@@ -667,6 +667,18 @@ bool ir_validate(IRFunc *func) {
             case IR_POOL_ALLOC: case IR_POOL_FREE: case IR_POOL_GET:
             case IR_SLAB_ALLOC: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
             case IR_SLAB_ALLOC_PTR:
+                break;
+            case IR_ENUM_GUARD:
+                /* Needs the value to check and the type to check it against —
+                 * without either the guard emits nothing and the elided
+                 * exhaustive-switch arm becomes unchecked again. */
+                if (inst->src1_local < 0 || !inst->cast_type) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d ENUM_GUARD missing "
+                            "src1_local/cast_type in '%.*s'\n",
+                            bi, (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
             case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
             case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED:
             case IR_CRITICAL_BEGIN: case IR_CRITICAL_END:
@@ -866,6 +878,7 @@ const char *ir_op_name(IROpKind op) {
     case IR_ORELSE_DECOMP:    return "ORELSE_DECOMP";
     case IR_SLICE_READ:       return "SLICE_READ";
     case IR_STRUCT_INIT_DECOMP: return "STRUCT_INIT_DECOMP";
+    case IR_ENUM_GUARD:       return "ENUM_GUARD";
     case IR_NOP:              return "NOP";
     }
     return "???";

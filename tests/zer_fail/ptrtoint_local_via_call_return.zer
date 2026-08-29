@@ -1,0 +1,9 @@
+// expect-error: cannot return result of call given @ptrtoint of a local
+// The RETURN sink of the same class. `return @ptrtoint(&l);` was rejected;
+// `return idfn(@ptrtoint(&l));` was not.
+usize idfn(usize x) { return x; }
+usize leak() {
+    u32 local = 5;
+    return idfn(@ptrtoint(&local));
+}
+u32 main() { return (u32)leak(); }

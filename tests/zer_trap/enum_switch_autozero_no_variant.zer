@@ -1,0 +1,14 @@
+// expect-trap
+// BUG-915, and the route that needs NO cast at all. ZER auto-zeroes every
+// variable; an enum whose variants do not include 0 therefore DEFAULTS to a
+// value that is not a variant, and the exhaustive switch classified it as the
+// last one. Six such enums exist in this repo's own corpus.
+enum E { a = 5, b = 6 }
+
+u32 main() {
+    E x;
+    switch (x) {
+        .a => { return 1; }
+        .b => { return 2; }
+    }
+}

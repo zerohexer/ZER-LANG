@@ -184,16 +184,36 @@ for f in $FILES; do
         # values; intentional defaults are legitimate)
         is_tok=$(awk -v t="$sw_text" 'BEGIN { if (t ~ /binary\.op|unary\.op|assign\.op|op_token/) print "1"; else print "0" }')
         [ "$is_tok" = "1" ] && continue
-        # Skip LOUD defaults — those that fail loudly via _zer_trap,
-        # checker_error, abort, assert(0), __builtin_unreachable, or
-        # fprintf to stderr. Scan a few lines after the `default:` for
-        # any of these markers. A loud default still won't be detected
-        # by GCC -Wswitch (the gold standard), but it prevents silent
-        # miscompiles by ensuring the compiler/runtime reports the gap.
+        # Skip COMPILE-TIME-LOUD defaults — ones that report the gap while the
+        # COMPILER is still running: a source-level `checker_error`, or a hard
+        # `abort()` / `assert(0)` / `__builtin_unreachable`.
+        #
+        # TIGHTENED 2026-08-29 (BUG-913/914). Two markers were REMOVED, and each
+        # removal was paid for by a shipped bug:
+        #
+        #  * `AUDIT-LOUD` — a COMMENT STRING. Writing the words "AUDIT-LOUD
+        #    exempt" in a comment silenced the gate over a default that was not
+        #    loud at all: `expr_touches_local_derived` (checker.c) answered a
+        #    SAFETY question with a silent `return false` for every node kind
+        #    nobody had listed, and its own comment said "false negative here =
+        #    safety hole". A stack address laundered through a CALL escaped to a
+        #    global unflagged (BUG-914). A gate whose membership is decided by
+        #    PROSE is the same defect `audit_walker_fields.sh` already had.
+        #
+        #  * `_zer_trap` — a trap in the EMITTED C. That is not a gate at all;
+        #    it is a user-visible RUNTIME failure in a binary the compiler
+        #    accepted (exit 0). `emit_defer_stmt` hid SEVEN missing statement
+        #    kinds behind one (switch / do-while / @critical / @once / spawn /
+        #    static_assert / label), each of which compiled clean and shipped a
+        #    `_zer_trap("compiler bug: ...")` to the user (BUG-913).
+        #
+        # The rule the two removals encode: a default may be exempt only if the
+        # COMPILER reports the gap. Deferring the report to the user's runtime
+        # does not qualify.
         is_loud=$(awk -v start=$d_line -v end=$((d_line + 8)) '
             BEGIN { found = 0 }
             NR>=start && NR<=end {
-                if ($0 ~ /_zer_trap|checker_error|abort\(|assert\(0\)|__builtin_unreachable|AUDIT-LOUD/) {
+                if ($0 ~ /checker_error|abort\(|assert\(0\)|__builtin_unreachable/) {
                     found = 1
                 }
             }
@@ -213,7 +233,19 @@ for f in $FILES; do
                 END { print (last>0 ? "1" : "0") }' "$f")
             [ "$in_emit_expr" = "1" ] && continue
         fi
-        findings+=("$f:$d_line (switch at line $sw_line: $(echo "$sw_text" | sed 's/^[[:space:]]*//'))")
+        # Enclosing function name — the stable key for the baseline (line
+        # numbers move; the function a walker lives in does not).
+        fn=$(awk -v n=$sw_line '
+            NR<=n && /^[A-Za-z_].*\(/ { split($0, a, "("); m=a[1]; sub(/.*[ \*]/, "", m); if (m != "") last=m }
+            END { print (last == "" ? "?" : last) }' "$f")
+        # BASELINE (2026-08-29, BUG-913/914): a default that stays must be a
+        # RECORDED decision, not a comment the script happens to pattern-match.
+        # `AUDIT-LOUD` used to be such a comment and it hid two shipped bugs.
+        # Rows are `file:function` + a justification; a NEW default fails.
+        if grep -qE "^${f}:${fn}\$" tools/walker_default_baseline.txt 2>/dev/null; then
+            continue
+        fi
+        findings+=("$f:$d_line in $fn() (switch at line $sw_line: $(echo "$sw_text" | sed 's/^[[:space:]]*//'))")
         found_count=$((found_count + 1))
     done < <(audit_one_file "$f")
 done

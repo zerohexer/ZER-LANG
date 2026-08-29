@@ -6124,6 +6124,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_ADDR_OF: case IR_DEREF_READ:
     case IR_CALL_DECOMP: case IR_INTRINSIC_DECOMP:
     case IR_ORELSE_DECOMP: case IR_SLICE_READ:
+    /* BUG-915: a pure runtime value check — allocates nothing, frees nothing,
+     * transfers nothing. It READS the switch value, but that read is already
+     * accounted for by the instruction that produced the hoisted local. */
+    case IR_ENUM_GUARD:
         break;
 
     /* J3 (2026-08-02): a DESIGNATED INITIALIZER that stores a tracked pointer

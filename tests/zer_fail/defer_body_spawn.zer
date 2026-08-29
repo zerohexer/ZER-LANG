@@ -1,0 +1,6 @@
+// expect-error: cannot use 'spawn' inside a defer body
+// BUG-913. PROBE WARNING: a spawn target that touches a non-shared global is
+// masked by the data-race rule, so the target here touches nothing — verified
+// ACCEPTED on a pre-fix build, which is what makes this test discriminate.
+void w(u32 v) { u32 t = v; }
+u32 main() { defer { spawn w(1); } return 0; }

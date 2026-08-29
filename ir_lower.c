@@ -2854,6 +2854,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          *   captures &sw_ref->variant persist to the original.
          *   For everything else: sw_ref is NODE_IDENT to a value local. */
         Node *sw_ref = NULL;
+        int sw_val_local = -1;   /* BUG-915: the hoisted VALUE local (non-union) */
         if (is_union) {
             Node *sw_expr = node->switch_stmt.expr;
             /* B2: when the union switch root is a shared struct, do NOT take the
@@ -2933,6 +2934,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
+            sw_val_local = val_local;
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
             sw_ref->kind = NODE_IDENT;
@@ -2968,6 +2970,25 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
+
+        /* BUG-915: the elision below is sound ONLY IF the value is a declared
+         * variant. Nothing had ever checked that, and two routes produce a
+         * non-variant enum with no cast at the switch — a load through a
+         * reinterpreted pointer (`@inttoptr(*State, addr)`, the documented MMIO
+         * enum-register read) and plain AUTO-ZERO of an enum whose variants do
+         * not include 0. Both silently took the LAST arm. Check the
+         * precondition at the use site, before the dispatch runs.
+         *
+         * Only the ELIDED shape needs it: with a `default` arm an unmatched
+         * value goes to `default`, which is the behaviour the user asked for,
+         * and a non-exhaustive chain simply matches nothing. */
+        if (is_exhaustive_enum && sw_val_local >= 0 && sw_eff) {
+            IRInst eg = make_inst(IR_ENUM_GUARD, node->loc.line);
+            eg.src1_local = sw_val_local;
+            eg.cast_type = sw_type;      /* keep any distinct wrapper — the
+                                          * guard emitter unwraps it itself */
+            emit_inst(ctx, eg);
+        }
 
         /* BUG-840: the dispatch chain is built arm-by-arm and the DEFAULT arm's
          * entry is an UNCONDITIONAL goto. Emitting it in the MIDDLE of the chain

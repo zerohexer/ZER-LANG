@@ -1,0 +1,16 @@
+// expect-trap
+// BUG-915, carrier route: the enum reached through a punned STRUCT's field.
+enum State { idle, running }
+struct W { State s; }
+
+u32 main() {
+    volatile u32 v = 99;
+    u32 raw = v;
+    *u32 p = &raw;
+    *W wp = @pun(*W, p);
+    State s = wp.s;
+    switch (s) {
+        .idle => { return 0; }
+        .running => { return 1; }
+    }
+}

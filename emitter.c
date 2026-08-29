@@ -944,7 +944,11 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
             if (vi) emit(e, " || ");
             emit(e, "%s == %lld", path, (long long)u->enum_type.variants[vi].value);
         }
-        emit(e, ")) _zer_trap(\"%s produced a value that is not a declared variant "
+        /* `what` names the OPERATION being guarded. BUG-915 added a fourth
+         * caller (the exhaustive-switch precondition) which does not "produce"
+         * a value at all, so the sentence names the operation and then states
+         * the fact, instead of asserting production. */
+        emit(e, ")) _zer_trap(\"%s: value is not a declared variant "
                 "of this enum\", __FILE__, __LINE__); ", what);
         return;
     }
@@ -10652,6 +10656,34 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         emit_indent(e);
         emit(e, "}\n");
         return;
+    case NODE_DO_WHILE:
+        /* BUG-913: the sibling of NODE_WHILE, missing since this walker was
+         * written. `defer { do { ... } while (c); }` fell to the loud default
+         * and shipped a `_zer_trap("compiler bug: ...")` in the emitted C — the
+         * compiler exited 0 and the USER got an internal-compiler-bug trap at
+         * runtime. Same walker, same loop family, one arm short. */
+        emit_indent(e);
+        emit(e, "do {\n");
+        e->indent++;
+        if (s->while_stmt.body && s->while_stmt.body->kind == NODE_BLOCK) {
+            for (int si = 0; si < s->while_stmt.body->block.stmt_count; si++) {
+                emit_defer_stmt(e, s->while_stmt.body->block.stmts[si], func);
+            }
+        } else if (s->while_stmt.body) {
+            emit_defer_stmt(e, s->while_stmt.body, func);
+        }
+        e->indent--;
+        emit_indent(e);
+        emit(e, "} while (");
+        if (s->while_stmt.cond) emit_rewritten_node(e, s->while_stmt.cond, func);
+        else emit(e, "0");
+        emit(e, ");\n");
+        return;
+    case NODE_STATIC_ASSERT:
+        /* BUG-913: compile-time only — the checker has already evaluated it.
+         * There is nothing to emit, but falling to the default shipped a
+         * runtime "compiler bug" trap for a construct that generates no code. */
+        return;
     case NODE_FOR:
         /* Best-effort: emit C `for` directly. NODE_FOR's init can be a
          * NODE_VAR_DECL or an expression; step is an expression. */
@@ -10709,11 +10741,42 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         if (sroot) emit_shared_unlock(e, sroot);
         return;
     }
-    default:
-        /* AUDIT-LOUD: silently miscompiling statement kinds in defer
-         * is the original bug class this helper closed. Fail loudly. */
-        fprintf(stderr, "compiler bug: emit_defer_stmt has no handler for "
-                "node kind %d at line %d\n",
+    /* BUG-913 — NO `default:`. This switch used to end in a loud default, and
+     * `tools/walker_default_audit.sh` EXEMPTED it because the default was
+     * "loud". That exemption is what let SEVEN node kinds
+     * (switch / do-while / @critical / @once / spawn / static_assert / label)
+     * sit here unhandled: the compiler exited 0 and shipped a
+     * `_zer_trap("compiler bug: ...")` into the user's binary. A runtime trap
+     * in EMITTED C is a user-visible failure, not a substitute for a build-time
+     * error — so the exemption is gone and this walker is exhaustive.
+     *
+     * The kinds below cannot reach a legal program: the checker rejects each
+     * one inside a defer body (see `defer_body_reject_unemittable` in
+     * checker.c, which enumerates the SAME set under its own -Werror=switch).
+     * A NEW NodeKind now fails the BUILD here, forcing a decision:
+     * implement it, or add it to the checker's rejection list. */
+    case NODE_SWITCH: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_LABEL:
+    /* Rejected by the checker for other reasons (control flow / nesting /
+     * coroutine state), listed so a change there cannot silently reach here. */
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_DEFER:
+    case NODE_YIELD: case NODE_AWAIT:
+    /* Declaration kinds — never statements inside a function body. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    /* Expression kinds — the parser wraps these in NODE_EXPR_STMT. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        /* Unreachable for a legal program — an internal-error backstop only. */
+        fprintf(stderr, "compiler bug: emit_defer_stmt reached node kind %d at "
+                "line %d — the checker should have rejected it\n",
                 s->kind, s->loc.line);
         emit_indent(e);
         emit(e, "_zer_trap(\"compiler bug: unsupported stmt kind in defer\", "
@@ -11645,6 +11708,28 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
         }
         if (pop) e->defer_stack.count = base;
+        break;
+    }
+
+    case IR_ENUM_GUARD: {
+        /* BUG-915: the exhaustive-enum switch elides its LAST arm's comparison
+         * (an unconditional goto), which is correct ONLY IF the value is one of
+         * the declared variants. Check that precondition here, on the hoisted
+         * switch value, before the dispatch runs. See ir.h IR_ENUM_GUARD for
+         * the two routes that produce a non-variant value with no cast in
+         * sight. Reuses the SAME guard emitter the three conversion doors use,
+         * so the recursion through struct fields / optional payloads / array
+         * elements is shared rather than re-derived. */
+        if (inst->src1_local >= 0 && inst->cast_type) {
+            emit_indent(e);
+            char lv[256];
+            const char *sp = func->is_async ? "self->" : "";
+            IRLocal *l = &func->locals[inst->src1_local];
+            snprintf(lv, sizeof(lv), "%s%.*s", sp, (int)l->name_len, l->name);
+            emit_enum_variant_guard_path(e, inst->cast_type, lv,
+                                         "switch on an exhaustive enum", 0);
+            emit(e, "\n");
+        }
         break;
     }
 

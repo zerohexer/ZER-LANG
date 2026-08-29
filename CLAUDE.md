@@ -402,7 +402,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
 | **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
-| **Enum-forge doors** ("can this conversion produce a non-variant?") | `@bitcast`, `@truncate`, `@saturate` — and `@cast` verified NOT to be one | the three `tests/zer_trap/*_enum_forged_*.zer`. Patched THREE times across three sessions before the door set was written down; each fix closed one door and left the siblings |
+| **Enum-forge doors** ("can this value be a non-variant?") | the three CONVERSIONS (`@bitcast`, `@truncate`, `@saturate`; `@cast` verified NOT one) **and the LOADS** — deref/field-read through `@pun`/`@ptrcast`/`@inttoptr`, plus plain auto-zero | `tests/zer_trap/*_enum_forged_*.zer` + `tests/zer_trap/enum_switch_*.zer`. Patched THREE times before the DOOR set was written down — and the door set was still the wrong axis: BUG-915 found four more routes with no conversion in them at all. Closed by guarding the USE (`IR_ENUM_GUARD` at the exhaustive switch), not by enumerating more doors |
+| **Defer-body statement kinds** ("can the raw-AST defer emitter express this?") | `emit_defer_stmt` (emitter.c) + the checker's `defer_body_reject_unemittable` | BOTH are no-`default:` exhaustive switches, so `-Werror=switch` fires at each end and the two lists cannot drift. The `orelse` case of this class was closed alone; SEVEN sibling kinds shipped a `_zer_trap("compiler bug")` to users for months (BUG-913) |
 | **Documented examples** ("does the reference still compile?") | every ```zer block in `docs/reference.md` | `tools/audit_reference_examples.sh` + `tools/reference_example_baseline.txt` — IN `make check` (the 8th gate). Twice the docs asserted a feature the parser did not have (funcptr arrays, bit-extract through a pointer) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
@@ -443,7 +444,7 @@ line, plus TEN axis-crossed matrices:
 |---|---|
 | `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
 | `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
-| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (684 baselined)` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (N baselined)` |
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
@@ -479,6 +480,29 @@ casts, so it printed OK against a deliberately broken compiler. `-Wcast-qual` is
 the question being asked. Both were caught the same way: **break the compiler on purpose and check the
 gate goes RED.** A gate that has only ever printed OK is a script, not a net — and that applies to the
 gate's SCOPE as much as to its assertion.
+
+**A THIRD instance, 2026-08-29, and the most expensive: `walker_default_audit.sh`'s LOUD
+EXEMPTION.** It skipped any `default:` whose next lines contained `_zer_trap` or the literal
+string **`AUDIT-LOUD`**. Both are defects of the same two kinds already listed above:
+
+* `AUDIT-LOUD` is a COMMENT — **prose deciding membership again**, in a second gate. Writing
+  "AUDIT-LOUD exempt" silenced the audit over `expr_touches_local_derived`'s
+  `default: return false`, a SAFETY answer whose own comment said *"false negative here =
+  safety hole"*. A stack address laundered through a call escaped to a global (BUG-914).
+* `_zer_trap` is a trap in the **EMITTED C** — a runtime failure in a binary the compiler
+  ACCEPTED (`zerc` exit 0). That is the bug reaching the user, not a gate catching it. It
+  hid SEVEN unhandled statement kinds in `emit_defer_stmt` (BUG-913).
+
+**The rule both removals encode: a `default:` is exempt only when the COMPILER reports the
+gap** (`checker_error` / `abort()` / `assert(0)` / `__builtin_unreachable`), or when it is
+listed in `tools/walker_default_baseline.txt` with a written reason. Deferring the report to
+the user's runtime does not qualify. Verified non-vacuous by injecting a bare
+`default: return;` AND a `default:` carrying both removed markers — the gate goes red for
+both, and green again on restore.
+
+**Generalisable, and worth grepping for directly: a gate exemption keyed on a STRING that
+appears in COMMENTS.** Two of the three instances above are that exact shape. For every
+`grep`/`awk` filter in `tools/*.sh`, ask whether a comment can satisfy it.
 
 **Keep the gates CURRENT — a stale matrix is worse than none (false confidence).** When a
 sink/site is unified away, REMOVE its cell/baseline row; when a new shape/site/node-kind is
@@ -1251,7 +1275,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
-| Enum forging (a value outside the variant set) | Runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works. The doors are EXACTLY THREE and the set is closed: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door — it requires a distinct typedef and cannot name a bare enum. The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard.** |
+| Enum forging (a value outside the variant set) | TWO layers, and the second is the one that makes the claim true. (a) CONVERSION doors — a runtime variant guard at the point of forgery: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door (needs a distinct typedef, cannot name a bare enum). **Adding a new value-producing conversion? Wire the guard, at BOTH emitter dispatch paths.** (b) USE-SITE guard — `IR_ENUM_GUARD` before an EXHAUSTIVE enum `switch` (BUG-915). The conversion doors were never the whole story: a non-variant also arrives by a LOAD through a reinterpreted pointer (`@inttoptr(*State,addr)` — the documented MMIO enum-register read — and `@pun`/`@ptrcast`, incl. through a struct field) and by plain AUTO-ZERO of an enum whose variants exclude 0 (no cast anywhere; six such enums are in this corpus). The exhaustive switch ELIDES its last arm's comparison, so all of those silently ran that arm. Layer (b) checks the elision's precondition at the use site — ONE site, no provenance tracking. A switch WITH a `default` arm is not elided and gets no guard. |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
 | Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` relaxes RANGE checks only (runtime alignment trap always emitted for variable addresses, BUG-736) |

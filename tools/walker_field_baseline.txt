@@ -824,3 +824,91 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# 2026-08-29 (BUG-913/914) — two `default:` clauses converted to exhaustive
+# switches, so both walkers now NAME every NodeKind. The rows below are the
+# cost of that conversion, and every one of them is an omission by CONSTRUCTION,
+# not an oversight:
+#
+#  * expr_touches_local_derived is an EXPRESSION walker ("does this expression
+#    touch a value derived from a stack address?"). It names statement and
+#    declaration kinds only so -Werror=switch can police the kind set; a
+#    statement never appears in expression position, and it carries no value to
+#    taint. Its EXPRESSION arms all descend (that is what BUG-914 added:
+#    call.callee + call.args, slice.*, struct_init field values, assign.*).
+#
+#  * defer_body_reject_unemittable is a STATEMENT walker ("does this defer body
+#    contain a statement the defer emitter cannot express?"). It descends every
+#    body-carrying statement kind (block / if / for / while / do-while) and
+#    deliberately does NOT descend expression children — a `switch`, `spawn`,
+#    `@critical`, `@once` or label cannot occur inside an expression — nor into
+#    the bodies of kinds it has already rejected at the top of the same call.
+checker.c:defer_body_reject_unemittable:NODE_ASM:asm_stmt.inputs
+checker.c:defer_body_reject_unemittable:NODE_ASM:asm_stmt.outputs
+checker.c:defer_body_reject_unemittable:NODE_ASSIGN:assign.target
+checker.c:defer_body_reject_unemittable:NODE_ASSIGN:assign.value
+checker.c:defer_body_reject_unemittable:NODE_AWAIT:await_stmt.cond
+checker.c:defer_body_reject_unemittable:NODE_BINARY:binary.left
+checker.c:defer_body_reject_unemittable:NODE_BINARY:binary.right
+checker.c:defer_body_reject_unemittable:NODE_CALL:call.args
+checker.c:defer_body_reject_unemittable:NODE_CALL:call.callee
+checker.c:defer_body_reject_unemittable:NODE_CRITICAL:critical.body
+checker.c:defer_body_reject_unemittable:NODE_DEFER:defer.body
+checker.c:defer_body_reject_unemittable:NODE_DO_WHILE:while_stmt.cond
+checker.c:defer_body_reject_unemittable:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:defer_body_reject_unemittable:NODE_FIELD:field.object
+checker.c:defer_body_reject_unemittable:NODE_FILE:file.decls
+checker.c:defer_body_reject_unemittable:NODE_FOR:for_stmt.cond
+checker.c:defer_body_reject_unemittable:NODE_FOR:for_stmt.step
+checker.c:defer_body_reject_unemittable:NODE_FUNC_DECL:func_decl.body
+checker.c:defer_body_reject_unemittable:NODE_GLOBAL_VAR:var_decl.init
+checker.c:defer_body_reject_unemittable:NODE_IF:if_stmt.cond
+checker.c:defer_body_reject_unemittable:NODE_INDEX:index_expr.index
+checker.c:defer_body_reject_unemittable:NODE_INDEX:index_expr.object
+checker.c:defer_body_reject_unemittable:NODE_INTERRUPT:interrupt.body
+checker.c:defer_body_reject_unemittable:NODE_INTRINSIC:intrinsic.args
+checker.c:defer_body_reject_unemittable:NODE_ONCE:once.body
+checker.c:defer_body_reject_unemittable:NODE_ORELSE:orelse.expr
+checker.c:defer_body_reject_unemittable:NODE_ORELSE:orelse.fallback
+checker.c:defer_body_reject_unemittable:NODE_RETURN:ret.expr
+checker.c:defer_body_reject_unemittable:NODE_SLICE:slice.end
+checker.c:defer_body_reject_unemittable:NODE_SLICE:slice.object
+checker.c:defer_body_reject_unemittable:NODE_SLICE:slice.start
+checker.c:defer_body_reject_unemittable:NODE_SPAWN:spawn_stmt.args
+checker.c:defer_body_reject_unemittable:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:defer_body_reject_unemittable:NODE_STRUCT_INIT:struct_init.fields
+checker.c:defer_body_reject_unemittable:NODE_SWITCH:switch_stmt.arms
+checker.c:defer_body_reject_unemittable:NODE_SWITCH:switch_stmt.expr
+checker.c:defer_body_reject_unemittable:NODE_TYPECAST:typecast.expr
+checker.c:defer_body_reject_unemittable:NODE_UNARY:unary.operand
+checker.c:defer_body_reject_unemittable:NODE_VAR_DECL:var_decl.init
+checker.c:defer_body_reject_unemittable:NODE_WHILE:while_stmt.cond
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.inputs
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.outputs
+checker.c:expr_touches_local_derived:NODE_AWAIT:await_stmt.cond
+checker.c:expr_touches_local_derived:NODE_BLOCK:block.stmts
+checker.c:expr_touches_local_derived:NODE_CRITICAL:critical.body
+checker.c:expr_touches_local_derived:NODE_DEFER:defer.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_touches_local_derived:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_touches_local_derived:NODE_FILE:file.decls
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.body
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.cond
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.init
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.step
+checker.c:expr_touches_local_derived:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_touches_local_derived:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.cond
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.else_body
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.then_body
+checker.c:expr_touches_local_derived:NODE_INTERRUPT:interrupt.body
+checker.c:expr_touches_local_derived:NODE_ONCE:once.body
+checker.c:expr_touches_local_derived:NODE_RETURN:ret.expr
+checker.c:expr_touches_local_derived:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_touches_local_derived:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_touches_local_derived:NODE_VAR_DECL:var_decl.init
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.cond

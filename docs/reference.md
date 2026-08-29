@@ -1134,6 +1134,41 @@ u32 z = maybe() orelse g;             // OK — compute it first
 defer { use(z); }
 ```
 
+#### What a defer body may contain
+
+A defer body is the one place in ZER where statements are emitted directly rather than
+through the compiler's normal statement lowering, so a small set of constructs cannot be
+expressed there. All of them have the same one-line workaround: put the construct in a
+helper function and defer the call.
+
+| in a defer body | |
+|---|---|
+| `if` / `else if` / `else`, `while`, `do`/`while`, `for` | OK |
+| variable declarations, assignments, calls, `asm`, `static_assert` | OK |
+| `switch` | **compile error** — move it into a helper |
+| `@critical { }` | **compile error** — move it into a helper |
+| `@once { }` | **compile error** — move it into a helper |
+| `spawn f(...)` | **compile error** — move it into a helper |
+| a label (`done:`) | **compile error** — `goto` is banned here, so it is unreachable |
+| `return`, `break`, `continue`, `goto`, nested `defer`, `yield`, `await` | **compile error** (see above) |
+
+```zer
+u32 g_mode = 0;
+
+void finish() {
+    switch (g_mode) {
+        1       => { g_mode = 10; }
+        default => { g_mode = 20; }
+    }
+}
+
+u32 main() {
+    defer finish();      // OK — the switch lives in the helper
+    g_mode = 1;
+    return 0;
+}
+```
+
 A forward `goto` that jumps **over** a later `defer` to a label past it is a
 compile error: on that path the defer never registered, so firing it at the
 label would run cleanup that was never set up. Register the defer before the
@@ -1961,6 +1996,37 @@ Convert pointer to usize integer.
 ```zer
 usize addr = @ptrtoint(my_ptr);
 ```
+
+**NOTES**
+- A pointer-width integer produced by `@ptrtoint` is still an ADDRESS as far as
+  escape analysis is concerned, so `@ptrtoint(&local)` cannot outlive the frame.
+  Every route out is rejected — a direct store, an arithmetic or cast chain, a
+  struct field, an array element, an `orelse` fallback, a `return`, and the
+  result of a **call** handed the address:
+
+<!-- audit: skip -->
+```zer
+usize g_addr = 0;
+usize idfn(usize x) { return x; }
+
+u32 bad() {
+    u32 local = 5;
+    g_addr = @ptrtoint(&local);          // ERROR — stack address to a global
+    usize a = @ptrtoint(&local);
+    g_addr = a + 0;                      // ERROR — arithmetic launder
+    g_addr = idfn(a);                    // ERROR — call launder
+    return 0;
+}
+
+usize also_bad() {
+    u32 local = 5;
+    return idfn(@ptrtoint(&local));      // ERROR — same, at the return sink
+}
+```
+
+- The rule keys on the ARGUMENT being an address-valued integer, not merely on
+  "a call that was given something local". `len_of(local_slice)` returning
+  `usize` is a count, not an address, and stays legal.
 
 ---
 
@@ -3068,13 +3134,14 @@ u32 bad(f32 x) {
 
 ### Forging an enum traps at the point of forgery
 
-ZER has no int-to-enum cast, so the only way to produce a value outside an enum's declared
-variants is a bit-level conversion. Those are legitimate — reading an enum out of a
-hardware register is a real firmware idiom — so ZER **tracks** rather than bans: the
-conversion compiles, and a guard traps if the value is not a declared variant. Without it
-an exhaustive `switch` silently runs its last arm on a value that matches none.
+ZER has no int-to-enum cast, so a value outside an enum's declared variants can only come
+from a bit-level conversion or from memory ZER did not write. Those are legitimate —
+reading an enum out of a hardware register is a real firmware idiom — so ZER **tracks**
+rather than bans: the code compiles, and a guard traps if the value is not a declared
+variant. Without it an exhaustive `switch` silently runs its last arm on a value that
+matches none.
 
-There are exactly **three** doors, and each carries the guard:
+The **conversion** doors are exactly three, and each carries the guard at the conversion:
 
 | conversion | guarded |
 |---|---|
@@ -3100,7 +3167,58 @@ u32 main() {
 ```
 
 `@bitcast(State, 7)` compiles and traps at run time with
-`@bitcast produced a value that is not a declared variant of this enum`.
+`@bitcast: value is not a declared variant of this enum`.
+
+### An exhaustive `switch` checks the value it dispatches on
+
+A conversion is not the only way to end up with a non-variant. Two more routes produce one
+with no cast in sight, and both used to take the last arm silently:
+
+- **A load through a reinterpreted pointer.** `@inttoptr(*State, addr)` — the documented
+  way to read an enum-valued hardware register — and the same through `@pun` / `@ptrcast`,
+  including via a struct field. The reinterpretation is audit-visible, but the *load* is
+  where a non-variant enters the program.
+- **Auto-zero of an enum whose variants do not include 0.** ZER zero-initialises every
+  variable; for `enum FuncCode { read_coils = 1, read_holding = 3 }` the zero value is not
+  a variant at all.
+
+An exhaustive `switch` — one with no `default` arm, where the compiler has already checked
+that every variant is covered — ELIDES its last arm's comparison, because a value that
+matched no earlier arm must be the remaining variant. That is true only if the value *is*
+one of the variants. ZER now checks that precondition where it is used:
+
+<!-- audit: skip -->
+```zer
+enum FuncCode { read_coils = 1, read_holding = 3 }
+
+u32 dispatch() {
+    FuncCode f;                        // auto-zeroed to 0 — NOT a variant
+    switch (f) {                       // traps here
+        .read_coils   => { return 1; }
+        .read_holding => { return 3; }
+    }
+}
+```
+
+The trap message is
+`switch on an exhaustive enum: value is not a declared variant of this enum`.
+
+The guard runs only for the elided shape. A `switch` **with** a `default` arm is not
+elided — an unmatched value goes to `default`, which is what the program asked for — and a
+chain that does not cover every variant simply matches nothing. If a register may legally
+hold values outside the enum, give the `switch` a `default` arm and the guard disappears:
+
+```zer
+enum FuncCode { read_coils = 1, read_holding = 3 }
+
+u32 dispatch(u32 raw) {
+    FuncCode f = @bitcast(FuncCode, 1);
+    switch (f) {
+        .read_coils => { return 1; }
+        default     => { return 0; }   // handles anything else, no guard needed
+    }
+}
+```
 
 ### Argument counts are checked
 

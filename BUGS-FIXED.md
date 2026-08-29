@@ -5,6 +5,171 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-29 — BUG-913..915: a gate exemption, and the three bugs it was hiding
+
+A full-codebase audit that started from the GATES rather than from the code. The finding
+that organises this session is that **`tools/walker_default_audit.sh` had an exemption
+broad enough to hide an entire bug class**, and each of the three bugs below was sitting
+behind it.
+
+The exemption skipped any `default:` clause whose next 8 lines contained
+`_zer_trap`, or the literal string **`AUDIT-LOUD`**. Both are wrong:
+
+* **`AUDIT-LOUD` is a COMMENT.** Writing the words "AUDIT-LOUD exempt" in a comment
+  silenced the gate. That is how `expr_touches_local_derived` kept a `default: return
+  false` — a SAFETY question answered "no" for every kind nobody had listed — while its
+  own comment said *"false negative here = safety hole"*. This is the same defect
+  CLAUDE.md already records for `audit_walker_fields.sh` ("decided membership on PROSE"),
+  in a different gate.
+* **`_zer_trap` is a trap in the EMITTED C** — a runtime failure in a binary the compiler
+  ACCEPTED (`zerc` exit 0). That is not a gate; it is the bug being shipped to the user
+  with a "compiler bug" message attached.
+
+Both markers are gone. A default is now exempt only when the COMPILER reports the gap
+(`checker_error` / `abort()` / `assert(0)` / `__builtin_unreachable`) or when it is listed
+in the new **`tools/walker_default_baseline.txt`** with a written reason — the same
+add-or-justify shape as the fixed-buffer / type-dispatch / carrier baselines. Verified
+non-vacuous both ways: injecting a bare `default: return;` makes it exit 1, and so does a
+`default:` carrying *both* removed markers; restoring the tree returns it to 0.
+
+### BUG-913 — SEVEN statement kinds unsupported inside a `defer` body
+
+```zer
+u32 main() {
+    u32 x = 1;
+    defer { switch (x) { 1 => { g = 10; } default => { g = 20; } } }
+    return 0;
+}
+```
+`zerc` exits **0** and the emitted C contains
+`_zer_trap("compiler bug: unsupported stmt kind in defer", ...)`. The user wrote valid ZER
+and got an internal-compiler-bug trap at run time.
+
+`emit_defer_stmt` is the last place in the compiler where raw AST is emitted as
+STATEMENTS — function bodies are IR-only, but a defer body is not lowered, so every
+construct has to be re-implemented in that one walker. It handled block / expr-stmt /
+var-decl / return / asm / if / while / for and ended in the loud `default:` above. Seven
+kinds fell into it: `switch`, `do`/`while`, `@critical`, `@once`, `spawn`, `static_assert`
+and a label.
+
+The `orelse`-with-a-value-fallback case of exactly this class was closed earlier, with the
+reasoning written out in `check_expr` — *"the emitted C carried TWO `_zer_trap(...)` calls,
+so the user saw an internal-compiler-bug message instead of a source-level error. Ban
+criterion 2 (emission impossibility)"*. The siblings were never enumerated.
+
+**Fix, split by what each kind actually needs.** Two are implemented: `do`/`while` (a pure
+sibling of the `while` arm already in that walker) and `static_assert` (compile-time only —
+it generates no code). The other five are REJECTED at the checker by one new walk,
+`defer_body_reject_unemittable`, with a diagnostic naming the one-line restructure
+(`defer helper();`). `switch` dispatch and the `spawn` wrapper are each hundreds of lines
+the IR path already owns; a second copy inside a raw-AST emitter is the debt this codebase
+forbids, so the rejection is the honest answer rather than a duplicate lowering.
+
+**The class is now gate-enforced at BOTH ends.** `emit_defer_stmt`'s `default:` is gone —
+it is an exhaustive switch, so a new NodeKind fails the BUILD there — and the checker's
+rejection walk is exhaustive too. The two lists cannot silently drift.
+
+Corpus cost measured before shipping: **0 occurrences across 2215 `.zer` files.**
+Tests: `tests/zer_fail/defer_body_{switch,critical,once,spawn,label}.zer` (each verified
+ACCEPTED on a pre-fix build — `defer_body_spawn` needed its target rewritten because the
+first version was MASKED by the spawn data-race rule) and
+`tests/zer/defer_body_do_while_ok.zer` (exit 133 pre-fix, 0 after).
+
+### BUG-914 — `@ptrtoint(&local)` laundered through a CALL escapes to a global
+
+```zer
+usize g = 0;
+usize idfn(usize x) { return x; }
+u32 main() { u32 local = 5; g = idfn(@ptrtoint(&local)); return 0; }   // ACCEPTED
+```
+Every other spelling of this launder is rejected — direct store, arithmetic chain, struct
+field, array element, `orelse` fallback, and the `return` sink. Only the call form was not,
+at either the assignment sink or the return sink.
+
+**Two root causes, one question answered two ways.** The call-result escape cluster is
+gated on `type_carries_data_pointer(result)`, whose own comment says *"`g_int =
+count(&local)` returns an int: no pointer escapes, don't reject"* — right for a count,
+wrong for an ADDRESS, which is exactly what `@ptrtoint` manufactures. Meanwhile the
+var-decl propagation site DOES treat a pointer-width integer as address-carrying
+(`is_ptr_int`). And `expr_touches_local_derived`, the walker that answers the propagation
+half, had the `AUDIT-LOUD`-exempted `default: return false` for `NODE_CALL`.
+
+**Fix.** `expr_touches_local_derived` is exhaustive now (NODE_CALL / NODE_SLICE /
+NODE_STRUCT_INIT / NODE_ASSIGN added, no `default:`), and a new
+`call_result_is_local_address_int` gates the assignment and return sinks.
+
+**Deliberately NOT "any pointer-width result of a call with a local-derived arg".** That
+wider rule rejects `len_of(local_slice)`, which is safe and common — the array arm of
+`arg_is_local_derived` fires on it. The discriminator is that an ARGUMENT is
+address-valued, and the only way to make one is `@ptrtoint` (which is also the only way an
+integer Symbol becomes `is_local_derived`). Boundary pinned by
+`tests/zer/ptrtoint_call_boundary_ok.zer`: a length-of-a-local-buffer call, a scalar-result
+call, and `@ptrtoint` of a GLOBAL all still compile and run.
+Tests: `tests/zer_fail/ptrtoint_local_via_call_{global,alias,return}.zer`, all three
+verified ACCEPTED on a pre-fix build.
+
+### BUG-915 — the exhaustive-enum `switch` trusted an unchecked precondition
+
+The silent one, and the one that reaches bare metal.
+
+An enum `switch` with no `default` arm is checked for exhaustiveness, and the dispatch then
+ELIDES the last arm's comparison: a value that matched no earlier arm *must* be the
+remaining variant. Sound — **if** the value is one of the variants. Nothing had ever checked
+that, and two routes produce one that is not:
+
+```zer
+// 1. a LOAD through a reinterpreted pointer — the DOCUMENTED MMIO enum-register read
+volatile *State sp = @inttoptr(*State, addr);
+State s = *sp;                       // 99
+switch (s) { .idle => {...} .running => {...} }   // silently ran `.running`
+
+// 2. AUTO-ZERO of an enum whose variants do not include 0 — no cast anywhere
+enum E { a = 5, b = 6 }
+E x;                                 // 0, not a variant
+switch (x) { .a => {...} .b => {...} }            // silently ran `.b`
+```
+Compile-time and run time BOTH missed it; on bare metal nothing faults. Route 2 needs no
+intrinsic at all, and **six enums in this repo's own corpus have no zero-valued variant**
+(including `FuncCode` in `examples/qemu-cortex-m3/ringbuf_protocol.zer`).
+
+CLAUDE.md's claim that the enum-forge doors are "EXACTLY THREE and the set is closed" was
+true of the *value-producing conversions* (`@bitcast`, `@truncate`, `@saturate`) and not of
+the program. The four guarded routes below were all accepted with no guard emitted at all:
+`@pun(*State, p)` + deref, `@ptrcast(*State, p)` + deref, `@pun(*W, p)` + field read, and
+`@inttoptr(*State, a)` + deref.
+
+**Fix — one site, at the USE.** A new `IR_ENUM_GUARD` instruction is emitted before the
+dispatch of an exhaustive enum switch and traps unless the hoisted value is a declared
+variant. It reuses `emit_enum_variant_guard_path`, the same emitter the three conversion
+doors use, so the recursion through struct fields / optional payloads / array elements is
+shared rather than re-derived.
+
+This is deliberately NOT a provenance bit threaded to every enum load. The switch is where
+the wrong classification happens, which is where ZER's coverage claim says a wrong use must
+be caught, and it is ONE site instead of N. A `switch` WITH a `default` arm is not elided
+and gets no guard — an unmatched value goes to `default`, which is what the program asked
+for. This is the "OPERATIONAL PRECONDITIONS ARE FINITE VARIABLES" lesson in CLAUDE.md,
+found in the compiler rather than in an oracle.
+
+`IR_ENUM_GUARD` is a real IR op, not an overloaded `IR_NOP`, so `-Werror=switch` forced the
+decision at every `switch (inst->op)` — which is how the emitter and zercheck_ir arms were
+written rather than forgotten. `ir_validate` requires both operands, so a guard that would
+emit nothing aborts the compile instead of silently restoring the hole.
+
+Tests: `tests/zer_trap/enum_switch_forged_via_{mmio,pun_deref,struct_field}.zer` and
+`tests/zer_trap/enum_switch_autozero_no_variant.zer` (all `// expect-trap`, all verified to
+exit 1 or 2 — i.e. NOT trap — on a pre-fix build), plus
+`tests/zer/enum_switch_variant_guard_ok.zer` pinning four over-rejection boundaries: an
+auto-zeroed enum whose 0 IS a variant, an explicit variant, an explicitly-initialised
+sparse enum, and a switch with a `default` arm.
+
+The trap sentence changed from `"%s produced a value that is not a declared variant"` to
+`"%s: value is not a declared variant of this enum"`, because the new caller does not
+*produce* a value. `docs/reference.md` is updated for the new wording and for both new
+routes.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

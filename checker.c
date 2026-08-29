@@ -1985,6 +1985,79 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* BUG-914 — the INTEGER half of the escape question.
+ *
+ * `call_result_escapes` above is gated by its consumers on
+ * `type_carries_data_pointer(result)`, whose own comment says "`g_int =
+ * count(&local)` returns an int: no pointer escapes, don't reject". That is
+ * right for a COUNT and wrong for an ADDRESS: `@ptrtoint` exists precisely to
+ * turn a pointer into a pointer-width integer, and `@inttoptr` turns it back.
+ * The var-decl propagation site already treats a pointer-width int as
+ * address-carrying (`is_ptr_int` + `expr_touches_local_derived`), so the two
+ * sites answered ONE question two ways — and the call form escaped:
+ *
+ *     usize g;  usize idfn(usize x) { return x; }
+ *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }   // was ACCEPTED
+ *     usize leak(){ u32 l = 5; return idfn(@ptrtoint(&l)); }   // was ACCEPTED
+ *
+ * while `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a` and
+ * `g = m() orelse a` are all rejected.
+ *
+ * Deliberately NOT "any pointer-width-int result of a call with a local-derived
+ * arg": that would reject `g_len = sum(local_arr)`, a common and safe pattern
+ * (measured: the array arm of `arg_is_local_derived` fires on it). The
+ * discriminator is that an argument is an ADDRESS-VALUED integer — the only way
+ * to make one is `@ptrtoint`, and the only way an integer Symbol becomes
+ * `is_local_derived` is through it. */
+static bool ptr_width_int_type(Checker *c, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);   /* unwraps distinct, NULL-safe */
+    if (k == TYPE_USIZE) return true;
+    if (k == TYPE_U64 && c->target_ptr_bits >= 64) return true;
+    if (k == TYPE_U32 && c->target_ptr_bits == 32) return true;
+    return false;
+}
+
+static bool arg_is_local_address_int(Checker *c, Node *arg, int depth) {
+    if (!arg || depth > 8) return false;
+    if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 8 &&
+        memcmp(arg->intrinsic.name, "ptrtoint", 8) == 0 &&
+        arg->intrinsic.arg_count > 0) {
+        /* unwrap_ptr_launder inside arg_is_local_derived peels the intrinsic to
+         * its pointer operand, so `&local` and a local-derived pointer both
+         * resolve there. Reuse it rather than re-deriving the root walk. */
+        return arg_is_local_derived(c, arg, 0);
+    }
+    if (arg->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, arg->ident.name,
+                                 (uint32_t)arg->ident.name_len);
+        return s && s->is_local_derived && ptr_width_int_type(c, s->type);
+    }
+    if (arg->kind == NODE_BINARY)
+        return arg_is_local_address_int(c, arg->binary.left, depth + 1) ||
+               arg_is_local_address_int(c, arg->binary.right, depth + 1);
+    if (arg->kind == NODE_TYPECAST)
+        return arg_is_local_address_int(c, arg->typecast.expr, depth + 1);
+    if (arg->kind == NODE_ORELSE)
+        return arg_is_local_address_int(c, arg->orelse.expr, depth + 1) ||
+               arg_is_local_address_int(c, arg->orelse.fallback, depth + 1);
+    if (arg->kind == NODE_CALL)
+        for (int i = 0; i < arg->call.arg_count; i++)
+            if (arg_is_local_address_int(c, arg->call.args[i], depth + 1))
+                return true;
+    return false;
+}
+
+/* The call hands back a pointer-width integer and was given a frame ADDRESS as
+ * an integer — so the result may BE that address. */
+static bool call_result_is_local_address_int(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    if (!ptr_width_int_type(c, typemap_get(c, call))) return false;
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (arg_is_local_address_int(c, call->call.args[i], 0)) return true;
+    return false;
+}
+
 /* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
  * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
  * global) copies the element's bytes into storage that outlives the frame. If
@@ -3064,14 +3137,60 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
     case NODE_ORELSE:
         return expr_touches_local_derived(c, expr->orelse.expr) ||
                expr_touches_local_derived(c, expr->orelse.fallback);
-    default:
-        /* AUDIT-LOUD exempt: this default is intentional — leaf and statement
-         * nodes can't carry a chain to a local-derived pointer. New NODE_
-         * kinds that introduce arithmetic chains should be added as explicit
-         * cases above. Walker is for stack-escape-via-arithmetic detection
-         * (EW8I0 BUG-664); false negative here = safety hole. */
+    /* BUG-914: NODE_CALL used to land in the `default: return false` below and
+     * a stack address laundered through a CALL escaped to a global unflagged:
+     *
+     *     usize g;  usize idfn(usize x) { return x; }
+     *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }   // was ACCEPTED
+     *
+     * Every sibling launder form — arithmetic, cast, intrinsic, field store,
+     * array element, orelse, struct-init — is caught; only the call form was
+     * not, because this walker's default answered "no" for every kind nobody
+     * had thought of. The default's OWN comment said "false negative here =
+     * safety hole", and the walker-default audit exempted it because the
+     * comment contained the string `AUDIT-LOUD`.
+     *
+     * Conservative by construction (the argument-precise barrier principle,
+     * BUG-740): a callee HANDED a local-derived value may return it, and this
+     * per-file + summaries model has no integer-provenance summary to prove
+     * otherwise. Answering "yes" can only OVER-reject. */
+    case NODE_CALL:
+        if (expr_touches_local_derived(c, expr->call.callee)) return true;
+        for (int i = 0; i < expr->call.arg_count; i++)
+            if (expr_touches_local_derived(c, expr->call.args[i])) return true;
+        return false;
+    case NODE_SLICE:
+        return expr_touches_local_derived(c, expr->slice.object) ||
+               expr_touches_local_derived(c, expr->slice.start) ||
+               expr_touches_local_derived(c, expr->slice.end);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            if (expr_touches_local_derived(c, expr->struct_init.fields[i].value))
+                return true;
+        return false;
+    case NODE_ASSIGN:
+        return expr_touches_local_derived(c, expr->assign.target) ||
+               expr_touches_local_derived(c, expr->assign.value);
+    /* BUG-914 — NO `default:`. A new NodeKind must now fail the BUILD here and
+     * force a decision, instead of silently answering "this cannot carry a
+     * stack address". Leaves and statement/declaration kinds carry no chain. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
         return false;
     }
+    return false;  /* unreachable (exhaustive) */
 }
 
 /* ---- ISR / @critical alloc ban helper ---- */
@@ -7105,6 +7224,31 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot store result of call with local-derived pointer argument — "
                         "stack memory may escape (sink outlives the local)");
+                }
+            }
+        }
+
+        /* BUG-914: the INTEGER sibling of the cluster above. The gate there is
+         * `type_carries_data_pointer(value)`, which is false for `usize` — so a
+         * frame address laundered as an INTEGER through a call
+         * (`g = idfn(@ptrtoint(&local))`) reached a global unflagged, while
+         * every non-call spelling of the same launder is rejected. */
+        if (node->assign.op == TOK_EQ && value &&
+            ptr_width_int_type(c, value)) {
+            Node *iroot = node->assign.value;
+            while (iroot && (iroot->kind == NODE_FIELD || iroot->kind == NODE_INDEX)) {
+                if (iroot->kind == NODE_FIELD) iroot = iroot->field.object;
+                else iroot = iroot->index_expr.object;
+            }
+            if (iroot && iroot->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, iroot)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of call given @ptrtoint of a local — "
+                        "the address dangles when the function returns "
+                        "(store the DATA, not the address)");
                 }
             }
         }
@@ -13643,6 +13787,98 @@ static void check_stmt_cond_body(Checker *c, Node *body) {
     c->branch_depth--;
 }
 
+/* BUG-913 — the ONE query for "can a defer body contain this statement?"
+ *
+ * A `defer` body is the last place in the compiler where raw AST is emitted as
+ * STATEMENTS (`emit_defer_stmt`, emitter.c): the IR path owns every other
+ * statement, so a defer body does not go through it and every construct must be
+ * re-implemented there. That walker is a partial mirror of statement emission,
+ * and it ended in a LOUD `default:` — which `tools/walker_default_audit.sh`
+ * EXEMPTED, so seven node kinds sat unhandled for months. Each of them
+ * COMPILED (zerc exit 0) and shipped a `_zer_trap("compiler bug: ...")` into
+ * the user's binary.
+ *
+ * Two were implemented (do-while, static_assert — a loop-family sibling and a
+ * no-code construct). The five below genuinely cannot be expressed by a raw-AST
+ * statement emitter without a SECOND copy of a complex lowering — switch
+ * dispatch (enum/union/optional arms + captures) and the spawn wrapper are each
+ * hundreds of lines that the IR path already owns, and duplicating them is the
+ * debt this codebase forbids. So they are REJECTED here, exactly as
+ * `orelse`-with-a-value-fallback already is (Ban framework criterion 2,
+ * emission impossibility), and the diagnostic names the one-line restructure.
+ *
+ * NO `default:` — a new NodeKind fails the build here AND in `emit_defer_stmt`,
+ * so the two lists cannot silently drift apart. */
+static void defer_body_reject_unemittable(Checker *c, Node *s) {
+    if (!s) return;
+    switch (s->kind) {
+    case NODE_SWITCH:
+        checker_error(c, s->loc.line,
+            "cannot use 'switch' inside a defer body — defer bodies are emitted "
+            "without the IR's switch lowering; move it into a helper function "
+            "and 'defer helper();'");
+        return;
+    case NODE_CRITICAL:
+        checker_error(c, s->loc.line,
+            "cannot use '@critical' inside a defer body — move it into a helper "
+            "function and 'defer helper();'");
+        return;
+    case NODE_ONCE:
+        checker_error(c, s->loc.line,
+            "cannot use '@once' inside a defer body — move it into a helper "
+            "function and 'defer helper();'");
+        return;
+    case NODE_SPAWN:
+        checker_error(c, s->loc.line,
+            "cannot use 'spawn' inside a defer body — move it into a helper "
+            "function and 'defer helper();'");
+        return;
+    case NODE_LABEL:
+        /* `goto` is already banned inside a defer body, so a label there can
+         * never be reached — it is dead syntax that the emitter cannot place. */
+        checker_error(c, s->loc.line,
+            "cannot declare a label inside a defer body — 'goto' is banned "
+            "there, so the label is unreachable");
+        return;
+    /* Recurse into the bodies the defer emitter DOES support. */
+    case NODE_BLOCK:
+        for (int i = 0; i < s->block.stmt_count; i++)
+            defer_body_reject_unemittable(c, s->block.stmts[i]);
+        return;
+    case NODE_IF:
+        defer_body_reject_unemittable(c, s->if_stmt.then_body);
+        defer_body_reject_unemittable(c, s->if_stmt.else_body);
+        return;
+    case NODE_FOR:
+        defer_body_reject_unemittable(c, s->for_stmt.init);
+        defer_body_reject_unemittable(c, s->for_stmt.body);
+        return;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        defer_body_reject_unemittable(c, s->while_stmt.body);
+        return;
+    /* Emittable leaves, and kinds already rejected by other defer rules
+     * (return/break/continue/goto/nested defer/yield/await) or impossible in a
+     * function body (declarations) / never a statement (expressions). */
+    case NODE_EXPR_STMT: case NODE_VAR_DECL: case NODE_RETURN:
+    case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_DEFER: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -15695,6 +15931,17 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* BUG-914: the same address laundered through a CALL —
+             * `return idfn(@ptrtoint(&local));`. The direct spelling above and
+             * the indirect `usize a = @ptrtoint(&x); return a;` (caught by
+             * is_local_derived) were both covered; the call form was not. */
+            if (node->ret.expr->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, node->ret.expr)) {
+                checker_error(c, node->loc.line,
+                    "cannot return result of call given @ptrtoint of a local — "
+                    "the address dangles after the function returns");
+            }
+
             /* scope escape: return local array as slice → dangling pointer
              * BUG-237: walk field/index chains to catch s.arr, s.inner.arr etc. */
             /* #8: the return target is slice-like if a slice OR an optional-of-slice
@@ -16266,6 +16513,14 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "'defer' cannot be nested inside another 'defer' body");
         }
+        /* BUG-913: reject the statement kinds the defer-body emitter cannot
+         * express, BEFORE they reach it. Same criterion and same shape as the
+         * `orelse`-in-a-defer ban above (Ban framework #2, emission
+         * impossibility) — that one was closed and its siblings were not,
+         * because the emitter's loud `default:` was exempted from the
+         * walker-default audit. Measured: 0 occurrences across 2215 corpus
+         * files, and the restructure is one line (`defer helper();`). */
+        defer_body_reject_unemittable(c, node->defer.body);
         check_body_effects(c, node->defer.body, node->loc.line,
             true, "cannot yield inside defer block — corrupts coroutine state machine",
             false, NULL,

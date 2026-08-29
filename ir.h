@@ -133,6 +133,28 @@ typedef enum {
     IR_SLICE_READ,       /* dest = src[start..end] */
     IR_STRUCT_INIT_DECOMP, /* dest = { .field = val, ... } */
 
+    /* --- Safety wrapper --- */
+    /* IR_ENUM_GUARD: trap unless local `src1_local` holds a DECLARED variant of
+     * `cast_type`. Emitted before an EXHAUSTIVE enum switch (one with no
+     * `default` arm), whose dispatch ELIDES the last arm's comparison and so
+     * silently classifies any non-variant value as that last variant.
+     *
+     * The elision's correctness PRECONDITION — "the value is one of the
+     * variants" — was assumed and never checked, and it does not hold for a
+     * value that entered from outside the enum's own algebra:
+     *   - a load through a reinterpreted pointer
+     *     (`@inttoptr(*State, addr)` — the documented MMIO enum-register read —
+     *      or `@pun(*State, p)` / `@ptrcast(*State, p)`, and the same through a
+     *      struct field), or
+     *   - plain AUTO-ZERO of an enum whose variants do not include 0
+     *     (`enum E { a = 5, b = 6 } E x;` — no cast anywhere).
+     * Both compiled clean, trapped nothing, and took the last arm.
+     *
+     * This is the USE SITE, which is where ZER's coverage claim says a wrong
+     * use must be caught, and it is ONE site rather than a provenance bit
+     * threaded to every load. */
+    IR_ENUM_GUARD,
+
     /* --- No-op (for IR structure) --- */
     IR_NOP,              /* placeholder — no code emitted */
 } IROpKind;

@@ -1,0 +1,24 @@
+// BUG-914 over-rejection boundary. The new rule keys on an ADDRESS-VALUED
+// integer argument (`@ptrtoint`, or a Symbol that became local-derived through
+// it), NOT on "a pointer-width result of a call with any local-derived arg" —
+// that wider rule would reject `len_of(local_slice)`, which is safe and common.
+usize g_len = 0;
+usize g_addr = 0;
+u32 gv = 7;
+
+usize len_of([*]u8 s) { return s.len; }
+usize idfn(usize x) { return x; }
+u32 scalar_of(u32 x) { return x; }
+
+u32 main() {
+    u8[8] buf;
+    [*]u8 sl = buf;
+    g_len = len_of(sl);                 // local buffer, but no address escapes
+    u32 local = 5;
+    u32 t = scalar_of(local);           // scalar result — nothing to dangle
+    if (t != 5) { return 1; }
+    g_addr = idfn(@ptrtoint(&gv));      // GLOBAL address — outlives the frame
+    if (g_len != 8) { return 2; }
+    if (g_addr == 0) { return 3; }
+    return 0;
+}

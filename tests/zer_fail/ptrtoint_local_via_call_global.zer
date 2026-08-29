@@ -1,0 +1,12 @@
+// expect-error: cannot store result of call given @ptrtoint of a local
+// BUG-914: every other spelling of this launder is rejected —
+//   g = @ptrtoint(&l);  g = a + 0;  g.f = a;  arr[0] = a;  g = m() orelse a
+// only the CALL form escaped, because the call-result escape sink is gated on
+// `type_carries_data_pointer(result)` and `usize` is a scalar.
+usize g = 0;
+usize idfn(usize x) { return x; }
+u32 main() {
+    u32 local = 5;
+    g = idfn(@ptrtoint(&local));
+    return 0;
+}

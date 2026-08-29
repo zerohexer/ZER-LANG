@@ -1,0 +1,41 @@
+// BUG-915 over-rejection boundary. The guard runs before EVERY exhaustive
+// enum switch (one with no `default` arm) — so these four shapes must all
+// still pass it. The guard is a compare against the declared variants; the
+// branch is always not-taken here, which is what makes it affordable.
+enum Dir { north, south, east, west }
+enum Sparse { lo = 10, mid = 20, hi = 30 }
+
+u32 pick(Dir d) {
+    switch (d) {
+        .north => { return 1; }
+        .south => { return 2; }
+        .east  => { return 3; }
+        .west  => { return 4; }
+    }
+}
+
+u32 sparse_pick(Sparse s) {
+    switch (s) {
+        .lo  => { return 10; }
+        .mid => { return 20; }
+        .hi  => { return 30; }
+    }
+}
+
+u32 main() {
+    // 1. plain variant, auto-zero IS variant 0
+    Dir d;
+    if (pick(d) != 1) { return 1; }
+    // 2. explicit variant
+    if (pick(Dir.west) != 4) { return 2; }
+    // 3. an enum with NO zero variant, explicitly initialised — legal, and the
+    //    guard must not fire (only the auto-zeroed form is a non-variant)
+    Sparse s = Sparse.mid;
+    if (sparse_pick(s) != 20) { return 3; }
+    // 4. a switch WITH a default arm is not elided and needs no guard
+    Sparse t = Sparse.hi;
+    switch (t) {
+        .lo => { return 4; }
+        default => { return 0; }
+    }
+}

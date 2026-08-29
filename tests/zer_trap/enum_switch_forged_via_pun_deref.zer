@@ -1,0 +1,17 @@
+// expect-trap
+// BUG-915, second route: a LOAD through a reinterpreted pointer. The three
+// value-producing doors (@bitcast/@truncate/@saturate) were guarded; the deref
+// of a punned enum pointer was not.
+enum State { idle, running }
+
+u32 main() {
+    volatile u32 v = 99;
+    u32 raw = v;
+    *u32 p = &raw;
+    *State sp = @pun(*State, p);
+    State s = *sp;
+    switch (s) {
+        .idle => { return 0; }
+        .running => { return 1; }
+    }
+}

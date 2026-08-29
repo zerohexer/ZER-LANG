@@ -5,6 +5,41 @@ Entries removed once fixed.
 
 ---
 
+# HANDOFF — read this first (updated 2026-08-29)
+
+**This session audited from the GATES, not from the code, and the headline finding is a
+GATE DEFECT.** `tools/walker_default_audit.sh` exempted any `default:` clause whose next
+lines contained `_zer_trap` or the literal string **`AUDIT-LOUD`**. Three shipped bugs were
+sitting behind that exemption (BUG-913/914/915 — see BUGS-FIXED.md 2026-08-29). Both
+markers are removed; a default is now exempt only when the COMPILER reports the gap, or
+when it is listed in the new `tools/walker_default_baseline.txt` with a reason.
+
+The two lessons, both already stated in CLAUDE.md and both re-learned the hard way here:
+
+* **A gate whose membership is decided by PROSE is not a gate.** `AUDIT-LOUD` was a comment
+  string. Writing it silenced the audit over a `default: return false` in
+  `expr_touches_local_derived` — a SAFETY question — whose own comment said "false negative
+  here = safety hole". CLAUDE.md records the identical defect for `audit_walker_fields.sh`
+  (membership from prose, baseline 758 -> 684). It was live in a second gate the whole time.
+* **A `_zer_trap` in the EMITTED C is not a substitute for a build-time error.** It is the
+  bug reaching the user, with a "compiler bug" label attached. `emit_defer_stmt` hid SEVEN
+  unhandled statement kinds behind one, each of which compiled with `zerc` exit 0.
+
+## Open, and worth taking next
+
+1. **`emit_defer_stmt` is the last raw-AST STATEMENT emitter** — see the entry below. It is
+   why a defer body needs auto-guards, shared locks and now a statement whitelist all
+   re-implemented separately from the IR path. Lowering defer bodies through the IR at each
+   fire point is the durable fix and is subsystem-scale.
+2. **`emitter.c:emit_rewritten_node`'s `default:`** is the one row in the new
+   `walker_default_baseline.txt`. Converting it to an exhaustive switch would make
+   `tools/walker_audit.sh` (which DIFFERENCES emit_expr's case list against it) permanently
+   empty — a gate that can only print OK. The two have to be retired or re-based together.
+3. Everything already listed under `## OPEN` below still stands, minus the ISR-RMW row,
+   which was re-measured and does not reproduce.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
@@ -1176,6 +1211,63 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+
+## OPEN — `emit_defer_stmt` is the last raw-AST STATEMENT emitter (ARCHITECTURAL, 2026-08-29)
+
+**Symptom class, not a single bug.** Function bodies are IR-only — that migration exists
+precisely so a safety decision is made ONCE, on the flat CFG, instead of at N AST sites.
+A `defer` BODY is the one exception: it is stored as AST and emitted by a hand-written
+statement walker, `emit_defer_stmt` (emitter.c). Everything the IR path gives for free has
+to be re-implemented there, and the history shows it being re-implemented one hole at a
+time:
+
+| what the IR path does automatically | what the defer body needed |
+|---|---|
+| bounds auto-guards | §C #16 — re-emitted by hand, in TRAP mode |
+| shared-struct lock/unlock | Axis B5 + §E #28 — re-emitted by hand, per statement position |
+| statement lowering for every kind | BUG-913 — SEVEN kinds were simply missing |
+| `orelse` branch lowering | banned outright (cannot be expressed) |
+
+BUG-913 closed the immediate hole (two kinds implemented, five rejected at the checker, the
+walker made exhaustive so `-Werror=switch` catches the next one). It did not remove the
+duplication.
+
+**The durable fix: lower the defer body through `lower_stmt` at each fire point**, so
+`emit_defer_stmt` disappears and defer bodies get bounds guards, locks and every statement
+form from the single IR path. Scope, measured against the current code:
+
+- `ir_lower.c` — `IR_DEFER_FIRE` carries a snapshot of AST bodies (`defer_fire_bodies`) plus
+  per-defer armed flags and a both-reachable-label guard flag; lowering inline means those
+  become real branches, and the snapshot mechanism is replaced by lowered blocks.
+- `zercheck_ir.c` — Phase C3 scans `IR_DEFER_PUSH.defer_body` AST for frees and re-applies
+  them at every return block in LIFO order, with `ir_defer_instance_id` keying the
+  double-free discriminator. Inline lowering makes those frees ordinary forward-pass
+  instructions, which is BETTER, but the LIFO ordering and the instance-id contract have to
+  be re-derived rather than deleted.
+- Locals declared in a defer body would be created once per fire point; `ir_add_local`'s
+  same-name suffixing already handles that.
+
+**Do NOT start this as a side effect of another fix.** It touches the three files that own
+defer semantics and the failure mode is a silently dropped or double-fired cleanup — the
+exact class `tests/test_defer_goto_matrix.c` exists to catch, and that matrix measures a
+BALANCE, which is invariant to an extra fire that also acquires (recorded in CLAUDE.md).
+Any attempt needs the fire-COUNT sub-grid, not just the balance cells.
+
+## OPEN — `walker_audit.sh` and `emit_rewritten_node`'s `default:` are coupled (LOW, tooling)
+
+`tools/walker_default_audit.sh` now carries exactly one baseline row:
+`emitter.c:emit_rewritten_node`. Converting that walker to an exhaustive switch is the
+right end-state — `-Werror=switch` beats any script — but it cannot be done alone:
+`tools/walker_audit.sh` gates the IR emitter by DIFFERENCING `emit_expr`'s case list
+against `emit_rewritten_node`'s, so listing every NodeKind in the latter makes that
+difference permanently empty. A gate that can only ever print OK is the false-confidence
+failure this repo treats as worse than no gate.
+
+Both moves together: make `emit_rewritten_node` exhaustive, then retire `walker_audit.sh`
+(subsumed by the compiler) or re-base it on a question `-Wswitch` cannot answer.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a
@@ -1402,12 +1494,22 @@ architecture). The enabling step is `&n` on a local that holds a tracked allocat
    argument-precise barrier principle and widen `n` to MAYBE_FREED on any free through an
    unresolved deref. Touches the CFG fixpoint; measure over-rejection first.
 
-### MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter
+### ~~MEDIUM silent bare-metal — non-atomic RMW in an ISR laundered through a pointer parameter~~ — **CLOSED, measured 2026-08-29**
 
-Sibling of BUG-774: the ISR compound-RMW check is intra-body, so `interrupt { rmw(&g); }`
-with `void rmw(*u32 p) { p[0] += 1; }` is unchecked. The transitive machinery from BUG-774
-(`record_isr_globals` following calls) exists; what is missing is propagating the
-*compound-assign* fact through a pointer PARAM rather than a global name.
+**Does NOT reproduce.** Three shapes probed, all rejected with the RMW diagnostic itself
+(*"volatile global 'g' is read-modify-written in a single statement and is shared between
+interrupt and main code"*), matching the direct control exactly:
+
+| shape | verdict |
+|---|---|
+| `interrupt { g = g + 1; }` — direct control | rejected |
+| `interrupt { rmw(&g); }`, `void rmw(volatile *u32 p) { *p = *p + 1; }` | rejected |
+| same with a struct field, `void rmw(volatile *C p) { p.v += 1; }` | rejected |
+
+**PROBE WARNING that cost the first pass a wrong answer:** the hazard needs `main` to touch
+`g` as well. With `main` returning a constant there is no interrupt/main sharing, so
+acceptance is CORRECT, not a hole — the first probe read that as "still live". The entry
+above is superseded; the transitive machinery it says is missing is present.
 
 ### MEDIUM (POLICY, not a bug) — `&packed_field` forms a misaligned `*T`
 

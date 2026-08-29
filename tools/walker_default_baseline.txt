@@ -1,0 +1,39 @@
+# Justified `default:` clauses in node-kind / op-kind switches.
+#
+# Format: one `file:function` row per justified default. Anything NOT listed
+# here fails `tools/walker_default_audit.sh`. Adding a row is a conscious
+# decision that must carry a reason directly above it.
+#
+# WHY THIS FILE EXISTS (2026-08-29, BUG-913/914). The audit used to exempt any
+# default whose following lines contained the literal string `AUDIT-LOUD` or a
+# `_zer_trap` call. Both exemptions were wrong and both cost a shipped bug:
+#
+#   * `AUDIT-LOUD` is a COMMENT. Writing "AUDIT-LOUD exempt" in a comment
+#     silenced the gate over `expr_touches_local_derived`, whose default
+#     answered a SAFETY question with a silent `return false` — and whose own
+#     comment said "false negative here = safety hole". A stack address
+#     laundered through a call escaped to a global unflagged (BUG-914).
+#
+#   * `_zer_trap` is a trap in the EMITTED C — a runtime failure in a binary
+#     the compiler ACCEPTED (exit 0), not a compile-time gate. It hid SEVEN
+#     missing statement kinds in `emit_defer_stmt`, each of which compiled
+#     clean and shipped an internal-compiler-bug trap to the user (BUG-913).
+#
+# The rule now: a default is exempt only when the COMPILER reports the gap
+# (`checker_error` / `abort()` / `assert(0)` / `__builtin_unreachable`), or
+# when it is listed here with a reason.
+
+# emit_rewritten_node is the IR-path EXPRESSION emitter. Its default covers the
+# statement and declaration kinds the parser cannot place in an expression
+# position, and it is loud twice over (a stderr "compiler bug" line at compile
+# time plus a trap in the emitted C).
+#
+# It is NOT converted to an exhaustive switch, for a measured reason:
+# `tools/walker_audit.sh` gates the IR emitter by DIFFERENCING emit_expr's case
+# list against this function's. Listing every NodeKind here would make that
+# difference permanently empty — a gate that can only ever print OK, which is
+# the false-confidence failure this repo treats as worse than no gate at all.
+# Converting it therefore has to happen together with retiring or re-basing
+# walker_audit.sh, and that is tracked in docs/limitations.md rather than done
+# as a side effect of tightening this one.
+emitter.c:emit_rewritten_node

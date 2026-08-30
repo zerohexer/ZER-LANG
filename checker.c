@@ -2206,12 +2206,23 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
         /* skip positions the callee provably never returns (no result-launder there) */
         bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
         if (!may_return_i) continue;
-        Node *arg = call->call.args[i];
-        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
-            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
-        /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
+        /* BUG-919: use the SHARED peeler, like the DETECTING sibling
+         * (call_has_nonkeep_derived_arg) already does. The hand-rolled loop this
+         * replaces knew nothing about the C-style cast, so
+         *
+         *     void stash(*u32 p) { g_p = idfn(p);          }  // infers keep -> caller rejected
+         *     void stash(*u32 p) { g_p = idfn((*u32)p);    }  // inferred NOTHING
+         *
+         * and `stash(&loc)` then compiled: ASan-confirmed stack-use-after-return.
+         * Detection and INFERENCE are two halves of one rule, and only the
+         * detection half had been taught. The loop was also a naive LAST-argument
+         * peel, so `@container` / `@cstr` reached the field name instead of the
+         * pointer — the mis-peel unwrap_ptr_launder exists to prevent.
+         *
+         * BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
          * descent — without it, `g = idfn(np[0..16])` records the launder but
          * skips keep inference (no propagation to np's root param). */
+        Node *arg = unwrap_ptr_launder(call->call.args[i]);
         while (arg && (arg->kind == NODE_SLICE ||
                        arg->kind == NODE_INDEX ||
                        arg->kind == NODE_FIELD)) {
@@ -14328,15 +14339,20 @@ static void check_stmt(Checker *c, Node *node) {
                 /* alias propagation for provenance + @container
                  * BUG-358: walk through @bitcast/@cast/NODE_TYPECAST to find root ident */
                 {
+                    /* BUG-919 (debt, not a measured hole): the shared peeler, so
+                     * this site cannot drift from the escape sinks. The
+                     * hand-rolled loop took the LAST argument of every intrinsic,
+                     * which for `@container(*T, ptr, field)` is the FIELD NAME —
+                     * so a local that happened to share the field's name had ITS
+                     * provenance copied onto the result. That direction produces a
+                     * spurious error rather than a hole, which is why it was not
+                     * urgent; it is still a wrong answer from a peel that has one
+                     * correct definition. The shared helper also stops peeling a
+                     * VALUE cast, which is right here: pointer provenance does not
+                     * survive `(u32)x`. */
                     Node *prov_root = init;
                     if (init->kind == NODE_ORELSE) prov_root = init->orelse.expr;
-                    while (prov_root) {
-                        if (prov_root->kind == NODE_INTRINSIC && prov_root->intrinsic.arg_count > 0)
-                            prov_root = prov_root->intrinsic.args[prov_root->intrinsic.arg_count - 1];
-                        else if (prov_root->kind == NODE_TYPECAST)
-                            prov_root = prov_root->typecast.expr;
-                        else break;
-                    }
+                    prov_root = unwrap_ptr_launder(prov_root);
                     if (prov_root && prov_root->kind == NODE_IDENT) {
                         Symbol *src = scope_lookup(c->current_scope,
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);

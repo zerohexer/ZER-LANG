@@ -1,0 +1,23 @@
+// BUG-919 BOUNDARY. Inferring keep through the cast must not reject a GLOBAL
+// argument — a global outlives every frame, which is the whole point of the
+// keep rule — and must not taint a SCALAR call result, which copies a value
+// rather than a reference.
+?*u32 g_p;
+u32 gv = 41;
+u32 gi;
+
+*u32 idfn(*u32 p)  { return p; }
+u32  cnt(*u32 p)   { return *p; }
+
+void stash(*u32 p) { g_p = idfn((*u32)p); }
+void count(*u32 p) { gi  = cnt((*u32)p); }
+
+u32 main() {
+    stash(&gv);                 // global — long-lived, accepted
+    u32 loc = 5;
+    count(&loc);                // scalar result — no reference escapes
+    *u32 r = g_p orelse { return 1; };
+    if (*r != 41) { return 2; }
+    if (gi != 5)  { return 3; }
+    return 0;
+}

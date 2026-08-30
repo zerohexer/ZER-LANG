@@ -5,11 +5,13 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-30 — BUG-914..918: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, and a comptime that could not narrow
+## Session 2026-08-30 — BUG-914..919: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, and a comptime that could not narrow
 
-A standalone audit (no branch to harvest). Five findings; three of the first four are
-silent by construction — the program compiles, runs, and gives a wrong answer or reads freed memory
-with no diagnostic at either compile time or run time.
+A standalone audit (no branch to harvest). Six findings. Four are ACCEPT-UNSAFE or a
+silent wrong value: the program compiles, runs, and reads freed memory or answers wrongly
+with no diagnostic at compile time OR run time. Two of the four (BUG-914, BUG-919) are the
+same shape one layer apart, and the second was found by ENUMERATING after the first —
+which is the only reason it was found at all.
 
 ### BUG-914 — a C-style cast laundered a HEAP pointer past ownership tracking (ACCEPT-UNSAFE)
 
@@ -115,6 +117,45 @@ backstop. `@enum_forged` is synthesized only by IR lowering (the checker rejects
 spelling as an unknown intrinsic) and is handled in BOTH emitter dispatch paths.
 Tests: `tests/zer_trap/enum_switch_forged_via_ptrcast.zer`,
 `tests/zer/enum_switch_exhaustive_ok.zer` (every variant, multi-value arms, captures).
+
+### BUG-919 — keep INFERENCE and keep DETECTION had drifted (ACCEPT-UNSAFE)
+
+Found by enumerating the hand-rolled peel sites BUG-914 exposed, not by report.
+
+```zer
+?*u32 g_p;
+*u32 idfn(*u32 p) { return p; }
+
+void stash(*u32 p) { g_p = idfn(p);       }   // infers keep -> stash(&loc) REJECTED
+void stash(*u32 p) { g_p = idfn((*u32)p); }   // inferred NOTHING -> stash(&loc) ACCEPTED
+```
+
+`keep` is INFERRED in ZER, and the inference is what restricts the CALL SITE. Two
+functions implement one rule: `call_has_nonkeep_derived_arg` DETECTS the launder and
+`infer_keep_from_call_args` MARKS the parameter. The detecting half peels with the shared
+`unwrap_ptr_launder`; the inferring half still hand-rolled a naive last-argument loop.
+So the launder was detected and then not acted on, and the caller was free to pass
+`&local`. **ASan-confirmed stack-use-after-return**, read through the global after the
+frame that owned the local had returned.
+
+The naive loop was wrong in a second way as well: it took the LAST argument of EVERY
+intrinsic, so `@container(*T, ptr, field)` peeled to the FIELD NAME and `@cstr(buf, str)`
+to the string literal — the exact mis-peel `unwrap_ptr_launder` was written to prevent.
+Both are gone with the one-line switch to the shared helper.
+
+Boundaries verified, because this is a TIGHTENING and a tightening's cost is
+over-rejection: a GLOBAL argument through the same shape still compiles (a global outlives
+every frame, which is the point of the rule), and a SCALAR call result is still untainted
+(it copies a value, not a reference). Both are `compile` cells.
+
+Also folded in as debt, with no measured hole: the var-decl PROVENANCE peel now calls the
+shared helper too. Its last-argument loop copied the provenance of any local that happened
+to share a `@container` field's name onto the result — a spurious error rather than a hole,
+which is why it was not urgent, but it is still a wrong answer from a peel that has one
+correct definition.
+
+Gate: two more `p19` cells (matrix 99 -> 103), RED on the pre-fix build. Tests:
+`tests/zer_fail/cast_launder_keep_inference.zer`, `tests/zer/cast_launder_keep_global_ok.zer`.
 
 ### BUG-918 — `comptime` could not narrow (a RELAXATION)
 

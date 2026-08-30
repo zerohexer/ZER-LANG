@@ -8,8 +8,8 @@ Entries removed once fixed.
 # HANDOFF — read this first (updated 2026-08-30)
 
 **2026-08-30 standalone audit — BUG-914..918 landed; four decisions recorded below so
-they are not re-litigated.** `make check` exit 0, **1410 .zer**, all nine gates, sink
-matrix **99 cells / 0 mismatch** (was 88). See BUGS-FIXED.md for the fixes; this section
+they are not re-litigated.** `make check` exit 0, **1412 .zer**, all nine gates, sink
+matrix **103 cells / 0 mismatch** (was 88). See BUGS-FIXED.md for the fixes; this section
 is only the things measured and NOT changed, plus the one gate/gap left open.
 
 ## DECIDED 2026-08-30 — do not re-open

@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-919. `keep` is INFERRED, and inference and DETECTION are two halves of one
+// rule that had drifted: call_has_nonkeep_derived_arg (detection) peels with the
+// shared unwrap_ptr_launder, while infer_keep_from_call_args (inference) still
+// hand-rolled a naive last-argument loop. So
+//
+//     void stash(*u32 p) { g_p = idfn(p);       }   // infers keep -> caller rejected
+//     void stash(*u32 p) { g_p = idfn((*u32)p); }   // inferred NOTHING
+//
+// and `stash(&loc)` compiled. MEASURED with ASan: stack-use-after-return, read
+// through the global after the frame that owned the local had returned. The
+// naive loop also took the LAST argument of every intrinsic, so @container /
+// @cstr reached the field name instead of the pointer.
+?*u32 g_p;
+
+*u32 idfn(*u32 p) { return p; }
+
+void stash(*u32 p) { g_p = idfn((*u32)p); }
+
+u32 main() {
+    u32 loc = 5;
+    stash(&loc);
+    return 0;
+}

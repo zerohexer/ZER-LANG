@@ -34,82 +34,78 @@
 # Frozen 2026-08-24 at 86 rows, measured against a shared prelude that already
 # supplies the doc's standing cast (Task / Point / Sensor / SensorData /
 # ListHead / Command / heap / pool) plus a catch-all mmio range.
-de87cd773e12d8d9  reference.md:42
-dfa8ccb992bdfc47  reference.md:93
-cbf973809ab90199  reference.md:158
-dd5fdde401db71ce  reference.md:210
-a6ebf1e6f152d059  reference.md:221
-fada445f41559b48  reference.md:251
-6ef265d9e0172d35  reference.md:308
-652a795e1b0c8729  reference.md:314
-a88161d6ee26cd71  reference.md:347
-c50576dbc5c2a59b  reference.md:388
-44069030d6a04a51  reference.md:415
-c06cc35ad5af93f6  reference.md:447
-7eb20e4b46c67ca2  reference.md:457
-c48ac2be266d6950  reference.md:544
-f4ef00cd72e06770  reference.md:578
-92c5fd99fd346712  reference.md:682
-cef8a0991afd00d4  reference.md:691
-558cd267303bf777  reference.md:709
-24b431e06f2590db  reference.md:753
-6478d5bd3562fdc5  reference.md:805
-dfaf2a0615cbe6bc  reference.md:833
-677840937f6c448f  reference.md:852
-157f503d18ac369a  reference.md:866
-8d21605548eaef59  reference.md:884
-5a4d68b5356493c6  reference.md:904
-2c6ba96c2b1361c6  reference.md:994
-594b613eae238b12  reference.md:999
-c42c34dc7b640555  reference.md:1030
-b00320093cfba975  reference.md:1085
-d54d5d28f9372705  reference.md:1117
-f6aacb1c7407ada0  reference.md:1129
-122efc1c95771253  reference.md:1158
-47f803c951ed58ab  reference.md:1240
-5e14fe2966596dc4  reference.md:1293
-72ee3e99afd59bec  reference.md:1310
-84297a2431669274  reference.md:1350
-bec093813c5f183d  reference.md:1355
-e41d7631cbfce5eb  reference.md:1378
-aa63b3222878de43  reference.md:1406
-b06fafd5daf9214b  reference.md:1472
-919bf4b635112a98  reference.md:1495
-bd7964125ba9ebee  reference.md:1534
-75de8470de7afd97  reference.md:1544
-de40d7f59a7c8237  reference.md:1619
-5ac99eba618f81de  reference.md:1656
-9c4588b653af2e44  reference.md:1683
-7a2aefd18fc7c978  reference.md:1696
-1cb844da08207d37  reference.md:1747
-8955b4e9d9ec07f0  reference.md:1792
-4c612956832afce6  reference.md:1833
-0d6e3127d44a32be  reference.md:1872
-de3e938dd8ebb874  reference.md:1912
-d361ea32e78aa5e3  reference.md:1926
-b28c0b01d6f2c572  reference.md:1962
-1512197f44d5f5f9  reference.md:2636
-d38a3e67e4ff9cd0  reference.md:2660
-a75a37b298d178ea  reference.md:2675
-aa8de80acb528ee5  reference.md:2688
-f9764f4cb5d9f483  reference.md:2724
-04fa5dbc461502aa  reference.md:2815
-cf1f45799e6f465a  reference.md:2857
-9077b704b75e0c84  reference.md:2872
-dcd613ebaca835de  reference.md:2894
-197eeeb88fb3a812  reference.md:3096
-a5fa354db7afd8d8  reference.md:3106
-a2d212648a84bea1  reference.md:3116
-3674a4d42fd5a947  reference.md:3134
-6c6f217dfa4c2874  reference.md:3147
-3c4361ded12b0d87  reference.md:3180
-8593d17a2cd3b65f  reference.md:3226
-234f52e2805d4d61  reference.md:3277
-af4c920a8953b104  reference.md:3316
-394fdfac3247114c  reference.md:3363
-e246a3334d5820c5  reference.md:3447
-d54d84941e077f48  reference.md:3465
-01adc7b7eff191c4  reference.md:3552
-22e9fa9c766877a3  reference.md:3578
-95f5145d30a07c57  reference.md:3602
-fdba85d6406e565e  reference.md:3618
+
+# 2026-08-30 (second pass): 79 -> 45. Two different things happened and they are
+# worth keeping apart.
+#
+# FIVE rows were never the doc's fault. make_prelude suppressed its own
+# `struct Task` when a block declared one, then emitted `Slab(Task) heap;` /
+# `Pool(Task, 8) pool;` ABOVE the block anyway — so five examples failed with
+# "undefined type 'Task'" pointing at a PRELUDE line. The harness was
+# manufacturing its own failures, which is the false-confidence shape this repo
+# gates against everywhere else, one level up. Fixed by making the Task-dependent
+# prelude entries conditional on the prelude actually owning Task.
+#
+# THIRTY-FOUR blocks were converted into self-contained programs: the missing
+# declaration added, or the block reshaped around a `main()` where a stub helper
+# was needed. Priority went to EXAMPLE and SYNOPSIS blocks, because those are the
+# ones a reader actually pastes; a SYNTAX skeleton showing `while (cond) { }` is a
+# legitimate fragment and several remain so deliberately.
+#
+# Three of the conversions also removed a now-stale `<!-- audit: fragment -->`.
+# That directive FORCES wrapping in main(), so once a block grows a top-level
+# declaration the directive turns a working example into a failing one. If you
+# make a fragment self-contained, delete its directive in the same edit.
+#
+# One conversion found a real DOC ERROR rather than a missing name: the
+# documented `struct Task` had `[*]u8 name` and the example assigned a string
+# literal to it, which the compiler correctly rejects (a literal is .rodata; a
+# mutable slice would hand out a writable view of it). The field is now
+# `const [*]u8` and the rule is written into the NOTES. That is the audit doing
+# its actual job — the doc asserted something the compiler does not allow.
+
+cbf973809ab90199  reference.md:179
+dd5fdde401db71ce  reference.md:231
+a6ebf1e6f152d059  reference.md:242
+92c5fd99fd346712  reference.md:855
+cef8a0991afd00d4  reference.md:865
+dfaf2a0615cbe6bc  reference.md:1106
+677840937f6c448f  reference.md:1126
+157f503d18ac369a  reference.md:1140
+8d21605548eaef59  reference.md:1159
+5a4d68b5356493c6  reference.md:1180
+2c6ba96c2b1361c6  reference.md:1270
+c42c34dc7b640555  reference.md:1315
+b00320093cfba975  reference.md:1370
+d54d5d28f9372705  reference.md:1402
+84297a2431669274  reference.md:1655
+45fc7ece2927363b  reference.md:1860
+75de8470de7afd97  reference.md:1878
+de40d7f59a7c8237  reference.md:1982
+8955b4e9d9ec07f0  reference.md:2166
+0c01215bfc7a0df8  reference.md:2343
+b28c0b01d6f2c572  reference.md:2401
+1512197f44d5f5f9  reference.md:3089
+d38a3e67e4ff9cd0  reference.md:3141
+a75a37b298d178ea  reference.md:3156
+aa8de80acb528ee5  reference.md:3169
+f9764f4cb5d9f483  reference.md:3205
+04fa5dbc461502aa  reference.md:3431
+cf1f45799e6f465a  reference.md:3473
+9077b704b75e0c84  reference.md:3488
+dcd613ebaca835de  reference.md:3510
+197eeeb88fb3a812  reference.md:3743
+a5fa354db7afd8d8  reference.md:3754
+b5dcbd79b4b22af0  reference.md:3764
+3674a4d42fd5a947  reference.md:3783
+6c6f217dfa4c2874  reference.md:3796
+3c4361ded12b0d87  reference.md:3829
+8593d17a2cd3b65f  reference.md:3875
+234f52e2805d4d61  reference.md:3938
+af4c920a8953b104  reference.md:3986
+394fdfac3247114c  reference.md:4045
+e246a3334d5820c5  reference.md:4338
+d54d84941e077f48  reference.md:4356
+01adc7b7eff191c4  reference.md:4443
+22e9fa9c766877a3  reference.md:4469
+fdba85d6406e565e  reference.md:4519

@@ -205,15 +205,40 @@ carries `// gap-runtime-exit:` so it cannot rot: while the gap is open the file 
 clean, and the day either axis is fixed the gaps runner FAILS LOUDLY telling you to
 promote it into `tests/zer_fail/`.
 
-## OPEN 2026-08-30 (LOW) — reference.md example baseline still 79
+## OPEN 2026-08-30 (LOW) — reference.md example baseline down to 45
 
-`tools/reference_example_baseline.txt` is 79 rows (was 82). Eighteen blocks were failing
-only because `is_toplevel()` reads a bare `if (...) {` at column 0 as a function
-DEFINITION (it matches "starts with a letter, contains `)`, ends with `{`"); they now carry
-an explicit `<!-- audit: fragment -->` and three of them compile as a result. The remaining
-79 reference names the surrounding prose supplies (`my_task`, `counter`, `shared_var`, …).
-Each is a block a reader cannot paste and compile. Converting one into a self-contained
-example and deleting its row is always an improvement — the baseline's own header says so.
+`tools/reference_example_baseline.txt` is 45 rows (was 79, and 82 before that). 107 of the
+202 ```zer blocks now compile standalone, 50 are skipped as deliberate non-programs, and
+45 remain baselined.
+
+What closed the 34: five were the HARNESS's own fault (`make_prelude` emitted
+`Slab(Task) heap;` above a block that declared its own `struct Task`, so the example failed
+on a PRELUDE line — fixed by making the Task-dependent prelude entries conditional), and 29
+were converted into self-contained programs. Priority went to EXAMPLE and SYNOPSIS blocks,
+since those are the ones a reader actually pastes.
+
+**What remains, and why it is not simply more of the same.** The 45 are dominated by SYNTAX
+skeletons — `while (cond) { poll(); }`, `defer statement;`, `switch (state) { .idle => … }`
+— whose job is to show a SHAPE. Making each self-contained means inventing a stub for every
+name (`poll`, `process`, `start`, `work`, `handle_a`, …) and burying two lines of syntax in
+fifteen lines of scaffolding. Two options exist and BOTH have a real cost, which is why this
+is left open rather than finished:
+
+- **Convert them anyway.** Maximum pasteability, materially worse as reference prose.
+- **Extend the audit PRELUDE with the doc's standing stub cast.** The blocks then get
+  CHECKED (today they are checked by nothing, so a stale syntax in one of them would ship),
+  at the price of a weaker audit: a prelude that supplies 25 helper names can no longer
+  catch "this example references something that does not exist."
+
+The second is probably right for SYNTAX blocks specifically — checking a syntax skeleton is
+worth more than pasting it — but it should be a deliberate decision with the stub list
+measured from the failures (names used by ≥2 blocks), not a drive-by.
+
+**Two traps for whoever continues this.** A `<!-- audit: fragment -->` directive FORCES
+wrapping in `main()`, so the moment a block grows a top-level declaration the directive
+turns a working example into a failing one — delete it in the same edit (this bit three
+times). And re-run the gate against a deliberately broken example before trusting a green
+run; the harness manufacturing its own failures is exactly what the five prelude rows were.
 
 ## OPEN 2026-08-30 (LOW) — `comptime` cannot call the bit-query intrinsics
 

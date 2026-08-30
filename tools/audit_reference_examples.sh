@@ -104,14 +104,28 @@ PRELUDE_DECLS=(
 # Emit the prelude entries this block does not define for itself. A block that
 # declares its own `struct Task` must not get a second one, and a block that
 # declares its own mmio range must not overlap the catch-all.
+#
+# `heap` and `pool` DEPEND on Task, and that dependency used to be silent: when a
+# block declared its OWN `struct Task`, the prelude correctly suppressed its
+# `struct Task` and then emitted `Slab(Task) heap;` / `Pool(Task, 8) pool;`
+# anyway — ABOVE the block, where Task does not exist yet. The block failed with
+# "undefined type 'Task'" pointing at a PRELUDE line, so five reference.md
+# examples sat in the baseline for a defect in this harness rather than anything
+# wrong with the doc. A harness that manufactures its own failures is the same
+# false-confidence shape this repo gates against everywhere else, one level up.
 make_prelude() {
-    local blk="$1" out="$2" name decl
+    local blk="$1" out="$2" name decl task_from_prelude=0
     : > "$out"
     grep -qE '^[[:space:]]*mmio[[:space:]]' "$blk" || \
         echo "mmio 0x0..0xFFFFFFFFFFFFFFFF;" >> "$out"
     for entry in "${PRELUDE_DECLS[@]}"; do
         name="${entry%%|*}"; decl="${entry#*|}"
         grep -qE "(struct|union|enum|container)[[:space:]]+$name\b|\b$name[[:space:]]*[;=]|\)[[:space:]]+$name[[:space:]]*;" "$blk" && continue
+        # Task-dependent entries: only sound while the prelude owns Task.
+        case "$name" in
+            heap|pool) [ "$task_from_prelude" = 1 ] || continue ;;
+            Task)      task_from_prelude=1 ;;
+        esac
         echo "$decl" >> "$out"
     done
 }

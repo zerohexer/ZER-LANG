@@ -39,6 +39,7 @@ Auto-zeroed on declaration. Overflow wraps (defined behavior).
 
 **SYNTAX**
 ```zer
+i32 big_value = 300;
 i32 x = -42;
 i8 small = @truncate(i8, big_value);
 ```
@@ -107,6 +108,9 @@ Pointer-width unsigned integer. Auto-detected from GCC at compile time
 
 **SYNTAX**
 ```zer
+u8[4] buf;
+[*]u8 data = buf;
+*u8 ptr = &buf[0];
 usize len = data.len;
 usize addr = @ptrtoint(ptr);
 ```
@@ -292,8 +296,11 @@ void process([*]u32 data) {
     }
 }
 
-u32[8] arr;
-process(arr);              // auto-coerces: T[N] → [*]T
+u32 main() {
+    u32[8] arr;
+    process(arr);          // auto-coerces: T[N] → [*]T
+    return 0;
+}
 ```
 
 **FIELDS**
@@ -343,6 +350,7 @@ Auto-derefs for field access: `ptr.field` works (no `->` needed).
 
 **SYNTAX**
 ```zer
+Task my_task;
 *Task t = &my_task;
 t.priority = 5;            // auto-deref, like ptr->priority in C
 ```
@@ -382,8 +390,13 @@ Zero overhead — represented as a plain C pointer where NULL = none.
 
 **SYNTAX**
 ```zer
-?*Task maybe = null;
-?*Task found = find_task(id);
+?*Task find_task(u32 id) { return null; }   // none found
+
+u32 main() {
+    ?*Task maybe = null;
+    ?*Task found = find_task(7);
+    return 0;
+}
 ```
 
 **EXAMPLE**
@@ -428,7 +441,10 @@ Must unwrap before use.
     return a / b;
 }
 
-u32 result = safe_divide(10, 3) orelse 0;  // default to 0
+u32 main() {
+    u32 result = safe_divide(10, 3) orelse 0;  // default to 0
+    return 0;
+}
 ```
 
 **NOTES**
@@ -457,6 +473,7 @@ rejects casting out to a different type.
 
 **SYNTAX**
 ```zer
+Task my_task;
 *opaque raw = @ptrcast(*opaque, &my_task);
 ```
 
@@ -491,7 +508,7 @@ All fields auto-zeroed.
 ```zer
 struct Task {
     u32 id;
-    [*]u8 name;
+    const [*]u8 name;          // const: a string literal lives in .rodata
     u32 priority;
     ?*Task next;
 }
@@ -499,16 +516,29 @@ struct Task {
 
 **EXAMPLE**
 ```zer
-Task t;                    // no 'struct' prefix (unlike C)
-t.id = 42;
-t.name = "worker";
-t.priority = 3;
-t.next = null;
+struct Task {
+    u32 id;
+    const [*]u8 name;
+    u32 priority;
+    ?*Task next;
+}
+
+u32 main() {
+    Task t;                    // no 'struct' prefix (unlike C)
+    t.id = 42;
+    t.name = "worker";
+    t.priority = 3;
+    t.next = null;
+    return 0;
+}
 ```
 
 **NOTES**
 - No semicolon after closing `}` (unlike C).
 - Pool/Slab/Ring/Arena cannot be struct fields.
+- A field that will hold a STRING LITERAL must be `const [*]u8`. A literal lives
+  in read-only memory, so storing one in a mutable `[*]u8` is rejected — it
+  would hand out a writable view of `.rodata`.
 
 **SEE ALSO**
 packed struct, enum, union
@@ -596,16 +626,13 @@ enum State { idle, running, blocked, done }
 ```
 
 **EXAMPLE**
-<!-- audit: fragment -->
 ```zer
-State s = State.idle;      // qualified access
+enum State { idle, running, blocked, done }
 
-switch (s) {
-    .idle    => { start(); }
-    .running => { work(); }
-    .blocked => { wait(); }
-    .done    => { finish(); }
-}
+void start() { }
+void work() { }
+void wait() { }
+void finish() { }
 
 // Explicit values and gaps:
 enum ErrorCode { ok = 0, warn = 100, err, fatal }
@@ -613,6 +640,18 @@ enum ErrorCode { ok = 0, warn = 100, err, fatal }
 
 // Negative values:
 enum Direction { left = -1, center = 0, right = 1 }
+
+u32 main() {
+    State s = State.idle;      // qualified access
+
+    switch (s) {
+        .idle    => { start(); }
+        .running => { work(); }
+        .blocked => { wait(); }
+        .done    => { finish(); }
+    }
+    return 0;
+}
 ```
 
 **NOTES**
@@ -632,6 +671,10 @@ Must switch to access variant — direct field access is a compile error.
 
 **SYNTAX**
 ```zer
+struct SensorData { u32 value; }
+struct Command { u32 op; }
+struct Ack { u32 seq; }
+
 union Message {
     SensorData sensor;
     Command command;
@@ -837,9 +880,14 @@ u32 val = fn(42) orelse 0;                 // unwrap return value
 
 **EXAMPLE**
 ```zer
-?void (*callback)(u32) = null;
-callback = my_handler;
-if (callback) |cb| { cb(42); }   // safe — unwrap before calling
+void my_handler(u32 event) { }
+
+u32 main() {
+    ?void (*callback)(u32) = null;
+    callback = my_handler;
+    if (callback) |cb| { cb(42); }   // safe — unwrap before calling
+    return 0;
+}
 ```
 
 **SEE ALSO**
@@ -881,6 +929,9 @@ Fahrenheit f = @cast(Fahrenheit, c);   // COMPILE ERROR — cross-distinct
 **COMPOUND TYPES**
 Distinct typedef works with all compound types. The wrapped type's operations are preserved:
 ```zer
+struct Motor { u32 speed; }
+struct Point { u32 x; u32 y; }
+
 distinct typedef ?u32 MaybeId;       // orelse, if-unwrap, == null all work
 distinct typedef *Motor SafeMotor;   // deref (*p), field access (p.speed) work
 distinct typedef [*]u8 Text;         // indexing (t[0]), .len, sub-slice work
@@ -1011,18 +1062,28 @@ Conditional execution. Braces ALWAYS required (no braceless one-liners).
 `else if` is supported.
 
 **SYNTAX**
-<!-- audit: fragment -->
 ```zer
-if (condition) {
-    // body
-}
+void handle_a() { }
+void handle_b() { }
+void handle_neither() { }
 
-if (a) {
-    handle_a();
-} else if (b) {
-    handle_b();
-} else {
-    handle_neither();
+u32 main() {
+    bool condition = true;
+    bool a = false;
+    bool b = true;
+
+    if (condition) {
+        // body
+    }
+
+    if (a) {
+        handle_a();
+    } else if (b) {
+        handle_b();
+    } else {
+        handle_neither();
+    }
+    return 0;
 }
 ```
 
@@ -1211,6 +1272,15 @@ defer statement;
 
 **EXAMPLE**
 ```zer
+u32 lock;
+bool error;
+
+void mutex_lock(*u32 m) { }
+void mutex_unlock(*u32 m) { }
+void cs_low() { }
+void cs_high() { }
+void do_work() { }
+
 void transfer() {
     mutex_lock(&lock);
     defer mutex_unlock(&lock);     // runs last
@@ -1340,14 +1410,20 @@ if (optional) |*val| {
 ```
 
 **EXAMPLE**
-<!-- audit: fragment -->
 ```zer
-?u32 result = safe_divide(10, 3);
+?u32 safe_divide(u32 a, u32 b) { if (b == 0) { return null; } return a / b; }
+void use(u32 v) { }
+void handle_error() { }
 
-if (result) |val| {
-    use(val);              // val is u32, guaranteed non-null
-} else {
-    handle_error();
+u32 main() {
+    ?u32 result = safe_divide(10, 3);
+
+    if (result) |val| {
+        use(val);              // val is u32, guaranteed non-null
+    } else {
+        handle_error();
+    }
+    return 0;
 }
 ```
 
@@ -1371,10 +1447,14 @@ you specifically want a named pool.
 
 **SYNOPSIS**
 ```zer
-*Task  t  = alloc(Task) orelse return;      // one object      (like malloc(sizeof(Task)))
-[*]u32 xs = alloc(u32, n) orelse return;    // n objects, zeroed (like calloc(n, sizeof(u32)))
-free(t);                                     // release a *T
-free(xs);                                    // release a [*]T
+struct Task { u32 id; u32 priority; }
+
+void demo(u32 n) {
+    *Task  t  = alloc(Task) orelse return;   // one object       (like malloc(sizeof(Task)))
+    [*]u32 xs = alloc(u32, n) orelse return; // n objects, zeroed (like calloc(n, sizeof(u32)))
+    free(t);                                 // release a *T
+    free(xs);                                // release a [*]T
+}
 ```
 
 **FORMS**
@@ -1453,6 +1533,7 @@ Accessing a freed slot with an old handle traps (generation mismatch).
 
 **SYNOPSIS**
 ```zer
+struct Task { u32 id; u32 priority; }
 Pool(Task, 8) tasks;       // 8 slots for Task, global only
 ```
 
@@ -1513,6 +1594,7 @@ NOT ISR-safe — calloc may use a global mutex that deadlocks in interrupt conte
 
 **SYNOPSIS**
 ```zer
+struct Task { u32 id; u32 priority; }
 Slab(Task) heap;           // global only
 ```
 
@@ -1575,16 +1657,20 @@ Handle(Task) h = pool.alloc() orelse { return 1; };
 
 **EXAMPLE**
 ```zer
+struct Task { u32 id; u32 priority; }
 Pool(Task, 8) tasks;
 
-Handle(Task) h = tasks.alloc() orelse { return 1; };
-tasks.get(h).id = 42;         // gen checked on every access
+u32 main() {
+    Handle(Task) h = tasks.alloc() orelse { return 1; };
+    tasks.get(h).id = 42;          // gen checked on every access
 
-Handle(Task) saved = h;        // copy the handle
-tasks.free(h);                 // gen incremented
+    Handle(Task) saved = h;        // copy the handle
+    tasks.free(h);                 // gen incremented
 
-// Runtime: saved has old gen → mismatch → trap
-// Compile: zercheck catches this as use-after-free
+    // Runtime: saved has old gen → mismatch → trap
+    // Compile: zercheck catches this as use-after-free
+    return 0;
+}
 ```
 
 **NOTES**
@@ -1597,12 +1683,17 @@ tasks.free(h);                 // gen incremented
 - For direct pointer access without Handle, use `alloc_ptr()` instead.
 
 **EXAMPLE (array of handles)**
-<!-- audit: fragment -->
 ```zer
-Handle(Task)[4] tasks;
-for (u32 i = 0; i < 4; i += 1) {
-    tasks[i] = heap.alloc() orelse { return 1; };
-    tasks[i].id = i;          // auto-deref on array element
+struct Task { u32 id; u32 priority; }
+Slab(Task) heap;
+
+u32 main() {
+    Handle(Task)[4] tasks;
+    for (u32 i = 0; i < 4; i += 1) {
+        tasks[i] = heap.alloc() orelse { return 1; };
+        tasks[i].id = i;      // auto-deref on array element
+    }
+    return 0;
 }
 ```
 
@@ -1693,19 +1784,30 @@ automatically — you write the same method name in both cases.
 
 **SYNOPSIS**
 ```zer
+struct Task { u32 id; u32 priority; }
+
 // Handle path — target is Handle(T), routes to auto-Slab alloc:
-Handle(Task) t = Task.alloc() orelse { return 1; };
-t.id = 42;           // auto-deref
-Task.free(t);        // arg is Handle → free
+u32 by_handle() {
+    Handle(Task) t = Task.alloc() orelse { return 1; };
+    t.id = 42;           // auto-deref
+    Task.free(t);        // arg is Handle → free
+    return 0;
+}
 
 // Pointer path — target is *T, routes to auto-Slab alloc_ptr:
-*Task t = Task.alloc() orelse { return 1; };
-t.id = 42;           // direct deref
-Task.free(t);        // arg is *T → free_ptr
+u32 by_pointer() {
+    *Task t = Task.alloc() orelse { return 1; };
+    t.id = 42;           // direct deref
+    Task.free(t);        // arg is *T → free_ptr
+    return 0;
+}
 
 // Explicit forms still work (same result as target-type routing):
-*Task t = Task.alloc_ptr() orelse { return 1; };
-Task.free_ptr(t);
+u32 explicit_form() {
+    *Task t = Task.alloc_ptr() orelse { return 1; };
+    Task.free_ptr(t);
+    return 0;
+}
 ```
 
 **METHODS**
@@ -1756,6 +1858,8 @@ Must be global. Used for producer-consumer patterns (e.g., UART RX/TX).
 **SYNOPSIS**
 ```zer
 Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
+
+u32 main() { return 0; }
 ```
 
 **METHODS**
@@ -1916,8 +2020,8 @@ Clamp val to the min/max of type T. No data loss — just capped.
 
 **EXAMPLE**
 ```zer
-i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
-u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
+i8 hi = @saturate(i8, 200);        // 127 (i8 max)
+u8 lo = @saturate(u8, -5);         // 0 (u8 min)
 ```
 
 **SAFETY**
@@ -1943,6 +2047,7 @@ Checks qualifier preservation (const, volatile).
 
 **EXAMPLE**
 ```zer
+i32 my_i32 = -1;
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
 ```
 
@@ -1957,8 +2062,12 @@ distinct typedefs — not general-purpose.
 **EXAMPLE**
 ```zer
 distinct typedef u32 Celsius;
-Celsius c = @cast(Celsius, 100);   // wrap
-u32 raw = @cast(u32, c);          // unwrap
+
+u32 main() {
+    Celsius c = @cast(Celsius, 100);   // wrap
+    u32 raw = @cast(u32, c);           // unwrap
+    return raw - 100;
+}
 ```
 
 ---
@@ -2007,6 +2116,8 @@ Convert pointer to usize integer.
 
 **EXAMPLE**
 ```zer
+u32 target;
+*u32 my_ptr = &target;
 usize addr = @ptrtoint(my_ptr);
 ```
 
@@ -2093,10 +2204,15 @@ containing struct. Field existence is validated at compile time.
 
 **EXAMPLE**
 ```zer
+struct ListHead { u32 link; }
 struct Device { u32 id; ListHead list; }
 
-*ListHead ptr = &dev.list;
-*Device d = @container(*Device, ptr, list);   // OK
+u32 main() {
+    Device dev;
+    *ListHead ptr = &dev.list;
+    *Device d = @container(*Device, ptr, list);   // OK
+    return (u32)d.id;
+}
 ```
 
 ---
@@ -2139,7 +2255,11 @@ Intentional crash. Calls the ZER trap handler with a message.
 
 **EXAMPLE**
 ```zer
-if (should_never_happen) { @trap(); }
+bool should_never_happen;
+u32 main() {
+    if (should_never_happen) { @trap(); }
+    return 0;
+}
 ```
 
 ---
@@ -2205,6 +2325,7 @@ Control-flow hints. `@unreachable()` marks a path that cannot execute (UB if rea
 
 **EXAMPLE**
 ```zer
+bool valid = true;
 if (@expect(valid, 1)) { }
 else { @unreachable(); }
 ```
@@ -2219,6 +2340,7 @@ Emits GCC `__builtin_bswap*()`.
 
 **EXAMPLE**
 ```zer
+u32 host = 0x11223344;
 u32 net = @bswap32(host);
 ```
 
@@ -3638,14 +3760,14 @@ comptime if (P) { ... }                    // const from comptime result
 ```
 
 **EXAMPLE**
-<!-- audit: fragment -->
 ```zer
+i32 puts(const *u8 s);          // from <stdio.h>
 const bool DEBUG = true;
 
 comptime if (DEBUG) {
-    void log([*]u8 msg) { puts(msg.ptr); }
+    void log(const [*]u8 msg) { puts(msg.ptr); }
 } else {
-    void log([*]u8 msg) { }    // no-op in release
+    void log(const [*]u8 msg) { }    // no-op in release
 }
 ```
 
@@ -4373,11 +4495,13 @@ Barrier bar;                // keyword type (like Arena, Pool)
   pointer parameter (which no per-file analysis can see) traps at runtime instead.
 
 ### Semaphore — Counting Semaphore
-<!-- audit: fragment -->
 ```zer
-Semaphore(3) dma_channels;    // 3 resources available
-@sem_acquire(dma_channels);   // blocks until count > 0, decrements
-@sem_release(dma_channels);   // increments, wakes one waiter
+Semaphore(3) dma_channels;        // 3 resources available — global only
+
+void transfer() {
+    @sem_acquire(dma_channels);   // blocks until count > 0, decrements
+    @sem_release(dma_channels);   // increments, wakes one waiter
+}
 
 // Pointer param support:
 void use_resource(*Semaphore s) {

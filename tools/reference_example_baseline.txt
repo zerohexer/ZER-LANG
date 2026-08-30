@@ -16,6 +16,15 @@
 # the file and dies the moment the block's text changes — which is exactly when
 # it needs re-reviewing. The trailing `reference.md:<line>` is a human hint only.
 #
+# 2026-08-30: 82 -> 79. Eighteen blocks were failing only because is_toplevel()
+# misread a bare `if (...) {` / `for (...) {` / `switch (...) {` at column 0 as a
+# function DEFINITION (it matches "starts with a letter, contains ), ends with
+# {") and so compiled them at file scope instead of wrapping them. They now
+# carry an explicit `<!-- audit: fragment -->`. Three of the eighteen compile as
+# a result and their rows are gone; the other fifteen still reference names the
+# prose supplies and stay baselined, now for their REAL reason rather than for a
+# misclassification.
+#
 # 2026-08-25: 86 -> 84. Two rows retired because their blocks now COMPILE — the
 # funcptr syntax catalogues, rewritten to be self-contained after BUG-878/879
 # made arrays of function pointers actually work. That is the baseline shrinking
@@ -76,11 +85,9 @@ de40d7f59a7c8237  reference.md:1619
 8955b4e9d9ec07f0  reference.md:1792
 4c612956832afce6  reference.md:1833
 0d6e3127d44a32be  reference.md:1872
-6e0b4c6efe281acf  reference.md:1885
 de3e938dd8ebb874  reference.md:1912
 d361ea32e78aa5e3  reference.md:1926
 b28c0b01d6f2c572  reference.md:1962
-e044455f457cb3e7  reference.md:1988
 1512197f44d5f5f9  reference.md:2636
 d38a3e67e4ff9cd0  reference.md:2660
 a75a37b298d178ea  reference.md:2675
@@ -104,6 +111,5 @@ e246a3334d5820c5  reference.md:3447
 d54d84941e077f48  reference.md:3465
 01adc7b7eff191c4  reference.md:3552
 22e9fa9c766877a3  reference.md:3578
-40b2571e361cc858  reference.md:3593
 95f5145d30a07c57  reference.md:3602
 fdba85d6406e565e  reference.md:3618

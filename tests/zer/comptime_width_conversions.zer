@@ -1,0 +1,61 @@
+// BUG-918. `comptime` is documented as the replacement for a C macro, but a
+// macro that NARROWS was not expressible: the comptime evaluator handled no cast
+// and no intrinsic at all, so `(u8)x`, `@truncate` and `@saturate` each made the
+// whole body report "comptime function ... body could not be evaluated".
+//
+// The three WIDTH conversions now fold. Each is asserted against the SAME
+// expression evaluated at RUNTIME, deliberately: a fold that disagrees with the
+// emitted code is a wrong constant burned into the .c, and a compile-only test
+// cannot see that (this is the BUG-844 lesson, and the reason the const-size
+// tests assert at runtime too). @bitcast stays unfolded on purpose — on a float
+// it is a reinterpretation this integer evaluator cannot model, and on an enum
+// target it carries a runtime variant guard a fold would silently skip.
+
+comptime u32 C_CAST_NARROW()  { u32 x = 300;  u8  y = (u8)x;              return y; }
+comptime u32 C_CAST_NEG_U8()  { i32 x = -1;   u8  y = (u8)x;              return y; }
+comptime u32 C_CAST_TO_I8()   { u32 x = 300;  i8  y = (i8)x;  u32 r = 0; if (y ==  44) { r = 1; } return r; }
+comptime u32 C_CAST_NEG_I8()  { i32 x = -300; i8  y = (i8)x;  u32 r = 0; if (y == -44) { r = 1; } return r; }
+comptime u32 C_TRUNC_U8()     { u32 x = 300;  u8  y = @truncate(u8, x);   return y; }
+comptime u32 C_TRUNC_UN()     { u32 x = 9;    u3  y = @truncate(u3, x);   return y; }
+comptime u32 C_SAT_HIGH()     { u32 x = 300;  u8  y = @saturate(u8, x);   return y; }
+comptime u32 C_SAT_NEG()      { i32 x = -5;   u8  y = @saturate(u8, x);   return y; }
+comptime u32 C_SAT_UN()       { u32 x = 9;    u3  y = @saturate(u3, x);   return y; }
+comptime u32 C_SAT_IN_RANGE() { u32 x = 5;    u8  y = @saturate(u8, x);   return y; }
+comptime u32 C_CAST_ARITH()   { u32 x = 300;  u8  y = (u8)x; u8 z = y + 250; return z; }
+
+u32 R_CAST_NARROW()  { u32 x = 300;  u8  y = (u8)x;              return y; }
+u32 R_CAST_NEG_U8()  { i32 x = -1;   u8  y = (u8)x;              return y; }
+u32 R_CAST_TO_I8()   { u32 x = 300;  i8  y = (i8)x;  u32 r = 0; if (y ==  44) { r = 1; } return r; }
+u32 R_CAST_NEG_I8()  { i32 x = -300; i8  y = (i8)x;  u32 r = 0; if (y == -44) { r = 1; } return r; }
+u32 R_TRUNC_U8()     { u32 x = 300;  u8  y = @truncate(u8, x);   return y; }
+u32 R_TRUNC_UN()     { u32 x = 9;    u3  y = @truncate(u3, x);   return y; }
+u32 R_SAT_HIGH()     { u32 x = 300;  u8  y = @saturate(u8, x);   return y; }
+u32 R_SAT_NEG()      { i32 x = -5;   u8  y = @saturate(u8, x);   return y; }
+u32 R_SAT_UN()       { u32 x = 9;    u3  y = @saturate(u3, x);   return y; }
+u32 R_SAT_IN_RANGE() { u32 x = 5;    u8  y = @saturate(u8, x);   return y; }
+u32 R_CAST_ARITH()   { u32 x = 300;  u8  y = (u8)x; u8 z = y + 250; return z; }
+
+u32 main() {
+    if (C_CAST_NARROW()  != R_CAST_NARROW())  { return 1; }
+    if (C_CAST_NEG_U8()  != R_CAST_NEG_U8())  { return 2; }
+    if (C_CAST_TO_I8()   != R_CAST_TO_I8())   { return 3; }
+    if (C_CAST_NEG_I8()  != R_CAST_NEG_I8())  { return 4; }
+    if (C_TRUNC_U8()     != R_TRUNC_U8())     { return 5; }
+    if (C_TRUNC_UN()     != R_TRUNC_UN())     { return 6; }
+    if (C_SAT_HIGH()     != R_SAT_HIGH())     { return 7; }
+    if (C_SAT_NEG()      != R_SAT_NEG())      { return 8; }
+    if (C_SAT_UN()       != R_SAT_UN())       { return 9; }
+    if (C_SAT_IN_RANGE() != R_SAT_IN_RANGE()) { return 10; }
+    if (C_CAST_ARITH()   != R_CAST_ARITH())   { return 11; }
+
+    // ...and the absolute values, so "both wrong the same way" cannot pass.
+    if (C_CAST_NARROW() !=  44) { return 21; }
+    if (C_CAST_NEG_U8() != 255) { return 22; }
+    if (C_TRUNC_U8()    !=  44) { return 23; }
+    if (C_TRUNC_UN()    !=   1) { return 24; }
+    if (C_SAT_HIGH()    != 255) { return 25; }
+    if (C_SAT_NEG()     !=   0) { return 26; }
+    if (C_SAT_UN()      !=   7) { return 27; }
+    if (C_CAST_ARITH()  !=  38) { return 28; }
+    return 0;
+}

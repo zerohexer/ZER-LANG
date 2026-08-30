@@ -4727,6 +4727,60 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
     }
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_BOOL_LIT) return n->bool_lit.value ? 1 : 0;
+    /* BUG-918 (a RELAXATION — read the reasoning before touching it): the three
+     * WIDTH conversions fold.
+     *
+     * A `comptime` function is documented as the replacement for a C macro, and
+     * a macro that narrows is completely ordinary — yet `(u32)x`, `@truncate` and
+     * `@saturate` all made the whole body unevaluable ("comptime function 'F'
+     * body could not be evaluated"), because this evaluator handled no cast and
+     * no intrinsic at all. The failure is loud, so this is over-rejection, not a
+     * hole; it is still the difference between `comptime` covering the macro
+     * cases and not.
+     *
+     * Only these three are folded, and only for a sized INTEGER target. That is
+     * the whole safety argument: each reduces EXACTLY to a function this file
+     * already uses to keep the interpreter and the emitted code in agreement.
+     * A cast and `@truncate` are `ct_wrap` (keep the low bits, sign-extend if
+     * the target is signed — measured: `(u8)-1` is 255 and `(i8)300` is 44 at
+     * runtime, which is what ct_wrap gives); `@saturate` is a clamp to the
+     * target's range. A float, bool or pointer target yields bits == 0 and falls
+     * through to CONST_EVAL_FAIL, i.e. today's behaviour.
+     *
+     * `@bitcast` is deliberately NOT folded: on a float it is a
+     * reinterpretation this integer evaluator cannot model, and on an enum
+     * target it carries a RUNTIME variant guard that a fold would silently skip
+     * — folding it could turn a trap into a wrong constant, which is the exact
+     * class BUG-844 exists to prevent. */
+    if (_comptime_checker &&
+        (n->kind == NODE_TYPECAST ||
+         (n->kind == NODE_INTRINSIC && n->intrinsic.type_arg &&
+          n->intrinsic.arg_count >= 1 && n->intrinsic.name_len == 8 &&
+          (memcmp(n->intrinsic.name, "truncate", 8) == 0 ||
+           memcmp(n->intrinsic.name, "saturate", 8) == 0)))) {
+        bool is_sat = (n->kind == NODE_INTRINSIC &&
+                       memcmp(n->intrinsic.name, "saturate", 8) == 0);
+        TypeNode *ttn = (n->kind == NODE_TYPECAST) ? n->typecast.target_type
+                                                   : n->intrinsic.type_arg;
+        Node *operand = (n->kind == NODE_TYPECAST) ? n->typecast.expr
+                                                   : n->intrinsic.args[0];
+        uint16_t bits = 0; bool sgn = false;
+        ct_type_width(resolve_type(_comptime_checker, ttn), &bits, &sgn);
+        if (bits == 0) return CONST_EVAL_FAIL;   /* not a sized integer target */
+        int64_t v = eval_const_expr_subst(operand, params, param_count);
+        if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        if (!is_sat) return ct_wrap(v, bits, sgn);
+        /* @saturate: clamp into the target's range. 64-bit unsigned has no
+         * representable upper bound in this int64 model, so leave it alone
+         * rather than clamp against a wrong maximum. */
+        if (bits >= 64) return (sgn || v >= 0) ? v : CONST_EVAL_FAIL;
+        int64_t hi = sgn ? ((int64_t)1 << (bits - 1)) - 1
+                         : (int64_t)(((uint64_t)1 << bits) - 1);
+        int64_t lo = sgn ? -((int64_t)1 << (bits - 1)) : 0;
+        if (v > hi) return hi;
+        if (v < lo) return lo;
+        return v;
+    }
     /* nested comptime function calls — depth guard prevents stack overflow */
     if (n->kind == NODE_CALL) {
         static int _subst_depth = 0;

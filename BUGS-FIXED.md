@@ -5,10 +5,10 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-30 — BUG-914..917: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, and every trap pointing at the wrong line
+## Session 2026-08-30 — BUG-914..918: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, and a comptime that could not narrow
 
-A standalone audit (no branch to harvest). Four findings, three of them silent by
-construction — the program compiles, runs, and gives a wrong answer or reads freed memory
+A standalone audit (no branch to harvest). Five findings; three of the first four are
+silent by construction — the program compiles, runs, and gives a wrong answer or reads freed memory
 with no diagnostic at either compile time or run time.
 
 ### BUG-914 — a C-style cast laundered a HEAP pointer past ownership tracking (ACCEPT-UNSAFE)
@@ -115,6 +115,40 @@ backstop. `@enum_forged` is synthesized only by IR lowering (the checker rejects
 spelling as an unknown intrinsic) and is handled in BOTH emitter dispatch paths.
 Tests: `tests/zer_trap/enum_switch_forged_via_ptrcast.zer`,
 `tests/zer/enum_switch_exhaustive_ok.zer` (every variant, multi-value arms, captures).
+
+### BUG-918 — `comptime` could not narrow (a RELAXATION)
+
+`comptime` is documented as the replacement for a C macro, and a macro that narrows is
+completely ordinary — but the comptime evaluator handled no cast and no intrinsic at all,
+so any of
+
+```zer
+comptime u32 F() { u32 x = 300; u8 y = (u8)x;            return y; }
+comptime u32 G() { u32 x = 300; u8 y = @truncate(u8, x); return y; }
+comptime u32 H() { u32 x = 300; u8 y = @saturate(u8, x); return y; }
+```
+
+made the WHOLE body report `comptime function 'F' body could not be evaluated`. Loud, so
+over-rejection rather than a hole — and still the difference between `comptime` covering
+the macro cases and not.
+
+**Only the three WIDTH conversions fold, and only for a sized INTEGER target.** That is the
+whole safety argument: each reduces exactly to a function this file already relies on to
+keep the interpreter and the emitted code in agreement — a cast and `@truncate` are
+`ct_wrap` (keep the low bits, sign-extend for a signed target), `@saturate` is a clamp to
+the target's range. A float / bool / pointer target yields width 0 and falls through to the
+existing CONST_EVAL_FAIL.
+
+`@bitcast` is excluded deliberately, not by omission: on a float it is a reinterpretation
+an integer evaluator cannot model, and on an enum target it carries a RUNTIME variant guard
+a fold would silently skip — turning a trap into a wrong constant, which is the exact
+BUG-844 class this evaluator's width work exists to prevent.
+
+**Validated by differential, not by inspection.** `tests/zer/comptime_width_conversions.zer`
+evaluates each expression BOTH at comptime and at runtime and asserts they agree AND that
+the value is the expected absolute one, so "both wrong the same way" cannot pass. It covers
+the sign edges (`(u8)-1` is 255, `(i8)300` is 44, `(i8)-300` is -44), both saturation ends,
+and `uN` targets. The pre-fix compiler rejects 19 of its blocks.
 
 ### BUG-917 — EVERY runtime trap reported a line that does not exist
 

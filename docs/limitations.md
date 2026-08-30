@@ -5,6 +5,77 @@ Entries removed once fixed.
 
 ---
 
+# HANDOFF — read this first (updated 2026-08-30)
+
+**2026-08-30 standalone audit — BUG-914..918 landed; four decisions recorded below so
+they are not re-litigated.** `make check` exit 0, **1410 .zer**, all nine gates, sink
+matrix **99 cells / 0 mismatch** (was 88). See BUGS-FIXED.md for the fixes; this section
+is only the things measured and NOT changed, plus the one gate/gap left open.
+
+## DECIDED 2026-08-30 — do not re-open
+
+### `(uN)x`, `(Enum)x`, `(Struct)x`, `(DistinctId)x` do not parse — and must not
+
+The C-style cast trigger is a fixed token set: keyword scalars, `*`, `?`, `const`,
+`volatile`. Every other target is an ordinary IDENTIFIER, so admitting it would make
+`(name)` in expression position ambiguous with a parenthesised variable. **The corpus
+already contains variables named `i1` and `i2`, which match the `iN` spelling exactly**, so
+`(i1) - 1` would parse as a CAST of `-1` rather than a subtraction — trading today's loud
+parse error for a silent wrong value. C resolves this with a symbol table in the lexer;
+ZER's parser deliberately has none.
+
+Every case has an unambiguous named form: `@truncate`/`@saturate` for `uN`/`iN`,
+`@bitcast` for an enum (guarded), `@cast` for a distinct typedef, `@pun` for a struct
+pointer. Documented in reference.md under "(Type)expr — C-Style Cast". **Do not "fix" this
+in the parser.**
+
+### `@ptrcast(*Enum, *u32)` stays LEGAL — the switch guards the consequence
+
+The `@ptrcast` type-confusion rule is deliberately narrowed to
+AGGREGATE -> different-AGGREGATE, so a primitive byte-view reinterpret (`*u32` -> `*u8`,
+struct -> `*u8` serialisation) stays a legal systems idiom. An enum pointee is not an
+aggregate, so `@ptrcast(*State, &some_u32)` is admitted by that same design.
+
+It CAN forge an enum, and no door-side guard can catch it — the cast yields a pointer, so
+there is no value to check until the read. BUG-916 therefore guards the CONSEQUENCE: the
+last arm of an exhaustive enum `switch` now compares, and a value that is no declared
+variant traps. **Do not tighten the ptrcast rule to cover enums** — that would reject the
+byte-view idiom the narrowing exists to protect, and the consequence is already closed.
+
+### `@bitcast` is NOT folded in `comptime` — deliberately
+
+BUG-918 folds the three WIDTH conversions (`(T)x`, `@truncate`, `@saturate`) because each
+reduces exactly to `ct_wrap` / a range clamp, which is what keeps the interpreter and the
+emitted code in agreement. `@bitcast` does not: on a float it is a reinterpretation an
+integer evaluator cannot model, and on an ENUM target it carries a runtime variant guard a
+fold would silently skip — turning a trap into a wrong constant, the exact BUG-844 class.
+The other intrinsics (`@size`, `@popcount`, `@ctz`, …) are simply unimplemented, not
+refused; `@ctz`/`@clz` would need the operand WIDTH to be correct at zero, which is the
+kind of edge that produces a silent disagreement.
+
+## OPEN 2026-08-30 (LOW) — reference.md example baseline still 79
+
+`tools/reference_example_baseline.txt` is 79 rows (was 82). Eighteen blocks were failing
+only because `is_toplevel()` reads a bare `if (...) {` at column 0 as a function
+DEFINITION (it matches "starts with a letter, contains `)`, ends with `{`"); they now carry
+an explicit `<!-- audit: fragment -->` and three of them compile as a result. The remaining
+79 reference names the surrounding prose supplies (`my_task`, `counter`, `shared_var`, …).
+Each is a block a reader cannot paste and compile. Converting one into a self-contained
+example and deleting its row is always an improvement — the baseline's own header says so.
+
+## OPEN 2026-08-30 (LOW) — `comptime` cannot call the bit-query intrinsics
+
+`@popcount` / `@ctz` / `@clz` / `@ffs` / `@parity` / `@bswapN` / `@size` in a `comptime`
+body make the whole fold fail with `comptime function 'F' body could not be evaluated`.
+Loud, never a wrong constant. Adding them is mechanical for `@bswapN` and `@popcount`;
+`@ctz`/`@clz` need the operand WIDTH threaded through to be correct at zero, and getting
+that wrong is a silent interpreter-vs-runtime disagreement, so it is not a one-liner. The
+differential harness to validate any such addition is
+`tests/zer/comptime_width_conversions.zer` — assert the fold against the SAME expression
+at runtime, never compile-only.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest

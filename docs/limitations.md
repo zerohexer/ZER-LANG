@@ -7,10 +7,18 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-30)
 
-**2026-08-30 standalone audit — BUG-914..918 landed; four decisions recorded below so
+**2026-08-30 standalone audit — BUG-914..921 landed; four decisions recorded below so
 they are not re-litigated.** `make check` exit 0, **1412 .zer**, all nine gates, sink
 matrix **103 cells / 0 mismatch** (was 88). See BUGS-FIXED.md for the fixes; this section
-is only the things measured and NOT changed, plus the one gate/gap left open.
+is only the things measured and NOT changed, plus the gaps left open.
+
+**New measurement sweep: `tools/compiler_asan_sweep.sh`** — runs ZERC ITSELF under
+ASan+UBSan over ~2200 corpus inputs. Nothing had ever instrumented the compiler (the other
+two sweeps instrument the EMITTED C), and it found a heap-use-after-free in `zercheck_ir.c`
+at three sites plus signed overflow in `emitter.c` on its first run. **Run it after any
+change to `zercheck_ir.c`'s handle bookkeeping or to any realloc-backed structure** — that
+class is invisible to every .zer test by construction, because reading freed memory does
+not crash, it just decides a safety verdict from stale bytes.
 
 ## DECIDED 2026-08-30 — do not re-open
 

@@ -7989,7 +7989,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                      * "integer constant is so large that it is unsigned" warnings (and
                      * `-Werror` failures). Emit `(LLONG_MIN_LITERAL)` for w==64 and
                      * the direct form for smaller widths. */
-                    int64_t max_v = (1LL << (w - 1)) - 1;
+                    /* BUG-921: computed in UNSIGNED. `1LL << 63` shifts into the
+                     * sign bit of a signed 64-bit type — undefined behaviour in
+                     * the COMPILER — and the `- 1` that followed then overflowed
+                     * INT64_MIN. Both were flagged by a UBSan build of zerc on
+                     * tests/zer/audit_saturate_i64_literal_ok.zer. The emitted C
+                     * was right by luck (GCC wraps, landing on INT64_MAX, and the
+                     * w == 64 branch below does not even use max_v for the MIN
+                     * side), which is exactly why it went unnoticed: a compiler
+                     * free to fold this differently would emit a wrong clamp with
+                     * no diagnostic anywhere. Unsigned shift and subtract are
+                     * fully defined at every width from 1 to 64. */
+                    int64_t max_v = (int64_t)((1ULL << (w - 1)) - 1ULL);
                     if (w == 64) {
                         emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? (-9223372036854775807LL - 1) : "
                                 "_zer_sat%d > %lldLL ? (%lldLL) : (",

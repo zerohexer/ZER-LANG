@@ -457,8 +457,18 @@ Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm /
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
 `MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,
-`tools/ub_sweep.sh`, `tools/grammar_closure_probe.sh` and `tools/qualifier_closure_probe.sh` are
-MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do not count them as coverage.
+`tools/ub_sweep.sh`, `tools/compiler_asan_sweep.sh`, `tools/grammar_closure_probe.sh` and
+`tools/qualifier_closure_probe.sh` are MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do
+not count them as coverage.
+
+**THE THREE SWEEPS ASK THREE DIFFERENT QUESTIONS — none subsumes another.** `ub_sweep.sh` is
+DIFFERENTIAL `-O0` vs `-O2` on the EMITTED C; `ubsan_sweep.sh` runs sanitizers on the EMITTED C;
+**`compiler_asan_sweep.sh` (2026-08-30) runs them on ZERC ITSELF**, which nothing did before and
+which found a heap-use-after-free in `zercheck_ir.c` at three sites (BUG-920) plus signed overflow
+in `emitter.c` (BUG-921) on its FIRST run. That class is invisible to every .zer test by
+construction: reading freed memory does not crash — the block is still mapped — it just makes a
+safety verdict out of stale bytes, silently and non-deterministically. **Run it after any change
+to `zercheck_ir.c`'s handle bookkeeping or to any realloc-backed structure.**
 
 **Choosing the mechanism (the rule of thumb):** sites are a `switch` on an enum →
 **`-Werror=switch`** (build-time, free, strongest). Sites are scattered dispatch/sinks →

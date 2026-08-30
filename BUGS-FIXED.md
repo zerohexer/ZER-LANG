@@ -5,13 +5,14 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-30 — BUG-914..919: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, and a comptime that could not narrow
+## Session 2026-08-30 — BUG-914..921: a cast the second layer never learned, a literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, a comptime that could not narrow, and the analyzer reading freed memory
 
-A standalone audit (no branch to harvest). Six findings. Four are ACCEPT-UNSAFE or a
+A standalone audit (no branch to harvest). Eight findings. Four are ACCEPT-UNSAFE or a
 silent wrong value: the program compiles, runs, and reads freed memory or answers wrongly
 with no diagnostic at compile time OR run time. Two of the four (BUG-914, BUG-919) are the
 same shape one layer apart, and the second was found by ENUMERATING after the first —
-which is the only reason it was found at all.
+which is the only reason it was found at all. The last two are in the COMPILER rather than
+in the language, found by instrumenting zerc itself, which no gate had ever done.
 
 ### BUG-914 — a C-style cast laundered a HEAP pointer past ownership tracking (ACCEPT-UNSAFE)
 
@@ -156,6 +157,53 @@ correct definition.
 
 Gate: two more `p19` cells (matrix 99 -> 103), RED on the pre-fix build. Tests:
 `tests/zer_fail/cast_launder_keep_inference.zer`, `tests/zer/cast_launder_keep_global_ok.zer`.
+
+### BUG-920 — the ANALYZER read freed memory to decide a safety verdict (3 sites)
+
+Found by a sweep nobody had run: **zerc itself** under ASan+UBSan over the whole corpus
+(`tools/compiler_asan_sweep.sh`, added with this fix). Every existing gate asks about the
+program ZER compiles; `ub_sweep.sh` and `ubsan_sweep.sh` instrument the EMITTED C. Nothing
+instrumented the compiler.
+
+```
+AddressSanitizer: heap-use-after-free  zercheck_ir.c:3706 in ir_check_inst
+  freed by: realloc in ir_alloc_handle_slot <- ir_add_handle  (zercheck_ir.c:3705)
+```
+
+`ir_add_handle` grows `ps->handles` with `realloc`, so **every pointer into that array is
+invalidated by it.** That is precisely why `IRAliasSnapshot` exists, and its usage note
+spells out the ordering — snapshot BEFORE the add-capable call, then
+`dst->state = snap.state`. Three sites deviated:
+
+| site | deviation |
+|---|---|
+| `zercheck_ir.c:3669` | snapshot taken correctly, then `fd->state = fh->state` — a stale read |
+| `zercheck_ir.c:3706` | same shape; the one ASan actually reached, via `tests/zer/tokenizer.zer` |
+| `zercheck_ir.c:5417` | **snapshot taken AFTER the add** — so `alloc_id`, `pool_name`, `escaped` and the view set were ALL copied out of freed memory |
+
+The consequence is the reason no test could have caught it: reading freed memory does not
+crash — the block is still mapped and usually still holds the old bytes — it just makes the
+verdict depend on what the allocator left behind. A leak, wrong-pool or use-after-free
+answer decided by stale bytes is silent and non-deterministic. Only the third site is
+plausibly reachable with a wrong value today; all three are the same defect and all three
+are fixed the same way.
+
+Sweep after the fix: **2223 inputs, zero findings.**
+
+### BUG-921 — signed overflow in the compiler while computing an `@saturate` bound
+
+Same sweep, same file class:
+
+```
+emitter.c:7992: runtime error: left shift of 1 by 63 places cannot be represented in 'long long int'
+emitter.c:7992: runtime error: signed integer overflow: -9223372036854775808 - 1
+```
+
+`int64_t max_v = (1LL << (w - 1)) - 1;` is computed BEFORE the `w == 64` branch that does
+not use it. GCC wraps, landing on INT64_MAX, so the emitted C was right — by luck. A
+compiler free to fold `1LL << 63` differently would emit a wrong clamp with no diagnostic
+anywhere in the pipeline. Computed in UNSIGNED now, which is defined at every width 1..64.
+The AST-path twin uses hard-coded literals per width and was never affected.
 
 ### BUG-918 — `comptime` could not narrow (a RELAXATION)
 

@@ -3666,7 +3666,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         IRAliasSnapshot fsnap;
                         ir_snapshot_alias(&fsnap, fh);
                         IRHandleInfo *fd = ir_add_handle(ps, inst->dest_local);
-                        if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fh->state; }
+                        /* BUG-920: `fsnap.state`, NOT `fh->state`. ir_add_handle may
+                         * have REALLOCATED ps->handles, so `fh` is dangling by now —
+                         * which is the whole reason IRAliasSnapshot exists, and why it
+                         * already captures `state`. */
+                        if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fsnap.state; }
                     } else {
                         /* 2026-08-16: the BASE carries no allocation identity — the
                          * common case being a BY-VALUE STRUCT PARAM, where the
@@ -3703,7 +3707,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 IRAliasSnapshot wsnap;
                                 ir_snapshot_alias(&wsnap, wh);
                                 IRHandleInfo *wd = ir_add_handle(ps, inst->dest_local);
-                                if (wd) { ir_apply_alias(wd, &wsnap); wd->state = wh->state; }
+                                /* BUG-920, the instance ASan actually caught: read the
+                                 * SNAPSHOT, not the reallocated-away `wh`. */
+                                if (wd) { ir_apply_alias(wd, &wsnap); wd->state = wsnap.state; }
                             }
                         }
                     }
@@ -5403,18 +5409,26 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 IRHandleInfo *arg_h = ir_view_arg_handle(zc, func, ps,
                                           inst->expr->call.args[param_idx]);
                 if (arg_h) {
+                    /* Audit 2026-06-11: raw field copy missed
+                     * pool_name + escaped + is_thread_handle, so
+                     * wrong-pool detection silently bypassed when
+                     * the handle round-tripped through a passthrough
+                     * function. Use ir_apply_alias to copy ALL
+                     * tracked state — same shape as IR_COPY at 2758.
+                     *
+                     * BUG-920: the snapshot must be taken BEFORE ir_add_handle,
+                     * which may REALLOCATE ps->handles and leave `arg_h`
+                     * dangling. Taking it after read the ENTIRE alias record —
+                     * alloc_id, pool_name, escaped, the view set — out of freed
+                     * memory, so a wrong-pool or leak verdict could be decided
+                     * by whatever the allocator left behind. This is the exact
+                     * ordering IRAliasSnapshot's own usage note specifies. */
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, arg_h);
                     IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                     if (dh) {
-                        /* Audit 2026-06-11: raw field copy missed
-                         * pool_name + escaped + is_thread_handle, so
-                         * wrong-pool detection silently bypassed when
-                         * the handle round-tripped through a passthrough
-                         * function. Use ir_apply_alias to copy ALL
-                         * tracked state — same shape as IR_COPY at 2758. */
-                        IRAliasSnapshot snap;
-                        ir_snapshot_alias(&snap, arg_h);
                         ir_apply_alias(dh, &snap);
-                        dh->state = arg_h->state;
+                        dh->state = snap.state;
                     }
                 }
                 /* BUG-847 (RELAXATION, 2026-08-23): the result of a proven

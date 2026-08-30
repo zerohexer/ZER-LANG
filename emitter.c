@@ -121,8 +121,16 @@ static void emit_opt_null_literal(Emitter *e, Type *opt_type) {
 
 /* forward declaration needed by emit_opt_wrap_value */
 static void emit_expr(Emitter *e, Node *node);
+/* BUG-924: emit_array_as_slice must be usable from the IR-REWRITTEN path too,
+ * where the inner expression has to go through emit_rewritten_node instead of
+ * emit_expr. Rather than a second copy of the coercion (the dual-dispatch drift
+ * this file keeps producing), the one definition takes the IRFunc: non-NULL
+ * selects the rewritten emitter, NULL keeps the AST behaviour every existing
+ * caller relies on. */
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
 
-static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type);
+static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type,
+                                Type *slice_type, IRFunc *func);
 
 /* B4: Emit value wrapped in optional struct: (Type){ val, 1 }.
  * Used for T → ?T wrapping at assignment, var-decl init.
@@ -141,7 +149,7 @@ static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
     if (ow_inner && type_dispatch_kind(ow_inner) == TYPE_SLICE &&
         ow_vt && type_dispatch_kind(ow_vt) == TYPE_ARRAY)
         emit_array_as_slice(e, value_expr, type_unwrap_distinct(ow_vt),
-                            type_unwrap_distinct(ow_inner));
+                            type_unwrap_distinct(ow_inner), NULL);
     else
         emit_expr(e, value_expr);
     emit(e, ", 1 }");
@@ -791,14 +799,20 @@ static void emit_defers_from(Emitter *e, int base);
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
-static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
+static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type,
+                                Type *slice_type, IRFunc *func) {
     emit(e, "((");
     emit_type(e, slice_type);
     emit(e, "){ (");
     if (slice_type && slice_type->slice.is_volatile) emit(e, "volatile ");
     emit_type(e, array_type->array.inner);
     emit(e, "*)");
-    emit_expr(e, array_expr);
+    /* BUG-924: `func` selects the dispatch path. In an IR-rewritten expression
+     * the operand's idents have been rewritten to local references that
+     * emit_expr does not resolve, so emitting through the wrong one produces a
+     * name C has never seen. NULL = the AST path, unchanged. */
+    if (func) emit_rewritten_node(e, array_expr, func);
+    else      emit_expr(e, array_expr);
     emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
 
@@ -2167,7 +2181,7 @@ static void emit_expr(Emitter *e, Node *node) {
                    tgt_eff->kind == TYPE_SLICE &&
                    type_unwrap_distinct(val_type)->kind == TYPE_ARRAY) {
             /* BUG-419: array→slice coercion in assignment (same as var-decl) */
-            emit_array_as_slice(e, node->assign.value, val_type, tgt_type);
+            emit_array_as_slice(e, node->assign.value, val_type, tgt_type, NULL);
         } else {
             emit_expr(e, node->assign.value);
         }
@@ -2586,7 +2600,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     eff_callee->func_ptr.params[i]->kind == TYPE_SLICE;
                 if (need_arr_coerce) {
                     emit_array_as_slice(e, node->call.args[i], arg_type,
-                                        eff_callee->func_ptr.params[i]);
+                                        eff_callee->func_ptr.params[i], NULL);
                 } else {
                     emit_expr(e, node->call.args[i]);
                     if (need_decay) emit(e, ".ptr");
@@ -3309,7 +3323,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *slice_tgt = aggregate_slice_coerce_target(ftype, fv_type);
                 Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
                 if (slice_tgt && vte && type_dispatch_kind(vte) == TYPE_ARRAY)
-                    emit_array_as_slice(e, fval, vte, slice_tgt);
+                    emit_array_as_slice(e, fval, vte, slice_tgt, NULL);
                 else
                     emit_expr(e, fval);
             }
@@ -7751,7 +7765,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     ? type_unwrap_distinct(tgt_eff->optional.inner) : NULL;
                 if (aw_inner && type_dispatch_kind(aw_inner) == TYPE_SLICE &&
                     type_dispatch_kind(val_eff) == TYPE_ARRAY)
-                    emit_array_as_slice(e, node->assign.value, val_eff, aw_inner);
+                    emit_array_as_slice(e, node->assign.value, val_eff, aw_inner, func);
                 else
                     emit_rewritten_node(e, node->assign.value, func);
                 emit(e, ", 1 }");
@@ -7903,9 +7917,47 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (guard_fp) emit(e, "_zer_nnfp(");
             emit_rewritten_node(e, node->call.callee, func);
             emit(e, guard_fp ? ")(" : "(");
+            /* BUG-924: argument COERCIONS, the other half of this dual dispatch.
+             * The AST sibling (emit_expr's NODE_CALL) applies array->slice and
+             * slice->pointer at the call boundary; this path emitted every
+             * argument raw. So a documented coercion worked at the var-decl-init
+             * site and silently did not at the ASSIGNMENT site, because only the
+             * latter lowers to `IR_ASSIGN <expr>` and lands here:
+             *
+             *     u32 r = take(arr);   // IR_CALL, args decomposed -> coerced
+             *     r = take(arr);       // IR_ASSIGN <expr>          -> raw, C error
+             *
+             * Not a silent miscompile — GCC rejects the emitted C — but the user
+             * sees a C-level type error about `_zer_slice_u8` for valid ZER, and
+             * the shape is common (112 occurrences in the corpus). */
+            Type *rw_cf = checker_get_type(e->checker, node->call.callee);
+            if (type_dispatch_kind(rw_cf) != TYPE_FUNC_PTR) rw_cf = NULL;
+            else rw_cf = type_unwrap_distinct(rw_cf);
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
+                Type *rw_pt = (rw_cf && (uint32_t)i < rw_cf->func_ptr.param_count)
+                    ? rw_cf->func_ptr.params[i] : NULL;
+                Type *rw_at = checker_get_type(e->checker, node->call.args[i]);
+                /* type_dispatch_kind rather than a raw `->kind ==`: NULL-safe,
+                 * and it cannot forget the distinct unwrap (the GAP-F / BUG-409
+                 * class, which the type-dispatch audit gates). Measured: a
+                 * `distinct typedef [*]u8` PARAMETER does not currently reach
+                 * here at all — the checker refuses the implicit array->distinct
+                 * conversion by design — so the unwrap is defensive here, not
+                 * load-bearing. Written this way because the audit's rule is
+                 * about the SHAPE, and a future relaxation would arrive with the
+                 * emission already correct. */
+                if (type_dispatch_kind(rw_at) == TYPE_ARRAY &&
+                    type_dispatch_kind(rw_pt) == TYPE_SLICE) {
+                    emit_array_as_slice(e, node->call.args[i],
+                                        type_unwrap_distinct(rw_at),
+                                        type_unwrap_distinct(rw_pt), func);
+                    continue;
+                }
                 emit_rewritten_node(e, node->call.args[i], func);
+                if (type_dispatch_kind(rw_at) == TYPE_SLICE &&
+                    type_dispatch_kind(rw_pt) == TYPE_POINTER)
+                    emit(e, ".ptr");
             }
             emit(e, ")");
         }
@@ -10457,7 +10509,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                            ? type_unwrap_distinct(wt_eff->optional.inner) : NULL;
                 if (wi && type_dispatch_kind(wi) == TYPE_SLICE &&
                     vte && type_dispatch_kind(vte) == TYPE_ARRAY)
-                    emit_array_as_slice(e, fval, vte, wi);
+                    emit_array_as_slice(e, fval, vte, wi, func);
                 else
                     emit_rewritten_node(e, fval, func);
                 emit(e, ", 1 }");
@@ -10466,7 +10518,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *ftype = struct_field_type_by_name(si_type, fname, fname_len);
                 Type *slice_tgt = aggregate_slice_coerce_target(ftype, fv_type);
                 if (slice_tgt && vte && type_dispatch_kind(vte) == TYPE_ARRAY)
-                    emit_array_as_slice(e, fval, vte, slice_tgt);
+                    emit_array_as_slice(e, fval, vte, slice_tgt, func);
                 else
                     emit_rewritten_node(e, fval, func);
             }
@@ -10867,13 +10919,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         ? type_unwrap_distinct(dst_eff->optional.inner) : NULL;
                     if (aw_inner && type_dispatch_kind(aw_inner) == TYPE_SLICE &&
                         src_eff && type_dispatch_kind(src_eff) == TYPE_ARRAY)
-                        emit_array_as_slice(e, inst->expr, src_type, aw_inner);
+                        emit_array_as_slice(e, inst->expr, src_type, aw_inner, func);
                     else
                         emit_rewritten_node(e, inst->expr, func);
                 }
                 emit(e, ", 1 }");
             } else if (need_slice) {
-                emit_array_as_slice(e, inst->expr, src_type, dst_type);
+                emit_array_as_slice(e, inst->expr, src_type, dst_type, func);
             } else {
                 emit_rewritten_node(e, inst->expr, func);
                 if (need_unwrap) emit(e, ".value");
@@ -11166,7 +11218,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         type_unwrap_distinct(callee_ft->func_ptr.params[i]) : NULL;
                     if (at_eff && at_eff->kind == TYPE_ARRAY &&
                         pt && pt->kind == TYPE_SLICE && arg_expr) {
-                        emit_array_as_slice(e, arg_expr, at_ast, callee_ft->func_ptr.params[i]);
+                        emit_array_as_slice(e, arg_expr, at_ast, callee_ft->func_ptr.params[i], func);
                     } else if (arg_expr) {
                         emit_rewritten_node(e, arg_expr, func);
                     } else {
@@ -11409,7 +11461,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 if (expr_eff && ret_eff &&
                     expr_eff->kind == TYPE_ARRAY && ret_eff->kind == TYPE_SLICE) {
                     emit(e, "return ");
-                    emit_array_as_slice(e, inst->expr, expr_type, ret);
+                    emit_array_as_slice(e, inst->expr, expr_type, ret, func);
                     emit(e, ";\n");
                 } else if (expr_eff && ret_eff && type_dispatch_kind(expr_eff) == TYPE_ARRAY &&
                            type_dispatch_kind(ret_eff) == TYPE_OPTIONAL && ret_eff->optional.inner &&
@@ -11422,7 +11474,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "return (");
                     emit_type(e, ret_eff);
                     emit(e, "){ ");
-                    emit_array_as_slice(e, inst->expr, expr_type, ri);
+                    emit_array_as_slice(e, inst->expr, expr_type, ri, func);
                     emit(e, ", 1 };\n");
                 } else {
                     /* Void expression in return — emit side effect, then bare return */

@@ -1,0 +1,47 @@
+// BUG-923: a LITERAL return has no provenance — it cannot be a view of a
+// parameter, so a function whose every return is a literal must be classified
+// RET_STATIC (mask 0), exactly as `return null` already was.
+//
+// Before the fix `return "lit"` fell through to RET_UNKNOWN, which marks the
+// return summary INCOMPLETE, so `call_result_static_given_args` could never
+// prove the result static and every escape sink rejected a call that passed a
+// local — even though the returned slice provably points into .rodata.
+//
+// Pre-fix this file does not compile: the return sink reports "stack memory may
+// escape through function return" on lines 22 and 27. That is the non-vacuity
+// witness — verified against a from-HEAD build.
+
+const [*]u8 pick(const [*]u8 unused) { return "literal"; }
+
+?const [*]u8 maybe_pick(const [*]u8 unused) { return "opt"; }
+
+// return sink: the result of a call carrying a local-derived argument
+const [*]u8 via_return() {
+    u8[4] b;
+    b[0] = 7;
+    return pick(b);
+}
+
+?const [*]u8 via_return_optional() {
+    u8[4] b;
+    return maybe_pick(b);
+}
+
+u32 main() {
+    const [*]u8 a = via_return();
+    if (a.len != 7) { return 1; }
+
+    ?const [*]u8 o = via_return_optional();
+    if (o) |v| {
+        if (v.len != 3) { return 2; }
+    } else {
+        return 3;
+    }
+
+    // var-decl sink with a local-derived argument
+    u8[4] loc;
+    const [*]u8 c = pick(loc);
+    if (c.len != 7) { return 4; }
+
+    return 0;
+}

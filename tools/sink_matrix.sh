@@ -320,6 +320,36 @@ cell p19_safe_struct_lit_g   compile 'u32 gd19=1; void c19(){ g_h = { .p = (*u32
 cell p19_safe_value_cast     compile 'struct N19{u32 v;} u32 g19v; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19v=(u32)n.v; free(n); if (g19v!=7) { return 2; } return 0; }'
 cell p19_safe_reset_global   compile 'struct N19{u32 v;} ?*N19 g19d; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19d=(*N19)n; u32 r=n.v; g19d=null; free(n); if (r!=7) { return 2; } return 0; }'
 
+# ---------------------------------------------------------------------------
+# SHAPE p20 (BUG-923): a call result that provably CANNOT view an argument.
+#
+# p18 is the reject side of this question ("the result VIEWS an argument, so the
+# argument's lifetime binds it"). p20 is the accept side, and it is the half a
+# per-sink patchwork gets wrong silently: the sinks do not ask "does the result
+# view an argument", they ask "is the summary usable at all", and a single
+# unclassifiable return made the whole summary unusable. `return "lit"` was
+# unclassifiable — not because a literal might alias a parameter, but because
+# `classify_return_root` only special-cased `null` and let every other literal
+# fall through to RET_UNKNOWN.
+#
+# Measured on a pre-fix build: the four accept cells below were ALL rejected —
+# "stack memory may escape" — for a slice living in .rodata. So these are
+# OVER-REJECT witnesses, and they are the reason the shape exists: nothing else
+# in the matrix would have noticed the summary going dark.
+#
+# The reject cell is the soundness guard and matters more than the four. The
+# relaxation is safe only because the mask accumulator is a JOIN (a literal arm
+# contributes no bit), so a MIXED function must still carry its param bit. If a
+# future change ever lets the literal arm dominate, p20_mixed_param flips from
+# reject to compile and a dangling stack slice ships.
+echo "===== SHAPE p20 = a call RESULT that provably views NOTHING (literal return) ====="
+cell p20_lit_return_sink    compile 'const [*]u8 pk20(const [*]u8 u){return "lit";} const [*]u8 f20(){ u8[4] b; return pk20(b); } u32 main(){ if (f20().len != 3) { return 1; } return 0; }'
+cell p20_lit_global_store   compile 'const [*]u8 pk20(const [*]u8 u){return "lit";} ?const [*]u8 g20; void c20(){ u8[4] b; g20 = pk20(b); } u32 main(){ c20(); return 0; }'
+cell p20_lit_optional_ret   compile '?const [*]u8 mp20(const [*]u8 u){return "opt";} ?const [*]u8 f20b(){ u8[4] b; return mp20(b); } u32 main(){ if (f20b()) |v| { if (v.len != 3) { return 1; } } return 0; }'
+cell p20_lit_keep_call      compile 'const [*]u8 pk20(const [*]u8 u){return "lit";} ?const [*]u8 g20k; void kp20(keep const [*]u8 s){ g20k = s; } u32 main(){ u8[4] b; kp20(pk20(b)); return 0; }'
+# SOUNDNESS GUARD: one arm returns the literal, the other returns the param.
+cell p20_mixed_param        reject 'const [*]u8 pk20m(bool f, const [*]u8 p){ if (f) { return p; } return "lit"; } const [*]u8 lk20(){ u8[4] loc; return pk20m(true, loc); } u32 main(){ return (u32)lk20().len; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

@@ -1,0 +1,46 @@
+// gap-runtime-exit: 0
+// GAP (2026-08-30, docs/limitations.md "a factory result consumed via `orelse`"):
+// the idiomatic way to consume a fallible factory is never registered as an
+// owned allocation, so the leak check never runs on it.
+//
+// Every binding below leaks. Only the FIRST is reported today:
+//   ?*Node o = make_node();                    -> "allocated at line N but never freed"
+//   *Node p = make_node() orelse {...};        -> SILENT
+//   [*]u8  s = make_bytes() orelse {...};      -> SILENT
+//   ?[*]u8 q = make_bytes();                   -> SILENT
+//
+// Two independent causes: the registration lives inside `case IR_CALL:` while
+// the orelse form lowers to `IR_ASSIGN <expr>`, and TYPE_SLICE is missing from
+// both `is_ptr_return` tests. See the limitations.md entry for the measured
+// boundary and why the four-line TYPE_SLICE fix is NOT the right one.
+//
+// While the gap is open this compiles clean and exits 0 (it really does leak —
+// that is the point). When either axis is fixed the compile fails, the gaps
+// runner FAILS LOUDLY, and this file should be promoted to tests/zer_fail/
+// with an `// expect-error: never freed`.
+//
+// NOTE the reported form is deliberately absent: including it would make the
+// file fail to compile TODAY and mask the three shapes actually under test.
+
+struct Node { u32 v; }
+
+?*Node make_node() { return alloc(Node); }
+
+?[*]u8 make_bytes() { return alloc(u8, 8); }
+
+u32 main() {
+    *Node p = make_node() orelse { return 1; };
+    p.v = 7;
+
+    [*]u8 s = make_bytes() orelse { return 2; };
+    s[0] = 9;
+
+    ?[*]u8 q = make_bytes();
+    if (q) |qq| {
+        if (qq.len != 8) { return 3; }
+    }
+
+    if (p.v != 7) { return 4; }
+    if (s[0] != 9) { return 5; }
+    return 0;
+}

@@ -105,6 +105,106 @@ The other intrinsics (`@size`, `@popcount`, `@ctz`, …) are simply unimplemente
 refused; `@ctz`/`@clz` would need the operand WIDTH to be correct at zero, which is the
 kind of edge that produces a silent disagreement.
 
+## OPEN 2026-08-30 (MEDIUM, silent) — a factory result consumed via `orelse` is never registered as an owned allocation, so it is never leak-checked
+
+**Symptom.** The idiomatic way to consume a fallible factory —
+`*Node p = make_node() orelse { return 1; }` — produces NO leak diagnostic when `p` is
+never freed. The un-idiomatic form catches it:
+
+```zer
+struct Node { u32 v; }
+?*Node make_node() { return alloc(Node); }
+
+u32 main() {
+    ?*Node o = make_node();          // CAUGHT: "allocated at line N but never freed"
+    *Node p = make_node() orelse { return 1; };   // MISSED — no diagnostic
+    return 0;
+}
+```
+
+Both allocate. Only the first is reported.
+
+**Measured boundary** (2026-08-30, each line a separate probe):
+
+| shape | leak reported? |
+|---|---|
+| `?*N o = mk();`                       | ✅ caught |
+| `*N p = mk() orelse { return 1; };`   | ❌ **missed** |
+| `*N p = alloc(N) orelse {...};` (direct, no factory) | ✅ caught |
+| `[*]u8 s = mk_slice() orelse {...};`  | ❌ missed |
+| `?[*]u8 o = mk_slice();`              | ❌ missed |
+| use-after-free through the orelse result | ✅ still caught |
+| double-free through the orelse result    | ✅ still caught |
+
+So this is a LEAK-only gap. UAF and double-free tracking are unaffected, which is why it
+never surfaced as a crash — the program simply grows.
+
+**Two independent root causes; a fix needs both.**
+
+1. **The registration lives in the wrong IR case.** Fresh-allocation registration for a
+   call result sits inside `case IR_CALL:` in `zercheck_ir.c`. `--emit-ir` shows the two
+   forms lower differently:
+   - `?*N o = mk();`                     → `%1 = CALL mk(0 args)`  → reaches the case
+   - `*N p = mk() orelse {...};`         → `%2 = ASSIGN <expr>`    → never reaches it
+
+   The `orelse` pre-lowering (`pre_lower_orelse`, `ir_lower.c`) rewrites the initializer
+   into an expression assigned to the destination, so the call is no longer the
+   instruction's own opcode.
+
+2. **`TYPE_SLICE` is missing from both `is_ptr_return` tests** (`zercheck_ir.c`, the
+   summary path and the no-summary path). A slice owns a heap block exactly as a pointer
+   does — `alloc(u8, n)` returns one — so a slice-returning factory is not leak-checked
+   even in the form that lowers to `IR_CALL`.
+
+**Why the obvious fix is wrong — MEASURED, do not repeat it.** Adding `TYPE_SLICE` to the
+two `is_ptr_return` tests is a four-line change that closes row 5 of the table above. It
+was implemented and `make check` came back **RED with three false leaks**:
+
+```
+FAIL: const_slice_return                  — const [*]u8 msg = get_greeting();   (returns a string literal)
+FAIL: escape_param_view_relaxations_ok    — MySlice m = wrap(b);                (returns a param VIEW)
+FAIL: optional_slice_coerce               — ?[*]u8 r = pick(true, buf);         (returns a param or null)
+```
+
+None of these allocate. They fail because the suppressions that are supposed to catch
+exactly this — `returns_param_color` / `dest_aliased_from_param`, `ret_is_borrow &&
+ret_is_content`, `ir_call_returns_static` — do not fire for a slice-returning view. That
+is not slice-specific: the same over-rejection already exists for POINTERS and is the
+documented residual in PART 6 §36.17 (`*u8 f = firstp(b);`), kept deliberately because it
+catches the through-call interior-pointer UAF. Registering slices extends that residual
+from a rare shape to an idiomatic one — every `const [*]u8 name()` factory becomes a false
+leak. Over-rejection is a soft gradient, but shipping a NEW one that breaks three valid
+corpus programs is not the trade to make.
+
+(One piece of that was separable and IS fixed: `ir_call_returns_static` failed on
+`const_slice_return` because `classify_return_root` did not classify a string literal as
+static. That is BUG-923, fixed independently — it is a real precision win at the escape
+sinks regardless of this entry. It does NOT close this gap; the two param-view rows remain.)
+
+**Fix sketch.** Order matters — do (a) before (b), or (b) re-breaks the corpus:
+
+  (a) Make the view/static classification cover slices. `returns_all_views` +
+      `returns_param_mask` already model "the result is a view of param n"; the consumer
+      arm that acts on it is gated on shapes that a slice return does not reach. Extend
+      the suppressions first, verify `const_slice_return` /
+      `escape_param_view_relaxations_ok` / `optional_slice_coerce` stay green with
+      `TYPE_SLICE` registration turned ON, and only then keep it on. This also pays down
+      §36.17 for pointers, which is the larger prize.
+
+  (b) Hoist the call-result registration out of `case IR_CALL:` so it also runs for an
+      `IR_ASSIGN` whose `inst->expr` is a `NODE_CALL`. This is the real work: ~250 lines
+      of call-result logic (summary lookup, param-color aliasing, extern heuristics,
+      static/borrow suppression, stdlib coloring) are interleaved inside a ~600-line
+      switch case. It wants extracting into one `ir_register_call_result(zc, func, ps,
+      inst, call)` helper called from both cases — a refactor, not a patch. Doing it as a
+      patch means a second copy of the logic, which is the multi-site class this codebase
+      exists to avoid.
+
+**Tripwire.** `tests/zer_gaps/factory_orelse_leak_missed.zer` holds the reproducer and
+carries `// gap-runtime-exit:` so it cannot rot: while the gap is open the file compiles
+clean, and the day either axis is fixed the gaps runner FAILS LOUDLY telling you to
+promote it into `tests/zer_fail/`.
+
 ## OPEN 2026-08-30 (LOW) — reference.md example baseline still 79
 
 `tools/reference_example_baseline.txt` is 79 rows (was 82). Eighteen blocks were failing

@@ -12628,6 +12628,23 @@ classified STATIC only if f's own mask is empty (f returns only statics); a
 param-returning f could thread one of OUR params, which Stage 2 does not re-resolve, so
 it's UNKNOWN. The `>=64`-param case forces UNKNOWN (mask is a `uint64_t`).
 
+**A LITERAL has no provenance (BUG-923, 2026-08-30).** All six literal kinds classify
+`RET_STATIC`. `null` always did; the others fell through the view-peeling loop to
+`root->kind != NODE_IDENT` → `RET_UNKNOWN`, and RET_UNKNOWN does not cost one bit — it
+clears `complete`, which makes the entire function's summary unusable at every consumer.
+Cost measured: `const [*]u8 pick(const [*]u8 u){return "lit";}` then `g = pick(local)`
+was rejected as a stack escape, at the global-store, return and return-field sinks, for a
+slice that provably lives in `.rodata`. **Why widening here is safe in general** — and the
+thing to re-derive before adding any further `RET_STATIC` case: the accumulator is
+`mask |= (1 << rc)`, a JOIN over every return, so an arm classified STATIC contributes
+NOTHING. A widening can therefore only clear bits or stop clearing `complete`; it can
+never set a bit that should have stayed clear, and a mixed function
+(`if (b) return p; return "lit";`) still carries p's bit from its own arm. The property
+that makes a case admissible is exactly that: **the value cannot alias a parameter.** A
+literal satisfies it; a bare `NODE_IDENT` does not, which is why the ident path still
+does the full shadow-aware resolution above. Guard:
+`tests/zer_fail/return_literal_mixed_param_escapes.zer`.
+
 **Escape PRECISION Stage 3 — unify the keep-call sink (2026-06-22d).** The
 `call_result_static_given_args` query now gates EVERY applicable call-result sink. Stage
 3 was a single gate (probing showed the rest already covered): the keep-call check

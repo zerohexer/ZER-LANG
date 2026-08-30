@@ -21588,7 +21588,20 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
  * A return aliasing a param/local is NEVER classified RET_STATIC. */
 static int classify_return_root(Checker *c, Node *rexpr) {
     if (!rexpr) return RET_STATIC;               /* bare return — no value */
-    if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
+    /* BUG-923: a LITERAL has no provenance — it cannot be a view of a parameter.
+     * `null` was already classified STATIC here; its siblings were not, and a
+     * STRING literal is the one that matters: it lives in .rodata, so `return
+     * "lit"` is exactly as static as `return some_global`. Landing in RET_UNKNOWN
+     * cost precision at every consumer of ret_param_mask —
+     *   const [*]u8 pick(const [*]u8 u) { return "lit"; }
+     *   g = pick(local);   // rejected: "stack memory may escape"
+     * even though the returned slice provably cannot alias `local`. Widening to
+     * every literal kind can only CLEAR mask bits, never set one, so it moves
+     * results from "may be a param view" to "static" — the sound direction. */
+    if (rexpr->kind == NODE_NULL_LIT   || rexpr->kind == NODE_STRING_LIT ||
+        rexpr->kind == NODE_INT_LIT    || rexpr->kind == NODE_FLOAT_LIT  ||
+        rexpr->kind == NODE_CHAR_LIT   || rexpr->kind == NODE_BOOL_LIT)
+        return RET_STATIC;
     /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root */
     Node *root = rexpr;
     for (;;) {

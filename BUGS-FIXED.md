@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-30 — BUG-914..922: a cast the second layer never learned, a literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, a comptime that could not narrow, and the analyzer reading freed memory
+## Session 2026-08-30 — BUG-914..924: a cast the second layer never learned, a literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, a comptime that could not narrow, the analyzer reading freed memory, a literal with no provenance treated as if it had some, and a coercion that depended on which statement the call sat in
 
 A standalone audit (no branch to harvest). Nine findings. Four are ACCEPT-UNSAFE or a
 silent wrong value: the program compiles, runs, and reads freed memory or answers wrongly
@@ -157,6 +157,127 @@ correct definition.
 
 Gate: two more `p19` cells (matrix 99 -> 103), RED on the pre-fix build. Tests:
 `tests/zer_fail/cast_launder_keep_inference.zer`, `tests/zer/cast_launder_keep_global_ok.zer`.
+
+### BUG-924 — a call ARGUMENT was coerced or not depending on the STATEMENT it sat in
+
+```zer
+u32 take([*]u8 s) { return (u32)s.len; }
+u32 main() {
+    u8[4] arr;
+    u32 r = take(arr);   // works
+    r = take(arr);       // same call, same types -> C compile error
+}
+```
+
+The second line emits `take(arr)` with `arr` as a bare `uint8_t *`, and GCC rejects the
+emitted C with a note about `_zer_slice_u8`. Valid ZER, a C-level diagnostic, and nothing
+in the ZER source to point at.
+
+The axis is the STATEMENT FORM, because that is what picks the dispatch path. A var-decl
+init lowers to `IR_CALL` with decomposed argument locals, which coerces. A plain
+assignment lowers to `%n = ASSIGN <expr>` — the call stays an AST expression handled by
+`emit_rewritten_node` — and that handler's argument loop was:
+
+```c
+for (int i = 0; i < node->call.arg_count; i++) {
+    if (i > 0) emit(e, ", ");
+    emit_rewritten_node(e, node->call.args[i], func);   /* raw. no coercion. */
+}
+```
+
+while its `emit_expr` sibling forty lines up applied both array→slice and slice→pointer at
+the same boundary. Textbook dual dispatch: `grep -c` would have shown two call handlers and
+one coercion.
+
+**Enumerating rather than patching found EIGHT more.** `emit_array_as_slice` ends in
+`emit_expr(e, array_expr)`, and TWELVE sites call it. Eight of the twelve are inside
+IR-rewritten handlers, each in an if/else whose OTHER branch emits the SAME node with
+`emit_rewritten_node(e, node, func)`:
+
+```c
+if (<needs coercion>) emit_array_as_slice(e, node->assign.value, val_eff, aw_inner);
+else                  emit_rewritten_node(e, node->assign.value, func);
+```
+
+One expression, two emitters, chosen by whether a coercion happened to be needed. Those
+eight had not produced a visible failure only because the operands reaching them are
+usually globals, which both emitters spell the same way.
+
+Fixed with ONE definition rather than a second copy: `emit_array_as_slice` now takes the
+`IRFunc *`, non-NULL selecting `emit_rewritten_node` and NULL preserving the AST behaviour.
+The four AST sites pass NULL, the eight IR sites pass `func`, and the new argument loop
+passes `func`. A future caller has to state which path it is on, which is the property the
+old signature could not express.
+
+Found by a sink-matrix cell, not by a test — `p20_lit_global_store` (added for BUG-923)
+came back OVER-REJECT, and the reason turned out to be an unrelated GCC failure in the
+`compile` half of the cell. Worth recording as a property of the harness: because
+`compile` cells build a real binary through GCC, they catch emitter defects that no
+checker-oracle cell can see. The cost is the sibling trap — two other p20 cells first
+failed because MY cells were type-wrong (`?[*]u8` from a `const [*]u8`, a const slice into
+a mutable `keep` param), which is the same "a non-zero exit is not your rule firing"
+mistake this file keeps recording, one level up in the gate.
+
+Corpus prevalence of the broken shape: 112 occurrences of `x = f(y);`.
+
+Test: `tests/zer/call_arg_coerce_all_stmt_forms.zer` crosses the statement form (var-decl
+init / plain assign / assign-to-global / assign-to-optional-global / compound assign /
+nested call argument) with the coercion. Non-vacuity: five `_zer_slice_u8` errors on a
+from-HEAD build, clean after.
+
+### BUG-923 — `return "lit"` was classified "may be a view of a parameter" (over-rejection)
+
+```zer
+const [*]u8 pick(const [*]u8 unused) { return "literal"; }
+const [*]u8 f() { u8[4] b; return pick(b); }   // rejected: "stack memory may escape"
+```
+
+`pick` provably returns a pointer into `.rodata`. It cannot alias `b` under any execution.
+The escape sink rejected the call anyway, at TWO sinks (the return sink and the
+return-field sink), and the same shape was rejected at the global-store sink.
+
+Root cause is one missing sibling. `classify_return_root` builds the per-function return
+summary (`ret_summary_complete` / `ret_param_mask`), and its very first lines already
+special-cased one literal:
+
+```c
+if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
+```
+
+Nothing else. A STRING literal fell through the view-peeling loop to
+`if (root->kind != NODE_IDENT) return RET_UNKNOWN;` — and RET_UNKNOWN does not merely lose
+one bit, it sets `cur_ret_summary_complete = false`, which makes the WHOLE function's
+summary unusable. Every consumer of the summary then has to assume the worst:
+`call_result_static_given_args` can never prove the result static, so
+`call_result_escapes` rejects, and `ir_call_returns_static` cannot suppress a leak.
+
+The fix states the actual invariant rather than patching the string case:
+
+> A literal has no provenance — it cannot be a view of a parameter.
+
+so all six literal kinds are classified RET_STATIC. That is the right generalization and
+also the safe one, because of the direction the change moves in: the mask is accumulated
+by `mask |= (1 << rc)` over every return, a JOIN. A literal arm contributes NOTHING to the
+mask. So the widening can only ever CLEAR bits or stop marking a summary incomplete —
+never set a bit that should have stayed clear. It cannot manufacture a "static" claim for
+a function that returns a param, because the param arm still sets its own bit
+independently.
+
+That direction is what the negative test pins. `tests/zer_fail/return_literal_mixed_param_escapes.zer`
+returns the parameter on one arm and the literal on the other; bit 1 still gets set, and
+passing a local is still rejected. If a future change ever lets the literal arm dominate
+the join, that file starts compiling and a dangling stack slice ships.
+
+Found while triaging an unrelated leak experiment, which is worth recording: the
+`const_slice_return` corpus test failed under that experiment *because* of this defect,
+and the defect turned out to be separable from — and more valuable than — the experiment
+that surfaced it. The experiment was reverted (see docs/limitations.md, the factory-orelse
+leak entry); this was kept.
+
+Non-vacuity: the positive test draws FOUR escape errors on a from-HEAD build and zero
+after. Tests: `tests/zer/return_literal_is_static_ok.zer` (positive, covers the return
+sink, the optional return sink and the var-decl sink),
+`tests/zer_fail/return_literal_mixed_param_escapes.zer` (the soundness guard).
 
 ### BUG-922 — a NON-NULL function pointer through a CARRIER, called through address 0
 

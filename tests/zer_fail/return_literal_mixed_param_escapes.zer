@@ -1,0 +1,25 @@
+// expect-error: stack memory may escape
+// BUG-923 SOUNDNESS GUARD. The literal relaxation must only CLEAR mask bits,
+// never suppress a genuine param view. Here one arm returns the literal (adds
+// nothing to the mask) and the other returns parameter `p` (sets bit 1), so the
+// summary still says "may return param 1" and passing a LOCAL must still be
+// rejected at the escape sink.
+//
+// If a future change makes the literal arm dominate the join — classifying the
+// whole function static because *some* return is a literal — this file starts
+// compiling and a dangling stack slice ships.
+
+const [*]u8 pick(bool b, const [*]u8 p) {
+    if (b) { return p; }
+    return "literal";
+}
+
+const [*]u8 leak() {
+    u8[4] local;
+    return pick(true, local);
+}
+
+u32 main() {
+    const [*]u8 s = leak();
+    return (u32)s.len;
+}

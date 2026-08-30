@@ -241,6 +241,27 @@ process(buf);              // auto-coerces: { .ptr=buf, .len=256 }
   The compiler still rejects a *caller* that passes a local and lets the result
   escape (`g_global = trim(local_buf)` is an error); using the result while the
   buffer is alive is fine. No lifetime annotations needed.
+- The caller-side restriction applies **only to functions that may actually
+  return one of their arguments.** The compiler infers this per function and per
+  parameter. A function whose returns are all literals or globals returns
+  nothing that could point at your stack, so passing a local to it is
+  unrestricted:
+  ```zer
+  u8[4] g_static;
+
+  const [*]u8 name(const [*]u8 unused) { return "zer"; }  // returns .rodata only
+  const [*]u8 f() { u8[4] b; return name(b); }            // OK — cannot view b
+
+  [*]u8 pick(bool c, [*]u8 p) { if (c) { return p; } return g_static; }
+  // `pick` may return param 1, so `g = pick(true, local)` is still an error
+
+  u32 main() {
+      if (f().len != 3) { return 1; }
+      return 0;
+  }
+  ```
+  Mixing the two is safe: an arm that returns a literal adds nothing, an arm
+  that returns a parameter still binds it.
 
 **SEE ALSO**
 [*]T

@@ -1,0 +1,80 @@
+// BUG-924: argument coercion at the call boundary is applied by BOTH emitter
+// dispatch paths, not just the AST one.
+//
+// `emit_expr`'s NODE_CALL coerced a `T[N]` argument into a `{ptr,len}` slice and
+// decayed a slice into `.ptr`; `emit_rewritten_node`'s NODE_CALL emitted every
+// argument raw. Only ONE statement form lowers to the second path:
+//
+//     u32 r = take(arr);   // var-decl init -> IR_CALL, args decomposed  -> OK
+//     r = take(arr);       // assignment    -> IR_ASSIGN <expr>          -> BROKEN
+//
+// so a documented coercion worked or did not depending on whether the result
+// went into a fresh binding. Not a silent miscompile — GCC rejects the emitted C
+// — but the user gets a C-level error about `_zer_slice_u8` for valid ZER.
+//
+// This file crosses the STATEMENT FORM with the coercion, because the statement
+// form is the axis that selects the dispatch path. Pre-fix it does not compile:
+// every assignment-form line below emits a raw `uint8_t *` where the callee
+// expects `_zer_slice_u8`.
+
+u32 take_slice([*]u8 s) { return (u32)s.len; }
+[*]u8 id_slice([*]u8 s) { return s; }
+u32 take_ptr(*u8 p) { return (u32)*p; }
+
+?[*]u8 g_opt;
+u32 g_len;
+u8[4] g_arr;
+
+u32 main() {
+    u8[4] arr;
+    arr[0] = 42;
+
+    // --- array -> slice, at each statement form ---
+
+    // var-decl init (the form that already worked)
+    u32 a = take_slice(arr);
+    if (a != 4) { return 1; }
+
+    // plain assignment — the broken form
+    u32 b;
+    b = take_slice(arr);
+    if (b != 4) { return 2; }
+
+    // assignment whose result is itself a slice
+    [*]u8 s;
+    s = id_slice(arr);
+    if (s.len != 4) { return 3; }
+    if (s[0] != 42) { return 4; }
+
+    // assignment into a GLOBAL
+    g_len = take_slice(arr);
+    if (g_len != 4) { return 5; }
+
+    // assignment into an optional global (array -> slice -> ?slice).
+    // The source must be a GLOBAL array: `id_slice` returns its parameter, so
+    // passing the LOCAL `arr` is a genuine escape and correctly rejected.
+    g_opt = id_slice(g_arr);
+    if (g_opt) |v| {
+        if (v.len != 4) { return 6; }
+    } else {
+        return 7;
+    }
+
+    // compound assignment — the target is read and written, same dispatch path
+    u32 c = 0;
+    c += take_slice(arr);
+    if (c != 4) { return 8; }
+
+    // nested as a call argument
+    if (take_slice(id_slice(arr)) != 4) { return 9; }
+
+    // A slice result reaching a pointer parameter, via the explicit `.ptr`
+    // every ZER-to-ZER call requires. (The IMPLICIT slice -> pointer decay is an
+    // extern-C affordance; the same fix mirrors it on this path, but exercising
+    // it needs a linkable C symbol, so it is not covered here.)
+    u32 d;
+    d = take_ptr(id_slice(arr).ptr);
+    if (d != 42) { return 10; }
+
+    return 0;
+}

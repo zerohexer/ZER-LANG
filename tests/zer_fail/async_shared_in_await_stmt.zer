@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot access shared struct in statement containing yield/await
+// The counterpart to tests/zer/async_shared_per_statement_ok.zer. The rule is
+// about the STATEMENT, not the function: a shared access in the same statement
+// as the suspend would hold the per-statement lock across it.
+shared struct S { u32 v; }
+S s;
+
+async void w() { await s.v > 0; }
+
+u32 main() { return 0; }

@@ -1,3 +1,4 @@
+// gap-runtime-exit: 133
 // PRECISION GAP #2 (2026-04-19 audit)
 // CLAIM: *opaque parameter cast to two different types inside the
 //        same function should be detectable as inconsistent use.

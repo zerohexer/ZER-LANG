@@ -199,9 +199,39 @@ for f in tests/zer_gaps/*.zer; do
     # (CLAUDE.md "zerc -o gotchas"). Clean both artefacts or the tree fills with
     # untracked binaries.
     rm -f "${f%.zer}.c" "${f%.zer}" 2>/dev/null
+    # 2026-08-30: compile-clean is the right oracle for a gap whose defect is
+    # "the checker should have rejected this". It is the WRONG oracle for a gap
+    # whose defect is a RUNTIME one — a wrong answer, a dropped defer, a missing
+    # trap — because such a file keeps compiling after the defect is fixed and
+    # goes on scoring "ok, gap still open" forever. Measured: eight files here
+    # were byte-identical duplicates of tests that had already been promoted, and
+    # one recorded a HIGH-severity dropped-defer miscompile that no longer
+    # happens. The directory drifted back into the parking lot the 2026-08-03
+    # triage rescued it from, one axis over.
+    #
+    # `// gap-runtime-exit: N` states what the program DOES while the gap is
+    # open. The file must still compile AND still produce N; a different exit
+    # means the behaviour changed, which for a runtime gap is exactly the moment
+    # to promote it. Optional, so compile-only gaps are unaffected.
+    gap_rt=$(head -8 "$f" | grep -oE '// gap-runtime-exit: *-?[0-9]+' | grep -oE '\-?[0-9]+$' | head -1)
+    if [ $gret -eq 0 ] && [ -n "$gap_rt" ]; then
+        timeout "${ZER_RUN_TIMEOUT:-20}" $ZERC "$f" $EXTRA_FLAGS $file_flags --run >/dev/null 2>&1
+        gap_actual=$?
+        rm -f "${f%.zer}.c" "${f%.zer}" 2>/dev/null
+        if [ "$gap_actual" != "$gap_rt" ]; then
+            GAP_FAIL=$((GAP_FAIL + 1))
+            echo "  FAIL: $name — compiles, but its RUNTIME behaviour changed"
+            echo "        recorded exit $gap_rt while the gap is open, got $gap_actual"
+            echo "        -> the gap closed: promote it to tests/zer/ or tests/zer_trap/"
+            echo "           and delete this file; a runtime gap that still compiles is"
+            echo "           NOT evidence the defect survives"
+            rm -f /tmp/_zer_gap_err.txt 2>/dev/null
+            continue
+        fi
+    fi
     if [ $gret -eq 0 ]; then
         GAP_OK=$((GAP_OK + 1))
-        echo "  ok:   $name (gap still open)"
+        echo "  ok:   $name (gap still open${gap_rt:+, runtime exit $gap_rt})"
     # `--` here for the same reason as the expect-error site above: a
     # gap-masked-by string that STARTS WITH A DASH would be parsed by grep as
     # its own options. The two sites answer the same question and must not

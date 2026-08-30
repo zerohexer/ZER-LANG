@@ -1,3 +1,4 @@
+// gap-runtime-exit: 0
 // AUDIT 2026-06-12 — MEDIUM severity (hosted-ARM runtime crash)
 //
 // Gap: emitter `@critical` cascade at emitter.c:9528-9594 gates

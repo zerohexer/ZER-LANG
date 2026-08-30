@@ -7,9 +7,9 @@ Entries removed once fixed.
 
 # HANDOFF — read this first (updated 2026-08-30)
 
-**2026-08-30 standalone audit — BUG-914..921 landed; four decisions recorded below so
-they are not re-litigated.** `make check` exit 0, **1412 .zer**, all nine gates, sink
-matrix **103 cells / 0 mismatch** (was 88). See BUGS-FIXED.md for the fixes; this section
+**2026-08-30 standalone audit — BUG-914..922 landed; four decisions recorded below so
+they are not re-litigated.** `make check` exit 0, **1418 .zer**, all nine gates, sink
+matrix **103 cells / 0 mismatch** (was 88). `tests/zer_gaps/` triaged 23 -> 10 (see below). See BUGS-FIXED.md for the fixes; this section
 is only the things measured and NOT changed, plus the gaps left open.
 
 **New measurement sweep: `tools/compiler_asan_sweep.sh`** — runs ZERC ITSELF under
@@ -19,6 +19,50 @@ at three sites plus signed overflow in `emitter.c` on its first run. **Run it af
 change to `zercheck_ir.c`'s handle bookkeeping or to any realloc-backed structure** — that
 class is invisible to every .zer test by construction, because reading freed memory does
 not crash, it just decides a safety verdict from stale bytes.
+
+## `tests/zer_gaps/` TRIAGED 2026-08-30 — 23 files -> 10, and the harness that let them rot
+
+The 2026-08-03 triage rescued this directory from being executed by NOTHING. It drifted
+back, one axis over: the runner asks only **"does it still compile"**, and that is the
+WRONG oracle for a gap whose defect is a RUNTIME one. Such a file keeps compiling after
+the defect is fixed and goes on scoring `ok, gap still open` forever.
+
+Measured:
+
+| finding | count |
+|---|---|
+| byte-identical DUPLICATES of tests already promoted to `tests/zer{,_trap}/` | 7 |
+| genuinely CLOSED, still reported open | 4 |
+| claim did not reproduce, and the reproducer could not have shown it | 1 |
+| a gap against a SPEC CLAIM that was itself corrected (2026-08-10) | 1 |
+| still open, correctly recorded | 10 |
+
+The worst was `audit_2026-06-17_defer_goto_fallthrough_drops` — a HIGH-severity SILENT
+MISCOMPILE (a `defer` dropped on the sibling fall-through path of a `goto`, so handles
+leaked and locks went unreleased). It is fixed, and had been for some time. Nothing
+noticed, because a miscompile compiles fine.
+
+`audit2_defer_scan_nested` is the other lesson: its claim came from CODE INSPECTION of
+`zercheck.c`'s scan-depth cap, an analyzer the CFG-based `zercheck_ir` had already
+replaced — and its reproducer allocated with `alloc(Task)` and freed with
+`heap.free_ptr(t)`, two different allocators, so it trapped on the mismatch and never
+reached the depth limit at all. An unmeasured claim plus a reproducer that does not
+reproduce it.
+
+**Harness fix: `// gap-runtime-exit: N`** states what the program DOES while the gap is
+open. The file must still compile AND still produce N; a different exit fails loudly and
+says to promote it. Optional, so compile-only gaps are unaffected. Verified non-vacuous by
+setting a wrong value and watching it go RED.
+
+Everything closed was promoted rather than deleted where it had no equivalent:
+`tests/zer/{probe_fault_returns_null,defer_goto_sibling_fallthrough_fires,bool_int_explicit_cast_ok,async_shared_per_statement_ok,defer_deep_nesting_free_seen}.zer`,
+`tests/zer_trap/explicit_trap.zer`, `tests/zer_fail/async_shared_in_await_stmt.zer`.
+
+**The general rule, worth keeping:** when a gate's oracle is weaker than the defect class
+it guards, the gate reports success forever. `expect-error` fixed that for negatives,
+`expect-trap` for traps, `expect-trap-at` for trap LOCATIONS (BUG-917 lived under the
+suite because stderr went to /dev/null), and `gap-runtime-exit` for behavioural gaps. Each
+was found the same way: by asking what the file would do if the defect were fixed.
 
 ## DECIDED 2026-08-30 — do not re-open
 

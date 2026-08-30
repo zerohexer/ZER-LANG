@@ -1,0 +1,34 @@
+// Promoted from tests/zer_gaps/gap4_async_shared_across_yield.zer (2026-08-30).
+//
+// That file recorded a gap against a SPEC CLAIM ("lock held across yield =
+// deadlock") that the implementation never needed to satisfy, and said so
+// itself: "May be a spec correction rather than a real compiler fix." The
+// correction was made — docs/limitations.md settled it 2026-08-10 — but the
+// reproducer stayed in the gap directory, where it went on reporting an open
+// gap against a rule that does not exist.
+//
+// The REAL rule, and what this pins: locking is PER-STATEMENT, so a shared
+// access in a statement that does NOT contain the suspend is fine — the lock is
+// taken and released before `yield` runs. A shared access in a statement that
+// DOES contain a yield/await is rejected, because there the lock really would be
+// held across the suspend; tests/zer_fail/ carries that negative.
+shared struct S { u32 v; }
+S s;
+
+async void task() {
+    s.v = 1;        // locked, written, unlocked — all before the suspend
+    yield;
+    s.v = 2;        // fresh lock on resume
+}
+
+u32 main() {
+    _zer_async_task t;
+    _zer_async_task_init(&t);
+    u32 polls = 0;
+    while (_zer_async_task_poll(&t) == 0) {
+        polls += 1;
+        if (polls > 10) { return 1; }
+    }
+    if (s.v != 2) { return 2; }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// Promoted from tests/zer_gaps/ast_probe.zer (2026-08-30): it was recorded as an
+// open gap and has been correct for a long time — @probe on an unmapped address
+// returns null rather than faulting, which is the whole point of the intrinsic.
+// probe_mode_default.zer covers only the SUCCESS path, so the fault path had no
+// test at all while a stale gap file claimed it was unverified.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+u32 main() {
+    ?u32 r = @probe(0x0);        // unmapped — must come back null, not fault
+    u32 v = r orelse 42;
+    if (v != 42) { return 1; }
+
+    u32 g = 7;                    // and a valid address still reads through
+    usize a = @ptrtoint(&g);
+    ?u32 ok = @probe(a);
+    u32 got = ok orelse 0;
+    if (got != 7) { return 2; }
+    return 0;
+}

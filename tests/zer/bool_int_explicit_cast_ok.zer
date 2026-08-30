@@ -1,0 +1,36 @@
+// Promoted from tests/zer_gaps/audit2026-05-24_bool_int_cast.zer (2026-08-30),
+// where it was recorded as a "SILENT GAP" on the strength of a code reading:
+// "(bool)42 produces a boolean containing the non-{0,1} value 42 ... exhaustive
+// switch reasoning is silently defeated". MEASURED, it does not: the emitter
+// writes `((uint8_t)!!(n))`, so the value is normalised to 0/1 and every
+// downstream use — the `if`, the exhaustive `switch`, the round trip back to
+// u32 — behaves.
+//
+// The remaining question was never a soundness one, only a design preference,
+// and the decision is recorded: ZER bans the IMPLICIT bool<->int coercion and
+// permits the EXPLICIT cast, which is what `(T)x` means everywhere else in the
+// language. reference.md states it under "(Type)expr — C-Style Cast".
+u32 main() {
+    volatile u32 raw = 42;
+    u32 n = raw;
+
+    bool b = (bool)n;                 // normalised, not reinterpreted
+    if (!b) { return 1; }
+    if ((u32)b != 1) { return 2; }    // NOT 42
+
+    bool z = (bool)0;
+    if (z) { return 3; }
+    if ((u32)z != 0) { return 4; }
+
+    // an exhaustive switch still reasons correctly about the normalised value
+    u32 hit = 0;
+    switch (b) {
+        true  => { hit = 1; }
+        false => { hit = 2; }
+    }
+    if (hit != 1) { return 5; }
+
+    // and the implicit direction is still banned — see
+    // tests/zer_fail/ for the negatives that pin it.
+    return 0;
+}

@@ -1,0 +1,36 @@
+// Promoted from tests/zer_gaps/audit_2026-06-17_defer_goto_fallthrough_drops.zer
+// (2026-08-30). That file recorded a HIGH-severity SILENT MISCOMPILE: when a
+// defer scope contained a `goto` that exits by one path, the defer body was not
+// emitted on the SIBLING fall-through path, because IR_DEFER_FIRE popped a
+// shared stack at the first fire. Symptom in real code: Pool/Slab handles
+// leaked, locks not released, file descriptors not closed — on the non-goto path
+// only, with no diagnostic.
+//
+// It is FIXED, and had been for some time. Nothing noticed, because the gap
+// harness asked only "does it still compile" and a miscompile compiles fine.
+// That is why the harness now takes `// gap-runtime-exit:` and why this file
+// lives here instead: the assertion has to be on the BEHAVIOUR.
+i32 g_called = 0;
+
+void mark() { g_called += 1; }
+
+u32 multi_path(u32 x) {
+    if (x > 0) {
+        defer mark();
+        if (x == 1) { goto done; }
+        // fall-through — the defer must fire here too
+    }
+    return 100;
+done:
+    return 200;
+}
+
+u32 main() {
+    multi_path(5);                    // fall-through path
+    if (g_called != 1) { return 1; }
+    multi_path(1);                    // goto path
+    if (g_called != 2) { return 2; }
+    multi_path(0);                    // never enters the defer scope
+    if (g_called != 2) { return 3; }
+    return 0;
+}

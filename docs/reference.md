@@ -45,6 +45,23 @@ i8 small = @truncate(i8, big_value);
 
 **NOTES**
 - Same rules as unsigned: no implicit narrowing, no implicit sign conversion.
+- **A literal must FIT the declared type — at every width, including `i64`.**
+  The bound is the type's own range, not the literal's spelling:
+
+<!-- audit: skip -->
+```zer
+i64 hi  =  9223372036854775807;   // OK  — INT64_MAX
+i64 lo  = -9223372036854775808;   // OK  — INT64_MIN
+u64 um  = 18446744073709551615;   // OK  — UINT64_MAX is a u64 constant
+i64 bad =  18446744073709551615;  // ERROR — does not fit in 'i64'
+i64 neg = -18446744073709551615;  // ERROR — magnitude does not fit
+i16 b16 = 40000;                  // ERROR — does not fit in 'i16'
+```
+
+  The rule is the same at every sink — variable, assignment, struct-literal
+  field, call argument, return, and global initialiser — because they all ask
+  one predicate. Wrapping is a defined RUNTIME behaviour (`hi + 1 == lo`); it is
+  not a way to write a constant you did not mean.
 
 **SEE ALSO**
 u8..u64
@@ -2927,6 +2944,34 @@ f32 ratio = (f32)big;          // int → float value convert
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
 - `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+- `bool` converts both ways EXPLICITLY: `(bool)5` is `true`, `(u32)true` is `1`.
+  Only the IMPLICIT conversion is banned.
+- Float → integer is DEFINED and SATURATES, NaN → 0 (see its own section below).
+
+**WHAT `(Type)expr` CAN NAME — and what it cannot**
+
+The cast is recognised syntactically, before any name is resolved, so the target
+must be spelled with a token the parser can identify as a type on sight:
+
+| target | example | works |
+|---|---|---|
+| keyword scalar | `(u32)x`, `(i8)x`, `(usize)x`, `(f32)x`, `(bool)x` | yes |
+| pointer | `(*Motor)p`, `(*opaque)p` | yes |
+| qualified pointer | `(const *u32)p`, `(volatile *u32)p` | yes |
+| **arbitrary width `uN`/`iN`** | `(u3)x`, `(i48)x` | **no** — use `@truncate(u3, x)` or `@saturate(u3, x)` |
+| **named enum** | `(State)x` | **no** — use `@bitcast(State, x)` (guarded, see below) |
+| **named struct/union** | `(Point)x` | **no** — assign the fields, or `@pun(*Point, p)` |
+| **distinct typedef** | `(Id)x` | **no** — use `@cast(Id, x)` |
+| **optional / slice** | `(?u32)x`, `([*]u8)a` | **no** — `?T` wraps implicitly; an array coerces to a slice on its own |
+
+This is a deliberate limitation, not an oversight. `u3`, `State` and `Id` are all
+ordinary identifiers, so admitting them as cast targets would make `(name)` in
+expression position ambiguous with a parenthesised variable — and the corpus
+already contains variables named `i1` and `i2`, which match the `iN` spelling
+exactly. `(i1) - 1` would then parse as a CAST of `-1` rather than a
+subtraction: a silent wrong value in place of today's loud parse error, which is
+the wrong trade. C resolves this with a symbol table in the lexer; ZER's parser
+deliberately has none. Every case has a named intrinsic that is unambiguous.
 
 ---
 
@@ -3074,7 +3119,8 @@ hardware register is a real firmware idiom — so ZER **tracks** rather than ban
 conversion compiles, and a guard traps if the value is not a declared variant. Without it
 an exhaustive `switch` silently runs its last arm on a value that matches none.
 
-There are exactly **three** doors, and each carries the guard:
+Three **value conversions** can produce one, and each carries the guard at the point of
+conversion:
 
 | conversion | guarded |
 |---|---|
@@ -3082,9 +3128,24 @@ There are exactly **three** doors, and each carries the guard:
 | `@truncate(Enum, n)` | yes |
 | `@saturate(Enum, n)` | yes |
 
-`@cast` is **not** a fourth door: it requires a distinct typedef and cannot name a bare
-enum. The guard also recurses through struct fields, optional payloads and array elements,
-so `@bitcast(Box, 7)` where `struct Box { State s; }` is checked too.
+`@cast` is not one of them: it requires a distinct typedef and cannot name a bare enum.
+The guard recurses through struct fields, optional payloads and array elements, so
+`@bitcast(Box, 7)` where `struct Box { State s; }` is checked too.
+
+**A pointer route cannot be guarded at the conversion, so the `switch` guards it.**
+`@ptrcast(*State, &some_u32)` produces a POINTER — there is no value at the cast site to
+check, and the forgery only materialises at the read. So the exhaustive `switch` itself
+carries a backstop: its last arm compares like every other arm, and a value matching no
+declared variant traps with
+
+```
+ZER TRAP: switch on an enum value that is not a declared variant
+```
+
+instead of silently running that last arm. This is the same defect the three conversion
+guards close, caught at the point of CONSEQUENCE rather than at each door — so a route
+nobody has enumerated still cannot produce a silent wrong branch. A `switch` with a
+`default` arm is unaffected: `default` is the answer for "none of the above".
 
 ```zer
 enum State { idle, running, done }
@@ -3101,6 +3162,9 @@ u32 main() {
 
 `@bitcast(State, 7)` compiles and traps at run time with
 `@bitcast produced a value that is not a declared variant of this enum`.
+
+The conversion guards are the ones that name the culprit, so prefer them: reading an enum
+out of a register is `@bitcast(State, reg_value)`, not a pointer cast.
 
 ### Argument counts are checked
 

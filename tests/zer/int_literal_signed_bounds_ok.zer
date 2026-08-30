@@ -1,0 +1,18 @@
+// BUG-915 BOUNDARY, asserted at RUNTIME. The exact extremes must still compile
+// and must still carry their value: tightening the i64 literal rule must not
+// cost INT64_MAX, INT64_MIN, or an unsigned UINT64_MAX (which is a perfectly
+// good u64 constant and the shape every corpus use of a huge literal has).
+u32 main() {
+    i64 hi = 9223372036854775807;
+    i64 lo = -9223372036854775808;
+    u64 um = 18446744073709551615;
+    i64 neg = -1;
+
+    if (hi <= 0) { return 1; }
+    if (lo >= 0) { return 2; }
+    if (um == 0) { return 3; }
+    if (neg != -1) { return 4; }
+    if (hi + 1 != lo) { return 5; }        // wraps, defined
+    if (um / 2 != 9223372036854775807) { return 6; }
+    return 0;
+}

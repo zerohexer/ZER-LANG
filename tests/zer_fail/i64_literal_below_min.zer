@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize 'a' of type 'i64'
+// BUG-915, the NEGATIVE half. The magnitude must fit, exactly as it must at
+// every narrower width. Before the fix this compiled and a was 1.
+u32 main() {
+    i64 a = -18446744073709551615;
+    if (a > 0) { return 1; }
+    return 0;
+}

@@ -88,8 +88,17 @@ for f in tests/zer_trap/*.zer; do
     #    demands SIGTRAP (133) specifically, the same opt-in shape as
     #    `// expect-error` for negatives, so existing tests that abort by other
     #    means keep working.
-    want_trap=$(head -5 "$f" | grep -c '// expect-trap')
-    timeout "${ZER_RUN_TIMEOUT:-20}" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>/dev/null
+    want_trap=$(head -5 "$f" | grep -c '// expect-trap$\|// expect-trap ')
+    #  * WHERE it trapped was invisible. stderr went to /dev/null, so a trap test
+    #    could not assert the message OR the reported source line — and BUG-917
+    #    lived under this suite the whole time: every trap named a line that does
+    #    not exist in the file (function-declaration line + offset in the
+    #    generated C), because IR block emission switched #line mapping off
+    #    wholesale. The number looks plausible, which is exactly why no test
+    #    caught it. `// expect-trap-at: N` asserts the reported location; the
+    #    optional-directive shape matches `expect-error` and `expect-trap`.
+    want_line=$(head -8 "$f" | grep -oE '// expect-trap-at: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    trap_out=$(timeout "${ZER_RUN_TIMEOUT:-20}" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>&1)
     ret=$?
     if [ $ret -eq 124 ]; then
         FAIL=$((FAIL + 1))
@@ -97,6 +106,9 @@ for f in tests/zer_trap/*.zer; do
     elif [ "$want_trap" -gt 0 ] && [ $ret -ne 133 ]; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (expected SIGTRAP/133, got exit $ret)"
+    elif [ -n "$want_line" ] && ! printf '%s' "$trap_out" | grep -qE "\.zer:$want_line\b"; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (expected trap at line $want_line, got: $(printf '%s' "$trap_out" | grep -o 'ZER TRAP:.*' | head -1))"
     elif [ $ret -ne 0 ]; then
         PASS=$((PASS + 1))
         echo "  PASS: $name (correctly trapped, exit $ret)"

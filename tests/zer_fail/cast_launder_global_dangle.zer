@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: left dangling at function exit
+// BUG-914. `g = (*N)n` is the SAME store as `g = n` — the emitter ELIDES an
+// identity pointer cast, so the emitted C is byte-identical — but zercheck_ir's
+// store-source peeler saw only @ptrcast/@pun/@bitcast/@cast/@container and not
+// the C-style cast. checker.c's unwrap_ptr_launder was taught this in BUG-791;
+// this layer was not. MEASURED LIVE before the fix: this program compiled, ran,
+// and returned 7 — a read of freed memory through the global.
+struct N { u32 v; }
+?*N g;
+
+u32 main() {
+    *N n = alloc(N) orelse { return 1; };
+    n.v = 7;
+    g = (*N)n;
+    free(n);
+    *N r = g orelse { return 2; };
+    return r.v;
+}

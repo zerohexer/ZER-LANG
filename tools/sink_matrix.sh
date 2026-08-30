@@ -272,6 +272,46 @@ cell p18_safe_stack_view    compile 'struct N18{u32 v;u32 w;} *u32 fo18(*N18 n){
 cell p18_safe_null_arm      compile '?*u32 mb18(*u32 p,bool ok){ if (ok) { return p; } return null; } u32 main(){ u32 loc=3; ?*u32 m=mb18(&loc,true); if (m) |pp| { if (*pp != 3) { return 1; } } return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p19 (BUG-914): the C-STYLE cast launder at the HEAP-OWNERSHIP sinks.
+#
+# p15 covers the same wrapper at the FRAME-BOUND sinks (checker.c, BUG-791).
+# This row is the sibling one layer down: zercheck_ir.c answers "which ALLOCATION
+# does this value alias?", and its two peelers saw @ptrcast / @pun / @bitcast /
+# @cast / @container but NOT `(*T)x` — casts postdate the analysis, and the
+# BUG-791 fix taught only the checker. Measured on main before the fix:
+#
+#     g = n;                 -> rejected      (dangling global)
+#     g = @ptrcast(*N, n);   -> rejected
+#     g = (*N)n;             -> COMPILED, RAN, returned freed memory
+#
+# with byte-identical emitted C for all three (the emitter elides an identity
+# pointer cast). Both peelers now consult the SHARED ast.h predicate, so a value
+# cast `(u32)x` is still never peeled — that is what the two `safe` cells pin.
+#
+# VERIFIED NON-VACUOUS against a pre-fix build (git archive HEAD): the four
+# GLOBAL-store cells were live HOLES, the two intra-function cells (alias_uaf,
+# double_free) were already caught by the direct-alias path and are kept as
+# class coverage rather than as evidence.
+echo "===== SHAPE p19 = a C-style cast laundering a HEAP pointer past ownership ====="
+cell p19_cast_global_store   reject 'struct N19{u32 v;} ?*N19 g19; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19=(*N19)n; free(n); *N19 r=g19 orelse {return 2;}; return r.v; }'
+cell p19_cast_global_field   reject 'struct N19{u32 v;} struct H19{?*N19 p;} H19 gh19; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; gh19.p=(*N19)n; free(n); *N19 r=gh19.p orelse {return 2;}; return r.v; }'
+cell p19_cast_double_hop     reject 'struct N19{u32 v;} ?*N19 g19b; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19b=(*N19)((*N19)n); free(n); *N19 r=g19b orelse {return 2;}; return r.v; }'
+cell p19_cast_opaque_global  reject 'struct N19{u32 v;} ?*opaque g19c; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19c=(*opaque)n; free(n); return 0; }'
+cell p19_cast_alias_uaf      reject 'struct N19{u32 v;} u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; *N19 k=(*N19)n; free(n); return k.v; }'
+# The checker-side sibling: a struct LITERAL field. struct_init_has_local_derived
+# hand-rolled its own peel (last-arg, no cast arm) instead of calling the shared
+# one, so `{ .p = (*u32)(&loc) }` escaped while the bare and @ptrcast spellings
+# were both rejected. It now uses unwrap_ptr_launder for cases A-D alike.
+cell p19_cast_struct_lit     reject 'void c19(){ u32 loc=5; g_h = { .p = (*u32)(&loc) }; } u32 main(){c19();return 0;}'
+cell p19_cast_struct_lit_al  reject 'void c19(){ u32 loc=5; *u32 a=&loc; g_h = { .p = (*u32)a }; } u32 main(){c19();return 0;}'
+cell p19_cast_double_free    reject 'struct N19{u32 v;} u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; *N19 k=(*N19)n; free(n); free(k); return 0; }'
+# BOUNDARY: a VALUE cast is not a reference and must never be peeled, and a
+# correctly-reset global must still compile — otherwise the fix is an over-reject.
+cell p19_safe_struct_lit_g   compile 'u32 gd19=1; void c19(){ g_h = { .p = (*u32)(&gd19) }; } u32 main(){c19();return 0;}'
+cell p19_safe_value_cast     compile 'struct N19{u32 v;} u32 g19v; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19v=(u32)n.v; free(n); if (g19v!=7) { return 2; } return 0; }'
+cell p19_safe_reset_global   compile 'struct N19{u32 v;} ?*N19 g19d; u32 main(){ *N19 n=alloc(N19) orelse {return 1;}; n.v=7; g19d=(*N19)n; u32 r=n.v; g19d=null; free(n); if (r!=7) { return 2; } return 0; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

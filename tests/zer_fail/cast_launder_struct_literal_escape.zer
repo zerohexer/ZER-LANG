@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: carrying a pointer to a local
+// BUG-914, the CHECKER-side sibling. struct_init_has_local_derived hand-rolled
+// its own peel — a last-argument loop with no cast arm — instead of calling the
+// shared unwrap_ptr_launder. So the same store three ways:
+//     g = { .p = &loc };                  rejected
+//     g = { .p = @ptrcast(*u32, &loc) };  rejected
+//     g = { .p = (*u32)(&loc) };          ACCEPTED  <- stack-use-after-return
+// and the emitted C is identical, because the emitter elides an identity
+// pointer cast. The hand-rolled loop also took the LAST argument of EVERY
+// intrinsic, which is the @container/@cstr mis-peel the shared helper exists to
+// avoid; both are gone now that cases A-D all read the peeled node.
+struct H { ?*u32 p; }
+H g;
+
+void c() {
+    u32 loc = 5;
+    g = { .p = (*u32)(&loc) };
+}
+
+u32 main() { c(); return 0; }

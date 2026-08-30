@@ -1,0 +1,15 @@
+// BUG-914 BOUNDARY. Peeling the cast must not reject a struct literal whose
+// pointer field holds the address of a GLOBAL — that outlives every frame and
+// is the whole point of the rule being about locals.
+struct H { ?*u32 p; }
+H g;
+u32 gd = 41;
+
+void c() { g = { .p = (*u32)(&gd) }; }
+
+u32 main() {
+    c();
+    *u32 r = g.p orelse { return 1; };
+    if (*r != 41) { return 2; }
+    return 0;
+}

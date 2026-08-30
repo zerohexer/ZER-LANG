@@ -5,6 +5,148 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-30 — BUG-914..917: the C-style cast the second layer never learned, a signed literal that only fit at 64 bits, the fourth enum door, and every trap pointing at the wrong line
+
+A standalone audit (no branch to harvest). Four findings, three of them silent by
+construction — the program compiles, runs, and gives a wrong answer or reads freed memory
+with no diagnostic at either compile time or run time.
+
+### BUG-914 — a C-style cast laundered a HEAP pointer past ownership tracking (ACCEPT-UNSAFE)
+
+```zer
+struct N { u32 v; }
+?*N g;
+u32 main() {
+    *N n = alloc(N) orelse { return 1; };
+    n.v = 7;
+    g = (*N)n;          // <- ACCEPTED
+    free(n);
+    *N r = g orelse { return 2; };
+    return r.v;         // reads freed memory; MEASURED: compiled, ran, returned 7
+}
+```
+
+`g = n;` and `g = @ptrcast(*N, n);` were both rejected. Only the C-style spelling slipped —
+and the emitter ELIDES an identity pointer cast, so the emitted C is byte-identical for all
+three. Three spellings of one program, two diagnosed.
+
+**Root cause: one question answered in two layers, and only one layer was taught.**
+`checker.c`'s `unwrap_ptr_launder` learned to peel a reference-producing C-style cast in
+BUG-791. `zercheck_ir.c` asks the same question — "which ALLOCATION does this value
+alias?" — through two peelers of its own (`ir_peel_cast_wrappers`,
+`ir_find_store_source_local`), and both still enumerated only the intrinsic casts. Casts
+postdate the escape analysis, which is why they are the shape that keeps being missed.
+
+A THIRD site was found by enumerating rather than by report: `struct_init_has_local_derived`
+hand-rolled its own peel — a last-argument loop with no cast arm — so
+`g = { .p = (*u32)(&loc) };` escaped a stack pointer while the bare and `@ptrcast`
+spellings were rejected. That loop also took the LAST argument of EVERY intrinsic, which is
+precisely the `@container`/`@cstr` mis-peel the shared helper exists to avoid.
+
+**Fix — one definition, three consumers.** The predicate moved to `ast.h` as
+`zer_tynode_is_reference_producing`; `checker.c`'s local copy delegates to it, both
+zercheck_ir peelers consult it, and `struct_init_has_local_derived` now calls
+`unwrap_ptr_launder` for cases A-D alike instead of hand-rolling. A value cast `(u32)x` is
+still never peeled — that boundary is pinned by two `compile` cells.
+
+**Six holes were live**, verified against a `git archive HEAD` build: the global store, the
+global struct-FIELD store, a two-hop cast, an `*opaque` store, and both struct-literal
+forms. Gate: **SHAPE p19** in `tools/sink_matrix.sh` (matrix 88 -> 99 cells, clean).
+Tests: `tests/zer_fail/cast_launder_{global_dangle,global_field_dangle,struct_literal_escape}.zer`,
+`tests/zer/cast_launder_{value_cast_ok,struct_literal_global_ok}.zer`.
+
+### BUG-915 — an over-range literal was rejected at every signed width EXCEPT i64
+
+```zer
+i16 a = 40000;                   // ERROR — does not fit in 'i16'
+i32 x = 3000000000;              // ERROR — does not fit in 'i32'
+i64 y = 18446744073709551615;    // ACCEPTED — and y is -1
+```
+
+`is_literal_compatible` returned `true` unconditionally for `TYPE_I64`, with the comment
+"val is uint64, positive literal fits in i64" — false for anything above 2^63-1. The `iN`
+sibling (`TYPE_SINT` with `bits >= 64`) had the same hole, and so did the NEGATIVE branch,
+where `i64 a = -18446744073709551615;` wrapped to 1.
+
+It was never "no rule at 64 bits": it is ONE rule with a hole at exactly the widest width —
+the same shape BUG-863 closed in the mirror direction (a negative constant into an unsigned
+type). Because all six value-flow sinks route through this single predicate, the hole was
+present at every one of them: var-decl, assignment, struct-literal field, call argument,
+return, global initialiser. The struct-field and call-argument sinks have no dedicated
+"integer literal does not fit" check of their own and relied entirely on this predicate.
+
+**Corpus cost measured before shipping: ZERO.** Every literal above `INT64_MAX` in the
+whole corpus targets `u64`, an `@addc`/`@mulw` argument, or an `mmio` range.
+Tests: `tests/zer_fail/i64_literal_{above_max,below_min,over_range_sinks}.zer`,
+`tests/zer/int_literal_signed_bounds_ok.zer` (asserts INT64_MAX / INT64_MIN / UINT64_MAX at
+RUNTIME, so a tightening cannot quietly cost the extremes).
+
+### BUG-916 — a FOURTH enum-forging route, and why the guard belongs at the consequence
+
+```zer
+enum State { a, b, c }
+volatile u32 raw = 99; u32 v = raw;
+*State p = @ptrcast(*State, &v);
+switch (*p) { .a => {} .b => {} .c => {} }    // ran `.c`
+```
+
+Value 99, equal to no variant, and arm `.c` executed — verbatim the BUG-843 symptom, after
+that symptom had already been fixed three times at three separate DOORS (`@bitcast`,
+`@truncate`, `@saturate`). This route cannot be closed at a door: `@ptrcast` produces a
+POINTER, so there is no value at the cast site to guard; the forgery materialises at the
+read.
+
+**The mechanism was a stated premise that had become false.** `ir_lower.c` entered the LAST
+arm of an exhaustive enum switch with NO comparison, reasoning that "the checker enforces
+all enum variants be covered ... so the last arm's condition-false case is unreachable at
+runtime". True only while every enum value is a declared variant.
+
+**Fix — guard the CONSEQUENCE, not the Nth door.** The last arm now compares like every
+other arm, and its false edge goes to a trap block. Any value that is no declared variant
+halts with `switch on an enum value that is not a declared variant` instead of silently
+running that arm — including through a route nobody has enumerated yet.
+
+The second half of the original comment is still load-bearing and is preserved: a plain
+branch to `bb_exit` would give it a spurious predecessor carrying pre-switch state and
+reintroduce MAYBE_FREED false positives. So the trap block's only successor is the arm
+itself — **bb_exit's predecessor set is unchanged**, and the analyzer sees the same CFG it
+saw before. The three conversion guards stay: they name the culprit, and this is the
+backstop. `@enum_forged` is synthesized only by IR lowering (the checker rejects that
+spelling as an unknown intrinsic) and is handled in BOTH emitter dispatch paths.
+Tests: `tests/zer_trap/enum_switch_forged_via_ptrcast.zer`,
+`tests/zer/enum_switch_exhaustive_ok.zer` (every variant, multi-value arms, captures).
+
+### BUG-917 — EVERY runtime trap reported a line that does not exist
+
+```
+u32 main() {            // a 7-line file
+    ...
+    return s[i];        // line 6 — out of bounds
+}
+ZER TRAP: array index out of bounds at ln1.zer:15
+```
+
+Function bodies are IR-only, and IR block emission switches source mapping off wholesale
+(`e->source_file = NULL`) because an unconditional `#line` collided with goto labels and
+statement expressions — the BUG-418 class. With ONE `#line` per function and none inside,
+every line in every function body mapped to "the function's declaration line, plus the
+offset in the generated C". So every trap message, and every GCC diagnostic about emitted
+code, named a wrong line. The trap itself always fired correctly; only the location lied,
+which is why nothing caught it — the number looks plausible.
+
+**Fix:** re-anchor per INSTRUCTION (`emit_line_map`), at a point that is always between
+statements at column 0 — never inside a `({...})` and never on the same line as a `{` or a
+label. This is why it is safe where the wholesale approach was not.
+
+One thing worth recording because the intuitive version is wrong: the directive is emitted
+for EVERY instruction, not only when the ZER line changes. `#line N` numbers the NEXT line
+N and then counts up, so an instruction expanding to three C lines leaves the counter at
+N+3 and a second instruction on the SAME ZER line is misreported. The first draft
+deduplicated on "line unchanged" and still reported line 28 for a statement on line 8.
+Cost: the intermediate `.c` grows ~10-47% (it is a temp file, deleted after GCC).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

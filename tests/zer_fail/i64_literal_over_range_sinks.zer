@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: field '.f' expects 'i64', got 'u64'
+// BUG-915 reached SIX sinks through the one shared predicate. This pins the
+// struct-literal-field and call-argument sinks, which have no dedicated
+// "integer literal does not fit" check of their own and relied entirely on
+// value_flows_to -> is_literal_compatible returning false.
+struct S { i64 f; }
+i64 ident(i64 v) { return v; }
+
+u32 main() {
+    S s = { .f = 18446744073709551615 };
+    i64 r = ident(18446744073709551615);
+    if (s.f == r) { return 1; }
+    return 0;
+}

@@ -1,0 +1,20 @@
+// expect-trap
+// expect-trap-at: 19
+// BUG-917 regression. Function bodies are IR-only and IR block emission switched
+// source mapping off wholesale, so with ONE #line per function and none inside,
+// every line in every body mapped to "the function's declaration line, plus the
+// offset in the generated C". Every trap therefore named a line that does not
+// exist — this file reported line 28. The trap always fired correctly;
+// only the location lied, which is why nothing caught it: the number is
+// plausible, and the harness discarded stderr entirely.
+//
+// The padding below is deliberate. The defect scales with distance from the
+// function header, so a trap on the FIRST line of a body would have looked
+// almost right; this one must be far enough down to be unambiguous.
+u32 main() {
+    u8[4] a;
+    volatile u32 vi = 9;
+    u32 i = vi;
+    [*]u8 s = a[0..4];
+    return s[i];
+}

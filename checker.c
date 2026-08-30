@@ -1027,8 +1027,20 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_I32:
             if (val > 0xFFFFFFFFULL) return false;
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
+        /* BUG-915: this said `return true;` with the comment "val is uint64,
+         * positive literal fits in i64" — which is false for anything above
+         * 2^63-1. So `i64 x = 18446744073709551615;` was ACCEPTED and silently
+         * became -1, at EVERY sink (var-decl, assignment, struct-literal field,
+         * call argument, return, global init — all six route through this
+         * predicate). Every NARROWER signed width rejected the same shape:
+         * `i16 a = 40000;` and `i32 x = 3000000000;` are hard errors. So it was
+         * never "no rule at 64 bits" — it was the SAME rule with a hole at
+         * exactly the widest width, which is the shape BUG-863 closed for the
+         * mirror direction (a negative constant into an unsigned type).
+         * Corpus cost measured before shipping: ZERO — every literal above
+         * INT64_MAX in the whole corpus targets u64 or an mmio range. */
         case TYPE_I64:
-            return true;  /* val is uint64, positive literal fits in i64 */
+            return val <= (uint64_t)INT64_MAX;
         /* Path C: arbitrary-width int — fits if within the width's max */
         case TYPE_UINT: {
             uint32_t _b = effective->intn.bits;
@@ -1037,7 +1049,12 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         }
         case TYPE_SINT: {
             uint32_t _b = effective->intn.bits;
-            if (_b >= 64) return true;
+            /* BUG-915, the iN sibling. `>= 64` returned true unconditionally, so
+             * `i64`-equivalent widths inherited the same hole. At 65..128 bits a
+             * u64 literal genuinely always fits (2^64-1 < 2^64), so only the
+             * exactly-64 case needs the signed bound. */
+            if (_b > 64) return true;
+            if (_b == 64) return val <= (uint64_t)INT64_MAX;
             return val <= ((1ULL << (_b - 1)) - 1ULL);
         }
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
@@ -1066,11 +1083,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I8:    return val <= 128;
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
-            case TYPE_I64:   return true;
+            /* BUG-915, the NEGATIVE half: the magnitude must fit, exactly as it
+             * must at every narrower width above. `i64 x = -18446744073709551615;`
+             * was accepted and wrapped to 1. */
+            case TYPE_I64:   return val <= (uint64_t)INT64_MAX + 1ULL;
             /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
             case TYPE_SINT: {
                 uint32_t _b = effective->intn.bits;
-                if (_b >= 64) return true;
+                if (_b > 64) return true;
+                if (_b == 64) return val <= (uint64_t)INT64_MAX + 1ULL;
                 return val <= (1ULL << (_b - 1));
             }
             /* unsigned types: negative literals never fit */
@@ -2027,10 +2048,22 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (struct_init_has_local_derived(c, fv)) return true;
             continue;
         }
-        /* unwrap intrinsic chains (mirror the direct case) */
-        Node *fu = fv;
-        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
-            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* BUG-914: peel with the SHARED peeler, not a hand-rolled loop.
+         *
+         * The loop this replaces took the LAST argument of every intrinsic — the
+         * exact mistake `unwrap_ptr_launder` exists to avoid for `@container`
+         * (whose pointer is args[0]) and `@cstr` (ditto) — and it knew nothing
+         * about the C-STYLE cast, so
+         *
+         *     g = { .p = &loc };                  // rejected
+         *     g = { .p = @ptrcast(*u32, &loc) };  // rejected
+         *     g = { .p = (*u32)(&loc) };          // ACCEPTED - stack escape
+         *
+         * with the cast ELIDED in the emitted C, i.e. the same store three ways.
+         * The peeled node now drives cases A-D alike; before, only case A saw a
+         * peeled value, so `{ .p = (*u32)alias }` skipped case B too. */
+        Node *fu = unwrap_ptr_launder(fv);
+        if (!fu) continue;
         /* Case A: &local — direct address-of */
         if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
             Node *root = fu->unary.operand;
@@ -2047,18 +2080,19 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             }
         }
         /* Case B: alias ident already flagged frame-bound (local OR arena -
-         * BUG-816: the arena half was missing here too). */
-        if (fv->kind == NODE_IDENT) {
+         * BUG-816: the arena half was missing here too). Reads the PEELED node
+         * (BUG-914) so `{ .p = (*u32)alias }` is the same store as `{ .p = alias }`. */
+        if (fu->kind == NODE_IDENT) {
             Symbol *fsym = scope_lookup(c->current_scope,
-                fv->ident.name, (uint32_t)fv->ident.name_len);
+                fu->ident.name, (uint32_t)fu->ident.name_len);
             if (fsym && (fsym->is_local_derived || fsym->is_arena_derived)) {
                 _si_hit_arena = fsym->is_arena_derived && !fsym->is_local_derived;
                 return true;
             }
         }
         /* Case C: slice over a local array (local[0..]) */
-        if (fv->kind == NODE_SLICE) {
-            Node *sroot = fv->slice.object;
+        if (fu->kind == NODE_SLICE) {
+            Node *sroot = fu->slice.object;
             while (sroot && (sroot->kind == NODE_FIELD || sroot->kind == NODE_INDEX)) {
                 if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
                 else sroot = sroot->index_expr.object;
@@ -2076,7 +2110,7 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             }
         }
         /* Case D: call-result launder of a local-derived arg */
-        if (fv->kind == NODE_CALL && call_has_local_derived_arg(c, fv, 0))
+        if (fu->kind == NODE_CALL && call_has_local_derived_arg(c, fu, 0))
             return true;
     }
     return false;
@@ -2368,22 +2402,12 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
  * *u32, &local)`) is NODE_INTRINSIC, not NODE_UNARY, so a taint sink that only
  * matched a bare NODE_UNARY missed it and the container escaped un-tainted via a
  * later `g = b` / `return b` (stack-use-after-return, ASan-confirmed). */
-/* Is a cast TARGET reference-producing — does `(T)x` designate the same object it
- * was given, or manufacture a fresh value? `*T` / `[]T` / `*opaque` (and `?` of
- * those) are pointers into an existing object, so the cast is an ALIAS and every
- * provenance question must see through it. `(u32)x` is a fresh value carrying no
- * reference to the frame; peeling it would taint unrelated integers.
- *
- * Deliberately NOT a `switch` on ->kind: this is a 3-way membership test, not an
- * exhaustive dispatch, so a `default:` would trip walker_default_audit.sh for no
- * safety gain. A new TYNODE kind defaults to "not a reference" = conservative
- * (no peel = no missed taint; at worst an over-rejection). */
+/* Is a cast TARGET reference-producing? THE definition lives in ast.h as
+ * `zer_tynode_is_reference_producing`, shared with zercheck_ir.c's peelers —
+ * the two layers ask the identical question and had drifted (see BUG-914).
+ * Kept as a local alias so the call sites below read unchanged. */
 static bool tynode_is_reference_producing(TypeNode *t) {
-    if (!t) return false;
-    if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
-        t->kind == TYNODE_OPAQUE || t->kind == TYNODE_FUNC_PTR) return true;
-    if (t->kind == TYNODE_OPTIONAL) return tynode_is_reference_producing(t->optional.inner);
-    return false;
+    return zer_tynode_is_reference_producing(t);
 }
 
 static Node *unwrap_ptr_launder(Node *v) {

@@ -1,0 +1,19 @@
+// BUG-914 BOUNDARY. The peel must fire ONLY for a reference-producing cast
+// target. A VALUE cast copies bits out of the allocation and carries no
+// reference, so peeling it would taint unrelated integers and reject this
+// correct program. Also pins that resetting the global before the free keeps
+// the laundered store legal.
+struct N { u32 v; }
+?*N g;
+u32 gv;
+
+u32 main() {
+    *N n = alloc(N) orelse { return 1; };
+    n.v = 7;
+    gv = (u32)n.v;          // value cast — not a reference, never peeled
+    g = (*N)n;              // reference cast — tracked
+    g = null;               // reset before the free: no dangle
+    free(n);
+    if (gv != 7) { return 2; }
+    return 0;
+}

@@ -1,0 +1,37 @@
+// BUG-916 BOUNDARY. The last arm of an exhaustive enum switch now COMPARES
+// instead of being entered unconditionally. Every declared variant must still
+// reach its own arm, captures must still bind, and a multi-value last arm must
+// still match each of its values — otherwise the backstop is an over-reject
+// that silently traps correct programs.
+enum Dir { north, south, east, west }
+
+u32 pick(Dir d) {
+    switch (d) {
+        .north => { return 10; }
+        .south => { return 20; }
+        .east, .west => { return 30; }
+    }
+    return 99;
+}
+
+u32 cap(Dir d) {
+    switch (d) {
+        .north => |v| { return 1 + (u32)v; }
+        .south => |v| { return 2 + (u32)v; }
+        .east  => |v| { return 3 + (u32)v; }
+        .west  => |v| { return 4 + (u32)v; }
+    }
+    return 99;
+}
+
+u32 main() {
+    if (pick(Dir.north) != 10) { return 1; }
+    if (pick(Dir.south) != 20) { return 2; }
+    if (pick(Dir.east)  != 30) { return 3; }
+    if (pick(Dir.west)  != 30) { return 4; }
+    if (cap(Dir.north) != 1) { return 5; }
+    if (cap(Dir.south) != 3) { return 6; }
+    if (cap(Dir.east)  != 5) { return 7; }
+    if (cap(Dir.west)  != 7) { return 8; }
+    return 0;
+}

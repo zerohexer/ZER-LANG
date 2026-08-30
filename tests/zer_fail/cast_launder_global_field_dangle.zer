@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: left dangling at function exit
+// BUG-914, the struct-FIELD sink of the same class. The bare and @ptrcast
+// spellings were both rejected here; only the C-style cast slipped.
+struct N { u32 v; }
+struct H { ?*N p; }
+H gh;
+
+u32 main() {
+    *N n = alloc(N) orelse { return 1; };
+    n.v = 7;
+    gh.p = (*N)n;
+    free(n);
+    *N r = gh.p orelse { return 2; };
+    return r.v;
+}

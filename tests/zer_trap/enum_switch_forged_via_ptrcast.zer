@@ -1,0 +1,25 @@
+// expect-trap
+// BUG-916. A FOURTH enum-forging route, and the reason the guard belongs at the
+// CONSEQUENCE and not only at each door: @ptrcast produces a POINTER, so there is
+// no value at the cast site to check. The forgery materialises at the READ.
+//
+// MEASURED LIVE before the fix: this printed value=99, eq_a/eq_b/eq_c all 0, and
+// then ran arm `.c` — verbatim the BUG-843 symptom ("the switch silently ran its
+// LAST arm"), which had already been fixed three times at three separate doors
+// (@bitcast, @truncate, @saturate). The last arm of an exhaustive enum switch was
+// entered with NO comparison, on the premise that the checker's exhaustiveness
+// rule made the miss unreachable — true only while every enum value is a variant.
+enum State { a, b, c }
+
+u32 main() {
+    volatile u32 raw = 99;
+    u32 v = raw;
+    *State p = @ptrcast(*State, &v);
+    State s = *p;
+    switch (s) {
+        .a => { return 1; }
+        .b => { return 2; }
+        .c => { return 3; }      // <- silently taken before the fix
+    }
+    return 0;
+}

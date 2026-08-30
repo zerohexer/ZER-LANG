@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: does not fit in 'i64'
+// BUG-915. Every NARROWER signed width already rejected an over-range literal
+// (`i16 a = 40000;`, `i32 x = 3000000000;`), but is_literal_compatible answered
+// `true` unconditionally for i64 with the comment "positive literal fits in
+// i64" — false above 2^63-1. MEASURED LIVE before the fix: this compiled and
+// x was -1, at every sink (var-decl, assignment, struct field, call argument,
+// return, global init all route through the one predicate). Same shape as
+// BUG-863 in the mirror direction: not "no rule", but one rule with a hole at
+// exactly the widest width.
+u32 main() {
+    i64 x = 18446744073709551615;
+    if (x < 0) { return 1; }
+    return 0;
+}

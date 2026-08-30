@@ -1034,8 +1034,20 @@ static IRHandleInfo *ir_arg_view_handle(IRPathState *ps, int arg_local) {
  * question is "is this expression a VIEW of some allocation?". */
 static Node *ir_peel_cast_wrappers(Node *e) {
     int guard = 0;
-    while (e && e->kind == NODE_INTRINSIC && e->intrinsic.arg_count > 0 &&
-           guard++ < 32) {
+    while (e && guard++ < 32) {
+        /* BUG-914: the C-STYLE cast is a pointer-preserving cast too, and it was
+         * the one shape this peeler never saw — casts postdate the analysis, and
+         * checker.c's `unwrap_ptr_launder` was taught about them (BUG-791) while
+         * this layer was not. The emitter ELIDES an identity pointer cast, so the
+         * emitted C is byte-identical to the form that IS caught. Gated on the
+         * target being reference-producing by the SHARED ast.h predicate, so a
+         * value cast `(u32)x` is still never peeled. */
+        if (e->kind == NODE_TYPECAST &&
+            zer_tynode_is_reference_producing(e->typecast.target_type)) {
+            e = e->typecast.expr;
+            continue;
+        }
+        if (e->kind != NODE_INTRINSIC || e->intrinsic.arg_count <= 0) break;
         const char *n = e->intrinsic.name;
         uint32_t nl = (uint32_t)e->intrinsic.name_len;
         if (nl == 9 && memcmp(n, "container", 9) == 0) {
@@ -1071,7 +1083,19 @@ static Node *ir_peel_cast_wrappers(Node *e) {
 static int ir_find_store_source_local(IRFunc *func, Node *val) {
     if (!val) return -1;
     if (val->kind == NODE_ORELSE) val = val->orelse.expr;
-    while (val && val->kind == NODE_INTRINSIC && val->intrinsic.arg_count > 0) {
+    for (int guard = 0; val && guard < 32; guard++) {
+        /* BUG-914: `g = (*N)n` is the SAME store as `g = n` — the emitter elides
+         * the identity cast — but the global-dangle sink saw a NODE_TYPECAST,
+         * found no source local, and left the global untracked. Measured: it
+         * compiled, ran, and returned freed memory, while the `@ptrcast` and bare
+         * spellings were both rejected. Same shared predicate as everywhere else,
+         * so a value cast is never peeled. */
+        if (val->kind == NODE_TYPECAST &&
+            zer_tynode_is_reference_producing(val->typecast.target_type)) {
+            val = val->typecast.expr;
+            continue;
+        }
+        if (val->kind != NODE_INTRINSIC || val->intrinsic.arg_count <= 0) break;
         if (val->intrinsic.name_len == 9 &&
             memcmp(val->intrinsic.name, "container", 9) == 0)
             val = val->intrinsic.args[0];

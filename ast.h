@@ -763,6 +763,39 @@ static inline Node *expr_root_ident(Node *e) {
     return (cur && cur->kind == NODE_IDENT) ? cur : NULL;
 }
 
+/* Is a cast TARGET reference-producing — does `(T)x` designate the same object
+ * it was given, or manufacture a fresh value?
+ *
+ * `*T` / `[*]T` / `*opaque` / a funcptr (and `?` of those) are references INTO an
+ * existing object, so `(T)x` is an ALIAS and every provenance question — escape,
+ * aliasing, ownership — must see THROUGH it. `(u32)x` is a fresh value carrying no
+ * reference, and peeling it would taint unrelated integers.
+ *
+ * SHARED because the answer is needed in TWO layers and drifted between them.
+ * checker.c's `unwrap_ptr_launder` learned to peel a C-style cast in BUG-791;
+ * zercheck_ir.c's peelers (`ir_peel_cast_wrappers`, `ir_find_store_source_local`)
+ * did not, and the emitter ELIDES an identity pointer cast entirely — so
+ *
+ *     g = n;                 // dangling-global UAF: caught
+ *     g = @ptrcast(*N, n);   // caught
+ *     g = (*N)n;             // ACCEPTED, ran, returned freed memory
+ *
+ * with byte-identical emitted C for all three. One definition now; a new
+ * reference-producing TypeNode kind is answered for every layer at once.
+ *
+ * Deliberately NOT a `switch` on ->kind: this is a membership test, not an
+ * exhaustive dispatch, so a `default:` would trip walker_default_audit.sh for no
+ * safety gain. A new TYNODE kind defaults to "not a reference" = conservative
+ * (no peel = no missed taint; at worst an over-rejection). */
+static inline bool zer_tynode_is_reference_producing(TypeNode *t) {
+    if (!t) return false;
+    if (t->kind == TYNODE_POINTER || t->kind == TYNODE_SLICE ||
+        t->kind == TYNODE_OPAQUE  || t->kind == TYNODE_FUNC_PTR) return true;
+    if (t->kind == TYNODE_OPTIONAL)
+        return zer_tynode_is_reference_producing(t->optional.inner);
+    return false;
+}
+
 /* BUG-389: depth-limited version — delegates to eval_const_expr_ex with no resolver */
 static inline int64_t eval_const_expr_d(Node *n, int depth) {
     return eval_const_expr_ex(n, depth, NULL, NULL);

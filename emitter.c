@@ -3740,6 +3740,16 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
+        } else if (nlen == 11 && memcmp(name, "enum_forged", 11) == 0) {
+            /* BUG-916. SYNTHESIZED ONLY — ir_lower.c's NODE_SWITCH builds this
+             * node for the last arm's else-edge of an exhaustive enum switch; the
+             * checker rejects `@enum_forged` from source as an unknown intrinsic,
+             * so no user program can reach it. Mirrored in BOTH emitter dispatch
+             * paths per CLAUDE.md's dual-dispatch rule; only the IR path is
+             * reachable today, and an unmirrored intrinsic is exactly the
+             * placeholder-emission trap that rule exists to prevent. */
+            emit(e, "_zer_trap(\"switch on an enum value that is not a declared "
+                    "variant\", __FILE__, __LINE__)");
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
@@ -8084,6 +8094,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"trap\", __FILE__, __LINE__)");
+        } else if (nlen == 11 && memcmp(name, "enum_forged", 11) == 0) {
+            /* BUG-916 — see the AST-path twin above. */
+            emit(e, "_zer_trap(\"switch on an enum value that is not a declared "
+                    "variant\", __FILE__, __LINE__)");
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
             /* @ptrcast(*T, expr) — cast with type_id check */
             Type *tgt_type = node->intrinsic.type_arg ?
@@ -12777,6 +12791,49 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 }
 
 /* Emit a regular (non-async) function from IR */
+
+/* BUG-917: re-anchor the C preprocessor's line counter to the ZER source line
+ * of the instruction about to be emitted.
+ *
+ * Function BODIES are IR-only, and IR block emission sets `e->source_file` to
+ * NULL — source mapping was switched off wholesale because `#line` collided with
+ * goto labels and statement expressions (the BUG-418 class). The consequence was
+ * never written down: with ONE `#line` per function (at its declaration) and none
+ * inside, every line inside every function body maps to
+ * "function's line + offset in the generated C". So EVERY runtime trap named a
+ * line that does not exist:
+ *
+ *     u32 main() {            // 7-line file
+ *         ...
+ *         return s[i];        // line 6 — out of bounds
+ *     }
+ *     ZER TRAP: array index out of bounds at ln1.zer:15     <- there is no line 15
+ *
+ * The trap fires correctly; only the location lies, which is why nothing caught
+ * it — the number is plausible. It costs the same for every GCC diagnostic about
+ * emitted code.
+ *
+ * Emitting the directive HERE is safe where the wholesale approach was not: this
+ * is called between instructions, at column 0, never inside a `({...})` statement
+ * expression and never on the same line as a `{` or a label (the block label is
+ * emitted with its own trailing newline).
+ *
+ * It is emitted for EVERY instruction, not only when the ZER line changes.
+ * `#line N` numbers the NEXT line N and then counts up, so an instruction that
+ * expands to three C lines leaves the counter at N+3 — a second instruction on
+ * the SAME ZER line would be misreported without its own anchor. Deduplicating
+ * on "line unchanged" is the intuitive version of this helper and it is wrong;
+ * the first draft did exactly that and still reported line 28 for a statement on
+ * line 8. An instruction with no location (0) re-anchors to the last known line
+ * rather than being left to drift. */
+static void emit_line_map(Emitter *e, const char *src_file, int line, int *last) {
+    if (!src_file) return;
+    if (line <= 0) line = *last;
+    if (line <= 0) return;
+    emit(e, "#line %d \"%s\"\n", line, src_file);
+    *last = line;
+}
+
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
     Node *fn = func->ast_node;
@@ -12939,10 +12996,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
-    /* Disable source mapping during IR block emission — #line directives
-     * collide with goto labels and statement expressions (BUG-418 class). */
+    /* Wholesale source mapping stays OFF during IR block emission — an
+     * unconditional #line collides with goto labels and statement expressions
+     * (BUG-418 class). BUG-917 re-anchors it per INSTRUCTION instead, which is
+     * safe because that point is always between statements at column 0. */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -13031,6 +13091,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
             IRInst *ins = &bb->insts[ii];
+            /* BUG-917: anchor the line counter BEFORE the guards, so an
+             * auto-guard trap reports the access's line, not the previous one. */
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
@@ -13200,9 +13263,11 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         add_async_local(e, func->locals[li].name, func->locals[li].name_len);
     }
 
-    /* Disable source mapping during IR blocks */
+    /* Disable source mapping during IR blocks (see BUG-917 note on the
+     * regular path — the per-instruction re-anchor below replaces it). */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* BUG-863: IR_RETURN reads this to decide whether the async termination
      * also stores a result. The regular-function path sets it; this one never
@@ -13226,6 +13291,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
              * same way as the regular path; emit_auto_guard_return_body
              * emits `self->_zer_state = -1; return 1;` for async returns. */
             IRInst *ins = &bb->insts[ii];
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): paired with the regular-path gate

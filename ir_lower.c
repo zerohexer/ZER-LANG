@@ -2949,17 +2949,33 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 
         /* Phase E: detect enum-exhaustive switches (no default arm).
-         * The checker enforces all enum variants be covered when there's
-         * no default — so the last arm's "condition false" case is
-         * unreachable at runtime. If we emit it as BRANCH anyway, the
-         * CFG merge at bb_exit gets a spurious predecessor carrying
-         * pre-switch state, causing MAYBE_FREED false positives when
-         * arms free a handle (rt_borrowck_switch_all_free pattern).
          *
-         * For enum-exhaustive switches, emit the last arm's entry as
-         * an unconditional GOTO bb_arm (no comparison). The condition
-         * is always true for the remaining variant, so skipping the
-         * check is semantically equivalent. */
+         * The checker enforces that all enum variants are covered when there is
+         * no default, so the last arm needs no comparison to be REACHED. Emitting
+         * a plain BRANCH to bb_exit on the false edge would give bb_exit a
+         * spurious predecessor carrying pre-switch state, causing MAYBE_FREED
+         * false positives when arms free a handle (rt_borrowck_switch_all_free).
+         * Hence the last arm's entry is unconditional.
+         *
+         * BUG-916 — the premise "unreachable at runtime" is FALSE, and this is
+         * where every enum-forging door lands. An enum value that is not any
+         * declared variant fell into the LAST arm, silently:
+         *
+         *     *State p = @ptrcast(*State, &some_u32);   // u32 holds 99
+         *     switch (*p) { .a => {} .b => {} .c => {} }   // ran `.c`
+         *
+         * — value 99, equal to no variant, yet `.c` executed. That is verbatim
+         * the BUG-843 symptom ("the switch then silently ran its LAST arm"),
+         * which was fixed three separate times at three separate DOORS
+         * (@bitcast, @truncate, @saturate). Those guards trap at the point of
+         * forgery and remain the precise diagnostic; this is the BACKSTOP at the
+         * point of CONSEQUENCE, so a door nobody has found yet cannot produce a
+         * silent wrong branch — one sink instead of N doors, which is the
+         * durable shape CLAUDE.md asks for.
+         *
+         * The CFG is deliberately left IDENTICAL: the false edge goes to a trap
+         * block whose only successor is bb_arm, so bb_exit gains no predecessor
+         * and the MAYBE_FREED reason above still holds. */
         bool has_default = false;
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             if (node->switch_stmt.arms[i].is_default) {
@@ -3001,16 +3017,18 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int bb_next = (oi + 1 < node->switch_stmt.arm_count) ?
                           ir_add_block(ctx->func, ctx->arena) : bb_exit;
             bool is_last_arm = (oi + 1 == node->switch_stmt.arm_count);
-            bool elide_compare = (is_exhaustive_enum && is_last_arm &&
-                                  !arm->is_default);
+            /* BUG-916: the last arm of an exhaustive enum switch still COMPARES;
+             * what changes is where the FALSE edge goes — to a trap block that
+             * falls into the arm, rather than to bb_exit. bb_exit's predecessor
+             * set is therefore unchanged (the reason the compare was elided in
+             * the first place), while a value that is no declared variant now
+             * halts instead of silently running this arm. */
+            bool guard_forged = (is_exhaustive_enum && is_last_arm &&
+                                 !arm->is_default);
+            int bb_forged = -1;
 
             if (arm->is_default) {
                 ensure_terminated(ctx, bb_arm);
-            } else if (elide_compare) {
-                /* Unconditional entry — last arm of exhaustive enum */
-                IRInst go = make_inst(IR_GOTO, node->loc.line);
-                go.goto_block = bb_arm;
-                emit_inst(ctx, go);
             } else {
                 /* Build per-arm comparison: OR of equality checks */
                 Node *cmp = NULL;
@@ -3216,11 +3234,38 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         cmp = or_node;
                     }
                 }
+                if (guard_forged) bb_forged = ir_add_block(ctx->func, ctx->arena);
                 IRInst br = make_inst(IR_BRANCH, node->loc.line);
                 br.cond_local = lower_expr(ctx, cmp);
                 br.true_block = bb_arm;
-                br.false_block = bb_next;
+                br.false_block = (bb_forged >= 0) ? bb_forged : bb_next;
                 emit_inst(ctx, br);
+            }
+
+            /* BUG-916: fill the forged-value trap block. It halts, then falls
+             * into bb_arm so the CFG shape the analyzer sees is unchanged. The
+             * `@enum_forged` node is synthesized here and nowhere else — the
+             * checker rejects that spelling from source — and both emitter
+             * dispatch paths carry a handler for it. */
+            if (bb_forged >= 0) {
+                int saved_block = ctx->current_block;
+                ctx->current_block = bb_forged;
+                Node *tn = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(tn, 0, sizeof(Node));
+                tn->kind = NODE_INTRINSIC;
+                tn->loc = node->loc;
+                tn->intrinsic.name = "enum_forged";
+                tn->intrinsic.name_len = 11;
+                tn->intrinsic.arg_count = 0;
+                checker_set_type(ctx->checker, tn, ty_void);
+                Node *st = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(st, 0, sizeof(Node));
+                st->kind = NODE_EXPR_STMT;
+                st->loc = node->loc;
+                st->expr_stmt.expr = tn;
+                lower_stmt(ctx, st);
+                ensure_terminated(ctx, bb_arm);
+                ctx->current_block = saved_block;
             }
 
             /* Arm body */

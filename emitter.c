@@ -5961,6 +5961,35 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
             "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
+    /* BUG-922: a NON-NULL function pointer reached through a CARRIER can still
+     * be null, because auto-zero fills the carrier and the
+     * "requires-an-initializer" rule only reaches a scalar DECLARATION. Four
+     * forms, all measured:
+     *
+     *     BinOp[3] g;        g[0](1,2);      // array element
+     *     struct Ops{BinOp f;} Ops o;  o.f(1,2);   // struct field, global
+     *     u32 c(){ Ops o; return o.f(1,2); }       // struct field, local
+     *     u32 call(BinOp f){ return f(1,2); }  call(g[0]);   // forwarded param
+     *
+     * Hosted, the jump to address 0 faults and ZER's handler reports it. On bare
+     * metal with no MMU, address 0 is the reset vector or ordinary memory: the
+     * jump silently goes SOMEWHERE, with no diagnostic at compile time OR run
+     * time. That is the silent-on-target class this guard exists for.
+     *
+     * TRACKED, not banned (the Ban Decision Framework). Extending
+     * "requires an initializer" through the carrier was tried and REVERTED on an
+     * earlier branch: ZER has no array-initializer syntax, so the rule would say
+     * "this type is unusable" and delete the dispatch-table idiom, breaking three
+     * corpus programs that assign every element before use and are correct.
+     *
+     * A STATEMENT EXPRESSION rather than a comma or a separate `if`, so the
+     * callee is evaluated EXACTLY ONCE — `ops[next()](x)` must not call next()
+     * twice. Applied to an indirect call only; a direct call by name never
+     * reaches it, and on a function designator `!f` is a constant anyway. */
+    emit(e, "#define _zer_nnfp(f) ({ __typeof__(f) _zer_fp = (f); "
+            "if (!_zer_fp) _zer_trap(\"call through a null function pointer\", "
+            "__FILE__, __LINE__); _zer_fp; })\n\n");
+
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
             "const char *file, int line) {\n");
@@ -7853,13 +7882,33 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
         }
-        emit_rewritten_node(e, node->call.callee, func);
-        emit(e, "(");
-        for (int i = 0; i < node->call.arg_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_rewritten_node(e, node->call.args[i], func);
+        {
+            /* BUG-922, the SECOND dispatch path — and the one that actually
+             * carries the struct-FIELD form. A call whose callee is a NODE_FIELD
+             * on a struct object is classified `is_builtin` by IR_CALL (the
+             * `Task.new` detection keys on TYPE_STRUCT) and delegated here, so
+             * guarding only the decomposed path left `o.f(1,2)` — two of the four
+             * measured null-carrier forms — completely unguarded. This is exactly
+             * the dual-dispatch rule in CLAUDE.md, and the reason it is stated as
+             * "grep must show TWO hits".
+             *
+             * A FIELD or an ELEMENT callee is always a VALUE, so `__typeof__` on
+             * it is a pointer type and the guard is well-formed. A bare-ident
+             * callee is deliberately NOT guarded here: it may be a function
+             * DESIGNATOR, and `__typeof__` of one yields a function type that
+             * cannot declare a variable. The IR path guards the bare-ident case,
+             * where the local table makes "provably a value" decidable. */
+            Node *gc = node->call.callee;
+            bool guard_fp = gc && (gc->kind == NODE_FIELD || gc->kind == NODE_INDEX);
+            if (guard_fp) emit(e, "_zer_nnfp(");
+            emit_rewritten_node(e, node->call.callee, func);
+            emit(e, guard_fp ? ")(" : "(");
+            for (int i = 0; i < node->call.arg_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_rewritten_node(e, node->call.args[i], func);
+            }
+            emit(e, ")");
         }
-        emit(e, ")");
         return;
     }
 
@@ -10897,17 +10946,48 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
                 }
             }
+            /* BUG-922: is this an INDIRECT call — a call through a funcptr VALUE
+             * rather than a function by name? Only those get the null guard.
+             *
+             * The distinction matters for more than cost: `__typeof__(f)` on a
+             * FUNCTION DESIGNATOR yields a function type, and declaring a
+             * variable of function type is invalid C. So the test must be
+             * "provably a value", never "not provably a function" — a name we
+             * cannot resolve stays UNGUARDED.
+             *
+             * A FIELD or an ELEMENT is always a value. A bare name is a value
+             * only when it resolves to a local/param, or to a global that is not
+             * a function. */
+            bool guard_fp = false;
+            if (inst->expr && inst->expr->kind == NODE_CALL && inst->expr->call.callee) {
+                Node *gc = inst->expr->call.callee;
+                if (gc->kind == NODE_FIELD || gc->kind == NODE_INDEX) {
+                    guard_fp = true;
+                } else if (inst->func_name) {
+                    for (int li = 0; li < func->local_count; li++) {
+                        if (func->locals[li].name_len == inst->func_name_len &&
+                            memcmp(func->locals[li].name, inst->func_name,
+                                   inst->func_name_len) == 0) { guard_fp = true; break; }
+                    }
+                    if (!guard_fp) {
+                        Symbol *gs = scope_lookup(e->checker->global_scope,
+                            inst->func_name, inst->func_name_len);
+                        if (gs && !gs->is_function) guard_fp = true;
+                    }
+                }
+            }
+            if (guard_fp) emit(e, "_zer_nnfp(");
             /* Emit callee: simple ident or field access (funcptr through struct) */
             if (inst->func_name) {
                 /* Check for cross-module function needing mangled name */
                 Symbol *fsym = scope_lookup(e->checker->global_scope,
                     inst->func_name, inst->func_name_len);
                 if (fsym && fsym->is_function && fsym->module_prefix) {
-                    emit(e, "%.*s__%.*s(",
+                    emit(e, "%.*s__%.*s",
                          (int)fsym->module_prefix_len, fsym->module_prefix,
                          (int)inst->func_name_len, inst->func_name);
                 } else {
-                    emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+                    emit(e, "%.*s", (int)inst->func_name_len, inst->func_name);
                 }
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
@@ -10928,12 +11008,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         Type *ot = func->locals[obj_id].type;
                         Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
                         emit_local_name(e, func, obj_id);
-                        emit(e, "%s%.*s(",
+                        emit(e, "%s%.*s",
                              (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
                              (int)callee->field.field_name_len, callee->field.field_name);
                     } else {
                         /* Global/extern funcptr */
-                        emit(e, "%.*s.%.*s(",
+                        emit(e, "%.*s.%.*s",
                              (int)callee->field.object->ident.name_len,
                              callee->field.object->ident.name,
                              (int)callee->field.field_name_len, callee->field.field_name);
@@ -10990,13 +11070,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                          * arr[func()]. */
                         emit_rewritten_node(e, idx_node, func);
                     }
-                    emit(e, "](");
+                    emit(e, "]");
                 } else {
                     emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
                 }
             } else {
                 emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
             }
+            /* Close the guard (if any) and open the argument list. One place, so
+             * every callee branch above agrees on the shape. */
+            emit(e, guard_fp ? ")(" : "(");
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");
                 if (inst->call_arg_locals[i] >= 0) {

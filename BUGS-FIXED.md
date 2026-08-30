@@ -5,9 +5,9 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-30 — BUG-914..921: a cast the second layer never learned, a literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, a comptime that could not narrow, and the analyzer reading freed memory
+## Session 2026-08-30 — BUG-914..922: a cast the second layer never learned, a literal that only fit at 64 bits, the fourth enum door, every trap pointing at the wrong line, a comptime that could not narrow, and the analyzer reading freed memory
 
-A standalone audit (no branch to harvest). Eight findings. Four are ACCEPT-UNSAFE or a
+A standalone audit (no branch to harvest). Nine findings. Four are ACCEPT-UNSAFE or a
 silent wrong value: the program compiles, runs, and reads freed memory or answers wrongly
 with no diagnostic at compile time OR run time. Two of the four (BUG-914, BUG-919) are the
 same shape one layer apart, and the second was found by ENUMERATING after the first —
@@ -157,6 +157,50 @@ correct definition.
 
 Gate: two more `p19` cells (matrix 99 -> 103), RED on the pre-fix build. Tests:
 `tests/zer_fail/cast_launder_keep_inference.zer`, `tests/zer/cast_launder_keep_global_ok.zer`.
+
+### BUG-922 — a NON-NULL function pointer through a CARRIER, called through address 0
+
+`tests/zer_gaps/funcptr_array_null_element.zer` recorded ONE form. Enumerating found
+**four**, and two of them were emitted by the OTHER dispatch path:
+
+```zer
+BinOp[3] g;               g[0](1,2);        // array element
+struct Ops{BinOp f;} Ops o;  o.f(1,2);      // struct field, global   <- other path
+u32 c(){ Ops o; return o.f(1,2); }          // struct field, local    <- other path
+u32 call(BinOp f){ return f(1,2); }  call(g[0]);   // forwarded param
+```
+
+`*T` is non-null by declaration and the scalar sibling `BinOp g;` is rejected outright
+("function pointer requires an initializer", BUG-866) — but auto-zero fills a CARRIER with
+NULL and that rule only reaches a scalar declaration. One question, answered differently
+for the array, the field and the param.
+
+Hosted, the jump to address 0 faults and ZER's handler reports it, which is why this
+survived: it looks handled. **On bare metal with no MMU, address 0 is the reset vector or
+ordinary memory** — the jump silently goes somewhere, with no diagnostic at compile time
+OR run time. Silent-on-target.
+
+**TRACKED, not banned.** Extending "requires an initializer" through the carrier was
+implemented and REVERTED on an earlier branch: ZER has no array-initializer syntax, so the
+rule would not say "initialize it", it would say "this type is unusable" — deleting the
+dispatch-table idiom and breaking three corpus programs that assign every element before
+use and are correct as written. The Ban Decision Framework says track when a tracking
+system can cover it.
+
+The guard is a STATEMENT EXPRESSION, `_zer_nnfp(f)`, not a comma expression and not a
+separate `if`, so **the callee is evaluated exactly once** — `ops[next()](x)` must not call
+`next()` twice, and `tests/zer/funcptr_guard_boundary_ok.zer` asserts that count.
+
+The test that "is this a value?" must be positive, never "not provably a function":
+`__typeof__` of a function DESIGNATOR is a function type, and declaring a variable of one
+is invalid C. So a bare name is guarded only when it resolves to a local/param or to a
+non-function global; an unresolvable name stays unguarded. A field or an element is always
+a value, so both are guarded unconditionally.
+
+Tests: `tests/zer_trap/funcptr_null_carrier_{array,struct_field}.zer`,
+`tests/zer/funcptr_guard_boundary_ok.zer` (every carrier when ASSIGNED, a direct call, and
+the single-evaluation count). The gap reproducer is retired — promoted, which is what the
+gap directory's convention asks for.
 
 ### BUG-920 — the ANALYZER read freed memory to decide a safety verdict (3 sites)
 

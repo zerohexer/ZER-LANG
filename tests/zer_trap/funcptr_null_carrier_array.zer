@@ -1,0 +1,24 @@
+// expect-trap
+// expect-trap-at: 23
+// BUG-922. A NON-NULL function pointer reached through a CARRIER can still be
+// null: auto-zero fills the carrier, and the "requires an initializer" rule
+// (BUG-866) only reaches a scalar DECLARATION. The scalar sibling `BinOp g;` is
+// rejected outright, so this is one question answered differently for the array.
+//
+// Enumerating found FOUR forms, not the one the gap file recorded — array
+// element, struct field (global), struct field (local), and a null forwarded
+// through a PARAM. All four are covered now; two of them turned out to be
+// emitted by the OTHER dispatch path, which is why the fix needed both.
+//
+// Hosted, the jump to address 0 faults and the SIGSEGV handler reports it. On
+// bare metal with no MMU, address 0 is the reset vector or ordinary memory: the
+// jump silently goes SOMEWHERE, with no diagnostic at compile time OR run time.
+// That is the silent-on-target class this guard exists for.
+typedef u32 (*BinOp)(u32, u32);
+u32 add(u32 a, u32 b) { return a + b; }
+BinOp[3] g_ops;
+
+u32 main() {
+    g_ops[1] = add;
+    return g_ops[0](1, 2);   // element 0 was never assigned
+}

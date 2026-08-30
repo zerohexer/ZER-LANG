@@ -4009,6 +4009,55 @@ u32 packed_misuse() {
 Read and write the field directly (`g.b = 7;`) — that path knows the layout and emits a
 correct unaligned access.
 
+### Calling through a null function pointer TRAPS
+
+A `*T` is non-null by declaration, and a funcptr VARIABLE must be initialised:
+
+```zer
+typedef u32 (*BinOp)(u32, u32);
+BinOp f;                 // ERROR — function pointer requires an initializer
+```
+
+A CARRIER is different. Auto-zero fills it with NULL and the
+requires-an-initializer rule reaches a scalar declaration only, so all four of
+these are accepted at compile time:
+
+<!-- audit: skip -->
+```zer
+BinOp[3] table;                       // every element starts NULL
+struct Ops { BinOp f; }  Ops o;       // o.f starts NULL
+u32 run(Ops p)      { return p.f(1, 2); }
+u32 call(BinOp fn)  { return fn(1, 2); }   // caller may pass table[0]
+```
+
+That is deliberate: ZER has no array-initializer syntax, so requiring one would
+make a dispatch table undeclarable — the idiom is to declare the table and assign
+every element before use. The hazard is TRACKED instead. Every INDIRECT call —
+through an element, a field, a local, or a parameter — is guarded, and a null
+target halts:
+
+```
+ZER TRAP: call through a null function pointer
+```
+
+A DIRECT call by name is never guarded (it cannot be null). The callee is
+evaluated exactly once, so `table[next()](x)` calls `next()` once.
+
+On a hosted system the unguarded jump would fault anyway; **on bare metal with no
+MMU, address 0 is the reset vector or ordinary memory**, and the jump would go
+somewhere silently. That is what the guard is for.
+
+If you want the absence to be part of the type rather than a trap, use a nullable
+element and unwrap it — fully supported, and it costs the same branch you were
+going to write anyway:
+
+<!-- audit: skip -->
+```zer
+?BinOp[3] ops;
+if (ops[i]) |f| { return f(a, b); }
+return 0;
+```
+
 ### The dereference identity rule
 
 Reading a value out of a pointer dereference makes a COPY. For a scalar or a plain struct

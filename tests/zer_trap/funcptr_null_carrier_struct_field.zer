@@ -1,0 +1,14 @@
+// expect-trap
+// expect-trap-at: 14
+// BUG-922, the form the FIRST attempt at the fix missed entirely. A call whose
+// callee is a NODE_FIELD on a struct object is classified `is_builtin` by
+// IR_CALL — the `Task.new` detection keys on TYPE_STRUCT — and delegated to the
+// rewritten-AST emitter. So guarding only the decomposed call path left the
+// struct-field form (two of the four carriers) completely unguarded, while the
+// array form was fixed. Exactly the dual-dispatch rule CLAUDE.md states as
+// "grep must show TWO hits".
+typedef u32 (*BinOp)(u32, u32);
+struct Ops { BinOp f; }
+Ops g_o;
+
+u32 main() { return g_o.f(1, 2); }

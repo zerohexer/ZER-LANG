@@ -1,0 +1,45 @@
+// BUG-922 BOUNDARY. The null-funcptr guard must not cost correctness:
+//   * a fully-assigned dispatch table still dispatches;
+//   * the callee is evaluated EXACTLY ONCE, so `ops[next()](...)` calls next()
+//     once — a comma expression or a separate `if` would have called it twice,
+//     which is why the guard is a statement expression;
+//   * a DIRECT call by name is never wrapped (`__typeof__` of a function
+//     designator is a function type and cannot declare a variable, so wrapping
+//     one would not even compile);
+//   * every carrier form works when assigned: array element, struct field
+//     (global and local), a funcptr local, and one forwarded through a param.
+typedef u32 (*BinOp)(u32, u32);
+struct Ops { BinOp f; }
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+
+BinOp[3] g_ops;
+Ops g_o;
+u32 g_calls;
+
+u32 next_index() { g_calls += 1; return 1; }
+u32 via_param(BinOp f) { return f(3, 4); }
+
+u32 main() {
+    g_ops[0] = add;
+    g_ops[1] = mul;
+    g_o.f = add;
+
+    if (g_ops[0](2, 3) != 5)  { return 1; }
+    if (g_ops[1](2, 3) != 6)  { return 2; }
+    if (g_o.f(2, 3)    != 5)  { return 3; }
+
+    Ops lo; lo.f = mul;
+    if (lo.f(2, 3)     != 6)  { return 4; }
+
+    BinOp local = add;
+    if (local(2, 3)    != 5)  { return 5; }
+    if (via_param(mul) != 12) { return 6; }
+    if (add(2, 3)      != 5)  { return 7; }   // direct call — never wrapped
+
+    // single evaluation: next_index() must run exactly once
+    if (g_ops[next_index()](2, 3) != 6) { return 8; }
+    if (g_calls != 1) { return 9; }
+    return 0;
+}

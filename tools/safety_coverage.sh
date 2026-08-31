@@ -1,8 +1,9 @@
 #!/bin/bash
 # Safety Coverage Audit — extract every safety check in the compiler
-# and emit a raw list. Used to build docs/safety_coverage.md (curated
-# coverage matrix linking each check to abstract model + operational
-# proof subset).
+# and emit a raw list. Feeds docs/safety_list.md, the hand-curated matrix
+# linking each check to its abstract model + operational proof subset.
+# (An earlier version of this comment named docs/safety_coverage.md, which
+#  has never existed in this repository — see the header text below.)
 #
 # Usage: bash tools/safety_coverage.sh [> docs/safety_coverage_raw.md]
 #
@@ -15,9 +16,9 @@
 # Many calls span multiple source lines. We preprocess by joining
 # continuation lines (no trailing semicolon) before matching.
 #
-# The curated coverage matrix (docs/safety_coverage.md) is maintained
-# by hand. This script is the source of truth for what exists; the
-# curation adds model assignment, Iris technique, proof status.
+# The curated matrix (docs/safety_list.md) is maintained by hand. This
+# script is the source of truth for what EXISTS; the curation adds model
+# assignment, Iris technique and proof status.
 
 set -uo pipefail
 
@@ -115,13 +116,26 @@ Multi-line calls (where the format string is on a separate line from
 the function name) are handled by folding continuation lines before
 regex matching.
 
-The **curated** coverage matrix lives in `docs/safety_coverage.md`
-and maps each check to its abstract model (M1-M4), the operational
-proof subset that proves it (λZER-*), the Iris technique needed,
-and proof status. Every row in this raw file must appear in the
-curated doc; CI enforces that.
+The **curated** matrix lives in `docs/safety_list.md` and maps each check to
+its abstract model (M1-M4), the operational proof subset that proves it
+(λZER-*), the Iris technique needed, and proof status.
 
-Regenerate: `bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`
+**NOT A GATE — corrected 2026-08-31.** This header used to say "Every row in
+this raw file must appear in the curated doc; CI enforces that", and pointed at
+`docs/safety_coverage.md`. Three things were wrong with that sentence:
+
+- nothing enforces it — `make safety-coverage` regenerates this file and prints
+  a WARNING on drift, and it is not part of `make check`;
+- the committed copy was stale by roughly 490 rows when measured, so the
+  correspondence it asserted had silently lapsed;
+- **`docs/safety_coverage.md` has never existed** in this repository (checked
+  across the whole git history). The curated matrix is `docs/safety_list.md`.
+
+Treat this file as a snapshot that is only as fresh as the last person to run
+the target.
+
+Regenerate: `make safety-coverage` (or
+`bash tools/safety_coverage.sh > docs/safety_coverage_raw.md`)
 
 ---
 
@@ -196,7 +210,7 @@ echo "## Part 5 — Unique safety predicates (after normalization)"
 echo ""
 echo "Distinct safety checks once format-string variation is stripped."
 echo "This is the **coverage denominator**: every unique predicate"
-echo "must appear in \`docs/safety_coverage.md\`."
+echo "is expected to appear in \`docs/safety_list.md\` — nothing checks that."
 echo ""
 
 {

@@ -5,12 +5,14 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-08-31 — BUG-913..920: the CONSTRAINED-VALUE class, two emitter declarator bugs, and a live peel-site escape
+## Session 2026-08-31 — BUG-913..921: the CONSTRAINED-VALUE class, two emitter declarator bugs, a live peel-site escape, and a dead runtime backstop
 
 A fresh audit of the **value domain** — the one domain with no axis-crossed matrix. Nine of
 the ten existing grids test escape, aliasing, control flow, concurrency or hardware; none
-asked "may this VALUE become that TYPE?". Seven bugs came out of that gap, six of them one
-class, and the class now has a grid.
+asked "may this VALUE become that TYPE?". Nine findings came out of it — six are one class,
+which now has a grid; two are emitter declarator bugs; one is a live escape found by
+following CLAUDE.md's own "hand-rolled peel sites are debt" note to its sites. A tenth entry
+(BUG-921) is a DIAGNOSIS rather than a fix, because the obvious fix is unsound.
 
 ### The class: a CONSTRAINED type is forgeable, and forging it is SILENT
 
@@ -227,6 +229,36 @@ with a private, shorter answer.
 Gated by a new **p19 axis in `tools/sink_matrix.sh`** (13 cells: launder x arena/local x
 global-store / struct-literal / var-decl-propagation, plus three over-rejection boundaries).
 Verified firing: **8 holes pre-fix, 101/101 after.**
+
+### BUG-921 — DIAGNOSED, not fixed: `--track-cptrs`'s use-after-free half is dead, and the obvious fix is unsound
+
+Found by auditing the emitter for safety wrappers present in one emission region and absent
+from the other — the AST-vs-IR divergence class. `_zer_check_alive` had 2 occurrences in the
+AST region and 0 in the IR region.
+
+`--track-cptrs` (implied by `--run`) emits an inline-header allocation layer plus
+`_zer_check_alive`. The DOUBLE-FREE half is WIRED — `__wrap_free` carries the trap and the
+`--wrap` link flags are passed (both read off the emitted C and the gcc command line; not
+demonstrated end-to-end, since every double-free probed was caught at compile time). The
+USE-AFTER-FREE half's only emission site
+is in `emit_expr` — the AST path, which function bodies stopped using at the IR migration.
+Measured: the flag emits the function DEFINITION and **zero calls**.
+
+**The port was written, then reverted, because it is unsound.** `_zer_check_alive` reads
+`ptr - 16` to test a magic, which is defined only for a pointer from the wrapped malloc.
+`@ptrcast(*opaque, &stack_var)` is the canonical *opaque idiom, and ASan on the ported build
+reported `stack-buffer-underflow` for it. So the AST version it would have been copied from
+was itself unsound for a non-heap `*opaque`, and the IR path dropping it removed a latent OOB
+read. A real fix needs allocation-ORIGIN provenance, which ZER does not carry.
+
+Severity is MEDIUM-LOW and the reason matters: this is a missing backstop, not a reachable
+hole. Every UAF shape written to reach it — a dynamic-index opaque table, a free through a
+cinclude'd C function, the same with a deliberately neutral name so the destructor heuristic
+could not fire — was caught at COMPILE time by zercheck.
+
+Shipped as a diagnosis: a comment at the emission site (so nobody "restores" it) plus an
+entry in docs/limitations.md, and CLAUDE.md's `*opaque` + cinclude row corrected — it claimed
+"100% (zercheck + --wrap=malloc compiled-in)".
 
 ### Tests
 

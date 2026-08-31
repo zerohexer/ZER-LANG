@@ -1,0 +1,23 @@
+// GAP (BUG-918 residual, 2026-08-31): the pointer-minting doors reject a
+// DIRECTLY constrained pointee (*Color, *bool) but not an AGGREGATE that merely
+// CARRIES one. That is deliberate — this exact shape is the MMIO register-block
+// overlay and the *opaque round-trip, and rejecting it would refuse the idioms
+// the primitives exist for. The residual is that a load of `r.ctl` here can
+// produce a non-variant enum with no guard.
+// Closing it needs the guard at the LOAD, gated on the base pointer's
+// provenance being MINTED — see docs/limitations.md.
+// When this starts failing, promote it to tests/zer_fail/ and add a
+// mint/enum-in-struct-pointee cell to tests/test_constrained_matrix.c.
+enum Mode { off, on }
+struct Regs { Mode ctl; u32 data; }
+mmio 0x40000000..0x4000FFFF;
+
+u32 classify(Mode m) {
+    switch (m) { .off => { return 1; } .on => { return 2; } }
+}
+
+u32 main() {
+    volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+    Mode m = r.ctl;          // any byte the device presents — unguarded
+    return classify(m);      // a non-variant silently takes the last arm
+}

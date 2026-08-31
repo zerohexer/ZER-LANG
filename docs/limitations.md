@@ -184,6 +184,83 @@ blanket rule was NOT shipped).
 
 ---
 
+## OPEN (BUG-921, 2026-08-31) — `--track-cptrs`'s use-after-free half has NO call site, and the obvious fix is UNSOUND
+
+**What is dead.** `--track-cptrs` — implied by `--run`, so the entire test suite runs with
+it — emits a runtime layer for `*opaque` tracking: a 16-byte inline header per allocation
+carrying a magic and an alive flag, `__wrap_malloc` / `__wrap_free` / `__wrap_realloc` /
+`__wrap_strdup` linked through `-Wl,--wrap=`, and `_zer_check_alive`.
+
+The DOUBLE-FREE half is WIRED: `__wrap_free` is emitted carrying the trap, and
+`zerc_main.c` passes `-Wl,--wrap=malloc,--wrap=free,--wrap=calloc,--wrap=realloc` whenever
+`track_cptrs` is set — both verified by reading the emitted C and the link command. Not
+demonstrated end-to-end, because every double-free shape probed was caught at COMPILE time
+and a C-side one is masked by the leak rule.
+
+The USE-AFTER-FREE half is `_zer_check_alive`, which is supposed to fire before a
+`@ptrcast` reads a pointer back out of an `*opaque`. **Its only emission site is in
+`emit_expr` — the AST path, which function bodies have not used since the IR migration made
+bodies IR-only.** Measured: with `--track-cptrs`, the emitted C for a program whose whole
+point is the round-trip contains the `_zer_check_alive` DEFINITION and **zero calls**.
+
+So the flag advertises a runtime check and emits an unused static function. CLAUDE.md's
+safety table credits *opaque with "Level 1-5 tracking (compile-time zercheck +
+poison-after-free + inline header + global malloc interception)"; levels 3/4 (the alive
+check at the cast) are not wired.
+
+**Why "port it to the IR path" is the WRONG fix — measured, not argued.** A port was
+written and then reverted. `_zer_check_alive` computes `(uint32_t *)((char*)ptr - 16)` and
+reads `hdr[2]` to test the magic. That read is only defined when the pointer came from
+`__wrap_malloc`, and an `*opaque` need not have — `@ptrcast(*opaque, &stack_var)` is the
+canonical *opaque idiom, and for it the probe reads 16 bytes BEFORE a stack object. With
+the port in place, **ASan reported `stack-buffer-underflow`** on exactly that program.
+
+Two conclusions follow. The AST-path version this would have been copied from was itself
+UNSOUND for any non-heap `*opaque`; and the IR path silently dropping it removed a latent
+out-of-bounds read. That is why this entry exists instead of a fix.
+
+**What a real fix needs.** The probe must be reached only for pointers known to come from
+the tracked allocator — allocation ORIGIN, which ZER does not carry today
+(`Symbol.provenance_type` records the pointee TYPE). Either add a heap-origin bit and gate
+the emission on it, or delete `_zer_check_alive` and stop advertising the layer. Both are
+design decisions, not patches.
+
+**Severity: MEDIUM-LOW, and be precise about why.** This is defence-in-depth, not a live
+exploitable hole with a demonstrated path. Every UAF shape written to reach the backstop
+was caught at COMPILE time by zercheck — a dynamic-index table of opaques, a free through a
+cinclude'd C function with a destructor-ish name, and the same with a deliberately neutral
+name (`c_handoff`, so the destructor heuristic could not fire). zercheck rejected all of
+them, which is the desired outcome. What is wrong is that the flag claims a backstop it does
+not provide, not that a reachable UAF is going unchecked.
+
+Diagnosis recorded in a comment at the emission site in `emitter.c` so a future session
+does not "restore" it and reintroduce the underflow.
+
+---
+
+## CORRECTED 2026-08-31 — `safety_coverage_raw.md` was stale AND pointed at a file that never existed
+
+`tools/safety_coverage.sh` extracts every safety check the compiler performs (checker_error /
+zc_error / ir_zc_error / emitted runtime traps) into `docs/safety_coverage_raw.md`, which its
+own header calls "the source of truth for what exists". Three problems, all measured:
+
+1. **Stale by ~490 rows.** The committed copy had 997 lines; regenerating produced 1487.
+   Everything added since it was last run — including whole classes of check — was absent
+   from the "source of truth".
+2. **It claimed CI enforcement that does not exist.** The header said *"Every row in this raw
+   file must appear in the curated doc; CI enforces that."* `make safety-coverage` is a
+   WARNING-only target and is not part of `make check`.
+3. **The curated doc it named has never existed.** `docs/safety_coverage.md` appears nowhere
+   in the git history; the script referenced it in four places. The real curated matrix is
+   `docs/safety_list.md`.
+
+Regenerated, and all four references repointed. The header now states plainly that this is a
+snapshot only as fresh as the last person to run the target. Also worth noting from the
+regenerated Part 1: `zercheck.c (handle-tracking zc_error/warning) | 0` — independent
+confirmation that the AST shim carries no live checks, which is what makes it safe to ignore.
+
+---
+
 ## MEASURED CLEAN 2026-08-31 — the intrinsic dual-path invariant, all 139
 
 Recorded so it is not re-probed blind, and because the METHOD matters more than the result.
@@ -258,7 +335,9 @@ constrained-value guard at a field read / deref whose base pointer's provenance 
 cost is one comparison per constrained load through a minted pointer and nothing on an
 ordinary `ptr.state` read — but the provenance has to be threaded to the load site, which
 is where the work is. Cell to add when it lands: a `mint/enum-in-struct-pointee` NEG row in
-`tests/test_constrained_matrix.c`.
+`tests/test_constrained_matrix.c`. Recorded as an executable reproducer at
+`tests/zer_gaps/mint_aggregate_carrying_enum.zer`, so closing it fails LOUDLY
+(the gaps runner inverts the expectation) instead of leaving a stale entry.
 
 ### LOW — `@ptrcast(*uN, *carrier)` yields an unmasked `uN`
 
@@ -284,7 +363,7 @@ site.
 **It becomes a SOUNDNESS issue the day VRP is taught to infer `[0, 2^N-1]` from a `uN`
 type**, which is an attractive precision win (that guard is provably unnecessary). Close
 this first if that is ever done — the note is here so the dependency is not discovered
-afterwards.
+afterwards. Executable reproducer: `tests/zer_gaps/uN_unmasked_through_ptrcast.zer`.
 
 ### PRECISION (not safety) — VRP never CREATES a range at an assignment
 
@@ -4762,9 +4841,12 @@ saved registers and ensures `ret` happens via the epilogue.
 - **A C `return;` inside a naked function becomes `ud2`, not `ret`.** Verified by objdump.
   So the emitter must SUPPRESS its synthetic trailing `return;` for naked functions —
   flipping the attribute alone converts every one of them into an illegal-instruction trap.
-- **18 positive `tests/zer/asm_*.zer` CALL their naked function**, so that trap is not
-  theoretical: enabling the attribute without the emitter change SIGILLs all of them. (The
-  ones that merely DECLARE a naked function are unaffected — the body is never entered.)
+- **18 naked functions across 16 positive `tests/zer/asm_*.zer` files are CALLED**, so that
+  trap is not theoretical: enabling the attribute without the emitter change SIGILLs every
+  one of them. (18 test files use `naked` at all; the ones that merely DECLARE such a
+  function are unaffected, because the body is never entered.) Counted from the tree
+  2026-08-31 — an earlier draft of this line said "18 files", conflating the function count
+  with the file count.
 - **Extended asm with global operands works fine inside a naked function** on GCC 13,
   despite the documentation saying only basic asm is safe. ZER's structured
   `asm { inputs: ... }` lowers to extended asm and its Z-rule operand tracking depends on

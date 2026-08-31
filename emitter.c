@@ -4791,6 +4791,42 @@ static void emit_func_ret_close(Emitter *e, Type *ret, bool ret_is_funcptr) {
     emit(e, ")");
 }
 
+/* BUG-921 (DIAGNOSED, DELIBERATELY NOT "FIXED") — `--track-cptrs`'s
+ * use-after-free half has no call site, and restoring it naively is UNSOUND.
+ *
+ * WHAT IS DEAD. `--track-cptrs` (implied by `--run`, so the whole test suite
+ * uses it) emits a runtime layer: a 16-byte inline header per allocation with a
+ * magic and an alive flag, `__wrap_malloc`/`__wrap_free`/`__wrap_realloc`/
+ * `__wrap_strdup` linked through `-Wl,--wrap=`, and `_zer_check_alive`. The
+ * DOUBLE-FREE half is WIRED — `__wrap_free` carries a trap on an already-clear
+ * alive flag, and zerc_main.c passes the `--wrap` link flags whenever the mode
+ * is on. The USE-AFTER-FREE half is `_zer_check_alive`, meant to fire before a
+ * `@ptrcast` reads a pointer back out of an `*opaque`, and its only emission
+ * site is in `emit_expr` — the AST path, which function bodies have not used
+ * since the IR migration made bodies IR-only. Measured: with `--track-cptrs`
+ * the emitted C contains the DEFINITION and ZERO calls.
+ *
+ * WHY PORTING IT TO THE IR PATH IS THE WRONG FIX, measured rather than argued.
+ * `_zer_check_alive` computes `(uint32_t *)((char*)ptr - 16)` and reads `hdr[2]`
+ * to test the magic. That is only a defined read when the pointer came from
+ * `__wrap_malloc`. An `*opaque` need not have: `@ptrcast(*opaque, &stack_var)`
+ * is the canonical *opaque idiom, and for it the probe reads 16 bytes BEFORE a
+ * stack object. A port was written, and ASan on the emitted program reported
+ * `stack-buffer-underflow` in exactly that shape. So the AST-path version this
+ * would have been copied from was itself unsound for any non-heap `*opaque`;
+ * the IR path silently dropping it removed a latent out-of-bounds read.
+ *
+ * WHAT A REAL FIX NEEDS: the probe must be reached only for pointers known to
+ * come from the tracked allocator. That is provenance information ZER does not
+ * currently carry (`Symbol.provenance_type` records the pointee TYPE, not the
+ * allocation ORIGIN). Either add a heap-origin bit and gate on it, or delete
+ * `_zer_check_alive` and stop advertising the layer. Both are design decisions.
+ *
+ * Not reachable in practice today either way: every UAF shape written to reach
+ * this backstop — a dynamic-index table, a free through a cinclude'd C function,
+ * a destructor-named and a neutrally-named one — was caught at COMPILE time by
+ * zercheck, which is the desired outcome. Recorded in docs/limitations.md. */
+
 static void emit_func_attributes(Emitter *e, Node *fn) {
     if (!fn || fn->kind != NODE_FUNC_DECL) return;
     if (fn->func_decl.section) {

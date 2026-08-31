@@ -2363,7 +2363,13 @@ Doesn't fit any? → STOP. Either:
 **`*opaque` safety coverage:**
 - Pure ZER: 100% compile-time (zercheck #7 handle states)
 - `*opaque` alone: 100% compile-time (zercheck + #3 provenance)
-- `*opaque` + `cinclude`: 100% (zercheck + `--wrap=malloc` compiled-in)
+- `*opaque` + `cinclude`: compile-time zercheck + the `--wrap=malloc` layer's DOUBLE-FREE
+  trap. **The USE-AFTER-FREE half of that runtime layer is NOT wired** — `_zer_check_alive`
+  has no call site on the IR path, and restoring it naively reintroduces an out-of-bounds
+  read (ASan-confirmed) because it probes `ptr - 16` on pointers that need not be heap.
+  BUG-921 in docs/limitations.md; do not "restore" it without reading that entry. Every UAF
+  shape probed was caught at COMPILE time regardless, so this is a missing backstop rather
+  than a reachable hole.
 - `cinclude` alone (raw `*u8`): NOT tracked — developer wraps with `*opaque` for safety
 
 ## STRICT: No-Debt Implementation Rule

@@ -1567,15 +1567,23 @@ static bool reject_mixed_float_int_compound(Checker *c, Type *target, Type *valu
     char tn[96], vn[96];
     snprintf(tn, sizeof(tn), "%s", type_name(target));
     snprintf(vn, sizeof(vn), "%s", type_name(value));
+    /* Name the conversion in the DESTINATION's own type rather than a hardcoded
+     * one — an `f64 -= 1` used to be told to write `(f32)n`. */
+    char fix[256];
+    if (tf) {
+        snprintf(fix, sizeof(fix),
+                 "Convert the integer operand first: '(%s)n'.", tn);
+    } else {
+        snprintf(fix, sizeof(fix),
+                 "Convert the float operand first: a '(%s)f' cast saturates "
+                 "(defined), or use @saturate/@truncate — a bare compound "
+                 "assignment leaves the out-of-range case undefined.", tn);
+    }
     checker_error(c, line,
         "compound assignment mixes '%s' and '%s' — ZER has no implicit "
         "float/integer conversion, and the plain spelling of the same operation "
         "is rejected for exactly this reason. %s",
-        tn, vn,
-        tf ? "Convert the integer operand first: '(f32)n'."
-           : "Convert the float operand first: a '(u32)f' cast saturates "
-             "(defined), or use @saturate/@truncate — a bare compound "
-             "assignment leaves the out-of-range case undefined.");
+        tn, vn, fix);
     return true;
 }
 
@@ -4844,10 +4852,23 @@ static Type *common_numeric_type(Checker *c, Type *a, Type *b, int line) {
         return (type_width(a) >= type_width(b)) ? a : b;
     }
 
-    /* int + float not allowed in ZER */
-    checker_error(c, line,
-        "cannot mix integer '%s' and float '%s'",
-        type_name(a), type_name(b));
+    /* int + float not allowed in ZER.
+     * 2026-08-31: the message used to print `a` under "integer" and `b` under
+     * "float" unconditionally, so `f32 x; x + 1` read "cannot mix integer 'f32'
+     * and float 'u32'" — both labels on the wrong operand. Name each side by
+     * what it actually is. type_name() rotates only TWO static buffers, so
+     * capture before formatting (CLAUDE.md). */
+    {
+        char an[96], bn[96];
+        snprintf(an, sizeof(an), "%s", type_name(a));
+        snprintf(bn, sizeof(bn), "%s", type_name(b));
+        bool a_is_float = type_is_float(a);
+        checker_error(c, line,
+            "cannot mix float '%s' and integer '%s' — ZER has no implicit "
+            "float/integer conversion. Convert explicitly: '(%s)x'",
+            a_is_float ? an : bn, a_is_float ? bn : an,
+            a_is_float ? an : bn);
+    }
     return a;
 }
 

@@ -1,0 +1,18 @@
+// GAP (2026-08-31): `uN` is a third constrained type in the "value set smaller
+// than the representation" sense, and every value-PRODUCING op masks it — binop
+// and unop via emit_intn_mask, @truncate masks, @saturate clamps, @bitcast is
+// rejected on width, a literal is checked at compile time (15 forms verified).
+// The one unmasked producer is a DEREF through a pointer minted by @ptrcast,
+// allowed because a u3's carrier IS u8 so the pointer types look compatible.
+// LOW: no consequence today — VRP does NOT derive bounds from a uN's width, so
+// an out-of-width uN cannot elide a bounds check (measured: a u3 index into a
+// u32[8] still carries its guard). It becomes a SOUNDNESS issue the day VRP is
+// taught that inference, which is an attractive precision win. Close this first
+// if that is ever done. See docs/limitations.md.
+u8 raw() { return 9; }
+u32 main() {
+    u8 r = raw();
+    *u8 q = &r;
+    *u3 p = @ptrcast(*u3, q);
+    return (u32)(*p);        // 9 — outside u3's [0,7]
+}

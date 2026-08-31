@@ -1,0 +1,14 @@
+// expect-error: cannot store struct/union literal carrying a pointer
+// BUG-920 sibling, found by ENUMERATING the sinks rather than reported: the
+// struct-literal walker peeled launders for its `&local` case and then tested the
+// UN-PEELED node in the other three, so every launder form defeated it.
+struct N { u32 v; }
+struct B { *N p; }
+B gb;
+void stash() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N a = ar.alloc(N) orelse return;
+    gb = { .p = @pun(*N, a) };
+}
+u32 main() { stash(); return 0; }

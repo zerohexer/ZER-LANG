@@ -1,0 +1,12 @@
+// expect-trap
+// BUG-917, carrier form: the guard must recurse struct fields exactly as the
+// enum guard does (BUG-864). Little-endian layout puts 0x02 in `ok`.
+struct Flags { u8 a; bool ok; u16 pad; }
+u32 raw() { return 0x00000207; }
+u32 main() {
+    u32 r = raw();
+    Flags f = @bitcast(Flags, r);
+    if (f.ok == true)  { return 1; }
+    if (f.ok == false) { return 2; }
+    return 3;
+}

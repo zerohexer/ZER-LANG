@@ -214,6 +214,45 @@ cell p16_safe_arena_local    compile 'struct N16{u32 v;} u32 main(){ u8[256] bk;
 cell p16_safe_lit_global_ptr compile 'struct N16{u32 v;} struct B16{ *N16 p; } N16 gn16; B16 gb16b; void c(){ gb16b={ .p=&gn16 }; } u32 main(){c();return 0;}'
 
 # ---------------------------------------------------------------------------
+# SHAPE p19 (BUG-920): the LAUNDER axis crossed with the ARENA lifetime. p15
+# established that a launder must be peeled before asking "is this frame-bound?",
+# and p16 established that the question has TWO lifetimes (local, arena). This row
+# is the product, and the product was where two sinks still had PRIVATE, shorter
+# peels than the shared `unwrap_ptr_launder`:
+#
+#   - the plain-assignment arena sink knew about @ptrcast and @cast ONLY, so @pun
+#     and a C-style cast walked past it. With the arena's backing buffer on the
+#     frame that is a stack-use-after-return — ASan-confirmed, and the program
+#     reads a dead frame with no diagnostic and no fault.
+#   - the STRUCT-LITERAL sink peeled for its &local case and then tested the
+#     UN-PEELED node in the three other cases, so EVERY launder form defeated it.
+#     Found by enumerating the sinks after fixing the first one; nothing reported it.
+#
+# PROBE WARNING: the obvious reproducer calls `ar.reset()` in the same function and
+# is MASKED by the dangling-global rule. Let the FRAME die instead — that is what
+# these cells do.
+echo "===== SHAPE p19 = a launder around an ARENA pointer at each escape sink ====="
+cell p19_arena_pun_glob      reject 'struct N19{u32 v;} ?*N19 g19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; g19=@pun(*N19,a); } u32 main(){c();return 0;}'
+cell p19_arena_ccast_glob    reject 'struct N19{u32 v;} ?*N19 g19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; g19=(*N19)a; } u32 main(){c();return 0;}'
+cell p19_arena_bitcast_glob  reject 'struct N19{u32 v;} ?*N19 g19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; g19=@bitcast(*N19,a); } u32 main(){c();return 0;}'
+cell p19_arena_pun_lit       reject 'struct N19{u32 v;} struct B19{ *N19 p; } B19 gb19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; gb19={ .p=@pun(*N19,a) }; } u32 main(){c();return 0;}'
+cell p19_arena_ccast_lit     reject 'struct N19{u32 v;} struct B19{ *N19 p; } B19 gb19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; gb19={ .p=(*N19)a }; } u32 main(){c();return 0;}'
+cell p19_arena_ptrcast_lit   reject 'struct N19{u32 v;} struct B19{ *N19 p; } B19 gb19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; gb19={ .p=@ptrcast(*N19,a) }; } u32 main(){c();return 0;}'
+cell p19_local_pun_lit       reject 'struct B19b{ *u32 p; } B19b gb19b; void c(){ L loc; gb19b={ .p=@pun(*u32,&loc.f) }; } u32 main(){c();return 0;}'
+cell p19_local_ccast_lit     reject 'struct B19b{ *u32 p; } B19b gb19b; void c(){ L loc; gb19b={ .p=(*u32)(&loc.f) }; } u32 main(){c();return 0;}'
+# BOUNDARY: the peel must not turn a launder over a GLOBAL address, or an arena
+# pointer used LOCALLY, into an escape.
+cell p19_safe_pun_global     compile 'u32 gx19=1; struct B19c{ *u32 p; } B19c gb19c; void c(){ gb19c={ .p=@pun(*u32,&gx19) }; } u32 main(){c();return 0;}'
+cell p19_safe_arena_local    compile 'struct N19{u32 v;} u32 main(){ u8[256] bk; Arena ar=Arena.over(bk); ?*N19 m=ar.alloc(N19); if (m) |a| { *N19 b=@pun(*N19,a); b.v=7; if (b.v != 7) { return 1; } } return 0; }'
+# 2-HOP: the launder sits in a VAR-DECL init, so the flag has to PROPAGATE to the
+# new local before the sink ever sees it. That walker had its own hand-rolled peel
+# too — it knew intrinsics and not a C-style cast — so `*N b = (*N)arena_ptr; g=b;`
+# broke the chain while `@pun` and the bare form both propagated.
+cell p19_twohop_ccast        reject 'struct N19{u32 v;} ?*N19 g19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; *N19 b=(*N19)a; g19=b; } u32 main(){c();return 0;}'
+cell p19_twohop_pun          reject 'struct N19{u32 v;} ?*N19 g19; void c(){ u8[256] bk; Arena ar=Arena.over(bk); *N19 a=ar.alloc(N19) orelse return; *N19 b=@pun(*N19,a); g19=b; } u32 main(){c();return 0;}'
+cell p19_safe_twohop_global  compile 'struct N19{u32 v;} N19 gn19; ?*N19 g19; void c(){ *N19 b=(*N19)(&gn19); g19=b; } u32 main(){c();return 0;}'
+
+# ---------------------------------------------------------------------------
 # SHAPE p17 (BUG-807): the launder peel applied to a CALL ARGUMENT rather than
 # to the stored value. p15 above covers `g = <launder>(&local)` — the launder
 # wrapping the value at the sink. This row covers `g = f(<launder>(&local))` —

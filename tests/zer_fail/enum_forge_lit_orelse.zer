@@ -1,0 +1,5 @@
+// expect-error: is not a variant of enum
+// BUG-913: ... at the orelse-fallback sink.
+enum Color { red, green, blue }
+?Color maybe() { return null; }
+u32 main() { Color c = maybe() orelse 99; return (u32)c; }

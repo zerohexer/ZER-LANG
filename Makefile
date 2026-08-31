@@ -162,11 +162,22 @@ test_asm_matrix: tests/test_asm_matrix.c
 test_defer_goto_matrix: tests/test_defer_goto_matrix.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# CONSTRAINED-VALUE oracle (2026-08-31). enum and bool are the two ZER types
+# whose legal values are a strict SUBSET of the integer that represents them, so
+# they are the only two that can be FORGED. The class is multi-site — the nine
+# value-flow sinks, the arithmetic operators, the three tracked conversion doors
+# and the three pointer-minting doors — and each site had been fixed on its own
+# before the axis was written down. Verified non-vacuous: 27 failures against the
+# pre-BUG-913 compiler (24 forged values accepted, 3 missing runtime guards),
+# 44/44 after.
+test_constrained_matrix: tests/test_constrained_matrix.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_constrained_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -191,6 +202,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_async_matrix
 	./test_asm_matrix
 	./test_defer_goto_matrix
+	./test_constrained_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh
@@ -275,6 +287,18 @@ clean:
 	      test_production test_production.exe \
 	      test_fuzz test_fuzz.exe \
 	      test_semantic_fuzz test_semantic_fuzz.exe \
+	      test_shape_matrix test_shape_matrix.exe \
+	      test_escape_matrix test_escape_matrix.exe \
+	      test_keep_matrix test_keep_matrix.exe \
+	      test_cflow_matrix test_cflow_matrix.exe \
+	      test_conc_matrix test_conc_matrix.exe \
+	      test_view_alias_matrix test_view_alias_matrix.exe \
+	      test_hw_matrix test_hw_matrix.exe \
+	      test_async_matrix test_async_matrix.exe \
+	      test_asm_matrix test_asm_matrix.exe \
+	      test_defer_goto_matrix test_defer_goto_matrix.exe \
+	      test_constrained_matrix test_constrained_matrix.exe \
+	      test_ir_validate test_ir_validate.exe \
 	      demo_lexer demo_lexer.exe \
 	      _zer_test_out.c _zer_test_out.exe _zer_test_out.o _zer_gcc_err.txt
 	rm -rf release

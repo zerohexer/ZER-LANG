@@ -1,0 +1,48 @@
+// BUG-913/914 over-rejection boundary: everything an enum IS allowed to do.
+// A literal that names a declared value stays legal at every sink; comparisons,
+// casts and use-as-index are untouched. This is the control that proves the
+// tightening cost nothing real.
+enum Color { red, green, blue }
+enum Code  { ok = 10, warn = 20, bad = -1 }
+
+struct S { Color c; }
+Color g_init = 2;                       // global init, in-range literal
+Color g_plain;
+
+u32 take(Color c) { return (u32)c; }
+Color give() { return 1; }              // return sink, in-range literal
+
+?Color none_c() { return null; }
+
+u32 main() {
+    Color a = Color.red;                // the idiomatic spelling
+    Color b = 1;                        // var-decl, in-range literal
+    g_plain = 2;                        // assignment, in-range literal
+    Code  d = -1;                       // NEGATIVE declared variant
+    Code  e = 20;                       // gapped declared variant
+    S s = { .c = 2 };                   // designated-init field
+    Color[3] arr;
+    arr[0] = 0;                         // array element
+    Color f = none_c() orelse 1;        // orelse fallback
+
+    // comparisons are unaffected — they consume an enum and yield a bool
+    if (a == Color.red && b != Color.blue && a < Color.blue) {
+        // casting out is the supported way to compute
+        u32 n = (u32)a + (u32)b + (u32)g_init + (u32)g_plain + (u32)s.c
+              + (u32)arr[0] + (u32)f + take(2) + (u32)give();
+        // an enum is still usable as an array index
+        u32[3] tbl; tbl[0] = 7; tbl[1] = 8; tbl[2] = 9;
+        u32 viaidx = tbl[a];
+        // exhaustive switch still works
+        switch (b) {
+            .red   => { n += 0; }
+            .green => { n += 0; }
+            .blue  => { n += 0; }
+        }
+        if (n == 11 && viaidx == 7 && (u32)@bitcast(u32, d) == 4294967295 && (u32)e == 20) {
+            return 0;
+        }
+        return n;
+    }
+    return 1;
+}

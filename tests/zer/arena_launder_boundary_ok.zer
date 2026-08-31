@@ -1,0 +1,25 @@
+// BUG-920 over-rejection boundary: peeling launders must not turn a launder over a
+// GLOBAL address, or an arena pointer used entirely LOCALLY, into an escape.
+struct N { u32 v; }
+struct B { *u32 p; }
+u32 g_x = 7;
+B gb;
+N g_n;
+?*N g_np;
+
+u32 main() {
+    gb = { .p = @pun(*u32, &g_x) };        // launder over a GLOBAL — fine
+    g_np = @pun(*N, &g_n);                 // ditto, plain assignment
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    ?*N m = ar.alloc(N);
+    if (m) |a| {
+        *N b = @pun(*N, a);                // arena pointer used LOCALLY — fine
+        b.v = 7;
+        if (b.v != 7) { return 1; }
+    }
+    if (g_np) |np| {
+        if (*gb.p == 7 && np.v == 0) { return 0; }
+    }
+    return 2;
+}

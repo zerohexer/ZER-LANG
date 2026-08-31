@@ -1,0 +1,4 @@
+// expect-error: cannot mint a pointer to
+// BUG-918: the same forge via @ptrcast from a *u32.
+enum Color { red, green, blue }
+u32 main() { u32 raw = 99; *u32 p = &raw; *Color q = @ptrcast(*Color, p); return (u32)(*q); }

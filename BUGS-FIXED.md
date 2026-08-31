@@ -5,6 +5,243 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-08-31 — BUG-913..920: the CONSTRAINED-VALUE class, two emitter declarator bugs, and a live peel-site escape
+
+A fresh audit of the **value domain** — the one domain with no axis-crossed matrix. Nine of
+the ten existing grids test escape, aliasing, control flow, concurrency or hardware; none
+asked "may this VALUE become that TYPE?". Seven bugs came out of that gap, six of them one
+class, and the class now has a grid.
+
+### The class: a CONSTRAINED type is forgeable, and forging it is SILENT
+
+A **constrained type** is one whose legal values are a strict SUBSET of the integer that
+represents it. ZER has exactly two: `enum` (its declared variants) and `bool` (0 and 1).
+
+CLAUDE.md recorded the forging doors as *"EXACTLY THREE and the set is closed"* —
+`@bitcast`, `@truncate`, `@saturate`, each paying for a runtime variant guard. That was
+true of the CONVERSION doors. It was never true of the language: a plain integer LITERAL,
+ordinary ARITHMETIC, and a MINTED POINTER all reached an enum with no check at all, and
+`bool` was not in the guard at all.
+
+**Why it is silent rather than loud.** The enum switch lowering emits the LAST arm as an
+unconditional else (ir_lower.c). That elision is deliberate and load-bearing — without it
+the CFG merge at `bb_exit` gains a spurious predecessor and arms that free a handle produce
+MAYBE_FREED false positives — and it is sound *given* that an enum only ever holds a
+declared variant. Break that premise and the entire cost lands as **a switch silently
+running an arm the value does not name**. No diagnostic, no trap, on hosted and bare metal
+alike. A forged `bool` is worse-behaved still: `b == true` and `b == false` are BOTH false.
+
+### BUG-913 — an integer literal forges an enum at all NINE value-flow sinks
+
+```zer
+enum Color { red, green, blue }
+Color c = 99;            // accepted
+f(99);  g = 99;  return 99;  { .c = 99 };  a[0] = 99;  x orelse 99;  spawn w(99);
+Color gg = 99;           // global init too
+```
+
+**Root cause — one predicate, nine sinks.** `is_literal_compatible` gates on
+`type_is_integer(effective)`, which an enum PASSES (`zer_type_kind_is_integer(ZER_TK_ENUM)`
+is 1, and must stay 1 — `(u32)c`, comparisons, the switch dispatch and the emitted
+`int32_t` all depend on it). It then fell into the catch-all `case TYPE_ENUM: return true`
+whose own comment said *"non-numeric types trivially fit ... this predicate doesn't
+apply"* — written on the assumption that the guard clause had already excluded enums. It
+had not. Because BUG-842 had already unified the eight sinks behind `value_flows_to`, the
+wrong answer was delivered to every one of them identically.
+
+**Fix.** `enum_literal_is_variant` — the literal must equal a DECLARED variant value.
+Compile-time known ⇒ compile-time verdict, so unlike the three conversion doors this one
+costs no runtime guard. The negative-literal path is matched the same way, because a
+variant may be declared negative (`enum Code { bad = -1 }`).
+
+Also extracted, because the fix gave `is_literal_compatible` a second meaning for one type:
+`check_int_literal_fits` (BUG-373's width check, previously five identical lines at three
+sinks) now skips enums, so a membership problem is not also reported as a width problem.
+And `report_value_flow_specific` is now the ONE place a specialised value-flow wording
+lives — `report_negative_const_flow` had been threaded through eight sinks by hand and
+BUG-913 would have meant editing all eight again.
+
+### BUG-914 — arithmetic on an enum forges one, at four more spellings
+
+```zer
+Color d = c + c;    // blue+blue = 4
+Color d = c << c;   c += 99;   d = ~c;   d = -c;
+```
+
+Closing the literal door alone was not enough: `c + 99` now fails on the mix rule, but
+enum-with-enum stayed accepted. There is no runtime guard to reach for — the operand set is
+unbounded, unlike a conversion where one trap at the site covers every input. Rejected per
+the Ban Decision Framework rule 4 (expressing "the result is still a variant" needs a
+refinement type ZER does not have). One predicate `reject_enum_arith` at five sites: binary
+arithmetic, bitwise/shift, unary `-`, unary `~`, compound assignment.
+
+**Comparisons and casts are untouched** — they consume an enum and yield a bool or an
+integer, forging nothing. Corpus cost of the whole tightening: **zero**.
+
+### BUG-915 — `a += f` did what `a = f` is refused, and bypassed float→int saturation
+
+```zer
+u32 a = 1; f32 f = 2.5;
+a = f;     // rejected: "cannot assign 'f32' to 'u32'"
+a += f;    // ACCEPTED — emitted as a bare C `a += f`
+```
+
+The compound path checked numeric-ness, bitwise-ness, the division guard and WIDTH, but
+never that both sides are on the same side of the int/float line. At equal width (u32/i32
+vs f32) the width check passes.
+
+This is not only two spellings disagreeing. It silently bypassed the float→int SATURATION
+that BUG-845/BUG-883 established as ZER's defined behaviour. **Measured** with `f = 1e20`:
+the emitted program returns **0 at -O0 and 255 at -O2** — the same program, two answers,
+chosen by the optimiser — and UBSan reports *"1e+20 is outside the range of representable
+values of type 'unsigned int'"*. The documented spelling `(u32)f` correctly gives
+4294967295 at both levels. Rejecting (rather than inserting the conversion) is what keeps
+the two spellings agreeing, which is the property whose absence caused this.
+
+### BUG-916 — the prototype path emits invalid C for a function returning a funcptr
+
+```zer
+*(u32) -> u32 pick(u32 k);              // forward declaration
+*(u32) -> u32 pick(u32 k) { ... }       // definition
+```
+```c
+uint32_t (*)(uint32_t) pick(uint32_t k);      // prototype path — gcc rejects outright
+uint32_t (*pick(uint32_t k))(uint32_t) { }    // definition path — correct
+```
+
+C nests the function's own name inside the pointer. The IR/definition path learned this in
+2026-04-25 and carries a comment saying so; the PROTOTYPE path (bodyless externs, ZER
+forward declarations, and the declarations emitted for imported module functions) kept the
+naive "type, space, name" form. The identical program WITHOUT the forward declaration
+compiled, which is what makes it a two-emission-path bug rather than a missing feature.
+
+Fixed by extracting `emit_func_ret_open` / `emit_func_ret_close` and routing BOTH paths
+through them, so they cannot drift again. Verified surgical: emitted C diffed across **952
+corpus files, one file differs**, and only by `()` → `(void)` on a zero-parameter funcptr
+return — a real prototype instead of a K&R unspecified-argument list.
+
+### BUG-917 — `bool` is the other constrained type, and had no guard
+
+```zer
+u8 r = raw();                    // 2
+bool b = @bitcast(bool, r);      // accepted, unguarded
+b == true   -> false
+b == false  -> false             // measured: the program returned 3
+```
+
+Directly, and through a struct field or an array element carrier — exactly the shapes
+BUG-864 had widened the ENUM guard to cover. `type_carries_enum_e` is renamed
+`type_carries_constrained_e` and answers for both types; `emit_enum_variant_guard_path`
+becomes `emit_constrained_value_guard_path` and emits `!(p == 0 || p == 1)` for a bool.
+All three conversion doors get it for free. **Zero guards are emitted in ordinary bool
+code** — verified by counting them in a program using bools in every position.
+
+### BUG-918 — the pointer-MINTING doors could mint a pointer to a constrained type
+
+```zer
+volatile *Color r = @inttoptr(*Color, 0x40000000);
+Color c = *r;              // any byte the device presents
+switch (c) { ... }         // silently takes the LAST arm
+```
+
+@bitcast/@truncate/@saturate produce a VALUE, so a runtime guard at the conversion covers
+them. @inttoptr/@ptrcast/@pun produce an ADDRESS — there is nothing to guard yet, and the
+later `*p` is an ordinary load with no check. Rejected at the mint rather than guarded at
+the load: a pointer to a constrained type has exactly one honest source, `&var`, and the
+guarded route for hardware is already the documented one (read the raw integer, then
+`@bitcast`, which traps).
+
+**Deliberately narrow.** The rule fires only on a DIRECTLY constrained pointee
+(`*Color`, `*bool`, `*Color[4]`, `*?Color`), never on an aggregate that merely CONTAINS
+one — `@ptrcast(*Sensor, ctx)` is the sanctioned *opaque round-trip and
+`@inttoptr(*Regs, base)` is how a peripheral is mapped. `type_carries_constrained` takes a
+`through_aggregate` flag so the two questions cannot be confused. The residual risk on the
+aggregate forms is recorded in `docs/limitations.md`.
+
+### BUG-919 — `@bitcast` to an ARRAY type has never worked
+
+```c
+({ __auto_type _zer_bci1 = r; int32_t[2] _zer_bco0; ... })   // not a declarator
+```
+
+@bitcast lowers to a GCC statement expression whose value is the punned temporary, and C
+has no array rvalue: the emitter wrote the type NAME and the temp name in that order, and
+the trailing `_zer_bco0;` would decay to a pointer even if it had parsed. Measured: it
+fails in EVERY position for EVERY element type, and there are **zero uses in the corpus**,
+because none could ever have compiled. Now a ZER diagnostic naming the working
+alternative — a one-field struct, verified to work — instead of a gcc syntax error
+pointing at generated C.
+
+### The gate: `tests/test_constrained_matrix.c` (44 cells, in `make check`)
+
+Every previous member of this class was patched alone: BUG-843 closed `@bitcast`, BUG-891
+`@truncate`, BUG-910 `@saturate`, BUG-864 the carriers — four sequential fixes, each
+leaving siblings open, before anyone wrote the axis down. The grid crosses the two
+constrained types with all four kinds of site (FLOW / OP / DOOR / MINT) and three verdict
+kinds (must-reject-for-the-right-reason / must-trap-at-runtime / must-compile-and-return-0).
+
+**Verified non-vacuous against a pre-fix build: 27 failures — 24 forged values ACCEPTED and
+3 missing runtime guards — then 44/44.** A cell rejected by a parse error is reported
+INVALID-PROBE rather than passing, and the `-Wswitch` scenario enum makes a new constrained
+type or a new site fail the build.
+
+Also fixed while here: `make clean` removed no matrix binary at all (ten of them), which is
+the stale-artifact trap CLAUDE.md documents.
+
+### BUG-920 — the peel-site debt was LIVE: a launder walked an arena pointer into a global
+
+`unwrap_ptr_launder` is the shared answer to "what is this value really?" — it peels
+@ptrcast, @pun, @bitcast, @cast, @container, @cstr and a C-style cast to a reference type,
+and it loops so they nest. CLAUDE.md records that checker.c still had hand-rolled peels
+beside it and calls that ratio "the debt". It was not just debt; three of those private
+peels were WRONG, and each was a shipped dangling-pointer escape:
+
+| site | its private peel knew | so this was accepted |
+|---|---|---|
+| plain assignment, arena sink | @ptrcast, @cast | `g = @pun(*N, arena_ptr);` `g = (*N)arena_ptr;` |
+| struct literal (all four cases) | peeled for `&local` ONLY, then tested the UN-peeled node | `gb = { .p = @pun(*N, arena_ptr) };` and every other launder, for locals too |
+| var-decl flag propagation | intrinsics, not casts | `*N b = (*N)arena_ptr; g = b;` |
+
+Every one has a rejected twin one line away — `g = arena_ptr` is caught — and for the
+C-style cast the emitter ELIDES the cast, so the accepted and rejected programs compile to
+**byte-identical C**.
+
+**Consequence measured, not argued.** With the arena's backing buffer on the frame
+(`u8[256] bk; Arena ar = Arena.over(bk);`) the escaped pointer outlives its memory:
+the program reads a dead frame, returns the wrong value, and **ASan reports
+`stack-use-after-return`**. No compile diagnostic, no fault.
+
+**PROBE WARNING for whoever revisits this:** the obvious reproducer calls `ar.reset()` in
+the same function and is MASKED by the dangling-global rule (*"global 'g' left dangling at
+function exit"*), which reports a DIFFERENT defect. Let the frame die instead.
+
+**The fix is the debt reduction.** All three sites now call `unwrap_ptr_launder`, so a
+launder added there reaches them for free. The struct-literal walker additionally had to use
+the peeled node in Cases B/C/D, not just Case A.
+
+**The struct-literal and var-decl siblings were found by ENUMERATING the sinks after fixing
+the first one — nothing reported them.** That is the multi-site discipline working exactly
+as CLAUDE.md describes: the reported bug was at one sink, and two more had the same question
+with a private, shorter answer.
+
+Gated by a new **p19 axis in `tools/sink_matrix.sh`** (13 cells: launder x arena/local x
+global-store / struct-literal / var-decl-propagation, plus three over-rejection boundaries).
+Verified firing: **8 holes pre-fix, 101/101 after.**
+
+### Tests
+
+Negatives (`tests/zer_fail/`, each with `// expect-error:`): `enum_forge_lit_*` (10, one
+per sink plus the negative literal), `enum_arith_*` (5), `compound_{float_into_int,
+int_into_float}`, `enum_mint_{inttoptr,ptrcast,pun}`, `bool_mint_ptrcast`.
+Runtime traps (`tests/zer_trap/`): `bool_forged_bitcast{,_struct_carrier}`.
+Over-rejection boundaries (`tests/zer/`): `enum_literal_variant_ok`,
+`compound_assign_same_domain_ok`, `bool_ordinary_no_guard_ok`,
+`constrained_mint_boundary_ok`, `funcptr_return_forward_decl_ok`.
+BUG-920: `arena_launder_{pun_global,ccast_global,structlit,twohop_ccast}.zer` +
+`local_launder_structlit_ccast.zer`, boundary `tests/zer/arena_launder_boundary_ok.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

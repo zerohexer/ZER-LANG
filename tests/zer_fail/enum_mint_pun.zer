@@ -1,0 +1,5 @@
+// expect-error: cannot mint a pointer to
+// BUG-918: and via @pun.
+enum Color { red, green, blue }
+struct W { u32 n; }
+u32 main() { W w; w.n = 99; *W wp = &w; *Color cp = @pun(*Color, wp); return (u32)(*cp); }

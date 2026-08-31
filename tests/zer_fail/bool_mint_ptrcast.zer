@@ -1,0 +1,6 @@
+// expect-error: cannot mint a pointer to
+// BUG-918 + BUG-917: bool is the other constrained type — a load through a
+// minted *bool yields a value that is neither true nor false.
+u8 raw() { return 2; }
+u32 main() { u8 r = raw(); *u8 q = &r; *bool p = @ptrcast(*bool, q); bool b = *p;
+if (b == true) { return 1; } if (b == false) { return 2; } return 3; }

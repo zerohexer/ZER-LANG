@@ -1,0 +1,13 @@
+// BUG-915 over-rejection boundary: compound assignment inside ONE numeric
+// domain is untouched. Only int<->float MIXING is rejected, because the plain
+// spelling of that same operation is rejected.
+u32 main() {
+    u32 a = 1; u32 b = 3; a += b; a *= 2; a -= 1;   // int op= int
+    f32 x = 1.5; f32 y = 2.0; x += y; x *= 2.0;      // float op= float
+    i32 s = -4; s += 2;
+    u8 n = 3; n += 4;
+    // an explicit conversion is how the mixed case is spelled
+    f32 z = 1.5; u32 c = 2; z += (f32)c; c += (u32)z;
+    if (a == 7 && x == 7.0 && s == -2 && n == 7 && c == 5) { return 0; }
+    return 1;
+}

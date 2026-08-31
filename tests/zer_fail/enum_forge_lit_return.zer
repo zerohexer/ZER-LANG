@@ -1,0 +1,5 @@
+// expect-error: is not a variant of enum
+// BUG-913: ... at the return sink.
+enum Color { red, green, blue }
+Color f() { return 99; }
+u32 main() { return (u32)f(); }

@@ -1,0 +1,4 @@
+// expect-error: on enum
+// BUG-914: and `-c`.
+enum Code { ok = 10, warn = 20 }
+u32 main() { Code c = Code.ok; Code d = -c; return (u32)@bitcast(u32, d); }

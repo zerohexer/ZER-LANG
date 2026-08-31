@@ -33,6 +33,13 @@ PATTERNS=(
     "/\\* stub \\*/"
     "/\\* placeholder \\*/"
     "/\\* TODO:[^*]*\\*/[^a-zA-Z\"]"   # bare TODO with no following code
+    # 2026-08-31: the fingerprint CLAUDE.md names as THE intrinsic dual-path
+    # failure mode — `emit_rewritten_node`'s final else emits `/* @name */ 0`
+    # for an intrinsic the IR path does not know, which compiles and then does
+    # the wrong thing (often segfaulting) at run time. It was missing from this
+    # list, so the gate did not look for the very shape its own documentation
+    # warns about.
+    "/\\* @[a-z_0-9]* \\*/ 0"
 )
 
 # Sample multi-module tests — representative of the module emission path.

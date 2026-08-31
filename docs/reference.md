@@ -145,6 +145,13 @@ if (x) { }                // COMPILE ERROR — x is u32, not bool
 **NOTES**
 - Switch on bool must be exhaustive: both `true` and `false` arms required.
 - Comparisons (`==`, `<`, etc.) return bool.
+- An EXPLICIT cast is allowed in both directions and normalises: `(bool)n` is `n != 0`, and
+  `(u32)flag` is 0 or 1. It is the implicit conversion that is banned, not the deliberate one.
+- `bool` is a CONSTRAINED type — its only legal values are 0 and 1 — so it shares the enum
+  rules: `@bitcast(bool, n)` traps at run time if `n` is neither, and `@ptrcast(*bool, p)` /
+  `@inttoptr(*bool, a)` / `@pun(*bool, p)` are compile errors. Without that, a bool holding
+  2 would make `b == true` and `b == false` BOTH false. See "Constrained types" under
+  SAFETY RULES YOU WILL HIT.
 
 ---
 
@@ -579,9 +586,18 @@ enum Direction { left = -1, center = 0, right = 1 }
 **NOTES**
 - Dot syntax required: `State.idle`, not bare `idle`.
 - Switch arms use `.variant => { }` syntax.
+- An enum holds ONLY its declared values. An integer literal is accepted wherever it names
+  one (`State s = 1;` is `running`) and rejected otherwise (`State s = 99;`).
+- **Arithmetic on an enum is a compile error** — `s + 1`, `s += 1`, `~s`, `s << 1`. The
+  result could leave the variant set, and an exhaustive `switch` would silently run its
+  last arm on it. Compute in an integer and convert back: `@bitcast(State, (u32)s + 1)`,
+  which traps if the result is not a variant. Comparisons (`s == State.idle`, `s < State.done`),
+  the `(u32)s` cast, and using an enum as an array index are all fine.
+- See "Constrained types" under SAFETY RULES YOU WILL HIT for the full set of rules and the
+  reason behind them.
 
 **SEE ALSO**
-switch, union
+switch, union, bool, Constrained types
 
 ---
 
@@ -706,8 +722,33 @@ i32 main() {
 }
 ```
 
+**FORWARD-DECLARING a function that RETURNS a function pointer** works in both syntaxes.
+C nests the function's own name inside the pointer for this shape, and both the prototype
+and the definition are emitted that way:
+
+```zer
+*(u32) -> u32 pick(u32 k);          // 2C forward declaration
+typedef u32 (*Op)(u32);
+Op pick2(u32 k);                    // 2A forward declaration
+
+u32 dbl(u32 x) { return x * 2; }
+u32 inc(u32 x) { return x + 1; }
+
+*(u32) -> u32 pick(u32 k) { if (k == 0) { return dbl; } return inc; }
+Op pick2(u32 k) { if (k == 0) { return inc; } return dbl; }
+
+u32 main() {
+    *(u32) -> u32 f = pick(0);
+    Op g = pick2(0);
+    if (f(3) == 6 && g(3) == 4) { return 0; }
+    return 1;
+}
+```
+
 **ARRAYS OF FUNCTION POINTERS** work in both syntaxes, and the element type
-should be NULLABLE:
+MUST be NULLABLE — array elements auto-zero, and a non-optional function pointer may not
+be null, so `*(u32, u32) -> u32 [4] ops;` is rejected while `?*(u32, u32) -> u32 [4] ops;`
+is accepted:
 
 ```zer
 u32 add(u32 a, u32 b) { return a + b; }
@@ -1833,6 +1874,12 @@ ar.alloc_slice(Byte, 64);
 
 **NOTES**
 - Arena-derived pointers cannot be stored in global/static variables (compile error).
+- The rule looks THROUGH conversions. `g = @pun(*N, a)`, `g = @ptrcast(*N, a)`,
+  `g = (*N)a`, `g = @bitcast(*N, a)`, `gb = { .p = @pun(*N, a) }` and the two-step
+  `*N b = (*N)a; g = b;` are all the same escape as `g = a` and all rejected. That is
+  deliberate: an identity C-style cast is ELIDED by the emitter, so the laundered and
+  the bare program compile to identical C, and a rule that saw only one of them would
+  be a rule you could spell your way around.
 - Two allocations from the SAME arena may point at each other; from DIFFERENT
   arenas they may not.
 - `alloc_slice(T, n)` refuses any request whose byte count `sizeof(T) * n`
@@ -1897,6 +1944,25 @@ Checks qualifier preservation (const, volatile).
 ```zer
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
 ```
+
+**NOTES**
+- The target may not be an ARRAY type (`@bitcast(u32[2], x)`) — @bitcast lowers to a GCC
+  statement expression and C has no array rvalue, so there is no value for the conversion
+  to produce. Wrap the array in a struct, which does work:
+
+```zer
+struct Pair { u32[2] a; }
+u64 raw() { return 0x0000000200000001; }
+u32 main() {
+    u64 r = raw();
+    Pair p = @bitcast(Pair, r);
+    return p.a[0];                 // 1
+}
+```
+
+- A target that CARRIES an `enum` or a `bool` — directly, or in a struct field, optional
+  payload or array element — gets a runtime guard that traps on a value outside the legal
+  set. See "Constrained types" under SAFETY RULES YOU WILL HIT.
 
 ---
 
@@ -3066,25 +3132,36 @@ u32 bad(f32 x) {
 }
 ```
 
-### Forging an enum traps at the point of forgery
+### Constrained types: `enum` and `bool` hold only their declared values
 
-ZER has no int-to-enum cast, so the only way to produce a value outside an enum's declared
-variants is a bit-level conversion. Those are legitimate — reading an enum out of a
-hardware register is a real firmware idiom — so ZER **tracks** rather than bans: the
-conversion compiles, and a guard traps if the value is not a declared variant. Without it
-an exhaustive `switch` silently runs its last arm on a value that matches none.
+`enum` and `bool` are the two ZER types whose legal values are a strict SUBSET of the
+integer that represents them — an enum holds its declared variants, a bool holds 0 or 1.
+Every other scalar can hold every bit pattern of its width, so only these two can be
+*forged*.
 
-There are exactly **three** doors, and each carries the guard:
+**Why ZER cares.** An exhaustive enum `switch` compiles its LAST arm as an unconditional
+else — it is entitled to, because exhaustiveness was checked. So a value that names no
+variant does not fault and does not fall through: it **silently runs the last arm**. A
+forged `bool` is stranger still — `b == true` and `b == false` are both false. Neither
+faults, on hosted or on bare metal, so ZER closes every route to producing one.
 
-| conversion | guarded |
+**Four kinds of route, closed four different ways:**
+
+| route | rule |
 |---|---|
-| `@bitcast(Enum, n)` | yes |
-| `@truncate(Enum, n)` | yes |
-| `@saturate(Enum, n)` | yes |
+| an integer **literal** — `Color c = 99;` and the same at every other value-flow position (assignment, call argument, return, global init, `{ .f = }`, array element, `orelse` fallback, `spawn` argument) | **compile error.** The value is known at compile time, so no runtime guard is needed. A literal that DOES name a declared variant is fine: `Color c = 1;` |
+| **arithmetic** — `c + c`, `c << c`, `c += 2`, `~c`, `-c` | **compile error.** The operand set is unbounded, so no single trap could cover it. Compute in an integer and convert back: `(u32)c`, then `@bitcast` |
+| the **conversion** doors — `@bitcast`, `@truncate`, `@saturate` | **tracked, not banned** — reading an enum out of a hardware register is a real firmware idiom. The conversion compiles and a guard **traps at run time** if the result is not legal |
+| the **pointer-minting** doors — `@inttoptr`, `@ptrcast`, `@pun`, when the pointee IS constrained (`*Color`, `*bool`) | **compile error.** These produce an address, not a value, so there is nothing to guard; the later `*p` is a bare load. Read the raw integer and convert: `u32 v = *reg; Color c = @bitcast(Color, v);` |
 
-`@cast` is **not** a fourth door: it requires a distinct typedef and cannot name a bare
-enum. The guard also recurses through struct fields, optional payloads and array elements,
-so `@bitcast(Box, 7)` where `struct Box { State s; }` is checked too.
+Comparisons (`c == Color.red`, `c < Color.blue`), explicit casts (`(u32)c`), and using an
+enum as an array index are all **unaffected** — they consume a constrained value and
+produce something else, forging nothing. `@cast` is not a door either: it requires a
+distinct typedef and cannot name a bare enum.
+
+The runtime guard recurses through struct fields, optional payloads and array elements, so
+`@bitcast(Box, 7)` where `struct Box { State s; }` is checked too — and it applies to both
+constrained types.
 
 ```zer
 enum State { idle, running, done }
@@ -3100,7 +3177,38 @@ u32 main() {
 ```
 
 `@bitcast(State, 7)` compiles and traps at run time with
-`@bitcast produced a value that is not a declared variant of this enum`.
+`@bitcast produced a value that is not a declared variant of this enum`; `@bitcast(bool, 2)`
+traps with `@bitcast produced a bool that is neither true nor false`.
+
+**Mapping a peripheral whose register block contains an enum field still works** — the
+rule fires only on a pointee that IS constrained, not on an aggregate that CONTAINS one:
+
+<!-- audit: skip -->
+```zer
+enum Mode { off, on }
+struct Regs { Mode ctl; u32 data; }
+mmio 0x40000000..0x4000FFFF;
+
+volatile *Regs r = @inttoptr(*Regs, 0x40000000);   // fine — Regs is a struct
+volatile *Mode m = @inttoptr(*Mode, 0x40000000);   // compile error — Mode is an enum
+```
+
+### A compound assignment obeys the same rules as the assignment it abbreviates
+
+`a += b` is checked as `a = a + b`, not as a looser thing. In particular it may not mix
+integers and floats, because the plain form may not either:
+
+<!-- audit: skip -->
+```zer
+u32 a = 1; f32 f = 2.5;
+a = f;     // compile error — no implicit float/integer conversion
+a += f;    // compile error — the same operation, so the same answer
+a += (u32)f;   // fine — the cast saturates, which is defined
+```
+
+That matters beyond consistency: a bare `a += f` would perform the float-to-integer
+conversion without the saturation described above, so an out-of-range value would be
+undefined rather than clamped.
 
 ### Argument counts are checked
 
@@ -4011,7 +4119,18 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 2048       # error when a function frame or an entry-point
+                                         #   call chain exceeds this many bytes
+zerc source.zer --emit-ir                # print the IR and exit (debugging the compiler)
+zerc source.zer --trace                  # compiler tracing (also --trace-calls)
+zerc source.zer --track-cptrs            # track C-interop pointers
+zerc source.zer --release                # accepted, currently a NO-OP
+zerc --help                              # the authoritative list
 ```
+
+`--emit-ir`, `--trace` and `--track-cptrs` are compiler-development switches, not part of
+the language; `--release` is reserved and does nothing today. Everything else affects the
+program you get.
 
 ### Pipeline
 

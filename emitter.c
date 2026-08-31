@@ -886,22 +886,36 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * no header for these predicates). Same shape, same depth limit; keep them in
  * step — they answer the same question for the same rule, the checker deciding
  * whether to care and the emitter deciding where to look. */
-static bool type_carries_enum_e(Type *t, int depth) {
+/* BUG-917: the question is not "does this carry an ENUM" but "does this carry a
+ * CONSTRAINED type" — one whose set of legal values is SMALLER than the integer
+ * representation that holds it. ZER has exactly two: `enum` (its declared
+ * variants) and `bool` (0 and 1). They have the same forging door and the same
+ * consequence, and only one of them was guarded. Measured before the fix:
+ *
+ *     bool b = @bitcast(bool, two);   // accepted, no guard
+ *     b == true  -> false
+ *     b == false -> false             // a bool that is neither
+ *
+ * — directly, and through a struct field or array element carrier, exactly as
+ * the enum case did before BUG-864 widened it. Renamed from
+ * `type_carries_enum_e` so the name states the question it now answers. */
+static bool type_carries_constrained_e(Type *t, int depth) {
     if (!t || depth > 32) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     if (k == TYPE_ENUM) return true;
-    if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
-    if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
+    if (k == TYPE_BOOL) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_constrained_e(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_constrained_e(u->array.inner, depth + 1);
     if (k == TYPE_STRUCT) {
         for (uint32_t i = 0; i < u->struct_type.field_count; i++)
-            if (type_carries_enum_e(u->struct_type.fields[i].type, depth + 1)) return true;
+            if (type_carries_constrained_e(u->struct_type.fields[i].type, depth + 1)) return true;
         return false;
     }
     if (k == TYPE_UNION) {
         for (uint32_t i = 0; i < u->union_type.variant_count; i++)
-            if (type_carries_enum_e(u->union_type.variants[i].type, depth + 1)) return true;
+            if (type_carries_constrained_e(u->union_type.variants[i].type, depth + 1)) return true;
         return false;
     }
     return false;
@@ -931,7 +945,7 @@ static bool type_carries_enum_e(Type *t, int depth) {
  *
  * `path` is the C lvalue expression to test; recursion appends `.field` /
  * `[i]` to it. Depth-limited like the type carriers in checker.c. */
-static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
+static void emit_constrained_value_guard_path(Emitter *e, Type *t, const char *path,
                                          const char *what, int depth) {
     if (!t || depth > 8) return;
     Type *u = type_unwrap_distinct(t);
@@ -948,40 +962,48 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                 "of this enum\", __FILE__, __LINE__); ", what);
         return;
     }
+    /* BUG-917: `bool` is the other constrained type — legal values are exactly
+     * 0 and 1. A forged one makes BOTH `b == true` and `b == false` false, which
+     * no ZER program can otherwise observe. Same trap, same three doors. */
+    if (k == TYPE_BOOL) {
+        emit(e, "if (!(%s == 0 || %s == 1)) _zer_trap(\"%s produced a bool that is "
+                "neither true nor false\", __FILE__, __LINE__); ", path, path, what);
+        return;
+    }
     if (k == TYPE_STRUCT) {
         for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
             Type *ft = u->struct_type.fields[i].type;
-            if (!type_carries_enum_e(ft, 0)) continue;
+            if (!type_carries_constrained_e(ft, 0)) continue;
             char sub[256];
             snprintf(sub, sizeof(sub), "%s.%.*s", path,
                      (int)u->struct_type.fields[i].name_len,
                      u->struct_type.fields[i].name);
-            emit_enum_variant_guard_path(e, ft, sub, what, depth + 1);
+            emit_constrained_value_guard_path(e, ft, sub, what, depth + 1);
         }
         return;
     }
     if (k == TYPE_OPTIONAL) {
         Type *in = u->optional.inner;
-        if (!type_carries_enum_e(in, 0)) return;
+        if (!type_carries_constrained_e(in, 0)) return;
         /* Only the payload of a PRESENT optional is meaningful; a null one
          * carries whatever the zeroing left, which is not a forged variant. */
         char sub[256];
         snprintf(sub, sizeof(sub), "%s.value", path);
         emit(e, "if (%s.has_value) { ", path);
-        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
+        emit_constrained_value_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
         return;
     }
     if (k == TYPE_ARRAY) {
         Type *in = u->array.inner;
-        if (!type_carries_enum_e(in, 0)) return;
+        if (!type_carries_constrained_e(in, 0)) return;
         if (u->array.size == 0 || u->array.size > 4096) return;
         int li = e->temp_count++;
         char sub[256];
         snprintf(sub, sizeof(sub), "%s[_zer_egi%d]", path, li);
         emit(e, "for (size_t _zer_egi%d = 0; _zer_egi%d < %llu; _zer_egi%d++) { ",
              li, li, (unsigned long long)u->array.size, li);
-        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
+        emit_constrained_value_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
         return;
     }
@@ -989,9 +1011,9 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
      * variant switch, which re-checks the tag. Nothing to guard here. */
 }
 
-static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
-    if (!type_carries_enum_e(t, 0)) return;
-    emit_enum_variant_guard_path(e, t, lv, "@bitcast", 0);
+static void emit_bitcast_constrained_guard(Emitter *e, Type *t, const char *lv) {
+    if (!type_carries_constrained_e(t, 0)) return;
+    emit_constrained_value_guard_path(e, t, lv, "@bitcast", 0);
 }
 
 /* BUG-845: float -> integer conversion is C UNDEFINED when the truncated value is
@@ -3550,7 +3572,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_intn_mask_lv(e, t, lv);
                 }
                 { char lv2[40]; snprintf(lv2, sizeof lv2, "_zer_bco%d", tmp);
-                  emit_bitcast_enum_guard(e, t, lv2); }   /* BUG-843 */
+                  emit_bitcast_constrained_guard(e, t, lv2); }   /* BUG-843 */
                 emit(e, "_zer_bco%d; })", tmp);
             } else {
                 emit(e, "0");
@@ -3565,7 +3587,7 @@ static void emit_expr(Emitter *e, Node *node) {
              * `@truncate(State, 7)` reaches the closed set by a different door and
              * had NO check at all, so the forged value silently ran the switch's
              * last arm — the exact defect BUG-843 closed for the other spelling. */
-            if (type_is_nonnative_intn(tt) || type_carries_enum_e(tt, 0)) {
+            if (type_is_nonnative_intn(tt) || type_carries_constrained_e(tt, 0)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -3574,7 +3596,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 else emit(e, "0");
                 emit(e, "); ");
                 emit_intn_mask_lv(e, tt, lv);
-                emit_enum_variant_guard_path(e, tt, lv, "@truncate", 0);
+                emit_constrained_value_guard_path(e, tt, lv, "@truncate", 0);
                 emit(e, "_zer_tr%d; })", tmp);
             } else {
                 emit(e, "(");
@@ -3602,7 +3624,7 @@ static void emit_expr(Emitter *e, Node *node) {
                  * ternary, not an lvalue the guard can name. Binding the finished
                  * result to a temp reuses each path's emission VERBATIM, so the
                  * guard cannot drift from the clamp it guards. */
-                bool sat_enum = t && type_carries_enum_e(t, 0);
+                bool sat_enum = t && type_carries_constrained_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
@@ -3643,7 +3665,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
-                    emit_enum_variant_guard_path(e, t, segp, "@saturate", 0);
+                    emit_constrained_value_guard_path(e, t, segp, "@saturate", 0);
                     emit(e, "_zer_seg%d; })", seg);
                 }
             } else {
@@ -4722,6 +4744,53 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
  * NODE_INTERRUPT). For interrupts, the GCC `interrupt` attribute is
  * emitted by the IR path's existing inline code — this helper covers
  * regular function attributes. */
+/* BUG-916: the C declarator for a function RETURNING a function pointer nests
+ * the function's own name INSIDE the pointer:
+ *
+ *     uint32_t (*pick(uint32_t k))(uint32_t);   <- valid
+ *     uint32_t (*)(uint32_t) pick(uint32_t k);  <- what a naive "type, space,
+ *                                                  name" emission produces; gcc
+ *                                                  rejects it outright
+ *
+ * The IR/definition path learned this in 2026-04-25 and carries a comment saying
+ * so. The PROTOTYPE path — bodyless externs, ZER forward declarations, and the
+ * declarations emitted for imported module functions — kept the naive form, so a
+ * program that merely DECLARES `*(u32) -> u32 pick(u32);` before defining it
+ * emitted C that does not compile, while the identical program without the
+ * forward declaration worked. Same question, two emission sites, one of them
+ * fixed: the shape CLAUDE.md names as the #1 recurring class.
+ *
+ * These two helpers are the single source of truth for that declarator. Call
+ * `open` before the name and `close` after the parameter list, passing `close`
+ * whatever `open` returned. */
+static bool emit_func_ret_open(Emitter *e, Type *ret) {
+    bool ret_is_funcptr = ret && type_dispatch_kind(ret) == TYPE_FUNC_PTR;
+    if (ret_is_funcptr) {
+        emit_type(e, ret->func_ptr.ret);
+        emit(e, " (*");
+    } else if (ret) {
+        emit_type(e, ret);
+        emit(e, " ");
+    } else {
+        emit(e, "void ");
+    }
+    return ret_is_funcptr;
+}
+
+static void emit_func_ret_close(Emitter *e, Type *ret, bool ret_is_funcptr) {
+    if (!ret_is_funcptr) return;
+    emit(e, ")(");
+    if (ret->func_ptr.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, ret->func_ptr.params[i]);
+        }
+    }
+    emit(e, ")");
+}
+
 static void emit_func_attributes(Emitter *e, Node *fn) {
     if (!fn || fn->kind != NODE_FUNC_DECL) return;
     if (fn->func_decl.section) {
@@ -4781,8 +4850,8 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * Single source of truth via helper — see emit_func_attributes(). */
     emit_func_attributes(e, node);
 
-    emit_type(e, ret);
-    emit(e, " ");
+    /* BUG-916: nested declarator when the return type is itself a funcptr. */
+    bool proto_ret_is_funcptr = emit_func_ret_open(e, ret);
     EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
     emit(e, "(");
 
@@ -4799,7 +4868,9 @@ static void emit_func_decl(Emitter *e, Node *node) {
         }
         if (node->func_decl.is_variadic) emit(e, ", ...");
     }
-    emit(e, ") ");
+    emit(e, ")");
+    emit_func_ret_close(e, ret, proto_ret_is_funcptr);   /* BUG-916 */
+    emit(e, " ");
 
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
@@ -7926,7 +7997,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * intrinsic handler exists at BOTH the AST and the IR site, and a
              * safety wrapper added to one and not the other is a silent hole
              * that only some spellings reach. */
-            if (type_is_nonnative_intn(tt) || type_carries_enum_e(tt, 0)) {
+            if (type_is_nonnative_intn(tt) || type_carries_constrained_e(tt, 0)) {
                 int tmp = e->temp_count++;
                 char lv[40]; snprintf(lv, sizeof lv, "_zer_tr%d", tmp);
                 emit(e, "({ "); emit_type(e, tt);
@@ -7935,7 +8006,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 else emit(e, "0");
                 emit(e, "); ");
                 emit_intn_mask_lv(e, tt, lv);
-                emit_enum_variant_guard_path(e, tt, lv, "@truncate", 0);
+                emit_constrained_value_guard_path(e, tt, lv, "@truncate", 0);
                 emit(e, "_zer_tr%d; })", tmp);
             } else {
                 emit(e, "(");
@@ -7963,7 +8034,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  * ternary, not an lvalue the guard can name. Binding the finished
                  * result to a temp reuses each path's emission VERBATIM, so the
                  * guard cannot drift from the clamp it guards. */
-                bool sat_enum = t && type_carries_enum_e(t, 0);
+                bool sat_enum = t && type_carries_constrained_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
                 emit(e, "({__auto_type _zer_sat%d = ", tmp);
@@ -8019,7 +8090,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
-                    emit_enum_variant_guard_path(e, t, segp, "@saturate", 0);
+                    emit_constrained_value_guard_path(e, t, segp, "@saturate", 0);
                     emit(e, "_zer_seg%d; })", seg);
                 }
             }
@@ -8045,7 +8116,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_intn_mask_lv(e, t, lv);
                 }
                 { char lv2[40]; snprintf(lv2, sizeof lv2, "_zer_bco%d", tmp);
-                  emit_bitcast_enum_guard(e, t, lv2); }   /* BUG-843 */
+                  emit_bitcast_constrained_guard(e, t, lv2); }   /* BUG-843 */
                 emit(e, "_zer_bco%d; })", tmp);
             }
         } else if (nlen == 4 && memcmp(name, "cast", 4) == 0) {
@@ -12829,21 +12900,16 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* If `ret` is itself a funcptr, the function RETURNS a funcptr —
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
-         * Without this branch, emitter would produce invalid C like
-         * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
-
+         * Without this, the emitter produces invalid C like
+         * `RET (*)(fp_args) name(params)` which gcc rejects.
+         * BUG-916: shared with the PROTOTYPE path via emit_func_ret_open /
+         * emit_func_ret_close — the prototype path had the naive form for
+         * months because this knowledge lived only here. */
+        bool ret_is_funcptr = false;
         if (main_promote) {
             emit(e, "int ");
-        } else if (ret_is_funcptr) {
-            /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
-            emit(e, " (*");
-        } else if (ret) {
-            emit_type(e, ret);
-            emit(e, " ");
         } else {
-            emit(e, "void ");
+            ret_is_funcptr = emit_func_ret_open(e, ret);
         }
         e->current_main_promoted = main_promote;
 
@@ -12873,15 +12939,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
         emit(e, ")");
 
-        /* Close funcptr-return form: )(fp_args) */
-        if (ret_is_funcptr) {
-            emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
-            }
-            emit(e, ")");
-        }
+        /* Close funcptr-return form: )(fp_args) — BUG-916 shared helper. */
+        emit_func_ret_close(e, ret, ret_is_funcptr);
         emit(e, " {\n");
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */

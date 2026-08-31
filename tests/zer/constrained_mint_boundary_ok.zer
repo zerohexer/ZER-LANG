@@ -1,0 +1,30 @@
+// BUG-918 over-rejection boundary. The rule fires only on a DIRECTLY constrained
+// pointee (*Enum / *bool), never on an aggregate that merely CONTAINS one — the
+// *opaque round-trip and the MMIO register overlay are exactly that shape, and
+// their safety rests on provenance tracking rather than on this rule.
+enum Mode { off, on }
+struct Sensor { Mode m; u32 v; }
+struct Regs   { Mode ctl; u32 data; }
+mmio 0x40000000..0x4000FFFF;
+
+u32 main() {
+    Sensor s; s.m = Mode.on; s.v = 3;
+
+    // sanctioned *opaque round-trip through a struct that CARRIES an enum
+    *opaque ctx = @ptrcast(*opaque, &s);
+    *Sensor back = @ptrcast(*Sensor, ctx);
+
+    // MMIO overlay of a register block that CARRIES an enum
+    volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+
+    // a legitimate pointer to an enum still comes from &var
+    Mode m = Mode.on;
+    *Mode mp = &m;
+
+    // and the documented guarded route from a raw register value
+    u32 rawv = 1;
+    Mode from_hw = @bitcast(Mode, rawv);
+
+    if (back.v == 3 && *mp == Mode.on && from_hw == Mode.on) { return 0; }
+    return 1;
+}

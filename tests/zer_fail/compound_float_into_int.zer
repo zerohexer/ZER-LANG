@@ -1,0 +1,4 @@
+// expect-error: compound assignment mixes
+// BUG-915: `a += f` did what `a = f` is refused, and bypassed the float->int
+// saturation BUG-883 defines: measured 0 at -O0 and 255 at -O2 for f = 1e20.
+u32 main() { u32 a = 1; f32 f = 2.5; a += f; return a; }

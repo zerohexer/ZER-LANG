@@ -184,6 +184,132 @@ blanket rule was NOT shipped).
 
 ---
 
+## MEASURED CLEAN 2026-08-31 — the intrinsic dual-path invariant, all 139
+
+Recorded so it is not re-probed blind, and because the METHOD matters more than the result.
+
+CLAUDE.md tells you to verify a new intrinsic reaches both emitter paths by grepping for TWO
+hits of its name. That is a weak oracle: many intrinsics dispatch from a shared table and
+legitimately appear once, so the grep both over- and under-reports. The question is answered
+by EMITTING and looking for the fallback fingerprint `/* @name */ 0` — `emit_rewritten_node`'s
+final `else`, which produces C that compiles and then misbehaves at run time.
+
+Swept all 139: one generated program per intrinsic, trying call shapes until the CHECKER
+accepts one (which also settles arity), emitted to C, grepped. **133 covered by the generated
+shapes, 0 stubs.** The remaining six (`@cast`, `@cstr`, `@ptrcast`, `@pun`, `@sem_acquire`,
+`@sem_release`) need a distinct typedef, a semaphore or an `*opaque` round-trip and were done
+by hand — also 0. The global-initializer (AST) path was spot-checked on the bit-query family.
+
+**The gate was blind to this class.** `tools/emit_audit.sh` greps for `/* forward */`,
+`/* stub */`, `/* placeholder */` and a bare TODO — NOT for `/* @name */ 0`, the one shape its
+own documentation names as the intrinsic dual-path failure mode. The pattern is added now
+(and verified to match the real string), but the audit still covers only 5 module samples, so
+it catches a stub that happens to land there. The exhaustive sweep stays a by-hand measurement,
+to be re-run when intrinsics are added.
+
+---
+
+## CLOSED 2026-08-31 (BUG-920) — the hand-rolled peel sites WERE live holes
+
+CLAUDE.md recorded "~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS
+the debt" as untidiness. Measured: three of those private peels were WRONG, each a shipped
+dangling-pointer escape with an ASan-confirmed `stack-use-after-return`. Fixed by routing
+all three through `unwrap_ptr_launder`; gated by the new p19 axis (8 holes pre-fix,
+101/101 after).
+
+**The census in CLAUDE.md was also stale** — measured this session, checker.c has 22
+shared-peeler uses and 11 remaining hand-rolled `intrinsic.name` tests. Of those 11, seven
+were READ and are correct: four are provenance-RECORDING sites that legitimately want
+`@ptrcast` specifically (peeling @pun/@bitcast there would record a provenance for a cast
+that is not the *opaque round-trip), one is `@cstr`-specific because its buffer is args[0],
+and two are inside `unwrap_ptr_launder` itself. **The remaining ones have not been audited
+one by one** — that is the residual, and the method that found all three bugs is simply to
+ask, at each site, whether the shared peeler would answer differently.
+
+---
+
+## OPEN — residuals after the CONSTRAINED-VALUE sweep (2026-08-31, BUG-913..919)
+
+The class is closed at every site the sweep could reach; these are the parts deliberately
+NOT closed, each with the reason and the shape a future fix would take.
+
+### MEDIUM — a MINTED pointer to an AGGREGATE that CARRIES a constrained field
+
+BUG-918 rejects `@inttoptr(*Color, a)` / `@ptrcast(*bool, p)` / `@pun(*Color, p)` — a
+DIRECTLY constrained pointee. It deliberately does NOT fire when the pointee merely
+CONTAINS one:
+
+```zer
+struct Regs { Mode ctl; u32 data; }        // Mode is an enum
+volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+Mode m = r.ctl;                            // any byte the device presents — unguarded
+```
+
+**Why it was not closed with the rest.** That shape IS the sanctioned *opaque round-trip
+(`@ptrcast(*Sensor, ctx)`) and the canonical MMIO register-block overlay. Rejecting it
+would refuse the two idioms the primitives exist for, and their safety already rests on a
+different mechanism — provenance tracking for @ptrcast, the runtime `type_id` check for
+@pun. Only `@inttoptr` has no such mechanism, because an integer address carries no proof
+of anything.
+
+**Fix shape (needs design, not a patch).** Guard the LOAD rather than the mint: emit the
+constrained-value guard at a field read / deref whose base pointer's provenance is MINTED.
+`Symbol.provenance_type` and the mmio machinery already carry most of what that needs. The
+cost is one comparison per constrained load through a minted pointer and nothing on an
+ordinary `ptr.state` read — but the provenance has to be threaded to the load site, which
+is where the work is. Cell to add when it lands: a `mint/enum-in-struct-pointee` NEG row in
+`tests/test_constrained_matrix.c`.
+
+### LOW — `@ptrcast(*uN, *carrier)` yields an unmasked `uN`
+
+```zer
+u8 r = 9; *u8 q = &r;
+*u3 p = @ptrcast(*u3, q);
+(u32)(*p)                    // 9 — outside u3's [0,7]
+```
+
+`uN` is a THIRD constrained type in the "value set smaller than the representation" sense,
+and every value-PRODUCING op masks it: binop/unop via `emit_intn_mask`, `@truncate` masks,
+`@saturate` clamps, `@bitcast` is rejected on width, and a literal is checked at compile
+time (all verified, 15 forms). The one unmasked producer is a DEREF through a pointer
+minted by `@ptrcast` — allowed because a `u3`'s carrier IS `u8`, so the two pointer types
+look compatible.
+
+**Not raised above LOW**, and deliberately not folded into BUG-918: there is no consequence
+today. VRP does NOT derive bounds from a `uN`'s width (measured: a `u3` index into a
+`u32[8]` still carries its guard), so an out-of-width `uN` cannot elide a bounds check. It
+is a value-correctness gap, and it is audit-visible — `@ptrcast` is explicit at the use
+site.
+
+**It becomes a SOUNDNESS issue the day VRP is taught to infer `[0, 2^N-1]` from a `uN`
+type**, which is an attractive precision win (that guard is provably unnecessary). Close
+this first if that is ever done — the note is here so the dependency is not discovered
+afterwards.
+
+### PRECISION (not safety) — VRP never CREATES a range at an assignment
+
+```zer
+u32 i = unknown();   // no range entry is pushed
+i = 2;               // vrp_invalidate_for_assign returns early: find_var_range is NULL
+arr[i]               // guarded, though i is provably 2
+```
+
+`vrp_invalidate_for_assign` narrows an EXISTING range to `[v,v]` for a literal assignment
+but returns early when the variable has no entry, so a variable that entered from an
+unprovable source can never regain a provable range. The declaration form (`u32 i = 2;`)
+and the guard form (`if (i < 4)`) both work; only re-assignment does not.
+
+**Why this is written down as OPEN rather than fixed.** It is a RELAXATION — the
+accept-unsafe direction, where a mistake is a shipped OOB rather than an over-rejection —
+and CLAUDE.md's discipline for that class is a full negative matrix before flipping. The
+soundness question is whether a range PUSHED inside a construct is correctly dropped at
+every join: `NODE_IF` and the loop drivers restore `var_range_count`, so a push inside them
+is dropped (conservative), and `NODE_LABEL` widens everything. Those were read and look
+right, but "looks right" is not the bar for this direction. Anyone taking it should extend
+`tests/test_cflow_matrix.c` with a push-inside-each-construct axis first.
+
+---
+
 
 ## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
 
@@ -2054,12 +2180,13 @@ four TypeNode kinds.
 bare-param-view relaxation (BUG-764) covers `return p[0..2];` but not a param view wrapped in a
 returned-by-value struct. Errs conservative → no soundness threat.
 
-### LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected (`rvek5f` `00f3c2af`)
-CLAUDE.md's "Hardware Support" quick reference shows
-`volatile *u32 reg = @inttoptr(...); u32 bits = reg[9..8];`, but `reg[hi..lo]` on a POINTER parses as a slice
-range → `error: slice start (9) is greater than end (8)`. Bit-extraction only works on a scalar VALUE.
-Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to show the deref form, or make
-`reg[hi..lo]` on a volatile scalar pointer auto-deref for bit-extraction.
+### ~~LOW Doc mismatch — bit-extraction on a `volatile *u32` MMIO register is over-rejected~~ — **CLOSED, measured 2026-08-31**
+**Does not reproduce.** `volatile *u32 reg = @inttoptr(*u32, 0x40000004); return reg[9..8];` compiles and
+emits the correct extraction — the generated C derefs the volatile pointer inside the shift
+(`(*reg >> _zer_lo0) & mask`), so the documented CLAUDE.md form works as written. The deref
+form `u32 v = *reg; v[9..8]` also works. Both verified on the emitted C. Kept as a closed
+row rather than deleted, because the entry had been carried forward through several waves
+and someone will look for it.
 
 ### Cross-references (already tracked elsewhere in this file — do NOT duplicate)
 - **HOLE-C / cross-block scoped-borrow, join-in-branch** (`rvek5f` `00f3c2af`) — **FIXED 2026-08-03.**
@@ -2096,6 +2223,14 @@ Verified workaround: `u32 v = *reg; u32 bits = v[9..8];`. Either fix the docs to
   / `IRVRPResult` have ZERO callers and are not in the Makefile, while all load-bearing bounds/division VRP
   is the AST VRP in checker.c. Either wire it (the tracked "wire the orphaned vrp_ir.c" direction) or delete
   it to stop implying live coverage.
+  **Read through 2026-08-31 and TWO DEFECTS RECORDED IN ITS HEADER** — the decision was to keep the file
+  (it is the started sketch of a locked architectural direction, and its header already states
+  unambiguously that it is dead) but to make its "treat this as untested" warning CONCRETE. The important
+  one is an UNSOUNDNESS: the `x & MASK` derivation reads the mask as a signed int64 with no positivity
+  test, so an all-ones mask yields an INVERTED range [0, negative] which `ir_range_proves_safe` accepts for
+  every array size — i.e. wiring it as-is would ELIDE a bounds check on the all-ones idiom. The other is a
+  header comment that says "intersect" where the code correctly computes the JOIN. Not fixed, deliberately:
+  editing dead code makes it look reviewed. Anyone wiring it starts from "sketch with known defects".
 
 ---
 
@@ -3923,12 +4058,17 @@ Gated the "may require libatomic on 32-bit" warning on
 the field was memset-zeroed and any `target_ptr_bits < N` check
 silently always-true. See BUGS-FIXED.md "Fix #1".
 
-## OPEN — `naked` attribute silently dropped on IR path
+## OPEN (no longer SILENT) — `naked` attribute dropped on the IR path
 
-See full entry near the bottom of this file ("`naked` attribute
-silently dropped on IR path (deferred 2026-05-02)") — kept in original
-location to preserve the more detailed analysis added in the
-2026-05-02 fix session.
+**Corrected 2026-08-31: the word "silently" is stale.** BUG-852 added a WARNING at every
+`naked` function declaration saying the attribute is not emitted and what the user does not
+get. Measured on `tests/zer/asm_syntax.zer`: the diagnostic fires, once per naked function.
+The attribute is still dropped — that half is open — but the SILENCE, which is what made it
+an audit finding, is gone.
+
+Left as-is this entry would have sent a session hunting a silent gap that had already been
+made loud. See the full entry near the bottom of this file for the analysis and for the
+measurements a future migration needs.
 
 ## ~~Codebase audit 2026-05-07 — 5 silent gaps closed~~ (FIXED 2026-05-07)
 
@@ -4602,16 +4742,45 @@ clearer code intent.
 
 ---
 
-## `naked` attribute silently dropped on IR path (deferred 2026-05-02)
+## `naked` attribute dropped on IR path (deferred 2026-05-02; WARNING added by BUG-852)
 
-**Status:** known regression from IR migration; not fixed because fixing
-breaks every existing `tests/zer/asm_*.zer` test.
+**Status:** known regression from the IR migration; the attribute is still not emitted, but
+since BUG-852 the compiler WARNS at every `naked` declaration rather than accepting the
+claim in silence. Not fixed further because fixing breaks every existing
+`tests/zer/asm_*.zer` test.
 
 **Symptom:** ZER source declaring `naked void f() { asm { ... } }`
 emits C without `__attribute__((naked))`. GCC therefore generates a
 normal prologue + epilogue around the asm body. The asm appears to
 "work" because the implicit prologue/epilogue saves/restores callee-
 saved registers and ensures `ret` happens via the epilogue.
+
+**Measured 2026-08-31 — the facts a migration needs, so they are not re-derived:**
+
+- **GCC 13 on x86-64 DOES support `__attribute__((naked))`.** The "does the toolchain even
+  allow it" question is settled; it compiles.
+- **A C `return;` inside a naked function becomes `ud2`, not `ret`.** Verified by objdump.
+  So the emitter must SUPPRESS its synthetic trailing `return;` for naked functions —
+  flipping the attribute alone converts every one of them into an illegal-instruction trap.
+- **18 positive `tests/zer/asm_*.zer` CALL their naked function**, so that trap is not
+  theoretical: enabling the attribute without the emitter change SIGILLs all of them. (The
+  ones that merely DECLARE a naked function are unaffected — the body is never entered.)
+- **Extended asm with global operands works fine inside a naked function** on GCC 13,
+  despite the documentation saying only basic asm is safe. ZER's structured
+  `asm { inputs: ... }` lowers to extended asm and its Z-rule operand tracking depends on
+  those operands, so this was the hazard most likely to block the migration, and it does
+  not. Verified by objdump on the emitted form of `asm_typed_operands.zer`.
+- **`endbr64` is still emitted** unless the user builds with `-fcf-protection=none`. Worth
+  knowing for a reset handler counting bytes; not ZER's to fix.
+
+**The real open question is a LANGUAGE one, not a flag.** With true naked semantics the
+user must write the return instruction themselves, and that instruction is
+architecture-specific (`ret` on x86-64/RISC-V, `bx lr` on ARM32). Today's asm tests
+deliberately use only `nop` "so the assembler is happy on whatever GCC host we run on";
+requiring an explicit return would make each of them arch-specific. ZER either needs a
+portable spelling (an `@cpu_ret()` intrinsic, which is Option E's shape) or an accepted
+per-arch split in the asm tests. That is a design decision for the owner, which is why this
+session recorded the measurements instead of flipping the switch.
 
 **Why this is a real loss of safety semantics:**
 

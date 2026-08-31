@@ -1,0 +1,15 @@
+// expect-error: cannot store arena-derived pointer
+// BUG-920: the arena escape check at the plain-assignment sink had a HAND-ROLLED
+// peel that knew @ptrcast and @cast only, so @pun and a C-style cast walked past
+// it while the bare form was rejected. With the arena's backing buffer on the
+// frame this is a stack-use-after-return — ASan-confirmed, no diagnostic, no fault.
+struct N { u32 v; }
+?*N g;
+void stash() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N a = ar.alloc(N) orelse return;
+    a.v = 111;
+    g = @pun(*N, a);
+}
+u32 main() { stash(); if (g) |p| { return p.v; } return 0; }

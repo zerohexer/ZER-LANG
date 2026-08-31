@@ -1,0 +1,5 @@
+// expect-error: is not a variant of enum
+// BUG-913: ... at the spawn-argument sink.
+enum Color { red, green, blue }
+void w(Color c) { }
+u32 main() { spawn w(99); return 0; }

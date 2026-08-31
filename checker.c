@@ -66,6 +66,63 @@ static bool type_carries_data_pointer(Type *t, int depth) {
     return false;
 }
 
+/* BUG-918: does this type carry a CONSTRAINED value at any nesting depth — one
+ * whose legal values are a strict subset of the integer that represents it?
+ * ZER has exactly two: `enum` (its declared variants) and `bool` (0 and 1).
+ *
+ * Mirror of the emitter's `type_carries_constrained_e`, which decides where the
+ * RUNTIME variant guard is emitted at the three conversion doors. This copy
+ * answers the COMPILE-TIME question at the three POINTER-MINTING doors, where
+ * there is no value yet to guard — only an address that a later load will read.
+ *
+ * `through_aggregate` picks which of two questions is being asked, and the
+ * distinction is load-bearing:
+ *
+ *   false — is the pointee ITSELF constrained (`*Color`, `*bool`, `*Color[4]`,
+ *           `*?Color`)? Such a pointer has exactly one honest source, `&var`,
+ *           so minting one is always a forge. This is what the minting doors
+ *           use.
+ *   true  — does it carry one ANYWHERE, including a struct/union field? That is
+ *           the question the emitter's guard asks, because it walks to each
+ *           field and tests it individually.
+ *
+ * The minting doors must NOT use the aggregate form: `@ptrcast(*Sensor, ctx)`
+ * where `Sensor` merely HAS an enum field is the sanctioned *opaque round-trip,
+ * whose safety rests on provenance tracking, and `@inttoptr(*Regs, base)` is how
+ * a peripheral is mapped. Rejecting those would be over-reach; their residual
+ * risk is recorded in docs/limitations.md rather than paid for here.
+ *
+ * Same recursion policy as its siblings above: optional / array / struct /
+ * union, distinct unwrapped by type_dispatch_kind, depth-limited, if-chain so
+ * the walker-default audit is unaffected. */
+static bool type_carries_constrained(Type *t, int depth, bool through_aggregate) {
+    if (!t || depth > 32) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_ENUM || k == TYPE_BOOL) return true;
+    if (k == TYPE_OPTIONAL)
+        return type_carries_constrained(u->optional.inner, depth + 1, through_aggregate);
+    if (k == TYPE_ARRAY)
+        return type_carries_constrained(u->array.inner, depth + 1, through_aggregate);
+    if (!through_aggregate) return false;
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            if (type_carries_constrained(u->struct_type.fields[i].type, depth + 1, true))
+                return true;
+        }
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            if (type_carries_constrained(u->union_type.variants[i].type, depth + 1, true))
+                return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 /* Does this type CARRY a Handle at any nesting depth?
  *
  * Sibling of type_carries_data_pointer, deliberately SEPARATE rather than an
@@ -988,6 +1045,43 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
     return false;
 }
 
+/* BUG-913: is `v` one of the DECLARED variant values of this enum?
+ *
+ * An enum is REPRESENTED as an integer (`zer_type_kind_is_integer(ZER_TK_ENUM)`
+ * is 1, and must stay 1 — `(u32)c`, `c == Color.red`, the switch dispatch and
+ * the emitted `int32_t` all depend on it). But its VALUE SET is the declared
+ * variants, not the whole integer range. Those are two different questions and
+ * `is_literal_compatible` was answering the representation one: it asked
+ * `type_is_integer(effective)`, which an enum passes, and then fell into the
+ * catch-all `case TYPE_ENUM: return true` whose comment ("non-numeric types
+ * trivially fit ... this predicate doesn't apply") was written on the assumption
+ * that the guard clause had already excluded enums. It had not.
+ *
+ * So EVERY sink that asks `value_flows_to` accepted an arbitrary integer literal
+ * into an enum destination — `Color c = 99;`, `f(99)`, `g = 99;`, `return 99;`,
+ * `{ .c = 99 }`, `a[0] = 99;`, `x orelse 99`, `spawn w(99)`, a global init. The
+ * value is then a NON-VARIANT, and the enum switch lowering emits the LAST arm
+ * as an unconditional else (it is entitled to: exhaustiveness was checked), so
+ * the forged value silently dispatches to that arm. No compile error, no runtime
+ * trap, wrong branch — on hosted and on bare metal alike.
+ *
+ * This is a FOURTH forging door. CLAUDE.md recorded the set as "EXACTLY THREE
+ * and the set is closed" (@bitcast / @truncate / @saturate), each of which pays
+ * for a runtime `emit_enum_variant_guard_path` trap. A source LITERAL needs no
+ * runtime guard — its value is known here — so this one is answered at compile
+ * time, which is strictly better than the three it joins.
+ *
+ * `variant_count == 0` returns true (undecidable rather than false), mirroring
+ * `emit_enum_variant_guard_path`'s own early-return, so the two doors agree on
+ * the degenerate type instead of one rejecting what the other waves through. */
+static bool enum_literal_is_variant(Type *effective, int64_t v) {
+    if (!effective || effective->enum_type.variant_count == 0) return true;
+    for (uint32_t i = 0; i < effective->enum_type.variant_count; i++) {
+        if ((int64_t)effective->enum_type.variants[i].value == v) return true;
+    }
+    return false;
+}
+
 /* Check if an expression node is a literal that can be assigned to target type.
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
 static bool is_literal_compatible(Node *expr, Type *target) {
@@ -1040,12 +1134,17 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             if (_b >= 64) return true;
             return val <= ((1ULL << (_b - 1)) - 1ULL);
         }
+        /* BUG-913: an enum's value set is its declared variants, NOT the
+         * integer range its representation allows. See enum_literal_is_variant. */
+        case TYPE_ENUM:
+            if (val > (uint64_t)INT64_MAX) return false;
+            return enum_literal_is_variant(effective, (int64_t)val);
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
          * trivially "fit" (the literal is being coerced to a non-int
          * target via other rules, so this predicate doesn't apply). */
         case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
         case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
-        case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+        case TYPE_ARRAY: case TYPE_STRUCT:
         case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
         case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
         case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
@@ -1077,12 +1176,18 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
             case TYPE_UINT:
                 return false;
+            /* BUG-913: a variant MAY be declared negative (`enum E { a = -1 }`),
+             * so the negative literal is matched against the variant set too
+             * rather than waved through. */
+            case TYPE_ENUM:
+                if (val > (uint64_t)INT64_MAX) return false;
+                return enum_literal_is_variant(effective, -(int64_t)val);
             /* Stage 2 Part B (2026-04-28): exhaustive — non-integer
              * targets trivially "fit" (negative-literal coercion to
              * non-int handled elsewhere). */
             case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
             case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
-            case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+            case TYPE_ARRAY: case TYPE_STRUCT:
             case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
             case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
             case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
@@ -1273,6 +1378,204 @@ static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
         "implicit sign conversion. Use @bitcast(%s, %lld) for the bit pattern, or "
         "write the value directly",
         what, v, tn, tn, v);
+    return true;
+}
+
+/* BUG-913: the enum-literal rejection needs its OWN wording for the same reason
+ * the negative-constant one does. The generic sink message would read
+ * "cannot initialize 'c' of type 'Color' with 'u32'", which names the literal's
+ * type and not the actual problem — the value is not a member of the variant
+ * set. Print the value, the enum, and the variants that ARE legal, so the fix is
+ * readable off the diagnostic.
+ *
+ * Returns true when it handled the diagnosis, so the caller skips its generic
+ * message. Only fires for a plain integer literal (with or without a leading
+ * `-`) landing directly on an enum destination: any other shape is already
+ * rejected by the ordinary type rules with a message that fits it. */
+static bool report_enum_literal_flow(Checker *c, Node *value, Type *target,
+                                     int line, const char *what) {
+    if (!value || !target) return false;
+    Type *eff = type_unwrap_distinct(target);
+    if (!eff || type_dispatch_kind(eff) != TYPE_ENUM) return false;
+    if (eff->enum_type.variant_count == 0) return false;
+
+    int64_t v;
+    if (value->kind == NODE_INT_LIT) {
+        if (value->int_lit.value > (uint64_t)INT64_MAX) return false;
+        v = (int64_t)value->int_lit.value;
+    } else if (value->kind == NODE_UNARY && value->unary.op == TOK_MINUS &&
+               value->unary.operand &&
+               value->unary.operand->kind == NODE_INT_LIT) {
+        if (value->unary.operand->int_lit.value > (uint64_t)INT64_MAX) return false;
+        v = -(int64_t)value->unary.operand->int_lit.value;
+    } else {
+        return false;
+    }
+    if (enum_literal_is_variant(eff, v)) return false;  /* it IS a variant */
+
+    /* type_name() rotates only TWO static buffers — capture before formatting
+     * (CLAUDE.md "type_name() uses 2-buffer rotation"). */
+    char tn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(target));
+
+    /* List up to six variants so the message stays readable on a wide enum. */
+    char vlist[256];
+    int off = 0;
+    uint32_t shown = eff->enum_type.variant_count < 6 ? eff->enum_type.variant_count : 6;
+    for (uint32_t i = 0; i < shown && off < (int)sizeof(vlist) - 1; i++) {
+        int n = snprintf(vlist + off, sizeof(vlist) - (size_t)off, "%s%.*s (%d)",
+                         i ? ", " : "",
+                         (int)eff->enum_type.variants[i].name_len,
+                         eff->enum_type.variants[i].name,
+                         (int)eff->enum_type.variants[i].value);
+        if (n < 0) break;
+        off += n;
+    }
+    if (shown < eff->enum_type.variant_count && off < (int)sizeof(vlist) - 5)
+        snprintf(vlist + off, sizeof(vlist) - (size_t)off, ", ...");
+
+    checker_error(c, line,
+        "%s: %lld is not a variant of enum '%s' — an enum holds only its declared "
+        "values, and a forged one would silently take the last arm of an exhaustive "
+        "switch. Variants: %s. Write '%s.<variant>', or @bitcast/@truncate/@saturate "
+        "if you really mean to convert a raw value (those trap at runtime on a "
+        "non-variant)",
+        what, (long long)v, tn, vlist, tn);
+    return true;
+}
+
+/* ONE place for every SPECIALISED value-flow rejection wording.
+ *
+ * `value_flows_to` is already the single query for "may this value land here?"
+ * (BUG-842). Its DIAGNOSIS had started to grow the same multi-site shape the
+ * query itself was created to kill: `report_negative_const_flow` had to be
+ * threaded through eight sinks by hand, and adding BUG-913's enum wording would
+ * have meant editing all eight again — with the usual outcome that one gets
+ * missed and that sink keeps the useless generic message.
+ *
+ * So the sinks call THIS, and a future specialised wording is added here only.
+ * Order matters only in that the most specific message should win; the two
+ * present cases are disjoint (unsigned destination vs enum destination).
+ * Returns true when a specific diagnosis was emitted, so the caller skips its
+ * generic message. */
+static bool report_value_flow_specific(Checker *c, Node *value, Type *target,
+                                       int line, const char *what) {
+    if (report_negative_const_flow(c, value, target, line, what)) return true;
+    if (report_enum_literal_flow(c, value, target, line, what)) return true;
+    return false;
+}
+
+/* BUG-373's literal WIDTH check, extracted (BUG-913).
+ *
+ * The same five lines stood at three sinks — var-decl init, assignment and
+ * global init — each asking "the coercion passed, but does the literal's VALUE
+ * actually fit the destination?" (literals default to u32, so
+ * can_implicit_coerce can wave an oversized one through).
+ *
+ * It is extracted here because BUG-913 gave `is_literal_compatible` a second
+ * meaning for one type: for an ENUM it now answers variant MEMBERSHIP, not
+ * width. Left inline, all three sinks would have printed "integer literal 99
+ * does not fit in 'Color'" — a width complaint about a membership problem —
+ * on top of the specific diagnosis `report_enum_literal_flow` already gave.
+ * Enums are therefore skipped here: that question is answered upstream, once,
+ * with wording that fits it. */
+static void check_int_literal_fits(Checker *c, Node *lit, Type *target, int line) {
+    if (!lit || lit->kind != NODE_INT_LIT || !target) return;
+    Type *eff = type_unwrap_distinct(target);
+    if (!type_is_integer(eff)) return;
+    if (type_dispatch_kind(eff) == TYPE_ENUM) return;  /* diagnosed upstream */
+    if (is_literal_compatible(lit, target)) return;
+    checker_error(c, line, "integer literal %llu does not fit in '%s'",
+                  (unsigned long long)lit->int_lit.value, type_name(target));
+}
+
+/* BUG-914 — the ARITHMETIC half of the enum-forging door BUG-913 opened.
+ *
+ * An enum is REPRESENTED as an integer and `type_is_numeric` / `type_is_integer`
+ * say so, which is what let every arithmetic and bitwise operator take an enum
+ * operand and hand back a value of enum TYPE that is not one of its variants:
+ *
+ *     Color c = Color.blue;      // 2
+ *     Color d = c + c;           // 4 — no variant. Silently takes the last
+ *                                //     arm of an exhaustive switch.
+ *     c += 99;  c = ~c;  c = -c; // same, at the compound and unary spellings
+ *
+ * Closing the LITERAL door alone was not enough: `c + 99` now fails on the
+ * mix rule ('Color' and 'u32'), but `c + c`, `c << c`, `~c` and `c += <variant>`
+ * are enum-with-enum and stayed accepted. There is no runtime guard to reach
+ * for either, because the operand set is unbounded — unlike @bitcast/@truncate/
+ * @saturate, where a single trap at the conversion site covers every input.
+ *
+ * So the operation is rejected rather than tracked, per the Ban Decision
+ * Framework's rule 4: expressing "the arithmetic result is still a variant"
+ * needs a dependent/refinement type ZER does not have. The value is one cast
+ * away (`(u32)c`), and coming back is a door that already traps
+ * (`@bitcast(Color, n)`), so nothing becomes unexpressible — it becomes
+ * audit-visible, which is the stated ZER trade.
+ *
+ * COMPARISONS ARE UNAFFECTED (`c == Color.red`, `c < Color.blue`): they consume
+ * an enum and yield a bool, forging nothing. Casts are unaffected for the same
+ * reason. Returns true when it reported, so the caller can pick its result type
+ * without emitting a second message. */
+static bool reject_enum_arith(Checker *c, Type *a, Type *b, int line,
+                              const char *opdesc) {
+    Type *ea = a ? type_unwrap_distinct(a) : NULL;
+    Type *eb = b ? type_unwrap_distinct(b) : NULL;
+    Type *bad = NULL;
+    if (ea && type_dispatch_kind(ea) == TYPE_ENUM) bad = ea;
+    else if (eb && type_dispatch_kind(eb) == TYPE_ENUM) bad = eb;
+    if (!bad) return false;
+    /* type_name() rotates only TWO static buffers — capture before formatting. */
+    char tn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(bad));
+    checker_error(c, line,
+        "%s on enum '%s' — an enum holds only its declared variants, and "
+        "arithmetic can produce a value outside that set, which would silently "
+        "take the last arm of an exhaustive switch. Convert explicitly: "
+        "'(u32)x' to compute, and '@bitcast(%s, n)' to come back (that door "
+        "traps at runtime on a non-variant). Comparisons on '%s' are unaffected",
+        opdesc, tn, tn, tn);
+    return true;
+}
+
+/* BUG-915: a compound assignment must obey the same float/int rule as the plain
+ * assignment it abbreviates.
+ *
+ * `a = f` (u32 <- f32) is REJECTED — ZER has no implicit narrowing or sign
+ * conversion, and float -> int is a conversion the language makes you spell.
+ * `a += f` was ACCEPTED: the compound path checked numeric-ness, bitwise-ness,
+ * the division guard and WIDTH, but never that the two sides are on the same
+ * side of the int/float line. At equal width (u32/i32 vs f32) the width check
+ * passes, so the emitter wrote a bare C `a += f`.
+ *
+ * That is not merely an inconsistency between two spellings of one operation.
+ * It also silently bypasses the float -> int SATURATION that BUG-845/BUG-883
+ * established as ZER's defined behaviour: measured on `a += f` with f = 1e20,
+ * the emitted program returns 0 at -O0 and 255 at -O2 — the same program, two
+ * answers, chosen by the optimiser — and UBSan reports "1e+20 is outside the
+ * range of representable values of type 'unsigned int'". The documented
+ * spelling `(u32)f` correctly gives 4294967295 at both levels.
+ *
+ * Rejecting (rather than inserting the saturating conversion) is what keeps the
+ * two spellings AGREEING, which is the property whose absence caused this. */
+static bool reject_mixed_float_int_compound(Checker *c, Type *target, Type *value,
+                                            int line) {
+    if (!target || !value) return false;
+    if (!type_is_numeric(target) || !type_is_numeric(value)) return false;
+    bool tf = type_is_float(target), vf = type_is_float(value);
+    if (tf == vf) return false;
+    char tn[96], vn[96];
+    snprintf(tn, sizeof(tn), "%s", type_name(target));
+    snprintf(vn, sizeof(vn), "%s", type_name(value));
+    checker_error(c, line,
+        "compound assignment mixes '%s' and '%s' — ZER has no implicit "
+        "float/integer conversion, and the plain spelling of the same operation "
+        "is rejected for exactly this reason. %s",
+        tn, vn,
+        tf ? "Convert the integer operand first: '(f32)n'."
+           : "Convert the float operand first: a '(u32)f' cast saturates "
+             "(defined), or use @saturate/@truncate — a bare compound "
+             "assignment leaves the out-of-range case undefined.");
     return true;
 }
 
@@ -2027,10 +2330,27 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (struct_init_has_local_derived(c, fv)) return true;
             continue;
         }
-        /* unwrap intrinsic chains (mirror the direct case) */
-        Node *fu = fv;
-        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
-            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* BUG-920: peel launders ONCE, with the shared peeler, and use the peeled
+         * node in EVERY case below.
+         *
+         * Two defects lived in the hand-rolled `while` this replaces. It was a
+         * blind LAST-ARG loop, so `@container(*T, p, field)` peeled to the field
+         * NAME and `@cstr(buf, s)` to the string literal — the exact trap
+         * `unwrap_ptr_launder`'s comment records — and it did not know about a
+         * C-style cast to a reference type at all. Worse, its result `fu` was then
+         * used by Case A ALONE: Cases B (an ident already flagged frame-bound) and
+         * C (a slice of a local) went on testing the UN-peeled `fv`, so every
+         * launder form defeated them:
+         *
+         *     gb = { .p = @pun(*N, arena_ptr) };   // ACCEPTED — the hole
+         *     gb = { .p = (*N)arena_ptr };         // ACCEPTED — the hole
+         *     gb = { .p = arena_ptr };             // rejected
+         *
+         * Found by ENUMERATING the sinks after fixing the plain-assignment one:
+         * the struct-literal sibling had the same question and a private, worse
+         * answer. That is the multi-site shape, and the enumeration is what
+         * exposed it — the reported bug was at the other sink. */
+        Node *fu = unwrap_ptr_launder(fv);
         /* Case A: &local — direct address-of */
         if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
             Node *root = fu->unary.operand;
@@ -2047,18 +2367,19 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             }
         }
         /* Case B: alias ident already flagged frame-bound (local OR arena -
-         * BUG-816: the arena half was missing here too). */
-        if (fv->kind == NODE_IDENT) {
+         * BUG-816: the arena half was missing here too). Uses the PEELED node
+         * (BUG-920) so a laundered alias is still seen. */
+        if (fu && fu->kind == NODE_IDENT) {
             Symbol *fsym = scope_lookup(c->current_scope,
-                fv->ident.name, (uint32_t)fv->ident.name_len);
+                fu->ident.name, (uint32_t)fu->ident.name_len);
             if (fsym && (fsym->is_local_derived || fsym->is_arena_derived)) {
                 _si_hit_arena = fsym->is_arena_derived && !fsym->is_local_derived;
                 return true;
             }
         }
-        /* Case C: slice over a local array (local[0..]) */
-        if (fv->kind == NODE_SLICE) {
-            Node *sroot = fv->slice.object;
+        /* Case C: slice over a local array (local[0..]) — PEELED node (BUG-920). */
+        if (fu && fu->kind == NODE_SLICE) {
+            Node *sroot = fu->slice.object;
             while (sroot && (sroot->kind == NODE_FIELD || sroot->kind == NODE_INDEX)) {
                 if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
                 else sroot = sroot->index_expr.object;
@@ -2075,8 +2396,9 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
                     return true;
             }
         }
-        /* Case D: call-result launder of a local-derived arg */
-        if (fv->kind == NODE_CALL && call_has_local_derived_arg(c, fv, 0))
+        /* Case D: call-result launder of a local-derived arg — PEELED (BUG-920),
+         * so `{ .p = @pun(*T, mk(&local)) }` reaches it too. */
+        if (fu && fu->kind == NODE_CALL && call_has_local_derived_arg(c, fu, 0))
             return true;
     }
     return false;
@@ -3157,7 +3479,7 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     char what[96];
                     snprintf(what, sizeof(what), "field '.%.*s'",
                              (int)df->name_len, df->name);
-                    if (!report_negative_const_flow(c, df->value, ft, line, what))
+                    if (!report_value_flow_specific(c, df->value, ft, line, what))
                         checker_error(c, line,
                             "field '.%.*s' expects '%s', got '%s'",
                             (int)df->name_len, df->name,
@@ -5555,6 +5877,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     "arithmetic requires numeric types, got '%s' and '%s'",
                     type_name(left), type_name(right));
                 result = left;
+            } else if (reject_enum_arith(c, left, right, node->loc.line,
+                                         "arithmetic")) {
+                /* BUG-914 — diagnosed; keep the enum type so one bad expression
+                 * does not cascade into a second message at the consuming sink. */
+                result = left;
             } else {
                 /* compile-time division by zero check.
                  * BUG-269: use eval_const_expr to catch expressions like (2-2) */
@@ -5777,6 +6104,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     "bitwise operators require integers, got '%s' and '%s'",
                     type_name(left), type_name(right));
                 result = left;
+            } else if (reject_enum_arith(c, left, right, node->loc.line,
+                                         "bitwise operation")) {
+                result = left;  /* BUG-914 */
             } else {
                 result = common_numeric_type(c, left, right, node->loc.line);
             }
@@ -5803,6 +6133,8 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_numeric(operand)) {
                 checker_error(c, node->loc.line,
                     "unary '-' requires numeric type, got '%s'", type_name(operand));
+            } else {
+                reject_enum_arith(c, operand, NULL, node->loc.line, "unary '-'");
             }
             result = operand;
             break;
@@ -5822,6 +6154,8 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_integer(operand)) {
                 checker_error(c, node->loc.line,
                     "'~' requires integer, got '%s'", type_name(operand));
+            } else {
+                reject_enum_arith(c, operand, NULL, node->loc.line, "'~'");
             }
             result = operand;
             break;
@@ -7226,22 +7560,30 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
         if (node->assign.op == TOK_EQ) {
-            /* SILENT-GAP FIX: arena escape check missed @ptrcast laundering.
-             * `g_ptr = @ptrcast(*u32, arena_ptr);` bypassed the escape check
-             * because the assignment value was NODE_INTRINSIC, not NODE_IDENT.
-             * Unwrap @ptrcast (and @cast) to inspect the underlying ident. */
-            Node *value_root = node->assign.value;
-            if (value_root && value_root->kind == NODE_INTRINSIC &&
-                value_root->intrinsic.name_len == 7 &&
-                memcmp(value_root->intrinsic.name, "ptrcast", 7) == 0 &&
-                value_root->intrinsic.arg_count >= 1) {
-                value_root = value_root->intrinsic.args[0];
-            } else if (value_root && value_root->kind == NODE_INTRINSIC &&
-                       value_root->intrinsic.name_len == 4 &&
-                       memcmp(value_root->intrinsic.name, "cast", 4) == 0 &&
-                       value_root->intrinsic.arg_count >= 1) {
-                value_root = value_root->intrinsic.args[0];
-            }
+            /* BUG-920: this was a HAND-ROLLED peel that knew about exactly two
+             * launders — @ptrcast and @cast — while the shared peeler
+             * `unwrap_ptr_launder` knows six (@ptrcast, @pun, @bitcast, @cast,
+             * @container, @cstr, plus a reference-producing C-style cast, and it
+             * loops so they nest). The LOCAL-escape sink one screen away already
+             * used the shared peeler, so the two sinks disagreed:
+             *
+             *     g = @pun(*N, arena_ptr);   // ACCEPTED   <- the hole
+             *     g = (*N)arena_ptr;         // ACCEPTED   <- the hole
+             *     g = @ptrcast(*N, arena_ptr);   // rejected
+             *     g = arena_ptr;                 // rejected
+             *
+             * With the arena's backing buffer on the frame, the accepted forms are
+             * a stack-use-after-return: measured, ASan-confirmed, and the program
+             * reads a dead frame with no diagnostic at compile time and no fault
+             * at run time. (The obvious reproducer that calls `ar.reset()` in the
+             * same function is MASKED by the dangling-global rule — route around
+             * it by letting the frame die instead.)
+             *
+             * This is the peel-site debt CLAUDE.md names: the same question
+             * answered at N sites, one of them with a private, shorter answer.
+             * Calling the shared peeler is both the fix and the debt reduction —
+             * a launder added to `unwrap_ptr_launder` now reaches this sink too. */
+            Node *value_root = unwrap_ptr_launder(node->assign.value);
         if (value_root &&
             value_root->kind == NODE_IDENT) {
             Symbol *val_sym = scope_lookup(c->current_scope,
@@ -7461,28 +7803,26 @@ static Type *check_expr(Checker *c, Node *node) {
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!value_flows_to(node->assign.value, value, target)) {
-                if (!report_negative_const_flow(c, node->assign.value, target,
+                if (!report_value_flow_specific(c, node->assign.value, target,
                                                 node->loc.line, "assignment"))
                     checker_error(c, node->loc.line,
                         "cannot assign '%s' to '%s'",
                         type_name(value), type_name(target));
             }
             /* BUG-373: integer literal range check on assignment */
-            if (node->assign.value->kind == NODE_INT_LIT &&
-                target && type_is_integer(type_unwrap_distinct(target))) {
-                if (!is_literal_compatible(node->assign.value, target)) {
-                    checker_error(c, node->loc.line,
-                        "integer literal %llu does not fit in '%s'",
-                        (unsigned long long)node->assign.value->int_lit.value,
-                        type_name(target));
-                }
-            }
+            check_int_literal_fits(c, node->assign.value, target, node->loc.line);
         } else {
             /* compound assignment: += -= etc. — both must be numeric */
             if (!type_is_numeric(target) || !type_is_numeric(value)) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
             }
+            /* BUG-914: `c += 99` / `c |= mask` forge an enum exactly as the
+             * binary spelling did. Same rule, same site set. */
+            reject_enum_arith(c, target, value, node->loc.line,
+                              "compound assignment");
+            /* BUG-915: `a += f` must not do what `a = f` is refused. */
+            reject_mixed_float_int_compound(c, target, value, node->loc.line);
             /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
             if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
                 node->assign.op == TOK_CARETEQ || node->assign.op == TOK_LSHIFTEQ ||
@@ -8655,7 +8995,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         !slice_to_ptr_ok) {
                         char what[48];
                         snprintf(what, sizeof(what), "argument %u", i + 1);
-                        if (!report_negative_const_flow(c, node->call.args[i], param,
+                        if (!report_value_flow_specific(c, node->call.args[i], param,
                                                         node->loc.line, what))
                             checker_error(c, node->loc.line,
                                 "argument %u: expected '%s', got '%s'",
@@ -10058,7 +10398,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
-                    if (!report_negative_const_flow(c, node->orelse.fallback, unwrapped,
+                    if (!report_value_flow_specific(c, node->orelse.fallback, unwrapped,
                                                     node->loc.line, "orelse fallback"))
                         checker_error(c, node->loc.line,
                             "orelse fallback type '%s' doesn't match '%s'",
@@ -10384,6 +10724,54 @@ static Type *check_expr(Checker *c, Node *node) {
                         inlen, iname,
                         expected, (expected == 1 ? "" : "s"),
                         node->intrinsic.arg_count);
+                }
+
+                /* BUG-918: the POINTER-MINTING doors may not mint a pointer to a
+                 * CONSTRAINED type (enum / bool).
+                 *
+                 * @bitcast / @truncate / @saturate produce a VALUE, so they pay
+                 * for a runtime variant guard at the conversion (BUG-843/864/891/
+                 * 910/917). @inttoptr / @ptrcast / @pun produce an ADDRESS — there
+                 * is nothing to guard yet, and the later `*p` / `p.field` load is
+                 * an ordinary read with no diagnostic and no check. That made
+                 *
+                 *     volatile *Color r = @inttoptr(*Color, 0x40000000);
+                 *     Color c = *r;            // any byte the device presents
+                 *     switch (c) { ... }       // silently takes the LAST arm
+                 *
+                 * a silent wrong-branch on bare metal, and the same through
+                 * @ptrcast from a *u32. The switch lowering is entitled to elide
+                 * the last arm's comparison (ir_lower.c: it is what keeps the
+                 * free-analysis from a spurious bb_exit predecessor), so the
+                 * ENTIRE cost of a forged enum lands as a silent mis-dispatch.
+                 *
+                 * Rejected at the mint rather than guarded at the load: a pointer
+                 * to a constrained type has exactly one honest source, `&var`,
+                 * and the guarded route for hardware is already the documented
+                 * one — read the raw integer, then @bitcast, which traps. So this
+                 * costs no expressiveness and no runtime check on the ordinary
+                 * `ptr.state` read, which stays a bare load. */
+                bool is_mint = (nlen == 8 && memcmp(name, "inttoptr", 8) == 0) ||
+                               (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) ||
+                               (nlen == 3 && memcmp(name, "pun", 3) == 0);
+                if (is_mint && node->intrinsic.type_arg) {
+                    Type *mt = resolve_type(c, node->intrinsic.type_arg);
+                    Type *mu = mt ? type_unwrap_distinct(mt) : NULL;
+                    if (mu && type_dispatch_kind(mu) == TYPE_POINTER &&
+                        type_carries_constrained(mu->pointer.inner, 0, false)) {
+                        char pn[96];
+                        snprintf(pn, sizeof(pn), "%s", type_name(mu->pointer.inner));
+                        checker_error(c, node->loc.line,
+                            "%.*s cannot mint a pointer to '%s' — enum and bool hold "
+                            "only their declared values, and a load through a minted "
+                            "pointer can produce any bit pattern the memory holds. A "
+                            "forged enum silently takes the last arm of an exhaustive "
+                            "switch; a forged bool is neither true nor false. Read the "
+                            "raw integer and convert: 'u32 v = *reg; %s c = "
+                            "@bitcast(%s, v);' — that door traps at runtime on a value "
+                            "outside the set",
+                            inlen, iname, pn, pn, pn);
+                    }
                 }
             }
 
@@ -10723,6 +11111,33 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-919: an ARRAY target has never worked and cannot, because
+                 * of C rather than because of ZER. @bitcast lowers to a GCC
+                 * statement expression whose value is the punned temporary, and
+                 * C has no array rvalue: the emitter wrote the type name and the
+                 * temp name in that order (`int32_t[2] _zer_bco0;` — not a
+                 * declarator) and the trailing `_zer_bco0;` would decay to a
+                 * pointer even if it had parsed.
+                 *
+                 * Measured: `@bitcast(u32[2], x)` fails in EVERY position, for
+                 * every element type, with a gcc syntax error pointing at the
+                 * emitted C rather than at the user's source; and there are zero
+                 * uses anywhere in the corpus, because none could ever have
+                 * compiled. So this converts a confusing downstream gcc error
+                 * into a ZER diagnostic that names the working alternative — a
+                 * one-field struct, which does work (verified) and is what the
+                 * array-in-struct guard recursion already covers. */
+                {
+                    Type *bt = result ? type_unwrap_distinct(result) : NULL;
+                    if (bt && type_dispatch_kind(bt) == TYPE_ARRAY) {
+                        checker_error(c, node->loc.line,
+                            "@bitcast cannot target an array type '%s' — C has no array "
+                            "rvalue, so there is no value for the conversion to produce. "
+                            "Wrap it in a struct and bitcast that: "
+                            "'struct W { %s a; } W w = @bitcast(W, src); ... w.a[0]'",
+                            type_name(result), type_name(result));
+                    }
+                }
                 /* validate same width */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
@@ -13886,7 +14301,7 @@ static void check_stmt(Checker *c, Node *node) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
                          (int)node->var_decl.name_len, node->var_decl.name);
-                if (report_negative_const_flow(c, node->var_decl.init, type,
+                if (report_value_flow_specific(c, node->var_decl.init, type,
                                                node->loc.line, what)) {
                     /* diagnosed with the sign-specific wording */
                 /* RF6: better error for null used with non-optional type */
@@ -13933,15 +14348,7 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-373: integer literal range check — even if coercion passed,
              * verify the literal value fits the target type. Literals default
              * to ty_u32 so can_implicit_coerce may accept oversized values. */
-            if (node->var_decl.init->kind == NODE_INT_LIT &&
-                type && type_is_integer(type_unwrap_distinct(type))) {
-                if (!is_literal_compatible(node->var_decl.init, type)) {
-                    checker_error(c, node->loc.line,
-                        "integer literal %llu does not fit in '%s'",
-                        (unsigned long long)node->var_decl.init->int_lit.value,
-                        type_name(type));
-                }
-            }
+            check_int_literal_fits(c, node->var_decl.init, type, node->loc.line);
         }
 
         /* BUG-499: reject variable shadowing of function parameters in async functions.
@@ -14065,11 +14472,19 @@ static void check_stmt(Checker *c, Node *node) {
                              * (2026-08-01) commented that "@container is not a
                              * launder form and is handled elsewhere" — it is a
                              * launder form, and it was not handled here. */
-                            else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
-                                init_root = (init_root->intrinsic.name_len == 9 &&
-                                             memcmp(init_root->intrinsic.name, "container", 9) == 0)
-                                    ? init_root->intrinsic.args[0]
-                                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                            /* BUG-920: delegate the whole launder question to the
+                             * shared peeler instead of re-deriving it here. The
+                             * hand-rolled version knew intrinsics (with the
+                             * @container special case) but NOT a C-style cast to a
+                             * reference type, so `*N b = (*N)arena_ptr; g = b;`
+                             * broke the chain and the arena flag never reached `b`
+                             * — while the identical program spelled `@pun` or bare
+                             * did propagate. The emitter ELIDES an identity cast,
+                             * so those two programs compile to the same C.
+                             * Calling the peeler also means a launder added there
+                             * in future reaches this walker for free. */
+                            else if (unwrap_ptr_launder(init_root) != init_root)
+                                init_root = unwrap_ptr_launder(init_root);
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;
@@ -16151,7 +16566,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             if (c->current_func_ret) {
                 if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
-                    if (!report_negative_const_flow(c, node->ret.expr,
+                    if (!report_value_flow_specific(c, node->ret.expr,
                                                     c->current_func_ret,
                                                     node->loc.line, "return value"))
                         checker_error(c, node->loc.line,
@@ -17677,7 +18092,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
                     snprintf(what, sizeof(what), "spawn argument %d", i + 1);
-                    if (!report_negative_const_flow(c, node->spawn_stmt.args[i],
+                    if (!report_value_flow_specific(c, node->spawn_stmt.args[i],
                                                     param_type, node->loc.line, what))
                         checker_error(c, node->loc.line,
                             "spawn argument %d: expected '%s', got '%s'",
@@ -21919,7 +22334,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",
                          (int)decl->var_decl.name_len, decl->var_decl.name);
-                if (!report_negative_const_flow(c, decl->var_decl.init, type,
+                if (!report_value_flow_specific(c, decl->var_decl.init, type,
                                                 decl->loc.line, what))
                     checker_error(c, decl->loc.line,
                         "cannot initialize '%.*s' of type '%s' with '%s'",
@@ -21957,15 +22372,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 }
             }
             /* BUG-373: integer literal range check for globals */
-            if (decl->var_decl.init->kind == NODE_INT_LIT &&
-                type && type_is_integer(type_unwrap_distinct(type))) {
-                if (!is_literal_compatible(decl->var_decl.init, type)) {
-                    checker_error(c, decl->loc.line,
-                        "integer literal %llu does not fit in '%s'",
-                        (unsigned long long)decl->var_decl.init->int_lit.value,
-                        type_name(type));
-                }
-            }
+            check_int_literal_fits(c, decl->var_decl.init, type, decl->loc.line);
         }
     }
     return c->error_count == 0;

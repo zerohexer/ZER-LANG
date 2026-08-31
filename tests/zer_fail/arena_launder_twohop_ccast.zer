@@ -1,0 +1,16 @@
+// expect-error: cannot store arena-derived pointer
+// BUG-920, 2-hop form: the launder sits in a VAR-DECL init, so the arena flag has
+// to PROPAGATE to the new local before any sink sees it. That walker had its own
+// hand-rolled peel — intrinsics but not a C-style cast — so this program broke the
+// chain while the `@pun` and bare spellings of it both propagated. The emitter
+// ELIDES an identity cast, so all three compile to the same C.
+struct N { u32 v; }
+?*N g;
+void stash() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N a = ar.alloc(N) orelse return;
+    *N b = (*N)a;
+    g = b;
+}
+u32 main() { stash(); return 0; }

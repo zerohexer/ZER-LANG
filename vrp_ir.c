@@ -42,6 +42,39 @@
  * If you wire it: add it to BOTH Makefile source lists, give it a caller, and
  * treat every function here as UNTESTED code being introduced for the first
  * time, not as existing code being switched on.
+ *
+ * ============================================================================
+ * DEFECTS FOUND BY READING IT (2026-08-31). Do not wire without fixing these.
+ * ============================================================================
+ *
+ * The warning above is kept deliberately abstract, so here is the concrete form
+ * of it. A read-through found two problems, one of them an UNSOUNDNESS of
+ * exactly the kind that makes wiring this dangerous — it would ELIDE a bounds
+ * check, which is the accept-unsafe direction:
+ *
+ *  1. UNSOUND — `ir_derive_range`'s `x & MASK` arm reads the mask as a signed
+ *     int64 with no positivity test. `NODE_INT_LIT.value` is a uint64, so a
+ *     mask with the top bit set (`x & 0xFFFFFFFFFFFFFFFF`, the all-ones idiom
+ *     the corpus really uses) becomes NEGATIVE, and the range is set to
+ *     [0, negative] — min > max. `ir_range_proves_safe` then asks
+ *     `min >= 0 && max < array_size`, which that inverted range SATISFIES for
+ *     every positive size. The result is "proven in bounds" for an arbitrary
+ *     index. The `%` arm guards with `> 0` and does not have this shape.
+ *     Compare the AST VRP's `derive_expr_range` (checker.c), which is the
+ *     reviewed version of the same derivation and does not accept a negative
+ *     bound.
+ *
+ *  2. Comment/code disagreement — the "Merge at Join Points" header says
+ *     "Both valid + overlap -> intersect", but the code computes the UNION
+ *     (min of mins, max of maxes) and the inline comment says so. The CODE is
+ *     right: a JOIN must widen, and intersecting at a merge is precisely the
+ *     unsoundness `bounds_lattice.v`'s `elide_on_join_sound` exists to rule
+ *     out. Only the header is wrong, but it is the sentence a reader trusts.
+ *
+ * Neither is fixed here, on purpose: editing dead code creates the impression
+ * it has been reviewed and tested, and it has not been. The point of this note
+ * is that a wiring session should start from "this is a sketch with known
+ * defects" rather than from "this compiled once".
  */
 
 #include "ir.h"

@@ -1,0 +1,13 @@
+// expect-error: cannot store arena-derived pointer
+// BUG-920, the other form the hand-rolled peel missed. The emitter ELIDES an
+// identity C-style cast, so the emitted C is byte-identical to the bare form
+// one line away that IS rejected.
+struct N { u32 v; }
+?*N g;
+void stash() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N a = ar.alloc(N) orelse return;
+    g = (*N)a;
+}
+u32 main() { stash(); return 0; }

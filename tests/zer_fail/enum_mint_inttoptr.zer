@@ -1,0 +1,7 @@
+// expect-error: cannot mint a pointer to
+// BUG-918: @inttoptr(*Enum, addr) put a device byte straight into an enum. The
+// switch lowering elides the last arms comparison, so a non-variant silently
+// took that arm on bare metal — no diagnostic, no trap, wrong branch.
+enum Color { red, green, blue }
+mmio 0x0..0xFFFFFFFF;
+u32 main() { volatile *Color r = @inttoptr(*Color, 0x1000); Color c = *r; return (u32)c; }

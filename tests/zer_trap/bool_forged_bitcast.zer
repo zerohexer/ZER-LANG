@@ -1,0 +1,13 @@
+// expect-trap
+// BUG-917: `bool` is the second CONSTRAINED type (legal values 0 and 1) and had
+// no guard at the @bitcast door the enum family already guards. A forged bool
+// makes BOTH `b == true` and `b == false` false — measured: this program
+// returned 3 before the fix. Now it traps at the point of forgery.
+u8 raw() { return 2; }
+u32 main() {
+    u8 r = raw();
+    bool b = @bitcast(bool, r);
+    if (b == true)  { return 1; }
+    if (b == false) { return 2; }
+    return 3;
+}

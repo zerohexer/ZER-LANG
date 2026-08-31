@@ -1,0 +1,16 @@
+// BUG-917 over-rejection boundary: ordinary bool code must be untouched — no
+// guard emitted, no behaviour change. Verified by construction: only the three
+// conversion doors call the constrained-value guard.
+struct F { bool a; bool b; u32 n; }
+bool flip(bool x) { return !x; }
+u32 main() {
+    bool t = true; bool f = false;
+    F s; s.a = true; s.b = false; s.n = 3;
+    bool[2] arr; arr[0] = t; arr[1] = f;
+    ?bool ob = t;
+    bool u = ob orelse false;
+    if (t && !f && s.a && !s.b && arr[0] && !arr[1] && u && flip(f)) {
+        switch (t) { true => { return 0; } false => { return 1; } }
+    }
+    return 2;
+}

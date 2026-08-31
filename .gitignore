@@ -4,11 +4,23 @@
 release/
 zerc
 zerc_debug
+# `make zer-lsp` builds an extensionless ELF at the repo root. It was NOT
+# ignored, so a session that built the LSP would offer a ~900KB binary for
+# commit — the tracked-binary trap the structural rules below exist to prevent.
+zer-lsp
 NUL
 
 # Tracer binaries (extensionless — *.exe does not match them on Linux)
 /zerc-trace
 /ztrace
+# Scratch binaries at the REPO ROOT. The structural rule further down covers
+# extension-less artifacts under a TEST TREE; it cannot see the root, which is
+# how `test` and `test1` (two ELF executables from a 2026-08-26 debugging
+# session) ended up tracked. Removed 2026-08-31; these names are the ones a
+# `gcc -o test` reflex produces.
+/test
+/test1
+/a.out
 
 # Test binaries (compiled by make check)
 test_lexer
@@ -62,6 +74,7 @@ test_asm_matrix
 # Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
 test_defer_goto_matrix
 test_view_alias_matrix
+test_constrained_matrix
 
 # ---------------------------------------------------------------------------
 # Compiled test binaries — a STRUCTURAL rule, not a name list.

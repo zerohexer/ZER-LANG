@@ -154,7 +154,20 @@ emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
 2. IR-rewritten path — search `emitter.c` around line 6451 onward
 
 When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
-`@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
+`@pun`) in both locations. **The two-hits grep is a WEAK check** — many intrinsics dispatch from a
+shared table and legitimately appear once. What actually answers the question is to EMIT the
+intrinsic and grep the C for the fallback fingerprint `/* @name */ 0`, which is what
+`emit_rewritten_node`'s final `else` writes for an intrinsic the IR path does not know.
+
+**Measured 2026-08-31 — all 139 intrinsics, ZERO stubs.** One generated program per intrinsic
+(trying call shapes until the CHECKER accepts one, which also settles arity), emitted to C, grepped
+for the fingerprint: 133 covered by the generated shapes, the remaining six (`@cast`, `@cstr`,
+`@ptrcast`, `@pun`, `@sem_acquire`, `@sem_release`) by hand because they need a distinct typedef, a
+semaphore or an `*opaque` round-trip. The global-initializer (AST) path was spot-checked the same
+way. The invariant HOLDS today; re-run the sweep after adding intrinsics.
+`tools/emit_audit.sh` now greps for that fingerprint too — it did not, so the gate was not looking
+for the exact shape this section warns about. It still covers only 5 module samples, so it catches a
+stub that happens to land there; the exhaustive sweep is by hand.
 
 **`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
 `type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
@@ -397,12 +410,12 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
 | **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
-| **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor | ONE peeler `unwrap_ptr_launder` + the **p15 axis in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. `checker.c` still has ~30 hand-rolled peel sites vs ~15 shared-peeler uses — that ratio IS the debt |
+| **Launder peel ("does this wrapper preserve the value's provenance?")** | every escape/free sink + the alloc-key extractor + the VAR-DECL flag propagation | ONE peeler `unwrap_ptr_launder` + the **p15 and p19 axes in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. **The remaining hand-rolled peels are DEBT THAT BITES, not just untidiness** — BUG-920 found three of them WRONG at once (the arena plain-assign sink knew 2 of 6 forms; the struct-literal walker peeled for its `&local` case and then tested the UN-PEELED node in the other three; the var-decl propagation knew intrinsics but not a C-style cast). Each was an ASan-confirmed dangling escape with a rejected twin one line away, and the emitter ELIDES an identity cast so the two programs are byte-identical C. **Two of the three were found by ENUMERATING the sinks after fixing the reported one.** Before trusting a peel site, check it calls the shared peeler; a private peel is a hole until proven otherwise |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). The SPELLING axis matters as much as the site axis: `g = @truncate(u32,g)+1`, `g = idfn(g)+1` and `g = maybe(g) orelse 0` were all accepted at BOTH sinks until BUG-841, because the underlying walker was an if-chain that returned "no" for unlisted node kinds |
 | **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
 | **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
-| **Enum-forge doors** ("can this conversion produce a non-variant?") | `@bitcast`, `@truncate`, `@saturate` — and `@cast` verified NOT to be one | the three `tests/zer_trap/*_enum_forged_*.zer`. Patched THREE times across three sessions before the door set was written down; each fix closed one door and left the siblings |
+| **CONSTRAINED-VALUE forging** ("can this produce a value outside the type's legal set?") — `enum` and `bool` | FOUR kinds of site, not one: the 9 `value_flows_to` sinks (a literal), the arithmetic/bitwise/unary/compound operators, the 3 tracked conversion doors (`@bitcast`/`@truncate`/`@saturate`, which GUARD at runtime), and the 3 pointer-MINTING doors (`@inttoptr`/`@ptrcast`/`@pun`, which REJECT) | **CONSTRAINED MATRIX in `tests/test_constrained_matrix.c`** (44 cells, `make check`). Patched SIX times across five sessions — BUG-843/864/891/910 closed one conversion door each, then BUG-913 found the literal reached all nine flow sinks and BUG-917 found `bool` was never in the guard at all. Verified firing: 27 failures pre-fix (24 accepted forgeries + 3 missing guards), 44/44 after. Fix by calling `type_carries_constrained` / `emit_constrained_value_guard_path`, never a bare `k == TYPE_ENUM` test |
 | **Documented examples** ("does the reference still compile?") | every ```zer block in `docs/reference.md` | `tools/audit_reference_examples.sh` + `tools/reference_example_baseline.txt` — IN `make check` (the 8th gate). Twice the docs asserted a feature the parser did not have (funcptr arrays, bit-extract through a pointer) |
 | New value-producing op (uN/iN mask/clamp, …) | every op that yields a value | thread the mask/clamp through EACH op; NO auto-gate — checklist it |
 
@@ -451,7 +464,7 @@ line, plus TEN axis-crossed matrices:
 | `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 
-Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto.
+Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto / **constrained**.
 
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
@@ -1004,7 +1017,11 @@ struct Ops { *(u32) -> u32 compute; }     // struct field
 u32 apply(*(u32, u32) -> u32 op, x, y);  // parameter
 ?*(u32) -> u32 on_event = null;           // nullable funcptr
 *(u32) -> ?u32 lookup;                    // funcptr returning optional
-*(u32, u32) -> u32 [4] ops;               // array — INLINE, no typedef!
+?*(u32, u32) -> u32 [4] ops;              // array — INLINE, no typedef. The element type
+                                          // must be NULLABLE: array elements auto-zero,
+                                          // and a non-optional funcptr may not be null.
+                                          // Verified 2026-08-31: the un-`?`-ed spelling
+                                          // this line used to show does not parse.
 *(u32, u32) -> u32 select_op(u32 kind);   // return type — INLINE, no typedef!
 *(keep *Handler) register_fn;              // keep on individual params
 ```
@@ -1251,7 +1268,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |
-| Enum forging (a value outside the variant set) | Runtime variant guard at the point of forgery — TRACKED, not banned, so reading an enum from a register still works. The doors are EXACTLY THREE and the set is closed: `@bitcast` (BUG-843), `@truncate` (BUG-891), `@saturate` (BUG-910). `@cast` is NOT a door — it requires a distinct typedef and cannot name a bare enum. The guard recurses struct fields, optional payloads and array elements, and each door wires it at BOTH emitter dispatch paths. **Adding a new value-producing conversion? It is a fourth door — wire the guard.** |
+| Constrained-value forging (`enum` outside its variants, `bool` other than 0/1) | The two types whose legal values are a strict SUBSET of their representation, and the only two that can be forged. FOUR kinds of site, closed four different ways. **FLOW** — an integer literal into an enum destination is a compile error at all nine `value_flows_to` sinks (BUG-913); the value is known here, so no runtime guard is needed. **OP** — arithmetic/bitwise/unary/compound on an enum is rejected (BUG-914): the operand set is unbounded so there is nothing a single trap could cover, and `(u32)c` + `@bitcast` back is the audit-visible route. Comparisons and casts are UNAFFECTED. **DOOR** — `@bitcast`/`@truncate`/`@saturate` are TRACKED, not banned, so reading an enum out of a register still works: a runtime guard traps at the point of forgery, recursing struct fields, optional payloads and array elements, for BOTH enum and bool (BUG-843/864/891/910/917). **MINT** — `@inttoptr`/`@ptrcast`/`@pun` may not produce a pointer whose pointee IS constrained (BUG-918); there is no value yet to guard and the later load is a bare read. Aggregates that merely CARRY one are still allowed (that is the *opaque round-trip and the MMIO overlay) — see limitations.md. **Why it matters:** the enum switch lowering emits the LAST arm as an unconditional else, so a forged value silently RUNS an arm it does not name. **Adding a value-producing conversion, a value-flow sink, or a third constrained type? Add its cell to `tests/test_constrained_matrix.c` in the same commit.** |
 | Arena pointer escape | Arena-derived pointers cannot be stored in global/static variables (ALL arenas, including global — `is_from_arena` flag) |
 | Division by zero | Forced guard (compile error if divisor not proven nonzero); struct fields via compound key range propagation |
 | Invalid MMIO address | `mmio` declarations (compile-time) + alignment check + **MMIO index bounds from range** (compile-time) + startup @probe validation (boot-time) + `--no-strict-mmio` relaxes RANGE checks only (runtime alignment trap always emitted for variable addresses, BUG-736) |
@@ -1668,15 +1685,15 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 571 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 701 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 39 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |
 | `test_*.c` | C unit tests (lexer/parser/checker/emitter/zercheck/fuzz) | ~1,900 | `make check` (compiled + run) |
-| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/**view-alias**/hw/async/asm/defer-goto) | 10 grids | `make check` |
+| `tests/test_*_matrix.c` | Exhaustive axis-crossed oracles (shape/escape/keep/cflow/conc/view-alias/hw/async/asm/defer-goto/**constrained**) | 11 grids | `make check` |
 | `examples/qemu-cortex-m3/` | Real firmware examples (QEMU Cortex-M3 + hosted) | 8 | Manual (`make qemu` or `zerc --run`) |
 
 All runners auto-detect positive vs negative tests. `make check` runs everything.

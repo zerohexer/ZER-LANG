@@ -1,0 +1,29 @@
+// BUG-916: a function RETURNING a function pointer, DECLARED before it is
+// defined. The definition path knew the C declarator nests the name inside the
+// pointer — `RET (*name(params))(args)` — and the PROTOTYPE path did not, so
+// this exact program emitted `RET (*)(args) name(params)`, which gcc rejects.
+// The identical program without the forward declaration compiled, which is what
+// made it a two-emission-path bug rather than a missing feature.
+*(u32) -> u32 pick(u32 k);          // 2C forward declaration
+typedef u32 (*Op)(u32);
+Op pick2(u32 k);                    // 2A forward declaration, typedef return
+
+u32 dbl(u32 x) { return x * 2; }
+u32 inc(u32 x) { return x + 1; }
+
+*(u32) -> u32 pick(u32 k) { if (k == 0) { return dbl; } return inc; }
+Op pick2(u32 k) { if (k == 0) { return inc; } return dbl; }
+
+// zero-parameter funcptr return: the declarator must close with `(void)`, not
+// the K&R `()` that leaves the argument list unspecified.
+*() -> u32 pick0();
+u32 forty() { return 40; }
+*() -> u32 pick0() { return forty; }
+
+u32 main() {
+    *(u32) -> u32 f = pick(0);
+    Op g = pick2(0);
+    *() -> u32 h = pick0();
+    if (f(3) == 6 && g(3) == 4 && h() == 40) { return 0; }
+    return 1;
+}

@@ -1380,6 +1380,127 @@ static ExprKey build_expr_key_a(Checker *c, Node *expr) {
     return (ExprKey){ key, wrote };
 }
 
+/* ================================================================
+ * VRP condition narrowing — ONE parser, ONE range table (BUG-920, 2026-09-01)
+ *
+ * "What does `<var> CMP <const>` tell me about <var>?" was answered by FOUR
+ * hand-written switch tables inside the NODE_IF handler: the condition holding
+ * and the guard-INVERSE, each duplicated for the operands in either order. A
+ * third caller (the short-circuit RHS below) would have been a fifth and sixth
+ * copy — the multi-site shape this codebase keeps paying for, on the analysis
+ * where a missed case is a silent out-of-bounds.
+ *
+ * Now: parse the comparison once into a normalised `var OP val`, invert OP when
+ * the caller wants the FALSE side, and push from a single table. The four
+ * historical tables are reproduced operator by operator. Two facts the old
+ * tables lacked fall out of the normalisation rather than being added by hand:
+ * the guard-inverse now applies with the constant on the LEFT (`if (4 > i)
+ * return;` states `i >= 4` afterwards), and the inverse of `!=` is `==`.
+ * ================================================================ */
+typedef struct {
+    bool ok;
+    const char *var;
+    uint32_t var_len;
+    int64_t val;
+    TokenType op;        /* normalised: always reads `var OP val` */
+} VrpCmp;
+
+/* Recognise `ident CMP const` / `field CMP const` in either order. A volatile
+ * operand is refused: the value can change between the check and the use, so a
+ * narrowing derived from it is unsound (TOCTOU). */
+static VrpCmp vrp_parse_cmp(Checker *c, Node *cond) {
+    VrpCmp k;
+    k.ok = false; k.var = NULL; k.var_len = 0; k.val = 0; k.op = TOK_EOF;
+    if (!cond || cond->kind != NODE_BINARY) return k;
+    Node *lhs = cond->binary.left;
+    Node *rhs = cond->binary.right;
+    if (!lhs || !rhs) return k;
+    TokenType op = cond->binary.op;
+    bool var_on_left = false;
+    const char *var = NULL; uint32_t var_len = 0;
+    int64_t val = CONST_EVAL_FAIL;
+
+    if (lhs->kind == NODE_IDENT) {
+        Symbol *lsym = scope_lookup(c->current_scope,
+            lhs->ident.name, (uint32_t)lhs->ident.name_len);
+        bool is_vol = (lsym && lsym->is_volatile);
+        val = eval_const_expr(rhs);
+        if (val != CONST_EVAL_FAIL && !is_vol) {
+            var = lhs->ident.name; var_len = (uint32_t)lhs->ident.name_len;
+            var_on_left = true;
+        }
+    } else if (lhs->kind == NODE_FIELD) {
+        val = eval_const_expr(rhs);
+        if (val != CONST_EVAL_FAIL) {
+            ExprKey ek = build_expr_key_a(c, lhs);
+            if (ek.len > 0) { var = ek.str; var_len = (uint32_t)ek.len; var_on_left = true; }
+        }
+    }
+    if (!var && rhs->kind == NODE_IDENT) {
+        Symbol *rsym = scope_lookup(c->current_scope,
+            rhs->ident.name, (uint32_t)rhs->ident.name_len);
+        bool r_vol = (rsym && rsym->is_volatile);
+        val = eval_const_expr(lhs);
+        if (val != CONST_EVAL_FAIL && !r_vol) {
+            var = rhs->ident.name; var_len = (uint32_t)rhs->ident.name_len;
+            var_on_left = false;
+        }
+    } else if (!var && rhs->kind == NODE_FIELD) {
+        val = eval_const_expr(lhs);
+        if (val != CONST_EVAL_FAIL) {
+            ExprKey ek = build_expr_key_a(c, rhs);
+            if (ek.len > 0) { var = ek.str; var_len = (uint32_t)ek.len; var_on_left = false; }
+        }
+    }
+    if (!var) return k;
+
+    /* normalise to `var OP val` — flip when the constant was on the left
+     * (`4 > i` states `i < 4`). == and != are symmetric. */
+    if (!var_on_left) {
+        switch (op) {
+        case TOK_LT:   op = TOK_GT;   break;
+        case TOK_LTEQ: op = TOK_GTEQ; break;
+        case TOK_GT:   op = TOK_LT;   break;
+        case TOK_GTEQ: op = TOK_LTEQ; break;
+        default: break;
+        }
+    }
+    k.ok = true; k.var = var; k.var_len = var_len; k.val = val; k.op = op;
+    return k;
+}
+
+/* Push the range implied by the comparison HOLDING (assume_true) or NOT holding.
+ * `known_nonzero` is set only when the derived range provably excludes zero.
+ * `!=` against a non-zero constant describes a hole, not an interval, so it
+ * pushes nothing — exactly as the original tables did. */
+static void vrp_push_cmp_range(Checker *c, VrpCmp k, bool assume_true) {
+    if (!k.ok) return;
+    TokenType op = k.op;
+    if (!assume_true) {
+        switch (op) {
+        case TOK_LT:     op = TOK_GTEQ;   break;
+        case TOK_LTEQ:   op = TOK_GT;     break;
+        case TOK_GT:     op = TOK_LTEQ;   break;
+        case TOK_GTEQ:   op = TOK_LT;     break;
+        case TOK_EQEQ:   op = TOK_BANGEQ; break;
+        case TOK_BANGEQ: op = TOK_EQEQ;   break;
+        default: return;
+        }
+    }
+    int64_t v = k.val;
+    switch (op) {
+    case TOK_LT:   push_var_range(c, k.var, k.var_len, INT64_MIN, v - 1, v <= 0); break;
+    case TOK_LTEQ: push_var_range(c, k.var, k.var_len, INT64_MIN, v,     v <  0); break;
+    case TOK_GT:   push_var_range(c, k.var, k.var_len, v + 1, INT64_MAX, v >= 0); break;
+    case TOK_GTEQ: push_var_range(c, k.var, k.var_len, v,     INT64_MAX, v >  0); break;
+    case TOK_EQEQ: push_var_range(c, k.var, k.var_len, v, v, v != 0); break;
+    case TOK_BANGEQ:
+        if (v == 0) push_var_range(c, k.var, k.var_len, INT64_MIN, INT64_MAX, true);
+        break;
+    default: break;
+    }
+}
+
 /* Track dynamic-index free for auto-guard (B1 refactor: unified helper).
  * When pool.free(arr[k]) or slab.free(arr[k]) is called with variable index k,
  * record the array+index so the emitter can auto-guard later arr[j].field access.
@@ -5515,14 +5636,39 @@ static Type *check_expr(Checker *c, Node *node) {
          * This suppresses only the HARD VERDICT in that position — the index
          * falls through to the auto-guard exactly as an unprovable one does, so
          * no runtime check is removed and nothing becomes accepted that would
-         * execute an out-of-bounds access. The proper fix is to narrow VRP from
-         * the LHS (then the access is PROVEN and the guard is elided); until
-         * then this is the difference between rejecting the idiom and merely
-         * not optimising it. */
+         * execute an out-of-bounds access.
+         *
+         * BUG-920 (2026-09-01) added the narrowing this comment asked for, so the
+         * `&&` form is now PROVEN and carries no guard at all. The suppression
+         * stays and still earns its place: it covers the `||` form (whose RHS runs
+         * on the OTHER side of the comparison, where the index really is out of
+         * range, so the guard is the right answer rather than an error) and every
+         * LHS the parser cannot reduce to `var CMP const`. */
         bool sc = (node->binary.op == TOK_AMPAMP || node->binary.op == TOK_PIPEPIPE);
-        if (sc) c->shortcircuit_rhs_depth++;
+        int sc_saved_ranges = c->var_range_count;
+        if (sc) {
+            c->shortcircuit_rhs_depth++;
+            /* BUG-920: apply the LHS to the RHS. The RHS of `&&` runs only when the
+             * LHS is TRUE and the RHS of `||` only when it is FALSE, so the
+             * corresponding range holds for exactly the sub-expression being
+             * checked — which is what makes `if (i < 4 && arr[i] > 0)` provable.
+             *
+             * Dropped again immediately after (the count restore below), so the
+             * fact cannot leak past the operator. The restore is a TRUNCATION, and
+             * it is only sound because a value CHANGED under the narrowing widens
+             * the older entries in place rather than appending a new one: an
+             * assignment unions into every live entry with the same key (BUG-913)
+             * and an `&x` marks them all address-taken (BUG-918). Without those two
+             * fixes this truncation would restore a stale narrow range over a value
+             * the RHS had already modified. */
+            VrpCmp sck = vrp_parse_cmp(c, node->binary.left);
+            if (sck.ok) vrp_push_cmp_range(c, sck, node->binary.op == TOK_AMPAMP);
+        }
         Type *right = check_expr(c, node->binary.right);
-        if (sc && c->shortcircuit_rhs_depth > 0) c->shortcircuit_rhs_depth--;
+        if (sc) {
+            c->var_range_count = sc_saved_ranges;   /* the fact holds ONLY in the RHS */
+            if (c->shortcircuit_rhs_depth > 0) c->shortcircuit_rhs_depth--;
+        }
 
         /* literal promotion: when one side is a literal and the other is
          * a known type, the literal adopts the other side's type.
@@ -14720,135 +14866,16 @@ static void check_stmt(Checker *c, Node *node) {
             struct VarRange *cmp_thenv = NULL;
             Node *if_cond = node->if_stmt.cond;
 
-            /* detect comparison pattern: ident OP const or const OP ident */
-            const char *cmp_var = NULL;
-            uint32_t cmp_var_len = 0;
-            int64_t cmp_val = CONST_EVAL_FAIL;
-            TokenType cmp_op = TOK_EOF;
-            bool var_on_left = false;
-
-            if (if_cond && if_cond->kind == NODE_BINARY) {
-                cmp_op = if_cond->binary.op;
-                Node *lhs = if_cond->binary.left;
-                Node *rhs = if_cond->binary.right;
-
-                /* try left side as ident or struct field
-                 * TOCTOU: skip volatile variables — value can change between
-                 * guard check and use, so range narrowing is unsound */
-                if (lhs->kind == NODE_IDENT) {
-                    Symbol *lsym = scope_lookup(c->current_scope,
-                        lhs->ident.name, (uint32_t)lhs->ident.name_len);
-                    bool is_vol = (lsym && lsym->is_volatile);
-                    cmp_val = eval_const_expr(rhs);
-                    if (cmp_val != CONST_EVAL_FAIL && !is_vol) {
-                        cmp_var = lhs->ident.name;
-                        cmp_var_len = (uint32_t)lhs->ident.name_len;
-                        var_on_left = true;
-                    }
-                } else if (lhs->kind == NODE_FIELD) {
-                    cmp_val = eval_const_expr(rhs);
-                    if (cmp_val != CONST_EVAL_FAIL) {
-                        ExprKey ek = build_expr_key_a(c, lhs);
-                        if (ek.len > 0) {
-                            cmp_var = ek.str;
-                            cmp_var_len = (uint32_t)ek.len;
-                            var_on_left = true;
-                        }
-                    }
-                }
-                /* try right side — also skip volatile (TOCTOU) */
-                if (!cmp_var && rhs->kind == NODE_IDENT) {
-                    Symbol *rsym = scope_lookup(c->current_scope,
-                        rhs->ident.name, (uint32_t)rhs->ident.name_len);
-                    bool r_vol = (rsym && rsym->is_volatile);
-                    cmp_val = eval_const_expr(lhs);
-                    if (cmp_val != CONST_EVAL_FAIL && !r_vol) {
-                        cmp_var = rhs->ident.name;
-                        cmp_var_len = (uint32_t)rhs->ident.name_len;
-                        var_on_left = false;
-                    }
-                } else if (!cmp_var && rhs->kind == NODE_FIELD) {
-                    cmp_val = eval_const_expr(lhs);
-                    if (cmp_val != CONST_EVAL_FAIL) {
-                        ExprKey ek = build_expr_key_a(c, rhs);
-                        if (ek.len > 0) {
-                            cmp_var = ek.str;
-                            cmp_var_len = (uint32_t)ek.len;
-                            var_on_left = false;
-                        }
-                    }
-                }
-            }
-
+            /* BUG-920: ONE parser (vrp_parse_cmp) for `var CMP const`, shared with
+             * the short-circuit RHS narrowing in check_expr. */
+            VrpCmp cmp_k = vrp_parse_cmp(c, if_cond);
             /* detect comparison with == 0 / != 0 */
-            if (if_cond && if_cond->kind == NODE_BINARY && cmp_var) {
+            if (if_cond && if_cond->kind == NODE_BINARY && cmp_k.ok) {
                 bool is_guard = body_always_exits(node->if_stmt.then_body) &&
                                 !node->if_stmt.else_body;
 
-                /* Inside then-block: apply condition directly */
-                /* known_nonzero is set ONLY when the derived range provably
-                 * excludes zero. A range [a, b] excludes zero iff b < 0 or a > 0.
-                 * Pre-fix code used predicates like `cmp_val > 0 || cmp_val < 0`
-                 * (val != 0) which is wrong: e.g., `if (x <= 5)` produces
-                 * [INT64_MIN, 5] which DOES contain 0. */
-                if (var_on_left) {
-                    switch (cmp_op) {
-                    case TOK_LT:      /* var < val → range [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val <= 0);
-                        break;
-                    case TOK_LTEQ:    /* var <= val → range [INT64_MIN, val]; nonzero iff val < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val < 0);
-                        break;
-                    case TOK_GT:      /* var > val → range [val+1, INT64_MAX]; nonzero iff val+1 > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
-                                       cmp_val >= 0);
-                        break;
-                    case TOK_GTEQ:    /* var >= val → range [val, INT64_MAX]; nonzero iff val > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0);
-                        break;
-                    case TOK_EQEQ:    /* var == val → range [val, val]; nonzero iff val != 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
-                                       cmp_val != 0);
-                        break;
-                    case TOK_BANGEQ:  /* var != val → if val == 0, known_nonzero */
-                        if (cmp_val == 0)
-                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
-                        break;
-                    default: break;
-                    }
-                } else {
-                    /* val OP var → flip: val < var means var > val */
-                    switch (cmp_op) {
-                    case TOK_LT:      /* val < var → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
-                                       cmp_val >= 0);
-                        break;
-                    case TOK_LTEQ:    /* val <= var → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0);
-                        break;
-                    case TOK_GT:      /* val > var → var < val → [INT64_MIN, val-1]; nonzero iff val <= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val <= 0);
-                        break;
-                    case TOK_GTEQ:    /* val >= var → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val < 0);
-                        break;
-                    case TOK_EQEQ:
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, cmp_val,
-                                       cmp_val != 0);
-                        break;
-                    case TOK_BANGEQ:
-                        if (cmp_val == 0)
-                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
-                        break;
-                    default: break;
-                    }
-                }
+                /* Inside then-block: the condition holds. */
+                vrp_push_cmp_range(c, cmp_k, true);
 
                 check_stmt_cond_body(c, node->if_stmt.then_body);
                 c->var_range_count = saved_range_count; /* restore */
@@ -14860,60 +14887,28 @@ static void check_stmt(Checker *c, Node *node) {
                 vrp_snap_restore(c, cmp_pre, saved_range_count);
 
                 /* Guard pattern: if (cond) { return; } → apply INVERSE after the if */
-                if (is_guard && var_on_left) {
-                    switch (cmp_op) {
-                    case TOK_GTEQ:    /* if (var >= val) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val <= 0);
-                        break;
-                    case TOK_GT:      /* if (var > val) return → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val < 0);
-                        break;
-                    case TOK_LT:      /* if (var < val) return → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0);
-                        break;
-                    case TOK_LTEQ:    /* if (var <= val) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
-                                       cmp_val >= 0);
-                        break;
-                    case TOK_EQEQ:    /* if (var == 0) return → var != 0 → known_nonzero */
-                        if (cmp_val == 0)
-                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
-                        break;
-                    default: break;
-                    }
-                } else if (is_guard && !var_on_left) {
-                    /* val OP var guard → apply inverse (flip) */
-                    switch (cmp_op) {
-                    case TOK_GTEQ:    /* if (val >= var) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
-                                       cmp_val >= 0);
-                        break;
-                    case TOK_GT:      /* if (val > var) return → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val, INT64_MAX,
-                                       cmp_val > 0);
-                        break;
-                    case TOK_LT:      /* if (val < var) return → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val,
-                                       cmp_val < 0);
-                        break;
-                    case TOK_LTEQ:    /* if (val <= var) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
-                                       cmp_val <= 0);
-                        break;
-                    case TOK_EQEQ:
-                        if (cmp_val == 0)
-                            push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, INT64_MAX, true);
-                        break;
-                    default: break;
-                    }
+                if (is_guard) {
+                    /* `if (cond) { return; }` — on the path that CONTINUES past the
+                     * if, the condition is known FALSE. */
+                    vrp_push_cmp_range(c, cmp_k, false);
                 }
 
                 if (node->if_stmt.else_body) {
-                    /* else-block gets the inverse of then-block's range
-                     * (but we already restored, so just check else normally)
+                    /* BUG-920b: the else body runs EXACTLY when the condition is
+                     * false, so the inverse holds throughout it — the same theorem
+                     * the guard pattern above uses, scoped to the else instead of
+                     * to the continuation. It was not applied before (the comment
+                     * here said "we already restored, so just check else normally"),
+                     * which made `if (i >= 8) { } else { a[i] }` carry a runtime
+                     * guard that the equivalent `if (i < 8) { a[i] }` does not.
+                     * Measured: 1 auto-guard before, 0 after.
+                     *
+                     * Pushed AFTER cmp_after_guard is taken, so the count reset
+                     * below drops it along with the else body's own pushes — the
+                     * fact is scoped to the else and cannot reach the join. An
+                     * assignment inside the else still widens the pre-branch entry
+                     * in place (BUG-913), which the JOIN then sees.
+                     *
                      *
                      * B6 (2026-08-01): SYMMETRIC count reset. The THEN body above
                      * restores `var_range_count` after being checked, dropping any
@@ -14931,6 +14926,7 @@ static void check_stmt(Checker *c, Node *node) {
                      * own pushes are dropped. In-place mutations by the else body
                      * are still handled by the JOIN below (Finding A). */
                     int cmp_after_guard = c->var_range_count;
+                    vrp_push_cmp_range(c, cmp_k, false);   /* BUG-920b */
                     check_stmt_cond_body(c, node->if_stmt.else_body);
                     c->var_range_count = cmp_after_guard;
                 }
@@ -19575,6 +19571,28 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
         if (existing->min_val > min_val) min_val = existing->min_val;
         if (existing->max_val < max_val) max_val = existing->max_val;
         if (existing->known_nonzero) known_nonzero = true;
+        /* BUG-920: the intersection can come out EMPTY (min > max) — the narrowing
+         * contradicts what was already known, so this program point is UNREACHABLE.
+         * There is no canonical empty range in this representation, and an INVERTED
+         * one is read as a PROOF by every consumer that asks "is max < limit?" or
+         * "is min > 0?": measured, `u32 i = 9; if (i < 4 && a[i] > 0)` intersected
+         * [9,9] with [MIN,3] to [9,3], and `index_range_verdict` answered
+         * PROVEN_SAFE and elided the bounds guard. Vacuously correct — the access
+         * cannot execute — but it is a proof arrived at by accident from a
+         * degenerate state, on the one analysis where a wrong "proven" is a silent
+         * out-of-bounds.
+         *
+         * Record "nothing is known" instead. The FULL range is the only value that
+         * reads conservatively at every consumer: no in-bounds proof, no nonzero
+         * proof, and — equally important — no ALWAYS-OOB verdict either. Keeping
+         * the previous WIDER fact was tried and is wrong in that last respect: it
+         * makes `u32 i = 9; if (i < 4) { a[i] }` a HARD REJECT of a program that is
+         * safe by construction. Unreachable code gets a guard it will never run. */
+        if (min_val > max_val) {
+            min_val = INT64_MIN;
+            max_val = INT64_MAX;
+            known_nonzero = false;
+        }
     }
     if (c->var_range_count >= c->var_range_capacity) {
         int new_cap = c->var_range_capacity * 2;

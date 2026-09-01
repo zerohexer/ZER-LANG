@@ -5,6 +5,97 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-01 — BUG-920: VRP now narrows from a short-circuit LHS into its RHS
+
+A RELAXATION — the one change class where a bug is a shipped out-of-bounds rather than an
+over-rejection, so it is built and reported to that standard.
+
+**The over-rejection.** `if (i < 4 && arr[i] > 0)` is the canonical guarded-access idiom and
+the exact shape the auto-guard warning tells users to write. VRP never applied the LHS to the
+RHS, so the index was unprovable there and carried a runtime guard that the nested-if
+spelling of the identical program does not. The comment above the short-circuit handler had
+been asking for this since BUG-874: *"The proper fix is to narrow VRP from the LHS (then the
+access is PROVEN and the guard is elided); until then this is the difference between
+rejecting the idiom and merely not optimising it."*
+
+**The fix.** The RHS of `&&` runs only when the LHS is TRUE and the RHS of `||` only when it
+is FALSE, so the corresponding range holds for exactly the sub-expression being checked. Push
+it before checking the RHS, drop it immediately after.
+
+**Why the drop is sound.** The restore is a TRUNCATION of `var_range_count`, and that is only
+sound because a value CHANGED under the narrowing widens the older entries IN PLACE rather
+than appending a new one — an assignment unions into every live entry with the same key
+(BUG-913) and an `&x` marks them all address-taken (BUG-918), both fixed earlier in this same
+session. Without those two, this truncation would restore a stale narrow range over a value
+the RHS had already modified. The three fixes are one mechanism.
+
+**One parser instead of six tables.** "What does `var CMP const` tell me about `var`?" was
+answered by FOUR hand-written switch tables in the NODE_IF handler (condition-holds and
+guard-inverse, each duplicated for the operands in either order). A third caller would have
+been a fifth and sixth copy — the multi-site shape this codebase keeps paying for, on the
+analysis where a missed case is a silent out-of-bounds. Now `vrp_parse_cmp` normalises to
+`var OP val` and `vrp_push_cmp_range` pushes from one table, inverting OP for the FALSE side.
+Two facts the old tables lacked fall out of the normalisation rather than being added by
+hand: the guard-inverse now applies with the constant on the LEFT (`if (4 > i) return;`
+states `i >= 4` afterwards), and the inverse of `!=` is `==`.
+
+**Measured precision.** Six unprovable-index accesses on a fixed array, one per comparison
+form: **6 auto-guards before, 1 after**. The survivor is `i != 0 && a[i]` — `!=` against a
+non-zero constant describes a hole, not an interval, so there is nothing to push. `i >= 8 ||
+a[i]` is proven too: the `||` RHS takes the INVERSE, which is the common "bounds-check-first"
+idiom.
+
+**Soundness matrix** (`tests/zer/shortcircuit_vrp_narrowing.zer`). Every cell measured to
+keep its guard, and the program's behaviour checked at runtime against a canary field placed
+directly after the array:
+
+| cell | must |
+|---|---|
+| `m < 4 && bump(&m) == 1 && a[m]` | GUARD — `&m` in the RHS marks it address-taken |
+| `gi < 4 && setg() == 1 && a[gi]` | GUARD — a call may change the global |
+| `n < 4 \|\| a[n]` | GUARD — the `\|\|` RHS runs with `n >= 4` |
+| `if (q < 4 && q > 0) {} a[q] = 999;` | GUARD — the fact must not leak past the operator |
+| `v_nine < 4 && a[v_nine]` (volatile) | GUARD — TOCTOU, the parser refuses a volatile operand |
+| `si < 4 && a[si]` (signed) | GUARD — `[MIN,3]` still includes negatives |
+
+Note that this test does NOT fail on the pre-fix compiler, and that is correct: the pre-fix
+compiler is imprecise, not wrong. Its job is to fail if the relaxation is ever made unsound.
+The precision claim is carried by the measured guard count above.
+
+**BUG-920b — the `else` branch, for free.** With one inverse-push helper in place, the branch
+that runs exactly when the condition is FALSE was a one-line extension. The code there had an
+acknowledged gap in its own comment (*"else-block gets the inverse of then-block's range (but
+we already restored, so just check else normally)"*), which made
+`if (i >= 8) { } else { a[i] }` carry a guard that the equivalent
+`if (i < 8) { a[i] }` does not. Measured: 1 auto-guard before, 0 after. The push happens
+after `cmp_after_guard` is taken so the existing count reset drops it — the fact is scoped to
+the else body and cannot reach the join.
+
+This is the payoff of the unification, and worth stating plainly: as four hand-written tables
+it would have been a fifth and sixth; as one normalising parser it is one call.
+
+**A second, larger win on the division axis.** `if (d != 0 && 100 / d > 0)` was not merely
+guarded before — it was a HARD COMPILE ERROR (*"divisor 'd' not proven nonzero"*), while the
+nested-if spelling of the identical program compiled. `!= 0` sets `known_nonzero`, so the
+division guard is now satisfied by the same narrowing. Soundness measured on the same axes:
+zeroing the value through `&d` inside the right operand, and zeroing the global through a
+call there, are both still rejected — negatives in
+`tests/zer_fail/shortcircuit_div_{alias,global}_zeroed.zer`.
+
+**A degenerate state the relaxation exposed.** Intersecting `[9,9]` with `[MIN,3]` produces
+the INVERTED range `[9,3]`, and `index_range_verdict` read it as PROVEN_SAFE (`min >= 0 &&
+max >= 0 && max < limit`) and elided the bounds guard. Vacuously correct — an empty range
+means the point is unreachable — but it is a proof arrived at by accident from a degenerate
+state, on the one analysis where a wrong "proven" is a silent out-of-bounds, and four other
+sites read `min_val`/`max_val` the same way to prove non-zero-ness.
+
+Fixed at the source: an empty intersection now records the FULL range, the only value that
+reads conservatively at every consumer — no in-bounds proof, no non-zero proof, and no
+ALWAYS-OOB verdict either. That last part matters and was got wrong first: keeping the
+previous, *wider* fact was tried, and it turns `u32 i = 9; if (i < 4) { a[i] }` into a HARD
+REJECT of a program that is safe by construction. Unreachable code now gets a guard it will
+never run.
+
 ## Session 2026-09-01 — BUG-921: the deferred whole-program passes only ever saw ONE module
 
 **Symptom.** Move any of five kinds of defect out of `main.zer` and into a module that

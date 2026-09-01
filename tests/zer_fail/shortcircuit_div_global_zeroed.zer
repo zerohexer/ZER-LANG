@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: divisor 'gd' not proven nonzero
+//
+// BUG-920 soundness cell, the GLOBAL axis of div_alias_zeroed: the right operand
+// calls a function that zeroes the global being divided by. The narrowing must be
+// dropped there too — a call can change anything the analysis cannot see through.
+
+u32 gd = 1;
+u32 zero_g() { gd = 0; return 1; }
+
+u32 main() {
+    u32 t = 0;
+    if (gd != 0 && zero_g() == 1 && 100 / gd > 0) { t += 1; }
+    return t;
+}

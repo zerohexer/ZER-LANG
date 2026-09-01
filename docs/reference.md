@@ -3882,12 +3882,44 @@ OPTIONAL is rejected too — see `?T` above; only `opt == null` is allowed.
 `&&  ||  !` — Short-circuit evaluation.
 
 The RIGHT operand of `&&` / `||` runs only when the left permits it, and the
-bounds checker knows that: `if (i < 4 && a[i] > 0)` — the canonical guarded
-access — compiles. The index is not PROVEN in range there (range narrowing does
-not yet flow across a short-circuit), so it carries a runtime auto-guard rather
-than being elided; write the guard as a nested `if` to get the check for free.
-Putting the access on the LEFT (`a[i] > 0 && i < 4`) runs it unconditionally and
-is still a hard error when the index is provably out of range.
+analysis uses that. A comparison of a variable against a constant on the left
+NARROWS that variable's range for the right operand, so the canonical guarded
+forms are PROVEN and carry no runtime check at all. The same holds in the `else`
+branch of an `if`, which runs exactly when the condition is false:
+
+```zer
+volatile u32 v_idx;
+u32[8] table;
+
+void narrowed() {
+    u32 i = v_idx;                        // unprovable — a volatile read
+    if (i < 8 && table[i] > 0) { }        // proven — no bounds check emitted
+    if (i >= 8 || table[i] > 0) { }       // proven — the `||` RHS takes the INVERSE
+
+    u32 d = v_idx;
+    if (d != 0 && 100 / d > 0) { }        // proven nonzero — satisfies the division guard
+}
+
+void narrowed_else() {
+    u32 i = v_idx;
+    if (i >= 8) { return; } else { table[i] = 1; }   // proven in the else
+}
+```
+
+The fact holds ONLY inside that operand (or that branch); after it, the variable
+is whatever it was. It is also dropped whenever it could be stale, and the access
+falls back to the runtime auto-guard:
+
+- the value is changed inside the right operand — `i < 8 && bump(&i) && table[i]`,
+  or a call that may write the global being tested;
+- the operand is `volatile` (it can change between the check and the use);
+- the variable is signed and the narrowed range still admits negatives — `si < 8`
+  gives `[MIN, 7]`;
+- the comparison is `!=` against a non-zero constant, which describes a hole
+  rather than an interval, so there is no range to apply.
+
+Putting the access on the LEFT (`table[i] > 0 && i < 8`) runs it unconditionally
+and is still a hard error when the index is provably out of range.
 
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`

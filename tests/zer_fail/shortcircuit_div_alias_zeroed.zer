@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: divisor 'd' not proven nonzero
+//
+// BUG-920 soundness cell. The short-circuit narrowing lets `if (d != 0 && 100 / d)`
+// compile — it was a HARD ERROR before, while the nested-if spelling of the same
+// program compiled. That relaxation must NOT survive a value the right operand
+// itself zeroes: `&d` in the RHS marks the variable address-taken, which drops
+// every narrowing for it (BUG-918), so the divisor is unproven again and the
+// program is correctly rejected. Without that interaction this would divide by
+// zero at runtime with no diagnostic.
+
+volatile u32 v_two = 2;
+u32 wild() { return v_two; }
+u32 zero_it(*u32 p) { *p = 0; return 1; }
+
+u32 main() {
+    u32 d = wild();
+    u32 t = 0;
+    if (d != 0 && zero_it(&d) == 1 && 100 / d > 0) { t += 1; }
+    return t;
+}

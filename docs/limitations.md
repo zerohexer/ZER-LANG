@@ -195,20 +195,18 @@ wrong conclusion. Kept for the measurement, not the verdict.
 ### (original entry)
 
 
-`if (i < 4 && arr[i] > 0)` — the canonical guarded-access idiom, and the exact shape the
-auto-guard warning tells users to write — still carries a runtime bounds guard, because
-VRP never applies a short-circuit LHS to its RHS. Verified still live after the harvest:
-the program compiles and runs correctly; the cost is one unnecessary branch.
+**CLOSED 2026-09-01 (BUG-920).** `if (i < 4 && arr[i] > 0)` is now PROVEN and carries no
+guard: measured 6 auto-guards -> 1 across the six comparison forms, the survivor being `!=`
+against a non-zero constant (a hole, not an interval). The `||` inverse
+(`i >= 4 || arr[i]`), the `else` branch (BUG-920b) and the DIVISION guard
+(`d != 0 && 100 / d` — which was a hard compile ERROR, not merely a guard) all came with it.
 
-**This is PRECISION, not safety** — hence not shipped with the 45. It becomes REQUIRED
-the day the ALWAYS-OOB verdict is promoted at short-circuit position, because the same
-idiom would then be REJECTED rather than merely guarded. 87xihb's BUG-800 carries the
-implementation (`vrp_narrow_from_cond`: `ident <op> const` plus conjunctions, De Morgan
-for the inverted disjunction, refusing volatile operands, a no-op on anything else) and
-is deliberately NOT a second copy of the NODE_IF narrowing — that path stays
-authoritative and keeps field keys, guard-body detection, known_nonzero and the
-then/else JOIN; this covers only the position it structurally cannot reach, inside a
-condition EXPRESSION.
+Implemented NOT as the branch's separate `vrp_narrow_from_cond` but by UNIFYING the four
+existing NODE_IF tables into one normalising parser (`vrp_parse_cmp`) plus one range table
+(`vrp_push_cmp_range`), which the short-circuit site then calls. A second narrowing
+implementation beside the authoritative one is exactly the multi-site shape that produced
+this file; one helper with four callers is the durable form. See BUGS-FIXED.md
+"Session 2026-09-01 — BUG-920".
 
 ---
 
@@ -665,7 +663,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 |---|---|---|---|
 | ~~O1~~ **DONE (BUG-829)** | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
 | ~~O2~~ **DONE (BUG-833)** | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
-| **O3 — STILL OPEN** | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
+| ~~O3~~ **DONE (BUG-920, 2026-09-01)** | `&&`/`\|\|` do not narrow their RHS | **87xihb** BUG-800 | Now PROVEN: 6 auto-guards -> 1 across the comparison forms. Shipped by unifying the four NODE_IF narrowing tables into `vrp_parse_cmp`/`vrp_push_cmp_range` and calling that from the short-circuit RHS, the guard-inverse and the `else` branch — not as a second narrowing implementation |
 
 ### Quality / no-longer-silent (not soundness)
 
@@ -746,7 +744,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
    attempt, and what its new grid caught.
 5. **O3 is a PRECONDITION** for promoting the always-OOB verdict at short-circuit position.
    Main warns today, so O3 is precision-only — but it becomes required the moment that
-   verdict is tightened.
+   verdict is tightened. **(O3 DONE 2026-09-01, BUG-920 — the precondition is now met.)**
 
 ### Verification method (so a fresh session can reproduce this table)
 
@@ -1179,6 +1177,28 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 ## OPEN — 2026-09-01 audit residuals (LOW; measured, none a soundness hole)
 
 Found while auditing for BUG-913..918. Each is measured on the post-fix compiler.
+
+### VRP comparison narrowing computes `v - 1` / `v + 1` without an int64 extreme guard
+
+`vrp_push_cmp_range` (checker.c) derives `i < v` as `[INT64_MIN, v - 1]` and `i > v` as
+`[v + 1, INT64_MAX]`. At `v == INT64_MIN` and `v == INT64_MAX` those are signed overflow —
+UB in the compiler itself. Carried over verbatim from the four hand-written tables BUG-920
+replaced (the arithmetic is unchanged), so it is not a regression, but it now lives in one
+place and should be fixed there.
+
+Severity is LOW and the direction is OVER-rejection, not unsafety: both comparisons are
+unsatisfiable at those values (`i < INT64_MIN` and `i > INT64_MAX` can never hold), so the
+honest result is "unreachable" and the wrap would instead record a narrow range that could
+turn a later index into a spurious ALWAYS-OOB error. Reaching it also requires a ZER source
+literal of exactly ±2^63 in a comparison.
+
+Fix: skip the push in those two cases (no narrowing = conservative), rather than clamping —
+clamping would assert `i == INT64_MIN`, which is the wrong fact.
+
+```c
+case TOK_LT: if (v != INT64_MIN) push_var_range(c, k.var, k.var_len, INT64_MIN, v - 1, v <= 0); break;
+case TOK_GT: if (v != INT64_MAX) push_var_range(c, k.var, k.var_len, v + 1, INT64_MAX, v >= 0); break;
+```
 
 ### `*opaque` provenance is checked only through a GLOBAL, never through a local
 

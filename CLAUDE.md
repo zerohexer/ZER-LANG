@@ -147,14 +147,29 @@ never against current C).
 
 ### Critical Compiler-Implementation Gotchas (avoid wasted-cycle rediscovery)
 
-**Two emitter dispatch paths for intrinsics.** Every intrinsic needs a handler
-in BOTH `emitter.c` paths or the IR-rewriter falls through to a placeholder
-emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
-1. AST path — search `emitter.c` around line 2754 onward
-2. IR-rewritten path — search `emitter.c` around line 6451 onward
+**Two emitter dispatch paths for intrinsics — and which one actually matters
+(MEASURED 2026-09-01; the old blanket wording sent you looking for bugs that
+are not there).** There are two independent handler chains and neither calls the
+other (`emit_rewritten_node` contains ZERO `emit_expr` calls, verified):
+1. AST path — `emit_expr`, `emitter.c` ~2754 onward
+2. IR-rewritten path — `emit_rewritten_node`, `emitter.c` ~6451 onward
 
-When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
-`@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
+**FUNCTION BODIES ARE IR-ONLY**, so the IR handler is the one every expression in
+a body reaches. Of the ~155 intrinsic names the checker knows, **108 have a
+handler in the IR path ONLY, and that is correct** — probed in defer bodies,
+`@critical`, `@once`, orelse fallbacks, conditions, call args, array indices,
+spawn args and asm operands: zero `/* @name */` stubs in the emitted C. The AST
+path is reachable only from the few NON-body positions (global initialisers and
+a handful of emitter helpers), and a global initialiser rejects any intrinsic
+that is not constant-foldable, so most intrinsics cannot arrive there at all.
+
+So: a NEW intrinsic needs the **IR** handler. Add the AST one only if it can
+legitimately appear in a global initialiser (the foldable bit-query / byte-swap
+family — `@popcount`, `@bswap32`, … — is the set that does). `grep -n
+'"name"' emitter.c` showing ONE hit is NOT by itself a bug; check WHICH path it
+is in, and whether the other position is reachable for that intrinsic. The
+`emit_audit.sh` gate (dead-stub markers in emitted C) is what actually catches a
+missing handler.
 
 **`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
 `type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
@@ -391,6 +406,7 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 |---|---|---|
 | Escape / keep ("frame-bound?") | store-global, return, keep-call, keep-infer, struct-field-store, spawn-arg | `tools/sink_matrix.sh` — **ADD A CELL per new shape** (a shape with no cell is INVISIBLE; yd5ajq grew it 32→41). `make check-sink-matrix` |
 | VRP range JOIN (merge at a control-flow join) | NODE_IF (§C#13 ✅), switch-arm, for-body, while/do-while body, do-while first-iter, goto/label | mirror `vrp_snap_take/restore/join` per node-kind; a missing kind = silent OOB. NO auto-gate — checklist every control-flow kind |
+| **VRP entry STACK ("did this update reach the entry that OUTLIVES the branch?")** | `vrp_invalidate_for_assign`, `vrp_join_assign_range`, the three `&x` address-taken sites | **`tests/zer/vrp_narrow_assign_matrix.zer`** (14 cells: narrowing form x reassignment position, one canary, one invariant measurement). `push_var_range` APPENDS and `find_var_range` returns the NEWEST, so a variable has a STACK of entries and a branch's narrowing is POPPED at the join. Any update written to the newest entry alone is UNDONE by that pop and the stale pre-branch range resurfaces — VRP then "proves" an index it has no right to and the bounds guard is ELIDED (silent OOB write; BUG-913 / BUG-918, 13 of 14 cells were live). **Every VarRange update must sweep EVERY entry for the key** — union-widen for a value update (a shadowed same-named local must only lose precision), unconditional for the monotone `address_taken`. `vrp_mark_address_taken` is the one query for the latter |
 | Node-kind walkers (any `switch` on `->kind`/`->op`) | every safety walker | `-Werror=switch` + `tools/walker_default_audit.sh` — NO `default:`; a new kind FAILS the build (strongest, free) |
 | Type-kind dispatch (`->kind == TYPE_X`) | 600+ sites | `type_dispatch_kind()` (unwraps distinct) + `tools/audit_type_dispatch.sh` baseline — a new raw site FAILS the gate |
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
@@ -1668,8 +1684,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 572 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 682 | `tests/test_zer.sh` |
 | `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |

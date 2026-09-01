@@ -1,0 +1,40 @@
+// BUG-915 regression — a `comptime if` COMPARING a const.
+//
+// The condition was evaluated by the plain eval_const_expr, which cannot see a
+// NODE_IDENT at all; the three fallbacks only fired when the WHOLE condition was
+// a const ident or a resolved comptime call. So `comptime if (P)` compiled and
+// `comptime if (P == 4)` was rejected as "not a compile-time constant", though
+// the reference documents const conditions and comparisons alike. The scoped
+// evaluator resolves const idents (and enum variants) at any depth.
+
+comptime u32 BIT(u32 n) { return 1 << n; }
+
+const u32 GLOBAL_P = 4;
+enum Mode { off, on }
+
+u32 main() {
+    u32 f = 0;
+
+    // bare const ident (worked before)
+    comptime if (GLOBAL_P) { } else { f += 1; }
+
+    // const compared to a literal — the rejected shape
+    comptime if (GLOBAL_P == 4) { } else { f += 2; }
+    comptime if (GLOBAL_P > 3) { } else { f += 4; }
+
+    // local const whose init is a comptime call
+    const u32 P = BIT(2);
+    comptime if (P == 4) { } else { f += 8; }
+
+    // const on the right, and a compound expression of consts
+    comptime if (4 == GLOBAL_P) { } else { f += 16; }
+    comptime if (GLOBAL_P + P == 8) { } else { f += 32; }
+
+    // enum variant in a comptime condition
+    comptime if (Mode.on == 1) { } else { f += 64; }
+
+    // the false arm must still be the one that is stripped
+    comptime if (GLOBAL_P == 5) { f += 128; }
+
+    return f;
+}

@@ -1176,6 +1176,55 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — 2026-09-01 audit residuals (LOW; measured, none a soundness hole)
+
+Found while auditing for BUG-913..918. Each is measured on the post-fix compiler.
+
+### One unprovable index, TWO different runtime responses depending on the SPELLING
+
+`arr[i]` where `i` is a bare IDENT gets the **silent auto-guard** (`if (i >= N) return 0;`
+— the write simply does not happen). EVERY other spelling of the same unprovable index gets
+the **trap** (`_zer_bounds_check` -> `_zer_trap`). Measured, all writing index 4 into a
+4-wide array with a canary field after it:
+
+| index spelling | response |
+|---|---|
+| `g.a[i]` (ident) | silent auto-guard, write skipped, exit 0 |
+| `g.a[i + 0]` | TRAP (133) |
+| `g.a[x.v]` (struct field) | TRAP |
+| `g.a[four()]` | TRAP |
+| `g.a[src[0]]` | TRAP |
+| `g.a[(u32)i]` | TRAP |
+| `g.a[@truncate(u32, i)]` | TRAP |
+| `g.a[none() orelse four()]` | silent auto-guard |
+
+No cell corrupts memory, so this is NOT a safety hole — it is a CONSISTENCY one. The silent
+form is the surprising half: on bare metal a peripheral write that never happens has no
+fault to notice it by (the wording BUG-796 already uses for the MMIO sink). The auto-guard
+is a locked design decision (CLAUDE.md: "auto-guard is the fallback, not the goal"), so this
+is recorded rather than changed; a future decision to make the two agree should move the
+IDENT case to the trap, not the other way.
+
+Also recorded in reference.md so users are not surprised by a skipped write.
+
+### Declaration order: functions are order-free, TYPES are not
+
+Since BUG-914 a function may be called before its definition. A struct / enum / union /
+typedef / container must still be declared before first use — `struct A { B b; }` before
+`struct B` is *"undefined type 'B'"*. That is a clean, early diagnostic (not a silent gap),
+and the emitter's pass-1 type emission is in source order, so making types order-free means
+a topological sort of the type graph. Not attempted; documented in reference.md instead.
+
+### `@size(expr)` beyond a bare identifier
+
+BUG-917 made `@size(<ident>)` work for values as well as type names. A projection or a call
+(`@size(s.field)`, `@size(f())`) is still rejected with *"@size requires a type argument"*.
+The fix would be to resolve the operand's type for any expression the checker can type; the
+operand is never emitted, so `sizeof` would still evaluate nothing. Left as a clear
+rejection rather than a half-supported form.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a

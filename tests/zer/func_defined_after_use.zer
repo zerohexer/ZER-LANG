@@ -1,0 +1,45 @@
+// BUG-914 regression — declaration order must not matter.
+//
+// ZER's checker registers every top-level declaration before checking any body,
+// so calling a function defined LATER in the file type-checks. The emitter used
+// to emit definitions in source order with no prototypes, so GCC saw an implicit
+// declaration and then a conflicting definition: the program passed every ZER
+// check and failed to build. Nothing in the corpus called a later-defined
+// runtime function (only comptime ones, which are never emitted).
+//
+// Covers the shapes an implicit `int()` declaration would silently corrupt:
+// a wide return, a bool return, a struct return, a pointer/slice return and a
+// float return.
+
+struct Pair { u32 a; u32 b; }
+
+u32 main() {
+    u64 w = wide(1);
+    if (w != 0x100000002) { return 1; }
+    if (!flag(2)) { return 2; }
+    Pair p = mkpair();
+    if (p.a != 3) { return 3; }
+    if (p.b != 4) { return 4; }
+    const [*]u8 s = name();
+    if (s.len != 3) { return 5; }
+    if (s[0] != 122) { return 6; }        // 'z'
+    f64 f = ratio();
+    if (f < 0.4) { return 7; }
+    if (f > 0.6) { return 8; }
+    if (even(4) != 1) { return 9; }       // mutual recursion, both later-defined
+    return 0;
+}
+
+u64 wide(u32 x) { return 0x100000000 + x + 1; }
+
+bool flag(u32 x) { if (x > 1) { return true; } return false; }
+
+Pair mkpair() { Pair p; p.a = 3; p.b = 4; return p; }
+
+const [*]u8 name() { return "zer"; }
+
+f64 ratio() { return 0.5; }
+
+u32 even(u32 n) { if (n == 0) { return 1; } return odd(n - 1); }
+
+u32 odd(u32 n) { if (n == 0) { return 0; } return even(n - 1); }

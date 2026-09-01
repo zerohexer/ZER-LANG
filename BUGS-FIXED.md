@@ -5,6 +5,140 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-01 — BUG-913..919: two VRP soundness holes, and three programs the checker accepted that GCC refused
+
+A full-tree audit. Seven fixes, each reproduced on main FIRST, and each of the six that
+change compiled behaviour has a test that FAILS on the pre-fix compiler. Two are silent
+memory corruption; three are "the checker said yes and the build died"; one is an
+over-rejection of a documented feature; one is a wrong diagnostic.
+
+The two VRP holes are the same shape on two axes, and the shape is worth naming because it
+is NOT the usual multi-site patchwork: `push_var_range` APPENDS a range entry rather than
+mutating, and `find_var_range` returns the MOST RECENT one. A variable therefore has a
+STACK of entries — one from its declaration, one per condition-derived narrowing — and the
+branch handler pops the narrowing at the join. Any update that writes only the newest entry
+is UNDONE by that pop, and the older, pre-branch entry resurfaces as if the update never
+happened. Two updates had exactly that bug.
+
+### BUG-913 — an assignment inside a comparison-narrowed `if` left the narrowed range live (CRITICAL, silent OOB write)
+```zer
+u32 i = 0;
+if (i == 0) { i = 100; }   // narrowing entry pushed for `i`, then mutated, then POPPED
+arr[i] = 7;                // VRP still "proves" i == 0 -> bounds guard ELIDED
+```
+The store compiled to a raw `arr[i] = 7`. No diagnostic, no warning, no trap — measured
+against a 4-element array inside a struct: the write landed on the field after it and
+returned the corrupted value (exit 231 for a canary of 5).
+
+`vrp_invalidate_for_assign` updated only `find_var_range`'s (newest) entry. The `if`
+handler's own snapshot/JOIN cannot see it either: that machinery snapshots entries
+`[0, saved_range_count)` and the mutation landed ABOVE that mark.
+
+Fix: an assignment KILLS every prior fact about the variable, so the update now sweeps every
+OLDER entry for the same key and UNIONS the assigned range into it. A union rather than an
+overwrite because two entries sharing a name may be different variables (an inner block
+shadowing an outer one) — a union can only widen, so precision at worst, never an unsound
+narrowing. The same sweep is applied to `vrp_join_assign_range` (the loop-body pre-pass).
+
+Scope, measured with the new matrix: **13 of its 14 cells had NO bounds guard before the
+fix**; only the else-branch spelling was safe. The narrowing forms `==`, `!=`, `<`, `<=`,
+`>`, `>=` and const-on-the-left all leaked, as did reassignment from a nested `if`, a `for`
+body, a `while` body, a `switch` arm, a compound `+=` and a call result.
+
+Tests: `tests/zer/vrp_narrowed_var_reassigned_in_branch.zer` (canary),
+`tests/zer/vrp_narrow_assign_matrix.zer` (the 14-cell gate — one invariant measurement, no
+per-cell table, in the style of the defer x goto matrix).
+
+### BUG-918 — `&x` inside a narrowed branch did not invalidate the outer range (CRITICAL, silent OOB write)
+```zer
+u32 i = 0;
+if (i == 0) { *u32 p = &i; *p = 4; }   // value changed THROUGH the alias
+g.a[i] = 999;                          // "proven" i == 0 -> guard elided
+```
+Same stack, other axis. `address_taken` is a MONOTONE, permanent invalidation (the branch
+snapshot deliberately never restores it), but all three `&x` sites set it on the newest
+entry only — the branch's narrowing — which the join then dropped. Canary corrupted,
+silently.
+
+Fix: ONE helper `vrp_mark_address_taken` sets the flag (and the full range) on EVERY live
+entry for the name; all three sites call it. `bump(&i)` (address escaping through a call
+arg) was already safe, which is why this survived: only the direct-write spelling was live.
+
+### BUG-914 — calling a function defined LATER in the file did not build
+```zer
+u32 main() { return helper(3); }
+u32 helper(u32 x) { return 0; }     // GCC: implicit declaration, then conflicting types
+```
+ZER's checker registers every top-level declaration before checking any body, so this
+type-checks; the emitter emitted definitions in source order with NO prototypes. The result
+was a program that passed every ZER check and then died in GCC, pointing at generated code
+through a `#line` into the user's source. Nothing in the corpus called a later-defined
+RUNTIME function — the nine files with a definition after `main` all define `comptime`
+functions, which are never emitted — which is exactly why a language-level property nobody
+would think to test stayed broken.
+
+Fix: a prototype pass before any body, in BOTH emit paths (preamble and `--lib`), mirroring
+the definition's signature exactly — attributes (`static` must match), module mangling,
+variadics, and the funcptr-returning declarator. That last one is now ONE query
+(`func_return_funcptr`) shared with `emit_regular_func_from_ir`, because a prototype that
+disagreed with its definition about the declarator shape would itself be a C error.
+`main` is skipped (its C signature is rewritten by the void->int promotion) and so are
+`async` functions (emitted as a state struct + `_init`/`_poll`, not as this signature).
+
+Test: `tests/zer/func_defined_after_use.zer` — wide, bool, struct, slice and float returns
+plus mutual recursion, all defined after `main`.
+
+### BUG-916 — `@bitcast` with a bare ARRAY operand (one silent miscompile, one build failure)
+```zer
+u64 v = @bitcast(u64, raw);        // raw is u32[2] — compiled CLEAN, and was WRONG
+i32[2] c = @bitcast(i32[2], raw);  // emitted `int32_t[2] tmp;` — invalid C
+```
+C has no array rvalue and the emission builds one. The SOURCE direction is the dangerous
+half: `__auto_type in = raw;` DECAYS the array to a pointer, so the `memcpy` copied the
+POINTER VALUE — the u64 came back holding a stack address presented as data, with no
+diagnostic at compile time and no fault at run time. The TARGET direction produced a
+declaration GCC rejects, and the enum-array variant guard emitted the same shape.
+
+Fix: reject a bare array on either side, naming the two things that DO work (wrap the array
+in a struct and bitcast that; or `@pun(*T, &arr)` to reinterpret in place). A struct or
+pointer operand is a real C value and is unaffected — `@bitcast(B, a)` where `B` holds the
+array still works. Zero corpus uses of an array operand.
+
+Tests: `tests/zer_fail/bitcast_bare_array_target.zer`, `bitcast_bare_array_source.zer`.
+
+### BUG-917 — `@size(x)` on a VALUE emitted `sizeof(struct x)`
+The emitter's ident branch looked the name up in the GLOBAL scope and, finding nothing,
+emitted `sizeof(struct <name>)` — a struct tag that does not exist:
+```zer
+u8[8] arr;  @size(arr)   ->   sizeof(struct arr)   // "incomplete type"
+```
+A GLOBAL of the same shape had always worked (the lookup succeeds and the symbol's TYPE is
+emitted), so the two spellings disagreed for no reason. Fix: the checker resolves the
+operand to a Type and both emitter paths prefer it; a type NAME is a symbol carrying its own
+Type, so the same lookup answers `@size(TypeName)` identically. One query, both meanings.
+The operand is never emitted, so `sizeof` still evaluates nothing.
+
+Test: `tests/zer/size_of_value.zer` (type names, globals, locals, a parameter, an array, a
+struct, a slice).
+
+### BUG-919 — `zerc -o out.c file.zer` blamed the wrong token
+The option scan starts at `argv[2]`, so the FIRST argument is taken as the source path
+whatever it looks like: a leading flag became the "input file" and the next token was
+reported as *"unknown option 'out.c'"*. Now a leading `-` says what is actually wrong and
+prints the usage line. Positional order is unchanged — this only fixes the diagnostic.
+
+### BUG-915 — `comptime if (P == 4)` rejected while `comptime if (P)` compiled
+The condition was evaluated by the plain `eval_const_expr`, which cannot see a `NODE_IDENT`
+at all; the three fallbacks below it only fired when the WHOLE condition was a const ident
+or a resolved comptime call. So the bare const compiled and every COMPARISON of a const was
+rejected as "not a compile-time constant", though reference.md documents const conditions
+and comparisons alike. Fix: use `eval_const_expr_scoped`, which already resolves const
+idents and enum-variant fields at any depth — one evaluator, every position.
+
+Test: `tests/zer/comptime_if_const_compare.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

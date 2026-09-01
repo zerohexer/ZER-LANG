@@ -1,0 +1,40 @@
+// BUG-917 regression — `@size(x)` on a VALUE.
+//
+// The emitter's ident branch looked the name up in the GLOBAL scope only and,
+// finding nothing, emitted `sizeof(struct <name>)`. A GLOBAL therefore worked
+// and the identical LOCAL emitted a struct tag that does not exist:
+// "invalid application of sizeof to incomplete type" — accepted by the checker,
+// rejected by GCC. Both spellings now resolve the operand's TYPE.
+
+struct S { u32 a; u32 b; }
+
+S gs;
+u32 gv = 0;
+u8[8] gbuf;
+
+u32 main() {
+    // type names (always worked)
+    if (@size(S) != 8) { return 1; }
+    if (@size(u32) != 4) { return 2; }
+
+    // globals (worked by accident — the global lookup found the symbol)
+    if (@size(gs) != 8) { return 3; }
+    if (@size(gv) != 4) { return 4; }
+    if (@size(gbuf) != 8) { return 5; }
+
+    // locals — these are the ones that emitted `sizeof(struct <name>)`
+    u32 x = 0;
+    S s;
+    u8[8] arr;
+    [*]u8 sl = arr[0..8];
+    if (@size(x) != 4) { return 6; }
+    if (@size(s) != 8) { return 7; }
+    if (@size(arr) != 8) { return 8; }
+    if (@size(sl) == 0) { return 9; }     // slice = {ptr,len}, size is target-dependent
+
+    // a parameter is a local too
+    if (psize(x) != 4) { return 10; }
+    return 0;
+}
+
+usize psize(u32 p) { return @size(p); }

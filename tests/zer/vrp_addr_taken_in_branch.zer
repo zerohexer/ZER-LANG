@@ -1,0 +1,41 @@
+// BUG-918 regression — `&x` inside a narrowed branch.
+//
+// `address_taken` is a MONOTONE, permanent VRP invalidation, but all three `&x`
+// sites set it on the MOST RECENT range entry only. Inside a branch that
+// narrowed the same variable, that entry is the branch's PUSHED narrowing,
+// which the join drops — so the older entry survived with address_taken CLEAR
+// and its pre-branch range intact, and the bounds guard was elided. The write
+// through the alias then landed past the array with no diagnostic and no trap.
+//
+// Discriminating: on the pre-fix compiler `poke()` overwrites `g.tail`.
+
+struct Frame { u32[4] a; u32 tail; }
+Frame g;
+
+void poke() {
+    u32 i = 0;
+    if (i == 0) { *u32 p = &i; *p = 4; }   // written THROUGH the alias
+    g.a[i] = 999;
+}
+
+void poke_field() {
+    u32 j = 0;
+    if (j < 2) { *u32 q = &j; *q = 4; }
+    g.a[j] = 888;
+}
+
+void bump(*u32 q) { *q = 4; }
+
+void poke_call() {
+    u32 k = 0;
+    if (k == 0) { bump(&k); }              // address escaping through a call arg
+    g.a[k] = 777;
+}
+
+u32 main() {
+    g.tail = 5;
+    poke();      if (g.tail != 5) { return 1; }
+    poke_field();if (g.tail != 5) { return 2; }
+    poke_call(); if (g.tail != 5) { return 3; }
+    return 0;
+}

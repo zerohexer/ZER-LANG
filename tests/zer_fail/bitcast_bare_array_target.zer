@@ -1,0 +1,9 @@
+// expect-error: @bitcast cannot reinterpret a bare array
+// BUG-916 — an ARRAY target emitted the illegal C declaration `int32_t[2] tmp;`,
+// so a program the checker ACCEPTED failed to build.
+u32 main() {
+    u32[2] raw;
+    raw[0] = 7;
+    i32[2] cs = @bitcast(i32[2], raw);
+    return cs[0];
+}

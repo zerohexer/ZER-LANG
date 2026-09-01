@@ -1,0 +1,64 @@
+// VRP NARROW x REASSIGN matrix (BUG-913 gate).
+//
+// One question — "after a branch that NARROWED a variable, does the analysis
+// still believe the narrowed range once the branch REASSIGNED it?" — asked at
+// every narrowing form and every reassignment position. The answer must always
+// be "no": the index is unknown at the merge, so the bounds guard must stay.
+//
+// The measurement is INVARIANT across the axes (CLAUDE.md's value-matrix rule):
+// every cell writes at `g.a[i]` where the array is 4 wide and every path sets
+// `i = 4`, so a guard that fires leaves `g.tail` untouched and a guard that was
+// ELIDED overwrites it. One canary, one expected value, no per-cell table.
+//
+// Pre-fix, the `==` / `<` / `!=` / nested / for-body / while-body cells all
+// corrupted the canary. Add a cell whenever a new narrowing form or a new
+// control-flow kind learns to narrow.
+
+struct Frame { u32[4] a; u32 tail; }
+Frame g;
+
+
+// --- axis 1: the narrowing form (then-branch reassignment) ---
+void c_eq()   { u32 i = 0; if (i == 0) { i = 4; } g.a[i] = 1; }
+void c_ne()   { u32 i = 1; if (i != 0) { i = 4; } g.a[i] = 1; }
+void c_lt()   { u32 i = 0; if (i < 2)  { i = 4; } g.a[i] = 1; }
+void c_lte()  { u32 i = 0; if (i <= 2) { i = 4; } g.a[i] = 1; }
+void c_gt()   { u32 i = 3; if (i > 1)  { i = 4; } g.a[i] = 1; }
+void c_gte()  { u32 i = 3; if (i >= 1) { i = 4; } g.a[i] = 1; }
+void c_rhs()  { u32 i = 0; if (0 == i) { i = 4; } g.a[i] = 1; }
+
+// --- axis 2: where the reassignment sits ---
+void c_else()    { u32 i = 0; if (i == 9) { i = 1; } else { i = 4; } g.a[i] = 1; }
+void c_nested()  { u32 i = 0; if (i == 0) { if (i == 0) { i = 4; } } g.a[i] = 1; }
+void c_forbody() { u32 i = 0; if (i == 0) { for (u32 k = 0; k < 1; k += 1) { i = 4; } } g.a[i] = 1; }
+void c_while()   { u32 i = 0; if (i == 0) { u32 k = 0; while (k < 1) { i = 4; k += 1; } } g.a[i] = 1; }
+void c_switch()  { u32 i = 0; if (i == 0) { switch (i) { 0 => { i = 4; } default => { i = 1; } } } g.a[i] = 1; }
+void c_compound(){ u32 i = 0; if (i == 0) { i += 4; } g.a[i] = 1; }
+void c_call()    { u32 i = 0; if (i == 0) { i = four(); } g.a[i] = 1; }
+
+// NOT a cell: a struct-FIELD index key (`if (x.v == 0) { x.v = 4; } g.a[x.v]`)
+// emits the TRAP form (`_zer_bounds_check`) rather than the silent auto-guard,
+// so it cannot share this matrix's "returns 0" measurement. It is covered by
+// that trap; the two runtime responses to one unprovable index are recorded in
+// docs/limitations.md.
+
+u32 four() { return 4; }
+
+u32 main() {
+    g.tail = 5;
+    c_eq();    if (g.tail != 5) { return 1; }
+    c_ne();    if (g.tail != 5) { return 2; }
+    c_lt();    if (g.tail != 5) { return 3; }
+    c_lte();   if (g.tail != 5) { return 4; }
+    c_gt();    if (g.tail != 5) { return 5; }
+    c_gte();   if (g.tail != 5) { return 6; }
+    c_rhs();   if (g.tail != 5) { return 7; }
+    c_else();  if (g.tail != 5) { return 8; }
+    c_nested();if (g.tail != 5) { return 9; }
+    c_forbody();if (g.tail != 5) { return 10; }
+    c_while(); if (g.tail != 5) { return 11; }
+    c_switch();if (g.tail != 5) { return 12; }
+    c_compound();if (g.tail != 5) { return 13; }
+    c_call();  if (g.tail != 5) { return 14; }
+    return 0;
+}

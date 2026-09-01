@@ -3330,11 +3330,18 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_type(e, t);
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
-                /* named type passed as identifier (e.g. @size(MyStruct)) */
-                Symbol *sym = scope_lookup(e->checker->global_scope,
-                    node->intrinsic.args[0]->ident.name,
-                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                if (sym && sym->type) emit_type(e, sym->type);
+                /* BUG-917: the checker resolves the operand (a type NAME or a
+                 * VALUE, local or global) to a Type — prefer it. Falls back to
+                 * the global-scope lookup only when nothing was resolved. */
+                Type *at = checker_get_type(e->checker, node->intrinsic.args[0]);
+                if (at) {
+                    emit_type(e, at);
+                } else {
+                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                        node->intrinsic.args[0]->ident.name,
+                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                    if (sym && sym->type) emit_type(e, sym->type);
+                }
             }
             emit(e, ")");
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
@@ -4734,6 +4741,105 @@ static void emit_func_attributes(Emitter *e, Node *fn) {
     }
 }
 
+/* Does this function RETURN a function pointer (C's nested-paren declarator
+ * form `RET (*name(params))(fp_args)`)?  Returns the funcptr type, or NULL.
+ *
+ * ONE query, called by the prototype pass AND by emit_regular_func_from_ir:
+ * the two must agree on the declarator shape or the prototype and definition
+ * are different declarations of the same name. Unwraps `distinct` so a
+ * `distinct typedef` funcptr return is answered the same way at both sites. */
+static Type *func_return_funcptr(Type *ret) {
+    if (!ret || type_dispatch_kind(ret) != TYPE_FUNC_PTR) return NULL;
+    return type_unwrap_distinct(ret);
+}
+
+/* BUG-914 (2026-09-01) — C PROTOTYPE PASS.
+ *
+ * ZER is declaration-order-independent: the checker registers every top-level
+ * decl before checking any body, so `main` may call a helper defined further
+ * down the file. C is not, and the emitter emitted definitions in source order
+ * with NO prototypes — so that program passed every ZER check and then died in
+ * GCC with "implicit declaration" + "conflicting types", pointing at generated
+ * code through a #line into the user's source. The whole test corpus defines
+ * helpers ABOVE their callers, which is why it never showed up.
+ *
+ * This emits the signature of every bodied function before any body, mirroring
+ * emit_regular_func_from_ir's signature exactly (attributes, funcptr-returning
+ * form, module mangling). Duplicating a user-written forward declaration is
+ * harmless — C allows repeated identical declarations.
+ *
+ * Skipped: comptime (never emitted), async (emitted as a state struct +
+ * _init/_poll, not as this signature), and `main` (its C signature is rewritten
+ * by the void->int promotion, and nothing may call it before its definition). */
+static void emit_func_prototype(Emitter *e, Node *fn) {
+    if (!fn || fn->kind != NODE_FUNC_DECL) return;
+    if (!fn->func_decl.body) return;               /* bodyless: emitted as-is */
+    if (fn->func_decl.is_comptime || fn->func_decl.is_async) return;
+    if (fn->func_decl.name_len == 4 &&
+        memcmp(fn->func_decl.name, "main", 4) == 0) return;
+
+    Type *func_type = checker_get_type(e->checker, fn);
+    Type *ft_eff = func_type ? type_unwrap_distinct(func_type) : NULL;
+    Type *ret = (ft_eff && type_dispatch_kind(ft_eff) == TYPE_FUNC_PTR)
+        ? ft_eff->func_ptr.ret : NULL;
+    /* ONE query, shared with the definition emitter — a prototype that disagreed
+     * with its definition about the funcptr-return form would be a C error. */
+    Type *retfp = func_return_funcptr(ret);
+    bool ret_is_funcptr = (retfp != NULL);
+
+    emit_func_attributes(e, fn);   /* `static` MUST match the definition */
+    if (ret_is_funcptr) {
+        emit_type(e, retfp->func_ptr.ret);
+        emit(e, " (*");
+    } else if (ret) {
+        emit_type(e, ret);
+        emit(e, " ");
+    } else {
+        emit(e, "void ");
+    }
+    EMIT_MANGLED_NAME(e, fn->func_decl.name, fn->func_decl.name_len);
+    emit(e, "(");
+    if (fn->func_decl.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            ParamDecl *p = &fn->func_decl.params[i];
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                           (uint32_t)i < func_type->func_ptr.param_count)
+                ? func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            emit_type_and_name(e, ptype, p->name, p->name_len);
+        }
+        if (fn->func_decl.is_variadic) emit(e, ", ...");
+    }
+    emit(e, ")");
+    if (ret_is_funcptr) {
+        emit(e, ")(");
+        for (uint32_t i = 0; i < retfp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, retfp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+    }
+    emit(e, ";\n");
+}
+
+static void emit_func_prototypes(Emitter *e, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    bool any = false;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL) continue;
+        if (!d->func_decl.body) continue;
+        if (d->func_decl.is_comptime || d->func_decl.is_async) continue;
+        if (d->func_decl.name_len == 4 &&
+            memcmp(d->func_decl.name, "main", 4) == 0) continue;
+        if (!any) { emit(e, "\n/* ZER function prototypes */\n"); any = true; }
+        emit_func_prototype(e, d);
+    }
+    if (any) emit(e, "\n");
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
     ZTRACE("EMIT  function '%.*s'", (int)node->func_decl.name_len, node->func_decl.name);
 
@@ -5492,6 +5598,9 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
 
         /* Emit stamped container struct declarations */
         emit_container_structs(e);
+
+        /* BUG-914: prototypes before any body (declaration-order independence) */
+        emit_func_prototypes(e, file_node);
 
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
@@ -6302,6 +6411,9 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         }
         emit(e, "\n");
     }
+
+    /* BUG-914: prototypes before any body (declaration-order independence) */
+    emit_func_prototypes(e, file_node);
 
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);
@@ -7892,6 +8004,15 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     Type *t = resolve_type_for_emit(e, ta);
                     if (t) emit_type(e, t);
                 }
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT &&
+                       checker_get_type(e->checker, node->intrinsic.args[0])) {
+                /* BUG-917: operand resolved by the checker — a type NAME or a
+                 * VALUE (local or global). emit_type handles struct/union tags,
+                 * module prefixes and array dimensions uniformly. Without this a
+                 * LOCAL fell through to the `struct <name>` guess below and
+                 * emitted `sizeof(struct arr)` for `u8[8] arr`. */
+                emit_type(e, checker_get_type(e->checker, node->intrinsic.args[0]));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* @size(TypeName) — type name passed as ident arg */
@@ -12831,13 +12952,16 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
          * Without this branch, emitter would produce invalid C like
          * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+        /* ONE query, shared with the prototype pass (func_return_funcptr) so the
+         * two can never disagree about the declarator shape. */
+        Type *retfp = main_promote ? NULL : func_return_funcptr(ret);
+        bool ret_is_funcptr = (retfp != NULL);
 
         if (main_promote) {
             emit(e, "int ");
         } else if (ret_is_funcptr) {
             /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
+            emit_type(e, retfp->func_ptr.ret);
             emit(e, " (*");
         } else if (ret) {
             emit_type(e, ret);
@@ -12876,9 +13000,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* Close funcptr-return form: )(fp_args) */
         if (ret_is_funcptr) {
             emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+            for (uint32_t i = 0; i < retfp->func_ptr.param_count; i++) {
                 if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
+                emit_type(e, retfp->func_ptr.params[i]);
             }
             emit(e, ")");
         }

@@ -1,0 +1,43 @@
+// BUG-913 regression — VRP stale-narrowing sweep.
+//
+// `if (i == 0) { i = 100; }` pushes a narrowing entry for `i`; the assignment
+// inside the branch updated only that PUSHED entry, which the branch join then
+// popped, so the older pre-branch entry (still [0,0]) survived and VRP "proved"
+// the later index in range. The bounds guard was ELIDED and the store compiled
+// to a raw `a[i] = ...` — a silent out-of-bounds write with no diagnostic and
+// no trap.
+//
+// Discriminating: on the pre-fix compiler `poke()` overwrites `g.tail`
+// (adjacent to the 4-element array) and this test exits 1.
+
+struct Frame { u32[4] a; u32 tail; }
+Frame g;
+
+void poke() {
+    u32 i = 0;
+    if (i == 0) { i = 4; }      // narrowed var reassigned inside the branch
+    g.a[i] = 999;               // must be guarded (i is 4, array is 4 wide)
+}
+
+void poke_lt() {
+    u32 j = 0;
+    if (j < 2) { j = 4; }
+    g.a[j] = 888;
+}
+
+void poke_nested() {
+    u32 k = 0;
+    if (k == 0) { if (k == 0) { k = 4; } }
+    g.a[k] = 777;
+}
+
+u32 main() {
+    g.tail = 5;
+    poke();
+    if (g.tail != 5) { return 1; }
+    poke_lt();
+    if (g.tail != 5) { return 2; }
+    poke_nested();
+    if (g.tail != 5) { return 3; }
+    return 0;
+}

@@ -241,6 +241,18 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* BUG-919 (2026-09-01): the option scan below starts at argv[2], so the FIRST
+     * argument is taken as the source path whatever it looks like. `zerc -o out.c
+     * f.zer` therefore reported *"unknown option 'out.c'"* — a diagnostic naming
+     * the wrong token, for a spelling every other compiler accepts. Say what is
+     * actually wrong instead of guessing at a file named "-o". */
+    if (argv[1][0] == '-') {
+        fprintf(stderr, "error: the input file must come FIRST, before any option "
+                        "('%s' looks like an option)\n"
+                        "usage: zerc <file.zer> [options]   (try --help)\n", argv[1]);
+        return 1;
+    }
+
     const char *input_path = argv[1];
     const char *output_path = NULL;
     bool do_run = false;

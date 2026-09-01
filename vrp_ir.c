@@ -34,10 +34,24 @@
  * architectural direction (per-block ranges with a real JOIN retire the
  * per-node-kind snapshot/restore patchwork that CLAUDE.md lists as a
  * multi-site class with NO automated gate). This file is the started sketch of
- * that. What has NOT survived is the urgency: its original headline
- * justification — that it retires a live under-rejection — was BH-18 #2, fixed
- * 2026-06-26, and 13 probes since then show every post-join index correctly
- * auto-guarded.
+ * that. Its original headline justification — that it retires a live
+ * under-rejection — was BH-18 #2, fixed 2026-06-26; a probe round after that
+ * found every post-join index correctly auto-guarded, and this comment used to
+ * conclude from it that the urgency was gone.
+ *
+ * THAT CONCLUSION WAS WRONG, and the correction is the reason to read this
+ * paragraph. 2026-09-01 found TWO more live holes in the same patchwork
+ * (BUG-913, BUG-918), both silent out-of-bounds writes with no diagnostic and
+ * no trap. Both come from the shape a per-block VRP does not have: ranges live
+ * on an APPEND-ONLY STACK of entries, a branch PUSHES a narrowing, and any
+ * update that reaches only the newest entry is undone when the join pops it.
+ * A measured 13 of 14 narrow-then-reassign spellings had NO bounds guard.
+ *
+ * So the urgency is real, and the earlier probe round is a lesson in what a
+ * probe round proves: it sampled the shapes someone thought of, and the two
+ * live ones — reassigning the narrowed variable, and writing it through `&x` —
+ * were not among them. `tests/zer/vrp_narrow_assign_matrix.zer` is the gate
+ * that now crosses those axes; a CFG-based VRP has to keep it green.
  *
  * If you wire it: add it to BOTH Makefile source lists, give it a caller, and
  * treat every function here as UNTESTED code being introduced for the first

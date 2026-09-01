@@ -858,6 +858,8 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
+static void vrp_mark_address_taken(Checker *c, const char *name, uint32_t name_len,
+                                   bool create_if_absent);
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
@@ -5887,23 +5889,11 @@ static Type *check_expr(Checker *c, Node *node) {
                      * unreliable — pointer writes can change value at any time.
                      * Covers ALL paths: var-decl init, assignment, call args,
                      * struct field store, return. Single check point = 100%. */
-                    {
-                        struct VarRange *r = find_var_range(c,
-                            root->ident.name, (uint32_t)root->ident.name_len);
-                        if (r) {
-                            r->min_val = INT64_MIN;
-                            r->max_val = INT64_MAX;
-                            r->known_nonzero = false;
-                            r->address_taken = true;
-                        } else {
-                            push_var_range(c, root->ident.name,
-                                (uint32_t)root->ident.name_len,
-                                INT64_MIN, INT64_MAX, false);
-                            r = find_var_range(c, root->ident.name,
-                                (uint32_t)root->ident.name_len);
-                            if (r) r->address_taken = true;
-                        }
-                    }
+                    /* BUG-918: ONE query — marks EVERY live entry for the
+                     * name, so a branch-pushed narrowing being popped cannot
+                     * resurrect a stale, un-invalidated range. */
+                    vrp_mark_address_taken(c, root->ident.name,
+                                           (uint32_t)root->ident.name_len, true);
                     /* BUG-208: block &union_var inside mutable capture arm. */
                     if (c->union_switch_var &&
                         root->ident.name_len == c->union_switch_var_len &&
@@ -9134,13 +9124,13 @@ static Type *check_expr(Checker *c, Node *node) {
                     else operand = operand->index_expr.object;
                 }
                 if (operand && operand->kind == NODE_IDENT) {
-                    struct VarRange *r = find_var_range(c, operand->ident.name,
-                        (uint32_t)operand->ident.name_len);
-                    if (r) {
-                        r->min_val = INT64_MIN;
-                        r->max_val = INT64_MAX;
-                        r->known_nonzero = false;
-                    }
+                    /* BUG-918: ONE query. This used to widen only the NEWEST
+                     * range entry, which a branch-pushed narrowing hides — the
+                     * same stale-entry shape the `&x` expression handler had.
+                     * (That handler already fires for this expression, so this
+                     * is defence in depth, not the primary route.) */
+                    vrp_mark_address_taken(c, operand->ident.name,
+                                           (uint32_t)operand->ident.name_len, false);
                 }
             }
         }
@@ -10393,6 +10383,34 @@ static Type *check_expr(Checker *c, Node *node) {
             /* BUG-231/320: reject @size(void) and @size(opaque) — no meaningful size.
              * Unwrap distinct first (BUG-320: distinct typedef void still has no size).
              * Check both type_arg path AND expression arg path (named types parsed as ident). */
+            /* BUG-917 (2026-09-01): `@size(x)` where x is a VALUE, not a type.
+             *
+             * The emitter's ident branch looked the name up in the GLOBAL scope
+             * and, finding nothing, emitted `sizeof(struct <name>)`. For a LOCAL
+             * that is a struct tag which does not exist:
+             *
+             *     u8[8] arr;  @size(arr)  ->  sizeof(struct arr)
+             *
+             * "invalid application of sizeof to incomplete type" — a program the
+             * checker ACCEPTED, failing in GCC. A GLOBAL of the same shape has
+             * always worked (the lookup succeeds and the symbol's TYPE is
+             * emitted), so the two spellings disagreed for no reason.
+             *
+             * Resolving the operand's type here makes them agree: the emitter
+             * prefers this typemap entry and emits `sizeof(<type>)`. A type NAME
+             * is registered as a symbol carrying its own Type, so the same lookup
+             * answers `@size(TypeName)` identically — one query, both meanings.
+             * The operand is never emitted, so `sizeof` still evaluates nothing. */
+            if (!node->intrinsic.type_arg && node->intrinsic.arg_count > 0 &&
+                node->intrinsic.args[0] &&
+                node->intrinsic.args[0]->kind == NODE_IDENT &&
+                !typemap_get(c, node->intrinsic.args[0])) {
+                Symbol *ssym = scope_lookup(c->current_scope,
+                    node->intrinsic.args[0]->ident.name,
+                    (uint32_t)node->intrinsic.args[0]->ident.name_len);
+                if (ssym && ssym->type && !ssym->is_function)
+                    checker_set_type(c, node->intrinsic.args[0], ssym->type);
+            }
             {
                 Type *st = NULL;
                 if (node->intrinsic.type_arg)
@@ -10741,6 +10759,39 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (tw > 0 && vw > 0 && zer_bitcast_width_valid(vw, tw) == 0) {
                         checker_error(c, node->loc.line,
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
+                    }
+                    /* BUG-916 (2026-09-01): a BARE ARRAY on either side.
+                     *
+                     * C has no array rvalue, and the emitted form is a statement
+                     * expression that builds one. Both directions were broken and
+                     * neither was diagnosed:
+                     *
+                     *   ARRAY TARGET  — `i32[2] c = @bitcast(i32[2], raw);` emits
+                     *     the illegal declaration `int32_t[2] _zer_bco0;`, so a
+                     *     program the checker ACCEPTED failed to build (and the
+                     *     enum-array variant guard emitted the same shape).
+                     *   ARRAY SOURCE  — `u64 v = @bitcast(u64, raw);` is WORSE: it
+                     *     compiles, and `__auto_type in = raw;` DECAYS the array to
+                     *     a pointer, so the memcpy copies the POINTER VALUE. The
+                     *     result is a stack address silently presented as data —
+                     *     a wrong answer and an address leak, with no diagnostic at
+                     *     compile time and no fault at run time. Measured.
+                     *
+                     * Rejecting is the whole fix: a struct or a pointer operand is a
+                     * real C value and keeps working (`@bitcast(B, a)` where B holds
+                     * the array, or `@pun(*B, &arr)` for the reinterpret-in-place
+                     * reading). Zero corpus uses of an array operand. */
+                    {
+                        bool t_arr = result && type_dispatch_kind(result) == TYPE_ARRAY;
+                        bool v_arr = val_type && type_dispatch_kind(val_type) == TYPE_ARRAY;
+                        if (t_arr || v_arr) {
+                            checker_error(c, node->loc.line,
+                                "@bitcast cannot reinterpret a bare array (%s side) — "
+                                "C has no array value, so the bits are not what gets "
+                                "copied. Wrap the array in a struct and bitcast that, "
+                                "or use @pun(*T, &arr) to reinterpret in place",
+                                t_arr ? "target" : "source");
+                        }
                     }
                     /* BUG-341: volatile stripping via @bitcast (same as @ptrcast BUG-258) */
                     check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
@@ -14450,7 +14501,16 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->if_stmt.is_comptime) {
             /* type-check the condition first so comptime calls get resolved */
             check_expr(c, node->if_stmt.cond);
-            int64_t cval = eval_const_expr(node->if_stmt.cond);
+            /* BUG-915 (2026-09-01): use the SCOPED evaluator, which resolves
+             * `const` identifiers and enum-variant fields at ANY depth. The
+             * plain eval_const_expr cannot see a NODE_IDENT at all, and the
+             * three fallbacks below only ever fired when the whole condition
+             * WAS that shape — so `comptime if (P)` worked while
+             * `comptime if (P == 4)` was rejected as "not a compile-time
+             * constant", though reference.md documents const conditions and
+             * comparisons alike. One evaluator, every position; the fallbacks
+             * stay as a belt for shapes the scoped evaluator declines. */
+            int64_t cval = eval_const_expr_scoped(c, node->if_stmt.cond);
             if (cval == CONST_EVAL_FAIL) {
                 /* try resolved comptime call: comptime if (FUNC()) */
                 if (node->if_stmt.cond->kind == NODE_CALL &&
@@ -19529,6 +19589,50 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     r->address_taken = false;
 }
 
+/* BUG-918 (2026-09-01): `&x` permanently invalidates VRP for x — mark EVERY
+ * live entry, not just the newest.
+ *
+ * Same shape as BUG-913's stale-narrowing sweep, on the other axis. The three
+ * `&x` sites each took `find_var_range` (the MOST RECENT entry) and set
+ * address_taken on it. Inside a branch that narrowed the same variable, the most
+ * recent entry is the branch's PUSHED narrowing — dropped at the join — so the
+ * older entry survived with address_taken CLEAR and its pre-branch range intact:
+ *
+ *     u32 i = 0;
+ *     if (i == 0) { *u32 p = &i; *p = 4; }   // written through the alias
+ *     g.a[i] = 999;                          // "proven" i == 0 -> guard elided
+ *
+ * Measured: the store landed past a 4-element array and overwrote the field
+ * after it, with no diagnostic and no trap.
+ *
+ * address_taken is a MONOTONE, permanent invalidation (vrp_snap_restore/join
+ * deliberately never restore it), so setting it on every entry for the name is
+ * exactly right; the accompanying full-range widening can only ADD guards. A
+ * same-named variable in an outer scope is widened too — precision, never
+ * soundness. */
+static void vrp_mark_address_taken(Checker *c, const char *name, uint32_t name_len,
+                                   bool create_if_absent) {
+    bool found = false;
+    for (int i = c->var_range_count - 1; i >= 0; i--) {
+        struct VarRange *r = &c->var_ranges[i];
+        if (r->name_len != name_len || memcmp(r->name, name, name_len) != 0) continue;
+        r->min_val = INT64_MIN;
+        r->max_val = INT64_MAX;
+        r->known_nonzero = false;
+        r->address_taken = true;
+        found = true;
+    }
+    if (found || !create_if_absent) return;
+    /* Only the `&x` EXPRESSION site creates an entry when the variable has none
+     * (that is what it did before this refactor). The other two callers must NOT:
+     * an entry born address-taken blocks every later narrowing for the name, and
+     * for a variable with no range yet nothing could be proven anyway, so it
+     * would be pure over-rejection. */
+    push_var_range(c, name, name_len, INT64_MIN, INT64_MAX, false);
+    struct VarRange *r = find_var_range(c, name, name_len);
+    if (r) r->address_taken = true;
+}
+
 /* Refactor 1: unified VRP range update on assignment.
  * One function handles both simple ident keys ("i") and compound keys ("s.x").
  * For TOK_EQ: try literal → derive_expr_range → call return range → wipe.
@@ -19539,6 +19643,7 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
                                        TokenType op, Node *value) {
     struct VarRange *r = find_var_range(c, key, key_len);
     if (!r) return;
+    int last_idx = (int)(r - c->var_ranges);   /* for the stale-entry sweep below */
     if (op == TOK_EQ && value) {
         /* Direct assignment: try to derive new range from value */
         if (value->kind == NODE_INT_LIT) {
@@ -19577,6 +19682,40 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
         r->min_val = INT64_MIN;
         r->max_val = INT64_MAX;
         r->known_nonzero = false;
+    }
+    /* BUG-913 (2026-09-01) — THE STALE-NARROWING SWEEP.
+     *
+     * `find_var_range` returns the MOST RECENT entry, and `push_var_range`
+     * APPENDS rather than mutating, so a variable can have several live entries:
+     * one from its declaration and one per condition-derived narrowing. The
+     * update above reaches only the newest. When that newest entry is a
+     * narrowing PUSHED by the enclosing `if` (a comparison on this very
+     * variable), the branch handler pops it at the join — and the OLDER,
+     * pre-assignment entry resurfaces as if the assignment never happened:
+     *
+     *     u32 i = 0;                    // entry0  i:[0,0]
+     *     if (i == 0) { i = 100; }      // entry1  i:[0,0] -> [100,100], POPPED
+     *     arr[i] = 7;                   // sees entry0 [0,0] -> "proven in range"
+     *
+     * The bounds guard was ELIDED and the store compiled to a raw `arr[i] = 7`
+     * — a silent out-of-bounds write with no diagnostic and no trap (measured:
+     * it overwrote the field following a 4-element array). The `if`-handler's
+     * snapshot/JOIN (Finding A) cannot see it either: that machinery snapshots
+     * entries [0, saved_range_count) and the mutation landed ABOVE that mark.
+     *
+     * An assignment KILLS every prior fact about the variable, so every older
+     * entry must be invalidated too. We UNION the assigned range into them
+     * rather than overwrite: two entries sharing a name may belong to DIFFERENT
+     * variables (an inner block shadowing an outer one), and a union can only
+     * ever widen — precision loss at worst, never an unsound narrowing.
+     *
+     * Do NOT "optimise" this into updating just the newest entry again. */
+    for (int i = last_idx - 1; i >= 0; i--) {
+        struct VarRange *o = &c->var_ranges[i];
+        if (o->name_len != key_len || memcmp(o->name, key, key_len) != 0) continue;
+        if (r->min_val < o->min_val) o->min_val = r->min_val;
+        if (r->max_val > o->max_val) o->max_val = r->max_val;
+        o->known_nonzero = o->known_nonzero && r->known_nonzero;
     }
 }
 
@@ -19643,6 +19782,19 @@ static void vrp_join_assign_range(Checker *c, const char *name, uint32_t name_le
     if (vmin < r->min_val) r->min_val = vmin;
     if (vmax > r->max_val) r->max_val = vmax;
     r->known_nonzero = r->known_nonzero && vnz;
+    /* BUG-913 sibling: same stale-entry sweep as vrp_invalidate_for_assign. A
+     * loop body that writes a variable whose newest entry is a condition-derived
+     * narrowing (`if (i == 0) { while (c) { i = 100; } }`) would otherwise leave
+     * the older, pre-narrowing entry untouched, and that entry outlives the
+     * narrowing. Union only — never narrows, so a shadowed same-named local in
+     * an outer scope can only lose precision. */
+    for (int i = (int)(r - c->var_ranges) - 1; i >= 0; i--) {
+        struct VarRange *o = &c->var_ranges[i];
+        if (o->name_len != name_len || memcmp(o->name, name, name_len) != 0) continue;
+        if (vmin < o->min_val) o->min_val = vmin;
+        if (vmax > o->max_val) o->max_val = vmax;
+        o->known_nonzero = o->known_nonzero && vnz;
+    }
 }
 
 /* BUG-748 (2026-06-18): pre-pass for while/do-while bodies that widens
@@ -19848,14 +20000,9 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
                                                   : root->index_expr.object;
             }
             if (root && root->kind == NODE_IDENT) {
-                struct VarRange *r = find_var_range(c, root->ident.name,
-                    (uint32_t)root->ident.name_len);
-                if (r) {
-                    r->min_val = INT64_MIN;
-                    r->max_val = INT64_MAX;
-                    r->known_nonzero = false;
-                    r->address_taken = true; /* blocks all later narrowing */
-                }
+                /* BUG-918: every live entry, not just the newest. */
+                vrp_mark_address_taken(c, root->ident.name,
+                                       (uint32_t)root->ident.name_len, false);
             }
         }
         vrp_widen_loop_addr_taken(c, n->unary.operand);

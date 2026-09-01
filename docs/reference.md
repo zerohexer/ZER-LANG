@@ -443,6 +443,42 @@ struct Motor { u32 rpm; }
 
 ## DECLARATIONS
 
+### Declaration order
+
+FUNCTIONS may be used before they are defined, anywhere in the file. The checker
+registers every top-level declaration before checking any body, and the emitted C
+carries a prototype for each. Mutual recursion needs no forward declaration:
+
+```zer
+u32 main() {
+    if (even(4) != 1) { return 1; }
+    return 0;
+}
+u32 even(u32 n) {
+    if (n == 0) { return 1; }
+    return odd(n - 1);
+}
+u32 odd(u32 n) {
+    if (n == 0) { return 0; }
+    return even(n - 1);
+}
+```
+
+TYPES must be declared before first use — `struct`, `enum`, `union`, `typedef` and
+`container`. A field naming a type declared further down is *"undefined type"*:
+
+<!-- audit: skip -->
+```zer
+struct A { B inner; }      // ERROR — undefined type 'B'
+struct B { u32 v; }
+```
+
+Order the type declarations, or break the cycle with a pointer to a type declared
+above. GLOBAL variables may appear in any order relative to each other and to
+functions.
+
+---
+
 ### struct
 
 **DESCRIPTION**
@@ -1898,6 +1934,13 @@ Checks qualifier preservation (const, volatile).
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
 ```
 
+**NOTES**
+- A BARE ARRAY is rejected on either side (`@bitcast(u32[2], x)`,
+  `@bitcast(u64, arr)`). C has no array value, so the bits are not what would
+  get copied. Two things that do work: wrap the array in a struct and bitcast
+  the struct, or use `@pun(*T, &arr)` to reinterpret in place.
+- A struct operand IS allowed, including a struct whose fields are arrays.
+
 ---
 
 ### @cast(T, val)
@@ -2056,12 +2099,30 @@ struct Device { u32 id; ListHead list; }
 ### @size(T)
 
 **DESCRIPTION**
-Returns the size of type T in bytes as usize. Like C's sizeof.
+Returns the size in bytes as usize. Like C's sizeof.
+
+The operand may be a TYPE NAME or a VALUE — a local, a global, or a parameter.
+A value operand is never evaluated; only its type is used.
 
 **EXAMPLE**
 ```zer
-usize s = @size(Task);     // e.g., 12
+struct Reading { u32 lo; u32 hi; }
+u32 main() {
+    usize a = @size(Reading);   // type name
+    usize b = @size(u32);       // primitive
+    u8[8] buf;
+    usize c = @size(buf);       // a value — its type, 8
+    if (a != 8) { return 1; }
+    if (b != 4) { return 2; }
+    if (c != 8) { return 3; }
+    return 0;
+}
 ```
+
+**NOTES**
+- The operand must be a type name or a plain identifier. A projection or a call
+  (`@size(s.field)`, `@size(f())`) is rejected — bind it to a local first.
+- `@size(void)` and `@size(opaque)` are rejected — no defined size.
 
 ---
 
@@ -3499,6 +3560,7 @@ comptime if (DEBUG) {
 
 **CONDITIONS**
 Accepted: literals (`1`, `0`), `const` variables, comptime function calls, expressions combining these.
+<!-- audit: skip -->
 ```zer
 comptime if (1) { ... }                    // literal
 comptime if (DEBUG) { ... }                // const bool
@@ -3506,7 +3568,13 @@ comptime if (PLATFORM()) { ... }           // comptime function call
 comptime if (VER() > 1) { ... }            // expression with comptime call
 const u32 P = PLATFORM();
 comptime if (P) { ... }                    // const from comptime result
+comptime if (P == 4) { ... }               // const COMPARED to a literal
+comptime if (P + CAP > 8) { ... }          // arithmetic over consts
+comptime if (Mode.on == 1) { ... }         // enum variant
 ```
+
+A `const` identifier resolves at any depth in the condition, not only when it is
+the whole condition.
 
 **EXAMPLE**
 ```zer
@@ -3848,6 +3916,21 @@ u32 negative() {
 
 Proven-safe really does mean no code: `u32 i = 2; arr[i]` emits a bare `arr[i]`. An
 unprovable index emits `if ((size_t)(i) >= 4u) { return 0; }` in front of the access.
+
+**The UNKNOWN verdict has two runtime shapes, and which one you get depends on how the
+index is SPELLED.** A bare identifier gets the auto-guard above — the function returns
+early and *the access simply does not happen*. Every other spelling gets a hard bounds
+check that TRAPS:
+
+| index | runtime behaviour when out of bounds |
+|---|---|
+| `arr[i]` (a plain identifier) | auto-guard: early return, write skipped, no fault |
+| `arr[i + 1]`, `arr[s.field]`, `arr[f()]`, `arr[other[0]]`, `arr[(u32)x]` | `SIGTRAP` |
+
+Neither shape performs the access, so both are memory-safe; they differ in whether you
+find out. If a skipped write would be a bug in your program — a peripheral store that
+never happens has no fault to notice it by — add the explicit `if (i >= N) { return; }`,
+which removes the guard entirely and makes the intent visible.
 
 ### An out-of-bounds access inside `@critical` or a held lock TRAPS
 

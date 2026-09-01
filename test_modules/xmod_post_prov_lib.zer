@@ -1,0 +1,14 @@
+// BUG-921 — *opaque provenance mismatch at a call site inside an imported module.
+struct XmodSensor { u32 v; }
+struct XmodMotor  { u32 w; }
+
+XmodMotor xmod_gm;
+
+void xmod_use_sensor(*opaque ctx) {
+    *XmodSensor s = @ptrcast(*XmodSensor, ctx);
+    s.v = 1;
+}
+
+void xmod_prov_bad() {
+    xmod_use_sensor(@ptrcast(*opaque, &xmod_gm));
+}

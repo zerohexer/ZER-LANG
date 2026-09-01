@@ -1,0 +1,20 @@
+// BUG-921 — stack budget facts that live in an imported module:
+//   xmod_hog  : a single 4096-byte frame (per-function --stack-limit check)
+//   xmod_mid  : a link in a call chain that CROSSES the module boundary
+u32 xmod_hog() {
+    u32[1024] big;
+    big[0] = 1;
+    return big[0];
+}
+
+u32 xmod_leaf() {
+    u32[200] pad;
+    pad[0] = 3;
+    return pad[0];
+}
+
+u32 xmod_mid() {
+    u32[200] pad2;
+    pad2[0] = xmod_leaf();
+    return pad2[0];
+}

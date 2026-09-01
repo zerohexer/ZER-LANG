@@ -1180,6 +1180,31 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 Found while auditing for BUG-913..918. Each is measured on the post-fix compiler.
 
+### `*opaque` provenance is checked only through a GLOBAL, never through a local
+
+`check_call_provenance` looks the argument up in `c->global_scope` only, so a provenance
+that lives on a LOCAL is invisible and the call goes unchecked:
+
+```zer
+*opaque ctx = @ptrcast(*opaque, &g_motor);
+use_sensor(ctx);          // ACCEPTED — wrong type, no diagnostic
+use_sensor(@ptrcast(*opaque, &g_motor));   // rejected (direct form)
+```
+
+Same call, same wrong type, opposite verdicts — the rule is reachable from the direct-cast
+spelling and from a global, not from a local carrying the same fact. Root cause: the pass is
+DEFERRED to after every body is checked, and by then the function scopes that held the local
+have been popped, so `scope_lookup` cannot see it. Not a soundness hole in the memory sense
+(`@ptrcast` still carries the runtime `type_id` check for the cinclude boundary), but it is a
+compile-time rule that the user can step out of by introducing a variable.
+
+Fix sketch: record the provenance fact on the CALL NODE during body checking (where the local
+is in scope) — `prov_map` keyed by the arg's expr key — and have the deferred pass read that
+instead of re-deriving from scope. That is the same "collect during the pass that has the
+context, decide in the deferred pass" shape `check_keep_inference` already uses.
+
+Tripwire: `use_sensor(ctx)` above compiles clean today.
+
 ### One unprovable index, TWO different runtime responses depending on the SPELLING
 
 `arr[i]` where `i` is a bare IDENT gets the **silent auto-guard** (`if (i >= N) return 0;`

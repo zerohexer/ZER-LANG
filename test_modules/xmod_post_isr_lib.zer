@@ -1,0 +1,15 @@
+// BUG-921 — an interrupt handler declared in an IMPORTED module. `is_isr` used
+// to be re-derived by scanning one file_node's decls, so an imported ISR was
+// neither an entry point nor part of the concurrent-peak sum: on bare metal the
+// ISR frame is pushed on top of main's, and the budget silently said OK.
+volatile u32 xmod_flag;
+
+void xmod_isr_work() {
+    u32[150] pad;
+    pad[0] = xmod_flag;
+    xmod_flag = pad[0];
+}
+
+interrupt USART1 {
+    xmod_isr_work();
+}

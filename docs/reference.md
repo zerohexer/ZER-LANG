@@ -3292,8 +3292,23 @@ grep -rnE "\basm\s*[(]" src/
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+`naked` marks a function whose body must be pure `asm(...)` statements plus `return` — it is
+what grants permission to write `asm` at all (see **inline asm**), and the checker enforces
+that no other statement appears, because a function without its own frame has nowhere to put
+one.
+
+**It does NOT currently suppress the prologue.** The attribute is not emitted, so GCC still
+generates a prologue and epilogue. `zerc` says so at every declaration:
+
+```
+warning: 'naked' is accepted for asm permission but the attribute is NOT emitted:
+GCC will still generate a prologue/epilogue, so you do NOT get your own frame
+layout, your own ret/iret/eret, or untouched callee-saved registers.
+```
+
+So do not use it for a reset handler, a context switcher, or anything else that depends on
+the frame being untouched — write those in C and bring them in with `cinclude`. Tracked in
+`docs/limitations.md` ("naked attribute silently dropped on IR path").
 
 **SYNTAX**
 ```zer
@@ -3718,7 +3733,20 @@ container B(T) { ?*A(T) y; }
 ### --stack-limit N
 
 **DESCRIPTION**
-Compile error when estimated stack usage exceeds N bytes. Checks per-function frame size and entry-point call chain depth.
+Compile error when estimated stack usage exceeds N bytes. Four checks, all over the
+**whole program** — imported modules included:
+
+1. **Per-function frame size** — every function, whether or not anything calls it.
+2. **Entry-point call chain** — the deepest chain reachable from each entry point. Chains
+   that cross a module boundary are summed.
+3. **What counts as an entry point** — `main`, every `interrupt` block, and every
+   *call-graph root* (a function nothing else in the program calls). The third case matters
+   on bare metal, where the entry is whatever the vector table names — `Reset_Handler`,
+   `_start`, a vendor symbol — not `main`. A root is reachable only from outside the
+   program (reset vector, vector table, or a C caller), so its chain has to fit the budget.
+4. **Concurrent peak** — the largest entry chain PLUS every interrupt's chain, because on
+   bare metal they share one stack and an ISR frame is pushed on top of whatever was
+   already there.
 
 **SYNTAX**
 ```
@@ -3726,8 +3754,16 @@ zerc main.zer --run --stack-limit 2048
 ```
 
 **NOTES**
-- Recursive functions get warning (can't compute max depth).
-- Function pointer calls with unknown target → error with --stack-limit (can't verify depth).
+- Recursive functions get a warning (max depth is not computable) and are excluded from the
+  chain checks.
+- A function pointer call with an unknown target in an entry point's chain is an error under
+  `--stack-limit` (depth unverifiable); without the flag it is a warning.
+- The hardware exception frame is **not** included in the concurrent peak — its size is
+  architecture- and configuration-specific, i.e. datasheet truth rather than program data,
+  so the diagnostic names it instead of guessing.
+- Summing every interrupt is the sound bound without priority information. If your design
+  guarantees that only some handlers can nest, raise the limit accordingly — the diagnostic
+  prints the arithmetic so you can see what it added.
 
 ---
 
@@ -4067,7 +4103,7 @@ the `Handle` by value rather than a pointer to it.
 | ISR data race | Shared globals without volatile → compile error |
 | Thread data race | Spawn target body scanned for non-shared global access → error/warning |
 | Dangling @ptrtoint | `return @ptrtoint(&local)` → compile error (direct + indirect via struct fields) |
-| Stack overflow | `--stack-limit N` per-function + call chain check. Funcptr indirect calls flagged. |
+| Stack overflow | `--stack-limit N`: per-function frame + call chain from every entry point (`main`, each `interrupt`, and every call-graph root — the bare-metal entry is rarely named `main`) + the concurrent peak (largest chain + every ISR). Whole-program, imports included. Funcptr indirect calls flagged. |
 | Division by zero (call) | `x / func()` where func() return range unknown → compile error |
 | Wrong pointer cast | Provenance tracking through *opaque round-trips |
 
@@ -4094,7 +4130,47 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 2048                # error when stack usage exceeds N bytes
+zerc source.zer --track-cptrs                     # runtime *opaque use-after-free tracking
+zerc source.zer --emit-ir                         # print the IR and exit (debugging)
+zerc source.zer --trace                           # print the compilation flow to stderr
+zerc source.zer --trace-calls                     # --trace plus the full call graph
+zerc source.zer --release                         # accepted, currently a NO-OP (warns)
+zerc -h                                           # usage
 ```
+
+### --track-cptrs
+
+Turns on the **runtime** half of `*opaque` tracking, for the C-interop boundary only. Pure
+ZER code is already fully tracked at compile time (handle states + provenance), so this adds
+nothing there — it exists because a pointer that crosses into hand-written C can be freed
+where the compiler cannot see it.
+
+It emits an inline 16-byte header per allocation (via `--wrap` on `malloc`, `free`, `calloc`
+and `realloc`, which `zerc` passes to GCC automatically) carrying a generation counter, and inserts a
+`_zer_check_alive` call before any `@ptrcast` **out of** an `*opaque`. A use after the C side
+freed it traps instead of reading released memory.
+
+Cost: 16 bytes per allocation plus one comparison per `@ptrcast` from `*opaque`. Off by
+default — turn it on when your program hands pointers to C and you want the boundary checked
+at runtime as well.
+
+### --emit-ir
+
+Prints the lowered IR (flat locals + basic blocks) for each function and exits without
+emitting C. A debugging aid for compiler work, not part of a normal build.
+
+### --trace / --trace-calls
+
+`--trace` prints the compilation flow to stderr (which phase is running, which module).
+`--trace-calls` adds the full internal call graph, and only produces output in a
+`zerc-trace` build. Both are compiler-debugging aids and do not change the generated code.
+
+### --release
+
+Accepted for command-line compatibility and warns that it does nothing. Optimisation belongs
+to GCC and is controlled by the flags `zerc` already passes (`-O2 -fwrapv
+-fno-strict-aliasing`); there is no separate ZER-level release mode to switch on.
 
 ### Pipeline
 

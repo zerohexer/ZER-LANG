@@ -1,0 +1,4 @@
+struct XmodMotorB { u32 w; }
+XmodMotorB xmod_gb2;
+void xmod_handler(*opaque ctx) { *XmodMotorB s = @ptrcast(*XmodMotorB, ctx); s.w = 1; }
+void xmod_b_go() { xmod_handler(@ptrcast(*opaque, &xmod_gb2)); }

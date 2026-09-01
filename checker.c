@@ -19456,6 +19456,8 @@ static void check_func_body(Checker *c, Node *node) {
                     struct ParamExpect *pe = &c->param_expects[c->param_expect_count++];
                     pe->func_name = node->func_decl.name;
                     pe->func_name_len = (uint32_t)node->func_decl.name_len;
+                    pe->module = c->current_module;
+                    pe->module_len = c->current_module_len;
                     pe->param_index = pi;
                     pe->expected_type = expected;
                 }
@@ -21224,7 +21226,11 @@ static uint32_t compute_max_depth(Checker *c, struct StackFrame *frame,
 }
 
 /* Build call graph and report stack depth + recursion warnings */
-static void check_stack_depth(Checker *c, Node *file_node) {
+/* BUG-921: frame CONSTRUCTION, split out of check_stack_depth so it can run
+ * over every module AST. The analysis half below is whole-program and must run
+ * exactly once, after every file has contributed its frames — otherwise a call
+ * chain that crosses a module boundary is measured against a half-built graph. */
+static void stack_build_frames(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
     /* build frames for all functions and interrupts */
     for (int i = 0; i < file_node->file.decl_count; i++) {
@@ -21244,12 +21250,50 @@ static void check_stack_depth(Checker *c, Node *file_node) {
         if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
             struct StackFrame *f = find_or_add_frame(c, decl->interrupt.name,
                 (uint32_t)decl->interrupt.name_len);
+            f->is_isr = true;
             scan_frame(c, f, decl->interrupt.body);
         }
     }
-    /* compute max depth from main and each interrupt */
+}
+
+/* BUG-923: which frames are CALL-GRAPH ROOTS — nothing else in the program calls
+ * them. Every entry point is a root, and on bare metal the entry is whatever the
+ * vector table names (`Reset_Handler`, `_start`, …), NOT `main`. The old check
+ * recognised exactly `main` and `interrupt` blocks, so a firmware whose entry is a
+ * reset handler had its ENTIRE call chain unmeasured: measured, a 3200-byte chain
+ * under `Reset_Handler` passed `--stack-limit 1000` in silence, because each
+ * individual frame (800) fit and no entry-chain check ever ran on it.
+ *
+ * A root that is not the entry is either dead code or called from C — and a budget
+ * the user asked to enforce should be enforced on any chain that CAN run, which is
+ * the same reasoning that already applies the per-function frame check regardless
+ * of reachability. Self-edges are ignored so a recursive root is still a root (the
+ * chain checks skip recursive frames separately). */
+static void stack_mark_roots(Checker *c, bool *is_root) {
+    for (int i = 0; i < c->stack_frame_count; i++) is_root[i] = true;
+    for (int i = 0; i < c->stack_frame_count; i++) {
+        struct StackFrame *f = &c->stack_frames[i];
+        for (int k = 0; k < f->callee_count; k++) {
+            for (int j = 0; j < c->stack_frame_count; j++) {
+                if (j == i) continue;   /* a self-call does not un-root a frame */
+                if (c->stack_frames[j].name_len == f->callee_lens[k] &&
+                    memcmp(c->stack_frames[j].name, f->callees[k],
+                           f->callee_lens[k]) == 0) {
+                    is_root[j] = false;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+static void check_stack_depth(Checker *c) {
+    /* compute max depth from every ENTRY POINT: main, each interrupt, and every
+     * other call-graph root (see stack_mark_roots) */
     if (c->stack_frame_count > 0) {
         bool *visited = calloc(c->stack_frame_count, sizeof(bool));
+        bool *is_root = calloc(c->stack_frame_count, sizeof(bool));
+        if (is_root) stack_mark_roots(c, is_root);
         for (int i = 0; i < c->stack_frame_count; i++) {
             struct StackFrame *f = &c->stack_frames[i];
             uint32_t max_depth = compute_max_depth(c, f, visited, 0);
@@ -21275,18 +21319,23 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                 if (!f->is_recursive &&
                     zer_stack_frame_valid((int)c->stack_limit, (int)max_depth) == 0) {
                     bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
-                    bool is_isr = false;
-                    for (int d = 0; d < file_node->file.decl_count; d++) {
-                        if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
-                            file_node->file.decls[d]->interrupt.name_len == f->name_len &&
-                            memcmp(file_node->file.decls[d]->interrupt.name, f->name, f->name_len) == 0) {
-                            is_isr = true; break;
-                        }
-                    }
+                    bool is_isr = f->is_isr;
+                    bool is_root_f = is_root && is_root[i];
                     if (is_main || is_isr) {
                         checker_error(c, 0,
                             "%s '%.*s' max call chain stack %u bytes exceeds --stack-limit %u",
                             is_isr ? "interrupt" : "entry",
+                            (int)f->name_len, f->name,
+                            (unsigned)max_depth, (unsigned)c->stack_limit);
+                    } else if (is_root_f) {
+                        /* BUG-923: a call-graph root is reachable only from outside the
+                         * program — the reset vector, a vector-table slot, or a C caller
+                         * — so it is an entry point whose chain the budget must cover. */
+                        checker_error(c, 0,
+                            "function '%.*s' is never called anywhere in the program, so it "
+                            "may be an entry point (reset handler, vector table, or a C "
+                            "caller): its max call chain stack %u bytes exceeds "
+                            "--stack-limit %u",
                             (int)f->name_len, f->name,
                             (unsigned)max_depth, (unsigned)c->stack_limit);
                     }
@@ -21339,18 +21388,16 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                 struct StackFrame *f2 = &c->stack_frames[i];
                 if (f2->is_recursive) continue;
                 bool is_main = (f2->name_len == 4 && memcmp(f2->name, "main", 4) == 0);
-                bool is_isr = false;
-                for (int d = 0; d < file_node->file.decl_count; d++) {
-                    if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
-                        file_node->file.decls[d]->interrupt.name_len == f2->name_len &&
-                        memcmp(file_node->file.decls[d]->interrupt.name,
-                               f2->name, f2->name_len) == 0) { is_isr = true; break; }
-                }
-                if (!is_main && !is_isr) continue;
+                bool is_isr = f2->is_isr;
+                /* BUG-923: the non-interrupt side of the peak is the LARGEST entry
+                 * chain, not `main`'s specifically — on bare metal `main` is often
+                 * absent or trivial and the reset handler is the real one. */
+                bool is_root2 = is_root && is_root[i];
+                if (!is_main && !is_isr && !is_root2) continue;
                 memset(visited, 0, c->stack_frame_count * sizeof(bool));
                 uint32_t d2 = compute_max_depth(c, f2, visited, 0);
-                if (is_main) main_depth = d2;
-                else { isr_total += d2; isr_count++; }
+                if (is_isr) { isr_total += d2; isr_count++; }
+                else if (d2 > main_depth) { main_depth = d2; }
             }
             uint32_t peak = main_depth + isr_total;
             if (isr_count > 0 && peak > c->stack_limit) {
@@ -21365,6 +21412,7 @@ static void check_stack_depth(Checker *c, Node *file_node) {
             }
         }
         free(visited);
+        free(is_root);
     }
 }
 
@@ -22120,6 +22168,34 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
 
 /* Post-check: validate *opaque call-site provenance against param expectations.
  * Scans all call expressions in the file, checks argument provenance. */
+/* BUG-921: `param_expects` is keyed by the RAW function name. Resolve a call the
+ * way ZER's own name resolution does: a definition in the CURRENT module wins;
+ * otherwise a UNIQUE cross-module match is used. Two or more candidates that
+ * disagree means we cannot say which callee this is — and a rule that cannot
+ * identify the callee must not claim a mismatch, so it stays silent. That is a
+ * deliberate under-report confined to the ambiguous-name case; the alternative
+ * (guessing) reported a type confusion in correct code, measured on two modules
+ * that each defined their own `handler(*opaque)`. */
+static Type *param_expect_lookup(Checker *c, const char *fname, uint32_t flen, int idx) {
+    Type *other = NULL;
+    bool other_conflict = false;
+    for (int pe = 0; pe < c->param_expect_count; pe++) {
+        struct ParamExpect *e = &c->param_expects[pe];
+        if (e->param_index != idx) continue;
+        if (e->func_name_len != flen) continue;
+        if (memcmp(e->func_name, fname, flen) != 0) continue;
+        bool same_module = (e->module_len == c->current_module_len) &&
+            (e->module_len == 0 ||
+             (e->module && c->current_module &&
+              memcmp(e->module, c->current_module, e->module_len) == 0));
+        if (same_module) return e->expected_type;   /* the local definition wins */
+        if (!other) other = e->expected_type;
+        else if (!type_equals(other, e->expected_type)) other_conflict = true;
+    }
+    if (other_conflict) return NULL;
+    return other;
+}
+
 static void check_call_provenance(Checker *c, Node *node) {
     if (!node) return;
     if (node->kind == NODE_CALL && node->call.callee->kind == NODE_IDENT) {
@@ -22129,15 +22205,7 @@ static void check_call_provenance(Checker *c, Node *node) {
         /* check each argument against param expectations */
         for (int i = 0; i < node->call.arg_count; i++) {
             /* find expected type for this param */
-            Type *expected = NULL;
-            for (int pe = 0; pe < c->param_expect_count; pe++) {
-                if (c->param_expects[pe].param_index == i &&
-                    c->param_expects[pe].func_name_len == flen &&
-                    memcmp(c->param_expects[pe].func_name, fname, flen) == 0) {
-                    expected = c->param_expects[pe].expected_type;
-                    break;
-                }
-            }
+            Type *expected = param_expect_lookup(c, fname, flen, i);
             if (!expected) continue;
 
             /* get argument provenance */
@@ -23247,6 +23315,11 @@ typedef struct {
     const char *name; uint32_t name_len;
     ZerInitKind kind;
     int decl_line;
+    /* BUG-921: the scan is whole-program, so the declaration can live in a module
+     * other than the one being compiled — the diagnostic must name THAT file, not
+     * whichever file happened to be current when the report ran. */
+    const char *decl_file;
+    const char *decl_src;
     bool used;        /* alloc() / @barrier_wait() seen */
     bool inited;      /* .over(...) assigned / @barrier_init() seen */
 } ZerInitUse;
@@ -23278,7 +23351,15 @@ static void zbi_add(ZerInitSet *st, const char *n, uint32_t l, ZerInitKind k, in
     }
     ZerInitUse *e = &st->v[st->n++];
     e->name = n; e->name_len = l; e->kind = k; e->decl_line = line;
+    e->decl_file = NULL; e->decl_src = NULL;
     e->used = false; e->inited = false;
+}
+/* Stamp the entry with the file that is CURRENT during the scan of this module. */
+static void zbi_stamp_file(Checker *c, ZerInitSet *st, const char *n, uint32_t l) {
+    ZerInitUse *u = zbi_find(st, n, l);
+    if (!u || u->decl_file) return;
+    u->decl_file = c->file_name;
+    u->decl_src  = c->source;
 }
 static void zbi_mark(ZerInitSet *st, Node *e, bool used, bool inited) {
     if (!e || e->kind != NODE_IDENT) return;
@@ -23348,10 +23429,13 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
     if (n->kind == NODE_VAR_DECL || n->kind == NODE_GLOBAL_VAR) {
         Type *t = n->var_decl.type ? resolve_type(c, n->var_decl.type) : NULL;
         Type *u = t ? type_unwrap_distinct(t) : NULL;
-        if (u && type_dispatch_kind(u) == TYPE_ARENA)
+        if (u && type_dispatch_kind(u) == TYPE_ARENA) {
             zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_ARENA, n->loc.line);
-        else if (u && type_dispatch_kind(u) == TYPE_BARRIER)
+            zbi_stamp_file(c, st, n->var_decl.name, (uint32_t)n->var_decl.name_len);
+        } else if (u && type_dispatch_kind(u) == TYPE_BARRIER) {
             zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_BARRIER, n->loc.line);
+            zbi_stamp_file(c, st, n->var_decl.name, (uint32_t)n->var_decl.name_len);
+        }
         /* `Arena a = Arena.over(buf);` initialises at the declaration */
         if (n->var_decl.init) zbi_mark(st, NULL, false, false);
         if (u && type_dispatch_kind(u) == TYPE_ARENA && n->var_decl.init) {
@@ -23407,12 +23491,28 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
     zbi_scan_children(c, st, n, depth);
 }
 
-static void check_builtin_init(Checker *c, Node *file_node) {
+/* BUG-921: scans EVERY module before reporting. Collection has to be whole-program
+ * in both directions — a declaration in one module used from another must be seen
+ * as USED, and a declaration used in its own module but initialised from main must
+ * be seen as INITIALISED. Reporting per-file would have produced both a miss and a
+ * false positive. */
+static void check_builtin_init(Checker *c, CheckerModuleFile *files, int file_count) {
     ZerInitSet st; zbi_init(&st);
-    zbi_scan(c, &st, file_node, 0);
+    const char *scan_file = c->file_name;
+    const char *scan_src  = c->source;
+    for (int f = 0; f < file_count; f++) {
+        if (!files[f].ast || files[f].ast->kind != NODE_FILE) continue;
+        if (files[f].file_name) { c->file_name = files[f].file_name; c->source = files[f].source; }
+        zbi_scan(c, &st, files[f].ast, 0);
+        c->file_name = scan_file; c->source = scan_src;
+    }
+    const char *saved_file = c->file_name;
+    const char *saved_src  = c->source;
     for (int i = 0; i < st.n; i++) {
         ZerInitUse *e = &st.v[i];
         if (!e->used || e->inited) continue;
+        if (e->decl_file) { c->file_name = e->decl_file; c->source = e->decl_src; }
+        else              { c->file_name = saved_file;   c->source = saved_src;   }
         if (e->kind == ZBI_ARENA)
             checker_error(c, e->decl_line,
                 "arena '%.*s' is allocated from but never given a backing store, so "
@@ -23426,18 +23526,72 @@ static void check_builtin_init(Checker *c, Node *file_node) {
                 "happens and it reports SUCCESS. Add '@barrier_init(%.*s, N);'",
                 (int)e->name_len, e->name, (int)e->name_len, e->name);
     }
+    c->file_name = saved_file;
+    c->source    = saved_src;
     zbi_free(&st);
 }
 
-void checker_post_passes(Checker *c, Node *file_node) {
-    if (!file_node || file_node->kind != NODE_FILE) return;
+/* BUG-921: the deferred passes are answered for the WHOLE PROGRAM, but four of
+ * them were driven by a single `file_node` and zerc_main handed over only the
+ * main module — so every imported module was silently exempt from them. Measured
+ * before the fix, with the offending code moved verbatim into an import:
+ *   - `--stack-limit 512` against a 4096-byte frame: caught single-file, MISSED
+ *   - recursion warning:                             1 single-file,   0 cross-module
+ *   - arena never given a backing store:             caught single-file, MISSED
+ *   - same-statement two-lock deadlock:              MISSED unless the caller
+ *     happened to sit in the main module (the transitive summary covered that one
+ *     case, which is why this looked closed)
+ *   - `*opaque` provenance mismatch at a call site:  caught single-file, MISSED
+ * None of these produce a runtime trap on bare metal: the stack simply overflows,
+ * the arena hands back null forever, the barrier reports success. That is the
+ * silent class.
+ *
+ * The split is per-FILE (collect) vs whole-program (analyse+report). Stack frames
+ * and resource-init uses MUST be collected from every file before either is
+ * analysed, or a call chain / initialisation that crosses a module boundary is
+ * judged against a partial picture. */
+void checker_post_passes_multi(Checker *c, CheckerModuleFile *files, int file_count) {
+    if (!files || file_count <= 0) return;
 
-    /* Whole-program *opaque param provenance validation */
-    if (c->param_expect_count > 0) {
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            check_call_provenance(c, file_node->file.decls[i]);
+    const char *saved_file = c->file_name;
+    const char *saved_src  = c->source;
+    const char *saved_mod  = c->current_module;
+    uint32_t    saved_modl = c->current_module_len;
+
+    /* ---- per-FILE half: runs over EVERY module ---- */
+    for (int f = 0; f < file_count; f++) {
+        Node *file_node = files[f].ast;
+        if (!file_node || file_node->kind != NODE_FILE) continue;
+        /* A diagnostic raised here belongs to THIS module, so it must be reported
+         * under this module's name — the line numbers are its own. */
+        if (files[f].file_name) { c->file_name = files[f].file_name; c->source = files[f].source; }
+        else                    { c->file_name = saved_file;         c->source = saved_src;       }
+        /* Name resolution inside these passes is module-relative. */
+        c->current_module     = files[f].module;
+        c->current_module_len = files[f].module_len;
+
+        /* Whole-program *opaque param provenance validation */
+        if (c->param_expect_count > 0) {
+            for (int i = 0; i < file_node->file.decl_count; i++) {
+                check_call_provenance(c, file_node->file.decls[i]);
+            }
         }
+
+        /* Stack depth: frame construction only — the analysis is below, once. */
+        stack_build_frames(c, file_node);
+
+        /* Deadlock detection — lock ordering on shared structs.
+         * Within any block, shared struct accesses must be in ascending type_id order.
+         * If A (type_id=1) is accessed, then B (type_id=2), then A again after B → OK.
+         * But if B is accessed first, then A → "potential deadlock: lock ordering violation." */
+        check_lock_ordering(c, file_node);
     }
+    c->file_name          = saved_file;
+    c->source             = saved_src;
+    c->current_module     = saved_mod;
+    c->current_module_len = saved_modl;
+
+    /* ---- whole-program half: runs exactly once ---- */
 
     /* Interrupt safety — validate shared globals */
     if (c->isr_global_count > 0) {
@@ -23446,16 +23600,15 @@ void checker_post_passes(Checker *c, Node *file_node) {
     /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
     check_atomic_cell_safety(c);
 
-    /* Stack depth analysis — detect recursion */
-    check_stack_depth(c, file_node);
-
-    /* Deadlock detection — lock ordering on shared structs.
-     * Within any block, shared struct accesses must be in ascending type_id order.
-     * If A (type_id=1) is accessed, then B (type_id=2), then A again after B → OK.
-     * But if B is accessed first, then A → "potential deadlock: lock ordering violation." */
-    check_lock_ordering(c, file_node);
+    /* Stack depth analysis — detect recursion, --stack-limit, concurrent peak */
+    check_stack_depth(c);
 
     /* BUG-848/849: Arena + Barrier need an initialisation their TYPE does not
      * state. Deferred to here because it legitimately follows the use. */
-    check_builtin_init(c, file_node);
+    check_builtin_init(c, files, file_count);
+}
+
+void checker_post_passes(Checker *c, Node *file_node) {
+    CheckerModuleFile one = { file_node, NULL, NULL, NULL, 0 };
+    checker_post_passes_multi(c, &one, 1);
 }

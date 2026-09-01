@@ -1,0 +1,4 @@
+// expect-error: use after free
+import xmod_post_zc_lib;
+
+u32 main() { xmod_post_zc_lib.xmod_zc_uaf(); return 0; }

@@ -1,0 +1,16 @@
+// BUG-921 — a single statement touching TWO shared structs, in a function that
+// is never called from the main module. The transitive caller summary covered
+// the reachable case, which is why this looked closed.
+shared struct XmodSA { u32 x; }
+shared struct XmodSB { u32 y; }
+XmodSA xmod_ga;
+XmodSB xmod_gb;
+
+void xmod_lock_bad() {
+    xmod_ga.x = xmod_gb.y;
+}
+
+void xmod_lock_entry() {
+    u32 t = 0;
+    if (t == 1) { xmod_lock_bad(); }
+}

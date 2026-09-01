@@ -1,0 +1,25 @@
+// EXPECTED: compile error
+// zerc-flags: --stack-limit 1000
+// expect-error: is never called anywhere in the program
+//
+// BUG-923 — `--stack-limit` used to recognise exactly two entry points: a function
+// literally named `main`, and `interrupt` blocks. On bare metal the entry is
+// whatever the vector table names — `Reset_Handler`, `_start`, a vendor symbol —
+// so the ENTIRE call chain of a real firmware went unmeasured. Measured pre-fix:
+// this 3200-byte chain passed `--stack-limit 1000` in silence, because every
+// individual frame (800) fits and no entry-chain check ever ran on it. Nothing
+// traps: the target simply overflows its stack into whatever sits below it.
+//
+// A call-graph ROOT — nothing in the program calls it — is reachable only from
+// outside the program, so it IS an entry point and its chain must fit the budget.
+
+u32 deep3() { u32[200] p; p[0] = 1; return p[0]; }
+u32 deep2() { u32[200] p; p[0] = deep3(); return p[0]; }
+u32 deep1() { u32[200] p; p[0] = deep2(); return p[0]; }
+
+void Reset_Handler() {
+    u32[200] p;
+    p[0] = deep1();
+}
+
+u32 main() { return 0; }

@@ -1,0 +1,5 @@
+import xmod_post_stack_lib;
+
+u32 main() {
+    return xmod_post_stack_lib.xmod_hog();
+}

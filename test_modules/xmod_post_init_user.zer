@@ -1,0 +1,10 @@
+import xmod_post_init_lib;
+
+u8[256] xmod_backing;
+
+u32 main() {
+    xmod_post_init_lib.xmod_scratch2 = Arena.over(xmod_backing);
+    @barrier_init(xmod_post_init_lib.xmod_gate, 2);
+    xmod_post_init_lib.xmod_init_use();
+    return 0;
+}

@@ -1,0 +1,26 @@
+// zerc-flags: --stack-limit 4000
+// BUG-923 boundary: treating every call-graph ROOT as an entry point must add a
+// real bound, not reject any program that has an uncalled function. The same
+// 3200-byte chain under `Reset_Handler` as the negative, against a budget it
+// fits, plus an uncalled leaf — both are roots, neither exceeds the limit.
+//
+// It also pins the peak arithmetic: the non-interrupt side of the concurrent
+// peak is the LARGEST entry chain (3200 here, not `main`'s 0), so a limit of
+// 4000 accepts and anything below 3200 would not.
+
+u32 deep3() { u32[200] p; p[0] = 1; return p[0]; }
+u32 deep2() { u32[200] p; p[0] = deep3(); return p[0]; }
+u32 deep1() { u32[200] p; p[0] = deep2(); return p[0]; }
+
+void Reset_Handler() {
+    u32[200] p;
+    p[0] = deep1();
+}
+
+u32 never_called_leaf() {
+    u32[4] small;
+    small[0] = 1;
+    return small[0];
+}
+
+u32 main() { return 0; }

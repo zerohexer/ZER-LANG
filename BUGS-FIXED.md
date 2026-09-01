@@ -5,6 +5,125 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-01 — BUG-921: the deferred whole-program passes only ever saw ONE module
+
+**Symptom.** Move any of five kinds of defect out of `main.zer` and into a module that
+`main.zer` imports, and the compiler stops reporting it. Nothing else changes — same code,
+same rule, same compiler — only which file the code sits in. Measured, each verbatim-moved:
+
+| defect | single file | moved into an import |
+|---|---|---|
+| `--stack-limit 512` vs a 4096-byte frame | error | **missed** |
+| recursion (unbounded stack on embedded) | warning | **missed** |
+| `Arena` used but never given a backing store | error | **missed** |
+| one statement locking two `shared` structs | error | **missed** unless the caller happened to be in the main module |
+| `*opaque` provenance mismatch at a call site | error | **missed** |
+
+None of these trap at runtime on bare metal. The stack simply overflows into whatever is
+below it; the arena hands back null forever so every `alloc()` silently no-ops; the barrier
+reports success to threads that were never synchronised. That is the silent class the audit
+was looking for, and `--stack-limit` is the worst member: the user sets a budget precisely
+so they do not have to reason about this, and the tool AFFIRMED a budget the target cannot
+honour.
+
+**Root cause.** `checker_post_passes(Checker *c, Node *file_node)` takes ONE file node, and
+`zerc_main.c` called it as `checker_post_passes(&checker, main_mod->ast)`. Four of its six
+passes walk that `file_node`, so every imported module was exempt from all four. The header
+comment above the declaration even claimed the opposite ("Runs after ALL module bodies, so a
+resource declared in one module and initialised in another is seen") — true of the *timing*,
+false of the *scope*. An exemption whose written rationale is wider than its code, which is
+the shape CLAUDE.md already warns about for safety gates.
+
+A second, smaller instance of the same root cause sat inside `check_stack_depth`: whether a
+frame was an ISR was re-derived by scanning `file_node`'s decls, so an `interrupt` block in
+an imported module was neither an entry point nor part of the concurrent-peak sum.
+
+**Why "call it once per module" is the WRONG fix.** Two of the four passes are only sound
+whole-program:
+- Stack depth: a call chain that crosses a module boundary must be SUMMED. Per-module runs
+  would measure `main` against a half-built call graph — measured 2400 bytes for a
+  main→import→import chain that per-module analysis scores at 800.
+- Arena/Barrier init: collection has to be whole-program in BOTH directions. A resource
+  declared in module A and used from B must be seen as USED; one used inside A but
+  initialised from `main` must be seen as INITIALISED. Reporting per-file produces a miss
+  in one direction and a FALSE POSITIVE in the other.
+
+**Fix.** Split the pass into a per-FILE half (call provenance, stack-frame CONSTRUCTION,
+lock ordering, resource-init COLLECTION) and a whole-program half (interrupt safety, atomic
+cells, stack-depth ANALYSIS, resource-init REPORTING), behind one entry point that takes
+every module:
+
+```c
+void checker_post_passes_multi(Checker *c, CheckerModuleFile *files, int file_count);
+void checker_post_passes(Checker *c, Node *file_node);  /* == _multi(c, &one, 1) */
+```
+
+`CheckerModuleFile` carries `{ast, file_name, source}` so a diagnostic raised for an
+imported module is reported under THAT module's name with its own line and source echo —
+without it the errors came out labelled with the main file's name and the module's line
+numbers, which points the user at the wrong file. `struct StackFrame` gained `is_isr`,
+recorded when the frame is built, replacing both `file_node` ISR re-derivations.
+
+**Tests.** Six pairs in `test_modules/xmod_post_*` driven by `run_tests.sh`, each asserting
+the DIAGNOSTIC substring rather than the exit code, plus controls (`expect_clean`) for the
+budget that fits and for both false-positive directions. Verified non-vacuous: against a
+`git archive HEAD` build of the pre-fix compiler all six FAIL and the controls pass.
+
+### BUG-921b — the fix exposed a false positive, and the fix for THAT is a resolution rule
+
+Widening the provenance check to every module made `param_expects` — keyed by the RAW
+function name — collide. Two modules that each define their own `handler(*opaque)` shared
+one entry, so module B's perfectly correct call was reported as passing `*SB` to something
+that "expects `*SA`". Measured: a two-module program where each module is internally
+consistent was rejected.
+
+Fixed by resolving the way ZER resolves the call: a definition in the CURRENT module wins;
+otherwise a UNIQUE cross-module match is used; two or more candidates that disagree means we
+cannot say which callee this is, and a rule that cannot identify the callee must not claim a
+mismatch. `ParamExpect` records the defining module, and the per-file half of the pass runs
+under each module's identity. The deliberate under-report is confined to the ambiguous-name
+case — the alternative was reporting type confusion in correct code.
+Control: `test_modules/xmod_post_coll_*`.
+
+### BUG-922 — zercheck reported imported-module diagnostics under the wrong file
+
+`zercheck_init(&zc_ir, …, input_path)` sets ONE `file_name` for the whole run, and the
+reporting pass walks functions collected from every module. So a use-after-free in
+`lib.zer` printed as `main.zer:8: zercheck: use after free` — the main file's name with the
+module's line number, a coordinate pointing at unrelated code or at nothing.
+
+The analysis itself was never module-blind (verified: identical four diagnostics for a
+UAF + double-free + leak whether the code sits in main or in an import) — only the label was
+wrong, which is worse than it sounds, because the user's first move is to open that file at
+that line and find nothing there. The emitter loop already knows which module it is emitting,
+so the IR hook now tags each collected function with its file and the reporting pass sets
+`zc_ir.file_name` per function. Test: `test_modules/xmod_post_zc_*` asserts the full
+`xmod_post_zc_lib.zer:12: zercheck: use after free` prefix.
+
+### BUG-923 — `--stack-limit` did not know what an entry point is on bare metal
+
+**Symptom.** A 3200-byte call chain under `Reset_Handler` passes `--stack-limit 1000` with
+no diagnostic. Every individual frame (800) fits, and no entry-chain check ever runs on it.
+
+**Root cause.** The entry-chain and concurrent-peak checks recognised exactly two things: a
+function literally named `main`, and `interrupt` blocks. On bare metal the entry is whatever
+the vector table names — `Reset_Handler`, `_start`, a vendor symbol — so on real firmware
+the flag measured per-function frames and nothing else. The user sets a budget precisely so
+they do not have to reason about this, and the tool AFFIRMED a budget the target cannot
+honour.
+
+**Fix.** A function that nothing else in the program calls is a CALL-GRAPH ROOT, reachable
+only from outside the program (reset vector, vector table, or a C caller) — so it is an
+entry point. `stack_mark_roots` computes them (ignoring self-edges, so a recursive root is
+still a root), the entry-chain check covers every root, and the concurrent peak now uses the
+LARGEST entry chain rather than `main`'s specifically. This is the same reasoning that
+already applies the per-function frame check regardless of reachability.
+
+Tests: `tests/zer_fail/stack_limit_root_entry.zer` (the 3200/1000 case) and
+`tests/zer/stack_limit_root_entry_fits_ok.zer` (the same chain at 4000, plus an uncalled
+leaf — proving the rule adds a bound rather than rejecting any program with an uncalled
+function; measured to flip to a rejection at 3000).
+
 ## Session 2026-09-01 — BUG-913..919: two VRP soundness holes, and three programs the checker accepted that GCC refused
 
 A full-tree audit. Seven fixes, each reproduced on main FIRST, and each of the six that

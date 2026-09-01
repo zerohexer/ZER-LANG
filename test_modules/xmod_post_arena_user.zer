@@ -1,0 +1,7 @@
+// expect-error: never given a backing store
+import xmod_post_arena_lib;
+
+u32 main() {
+    xmod_post_arena_lib.xmod_arena_use();
+    return 0;
+}

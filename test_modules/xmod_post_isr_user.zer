@@ -1,0 +1,8 @@
+// Compile-only: GCC refuses __attribute__((interrupt)) on hosted x86-64.
+import xmod_post_isr_lib;
+
+u32 main() {
+    u32[150] here;
+    here[0] = 1;
+    return here[0];
+}

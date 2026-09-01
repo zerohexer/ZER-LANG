@@ -1,0 +1,14 @@
+// BUG-921 control: a resource DECLARED and USED here, but INITIALISED from the
+// importing module. Collection has to be whole-program in BOTH directions —
+// reporting per-file would flag these as never-initialised, which is the false
+// positive that makes "just call the pass once per module" the wrong fix.
+Arena xmod_scratch2;
+Barrier xmod_gate;
+
+struct XmodCell2 { u32 v; }
+
+void xmod_init_use() {
+    ?*XmodCell2 n = xmod_scratch2.alloc(XmodCell2);
+    *XmodCell2 p = n orelse return;
+    p.v = 7;
+}

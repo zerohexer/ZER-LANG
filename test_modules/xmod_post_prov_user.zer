@@ -1,0 +1,4 @@
+// expect-error: wrong *opaque type
+import xmod_post_prov_lib;
+
+u32 main() { xmod_post_prov_lib.xmod_prov_bad(); return 0; }

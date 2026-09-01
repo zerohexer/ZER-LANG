@@ -1,0 +1,4 @@
+// expect-error: deadlock: single statement accesses both
+import xmod_post_lock_lib;
+
+u32 main() { return 0; }

@@ -1,0 +1,9 @@
+// BUG-921 control: two modules that each define their OWN same-named *opaque
+// handler. `param_expects` is keyed by the raw function name, so once every
+// module's call sites are checked the two entries collide — module B's perfectly
+// correct call was reported as a type confusion until the lookup learned to
+// prefer the definition in the CURRENT module.
+struct XmodSensorA { u32 v; }
+XmodSensorA xmod_ga2;
+void xmod_handler(*opaque ctx) { *XmodSensorA s = @ptrcast(*XmodSensorA, ctx); s.v = 1; }
+void xmod_a_go() { xmod_handler(@ptrcast(*opaque, &xmod_ga2)); }

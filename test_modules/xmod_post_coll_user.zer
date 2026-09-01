@@ -1,0 +1,8 @@
+import xmod_post_coll_a;
+import xmod_post_coll_b;
+
+u32 main() {
+    xmod_post_coll_a.xmod_a_go();
+    xmod_post_coll_b.xmod_b_go();
+    return 0;
+}

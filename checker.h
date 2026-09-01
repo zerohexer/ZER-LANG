@@ -162,6 +162,12 @@ typedef struct {
     struct ParamExpect {
         const char *func_name;
         uint32_t func_name_len;
+        /* BUG-921: which module DEFINED this function (NULL/0 = the main module).
+         * The table is keyed by the raw name, so without this two modules that each
+         * define a same-named `*opaque` handler share one entry and the second one's
+         * perfectly correct call is reported as a type confusion. */
+        const char *module;
+        uint32_t module_len;
         int param_index;          /* which parameter */
         Type *expected_type;      /* what @ptrcast casts it to inside the function */
     } *param_expects;
@@ -339,6 +345,11 @@ typedef struct {
         int callee_capacity;
         bool is_recursive;      /* part of a call cycle */
         bool has_indirect_call; /* calls through function pointer with unknown target */
+        bool is_isr;            /* declared as `interrupt NAME { ... }` — an ENTRY POINT.
+                                 * BUG-921: recorded when the frame is BUILT. It used to be
+                                 * re-derived by scanning one file_node's decls, which made
+                                 * an ISR in an imported module invisible to the entry-point
+                                 * and concurrent-peak checks. */
     } *stack_frames;
     int stack_frame_count;
     int stack_frame_capacity;
@@ -350,10 +361,25 @@ void checker_register_file(Checker *c, Node *file_node); /* register declaration
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
 void check_keep_inference(Checker *c);
-/* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
- * bodies, so a resource declared in one module and initialised in another is
- * seen. Covers Arena backing stores and Barrier targets. */
-void checker_post_passes(Checker *c, Node *file_node); /* stack depth + interrupt safety (after all bodies checked) */
+/* Deferred whole-program passes. Run after ALL module bodies are checked.
+ *
+ * BUG-921: these split into a per-FILE half (call provenance, stack-frame
+ * construction, lock ordering, resource-init COLLECTION) and a whole-program
+ * half (interrupt safety, atomic cells, stack-depth ANALYSIS, resource-init
+ * REPORTING). Pass EVERY module AST — handing over only the main file silently
+ * skipped the per-file half for every import, which is how a 4 KB frame in an
+ * imported module passed --stack-limit 512 and an arena that can never allocate
+ * compiled clean. `checker_post_passes` is the single-file convenience wrapper
+ * (LSP / checker_check); the compile path must use the _multi form. */
+typedef struct {
+    Node *ast;
+    const char *file_name;  /* NULL -> keep the checker's current name */
+    const char *source;     /* NULL -> no source line echoed */
+    const char *module;     /* NULL/0 = the main module (no name mangling) */
+    uint32_t module_len;
+} CheckerModuleFile;
+void checker_post_passes_multi(Checker *c, CheckerModuleFile *files, int file_count);
+void checker_post_passes(Checker *c, Node *file_node); /* == _multi(c, &file_node, 1) */
 void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
 void checker_pop_module_scope(Checker *c); /* pop module scope */
 

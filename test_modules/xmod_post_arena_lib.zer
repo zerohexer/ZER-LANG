@@ -1,0 +1,12 @@
+// BUG-921 — an Arena that is never given a backing store, DECLARED AND USED
+// inside an imported module. `alloc()` returns null forever; nothing traps.
+// Pre-fix this compiled clean because checker_post_passes only saw main's AST.
+Arena xmod_scratch;
+
+struct XmodCell { u32 v; }
+
+void xmod_arena_use() {
+    ?*XmodCell n = xmod_scratch.alloc(XmodCell);
+    *XmodCell p = n orelse return;
+    p.v = 7;
+}

@@ -1,0 +1,14 @@
+// BUG-922 — zercheck reports through ONE `zc->file_name`, so a diagnostic for an
+// imported module was printed with the MAIN file's name and THIS file's line
+// number: a coordinate that points at unrelated code, or at no code at all. The
+// analysis was always correct cross-module; only the label was wrong.
+struct XmodItem { u32 v; }
+Pool(XmodItem, 4) xmod_pool;
+
+void xmod_zc_uaf() {
+    ?Handle(XmodItem) mh = xmod_pool.alloc();
+    Handle(XmodItem) h = mh orelse return;
+    xmod_pool.free(h);
+    u32 x = h.v;
+    x = x;
+}

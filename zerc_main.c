@@ -192,6 +192,14 @@ extern bool zercheck_ir(ZerCheck *zc_ir, void *ir_func);
 static void **zerc_ir_hook_funcs = NULL;
 static int zerc_ir_hook_count = 0;
 static int zerc_ir_hook_cap = 0;
+/* BUG-922: which module each collected function came from. zercheck reports under
+ * ONE `zc->file_name`, so every diagnostic for an imported module was printed with
+ * the MAIN file's name and the MODULE's line number — a coordinate that points at
+ * unrelated code, or at no code at all. The analysis itself was always correct
+ * cross-module (verified: same four diagnostics for a UAF/double-free/leak whether
+ * the code sits in main or in an import); only the label was wrong. */
+static const char **zerc_ir_hook_files = NULL;
+static const char *zerc_ir_hook_cur_file = NULL;
 
 void zerc_ir_hook(void *ctx, void *ir_func) {
     (void)ctx; /* Using static arrays since hook is called many times */
@@ -199,8 +207,11 @@ void zerc_ir_hook(void *ctx, void *ir_func) {
         zerc_ir_hook_cap = zerc_ir_hook_cap < 16 ? 16 : zerc_ir_hook_cap * 2;
         zerc_ir_hook_funcs = (void **)realloc(zerc_ir_hook_funcs,
             zerc_ir_hook_cap * sizeof(void *));
+        zerc_ir_hook_files = (const char **)realloc(zerc_ir_hook_files,
+            zerc_ir_hook_cap * sizeof(const char *));
     }
-    if (zerc_ir_hook_funcs) {
+    if (zerc_ir_hook_funcs && zerc_ir_hook_files) {
+        zerc_ir_hook_files[zerc_ir_hook_count] = zerc_ir_hook_cur_file;
         zerc_ir_hook_funcs[zerc_ir_hook_count++] = ir_func;
     }
 }
@@ -650,8 +661,32 @@ int main(int argc, char **argv) {
      * so forward-referenced/cross-module/transitive keeps are handled soundly). */
     check_keep_inference(&checker);
 
-    /* Post-passes on main file: stack depth + interrupt safety + lock ordering */
-    checker_post_passes(&checker, main_mod->ast);
+    /* Post-passes over EVERY module, in topo order (dependencies first, main last).
+     * BUG-921: this used to pass only `main_mod->ast`, which silently exempted every
+     * imported module from stack-depth (--stack-limit AND recursion), Arena/Barrier
+     * initialisation, lock ordering and *opaque call provenance. */
+    {
+        CheckerModuleFile *post_files = (CheckerModuleFile *)malloc(
+            sizeof(CheckerModuleFile) * (size_t)(topo_count > 0 ? topo_count : 1));
+        if (post_files) {
+            int post_n = 0;
+            for (int ti = 0; ti < topo_count; ti++) {
+                int pidx = topo_order[ti];
+                Module *m = &cc.modules[pidx];
+                if (!m->ast) continue;
+                post_files[post_n].ast        = m->ast;
+                post_files[post_n].file_name  = (pidx == 0) ? input_path : m->path;
+                post_files[post_n].source     = m->source;
+                post_files[post_n].module     = (pidx == 0) ? NULL : m->name;
+                post_files[post_n].module_len = (pidx == 0) ? 0u : (uint32_t)strlen(m->name);
+                post_n++;
+            }
+            checker_post_passes_multi(&checker, post_files, post_n);
+            free(post_files);
+        } else {
+            checker_post_passes(&checker, main_mod->ast);
+        }
+    }
     if (checker.error_count > 0) {
         fprintf(stderr, "error: type check failed\n");
         free(cc.modules);
@@ -777,6 +812,9 @@ int main(int argc, char **argv) {
     for (int ti = 0; ti < topo_count; ti++) {
         Module *m = &cc.modules[topo_order[ti]];
         emitter.source_file = m->path;
+        /* BUG-922: tag every function the hook collects while emitting this module,
+         * so zercheck can report it under the file it actually lives in. */
+        zerc_ir_hook_cur_file = (topo_order[ti] == 0) ? input_path : m->path;
         if (topo_order[ti] == 0) {
             emitter.current_module = NULL;
             emitter.current_module_len = 0;
@@ -813,10 +851,13 @@ int main(int argc, char **argv) {
         zc_ir.building_summary = false;
         g_zer_in_converge = 0;   /* the real reporting pass — show it in the trace */
 
-        /* Main analysis pass — errors now recorded */
+        /* Main analysis pass — errors now recorded, each under its own file. */
         for (int i = 0; i < zerc_ir_hook_count; i++) {
+            zc_ir.file_name = (zerc_ir_hook_files && zerc_ir_hook_files[i])
+                ? zerc_ir_hook_files[i] : input_path;
             zercheck_ir(&zc_ir, zerc_ir_hook_funcs[i]);
         }
+        zc_ir.file_name = input_path;
 
         /* Audit-mode disagreement reporting (used by tools/agreement_audit.sh).
          * Format: AGREEMENT_FAIL <file>: ast=N ir=M kind=<class> funcs=K */
@@ -835,7 +876,10 @@ int main(int argc, char **argv) {
         }
     }
     free(zerc_ir_hook_funcs);
+    free((void *)zerc_ir_hook_files);
     zerc_ir_hook_funcs = NULL;
+    zerc_ir_hook_files = NULL;
+    zerc_ir_hook_cur_file = NULL;
     zerc_ir_hook_count = 0;
     zerc_ir_hook_cap = 0;
 

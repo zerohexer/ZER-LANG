@@ -1,0 +1,9 @@
+// Driven by run_tests.sh with explicit --stack-limit values; compiles clean
+// without the flag (there is no budget to exceed).
+import xmod_post_stack_lib;
+
+u32 main() {
+    u32[200] here;
+    here[0] = xmod_post_stack_lib.xmod_mid();
+    return here[0];
+}

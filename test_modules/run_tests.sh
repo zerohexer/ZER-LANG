@@ -94,6 +94,56 @@ run_test comptime_user 0
 # Multi-module: enum + switch across modules
 run_test enum_user 0
 
+# BUG-921: the deferred whole-program passes used to be handed ONLY the main
+# module's AST, so every imported module was silently exempt from them. Each
+# case below compiled clean before the fix. Assert the REASON, not the exit
+# code — several of these files can be rejected by unrelated rules.
+expect_diag() {
+    local name=$1; local want=$2; shift 2
+    local out
+    out=$($ZERC $name.zer "$@" -o /dev/null 2>&1)
+    if echo "$out" | grep -qF "$want"; then
+        PASS=$((PASS+1))
+    else
+        echo "  FAIL: $name (expected diagnostic containing: $want)"
+        echo "$out" | head -3
+        FAIL=$((FAIL+1))
+    fi
+}
+expect_clean() {
+    local name=$1; shift
+    local out
+    out=$($ZERC $name.zer "$@" -o _$name.c 2>&1)
+    if [ $? -eq 0 ] && ! echo "$out" | grep -q "error"; then
+        PASS=$((PASS+1))
+    else
+        echo "  FAIL: $name (should compile clean)"
+        echo "$out" | head -3
+        FAIL=$((FAIL+1))
+    fi
+}
+# arena declared+used in an import, never given a backing store -> alloc() null forever
+expect_diag xmod_post_arena_user "never given a backing store"
+# two shared structs in one statement, in an import, unreachable from main
+expect_diag xmod_post_lock_user  "deadlock: single statement accesses both"
+# *opaque provenance mismatch at a call site inside an import
+expect_diag xmod_post_prov_user  "wrong *opaque type"
+# --stack-limit against a 4096-byte frame that lives in an import
+expect_diag xmod_post_hog_user   "function 'xmod_hog' local stack 4096 bytes exceeds" --stack-limit 512
+# a call chain that CROSSES the module boundary must be SUMMED (200+200+200 words)
+expect_diag xmod_post_stack_user "entry 'main' max call chain stack 2400 bytes exceeds" --stack-limit 1200
+# an ISR declared in an import is an entry point AND part of the concurrent peak
+expect_diag xmod_post_isr_user   "concurrent stack peak 1200 bytes exceeds" --stack-limit 800
+# control: the same program under a budget it fits must NOT be rejected
+expect_clean xmod_post_isr_user --stack-limit 2000
+# BUG-922: a zercheck diagnostic for an imported module must name THAT file
+expect_diag xmod_post_zc_user "xmod_post_zc_lib.zer:12: zercheck: use after free"
+# controls for the two FALSE-POSITIVE directions the whole-program design must avoid:
+#   resource declared+used in a module but initialised from main
+#   two modules that each define their own same-named *opaque handler
+expect_clean xmod_post_init_user
+expect_clean xmod_post_coll_user
+
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*
 

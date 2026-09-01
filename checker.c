@@ -1488,10 +1488,16 @@ static void vrp_push_cmp_range(Checker *c, VrpCmp k, bool assume_true) {
         }
     }
     int64_t v = k.val;
+    /* `v - 1` / `v + 1` at the int64 extremes is signed overflow — UB in the
+     * COMPILER, carried over verbatim from the four tables this replaced. Skip
+     * instead of clamping: `i < INT64_MIN` and `i > INT64_MAX` are unsatisfiable,
+     * so the honest fact is "unreachable", and clamping would instead assert
+     * `i == INT64_MIN`, a range narrow enough to turn a later index into a
+     * spurious always-OOB error. No narrowing is the conservative answer. */
     switch (op) {
-    case TOK_LT:   push_var_range(c, k.var, k.var_len, INT64_MIN, v - 1, v <= 0); break;
+    case TOK_LT:   if (v != INT64_MIN) push_var_range(c, k.var, k.var_len, INT64_MIN, v - 1, v <= 0); break;
     case TOK_LTEQ: push_var_range(c, k.var, k.var_len, INT64_MIN, v,     v <  0); break;
-    case TOK_GT:   push_var_range(c, k.var, k.var_len, v + 1, INT64_MAX, v >= 0); break;
+    case TOK_GT:   if (v != INT64_MAX) push_var_range(c, k.var, k.var_len, v + 1, INT64_MAX, v >= 0); break;
     case TOK_GTEQ: push_var_range(c, k.var, k.var_len, v,     INT64_MAX, v >  0); break;
     case TOK_EQEQ: push_var_range(c, k.var, k.var_len, v, v, v != 0); break;
     case TOK_BANGEQ:

@@ -1178,28 +1178,6 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 Found while auditing for BUG-913..918. Each is measured on the post-fix compiler.
 
-### VRP comparison narrowing computes `v - 1` / `v + 1` without an int64 extreme guard
-
-`vrp_push_cmp_range` (checker.c) derives `i < v` as `[INT64_MIN, v - 1]` and `i > v` as
-`[v + 1, INT64_MAX]`. At `v == INT64_MIN` and `v == INT64_MAX` those are signed overflow —
-UB in the compiler itself. Carried over verbatim from the four hand-written tables BUG-920
-replaced (the arithmetic is unchanged), so it is not a regression, but it now lives in one
-place and should be fixed there.
-
-Severity is LOW and the direction is OVER-rejection, not unsafety: both comparisons are
-unsatisfiable at those values (`i < INT64_MIN` and `i > INT64_MAX` can never hold), so the
-honest result is "unreachable" and the wrap would instead record a narrow range that could
-turn a later index into a spurious ALWAYS-OOB error. Reaching it also requires a ZER source
-literal of exactly ±2^63 in a comparison.
-
-Fix: skip the push in those two cases (no narrowing = conservative), rather than clamping —
-clamping would assert `i == INT64_MIN`, which is the wrong fact.
-
-```c
-case TOK_LT: if (v != INT64_MIN) push_var_range(c, k.var, k.var_len, INT64_MIN, v - 1, v <= 0); break;
-case TOK_GT: if (v != INT64_MAX) push_var_range(c, k.var, k.var_len, v + 1, INT64_MAX, v >= 0); break;
-```
-
 ### `*opaque` provenance is checked only through a GLOBAL, never through a local
 
 `check_call_provenance` looks the argument up in `c->global_scope` only, so a provenance

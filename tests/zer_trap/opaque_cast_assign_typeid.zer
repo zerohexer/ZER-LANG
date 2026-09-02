@@ -1,0 +1,28 @@
+// expect-trap: type mismatch in cast
+// BUG-915. Casting FROM `*opaque` back to a typed pointer carries a runtime
+// type_id check — that check is the entire mechanism preventing a wrong-typed
+// `*opaque` from being dereferenced across a C-interop boundary.
+//
+// It was emitted by the var-decl path and by IR_CAST, but NOT by
+// emit_rewritten_node's NODE_TYPECAST, which is the path a PLAIN ASSIGNMENT
+// takes. On main that path emitted `((struct Motor*)ctx)` — a direct cast of
+// the `_zer_opaque` STRUCT to a pointer, which GCC rejects outright, so the
+// program did not even build; and the guard it was supposed to carry was gone.
+//
+// Here a *Sensor is handed over as *opaque and cast back to *Motor through the
+// assignment form. The trap must fire.
+struct Sensor { u32 a; }
+struct Motor  { u32 b; }
+
+u32 use(*opaque ctx, *Motor seed) {
+    *Motor m = seed;
+    m = (*Motor)ctx;
+    return m.b;
+}
+
+u32 main() {
+    Sensor s; s.a = 77;
+    Motor mo; mo.b = 1;
+    *opaque c = (*opaque)&s;
+    return use(c, &mo);
+}

@@ -1,0 +1,22 @@
+// expect-error: non-shared global
+// BUG-913. The spawn target reaches its callback through a FACTORY whose only
+// `return <racy funcname>` sits inside a SWITCH ARM. scan_returned_funcname was
+// an if/else chain over RETURN/BLOCK/IF/WHILE/FOR, so the switch arm was never
+// descended and the data race was ACCEPTED.
+//
+// `mk` returns the safe `nop` on the fall-through, so nothing but the switch
+// arm can supply `cb` — a rejection here can only come from descending it.
+u32 g;
+void cb() { g += 1; }
+void nop() { }
+
+*() -> void mk(u32 k) {
+    switch (k) {
+        0 => { return cb; }
+        default => { }
+    }
+    return nop;
+}
+
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }

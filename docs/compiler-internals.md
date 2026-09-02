@@ -2089,6 +2089,51 @@ runtime check where genuinely unknowable (uses the existing `_zer_opaque`
 machinery which already has `type_id`), no fat pointers, no ABI changes,
 no compiler-side semantic judgment.
 
+### Cast EMISSION is one function, not three (BUG-915, 2026-09-02)
+
+The rules above describe what a cast MEANS. Where they are turned into C, there
+are three entry points, and they must not drift:
+
+| # | Emitter | Reached by |
+|---|---|---|
+| 1 | `emit_expr` `NODE_TYPECAST` | global / const initializers (they must be C constant expressions, so they never take the IR path) |
+| 2 | `emit_rewritten_node` `NODE_TYPECAST` | the IR expression path — **plain assignments**, **defer bodies**, spawn args |
+| 3 | `emit_ir_inst` `IR_CAST` | the decomposed 3AC path (var-decl inits, most expressions) |
+
+Four behaviours have to hold at all three: wrap to `*opaque` with a `type_id`,
+unwrap from `*opaque` with the runtime `type_id` trap, `(uint8_t)!!` to `bool`,
+and the saturating float→int guard. Sites 1 and 3 implemented all four. Site 2
+implemented one — so `b = (bool)five();` stored `5` (truthy under `if (b)` AND
+unequal to `true`), and `m = (*Motor)ctx;` emitted a direct cast of the
+`_zer_opaque` STRUCT to a pointer, which GCC rejects and which had lost the
+type-id trap on the way.
+
+**The fix is a class-kill, not a fourth copy.** `classify_cast()` returns a
+`CastForm` (a no-`default:` enum, so a new form is a build error at every site),
+and `emit_cast_value()` performs the emission once. A site supplies only its own
+way of producing the operand, through `CastOperand`:
+
+```c
+typedef enum { CASTOP_AST, CASTOP_REWRITTEN, CASTOP_LOCAL } CastOperandKind;
+```
+
+Each call site is now ~6 lines. The invariant a future session can check in one
+command: **`grep -c "type mismatch in cast" emitter.c` must be 1.** A 2 means
+someone re-inlined the policy at a site instead of extending the shared one.
+
+Same shape as `value_flows_to` in `checker.c` (one decision, eight sinks): the
+DECISION is shared and only the site-local mechanics differ. Prefer this over
+"add the missing arm" whenever a policy already exists in more than one place —
+adding the arm fixes today's bug and leaves the next divergence just as
+invisible.
+
+Related, same session: `funcptr_return_shape()` is the one-query form of "does
+this function RETURN a function pointer?", used by both signature emitters. It
+peels `distinct` and the null-sentinel `?`, because `?FuncPtr` IS the pointer at
+runtime and needs the identical `RET (*name(params))(args)` declarator. Testing
+`ret->kind == TYPE_FUNC_PTR` raw made `?VFn f()` emit an abstract declarator
+(BUG-916) — BUG-879 one sink over.
+
 ### Track-don't-judge applied to casts
 
 ZER's broader architecture pattern: the compiler TRACKS structural

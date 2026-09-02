@@ -131,6 +131,22 @@ test_conc_matrix: tests/test_conc_matrix.c
 test_view_alias_matrix: tests/test_view_alias_matrix.c
 	$(CC) $(CFLAGS) -o $@ $^
 
+# shared-struct AUTO-LOCK x statement-body form (BUG-917). Asks the one question
+# the accept/reject matrices structurally cannot: was the mutex actually EMITTED?
+# A bare switch arm (`0 => g.x = 5,`) bypassed the per-statement lock wrapper and
+# emitted an unsynchronized write to shared memory with no diagnostic. EMIT-ONLY:
+# it greps the generated C, because a data race has no single-threaded signal.
+test_sharedlock_matrix: tests/test_sharedlock_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
+# scoped-borrow RELEASE x join placement. Nine hard-gated negatives pin the
+# soundness that exists (a join on a path that may not run must not release the
+# borrow); two PENDING cells pin the known over-rejection (a join on every arm of
+# an if/else) with the expectation INVERTED, so the day the relaxation lands the
+# grid fails loudly and the cell gets promoted instead of silently going green.
+test_borrow_join_matrix: tests/test_borrow_join_matrix.c
+	$(CC) $(CFLAGS) -o $@ $^
+
 # ISR / atomics / MMIO soundness guard (frontier Domain 2). PROGRAM-CONSEQUENCE
 # only (not the hardware floor): MMIO range/alignment/decl, volatile-strip,
 # slab/spawn-in-ISR, ISR non-volatile shared global, ISR volatile compound-RMW.
@@ -166,7 +182,7 @@ test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_sharedlock_matrix test_borrow_join_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -187,6 +203,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_cflow_matrix
 	./test_conc_matrix
 	./test_view_alias_matrix
+	./test_sharedlock_matrix
+	./test_borrow_join_matrix
 	./test_hw_matrix
 	./test_async_matrix
 	./test_asm_matrix

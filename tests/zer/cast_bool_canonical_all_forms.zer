@@ -1,0 +1,54 @@
+// BUG-915 regression. `(bool)x` must yield the CANONICAL bool, so that
+// `if (b)` and `b == true` can never disagree. ZER emits bool as uint8_t, so a
+// plain `(uint8_t)5` stores 5 — truthy under `if`, yet != true. That is one
+// value reading two ways.
+//
+// The policy lived in THREE emitters and only two of them applied `!!`. The
+// missing one was emit_rewritten_node's NODE_TYPECAST, which is the live path
+// for a PLAIN ASSIGNMENT and for DEFER bodies — so the var-decl form below was
+// correct on main while the assignment form was not.
+//
+// This test crosses the cast with every emission form rather than checking one,
+// because the defect class is per-form, not per-feature. Any form that stops
+// canonicalising makes this exit non-zero.
+u32 five() { return 5; }
+bool gflag;
+bool dflag;
+
+bool ret_form(u32 v) { return (bool)v; }
+
+/* defer bodies are re-emitted from raw AST through emit_rewritten_node — the
+ * site that was missing the normalization. Its own form, its own cell. */
+u32 defer_form() {
+    defer dflag = (bool)five();
+    return 0;
+}
+
+u32 main() {
+    u32 n = five();
+
+    bool a = (bool)n;                 // var-decl init
+    if (a != true) { return 1; }
+
+    bool b = false;
+    b = (bool)n;                      // plain assignment  <-- the broken form
+    if (b != true) { return 2; }
+
+    gflag = (bool)n;                  // store to a global
+    if (gflag != true) { return 3; }
+
+    if (ret_form(n) != true) { return 4; }   // return position
+
+    bool d = false;
+    if (n > 0) { d = (bool)n; }       // inside a branch
+    if (d != true) { return 5; }
+
+    bool z = (bool)0;                 // zero must stay false
+    if (z != false) { return 6; }
+
+    u32 r = defer_form();             // inside a defer body
+    if (dflag != true) { return 7; }
+    if (r != 0) { return 8; }
+
+    return 0;
+}

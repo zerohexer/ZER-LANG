@@ -254,8 +254,11 @@ void process([*]u32 data) {
     }
 }
 
-u32[8] arr;
-process(arr);              // auto-coerces: T[N] → [*]T
+u32 main() {
+    u32[8] arr;
+    process(arr);          // auto-coerces: T[N] -> [*]T
+    return arr[0] - 1;     // 0
+}
 ```
 
 **FIELDS**
@@ -305,8 +308,14 @@ Auto-derefs for field access: `ptr.field` works (no `->` needed).
 
 **SYNTAX**
 ```zer
-*Task t = &my_task;
-t.priority = 5;            // auto-deref, like ptr->priority in C
+struct Task { u32 id; u32 priority; }
+
+u32 main() {
+    Task my_task;
+    *Task t = &my_task;
+    t.priority = 5;        // auto-deref, like ptr->priority in C
+    return t.priority - 5; // 0
+}
 ```
 
 **EXAMPLE**
@@ -2914,12 +2923,19 @@ Explicit type conversion using C-style syntax. Narrowing truncates by default.
 
 **EXAMPLE**
 ```zer
-u8 small = 42;
-u32 big = (u32)small;          // widening
-u16 trunc = (u16)big;          // narrowing (truncate)
-f32 ratio = (f32)big;          // int → float value convert
-(*Motor)opaque_ctx             // pointer cast (provenance checked)
-(*opaque)sensor_ptr            // type erase
+struct Motor { u32 rpm; }
+
+u32 main() {
+    u8 small = 42;
+    u32 big = (u32)small;          // widening
+    u16 trunc = (u16)big;          // narrowing (truncate)
+    f32 ratio = (f32)big;          // int -> float value convert
+
+    Motor m; m.rpm = 7;
+    *opaque erased = (*opaque)&m;  // type erase (records the source type)
+    *Motor back = (*Motor)erased;  // restore (runtime type_id check)
+    return back.rpm - 7;
+}
 ```
 
 **NOTES**
@@ -2927,6 +2943,57 @@ f32 ratio = (f32)big;          // int → float value convert
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
 - `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+- Float → integer **saturates**, and NaN becomes 0. See
+  "Converting a float to an integer" below for the full rule.
+
+**CASTING TO `bool` — the canonical-value guarantee**
+
+`(bool)x` on an integer, float or pointer yields exactly `true` or `false`,
+never the raw value. This matters because ZER emits `bool` as a byte: without
+the normalization a value like `5` would be truthy under `if (b)` and yet
+compare unequal to `true`, so the *same* value would read two ways.
+
+```zer
+u32 five() { return 5; }
+
+u32 main() {
+    u32 n = five();
+    bool a = (bool)n;              // var-decl init
+    bool b = false;
+    b = (bool)n;                   // plain assignment
+    if (a != true)  { return 1; }
+    if (b != true)  { return 2; }
+    if (a != b)     { return 3; }  // every form agrees
+    return 0;
+}
+```
+
+The guarantee holds in **every** position a cast can appear — variable
+initializer, plain assignment, store to a global, `return`, call argument, and
+inside a `defer` body. (Before 2026-09-02 the assignment and `defer` forms
+skipped the normalization; see BUGS-FIXED BUG-915.)
+
+**CASTING FROM `*opaque` — the runtime type check**
+
+Casting a `*opaque` back to a typed pointer is checked at runtime against the
+type the pointer was erased from. A mismatch **traps**; it is not undefined
+behaviour and it is not silent.
+
+```zer
+struct Sensor { u32 a; }
+struct Motor  { u32 b; }
+
+u32 read_motor(*opaque ctx, *Motor seed) {
+    *Motor m = seed;
+    m = (*Motor)ctx;               // traps if ctx did not come from a *Motor
+    return m.b;
+}
+```
+
+A `*opaque` that entered from C (`cinclude`) carries type id 0 = "unknown" and
+is allowed through, because ZER cannot know what C put there — that boundary is
+a documented floor, not a checked edge. Like the `bool` rule above, the check is
+applied at every cast form.
 
 ---
 
@@ -4040,6 +4107,13 @@ g.total = g.value + 1;     // same lock scope (consecutive access grouped)
   snapshot. A **mutable pointer capture `|*x|` of a shared union variant** is a
   compile error (it would alias the shared bytes past the auto-lock) — copy the
   field into a local, mutate it, then assign it back as its own statement.
+- The lock is emitted **per statement, in every statement position** — a function
+  body, either arm of an `if`, a loop body, a `switch` arm whether or not it is
+  braced, a `@critical` or `@once` body, and a `defer` body. There is no spelling
+  of a shared access that skips it. (Before 2026-09-02 a braceless switch arm,
+  `0 => g.x = 5,`, did skip it and emitted an unsynchronized write; the braced
+  form of the same line locked correctly. See BUGS-FIXED BUG-917, and
+  `tests/test_sharedlock_matrix.c`, which now checks every form.)
 
 ### shared(rw) struct — Reader-Writer Lock
 ```zer
@@ -4105,7 +4179,13 @@ borrowed by that thread until `.join()`:
   (`o.cb = bump; o.cb();`), a funcptr array element, or a funcptr obtained from
   a factory (`*() fp = get_fp(); fp();`, including a factory that returns
   another factory's result). A callback that touches nothing, touches only
-  `threadlocal`, or synchronizes with `@atomic_*` compiles as usual
+  `threadlocal`, or synchronizes with `@atomic_*` compiles as usual.
+  A factory's `return` is found **wherever it sits** — top level, or inside an
+  `if`, `for`, `while`, `do-while`, `switch` arm, `defer`, `@critical` or
+  `@once` body. (Before 2026-09-02 the `switch`-arm and `do-while` positions
+  were not searched, so a factory returning the racing callback from either one
+  compiled clean; see BUGS-FIXED BUG-913. The identical rule and the identical
+  fix apply at the `interrupt` sink.)
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)

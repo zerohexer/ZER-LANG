@@ -1,0 +1,25 @@
+// BUG-914 regression. `&idx` inside a SCOPED SPAWN argument must widen idx's
+// VRP range for the whole loop body, exactly as a plain `bump(&idx)` does.
+//
+// Pre-fix: vrp_widen_loop_addr_taken was an if/else chain whose trailing
+// comment claimed NODE_SPAWN was a leaf. It is not — spawn_stmt.args[] holds
+// expressions. So `idx` kept its [0,0] init range, `arr[idx]` was PROVEN safe,
+// the auto-guard was ELIDED, and iterations 2 and 3 executed `arr[100] = 7`
+// on a 4-byte stack array with no diagnostic and no runtime check.
+//
+// Post-fix the guard is inserted, fires on iteration 2, and returns 0.
+// Pre-fix this program runs to completion and returns 42.
+void bump(*u32 p) { *p = 100; }
+
+u32 run() {
+    u8[4] arr;
+    u32 idx = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        arr[idx] = 7;
+        ThreadHandle th = spawn bump(&idx);
+        th.join();
+    }
+    return 42;
+}
+
+u32 main() { return run(); }

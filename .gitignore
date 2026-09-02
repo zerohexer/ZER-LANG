@@ -62,6 +62,8 @@ test_asm_matrix
 # Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
 test_defer_goto_matrix
 test_view_alias_matrix
+test_sharedlock_matrix
+test_borrow_join_matrix
 
 # ---------------------------------------------------------------------------
 # Compiled test binaries — a STRUCTURAL rule, not a name list.

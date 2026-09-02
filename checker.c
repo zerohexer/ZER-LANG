@@ -12981,21 +12981,72 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         _scan_global_depth--;
         return found;
     }
-    if (n->kind == NODE_BLOCK) {
+    /* BUG-913 (2026-09-02): this was an if/else CHAIN over five kinds
+     * (RETURN/BLOCK/IF/WHILE/FOR). A `return <racy funcname>` sitting in any
+     * OTHER body-bearing statement was invisible, so the factory looked like it
+     * returned nothing reachable and the spawn was ACCEPTED. Measured live on
+     * main with a discriminating probe (the factory's only racy return inside
+     * the construct, a safe `return nop;` on the fall-through so no other arm
+     * can mask the result):
+     *
+     *     switch (k) { 0 => { return cb; } default => { } }   -> ACCEPTED
+     *     do { if (k == 9) { return cb; } } while (k > 0);    -> ACCEPTED
+     *
+     * where `cb` does `g += 1` on a non-shared global — a real data race from
+     * the spawned thread, with no diagnostic.
+     *
+     * Now a no-`default:` exhaustive switch, so -Werror=switch forces every
+     * future NodeKind to be classified here instead of silently answering "no".
+     * That is the durable half of the fix: the if-chain form is invisible to
+     * both tools/walker_default_audit.sh and tools/audit_walker_fields.sh, which
+     * is why two of the eleven forms survived four sessions of REACH work. */
+    switch (n->kind) {
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             if (scan_returned_funcname(c, n->block.stmts[i], depth, out_name, out_len))
                 return true;
         return false;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         if (scan_returned_funcname(c, n->if_stmt.then_body, depth + 1, out_name, out_len))
             return true;
         return scan_returned_funcname(c, n->if_stmt.else_body, depth + 1, out_name, out_len);
-    }
-    if (n->kind == NODE_WHILE)
+    case NODE_WHILE:
+    case NODE_DO_WHILE:   /* DO_WHILE was the missing sibling of WHILE. */
         return scan_returned_funcname(c, n->while_stmt.body, depth + 1, out_name, out_len);
-    if (n->kind == NODE_FOR)
+    case NODE_FOR:
         return scan_returned_funcname(c, n->for_stmt.body, depth + 1, out_name, out_len);
+    case NODE_SWITCH:
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (scan_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1,
+                                       out_name, out_len))
+                return true;
+        return false;
+    case NODE_DEFER:
+        return scan_returned_funcname(c, n->defer.body, depth + 1, out_name, out_len);
+    case NODE_CRITICAL:
+        return scan_returned_funcname(c, n->critical.body, depth + 1, out_name, out_len);
+    case NODE_ONCE:
+        return scan_returned_funcname(c, n->once.body, depth + 1, out_name, out_len);
+    /* Kinds that cannot CONTAIN a `return` statement. NODE_RETURN itself is
+     * handled above. Listed explicitly (no `default:`) so a new body-bearing
+     * NodeKind fails the build here rather than reopening this hole. */
+    case NODE_RETURN:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
     return false;
 }
 
@@ -19757,6 +19808,27 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_ONCE:
         vrp_invalidate_loop_body_writes(c, body->once.body);
         break;
+    /* BUG-914 (2026-09-02): SPAWN args, the AWAIT condition and the ASM operand
+     * expressions are EXPRESSIONS, not leaves — `spawn_stmt.args[]`,
+     * `await_stmt.cond` and `asm_stmt.inputs/outputs[].expr` (ast.h). All three
+     * sat in the no-op group below. BUG-826 fixed exactly this omission in the
+     * ISR walker (record_isr_globals) and the atomic-cell walker
+     * (record_atomic_plain_in_callee) but did not carry it to the VRP pair —
+     * the textbook multi-site miss. See the sibling pass for the measured
+     * consequence. */
+    case NODE_SPAWN:
+        for (int i = 0; i < body->spawn_stmt.arg_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        vrp_invalidate_loop_body_writes(c, body->await_stmt.cond);
+        break;
+    case NODE_ASM:
+        for (int i = 0; i < body->asm_stmt.input_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < body->asm_stmt.output_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->asm_stmt.outputs[i].expr);
+        break;
     /* Expression kinds walked only so a NESTED orelse (or assignment) is
      * reached — they write nothing themselves. */
     case NODE_BINARY:
@@ -19809,7 +19881,7 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -19835,12 +19907,37 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
  * with a full range, so no later narrowing applies anywhere in the loop.
  * Over-widening is SOUND for VRP — it can only ADD a guard, never remove one —
  * and only address-taken vars are touched, so plain counters keep the precise
- * join. Mirrors the sibling's if/else-chain form (NOT a switch) so the
- * walker-default audit stays untouched. */
+ * join.
+ *
+ * BUG-914 (2026-09-02): this used to be an if/else CHAIN, whose trailing comment
+ * asserted that "all other NodeKind values are leaves ... no `&` subtree". That
+ * was FALSE for three kinds — NODE_SPAWN (`spawn_stmt.args[]`), NODE_AWAIT
+ * (`await_stmt.cond`) and NODE_ASM (operand exprs) all carry expressions. The
+ * measured consequence, verified on main:
+ *
+ *     u8[4] arr;  u32 idx = 0;
+ *     for (u32 i = 0; i < 3; i += 1) {
+ *         arr[idx] = 7;                                 // <- guard ELIDED
+ *         ThreadHandle th = spawn bump(&idx);           // bump does *p = 100
+ *         th.join();
+ *     }
+ *
+ * The identical program with a plain `bump(&idx);` emits
+ * `if ((size_t)(idx) >= 4u) { return 0; }`; the spawn form emitted NO guard at
+ * all, so iterations 2 and 3 executed `arr[100] = 7` — an out-of-bounds stack
+ * write with no compile-time diagnostic and no runtime check. On bare metal
+ * that is silent corruption with nothing to fault on.
+ *
+ * Converted to a no-`default:` exhaustive switch: -Werror=switch now forces
+ * every future NodeKind to be classified, which is what an if-chain can never
+ * do (it is invisible to tools/walker_default_audit.sh as well). Over-widening
+ * is SOUND for VRP — it can only ADD a guard, never remove one — so descending
+ * more is always the safe direction. */
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
     if (!n) return;
     NodeKind k = n->kind;
-    if (k == NODE_UNARY) {
+    switch (k) {
+    case NODE_UNARY:
         if (n->unary.op == TOK_AMP) {
             Node *root = n->unary.operand;
             while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -19859,71 +19956,117 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
             }
         }
         vrp_widen_loop_addr_taken(c, n->unary.operand);
-    } else if (k == NODE_BLOCK) {
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
-    } else if (k == NODE_IF) {
+        break;
+    case NODE_IF:
         vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
         vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
-    } else if (k == NODE_FOR) {
+        break;
+    case NODE_FOR:
         vrp_widen_loop_addr_taken(c, n->for_stmt.init);
         vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->for_stmt.step);
         vrp_widen_loop_addr_taken(c, n->for_stmt.body);
-    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
         vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->while_stmt.body);
-    } else if (k == NODE_SWITCH) {
+        break;
+    case NODE_SWITCH:
         vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
         for (int i = 0; i < n->switch_stmt.arm_count; i++)
             vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
-    } else if (k == NODE_EXPR_STMT) {
+        break;
+    case NODE_EXPR_STMT:
         vrp_widen_loop_addr_taken(c, n->expr_stmt.expr);
-    } else if (k == NODE_DEFER) {
+        break;
+    case NODE_DEFER:
         vrp_widen_loop_addr_taken(c, n->defer.body);
-    } else if (k == NODE_CRITICAL) {
+        break;
+    case NODE_CRITICAL:
         vrp_widen_loop_addr_taken(c, n->critical.body);
-    } else if (k == NODE_ONCE) {
+        break;
+    case NODE_ONCE:
         vrp_widen_loop_addr_taken(c, n->once.body);
-    } else if (k == NODE_VAR_DECL) {
+        break;
+    case NODE_VAR_DECL:
         vrp_widen_loop_addr_taken(c, n->var_decl.init);
-    } else if (k == NODE_RETURN) {
+        break;
+    case NODE_RETURN:
         vrp_widen_loop_addr_taken(c, n->ret.expr);
-    } else if (k == NODE_ASSIGN) {
+        break;
+    case NODE_ASSIGN:
         vrp_widen_loop_addr_taken(c, n->assign.target);
         vrp_widen_loop_addr_taken(c, n->assign.value);
-    } else if (k == NODE_CALL) {
+        break;
+    case NODE_CALL:
         /* THE case this pass exists for: `bump(&i)`. */
         vrp_widen_loop_addr_taken(c, n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->call.args[i]);
-    } else if (k == NODE_INTRINSIC) {
+        break;
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
-    } else if (k == NODE_BINARY) {
+        break;
+    case NODE_BINARY:
         vrp_widen_loop_addr_taken(c, n->binary.left);
         vrp_widen_loop_addr_taken(c, n->binary.right);
-    } else if (k == NODE_FIELD) {
+        break;
+    case NODE_FIELD:
         vrp_widen_loop_addr_taken(c, n->field.object);
-    } else if (k == NODE_INDEX) {
+        break;
+    case NODE_INDEX:
         vrp_widen_loop_addr_taken(c, n->index_expr.object);
         vrp_widen_loop_addr_taken(c, n->index_expr.index);
-    } else if (k == NODE_ORELSE) {
+        break;
+    case NODE_ORELSE:
         vrp_widen_loop_addr_taken(c, n->orelse.expr);
         vrp_widen_loop_addr_taken(c, n->orelse.fallback);
-    } else if (k == NODE_SLICE) {
+        break;
+    case NODE_SLICE:
         vrp_widen_loop_addr_taken(c, n->slice.object);
         vrp_widen_loop_addr_taken(c, n->slice.start);
         vrp_widen_loop_addr_taken(c, n->slice.end);
-    } else if (k == NODE_TYPECAST) {
+        break;
+    case NODE_TYPECAST:
         vrp_widen_loop_addr_taken(c, n->typecast.expr);
-    } else if (k == NODE_STRUCT_INIT) {
+        break;
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++)
             vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+        break;
+    /* THE BUG-914 kinds: these are NOT leaves. */
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        vrp_widen_loop_addr_taken(c, n->await_stmt.cond);
+        break;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.outputs[i].expr);
+        break;
+    /* Genuine leaves — no expression subtree that could contain `&x`. Listed
+     * explicitly (no `default:`) so a new NodeKind is a build error here. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
     }
-    /* All other NodeKind values are leaves (literals, idents, break/continue/
-     * goto/label/yield/await/spawn/asm/static_assert) — no `&` subtree. */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */
@@ -20021,21 +20164,66 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
     if (!c || !n || depth > 8) return;
-    if (n->kind == NODE_RETURN) { record_isr_funcname_binding(c, n->ret.expr, depth); return; }
-    if (n->kind == NODE_BLOCK) {
+    /* BUG-913 — the ISR SIBLING of scan_returned_funcname. Same defect, one kind
+     * apart: this chain did cover DO_WHILE but not SWITCH, so
+     *
+     *     *() -> void mk() { switch (k) { 0 => { return bump; } default => { } }
+     *                        return nop; }
+     *     interrupt TIM1 { *() -> void fp = mk(); fp(); }
+     *
+     * was ACCEPTED with `bump` doing `g += 1` on a non-volatile global also
+     * touched by main — the missing-volatile ISR race, silent on bare metal.
+     * Converted to the same no-`default:` exhaustive switch so the two sinks
+     * can no longer drift apart by a kind (they already had). */
+    switch (n->kind) {
+    case NODE_RETURN:
+        record_isr_funcname_binding(c, n->ret.expr, depth);
+        return;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             record_isr_returned_funcname(c, n->block.stmts[i], depth);
         return;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         record_isr_returned_funcname(c, n->if_stmt.then_body, depth + 1);
         record_isr_returned_funcname(c, n->if_stmt.else_body, depth + 1);
         return;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1);
+        return;
+    case NODE_FOR:
+        record_isr_returned_funcname(c, n->for_stmt.body, depth + 1);
+        return;
+    case NODE_SWITCH:   /* the missing kind on this sink */
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            record_isr_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1);
+        return;
+    case NODE_DEFER:
+        record_isr_returned_funcname(c, n->defer.body, depth + 1);
+        return;
+    case NODE_CRITICAL:
+        record_isr_returned_funcname(c, n->critical.body, depth + 1);
+        return;
+    case NODE_ONCE:
+        record_isr_returned_funcname(c, n->once.body, depth + 1);
+        return;
+    /* Cannot contain a `return`. No `default:` — see the spawn sibling. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
     }
-    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) {
-        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1); return;
-    }
-    if (n->kind == NODE_FOR) { record_isr_returned_funcname(c, n->for_stmt.body, depth + 1); return; }
 }
 
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {

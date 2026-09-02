@@ -1176,6 +1176,139 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — 2026-09-02 audit: leads NOT yet verified (hypotheses, not findings)
+
+These came out of full-file structural reads of `zercheck_ir.c`, `ir_lower.c` and
+`emitter.c` during the 2026-09-02 audit. **None has a reproducer.** Four items from the
+same sweep WERE verified and are fixed (BUG-913..916, see BUGS-FIXED.md); four others
+were verified as NOT bugs and are recorded there too. What is left is this list.
+
+Treat every row as a HYPOTHESIS. This file's own MEASURE-FIRST protocol applies: build
+the reproducer against current main and read the DIAGNOSTIC before implementing
+anything. Four of six entries in a previous OPEN list turned out to be already closed.
+
+**Ordered by the severity they WOULD have if real.**
+
+### A. `ir_merge_states` (zercheck_ir.c:1095) merges a SUBSET of `IRHandleInfo`
+
+The join copies `state`, `free_block`, `freed_all_paths` and (for 3 of 9 arms) `free_line`
+for handles already present in the result; every other field keeps whatever
+`states[first_live]` had, i.e. **is decided by predecessor order**:
+`escaped`, `alloc_id`, `source_color`, `pool_name`, `is_move_local`, `is_thread_handle`,
+`alloc_line`, `freed_defer_id`, and the BUG-849 `view_alloc_ids`/`view_count`/`view_overflow`
+set. `escaped` drives the leak skip and the overwrite check; the view set drives UAF
+reporting. Order-dependence in either direction is the concern.
+
+Related, same function: the state table covers **9 of 25** (state × state) pairs. Identity
+pairs and `rh == MAYBE_FREED` are correct by fall-through, but every pair involving
+`IR_HS_UNKNOWN` is unhandled — `(UNKNOWN, ALIVE)` keeps UNKNOWN, which would untrack an
+allocation at a join. Reachability is narrow (a pred needs an explicit UNKNOWN entry, which
+today only the global-store clear at 2934/4225 produces), so build the probe around that.
+
+Also: the convergence test (6519) compares only `handle_count`, per-handle `state`,
+`thread_count` and per-thread `joined`. An iteration that changes only `escaped` or the
+view set reports "converged".
+
+### B. `IRPathState.critical_depth` is not merged at all
+
+`ir_ps_copy` supplies it from `states[first_live]`; there is no max/join. If one
+predecessor is inside `@critical` and another is not, the `@critical` spawn/slab bans
+(2959, 3073, 5869) would read the wrong depth on the merged path.
+
+### C. `ir_ps_copy` forces `terminated = false`, making three merge branches dead
+
+`ir_ps_copy` (line 186) hard-codes it, and the driver always feeds the merge through
+`ir_ps_copy` — so `states[si].terminated` is always false and the `first_live` search
+(1104), the "all preds terminated ⇒ unreachable" branch (1108) and the dead-path skip
+(1144) never fire. Either the field is doing nothing, or it is meant to and does not.
+Establish which before touching it.
+
+### D. Terminator/opcode enumerations that disagree with each other
+
+- `ir_block_is_terminated` (ir.c:287) lists BRANCH/GOTO/RETURN/YIELD. `ir_compute_preds`,
+  `dfs_reachable` and `cfg_reaches_fire` all treat `IR_AWAIT` as a terminator. One of the
+  four is wrong.
+- `ir_fire_has_work_after` skip-list (2401) has 5 opcodes and omits `IR_NOP` — which
+  lowering emits, and which is the carrier for spawn/asm passthrough. A stray NOP after a
+  defer fire would make a function-exit fire look block-scoped.
+- `ir_type_is_ptrish` (1509) covers POINTER/OPAQUE/HANDLE but not `TYPE_SLICE`, although
+  3634 and 7022 both treat SLICE as reference-producing.
+- `ir.c` has `default:` in 3 of its 4 opcode switches (243, 315, 353), while
+  `zercheck_ir.c` has none anywhere. A new opcode is silently absorbed on the `ir.c` side.
+
+### E. `ir_lower_interrupt` and defers — **REFUTED, measured 2026-09-02**
+
+The hypothesis was that `ir_lower_interrupt` (3949) drops pending defers because it lacks
+the explicit fire that `ir_lower_func` has (3904-3908). Measured on the emitted C: it does
+not. A `defer release();` in an `interrupt` body emits `release()` on the fall-through
+path, and on an early-`return` path as well — exactly once on each, two call sites for the
+two paths. The block-scope fire covers what the implicit-return fire would have.
+
+Left in this list, marked refuted rather than deleted, because the reasoning that produced
+it (reading one function's exit path in isolation) is the same reasoning that will produce
+it again.
+
+### F. `pre_lower_orelse` on `await_stmt.cond` defeats `IR_AWAIT` re-evaluation
+
+`IR_AWAIT`'s design (comment at ir_lower.c:3685) is that the emitter re-evaluates the
+condition on every poll. `pre_lower_orelse` at 3704 hoists an orelse in that condition into
+the block BEFORE the await, so on resume the emitter re-reads a temp that is never
+recomputed. `await (poll() orelse false);` would latch its first value.
+
+### G. Bare-expression switch arm and the shared lock — **CONFIRMED and FIXED (BUG-917)**
+
+Measured, and it was a silent data race:
+
+    0 => g.x = 5,        ->  g.x = 5;                       (no mutex)
+    0 => { g.x = 5; }    ->  lock; g.x = 5; unlock;
+
+Same program, two spellings, one unsynchronized with no diagnostic. Fixed in the PARSER by
+wrapping the bare arm expression in a single-statement `NODE_BLOCK`, which makes "every
+statement body is a NODE_BLOCK" universal rather than true-with-one-exception. See
+BUGS-FIXED.md BUG-917.
+
+The same entry speculated that `defer <stmt>;` (which builds a bare `NODE_EXPR_STMT` the
+same way) and `NODE_AWAIT` conditions were unlocked for the same reason. **`defer` was
+measured and is NOT affected** — it locks correctly in both spellings, because defer bodies
+are replayed through a different path. The AWAIT condition is still unmeasured; note that
+`await` only exists in `async` functions, where a shared access in a statement containing
+the suspend is already a compile error, so the reachable window is narrow.
+
+### H. `expr_mentions_name` still has the gap its twin had
+
+`expr_mentions_global` (checker.c:2674) was widened by BUG-856 to cover INTRINSIC / CALL /
+ORELSE / SLICE. `expr_mentions_name` (2659) covers only IDENT / BINARY / UNARY / FIELD /
+INDEX / TYPECAST. It feeds `rmw_scan_body`. Two functions, one question, one of them fixed.
+
+### I. Depth and width caps with no diagnostic on exhaustion
+
+`resolve_write_target_global` bails at **depth > 6** — the tightest bound of any shared
+safety resolver, at both RMW sinks. `RMW_ALIAS_MAX 16` silently drops bindings past 16
+(overflow checks at 13287/13378/20139/20191) and a dropped binding is a MISSED race, i.e.
+the unsafe direction. `Type *found[4]` caps shared types per statement at 4.
+`Symbol.rmw_param_mask` at 7742 has no conservative fallback past index 63.
+
+### J. Two allocator-name enumerations that will rot
+
+`ir_classify_method_call_ex` knows 8 method names and none of the Ring ones, although
+`IR_RING_PUSH`/`POP`/`PUSH_CHECKED` exist in `ir.h`. The cstdlib allocator list is
+`malloc`/`calloc`/`realloc` only — `strdup`, `aligned_alloc`, `reallocarray` fall to
+`ZC_COLOR_UNKNOWN`. And `ThreadHandle` recognizes only `join`, while two diagnostics tell
+the user to "add th.join() or detach explicitly" — `detach` is not recognized, so following
+the advice does not silence the error.
+
+### K. Large parts of `ir_check_inst` are dead in the current pipeline
+
+Lowering emits 22 opcodes. `IR_SPAWN`, `IR_FIELD_WRITE` and `IR_INDEX_WRITE` are not among
+them (spawn goes through `IR_NOP` + `NODE_SPAWN`; the writes go through `IR_ASSIGN`), yet
+each has a full handler. Consequence worth checking: `is_thread_handle` is set ONLY at 5911
+inside the dead `IR_SPAWN` handler, so the "ThreadHandle not joined" branch at 7689 may be
+unreachable and the live check may be the name-based pass at 7759. A fix applied to any of
+these three handlers would be silently ineffective — which is the reason to resolve this
+one even though it is not itself a bug.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a
@@ -1825,6 +1958,29 @@ where a bug ships a race rather than an over-rejection. It should follow the
 documented accept-unsafe discipline: build the exhaustive branch x join-position
 grid FIRST, verify it fires against the pre-fix build, then relax. The
 over-rejection is safe to live with meanwhile.
+
+**UPDATE 2026-09-02 — the grid now EXISTS: `tests/test_borrow_join_matrix.c`**
+(in `make check`). That was the prescribed first step and it is done, so the next
+session starts from a fixed contract instead of inventing one:
+
+- **Nine hard-gated negatives** pin the soundness that exists today (then-only,
+  else-only, no-else, neither, nested-in-one-arm, nested-in-both, loop body,
+  switch arms, and a two-handle cell that forces the release to be keyed
+  per-HANDLE rather than per-branch). All nine pass — measured, not assumed.
+- **Two PENDING cells** are this over-rejection, with the expectation INVERTED
+  (`tests/zer_gaps/` semantics): they must currently be REJECTED **and for the
+  borrow reason**, so the cell cannot pass vacuously. The day the relaxation
+  lands, the grid FAILS with "GAP CLOSED — promote this cell". A closing gap that
+  silently starts passing is the failure mode this convention exists to prevent.
+
+The mechanism is small (record a handle whose join was refused at exactly
+`th_spawn_branch_depth + 1`, once per arm; release after the if when BOTH arms
+recorded the SAME handle). The **soundness obligation is not**, and it is written
+out in full in the matrix file's header — five conditions, of which two (a
+different handle declared inside an arm borrowing the same local, and the
+break/continue/return/goto interaction with a linear tracker) must be MEASURED
+before any code is written. They were not measured this session, which is why the
+relaxation was specified rather than shipped.
 
 **Tripwire.** `tests/zer/scoped_borrow_branch_shapes.zer` pins the four shapes
 that must keep compiling, so the guard cannot broaden unnoticed.

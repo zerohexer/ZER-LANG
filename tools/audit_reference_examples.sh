@@ -105,13 +105,28 @@ PRELUDE_DECLS=(
 # declares its own `struct Task` must not get a second one, and a block that
 # declares its own mmio range must not overlap the catch-all.
 make_prelude() {
-    local blk="$1" out="$2" name decl
+    local blk="$1" out="$2" name decl skipped_task=0
     : > "$out"
     grep -qE '^[[:space:]]*mmio[[:space:]]' "$blk" || \
         echo "mmio 0x0..0xFFFFFFFFFFFFFFFF;" >> "$out"
     for entry in "${PRELUDE_DECLS[@]}"; do
         name="${entry%%|*}"; decl="${entry#*|}"
-        grep -qE "(struct|union|enum|container)[[:space:]]+$name\b|\b$name[[:space:]]*[;=]|\)[[:space:]]+$name[[:space:]]*;" "$blk" && continue
+        if grep -qE "(struct|union|enum|container)[[:space:]]+$name\b|\b$name[[:space:]]*[;=]|\)[[:space:]]+$name[[:space:]]*;" "$blk"; then
+            [ "$name" = "Task" ] && skipped_task=1
+            continue
+        fi
+        # 2026-09-02: `heap` and `pool` are Slab(Task)/Pool(Task,8) — they DEPEND on
+        # the Task declaration. When a block supplies its own `struct Task`, the
+        # Task entry above is skipped but these two were still emitted, ahead of the
+        # block, referencing a type that does not exist yet: "undefined type 'Task'"
+        # at two prelude lines. The block was blamed and pushed into the baseline.
+        # A self-contained example is the thing this audit exists to encourage, so a
+        # prelude that punishes one is worse than no prelude. Skip the dependents
+        # with their dependency; the block declares Task, so a block that also wants
+        # an allocator can declare it too.
+        if [ "$skipped_task" = "1" ] && { [ "$name" = "heap" ] || [ "$name" = "pool" ]; }; then
+            continue
+        fi
         echo "$decl" >> "$out"
     done
 }

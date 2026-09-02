@@ -16,6 +16,15 @@
 # the file and dies the moment the block's text changes — which is exactly when
 # it needs re-reviewing. The trailing `reference.md:<line>` is a human hint only.
 #
+# 2026-09-02: 80 -> 74. SIX rows retired. Two blocks were rewritten to be
+# self-contained ([*]T and *T). The other FOUR were never broken: `make_prelude`
+# emitted `Slab(Task) heap;` and `Pool(Task, 8) pool;` AHEAD of a block that
+# declared its own `struct Task`, having correctly skipped the Task entry itself
+# — so the prelude referenced a type that did not exist yet and the block was
+# blamed for "undefined type 'Task'". The gate was broken and its baseline
+# absorbed the evidence. Same lesson as the walker-field baseline this session:
+# when a row goes in without a stated reason, nobody re-checks whether the row
+# is describing the example or describing the checker.
 # 2026-08-25: 86 -> 84. Two rows retired because their blocks now COMPILE — the
 # funcptr syntax catalogues, rewritten to be self-contained after BUG-878/879
 # made arrays of function pointers actually work. That is the baseline shrinking
@@ -30,13 +39,9 @@ dfa8ccb992bdfc47  reference.md:93
 cbf973809ab90199  reference.md:158
 dd5fdde401db71ce  reference.md:210
 a6ebf1e6f152d059  reference.md:221
-fada445f41559b48  reference.md:251
-6ef265d9e0172d35  reference.md:308
-652a795e1b0c8729  reference.md:314
 a88161d6ee26cd71  reference.md:347
 c50576dbc5c2a59b  reference.md:388
 44069030d6a04a51  reference.md:415
-c06cc35ad5af93f6  reference.md:447
 7eb20e4b46c67ca2  reference.md:457
 c48ac2be266d6950  reference.md:544
 f4ef00cd72e06770  reference.md:578
@@ -59,13 +64,10 @@ f6aacb1c7407ada0  reference.md:1129
 122efc1c95771253  reference.md:1158
 47f803c951ed58ab  reference.md:1240
 5e14fe2966596dc4  reference.md:1293
-72ee3e99afd59bec  reference.md:1310
 84297a2431669274  reference.md:1350
 bec093813c5f183d  reference.md:1355
 e41d7631cbfce5eb  reference.md:1378
-aa63b3222878de43  reference.md:1406
 b06fafd5daf9214b  reference.md:1472
-919bf4b635112a98  reference.md:1495
 bd7964125ba9ebee  reference.md:1534
 75de8470de7afd97  reference.md:1544
 de40d7f59a7c8237  reference.md:1619
@@ -81,7 +83,6 @@ de3e938dd8ebb874  reference.md:1912
 d361ea32e78aa5e3  reference.md:1926
 b28c0b01d6f2c572  reference.md:1962
 e044455f457cb3e7  reference.md:1988
-1512197f44d5f5f9  reference.md:2636
 d38a3e67e4ff9cd0  reference.md:2660
 a75a37b298d178ea  reference.md:2675
 aa8de80acb528ee5  reference.md:2688

@@ -1,0 +1,20 @@
+// expect-error: interrupt and main
+// BUG-913 at the ISR SINK — the sibling of spawn_race_factory_switch.zer.
+// record_isr_returned_funcname had DO_WHILE but not SWITCH, so the two sinks
+// were one kind apart and this ISR/main race on a non-volatile global was
+// accepted while the spawn form of the same shape was not.
+u32 g;
+void bump() { g += 1; }
+void nop() { }
+
+*() -> void mk() {
+    u32 k = 0;
+    switch (k) {
+        0 => { return bump; }
+        default => { }
+    }
+    return nop;
+}
+
+interrupt TIM1 { *() -> void fp = mk(); fp(); }
+u32 main() { g = 1; return g; }

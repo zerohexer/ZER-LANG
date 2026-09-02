@@ -399,14 +399,19 @@ checker.c:validate_gotos:NODE_VAR_DECL:var_decl.init
 checker.c:validate_gotos:NODE_WHILE:while_stmt.cond
 
 # --- checker.c: vrp_invalidate_loop_body_writes ---
-checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.inputs
-checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.outputs
-checker.c:vrp_invalidate_loop_body_writes:NODE_AWAIT:await_stmt.cond
+# BUG-914 (2026-09-02): FOUR rows removed from this block — NODE_SPAWN:spawn_stmt.args,
+# NODE_AWAIT:await_stmt.cond and the two NODE_ASM operand lists. They were bulk-
+# baselined with NO per-row justification, and the SPAWN one was a live silent
+# stack-OOB (an `&idx` in a scoped-spawn argument never widened the loop range,
+# so a later `arr[idx]` had its bounds guard elided). The gate had FLAGGED the
+# hole; baselining it without writing down why made it invisible again.
+# LESSON, and it generalises to every row in this file: a baseline row with no
+# stated reason is an UN-REVIEWED hole wearing a reviewed badge. When you add
+# a row, write the sentence that says why the skip is correct.
 checker.c:vrp_invalidate_loop_body_writes:NODE_FILE:file.decls
 checker.c:vrp_invalidate_loop_body_writes:NODE_FUNC_DECL:func_decl.body
 checker.c:vrp_invalidate_loop_body_writes:NODE_GLOBAL_VAR:var_decl.init
 checker.c:vrp_invalidate_loop_body_writes:NODE_INTERRUPT:interrupt.body
-checker.c:vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args
 checker.c:vrp_invalidate_loop_body_writes:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- emitter.c: emit_auto_guards ---
@@ -824,3 +829,108 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# 2026-09-02 — 684 -> 762. THREE if/else-chain walkers converted to no-`default:`
+# exhaustive switches (BUG-913 / BUG-914). The conversion is the fix: as if-chains
+# they were invisible to BOTH kind-level gates, which is how the holes below
+# survived. Converting them makes every kind explicit, and every kind they
+# deliberately do NOT descend has to be justified here. That is the trade the
+# gate is for.
+#
+# vrp_widen_loop_addr_taken — finds `&x` inside a LOOP BODY so the loop can widen
+# x's range before the body is checked. The five skipped children are top-level
+# DECLARATION bodies (a file, a function, a global initializer, an interrupt
+# handler) which cannot syntactically occur inside a loop body, plus a
+# static_assert condition, which must be a compile-time constant and therefore
+# cannot contain `&x`. Descending them could only cost time, never find a `&`.
+checker.c:vrp_widen_loop_addr_taken:NODE_FILE:file.decls
+checker.c:vrp_widen_loop_addr_taken:NODE_FUNC_DECL:func_decl.body
+checker.c:vrp_widen_loop_addr_taken:NODE_GLOBAL_VAR:var_decl.init
+checker.c:vrp_widen_loop_addr_taken:NODE_INTERRUPT:interrupt.body
+checker.c:vrp_widen_loop_addr_taken:NODE_STATIC_ASSERT:static_assert_stmt.cond
+#
+# scan_returned_funcname / record_isr_returned_funcname — the spawn-sink and
+# ISR-sink FACTORY walkers. Both look for one thing: a `return <funcname>;`
+# STATEMENT in a factory body. They therefore descend statement BODIES and
+# nothing else. Every accessor below is either (a) an expression child of a
+# handled arm (`if_stmt.cond`, `for_stmt.init/cond/step`, `while_stmt.cond`,
+# `switch_stmt.expr`) or (b) a child of a kind that cannot contain a return
+# statement at all. ZER has no statement-expressions, so no `return` can be
+# reached through any of them. Note the two lists are IDENTICAL apart from the
+# spawn walker's extra NODE_RETURN row (it consumes `ret.expr` through a
+# different helper) — the sinks are meant to stay in lockstep, and a future
+# divergence between these two blocks is itself the signal that they drifted.
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:scan_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:scan_returned_funcname:NODE_BINARY:binary.left
+checker.c:scan_returned_funcname:NODE_BINARY:binary.right
+checker.c:scan_returned_funcname:NODE_CALL:call.args
+checker.c:scan_returned_funcname:NODE_CALL:call.callee
+checker.c:scan_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:scan_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:scan_returned_funcname:NODE_FIELD:field.object
+checker.c:scan_returned_funcname:NODE_FILE:file.decls
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:scan_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:scan_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:scan_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:scan_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:scan_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:scan_returned_funcname:NODE_RETURN:ret.expr
+checker.c:scan_returned_funcname:NODE_SLICE:slice.end
+checker.c:scan_returned_funcname:NODE_SLICE:slice.object
+checker.c:scan_returned_funcname:NODE_SLICE:slice.start
+checker.c:scan_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:scan_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:scan_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:scan_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:scan_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:scan_returned_funcname:NODE_UNARY:unary.operand
+checker.c:scan_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:scan_returned_funcname:NODE_WHILE:while_stmt.cond
+#
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:record_isr_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.left
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.right
+checker.c:record_isr_returned_funcname:NODE_CALL:call.args
+checker.c:record_isr_returned_funcname:NODE_CALL:call.callee
+checker.c:record_isr_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_FIELD:field.object
+checker.c:record_isr_returned_funcname:NODE_FILE:file.decls
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:record_isr_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:record_isr_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:record_isr_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:record_isr_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.end
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.object
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.start
+checker.c:record_isr_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:record_isr_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:record_isr_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:record_isr_returned_funcname:NODE_UNARY:unary.operand
+checker.c:record_isr_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_WHILE:while_stmt.cond

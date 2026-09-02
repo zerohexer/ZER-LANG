@@ -375,7 +375,8 @@ static const char *sink_name(CASink s) {
  * A new reach form with no cell here is INVISIBLE. Add the cell in the same
  * commit as the form. */
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
-               RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM, RCH_COUNT } CAReach;
+               RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM,
+               RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
 static const char *reach_name(CAReach r) {
@@ -388,6 +389,8 @@ static const char *reach_name(CAReach r) {
     case RCH_FACTORY2: return "factory-2hop";
     case RCH_FIELD_ARRAY: return "field-array-elem";
     case RCH_FWD_PARAM:   return "forwarded-param";
+    case RCH_FACTORY_SWITCH:  return "factory-switch-arm";
+    case RCH_FACTORY_DOWHILE: return "factory-dowhile-body";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -448,6 +451,24 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
     case RCH_FWD_PARAM:
         extra = "void inner(*() -> void f) { f(); }\n";
         wbody = "spawn inner(cb);"; break;
+    /* 10th and 11th forms (BUG-913, 2026-09-02). The factory reaches `cb`
+     * through a statement kind scan_returned_funcname's if/else chain never
+     * descended: a SWITCH ARM, and a DO-WHILE body (it handled NODE_WHILE but
+     * not its NODE_DO_WHILE sibling). Both were ACCEPTED on main.
+     *
+     * Note the shape: the factory falls through to `return nop;`, so the ONLY
+     * way `cb` can be reached is by descending the construct under test. A
+     * factory whose trailing return also handed back `cb` would be rejected by
+     * the plain-RETURN arm and prove nothing — that masking is what made the
+     * first probes of these two forms read as "already covered". */
+    case RCH_FACTORY_SWITCH:
+        extra = "void nop() { }\n"
+                "*() -> void mk(u32 k) { switch (k) { 0 => { return cb; } default => { } } return nop; }\n";
+        wbody = "*() -> void fp = mk(0); fp();"; break;
+    case RCH_FACTORY_DOWHILE:
+        extra = "void nop() { }\n"
+                "*() -> void mk(u32 k) { do { if (k == 9) { return cb; } } while (k > 0); return nop; }\n";
+        wbody = "*() -> void fp = mk(0); fp();"; break;
     default: break;
     }
     snprintf(out, n,
@@ -572,6 +593,7 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
  * A new reach form must get a cell HERE as well as in the spawn grid. */
 typedef enum { IR_DIRECT, IR_GLOBAL_FP, IR_ARG, IR_STRUCT_INIT, IR_LOCAL_BIND,
                IR_FIELD_ASSIGN, IR_FIELD_ARRAY, IR_FACTORY1, IR_FACTORY2,
+               IR_FACTORY_SWITCH, IR_FACTORY_DOWHILE,
                IR_COUNT } IsrReach;
 
 static const char *isr_name(IsrReach r) {
@@ -585,6 +607,8 @@ static const char *isr_name(IsrReach r) {
     case IR_FIELD_ARRAY:  return "field-array-elem";
     case IR_FACTORY1:     return "factory-1hop";
     case IR_FACTORY2:     return "factory-2hop";
+    case IR_FACTORY_SWITCH:  return "factory-switch-arm";
+    case IR_FACTORY_DOWHILE: return "factory-dowhile-body";
     case IR_COUNT:        break;
     }
     return "?";
@@ -607,6 +631,18 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
                           body = "*() -> void fp = mk(); fp();"; break;
     case IR_FACTORY2:     extra = "*() -> void mk2() { return bump; }\n*() -> void mk() { return mk2(); }\n";
                           body = "*() -> void fp = mk(); fp();"; break;
+    /* BUG-913 — the ISR SIBLINGS of the two new spawn cells. The two sinks were
+     * one kind apart: record_isr_returned_funcname covered DO_WHILE but not
+     * SWITCH, while the spawn walker covered neither. Keeping both cells on
+     * both grids is what makes that drift visible instead of silent. */
+    case IR_FACTORY_SWITCH:
+                          extra = "void nop() { }\n"
+                                  "*() -> void mk(u32 k) { switch (k) { 0 => { return bump; } default => { } } return nop; }\n";
+                          body = "*() -> void fp = mk(0); fp();"; break;
+    case IR_FACTORY_DOWHILE:
+                          extra = "void nop() { }\n"
+                                  "*() -> void mk(u32 k) { do { if (k == 9) { return bump; } } while (k > 0); return nop; }\n";
+                          body = "*() -> void fp = mk(0); fp();"; break;
     default: break;
     }
     snprintf(out, n,

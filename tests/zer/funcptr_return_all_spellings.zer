@@ -1,0 +1,30 @@
+// BUG-916 regression. A function whose RETURN TYPE is a function pointer must
+// emit C's nested declarator `RET (*name(params))(args)`. The "is the return a
+// funcptr?" test read `ret->kind == TYPE_FUNC_PTR` RAW, so a return type behind
+// a `?` or a `distinct` wrapper missed it and emitted
+//   void (*)() maybe(uint32_t k)
+// — an abstract declarator with a name glued on, which GCC rejects outright.
+// A valid ZER program did not build.
+//
+// This is BUG-879 one sink over (that fix peeled the same two wrappers for a
+// funcptr ARRAY element). Both funcptr spellings and both wrappers are crossed
+// here, because the defect was per-SPELLING, not per-feature.
+typedef void (*VFn)();
+
+void cb_a() { }
+void cb_b() { }
+
+*() -> void         mk_2c()          { return cb_a; }   // 2C, bare
+?*() -> void        mk_2c_opt(u32 k) { if (k == 0) { return null; } return cb_a; }
+VFn                 mk_2a()          { return cb_b; }   // 2A typedef, bare
+?VFn                mk_2a_opt(u32 k) { if (k == 0) { return null; } return cb_b; }
+
+u32 main() {
+    *() -> void f1 = mk_2c();            f1();
+    *() -> void f2 = mk_2c_opt(1) orelse cb_a;  f2();
+    VFn         f3 = mk_2a();            f3();
+    VFn         f4 = mk_2a_opt(1) orelse cb_b;  f4();
+    /* the null arm must still be reachable and well-typed */
+    VFn         f5 = mk_2a_opt(0) orelse cb_b;  f5();
+    return 0;
+}

@@ -1097,6 +1097,106 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
     emit(e, ")_zer_f2i%d; })", tmp);
 }
 
+/* ================================================================
+ * CAST EMISSION — ONE POLICY, THREE CALL SITES  (BUG-915, 2026-09-02)
+ * ================================================================
+ *
+ * A `(T)x` cast is emitted from THREE places, and the policy had been copied
+ * into each by hand:
+ *
+ *   1. emit_expr           NODE_TYPECAST  — global/const initializers
+ *   2. emit_rewritten_node NODE_TYPECAST  — the IR expression path: plain
+ *                                           assignments, defer bodies, spawn args
+ *   3. emit_ir_inst        IR_CAST        — the decomposed 3AC path
+ *
+ * Sites 1 and 3 implemented FOUR behaviours. Site 2 implemented ONE. Measured
+ * on main, both live and both silent-to-the-user:
+ *
+ *   bool a = false;  a = (bool)pick();      // pick() returns 5
+ *       -> site 2 emitted `a = ((uint8_t)pick())`, so `a` holds 5.
+ *          `if (a)` is TRUE and `a == true` is FALSE — the same value reading
+ *          two ways. The probe returned 9 where it must return 0.
+ *          (This is BUG-586, fixed at sites 1 and 3, never at site 2.)
+ *
+ *   *Motor m = seed;  m = (*Motor)ctx;      // ctx is *opaque
+ *       -> site 2 emitted `((struct Motor*)ctx)`, casting the `_zer_opaque`
+ *          STRUCT straight to a pointer. GCC rejects it ("cannot convert to a
+ *          pointer type"), so a valid ZER program does not build; and had it
+ *          built, the runtime `type_id` check that site 3 emits — the whole
+ *          mechanism that stops a wrong-typed `*opaque` being dereferenced —
+ *          would have been absent.
+ *
+ * Adding the missing arms to site 2 would have made a fourth copy and left the
+ * next divergence just as invisible. Instead the DECISION and the EMISSION now
+ * live here once; each site supplies only its own way of emitting the operand,
+ * through CastOperand. This is the same class-kill shape as `value_flows_to`
+ * (checker.c) — one query, N thin sites — and it is what makes the parity
+ * structural rather than remembered.
+ *
+ * The form switch has no `default:`, so a new cast form is a build error rather
+ * than a silent fall-through to a plain C cast at whichever site was forgotten.
+ */
+typedef enum {
+    CASTF_TO_OPAQUE,    /* *T -> *opaque : wrap as (_zer_opaque){ptr, type_id} */
+    CASTF_FROM_OPAQUE,  /* *opaque -> *T : unwrap .ptr, trap on type_id mismatch */
+    CASTF_TO_BOOL,      /* int/float/ptr -> bool : (uint8_t)!!x, NOT a plain cast */
+    CASTF_F2I,          /* float -> integer : saturating (BUG-883) */
+    CASTF_PLAIN         /* everything else : ((T)x) */
+} CastForm;
+
+/* How the ONE emitter below gets at the value being cast. */
+typedef enum { CASTOP_AST, CASTOP_REWRITTEN, CASTOP_LOCAL } CastOperandKind;
+typedef struct {
+    CastOperandKind kind;
+    Node   *expr;       /* CASTOP_AST / CASTOP_REWRITTEN */
+    IRFunc *func;       /* CASTOP_REWRITTEN / CASTOP_LOCAL */
+    int     local;      /* CASTOP_LOCAL */
+} CastOperand;
+
+/* type_id of the struct/enum/union a pointer points at (0 = not one of those).
+ * Every kind test below goes through type_dispatch_kind(), which unwraps
+ * `distinct` and is NULL-safe — so a `distinct` typedef over a struct still
+ * yields its type_id instead of silently reading 0 and disabling the check. */
+static uint32_t cast_pointee_type_id(Type *ptr_inner) {
+    if (!ptr_inner) return 0;
+    Type *inner = type_unwrap_distinct(ptr_inner);
+    switch (type_dispatch_kind(ptr_inner)) {
+    case TYPE_STRUCT: return inner->struct_type.type_id;
+    case TYPE_ENUM:   return inner->enum_type.type_id;
+    case TYPE_UNION:  return inner->union_type.type_id;
+    default:          return 0;
+    }
+}
+
+static bool cast_type_is_opaque_ptr(Type *eff) {
+    if (!eff) return false;
+    if (type_dispatch_kind(eff) == TYPE_OPAQUE) return true;
+    return type_dispatch_kind(eff) == TYPE_POINTER && eff->pointer.inner &&
+           type_dispatch_kind(eff->pointer.inner) == TYPE_OPAQUE;
+}
+
+/* THE policy. Order matters and is the order sites 1 and 3 already used:
+ * opaque handling outranks bool/float because an opaque round-trip is about
+ * representation, not value. */
+static CastForm classify_cast(Type *src_eff, Type *tgt_eff) {
+    if (type_dispatch_kind(src_eff) == TYPE_POINTER &&
+        type_dispatch_kind(tgt_eff) == TYPE_POINTER && tgt_eff->pointer.inner &&
+        type_dispatch_kind(tgt_eff->pointer.inner) == TYPE_OPAQUE)
+        return CASTF_TO_OPAQUE;
+    if (type_dispatch_kind(tgt_eff) == TYPE_POINTER && cast_type_is_opaque_ptr(src_eff))
+        return CASTF_FROM_OPAQUE;
+    if (type_dispatch_kind(tgt_eff) == TYPE_BOOL && src_eff &&
+        (type_is_integer(src_eff) || type_is_float(src_eff) ||
+         type_dispatch_kind(src_eff) == TYPE_POINTER))
+        return CASTF_TO_BOOL;
+    if (f2i_needs_guard(src_eff, tgt_eff)) return CASTF_F2I;
+    return CASTF_PLAIN;
+}
+
+static void emit_cast_operand(Emitter *e, const CastOperand *op);
+static void emit_cast_value(Emitter *e, const CastOperand *op,
+                            Type *src_eff, Type *tgt, Type *tgt_eff);
+
 /* BUG-851: five emitter GIVE-UP paths emitted a comment plus a placeholder when the
  * emitter reached a shape it could not lower. Not a live bug — a live RISK, of exactly
  * the class tools/emit_audit.sh exists to guard, sitting in the emitter itself and not
@@ -1432,6 +1532,35 @@ static void emit_type(Emitter *e, Type *t) {
 }
 
 /* emit type with variable name (handles arrays and func ptrs) */
+/* BUG-916 (2026-09-02): a function whose RETURN TYPE is a function pointer needs
+ * C's nested-declarator form `RET (*name(params))(fp_args)`. Both signature
+ * emitters tested for that with a RAW type-kind comparison against TYPE_FUNC_PTR
+ * (no distinct/optional unwrap), so a return
+ * type wearing a `?` or `distinct` wrapper missed the branch and fell through to
+ * the plain `emit_type(ret); " "; name` form, producing
+ *
+ *     void (*)() maybe(uint32_t k) { ... }
+ *
+ * an abstract declarator with a name glued on. GCC rejects it, so a valid ZER
+ * program simply did not build — measured for both spellings of the type,
+ * `?VFn` (2A typedef) and `?*() -> void` (2C).
+ *
+ * This is BUG-879 one sink over. That fix peeled exactly these two wrappers so a
+ * funcptr ARRAY ELEMENT got the right declarator; the function-return sink was
+ * not carried along. Peeling is correct rather than merely convenient: `?FuncPtr`
+ * IS the pointer at runtime (null sentinel, no `.has_value` field), so the C
+ * declarator shape is identical to the non-optional one.
+ *
+ * Returns the underlying TYPE_FUNC_PTR, or NULL when the return type is not a
+ * function pointer. ONE query, used by every signature site. */
+static Type *funcptr_return_shape(Type *ret) {
+    Type *t = ret ? type_unwrap_distinct(ret) : NULL;
+    while (t && type_dispatch_kind(t) == TYPE_OPTIONAL &&
+           is_null_sentinel(t->optional.inner))
+        t = type_unwrap_distinct(t->optional.inner);
+    return (type_dispatch_kind(t) == TYPE_FUNC_PTR) ? t : NULL;
+}
+
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
 
@@ -3204,82 +3333,12 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_TYPECAST: {
-        /* (Type)expr — emit as C cast for primitives.
-         * For *opaque round-trips, emit the _zer_opaque unwrap/wrap. */
+        /* Site 1 of 3. All cast policy lives in emit_cast_value (BUG-915). */
         Type *tgt = checker_get_type(e->checker, node);
         Type *src = checker_get_type(e->checker, node->typecast.expr);
-        Type *tgt_eff = tgt ? type_unwrap_distinct(tgt) : NULL;
-        Type *src_eff = src ? type_unwrap_distinct(src) : NULL;
-
-        /* pointer ↔ *opaque: use _zer_opaque wrap/unwrap (same as @ptrcast) */
-        if (tgt_eff && src_eff &&
-            tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-            type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-            src_eff->kind == TYPE_POINTER) {
-            /* casting TO *opaque — wrap with type_id */
-            uint32_t tid = 0;
-            if (src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-            }
-            emit(e, "(_zer_opaque){(void*)(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "), %u}", (unsigned)tid);
-        } else if (tgt_eff && src_eff &&
-                   tgt_eff->kind == TYPE_POINTER &&
-                   ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                     type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                    src_eff->kind == TYPE_OPAQUE)) {
-            /* casting FROM *opaque — unwrap .ptr with type check */
-            uint32_t expected_tid = 0;
-            if (tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-            }
-            if (expected_tid > 0) {
-                int tmp = e->temp_count++;
-                emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
-                emit_expr(e, node->typecast.expr);
-                emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
-                     "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); "
-                     "(", tmp, (unsigned)expected_tid, tmp);
-                emit_type(e, tgt);
-                emit(e, ")_zer_pc%d.ptr; })", tmp);
-            } else {
-                emit(e, "((");
-                emit_type(e, tgt);
-                emit(e, ")(");
-                emit_expr(e, node->typecast.expr);
-                emit(e, ").ptr)");
-            }
-        } else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&
-                   (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                    src_eff->kind == TYPE_POINTER)) {
-            /* To bool: use truthy conversion (!!x), not plain integer cast.
-             * ZER emits bool as uint8_t so (uint8_t)5 gives 5, not 1 —
-             * BUG-586 fixed this in IR_CAST but the AST path (used for
-             * global initializers, which must be constant expressions and
-             * therefore cannot take the IR path) was missed. */
-            emit(e, "((uint8_t)!!(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "))");
-        } else if (f2i_needs_guard(src_eff, tgt_eff)) {
-            int tmp = e->temp_count++;                    /* BUG-845 site 1 (AST) */
-            emit_f2i_open(e, src_eff, tmp);
-            emit_expr(e, node->typecast.expr);
-            emit_f2i_close(e, tgt, tmp);
-        } else {
-            /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
-            emit(e, "((");
-            emit_type(e, tgt);
-            emit(e, ")(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "))");
-        }
+        CastOperand op = { CASTOP_AST, node->typecast.expr, NULL, -1 };
+        emit_cast_value(e, &op, src ? type_unwrap_distinct(src) : NULL,
+                        tgt, tgt ? type_unwrap_distinct(tgt) : NULL);
         break;
     }
 
@@ -4781,8 +4840,17 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * Single source of truth via helper — see emit_func_attributes(). */
     emit_func_attributes(e, node);
 
-    emit_type(e, ret);
-    emit(e, " ");
+    /* BUG-916: the prototype path had NO funcptr-return handling at all, so a
+     * bodyless `*() -> void mk();` (or the `?`/`distinct` forms) emitted an
+     * abstract declarator here too. Same shared query as the IR site. */
+    Type *proto_ret_fp = funcptr_return_shape(ret);
+    if (proto_ret_fp) {
+        emit_type(e, proto_ret_fp->func_ptr.ret);
+        emit(e, " (*");
+    } else {
+        emit_type(e, ret);
+        emit(e, " ");
+    }
     EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
     emit(e, "(");
 
@@ -4799,7 +4867,16 @@ static void emit_func_decl(Emitter *e, Node *node) {
         }
         if (node->func_decl.is_variadic) emit(e, ", ...");
     }
-    emit(e, ") ");
+    emit(e, ")");
+    if (proto_ret_fp) {
+        emit(e, ")(");
+        for (uint32_t i = 0; i < proto_ret_fp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, proto_ret_fp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+    }
+    emit(e, " ");
 
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
@@ -6352,12 +6429,79 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
 
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward */
+
+/* --- the shared cast emitter declared beside classify_cast (BUG-915) --- */
+static void emit_cast_operand(Emitter *e, const CastOperand *op) {
+    switch (op->kind) {
+    case CASTOP_AST:       emit_expr(e, op->expr); break;
+    case CASTOP_REWRITTEN: emit_rewritten_node(e, op->expr, op->func); break;
+    case CASTOP_LOCAL:     emit_local_name(e, op->func, op->local); break;
+    }
+}
+
+static void emit_cast_value(Emitter *e, const CastOperand *op,
+                            Type *src_eff, Type *tgt, Type *tgt_eff) {
+    switch (classify_cast(src_eff, tgt_eff)) {
+    case CASTF_TO_OPAQUE: {
+        uint32_t tid = cast_pointee_type_id(src_eff->pointer.inner);
+        emit(e, "(_zer_opaque){(void*)(");
+        emit_cast_operand(e, op);
+        emit(e, "), %u}", (unsigned)tid);
+        break;
+    }
+    case CASTF_FROM_OPAQUE: {
+        uint32_t expected = cast_pointee_type_id(tgt_eff->pointer.inner);
+        if (expected > 0) {
+            int tmp = e->temp_count++;
+            emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+            emit_cast_operand(e, op);
+            emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                    "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
+                 tmp, (unsigned)expected, tmp);
+            emit_type(e, tgt);
+            emit(e, ")_zer_pc%d.ptr; })", tmp);
+        } else {
+            /* type_id 0 = extern/cinclude provenance: nothing to check against,
+             * but the `.ptr` unwrap is still required — the operand is a struct. */
+            emit(e, "((");
+            emit_type(e, tgt);
+            emit(e, ")(");
+            emit_cast_operand(e, op);
+            emit(e, ").ptr)");
+        }
+        break;
+    }
+    case CASTF_TO_BOOL:
+        /* ZER emits bool as uint8_t, so a plain `(uint8_t)5` yields 5 and the
+         * value is simultaneously truthy and != true. `!!` restores the single
+         * canonical representation the language promises. */
+        emit(e, "((uint8_t)!!(");
+        emit_cast_operand(e, op);
+        emit(e, "))");
+        break;
+    case CASTF_F2I: {
+        int tmp = e->temp_count++;
+        emit_f2i_open(e, src_eff, tmp);
+        emit_cast_operand(e, op);
+        emit_f2i_close(e, tgt, tmp);
+        break;
+    }
+    case CASTF_PLAIN:
+        emit(e, "((");
+        emit_type(e, tgt);
+        emit(e, ")(");
+        emit_cast_operand(e, op);
+        emit(e, "))");
+        break;
+    }
+}
+
 /* ================================================================
  * Builtin Call Emitter — emit pool/slab/ring/arena/Task inline C
  * Extracted from emit_expr NODE_CALL. Uses emit_rewritten_node for args.
  * Returns true if handled, false if not a recognized builtin.
  * ================================================================ */
-static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward */
 static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     if (!node || node->kind != NODE_CALL || !node->call.callee ||
         node->call.callee->kind != NODE_FIELD || !node->call.callee->field.object ||
@@ -10291,22 +10435,24 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * REACHABLE third emission path, not a theoretical fallback — pmytnl
          * reports nearly missing it, and a guard at two of three sites leaves the
          * UB live in exactly the scope that is hardest to notice. */
+        /* Site 2 of 3 — the one that used to implement only the f2i guard.
+         * The target comes from the TYNODE here (not the typemap) because a
+         * defer body is re-emitted from raw AST; the source still comes from
+         * the typemap. Both feed the one shared policy. */
         Type *t3 = node->typecast.target_type
                      ? resolve_tynode(e, node->typecast.target_type) : NULL;
         Type *s3 = checker_get_type(e->checker, node->typecast.expr);
-        if (t3 && f2i_needs_guard(s3 ? type_unwrap_distinct(s3) : NULL,
-                                  type_unwrap_distinct(t3))) {
-            int tmp = e->temp_count++;
-            emit_f2i_open(e, type_unwrap_distinct(s3), tmp);
+        if (!t3) {   /* unresolvable target: keep the historical bare emission */
+            emit(e, "(");
             emit_rewritten_node(e, node->typecast.expr, func);
-            emit_f2i_close(e, t3, tmp);
+            emit(e, ")");
             return;
         }
-        emit(e, "((");
-        if (t3) emit_type(e, t3);
-        emit(e, ")");
-        emit_rewritten_node(e, node->typecast.expr, func);
-        emit(e, ")");
+        {
+            CastOperand op = { CASTOP_REWRITTEN, node->typecast.expr, func, -1 };
+            emit_cast_value(e, &op, s3 ? type_unwrap_distinct(s3) : NULL,
+                            t3, type_unwrap_distinct(t3));
+        }
         return;
     }
 
@@ -12591,75 +12737,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
 
-            /* To *opaque: wrap with type_id */
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-                type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-                src_eff && src_eff->kind == TYPE_POINTER) {
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
-                emit(e, "(_zer_opaque){(void*)(");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, "), %u}", (unsigned)tid);
-            }
-            /* From *opaque: unwrap .ptr with type check */
-            else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
-                     src_eff &&
-                     ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                       type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                      src_eff->kind == TYPE_OPAQUE)) {
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
-                if (expected_tid > 0 && inst->src1_local >= 0) {
-                    int tmp = e->temp_count++;
-                    emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
-                         "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
-                         tmp, (unsigned)expected_tid, tmp);
-                    emit_type(e, tgt);
-                    emit(e, ")_zer_pc%d.ptr; })", tmp);
-                } else if (inst->src1_local >= 0) {
-                    emit(e, "((");
-                    emit_type(e, tgt);
-                    emit(e, ")(");
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, ").ptr)");
-                }
-            }
-            /* To bool: use truthy conversion (!!x), not plain integer cast.
-             * In C, `_Bool` has special conversion rules (non-zero → 1), but
-             * ZER emits bool as uint8_t so a plain `(uint8_t)5` gives 5, not 1.
-             * BUG-586: test expects `(bool)5 == true`. */
-            else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && inst->src1_local >= 0 &&
-                     src_eff && (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                                 src_eff->kind == TYPE_POINTER)) {
-                emit(e, "((uint8_t)!!(");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, "))");
-            }
-            /* Simple C cast */
-            else if (inst->src1_local >= 0 && f2i_needs_guard(src_eff, tgt_eff)) {
-                int tmp = e->temp_count++;                /* BUG-845 site 2 (IR_CAST) */
-                emit_f2i_open(e, src_eff, tmp);
-                emit_local_name(e, func, inst->src1_local);
-                emit_f2i_close(e, tgt, tmp);
-            }
-            else if (inst->src1_local >= 0) {
-                emit(e, "((");
-                emit_type(e, tgt);
-                emit(e, ")");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, ")");
+            /* Site 3 of 3 — see emit_cast_value (BUG-915). The operand is a
+             * LOCAL here rather than an AST expression; that is the only thing
+             * this site still decides for itself. */
+            if (inst->src1_local >= 0) {
+                CastOperand op = { CASTOP_LOCAL, NULL, func, inst->src1_local };
+                emit_cast_value(e, &op, src_eff, tgt, tgt_eff);
             }
             emit(e, ";\n");
         }
@@ -12831,13 +12914,14 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
          * Without this branch, emitter would produce invalid C like
          * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+        Type *ret_fp = main_promote ? NULL : funcptr_return_shape(ret);
+        bool ret_is_funcptr = (ret_fp != NULL);
 
         if (main_promote) {
             emit(e, "int ");
         } else if (ret_is_funcptr) {
             /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
+            emit_type(e, ret_fp->func_ptr.ret);
             emit(e, " (*");
         } else if (ret) {
             emit_type(e, ret);
@@ -12876,9 +12960,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* Close funcptr-return form: )(fp_args) */
         if (ret_is_funcptr) {
             emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+            for (uint32_t i = 0; i < ret_fp->func_ptr.param_count; i++) {
                 if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
+                emit_type(e, ret_fp->func_ptr.params[i]);
             }
             emit(e, ")");
         }

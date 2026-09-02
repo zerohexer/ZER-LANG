@@ -5,6 +5,240 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-02 — BUG-913..917: five holes from a fresh full-tree audit
+
+A from-scratch audit (no branch to harvest — subsystem maps of `checker.c`,
+`zercheck_ir.c`, `ir_lower.c` and `emitter.c`, then targeted probing). Five defects,
+all verified live on main with a discriminating reproducer BEFORE any fix, and every
+one of them an instance of a class this file already names — which is the finding under
+the findings: **the classes are known; the gates for two of them cannot see if-chains,
+one gate had the live hole sitting in its own baseline with no justification, and one
+class (was the lock EMITTED?) had no gate at all until this session.**
+
+Environment note for whoever reproduces this: **ASan does not function in the sandbox
+this ran in** — a hand-written 4-byte array indexed at 100 reports nothing. Every
+memory finding below is therefore established by reading the emitted C and by
+observable program behaviour (an exit code that differs pre/post fix), not by a
+sanitizer. Do not read "no ASan report" as "no bug" here.
+
+### BUG-914 — an `&x` in a `spawn` argument did not widen the loop range → silent stack OOB
+
+```zer
+void bump(*u32 p) { *p = 100; }
+u32 run() {
+    u8[4] arr;
+    u32 idx = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        arr[idx] = 7;                              // guard ELIDED
+        ThreadHandle th = spawn bump(&idx);
+        th.join();
+    }
+    return 42;
+}
+```
+
+The identical program with a plain `bump(&idx);` emits `if ((size_t)(idx) >= 4u) { return 0; }`.
+The `spawn` spelling emitted **no guard at all**, so iterations 2 and 3 executed
+`arr[100] = 7` on a 4-byte stack array — no diagnostic, no runtime check. Measured
+directly: an instrumented build prints `iter i=1 idx=100`, `iter i=2 idx=100`.
+
+Root cause: `vrp_widen_loop_addr_taken` was an if/else chain closing with
+
+> `/* All other NodeKind values are leaves (... spawn/asm/static_assert) — no & subtree. */`
+
+That comment is false. `NODE_SPAWN` carries `spawn_stmt.args[]`, `NODE_AWAIT` carries
+`await_stmt.cond`, `NODE_ASM` carries operand expressions (ast.h). Its sibling
+`vrp_invalidate_loop_body_writes` — already a no-`default:` switch — listed the same
+three kinds in its no-op group.
+
+**BUG-826 fixed exactly this omission** in `record_isr_globals` and
+`record_atomic_plain_in_callee` and did not carry it to the VRP pair. Same question,
+four sites, two fixed.
+
+Fix: both walkers descend SPAWN args, the AWAIT cond and ASM operands; and
+`vrp_widen_loop_addr_taken` is converted from an if-chain to a no-`default:` exhaustive
+switch, so `-Werror=switch` now forces the classification. Over-widening is sound for
+VRP (it can only ADD a guard), so descending more is always the safe direction.
+
+Test: `tests/zer/vrp_loop_addr_taken_spawn.zer` — exits 42 pre-fix, 0 post-fix.
+
+**The part worth keeping.** `tools/audit_walker_fields.sh` HAD FLAGGED this. The rows
+`vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args` and its AWAIT/ASM siblings
+were sitting in `tools/walker_field_baseline.txt` — bulk-added under a bare
+`# --- checker.c: vrp_invalidate_loop_body_writes ---` header with **no stated reason**.
+The gate did its job; baselining the row without writing down why made a live
+silent-OOB invisible again. The general rule now recorded in that file: *a baseline row
+with no stated reason is an un-reviewed hole wearing a reviewed badge.*
+
+### BUG-913 — a factory returning a racing callback from a `switch` arm or `do-while` body
+
+```zer
+u32 g;
+void cb() { g += 1; }
+void nop() { }
+*() -> void mk(u32 k) {
+    switch (k) { 0 => { return cb; } default => { } }
+    return nop;
+}
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }
+```
+
+Accepted on main. `cb` writes a non-shared global from the spawned thread — the data
+race the whole funcptr-REACH axis exists to catch.
+
+`scan_returned_funcname` was an if/else chain over RETURN / BLOCK / IF / WHILE / FOR.
+A `return` in a **switch arm** or a **do-while body** was never reached, so the factory
+looked like it returned nothing reachable. The ISR sibling
+`record_isr_returned_funcname` had DO_WHILE but not SWITCH — the two sinks were literally
+one kind apart, which is the drift CLAUDE.md warns about for this exact pair.
+
+Both are now no-`default:` exhaustive switches covering every body-bearing kind
+(SWITCH, DO_WHILE, DEFER, CRITICAL, ONCE added at both).
+
+**Probe design matters here and cost two false readings.** A factory that also returns
+the racy callback on the fall-through is rejected by the plain-RETURN arm and proves
+nothing; the first `for`/`do-while` probes read "already covered" for that reason. The
+discriminating shape returns a SAFE callback (`nop`) on every path except the construct
+under test. And an ISR probe run with `-o /dev/null` builds an exe, so **GCC** rejects
+it with "interrupt service routine can only have a pointer argument…" — a masking
+diagnostic that is not ZER's. Isolate with `-o out.c`.
+
+Tests: `tests/zer_fail/spawn_race_factory_switch.zer`,
+`tests/zer_fail/spawn_race_factory_dowhile.zer`,
+`tests/zer_fail/isr_race_factory_switch.zer` (all with `// expect-error:`), plus **four
+new cells in the REACH grid and two in the ISR sub-grid** of `tests/test_conc_matrix.c`
+— verified to FAIL against a from-HEAD build.
+
+### BUG-915 — `(bool)x` and the `*opaque` type-id check missing on one of three cast paths
+
+```zer
+u32 five() { return 5; }
+bool b = false;
+b = (bool)five();        // plain assignment
+// -> emitted `b = ((uint8_t)five())`, so b holds 5:
+//    `if (b)` is TRUE and `b == true` is FALSE.
+```
+
+The probe returned 9 where it must return 0. This is BUG-586, fixed twice and never at
+the third site.
+
+The same site also dropped the `*opaque` runtime type-id check:
+`m = (*Motor)ctx;` emitted `((struct Motor*)ctx)` — a direct cast of the `_zer_opaque`
+**struct** to a pointer, which GCC rejects, so a valid ZER program did not build; and
+the guard that stops a wrong-typed `*opaque` being dereferenced was gone with it.
+
+Cast policy was copied into three emitters — `emit_expr` NODE_TYPECAST (global/const
+initializers), `emit_rewritten_node` NODE_TYPECAST (plain assignments, **defer bodies**,
+spawn args), and `emit_ir_inst` IR_CAST (the 3AC path). Sites 1 and 3 implemented four
+behaviours; site 2 implemented one.
+
+Fix is the **class-kill, not a fourth copy**: `classify_cast()` + `emit_cast_value()`
+now hold the decision and the emission once, and each site supplies only its own way of
+producing the operand via a `CastOperand` descriptor. The form switch has no `default:`,
+so a new cast form is a build error at all three rather than a silent plain-cast at
+whichever site was forgotten. Same shape as `value_flows_to` in `checker.c`: one query,
+N thin sites. `grep -c "type mismatch in cast" emitter.c` is now **1**, was 2 (and
+should have been 3).
+
+Tests: `tests/zer/cast_bool_canonical_all_forms.zer` (the cast crossed with six emission
+forms — var-decl, assignment, global store, return, branch, zero; exits 2 pre-fix) and
+`tests/zer_trap/opaque_cast_assign_typeid.zer` (the restored trap fires; pre-fix the
+emitted C does not compile).
+
+### BUG-916 — a function returning an OPTIONAL function pointer emitted invalid C
+
+```zer
+typedef void (*VFn)();
+?VFn maybe(u32 k) { if (k == 0) { return null; } return cb; }
+```
+emitted `void (*)() maybe(uint32_t k) { ... }` — an abstract declarator with a name
+glued on. GCC: `expected identifier or '(' before ')' token`. Both spellings affected
+(`?VFn` and `?*() -> void`).
+
+`ret_is_funcptr` tested `ret->kind == TYPE_FUNC_PTR` **raw**, so a `?`- or
+`distinct`-wrapped funcptr return missed the nested-declarator branch. **This is BUG-879
+one sink over** — that fix peeled the same two wrappers so a funcptr ARRAY ELEMENT got
+the right declarator, and the function-return sink was not carried along. Peeling is
+correct, not merely convenient: `?FuncPtr` IS the pointer at runtime (null sentinel, no
+`.has_value`), so the declarator shape is identical.
+
+Fix: one shared `funcptr_return_shape()` query used by both signature emitters. The AST
+prototype path had **no** funcptr-return handling at all, so a bodyless
+`*() -> void mk();` was broken there too; it now uses the same query.
+
+Test: `tests/zer/funcptr_return_all_spellings.zer` — crosses both funcptr spellings with
+bare and optional returns. Exits 1 pre-fix (does not build), 0 post-fix.
+
+### BUG-917 — a bare-expression `switch` arm bypassed the shared-struct auto-lock
+
+```zer
+shared struct S { u32 x; }
+S g;
+switch (k) {
+    0 => g.x = 5,            // emitted:  g.x = 5;                    NO MUTEX
+    default => { }
+}
+switch (k) {
+    0 => { g.x = 5; }        // emitted:  lock; g.x = 5; unlock;
+    default => { }
+}
+```
+
+Two spellings of one program; one of them an unsynchronized write to shared
+memory, with no diagnostic anywhere. `shared struct` is the headline concurrency
+mechanism — "touch a field, it locks, no annotation" — and this was a hole in it.
+
+Root cause is an INVARIANT with one exception. The per-statement lock wrapper
+lives in ir_lower's `NODE_BLOCK` case, so the real guarantee is "every statement
+*inside a block* is locked". That is equivalent to the promised guarantee only
+because the parser makes every statement body a block — if/else, for, while,
+do-while, `@critical`, `@once`, function bodies. The braceless switch arm was the
+single place that produced a bare `NODE_EXPR_STMT`, so it never reached the
+wrapper. (`defer <stmt>;` builds a bare EXPR_STMT the same way and was MEASURED
+to be unaffected — it locks correctly in both spellings, through a different
+replay path. It was left alone rather than changed on the strength of the
+analogy.)
+
+Fixed in the PARSER, not at the lock site: the bare arm expression is now wrapped
+in a single-statement `NODE_BLOCK`. Fixing the lock would have fixed the lock and
+left every other "bodies are blocks" assumption still wrong for this one form;
+making the invariant universal retires the class.
+
+**The gate this class never had.** Nothing could have caught it: the concurrency
+matrix asks accept-or-reject and BOTH spellings are accepted; the walker audits
+ask about node kinds and the kind was handled. The unasked question was *"was the
+lock EMITTED?"*. `tests/test_sharedlock_matrix.c` (NEW, 11th grid, in `make check`)
+asks exactly that, crossed over 14 statement-body forms, by reading the generated
+C — a data race has no single-threaded runtime signal to assert on. Verified to
+fire: against a pre-fix build it reports 2 failures.
+
+Those two are worth noting: the grid flagged the bare `default =>` arm as well,
+which is the same defect at a form I had not probed by hand. That is the
+enumeration finding a sibling, which is the whole reason to write the axis down
+rather than fix the reported cell.
+
+### Checked and found NOT to be bugs — recorded so nobody re-chases them
+
+- **`emit_rewritten_node` emits `/* struct/union compare unsupported */ 0` for `x == y`
+  on aggregates.** Dead defensive code: the checker rejects aggregate `==` first
+  ("an aggregate has no defined ordering or field-wise equality in ZER").
+- **`@saturate` on the AST path has no clamp for non-native signed widths** (`i7`).
+  Unreachable: a global initializer cannot use `@saturate` at all ("does not lower to a
+  compile-time-constant value at global scope"), and the AST path is the global-initializer
+  path. The local/IR path clamps correctly to `[-64, 63]`.
+- **`collect_shared_types_in_stmt` returns 0 for `NODE_SPAWN`**, so `spawn f(a.x, b.y)`
+  with two shared types is not a deadlock error. Correct as written — measured emission
+  shows each spawn ARG gets its **own** lock/unlock pair, sequentially, never nested. The
+  same-statement two-lock hazard does not exist here, so flagging it would be pure
+  over-rejection.
+- **"`spawn` args are never scanned for shared roots"** (from an `ir_lower.c`-only read).
+  Refuted: the lock is emitted by the emitter's `NODE_SPAWN` handler, not by lowering —
+  `/* shared-read lock for spawn arg 0 */ pthread_mutex_lock(&ga._zer_mtx);`.
+
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

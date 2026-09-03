@@ -1,0 +1,5 @@
+// expect-error: does not name a variant of enum
+// BUG-913: ... at the global-init sink.
+enum Color { red, green, blue }
+Color g = 99;
+u32 main() { return (u32)g; }

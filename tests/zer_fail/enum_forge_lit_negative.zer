@@ -1,0 +1,5 @@
+// expect-error: does not name a variant of enum
+// BUG-913: a NEGATIVE literal is matched against the variant set too — an enum
+// may declare negative values, so it is a membership test, not a sign test.
+enum Code { ok = 10, warn = 20 }
+u32 main() { Code c = -1; return (u32)@bitcast(u32, c); }

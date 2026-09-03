@@ -1,0 +1,4 @@
+// expect-error: does not name a variant of enum
+// BUG-913: ... at the array-element sink.
+enum Color { red, green, blue }
+u32 main() { Color[2] a; a[0] = 99; return (u32)a[0]; }

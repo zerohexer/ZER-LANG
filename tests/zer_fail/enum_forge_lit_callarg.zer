@@ -1,0 +1,5 @@
+// expect-error: does not name a variant of enum
+// BUG-913: ... at the call-argument sink.
+enum Color { red, green, blue }
+u32 f(Color c) { return (u32)c; }
+u32 main() { return f(99); }

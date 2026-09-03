@@ -1,0 +1,18 @@
+// BUG-927 boundary: the LEGITIMATE routes to an enum value must keep working after
+// the int-literal route was closed. A declared variant, a @bitcast from hardware
+// (variant-checked at runtime), enum params/returns, struct-init fields, switch,
+// and comparison against a variant.
+enum Color { red, green, blue }
+struct S { Color c; }
+Color pick(Color x) { return x; }
+u32 main() {
+    Color a = Color.red;
+    Color b = @bitcast(Color, 1);
+    S s = { .c = Color.blue };
+    Color d = pick(Color.green);
+    if (a == Color.red) {
+        switch (s.c) { .red => { return 90; } .green => { return 91; } .blue => { } }
+    }
+    if (b == Color.green) { if (d == Color.green) { return 0; } }
+    return 92;
+}

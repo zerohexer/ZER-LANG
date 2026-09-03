@@ -1,0 +1,5 @@
+// expect-error: does not name a variant of enum
+// BUG-913: ... at the designated-initializer field sink.
+enum Color { red, green, blue }
+struct S { Color c; }
+u32 main() { S s = { .c = 99 }; return (u32)s.c; }

@@ -1,0 +1,4 @@
+// expect-error: does not name a variant of enum
+// BUG-913: an integer literal must not forge an enum at the var-decl sink.
+enum Color { red, green, blue }
+u32 main() { Color c = 99; return (u32)c; }

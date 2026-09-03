@@ -1,0 +1,4 @@
+// expect-error: does not name a variant of enum
+// BUG-913: ... at the assignment sink.
+enum Color { red, green, blue }
+u32 main() { Color c = Color.red; c = 99; return (u32)c; }

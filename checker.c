@@ -1234,6 +1234,40 @@ static bool const_negative_into_unsigned(Node *value, Type *target) {
     return v < 0;
 }
 
+/* BUG-927: an integer literal is NOT a route to an enum value.
+ *
+ * `zer_type_kind_is_integer` answers TRUE for ZER_TK_ENUM (enums are
+ * integer-backed), so `is_literal_compatible` accepted `Color c = 99;` at EVERY
+ * value-flow sink. The forged value then reached a switch and silently took an
+ * arm — the exact consequence BUG-843 introduced the variant guard to stop.
+ *
+ * emitter.c's comment for that guard says "ZER has no int->enum cast, so every
+ * other path to an enum value is a declared variant". That sentence was FALSE: a
+ * bare literal is a path, and it is the most obvious one. This restores it.
+ *
+ * Rejected rather than guarded, deliberately. The legitimate route from an
+ * arbitrary integer to an enum already exists and is already checked —
+ * @bitcast / @truncate / @saturate all emit emit_enum_variant_guard_path. A
+ * literal is known at compile time, so there is nothing to defer to runtime: if it
+ * is a declared variant the author can name it, and if it is not, the program is
+ * wrong. Making the bad state unrepresentable beats guarding it.
+ *
+ * Scoped to VALUE FLOW, not to is_literal_compatible itself, because that helper is
+ * also used by the binary-comparison paths (checker.c ~5534) where `c == 0` neither
+ * creates nor forges an enum value. Corpus cost measured before shipping: ZERO
+ * (the two `Name x = <int>;` hits in the corpus are `distinct typedef u32`, not
+ * enums). */
+static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
+    if (!value || !target) return false;
+    Type *ut = type_unwrap_distinct(target);
+    if (!ut || type_dispatch_kind(ut) != TYPE_ENUM) return false;
+    /* A value that is ALREADY enum-typed is a declared variant or a guarded
+     * conversion — both fine, and both take the type_equals path anyway. */
+    Type *uv = vt ? type_unwrap_distinct(vt) : NULL;
+    if (uv && type_dispatch_kind(uv) == TYPE_ENUM) return false;
+    return true;
+}
+
 /* THE value-flow compatibility question — "may a value of type `vt`, written as
  * the expression `value`, flow into a destination of type `target`?"
  *
@@ -1248,6 +1282,7 @@ static bool const_negative_into_unsigned(Node *value, Type *target) {
  * to add the condition. One query now; each site keeps its own error wording. */
 static bool value_flows_to(Node *value, Type *vt, Type *target) {
     if (const_negative_into_unsigned(value, target)) return false;
+    if (const_int_into_enum(value, vt, target)) return false;
     if (type_equals(target, vt)) return true;
     if (can_implicit_coerce(vt, target)) return true;
     if (is_literal_compatible(value, target)) return true;
@@ -1260,8 +1295,31 @@ static bool value_flows_to(Node *value, Type *vt, Type *target) {
  * message that cannot express the difference it reports is worse than the hole
  * it replaced. Returns true when it handled the diagnosis, so the caller skips
  * its generic message. */
-static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
-                                       int line, const char *what) {
+static bool report_value_flow_refusal(Checker *c, Node *value, Type *target,
+                                      int line, const char *what) {
+    /* BUG-927: an integer flowing into an ENUM. The generic message says
+     * "cannot initialize 'c' of type 'Color' with 'u32'", which is true and tells
+     * the author nothing about what to write instead — and the two legitimate
+     * routes are not guessable. `vt` is deliberately not a parameter: if the value
+     * were enum-typed, type_equals would have accepted it and we would not be
+     * reporting a refusal at all. */
+    {
+        Type *ue = type_unwrap_distinct(target);
+        if (ue && type_dispatch_kind(ue) == TYPE_ENUM &&
+            ue->enum_type.variant_count > 0) {
+            char tn[96];
+            snprintf(tn, sizeof(tn), "%s", type_name(target));
+            checker_error(c, line,
+                "%s: an integer does not name a variant of enum '%s' — ZER has no "
+                "int-to-enum conversion. Write '%s.%.*s' (or another declared "
+                "variant), or @bitcast(%s, N) if the value comes from hardware "
+                "(that route is variant-checked at runtime)",
+                what, tn, tn,
+                (int)ue->enum_type.variants[0].name_len,
+                ue->enum_type.variants[0].name, tn);
+            return true;
+        }
+    }
     if (!const_negative_into_unsigned(value, target)) return false;
     long long v = (long long)eval_const_expr(value);
     /* type_name() rotates only TWO static buffers — capture before formatting
@@ -3157,7 +3215,7 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     char what[96];
                     snprintf(what, sizeof(what), "field '.%.*s'",
                              (int)df->name_len, df->name);
-                    if (!report_negative_const_flow(c, df->value, ft, line, what))
+                    if (!report_value_flow_refusal(c, df->value, ft, line, what))
                         checker_error(c, line,
                             "field '.%.*s' expects '%s', got '%s'",
                             (int)df->name_len, df->name,
@@ -7461,7 +7519,7 @@ static Type *check_expr(Checker *c, Node *node) {
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!value_flows_to(node->assign.value, value, target)) {
-                if (!report_negative_const_flow(c, node->assign.value, target,
+                if (!report_value_flow_refusal(c, node->assign.value, target,
                                                 node->loc.line, "assignment"))
                     checker_error(c, node->loc.line,
                         "cannot assign '%s' to '%s'",
@@ -8655,7 +8713,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         !slice_to_ptr_ok) {
                         char what[48];
                         snprintf(what, sizeof(what), "argument %u", i + 1);
-                        if (!report_negative_const_flow(c, node->call.args[i], param,
+                        if (!report_value_flow_refusal(c, node->call.args[i], param,
                                                         node->loc.line, what))
                             checker_error(c, node->loc.line,
                                 "argument %u: expected '%s', got '%s'",
@@ -10058,7 +10116,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
-                    if (!report_negative_const_flow(c, node->orelse.fallback, unwrapped,
+                    if (!report_value_flow_refusal(c, node->orelse.fallback, unwrapped,
                                                     node->loc.line, "orelse fallback"))
                         checker_error(c, node->loc.line,
                             "orelse fallback type '%s' doesn't match '%s'",
@@ -13886,7 +13944,7 @@ static void check_stmt(Checker *c, Node *node) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
                          (int)node->var_decl.name_len, node->var_decl.name);
-                if (report_negative_const_flow(c, node->var_decl.init, type,
+                if (report_value_flow_refusal(c, node->var_decl.init, type,
                                                node->loc.line, what)) {
                     /* diagnosed with the sign-specific wording */
                 /* RF6: better error for null used with non-optional type */
@@ -16151,7 +16209,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             if (c->current_func_ret) {
                 if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
-                    if (!report_negative_const_flow(c, node->ret.expr,
+                    if (!report_value_flow_refusal(c, node->ret.expr,
                                                     c->current_func_ret,
                                                     node->loc.line, "return value"))
                         checker_error(c, node->loc.line,
@@ -17677,7 +17735,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
                     snprintf(what, sizeof(what), "spawn argument %d", i + 1);
-                    if (!report_negative_const_flow(c, node->spawn_stmt.args[i],
+                    if (!report_value_flow_refusal(c, node->spawn_stmt.args[i],
                                                     param_type, node->loc.line, what))
                         checker_error(c, node->loc.line,
                             "spawn argument %d: expected '%s', got '%s'",
@@ -21919,7 +21977,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",
                          (int)decl->var_decl.name_len, decl->var_decl.name);
-                if (!report_negative_const_flow(c, decl->var_decl.init, type,
+                if (!report_value_flow_refusal(c, decl->var_decl.init, type,
                                                 decl->loc.line, what))
                     checker_error(c, decl->loc.line,
                         "cannot initialize '%.*s' of type '%s' with '%s'",

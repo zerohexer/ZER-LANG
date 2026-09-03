@@ -2096,6 +2096,47 @@ if (should_never_happen) { @trap(); }
 
 ---
 
+### @try_enum(EnumType, value)
+
+**DESCRIPTION**
+Checked integer-to-enum conversion. Returns `?EnumType` — the enum value if the
+integer is a declared variant, `null` if it is not.
+
+ZER has no implicit integer-to-enum conversion: `Color c = 99;` is a compile error,
+and so is arithmetic on enum operands, because both can produce a value outside the
+declared variant set. `@try_enum` is the route when the integer comes from outside
+the program (a hardware register, a decoded message) and may legitimately hold a
+reserved encoding — the failure lands in the type and is handled with the same
+`orelse` / `if |v|` control flow as any other optional.
+
+Use `@bitcast(EnumType, value)` instead when the value is certain to be a variant;
+that route traps at runtime if it is not.
+
+**EXAMPLE**
+```zer
+enum Mode { idle, running, halted }
+
+u32 decode(u32 raw) {
+    // supply a default for a reserved encoding
+    Mode m = @try_enum(Mode, raw) orelse Mode.idle;
+
+    // or branch on it
+    if (@try_enum(Mode, raw)) |v| {
+        switch (v) {
+            .idle => { return 10; }
+            .running => { return 11; }
+            .halted => { return 12; }
+        }
+    }
+    // reserved encoding — a state this build does not model
+    return 90 + (u32)m;
+}
+
+u32 main() { return decode(7) - decode(1) + 80; }
+```
+
+---
+
 ### @probe(addr)
 
 **DESCRIPTION**

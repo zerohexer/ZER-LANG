@@ -11910,6 +11910,46 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = c->builtin_mulwide64 ? c->builtin_mulwide64 : ty_u32;
+        } else if (nlen == 8 && memcmp(name, "try_enum", 8) == 0) {
+            /* BUG-929: `@try_enum(E, x) -> ?E` — the CHECKED int-to-enum conversion.
+             *
+             * BUG-927/928 closed every silent route from an integer to an enum, which
+             * left `@bitcast` as the only way to read an enum out of a hardware
+             * register — and @bitcast TRAPS on a value outside the variant set. That
+             * is the wrong answer for a register that may legitimately hold a
+             * reserved encoding: the program aborts instead of handling it.
+             *
+             * Rust reaches for `TryFrom` here and gets a `Result` the caller must
+             * handle. ZER already has that shape — `?T` plus `orelse` / `if |v|` —
+             * so the failure lands in the type and is handled with ordinary control
+             * flow, with no new concept and no `unsafe`:
+             *
+             *     Color c = @try_enum(Color, raw) orelse Color.unknown;
+             *     if (@try_enum(Color, raw)) |v| { use(v); }
+             *
+             * @bitcast stays for "I am certain" (and stays variant-guarded). */
+            Type *te_t = node->intrinsic.type_arg
+                       ? resolve_type(c, node->intrinsic.type_arg) : NULL;
+            Type *te_u = te_t ? type_unwrap_distinct(te_t) : NULL;
+            if (!te_u || type_dispatch_kind(te_u) != TYPE_ENUM) {
+                checker_error(c, node->loc.line,
+                    "@try_enum requires an enum type as its first argument, e.g. "
+                    "@try_enum(Color, raw)");
+                result = ty_u32;
+            } else if (node->intrinsic.arg_count != 1) {
+                checker_error(c, node->loc.line,
+                    "@try_enum requires exactly 1 value argument after the type");
+                result = type_optional(c->arena, te_t);
+            } else {
+                Type *te_v = typemap_get(c, node->intrinsic.args[0]);
+                if (te_v && !type_is_integer(te_v)) {
+                    char tn2[96];
+                    snprintf(tn2, sizeof(tn2), "%s", type_name(te_v));
+                    checker_error(c, node->loc.line,
+                        "@try_enum value must be an integer, got '%s'", tn2);
+                }
+                result = type_optional(c->arena, te_t);
+            }
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             /* @probe(addr) → ?u32: try reading MMIO address, null if faults.
              *

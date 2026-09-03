@@ -1056,7 +1056,11 @@ static Node *parse_primary(Parser *p) {
                               (n->intrinsic.name_len == 8 &&
                                memcmp(n->intrinsic.name, "inttoptr", 8) == 0) ||
                               (n->intrinsic.name_len == 9 &&
-                               memcmp(n->intrinsic.name, "container", 9) == 0);
+                               memcmp(n->intrinsic.name, "container", 9) == 0) ||
+                              /* BUG-929: @try_enum(E, x) names an enum TYPE first, so
+                               * it must take the type_arg path like @bitcast does. */
+                              (n->intrinsic.name_len == 8 &&
+                               memcmp(n->intrinsic.name, "try_enum", 8) == 0);
         if (is_type_token(p->current.type) &&
             (p->current.type != TOK_IDENT || force_type_arg)) {
             n->intrinsic.type_arg = parse_type(p);

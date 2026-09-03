@@ -722,6 +722,8 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 @container(*T, ptr, f)   container_of (field-validated, provenance-tracked)
 @trap()                  crash intentionally
 @probe(addr)             safe MMIO read — returns ?u32, null if address faults
+@try_enum(E, val)        CHECKED int->enum — returns ?E, null if not a declared variant
+                         (@bitcast is the unchecked-but-trapping route; a bare int is REJECTED)
 @unreachable()           GCC unreachable hint (UB if reached)  [D-Alpha-2]
 @expect(val, expected)   branch prediction hint                [D-Alpha-2]
 ```

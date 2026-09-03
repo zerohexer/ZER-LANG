@@ -931,6 +931,34 @@ static bool type_carries_enum_e(Type *t, int depth) {
  *
  * `path` is the C lvalue expression to test; recursion appends `.field` /
  * `[i]` to it. Depth-limited like the type carriers in checker.c. */
+/* BUG-929: `@try_enum(E, x)` -> `?E`, the CHECKED int-to-enum conversion.
+ *
+ * Emitted inline rather than as a runtime helper because the variant set is
+ * per-enum. `?Enum` is `_zer_opt_i32` (enums are int32_t), so the statement
+ * expression builds that struct directly. Temporaries are scoped by the statement
+ * expression, so nesting `@try_enum` inside `@try_enum` shadows legally.
+ *
+ * Shared by BOTH emitter dispatch paths — the AST one and the IR-rewritten one.
+ * CLAUDE.md: an intrinsic handled in only one path falls through to a placeholder
+ * emission and segfaults at runtime, so the value expression is passed in as an
+ * already-emitted callback rather than duplicating the body. */
+static void emit_try_enum_open(Emitter *e) {
+    emit(e, "({ int32_t _zer_tev = (int32_t)(");
+}
+static void emit_try_enum_close(Emitter *e, Type *t) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    emit(e, "); _zer_opt_i32 _zer_teo; _zer_teo.has_value = (");
+    if (u && type_dispatch_kind(u) == TYPE_ENUM && u->enum_type.variant_count > 0) {
+        for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
+            if (vi) emit(e, " || ");
+            emit(e, "_zer_tev == %lld", (long long)u->enum_type.variants[vi].value);
+        }
+    } else {
+        emit(e, "0");
+    }
+    emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
+}
+
 static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                                          const char *what, int depth) {
     if (!t || depth > 8) return;
@@ -3740,6 +3768,12 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
+        } else if (nlen == 8 && memcmp(name, "try_enum", 8) == 0) {
+            emit_try_enum_open(e);
+            if (node->intrinsic.arg_count > 0) emit_expr(e, node->intrinsic.args[0]);
+            else emit(e, "0");
+            emit_try_enum_close(e, node->intrinsic.type_arg
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
@@ -10077,6 +10111,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             if (!sr_ptr) emit(e, "&");
             emit_rewritten_node(e, node->intrinsic.args[0], func);
             emit(e, ")");
+        } else if (nlen == 8 && memcmp(name, "try_enum", 8) == 0) {
+            emit_try_enum_open(e);
+            if (node->intrinsic.arg_count > 0)
+                emit_rewritten_node(e, node->intrinsic.args[0], func);
+            else emit(e, "0");
+            emit_try_enum_close(e, node->intrinsic.type_arg
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0 && node->intrinsic.arg_count > 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             emit_rewritten_node(e, node->intrinsic.args[0], func);

@@ -1,0 +1,23 @@
+// BUG-929: @try_enum(E, x) -> ?E is the CHECKED int-to-enum conversion.
+// BUG-927/928 closed every silent route from an integer to an enum, which left
+// @bitcast as the only way to read an enum out of a register — and @bitcast TRAPS
+// on a reserved encoding. @try_enum puts the failure in the TYPE instead, so it is
+// handled with the same orelse / if-unwrap control flow as every other fallible
+// operation in ZER. Exercises: orelse taken, orelse not taken, if-unwrap on a valid
+// value, if-unwrap on an invalid one, and switch on the unwrapped result.
+enum Color { red, green, blue }
+u32 main() {
+    u32 raw = 1;
+    u32 bad = 99;
+    Color a = @try_enum(Color, raw) orelse Color.red;      // valid   -> green (1)
+    Color b = @try_enum(Color, bad) orelse Color.blue;     // invalid -> blue  (2)
+    u32 n = 0;
+    if (@try_enum(Color, raw)) |v| { if (v == Color.green) { n += 10; } }
+    if (@try_enum(Color, bad)) |v| { if (v == Color.red)   { n += 100; } }
+    u32 s = 0;
+    if (@try_enum(Color, 2)) |v| {
+        switch (v) { .red => { s = 1; } .green => { s = 2; } .blue => { s = 3; } }
+    }
+    if ((u32)a == 1) { if ((u32)b == 2) { if (n == 10) { if (s == 3) { return 0; } } } }
+    return 70;
+}

@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: exactly 1 value argument
+enum C { r, g }
+u32 main(){ return (u32)(@try_enum(C) orelse C.r); }

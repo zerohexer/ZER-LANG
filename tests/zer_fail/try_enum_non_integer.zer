@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: value must be an integer
+enum C { r, g }
+u32 main(){ f32 f = 1.0; return (u32)(@try_enum(C, f) orelse C.r); }

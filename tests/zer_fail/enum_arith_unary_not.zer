@@ -1,0 +1,4 @@
+// expect-error: not a declared variant
+// BUG-914: `~c` on an enum yields a value far outside the variant set.
+enum Color { red, green, blue }
+u32 main() { Color c = Color.green; Color d = ~c; return (u32)d; }

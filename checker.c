@@ -1234,6 +1234,29 @@ static bool const_negative_into_unsigned(Node *value, Type *target) {
     return v < 0;
 }
 
+/* BUG-928: arithmetic and bitwise operators on ENUM operands produce values that are
+ * not declared variants.
+ *
+ * `zer_type_kind_is_numeric` answers TRUE for ZER_TK_ENUM, so `c + c`, `c << c`,
+ * `c & c`, `-c` and `~c` all type-check AND carry the enum type onward — which means
+ * BUG-927's value-flow rule cannot see them either (type_equals accepts an enum into
+ * an enum). `Color d = c + c;` then reaches a switch and takes an arbitrary arm.
+ *
+ * Rejected, like the literal door: an enum is a CLOSED set of named variants, and
+ * there is no arithmetic on it that is guaranteed to land back inside the set. The
+ * author who wants arithmetic wants the CARRIER, and can say so: `(u32)c + (u32)c`.
+ * Comparisons are untouched — `==`, `!=`, `<`, `>` neither create nor forge a value,
+ * and `switch` and equality against a variant are the idiomatic uses.
+ *
+ * Corpus cost measured before shipping: ZERO uses of enum arithmetic. */
+static bool enum_operand_in_value_op(Type *a, Type *b) {
+    Type *ua = a ? type_unwrap_distinct(a) : NULL;
+    Type *ub = b ? type_unwrap_distinct(b) : NULL;
+    if (ua && type_dispatch_kind(ua) == TYPE_ENUM) return true;
+    if (ub && type_dispatch_kind(ub) == TYPE_ENUM) return true;
+    return false;
+}
+
 /* BUG-927: an integer literal is NOT a route to an enum value.
  *
  * `zer_type_kind_is_integer` answers TRUE for ZER_TK_ENUM (enums are
@@ -5608,7 +5631,14 @@ static Type *check_expr(Checker *c, Node *node) {
         /* arithmetic: both numeric, result = common type */
         case TOK_PLUS: case TOK_MINUS: case TOK_STAR:
         case TOK_SLASH: case TOK_PERCENT:
-            if (!type_is_numeric(left) || !type_is_numeric(right)) {
+            if (enum_operand_in_value_op(left, right)) {
+                checker_error(c, node->loc.line,
+                    "arithmetic on an enum operand ('%s') can produce a value that is "
+                    "not a declared variant — convert to the carrier first, e.g. "
+                    "(u32)x + (u32)y",
+                    type_name(enum_operand_in_value_op(left, NULL) ? left : right));
+                result = left;
+            } else if (!type_is_numeric(left) || !type_is_numeric(right)) {
                 checker_error(c, node->loc.line,
                     "arithmetic requires numeric types, got '%s' and '%s'",
                     type_name(left), type_name(right));
@@ -5830,6 +5860,15 @@ static Type *check_expr(Checker *c, Node *node) {
         /* bitwise: both integer, result = common type */
         case TOK_AMP: case TOK_PIPE: case TOK_CARET:
         case TOK_LSHIFT: case TOK_RSHIFT:
+            if (enum_operand_in_value_op(left, right)) {
+                checker_error(c, node->loc.line,
+                    "bitwise operation on an enum operand ('%s') can produce a value "
+                    "that is not a declared variant — convert to the carrier first, "
+                    "e.g. (u32)x | (u32)y",
+                    type_name(enum_operand_in_value_op(left, NULL) ? left : right));
+                result = left;
+                break;
+            }
             if (!type_is_integer(left) || !type_is_integer(right)) {
                 checker_error(c, node->loc.line,
                     "bitwise operators require integers, got '%s' and '%s'",
@@ -5856,6 +5895,19 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *operand = check_expr(c, node->unary.operand);
         c->in_amp = saved_in_amp;
 
+        /* BUG-928: `-c` / `~c` on an enum operand yields a non-variant just as
+         * surely as the binary forms. Placed before the switch so both unary
+         * value-producing operators are covered by ONE test — the sibling-route
+         * failure this whole class is made of. `!` is excluded: it yields bool. */
+        if ((node->unary.op == TOK_MINUS || node->unary.op == TOK_TILDE) &&
+            enum_operand_in_value_op(operand, NULL)) {
+            checker_error(c, node->loc.line,
+                "unary '%s' on an enum operand ('%s') can produce a value that is not "
+                "a declared variant — convert to the carrier first, e.g. %s(u32)x",
+                node->unary.op == TOK_MINUS ? "-" : "~", type_name(operand),
+                node->unary.op == TOK_MINUS ? "-" : "~");
+            return operand;
+        }
         switch (node->unary.op) {
         case TOK_MINUS:
             if (!type_is_numeric(operand)) {
@@ -7536,6 +7588,16 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         } else {
+            /* BUG-928: `c += 2` on an enum target is the same forging operation as
+             * `c = c + 2`, and the assign path types it separately from the binary
+             * one — the compound/plain sibling split this codebase keeps hitting
+             * (see the `<<` vs `<<=` note in CLAUDE.md's AST->IR audit rule). */
+            if (enum_operand_in_value_op(target, NULL)) {
+                checker_error(c, node->loc.line,
+                    "compound assignment to an enum ('%s') can produce a value that is "
+                    "not a declared variant — assign a declared variant instead",
+                    type_name(target));
+            } else
             /* compound assignment: += -= etc. — both must be numeric */
             if (!type_is_numeric(target) || !type_is_numeric(value)) {
                 checker_error(c, node->loc.line,
@@ -10652,6 +10714,28 @@ static Type *check_expr(Checker *c, Node *node) {
                                 TypeKind g1_tk = type_dispatch_kind(g1_tgt->pointer.inner);
                                 bool g1_s_agg = (g1_sk == TYPE_STRUCT || g1_sk == TYPE_UNION);
                                 bool g1_t_agg = (g1_tk == TYPE_STRUCT || g1_tk == TYPE_UNION);
+                                /* BUG-928: an ENUM pointee is not interchangeable with
+                                 * its integer carrier. The aggregate test above requires
+                                 * BOTH sides to be struct/union, so `@ptrcast(*Color,
+                                 * p)` from a `*u32` fell through every arm — and the
+                                 * forged variant then materialises at the DEREF, where
+                                 * no guard runs. Same root cause as BUG-927: ZER_TK_ENUM
+                                 * answers "integer", so an enum silently passes wherever
+                                 * an integer is accepted. Third site of that one bug.
+                                 *
+                                 * A *opaque source keeps its documented freedom (unknown
+                                 * provenance cannot be proven wrong); this fires only
+                                 * when both pointees are concrete and exactly one is an
+                                 * enum. Corpus cost: no @ptrcast to an enum pointee. */
+                                if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
+                                    (g1_sk == TYPE_ENUM) != (g1_tk == TYPE_ENUM)) {
+                                    checker_error(c, node->loc.line,
+                                        "@ptrcast between '%s' and '%s' reinterprets an "
+                                        "integer as an enum — the dereference would yield "
+                                        "a value that is not a declared variant. Read the "
+                                        "carrier and use @bitcast, which is variant-checked",
+                                        type_name(val_type), type_name(result));
+                                }
                                 if (g1_s_agg && g1_t_agg) {
                                     Type *g1_si = type_unwrap_distinct(eff->pointer.inner);
                                     Type *g1_ti = type_unwrap_distinct(g1_tgt->pointer.inner);

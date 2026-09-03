@@ -1,0 +1,4 @@
+// expect-error: not a declared variant
+// BUG-914: enum + enum can leave the variant set (blue+blue = 4).
+enum Color { red, green, blue }
+u32 main() { Color c = Color.blue; Color d = c + c; return (u32)d; }

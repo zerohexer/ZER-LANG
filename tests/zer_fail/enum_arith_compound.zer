@@ -1,0 +1,4 @@
+// expect-error: not a declared variant
+// BUG-914: the compound spelling forged exactly as the binary one did.
+enum Color { red, green, blue }
+u32 main() { Color c = Color.red; c += 2; return (u32)c; }

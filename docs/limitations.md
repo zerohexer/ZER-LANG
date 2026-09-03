@@ -30,6 +30,464 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed
+
+**Read this section ALONE and you can start work. Nothing here needs re-deriving.**
+Every finding was MEASURED against `main` at `c8e58304` using the branch's OWN test
+file (a reconstruction can CONFIRM a hole but never REFUTE one). Reproducers are
+inline so you do not need to fetch the branches to begin.
+
+### Branches surveyed, and where each forked
+
+| branch | ahead | behind | forked at | date |
+|---|---|---|---|---|
+| `vigilant-tesla-v7pucv` | 1 | 0 | c8e58304 | 2026-09-03 |
+| `vigilant-tesla-pstdqk` | 1 | 0 | c8e58304 | 2026-09-02 |
+| `vigilant-tesla-yzhu1s` | 4 | 0 | c8e58304 | 2026-09-01 |
+| `vigilant-tesla-fhf8rn` | 2 | 0 | c8e58304 | 2026-08-31 |
+| `vigilant-tesla-lzmkhn` | 8 | 0 | c8e58304 | 2026-08-30 |
+| `vigilant-tesla-o51x9p` | 2 | 0 | c8e58304 | 2026-08-29 |
+| `vigilant-tesla-1zukjq` | 6 | 0 | c8e58304 | 2026-08-28 |
+| `vigilant-tesla-ef9cao` | 7 | 0 | c8e58304 | 2026-08-27 |
+| `vigilant-tesla-osp1a7` | 7 | 17 | ae033cd0 | 2026-08-26 |
+| `vigilant-tesla-as71kk` | 16 | 18 | 9f8cda08 | 2026-08-25 |
+| `vigilant-tesla-r1piyr` | 1 | 19 | 1c4c64d2 | 2026-08-24 |
+
+Eight forked from CURRENT HEAD, so they audit the live compiler and their findings
+are live. The last three are largely CONSUMED (osp1a7's BUG-909..912 landed; as71kk
+BUG-857..881; r1piyr BUG-857..864) — only the residuals listed below survive.
+
+**BUG NUMBERS COLLIDE.** All eight current-HEAD branches independently numbered from
+BUG-913. Never trust a branch's BUG-NNN; renumber on adoption.
+
+Fetch a file without checking out:
+    git show origin/claude/vigilant-tesla-<id>:tests/zer_fail/<name>.zer
+
+### THREE HARNESS TRAPS THAT WILL WASTE YOUR TIME (all hit during this survey)
+
+1. **A `zer_fail` test that produces NO checker diagnostic is not automatically a
+   hole.** ZER answers several classes by TRACKING (a runtime guard), not by
+   rejecting — enum forging is the big one. `zerc f.zer -o out.c` shows nothing and
+   the program still TRAPS at runtime, correctly. Discriminate by running:
+   `zerc f.zer --run; echo $?` — **133 = SIGTRAP = handled, not a hole.**
+   This would have produced ~18 false holes in this survey.
+2. **`$?` is clobbered by command substitution.** `printf "%s %s" "$(basename $f)" "$?"`
+   reports the exit of `basename`, not of the program. Capture `rc=$?` on the line
+   IMMEDIATELY after the command. This made all four enum trap pins look broken when
+   the real runner shows them PASS at exit 133.
+3. **Module tests extracted flat cannot resolve their imports.** ~12 `xmod_*` /
+   `contuser` / `spawnimp_user` files "fail" with `cannot open module` — that is the
+   extraction, not an over-rejection. Keep companions in the same directory.
+
+4. **A TIMED-OUT probe looks exactly like "accepted with no diagnostics".** A probe
+   that wraps `zerc` in `timeout N` and then greps stdout for diagnostics cannot tell
+   a HANG from a clean accept — both produce empty output. This survey classified
+   `const u32 A = A;` as "accepted" when it actually hangs the compiler forever.
+   Always capture the exit code separately and treat 124 as its own verdict.
+
+Also: `tests/zer_trap/` files may carry `// zerc-flags:` on the first 5 lines and the
+runner passes them; a probe that ignores them measures a different program.
+
+---
+
+### CLASS 1 — ENUM FORGING: the door set is NOT closed (HIGH, accept-unsafe)
+
+**CLAUDE.md currently states the doors are "EXACTLY THREE and the set is closed
+(@bitcast, @truncate, @saturate)". MEASURED FALSE 2026-08-20.** That sentence must be
+corrected when this class is fixed.
+
+**CONFIRMED HANDLED (do NOT re-fix — these TRAP at 133):** `@bitcast`, `@truncate`,
+`@saturate`, `@pun` to a funcptr, `@inttoptr` mint. Main's four
+`tests/zer_trap/*_enum_forged_*.zer` pins all pass.
+
+**LIVE — a plain LITERAL is the fourth door, and it was never counted.** Branch
+`fhf8rn`. Ten sinks, each its own test file, all reach an impossible switch arm
+(the programs exit 99, their own "impossible" signal):
+
+    enum Color { red, green, blue }
+    u32 main() { Color c = 99; return (u32)c; }        // enum_forge_lit_vardecl
+
+Sinks: `_vardecl`, `_assign`, `_callarg`, `_return`, `_structinit`, `_arrayelem`,
+`_globalinit`, `_orelse`, `_spawnarg`, `_negative`.
+
+**LIVE — enum ARITHMETIC produces non-variants.** Branch `fhf8rn`, 5 forms
+(`enum_arith_binary`, `_bitwise`, `_compound`, `_unary_minus`, `_unary_not`):
+
+    enum Color { red, green, blue }
+    u32 main() { Color c = Color.blue; Color d = c + c; return (u32)d; }
+
+**LIVE — `@ptrcast` is a door** (`fhf8rn/enum_mint_ptrcast`, exits 99).
+**LIVE — `@pun` to enum / pointer / slice, `@inttoptr` to an enum target**
+(`ef9cao`: `pun_forge_enum`, `pun_forge_pointer`, `pun_forge_slice`,
+`inttoptr_enum_target`, `inttoptr_enum_in_struct`).
+
+**Best source: `fhf8rn`** (literal sinks + arithmetic) **plus `ef9cao`** (the
+`@pun`/`@inttoptr` doors). Fix shape: the variant guard already exists and already
+recurses struct fields / optional payloads / array elements — it needs to be wired at
+the literal-assignment sites and at these conversions, i.e. ONE predicate at the
+value-flow sites, not another per-door patch.
+
+---
+
+### CLASS 2 — CAST/LAUNDER AT THE **HEAP / UAF** SINK (CRITICAL, accept-unsafe)
+
+**This is NOT the class closed by BUG-791.** BUG-791 peeled launders at the STACK
+ESCAPE sinks (`unwrap_ptr_launder` + the store-to-global arm + `ir_extract_compound_key`).
+The sink still open is the **allocation-identity / handle-tracking** one in
+`zercheck_ir.c`: a laundered pointer assigned to a GLOBAL loses its alloc identity, so
+the free is never linked to the later use.
+
+**2a. UAF through a cast-laundered GLOBAL** — `lzmkhn/cast_launder_global_dangle`.
+Measured: **0 diagnostics.**
+
+    struct N { u32 v; }
+    ?*N g;
+    u32 main() {
+        *N n = alloc(N) orelse { return 1; };
+        n.v = 7;
+        g = (*N)n;          // <-- identity lost here
+        free(n);
+        *N r = g orelse { return 2; };
+        return r.v;         // use-after-free
+    }
+
+**2b. UAF through `@cast` to a distinct typedef** — `1zukjq/cast_launder_uaf`:
+
+    distinct typedef [*]u8 Buf;
+    u32 res;
+    void f() {
+        [*]u8 b = alloc(u8, 4) orelse return;
+        Buf c = @cast(Buf, b);
+        free(b);
+        res = (u32)c[0];    // UAF
+    }
+
+**2c. DOUBLE FREE through the same distinct-typedef launder** —
+`1zukjq/cast_launder_double_free`: `free(c); free(b);` where `c = @cast(Buf, b)`.
+
+**2d. Cast defeats KEEP INFERENCE** — `lzmkhn/cast_launder_keep_inference`:
+
+    ?*u32 g_p;
+    *u32 idfn(*u32 p) { return p; }
+    void stash(*u32 p) { g_p = idfn((*u32)p); }
+    u32 main() { u32 loc = 5; stash(&loc); return 0; }
+
+**2e. STRUCT LITERAL is an unpeeled launder** — `lzmkhn/cast_launder_struct_literal_escape`
+and `fhf8rn/local_launder_structlit_ccast`:
+
+    struct H { ?*u32 p; }
+    H g;
+    void c() { u32 loc = 5; g = { .p = (*u32)(&loc) }; }
+
+**2f. ARENA-derived pointer laundered to a global** — branch `fhf8rn`, 4 forms.
+`is_from_arena` is defeated by a C-cast, by `@pun`, by a struct literal, and by a
+two-hop C-cast:
+
+    struct N { u32 v; }
+    ?*N g;
+    void stash() {
+        u8[256] bk;
+        Arena ar = Arena.over(bk);
+        *N a = ar.alloc(N) orelse return;
+        g = (*N)a;                      // arena_launder_ccast_global
+        // g = @pun(*N, a);             // arena_launder_pun_global
+        // gb = { .p = @pun(*N, a) };   // arena_launder_structlit
+        // *N b = (*N)a; g = b;         // arena_launder_twohop_ccast
+    }
+
+**2g. `@cstr` and `@container` as launders** — branch `ef9cao`:
+
+    ?*u8 gp;
+    void publish() {
+        u8[8] buf;
+        const [*]u8 s = "hi";
+        gp = @cstr(buf, s);             // launder_cstr_global_escape — buf is a LOCAL
+    }
+
+    // launder_container_struct_literal: @container inside a struct literal
+    Dev local; *LH lp = &local.lh;
+    W w = { .d = @container(*Dev, lp, lh) };
+
+**Best source: `lzmkhn`** (4 forms incl. keep-inference) **+ `fhf8rn`** (arena, 4
+forms) **+ `1zukjq`** (distinct-typedef UAF + double-free) **+ `ef9cao`**
+(`@cstr`/`@container`).
+
+**Fix shape — do NOT patch these one at a time.** The peel must reach (i) the
+allocation-identity path in `zercheck_ir.c` for a store to a GLOBAL, and (ii) the
+STRUCT LITERAL as a launder carrier at every escape sink. `fhf8rn`'s own
+limitations.md records "CLOSED 2026-08-31 (BUG-920) — the hand-rolled peel sites WERE
+live holes", which is the same conclusion from the other side.
+
+---
+
+### CLASS 3 — LOOP COUNTER PAST END / OFF BY ONE (HIGH, silent OOB) — `v7pucv`
+
+7 tests: `loop_counter_off_by_one`, `_past_end`, `_past_end_field`,
+`_step_overshoot`, `_while_past_end`, `loop_counter_dowhile_past_end`,
+`dowhile_counter_past_end_bug748`.
+
+    u32 main() {
+        u32[4] arr;
+        for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }   // <= is one past the end
+        return 0;
+    }
+
+Companion POSITIVES that must keep compiling (currently OVER-REJECTED, see below):
+`loop_counter_bounds_ok`, `vrp_empty_range_zero_trip_ok`.
+
+---
+
+### CLASS 4 — THE **ASSIGN FORM** IS NOT TRACKED (HIGH, accept-unsafe) — `v7pucv`
+
+Allocation and move tracking key on the VAR-DECL spelling; the ASSIGNMENT spelling of
+the same operation is invisible. 9 tests.
+
+    struct Device { u32 id; }
+    Pool(Device, 8) pool_a;
+    void run() {
+        ?Handle(Device) mh;
+        mh = pool_a.alloc();        // ASSIGN, not var-decl  <-- not registered
+        Handle(Device) h = mh orelse return;
+        pool_a.free(h);
+        u32 v = pool_a.get(h).id;   // UAF, accepted
+    }
+
+Forms: `alloc_assign_form_uaf`, `_double_free`, `_leak`, `_ptr_uaf`, `_branch_uaf`,
+`_universal_uaf`; and for `move struct`: `move_assign_form_ident`, `_field`, `_index`:
+
+    move struct Token { u32 id; }
+    u32 main() { Token a; a.id = 1; Token b; b = a; return a.id; }  // use-after-move
+
+Also `v7pucv`: `move_struct_deep_nesting_uam`, `wrong_pool_across_branch`.
+
+---
+
+### CLASS 5 — ATOMIC CELL vs SCOPED SPAWN (HIGH, silent race) — `v7pucv`
+
+The atomic-cell rule does not cover the window between `spawn` and `.join()`:
+
+    u32 g_ctr;
+    void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+    u32 main() {
+        ThreadHandle t = spawn worker();
+        g_ctr = 5;              // plain write races the atomic — accepted
+        t.join();
+        return 0;
+    }
+
+3 tests: `atomic_cell_scoped_spawn_window`, `_two_threads`, `_via_helper`.
+
+---
+
+### CLASS 6 — RMW SPLIT OVER TWO STATEMENTS (MEDIUM, bare-metal) — `1zukjq`
+
+**Direct residual of BUG-792.** That fix made the rule catch the written-out
+single-statement form (`g = g + 1`); splitting the same operation over two statements
+still evades it, because the rule is per-STATEMENT:
+
+    volatile u32 g;
+    interrupt TIM2 { g = 7; }
+    u32 main() {
+        u32 t = g;
+        g = t + 1;      // same RMW, two statements — accepted
+        return g;
+    }
+
+---
+
+### CLASS 7 — VIEW / STRUCT-INIT FIELD (HIGH, accept-unsafe) — `1zukjq`
+
+    // multiview_assign_uaf — a reassigned slice view loses which allocation it names
+    [*]u8 pick([*]u8 a, [*]u8 b, bool fl) { if (fl) { return b[0..1]; } return a[0..1]; }
+    void g(bool fl) {
+        [*]u8 x = alloc(u8, 4) orelse return;
+        [*]u8 y = alloc(u8, 4) orelse return;
+        [*]u8 h = x;  h = pick(x, y, fl);
+        free(y);  res = (u32)h[0];  free(x);
+    }
+
+    // struct_init_field_uaf — a freed pointer stored into a struct literal, then read
+    *Item t = pool.alloc_ptr() orelse return;
+    pool.free_ptr(t);
+    Holder h = { .t = t };
+    res = h.t.id;
+
+    // param_local0_double_free — unwrap a by-value param's handle field, free both
+    void f(Holder hd) { Handle(Item) k = hd.h; pool.free(k); pool.free(hd.h); }
+
+Also `multiview_branch_join_uaf`, `struct_init_field_move`.
+
+---
+
+### CLASS 8 — `defer` BODY RESTRICTIONS NOT ENFORCED (MEDIUM) — `o51x9p`
+
+5 tests. `spawn` inside a defer body is accepted:
+
+    void w(u32 v) { u32 t = v; }
+    u32 main() { defer { spawn w(1); } return 0; }
+
+Forms: `defer_body_spawn`, `_critical`, `_label`, `_once`, `_switch`.
+
+---
+
+### CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`
+
+**Upgraded from MEDIUM after re-measurement 2026-08-20.** This does not merely
+compile — the compiler LOOPS FOREVER in constant evaluation. Measured `exit=124` at a
+15-second timeout, on both the hand-written form and the branch's own file:
+
+    const u32 A = A;            // global_init_cycle_self -- COMPILER HANGS
+    u32 main() { return A; }
+
+A hang is worse than an accept: it cannot be caught by any negative test that has a
+timeout, and it takes `make check` down with it (`tests/zer_trap` already treats 124
+as an explicit FAIL for exactly this reason). Fix needs a visited-set / depth bound in
+the global-initializer constant folder, reported as a diagnostic.
+
+4 tests: `global_init_cycle_self`, `_cycle_mutual`, `_chain_too_deep`,
+`_from_mutable`. Check whether `_cycle_mutual` hangs too before assuming it only
+accepts.
+
+---
+
+### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
+
+    usize g = 0;
+    usize idfn(usize x) { return x; }
+    u32 main() { u32 local = 5; g = idfn(@ptrtoint(&local)); return 0; }
+
+3 tests: `_via_call_global`, `_via_call_alias`, `_via_call_return`.
+CLAUDE.md lists `@ptrtoint(&local)` direct AND indirect escape as covered — the
+CALL-laundered form is not.
+
+---
+
+### CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`
+
+The range and alignment checks fold a literal but not a `const` identifier:
+
+    mmio 0x4000_0000..0x4000_0FFF;
+    const u32 ADDR = 0x40005000;                  // outside the declared range
+    u32 main() { volatile *u32 r = @inttoptr(*u32, ADDR); return 0; }
+
+2 tests: `mmio_const_ident_oob_addr`, `mmio_const_ident_misaligned`.
+Companion positive `mmio_const_ident_base` is currently OVER-REJECTED (below).
+
+---
+
+### CLASS 12 — FUNCPTR FACTORY THROUGH switch / do-while (MEDIUM) — `pstdqk`
+
+Extends the funcptr REACH class. `scan_returned_funcname` does not descend a `switch`
+arm or a `do-while` body:
+
+    u32 g;
+    void cb() { g += 1; }
+    void nop() { }
+    *() -> void mk(u32 k) {
+        switch (k) { 0 => { return cb; } default => { } }
+        return nop;
+    }
+    void worker() { *() -> void fp = mk(0); fp(); }
+    u32 main() { spawn worker(); return 0; }
+
+3 tests: `spawn_race_factory_switch`, `spawn_race_factory_dowhile`,
+`isr_race_factory_switch`. **Both sinks — add the ISR mirror in the same commit.**
+
+---
+
+### CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`
+
+    struct Inner { u32 a; }
+    struct Outer { u64 pad; Inner in; }
+    u32 main() {
+        Inner i; i.a = 3;
+        *Inner ip = &i;                            // NOT a field of an Outer
+        *Outer o = @container(*Outer, ip, in);     // accepted — reads outside `i`
+        return (u32)o.pad;
+    }
+
+5 tests: `container_whole_object`, `_alias`, `_direct`, `_global`,
+`container_array_element`.
+
+---
+
+### CLASS 14 — CLI ARGUMENT VALIDATION (LOW, tooling) — `as71kk`
+
+`cli_unknown_option`, `cli_bad_target_arch`, `cli_bad_stack_limit`. Unknown and
+malformed arguments are silently ignored. **NOTE: also found independently on branch
+`hefb6x` in the previous survey and still not landed** — two branches, one finding.
+
+---
+
+### CLASS 15-18 — smaller, each one branch
+
+- **i64 literal range** (`lzmkhn`): `i64_literal_above_max`, `_below_min`,
+  `_over_range_sinks`.
+- **compound float <-> int** (`fhf8rn`): `compound_float_into_int`,
+  `compound_int_into_float`.
+- **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,
+  `_tilde`. NB: distinct from the ALLOWED unsigned ops `~0` / `0 - 1`; see the
+  corpus-cost rule in CLAUDE.md before widening.
+- **misc** (`yzhu1s`): `bitcast_bare_array_source`, `stack_limit_root_entry`.
+- **bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).
+
+---
+
+### NON-TEST FINDINGS (no reproducer; from the branches' limitations.md)
+
+- **`ir_merge_states` merges only 4-5 of ~17-18 `IRHandleInfo` fields.** Found
+  INDEPENDENTLY by `v7pucv`, `pstdqk` AND `1zukjq`. Three branches converging is the
+  strongest architectural signal in this survey. A field that is not merged is a fact
+  silently dropped at every CFG join — the same shape as the `threads[]` merge bug.
+- **`IRPathState.critical_depth` is not merged at all** (`pstdqk` lead B).
+- **`ir_ps_copy` forces `terminated = false`, making three merge branches dead**
+  (`pstdqk` lead C).
+- **The analyzer READ FREED MEMORY to decide a safety verdict** (`lzmkhn`
+  BUG-920/921). A use-after-free INSIDE the compiler affecting a safety answer. That
+  branch also ships `tools/compiler_asan_sweep.sh` — take the tool.
+- **The grammar-closure probe printed OK on a compiler that HAD a breach**
+  (`ef9cao`). A gate that was lying; same class as the two gate defects in
+  CLAUDE.md's "A GATE CAN ITSELF BE BROKEN".
+- **`--track-cptrs`'s use-after-free half has NO call site, and the obvious fix is
+  UNSOUND** (`fhf8rn` BUG-921).
+- **`emit_defer_stmt` is the last raw-AST STATEMENT emitter** (`o51x9p`,
+  ARCHITECTURAL).
+- **`tests/zer_gaps/` triaged 23 -> 10 plus the harness oracle that let them rot**
+  (`lzmkhn`) — take this wholesale.
+- **reference.md**: 34 more examples compile standalone; an audit-harness defect
+  manufactured five of the failures (`lzmkhn`). Baseline down to 45.
+- `pstdqk` lead E (`ir_lower_interrupt` + defers) is **REFUTED, measured** — do not
+  re-probe. Lead G was CONFIRMED and fixed on that branch (BUG-917).
+
+---
+
+### OVER-REJECTIONS found by the survey (positives main refuses)
+
+| test | branch |
+|---|---|
+| `loop_counter_bounds_ok`, `vrp_empty_range_zero_trip_ok` | v7pucv |
+| `comptime_width_conversions`, `return_literal_is_static_ok` | lzmkhn |
+| `mmio_const_ident_base` | o51x9p |
+| `funcptr_global_registry_ok` | osp1a7 |
+| `cast_launder_ok` | 1zukjq |
+
+NOT over-rejections: ~12 `xmod_*` / `contuser` / `spawnimp_user` module tests — see
+harness trap 3.
+
+---
+
+### SUGGESTED ORDER (highest collapse ratio first)
+
+1. **Enum literal door** — 10 sinks close with one predicate at the value-flow sites.
+   Correct CLAUDE.md's "EXACTLY THREE / set is closed" sentence in the same commit.
+2. **Cast/launder at the HEAP-UAF sink** — ~15 tests across 4 branches, one peel
+   reaching the allocation-identity path + struct-literal carrier.
+3. **`ir_merge_states` field coverage** — 3 branches agree; architectural.
+4. **The ASSIGN form** for alloc/move — 9 tests, one registration site.
+5. **The global-init self-cycle HANG** — small fix, but it is a compiler DoS and
+   any negative test for it will time out `make check` until it is fixed.
+6. Everything else, per class above.
+
 ## Where main stands
 
 `make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT

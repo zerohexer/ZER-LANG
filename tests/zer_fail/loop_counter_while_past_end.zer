@@ -1,0 +1,9 @@
+// expect-error: loop provably performs an out-of-bounds access
+// BUG-913, `while` half. Same defect as the `for` spelling: before this rule the
+// loop silently stopped at i == 4 and main returned 0 = "success".
+u32 main() {
+    u32[4] arr;
+    u32 i = 0;
+    while (i < 8) { arr[i] = i; i += 1; }
+    return 0;
+}

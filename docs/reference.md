@@ -170,8 +170,24 @@ void do_work() { }
 
 **DESCRIPTION**
 Fixed-size array. Size goes between type and name (NOT after name like C).
-Every index access is bounds-checked. Out-of-bounds traps at runtime.
-Compile-time constant indices are checked at compile time.
+Every index access is bounds-checked. Compile-time constant indices, and indices
+whose range the compiler can prove, are checked at compile time.
+
+An index the compiler cannot prove gets an **auto-guard**, and the auto-guard's
+runtime form is an early `return` of the function's zero value — **not** a trap.
+That is a real behavioural difference from `[*]T`, which traps:
+
+| container | unprovable index, out of range at run time |
+|---|---|
+| `T[N]` (fixed array) | auto-guard: the enclosing function returns its zero value, silently |
+| `[*]T` (slice) | `_zer_trap` — `SIGTRAP`, with the file and line |
+
+So a fixed-array access that goes out of range does not crash: it abandons the
+rest of the function and hands the caller a zero. Inside `@critical` or a held
+lock the guard traps instead (an early return would leak the interrupt-disable or
+the mutex) — see "SAFETY RULES YOU WILL HIT". If you want the loud behaviour
+everywhere, index a slice, or write the explicit `if (i >= N) { ... }`, which
+also removes the guard entirely.
 
 **SYNTAX**
 ```zer
@@ -188,7 +204,7 @@ scores[3] = 200;          // OK — index 3 < 4
 scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
 
 u32 i = get_index();
-scores[i] = 50;           // runtime bounds check — traps if i >= 4
+scores[i] = 50;           // auto-guard — if i >= 4 the function returns early
 
 // Range propagation: proven-safe indices have ZERO overhead
 for (u32 j = 0; j < 4; j += 1) {
@@ -3817,19 +3833,55 @@ compile error instead.
 Rules that reject code most people expect to compile. Each is here because the
 alternative is a wrong answer at run time rather than a message at compile time.
 
-### Bounds: three verdicts, not two
+### Bounds: four verdicts, not two
 
-An index gets one of three verdicts from its proven range:
+An index gets one of four verdicts:
 
 | Verdict | When | Result |
 |---|---|---|
 | PROVEN SAFE | the whole range is inside the bound | no check emitted — zero overhead |
 | PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
-| UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (runtime check) |
+| LOOP RUNS PAST THE END | the index is the counter of a counted loop that *will* take a value past the bound | **compile error** |
+| UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (early return) |
 
-The middle verdict is the one that surprises people: an index the compiler can prove is
-*always* wrong is an error, not a runtime check — including when it is reached through a
-variable, and including a range that is entirely negative.
+An index the compiler can prove is *always* wrong is an error, not a runtime
+check — including when it is reached through a variable, and including a range
+that is entirely negative.
+
+An **empty** range is not an error. A range whose max is below its min (a
+zero-trip loop, or a contradictory guard) says the access is unreachable, so
+nothing is diagnosed:
+
+<!-- audit: skip -->
+```zer
+u32[4] arr;
+for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }   // fine — the body never runs
+```
+
+The third verdict is the off-by-N loop bound. A *range* only says which values a
+variable MAY hold, which is why a straddling range alone is not an error. But the
+counter of a `for` whose init, bound and step are constants, with a body that
+cannot skip an iteration or change the counter, provably TAKES every value of its
+sequence — so if one of them indexes past the end, the loop provably performs an
+out-of-bounds access:
+
+<!-- audit: skip -->
+```zer
+u32[4] arr;
+for (u32 i = 0; i < 8; i += 1) { arr[i] = i; }   // ERROR — counter runs 0..7
+for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }  // ERROR — off by one
+for (u32 i = 0; i < 4; i += 1) { arr[i] = i; }   // OK — and no check is emitted
+```
+
+`while` and `do-while` get the same treatment when the counter is bumped by a
+constant in the LAST statement of the body — that position is what makes the
+values at the access `lo, lo+step, ...`; with the increment first they are
+`lo+step, ...` instead, so no certainty is claimed there.
+
+Break any premise and it falls back to the auto-guard: a `break`/`return`/`goto`
+or an `orelse` in the body, an assignment to the counter, a nested loop, a
+non-constant bound, or an access nested inside an `if` (the offending values may
+never reach it).
 
 <!-- audit: skip -->
 ```zer
@@ -3899,6 +3951,48 @@ u32 packed_misuse() {
 
 Read and write the field directly (`g.b = 7;`) — that path knows the layout and emits a
 correct unaligned access.
+
+### A handle that could come from two pools cannot be freed after the merge
+
+`Handle(T)` is an index plus a generation, not a pointer — it carries no reference to the
+pool it came from. Freeing it on the wrong pool indexes the wrong slot and generation
+arrays. When two paths allocate the same handle from DIFFERENT pools, no single pool is the
+right one to name afterwards:
+
+<!-- audit: skip -->
+```zer
+?Handle(Device) mh;
+if (cond) { mh = pool_a.alloc(); } else { mh = pool_b.alloc(); }
+Handle(Device) h = mh orelse return;
+pool_a.free(h);        // ERROR — may have come from pool_a OR pool_b
+```
+
+Free it on the branch that allocated it, or allocate from one pool. A free INSIDE a branch
+is fine — there the pool is known exactly.
+
+### A plain access races a SCOPED thread too, not just a fire-and-forget one
+
+Once a global is touched with `@atomic_*` anywhere it is an ATOMIC CELL, and every other
+access to it in a concurrent context must be atomic as well. The concurrent context of a
+scoped spawn is the window between the `spawn` and its `join` — not nothing:
+
+<!-- audit: skip -->
+```zer
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+
+u32 main() {
+    g_ctr = 0;                         // OK — before the spawn, one thread
+    ThreadHandle t = spawn worker();
+    g_ctr = 5;                         // ERROR — races the running worker
+    t.join();
+    g_ctr = g_ctr + 1;                 // OK — after the join, one thread again
+    return 0;
+}
+```
+
+With two scoped threads live, one `join` does not close the window — the other thread is
+still running.
 
 ### The dereference identity rule
 
@@ -4011,7 +4105,39 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --stack-limit 4096       # error if a frame or call chain exceeds N bytes
+zerc source.zer --track-cptrs            # runtime *opaque tracking for C interop
+zerc source.zer --emit-ir                # print the lowered IR and exit (debugging)
+zerc source.zer --trace                  # print the compilation flow to stderr
+zerc source.zer --trace-calls            # full call-graph trace (zerc-trace build)
+zerc source.zer --help                   # usage
 ```
+
+An unrecognised option is a hard error — `zerc` never silently ignores a flag
+it does not know, and an unknown VALUE (`--target-arch=arm64`) is an error too.
+
+`--release` is accepted and is currently a **no-op**; it prints a warning saying
+so. Optimisation is GCC's, through the flags `zerc` passes.
+
+`--track-cptrs` wraps `*opaque` values in a `{ptr, type_id}` record and links
+with `-Wl,--wrap=malloc,...` so a wrong cast across the C boundary traps at
+runtime. It is implied by `--run`.
+
+`--target-features=` takes a comma-separated list. Recognised values:
+
+| value | GCC flag |
+|---|---|
+| `avx512f` | `-mavx512f` |
+| `avx2`, `avx` | `-mavx2`, `-mavx` |
+| `sse2`, `sse` | `-msse2`, `-msse` |
+| `aes`, `sha` | `-maes`, `-msha` |
+| `bmi2`, `bmi1` (or `bmi`) | `-mbmi2`, `-mbmi` |
+| `lzcnt`, `popcnt` | `-mlzcnt`, `-mpopcnt` |
+| `invpcid`, `pku`, `xsave` | `-minvpcid`, `-mpku`, `-mxsave` |
+| `smap` | *(none — kernel-only; sets the feature bit for the checker)* |
+
+The x86-64 baseline is `sse` + `sse2`; `--target-arch=aarch64` / `riscv64`
+clears it, since those architectures have their own baseline.
 
 ### Pipeline
 

@@ -843,15 +843,34 @@ static void register_builtin_pair_types(Checker *c);
  * Trusting VRP to prove DANGER is the safe direction — a wrong range can only
  * over-reject. (Trusting it to prove SAFETY is the risky one, and the bounds path
  * already does that to elide checks.) */
-typedef enum { IDX_UNKNOWN, IDX_PROVEN_SAFE, IDX_ALWAYS_OOB } IndexVerdict;
+typedef enum { IDX_UNKNOWN, IDX_PROVEN_SAFE, IDX_ALWAYS_OOB,
+               IDX_PARTIAL_OOB } IndexVerdict;
 static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
     if (!r || limit == 0) return IDX_UNKNOWN;
+    /* BUG-914: an EMPTY range (max < min) says the value cannot exist here — the
+     * code is UNREACHABLE, which is a proof of DEAD, not a proof of DANGER.
+     * `bounds_ident_proven_ok.zer` already recorded that intent for a range that
+     * became empty by narrowing (min 6, max 0), and that case escaped only
+     * because its max happened to be >= 0. A zero-trip loop reaches the same
+     * state with a NEGATIVE max: `for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }`
+     * gives [0, -1], fell into the "entirely negative -> always out of bounds"
+     * arm below, and was HARD-REJECTED on main. The same shape appears for real
+     * whenever a bound is a configuration constant that can legitimately be 0.
+     * Diagnose nothing; the access is never executed. */
+    if (r->min_val > r->max_val) return IDX_UNKNOWN;
     /* every value in the range is a valid index */
     if (r->min_val >= 0 && r->max_val >= 0 && (uint64_t)r->max_val < limit)
         return IDX_PROVEN_SAFE;
     /* no value in the range can be one: entirely past the end, or entirely negative */
     if (r->min_val >= 0 && (uint64_t)r->min_val >= limit) return IDX_ALWAYS_OOB;
     if (r->max_val < 0) return IDX_ALWAYS_OOB;
+    /* The range STRADDLES the end: some values index, some run past. This is the
+     * off-by-N loop bound (`for (i=0;i<5;i+=1) arr4[i]`) — VRP has the range and
+     * the range provably reaches past the array. Distinguished from IDX_UNKNOWN
+     * (no range at all) so the diagnostic can say WHICH it is. */
+    if (r->min_val >= 0 && (uint64_t)r->min_val < limit && r->max_val >= 0 &&
+        (uint64_t)r->max_val >= limit)
+        return IDX_PARTIAL_OOB;
     return IDX_UNKNOWN;
 }
 
@@ -865,6 +884,7 @@ static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
+static bool loop_seq_reaches_limit(int64_t lo, int64_t step, int64_t last, uint64_t limit);
 static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
@@ -7989,6 +8009,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             typemap_set(c, field_node, result);
                             break;
                         }
+                        /* BUG-916: this join closes one scoped concurrency window.
+                         * It is past the same depth guard the borrow release uses,
+                         * so a join nested deeper than its spawn does NOT close it
+                         * — the conservative direction, matching the borrow rule. */
+                        if (c->scoped_spawn_live > 0) {
+                            c->scoped_spawn_live--;
+                            if (c->scoped_spawn_live == 0 && !c->ff_spawn_in_func)
+                                c->after_spawn_in_func = false;
+                        }
                         for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
@@ -9609,8 +9638,64 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
                  * Warn so programmer knows they can add a guard for zero overhead. */
+                /* BUG-913: the counter of a monotone counted loop provably TAKES
+                 * every value of its sequence. If one of them indexes past the
+                 * end, this is a proven out-of-bounds access, not a precision
+                 * gap — the same verdict `arr[10]` already gets, wearing a loop.
+                 * Requires the access to sit at the loop body's own branch depth
+                 * (an access nested in an `if` may be unreachable for the
+                 * offending values) and, like IDX_ALWAYS_OOB, not to be in
+                 * short-circuit RHS position. */
+                if (!checker_is_proven(c, node) && c->cert_loop_step > 0 &&
+                    c->shortcircuit_rhs_depth == 0 &&
+                    c->branch_depth == c->cert_loop_depth &&
+                    c->cert_loop_name &&
+                    (uint32_t)node->index_expr.index->ident.name_len == c->cert_loop_name_len &&
+                    memcmp(node->index_expr.index->ident.name, c->cert_loop_name,
+                           c->cert_loop_name_len) == 0 &&
+                    loop_seq_reaches_limit(c->cert_loop_lo, c->cert_loop_step,
+                                           c->cert_loop_last, obj->array.size)) {
+                    checker_error(c, node->loc.line,
+                        "loop counter '%.*s' runs %lld..%lld, so this indexes past the "
+                        "end of an array of size %llu — the loop provably performs an "
+                        "out-of-bounds access. Fix the loop bound (use %llu), or index "
+                        "a slice, which is bounds-checked at runtime",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (long long)c->cert_loop_lo, (long long)c->cert_loop_last,
+                        (unsigned long long)obj->array.size,
+                        (unsigned long long)obj->array.size);
+                    mark_proven(c, node);   /* diagnosed — do not also auto-guard */
+                }
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
+                    if (iv == IDX_PARTIAL_OOB) {
+                        /* The range is KNOWN and provably reaches past the end —
+                         * the off-by-N loop bound (`for (i=0;i<5;i+=1) arr4[i]`).
+                         * Say so: the old wording ("not proven in range") is the
+                         * message for having NO range at all, and it read as a
+                         * mere precision note, so the single most common buffer
+                         * overflow in C looked identical to a missing inference.
+                         * Also state what the guard DOES at runtime — it is an
+                         * early return, not a trap, so nothing else reports it. */
+                        checker_warning(c, node->loc.line,
+                            "index '%.*s' has proven range [%lld, %lld], which runs PAST "
+                            "the end of an array of size %llu — the access is out of "
+                            "bounds whenever '%.*s' reaches %llu. The auto-guard makes "
+                            "the enclosing function RETURN EARLY there (no trap, no "
+                            "message), so the remaining statements are silently skipped. "
+                            "Fix the bound, or add 'if (%.*s >= %llu) { return; }'",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (long long)r->min_val, (long long)r->max_val,
+                            (unsigned long long)obj->array.size,
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (unsigned long long)obj->array.size,
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (unsigned long long)obj->array.size);
+                    } else {
                     checker_warning(c, node->loc.line,
                         "index '%.*s' not proven in range for array of size %llu — "
                         "auto-guard inserted. Add 'if (%.*s >= %llu) { return; }' to eliminate guard",
@@ -9620,6 +9705,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         (int)node->index_expr.index->ident.name_len,
                         node->index_expr.index->ident.name,
                         (unsigned long long)obj->array.size);
+                    }
                 }
             }
             /* Inline call range: arr[func()] where func has return range.
@@ -13627,6 +13713,164 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
     return arg_is_local_derived(c, arg, 0);
 }
 
+/* ================================================================
+ * BUG-913 — LOOP-INDUCTION CERTAINTY (the off-by-N loop bound)
+ *
+ * `for (u32 i = 0; i < 8; i += 1) { arr4[i] = i; }` was accepted with only a
+ * WARNING and compiled to an auto-guard whose runtime form is a silent early
+ * RETURN — so the canonical off-by-N buffer overflow was silent at compile time
+ * AND at run time: the loop stopped at i == 4, every statement after it in the
+ * function never ran, and the function returned a zero value. On bare metal
+ * there is no trap and no message to notice it by.
+ *
+ * VRP already proves the RANGE ([0,7] here). A range is a MAY-hold fact, so it
+ * cannot justify an error on its own — `u32 b = 10; if (c) { b = 2; }
+ * arr4[b]` also straddles and is safe, and the corpus pins that boundary
+ * (tests/zer/bounds_ident_proven_ok.zer). What licenses the error is the
+ * stronger WILL-hold fact a counted loop gives: if the counter starts at a
+ * constant, steps by a positive constant, is bounded by a constant, and nothing
+ * in the body can skip an iteration or change the counter, then every value of
+ * the sequence really is taken. If one of them indexes past the end, the
+ * program provably performs an out-of-bounds access.
+ *
+ * Everything here is a PROOF OF DANGER, so an incomplete walk can only fail to
+ * report — never accept something unsafe. The predicate is therefore written to
+ * answer "no" for every node kind it has not been taught, enforced by a
+ * no-`default:` switch under -Werror=switch.
+ * ================================================================ */
+
+/* Does the arithmetic sequence lo, lo+step, ... (values <= last) contain a value
+ * >= limit? Caller guarantees step > 0 and lo >= 0. */
+static bool loop_seq_reaches_limit(int64_t lo, int64_t step, int64_t last,
+                                   uint64_t limit) {
+    if (step <= 0 || last < lo || lo < 0) return false;
+    if ((uint64_t)lo >= limit) return true;
+    if (limit > (uint64_t)INT64_MAX) return false;
+    int64_t need = (int64_t)limit - lo;                /* > 0 */
+    int64_t k = (need + step - 1) / step;              /* ceil(need/step) */
+    if (k > (INT64_MAX - lo) / step) return false;     /* would overflow — give up */
+    return lo + k * step <= last;
+}
+
+/* Is every statement of this subtree guaranteed to run once per iteration, with
+ * the counter `v` untouched? Answers "no" for anything not explicitly cleared. */
+static bool loop_body_straight_line(Node *n, const char *v, uint32_t vlen) {
+    if (!n) return true;
+    switch (n->kind) {
+    /* --- Statements that can skip, repeat, leave or resume the body --- */
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_RETURN: case NODE_GOTO:
+    case NODE_LABEL: case NODE_YIELD: case NODE_AWAIT: case NODE_DEFER:
+    case NODE_ASM:  case NODE_SPAWN:
+        return false;
+    /* An `orelse` fallback may be a bare return/break/continue, and a `@trap()`
+     * or `@unreachable()` halts before a later iteration — all of them break the
+     * "every value is taken" premise. Rejecting the whole kind keeps the
+     * premise honest without a second walker. */
+    case NODE_ORELSE:
+        return false;
+    case NODE_INTRINSIC:
+        if ((n->intrinsic.name_len == 4 &&
+             memcmp(n->intrinsic.name, "trap", 4) == 0) ||
+            (n->intrinsic.name_len == 11 &&
+             memcmp(n->intrinsic.name, "unreachable", 11) == 0))
+            return false;
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (!loop_body_straight_line(n->intrinsic.args[i], v, vlen)) return false;
+        return true;
+    /* --- Writing or aliasing the counter breaks the sequence --- */
+    case NODE_ASSIGN:
+        if (n->assign.target && n->assign.target->kind == NODE_IDENT &&
+            n->assign.target->ident.name_len == (size_t)vlen &&
+            memcmp(n->assign.target->ident.name, v, vlen) == 0) return false;
+        return loop_body_straight_line(n->assign.target, v, vlen) &&
+               loop_body_straight_line(n->assign.value, v, vlen);
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP && n->unary.operand &&
+            n->unary.operand->kind == NODE_IDENT &&
+            n->unary.operand->ident.name_len == (size_t)vlen &&
+            memcmp(n->unary.operand->ident.name, v, vlen) == 0) return false;
+        return loop_body_straight_line(n->unary.operand, v, vlen);
+    /* A re-declaration shadows the counter, so a later `arr[v]` is a different
+     * variable than the one the sequence describes. */
+    case NODE_VAR_DECL:
+        if (n->var_decl.name_len == (size_t)vlen &&
+            memcmp(n->var_decl.name, v, vlen) == 0) return false;
+        return loop_body_straight_line(n->var_decl.init, v, vlen);
+    /* --- Structure that is fine to walk through --- */
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (!loop_body_straight_line(n->block.stmts[i], v, vlen)) return false;
+        return true;
+    case NODE_EXPR_STMT: return loop_body_straight_line(n->expr_stmt.expr, v, vlen);
+    case NODE_IF:
+        /* An `if` cannot skip an ITERATION — the counter still advances — so the
+         * sequence premise survives. Whether the ACCESS is unconditional is a
+         * separate question, answered by comparing branch_depth at the index. */
+        return loop_body_straight_line(n->if_stmt.cond, v, vlen) &&
+               loop_body_straight_line(n->if_stmt.then_body, v, vlen) &&
+               loop_body_straight_line(n->if_stmt.else_body, v, vlen);
+    case NODE_BINARY:
+        return loop_body_straight_line(n->binary.left, v, vlen) &&
+               loop_body_straight_line(n->binary.right, v, vlen);
+    case NODE_CALL:
+        if (!loop_body_straight_line(n->call.callee, v, vlen)) return false;
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (!loop_body_straight_line(n->call.args[i], v, vlen)) return false;
+        return true;
+    case NODE_FIELD:  return loop_body_straight_line(n->field.object, v, vlen);
+    case NODE_INDEX:  return loop_body_straight_line(n->index_expr.object, v, vlen) &&
+                             loop_body_straight_line(n->index_expr.index, v, vlen);
+    case NODE_SLICE:  return loop_body_straight_line(n->slice.object, v, vlen) &&
+                             loop_body_straight_line(n->slice.start, v, vlen) &&
+                             loop_body_straight_line(n->slice.end, v, vlen);
+    case NODE_TYPECAST:  return loop_body_straight_line(n->typecast.expr, v, vlen);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (!loop_body_straight_line(n->struct_init.fields[i].value, v, vlen))
+                return false;
+        return true;
+    /* --- Leaves --- */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_SIZEOF: case NODE_CAST:
+        return true;
+    /* --- Everything else: not taught, so not straight-line --- */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT: case NODE_MMIO:
+    case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
+/* BUG-913, `while` half. A `while` has no step phase, so the counter is
+ * incremented inside the body. Recognise ONLY the canonical shape: a block whose
+ * LAST top-level statement is `v += <positive constant>` and whose every other
+ * top-level statement is straight-line and does not touch `v`.
+ *
+ * Requiring the increment to be LAST is what makes the value set at an access
+ * exactly {lo, lo+S, ...}: with the increment first, `while (i < 4) { i += 1;
+ * arr[i]; }` reaches 4, and a rule that assumed otherwise would be wrong in the
+ * accept direction. Returns the step, or 0 for "not this shape". */
+static int64_t while_counter_step(Node *body, const char *v, uint32_t vlen) {
+    if (!body || body->kind != NODE_BLOCK || body->block.stmt_count == 0) return 0;
+    int last = body->block.stmt_count - 1;
+    Node *inc = body->block.stmts[last];
+    if (inc && inc->kind == NODE_EXPR_STMT) inc = inc->expr_stmt.expr;
+    if (!inc || inc->kind != NODE_ASSIGN || inc->assign.op != TOK_PLUSEQ) return 0;
+    if (!inc->assign.target || inc->assign.target->kind != NODE_IDENT) return 0;
+    if ((uint32_t)inc->assign.target->ident.name_len != vlen ||
+        memcmp(inc->assign.target->ident.name, v, vlen) != 0) return 0;
+    int64_t step = eval_const_expr(inc->assign.value);
+    if (step == CONST_EVAL_FAIL || step <= 0) return 0;
+    for (int i = 0; i < last; i++)
+        if (!loop_body_straight_line(body->block.stmts[i], v, vlen)) return 0;
+    return step;
+}
+
 /* Walk a RUNTIME-conditional body (if/else arm, loop body, switch arm) with
  * Checker.branch_depth raised. The scoped-borrow tracker is a linear
  * statement-order approximation; without this a `th.join()` nested in a branch
@@ -15028,6 +15272,56 @@ static void check_stmt(Checker *c, Node *node) {
          * so it overrides a loop-var range the alias can invalidate. */
         vrp_widen_loop_addr_taken(c, node->for_stmt.body);
 
+        /* BUG-913: establish loop-induction CERTAINTY for the counter, if the
+         * loop's shape proves every value of the sequence is really taken.
+         * Saved/restored around the body so only the INNERMOST counted loop is
+         * live, and so nothing leaks past the loop. */
+        const char *sv_cn = c->cert_loop_name; uint32_t sv_cl = c->cert_loop_name_len;
+        int64_t sv_lo = c->cert_loop_lo, sv_st = c->cert_loop_step,
+                sv_la = c->cert_loop_last;
+        int sv_cd = c->cert_loop_depth;
+        c->cert_loop_name = NULL; c->cert_loop_step = 0;  /* default: no certainty */
+        if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY &&
+            node->for_stmt.cond->binary.left &&
+            node->for_stmt.cond->binary.left->kind == NODE_IDENT &&
+            node->for_stmt.step && node->for_stmt.step->kind == NODE_ASSIGN &&
+            node->for_stmt.step->assign.op == TOK_PLUSEQ &&
+            node->for_stmt.step->assign.target &&
+            node->for_stmt.step->assign.target->kind == NODE_IDENT &&
+            node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
+            node->for_stmt.init->var_decl.init) {
+            Node *fc2 = node->for_stmt.cond;
+            const char *cv = fc2->binary.left->ident.name;
+            uint32_t cvl = (uint32_t)fc2->binary.left->ident.name_len;
+            Node *stp = node->for_stmt.step;
+            int64_t lo2 = eval_const_expr(node->for_stmt.init->var_decl.init);
+            int64_t k2  = eval_const_expr(fc2->binary.right);
+            int64_t st2 = eval_const_expr(stp->assign.value);
+            bool same_var =
+                (uint32_t)stp->assign.target->ident.name_len == cvl &&
+                memcmp(stp->assign.target->ident.name, cv, cvl) == 0 &&
+                (uint32_t)node->for_stmt.init->var_decl.name_len == cvl &&
+                memcmp(node->for_stmt.init->var_decl.name, cv, cvl) == 0;
+            if (same_var && lo2 != CONST_EVAL_FAIL && k2 != CONST_EVAL_FAIL &&
+                st2 != CONST_EVAL_FAIL && lo2 >= 0 && st2 > 0 &&
+                (fc2->binary.op == TOK_LT || fc2->binary.op == TOK_LTEQ) &&
+                loop_body_straight_line(node->for_stmt.body, cv, cvl)) {
+                /* last value the counter TAKES inside the body */
+                int64_t bound = (fc2->binary.op == TOK_LT) ? k2 - 1 : k2;
+                if (bound >= lo2) {
+                    int64_t n_steps = (bound - lo2) / st2;
+                    c->cert_loop_name = cv;
+                    c->cert_loop_name_len = cvl;
+                    c->cert_loop_lo = lo2;
+                    c->cert_loop_step = st2;
+                    c->cert_loop_last = lo2 + n_steps * st2;
+                    /* check_stmt_cond_body raises branch_depth by one for the
+                     * body; anything deeper is inside a conditional. */
+                    c->cert_loop_depth = c->branch_depth + 1;
+                }
+            }
+        }
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
         /* B1 (2026-08-01): snapshot the post-pre-pass VALUES and restore them
@@ -15046,6 +15340,9 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1_pre, b1_saved);
         free(b1_pre);
         c->in_loop = prev_in_loop;
+        c->cert_loop_name = sv_cn; c->cert_loop_name_len = sv_cl;
+        c->cert_loop_lo = sv_lo; c->cert_loop_step = sv_st;
+        c->cert_loop_last = sv_la; c->cert_loop_depth = sv_cd;
         c->var_range_count = saved_range_count; /* ranges invalid after loop */
         pop_scope(c);
         break;
@@ -15075,6 +15372,19 @@ static void check_stmt(Checker *c, Node *node) {
          * the cond (mirrors the for-loop pattern), then check body.
          * saved_range_count restores after the loop. */
         int saved_range_count = c->var_range_count;
+        /* BUG-913 (while half): capture the counter's ENTRY value BEFORE the
+         * widening below destroys it. */
+        int64_t w_entry_lo = -1;
+        if (node->while_stmt.cond && node->while_stmt.cond->kind == NODE_BINARY &&
+            node->while_stmt.cond->binary.left &&
+            node->while_stmt.cond->binary.left->kind == NODE_IDENT) {
+            struct VarRange *wr = find_var_range(c,
+                node->while_stmt.cond->binary.left->ident.name,
+                (uint32_t)node->while_stmt.cond->binary.left->ident.name_len);
+            if (wr && !wr->address_taken && wr->min_val == wr->max_val &&
+                wr->min_val >= 0)
+                w_entry_lo = wr->min_val;
+        }
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
 
         /* BUG-D (2026-07-16): the cond-derived narrowing below is SOUND for
@@ -15105,6 +15415,38 @@ static void check_stmt(Checker *c, Node *node) {
         /* B7: see the for-loop driver. */
         vrp_widen_loop_addr_taken(c, node->while_stmt.body);
 
+        /* BUG-913 (while half): same certainty as the for-loop, established from
+         * the entry value, a constant bound and a trailing constant increment. */
+        const char *wsv_cn = c->cert_loop_name; uint32_t wsv_cl = c->cert_loop_name_len;
+        int64_t wsv_lo = c->cert_loop_lo, wsv_st = c->cert_loop_step,
+                wsv_la = c->cert_loop_last;
+        int wsv_cd = c->cert_loop_depth;
+        c->cert_loop_name = NULL; c->cert_loop_step = 0;
+        if (w_entry_lo >= 0 && node->while_stmt.cond &&
+            node->while_stmt.cond->kind == NODE_BINARY &&
+            node->while_stmt.cond->binary.left &&
+            node->while_stmt.cond->binary.left->kind == NODE_IDENT &&
+            (node->while_stmt.cond->binary.op == TOK_LT ||
+             node->while_stmt.cond->binary.op == TOK_LTEQ)) {
+            const char *wv = node->while_stmt.cond->binary.left->ident.name;
+            uint32_t wvl = (uint32_t)node->while_stmt.cond->binary.left->ident.name_len;
+            int64_t wk = eval_const_expr(node->while_stmt.cond->binary.right);
+            int64_t wstep = while_counter_step(node->while_stmt.body, wv, wvl);
+            if (wk != CONST_EVAL_FAIL && wstep > 0) {
+                int64_t wbound = (node->while_stmt.cond->binary.op == TOK_LT)
+                               ? wk - 1 : wk;
+                if (wbound >= w_entry_lo) {
+                    int64_t n_steps = (wbound - w_entry_lo) / wstep;
+                    c->cert_loop_name = wv;
+                    c->cert_loop_name_len = wvl;
+                    c->cert_loop_lo = w_entry_lo;
+                    c->cert_loop_step = wstep;
+                    c->cert_loop_last = w_entry_lo + n_steps * wstep;
+                    c->cert_loop_depth = c->branch_depth + 1;
+                }
+            }
+        }
+
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
         /* B1 (2026-08-01): same in-place-mutation leak as the for-loop — see the
@@ -15119,6 +15461,9 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1w_pre, b1w_saved);
         free(b1w_pre);
         c->in_loop = prev_in_loop;
+        c->cert_loop_name = wsv_cn; c->cert_loop_name_len = wsv_cl;
+        c->cert_loop_lo = wsv_lo; c->cert_loop_step = wsv_st;
+        c->cert_loop_last = wsv_la; c->cert_loop_depth = wsv_cd;
         c->var_range_count = saved_range_count;
         break;
     }
@@ -17403,10 +17748,34 @@ static void check_stmt(Checker *c, Node *node) {
         /* spawn func(args); — validate function, check arg safety.
          * Also: scan spawned function body for non-shared global access (data race). */
         /* A6-full atomic-cell: a FIRE-AND-FORGET spawn runs unbounded — from here
-         * on in this function, a plain access to an atomic cell could race it. A
-         * SCOPED spawn (ThreadHandle) is joined, so post-join access is safe; the
-         * spawn..join window is the narrower scoped-borrow concern, not this. */
-        if (node->spawn_stmt.handle_name == NULL) c->after_spawn_in_func = true;
+         * on in this function, a plain access to an atomic cell could race it.
+         *
+         * BUG-916: the original rule stopped there, and its own comment gave the
+         * reason — "a SCOPED spawn (ThreadHandle) is joined, so POST-JOIN access
+         * is safe; the spawn..join window is the narrower scoped-borrow concern".
+         * Post-join access really is safe, but the code set nothing at all, so the
+         * spawn..join WINDOW was unchecked too — and the scoped-borrow tracker it
+         * hands that window to guards POINTERS PASSED TO THE THREAD, not globals
+         * the thread touches atomically. Nothing covered it. Measured: with
+         * `void worker() { u32 v = @atomic_add(&g, 1); }`,
+         *
+         *   spawn worker();                 g = 5;              -> REJECTED
+         *   ThreadHandle t = spawn worker(); g = 5; t.join();    -> accepted
+         *
+         * — the same race, silent, because of the spelling. (The spawn body scan
+         * does not catch it either: `@atomic_*` is an exemption there, which is
+         * exactly why the atomic-cell rule exists.)
+         *
+         * An exemption whose written justification is narrower than its code is a
+         * documented recurring shape in this codebase; this is one. Implement the
+         * justification: the window is concurrent, after the join it is not. */
+        if (node->spawn_stmt.handle_name == NULL) {
+            c->ff_spawn_in_func = true;
+            c->after_spawn_in_func = true;
+        } else {
+            c->scoped_spawn_live++;
+            c->after_spawn_in_func = true;
+        }
         Symbol *func_sym = scope_lookup(c->global_scope,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
@@ -19244,7 +19613,11 @@ static void check_func_body(Checker *c, Node *node) {
          * single-threaded use stay legal (the inclusion-model "shared = reachable
          * by >=2 threads" — a pre-spawn write is reached by only one). */
         bool saved_after_spawn = c->after_spawn_in_func;
+        bool saved_ff_spawn = c->ff_spawn_in_func;
+        int  saved_scoped_live = c->scoped_spawn_live;
         c->after_spawn_in_func = false;
+        c->ff_spawn_in_func = false;
+        c->scoped_spawn_live = 0;   /* BUG-916: per-function, like the flag above */
         /* Stage 1->2 escape summary: start complete with an empty param mask;
          * the NODE_RETURN handler classifies each valued return below (UNKNOWN
          * clears `complete`, ARParam(n) sets mask bit n; read into the Symbol
@@ -19272,6 +19645,8 @@ static void check_func_body(Checker *c, Node *node) {
          * param n), like ret_param_mask, computed once per function instead of
          * re-walking callee bodies per caller. Tracked in docs/limitations.md. */
         c->after_spawn_in_func = saved_after_spawn;
+        c->ff_spawn_in_func = saved_ff_spawn;
+        c->scoped_spawn_live = saved_scoped_live;
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
         c->in_naked = false;

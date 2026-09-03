@@ -1,0 +1,47 @@
+// expect-error: is transferred
+// BUG-917: ir_contains_move_struct_field_depth answered "contains no move field"
+// when its recursion cap fired — the PERMISSIVE direction for a predicate that
+// turns ownership tracking ON. At 33 layers this use-after-move was caught; at 34
+// it compiled clean.
+move struct Token { u32 id; }
+struct S0 { Token t; }
+struct S1 { S0 inner; }
+struct S2 { S1 inner; }
+struct S3 { S2 inner; }
+struct S4 { S3 inner; }
+struct S5 { S4 inner; }
+struct S6 { S5 inner; }
+struct S7 { S6 inner; }
+struct S8 { S7 inner; }
+struct S9 { S8 inner; }
+struct S10 { S9 inner; }
+struct S11 { S10 inner; }
+struct S12 { S11 inner; }
+struct S13 { S12 inner; }
+struct S14 { S13 inner; }
+struct S15 { S14 inner; }
+struct S16 { S15 inner; }
+struct S17 { S16 inner; }
+struct S18 { S17 inner; }
+struct S19 { S18 inner; }
+struct S20 { S19 inner; }
+struct S21 { S20 inner; }
+struct S22 { S21 inner; }
+struct S23 { S22 inner; }
+struct S24 { S23 inner; }
+struct S25 { S24 inner; }
+struct S26 { S25 inner; }
+struct S27 { S26 inner; }
+struct S28 { S27 inner; }
+struct S29 { S28 inner; }
+struct S30 { S29 inner; }
+struct S31 { S30 inner; }
+struct S32 { S31 inner; }
+struct S33 { S32 inner; }
+u32 main() {
+    S33 a;
+    a.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.t.id = 7;
+    S33 b = a;
+    u32 x = a.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.inner.t.id;
+    return x;
+}

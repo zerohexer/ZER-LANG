@@ -1,0 +1,17 @@
+// BUG-920 OVER-REJECTION BOUNDARY: tracking the assignment spelling of a move
+// must not reject the ordinary transfer-then-consume flow, and a bare `=` to a
+// fresh move local is a DEFINITION, not a use.
+move struct Token { u32 id; }
+void consume(Token t) { }
+u32 main() {
+    Token a; a.id = 1;
+    Token b;
+    b = a;              // transfer a -> b
+    consume(b);         // b consumed
+
+    Token c; c.id = 2;
+    Token d;
+    d = c;              // an independent second transfer
+    consume(d);
+    return 0;
+}

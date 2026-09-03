@@ -5,6 +5,241 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-03 — BUG-913..920: the off-by-N loop, and the SPELLING that turned every handle check off
+
+A full-codebase audit. Eight fixes; **every one of the fourteen new negative tests compiles
+CLEAN on the pre-fix compiler and is rejected by the fixed one** (measured, not asserted —
+the pre-fix binary was built from `HEAD` and each file run against both). Corpus cost of the
+whole session: **zero** — 1419 `.zer`, 784 rust, 36 zig, 30 module tests, all nine audit
+gates and all ten matrices unchanged.
+
+Two of them are the same recurring shape this file keeps recording: **two spellings of one
+program disagreeing**, and **an exemption whose written justification is narrower than its
+code**.
+
+### BUG-919 — writing an allocation as an ASSIGNMENT turned OFF every handle check
+
+```
+?Handle(Device) mh;
+mh = pool_a.alloc();              // assignment, not an initializer
+Handle(Device) h = mh orelse return;
+pool_a.free(h);
+pool_a.free(h);                   // ACCEPTED
+```
+
+The byte-equivalent `?Handle(Device) mh = pool_a.alloc();` is correctly rejected. The two
+forms lower differently: an initializer becomes `%1 = CALL` (the instruction's dest IS the
+allocation), while an assignment keeps the whole `mh = pool_a.alloc()` as the instruction's
+AST expr and gives the instruction a statement-value TEMP as its dest. `zercheck_ir.c`'s
+IR_ASSIGN alloc registration keys off `inst->dest_local` and requires the expr to BE the
+call, so it never fired — **nothing registered the allocation at all**.
+
+The consequences were not partial. On that spelling the LEAK check, the DOUBLE-FREE check,
+the USE-AFTER-FREE check and the WRONG-POOL check were every one of them silently inert,
+for `pool.alloc()`, `pool.alloc_ptr()` and the universal `alloc()`. It is also the ONLY way
+to write a CONDITIONAL allocation —
+
+```
+?Handle(Device) mh;
+if (c) { mh = pool_a.alloc(); } else { mh = pool_b.alloc(); }
+```
+
+— which is why every branch shape was unchecked too, and why this hid BUG-918 underneath it.
+
+Fixed with a self-contained pre-step that registers on the ASSIGNED local rather than the
+statement temp; `inst->dest_local` is read at ~50 sites further down that handler, so
+rewriting it there was the higher-risk change. Six negatives pin the spelling × sink
+matrix.
+
+**Turning the spelling on exposed two over-rejections that only EXIST in it** — a var-decl
+cannot be re-initialised, so alloc/free/alloc reuse can only be written this way — and both
+had to be closed before the fix was shippable:
+
+1. `alloc_id == 0` means UNTRACKED to `ir_propagate_alias_state`. Registering with
+   `alloc_id = <local id>` therefore lost the alias group whenever the optional was
+   LOCAL 0: freeing the handle bound out of it did not mark the optional freed, and the
+   next allocation into it was reported "overwritten while alive". Keep the local-id
+   convention where it is usable; fall back to the high-based counter.
+2. The UAF walker descended into an assignment TARGET, so `mh = pool.alloc();` after
+   `pool.free(...)` was read as a use of a freed handle. A plain `=` to a BARE IDENT is a
+   DEFINITION, not a use. Every other target shape still descends — `*p = v`, `arr[i] = v`,
+   `s.f = v`, and any compound op, which reads the target before writing it — because
+   writing THROUGH a freed pointer really is a use.
+
+`tests/zer/alloc_assign_form_reuse_ok.zer` pins all three reuse shapes (sequential, in a
+loop, and a conditional allocation from one pool) and RUNS.
+
+### BUG-920 — and so did writing a MOVE as an assignment
+
+The same defect, same file, one handler away:
+
+```
+move struct Token { u32 id; }
+Token a; a.id = 1;
+Token b;
+b = a;                            // transfer
+return a.id;                      // ACCEPTED
+```
+
+`Token b = a;` lowers to `IR_COPY`, whose handler performs the transfer. `b = a;` stays
+inside `IR_ASSIGN`'s expr with a statement temp as its dest, and nothing transferred
+anything. Live for all three source shapes — a bare ident, `b = w.inner`, `b = arr[0]` —
+each accepted while its initializer spelling was correctly rejected.
+
+Found by asking the BUG-919 question of the OTHER tracked-value registrations rather than
+stopping at the one that was reported. `ThreadHandle` cannot be declared without an
+initializer (the parser requires it), so the class has no third member today; a new tracked
+value would.
+
+**The durable form of this is now a row in CLAUDE.md's multi-site table:** an allocation or
+transfer has TWO SPELLINGS that lower differently, and a registration written for one is
+absent from the other. Test both.
+
+**The class was then ENUMERATED rather than left at two instances.** Every other
+tracked-value registration was probed in the assignment spelling and found SOUND:
+`arena.alloc_slice` (arena-escape still rejected), a slice VIEW (`sub = base[0..4]` — the
+use after freeing the base is still caught), a local-address escape (`p = &local; g = p`),
+and `ThreadHandle`, which the parser will not let you declare without an initializer. So
+the two fixed here are the whole set today; a NEW tracked value would add a third.
+
+### BUG-918 — the allocating pool was not merged at a CFG join
+
+`IRHandleInfo.pool_name` is a one-slot answer to a question whose truth is a SET, and
+`ir_merge_states` never merged it: the first live predecessor's name simply won. So a
+handle allocated from `pool_a` on one path and `pool_b` on the other, freed on `pool_a`
+after the merge, compiled clean — while the straight-line version of the same misuse was
+correctly rejected. Freeing a handle on the wrong pool indexes the wrong slot/gen arrays.
+
+Merged as an AMBIGUITY (`pool_mixed`), not by picking a winner and not by clearing to NULL
+— clearing would disable the check entirely, which is the same hole one step removed. **No
+over-rejection:** a free INSIDE a branch is checked before the merge, where the name is
+exact; only a free AFTER the merge is ambiguous, and such a free cannot be correct for both
+pools.
+
+This is the `threads[]` defect class (a state field the merge does not merge) recurring on
+a different field. `ir_merge_states` merges 4 of ~17 `IRHandleInfo` fields; the rest are
+frozen to the first live predecessor. The remaining ones are recorded in
+`docs/limitations.md` rather than changed blind — each needs its own argument about what
+the join of two disagreeing values means.
+
+### BUG-917 — the move-struct depth cap answered in the PERMISSIVE direction
+
+`ir_contains_move_struct_field_depth` returned `false` — "this type contains no move field"
+— when its 32-level recursion cap fired. That is the permissive direction for a predicate
+whose job is to turn ownership tracking ON. Measured with a `move struct Token` wrapped in
+plain structs: at 33 layers the use-after-move was correctly rejected; at 34 it compiled
+clean.
+
+A depth guard exists to bound recursion, not to decide safety. When it fires the honest
+answer is "could not rule it out", so it now returns `true` and the value is tracked.
+Corpus cost measured at zero.
+
+### BUG-913 — an off-by-N loop bound was a WARNING, and the runtime silently truncated
+
+```
+u32[4] arr;
+for (u32 i = 0; i < 8; i += 1) { arr[i] = i; }
+```
+
+Compile time: a warning reading `index 'i' not proven in range` — the same wording used when
+there is NO range at all, so the single most common buffer overflow in C looked identical to
+a missing inference. Run time: on iteration 4 the auto-guard fires, and the auto-guard's
+runtime form is an early `return` of the function's zero value. So the loop stopped at 4,
+every statement after it never ran, and `main` returned **0 — success**. On bare metal
+there is no trap and no message to notice it by. Both ends silent.
+
+A *range* cannot license an error on its own: it says which values a variable MAY hold, and
+`u32 b = 10; if (c) { b = 2; } arr4[b]` straddles the bound and is safe —
+`tests/zer/bounds_ident_proven_ok.zer` pins exactly that boundary. What licenses it is the
+stronger WILL-hold fact a counted loop gives: if the counter starts at a constant, steps by
+a positive constant, is bounded by a constant, and nothing in the body can skip an iteration
+or change the counter, every value of the sequence is really taken. If one of them indexes
+past the end, the loop provably performs an out-of-bounds access, and that is now a compile
+error — for `for`, `while` and `do-while`.
+
+Everything about the rule is a PROOF OF DANGER, so an incomplete walk can only fail to
+report. The straight-line-body predicate is a no-`default:` switch that answers "no" for
+every node kind it has not been taught. Break any premise and it falls back to the
+auto-guard: a `break`/`return`/`goto`/`orelse` in the body, an assignment to the counter, a
+non-constant bound, a `while` whose increment comes FIRST (the values at the access are then
+1..N, not 0..N-1 — claiming otherwise would be wrong in the ACCEPT direction), or an access
+nested inside an `if`, where the offending values may never reach it. Eleven boundary cases
+are pinned by `tests/zer/loop_counter_bounds_ok.zer`.
+
+**Corpus cost: zero.** 1397 `.zer`, 784 rust, 36 zig, 30 module tests unchanged. Two
+existing tests were PROMOTED to negatives: `while_vrp_autoguard` and `dowhile_vrp_autoguard`
+are genuine off-by-N loops written to prove the guard is INSERTED, and asserted exit 0 —
+which cannot tell a working guard from a missing one. Their BUG-748 property (the loop
+variable must not stay proven `[0,0]` inside the body) is kept alive by runtime-bound
+siblings, where no certainty can be claimed.
+
+The straddling-range case that is NOT a counted loop still warns, but the warning now says
+what it knows: the proven range, that it runs past the end, and — the part nothing said
+before — that the guard makes the enclosing function RETURN EARLY with no trap and no
+message.
+
+### BUG-914 — an EMPTY range was diagnosed as "always out of bounds"
+
+```
+for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }   // hard error on main
+```
+
+`index_range_verdict`'s "entirely negative → always out of bounds" arm also caught ranges
+whose max is below their min. An empty range says the value cannot exist here — the code is
+UNREACHABLE, a proof of DEAD, not a proof of DANGER. `bounds_ident_proven_ok.zer` had
+already recorded that intent for a range emptied by narrowing (min 6, max 0); that case
+escaped only because its max happened to be >= 0. A zero-trip loop reaches the same state
+with max = -1. The shape appears for real whenever a bound is a configuration constant that
+can legitimately be 0.
+
+### BUG-916 — a SCOPED spawn did not open the atomic-cell concurrency window
+
+With `void worker() { u32 v = @atomic_add(&g, 1); }`:
+
+```
+spawn worker();                  g = 5;              -> rejected
+ThreadHandle t = spawn worker(); g = 5; t.join();    -> ACCEPTED
+```
+
+The same race, silent, because of the spelling. The rule's own comment gave the reason: *"a
+SCOPED spawn is joined, so post-join access is safe; the spawn..join window is the narrower
+scoped-borrow concern"*. Post-join access really is safe — but the code set nothing at all,
+so the WINDOW was unchecked too, and the scoped-borrow tracker it hands that window to
+guards POINTERS PASSED TO THE THREAD, not globals the thread touches atomically. Nothing
+covered it. The spawn body scan does not catch it either: `@atomic_*` is an exemption there,
+which is exactly why the atomic-cell rule exists.
+
+An exemption whose written justification is narrower than its code is a shape CLAUDE.md
+already tells you to probe for. Fixed by implementing the justification: the window is
+concurrent, after the join it is not. The join closes it only when it is no deeper in
+runtime-conditional nesting than the spawn — the same guard the borrow release uses — and
+only when no other scoped thread is still live. Pre-spawn init and post-join access stay
+legal, pinned by a positive.
+
+### BUG-915 — the IR path still had BUG-767's silent `0`
+
+`emit_rewritten_node`'s unknown-intrinsic fallback emitted `/* @name */ 0`. It is the exact
+twin of the AST-path fallback that BUG-767 hardened, left on the pre-BUG-767 form **in the
+only path function bodies use**. An intrinsic added to the checker's dispatch chain without
+a matching arm here would compile to the literal 0 — a privileged register read, an MMIO
+probe or an atomic silently becoming "zero", with no diagnostic and nothing to notice at run
+time. Dead today (all 142 checker-accepted names were swept against 256 generated programs;
+no stub reached the C), and now it fails loud instead of quietly, like its twin.
+
+Also: the AST path tested `nlen >= 10` for the `atomic_` prefix, excluding `@atomic_or` (9
+chars) — the checker fixed that same off-by-one in BUG-427 and this copy never followed.
+Unreachable today, and it is the same predicate written twice with two different answers.
+
+### Documentation
+
+`docs/reference.md` said a fixed-array index is *"bounds-checked. Out-of-bounds traps at
+runtime"*. It does not trap — that is what `[*]T` does. `T[N]` gets the auto-guard, whose
+runtime form is a silent early return. The two containers now have that difference stated in
+a table where the claim used to be, plus the fourth bounds verdict, the empty-range rule, and
+the five CLI flags and full `--target-features` vocabulary that were missing.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

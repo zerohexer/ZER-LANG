@@ -1,0 +1,7 @@
+// expect-error: loop provably performs an out-of-bounds access
+u32 main() {
+    u32[4] arr;
+    u32 i = 0;
+    do { arr[i] = i; i += 1; } while (i < 7);
+    return 0;
+}

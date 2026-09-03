@@ -1,0 +1,14 @@
+// expect-error: plain access to 'g_ctr' in a concurrent context
+// BUG-916: the atomic-cell rule fired for a FIRE-AND-FORGET spawn and not for a
+// SCOPED one, so the same race was accepted purely for its spelling. The rule's
+// own comment said post-join access is safe — true — but the code set nothing at
+// all, leaving the spawn..join WINDOW unchecked. The spawn body scan does not
+// cover it either: @atomic_* is an exemption there.
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+u32 main() {
+    ThreadHandle t = spawn worker();
+    g_ctr = 5;
+    t.join();
+    return 0;
+}

@@ -1,0 +1,13 @@
+// BUG-916 OVER-REJECTION BOUNDARY. Closing the scoped concurrency window at the
+// join must not make single-threaded access illegal: an init BEFORE the spawn and
+// any access AFTER the join are both reached by one thread only.
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+u32 main() {
+    g_ctr = 0;                        // pre-spawn init — one thread
+    ThreadHandle t = spawn worker();
+    t.join();
+    g_ctr = g_ctr + 1;                // post-join — one thread again
+    if (g_ctr != 2) { return 1; }
+    return 0;
+}

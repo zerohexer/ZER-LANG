@@ -1,0 +1,15 @@
+// expect-error: double free
+// BUG-919: an allocation written as an ASSIGNMENT instead of a var-decl
+// INITIALIZER registered NO allocation at all, so the leak, double-free,
+// use-after-free and wrong-pool checks were every one of them silently inert on
+// this spelling. The initializer spelling of the same program was rejected.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+void run() {
+    ?Handle(Device) mh;
+    mh = pool_a.alloc();
+    Handle(Device) h = mh orelse return;
+    pool_a.free(h);
+    pool_a.free(h);
+}
+u32 main() { run(); return 0; }

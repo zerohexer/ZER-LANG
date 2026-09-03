@@ -184,6 +184,164 @@ blanket rule was NOT shipped).
 
 ---
 
+## OPEN — five findings from the 2026-09-03 audit that were MEASURED but not changed
+
+Each is recorded with the measurement that produced it, so the next session does not have to
+re-derive it. None is an accept-unsafe hole; the first is a residual class, the second is a
+language-semantics call, the third is an over-rejection.
+
+### 1. `ir_merge_states` merges 4 of ~17 `IRHandleInfo` fields (residual of BUG-918)
+
+`zercheck_ir.c`'s CFG merge reconciles `state`, `free_line`, `free_block`,
+`freed_all_paths` — and, since BUG-918, `pool_name`/`pool_mixed`. Everything else is frozen
+to whatever the FIRST LIVE PREDECESSOR happened to hold when two branches disagree:
+
+`alloc_line`, `alloc_id`, `escaped`, `is_move_local`, `source_color`, `is_thread_handle`,
+`view_alloc_ids[]` / `view_count` / `view_overflow`, `defer_double_reported`, and
+`IRPathState.critical_depth`.
+
+This is the `threads[]` defect class (fixed 2026-06-21 for `IRThreadTrack`, and now for
+`pool_name`) still standing on the rest. **It is a class, not a list of bugs** — each field
+needs its own argument about what the join of two disagreeing values means, and for several
+the honest answer is an AMBIGUITY marker rather than a winner, exactly as `pool_mixed` is.
+The ones worth doing first, by consequence if wrong:
+
+- `source_color` — gates the arena-vs-pool free discipline. Two branches allocating the same
+  local from an arena and a pool respectively would take the first branch's color.
+- `escaped` — an OR-merge is almost certainly right (escaped on any path = escaped), and its
+  current freeze can only mis-report a leak in one direction or the other.
+- `view_alloc_ids[]` — should be a UNION with `view_overflow` OR-ed; the field's own comment
+  says an overflowed view means "may view ANY tracked allocation", so a union that overflows
+  degrades correctly.
+
+No reproducer is recorded for these because none was found; `pool_name` was found by asking
+the question of every field, and the same question should be asked again with a reproducer
+attempt per field before any of them is changed.
+
+### 2. The auto-guard's runtime form is a SILENT EARLY RETURN — a language-semantics call
+
+An unprovable index into a fixed array compiles to `if (i >= N) { <defers>; return <zero>; }`.
+Measured consequences, all with no runtime diagnostic:
+
+- a function returning a struct returns `{0}`, so a caller reads a field that was never set;
+- a function returning `?u32` returns None — an out-of-bounds READ becomes "no value";
+- a guard inside a LOOP returns from the whole FUNCTION, so the loop silently truncates
+  and everything after it is skipped. In `main` the exit code is 0 — success.
+
+This contradicts ZER's own stated rule, recorded under "DECIDED — do not re-open" for the
+float→int decision: *memory violations halt (slice OOB, misaligned `@inttoptr`, bad `@pun`);
+arithmetic gets a defined value*. An array OOB is a memory violation, and `[*]T` already
+traps on exactly the same logical error — the same program, one container away, dies loudly.
+The code already knows this: BUG-835's comment says trapping is *"consistent with slices,
+which already TRAP on an out-of-range index"*, and applies it inside `@critical`, a held
+lock and a defer body, where an early return would leak something.
+
+**Measured corpus cost of making the guard always trap: 27 tests.** (Build with the guard
+emitting `_zer_trap` and run `tests/test_zer.sh`: 1370 pass, 27 fail, all exit 133 = SIGTRAP,
+all of them `vrp_*_guarded` / `autoguard_*` / `mmio_var_idx_guard` — files written
+specifically to assert the silent-return semantics.) So this is not a bug to fix quietly; it
+is a deliberate semantic that 27 tests encode, and changing it is the owner's call, like the
+float→int one. It is recorded here because nothing said what the guard DOES at runtime.
+
+BUG-913 closed the sharpest edge of it — the off-by-N loop is now a compile error, so the
+worst case (a loop silently running half its iterations and reporting success) no longer
+reaches the guard. What remains is the genuinely-unprovable index.
+
+Partial step already taken: the warning for a KNOWN range that runs past the end now says so,
+and says the guard returns early with no trap and no message. The generic "not proven in
+range" wording is now used only when there is no range at all.
+
+### 3. Re-defining a CONSUMED move struct is over-rejected (pre-existing)
+
+```
+Token b;
+b = a;              // transfer
+consume(b);         // b consumed
+b = make_token();   // ERROR: "use after move: 'b' ownership transferred"
+```
+
+Assigning a fresh value to a move local that has itself been consumed is a DEFINITION, not
+a use — the same argument that BUG-919's target-skip makes for handles. Verified pre-existing
+(three errors on `HEAD`, two after the BUG-919/920 work, which removed the walker's half of
+it). What remains comes from the move-transfer sinks marking the destination's own entry;
+closing it needs the same "a bare `=` target is a definition" rule applied there, and a
+negative matrix proving a genuine use-after-move through each source shape still fires. Not
+done here because the session's move changes were already at the edge of what one negative
+matrix covers.
+
+### 4. The emitted preamble needs a hosted libc's HEADERS even for a program that uses none of it
+
+Measured 2026-09-03 on a bare-metal-shaped program (MMIO write, a slice, a bounds-checked
+loop — no heap, no I/O, no threads):
+
+```
+gcc -ffreestanding -nostdinc -isystem $(gcc -print-file-name=include) -c out.c
+out.c:19:10: fatal error: string.h: No such file or directory
+```
+
+The preamble defines `_ZER_HOSTED` and correctly gates `<pthread.h>`, `<time.h>`,
+`<sched.h>`, the `fprintf` arm of `_zer_trap` and the `abort()` fallback on it — the
+freestanding intent is clearly there and mostly implemented. But `<string.h>`, `<stdio.h>`
+and `<stdlib.h>` sit OUTSIDE the gate, and none of the three is a freestanding header (C99
+§4 requires only float.h, iso646.h, limits.h, stdarg.h, stddef.h, stdbool.h, stdint.h).
+
+Two separate reasons they are reached:
+
+- `memset` / `memcpy` (`<string.h>`) — auto-zero and the Slab runtime. GCC supplies both as
+  builtins under `-ffreestanding`, so the real requirement is the DECLARATIONS, and a
+  bare-metal project supplying its own is the normal arrangement.
+- `calloc` / `free` (`<stdlib.h>`) — used ONLY by the Slab runtime, **which is emitted
+  unconditionally even when the program contains no Slab.** That is what makes this bite a
+  program that asked for nothing heap-shaped.
+
+Loud, not silent — a compile error, not a miscompile — which is why it is recorded rather
+than ranked with the safety findings. It survived because `arm-none-eabi` ships newlib's
+headers, so the QEMU Cortex-M3 examples build fine; it bites a true `-nostdlib` kernel or
+EFI target, which is exactly the case `_zer_trap`'s own comment names.
+
+Fix sketch, in the order that keeps each step verifiable: (1) emit the Slab/pool heap
+runtime only when the program actually uses one — the emitter already knows, since it emits
+auto-slabs per struct type; (2) move `<stdio.h>` and `<stdlib.h>` inside `#if _ZER_HOSTED`;
+(3) under `#else`, declare `memset`/`memcpy` rather than including `<string.h>`, so a
+freestanding link fails on a missing SYMBOL (clear) instead of a missing HEADER (obscure).
+Verify with the compile line above plus the QEMU examples, which must keep building.
+
+### 5. An ISR/main-shared `volatile` AGGREGATE is rejected on the whole type's width
+
+`volatile_global_exempt_from_race_check` admits only a single-word SCALAR, so every one of
+these is a hard error when touched from both an interrupt and main:
+
+```
+volatile u32[4] buf;          volatile S gs;        // S = { u32 a; u32 b; }
+volatile Ring(Msg, 8) q;      volatile Pool(T,8) p;   volatile [*]u32 gsl;
+```
+
+The rejection is SOUND — a whole-aggregate copy really does tear. But the check asks the
+width of the TYPE, while the hazard is the width of the ACCESS: `buf[0] = 1` in the ISR and
+`x = buf[0]` in main are each one aligned 32-bit volatile access, which cannot tear on any
+supported target. Measured: there is currently **no way to write an ISR→main buffer of more
+than one word** in ZER. `@atomic_*` does not rescue it (the "must be volatile" rule fires
+first, on the declaration), `shared struct` does not (same), and the diagnostic's own advice
+— *"use @atomic_* on a `*shared T`"* — names a type that is not constructible, which this
+document already records.
+
+The relaxation, if taken, has a precise shape: keep the check at the DECLARATION but drive it
+from the ACCESS SHAPES the ISR pass already collects. Admit the aggregate only when every
+recorded access from either side is a field/index access whose resulting lvalue is a
+single-word scalar, no access is the bare aggregate (a whole-aggregate read or write), the
+address is never taken, and the containing struct is not `packed` (a packed field is not
+naturally aligned, so it CAN be split into several bus transactions). Anything not
+classified must count as a whole-aggregate access — the sound default. The RMW rule stays
+untouched: `buf[0] += 1` is still a non-atomic read-modify-write.
+
+Not implemented here because it widens an ACCEPT, and the accept-unsafe discipline wants the
+access-shape collection built and its negative matrix (whole-struct assign, multi-word
+element, packed field, address-taken, slice descriptor written) written first. The
+`SITE x SHAPE` volatile grid in `tests/test_hw_matrix.c` is where those cells go.
+
+
+---
+
 
 ## SUPERSEDED by harvest-2 H14 — `&&` / `||` narrowing (the "PRECISION only" call was WRONG)
 

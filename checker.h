@@ -58,6 +58,25 @@ typedef struct {
      * NOT increment it: only the taken branch is checked and the other is
      * stripped, so a join there is unconditional. */
     int branch_depth;
+    /* BUG-913 — loop-induction CERTAINTY. A VRP range says which values a
+     * variable MAY hold; these say which values a counted loop's counter WILL
+     * hold. Set only while checking the body of a `for` whose init, bound and
+     * step are integer constants with a positive step and whose body is
+     * straight-line (no break/continue/return/goto/yield/defer/asm/orelse and no
+     * write to or address-of the counter) — so every value of the sequence
+     * cert_loop_lo, +step, ... <= cert_loop_last really is executed.
+     *
+     * `cert_loop_name == NULL` (the memset default, and the value restored on
+     * every path that cannot establish the shape) means NO certainty, which
+     * degrades to today's behaviour. Only the INNERMOST such loop is tracked;
+     * an outer counter used inside a nested loop loses certainty, which is the
+     * conservative direction. */
+    const char *cert_loop_name;
+    uint32_t cert_loop_name_len;
+    int64_t cert_loop_lo;
+    int64_t cert_loop_step;   /* 0 = no certainty */
+    int64_t cert_loop_last;
+    int cert_loop_depth;      /* branch_depth at which the body is unconditional */
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */
@@ -200,6 +219,12 @@ typedef struct {
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
+    /* BUG-916: the two halves of `after_spawn_in_func`, kept apart so a join can
+     * close the SCOPED window without clearing a fire-and-forget one. A
+     * fire-and-forget spawn runs unbounded, so its flag never clears; a scoped
+     * spawn is concurrent only between the spawn and its join. */
+    bool ff_spawn_in_func;    /* a fire-and-forget spawn happened in this body */
+    int  scoped_spawn_live;   /* scoped threads spawned and not yet joined here */
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */

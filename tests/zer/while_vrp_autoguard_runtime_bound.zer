@@ -1,0 +1,17 @@
+// BUG-748 (2026-06-18), kept alive with a RUNTIME bound so the BUG-913
+// certain-OOB rule does not fire: the property under test is that the while body
+// must NOT be checked under the loop variable's outer init-range. Pre-BUG-748
+// `i` looked like [0,0] inside the body, arr[i] was falsely proven safe and the
+// auto-guard was DROPPED — a silent stack OOB confirmed by ASan. Post-fix the
+// guard is inserted and the function early-returns instead of overflowing.
+u32 limit() { return 10; }
+u32 main() {
+    u32 i = 0;
+    u32[5] arr;
+    u32 n = limit();
+    while (i < n) {
+        arr[i] = 99;
+        i += 1;
+    }
+    return 0;
+}

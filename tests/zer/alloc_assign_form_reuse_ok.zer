@@ -1,0 +1,44 @@
+// BUG-919/920 OVER-REJECTION BOUNDARY. Tracking the assignment spelling must not
+// make the REUSE patterns illegal — and reuse can only be written that way, since
+// a var-decl cannot be re-initialised. Two things had to be right for these:
+//   * the new allocation's alloc_id must be non-zero, or the alias group is lost
+//     (alloc_id 0 means "untracked") and the next allocation is reported as
+//     "overwritten while alive";
+//   * a plain `=` to a BARE IDENT is a DEFINITION, not a use, so overwriting a
+//     freed handle is not a use-after-free.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+u32 rt() { return 0; }
+
+void reuse_sequential() {
+    ?Handle(Device) mh;
+    mh = pool_a.alloc();
+    Handle(Device) a = mh orelse return;
+    pool_a.free(a);
+    mh = pool_a.alloc();
+    Handle(Device) b = mh orelse return;
+    pool_a.free(b);
+}
+
+void reuse_in_loop() {
+    ?Handle(Device) mh;
+    for (u32 i = 0; i < 4; i += 1) {
+        mh = pool_a.alloc();
+        Handle(Device) h = mh orelse return;
+        pool_a.free(h);
+    }
+}
+
+void conditional_alloc_one_pool() {
+    ?Handle(Device) mh;
+    if (rt() == 0) { mh = pool_a.alloc(); } else { mh = pool_a.alloc(); }
+    Handle(Device) h = mh orelse return;
+    pool_a.free(h);
+}
+
+u32 main() {
+    reuse_sequential();
+    reuse_in_loop();
+    conditional_alloc_one_pool();
+    return 0;
+}

@@ -1,0 +1,12 @@
+// expect-error: use after free
+// BUG-919, use-after-free half.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+void run() {
+    ?Handle(Device) mh;
+    mh = pool_a.alloc();
+    Handle(Device) h = mh orelse return;
+    pool_a.free(h);
+    u32 v = pool_a.get(h).id;
+}
+u32 main() { run(); return 0; }

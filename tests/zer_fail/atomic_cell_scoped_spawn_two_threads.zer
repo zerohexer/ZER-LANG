@@ -1,0 +1,13 @@
+// expect-error: plain access to 'g_ctr' in a concurrent context
+// BUG-916: one join does not close the window while a second scoped thread is
+// still running.
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+u32 main() {
+    ThreadHandle a = spawn worker();
+    ThreadHandle b = spawn worker();
+    a.join();
+    g_ctr = 5;
+    b.join();
+    return 0;
+}

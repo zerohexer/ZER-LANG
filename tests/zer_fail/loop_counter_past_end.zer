@@ -1,0 +1,9 @@
+// expect-error: loop provably performs an out-of-bounds access
+// BUG-913: the canonical off-by-N. Before this rule the program compiled with
+// only a warning and the auto-guard turned iteration 4 into a SILENT early
+// return from main — exit 0, "success", with half the loop never run.
+u32 main() {
+    u32[4] arr;
+    for (u32 i = 0; i < 8; i += 1) { arr[i] = i; }
+    return 0;
+}

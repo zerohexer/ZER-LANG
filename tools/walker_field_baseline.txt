@@ -824,3 +824,36 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# 2026-09-03 — BUG-913 `checker.c:loop_body_straight_line`. This predicate answers
+# "is every statement of this subtree guaranteed to run once per iteration, with the
+# loop counter untouched?" for the certain-OOB loop rule. Its contract is that an
+# unrecognised or disqualifying kind answers NO, so each kind below RETURNS FALSE
+# outright — there is nothing to learn from its children, and descending them could
+# only turn a "no" into a "no". The direction is the safe one: the rule is a PROOF OF
+# DANGER, so failing to descend can only fail to report, never accept.
+checker.c:loop_body_straight_line:NODE_ASM:asm_stmt.inputs
+checker.c:loop_body_straight_line:NODE_ASM:asm_stmt.outputs
+checker.c:loop_body_straight_line:NODE_AWAIT:await_stmt.cond
+checker.c:loop_body_straight_line:NODE_CRITICAL:critical.body
+checker.c:loop_body_straight_line:NODE_DEFER:defer.body
+checker.c:loop_body_straight_line:NODE_DO_WHILE:while_stmt.body
+checker.c:loop_body_straight_line:NODE_DO_WHILE:while_stmt.cond
+checker.c:loop_body_straight_line:NODE_FILE:file.decls
+checker.c:loop_body_straight_line:NODE_FOR:for_stmt.body
+checker.c:loop_body_straight_line:NODE_FOR:for_stmt.cond
+checker.c:loop_body_straight_line:NODE_FOR:for_stmt.init
+checker.c:loop_body_straight_line:NODE_FOR:for_stmt.step
+checker.c:loop_body_straight_line:NODE_FUNC_DECL:func_decl.body
+checker.c:loop_body_straight_line:NODE_GLOBAL_VAR:var_decl.init
+checker.c:loop_body_straight_line:NODE_INTERRUPT:interrupt.body
+checker.c:loop_body_straight_line:NODE_ONCE:once.body
+checker.c:loop_body_straight_line:NODE_ORELSE:orelse.expr
+checker.c:loop_body_straight_line:NODE_ORELSE:orelse.fallback
+checker.c:loop_body_straight_line:NODE_RETURN:ret.expr
+checker.c:loop_body_straight_line:NODE_SPAWN:spawn_stmt.args
+checker.c:loop_body_straight_line:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:loop_body_straight_line:NODE_SWITCH:switch_stmt.arms
+checker.c:loop_body_straight_line:NODE_SWITCH:switch_stmt.expr
+checker.c:loop_body_straight_line:NODE_WHILE:while_stmt.body
+checker.c:loop_body_straight_line:NODE_WHILE:while_stmt.cond

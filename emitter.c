@@ -3745,8 +3745,15 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
-        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
-            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission */
+        } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission.
+             * BUG-915: was `nlen >= 10`, which excludes `@atomic_or` (9 chars) —
+             * the checker fixed exactly that off-by-one in BUG-427 and this copy
+             * never followed. Unreachable today (the checker rejects any atomic
+             * in a global initialiser, the only context that still reaches this
+             * AST path) but it is the same predicate written twice with two
+             * different answers, which is the drift this file keeps paying for.
+             * The IR path already uses `>= 7`. */
             const char *op = name + 7;
             int oplen = nlen - 7;
             bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
@@ -10102,8 +10109,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_rewritten_node(e, node->intrinsic.args[0], func); emit(e, ", ");
             emit_rewritten_node(e, node->intrinsic.args[1], func); emit(e, ")");
         } else {
-            /* Truly unknown intrinsic — should not reach here */
-            emit(e, "/* @%.*s */ 0", (int)nlen, name);
+            /* BUG-915: this is the IR-path TWIN of the AST-path fallback that
+             * BUG-767 hardened, and it was left on the pre-BUG-767 silent-`0`
+             * form — in the ONLY path function bodies use. An intrinsic added to
+             * the checker's dispatch chain without a matching arm here would
+             * therefore compile to the literal 0: a privileged register read, an
+             * MMIO probe or an atomic would silently become "zero", with no
+             * diagnostic at compile time and nothing to notice at run time. That
+             * is precisely the failure BUG-767 was raised for. Dead today (every
+             * checker-accepted name has an arm above — swept), and it must FAIL
+             * LOUD the moment it stops being dead: an undeclared identifier makes
+             * GCC name the intrinsic instead of emitting a zero. */
+            emit(e, "__zer_intrinsic_%.*s_has_no_IR_emitter_handler", (int)nlen, name);
         }
         return;
     }

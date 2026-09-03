@@ -1,0 +1,12 @@
+// expect-error: plain access to 'g_ctr' in a concurrent context
+// BUG-916 sibling: moving the plain write into a helper must not change the
+// verdict (the G3 callee descent is gated on the same flag).
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+void poke() { g_ctr = 5; }
+u32 main() {
+    ThreadHandle t = spawn worker();
+    poke();
+    t.join();
+    return 0;
+}

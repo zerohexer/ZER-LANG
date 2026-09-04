@@ -112,6 +112,96 @@ can confirm a hole but never refute one) and verified to fail on the pre-fix bui
 
 ---
 
+## Session 2026-09-05 — BUG-933: the ASSIGN spelling of an allocation was invisible
+
+Survey CLASS 4 (`v7pucv`). All 11 reproducers measured live on `671ab95a`, all now
+rejected, all verified to compile clean on the pre-fix build.
+
+### The shape
+
+```zer
+?Handle(Device) mh = pool_a.alloc();   // VAR-DECL — tracked
+?Handle(Device) mh; mh = pool_a.alloc();  // ASSIGN  — invisible
+```
+
+The two spellings lower to different IR. The var-decl gives `%t = CALL` followed by
+`%0 = COPY`. The assign gives **one** passthrough `%t = ASSIGN <NODE_ASSIGN>`: no
+`IR_CALL`, no `COPY`, and the target local `mh` **is never any instruction's
+`dest_local`**. Every arm in the handler keys on `dest_local`, so it saw a temp and
+the allocation was never registered — UAF, double-free and leak all accepted for a
+program whose var-decl spelling is correctly rejected.
+
+### Five distinct causes behind the eleven
+
+| # | cause | forms |
+|---|---|---|
+| 1 | `ir_unwrap_alloc_expr` peels `NODE_ORELSE` but not `NODE_ASSIGN`, and the target is never a `dest_local` | the 6 `alloc_assign_form_*` |
+| 2 | the move-on-assign arm required a FIELD/INDEX target, so a bare `b = a;` — the plainest use-after-move in the language — was accepted | `move_assign_form_ident` |
+| 3 | a move SOURCE that is a projection (`b = w.inner`, `b = arr[0]`) never resolved, because `rhs_local` only finds a bare ident | `move_assign_form_field`, `_index` |
+| 4 | `ir_contains_move_struct_field_depth` recursed into STRUCT and UNION but **not ARRAY** — the "wrapper hides the inner kind" class, array arm missing | `move_assign_form_index` |
+| 5 | that same walk returned **false** past its depth guard — "contains no move struct" — so a 34-deep nest defeated move tracking by being deep | `move_struct_deep_nesting_uam` |
+
+Cause 5 is worth stating on its own: **exceeding a guard must be conservative.**
+The guard bounds recursion; it does not answer the question. `false` disabled
+tracking; `true` can only over-reject a copy of a deeply-nested NON-move struct, and
+corpus cost is zero.
+
+Fix 1 is shared, not duplicated: `ir_register_alloc_result` is extracted and called
+by BOTH the var-decl arm and the new assign arm, so the two spellings cannot drift
+apart again. The var-decl path was verified unchanged before the assign arm was added.
+
+### And it made a REAL merge hole reachable
+
+`wrong_pool_across_branch` — allocate from `pool_a` on one arm and `pool_b` on the
+other, then `pool_a.free(h)`:
+
+```
+no branch, wrong pool     -> caught
+both arms same pool       -> caught
+MIXED arms                -> ACCEPTED
+```
+
+`pool_name` is one of the 13 fields `ir_merge_states` leaves to `first_live`. That
+was **not reachable before this fix** — with neither branch registering an
+allocation, the two predecessors never disagreed about anything. Merged now with a
+`_ir_pool_mixed` sentinel, set ONLY when both preds name a pool and the names
+differ, so a single-pool program is untouched. The diagnostic says so in words and
+names the restructure.
+
+### The rest of the `ir_merge_states` finding is REFUTED, measured
+
+Three branches converged on *"merges only 4-5 of ~18 fields"*. Numerically true; as a
+safety claim it does not hold, and a future session should not re-derive it:
+
+- **7 of the 13 unmerged fields are set at handle CREATION** (`alloc_id`,
+  `alloc_line`, `source_color`, `is_move_local`, `is_thread_handle`, the view set,
+  and `pool_name` in the single-pool case). They are therefore IDENTICAL across
+  predecessors — or the handle exists in only one pred, where the merge copies the
+  whole struct (`*nh = *src`). Nothing to drop.
+- **`escaped` is compensated**, not merged: the exit pass scans EVERY block's own
+  state and builds `covered_ids` keyed on `alloc_id`, so an escape recorded in any
+  block covers the allocation. Probed across three merge shapes (if-body, else, and
+  a loop back-edge) — no false leak.
+- **`freed_defer_id` / `defer_double_reported` are diagnostic dedup**; dropping one
+  can duplicate or suppress a duplicate message, never change a verdict.
+
+`pool_name` was the one field that could genuinely differ, and it needed CLASS 4
+fixed first to become observable at all.
+
+### One correction to my own probe
+
+I first attributed a multi-view heap-UAF (`h = pick(c,p,q)` after `free(p)`) to the
+merge. It reproduces with **no branch at all** — it is the ASSIGN form again, and
+ASan confirms `heap-use-after-free`. Measuring the unconditional variant is what
+separated the two.
+
+Tests: the branch's 11 negatives verbatim (each with `expect-error`, each verified
+accepted pre-fix) plus `tests/zer/assign_form_ok.zer`, a boundary positive pinning
+that assign-form allocation, a move whose DESTINATION is used, a move out of an
+array, and a plain non-move array copy all still compile and run.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

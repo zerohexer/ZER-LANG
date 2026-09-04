@@ -422,6 +422,26 @@ Companion POSITIVES that must keep compiling (currently OVER-REJECTED, see below
 
 ---
 
+### ~~CLASS 4 — THE **ASSIGN FORM** IS NOT TRACKED~~ — **CLOSED 2026-09-05 as BUG-933, DO NOT REDO**
+
+> All 11 reproducers reject; each verified accepted on the pre-fix build. FIVE distinct
+> causes, not one: (1) `ir_unwrap_alloc_expr` does not peel `NODE_ASSIGN` and the assign
+> target is never any instruction's `dest_local`, so the allocation was never registered;
+> (2) the move-on-assign arm required a FIELD/INDEX target, missing the bare `b = a;`;
+> (3) a move SOURCE that is a projection never resolved; (4)
+> `ir_contains_move_struct_field_depth` did not recurse into **ARRAY** (the carrier class);
+> (5) that walk returned **false** past its depth guard, so a 34-deep nest defeated move
+> tracking by being deep — **exceeding a guard must be conservative**.
+>
+> Registration is now shared (`ir_register_alloc_result`) between the var-decl and assign
+> paths so the two spellings cannot drift apart again.
+>
+> Tests: the branch's 11 negatives verbatim + `tests/zer/assign_form_ok.zer` (boundary
+> positive: assign-form alloc, move-then-use-DEST, move out of an array, and a plain
+> non-move array copy must all still run).
+
+<details><summary>original entry (kept for the reproducers)</summary>
+
 ### CLASS 4 — THE **ASSIGN FORM** IS NOT TRACKED (HIGH, accept-unsafe) — `v7pucv`
 
 Allocation and move tracking key on the VAR-DECL spelling; the ASSIGNMENT spelling of
@@ -446,6 +466,8 @@ Forms: `alloc_assign_form_uaf`, `_double_free`, `_leak`, `_ptr_uaf`, `_branch_ua
 Also `v7pucv`: `move_struct_deep_nesting_uam`, `wrong_pool_across_branch`.
 
 ---
+
+</details>
 
 ### CLASS 5 — ATOMIC CELL vs SCOPED SPAWN (HIGH, silent race) — `v7pucv`
 
@@ -620,10 +642,24 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 
 ### NON-TEST FINDINGS (no reproducer; from the branches' limitations.md)
 
-- **`ir_merge_states` merges only 4-5 of ~17-18 `IRHandleInfo` fields.** Found
-  INDEPENDENTLY by `v7pucv`, `pstdqk` AND `1zukjq`. Three branches converging is the
-  strongest architectural signal in this survey. A field that is not merged is a fact
-  silently dropped at every CFG join — the same shape as the `threads[]` merge bug.
+- ~~**`ir_merge_states` merges only 4-5 of ~17-18 `IRHandleInfo` fields.**~~
+  **MEASURED 2026-09-05 (BUG-933) — mostly REFUTED as a safety claim; ONE field was real.
+  Do not re-derive.** The count is right; the conclusion was not. Of the 13 unmerged
+  fields: **7 are set at handle CREATION** (`alloc_id`, `alloc_line`, `source_color`,
+  `is_move_local`, `is_thread_handle`, the view set, and `pool_name` in the single-pool
+  case) so they are IDENTICAL across predecessors — or the handle exists in only one pred,
+  where the merge copies the whole struct (`*nh = *src`). **`escaped` is COMPENSATED, not
+  merged**: the exit pass scans EVERY block's own state and builds `covered_ids` keyed on
+  `alloc_id`, so an escape recorded in any block covers the allocation (probed across
+  if-body / else / loop-back-edge — no false leak). **`freed_defer_id` and
+  `defer_double_reported` are diagnostic dedup** and cannot change a verdict.
+  **The ONE real hole was `pool_name`** (`wrong_pool_across_branch`: allocate from
+  `pool_a` on one arm and `pool_b` on the other, then `pool_a.free(h)`) — and it was
+  **NOT REACHABLE until CLASS 4 was fixed**, because with neither branch registering an
+  allocation the predecessors never disagreed about anything. Now merged with a
+  `_ir_pool_mixed` sentinel set only when both preds name a pool and the names differ.
+  **Lesson worth keeping: a field-coverage count is not a hole count — ask which fields
+  can DIFFER across predecessors, and whether a later pass re-derives the fact.**
 - **`IRPathState.critical_depth` is not merged at all** (`pstdqk` lead B).
 - **`ir_ps_copy` forces `terminated = false`, making three merge branches dead**
   (`pstdqk` lead C).
@@ -686,8 +722,10 @@ accept-unsafe class.
    Correct CLAUDE.md's "EXACTLY THREE / set is closed" sentence in the same commit.
 2. **Cast/launder at the HEAP-UAF sink** — ~15 tests across 4 branches, one peel
    reaching the allocation-identity path + struct-literal carrier.
-3. **`ir_merge_states` field coverage** — 3 branches agree; architectural.
-4. **The ASSIGN form** for alloc/move — 9 tests, one registration site.
+3. ~~**`ir_merge_states` field coverage**~~ — MEASURED, mostly refuted; the one
+   real field (`pool_name`) is CLOSED with BUG-933. See the NON-TEST FINDINGS note.
+4. ~~**The ASSIGN form** for alloc/move~~ — CLOSED (BUG-933); it was 11 tests and
+   FIVE causes, not one registration site.
 5. **The global-init self-cycle HANG** — small fix, but it is a compiler DoS and
    any negative test for it will time out `make check` until it is fixed.
 6. Everything else, per class above.

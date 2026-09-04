@@ -1,0 +1,12 @@
+// expect-error: use after free
+// BUG-919 sibling: alloc_ptr / free_ptr take the same path.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+void run() {
+    ?*Device mp;
+    mp = pool_a.alloc_ptr();
+    *Device p = mp orelse return;
+    pool_a.free_ptr(p);
+    pool_a.free_ptr(p);
+}
+u32 main() { run(); return 0; }

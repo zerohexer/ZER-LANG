@@ -1,0 +1,10 @@
+// expect-error: is transferred
+// BUG-920, FIELD source.
+move struct Token { u32 id; }
+struct Wrap { Token inner; }
+u32 main() {
+    Wrap w; w.inner.id = 1;
+    Token b;
+    b = w.inner;
+    return w.inner.id;
+}

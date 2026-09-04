@@ -1,0 +1,13 @@
+// expect-error: use after free
+// BUG-919: a CONDITIONAL allocation can only be written in the assignment form,
+// which is why every branch shape was unchecked too.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+void run(u32 cond) {
+    ?Handle(Device) mh;
+    if (cond == 0) { mh = pool_a.alloc(); } else { mh = pool_a.alloc(); }
+    Handle(Device) h = mh orelse return;
+    pool_a.free(h);
+    pool_a.free(h);
+}
+u32 main() { run(0); return 0; }

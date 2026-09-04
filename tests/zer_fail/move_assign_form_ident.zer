@@ -1,0 +1,13 @@
+// expect-error: is transferred
+// BUG-920: a move-struct TRANSFER written as an ASSIGNMENT rather than a var-decl
+// INITIALIZER transferred nothing — the initializer spelling of the same program
+// is rejected. Same root cause as BUG-919: the initializer lowers to IR_COPY
+// (which performs the transfer), the assignment stays inside IR_ASSIGN's expr
+// with a statement temp as its dest.
+move struct Token { u32 id; }
+u32 main() {
+    Token a; a.id = 1;
+    Token b;
+    b = a;
+    return a.id;
+}

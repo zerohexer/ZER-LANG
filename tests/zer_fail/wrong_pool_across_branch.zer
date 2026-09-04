@@ -1,0 +1,15 @@
+// expect-error: more than one pool
+// BUG-918: `pool_name` is a one-slot answer to a question whose truth is a SET,
+// and ir_merge_states never merged it — the first live predecessor's name simply
+// won, so this free (wrong on the pool_b path) compiled clean while the
+// straight-line version of the same misuse was rejected.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+Pool(Device, 8) pool_b;
+void run(u32 cond) {
+    ?Handle(Device) mh;
+    if (cond == 0) { mh = pool_a.alloc(); } else { mh = pool_b.alloc(); }
+    Handle(Device) h = mh orelse return;
+    pool_a.free(h);
+}
+u32 main() { run(1); return 0; }

@@ -550,6 +550,7 @@ zercheck_ir.c:if (eff && eff->kind == TYPE_HANDLE) {
 zercheck_ir.c:if (eff && eff->kind == TYPE_OPTIONAL) {
 zercheck_ir.c:if (eff->kind != TYPE_STRUCT) return;
 zercheck_ir.c:if (eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+zercheck_ir.c:if (eff->kind == TYPE_ARRAY) {
 zercheck_ir.c:if (eff->kind == TYPE_STRUCT) {
 zercheck_ir.c:if (eff->kind == TYPE_UNION) {
 zercheck_ir.c:if (ft->kind == TYPE_HANDLE) {

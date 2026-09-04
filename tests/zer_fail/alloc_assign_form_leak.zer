@@ -1,0 +1,11 @@
+// expect-error: never freed
+// BUG-919, leak half.
+struct Device { u32 id; }
+Pool(Device, 8) pool_a;
+void run() {
+    ?Handle(Device) mh;
+    mh = pool_a.alloc();
+    Handle(Device) h = mh orelse return;
+    u32 v = pool_a.get(h).id;
+}
+u32 main() { run(); return 0; }

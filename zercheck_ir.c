@@ -850,7 +850,15 @@ static bool ir_is_move_struct_type(Type *t) {
  * while catching nested cases. */
 static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
     if (!t) return false;
-    if (depth > 32) return false;
+    /* BUG-933: EXCEEDING THE GUARD MUST BE CONSERVATIVE. Returning false said
+     * "contains no move struct", which disables move tracking entirely — so a
+     * 34-deep nest defeated use-after-move detection by being deep. The guard
+     * exists to bound recursion, not to answer the question; when it fires the
+     * honest answer is "assume it might", which can only OVER-reject (a copy of a
+     * deeply-nested NON-move struct starts being move-tracked). Corpus cost is
+     * zero — nothing here nests anywhere near this. Same direction as the VRP
+     * verdict: trusting the analysis to prove DANGER is the safe side. */
+    if (depth > 32) return true;
     Type *eff = type_unwrap_distinct(t);
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
@@ -863,6 +871,16 @@ static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
                     return true;
             }
         }
+    }
+    /* BUG-933: an ARRAY is a CARRIER too. `Token[2] arr;` contains move structs,
+     * but this walk recursed only into STRUCT and UNION, so `b = arr[0];` was not
+     * recognised as a transfer at all. Exactly the "wrapper hides the inner kind"
+     * class CLAUDE.md lists (?T / distinct T / array-of / by-value struct), and the
+     * array arm was the missing one here. */
+    if (eff->kind == TYPE_ARRAY) {
+        Type *et = eff->array.inner;
+        if (ir_is_move_struct_type(et)) return true;
+        return ir_contains_move_struct_field_depth(et, depth + 1);
     }
     if (eff->kind == TYPE_UNION) {
         for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
@@ -891,6 +909,14 @@ static bool ir_should_track_move(Type *t) {
  * When ownership transfers (e.g., Token b = a), the destination
  * gets a fresh alloc_id representing a new ownership identity —
  * the source's alloc_id goes with its TRANSFERRED state. */
+/* BUG-933: MIXED-POOL sentinel. When two predecessors allocate the same handle
+ * from DIFFERENT pools, the merged handle belongs to neither, and a pool-specific
+ * op on it cannot be proven safe. pool_name is NOT merged (it is one of the 13
+ * fields ir_merge_states leaves to first_live), which was invisible until the
+ * ASSIGN spelling started registering allocations at all — before that neither
+ * branch registered, so the disagreement never arose. Compared by POINTER. */
+static const char _ir_pool_mixed[] = "<mixed>";
+
 static int _ir_next_alloc_id = 1000000;  /* high base so it doesn't
                                             collide with local_id-based
                                             ids set at allocation */
@@ -1186,6 +1212,17 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle alive), so a pred without it cannot contribute an alive
              * path that this would wrongly mask. */
             if (ph->freed_all_paths) rh->freed_all_paths = 1;
+            /* BUG-933: POOL IDENTITY across the join. Only when BOTH preds name a
+             * pool and they DIFFER — so a single-pool program is untouched and this
+             * can only reject a handle that genuinely may come from either. */
+            if (rh->pool_name && rh->pool_name_len &&
+                ph->pool_name && ph->pool_name_len &&
+                rh->pool_name != _ir_pool_mixed &&
+                (rh->pool_name_len != ph->pool_name_len ||
+                 memcmp(rh->pool_name, ph->pool_name, rh->pool_name_len) != 0)) {
+                rh->pool_name = _ir_pool_mixed;
+                rh->pool_name_len = (uint32_t)(sizeof(_ir_pool_mixed) - 1);
+            }
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
              * MAYBE_FREED, keep it. Both same state → keep.
              * Both freed → keep freed. */
@@ -1943,6 +1980,51 @@ static void ir_extract_pool_name(Node *call, const char **out_name,
 /* Unwrap orelse-wrapped alloc: `pool.alloc() orelse return` — the IR
  * ASSIGN's expression is NODE_ORELSE(NODE_CALL, NODE_RETURN). We want
  * the primary call for classification. */
+/* BUG-933: register an allocation RESULT onto a destination local. Extracted so
+ * the two spellings of one operation share it:
+ *
+ *     ?Handle(T) mh = pool.alloc();   // VAR-DECL -> IR_CALL + COPY
+ *     ?Handle(T) mh; mh = pool.alloc();  // ASSIGN -> ONE passthrough IR_ASSIGN
+ *
+ * The assign spelling lowers to a single `%t = ASSIGN <NODE_ASSIGN>` with no
+ * IR_CALL and no COPY, and the target local is never any instruction's dest — so
+ * every arm that keys on inst->dest_local missed it and the allocation went
+ * completely untracked (UAF, double-free and leak all accepted). Returns true if
+ * it registered, so the caller can stop. */
+static void ir_extract_pool_name(Node *call, const char **out, uint32_t *out_len);
+static bool ir_register_alloc_result(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                     Node *call, IRMethodKind mc,
+                                     int dest, int line) {
+    if (dest < 0) return false;
+    if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
+        IRHandleInfo *h = ir_add_handle(ps, dest);
+        if (h) {
+            if (h->state == IR_HS_ALIVE && dest < func->local_count &&
+                !func->locals[dest].is_temp) {
+                ir_zc_error(zc, line,
+                    "handle %%%d overwritten while alive — previous leaked", dest);
+            }
+            h->state = IR_HS_ALIVE;
+            h->alloc_line = line;
+            h->alloc_id = dest;
+            h->source_color = ZC_COLOR_POOL;
+            ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);
+        }
+        return true;
+    }
+    if (mc == IRMC_ARENA_ALLOC) {
+        IRHandleInfo *h = ir_add_handle(ps, dest);
+        if (h) {
+            h->state = IR_HS_ALIVE;
+            h->alloc_line = line;
+            h->alloc_id = dest;
+            h->source_color = ZC_COLOR_ARENA;
+        }
+        return true;
+    }
+    return false;
+}
+
 static Node *ir_unwrap_alloc_expr(Node *expr) {
     if (!expr) return NULL;
     if (expr->kind == NODE_ORELSE) return expr->orelse.expr;
@@ -2181,6 +2263,15 @@ static void ir_check_call_wrong_pool(ZerCheck *zc, IRFunc *func,
     if (cur_l == h->pool_name_len &&
         memcmp(cur_n, h->pool_name, cur_l) == 0) return;
     const char *verb = (mc == IRMC_GET) ? "used on" : "freed on";
+    if (h->pool_name == _ir_pool_mixed) {
+        ir_zc_error(zc, line,
+            "handle may come from more than one pool on different paths but is %s "
+            "'%.*s' — allocate from a single pool, or branch on the pool at the use "
+            "site the same way the allocation does",
+            verb, (int)cur_l, cur_n);
+        urs_add(rs, root_local);
+        return;
+    }
     ir_zc_error(zc, line,
         "wrong pool: handle was allocated from '%.*s' but %s '%.*s'",
         (int)h->pool_name_len, h->pool_name, verb, (int)cur_l, cur_n);
@@ -4260,7 +4351,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * copy makes t's bytes readable but logically invalid. */
             if (target_expr && rhs_local >= 0 && rhs_local < func->local_count &&
                 (target_expr->kind == NODE_FIELD ||
-                 target_expr->kind == NODE_INDEX)) {
+                 target_expr->kind == NODE_INDEX ||
+                 /* BUG-933: a bare-IDENT target (`b = a;`) is the ASSIGN
+                  * spelling of `Token b = a;`, which IS tracked. Requiring
+                  * FIELD/INDEX meant the plainest use-after-move in the
+                  * language was accepted. */
+                 target_expr->kind == NODE_IDENT)) {
                 Type *rhs_type = func->locals[rhs_local].type;
                 if (ir_should_track_move(rhs_type)) {
                     IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
@@ -4275,6 +4371,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
             }
+
+              /* BUG-933: the move SOURCE may be a projection — `b = w.inner;`,
+               * `b = arr[0];`. rhs_local only resolves a bare ident, so those two
+               * spellings of the same transfer were invisible while `b = a;` and the
+               * var-decl form were both tracked. Resolve the source through the
+               * compound key and transfer THAT handle, so the later read of
+               * `w.inner` / `arr[0]` is a use-after-move. */
+              if (target_expr && rhs_local < 0 && value_expr &&
+                  (value_expr->kind == NODE_FIELD || value_expr->kind == NODE_INDEX)) {
+                  int mroot; const char *mpath; uint32_t mplen;
+                  if (ir_extract_compound_key(zc, func, value_expr,
+                                              &mroot, &mpath, &mplen) == 0 &&
+                      mroot >= 0 && mroot < func->local_count && mplen > 0 &&
+                      ir_should_track_move(func->locals[mroot].type)) {
+                      IRHandleInfo *mh = ir_find_compound_handle(ps, mroot, mpath, mplen);
+                      if (mh && ir_is_invalid(mh)) {
+                          ir_zc_error(zc, inst->source_line,
+                              "use of %s value in move-assignment source",
+                              ir_state_name(mh->state));
+                      }
+                      if (!mh) mh = ir_add_compound_handle(ps, mroot, mpath, mplen);
+                      if (mh) {
+                          if (mh->alloc_id == 0) mh->alloc_id = _ir_next_alloc_id++;
+                          ir_mark_transferred(ps, mh, inst->source_line);
+                      }
+                  }
+              }
         }
         /* Phase E: recognize pool/slab builtin method calls in the RHS.
          * Handled shapes:
@@ -4283,6 +4406,28 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          *   x = pool.get(h)                       → UAF check on h
          *   h = mh orelse return                  → alias dest to source ident
          *   (pool.free is a statement, not assign — handled in IR_CALL) */
+        /* BUG-933: THE ASSIGN SPELLING. `mh = pool.alloc();` lowers to ONE
+         * passthrough `%t = ASSIGN <NODE_ASSIGN>`: there is no IR_CALL, no COPY,
+         * and the TARGET local (mh) is never any instruction's dest_local — so
+         * every arm below, which keys on inst->dest_local, saw a temp and the
+         * allocation was never registered at all. UAF, double-free and leak were
+         * all accepted for the assign spelling of a program whose var-decl
+         * spelling is correctly rejected: the two-spellings-of-one-program
+         * disagreement this codebase keeps finding. Register against the
+         * resolved TARGET, through the same helper the var-decl path uses. */
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+            inst->expr->assign.op == TOK_EQ) {
+            Node *acall = ir_unwrap_alloc_expr(inst->expr->assign.value);
+            if (acall && acall->kind == NODE_CALL) {
+                IRMethodKind amc = ir_classify_method_call_ex(zc->checker, acall);
+                if (amc == IRMC_ALLOC || amc == IRMC_ALLOC_PTR ||
+                    amc == IRMC_ARENA_ALLOC) {
+                    int atgt = ir_find_value_local(func, inst->expr->assign.target);
+                    ir_register_alloc_result(zc, func, ps, acall, amc, atgt,
+                                             inst->source_line);
+                }
+            }
+        }
         if (inst->dest_local >= 0 && inst->expr) {
             Node *rhs = ir_unwrap_alloc_expr(inst->expr);
 
@@ -4616,35 +4761,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     ir_check_dangling_globals_at_call(zc, ps,
                                                       inst->source_line);
                 }
-                if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR) {
-                    IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
-                    if (h) {
-                        if (h->state == IR_HS_ALIVE &&
-                            inst->dest_local < func->local_count &&
-                            !func->locals[inst->dest_local].is_temp) {
-                            ir_zc_error(zc, inst->source_line,
-                                "handle %%%d overwritten while alive — previous leaked",
-                                inst->dest_local);
-                        }
-                        h->state = IR_HS_ALIVE;
-                        h->alloc_line = inst->source_line;
-                        h->alloc_id = inst->dest_local;
-                        h->source_color = ZC_COLOR_POOL;
-                        /* F3.2: record source-level pool name for
-                         * cross-pool misuse detection at GET/FREE sites
-                         * (handled by ir_check_expr_wrong_pool walker). */
-                        ir_extract_pool_name(rhs, &h->pool_name,
-                                             &h->pool_name_len);
-                    }
-                    break;
-                } else if (mc == IRMC_ARENA_ALLOC) {
-                    IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);
-                    if (h) {
-                        h->state = IR_HS_ALIVE;
-                        h->alloc_line = inst->source_line;
-                        h->alloc_id = inst->dest_local;
-                        h->source_color = ZC_COLOR_ARENA;
-                    }
+                if (mc == IRMC_ALLOC || mc == IRMC_ALLOC_PTR ||
+                    mc == IRMC_ARENA_ALLOC) {
+                    /* BUG-933: shared with the ASSIGN-spelling arm, so the two
+                     * spellings of one allocation cannot drift apart again. */
+                    ir_register_alloc_result(zc, func, ps, rhs, mc,
+                                             inst->dest_local, inst->source_line);
                     break;
                 } else if (mc == IRMC_GET) {
                     /* pool.get(h) — UAF check on h. Argument resolution. */

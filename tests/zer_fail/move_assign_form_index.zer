@@ -1,0 +1,9 @@
+// expect-error: is transferred
+// BUG-920, ARRAY-ELEMENT source.
+move struct Token { u32 id; }
+u32 main() {
+    Token[2] arr; arr[0].id = 1;
+    Token b;
+    b = arr[0];
+    return arr[0].id;
+}

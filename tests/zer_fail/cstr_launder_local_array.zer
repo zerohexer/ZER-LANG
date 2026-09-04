@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot store pointer to local
+// BUG-931: @cstr returns a pointer INTO its args[0], but the escape sink's
+// hand-rolled peel knew only @container and took the LAST arg — the string
+// literal — so a pointer into a local array reached a global unflagged.
+?*u8 gp;
+void publish() {
+    u8[8] buf;
+    const [*]u8 s = "hi";
+    gp = @cstr(buf, s);
+}
+u32 main() { publish(); return 0; }

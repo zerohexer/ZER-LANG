@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot store struct/union literal
+// BUG-931: the struct-literal field scan used a hand-rolled last-arg intrinsic
+// loop with no C-style cast, so `{ .p = (*u32)(&loc) }` stored a stack pointer in
+// a global while the identical `{ .p = &loc }` was rejected.
+struct H { ?*u32 p; }
+H g;
+void c() { u32 loc = 5; g = { .p = (*u32)(&loc) }; }
+u32 main() { c(); return 0; }

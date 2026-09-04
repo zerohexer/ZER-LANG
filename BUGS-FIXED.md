@@ -5,6 +5,81 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-04 — BUG-931: EIGHT partial launder peelers, one question
+
+Survey CLASS 2 (the heap/UAF launder sink, recorded from `lzmkhn` / `fhf8rn` / `1zukjq` /
+`ef9cao`). Eleven reproducers, all measured live on `f08094fc`, all now rejected — and the
+branches' own over-rejection positive `cast_launder_ok`, which main was REFUSING, now
+compiles and runs.
+
+### The shape
+
+One semantic question — **"does this wrapper preserve the value's identity?"** — was
+answered by **eight separate hand-rolled peelers**, each knowing a different subset of the
+carriers. `checker.c` had a complete one (`unwrap_ptr_launder`, intrinsics + the gated
+C-style cast) and it was simply not called at five of the sinks:
+
+| # | site | knew | missed |
+|---|---|---|---|
+| 1 | `zercheck_ir.c` `ir_peel_ref_cast` | typecast | every intrinsic |
+| 2 | `zercheck_ir.c` `ir_peel_cast_wrappers` (7 callers) | 4 intrinsics | typecast, `@cstr` |
+| 3 | `zercheck_ir.c` `ir_find_store_source_local` | intrinsics, `.ptr` | typecast |
+| 4 | `zercheck_ir.c` IR_ASSIGN alias arm | **`"ptrcast"` only** | the other five |
+| 5 | `checker.c` `struct_init_has_local_derived` | last-arg intrinsics | typecast, `@container`/`@cstr` arg |
+| 6 | `checker.c` arena escape check | `@ptrcast`, `@cast` | typecast, `@pun` |
+| 7 | `checker.c` `infer_keep_from_call_args` | last-arg intrinsics | typecast |
+| 8 | `checker.c` the assign-value pre-peel | `@container` | **`@cstr`** |
+
+Because each sink knew a *different* subset, every carrier was correctly rejected somewhere
+and silently accepted somewhere else — which is exactly why single-sink testing never found
+it. `g = @ptrcast(*N,n)` was caught while the byte-identical `g = (*N)n` was not.
+
+### What each one let through (all measured, all zero diagnostics)
+
+- **heap UAF**: `g = (*N)n; free(n); ... return r.v;` — the emitter DELETES that cast, so
+  the emitted C is byte-identical to the form that IS rejected.
+- **UAF + double-free through `@cast`**: and `@cast` is the *mandatory* spelling for a
+  distinct-typedef pointer — the type system refuses a plain init — so the one unreachable
+  carrier at site 4 was the only one a user could write.
+- **keep inference** (two spellings): `g_p = idfn((*u32)p)` and `g_p = (*u32)idfn(p)`. The
+  second skipped the gate *entirely*, because the value root was the cast, not the call.
+- **struct literal**: `g = { .p = (*u32)(&loc) }`.
+- **arena**, four forms including the two-hop `*N b = (*N)a; g = b;` — with a local backing
+  store that is a real stack use-after-return.
+- **`@cstr`**: site 8 peeled to the LAST argument — the *string literal* — instead of the
+  buffer, which is verbatim the failure `unwrap_ptr_launder`'s own comment documents.
+
+### Fix
+
+`zercheck_ir.c`'s three peelers collapse into one, `ir_peel_launder`, which interleaves both
+carrier families in a single loop so a two-hop `(*N)@pun(*N,n)` peels fully. Its intrinsic set
+is an **allowlist**, deliberately kept from `ir_peel_cast_wrappers` rather than mirroring
+`checker.c`'s unconditional last-arg peel: that form would also peel a VALUE-producing
+intrinsic such as `@ptrtoint`, aliasing a `usize` to a pointer's allocation. `checker.c` gets
+away with it because its callers gate on the result type; the key extractor does not. Same
+rule CLAUDE.md states as *"FORMING a reference aliases; READING a value does not."*
+
+The five `checker.c` sites now call `unwrap_ptr_launder`. One extra shape was needed at site
+8: after peeling, `@cstr` yields the **array itself**, not `&elem` — a local array decaying
+to a pointer IS an address-of its first element, and it fell between two rules (this sink
+demanded a `&`; the "local array as slice" rule only fires for a SLICE destination).
+
+Also fixed an **over-rejection**: freeing through a laundered name was reported as a leak of
+the original, because the alias never formed. `tests/zer/cast_launder_ok.zer` (the branches'
+own boundary positive) failed on the pre-fix build and passes now.
+
+### Gate
+
+`tools/sink_matrix.sh` gains **p15b — carrier x sink** (12 cells, 88 -> 100). p15 proved the
+peel at the STACK-escape sinks only; crossing carrier with sink is what makes a per-sink
+subset visible at all. **Verified to fire**: against a pre-fix build the new axis reports
+**9 holes + 1 over-rejection**; post-fix, clean.
+
+Nine negatives in `tests/zer_fail/` (`cast_launder_*`, `arena_launder_*`, `cstr_launder_*`),
+each with `// expect-error:` and each verified to compile clean on the pre-fix compiler.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

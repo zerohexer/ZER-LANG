@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-931: @cast is the MANDATORY spelling to reach a distinct-typedef pointer
+// (the type system refuses a plain init), and it was the one carrier the alias
+// arm did not recognise — it hardcoded "ptrcast".
+struct N { u32 v; }
+distinct typedef *N Pn;
+u32 res;
+void f() {
+    *N n = alloc(N) orelse return;
+    Pn c = @cast(Pn, n);
+    free(n);
+    res = c.v;
+}
+u32 main() { f(); return 0; }

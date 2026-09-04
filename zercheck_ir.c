@@ -1032,25 +1032,10 @@ static IRHandleInfo *ir_arg_view_handle(IRPathState *ps, int arg_local) {
  * sinks intentionally treat a laundered value as untracked, and widening them
  * would change unrelated aliasing decisions. This is used ONLY where the
  * question is "is this expression a VIEW of some allocation?". */
-static Node *ir_peel_cast_wrappers(Node *e) {
-    int guard = 0;
-    while (e && e->kind == NODE_INTRINSIC && e->intrinsic.arg_count > 0 &&
-           guard++ < 32) {
-        const char *n = e->intrinsic.name;
-        uint32_t nl = (uint32_t)e->intrinsic.name_len;
-        if (nl == 9 && memcmp(n, "container", 9) == 0) {
-            e = e->intrinsic.args[0];
-        } else if ((nl == 7 && memcmp(n, "ptrcast", 7) == 0) ||
-                   (nl == 3 && memcmp(n, "pun", 3) == 0) ||
-                   (nl == 7 && memcmp(n, "bitcast", 7) == 0) ||
-                   (nl == 4 && memcmp(n, "cast", 4) == 0)) {
-            e = e->intrinsic.args[e->intrinsic.arg_count - 1];
-        } else {
-            break;   /* not a pointer-preserving cast — stop */
-        }
-    }
-    return e;
-}
+/* BUG-931: ir_peel_cast_wrappers is SUBSUMED by ir_peel_launder (defined below,
+ * beside ir_tynode_is_ref_producing which it needs). Its 7 call sites now get the
+ * C-style-cast carrier too, which is what closed the heap-UAF at those sinks. */
+static Node *ir_peel_launder(Node *v);
 
 /* G5 store-source launder-unwrap: recover the underlying handle-carrying local
  * from a store RHS that was LAUNDERED, so the global-dangle sinks inherit the
@@ -1071,13 +1056,10 @@ static Node *ir_peel_cast_wrappers(Node *e) {
 static int ir_find_store_source_local(IRFunc *func, Node *val) {
     if (!val) return -1;
     if (val->kind == NODE_ORELSE) val = val->orelse.expr;
-    while (val && val->kind == NODE_INTRINSIC && val->intrinsic.arg_count > 0) {
-        if (val->intrinsic.name_len == 9 &&
-            memcmp(val->intrinsic.name, "container", 9) == 0)
-            val = val->intrinsic.args[0];
-        else
-            val = val->intrinsic.args[val->intrinsic.arg_count - 1];
-    }
+    /* BUG-931: was a FOURTH hand-rolled peel that knew intrinsics but not the
+     * C-style cast, so `g = (*N)n` reached this sink untracked while
+     * `g = @ptrcast(*N,n)` did not. Shared peeler now. */
+    val = ir_peel_launder(val);
     if (val && val->kind == NODE_FIELD && val->field.field_name_len == 3 &&
         memcmp(val->field.field_name, "ptr", 3) == 0)
         val = val->field.object;
@@ -1381,10 +1363,54 @@ static bool ir_tynode_is_ref_producing(TypeNode *t) {
  * no leak report. Peeled HERE rather than at each caller so every consumer of the
  * key (free arg, defer-free arg, alloc tracking, alias registration) gains it at
  * once — the same one-query discipline as checker.c's shared peeler. */
-static Node *ir_peel_ref_cast(Node *v) {
-    while (v && v->kind == NODE_TYPECAST &&
-           ir_tynode_is_ref_producing(v->typecast.target_type))
-        v = v->typecast.expr;
+/* BUG-931: the ONE peeler for "does this wrapper preserve the allocation's
+ * identity?".  zercheck_ir.c carried THREE partial peelers and each was missing
+ * precisely what the others had:
+ *
+ *     ir_peel_cast_wrappers      intrinsics (allowlist), NO typecast   7 sites
+ *     ir_peel_ref_cast           typecast only, NO intrinsics          2 sites
+ *     ir_find_store_source_local intrinsics + `.ptr`, NO typecast      1 site
+ *
+ * so `g = (*N)n` walked past the global-store sink while `g = @ptrcast(*N,n)`
+ * was caught, and `@cast(Buf,b)` walked past the alias/free sinks while the
+ * identical `([*]u8)b` was caught.  Both were MEASURED heap use-after-free with
+ * ZERO diagnostics, and the double-free sibling too.  This is the one-question-
+ * many-sites shape CLAUDE.md names as the project's #1 recurring class, and the
+ * prescribed cure is ONE QUERY — so the three collapse to this.
+ *
+ * The intrinsic set is an ALLOWLIST, deliberately kept from ir_peel_cast_wrappers
+ * rather than mirroring checker.c's unconditional "peel the last arg": that form
+ * would also peel a VALUE-producing intrinsic such as @ptrtoint, aliasing a usize
+ * to a pointer's allocation.  checker.c gets away with it because its callers gate
+ * on the result type; the key extractor here does not.  Same rule CLAUDE.md states
+ * as "FORMING a reference aliases; READING a value does not".
+ *
+ * The loop interleaves both carriers, so a two-hop `(*N)@pun(*N, n)` peels fully. */
+static Node *ir_peel_launder(Node *v) {
+    int guard = 0;
+    while (v && guard++ < 32) {
+        Node *prev = v;
+        if (v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
+            const char *n = v->intrinsic.name;
+            uint32_t nl = (uint32_t)v->intrinsic.name_len;
+            /* @container(*T, ptr, field) and @cstr(buf, str) return a pointer
+             * INTO their args[0]; the rest pass the pointer as their LAST arg
+             * (args[0] being the target TYPE). Peeling @cstr to the last arg
+             * reaches the STRING LITERAL, not the caller's buffer. */
+            if ((nl == 9 && memcmp(n, "container", 9) == 0) ||
+                (nl == 4 && memcmp(n, "cstr", 4) == 0))
+                v = v->intrinsic.args[0];
+            else if ((nl == 7 && memcmp(n, "ptrcast", 7) == 0) ||
+                     (nl == 3 && memcmp(n, "pun", 3) == 0) ||
+                     (nl == 7 && memcmp(n, "bitcast", 7) == 0) ||
+                     (nl == 4 && memcmp(n, "cast", 4) == 0))
+                v = v->intrinsic.args[v->intrinsic.arg_count - 1];
+        } else if (v->kind == NODE_TYPECAST &&
+                   ir_tynode_is_ref_producing(v->typecast.target_type)) {
+            v = v->typecast.expr;
+        }
+        if (v == prev) break;   /* not a launder — stop */
+    }
     return v;
 }
 
@@ -1396,7 +1422,7 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, Node *expr,
     *out_path = NULL;
     *out_path_len = 0;
     if (!expr) return -1;
-    expr = ir_peel_ref_cast(expr);   /* BUG-791: casts are identity for allocations */
+    expr = ir_peel_launder(expr);  /* BUG-791/931: launders are identity for allocations */
     if (!expr) return -1;
 
     Node *root = ir_key_root_ident(expr);
@@ -1457,8 +1483,7 @@ static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
     while (arg && guard++ < 32) {
         Node *prev = arg;
         if (arg->kind == NODE_ORELSE) arg = arg->orelse.expr;
-        arg = ir_peel_cast_wrappers(arg);
-        arg = ir_peel_ref_cast(arg);
+        arg = ir_peel_launder(arg);   /* BUG-931: one peeler, both carriers */
         if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
             arg = arg->unary.operand;
         else if (arg && arg->kind == NODE_SLICE)
@@ -3875,7 +3900,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * arms skipped it. Accept either shape. */
             Node *oe = inst->expr;
             if (oe->kind == NODE_ORELSE) oe = oe->orelse.expr;
-            oe = ir_peel_cast_wrappers(oe);
+            oe = ir_peel_launder(oe);
             if (oe && oe->kind == NODE_IDENT) {
                 int o_src = ir_find_local(func, oe->ident.name,
                                           (uint32_t)oe->ident.name_len);
@@ -3944,7 +3969,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
             inst->expr->assign.op == TOK_EQ &&
             inst->expr->assign.value) {
-            Node *rv = ir_peel_cast_wrappers(inst->expr->assign.value);
+            Node *rv = ir_peel_launder(inst->expr->assign.value);
             /* Peel to the root identifier — but ONLY for an expression that
              * actually FORMS A REFERENCE into the allocation.
              *
@@ -4369,11 +4394,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * state if free_ptr is later called on an alias). Needed to
              * propagate cross-function `destroy_cat(opaque)` patterns where
              * the opaque param is ptrcast then freed. */
-            if (rhs && rhs->kind == NODE_INTRINSIC &&
-                rhs->intrinsic.name && rhs->intrinsic.name_len == 7 &&
-                memcmp(rhs->intrinsic.name, "ptrcast", 7) == 0 &&
-                rhs->intrinsic.arg_count >= 1) {
-                Node *src = rhs->intrinsic.args[0];
+            /* BUG-931: this arm hardcoded "ptrcast" — ONE carrier out of six.
+             * `@cast` (the MANDATORY spelling for a distinct-typedef pointer,
+             * since the type system refuses a plain init), `@pun`, `@bitcast`,
+             * `@container`, `@cstr` and the C-style cast all walked past, so the
+             * alias never formed and the allocation was left untracked: measured
+             * heap UAF *and* double-free with zero diagnostics. Routed through
+             * the shared peeler so every carrier lands here, two-hop included. */
+            Node *lsrc = ir_peel_launder(rhs);
+            if (lsrc && lsrc != rhs) {
+                Node *src = lsrc;
                 if (src && src->kind == NODE_IDENT) {
                     int src_local = ir_find_local_exact_first(func,
                         src->ident.name, (uint32_t)src->ident.name_len);
@@ -4419,7 +4449,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             /* 2026-08-06: peel the cast family first — `@ptrcast(*B, &s[0])` is a
              * NODE_INTRINSIC, so without this the whole interior-pointer branch
              * was skipped and the view lost its heap alias (ASan-confirmed). */
-            Node *rhs_pv = ir_peel_cast_wrappers(rhs);
+            Node *rhs_pv = ir_peel_launder(rhs);
             if (rhs_pv && rhs_pv->kind == NODE_UNARY && rhs_pv->unary.op == TOK_AMP) {
                 Node *rhs = rhs_pv;   /* shadow: the peeled view drives this branch */
                 Node *addr_target = rhs->unary.operand;
@@ -6952,7 +6982,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     Node *vexpr = ir_local_def_expr(func, bb, rlocal);
                     if (vexpr && vexpr->kind == NODE_ASSIGN && vexpr->assign.value)
                         vexpr = vexpr->assign.value;
-                    vexpr = ir_peel_cast_wrappers(vexpr);
+                    vexpr = ir_peel_launder(vexpr);
 
                     /* (c2) 2026-08-06 — MULTI-HOP. `*B outer([*]B s){ return
                      * inner(s); }`: the return is a CALL whose callee already has
@@ -6974,7 +7004,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         if (hs && hs->returns_param_color > 0) {
                             int hp = hs->returns_param_color - 1;
                             if (hp >= 0 && hp < vexpr->call.arg_count) {
-                                vexpr = ir_peel_cast_wrappers(vexpr->call.args[hp]);
+                                vexpr = ir_peel_launder(vexpr->call.args[hp]);
                                 /* After substitution the expression is whatever
                                  * WE handed the callee. If that is a bare param
                                  * ident, the chain is an IDENTITY view of our own
@@ -7066,7 +7096,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             if (ir_find_local_exact_first(func, tr->ident.name,
                                     (uint32_t)tr->ident.name_len) != rlocal) continue;
                             /* the stored value must be a VIEW of a param */
-                            Node *sv = ir_peel_cast_wrappers(e->assign.value);
+                            Node *sv = ir_peel_launder(e->assign.value);
                             if (!sv || !((sv->kind == NODE_UNARY && sv->unary.op == TOK_AMP) ||
                                          sv->kind == NODE_SLICE)) continue;
                             int speel = 0;

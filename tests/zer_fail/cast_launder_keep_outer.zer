@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy
+// BUG-931: sibling of cast_launder_keep_inference with the cast OUTSIDE the call —
+// the value root was the cast node, not the call, so the whole gate was skipped.
+?*u32 g_p;
+*u32 idfn(*u32 p) { return p; }
+void stash(*u32 p) { g_p = (*u32)idfn(p); }
+u32 main() { u32 loc = 5; stash(&loc); return 0; }

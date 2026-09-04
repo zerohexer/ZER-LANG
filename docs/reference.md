@@ -2020,6 +2020,12 @@ type confusion before any memory read.
   right tool for byte-level data.
 - For direct `(*T)src` where types match (identity), no `@pun` needed —
   the compiler allows the cast directly with zero overhead.
+- A cast is **transparent to lifetime and ownership**. `(*T)p`, `@pun`,
+  `@ptrcast`, `@cast`, `@container` and `@cstr` all name the SAME object as
+  their source, so the escape, arena, `keep` and use-after-free rules see
+  straight through them. Writing a cast to quiet a lifetime error will not
+  work — and should not: the emitted C for an identity cast is byte-identical
+  to the code without it.
 
 **WHEN TO USE**
 - You have a `*T` and genuinely need to view its bits as `*U` (different

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use of freed handle
+// BUG-931: a C-style cast is an IDENTITY cast the emitter deletes entirely, so
+// `g = (*N)n` is byte-identical to `g = n` in the emitted C — but only the latter
+// was tracked, so the free never linked to the later read through the global.
+struct N { u32 v; }
+?*N g;
+u32 main() {
+    *N n = alloc(N) orelse { return 1; };
+    n.v = 7;
+    g = (*N)n;
+    free(n);
+    *N r = g orelse { return 2; };
+    return r.v;
+}

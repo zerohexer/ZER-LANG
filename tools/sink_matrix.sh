@@ -188,6 +188,29 @@ cell p15_safe_value_cast    compile 'u32 gv15=0; void c(){ u32 x=5; gv15=(u32)x;
 cell p15_safe_orelse_global compile 'u32 gd15b=1; ?*u32 mk15b(){return null;} void c(){ g_p=mk15b() orelse &gd15b; } u32 main(){c();return 0;}'
 cell p15_safe_cast_global   compile 'u32 gd15c=1; void c(){ g_p=(*u32)(&gd15c); } u32 main(){c();return 0;}'
 
+# p15b — THE SAME QUESTION AT THE HEAP / ALLOCATION-IDENTITY SINK (2026-09-04, BUG-931).
+# p15 above proved the peel at the STACK-ESCAPE sinks. It did not cover the sink that
+# asks "which allocation is this?", and zercheck_ir.c answered that with THREE partial
+# peelers (typecast-only, intrinsics-only, intrinsics+.ptr) while checker.c had FOUR MORE
+# hand-rolled ones. Each knew a different subset, so every carrier was caught at some
+# sinks and invisible at others. Crossing CARRIER x SINK is what makes that visible:
+# a cell missing here is a hole that no single-sink test can see.
+echo "===== SHAPE p15b = launder carriers at the HEAP / arena / keep sinks ====="
+cell p15b_heap_cast_glob     reject 'struct N9{u32 v;} ?*N9 gh9; u32 main(){ *N9 n=alloc(N9) orelse {return 1;}; gh9=(*N9)n; free(n); *N9 r=gh9 orelse {return 2;}; return r.v; }'
+cell p15b_heap_cast_dfree    reject 'struct N9{u32 v;} u32 main(){ *N9 n=alloc(N9) orelse {return 1;}; free((*N9)n); free(n); return 0; }'
+cell p15b_heap_distinct_uaf  reject 'struct N9{u32 v;} distinct typedef *N9 Pn9; u32 r9; void f(){ *N9 n=alloc(N9) orelse return; Pn9 c=@cast(Pn9,n); free(n); r9=c.v; } u32 main(){f();return 0;}'
+cell p15b_heap_distinct_dfree reject 'struct N9{u32 v;} distinct typedef *N9 Pn9; void f(){ *N9 n=alloc(N9) orelse return; Pn9 c=@cast(Pn9,n); free(c); free(n); } u32 main(){f();return 0;}'
+cell p15b_keep_inner_cast    reject '*u32 idf9(*u32 p){return p;} void st9(*u32 p){ g_p=idf9((*u32)p); } u32 main(){ u32 l=5; st9(&l); return 0; }'
+cell p15b_keep_outer_cast    reject '*u32 idf9(*u32 p){return p;} void st9(*u32 p){ g_p=(*u32)idf9(p); } u32 main(){ u32 l=5; st9(&l); return 0; }'
+cell p15b_structlit_cast     reject 'struct H9{?*u32 p;} H9 gh9b; void c(){ u32 l=5; gh9b={.p=(*u32)(&l)}; } u32 main(){c();return 0;}'
+cell p15b_arena_ccast        reject 'struct N9{u32 v;} ?*N9 ga9; void c(){ u8[256] bk; Arena a9=Arena.over(bk); *N9 x=a9.alloc(N9) orelse return; ga9=(*N9)x; } u32 main(){c();return 0;}'
+cell p15b_arena_twohop       reject 'struct N9{u32 v;} ?*N9 ga9b; void c(){ u8[256] bk; Arena a9=Arena.over(bk); *N9 x=a9.alloc(N9) orelse return; *N9 y=(*N9)x; ga9b=y; } u32 main(){c();return 0;}'
+cell p15b_cstr_local_array   reject '?*u8 gc9; void c(){ u8[8] b; const [*]u8 s="hi"; gc9=@cstr(b,s); } u32 main(){c();return 0;}'
+# BOUNDARY: the peel must not turn a legitimate single free through a laundered name
+# into a leak report, and a launder of GLOBAL storage stays legal at every sink.
+cell p15b_safe_free_once     compile 'distinct typedef [*]u8 Buf9; u32 r9b; void f(){ [*]u8 b=alloc(u8,4) orelse return; b[0]=7; Buf9 c=@cast(Buf9,b); r9b=(u32)c[0]; free(c); } u32 main(){f(); if(r9b!=7){return 2;} return 0;}'
+cell p15b_safe_cstr_global   compile 'u8[8] gb9; ?*u8 gc9b; void c(){ const [*]u8 s="hi"; gc9b=@cstr(gb9,s); } u32 main(){c();return 0;}'
+
 # ---------------------------------------------------------------------------
 # SHAPE p16 (BUG-803): an ARENA-derived pointer is the SECOND lifetime this
 # matrix must track, and until 2026-08-18 only the first one (a stack local) was

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot store arena-derived pointer
+// BUG-931: the arena escape check had a hand-rolled peel knowing only @ptrcast and
+// @cast, so a C-style cast laundered an arena pointer into a global. With a local
+// backing store that is a real stack use-after-return.
+struct N { u32 v; }
+?*N g;
+void stash() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N a = ar.alloc(N) orelse return;
+    g = (*N)a;
+}
+u32 main() { stash(); return 0; }

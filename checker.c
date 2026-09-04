@@ -2143,10 +2143,13 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (struct_init_has_local_derived(c, fv)) return true;
             continue;
         }
-        /* unwrap intrinsic chains (mirror the direct case) */
-        Node *fu = fv;
-        while (fu && fu->kind == NODE_INTRINSIC && fu->intrinsic.arg_count > 0)
-            fu = fu->intrinsic.args[fu->intrinsic.arg_count - 1];
+        /* BUG-931: was a hand-rolled last-arg intrinsic loop — the exact shape
+         * call_has_nonkeep_derived_arg's comment warns against. It knew nothing
+         * of the C-style cast, so `g = { .p = (*u32)(&loc) }` stored a stack
+         * pointer into a global while the identical `{ .p = &loc }` was rejected,
+         * and it peeled @container/@cstr to the WRONG argument. Shared peeler. */
+        Node *fu = unwrap_ptr_launder(fv);
+        fv = fu;   /* Case B below must see the peeled node too */
         /* Case A: &local — direct address-of */
         if (fu && fu->kind == NODE_UNARY && fu->unary.op == TOK_AMP) {
             Node *root = fu->unary.operand;
@@ -2288,9 +2291,12 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
         /* skip positions the callee provably never returns (no result-launder there) */
         bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
         if (!may_return_i) continue;
-        Node *arg = call->call.args[i];
-        while (arg && arg->kind == NODE_INTRINSIC && arg->intrinsic.arg_count > 0)
-            arg = arg->intrinsic.args[arg->intrinsic.arg_count - 1];
+        /* BUG-931: was a hand-rolled last-arg loop — no C-style cast, and it
+         * peeled @container/@cstr to the WRONG argument. `g_p = idfn((*u32)p)`
+         * therefore recorded the launder but never inferred keep on p, so the
+         * call site `stash(&loc)` was accepted: a stack pointer reached a global
+         * one indirection away. Shared peeler. */
+        Node *arg = unwrap_ptr_launder(call->call.args[i]);
         /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
          * descent — without it, `g = idfn(np[0..16])` records the launder but
          * skips keep inference (no propagation to np's root param). */
@@ -6539,15 +6545,12 @@ static Type *check_expr(Checker *c, Node *node) {
          * Fix: for @container specifically, take args[0] (the pointer);
          * everything else continues to use the last-arg unwrap. */
         {
-            Node *aval = node->assign.value;
-            while (aval && aval->kind == NODE_INTRINSIC && aval->intrinsic.arg_count > 0) {
-                const char *iname = aval->intrinsic.name;
-                size_t inlen = aval->intrinsic.name_len;
-                if (inlen == 9 && memcmp(iname, "container", 9) == 0)
-                    aval = aval->intrinsic.args[0];
-                else
-                    aval = aval->intrinsic.args[aval->intrinsic.arg_count - 1];
-            }
+            /* BUG-931: this pre-peel knew @container but NOT @cstr, so
+             * `gp = @cstr(buf, s)` peeled to the LAST arg — the STRING LITERAL —
+             * instead of the caller's buffer, and a pointer into a local array
+             * reached a global unflagged. That is verbatim the failure the shared
+             * peeler's own comment documents; this site simply never called it. */
+            Node *aval = unwrap_ptr_launder(node->assign.value);
             /* AUDIT 2026-06-12: walk &(...) through NODE_FIELD / NODE_INDEX to
              * the root ident so `&local.field` / `&local.field.sub` / `&local[k]`
              * are detected (previously only bare `&local` was caught). The
@@ -6588,12 +6591,42 @@ static Type *check_expr(Checker *c, Node *node) {
             Node *avalu = unwrap_ptr_launder(aval);
             Node *opv = (avalu && avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP)
                         ? avalu->unary.operand : NULL;
+            /* BUG-931: a launder can yield the ARRAY ITSELF rather than `&elem`.
+             * `@cstr(buf, s)` returns a pointer INTO buf, so after the peel the
+             * value is a bare array ident — the same store as `gp = &buf[0]`, and
+             * it fell between two rules: this one demanded a `&`, and the
+             * "local array as slice" rule only fires for a SLICE destination.
+             * A local array decaying to a pointer IS an address-of its first
+             * element, so it belongs to this sink. */
+            bool decayed_local_array = false;
+            if (!opv && avalu && avalu->kind == NODE_IDENT) {
+                /* The decay only happens when the DESTINATION is a pointer. Between
+                 * two arrays (`volatile u8[4] hw; hw = src;`) this is a VALUE COPY of
+                 * the contents and nothing escapes — rejecting it broke test_emit's
+                 * BUG-273 volatile byte-loop case, which is why the gate is here. */
+                Type *tt = typemap_get(c, node->assign.target);
+                TypeKind tk = tt ? type_dispatch_kind(tt) : TYPE_VOID;
+                bool tgt_is_ptr = (tk == TYPE_POINTER || tk == TYPE_OPAQUE);
+                if (tk == TYPE_OPTIONAL) {
+                    Type *ti = type_unwrap_optional(tt);
+                    TypeKind ik = ti ? type_dispatch_kind(ti) : TYPE_VOID;
+                    tgt_is_ptr = (ik == TYPE_POINTER || ik == TYPE_OPAQUE);
+                }
+                Symbol *asym = scope_lookup(c->current_scope,
+                    avalu->ident.name, (uint32_t)avalu->ident.name_len);
+                if (tgt_is_ptr && asym && asym->type &&
+                    type_dispatch_kind(asym->type) == TYPE_ARRAY) {
+                    opv = avalu;
+                    decayed_local_array = true;
+                }
+            }
             while (opv && (opv->kind == NODE_FIELD || opv->kind == NODE_INDEX)) {
                 opv = (opv->kind == NODE_FIELD) ? opv->field.object
                                                 : opv->index_expr.object;
             }
             if (node->assign.op == TOK_EQ && avalu &&
-                avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP &&
+                (decayed_local_array ||
+                 (avalu->kind == NODE_UNARY && avalu->unary.op == TOK_AMP)) &&
                 opv && opv->kind == NODE_IDENT) {
                 Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
                 classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
@@ -7121,10 +7154,16 @@ static Type *check_expr(Checker *c, Node *node) {
              * returning ?[*]u8) — the old pointer/slice-only gate left silent
              * stack-UAFs. Scalars stay false → unaffected. */
             type_carries_data_pointer(value, 0)) {
-            Node *vroot = node->assign.value;
+            /* BUG-931: peel launders BEFORE the field/index descent. With an
+             * OUTER cast (`g = (*u32)idfn(p)`) vroot was the NODE_TYPECAST and
+             * not the NODE_CALL, so this keep-inference gate was skipped whole
+             * and the call site accepted `stash(&loc)` — a stack pointer into a
+             * global, one indirection away. */
+            Node *vroot = unwrap_ptr_launder(node->assign.value);
             while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
                 if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
                 else vroot = vroot->index_expr.object;
+                vroot = unwrap_ptr_launder(vroot);
             }
             if (vroot && vroot->kind == NODE_CALL &&
                 call_has_nonkeep_derived_arg(c, vroot, 0)) {
@@ -7374,19 +7413,12 @@ static Type *check_expr(Checker *c, Node *node) {
             /* SILENT-GAP FIX: arena escape check missed @ptrcast laundering.
              * `g_ptr = @ptrcast(*u32, arena_ptr);` bypassed the escape check
              * because the assignment value was NODE_INTRINSIC, not NODE_IDENT.
-             * Unwrap @ptrcast (and @cast) to inspect the underlying ident. */
-            Node *value_root = node->assign.value;
-            if (value_root && value_root->kind == NODE_INTRINSIC &&
-                value_root->intrinsic.name_len == 7 &&
-                memcmp(value_root->intrinsic.name, "ptrcast", 7) == 0 &&
-                value_root->intrinsic.arg_count >= 1) {
-                value_root = value_root->intrinsic.args[0];
-            } else if (value_root && value_root->kind == NODE_INTRINSIC &&
-                       value_root->intrinsic.name_len == 4 &&
-                       memcmp(value_root->intrinsic.name, "cast", 4) == 0 &&
-                       value_root->intrinsic.arg_count >= 1) {
-                value_root = value_root->intrinsic.args[0];
-            }
+             * BUG-931: the fix for that was a hand-rolled two-branch peel that
+             * knew ONLY @ptrcast and @cast, so `g = (*N)a`, `g = @pun(*N,a)` and
+             * the two-hop `*N b = (*N)a; g = b;` still laundered an arena pointer
+             * into a global — a real stack UAF once the backing store is a local.
+             * Shared peeler: every carrier, and it composes. */
+            Node *value_root = unwrap_ptr_launder(node->assign.value);
         if (value_root &&
             value_root->kind == NODE_IDENT) {
             Symbol *val_sym = scope_lookup(c->current_scope,
@@ -14293,6 +14325,16 @@ static void check_stmt(Checker *c, Node *node) {
                                              memcmp(init_root->intrinsic.name, "container", 9) == 0)
                                     ? init_root->intrinsic.args[0]
                                     : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+                            /* BUG-931: the C-style cast was the ONE carrier this
+                             * chain-unwrap never knew, so `*N b = (*N)a; g = b;`
+                             * dropped a's arena/local taint at the var-decl and the
+                             * two-hop launder reached the global unflagged. Gated on
+                             * the target being reference-producing, exactly as the
+                             * shared peeler gates it — a VALUE cast makes a new
+                             * value and must NOT inherit the source's provenance. */
+                            else if (init_root->kind == NODE_TYPECAST &&
+                                     tynode_is_reference_producing(init_root->typecast.target_type))
+                                init_root = init_root->typecast.expr;
                             /* walk into & — &x root is x */
                             else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
                                 init_root = init_root->unary.operand;

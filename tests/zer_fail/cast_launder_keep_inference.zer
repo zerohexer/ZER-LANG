@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy
+// BUG-931: keep inference walked the call's args with a hand-rolled peel that had
+// no C-style cast, so p was never inferred keep and this call site was accepted —
+// a stack pointer reaching a global one indirection away.
+?*u32 g_p;
+*u32 idfn(*u32 p) { return p; }
+void stash(*u32 p) { g_p = idfn((*u32)p); }
+u32 main() { u32 loc = 5; stash(&loc); return 0; }

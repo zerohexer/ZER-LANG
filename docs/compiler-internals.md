@@ -12359,6 +12359,86 @@ having all five consume it is the durable fix. See `docs/unified-oracle-proved-Z
 
 ---
 
+## The LAUNDER class — one question, SEVEN carriers x TWO FILES (BUG-791 / BUG-931)
+
+Companion to the funcptr REACH section below: same multi-site shape, different axis. Worth
+reading together — REACH crosses FORM x SINK, this one crosses **CARRIER x SINK**, and the
+second axis is the one that hid the bug for the entire life of C-style casts.
+
+### The question
+
+*"Does this wrapper preserve the value's identity?"* Two identities, asked in two files:
+
+| file | identity | consumers |
+|---|---|---|
+| `checker.c` | **provenance** — is this value frame-bound (local / arena)? | escape sinks, `keep` inference |
+| `zercheck_ir.c` | **allocation** — which `alloc` is this? | UAF, double-free, leak |
+
+They are ONE question. A carrier that hides a local from `checker.c` hides an allocation
+from `zercheck_ir.c` for the same reason, and both were fixed by the same peel.
+
+### The carriers
+
+`(*T)x` · `@ptrcast` · `@pun` · `@bitcast` · `@cast` · `@container` · `@cstr`
+
+Two argument conventions, and getting them wrong is a *silent* miss rather than an error:
+`@container(*T, ptr, field)` and `@cstr(buf, str)` carry the pointer in **args[0]**;
+everything else carries it as the **LAST** arg (args[0] being the target TYPE). A hand-rolled
+last-arg loop applied to `@cstr` peels to the STRING LITERAL, not the caller's buffer.
+
+### Why it stayed open so long
+
+BUG-931 found **eight** hand-rolled peelers. Not one missing peel — eight peelers each
+knowing a DIFFERENT SUBSET:
+
+| site | knew | missed |
+|---|---|---|
+| `ir_peel_ref_cast` | typecast | every intrinsic |
+| `ir_peel_cast_wrappers` (7 callers) | 4 intrinsics | typecast, `@cstr` |
+| `ir_find_store_source_local` | intrinsics, `.ptr` | typecast |
+| IR_ASSIGN alias arm | **`"ptrcast"` literal** | the other six |
+| `struct_init_has_local_derived` | last-arg intrinsics | typecast, both args[0] cases |
+| arena escape check | `@ptrcast`, `@cast` | typecast, `@pun` |
+| `infer_keep_from_call_args` | last-arg intrinsics | typecast |
+| the assign-value pre-peel | `@container` | **`@cstr`** |
+
+**Every carrier was therefore rejected at SOME sinks and accepted at others.** That is why
+per-sink testing could not find it, and why `g = @ptrcast(*N,n)` was caught while the
+byte-identical `g = (*N)n` was not — the emitter DELETES an identity cast, so the emitted C
+of the accepted program equals that of the rejected one.
+
+### The rule
+
+**Call the shared peeler. Never write a ninth.** `checker.c` → `unwrap_ptr_launder`;
+`zercheck_ir.c` → `ir_peel_launder`. When you add a carrier, add it to those two and add its
+`p15b` cells in the SAME commit.
+
+Three constraints that are NOT obvious and cost measurements to establish:
+
+1. **`zercheck_ir`'s intrinsic set is an ALLOWLIST, `checker.c`'s is not — deliberately.**
+   `checker.c` peels the last arg of ANY intrinsic and gets away with it because its callers
+   gate on the RESULT type. The allocation-key extractor does not, so peeling `@ptrtoint`
+   would alias a `usize` to a pointer's allocation. This is the file-level form of the
+   standing rule *"FORMING a reference aliases; READING a value does not."*
+2. **`orelse` is a JOIN, not a carrier.** It collapses to TWO nodes; peeling to the primary
+   silently drops the fallback arm. It needs the predicate `value_frame_bound_symbol`.
+3. **A peel that yields a bare ARRAY is a decay only when the DESTINATION is a pointer.**
+   `@cstr(buf, s)` peels to `buf` itself, and a local array decaying to a pointer IS an
+   address-of its first element — but between two arrays (`volatile u8[4] hw; hw = src;`) the
+   same shape is a VALUE COPY and nothing escapes. Ungated, that over-rejection broke
+   `test_emit.c`'s BUG-273 volatile byte-loop case.
+
+### The gate
+
+`tools/sink_matrix.sh`: **p15** (launder x stack-escape sinks, BUG-791) and **p15b**
+(carrier x heap/arena/keep sinks, BUG-931). Both verified to FIRE against a pre-fix build —
+p15b reports 9 holes + 1 over-rejection there, clean after. A launder cell that only ever
+passed would be a script, not a net.
+
+One measurement worth keeping: the fix also CLOSED an over-rejection. Freeing through a
+laundered name (`Buf c = @cast(Buf, b); free(c);`) was reported as a leak of `b`, because the
+alias never formed. Missing identity cuts both ways — it loses frees as well as uses.
+
 ## The funcptr REACH class — one question, NINE forms x TWO sinks (2026-08-06/10)
 
 Canonical worked example of the multi-site class, and the clearest evidence for why a GRID

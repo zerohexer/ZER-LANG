@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-931: the double-free sibling of cast_launder_distinct_uaf — freeing through
+// the laundered name and then the original must not be two separate allocations.
+struct N { u32 v; }
+distinct typedef *N Pn;
+void f() {
+    *N n = alloc(N) orelse return;
+    Pn c = @cast(Pn, n);
+    free(c);
+    free(n);
+}
+u32 main() { f(); return 0; }

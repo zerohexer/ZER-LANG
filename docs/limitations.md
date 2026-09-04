@@ -282,6 +282,36 @@ value-flow sites, not another per-door patch.
 
 ---
 
+### ~~CLASS 2 — CAST/LAUNDER AT THE **HEAP / UAF** SINK~~ — **CLOSED 2026-09-04 as BUG-931, DO NOT REDO**
+
+> **All eleven recorded forms (2a–2g) now reject; measured.** The cause was NOT a missing
+> peel but **EIGHT separate hand-rolled peelers**, each knowing a different subset of the
+> carriers — so every carrier was rejected at some sinks and silently accepted at others,
+> which is why no single-sink test found it. `checker.c` already had a complete peeler
+> (`unwrap_ptr_launder`); five sinks simply never called it, and `zercheck_ir.c` had three
+> partial ones of its own plus an alias arm hardcoded to `"ptrcast"`.
+>
+> **Landed:** `zercheck_ir.c`'s three peelers collapse into one `ir_peel_launder`
+> (allowlist-based, so a VALUE-producing intrinsic like `@ptrtoint` is NOT peeled); the
+> five `checker.c` sites call `unwrap_ptr_launder`; one new shape at the assign-value sink
+> (a launder can yield the ARRAY ITSELF, gated on a POINTER destination — between two
+> arrays it is a value copy, see trap below).
+>
+> **Also closed an OVER-REJECTION:** freeing through a laundered name was reported as a
+> leak of the original. `tests/zer/cast_launder_ok.zer` (the branches' own boundary
+> positive) failed pre-fix and passes now.
+>
+> **Gate:** `tools/sink_matrix.sh` **p15b — carrier x sink**, 12 cells (88 -> 100),
+> verified to fire (9 holes + 1 over-rejection against a pre-fix build). Nine negatives in
+> `tests/zer_fail/`, each with `// expect-error:` and each verified accepted pre-fix.
+>
+> **Trap paid for here:** the first version of the array-decay shape rejected
+> `volatile u8[4] hw; hw = src;` — a whole-array VALUE COPY, not a pointer store. Caught by
+> `test_emit.c`'s BUG-273 case. Any future widening of that shape must keep the
+> pointer-destination gate.
+
+<details><summary>original entry (kept for the reproducers)</summary>
+
 ### CLASS 2 — CAST/LAUNDER AT THE **HEAP / UAF** SINK (CRITICAL, accept-unsafe)
 
 **This is NOT the class closed by BUG-791.** BUG-791 peeled launders at the STACK
@@ -372,6 +402,8 @@ limitations.md records "CLOSED 2026-08-31 (BUG-920) — the hand-rolled peel sit
 live holes", which is the same conclusion from the other side.
 
 ---
+
+</details>
 
 ### CLASS 3 — LOOP COUNTER PAST END / OFF BY ONE (HIGH, silent OOB) — `v7pucv`
 

@@ -30,6 +30,118 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — BRANCH `loving-davinci-r3an9y` (2026-09-04): 12 holes, 35 live negatives
+
+Surveyed 2026-09-04, measured against main at `225a5b9d`. A DIFFERENT branch family
+from the `vigilant-tesla-*` set above, but it forked at the SAME base (`c8e58304`),
+so **its BUG-913..924 collide with all eight of theirs** — renumber on adoption.
+
+    git show origin/claude/loving-davinci-r3an9y:tests/zer_fail/<name>.zer
+
+One commit, `df4e51ee`, unusually well documented — read its commit body before
+starting, it names the fix mechanism for each. 48 test files extracted; 35 of its
+negatives are LIVE on main. Several classes here appear in NO other branch.
+
+### Directly extends work already landed — take these first
+
+**A. Enum auto-zero is a SEVENTH forging door (their BUG-917).** BUG-927/928/929
+closed literal, arithmetic, `@ptrcast`, and added `@try_enum`. This one is upstream
+of all of them: ZER's auto-zero guarantee gives every variable 0, and an enum whose
+variants do not include 0 is therefore born invalid.
+
+    enum E { a = 1, b = 2 }
+    u32 main() { E e; switch (e) { .a => { return 1; } .b => { return 2; } } return 3; }
+    // MEASURED: runs, exits 2 — took the `.b` arm for a value of 0
+
+Their fix: a consumer-side `enum_nonvariant_trap` at BOTH emitter paths plus a
+declaration rule for the bare-uninitialised door. That is TRACKING (trap), which is
+right here — unlike a literal, the author wrote nothing to reject.
+
+**B. Packed-struct ARRAY field, four more doors (their BUG-922).** BUG-786 covered a
+deref through `&packed.field`. An ARRAY field of a packed struct escapes the
+alignment rule at four further doors — slice, coercion, call-arg and `&elem`:
+
+    packed struct P { u8 a; u32[2] w; }
+    u32 main() { P p; [*]u32 s = p.w[0..]; s[0] = 1; return p.w[0] - 1; }
+    // MEASURED: 0 diagnostics
+
+Their mechanism: `value_flows_to` takes the Checker, plus `packed_array_field_view`.
+Note that changes the signature of the query BUG-842 introduced and BUG-927 extended
+— reconcile rather than duplicating it.
+
+### Classes that appear in NO other branch
+
+**C. A slice's `.ptr` / `.len` are ASSIGNABLE (their BUG-920) — HIGH, defeats bounds.**
+
+    u32 main() { u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1; return 0; }
+
+The slice header is the whole basis of `[*]T` bounds safety; if `.len` is writable the
+guarantee is forgeable in one line. 3 tests: `slice_len_assign_forge`,
+`slice_ptr_assign_forge`, `slice_len_addr_forge`.
+
+**D. Unique-resource COPY-BY-VALUE (their BUG-916) — 8 tests.** `Arena`, `Barrier`
+and `Semaphore` alias their state when copied:
+
+    u8[64] buf; Arena a = Arena.over(buf);
+    Arena b = a;                    // two Arenas over one backing store
+    *T x = a.alloc(T) orelse return;
+    *T y = b.alloc(T) orelse return;   // may return the SAME slot
+
+Doors: plain copy, by-value param, return, orelse fallback, a struct CARRYING one,
+and a struct-init field. Their fix is one predicate `type_unique_resource_name` +
+`check_unique_resource_copy` at every value-flow site — the one-query shape.
+
+**E. STATIC LOCALS are invisible to the spawn race scan AND the ISR check (BUG-915).**
+
+    void w() { static u32 c = 0; c += 1; }
+    u32 main() { spawn w(); spawn w(); return 0; }
+
+A static local has global lifetime but is not in the global scope, so neither sink
+sees it. 3 tests, both sinks. Their fix: a scan-scoped static table + `IsrGlobal`
+keyed by declaration.
+
+**F. Scoped-spawn borrow only ever covered a literal `&v` (their BUG-924) — 6 tests.**
+A pointer local, a struct carrier, a slice view, a param and a threadlocal alias all
+lend nothing, so the parent can race the child:
+
+    void w(*u32 p) { *p = 5; }
+    u32 main() { u32 v = 0; *u32 q = &v; ThreadHandle th = spawn w(q);
+                 v = 3; th.join(); return v; }
+
+Their fix: `Symbol.borrow_root` recorded at the declaration sites, one sink
+`scoped_spawn_borrow` for both spellings, unknown root REJECTED.
+
+**G. Views into a pool/slab slot escape UAF tracking (their BUG-919) — 5 tests.**
+
+    Handle(T) h = p.alloc() orelse return;
+    *u32 q = &p.get(h).v;
+    p.free(h);
+    *q = 7;                          // UAF, accepted
+
+Forms: `pool_get_field_addr_uaf`, `_index_addr_uaf`, `_field_slice_uaf`,
+`pool_get_field_addr_keep_stash`, `slab_get_field_addr_uaf`, plus
+`handle_field_slice_uaf`. Their fix: `ir_view_root_handle` + `pool_get_handle_root`
+at the keep sink.
+
+**H. `spawn w(a.x + b.y)` reads the second shared struct UNLOCKED (their BUG-914).**
+Adjacent to BUG-795 (the callee-position walk) but a different sink: per-ARGUMENT
+shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
+
+**I. Bare `orelse return` in a non-null-pointer or funcptr function (their BUG-918).**
+Returned NULL as a non-null pointer, and produced a GCC error for slice/struct
+returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
+
+### Their remaining three (no live negative here; verify before adopting)
+
+- **BUG-913** an if-unwrap capture overwrote a same-named outer local
+- **BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration
+- **BUG-923** a bit-slice write on a `uN` value did not compile
+
+### Suggested order for this branch
+
+A (completes the enum class just closed) → C (one line forges any bound) →
+G and F (both accept-unsafe, both concurrency/UAF) → D → E → B → H → I.
+
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed
 
 **Read this section ALONE and you can start work. Nothing here needs re-deriving.**

@@ -1257,6 +1257,41 @@ static bool enum_operand_in_value_op(Type *a, Type *b) {
     return false;
 }
 
+/* BUG-930 (adopted from branch loving-davinci-r3an9y, their BUG-917): ZER's
+ * auto-zero guarantee and an enum whose variants do not include 0 are in direct
+ * conflict — the variable is born holding a value outside its own type.
+ *
+ *     enum E { a = 1, b = 2 }
+ *     u32 main() { E e; switch (e) { .a => {...} .b => {...} } }
+ *
+ * Measured before the fix: this RAN and took the `.b` arm for a value of 0. It is
+ * the SEVENTH forging door, and the only one upstream of every other: BUG-927
+ * closed the literal, BUG-928 arithmetic and @ptrcast, BUG-929 added the checked
+ * route — and none of them apply, because the author wrote no conversion at all.
+ *
+ * Closed at the DECLARATION rather than by a guard, because unlike the runtime
+ * doors there is a one-line restructure available and the compiler knows at
+ * compile time that it is needed. The diagnostic names it. */
+static void enum_no_zero_variant_init_check(Checker *c, int line, Type *type,
+                                            const char *name, uint32_t name_len) {
+    if (!type) return;
+    Type *eff = type_unwrap_distinct(type);
+    if (!eff || type_dispatch_kind(eff) != TYPE_ENUM) return;
+    if (eff->enum_type.variant_count == 0) return;
+    for (uint32_t i = 0; i < eff->enum_type.variant_count; i++)
+        if (eff->enum_type.variants[i].value == 0) return;
+    checker_error(c, line,
+        "enum '%.*s' has no variant with value 0, so the auto-zeroed '%.*s' would "
+        "hold a value outside its variant set (an exhaustive switch on it would "
+        "take an arbitrary arm). Initialize it: '%.*s %.*s = %.*s.%.*s;'",
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)name_len, name,
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)name_len, name,
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)eff->enum_type.variants[0].name_len, eff->enum_type.variants[0].name);
+}
+
 /* BUG-927: an integer literal is NOT a route to an enum value.
  *
  * `zer_type_kind_is_integer` answers TRUE for ZER_TK_ENUM (enums are
@@ -13908,6 +13943,12 @@ static void check_stmt(Checker *c, Node *node) {
                     "use '?*%s' for nullable pointers",
                     type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
+            /* BUG-930: same "auto-zero is not a value of this type" question for a
+             * bare enum with no zero-valued variant. One query, both declaration
+             * sites, placed beside its sibling rule. */
+            enum_no_zero_variant_init_check(c, node->loc.line, type,
+                                            node->var_decl.name,
+                                            (uint32_t)node->var_decl.name_len);
         }
 
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
@@ -18735,6 +18776,12 @@ static void register_decl(Checker *c, Node *node) {
                     "use '?*%s' for nullable pointers",
                     type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
+            /* BUG-930: same "auto-zero is not a value of this type" question for a
+             * bare enum with no zero-valued variant. One query, both declaration
+             * sites, placed beside its sibling rule. */
+            enum_no_zero_variant_init_check(c, node->loc.line, type,
+                                            node->var_decl.name,
+                                            (uint32_t)node->var_decl.name_len);
         }
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,

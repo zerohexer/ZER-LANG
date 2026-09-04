@@ -1,0 +1,17 @@
+// BUG-930 boundary: the rule fires ONLY when the enum has no variant with value 0.
+// An enum whose first variant is 0 auto-zeroes to a real variant and is untouched;
+// an enum without one is fine as soon as it is initialized.
+enum HasZero { red, green, blue }
+enum NoZero { a = 1, b = 2 }
+struct S { HasZero h; }
+u32 main() {
+    HasZero z;                  // auto-zero IS .red — allowed
+    NoZero n = NoZero.a;        // initialized — allowed
+    S s;                        // field auto-zeroes to .red — allowed
+    u32 t = 0;
+    switch (z) { .red => { t += 1; } .green => { } .blue => { } }
+    switch (n) { .a => { t += 2; } .b => { } }
+    switch (s.h) { .red => { t += 4; } .green => { } .blue => { } }
+    if (t == 7) { return 0; }
+    return t;
+}

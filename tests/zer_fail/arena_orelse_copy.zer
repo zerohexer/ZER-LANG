@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916 (2026-09-04): an `orelse` is a JOIN — its fallback can hand over an
+// EXISTING arena by value just as a plain `Arena b = a;` does, and the copy would
+// alias the original's buffer. The copy check descends both arms.
+u8[64] buf;
+Arena a;
+u32 main() {
+    a = Arena.over(buf);
+    ?Arena none = null;
+    Arena b = none orelse a;
+    return 0;
+}

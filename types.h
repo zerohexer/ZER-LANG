@@ -272,6 +272,20 @@ struct Symbol {
     const char **th_borrow_names;
     uint32_t *th_borrow_lens;
     int th_borrow_count;
+    /* BUG-924 (2026-09-04): the LOCAL whose storage this pointer / slice /
+     * pointer-carrying struct value references, recorded at the declaration or
+     * assignment that derived it (`q = &v`, `s = buf[0..4]`, `h.p = &v`). The
+     * scoped-spawn sink used to establish the exclusive borrow ONLY for a literal
+     * `&local` argument, so `spawn w(q)` / `spawn w(s)` / `spawn w(h)` borrowed
+     * nothing and the parent wrote `v` before the join (a data race). NULL = no
+     * local known. `borrow_root_unknown` = the value IS frame-derived but the
+     * local cannot be named (a call launder, or two different roots merged into
+     * one carrier) — the sink then REJECTS rather than guess. A threadlocal root
+     * is recorded too (its name resolves to the global-scope threadlocal), so the
+     * D4 "each thread has its own copy" rule fires through an alias as well. */
+    const char *borrow_root_name;
+    uint32_t borrow_root_len;
+    bool borrow_root_unknown;
     /* A6-full atomic-cell inclusion (2026-06-21): set on a scalar GLOBAL the
      * first time it is the target of an `@atomic_*`. Strict (Rust) model: once a
      * location is atomic, ALL access must be atomic — a plain access anywhere

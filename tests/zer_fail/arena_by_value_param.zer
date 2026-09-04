@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: cannot pass 'Arena' by value
+// BUG-916: the callee bumps a COPY over the caller's buffer.
+struct T { u32 v; }
+void take(Arena a) { *T t = a.alloc(T) orelse return; t.v = 7; }
+u32 main() { u8[64] buf; Arena a = Arena.over(buf); take(a); return 0; }

@@ -1,0 +1,14 @@
+// expect-trap
+// BUG-917: a calloc'd struct carrying an enum with no zero variant holds a
+// non-variant that no declaration rule can see. The exhaustive switch used to
+// enter its last arm unconditionally; it now re-checks and TRAPS.
+enum E { a = 1, b = 2 }
+struct S { E e; }
+u32 main() {
+    ?*S s = alloc(S);
+    *S p = s orelse return;
+    u32 r = 3;
+    switch (p.e) { .a => { r = 1; } .b => { r = 2; } }
+    free(p);
+    return r;
+}

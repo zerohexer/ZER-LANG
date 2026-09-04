@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-919: address of an array ELEMENT inside the slot, through get().
+struct T { u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    *u8 q = &p.get(h).arr[0];
+    p.free(h);
+    *q = 7;
+    return 0;
+}

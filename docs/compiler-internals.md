@@ -12654,3 +12654,99 @@ call-result sink must use this helper, not re-inline the predicate.** The litera
 compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
+
+## Audit 2026-09-04 — the mechanisms behind BUG-913..919 (read before touching any of them)
+
+Seven holes from a full read of the compiler plus ~90 probes. The BUGS-FIXED.md entry has the
+symptoms; this section records the MECHANISMS a later session needs.
+
+**Capture locals dedup only with capture locals (`ir_add_local`, BUG-913).** The dedup key
+was (orig_name, type, scope_depth); it now also requires `is_capture` to match. An if-unwrap
+capture is created at the ENCLOSING depth, before the then-body's block exists, so the
+block-exit hiding never reached it — NODE_IF now hides the capture after the then-body is
+lowered, and a re-declared capture is un-hidden when dedup returns it. Switch-arm captures are
+unaffected (they carry unique `_capN` names). If you add a new capture-producing construct,
+create the local with `is_capture=true` and hide it after its body.
+
+**Per-statement lock collector covers NODE_SPAWN per ARGUMENT (BUG-914).** The emitter locks
+one shared root per spawn argument (IR_NOP spawn emission, `find_shared_root`), so the deadlock
+collector treats each argument as its own statement. Any new statement kind that EVALUATES an
+expression in the parent must get a case in `collect_shared_types_in_stmt`; the zero-list
+there is the place a new kind silently lands.
+
+**Static locals in the race scans (BUG-915).** Spawn: `scan_unsafe_global_access` keeps a
+dynamic name list (`_static_local_*`), pushed at NODE_VAR_DECL when `is_static` and not
+exempt, scoped by saving/restoring the count at NODE_BLOCK, consulted at NODE_IDENT when the
+global lookup fails; `_flagged_static_local` selects the diagnostic wording. ISR:
+`struct IsrGlobal.decl` keys a static local by its declaration node; `track_isr_static_local`
+is called from the transitive ISR walk (declaration) and from `check_expr` NODE_IDENT
+(use, main side); `check_interrupt_safety` reads volatile/line/type from the decl when there
+is no global Symbol. The width exemption is `volatile_type_exempt_single_word` (type-based)
+wrapped by `volatile_global_exempt_from_race_check` (Symbol-based) — one rule, three sites.
+
+**Unique-resource copies (BUG-916).** `type_unique_resource_name` (Pool/Ring/Slab/Arena/
+Barrier/Semaphore, recursing through struct/union/array carriers) + `expr_reads_existing_object`
+(IDENT/FIELD/INDEX/deref/cast — NOT a call or a struct literal) = `check_unique_resource_copy`,
+called at var-decl init, assignment, call argument, return (only when the root outlives the
+call: global/static, or a non-ident path), and struct-literal fields. Adding a new resource
+type means adding one arm to the name predicate; adding a value-flow site means one call.
+
+**Enum non-variant guard (BUG-917).** `ir_lower` keeps the elided last-arm entry of an
+exhaustive enum switch (the elision prevents a spurious bb_exit predecessor in zercheck) and
+inserts, at the top of that arm, `BRANCH(cmp) → bb_ok | bb_trap` where bb_trap holds an
+`IR_ASSIGN{dest=-1, expr=NODE_INTRINSIC "enum_nonvariant_trap"}` and falls into bb_ok. The
+intrinsic is emitted at BOTH dispatch paths in emitter.c (search the name — two hits). The
+declaration-site rule is `enum_no_zero_variant_init_check` at both var-decl sites.
+
+**Zero value of a return type (BUG-918).** `emit_return_null` delegates to `emit_zero_value`,
+which now knows slices. The checker's bare-`orelse return` rule uses `nonnull_zero_hole`, the
+same predicate as the var-decl non-null rule — keep them the same predicate.
+
+**View-root resolution (BUG-919).** `ir_view_root_handle(zc, func, ps, expr)` in zercheck_ir.c
+answers "which tracked allocation does this lvalue path live in": SLICE/INDEX descend; a FIELD
+whose own type is pointer/slice/opaque READS a reference and resolves through the compound
+handle `(root, ".field")`; an inline FIELD descends; an IDENT root resolves to its local handle;
+a `pool.get(h)`/`slab.get(h)` root resolves to h. Used by the interior-pointer arm (when the
+old ident walk did not reach an ident) and the slice-view arm (when the old walk stopped at a
+FIELD or CALL). NULL means "no alias" — today's behaviour, never a new rejection. The keep
+call-site sink got the matching `pool_get_handle_root` peel in checker.c. **If you add a new
+view-forming expression, route it through this helper rather than a new walk.**
+
+**Dead code found and left in place (tech debt, not touched this session):** the emitter's
+`IR_NOP{NODE_SWITCH}` mini-emitter (~400 lines, emitter.c "Enum/union/optional switch — emit
+if/else chain directly") — ir_lower has lowered every switch kind through `lower_stmt` since
+BUG-579, so that path is unreachable; it silently drops nested `if` bodies with var-decls, and
+would be a miscompile if ever reached. Delete it with a `-Werror=switch`-clean build, and keep
+the emit_audit gate green.
+
+### BUG-920..924 — the second half of the 2026-09-04 audit (mechanisms)
+
+- **Slice header is read-only (BUG-920).** `slice_header_field(c, n)` names `.ptr`/`.len` on a
+  slice-typed object; NODE_ASSIGN (after the target resolves) and NODE_UNARY `&` refuse it. The
+  view is rebuilt by a slice expression, which is the bounds-checked door. Do NOT add a third
+  door (a `@ptrcast` of `&s`, a `@pun`) without routing it through the same predicate.
+- **Parser lookahead for `IDENT ( *` (BUG-921).** The C-style funcptr declaration is committed
+  only on `IDENT ( * IDENT ) (`; anything else is an expression statement. `f(*p);` is a call.
+- **Packed array-field views (BUG-922).** `packed_array_field_view(c, v)` = NODE_FIELD whose type
+  is an ARRAY with element alignment > 1 on a `packed_path_aggregate` path. Asked inside
+  `value_flows_to` for a SLICE target (so all eight value-flow sites refuse the coercion at once)
+  and at NODE_SLICE. `addr_of_is_packed_field` peels NODE_INDEX steps, so `&p.w[0]` is the same
+  pointer as `&p.w`. `value_flows_to` now takes the Checker — every caller passes `c`.
+- **uN bit-slice store (BUG-923).** `emit_intn_mask` wraps VALUES (IR_BINOP/IR_UNOP); the
+  NODE_ASSIGN arm of `emit_rewritten_node` skips it when the target is a NODE_SLICE — the
+  bit-slice store masks within [hi..lo] itself, and the checker bounds `hi` by the width.
+- **Borrow root (BUG-924) — the scoped-spawn sink's missing variable.** `Symbol.borrow_root_name`
+  (+ `_len`, `_unknown`) records WHICH local a pointer/slice/carrier value references. Set at the
+  two DECLARATION sites through `record_borrow_root` (var-decl init: replace; assignment: replace
+  on `q = …`, merge on `h.p = …`), propagated by `propagate_escape_flags` (merge). Resolver
+  `borrow_root_of_value` is three-valued {none, ROOT, unknown}: `&chain` → the chain's root local
+  (a pointer/slice root means "into its pointee", so it delegates to that ident's record; a
+  threadlocal global root is recorded by name for D4); slice/index/field chains and idents → the
+  ident's record, or the ident itself for a local ARRAY; struct literals merge their fields;
+  anything else that `arg_is_local_derived` calls frame-bound is `unknown`. The sink
+  `scoped_spawn_borrow` is ONE function for the `&` and the non-`&` spellings (D4 threadlocal, D6
+  second live spawn, D7 record-every-borrow all live there; the same spawn lending one local twice
+  is one borrow). A non-`&` argument lends its own root ident when `type_carries_nonshared_pointer`
+  and the recorded root; `unknown` is REJECTED. Two rules that keep it sound: the write-side check
+  walks `*`/field/index to the root ident (so borrowing `q` catches `*q = 3`), and `unknown` never
+  degrades to "no borrow". Precision residual (two roots in one carrier) is in limitations.md.

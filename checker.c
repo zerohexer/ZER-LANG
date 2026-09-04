@@ -424,6 +424,36 @@ static Type *nonnull_zero_hole(Type *t, bool *is_func) {
     return NULL;
 }
 
+/* BUG-917: an enum whose variant set does not contain 0 has no auto-zero
+ * value: `enum E { a = 1, b = 2 } E e;` leaves `e` holding a NON-VARIANT, and an
+ * exhaustive `switch (e)` then has no honest arm to run (it used to run the
+ * last one silently; it now traps). The declaration is the one door a
+ * compile-time rule can close — the fix is a one-line initializer. Carriers
+ * (a struct field, an array element, a calloc'd object) are left to the
+ * run-time switch guard: rejecting every aggregate that contains such an enum
+ * would refuse real firmware (a parsed packet header whose command field is
+ * an enum with no zero code), where the zero never reaches a switch. */
+static void checker_error(Checker *c, int line, const char *fmt, ...);  /* defined below */
+static void enum_no_zero_variant_init_check(Checker *c, int line, Type *type,
+                                            const char *name, uint32_t name_len) {
+    if (!type) return;
+    Type *eff = type_unwrap_distinct(type);
+    if (!eff || type_dispatch_kind(eff) != TYPE_ENUM) return;
+    if (eff->enum_type.variant_count == 0) return;
+    for (uint32_t i = 0; i < eff->enum_type.variant_count; i++)
+        if (eff->enum_type.variants[i].value == 0) return;
+    checker_error(c, line,
+        "enum '%.*s' has no variant with value 0, so the auto-zeroed '%.*s' would "
+        "hold a value outside its variant set (an exhaustive switch on it traps). "
+        "Initialize it: '%.*s %.*s = %.*s.%.*s;'",
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)name_len, name,
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)name_len, name,
+        (int)eff->enum_type.name_len, eff->enum_type.name,
+        (int)eff->enum_type.variants[0].name_len, eff->enum_type.variants[0].name);
+}
+
 /* Is this optional INNER type represented by a null sentinel (so the optional
  * IS the pointer at runtime and has no `.value` field)? Checker-side twin of
  * emitter.c's `is_null_sentinel`; kept identical, including the `*opaque`
@@ -467,6 +497,22 @@ static bool is_null_sentinel_ck(Type *inner) {
  * still provides no ORDERING. It is the established embedded idiom, the
  * diagnostic already says volatile is not synchronization, and banning it is a
  * separate judgment call. A tearable multi-word access is not a judgment call. */
+/* BUG-915: the TYPE half of the predicate, split out so a STATIC LOCAL (which
+ * has no Symbol visible from the spawn scan — it belongs to another function's
+ * scope — and no global-scope Symbol at all for the ISR check) can ask the same
+ * question through its declaration's type. One rule, three sites. */
+static bool volatile_type_exempt_single_word(Checker *c, Type *t) {
+    if (!c || !t) return false;
+    Type *vt = type_unwrap_distinct(t);
+    if (!vt) return false;
+    TypeKind k = type_dispatch_kind(vt);
+    bool scalar = type_is_integer(vt) || k == TYPE_BOOL || k == TYPE_POINTER;
+    if (!scalar) return false;          /* aggregate — never one word */
+    int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
+    if (w <= 0) return false;
+    return w <= c->target_ptr_bits;
+}
+
 static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
     if (!c || !sym || !sym->is_volatile) return false;
     Type *vt = type_unwrap_distinct(sym->type);
@@ -490,6 +536,127 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
     int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
     if (w <= 0) return false;
     return w <= c->target_ptr_bits;
+}
+
+/* BUG-916: a UNIQUE RESOURCE is a value whose bytes are the only owner of some
+ * state a COPY would then share: an Arena's bump pointer over one buffer (two
+ * copies hand out the SAME bytes twice — measured: `Arena b = a;` then one
+ * alloc from each returned the same object), a Pool/Slab/Ring's free-list and
+ * slot array, a Barrier's or Semaphore's counter. Pool/Ring/Slab were already
+ * refused at ONE site (assignment, BUG-225); Arena/Barrier/Semaphore and every
+ * other value-flow site were not. One predicate, recursing through the
+ * aggregates that can carry one, asked at every copy site. Returns the name of
+ * the resource kind found, or NULL when the type is freely copyable. */
+static const char *type_unique_resource_name(Type *t, int depth) {
+    if (!t || depth > 32) return NULL;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return NULL;
+    switch (u->kind) {
+    case TYPE_POOL:      return "Pool";
+    case TYPE_RING:      return "Ring";
+    case TYPE_SLAB:      return "Slab";
+    case TYPE_ARENA:     return "Arena";
+    case TYPE_BARRIER:   return "Barrier";
+    case TYPE_SEMAPHORE: return "Semaphore";
+    case TYPE_ARRAY:     return type_unique_resource_name(u->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            const char *r = type_unique_resource_name(u->struct_type.fields[i].type, depth + 1);
+            if (r) return r;
+        }
+        return NULL;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++) {
+            const char *r = type_unique_resource_name(u->union_type.variants[i].type, depth + 1);
+            if (r) return r;
+        }
+        return NULL;
+    case TYPE_VOID: case TYPE_BOOL:
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_UINT: case TYPE_SINT: case TYPE_F32: case TYPE_F64:
+    case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE: case TYPE_ENUM:
+    case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_HANDLE: case TYPE_DISTINCT:
+        return NULL;
+    }
+    return NULL;
+}
+
+/* BUG-919: if `e` is a `pool.get(h)` / `slab.get(h)` call, return the handle
+ * argument expression (the slot it names); otherwise return `e` unchanged. Lets
+ * a root walk that stopped at the get() CALL continue to the Handle, so
+ * `&pool.get(h).field` and `&h.field` (auto-deref) classify identically. */
+static Node *pool_get_handle_root(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_CALL || e->call.arg_count != 1) return e;
+    Node *callee = e->call.callee;
+    if (!callee || callee->kind != NODE_FIELD) return e;
+    if (callee->field.field_name_len != 3 || memcmp(callee->field.field_name, "get", 3) != 0)
+        return e;
+    if (!callee->field.object || callee->field.object->kind != NODE_IDENT) return e;
+    Symbol *ps = scope_lookup(c->current_scope, callee->field.object->ident.name,
+                              (uint32_t)callee->field.object->ident.name_len);
+    if (!ps || !ps->type) return e;
+    TypeKind pk = type_dispatch_kind(ps->type);
+    if (pk != TYPE_POOL && pk != TYPE_SLAB) return e;
+    return e->call.args[0];
+}
+
+/* Does this expression READ an existing object (so a value flow from it is a
+ * COPY of that object), as opposed to producing a fresh value (`Arena.over(buf)`,
+ * a call, a struct literal)? Only the former can alias a unique resource. */
+static bool expr_reads_existing_object(Node *e) {
+    if (!e) return false;
+    switch (e->kind) {
+    case NODE_IDENT: case NODE_FIELD: case NODE_INDEX:
+        return true;
+    case NODE_UNARY:
+        return e->unary.op == TOK_STAR;
+    case NODE_TYPECAST:
+        return expr_reads_existing_object(e->typecast.expr);
+    case NODE_ORELSE:
+        /* a JOIN: either arm may hand over an existing object (`opt orelse a`) */
+        return expr_reads_existing_object(e->orelse.expr) ||
+               expr_reads_existing_object(e->orelse.fallback);
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_CALL:
+    case NODE_SLICE: case NODE_INTRINSIC:
+    case NODE_CAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
+    return false;
+}
+
+/* The one copy-check for unique resources. `what` names the flow for the
+ * message ("initialize", "assign", "pass", "return", "spawn with"). */
+static void check_unique_resource_copy(Checker *c, int line, Node *src,
+                                       Type *src_type, const char *what) {
+    if (!src || !src_type) return;
+    if (!expr_reads_existing_object(src)) return;
+    const char *rn = type_unique_resource_name(src_type, 0);
+    if (!rn) return;
+    bool ptr_ok = (rn[0] == 'B' || rn[0] == 'S') && rn[1] != 'l';   /* Barrier, Semaphore */
+    checker_error(c, line,
+        "cannot %s '%s' by value — resource types are not copyable: a %s is a "
+        "unique resource, and a copy would share its state (an Arena copy hands "
+        "out the same bytes twice; a copied Pool/Slab/Ring has two free-lists over "
+        "one slot array; a copied Barrier/Semaphore never synchronizes with the "
+        "original). %s",
+        what, type_name(src_type), rn,
+        ptr_ok ? "Pass a pointer '*Barrier' / '*Semaphore' instead"
+               : "Give it ONE owner and reach it by name (a global, or the function "
+                 "that declares it)");
 }
 
 static bool type_carries_nonshared_pointer(Type *t, int depth) {
@@ -878,6 +1045,7 @@ static int classify_return_root(Checker *c, Node *rexpr);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
+static void track_isr_static_local(Checker *c, Node *decl);   /* BUG-915 */
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -1246,8 +1414,14 @@ static bool const_negative_into_unsigned(Node *value, Type *target) {
  * CLAUDE.md names as the #1 recurring bug class, and it is exactly what let the
  * negative literal stay accepted at every one of them: there was no single place
  * to add the condition. One query now; each site keeps its own error wording. */
-static bool value_flows_to(Node *value, Type *vt, Type *target) {
+static bool packed_array_field_view(Checker *c, Node *v);   /* BUG-922, defined below */
+static bool value_flows_to(Checker *c, Node *value, Type *vt, Type *target) {
     if (const_negative_into_unsigned(value, target)) return false;
+    /* BUG-922: an ARRAY field of a packed struct flowing into a SLICE forms a
+     * view whose elements are misaligned — refused at every value-flow site
+     * through this one query (report_negative_const_flow words it). */
+    if (type_dispatch_kind(target) == TYPE_SLICE && packed_array_field_view(c, value))
+        return false;
     if (type_equals(target, vt)) return true;
     if (can_implicit_coerce(vt, target)) return true;
     if (is_literal_compatible(value, target)) return true;
@@ -1262,6 +1436,19 @@ static bool value_flows_to(Node *value, Type *vt, Type *target) {
  * its generic message. */
 static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
                                        int line, const char *what) {
+    /* BUG-922: the packed-array-view refusal from value_flows_to — same hook,
+     * because the generic "cannot initialize '[]u32' with 'u32[2]'" would name a
+     * type mismatch that is not the problem. */
+    if (type_dispatch_kind(target) == TYPE_SLICE && packed_array_field_view(c, value)) {
+        checker_error(c, line,
+            "%s: cannot form a slice over an array field of a packed struct — its "
+            "elements are not aligned, so the slice's element accesses would be "
+            "misaligned loads/stores (a hard fault on ARM/RISC-V, a silent split "
+            "access on Cortex-M0+). Copy the field into an aligned array first, or "
+            "use a byte array (u8 elements are never misaligned)",
+            what);
+        return true;
+    }
     if (!const_negative_into_unsigned(value, target)) return false;
     long long v = (long long)eval_const_expr(value);
     /* type_name() rotates only TWO static buffers — capture before formatting
@@ -2317,6 +2504,12 @@ static bool type_can_carry_pointer(Type *t) {
                    eff->kind == TYPE_OPAQUE);
 }
 
+/* BUG-924: three-valued borrow root {none, ROOT(name), unknown} — defined with
+ * its resolver below addr_of_is_local_derived; declared here for the alias
+ * propagation. */
+typedef struct { const char *name; uint32_t len; bool unknown; } BorrowRoot;
+static void borrow_root_merge(BorrowRoot *acc, BorrowRoot r);
+
 /* Propagate is_local_derived / is_arena_derived / is_from_arena from src to dst,
  * but ONLY if dst's type can carry a pointer. Centralizes the 3-flag propagation
  * pattern that was scattered at 5+ sites (4 of which were missing the type guard). */
@@ -2325,6 +2518,16 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_local_derived) dst->is_local_derived = true;
     if (src->is_arena_derived) dst->is_arena_derived = true;
     if (src->is_from_arena) dst->is_from_arena = true;
+    /* BUG-924: the borrow root rides the alias too (merge — a second different
+     * root makes the carrier's root unknown, which the spawn sink rejects). */
+    if (src->borrow_root_name || src->borrow_root_unknown) {
+        BorrowRoot acc = { dst->borrow_root_name, dst->borrow_root_len, dst->borrow_root_unknown };
+        BorrowRoot r = { src->borrow_root_name, src->borrow_root_len, src->borrow_root_unknown };
+        borrow_root_merge(&acc, r);
+        dst->borrow_root_name = acc.name;
+        dst->borrow_root_len = acc.len;
+        dst->borrow_root_unknown = acc.unknown;
+    }
     /* BUG-848: arena_source is deliberately NOT propagated here.
      *
      * This helper is called with `dst` = the ROOT of the assignment target, which
@@ -2558,10 +2761,50 @@ static Type *packed_path_aggregate(Checker *c, Node *e, bool *packed_seen, int d
 static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
     Node *op = expr->unary.operand;
+    /* BUG-922: `&p.w[0]` — the address of an ELEMENT of an array field inside a
+     * packed struct is just as misaligned as `&p.b`; peel the index steps to
+     * the field they navigate within (the INDEX arm of packed_path_aggregate
+     * already descends the same way). */
+    int ipeel = 0;
+    while (op && op->kind == NODE_INDEX && ipeel++ < 64) op = op->index_expr.object;
     if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
     bool packed_seen = false;
     packed_path_aggregate(c, op, &packed_seen, 0);
     return packed_seen;
+}
+
+/* BUG-922: is `v` an ARRAY field (of a non-byte element type) reached through a
+ * packed struct? Such a field must not become a SLICE — by implicit array->slice
+ * coercion at a value-flow site, or by `p.w[0..]` — because every element access
+ * through the slice is a misaligned load/store. The three forms measured
+ * accepted on main: `[*]u32 s = p.w;`, `fill(p.w)` and `[*]u32 s = p.w[0..];`.
+ * Sibling class of BUG-786 (`&p.b`), which covered only the bare `&field` form.
+ * Byte arrays are exempt — a u8 element is never misaligned. */
+static bool packed_array_field_view(Checker *c, Node *v) {
+    if (!v || v->kind != NODE_FIELD) return false;
+    Type *ft = checker_get_type(c, v);
+    if (!ft || type_dispatch_kind(ft) != TYPE_ARRAY) return false;
+    Type *fa = type_unwrap_distinct(ft);
+    if (!fa || !fa->array.inner) return false;
+    if (type_alignment_bytes(fa->array.inner) <= 1) return false;
+    bool packed_seen = false;
+    packed_path_aggregate(c, v, &packed_seen, 0);
+    return packed_seen;
+}
+
+/* BUG-920: is `n` the `.len` or `.ptr` HEADER field of a slice? Returns the
+ * field name or NULL. Assigning either (or taking its address) forges a view
+ * that the bounds check then trusts: `s.len = 100; s[50] = 1;` wrote 46 bytes
+ * past a 4-byte array with no diagnostic; `s.ptr = &b[0]; s[3] = 1;` indexed a
+ * 2-byte array at 3. The two fields are ONE bounds-checked view; the only way to
+ * change it is to rebuild it with a slice expression, which is checked. */
+static const char *slice_header_field(Checker *c, Node *n) {
+    if (!n || n->kind != NODE_FIELD || !n->field.object) return NULL;
+    Type *ot = checker_get_type(c, n->field.object);
+    if (!ot || type_dispatch_kind(ot) != TYPE_SLICE) return NULL;
+    if (n->field.field_name_len == 3 && memcmp(n->field.field_name, "len", 3) == 0) return "len";
+    if (n->field.field_name_len == 3 && memcmp(n->field.field_name, "ptr", 3) == 0) return "ptr";
+    return NULL;
 }
 /* BUG-833: `Symbol.is_packed_derived` was WRITTEN at exactly one site (the
  * var-decl `addr_exprs` loop) and READ at exactly one (the deref of a bare ident).
@@ -2615,6 +2858,193 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
     return true;
 }
 
+/* ================================================================
+ * BUG-924 (2026-09-04): the BORROW ROOT of a value — "which LOCAL's storage does
+ * this pointer / slice / pointer-carrying struct reference?"
+ *
+ * The scoped-spawn borrow (`ThreadHandle th = spawn w(&v); … th.join();` lends
+ * `v` exclusively to the thread until the join) was established ONLY for a
+ * literal `&local` argument. Every sibling spelling of the same borrow —
+ *     *u32 q = &v;        spawn w(q);     v = 3;      // pointer local
+ *     H h; h.p = &v;      spawn w(h);     v = 3;      // struct carrier
+ *     [*]u8 s = buf;      spawn w(s);     buf[0] = 3; // slice view
+ *     *u32 q = &tl;       spawn w(q);                 // threadlocal via alias
+ * — borrowed nothing, so the parent wrote the lent storage before the join.
+ * `is_local_derived` says the value IS frame-bound but not WHICH local, so the
+ * sink could not borrow anything; that missing variable is what this records.
+ *
+ * Three-valued: {none, ROOT(name), unknown}. `unknown` = frame-derived but the
+ * local cannot be named (a call launder, a capture, two different roots merged
+ * into one carrier). The sink REJECTS unknown — cannot prove ⇒ reject, never
+ * guess. Recorded at the two DECLARATION-SITE hooks (var-decl init and
+ * assignment), per CLAUDE.md's declaration-vs-use rule; read at the spawn sink.
+ * ================================================================ */
+/* BorrowRoot itself is declared above propagate_escape_flags (its first user). */
+static void borrow_root_merge(BorrowRoot *acc, BorrowRoot r) {
+    if (r.unknown) { acc->unknown = true; acc->name = NULL; acc->len = 0; return; }
+    if (!r.name || acc->unknown) return;
+    if (!acc->name) { acc->name = r.name; acc->len = r.len; return; }
+    if (acc->len == r.len && memcmp(acc->name, r.name, r.len) == 0) return;
+    acc->unknown = true; acc->name = NULL; acc->len = 0;   /* two different roots */
+}
+
+static Node *borrow_chain_root(Node *n) {
+    while (n && (n->kind == NODE_SLICE || n->kind == NODE_INDEX || n->kind == NODE_FIELD)) {
+        if (n->kind == NODE_SLICE) n = n->slice.object;
+        else if (n->kind == NODE_INDEX) n = n->index_expr.object;
+        else n = n->field.object;
+    }
+    return n;
+}
+
+static bool arg_is_local_derived(Checker *c, Node *arg, int depth);
+
+/* The root of an IDENT: a local ARRAY is its own root (array→slice coercion
+ * views it); a pointer/slice/struct local reports what was recorded on it; a
+ * frame-derived local with nothing recorded is unknown; anything else is none. */
+static BorrowRoot borrow_root_of_ident(Checker *c, Node *id) {
+    BorrowRoot r = { NULL, 0, false };
+    Symbol *s = scope_lookup(c->current_scope, id->ident.name, (uint32_t)id->ident.name_len);
+    if (!s) return r;
+    bool is_global = scope_lookup_local(c->global_scope, id->ident.name,
+                                        (uint32_t)id->ident.name_len) != NULL;
+    if (is_global || s->is_static) return r;
+    if (s->type && type_dispatch_kind(s->type) == TYPE_ARRAY) {
+        r.name = id->ident.name; r.len = (uint32_t)id->ident.name_len; return r;
+    }
+    if (s->borrow_root_name) { r.name = s->borrow_root_name; r.len = s->borrow_root_len; return r; }
+    if (s->borrow_root_unknown || s->is_local_derived || s->is_arena_derived) r.unknown = true;
+    return r;
+}
+
+static BorrowRoot borrow_root_of_value(Checker *c, Node *v, int depth) {
+    BorrowRoot r = { NULL, 0, false };
+    if (!v || depth > 8) return r;
+    v = unwrap_ptr_launder(v);
+    if (!v) return r;
+    if (v->kind == NODE_ORELSE) {
+        r = borrow_root_of_value(c, v->orelse.expr, depth + 1);
+        borrow_root_merge(&r, borrow_root_of_value(c, v->orelse.fallback, depth + 1));
+        return r;
+    }
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
+        Node *root = borrow_chain_root(v->unary.operand);
+        if (!root || root->kind != NODE_IDENT) {
+            if (arg_is_local_derived(c, v, 0)) r.unknown = true;
+            return r;
+        }
+        Symbol *s = scope_lookup(c->current_scope, root->ident.name,
+                                 (uint32_t)root->ident.name_len);
+        bool is_global = scope_lookup_local(c->global_scope, root->ident.name,
+                                            (uint32_t)root->ident.name_len) != NULL;
+        if (!s) return r;
+        if (is_global) {
+            /* a threadlocal is recorded by name so the sink can apply D4 */
+            if (s->func_node && s->func_node->kind == NODE_GLOBAL_VAR &&
+                s->func_node->var_decl.is_threadlocal) {
+                r.name = root->ident.name; r.len = (uint32_t)root->ident.name_len;
+            }
+            return r;
+        }
+        if (s->is_static) return r;
+        /* a pointer/slice root: `&p.f` is INTO p's pointee, not into p */
+        if (s->type && escape_type_carries_ref(s->type)) return borrow_root_of_ident(c, root);
+        r.name = root->ident.name; r.len = (uint32_t)root->ident.name_len;
+        return r;
+    }
+    if (v->kind == NODE_SLICE || v->kind == NODE_INDEX || v->kind == NODE_FIELD) {
+        Node *root = borrow_chain_root(v);
+        if (root && root->kind == NODE_IDENT) return borrow_root_of_ident(c, root);
+        if (arg_is_local_derived(c, v, 0)) r.unknown = true;
+        return r;
+    }
+    if (v->kind == NODE_IDENT) return borrow_root_of_ident(c, v);
+    if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            borrow_root_merge(&r, borrow_root_of_value(c, v->struct_init.fields[i].value, depth + 1));
+        return r;
+    }
+    if (arg_is_local_derived(c, v, 0)) r.unknown = true;   /* call launder etc. */
+    return r;
+}
+
+/* Declaration-site hook. `whole` = the entire variable is (re)bound (var-decl
+ * init, `q = …`): the root is REPLACED, so `q = &global` clears it (same
+ * non-sticky rule as BUG-194). A field/index store (`h.p = …`) MERGES into the
+ * container's root: a second different root makes it unknown. */
+static void record_borrow_root(Checker *c, Symbol *sym, Node *value, bool whole) {
+    if (!sym || !value || !sym->type || !type_can_carry_pointer(sym->type)) return;
+    BorrowRoot r = borrow_root_of_value(c, value, 0);
+    if (!whole) {
+        BorrowRoot acc = { sym->borrow_root_name, sym->borrow_root_len, sym->borrow_root_unknown };
+        borrow_root_merge(&acc, r);
+        r = acc;
+    }
+    /* a value rooted in itself (`s = s[1..]`) says nothing new — keep what is known */
+    if (r.name && r.len == sym->name_len && memcmp(r.name, sym->name, r.len) == 0) return;
+    sym->borrow_root_name = r.name;
+    sym->borrow_root_len = r.len;
+    sym->borrow_root_unknown = r.unknown;
+}
+
+/* The scoped-spawn SINK: lend local `vs` (named vn/vl) to the thread behind
+ * ThreadHandle `th` until its join. ONE function for both the `&local` argument
+ * and the BUG-924 pointer/slice/carrier arguments, so the two spellings cannot
+ * drift. Skips globals (they outlive the thread), statics, and shared structs
+ * (auto-locked); applies D4 to a threadlocal root; applies D6 to a local that a
+ * DIFFERENT live spawn already holds (the same spawn lending one local twice —
+ * `spawn w(&a.x, &a.y)`, or a carrier plus its root — is one borrow). */
+static void scoped_spawn_borrow(Checker *c, Symbol *th, Symbol *vs,
+                                const char *vn, uint32_t vl, int bcap, int line) {
+    if (!th || !vs || !vs->type) return;
+    if (vs->func_node && vs->func_node->kind == NODE_GLOBAL_VAR &&
+        vs->func_node->var_decl.is_threadlocal) {
+        checker_error(c, line,
+            "cannot pass '&%.*s' (threadlocal) to a scoped spawn — "
+            "each thread has its own copy, so the child would write "
+            "the parent's slot (data race). Pass it by value",
+            (int)vl, vn);
+        return;
+    }
+    if (vs->is_static) return;
+    if (scope_lookup_local(c->global_scope, vn, vl) != NULL) return;
+    if (type_dispatch_kind(vs->type) == TYPE_STRUCT) {
+        Type *vt = type_unwrap_distinct(vs->type);
+        if (vt->struct_type.is_shared || vt->struct_type.is_shared_rw) return;
+    }
+    for (int i = 0; i < th->th_borrow_count; i++) {
+        if (th->th_borrow_lens[i] == vl && memcmp(th->th_borrow_names[i], vn, vl) == 0)
+            return;                                  /* already lent by THIS spawn */
+    }
+    /* D6 (2026-08-01): the flag was set UNCONDITIONALLY, so lending the SAME
+     * local to a second live scoped spawn (`spawn a(&x); spawn b(&x);` before
+     * either join) was accepted — two threads mutating one stack local, a
+     * worker-vs-worker race the parent-write check cannot see. Reject an
+     * already-borrowed local; join() clears the flag, so sequential borrow
+     * (spawn, join, spawn again) still compiles. */
+    if (vs->is_borrowed_by_thread) {
+        checker_error(c, line,
+            "'%.*s' is already borrowed by a live scoped spawn — "
+            "lending it to a second thread is a data race. join() "
+            "the first thread before spawning the second",
+            (int)vl, vn);
+        return;
+    }
+    vs->is_borrowed_by_thread = true;
+    /* D7: record EVERY borrow (was: first only, then `break`), so join()
+     * releases each. First entry mirrors the legacy field. */
+    if (th->th_borrow_names && th->th_borrow_lens && th->th_borrow_count < bcap) {
+        th->th_borrow_names[th->th_borrow_count] = vn;
+        th->th_borrow_lens[th->th_borrow_count] = vl;
+        th->th_borrow_count++;
+    }
+    if (!th->th_borrows_name) {
+        th->th_spawn_branch_depth = c->branch_depth;
+        th->th_borrows_name = vn;
+        th->th_borrows_name_len = vl;
+    }
+}
+
 /* Scan-local pointer aliases: `*u32 p = &counter;` inside the body being scanned.
  * The scan walks ANOTHER function's AST from the CALLER's scope, so scope_lookup
  * cannot see that function's locals — the alias has to be recorded when the scan
@@ -2628,7 +3058,44 @@ static int _rmw_alias_count = 0;
  * read-modify-write, so the diagnostic can name THAT rather than the generic
  * "accesses non-shared global" (which reads as if any access were the problem). */
 static bool _rmw_flagged_rmw = false;
-static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false; }
+/* BUG-915: STATIC LOCALS visible to the spawn race scan. A `static u32 c;`
+ * inside a function is one object shared by every thread that runs the
+ * function — exactly a non-shared global with a narrower name — but the scan
+ * resolves identifiers against the GLOBAL scope only (it walks another
+ * function's AST from the spawn site), so a static local was invisible:
+ * `void w() { static u32 c = 0; c += 1; } spawn w(); spawn w();` compiled
+ * clean and raced. Recorded when the scan VISITS the declaration (a static
+ * local is declared before it is used, lexically), scoped to the enclosing
+ * NODE_BLOCK so a same-named LOCAL in a sibling function is never mistaken
+ * for it. Stack-first dynamic; never reset explicitly — block scoping is the
+ * reset. `_flagged_static_local` lets the spawn diagnostic say what it found. */
+static const char **_static_local_names = NULL;
+static uint32_t *_static_local_lens = NULL;
+static int _static_local_count = 0, _static_local_cap = 0;
+static bool _flagged_static_local = false;
+static void static_local_push(const char *name, uint32_t len) {
+    if (_static_local_count >= _static_local_cap) {
+        int nc = _static_local_cap < 16 ? 16 : _static_local_cap * 2;
+        const char **nn = (const char **)realloc(_static_local_names, nc * sizeof(*nn));
+        uint32_t *nl = (uint32_t *)realloc(_static_local_lens, nc * sizeof(*nl));
+        if (!nn || !nl) return;   /* out of memory: drop the row (over-accept only
+                                   * in a state the whole compiler cannot survive) */
+        _static_local_names = nn; _static_local_lens = nl; _static_local_cap = nc;
+    }
+    _static_local_names[_static_local_count] = name;
+    _static_local_lens[_static_local_count] = len;
+    _static_local_count++;
+}
+static bool static_local_lookup(const char *name, uint32_t len) {
+    for (int i = _static_local_count - 1; i >= 0; i--)
+        if (_static_local_lens[i] == len && memcmp(_static_local_names[i], name, len) == 0)
+            return true;
+    return false;
+}
+static void rmw_alias_reset(void) {
+    _rmw_alias_count = 0; _rmw_flagged_rmw = false;
+    _flagged_static_local = false;
+}
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
     for (int i = 0; i < _rmw_alias_count; i++)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
@@ -3153,7 +3620,9 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * Same question, second sink. */
                 check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
-                if (vt && ft && !value_flows_to(df->value, vt, ft)) {
+                /* BUG-916: `Ctx c = { .a = ga };` copies the Arena into the field. */
+                check_unique_resource_copy(c, line, df->value, vt, "initialize a field from");
+                if (vt && ft && !value_flows_to(c, df->value, vt, ft)) {
                     char what[96];
                     snprintf(what, sizeof(what), "field '.%.*s'",
                              (int)df->name_len, df->name);
@@ -5489,6 +5958,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     gs->type && type_is_integer(gs->type)) {
                     record_atomic_plain_write(c, gs, node->loc.line);
                 }
+            } else if (sym->is_static && !sym->is_const && sym->func_node &&
+                       sym->func_node->kind == NODE_VAR_DECL) {
+                /* BUG-915: a static LOCAL — same ISR/main sharing question as a
+                 * global, keyed by its declaration node. */
+                track_isr_static_local(c, sym->func_node);
             }
         }
         break;
@@ -5797,6 +6271,18 @@ static Type *check_expr(Checker *c, Node *node) {
         if (node->unary.op == TOK_AMP) c->in_amp = true;
         Type *operand = check_expr(c, node->unary.operand);
         c->in_amp = saved_in_amp;
+        /* BUG-920: `&s.len` / `&s.ptr` — the write-through-pointer door to the
+         * same forgery the assignment rule refuses. */
+        if (node->unary.op == TOK_AMP) {
+            const char *hf = slice_header_field(c, node->unary.operand);
+            if (hf) {
+                checker_error(c, node->loc.line,
+                    "cannot take the address of '.%s' of a slice — .ptr and .len are "
+                    "one bounds-checked view and must not be written through a pointer. "
+                    "Rebuild the view with a slice expression instead ('s = arr[a..b]')",
+                    hf);
+            }
+        }
 
         switch (node->unary.op) {
         case TOK_MINUS:
@@ -5991,6 +6477,18 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
+        /* BUG-920: `s.len = …` / `s.ptr = …` forge a view the bounds check trusts. */
+        {
+            const char *hf = slice_header_field(c, node->assign.target);
+            if (hf) {
+                checker_error(c, node->loc.line,
+                    "cannot assign to '.%s' of a slice — .ptr and .len are one "
+                    "bounds-checked view; changing either would let the slice reach "
+                    "memory it does not own. Rebuild the view with a slice expression "
+                    "instead ('s = arr[a..b]')",
+                    hf);
+            }
+        }
         /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a WRITE to a local
          * that is currently borrowed by a scoped spawn (between `spawn
          * worker(&x)` and `th.join()`) is a data race — the thread has
@@ -6360,14 +6858,14 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types.
-         * BUG-506: unwrap distinct. */
-        { Type *teff = target ? type_unwrap_distinct(target) : NULL;
-        if (node->assign.op == TOK_EQ && teff &&
-            (teff->kind == TYPE_POOL || teff->kind == TYPE_RING || teff->kind == TYPE_SLAB)) {
-            checker_error(c, node->loc.line,
-                "cannot assign %s — resource types are not copyable",
-                teff->kind == TYPE_POOL ? "Pool" : teff->kind == TYPE_RING ? "Ring" : "Slab");
-        } }
+         * BUG-506: unwrap distinct.
+         * BUG-916: ONE predicate for every unique resource (adds Arena, Barrier,
+         * Semaphore and any aggregate carrying one) and only when the RHS reads
+         * an existing object — `a = Arena.over(buf);` is a fresh value, not a
+         * copy, and must keep working. */
+        if (node->assign.op == TOK_EQ)
+            check_unique_resource_copy(c, node->loc.line, node->assign.value,
+                                       value, "assign");
 
         /* string literal to mutable slice: runtime crash on write.
          * BUG-424: allow assignment to const slice fields (const []u8 is safe). */
@@ -6549,6 +7047,12 @@ static Type *check_expr(Checker *c, Node *node) {
                         mark_slice_local_derived_from_value(c, tsym, tsym->type,
                                                             node->assign.value);
                     }
+                    /* BUG-924: record WHICH local the stored value references — the
+                     * whole variable is re-rooted on `q = …`, a field store `h.p = …`
+                     * merges into the container's root. */
+                    if (node->assign.op == TOK_EQ)
+                        record_borrow_root(c, tsym, node->assign.value,
+                                           node->assign.target->kind == NODE_IDENT);
                     /* check if new value is &local — also check orelse fallback (BUG-314) */
                     {
                         Node *vcheck = node->assign.value;
@@ -7460,7 +7964,7 @@ static Type *check_expr(Checker *c, Node *node) {
         }
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
-            if (!value_flows_to(node->assign.value, value, target)) {
+            if (!value_flows_to(c, node->assign.value, value, target)) {
                 if (!report_negative_const_flow(c, node->assign.value, target,
                                                 node->loc.line, "assignment"))
                     checker_error(c, node->loc.line,
@@ -8650,8 +9154,12 @@ static Type *check_expr(Checker *c, Node *node) {
                                 i + 1, type_name(arg), type_name(arg));
                         }
                     }
+                    /* BUG-916: `take(a)` with `void take(Arena a)` — the callee
+                     * bumps a COPY over the caller's buffer. */
+                    check_unique_resource_copy(c, node->loc.line, node->call.args[i],
+                                               arg, "pass");
 
-                    if (!value_flows_to(node->call.args[i], arg, param) &&
+                    if (!value_flows_to(c, node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
                         char what[48];
                         snprintf(what, sizeof(what), "argument %u", i + 1);
@@ -8758,6 +9266,10 @@ static Type *check_expr(Checker *c, Node *node) {
                                           ? aroot->field.object
                                           : aroot->index_expr.object;
                             }
+                            /* BUG-919 (keep sink): `&pool.get(h).v` names slot h
+                             * exactly as `&h.v` does; peel the get() to its
+                             * handle so both spellings are classified alike. */
+                            aroot = pool_get_handle_root(c, aroot);
                             if (aroot && aroot->kind == NODE_IDENT) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
                                 aroot->ident.name,
@@ -9812,6 +10324,17 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *obj_raw = check_expr(c, node->slice.object);
         /* BUG-410: unwrap distinct for slice/array/integer dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
+        /* BUG-922: `p.w[0..]` — a slice formed directly over an array field of a
+         * packed struct (the explicit twin of the implicit coercion refused in
+         * value_flows_to). */
+        if (packed_array_field_view(c, node->slice.object)) {
+            checker_error(c, node->loc.line,
+                "cannot form a slice over an array field of a packed struct — its "
+                "elements are not aligned, so element accesses through the slice would "
+                "be misaligned loads/stores (a hard fault on ARM/RISC-V, a silent split "
+                "access on Cortex-M0+). Copy the field into an aligned array first, or "
+                "use a byte array (u8 elements are never misaligned)");
+        }
 
         /* BUG-881: BIT EXTRACTION THROUGH A POINTER.
          *
@@ -9959,6 +10482,29 @@ static Type *check_expr(Checker *c, Node *node) {
          * break/continue. The NODE_RETURN/NODE_BREAK/NODE_CONTINUE handlers
          * enforce these bans, but orelse fallback is a flag — those handlers
          * never run. Without these explicit checks, the bans are silent. */
+        /* BUG-918: a bare `orelse return` returns the ZERO of the function's
+         * return type. For an integer that is the documented 0; for a slice or a
+         * struct the emitter now builds `(T){0}`; but for a NON-NULL pointer or
+         * funcptr there is no zero VALUE — the zero is exactly the NULL the type
+         * forbids, and `*T pick(?*T o) { *T t = o orelse return; ... }` handed
+         * the caller a null `*T` (hosted: memory-fault trap on the deref; bare
+         * metal: a read of address 0). Same class as the var-decl "non-null
+         * pointer requires an initializer" rule; same predicate. */
+        if (node->orelse.fallback_is_return && c->current_func_ret) {
+            bool zf = false;
+            Type *zh = nonnull_zero_hole(c->current_func_ret, &zf);
+            if (zh) {
+                checker_error(c, node->loc.line,
+                    "bare 'orelse return' in a function returning non-null '%s' — "
+                    "a bare return yields the type's zero value, and a %s has no "
+                    "valid zero (it would be the NULL the type forbids). Return "
+                    "'?%s' from the function, or unwrap explicitly and return a "
+                    "real value on the null path",
+                    type_name(c->current_func_ret),
+                    zf ? "function pointer" : "non-null pointer",
+                    type_name(c->current_func_ret));
+            }
+        }
         if (node->orelse.fallback_is_return &&
             zer_return_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
             if (c->defer_depth > 0) {
@@ -10057,7 +10603,7 @@ static Type *check_expr(Checker *c, Node *node) {
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
                 /* fallback must match unwrapped type */
-                if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
+                if (!value_flows_to(c, node->orelse.fallback, fallback, unwrapped)) {
                     if (!report_negative_const_flow(c, node->orelse.fallback, unwrapped,
                                                     node->loc.line, "orelse fallback"))
                         checker_error(c, node->loc.line,
@@ -13252,14 +13798,31 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             *out_len = (uint32_t)node->ident.name_len;
             return true;
         }
+        /* BUG-915: not a global — a STATIC LOCAL declared earlier in this body
+         * (or an enclosing block of it) is the same hazard under a narrower
+         * name. `const`/single-word-volatile statics were filtered at the
+         * declaration, so anything in the list is a race. */
+        if (!sym && static_local_lookup(node->ident.name, (uint32_t)node->ident.name_len)) {
+            _flagged_static_local = true;
+            *out_name = node->ident.name;
+            *out_len = (uint32_t)node->ident.name_len;
+            return true;
+        }
         return false;
     }
     /* Recurse into children */
     switch (node->kind) {
-    case NODE_BLOCK:
+    case NODE_BLOCK: {
+        /* BUG-915: static locals are scoped to the block that declares them. */
+        int _sl_saved = _static_local_count;
         for (int i = 0; i < node->block.stmt_count; i++)
-            if (scan_unsafe_global_access(c, node->block.stmts[i], out_name, out_len)) return true;
+            if (scan_unsafe_global_access(c, node->block.stmts[i], out_name, out_len)) {
+                _static_local_count = _sl_saved;
+                return true;
+            }
+        _static_local_count = _sl_saved;
         return false;
+    }
     case NODE_IF:
         if (scan_unsafe_global_access(c, node->if_stmt.cond, out_name, out_len)) return true;
         if (scan_unsafe_global_access(c, node->if_stmt.then_body, out_name, out_len)) return true;
@@ -13281,6 +13844,12 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * descend into do_inc so a later `fp()` reaching a non-shared global
          * is caught (the direct-call scan can't resolve the local callee). */
         if (scan_funcname_binding(c, node->var_decl.init, out_name, out_len)) return true;
+        /* BUG-915: a static local is shared storage. Same exemptions as a global:
+         * const, and the single-word volatile flag idiom. */
+        if (node->var_decl.is_static && node->var_decl.name && !node->var_decl.is_const &&
+            !(node->var_decl.is_volatile &&
+              volatile_type_exempt_single_word(c, checker_get_type(c, node))))
+            static_local_push(node->var_decl.name, (uint32_t)node->var_decl.name_len);
         /* BUG-792: remember `*u32 p = &counter` so a later `*p += 1` in this body
          * resolves to counter. Recorded here because the scan cannot look up
          * another function's locals through the scope chain. */
@@ -13726,6 +14295,13 @@ static void check_stmt(Checker *c, Node *node) {
                     "use '?*%s' for nullable pointers",
                     type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
+            /* BUG-917: the same "auto-zero is not a value of this type" question
+             * for a bare enum with no zero-valued variant. The exhaustive-switch
+             * trap (ir_lower) catches every door at run time; this is the one door
+             * that can be closed at compile time with a one-line restructure. */
+            enum_no_zero_variant_init_check(c, node->loc.line, type,
+                                            node->var_decl.name,
+                                            (uint32_t)node->var_decl.name_len);
         }
 
         typemap_set(c, node,type); /* store for emitter to read via checker_get_type */
@@ -13771,6 +14347,9 @@ static void check_stmt(Checker *c, Node *node) {
                         type_name(init_type), type_name(init_type));
                 }
             }
+            /* BUG-916: `Arena b = a;` — var-decl copy of a unique resource. */
+            check_unique_resource_copy(c, node->loc.line, node->var_decl.init,
+                                       init_type, "initialize from");
 
             /* non-storable check: pool.get(h) pointer result.
              * BUG-405: only block when result is a pointer — scalar values
@@ -13882,7 +14461,7 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            if (!value_flows_to(node->var_decl.init, init_type, type)) {
+            if (!value_flows_to(c, node->var_decl.init, init_type, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
                          (int)node->var_decl.name_len, node->var_decl.name);
@@ -14218,6 +14797,10 @@ static void check_stmt(Checker *c, Node *node) {
              * Shared with the assignment sink via the helper (they must not
              * drift — the assignment form was previously un-tainted). */
             mark_slice_local_derived_from_value(c, sym, type, node->var_decl.init);
+
+            /* BUG-924: record WHICH local this value references (declaration site). */
+            if (sym && node->var_decl.init)
+                record_borrow_root(c, sym, node->var_decl.init, true);
 
             /* @ptrcast provenance: track original type when casting to *opaque.
              * *opaque ctx = @ptrcast(*opaque, sensor_ptr) → provenance = Sensor type.
@@ -16149,8 +16732,34 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* BUG-916: returning a GLOBAL/static unique resource by value hands
+             * the caller a second owner of the same state. A LOCAL returned by
+             * value is a move (the local dies with the frame), so only a root
+             * that outlives the call is a copy. */
+            if (c->current_func_ret && node->ret.expr &&
+                expr_reads_existing_object(node->ret.expr) &&
+                type_unique_resource_name(ret_type, 0)) {
+                Node *rr = node->ret.expr;
+                while (rr && (rr->kind == NODE_FIELD || rr->kind == NODE_INDEX ||
+                              rr->kind == NODE_TYPECAST ||
+                              (rr->kind == NODE_UNARY && rr->unary.op == TOK_STAR))) {
+                    if (rr->kind == NODE_FIELD) rr = rr->field.object;
+                    else if (rr->kind == NODE_INDEX) rr = rr->index_expr.object;
+                    else if (rr->kind == NODE_TYPECAST) rr = rr->typecast.expr;
+                    else rr = rr->unary.operand;
+                }
+                Symbol *rs = (rr && rr->kind == NODE_IDENT)
+                    ? scope_lookup(c->current_scope, rr->ident.name,
+                                   (uint32_t)rr->ident.name_len) : NULL;
+                bool rs_global = rs && (rs->is_static ||
+                    scope_lookup_local(c->global_scope, rs->name, rs->name_len) == rs);
+                if (!rs || rs_global || (rr && rr->kind != NODE_IDENT))
+                    check_unique_resource_copy(c, node->loc.line, node->ret.expr,
+                                               ret_type, "return");
+            }
+
             if (c->current_func_ret) {
-                if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
+                if (!value_flows_to(c, node->ret.expr, ret_type, c->current_func_ret)) {
                     if (!report_negative_const_flow(c, node->ret.expr,
                                                     c->current_func_ret,
                                                     node->loc.line, "return value"))
@@ -17674,7 +18283,7 @@ static void check_stmt(Checker *c, Node *node) {
                         typemap_set(c, node->spawn_stmt.args[i], param_type);
                     }
                 }
-                if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
+                if (!value_flows_to(c, node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
                     snprintf(what, sizeof(what), "spawn argument %d", i + 1);
                     if (!report_negative_const_flow(c, node->spawn_stmt.args[i],
@@ -17790,8 +18399,10 @@ static void check_stmt(Checker *c, Node *node) {
                  * record it on the handle so join clears it); a parent WRITE to
                  * it before join is a data race. Shared structs are excluded
                  * (auto-locked); globals/statics outlive the thread. */
+                /* BUG-924: each argument may borrow TWO locals (its own root
+                 * ident and the recorded local it references). */
                 int bcap = node->spawn_stmt.arg_count > 0
-                             ? node->spawn_stmt.arg_count : 1;
+                             ? node->spawn_stmt.arg_count * 2 : 1;
                 sym->th_borrow_names = (const char **)arena_alloc(c->arena,
                     sizeof(const char *) * (size_t)bcap);
                 sym->th_borrow_lens = (uint32_t *)arena_alloc(c->arena,
@@ -17800,8 +18411,52 @@ static void check_stmt(Checker *c, Node *node) {
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
                     if (!ba || ba->kind != NODE_UNARY ||
-                        ba->unary.op != TOK_AMP || !ba->unary.operand)
+                        ba->unary.op != TOK_AMP || !ba->unary.operand) {
+                        /* BUG-924 (2026-09-04): a NON-`&` argument that reaches the
+                         * parent's memory — a pointer/slice local, a by-value
+                         * struct carrying one, a slice of a local array, an
+                         * optional pointer — establishes the SAME borrow as `&v`.
+                         * Two locals are lent: (1) the argument's own root ident
+                         * when its type carries a non-shared pointer (a write
+                         * THROUGH it, `*q = 3` / `s[0] = 3` / `*h.p = 3`, walks to
+                         * that ident at the write-side check), and (2) the local
+                         * whose storage the value references, recorded at its
+                         * derivation (`v` for `q = &v`, `buf` for `s = buf`). A
+                         * value that is frame-derived with NO nameable root cannot
+                         * be borrowed, so it is REJECTED — cannot prove ⇒ reject. */
+                        if (!ba) continue;
+                        Node *pa = unwrap_ptr_launder(ba);
+                        if (pa && pa->kind == NODE_ORELSE) pa = pa->orelse.expr;
+                        Node *aroot = borrow_chain_root(pa);
+                        if (aroot && aroot->kind == NODE_IDENT) {
+                            Symbol *as = scope_lookup(c->current_scope, aroot->ident.name,
+                                                      (uint32_t)aroot->ident.name_len);
+                            bool aglobal = scope_lookup_local(c->global_scope,
+                                aroot->ident.name, (uint32_t)aroot->ident.name_len) != NULL;
+                            if (as && !aglobal && !as->is_static && as->type &&
+                                type_carries_nonshared_pointer(as->type, 0))
+                                scoped_spawn_borrow(c, sym, as, aroot->ident.name,
+                                    (uint32_t)aroot->ident.name_len, bcap, node->loc.line);
+                        }
+                        BorrowRoot br = borrow_root_of_value(c, ba, 0);
+                        if (br.unknown) {
+                            checker_error(c, node->loc.line,
+                                "spawn argument %d references a local whose identity "
+                                "the compiler cannot resolve (a call result, a capture, "
+                                "or a carrier holding pointers into two different "
+                                "locals), so the exclusive borrow until .join() cannot "
+                                "be established — a parent write to that local before "
+                                "the join would be a data race. Pass '&local' directly, "
+                                "or copy the data by value", bi + 1);
+                            continue;
+                        }
+                        if (br.name) {
+                            Symbol *rs = scope_lookup(c->current_scope, br.name, br.len);
+                            scoped_spawn_borrow(c, sym, rs, br.name, br.len, bcap,
+                                                node->loc.line);
+                        }
                         continue;
+                    }
                     /* S2 (2026-08-02): walk the &-operand's field/index chain to
                      * the root ident. The matcher required a BARE NODE_IDENT, so
                      * an INTERIOR pointer (`spawn worker(&b.v)`) established NO
@@ -17847,39 +18502,7 @@ static void check_stmt(Checker *c, Node *node) {
                         continue;
                     }
                     if (!vs || vs->is_static || vglobal || !vs->type) continue;
-                    Type *vt = type_unwrap_distinct(vs->type);
-                    bool vshared = vt && vt->kind == TYPE_STRUCT &&
-                        (vt->struct_type.is_shared || vt->struct_type.is_shared_rw);
-                    if (vshared) continue;
-                    /* D6 (2026-08-01): the flag was set UNCONDITIONALLY, so lending
-                     * the SAME local to a second live scoped spawn (`spawn a(&x);
-                     * spawn b(&x);` before either join) was accepted — two threads
-                     * mutating one stack local, a worker-vs-worker race the
-                     * parent-write check cannot see. Reject an already-borrowed
-                     * local; join() clears the flag, so sequential borrow (spawn,
-                     * join, spawn again) still compiles. */
-                    if (vs->is_borrowed_by_thread) {
-                        checker_error(c, node->loc.line,
-                            "'%.*s' is already borrowed by a live scoped spawn — "
-                            "lending it to a second thread is a data race. join() "
-                            "the first thread before spawning the second",
-                            (int)vl, vn);
-                        continue;
-                    }
-                    vs->is_borrowed_by_thread = true;
-                    /* D7: record EVERY borrow (was: first only, then `break`), so
-                     * join() releases each. First entry mirrors the legacy field. */
-                    if (sym->th_borrow_names && sym->th_borrow_lens &&
-                        sym->th_borrow_count < bcap) {
-                        sym->th_borrow_names[sym->th_borrow_count] = vn;
-                        sym->th_borrow_lens[sym->th_borrow_count] = vl;
-                        sym->th_borrow_count++;
-                    }
-                    if (!sym->th_borrows_name) {
-                        sym->th_spawn_branch_depth = c->branch_depth;
-                        sym->th_borrows_name = vn;
-                        sym->th_borrows_name_len = vl;
-                    }
+                    scoped_spawn_borrow(c, sym, vs, vn, vl, bcap, node->loc.line);
                 }
             }
         }
@@ -17890,6 +18513,7 @@ static void check_stmt(Checker *c, Node *node) {
             func_sym->func_node->func_decl.body) {
             const char *bad_name = NULL;
             uint32_t bad_len = 0;
+            rmw_alias_reset();   /* BUG-915: the "what was flagged" bits must not carry over */
             if (scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
                                            &bad_name, &bad_len)) {
                 /* If function uses @atomic_* or @barrier — developer is doing manual
@@ -17910,6 +18534,11 @@ static void check_stmt(Checker *c, Node *node) {
                         "volatile global '%.*s' — data race. volatile gives NO atomicity, "
                         "so the read and the write can interleave with another thread; "
                         "use @atomic_add / @atomic_* or a shared struct" :
+                        _flagged_static_local ?
+                        "spawn target '%.*s' accesses static local '%.*s' — a static "
+                        "local is ONE object shared by every thread that runs the "
+                        "function (data race). Use a shared struct, threadlocal, or "
+                        "@atomic_*" :
                         "spawn target '%.*s' accesses non-shared global '%.*s' — "
                         "data race. Use shared struct, threadlocal, or @atomic_* "
                         "(volatile is NOT synchronization — it gives no atomicity "
@@ -18553,6 +19182,10 @@ static void register_decl(Checker *c, Node *node) {
                     "use '?*%s' for nullable pointers",
                     type_name(nz->pointer.inner), type_name(nz->pointer.inner));
             }
+            /* BUG-917: global sibling of the local rule — one query at both. */
+            enum_no_zero_variant_init_check(c, node->loc.line, type,
+                                            node->var_decl.name,
+                                            (uint32_t)node->var_decl.name_len);
         }
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,
@@ -20002,6 +20635,30 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
     }
 }
 
+/* BUG-915: the static-local twin of track_isr_global. Keyed by the declaration
+ * NODE, not the name — two functions may each own a `static u32 c`. */
+static void track_isr_static_local(Checker *c, Node *decl) {
+    if (!decl || decl->kind != NODE_VAR_DECL) return;
+    for (int i = 0; i < c->isr_global_count; i++) {
+        struct IsrGlobal *g = &c->isr_globals[i];
+        if (g->decl != decl) continue;
+        if (c->in_interrupt) g->from_isr = true; else g->from_func = true;
+        return;
+    }
+    if (c->isr_global_count >= c->isr_global_capacity) {
+        int new_cap = c->isr_global_capacity * 2;
+        if (new_cap < 16) new_cap = 16;
+        c->isr_globals = realloc(c->isr_globals, new_cap * sizeof(struct IsrGlobal));
+        c->isr_global_capacity = new_cap;
+    }
+    struct IsrGlobal *g = &c->isr_globals[c->isr_global_count++];
+    memset(g, 0, sizeof(*g));
+    g->name = decl->var_decl.name;
+    g->name_len = (uint32_t)decl->var_decl.name_len;
+    g->decl = decl;
+    if (c->in_interrupt) g->from_isr = true; else g->from_func = true;
+}
+
 /* ISR-TRANS: the ISR global-access safety checks ("accessed from both ISR and
  * main → must be volatile", "volatile compound RMW → non-atomic") only saw the
  * globals lexically inside the `interrupt {}` body. If the ISR touched a global
@@ -20185,6 +20842,14 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
     case NODE_VAR_DECL:
+        /* BUG-915 (mirrored sink): a STATIC LOCAL declared in a function the ISR
+         * reaches is shared storage between the ISR and whichever main-code path
+         * also runs that function — the same hazard as a global, under a name
+         * the global-scope lookup in the NODE_IDENT arm can never resolve. The
+         * main-code side is recorded by check_expr's NODE_IDENT (it sees the
+         * Symbol); both sides key on the DECLARATION node. */
+        if (node->var_decl.is_static && !node->var_decl.is_const)
+            track_isr_static_local(c, node);
         /* BUG-792 (mirrored sink): remember `*u32 p = &counter` so a later
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
@@ -20659,26 +21324,44 @@ static void check_interrupt_safety(Checker *c) {
         struct IsrGlobal *g = &c->isr_globals[i];
         if (!g->from_isr || !g->from_func) continue; /* not shared */
         /* shared global — check volatile */
-        Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
-        if (!sym) continue;
-        if (!sym->is_volatile) {
-            checker_error(c, sym->line,
-                "global '%.*s' is accessed from both interrupt and main code — "
+        Symbol *sym = NULL;
+        bool g_volatile;
+        int g_line;
+        Type *g_type;
+        const char *g_what;
+        if (g->decl) {
+            /* BUG-915: a static local has no global-scope Symbol; its
+             * declaration carries everything the three checks below need. */
+            g_volatile = g->decl->var_decl.is_volatile;
+            g_line = g->decl->loc.line;
+            g_type = checker_get_type(c, g->decl);
+            g_what = "static local";
+        } else {
+            sym = scope_lookup(c->global_scope, g->name, g->name_len);
+            if (!sym) continue;
+            g_volatile = sym->is_volatile;
+            g_line = (int)sym->line;
+            g_type = sym->type;
+            g_what = "global";
+        }
+        if (!g_volatile) {
+            checker_error(c, g_line,
+                "%s '%.*s' is accessed from both interrupt and main code — "
                 "must be declared volatile",
-                (int)g->name_len, g->name);
+                g_what, (int)g->name_len, g->name);
         } else if (g->compound_in_isr || g->compound_in_func) {
             /* volatile but compound assignment — race condition */
-            checker_error(c, sym->line,
+            checker_error(c, g_line,
                 /* BUG-792: no longer only `+=` and no longer only a NAMED target —
                  * the rule now also sees `g = g + 1` and writes reaching g through a
                  * pointer — so the message must describe the OPERATION, not one
                  * spelling of it. */
-                "volatile global '%.*s' is read-modify-written in a single "
+                "volatile %s '%.*s' is read-modify-written in a single "
                 "statement and is shared between interrupt and main code — "
                 "the read and the write can be split by an interrupt, losing an "
                 "update; use an explicit read/mask/write or @atomic_*",
-                (int)g->name_len, g->name);
-        } else if (!volatile_global_exempt_from_race_check(c, sym)) {
+                g_what, (int)g->name_len, g->name);
+        } else if (!volatile_type_exempt_single_word(c, g_type)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and
              * shape. The exemption exists for the SINGLE-WORD flag idiom; a
              * `volatile u64` on a 32-bit target, a `volatile u128`, or a volatile
@@ -20692,13 +21375,13 @@ static void check_interrupt_safety(Checker *c) {
              * The spawn site was fixed first and this one was missed — both now
              * call volatile_global_exempt_from_race_check, and
              * tests/test_hw_matrix.c pins them together. */
-            checker_error(c, sym->line,
-                "volatile global '%.*s' is shared between interrupt and main "
+            checker_error(c, g_line,
+                "volatile %s '%.*s' is shared between interrupt and main "
                 "code but is not a single-word scalar — the access lowers to "
                 "several loads/stores, so a reader can TEAR (observe half of one "
                 "write and half of another). volatile gives no atomicity. Use a "
                 "single-word scalar flag, or @atomic_* on a *shared T",
-                (int)g->name_len, g->name);
+                g_what, (int)g->name_len, g->name);
         }
     }
 }
@@ -21915,7 +22598,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "global arrays must use literal initializers",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
             }
-            if (!value_flows_to(decl->var_decl.init, init, type)) {
+            if (!value_flows_to(c, decl->var_decl.init, init, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",
                          (int)decl->var_decl.name_len, decl->var_decl.name);
@@ -22932,6 +23615,25 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
         return n;
     }
     case NODE_SWITCH: return collect_shared_types_in_expr(c, stmt->switch_stmt.expr, types, max_types, 0);
+    case NODE_SPAWN: {
+        /* BUG-914: the spawn ARGUMENTS are evaluated in the parent thread as
+         * ONE statement, and the emitter locks exactly ONE shared root per
+         * argument (find_shared_root). `spawn w(a.x + b.y)` therefore read
+         * `b.y` with no lock at all — measured in the emitted C:
+         *     pthread_mutex_lock(&a._zer_mtx); _sa->a0 = (a.x + b.y);
+         * This statement kind returned 0 here, so the same-statement
+         * two-shared-types rule that rejects `a.x = b.y` never saw it. Collect
+         * across every argument, exactly like the FOR init+cond arm above. */
+        /* Each ARGUMENT is its own lock scope (the emitter locks, copies,
+         * unlocks per argument), so `spawn w(a.x, b.y)` is two sequential
+         * single-root reads and stays legal; only two roots inside ONE argument
+         * are held together. Collect per argument; report the first offender. */
+        for (int ai = 0; ai < stmt->spawn_stmt.arg_count; ai++) {
+            int n = collect_shared_types_in_expr(c, stmt->spawn_stmt.args[ai], types, max_types, 0);
+            if (n >= 2) return n;
+        }
+        return 0;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — same shape as
      * find_shared_type_in_stmt above. Statement kinds without a
      * cond/init/expr that could read a shared struct return 0. */
@@ -22942,7 +23644,7 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:

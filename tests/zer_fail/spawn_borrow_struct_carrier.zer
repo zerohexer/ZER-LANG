@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-924 (2026-09-04): a by-value struct CARRYING &v is the same borrow as &v.
+struct H { *u32 p; }
+void w(H h) { *h.p = 5; }
+u32 main() {
+    u32 v = 0;
+    H h;
+    h.p = &v;
+    ThreadHandle th = spawn w(h);
+    v = 3;
+    th.join();
+    return v;
+}

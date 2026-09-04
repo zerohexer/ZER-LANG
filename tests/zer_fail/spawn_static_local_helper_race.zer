@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: accesses static local 'c'
+// BUG-915: reached transitively through a helper, with the RMW written out.
+u32 bump() { static u32 c = 0; c = c + 1; return c; }
+void w() { u32 x = bump(); }
+u32 main() { spawn w(); u32 y = bump(); return 0; }

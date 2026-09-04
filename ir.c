@@ -71,7 +71,24 @@ int ir_add_local(IRFunc *func, Arena *arena,
                 bool same_type = (!type || !func->locals[i].type ||
                                   type == func->locals[i].type);
                 bool same_scope = (func->locals[i].scope_depth == cur_depth);
-                if (same_type && same_scope) return func->locals[i].id;
+                /* BUG-913: a CAPTURE may only dedup with another CAPTURE, and a
+                 * plain local only with a plain local. `u32 v = 5; ?u32 o = 7;
+                 * if (o) |v| { }` dedup'd the capture `v` onto the OUTER `v`
+                 * (same name, same type, and the capture is created at the
+                 * enclosing scope depth), so the unwrap `v = o.value` OVERWROTE
+                 * the outer variable and `return v` after the if gave 7, not 5 —
+                 * a silent wrong value. The two-captures-share-a-local rule the
+                 * comment above describes stays; it never meant "share with a
+                 * variable the user declared". */
+                bool same_kind = (func->locals[i].is_capture == is_capture);
+                if (same_type && same_scope && same_kind) {
+                    /* A re-declared capture (second `if (b) |v|` in the same
+                     * scope) comes back into scope: the NODE_IF lowering hides a
+                     * capture once its then-body is done, so unhide it here or
+                     * ir_find_local would prefer an outer visible `v`. */
+                    if (is_capture) func->locals[i].hidden = false;
+                    return func->locals[i].id;
+                }
                 /* Different type OR different scope → fall through to create
                  * new suffixed local. Use `_%d` with the count to ensure
                  * uniqueness across suffixed + unsuffixed variants. */

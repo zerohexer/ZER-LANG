@@ -74,7 +74,7 @@ u48 big;                 // 48-bit
 - Widths 1..128. Same no-implicit-narrowing rule as u8..u64 (`u21 x = @truncate(u21, big);`).
 - Arithmetic on bare integer literals is `u32`, so `u21 x = 1000 + 500;` is rejected (u32→u21 narrowing). Write a fitting literal (`u21 x = 1500;`) or use `uN`-typed operands (`u21 a = 1000; u21 x = a + 500;` — this wraps at 2^N).
 - Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
-- A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.
+- A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`. Bit-slice reads AND writes work on a `uN` (`u12 r; r[11..8] = 15;`), on a local or a struct field alike; `hi` must be below N.
 - `>64`-bit arithmetic (`u128` …) works but is emulated (multi-word). For hand-tuned big-int, use the `@addc`/`@subb`/`@mulw` carry primitives.
 
 **SEE ALSO**
@@ -259,8 +259,8 @@ process(arr);              // auto-coerces: T[N] → [*]T
 ```
 
 **FIELDS**
-- `.ptr` → *T — Raw pointer to first element
-- `.len` → usize — Number of elements
+- `.ptr` → *T — Raw pointer to first element (READ-ONLY)
+- `.len` → usize — Number of elements (READ-ONLY)
 
 **SUB-SLICING**
 ```zer
@@ -273,6 +273,21 @@ buf[..5]                   // elements 0-4
 - `[]T` is deprecated. Use `[*]T` instead. `[]T` emits a warning.
 - String literals are `const [*]u8`, not `char*`.
 - Cannot be null. Use `?[*]T` for nullable.
+- `.ptr` and `.len` are one bounds-checked view: the compiler REFUSES `s.len = n;`,
+  `s.ptr = q;` and `&s.len` / `&s.ptr` (a forged length or a retargeted pointer would let
+  the slice reach memory it does not own, and the bounds check would trust it). To change
+  what a slice views, rebuild it with a slice expression, which is bounds-checked:
+  ```zer
+  u32 main() {
+      u8[8] arr;
+      [*]u8 s = arr[0..4];
+      s = arr[2..6];          // OK — a new bounds-checked view
+      // s.len = 100;         // ERROR — cannot assign to '.len' of a slice
+      return 0;
+  }
+  ```
+- An array field of a `packed struct` cannot be viewed as a slice unless its elements
+  are bytes — see `packed struct`.
 
 **SEE ALSO**
 T[N], *T, []T
@@ -503,8 +518,35 @@ packed struct SensorPacket {
 }   // exactly 4 bytes, no padding
 ```
 
+**ALIGNMENT RULES**
+Direct field access (`p.temperature`) is always safe — the compiler emits an
+unaligned-tolerant access. What it refuses is anything that would hand out an
+ADDRESS into the packed layout and then access it as if aligned (a hard fault on
+ARM/RISC-V, a silent split access on Cortex-M0+, invisible on x86):
+- `&p.temperature` — a pointer to a multi-byte field → compile error.
+- `&p.w[0]` — a pointer to an element of a multi-byte array field → compile error.
+- A slice over a multi-byte array field, by ANY route — `p.w[0..]`, `[*]u32 s = p.w;`,
+  `fill(p.w)` → compile error.
+- Byte arrays are always fine: `u8` elements have alignment 1, so `[*]u8 v = p.payload;`
+  and `p.payload[2..5]` are legal.
+
+```zer
+packed struct Frame { u8 kind; u8[6] payload; u32[2] words; }
+u32 sum([*]u8 s) { u32 t = 0; for (u8 b in s) { t += b; } return t; }
+u32 main() {
+    Frame f;
+    f.words[0] = 7;                 // OK — direct access
+    u32 w = f.words[0];             // OK — read copies to an aligned local
+    [*]u8 view = f.payload;         // OK — byte elements
+    u32 t = sum(f.payload[1..4]);   // OK — byte elements
+    // [*]u32 ws = f.words;         // ERROR — cannot form a slice over an array field of a packed struct
+    // *u32 q = &f.words[0];        // ERROR — points into a PACKED struct field
+    return w - 7 + t;
+}
+```
+
 **SEE ALSO**
-struct, move struct
+struct, move struct, [*]T
 
 ---
 
@@ -579,6 +621,23 @@ enum Direction { left = -1, center = 0, right = 1 }
 **NOTES**
 - Dot syntax required: `State.idle`, not bare `idle`.
 - Switch arms use `.variant => { }` syntax.
+- **Every ZER variable is auto-zeroed, so an enum with no variant equal to 0 has
+  no default value.** Declaring one without an initializer is a compile error
+  (`enum E { a = 1, b = 2 }  E e;` — initialize it: `E e = E.a;`). Storage the
+  declaration rule cannot see — a struct field, an array element, a calloc'd or
+  pool-allocated object — still holds 0 there, and an exhaustive `switch` on such
+  a value **traps at runtime** ("enum value outside its variant set") instead of
+  silently running one of its arms. Giving one variant the value 0 avoids both.
+
+<!-- audit: skip -->
+```zer
+enum Cmd { read = 1, write = 2 }
+Cmd c;                     // compile error: no variant is 0
+Cmd d = Cmd.read;          // OK
+struct Pkt { Cmd cmd; }
+Pkt p;                     // allowed — p.cmd is 0
+switch (p.cmd) { .read => { } .write => { } }   // TRAPS: 0 is not a variant
+```
 
 **SEE ALSO**
 switch, union
@@ -960,6 +1019,23 @@ void count() {
 static void helper() { }    // not exported
 ```
 
+**NOTES**
+- A static local is ONE object for every caller of the function, so it is
+  shared storage exactly like a global. A function reached from a `spawn`ed
+  thread that touches a non-`const` static local is a data race (compile error,
+  same rule and same escape hatches as a global: `threadlocal`, `@atomic_*`, a
+  `shared struct`, or a single-word `volatile` flag). A static local in a
+  function reached from BOTH an `interrupt` handler and main code must be
+  `volatile`, like a shared global.
+
+<!-- audit: skip -->
+```zer
+void count() { static u32 n; n += 1; }
+spawn count();             // compile error: 'count' accesses static local 'n'
+void flag() { static volatile u32 done; done = 1; }
+spawn flag();              // OK — single-word volatile store
+```
+
 ---
 
 ## CONTROL FLOW
@@ -1269,7 +1345,31 @@ u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is ba
 
 **NOTES**
 - `orelse return` has no value. The return value comes from the function's return type.
+- The value returned is the type's ZERO: `0` for an integer/float/bool/Handle,
+  null for an optional, an empty slice for `[*]T`, an all-zero struct for a
+  struct return. A function returning a non-null pointer or a function pointer
+  has no zero value, so a bare `orelse return` there is a compile error — return
+  `?*T` from the function, or unwrap explicitly and return a real value.
 - For bool-returning functions, restructure to avoid orelse in return path.
+
+```zer
+struct P { u32 x; }
+[*]u8 pick(?[*]u8 o) { [*]u8 s = o orelse return; return s; }   // empty slice on null
+P make(?u32 o) { u32 v = o orelse return; P p; p.x = v; return p; } // zero P on null
+u32 main() {
+    ?[*]u8 none = null;
+    ?u32 no = null;
+    if (pick(none).len != 0) { return 1; }
+    if (make(no).x != 0) { return 2; }
+    return 0;
+}
+```
+
+<!-- audit: skip -->
+```zer
+struct T { u32 v; }
+*T first(?*T o) { *T t = o orelse return; return t; }   // compile error: no zero for *T
+```
 
 **SEE ALSO**
 ?T, ?*T, if-unwrap
@@ -1302,6 +1402,20 @@ if (result) |val| {
     use(val);              // val is u32, guaranteed non-null
 } else {
     handle_error();
+}
+```
+
+**NOTES**
+- The capture is a NEW variable scoped to the then-body. It may reuse the name
+  of an outer variable; the outer one is shadowed inside the body and untouched
+  after it:
+
+```zer
+u32 main() {
+    u32 v = 5;
+    ?u32 o = 7;
+    if (o) |v| { u32 inner = v; }   // inner == 7
+    return v - 5;                    // outer v is still 5 → exit 0
 }
 ```
 
@@ -1450,6 +1564,11 @@ u32 main() {
 - Pool does NOT use heap. Safe for ISR and bare metal.
 - `.get(h)` result is non-storable: `*Task t = tasks.get(h)` is a compile error.
   Must use inline: `tasks.get(h).field`.
+- A VIEW into the slot is tracked as an alias of `h`: `*u32 q = &tasks.get(h).v`,
+  `&h.v`, `&h.arr[0]`, `[*]u8 s = h.arr[0..]` or `tasks.get(h).arr[0..]` all
+  become invalid at `tasks.free(h)` — using one afterwards is a compile error
+  ("use after free"), and handing one to a function that retains it is refused
+  like `&h.v` is.
 - N must be a compile-time constant.
 
 **SEE ALSO**
@@ -1839,6 +1958,13 @@ ar.alloc_slice(Byte, 64);
   overflows, so a slice can never report a length the arena does not hold.
 - No individual free — arena is all-or-nothing.
 - Use `defer ar.reset()` to ensure cleanup on all exit paths.
+- **An Arena is not copyable.** `Arena b = a;`, `b = a;`, passing one by value,
+  returning a global one by value, or copying a struct that holds one is a
+  compile error: both copies would bump the SAME buffer and hand out the same
+  bytes twice. A fresh value (`Arena.over(...)`, or a local arena returned from
+  a factory) is not a copy. Give the arena one owner and reach it by name. The
+  same rule covers Pool, Slab, Ring, Barrier and Semaphore (a copied Barrier or
+  Semaphore never synchronizes with the original; pass `*Barrier`/`*Semaphore`).
 
 **SEE ALSO**
 Pool(T,N), Slab(T)
@@ -4070,6 +4196,26 @@ borrowed by that thread until `.join()`:
 - `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
   so the child would write the parent's slot. Pass it by value instead.
 - All `&` arguments are tracked, not just the first; `.join()` releases every one.
+- The borrow does not depend on the SPELLING of the argument. A pointer local bound
+  to `&x`, a slice viewing a local array, a by-value struct carrying `&x`, a pointer
+  parameter, an optional pointer — each lends the same storage as `&x` would, and
+  both the argument's own variable and the local it references are borrowed:
+  ```zer
+  void w(*u32 p) { *p = 5; }
+  u32 main() {
+      u32 v = 0;
+      *u32 q = &v;
+      ThreadHandle th = spawn w(q);   // borrows q AND v
+      // v = 3;                        // compile error — borrowed until the join
+      // *q = 3;                       // compile error — same borrow, through q
+      th.join();
+      v = v + 1;                       // OK — released
+      return v - 6;
+  }
+  ```
+  A value that references a local the compiler cannot name (a call result, a
+  capture, or one struct holding pointers into two different locals) is refused at
+  the spawn — spell those borrows as separate `&x` arguments.
 - A `.join()` **inside a branch** does not release the borrow for code after that
   branch — the other path never joined, so the thread may still be running:
   ```zer
@@ -4110,6 +4256,13 @@ borrowed by that thread until `.join()`:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)
   - Transitive: follows callees 8 levels deep
+  - A **static local** in any function the thread reaches counts as a
+    non-shared global (it is one object for every thread); `static const` and
+    a single-word `static volatile` flag are exempt like their global twins
+- The spawn ARGUMENTS are evaluated in the parent, one lock scope per
+  argument. Two different `shared` types inside ONE argument (`spawn w(a.x +
+  b.y)`) → compile error (the same-statement two-locks rule); in separate
+  arguments (`spawn w(a.x, b.y)`) they are locked one after the other and fine
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
   **single-word** `volatile` global
 - The same single-word restriction applies to a global shared between an
@@ -4198,6 +4351,9 @@ void use_resource(*Semaphore s) {
 - `Semaphore(0)` valid — producer-consumer pattern (start empty, producer releases).
 - Thread-safe: has own mutex + condvar internally.
 - Type-checked: `@sem_acquire` only accepts `Semaphore` or `*Semaphore`.
+- Not copyable: `Semaphore(1) t = s;` (and the same for `Barrier`) is a compile
+  error — the copy counts on its own and never pairs with the original. Share
+  one through a pointer.
 
 ### Atomics
 ```zer

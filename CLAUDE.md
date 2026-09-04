@@ -443,7 +443,7 @@ line, plus TEN axis-crossed matrices:
 |---|---|
 | `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
 | `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
-| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (684 baselined)` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (728 baselined)` |
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
@@ -1668,9 +1668,9 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 577 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 715 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 38 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |

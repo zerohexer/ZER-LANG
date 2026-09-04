@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-919: the same slice view through Handle auto-deref (`h.arr[0..]`).
+struct T { u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    [*]u8 s = h.arr[0..];
+    p.free(h);
+    s[0] = 7;
+    return 0;
+}

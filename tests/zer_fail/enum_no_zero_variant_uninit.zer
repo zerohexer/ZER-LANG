@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: has no variant with value 0
+// BUG-917: `E e;` auto-zeroes to 0, which is not a variant; the exhaustive
+// switch below silently ran its LAST arm (measured: exit 2).
+enum E { a = 1, b = 2 }
+u32 main() { E e; switch (e) { .a => { return 1; } .b => { return 2; } } return 3; }

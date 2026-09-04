@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916: a copied Semaphore counts on its own — acquire on the copy never
+// pairs with release on the original.
+Semaphore(1) s;
+u32 main() { Semaphore(1) t = s; @sem_acquire(t); @sem_release(s); return 0; }

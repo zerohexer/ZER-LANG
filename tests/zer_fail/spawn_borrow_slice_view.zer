@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-924 (2026-09-04): a slice VIEW of a local array lends the array.
+void w([*]u8 s) { s[0] = 5; }
+u32 main() {
+    u8[4] a;
+    [*]u8 s = a[0..2];
+    ThreadHandle th = spawn w(s);
+    a[1] = 3;                    // the array the thread is writing through s
+    th.join();
+    return 0;
+}

@@ -1,0 +1,17 @@
+// BUG-919 boundary: views into a live slot, used BEFORE the free, stay legal —
+// the alias must not over-reject the ordinary read-modify-free sequence.
+struct T { u32 v; u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    *u32 q = &p.get(h).v;
+    *q = 5;
+    [*]u8 s = p.get(h).arr[1..];
+    s[0] = 9;
+    *u8 e = &h.arr[2];
+    *e = 3;
+    u32 r = p.get(h).v + p.get(h).arr[1] + h.arr[2];
+    p.free(h);
+    if (r != 17) { return 1; }
+    return 0;
+}

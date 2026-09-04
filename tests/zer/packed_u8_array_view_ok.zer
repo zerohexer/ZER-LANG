@@ -1,0 +1,20 @@
+// BUG-922 (2026-09-04) precision witness: a slice over a BYTE array field of
+// a packed struct is fine — u8 elements have alignment 1, so no access
+// through the view can be misaligned. The rule keys on the ELEMENT alignment,
+// not on the packed attribute alone.
+packed struct Frame { u8 kind; u8[6] payload; u16 crc; }
+u32 sum([*]u8 s) {
+    u32 t = 0;
+    for (u8 b in s) { t += b; }
+    return t;
+}
+u32 main() {
+    Frame f;
+    f.payload[0] = 1; f.payload[1] = 2; f.payload[5] = 3;
+    [*]u8 view = f.payload;          // coercion
+    [*]u8 tail = f.payload[3..6];    // slice expression
+    if (sum(view) != 6) { return 1; }
+    if (sum(tail) != 3) { return 2; }
+    if (sum(f.payload) != 6) { return 3; }   // call-arg coercion
+    return 0;
+}

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot return 'Arena' by value
+// BUG-916: returning a GLOBAL Arena by value hands the caller a second owner
+// of the same bump state. (A LOCAL returned by value is a move and stays legal.)
+u8[64] gbuf;
+Arena ga;
+Arena get() { return ga; }
+u32 main() { ga = Arena.over(gbuf); Arena b = get(); return 0; }

@@ -1892,6 +1892,75 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
+/* BUG-919: the tracked ALLOCATION an lvalue path lives in, or NULL.
+ *
+ * `*u32 q = &p.get(h).v;  p.free(h);  *q = 7;` compiled clean and wrote into a
+ * freed pool slot (measured: exit 0, no diagnostic). The interior-pointer arm
+ * walks `&expr` down through FIELD/INDEX to a root IDENT and aliases the new
+ * pointer to that root's handle — but `pool.get(h)` is a NODE_CALL, so the
+ * walk stopped and no alias was formed. The slice-view arm had the mirror
+ * blind spot one step earlier: it bailed on any FIELD, so `h.arr[0..]` and
+ * `p.get(h).arr[0..]` (a Handle auto-deref, and a get()) escaped as untracked
+ * views too. Six shapes, one question: "which allocation does this path
+ * NAVIGATE within?"
+ *
+ * The rule is CLAUDE.md's forms-vs-reads: field/index/slice steps through
+ * INLINE storage are navigation inside one allocation and peel freely; a step
+ * that READS a reference (a pointer/slice/opaque FIELD, or indexing a
+ * pointer/slice object) lands in whatever that reference points to — resolved
+ * through the compound handle for a field, or the object's own handle for an
+ * indexed reference. A root that is `pool.get(h)` / `slab.get(h)` IS the slot h
+ * names, so it resolves to h's handle. Anything unresolvable returns NULL,
+ * which is exactly today's behaviour (no alias, no new rejection). */
+static IRHandleInfo *ir_view_root_handle(ZerCheck *zc, IRFunc *func,
+                                         IRPathState *ps, Node *expr) {
+    Node *cur = expr;
+    int guard = 0;
+    while (cur && guard++ < 64) {
+        if (cur->kind == NODE_SLICE) { cur = cur->slice.object; continue; }
+        if (cur->kind == NODE_INDEX) {
+            /* Indexing a reference (heap slice / pointer): the object itself
+             * carries the allocation; indexing an inline array navigates. Either
+             * way the answer is the object's, so just descend. */
+            cur = cur->index_expr.object;
+            continue;
+        }
+        if (cur->kind == NODE_FIELD) {
+            Type *ft = checker_get_type(zc->checker, cur);   /* the FIELD's type */
+            TypeKind fk = ft ? type_dispatch_kind(ft) : TYPE_VOID;
+            if (fk == TYPE_POINTER || fk == TYPE_SLICE || fk == TYPE_OPAQUE) {
+                /* READS a reference stored in the field: the allocation is the
+                 * one it points to — known only through the compound handle. */
+                int rl; const char *rp; uint32_t rpl;
+                if (ir_extract_compound_key(zc, func, cur, &rl, &rp, &rpl) == 0 &&
+                    rpl > 0 && rl >= 0)
+                    return ir_find_compound_handle(ps, rl, rp, rpl);
+                return NULL;
+            }
+            cur = cur->field.object;   /* inline field — navigation */
+            continue;
+        }
+        break;
+    }
+    if (!cur) return NULL;
+    if (cur->kind == NODE_IDENT) {
+        int lid = ir_find_local_exact_first(func, cur->ident.name,
+                                            (uint32_t)cur->ident.name_len);
+        if (lid < 0) return NULL;
+        return ir_find_handle(ps, lid);
+    }
+    if (cur->kind == NODE_CALL && cur->call.arg_count >= 1 &&
+        ir_classify_method_call_ex(zc->checker, cur) == IRMC_GET) {
+        int rl; const char *rp; uint32_t rpl;
+        if (ir_extract_compound_key(zc, func, cur->call.args[0], &rl, &rp, &rpl) == 0 &&
+            rl >= 0) {
+            if (rpl == 0) return ir_find_handle(ps, rl);
+            return ir_find_compound_handle(ps, rl, rp, rpl);
+        }
+    }
+    return NULL;
+}
+
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -3848,6 +3917,21 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                     }
+                } else if (sroot) {
+                    /* BUG-919: the walk stopped at a FIELD (`h.arr[0..]`,
+                     * `t.buf[2..]`) or a `pool.get(h)` CALL. Resolve the
+                     * allocation the path navigates within and alias the view to
+                     * it, exactly as the IDENT root above does. */
+                    IRHandleInfo *vsrc_h = ir_view_root_handle(zc, func, ps, slice_val);
+                    if (vsrc_h && vsrc_h->alloc_id != 0) {
+                        IRAliasSnapshot vsnap;
+                        ir_snapshot_alias(&vsnap, vsrc_h);
+                        IRHandleInfo *vdst_h = ir_add_handle(ps, b_dest);
+                        if (vdst_h) {
+                            ir_apply_alias(vdst_h, &vsnap);
+                            vdst_h->state = vsnap.state;
+                        }
+                    }
                 }
             }
         }
@@ -4520,6 +4604,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 ir_apply_alias(dst_h, &snap);
                                 dst_h->state = snap.state;
                             }
+                        }
+                    }
+                } else if (target && target->kind != NODE_IDENT && !used_compound) {
+                    /* BUG-919: `&pool.get(h).v` / `&pool.get(h).arr[0]` — the root
+                     * is the get() CALL, which names slot h. Alias the interior
+                     * pointer to h's handle so p.free(h) reaches it. */
+                    IRHandleInfo *vh = ir_view_root_handle(zc, func, ps, rhs->unary.operand);
+                    if (vh && vh->alloc_id != 0) {
+                        IRAliasSnapshot vsnap;
+                        ir_snapshot_alias(&vsnap, vh);
+                        IRHandleInfo *vdst_h = ir_add_handle(ps, inst->dest_local);
+                        if (vdst_h) {
+                            ir_apply_alias(vdst_h, &vsnap);
+                            vdst_h->state = vsnap.state;
                         }
                     }
                 }

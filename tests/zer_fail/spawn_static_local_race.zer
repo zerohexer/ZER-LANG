@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: accesses static local 'c'
+// BUG-915: a static local is ONE object for every thread that runs the
+// function. The spawn race scan resolved names against the global scope only,
+// so this compiled clean and raced.
+void w() { static u32 c = 0; c += 1; }
+u32 main() { spawn w(); spawn w(); return 0; }

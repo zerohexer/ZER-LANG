@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: points into a PACKED struct field
+// BUG-922 (2026-09-04): `&p.w[0]` — an INDEX step between the field and the
+// address-of — was not peeled by the packed-field rule, so the pointer
+// escaped the alignment check and `*q = 1` was a misaligned u32 store.
+packed struct P { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    *u32 q = &p.w[0];
+    *q = 1;
+    return p.w[0] - 1;
+}

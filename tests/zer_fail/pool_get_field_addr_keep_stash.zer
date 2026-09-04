@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-919 (keep sink): `stash(&pool.get(h).v)` hands a pointer INTO slot h to a
+// function that retains it; `stash(&h.v)` was already refused at this sink,
+// the get() spelling walked to a CALL root and was accepted.
+struct T { u32 v; }
+Pool(T, 4) p;
+?*u32 gq = null;
+void stash(*u32 q) { gq = q; }
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    stash(&p.get(h).v);
+    p.free(h);
+    return 0;
+}

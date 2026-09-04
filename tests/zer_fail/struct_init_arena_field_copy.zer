@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916: the struct-literal field is a value-flow site too.
+struct Ctx { Arena a; u32 n; }
+u8[64] gbuf;
+Arena ga;
+u32 main() { ga = Arena.over(gbuf); Ctx c = { .a = ga, .n = 1 }; return c.n - 1; }

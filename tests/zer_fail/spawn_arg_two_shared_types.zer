@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: deadlock: single statement accesses both
+// BUG-914: the spawn ARGUMENTS are one statement evaluated in the parent, and
+// the emitter locks ONE shared root per argument — `b.y` was read UNLOCKED
+// (measured in the emitted C). Same-statement two-shared-types rule now covers
+// NODE_SPAWN like every other statement kind.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void w(u32 v) { a.x = v; }
+u32 main() { spawn w(a.x + b.y); return 0; }

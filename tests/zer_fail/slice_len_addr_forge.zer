@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot take the address of '.len' of a slice
+// BUG-920 (2026-09-04): the sibling door — `&s.len` handed out a writable
+// pointer to the header field, so the forge happened one deref later.
+void bump(*usize n) { *n = 100; }
+u32 main() {
+    u8[4] a;
+    [*]u8 s = a;
+    bump(&s.len);
+    s[50] = 1;
+    return 0;
+}

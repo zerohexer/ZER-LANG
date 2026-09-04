@@ -1,0 +1,21 @@
+// BUG-913: an if-unwrap capture with the SAME NAME and TYPE as an outer local
+// used to be dedup'd onto that local by the IR lowerer, so the unwrap
+// `v = o.value` OVERWROTE the outer variable and `return v` gave 7, not 5.
+// Also pins: two sequential captures of one name (they may share a local),
+// a capture read from a defer, and a pointer capture writing back.
+u32 g = 0;
+u32 main() {
+    u32 v = 5;
+    ?u32 o = 7;
+    if (o) |v| { u32 t = v; if (t != 7) { return 1; } }
+    if (v != 5) { return 2; }
+    ?u32 a = 1; ?u32 b = 2;
+    if (a) |v| { defer { g = v; } u32 t = v; if (t != 1) { return 3; } }
+    if (b) |v| { u32 t = v + 1; if (t != 3) { return 4; } }
+    if (g != 1) { return 5; }
+    if (a) |*v| { *v = 10; }
+    u32 x = a orelse 0;
+    if (x != 10) { return 6; }
+    if (v != 5) { return 7; }
+    return 0;
+}

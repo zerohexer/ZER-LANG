@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: bare 'orelse return' in a function returning non-null
+// BUG-918: the zero of `*T` is the NULL the type forbids; the caller then
+// dereferenced it (hosted: memory-fault trap; bare metal: a read of address 0).
+struct T { u32 v; }
+*T pick(?*T o) { *T t = o orelse return; return t; }
+u32 main() { return 0; }

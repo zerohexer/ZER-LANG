@@ -1,0 +1,24 @@
+// BUG-923 (2026-09-04): a bit-slice WRITE `r[hi..lo] = v` on a non-native-
+// width integer (u12 here) was emitted with the uN width mask wrapped around
+// the whole read-modify-write assignment, which produced C that did not
+// compile ("lvalue required") for a local and a struct field alike. The mask
+// belongs to the VALUE, not to the bit-slice store; the store's own mask
+// already keeps the result inside N bits.
+struct Reg { u12 ctl; u32 pad; }
+u32 main() {
+    u12 r = 0;
+    r[11..8] = 15;
+    r[3..0] = 3;
+    if (r != 0xF03) { return 1; }
+
+    Reg s;
+    s.ctl[11..8] = 15;
+    s.ctl[3..0] = 3;
+    if (s.ctl != 0xF03) { return 2; }
+
+    u8 b = 0;                 // native width still works
+    b[7..4] = 15;
+    b[3..0] = 3;
+    if (b != 0xF3) { return 3; }
+    return 0;
+}

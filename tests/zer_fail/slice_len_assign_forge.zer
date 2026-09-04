@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to '.len' of a slice
+// BUG-920 (2026-09-04): a slice's header fields were plain assignable, so
+// `s.len = 100` forged a view 96 bytes longer than its 4-byte storage and
+// `s[50] = 1` passed the bounds check against the forged length — a silent
+// out-of-bounds write with no diagnostic at compile time or run time.
+u32 main() {
+    u8[4] a;
+    [*]u8 s = a;
+    s.len = 100;
+    s[50] = 1;
+    return 0;
+}

@@ -2330,7 +2330,20 @@ static Node *parse_statement(Parser *p) {
                 Token saved2_cur = p->current;
                 advance(p); /* consume ( */
                 if (check(p, TOK_STAR)) {
-                    is_var = true; /* function pointer decl */
+                    /* BUG-921: `IDENT ( *` alone is NOT a function-pointer
+                     * declaration — `f(*p);` (a call whose argument is a
+                     * dereference) starts the same way and was refused with
+                     * "expected variable name at ';'". The declaration shape is
+                     * `T (*name)(params)`: after the `*` comes an IDENT, then `)`,
+                     * then another `(`. Require all of it. */
+                    advance(p); /* consume * */
+                    if (check(p, TOK_IDENT)) {
+                        advance(p);
+                        if (check(p, TOK_RPAREN)) {
+                            advance(p);
+                            is_var = check(p, TOK_LPAREN); /* function pointer decl */
+                        }
+                    }
                 } else if (is_type_token(p->current.type)) {
                     /* Could be container: Stack(u32) varname
                      * Skip past type + ) and check if IDENT follows */

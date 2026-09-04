@@ -824,3 +824,55 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# --- checker.c: expr_reads_existing_object (BUG-916, 2026-09-04) ---
+# A SHAPE classifier, not a walker: it answers "does this expression READ an
+# existing object (so a unique-resource copy would alias it)?" — ident, field,
+# index, deref, and a cast/orelse of those. Every other kind yields a FRESH
+# value (a call result, a literal, a struct literal — each checked at its own
+# sink) or is a statement that never reaches it, so it is listed only for
+# -Werror=switch and deliberately not descended.
+checker.c:expr_reads_existing_object:NODE_ASM:asm_stmt.inputs
+checker.c:expr_reads_existing_object:NODE_ASM:asm_stmt.outputs
+checker.c:expr_reads_existing_object:NODE_ASSIGN:assign.target
+checker.c:expr_reads_existing_object:NODE_ASSIGN:assign.value
+checker.c:expr_reads_existing_object:NODE_AWAIT:await_stmt.cond
+checker.c:expr_reads_existing_object:NODE_BINARY:binary.left
+checker.c:expr_reads_existing_object:NODE_BINARY:binary.right
+checker.c:expr_reads_existing_object:NODE_BLOCK:block.stmts
+checker.c:expr_reads_existing_object:NODE_CALL:call.args
+checker.c:expr_reads_existing_object:NODE_CALL:call.callee
+checker.c:expr_reads_existing_object:NODE_CRITICAL:critical.body
+checker.c:expr_reads_existing_object:NODE_DEFER:defer.body
+checker.c:expr_reads_existing_object:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_reads_existing_object:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_reads_existing_object:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_reads_existing_object:NODE_FIELD:field.object
+checker.c:expr_reads_existing_object:NODE_FILE:file.decls
+checker.c:expr_reads_existing_object:NODE_FOR:for_stmt.body
+checker.c:expr_reads_existing_object:NODE_FOR:for_stmt.cond
+checker.c:expr_reads_existing_object:NODE_FOR:for_stmt.init
+checker.c:expr_reads_existing_object:NODE_FOR:for_stmt.step
+checker.c:expr_reads_existing_object:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_reads_existing_object:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_reads_existing_object:NODE_IF:if_stmt.cond
+checker.c:expr_reads_existing_object:NODE_IF:if_stmt.else_body
+checker.c:expr_reads_existing_object:NODE_IF:if_stmt.then_body
+checker.c:expr_reads_existing_object:NODE_INDEX:index_expr.index
+checker.c:expr_reads_existing_object:NODE_INDEX:index_expr.object
+checker.c:expr_reads_existing_object:NODE_INTERRUPT:interrupt.body
+checker.c:expr_reads_existing_object:NODE_INTRINSIC:intrinsic.args
+checker.c:expr_reads_existing_object:NODE_ONCE:once.body
+checker.c:expr_reads_existing_object:NODE_RETURN:ret.expr
+checker.c:expr_reads_existing_object:NODE_SLICE:slice.end
+checker.c:expr_reads_existing_object:NODE_SLICE:slice.object
+checker.c:expr_reads_existing_object:NODE_SLICE:slice.start
+checker.c:expr_reads_existing_object:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_reads_existing_object:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_reads_existing_object:NODE_STRUCT_INIT:struct_init.fields
+checker.c:expr_reads_existing_object:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_reads_existing_object:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_reads_existing_object:NODE_UNARY:unary.operand
+checker.c:expr_reads_existing_object:NODE_VAR_DECL:var_decl.init
+checker.c:expr_reads_existing_object:NODE_WHILE:while_stmt.body
+checker.c:expr_reads_existing_object:NODE_WHILE:while_stmt.cond

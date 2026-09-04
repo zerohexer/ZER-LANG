@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to '.ptr' of a slice
+// BUG-920 (2026-09-04): retargeting `.ptr` while keeping the old `.len`
+// pointed a 4-element view at a 2-element array; `s[3] = 1` was in bounds
+// of the header and out of bounds of the storage.
+u32 main() {
+    u8[4] a;
+    u8[2] b;
+    [*]u8 s = a;
+    s.ptr = &b[0];
+    s[3] = 1;
+    return 0;
+}

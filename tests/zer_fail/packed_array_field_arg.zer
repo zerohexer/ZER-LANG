@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot form a slice over an array field of a packed struct
+// BUG-922 (2026-09-04): the call-argument coercion site. `fill(p.w)` handed
+// a callee a `[*]u32` over unaligned storage; the callee's `s[0] = 1` is a
+// misaligned store it cannot see.
+packed struct P { u8 a; u32[2] w; }
+void fill([*]u32 s) { s[0] = 1; }
+u32 main() {
+    P p;
+    fill(p.w);
+    return p.w[0] - 1;
+}

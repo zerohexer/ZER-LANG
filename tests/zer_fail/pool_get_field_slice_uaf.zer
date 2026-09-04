@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-919: a SLICE view of an array field inside the slot, through get(). The
+// slice-view alias walk bailed on any FIELD step, so the view was untracked.
+struct T { u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    [*]u8 s = p.get(h).arr[0..];
+    p.free(h);
+    s[0] = 7;
+    return 0;
+}

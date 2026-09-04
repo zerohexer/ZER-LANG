@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: static local 'c' is accessed from both interrupt and main code
+// BUG-915 (ISR sibling): a static local in a helper the ISR reaches is shared
+// with main code exactly like a global; it had no global-scope Symbol, so the
+// ISR check never saw it. (Checker verdict — GCC refuses ISRs on hosted x86.)
+void helper() { static u32 c = 0; c += 1; }
+interrupt TIM1 { helper(); }
+u32 main() { helper(); return 0; }

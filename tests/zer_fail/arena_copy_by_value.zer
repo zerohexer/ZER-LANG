@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916: `Arena b = a;` copies the bump pointer; both copies then hand out
+// the SAME bytes (measured: x.v overwritten by y.v). Pool/Ring/Slab were
+// refused at one site; Arena/Barrier/Semaphore were not refused anywhere.
+struct T { u32 v; }
+u32 main() {
+    u8[64] buf; Arena a = Arena.over(buf);
+    Arena b = a;
+    *T x = a.alloc(T) orelse return;
+    *T y = b.alloc(T) orelse return;
+    x.v = 1; y.v = 2;
+    return x.v;
+}

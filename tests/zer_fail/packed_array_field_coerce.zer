@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot form a slice over an array field of a packed struct
+// BUG-922 (2026-09-04): the array-to-slice COERCION at a var-decl init is
+// the same door as a slice expression — `[*]u32 s = p.w;` built the
+// misaligned view without any slice syntax in the source.
+packed struct P { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    [*]u32 s = p.w;
+    s[1] = 1;
+    return p.w[1] - 1;
+}

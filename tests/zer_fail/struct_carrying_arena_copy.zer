@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916: the carrier form — a struct holding an Arena, copied whole.
+struct Ctx { Arena a; u32 n; }
+u32 main() { u8[64] buf; Ctx c; c.a = Arena.over(buf); Ctx d = c; return d.n; }

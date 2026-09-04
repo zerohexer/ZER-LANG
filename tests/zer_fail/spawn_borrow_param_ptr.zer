@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-924 (2026-09-04): a pointer PARAMETER lent to a scoped spawn is borrowed
+// too — a write THROUGH it before the join races the thread.
+void w(*u32 p) { *p = 5; }
+void f(*u32 p) {
+    ThreadHandle th = spawn w(p);
+    *p = 3;
+    th.join();
+}
+u32 main() { u32 v = 0; f(&v); return 0; }

@@ -1,0 +1,19 @@
+// BUG-921 (2026-09-04): `f(*p);` as a STATEMENT was mis-parsed as the start
+// of a C-style function-pointer declaration `f (*name)(...)`, so a plain call
+// whose first argument is a dereference failed with a parse error. The
+// lookahead now requires `IDENT ) (` after the `*` before committing to the
+// declaration form — and the declaration form itself still parses.
+u32 g_total;
+void add(u32 x) { g_total += x; }
+void add2(u32 x, u32 y) { g_total += x + y; }
+u32 twice(u32 x) { return x * 2; }
+u32 main() {
+    u32 v = 5;
+    *u32 p = &v;
+    add(*p);                        // was: parse error
+    add2(*p, *p);
+    if (g_total != 15) { return 1; }
+    u32 (*fp)(u32) = twice;         // the real declaration form still works
+    if (fp(*p) != 10) { return 2; }
+    return 0;
+}

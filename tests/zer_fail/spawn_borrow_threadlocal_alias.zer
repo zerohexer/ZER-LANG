@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: (threadlocal) to a scoped spawn
+// BUG-924 (2026-09-04): the D4 rule refused `spawn w(&tl)` but not the same
+// address behind a pointer local — the child still wrote the PARENT's TLS slot.
+threadlocal u32 tl;
+void w(*u32 p) { *p = 1; }
+u32 main() {
+    *u32 q = &tl;
+    ThreadHandle th = spawn w(q);
+    th.join();
+    return 0;
+}

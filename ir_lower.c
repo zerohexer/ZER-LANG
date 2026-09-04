@@ -2455,6 +2455,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         lower_stmt(ctx, node->if_stmt.then_body);
         emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
         ctx->defer_count = then_defer_base;
+        /* BUG-913: the capture is scoped to the THEN body. It is created at the
+         * enclosing depth (before the body's block scope exists), so the block-
+         * exit hiding never reaches it, and with the dedup fix in ir_add_local
+         * the capture is now a DISTINCT local from a same-named outer variable —
+         * so it must be hidden here, or `return v` after the if would resolve to
+         * the capture (ir_find_local prefers the LAST visible match). */
+        if (has_capture) {
+            int hide_id = ir_find_local(ctx->func,
+                node->if_stmt.capture_name,
+                (uint32_t)node->if_stmt.capture_name_len);
+            if (hide_id >= 0 && hide_id < ctx->func->local_count &&
+                ctx->func->locals[hide_id].is_capture)
+                ctx->func->locals[hide_id].hidden = true;
+        }
 
         /* Phase E: detect if the then-body "always exits" — its final
          * block ends with RETURN/BREAK/CONTINUE (not a normal fall-
@@ -3225,6 +3239,93 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
             /* Arm body */
             ctx->current_block = bb_arm;
+
+            /* BUG-917: the elided compare above assumed the switch value IS one
+             * of the variants. It need not be: `enum E { a = 1, b = 2 } E e;`
+             * auto-zeroes to 0, a calloc'd/pool/arena struct carrying such an
+             * enum is 0, and a forged value from a cinclude'd C function is
+             * anything. All of them silently ran THIS arm (measured: `E e;
+             * switch (e) { .a => 1, .b => 2 }` returned 2). Keep the elided
+             * entry — it is what keeps the zercheck CFG free of a spurious
+             * bb_exit predecessor (see the comment at is_exhaustive_enum) — but
+             * re-check the value INSIDE the arm and trap on a mismatch. The
+             * guard's join carries an identical state on both edges, so the
+             * flow lattice is unaffected. Same trap-at-the-consumer stance as the
+             * three enum-forge doors (@bitcast/@truncate/@saturate); this closes
+             * the doors no conversion opens. */
+            if (elide_compare && is_enum) {
+                Node *gcmp = NULL;
+                for (int vi = 0; vi < arm->value_count; vi++) {
+                    const char *vname = NULL;
+                    size_t vlen = 0;
+                    if (arm->values[vi]->kind == NODE_IDENT) {
+                        vname = arm->values[vi]->ident.name;
+                        vlen = arm->values[vi]->ident.name_len;
+                    } else if (arm->values[vi]->kind == NODE_FIELD) {
+                        vname = arm->values[vi]->field.field_name;
+                        vlen = arm->values[vi]->field.field_name_len;
+                    }
+                    int64_t variant_value = 0;
+                    bool found_v = false;
+                    if (vname) {
+                        for (uint32_t ei = 0; ei < sw_eff->enum_type.variant_count; ei++) {
+                            if (sw_eff->enum_type.variants[ei].name_len == vlen &&
+                                memcmp(sw_eff->enum_type.variants[ei].name, vname, vlen) == 0) {
+                                variant_value = (int64_t)sw_eff->enum_type.variants[ei].value;
+                                found_v = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found_v) { gcmp = NULL; break; }   /* unknown spelling — no guard */
+                    Node *glit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(glit, 0, sizeof(Node));
+                    glit->kind = NODE_INT_LIT;
+                    glit->loc = node->loc;
+                    glit->int_lit.value = (uint64_t)variant_value;
+                    Node *geq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(geq, 0, sizeof(Node));
+                    geq->kind = NODE_BINARY;
+                    geq->loc = node->loc;
+                    geq->binary.op = TOK_EQEQ;
+                    geq->binary.left = sw_ref;
+                    geq->binary.right = glit;
+                    if (!gcmp) {
+                        gcmp = geq;
+                    } else {
+                        Node *gor = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(gor, 0, sizeof(Node));
+                        gor->kind = NODE_BINARY;
+                        gor->loc = node->loc;
+                        gor->binary.op = TOK_PIPEPIPE;
+                        gor->binary.left = gcmp;
+                        gor->binary.right = geq;
+                        gcmp = gor;
+                    }
+                }
+                if (gcmp) {
+                    int bb_ok = ir_add_block(ctx->func, ctx->arena);
+                    int bb_trap = ir_add_block(ctx->func, ctx->arena);
+                    IRInst gbr = make_inst(IR_BRANCH, node->loc.line);
+                    gbr.cond_local = lower_expr(ctx, gcmp);
+                    gbr.true_block = bb_ok;
+                    gbr.false_block = bb_trap;
+                    emit_inst(ctx, gbr);
+                    ctx->current_block = bb_trap;
+                    Node *trap = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(trap, 0, sizeof(Node));
+                    trap->kind = NODE_INTRINSIC;
+                    trap->loc = node->loc;
+                    trap->intrinsic.name = "enum_nonvariant_trap";
+                    trap->intrinsic.name_len = 20;
+                    IRInst tr = make_inst(IR_ASSIGN, node->loc.line);
+                    tr.dest_local = -1;
+                    tr.expr = trap;
+                    emit_inst(ctx, tr);
+                    ensure_terminated(ctx, bb_ok);
+                    ctx->current_block = bb_ok;
+                }
+            }
 
             /* Capture */
             if (arm->capture_name && !is_void_opt) {

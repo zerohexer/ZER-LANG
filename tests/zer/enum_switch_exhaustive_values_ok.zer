@@ -1,0 +1,13 @@
+// BUG-917 boundary: every variant value, including a multi-value last arm,
+// still selects its arm; the guard on the last arm never fires for a variant.
+enum E { a = 1, b = 2, c = 3 }
+enum Z { zero, one }
+u32 pick(E e) { switch (e) { .a => { return 10; } .b, .c => { return 20; } } return 0; }
+u32 main() {
+    if (pick(E.a) != 10) { return 1; }
+    if (pick(E.b) != 20) { return 2; }
+    if (pick(E.c) != 20) { return 3; }
+    Z z;   // has a zero variant — auto-zero is a value
+    switch (z) { .zero => { return 0; } .one => { return 4; } }
+    return 5;
+}

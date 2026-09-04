@@ -9,7 +9,10 @@ Result g_result;
 
 comptime u32 THRESHOLD() { return 50; }
 
-*Sensor create_sensor(u32 reading, u32 cal) {
+// BUG-918: a bare `orelse return` in a `*Sensor`-returning function returned NULL
+// as a non-null pointer when the slab was exhausted. The ZER-correct spelling is
+// the optional return; the caller unwraps.
+?*Sensor create_sensor(u32 reading, u32 cal) {
     ?*Sensor ms = heap.alloc_ptr();
     *Sensor s = ms orelse return;
     s.reading = reading;
@@ -38,7 +41,7 @@ u32 main() {
     g_result.total = 0;
 
     // Slab lifecycle
-    *Sensor s = create_sensor(30, 25);
+    *Sensor s = create_sensor(30, 25) orelse { return 9; };
     defer heap.free_ptr(s);
 
     // *opaque round-trip

@@ -206,6 +206,7 @@ static Type *aggregate_slice_coerce_target(Type *field_type, Type *val_type) {
 
 /* Emit return-null for current function's return type.
  * Handles ?void, ?T struct, ?*T null sentinel, void, and scalar. */
+static void emit_zero_value(Emitter *e, Type *t);   /* defined below (BUG-918) */
 static void emit_return_null(Emitter *e) {
     Type *ret = e->current_func_ret;
     if (!ret || ret->kind == TYPE_VOID) {
@@ -224,7 +225,13 @@ static void emit_return_null(Emitter *e) {
         emit_opt_null_literal(e, ret);
         emit(e, "; ");
     } else {
-        emit(e, "return 0; ");
+        /* BUG-918: was a bare `return 0;` for EVERY non-optional type, which is
+         * not a C value of a struct or slice return type (`P pick(?u32 o) {
+         * u32 v = o orelse return; ... }` failed in GCC). One zero-value
+         * emitter for both this path and the auto-guard early return. */
+        emit(e, "return ");
+        emit_zero_value(e, ret);
+        emit(e, "; ");
     }
 }
 
@@ -479,6 +486,15 @@ static void emit_zero_value(Emitter *e, Type *t) {
         emit(e, "NULL");
     } else if (inner->kind == TYPE_STRUCT || inner->kind == TYPE_UNION) {
         /* BUG-422: struct/union return needs compound literal, not bare 0 */
+        emit(e, "(");
+        emit_type(e, t);
+        emit(e, "){0}");
+    } else if (type_dispatch_kind(inner) == TYPE_SLICE) {
+        /* BUG-918: a slice is a {ptr,len} struct too. A bare `0` here is what
+         * `orelse return` and the auto-guard early-return emitted for a
+         * `[*]T`-returning function — GCC: "incompatible types when returning
+         * type 'int'". A valid ZER program failing in the backend, with the
+         * error naming a .c file the user never wrote. */
         emit(e, "(");
         emit_type(e, t);
         emit(e, "){0}");
@@ -3740,6 +3756,12 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "__atomic_thread_fence(__ATOMIC_ACQUIRE)");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"explicit trap\", __FILE__, __LINE__)");
+        } else if (nlen == 20 && memcmp(name, "enum_nonvariant_trap", 20) == 0) {
+            /* BUG-917: synthesized by ir_lower at the last arm of an exhaustive
+             * enum switch (AST-path twin of the IR handler; unreachable from a
+             * global initializer, kept for the dual-dispatch rule). */
+            emit(e, "_zer_trap(\"switch on an enum value outside its variant set "
+                    "(auto-zeroed storage, or a forged value)\", __FILE__, __LINE__)");
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
@@ -7350,7 +7372,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * are handled by the dedicated cases below and don't carry a scalar
          * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
          * operand) so they keep their existing div-guard / shift paths. */
-        if (type_is_nonnative_intn(tgt_type)) {
+        /* BUG-923: a BIT-SLICE target (`r[11..8] = v` on a u12) has the uN type
+         * too, but it is not an lvalue — hoisting `&(r[11..8])` here produced
+         * "lvalue required as unary '&' operand" from GCC on a valid program.
+         * The bit-slice store below already masks within [hi..lo] (the checker
+         * bounds hi by the width), so it needs no re-wrap. */
+        if (type_is_nonnative_intn(tgt_type) &&
+            node->assign.target && node->assign.target->kind != NODE_SLICE) {
             TokenType aop = node->assign.op;
             if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
                 aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
@@ -8084,6 +8112,19 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"trap\", __FILE__, __LINE__)");
+        } else if (nlen == 20 && memcmp(name, "enum_nonvariant_trap", 20) == 0) {
+            /* BUG-917: the last arm of an exhaustive enum switch used to be
+             * entered UNCONDITIONALLY (the compare was elided because "the
+             * checker proved every variant is covered"). That proof assumes the
+             * value IS a variant. `enum E { a = 1, b = 2 } E e;` auto-zeroes to 0
+             * — not a variant — and the switch silently ran the LAST arm
+             * (measured: exit 2, no diagnostic). Same for a calloc'd / pool
+             * slot / struct field carrying such an enum, so a declaration-site
+             * rule cannot close every door; the guard has to live at the
+             * consumer. ir_lower now keeps the elided entry but re-checks the
+             * value inside the arm and traps here on a mismatch. */
+            emit(e, "_zer_trap(\"switch on an enum value outside its variant set "
+                    "(auto-zeroed storage, or a forged value)\", __FILE__, __LINE__)");
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
             /* @ptrcast(*T, expr) — cast with type_id check */
             Type *tgt_type = node->intrinsic.type_arg ?

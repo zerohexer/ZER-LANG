@@ -1,0 +1,14 @@
+// BUG-918: a bare `orelse return` in a function returning a SLICE or a STRUCT
+// emitted `return 0;` — GCC "incompatible types when returning type 'int'". The
+// zero value is now the compound literal `(T){0}` (empty slice / zero struct).
+struct P { u32 x; }
+[*]u8 pick_slice(?[*]u8 o) { [*]u8 s = o orelse return; return s; }
+P pick_struct(?u32 o) { u32 v = o orelse return; P p; p.x = v; return p; }
+u32 main() {
+    u8[4] a; ?[*]u8 some = a; ?[*]u8 none = null;
+    [*]u8 s1 = pick_slice(some); if (s1.len != 4) { return 1; }
+    [*]u8 s2 = pick_slice(none); if (s2.len != 0) { return 2; }
+    ?u32 o = null; P p = pick_struct(o); if (p.x != 0) { return 3; }
+    ?u32 o2 = 9; P p2 = pick_struct(o2); if (p2.x != 9) { return 4; }
+    return 0;
+}

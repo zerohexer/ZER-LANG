@@ -1,18 +1,22 @@
 // Gap 31 regression test (2026-04-27, Stage 2): range-for must snapshot
-// collection.len BEFORE the loop. Mutating slice.len inside the body
-// must NOT change the bound mid-iteration.
+// collection.len BEFORE the loop. Rebinding the slice inside the body must
+// NOT change the bound mid-iteration.
+//
+// BUG-920 (2026-09-04): the original spelling mutated `slice.len` / `slice.ptr`
+// directly. Assigning a slice's header fields is now a compile error — it
+// forged a view longer than its storage (`s.len = 100; s[50] = 1;` wrote 46
+// bytes past a 4-byte array with no diagnostic). The ZER way to change the
+// view is to rebuild it with a slice expression, which is bounds-checked.
 
 i32 main() {
     u8[10] data;
     data[0] = 1; data[1] = 2; data[2] = 3; data[3] = 4; data[4] = 5;
-    [*]u8 slice;
-    slice.ptr = &data[0];
-    slice.len = 5;
+    [*]u8 slice = data[0..5];
     u32 count = 0;
     for (u8 b in slice) {
         count += 1;
         if (count == 2) {
-            slice.len = 10;  // mutate mid-loop — must NOT affect snapshot
+            slice = data[0..10];  // rebind mid-loop — must NOT affect snapshot
         }
     }
     if (count != 5) { return 1; }   // snapshot held; loop ran exactly 5 times

@@ -211,6 +211,10 @@ typedef struct {
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
         bool compound_in_func;  /* compound assign in regular func */
+        /* BUG-915: a STATIC LOCAL, identified by its declaration node (two
+         * functions may each have a `static u32 c`). NULL for a true global,
+         * which is identified by name in the global scope as before. */
+        Node *decl;
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;

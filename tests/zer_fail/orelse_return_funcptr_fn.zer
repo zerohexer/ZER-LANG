@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: bare 'orelse return' in a function returning non-null
+// BUG-918: funcptr sibling — a NULL callback returned as a non-null one.
+u32 dbl(u32 x) { return x * 2; }
+*(u32) -> u32 pick(?u32 o) { u32 v = o orelse return; return dbl; }
+u32 main() { return 0; }

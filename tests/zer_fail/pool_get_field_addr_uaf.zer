@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-919: `&pool.get(h).v` is an interior pointer INTO slot h. The
+// interior-pointer alias walk stopped at the get() CALL, so the pointer was
+// never aliased to h and the write after p.free(h) compiled clean (measured:
+// exit 0). `&h.v` (auto-deref) was already caught; this is its get() twin.
+struct T { u32 v; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    *u32 q = &p.get(h).v;
+    p.free(h);
+    *q = 7;
+    return 0;
+}

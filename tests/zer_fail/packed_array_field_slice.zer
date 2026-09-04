@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot form a slice over an array field of a packed struct
+// BUG-922 (2026-09-04): the packed-field alignment rule guarded `&p.w` and
+// `&p.field` but not a SLICE EXPRESSION over an array field. `p.w[0..]`
+// produced a `[*]u32` whose element accesses are 1-byte-aligned u32
+// loads/stores — a hard fault on ARM/RISC-V, silent on x86.
+packed struct P { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    [*]u32 s = p.w[0..];
+    s[0] = 1;
+    return p.w[0] - 1;
+}

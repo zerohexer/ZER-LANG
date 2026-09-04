@@ -5,6 +5,208 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-04 — BUG-913..924: twelve holes from a full-codebase read + ~130 adversarial probes
+
+Method: read every compiler source in full (checker, emitter, ir_lower, zercheck_ir, parser,
+types, ir) before writing a probe, then ~90 probes across the silent-gap classes — VRP joins,
+escape sinks, concurrency, enum forging, optionals, resource types, comptime widths, slice
+headers, packed layouts, uN emission forms, parser lookahead. Each probe was judged by its
+DIAGNOSTIC (`-o out.c`) or its runtime exit, never its exit code alone. The VRP-join class
+(`||`/else/`!=` narrowing, aliased writes inside a narrowed branch, loop-body writes through a
+switch arm, do-while exit values, multi-dim arrays) held at every probe; the comptime width
+class held; the escape-sink matrix held at all eleven sink probes. Twelve classes did not.
+
+### BUG-913 — an if-unwrap capture OVERWROTE a same-named outer local (silent wrong value)
+```
+u32 v = 5;  ?u32 o = 7;
+if (o) |v| { }
+return v;          // returned 7
+```
+`ir_add_local` dedups a new local onto an existing one with the same name, type and scope
+depth. The capture is created at the ENCLOSING depth (before the then-body's block scope
+exists), so it dedup'd onto the user's `v`, and the unwrap `v = o.value` was emitted as a store
+to the outer variable. The rule that two sequential captures may share one local (`if (a) |v|
+… if (b) |v| …`, so C does not see `uint32_t v` twice) never meant "share with a variable the
+user declared". A capture now dedups only with another capture, and the NODE_IF lowering hides
+it once the then-body is done (it is created outside the block-exit hiding), unhiding it on a
+later re-declaration. `tests/zer/capture_shadow_outer_local.zer` pins the outer value, two
+sequential captures, a capture read from a defer, and a `|*v|` write-back.
+
+### BUG-914 — `spawn w(a.x + b.y)` read the second shared struct with NO lock
+Spawn arguments are evaluated in the parent as one statement, and the emitter locks exactly
+one shared root per argument (`find_shared_root`). Measured in the emitted C:
+`pthread_mutex_lock(&a._zer_mtx); _sa->a0 = (a.x + b.y);`. The same-statement two-locks rule
+(`a.x = b.y` is rejected as a deadlock) returned 0 for NODE_SPAWN. It now collects PER
+ARGUMENT — each argument is its own lock scope, so `spawn w(a.x, b.y)` stays legal
+(`tests/zer/spawn_arg_two_shared_separate_ok.zer`) and two roots inside one argument are
+rejected (`tests/zer_fail/spawn_arg_two_shared_types.zer`).
+
+### BUG-915 — static locals were invisible to BOTH race scans
+```
+void w() { static u32 c = 0; c += 1; }
+spawn w(); spawn w();                          // compiled clean, raced
+void h() { static u32 c = 0; c += 1; }  interrupt TIM1 { h(); }  u32 main() { h(); }   // same
+```
+A static local is one object for every thread and every ISR that runs the function — a global
+with a narrower name. Both scans resolve identifiers against the GLOBAL scope (they walk another
+function's AST from the spawn site / the ISR), so a static local resolved to nothing and was
+skipped. Spawn side: the scan records `static` declarations as it visits them, scoped to the
+declaring NODE_BLOCK, and flags a later use; `const` and single-word `volatile` are exempt
+through the same predicate a global uses (split into a type-based half,
+`volatile_type_exempt_single_word`, so the three sites share it). ISR side: entries are keyed
+by the DECLARATION node (`IsrGlobal.decl`), recorded by the transitive ISR walk at the
+declaration and by `check_expr`'s NODE_IDENT for main code. Tests: `spawn_static_local_race`,
+`spawn_static_local_helper_race`, `isr_static_local_shared` (negatives) and
+`spawn_static_local_exempt_ok` (the boundary: `static const`, a single-word `static volatile`,
+and a same-named plain local in another function).
+
+### BUG-916 — copying an Arena aliased its buffer; Barrier/Semaphore copies were silent too
+`Arena b = a;` then one alloc from each handed out the SAME object (measured: `x.v` overwritten
+by `y.v`). Pool/Ring/Slab had been refused at ONE site (assignment, BUG-225); Arena, Barrier
+and Semaphore were refused nowhere, and the var-decl / call-arg / return / struct-literal sites
+were unguarded for all six. One predicate, `type_unique_resource_name` (recursing through
+structs, unions and arrays that carry one), asked at every value-flow site through
+`check_unique_resource_copy` — and only when the source READS an existing object:
+`a = Arena.over(buf)` is a fresh value and a LOCAL arena returned from a factory is a move,
+both still legal (`tests/zer/arena_fresh_value_and_pointer_ok.zer`). Seven negatives:
+`arena_copy_by_value`, `arena_by_value_param`, `arena_return_global_copy`,
+`struct_carrying_arena_copy`, `struct_init_arena_field_copy`, `semaphore_copy_by_value`,
+`barrier_copy_by_value`, and `arena_orelse_copy` (an `orelse` is a JOIN — the
+`audit_walker_fields.sh` gate flagged the classifier's un-descended fallback, and that arm was a
+real door: `Arena b = none orelse a;` copied). Corpus cost: zero.
+
+### BUG-917 — an enum with no zero variant: the auto-zero ran the switch's LAST arm
+`enum E { a = 1, b = 2 }  E e;  switch (e) { .a => 1, .b => 2 }` returned 2 — no diagnostic.
+The exhaustive-enum switch elided the last arm's compare ("every variant is covered"), which
+presumes the value IS a variant; auto-zeroed storage is 0. A declaration rule alone cannot
+close this — a struct field, an array element, a calloc'd or pool-allocated object is zeroed
+where no rule sees it — so the guard lives at the CONSUMER: the last arm keeps its elided
+entry (that elision is what keeps the zercheck CFG free of a spurious exit predecessor) and
+re-checks the value inside the arm, trapping on a mismatch through a synthesized
+`enum_nonvariant_trap` intrinsic wired at both emitter dispatch paths. The one door a
+compile-time rule can close is closed: a bare `E e;` / global `E g;` with no initializer and
+no zero variant is an error naming the fix (`E e = E.a;`). Corpus: five enums lack a zero
+variant; none is declared bare without an initializer.
+Tests: `tests/zer_trap/enum_autozero_field_switch_trap.zer` (the calloc'd field door traps),
+`enum_no_zero_variant_uninit` / `_global_uninit` (negatives), `enum_switch_exhaustive_values_ok`.
+
+### BUG-918 — bare `orelse return` for a slice/struct return failed in GCC; for `*T` it returned NULL
+`emit_return_null` emitted `return 0;` for every non-optional type. For `[*]T` and a struct
+that is not a C value ("incompatible types when returning type 'int'" — a valid ZER program
+failing in the backend); for a non-null `*T` it IS a value, the NULL the type forbids, and the
+caller dereferenced it. The emitter now uses one zero-value emitter (`emit_zero_value`, which
+also gained the slice case, so the auto-guard early return in a slice-returning function is
+fixed by the same line), and the checker refuses a bare `orelse return` when the return type has
+a zero hole (`nonnull_zero_hole` — the same predicate as the var-decl "non-null pointer
+requires an initializer" rule). Tests: `orelse_return_slice_struct_zero` (positive),
+`orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
+
+### BUG-919 — views into a pool/slab slot through `get()` or a Handle slice escaped UAF tracking
+```
+*u32 q = &p.get(h).v;   p.free(h);   *q = 7;        // exit 0 — wrote into a freed slot
+[*]u8 s = h.arr[0..];   p.free(h);   s[0] = 7;      // same
+```
+Six shapes, one question — "which allocation does this path navigate within?": the
+interior-pointer alias walk stopped at the `get()` CALL root, and the slice-view walk bailed
+on any FIELD step ("conservative = no alias", which is the UNSAFE direction for a view). `&h.v`
+was already caught, so this is the classic sibling-form gap. One resolver,
+`ir_view_root_handle`, applies CLAUDE.md's forms-vs-reads rule: field/index/slice steps through
+inline storage navigate within one allocation; a step that READS a reference (pointer/slice
+field) resolves through the compound handle; a `get(h)` root resolves to h. Both arms use it
+when the old walk did not reach an ident. The keep call-site sink had the same gap
+(`stash(&p.get(h).v)` accepted while `stash(&h.v)` was refused) — `pool_get_handle_root` peels
+the get() there. Tests: `pool_get_field_addr_uaf`, `slab_get_field_addr_uaf`,
+`pool_get_index_addr_uaf`, `pool_get_field_slice_uaf`, `handle_field_slice_uaf`,
+`pool_get_field_addr_keep_stash` (negatives), `pool_get_view_before_free_ok` (boundary).
+
+### BUG-920 — a slice's `.len` / `.ptr` were plain assignable: a forged view, no diagnostic
+```
+u8[4] a;  [*]u8 s = a;  s.len = 100;  s[50] = 1;      // exit 0 — wrote 46 bytes past the array
+[*]u8 s = a;  s.ptr = &b[0];  s[3] = 1;               // b has 2 elements — same
+bump(&s.len);                                          // the address-of sibling
+```
+A `[*]T` is ONE bounds-checked view; `.ptr` and `.len` are the two halves of that view and the
+bounds check trusts them. The field-assignment path treated a slice header like any struct, so
+the program could set the very length the check compares against. Fixed at the two doors —
+assignment to `.ptr`/`.len` (`slice_header_field`, applied after the target resolves) and
+`&s.ptr` / `&s.len` (a writable pointer to the header is the same forge one deref later). The
+view is rebuilt with a slice expression (`s = arr[a..b]`), which IS bounds-checked.
+`tests/zer/range_for_len_snapshot.zer` had been asserting the gap (it mutated `slice.len` to
+prove the range-for snapshot) and is rewritten to rebind. Tests: `slice_len_assign_forge`,
+`slice_ptr_assign_forge`, `slice_len_addr_forge`. Corpus cost: that one test.
+
+### BUG-921 — `f(*p);` as a statement was a PARSE ERROR (mistaken for a funcptr declaration)
+The statement-level lookahead saw `IDENT ( *` and committed to the C-style function-pointer
+declaration `T (*name)(args)`, so a call whose first argument is a dereference did not parse.
+The lookahead now requires the full `IDENT ( * IDENT ) (` shape before committing; a
+declaration still parses, a call is a call. Test: `tests/zer/call_deref_arg_stmt_ok.zer`
+(both forms in one file).
+
+### BUG-922 — a view over an ARRAY FIELD of a packed struct escaped the alignment rule
+```
+packed struct P { u8 a; u32[2] w; }
+[*]u32 s = p.w[0..];  s[0] = 1;     // slice expression
+[*]u32 s = p.w;                     // var-decl coercion
+fill(p.w);                          // call-arg coercion
+*u32 q = &p.w[0];  *q = 1;          // an INDEX step between field and &
+```
+The packed-field rule refused `&p.w` and `&p.field` and warned at the deref, but three
+value-flow sites built a `[*]u32` over the unaligned storage with no `&` in the source, and the
+address-of arm did not peel an index step. Every element access through those views is a
+1-byte-aligned u32 load/store — a hard fault on ARM/RISC-V, silently split on Cortex-M0+,
+invisible on x86 (which is why every test passed). The slice half is one predicate,
+`packed_array_field_view` (array field, element alignment > 1, packed aggregate on the path),
+asked inside `value_flows_to` for a SLICE target — the ONE value-flow query, so all eight
+sites got it at once (`value_flows_to` now takes the Checker) — and at NODE_SLICE. The
+address-of half: `addr_of_is_packed_field` peels NODE_INDEX steps. Byte arrays stay legal
+(element alignment 1 can never be misaligned): `tests/zer/packed_u8_array_view_ok.zer`.
+Negatives: `packed_array_field_slice`, `_coerce`, `_arg`, `packed_array_elem_addr`.
+
+### BUG-923 — a bit-slice WRITE on a `uN` value did not compile (mask wrapped the store)
+`u12 r; r[11..8] = 15;` emitted the uN width mask around the whole read-modify-write
+assignment, and GCC refused the result ("lvalue required as unary '&' operand" — a valid ZER
+program failing in the backend, on hosted and bare-metal alike). The mask belongs to a VALUE
+(`IR_BINOP`/`IR_UNOP` results), not to a bit-slice store whose own mask already keeps the
+result inside N bits; the NODE_ASSIGN arm in `emit_rewritten_node` now skips it when the target
+is a NODE_SLICE. A local and a struct field alike: `tests/zer/bitslice_uN_write.zer`.
+
+### BUG-924 — the scoped-spawn borrow existed only for a literal `&v` argument
+```
+*u32 q = &v;    ThreadHandle th = spawn w(q);  v = 3;    th.join();   // compiled clean, raced
+H h; h.p = &v;  ThreadHandle th = spawn w(h);  v = 3;    th.join();   // same
+[*]u8 s = a;    ThreadHandle th = spawn w(s);  a[1] = 3; th.join();   // same
+*u32 q = &tl;   ThreadHandle th = spawn w(q);                         // D4 bypassed via an alias
+void f(*u32 p){ ThreadHandle th = spawn w(p);  *p = 3;   th.join(); } // param never borrowed
+```
+The rule that lends `v` exclusively to the thread until the join (Axis C, patched by S2/D4/D6/
+D7) matched `&ident` syntactically, so every other spelling of the same borrow lent nothing.
+The missing finite variable was WHICH local a pointer references: `is_local_derived` says
+"frame-bound" but not "of what", so the sink had nothing to borrow. `Symbol.borrow_root_name`
+now records that local at the two DECLARATION sites (`record_borrow_root` at var-decl init and
+at assignment — whole-variable rebinding replaces, a field store merges), rides aliases through
+`propagate_escape_flags`, and the sink (`scoped_spawn_borrow`, ONE function for the `&` and the
+non-`&` spellings) lends both the argument's own root ident when it carries a non-shared pointer
+(a write THROUGH it walks to that ident) and the recorded local. Three-valued: a frame-derived
+value whose root cannot be named (a call launder, a capture, two different roots merged into one
+carrier) is REJECTED — cannot prove, never guess. A threadlocal root is recorded by name so D4
+fires through the alias. Negatives: `spawn_borrow_ptr_local`, `_struct_carrier`, `_slice_view`,
+`_param_ptr`, `_threadlocal_alias`, `_two_roots_unknown`; boundary:
+`tests/zer/spawn_borrow_released_at_join_ok.zer` (released at join; a global lends nothing).
+Corpus cost: zero (every scoped spawn in the tree still compiles).
+
+### Verified NOT bugs this session (so nobody re-probes them)
+`||`/`else`/`!=` never narrow an index into a fixed array; a narrowed index modified through a
+pointer or an alias inside the branch is guarded; a loop variable written in a switch arm
+inside the loop body is invalidated; do-while exit values are guarded; comptime `~`, `>>`,
+`|`, `<<`, `0 - a` on `u8` match runtime bit-for-bit; struct `==` is rejected; union variant
+read without a switch is rejected; `(*opaque)` cannot launder `const` or `volatile`;
+`&local` cannot reach a global through a union variant, an optional-pointer array element, a
+pool slot, a global arena, a heap object, or a slab object; a string literal cannot be written
+or freed; ThreadHandle cannot be joined twice; a stack `shared struct` cannot go to a
+fire-and-forget spawn; a copied `shared struct` is rejected.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

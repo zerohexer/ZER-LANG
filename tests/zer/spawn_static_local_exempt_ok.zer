@@ -1,0 +1,9 @@
+// BUG-915 boundary: the same exemptions a global gets — `static const` and a
+// single-word `static volatile` flag — keep compiling from a spawned thread,
+// and a plain (non-static) local of the same name in another function is not
+// mistaken for the static.
+u32 k() { static const u32 K = 4; return K; }
+void flag() { static volatile u32 done = 0; done = 1; }
+u32 other() { u32 c = 3; return c; }
+void w() { u32 x = k(); flag(); u32 c = other(); }
+u32 main() { ThreadHandle th = spawn w(); th.join(); return 0; }

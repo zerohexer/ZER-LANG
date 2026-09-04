@@ -30,6 +30,73 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals recorded by the 2026-09-04 audit (BUG-913..919 fixed; these were NOT)
+
+Each was measured on main during that audit. None is an accept-unsafe hole that is SILENT on
+every platform; the two runtime-only ones are loud. Reproducers are in the `tests/zer_fail`
+negatives' comments or inline below.
+
+### LOW — `free()` of an INTERIOR pointer is caught only at runtime
+`*T p = &s[1]; free(p);` on a heap slice `s` compiles clean. The universal `free(*T)` routes to
+the auto-slab `free_ptr`, whose page check TRAPS ("slab: free_ptr with invalid pointer") — and
+when no auto-slab for `T` exists the emitted C fails in GCC (`_zer_auto_slab_T undeclared`).
+Loud both ways, but a compile-time rejection is the honest answer: the alias created by
+`&expr[i]` / `&expr.field` could carry an `is_interior` bit and the free sites refuse it. Corpus
+cost of the reject: zero `free(&` occurrences.
+
+### LOW (precision) — a pointer-returning function whose result is a PARAM VIEW is registered as a fresh allocation
+`*T pick(?*T o) { *T t = o orelse return; return t; }` … `*T t = pick(o);` in the caller reports
+"handle (local 't') allocated … but never freed". The `ret_is_borrow` summary excludes a
+param-VIEW return (AOParam, documented in zercheck.h), so the caller leak-checks a borrow.
+Real over-rejection of the accessor idiom; the same shape masks the keep-sink probe
+`*u32 view(Handle(T) h) { return &p.get(h).v; }`. Fix is the AOParam → caller-alias link
+sketched under BUG-849 (`view_alloc_ids`), applied to the direct-param case.
+
+### LOW — Arena as a STRUCT FIELD: methods are not supported (loud GCC error)
+`struct Ctx { Arena a; }` … `c.a.alloc(T)` — the checker accepts it and the emitter recognises
+arena methods only on an IDENT receiver, so GCC reports `'_zer_arena' has no member named
+'alloc'`. Either reject `Arena` as a field or route the method call through a field receiver.
+The BUG-916 copy rule already refuses copying such a struct.
+
+### LOW — enum with no zero variant: CARRIER storage is guarded only at the switch
+BUG-917 rejects a bare `E e;` and traps at an exhaustive switch. A struct field, array element,
+calloc'd or pool object carrying such an enum still holds 0 with no compile-time diagnostic;
+every consumer other than an exhaustive switch (`==`, a cast to integer) reads the non-variant
+silently. Not memory-unsafe. The teachable fix is to give one variant the value 0.
+
+### LOW — ISR check does not propagate a compound-RMW fact for a STATIC LOCAL
+BUG-915 makes a static local shared between ISR and main require `volatile`; the "volatile but
+read-modify-written" refinement resolves its target through `resolve_write_target_global`,
+which does not see static locals, so `static volatile u32 c; c += 1;` in an ISR-reachable
+helper is accepted where the global spelling is refused. Same fix shape as BUG-792 (resolve
+through the declaration node).
+
+### LOW (diagnostic) — a runtime trap inside an inline bounds check reports the wrong line
+`_zer_bounds_check(...)` emitted in an expression reports `__LINE__` of the emitted C after
+`#line` was disabled for the IR body, so "array index out of bounds at file.zer:29" can name a
+line the source does not have. The statement-level auto-guard reports correctly.
+
+### LOW (precision) — `defer th.join()` is reported as "ThreadHandle not joined"
+```
+ThreadHandle th = spawn w(&work);  defer th.join();  return 0;
+```
+The join-at-exit check is linear and looks for a `th.join()` statement; a join inside a
+`defer` body fires on every exit path, which is exactly what the rule wants, but the walk does
+not descend into the defer. Over-rejection only (the direct `th.join();` compiles). Fix sketch:
+treat a `defer` body containing the join as a join at every scope exit (the defer fires on all
+of them), the same way `defer pool.free(h)` is already credited by the leak check.
+
+### LOW (precision) — a carrier holding pointers into TWO different locals is refused at a scoped spawn
+`H h; h.p = &v; h.q = &x; ThreadHandle th = spawn w(h);` — BUG-924's borrow root is single-
+valued, so two roots merge to "unknown" and the sink rejects ("cannot resolve"). Sound (the
+alternative was to borrow neither). Spell the borrow as `spawn w(&v, &x)` or a struct with one
+root. Fix sketch: make the root a small set (arena list) and borrow every member.
+
+### Dead code — the emitter's `IR_NOP{NODE_SWITCH}` mini-emitter (~400 lines)
+Unreachable since BUG-579 lowered every switch kind through `lower_stmt`; it silently drops
+nested `if` bodies containing var-decls, so it would be a miscompile if it were ever reached.
+Delete it (keep `emit_audit.sh` and `-Werror=switch` green).
+
 ## Where main stands
 
 `make check` exit 0 — **1391 .zer**, modules 30/30, 200 fuzz, 139 convert, all ten matrices, all EIGHT

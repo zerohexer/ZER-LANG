@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: has no variant with value 0
+// BUG-917: the global twin of the local rule.
+enum E { a = 1, b = 2 }
+E g;
+u32 main() { switch (g) { .a => { return 1; } .b => { return 2; } } return 3; }

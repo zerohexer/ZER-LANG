@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: resource types are not copyable
+// BUG-916: a copied Barrier never rendezvous with the original.
+Barrier b;
+u32 main() { @barrier_init(b, 1); Barrier c = b; @barrier_init(c, 1); @barrier_wait(c); @barrier_wait(b); return 0; }

@@ -80,6 +80,38 @@ each with `// expect-error:` and each verified to compile clean on the pre-fix c
 
 ---
 
+## Session 2026-09-04 — BUG-932: an EMPTY range is unreachable, not "always out of bounds"
+
+A regression from my own BUG-925 (the provably-OOB three-way verdict). `index_range_verdict`
+classified an **empty** range as ALWAYS_OOB:
+
+```zer
+for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }   // never executes
+```
+```
+error: index 'i' is always out of bounds for array of size 4 (its value is proven to be in [0, -1])
+```
+
+The printed range gives it away — `[0, -1]` is `min > max`, an empty set, and the diagnostic
+is asserting a property of a value that does not exist. It slipped into the `max_val < 0`
+arm, which is there for a genuinely all-negative range like `[-5, -1]`.
+
+An empty range means the program point is UNREACHABLE. Nothing is provable either way, so
+the honest verdict is `IDX_UNKNOWN`; one condition, ahead of both tests. The rule still
+fires on both real cases (`u32 i = 10` past the end, `i32 i = -3` negative), and an in-range
+index still compiles with the check elided.
+
+`make check` was green over this — no corpus test has a zero-trip loop with an indexed body.
+It was found by MEASURING the survey's recorded over-rejection list against main rather than
+reading it, which is the same discipline that says a documented hole is a hypothesis: a
+documented over-rejection is one too.
+
+Regression positives `tests/zer/loop_counter_bounds_ok.zer` and
+`tests/zer/vrp_empty_range_zero_trip_ok.zer`, taken VERBATIM from `v7pucv` (a reconstruction
+can confirm a hole but never refute one) and verified to fail on the pre-fix build.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

@@ -846,6 +846,16 @@ static void register_builtin_pair_types(Checker *c);
 typedef enum { IDX_UNKNOWN, IDX_PROVEN_SAFE, IDX_ALWAYS_OOB } IndexVerdict;
 static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
     if (!r || limit == 0) return IDX_UNKNOWN;
+    /* BUG-932: an EMPTY range (min > max) means the program point is UNREACHABLE —
+     * there is no value to be in or out of bounds. A zero-trip loop
+     * `for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }` narrows i to [0, -1], which
+     * fell into the "entirely negative" arm below (that arm exists for a real range
+     * like [-5,-1]) and reported "always out of bounds ... in [0, -1]" — a diagnostic
+     * whose own printed range is visibly impossible. Rejecting dead code is an
+     * over-rejection, and it was introduced by the ALWAYS_OOB rule itself, so it is
+     * bounded to this helper. UNKNOWN is the honest verdict: nothing is provable
+     * about a value set that is empty. */
+    if (r->min_val > r->max_val) return IDX_UNKNOWN;
     /* every value in the range is a valid index */
     if (r->min_val >= 0 && r->max_val >= 0 && (uint64_t)r->max_val < limit)
         return IDX_PROVEN_SAFE;

@@ -1,0 +1,61 @@
+// BUG-913 OVER-REJECTION BOUNDARY. Every loop here must COMPILE and RUN: the
+// certain-OOB error is licensed only by "the counter WILL take a value past the
+// end", so each shape below breaks one premise and must fall back to today's
+// behaviour (proven-safe, or a warning + auto-guard).
+u32 sink;
+u32 rt() { return 3; }
+
+u32 main() {
+    u32[4] arr;
+    u8[8] wide;
+
+    // 1. correct bound — proven safe, guard elided
+    for (u32 i = 0; i < 4; i += 1) { arr[i] = i; }
+    if (arr[3] != 3) { return 1; }
+
+    // 2. the access is nested in a conditional — the offending values may never
+    //    reach it, so certainty about the SEQUENCE says nothing about the ACCESS
+    for (u32 i = 0; i < 8; i += 1) { if (i < 4) { arr[i] = i; } }
+    if (arr[3] != 3) { return 2; }
+
+    // 3. the body can leave the loop early — the sequence is not run in full
+    for (u32 i = 0; i < 8; i += 1) { if (i > 3) { break; } arr[i] = i; }
+    if (arr[3] != 3) { return 3; }
+
+    // 4. the body writes the counter — it is no longer an induction variable
+    for (u32 i = 0; i < 8; i += 1) { arr[i] = i; if (i == 3) { i = 0; } sink += 1; if (sink > 20) { break; } }
+
+    // 5. the step SKIPS past the bound before reaching the end: values are 0
+    //    only, so nothing indexes out of range even though the range straddles
+    for (u32 i = 0; i < 5; i += 10) { arr[i] = 7; }
+    if (arr[0] != 7) { return 5; }
+
+    // 6. a non-constant bound — no sequence is known at all
+    for (u32 i = 0; i < rt(); i += 1) { arr[i] = i; }
+
+    // 7. a slice is bounds-checked at runtime, never auto-guarded away
+    [*]u8 s = wide[0..8];
+    for (u32 i = 0; i < 8; i += 1) { s[i] = 1; }
+    if (s[7] != 1) { return 7; }
+
+    // 8. zero-trip loop — the body never runs, so no value is taken
+    for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }
+
+    // 9. `while` with the increment FIRST: the values at the access are 1..4,
+    //    not 0..3, so the sequence the rule would assume is the wrong one and no
+    //    certainty may be claimed (the auto-guard covers it instead)
+    u32 k = 0;
+    while (k < 4) { k += 1; arr[k] = k; }
+
+    // 10. a correct `while` — proven safe, guard elided
+    u32 m = 0;
+    while (m < 4) { arr[m] = m; m += 1; }
+    if (arr[3] != 3) { return 10; }
+
+    // 11. `while` whose counter is bumped inside a conditional — not the
+    //     recognised shape, so no certainty
+    u32 q = 0;
+    while (q < 8) { if (q < 4) { arr[q] = q; } if (q < 100) { q += 1; } }
+
+    return 0;
+}

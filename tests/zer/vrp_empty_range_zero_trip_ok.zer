@@ -1,0 +1,22 @@
+// BUG-914: an EMPTY range (max < min) proves the access is UNREACHABLE, not that
+// it is out of bounds. A zero-trip loop gives the counter the range [0, -1];
+// that fell into the "entirely negative => always out of bounds" arm and was a
+// HARD COMPILE ERROR on main, so a bound that is legitimately zero could not be
+// written. Every loop here must compile and run.
+u32 sink;
+u32 main() {
+    u32[4] arr;
+    arr[0] = 1;
+
+    // literal zero bound
+    for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; sink += 1; }
+
+    // narrowed to an empty range by a contradictory guard (the shape
+    // bounds_ident_proven_ok.zer pins, restated here with a negative max)
+    u32 d = 0;
+    if (d > 5) { arr[d] = 33; sink += 1; }
+
+    if (sink != 0) { return 1; }
+    if (arr[0] != 1) { return 2; }
+    return 0;
+}

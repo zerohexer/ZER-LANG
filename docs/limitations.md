@@ -659,6 +659,25 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 NOT over-rejections: ~12 `xmod_*` / `contuser` / `spawnimp_user` module tests — see
 harness trap 3.
 
+**MEASURED 2026-09-04 against `6f8da82c` — the seven-item over-rejection list, triaged.**
+Do not re-derive; each was run, not read.
+
+| test | branch | status |
+|---|---|---|
+| `cast_launder_ok` | `1zukjq` | **CLOSED** by BUG-931 — the missing alias made a free look like a leak |
+| `loop_counter_bounds_ok` | `v7pucv` | **CLOSED** by BUG-932 |
+| `vrp_empty_range_zero_trip_ok` | `v7pucv` | **CLOSED** by BUG-932 — same single cause, a zero-trip loop |
+| `funcptr_global_registry_ok` | `osp1a7` | **DECIDED — DO NOT "FIX".** Their whole-file rule was measured to ACCEPT an unguarded indirect call through null (no guard in the emitted C). Main's rule is the sound one and the restructure is teachable: `?u32 (*g)(u32,u32) = null;` + `if (g) \|f\|` compiles and runs. Soundness is the hard wall; over-rejection is the soft gradient |
+| `mmio_const_ident_base` | `o51x9p` | live — `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
+| `comptime_width_conversions` | `lzmkhn` | live — the comptime evaluator cannot evaluate a C-style cast in a comptime body. Contained, evaluator-local |
+| `return_literal_is_static_ok` | `lzmkhn` | live — `return pick(b)` where the callee returns a LITERAL, not a view of the local. Genuine PRECISION work on the return summary (`ret_param_mask` / `call_result_static_given_args`), not a rule bug |
+
+**The triage that matters:** two were BUGS IN A RULE (one of them mine, shipped green because
+no corpus test had that shape) and were obligatory to fix; one is a DECISION already taken on
+soundness grounds; two are contained gaps; ONE is real precision work. Only that last row is
+a "relaxation project", and per the MAX-ORACLE standard it ranks below every remaining
+accept-unsafe class.
+
 ---
 
 ### SUGGESTED ORDER (highest collapse ratio first)

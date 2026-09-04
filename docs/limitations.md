@@ -44,10 +44,22 @@ negatives are LIVE on main. Several classes here appear in NO other branch.
 
 ### Directly extends work already landed — take these first
 
-**A. Enum auto-zero is a SEVENTH forging door (their BUG-917).** BUG-927/928/929
-closed literal, arithmetic, `@ptrcast`, and added `@try_enum`. This one is upstream
-of all of them: ZER's auto-zero guarantee gives every variable 0, and an enum whose
-variants do not include 0 is therefore born invalid.
+**A. ~~Enum auto-zero is a SEVENTH forging door (their BUG-917)~~ — CLOSED
+2026-09-04 as BUG-930.** DO NOT REDO. Landed: `enum_no_zero_variant_init_check`, one
+query at both declaration sites (local var-decl and global-var), placed beside the
+"non-null pointer requires an initializer" rule that asks the same question about a
+different type. Tests `tests/zer_fail/enum_no_zero_variant_{uninit,global_uninit}.zer`
+plus boundary `tests/zer/enum_zero_variant_boundary_ok.zer`.
+
+RESIDUAL, still open: their CONSUMER-side half, an `enum_nonvariant_trap` emitted at
+both emitter paths, for storage that is zeroed where no declaration is visible to the
+rule (a memset region, an array element reached through a pointer, cinclude-provided
+memory). The declaration rule covers the door the author can see; the trap covers the
+rest. Their implementation is on the branch if that residual is taken up.
+
+Kept for context — this is what it was, and why it was upstream of the other six
+doors: ZER's auto-zero guarantee gives every variable 0, and an enum whose variants
+do not include 0 is therefore born invalid.
 
     enum E { a = 1, b = 2 }
     u32 main() { E e; switch (e) { .a => { return 1; } .b => { return 2; } } return 3; }
@@ -97,8 +109,14 @@ and a struct-init field. Their fix is one predicate `type_unique_resource_name` 
     u32 main() { spawn w(); spawn w(); return 0; }
 
 A static local has global lifetime but is not in the global scope, so neither sink
-sees it. 3 tests, both sinks. Their fix: a scan-scoped static table + `IsrGlobal`
-keyed by declaration.
+sees it. 3 tests, BOTH sinks — the ISR sibling is:
+
+    void helper() { static u32 c = 0; c += 1; }
+    interrupt TIM1 { helper(); }
+    u32 main() { helper(); return 0; }
+
+Their fix: a scan-scoped static table + `IsrGlobal` keyed by declaration. Fix both
+sinks in the same commit — this is the mirrored-sink family.
 
 **F. Scoped-spawn borrow only ever covered a literal `&v` (their BUG-924) — 6 tests.**
 A pointer local, a struct carrier, a slice view, a param and a threadlocal alias all
@@ -119,17 +137,39 @@ Their fix: `Symbol.borrow_root` recorded at the declaration sites, one sink
     *q = 7;                          // UAF, accepted
 
 Forms: `pool_get_field_addr_uaf`, `_index_addr_uaf`, `_field_slice_uaf`,
-`pool_get_field_addr_keep_stash`, `slab_get_field_addr_uaf`, plus
-`handle_field_slice_uaf`. Their fix: `ir_view_root_handle` + `pool_get_handle_root`
+`pool_get_field_addr_keep_stash`, `slab_get_field_addr_uaf`, plus the Handle-slice
+spelling, which reaches the slot without calling get() at all:
+
+    struct T { u8[4] arr; }
+    Pool(T, 4) p;
+    u32 main() {
+        Handle(T) h = p.alloc() orelse return;
+        [*]u8 s = h.arr[0..];      // view into the slot via Handle auto-deref
+        p.free(h);
+        s[0] = 7;                  // UAF, accepted
+        return 0;
+    } Their fix: `ir_view_root_handle` + `pool_get_handle_root`
 at the keep sink.
 
 **H. `spawn w(a.x + b.y)` reads the second shared struct UNLOCKED (their BUG-914).**
 Adjacent to BUG-795 (the callee-position walk) but a different sink: per-ARGUMENT
 shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
 
+    shared struct A { u32 x; }
+    shared struct B { u32 y; }
+    A a; B b;
+    void w(u32 v) { a.x = v; }
+    u32 main() { spawn w(a.x + b.y); return 0; }
+
 **I. Bare `orelse return` in a non-null-pointer or funcptr function (their BUG-918).**
 Returned NULL as a non-null pointer, and produced a GCC error for slice/struct
 returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
+
+    struct T { u32 v; }
+    *T pick(?*T o) { *T t = o orelse return; return t; }   // returns NULL as *T
+
+    u32 dbl(u32 x) { return x * 2; }
+    *(u32) -> u32 pick2(?u32 o) { u32 v = o orelse return; return dbl; }
 
 ### Their remaining three (no live negative here; verify before adopting)
 
@@ -139,8 +179,9 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ### Suggested order for this branch
 
-A (completes the enum class just closed) → C (one line forges any bound) →
-G and F (both accept-unsafe, both concurrency/UAF) → D → E → B → H → I.
+~~A~~ (DONE, BUG-930) → **C** (one line forges any bound) → **G** and **F** (both
+accept-unsafe; G is UAF, F is a data race) → **D** → **E** → **B** → **H** → **I**.
+A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed
 

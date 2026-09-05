@@ -1,0 +1,29 @@
+// Promoted from tests/zer_gaps/audit2_defer_scan_nested.zer (AUDIT2 #3, 2026-04-19):
+// the raw-AST defer-body scanner in zercheck.c had a 31-level recursion cap, so a
+// defer registered under 32 nested `if` blocks was invisible to the leak pre-scan.
+// BUG-920: defer bodies are lowered through the IR at their fire sites — there is
+// no scanner and no depth cap. (The original gap file freed an `alloc(T)` object
+// through a NAMED slab, which the lowered body now correctly rejects as a wrong-pool
+// free; this positive allocates from that slab.)
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse return;
+    /* 32 nested plain blocks (unconditional — an `if (c)` chain would leave the
+     * c == false paths without the free, which the lowered body now correctly
+     * reports as a leak; the old scanner applied every defer's frees to every
+     * return regardless of reachability). */
+    { { { { { { { {
+    { { { { { { { {
+    { { { { { { { {
+    { { { { { { { {
+        defer heap.free_ptr(t);
+        u32 x = t.id;
+        return x;
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    return 0;
+}

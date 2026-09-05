@@ -160,6 +160,12 @@ typedef struct {
     void *gr_block_guards;
     int gr_block_count;
     int gr_cur_block;
+    /* BUG-920: defer_origin of the instruction being checked (0 = not from a
+     * defer body). A handle freed by registration k and freed again by an
+     * instruction of origin k is the same body RE-FIRING on a path that
+     * already ran it (goto eager fire + guarded label exit) — idempotent, not a
+     * double free / UAF. See ir_use_guard_disjoint. */
+    int cur_defer_origin;
 } ZerCheck;
 
 /* ---- API ---- */

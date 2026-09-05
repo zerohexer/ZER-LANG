@@ -27,13 +27,6 @@
  *   Handle(T)          → uint64_t (gen(32) << 32 | index(32))
  * ================================================================ */
 
-/* deferred statement stack — grows dynamically */
-typedef struct {
-    Node **stmts;
-    int count;
-    int capacity;
-} DeferStack;
-
 /* spawn wrapper — deferred file-scope wrapper function for pthread_create */
 typedef struct {
     int id;                 /* spawn_id for unique naming */
@@ -48,8 +41,6 @@ typedef struct {
     int temp_count;         /* counter for temporary variable names */
     Type *current_func_ret; /* return type of current function */
     bool current_main_promoted; /* true if current func is `void main()` promoted to `int main()` — bare return becomes `return 0;` */
-    DeferStack defer_stack; /* current block's deferred statements */
-    int loop_defer_base;    /* defer stack base at loop entry (for break/continue) */
     bool lib_mode;          /* --lib: no prefix on struct names, no preamble */
     bool track_cptrs;       /* --track-cptrs: Level 3+4+5 inline header tracking */
     int probe_mode;         /* Fix #4: 0=hosted (default, signal handler), 1=raw, 2=disabled */
@@ -102,26 +93,10 @@ typedef struct {
     void (*ir_hook)(void *ctx, void *ir_func);
     void *ir_hook_ctx;
 
-    /* The IRFunc whose body is currently being emitted (actually IRFunc*, typed
-     * void* to keep ir.h out of emitter.h). Set at emit_regular/async_func_from_ir
-     * entry, cleared at exit. Lets a mid-body conditional early-exit (auto-guard
-     * bounds return, @cstr overflow return) FIRE the pending IR defer bodies
-     * (which live on defer_stack, keyed to this func's locals) instead of
-     * aborting — the AST-path emit_defers stub used to abort() whenever any
-     * defer was pending. NULL on the AST/global-init path (which has no defers). */
-    void *cur_ir_func;
-
-    /* When true, a safety auto-guard emits a TRAP instead of an early-return.
-     * Set only while emitting a `defer` body: an early-return there would fire
-     * emit_defers() (re-entering the defer stack) and skip the rest of the
-     * function's cleanup — wrong. A trap aborts safely before the OOB access,
-     * matching how slice bounds-checks already behave inside defers. */
-    bool guard_traps;
-    /* BUG-835: how many scopes are open that a `return` must NEVER leave — a held
-     * shared lock, or an interrupt-disabled @critical block. Counted rather than
-     * a bool because they nest. While non-zero, the bounds/UAF auto-guard degrades
-     * to _zer_trap instead of emitting an early `return`. */
-    int noreturn_scope_depth;
+    /* BUG-919/920 (2026-09-05): the emitter no longer synthesises early exits
+     * (auto-guards are IR branches) and no longer emits defer bodies (they are
+     * lowered inline), so the per-function defer stack, the current-IRFunc
+     * handle, the trap-mode flag and the no-return scope counter are gone. */
 
 } Emitter;
 

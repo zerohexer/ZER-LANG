@@ -1,0 +1,16 @@
+// expect-trap
+// BUG-920: an unprovable index in a defer-body VAR-DECL initialiser. The
+// checker warned "auto-guard inserted" but the raw-AST defer emitter emitted
+// `arr[i]` with no guard in var-decl position (silent OOB read on main). The
+// body is lowered through IR now, so the guard is a real branch — and inside a
+// defer body a failed guard TRAPS (an early return would skip the rest of the
+// cleanup).
+volatile u32 vi = 100;
+u32 g;
+u32 main() {
+    u32[4] arr;
+    arr[0] = 1;
+    u32 i = vi;
+    defer { u32 v = arr[i]; g = v; }
+    return 0;
+}

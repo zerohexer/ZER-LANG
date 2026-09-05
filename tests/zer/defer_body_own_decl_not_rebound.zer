@@ -1,0 +1,20 @@
+// BUG-920: a name the defer body DECLARES ITSELF must not be rebound at
+// registration to a same-named outer local that carries a suffixed C name.
+// The inner-block `z` is `z_N` in the emitted C; the body's own `u32 z = 5`
+// must win inside the body.
+u32 g;
+u32 f() {
+    u32 z = 9;
+    {
+        u32 z = 1;
+        defer { u32 z = 5; g = z; }
+        z += 1;
+    }
+    return z;
+}
+u32 main() {
+    u32 r = f();
+    if (r != 9) { return 1; }
+    if (g != 5) { return 2; }
+    return 0;
+}

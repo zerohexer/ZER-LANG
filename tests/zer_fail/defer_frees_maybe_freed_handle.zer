@@ -1,0 +1,16 @@
+// expect-error: may already be freed
+// BUG-920: `if (c) { free(h); } defer free(h);` — the deferred free runs on
+// EVERY exit path, including the one where h was already freed. The raw-AST
+// defer scanner silently promoted MAYBE_FREED to FREED (no diagnostic; the
+// emitted C called free twice). With the body lowered inline at the fire site
+// the deferred free is an ordinary free of a MAYBE_FREED handle and is
+// rejected like any other.
+struct T { u32 v; }
+volatile u32 vflag = 1;
+u32 main() {
+    *T h = alloc(T) orelse { return 1; };
+    bool c = vflag == 1;
+    if (c) { free(h); }
+    defer free(h);
+    return 0;
+}

@@ -651,6 +651,12 @@ struct Node {
 
 /* ---- AST utility functions ---- */
 const char *node_kind_name(NodeKind kind);
+
+/* Deep clone (BUG-920). Every cloned node is reported to `hook(orig, clone, ud)`
+ * so node-keyed side tables can be mirrored. NODE_SPAWN nodes are SHARED (not
+ * cloned). See ast.c for the rationale. */
+typedef void (*AstCloneHook)(Node *orig, Node *clone, void *ud);
+Node *ast_clone(Arena *a, Node *n, AstCloneHook hook, void *ud);
 void ast_print(Node *node, int indent);
 
 /* Evaluate compile-time constant integer expression.

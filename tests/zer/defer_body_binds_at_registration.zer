@@ -1,0 +1,18 @@
+// BUG-920: a defer body binds to the locals visible where it is WRITTEN, even
+// when it fires at a point where an inner same-named local shadows them.
+u32 g;
+u32 f() {
+    u32 x = 1;
+    defer { g = x; }
+    {
+        u32 x = 2;
+        if (x == 2) { return 7; }
+    }
+    return 0;
+}
+u32 main() {
+    u32 r = f();
+    if (r != 7) { return 1; }
+    if (g != 1) { return 2; }
+    return 0;
+}

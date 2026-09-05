@@ -1796,6 +1796,36 @@ Then `#4`, `#5` (miscompiles), then `#6`, `#7`, `#9` (ergonomics).
 
 ---
 
+## OPEN — a forward `goto` over a defer REGISTRATION leaves that path's leak unreported (LOW, pre-existing, documented 2026-09-05)
+
+```zer
+if (c) { goto skip; }
+*T h = alloc(T) orelse { return 9; };
+defer free(h);
+skip:
+return 0;                   // c == true: h was never allocated — nothing leaks
+```
+
+**Status — not a soundness hole today, but the analysis is generous on this shape.**
+The F2 armed flag makes the runtime correct (the body fires only if its registration ran).
+zercheck_ir treats the armed gate's SKIP edge as infeasible at merges (`ir_pred_is_gate_skip`,
+BUG-920), i.e. it assumes every registered body fires — exactly what the pre-BUG-920 analysis
+assumed when the gate lived only in the emitted C. On the example above that is right (the
+allocation was skipped too). The shape where it is generous: `Handle h = alloc(); if (c)
+{ goto L; } defer free(h); L: return;` — on the `c` path h IS allocated and the defer never
+registers, so h leaks at runtime, and the analysis does not say so. It never said so.
+
+**Fix sketch.** Track the armed flag as a two-valued fact in `IRPathState` (FALSE at entry,
+TRUE after its registration literal, unknown after a merge that disagrees) and drop the skip
+edge only when the flag is known TRUE. Then the shape above reports "may not be freed on all
+paths". Precision cost to check first: a fire that follows a merge of a goto-over path and a
+normal path becomes MAYBE at the return even when the goto-over path skipped the allocation
+too (the merge adds the other pred's ALIVE entry) — that is the case the current rule accepts
+correctly, so the two-valued fact must be combined with "the handle has no entry on the skip
+path" before the change is a pure improvement.
+
+---
+
 ## OPEN — Level B: a handle with 2+ recorded free sites is never "disjoint" again (LOW, precision, BUG-914 residual)
 
 **Symptom.** Three frees that together cover every path, each disjoint from the others,
@@ -4455,13 +4485,16 @@ recursive call chains.
 - `audit2_switch_partial_transfer.zer` — 5-arm switch with 3 freeing,
   2 not → MAYBE_FREED correctly emitted.
 
-### Behavior to investigate further
+### ~~Behavior to investigate further~~ (RESOLVED 2026-09-05, BUG-920)
 
-- `audit2_defer_scan_nested.zer` — 32 levels of nested `if (c) {...}`
-  with defer at innermost compiles clean. Unclear whether
-  `scan_stack[32]` overflow was hit and zercheck still found the defer
-  via direct walk, or whether depth wasn't actually > 31. Requires
-  instrumentation to confirm.
+- ~~`audit2_defer_scan_nested.zer` — 32 levels of nested `if (c) {...}`
+  with defer at innermost compiles clean.~~ The raw-AST defer scanner and its
+  depth cap no longer exist: defer bodies are lowered through the IR at their
+  fire sites. The gap file is promoted to `tests/zer/defer_nested_32_levels_ok.zer`
+  (unconditional nesting — the original `if (c)` chain leaves the `c == false`
+  paths without the free, which the lowered body now correctly reports as a
+  leak; the old scanner applied every defer's frees to every return regardless
+  of reachability, which is how it "compiled clean").
 
 ### ~~AST→IR emission audit — 6 more runtime-check regressions~~ (FIXED 2026-04-19, commit 3bdcf85)
 

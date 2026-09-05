@@ -549,3 +549,198 @@ void ast_print(Node *node, int depth) {
         break;
     }
 }
+
+/* ================================================================
+ * Deep clone (BUG-920, 2026-09-05)
+ *
+ * A defer body is lowered to IR at EVERY fire site (scope exit, every
+ * return, every break/continue that leaves its scope, every goto that
+ * skips past it). Lowering MUTATES the AST it is handed (pre_lower_orelse
+ * replaces an orelse with a temp ident in place; rewrite_capture_name
+ * renames captures; for-init rewrites), so lowering one body twice would
+ * lower a half-rewritten tree the second time. Each fire therefore lowers a
+ * fresh deep copy.
+ *
+ * `hook(orig, clone, ud)` runs for every cloned node so the caller can
+ * mirror node-KEYED side tables — the checker's typemap, proven-safe marks
+ * and auto-guard marks — onto the copy; a clone without them would emit
+ * with no type and no bounds guard.
+ *
+ * NODE_SPAWN is SHARED, not cloned: the emitter's thread-wrapper registry is
+ * keyed by the spawn node (one wrapper struct + function per spawn site), and
+ * the spawn lowering rewrites its argument idents idempotently, so one node
+ * serves every fire. Strings and TypeNodes are immutable after parsing and
+ * are shared too.
+ *
+ * Exhaustive over NodeKind (no default:) — a new kind must be placed
+ * deliberately, under -Werror=switch.
+ * ================================================================ */
+static Node **ast_clone_list(Arena *a, Node **items, int count,
+                             AstCloneHook hook, void *ud) {
+    if (!items || count <= 0) return items;
+    Node **out = (Node **)arena_alloc(a, (size_t)count * sizeof(Node *));
+    for (int i = 0; i < count; i++) out[i] = ast_clone(a, items[i], hook, ud);
+    return out;
+}
+
+static AsmOperand *ast_clone_asm_ops(Arena *a, AsmOperand *ops, int count,
+                                     AstCloneHook hook, void *ud) {
+    if (!ops || count <= 0) return ops;
+    AsmOperand *out = (AsmOperand *)arena_alloc(a, (size_t)count * sizeof(AsmOperand));
+    for (int i = 0; i < count; i++) {
+        out[i] = ops[i];
+        out[i].expr = ast_clone(a, ops[i].expr, hook, ud);
+    }
+    return out;
+}
+
+Node *ast_clone(Arena *a, Node *n, AstCloneHook hook, void *ud) {
+    if (!n) return NULL;
+    if (n->kind == NODE_SPAWN) return n;          /* shared by design — see above */
+    Node *c = (Node *)arena_alloc(a, sizeof(Node));
+    *c = *n;                                      /* scalars, flags, shared strings */
+    switch (n->kind) {
+    /* ---- top-level declarations (cannot sit inside a defer body; cloned
+     * structurally so the function is total) ---- */
+    case NODE_FILE:
+        c->file.decls = ast_clone_list(a, n->file.decls, n->file.decl_count, hook, ud);
+        break;
+    case NODE_FUNC_DECL:
+        c->func_decl.body = ast_clone(a, n->func_decl.body, hook, ud);
+        break;
+    case NODE_INTERRUPT:
+        c->interrupt.body = ast_clone(a, n->interrupt.body, hook, ud);
+        break;
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO:
+    case NODE_CONTAINER_DECL:
+        break;                                    /* declaration payload is immutable */
+    case NODE_GLOBAL_VAR:
+    case NODE_VAR_DECL:
+        c->var_decl.init = ast_clone(a, n->var_decl.init, hook, ud);
+        break;
+
+    /* ---- statements ---- */
+    case NODE_BLOCK:
+        c->block.stmts = ast_clone_list(a, n->block.stmts, n->block.stmt_count, hook, ud);
+        break;
+    case NODE_IF:
+        c->if_stmt.cond      = ast_clone(a, n->if_stmt.cond, hook, ud);
+        c->if_stmt.then_body = ast_clone(a, n->if_stmt.then_body, hook, ud);
+        c->if_stmt.else_body = ast_clone(a, n->if_stmt.else_body, hook, ud);
+        break;
+    case NODE_FOR:
+        c->for_stmt.init = ast_clone(a, n->for_stmt.init, hook, ud);
+        c->for_stmt.cond = ast_clone(a, n->for_stmt.cond, hook, ud);
+        c->for_stmt.step = ast_clone(a, n->for_stmt.step, hook, ud);
+        c->for_stmt.body = ast_clone(a, n->for_stmt.body, hook, ud);
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        c->while_stmt.cond = ast_clone(a, n->while_stmt.cond, hook, ud);
+        c->while_stmt.body = ast_clone(a, n->while_stmt.body, hook, ud);
+        break;
+    case NODE_SWITCH: {
+        c->switch_stmt.expr = ast_clone(a, n->switch_stmt.expr, hook, ud);
+        if (n->switch_stmt.arms && n->switch_stmt.arm_count > 0) {
+            SwitchArm *arms = (SwitchArm *)arena_alloc(a,
+                (size_t)n->switch_stmt.arm_count * sizeof(SwitchArm));
+            for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+                arms[i] = n->switch_stmt.arms[i];
+                arms[i].values = ast_clone_list(a, n->switch_stmt.arms[i].values,
+                                                n->switch_stmt.arms[i].value_count, hook, ud);
+                arms[i].body = ast_clone(a, n->switch_stmt.arms[i].body, hook, ud);
+            }
+            c->switch_stmt.arms = arms;
+        }
+        break;
+    }
+    case NODE_RETURN:
+        c->ret.expr = ast_clone(a, n->ret.expr, hook, ud);
+        break;
+    case NODE_DEFER:
+        c->defer.body = ast_clone(a, n->defer.body, hook, ud);
+        break;
+    case NODE_EXPR_STMT:
+        c->expr_stmt.expr = ast_clone(a, n->expr_stmt.expr, hook, ud);
+        break;
+    case NODE_ASM:
+        c->asm_stmt.inputs   = ast_clone_asm_ops(a, n->asm_stmt.inputs, n->asm_stmt.input_count, hook, ud);
+        c->asm_stmt.outputs  = ast_clone_asm_ops(a, n->asm_stmt.outputs, n->asm_stmt.output_count, hook, ud);
+        c->asm_stmt.clobbers = ast_clone_asm_ops(a, n->asm_stmt.clobbers, n->asm_stmt.clobber_count, hook, ud);
+        break;
+    case NODE_CRITICAL:
+        c->critical.body = ast_clone(a, n->critical.body, hook, ud);
+        break;
+    case NODE_ONCE:
+        c->once.body = ast_clone(a, n->once.body, hook, ud);
+        break;
+    case NODE_AWAIT:
+        c->await_stmt.cond = ast_clone(a, n->await_stmt.cond, hook, ud);
+        break;
+    case NODE_STATIC_ASSERT:
+        c->static_assert_stmt.cond = ast_clone(a, n->static_assert_stmt.cond, hook, ud);
+        break;
+    case NODE_SPAWN:                              /* handled above (shared) */
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD:
+        break;
+
+    /* ---- expressions ---- */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    case NODE_BINARY:
+        c->binary.left  = ast_clone(a, n->binary.left, hook, ud);
+        c->binary.right = ast_clone(a, n->binary.right, hook, ud);
+        break;
+    case NODE_UNARY:
+        c->unary.operand = ast_clone(a, n->unary.operand, hook, ud);
+        break;
+    case NODE_ASSIGN:
+        c->assign.target = ast_clone(a, n->assign.target, hook, ud);
+        c->assign.value  = ast_clone(a, n->assign.value, hook, ud);
+        break;
+    case NODE_CALL:
+        c->call.callee = ast_clone(a, n->call.callee, hook, ud);
+        c->call.args   = ast_clone_list(a, n->call.args, n->call.arg_count, hook, ud);
+        c->call.comptime_struct_init = ast_clone(a, n->call.comptime_struct_init, hook, ud);
+        break;
+    case NODE_FIELD:
+        c->field.object = ast_clone(a, n->field.object, hook, ud);
+        break;
+    case NODE_INDEX:
+        c->index_expr.object = ast_clone(a, n->index_expr.object, hook, ud);
+        c->index_expr.index  = ast_clone(a, n->index_expr.index, hook, ud);
+        break;
+    case NODE_SLICE:
+        c->slice.object = ast_clone(a, n->slice.object, hook, ud);
+        c->slice.start  = ast_clone(a, n->slice.start, hook, ud);
+        c->slice.end    = ast_clone(a, n->slice.end, hook, ud);
+        break;
+    case NODE_ORELSE:
+        c->orelse.expr     = ast_clone(a, n->orelse.expr, hook, ud);
+        c->orelse.fallback = ast_clone(a, n->orelse.fallback, hook, ud);
+        break;
+    case NODE_INTRINSIC:
+        c->intrinsic.args = ast_clone_list(a, n->intrinsic.args, n->intrinsic.arg_count, hook, ud);
+        break;
+    case NODE_TYPECAST:
+        c->typecast.expr = ast_clone(a, n->typecast.expr, hook, ud);
+        break;
+    case NODE_STRUCT_INIT:
+        if (n->struct_init.fields && n->struct_init.field_count > 0) {
+            DesigField *f = (DesigField *)arena_alloc(a,
+                (size_t)n->struct_init.field_count * sizeof(DesigField));
+            for (int i = 0; i < n->struct_init.field_count; i++) {
+                f[i] = n->struct_init.fields[i];
+                f[i].value = ast_clone(a, n->struct_init.fields[i].value, hook, ud);
+            }
+            c->struct_init.fields = f;
+        }
+        break;
+    }
+    if (hook) hook(n, c, ud);
+    return c;
+}

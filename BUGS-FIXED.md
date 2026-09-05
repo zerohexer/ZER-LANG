@@ -5,10 +5,10 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-05 — BUG-913..918: five accept-unsafe holes + one over-rejection from a fresh full-codebase audit
+## Session 2026-09-05 — BUG-913..920: six holes, one over-rejection, and two "move it into the IR" refactors from a fresh full-codebase audit
 
 All were found by reading the IR pipeline end to end and probing the seams between
-passes, not by any gate. Each shipped a wrong program with NO diagnostic; each has a test
+passes, not by any gate. Each hole shipped a wrong program with NO diagnostic; each has a test
 that was verified to PASS on the pre-fix compiler (a `git archive HEAD` build) and fail on
 the fixed one — a test that has only ever passed is a script, not a net.
 
@@ -152,6 +152,60 @@ struct-returning function used to emit `return 0;`).
 Tests: `tests/zer/autoguard_before_shared_lock.zer` (133 → 0), `autoguard_fires_pending_defer`,
 `autoguard_struct_return_zero`, `autoguard_optional_return_none`, `autoguard_async_early_exit`,
 `tests/zer_trap/autoguard_in_critical_traps.zer`; every existing auto-guard test unchanged.
+
+### BUG-920 — defer bodies are lowered into the IR at every fire site; the raw-AST defer emitter and scanner are gone
+This is the task's own example of the tech debt to retire ("AST causes multiple sites to
+update for safety checks — move everything to IR in one pass"). A defer body used to travel
+as raw AST: pushed by `IR_DEFER_PUSH`, snapshotted onto each `IR_DEFER_FIRE`, emitted at the
+fire by a SECOND statement emitter (`emit_defer_stmt`, ~300 lines with partial statement
+coverage) and analysed by a SECOND handle analyzer (`ir_defer_scan_frees/uses` + the C3
+return-block pass, ~350 lines). Every rule had to be re-implemented for defer bodies and
+several were not. Measured on main, each with no diagnostic:
+
+| shape | what happened |
+|---|---|
+| `if (c) { free(h); } defer free(h);` | the scanner promoted MAYBE_FREED to FREED silently — the emitted C called free twice on the `c` path |
+| unprovable index in a defer-body var-decl init / while-cond / for-init | "auto-guard inserted" warning, raw `arr[i]` emitted (silent OOB) |
+| `while (g.v > 0)` / `if (g.v > 2)` / `for (...; i < g.v; ...)` on a `shared` struct in a defer body | condition read with NO mutex (only expression statements and var-decl inits were lock-wrapped) |
+| `switch`, `do-while`, `@critical`, `@once` inside a defer body | runtime trap "compiler bug: unsupported stmt kind in defer" on valid code |
+| `u32 z = 9; { u32 z = 1; defer { u32 z = 5; g = z; } }` | the registration-time rewrite bound the body's own `z` to the block's suffixed `z_N` (g == 1) |
+| 32-level nesting around a defer (`tests/zer_gaps/audit2_defer_scan_nested.zer`) | the scanner had a 31-level cap |
+
+Now `lower_defer_bodies` lowers a fresh deep clone (`ast_clone`, ast.c, exhaustive over
+NodeKind; the clone hook mirrors typemap / proven / auto-guard marks) of every live body,
+LIFO, through `lower_stmt` at each fire; `IR_DEFER_PUSH`/`IR_DEFER_FIRE` are markers. The
+emitter's defer stack, `emit_defer_stmt`, `emit_defer_shared_root`, `emit_defers*`,
+`emit_auto_guards`, `emit_safety_early_return`, the ~400-line dead `IR_NOP` NODE_SWITCH
+arm emitter, `guard_traps`, `noreturn_scope_depth` and `cur_ir_func` are deleted; so are
+zercheck_ir's defer scanners, `ir_fire_has_work_after`, `ir_defer_instance_id`,
+`freed_defer_id` and `defer_double_reported`. Full design (registration-time binding +
+scope hiding, dead fires, gates as IR branches with `defer_gate` / `defer_origin`, lock
+release before bodies) in compiler-internals.md "Defer bodies are LOWERED INTO THE IR".
+
+Three things the refactor surfaced and fixed on the way:
+- **Dead fires after a terminator.** A block exit whose last statement returned still
+  appended its fire after the RETURN; with real bodies, zercheck's linear block walk read
+  the dead `free(h)` as a second free. `fire_is_dead` emits nothing there.
+- **Gates need semantics, not just C.** The F2 armed flag and the cleanup-label guard were
+  invisible to the analysis; as IR branches their skip edges made every registered handle
+  MAYBE_FREED at the return. `ir_pred_is_gate_skip` drops the skip edge from merges and the
+  same-registration re-fire is idempotent via `defer_origin` — the analysis the old code
+  effectively had, now stated in one place (limitations.md records the one shape where it
+  is generous: a forward goto over a registration).
+- **The value/block `orelse` ban inside defer bodies is lifted** (its reason was "the raw
+  emitter has no orelse arm"); `defer cleanup(maybe() orelse 0);` works
+  (`tests/zer/defer_orelse_value_ok.zer` replaces the two negatives).
+
+Gates: `tools/emit_audit.sh` REQUIRED entries gained a minimum count
+(`defer_body_shared_cond_locked.zer` needs ≥ 4 locks; 3 on the pre-fix build);
+`tools/walker_audit.sh` now finds the end of `emit_expr`'s span structurally (its old
+marker was `emit_defers_from`, deleted here — and with the marker gone it printed nothing
+at all, so it also fails loudly now when a span cannot be located).
+Tests: `tests/zer_fail/defer_frees_maybe_freed_handle.zer`, `..._pool_handle.zer`
+(compiled clean pre-fix), `tests/zer_trap/defer_{vardecl_index,while_cond_index,for_init_index}_guard_traps.zer`
+(exit 0 pre-fix), `tests/zer/defer_body_{switch_do_while,critical_once,shared_cond_locked,own_decl_not_rebound,binds_at_registration}.zer`,
+`defer_nested_32_levels_ok.zer`, `defer_orelse_value_ok.zer`; the defer-goto matrix (36
+cells, runtime balance) and every existing defer/goto test unchanged.
 
 ---
 

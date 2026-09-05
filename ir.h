@@ -172,38 +172,28 @@ typedef struct IRInst {
 
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
-    /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this
-     * fire point, captured at lowering. The emitter emits THESE (LIFO: index 0 =
-     * oldest/outermost, emit high->low) instead of replaying a shared mutable
-     * stack in block-ID order (which dropped a sibling fall-through fire after a
-     * goto-path fire popped the stack — plt86m defer-goto gap). NULL/0 for
-     * pop-only fires and non-fire ops (make_inst memsets). */
-    Node **defer_fire_bodies;
-    int    defer_fire_body_count;
-    /* F2 (2026-08-03): per-defer runtime ARMED flag local, parallel to
-     * defer_fire_bodies (-1 = no flag, fire unconditionally). A forward `goto`
-     * can jump OVER a defer's registration to a label past it; the compile-time
-     * defer stack still lists that defer as pending, so the fire ran a body
-     * whose registration never executed (lock underflow). The flag is set where
-     * the defer REGISTERS and tested where it FIRES, so it is correct regardless
-     * of how control reached the fire — soundness does not depend on the
-     * positional `gi < di < li` analysis being complete.
-     * Allocated only in functions that contain a LABEL: structured
-     * break/continue/return keep the static stack accurate, so an unstructured
-     * jump is the only way to desynchronise it. */
-    int   *defer_fire_flags;
-    /* IR_DEFER_FIRE guard (plt86m defer-goto, both-reachable cleanup label):
-     * snapshot bodies whose ORIGINAL defer depth < defer_fire_guard_below are
-     * emitted as `if (!<flag local>) { body }` — the goto sets the flag, so the
-     * eager goto-path fire is not duplicated by this lazy label-return fire,
-     * while the fall-through path (flag still 0) fires AFTER the return expr is
-     * evaluated (BUG-442 timing). guard_flag = -1 means no guard. */
-    int    defer_fire_guard_flag;
-    int    defer_fire_guard_below;
+    /* BUG-920 (2026-09-05): IR_DEFER_PUSH / IR_DEFER_FIRE are MARKERS. The
+     * defer body is lowered inline at every fire site (ir_lower.c
+     * lower_defer_bodies), so the capture-on-fire body snapshot, the per-body
+     * armed flags and the cleanup-label guard that used to ride on the FIRE
+     * instruction are gone — those decisions are IR branches now. */
 
     /* Intrinsic operand */
     const char *intrinsic_name;
     const char *trap_msg;         /* IR_TRAP: message literal (no %% chars) */
+    /* BUG-920: provenance of an instruction lowered from a defer BODY —
+     * 1-based registration index of that defer (0 = not from a defer body).
+     * A body fires at several sites; on a path that already ran it (a goto
+     * fired it eagerly, then the label's exit fires it again under a runtime
+     * guard), zercheck_ir treats a free by the SAME registration of a handle
+     * that registration already freed as a re-fire, not a double free. */
+    int defer_origin;
+    /* BUG-920: IR_BRANCH gate around an inlined defer body. 1 = the F2 ARMED
+     * flag (true edge = body runs, false edge = registration never executed),
+     * 2 = the plt86m cleanup-label GUARD (true edge = body runs, false edge =
+     * a goto already fired it eagerly). zercheck_ir treats the FALSE edge as
+     * infeasible for its merge — see ir_pred_is_gate_skip. */
+    int defer_gate;
     uint32_t intrinsic_name_len;
 
     /* Three-address-code operands (Phase 8) */

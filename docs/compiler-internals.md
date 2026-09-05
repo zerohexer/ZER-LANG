@@ -6095,7 +6095,68 @@ Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
 as flag values fell into the validator's "out of range" check for
 functions with local_count == 0.
 
-### capture-on-FIRE + runtime-flag defer emission (2026-06-20 — plt86m defer-goto)
+### Defer bodies are LOWERED INTO THE IR at every fire site (2026-09-05, BUG-920) — read this first
+
+**Current model (supersedes the capture-on-FIRE section that follows, which is kept
+as the record of the constraints it solved):** `NODE_DEFER` records the body in
+`LowerCtx.defer_bodies[]` (with its F2 armed flag and its registration scope depth) and
+emits an `IR_DEFER_PUSH` MARKER. Every fire — `emit_defer_fire` (function/return exit),
+`emit_defer_fire_scoped` (block exit, break/continue, if/switch arms, goto eager fire) —
+emits an `IR_DEFER_FIRE` MARKER and then `lower_defer_bodies(ctx, base, line)`: for each
+live body, LIFO, a fresh deep copy (`ast_clone`, ast.c — the lowering MUTATES the AST it is
+handed, so the same body cannot be lowered twice) is wrapped in a `NODE_BLOCK` if it is not
+one already and lowered through `lower_stmt`, exactly like any other statement. So the
+per-statement shared-lock wrapper, the auto-guards (`lower_auto_guards`, BUG-919), the
+handle/UAF tracking in zercheck_ir and every future rule apply to a defer body BY
+CONSTRUCTION. There is no emitter-side defer stack, no `emit_defer_stmt` (the second
+statement emitter that re-answered every rule and missed several), and no zercheck_ir
+`ir_defer_scan_frees/uses` + C3 pass (the second analyzer over raw defer ASTs that
+promoted a MAYBE_FREED handle to FREED silently). `emit_defer_pop_only` is a marker only.
+
+Pieces that make it correct:
+- **`defer_clone_hook`** mirrors the node-keyed side tables onto each clone: typemap
+  (`checker_set_type`), proven marks (`checker_mark_proven`), auto-guard marks
+  (`checker_mark_auto_guard`). A clone without them would emit with no type and no guard.
+  `NODE_SPAWN` is SHARED, not cloned (the emitter's thread-wrapper registry is keyed by
+  the spawn node; spawn-arg ident rewriting is idempotent).
+- **Registration-time binding.** `rewrite_defer_body_idents` still rewrites the body's
+  idents to the unique C names of the locals visible where the defer is WRITTEN, and
+  `rw_collect_decl_names` keeps the names the body declares itself out of that rewrite
+  (`rw_skip_names`). At the fire, `lower_defer_bodies` additionally HIDES every
+  pre-existing local from a scope deeper than the registration scope (`defer_depths[]`)
+  while the body lowers, so `{ u32 x; defer { g = x; } { u32 x; return; } }` binds the outer
+  x even though the inner x is visible at the return. Both are needed: the C name of an
+  unsuffixed outer local equals its source name, so a name lookup alone would find the
+  inner shadow.
+- **Dead fires emit nothing.** `fire_is_dead`: a fire requested after the current block is
+  already terminated (a block exit whose last statement returned) emits neither marker nor
+  bodies — zercheck_ir walks a block's instructions linearly, and a dead `free(h)` after
+  the RETURN read as a second free of h.
+- **Gates are IR branches.** The F2 armed flag (`defer_gate = 1`) and the plt86m
+  cleanup-label guard (`!flag`, `defer_gate = 2`) wrap the inlined body in a `BRANCH` whose
+  TRUE edge runs the body and FALSE edge skips it. zercheck_ir cannot evaluate either
+  flag, so `ir_pred_is_gate_skip` drops the SKIP edge from a block's merge
+  (`ir_collect_pred_states`) — the semantics the analysis always had when the gates lived
+  only in the emitted C — and `IRInst.defer_origin` (1-based registration index, stamped
+  at `emit_inst`/`emit_3ac` while a body lowers) lets `ir_use_guard_disjoint` treat a free
+  or use by the SAME registration of a handle that registration already freed
+  (`IRHandleInfo.freed_by_origin`) as a re-fire, not a double free: the goto path fires
+  eagerly, the guarded label exit fires the same body again on the merged state.
+- **Lock release precedes the bodies.** An `orelse return/break/continue` fail path now
+  unlocks the statement's shared root BEFORE firing the defers (the NODE_RETURN order),
+  so a body that locks another shared struct never nests inside the statement's lock.
+- **Inside a body, a failed guard TRAPS** (`ctx->defer_body_depth`): an early return would
+  skip the rest of the cleanup.
+
+Lifted with it: the value/block `orelse` ban inside a defer body (F3, "emission
+impossibility") — `defer cleanup(maybe() orelse 0);` lowers like any orelse now.
+
+### capture-on-FIRE + runtime-flag defer emission (2026-06-20 — plt86m defer-goto) — HISTORICAL
+
+**Superseded 2026-09-05 (see the section above): the bodies are no longer snapshotted onto
+the FIRE instruction and emitted from AST; they are lowered inline. The armed flag and the
+cleanup-label guard survive as IR branches (`defer_gate`). What follows is the record of
+the constraints the runtime flags solve, which still hold.**
 
 **The defer body-emission model changed: each `IR_DEFER_FIRE` carries its OWN
 snapshot of live defer bodies (captured at lowering), and a both-reachable
@@ -12070,8 +12131,14 @@ than breaking it — that's the design key for any future lock work:
   skip the done-publish and hang losers (same rationale as the `@critical` ban; no
   existing `@once` body uses control flow). Freestanding (`#else`) path unchanged
   (single-core, loser does not wait).
-- **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
-  deferred shared access.
+- **B5 defer-body lock** (BUG-749): originally `emit_defer_stmt` NODE_EXPR_STMT
+  lock-wrapped the deferred shared access (and ONLY expression statements and var-decl
+  initialisers — a shared read in a defer-body while/if/for CONDITION had no lock).
+  Since BUG-920 (2026-09-05) the defer body is lowered through `lower_stmt`, so the
+  per-statement `emit_shared_lock_if_needed` and the condition locks
+  (`emit_shared_lock_around_cond`) reach it like any other block; gated by the
+  REQUIRED-count entry in `tools/emit_audit.sh` for
+  `tests/zer/defer_body_shared_cond_locked.zer`.
 
 ## Unified Level A product — the plan (2026-08-10)
 

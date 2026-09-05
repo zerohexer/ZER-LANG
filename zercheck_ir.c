@@ -57,15 +57,7 @@ typedef struct {
     IRHandleState state;
     int alloc_line;        /* where allocated */
     int free_line;         /* where freed */
-    /* F1 (2026-08-02): which DEFER BODY instance freed this handle (0 = none).
-     * Replaces source-LINE equality (free_line != defer_line) as the way to
-     * tell a REAL double free from the legitimate two-branch
-     * `defer { if(e){free} else{free} }`. Line-equality wrongly SKIPPED a
-     * genuine double free whenever the explicit free — or a SECOND defer —
-     * happened to sit on the same physical line as the `defer` keyword.
-     * Written ONLY in the post-fixpoint scope-exit scan, so no CFG-merge or
-     * snapshot handling is needed. */
-    int freed_defer_id;
+    int freed_by_origin;   /* BUG-920: defer_origin of the instruction that freed it (0 = explicit) */
     /* Level B guarded refinement (2026-06-27): the BLOCK index where this handle
      * was freed (-1 = not freed / unknown). Paired with the per-block guard sets
      * (ZerCheck.gr_block_guards) to decide, at a MAYBE_FREED use, whether the
@@ -121,10 +113,6 @@ typedef struct {
      * analysis. */
     const char *pool_name;
     uint32_t pool_name_len;
-    /* Control-flow oracle (2026-06-07): set once a defer-double-free has been
-     * reported for this handle, to avoid duplicate diagnostics when the C3
-     * exit pass re-scans the same defer body. */
-    bool defer_double_reported;
     /* BUG-849 (2026-08-23) — MULTI-VIEW. `FuncSummary.returns_param_color` is a
      * ONE-SLOT answer to a question whose truth is a SET: which arguments may the
      * result be a view of. When a callee's returns are views of DIFFERENT params
@@ -624,7 +612,17 @@ static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
  *   - NULL guards / out-of-range blocks / no contradiction → false (→ reject).
  * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
 static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
-    if (!h || h->state != IR_HS_MAYBE_FREED) return false;
+    if (!h) return false;
+    /* BUG-920: a use or free by the SAME defer registration that already freed
+     * this handle is that body RE-FIRING on a path where it already ran (a
+     * goto fired it eagerly; the cleanup label's exit fires it again under a
+     * runtime guard zercheck cannot evaluate). Idempotent by construction of
+     * the guard — admissible. Checked before the MAYBE_FREED gate because the
+     * eager fire leaves the handle definitely FREED on that path. */
+    if (zc->cur_defer_origin > 0 && h->freed_by_origin == zc->cur_defer_origin &&
+        (h->state == IR_HS_FREED || h->state == IR_HS_MAYBE_FREED))
+        return true;
+    if (h->state != IR_HS_MAYBE_FREED) return false;
     /* §A #4 SOUNDNESS (2026-07-04): once the handle has been freed on ALL paths
      * (a complementary free-pair {(C,+),(C,-)} completed its coverage), NO
      * subsequent use or free is admissible — every path reaches the freed
@@ -1203,6 +1201,13 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                 rh->state = IR_HS_MAYBE_FREED;
                 rh->free_line = ph->free_line;
             }
+            /* BUG-920: carry the freeing defer registration alongside free_line
+             * (only fill when rh has none of its own — an explicit free on the
+             * other pred wins, conservatively). */
+            if ((rh->state == IR_HS_MAYBE_FREED || rh->state == IR_HS_FREED) &&
+                rh->freed_by_origin == 0 && ph->freed_by_origin > 0 &&
+                (ph->state == IR_HS_FREED || ph->state == IR_HS_MAYBE_FREED))
+                rh->freed_by_origin = ph->freed_by_origin;
             /* Level B: carry the free BLOCK from whichever predecessor froze the
              * handle, so a MAYBE_FREED handle remembers WHERE it was freed (used
              * by the guard-disjointness check at the use). Mirror of the
@@ -2324,401 +2329,6 @@ static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
     free(aids);
 }
 
-/* AU-2: is an AST statement an `arena.reset()` / `arena.unsafe_reset()` call?
- * (NODE_FIELD callee, method "reset"/"unsafe_reset"). Mirrors ir_defer_free_arg
- * shape. Used by the defer scanner so a deferred reset invalidates arena
- * handles. */
-static bool ir_defer_is_arena_reset(Node *node) {
-    if (!node || node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return false;
-    Node *call = node->expr_stmt.expr;
-    if (call->kind != NODE_CALL) return false;
-    Node *callee = call->call.callee;
-    if (!callee || callee->kind != NODE_FIELD) return false;
-    const char *m = callee->field.field_name;
-    uint32_t ml = (uint32_t)callee->field.field_name_len;
-    return (ml == 5 && memcmp(m, "reset", 5) == 0) ||
-           (ml == 12 && memcmp(m, "unsafe_reset", 12) == 0);
-}
-
-/* Check if an AST statement is a free call. Returns the argument
- * expression (the thing being freed) or NULL. Recognizes:
- *   - pool.free(x)    (NODE_FIELD callee, method "free")
- *   - slab.free(x)    (same — dispatches via builtin)
- *   - pool.free_ptr(x) / slab.free_ptr(x)
- *   - bare free(x)    (plain cstdlib from cinclude)
- *   - Task.free(x) / Task.free_ptr(x)
- */
-static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
-    if (!node) return NULL;
-    if (node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return NULL;
-    Node *call = node->expr_stmt.expr;
-    if (call->kind != NODE_CALL || call->call.arg_count == 0) return NULL;
-
-    Node *callee = call->call.callee;
-    if (callee && callee->kind == NODE_FIELD) {
-        const char *m = callee->field.field_name;
-        uint32_t ml = (uint32_t)callee->field.field_name_len;
-        if ((ml == 4 && memcmp(m, "free", 4) == 0) ||
-            (ml == 8 && memcmp(m, "free_ptr", 8) == 0))
-            return call->call.args[0];
-    }
-    if (callee && callee->kind == NODE_IDENT &&
-        callee->ident.name_len == 4 &&
-        memcmp(callee->ident.name, "free", 4) == 0)
-        return call->call.args[0];
-    /* BUG-829: ONE question — "is this call a free?" — answered by TWO functions
-     * that disagreed. The main-body IR_CALL handler asks ir_is_extern_free_call
-     * (bodyless + void/destructor-named + pointer/opaque first param); this
-     * scanner asked a narrower NAME-ONLY question, so the same call inside a
-     * `defer` was not a free:
-     *     *opaque dev = sensor_open("/dev/spi0") orelse return;
-     *     defer sensor_close(dev);        // "allocated ... but never freed"
-     * The DIRECT call IS recognised, which is what localises this to the scanner
-     * rather than the heuristic. It is the flagship C-interop example in
-     * docs/reference.md, which the docs assert compiles and which did not.
-     * Widening a free classification marks the handle FREED — the CONSERVATIVE
-     * direction for the use checks — so this relaxes only the LEAK check, and
-     * only by trusting the classifier the main-body path already trusts.
-     * Double-free through a defer still fires. */
-    if (zc && ir_is_extern_free_call(zc, call))
-        return call->call.args[0];
-    /* BUG-829, second form: a ZER WRAPPER around the destructor
-     * (`void my_close(*Dev p) { dev_close(p); }`) is not bodyless, so the extern
-     * heuristic above says no. The main-body path settles it with the
-     * cross-function FuncSummary; ask the same summary here so BOTH forms of
-     * "this call frees its argument" get the same answer inside a defer as
-     * outside it. Returns the first param the callee is known to free. */
-    if (zc && callee && callee->kind == NODE_IDENT) {
-        for (int si = 0; si < zc->summary_count; si++) {
-            FuncSummary *sm = &zc->summaries[si];
-            if (sm->func_name_len != (uint32_t)callee->ident.name_len ||
-                memcmp(sm->func_name, callee->ident.name, sm->func_name_len) != 0)
-                continue;
-            for (int pi = 0; pi < sm->param_count && pi < call->call.arg_count; pi++)
-                if (sm->frees_param[pi]) return call->call.args[pi];
-            break;
-        }
-    }
-    return NULL;
-}
-
-/* Is there REAL WORK reachable after this defer fire?
- *
- * The discriminator between a BLOCK-scoped fire (mid-function, whose frees must
- * be applied in the forward pass so a later use is checked against them) and the
- * FUNCTION-EXIT fire (which Phase C3 already handles correctly at return blocks,
- * including the LIFO use/free interleave).
- *
- * Measured IR:
- *   block-scoped   bb3: DEFER_FIRE          -> bb4: DEFER_FIRE, CALL use, RETURN
- *   function-exit  bb1: DEFER_FIRE          -> bb3: DEFER_FIRE, RETURN
- * so "anything after the fire that is not defer bookkeeping / control flow"
- * separates them exactly.
- *
- * This matters because applying frees at a function-exit fire BREAKS the LIFO
- * contract: `defer free(p); defer use_it(p);` fires the USE first (against a
- * still-alive p), and a forward-pass free made C3's deferred-use scan report a
- * false use-after-free (tests/zer/defer_lifo_safe, defer_free_pattern_ok).
- * C3 owns that ordering; this only covers what C3 cannot see. */
-static bool ir_fire_has_work_after(IRFunc *func, IRInst *fire) {
-    if (!func || !fire) return false;
-    /* locate the fire by pointer — the walker does not carry its index */
-    int start_block = -1, start_inst = -1;
-    for (int bi0 = 0; bi0 < func->block_count && start_block < 0; bi0++) {
-        IRBlock *bb0 = &func->blocks[bi0];
-        for (int ii0 = 0; ii0 < bb0->inst_count; ii0++) {
-            if (&bb0->insts[ii0] == fire) { start_block = bi0; start_inst = ii0; break; }
-        }
-    }
-    if (start_block < 0) return false;
-    int seen_cap = func->block_count > 0 ? func->block_count : 1;
-    char *seen = (char *)calloc((size_t)seen_cap, 1);
-    if (!seen) return false;
-    int *stack = (int *)malloc((size_t)seen_cap * sizeof(int));
-    if (!stack) { free(seen); return false; }
-    int sp = 0;
-    bool found = false;
-    int bi = start_block, from_inst = start_inst + 1;
-    for (;;) {
-        if (bi >= 0 && bi < func->block_count && !seen[bi]) {
-            if (from_inst == 0) seen[bi] = 1;   /* only mark on a full visit */
-            IRBlock *bb = &func->blocks[bi];
-            for (int ii = from_inst; ii < bb->inst_count && !found; ii++) {
-                IROpKind op = bb->insts[ii].op;
-                if (op == IR_DEFER_FIRE || op == IR_DEFER_PUSH ||
-                    op == IR_GOTO || op == IR_RETURN || op == IR_BRANCH) continue;
-                found = true;
-            }
-            if (found) break;
-            /* IRBlock records PREDS, not succs — derive the successors of `bi`
-             * by finding every block that lists `bi` as a predecessor. */
-            for (int sb = 0; sb < func->block_count && sp < seen_cap; sb++) {
-                if (seen[sb]) continue;
-                IRBlock *cand = &func->blocks[sb];
-                for (int pi = 0; pi < cand->pred_count; pi++) {
-                    if (cand->preds[pi] == bi) { stack[sp++] = sb; break; }
-                }
-            }
-        }
-        if (sp == 0) break;
-        bi = stack[--sp];
-        from_inst = 0;
-    }
-    free(stack); free(seen);
-    return found;
-}
-
-/* PUSH-order index of a defer body, using the SAME ordering Phase C3 builds its
- * dfs[] with (every IR_DEFER_PUSH, block order then instruction order). Returns
- * index+1 as the per-defer instance id — 0 means "not found", matching C3's
- * convention where 0 is reserved for "freed by something other than a defer".
- *
- * The ids MUST agree: C3 re-applies every defer's frees at each return block and
- * only skips the double-free report when freed_defer_id == that defer's id. A
- * mismatch would turn this fix into a false double-free on every block-scoped
- * defer. */
-static int ir_defer_instance_id(IRFunc *func, Node *body) {
-    if (!func || !body) return 0;
-    int k = 0;
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        for (int ii = 0; ii < bb->inst_count; ii++) {
-            IRInst *in = &bb->insts[ii];
-            if (in->op != IR_DEFER_PUSH || !in->defer_body) continue;
-            if (in->defer_body == body) return k + 1;
-            k++;
-        }
-    }
-    return 0;
-}
-
-/* Walk a defer body. For each free found, resolve the argument to a
- * tracked handle (bare or compound) and mark it FREED at defer_line.
- * Recursively walks NODE_BLOCK so multi-statement defers are covered. */
-static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                 Node *body, int defer_line, int defer_id) {
-    if (!body) return;
-
-    /* Try this node as a free statement */
-    Node *farg = ir_defer_free_arg(zc, body);
-    if (farg) {
-        int root_local;
-        const char *path;
-        uint32_t path_len;
-        if (ir_extract_compound_key(zc, func, farg,
-                                     &root_local, &path, &path_len) == 0) {
-            IRHandleInfo *h;
-            if (path_len == 0) h = ir_find_handle(ps, root_local);
-            else h = ir_find_compound_handle(ps, root_local, path, path_len);
-            if (h && (h->state == IR_HS_ALIVE ||
-                      h->state == IR_HS_MAYBE_FREED)) {
-                h->state = IR_HS_FREED;
-                h->free_line = defer_line;
-                h->freed_defer_id = defer_id;   /* F1 */
-                /* Phase E: propagate to aliases sharing alloc_id.
-                 * Without this, `Handle h = mh orelse return; defer free(h);`
-                 * only marks h FREED, leaving mh (the ?Handle alias with
-                 * same alloc_id) as ALIVE at function exit → false leak. */
-                ir_propagate_alias_state(ps, h, IR_HS_FREED, defer_line);
-                /* F1: mirror the defer-instance id onto the alias group, so a
-                 * sibling alias freed via THIS same defer body is recognised as
-                 * the same instance and not reported as a double free. */
-                if (h->alloc_id != 0) {
-                    for (int _ai = 0; _ai < ps->handle_count; _ai++) {
-                        if (ps->handles[_ai].alloc_id == h->alloc_id)
-                            ps->handles[_ai].freed_defer_id = defer_id;
-                    }
-                }
-            } else if (h && h->state == IR_HS_FREED &&
-                       h->freed_defer_id != defer_id &&
-                       !h->defer_double_reported) {
-                /* Control-flow oracle CF_DEFER_DOUBLE (2026-06-07): the handle
-                 * was already freed by something OTHER than this defer (an
-                 * explicit body free, or a different defer), and this deferred
-                 * free will free it AGAIN at scope exit = double free.
-                 *
-                 * F1 (2026-08-02): the discriminator is the per-defer-body
-                 * INSTANCE ID, not source-line equality. It distinguishes a REAL
-                 * double free from the legitimate `defer { if (e) { free(h); }
-                 * else { free(h); } }`: the recursive scan walks BOTH
-                 * mutually-exclusive branches linearly, so the second branch
-                 * sees h already FREED — but both frees carry THIS defer's id
-                 * (stamped at the ALIVE->FREED mark above), so
-                 * freed_defer_id==defer_id and we correctly skip. A genuine
-                 * double free comes from an explicit free (id 0) or a DIFFERENT
-                 * defer (different id), so freed_defer_id!=defer_id.
-                 *
-                 * The previous guard used `free_line != defer_line`, which was
-                 * a PROXY for "same defer body" and broke whenever the two frees
-                 * shared a physical line: `defer g.free_ptr(p); g.free_ptr(p);`
-                 * and `defer free(h); defer free(h);` both compiled clean.
-                 *
-                 * No ordering comparison: a defer registered AFTER an explicit
-                 * free still fires at scope exit (`free(h); defer free(h);` IS a
-                 * double free), so guarding on order would be a false NEGATIVE.
-                 * The only cost is over-rejecting the rare `if (c) { free(h);
-                 * return; } defer free(h);` ordering — acceptable per the
-                 * soundness criterion; under-rejection is the hole this closes. */
-                ir_zc_error(zc, defer_line,
-                    "double free: deferred free of %%%d which was already "
-                    "freed at line %d",
-                    root_local, h->free_line);
-                h->defer_double_reported = 1;
-            }
-        }
-    }
-
-    /* AU-2 (2026-07-01): a deferred arena.reset()/unsafe_reset() invalidates
-     * every arena-colored handle, exactly like a direct reset. Without this a
-     * `defer arena.reset(); defer use(p);` (or just leak detection on an
-     * arena handle freed only via deferred reset) was blind. */
-    if (ir_defer_is_arena_reset(body))
-        ir_mark_arena_handles_freed(ps, defer_line);
-
-    /* Recurse into block AND nested control-flow bodies (BUG-608).
-     * Conservative: any reachable free inside defer marks handle FREED.
-     * Misses some conditional-free double-detect but prevents false
-     * leak on `defer { if (err) { free(h); } else { free(h); } }`. */
-    switch (body->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < body->block.stmt_count; i++)
-            ir_defer_scan_frees(zc, func, ps, body->block.stmts[i], defer_line, defer_id);
-        break;
-    case NODE_IF:
-        ir_defer_scan_frees(zc, func, ps, body->if_stmt.then_body, defer_line, defer_id);
-        ir_defer_scan_frees(zc, func, ps, body->if_stmt.else_body, defer_line, defer_id);
-        break;
-    case NODE_FOR:
-        /* BUG-827: a free in the for-INITIALISER of a defer body was not scanned,
-         * so the handle stayed ALIVE at exit (spurious leak) and a later free of
-         * the same allocation was not seen as a double free. */
-        ir_defer_scan_frees(zc, func, ps, body->for_stmt.init, defer_line, defer_id);
-        ir_defer_scan_frees(zc, func, ps, body->for_stmt.body, defer_line, defer_id);
-        break;
-    case NODE_WHILE: case NODE_DO_WHILE:
-        ir_defer_scan_frees(zc, func, ps, body->while_stmt.body, defer_line, defer_id);
-        break;
-    case NODE_SWITCH:
-        for (int i = 0; i < body->switch_stmt.arm_count; i++)
-            ir_defer_scan_frees(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, defer_id);
-        break;
-    case NODE_CRITICAL:
-        ir_defer_scan_frees(zc, func, ps, body->critical.body, defer_line, defer_id);
-        break;
-    case NODE_ONCE:
-        ir_defer_scan_frees(zc, func, ps, body->once.body, defer_line, defer_id);
-        break;
-    /* Stage 2 Part B (2026-04-28): exhaustive — leaf/non-control-flow
-     * kinds have no scannable body for free detection. The defer scanner
-     * only descends into block-shaped statements. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        break;
-    }
-}
-
-/* plt86m audit 2026-06-17: walk a defer body and check non-free USES against
- * the supplied exit path state `ps`. A USE of an entity that is FREED /
- * move-TRANSFERRED at scope exit is a use-after-free / use-after-move — the
- * defer fires AFTER the body's frees/moves, but the deferred statement is
- * lifted out of the linear IR stream, so the ordinary use-checker
- * (ir_check_expr_uaf during the fixpoint) never sees it. We route it through
- * the SAME checker here. A free(x)/free_ptr(x) statement's argument is NOT a
- * use (freeing in a defer is the normal cleanup pattern — handled by
- * ir_defer_scan_frees), so skip those. `rs` dedups reports per root-local
- * across every return block + defer in the function. */
-static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                Node *body, int defer_line, UafReportSet *rs) {
-    if (!body) return;
-
-    if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
-        ir_defer_free_arg(zc, body) == NULL) {
-        ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
-    }
-    /* BUG-819: the two non-control-flow expression positions. Both sat in the
-     * no-op leaf list below, which reads as "nothing to scan" — but a VAR_DECL
-     * carries an initialiser and a RETURN carries a value, and either can read a
-     * handle this defer's exit state says is already freed. */
-    if (body->kind == NODE_VAR_DECL && body->var_decl.init)
-        ir_check_expr_uaf(zc, func, ps, body->var_decl.init, defer_line, rs);
-    if (body->kind == NODE_RETURN && body->ret.expr)
-        ir_check_expr_uaf(zc, func, ps, body->ret.expr, defer_line, rs);
-
-    /* BUG-819: this walker NAMED every control-flow kind but only ever handed an
-     * expression to the UAF checker for NODE_EXPR_STMT — so a defer-body read of a
-     * freed handle in any EXPRESSION POSITION was silently unchecked:
-     *     defer { if (h.field > 0) { ... } }      // condition   — missed
-     *     defer { u32 v = h.field; use(v); }      // var-decl init — missed
-     * Passing the kind gate is not the same as descending the fields; that is the
-     * whole point of the FIELD-descent discipline. Every expression position below
-     * now routes through the same ir_check_expr_uaf the statement position uses. */
-    switch (body->kind) {
-    case NODE_BLOCK:
-        for (int i = 0; i < body->block.stmt_count; i++)
-            ir_defer_scan_uses(zc, func, ps, body->block.stmts[i], defer_line, rs);
-        break;
-    case NODE_IF:
-        ir_check_expr_uaf(zc, func, ps, body->if_stmt.cond, defer_line, rs);
-        ir_defer_scan_uses(zc, func, ps, body->if_stmt.then_body, defer_line, rs);
-        ir_defer_scan_uses(zc, func, ps, body->if_stmt.else_body, defer_line, rs);
-        break;
-    case NODE_FOR:
-        ir_defer_scan_uses(zc, func, ps, body->for_stmt.init, defer_line, rs);
-        ir_check_expr_uaf(zc, func, ps, body->for_stmt.cond, defer_line, rs);
-        ir_check_expr_uaf(zc, func, ps, body->for_stmt.step, defer_line, rs);
-        ir_defer_scan_uses(zc, func, ps, body->for_stmt.body, defer_line, rs);
-        break;
-    case NODE_WHILE: case NODE_DO_WHILE:
-        ir_check_expr_uaf(zc, func, ps, body->while_stmt.cond, defer_line, rs);
-        ir_defer_scan_uses(zc, func, ps, body->while_stmt.body, defer_line, rs);
-        break;
-    case NODE_SWITCH:
-        ir_check_expr_uaf(zc, func, ps, body->switch_stmt.expr, defer_line, rs);
-        for (int i = 0; i < body->switch_stmt.arm_count; i++)
-            ir_defer_scan_uses(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, rs);
-        break;
-    case NODE_CRITICAL:
-        ir_defer_scan_uses(zc, func, ps, body->critical.body, defer_line, rs);
-        break;
-    case NODE_ONCE:
-        ir_defer_scan_uses(zc, func, ps, body->once.body, defer_line, rs);
-        break;
-    /* exhaustive (no default:) per the -Wswitch walker rule — leaf/non-
-     * control-flow kinds carry no scannable sub-body. */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
-    case NODE_STATIC_ASSERT:
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
-    case NODE_SIZEOF: case NODE_STRUCT_INIT:
-        break;
-    }
-}
-
 /* Propagate state through aliases sharing alloc_id. When `target` is
  * marked FREED or TRANSFERRED, other entities (bare or compound) with
  * the same alloc_id represent the same underlying allocation and must
@@ -2734,6 +2344,7 @@ static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
         if (!ir_is_invalid(h)) {
             h->state = new_state;
             h->free_line = line;
+            h->freed_by_origin = target->freed_by_origin;   /* BUG-920 */
             /* BUG-914: the alias already remembered an earlier (conditional)
              * free site → now two sites → saturate. A fresh -1 is left for
              * the end-of-block tagging to fill with THIS block. */
@@ -2749,6 +2360,7 @@ static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
              * its own diagnostic). */
             h->state = IR_HS_FREED;
             h->free_line = line;
+            h->freed_by_origin = target->freed_by_origin;   /* BUG-920 */
             if (h->free_block >= 0) h->free_block = IR_FREE_BLOCK_MULTI;
         }
     }
@@ -3012,6 +2624,7 @@ static bool ir_register_global_field_store(ZerCheck *zc, IRPathState *ps,
 }
 
 static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
+    zc->cur_defer_origin = inst->defer_origin;   /* BUG-920 */
     (void)zc; /* used for error reporting */
     if (g_zer_trace && !zc->building_summary)
         fprintf(stderr, "[check] %-8s @line %d\n", ir_op_name(inst->op), inst->source_line);
@@ -3591,7 +3204,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         }
 
         if (h) {
-            if (h->state == IR_HS_FREED) {
+            if (ir_use_guard_disjoint(zc, h) && h->state == IR_HS_FREED) {
+                /* BUG-920: same-registration re-fire — idempotent. */
+            } else if (h->state == IR_HS_FREED) {
                 ir_zc_error(zc, inst->source_line,
                     "double free: %%%d already freed at line %d",
                     target, h->free_line);
@@ -3613,6 +3228,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
             h->state = IR_HS_FREED;
             h->free_line = inst->source_line;
+            h->freed_by_origin = zc->cur_defer_origin;   /* BUG-920 */
             ir_note_free_site(h);
 
             /* Mark aliases (bare or compound) with same alloc_id as FREED —
@@ -5283,7 +4899,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     if (h) {
-                        if (h->state == IR_HS_FREED) {
+                        if (ir_use_guard_disjoint(zc, h) && h->state == IR_HS_FREED) {
+                            /* BUG-920: same-registration re-fire — idempotent. */
+                        } else if (h->state == IR_HS_FREED) {
                             ir_zc_error(zc, inst->source_line,
                                 "double free: local %%%d already freed at line %d",
                                 root_local, h->free_line);
@@ -5306,6 +4924,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * the IR_CALL entry point below. */
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        h->freed_by_origin = zc->cur_defer_origin;   /* BUG-920 */
                         ir_note_free_site(h);
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
@@ -5717,7 +5336,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                     }
                     if (h) {
-                        if (h->state == IR_HS_FREED) {
+                        if (ir_use_guard_disjoint(zc, h) && h->state == IR_HS_FREED) {
+                            /* BUG-920: same-registration re-fire — idempotent. */
+                        } else if (h->state == IR_HS_FREED) {
                             ir_zc_error(zc, inst->source_line,
                                 "double free: local %%%d already freed at line %d",
                                 root_local, h->free_line);
@@ -5733,6 +5354,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        h->freed_by_origin = zc->cur_defer_origin;   /* BUG-920 */
                         ir_note_free_site(h);
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
@@ -6159,43 +5781,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     case IR_LOCK: case IR_UNLOCK:
     case IR_ARENA_RESET: case IR_RING_PUSH: case IR_RING_POP:
     case IR_RING_PUSH_CHECKED:
-    case IR_DEFER_FIRE: {
-        /* 2026-08-03f: a BLOCK-scoped defer fires mid-function, and its frees
-         * were never applied in the forward pass — IR_DEFER_FIRE sat in the
-         * no-op list and Phase C3 applies defer frees only at RETURN blocks. So
-         *
-         *     { defer free(p); }      <- fires HERE
-         *     u32 r = use(p);         <- checked against a state where p is ALIVE
-         *
-         * compiled clean and read the freed slot (verified: returns 222; the
-         * emitted C frees at block exit, then calls use(p)).
-         *
-         * Apply the frees at the fire point, but only for a fire that actually
-         * EMITS its bodies (src2_local != 2 — the same flag ir_validate uses to
-         * decide a push has a reachable body-emitting fire). A non-emitting fire
-         * is bookkeeping and must not free anything.
-         *
-         * The instance id must match C3's k+1 so its return-block re-application
-         * sees freed_defer_id == id and skips the double-free report.
-         * Monotonic — FREED is idempotent — so the CFG fixpoint still converges.
-         *
-         * Return values are computed BEFORE their fire in IR order, so
-         * `defer free(h); return h.field;` is unaffected (pinned by a positive
-         * test). */
-        if (inst->src2_local != 2 && inst->defer_fire_bodies &&
-            ir_fire_has_work_after(func, inst)) {
-            /* LIFO: defers fire in reverse registration order, mirroring C3. */
-            for (int dbi = inst->defer_fire_body_count - 1; dbi >= 0; dbi--) {
-                Node *dbody = inst->defer_fire_bodies[dbi];
-                if (!dbody) continue;
-                int did = ir_defer_instance_id(func, dbody);
-                if (did > 0)
-                    ir_defer_scan_frees(zc, func, ps, dbody,
-                                        inst->source_line, did);
-            }
-        }
-        break;
-    }
+    case IR_DEFER_FIRE:
+        /* BUG-920 (2026-09-05): a defer body is LOWERED INLINE at every fire site
+         * (ir_lower.c lower_defer_bodies), so its frees and uses are ordinary
+         * instructions that follow this marker — nothing to apply here. The
+         * AST scanners (ir_defer_scan_frees / ir_defer_scan_uses) and the C3
+         * return-block pass that used to re-implement handle tracking over raw
+         * defer ASTs are gone with them. */
     case IR_DEFER_PUSH:
     case IR_TRAP:
     case IR_INTRINSIC:
@@ -6421,6 +6013,55 @@ static Node *ir_local_def_expr(IRFunc *func, IRBlock *pref, int local) {
  * nothing, so it must not veto the param-view inference the other arm supports.
  * Before BUG-847 it did, and the caller then registered the result as a fresh
  * allocation and reported a leak that does not exist. */
+/* BUG-920: is `pred -> bi` the SKIP edge of a defer-body gate? An inlined
+ * defer body sits behind an IR_BRANCH tagged defer_gate: the F2 armed flag
+ * (false = the registration never executed) or the plt86m cleanup-label guard
+ * (false = a goto already fired this body eagerly). Neither flag is a value
+ * this analysis tracks, so the skip edge is treated as infeasible for the
+ * merge — which is exactly the semantics the pre-BUG-920 analysis had when the
+ * gates lived only in the emitted C (every body was assumed to run at every
+ * fire, and a same-registration re-fire is idempotent by ir_use_guard_disjoint).
+ * The guard gate's skip path already carries the body's effects (it ran
+ * eagerly), so nothing is lost there; the armed gate's skip path is a forward
+ * goto over the registration — its leak, if any, is not reported (pre-existing,
+ * limitations.md). */
+static bool ir_pred_is_gate_skip(IRFunc *func, int pred, int bi) {
+    if (pred < 0 || pred >= func->block_count) return false;
+    IRBlock *pb = &func->blocks[pred];
+    if (pb->inst_count == 0) return false;
+    IRInst *last = &pb->insts[pb->inst_count - 1];
+    return last->op == IR_BRANCH && last->defer_gate != 0 &&
+           last->false_block == bi && last->true_block != bi;
+}
+
+/* Copy the FEASIBLE predecessor states of block bi (gate skip edges dropped);
+ * if that would leave none, keep them all. Returns the count. */
+static int ir_collect_pred_states(IRFunc *func, IRPathState *block_states, int bi,
+                                  IRPathState **out) {
+    IRBlock *bb = &func->blocks[bi];
+    IRPathState *ps = (IRPathState *)calloc((size_t)(bb->pred_count > 0 ? bb->pred_count : 1),
+                                            sizeof(IRPathState));
+    int n = 0;
+    for (int pi = 0; pi < bb->pred_count; pi++) {
+        if (ir_pred_is_gate_skip(func, bb->preds[pi], bi)) continue;
+        ps[n] = ir_ps_copy(&block_states[bb->preds[pi]]);
+        /* ir_ps_copy clears `terminated`; a DEAD predecessor (an unreachable
+         * block that inherited a return block's state) must stay terminated so
+         * ir_merge_states skips it — see the no-pred seeding in the driver. */
+        ps[n].terminated = block_states[bb->preds[pi]].terminated;
+        n++;
+    }
+    if (n == 0) {
+        for (int pi = 0; pi < bb->pred_count; pi++) {
+            ps[n] = ir_ps_copy(&block_states[bb->preds[pi]]);
+            ps[n].terminated = block_states[bb->preds[pi]].terminated;
+            n++;
+        }
+    }
+    *out = ps;
+    return n;
+}
+
 static bool ir_return_is_null_literal(IRFunc *func, IRBlock *bb, IRInst *last,
                                       int rlocal) {
     if (last->expr) {
@@ -6520,6 +6161,16 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         func->blocks[bi - 1].inst_count - 1];
                     if (prev_last->op == IR_RETURN) {
                         merged = ir_ps_copy(&block_states[bi - 1]);
+                        /* BUG-920: this block is UNREACHABLE (no preds) — its own
+                         * instructions are still checked against the inherited
+                         * state (the Phase E intent), but its exit must not flow
+                         * into a live successor: an unreachable join block after
+                         * two returning arms (`if(a){if(b){return}else{return}}`)
+                         * inherited the arm's post-defer state (h FREED, now that
+                         * defer bodies are real instructions) and made the live
+                         * fall-through MAYBE_FREED. ir_merge_states skips
+                         * terminated predecessors. */
+                        merged.terminated = true;
                     } else {
                         ir_ps_init(&merged);
                     }
@@ -6552,12 +6203,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     }
                 }
             } else {
-                IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
-                for (int pi = 0; pi < bb->pred_count; pi++) {
-                    pred_states[pi] = ir_ps_copy(&block_states[bb->preds[pi]]);
-                }
-                merged = ir_merge_states(pred_states, bb->pred_count);
-                for (int pi = 0; pi < bb->pred_count; pi++)
+                IRPathState *pred_states = NULL;
+                int npred = ir_collect_pred_states(func, block_states, bi, &pred_states);
+                merged = ir_merge_states(pred_states, npred);
+                for (int pi = 0; pi < npred; pi++)
                     ir_ps_free(&pred_states[pi]);
                 free(pred_states);
             }
@@ -6654,6 +6303,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     func->blocks[bi - 1].inst_count - 1];
                 if (prev_last->op == IR_RETURN) {
                     merged = ir_ps_copy(&block_states[bi - 1]);
+                    merged.terminated = true;   /* BUG-920: dead block, see the fixpoint twin */
                 } else {
                     ir_ps_init(&merged);
                 }
@@ -6687,12 +6337,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
             }
         } else {
-            IRPathState *pred_states = (IRPathState *)calloc(bb->pred_count, sizeof(IRPathState));
-            for (int pi = 0; pi < bb->pred_count; pi++) {
-                pred_states[pi] = ir_ps_copy(&block_states[bb->preds[pi]]);
-            }
-            merged = ir_merge_states(pred_states, bb->pred_count);
-            for (int pi = 0; pi < bb->pred_count; pi++)
+            IRPathState *pred_states = NULL;
+            int npred = ir_collect_pred_states(func, block_states, bi, &pred_states);
+            merged = ir_merge_states(pred_states, npred);
+            for (int pi = 0; pi < npred; pi++)
                 ir_ps_free(&pred_states[pi]);
             free(pred_states);
         }
@@ -7377,68 +7025,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase C3: before leak detection, scan every IR_DEFER_PUSH body in the
-     * function and mark handles freed therein as FREED in the return-block
-     * path states. Conservative: every defer's frees apply to every return
-     * block. Matches zercheck.c defer_scan_all_frees at function exit.
-     *
-     * Without this, any handle freed only inside a `defer { pool.free(h); }`
-     * would appear ALIVE at function exit and trigger a false leak error.
-     *
-     * We walk all blocks to collect defers once, then apply to each return
-     * block's state. */
-    /* plt86m audit 2026-06-17: also check defer-body USES (not just frees)
-     * against each return block's PRISTINE exit state — a deferred USE of a
-     * handle the body already freed / move-transferred is a use-after-free /
-     * use-after-move. The uses-pass runs BEFORE the frees-pass below so a
-     * `defer free(h); defer use(h)` (LIFO-valid: use fires first, against a
-     * still-ALIVE h) is not false-flagged; the shared `defer_use_rs` dedups
-     * reports per root-local across all return blocks. */
-    UafReportSet defer_use_rs = {0};
-    /* AU-1 (2026-07-01): defers fire in LIFO (reverse-registration) order at
-     * scope exit. A `defer use(h)` registered BEFORE a `defer free(h)` therefore
-     * fires AFTER it — the use sees a FREED handle (a real UAF). The old split
-     * (all-uses against pristine state, THEN all-frees) missed this: it checked
-     * every use before applying any free. Fix: collect defers in registration
-     * order, then per return block process them in FIRE order (reverse) — for
-     * each defer, check its USES against the current state, THEN apply its
-     * FREES. So a use sees exactly the frees of later-registered defers (which
-     * fire first). The safe shape `defer free(h); defer use(h)` (use fires first,
-     * against ALIVE h) still passes — its free is applied after its use is
-     * checked. Leak detection is unaffected (the FINAL state has every free
-     * applied regardless of order). */
-    IRInst **dfs = NULL; int dfn = 0, dfc = 0;
-    for (int di = 0; di < func->block_count; di++) {
-        IRBlock *db = &func->blocks[di];
-        for (int dj = 0; dj < db->inst_count; dj++) {
-            IRInst *inst = &db->insts[dj];
-            if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
-            if (dfn == dfc) {
-                int ndc = dfc ? dfc * 2 : 8;
-                IRInst **nd = (IRInst **)realloc(dfs, (size_t)ndc * sizeof(IRInst *));
-                if (!nd) break;
-                dfs = nd; dfc = ndc;
-            }
-            dfs[dfn++] = inst;
-        }
-    }
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        if (bb->inst_count == 0) continue;
-        IRInst *last = &bb->insts[bb->inst_count - 1];
-        if (last->op != IR_RETURN) continue;
-        IRPathState *ret_ps = &block_states[bi];
-        for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
-            ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
-                               dfs[k]->source_line, &defer_use_rs);
-            /* F1: k+1 as the per-defer instance id — 0 is reserved for
-             * "not freed by any defer" (memset-zeroed slot / explicit free). */
-            ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
-                                dfs[k]->source_line, k + 1);
-        }
-    }
-    free(dfs);
-    free(defer_use_rs.ids);
+    /* BUG-920: the Phase C3 "apply every defer body's frees/uses to every
+     * return block" pass is gone — defer bodies are real IR at their fire
+     * sites, so each return block's state already carries exactly the frees
+     * that fire on its path (LIFO, after the return value is computed). */
 
     /* Phase D6: ghost handle detection — compute which allocated handles
      * are NEVER read subsequently. `pool.alloc()` as a bare expression

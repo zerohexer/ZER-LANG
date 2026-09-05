@@ -469,8 +469,6 @@ static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
     }
 }
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
-static void emit_auto_guards(Emitter *e, Node *node);
-static void emit_defers(Emitter *e);
 
 /* Emit the zero value for a type (used by auto-guard return, auto-orelse).
  * void → nothing (caller emits bare return), integer → 0, bool → 0,
@@ -493,186 +491,12 @@ static void emit_zero_value(Emitter *e, Type *t) {
     }
 }
 
-/* Emit `{ defers; return [value]; }` for early-exit safety guards
- * (auto-guard NODE_INDEX, UAF auto-guard NODE_FIELD, @cstr overflow auto-orelse).
- *
- * Async-aware: in async function bodies (Duff's-device poll loops), a bare
- * C `return;` would suspend the coroutine without signalling completion —
- * subsequent polls would re-enter at state 0 and re-run the prologue,
- * silently looping. Emit the same termination sequence IR_RETURN uses for
- * async (`self->_zer_state = -1; return 1;`) so the auto-guard early-out
- * marks the coroutine done.
- *
- * Main-promotion-aware: `void main()` is auto-promoted to `int main(void)`.
- * A bare `return;` in C `int main(void)` makes the exit code UB — eax holds
- * whatever happened to be there. Observed exit=208 on gcc -O2 vs exit=0 on
- * -O0 for the same source. Emit `return 0;` when `current_main_promoted`.
- *
- * `with_braces` controls whether the leading `{` / trailing `}` is emitted —
- * NODE_INDEX/NODE_FIELD callers want explicit braces+newline (statement form);
- * @cstr inline statement-expression already opened the brace via "if (...) { ". */
-static void emit_safety_early_return(Emitter *e, bool with_braces) {
-    /* §C #16: inside a defer body an early-return would re-fire the defer stack
-     * and skip the remaining function cleanup, so a bounds/UAF auto-guard traps
-     * instead (aborts safely before the out-of-bounds access). See guard_traps. */
-    /* BUG-835: the guard's runtime form is `if (idx >= N) { <defers>; return X; }`.
-     * guard_traps already covered a DEFER body; nothing covered the two OTHER scopes
-     * a `return` must never leave, so the compiler emitted, verbatim:
-     *
-     *   __asm__("mrs %0, primask\n cpsid i" ...);   // interrupts OFF
-     *   if ((size_t)(i) >= 4u) { return 0; }        // <-- leaves them OFF forever
-     *   __asm__("msr primask, %0" ...);             // never reached
-     *
-     *   pthread_mutex_lock(&g._zer_mtx);
-     *   if ((size_t)(i) >= 4u) { return; }          // <-- mutex never released
-     *   pthread_mutex_unlock(&g._zer_mtx);
-     *
-     * ZER hard-errors a USER-written `return` inside @critical for exactly this
-     * reason; the compiler was emitting the construct it bans. MEASURED: the lock
-     * form HANGS FOREVER (the join waits on a worker that can never take the mutex);
-     * the @critical form returned 0 silently, because hosted x86-64 degrades the
-     * critical section to a compiler fence — on bare metal it leaves interrupts off
-     * with no fault to notice it by. That asymmetry is why no existing test caught
-     * either half. Trapping is the same trade-off already accepted for defer bodies,
-     * and consistent with slices, which already TRAP on an out-of-range index. */
-    if (e->guard_traps || e->noreturn_scope_depth > 0) {
-        if (with_braces) emit(e, "{ ");
-        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
-                "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);");
-        if (with_braces) emit(e, " }\n"); else emit(e, " ");
-        return;
-    }
-    if (with_braces) emit(e, "{\n");
-    emit_defers(e);
-    if (e->in_async) {
-        if (with_braces) emit_indent(e);
-        emit(e, "self->_zer_state = -1; return 1;");
-    } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
-        emit(e, "return ");
-        emit_zero_value(e, e->current_func_ret);
-        emit(e, ";");
-    } else if (e->current_main_promoted) {
-        emit(e, "return 0;");
-    } else {
-        emit(e, "return;");
-    }
-    if (with_braces) emit(e, " }\n");
-    else emit(e, " ");
-}
-
-
-/* Walk expression tree, emit auto-guard if-return statements for unproven NODE_INDEX.
- * Called BEFORE emit_expr for the containing statement. */
-static void emit_auto_guards(Emitter *e, Node *node) {
-    if (!node) return;
-    switch (node->kind) {
-    case NODE_INDEX: {
-        uint64_t ag_size = checker_auto_guard_size(e->checker, node);
-        if (ag_size > 0) {
-            emit_indent(e);
-            emit(e, "if ((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
-            emit_safety_early_return(e, true);
-        }
-        emit_auto_guards(e, node->index_expr.object);
-        emit_auto_guards(e, node->index_expr.index);
-        break;
-    }
-    case NODE_FIELD:
-        /* UAF auto-guard: if handle array element may have been freed at dynamic index,
-         * emit if (use_idx == freed_idx) { return <zero>; } */
-        if (checker_auto_guard_size(e->checker, node) == UINT64_MAX &&
-            node->field.object->kind == NODE_INDEX &&
-            node->field.object->index_expr.object->kind == NODE_IDENT) {
-            const char *aname = node->field.object->index_expr.object->ident.name;
-            uint32_t alen = (uint32_t)node->field.object->index_expr.object->ident.name_len;
-            Checker *ck = e->checker;
-            for (int dfi = 0; dfi < ck->dyn_freed_count; dfi++) {
-                struct DynFreed *df = &ck->dyn_freed[dfi];
-                if (df->array_name_len == alen &&
-                    memcmp(df->array_name, aname, alen) == 0 && !df->all_freed) {
-                    emit_indent(e);
-                    emit(e, "if ((");
-                    emit_expr(e, node->field.object->index_expr.index);
-                    emit(e, ") == (");
-                    emit_expr(e, df->freed_idx);
-                    emit(e, ")) ");
-                    emit_safety_early_return(e, true);
-                    break;
-                }
-            }
-        }
-        emit_auto_guards(e, node->field.object); break;
-    case NODE_ASSIGN:
-        emit_auto_guards(e, node->assign.target);
-        emit_auto_guards(e, node->assign.value); break;
-    case NODE_BINARY:
-        emit_auto_guards(e, node->binary.left);
-        emit_auto_guards(e, node->binary.right); break;
-    case NODE_UNARY:
-        emit_auto_guards(e, node->unary.operand); break;
-    case NODE_CALL:
-        emit_auto_guards(e, node->call.callee);
-        for (int i = 0; i < node->call.arg_count; i++)
-            emit_auto_guards(e, node->call.args[i]);
-        break;
-    case NODE_ORELSE:
-        emit_auto_guards(e, node->orelse.expr);
-        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
-            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
-            emit_auto_guards(e, node->orelse.fallback);
-        break;
-    case NODE_INTRINSIC:
-        for (int i = 0; i < node->intrinsic.arg_count; i++)
-            emit_auto_guards(e, node->intrinsic.args[i]);
-        break;
-    case NODE_TYPECAST:
-        emit_auto_guards(e, node->typecast.expr);
-        break;
-    case NODE_STRUCT_INIT:
-        for (int i = 0; i < node->struct_init.field_count; i++)
-            emit_auto_guards(e, node->struct_init.fields[i].value);
-        break;
-    case NODE_SLICE:
-        emit_auto_guards(e, node->slice.object);
-        emit_auto_guards(e, node->slice.start);
-        emit_auto_guards(e, node->slice.end);
-        break;
-    /* Audit-fix (2026-06-30): descend into spawn args and await condition.
-     * Previously NODE_SPAWN and NODE_AWAIT fell through as leaf no-ops, so an
-     * unproven array index inside `spawn worker(arr[i])` or `await arr[i] != 0`
-     * never had its checker-promised auto-guard emitted — the warning printed
-     * "auto-guard inserted" but the IR emitter wrote raw `g_arr[i]` without
-     * the if(i>=N)return; guard. Same BUG-595..612 class — silent OOB on
-     * baremetal, SIGSEGV-rescued on hosted. Pair-fix with the IR gate widening
-     * at emitter.c:11241 / :11380 adding IR_AWAIT and IR_NOP. */
-    case NODE_SPAWN:
-        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
-            emit_auto_guards(e, node->spawn_stmt.args[i]);
-        break;
-    case NODE_AWAIT:
-        emit_auto_guards(e, node->await_stmt.cond);
-        break;
-    /* Leaf nodes — no sub-expressions with array indices */
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
-    /* Statement/decl nodes — emit_auto_guards only called on expressions */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
-    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_YIELD: case NODE_STATIC_ASSERT:
-        break;
-    }
-}
-
+/* BUG-919 / BUG-920 (2026-09-05): the emitter no longer synthesises any
+ * early exit. Bounds / UAF auto-guards are IR branches (ir_lower.c
+ * lower_auto_guards) and defer bodies are lowered inline at their fire sites
+ * (lower_defer_bodies), so emit_safety_early_return, emit_auto_guards,
+ * emit_defers and the raw-AST emit_defer_stmt are gone. Every statement in a
+ * function body is emitted from IR — there is exactly one statement emitter. */
 static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */
 
 
@@ -736,8 +560,6 @@ static bool shared_is_rw(Type *t) {
 /* Emit lock acquire for shared struct variable.
  * For shared(rw) structs, is_write determines rdlock vs wrlock. */
 static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
-    e->noreturn_scope_depth++;   /* BUG-835: counted HERE so all five call sites are
-                                  * covered by construction, not by remembering. */
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
@@ -767,7 +589,6 @@ static void emit_shared_lock(Emitter *e, Node *root) {
 
 /* Emit lock release for shared struct variable */
 static void emit_shared_unlock(Emitter *e, Node *root) {
-    if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;   /* BUG-835 */
     Type *rt = checker_get_type(e->checker, root);
     bool is_ptr = (rt && type_unwrap_distinct(rt)->kind == TYPE_POINTER);
     const char *arrow = is_ptr ? "->" : ".";
@@ -792,9 +613,6 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
     if (t) return t;
     return resolve_type_for_emit(e, tn);  /* fallback for uncached TypeNodes */
 }
-static void emit_defers(Emitter *e);
-static void emit_defers_from(Emitter *e, int base);
-static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
@@ -3172,14 +2990,14 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "; if (");
             emit_opt_null_check(e, tmp, orelse_type);
             emit(e, ") { ");
+            /* BUG-920: this is the AST emitter (global initialisers, spawn
+             * arguments); a function body is IR-only, so no defer can be
+             * pending here and none is fired. */
             if (node->orelse.fallback_is_return) {
-                emit_defers(e);
                 emit_return_null(e);
             } else if (node->orelse.fallback_is_break) {
-                emit_defers_from(e, e->loop_defer_base);
                 emit(e, "break; ");
             } else {
-                emit_defers_from(e, e->loop_defer_base);
                 emit(e, "continue; ");
             }
             emit(e, "} ");
@@ -3863,13 +3681,11 @@ static void emit_expr(Emitter *e, Node *node) {
             if (buf_eff && buf_eff->kind == TYPE_ARRAY) {
                 emit(e, "; if (_zer_cs%d.len + 1 > %llu) { ",
                      tmp, (unsigned long long)buf_eff->array.size);
-                /* auto-orelse: return zero value instead of trap. Trap stays as comment.
-                 * Caller already opened "{ " — emit defers+return+"}" inline. */
-                emit_safety_early_return(e, false);
+                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
                 emit(e, "} ");
             } else if (dest_is_slice) {
                 emit(e, "; if (_zer_cs%d.len + 1 > _zer_cd%d.len) { ", tmp, tmp);
-                emit_safety_early_return(e, false);
+                emit(e, "_zer_trap(\"@cstr buffer overflow\", __FILE__, __LINE__); ");
                 emit(e, "} ");
             } else {
                 emit(e, "; ");
@@ -4107,59 +3923,6 @@ static void emit_expr(Emitter *e, Node *node) {
  * operator: (_zer_bounds_check(idx, len, ...), arr)[idx].
  * This respects short-circuit (&&/||) and works in if/while/for conditions.
  * The old statement-level emit_bounds_checks() hoisting has been removed. */
-
-/* emit all accumulated defers in reverse order */
-/* emit defers from current count down to 'base' (exclusive) */
-static void emit_defers_from(Emitter *e, int base) {
-    /* Fire pending IR defer bodies (LIFO, top down to `base`) WITHOUT popping —
-     * used by a mid-body CONDITIONAL early-exit (auto-guard bounds return, @cstr
-     * overflow return, orelse fallback return/break/continue) where the code path
-     * that continues AFTER the early-exit still owns the same pending defers.
-     * IR path: bodies live on e->defer_stack (pushed by IR_DEFER_PUSH) and are
-     * keyed to cur_ir_func's locals. Before this, the auto-guard early-return
-     * called emit_defers with a pending IR defer and the compiler ABORTED
-     * ("emit_defers_from reached with N pending defers") on the extremely common
-     * `defer free(x); arr[i]=…` idiom. */
-    if (e->defer_stack.count <= base) return;
-    if (!e->cur_ir_func) {
-        /* No IR function context (AST/global-init path) should never have a
-         * pending defer — that path has no defer statements. Loud if it does. */
-        fprintf(stderr, "INTERNAL ERROR: emit_defers_from reached with %d pending "
-                        "defers but no IR function context. Please report.\n",
-                        e->defer_stack.count - base);
-        abort();
-    }
-    IRFunc *func = (IRFunc *)e->cur_ir_func;
-    for (int di = e->defer_stack.count - 1; di >= base; di--) {
-        Node *db = e->defer_stack.stmts[di];
-        if (!db) continue;
-        if (db->kind == NODE_BLOCK) {
-            /* F4 (2026-08-02): brace-scope the block-form defer body. A defer
-             * body is emitted at EVERY exit path, so a local declared inside
-             * (`defer { u32 z = x; ... }`) otherwise lands in the SHARED C
-             * function scope and the second exit path's copy is a gcc
-             * "redefinition" error — valid ZER failed to compile, and only at
-             * the gcc stage. The single-statement form below never declares, so
-             * it needs no brace. */
-            emit_indent(e);
-            emit(e, "{\n");
-            e->indent++;
-            for (int si = 0; si < db->block.stmt_count; si++)
-                emit_defer_stmt(e, db->block.stmts[si], func);
-            e->indent--;
-            emit_indent(e);
-            emit(e, "}\n");
-        } else {
-            emit_defer_stmt(e, db, func);
-        }
-    }
-}
-
-/* emit ALL defers (for return — must fire every scope's defers) */
-static void emit_defers(Emitter *e) {
-    emit_defers_from(e, 0);
-}
-
 
 /* ================================================================
  * TYPE RESOLUTION HELPER — resolve TypeNode for emission
@@ -10427,311 +10190,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 }
 
-/* Axis B5 (2026-06-21): find the shared-struct root touched by a defer-body
- * expression so the deferred access can be lock-wrapped. Defer bodies are
- * emitted as RAW AST at the IR_DEFER_FIRE site (not lowered through
- * emit_shared_lock_if_needed), so a `defer g.count = 0;` on a shared `g` was
- * emitted with NO mutex — an unlocked shared write that races other threads.
- * Mirrors ir_lower.c find_shared_root_expr; returns ONLY a genuinely-shared
- * root (so emit_shared_lock_mode never emits a lock on a struct that has no
- * _zer_mtx field, which would be a compile error in the emitted C). The shared
- * mutex is recursive (BUG-473), so wrapping here is safe even if a lock is
- * already held. */
-static Node *emit_defer_shared_root(Emitter *e, Node *expr) {
-    if (!expr) return NULL;
-    if (expr->kind == NODE_FIELD) {
-        /* AUDIT-2026-06-28: at each FIELD step, check the OBJECT's type.
-         * Defer-body shared access like `defer w.sp.v = X;` where `w.sp`
-         * is `*shared S` was silently missed — the walker descended past
-         * `w.sp` to `w` (non-shared) and returned NULL. No lock was
-         * emitted around the deferred access = silent race at defer fire.
-         * Companion to find_shared_root_expr in ir_lower.c. */
-        Node *cur = expr;
-        while (cur) {
-            Node *next;
-            if (cur->kind == NODE_FIELD) next = cur->field.object;
-            else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
-            else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
-            else break;
-            Type *nt = checker_get_type(e->checker, next);
-            if (nt) {
-                Type *eff = type_unwrap_distinct(nt);
-                if (eff->kind == TYPE_STRUCT &&
-                    (eff->struct_type.is_shared || eff->struct_type.is_shared_rw))
-                    return next;
-                if (eff->kind == TYPE_POINTER) {
-                    Type *inner = type_unwrap_distinct(eff->pointer.inner);
-                    if (inner && inner->kind == TYPE_STRUCT &&
-                        (inner->struct_type.is_shared || inner->struct_type.is_shared_rw))
-                        return next;
-                }
-            }
-            cur = next;
-        }
-    }
-    /* Recurse via if/else chains (NOT a switch) — mirrors ir_lower.c
-     * find_shared_root_expr and avoids the walker-default audit (no default:
-     * clause to silently swallow new node kinds). */
-    Node *found = NULL;
-    if (expr->kind == NODE_BINARY) {
-        found = emit_defer_shared_root(e, expr->binary.left);
-        if (!found) found = emit_defer_shared_root(e, expr->binary.right);
-    } else if (expr->kind == NODE_ASSIGN) {
-        found = emit_defer_shared_root(e, expr->assign.target);
-        if (!found) found = emit_defer_shared_root(e, expr->assign.value);
-    } else if (expr->kind == NODE_CALL) {
-        for (int i = 0; i < expr->call.arg_count && !found; i++)
-            found = emit_defer_shared_root(e, expr->call.args[i]);
-    } else if (expr->kind == NODE_UNARY) {
-        found = emit_defer_shared_root(e, expr->unary.operand);
-    } else if (expr->kind == NODE_INDEX) {
-        found = emit_defer_shared_root(e, expr->index_expr.object);
-        if (!found) found = emit_defer_shared_root(e, expr->index_expr.index);
-    } else if (expr->kind == NODE_TYPECAST) {
-        found = emit_defer_shared_root(e, expr->typecast.expr);
-    } else if (expr->kind == NODE_INTRINSIC) {
-        /* §E #28 form-coverage: a defer body reading a shared struct through an
-         * intrinsic (`@truncate(u32, g.v)`) must still emit the mutex lock at
-         * defer-fire — the walker previously returned NULL on NODE_INTRINSIC, so
-         * the deferred access was emitted UNLOCKED = silent race. Condvar/barrier/
-         * once intrinsics handle their own lock — don't double-wrap. */
-        const char *nm = expr->intrinsic.name;
-        size_t nlen = expr->intrinsic.name_len;
-        bool intrinsic_handles_own_lock =
-            (nlen >= 5 && memcmp(nm, "cond_", 5) == 0) ||
-            (nlen >= 8 && memcmp(nm, "barrier_", 8) == 0) ||
-            (nlen == 4 && memcmp(nm, "once", 4) == 0);
-        if (!intrinsic_handles_own_lock) {
-            for (int i = 0; i < expr->intrinsic.arg_count && !found; i++)
-                found = emit_defer_shared_root(e, expr->intrinsic.args[i]);
-        }
-    } else if (expr->kind == NODE_ORELSE) {
-        /* §E #28: `defer { x = a() orelse g.v; }`. */
-        found = emit_defer_shared_root(e, expr->orelse.expr);
-        if (!found) found = emit_defer_shared_root(e, expr->orelse.fallback);
-    } else if (expr->kind == NODE_SLICE) {
-        /* §E #28: `defer { s = g.buf[0..n]; }`. */
-        found = emit_defer_shared_root(e, expr->slice.object);
-        if (!found) found = emit_defer_shared_root(e, expr->slice.start);
-        if (!found) found = emit_defer_shared_root(e, expr->slice.end);
-    } else if (expr->kind == NODE_STRUCT_INIT) {
-        /* §E #28: `defer { P p = { .x = g.v }; }`. */
-        for (int i = 0; i < expr->struct_init.field_count && !found; i++)
-            found = emit_defer_shared_root(e, expr->struct_init.fields[i].value);
-    }
-    return found;
-}
-
-/* Emit a single statement from a defer body. Defer bodies are stored as raw
- * AST (NODE_BLOCK or single stmt) — NOT lowered to IR — so the IR-path defer
- * emitter needs a way to translate stmt-level AST into C. Without this
- * helper, statement kinds (NODE_IF / NODE_FOR / NODE_WHILE / nested
- * NODE_BLOCK) would silently hit emit_rewritten_node's default and
- * miscompile to "/ * unhandled node N * /0", dropping the entire statement.
- *
- * Control-flow statements banned in defer per CLAUDE.md
- * (return/break/continue/goto) are still rejected at checker level — this
- * emitter accepts them defensively, but check_stmt will have errored
- * before lowering reached us. */
-static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
-    if (!s) return;
-    switch (s->kind) {
-    case NODE_BLOCK: {
-        emit_indent(e);
-        emit(e, "{\n");
-        e->indent++;
-        for (int si = 0; si < s->block.stmt_count; si++) {
-            emit_defer_stmt(e, s->block.stmts[si], func);
-        }
-        e->indent--;
-        emit_indent(e);
-        emit(e, "}\n");
-        return;
-    }
-    case NODE_EXPR_STMT:
-        if (s->expr_stmt.expr) {
-            /* §C #16: defer bodies are raw AST emitted here and never reached the
-             * IR auto-guard pre-pass, so an unprovable fixed-array index in a defer
-             * (`defer arr[i]=x`) wrote raw (silent OOB). Emit guards in TRAP mode
-             * (early-return would re-fire the defer stack). Mirrors the IR gate. */
-            e->guard_traps = true;
-            emit_auto_guards(e, s->expr_stmt.expr);
-            e->guard_traps = false;
-            /* Axis B5: lock-wrap a deferred shared-struct access (the IR-path
-             * lock-emission doesn't reach raw defer bodies). Write lock if the
-             * expression is an assignment, else read lock. Recursive mutex
-             * (BUG-473) makes this safe even if a lock is already held. */
-            Node *sroot = emit_defer_shared_root(e, s->expr_stmt.expr);
-            bool is_w = (s->expr_stmt.expr->kind == NODE_ASSIGN);
-            if (sroot) emit_shared_lock_mode(e, sroot, is_w);
-            emit_indent(e);
-            emit_rewritten_node(e, s->expr_stmt.expr, func);
-            emit(e, ";\n");
-            if (sroot) emit_shared_unlock(e, sroot);
-        }
-        return;
-    case NODE_RETURN:
-        if (s->ret.expr) {
-            e->guard_traps = true;
-            emit_auto_guards(e, s->ret.expr);
-            e->guard_traps = false;
-        }
-        emit_indent(e);
-        emit(e, "return");
-        if (s->ret.expr) {
-            emit(e, " ");
-            emit_rewritten_node(e, s->ret.expr, func);
-        }
-        emit(e, ";\n");
-        return;
-    case NODE_ASM:
-        emit_indent(e);
-        if (s->asm_stmt.is_structured) {
-            emit_structured_asm(e, s, func);
-        } else {
-            emit(e, "__asm__ __volatile__(%.*s);\n",
-                 (int)s->asm_stmt.code_len, s->asm_stmt.code);
-        }
-        return;
-    case NODE_IF:
-        if (s->if_stmt.cond) {
-            e->guard_traps = true;
-            emit_auto_guards(e, s->if_stmt.cond);
-            e->guard_traps = false;
-        }
-        emit_indent(e);
-        emit(e, "if (");
-        if (s->if_stmt.cond) emit_rewritten_node(e, s->if_stmt.cond, func);
-        emit(e, ") ");
-        if (s->if_stmt.then_body) {
-            if (s->if_stmt.then_body->kind == NODE_BLOCK) {
-                emit(e, "{\n");
-                e->indent++;
-                for (int si = 0; si < s->if_stmt.then_body->block.stmt_count; si++) {
-                    emit_defer_stmt(e, s->if_stmt.then_body->block.stmts[si], func);
-                }
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}");
-            } else {
-                emit(e, "{ ");
-                emit_defer_stmt(e, s->if_stmt.then_body, func);
-                emit_indent(e);
-                emit(e, "}");
-            }
-        } else {
-            emit(e, "{}");
-        }
-        if (s->if_stmt.else_body) {
-            emit(e, " else ");
-            if (s->if_stmt.else_body->kind == NODE_BLOCK) {
-                emit(e, "{\n");
-                e->indent++;
-                for (int si = 0; si < s->if_stmt.else_body->block.stmt_count; si++) {
-                    emit_defer_stmt(e, s->if_stmt.else_body->block.stmts[si], func);
-                }
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            } else if (s->if_stmt.else_body->kind == NODE_IF) {
-                /* else-if chain — recurse directly without extra block */
-                emit_defer_stmt(e, s->if_stmt.else_body, func);
-            } else {
-                emit(e, "{ ");
-                emit_defer_stmt(e, s->if_stmt.else_body, func);
-                emit(e, "}\n");
-            }
-        } else {
-            emit(e, "\n");
-        }
-        return;
-    case NODE_WHILE:
-        emit_indent(e);
-        emit(e, "while (");
-        if (s->while_stmt.cond) emit_rewritten_node(e, s->while_stmt.cond, func);
-        emit(e, ") {\n");
-        e->indent++;
-        if (s->while_stmt.body && s->while_stmt.body->kind == NODE_BLOCK) {
-            for (int si = 0; si < s->while_stmt.body->block.stmt_count; si++) {
-                emit_defer_stmt(e, s->while_stmt.body->block.stmts[si], func);
-            }
-        } else if (s->while_stmt.body) {
-            emit_defer_stmt(e, s->while_stmt.body, func);
-        }
-        e->indent--;
-        emit_indent(e);
-        emit(e, "}\n");
-        return;
-    case NODE_FOR:
-        /* Best-effort: emit C `for` directly. NODE_FOR's init can be a
-         * NODE_VAR_DECL or an expression; step is an expression. */
-        emit_indent(e);
-        emit(e, "for (");
-        if (s->for_stmt.init) {
-            if (s->for_stmt.init->kind == NODE_VAR_DECL) {
-                Type *t = checker_get_type(e->checker, s->for_stmt.init);
-                if (t) emit_type(e, t);
-                emit(e, " %.*s",
-                     (int)s->for_stmt.init->var_decl.name_len,
-                     s->for_stmt.init->var_decl.name);
-                if (s->for_stmt.init->var_decl.init) {
-                    emit(e, " = ");
-                    emit_rewritten_node(e, s->for_stmt.init->var_decl.init, func);
-                }
-            } else {
-                emit_rewritten_node(e, s->for_stmt.init, func);
-            }
-        }
-        emit(e, "; ");
-        if (s->for_stmt.cond) emit_rewritten_node(e, s->for_stmt.cond, func);
-        emit(e, "; ");
-        if (s->for_stmt.step) emit_rewritten_node(e, s->for_stmt.step, func);
-        emit(e, ") {\n");
-        e->indent++;
-        if (s->for_stmt.body && s->for_stmt.body->kind == NODE_BLOCK) {
-            for (int si = 0; si < s->for_stmt.body->block.stmt_count; si++) {
-                emit_defer_stmt(e, s->for_stmt.body->block.stmts[si], func);
-            }
-        } else if (s->for_stmt.body) {
-            emit_defer_stmt(e, s->for_stmt.body, func);
-        }
-        e->indent--;
-        emit_indent(e);
-        emit(e, "}\n");
-        return;
-    case NODE_VAR_DECL: {
-        /* §E #28 form-coverage: lock-wrap deferred shared-struct reads in a
-         * var-decl init too (not only NODE_EXPR_STMT). `defer { u32 z = g.v; }`
-         * (or the intrinsic-wrapped form) must emit a rdlock, else the deferred
-         * read at fire-time races. Read lock; recursive mutex is safe if a lock
-         * is already held (BUG-473). */
-        Node *sroot = s->var_decl.init ? emit_defer_shared_root(e, s->var_decl.init) : NULL;
-        if (sroot) emit_shared_lock_mode(e, sroot, false);
-        emit_indent(e);
-        Type *t = checker_get_type(e->checker, s);
-        if (t) emit_type(e, t);
-        emit(e, " %.*s", (int)s->var_decl.name_len, s->var_decl.name);
-        if (s->var_decl.init) {
-            emit(e, " = ");
-            emit_rewritten_node(e, s->var_decl.init, func);
-        }
-        emit(e, ";\n");
-        if (sroot) emit_shared_unlock(e, sroot);
-        return;
-    }
-    default:
-        /* AUDIT-LOUD: silently miscompiling statement kinds in defer
-         * is the original bug class this helper closed. Fail loudly. */
-        fprintf(stderr, "compiler bug: emit_defer_stmt has no handler for "
-                "node kind %d at line %d\n",
-                s->kind, s->loc.line);
-        emit_indent(e);
-        emit(e, "_zer_trap(\"compiler bug: unsupported stmt kind in defer\", "
-             "__FILE__, __LINE__);\n");
-        return;
-    }
-}
-
 /* Emit one IR instruction as C code */
 static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     switch (inst->op) {
@@ -11476,7 +10934,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_BEGIN: {
-        e->noreturn_scope_depth++;   /* BUG-835: a return here leaves interrupts OFF */
         emit_indent(e);
         emit(e, "{ /* @critical */\n");
         e->indent++;
@@ -11519,8 +10976,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 
     case IR_CRITICAL_END: {
-        if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;   /* BUG-835 */
-        emit_indent(e);
+            emit_indent(e);
         emit(e, "#if defined(__ARM_ARCH)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
@@ -11552,119 +11008,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
-    case IR_DEFER_PUSH: {
-        /* Push defer body onto emitter's defer stack (same as AST path) */
-        if (inst->defer_body) {
-            if (e->defer_stack.count >= e->defer_stack.capacity) {
-                int new_cap = e->defer_stack.capacity * 2;
-                if (new_cap < 16) new_cap = 16;
-                Node **new_stmts = (Node **)malloc(new_cap * sizeof(Node *));
-                if (e->defer_stack.stmts) {
-                    memcpy(new_stmts, e->defer_stack.stmts,
-                           e->defer_stack.count * sizeof(Node *));
-                    free(e->defer_stack.stmts);
-                }
-                e->defer_stack.stmts = new_stmts;
-                e->defer_stack.capacity = new_cap;
-            }
-            e->defer_stack.stmts[e->defer_stack.count++] = inst->defer_body;
-        }
+    case IR_DEFER_PUSH:
+    case IR_DEFER_FIRE:
+        /* BUG-920 (2026-09-05): MARKERS. A defer body is lowered inline at
+         * every fire site by ir_lower.c (lower_defer_bodies), so the
+         * instructions that follow an IR_DEFER_FIRE ARE the body; there is no
+         * emitter-side defer stack and no second statement emitter any more.
+         * The markers survive for ir_validate's push/fire balance check and
+         * for --emit-ir. */
         break;
-    }
-
-    case IR_DEFER_FIRE: {
-        /* Fire pending defers in LIFO order.
-         * cond_local >= 0: scoped fire from top down to base (cond_local).
-         * src2_local == 0 (default): emit bodies + pop.
-         * src2_local == 1: emit bodies, no pop (for break/continue/orelse-exits).
-         * src2_local == 2: pop only (no emit) — used at loop exit to clean up
-         *                  after divergent paths already emitted their fire-no-pop.
-         * cond_local == -1: fire all (no pop — function exit). */
-        int base = (inst->cond_local >= 0) ? inst->cond_local : 0;
-        /* src2_local: 0 = emit+pop, 1 = emit, no pop, 2 = pop only */
-        bool pop = (inst->cond_local >= 0) && (inst->src2_local != 1);
-        bool emit_bodies = (inst->src2_local != 2);
-        if (!emit_bodies) {
-            if (pop) e->defer_stack.count = base;
-            break;
-        }
-        /* capture-on-FIRE (plt86m defer-goto): emit THIS fire's own snapshot of
-         * live defer bodies (LIFO: index high = newest defer = first), NOT a
-         * replay of the shared mutable defer_stack in block-ID order — that
-         * replay dropped a sibling fall-through fire after a goto-path fire
-         * popped the stack. The defer_stack push/pop bookkeeping (below) stays
-         * for ir_validate balance but is no longer READ for body emission.
-         * emit_defer_stmt handles NODE_BLOCK + every legit defer-body kind. */
-        for (int di = inst->defer_fire_body_count - 1; di >= 0; di--) {
-            Node *db = inst->defer_fire_bodies[di];
-            if (!db) continue;
-            /* both-reachable cleanup-label guard (plt86m defer-goto): a body
-             * whose ORIGINAL defer depth (base+di) is < guard_below was fired
-             * EAGERLY by a goto (which set the flag), so emit it as
-             * `if (!flag) { body }` — skipped on the goto path, fired on the
-             * fall-through path (flag still 0) AT this return, after eval. */
-            int depth = base + di;
-            bool guarded = (inst->defer_fire_guard_flag >= 0) &&
-                           (depth < inst->defer_fire_guard_below);
-            /* F2 (2026-08-03): ARMED gate. A forward `goto` can jump OVER this
-             * defer's registration to a label past it; the compile-time defer
-             * stack still lists it as pending, so this fire ran a body whose
-             * registration never executed — `rel()` without `acq()`, a lock
-             * underflow, silent. The flag is set where the defer REGISTERS
-             * (ir_lower NODE_DEFER) and tested here, so it is right regardless
-             * of how control reached this fire.
-             *
-             * INDEPENDENT of `guarded`, and they nest rather than combine:
-             *   guarded  = "a goto already fired this eagerly, skip it"
-             *   armed    = "this registration never ran, skip it"
-             * Opposite polarities, both may apply to one fire. */
-            int armed_flag = inst->defer_fire_flags ? inst->defer_fire_flags[di] : -1;
-            if (guarded) {
-                emit_indent(e);
-                emit(e, "if (!");
-                emit_local_name(e, func, inst->defer_fire_guard_flag);
-                emit(e, ") {\n");
-                e->indent++;
-            }
-            if (armed_flag >= 0) {
-                emit_indent(e);
-                emit(e, "if (");
-                emit_local_name(e, func, armed_flag);
-                emit(e, ") {\n");
-                e->indent++;
-            }
-            if (db->kind == NODE_BLOCK) {
-                /* F4 (2026-08-02): brace-scope — see the emit_defers_from
-                 * sibling. Flattening the block here rather than calling
-                 * emit_defer_stmt(block) is deliberate: the `guarded` if-wrap
-                 * above must be able to nest the whole body. These braces just
-                 * restore the scope the flattening removes. */
-                emit_indent(e);
-                emit(e, "{\n");
-                e->indent++;
-                for (int si = 0; si < db->block.stmt_count; si++) {
-                    emit_defer_stmt(e, db->block.stmts[si], func);
-                }
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            } else {
-                emit_defer_stmt(e, db, func);
-            }
-            if (armed_flag >= 0) {
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            }
-            if (guarded) {
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            }
-        }
-        if (pop) e->defer_stack.count = base;
-        break;
-    }
 
     case IR_INTRINSIC: {
         /* IR_INTRINSIC no longer created by lowering — all flow through
@@ -11789,392 +11141,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "}\n");
                 }
             } else if (inst->expr->kind == NODE_SWITCH) {
-                /* Enum/union/optional switch — emit if/else chain directly.
-                 * Uses emit_rewritten_node for sub-expressions. */
-                Node *sw = inst->expr;
-                int sw_tmp = e->temp_count++;
-                Type *sw_type = checker_get_type(e->checker, sw->switch_stmt.expr);
-                Type *sw_eff = sw_type ? type_unwrap_distinct(sw_type) : NULL;
-                bool is_union = sw_eff && sw_eff->kind == TYPE_UNION;
-                bool is_opt = sw_eff && sw_eff->kind == TYPE_OPTIONAL &&
-                              !is_null_sentinel(sw_eff->optional.inner);
-                bool is_enum = sw_eff && sw_eff->kind == TYPE_ENUM;
-
-                /* Hoist switch expression.
-                 * For unions: use pointer to original so `|*v|` captures can modify it.
-                 * For enum/optional: hoist into temp (value semantics fine). */
+                /* BUG-920: ir_lower lowers EVERY switch to IR branches
+                 * (BUG-579), so a NODE_SWITCH can no longer reach the emitter.
+                 * The ~400-line raw-AST arm emitter that used to sit here was
+                 * dead code with partial statement coverage and its own
+                 * defer stack — the exact second-emitter shape that produced
+                 * the defer-body holes. Fail loudly instead of miscompiling. */
+                fprintf(stderr, "compiler bug: NODE_SWITCH reached emit_ir_inst "
+                        "as an IR_NOP passthrough at line %d\n", inst->expr->loc.line);
                 emit_indent(e);
-                if (is_union) {
-                    bool sw_is_rvalue = (sw->switch_stmt.expr->kind == NODE_CALL);
-                    if (sw_is_rvalue) {
-                        /* rvalue: hoist into temp FIRST, then take its address */
-                        emit(e, "{ __typeof__(");
-                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                        emit(e, ") _zer_swt%d = ", sw_tmp);
-                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                        emit(e, ";\n");
-                        emit_indent(e);
-                        emit(e, "__typeof__(_zer_swt%d) *_zer_sw%d = &_zer_swt%d;\n",
-                             sw_tmp, sw_tmp, sw_tmp);
-                    } else {
-                        emit(e, "{ __typeof__(");
-                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                        emit(e, ") *_zer_sw%d = &(", sw_tmp);
-                        emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                        emit(e, ");\n");
-                    }
-                } else {
-                    emit(e, "{ __typeof__(");
-                    emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                    emit(e, ") _zer_sw%d = ", sw_tmp);
-                    emit_rewritten_node(e, sw->switch_stmt.expr, func);
-                    emit(e, ";\n");
-                }
-                /* Accessor: unions use `->` (pointer), others use `.` (value) */
-                const char *sw_acc = is_union ? "->" : ".";
-
-                for (int ai = 0; ai < sw->switch_stmt.arm_count; ai++) {
-                    SwitchArm *arm = &sw->switch_stmt.arms[ai];
-                    emit_indent(e);
-                    if (arm->is_default) {
-                        if (ai > 0) emit(e, "else ");
-                        emit(e, "{\n");
-                    } else {
-                        if (ai > 0) emit(e, "else ");
-                        emit(e, "if (");
-                        if (is_union) {
-                            emit(e, "_zer_sw%d%s_tag == %d", sw_tmp, sw_acc, ai);
-                        } else if (is_opt) {
-                            /* Optional: first arm = has_value, second = !has_value (or vice versa) */
-                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_NULL_LIT) {
-                                emit(e, "!_zer_sw%d.has_value", sw_tmp);
-                            } else {
-                                emit(e, "_zer_sw%d.has_value", sw_tmp);
-                            }
-                        } else if (is_enum && arm->is_enum_dot) {
-                            /* Enum: .variant → compare against _ZER_EnumName_variant */
-                            const char *ename = sw_eff->enum_type.name;
-                            uint32_t elen = sw_eff->enum_type.name_len;
-                            for (int vi = 0; vi < arm->value_count; vi++) {
-                                if (vi > 0) emit(e, " || ");
-                                emit(e, "_zer_sw%d == ", sw_tmp);
-                                /* Emit _ZER_EnumName_variant */
-                                /* Arm value is NODE_IDENT with variant name */
-                                if (arm->values[vi]->kind == NODE_IDENT) {
-                                    if (sw_eff->enum_type.module_prefix) {
-                                        emit(e, "_ZER_%.*s__%.*s_%.*s",
-                                             (int)sw_eff->enum_type.module_prefix_len,
-                                             sw_eff->enum_type.module_prefix,
-                                             (int)elen, ename,
-                                             (int)arm->values[vi]->ident.name_len,
-                                             arm->values[vi]->ident.name);
-                                    } else {
-                                        emit(e, "_ZER_%.*s_%.*s",
-                                             (int)elen, ename,
-                                             (int)arm->values[vi]->ident.name_len,
-                                             arm->values[vi]->ident.name);
-                                    }
-                                } else {
-                                    emit_rewritten_node(e, arm->values[vi], func);
-                                }
-                            }
-                        } else {
-                            /* Integer/other values */
-                            for (int vi = 0; vi < arm->value_count; vi++) {
-                                if (vi > 0) emit(e, " || ");
-                                emit(e, "_zer_sw%d == ", sw_tmp);
-                                emit_rewritten_node(e, arm->values[vi], func);
-                            }
-                        }
-                        emit(e, ") {\n");
-                    }
-                    e->indent++;
-
-                    /* Capture */
-                    if (arm->capture_name) {
-                        emit_indent(e);
-                        if (is_union && arm->capture_is_ptr) {
-                            /* Mutable union capture: Type *v = &_sw->variant (pointer to ORIGINAL) */
-                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
-                                emit(e, "__typeof__(_zer_sw%d%s%.*s) *%.*s = &_zer_sw%d%s%.*s;\n",
-                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
-                                     arm->values[0]->ident.name,
-                                     (int)arm->capture_name_len, arm->capture_name,
-                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
-                                     arm->values[0]->ident.name);
-                            }
-                        } else if (is_union) {
-                            /* Immutable union capture: copy variant value.
-                             * Arrays can't be assigned — use memcpy. */
-                            if (arm->value_count > 0 && arm->values[0]->kind == NODE_IDENT) {
-                                emit(e, "__typeof__(_zer_sw%d%s%.*s) %.*s; memcpy(&%.*s, &_zer_sw%d%s%.*s, sizeof(%.*s));\n",
-                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
-                                     arm->values[0]->ident.name,
-                                     (int)arm->capture_name_len, arm->capture_name,
-                                     (int)arm->capture_name_len, arm->capture_name,
-                                     sw_tmp, sw_acc, (int)arm->values[0]->ident.name_len,
-                                     arm->values[0]->ident.name,
-                                     (int)arm->capture_name_len, arm->capture_name);
-                            }
-                        } else if (is_opt) {
-                            /* Optional capture: unwrap .value */
-                            if (is_void_opt(sw_eff)) {
-                                /* ?void: no capture value */
-                            } else {
-                                emit(e, "__typeof__(_zer_sw%d.value) %.*s = _zer_sw%d.value;\n",
-                                     sw_tmp, (int)arm->capture_name_len, arm->capture_name,
-                                     sw_tmp);
-                            }
-                        } else {
-                            /* Enum/integer capture */
-                            emit(e, "__typeof__(_zer_sw%d) %.*s = _zer_sw%d;\n",
-                                 sw_tmp, (int)arm->capture_name_len, arm->capture_name,
-                                 sw_tmp);
-                        }
-                    }
-
-                    /* Arm body — emit statements directly.
-                     * Save defer_stack.count so we can fire+pop arm-scoped defers at arm end
-                     * (defers declared inside arm reference arm-local vars; must not leak). */
-                    int arm_defer_base = e->defer_stack.count;
-                    if (arm->body) {
-                        if (arm->body->kind == NODE_BLOCK) {
-                            for (int si = 0; si < arm->body->block.stmt_count; si++) {
-                                Node *bs = arm->body->block.stmts[si];
-                                if (bs->kind == NODE_EXPR_STMT && bs->expr_stmt.expr) {
-                                    emit_indent(e);
-                                    emit_rewritten_node(e, bs->expr_stmt.expr, func);
-                                    emit(e, ";\n");
-                                } else if (bs->kind == NODE_RETURN) {
-                                    emit_indent(e);
-                                    /* Check if function returns optional → wrap */
-                                    Type *fret = e->current_func_ret;
-                                    Type *fret_eff = fret ? type_unwrap_distinct(fret) : NULL;
-                                    if (bs->ret.expr && fret_eff &&
-                                        fret_eff->kind == TYPE_OPTIONAL &&
-                                        !is_null_sentinel(fret_eff->optional.inner)) {
-                                        Type *expr_type = checker_get_type(e->checker, bs->ret.expr);
-                                        if (expr_type && !type_is_optional(expr_type)) {
-                                            if (is_void_opt(fret_eff)) {
-                                                emit_rewritten_node(e, bs->ret.expr, func);
-                                                emit(e, ";\n");
-                                                emit_indent(e);
-                                                emit(e, "return (_zer_opt_void){ 1 };\n");
-                                            } else {
-                                                emit(e, "return (");
-                                                emit_type(e, fret_eff);
-                                                emit(e, "){ ");
-                                                emit_rewritten_node(e, bs->ret.expr, func);
-                                                emit(e, ", 1 };\n");
-                                            }
-                                        } else if (bs->ret.expr->kind == NODE_NULL_LIT) {
-                                            emit(e, "return ");
-                                            emit_opt_null_literal(e, fret_eff);
-                                            emit(e, ";\n");
-                                        } else {
-                                            emit(e, "return ");
-                                            emit_rewritten_node(e, bs->ret.expr, func);
-                                            emit(e, ";\n");
-                                        }
-                                    } else {
-                                        emit(e, "return");
-                                        if (bs->ret.expr) {
-                                            emit(e, " ");
-                                            emit_rewritten_node(e, bs->ret.expr, func);
-                                        }
-                                        emit(e, ";\n");
-                                    }
-                                } else if (bs->kind == NODE_BREAK) {
-                                    /* break in switch → just end arm (no C break needed, using if/else) */
-                                } else if (bs->kind == NODE_VAR_DECL) {
-                                    /* Variable declaration inside switch arm.
-                                     * NODE_ORELSE init requires special emission: the fallback
-                                     * may be `return`/`break`/`continue` which can't be inside
-                                     * a compound literal assignment expression. */
-                                    Type *vt = checker_get_type(e->checker, bs);
-                                    if (bs->var_decl.init && bs->var_decl.init->kind == NODE_ORELSE) {
-                                        Node *or_node = bs->var_decl.init;
-                                        Type *opt_type = checker_get_type(e->checker, or_node->orelse.expr);
-                                        Type *opt_eff = opt_type ? type_unwrap_distinct(opt_type) : NULL;
-                                        bool nullsent = opt_eff && opt_eff->kind == TYPE_OPTIONAL &&
-                                                        is_null_sentinel(opt_eff->optional.inner);
-                                        int tmp = e->temp_count++;
-                                        /* Declare target */
-                                        emit_indent(e);
-                                        if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
-                                        else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
-                                        emit(e, " = {0};\n");
-                                        /* Emit: __typeof__(expr) tmp = expr; if (!tmp.has_value) { fallback } target = tmp.value; */
-                                        emit_indent(e);
-                                        emit(e, "{ __typeof__(");
-                                        emit_rewritten_node(e, or_node->orelse.expr, func);
-                                        emit(e, ") _zer_or%d = ", tmp);
-                                        emit_rewritten_node(e, or_node->orelse.expr, func);
-                                        emit(e, "; if (");
-                                        if (nullsent) emit(e, "!_zer_or%d", tmp);
-                                        else emit(e, "!_zer_or%d.has_value", tmp);
-                                        emit(e, ") { ");
-                                        if (or_node->orelse.fallback_is_return) {
-                                            /* Fire pending defers (including outer ones), then return appropriate value */
-                                            Type *fret = e->current_func_ret;
-                                            Type *fret_eff = fret ? type_unwrap_distinct(fret) : NULL;
-                                            /* Fire defers BEFORE return (skip arm-scoped since we're jumping out) */
-                                            for (int di = e->defer_stack.count - 1; di >= 0; di--) {
-                                                Node *db = e->defer_stack.stmts[di];
-                                                if (db && db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
-                                                    emit_rewritten_node(e, db->expr_stmt.expr, func); emit(e, "; ");
-                                                }
-                                            }
-                                            emit(e, "return");
-                                            if (fret_eff) {
-                                                if (fret_eff->kind == TYPE_OPTIONAL) {
-                                                    emit(e, " "); emit_opt_null_literal(e, fret_eff);
-                                                } else if (fret_eff->kind != TYPE_VOID) {
-                                                    emit(e, " 0");
-                                                }
-                                            }
-                                            emit(e, "; ");
-                                        } else if (or_node->orelse.fallback && or_node->orelse.fallback->kind != NODE_BLOCK) {
-                                            /* Value fallback: assign fallback to target */
-                                            emit(e, "%.*s = ", (int)bs->var_decl.name_len, bs->var_decl.name);
-                                            emit_rewritten_node(e, or_node->orelse.fallback, func);
-                                            emit(e, "; goto _zer_arm_done%d; ", tmp);
-                                        }
-                                        emit(e, "} ");
-                                        /* Success: assign .value (or plain for null sentinel) */
-                                        emit(e, "%.*s = ", (int)bs->var_decl.name_len, bs->var_decl.name);
-                                        if (nullsent) emit(e, "_zer_or%d", tmp);
-                                        else emit(e, "_zer_or%d.value", tmp);
-                                        emit(e, "; }\n");
-                                        if (or_node->orelse.fallback && or_node->orelse.fallback->kind != NODE_BLOCK &&
-                                            !or_node->orelse.fallback_is_return) {
-                                            emit(e, "_zer_arm_done%d:;\n", tmp);
-                                        }
-                                    } else {
-                                        emit_indent(e);
-                                        if (vt) emit_type_and_name(e, vt, bs->var_decl.name, bs->var_decl.name_len);
-                                        else emit(e, "uint32_t %.*s", (int)bs->var_decl.name_len, bs->var_decl.name);
-                                        if (bs->var_decl.init) {
-                                            emit(e, " = ");
-                                            emit_rewritten_node(e, bs->var_decl.init, func);
-                                        } else {
-                                            emit(e, " = {0}");
-                                        }
-                                        emit(e, ";\n");
-                                    }
-                                } else if (bs->kind == NODE_DEFER) {
-                                    /* Defer inside switch arm — push to defer stack */
-                                    if (e->defer_stack.count >= e->defer_stack.capacity) {
-                                        int nc = e->defer_stack.capacity * 2;
-                                        if (nc < 16) nc = 16;
-                                        Node **ns = (Node **)malloc(nc * sizeof(Node *));
-                                        if (e->defer_stack.stmts) {
-                                            memcpy(ns, e->defer_stack.stmts, e->defer_stack.count * sizeof(Node *));
-                                            free(e->defer_stack.stmts);
-                                        }
-                                        e->defer_stack.stmts = ns;
-                                        e->defer_stack.capacity = nc;
-                                    }
-                                    e->defer_stack.stmts[e->defer_stack.count++] = bs->defer.body;
-                                } else if (bs->kind == NODE_IF) {
-                                    /* If inside switch arm — emit condition + then/else bodies.
-                                     * Helper walks a then/else body (block or single stmt). */
-                                    #define EMIT_ARM_IF_BODY(body) do { \
-                                        Node *_b = (body); \
-                                        if (!_b) break; \
-                                        if (_b->kind == NODE_BLOCK) { \
-                                            for (int _bi = 0; _bi < _b->block.stmt_count; _bi++) { \
-                                                Node *_is = _b->block.stmts[_bi]; \
-                                                if (!_is) continue; \
-                                                if (_is->kind == NODE_EXPR_STMT && _is->expr_stmt.expr) { \
-                                                    emit_indent(e); emit_rewritten_node(e, _is->expr_stmt.expr, func); emit(e, ";\n"); \
-                                                } else if (_is->kind == NODE_RETURN) { \
-                                                    emit_indent(e); emit(e, "return"); \
-                                                    if (_is->ret.expr) { emit(e, " "); emit_rewritten_node(e, _is->ret.expr, func); } \
-                                                    emit(e, ";\n"); \
-                                                } \
-                                            } \
-                                        } else if (_b->kind == NODE_EXPR_STMT && _b->expr_stmt.expr) { \
-                                            emit_indent(e); emit_rewritten_node(e, _b->expr_stmt.expr, func); emit(e, ";\n"); \
-                                        } else if (_b->kind == NODE_RETURN) { \
-                                            emit_indent(e); emit(e, "return"); \
-                                            if (_b->ret.expr) { emit(e, " "); emit_rewritten_node(e, _b->ret.expr, func); } \
-                                            emit(e, ";\n"); \
-                                        } \
-                                    } while (0)
-                                    emit_indent(e);
-                                    emit(e, "if (");
-                                    emit_rewritten_node(e, bs->if_stmt.cond, func);
-                                    emit(e, ") {\n");
-                                    e->indent++;
-                                    EMIT_ARM_IF_BODY(bs->if_stmt.then_body);
-                                    e->indent--;
-                                    emit_indent(e); emit(e, "}");
-                                    if (bs->if_stmt.else_body) {
-                                        emit(e, " else {\n");
-                                        e->indent++;
-                                        EMIT_ARM_IF_BODY(bs->if_stmt.else_body);
-                                        e->indent--;
-                                        emit_indent(e); emit(e, "}");
-                                    }
-                                    emit(e, "\n");
-                                    #undef EMIT_ARM_IF_BODY
-                                } else {
-                                    /* Other statement — use emit_rewritten_node */
-                                    emit_indent(e);
-                                    emit_rewritten_node(e, bs, func);
-                                    emit(e, ";\n");
-                                }
-                            }
-                        } else if (arm->body->kind == NODE_EXPR_STMT && arm->body->expr_stmt.expr) {
-                            /* Single-expression arm: `Dir.north => result = 1` */
-                            emit_indent(e);
-                            emit_rewritten_node(e, arm->body->expr_stmt.expr, func);
-                            emit(e, ";\n");
-                        } else if (arm->body->kind == NODE_RETURN) {
-                            emit_indent(e);
-                            emit(e, "return");
-                            if (arm->body->ret.expr) {
-                                emit(e, " ");
-                                emit_rewritten_node(e, arm->body->ret.expr, func);
-                            }
-                            emit(e, ";\n");
-                        } else {
-                            emit_indent(e);
-                            emit_rewritten_node(e, arm->body, func);
-                            emit(e, ";\n");
-                        }
-                    }
-                    /* Fire + pop arm-scoped defers — declared inside arm reference
-                     * arm-local vars that are out of scope after the arm block ends. */
-                    if (e->defer_stack.count > arm_defer_base) {
-                        for (int di = e->defer_stack.count - 1; di >= arm_defer_base; di--) {
-                            Node *db = e->defer_stack.stmts[di];
-                            if (!db) continue;
-                            if (db->kind == NODE_EXPR_STMT && db->expr_stmt.expr) {
-                                emit_indent(e);
-                                emit_rewritten_node(e, db->expr_stmt.expr, func);
-                                emit(e, ";\n");
-                            } else if (db->kind == NODE_BLOCK) {
-                                for (int bi = 0; bi < db->block.stmt_count; bi++) {
-                                    Node *bs2 = db->block.stmts[bi];
-                                    if (bs2 && bs2->kind == NODE_EXPR_STMT && bs2->expr_stmt.expr) {
-                                        emit_indent(e);
-                                        emit_rewritten_node(e, bs2->expr_stmt.expr, func);
-                                        emit(e, ";\n");
-                                    }
-                                }
-                            }
-                        }
-                        e->defer_stack.count = arm_defer_base;
-                    }
-
-                    e->indent--;
-                    emit_indent(e);
-                    emit(e, "}\n");
-                }
-                emit_indent(e);
-                emit(e, "}\n");
+                emit(e, "_zer_trap(\"compiler bug: unlowered switch\", __FILE__, __LINE__);\n");
             } else {
                 /* Other passthrough — emit as expression */
                 emit_indent(e);
@@ -12904,7 +11880,6 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
     }
-    e->defer_stack.count = 0; /* clear defer stack from previous function */
 
     /* Declare local variables (skip params — they're parameters).
      * Static locals declared with static keyword (persists across calls).
@@ -13255,14 +12230,9 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
 void emit_func_from_ir(Emitter *e, void *ir_func_ptr) {
     IRFunc *func = (IRFunc *)ir_func_ptr;
     if (!func) return;
-    /* Expose the current func so a mid-body conditional early-exit can fire its
-     * pending IR defer bodies (emit_defers_from) instead of aborting. */
-    void *saved_ir_func = e->cur_ir_func;
-    e->cur_ir_func = func;
     if (func->is_async) {
         emit_async_func_from_ir(e, func);
     } else {
         emit_regular_func_from_ir(e, func);
     }
-    e->cur_ir_func = saved_ir_func;
 }

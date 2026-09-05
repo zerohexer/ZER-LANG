@@ -25,10 +25,14 @@ EMITTER="emitter.c"
 AST_START=$(grep -n '^static void emit_expr(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
 IR_START=$(grep -n '^static void emit_rewritten_node(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
 # Function-body switch ends where the next top-level function begins.
-# emit_stmt was removed 2026-04-19 (IR-only for function bodies) — use the
-# next definition in the file instead.
-AST_END=$(grep -n '^static void emit_defers_from(Emitter[^;]*{' "$EMITTER" | head -1 | cut -d: -f1)
+# emit_stmt was removed 2026-04-19 (IR-only for function bodies) and
+# emit_defers_from on 2026-09-05 (BUG-920: no emitter-side defer stack) — use the
+# FIRST top-level static definition after emit_expr as the span end, whatever
+# its name, so a deleted neighbour cannot silently empty the span again.
+AST_END=$(awk -v s="$AST_START" 'NR>s && /^static [A-Za-z_ *]+\(/ {print NR; exit}' "$EMITTER")
 IR_END=$(grep -n '^static void emit_ir_inst(Emitter' "$EMITTER" | head -1 | cut -d: -f1)
+[ -n "$AST_START" ] && [ -n "$AST_END" ] && [ -n "$IR_START" ] && [ -n "$IR_END" ] || {
+    echo "walker_audit: could not locate the emit_expr / emit_rewritten_node spans" >&2; exit 2; }
 
 AST_CASES=$(mktemp)
 IR_CASES=$(mktemp)

@@ -79,6 +79,13 @@ typedef struct {
      * defer_bodies (-1 = none). See ir.h defer_fire_flags. */
     int defer_flags_inline[32];
     int *defer_flags;
+    /* BUG-920: scope depth at REGISTRATION, parallel to defer_bodies. When a
+     * body is lowered at a fire site, every local created before the fire at
+     * a DEEPER scope is hidden for the duration: the body was written where
+     * those locals did not exist, so a same-named inner local must not
+     * capture its references (`{ u32 x; defer { g = x; } { u32 x; return; } }`). */
+    int defer_depths_inline[32];
+    int *defer_depths;
     /* Active runtime defer-fire guard (plt86m defer-goto, both-reachable cleanup
      * label). After such a label, subsequent fires of the goto-fired defers
      * (original depth < active_guard_below) emit `if (!flag) {...}` so the goto
@@ -127,10 +134,22 @@ typedef struct {
      * on overflow). */
     int critical_depth;
     int defer_body_depth;
+    int cur_defer_origin;     /* BUG-920: 1-based defer index while lowering its body, else 0 */
     Node *guarded_inline[32];
     Node **guarded;
     int guarded_count;
     int guarded_cap;
+    /* BUG-920: names DECLARED inside the defer body being registered. The
+     * registration-time ident rewrite must leave those alone — they bind to
+     * locals the body's own lowering creates at fire time, not to a same-named
+     * outer local that happens to carry a suffixed C name. Active only while
+     * rewrite_defer_body_idents runs (stack-first, arena on overflow). */
+    const char **rw_skip_names;
+    uint32_t *rw_skip_lens;
+    int rw_skip_count;
+    int rw_skip_cap;
+    const char *rw_skip_inline[16];
+    uint32_t rw_skip_len_inline[16];
 } LowerCtx;
 
 /* ---- Helpers ---- */
@@ -141,6 +160,7 @@ static void lower_auto_guards(LowerCtx *ctx, Node *node);
  * carrying an AST payload gets its auto-guards lowered FIRST, so the guard
  * branch precedes the guarded access no matter which op kind carries it. */
 static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    inst.defer_origin = ctx->cur_defer_origin;   /* BUG-920 */
     if (inst.expr) lower_auto_guards(ctx, inst.expr);
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
@@ -162,8 +182,6 @@ static IRInst make_inst(IROpKind op, int line) {
      * reject every IR_RETURN / IR_GOTO (they leave these fields unused). */
     inst.obj_local = -1;
     inst.handle_local = -1;
-    inst.defer_fire_guard_flag = -1;  /* no guard by default */
-    inst.defer_fire_flags = NULL;     /* F2: no armed flags by default */
     inst.source_line = line;
     return inst;
 }
@@ -374,6 +392,7 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
 
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
+    inst.defer_origin = ctx->cur_defer_origin;   /* BUG-920 */
     if (inst.expr) lower_auto_guards(ctx, inst.expr);   /* BUG-919 */
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
@@ -994,55 +1013,168 @@ static bool block_always_exits(Node *node) {
 #endif
 
 
-/* Capture-on-FIRE (plt86m defer-goto): snapshot the live defer bodies
- * [base, defer_count) into a fire instruction (arena-allocated), so the emitter
- * emits this fire's OWN bodies instead of replaying a shared mutable stack in
- * block-ID order. */
-static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
-    int n = ctx->defer_count - base;
-    if (n <= 0) return;
-    fire->defer_fire_bodies = (Node **)arena_alloc(ctx->arena, (size_t)n * sizeof(Node *));
-    fire->defer_fire_flags = (int *)arena_alloc(ctx->arena, (size_t)n * sizeof(int));
-    for (int i = 0; i < n; i++) {
-        fire->defer_fire_bodies[i] = ctx->defer_bodies[base + i];
-        fire->defer_fire_flags[i] = ctx->defer_flags[base + i];   /* F2 */
-    }
-    fire->defer_fire_body_count = n;
-    /* Attach the active both-reachable-cleanup-label guard: bodies whose
-     * ORIGINAL depth (base+i) is < active_guard_below were fired eagerly by a
-     * goto, so this fire emits them as `if (!flag) {...}`. Newer defers
-     * (depth >= guard_below, registered after the label) stay unguarded. */
-    if (ctx->active_guard_flag >= 0) {
-        fire->defer_fire_guard_flag = ctx->active_guard_flag;
-        fire->defer_fire_guard_below = ctx->active_guard_below;
+/* ================================================================
+ * Defer bodies are LOWERED INTO THE IR at every fire site (BUG-920, 2026-09-05)
+ *
+ * A defer body used to travel as raw AST: pushed by IR_DEFER_PUSH, snapshotted
+ * onto each IR_DEFER_FIRE, and emitted at the fire by a SECOND statement
+ * emitter (emit_defer_stmt) that re-answered every safety rule — and missed
+ * several: an unprovable index in a defer-body var-decl / while-cond / for-init
+ * got no guard, a shared-struct read in a defer-body condition got no lock, a
+ * switch / do-while / @critical / @once inside a defer body trapped at runtime
+ * with "compiler bug", and zercheck_ir needed its own AST scanners
+ * (ir_defer_scan_frees/uses) to see the body's frees and uses at all — which
+ * accepted `if (c) { free(h); } defer free(h);` (a MAYBE_FREED handle freed
+ * again). Now each fire lowers a fresh deep clone of the body through
+ * lower_stmt like any other statement, so guards, locks, handle tracking and
+ * every future rule apply to defer bodies by construction. IR_DEFER_PUSH /
+ * IR_DEFER_FIRE remain as MARKERS (ir_validate's push/fire balance, --emit-ir).
+ *
+ * Why a CLONE: lowering mutates the AST it is handed (pre_lower_orelse swaps an
+ * orelse for a temp ident in place, captures are renamed, for-init is
+ * rewritten), so the same body lowered twice would be a half-rewritten tree the
+ * second time. The clone hook mirrors the node-keyed side tables (typemap,
+ * proven marks, auto-guard marks) onto the copy.
+ *
+ * Why the registration-time ident rewrite stays: a fire can happen where an
+ * INNER same-named local shadows the one the defer was written against
+ * (`{ u32 x = 1; defer { g = x; } { u32 x = 2; return; } }`); resolving by
+ * source name at the fire would bind the inner x. rewrite_defer_body_idents
+ * binds the outer names to their unique C names at registration, and skips the
+ * names the body declares itself (rw_skip_names).
+ * ================================================================ */
+static void defer_clone_hook(Node *orig, Node *clone, void *ud) {
+    Checker *c = (Checker *)ud;
+    Type *t = checker_get_type(c, orig);
+    if (t) checker_set_type(c, clone, t);
+    if (checker_is_proven(c, orig)) checker_mark_proven(c, clone);
+    uint64_t ag = checker_auto_guard_size(c, orig);
+    if (ag > 0) checker_mark_auto_guard(c, clone, ag);
+}
+
+/* Lower the live defer bodies [base, defer_count) inline, LIFO. `guarded`
+ * (plt86m both-reachable cleanup label: a goto already fired this body eagerly
+ * and set the flag) and `armed` (F2: the registration actually ran) become IR
+ * branches around the body. Both may apply to one body; they nest. */
+static void lower_defer_bodies(LowerCtx *ctx, int base, int line) {
+    for (int i = ctx->defer_count - 1; i >= base; i--) {
+        Node *body = ctx->defer_bodies[i];
+        if (!body) continue;
+        bool guarded = (ctx->active_guard_flag >= 0) && (i < ctx->active_guard_below);
+        int armed = (i < ctx->defer_bodies_cap) ? ctx->defer_flags[i] : -1;
+        int bb_skip = -1;
+        if (guarded || armed >= 0) {
+            bb_skip = ir_add_block(ctx->func, ctx->arena);
+            if (guarded) {
+                int nf = create_temp(ctx, ty_bool, line);
+                IRInst nt = make_inst(IR_UNOP, line);
+                nt.dest_local = nf;
+                nt.src1_local = ctx->active_guard_flag;
+                nt.op_token = TOK_BANG;
+                emit_3ac(ctx, nt);
+                int bb_next = ir_add_block(ctx->func, ctx->arena);
+                IRInst br = make_inst(IR_BRANCH, line);
+                br.cond_local = nf;
+                br.true_block = bb_next;
+                br.false_block = bb_skip;
+                br.defer_gate = 2;
+                emit_inst(ctx, br);
+                ctx->current_block = bb_next;
+            }
+            if (armed >= 0) {
+                int bb_body = ir_add_block(ctx->func, ctx->arena);
+                IRInst br = make_inst(IR_BRANCH, line);
+                br.cond_local = armed;
+                br.true_block = bb_body;
+                br.false_block = bb_skip;
+                br.defer_gate = 1;
+                emit_inst(ctx, br);
+                ctx->current_block = bb_body;
+            }
+        }
+        Node *copy = ast_clone(ctx->arena, body, defer_clone_hook, ctx->checker);
+        if (copy->kind != NODE_BLOCK) {
+            /* A single-statement body goes through NODE_BLOCK too, so the
+             * per-statement shared-lock wrapping and scope handling apply. */
+            Node *blk = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(blk, 0, sizeof(Node));
+            blk->kind = NODE_BLOCK;
+            blk->loc = copy->loc;
+            blk->block.stmts = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+            blk->block.stmts[0] = copy;
+            blk->block.stmt_count = 1;
+            copy = blk;
+        }
+        int saved_managed = ctx->block_defers_managed;
+        int saved_defer_count = ctx->defer_count;
+        Node *saved_root = ctx->current_stmt_shared_root;
+        ctx->block_defers_managed = 0;
+        ctx->defer_body_depth++;
+        /* Hide every pre-existing local from a scope DEEPER than the defer's
+         * registration scope (see defer_depths): the body binds to what was
+         * visible where it was written. Locals the body itself declares are
+         * created during lowering (id >= n_before) and are unaffected. */
+        int reg_depth = (i < ctx->defer_bodies_cap) ? ctx->defer_depths[i] : -1;
+        int n_before = ctx->func->local_count;
+        bool *was_hidden = (bool *)malloc((size_t)(n_before > 0 ? n_before : 1));
+        for (int li = 0; li < n_before && was_hidden; li++) {
+            was_hidden[li] = ctx->func->locals[li].hidden;
+            if (reg_depth >= 0 && !ctx->func->locals[li].hidden &&
+                ctx->func->locals[li].scope_depth > reg_depth)
+                ctx->func->locals[li].hidden = true;
+        }
+        int saved_origin = ctx->cur_defer_origin;
+        ctx->cur_defer_origin = i + 1;
+        lower_stmt(ctx, copy);
+        ctx->cur_defer_origin = saved_origin;
+        for (int li = 0; li < n_before && was_hidden; li++)
+            ctx->func->locals[li].hidden = was_hidden[li];
+        free(was_hidden);
+        ctx->defer_body_depth--;
+        ctx->defer_count = saved_defer_count;
+        ctx->block_defers_managed = saved_managed;
+        ctx->current_stmt_shared_root = saved_root;
+        if (bb_skip >= 0) {
+            ensure_terminated(ctx, bb_skip);
+            ctx->current_block = bb_skip;
+        }
     }
 }
 
-/* Emit IR_DEFER_FIRE for pending defers (fire all, no pop — function/return exit) */
+/* Fire marker + inline bodies for ALL pending defers (function/return exit). */
+/* A fire requested after the current block is already terminated (a block
+ * exit whose last statement returned) is dead: emit nothing. The bodies would
+ * be unreachable C, and zercheck_ir walks a block's instructions linearly, so a
+ * dead `free(h)` after the RETURN would read as a second free of h. */
+static bool fire_is_dead(LowerCtx *ctx) {
+    IRBlock *cb = &ctx->func->blocks[ctx->current_block];
+    return cb->inst_count > 0 && ir_block_is_terminated(cb);
+}
+
 static void emit_defer_fire(LowerCtx *ctx, int line) {
-    if (ctx->defer_count > 0) {
+    if (ctx->defer_count > 0 && !fire_is_dead(ctx)) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
-        ir_snapshot_defer_bodies(ctx, &fire, 0);
         emit_inst(ctx, fire);
+        lower_defer_bodies(ctx, 0, line);
     }
 }
 
-/* Emit scoped IR_DEFER_FIRE: fire defers from top down to base.
- * pop=true: remove them from emitter stack (for end of loop iteration).
- * pop=false: keep on stack (for mid-body break/continue). */
+/* Scoped fire: bodies from the top down to `base`.
+ * pop=true: the compile-time stack is popped by the caller (end of scope);
+ * pop=false: kept (mid-body break/continue — other paths still own them).
+ * The marker keeps cond_local/src2_local for ir_validate's balance check. */
 static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) {
-    if (ctx->defer_count > base) {
+    if (ctx->defer_count > base && !fire_is_dead(ctx)) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
         fire.cond_local = base;
         fire.src2_local = pop ? 0 : 1;
-        ir_snapshot_defer_bodies(ctx, &fire, base);
         emit_inst(ctx, fire);
+        lower_defer_bodies(ctx, base, line);
     }
 }
 
-/* Emit "pop only" op — doesn't emit defer bodies, just decrements emitter's
- * compile-time defer_stack count. Used at loop exit after all body paths have
- * already emitted their defer bodies (with no-pop). */
+/* Pop-only marker (src2_local = 2): no bodies. Emitted in the post block a
+ * loop/block creates after all its exit paths have already fired. */
 static void emit_defer_pop_only(LowerCtx *ctx, int base, int line) {
     if (ctx->defer_count > base) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
@@ -1067,6 +1199,14 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
 
     switch (expr->kind) {
     case NODE_IDENT: {
+        /* BUG-920: a name the defer body declares itself is not rewritten at
+         * registration (see rw_skip_names). */
+        for (int si = 0; si < ctx->rw_skip_count; si++) {
+            if (ctx->rw_skip_lens[si] == (uint32_t)expr->ident.name_len &&
+                memcmp(ctx->rw_skip_names[si], expr->ident.name,
+                       ctx->rw_skip_lens[si]) == 0)
+                return;
+        }
         int id = ir_find_local(ctx->func, expr->ident.name,
                                (uint32_t)expr->ident.name_len);
         if (id >= 0) {
@@ -1157,6 +1297,85 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
  * (`defer pool.free(h);` where `h` shadows outer `h`) would lookup by
  * the raw name and potentially resolve to the outer local, causing
  * defer-free tracking to miss the inner handle. */
+/* BUG-920: record a name the defer body declares (var-decl, for-init decl,
+ * if / switch-arm capture) so rewrite_idents leaves its references alone. */
+static void rw_skip_add(LowerCtx *ctx, const char *name, size_t len) {
+    if (!name) return;
+    if (ctx->rw_skip_count >= ctx->rw_skip_cap) {
+        int nc = ctx->rw_skip_cap * 2;
+        const char **nn = (const char **)arena_alloc(ctx->arena, (size_t)nc * sizeof(const char *));
+        uint32_t *nl = (uint32_t *)arena_alloc(ctx->arena, (size_t)nc * sizeof(uint32_t));
+        memcpy(nn, ctx->rw_skip_names, (size_t)ctx->rw_skip_count * sizeof(const char *));
+        memcpy(nl, ctx->rw_skip_lens, (size_t)ctx->rw_skip_count * sizeof(uint32_t));
+        ctx->rw_skip_names = nn;
+        ctx->rw_skip_lens = nl;
+        ctx->rw_skip_cap = nc;
+    }
+    ctx->rw_skip_names[ctx->rw_skip_count] = name;
+    ctx->rw_skip_lens[ctx->rw_skip_count] = (uint32_t)len;
+    ctx->rw_skip_count++;
+}
+
+static void rw_collect_decl_names(LowerCtx *ctx, Node *stmt) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < stmt->block.stmt_count; i++)
+            rw_collect_decl_names(ctx, stmt->block.stmts[i]);
+        break;
+    case NODE_VAR_DECL:
+        rw_skip_add(ctx, stmt->var_decl.name, stmt->var_decl.name_len);
+        break;
+    case NODE_IF:
+        if (stmt->if_stmt.capture_name)
+            rw_skip_add(ctx, stmt->if_stmt.capture_name, stmt->if_stmt.capture_name_len);
+        rw_collect_decl_names(ctx, stmt->if_stmt.then_body);
+        rw_collect_decl_names(ctx, stmt->if_stmt.else_body);
+        break;
+    case NODE_FOR:
+        rw_collect_decl_names(ctx, stmt->for_stmt.init);
+        rw_collect_decl_names(ctx, stmt->for_stmt.body);
+        break;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        rw_collect_decl_names(ctx, stmt->while_stmt.body);
+        break;
+    case NODE_SWITCH:
+        for (int i = 0; i < stmt->switch_stmt.arm_count; i++) {
+            if (stmt->switch_stmt.arms[i].capture_name)
+                rw_skip_add(ctx, stmt->switch_stmt.arms[i].capture_name,
+                            stmt->switch_stmt.arms[i].capture_name_len);
+            rw_collect_decl_names(ctx, stmt->switch_stmt.arms[i].body);
+        }
+        break;
+    case NODE_CRITICAL:
+        rw_collect_decl_names(ctx, stmt->critical.body);
+        break;
+    case NODE_ONCE:
+        rw_collect_decl_names(ctx, stmt->once.body);
+        break;
+    case NODE_DEFER:
+        rw_collect_decl_names(ctx, stmt->defer.body);
+        break;
+    /* No declarations: leaf statements and expression kinds. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
+    }
+}
+
 static void rewrite_defer_body_idents(LowerCtx *ctx, Node *stmt) {
     if (!stmt) return;
     switch (stmt->kind) {
@@ -1969,38 +2188,47 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         orelse_node->orelse.fallback_is_continue) {
         ctx->func->blocks[bb_fail].is_orelse_fallback = true;
     }
+    /* Release the active shared-struct lock for THIS statement BEFORE the
+     * deferred bodies run and before the exit — the NODE_RETURN order. Without
+     * the unlock, `value = shared.field orelse return;` leaks the auto-mutex and
+     * the next thread to acquire it deadlocks; with the bodies lowered inline
+     * (BUG-920) firing them under the lock would also nest a second struct's
+     * lock inside this one, the AB-BA shape the per-statement model forbids. */
+    Node *held_root = ctx->current_stmt_shared_root;
     if (orelse_node->orelse.fallback_is_return) {
-        emit_defer_fire(ctx, line);
-        /* Release the active shared-struct lock for THIS statement before
-         * the return — same pattern as NODE_RETURN handler. Without this,
-         * `value = shared.field orelse return;` leaks the auto-mutex and
-         * the next thread to acquire it deadlocks. */
-        if (ctx->current_stmt_shared_root) {
+        if (held_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
+            unlock.expr = held_root;
             emit_inst(ctx, unlock);
+            ctx->current_stmt_shared_root = NULL;
         }
+        emit_defer_fire(ctx, line);
+        ctx->current_stmt_shared_root = held_root;
         IRInst ret = make_inst(IR_RETURN, line);
         ret.ret_from_orelse = true;  /* ?void: propagate FAILURE (None), not success */
         emit_inst(ctx, ret);
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
+        if (held_root) {
+            IRInst unlock = make_inst(IR_UNLOCK, line);
+            unlock.expr = held_root;
+            emit_inst(ctx, unlock);
+            ctx->current_stmt_shared_root = NULL;
+        }
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        ctx->current_stmt_shared_root = held_root;
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_exit_block;
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
-        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_stmt_shared_root) {
+        if (held_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
+            unlock.expr = held_root;
             emit_inst(ctx, unlock);
+            ctx->current_stmt_shared_root = NULL;
         }
+        emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
+        ctx->current_stmt_shared_root = held_root;
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_continue_block;
         emit_inst(ctx, go);
@@ -3936,9 +4164,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Rewrite idents in the defer body so references to scope-
          * shadowed names (`h` → `h_17`) resolve correctly when the
          * defer body is consumed later (emitter or zercheck_ir). */
+        ctx->rw_skip_names = ctx->rw_skip_inline;
+        ctx->rw_skip_lens = ctx->rw_skip_len_inline;
+        ctx->rw_skip_cap = 16;
+        ctx->rw_skip_count = 0;
+        rw_collect_decl_names(ctx, node->defer.body);
         rewrite_defer_body_idents(ctx, node->defer.body);
+        ctx->rw_skip_count = 0;
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
-        push.defer_body = node->defer.body;
+        push.defer_body = node->defer.body;   /* marker payload (--emit-ir / validate) */
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -3950,6 +4184,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int *nf = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
             memcpy(nf, ctx->defer_flags, (size_t)ctx->defer_count * sizeof(int));
             ctx->defer_flags = nf;
+            int *nd = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
+            memcpy(nd, ctx->defer_depths, (size_t)ctx->defer_count * sizeof(int));
+            ctx->defer_depths = nd;
             ctx->defer_bodies_cap = nc;
         }
         ctx->defer_bodies[ctx->defer_count] = node->defer.body;
@@ -3975,8 +4212,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             set.literal_kind = 0;
             emit_3ac(ctx, set);
         }
-        if (ctx->defer_count < ctx->defer_bodies_cap)
+        if (ctx->defer_count < ctx->defer_bodies_cap) {
             ctx->defer_flags[ctx->defer_count] = armed;
+            ctx->defer_depths[ctx->defer_count] = ctx->func->current_scope;
+        }
         ctx->defer_count++;
         break;
     }
@@ -4147,6 +4386,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.guarded = ctx.guarded_inline;
     ctx.guarded_cap = 32;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_depths = ctx.defer_depths_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
@@ -4262,6 +4502,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.guarded = ctx.guarded_inline;
     ctx.guarded_cap = 32;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_depths = ctx.defer_depths_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;

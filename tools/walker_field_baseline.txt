@@ -410,33 +410,6 @@ checker.c:vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args
 checker.c:vrp_invalidate_loop_body_writes:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- emitter.c: emit_auto_guards ---
-emitter.c:emit_auto_guards:NODE_ASM:asm_stmt.inputs
-emitter.c:emit_auto_guards:NODE_ASM:asm_stmt.outputs
-emitter.c:emit_auto_guards:NODE_BLOCK:block.stmts
-emitter.c:emit_auto_guards:NODE_CRITICAL:critical.body
-emitter.c:emit_auto_guards:NODE_DEFER:defer.body
-emitter.c:emit_auto_guards:NODE_DO_WHILE:while_stmt.body
-emitter.c:emit_auto_guards:NODE_DO_WHILE:while_stmt.cond
-emitter.c:emit_auto_guards:NODE_EXPR_STMT:expr_stmt.expr
-emitter.c:emit_auto_guards:NODE_FILE:file.decls
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.body
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.cond
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.init
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.step
-emitter.c:emit_auto_guards:NODE_FUNC_DECL:func_decl.body
-emitter.c:emit_auto_guards:NODE_GLOBAL_VAR:var_decl.init
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.cond
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.else_body
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.then_body
-emitter.c:emit_auto_guards:NODE_INTERRUPT:interrupt.body
-emitter.c:emit_auto_guards:NODE_ONCE:once.body
-emitter.c:emit_auto_guards:NODE_RETURN:ret.expr
-emitter.c:emit_auto_guards:NODE_STATIC_ASSERT:static_assert_stmt.cond
-emitter.c:emit_auto_guards:NODE_SWITCH:switch_stmt.arms
-emitter.c:emit_auto_guards:NODE_SWITCH:switch_stmt.expr
-emitter.c:emit_auto_guards:NODE_VAR_DECL:var_decl.init
-emitter.c:emit_auto_guards:NODE_WHILE:while_stmt.body
-emitter.c:emit_auto_guards:NODE_WHILE:while_stmt.cond
 
 # --- emitter.c: expr_has_side_effects ---
 emitter.c:expr_has_side_effects:NODE_ASM:asm_stmt.inputs
@@ -725,78 +698,10 @@ zercheck_ir.c:ir_check_expr_wrong_pool:NODE_WHILE:while_stmt.cond
 #   a FREE in a condition would need a call returning non-void named like a
 #   destructor; pool.free/free_ptr/free are all void. Narrow enough to leave —
 #   the USES sibling (the UAF direction) DOES walk conditions as of BUG-809.
-zercheck_ir.c:ir_defer_scan_frees:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:ir_defer_scan_frees:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:ir_defer_scan_frees:NODE_ASSIGN:assign.target
-zercheck_ir.c:ir_defer_scan_frees:NODE_ASSIGN:assign.value
-zercheck_ir.c:ir_defer_scan_frees:NODE_AWAIT:await_stmt.cond
-zercheck_ir.c:ir_defer_scan_frees:NODE_BINARY:binary.left
-zercheck_ir.c:ir_defer_scan_frees:NODE_BINARY:binary.right
-zercheck_ir.c:ir_defer_scan_frees:NODE_CALL:call.args
-zercheck_ir.c:ir_defer_scan_frees:NODE_CALL:call.callee
-zercheck_ir.c:ir_defer_scan_frees:NODE_DEFER:defer.body
-zercheck_ir.c:ir_defer_scan_frees:NODE_DO_WHILE:while_stmt.cond
-zercheck_ir.c:ir_defer_scan_frees:NODE_EXPR_STMT:expr_stmt.expr
-zercheck_ir.c:ir_defer_scan_frees:NODE_FIELD:field.object
-zercheck_ir.c:ir_defer_scan_frees:NODE_FILE:file.decls
-zercheck_ir.c:ir_defer_scan_frees:NODE_FOR:for_stmt.cond
-zercheck_ir.c:ir_defer_scan_frees:NODE_FOR:for_stmt.step
-zercheck_ir.c:ir_defer_scan_frees:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:ir_defer_scan_frees:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:ir_defer_scan_frees:NODE_IF:if_stmt.cond
-zercheck_ir.c:ir_defer_scan_frees:NODE_INDEX:index_expr.index
-zercheck_ir.c:ir_defer_scan_frees:NODE_INDEX:index_expr.object
-zercheck_ir.c:ir_defer_scan_frees:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:ir_defer_scan_frees:NODE_INTRINSIC:intrinsic.args
-zercheck_ir.c:ir_defer_scan_frees:NODE_ORELSE:orelse.expr
-zercheck_ir.c:ir_defer_scan_frees:NODE_ORELSE:orelse.fallback
-zercheck_ir.c:ir_defer_scan_frees:NODE_RETURN:ret.expr
-zercheck_ir.c:ir_defer_scan_frees:NODE_SLICE:slice.end
-zercheck_ir.c:ir_defer_scan_frees:NODE_SLICE:slice.object
-zercheck_ir.c:ir_defer_scan_frees:NODE_SLICE:slice.start
-zercheck_ir.c:ir_defer_scan_frees:NODE_SPAWN:spawn_stmt.args
-zercheck_ir.c:ir_defer_scan_frees:NODE_STATIC_ASSERT:static_assert_stmt.cond
-zercheck_ir.c:ir_defer_scan_frees:NODE_STRUCT_INIT:struct_init.fields
-zercheck_ir.c:ir_defer_scan_frees:NODE_SWITCH:switch_stmt.expr
-zercheck_ir.c:ir_defer_scan_frees:NODE_TYPECAST:typecast.expr
-zercheck_ir.c:ir_defer_scan_frees:NODE_UNARY:unary.operand
-zercheck_ir.c:ir_defer_scan_frees:NODE_VAR_DECL:var_decl.init
-zercheck_ir.c:ir_defer_scan_frees:NODE_WHILE:while_stmt.cond
 
 # --- zercheck_ir.c: ir_defer_scan_uses ---
 #   conditions, var-decl inits and return exprs are checked at the head of the
 #   function as of BUG-809; remaining rows are kinds with no handle-bearing child.
-zercheck_ir.c:ir_defer_scan_uses:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:ir_defer_scan_uses:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:ir_defer_scan_uses:NODE_ASSIGN:assign.target
-zercheck_ir.c:ir_defer_scan_uses:NODE_ASSIGN:assign.value
-zercheck_ir.c:ir_defer_scan_uses:NODE_AWAIT:await_stmt.cond
-zercheck_ir.c:ir_defer_scan_uses:NODE_BINARY:binary.left
-zercheck_ir.c:ir_defer_scan_uses:NODE_BINARY:binary.right
-zercheck_ir.c:ir_defer_scan_uses:NODE_CALL:call.args
-zercheck_ir.c:ir_defer_scan_uses:NODE_CALL:call.callee
-zercheck_ir.c:ir_defer_scan_uses:NODE_DEFER:defer.body
-zercheck_ir.c:ir_defer_scan_uses:NODE_EXPR_STMT:expr_stmt.expr
-zercheck_ir.c:ir_defer_scan_uses:NODE_FIELD:field.object
-zercheck_ir.c:ir_defer_scan_uses:NODE_FILE:file.decls
-zercheck_ir.c:ir_defer_scan_uses:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:ir_defer_scan_uses:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:ir_defer_scan_uses:NODE_INDEX:index_expr.index
-zercheck_ir.c:ir_defer_scan_uses:NODE_INDEX:index_expr.object
-zercheck_ir.c:ir_defer_scan_uses:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:ir_defer_scan_uses:NODE_INTRINSIC:intrinsic.args
-zercheck_ir.c:ir_defer_scan_uses:NODE_ORELSE:orelse.expr
-zercheck_ir.c:ir_defer_scan_uses:NODE_ORELSE:orelse.fallback
-zercheck_ir.c:ir_defer_scan_uses:NODE_RETURN:ret.expr
-zercheck_ir.c:ir_defer_scan_uses:NODE_SLICE:slice.end
-zercheck_ir.c:ir_defer_scan_uses:NODE_SLICE:slice.object
-zercheck_ir.c:ir_defer_scan_uses:NODE_SLICE:slice.start
-zercheck_ir.c:ir_defer_scan_uses:NODE_SPAWN:spawn_stmt.args
-zercheck_ir.c:ir_defer_scan_uses:NODE_STATIC_ASSERT:static_assert_stmt.cond
-zercheck_ir.c:ir_defer_scan_uses:NODE_STRUCT_INIT:struct_init.fields
-zercheck_ir.c:ir_defer_scan_uses:NODE_TYPECAST:typecast.expr
-zercheck_ir.c:ir_defer_scan_uses:NODE_UNARY:unary.operand
-zercheck_ir.c:ir_defer_scan_uses:NODE_VAR_DECL:var_decl.init
 
 # --- zercheck_ir.c: zercheck_ir ---
 
@@ -855,3 +760,44 @@ ir_lower.c:lower_auto_guards:NODE_SWITCH:switch_stmt.expr
 ir_lower.c:lower_auto_guards:NODE_VAR_DECL:var_decl.init
 ir_lower.c:lower_auto_guards:NODE_WHILE:while_stmt.body
 ir_lower.c:lower_auto_guards:NODE_WHILE:while_stmt.cond
+# BUG-920 (2026-09-05): rw_collect_decl_names collects the names a defer body
+# DECLARES (var-decl, for-init decl, if / switch-arm capture) so the
+# registration-time ident rewrite leaves them alone. Expression kinds and leaf
+# statements declare nothing, so their children are intentionally not walked;
+# the exhaustive case list exists for -Werror=switch, not for descent.
+ir_lower.c:rw_collect_decl_names:NODE_ASM:asm_stmt.inputs
+ir_lower.c:rw_collect_decl_names:NODE_ASM:asm_stmt.outputs
+ir_lower.c:rw_collect_decl_names:NODE_ASSIGN:assign.target
+ir_lower.c:rw_collect_decl_names:NODE_ASSIGN:assign.value
+ir_lower.c:rw_collect_decl_names:NODE_AWAIT:await_stmt.cond
+ir_lower.c:rw_collect_decl_names:NODE_BINARY:binary.left
+ir_lower.c:rw_collect_decl_names:NODE_BINARY:binary.right
+ir_lower.c:rw_collect_decl_names:NODE_CALL:call.args
+ir_lower.c:rw_collect_decl_names:NODE_CALL:call.callee
+ir_lower.c:rw_collect_decl_names:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:rw_collect_decl_names:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:rw_collect_decl_names:NODE_FIELD:field.object
+ir_lower.c:rw_collect_decl_names:NODE_FILE:file.decls
+ir_lower.c:rw_collect_decl_names:NODE_FOR:for_stmt.cond
+ir_lower.c:rw_collect_decl_names:NODE_FOR:for_stmt.step
+ir_lower.c:rw_collect_decl_names:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:rw_collect_decl_names:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:rw_collect_decl_names:NODE_IF:if_stmt.cond
+ir_lower.c:rw_collect_decl_names:NODE_INDEX:index_expr.index
+ir_lower.c:rw_collect_decl_names:NODE_INDEX:index_expr.object
+ir_lower.c:rw_collect_decl_names:NODE_INTERRUPT:interrupt.body
+ir_lower.c:rw_collect_decl_names:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:rw_collect_decl_names:NODE_ORELSE:orelse.expr
+ir_lower.c:rw_collect_decl_names:NODE_ORELSE:orelse.fallback
+ir_lower.c:rw_collect_decl_names:NODE_RETURN:ret.expr
+ir_lower.c:rw_collect_decl_names:NODE_SLICE:slice.end
+ir_lower.c:rw_collect_decl_names:NODE_SLICE:slice.object
+ir_lower.c:rw_collect_decl_names:NODE_SLICE:slice.start
+ir_lower.c:rw_collect_decl_names:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:rw_collect_decl_names:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:rw_collect_decl_names:NODE_STRUCT_INIT:struct_init.fields
+ir_lower.c:rw_collect_decl_names:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:rw_collect_decl_names:NODE_TYPECAST:typecast.expr
+ir_lower.c:rw_collect_decl_names:NODE_UNARY:unary.operand
+ir_lower.c:rw_collect_decl_names:NODE_VAR_DECL:var_decl.init
+ir_lower.c:rw_collect_decl_names:NODE_WHILE:while_stmt.cond

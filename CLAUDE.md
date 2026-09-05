@@ -2532,7 +2532,9 @@ Also: update EVERY recursive AST walker that handles all node types. **7 walkers
 - `validate_gotos` (checker.c) — goto target validation
 - `zc_check_expr` (zercheck.c) — expression UAF/double-free checks
 - `zc_check_stmt` (zercheck.c) — statement-level handle tracking
-- `emit_auto_guards` (emitter.c) — bounds check guard emission
+- `lower_auto_guards` (ir_lower.c) — bounds/UAF guard LOWERING (an IR branch since BUG-919; the emitter has no guard code)
+- `ast_clone` (ast.c) — deep clone used to lower a defer body at each fire site (BUG-920); a new node kind with children must be cloned here
+- `rw_collect_decl_names` (ir_lower.c) — names a defer body declares (kept out of the registration-time ident rewrite)
 - `emit_top_level_decl` (emitter.c) — top-level declaration emission
 
 3 walkers keep intentional `default:`: `emit_expr`/`emit_stmt` (emit `/* unhandled */` diagnostic), `resolve_type_for_emit` (returns `ty_void` fallback). These produce visible output on unknown nodes, not silent skips.
@@ -2607,6 +2609,7 @@ Quick reminders for common IR work:
 - **Entry block MUST be `bb0`** — call `start_block()` BEFORE `collect_labels()`
 - **`checker_set_type()` is PUBLIC** — use it when synthesizing AST in IR lowering
 - **Function bodies are IR-only** since 2026-04-19 — `emit_stmt` deleted, no AST fallback
+- **DEFER BODIES ARE IR TOO** since 2026-09-05 (BUG-920) — a body is deep-cloned (`ast_clone`) and lowered through `lower_stmt` at EVERY fire site (`lower_defer_bodies`); `IR_DEFER_PUSH`/`IR_DEFER_FIRE` are markers. There is no emitter-side defer stack, no `emit_defer_stmt`, and no zercheck_ir defer scanner: every safety rule reaches a defer body by construction. The F2 armed flag and the cleanup-label guard are IR branches tagged `defer_gate`; zercheck_ir drops their skip edge at merges and treats a same-registration re-fire (`defer_origin`) as idempotent. Bounds/UAF auto-guards are IR branches too (BUG-919, `lower_auto_guards` at `emit_inst`/`emit_3ac`; `IR_TRAP` where a return cannot leave the scope).
 - **`emit_rewritten_node` is NOT `emit_expr`** — zero emit_expr calls in IR function body emission
 - **AST→IR migration watchpoint**: any IR handler that replaces `emit_expr(inst->expr)` with direct emission MUST port every `_zer_trap` / `_zer_bounds_check` / `_zer_shl` safety wrapper. See "AST→IR Emission Diff Audit" section below.
 

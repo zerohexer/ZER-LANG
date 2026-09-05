@@ -9993,28 +9993,14 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* F3 (2026-08-02): the missing FOURTH arm of the family above. The
-         * three CONTROL-FLOW orelse forms are banned in a defer body; the
-         * VALUE/BLOCK form (`x orelse v`, `x orelse { ... }`) was not, and it is
-         * an EMISSION IMPOSSIBILITY on this path — defer bodies are emitted from
-         * raw AST via emit_rewritten_node, which has no NODE_ORELSE handler
-         * (orelse needs the branch+temp lowering the raw emitter cannot
-         * express). Verified on main: the emitted C carried TWO
-         * `_zer_trap("compiler bug: unhandled NODE kind")` calls, so the user
-         * saw an internal-compiler-bug message instead of a source-level error.
-         *
-         * Ban criterion 2 (emission impossibility), same as yield/await in a
-         * defer — not a policy choice. The fix is to move the orelse before the
-         * defer, which the message says. */
-        if (c->defer_depth > 0 &&
-            !node->orelse.fallback_is_return &&
-            !node->orelse.fallback_is_break &&
-            !node->orelse.fallback_is_continue) {
-            checker_error(c, node->loc.line,
-                "cannot use 'orelse' with a value/block fallback inside a defer "
-                "body — defer bodies cannot express orelse's branch; compute the "
-                "value before the defer");
-        }
+        /* BUG-920 (2026-09-05): the F3 (2026-08-02) ban on a VALUE/BLOCK
+         * `orelse` inside a defer body is LIFTED. It was ban criterion 2
+         * ("emission impossibility"): defer bodies were emitted from raw AST by
+         * an emitter with no orelse arm. A defer body is now lowered through
+         * lower_stmt at every fire site, so its orelse gets the same branch +
+         * temp lowering as any other statement (tests/zer/defer_orelse_value_ok.zer).
+         * The three CONTROL-FLOW forms above stay banned for their own reasons
+         * (they would leave the cleanup early). */
 
         if (node->orelse.fallback_is_return ||
             node->orelse.fallback_is_break ||
@@ -19982,6 +19968,12 @@ static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size) {
     struct AutoGuard *g = &c->auto_guards[c->auto_guard_count++];
     g->node = node;
     g->array_size = array_size;
+}
+
+/* BUG-920: public wrappers for the defer-body clone hook. */
+void checker_mark_proven(Checker *c, Node *node) { mark_proven(c, node); }
+void checker_mark_auto_guard(Checker *c, Node *node, uint64_t array_size) {
+    mark_auto_guard(c, node, array_size);
 }
 
 uint64_t checker_auto_guard_size(Checker *c, Node *node) {

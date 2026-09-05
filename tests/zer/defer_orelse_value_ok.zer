@@ -1,0 +1,21 @@
+// BUG-920: `orelse` with a VALUE fallback inside a defer body. It was banned
+// ("emission impossibility") while defer bodies were emitted from raw AST by an
+// emitter with no orelse arm; the body is lowered through the IR now, so the
+// orelse gets the ordinary branch + temp lowering. Replaces the two negatives
+// orelse_value_in_defer.zer and gapclosed_audit2026-05-24_defer_orelse_value.zer.
+u32 g = 5;
+u32 g_cleanup_arg;
+?u32 maybe() { return 7; }
+?u32 none() { return null; }
+void cleanup(u32 x) { g_cleanup_arg = x; }
+u32 out;
+void run() {
+    defer cleanup(maybe() orelse 0);
+    defer { u32 z = none() orelse g; out = z; }
+}
+u32 main() {
+    run();
+    if (g_cleanup_arg != 7) { return 1; }
+    if (out != 5) { return 2; }
+    return 0;
+}

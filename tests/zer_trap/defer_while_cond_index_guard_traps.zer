@@ -1,0 +1,10 @@
+// expect-trap
+// BUG-920: unprovable index in a defer-body WHILE condition (no guard before).
+volatile u32 vi = 100;
+u32 g;
+u32 main() {
+    u32[4] arr;
+    u32 i = vi;
+    defer { while (arr[i] > 0) { g += 1; i = 0; } }
+    return 0;
+}

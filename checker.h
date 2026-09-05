@@ -371,6 +371,9 @@ bool checker_is_proven(Checker *c, Node *node);
 
 /* returns array_size if this node needs auto-guard, 0 if not */
 uint64_t checker_auto_guard_size(Checker *c, Node *node);
+/* BUG-920: mirror node-keyed marks onto a cloned node (ast_clone hook). */
+void checker_mark_proven(Checker *c, Node *node);
+void checker_mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);

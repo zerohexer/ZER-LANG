@@ -1123,10 +1123,11 @@ defer {
 }
 ```
 
-`orelse` with a **value or block fallback** is banned inside a defer body — the
-defer body cannot express orelse's branch. Compute the value before the defer.
-(`orelse return` / `break` / `continue` are already banned there too, because
-they corrupt cleanup flow.)
+`orelse` with a **value fallback** is allowed inside a defer body (since
+2026-09-05 — defer bodies are lowered through the same IR as every other
+statement, so `defer cleanup(maybe() orelse 0);` works). `orelse return` /
+`break` / `continue` stay banned there, because they would leave the cleanup
+early.
 
 ```zer
 defer { u32 z = maybe() orelse g; }   // COMPILE ERROR

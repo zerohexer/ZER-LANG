@@ -72,14 +72,24 @@ done
 # sample must contain the pattern. Add an entry whenever a lock/guard/trap
 # emission is found missing for a shape; a grid that only checks diagnostics
 # cannot see a dropped emission.
+# Entry format: "sample|pattern" (pattern must occur at least once) or
+# "sample|pattern|N" (at least N occurrences — for a lock that must be taken
+# once per site, where a dropped site still leaves the pattern present).
 REQUIRED=(
     "tests/zer/shared_many_roots_one_stmt.zer|rdlock\\(&a17"
     "tests/zer/shared_many_roots_one_stmt.zer|rdlock\\(&a18"
+    # BUG-920: three defer bodies read shared `g` in a while/if/for CONDITION
+    # (one lock each) plus the statement `g.v = 3` — the raw-AST defer emitter
+    # locked none of the conditions (2 locks total pre-fix).
+    "tests/zer/defer_body_shared_cond_locked.zer|pthread_mutex_lock\\(&g\\._zer_mtx\\)|4"
 )
 MISSING=0
 for entry in "${REQUIRED[@]}"; do
     sample="${entry%%|*}"
-    pattern="${entry#*|}"
+    rest="${entry#*|}"
+    pattern="${rest%%|*}"
+    min=1
+    if [ "$rest" != "$pattern" ]; then min="${rest#*|}"; fi
     if [ ! -f "$sample" ]; then
         echo "REQUIRED sample missing: $sample"
         MISSING=$((MISSING + 1))
@@ -90,8 +100,9 @@ for entry in "${REQUIRED[@]}"; do
         MISSING=$((MISSING + 1))
         continue
     fi
-    if ! grep -E "$pattern" "$TMP" > /dev/null 2>&1; then
-        echo "DROPPED EMISSION in $sample: expected pattern '$pattern' not found"
+    found=$(grep -cE "$pattern" "$TMP" 2>/dev/null || true)
+    if [ "${found:-0}" -lt "$min" ]; then
+        echo "DROPPED EMISSION in $sample: expected pattern '$pattern' at least $min time(s), found ${found:-0}"
         MISSING=$((MISSING + 1))
     fi
 done

@@ -1,0 +1,22 @@
+// BUG-920: shared-struct reads in a defer body's while/if/for CONDITIONS. The
+// raw-AST defer emitter lock-wrapped only expression statements and var-decl
+// initialisers, so these conditions read the shared field with NO mutex. The
+// body is lowered through the same per-statement lock path as any block now;
+// tools/emit_audit.sh asserts the lock count in the emitted C.
+shared struct S { u32 v; }
+S g;
+u32 out;
+u32 f() {
+    defer { while (g.v > 0) { g.v -= 1; out += 1; } }
+    defer { if (g.v > 2) { out += 10; } }
+    defer { for (u32 i = 0; i < g.v; i += 1) { out += 100; } }
+    g.v = 3;
+    return 0;
+}
+u32 main() {
+    u32 r = f();
+    if (r != 0) { return 1; }
+    /* LIFO: the for-loop runs 3 times (+300), then the if (+10), then the while drains (+3) */
+    if (out != 313) { return 2; }
+    return 0;
+}

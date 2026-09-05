@@ -1,0 +1,17 @@
+// BUG-920: `@critical` and `@once` inside a defer body — both previously hit
+// the raw-AST emitter's "unsupported stmt kind in defer" trap.
+u32 g;
+u32 h;
+u32 f() {
+    defer { @critical { g += 1; } }
+    defer { @once { h += 1; } }
+    return 0;
+}
+u32 main() {
+    u32 r = f();
+    r = f();
+    if (r != 0) { return 1; }
+    if (g != 2) { return 2; }
+    if (h != 1) { return 3; }
+    return 0;
+}

@@ -1,0 +1,13 @@
+// expect-error: may already be freed
+// BUG-920 (Pool form): conditional pool.free then a deferred pool.free of the
+// same handle — a double free on the `c` path, accepted by the old scanner.
+struct T { u32 v; }
+Pool(T, 4) pool;
+volatile u32 vflag = 1;
+u32 main() {
+    Handle(T) h = pool.alloc() orelse { return 1; };
+    bool c = vflag == 1;
+    if (c) { pool.free(h); }
+    defer pool.free(h);
+    return 0;
+}

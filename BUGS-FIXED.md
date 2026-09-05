@@ -324,6 +324,60 @@ They need the branch's auto-guard-into-IR refactor (survey item M), not this fix
 
 ---
 
+## Session 2026-09-06 — BUG-937: Level B recorded ONE free site, so the SECOND was invisible
+
+From the `loving-davinci-ii7a90` survey, and a hole in a relaxation shipped here.
+
+`free_block` feeds the ACCEPT side of Level B's guard-disjointness test, and the
+post-block tag is gated on `free_block < 0` — so only the FIRST free site was ever
+recorded. With two sites, a use under the SECOND free's own guards was compared
+against the FIRST free's guards, found disjoint, and accepted:
+
+```zer
+if (c)  { free(h); }
+if (!c) { if (d) { free(h); } }
+if (!c) { if (d) { g = h.v; } }      // the 2nd free's exact path — ACCEPTED
+```
+
+The design comment above `ir_use_guard_disjoint` already *names* this — *"the single
+`free_block` only records ONE of the two frees"* — and `freed_all_paths` was added to
+gate it. But that gate only fires when the two guard sets are COMPLEMENTARY SINGLETONS
+(`ir_free_completes_coverage`). The second free here is under `{!c, d}`, coverage never
+completes, and the gate never fires.
+
+**Fix — saturate, don't enumerate.** A second site sets `free_block` to
+`IR_FREE_BLOCK_MULTI`. Both readers already bail on `fb < 0`, so the sentinel makes
+them conservative with no further change: the accept side simply stops applying once
+the analyzer can no longer name ONE site to be disjoint from.
+
+Three parts, because the fact travels three ways:
+
+| | |
+|---|---|
+| the post-block tag | needed a PRE-BLOCK snapshot — a handle that ARRIVES freed is not a new site, and comparing `bi` alone would have saturated every inherited-freed handle |
+| the CFG merge | was a CARRY (fill only when empty), so two predecessors freeing at different sites kept whichever arrived first. It is a JOIN |
+| the ALIAS group | `*T h2 = h;` and the use through `h2` escaped everything above |
+
+### The alias half is the interesting one
+
+The note above `ir_mark_freed_all_paths` says `free_block` is deliberately NOT
+propagated to aliases, because it feeds the ACCEPT side and carrying a block index
+across an alias would be a RELAXATION. That is correct — and it does not apply to the
+sentinel. **MULTI is a REFUSAL**, so propagating it can only TIGHTEN, exactly like
+`freed_all_paths`. `ir_saturate_free_site` mirrors that helper, including its
+no-`ir_is_invalid`-filter reasoning (every alias is MAYBE_FREED at that point, so
+filtering them out marks nothing).
+
+**Precision preserved, verified:** all 12 existing `guarded_*` negatives still reject,
+and `tests/zer/guarded_level_b_ok.zer` pins Level B's two legitimate recoveries — one
+free site with a use under the complement guard, and complementary frees completing
+coverage without a leak report. Recorded cost: a genuinely disjoint use with three or
+more complementary frees now over-rejects.
+
+Three negatives from the branch, each verified accepted pre-fix.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

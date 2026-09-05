@@ -97,7 +97,7 @@ guards still narrow) and relies on the existing B4 snapshot to restore the
 pre-defer ranges afterwards. Five `zer_trap` siblings cover the var-decl-init,
 for-init and while-cond positions.
 
-**D. BUG-914 — Level B keeps ONE free site, so a SECOND disjoint free is unguarded.**
+**D. ~~BUG-914 — Level B keeps ONE free site, so a SECOND disjoint free is unguarded.~~ — CLOSED 2026-09-06 as BUG-937, DO NOT REDO.** *(IR_FREE_BLOCK_MULTI saturation at the tag, the merge JOIN, and the alias group. All 3 branch negatives STATED, all 12 existing guarded_* negatives unchanged, Level B's two recoveries pinned by tests/zer/guarded_level_b_ok.zer. Cost: a disjoint use with 3+ complementary frees now over-rejects.)* Original:
 Directly a hole in the guarded-refinement relaxation:
 
     if (c) { free(h); }
@@ -205,7 +205,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 1. A  ~~switch arm as the 9th value-flow sink~~  CLOSED (BUG-934)
 2. B  ~~the 16-root lock cap~~               CLOSED (BUG-935), gate taken
 3. C  ~~stale VRP in defer bodies~~          CLOSED (BUG-936); 3 siblings need M
-4. D  Level B multi-free                      -- a hole in a relaxation we shipped
+4. D  ~~Level B multi-free~~                 CLOSED (BUG-937)
 5. E  &freed.field                            -- mind our FORMING-vs-READING rule
 6. F  the const-expression retype MISCOMPILE  -- two-spellings class again
 7. J/I/K/H/G  the smaller ones

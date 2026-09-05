@@ -692,6 +692,54 @@ static bool ir_free_completes_coverage(ZerCheck *zc, IRHandleInfo *h) {
  *
  * Do not re-inline `h->freed_all_paths = 1` at a new free site — same rule as
  * `ir_mark_transferred`. */
+/* BUG-937: `free_block` records where a handle was freed, and feeds the ACCEPT side
+ * of Level B's guard-disjointness test. It recorded only the FIRST free site (the
+ * post-block tag is gated on `free_block < 0`), so with TWO free sites a use under
+ * the SECOND free's own guards was compared against the FIRST free's guards, found
+ * disjoint, and ACCEPTED — a verified use-after-free:
+ *
+ *     if (c)  { free(h); }
+ *     if (!c) { if (d) { free(h); } }
+ *     if (!c) { if (d) { g = h.v; } }      // the 2nd free's exact path
+ *
+ * `freed_all_paths` already gated the COMPLEMENTARY-singleton case (§A #4); this is
+ * the same hole when the second free's guard set is not a singleton, so coverage
+ * never completes and that gate never fires.
+ *
+ * A second site SATURATES to MULTI. Both readers (`ir_use_guard_disjoint`,
+ * `ir_free_completes_coverage`) already bail on `fb < 0`, so the sentinel makes them
+ * conservative with no further change — the accept side simply stops applying once
+ * the analyzer can no longer name ONE site to be disjoint from. Precision cost: a
+ * genuinely disjoint use with three or more complementary frees now over-rejects. */
+#define IR_FREE_BLOCK_MULTI (-2)
+
+/* BUG-937: saturate `free_block` to MULTI across the whole ALIAS GROUP.
+ *
+ * The note above `ir_mark_freed_all_paths` explains why `free_block` is NOT
+ * propagated to aliases: it feeds the ACCEPT side of the disjointness test, so
+ * carrying a block index across an alias would be a RELAXATION.
+ *
+ * The MULTI sentinel is the opposite kind of fact. It is a REFUSAL — "the analyzer
+ * can no longer name one site to be disjoint from" — so propagating it can only
+ * TIGHTEN, exactly like `freed_all_paths`. Without it the alias spelling escaped:
+ *
+ *     *T h2 = h;
+ *     if (c) { free(h); }  if (!c) { if (d) { free(h); } }
+ *     if (!c) { if (d) { g = h2.v; } }        // accepted through h2
+ *
+ * Same no-`ir_is_invalid`-filter reasoning as the flag above: every alias is
+ * MAYBE_FREED at this point, and filtering them out would mark nothing. */
+static void ir_saturate_free_site(IRPathState *ps, IRHandleInfo *h) {
+    h->free_block = IR_FREE_BLOCK_MULTI;
+    int aid = h->alloc_id;
+    if (aid == 0) return;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *a = &ps->handles[i];
+        if (a != h && a->alloc_id == aid)
+            a->free_block = IR_FREE_BLOCK_MULTI;
+    }
+}
+
 static void ir_mark_freed_all_paths(IRPathState *ps, IRHandleInfo *h) {
     h->freed_all_paths = 1;
     int aid = h->alloc_id;
@@ -993,6 +1041,7 @@ static void ir_mark_local_escaped(IRPathState *ps, int local_id) {
  * function global UAF needs FuncSummary work — see docs/limitations.md. */
 #define IR_GLOBAL_ROOT_ID (-2)
 
+
 /* True if ident names a module-level global NOT shadowed by any function
  * local. Locals shadow globals, so a same-named local wins. */
 static bool ir_ident_is_unshadowed_global(ZerCheck *zc, IRFunc *func, Node *ident) {
@@ -1203,9 +1252,20 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle, so a MAYBE_FREED handle remembers WHERE it was freed (used
              * by the guard-disjointness check at the use). Mirror of the
              * free_line carry above; only fill when rh has none of its own. */
-            if (rh->state == IR_HS_MAYBE_FREED && rh->free_block < 0 &&
-                ph->free_block >= 0) {
-                rh->free_block = ph->free_block;
+            /* BUG-937: this was a CARRY (fill only when empty), so two predecessors
+             * that freed at DIFFERENT sites kept whichever arrived first and the
+             * other site became invisible to the disjointness test. It is a JOIN. */
+            if (rh->state == IR_HS_MAYBE_FREED || rh->state == IR_HS_FREED) {
+                if (rh->free_block == IR_FREE_BLOCK_MULTI ||
+                    ph->free_block == IR_FREE_BLOCK_MULTI) {
+                    if (ph->free_block == IR_FREE_BLOCK_MULTI)
+                        rh->free_block = IR_FREE_BLOCK_MULTI;
+                } else if (rh->free_block < 0 && ph->free_block >= 0) {
+                    rh->free_block = ph->free_block;
+                } else if (rh->free_block >= 0 && ph->free_block >= 0 &&
+                           rh->free_block != ph->free_block) {
+                    rh->free_block = IR_FREE_BLOCK_MULTI;
+                }
             }
             /* Level B: OR-carry the all-paths-freed flag. Sound because it is
              * only set for SINGLETON complementary coverage (no path leaves the
@@ -6637,6 +6697,15 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
             /* Process instructions in this block */
             zc->gr_cur_block = bi;
+            /* BUG-937: a handle that ARRIVES freed must not be re-tagged with this
+             * block — only a free that HAPPENS here is a new site. Snapshot which
+             * handles were already FREED so the tag below can tell the two apart. */
+            int fb_pre_n = merged.handle_count;
+            unsigned char *fb_was = fb_pre_n > 0
+                ? (unsigned char *)calloc((size_t)fb_pre_n, 1) : NULL;
+            if (fb_was)
+                for (int hi = 0; hi < fb_pre_n; hi++)
+                    fb_was[hi] = (merged.handles[hi].state == IR_HS_FREED) ? 1 : 0;
             for (int ii = 0; ii < bb->inst_count; ii++) {
                 ir_check_inst(zc, &merged, &bb->insts[ii], func);
             }
@@ -6646,11 +6715,19 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
              * merge carry. free_block is NOT part of the convergence check
              * (state only), so this can't perturb the fixed point. */
             for (int hi = 0; hi < merged.handle_count; hi++) {
-                if (merged.handles[hi].state == IR_HS_FREED &&
-                    merged.handles[hi].free_block < 0) {
+                if (merged.handles[hi].state != IR_HS_FREED) continue;
+                bool freed_here = !(fb_was && hi < fb_pre_n && fb_was[hi]);
+                if (merged.handles[hi].free_block < 0 &&
+                    merged.handles[hi].free_block != IR_FREE_BLOCK_MULTI) {
                     merged.handles[hi].free_block = bi;
+                } else if (freed_here &&
+                           merged.handles[hi].free_block >= 0 &&
+                           merged.handles[hi].free_block != bi) {
+                    /* BUG-937: a SECOND site. Saturate — see IR_FREE_BLOCK_MULTI. */
+                    ir_saturate_free_site(&merged, &merged.handles[hi]);
                 }
             }
+            free(fb_was);
 
             /* Check if state changed (for fixed-point convergence).
              *
@@ -6771,6 +6848,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
 
         zc->gr_cur_block = bi;
+        /* BUG-937: same pre-block snapshot as the fixpoint pass — an inherited
+         * FREED handle is not a new free site. */
+        int fb2_pre_n = merged.handle_count;
+        unsigned char *fb2_was = fb2_pre_n > 0
+            ? (unsigned char *)calloc((size_t)fb2_pre_n, 1) : NULL;
+        if (fb2_was)
+            for (int hi = 0; hi < fb2_pre_n; hi++)
+                fb2_was[hi] = (merged.handles[hi].state == IR_HS_FREED) ? 1 : 0;
         for (int ii = 0; ii < bb->inst_count; ii++) {
             ir_check_inst(zc, &merged, &bb->insts[ii], func);
             ir_trace_states(zc, func, &merged, &bb->insts[ii]);
@@ -6778,11 +6863,18 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         /* Level B: tag handles freed in this block (the final pass also writes
          * block_states[bi], read by later blocks' merges in this same pass). */
         for (int hi = 0; hi < merged.handle_count; hi++) {
-            if (merged.handles[hi].state == IR_HS_FREED &&
-                merged.handles[hi].free_block < 0) {
+            if (merged.handles[hi].state != IR_HS_FREED) continue;
+            bool freed_here = !(fb2_was && hi < fb2_pre_n && fb2_was[hi]);
+            if (merged.handles[hi].free_block < 0 &&
+                merged.handles[hi].free_block != IR_FREE_BLOCK_MULTI) {
                 merged.handles[hi].free_block = bi;
+            } else if (freed_here &&
+                       merged.handles[hi].free_block >= 0 &&
+                       merged.handles[hi].free_block != bi) {
+                ir_saturate_free_site(&merged, &merged.handles[hi]);
             }
         }
+        free(fb2_was);
 
         ir_ps_free(&block_states[bi]);
         block_states[bi] = merged;

@@ -1,0 +1,19 @@
+// expect-error: use after free
+// BUG-914 (FREED-FREED merge form): both arms free under DIFFERENT guard sets
+// ({c} and {!c, d}); the merge with the untouched `!c && !d` path yields
+// MAYBE_FREED. The single surviving free site was the first arm's, so a use
+// under !c && d was accepted. The FREED∧FREED merge now joins the sites too.
+struct T { u32 v; }
+volatile u32 v1 = 0;
+volatile u32 v2 = 1;
+?*T gp = null;
+u32 g;
+u32 main() {
+    *T h = alloc(T) orelse { return 1; };
+    gp = h;
+    bool c = v1 == 1;
+    bool d = v2 == 1;
+    if (c) { free(h); } else { if (d) { free(h); } }
+    if (!c) { if (d) { g = h.v; } }
+    return 0;
+}

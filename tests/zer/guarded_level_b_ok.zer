@@ -1,0 +1,31 @@
+// BUG-937 BOUNDARY POSITIVE: free_block now SATURATES to MULTI at a second free
+// site, which is a tightening. This pins Level B's two legitimate recoveries, so
+// the saturation cannot quietly swallow them.
+struct T { u32 v; }
+volatile u32 v1 = 0;
+?*T gp = null;
+u32 g;
+
+// (1) ONE free site, use under the complement guard — the recovery Level B exists
+//     for. Exactly one site, so nothing saturates.
+void single_free_disjoint_use() {
+    *T h = alloc(T) orelse return;
+    gp = h;
+    bool c = v1 == 1;
+    if (c)  { free(h); }
+    if (!c) { g = h.v; free(h); }
+}
+
+// (2) COMPLEMENTARY frees — coverage completes, so this must not be a leak.
+void complementary_frees() {
+    *T h = alloc(T) orelse return;
+    bool c = v1 == 1;
+    if (c)  { free(h); }
+    if (!c) { free(h); }
+}
+
+u32 main() {
+    single_free_disjoint_use();
+    complementary_frees();
+    return 0;
+}

@@ -1,0 +1,21 @@
+// expect-error: use after free
+// BUG-914 (alias form): the second, disjoint-accepted free of `h` must also
+// strengthen the pointer alias `h2` (same allocation) — before, the alias
+// stayed MAYBE_FREED with the stale single free site and a use through it on
+// the second free's path was accepted.
+struct T { u32 v; }
+volatile u32 v1 = 0;
+volatile u32 v2 = 1;
+?*T gp = null;
+u32 g;
+u32 main() {
+    *T h = alloc(T) orelse { return 1; };
+    *T h2 = h;
+    gp = h;
+    bool c = v1 == 1;
+    bool d = v2 == 1;
+    if (c) { free(h); }
+    if (!c) { if (d) { free(h); } }
+    if (!c) { if (d) { g = h2.v; } }
+    return 0;
+}

@@ -1598,16 +1598,38 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * EXPRESSION EMISSION
  * ================================================================ */
 
+/* BUG-939: emit an integer literal AT ITS RESOLVED WIDTH.
+ *
+ * Both AST literal emitters printed a bare `%llu` for any value fitting in 32 bits,
+ * so a literal the checker had RETYPED to i64/u64 still reached C as an `int` — and
+ * the arithmetic around it was then done in `int`:
+ *
+ *     i64 v = -(1 << 40);      // var-decl: IR temps are typed, correct
+ *     i64 a;  a = -(1 << 40);  // assign:  emitted inline -> `-_zer_shl(1, 40)`
+ *
+ * LIT-1's retype is only half the fix; without a width suffix the retyped node still
+ * prints as a 32-bit constant. Shared by BOTH emitters so the two spellings cannot
+ * drift apart again — same reason emit_try_enum_open/close is shared. */
+static void emit_int_literal(Emitter *e, Node *node) {
+    unsigned long long v = (unsigned long long)node->int_lit.value;
+    if (v > 0xFFFFFFFFULL) { emit(e, "%lluULL", v); return; }
+    Type *lt = checker_get_type(e->checker, node);
+    Type *eff = lt ? type_unwrap_distinct(lt) : NULL;
+    if (eff && type_is_integer(eff) && type_width(eff) > 32) {
+        /* The width comes from the TYPE, not the value: a small literal inside a
+         * 64-bit expression must still be 64-bit or the operation wraps at 32. */
+        emit(e, "%llu%s", v, type_is_signed(eff) ? "LL" : "ULL");
+        return;
+    }
+    emit(e, "%llu", v);
+}
+
 static void emit_expr(Emitter *e, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
     case NODE_INT_LIT:
-        if (node->int_lit.value > 0xFFFFFFFF) {
-            emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
-        } else {
-            emit(e, "%llu", (unsigned long long)node->int_lit.value);
-        }
+        emit_int_literal(e, node);
         break;
 
     case NODE_FLOAT_LIT:
@@ -4940,7 +4962,17 @@ static void emit_global_var(Emitter *e, Node *node) {
              * This avoids GCC statement expression errors from _zer_shl/shr
              * macros which can't be used in global initializers. */
             bool emitted_const = false;
-            if (node->var_decl.is_const) {
+            /* BUG-939: the gate was `is_const`, so a NON-const global whose
+             * initializer needs a macro emitted the macro — and `_zer_shl` is a GCC
+             * STATEMENT EXPRESSION, which is illegal at file scope:
+             *     i64 g = -(1 << 4);   ->  int64_t g = (-_zer_shl(1LL, 4LL));
+             *                              error: braced-group ... only inside a function
+             * i.e. a valid ZER program that could not be BUILT. Constness has nothing
+             * to do with it: what matters is whether the initializer FOLDS, and a
+             * foldable tree is identical either way. eval_const_expr returns
+             * CONST_EVAL_FAIL for anything with a variable in it, so widening the
+             * gate cannot fold something it should not. */
+            {
                 int64_t cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
                     if (cval < 0) {
@@ -6783,10 +6815,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_INT_LIT:
-        if (node->int_lit.value > 0xFFFFFFFF)
-            emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
-        else
-            emit(e, "%llu", (unsigned long long)node->int_lit.value);
+        emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
         emit(e, "%.17g", node->float_lit.value);

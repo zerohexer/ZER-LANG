@@ -426,6 +426,74 @@ pre-fix, plus the branch's own boundary positive.
 
 ---
 
+## Session 2026-09-06 — BUG-939: a constant's WIDTH depended on which sink it flowed to
+
+From the `loving-davinci-ii7a90` survey. LIT-1's retype existed but ran at **four of
+the eight** value-flow sinks, so the same constant produced a **different value**
+depending on the spelling:
+
+```zer
+i64 v = -(1 << 40);      // var-decl  — retyped, correct
+i64 a;  a = -(1 << 40);  // assign    — folded at the default width
+```
+
+Measured: the two **disagree at runtime**. Same sink set this file keeps finding.
+
+| sink | had a retype? |
+|---|---|
+| struct-init field · call arg · var-decl init · return | yes |
+| **assignment · orelse fallback · spawn arg · global init** | **no** |
+
+### It needed three separate fixes, not one
+
+**1 — the missing sinks.** One call ahead of the assign op-chain (covering plain AND
+compound in one place rather than one per branch), plus orelse-fallback and global
+init.
+
+**2 — the emitter.** Both AST literal emitters printed a bare `%llu` for anything
+fitting in 32 bits, so a literal the checker had *already retyped* to i64 still
+reached C as an `int`, and the arithmetic around it was done in `int`. One shared
+`emit_int_literal` keyed on the node's resolved type, used by both — the same
+reason `emit_try_enum_open/close` is shared. Spawn-arg needed only this half.
+
+**3 — the file-scope fold**, which turned out to be a *pre-existing* bug of its own:
+the fold was gated on `is_const`, so a non-const global emitted the macro — and
+`_zer_shl` is a GCC **statement expression**, illegal at file scope:
+
+```
+i64 g = -(1 << 4);   ->   int64_t g = (-_zer_shl(1LL, 4LL));
+                          error: braced-group ... only inside a function
+```
+
+A valid ZER program that could not be built. Constness is irrelevant; what matters is
+whether the initializer FOLDS, and `eval_const_expr` returns FAIL for anything with a
+variable in it, so widening the gate cannot fold what it shouldn't.
+
+### Two mistakes of mine, both caught
+
+**I broke an `else` binding.** Slotting the compound-assign retype between `} else`
+and the numeric check re-bound that `else` to my statement and made the numeric check
+**unconditional**. Found by reading the surrounding code after the edit, not by a
+test — the corpus has no compound assignment on a non-numeric type. The unified
+placement removes the hazard entirely.
+
+**The walker audit rejected my first placement** and I nearly baselined it without
+understanding why. Bisecting hunk-by-hunk showed a no-op comment in the same region
+passed, so it was not a line-shift artifact — it was specifically that hunk. Moving
+to ONE call before the chain both fixed the audit and produced the better design.
+*A gate disagreeing is a reason to look, not a row to add.*
+
+### Recorded residual — NOT fixed
+
+A constant tree in a **binary operand** position is still folded at the default
+width: `v != (1 << 40)` compares wrong. `is_literal_compatible` accepts only a lone
+`NODE_INT_LIT`, never a pure-literal TREE, so the binary retype never fires for one.
+That is BUG-921's half (the over-rejection side of the same predicate) and is
+recorded in `limitations.md`. The new positive uses variables for every comparison
+and says so in-file, so it measures what was fixed rather than what wasn't.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

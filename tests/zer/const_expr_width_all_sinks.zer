@@ -1,0 +1,41 @@
+// BUG-939: LIT-1's retype ran at FOUR of the eight value-flow sinks, so the same
+// constant produced a DIFFERENT VALUE depending on the spelling. This exercises
+// every sink a constant can FLOW to, each compared against the var-decl spelling
+// that was already correct. Pre-fix this returns non-zero.
+//
+// NOTE ON WHAT IS DELIBERATELY NOT ASSERTED: a constant tree in a BINARY OPERAND
+// position (`v != (1 << 40)`) is still folded at the default width, because
+// is_literal_compatible accepts only a lone NODE_INT_LIT and never a pure-literal
+// TREE, so the binary retype never fires for one. That is BUG-921's half and it is
+// recorded in limitations.md — every comparison below therefore uses a VARIABLE.
+?i64 mk() { return null; }
+i64 g_init = -(1 << 40);
+i64 seen;
+void takes(i64 x) { seen = x; }
+
+u32 main() {
+    i64 want = -(1 << 40);              // var-decl — the reference spelling
+    if (want == 0) { return 1; }
+
+    i64 a; a = -(1 << 40);              // assignment
+    if (a != want) { return 2; }
+
+    if (g_init != want) { return 3; }   // global init
+
+    i64 o = mk() orelse -(1 << 40);     // orelse fallback
+    if (o != want) { return 4; }
+
+    i64 pos  = (1 << 40);
+    i64 c = 0; c += (1 << 40);          // compound assign
+    if (c != pos) { return 5; }
+
+    takes(-(1 << 40));                  // call arg
+    if (seen != want) { return 6; }
+
+    // 32-bit semantics must be untouched by the widening
+    u32 w = 0xFFFFFFFF; w = w + 1;
+    if (w != 0) { return 7; }
+    u32 sh = 1; sh = sh << 31;
+    if (sh != 2147483648) { return 8; }
+    return 0;
+}

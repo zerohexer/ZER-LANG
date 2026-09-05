@@ -7645,6 +7645,22 @@ static Type *check_expr(Checker *c, Node *node) {
                 (uint32_t)node->assign.target->ident.name_len);
             if (asym) asym->resource_initialized = true;
         }
+        /* BUG-939: LIT-1's retype ran at FOUR of the eight value-flow sinks
+         * (struct-init field, call arg, var-decl init, return) and not the other
+         * four, so the same constant produced a DIFFERENT VALUE depending on the
+         * spelling:
+         *     i64 v = -(1 << 40);      // retyped -> correct
+         *     i64 a;  a = -(1 << 40);  // not     -> folded at the default width
+         * The two-spellings class, on the sink set this file keeps finding.
+         *
+         * ONE call ahead of the op-chain rather than one per branch: plain and
+         * compound assignment are the same constant flowing to the same
+         * destination, so they want the same retype, and a single site cannot
+         * drift between them. */
+        if (is_pure_int_literal_expr(node->assign.value)) {
+            Type *rt = int_retype_target(target);
+            if (rt) retype_const_int_to_target(c, node->assign.value, rt);
+        }
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!value_flows_to(node->assign.value, value, target)) {
@@ -10253,6 +10269,11 @@ static Type *check_expr(Checker *c, Node *node) {
                              ? unwrapped : ty_void;
             } else {
                 Type *fallback = check_expr(c, node->orelse.fallback);
+                if (is_pure_int_literal_expr(node->orelse.fallback)) {
+                    /* BUG-939: retype wherever a constant FLOWS — see the assignment sink. */
+                    Type *rt = int_retype_target(unwrapped);
+                    if (rt) retype_const_int_to_target(c, node->orelse.fallback, rt);
+                }
                 /* fallback must match unwrapped type */
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
                     if (!report_value_flow_refusal(c, node->orelse.fallback, unwrapped,
@@ -22251,6 +22272,11 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                     "cannot initialize global array '%.*s' from variable — "
                     "global arrays must use literal initializers",
                     (int)decl->var_decl.name_len, decl->var_decl.name);
+            }
+            if (is_pure_int_literal_expr(decl->var_decl.init)) {
+                /* BUG-939: retype wherever a constant FLOWS — see the assignment sink. */
+                Type *rt = int_retype_target(type);
+                if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
             }
             if (!value_flows_to(decl->var_decl.init, init, type)) {
                 char what[96];

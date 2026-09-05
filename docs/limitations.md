@@ -119,7 +119,21 @@ allocation. NOTE the interaction with our own rule *"FORMING a reference aliases
 READING a value does not"* — the fix must check the auto-deref CROSSINGS on the
 operand chain, not treat `&` as opaque. Sibling: `uaf_addr_of_index_through_freed_slice`.
 
-**F. BUG-922 — a MISCOMPILE, and it is the TWO-SPELLINGS class again.**
+**F. ~~BUG-922 — a MISCOMPILE, and it is the TWO-SPELLINGS class again.~~ —
+CLOSED 2026-09-06 as BUG-939, PARTIALLY.** *Retype added at the four missing sinks
+(one call ahead of the assign op-chain covers plain AND compound), a shared
+`emit_int_literal` keyed on the resolved type for BOTH AST emitters, and the
+file-scope fold un-gated from `is_const` (a non-const global emitted `_zer_shl`, a
+GCC statement expression, which is **illegal at file scope** — a valid ZER program
+that could not be BUILT).*
+**STILL OPEN — the BINARY OPERAND position.** `v != (1 << 40)` still folds at the
+default width, because `is_literal_compatible` accepts only a lone `NODE_INT_LIT`
+and never a pure-literal TREE, so the binary retype at checker.c never fires for
+one. **That is the same predicate as item K (BUG-921), so the two must be done
+together** — widening `is_literal_compatible` to a pure-literal tree whose
+WIDTH-EXACT fold fits closes both the over-rejection AND this residual. The branch's
+caveat applies: every literal AND intermediate must fit, because `/`, `%` and shifts
+do not commute with the wrap. Original:
 
     i64 v = -(1 << 40);      // var-decl  -> correct
     i64 a;  a = -(1 << 40);  // assign    -> DIFFERENT VALUE
@@ -207,7 +221,8 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 3. C  ~~stale VRP in defer bodies~~          CLOSED (BUG-936); 3 siblings need M
 4. D  ~~Level B multi-free~~                 CLOSED (BUG-937)
 5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
-6. F  the const-expression retype MISCOMPILE  -- two-spellings class again
+6. F  ~~const-expression MISCOMPILE~~       CLOSED (BUG-939); binary-operand
+      residual folds into K (BUG-921) — same predicate, do them together
 7. J/I/K/H/G  the smaller ones
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
 ```

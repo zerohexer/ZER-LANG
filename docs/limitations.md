@@ -49,7 +49,8 @@ verified by hand.**
 
 ### TAKE FIRST — it extends a class already closed here
 
-**A. The SWITCH ARM is a NINTH value-flow sink.** 4 tests: `switch_arm_literal_oob`,
+**A. ~~The SWITCH ARM is a NINTH value-flow sink.~~ — CLOSED 2026-09-06 as BUG-934, DO NOT REDO.**
+All four reject; boundary pinned by `tests/zer/switch_arm_flow_ok.zer`. Original: 4 tests: `switch_arm_literal_oob`,
 `_bool_on_int`, `_float_on_int`, `_negative_into_unsigned`. CLAUDE.md's value-flow
 row lists EIGHT sinks; the switch arm is not one of them, so every rule that rides
 `value_flows_to` — including BUG-927's enum door and BUG-842's negative constant —
@@ -194,7 +195,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 ### SUGGESTED ORDER
 
 ```
-1. A  switch arm as the 9th value-flow sink   -- one site, four tests, our own class
+1. A  ~~switch arm as the 9th value-flow sink~~  CLOSED (BUG-934)
 2. B  the 16-root lock cap                    -- silent data race, and take their gate
 3. C  stale VRP in defer bodies               -- unguarded OOB store, 0 diagnostics
 4. D  Level B multi-free                      -- a hole in a relaxation we shipped

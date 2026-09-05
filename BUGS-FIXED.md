@@ -202,6 +202,42 @@ array, and a plain non-move array copy all still compile and run.
 
 ---
 
+## Session 2026-09-06 — BUG-934: the switch arm was the NINTH value-flow sink
+
+From the `loving-davinci-ii7a90` survey. BUG-842 collapsed eight sinks into one query,
+`value_flows_to` — var-decl init, assignment, call arg, return, spawn arg, struct-init
+field, orelse fallback, global init. The **switch arm was never one of them**: an arm
+value was `check_expr`'d and never compared against the SUBJECT's type.
+
+So every rule riding that query was absent there — BUG-927's enum door, BUG-842's
+negative constant, the bool/float/width rules. Measured, all accepted on main:
+
+```
+u8  b;  switch (b) { 300  => … }      while  u8  b = 300;   is rejected
+u32 x;  switch (x) { -5   => … }      while  u32 x = -5;    is rejected
+u32 x;  switch (x) { true => … }
+u32 x;  switch (x) { 1.5  => … }
+```
+
+The two-spellings shape again, one sink short of the set.
+
+**Fix:** one call in the arm loop. Two messages, because they are two different
+mistakes — an integer that does not FIT is a range problem and the operand type is
+the fact the author needs; a bool or float is a KIND problem and naming both types is
+what helps. The negative-constant case routes through the existing shared reporter
+(`report_value_flow_refusal`) rather than growing a second one.
+
+**Boundary pinned** by `tests/zer/switch_arm_flow_ok.zer` — arms in range, enum dot
+syntax, enum qualified, bool subject, multi-value arm, const ident arm, and a negative
+arm on a signed subject all still compile and run. 86 corpus files contain a `switch`;
+`make check` exit 0 with none newly rejected.
+
+Four negatives taken verbatim from the branch, each verified accepted pre-fix. Their
+`expect-error` wording was better than my first draft ("does not fit the switch operand
+type") — the rule was changed to match the intended reason, not the tests softened.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

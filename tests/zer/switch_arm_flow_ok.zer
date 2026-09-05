@@ -1,0 +1,26 @@
+// BUG-934 BOUNDARY POSITIVE: the switch arm is now a value-flow sink, so this
+// file pins every legal arm shape. If the ninth sink is ever widened, these must
+// keep compiling — otherwise the fix has become an over-rejection.
+enum St { idle, run }
+const u32 K = 7;
+u32 res;
+
+u32 arms_in_range() { u8 b = 44; switch (b) { 44 => { return 0; } 200 => { return 1; } default => { return 2; } } }
+u32 enum_dot(St s)  { switch (s) { .idle => { return 0; } .run => { return 1; } } }
+u32 enum_qualified(St s) { switch (s) { St.idle => { return 0; } default => { return 1; } } }
+u32 bool_subject(bool f) { switch (f) { true => { return 0; } false => { return 1; } } }
+u32 multi_value(u32 x) { switch (x) { 1, 2, 3 => { return 0; } default => { return 1; } } }
+u32 const_ident(u32 x) { switch (x) { K => { return 0; } default => { return 1; } } }
+u32 signed_negative(i32 x) { switch (x) { -5 => { return 0; } default => { return 1; } } }
+
+u32 main() {
+    res += arms_in_range();
+    res += enum_dot(St.run);
+    res += enum_qualified(St.idle);
+    res += bool_subject(true);
+    res += multi_value(2);
+    res += const_ident(7);
+    res += signed_negative(-5);
+    if (res != 1) { return 1; }
+    return 0;
+}

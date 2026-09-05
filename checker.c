@@ -15469,7 +15469,41 @@ static void check_stmt(Checker *c, Node *node) {
             /* check match values — skip for enum/union dot syntax (.variant) */
             if (!arm->is_enum_dot) {
                 for (int j = 0; j < arm->value_count; j++) {
-                    check_expr(c, arm->values[j]);
+                    Type *av = check_expr(c, arm->values[j]);
+                    /* BUG-934: THE SWITCH ARM IS THE NINTH VALUE-FLOW SINK.
+                     * `value_flows_to` (BUG-842) collapsed eight sinks into one
+                     * query — var-decl init, assignment, call arg, return, spawn
+                     * arg, struct-init field, orelse fallback, global init — and
+                     * every rule riding it (BUG-927's enum door, BUG-842's negative
+                     * constant, the bool/float/width rules) was ABSENT here,
+                     * because the arm was only ever `check_expr`d and never
+                     * compared against the SUBJECT's type. Measured: `u8 b;
+                     * switch (b) { 300 => … }` and `u32 x; switch (x) { -5 => … }`
+                     * were accepted while the var-decl spelling of the identical
+                     * value is correctly rejected — the two-spellings shape again,
+                     * one sink short. */
+                    if (av && expr && !value_flows_to(arm->values[j], av, expr)) {
+                        if (!report_value_flow_refusal(c, arm->values[j], expr,
+                                                       arm->values[j]->loc.line,
+                                                       "switch arm")) {
+                            /* Two different mistakes, two messages. An integer that
+                             * does not FIT is a range problem and the operand type is
+                             * the fact the author needs; anything else is a KIND
+                             * problem and naming both types is what helps. */
+                            char sub[96];
+                            snprintf(sub, sizeof(sub), "%s", type_name(expr));
+                            if (type_is_integer(av) && type_is_integer(expr)) {
+                                checker_error(c, arm->values[j]->loc.line,
+                                    "switch arm: this value does not fit the switch "
+                                    "operand type '%s'", sub);
+                            } else {
+                                checker_error(c, arm->values[j]->loc.line,
+                                    "switch arm value of type '%s' cannot match a "
+                                    "switch operand of type '%s'",
+                                    type_name(av), sub);
+                            }
+                        }
+                    }
                 }
             }
 

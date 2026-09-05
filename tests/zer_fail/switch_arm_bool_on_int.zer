@@ -1,0 +1,3 @@
+// expect-error: switch arm value of type 'bool' cannot match a switch operand of type 'u8'
+// bool is NOT an integer — `true =>` on a u8 switch compared against 1 pre-fix.
+u32 main() { u8 b = 1; switch (b) { true => { return 1; } default => { } } return 0; }

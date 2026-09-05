@@ -1,0 +1,4 @@
+// expect-error: does not fit the switch operand type 'u8'
+// BUG-925: an arm value outside the operand's range could never match (or,
+// pre-fix, matched the TRUNCATED value) — accepted silently before.
+u32 main() { u8 b = 44; switch (b) { 300 => { return 1; } default => { } } return 0; }

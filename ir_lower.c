@@ -121,11 +121,27 @@ typedef struct {
      * locks do not nest within one condition (conditions are expressions), so
      * one slot suffices. */
     Node *cond_shared_saved;
+    /* BUG-919: auto-guard lowering state. critical_depth / defer_body_depth
+     * decide whether a failed guard may RETURN or must TRAP; `guarded` is the
+     * set of AST nodes already guarded in this function (stack-first, arena
+     * on overflow). */
+    int critical_depth;
+    int defer_body_depth;
+    Node *guarded_inline[32];
+    Node **guarded;
+    int guarded_count;
+    int guarded_cap;
 } LowerCtx;
 
 /* ---- Helpers ---- */
 
+static void lower_auto_guards(LowerCtx *ctx, Node *node);
+
+/* THE choke point every instruction goes through. BUG-919: an instruction
+ * carrying an AST payload gets its auto-guards lowered FIRST, so the guard
+ * branch precedes the guarded access no matter which op kind carries it. */
 static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    if (inst.expr) lower_auto_guards(ctx, inst.expr);
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -358,6 +374,7 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
 
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
+    if (inst.expr) lower_auto_guards(ctx, inst.expr);   /* BUG-919 */
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -2125,6 +2142,250 @@ static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local,
 }
 
 /* Lower a single statement */
+
+/* ================================================================
+ * Auto-guard lowering (BUG-919, 2026-09-05)
+ *
+ * The checker marks an unprovable fixed-array / MMIO index (mark_auto_guard)
+ * and a possibly-freed dynamic-index element read (the UINT64_MAX sentinel).
+ * The EMITTER used to synthesise `if ((size_t)i >= N) { <defers>; return 0; }`
+ * in C before an op-kind-gated subset of instructions — invisible to the IR,
+ * to zercheck_ir, and to any pass that reasons about control flow, and every
+ * op kind missing from the gate was a silent OOB (IR_INDEX_READ, IR_AWAIT,
+ * IR_NOP each in their turn). The guard is now a real IR branch, lowered at
+ * the single choke point every instruction goes through (emit_inst/emit_3ac):
+ *
+ *     %c = (usize)i >= N
+ *     BRANCH %c -> bb_fail, bb_cont
+ *   bb_fail:  DEFER_FIRE; RETURN            (or TRAP when a return cannot leave
+ *                                            the scope: lock held / @critical /
+ *                                            inside a defer body)
+ *   bb_cont:  <the guarded instruction>
+ *
+ * bb_fail is tagged is_orelse_fallback so the leak/join checks skip it — the
+ * early-out path is an abnormal exit, exactly as invisible to those checks as
+ * the emitter-synthesised return was.
+ *
+ * A guarded node is recorded so the same NODE_INDEX reached through two
+ * instructions (an IR_INDEX_READ and the parent IR_CALL that keeps the call
+ * AST, an IR_LOCK root and the IR_ASSIGN of the same statement) is guarded
+ * ONCE, at the earliest of them.
+ * ================================================================ */
+static bool guard_seen(LowerCtx *ctx, Node *n) {
+    for (int i = 0; i < ctx->guarded_count; i++)
+        if (ctx->guarded[i] == n) return true;
+    return false;
+}
+
+static void guard_mark(LowerCtx *ctx, Node *n) {
+    if (ctx->guarded_count >= ctx->guarded_cap) {
+        int nc = ctx->guarded_cap * 2;
+        Node **nb = (Node **)arena_alloc(ctx->arena, (size_t)nc * sizeof(Node *));
+        memcpy(nb, ctx->guarded, (size_t)ctx->guarded_count * sizeof(Node *));
+        ctx->guarded = nb;
+        ctx->guarded_cap = nc;
+    }
+    ctx->guarded[ctx->guarded_count++] = n;
+}
+
+/* The exit of a failed guard. BUG-835 semantics preserved: a return that would
+ * leave a lock held / interrupts disabled / skip the rest of a defer cleanup is
+ * a TRAP instead. Otherwise fire every pending defer and return the zero value
+ * of the function's return type (a bare IR_RETURN; ret_from_orelse makes a
+ * `?void` return None rather than Some). */
+static void lower_guard_exit(LowerCtx *ctx, int line) {
+    if (ctx->critical_depth > 0 || ctx->current_stmt_shared_root ||
+        ctx->defer_body_depth > 0) {
+        IRInst tr = make_inst(IR_TRAP, line);
+        tr.trap_msg = "out-of-bounds access inside a held lock, @critical block "
+                      "or defer cleanup — cannot return without leaking it";
+        emit_inst(ctx, tr);
+        return;
+    }
+    emit_defer_fire(ctx, line);
+    IRInst ret = make_inst(IR_RETURN, line);
+    ret.ret_from_orelse = true;
+    emit_inst(ctx, ret);
+}
+
+/* BRANCH on `cond_local` to a fail block (guard exit) and continue lowering in
+ * a fresh continuation block. */
+static void lower_guard_branch(LowerCtx *ctx, int cond_local, int line) {
+    int bb_fail = ir_add_block(ctx->func, ctx->arena);
+    int bb_cont = ir_add_block(ctx->func, ctx->arena);
+    IRInst br = make_inst(IR_BRANCH, line);
+    br.cond_local = cond_local;
+    br.true_block = bb_fail;
+    br.false_block = bb_cont;
+    emit_inst(ctx, br);
+    ctx->current_block = bb_fail;
+    ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+    lower_guard_exit(ctx, line);
+    ctx->current_block = bb_cont;
+}
+
+/* Bounds guard: `(usize)index >= size`. The cast mirrors the emitter's
+ * `(size_t)(i)` — a negative signed index wraps to a huge value and fails. */
+static void lower_index_guard(LowerCtx *ctx, Node *node, uint64_t size) {
+    int line = node->loc.line;
+    rewrite_idents(ctx, node->index_expr.index);
+    int il = lower_expr(ctx, node->index_expr.index);
+    if (il < 0) {
+        /* Cannot happen for an integer index; never silently drop a guard. */
+        fprintf(stderr, "compiler bug: auto-guard index at line %d could not be "
+                        "lowered — emitting an unconditional trap\n", line);
+        IRInst tr = make_inst(IR_TRAP, line);
+        tr.trap_msg = "compiler bug: unguardable array index";
+        emit_inst(ctx, tr);
+        int bb_cont = ir_add_block(ctx->func, ctx->arena);
+        ctx->current_block = bb_cont;
+        return;
+    }
+    int cl = create_temp(ctx, ty_usize, line);
+    IRInst cast = make_inst(IR_CAST, line);
+    cast.dest_local = cl;
+    cast.src1_local = il;
+    cast.cast_type = ty_usize;
+    emit_3ac(ctx, cast);
+    int sl = create_temp(ctx, ty_usize, line);
+    IRInst lit = make_inst(IR_LITERAL, line);
+    lit.dest_local = sl;
+    lit.literal_int = (int64_t)size;
+    lit.literal_kind = 0;
+    emit_3ac(ctx, lit);
+    int cond = create_temp(ctx, ty_bool, line);
+    IRInst cmp = make_inst(IR_BINOP, line);
+    cmp.dest_local = cond;
+    cmp.src1_local = cl;
+    cmp.src2_local = sl;
+    cmp.op_token = TOK_GTEQ;
+    emit_3ac(ctx, cmp);
+    lower_guard_branch(ctx, cond, line);
+}
+
+/* Dynamic-index UAF guard: `arr[i].f` after `free(arr[k])` at a variable index
+ * — exit when `i == k` (the element may be the freed one). */
+static void lower_uaf_guard(LowerCtx *ctx, Node *node) {
+    Node *idx_node = node->field.object;               /* NODE_INDEX */
+    Node *arr = idx_node->index_expr.object;           /* NODE_IDENT */
+    Checker *ck = ctx->checker;
+    for (int dfi = 0; dfi < ck->dyn_freed_count; dfi++) {
+        struct DynFreed *df = &ck->dyn_freed[dfi];
+        if (df->array_name_len != (uint32_t)arr->ident.name_len ||
+            memcmp(df->array_name, arr->ident.name, df->array_name_len) != 0 ||
+            df->all_freed)
+            continue;
+        int line = node->loc.line;
+        rewrite_idents(ctx, idx_node->index_expr.index);
+        int il = lower_expr(ctx, idx_node->index_expr.index);
+        rewrite_idents(ctx, df->freed_idx);
+        int fl = lower_expr(ctx, df->freed_idx);
+        if (il < 0 || fl < 0) continue;
+        int cond = create_temp(ctx, ty_bool, line);
+        IRInst cmp = make_inst(IR_BINOP, line);
+        cmp.dest_local = cond;
+        cmp.src1_local = il;
+        cmp.src2_local = fl;
+        cmp.op_token = TOK_EQEQ;
+        emit_3ac(ctx, cmp);
+        lower_guard_branch(ctx, cond, line);
+        break;
+    }
+}
+
+/* Walk an instruction's AST payload and lower a guard for every marked node not
+ * yet guarded. Exhaustive over NodeKind (no default:) so a new kind must be
+ * placed on one side deliberately. */
+static void lower_auto_guards(LowerCtx *ctx, Node *node) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_INDEX: {
+        if (!guard_seen(ctx, node)) {
+            uint64_t ag = checker_auto_guard_size(ctx->checker, node);
+            if (ag > 0 && ag != UINT64_MAX) {
+                guard_mark(ctx, node);
+                lower_index_guard(ctx, node, ag);
+            }
+        }
+        lower_auto_guards(ctx, node->index_expr.object);
+        lower_auto_guards(ctx, node->index_expr.index);
+        break;
+    }
+    case NODE_FIELD:
+        if (!guard_seen(ctx, node) &&
+            checker_auto_guard_size(ctx->checker, node) == UINT64_MAX &&
+            node->field.object->kind == NODE_INDEX &&
+            node->field.object->index_expr.object->kind == NODE_IDENT) {
+            guard_mark(ctx, node);
+            lower_uaf_guard(ctx, node);
+        }
+        lower_auto_guards(ctx, node->field.object);
+        break;
+    case NODE_ASSIGN:
+        lower_auto_guards(ctx, node->assign.target);
+        lower_auto_guards(ctx, node->assign.value);
+        break;
+    case NODE_BINARY:
+        lower_auto_guards(ctx, node->binary.left);
+        lower_auto_guards(ctx, node->binary.right);
+        break;
+    case NODE_UNARY:
+        lower_auto_guards(ctx, node->unary.operand);
+        break;
+    case NODE_CALL:
+        lower_auto_guards(ctx, node->call.callee);
+        for (int i = 0; i < node->call.arg_count; i++)
+            lower_auto_guards(ctx, node->call.args[i]);
+        break;
+    case NODE_ORELSE:
+        lower_auto_guards(ctx, node->orelse.expr);
+        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
+            lower_auto_guards(ctx, node->orelse.fallback);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            lower_auto_guards(ctx, node->intrinsic.args[i]);
+        break;
+    case NODE_TYPECAST:
+        lower_auto_guards(ctx, node->typecast.expr);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            lower_auto_guards(ctx, node->struct_init.fields[i].value);
+        break;
+    case NODE_SLICE:
+        lower_auto_guards(ctx, node->slice.object);
+        lower_auto_guards(ctx, node->slice.start);
+        lower_auto_guards(ctx, node->slice.end);
+        break;
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            lower_auto_guards(ctx, node->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        lower_auto_guards(ctx, node->await_stmt.cond);
+        break;
+    /* Leaves — no sub-expression can carry an index. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    /* Statement / declaration kinds carried by an instruction (NODE_ONCE on an
+     * IR_BRANCH, NODE_ASM on an IR_NOP, ...) own no guarded expression. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
+        break;
+    }
+}
+
 static void lower_stmt(LowerCtx *ctx, Node *node) {
     if (!node) return;
     ZTRACE("LOWER  %-12s @ line %d  (into block %d)",
@@ -3790,7 +4051,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_CRITICAL: {
         IRInst begin = make_inst(IR_CRITICAL_BEGIN, node->loc.line);
         emit_inst(ctx, begin);
+        ctx->critical_depth++;   /* BUG-919: a guard inside must trap, not return */
         lower_stmt(ctx, node->critical.body);
+        ctx->critical_depth--;
         IRInst end = make_inst(IR_CRITICAL_END, node->loc.line);
         emit_inst(ctx, end);
         break;
@@ -3881,6 +4144,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.guarded = ctx.guarded_inline;
+    ctx.guarded_cap = 32;
     ctx.defer_flags = ctx.defer_flags_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
@@ -3994,6 +4259,8 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.loop_exit_block = -1;
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
+    ctx.guarded = ctx.guarded_inline;
+    ctx.guarded_cap = 32;
     ctx.defer_flags = ctx.defer_flags_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;

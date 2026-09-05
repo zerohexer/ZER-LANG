@@ -823,3 +823,35 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+# BUG-919 (2026-09-05): lower_auto_guards is the IR-lowering twin of the emitter's
+# emit_auto_guards (whose 27 rows sit above). It walks an INSTRUCTION'S expression
+# payload for marked NODE_INDEX / NODE_FIELD nodes; statement kinds reach it only as
+# opaque markers (NODE_ONCE on an IR_BRANCH, NODE_ASM on an IR_NOP) whose children
+# are lowered separately, so their fields are intentionally not descended.
+ir_lower.c:lower_auto_guards:NODE_ASM:asm_stmt.inputs
+ir_lower.c:lower_auto_guards:NODE_ASM:asm_stmt.outputs
+ir_lower.c:lower_auto_guards:NODE_BLOCK:block.stmts
+ir_lower.c:lower_auto_guards:NODE_CRITICAL:critical.body
+ir_lower.c:lower_auto_guards:NODE_DEFER:defer.body
+ir_lower.c:lower_auto_guards:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:lower_auto_guards:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:lower_auto_guards:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:lower_auto_guards:NODE_FILE:file.decls
+ir_lower.c:lower_auto_guards:NODE_FOR:for_stmt.body
+ir_lower.c:lower_auto_guards:NODE_FOR:for_stmt.cond
+ir_lower.c:lower_auto_guards:NODE_FOR:for_stmt.init
+ir_lower.c:lower_auto_guards:NODE_FOR:for_stmt.step
+ir_lower.c:lower_auto_guards:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:lower_auto_guards:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:lower_auto_guards:NODE_IF:if_stmt.cond
+ir_lower.c:lower_auto_guards:NODE_IF:if_stmt.else_body
+ir_lower.c:lower_auto_guards:NODE_IF:if_stmt.then_body
+ir_lower.c:lower_auto_guards:NODE_INTERRUPT:interrupt.body
+ir_lower.c:lower_auto_guards:NODE_ONCE:once.body
+ir_lower.c:lower_auto_guards:NODE_RETURN:ret.expr
+ir_lower.c:lower_auto_guards:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:lower_auto_guards:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:lower_auto_guards:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:lower_auto_guards:NODE_VAR_DECL:var_decl.init
+ir_lower.c:lower_auto_guards:NODE_WHILE:while_stmt.body
+ir_lower.c:lower_auto_guards:NODE_WHILE:while_stmt.cond

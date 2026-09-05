@@ -81,3 +81,7 @@ checker.c:    Node *fast[16];
 # IRHandleInfo, which is memcpy-copied per CFG block, so a pointer field would
 # be shared across path-state copies.
 zercheck_ir.c:    int view_alloc_ids[8];
+# BUG-919 (2026-09-05): stack FAST PATH for the per-function set of AST nodes
+# already auto-guarded (guard_mark grows it into the arena by doubling — the
+# Rule #7 shape, not a cap). Same pattern as defer_bodies_inline right above it.
+ir_lower.c:    Node *guarded_inline[32];

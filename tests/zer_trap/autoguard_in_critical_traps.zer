@@ -1,0 +1,10 @@
+// expect-trap
+// BUG-919 / BUG-835: a guard that cannot return (inside @critical) is an IR_TRAP.
+volatile u32 vi = 100;
+u32 g;
+u32 main() {
+    u32[4] arr;
+    u32 i = vi;
+    @critical { arr[i] = 7; }
+    return 0;
+}

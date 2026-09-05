@@ -135,6 +135,11 @@ typedef enum {
 
     /* --- No-op (for IR structure) --- */
     IR_NOP,              /* placeholder — no code emitted */
+    /* BUG-919 (2026-09-05): unconditional runtime trap — a TERMINATOR (no
+     * successor, not a function exit). Emitted by the auto-guard lowering
+     * for a bounds/UAF guard that cannot early-return (a lock is held, inside
+     * @critical, inside a defer body). Emits `_zer_trap(trap_msg, ...)`. */
+    IR_TRAP,
 } IROpKind;
 
 const char *ir_op_name(IROpKind op);  /* op enum -> "CALL"/"ASSIGN"/... (ir_print + --trace) */
@@ -198,6 +203,7 @@ typedef struct IRInst {
 
     /* Intrinsic operand */
     const char *intrinsic_name;
+    const char *trap_msg;         /* IR_TRAP: message literal (no %% chars) */
     uint32_t intrinsic_name_len;
 
     /* Three-address-code operands (Phase 8) */

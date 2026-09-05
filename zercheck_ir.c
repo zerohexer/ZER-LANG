@@ -6197,6 +6197,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         break;
     }
     case IR_DEFER_PUSH:
+    case IR_TRAP:
     case IR_INTRINSIC:
     case IR_BINOP: case IR_LITERAL:
     case IR_ADDR_OF: case IR_DEREF_READ:

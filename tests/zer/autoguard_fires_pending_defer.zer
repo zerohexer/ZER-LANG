@@ -1,0 +1,16 @@
+// BUG-919: a failed guard's early exit is IR_DEFER_FIRE + IR_RETURN, so pending
+// defers (the free of h) still run on that path; in-range here, so the guard
+// passes and the program completes normally (no leak, no double free).
+struct T { u32 v; }
+volatile u32 vi = 2;
+u32 g;
+u32 main() {
+    u32[4] arr;
+    *T h = alloc(T) orelse { return 9; };
+    defer free(h);
+    u32 i = vi;
+    arr[i] = 7;
+    g = arr[i];
+    if (g != 7) { return 1; }
+    return 0;
+}

@@ -3364,13 +3364,33 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 
 **Slice-to-pointer auto-coerce for extern C functions:** When arg is `[]T` and param is `*T` at a call site for a forward-declared function (no body), the checker allows it. The emitter auto-appends `.ptr` (already handled at line ~1265). ZER-to-ZER calls with bodies still require explicit `.ptr`. This is the C interop boundary convenience — `puts("hello")` works without `.ptr` when `puts` is declared as `i32 puts(const *u8 s);`.
 
-## Bounds Auto-Guard (checker.c + emitter.c)
+## Bounds Auto-Guard (checker.c + ir_lower.c) — an IR branch since BUG-919 (2026-09-05)
 
 When array index is not proven by range propagation, compiler auto-inserts `if (idx >= size) { return <zero>; }` as invisible guard. Works for ALL cases: params, globals, volatile, computed.
 
-**Checker:** `mark_auto_guard(c, node, array_size)` stores in `auto_guards` array. `checker_auto_guard_size()` exposed to emitter. Warning emitted so programmer can add explicit guard for zero overhead.
+**Checker:** `mark_auto_guard(c, node, array_size)` stores in `auto_guards` array. `checker_auto_guard_size()` exposed to the lowering. Warning emitted so programmer can add explicit guard for zero overhead.
 
-**Emitter:** `emit_auto_guards(e, node)` walks expression tree, finds auto-guarded NODE_INDEX, emits `if` guard as preceding statement. Called from the IR emitter per IR_ASSIGN whose `expr` may contain an auto-guarded index. Uses `emit_zero_value()` for return type's zero value. Runtime `_zer_bounds_check` stays as belt-and-suspenders backup.
+**Lowering (the ONLY guard emitter):** `ir_lower.c lower_auto_guards(ctx, expr)` runs inside
+`emit_inst` / `emit_3ac` — the single choke point every instruction goes through — on the
+instruction's AST payload, and for every marked NODE_INDEX (bounds / MMIO bound) or
+NODE_FIELD (UINT64_MAX = dynamic-index UAF guard) not yet guarded in this function emits
+`%c = (usize)idx >= N; BRANCH %c -> bb_fail, bb_cont`. `bb_fail` = `DEFER_FIRE; RETURN`
+(bare — `emit_return_null` gives the zero value / None for every return type), or `IR_TRAP`
+when a return cannot leave the scope (`ctx->critical_depth`, `ctx->current_stmt_shared_root`,
+`ctx->defer_body_depth` — the BUG-835 rule). `bb_fail` is tagged `is_orelse_fallback` so the
+exit-state checks skip it. The per-function `guarded` set means a node reached through two
+instructions (IR_INDEX_READ + its parent IR_CALL's AST; an IR_LOCK root + the statement's
+IR_ASSIGN) is guarded at the EARLIEST — so the guard now precedes the lock of an indexed
+shared root, which used to be taken unguarded. `IR_TRAP` is a terminator (no successor, not a
+function exit): `ir_block_is_terminated`, `ir_compute_preds`, `dfs_reachable`,
+`cfg_reaches_fire`, `ir_validate` and the zercheck no-op list all know it.
+
+**Why it moved out of the emitter:** the emitter's `emit_auto_guards` ran only before an
+op-kind-gated subset of instructions, and every kind missing from that gate (IR_INDEX_READ,
+IR_AWAIT, IR_NOP, each in its turn) was a silent OOB; the synthesised C return was invisible
+to zercheck_ir and forced the emitter to keep its own defer stack (the raw-AST defer-body
+emitter, BUG-920). The emitter has no guard code left; `_zer_bounds_check` on slices is
+unchanged (inline trap, single-eval).
 
 ## Auto-Keep, @cstr Auto-Orelse, Provenance Extensions
 

@@ -1,0 +1,14 @@
+// BUG-919: the bounds auto-guard is an IR branch now, lowered at the instruction
+// that carries the index — here the IR_LOCK of `arr[i]` — so it precedes the
+// lock. Before, the emitter inserted the guard only before the IR_ASSIGN, i.e.
+// INSIDE the held lock: the lock itself indexed arr[100] unguarded and the guard
+// then had to TRAP ("inside a held lock"). Pre-fix: exit 133. Now: clean early
+// return, exit 0.
+shared struct S { u32 v; }
+S[4] arr;
+volatile u32 vi = 100;
+u32 main() {
+    u32 i = vi;
+    arr[i].v = 1;
+    return 0;
+}

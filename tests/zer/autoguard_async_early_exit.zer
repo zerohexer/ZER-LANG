@@ -1,0 +1,20 @@
+// BUG-919: the guard's early exit inside an async body terminates the coroutine
+// (state = -1, done) instead of suspending it — g stays 0, poll returns done.
+volatile u32 vi = 100;
+u32 g;
+async void work() {
+    u32[4] arr;
+    u32 i = vi;
+    arr[i] = 1;
+    g = 5;
+    yield;
+    g = 6;
+}
+u32 main() {
+    _zer_async_work t;
+    _zer_async_work_init(&t);
+    u32 n = 0;
+    while (_zer_async_work_poll(&t) == 0) { n += 1; if (n > 10) { return 2; } }
+    if (g != 0) { return 1; }
+    return 0;
+}

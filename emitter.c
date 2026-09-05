@@ -206,6 +206,7 @@ static Type *aggregate_slice_coerce_target(Type *field_type, Type *val_type) {
 
 /* Emit return-null for current function's return type.
  * Handles ?void, ?T struct, ?*T null sentinel, void, and scalar. */
+static void emit_zero_value(Emitter *e, Type *t);
 static void emit_return_null(Emitter *e) {
     Type *ret = e->current_func_ret;
     if (!ret || ret->kind == TYPE_VOID) {
@@ -224,7 +225,12 @@ static void emit_return_null(Emitter *e) {
         emit_opt_null_literal(e, ret);
         emit(e, "; ");
     } else {
-        emit(e, "return 0; ");
+        /* BUG-919: a bare return in a struct/union-returning function needs a
+         * compound literal, not `0` (the auto-guard early exit is now an IR
+         * bare IR_RETURN and reaches here for every return type). */
+        emit(e, "return ");
+        emit_zero_value(e, ret);
+        emit(e, "; ");
     }
 }
 
@@ -11362,6 +11368,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
+    case IR_TRAP: {
+        /* BUG-919: unconditional trap terminator (guard that cannot return). */
+        emit_indent(e);
+        emit(e, "_zer_trap(\"%s\", __FILE__, __LINE__);\n",
+             inst->trap_msg ? inst->trap_msg : "compiler bug: IR_TRAP without message");
+        break;
+    }
+
     case IR_YIELD: {
         if (func->is_async) {
             emit_indent(e);
@@ -13034,20 +13048,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * unmapped; baremetal: silent corruption (entire address space
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
+            /* BUG-919 (2026-09-05): auto-guards are LOWERED INTO THE IR
+             * (ir_lower.c lower_auto_guards, hooked at every instruction
+             * append), so this emitter no longer inserts them. The op-kind
+             * gate that used to live here was the multi-site trap: every
+             * kind missing from it (IR_INDEX_READ, IR_AWAIT, IR_NOP each in
+             * their turn) was a silent OOB. */
             IRInst *ins = &bb->insts[ii];
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
-                 * AST array indexing re-emitted per-poll) and IR_NOP (carries
-                 * NODE_SPAWN args copied in parent thread). Both were
-                 * silently miscompiling unproven arr[i] — emit_auto_guards
-                 * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
             emit_ir_inst(e, ins, func);
         }
 
@@ -13229,18 +13236,8 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
              * emit_ir_inst (no emit_auto_guards). The guard now fires the
              * same way as the regular path; emit_auto_guard_return_body
              * emits `self->_zer_state = -1; return 1;` for async returns. */
+            /* BUG-919: guards are IR instructions now (see the regular path). */
             IRInst *ins = &bb->insts[ii];
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): paired with the regular-path gate
-                 * widening — IR_AWAIT carries the await condition's array
-                 * indexing re-emitted per-poll; IR_NOP carries spawn args. */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
             emit_ir_inst(e, ins, func);
         }
     }

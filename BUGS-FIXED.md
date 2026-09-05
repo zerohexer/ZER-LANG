@@ -121,6 +121,38 @@ branch + temp, exactly as the passthrough route does (a bare type-name ident is 
 the emitter's message no longer names a spawn. Test: `tests/zer/builtin_arg_orelse_return.zer`
 (rejected pre-fix with the false leak; exit 0 now).
 
+### BUG-919 — the bounds / UAF auto-guard is now an IR branch, not emitter-synthesised C
+The checker marks an unprovable fixed-array / MMIO index (and a possibly-freed dynamic-index
+element read); the EMITTER used to synthesise `if ((size_t)i >= N) { <defers>; return 0; }`
+in C before an op-kind-gated subset of instructions. That gate was a multi-site trap on its
+own record (IR_INDEX_READ, IR_AWAIT and IR_NOP were each once missing from it = silent OOB),
+the guard was invisible to the IR, to zercheck_ir and to any pass that reasons about control
+flow, and the emitter-side early return was the one thing that forced the emitter to keep its
+own defer stack and its own raw-AST defer-body emitter (BUG-920).
+
+Now `ir_lower.c lower_auto_guards` runs at THE single choke point every instruction goes
+through (`emit_inst` / `emit_3ac`) and lowers, for every marked node not yet guarded:
+```
+%c = (usize)i >= N ; BRANCH %c -> bb_fail, bb_cont
+bb_fail: DEFER_FIRE; RETURN        (or IR_TRAP when a return cannot leave the scope:
+                                    lock held / @critical / inside a defer body — BUG-835)
+bb_cont: <the guarded instruction>
+```
+`bb_fail` is tagged `is_orelse_fallback` so the leak/join checks skip it, exactly as
+invisible to them as the synthesised return was. New op `IR_TRAP` (a terminator; every
+successor/terminator switch and ir_validate know it). A guarded node is recorded once per
+function so the same NODE_INDEX reached through two instructions (an IR_INDEX_READ and the
+parent IR_CALL that keeps the call AST; an IR_LOCK root and the IR_ASSIGN of the same
+statement) is guarded at the earliest of them — which also fixes an ordering hole: the lock
+of `arr[i].v = 1` on a shared `S[4] arr` indexed arr[100] BEFORE the guard and the guard
+then had to trap inside the held lock (pre-fix exit 133; now a clean early return).
+`emit_return_null` emits the zero compound literal for struct returns (a bare return in a
+struct-returning function used to emit `return 0;`).
+
+Tests: `tests/zer/autoguard_before_shared_lock.zer` (133 → 0), `autoguard_fires_pending_defer`,
+`autoguard_struct_return_zero`, `autoguard_optional_return_none`, `autoguard_async_early_exit`,
+`tests/zer_trap/autoguard_in_critical_traps.zer`; every existing auto-guard test unchanged.
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

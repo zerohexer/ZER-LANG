@@ -30,6 +30,178 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): 12 items + 2 refactors + 2 relaxations
+
+**Read this section ALONE and you can start. Every line below was MEASURED against
+main at `9a0e731b` in CHECKER-ONLY mode (`-o out.c`), not read from the branch.**
+
+```
+fork point   c8e58304   (the SAME base as all nine other survey branches)
+extract      git show origin/claude/loving-davinci-ii7a90:<path>
+BUG NUMBERS  its BUG-913..924 COLLIDE with loving-davinci-r3an9y's BUG-913..924
+             and with the vigilant-tesla set. RENUMBER ON ADOPTION.
+```
+
+**Measured: 55 test files. 18 already rejected by main (skip). 37 accepted — of
+those 6 are `zer_trap` (correct: tracked at runtime, not holes) and ~17 are
+`tests/zer` positives (correct). THE LIVE HOLES ARE 14, plus 4 non-test items
+verified by hand.**
+
+### TAKE FIRST — it extends a class already closed here
+
+**A. The SWITCH ARM is a NINTH value-flow sink.** 4 tests: `switch_arm_literal_oob`,
+`_bool_on_int`, `_float_on_int`, `_negative_into_unsigned`. CLAUDE.md's value-flow
+row lists EIGHT sinks; the switch arm is not one of them, so every rule that rides
+`value_flows_to` — including BUG-927's enum door and BUG-842's negative constant —
+is absent there. Measured, all four accepted on main:
+
+    u32 main(){ u8 b = 44;  switch (b) { 300  => {…} default => {} } return 0; }
+    u32 main(){ u32 x = 4;  switch (x) { -5   => {…} default => {} } return 0; }
+    u32 main(){ u32 x = 4;  switch (x) { true => {…} default => {} } return 0; }
+    u32 main(){ u32 x = 4;  switch (x) { 1.5  => {…} default => {} } return 0; }
+
+while the var-decl spelling of the same value (`u8 b = 300;`, `u32 x = -5;`) is
+correctly rejected. ONE site, and it closes four tests. Cheapest item in the survey.
+
+### ACCEPT-UNSAFE / MISCOMPILE — all verified live
+
+**B. BUG-917 — the 16-root shared-lock cap drops locks SILENTLY.** *(highest
+severity in this branch)* The B1 multi-root collector used a fixed 16-slot array
+and returned early at the cap. MEASURED on main with 18 roots of ONE `shared(rw)`
+type in one statement: **0 diagnostics, 15 `rdlock` calls emitted, `s17`/`s18`
+read with NO lock at all.** A silent data race in emitted code. (Probe with 18
+DISTINCT shared types instead and the deadlock rule masks it — use one type.)
+Their fix: `SharedRootVec` (16 inline + heap doubling) replacing three capped
+arrays, and `tools/emit_audit.sh` gains a REQUIRED-fingerprint section asserting
+the 17th/18th `rdlock` — a gate for emission that must be PRESENT, which we do not
+have. **Take the gate idea as well as the fix.**
+
+**C. BUG-913 — stale VRP in a defer body → an unguarded out-of-bounds store.**
+A defer body is range-checked at the `defer` STATEMENT but RUNS at scope exit,
+after every intervening reassignment:
+
+    u32 main(){ u32[4] arr; u32 i = 0; defer { arr[i] = 7; } i = 100; return 0; }
+
+MEASURED: 0 diagnostics, 0 warnings, and the emitted C contains a bare
+`arr[i] = 7;` with `i = 100` above it and NO bounds check. Their fix widens every
+range live at registration to TOP for the body (keeping `address_taken`; in-body
+guards still narrow) and relies on the existing B4 snapshot to restore the
+pre-defer ranges afterwards. Five `zer_trap` siblings cover the var-decl-init,
+for-init and while-cond positions.
+
+**D. BUG-914 — Level B keeps ONE free site, so a SECOND disjoint free is unguarded.**
+Directly a hole in the guarded-refinement relaxation:
+
+    if (c) { free(h); }
+    if (!c) { if (d) { free(h); } }
+    if (!c) { if (d) { g = h.v; } }      // accepted — the exact path of the 2nd free
+
+`free_block` held the FIRST site, so a use under `!c && d` was judged disjoint from
+it. Their fix makes the slot a JOIN over free sites saturating to
+`IR_FREE_BLOCK_MULTI`, with one sink `ir_note_free_site` at the three free sites,
+the merge joining sites for FREED and MAYBE_FREED, and alias propagation
+saturating. They record the precision cost (a third complementary free) as a
+known over-rejection. Related tests: `guarded_multi_free_alias_uaf`,
+`guarded_freed_both_arms_then_use`.
+
+**E. BUG-915 — `&freed.field` was skipped as a capture.** `free(h); wr(&h.v);`
+compiles clean on main. The UAF walker skipped EVERY `&` operand. Forming `&h.v`
+dereferences a freed pointer to produce an interior pointer into the freed
+allocation. NOTE the interaction with our own rule *"FORMING a reference aliases;
+READING a value does not"* — the fix must check the auto-deref CROSSINGS on the
+operand chain, not treat `&` as opaque. Sibling: `uaf_addr_of_index_through_freed_slice`.
+
+**F. BUG-922 — a MISCOMPILE, and it is the TWO-SPELLINGS class again.**
+
+    i64 v = -(1 << 40);      // var-decl  -> correct
+    i64 a;  a = -(1 << 40);  // assign    -> DIFFERENT VALUE
+
+MEASURED: the two spellings **disagree at runtime**. The post-acceptance retype ran
+at four of the eight value-flow sinks; assignment, orelse fallback, spawn arg and
+global init evaluated the tree in u32, and both AST literal emitters wrote a bare C
+`int`. Their fix: one `retype_accepted_const` at all sinks + compound assign +
+binary operand, one `emit_int_literal` that casts >32-bit literals, and a
+file-scope fold for negative trees. **This is the same shape as BUG-933 — see the
+two-spellings row in CLAUDE.md.**
+
+**G. BUG-916 — spawn arguments emitted from the AST by name without
+`rewrite_idents`,** so an argument naming a SHADOWED inner local bound to the wrong
+variable.
+
+**H. BUG-918 — `orelse` inside a builtin method's args survives lowering.**
+MEASURED: `heap.free_ptr(mh orelse return)` produces a FALSE LEAK on main
+(`handle 'mh' allocated … but never freed`) because zercheck cannot key the free's
+argument; the branch also reports the emitter falling through to a "compiler bug …
+in a spawn argument" message plus a runtime trap. Their fix hoists every `orelse`
+in a builtin's args to a branch + temp.
+
+**I. BUG-923 — `(u3)x` / `(i48)x` do not PARSE** (uN/iN are IDENTs, never a cast
+start). MEASURED: `error: expected ';' after variable declaration`. Their fix moves
+`intn_type_name` to `ast.h` and makes the cast speculative like `(*`. They also
+found that once parseable, all three cast emitters kept the carrier's high bits
+(`(u3)300 == 44`), needing `emit_intn_cast_wrap_open/close` at all three sites —
+i.e. the uN width-wrap multi-site class AGAIN.
+
+**J. BUG-924 — a value-optional global initialised with its bare payload emits
+INVALID C.** MEASURED: `?u32 g = 5;` is accepted by the checker and emits
+`_zer_opt_u32 g = 5;` → `gcc: error: invalid initializer`. A valid ZER program that
+cannot be built.
+
+**K. BUG-921 — OVER-REJECTION: a pure integer-literal EXPRESSION is typed by its
+spelling.** MEASURED: `i8 x = -5 - 1;` and `u16 y = 100 + 27;` are rejected while
+the identical VALUE as a lone literal (`i8 x = -6;`) is accepted. Their fix accepts
+any pure-literal tree whose WIDTH-EXACT fold fits — every literal AND intermediate
+must fit, because `/`, `%` and shifts do not commute with the wrap — and looks
+through one optional level.
+
+### TWO REFACTORS — architectural, and one closes a recorded item
+
+**L. Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
+emitter.** This closes the recorded NON-TEST finding *"`emit_defer_stmt` is the
+last raw-AST STATEMENT emitter (`o51x9p`, ARCHITECTURAL)"*. A defer body used to
+travel as raw AST, emitted by a SECOND statement emitter and analysed by a SECOND
+handle analyzer — so every safety rule had to be re-implemented for defer bodies
+and several were not. The branch lists six measured consequences, incl. a
+MAYBE_FREED silently promoted to FREED (double free), shared reads in a defer-body
+condition taking NO mutex, and `switch`/`do-while`/`@critical` inside a defer body
+trapping at runtime on VALID code. Deletes ~733 lines from `zercheck_ir.c` plus the
+emitter's whole defer stack. **Large; adopt deliberately, not casually.**
+
+**M. Lower bounds/UAF AUTO-GUARDS into the IR as branches; new `IR_TRAP`
+terminator.** The emitter synthesised the guard in C before an op-kind-GATED subset
+of instructions, so every op kind missing from that gate was a silent OOB and the
+guard was invisible to `zercheck_ir`. Moves it to the single choke point every
+instruction passes through. Also fixes an ordering bug: the lock of an indexed
+shared root (`arr[i].v = 1`) now guards BEFORE the lock instead of trapping inside
+a held lock (133 → clean early return).
+
+### TWO RELAXATIONS — both measured, both with the reason NARROWER than the code
+
+**N.** `break`/`continue` targeting a loop nested INSIDE a defer body / `@critical`
+/ `@once` leaves only that loop, never the body — the ban keyed on "inside a
+defer/@critical/@once" alone. A break of a loop that ENCLOSES the block stays
+rejected.
+
+**O.** The same-statement deadlock rule merged a callee's TRANSITIVE shared types
+into every calling statement, so `u32 r = f();` was rejected when `f` touches two
+shared structs sequentially. A statement with no DIRECT shared access takes no
+lock, so nothing can nest around the call. `g.v = f();` stays rejected.
+
+### SUGGESTED ORDER
+
+```
+1. A  switch arm as the 9th value-flow sink   -- one site, four tests, our own class
+2. B  the 16-root lock cap                    -- silent data race, and take their gate
+3. C  stale VRP in defer bodies               -- unguarded OOB store, 0 diagnostics
+4. D  Level B multi-free                      -- a hole in a relaxation we shipped
+5. E  &freed.field                            -- mind our FORMING-vs-READING rule
+6. F  the const-expression retype MISCOMPILE  -- two-spellings class again
+7. J/I/K/H/G  the smaller ones
+8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
+```
+
+---
+
 ## OPEN — BRANCH `loving-davinci-r3an9y` (2026-09-04): 12 holes, 35 live negatives
 
 Surveyed 2026-09-04, measured against main at `225a5b9d`. A DIFFERENT branch family

@@ -157,7 +157,11 @@ through one optional level.
 ### TWO REFACTORS — architectural, and one closes a recorded item
 
 **L. Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
-emitter.** This closes the recorded NON-TEST finding *"`emit_defer_stmt` is the
+emitter.** *(CROSS-BRANCH COMPARISON DONE 2026-09-06 — this SUPERSEDES `o51x9p`'s
+answer to the same defect; see the corrected CLASS 8. o51x9p BANS the constructs
+in +615 lines, ii7a90 SUPPORTS them at net −386, and the Ban Decision Framework
+picks ii7a90 because the ban's only possible justification — emission
+impossibility — is disproved by ii7a90 emitting them.)* This closes the recorded NON-TEST finding *"`emit_defer_stmt` is the
 last raw-AST STATEMENT emitter (`o51x9p`, ARCHITECTURAL)"*. A defer body used to
 travel as raw AST, emitted by a SECOND statement emitter and analysed by a SECOND
 handle analyzer — so every safety rule had to be re-implemented for defer bodies
@@ -698,6 +702,40 @@ Also `multiview_branch_join_uaf`, `struct_init_field_move`.
 
 ---
 
+### CLASS 8 — `defer` BODY: **TWO BRANCHES DISAGREE. TAKE `ii7a90`, NOT `o51x9p`.**
+
+> **CORRECTED 2026-09-06 by a cross-branch comparison. The heading below —
+> "restrictions not enforced" — ENCODES o51x9p's ANSWER, and that answer is the
+> WRONG ONE by ZER's own Ban Decision Framework. Do not implement it.**
+>
+> Both branches found the same defect and fixed it in OPPOSITE directions:
+>
+> | | `o51x9p` | `loving-davinci-ii7a90` |
+> |---|---|---|
+> | verdict | **BAN** switch/`@critical`/`@once`/spawn/label in a defer body | **SUPPORT** them — lower the body into the IR |
+> | tests | 5 `zer_fail` + 1 positive | 6 `zer` POSITIVES |
+> | size | +615 lines, mostly `checker.c` | net **−386** (+1448 / −1834) |
+>
+> **What main actually does (measured 2026-09-06):** `defer { switch (k) {…} }`
+> compiles with **0 diagnostics**, emits a `compiler bug: unsupported stmt kind in
+> defer` marker, and **traps at runtime (exit 133) on valid code.** So this is not
+> an accept-unsafe hole and not a missing ban — it is a BROKEN EMISSION.
+>
+> **Why ii7a90 wins.** The Ban Decision Framework permits a ban only for a hardware
+> constraint, an EMISSION IMPOSSIBILITY, a missing runtime, or a missing type
+> system. o51x9p's ban implicitly claims the second — and ii7a90 **disproves it by
+> emitting the construct correctly**. None of the other three applies, so rule 5
+> governs: *track, don't ban*. CLAUDE.md also says outright: *"If the user pushes
+> back on a ban, they're usually right — look for a tracking solution."*
+>
+> Adopting o51x9p here would have turned a fixable emitter gap into a permanent
+> language restriction, and cost 615 lines to do it.
+>
+> **Keep from o51x9p:** nothing on this class. Its 5 negatives assert the ban and
+> must NOT be added — they would pin the wrong behaviour.
+
+<details><summary>original entry (o51x9p's framing — kept for its reproducers only)</summary>
+
 ### CLASS 8 — `defer` BODY RESTRICTIONS NOT ENFORCED (MEDIUM) — `o51x9p`
 
 5 tests. `spawn` inside a defer body is accepted:
@@ -708,6 +746,8 @@ Also `multiview_branch_join_uaf`, `struct_init_field_move`.
 Forms: `defer_body_spawn`, `_critical`, `_label`, `_once`, `_switch`.
 
 ---
+
+</details>
 
 ### CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`
 

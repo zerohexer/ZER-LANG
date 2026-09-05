@@ -370,6 +370,9 @@ void checker_pop_module_scope(Checker *c); /* pop module scope */
 
 /* returns the resolved Type* for an expression node (set during check) */
 Type *checker_get_type(Checker *c, Node *node);
+/* Fold a pure integer-literal TREE flowing into an integer / ?integer target
+ * (emitter: file-scope initializers must be constant expressions). */
+bool checker_const_int_tree_value(Node *value, Type *target, int64_t *out);
 
 /* Sets the resolved Type* for an AST node in the typemap.
  * Used by IR lowering to annotate synthesized AST nodes (e.g., comparison

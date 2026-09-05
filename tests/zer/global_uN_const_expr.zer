@@ -1,0 +1,15 @@
+// A global uN initialized from a constant expression (2026-09-05, LIT-2).
+// The former tripwire `tests/zer_fail/global_uN_arith_narrow.zer` said: if
+// `u21 g = 1000 + 500;` ever compiles, the global emit path must mask. It
+// does not need to: the fold is WIDTH-EXACT (every intermediate fits u21), so
+// the folded constant is in range by construction — no over-width value can
+// reach the global. The over-width tree is still rejected (same file, new shape).
+u21 g = 1000 + 500;
+u3  h = 3 + 4;
+i5  m = -15 - 1;
+u32 main() {
+    if (g != 1500) { return 1; }
+    if (h != 7) { return 2; }
+    if (m != -16) { return 3; }
+    return 0;
+}

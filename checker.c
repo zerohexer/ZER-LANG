@@ -1004,12 +1004,149 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
     return false;
 }
 
+static bool is_pure_int_literal_expr(Node *e);
+
+/* LIT-2 (2026-09-05): the [lo, hi] range of an integer destination as int64
+ * plus its bit width, for the width-exact literal-expression fold below.
+ * Types whose range exceeds int64 (u64, 64-bit usize, uN/iN at >= 64 bits) are
+ * clamped to the int64-representable part — the fold is CONSERVATIVE: a value
+ * it cannot represent is rejected, never accepted. False for non-integers. */
+static bool int_type_fold_bounds(Type *effective, int64_t *lo, int64_t *hi,
+                                 uint32_t *bits) {
+    switch (type_dispatch_kind(effective)) {
+    case TYPE_U8:  *lo = 0; *hi = 255;         *bits = 8;  return true;
+    case TYPE_U16: *lo = 0; *hi = 65535;       *bits = 16; return true;
+    case TYPE_U32: *lo = 0; *hi = 0xFFFFFFFFLL; *bits = 32; return true;
+    case TYPE_U64: *lo = 0; *hi = INT64_MAX;   *bits = 64; return true;
+    case TYPE_USIZE:
+        if (zer_target_ptr_bits == 64) { *lo = 0; *hi = INT64_MAX; *bits = 64; }
+        else { *lo = 0; *hi = 0xFFFFFFFFLL; *bits = 32; }
+        return true;
+    case TYPE_I8:  *lo = -128;       *hi = 127;        *bits = 8;  return true;
+    case TYPE_I16: *lo = -32768;     *hi = 32767;      *bits = 16; return true;
+    case TYPE_I32: *lo = -2147483648LL; *hi = 2147483647LL; *bits = 32; return true;
+    case TYPE_I64: *lo = INT64_MIN;  *hi = INT64_MAX;  *bits = 64; return true;
+    case TYPE_UINT: {
+        uint32_t b = effective->intn.bits;
+        if (b >= 64) { *lo = 0; *hi = INT64_MAX; *bits = 64; return true; }
+        *lo = 0; *hi = (int64_t)((1ULL << b) - 1ULL); *bits = b; return true;
+    }
+    case TYPE_SINT: {
+        uint32_t b = effective->intn.bits;
+        if (b >= 64) { *lo = INT64_MIN; *hi = INT64_MAX; *bits = 64; return true; }
+        *hi = (int64_t)((1ULL << (b - 1)) - 1ULL); *lo = -*hi - 1; *bits = b;
+        return true;
+    }
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
+    case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+    case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM:
+    case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+    case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+    case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+        return false;
+    }
+    return false;
+}
+
+/* LIT-2: fold a pure integer-literal expression IN THE DESTINATION WIDTH.
+ *
+ * Why not `eval_const_expr` + "does the result fit"? Because after acceptance
+ * the tree is RETYPED to the destination (LIT-1, `retype_const_int_to_target`)
+ * and evaluated at runtime in that width with wrapping arithmetic. A fold in
+ * int64 agrees with that evaluation only when NO INTERMEDIATE wraps:
+ * `i32 x = (2000000000 + 2000000000) / 2` folds to 2000000000 (fits) but runs
+ * as (-294967296) / 2 in i32. Division, remainder and shifts do not commute
+ * with the wrap, so the only sound rule is the one C compilers apply to
+ * constant expressions: every literal and every intermediate must fit the
+ * destination range, or the expression is rejected (the user widens it).
+ * Shifts follow ZER's `_zer_shl/_zer_shr` contract but are rejected rather
+ * than folded to 0 when the count reaches the width; a negative left-shift
+ * operand is rejected. `~` is masked to the width for unsigned destinations
+ * (that is what the emitted C computes) and is plain complement for signed. */
+static bool fold_literal_in_width(Node *e, int64_t lo, int64_t hi, uint32_t bits,
+                                  int64_t *out, int depth) {
+    if (!e || depth > 256) return false;
+    int64_t v;
+    if (e->kind == NODE_INT_LIT) {
+        if (e->int_lit.value > (uint64_t)hi) return false;
+        v = (int64_t)e->int_lit.value;
+    } else if (e->kind == NODE_UNARY) {
+        int64_t a;
+        if (!fold_literal_in_width(e->unary.operand, lo, hi, bits, &a, depth + 1))
+            return false;
+        if (e->unary.op == TOK_MINUS) {
+            if (a == INT64_MIN) return false;
+            v = -a;
+        } else if (e->unary.op == TOK_TILDE) {
+            if (lo == 0 && bits < 64) v = (int64_t)(((uint64_t)~a) & ((1ULL << bits) - 1ULL));
+            else v = ~a;
+        } else if (e->unary.op == TOK_PLUS) {
+            v = a;
+        } else {
+            return false;
+        }
+    } else if (e->kind == NODE_BINARY) {
+        int64_t l, r;
+        if (!fold_literal_in_width(e->binary.left, lo, hi, bits, &l, depth + 1)) return false;
+        if (!fold_literal_in_width(e->binary.right, lo, hi, bits, &r, depth + 1)) return false;
+        switch (e->binary.op) {  /* op-switch — excluded from walker-default audit */
+        case TOK_PLUS:  if (__builtin_add_overflow(l, r, &v)) return false; break;
+        case TOK_MINUS: if (__builtin_sub_overflow(l, r, &v)) return false; break;
+        case TOK_STAR:  if (__builtin_mul_overflow(l, r, &v)) return false; break;
+        case TOK_SLASH:
+            if (r == 0 || (l == INT64_MIN && r == -1)) return false;
+            v = l / r; break;
+        case TOK_PERCENT:
+            if (r == 0 || (l == INT64_MIN && r == -1)) return false;
+            v = l % r; break;
+        case TOK_LSHIFT:
+            if (r < 0 || r >= (int64_t)bits || l < 0) return false;
+            if (l != 0 && l > (hi >> r)) return false;
+            v = l << r; break;
+        case TOK_RSHIFT:
+            if (r < 0 || r >= (int64_t)bits) return false;
+            v = l >> r; break;
+        case TOK_AMP:   v = l & r; break;
+        case TOK_PIPE:  v = l | r; break;
+        case TOK_CARET: v = l ^ r; break;
+        default: return false;
+        }
+    } else {
+        return false;
+    }
+    if (v < lo || v > hi) return false;
+    *out = v;
+    return true;
+}
+
+/* LIT-2: does the pure integer-literal expression `e` fit the integer
+ * destination `effective` under the width-exact fold? */
+static bool pure_literal_expr_fits(Node *e, Type *effective) {
+    int64_t lo, hi, v;
+    uint32_t bits;
+    if (!is_pure_int_literal_expr(e)) return false;
+    if (!int_type_fold_bounds(effective, &lo, &hi, &bits)) return false;
+    return fold_literal_in_width(e, lo, hi, bits, &v, 0);
+}
+
 /* Check if an expression node is a literal that can be assigned to target type.
- * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
+ * Integer literals fit any integer. Float literals fit any float. null fits ?T.
+ *
+ * LIT-2 (2026-09-05): the integer branches look through ONE optional level —
+ * `?i8 y = 5;` / `?i32 x = -5;` / `return 3 - 10;` from a `?i32` function are
+ * value-into-optional writes whose only question is "does the constant fit the
+ * payload width". `int_retype_target` already returns the payload type for the
+ * retype, so the emitter's optional wrap sees a payload-width constant. */
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
+    if (effective && type_dispatch_kind(effective) == TYPE_OPTIONAL &&
+        expr->kind != NODE_NULL_LIT) {
+        Type *inner = type_unwrap_distinct(effective->optional.inner);
+        if (inner && (type_is_integer(inner) || type_is_float(inner))) effective = inner;
+    }
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
         /* range check: literal must fit in target type.
          * SAFETY: zer_literal_fits_u in src/safety/arith_rules.c (M08).
@@ -1109,6 +1246,16 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         if (expr->unary.operand->kind == NODE_FLOAT_LIT && type_is_float(effective))
             return true;
     }
+    /* LIT-2: a pure integer-literal EXPRESSION — `-5 - 1`, `100 + 27`,
+     * `1 << 12`, `-(1 << 15)`, `~0xF0`. Before this the tree was typed by its
+     * default literal width (u32) and rejected into every other integer
+     * destination ("cannot initialize 'x' of type 'i32' with 'u32'") while the
+     * single literal `-6` was accepted — the rule was about SPELLING, not value.
+     * Accepted only when the width-exact fold succeeds, so the retyped runtime
+     * evaluation is guaranteed to produce the folded value. */
+    if (type_is_integer(effective) && expr->kind != NODE_INT_LIT &&
+        pure_literal_expr_fits(expr, effective))
+        return true;
     return false;
 }
 
@@ -1176,6 +1323,43 @@ static Type *int_retype_target(Type *t) {
         if (inner && type_is_integer(inner)) return e->optional.inner;
     }
     return NULL;
+}
+
+/* LIT-1/LIT-2: THE post-acceptance retype — call at EVERY sink right after
+ * `value_flows_to` (or the binary-operand `is_literal_compatible`) accepted a
+ * pure integer-literal tree into `target`, so the tree is evaluated in the
+ * destination width. Until 2026-09-05 this was written out at four of the
+ * eight value-flow sinks (var-decl, call arg, return, struct-init field) and
+ * MISSING at the other four (assignment, orelse fallback, spawn arg, global
+ * init), so `i64 a; a = -(1 << 40);` computed `1 << 40` in the literal's
+ * default u32 (= 0 under ZER's shift rule) and stored 0, while the var-decl
+ * spelling `i64 a = -(1 << 40);` one line away stored -2^40 — no diagnostic.
+ * The multi-site shape CLAUDE.md names; one helper now, eight callers. */
+static void retype_accepted_const(Checker *c, Node *value, Type *target) {
+    if (!value || !is_pure_int_literal_expr(value)) return;
+    Type *rt = int_retype_target(target);
+    if (rt) retype_const_int_to_target(c, value, rt);
+}
+
+/* PUBLIC (emitter, global initializers): is `value` a pure integer-literal
+ * TREE (not a lone literal) flowing into an integer / ?integer `target`, and
+ * what does it fold to? A file-scope initializer must be a C constant
+ * expression, and the tree's operators emit as statement-expression macros
+ * (`_zer_shl`), which GCC refuses at file scope — so the emitter folds the
+ * tree to one constant instead. The int64 fold is exact for every accepted
+ * tree (LIT-2's width-exact fit implies no intermediate overflowed), and for a
+ * same-type tree (`u32 g = 1 << 40;`) the cast to the destination width
+ * reproduces ZER's wrap / shift-to-zero semantics (every shifted-out multiple
+ * of 2^32 truncates to 0). False when the tree cannot be folded, in which case
+ * the caller emits the expression as before. */
+bool checker_const_int_tree_value(Node *value, Type *target, int64_t *out) {
+    if (!value || value->kind == NODE_INT_LIT) return false;
+    if (!is_pure_int_literal_expr(value)) return false;
+    if (!int_retype_target(target)) return false;
+    int64_t v = eval_const_expr(value);
+    if (v == CONST_EVAL_FAIL) return false;
+    *out = v;
+    return true;
 }
 
 /* eval_const_expr() is defined in ast.h (shared with emitter) */
@@ -1278,7 +1462,38 @@ static bool value_flows_to(Node *value, Type *vt, Type *target) {
  * its generic message. */
 static bool report_negative_const_flow(Checker *c, Node *value, Type *target,
                                        int line, const char *what) {
-    if (!const_negative_into_unsigned(value, target)) return false;
+    if (!const_negative_into_unsigned(value, target)) {
+        /* LIT-2: a pure literal EXPRESSION that failed the width-exact fold.
+         * The generic wording would print the literal's default type ('u32'),
+         * which names nothing the user wrote. Say what the constant is and
+         * which width it missed. Only integer / ?integer destinations. */
+        Type *rt = int_retype_target(target);
+        if (!rt || !value || value->kind == NODE_INT_LIT ||
+            !is_pure_int_literal_expr(value))
+            return false;
+        char tn[96];
+        snprintf(tn, sizeof(tn), "%s", type_name(rt));
+        int64_t folded = eval_const_expr(value);
+        int64_t lo = 0, hi = 0;
+        uint32_t bits = 0;
+        bool have_bounds = int_type_fold_bounds(type_unwrap_distinct(rt), &lo, &hi, &bits);
+        if (folded != CONST_EVAL_FAIL && have_bounds && folded >= lo && folded <= hi)
+            checker_error(c, line,
+                "%s: constant expression folds to %lld but an intermediate value "
+                "does not fit '%s' — every literal and intermediate must fit the "
+                "destination width; widen the operands or the destination",
+                what, (long long)folded, tn);
+        else if (folded != CONST_EVAL_FAIL)
+            checker_error(c, line,
+                "%s: constant expression evaluates to %lld, which does not fit '%s'",
+                what, (long long)folded, tn);
+        else
+            checker_error(c, line,
+                "%s: constant expression cannot be evaluated in '%s' "
+                "(overflow, division by zero, or a shift by the full width)",
+                what, tn);
+        return true;
+    }
     long long v = (long long)eval_const_expr(value);
     /* type_name() rotates only TWO static buffers — capture before formatting
      * (CLAUDE.md "type_name() uses 2-buffer rotation"). */
@@ -3178,11 +3393,10 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                             "field '.%.*s' expects '%s', got '%s'",
                             (int)df->name_len, df->name,
                             type_name(ft), type_name(vt));
-                } else if (df->value && is_pure_int_literal_expr(df->value)) {
+                } else {
                     /* LIT-1: `.baud = -7` into a 64-bit field must compute -7 in
                      * the field's width, not the literal's default u32. */
-                    Type *rt = int_retype_target(ft);
-                    if (rt) retype_const_int_to_target(c, df->value, rt);
+                    retype_accepted_const(c, df->value, ft);
                 }
                 break;
             }
@@ -3900,24 +4114,8 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
 }
 
 /* RF3: resolve_type stores result in typemap so emitter can read via checker_get_type */
-/* Path C front door: parse an arbitrary-width int type name like "u21"/"i48".
- * Sets *out_bits (1..128) and *out_signed; returns false if `name` is not a
- * uN/iN spelling. u8/16/32/64 and i8/16/32/64 are keywords (TOK_U8 …) and never
- * reach here, so this only fires for the non-standard widths. */
-static bool parse_intn_width(const char *name, uint32_t len,
-                             uint32_t *out_bits, bool *out_signed) {
-    if (len < 2 || len > 4) return false;
-    if (name[0] != 'u' && name[0] != 'i') return false;
-    uint32_t bits = 0;
-    for (uint32_t i = 1; i < len; i++) {
-        if (name[i] < '0' || name[i] > '9') return false;
-        bits = bits * 10u + (uint32_t)(name[i] - '0');
-    }
-    if (bits < 1 || bits > 128) return false;
-    *out_bits = bits;
-    *out_signed = (name[0] == 'i');
-    return true;
-}
+/* Path C front door: the uN/iN name predicate is `intn_type_name` (ast.h),
+ * shared with the parser's cast-start detection. */
 
 static Type *resolve_type(Checker *c, TypeNode *tn) {
     if (!tn) return ty_void;
@@ -4142,7 +4340,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (!sym) {
             /* Path C: arbitrary-width integer u<N>/i<N> (e.g. u21, i48). */
             uint32_t _nb; bool _sgn;
-            if (parse_intn_width(tn->named.name, (uint32_t)tn->named.name_len, &_nb, &_sgn)) {
+            if (intn_type_name(tn->named.name, (uint32_t)tn->named.name_len, &_nb, &_sgn)) {
                 return _sgn ? type_sint(c->arena, _nb) : type_uint(c->arena, _nb);
             }
             checker_error(c, tn->loc.line, "undefined type '%.*s'",
@@ -5549,17 +5747,11 @@ static Type *check_expr(Checker *c, Node *node) {
          * integer-literal operands only; non-integer sides yield NULL → no-op. */
         if (is_literal_compatible(node->binary.left, right)) {
             left = right;
-            if (is_pure_int_literal_expr(node->binary.left)) {
-                Type *rt = int_retype_target(right);
-                if (rt) retype_const_int_to_target(c, node->binary.left, rt);
-            }
+            retype_accepted_const(c, node->binary.left, right);
         }
         if (is_literal_compatible(node->binary.right, left)) {
             right = left;
-            if (is_pure_int_literal_expr(node->binary.right)) {
-                Type *rt = int_retype_target(left);
-                if (rt) retype_const_int_to_target(c, node->binary.right, rt);
-            }
+            retype_accepted_const(c, node->binary.right, left);
         }
 
         switch (node->binary.op) {
@@ -7482,6 +7674,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot assign '%s' to '%s'",
                         type_name(value), type_name(target));
+            } else {
+                retype_accepted_const(c, node->assign.value, target);
             }
             /* BUG-373: integer literal range check on assignment */
             if (node->assign.value->kind == NODE_INT_LIT &&
@@ -7586,8 +7780,16 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* reject narrowing: value wider than target (unless value is a literal)
              * SAFETY: zer_narrowing_valid in src/safety/arith_rules.c (M07) */
-            if (type_is_numeric(target) && type_is_numeric(value) &&
-                !is_literal_compatible(node->assign.value, target)) {
+            bool rhs_lit_fits = is_literal_compatible(node->assign.value, target);
+            /* LIT-2 (the ninth sink): a pure-literal RHS that fits is evaluated in
+             * the TARGET's width, exactly as `s = s + (1 << 40)` is by binary
+             * promotion — `u64 s; s += 1 << 40;` computed the shift in the
+             * literal's default u32 (= 0) and added nothing. A shift COUNT is
+             * left alone: it names a bit position, not a value of the target. */
+            if (rhs_lit_fits && node->assign.op != TOK_LSHIFTEQ &&
+                node->assign.op != TOK_RSHIFTEQ)
+                retype_accepted_const(c, node->assign.value, target);
+            if (type_is_numeric(target) && type_is_numeric(value) && !rhs_lit_fits) {
                 int tw = type_width(target);
                 int vw = type_width(value);
                 /* compound assignment has no @truncate wrapping, so has_truncate=0 */
@@ -8676,11 +8878,10 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line,
                                 "argument %u: expected '%s', got '%s'",
                                 i + 1, type_name(param), type_name(arg));
-                    } else if (is_pure_int_literal_expr(node->call.args[i])) {
+                    } else {
                         /* LIT-1: `f(-3)` where the param is i64 (or ?i64) must
                          * pass -3 computed in i64, not the literal's default u32. */
-                        Type *rt = int_retype_target(param);
-                        if (rt) retype_const_int_to_target(c, node->call.args[i], rt);
+                        retype_accepted_const(c, node->call.args[i], param);
                     }
                 }
 
@@ -10067,6 +10268,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "orelse fallback type '%s' doesn't match '%s'",
                             type_name(fallback), type_name(unwrapped));
+                } else {
+                    retype_accepted_const(c, node->orelse.fallback, unwrapped);
                 }
                 result = unwrapped;
             }
@@ -13913,13 +14116,12 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)node->var_decl.name_len, node->var_decl.name,
                         type_name(type), type_name(init_type));
                 }
-            } else if (is_pure_int_literal_expr(node->var_decl.init)) {
+            } else {
                 /* LIT-1: the initializer is accepted and is a pure integer-literal
                  * constant — retype it to the declared width (or the inner width of
                  * a ?integer) so the value (and any negation / arithmetic) is
                  * computed in that width, not in the literal's default u32. */
-                Type *rt = int_retype_target(type);
-                if (rt) retype_const_int_to_target(c, node->var_decl.init, rt);
+                retype_accepted_const(c, node->var_decl.init, type);
             }
             /* cross-platform portability: @ptrtoint to fixed-width type is fragile.
              * u32 x = @ptrtoint(ptr) works on 32-bit but loses bits on 64-bit.
@@ -15202,7 +15404,35 @@ static void check_stmt(Checker *c, Node *node) {
             /* check match values — skip for enum/union dot syntax (.variant) */
             if (!arm->is_enum_dot) {
                 for (int j = 0; j < arm->value_count; j++) {
-                    check_expr(c, arm->values[j]);
+                    Type *avt = check_expr(c, arm->values[j]);
+                    /* BUG-925: an INTEGER switch's arm value is a value flowing
+                     * into the operand's type — the same question every other
+                     * sink asks with `value_flows_to`, and the one place it was
+                     * never asked. `u32 u; switch (u) { -1 => …}` matched
+                     * 4294967295, `u8 b; … 300 =>` / `1.5 =>` / `true =>` were
+                     * accepted, and `i64 y; … -6 =>` never matched (the arm was
+                     * compared in the literal's default u32, the LIT-1 shape).
+                     * Accepted values are retyped to the operand's width. */
+                    if (expr_eff && type_is_integer(expr_eff) && avt &&
+                        arm->values[j]) {
+                        Node *av = arm->values[j];
+                        if (!value_flows_to(av, avt, expr)) {
+                            if (av->kind == NODE_INT_LIT)
+                                checker_error(c, av->loc.line,
+                                    "switch arm value %llu does not fit the switch "
+                                    "operand type '%s' — this arm could never match",
+                                    (unsigned long long)av->int_lit.value,
+                                    type_name(expr));
+                            else if (!report_negative_const_flow(c, av, expr,
+                                                                 av->loc.line, "switch arm"))
+                                checker_error(c, av->loc.line,
+                                    "switch arm value of type '%s' cannot match a "
+                                    "switch operand of type '%s'",
+                                    type_name(avt), type_name(expr));
+                        } else {
+                            retype_accepted_const(c, av, expr);
+                        }
+                    }
                 }
             }
 
@@ -16165,11 +16395,10 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "return type '%s' doesn't match function return type '%s'",
                             type_name(ret_type), type_name(c->current_func_ret));
-                } else if (is_pure_int_literal_expr(node->ret.expr)) {
+                } else {
                     /* LIT-1: `return -3;` from an i64 (or ?i64) function must
                      * compute in i64, not the literal's default u32. */
-                    Type *rt = int_retype_target(c->current_func_ret);
-                    if (rt) retype_const_int_to_target(c, node->ret.expr, rt);
+                    retype_accepted_const(c, node->ret.expr, c->current_func_ret);
                 }
             }
         } else {
@@ -17716,6 +17945,8 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "spawn argument %d: expected '%s', got '%s'",
                             i + 1, type_name(param_type), type_name(arg_type));
+                } else {
+                    retype_accepted_const(c, node->spawn_stmt.args[i], param_type);
                 }
             }
         }
@@ -21978,6 +22209,8 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                         "cannot initialize '%.*s' of type '%s' with '%s'",
                         (int)decl->var_decl.name_len, decl->var_decl.name,
                         type_name(type), type_name(init));
+            } else {
+                retype_accepted_const(c, decl->var_decl.init, type);
             }
             /* BUG-911: a global whose initializer NAMES another global was emitted
              * VERBATIM, and C refuses that at file scope:

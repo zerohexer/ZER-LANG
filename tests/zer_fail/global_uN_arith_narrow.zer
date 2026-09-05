@@ -1,15 +1,16 @@
-// EXPECTED: compile error
-// A global uN initialized with integer arithmetic is rejected: `1000 + 500` is
-// typed u32, and u32 -> u21 is a narrowing conversion. This narrowing rejection
-// (together with the "does not fit" check on over-width literals and C's
-// constant-initializer requirement, which blocks uN-operand arithmetic) is what
-// makes width-masking unnecessary at global scope: no over-width value can reach
-// a global uN in the first place. emit_intn_mask therefore runs only on the
-// function-body paths (IR_BINOP / IR_UNOP), where real uN arithmetic occurs.
+// expect-error: does not fit 'u21'
+// A global uN initialized with a constant expression that does NOT fit the
+// width is rejected. (Until 2026-09-05 this file rejected `1000 + 500` because
+// literal arithmetic was u32-typed and u32 -> u21 was a narrowing; LIT-2 now
+// types a pure-literal tree by its destination and folds it WIDTH-EXACTLY, so
+// `u21 g = 1000 + 500;` is accepted — see tests/zer/global_uN_const_expr.zer —
+// and only an over-width result is refused.)
 //
-// TRIPWIRE: if this ever COMPILES (someone relaxes the uN narrowing/const-fold
-// rules), the global emit path must mask the result to the width at that time —
-// otherwise the global would hold an unmasked over-width value. Do not delete
-// this test without adding that mask.
-u21 g = 1000 + 500;
+// TRIPWIRE (unchanged in spirit): the global emit path does NOT mask uN
+// initializers. That is sound ONLY because every accepted constant expression
+// fits the width by construction (the width-exact fold rejects anything else).
+// If this file ever COMPILES, that guarantee is gone and the global emit path
+// must mask the result to the width. Do not delete this test without adding
+// that mask.
+u21 g = 2097151 + 1;
 u32 main() { return 0; }

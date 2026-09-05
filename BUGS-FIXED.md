@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-05 — BUG-913..920: six holes, one over-rejection, and two "move it into the IR" refactors from a fresh full-codebase audit
+## Session 2026-09-05 — BUG-913..924: six holes, one over-rejection, two "move it into the IR" refactors, then the constant-expression class (three miscompiles behind one over-rejection)
 
 All were found by reading the IR pipeline end to end and probing the seams between
 passes, not by any gate. Each hole shipped a wrong program with NO diagnostic; each has a test
@@ -232,6 +232,88 @@ when its block is. `check_block_lock_ordering` now recomputes the statement's DI
 (`shared_collect_direct_only`) and skips the error when it is empty. `g.v = f();` — S held
 around f's lock of T — stays rejected (`tests/zer_fail/deadlock_call_under_lock.zer`);
 all eleven existing deadlock negatives unchanged. Test: `tests/zer/deadlock_rule_bare_call_ok.zer`.
+
+### BUG-921 — a pure integer-literal EXPRESSION was typed by its spelling, not its value (over-rejection at every sink)
+`i32 x = -5;` compiled; `i32 x = -5 - 1;` did not ("cannot initialize 'x' of type 'i32' with
+'u32'"). So did `i8 g = 100 + 27;`, `u8 w = 255 - 0;`, `u16 s = 1 << 12;`, `u3 t = 3 + 4;`,
+`?i8 y = 5;`, `?i32 o = -5;`, `?f32 r = 1.5;`, `return 3 - 10;` from an `i32` function and
+`take(-3)` into a `?i8` parameter. `is_literal_compatible` knew exactly two shapes — a bare
+literal and `-literal` — and never looked through `?T`; everything else carried the literals'
+default u32 into the type-mismatch chain.
+
+**Fix (LIT-2).** `is_literal_compatible` accepts any pure-literal tree (`is_pure_int_literal_expr`)
+whose **width-exact** fold fits the destination (`fold_literal_in_width`: every literal and every
+intermediate must fit the destination range; shifts by the full width and negative left operands are
+rejected; `~` is masked to the width for unsigned targets), and looks through one optional level for
+integer / float payloads. Width-exact rather than "fold in int64 then check the result" because after
+acceptance the tree is RETYPED and evaluated in the destination width with wrapping arithmetic, and
+`/`, `%` and shifts do not commute with the wrap: `i32 x = (2000000000 + 2000000000) / 2` folds to
+2e9 but would run as (-294967296) / 2. `report_negative_const_flow` gained the matching diagnosis
+("evaluates to 128, which does not fit 'i8'" / "an intermediate value does not fit"), so the message
+names the constant rather than the literal's default type. Corpus cost of the tightened side: zero
+(nothing that compiled before is rejected now). Tests: `tests/zer/const_expr_literal_fits_all_sinks.zer`
+(21 shapes across all eight sinks, rejected 20 ways pre-fix), `tests/zer_fail/const_expr_{misfit_i8,
+misfit_u3,negative_into_u8,shift_full_width,intermediate_overflow}.zer`.
+
+### BUG-922 — the retype ran at FOUR of the eight value-flow sinks, and the AST literal emitter dropped the width anyway
+Found by probing BUG-921's relaxation with 64-bit destinations, but pre-existing: `i64 a = 0;
+a = -(1 << 40);` stored **0** while `i64 a = -(1 << 40);` stored -2^40; `u64 c; c = 100000 * 100000;`
+stored 1410065408. No diagnostic. Two defects stacked: (1) `retype_const_int_to_target` was written out
+at var-decl / call-arg / return / struct-init and MISSING at assignment, orelse fallback, spawn arg and
+global init — the multi-site shape CLAUDE.md names, one step past the `value_flows_to` unification
+(BUG-842 unified the DECISION, not the post-acceptance retype); (2) even where it ran, the two AST
+literal emitters (`emit_expr` / `emit_rewritten_node`, identical copies) wrote a bare `1`, a C `int`,
+so `_zer_shl(1, 40)` measured `sizeof(int)` and the product wrapped at 32 bits. The IR var-decl path
+was right only because IR_LITERAL emits a cast per temp.
+
+**Fix.** ONE helper `retype_accepted_const(c, value, target)` called at all eight sinks — nine,
+counting compound assignment (`u64 s; s += 1 << 40;` added 0; the RHS is now evaluated in the
+target's width as `s = s + (1 << 40)` already was, shift COUNTS excepted); ONE `emit_int_literal`
+for both AST paths, casting a literal the checker typed wider than 32 bits (`((int64_t)1ULL)`). Globals: a negative pure-literal tree (the non-negative ones were already folded
+in place by the BUG-911 fold) now folds to one constant via `checker_const_int_tree_value` instead of
+emitting `_zer_shl` at file scope, where GCC refuses a statement expression. Test:
+`tests/zer/const_expr_64bit_all_sinks.zer` (exit 6 pre-fix).
+
+### BUG-923 — `(u3)x` did not parse, and once it did, the cast kept the carrier's high bits
+uN/iN names are IDENTs, not keywords, so the parser's cast-start switch never saw them: `(u3)x`
+parsed as a parenthesized variable `u3` followed by `x` — "expected ';'". Adding the cast start
+(`intn_type_name` moved from checker.c to ast.h and shared; speculative like `(*`, so a variable
+actually named `u3` still parses in parentheses) exposed the second half: all three cast emission
+sites wrote `(uint8_t)x`, so `(u3)300` read back as **44** — a u3 holding a value outside its range,
+the invariant `emit_intn_mask` exists to keep. `@truncate(u3, x)` had been masked since BUG-864;
+the cast spelling was not. **Fix:** `emit_intn_cast_wrap_open/close`, a pure-expression wrap
+(legal in a global initializer, unlike @truncate's statement-expression form) at `emit_expr`
+NODE_TYPECAST, `emit_rewritten_node` NODE_TYPECAST and `IR_CAST`. Tests:
+`tests/zer/intn_cast_all_sites.zer` (var-decl, call arg, designated init, defer body, global
+init, widening back; exit 1 with the wrap missing), `tests/zer/intn_named_variable_paren.zer`.
+
+### BUG-924 — a value-optional GLOBAL initialized with its bare payload emitted an invalid initializer
+`?u32 g = 5;` passed the checker (u32 → ?u32) and emitted `_zer_opt_u32 g = 5;` — GCC "invalid
+initializer" naming a .c file the user never opened (the BUG-911 class). The local paths wrap the
+payload in IR lowering; file scope has no IR and no wrap. **Fix:** the global emitter wraps a
+non-optional initializer of a value-optional global as `{ .value = …, .has_value = 1 }` (null
+sentinel `?*T` and `?void` excluded). Test: `tests/zer/global_value_optional_init.zer`.
+
+### BUG-925 — an integer switch's arm values were never typed against the operand
+The arm values of `switch (int)` were `check_expr`'d and nothing else — the one value-flow site
+`value_flows_to` (BUG-842) never reached. Measured, all silent: `u32 u; switch (u) { -1 => }`
+MATCHED 4294967295 (the BUG-863 sign hole, live here); `u8 b; … 300 =>`, `1.5 =>` and `true =>`
+were accepted (a float arm on an integer switch; `true` compared as 1); and `i64 y = -6; … -6 =>`
+NEVER matched — the arm was compared in the literal's default u32, so −6 zero-extended to
+4294967290 (the LIT-1 shape, at the last un-retyped site; `u64 x = 1 << 40; … 1 << 40 =>` likewise
+compared against 0). **Fix:** each arm value must `value_flows_to` the operand type (same wording
+family as the other sinks, plus "arm value 300 does not fit … could never match"), and an accepted
+value is `retype_accepted_const`'d to the operand's width. Corpus cost measured over 1,131 positive
+files: zero. Tests: `tests/zer/switch_int_arm_const_expr.zer` (exit 1 pre-fix),
+`tests/zer_fail/switch_arm_{literal_oob,negative_into_unsigned,float_on_int,bool_on_int}.zer`
+(all four compiled pre-fix).
+
+**The class, for the next reader.** All five are one question — "what does a literal expression mean at
+this destination?" — answered at N sites: eight value-flow sinks plus compound assignment plus the switch arm × (decision,
+retype) × two literal emitters × three cast emitters. The decision was unified in BUG-842; this session unified the retype
+(`retype_accepted_const`), the literal emission (`emit_int_literal`), the cast wrap
+(`emit_intn_cast_wrap_*`) and the fit rule (`fold_literal_in_width`). A new sink must call the first;
+a new emission path for literals or casts must call the others.
 
 ---
 

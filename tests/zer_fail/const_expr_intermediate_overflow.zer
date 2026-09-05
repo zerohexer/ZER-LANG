@@ -1,0 +1,5 @@
+// expect-error: an intermediate value does not fit
+// LIT-2: the fold is WIDTH-EXACT. (2e9 + 2e9) / 2 folds to 2e9 in int64, but
+// the retyped runtime evaluation would compute (-294967296) / 2 in i32 —
+// division does not commute with the wrap, so this must be rejected.
+u32 main() { i32 x = (2000000000 + 2000000000) / 2; return 0; }

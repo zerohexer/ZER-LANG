@@ -977,6 +977,48 @@ static bool type_is_nonnative_intn(Type *t) {
     return !(nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128);
 }
 
+/* Width-wrap a C-STYLE CAST to a non-native uN/iN as a PURE EXPRESSION
+ * (2026-09-05, with the `(u3)x` cast spelling). `(uint8_t)x` alone keeps the
+ * bits above N — `(u3)300` read back as 44 — the same defect @truncate closed
+ * with a statement-expression + `emit_intn_mask_lv`. A cast is also legal in a
+ * GLOBAL INITIALIZER, which must be a constant expression, so this form uses no
+ * temp: the caller emits `(T)(operand)` between _open and _close and the pair
+ * wraps it — unsigned `((T)((… ) & MASK))`, signed
+ * `((T)(((SS)((SU)(…) << sh)) >> sh))` (shift-left-then-arithmetic-right
+ * sign-extends from bit N-1). No-op for native widths. THREE cast sites use it
+ * (AST emit_expr, emit_rewritten_node, IR_CAST) — CLAUDE.md's dual-dispatch
+ * rule; a wrap at one and not the others is the silent-miscompile shape. */
+static void emit_intn_cast_wrap_open(Emitter *e, Type *t) {
+    if (!type_is_nonnative_intn(t)) return;
+    TypeKind k = type_dispatch_kind(t);
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    emit(e, "((");
+    emit_type(e, t);
+    if (k == TYPE_UINT) {
+        emit(e, ")((");
+    } else {
+        const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+        const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+        emit(e, ")(((%s)((%s)(", ss, su);
+    }
+}
+static void emit_intn_cast_wrap_close(Emitter *e, Type *t) {
+    if (!type_is_nonnative_intn(t)) return;
+    TypeKind k = type_dispatch_kind(t);
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64)
+            emit(e, ") & 0x%llxULL))", (unsigned long long)((1ULL << nb) - 1ULL));
+        else
+            emit(e, ") & ((((unsigned __int128)1u) << %u) - 1u)))", nb);
+    } else {
+        uint32_t sh = cw - nb;
+        emit(e, ") << %u)) >> %u))", sh, sh);
+    }
+}
+
 /* emit a C type name for a ZER type */
 static void emit_type(Emitter *e, Type *t) {
     if (!t) { emit(e, "void"); return; }
@@ -1394,16 +1436,40 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * EXPRESSION EMISSION
  * ================================================================ */
 
+/* THE integer-literal emitter for the two AST paths (emit_expr and
+ * emit_rewritten_node — they had identical copies). A literal the checker
+ * RETYPED to a >32-bit destination (LIT-1/LIT-2: `i64 a; a = -(1 << 40);`,
+ * `u64 c; c = 100000 * 100000;`) must carry that width into C: emitted bare it
+ * is an `int`, so `_zer_shl(1, 40)` measured `sizeof(int)` and gave 0, and the
+ * product wrapped at 32 bits — while the var-decl spelling one line away (IR
+ * temps, cast per literal) computed the right value. Widths <= 32 are left bare:
+ * C's `int` arithmetic already agrees with them, and a cast on every literal
+ * would churn the emitted C for nothing. */
+static void emit_int_literal(Emitter *e, Node *node) {
+    Type *lt = checker_get_type(e->checker, node);
+    Type *le = lt ? type_unwrap_distinct(lt) : NULL;
+    if (le && type_is_integer(le)) {
+        int bits = 0; bool sg = false;
+        f2i_bounds(le, &bits, &sg);
+        if (bits > 32) {
+            emit(e, "((");
+            emit_type(e, lt);
+            emit(e, ")%lluULL)", (unsigned long long)node->int_lit.value);
+            return;
+        }
+    }
+    if (node->int_lit.value > 0xFFFFFFFF)
+        emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
+    else
+        emit(e, "%llu", (unsigned long long)node->int_lit.value);
+}
+
 static void emit_expr(Emitter *e, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
     case NODE_INT_LIT:
-        if (node->int_lit.value > 0xFFFFFFFF) {
-            emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
-        } else {
-            emit(e, "%llu", (unsigned long long)node->int_lit.value);
-        }
+        emit_int_literal(e, node);
         break;
 
     case NODE_FLOAT_LIT:
@@ -3097,12 +3163,15 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->typecast.expr);
             emit_f2i_close(e, tgt, tmp);
         } else {
-            /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
+            /* Simple C cast for primitives, pointer↔pointer, int↔ptr.
+             * Non-native uN/iN target: width-wrapped (cast site 1 of 3). */
+            emit_intn_cast_wrap_open(e, tgt);
             emit(e, "((");
             emit_type(e, tgt);
             emit(e, ")(");
             emit_expr(e, node->typecast.expr);
             emit(e, "))");
+            emit_intn_cast_wrap_close(e, tgt);
         }
         break;
     }
@@ -4671,25 +4740,55 @@ static void emit_global_var(Emitter *e, Node *node) {
             emit(e, " = ");
             emit_opt_null_literal(e, type);
         } else {
-            /* For const globals: try compile-time evaluation first.
-             * This avoids GCC statement expression errors from _zer_shl/shr
-             * macros which can't be used in global initializers. */
+            /* A VALUE-optional global (`?i32 g = 5;`, `?f32 r = 1.5;`) whose
+             * initializer is the bare payload: wrap it into the struct. The
+             * local paths wrap in IR lowering; file scope has no IR, and before
+             * 2026-09-05 the payload was emitted bare — an "invalid initializer"
+             * from GCC naming a .c file the user never opened (the BUG-911 class).
+             * Null-sentinel `?*T` and `?void` never reach here (plain pointer /
+             * no payload). */
+            Type *init_t = checker_get_type(e->checker, node->var_decl.init);
+            Type *init_eff = init_t ? type_unwrap_distinct(init_t) : NULL;
+            bool wrap_opt = type_dispatch_kind(gtype_eff) == TYPE_OPTIONAL &&
+                            !is_null_sentinel(gtype_eff->optional.inner) &&
+                            type_dispatch_kind(gtype_eff->optional.inner) != TYPE_VOID &&
+                            init_eff && type_dispatch_kind(init_eff) != TYPE_OPTIONAL;
+            Type *payload_t = wrap_opt ? gtype_eff->optional.inner : type;
+            emit(e, " = ");
+            if (wrap_opt) emit(e, "{ .value = ");
+            /* A pure integer-literal TREE (`-(1 << 40)`, `100 + 27`) folds to
+             * ONE constant here: its operators emit as statement-expression
+             * macros (`_zer_shl`), which GCC refuses at file scope, and the
+             * checker already proved the fold fits the destination (LIT-2).
+             * Cast to the destination so the constant carries its width. */
+            int64_t tree_val = 0;
             bool emitted_const = false;
-            if (node->var_decl.is_const) {
+            if (checker_const_int_tree_value(node->var_decl.init, payload_t, &tree_val)) {
+                emit(e, "((");
+                emit_type(e, payload_t);
+                if (tree_val == INT64_MIN)
+                    emit(e, ")(-9223372036854775807LL - 1LL))");
+                else
+                    emit(e, ")(%lldLL))", (long long)tree_val);
+                emitted_const = true;
+            }
+            /* For const globals: try compile-time evaluation next (covers
+             * comptime calls the pure-literal fold does not). */
+            if (!emitted_const && node->var_decl.is_const) {
                 int64_t cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
                     if (cval < 0) {
-                        emit(e, " = (%lld)", (long long)cval);
+                        emit(e, "(%lld)", (long long)cval);
                     } else {
-                        emit(e, " = %llu", (unsigned long long)cval);
+                        emit(e, "%llu", (unsigned long long)cval);
                     }
                     emitted_const = true;
                 }
             }
             if (!emitted_const) {
-                emit(e, " = ");
                 emit_expr(e, node->var_decl.init);
             }
+            if (wrap_opt) emit(e, ", .has_value = 1 }");
         }
     } else {
         /* auto-zero — unwrap distinct to check if compound init needed */
@@ -6518,10 +6617,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     }
 
     case NODE_INT_LIT:
-        if (node->int_lit.value > 0xFFFFFFFF)
-            emit(e, "%lluULL", (unsigned long long)node->int_lit.value);
-        else
-            emit(e, "%llu", (unsigned long long)node->int_lit.value);
+        emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
         emit(e, "%.17g", node->float_lit.value);
@@ -10071,11 +10167,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_f2i_close(e, t3, tmp);
             return;
         }
+        /* Non-native uN/iN target: width-wrapped (cast site 2 of 3). */
+        emit_intn_cast_wrap_open(e, t3);
         emit(e, "((");
         if (t3) emit_type(e, t3);
         emit(e, ")");
         emit_rewritten_node(e, node->typecast.expr, func);
         emit(e, ")");
+        emit_intn_cast_wrap_close(e, t3);
         return;
     }
 
@@ -11649,11 +11748,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_f2i_close(e, tgt, tmp);
             }
             else if (inst->src1_local >= 0) {
+                /* Non-native uN/iN target: width-wrapped (cast site 3 of 3). */
+                emit_intn_cast_wrap_open(e, tgt);
                 emit(e, "((");
                 emit_type(e, tgt);
                 emit(e, ")");
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, ")");
+                emit_intn_cast_wrap_close(e, tgt);
             }
             emit(e, ";\n");
         }

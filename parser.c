@@ -964,6 +964,21 @@ static Node *parse_primary(Parser *p) {
             is_cast = true;
             star_ambiguous = true;
             break;
+        case TOK_IDENT: {   /* (u3)x / (i48)x — arbitrary-width int cast (2026-09-05).
+                             * uN/iN are IDENTS, not keywords, so they were never a
+                             * cast start and `(u3)x` parsed as a parenthesized
+                             * variable `u3`. AMBIGUOUS in the same way `(*` is
+                             * (a variable may be named `u3`), so it takes the same
+                             * speculative path: a cast only if `(` type `)` is
+                             * followed by a token that can start the operand. */
+            uint32_t _nb; bool _sgn;
+            if (intn_type_name(tok_text(&p->current), (uint32_t)tok_len(&p->current),
+                               &_nb, &_sgn)) {
+                is_cast = true;
+                star_ambiguous = true;
+            }
+            break;
+        }
         default: break;
         }
 
@@ -976,8 +991,9 @@ static Node *parse_primary(Parser *p) {
          * followed by `)` AND the token after `)` can start a unary expression
          * (the cast operand). Otherwise backtrack and parse a parenthesized
          * expression. The scanner + panic_mode/had_error are saved/restored so a
-         * failed speculative parse leaves no spurious error. Only `*` needs this;
-         * keyword/`?`/`const`/`volatile` triggers are unambiguous. */
+         * failed speculative parse leaves no spurious error. `*` and a uN/iN
+         * IDENT need this; keyword/`?`/`const`/`volatile` triggers are
+         * unambiguous. */
         if (is_cast && star_ambiguous) {
             Scanner saved = *p->scanner;
             Token saved_cur = p->current;

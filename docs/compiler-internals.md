@@ -110,7 +110,9 @@ surface: `docs/reference.md`. Session history: BUGS-FIXED.md 2026-07-09 (+ the
 07-10 / 07-12 update notes). The load-bearing facts a future session needs:
 
 1. **Generic over N — there is NO per-width code.** `u17` works because the whole
-   pipeline computes from the bit count: `parse_intn_width` (checker.c ~1993)
+   pipeline computes from the bit count: `intn_type_name` (ast.h — shared with the
+   parser since 2026-09-05, when `(u3)x` became a cast start; before that a uN/iN
+   IDENT parsed as a parenthesized variable)
    parses any `u<N>`/`i<N>` name (N in 1..128); the `resolve_type` TYNODE_NAMED
    hook (~2200, fires ONLY when `scope_lookup` finds no struct/typedef of that
    name) returns `type_uint`/`type_sint(arena, N)` — a `TYPE_UINT`/`TYPE_SINT`
@@ -127,17 +129,50 @@ surface: `docs/reference.md`. Session history: BUGS-FIXED.md 2026-07-09 (+ the
    TWO IR sites: IR_BINOP (arithmetic + shift, ~10833/10922) and IR_UNOP
    (negation/complement, ~10960). It takes an `IRLocal*` — **IR-path ONLY**
    (function bodies), which is why the global-scope question (#4) matters.
-4. **Global-scope needs NO mask — verified safe by REJECTION, not by masking.** A
-   global `uN` cannot carry an over-width value: int-literal arithmetic
-   (`u21 g = 1000+500`) is u32→uN narrowing-REJECTED (this holds at LOCAL scope
-   too — real uN arithmetic needs uN-TYPED operands, not bare int literals, whose
-   sum defaults to u32); over-width literals hit the fits-check; uN-operand const
-   arithmetic (`const u21 g = a*b`) is GCC "initializer element is not constant"
-   (`eval_const_expr` does not fold const-uN idents). Only a fitting literal is a
-   valid global uN init, which can't overflow. Pinned by `tests/zer/uint_global.zer`
-   + `tests/zer_fail/global_uN_arith_narrow.zer` (tripwire). Do NOT "add the mask
-   for completeness" — it is untestable dead code; the tripwire forces a mask ONLY
-   if the narrowing is ever relaxed.
+4. **Global-scope needs NO mask — verified safe by the WIDTH-EXACT FOLD, not by
+   masking.** A global `uN` cannot carry an over-width value: a pure-literal
+   constant expression (`u21 g = 1000+500`, accepted since 2026-09-05 — LIT-2)
+   is typed by its destination and folded WIDTH-EXACTLY (`fold_literal_in_width`:
+   every literal and intermediate must fit the destination range), so the folded
+   constant is in range by construction; over-width literals and over-width folds
+   hit the fits-check; uN-operand const arithmetic (`const u21 g = a*b`) is GCC
+   "initializer element is not constant" (`eval_const_expr` does not fold
+   const-uN idents). Pinned by `tests/zer/uint_global.zer`,
+   `tests/zer/global_uN_const_expr.zer` (the accepted shapes) +
+   `tests/zer_fail/global_uN_arith_narrow.zer` (tripwire: an over-width tree
+   `2097151 + 1`). Do NOT "add the mask for completeness" — it is untestable
+   dead code; the tripwire forces a mask ONLY if the fit rule is ever relaxed.
+   (Before 2026-09-05 the same guarantee came from u32→uN narrowing REJECTION of
+   any literal arithmetic; the relaxation kept the invariant by making the fold
+   exact instead.)
+4a. **Integer constant expressions (LIT-1/LIT-2, checker.c ~1000-1460).** A
+   pure-literal tree (`is_pure_int_literal_expr`: literals, unary `- + ~`,
+   arithmetic/bitwise/shift binaries — nothing with an ident/call/field) is typed
+   by its DESTINATION: `is_literal_compatible` accepts it when
+   `fold_literal_in_width` succeeds (every literal AND intermediate fits the
+   destination range — the only rule under which the int64 fold provably equals
+   the wrapped runtime evaluation; `/`, `%` and shifts do not commute with the
+   wrap), looking through one `?T` level for integer/float payloads. After
+   `value_flows_to` accepts, EVERY sink calls `retype_accepted_const` (the eight
+   value-flow sinks, the compound-assign RHS, the binary-operand promotion and
+   the integer switch ARM — BUG-925 added the arm, which until then was typed
+   against NOTHING) so the tree's nodes carry the destination type into IR lowering
+   (IR_LITERAL temps cast per literal) and into the AST paths (`emit_int_literal`
+   casts any literal typed wider than 32 bits — bare it is a C `int`, so
+   `_zer_shl(1, 40)` measured `sizeof(int)`). Globals: non-negative trees are
+   folded in place into a NODE_INT_LIT by the BUG-911 fold; negative ones stay
+   trees and the global emitter folds them via `checker_const_int_tree_value`
+   (a statement-expression macro is illegal at file scope). Diagnostics for a
+   failed fit come from `report_negative_const_flow` (constant / intermediate /
+   unevaluable wording). Tests: `tests/zer/const_expr_{literal_fits,64bit}_all_sinks.zer`.
+4b. **C-style casts to a non-native uN/iN are width-wrapped at THREE emitter
+   sites** (`emit_intn_cast_wrap_open/close`, a PURE expression so it is legal in
+   a global initializer): `emit_expr` NODE_TYPECAST, `emit_rewritten_node`
+   NODE_TYPECAST (defer bodies, passthrough args) and `IR_CAST`. `(u3)300` is 4.
+   `@truncate` keeps its own statement-expression form because it also runs the
+   enum-variant guard. The cast spelling itself only became parseable the same
+   day: `intn_type_name` (ast.h, shared with the checker's `resolve_type`) makes a
+   uN/iN IDENT a speculative cast start like `(*`.
 5. **Carry primitives are safe value ops** (no asm/memory surface): `@addc`/`@subb`/
    `@mulw` → spellable builtin structs `AddCarry64{sum,carry}` / `SubBorrow64{diff,
    borrow}` / `MulWide64{lo,hi}`, lowering to `__builtin_add_overflow` /

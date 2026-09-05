@@ -1,0 +1,2 @@
+// expect-error: switch arm value of type 'f64' cannot match a switch operand of type 'u8'
+u32 main() { u8 b = 1; switch (b) { 1.5 => { return 1; } default => { } } return 0; }

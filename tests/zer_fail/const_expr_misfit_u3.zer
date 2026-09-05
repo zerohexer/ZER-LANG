@@ -1,0 +1,2 @@
+// expect-error: constant expression evaluates to 8, which does not fit
+u32 main() { u3 x = 4 + 4; return 0; }

@@ -1,0 +1,24 @@
+// A VALUE-optional global initialized with its bare payload (2026-09-05).
+// `?u32 g = 5;` was accepted by the checker (u32 -> ?u32) and emitted the
+// payload BARE into the `{ value, has_value }` struct — GCC "invalid
+// initializer" naming a .c file the user never opened. `?i8 g = -3;` and
+// `?f32 r = 1.5;` were rejected outright (literal into ?T never unwrapped).
+?u32 g1 = 5;
+?f32 g2 = 1.5;
+?bool g3 = true;
+?i8 g5 = -3;
+?i64 g6 = -(1 << 40);
+const u32 K = 1 << 3;
+i64 g8 = -9223372036854775807 - 1;      // INT64_MIN — needs the (x - 1) spelling in C
+u32 main() {
+    u32 a = g1 orelse 0; f32 b = g2 orelse 0.0; bool c = g3 orelse false;
+    i8 d = g5 orelse 0; i64 f = g6 orelse 0;
+    if (a != 5) { return 1; }
+    if (b != 1.5) { return 2; }
+    if (!c) { return 3; }
+    if (d != -3) { return 4; }
+    if (f != -1099511627776) { return 5; }
+    if (K != 8) { return 6; }
+    if (g8 != -9223372036854775807 - 1) { return 8; }
+    return 0;
+}

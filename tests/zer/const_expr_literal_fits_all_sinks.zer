@@ -1,0 +1,52 @@
+// LIT-2 (2026-09-05): a PURE integer-literal EXPRESSION fits an integer (or
+// ?integer) destination when its width-exact fold fits — every sink: var-decl,
+// assignment, call arg, return, struct-init field, ?T payload, uN/iN targets.
+// Pre-fix: every one of these was "cannot initialize ... of type 'i32' with 'u32'".
+struct S { ?i32 v; i8 w; }
+?i64 f() { return -9; }
+?i8 g() { return 3 - 10; }
+i32 sub() { return 3 - 10; }
+void h(?i8 v, i8 w) { if (w != -3) { @trap(); } }
+u32 main() {
+    i32 x = -5 - 1;
+    i32 y = 5 - 1;
+    i8 a = 100 + 27;
+    i16 b = -32767 - 1;
+    i64 z = -(1 << 40);
+    u8 w = 255 - 0;
+    u8 m = ~0xF0;
+    u16 s = 1 << 12;
+    i32 c = -2147483647 - 1 + 1;
+    ?i32 ox = -5;
+    ?i8 oy = 5;
+    ?i32 oz = 5 - 1;
+    S st = { .v = -5, .w = 100 + 27 };
+    ?i32 q = null; q = -7;
+    i32 r = q orelse 0;
+    u3 t = 3 + 4;
+    i48 big = -(1 << 40) - 1;
+    i8 assign = 0; assign = -100 - 28;
+    h(5, -3);
+    if (x != -6) { return 1; }
+    if (y != 4) { return 2; }
+    if (a != 127) { return 3; }
+    if (b != -32768) { return 4; }
+    if (z != -1099511627776) { return 5; }
+    if (w != 255) { return 6; }
+    if (m != 15) { return 7; }
+    if (s != 4096) { return 8; }
+    if (c != -2147483647) { return 9; }
+    i32 oxv = ox orelse 0; if (oxv != -5) { return 10; }
+    i8 oyv = oy orelse 0; if (oyv != 5) { return 11; }
+    i32 ozv = oz orelse 0; if (ozv != 4) { return 12; }
+    i32 sv = st.v orelse 0; if (sv != -5) { return 13; }
+    if (st.w != 127) { return 14; }
+    if (r != -7) { return 15; }
+    if (t != 7) { return 16; }
+    if (big != -1099511627777) { return 17; }
+    if (assign != -128) { return 18; }
+    i64 fv = f() orelse 0; if (fv != -9) { return 19; }
+    i8 gv = g() orelse 0; if (gv != -7) { return 20; }
+    if (sub() != -7) { return 21; }
+    return 0;
+}

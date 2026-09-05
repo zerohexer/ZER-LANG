@@ -71,8 +71,8 @@ u48 big;                 // 48-bit
 ```
 
 **NOTES**
-- Widths 1..128. Same no-implicit-narrowing rule as u8..u64 (`u21 x = @truncate(u21, big);`).
-- Arithmetic on bare integer literals is `u32`, so `u21 x = 1000 + 500;` is rejected (u32→u21 narrowing). Write a fitting literal (`u21 x = 1500;`) or use `uN`-typed operands (`u21 a = 1000; u21 x = a + 500;` — this wraps at 2^N).
+- Widths 1..128. Same no-implicit-narrowing rule as u8..u64 (`u21 x = @truncate(u21, big);` or the C-style cast `u21 x = (u21)big;` — both keep the low N bits).
+- A constant expression of bare literals fits any integer type it evaluates into: `u21 x = 1000 + 500;`, `u3 f = 3 + 4;`, `i12 d = -2047 - 1;` are accepted (see "Integer constant expressions"). `u3 g = 4 + 4;` is rejected: 8 does not fit. Runtime `uN`-typed operands wrap at 2^N (`u21 a = 1000; u21 x = a + 500;`).
 - Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
 - A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.
 - `>64`-bit arithmetic (`u128` …) works but is emulated (multi-word). For hand-tuned big-int, use the `@addc`/`@subb`/`@mulw` carry primitives.
@@ -1093,6 +1093,13 @@ switch (ready) {
 ```
 
 **NOTES**
+- An integer switch's arm values must fit the OPERAND's type, by the same rule as
+  an assignment: `u8 b; switch (b) { 300 => … }` ("could never match"),
+  `u32 u; … -1 =>` (no implicit sign conversion), `1.5 =>` or `true =>` on an
+  integer are compile errors. A constant expression arm (`1 + 2 =>`,
+  `1 << 40 =>` on a `u64`, `-6 =>` on an `i64`) is evaluated in the operand's
+  width; a `const` of a narrower integer type widens. (Until 2026-09-05 arms
+  were not typed at all — `-6 =>` on an `i64` silently never matched.)
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
 - Optional `?T` switch: `default => |*v| { ... }` capture
@@ -2915,19 +2922,90 @@ Explicit type conversion using C-style syntax. Narrowing truncates by default.
 
 **EXAMPLE**
 ```zer
-u8 small = 42;
-u32 big = (u32)small;          // widening
-u16 trunc = (u16)big;          // narrowing (truncate)
-f32 ratio = (f32)big;          // int → float value convert
-(*Motor)opaque_ctx             // pointer cast (provenance checked)
-(*opaque)sensor_ptr            // type erase
+struct Motor { u32 rpm; }
+u32 main() {
+    u8 small = 42;
+    u32 big = (u32)small;          // widening
+    u16 trunc = (u16)big;          // narrowing (truncate)
+    f32 ratio = (f32)big;          // int → float value convert
+    u3 low = (u3)big;              // arbitrary-width target: keeps the low 3 bits (42 & 7 = 2)
+    i48 wide = (i48)big;
+    Motor m;
+    *opaque ctx = (*opaque)&m;     // type erase (provenance = *Motor)
+    *Motor back = (*Motor)ctx;     // pointer cast (provenance checked)
+    if (low != 2 || wide != 42 || trunc != 42) { return 1; }
+    return 0;
+}
 ```
 
 **NOTES**
 - Widening: always safe, no data loss.
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
+- `uN`/`iN` targets (`(u3)x`, `(i48)x`) truncate to N bits exactly like `@truncate` —
+  `(u3)300` is `4`, never a carrier-width value. A variable that happens to be named
+  like a width (`u32 u3 = 9; (u3) + 1`) still parses as a parenthesized expression: a
+  uN/iN name is a cast only when `(name)` is followed by an operand, the same rule as
+  `(*ptr)` vs `(*T)x`.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
 - `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+
+---
+
+### Integer constant expressions
+
+**DESCRIPTION**
+An expression built only from integer literals, unary `-`/`+`/`~` and the
+arithmetic, bitwise and shift operators is a **constant expression**. It is
+typed by its DESTINATION, not by the literals' default width: it flows into any
+integer (or `?integer`) destination whose range it fits, and is then evaluated
+in that destination's width. Before 2026-09-05 only a lone literal (`-6`) got
+this treatment; `-5 - 1` was typed `u32` and rejected into an `i32`.
+
+**EXAMPLE**
+```zer
+struct Cfg { i8 gain; ?i32 offset; }
+i32 sub() { return 3 - 10; }
+void take(?i8 v) { }
+u32 main() {
+    i32 x = -5 - 1;                  // -6, computed in i32
+    i8  g = 100 + 27;                // 127
+    u16 s = 1 << 12;
+    u8  m = ~0xF0;                   // 15 — `~` is masked to the destination width
+    i16 lo = -32767 - 1;
+    u3  t = 3 + 4;                   // 7
+    ?i32 o = 5 - 1;                  // value into an optional payload
+    Cfg c = { .gain = 100 + 27, .offset = -5 };
+    take(-3);
+    if (x != -6 || g != 127 || m != 15) { return 1; }
+    return 0;
+}
+```
+
+**NOTES**
+- The fold is **width-exact**: every literal and every intermediate must fit the
+  destination range, or the expression is rejected — `i8 x = 100 + 28;`
+  ("evaluates to 128, which does not fit 'i8'"), `u8 y = 1 - 2;`,
+  `i32 z = (2000000000 + 2000000000) / 2;` ("an intermediate value does not
+  fit"). The reason: after acceptance the expression is evaluated in the
+  destination width with wrapping arithmetic, and division, remainder and
+  shifts do not commute with the wrap, so an intermediate that wraps would give
+  a different value than the fold. Widen the operands or the destination.
+- `-(1 << 15)` into an `i16` is rejected for the same reason (32768 does not fit);
+  write `-32767 - 1` or `-32768`.
+- A shift count at or beyond the destination width is rejected in a constant
+  expression (`i32 x = 1 << 32;`); at runtime the same shift is a defined `0`.
+- A negative constant never flows into an unsigned type (`u32 a = -1;` — use
+  `@bitcast(u32, -1)`). This includes `u8 y = 1 - 2;`.
+- The same holds for a binary operand (`s + (1 << 40)` with `u64 s`) and a compound
+  assignment (`s += 1 << 40;`): the constant takes the other side's width. A shift
+  COUNT (`s <<= 3`) is a bit position and is left alone.
+- Only pure-literal trees qualify. Anything containing a variable, call or field
+  is typed by its operands as before (`u32 a = 5; i32 b = a - 6;` is a u32→i32
+  mismatch — cast it).
+- A literal also flows into an optional payload of the matching kind: `?i8 y = 5;`,
+  `?i32 o = -5;`, `?f32 r = 1.5;` (a float literal is `f64` by default; the `?T`
+  payload width is what it is checked against). A GLOBAL of value-optional type
+  initialised with its bare payload is wrapped for you (`?u32 g = 5;`).
 
 ---
 
@@ -3820,7 +3898,7 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
+- `(*A)b_ptr` — C-style cast between DIFFERENT pointee types — use @pun (value casts `(T)x` ARE supported, see "(Type)expr — C-Style Cast")
 - `,` — Comma operator
 - `goto` — Use structured control flow
 
@@ -4339,7 +4417,7 @@ u32 main() {
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- No unchecked C-style casts (`(T)x` exists, but pointer casts are provenance-checked, `(*A)b_ptr` between different pointees is rejected in favour of `@pun`, and narrowing to `uN` keeps exactly N bits)
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

@@ -1,0 +1,36 @@
+// (u3)x / (i48)x — C-style cast to an arbitrary-width uN/iN (2026-09-05).
+// Two things under test: the PARSER accepts a uN/iN IDENT as a cast start, and
+// every cast emission site width-wraps the result ((u3)300 is 4, not 44):
+// var-decl init (IR_CAST), inline call arg / designated init / defer body
+// (emit_rewritten_node), and a GLOBAL initializer (AST path, must stay a
+// constant expression — no statement-expression allowed there).
+u3 g_cast = (u3)13;          // global initializer — must stay a constant expression
+i5 g_neg = (i5)(0 - 1);
+struct W { u3 lo; i7 s; }
+u32 pick(u3 v) { return (u32)v; }
+u32 main() {
+    volatile u32 x = 300;
+    u3 a = (u3)x;                       // 300 & 7 = 4
+    i7 b = (i7)x;                       // 300 = 0b100101100 → low 7 bits 0101100 = 44
+    i7 c = (i7)(x + 100);               // 400 = 0b1_1001_0000 → low 7 bits = 16
+    u32 d = pick((u3)x);                // inline cast as a call arg
+    W w = { .lo = (u3)x, .s = (i7)x };  // designated init
+    u32 wide = (u32)a;
+    i48 big = (i48)x;
+    u3 back = (u3)big;
+    if (a != 4) { return 1; }
+    if (b != 44) { return 2; }
+    if (c != 16) { return 3; }
+    if (d != 4) { return 4; }
+    if (w.lo != 4) { return 5; }
+    if (w.s != 44) { return 6; }
+    if (wide != 4) { return 7; }
+    if (big != 300) { return 8; }
+    if (back != 4) { return 9; }
+    if (g_cast != 5) { return 10; }
+    if (g_neg != -1) { return 11; }
+    u3 t = @truncate(u3, x);
+    if (t != a) { return 12; }
+    defer { u3 z = (u3)x; if (z != 4) { @trap(); } }
+    return 0;
+}

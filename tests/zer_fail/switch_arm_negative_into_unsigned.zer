@@ -1,0 +1,4 @@
+// expect-error: negative constant -1 does not fit unsigned type 'u32'
+// BUG-925: `-1 =>` on a u32 switch MATCHED 4294967295 — the sign-conversion
+// hole BUG-863 closed at the other eight sinks, live at this one.
+u32 main() { u32 u = 4294967295; switch (u) { -1 => { return 1; } default => { } } return 0; }

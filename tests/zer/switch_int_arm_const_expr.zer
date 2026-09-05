@@ -1,0 +1,20 @@
+// BUG-925: an integer switch's arm value flows into the OPERAND's type and is
+// evaluated in that width. Pre-fix the arm was compared in the literal's default
+// u32: `i64 y = -6; switch (y) { -6 => …}` never matched (−6 zero-extended to
+// 4294967290), `u64 x = 1 << 40; … 1 << 40 =>` never matched (0 in u32).
+u32 main() {
+    i64 y = -5 - 1;
+    u64 x = 1 << 40;
+    i8 z = 3;
+    const u8 K8 = 7;
+    u32 v = 7;
+    usize n = 3;
+    u32 r = 0;
+    switch (y) { -6 => { r += 1; }  default => { return 1; } }
+    switch (x) { 1 << 40 => { r += 1; }  default => { return 2; } }
+    switch (z) { 1 + 2, 4 => { r += 1; }  default => { return 3; } }
+    switch (v) { K8 => { r += 1; }  default => { return 4; } }     // narrower const widens
+    switch (n) { 3 => { r += 1; }  default => { return 5; } }
+    if (r != 5) { return 6; }
+    return 0;
+}

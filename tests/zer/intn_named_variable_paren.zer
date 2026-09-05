@@ -1,0 +1,10 @@
+// A VARIABLE named like a uN/iN type (`u3`) keeps parsing in parentheses —
+// the cast start is speculative, exactly like `(*ptr)` vs `(*T)cast`.
+u32 main() {
+    u32 u3 = 9;              // a VARIABLE named u3 — parenthesised use must still parse
+    u32 y = (u3) + 1;
+    u32 z = (u3);
+    if (y != 10) { return 1; }
+    if (z != 9) { return 2; }
+    return 0;
+}

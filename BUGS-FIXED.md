@@ -238,6 +238,54 @@ type") — the rule was changed to match the intended reason, not the tests soft
 
 ---
 
+## Session 2026-09-06 — BUG-935: a 16-slot cap on a SAFETY collector, failing silently
+
+From the `loving-davinci-ii7a90` survey. The multi-root shared-lock collector used a
+fixed 16-slot array, and BOTH `add_shared_root_unique` and
+`find_all_shared_roots_expr` returned at `*count >= max` — silently.
+
+MEASURED on the pre-fix compiler, 18 roots of one `shared(rw)` type in one statement:
+
+```
+diagnostics                 0
+rdlock emitted             15
+s17, s18                   READ WITH NO LOCK
+```
+
+A silent data race in the emitted C, with nothing to see at the source level.
+
+**The rule this establishes:** *a cap on a SAFETY collector cannot fail silently.*
+Either it grows, or it must refuse the program. Here it grows — `SharedRootVec`,
+stack-first 16 with heap doubling, per CLAUDE.md rule #7. Three capped arrays and the
+two carrier signatures collapse into it; the UNLOCK replays the captured set, so a
+root locked by the collector can never be left unreleased. Verified: all 18 roots
+locked exactly once and unlocked exactly once.
+
+### The gate is a NEW KIND, and that is the point
+
+Every existing gate asserts something is **absent**: no `default:`, no new raw
+dispatch site, no dead stub, no hole in a matrix. **That shape structurally cannot
+catch a silent DROP** — code the compiler was supposed to emit and didn't. It is also
+invisible to any runtime test: a missing lock is a race, not a wrong value, so the
+program still exits 0 single-threaded.
+
+`tools/emit_audit.sh` therefore gains a **REQUIRED-FINGERPRINT** section: compile a
+program, require a pattern to APPEAR. Verified in both directions — passes post-fix,
+and against the pre-fix build reports `MISSING EMISSION: shared root s17 lock=0
+unlock=0`.
+
+**The gate was itself broken on the first attempt, in the documented shape.** With
+`set -e` active, `grep -c` exits 1 on ZERO matches — which is exactly the case the
+gate exists to report — so it died silently with exit 1 and printed nothing. Caught by
+running it against the pre-fix compiler and noticing the *reason* was absent, not just
+the exit code. `|| true` on both greps.
+
+`tests/zer/shared_many_roots_ok.zer` pins that the shape compiles and runs, but it does
+NOT discriminate — only the gate does, for the reason above. Recorded so nobody
+mistakes the positive for the net.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

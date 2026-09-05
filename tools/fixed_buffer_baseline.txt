@@ -86,3 +86,9 @@ checker.c:    Node *fast[16];
 # IRHandleInfo, which is memcpy-copied per CFG block, so a pointer field would
 # be shared across path-state copies.
 zercheck_ir.c:    int view_alloc_ids[8];
+
+# BUG-935: the stack-first HALF of a stack-first/heap-doubling vector — exactly the
+# pattern this rule prescribes (srv_push grows onto the heap past 16 and srv_free
+# releases it, so nothing is ever dropped). The cap it REPLACED was the bug: a
+# fixed 16 with a silent early return that emitted 15 locks for 18 shared roots.
+ir_lower.c:    Node  *inline_buf[16];

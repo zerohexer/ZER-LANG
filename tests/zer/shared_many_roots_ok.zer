@@ -1,0 +1,52 @@
+// BUG-935: the multi-root shared-lock collector had a FIXED 16-slot cap and
+// dropped everything past it SILENTLY — 18 roots emitted 15 rdlocks and read the
+// last two with NO lock, zero diagnostics. A cap on a SAFETY collector cannot
+// fail silently. This pins that a statement over 18 roots compiles, runs, and is
+// lock-balanced; tools/emit_audit.sh asserts every root is actually locked.
+shared(rw) struct S { u32 v; }
+S s1;
+S s2;
+S s3;
+S s4;
+S s5;
+S s6;
+S s7;
+S s8;
+S s9;
+S s10;
+S s11;
+S s12;
+S s13;
+S s14;
+S s15;
+S s16;
+S s17;
+S s18;
+u32 res;
+void seed() {
+    s1.v = 1;
+    s2.v = 2;
+    s3.v = 3;
+    s4.v = 4;
+    s5.v = 5;
+    s6.v = 6;
+    s7.v = 7;
+    s8.v = 8;
+    s9.v = 9;
+    s10.v = 10;
+    s11.v = 11;
+    s12.v = 12;
+    s13.v = 13;
+    s14.v = 14;
+    s15.v = 15;
+    s16.v = 16;
+    s17.v = 17;
+    s18.v = 18;
+}
+void sum() { res = s1.v + s2.v + s3.v + s4.v + s5.v + s6.v + s7.v + s8.v + s9.v + s10.v + s11.v + s12.v + s13.v + s14.v + s15.v + s16.v + s17.v + s18.v; }
+u32 main() {
+    seed();
+    sum();
+    if (res != 171) { return 1; }   // 1+2+...+18
+    return 0;
+}

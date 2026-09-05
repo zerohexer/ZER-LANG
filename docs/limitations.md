@@ -66,7 +66,7 @@ correctly rejected. ONE site, and it closes four tests. Cheapest item in the sur
 
 ### ACCEPT-UNSAFE / MISCOMPILE — all verified live
 
-**B. BUG-917 — the 16-root shared-lock cap drops locks SILENTLY.** *(highest
+**B. ~~BUG-917 — the 16-root shared-lock cap drops locks SILENTLY.~~ — CLOSED 2026-09-06 as BUG-935, DO NOT REDO.** *(SharedRootVec, stack-first 16 + heap doubling; the required-emission gate taken too and verified RED pre-fix.)* Original: *(highest
 severity in this branch)* The B1 multi-root collector used a fixed 16-slot array
 and returned early at the cap. MEASURED on main with 18 roots of ONE `shared(rw)`
 type in one statement: **0 diagnostics, 15 `rdlock` calls emitted, `s17`/`s18`
@@ -196,7 +196,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 
 ```
 1. A  ~~switch arm as the 9th value-flow sink~~  CLOSED (BUG-934)
-2. B  the 16-root lock cap                    -- silent data race, and take their gate
+2. B  ~~the 16-root lock cap~~               CLOSED (BUG-935), gate taken
 3. C  stale VRP in defer bodies               -- unguarded OOB store, 0 diagnostics
 4. D  Level B multi-free                      -- a hole in a relaxation we shipped
 5. E  &freed.field                            -- mind our FORMING-vs-READING rule

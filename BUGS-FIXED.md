@@ -5,9 +5,9 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-05 — BUG-913..916: four accept-unsafe holes from a fresh full-codebase audit
+## Session 2026-09-05 — BUG-913..918: five accept-unsafe holes + one over-rejection from a fresh full-codebase audit
 
-All four were found by reading the IR pipeline end to end and probing the seams between
+All were found by reading the IR pipeline end to end and probing the seams between
 passes, not by any gate. Each shipped a wrong program with NO diagnostic; each has a test
 that was verified to PASS on the pre-fix compiler (a `git archive HEAD` build) and fail on
 the fixed one — a test that has only ever passed is a script, not a net.
@@ -88,6 +88,38 @@ scope-suffixed local (`x_5` in the emitted C) is named correctly; the spawn args
 so the un-rewritten `x` bound to the outer declaration. Silent wrong value. Fix: rewrite
 the spawn args in the `NODE_SPAWN` lowering. Test: `tests/zer/spawn_arg_shadowed_local.zer`
 (exit 1 pre-fix).
+
+### BUG-917 — the B1 multi-root lock collector CAPPED at 16 roots and dropped the rest
+```
+u32 x = a1.v + a2.v + ... + a16.v + a17.v + a18.v;   // 18 shared(rw) structs
+```
+`find_all_shared_roots_expr` collected into `Node *roots[16]` and returned early at
+`*count >= max`; the block iterator and for-init mirrored the cap in `shared_extra[16]` /
+`init_extra[16]`. Verified in the emitted C: `rdlock(&a1..a16)` and a17/a18 read BARE. No
+diagnostic, no trap — a race. The fixed-buffer baseline had justified the cap with ">16
+distinct shared structs is not a real program", which is the wrong kind of justification:
+exceeding a "not real" bound must grow or diagnose, never silently drop a lock.
+
+Fix: `SharedRootVec` (16 inline, heap doubling — the Rule #7 shape) replaces all three
+arrays; `emit_shared_unlock_if_needed` replays the captured set and releases the vector.
+Gate: `tools/emit_audit.sh` grew a REQUIRED-fingerprint section (the mirror image of its
+dead-stub check — emission that must be PRESENT), asserting `rdlock(&a17` / `rdlock(&a18`
+in the C for `tests/zer/shared_many_roots_one_stmt.zer`; verified RED on the pre-fix build.
+
+### BUG-918 — an `orelse` inside a BUILTIN method's argument list survived lowering
+```
+heap.free(mh orelse return);        // "compiler bug: orelse with control-flow fallback in a
+                                    //  spawn argument" + runtime trap, and zercheck: "handle
+                                    //  'mh' ... never freed"
+```
+Builtin calls (`pool.*`, `slab.*`, `ring.*`, `arena.*`, `T.alloc/free`, `alloc(T,n)`,
+`free(slice)`) route through `IR_CALL` with the raw AST args (a type-name arg cannot be
+decomposed), and that route never ran `pre_lower_orelse` on them. The emitter's fallback arm
+then trapped (and blamed a spawn argument it was not in), while zercheck could not key the
+free's argument and reported a false leak. Fix: hoist every orelse in a builtin's args to a
+branch + temp, exactly as the passthrough route does (a bare type-name ident is untouched);
+the emitter's message no longer names a spawn. Test: `tests/zer/builtin_arg_orelse_return.zer`
+(rejected pre-fix with the false leak; exit 0 now).
 
 ---
 

@@ -447,7 +447,7 @@ line, plus TEN axis-crossed matrices:
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
-| `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
+| `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` (also asserts REQUIRED fingerprints — emission that must be PRESENT, e.g. the 17th/18th shared-root rdlock of BUG-917; a missing one prints `DROPPED EMISSION`) |
 | `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 

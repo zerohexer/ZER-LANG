@@ -12011,6 +12011,13 @@ than breaking it — that's the design key for any future lock work:
   (`x = ga.v + gb.v`) locks them ALL — but the extras as **read locks**, which
   compose (multiple readers OK). The same-statement multi-WRITE case is still a
   compile error, so a multi-root statement is always all-reads → no deadlock.
+  **BUG-917 (2026-09-05): the root set is a growable `SharedRootVec`** (16 inline,
+  heap doubling), NOT the old `roots[16]` cap — the cap silently stopped collecting
+  at the 17th root, so a statement reading 18 shared(rw) structs locked 16 and read
+  two bare. `emit_shared_lock_if_needed` fills the vector, `emit_shared_unlock_if_needed`
+  replays and frees it (call it even with a NULL root). Gated by the REQUIRED-fingerprint
+  section of `tools/emit_audit.sh` (asserts `rdlock(&a17` / `rdlock(&a18` in the C for
+  `tests/zer/shared_many_roots_one_stmt.zer`).
 - **B2 shared union-switch** (BUG-754): the union-switch lowering used to alias the
   shared bytes (`sw_ref = &g.union`) and read tag/capture AFTER the lock released.
   Fix = **copy-out**: when `find_shared_root_expr(sw_expr) != NULL` (covers

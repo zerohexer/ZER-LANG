@@ -57,19 +57,14 @@ zerc_main.c:    Node *import_asts[64];
 # handler (never silently drops; defer_bodies_cap doubles). Mirrors LowerCtx's
 # own label_inline[32] in the same struct.
 ir_lower.c:    Node *defer_bodies_inline[32];
-# B1 multi-root lock (2026-06-21): bounded local scratch for the distinct
-# shared(rw) roots in ONE statement. Realistic max is 2-3 (a statement reading
-# >16 distinct shared structs is not a real program); find_all_shared_roots_expr
-# stops at max, never overflowing. emit_shared_lock_if_needed +
-# emit_shared_unlock_if_needed re-derive the same set, so lock/unlock stay paired.
-ir_lower.c:        Node *roots[16]; int n = 0;
-# B1 orelse capture/replay (2026-07-16): the block-iterator and for-init capture
-# the extra shared roots locked for ONE statement so the unlock replays exactly
-# that set across the orelse rewrite (fixes the same-type two-instance orelse
-# data race). Same 16-bound as roots[16] above (find_all_shared_roots_expr caps
-# at 16); realistic max 2-3. Short-lived per-iteration scratch.
-ir_lower.c:            Node *shared_extra[16]; int shared_extra_n = 0;
-ir_lower.c:        Node *init_extra[16]; int init_extra_n = 0;
+# BUG-917 (2026-09-05): the shared-root set of ONE statement (SharedRootVec) —
+# stack FAST PATH of 16 with heap doubling in add_shared_root_unique, the Rule #7
+# shape. It REPLACES the three capped `roots[16]` / `shared_extra[16]` /
+# `init_extra[16]` arrays that used to sit here with the justification ">16 roots
+# is not a real program": the cap silently stopped collecting at the 17th root, so
+# a statement reading 18 shared(rw) structs locked 16 and read two bare (verified
+# in the emitted C). Not a cap: the 17th root grows the vector.
+ir_lower.c:    Node *inline_items[16];
 # BUG-794 (2026-08-17): stack FAST PATH for the atomic-cell access-path walk, with
 # arena overflow doubling right below it (the prescribed Rule #7 shape, same as
 # parser.c stack_decls / zercheck_ir.c fast_stack). Not a cap: a deeper chain grows

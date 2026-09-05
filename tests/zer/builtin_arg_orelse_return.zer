@@ -1,0 +1,24 @@
+// BUG-918: an `orelse return` / `orelse <value>` INSIDE a builtin method's
+// argument list. Builtin args are emitted from the AST, and the orelse was
+// never pre-lowered on that route: the compiler printed "compiler bug: orelse
+// with control-flow fallback in a spawn argument", emitted a runtime trap, and
+// zercheck reported `mh` as never freed (it could not key the free's argument).
+// The orelse is now hoisted to a branch + temp like every other expression.
+struct T { u32 v; }
+struct U { u32 w; }
+Slab(T) heap;
+Pool(U, 4) pool;
+u32 main() {
+    ?Handle(T) mh = heap.alloc();
+    Handle(T) h = mh orelse { return 1; };
+    h.v = 3;
+    heap.free(mh orelse return);
+
+    ?Handle(U) mp = pool.alloc();
+    Handle(U) p = mp orelse { return 2; };
+    p.w = 4;
+    u32 got = pool.get(mp orelse return).w;
+    if (got != 4) { return 3; }
+    pool.free(mp orelse return);
+    return 0;
+}

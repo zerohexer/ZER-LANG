@@ -796,6 +796,18 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         /* Decompose arguments to locals (skip for builtins — type-name args) */
         int *arg_locals = NULL;
         int arg_count = expr->call.arg_count;
+        if (call_is_builtin) {
+            /* BUG-918 (2026-09-05): a builtin's args are emitted from the AST
+             * (`heap.free(mh orelse return)`), and an `orelse` that survives to
+             * the emitter has no lowering for its control-flow fallback — the
+             * emitter printed "compiler bug: orelse ... in a spawn argument" and
+             * zercheck, unable to key the free's argument, reported `mh` as
+             * never freed. Hoist every orelse in the args to a branch + temp
+             * exactly as the passthrough route does; a type-name arg is a bare
+             * NODE_IDENT, which pre_lower_orelse leaves untouched. */
+            for (int i = 0; i < arg_count; i++)
+                pre_lower_orelse(ctx, &expr->call.args[i], expr->loc.line);
+        }
         if (arg_count > 0 && !call_is_builtin && !call_is_comptime) {
             arg_locals = (int *)arena_alloc(ctx->arena, arg_count * sizeof(int));
             for (int i = 0; i < arg_count; i++) {
@@ -1322,22 +1334,56 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
  * multi-shared-TYPE deadlock check already rejects the multi-WRITE case, so any
  * statement that reaches here with >1 root is all-reads. Uses if/else (not a
  * switch) to avoid the walker-default audit. */
-static void add_shared_root_unique(Node *root, Node **out, int *count, int max) {
-    if (!root || *count >= max) return;
-    for (int i = 0; i < *count; i++) {
-        if (out[i] == root) return;
-        if (out[i]->kind == NODE_IDENT && root->kind == NODE_IDENT &&
-            out[i]->ident.name_len == root->ident.name_len &&
-            memcmp(out[i]->ident.name, root->ident.name,
+/* BUG-917 (2026-09-05): the set of distinct shared roots locked for ONE
+ * statement. Stack-first (16 inline) with heap doubling — NOT a cap. The old
+ * `Node *roots[16]` + `*count >= max` early return silently STOPPED COLLECTING
+ * at the 17th root, so a statement reading 18 shared(rw) structs emitted 16
+ * rdlocks and read the other two with no lock at all (verified in the emitted
+ * C: a1..a16 locked, a17/a18 bare). The baseline justification said ">16 is
+ * not a real program" — but the consequence of exceeding a "not real" bound
+ * must be a diagnostic or growth, never a silent race. */
+typedef struct {
+    Node **items;
+    int n;
+    int cap;
+    Node *inline_items[16];
+} SharedRootVec;
+
+static void srv_init(SharedRootVec *v) {
+    v->items = v->inline_items;
+    v->n = 0;
+    v->cap = 16;
+}
+
+static void srv_free(SharedRootVec *v) {
+    if (v->items != v->inline_items) free(v->items);
+    srv_init(v);
+}
+
+static void add_shared_root_unique(Node *root, SharedRootVec *v) {
+    if (!root) return;
+    for (int i = 0; i < v->n; i++) {
+        if (v->items[i] == root) return;
+        if (v->items[i]->kind == NODE_IDENT && root->kind == NODE_IDENT &&
+            v->items[i]->ident.name_len == root->ident.name_len &&
+            memcmp(v->items[i]->ident.name, root->ident.name,
                    root->ident.name_len) == 0)
             return;
     }
-    out[(*count)++] = root;
+    if (v->n >= v->cap) {
+        int nc = v->cap * 2;
+        Node **ni = (Node **)malloc((size_t)nc * sizeof(Node *));
+        if (!ni) return;   /* OOM: keep what we have (never drop silently below) */
+        memcpy(ni, v->items, (size_t)v->n * sizeof(Node *));
+        if (v->items != v->inline_items) free(v->items);
+        v->items = ni;
+        v->cap = nc;
+    }
+    v->items[v->n++] = root;
 }
 
-static void find_all_shared_roots_expr(Checker *c, Node *expr,
-                                       Node **out, int *count, int max) {
-    if (!expr || *count >= max) return;
+static void find_all_shared_roots_expr(Checker *c, Node *expr, SharedRootVec *v) {
+    if (!expr) return;
     if (expr->kind == NODE_FIELD) {
         /* §E #27 C-F4: check the OBJECT's type at EACH projection step, not just
          * the innermost ident — mirrors the primary lock emitter
@@ -1371,32 +1417,32 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
             cur = next;
         }
         if (shared_sub)
-            add_shared_root_unique(shared_sub, out, count, max);
+            add_shared_root_unique(shared_sub, v);
     }
     if (expr->kind == NODE_BINARY) {
-        find_all_shared_roots_expr(c, expr->binary.left, out, count, max);
-        find_all_shared_roots_expr(c, expr->binary.right, out, count, max);
+        find_all_shared_roots_expr(c, expr->binary.left, v);
+        find_all_shared_roots_expr(c, expr->binary.right, v);
     } else if (expr->kind == NODE_ASSIGN) {
-        find_all_shared_roots_expr(c, expr->assign.target, out, count, max);
-        find_all_shared_roots_expr(c, expr->assign.value, out, count, max);
+        find_all_shared_roots_expr(c, expr->assign.target, v);
+        find_all_shared_roots_expr(c, expr->assign.value, v);
     } else if (expr->kind == NODE_CALL) {
         /* BUG-795: see find_shared_root_expr — callee position was never walked. */
-        find_all_shared_roots_expr(c, expr->call.callee, out, count, max);
+        find_all_shared_roots_expr(c, expr->call.callee, v);
         for (int i = 0; i < expr->call.arg_count; i++)
-            find_all_shared_roots_expr(c, expr->call.args[i], out, count, max);
+            find_all_shared_roots_expr(c, expr->call.args[i], v);
     } else if (expr->kind == NODE_UNARY) {
-        find_all_shared_roots_expr(c, expr->unary.operand, out, count, max);
+        find_all_shared_roots_expr(c, expr->unary.operand, v);
     } else if (expr->kind == NODE_INDEX) {
-        find_all_shared_roots_expr(c, expr->index_expr.object, out, count, max);
-        find_all_shared_roots_expr(c, expr->index_expr.index, out, count, max);
+        find_all_shared_roots_expr(c, expr->index_expr.object, v);
+        find_all_shared_roots_expr(c, expr->index_expr.index, v);
     } else if (expr->kind == NODE_TYPECAST) {
-        find_all_shared_roots_expr(c, expr->typecast.expr, out, count, max);
+        find_all_shared_roots_expr(c, expr->typecast.expr, v);
     } else if (expr->kind == NODE_SLICE) {
-        find_all_shared_roots_expr(c, expr->slice.object, out, count, max);
+        find_all_shared_roots_expr(c, expr->slice.object, v);
         if (expr->slice.start)
-            find_all_shared_roots_expr(c, expr->slice.start, out, count, max);
+            find_all_shared_roots_expr(c, expr->slice.start, v);
         if (expr->slice.end)
-            find_all_shared_roots_expr(c, expr->slice.end, out, count, max);
+            find_all_shared_roots_expr(c, expr->slice.end, v);
     } else if (expr->kind == NODE_INTRINSIC) {
         /* §E #27 B1: the secondary-lock walker must recurse intrinsic args
          * (`@truncate(u32, gb.v)`) like the primary find_shared_root_expr does.
@@ -1411,17 +1457,17 @@ static void find_all_shared_roots_expr(Checker *c, Node *expr,
             (nlen == 4 && memcmp(nm, "once", 4) == 0);
         if (!intrinsic_handles_own_lock) {
             for (int i = 0; i < expr->intrinsic.arg_count; i++)
-                find_all_shared_roots_expr(c, expr->intrinsic.args[i], out, count, max);
+                find_all_shared_roots_expr(c, expr->intrinsic.args[i], v);
         }
     } else if (expr->kind == NODE_ORELSE) {
         /* §E #27 B1: an orelse fallback reading another shared struct
          * (`maybe_v() orelse gb.v`) needs gb locked too. */
-        find_all_shared_roots_expr(c, expr->orelse.expr, out, count, max);
-        find_all_shared_roots_expr(c, expr->orelse.fallback, out, count, max);
+        find_all_shared_roots_expr(c, expr->orelse.expr, v);
+        find_all_shared_roots_expr(c, expr->orelse.fallback, v);
     } else if (expr->kind == NODE_STRUCT_INIT) {
         /* §E #27 B1: `Pair p = { .a = ga.v, .b = gb.v }` needs both locks. */
         for (int i = 0; i < expr->struct_init.field_count; i++)
-            find_all_shared_roots_expr(c, expr->struct_init.fields[i].value, out, count, max);
+            find_all_shared_roots_expr(c, expr->struct_init.fields[i].value, v);
     }
 }
 
@@ -1521,7 +1567,7 @@ static bool stmt_writes_shared_ir(Node *stmt) {
 }
 
 /* B1 lock emission. Captures the EXTRA shared roots locked (beyond the primary)
- * into extra_out[]/extra_n so the paired unlock can replay EXACTLY that set —
+ * into `extras` (a growable SharedRootVec, BUG-917) so the paired unlock can replay EXACTLY that set —
  * re-deriving at unlock time is unsound because lowering destructively rewrites
  * a NODE_ORELSE in between (the previous code sidestepped this by skipping
  * extras entirely for orelse statements, leaving `x = ga.v orelse gb.v` with gb
@@ -1534,8 +1580,8 @@ static bool stmt_writes_shared_ir(Node *stmt) {
  * read locks compose (B1); only the pre-existing AB-BA liveness floor is
  * unchanged. */
 static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root,
-                                       Node **extra_out, int *extra_n) {
-    if (extra_n) *extra_n = 0;
+                                       SharedRootVec *extras) {
+    srv_init(extras);
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
@@ -1545,35 +1591,41 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     emit_inst(ctx, lock);
     Node *se = stmt_shared_expr_ir(stmt);
     if (se) {
-        Node *roots[16]; int n = 0;
-        find_all_shared_roots_expr(ctx->checker, se, roots, &n, 16);
-        for (int i = 0; i < n; i++) {
-            if (roots[i] == root) continue; /* primary already locked */
+        /* BUG-917: collect EVERY root (growable), lock each extra, and keep the
+         * exact set in `extras` so the unlock replays it. */
+        SharedRootVec roots;
+        srv_init(&roots);
+        find_all_shared_roots_expr(ctx->checker, se, &roots);
+        for (int i = 0; i < roots.n; i++) {
+            if (roots.items[i] == root) continue; /* primary already locked */
             IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
-            l2.expr = roots[i];
+            l2.expr = roots.items[i];
             l2.src2_local = 0; /* read lock for extras */
             emit_inst(ctx, l2);
-            if (extra_out && extra_n && *extra_n < 16)
-                extra_out[(*extra_n)++] = roots[i];
+            add_shared_root_unique(roots.items[i], extras);
         }
+        srv_free(&roots);
     }
 }
 
+/* Unlock the CAPTURED extras (reverse order), then the primary, and release
+ * the capture vector. Replaying the captured set (not re-deriving) keeps
+ * lock/unlock balanced across the orelse rewrite. Safe to call with a NULL
+ * root (no lock was taken) — the vector is still released. */
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
-                                         Node **extra, int extra_n) {
-    if (!root) return;
-    /* Unlock the CAPTURED extras (reverse order), then the primary. Replaying
-     * the captured set (not re-deriving) keeps lock/unlock balanced across the
-     * orelse rewrite. */
-    for (int i = extra_n - 1; i >= 0; i--) {
-        if (!extra || !extra[i]) continue;
-        IRInst u2 = make_inst(IR_UNLOCK, root->loc.line);
-        u2.expr = extra[i];
-        emit_inst(ctx, u2);
+                                         SharedRootVec *extras) {
+    if (root) {
+        for (int i = extras->n - 1; i >= 0; i--) {
+            if (!extras->items[i]) continue;
+            IRInst u2 = make_inst(IR_UNLOCK, root->loc.line);
+            u2.expr = extras->items[i];
+            emit_inst(ctx, u2);
+        }
+        IRInst unlock = make_inst(IR_UNLOCK, root->loc.line);
+        unlock.expr = root;
+        emit_inst(ctx, unlock);
     }
-    IRInst unlock = make_inst(IR_UNLOCK, root->loc.line);
-    unlock.expr = root;
-    emit_inst(ctx, unlock);
+    srv_free(extras);
 }
 
 /* Check if an expression contains NODE_ORELSE at the top level */
@@ -2107,9 +2159,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         ctx->func->current_scope++;
         for (int i = 0; i < node->block.stmt_count; i++) {
             Node *shared_root;
-            Node *shared_extra[16]; int shared_extra_n = 0;
+            SharedRootVec shared_extra;
             Node *stmt = node->block.stmts[i];
-            emit_shared_lock_if_needed(ctx, stmt, &shared_root, shared_extra, &shared_extra_n);
+            emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
             /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
              * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
              * IR_RETURN terminates the block. Cross-thread access then
@@ -2125,7 +2177,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ret.src1_local = lower_expr(ctx, ret_expr);
                     if (ret.src1_local < 0) ret.expr = ret_expr;
                 }
-                emit_shared_unlock_if_needed(ctx, shared_root, shared_extra, shared_extra_n);
+                emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
                 shared_root = NULL;
                 emit_defer_fire(ctx, stmt->loc.line);
                 emit_inst(ctx, ret);
@@ -2147,7 +2199,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
             lower_stmt(ctx, stmt);
             ctx->current_stmt_shared_root = prev_shared;
-            emit_shared_unlock_if_needed(ctx, shared_root, shared_extra, shared_extra_n);
+            emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
         }
         /* Fire defers pushed inside THIS block at block exit.
          *
@@ -2569,9 +2621,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * silently writes the shared field with no synchronization
          * (NODE_BLOCK's per-stmt lock wrapper doesn't fire on for-init). */
         Node *init_root = NULL;
-        Node *init_extra[16]; int init_extra_n = 0;
+        SharedRootVec init_extra;
+        srv_init(&init_extra);
         if (node->for_stmt.init) {
-            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &init_root, init_extra, &init_extra_n);
+            emit_shared_lock_if_needed(ctx, node->for_stmt.init, &init_root, &init_extra);
             /* Expose the active lock root so nested early-exits inside
              * the init (e.g., `for (u32 v = g.field orelse return; ...)`
              * — orelse fallback inside for-init) release the lock before
@@ -2580,9 +2633,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->current_stmt_shared_root = init_root ? init_root : prev_shared;
             lower_stmt(ctx, node->for_stmt.init);
             ctx->current_stmt_shared_root = prev_shared;
-            if (init_root) {
-                emit_shared_unlock_if_needed(ctx, init_root, init_extra, init_extra_n);
-            }
+            emit_shared_unlock_if_needed(ctx, init_root, &init_extra);
         }
 
         int bb_cond = ir_add_block(ctx->func, ctx->arena);

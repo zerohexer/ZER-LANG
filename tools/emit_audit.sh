@@ -64,6 +64,43 @@ for sample in "${SAMPLES[@]}"; do
     done
 done
 
+# ---- REQUIRED fingerprints (BUG-917, 2026-09-05) ----
+# The mirror image of a dead stub: emission that must be PRESENT and was
+# silently dropped. A fixed 16-slot root array made a statement reading 18
+# shared(rw) structs lock 16 of them and read two bare — no diagnostic, no
+# trap, just a race. Each entry is "sample|pattern": the emitted C for the
+# sample must contain the pattern. Add an entry whenever a lock/guard/trap
+# emission is found missing for a shape; a grid that only checks diagnostics
+# cannot see a dropped emission.
+REQUIRED=(
+    "tests/zer/shared_many_roots_one_stmt.zer|rdlock\\(&a17"
+    "tests/zer/shared_many_roots_one_stmt.zer|rdlock\\(&a18"
+)
+MISSING=0
+for entry in "${REQUIRED[@]}"; do
+    sample="${entry%%|*}"
+    pattern="${entry#*|}"
+    if [ ! -f "$sample" ]; then
+        echo "REQUIRED sample missing: $sample"
+        MISSING=$((MISSING + 1))
+        continue
+    fi
+    if ! "$ZERC" "$sample" --emit-c -o "$TMP" 2>/dev/null; then
+        echo "REQUIRED sample failed to compile: $sample"
+        MISSING=$((MISSING + 1))
+        continue
+    fi
+    if ! grep -E "$pattern" "$TMP" > /dev/null 2>&1; then
+        echo "DROPPED EMISSION in $sample: expected pattern '$pattern' not found"
+        MISSING=$((MISSING + 1))
+    fi
+done
+if [ $MISSING -ne 0 ]; then
+    echo ""
+    echo "$MISSING required emission(s) missing. See BUG-917 in BUGS-FIXED.md."
+    exit 1
+fi
+
 if [ $FOUND -eq 0 ]; then
     echo "OK — no dead-stub markers in emitted C across ${#SAMPLES[@]} samples."
     exit 0

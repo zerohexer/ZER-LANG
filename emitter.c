@@ -10326,9 +10326,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             node->orelse.fallback_is_continue) {
             /* Control flow out of an argument list has no meaning here; the
              * checker rejects it, so reaching this is a compiler bug. */
-            fprintf(stderr, "compiler bug: orelse with control-flow fallback in a "
-                            "spawn argument at line %d\n", node->loc.line);
-            emit(e, "(_zer_trap(\"orelse control-flow fallback in spawn arg\", "
+            /* BUG-918: this arm is reached from ANY passthrough expression the
+             * lowering did not pre-lower (spawn args, and — before the fix —
+             * builtin call args), so the message must not name one of them. */
+            fprintf(stderr, "compiler bug: orelse with control-flow fallback survived "
+                            "lowering in a passthrough expression at line %d\n",
+                    node->loc.line);
+            emit(e, "(_zer_trap(\"orelse control-flow fallback survived lowering\", "
                  "__FILE__, __LINE__), 0)");
             return;
         }

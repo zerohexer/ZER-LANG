@@ -1,0 +1,32 @@
+// BUG-917: ONE statement reading 18 distinct shared(rw) structs. The B1
+// multi-root lock collector used a fixed 16-slot array and silently stopped
+// collecting at the 17th root, so a17/a18 were read with NO lock (verified in
+// the emitted C on the pre-fix build). tools/emit_audit.sh asserts that the
+// emitted C for this file takes a read lock on every one of the 18 roots.
+shared(rw) struct S { u32 v; }
+S a1;
+S a2;
+S a3;
+S a4;
+S a5;
+S a6;
+S a7;
+S a8;
+S a9;
+S a10;
+S a11;
+S a12;
+S a13;
+S a14;
+S a15;
+S a16;
+S a17;
+S a18;
+u32 main() {
+    a17.v = 1;
+    a18.v = 1;
+    u32 x = a1.v + a2.v + a3.v + a4.v + a5.v + a6.v + a7.v + a8.v + a9.v + a10.v +
+            a11.v + a12.v + a13.v + a14.v + a15.v + a16.v + a17.v + a18.v;
+    if (x != 2) { return 1; }
+    return 0;
+}

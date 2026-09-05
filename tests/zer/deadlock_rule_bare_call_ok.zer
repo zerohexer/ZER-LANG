@@ -1,0 +1,25 @@
+// A statement that only CALLS a function holds no lock of its own, so the callee's
+// sequential per-statement locks on S and T can never nest — no deadlock. The
+// same-statement deadlock rule used to merge the callee's transitive shared types
+// into a lock-free statement and reject `u32 r = f();` (relaxed 2026-09-05).
+// `g.v = f();` — a lock held AROUND the call — stays rejected
+// (tests/zer_fail/deadlock_call_under_lock.zer).
+shared struct S { ?u32 v; }
+shared struct T { u32 c; }
+S g;
+T t;
+u32 f() {
+    defer { t.c += 1; }
+    u32 x = g.v orelse return;
+    return x;
+}
+u32 main() {
+    u32 r = f();
+    if (r != 0) { return 1; }
+    g.v = 5;
+    r = f();
+    if (r != 5) { return 2; }
+    u32 c = t.c;
+    if (c != 2) { return 3; }
+    return 0;
+}

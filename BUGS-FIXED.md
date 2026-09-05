@@ -207,6 +207,32 @@ Tests: `tests/zer_fail/defer_frees_maybe_freed_handle.zer`, `..._pool_handle.zer
 `defer_nested_32_levels_ok.zer`, `defer_orelse_value_ok.zer`; the defer-goto matrix (36
 cells, runtime balance) and every existing defer/goto test unchanged.
 
+### Two relaxations the audit measured as over-rejections (reject → accept, verified both ways)
+Both were found by probing the new defer lowering with real programs; both are checker
+rules whose stated reason was narrower than their code, and both were verified to REJECT on
+the pre-fix build and to keep rejecting the shapes their negatives pin.
+
+**`break` / `continue` of a loop nested INSIDE a defer body, `@critical` block or `@once`
+body.** The ban keyed on "inside a defer / @critical / @once" alone, so a `for` loop inside
+a defer body could not `break` out of ITSELF — though that leaves the loop, not the cleanup.
+`Checker.loop_depth` plus the depth at which the innermost defer / @critical / @once body
+began (`defer_loop_base` …) give `eff_defer_depth_for_jump` / `eff_critical_depth_for_jump`
+/ `jump_leaves_once`: the depths a jump would actually LEAVE. The VST-verified predicates
+(`zer_break_allowed_in_context` …) are unchanged — they receive the effective depths. A
+`break` of a loop that ENCLOSES the block still leaves it and stays rejected
+(`tests/zer_fail/critical_break.zer`, `orelse_break_in_critical.zer`). Tests:
+`tests/zer/defer_body_inner_loop_break_continue.zer`, `critical_inner_loop_break_continue.zer`.
+
+**The same-statement deadlock rule and a bare call.** `u32 r = f();` was rejected when `f`
+touches two shared structs (sequentially, in separate statements of its own), because the
+rule merged the callee's transitive shared types into every calling statement. A statement
+with no DIRECT shared access takes no lock (`find_shared_root_in_stmt_ir` locks only a
+direct root), so nothing can nest around the call; the callee's own statements are checked
+when its block is. `check_block_lock_ordering` now recomputes the statement's DIRECT set
+(`shared_collect_direct_only`) and skips the error when it is empty. `g.v = f();` — S held
+around f's lock of T — stays rejected (`tests/zer_fail/deadlock_call_under_lock.zer`);
+all eleven existing deadlock negatives unchanged. Test: `tests/zer/deadlock_rule_bare_call_ok.zer`.
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

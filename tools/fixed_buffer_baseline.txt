@@ -85,3 +85,9 @@ zercheck_ir.c:    int view_alloc_ids[8];
 # already auto-guarded (guard_mark grows it into the arena by doubling — the
 # Rule #7 shape, not a cap). Same pattern as defer_bodies_inline right above it.
 ir_lower.c:    Node *guarded_inline[32];
+# 2026-09-05 (deadlock-rule relaxation): the statement's DIRECT shared-type set,
+# a sibling of the `Type *found[4];` scratch right above it in
+# check_block_lock_ordering. The collector stops at max_types and the only question
+# asked of this array is whether it is EMPTY (n_direct == 0 ⇒ the statement holds
+# no lock), so the bound cannot change the verdict.
+checker.c:            Type *direct[4];

@@ -50,6 +50,17 @@ typedef struct {
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
+    /* 2026-09-05 relaxation: loop nesting depth, and the depth at which the
+     * innermost defer / @critical / @once body began. A break/continue whose
+     * target loop is INSIDE that body leaves only the loop; one whose target
+     * loop ENCLOSES the body would leave the body early and stays banned. */
+    int loop_depth;
+    int defer_loop_base;
+    int critical_loop_base;
+    int once_loop_base;
+    /* 2026-09-05 relaxation: while true, collect_shared_types_in_expr skips a
+     * callee's transitive shared types (the DIRECT set of a statement). */
+    bool shared_collect_direct_only;
     /* 2026-08-03: > 0 when inside a RUNTIME-conditional body (if/else arm, loop
      * body, switch arm). The scoped-borrow tracker is a linear statement-order
      * approximation, so a `th.join()` nested in a branch must NOT release the

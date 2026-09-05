@@ -861,6 +861,21 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
 static void vrp_widen_all_top(Checker *c, int n);
+/* 2026-09-05 relaxation: the defer / @critical depth a break or continue at
+ * this point would actually LEAVE. A loop entered INSIDE the innermost defer
+ * (or @critical / @once) body is left without leaving that body, so the ban
+ * does not apply; a loop that encloses the body would be left THROUGH the
+ * body's end, which is the case the ban exists for. Enabled by BUG-920: the
+ * lowering handles a loop inside a defer body like any other loop. */
+static int eff_defer_depth_for_jump(Checker *c) {
+    return (c->defer_depth > 0 && c->loop_depth > c->defer_loop_base) ? 0 : c->defer_depth;
+}
+static int eff_critical_depth_for_jump(Checker *c) {
+    return (c->critical_depth > 0 && c->loop_depth > c->critical_loop_base) ? 0 : c->critical_depth;
+}
+static bool jump_leaves_once(Checker *c) {
+    return c->in_once && !(c->loop_depth > c->once_loop_base);
+}
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
 static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
@@ -9971,23 +9986,25 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
         if (node->orelse.fallback_is_break &&
-            zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
+            zer_break_allowed_in_context(eff_defer_depth_for_jump(c),
+                                          eff_critical_depth_for_jump(c),
                                           c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+            if (eff_defer_depth_for_jump(c) > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'orelse break' inside defer block — corrupts cleanup flow");
-            } else if (c->critical_depth > 0) {
+            } else if (eff_critical_depth_for_jump(c) > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'orelse break' inside @critical block — interrupts would not be re-enabled");
             }
         }
         if (node->orelse.fallback_is_continue &&
-            zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
+            zer_continue_allowed_in_context(eff_defer_depth_for_jump(c),
+                                             eff_critical_depth_for_jump(c),
                                              c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+            if (eff_defer_depth_for_jump(c) > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'orelse continue' inside defer block — corrupts cleanup flow");
-            } else if (c->critical_depth > 0) {
+            } else if (eff_critical_depth_for_jump(c) > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'orelse continue' inside @critical block — interrupts would not be re-enabled");
             }
@@ -15017,6 +15034,7 @@ static void check_stmt(Checker *c, Node *node) {
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        c->loop_depth++;
         /* B1 (2026-08-01): snapshot the post-pre-pass VALUES and restore them
          * after the body. `var_range_count = saved_range_count` below only drops
          * entries PUSHED by the body — it cannot undo an IN-PLACE mutation of an
@@ -15033,6 +15051,7 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1_pre, b1_saved);
         free(b1_pre);
         c->in_loop = prev_in_loop;
+        c->loop_depth--;
         c->var_range_count = saved_range_count; /* ranges invalid after loop */
         pop_scope(c);
         break;
@@ -15094,6 +15113,7 @@ static void check_stmt(Checker *c, Node *node) {
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        c->loop_depth++;
         /* B1 (2026-08-01): same in-place-mutation leak as the for-loop — see the
          * comment there. `var_range_count = saved_range_count` drops only entries
          * PUSHED by the body; a narrowing that mutated a pre-existing entry
@@ -15106,6 +15126,7 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1w_pre, b1w_saved);
         free(b1w_pre);
         c->in_loop = prev_in_loop;
+        c->loop_depth--;
         c->var_range_count = saved_range_count;
         break;
     }
@@ -16165,18 +16186,20 @@ static void check_stmt(Checker *c, Node *node) {
         break;
     }
 
-    case NODE_BREAK:
-        if (c->in_once) {
+    case NODE_BREAK: {
+        if (jump_leaves_once(c)) {
             checker_error(c, node->loc.line,
                 "cannot use 'break' inside @once block — it would skip the one-time "
                 "completion publish and hang threads waiting on @once");
         }
-        /* SAFETY: zer_break_allowed_in_context in src/safety/context_bans.c */
-        if (zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
-                                           c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+        /* SAFETY: zer_break_allowed_in_context in src/safety/context_bans.c.
+         * The depths passed are the ones this jump would LEAVE (see
+         * eff_defer_depth_for_jump) — the predicate itself is unchanged. */
+        int eff_d = eff_defer_depth_for_jump(c), eff_c = eff_critical_depth_for_jump(c);
+        if (zer_break_allowed_in_context(eff_d, eff_c, c->in_loop ? 1 : 0) == 0) {
+            if (eff_d > 0) {
                 checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
-            } else if (c->critical_depth > 0) {
+            } else if (eff_c > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'break' inside @critical block — interrupts would not be re-enabled");
             } else {
@@ -16184,6 +16207,7 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         break;
+    }
 
     case NODE_GOTO:
         if (c->in_once) {
@@ -16222,18 +16246,18 @@ static void check_stmt(Checker *c, Node *node) {
         }
         break;
 
-    case NODE_CONTINUE:
-        if (c->in_once) {
+    case NODE_CONTINUE: {
+        if (jump_leaves_once(c)) {
             checker_error(c, node->loc.line,
                 "cannot use 'continue' inside @once block — it would skip the one-time "
                 "completion publish and hang threads waiting on @once");
         }
         /* SAFETY: zer_continue_allowed_in_context in src/safety/context_bans.c */
-        if (zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
-                                              c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+        int eff_d = eff_defer_depth_for_jump(c), eff_c = eff_critical_depth_for_jump(c);
+        if (zer_continue_allowed_in_context(eff_d, eff_c, c->in_loop ? 1 : 0) == 0) {
+            if (eff_d > 0) {
                 checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
-            } else if (c->critical_depth > 0) {
+            } else if (eff_c > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'continue' inside @critical block — interrupts would not be re-enabled");
             } else {
@@ -16241,6 +16265,7 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         break;
+    }
 
     case NODE_DEFER:
         /* Ban yield/await in defer body — corrupts Duff's device state machine.
@@ -16258,6 +16283,8 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
+        int saved_defer_loop_base = c->defer_loop_base;
+        c->defer_loop_base = c->loop_depth;
         {
             /* VRP (B4, 2026-08-01): a defer body runs at SCOPE EXIT, i.e. AFTER
              * every statement between the `defer` and the exit. So a range
@@ -16290,6 +16317,7 @@ static void check_stmt(Checker *c, Node *node) {
             vrp_snap_restore(c, vrp_pre, vrp_saved);
             free(vrp_pre);
         }
+        c->defer_loop_base = saved_defer_loop_base;
         c->defer_depth--;
         break;
 
@@ -17321,9 +17349,12 @@ static void check_stmt(Checker *c, Node *node) {
                   "malloc/calloc/free may deadlock when interrupts are disabled. "
                   "Use Pool(T, N) instead, or move the call outside @critical");
         c->critical_depth++;
+        int saved_critical_loop_base = c->critical_loop_base;
+        c->critical_loop_base = c->loop_depth;
         if (node->critical.body) {
             check_stmt(c, node->critical.body);
         }
+        c->critical_loop_base = saved_critical_loop_base;
         c->critical_depth--;
         break;
 
@@ -17336,7 +17367,9 @@ static void check_stmt(Checker *c, Node *node) {
          * called from @once. No existing code uses control flow in a @once body.) */
         if (node->once.body) {
             bool saved_in_once = c->in_once;
+            int saved_once_loop_base = c->once_loop_base;
             c->in_once = true;
+            c->once_loop_base = c->loop_depth;
             /* VRP (B5, 2026-08-01): a @once body runs AT MOST ONCE — skipped on
              * every later call and on loser threads. So a range narrowed inside
              * is valid only on the RUN path; the SKIP path keeps the pre-body
@@ -17358,6 +17391,7 @@ static void check_stmt(Checker *c, Node *node) {
             vrp_snap_join(c, vrp_pre, vrp_saved);
             free(vrp_pre);
             c->in_once = saved_in_once;
+            c->once_loop_base = saved_once_loop_base;
         }
         break;
 
@@ -22878,7 +22912,8 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
         /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
          * Uses DFS with memoization — no depth limit, handles mutual recursion.
          * Each function computed once via compute_func_shared_types(). */
-        if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+        if (!c->shared_collect_direct_only &&
+            count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
             const char *cn = expr->call.callee->ident.name;
             uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
             compute_func_shared_types(c, cn, cl);
@@ -22997,7 +23032,24 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
         /* Check for multi-shared-type expressions within a single statement */
         Type *found[4];
         int n = collect_shared_types_in_stmt(c, stmt, found, 4);
+        /* 2026-09-05 relaxation: the callee-transitive types matter only when
+         * this statement HOLDS a lock around the call, i.e. it accesses a shared
+         * struct DIRECTLY (the lowering takes a statement lock only for a direct
+         * shared root — find_shared_root_in_stmt_ir). A bare `r = f();` holds
+         * nothing, so f's sequential per-statement locks on S and T cannot nest
+         * and there is no deadlock to report; f's own statements are checked
+         * when f's block is. `g.v = f()` (S held around f's lock of T) stays an
+         * error. */
+        int n_direct = 0;
         if (n >= 2) {
+            Type *direct[4];
+            c->shared_collect_direct_only = true;
+            n_direct = collect_shared_types_in_stmt(c, stmt, direct, 4);
+            c->shared_collect_direct_only = false;
+        }
+        if (n >= 2 && n_direct == 0) {
+            /* lock-free statement — nothing can nest */
+        } else if (n >= 2) {
             /* Two different shared types in one statement — potential deadlock.
              * BUG-500: skip for shared(rw) read-only statements. rwlock allows
              * concurrent readers — no deadlock. Only writes need exclusive lock. */

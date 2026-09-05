@@ -3027,6 +3027,18 @@ Variable shadowing of function params banned in async functions. Params and loca
 ### BUG-500: shared(rw) read-only multi-type allowed
 Deadlock check now skips when BOTH shared types are `is_shared_rw` AND statement is read-only. `pthread_rwlock_rdlock` allows concurrent readers — no deadlock. Write statements still trigger deadlock check.
 
+**2026-09-05 relaxation — a bare call holds no lock.** `check_block_lock_ordering` merges a
+callee's transitive shared types into the calling statement (BUG-474 DFS cache). That is
+right only when the statement HOLDS a lock around the call, i.e. accesses a shared struct
+directly (`find_shared_root_in_stmt_ir` takes a statement lock only for a direct root).
+`u32 r = f();` holds nothing, so f's sequential per-statement locks cannot nest and there
+is no deadlock to report — f's own statements are checked when f's block is. The check now
+recomputes the statement's DIRECT set (`Checker.shared_collect_direct_only` makes
+`collect_shared_types_in_expr` skip the callee cache) and skips the error when it is empty.
+`g.v = f()` stays an error. Sibling relaxation the same day: `break`/`continue` of a loop
+nested INSIDE a defer / `@critical` / `@once` body (`eff_defer_depth_for_jump` &c. — the
+depth the jump would actually LEAVE; the VST-verified context predicates are unchanged).
+
 ### BUG-501: array.len emitter fix
 Range-for desugaring generates `collection.len` for loop condition. For TYPE_ARRAY, emitter now emits the compile-time array size as literal (`4U`) instead of invalid C `.len` field access. Checker already handled `array.len` → `ty_usize` — emitter was the missing piece.
 

@@ -1271,10 +1271,10 @@ When considering new features, apply the **primitives test**: if the use case ca
 | ISR data race | Shared global without volatile → error. Compound assign on shared volatile → error (non-atomic read-modify-write) |
 | Stack overflow | Recursion detection via call graph DFS → warning. `--stack-limit N` → error when per-function frame or entry-point call chain exceeds N bytes |
 | Misaligned MMIO | `@inttoptr` alignment check — address must match target type alignment (u32=4, u16=2, u64=8) |
-| @critical escape | `return`/`break`/`continue`/`goto` inside `@critical` → compile error (would skip interrupt re-enable) |
+| @critical escape | `return`/`break`/`continue`/`goto` inside `@critical` → compile error (would skip interrupt re-enable). A `break`/`continue` whose target loop is INSIDE the block (or inside a defer body / `@once` body) leaves only that loop and is allowed (relaxed 2026-09-05, `eff_defer_depth_for_jump`) |
 | Interior pointer UAF | `*u32 p = &b.field; free(b); p[0]` → compile error. Field-derived pointers share alloc_id with parent. NODE_INDEX UAF check. |
 | Thread data race | `shared struct` auto-locked. Non-shared pointer to `spawn` → compile error (unless scoped with ThreadHandle+join). Handle to `spawn` → compile error. Spawn target body scanned for non-shared global access: error (no sync) or warning (has @atomic/@barrier). Transitive through callees (8 levels). Escape: volatile, shared, threadlocal, @atomic_*. |
-| Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. |
+| Deadlock | Same-statement multi-shared-type access → compile error. Emitter does lock-per-statement (no nested locks), so cross-statement ordering is safe. Only same-statement access to 2+ shared types is a real deadlock risk. A callee's transitive shared types count ONLY when the statement itself accesses a shared struct directly (it holds a lock around the call); a bare `r = f();` holds nothing (relaxed 2026-09-05) |
 | Ownership transfer | `spawn` with non-shared pointer marks variable HS_TRANSFERRED — use after transfer → compile error. |
 | Move semantics | `move struct` — pass to function or assign transfers ownership, use after transfer → compile error. Compile-time via zercheck. |
 | Thread not joined | Scoped spawn `ThreadHandle` not joined before function exit → zercheck compile error. |
@@ -2340,8 +2340,8 @@ Doesn't fit any? → STOP. Either:
 - `spawn in async` — needs type system (thread lifetime tracking requires borrow checker or GC)
 - `alloc in interrupt` — OS constraint (malloc lock + interrupted malloc = deadlock)
 - `naked non-asm` — hardware constraint (no prologue = no stack)
-- `return/break/continue/goto in @critical` — hardware constraint (skips interrupt re-enable)
-- `return/break/continue/goto in defer` — emission impossibility (corrupts cleanup flow)
+- `return/break/continue/goto in @critical` — hardware constraint (skips interrupt re-enable). NOT a `break`/`continue` of a loop nested INSIDE the block — that leaves the loop, not the block (relaxed 2026-09-05)
+- `return/break/continue/goto in defer` — emission impossibility (corrupts cleanup flow). Same nested-loop exception; and since BUG-920 a value `orelse` inside a defer body is fine (the body is ordinary IR)
 
 **`*opaque` safety coverage:**
 - Pure ZER: 100% compile-time (zercheck #7 handle states)

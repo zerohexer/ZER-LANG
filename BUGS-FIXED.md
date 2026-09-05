@@ -554,6 +554,50 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-941: a spawn argument bound to the WRONG variable
+
+Survey item G. The `NODE_SPAWN` statement is lowered as a raw AST passthrough
+(`sp.expr = node`), and the emitter then emits each argument **by name**. IR lowering
+renames shadowed locals — an inner `x` becomes `x_2` in the emitted C — but this
+passthrough never called `rewrite_idents`, so:
+
+```zer
+u32 x = 1;
+{ u32 x = 7; spawn w(x); }        // emitted `_sa->a0 = x;`  -> the OUTER x
+```
+
+The thread received **1 instead of 7**, with no diagnostic. The EXPRESSION passthrough
+calls `rewrite_idents` for exactly this reason; the statement one did not.
+
+Only the arguments are rewritten — the callee is a function name, not a local, so it
+is not a rename candidate.
+
+### The gap was already BASELINED, which is the part worth noting
+
+`tools/walker_field_baseline.txt` carried
+`ir_lower.c:lower_stmt:NODE_SPAWN:spawn_stmt.args` — the non-descent was **recorded
+and accepted**, with no note that binding the wrong variable was the consequence. So
+the audit had been reporting this arm for as long as the row existed, and the row
+turned the report off.
+
+That is the failure mode CLAUDE.md warns about from the other direction: a baseline
+row is a claim that a site is *safe*, and adding one to quiet a gate converts a live
+defect into silence. When the walker began descending, the audit said so and asked
+for the row's removal in the same commit — *"a stale baseline is worse than none"* —
+which is the gate working in both directions.
+
+### Sibling checked and structurally excluded
+
+`asm` operands also bind ZER lvalues by name. They cannot hit this: `asm` is legal
+only inside a `naked` function, which may contain nothing but asm and return, so no
+local declaration exists to shadow. Measured, and recorded in the test.
+
+Verified across scoped spawn, fire-and-forget, two shadowed args, and an expression
+over a shadowed local; a non-shadowing control is unchanged. The branch's test passes
+and fails on the pre-session build.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

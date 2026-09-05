@@ -146,8 +146,8 @@ binary operand, one `emit_int_literal` that casts >32-bit literals, and a
 file-scope fold for negative trees. **This is the same shape as BUG-933 — see the
 two-spellings row in CLAUDE.md.**
 
-**G. BUG-916 — spawn arguments emitted from the AST by name without
-`rewrite_idents`,** so an argument naming a SHADOWED inner local bound to the wrong
+**G. ~~BUG-916 — spawn arguments emitted from the AST by name without
+`rewrite_idents`,~~ — CLOSED 2026-09-06 as BUG-941, DO NOT REDO.** *(The non-descent was ALREADY in `walker_field_baseline.txt`, so the audit had been silenced on it; the stale row is removed. `asm` operands are the structurally-excluded sibling — asm is legal only in a `naked` function, which cannot declare a local to shadow.)* Original: so an argument naming a SHADOWED inner local bound to the wrong
 variable.
 
 **H. BUG-918 — `orelse` inside a builtin method's args survives lowering.**

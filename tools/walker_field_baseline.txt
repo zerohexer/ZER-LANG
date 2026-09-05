@@ -535,7 +535,6 @@ ir_lower.c:lower_stmt:NODE_ORELSE:orelse.fallback
 ir_lower.c:lower_stmt:NODE_SLICE:slice.end
 ir_lower.c:lower_stmt:NODE_SLICE:slice.object
 ir_lower.c:lower_stmt:NODE_SLICE:slice.start
-ir_lower.c:lower_stmt:NODE_SPAWN:spawn_stmt.args
 ir_lower.c:lower_stmt:NODE_STATIC_ASSERT:static_assert_stmt.cond
 ir_lower.c:lower_stmt:NODE_STRUCT_INIT:struct_init.fields
 ir_lower.c:lower_stmt:NODE_TYPECAST:typecast.expr

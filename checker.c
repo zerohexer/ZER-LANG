@@ -1000,8 +1000,17 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
 
 /* Check if an expression node is a literal that can be assigned to target type.
  * Integer literals fit any integer. Float literals fit any float. null fits ?T. */
+/* BUG-940: defined below, beside the soundness rule it implements. */
+static bool int_literal_tree_fits(Checker *c, Node *e, Type *target);
+
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
+    /* BUG-940: a pure integer-literal TREE is as constant as a lone literal, and
+     * accepting only the latter caused both an over-rejection (`i8 x = -5 - 1;`
+     * refused while `i8 x = -6;` is accepted) and a miscompile (a tree in a BINARY
+     * OPERAND position never reached LIT-1's retype, so `v != (1 << 40)` compared
+     * against a value folded at the default width — BUG-939's residual). */
+    if (int_literal_tree_fits(NULL, expr, target)) return true;
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
@@ -1111,6 +1120,128 @@ static bool is_literal_compatible(Node *expr, Type *target) {
  * an expression has no variable operands, so it can be safely retyped to a
  * destination integer type (below). Excludes anything with an ident/call/field
  * so we never retype a subtree whose value depends on a real variable. */
+/* BUG-940: may a pure integer-literal TREE be evaluated IN `target`'s width and
+ * still give the same answer as the int64 fold?
+ *
+ * `is_literal_compatible` accepted only a LONE `NODE_INT_LIT`, which caused BOTH
+ * halves of one defect:
+ *   - OVER-REJECTION: `i8 x = -5 - 1;` refused while `i8 x = -6;` — the same
+ *     value — is accepted.
+ *   - MISCOMPILE: a tree in a BINARY OPERAND position never reached LIT-1's
+ *     retype, so `v != (1 << 40)` compared against a value folded at the default
+ *     width (the residual left open by BUG-939).
+ *
+ * THE RULE, and why it is sound. For `+ - * << & | ^` and unary `-`/`+`, reduction
+ * mod 2^n is a RING HOMOMORPHISM: computing in n bits and then comparing equals
+ * computing exactly and then reducing. So if every LEAF fits the target and the
+ * exact result fits the target, evaluating in the target width is exact — an
+ * intermediate may wrap and a later operation brings it back.
+ *
+ * `/`, `%`, `>>` and `~` DO NOT commute with the wrap and are refused:
+ *
+ *     u8 b = 300 / 2;     exact 150 (fits u8), but in u8: 300->44, 44/2 = 22
+ *     u8 b = 300 - 100;   exact 200 (fits u8), but leaf 300 does not fit u8
+ *
+ * The second is why the LEAF check is not redundant with the final check — it is
+ * the discriminating case, and dropping it silently changes values.
+ *
+ * Conservative in the REJECT direction throughout: an unfoldable tree, an
+ * unrecognised operator, or a leaf out of range all return false, which merely
+ * keeps today's over-rejection. */
+static bool is_pure_int_literal_expr(Node *e);   /* fwd: defined below */
+static Type *int_retype_target(Type *t);         /* fwd: defined below */
+
+/* Does the exact value `v` fit `eff`'s representable range? Width+signedness only,
+ * so it is one rule for every integer type instead of a per-kind switch. */
+static bool const_int_fits_type(int64_t v, Type *eff) {
+    if (!eff || !type_is_integer(eff)) return false;
+    int w = type_width(eff);
+    if (w <= 0 || w > 64) return false;
+    if (type_is_signed(eff)) {
+        if (w >= 64) return true;
+        int64_t hi = ((int64_t)1 << (w - 1)) - 1;
+        int64_t lo = -((int64_t)1 << (w - 1));
+        return v >= lo && v <= hi;
+    }
+    if (v < 0) return false;
+    if (w >= 64) return true;
+    return (uint64_t)v <= (((uint64_t)1 << w) - 1);
+}
+
+/* Every LEAF literal must be writable in the target. Not required for soundness —
+ * the ring homomorphism already guarantees exactness — but required by ZER's "no
+ * implicit narrowing" stance: `u8 b = 300 - 100;` folds to 200 and is exact in u8,
+ * yet 300 is not a u8 and accepting it would silently narrow what the author wrote.
+ * A leaf under unary minus is checked at its MAGNITUDE, so `-128` is legal for i8
+ * exactly as the lone-literal path already allows. */
+static bool lit_leaves_fit(Node *e, Type *target) {
+    if (!e) return false;
+    Type *eff = type_unwrap_distinct(target);
+    if (!eff) return false;
+    if (e->kind == NODE_INT_LIT) {
+        uint64_t uv = e->int_lit.value;
+        if (uv > (uint64_t)INT64_MAX) return false;
+        int64_t v = (int64_t)uv;
+        if (const_int_fits_type(v, eff)) return true;
+        /* the negated form, for a signed minimum such as i8's -128 */
+        return type_is_signed(eff) && const_int_fits_type(-v, eff);
+    }
+    if (e->kind == NODE_UNARY) return lit_leaves_fit(e->unary.operand, target);
+    if (e->kind == NODE_BINARY)
+        return lit_leaves_fit(e->binary.left, target) &&
+               lit_leaves_fit(e->binary.right, target);
+    return false;
+}
+
+static bool lit_tree_ops_commute_with_wrap(Node *e) {
+    if (!e) return false;
+    if (e->kind == NODE_INT_LIT) return true;
+    if (e->kind == NODE_UNARY) {
+        if (e->unary.op == TOK_TILDE) return false;   /* width-dependent */
+        return lit_tree_ops_commute_with_wrap(e->unary.operand);
+    }
+    if (e->kind == NODE_BINARY) {
+        switch (e->binary.op) {
+        case TOK_SLASH: case TOK_PERCENT: case TOK_RSHIFT:
+            return false;                              /* not homomorphic */
+        case TOK_PLUS: case TOK_MINUS: case TOK_STAR:
+        case TOK_AMP: case TOK_PIPE: case TOK_CARET: case TOK_LSHIFT:
+            return lit_tree_ops_commute_with_wrap(e->binary.left) &&
+                   lit_tree_ops_commute_with_wrap(e->binary.right);
+        default: return false;
+        }
+    }
+    return false;
+}
+
+static bool int_literal_tree_fits(Checker *c, Node *e, Type *target) {
+    (void)c;
+    if (!e || !target) return false;
+    if (e->kind == NODE_INT_LIT) return false;   /* the lone-literal path handles it */
+    if (!is_pure_int_literal_expr(e)) return false;
+    Type *rt = int_retype_target(target);
+    if (!rt) return false;
+    Type *eff = type_unwrap_distinct(rt);
+    if (!eff || !type_is_integer(eff)) return false;
+    /* uN / iN are EXCLUDED, deliberately. `tests/zer_fail/global_uN_arith_narrow.zer`
+     * is a TRIPWIRE whose comment says: if a relaxation ever lets arithmetic reach a
+     * global uN, the global emit path must mask to the width in the same change.
+     * This rule proves the value FITS the declared width, so the over-width value
+     * that tripwire guards against cannot occur — but uN masking is a separate
+     * documented feature with its own emit paths, and nothing here needs uN to work.
+     * Taking on that question is not this fix's job, so the carve-out keeps someone
+     * else's deliberate cross-feature guard meaningful. Standard widths only. */
+    {
+        int w = type_width(eff);
+        if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    }
+    if (!lit_tree_ops_commute_with_wrap(e)) return false;
+    if (!lit_leaves_fit(e, rt)) return false;
+    int64_t folded = eval_const_expr(e);
+    if (folded == CONST_EVAL_FAIL) return false;
+    return const_int_fits_type(folded, eff);
+}
+
 static bool is_pure_int_literal_expr(Node *e) {
     if (!e) return false;
     if (e->kind == NODE_INT_LIT) return true;

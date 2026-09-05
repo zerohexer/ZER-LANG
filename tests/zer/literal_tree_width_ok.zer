@@ -1,0 +1,30 @@
+// BUG-940: a pure integer-literal TREE is as constant as a lone literal.
+// is_literal_compatible accepted only the latter, which caused BOTH an
+// over-rejection (a tree refused where the identical VALUE as one literal is
+// accepted) and a miscompile (a tree in a BINARY OPERAND position never reached
+// LIT-1's retype, so it folded at the default width — BUG-939's residual).
+//
+// SOUNDNESS: for + - * << & | ^ and unary -, reduction mod 2^n is a ring
+// homomorphism, so if every leaf fits and the exact result fits, evaluating in the
+// target width is exact. / % >> ~ do NOT commute and are refused — see the
+// negatives in tests/zer_fail/literal_tree_*.zer.
+//
+// uN / iN are EXCLUDED on purpose: tests/zer_fail/global_uN_arith_narrow.zer is a
+// tripwire asking that any such relaxation add the global width mask in the same
+// change. This rule proves the value fits, so that cannot bite — but uN masking is
+// a separate feature and nothing here needs it.
+u32 main() {
+    i8  a = -5 - 1;      i8  aw = -6;    if (a != aw) { return 1; }
+    u16 b = 100 + 27;                    if (b != 127) { return 2; }
+    u8  c = 1 << 4;                      if (c != 16) { return 3; }
+    i64 d = -7;                          if (d != -7) { return 4; }
+
+    // the BINARY OPERAND position — the residual BUG-939 could not close
+    i64 e = (1 << 40);                   if (e != (1 << 40)) { return 5; }
+    i64 f = 0; f += (1 << 40);           if (f != (1 << 40)) { return 6; }
+
+    // 32-bit semantics must be untouched
+    u32 w = 0xFFFFFFFF; w = w + 1;       if (w != 0) { return 7; }
+    u32 s = 1; s = s << 31;              if (s != 2147483648) { return 8; }
+    return 0;
+}

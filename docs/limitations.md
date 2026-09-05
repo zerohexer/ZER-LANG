@@ -169,8 +169,8 @@ INVALID C.** MEASURED: `?u32 g = 5;` is accepted by the checker and emits
 `_zer_opt_u32 g = 5;` → `gcc: error: invalid initializer`. A valid ZER program that
 cannot be built.
 
-**K. BUG-921 — OVER-REJECTION: a pure integer-literal EXPRESSION is typed by its
-spelling.** MEASURED: `i8 x = -5 - 1;` and `u16 y = 100 + 27;` are rejected while
+**K. ~~BUG-921 — OVER-REJECTION: a pure integer-literal EXPRESSION is typed by its
+spelling.~~ — CLOSED 2026-09-06 as BUG-940, DO NOT REDO.** *(Ring-homomorphism rule: `+ - * << & | ^` and unary `-` commute with the wrap, `/ % >> ~` do not. Leaf-fits + final-fits. **uN/iN excluded** to honour the `global_uN_arith_narrow` tripwire. Also closes BUG-939's binary-operand residual — same predicate. NOTE the ordering: doing this BEFORE 939 would have been harmful.)* Original: MEASURED: `i8 x = -5 - 1;` and `u16 y = 100 + 27;` are rejected while
 the identical VALUE as a lone literal (`i8 x = -6;`) is accepted. Their fix accepts
 any pure-literal tree whose WIDTH-EXACT fold fits — every literal AND intermediate
 must fit, because `/`, `%` and shifts do not commute with the wrap — and looks

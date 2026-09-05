@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize
+// REJECTED because the LEAF 300 is not a u8, even though the tree folds to 200
+// which is. That leaf check is not needed for soundness (the ring homomorphism
+// makes it exact) — it is ZER's no-implicit-narrowing rule applied to a leaf.
+// BUG-940: this tree must NOT be accepted — see literal_tree_width_ok.zer.
+u32 main(){ u8 b = 300 - 100; return (u32)b; }

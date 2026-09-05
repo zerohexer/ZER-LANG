@@ -494,6 +494,66 @@ and says so in-file, so it measures what was fixed rather than what wasn't.
 
 ---
 
+## Session 2026-09-06 — BUG-940: a literal TREE is as constant as a literal
+
+Closes survey item **K (BUG-921)** and the residual **BUG-939** could not.
+`is_literal_compatible` accepted only a lone `NODE_INT_LIT`, and that one gap caused
+two opposite-looking defects:
+
+```zer
+i8 x = -6;          // accepted
+i8 x = -5 - 1;      // SAME VALUE — rejected           (over-rejection)
+i64 v = (1 << 40);
+if (v != (1 << 40))  // tree in a BINARY OPERAND slot — never reached LIT-1's
+                     // retype, so it folded at the default width  (MISCOMPILE)
+```
+
+### The ordering was not symmetric, and it matters
+
+Doing this BEFORE BUG-939 would have been **actively harmful**: accepting more
+literal trees while the retype ran at half the sinks and the emitter still printed
+32-bit literals means *more* programs computing wrong values. 939 is what made 940
+safe. Worth stating, because the entry read as a standalone over-rejection.
+
+### The rule, and why it is sound
+
+For `+ - * << & | ^` and unary `-`, reduction mod 2ⁿ is a **ring homomorphism**, so
+computing in the target width and computing exactly agree whenever the exact result
+fits. `/`, `%`, `>>` and `~` do **not** commute with the wrap and are refused:
+
+```
+u8 b = 300 / 2;     exact 150 fits u8 — but in u8: 300->44, 44/2 = 22
+u8 b = 300 - 100;   exact 200 fits u8 — but the LEAF 300 is not a u8
+```
+
+The second is the discriminating case, and it is why the leaf check is not redundant
+with the final check. The leaf check is **not** required for soundness (the
+homomorphism already gives exactness) — it is ZER's no-implicit-narrowing rule
+applied to a leaf, and it is the reason `u8 b = 300 - 100;` stays rejected.
+
+Conservative in the REJECT direction throughout: an unfoldable tree, an unrecognised
+operator, or an out-of-range leaf all fall through to today's behaviour, so the
+predicate can only ever ACCEPT more.
+
+### A tripwire fired, and I honoured it rather than argue with it
+
+`tests/zer_fail/global_uN_arith_narrow.zer` began compiling. Its comment predicted
+exactly this: *"if this ever COMPILES … the global emit path must mask the result to
+the width at that time."*
+
+This rule proves the value FITS the declared width, so the over-width value that
+tripwire guards against cannot occur — I could have updated it. I did not: uN masking
+is a separate feature with its own emit paths, nothing here needs uN, and overriding
+a deliberate cross-feature guard to save a carve-out is a bad trade. **uN/iN are
+excluded; standard widths only.** The reasoning is recorded at the carve-out and in
+the positive.
+
+Tests: `tests/zer/literal_tree_width_ok.zer` (verified failing on the pre-session
+build) and four negatives — leaf out of range, result out of range, `/`, `>>` — each
+with `expect-error` and each verified rejected pre-fix for the same reason.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

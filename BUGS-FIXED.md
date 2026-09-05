@@ -378,6 +378,54 @@ Three negatives from the branch, each verified accepted pre-fix.
 
 ---
 
+## Session 2026-09-06 — BUG-938: `&` was treated as capture, even through a pointer
+
+From the `loving-davinci-ii7a90` survey. The UAF walker skipped every `&` operand,
+with the reason *"& is capture, not read"*. Measured accepted on main:
+
+```zer
+free(h);  wr(&h.v);        // h is *T  — `h.v` auto-derefs h
+free(s);  wr(&s[0]);       // s is [*]u8 — indexing derefs
+```
+
+**The reason was half right, which is why it survived.** `&local.field` really does
+dereference nothing — navigating a value struct is address arithmetic. The skip was
+correct for that and wrong the moment the chain crosses a pointer.
+
+This is the codebase's own rule read carefully: *"FORMING a reference aliases;
+READING a value does not."* `&` forms a reference, and the question the skip never
+asked is whether **getting to** the addressed thing went through an allocation.
+
+**Fix:** `ir_addr_of_deref_target` walks the operand chain and returns the
+sub-expression that is dereferenced, or NULL when nothing is. The skip stays for
+value navigation; the walker descends exactly when a step auto-derefs a
+pointer / slice / opaque / Handle. An explicit `*p` counts as a deref regardless of
+what the type query returns — a missing typemap entry must not silently re-open the
+hole, and being conservative there errs toward REJECT.
+
+Controls verified compiling AND running: `&local.field`, `&arr[0]` on a fixed array,
+`&nested.inner.v`, and `&h.v` taken while the allocation is still live.
+
+### The sibling the branch did not report
+
+`ir_check_expr_wrong_pool` had the **identical `&` skip**, and the branch that found
+the UAF half left it. Found by enumerating the sibling sites, which is the standing
+rule for this class:
+
+```zer
+g = pb.get(h).id;        // pa-allocated h — already rejected
+wr(&pb.get(h).id);       // the same access — was ACCEPTED
+```
+
+No deref question arises there: that walker only reports a `pool.get`/`free` call
+whose receiver disagrees with the handle's pool, and taking the ADDRESS of such an
+access is still that access. So its operand is descended unconditionally.
+
+Three negatives (two from the branch, one for the sibling), each verified accepted
+pre-fix, plus the branch's own boundary positive.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

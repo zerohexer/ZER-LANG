@@ -2110,6 +2110,50 @@ static Node *ir_unwrap_alloc_expr(Node *expr) {
  * Only flags if handle state is IR_HS_FREED / MAYBE_FREED / TRANSFERRED.
  */
 
+/* BUG-938: does forming `&<operand>` DEREFERENCE something?
+ *
+ * The walker skipped every `&` operand outright, with the reason "& is capture, not
+ * read". That is right for `&local.field` — navigating a VALUE struct dereferences
+ * nothing — and wrong the moment the chain crosses a POINTER:
+ *
+ *     free(h);  wr(&h.v);        // h is *T: `h.v` auto-derefs h. UAF, accepted.
+ *     free(s);  wr(&s[0]);       // s is [*]u8: indexing derefs. UAF, accepted.
+ *
+ * This is the codebase's own rule read carefully — *"FORMING a reference aliases;
+ * READING a value does not"*. `&` forms a reference, and the question is whether
+ * getting to the thing whose address is taken went THROUGH an allocation. So the
+ * skip stays for value navigation and is lifted exactly when a step auto-derefs.
+ *
+ * Returns the sub-expression that is dereferenced, or NULL when nothing is. */
+static Node *ir_addr_of_deref_target(ZerCheck *zc, Node *operand) {
+    Node *cur = operand;
+    int guard = 0;
+    while (cur && guard++ < 32) {
+        Node *obj = NULL;
+        if (cur->kind == NODE_FIELD)       obj = cur->field.object;
+        else if (cur->kind == NODE_INDEX)  obj = cur->index_expr.object;
+        else if (cur->kind == NODE_SLICE)  obj = cur->slice.object;
+        else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR)
+            obj = cur->unary.operand;
+        else break;
+        if (!obj) break;
+        Type *ot = checker_get_type(zc->checker, obj);
+        TypeKind k = type_dispatch_kind(ot);
+        bool derefs = ir_type_is_ptrish(ot) || k == TYPE_SLICE;
+        if (!derefs && k == TYPE_OPTIONAL) {
+            Type *e = type_unwrap_distinct(ot);
+            derefs = e && type_dispatch_kind(e->optional.inner) == TYPE_SLICE;
+        }
+        /* An explicit `*p` derefs whatever p is, whether or not the TYPE query
+         * resolves — otherwise a missing typemap entry would silently re-open the
+         * hole. Conservative in the REJECT direction, which is the safe one. */
+        if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) derefs = true;
+        if (derefs) return obj;
+        cur = obj;
+    }
+    return NULL;
+}
+
 typedef struct {
     int *ids;
     int count;
@@ -2224,8 +2268,13 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
         break;
     case NODE_UNARY:
-        /* & operator is capture, not read — skip. Otherwise check operand. */
-        if (expr->unary.op == TOK_AMP) break;
+        /* & is capture, not read — EXCEPT when reaching the addressed thing goes
+         * through a pointer/slice, which dereferences it. BUG-938. */
+        if (expr->unary.op == TOK_AMP) {
+            Node *dt = ir_addr_of_deref_target(zc, expr->unary.operand);
+            if (dt) ir_check_expr_uaf(zc, func, ps, dt, line, rs);
+            break;
+        }
         ir_check_expr_uaf(zc, func, ps, expr->unary.operand, line, rs);
         break;
     case NODE_BINARY:
@@ -2359,7 +2408,14 @@ static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
                                  line, rs);
         break;
     case NODE_UNARY:
-        if (expr->unary.op == TOK_AMP) break;
+        /* BUG-938 SIBLING. This walker had the identical `&` skip, and the branch
+         * that reported the UAF half did not touch it — found by enumerating the
+         * sibling sites, which is the rule for this class. Unlike the UAF walker
+         * there is no deref question to ask here: this walker only reports a
+         * pool.get/free CALL whose receiver disagrees with the handle's pool, and
+         * taking the ADDRESS of such an access is still that access.
+         *     wr(&pb.get(h).id);      // pa-allocated h — was accepted
+         * So the operand is descended unconditionally. */
         ir_check_expr_wrong_pool(zc, func, ps, expr->unary.operand, line, rs);
         break;
     case NODE_BINARY:

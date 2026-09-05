@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: wrong pool
+// BUG-938 SIBLING: the wrong-pool walker had the SAME `&`-operand skip as the UAF
+// walker. Taking the ADDRESS of a wrong-pool get is still a wrong-pool access, and
+// the direct spelling `g = pb.get(h).id;` was already rejected. Found by enumerating
+// the sibling sites, not reported by the branch that found the UAF half.
+struct D { u32 id; }
+Pool(D, 4) pa;
+Pool(D, 4) pb;
+void wr(*u32 p) { *p = 7; }
+u32 main() {
+    ?Handle(D) mh = pa.alloc();
+    Handle(D) h = mh orelse { return 1; };
+    wr(&pb.get(h).id);
+    pa.free(h);
+    return 0;
+}

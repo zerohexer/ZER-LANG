@@ -1,0 +1,18 @@
+// BUG-915 positive: `&s.f` of a by-VALUE struct local navigates within the
+// local — no auto-deref crossing, so freeing an unrelated handle it holds a
+// pointer to is not involved and nothing is reported. Also `&h.v` BEFORE the
+// free is a legitimate interior pointer.
+struct T { u32 v; }
+struct S { u32 f; ?*T p; }
+void wr(*u32 p) { *p = 7; }
+u32 main() {
+    *T h = alloc(T) orelse { return 1; };
+    wr(&h.v);
+    if (h.v != 7) { return 2; }
+    S s;
+    s.p = h;
+    free(h);
+    wr(&s.f);
+    if (s.f != 7) { return 3; }
+    return 0;
+}

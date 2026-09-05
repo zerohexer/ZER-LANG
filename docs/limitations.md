@@ -112,7 +112,7 @@ saturating. They record the precision cost (a third complementary free) as a
 known over-rejection. Related tests: `guarded_multi_free_alias_uaf`,
 `guarded_freed_both_arms_then_use`.
 
-**E. BUG-915 — `&freed.field` was skipped as a capture.** `free(h); wr(&h.v);`
+**E. ~~BUG-915 — `&freed.field` was skipped as a capture.~~ — CLOSED 2026-09-06 as BUG-938, DO NOT REDO.** *(`ir_addr_of_deref_target`: the skip stays for VALUE navigation and lifts exactly when a step auto-derefs. **Also closed the sibling the branch missed** — `ir_check_expr_wrong_pool` had the identical skip, so `wr(&pb.get(h).id)` escaped the wrong-pool rule; found by enumerating sibling sites.)* Original: `free(h); wr(&h.v);`
 compiles clean on main. The UAF walker skipped EVERY `&` operand. Forming `&h.v`
 dereferences a freed pointer to produce an interior pointer into the freed
 allocation. NOTE the interaction with our own rule *"FORMING a reference aliases;
@@ -206,7 +206,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 2. B  ~~the 16-root lock cap~~               CLOSED (BUG-935), gate taken
 3. C  ~~stale VRP in defer bodies~~          CLOSED (BUG-936); 3 siblings need M
 4. D  ~~Level B multi-free~~                 CLOSED (BUG-937)
-5. E  &freed.field                            -- mind our FORMING-vs-READING rule
+5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
 6. F  the const-expression retype MISCOMPILE  -- two-spellings class again
 7. J/I/K/H/G  the smaller ones
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable

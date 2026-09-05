@@ -286,6 +286,44 @@ mistakes the positive for the net.
 
 ---
 
+## Session 2026-09-06 — BUG-936: a defer body was range-checked where it is WRITTEN, not where it RUNS
+
+From the `loving-davinci-ii7a90` survey, and it is the missing HALF of a fix already
+here. B4 (2026-08-01) established that a defer body runs at scope exit, and used that
+to stop the body's narrowing leaking FORWARD. The same observation applies BACKWARD
+and was never made: the body is checked at the `defer`, but runs after every
+intervening reassignment.
+
+```zer
+u32[4] arr; u32 i = 0; defer { arr[i] = 7; } i = 100;
+```
+
+`i` was `[0,0]` at registration, so `arr[i]` was PROVEN safe, its guard elided, and
+the emitted C stored 400 bytes past a 16-byte stack array — **0 diagnostics, 0
+warnings, exit 0.**
+
+**Fix:** widen every range live at registration to TOP before checking the body. Six
+lines, inside B4's existing snapshot. `address_taken` is deliberately NOT cleared —
+it is a permanent fact about the variable, not a range, and clearing it would
+re-enable narrowing that BUG-479 disabled.
+
+Now: 2 warnings, a guard emitted, and **exit 133** — it traps instead of writing.
+
+**Precision cost measured at zero.** No corpus file has a defer body that indexes an
+array. And the widening only bites where the index depends on a variable range: a
+LITERAL index in a defer body is still proven (no warning), an in-body guard still
+narrows from TOP, non-defer indices are untouched, and `defer free(n)` is unaffected.
+
+### What this does NOT close — recorded so it is not assumed
+
+Of the branch's five defer-related trap tests, this closes **two**. The other three —
+an unprovable index in a defer-body **var-decl init**, **for-init**, or **while-cond**
+— still exit 0. They are a different defect: the auto-guard is emitted only before an
+op-kind-GATED subset of instructions, and those three positions are not in the gate.
+They need the branch's auto-guard-into-IR refactor (survey item M), not this fix.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

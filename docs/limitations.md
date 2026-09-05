@@ -77,7 +77,14 @@ arrays, and `tools/emit_audit.sh` gains a REQUIRED-fingerprint section asserting
 the 17th/18th `rdlock` — a gate for emission that must be PRESENT, which we do not
 have. **Take the gate idea as well as the fix.**
 
-**C. BUG-913 — stale VRP in a defer body → an unguarded out-of-bounds store.**
+**C. ~~BUG-913 — stale VRP in a defer body → an unguarded out-of-bounds store.~~ —
+CLOSED 2026-09-06 as BUG-936, PARTIALLY: DO NOT REDO the widening, DO still take M.**
+*The widening (ranges live at registration → TOP for the body) is in and closes
+`defer_vrp_stale_index` + `_after_loop` (both now trap 133, both verified exit 0
+pre-fix). It does NOT close the three siblings — an unprovable index in a defer-body
+VAR-DECL INIT, FOR-INIT or WHILE-COND still exits 0, because the auto-guard is emitted
+only before an op-kind-GATED subset of instructions and those positions are not in the
+gate. Those need refactor **M**.* Original:
 A defer body is range-checked at the `defer` STATEMENT but RUNS at scope exit,
 after every intervening reassignment:
 
@@ -197,7 +204,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 ```
 1. A  ~~switch arm as the 9th value-flow sink~~  CLOSED (BUG-934)
 2. B  ~~the 16-root lock cap~~               CLOSED (BUG-935), gate taken
-3. C  stale VRP in defer bodies               -- unguarded OOB store, 0 diagnostics
+3. C  ~~stale VRP in defer bodies~~          CLOSED (BUG-936); 3 siblings need M
 4. D  Level B multi-free                      -- a hole in a relaxation we shipped
 5. E  &freed.field                            -- mind our FORMING-vs-READING rule
 6. F  the const-expression retype MISCOMPILE  -- two-spellings class again

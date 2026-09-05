@@ -16594,6 +16594,28 @@ static void check_stmt(Checker *c, Node *node) {
              * inline with no snapshot at all. */
             int vrp_saved = c->var_range_count;
             struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
+            /* BUG-936: B4 above fixed the OUTGOING direction — the body's narrowing
+             * must not leak to the following code. The INCOMING direction is the
+             * same observation and was missing: the body is checked HERE but RUNS at
+             * scope exit, AFTER every intervening reassignment, so a range proven at
+             * the `defer` does not hold when the body executes.
+             *
+             *     u32[4] arr; u32 i = 0; defer { arr[i] = 7; } i = 100;
+             *
+             * `i` was [0,0] at registration, `arr[i]` was PROVEN safe, its guard was
+             * elided, and the emitted C stored 400 bytes past a 16-byte stack array
+             * with no diagnostic and no warning. Widen every live range to TOP for
+             * the body; an in-body guard can still narrow from there, which is the
+             * only narrowing that is actually valid at fire time.
+             *
+             * `address_taken` is deliberately NOT cleared: it is a permanent fact
+             * about the variable, not a range, and clearing it would RE-ENABLE
+             * narrowing that BUG-479 disabled. */
+            for (int vi = 0; vi < vrp_saved; vi++) {
+                c->var_ranges[vi].min_val = INT64_MIN;
+                c->var_ranges[vi].max_val = INT64_MAX;
+                c->var_ranges[vi].known_nonzero = false;
+            }
             check_stmt(c, node->defer.body);
             c->var_range_count = vrp_saved;
             vrp_snap_restore(c, vrp_pre, vrp_saved);

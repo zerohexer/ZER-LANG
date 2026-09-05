@@ -1,0 +1,15 @@
+// expect-trap
+// BUG-913: a range proven at the `defer` statement does NOT hold when the body
+// RUNS. `i` is 0 where the defer is registered, so `arr[i]` was proven in range
+// and emitted RAW; at scope exit i == 100 and the raw store wrote 400 bytes past
+// a 16-byte stack array with no diagnostic (verified on main: exit 0).
+// The body is now checked against TOP for every range live at registration, so
+// the index gets a bounds guard that traps at fire time.
+u32 g;
+u32 main() {
+    u32[4] arr;
+    u32 i = 0;
+    defer { arr[i] = 7; g = arr[i]; }
+    i = 100;
+    return 0;
+}

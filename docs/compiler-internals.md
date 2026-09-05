@@ -1117,8 +1117,22 @@ stands):
   (`IR_UNOP TOK_BANG`, `IR_COPY`) from a branch's `cond_local` to a root bool
   local + polarity, so `if(c)` and `if(!c)` correlate as `(c,+)` / `(c,−)`.
 - **Per-handle `free_block`** (`IRHandleInfo`) — the block a handle was freed in;
-  set in the driver post-inst-loop (state FREED + `free_block < 0` ⇒ freed here),
+  set in the driver post-inst-loop (state FREED + `free_block == -1` ⇒ freed here),
   carried to `MAYBE_FREED` through `ir_merge_states`.
+  **BUG-914 (2026-09-05): the slot is a JOIN over free SITES, saturating to
+  `IR_FREE_BLOCK_MULTI (-2)`.** One slot held only the FIRST free; a second,
+  disjoint-accepted free (`if(c){free} if(!c){if(d){free}}`) left it pointing at
+  the first, so a use under `!c && d` was judged disjoint from "the" free and
+  accepted on the exact path of the second (verified UAF). MULTI is set by
+  `ir_note_free_site(h)` (THE single sink, called at the three free sites after
+  `state = FREED`), by the merge when the two preds carry different sites or
+  either is MULTI (applies to FREED∧FREED merges too — `if(c){free}else{if(d)
+  {free}}` then an ALIVE pred), and by `ir_propagate_alias_state` when an alias
+  already carried a site. The same propagation now STRENGTHENS a `MAYBE_FREED`
+  alias to `FREED` when the allocation is definitely freed (same memory, same
+  path). Every consumer (`ir_use_guard_disjoint`, `ir_free_completes_coverage`)
+  treats `fb < 0` as "cannot prove" → reject. Precision cost (limitations.md):
+  a THIRD complementary free is over-rejected.
 - **Use-site + double-free recovery `ir_use_guard_disjoint(zc, h)`** — true iff
   `h` is `MAYBE_FREED` and the free block's guard set CONTRADICTS the current
   block's on some root (free under `(C,p)`, use under `(C,¬p)`). Applied at the

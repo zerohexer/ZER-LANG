@@ -5,6 +5,92 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-05 — BUG-913..916: four accept-unsafe holes from a fresh full-codebase audit
+
+All four were found by reading the IR pipeline end to end and probing the seams between
+passes, not by any gate. Each shipped a wrong program with NO diagnostic; each has a test
+that was verified to PASS on the pre-fix compiler (a `git archive HEAD` build) and fail on
+the fixed one — a test that has only ever passed is a script, not a net.
+
+### BUG-913 — a defer body was checked against ranges that hold at REGISTRATION, not at FIRE
+```
+u32[4] arr; u32 i = 0;
+defer { arr[i] = 7; g = arr[i]; }
+i = 100;
+return 0;                    // fires: arr[100] = 7 — RAW store, no trap, exit 0
+```
+The checker walks the defer body once, where the `defer` statement sits, with the VRP
+stack of that point. `i` is `[0,0]` there, so `arr[i]` was PROVEN and emitted with no
+bounds check. The body RUNS at scope exit, after every statement in between — the proof
+was of a different program point. B4 (2026-08-01) fixed the OUTBOUND direction (a range
+derived in the body must not narrow the code after the defer); this is the INBOUND
+direction, and it is the memory-unsafe one: a 400-byte stack write past a 16-byte array.
+
+Fix: `vrp_widen_all_top(c, n)` widens every range live at the `defer` to TOP before the
+body is checked (address_taken kept — it is a permanent no-narrow mark); the existing B4
+snapshot restore puts the pre-defer ranges back for the following code. A guard INSIDE
+the body (`if (i < 4)`) still narrows, because that guard is evaluated at fire time.
+Consequence to know about: a division in a defer body by a local that was only proven
+nonzero BEFORE the defer is now a compile error ("not proven nonzero") — the proof was
+invalid for the same reason; move the guard into the body. Tests:
+`tests/zer_trap/defer_vrp_stale_index.zer`, `..._after_loop.zer` (both exit 0 on the
+pre-fix build, trap now), `tests/zer/defer_vrp_inbody_guard_narrows.zer`.
+
+The emitter half of the same class — an unprovable index in a defer-body VAR_DECL init /
+while-cond / for-init got the "auto-guard inserted" warning but the raw-AST defer emitter
+never emitted the guard — is closed by the defer-body IR lowering (next session entry).
+
+### BUG-914 — Level B guarded refinement recorded ONE free site; the second free hid behind the first
+```
+if (c) { free(h); }                       // site A, guard {c}
+if (!c) { if (d) { free(h); } }           // site B, guard {!c, d} — disjoint from A, accepted
+if (!c) { if (d) { g = h.v; } }           // guard {!c, d} — disjoint from A → ACCEPTED. UAF.
+```
+`IRHandleInfo.free_block` is a single int. The second free was correctly admitted as
+disjoint from the first, but the slot kept pointing at A (the end-of-block tagging only
+fills `-1`), so the use — on the exact path of B — was judged against A only. Same hole
+through the FREED∧FREED merge (`if(c){free} else {if(d){free}}` then an ALIVE pred keeps
+whichever single site survived) and through an alias (`*T h2 = h` stayed MAYBE_FREED with
+the stale site while `h` went FREED, because `ir_propagate_alias_state` skipped invalid
+aliases).
+
+Fix: the slot is a JOIN over free sites saturating to `IR_FREE_BLOCK_MULTI (-2)`; one
+sink `ir_note_free_site` at the three free sites, the merge joins sites (FREED and
+MAYBE_FREED), alias propagation saturates and additionally strengthens a MAYBE_FREED
+alias to FREED on a definite free. All consumers already treat `fb < 0` as "cannot
+prove". Precision cost recorded in limitations.md (a third complementary free is now
+over-rejected; a set-valued slot would recover it). Tests:
+`tests/zer_fail/guarded_multi_free_second_site_uaf.zer`, `guarded_multi_free_alias_uaf.zer`,
+`guarded_freed_both_arms_then_use.zer` (all compiled clean pre-fix); the three
+`tests/zer/guarded_*` positives unchanged.
+
+### BUG-915 — `&h.field` of a freed pointer was "a capture, not a read"
+```
+free(h);
+wr(&h.v);                    // compiled clean; emitted wr(&h->v) — write into freed memory
+```
+`ir_check_expr_uaf` skipped every `&` operand. Right for `&local` and `&value_struct.f`
+(navigation within the local), wrong when a step on the chain is a POINTER, slice or
+Handle: forming `&h->v` dereferences `h` and yields an interior pointer INTO the freed
+allocation — the "FORMING a reference aliases" rule. Fix: walk the operand chain and check
+every object whose type crosses an auto-deref (pointer/slice/Handle); index expressions on
+the chain are checked as values. Tests: `tests/zer_fail/uaf_addr_of_field_through_freed_ptr.zer`,
+`uaf_addr_of_index_through_freed_slice.zer`, positive `tests/zer/addr_of_field_value_struct_ok.zer`.
+
+### BUG-916 — a `spawn` argument naming a shadowed inner local bound to the OUTER one
+```
+u32 x = 1;
+{ u32 x = 7; ThreadHandle th = spawn w(x); th.join(); }   // thread saw 1
+```
+`NODE_SPAWN` lowers to an `IR_NOP` passthrough and the emitter writes each argument from
+the AST by name. Every other passthrough expression goes through `rewrite_idents` so a
+scope-suffixed local (`x_5` in the emitted C) is named correctly; the spawn args did not,
+so the un-rewritten `x` bound to the outer declaration. Silent wrong value. Fix: rewrite
+the spawn args in the `NODE_SPAWN` lowering. Test: `tests/zer/spawn_arg_shadowed_local.zer`
+(exit 1 pre-fix).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

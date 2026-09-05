@@ -70,8 +70,20 @@ typedef struct {
      * was freed (-1 = not freed / unknown). Paired with the per-block guard sets
      * (ZerCheck.gr_block_guards) to decide, at a MAYBE_FREED use, whether the
      * use's guard is DISJOINT from the free's guard (`if(c){free} if(!c){use}`
-     * recovery). Preserved through the ALIVE+FREED→MAYBE_FREED merge. */
+     * recovery). Preserved through the ALIVE+FREED→MAYBE_FREED merge.
+     * BUG-914 (2026-09-05): ONE slot cannot hold TWO free sites. A second,
+     * disjoint-accepted free (`if(c){free} if(!c){if(d){free}}`) left this
+     * pointing at the FIRST free, so a later use under `!c && d` was judged
+     * disjoint from the first free and ACCEPTED — a use on the exact path of
+     * the second free (verified UAF on main). The moment a handle has more
+     * than one recorded free site the slot saturates to IR_FREE_BLOCK_MULTI,
+     * which every consumer treats as "cannot prove disjoint" (reject). The
+     * widening is monotone through merges and alias propagation. Precision
+     * limit (documented in limitations.md): a THIRD complementary free
+     * (`if(!c){if(!d){free}}`) is over-rejected; a set-valued slot would
+     * recover it. */
     int free_block;
+#define IR_FREE_BLOCK_MULTI (-2)
     /* Level B leak-coverage: set when this handle has been freed under a
      * condition AND its exact SINGLETON complement (free under (C,+) in one
      * block and (C,-) in another, each guard set being exactly {(C,·)} so there
@@ -1195,9 +1207,22 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle, so a MAYBE_FREED handle remembers WHERE it was freed (used
              * by the guard-disjointness check at the use). Mirror of the
              * free_line carry above; only fill when rh has none of its own. */
-            if (rh->state == IR_HS_MAYBE_FREED && rh->free_block < 0 &&
-                ph->free_block >= 0) {
-                rh->free_block = ph->free_block;
+            if (rh->state == IR_HS_MAYBE_FREED || rh->state == IR_HS_FREED) {
+                /* BUG-914: the carry is a JOIN over free SITES. Two different
+                 * sites (or either side already saturated) → MULTI, so no
+                 * later use can be proven disjoint from "the" free. Applies
+                 * to FREED∧FREED too: `if(c){free}else{if(d){free}}` merges
+                 * two definite frees whose sites differ, and a later
+                 * ALIVE-pred merge turns that into MAYBE_FREED carrying
+                 * whichever single site survived. */
+                if (rh->free_block == IR_FREE_BLOCK_MULTI ||
+                    ph->free_block == IR_FREE_BLOCK_MULTI) {
+                    rh->free_block = IR_FREE_BLOCK_MULTI;
+                } else if (ph->free_block >= 0) {
+                    if (rh->free_block < 0) rh->free_block = ph->free_block;
+                    else if (rh->free_block != ph->free_block)
+                        rh->free_block = IR_FREE_BLOCK_MULTI;
+                }
             }
             /* Level B: OR-carry the all-paths-freed flag. Sound because it is
              * only set for SINGLETON complementary coverage (no path leaves the
@@ -2057,8 +2082,30 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         }
         break;
     case NODE_UNARY:
-        /* & operator is capture, not read — skip. Otherwise check operand. */
-        if (expr->unary.op == TOK_AMP) break;
+        /* `&x` of a bare local (or of a field of a by-VALUE struct local) is a
+         * capture, not a read — skip. BUG-915 (2026-09-05): but `&h.f` /
+         * `&h[i]` where some object on the chain is a POINTER, slice or
+         * Handle DEREFERENCES that object to form the interior address — the
+         * new pointer aliases the freed allocation (`free(h); wr(&h.v);`
+         * compiled clean and wrote into freed memory). Forming a reference
+         * into an allocation is a use of it (the "FORMING a reference
+         * aliases" rule), so every auto-deref crossing on the chain is
+         * checked; navigation steps within a by-value aggregate still peel
+         * freely. */
+        if (expr->unary.op == TOK_AMP) {
+            Node *o = expr->unary.operand;
+            while (o && (o->kind == NODE_FIELD || o->kind == NODE_INDEX)) {
+                Node *obj = (o->kind == NODE_FIELD) ? o->field.object
+                                                    : o->index_expr.object;
+                if (o->kind == NODE_INDEX)
+                    ir_check_expr_uaf(zc, func, ps, o->index_expr.index, line, rs);
+                TypeKind ok = type_dispatch_kind(checker_get_type(zc->checker, obj));
+                if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE)
+                    ir_check_ident_uaf(zc, func, ps, obj, line, rs);
+                o = obj;
+            }
+            break;
+        }
         ir_check_expr_uaf(zc, func, ps, expr->unary.operand, line, rs);
         break;
     case NODE_BINARY:
@@ -2683,11 +2730,39 @@ static void ir_propagate_alias_state(IRPathState *ps, IRHandleInfo *target,
     for (int i = 0; i < ps->handle_count; i++) {
         IRHandleInfo *h = &ps->handles[i];
         if (h == target) continue;
-        if (h->alloc_id == aid && !ir_is_invalid(h)) {
+        if (h->alloc_id != aid) continue;
+        if (!ir_is_invalid(h)) {
             h->state = new_state;
             h->free_line = line;
+            /* BUG-914: the alias already remembered an earlier (conditional)
+             * free site → now two sites → saturate. A fresh -1 is left for
+             * the end-of-block tagging to fill with THIS block. */
+            if (h->free_block >= 0) h->free_block = IR_FREE_BLOCK_MULTI;
+        } else if (new_state == IR_HS_FREED &&
+                   h->state == IR_HS_MAYBE_FREED) {
+            /* BUG-914: a definite free of the allocation STRENGTHENS a
+             * MAYBE_FREED alias to FREED on this path — same memory, same
+             * path. Leaving the alias MAYBE_FREED with its stale single
+             * free_block let a use through the alias be judged disjoint
+             * from the FIRST free while sitting on the path of the second.
+             * TRANSFERRED aliases keep their state (a different axis with
+             * its own diagnostic). */
+            h->state = IR_HS_FREED;
+            h->free_line = line;
+            if (h->free_block >= 0) h->free_block = IR_FREE_BLOCK_MULTI;
         }
     }
+}
+
+/* BUG-914: THE single sink for "handle h is being freed here". Call at every
+ * free site right after `h->state = IR_HS_FREED`. If h already carried a free
+ * site (it was MAYBE_FREED from an earlier conditional free — the only way to
+ * reach a free site without a double-free diagnostic), the slot saturates to
+ * MULTI; a fresh handle keeps -1 and is tagged with the current block at the
+ * end of the block, exactly as before. Do not re-inline this at a new free
+ * site — same rule as ir_mark_transferred / ir_mark_freed_all_paths. */
+static void ir_note_free_site(IRHandleInfo *h) {
+    if (h->free_block != -1) h->free_block = IR_FREE_BLOCK_MULTI;
 }
 
 /* BH-18 #1 (2026-07-01): THE single move-transfer sink. Marks `h` TRANSFERRED
@@ -3538,6 +3613,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
             h->state = IR_HS_FREED;
             h->free_line = inst->source_line;
+            ir_note_free_site(h);
 
             /* Mark aliases (bare or compound) with same alloc_id as FREED —
              * handled uniformly via ir_propagate_alias_state. */
@@ -5230,6 +5306,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * the IR_CALL entry point below. */
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        ir_note_free_site(h);
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
                     }
@@ -5656,6 +5733,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        ir_note_free_site(h);
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
                     }
@@ -6495,7 +6573,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
              * (state only), so this can't perturb the fixed point. */
             for (int hi = 0; hi < merged.handle_count; hi++) {
                 if (merged.handles[hi].state == IR_HS_FREED &&
-                    merged.handles[hi].free_block < 0) {
+                    merged.handles[hi].free_block == -1) {
                     merged.handles[hi].free_block = bi;
                 }
             }
@@ -6627,7 +6705,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
          * block_states[bi], read by later blocks' merges in this same pass). */
         for (int hi = 0; hi < merged.handle_count; hi++) {
             if (merged.handles[hi].state == IR_HS_FREED &&
-                merged.handles[hi].free_block < 0) {
+                merged.handles[hi].free_block == -1) {
                 merged.handles[hi].free_block = bi;
             }
         }

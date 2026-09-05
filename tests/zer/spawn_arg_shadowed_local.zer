@@ -1,0 +1,19 @@
+// BUG-916: a spawn argument naming a SHADOWED inner local must bind to the
+// inner declaration. The inner `x` is `x_N` in the emitted C; the un-rewritten
+// spawn arg bound to the outer `x` (value 1) and the thread saw the wrong value
+// with no diagnostic (verified on main: exit 1).
+shared struct Out { u32 v; }
+Out g;
+void w(u32 x) { g.v = x; }
+u32 main() {
+    u32 x = 1;
+    {
+        u32 x = 7;
+        ThreadHandle th = spawn w(x);
+        th.join();
+    }
+    u32 r = g.v;
+    if (r != 7) { return 1; }
+    if (x != 1) { return 2; }
+    return 0;
+}

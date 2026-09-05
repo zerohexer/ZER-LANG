@@ -1796,6 +1796,38 @@ Then `#4`, `#5` (miscompiles), then `#6`, `#7`, `#9` (ergonomics).
 
 ---
 
+## OPEN — Level B: a handle with 2+ recorded free sites is never "disjoint" again (LOW, precision, BUG-914 residual)
+
+**Symptom.** Three frees that together cover every path, each disjoint from the others,
+are rejected at the third:
+
+```zer
+if (c) { free(h); }
+if (!c) { if (d) { free(h); } }
+if (!c) { if (!d) { free(h); } }   // rejected: "freeing h which may already be freed"
+```
+
+**Cause — deliberate (BUG-914).** `IRHandleInfo.free_block` is ONE slot. Holding only the
+first site was a soundness hole (a use under `!c && d` was judged disjoint from site A
+while sitting on the path of site B), so the slot now saturates to `IR_FREE_BLOCK_MULTI`
+the moment a second site is recorded, and every consumer treats that as "cannot prove
+disjoint". The third free above is safe in reality but the analysis no longer knows the
+two prior sites to compare against.
+
+**Fix sketch.** Make the slot a SET of free blocks (or a small inline array with a
+saturating overflow flag); `ir_use_guard_disjoint` must then prove disjointness from
+EVERY member. That is a relaxation — build the free-site x use-guard grid first and verify
+it fires on the pre-fix build. Corpus cost of the current over-rejection: zero tests, zero
+examples use the three-way shape.
+
+**Related, pre-existing.** `free_block` is never reset when a freed local is RE-ASSIGNED
+from a fresh allocation (`free(h); h = alloc(T) orelse ...;`), so a later conditional
+free of the new allocation now saturates to MULTI (before: kept the stale unconditional
+site, which was equally "not disjoint"). Over-rejection only; the 35 `state = IR_HS_ALIVE`
+sites are the multi-site shape a single `ir_note_alloc(h)` sink would collapse.
+
+---
+
 ## OPEN — scoped-borrow: a join on EVERY branch arm is over-rejected (LOW, precision)
 
 **Symptom.** Joining on every arm of a branch and then using the borrowed local is

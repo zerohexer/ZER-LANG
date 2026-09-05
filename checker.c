@@ -860,6 +860,7 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
+static void vrp_widen_all_top(Checker *c, int n);
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
 static void vrp_snap_join(Checker *c, struct VarRange *s, int n);
 static void mark_proven(Checker *c, Node *node);
@@ -16285,6 +16286,19 @@ static void check_stmt(Checker *c, Node *node) {
              * inline with no snapshot at all. */
             int vrp_saved = c->var_range_count;
             struct VarRange *vrp_pre = vrp_snap_take(c, vrp_saved);
+            /* BUG-913 (2026-09-05): the INBOUND direction. A range that holds
+             * at the `defer` statement does NOT hold when the body RUNS —
+             * every statement between registration and scope exit may
+             * reassign the variable. `u32 i = 0; defer { arr[i] = 7; } i =
+             * 100;` proved `arr[i]` at registration and emitted a RAW
+             * `arr[100] = 7` at exit (verified on main: silent stack write,
+             * no trap). So the body is checked against TOP for every range
+             * live at registration: address_taken is kept (still blocks a
+             * later narrowing), and a guard INSIDE the body (`if (i < 4)`)
+             * still narrows, because that guard is evaluated at fire time.
+             * The snapshot restore below puts the pre-defer ranges back for
+             * the code that follows. */
+            vrp_widen_all_top(c, vrp_saved);
             check_stmt(c, node->defer.body);
             c->var_range_count = vrp_saved;
             vrp_snap_restore(c, vrp_pre, vrp_saved);
@@ -19603,6 +19617,19 @@ static void vrp_snap_restore(Checker *c, struct VarRange *s, int n) {
         c->var_ranges[i].min_val = s[i].min_val;
         c->var_ranges[i].max_val = s[i].max_val;
         c->var_ranges[i].known_nonzero = s[i].known_nonzero;
+    }
+}
+/* BUG-913: widen the first n live ranges to TOP in place (a defer body is
+ * checked against no fact that was derived before the `defer` statement).
+ * address_taken survives — it is a permanent "never narrow" mark. Same TOP
+ * shape as the BUG-479 address-taken widening, so every consumer already
+ * handles it. */
+static void vrp_widen_all_top(Checker *c, int n) {
+    for (int i = 0; i < n && i < c->var_range_count; i++) {
+        struct VarRange *r = &c->var_ranges[i];
+        r->min_val = INT64_MIN;
+        r->max_val = INT64_MAX;
+        r->known_nonzero = false;
     }
 }
 static void vrp_snap_join(Checker *c, struct VarRange *s, int n) {

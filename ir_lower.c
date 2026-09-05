@@ -3720,6 +3720,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * pthread_t declaration directly. zercheck_ir tracks ThreadHandle
          * join status by name via IR_NOP(NODE_SPAWN) handler, not by IR
          * local id. */
+        /* BUG-916 (2026-09-05): the spawn ARGUMENTS are emitted from this AST
+         * node by name (`_sa->a0 = <arg>`), so they must be rewritten to the
+         * scope-suffixed IR local names like every other passthrough
+         * expression. Without this, `u32 x = 1; { u32 x = 7; spawn w(x); }`
+         * handed the OUTER x (1) to the thread — the inner local is `x_N` in
+         * the emitted C, and the un-rewritten ident silently bound to the
+         * outer declaration. Silent wrong value, no diagnostic. */
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            rewrite_idents(ctx, node->spawn_stmt.args[i]);
         IRInst sp = make_inst(IR_NOP, node->loc.line);
         sp.expr = node; /* emit_stmt handles NODE_SPAWN */
         emit_inst(ctx, sp);

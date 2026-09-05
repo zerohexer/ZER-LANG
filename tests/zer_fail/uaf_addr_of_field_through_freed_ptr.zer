@@ -1,0 +1,13 @@
+// expect-error: use after free
+// BUG-915: `&h.v` where `h` is a freed `*T` DEREFERENCES h to form an interior
+// pointer into the freed allocation. The UAF walker skipped every `&` operand
+// as "capture, not read", so `free(h); wr(&h.v);` compiled clean and wrote
+// through the dangling interior pointer (verified on main).
+struct T { u32 v; }
+void wr(*u32 p) { *p = 7; }
+u32 main() {
+    *T h = alloc(T) orelse { return 1; };
+    free(h);
+    wr(&h.v);
+    return 0;
+}

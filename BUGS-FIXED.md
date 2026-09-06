@@ -598,6 +598,60 @@ and fails on the pre-session build.
 
 ---
 
+## Session 2026-09-06 — BUG-942..945: global initializers, the MMIO address nobody could fold, a hang, and a gate checking nothing
+
+Adopted from `vigilant-tesla-o51x9p` `91d4f06` (their BUG-916..919, renumbered), by
+cherry-pick. Every reproducer was MEASURED on this branch first: `const u32 A = A;` hung
+`zerc` (killed at 4,199 s of CPU), the mutual form likewise, and the positive
+`global_init_const_fold_ok` failed at GCC. Survey CLASS 9 and CLASS 11 both close here,
+plus the `mmio_const_ident_base` row of the over-rejection table.
+
+### BUG-943 — `const u32 A = A;` HUNG the compiler (CLASS 9, DoS)
+
+`resolve_const_ident` handed `eval_const_expr_ex` a fresh depth of 0 on every identifier
+hop, so the evaluator's own bound never saw the chain. Bounded once with a file-static
+counter (`_const_ident_depth`, save/restore so an early `CONST_EVAL_FAIL` cannot leak
+depth) — that stops the hang — and reported in the user's terms by
+`global_init_chain_verdict`, a **path-visited set that pops on the way out**. A first cut
+used a depth bound and called a legitimate 70-link chain "cyclic" — a WRONG diagnostic,
+not a strict one; the shipped walk distinguishes "revisits a symbol" (cycle) from "longer
+than the substitution can carry" (its own message, limit 64). A diamond
+(`DL = DR; DM = DR; DT = DL + DM`) compiles, pinned in the positive.
+
+### BUG-942 — six invalid-C global-initializer shapes
+
+BUG-911 folded `u32 B = A + 1;` for an INTEGER target, a NON-NEGATIVE result, through
+the scoped evaluator only. A negative const, a float, a bool, an intrinsic init
+(`@size(u32) * 4`), and a slice target all emitted the NAME at file scope and GCC
+refused it, naming a `.c` the user never opened. Now the emitter substitutes a `const`
+global's OWN initializer while emitting a global init (`Emitter.global_init_depth`) —
+correct by construction, since that expression already passed the global-initializer
+rules for ITS declaration. A MUTABLE global is genuinely not a constant and is rejected
+at the ZER line (`global_init_from_mutable`).
+
+### BUG-944 — an MMIO base named by a `const` was the one spelling nobody could fold (CLASS 11)
+
+"What constant address does this `@inttoptr` designate?" was answered at FOUR sites
+with plain `eval_const_expr`, which stops at an identifier. So
+`const u32 UART = 0x4000_0000; @inttoptr(*u32, UART)` derived no bound: indexing the
+pointer was REJECTED outright, and an out-of-range or misaligned address deferred its
+diagnostic to a runtime trap on first boot. ONE query, `mmio_const_addr`, at all four
+sites — strictly tightens the two error gates, strictly relaxes the two bound
+derivations. Multi-site row added to CLAUDE.md.
+
+### BUG-945 — `audit_reference_examples.sh` skipped every rejection block
+
+49 blocks were checked in NEITHER direction. Opt-in `<!-- audit: expect-error: <substring> -->`
+asserts the rejection AND its reason (the naive "must fail" oracle was measured and
+rejected: fragments die on syntax before reaching the rule). 13 backfilled; the gate's
+verdict line now reports `rejected-as-documented`.
+
+Tests: `tests/zer_fail/global_init_{cycle_self,cycle_mutual,chain_too_deep,from_mutable}.zer`,
+`tests/zer_fail/mmio_const_ident_{oob_addr,misaligned,oob_index}.zer`,
+`tests/zer/global_init_const_fold_ok.zer`, `tests/zer/mmio_const_ident_base.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

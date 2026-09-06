@@ -772,7 +772,13 @@ Forms: `defer_body_spawn`, `_critical`, `_label`, `_once`, `_switch`.
 
 </details>
 
-### CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`
+### ~~CLASS 9 — GLOBAL INITIALIZERS: a self-cycle HANGS THE COMPILER~~ — **CLOSED 2026-09-06 as BUG-942/943, DO NOT REDO**
+
+> Cherry-picked `o51x9p` `91d4f06` (renumbered). All four negatives reject with their
+> stated reason; the positive `global_init_const_fold_ok` (six shapes BUG-911 missed +
+> the diamond) runs. Measured hang on this branch before the pick: 4,199 s CPU.
+
+<details><summary>original entry</summary>
 
 **Upgraded from MEDIUM after re-measurement 2026-08-20.** This does not merely
 compile — the compiler LOOPS FOREVER in constant evaluation. Measured `exit=124` at a
@@ -790,6 +796,8 @@ the global-initializer constant folder, reported as a diagnostic.
 `_from_mutable`. Check whether `_cycle_mutual` hangs too before assuming it only
 accepts.
 
+</details>
+
 ---
 
 ### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
@@ -804,7 +812,11 @@ CALL-laundered form is not.
 
 ---
 
-### CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`
+### ~~CLASS 11 — MMIO ADDRESS VIA A `const` IDENT~~ — **CLOSED 2026-09-06 as BUG-944, DO NOT REDO**
+
+> Same cherry-pick as CLASS 9. ONE query `mmio_const_addr` at the four sites; both
+> negatives reject at compile time, and the over-rejected positive `mmio_const_ident_base`
+> (a `const` base + indexing) now compiles and runs. Original:
 
 The range and alignment checks fold a literal but not a `const` identifier:
 
@@ -939,7 +951,7 @@ Do not re-derive; each was run, not read.
 | `loop_counter_bounds_ok` | `v7pucv` | **CLOSED** by BUG-932 |
 | `vrp_empty_range_zero_trip_ok` | `v7pucv` | **CLOSED** by BUG-932 — same single cause, a zero-trip loop |
 | `funcptr_global_registry_ok` | `osp1a7` | **DECIDED — DO NOT "FIX".** Their whole-file rule was measured to ACCEPT an unguarded indirect call through null (no guard in the emitted C). Main's rule is the sound one and the restructure is teachable: `?u32 (*g)(u32,u32) = null;` + `if (g) \|f\|` compiles and runs. Soundness is the hard wall; over-rejection is the soft gradient |
-| `mmio_const_ident_base` | `o51x9p` | live — `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
+| `mmio_const_ident_base` | `o51x9p` | **CLOSED** by BUG-944 (2026-09-06) — `mmio_const_addr` resolves the const's init at all four sites |
 | `comptime_width_conversions` | `lzmkhn` | live — the comptime evaluator cannot evaluate a C-style cast in a comptime body. Contained, evaluator-local |
 | `return_literal_is_static_ok` | `lzmkhn` | live — `return pick(b)` where the callee returns a LITERAL, not a view of the local. Genuine PRECISION work on the return summary (`ret_param_mask` / `call_result_static_given_args`), not a rule bug |
 
@@ -961,8 +973,7 @@ accept-unsafe class.
    real field (`pool_name`) is CLOSED with BUG-933. See the NON-TEST FINDINGS note.
 4. ~~**The ASSIGN form** for alloc/move~~ — CLOSED (BUG-933); it was 11 tests and
    FIVE causes, not one registration site.
-5. **The global-init self-cycle HANG** — small fix, but it is a compiler DoS and
-   any negative test for it will time out `make check` until it is fixed.
+5. ~~**The global-init self-cycle HANG**~~ — CLOSED (BUG-943).
 6. Everything else, per class above.
 
 ## Where main stands

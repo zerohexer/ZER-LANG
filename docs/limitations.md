@@ -283,6 +283,51 @@ so `u32 r = f();` was rejected when `f` touches two
 shared structs sequentially. A statement with no DIRECT shared access takes no
 lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 
+### M — THE ARCHITECTURAL HALF: where the guard must be lowered (MEASURED 2026-09-07, do not re-derive)
+
+M's two contained halves are CLOSED — the ordering bug (BUG-952) and the fail-closed
+gate (BUG-953). What remains is lowering the guard itself into the IR as a branch, and
+a vertical slice of that was BUILT, measured, and reverted. The tree is unchanged; this
+is what it established.
+
+**The obvious wiring point does not work.** `lower_expr`'s `NODE_INDEX` arm looks like
+the choke point, and it is not: an assignment TARGET never passes through it. Measured
+with a trace on `arr[i] = 7` — the arm fired only for the unrelated `arr[0]` READ in
+another function, at a different source line, while the guarded access at line 4 never
+reached it at all. An `ASSIGN` goes to passthrough carrying its whole AST, so the target
+index node is never individually lowered. Assignment targets are where nearly every
+auto-guard lives, so wiring there guards almost nothing.
+
+**The guard must therefore be lowered by a STATEMENT-LEVEL AST WALK**, mirroring what
+`emit_auto_guards` already does in the emitter — descend the statement's expression tree,
+find each index whose `checker_auto_guard_size` is non-zero, and emit the branch before
+the statement's instructions. Note this must come before the statement's LOCK, which is
+what BUG-952 established.
+
+**Do not simply copy `emit_auto_guards` into `ir_lower.c`.** That would be a second
+implementation of "find the guardable indexes", the multi-site shape this codebase keeps
+paying for. The descent wants to become ONE walker both sides call — a visitor that
+yields index nodes — with the emitter's version emitting C and the lowering version
+emitting IR, until the emitter's is deleted.
+
+**What the slice DID prove works:**
+
+- The IR early-exit block is straightforward and STRICTLY BETTER than the C one: fire
+  defers, release `current_stmt_shared_root`, `IR_RETURN` a zero literal. Releasing the
+  lock is exactly what the C-level guard cannot do, and the reason it degrades to a trap
+  inside one ("cannot return without leaking it").
+- Using `IR_RETURN` sidesteps the emitter's three special cases for free — the async
+  termination sequence, `void main()` promotion, and the defer-body form — because
+  `IR_RETURN`'s own emitter already handles them.
+- Single evaluation is available: lower the index once and rewrite the AST to name the
+  local, the trick the `NODE_INDEX` arm already uses for an `orelse` index.
+- A `checker_mark_guard_lowered` marker lets `checker_auto_guard_size` return 0 for a
+  node whose guard is now in the IR, so the two paths can coexist during migration
+  rather than the flip being all-or-nothing. That is what makes this refactor
+  incrementally landable, unlike L's stage 2.
+- Restricting the first cut to void/integer/bool return types is safe: anything else
+  declines and the emitter's guard still fires. Declining is always safe.
+
 ### L — FEASIBILITY, MEASURED 2026-09-06. Read before implementing; the obvious route is the WRONG one.
 
 Design work done, implementation NOT started. Two prerequisites were discovered by

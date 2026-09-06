@@ -150,8 +150,17 @@ two-spellings row in CLAUDE.md.**
 `rewrite_idents`,~~ — CLOSED 2026-09-06 as BUG-941, DO NOT REDO.** *(The non-descent was ALREADY in `walker_field_baseline.txt`, so the audit had been silenced on it; the stale row is removed. `asm` operands are the structurally-excluded sibling — asm is legal only in a `naked` function, which cannot declare a local to shadow.)* Original: so an argument naming a SHADOWED inner local bound to the wrong
 variable.
 
-**H. BUG-918 — `orelse` inside a builtin method's args survives lowering.**
-MEASURED: `heap.free_ptr(mh orelse return)` produces a FALSE LEAK on main
+**H. ~~BUG-918 — `orelse` inside a builtin method's args survives lowering.~~ —
+CLOSED 2026-09-06 as BUG-942, DO NOT REDO.** *(The survey named ONE site; enumerating
+the raw-AST argument positions found **FOUR** — builtin method arg, universal
+`free(slice)`, spawn arg, and **asm operand**, the last found only by the enumeration.
+All four hoist via the one shared `pre_lower_orelse`. Two further findings: the hoisted
+identifier carried NO TYPE, so the emitter's `free(slice)` gate failed and wrote
+`free(tmp)` instead of `free((void*)tmp.ptr)` — fixed at the declaration site with
+`checker_set_type`; and the **VALUE** fallback was broken too, not just the loud
+control-flow one. The emitter's "compiler bug … in a spawn argument" message named
+spawn at all four sites and claimed the checker rejected the case — both false, both
+corrected.)* Original: MEASURED: `heap.free_ptr(mh orelse return)` produces a FALSE LEAK on main
 (`handle 'mh' allocated … but never freed`) because zercheck cannot key the free's
 argument; the branch also reports the emitter falling through to a "compiler bug …
 in a spawn argument" message plus a runtime trap. Their fix hoists every `orelse`
@@ -223,9 +232,61 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
 6. F  ~~const-expression MISCOMPILE~~       CLOSED (BUG-939); binary-operand
       residual folds into K (BUG-921) — same predicate, do them together
-7. J/I/K/H/G  the smaller ones
+7. ~~J/I/K/H/G~~  K, G, H CLOSED (BUG-940/941/942); **I and J remain**
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
 ```
+
+---
+
+## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+
+Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
+not reported by any branch. The baseline claimed an asm operand can reach "no local, no
+loop and no effect"; the third was false, and this is what is behind it.
+
+The emitter's per-statement `shared struct` auto-locking does not wrap an `asm`
+statement, so a shared field read in an OPERAND is emitted bare:
+
+```zer
+shared struct A { u32 x; }
+A a;
+naked void k(){
+    asm { instructions: "nop" inputs: { "rax" = a.x } safety: "..." }
+}
+void worker(){ k(); }
+u32 main(){ ThreadHandle t = spawn worker(); t.join(); return 0; }
+```
+
+MEASURED on main at `aeea0cd5` — accepted with **no diagnostic**, and the emitted C is:
+
+```c
+void k(void) { _zer_bb0:; __asm__ __volatile__ ("nop" :  : "a"(a.x)); return; }
+```
+
+no `pthread_mutex_lock`, while the identical read in an ordinary statement emits
+`_zer_mtx_ensure_init` + `pthread_mutex_lock` + read (verified side by side). The whole
+contract of `shared` is that the lock is automatic, so this is an unlocked shared access
+reachable from a spawned thread — the same class as BUG-935, at a site the collector
+never visits.
+
+**Not to be confused with the CALL-laundered shape**, which behaves differently and is
+NOT a hole: a call in an operand reaching two shared structs (`"rax" = touch_both()`) is
+ACCEPTED while the same call in an ordinary statement is REJECTED by the deadlock rule.
+That divergence is the OVER-REJECTION item **O** in the ii7a90 survey proposes to relax
+(a statement with no DIRECT shared access takes no lock, so nothing can nest around the
+call) — the asm site is accidentally already on the relaxed side. Do not "fix" that one
+by tightening asm; fix it by doing O.
+
+**Fix sketch:** the shared-root collector (`find_all_shared_roots_expr`, the
+`SharedRootVec` from BUG-935) does not run on `asm_stmt.inputs` / `.outputs`. Running it
+there and emitting the lock/unlock around the asm statement is the shape of the fix.
+Two hazards to check before shipping it: a lock around an `asm` block inside `@critical`
+(the interrupt-disabled window), and whether locking is even legal in a `naked` function
+under the S1 restriction — this may be a case where REJECTING a direct shared access in
+an operand is the right answer rather than locking it, since a naked function has no
+frame. Decide with the Ban Decision Framework; do not assume the lock.
+
+Tripwire: none yet — write the negative in the same commit as the fix.
 
 ---
 

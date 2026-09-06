@@ -802,6 +802,24 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 arg_locals[i] = lower_expr(ctx, expr->call.args[i]);
             }
         }
+        /* BUG-942: a BUILTIN's arguments are deliberately NOT decomposed (they may
+         * be a bare TYPE NAME — `arena.alloc(Task)`, `alloc(u8, n)` — which is not
+         * an expression and has no local to lower into). But that skip also skipped
+         * pre_lower_orelse, so an `orelse` inside a builtin argument survived into
+         * the emitter's raw-AST path, where it either emitted a runtime trap on
+         * VALID code (`free(ms orelse return)`) or left zercheck unable to key the
+         * argument, producing a FALSE LEAK on `heap.free_ptr(mh orelse return)`.
+         *
+         * pre_lower_orelse rewrites ONLY NODE_ORELSE subtrees, so a type-name
+         * argument is a leaf and passes through untouched — which is exactly why it
+         * is the right tool here and full decomposition is not. It must run AFTER
+         * rewrite_idents (above): it replaces the argument with an identifier
+         * naming an IR temp whose name is already final. Same order as the
+         * expression passthrough. */
+        if (call_is_builtin) {
+            for (int i = 0; i < arg_count; i++)
+                pre_lower_orelse(ctx, &expr->call.args[i], expr->loc.line);
+        }
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_i32;
         Type *rt_eff = type_unwrap_distinct(rt);
@@ -1817,6 +1835,17 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
         id->loc = n->loc;
         id->ident.name = tloc->name;
         id->ident.name_len = (size_t)tloc->name_len;
+        /* BUG-942: register the replacement's type. The synthesized identifier had
+         * NO typemap entry, so any consumer that asks `checker_get_type` for it got
+         * NULL and took its untyped fallback. That never showed while every caller
+         * of this function fed a path that decomposes arguments into IR locals —
+         * but a BUILTIN's arguments are read back from the raw AST, and the
+         * emitter's `free(slice)` arm gates on the argument being a SLICE, so a
+         * hoisted `free(ms orelse return)` emitted `free(tmp)` instead of
+         * `free((void*)tmp.ptr)` — which GCC then refused to compile.
+         * This is the declaration-site fix: the identifier stands for the orelse's
+         * result, so it carries the orelse's result type. */
+        checker_set_type(ctx->checker, id, rt);
         *pp = id;
         return;
     }
@@ -3783,6 +3812,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * a rename candidate. */
         for (int si = 0; si < node->spawn_stmt.arg_count; si++)
             rewrite_idents(ctx, node->spawn_stmt.args[si]);
+        /* BUG-942: and an `orelse` in a spawn argument must be hoisted for the same
+         * reason the expression passthrough hoists one — emit_rewritten_node's
+         * NODE_ORELSE arm cannot express a control-flow fallback, so
+         * `spawn w(none() orelse return)` emitted a _zer_trap on VALID code.
+         * After the hoist the argument is a plain identifier and the `return`
+         * is a real IR branch that runs BEFORE the thread is created. */
+        for (int si = 0; si < node->spawn_stmt.arg_count; si++)
+            pre_lower_orelse(ctx, &node->spawn_stmt.args[si], node->loc.line);
         IRInst sp = make_inst(IR_NOP, node->loc.line);
         sp.expr = node; /* emit_stmt handles NODE_SPAWN */
         emit_inst(ctx, sp);
@@ -3823,6 +3860,22 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
     /* ---- ASM ---- */
     case NODE_ASM: {
+        /* BUG-942: an asm OPERAND is a ZER expression emitted from the raw AST, so
+         * an `orelse` in one reached the same dead end (`"rax" = (none() orelse
+         * return)` emitted a _zer_trap). Hoist it, exactly as at the other two
+         * raw-AST argument sites.
+         *
+         * NOTE the asymmetry with BUG-941: asm operands need pre_lower_orelse but
+         * NOT rewrite_idents, because `asm` is legal only inside a `naked` function
+         * and a naked function may not declare a local ("naked function must only
+         * contain asm and return") — so there is no local here to shadow, while a
+         * call inside an operand can still yield an optional. */
+        for (int ai = 0; ai < node->asm_stmt.input_count; ai++)
+            if (node->asm_stmt.inputs[ai].expr)
+                pre_lower_orelse(ctx, &node->asm_stmt.inputs[ai].expr, node->loc.line);
+        for (int ao = 0; ao < node->asm_stmt.output_count; ao++)
+            if (node->asm_stmt.outputs[ao].expr)
+                pre_lower_orelse(ctx, &node->asm_stmt.outputs[ao].expr, node->loc.line);
         IRInst inst = make_inst(IR_NOP, node->loc.line);
         inst.expr = node; /* pass through — emitter handles raw asm */
         emit_inst(ctx, inst);

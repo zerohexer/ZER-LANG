@@ -1,0 +1,34 @@
+// BUG-942, second half: the hoisted `orelse` was replaced by a synthesized
+// NODE_IDENT that carried NO TYPE. Every previous caller of pre_lower_orelse fed
+// a path that decomposes arguments into IR locals, so nobody ever asked the
+// identifier for its type — but a builtin's arguments are read back from the raw
+// AST, and the emitter's `free(slice)` arm gates on the argument BEING a slice.
+//
+// With the hoist but no type, that gate failed and the emitter wrote
+//     free(_zer_t1);            instead of   free((void*)(_zer_t1).ptr);
+// which GCC rejects: "incompatible type for argument 1 of 'free'".
+//
+// PRE-FIX (before the hoist): exit 1, GCC "request for member 'ptr' in something
+// not a structure or union" — the trap expression has no `.ptr`.
+// MID-FIX (hoist, no type): exit 1, GCC "incompatible type for argument 1".
+// Both failures are in EMITTED C, so `-o out.c` alone does not show them.
+
+u32 reached = 0;
+
+void ctrl_flow(){
+    ?[*]u8 ms = null;
+    free(ms orelse return);
+    reached = 9;                 // must NOT run
+}
+
+u32 main(){
+    ?[*]u8 got = alloc(u8, 4);
+    [*]u8 s = got orelse { return 1; };
+    s[0] = 3;
+    if (s[0] != 3) { return 2; }
+    free(s);
+
+    ctrl_flow();
+    if (reached != 0) { return 3; }
+    return 0;
+}

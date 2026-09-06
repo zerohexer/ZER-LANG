@@ -1,0 +1,35 @@
+// BUG-942: a spawn argument is emitted from the raw AST, so an `orelse` in one
+// reached emit_rewritten_node's NODE_ORELSE arm, which cannot express a
+// control-flow fallback and emitted a runtime trap instead.
+//
+// PRE-FIX: exit 133 — "ZER TRAP: orelse control-flow fallback in spawn arg",
+// a shipped trap on a VALID program.
+//
+// The `return` fallback returns from the ENCLOSING function, before the thread
+// is ever created — which is what makes it meaningful here.
+
+u32 seen = 0;
+u32 stage = 0;
+?u32 none(){ return null; }
+?u32 some(){ return 7; }
+void w(u32 a){ @atomic_store(&seen, a); }
+
+void spawn_ctrl(){
+    ThreadHandle th = spawn w(none() orelse return);
+    th.join();
+    stage = 9;                       // must NOT run
+}
+
+u32 main(){
+    ThreadHandle t1 = spawn w(some() orelse 3);
+    t1.join();
+    if (@atomic_load(&seen) != 7) { return 1; }
+
+    ThreadHandle t2 = spawn w(none() orelse 3);
+    t2.join();
+    if (@atomic_load(&seen) != 3) { return 2; }
+
+    spawn_ctrl();
+    if (stage != 0) { return 3; }
+    return 0;
+}

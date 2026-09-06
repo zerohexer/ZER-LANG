@@ -21,12 +21,28 @@
 #     working, and have nothing to descend.
 #
 #   * NODE_ASM operands. `asm_stmt.inputs` / `asm_stmt.outputs` bind ZER lvalues,
-#     and NO walker in the tree descends them. That is currently UNREACHABLE, not
-#     safe: `asm` is legal only inside a `naked` function, and a naked function
-#     may contain nothing but asm and `return` — so no local, no loop and no
-#     effect can be reached through an operand. It becomes live the moment the S1
-#     naked-only restriction is relaxed (Option E). Tracked in docs/limitations.md
-#     as "asm operands are invisible to the AST safety walkers".
+#     and no AST *safety* walker in the tree descends them. `asm` is legal only
+#     inside a `naked` function, and a naked function may contain nothing but asm
+#     and `return`, so an operand can reach no LOCAL and no LOOP.
+#
+#     CORRECTED 2026-09-06 (BUG-942): the sentence used to end "...so no local, no
+#     loop and no EFFECT can be reached through an operand", and that third item
+#     was FALSE. An operand may contain a CALL — `"rax" = (none() orelse 1)` — and
+#     a call reaches whatever the callee reaches. That missing qualifier is exactly
+#     what made the site live: an `orelse` in an operand was never hoisted, and
+#     emitted a runtime trap on a valid program. `ir_lower.c:lower_stmt` now
+#     descends both fields, so its two rows are gone from this file.
+#
+#     This is the shape CLAUDE.md names as worth probing for directly — an
+#     exemption whose written rationale is NARROWER than its code. The remaining
+#     rows below are still baselined, but on the narrower claim (no local, no
+#     loop), NOT on "nothing can be reached". Whether a call in an operand defeats
+#     any of those particular walkers is an OPEN question recorded in
+#     docs/limitations.md; it is not answered by this file.
+#
+#     All of it becomes live the moment the S1 naked-only restriction is relaxed
+#     (Option E). Tracked in docs/limitations.md as "asm operands are invisible to
+#     the AST safety walkers".
 #
 
 # --- checker.c: all_paths_return ---
@@ -514,8 +530,6 @@ ir_lower.c:lower_expr:NODE_WHILE:while_stmt.body
 ir_lower.c:lower_expr:NODE_WHILE:while_stmt.cond
 
 # --- ir_lower.c: lower_stmt ---
-ir_lower.c:lower_stmt:NODE_ASM:asm_stmt.inputs
-ir_lower.c:lower_stmt:NODE_ASM:asm_stmt.outputs
 ir_lower.c:lower_stmt:NODE_ASSIGN:assign.target
 ir_lower.c:lower_stmt:NODE_ASSIGN:assign.value
 ir_lower.c:lower_stmt:NODE_BINARY:binary.left

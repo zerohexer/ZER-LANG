@@ -1,0 +1,40 @@
+// BUG-942: an `orelse` inside a BUILTIN method's argument survived IR lowering.
+//
+// A builtin's arguments are deliberately NOT decomposed into IR locals — one of
+// them may be a bare TYPE NAME (`arena.alloc(Task)`), which is not an expression.
+// That skip also skipped pre_lower_orelse, so the orelse reached the emitter as
+// raw AST and zercheck could not key the free's argument.
+//
+// PRE-FIX this file did not build at all: exit 1 with TWO FALSE LEAKS —
+//   "handle %0 (local 'mh') allocated at line 7 but never freed"
+//   "handle %8 (local 'a')  allocated at line 18 but never freed"
+// plus a bogus "compiler bug: orelse with control-flow fallback in a spawn
+// argument" on a statement containing no spawn.
+//
+// Both fallback kinds are covered: the CONTROL-FLOW one (`orelse return`, which
+// must actually return) and the VALUE one (`orelse a`, which broke the same way).
+
+struct T { u32 v; }
+Pool(T, 1) p;
+Slab(T) heap;
+u32 marker = 0;
+
+void ctrl_flow_fallback(){
+    ?Handle(T) mh = p.alloc();      // the single slot is taken -> null
+    p.free(mh orelse return);       // the `return` must fire HERE
+    marker = 9;                     // and this must NOT run
+}
+
+u32 main(){
+    Handle(T) held = p.alloc() orelse { return 1; };   // take the only slot
+    ctrl_flow_fallback();
+    if (marker != 0) { return 2; }                     // the orelse fell through
+    p.free(held);
+
+    // value fallback in a Slab method argument
+    *T a = heap.alloc_ptr() orelse { return 3; };
+    a.v = 5;
+    ?*T nothing = null;
+    heap.free_ptr(nothing orelse a);                   // frees `a`
+    return 0;
+}

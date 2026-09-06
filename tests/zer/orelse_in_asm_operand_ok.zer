@@ -1,0 +1,43 @@
+// BUG-942: an asm OPERAND is a ZER expression emitted from the raw AST, so an
+// `orelse` in one hit the same dead end as the builtin-argument and spawn-argument
+// sites. This site was found by ENUMERATING the raw-AST argument positions; the
+// survey named only the builtin one.
+//
+// PRE-FIX: exit 133 — "ZER TRAP: orelse control-flow fallback in spawn arg"
+// (the message named spawn because that was the only site anyone had hit).
+//
+// NOTE the asymmetry with BUG-941, which fixed spawn arguments emitted by NAME
+// without rewrite_idents: asm operands need pre_lower_orelse but NOT
+// rewrite_idents, because `asm` is legal only inside a `naked` function and a
+// naked function may not declare a local ("naked function must only contain asm
+// and return"). There is no local here to shadow — but a CALL in an operand can
+// still yield an optional, so the orelse question is live and the shadow one is not.
+//
+// The naked attribute is not emitted on hosted x86-64 (zerc warns about exactly
+// that), so these are safe to CALL — and they must be called, or the trap sits in
+// a dead branch and the test proves nothing.
+
+?u32 none(){ return null; }
+?u32 some(){ return 5; }
+
+naked void val_fallback(){
+    asm {
+        instructions: "nop"
+        inputs: { "rax" = (some() orelse 1) }
+        safety: "a nop with one register input; touches no memory, no flags, no control flow"
+    }
+}
+
+naked void ctrl_fallback(){
+    asm {
+        instructions: "nop"
+        inputs: { "rax" = (none() orelse return) }
+        safety: "a nop with one register input; touches no memory, no flags, no control flow"
+    }
+}
+
+u32 main(){
+    val_fallback();
+    ctrl_fallback();
+    return 0;
+}

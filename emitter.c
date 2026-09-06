@@ -10394,11 +10394,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
         if (node->orelse.fallback_is_return || node->orelse.fallback_is_break ||
             node->orelse.fallback_is_continue) {
-            /* Control flow out of an argument list has no meaning here; the
-             * checker rejects it, so reaching this is a compiler bug. */
-            fprintf(stderr, "compiler bug: orelse with control-flow fallback in a "
-                            "spawn argument at line %d\n", node->loc.line);
-            emit(e, "(_zer_trap(\"orelse control-flow fallback in spawn arg\", "
+            /* BUG-942: this arm used to say "the checker rejects it, so reaching
+             * this is a compiler bug", and to name a SPAWN argument. Both were
+             * wrong. The checker does not reject it, and it was reachable from
+             * FOUR raw-AST argument positions, of which spawn was only one:
+             * a builtin method's argument (`heap.free_ptr(mh orelse return)`),
+             * the universal `free(slice)`, a spawn argument, and an asm operand.
+             * The misnamed message sent every one of them looking at spawn.
+             *
+             * All four now hoist the orelse in ir_lower.c before emission (see
+             * BUG-942 there), so this really is unreachable — but it is kept as a
+             * backstop, and it now says WHAT it saw rather than guessing WHERE. */
+            fprintf(stderr, "compiler bug: an orelse with a control-flow fallback "
+                            "reached raw-AST emission un-hoisted, at line %d — see "
+                            "BUG-942 in ir_lower.c\n", node->loc.line);
+            emit(e, "(_zer_trap(\"un-hoisted orelse control-flow fallback\", "
                  "__FILE__, __LINE__), 0)");
             return;
         }

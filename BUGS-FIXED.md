@@ -554,6 +554,76 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-942: an `orelse` in a raw-AST argument, at FOUR sites
+
+Survey item H, which named ONE site. Enumerating the raw-AST argument positions found
+four, and the emitter's own diagnostic had been misnaming three of them for as long as
+it existed.
+
+A builtin's arguments are deliberately NOT decomposed into IR locals — one may be a
+bare TYPE NAME (`arena.alloc(Task)`, `alloc(u8, n)`), which is not an expression and
+has no local to lower into. That skip also skipped `pre_lower_orelse`, so an `orelse`
+inside a builtin argument survived into the emitter's raw-AST path.
+
+| site | measured symptom on main |
+|---|---|
+| builtin method arg | `heap.free_ptr(mh orelse return)` — **FALSE LEAK**, refuses to build |
+| universal `free(slice)` | `free(ms orelse return)` — runtime `_zer_trap` on valid code |
+| spawn arg | `spawn w(none() orelse return)` — runtime `_zer_trap` on valid code |
+| **asm operand** | `"rax" = (none() orelse return)` — runtime `_zer_trap`, **found by enumeration** |
+
+The fix is the same one query at all four: `pre_lower_orelse`, which rewrites ONLY
+`NODE_ORELSE` subtrees, so a type-name argument is a leaf and passes through untouched.
+That is exactly why it is the right tool and full decomposition is not.
+
+Both fallback kinds were broken, not just the loud one: the VALUE fallback
+(`heap.free_ptr(nothing orelse a)`) produced a false leak too, because zercheck could
+not key the argument either way.
+
+### The second half — a synthesized node with no type
+
+Hoisting alone was not enough. `pre_lower_orelse` replaces the orelse with a
+synthesized `NODE_IDENT` and never registered its type, so `checker_get_type` returned
+NULL for it. That had never mattered, because every previous caller fed a path that
+decomposes arguments into IR locals and nobody asked. A builtin's arguments are read
+back from the raw AST, and the emitter's `free(slice)` arm gates on the argument BEING
+a slice — so the hoisted `free(ms orelse return)` emitted `free(tmp)` instead of
+`free((void*)tmp.ptr)`, which GCC then refused.
+
+Fixed at the declaration site (`checker_set_type` on the synthesized identifier), not
+at my new call sites: the identifier stands for the orelse's result, so it carries the
+orelse's result type. Both failures live in EMITTED C, so `-o out.c` alone shows
+neither — the tests must RUN.
+
+### The exemption's rationale was narrower than its code
+
+`tools/walker_field_baseline.txt` baselined the asm operand rows with a written
+justification ending *"so no local, no loop and no EFFECT can be reached through an
+operand"*. The first two hold — `asm` is naked-only and a naked function may not
+declare a local (verified). The third is false: an operand may contain a CALL, and a
+call reaches whatever the callee reaches. That missing qualifier is precisely what made
+the asm site live.
+
+This is the shape CLAUDE.md says to probe for directly — an exemption whose written
+rationale is narrower than its code — and it is the second consecutive bug in which a
+BASELINE ROW had silenced the audit on a live defect (BUG-941's was
+`NODE_SPAWN:spawn_stmt.args`). The two `ir_lower.c:lower_stmt:NODE_ASM:*` rows are
+removed and the header's claim is corrected to the narrower one that is actually true.
+
+### The diagnostic was lying about where it was
+
+The emitter's arm said *"the checker rejects it, so reaching this is a compiler bug"*
+and named a SPAWN argument. Neither was true: the checker does not reject it, and three
+of the four sites are not spawn. It now reports what it saw rather than guessing where,
+and is kept as a genuine backstop now that all four sites hoist.
+
+Four positives, each verified to FAIL on the pre-fix build (exit 1 / 133 / 133 / 1):
+`orelse_in_builtin_arg_ok`, `orelse_in_spawn_arg_ok`, `orelse_in_asm_operand_ok`,
+`orelse_in_universal_free_ok`. The asm one CALLS both naked functions — with the trap
+in a dead branch it passed pre-fix too, i.e. it would have been vacuous.
+
+`make check` exit 0, nine gates OK.
+
 ## Session 2026-09-06 — BUG-941: a spawn argument bound to the WRONG variable
 
 Survey item G. The `NODE_SPAWN` statement is lowered as a raw AST passthrough

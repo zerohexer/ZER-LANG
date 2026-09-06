@@ -1359,6 +1359,36 @@ Test: `tests/zer/comptime_width_conversions.zer`.
 
 ---
 
+## Session 2026-09-06 — BUG-989/990: the analyzer read freed memory to decide a safety verdict; `tools/compiler_asan_sweep.sh` (from `vigilant-tesla-lzmkhn`)
+
+Cherry-pick of `40eb8d2` (their BUG-920/921). Found by a sweep nobody had run: ZERC ITSELF
+under ASan+UBSan over the whole corpus — every other gate asks about the program ZER
+compiles, and the two existing sweeps instrument the EMITTED C.
+
+### BUG-989 — heap-use-after-free in `zercheck_ir.c`, three sites
+
+`ir_add_handle` grows `ps->handles` with `realloc`, so every pointer into that array is
+invalidated by it — which is exactly why `IRAliasSnapshot` exists. Three sites deviated:
+two took the snapshot correctly and then read `fh->state` through the stale pointer; the
+third took the snapshot AFTER the add, so alloc_id, pool_name, escaped and the view set were
+all copied out of freed memory. No `.zer` test could have caught this: reading freed memory
+does not crash, it makes the leak / wrong-pool / UAF verdict depend on what the allocator
+left behind, silently and non-deterministically (ASan reached one site via
+`tests/zer/tokenizer.zer`).
+
+### BUG-990 — `1LL << 63` (and `INT64_MIN - 1` after it) computing an `@saturate` bound in the emitter
+
+GCC wraps so the emitted C was right by luck; computed unsigned now. The AST-path twin uses
+hard-coded literals per width.
+
+`tools/compiler_asan_sweep.sh` is the third sweep (sanitizers on the COMPILER; the others are
+`-O0`/`-O2` differential and sanitizers on emitted C). It builds into a temp dir so it can
+never leave instrumented `.o` files behind (the #1 phantom-bug trap). NOTE for this sandbox:
+ASan may be inert here (see CLAUDE.md) — verify the positive control before trusting a clean
+run.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

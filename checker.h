@@ -49,6 +49,13 @@ typedef struct {
     uint64_t cur_ret_param_mask;   /* bit n: a return may be a view of parameter n */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int  loop_depth;        /* BUG-947: loop NESTING count, not just "in one". */
+    bool lockchk_direct_only; /* BUG-948: while set, collect_shared_types_in_expr
+                             * does NOT merge a callee's transitive shared types.
+                             * Used for one probe pass: a statement with no DIRECT
+                             * shared access takes no lock, so nothing can nest
+                             * around its calls and the transitive set is
+                             * irrelevant. Single-threaded compiler; set and
+                             * cleared at the one decision point. */
     int  block_entry_loop_depth; /* BUG-947: loop_depth at the moment the INNERMOST
                              * defer / @critical / @once body was entered. A break or
                              * continue targets a loop nested INSIDE that body iff
@@ -330,7 +337,14 @@ typedef struct {
         int type_capacity;
         bool computed;          /* true if DFS completed (memoized) */
         bool in_progress;       /* true during DFS (cycle detection) */
-    } *func_shared_cache;
+    } **func_shared_cache;  /* BUG-949: array of POINTERS to individually
+                             * allocated entries. It used to be an array of
+                             * entries grown with realloc, while
+                             * scan_body_shared_types holds an entry pointer
+                             * ACROSS a recursive compute_func_shared_types that
+                             * can add an entry — so past the initial capacity of
+                             * 16 the array moved and the merge wrote through a
+                             * freed pointer. Entries must never move. */
     int func_shared_cache_count;
     int func_shared_cache_capacity;
 

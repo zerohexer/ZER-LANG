@@ -22896,24 +22896,31 @@ bool checker_check(Checker *c, Node *file_node) {
 static struct FuncSharedTypes *find_func_shared_cache(Checker *c,
     const char *name, uint32_t len) {
     for (int i = 0; i < c->func_shared_cache_count; i++) {
-        if (c->func_shared_cache[i].func_name_len == len &&
-            memcmp(c->func_shared_cache[i].func_name, name, len) == 0)
-            return &c->func_shared_cache[i];
+        if (c->func_shared_cache[i]->func_name_len == len &&
+            memcmp(c->func_shared_cache[i]->func_name, name, len) == 0)
+            return c->func_shared_cache[i];
     }
     return NULL;
 }
 
 static struct FuncSharedTypes *add_func_shared_cache(Checker *c,
     const char *name, uint32_t len) {
+    /* BUG-949: the POINTER ARRAY may move; the ENTRIES must not. Callers hold an
+     * entry pointer across a recursive call that can add another entry. */
     if (c->func_shared_cache_count >= c->func_shared_cache_capacity) {
         int nc = c->func_shared_cache_capacity < 16 ? 16 : c->func_shared_cache_capacity * 2;
-        c->func_shared_cache = realloc(c->func_shared_cache, nc * sizeof(struct FuncSharedTypes));
+        struct FuncSharedTypes **na = realloc(c->func_shared_cache,
+                                              nc * sizeof(struct FuncSharedTypes *));
+        if (!na) return NULL;
+        c->func_shared_cache = na;
         c->func_shared_cache_capacity = nc;
     }
-    struct FuncSharedTypes *entry = &c->func_shared_cache[c->func_shared_cache_count++];
-    memset(entry, 0, sizeof(*entry));
+    struct FuncSharedTypes *entry =
+        (struct FuncSharedTypes *)calloc(1, sizeof(struct FuncSharedTypes));
+    if (!entry) return NULL;
     entry->func_name = name;
     entry->func_name_len = len;
+    c->func_shared_cache[c->func_shared_cache_count++] = entry;
     return entry;
 }
 
@@ -22939,6 +22946,7 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
 static void compute_func_shared_types(Checker *c, const char *fname, uint32_t flen) {
     struct FuncSharedTypes *fsc = find_func_shared_cache(c, fname, flen);
     if (!fsc) fsc = add_func_shared_cache(c, fname, flen);
+    if (!fsc) return;                              /* BUG-949: OOM — stay conservative */
     if (fsc->computed || fsc->in_progress) return; /* memoized or cycle */
     fsc->in_progress = true;
 
@@ -23406,8 +23414,16 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
         /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
          * Uses DFS with memoization — no depth limit, handles mutual recursion.
-         * Each function computed once via compute_func_shared_types(). */
-        if (count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+         * Each function computed once via compute_func_shared_types().
+         *
+         * BUG-948: skipped during the DIRECT-ONLY probe pass. The transitive set
+         * matters only when the CALLING statement itself holds a lock across the
+         * call — measured: `u32 r = a.x + helper();` emits lock / read / CALL /
+         * unlock, so a callee touching a second shared type really does nest. With
+         * no direct access the statement emits no lock at all, so nothing can nest
+         * and the callee's own per-statement locks are taken and released alone. */
+        if (!c->lockchk_direct_only &&
+            count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
             const char *cn = expr->call.callee->ident.name;
             uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
             compute_func_shared_types(c, cn, cl);
@@ -23523,9 +23539,37 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
     for (int i = 0; i < block->block.stmt_count; i++) {
         Node *stmt = block->block.stmts[i];
 
-        /* Check for multi-shared-type expressions within a single statement */
+        /* Check for multi-shared-type expressions within a single statement.
+         *
+         * BUG-948 (survey item O): probe DIRECT accesses first. The rule's own
+         * model — stated in the comment above and verified in the emitted C — is
+         * that a deadlock needs TWO locks held at once, and the emitter takes a
+         * lock for a statement only when that statement DIRECTLY touches a shared
+         * struct. So a statement with no direct access holds nothing across its
+         * calls, and merging a callee's transitive types into it rejected code that
+         * cannot deadlock:
+         *
+         *     u32 r = touch_both();     // refused, though main() locks nothing
+         *
+         * The inconsistency is visible without any argument: the identical
+         * statement calling a function that touches ONE shared struct was always
+         * accepted, and the caller's lock behaviour is the same in both cases —
+         * none. `a.x = touch_both();` still has a direct access and stays rejected. */
         Type *found[4];
-        int n = collect_shared_types_in_stmt(c, stmt, found, 4);
+        /* Probe into `found` and reuse it — the second pass overwrites it, and only
+         * the COUNT of the first pass is needed. A second scratch array would grow
+         * the fixed-buffer baseline for no reason. */
+        c->lockchk_direct_only = true;
+        int ndirect = collect_shared_types_in_stmt(c, stmt, found, 4);
+        c->lockchk_direct_only = false;
+        /* NOTE: this must gate the CHECK ONLY, never the recursion below. A first
+         * draft used `continue` here and silently stopped descending into nested
+         * bodies whose OWN statements had a direct access — `do { a.x = b.y; }
+         * while (k);` compiled, because the do-while statement itself touches
+         * nothing directly. Three existing negatives caught it (deadlock_depth20,
+         * _in_do_while, _in_switch_arm). A relaxation that skips a walk is not a
+         * relaxation, it is a hole. */
+        int n = (ndirect == 0) ? 0 : collect_shared_types_in_stmt(c, stmt, found, 4);
         if (n >= 2) {
             /* Two different shared types in one statement — potential deadlock.
              * BUG-500: skip for shared(rw) read-only statements. rwlock allows

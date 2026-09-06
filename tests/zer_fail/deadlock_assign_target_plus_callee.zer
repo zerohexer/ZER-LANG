@@ -1,0 +1,8 @@
+// expect-error: deadlock: single statement accesses both
+// BUG-948 boundary: the direct access can be the ASSIGNMENT TARGET rather than a
+// read, and the lock is held across the call just the same.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 touch_b(){ return b.y; }
+u32 main(){ a.x = touch_b(); return 0; }

@@ -1,0 +1,9 @@
+// expect-error: deadlock: single statement accesses both
+// BUG-948 boundary: a DIRECT access to A means the emitter holds A's lock across
+// the call, so a callee touching B really does nest two locks. Verified in the
+// emitted C: lock / read a.x / CALL / unlock. This must stay rejected.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 touch_b(){ return b.y; }
+u32 main(){ u32 r = a.x + touch_b(); return r; }

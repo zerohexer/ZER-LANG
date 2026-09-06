@@ -554,6 +554,88 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-948 / BUG-949: the deadlock rule, and a use-after-free under it
+
+Survey item O, and a latent memory bug the relaxation shook loose.
+
+### BUG-948 — a statement that holds no lock cannot deadlock
+
+The same-statement deadlock rule merged a callee's TRANSITIVE shared types into
+every calling statement, so a statement with NO DIRECT shared access was rejected:
+
+```zer
+u32 r = touch_both();      // refused, though main() locks nothing at all
+```
+
+The rule's own model, stated in its comment, is that a deadlock needs TWO locks held
+AT ONCE — and the emitter takes a lock for a statement only when that statement
+DIRECTLY touches a shared struct. Both halves were verified in the emitted C rather
+than argued:
+
+```c
+u32 r = a.x + helper();   ->   lock / read a.x / CALL helper() / unlock
+u32 r = helper();         ->   no lock in the caller at all
+```
+
+So with a direct access the callee's locks really do nest and the merge is necessary;
+with none, nothing nests. The inconsistency needed no argument at all: the identical
+statement calling a function that touches ONE shared struct was always accepted, and
+the caller's lock behaviour is the same in both cases — none.
+
+The positive test is empirical rather than a compile check: two threads call
+functions touching A and B in OPPOSITE orders, 200 times each. If a lock were held
+across those calls it would deadlock and the harness would hang.
+
+### The first draft was a HOLE, and the existing negatives caught it
+
+Gating with `continue` skipped the rest of the loop body — which includes the
+RECURSION into nested bodies. So `do { a.x = b.y; } while (k);` compiled, because the
+do-while statement itself touches nothing directly. Three existing negatives failed
+immediately (`deadlock_depth20`, `_in_do_while`, `_in_switch_arm`). A relaxation that
+skips a walk is not a relaxation, it is a hole. Gate the CHECK, never the walk.
+
+### BUG-949 — a use-after-free, found because the relaxation perturbed it
+
+Two of the three negatives went green after that fix; `deadlock_depth20` did not, and
+bisecting the chain length put the boundary at exactly 16 -> 17. That is the initial
+capacity of `func_shared_cache`.
+
+`find_func_shared_cache` returned a pointer INTO an array that
+`add_func_shared_cache` grows with `realloc`, and `scan_body_shared_types` holds that
+pointer ACROSS a recursive `compute_func_shared_types` that can add an entry. Past
+the 16th entry the array moves and the merge writes through a freed pointer.
+
+**ASan, on a build of the intermediate state:**
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+    #0 fsc_add_type_id      checker.c:22921
+    #1 scan_body_shared_types checker.c:23022
+    #4 compute_func_shared_types checker.c:22954
+```
+
+and zero ASan errors after the fix, with the correct rejection restored.
+
+**Stated honestly:** the defect is real by construction and ASan-confirmed on the
+intermediate, but it did NOT manifest on the pre-session build for any shape I tried
+(chains to depth 100, 30 sibling functions, both under ASan). My extra probe pass
+changed the allocation counts enough to make it fire. A pointer held across a
+reallocating call is a defect whether or not a given input is lucky.
+
+Fixed by making the cache an array of POINTERS to individually allocated entries, so
+entries never move — the class fix, not a re-find at the one site that happened to
+break.
+
+### One more audit refusal, handled the same way as before
+
+The probe originally used a second `Type *direct[4]` scratch array and the
+fixed-buffer audit flagged it. Only the COUNT of the first pass is needed and the
+second pass overwrites the buffer anyway, so the array is gone rather than baselined
+— the same call as the `type_dispatch` one earlier this session.
+
+One positive, two negatives with `expect-error`. `make check` exit 0, nine gates,
+1484.
+
 ## Session 2026-09-06 — BUG-947: a break whose loop is INSIDE the block it is in
 
 Survey item N, a measured relaxation. `break` / `continue` inside a defer body,

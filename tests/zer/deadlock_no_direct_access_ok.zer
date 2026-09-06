@@ -1,0 +1,45 @@
+// BUG-948 (survey item O): the same-statement deadlock rule merged a callee's
+// TRANSITIVE shared types into every calling statement, so a statement with NO
+// DIRECT shared access was rejected:
+//
+//     u32 r = touch_both();      // refused, though main() locks nothing at all
+//
+// The rule's own model — stated in its comment and verified in the emitted C — is
+// that a deadlock needs TWO locks held AT ONCE, and the emitter takes a lock for a
+// statement only when that statement DIRECTLY touches a shared struct. Measured:
+//
+//     u32 r = a.x + helper();    lock / read a.x / CALL helper() / unlock
+//     u32 r = helper();          no lock in the caller at all
+//
+// So with a direct access the callee's locks really do nest and the merge is
+// needed; with none, nothing nests. The inconsistency needed no argument: the same
+// statement calling a function touching ONE shared struct was always accepted, and
+// the caller's lock behaviour is identical in both cases — none.
+//
+// PRE-FIX this file does not compile ("deadlock: single statement accesses both
+// 'A' and 'B'"), so every return code below is unreachable.
+//
+// The test is empirical, not just a compile check: two threads call functions that
+// touch A and B in OPPOSITE orders, 200 times each. If a lock were held across
+// those calls this would deadlock and the harness would hang.
+
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+
+u32 touch_both(){ a.x = 1; return b.y; }        // A then B
+u32 touch_both_rev(){ b.y = 2; return a.x; }    // B then A
+
+void w1(){ for (u32 i = 0; i < 200; i += 1) { u32 r = touch_both(); } }
+void w2(){ for (u32 i = 0; i < 200; i += 1) { u32 r = touch_both_rev(); } }
+
+u32 main(){
+    b.y = 7;
+    ThreadHandle t1 = spawn w1();
+    ThreadHandle t2 = spawn w2();
+    t1.join();
+    t2.join();
+    if (a.x != 1) { return 1; }
+    if (b.y != 2) { return 2; }
+    return 0;
+}

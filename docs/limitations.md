@@ -32,12 +32,19 @@ repeated.
 
 ## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): ALL 12 ITEMS CLOSED; 2 refactors + 2 relaxations REMAIN
 
-**STATUS 2026-09-06: items A–K are all CLOSED** (BUG-934..946). What remains from this
-branch is **L** and **M** (the two architectural refactors) and **N** / **O** (the two
-measured relaxations). Three findings were made while closing them that this branch
-never reported, and each has its own OPEN entry below: a `shared struct` read in an asm
-operand takes NO LOCK; a designated initializer does not work at global scope for any
-field type; and BUG-936 left three defer-body auto-guard siblings that only **M** closes.
+**STATUS 2026-09-06: items A–K AND both relaxations N / O are CLOSED** (BUG-934..949).
+**Only the two architectural refactors L and M remain.**
+
+Four findings were made while closing them that this branch never reported, each with
+its own OPEN entry below: a `shared struct` read in an asm operand takes NO LOCK; a
+designated initializer does not work at global scope for any field type; BUG-936 left
+three defer-body auto-guard siblings that only **M** closes; and BUG-949, a
+use-after-free in the shared-types cache (fixed). **N also proved that the defer half
+of the emitter is the blocker it is described as**: the checker relaxation was
+correct, but `emit_defer_stmt` had no break/continue arm and TRAPPED, so the emitter
+arms had to ship with it — accepting a program the emitter cannot produce is strictly
+worse than the over-rejection. A ZER `switch` in a defer body still traps; that one
+waits for **L**.
 
 **Read this section ALONE and you can start. Every line below was MEASURED against
 main at `9a0e731b` in CHECKER-ONLY mode (`-o out.c`), not read from the branch.**
@@ -254,8 +261,20 @@ over-rejection. A ZER `switch` in a defer body still traps; pre-existing, refact
 defer/@critical/@once" alone. A break of a loop that ENCLOSES the block stays
 rejected.
 
-**O.** The same-statement deadlock rule merged a callee's TRANSITIVE shared types
-into every calling statement, so `u32 r = f();` was rejected when `f` touches two
+**O. ~~The same-statement deadlock rule merged a callee's TRANSITIVE shared types
+into every calling statement~~ — CLOSED 2026-09-06 as BUG-948 (+ BUG-949),
+DO NOT REDO.** *(Both halves of the model verified in the EMITTED C, not argued:
+`u32 r = a.x + helper();` emits lock / read / CALL / unlock, so with a direct access
+the callee's locks genuinely nest; `u32 r = helper();` emits no lock in the caller at
+all. The positive test is empirical — two threads, opposite orders, 200 iterations.
+**The first draft was a HOLE**: gating with `continue` also skipped the RECURSION into
+nested bodies, so `do { a.x = b.y; } while (k);` compiled; three existing negatives
+caught it. Gate the CHECK, never the walk. **And it shook loose BUG-949**, a
+use-after-free: `find_func_shared_cache` returned a pointer INTO a realloc-grown array
+while `scan_body_shared_types` held it across a recursive call that can add an entry —
+ASan-confirmed on the intermediate build, boundary exactly at the initial capacity
+16 -> 17. Fixed by making entries individually allocated so they never move.)* Original:
+so `u32 r = f();` was rejected when `f` touches two
 shared structs sequentially. A statement with no DIRECT shared access takes no
 lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 

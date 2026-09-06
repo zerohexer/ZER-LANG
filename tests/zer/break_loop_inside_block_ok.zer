@@ -1,0 +1,70 @@
+// BUG-947 (survey item N): a `break` / `continue` inside a defer body, `@critical`
+// or `@once` was banned by asking ONLY "are we inside one of those?".
+//
+// But every one of those bans states its reason as the jump LEAVING the block —
+// skipping the defer's cleanup, the interrupt re-enable, or @once's completion
+// publish. When the loop being targeted is itself nested INSIDE the block, the jump
+// cannot leave it and the reason does not apply. The exemption's rationale was
+// narrower than its code, the same shape as the asm-operand row in BUG-942.
+//
+// PRE-FIX all five cases below are compile errors ("cannot use 'break' inside
+// defer block", etc.), so the file does not build.
+//
+// The assertions are OBSERVABLE on purpose. A defer body runs at scope exit, so a
+// check written inside main after `return` proves nothing — the first draft of this
+// test was vacuous that way. The defer cases therefore run in a helper and are
+// checked from main AFTER it returns. Both were mutation-checked: breaking at 5
+// instead of 3 exits 1, continuing below 5 instead of 7 exits 2.
+
+u32 hits = 0;
+u32 cont_hits = 0;
+u32 crit_hits = 0;
+u32 once_hits = 0;
+
+void with_defer_break(){
+    defer {
+        for (u32 i = 0; i < 10; i += 1) {
+            if (i == 3) { break; }        // stops the loop INSIDE the defer body
+            hits += 1;
+        }
+    }
+    hits = 0;
+}
+
+void with_defer_continue(){
+    defer {
+        for (u32 i = 0; i < 10; i += 1) {
+            if (i < 7) { continue; }      // skip 0..6, count 7, 8, 9
+            cont_hits += 1;
+        }
+    }
+    cont_hits = 0;
+}
+
+u32 main(){
+    with_defer_break();
+    if (hits != 3) { return 1; }
+
+    with_defer_continue();
+    if (cont_hits != 3) { return 2; }
+
+    @critical {
+        for (u32 i = 0; i < 10; i += 1) {
+            if (i == 3) { break; }
+            crit_hits += 1;
+        }
+    }
+    if (crit_hits != 3) { return 3; }
+
+    @once {
+        u32 n = 0;
+        while (n < 10) {
+            n += 1;
+            if (n == 4) { break; }
+            once_hits += 1;
+        }
+    }
+    if (once_hits != 3) { return 4; }
+
+    return 0;
+}

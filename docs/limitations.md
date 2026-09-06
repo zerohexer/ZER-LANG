@@ -239,8 +239,18 @@ a held lock (133 → clean early return).
 
 ### TWO RELAXATIONS — both measured, both with the reason NARROWER than the code
 
-**N.** `break`/`continue` targeting a loop nested INSIDE a defer body / `@critical`
-/ `@once` leaves only that loop, never the body — the ban keyed on "inside a
+**N. ~~`break`/`continue` targeting a loop nested INSIDE a defer body / `@critical`
+/ `@once`~~ — CLOSED 2026-09-06 as BUG-947, DO NOT REDO.** *(`escaping_block_depth`
+returns the depth the jump would ESCAPE, so the VST-verified predicates in
+`src/safety/context_bans.c` are UNCHANGED — asked a more accurate question, not a
+different one. The test is a COMPARISON against the loop depth recorded at the
+innermost block's entry, which is what makes the interleaved case
+`defer { for(){ @critical { break; } } }` stay rejected. **The relaxation also
+exposed an EMISSION gap that had to be closed in the same commit**: `@critical` and
+`@once` emitted fine but `emit_defer_stmt` had no break/continue arm and trapped —
+accepting a program the emitter cannot produce would be strictly worse than the
+over-rejection. A ZER `switch` in a defer body still traps; pre-existing, refactor
+**L**.)* Original: leaves only that loop, never the body — the ban keyed on "inside a
 defer/@critical/@once" alone. A break of a loop that ENCLOSES the block stays
 rejected.
 

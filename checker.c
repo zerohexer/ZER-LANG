@@ -14047,6 +14047,37 @@ static void check_stmt_cond_body(Checker *c, Node *body) {
     c->branch_depth--;
 }
 
+/* BUG-947 (survey item N): a `break` / `continue` inside a defer body, `@critical`
+ * or `@once` was banned by asking ONLY "are we inside one of those?". But the ban's
+ * stated reason is that the jump would LEAVE the block — skipping the defer's
+ * cleanup, the interrupt re-enable, or @once's completion publish. When the loop
+ * being targeted is itself nested INSIDE the block, the jump cannot leave it, and
+ * the reason does not apply:
+ *
+ *     defer { for (u32 i = 0; i < 3; i += 1) { if (i == 1) { break; } } }
+ *
+ * That is an over-rejection of ordinary code. The exemption's rationale was again
+ * narrower than its code, the same shape as the asm-operand row in BUG-942.
+ *
+ * The test is one comparison: the innermost block recorded the loop depth at its
+ * entry, so the target loop is inside it exactly when we have entered a loop since.
+ * It composes correctly when blocks and loops interleave, because
+ * block_entry_loop_depth always names the INNERMOST block:
+ *
+ *     @critical { for(){ break; } }      1 > 0  -> allowed  (cannot leave)
+ *     for(){ defer { break; } }          1 > 1  -> rejected (leaves the defer)
+ *     defer { for(){ @critical { break; } } }
+ *                                        1 > 1  -> rejected (leaves @critical)
+ *
+ * This returns the depth the jump would ESCAPE, so the VST-verified predicates in
+ * src/safety/context_bans.c keep their exact contract and their proofs — they are
+ * asked a more accurate question, not a different one. */
+static int escaping_block_depth(Checker *c, int depth) {
+    if (depth <= 0) return 0;
+    if (c->loop_depth > c->block_entry_loop_depth) return 0;  /* target loop is inside */
+    return depth;
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -15450,6 +15481,7 @@ static void check_stmt(Checker *c, Node *node) {
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        c->loop_depth++;                  /* BUG-947 */
         /* B1 (2026-08-01): snapshot the post-pre-pass VALUES and restore them
          * after the body. `var_range_count = saved_range_count` below only drops
          * entries PUSHED by the body — it cannot undo an IN-PLACE mutation of an
@@ -15466,6 +15498,7 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1_pre, b1_saved);
         free(b1_pre);
         c->in_loop = prev_in_loop;
+        c->loop_depth--;                  /* BUG-947 */
         c->var_range_count = saved_range_count; /* ranges invalid after loop */
         pop_scope(c);
         break;
@@ -15527,6 +15560,7 @@ static void check_stmt(Checker *c, Node *node) {
 
         bool prev_in_loop = c->in_loop;
         c->in_loop = true;
+        c->loop_depth++;                  /* BUG-947 */
         /* B1 (2026-08-01): same in-place-mutation leak as the for-loop — see the
          * comment there. `var_range_count = saved_range_count` drops only entries
          * PUSHED by the body; a narrowing that mutated a pre-existing entry
@@ -15539,6 +15573,7 @@ static void check_stmt(Checker *c, Node *node) {
         vrp_snap_restore(c, b1w_pre, b1w_saved);
         free(b1w_pre);
         c->in_loop = prev_in_loop;
+        c->loop_depth--;                  /* BUG-947 */
         c->var_range_count = saved_range_count;
         break;
     }
@@ -16632,18 +16667,23 @@ static void check_stmt(Checker *c, Node *node) {
         break;
     }
 
-    case NODE_BREAK:
-        if (c->in_once) {
+    case NODE_BREAK: {
+        /* BUG-947: all three bans ask about the depth the jump would ESCAPE, not
+         * the depth we happen to be at — a loop nested inside the block keeps the
+         * jump inside it. See escaping_block_depth. */
+        int esc_defer = escaping_block_depth(c, c->defer_depth);
+        int esc_crit  = escaping_block_depth(c, c->critical_depth);
+        if (c->in_once && escaping_block_depth(c, 1) > 0) {
             checker_error(c, node->loc.line,
                 "cannot use 'break' inside @once block — it would skip the one-time "
                 "completion publish and hang threads waiting on @once");
         }
         /* SAFETY: zer_break_allowed_in_context in src/safety/context_bans.c */
-        if (zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
+        if (zer_break_allowed_in_context(esc_defer, esc_crit,
                                            c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+            if (esc_defer > 0) {
                 checker_error(c, node->loc.line, "cannot use 'break' inside defer block");
-            } else if (c->critical_depth > 0) {
+            } else if (esc_crit > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'break' inside @critical block — interrupts would not be re-enabled");
             } else {
@@ -16651,6 +16691,7 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         break;
+    }
 
     case NODE_GOTO:
         if (c->in_once) {
@@ -16689,18 +16730,21 @@ static void check_stmt(Checker *c, Node *node) {
         }
         break;
 
-    case NODE_CONTINUE:
-        if (c->in_once) {
+    case NODE_CONTINUE: {
+        /* BUG-947: same as NODE_BREAK — ask about the depth the jump would ESCAPE. */
+        int esc_defer = escaping_block_depth(c, c->defer_depth);
+        int esc_crit  = escaping_block_depth(c, c->critical_depth);
+        if (c->in_once && escaping_block_depth(c, 1) > 0) {
             checker_error(c, node->loc.line,
                 "cannot use 'continue' inside @once block — it would skip the one-time "
                 "completion publish and hang threads waiting on @once");
         }
         /* SAFETY: zer_continue_allowed_in_context in src/safety/context_bans.c */
-        if (zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
+        if (zer_continue_allowed_in_context(esc_defer, esc_crit,
                                               c->in_loop ? 1 : 0) == 0) {
-            if (c->defer_depth > 0) {
+            if (esc_defer > 0) {
                 checker_error(c, node->loc.line, "cannot use 'continue' inside defer block");
-            } else if (c->critical_depth > 0) {
+            } else if (esc_crit > 0) {
                 checker_error(c, node->loc.line,
                     "cannot use 'continue' inside @critical block — interrupts would not be re-enabled");
             } else {
@@ -16708,6 +16752,7 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
         break;
+    }
 
     case NODE_DEFER:
         /* Ban yield/await in defer body — corrupts Duff's device state machine.
@@ -16725,6 +16770,10 @@ static void check_stmt(Checker *c, Node *node) {
             false, NULL,
             false, NULL);
         c->defer_depth++;
+        /* BUG-947: remember the loop nesting at this body's entry, so a break or
+         * continue can tell whether the loop it targets is INSIDE the body. */
+        int prev_belp_d = c->block_entry_loop_depth;
+        c->block_entry_loop_depth = c->loop_depth;
         {
             /* VRP (B4, 2026-08-01): a defer body runs at SCOPE EXIT, i.e. AFTER
              * every statement between the `defer` and the exit. So a range
@@ -16767,6 +16816,7 @@ static void check_stmt(Checker *c, Node *node) {
             free(vrp_pre);
         }
         c->defer_depth--;
+        c->block_entry_loop_depth = prev_belp_d;
         break;
 
     case NODE_STATIC_ASSERT: {
@@ -17797,10 +17847,15 @@ static void check_stmt(Checker *c, Node *node) {
                   "malloc/calloc/free may deadlock when interrupts are disabled. "
                   "Use Pool(T, N) instead, or move the call outside @critical");
         c->critical_depth++;
+        /* BUG-947: remember the loop nesting at this body's entry, so a break or
+         * continue can tell whether the loop it targets is INSIDE the body. */
+        int prev_belp_c = c->block_entry_loop_depth;
+        c->block_entry_loop_depth = c->loop_depth;
         if (node->critical.body) {
             check_stmt(c, node->critical.body);
         }
         c->critical_depth--;
+        c->block_entry_loop_depth = prev_belp_c;
         break;
 
     case NODE_ONCE:
@@ -17813,6 +17868,11 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->once.body) {
             bool saved_in_once = c->in_once;
             c->in_once = true;
+        /* BUG-947: remember the loop nesting at this body's entry, so a break or
+         * continue can tell whether the loop it targets is INSIDE the body. */
+        int prev_belp_o = c->block_entry_loop_depth;
+        c->block_entry_loop_depth = c->loop_depth;
+
             /* VRP (B5, 2026-08-01): a @once body runs AT MOST ONCE — skipped on
              * every later call and on loser threads. So a range narrowed inside
              * is valid only on the RUN path; the SKIP path keeps the pre-body
@@ -17834,6 +17894,7 @@ static void check_stmt(Checker *c, Node *node) {
             vrp_snap_join(c, vrp_pre, vrp_saved);
             free(vrp_pre);
             c->in_once = saved_in_once;
+            c->block_entry_loop_depth = prev_belp_o;
         }
         break;
 

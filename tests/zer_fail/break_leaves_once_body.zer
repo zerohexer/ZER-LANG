@@ -1,0 +1,9 @@
+// expect-error: cannot use 'break' inside @once block
+// BUG-947 boundary: the loop encloses @once, so the break leaves it and would skip
+// the one-time completion publish.
+u32 main(){
+    for (u32 i = 0; i < 3; i += 1) {
+        @once { break; }
+    }
+    return 0;
+}

@@ -10817,6 +10817,22 @@ static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func) {
         if (sroot) emit_shared_unlock(e, sroot);
         return;
     }
+    case NODE_BREAK:
+    case NODE_CONTINUE:
+        /* BUG-947: reachable only since the checker stopped banning a break or
+         * continue whose TARGET LOOP is nested inside the defer body. The checker's
+         * condition is exactly this emitter's precondition: it permits the jump only
+         * when a loop was entered after the body began, so a `break;` emitted here
+         * always has an enclosing loop emitted by THIS function, in THIS body.
+         *
+         * Safe against C's binding rule for the same reason: emit_defer_stmt emits
+         * only `for` and `while` — it has no switch arm at all — so the nearest
+         * enclosing C construct is that loop and nothing else. (A ZER `switch` in a
+         * defer body still hits the loud default below; that is the pre-existing
+         * gap refactor L removes, not a regression from this change.) */
+        emit_indent(e);
+        emit(e, s->kind == NODE_BREAK ? "break;\n" : "continue;\n");
+        return;
     default:
         /* AUDIT-LOUD: silently miscompiling statement kinds in defer
          * is the original bug class this helper closed. Fail loudly. */

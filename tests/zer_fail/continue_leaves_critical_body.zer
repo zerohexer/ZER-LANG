@@ -1,0 +1,8 @@
+// expect-error: cannot use 'continue' inside @critical block
+// BUG-947 boundary: the continue half of the same rule.
+u32 main(){
+    for (u32 i = 0; i < 3; i += 1) {
+        @critical { continue; }
+    }
+    return 0;
+}

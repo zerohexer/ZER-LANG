@@ -1,0 +1,9 @@
+// expect-error: cannot use 'break' inside @critical block
+// BUG-947 boundary: the loop encloses @critical, so the break leaves it and
+// interrupts would not be re-enabled.
+u32 main(){
+    for (u32 i = 0; i < 3; i += 1) {
+        @critical { break; }
+    }
+    return 0;
+}

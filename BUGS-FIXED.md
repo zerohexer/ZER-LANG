@@ -554,6 +554,80 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-947: a break whose loop is INSIDE the block it is in
+
+Survey item N, a measured relaxation. `break` / `continue` inside a defer body,
+`@critical` or `@once` was banned by asking only *"are we inside one of those?"*.
+
+But each ban states its reason as the jump LEAVING the block — skipping the defer's
+cleanup, the interrupt re-enable, or `@once`'s completion publish. When the target
+loop is itself nested INSIDE the block, the jump cannot leave it and the reason does
+not apply:
+
+```zer
+defer { for (u32 i = 0; i < 3; i += 1) { if (i == 1) { break; } } }   // was refused
+```
+
+The exemption's rationale was narrower than its code — the same shape as BUG-942's
+asm-operand baseline row, now three for three this session.
+
+### The test is a COMPARISON, not a flag
+
+Each block records the loop depth at its entry, and the jump is contained exactly
+when a loop has been entered since. It composes when blocks and loops interleave
+because `block_entry_loop_depth` always names the INNERMOST block:
+
+| shape | test | verdict |
+|---|---|---|
+| `@critical { for(){ break; } }` | 1 > 0 | allowed — cannot leave |
+| `for(){ defer { break; } }` | 1 > 1 | rejected — leaves the defer |
+| `defer { for(){ @critical { break; } } }` | 1 > 1 | rejected — leaves `@critical` |
+
+The third is why a boolean "are we in a loop?" is not enough, and it has its own
+negative test.
+
+### The verified predicates were not touched
+
+`escaping_block_depth` returns the depth the jump would ESCAPE, and that is what is
+passed to `zer_break_allowed_in_context` / `zer_continue_allowed_in_context`. Those
+live in `src/safety/context_bans.c`, are VST-verified at Level 3, and are unchanged —
+they are asked a more accurate question, not a different one. Their contract ("may a
+jump escape these contexts?") is exactly what the new argument expresses.
+
+### The relaxation exposed an EMISSION gap, which had to be closed too
+
+Accepting the program is worthless if the emitter cannot produce it — that would turn
+a clean compile error into a runtime trap, strictly worse than the over-rejection.
+Measured after the checker change: `@critical` and `@once` emitted correctly, and
+**defer trapped** — `emit_defer_stmt`, the raw-AST second statement emitter, has no
+`break`/`continue` arm and hit its loud `default:`. That is the gap refactor **L**
+exists to remove.
+
+Two arms added. They are safe against C's binding rule for a precise reason:
+`emit_defer_stmt` emits only `for` and `while` and has no switch arm at all, so the
+nearest enclosing C construct is a loop from that same defer body — and the checker's
+new condition is exactly this emitter's precondition, since it permits the jump only
+when a loop was entered after the body began. (A ZER `switch` in a defer body still
+hits the loud default; pre-existing, also L.)
+
+### Two of my own mistakes, both caught by measuring
+
+**A mixed-ABI binary.** Adding two `int` fields to `struct Checker` without cleaning
+first produced a compiler that rejected a TRIVIAL program with `--stack-limit 1` —
+the documented Makefile-has-no-header-dependencies trap in CLAUDE.md. My probe
+printed only "REJECT" and hid the reason, so the first read was "the fix did not
+fire". A one-line trace showed the predicate computing `1 > 0` correctly all along.
+Read the reason, never the verdict.
+
+**A vacuous test.** The first defer positive asserted `hits != 3` INSIDE the defer
+body — which runs after `return` has already produced the exit code, so it could
+never fail. The defer cases now run in a helper and are checked from `main` after it
+returns, and both were mutation-checked: breaking at 5 instead of 3 exits 1,
+continuing below 5 instead of 7 exits 2.
+
+One positive, five negatives (each with `expect-error`, each verified to reject for
+the RIGHT reason). `make check` exit 0, nine gates, 1481.
+
 ## Session 2026-09-06 — BUG-945 / BUG-946: `(u3)x` did not parse, then did not wrap
 
 Survey item I, the last of the twelve. Two halves, and the second only became

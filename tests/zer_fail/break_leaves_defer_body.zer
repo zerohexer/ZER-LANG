@@ -1,0 +1,10 @@
+// expect-error: cannot use 'break' inside defer block
+// BUG-947 boundary: the relaxation must NOT reach a break whose target loop
+// ENCLOSES the block. Here the loop is outside the defer, so the break leaves the
+// defer body and would skip its cleanup — exactly the case the ban exists for.
+u32 main(){
+    for (u32 i = 0; i < 3; i += 1) {
+        defer { break; }
+    }
+    return 0;
+}

@@ -48,6 +48,12 @@ typedef struct {
     bool cur_ret_summary_complete; /* false once any return is not classifiable (STATIC/PARAM(n)) */
     uint64_t cur_ret_param_mask;   /* bit n: a return may be a view of parameter n */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
+    int  loop_depth;        /* BUG-947: loop NESTING count, not just "in one". */
+    int  block_entry_loop_depth; /* BUG-947: loop_depth at the moment the INNERMOST
+                             * defer / @critical / @once body was entered. A break or
+                             * continue targets a loop nested INSIDE that body iff
+                             * loop_depth > this — in which case it cannot leave the
+                             * body, and the ban's stated reason does not apply. */
     int defer_depth;        /* > 0 when inside a defer block */
     int critical_depth;     /* > 0 when inside @critical block — ban return/break/continue/goto */
     /* 2026-08-03: > 0 when inside a RUNTIME-conditional body (if/else arm, loop

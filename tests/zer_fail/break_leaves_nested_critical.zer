@@ -1,0 +1,14 @@
+// expect-error: cannot use 'break' inside defer block
+// BUG-947 boundary, the case that makes the test a COMPARISON rather than a flag:
+// blocks and loops interleave. The loop is inside the defer body, but @critical is
+// inside the LOOP — so the break leaves @critical even though it does not leave the
+// defer's loop. block_entry_loop_depth names the INNERMOST block, so 1 > 1 is false
+// and it stays rejected.
+u32 main(){
+    defer {
+        for (u32 i = 0; i < 3; i += 1) {
+            @critical { break; }
+        }
+    }
+    return 0;
+}

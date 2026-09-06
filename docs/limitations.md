@@ -655,7 +655,8 @@ Sinks: `_vardecl`, `_assign`, `_callarg`, `_return`, `_structinit`, `_arrayelem`
     enum Color { red, green, blue }
     u32 main() { Color c = Color.blue; Color d = c + c; return (u32)d; }
 
-**LIVE — `@ptrcast` is a door** (`fhf8rn/enum_mint_ptrcast`, exits 99).
+~~**LIVE — `@ptrcast` is a door** (`fhf8rn/enum_mint_ptrcast`, exits 99).~~ CLOSED
+(BUG-928; bool sibling BUG-1001).
 **LIVE — `@pun` to enum / pointer / slice, `@inttoptr` to an enum target**
 (`ef9cao`: `pun_forge_enum`, `pun_forge_pointer`, `pun_forge_slice`,
 `inttoptr_enum_target`, `inttoptr_enum_in_struct`).
@@ -1109,13 +1110,21 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 - ~~**i64 literal range** (`lzmkhn`): `i64_literal_above_max`, `_below_min`,
   `_over_range_sinks`.~~ — **CLOSED 2026-09-06 as BUG-991** (all three reject; the
   boundary positive runs).
-- **compound float <-> int** (`fhf8rn`): `compound_float_into_int`,
-  `compound_int_into_float`.
+- ~~**compound float <-> int** (`fhf8rn`): `compound_float_into_int`,
+  `compound_int_into_float`.~~ — **CLOSED 2026-09-06 as BUG-1002** (both reject;
+  `compound_assign_same_domain_ok` runs).
 - **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,
   `_tilde`. NB: distinct from the ALLOWED unsigned ops `~0` / `0 - 1`; see the
   corpus-cost rule in CLAUDE.md before widening.
 - **misc** (`yzhu1s`): `bitcast_bare_array_source`, `stack_limit_root_entry`.
-- **bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).
+- ~~**bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).~~ — **CLOSED
+  2026-09-06 as BUG-1001** (`@ptrcast` and `@inttoptr` bool pointee; `@pun` was already
+  BUG-969). NOT taken from `fhf8rn`: `enum_mint_pun` from a `*W` struct source — main
+  TRAPS it at runtime (the type_id check CAN fire there; exit 133), which is the tracked
+  answer; `constrained_mint_boundary_ok` — main REJECTS `@inttoptr(*Regs)` when Regs
+  CARRIES an enum (BUG-970 is deliberately carrier-wide: register bits are not variants);
+  `enum_literal_variant_ok` — main rejects EVERY literal into an enum (BUG-927), theirs
+  accepts an in-range one. Both stricter, both sound, both documented.
 
 ---
 

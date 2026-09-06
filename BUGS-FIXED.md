@@ -1605,6 +1605,30 @@ struct-field and orelse-fallback sinks.
 Tests: `tests/zer/global_value_optional_payload_init.zer` (int / bool / negative / null /
 const-ident payloads), `tests/zer/optional_float_literal_init.zer`.
 
+### BUG-1001 — `@ptrcast(*bool, u8ptr)` and `@inttoptr(*bool, addr)` minted a pointer to a bool that is neither true nor false
+The two pointer-MINTING doors were closed for an ENUM pointee (BUG-928, BUG-970) and
+open for the other constrained type. `bool` is a `uint8_t` in the emitted C whose legal
+values are 0/1; a load through a minted `*bool` yielded 2, and `b == true` / `b == false`
+were BOTH false (measured exit 3). The `@ptrcast` door now fires when either pointee is an
+enum or a bool and the pointees differ (an enum-to-different-enum cast is covered by the
+same test); the `@inttoptr` door uses `type_carries_bool_c`, the bool twin of
+`type_carries_enum_c` (same wrapper recursion). `@pun` was already closed for bool by
+BUG-969's `type_carries_forgeable`. `tests/zer_trap/bool_switch_foreign_value.zer` — the
+BUG-983 use-site trap, which read a bool through `@inttoptr(*bool)` — is now
+`tests/zer_fail/bool_mint_inttoptr.zer`: the door is closed at the mint, as for an enum,
+because the switch was the ONE consumer with a guard. From `vigilant-tesla-fhf8rn` (their
+BUG-918, bool half). Tests: `tests/zer_fail/bool_mint_ptrcast.zer`, `bool_mint_inttoptr.zer`.
+
+### BUG-1002 — `a += f` (int += float) bypassed the float->int saturation
+`a = f` is refused; `a += f` was accepted and emitted a raw C `a += f`, a conversion that
+is undefined out of range — measured with `f = 1e20`: 0 at -O0 and 255 at -O2, and UBSan
+reports it. The other direction (`f += n`) took the same plain/compound split. The compound
+arm of NODE_ASSIGN now rejects a float/integer domain mix with a message naming the explicit
+form (`a += (u32)f` saturates). Corpus cost: zero (two files mix floats and compound ops;
+neither mixes domains). From `vigilant-tesla-fhf8rn` (their BUG-915). Tests:
+`tests/zer_fail/compound_float_into_int.zer`, `compound_int_into_float.zer`; positive
+`tests/zer/compound_assign_same_domain_ok.zer`.
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

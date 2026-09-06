@@ -2362,6 +2362,12 @@ u32 folds() {
 }
 ```
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
+- The pointee may not be (or carry) an **enum or a bool** — `@inttoptr(*State,
+  addr)` and `@inttoptr(*bool, addr)` are compile errors. The bits at a hardware
+  address are not guaranteed to be a declared variant (or 0/1), and an exhaustive
+  `switch` relies on that. Read the register as an integer and convert with
+  `@bitcast`, which is variant-checked at runtime:
+  `volatile *u32 r = @inttoptr(*u32, addr); State s = @bitcast(State, *r);`
 
 **SEE ALSO**
 @ptrtoint, mmio
@@ -2400,6 +2406,10 @@ remembers what type went in through `*opaque` round-trips.
 - `@ptrcast` between two DIFFERENT struct/union pointee types is a compile
   error — "type confusion — use @pun(...)". Identity casts,
   primitive byte-views (`*u32 → *u8`), and `*opaque` round-trips stay allowed.
+- `@ptrcast` to or from an **enum or bool** pointee that differs from the source
+  pointee is a compile error — it would mint a pointer whose load is not a
+  declared variant (or neither `true` nor `false`). Read the carrier and use
+  `@bitcast`, which is variant-checked.
 
 **SEE ALSO**
 *opaque, @pun, @container
@@ -4667,6 +4677,12 @@ is still a hard error when the index is provably out of range.
 
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
+
+A compound assignment follows the same domain rule as the plain one: `a += f`
+with an integer `a` and a float `f` (or `f += n`) is a compile error, exactly as
+`a = f` is. Convert explicitly — `a += (u32)f` saturates the float into the
+integer, `f += (f32)n` converts the integer. (Before 2026-09-06 the compound
+spelling slipped through as a raw C conversion, undefined out of range.)
 
 ### Bit Extraction
 ```zer

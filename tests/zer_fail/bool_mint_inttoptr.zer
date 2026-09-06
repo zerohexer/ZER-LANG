@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: cannot produce a pointer to
+// BUG-1001 (2026-09-06): the bool sibling of BUG-970 — `@inttoptr(*bool, addr)`
+// mints a pointer whose load is a byte that is neither 0 nor 1. This file was
+// tests/zer_trap/bool_switch_foreign_value.zer (BUG-983's use-site half: the
+// switch totality trap caught the foreign value at the ONE consumer that has a
+// guard). `if (b == true)` / `b == false` have no guard and were both false —
+// so the door is closed at the mint, as it is for an enum pointee.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+
+i32 main() {
+    u8 backing = 2;
+    usize addr = @ptrtoint(&backing);
+    volatile *bool reg = @inttoptr(*bool, addr);
+    bool b = *reg;
+    switch (b) {
+        true  => { return 1; }
+        false => { return 2; }
+    }
+    return 0;
+}

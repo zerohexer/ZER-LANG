@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: compound assignment mixes
+// BUG-1002 (2026-09-06): the other direction, for the same reason `f = a` is refused.
+u32 main() { f32 f = 1.0; u32 a = 2; f += a; return (u32)f; }

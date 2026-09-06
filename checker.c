@@ -3137,6 +3137,34 @@ static bool type_carries_enum_c(Type *t, int depth) {
     return false;
 }
 
+/* BUG-1001 (2026-09-06): the bool sibling of type_carries_enum_c, for the
+ * pointer-MINTING doors. `bool` is a uint8_t in the emitted C whose legal values
+ * are 0/1; a load through a minted `*bool` yields a value that is neither
+ * `true` nor `false` (measured: `b == true` and `b == false` BOTH false). Same
+ * wrappers as every other carrier predicate. */
+static bool type_carries_bool_c(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_BOOL) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_bool_c(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_bool_c(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_bool_c(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_bool_c(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
 /* Can the @pun runtime type_id trap the emitter writes actually FIRE?
  *
  * It emits `pn.type_id = SRC_TID; if (pn.type_id != TGT_TID && pn.type_id != 0) trap`
@@ -9055,6 +9083,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
             }
+            /* BUG-1002 (2026-09-06): `a += f` did what `a = f` is refused, and so
+             * bypassed the float->int SATURATION that BUG-845/883 define — the
+             * emitted `a += f` is a raw C conversion, UB out of range (measured
+             * with f = 1e20: 0 at -O0, 255 at -O2). The other direction
+             * (`f += n`) is the same plain/compound split. Convert explicitly:
+             * `a += (u32)f` saturates, `f += (f32)n` converts. */
+            else if (type_is_float(target) != type_is_float(value)) {
+                checker_error(c, node->loc.line,
+                    "compound assignment mixes '%s' and '%s' (float and integer) — "
+                    "convert explicitly: '(T)x' saturates a float into an integer",
+                    type_name(target), type_name(value));
+            }
             /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
             if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
                 node->assign.op == TOK_CARETEQ || node->assign.op == TOK_LSHIFTEQ ||
@@ -12312,14 +12352,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                  * provenance cannot be proven wrong); this fires only
                                  * when both pointees are concrete and exactly one is an
                                  * enum. Corpus cost: no @ptrcast to an enum pointee. */
-                                if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
-                                    (g1_sk == TYPE_ENUM) != (g1_tk == TYPE_ENUM)) {
-                                    checker_error(c, node->loc.line,
-                                        "@ptrcast between '%s' and '%s' reinterprets an "
-                                        "integer as an enum — the dereference would yield "
-                                        "a value that is not a declared variant. Read the "
-                                        "carrier and use @bitcast, which is variant-checked",
-                                        type_name(val_type), type_name(result));
+                                /* BUG-1001: `bool` is the other CONSTRAINED type (its
+                                 * legal values are 0/1 in a u8 carrier), so
+                                 * `@ptrcast(*bool, u8ptr)` minted a *bool whose load is
+                                 * neither true nor false — measured: `b == true` and
+                                 * `b == false` both false, exit 3. Fires when either
+                                 * pointee is constrained and the pointees differ. */
+                                {
+                                    bool g1_s_con = (g1_sk == TYPE_ENUM || g1_sk == TYPE_BOOL);
+                                    bool g1_t_con = (g1_tk == TYPE_ENUM || g1_tk == TYPE_BOOL);
+                                    if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
+                                        (g1_s_con || g1_t_con) &&
+                                        !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                                     type_unwrap_distinct(g1_tgt->pointer.inner))) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between '%s' and '%s' reinterprets an "
+                                            "integer as an enum or bool — the dereference would "
+                                            "yield a value that is not a declared variant. Read "
+                                            "the carrier and use @bitcast, which is variant-checked",
+                                            type_name(val_type), type_name(result));
+                                    }
                                 }
                                 if (g1_s_agg && g1_t_agg) {
                                     Type *g1_si = type_unwrap_distinct(eff->pointer.inner);
@@ -12727,10 +12779,14 @@ static Type *check_expr(Checker *c, Node *node) {
                      * docs/limitations.md. */
                     if (type_dispatch_kind(res_eff) == TYPE_POINTER &&
                         res_eff->pointer.inner &&
-                        type_carries_enum_c(res_eff->pointer.inner, 0)) {
+                        (type_carries_enum_c(res_eff->pointer.inner, 0) ||
+                         type_carries_bool_c(res_eff->pointer.inner, 0))) {
+                        /* BUG-1001: `bool` is the other constrained pointee — the
+                         * same door, the same measured consequence (a byte that is
+                         * neither 0 nor 1 matched no switch arm / no comparison). */
                         checker_error(c, node->loc.line,
                             "@inttoptr cannot produce a pointer to '%s' — it carries "
-                            "an enum, and the bits at a hardware address are not "
+                            "an enum or bool, and the bits at a hardware address are not "
                             "guaranteed to be a declared variant, which an exhaustive "
                             "switch relies on. Read the register as an integer and "
                             "convert: 'volatile *u32 r = @inttoptr(*u32, addr); "

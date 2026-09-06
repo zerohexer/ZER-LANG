@@ -272,8 +272,13 @@ condition taking NO mutex, and `switch`/`do-while`/`@critical` inside a defer bo
 trapping at runtime on VALID code. Deletes ~733 lines from `zercheck_ir.c` plus the
 emitter's whole defer stack. **Large; adopt deliberately, not casually.**
 
-**M. Lower bounds/UAF AUTO-GUARDS into the IR as branches; new `IR_TRAP`
-terminator.** The emitter synthesised the guard in C before an op-kind-GATED subset
+**M. ~~Lower bounds/UAF AUTO-GUARDS into the IR as branches; new `IR_TRAP`
+terminator.~~ — CLOSED 2026-09-06 as BUG-994, DO NOT REDO.** *(Cherry-picked whole;
+`lower_auto_guards` at `emit_inst`/`emit_3ac`, `IR_TRAP` terminator, six tests.
+The emitter's two op-kind gates are gone; `emit_auto_guards` survives ONLY for the
+raw-AST defer-body path, which L deletes — so item C's three siblings (defer-body
+var-decl init / for-init / while-cond, measured exit 0 again after M) close with L,
+not M.)* Original: The emitter synthesised the guard in C before an op-kind-GATED subset
 of instructions, so every op kind missing from that gate was a silent OOB and the
 guard was invisible to `zercheck_ir`. Moves it to the single choke point every
 instruction passes through. Also fixes an ordering bug: the lock of an indexed
@@ -304,6 +309,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
       residual folds into K (BUG-921) — same predicate, do them together
 7. J/I/K/H/G  the smaller ones
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
+        M CLOSED (BUG-994); L next (it depends on M's lower_auto_guards / IR_TRAP)
 ```
 
 ---

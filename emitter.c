@@ -349,7 +349,9 @@ static void emit_return_null(Emitter *e) {
         /* BUG-951: was a bare `return 0;` for EVERY non-optional type, which is
          * not a C value of a struct or slice return type (`P pick(?u32 o) {
          * u32 v = o orelse return; ... }` failed in GCC). One zero-value
-         * emitter for both this path and the auto-guard early return. */
+         * emitter for both this path and the auto-guard early return — which
+         * since BUG-994 is an IR bare IR_RETURN and reaches here for every
+         * return type. */
         emit(e, "return ");
         emit_zero_value(e, ret);
         emit(e, "; ");
@@ -11973,6 +11975,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
     }
 
+    case IR_TRAP: {
+        /* BUG-994: unconditional trap terminator (guard that cannot return). */
+        emit_indent(e);
+        emit(e, "_zer_trap(\"%s\", __FILE__, __LINE__);\n",
+             inst->trap_msg ? inst->trap_msg : "compiler bug: IR_TRAP without message");
+        break;
+    }
+
     case IR_YIELD: {
         if (func->is_async) {
             emit_indent(e);
@@ -13616,23 +13626,16 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * unmapped; baremetal: silent corruption (entire address space
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
+            /* BUG-994 (2026-09-05): auto-guards are LOWERED INTO THE IR
+             * (ir_lower.c lower_auto_guards, hooked at every instruction
+             * append), so this emitter no longer inserts them. The op-kind
+             * gate that used to live here was the multi-site trap: every
+             * kind missing from it (IR_INDEX_READ, IR_AWAIT, IR_NOP each in
+             * their turn) was a silent OOB. */
             IRInst *ins = &bb->insts[ii];
             /* BUG-992: anchor the line counter BEFORE the guards, so an
              * auto-guard trap reports the access's line, not the previous one. */
             emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
-                 * AST array indexing re-emitted per-poll) and IR_NOP (carries
-                 * NODE_SPAWN args copied in parent thread). Both were
-                 * silently miscompiling unproven arr[i] — emit_auto_guards
-                 * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
             emit_ir_inst(e, ins, func);
         }
 
@@ -13816,19 +13819,9 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
              * emit_ir_inst (no emit_auto_guards). The guard now fires the
              * same way as the regular path; emit_auto_guard_return_body
              * emits `self->_zer_state = -1; return 1;` for async returns. */
+            /* BUG-994: guards are IR instructions now (see the regular path). */
             IRInst *ins = &bb->insts[ii];
             emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): paired with the regular-path gate
-                 * widening — IR_AWAIT carries the await condition's array
-                 * indexing re-emitted per-poll; IR_NOP carries spawn args. */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
             emit_ir_inst(e, ins, func);
         }
     }

@@ -287,6 +287,7 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
                 add_pred(&func->blocks[bi + 1], arena, bi);
             break;
         case IR_RETURN:
+        case IR_TRAP:
             /* No successor */
             break;
         default:
@@ -301,7 +302,8 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
 bool ir_block_is_terminated(IRBlock *block) {
     if (block->inst_count == 0) return false;
     IROpKind op = block->insts[block->inst_count - 1].op;
-    return op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN || op == IR_YIELD;
+    return op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN || op == IR_YIELD ||
+           op == IR_TRAP;
 }
 
 /* ================================================================
@@ -376,6 +378,7 @@ static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
         dfs_reachable(func, last->goto_block, reachable);
         break;
     case IR_RETURN:
+    case IR_TRAP:
         /* no successors */
         break;
     case IR_YIELD:
@@ -694,6 +697,13 @@ bool ir_validate(IRFunc *func) {
             case IR_SLICE_READ: case IR_STRUCT_INIT_DECOMP:
             case IR_NOP:
                 break;
+            case IR_TRAP:
+                if (!inst->trap_msg) {
+                    fprintf(stderr, "IR VALIDATION ERROR: bb%d TRAP has no message in '%.*s'\n",
+                            bi, (int)func->name_len, func->name);
+                    valid = false;
+                }
+                break;
             }
         }
     }
@@ -767,6 +777,7 @@ bool ir_validate(IRFunc *func) {
                                 reached = cfg_reaches_fire(func, last->goto_block, fire_in_block, visited);
                                 break;
                             case IR_RETURN:
+                            case IR_TRAP:
                                 reached = false;
                                 break;
                             case IR_YIELD:
@@ -839,6 +850,7 @@ bool ir_validate(IRFunc *func) {
 
 const char *ir_op_name(IROpKind op) {
     switch (op) {
+    case IR_TRAP:             return "TRAP";
     case IR_ASSIGN:           return "ASSIGN";
     case IR_CALL:             return "CALL";
     case IR_BRANCH:           return "BRANCH";

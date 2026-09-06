@@ -101,3 +101,7 @@ ir_lower.c:    Node  *inline_buf[16];
 # a depth-first PATH set with push/pop, so its live size is the chain depth,
 # not the number of const globals in the program.
 checker.c:    Symbol *inline_buf[64];
+# BUG-994 (2026-09-05): stack FAST PATH for the per-function set of AST nodes
+# already auto-guarded (guard_mark grows it into the arena by doubling — the
+# Rule #7 shape, not a cap). Same pattern as defer_bodies_inline right above it.
+ir_lower.c:    Node *guarded_inline[32];

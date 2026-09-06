@@ -1335,6 +1335,30 @@ FAULT path), `defer_goto_sibling_fallthrough_fires`, `bool_int_explicit_cast_ok`
 
 ---
 
+## Session 2026-09-06 — BUG-987 (relaxation): `comptime` folds the three width conversions (from `vigilant-tesla-lzmkhn`)
+
+Cherry-pick of `207b701` (their BUG-918). `comptime` is documented as the replacement for a
+C macro, and a macro that narrows is ordinary — but the evaluator handled no cast and no
+intrinsic at all, so `(u8)x`, `@truncate` and `@saturate` each made the WHOLE body report
+"could not be evaluated". Only the three WIDTH conversions fold, and only for a sized
+integer target: each reduces exactly to a function the evaluator already uses to keep the
+interpreter and the emitted code in agreement — a cast and `@truncate` are `ct_wrap`,
+`@saturate` is a clamp. A float/bool/pointer target yields width 0 and falls through to
+today's `CONST_EVAL_FAIL`. `@bitcast` is excluded deliberately: on a float it is a
+reinterpretation an integer evaluator cannot model, and on an enum target it carries a
+runtime variant guard a fold would silently skip (a trap turned into a wrong constant — the
+BUG-844 class). Validated by DIFFERENTIAL, not inspection: the test computes each expression
+at comptime AND at runtime and asserts they agree, and asserts the absolute value too so
+"both wrong the same way" cannot pass; the pre-fix compiler rejected 19 of its blocks.
+
+Also: eighteen reference blocks were baselined only because `is_toplevel()` read a bare
+`if (...) {` at column 0 as a function definition; they carry an explicit fragment
+directive now (baseline 74 -> 70). `tests/test_zer.sh` gains `// expect-trap-at:`.
+
+Test: `tests/zer/comptime_width_conversions.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

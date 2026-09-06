@@ -1271,6 +1271,39 @@ promote it into `tests/zer_fail/`.
 
 (Adopted from `lzmkhn` `c1c149e` with BUG-985/986, 2026-09-06; the tripwire `tests/zer_gaps/factory_orelse_leak_missed.zer` came with it.)
 
+## DECIDED 2026-08-30 (adopted 2026-09-06 with BUG-987) — do not re-open
+
+### `(uN)x`, `(Enum)x`, `(Struct)x`, `(DistinctId)x` do not parse — and must not (bare-ident targets)
+
+The C-style cast trigger is a fixed token set: keyword scalars, `*`, `?`, `const`,
+`volatile`. Every other target is an ordinary IDENTIFIER, so admitting it would make
+`(name)` in expression position ambiguous with a parenthesised variable. **The corpus
+already contains variables named `i1` and `i2`, which match the `iN` spelling exactly**, so
+`(i1) - 1` would parse as a CAST of `-1` rather than a subtraction — trading today's loud
+parse error for a silent wrong value. Every case has an unambiguous named form:
+`@truncate`/`@saturate` for `uN`/`iN`, `@bitcast` for an enum (guarded), `@cast` for a
+distinct typedef, `@pun` for a struct pointer. **NOTE the tension with `ii7a90` item I
+(`(u3)x` parse via a speculative cast like `(*`):** if that is ever taken, it must be
+SPECULATIVE (commit only when the whole `(uN)` token pair is followed by an operand that
+cannot start a binary continuation) and the `i1`/`i2` corpus variables must keep parsing as
+variables — measure both before adopting.
+
+### `@bitcast` is NOT folded in `comptime` — deliberately
+
+The three WIDTH conversions fold because each reduces to `ct_wrap` / a clamp; `@bitcast`
+on a float is a reinterpretation the integer evaluator cannot model, and on an ENUM target
+carries a runtime variant guard a fold would skip. The other intrinsics (`@size`,
+`@popcount`, `@ctz`, …) are simply unimplemented, not refused.
+
+## OPEN 2026-08-30 (LOW) — `comptime` cannot call the bit-query intrinsics
+
+`@popcount` / `@ctz` / `@clz` / `@ffs` / `@parity` / `@bswapN` / `@size` in a `comptime`
+body make the whole fold fail with `comptime function 'F' body could not be evaluated`.
+Loud, never a wrong constant. `@bswapN` and `@popcount` are mechanical; `@ctz`/`@clz` need
+the operand WIDTH threaded through to be correct at zero. Validate any addition with the
+differential harness `tests/zer/comptime_width_conversions.zer` — assert the fold against
+the SAME expression at runtime, never compile-only.
+
 ## OPEN — `pstdqk` audit leads NOT yet verified (hypotheses, not findings; adopted 2026-09-06 with BUG-961..965)
 
 Structural reads of `zercheck_ir.c`, `ir_lower.c` and `emitter.c`. **None has a reproducer.**

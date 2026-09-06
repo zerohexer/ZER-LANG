@@ -811,6 +811,7 @@ enum State { idle, running, blocked, done }
 ```
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 State s = State.idle;      // qualified access
 
@@ -1048,6 +1049,7 @@ Handle(T) h;       h.field;       // Handle — compiler auto-looks-up via slab.
 Mental model is taught by visible types (`*T`, `?*T`, `Handle(T)`), not by the deref operator. Modeled on Rust/Zig — both modern systems languages use `.` everywhere.
 
 **OPTIONAL FUNCTION POINTERS VS OPTIONAL RETURN**
+<!-- audit: fragment -->
 ```zer
 // At declaration sites (var, param, field, global):
 // ? wraps the function pointer → nullable funcptr
@@ -1295,6 +1297,7 @@ Conditional execution. Braces ALWAYS required (no braceless one-liners).
 `else if` is supported.
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 if (condition) {
     // body
@@ -1324,6 +1327,7 @@ C-style for loop. No `++` or `--` — use `+= 1` / `-= 1`.
 Loop variable is scoped to the loop body.
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 for (u32 i = 0; i < 10; i += 1) {
     process(i);
@@ -1344,6 +1348,7 @@ for (u32 i = 0; i < 10; i++) { }   // COMPILE ERROR — no ++
 Loop while condition is true. Braces required.
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 while (running) {
     poll();
@@ -1376,6 +1381,7 @@ do {
 Iterate over slice elements. `in` is a contextual keyword (not reserved).
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 for (u32 item in data_slice) {
     process(item);
@@ -1396,6 +1402,7 @@ Uses `=>` arrows. No `case` keyword. No fallthrough. No `break` needed.
 Enum and bool switches must be exhaustive. Integer switches need `default`.
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 // Enum — exhaustive
 switch (state) {
@@ -1647,6 +1654,7 @@ if (optional) |*val| {
 ```
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 ?u32 result = safe_divide(10, 3);
 
@@ -1922,6 +1930,7 @@ tasks.free(h);                 // gen incremented
 - For direct pointer access without Handle, use `alloc_ptr()` instead.
 
 **EXAMPLE (array of handles)**
+<!-- audit: fragment -->
 ```zer
 Handle(Task)[4] tasks;
 for (u32 i = 0; i < 4; i += 1) {
@@ -2102,6 +2111,7 @@ entire purpose, so throwing the report away makes it identical to `push`. Write
 what you mean. Discarding a `pop()` result is allowed — that is a "drop one".
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 Ring(u8, 256) rx_buf;
 
@@ -2628,6 +2638,7 @@ Safe MMIO read. Returns `?u32` — null if the address faults (unmapped memory).
 Uses signal-based fault handler. Works on any platform.
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 ?u32 val = @probe(0x40020000);
 if (val) |v| {
@@ -2777,6 +2788,7 @@ ARM: cpsid/cpsie/wfi, RISC-V: csrci/csrsi/wfi).
 Faults with SIGSEGV in user mode — kernel code only.
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 u64 saved = @cpu_save_int_state();
 @cpu_disable_int();
@@ -4283,12 +4295,42 @@ u32 x = 5;
 u32 y = BIT(x);            // COMPILE ERROR — x is not compile-time constant
 ```
 
+**WHAT A COMPTIME BODY MAY CONTAIN**
+
+The evaluator is an INTEGER interpreter, and it wraps every operation into the
+declared width of its binding, so a fold and the emitted code always agree
+(`u8 x = 200; u8 y = 100; u8 z = x + y;` folds 44, not 300).
+
+| construct | supported |
+|---|---|
+| integer arithmetic / bitwise / shift / comparison | yes |
+| locals, assignment, compound assignment | yes |
+| `if` / `else`, `for`, `while`, `do-while`, `switch`, nested blocks | yes |
+| fixed arrays (`u8[N] v; v[0] = …; v[0] + v[1]`) | yes |
+| calls to other `comptime` functions, enum variants, `const` identifiers | yes |
+| `(T)x`, `@truncate(T, x)`, `@saturate(T, x)` — integer target | yes |
+| `(T)x` where T is float / bool / pointer | **no** |
+| `@bitcast`, `@size`, `@popcount` and the other intrinsics | **no** |
+| floats, pointers, structs, slices, strings | **no** |
+
+`@bitcast` is excluded deliberately rather than by omission: on a float it is a
+reinterpretation an integer evaluator cannot model, and on an enum target it
+carries a RUNTIME variant guard that a fold would silently skip — which would
+turn a trap into a wrong constant.
+
+Anything unsupported makes the WHOLE body unevaluable, reported as
+`comptime function 'F' body could not be evaluated`. That is a loud error, never
+a silently-wrong constant.
+
 **LIMITS**
 - Recursive comptime call chains have a depth cap of 16. Exceeding it
   produces a clear compile error: `comptime call chain exceeded
   recursion depth (16) — split the computation, hoist constants, or
   reduce recursion depth`. Restructure to use iteration or split into
   multiple smaller comptime functions.
+- Loops are capped at 10,000 iterations and the whole evaluation at a global
+  instruction budget. Hitting either fails the fold rather than returning a
+  truncated value.
 
 ---
 
@@ -4299,6 +4341,7 @@ Conditional compilation. Replaces C `#ifdef`. Condition must be compile-time con
 Only the taken branch is type-checked — dead branch is ignored entirely.
 
 **SYNTAX**
+<!-- audit: fragment -->
 ```zer
 comptime if (DEBUG) {
     // only compiled when DEBUG is true
@@ -4309,6 +4352,7 @@ comptime if (DEBUG) {
 
 **CONDITIONS**
 Accepted: literals (`1`, `0`), `const` variables, comptime function calls, expressions combining these.
+<!-- audit: fragment -->
 ```zer
 comptime if (1) { ... }                    // literal
 comptime if (DEBUG) { ... }                // const bool
@@ -4319,6 +4363,7 @@ comptime if (P) { ... }                    // const from comptime result
 ```
 
 **EXAMPLE**
+<!-- audit: fragment -->
 ```zer
 const bool DEBUG = true;
 
@@ -5129,6 +5174,7 @@ threadlocal u32 counter;    // each thread has its own copy
   waiting threads). Put such logic in a helper function called from `@once`.
 
 ### Barrier — Thread Sync Point
+<!-- audit: fragment -->
 ```zer
 Barrier bar;                // keyword type (like Arena, Pool)
 @barrier_init(bar, 3);     // 3 threads must arrive
@@ -5143,6 +5189,7 @@ Barrier bar;                // keyword type (like Arena, Pool)
   pointer parameter (which no per-file analysis can see) traps at runtime instead.
 
 ### Semaphore — Counting Semaphore
+<!-- audit: fragment -->
 ```zer
 Semaphore(3) dma_channels;    // 3 resources available
 @sem_acquire(dma_channels);   // blocks until count > 0, decrements
@@ -5162,6 +5209,7 @@ void use_resource(*Semaphore s) {
   one through a pointer.
 
 ### Atomics
+<!-- audit: fragment -->
 ```zer
 @atomic_store(&flag, 1);
 u32 val = @atomic_load(&flag);

@@ -135,6 +135,13 @@ typedef enum {
 
     /* --- No-op (for IR structure) --- */
     IR_NOP,              /* placeholder — no code emitted */
+
+    /* BUG-957 (refactor M, stage C): an unconditional abort, and a TERMINATOR.
+     * A bounds guard inside @critical cannot RETURN — that would skip the
+     * interrupt re-enable, the construct ZER hard-errors on when a user writes it —
+     * so its early-exit block ends here instead. Having it in the IR rather than
+     * as a bare _zer_trap() spliced into C means the CFG knows the path ends. */
+    IR_TRAP,
 } IROpKind;
 
 const char *ir_op_name(IROpKind op);  /* op enum -> "CALL"/"ASSIGN"/... (ir_print + --trace) */

@@ -1071,9 +1071,6 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     GuardLowerCtx *g = (GuardLowerCtx *)ud;
     LowerCtx *ctx = g->ctx;
 
-    /* A return here would skip the interrupt re-enable — the construct ZER
-     * hard-errors on when a user writes it. Leave it to the emitter, which traps. */
-    if (ctx->critical_depth > 0) return;
     if (site->freed_idx) return;              /* UAF form not lowered yet */
     if (site->array_size == 0) return;
 
@@ -1092,7 +1089,6 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     /* Only shapes whose zero value is a plain literal. A struct or slice return
      * needs the emitter's emit_zero_value, so decline and let it guard. */
     if (!void_ret && !(type_is_integer(re) || type_dispatch_kind(re) == TYPE_BOOL)) return;
-    if (ctx->func->is_async) return;   /* async return shape not handled yet */
 
     /* NO AST MUTATION. The first version rewrote the access to read the guard's
      * temp, for single evaluation — and that broke the moment the AST was lowered
@@ -1148,6 +1144,19 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     emit_inst(ctx, br);
 
     ctx->current_block = bb_exit;
+
+    /* BUG-957: inside @critical the exit must ABORT, not return. A return would
+     * skip the interrupt re-enable and leave interrupts off forever — exactly the
+     * construct ZER hard-errors on when a user writes `return` inside @critical.
+     * IR_TRAP is a terminator, so the CFG knows the path ends; the emitted text is
+     * the same abort the C-level guard used. */
+    if (ctx->critical_depth > 0) {
+        emit_inst(ctx, make_inst(IR_TRAP, g->line));
+        ctx->current_block = bb_ok;
+        checker_mark_guard_lowered(ctx->checker, site->access);
+        return;
+    }
+
     emit_defer_fire(ctx, g->line);
     if (ctx->current_stmt_shared_root) {
         IRInst unlock = make_inst(IR_UNLOCK, g->line);
@@ -1186,12 +1195,24 @@ static void lower_stmt_guards(LowerCtx *ctx, Node *stmt) {
     case NODE_VAR_DECL:  e = stmt->var_decl.init;  break;
     case NODE_RETURN:    e = stmt->ret.expr;       break;
 
-    /* NOT migrated yet. Conditions and for-clauses are lowered on paths of their
-     * own (a for-init has its own lock site), and the nested BODIES of these get
-     * their own turn through the block loop, so walking them here would
-     * double-guard. Left to the emitter until each is done deliberately. */
-    case NODE_IF: case NODE_WHILE: case NODE_DO_WHILE: case NODE_FOR:
-    case NODE_SWITCH: case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL:
+    /* BUG-957: an IF or SWITCH selector is evaluated EXACTLY ONCE, so hoisting its
+     * guard to just before the statement is equivalent. Only the selector — the
+     * BODIES are statements in their own blocks and get their own turn, so walking
+     * them here would double-guard.
+     *
+     * A LOOP condition is deliberately NOT here. `while (arr[i] > 0)` re-evaluates
+     * per iteration, and a guard hoisted before the loop would be checked once
+     * while `i` changes underneath it — sound only by accident. Migrating those
+     * means emitting into the loop's condition block, which is a separate job. */
+    case NODE_IF:     e = stmt->if_stmt.cond;     break;
+    case NODE_SWITCH: e = stmt->switch_stmt.expr; break;
+
+    /* NOT migrated. Loop conditions and for-clauses are lowered on paths of their
+     * own (a for-init even has its own lock site), and nested bodies get their own
+     * turn through the block loop. Left to the emitter until each is done
+     * deliberately. */
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_FOR:
+    case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL:
     case NODE_ONCE: case NODE_SPAWN: case NODE_AWAIT: case NODE_YIELD:
     case NODE_ASM: case NODE_GOTO: case NODE_LABEL: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_STATIC_ASSERT:

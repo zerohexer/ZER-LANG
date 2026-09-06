@@ -554,6 +554,58 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-957: IR_TRAP, and 96% of guards migrated (refactor M, stage C)
+
+Widening stage B until almost nothing is left on the C path. **108 of 112 guards
+across the 588-file corpus (96%) are now IR branches**, up from 78 (69%).
+
+### Three widenings, each measured rather than assumed
+
+**Async — free.** I had declined it out of caution. Measured: `IR_RETURN` already
+emits the async termination sequence (`self->_zer_state = -1; return 1;`), so removing
+the decline just worked. All 36 async positives pass.
+
+**`@critical` — the `IR_TRAP` terminator.** A guard there cannot RETURN: that would
+skip the interrupt re-enable and leave interrupts off forever, the construct ZER
+hard-errors on when a user writes it. So the exit block ends in a new `IR_TRAP` op
+instead. The emitted text is the same abort the C guard used; what is new is that the
+CFG knows the path ends, and that the shape no longer needs the emitter at all.
+
+Adding the op kind was a BUILD FAILURE in five switches until each was classified —
+`ir_op_takes_auto_guards` (the fail-closed gate from BUG-953, working as designed),
+the emitter's instruction switch, `zercheck_ir`, `ir_validate` and the printer. That is
+the `-Werror=switch` mechanism paying for itself.
+
+**`if` and `switch` selectors — the big one.** Those are evaluated EXACTLY ONCE, so
+hoisting the guard to just before the statement is equivalent. That single change took
+migration from 72% to 96%, because conditions like `if (!entities[i].alive)` are where
+the remaining guards actually lived.
+
+A LOOP condition is deliberately NOT migrated. `while (arr[i] > 0)` re-evaluates per
+iteration, and a guard hoisted before the loop would be checked once while the index
+changed underneath it — sound only by accident. Migrating those means emitting into the
+loop's condition block, which is a separate job.
+
+### The test pins SAFETY, and it took two tries to make it do that
+
+The risk in this migration is not the emission shape, it is losing a guard. So
+`guard_positions_still_fire` drives every migrated position out of bounds and checks
+each one returns its zero value with nothing written.
+
+The first version did not discriminate. Mutating the comparison from `>=` to `>` left
+it passing, because an index of 100 trips both. It now includes the BOUNDARY — index
+exactly 4 on a four-element array, the only case where `>` differs — and an IN-RANGE
+case so that a guard which fired unconditionally would also be caught. Re-mutated:
+off-by-one exits 7, an inverted branch exits 1. Both caught.
+
+### What is left on the C path
+
+Four guards, in three shapes: an `await` condition, a spawn argument, and an
+orelse-in-assign. `emit_auto_guards` therefore still exists and still runs — deleting
+it is what would finish M and unblock L's stage 3.
+
+`make check` exit 0, nine gates, 1486.
+
 ## Session 2026-09-07 — BUG-956: bounds guards are now IR BRANCHES (refactor M, stage B)
 
 The architectural half of M. A bounds guard used to be spliced into the C text by the

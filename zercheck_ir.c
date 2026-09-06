@@ -3227,6 +3227,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (ps->critical_depth > 0) ps->critical_depth--;
         break;
 
+    /* BUG-957: IR_TRAP is an unconditional abort — the bounds guard's early exit
+     * where a return is not legal. Nothing to track: no handle changes state, and
+     * the path ends here, so anything after it is unreachable. */
+    case IR_TRAP:
+        break;
+
     /* Phase E: IR_NOP wrapping NODE_SPAWN or NODE_ASM. Per emitter.c,
      * spawn and asm emit IR_NOP with inst->expr = the AST node
      * (passthrough path). Reroute to per-kind logic. */

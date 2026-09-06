@@ -516,6 +516,9 @@ static bool ir_op_takes_auto_guards(IROpKind op) {
     case IR_INTRINSIC: case IR_INTRINSIC_DECOMP:
     case IR_CALL_DECOMP: case IR_STRUCT_INIT_DECOMP: case IR_ORELSE_DECOMP:
     case IR_NOP:
+    /* IR_TRAP never carries an expr, so this is moot — but the fail-closed
+     * default is `true`, and stating it keeps the rule uniform. */
+    case IR_TRAP:
         return true;
     }
     return true;   /* unreachable; conservative if a cast smuggles a bad value in */
@@ -11529,6 +11532,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         }
         break;
     }
+
+    case IR_TRAP:
+        /* BUG-957: the guard's early exit where a RETURN is not legal — inside
+         * @critical, returning would skip the interrupt re-enable. Same emitted
+         * text as the C-level guard used, now with the CFG knowing the path ends. */
+        emit_indent(e);
+        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+                "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
+        break;
 
     case IR_UNLOCK: {
         if (inst->expr) {

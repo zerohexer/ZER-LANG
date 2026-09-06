@@ -1,0 +1,58 @@
+// BUG-957: bounds guards moved from C splices into IR branches for most positions
+// (96% of the corpus). The risk of that migration is not the emission SHAPE — it is
+// losing a guard. This pins that the guard still fires in each newly-migrated
+// position, by making every one of them actually go out of bounds.
+//
+// Each helper takes an index VRP cannot prove and returns its zero value when the
+// guard fires. If any guard were dropped the read would go out of bounds instead —
+// caught by ASan, and usually by a wrong value here too.
+//
+// The if-condition and switch-selector cases are migrated because those selectors
+// are evaluated EXACTLY ONCE, so hoisting the guard before the statement is
+// equivalent. A LOOP condition is deliberately not migrated: `while (arr[i] > 0)`
+// re-evaluates per iteration, and a hoisted guard would be checked once while the
+// index changed underneath it. That case still uses the emitter's guard, and
+// `loop_cond` below covers it so the two paths are both exercised.
+
+u32[4] arr;
+u32 launder(u32 x){ u32 r = 0; for (u32 k = 0; k < 1; k += 1) { r = x; } return r; }
+
+u32 in_expr_stmt(){ u32 i = launder(100); arr[i] = 9; return 7; }   // guard -> 0
+u32 in_var_decl(){  u32 i = launder(100); u32 v = arr[i]; return v + 7; }
+u32 in_return(){    u32 i = launder(100); return arr[i] + 7; }
+u32 in_if_cond(){   u32 i = launder(100); if (arr[i] > 0) { return 5; } return 7; }
+
+u32 in_switch(){
+    u32 i = launder(100);
+    switch (arr[i]) { 0 => { return 5; } default => { return 6; } }
+}
+
+u32 loop_cond(){    // NOT migrated — still the emitter's guard, must still fire
+    u32 i = launder(100);
+    while (arr[i] > 0) { return 5; }
+    return 7;
+}
+
+// The BOUNDARY, and the reason it is here: an index of 100 trips both `>` and `>=`,
+// so a test using only that cannot tell a correct guard from an off-by-one. Index
+// EXACTLY 4 on a 4-element array is the case where `>` would wrongly let it through.
+// Verified by mutation: changing the comparison to `>` leaves the 100 cases passing
+// and fails this one.
+u32 at_boundary(){ u32 i = launder(4); u32 v = arr[i]; return v + 7; }
+
+// And one INSIDE the range, so the guard is not simply always-taken: a guard that
+// fired unconditionally would also make every case above return 0.
+u32 in_range(){ u32 i = launder(2); return arr[i] + 7; }
+
+u32 main(){
+    if (in_expr_stmt() != 0) { return 1; }
+    if (in_var_decl()  != 0) { return 2; }
+    if (in_return()    != 0) { return 3; }
+    if (in_if_cond()   != 0) { return 4; }
+    if (in_switch()    != 0) { return 5; }
+    if (loop_cond()    != 0) { return 6; }
+    if (at_boundary()  != 0) { return 7; }   // idx == len: `>` would miss this
+    if (in_range()     != 7) { return 8; }   // idx < len: guard must NOT fire
+    if (arr[0] != 0)         { return 9; }   // nothing was written out of bounds
+    return 0;
+}

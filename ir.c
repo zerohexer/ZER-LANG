@@ -331,7 +331,8 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
 bool ir_block_is_terminated(IRBlock *block) {
     if (block->inst_count == 0) return false;
     IROpKind op = block->insts[block->inst_count - 1].op;
-    return op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN || op == IR_YIELD;
+    return op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN ||
+           op == IR_YIELD || op == IR_TRAP;   /* BUG-957 */
 }
 
 /* ================================================================
@@ -723,6 +724,9 @@ bool ir_validate(IRFunc *func) {
             case IR_INTRINSIC_DECOMP: case IR_ORELSE_DECOMP:
             case IR_SLICE_READ: case IR_STRUCT_INIT_DECOMP:
             case IR_NOP:
+            /* BUG-957: IR_TRAP carries no operands to validate — it is a bare
+             * terminating abort. */
+            case IR_TRAP:
                 break;
             }
         }
@@ -869,6 +873,7 @@ bool ir_validate(IRFunc *func) {
 
 const char *ir_op_name(IROpKind op) {
     switch (op) {
+    case IR_TRAP:             return "TRAP";     /* BUG-957 */
     case IR_ASSIGN:           return "ASSIGN";
     case IR_CALL:             return "CALL";
     case IR_BRANCH:           return "BRANCH";

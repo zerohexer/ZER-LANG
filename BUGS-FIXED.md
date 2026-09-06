@@ -554,6 +554,76 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-950: `ir_clone_block_range` (refactor L, stage 1 of 3)
+
+Refactor **L** — lower defer bodies into the IR and delete the raw-AST defer emitter —
+needs a duplicate of a body's lowered blocks per fire site. This is that primitive, and
+NOTHING IN THE COMPILER CALLS IT YET: it is stage 1 of 3, landed on its own so stage 2
+starts from a green base. Only the tests exercise it today.
+
+### Why cloning happens at the IR level, not the AST level
+
+Measured first. A defer body really does reach more than one fire site — one `defer`
+plus an early `return` emits **2 copies** of the body in a single function — so
+per-site lowering means lowering the same AST twice, and that has two blockers:
+
+- **Lowering MUTATES the AST.** `pre_lower_orelse` REPLACES each orelse with an
+  identifier naming a temp, so a second lowering finds no orelse, emits no branch, and
+  leaves the identifier dangling into the FIRST site's blocks. This is the hazard
+  CLAUDE.md records as *"never call ir_lower_func twice on the same AST"*. No AST
+  cloner exists in the tree.
+- **The typemap is keyed by the Node POINTER** (`typemap_set` hashes the address), so a
+  cloned node has no type entry and `checker_get_type` returns NULL for it — which
+  emission depends on everywhere.
+
+Together those make the AST route a 53-kind exhaustive walker plus typemap copying.
+
+An `IRInst` names other blocks only by INTEGER INDEX (`true_block`, `false_block`,
+`goto_block`), names locals only by id, and blocks live in a flat array. So duplicating
+a body is copying a contiguous BLOCK RANGE and offsetting three fields. Locals need no
+remap — a clone stays in the same function. Neither blocker applies.
+
+### The two details that could have gone wrong silently
+
+**The sentinel.** `make_inst` initialises all three block fields to **-1**, and every
+`IRInst` in the tree is built through it (verified: the only bare `IRInst` declaration
+is inside `make_inst` itself, and nothing outside `ir_lower.c` writes those fields). So
+-1 is a reliable "unused" marker and the remap needs no op-kind gate. A remap keyed on
+`!= 0` would have turned -1 into a real block index — and block 0 is the ENTRY block,
+so that is a live branch target, not an obviously-wrong value.
+
+**In-range versus out-of-range.** Only a reference pointing INTO the cloned range moves.
+A reference to a block outside it still names a block that exists and must be left
+alone. Remapping every `>= 0` would silently redirect it.
+
+A clone deliberately does NOT inherit the source `label` (two blocks with one label
+emit duplicate C goto targets) or `preds` (recomputed by `ir_compute_preds`).
+
+### The tests were mutation-checked, not just run
+
+Five tests, 17 assertions, in `test_ir_validate.c` beside the existing IR tests. Each
+was verified to CATCH the mistake it is written for, by breaking the cloner three ways:
+
+| mutant | failures |
+|---|---|
+| remap keyed on `!= 0` instead of the range | 3 (the -1 sentinel assertions) |
+| remap every `>= 0` | 1 (the out-of-range assertion) |
+| no remap at all | 4 (the in-range assertions) |
+
+A gate that has only ever passed is a script, not a net.
+
+`make check` exit 0, nine gates, 34/34 in `test_ir_validate` (was 17).
+
+### What remains
+
+Stage 2 lowers each defer body once into a detached block range and splices a clone at
+each fire site; the change point is the THREE functions `emit_defer_fire`,
+`emit_defer_fire_scoped` and `emit_defer_pop_only`, not the ~11 call sites. It must
+preserve the capture-on-FIRE snapshot, the per-defer ARMED flag (F2) and the
+cleanup-label guard — each exists because a real bug got through — and it needs the
+template blocks marked skip-emit so they do not become dead C. Stage 3 deletes
+`emit_defer_stmt` (214 lines) and prunes zercheck_ir's second defer analyzer.
+
 ## Session 2026-09-06 — BUG-948 / BUG-949: the deadlock rule, and a use-after-free under it
 
 Survey item O, and a latent memory bug the relaxation shook loose.

@@ -334,6 +334,30 @@ int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len)
 /* Create a new basic block. Returns the block ID. */
 int ir_add_block(IRFunc *func, Arena *arena);
 
+/* BUG-950 (refactor L, stage 1): clone blocks [first, last] INCLUSIVE, appending
+ * the copies at the end of func->blocks. Returns the id of the first clone, or -1
+ * if the range is invalid.
+ *
+ * Needed because a defer body fires at MORE THAN ONE exit path (measured: one
+ * `defer` plus an early `return` emits two copies in one function), and lowering
+ * the same AST twice is unsound — `pre_lower_orelse` REPLACES each orelse with an
+ * identifier naming a temp, so the second lowering emits no branch and the
+ * identifier dangles into the first site's blocks. Cloning at the IR level instead
+ * of the AST level avoids that and the typemap problem too: the typemap is keyed
+ * by Node POINTER, so an AST clone would have no types.
+ *
+ * Locals are NOT remapped — a clone stays in the same function, so local ids are
+ * still correct. Block-index fields (true_block / false_block / goto_block) are
+ * remapped when they are >= 0 AND point INTO [first, last]; a reference outside
+ * the range names a block that still exists and is left alone. `make_inst`
+ * initialises all three to -1 and every IRInst in the tree is built through it,
+ * so -1 is a reliable "unused" sentinel and the remap needs no op-kind gate.
+ *
+ * A clone does NOT inherit `label` — two blocks with one source label would be
+ * duplicate goto targets in the emitted C. `preds` are left empty; they are
+ * computed after lowering by ir_compute_preds. */
+int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last);
+
 /* Add an instruction to a basic block. */
 void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst);
 

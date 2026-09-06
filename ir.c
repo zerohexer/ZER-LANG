@@ -195,6 +195,53 @@ int ir_add_block(IRFunc *func, Arena *arena) {
     return id;
 }
 
+/* BUG-950 (refactor L, stage 1) — see ir.h for why this exists and why cloning
+ * happens at the IR level rather than the AST level. */
+int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
+    if (!func || !arena) return -1;
+    if (first < 0 || last < first || last >= func->block_count) return -1;
+
+    int n = last - first + 1;
+
+    /* Allocate every clone FIRST. ir_add_block reallocs func->blocks, so both the
+     * source and destination pointers must be re-read afterwards — reading them
+     * before the loop would leave them dangling on the first growth. */
+    int base = -1;
+    for (int i = 0; i < n; i++) {
+        int id = ir_add_block(func, arena);
+        if (i == 0) base = id;
+    }
+    if (base < 0) return -1;
+
+    int offset = base - first;
+
+    for (int i = 0; i < n; i++) {
+        IRBlock *src = &func->blocks[first + i];
+        IRBlock *dst = &func->blocks[base + i];
+
+        /* Deliberately NOT copied: the source `label` (two blocks carrying one
+         * label would emit duplicate C goto targets) and `preds` (recomputed by
+         * ir_compute_preds after lowering). */
+        dst->is_orelse_fallback = src->is_orelse_fallback;
+        dst->is_early_exit      = src->is_early_exit;
+
+        if (src->inst_count <= 0) continue;
+        dst->insts = (IRInst *)arena_alloc(arena, (size_t)src->inst_count * sizeof(IRInst));
+        memcpy(dst->insts, src->insts, (size_t)src->inst_count * sizeof(IRInst));
+        dst->inst_count = src->inst_count;
+        dst->inst_capacity = src->inst_count;
+
+        for (int k = 0; k < dst->inst_count; k++) {
+            IRInst *in = &dst->insts[k];
+            if (in->true_block  >= first && in->true_block  <= last) in->true_block  += offset;
+            if (in->false_block >= first && in->false_block <= last) in->false_block += offset;
+            if (in->goto_block  >= first && in->goto_block  <= last) in->goto_block  += offset;
+        }
+    }
+    return base;
+}
+
+
 void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst) {
     if (block->inst_count >= block->inst_capacity) {
         int new_cap = block->inst_capacity * 2;

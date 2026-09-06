@@ -298,6 +298,114 @@ static void test_defer_fire_pop_only_does_not_count(void) {
  * Main
  * ================================================================ */
 
+/* ================================================================
+ * BUG-950 (refactor L, stage 1) — ir_clone_block_range
+ *
+ * A defer body fires at MORE THAN ONE exit path, so refactor L needs a
+ * duplicate of the body's lowered blocks per fire site. Cloning happens at the
+ * IR level because an IRInst names other blocks only by INTEGER INDEX; the AST
+ * route would need a 53-kind deep cloner AND typemap copying, since the typemap
+ * is keyed by node pointer.
+ *
+ * The remap is the whole risk, so it is what these test: an index INSIDE the
+ * cloned range must move, an index OUTSIDE it must NOT, and the -1 sentinel
+ * must survive untouched (make_inst sets all three to -1, so a remap that
+ * treated 0 as "unused" — or -1 as a real block — would corrupt control flow).
+ * ================================================================ */
+
+static void expect_int(int got, int want, const char *name) {
+    tests_run++;
+    if (got == want) { tests_passed++; }
+    else { printf("  FAIL: %s - got %d, want %d\n", name, got, want); tests_failed++; }
+}
+
+static void test_clone_remaps_internal_branch(void) {
+    Arena a; arena_init(&a, 64*1024);
+    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
+    int b0 = ir_add_block(f, &a);   /* 0 */
+    int b1 = ir_add_block(f, &a);   /* 1 */
+    int b2 = ir_add_block(f, &a);   /* 2 */
+    IRInst br = clean_inst(IR_BRANCH);
+    br.cond_local = 0; br.true_block = b1; br.false_block = b2;
+    ir_block_add_inst(&f->blocks[b0], &a, br);
+    IRInst g = clean_inst(IR_GOTO); g.goto_block = b2;
+    ir_block_add_inst(&f->blocks[b1], &a, g);
+    ir_block_add_inst(&f->blocks[b2], &a, clean_inst(IR_RETURN));
+
+    int base = ir_clone_block_range(f, &a, b0, b2);
+    expect_int(base, 3, "clone of [0,2] starts at block 3");
+    /* every reference was INSIDE the range, so every one moves by +3 */
+    expect_int(f->blocks[3].insts[0].true_block,  4, "internal true_block remapped");
+    expect_int(f->blocks[3].insts[0].false_block, 5, "internal false_block remapped");
+    expect_int(f->blocks[4].insts[0].goto_block,  5, "internal goto_block remapped");
+    /* the ORIGINALS must be untouched */
+    expect_int(f->blocks[0].insts[0].true_block, 1, "original true_block unchanged");
+    expect_int(f->blocks[1].insts[0].goto_block, 2, "original goto_block unchanged");
+    arena_free(&a);
+}
+
+static void test_clone_leaves_external_reference_alone(void) {
+    Arena a; arena_init(&a, 64*1024);
+    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
+    int b0 = ir_add_block(f, &a);   /* 0 - OUTSIDE the cloned range */
+    int b1 = ir_add_block(f, &a);   /* 1 */
+    int b2 = ir_add_block(f, &a);   /* 2 */
+    ir_block_add_inst(&f->blocks[b0], &a, clean_inst(IR_RETURN));
+    IRInst br = clean_inst(IR_BRANCH);
+    br.cond_local = 0;
+    br.true_block  = b2;   /* inside  [1,2] -> must move */
+    br.false_block = b0;   /* outside [1,2] -> must NOT move: block 0 still exists */
+    ir_block_add_inst(&f->blocks[b1], &a, br);
+    ir_block_add_inst(&f->blocks[b2], &a, clean_inst(IR_RETURN));
+
+    int base = ir_clone_block_range(f, &a, b1, b2);
+    expect_int(base, 3, "clone of [1,2] starts at block 3");
+    expect_int(f->blocks[3].insts[0].true_block,  4, "in-range target remapped");
+    expect_int(f->blocks[3].insts[0].false_block, 0, "OUT-of-range target left alone");
+    arena_free(&a);
+}
+
+static void test_clone_preserves_unused_sentinel(void) {
+    Arena a; arena_init(&a, 64*1024);
+    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
+    int b0 = ir_add_block(f, &a);
+    /* A RETURN names no block: all three fields are the -1 sentinel. If the
+     * remap tested "!= 0" instead of ">= first", -1 would become 0 and the
+     * emitter would read a branch target that was never set. */
+    ir_block_add_inst(&f->blocks[b0], &a, clean_inst(IR_RETURN));
+    int base = ir_clone_block_range(f, &a, b0, b0);
+    expect_int(base, 1, "single-block clone");
+    expect_int(f->blocks[1].insts[0].true_block,  -1, "-1 true_block preserved");
+    expect_int(f->blocks[1].insts[0].false_block, -1, "-1 false_block preserved");
+    expect_int(f->blocks[1].insts[0].goto_block,  -1, "-1 goto_block preserved");
+    arena_free(&a);
+}
+
+static void test_clone_result_validates(void) {
+    Arena a; arena_init(&a, 64*1024);
+    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
+    int b0 = ir_add_block(f, &a);
+    int b1 = ir_add_block(f, &a);
+    IRInst g = clean_inst(IR_GOTO); g.goto_block = b1;
+    ir_block_add_inst(&f->blocks[b0], &a, g);
+    ir_block_add_inst(&f->blocks[b1], &a, clean_inst(IR_RETURN));
+    ir_clone_block_range(f, &a, b0, b1);
+    /* The clone must not leave a dangling block index behind - ir_validate is
+     * the existing checker for exactly that. */
+    expect_valid(f, "function still validates after cloning a block range");
+    arena_free(&a);
+}
+
+static void test_clone_rejects_bad_range(void) {
+    Arena a; arena_init(&a, 64*1024);
+    IRFunc *f = make_minimal_func(&a);
+    expect_int(ir_clone_block_range(f, &a, -1, 0), -1, "negative first rejected");
+    expect_int(ir_clone_block_range(f, &a, 1, 0), -1, "last < first rejected");
+    expect_int(ir_clone_block_range(f, &a, 0, 99), -1, "last past end rejected");
+    arena_free(&a);
+}
+
+
 int main(void) {
     Arena a; arena_init(&a, 4*1024);
     types_init(&a);
@@ -332,6 +440,13 @@ int main(void) {
     test_minimal_valid();
     test_defer_push_fire_same_block();
     test_defer_fire_pop_only_does_not_count();
+
+    /* BUG-950: ir_clone_block_range */
+    test_clone_remaps_internal_branch();
+    test_clone_leaves_external_reference_alone();
+    test_clone_preserves_unused_sentinel();
+    test_clone_result_validates();
+    test_clone_rejects_bad_range();
 
     printf("\n=== Results: %d/%d passed, %d failed ===\n",
            tests_passed, tests_run, tests_failed);

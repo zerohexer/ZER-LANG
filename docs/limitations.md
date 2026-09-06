@@ -341,6 +341,16 @@ write bit per type id in `FuncSharedTypes` (`fsc_add_type_id(fsc, id, is_write)`
 the exemption only when the direct access AND every transitive access are reads. Found while
 building BUG-998 (the same-type rw re-entry rule), which is the SAFETY half and is closed.
 
+**Same shelf — a plain `shared` lock held around a FUNCPTR call.** BUG-1003 rejects an
+indirect call under a `shared(rw)` lock (the memory-safety half: rwlock re-entry). Under a
+plain `shared` lock the callee is equally unknown to the summary and may lock a SECOND shared
+struct — the same-statement two-lock shape — but the rule is NOT applied there, by
+measurement: `go.cb();` on a shared `Ops` and a funcptr PARAM called under a shared root are
+live corpus idioms, and the recursive mutex makes same-root re-entry harmless. Liveness
+only. Fix sketch that keeps the idiom: resolve the funcptr through the REACH machinery
+(`scan_funcname_binding` — direct name / reassigned local / field / element / factory /
+forwarded param) and merge the bound functions' summaries; reject only when unresolvable.
+
 ## OPEN — residuals recorded by the 2026-09-04 audit (BUG-946..919 fixed; these were NOT)
 
 Each was measured on main during that audit. None is an accept-unsafe hole that is SILENT on

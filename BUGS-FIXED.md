@@ -1629,6 +1629,24 @@ neither mixes domains). From `vigilant-tesla-fhf8rn` (their BUG-915). Tests:
 `tests/zer_fail/compound_float_into_int.zer`, `compound_int_into_float.zer`; positive
 `tests/zer/compound_assign_same_domain_ok.zer`.
 
+### BUG-1003 — a `shared(rw)` lock held around a call THROUGH A FUNCTION POINTER
+The BUG-998 hole through the one callee form the transitive summary cannot resolve. The
+summary keys on a NAMED function, so `g.v = fp();` with `fp` bound to a function that
+write-locks `g` had no callee set at all — measured on the pre-fix build: exit 0, the
+callee's write unlocked (EDEADLK ignored) and its unlock releasing the caller's lock. Same
+through a funcptr FIELD of the shared struct itself (`g.cb()`, the BUG-795 callee-position
+form). `collect_shared_types_in_expr` now records an INDIRECT call (an IDENT that is not a
+global function, or any funcptr-typed callee — local, global, field, element; a builtin
+method is neither), and `check_block_lock_ordering` rejects a statement that holds a
+`shared(rw)` lock around one. **Scoped to `shared(rw)` by measurement:** the plain-`shared`
+form is the callback-table idiom (`go.cb();` on a shared `Ops`; a funcptr PARAM called under
+a shared root — `tests/zer/shared_lock_completeness_ok.zer`,
+`rust_tests/rt_sendfn_spawn_with_fn_arg.zer`) and its recursive mutex makes same-root
+re-entry harmless; the nested-second-lock possibility that remains there is a liveness
+residual recorded in limitations.md beside BUG-500's. No corpus program holds an rwlock
+around an indirect call. Tests: `tests/zer_fail/shared_rw_reentrant_funcptr_call.zer`,
+`shared_rw_funcptr_field_call.zer`.
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

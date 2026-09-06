@@ -5058,7 +5058,10 @@ function it calls in that same statement must not touch the same struct
 nested write lock on the same thread either hangs (writer waiting on its own
 read lock) or, under glibc, is refused with `EDEADLK` and the callee then
 writes unlocked. Move the call into its own statement. A plain `shared` struct
-uses a recursive mutex, so the same shape is fine there.
+uses a recursive mutex, so the same shape is fine there. A call **through a
+function pointer** while a `shared(rw)` lock is held is rejected outright (the
+callee is unknown, so it cannot be proven not to re-enter the lock) — this
+includes calling a funcptr field of the struct itself, `g.cb()`.
 
 <!-- audit: expect-error: not re-entrant -->
 ```zer

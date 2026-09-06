@@ -79,6 +79,11 @@ typedef struct {
      * set a call inside this statement will lock while the statement's own
      * lock is held). Complement of the flag above. */
     bool shared_collect_callee_only;
+    /* BUG-1003: set by collect_shared_types_in_expr when the statement calls
+     * through a FUNCTION POINTER (callee not a named function). The callee is
+     * unknown to the transitive summary, so a statement that holds a shared
+     * lock around such a call cannot be proven free of a nested lock. */
+    bool shared_collect_saw_indirect_call;
     /* 2026-08-03: > 0 when inside a RUNTIME-conditional body (if/else arm, loop
      * body, switch arm). The scoped-borrow tracker is a linear statement-order
      * approximation, so a `th.join()` nested in a branch must NOT release the

@@ -25674,6 +25674,34 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
             count = collect_shared_types_in_expr(c, expr->call.callee, types, max_types, count);
         for (int i = 0; i < expr->call.arg_count && count < max_types; i++)
             count = collect_shared_types_in_expr(c, expr->call.args[i], types, max_types, count);
+        /* BUG-1003 (2026-09-06): a call THROUGH A FUNCTION POINTER has no
+         * summary — the transitive lookup below needs a named function. Record
+         * it so check_block_lock_ordering can refuse to hold a shared lock
+         * around a callee it cannot see (measured: `g.v = fp();` with fp
+         * bound to a function writing shared(rw) g compiled and re-entered the
+         * rwlock, exit 0 with the callee's write unlocked — the BUG-998 hole
+         * through the one callee form the summary does not resolve). An
+         * IDENT that names a global FUNCTION is direct; a funcptr-typed
+         * callee (local/global variable, struct field, array element) is
+         * indirect; a builtin method (`pool.alloc()`, a NODE_FIELD with no
+         * funcptr type) is neither. */
+        if (expr->call.callee) {
+            Node *ce = expr->call.callee;
+            bool direct = false;
+            if (ce->kind == NODE_IDENT) {
+                Symbol *fs = scope_lookup(c->global_scope, ce->ident.name,
+                                          (uint32_t)ce->ident.name_len);
+                if (fs && fs->is_function) direct = true;
+            }
+            if (!direct) {
+                Type *ct = typemap_get(c, ce);
+                Type *ceff = ct ? type_unwrap_distinct(ct) : NULL;
+                if (ceff && type_dispatch_kind(ceff) == TYPE_OPTIONAL && ceff->optional.inner)
+                    ceff = type_unwrap_distinct(ceff->optional.inner);
+                if (ceff && type_dispatch_kind(ceff) == TYPE_FUNC_PTR)
+                    c->shared_collect_saw_indirect_call = true;
+            }
+        }
         /* Transitive: look up callee's cached shared types (BUG-474 proper fix).
          * Uses DFS with memoization — no depth limit, handles mutual recursion.
          * Each function computed once via compute_func_shared_types(). */
@@ -25828,8 +25856,32 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
         Type *direct[4];
         if (n >= 1) {
             c->shared_collect_direct_only = true;
+            c->shared_collect_saw_indirect_call = false;
             n_direct = collect_shared_types_in_stmt(c, stmt, direct, 4);
             c->shared_collect_direct_only = false;
+        }
+        /* BUG-1003: a lock held around a call the summary cannot see. See the
+         * NODE_CALL arm of collect_shared_types_in_expr. */
+        /* Scoped to shared(rw) — MEASURED: the plain-`shared` form is the
+         * callback-table idiom (`go.cb();` on a shared Ops, a funcptr PARAM
+         * called under a shared root: 2 corpus programs), and its recursive
+         * mutex makes same-root re-entry harmless; what remains there is a
+         * possible nested lock on a SECOND shared struct — a liveness residual
+         * recorded in limitations.md beside BUG-500's. For shared(rw) the
+         * re-entry is the BUG-998 memory-safety defect, and no corpus program
+         * holds an rwlock around an indirect call. */
+        if (n_direct >= 1 && c->shared_collect_saw_indirect_call) {
+            for (int di = 0; di < n_direct; di++) {
+                if (!direct[di]->struct_type.is_shared_rw) continue;
+                checker_error(c, stmt->loc.line,
+                    "this statement holds the lock of shared(rw) '%.*s' and calls "
+                    "through a function pointer — the callee is unknown, so it may "
+                    "lock '%.*s' again (a reader-writer lock is not re-entrant) or a "
+                    "second shared struct; call it in its own statement",
+                    (int)direct[di]->struct_type.name_len, direct[di]->struct_type.name,
+                    (int)direct[di]->struct_type.name_len, direct[di]->struct_type.name);
+                break;
+            }
         }
         /* BUG-998 (2026-09-06): the SAME shared(rw) type held by this statement
          * AND locked again by a function the statement calls. The two-type rule

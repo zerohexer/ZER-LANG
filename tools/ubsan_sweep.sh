@@ -74,7 +74,16 @@ SAN="$SAN -fno-sanitize=signed-integer-overflow,shift"
 #     path really is reached. Under this sweep the sanitizer aborts before the
 #     handler runs, which is the sanitizer being right about C and wrong about
 #     what the program means.
-BASELINE_NAMES=" rt_unsafe_probe_mmio "
+#
+#   probe_fault_returns_null — the SAME mechanism, one sibling later. It probes
+#     0x0 deliberately (the fault path had no test until 2026-08-30; only the
+#     success path was covered). Added to the baseline the run after the test
+#     landed, which is the lesson worth keeping: a new test that exercises an
+#     already-baselined mechanism needs its baseline row IN THE SAME COMMIT, or
+#     the next sweep reports a "new" finding for a reason that was reviewed and
+#     accepted long ago. Verified before baselining that the finding reproduces
+#     on a from-HEAD build — i.e. it is the mechanism, not a regression.
+BASELINE_NAMES=" rt_unsafe_probe_mmio probe_fault_returns_null "
 
 total=0; ran=0; skipped=0; hits=0; known=0
 FAILLOG="$TMP/fail.txt"; : > "$FAILLOG"

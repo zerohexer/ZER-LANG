@@ -1277,6 +1277,44 @@ Tests: `tests/zer_trap/{bool_bitcast_forge,bool_switch_foreign_value}.zer`,
 
 ---
 
+## Session 2026-09-06 — BUG-985/986: a literal treated as if it had provenance, and a call-arg coercion that depended on which statement the call sat in (from `vigilant-tesla-lzmkhn`)
+
+Cherry-pick of `c1c149e` (their BUG-923/924). The one emitter conflict was their branch's
+earlier `_zer_nnfp` callee guard, which main answers differently (the funcptr-null-carrier
+traps already fire here); only the coercion half was taken.
+
+### BUG-985 (over-rejection) — `return "literal"` cleared the whole return summary
+
+`classify_return_root` special-cased `return null` as static and nothing else, so a
+string-literal return fell to RET_UNKNOWN — which does not cost one mask bit, it clears
+`ret_summary_complete`, and every escape sink then assumes the worst:
+`const [*]u8 pick(const [*]u8 u) { return "lit"; }` made `return pick(local)` "stack
+memory may escape" for a slice that provably lives in `.rodata`. Fixed by the invariant, not
+the string case: a LITERAL has no provenance, so all six literal kinds classify RET_STATIC.
+Sound by direction (the mask is a JOIN over returns; a literal arm contributes nothing).
+`return_literal_mixed_param_escapes` pins that a mixed function keeps its param bit.
+
+### BUG-986 (emitter dual dispatch) — a call ARGUMENT was coerced or not depending on the statement
+
+`u32 r = take(arr);` lowers to IR_CALL with decomposed args (coerced);
+`r = take(arr);` lowers to `IR_ASSIGN <expr>` and `emit_rewritten_node`'s NODE_CALL
+emitted every argument raw — a GCC error about `_zer_slice_u8` for valid ZER (112
+occurrences of the shape in the corpus). Enumerating found eight more: `emit_array_as_slice`
+ended in `emit_expr`, and eight of its twelve call sites sit in IR-rewritten handlers whose
+OTHER branch emits the same node with `emit_rewritten_node`. One definition now: the helper
+takes the IRFunc, non-NULL selecting the rewritten emitter.
+
+Gate: sink-matrix SHAPE p20 (four accept cells, all rejected pre-fix, plus the mixed-arm
+soundness guard). Also documented, not fixed: a factory result consumed via `orelse` is never
+registered as an owned allocation (leak-only gap; the obvious `TYPE_SLICE` fix was measured
+RED on three valid corpus programs and reverted) — `docs/limitations.md`, tripwire
+`tests/zer_gaps/factory_orelse_leak_missed.zer`.
+
+Tests: `tests/zer/{call_arg_coerce_all_stmt_forms,return_literal_is_static_ok}.zer`,
+`tests/zer_fail/return_literal_mixed_param_escapes.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

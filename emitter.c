@@ -8209,17 +8209,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
             node->call.callee->field.object &&
             node->call.callee->field.object->kind == NODE_IDENT) {
-            /* ThreadHandle.join() → pthread_join(th, NULL).
-             * Detect: field name "join" + object type is thread handle.
-             * Thread handles are emitted as pthread_t — check checker_get_type. */
-            if (node->call.callee->field.field_name_len == 4 &&
-                memcmp(node->call.callee->field.field_name, "join", 4) == 0) {
-                /* ThreadHandle — emit pthread_join directly */
-                emit(e, "pthread_join(");
-                emit_rewritten_node(e, node->call.callee->field.object, func);
-                emit(e, ", NULL)");
-                return;
-            }
             Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
             if (!ot) {
                 Symbol *sym = scope_lookup(e->checker->global_scope,
@@ -8237,6 +8226,35 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                         break;
                     }
                 }
+            }
+            /* ThreadHandle.join() → pthread_join(th, NULL).
+             *
+             * BUG-977: the comment here used to say "field name `join` + object
+             * type is thread handle", but `ot` was computed BELOW this block, so
+             * the only actual gate was the NAME. Any `s.join(...)` on an ident
+             * was rewritten to `pthread_join(s, NULL)` — the receiver passed as
+             * a pthread_t and every argument DROPPED. Measured on
+             * `struct Ops { *(u32) -> u32 join; }`: `s.join(41)` emitted
+             * `pthread_join(s, NULL)`. GCC rejects that particular spelling
+             * (incompatible type), so it surfaced as a confusing error inside
+             * generated code rather than a wrong answer — but the AST path
+             * (emitter.c ~2545) had always gated this on the receiver being a
+             * registered scoped-spawn handle, so the two paths disagreed, which
+             * is the dual-dispatch class this file keeps re-learning.
+             *
+             * A ThreadHandle is declared as a plain `u64` symbol carrying
+             * Symbol.is_thread_handle (checker.c ~17785); nothing else that can
+             * own a `.join` FIELD is an integer, so requiring an integer
+             * receiver separates the two with no lookup into a scope that has
+             * already been popped by emission time. */
+            if (node->call.callee->field.field_name_len == 4 &&
+                memcmp(node->call.callee->field.field_name, "join", 4) == 0 &&
+                ot && type_dispatch_kind(ot) == TYPE_U64) {
+                /* ThreadHandle — emit pthread_join directly */
+                emit(e, "pthread_join(");
+                emit_rewritten_node(e, node->call.callee->field.object, func);
+                emit(e, ", NULL)");
+                return;
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
@@ -11327,7 +11345,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                             obj_id = li; break;
                         }
                     }
-                    if (obj_id >= 0) {
+                    Type *hot = (obj_id >= 0) ? func->locals[obj_id].type : NULL;
+                    if (!hot) {
+                        Symbol *gs = scope_lookup(e->checker->global_scope,
+                            callee->field.object->ident.name,
+                            (uint32_t)callee->field.object->ident.name_len);
+                        if (gs) hot = gs->type;
+                    }
+                    if (hot && type_dispatch_kind(hot) == TYPE_HANDLE) {
+                        /* BUG-978: calling a function-pointer FIELD through a
+                         * Handle. Handle auto-deref (`h.f` -> `((T*)get(&slab,h))->f`)
+                         * is implemented once, in emit_rewritten_node's NODE_FIELD
+                         * case; this decomposed-call site re-implements field
+                         * emission by hand and its hand-rolled version knew only
+                         * `.` and `->`, so it emitted `h.fn(...)` — `h` is a
+                         * uint64_t, so GCC rejected the generated C with
+                         * "request for member 'fn' in something not a structure",
+                         * pointing at the ZER line. Reading and WRITING the same
+                         * field both worked, because both go through the shared
+                         * NODE_FIELD path. Delegate the callee to it rather than
+                         * teaching a second copy about handles. */
+                        emit_rewritten_node(e, callee, func);
+                        emit(e, "(");
+                    } else if (obj_id >= 0) {
                         Type *ot = func->locals[obj_id].type;
                         Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
                         emit_local_name(e, func, obj_id);
@@ -11568,6 +11608,32 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_GOTO: {
         emit_indent(e);
+        /* BUG-976: union switch totality guard (1zukjq's BUG-976). ir_lower.c
+         * parks the hoisted union POINTER local in `src1_local` and the union
+         * Type in `cast_type` on exactly one goto — the unconditional entry to
+         * the dispatch chain — so this is the one place the tag can be tested
+         * before any arm runs. Every other IR_GOTO leaves cast_type NULL. (The
+         * ENUM sibling is BUG-950's IR-level BRANCH inside the elided arm, not
+         * a goto annotation.) */
+        if (inst->cast_type && inst->src1_local >= 0 &&
+            inst->src1_local < func->local_count) {
+            Type *et = type_unwrap_distinct(inst->cast_type);
+            /* `src1_local` holds the POINTER local
+             * the union switch hoisted, and the discriminant is its `_tag`
+             * field; indices are 0..variant_count-1 by construction, so one
+             * unsigned range test covers every non-variant tag. */
+            if (et && type_dispatch_kind(et) == TYPE_UNION &&
+                et->union_type.variant_count > 0) {
+                IRLocal *sv = &func->locals[inst->src1_local];
+                const char *sp = func->is_async ? "self->" : "";
+                emit(e, "if ((unsigned)(%s%.*s->_tag) >= %uu) "
+                        "_zer_trap(\"switch on a union whose tag is not a declared "
+                        "variant\", __FILE__, __LINE__);\n",
+                     sp, (int)sv->name_len, sv->name,
+                     (unsigned)et->union_type.variant_count);
+                emit_indent(e);
+            }
+        }
         emit(e, "goto _zer_bb%d;\n", inst->goto_block);
         break;
     }

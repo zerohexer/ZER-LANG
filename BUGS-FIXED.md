@@ -1170,6 +1170,76 @@ Tests: `tests/zer_fail/isr_rmw_split_statements.zer`; hw-matrix 37/37.
 
 ---
 
+## Session 2026-09-06 — BUG-976..982: seven holes adopted from `vigilant-tesla-1zukjq` (their BUG-913..921)
+
+Cherry-pick of `c060f36`, reconciled against three things already on this branch: their
+enum switch-totality guard (BUG-913) is the same rule as BUG-950 and was NOT taken — the
+enum keeps BUG-950's IR-level BRANCH, and only the UNION half of their goto-annotation form
+survives; their `@cast` launder alias (BUG-921) is BUG-931's `ir_peel_launder` and was
+dropped; their alloc registration hunk is BUG-933's `ir_register_alloc_result`. Every
+negative measured accepted here before the pick (7 of 7 — survey CLASS 7 in full), all
+reject for their stated reason after; both positives run; the union trap traps.
+
+### BUG-976 — a union switch with a non-variant tag matched NO arm and silently did nothing
+
+A union read through `@inttoptr(*U, addr)` with tag 77 fell straight through to the
+statement after the switch — no diagnostic, no fault, on hosted or bare metal. The union
+chain keeps its last comparison (only the ENUM chain elides one), so the guard goes in
+FRONT of the whole chain, in its own block reached by an unconditional goto carrying the
+union Type in `cast_type` and the hoisted pointer local in `src1_local`; the emitter's
+IR_GOTO renders `if ((unsigned)(p->_tag) >= N) _zer_trap(...)`. One block, one edge, one
+predecessor — no join, so the CFG merge sees the shape it saw before.
+
+### BUG-977 — the IR emitter rewrote ANY `<ident>.join(...)` to `pthread_join` on the NAME alone
+
+`struct Ops { *(u32) -> u32 join; }` — `s.join(41)` emitted `pthread_join(s, NULL)`, every
+argument dropped. Its own comment claimed a type check; `ot` was computed below the
+branch. Now gated on the receiver being the `u64` a ThreadHandle is declared as.
+
+### BUG-978 — a function-pointer FIELD called through a Handle emitted `h.fn(...)` on a `uint64_t`
+
+Reads and writes auto-dereffed through the shared NODE_FIELD path; only the decomposed CALL
+site had a second, hand-rolled copy of field emission. Delegated to the shared path.
+
+### BUG-979 — alloc_id 0 was both the "untracked" sentinel AND a legal id minted from local 0
+
+`void f(Holder hd) { Handle(Item) k = hd.h; free(k); free(hd.h); }` compiled clean while
+`void f(u32 pad, Holder hd)` was rejected — a double free accepted or rejected by
+parameter position alone, because `hd` is local 0 and its compound handle got alloc_id 0,
+which two propagation sites `return` on. Fixed by making the id spaces disjoint
+(`ir_alloc_id_of_local` = id + 1, ONE function at every minting site), not by special-casing
+the collision.
+
+### BUG-980 — `IR_STRUCT_INIT_DECOMP` never ran the UAF walkers, and never reached the move sink
+
+`pool.free_ptr(t); Holder h = { .t = t };` was accepted (the assignment spelling was
+rejected); `Holder h = { .t = a };` for a `move struct a` consumed nothing. The walkers
+already descend NODE_STRUCT_INIT; the case now calls them, and routes a move-struct operand
+through `ir_mark_transferred` like every other consume sink.
+
+### BUG-981 — the multi-view call result was registered only at the var-decl sink, and the merge dropped the view set
+
+`[*]u8 h = x; h = pick(x, y, f); free(y); h[0]` was accepted (the var-decl spelling
+rejected); and `if (c) { h = pick(x, y, f); }` erased the set at the join. ONE function
+`ir_fill_multiview_set` serves both sinks; the merge is a UNION with the overflow flag ORed.
+
+### BUG-982 (latent) — leak-report sites indexed `func->locals[h->local_id]` with no bounds check
+
+`IR_GLOBAL_ROOT_ID` (-2) is a legal `local_id`, kept out only by a convention stated as a
+request in a comment. Now a check. Also two NULL derefs of `type_unwrap_distinct` in the
+move predicates.
+
+Also from the same commit: reference.md gains a LEXICAL chapter (comments, char and string
+escape sets, `0x`/`0b` and the absence of octal, the reserved prefix), the structured
+`asm { }` block rules, the missing CLI flags and argument-order rule, the reserved auto-slab
+method names, the switch totality guarantee, and the "what a C-style cast cannot do" table.
+
+Tests: `tests/zer_fail/{multiview_assign_uaf,multiview_branch_join_uaf,struct_init_field_uaf,struct_init_field_move,param_local0_double_free,cast_launder_uaf,cast_launder_double_free}.zer`,
+`tests/zer/{enum_union_switch_totality_ok,struct_field_method_names_ok}.zer`,
+`tests/zer_trap/union_switch_foreign_tag.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

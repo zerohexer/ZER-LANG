@@ -832,6 +832,18 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         /* Decompose arguments to locals (skip for builtins — type-name args) */
         int *arg_locals = NULL;
         int arg_count = expr->call.arg_count;
+        if (call_is_builtin) {
+            /* BUG-999 (2026-09-06): a builtin's args are emitted from the AST
+             * (`heap.free(mh orelse return)`), and an `orelse` that survives to
+             * the emitter has no lowering for its control-flow fallback — the
+             * emitter printed "compiler bug: orelse ... in a spawn argument" and
+             * zercheck, unable to key the free's argument, reported `mh` as
+             * never freed. Hoist every orelse in the args to a branch + temp
+             * exactly as the passthrough route does; a type-name arg is a bare
+             * NODE_IDENT, which pre_lower_orelse leaves untouched. */
+            for (int i = 0; i < arg_count; i++)
+                pre_lower_orelse(ctx, &expr->call.args[i], expr->loc.line);
+        }
         if (arg_count > 0 && !call_is_builtin && !call_is_comptime) {
             arg_locals = (int *)arena_alloc(ctx->arena, arg_count * sizeof(int));
             for (int i = 0; i < arg_count; i++) {

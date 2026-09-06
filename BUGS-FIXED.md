@@ -1577,6 +1577,34 @@ a second rw struct is still accepted (an ABBA hang with a mirror-image statement
 Tests: `tests/zer_fail/shared_rw_reentrant_call_write.zer`, `_read_then_write`, `_two_hop`,
 `_via_pointer`; positive `tests/zer/shared_mutex_reentrant_call_ok.zer` (recursive mutex, value-checked).
 
+### BUG-999 — `orelse` inside a builtin method's argument list survived lowering (false leak + runtime trap)
+Builtin method calls (`heap.free(...)`, `pool.get(...)`, `pool.free(...)`) route their AST
+args to the emitter without `pre_lower_orelse`, so `heap.free_ptr(mh orelse return)` reached
+the emitter's fallback arm — "compiler bug: orelse with control-flow fallback in a spawn
+argument" plus a runtime trap — and zercheck, unable to key the free's argument, reported
+`mh` as never freed (measured: both diagnostics on the pre-fix build). Every `orelse` in a
+builtin's args is now hoisted to a branch + temp in `lower_expr` exactly as the passthrough
+route does (a type-name arg is a bare NODE_IDENT, which `pre_lower_orelse` leaves untouched);
+the emitter's fallback message no longer names a spawn. From `vigilant-tesla-ii7a90`
+(their BUG-918). Test: `tests/zer/builtin_arg_orelse_return.zer`.
+
+### BUG-1000 — a value-optional GLOBAL initialised with its bare payload emitted invalid C; `?f32 r = 1.5;` rejected
+`?u32 g = 5;` was accepted by the checker and emitted `_zer_opt_u32 g = 5;` — GCC "invalid
+initializer" naming a `.c` file the user never opened, i.e. a valid ZER program that could
+not be BUILT (the BUG-911 class). Local declarations wrap the payload during IR lowering;
+file scope has no IR. `emit_global_var` now wraps a bare payload into
+`{ .value = <payload>, .has_value = 1 }` when the global's type is a VALUE optional (not a
+null-sentinel `?*T`, not `?void`) and the initializer's type is not itself an optional; the
+const-fold and `global_init_depth` paths sit inside the wrap. Item J of `ii7a90`.
+Sibling found while testing the shapes: a float literal is f64, so `?f32 r = 1.5;` was
+rejected at EVERY scope ("cannot initialize '?f32' with 'f64'") while `f32 x = 1.5;` is
+accepted and the integer tree already looks through one optional level (BUG-940).
+`is_literal_compatible` now looks through the payload of a value optional for a float
+literal (and `-lit`) too — verified at the var-decl, global, assignment, call-arg, return,
+struct-field and orelse-fallback sinks.
+Tests: `tests/zer/global_value_optional_payload_init.zer` (int / bool / negative / null /
+const-ident payloads), `tests/zer/optional_float_literal_init.zer`.
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

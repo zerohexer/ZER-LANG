@@ -5065,6 +5065,22 @@ static void emit_global_var(Emitter *e, Node *node) {
             emit(e, " = ");
             emit_opt_null_literal(e, type);
         } else {
+            /* BUG-1000 (2026-09-06): a VALUE-optional global (`?u32 g = 5;`,
+             * `?f32 r = 1.5;`, `?bool b = true;`) whose initializer is the bare
+             * PAYLOAD must be wrapped into the `{ .value, .has_value }` struct.
+             * The local paths wrap during IR lowering; file scope has no IR, and
+             * the payload was emitted bare — GCC "invalid initializer" naming a
+             * .c file the user never opened (a valid ZER program that could not
+             * be BUILT). Null-sentinel `?*T` (plain pointer) and `?void` (no
+             * payload) never take this branch; an initializer that is ITSELF an
+             * optional (`?u32 g = other;`) is copied whole. */
+            Type *init_t = checker_get_type(e->checker, node->var_decl.init);
+            Type *init_eff = init_t ? type_unwrap_distinct(init_t) : NULL;
+            bool wrap_opt = gtype_eff && type_dispatch_kind(gtype_eff) == TYPE_OPTIONAL &&
+                            !is_null_sentinel(gtype_eff->optional.inner) &&
+                            type_dispatch_kind(gtype_eff->optional.inner) != TYPE_VOID &&
+                            init_eff && type_dispatch_kind(init_eff) != TYPE_OPTIONAL;
+            if (wrap_opt) emit(e, " = { .value =");
             /* For const globals: try compile-time evaluation first.
              * This avoids GCC statement expression errors from _zer_shl/shr
              * macros which can't be used in global initializers. */
@@ -5083,15 +5099,15 @@ static void emit_global_var(Emitter *e, Node *node) {
                 int64_t cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
                     if (cval < 0) {
-                        emit(e, " = (%lld)", (long long)cval);
+                        emit(e, wrap_opt ? " (%lld)" : " = (%lld)", (long long)cval);
                     } else {
-                        emit(e, " = %llu", (unsigned long long)cval);
+                        emit(e, wrap_opt ? " %llu" : " = %llu", (unsigned long long)cval);
                     }
                     emitted_const = true;
                 }
             }
             if (!emitted_const) {
-                emit(e, " = ");
+                emit(e, wrap_opt ? " " : " = ");
                 /* BUG-942: mark the global-initializer context so a NODE_IDENT
                  * naming a const global is replaced by that global's own
                  * initializer rather than emitted as a name (invalid C). */
@@ -5099,6 +5115,7 @@ static void emit_global_var(Emitter *e, Node *node) {
                 emit_expr(e, node->var_decl.init);
                 e->global_init_depth--;
             }
+            if (wrap_opt) emit(e, ", .has_value = 1 }");
         }
     } else {
         /* auto-zero — unwrap distinct to check if compound init needed */
@@ -10644,9 +10661,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             node->orelse.fallback_is_continue) {
             /* Control flow out of an argument list has no meaning here; the
              * checker rejects it, so reaching this is a compiler bug. */
-            fprintf(stderr, "compiler bug: orelse with control-flow fallback in a "
-                            "spawn argument at line %d\n", node->loc.line);
-            emit(e, "(_zer_trap(\"orelse control-flow fallback in spawn arg\", "
+            /* BUG-999: this arm is reached from ANY passthrough expression the
+             * lowering did not pre-lower (spawn args, and — before the fix —
+             * builtin call args), so the message must not name one of them. */
+            fprintf(stderr, "compiler bug: orelse with control-flow fallback survived "
+                            "lowering in a passthrough expression at line %d\n",
+                    node->loc.line);
+            emit(e, "(_zer_trap(\"orelse control-flow fallback survived lowering\", "
                  "__FILE__, __LINE__), 0)");
             return;
         }

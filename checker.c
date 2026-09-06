@@ -1332,6 +1332,19 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     }
     /* bool is NOT an integer — no int→bool coercion (spec rule) */
     if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
+    /* BUG-1000 sibling (2026-09-06): a float literal is f64, so `?f32 r = 1.5;`
+     * was rejected ("cannot initialize '?f32' with 'f64'") while `f32 x = 1.5;`
+     * is accepted — the integer tree looks through ONE optional level
+     * (int_literal_tree_fits, BUG-940) and the float literal did not. Same
+     * rule, same depth: the payload of a VALUE optional. */
+    if (type_dispatch_kind(effective) == TYPE_OPTIONAL && effective->optional.inner) {
+        Type *inner = type_unwrap_distinct(effective->optional.inner);
+        if (expr->kind == NODE_FLOAT_LIT && type_is_float(inner)) return true;
+        if (expr->kind == NODE_UNARY && expr->unary.op == TOK_MINUS &&
+            expr->unary.operand && expr->unary.operand->kind == NODE_FLOAT_LIT &&
+            type_is_float(inner))
+            return true;
+    }
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
     if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
     if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;

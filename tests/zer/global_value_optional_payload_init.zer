@@ -1,0 +1,25 @@
+// BUG-1000 (2026-09-06): a VALUE-optional GLOBAL initialised with its bare payload.
+// The checker accepted `?u32 g = 5;` and the emitter wrote `_zer_opt_u32 g = 5;` —
+// GCC "invalid initializer" naming a .c file the user never opened, i.e. a valid
+// ZER program that could not be BUILT. Local declarations wrap the payload during
+// IR lowering; file scope has no IR, so emit_global_var now wraps it itself.
+// Shapes: int / bool / negative int / struct init / null / const-ident payload.
+struct P { u32 x; u32 y; }
+?u32 g = 5;
+?bool b = true;
+?i8 n = -3;
+?u32 z = null;
+const u32 K = 9;
+?u32 k = K;
+u32 main() {
+    u32 v = g orelse 1; if (v != 5) { return 1; }
+    
+    bool bb = b orelse false; if (!bb) { return 3; }
+    i8 nn = n orelse 0; if (nn != -3) { return 4; }
+    
+    if (z) |zz| { return 7; }
+    
+    u32 kk = k orelse 0; if (kk != 9) { return 9; }
+    
+    return 0;
+}

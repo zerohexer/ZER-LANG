@@ -229,7 +229,8 @@ two-spellings row in CLAUDE.md.**
 `rewrite_idents`,~~ — CLOSED 2026-09-06 as BUG-941, DO NOT REDO.** *(The non-descent was ALREADY in `walker_field_baseline.txt`, so the audit had been silenced on it; the stale row is removed. `asm` operands are the structurally-excluded sibling — asm is legal only in a `naked` function, which cannot declare a local to shadow.)* Original: so an argument naming a SHADOWED inner local bound to the wrong
 variable.
 
-**H. BUG-918 — `orelse` inside a builtin method's args survives lowering.**
+**H. ~~BUG-918 — `orelse` inside a builtin method's args survives lowering.~~ — CLOSED
+2026-09-06 as BUG-999, DO NOT REDO.** Original:
 MEASURED: `heap.free_ptr(mh orelse return)` produces a FALSE LEAK on main
 (`handle 'mh' allocated … but never freed`) because zercheck cannot key the free's
 argument; the branch also reports the emitter falling through to a "compiler bug …
@@ -243,8 +244,9 @@ found that once parseable, all three cast emitters kept the carrier's high bits
 (`(u3)300 == 44`), needing `emit_intn_cast_wrap_open/close` at all three sites —
 i.e. the uN width-wrap multi-site class AGAIN.
 
-**J. BUG-924 — a value-optional global initialised with its bare payload emits
-INVALID C.** MEASURED: `?u32 g = 5;` is accepted by the checker and emits
+**J. ~~BUG-924 — a value-optional global initialised with its bare payload emits
+INVALID C.~~ — CLOSED 2026-09-06 as BUG-1000, DO NOT REDO** *(plus the `?f32 r = 1.5`
+float-literal sibling at every sink).* Original: MEASURED: `?u32 g = 5;` is accepted by the checker and emits
 `_zer_opt_u32 g = 5;` → `gcc: error: invalid initializer`. A valid ZER program that
 cannot be built.
 
@@ -314,7 +316,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
 6. F  ~~const-expression MISCOMPILE~~       CLOSED (BUG-939); binary-operand
       residual folds into K (BUG-921) — same predicate, do them together
-7. J/I/K/H/G  the smaller ones
+7. J/I/K/H/G  the smaller ones — J (BUG-1000), K (BUG-940), H (BUG-999), G (BUG-941) CLOSED; I stays DECIDED-against
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
         M CLOSED (BUG-994); L CLOSED (BUG-995) — both refactors landed
 ```

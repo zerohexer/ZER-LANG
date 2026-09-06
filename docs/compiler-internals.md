@@ -361,9 +361,11 @@ reproducing on main FIRST, each with regression tests. Per-bug detail: BUGS-FIXE
 tracker: top of `docs/limitations.md`. This section is the DURABLE part — the root-cause taxonomy and
 what it says about where the safety architecture actually leaks.
 
-**Exactly ONE item is deliberately still open**: the durable §F2 fix (per-defer runtime "armed"
-flag). §F2 shipped as a sound interim REJECT, and its precondition — an exhaustive goto x defer
-matrix — now exists (`tests/test_defer_goto_matrix.c`, below).
+**The one item that was deliberately left open — the durable §F2 fix (per-defer runtime "armed"
+flag) — has since SHIPPED** (2026-08-17, after the exhaustive goto x defer matrix
+`tests/test_defer_goto_matrix.c` existed as its precondition; BUG-995 keeps it as an IR
+`BRANCH` tagged `defer_gate`). §F2's interim sound REJECT is gone: a forward goto over a later
+defer compiles, and the skipped defer never fires on that path (reference.md "defer").
 
 ### The taxonomy (the first 26 classified; §E–§J below fit the same shapes)
 

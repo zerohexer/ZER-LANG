@@ -1468,20 +1468,27 @@ defer { u32 z = maybe() orelse g; use(z); }   // OK — value fallback
 defer { u32 z = maybe() orelse return; }      // COMPILE ERROR — leaves the cleanup
 ```
 
-A forward `goto` that jumps **over** a later `defer` to a label past it is a
-compile error: on that path the defer never registered, so firing it at the
-label would run cleanup that was never set up. Register the defer before the
-goto — the normal acquire/cleanup order:
+A forward `goto` that jumps **over** a later `defer` to a label past it is
+allowed, and the skipped defer does **not** fire on that path: a defer is armed
+at its registration (a per-defer runtime flag, emitted only for defers a goto can
+skip), so the label's exit runs cleanup only for defers that were actually set
+up. (Until 2026-08-17 this shape was a compile error — the interim form of the
+same rule; it is TRACKED now, and `tests/test_defer_goto_matrix.c` pins every
+goto x defer placement.)
 
 ```zer
+u32 lock_count = 0;
+void acq() { lock_count += 1; }
+void rel() { lock_count -= 1; }
 void f(u32 err) {
     if (err == 1) { goto done; }
     acq();
-    defer rel();          // COMPILE ERROR — the goto above skips this
+    defer rel();          // skipped by the goto above — never fires on that path
     lock_count += 100;
 done:
     return;
 }
+u32 main() { f(1); f(0); return lock_count - 100; }   // f(1): nothing fired; f(0): acq, +100, rel
 
 void ok(u32 err) {
     acq();

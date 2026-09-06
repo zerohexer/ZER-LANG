@@ -38,7 +38,8 @@ repeated.
 Four findings were made while closing them that this branch never reported, each with
 its own OPEN entry below: a `shared struct` read in an asm operand takes NO LOCK; a
 designated initializer does not work at global scope for any field type; BUG-936 left
-three defer-body auto-guard siblings that only **M** closes; and BUG-949, a
+three defer-body auto-guard siblings (**owned by L, NOT M — corrected 2026-09-06;
+see the ORDER section**); and BUG-949, a
 use-after-free in the shared-types cache (fixed). **N also proved that the defer half
 of the emitter is the blocker it is described as**: the checker relaxation was
 correct, but `emit_defer_stmt` had no break/continue arm and TRAPPED, so the emitter
@@ -98,7 +99,11 @@ CLOSED 2026-09-06 as BUG-936, PARTIALLY: DO NOT REDO the widening, DO still take
 pre-fix). It does NOT close the three siblings — an unprovable index in a defer-body
 VAR-DECL INIT, FOR-INIT or WHILE-COND still exits 0, because the auto-guard is emitted
 only before an op-kind-GATED subset of instructions and those positions are not in the
-gate. Those need refactor **M**.* Original:
+gate. **CORRECTED 2026-09-06: those three need refactor L, NOT M** — measured,
+`emit_defer_stmt` calls `emit_auto_guards` in only 3 of its 10 arms (EXPR_STMT, RETURN,
+IF-cond) and not in WHILE-cond, FOR-init or VAR_DECL-init, which are exactly the three.
+They live in the raw-AST defer emitter that L deletes; M's IR op-kind gate never sees a
+defer body.* Original:
 A defer body is range-checked at the `defer` STATEMENT but RUNS at scope exit,
 after every intervening reassignment:
 
@@ -277,6 +282,48 @@ ASan-confirmed on the intermediate build, boundary exactly at the initial capaci
 so `u32 r = f();` was rejected when `f` touches two
 shared structs sequentially. A statement with no DIRECT shared access takes no
 lock, so nothing can nest around the call. `g.v = f();` stays rejected.
+
+### ORDER OF L AND M — MEASURED 2026-09-06, do not re-derive
+
+**L FIRST, THEN M.** This reverses an earlier recommendation of mine that ordered them
+by SIZE (M is smaller) rather than by what each actually fixes. Every line below was
+measured against main at `b925a871` by INSPECTING EMITTED C, never by exit code — the
+auto-guard is a silent `if (...) return;`, so exit 0 can mean "the guard fired". Reading
+exit codes gives the wrong answer here, and it gave me one twice during this check.
+
+**L's live symptom set — all three confirmed:**
+
+| symptom | evidence |
+|---|---|
+| unlocked shared read | `defer { if (s.v > 0) {…} }` emits `if ((s.v > 0))` with NO `pthread_mutex_lock`; the identical read in an ordinary statement locks |
+| **false assurance + silent OOB** | `defer { u32 v = arr[i]; }` warns *"auto-guard inserted"* and emits **ZERO** guards. Same for a defer-body FOR-init and WHILE-cond |
+| trap on VALID code | `switch`, `do-while` and `@critical` in a defer body each emit `_zer_trap("compiler bug: unsupported stmt kind in defer")` |
+
+One root cause: `emit_defer_stmt` (emitter.c, 214 lines) is a SECOND statement emitter
+with arms for BLOCK / EXPR_STMT / RETURN / ASM / IF / WHILE / FOR / VAR_DECL / BREAK /
+CONTINUE, and it calls `emit_auto_guards` in only THREE of them.
+
+**M's live symptom set: ONE, and it is not a soundness hole.** An indexed shared root
+emits the lock first and then traps inside it:
+
+```c
+pthread_mutex_lock(&(_zer_bounds_check((size_t)(i), 4, …), arr)[i]._zer_mtx);
+if ((size_t)(i) >= 4u) { _zer_trap("out-of-bounds access inside a held lock …"); }
+```
+
+so a program that should take the guard's clean early return exits 133 instead. Safe,
+just worse. Everything else about M's premise is TRUE but currently LATENT: the gate is
+a hand-maintained allowlist of 8 op kinds in TWO copies (regular + async), widened
+reactively at least twice — but **25 op kinds sit outside it and none could be made to
+drop a guard**, because lowering funnels conditions through gated ops first. Probed
+clean: `if` / `while` conditions, for-init, IR_BINOP, `@critical`, `@once`, an async
+body, and an async `await` condition.
+
+**Dependency, measured rather than assumed:** L fixes the three unguarded defer
+positions, because lowering the body into the IR routes it through the ordinary gated
+path. M does NOT — its gate never sees a defer body. And L makes M strictly smaller and
+safer, since M's choke-point change then applies to a codebase with ONE statement
+emitter instead of two. There is no dependency in the other direction.
 
 ### SUGGESTED ORDER
 

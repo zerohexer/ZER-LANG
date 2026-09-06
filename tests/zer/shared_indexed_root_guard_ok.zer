@@ -1,0 +1,41 @@
+// BUG-952 (refactor M, the ordering half): the auto-guard must be emitted BEFORE the
+// lock of an INDEXED shared root, not inside it.
+//
+// IR_LOCK carries the shared ROOT expression, and that root can be indexed —
+// `arr[i].v = 1` where `arr` is `shared struct S[4]`. IR_LOCK was missing from the
+// emitter's auto-guard op-kind gate, so the guard was attached to the following
+// ASSIGN instead, which sits INSIDE the lock:
+//
+//     pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
+//     if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
+//
+// The lock's own bounds check trapped first, and even reaching the guard it could
+// only trap, because a lock is held and returning would leak it. PRE-FIX this file
+// exits 133. With the guard before the lock the early return is legal again.
+//
+// The gate is a hand-maintained allowlist that has now been widened reactively three
+// times (async 2026-05-03/06, AWAIT/NOP 2026-06-30, IR_LOCK here) — which is the
+// defect refactor M exists to remove. Every OTHER expr-carrying op was probed and is
+// covered, because its index funnels through an already-gated op during
+// decomposition. IR_UNLOCK carries the same root and is deliberately NOT gated: it
+// runs with the lock held, so a guard there could only trap, and the LOCK guard has
+// already returned early on that path.
+
+shared struct S { u32 v; }
+S[4] arr;
+
+u32 launder(u32 x){ u32 r = 0; for (u32 k = 0; k < 1; k += 1) { r = x; } return r; }
+
+// out of range: the guard returns 0 early and the store must NOT happen
+u32 oob(){ u32 i = launder(100); arr[i].v = 7; return 5; }
+
+u32 main(){
+    // in range: the store must actually happen, through the lock
+    u32 j = launder(2);
+    arr[j].v = 7;
+    if (arr[2].v != 7) { return 1; }
+
+    if (oob() != 0) { return 2; }      // early return yields the zero value
+    if (arr[0].v != 0) { return 3; }   // and wrote nothing
+    return 0;
+}

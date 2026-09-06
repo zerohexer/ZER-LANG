@@ -402,7 +402,10 @@ if ((size_t)(i) >= 4u) { _zer_trap("out-of-bounds access inside a held lock …"
 ```
 
 so a program that should take the guard's clean early return exits 133 instead. Safe,
-just worse. Everything else about M's premise is TRUE but currently LATENT: the gate is
+just worse. **CLOSED 2026-09-07 as BUG-952** — `IR_LOCK` was simply missing from the
+gate; adding it emits the check before the lock (133 -> 0). The rest of M — replacing
+the hand-maintained allowlist with a single choke point — is still open, and is the
+PREREQUISITE for L. Everything else about M's premise is TRUE but currently LATENT: the gate is
 a hand-maintained allowlist of 8 op kinds in TWO copies (regular + async), widened
 reactively at least twice — but **25 op kinds sit outside it and none could be made to
 drop a guard**, because lowering funnels conditions through gated ops first. Probed

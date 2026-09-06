@@ -13178,9 +13178,30 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                  * NODE_SPAWN args copied in parent thread). Both were
                  * silently miscompiling unproven arr[i] — emit_auto_guards
                  * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
+                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
+                 * gate too. It carries the SHARED ROOT expression, and that root can
+                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
+                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
+                 * so the emitted C read:
+                 *
+                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
+                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
+                 *
+                 * — the lock's own bounds check traps first, and even reaching the
+                 * guard it could only trap, because a lock is held and returning
+                 * would leak it. Measured: exit 133 on a program whose guard should
+                 * have taken a clean early return. Guarding the LOCK emits the check
+                 * BEFORE the lock, where the early return is still legal.
+                 *
+                 * This is the gate defect M exists to remove, and IR_LOCK is a
+                 * measured instance of it: an op kind carrying a guardable expr that
+                 * nobody had added. The list is hand-maintained and has been widened
+                 * reactively three times now (2026-05-03/06 async, 2026-06-30
+                 * AWAIT/NOP, and this). */
                 if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
                     k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
+                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP ||
+                    k == IR_LOCK) {
                     emit_auto_guards(e, ins->expr);
                 }
             }
@@ -13371,9 +13392,30 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                 /* Audit-fix (2026-06-30): paired with the regular-path gate
                  * widening — IR_AWAIT carries the await condition's array
                  * indexing re-emitted per-poll; IR_NOP carries spawn args. */
+                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
+                 * gate too. It carries the SHARED ROOT expression, and that root can
+                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
+                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
+                 * so the emitted C read:
+                 *
+                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
+                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
+                 *
+                 * — the lock's own bounds check traps first, and even reaching the
+                 * guard it could only trap, because a lock is held and returning
+                 * would leak it. Measured: exit 133 on a program whose guard should
+                 * have taken a clean early return. Guarding the LOCK emits the check
+                 * BEFORE the lock, where the early return is still legal.
+                 *
+                 * This is the gate defect M exists to remove, and IR_LOCK is a
+                 * measured instance of it: an op kind carrying a guardable expr that
+                 * nobody had added. The list is hand-maintained and has been widened
+                 * reactively three times now (2026-05-03/06 async, 2026-06-30
+                 * AWAIT/NOP, and this). */
                 if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
                     k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP) {
+                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP ||
+                    k == IR_LOCK) {
                     emit_auto_guards(e, ins->expr);
                 }
             }

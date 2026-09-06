@@ -554,6 +554,58 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-952: the auto-guard fired INSIDE the lock it should precede
+
+Refactor **M**'s ordering half, and a measured instance of the gate defect M exists to
+remove.
+
+`IR_LOCK` carries the shared ROOT expression, and that root can be INDEXED —
+`arr[i].v = 1` where `arr` is `shared struct S[4]`. But `IR_LOCK` was missing from the
+emitter's auto-guard op-kind gate, so the guard attached to the following `IR_ASSIGN`
+instead — which sits INSIDE the lock:
+
+```c
+pthread_mutex_lock(&(_zer_bounds_check((size_t)(i), 4, …), arr)[i]._zer_mtx);
+if ((size_t)(i) >= 4u) { _zer_trap("…out-of-bounds inside a held lock…"); }
+```
+
+The lock's own `_zer_bounds_check` traps first; and even reaching the guard it could
+only trap, because a lock is held and returning would leak it. Measured: **exit 133** on
+a program whose guard should have taken a clean early return. With `IR_LOCK` gated the
+check is emitted BEFORE the lock, where the early return is still legal — **133 → 0**,
+and both paths verified: in range the store happens through the lock, out of range the
+function returns the zero value and writes nothing.
+
+### The gate is the defect, and this is the third reactive widening
+
+The list is a hand-maintained allowlist of op kinds, in TWO copies (regular and async),
+and it has now been widened after the fact three times: async emission (2026-05-03/06),
+`IR_AWAIT`/`IR_NOP` (2026-06-30), and `IR_LOCK` here. Each widening followed a
+measured miscompile. That is precisely why M replaces the gate with a single choke
+point every instruction passes through.
+
+### The rest of the gate was enumerated, not assumed
+
+Nine op kinds carry an `expr` and are not gated. Each was probed with an index VRP
+cannot prove, checking EMITTED C rather than exit codes (the auto-guard is a silent
+`if (…) return;`, so exit 0 can mean the guard fired):
+
+`IR_COPY`, `IR_UNOP`, `IR_CAST`, `IR_STRUCT_INIT_DECOMP`, `IR_FIELD_READ`, `IR_BRANCH`,
+`IR_BINOP`, `IR_GOTO` — all covered, because the index funnels through an already-gated
+op during decomposition. `IR_LOCK` was the only real gap.
+
+`IR_UNLOCK` carries the same root and is deliberately NOT gated: it runs with the lock
+held, so a guard there could only trap, and the LOCK guard has already returned early on
+that path.
+
+### Known cosmetic residue
+
+The ASSIGN inside the lock still emits its own guard, now dead code (the LOCK guard
+returned first). Suppressing it needs per-statement "already guarded" state; M's choke
+point removes it for free, so it is left rather than patched around.
+
+`make check` exit 0, nine gates, 1485 (+1). The test exits 133 on the pre-fix build.
+
 ## Session 2026-09-07 — BUG-950: `ir_clone_block_range` (refactor L, stage 1 of 3)
 
 Refactor **L** — lower defer bodies into the IR and delete the raw-AST defer emitter —

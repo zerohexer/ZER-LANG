@@ -13328,6 +13328,36 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 }
 
+/* BUG-992 (lzmkhn's BUG-917): re-anchor the C preprocessor's line counter to
+ * the ZER source line of the instruction about to be emitted.
+ *
+ * Function BODIES are IR-only, and IR block emission sets `e->source_file` to
+ * NULL — source mapping was switched off wholesale because `#line` collided with
+ * goto labels and statement expressions (the BUG-418 class). The consequence was
+ * never written down: with ONE `#line` per function (at its declaration) and none
+ * inside, every line inside every function body mapped to "function's line +
+ * offset in the generated C", so EVERY runtime trap named a line that does not
+ * exist (a 7-line file reported "ln1.zer:15"). The trap fires correctly; only
+ * the location lies, which is why nothing caught it — the number is plausible.
+ *
+ * Emitting the directive HERE is safe where the wholesale approach was not: this
+ * is called between instructions, at column 0, never inside a `({...})` statement
+ * expression and never on the same line as a `{` or a label (the block label is
+ * emitted with its own trailing newline).
+ *
+ * It is emitted for EVERY instruction, not only when the ZER line changes:
+ * `#line N` numbers the NEXT line N and then counts up, so an instruction that
+ * expands to three C lines leaves the counter at N+3 — a second instruction on
+ * the SAME ZER line would be misreported without its own anchor. An instruction
+ * with no location (0) re-anchors to the last known line rather than drifting. */
+static void emit_line_map(Emitter *e, const char *src_file, int line, int *last) {
+    if (!src_file) return;
+    if (line <= 0) line = *last;
+    if (line <= 0) return;
+    emit(e, "#line %d \"%s\"\n", line, src_file);
+    *last = line;
+}
+
 /* Emit a regular (non-async) function from IR */
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
@@ -13492,10 +13522,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
-    /* Disable source mapping during IR block emission — #line directives
-     * collide with goto labels and statement expressions (BUG-418 class). */
+    /* Wholesale source mapping stays OFF during IR block emission — an
+     * unconditional #line collides with goto labels and statement expressions
+     * (BUG-418 class). BUG-992 re-anchors it per INSTRUCTION instead, which is
+     * safe because that point is always between statements at column 0. */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -13584,6 +13617,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
             IRInst *ins = &bb->insts[ii];
+            /* BUG-992: anchor the line counter BEFORE the guards, so an
+             * auto-guard trap reports the access's line, not the previous one. */
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
@@ -13753,9 +13789,11 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         add_async_local(e, func->locals[li].name, func->locals[li].name_len);
     }
 
-    /* Disable source mapping during IR blocks */
+    /* Disable source mapping during IR blocks (see the BUG-992 note on the
+     * regular path — the per-instruction re-anchor below replaces it). */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* BUG-863: IR_RETURN reads this to decide whether the async termination
      * also stores a result. The regular-function path sets it; this one never
@@ -13779,6 +13817,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
              * same way as the regular path; emit_auto_guard_return_body
              * emits `self->_zer_state = -1; return 1;` for async returns. */
             IRInst *ins = &bb->insts[ii];
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): paired with the regular-path gate

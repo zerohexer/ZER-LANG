@@ -1068,8 +1068,9 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 
 ### CLASS 15-18 — smaller, each one branch
 
-- **i64 literal range** (`lzmkhn`): `i64_literal_above_max`, `_below_min`,
-  `_over_range_sinks`.
+- ~~**i64 literal range** (`lzmkhn`): `i64_literal_above_max`, `_below_min`,
+  `_over_range_sinks`.~~ — **CLOSED 2026-09-06 as BUG-991** (all three reject; the
+  boundary positive runs).
 - **compound float <-> int** (`fhf8rn`): `compound_float_into_int`,
   `compound_int_into_float`.
 - **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,

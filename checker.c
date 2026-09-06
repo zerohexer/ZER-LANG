@@ -1279,8 +1279,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_I32:
             if (val > 0xFFFFFFFFULL) return false;
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
+        /* BUG-991 (lzmkhn's BUG-915): this said `return true;` with the comment
+         * "val is uint64, positive literal fits in i64" — false above 2^63-1.
+         * `i64 x = 18446744073709551615;` was ACCEPTED at every one of the
+         * value-flow sinks that route through this predicate and silently
+         * became -1, while every NARROWER signed width rejected the same shape.
+         * Not "no rule at 64 bits": the SAME rule with a hole at the widest
+         * width — the mirror of BUG-863. Corpus cost measured: zero. */
         case TYPE_I64:
-            return true;  /* val is uint64, positive literal fits in i64 */
+            return val <= (uint64_t)INT64_MAX;
         /* Path C: arbitrary-width int — fits if within the width's max */
         case TYPE_UINT: {
             uint32_t _b = effective->intn.bits;
@@ -1289,7 +1296,10 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         }
         case TYPE_SINT: {
             uint32_t _b = effective->intn.bits;
-            if (_b >= 64) return true;
+            /* BUG-991, the iN sibling: at 65..128 bits a u64 literal always fits;
+             * exactly 64 needs the signed bound. */
+            if (_b > 64) return true;
+            if (_b == 64) return val <= (uint64_t)INT64_MAX;
             return val <= ((1ULL << (_b - 1)) - 1ULL);
         }
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
@@ -1318,11 +1328,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I8:    return val <= 128;
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
-            case TYPE_I64:   return true;
+            /* BUG-991, the NEGATIVE half: the magnitude must fit, exactly as at
+             * every narrower width. `i64 x = -18446744073709551615;` was accepted
+             * and wrapped to 1. */
+            case TYPE_I64:   return val <= (uint64_t)INT64_MAX + 1ULL;
             /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
             case TYPE_SINT: {
                 uint32_t _b = effective->intn.bits;
-                if (_b >= 64) return true;
+                if (_b > 64) return true;
+                if (_b == 64) return val <= (uint64_t)INT64_MAX + 1ULL;
                 return val <= (1ULL << (_b - 1));
             }
             /* unsigned types: negative literals never fit */

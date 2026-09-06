@@ -1389,6 +1389,44 @@ run.
 
 ---
 
+## Session 2026-09-06 — BUG-991/992: a literal that only fit at 64 bits, and every trap pointing at the wrong line (from `vigilant-tesla-lzmkhn`)
+
+Hand-applied from `8b4aa54` (their BUG-915/917); the same commit's launder peel (their
+BUG-914) is BUG-931 here and its enum switch guard (their BUG-916) is BUG-950, so the
+commit was not cherry-picked whole.
+
+### BUG-991 — an over-range literal was rejected at every signed width except i64
+
+`is_literal_compatible` said `return true;` for `TYPE_I64` ("positive literal fits in
+i64"), false above 2^63-1 — so `i64 x = 18446744073709551615;` compiled and x was -1 at every
+sink that routes through the predicate (var-decl, assignment, struct-literal field, call
+argument, return, global init), while `i16 a = 40000;` is a hard error. One rule with a hole
+at exactly the widest width, the mirror of BUG-863; the `iN` sibling had `>= 64` (at 65..128
+bits a u64 literal genuinely always fits, exactly 64 needs the signed bound), and the NEGATIVE
+half (`-18446744073709551615` wrapped to 1) had the same hole. Corpus cost: zero — every
+literal above INT64_MAX in the corpus targets `u64` or an mmio range. The boundary
+(INT64_MAX, INT64_MIN, UINT64_MAX into u64) is asserted at runtime by
+`int_literal_signed_bounds_ok`.
+
+### BUG-992 — every runtime trap named a line that does not exist
+
+Function bodies are IR-only and block emission switched `#line` mapping off wholesale (the
+BUG-418 collision with goto labels and statement expressions), so a 7-line file reported
+"line 15" — function's line + offset in the generated C. The trap fires correctly; only the
+location lies, which is why nothing caught it: the number is plausible. Re-anchored per
+INSTRUCTION (`emit_line_map`, both the regular and the async IR emitters), at a point always
+between statements at column 0, BEFORE the auto-guards so a guard trap reports the access's
+line. Emitted for EVERY instruction, not only on a line change — `#line N` numbers the NEXT
+line and counts up, so a second instruction on the same ZER line needs its own anchor.
+`tests/test_zer.sh`'s `// expect-trap-at: N` asserts the reported location (the trap runner
+used to discard stderr, which is why this lived under the suite); `explicit_trap.zer` pins
+line 8, and an OOB slice index on line 5 now reports line 5.
+
+Tests: `tests/zer_fail/i64_literal_{above_max,below_min,over_range_sinks}.zer`,
+`tests/zer/int_literal_signed_bounds_ok.zer`, `tests/zer_trap/explicit_trap.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

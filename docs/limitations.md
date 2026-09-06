@@ -30,7 +30,14 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): 12 items + 2 refactors + 2 relaxations
+## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): ALL 12 ITEMS CLOSED; 2 refactors + 2 relaxations REMAIN
+
+**STATUS 2026-09-06: items A–K are all CLOSED** (BUG-934..946). What remains from this
+branch is **L** and **M** (the two architectural refactors) and **N** / **O** (the two
+measured relaxations). Three findings were made while closing them that this branch
+never reported, and each has its own OPEN entry below: a `shared struct` read in an asm
+operand takes NO LOCK; a designated initializer does not work at global scope for any
+field type; and BUG-936 left three defer-body auto-guard siblings that only **M** closes.
 
 **Read this section ALONE and you can start. Every line below was MEASURED against
 main at `9a0e731b` in CHECKER-ONLY mode (`-o out.c`), not read from the branch.**
@@ -166,7 +173,18 @@ argument; the branch also reports the emitter falling through to a "compiler bug
 in a spawn argument" message plus a runtime trap. Their fix hoists every `orelse`
 in a builtin's args to a branch + temp.
 
-**I. BUG-923 — `(u3)x` / `(i48)x` do not PARSE** (uN/iN are IDENTs, never a cast
+**I. ~~BUG-923 — `(u3)x` / `(i48)x` do not PARSE~~ — CLOSED 2026-09-06 as
+BUG-945 + BUG-946, DO NOT REDO.** *(Parse: the uN/iN spelling now takes the SAME
+speculate-and-backtrack arm as `(*`; corpus cost measured ZERO — all 313
+parenthesized int-type spellings in the tree are keyword widths that never reach it.
+The width rule moved to `ast.h` as `zer_is_intn_type_name` with `checker.c` a thin
+wrapper, so parser and checker ask ONE question. Wrap: measuring first showed the
+survey's expectation was wrong — it is not three cast emitters needing a new
+`emit_intn_cast_wrap_open/close`, it is ONE site (`IR_CAST`) needing the EXISTING
+`emit_intn_mask` that IR_BINOP and IR_UNOP already use. Var-decl / call-arg / return
+were wrong (44 instead of 4); plain and global assignment were already right — the
+two-spellings split. The test discriminates both halves, verified against a build of
+the intermediate state, not assumed.)* Original: (uN/iN are IDENTs, never a cast
 start). MEASURED: `error: expected ';' after variable declaration`. Their fix moves
 `intn_type_name` to `ast.h` and makes the cast speculative like `(*`. They also
 found that once parseable, all three cast emitters kept the carrier's high bits
@@ -241,7 +259,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
 6. F  ~~const-expression MISCOMPILE~~       CLOSED (BUG-939); binary-operand
       residual folds into K (BUG-921) — same predicate, do them together
-7. ~~J/I/K/H/G~~  K, G, H, J CLOSED (BUG-940/941/942/943+944); **only I remains**
+7. ~~J/I/K/H/G~~  ALL CLOSED (BUG-940/941/942/943+944/945+946)
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
 ```
 

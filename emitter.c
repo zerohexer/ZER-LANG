@@ -12770,6 +12770,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ")");
             }
             emit(e, ";\n");
+            /* BUG-946: Path C — a cast to a non-native uN/iN must be wrapped to N
+             * bits. The cast emits only the CARRIER cast, and the carrier is the
+             * smallest native type >= N, so `(u3)300` emitted `(uint8_t)300` and
+             * evaluated to 44 instead of 4 — a silent wrong answer on a valid
+             * program, in the class CLAUDE.md lists beside _zer_shl.
+             *
+             * Measured before fixing: var-decl init, call argument and return were
+             * all wrong, while plain assignment and global assignment were already
+             * right (they mask after the store) — the TWO-SPELLINGS split again.
+             * All three wrong spellings funnel through IR_CAST, so one call here
+             * covers them, and it is the SAME emit_intn_mask that IR_BINOP and
+             * IR_UNOP use rather than a new expression-position wrapper. */
+            if (inst->dest_local >= 0) {
+                const char *csp = func->is_async ? "self->" : "";
+                emit_intn_mask(e, &func->locals[inst->dest_local], csp);
+            }
         }
         break;
     }

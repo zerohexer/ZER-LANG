@@ -554,6 +554,70 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-945 / BUG-946: `(u3)x` did not parse, then did not wrap
+
+Survey item I, the last of the twelve. Two halves, and the second only became
+reachable once the first was fixed.
+
+### BUG-945 — a uN/iN spelling is an IDENT, not a keyword
+
+`u8`/`u16`/`u32`/`u64` and their signed twins are LEXER KEYWORDS; every other width
+is an ordinary identifier. So the parser's cast disambiguation, which switches on the
+token after `(`, sent `(u3)x` and `(i48)x` to `default:` — parsed as a parenthesized
+expression, then died at the operand:
+
+```
+error: expected ';' after variable declaration at 'x'
+```
+
+`u3` already worked as a declaration type (`u3 y;`) and as an intrinsic type argument
+(`@truncate(u3, x)`). Only the cast position refused it.
+
+It is ambiguous in exactly the way `(*` is — the parser has no scope, so `(u3)` could
+name a variable — so it takes the SAME speculate-and-backtrack arm rather than a new
+mechanism. **Corpus cost measured before shipping: ZERO.** Of 313 parenthesized
+int-type spellings across `tests/`, `rust_tests/`, `zig_tests/`, `lib/` and
+`examples/`, every single one is a keyword width that never reaches this arm.
+
+The width-parsing rule moved to `ast.h` as `zer_is_intn_type_name`, and `checker.c`'s
+`parse_intn_width` became a thin wrapper over it. Both the parser and the checker must
+now ask this question, and a second copy in `parser.c` would be precisely the
+multi-site shape this codebase keeps paying for.
+
+### BUG-946 — the cast then kept the carrier's high bits
+
+The carrier is the smallest native type >= N, and the cast emitted only the carrier
+cast, so `(u3)300` emitted `(uint8_t)300` and evaluated to **44 instead of 4** — a
+silent wrong answer on a valid program, in the class CLAUDE.md lists beside `_zer_shl`.
+
+Measured across the sinks BEFORE fixing, which is what made the fix a one-liner:
+
+| sink | before |
+|---|---|
+| var-decl init | **44** |
+| call argument | **44** |
+| return | **44** |
+| plain assignment | 4 — already right |
+| global assignment | 4 — already right |
+| `@truncate(u3, x)` | 4 — already right |
+
+The two-spellings split again: assignment masks after the store, the others do not.
+All three wrong spellings funnel through `IR_CAST`, so ONE call there covers them —
+and it is the same `emit_intn_mask` that `IR_BINOP` and `IR_UNOP` already use, not a
+new expression-position wrapper. The survey expected three separate cast emitters to
+need `emit_intn_cast_wrap_open/close`; measuring first showed one site and one
+existing helper.
+
+### The test discriminates BOTH halves, and that was verified, not assumed
+
+Pre-session the file does not parse, which proves only the parse half. So a build of
+the INTERMEDIATE state — parser fix applied, mask hunk reverted — was made and run:
+it exits 1 on the `i3` sign-extension case. Three states measured: parse error, exit
+1, exit 0. The test also exercises every sink, since three were wrong and three were
+right and only the split explains why.
+
+`make check` exit 0, nine gates, 1475 positives.
+
 ## Session 2026-09-06 — BUG-943 / BUG-944: the optional wrap, missing at two more sinks
 
 Survey item J, and a sibling found while measuring it. Both are the same question —

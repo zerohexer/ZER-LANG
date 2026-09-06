@@ -4153,17 +4153,10 @@ static TypeNode *subst_typenode(Arena *a, TypeNode *tn,
  * reach here, so this only fires for the non-standard widths. */
 static bool parse_intn_width(const char *name, uint32_t len,
                              uint32_t *out_bits, bool *out_signed) {
-    if (len < 2 || len > 4) return false;
-    if (name[0] != 'u' && name[0] != 'i') return false;
-    uint32_t bits = 0;
-    for (uint32_t i = 1; i < len; i++) {
-        if (name[i] < '0' || name[i] > '9') return false;
-        bits = bits * 10u + (uint32_t)(name[i] - '0');
-    }
-    if (bits < 1 || bits > 128) return false;
-    *out_bits = bits;
-    *out_signed = (name[0] == 'i');
-    return true;
+    /* BUG-945: the rule itself moved to ast.h so the PARSER can ask it too (it
+     * must decide whether `(u3)x` is a cast). Kept as a thin wrapper rather than
+     * updating the call site, so there is exactly ONE implementation. */
+    return zer_is_intn_type_name(name, len, out_bits, out_signed);
 }
 
 static Type *resolve_type(Checker *c, TypeNode *tn) {

@@ -68,10 +68,13 @@ u21 next = addr + 1;     // wraps to 0 at 2^21
 i12 delta = -2048;       // signed 12-bit, range [-2048, 2047]
 u3  flag  = 7;           // sub-byte
 u48 big;                 // 48-bit
+
+u32 wide = 300;
+u3  narrow = (u3)wide;   // C-style cast — truncates to 3 bits, so 4
 ```
 
 **NOTES**
-- Widths 1..128. Same no-implicit-narrowing rule as u8..u64 (`u21 x = @truncate(u21, big);`).
+- Widths 1..128. Same no-implicit-narrowing rule as u8..u64 — narrow explicitly with either `@truncate(u21, big)` or a C-style cast `(u21)big`. Both wrap to N bits, not to the carrier width (BUG-946: `(u3)300` is 4, not 44).
 - Arithmetic on bare integer literals is `u32`, so `u21 x = 1000 + 500;` is rejected (u32→u21 narrowing). Write a fitting literal (`u21 x = 1500;`) or use `uN`-typed operands (`u21 a = 1000; u21 x = a + 500;` — this wraps at 2^N).
 - Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
 - A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.

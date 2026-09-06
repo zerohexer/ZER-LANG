@@ -964,6 +964,27 @@ static Node *parse_primary(Parser *p) {
             is_cast = true;
             star_ambiguous = true;
             break;
+        case TOK_IDENT:
+            /* BUG-945: a uN/iN spelling is an IDENT, not a keyword — u8/16/32/64
+             * and i8/16/32/64 are lexer keywords, every OTHER width is not. So
+             * `(u3)x` and `(i48)x` fell to `default:`, were parsed as a
+             * parenthesized expression, and died at the operand:
+             *     error: expected ';' after variable declaration at 'x'
+             * `u3` works as a declaration type and as an intrinsic type argument;
+             * only the cast position refused it.
+             *
+             * AMBIGUOUS in exactly the way `(*` is — `(u3)` could name a variable,
+             * since the parser has no scope — so it takes the SAME speculative
+             * path rather than a new mechanism. Corpus cost of doing so is
+             * measured ZERO: of 313 parenthesized int-type spellings across
+             * tests/, rust_tests/, zig_tests/, lib/ and examples/, every one is a
+             * keyword width that never reaches this arm. */
+            if (zer_is_intn_type_name(p->current.start,
+                                      (uint32_t)p->current.length, NULL, NULL)) {
+                is_cast = true;
+                star_ambiguous = true;   /* reuse the speculate-and-backtrack arm */
+            }
+            break;
         default: break;
         }
 

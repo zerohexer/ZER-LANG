@@ -1,0 +1,58 @@
+// BUG-945 + BUG-946: `(u3)x` / `(i48)x` did not PARSE, and once they did the cast
+// kept the CARRIER's high bits.
+//
+// BUG-945 — a uN/iN spelling is an IDENT, not a keyword. Only u8/16/32/64 and
+// i8/16/32/64 are lexer keywords; every other width is an identifier, so `(u3)x`
+// fell to the parser's `default:` arm, was parsed as a parenthesized expression,
+// and died at the operand: "expected ';' after variable declaration at 'x'".
+// `u3` already worked as a declaration type and as an intrinsic type argument —
+// only the cast position refused it. It is ambiguous in exactly the way `(*` is
+// (the parser has no scope, so `(u3)` could name a variable), so it takes the SAME
+// speculate-and-backtrack path. Corpus cost of that: measured ZERO — all 313
+// parenthesized int-type spellings in the tree are keyword widths.
+//
+// BUG-946 — the cast then emitted only the carrier cast, and the carrier is the
+// smallest native type >= N, so `(u3)300` emitted `(uint8_t)300` and evaluated to
+// 44 instead of 4. Measured before fixing: var-decl init, call argument and return
+// were all wrong while plain and global ASSIGNMENT were already right (they mask
+// after the store) — the two-spellings split. All three funnel through IR_CAST.
+//
+// PRE-SESSION this file does not parse. With the parse fix but no wrap it exits 1
+// (the i3 case). Both halves were verified against a build of each state.
+
+u32 widen(u3 v){ return (u32)v; }
+u3  narrow(u32 x){ return (u3)x; }        // the RETURN sink
+i48 sign48(i64 d){ return (i48)d; }
+
+u32 main(){
+    // --- the wrap itself, unsigned and signed ---
+    u32 a = 5;
+    i3 s = (i3)a;                   // 5 -> 0b101 -> -3 in 3-bit two's complement
+    if (s != -3) { return 1; }
+
+    u32 b = 300;
+    u3 u = (u3)b;                   // 300 & 7 == 4          (var-decl sink)
+    if (u != 4) { return 2; }
+
+    u64 c = 0x1FFFFFFFFFFFF;        // 49 bits set
+    u48 w = (u48)c;
+    if (w != 0xFFFFFFFFFFFF) { return 3; }
+
+    i64 d = -1;
+    i48 v = (i48)d;                 // stays -1 after sign-extend
+    if (v != -1) { return 4; }
+
+    u32 e = 200;
+    u7 sev = (u7)e;                 // 200 & 127 == 72
+    if (sev != 72) { return 5; }
+
+    // --- every sink, since three of them were wrong and three were right ---
+    if (widen((u3)b) != 4) { return 6; }        // call-argument sink
+    if ((u32)narrow(300) != 4) { return 7; }    // return sink
+    u3 asg = 0;
+    asg = (u3)b;                                 // assignment sink
+    if (asg != 4) { return 8; }
+    if (sign48(-1) != -1) { return 9; }
+
+    return 0;
+}

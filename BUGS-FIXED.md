@@ -1103,6 +1103,36 @@ the exit code).
 
 ---
 
+## Session 2026-09-06 — BUG-973: `@cond_timedwait` alone emitted C naming an undeclared member (from `vigilant-tesla-ef9cao`)
+
+Cherry-pick of `fbdcb1e` (their BUG-921).
+
+```zer
+shared struct C { u32 count; }
+C g;
+u32 main() { ?void r = @cond_timedwait(g, g.count > 0, 1); return 0; }
+// GCC: 'struct C' has no member named '_zer_cond'
+```
+
+Which shared structs need a `pthread_cond_t` member was discovered by an emitter PRESCAN
+that matched a `cond_` intrinsic only when it was the WHOLE of a `NODE_EXPR_STMT`.
+`@cond_wait` / `@cond_signal` / `@cond_broadcast` return void and are written as statements;
+`@cond_timedwait` is the one that RETURNS a value (`?void`), so it is written as a var-decl
+initializer the prescan never looked at. The name test was fine; the POSITION test was the
+bug. It survived because any program that also calls `@cond_wait` on the same struct
+registers the member and masks it — which is why the regression test uses `@cond_timedwait`
+and nothing else. Fixed by recording the fact where every occurrence is already visited: the
+checker validates every `@cond_*` first argument in full expression context and sets
+`Type.struct_type.uses_condvar`; the emitter reads the flag at its two decision sites. The
+prescan arm, `register_condvar_type`, `is_condvar_type` and the `condvar_type_ids` registry
+are DELETED rather than left beside the flag — two mechanisms for one fact is how the
+position dependence got in. (`types.h` grew a field: the objects were rebuilt from clean.)
+
+Test: `tests/zer/cond_timedwait_alone.zer` (fails to BUILD pre-fix with exactly that GCC
+error; exercises the timeout-returns-null and the already-true-predicate outcomes).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

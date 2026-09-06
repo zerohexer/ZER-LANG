@@ -4952,11 +4952,39 @@ static void emit_global_var(Emitter *e, Node *node) {
         /* optional null init needs struct literal, not scalar 0.
          * BUG-506: unwrap distinct — distinct typedef ?T is still optional. */
         Type *gtype_eff = type ? type_unwrap_distinct(type) : NULL;
+        Type *gi_type = checker_get_type(e->checker, node->var_decl.init);
         if (gtype_eff && gtype_eff->kind == TYPE_OPTIONAL &&
             !is_null_sentinel(gtype_eff->optional.inner) &&
             node->var_decl.init->kind == NODE_NULL_LIT) {
             emit(e, " = ");
             emit_opt_null_literal(e, type);
+        } else if (gtype_eff && type_dispatch_kind(gtype_eff) == TYPE_OPTIONAL &&
+                   !is_null_sentinel(gtype_eff->optional.inner) &&
+                   !is_void_opt(type) &&
+                   !(gi_type && type_dispatch_kind(gi_type) == TYPE_OPTIONAL)) {
+            /* BUG-943: a value-optional global initialised with its bare PAYLOAD.
+             * This branch handled exactly ONE optional shape — the null literal —
+             * and everything else fell through to the scalar path below, so
+             *     ?u32 g = 5;   ->   _zer_opt_u32 g = 5;
+             * i.e. `gcc: error: invalid initializer`: a valid ZER program that
+             * could not be BUILT. Measured on four shapes (?u32, ?bool, ?enum,
+             * ?i64); only `= null` worked, because only `= null` had an arm.
+             *
+             * The payload must be const-FOLDED rather than emitted as an
+             * expression, for the same reason BUG-939 folds below: a tree needing
+             * `_zer_shl` emits a GCC statement expression, which is illegal at
+             * file scope. When it does not fold, emit_opt_wrap_value is the shared
+             * T -> ?T query (the same one assignment and struct-field init use). */
+            int64_t oval = eval_const_expr(node->var_decl.init);
+            if (oval != CONST_EVAL_FAIL) {
+                emit(e, " = (");
+                emit_type(e, type);
+                if (oval < 0) emit(e, "){ (%lld), 1 }", (long long)oval);
+                else          emit(e, "){ %lluULL, 1 }", (unsigned long long)oval);
+            } else {
+                emit(e, " = ");
+                emit_opt_wrap_value(e, type, node->var_decl.init);
+            }
         } else {
             /* For const globals: try compile-time evaluation first.
              * This avoids GCC statement expression errors from _zer_shl/shr

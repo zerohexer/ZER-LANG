@@ -173,8 +173,17 @@ found that once parseable, all three cast emitters kept the carrier's high bits
 (`(u3)300 == 44`), needing `emit_intn_cast_wrap_open/close` at all three sites —
 i.e. the uN width-wrap multi-site class AGAIN.
 
-**J. BUG-924 — a value-optional global initialised with its bare payload emits
-INVALID C.** MEASURED: `?u32 g = 5;` is accepted by the checker and emits
+**J. ~~BUG-924 — a value-optional global initialised with its bare payload emits
+INVALID C.~~ — CLOSED 2026-09-06 as BUG-943, DO NOT REDO.** *(The survey named one
+shape; the family is four — `?u32 = 5`, `?bool = true`, `?E = E.b`, `?i64 = -7` all
+emitted invalid C, and only `= null` worked because only `= null` had an arm. The
+payload is const-folded when it folds — the BUG-939 file-scope statement-expression
+rule — and otherwise goes through `emit_opt_wrap_value`, the shared T -> ?T query.
+**Measuring it also found BUG-944**, the FIFTH raw-AST argument site: the SUBJECT of an
+`orelse` is a raw passthrough, and the emitter's raw-AST argument loop applies NO
+coercion while the decomposed path applies four — so `f(5) orelse 0` failed to compile
+where `?u32 r = f(5);` built. Fixed by ROUTING an ordinary call through `lower_expr`
+rather than duplicating the coercions.)* Original: MEASURED: `?u32 g = 5;` is accepted by the checker and emits
 `_zer_opt_u32 g = 5;` → `gcc: error: invalid initializer`. A valid ZER program that
 cannot be built.
 
@@ -232,9 +241,43 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 5. E  ~~&freed.field~~                       CLOSED (BUG-938) + its sibling
 6. F  ~~const-expression MISCOMPILE~~       CLOSED (BUG-939); binary-operand
       residual folds into K (BUG-921) — same predicate, do them together
-7. ~~J/I/K/H/G~~  K, G, H CLOSED (BUG-940/941/942); **I and J remain**
+7. ~~J/I/K/H/G~~  K, G, H, J CLOSED (BUG-940/941/942/943+944); **only I remains**
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
 ```
+
+---
+
+## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
+
+Found while measuring item J's sinks; not reported by any branch, and NOT
+optional-specific — it was checked against a plain field precisely to find out.
+
+```zer
+struct S { u32 f; }
+S s = { .f = 5 };            // global
+u32 main(){ return s.f; }
+```
+
+MEASURED on main at `41ebfb4b`:
+
+```
+error: cannot initialize 's' of type 'S' with 'void'
+```
+
+The identical initializer in a LOCAL declaration builds and returns 5. Measured across
+four field shapes — plain `u32`, `?u32 = 5`, `?u32 = null`, and the field omitted
+entirely — all four are rejected at global scope with the same message.
+
+The message is the tell: the struct-init expression is typed **`void`** at global scope,
+i.e. the checker never typed it at all, rather than typing it and finding a mismatch. So
+this is likely one missing `check_expr` on the global-var init path, not a coercion gap.
+
+`docs/reference.md` shows designated initializers only in function scope
+(`Point p = { .x = 10, .y = 20 };`, assignment, call argument, return), and NO test in
+the tree performs one at global scope — which is why it has survived. It is an
+over-rejection, not a soundness hole: the program is refused, never miscompiled.
+
+Tripwire: none yet — write the positive in the same commit as the fix.
 
 ---
 

@@ -554,6 +554,73 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-06 — BUG-943 / BUG-944: the optional wrap, missing at two more sinks
+
+Survey item J, and a sibling found while measuring it. Both are the same question —
+*is the `T -> ?T` wrap applied at this sink?* — answered at two places that never asked.
+
+### BUG-943 — a value-optional GLOBAL initialised with its payload
+
+`emit_global_var`'s initializer branch had exactly ONE optional arm, the null literal.
+Every other shape fell through to the scalar path:
+
+```zer
+?u32 g = 5;      // -> _zer_opt_u32 g = 5;   -> gcc: error: invalid initializer
+```
+
+A valid ZER program that could not be BUILT. Measured across the family: `?u32 = 5`,
+`?bool = true`, `?E = E.b` and `?i64 = -7` all emitted invalid C; only `= null` worked,
+because only `= null` had an arm. `?*T = null` was fine — a null sentinel has no wrapper.
+
+The payload is const-FOLDED when it folds, for the BUG-939 reason: a tree needing
+`_zer_shl` emits a GCC statement expression, which is illegal at file scope. When it
+does not fold — an enum member does not — it goes through `emit_opt_wrap_value`, the
+shared `T -> ?T` query that assignment and struct-field init already use. The test
+covers both paths deliberately.
+
+### BUG-944 — the FIFTH raw-AST argument site, one bug after the other four
+
+`lower_orelse_to_dest` emits the orelse's SUBJECT as a raw AST passthrough. The
+passthrough exists for BUILTINS, whose arguments may be a bare type name — but the
+emitter's raw-AST argument loop applies **no coercion at all**, while the decomposed
+path applies four: the optional wrap, its null form, array to slice, and slice to
+pointer. So the coercion set differed by CONTEXT, not by the call:
+
+```zer
+?u32 r = f(5);            // builds — decomposed, wrapped
+return f(5) orelse 0;     // gcc: "incompatible type for argument 1 of 'f'"
+```
+
+Measured live for the optional wrap AND array-to-slice; both build correctly one line
+earlier. This is the same class as BUG-942 and did not surface in its enumeration
+because that one asked *"where does an `orelse` survive in an argument?"* while this
+asks *"where is a CALL emitted from raw AST, so its arguments miss the coercions?"* —
+a broader question that contains it.
+
+Fixed by ROUTING an ordinary call through `lower_expr` rather than copying the four
+coercions into the raw-AST loop: the one-query shape, and an ordinary call in an orelse
+subject now inherits every future coercion too. Builtins keep the passthrough, which is
+the only reason it exists — the test pins that with a `heap.alloc_ptr() orelse` subject.
+
+The builtin predicate was EXTRACTED from `lower_expr` into
+`call_bypasses_arg_lowering` so both sites ask the same question instead of the second
+one re-deriving it. The extraction was committed to mentally as a no-behaviour-change
+checkpoint and verified as one (197 orelse positives unchanged) before the routing was
+switched on.
+
+### The audit refused a raw type dispatch, and I did not baseline it
+
+The new global-init arm tripped `audit_type_dispatch.sh`. Its sibling one line above is
+already baselined and mine was equally safe — an already-unwrapped `_eff` local — so a
+row would have been accepted. I used `type_dispatch_kind` instead. Twice this session a
+baseline row turned out to have silenced the audit on a LIVE defect (BUG-941's spawn
+args, BUG-942's asm operands); adding one for convenience, when the query costs nothing,
+is how that happens.
+
+Two positives, both verified to fail on the pre-session build (`invalid initializer`,
+`incompatible type for argument 1`): `optional_global_payload_init_ok`,
+`orelse_subject_call_coercion_ok`. `make check` exit 0, nine gates, 1474 positives.
+
 ## Session 2026-09-06 — BUG-942: an `orelse` in a raw-AST argument, at FOUR sites
 
 Survey item H, which named ONE site. Enumerating the raw-AST argument positions found

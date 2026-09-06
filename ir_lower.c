@@ -312,6 +312,51 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
 static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local, Node *node, int line);
 static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
 
+/* BUG-944: extracted from lower_expr's NODE_CALL arm so that lower_orelse_to_dest
+ * can ask the SAME question instead of re-deriving it. True when a call's
+ * arguments must NOT be decomposed into IR locals, because one of them may be a
+ * bare TYPE NAME (`arena.alloc(Task)`, `alloc(u8, n)`) which is not an
+ * expression. Such a call is emitted from the raw AST.
+ *
+ * Builtins are Pool / Slab / Ring / Arena / Struct method calls, plus the two
+ * ident-callee universal forms. The `free` arm is gated on the argument being a
+ * SLICE so a cinclude `free(ptr)` is never hijacked. See docs/universal_alloc.md. */
+static bool call_bypasses_arg_lowering(LowerCtx *ctx, Node *expr) {
+    if (!expr || expr->kind != NODE_CALL) return false;
+    if (expr->call.callee && expr->call.callee->kind == NODE_FIELD &&
+        expr->call.callee->field.object) {
+        Type *ot = checker_get_type(ctx->checker, expr->call.callee->field.object);
+        if (!ot && expr->call.callee->field.object->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(ctx->checker->global_scope,
+                expr->call.callee->field.object->ident.name,
+                (uint32_t)expr->call.callee->field.object->ident.name_len);
+            if (s) ot = s->type;
+        }
+        if (ot) {
+            Type *ot_eff = type_unwrap_distinct(ot);
+            if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
+                ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
+                ot_eff->kind == TYPE_STRUCT /* Task.new/delete */)
+                return true;
+        }
+    }
+    if (expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
+        const char *cn = expr->call.callee->ident.name;
+        uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
+        if (cl == 5 && memcmp(cn, "alloc", 5) == 0 &&
+            expr->call.arg_count == 2 &&
+            expr->call.args[0]->kind == NODE_IDENT) {
+            Type *art = checker_get_type(ctx->checker, expr);
+            if (art && type_dispatch_kind(art) == TYPE_OPTIONAL) return true;
+        } else if (cl == 4 && memcmp(cn, "free", 4) == 0 &&
+                   expr->call.arg_count == 1) {
+            Type *fat = checker_get_type(ctx->checker, expr->call.args[0]);
+            if (fat && type_dispatch_kind(fat) == TYPE_SLICE) return true;
+        }
+    }
+    return false;
+}
+
 /* can_lower_expr removed — lower_expr is now unconditional.
  * ALL expressions get decomposed to local IDs. Complex expressions
  * (calls, intrinsics, builtins, casts, orelse, struct_init) go through
@@ -748,50 +793,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
     case NODE_CALL: {
         rewrite_idents(ctx, expr);
 
-        /* Detect builtins — these have type-name args that can't be decomposed.
-         * Route builtins through IR_CALL with expr (emitter uses emit_expr). */
-        bool call_is_builtin = false;
         bool call_is_comptime = expr->call.is_comptime_resolved;
-        if (expr->call.callee && expr->call.callee->kind == NODE_FIELD &&
-            expr->call.callee->field.object) {
-            Type *ot = checker_get_type(ctx->checker, expr->call.callee->field.object);
-            if (!ot && expr->call.callee->field.object->kind == NODE_IDENT) {
-                Symbol *s = scope_lookup(ctx->checker->global_scope,
-                    expr->call.callee->field.object->ident.name,
-                    (uint32_t)expr->call.callee->field.object->ident.name_len);
-                if (s) ot = s->type;
-            }
-            if (ot) {
-                Type *ot_eff = type_unwrap_distinct(ot);
-                if (ot_eff->kind == TYPE_POOL || ot_eff->kind == TYPE_SLAB ||
-                    ot_eff->kind == TYPE_RING || ot_eff->kind == TYPE_ARENA ||
-                    ot_eff->kind == TYPE_STRUCT /* Task.new/delete */)
-                    call_is_builtin = true;
-            }
-        }
-
-        /* Universal alloc(T,n) / free(slice): ident-callee builtins. alloc(T,n)
-         * carries a type-name arg[0] that must NOT be decomposed; free(slice) is
-         * emitted inline. Route both through IR_CALL with expr. Gated on the
-         * result/arg type so a cinclude free(ptr) (pointer, not slice) is never
-         * hijacked. See docs/universal_alloc.md. */
-        if (!call_is_builtin && expr->call.callee &&
-            expr->call.callee->kind == NODE_IDENT) {
-            const char *cn = expr->call.callee->ident.name;
-            uint32_t cl = (uint32_t)expr->call.callee->ident.name_len;
-            if (cl == 5 && memcmp(cn, "alloc", 5) == 0 &&
-                expr->call.arg_count == 2 &&
-                expr->call.args[0]->kind == NODE_IDENT) {
-                Type *art = checker_get_type(ctx->checker, expr);
-                if (art && type_dispatch_kind(art) == TYPE_OPTIONAL)
-                    call_is_builtin = true;
-            } else if (cl == 4 && memcmp(cn, "free", 4) == 0 &&
-                       expr->call.arg_count == 1) {
-                Type *fat = checker_get_type(ctx->checker, expr->call.args[0]);
-                if (fat && type_dispatch_kind(fat) == TYPE_SLICE)
-                    call_is_builtin = true;
-            }
-        }
+        bool call_is_builtin = call_bypasses_arg_lowering(ctx, expr);
 
         /* Decompose arguments to locals (skip for builtins — type-name args) */
         int *arg_locals = NULL;
@@ -1939,10 +1942,36 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     Node *inner = orelse_node->orelse.expr;
     rewrite_idents(ctx, inner);
     pre_lower_orelse(ctx, &inner, line);
-    IRInst assign_tmp = make_inst(IR_ASSIGN, line);
-    assign_tmp.dest_local = tmp_id;
-    assign_tmp.expr = inner;
-    emit_inst(ctx, assign_tmp);
+    /* BUG-944: an ORDINARY call must go through lower_expr, not the raw-AST
+     * passthrough. The passthrough exists for BUILTINS (their arguments may be a
+     * bare type name), and the emitter's raw-AST argument loop applies NO
+     * coercion at all — while the decomposed path applies four: the T -> ?T
+     * optional wrap, array -> slice, slice -> pointer, and the null form. So
+     * `f(5) orelse 0` where f takes `?u32` emitted `f(5)` and GCC refused
+     * ("incompatible type for argument 1"), and `f(arr) orelse 0` where f takes
+     * `[*]u8` did the same — both build correctly one line earlier as
+     * `?u32 r = f(5);`. Measured: the coercion set differed by CONTEXT, not by
+     * the call.
+     *
+     * Routing rather than duplicating the four coercions into the raw-AST loop is
+     * deliberate: it is the ONE-query shape this codebase prefers, and it makes an
+     * ordinary call in an orelse subject inherit every future coercion too. The
+     * builtin case keeps the passthrough, which is the only reason it exists. */
+    int inner_local = -1;
+    if (inner->kind == NODE_CALL && !inner->call.is_comptime_resolved &&
+        !call_bypasses_arg_lowering(ctx, inner))
+        inner_local = lower_expr(ctx, inner);
+    if (inner_local >= 0) {
+        IRInst cp = make_inst(IR_COPY, line);
+        cp.dest_local = tmp_id;
+        cp.src1_local = inner_local;
+        emit_inst(ctx, cp);
+    } else {
+        IRInst assign_tmp = make_inst(IR_ASSIGN, line);
+        assign_tmp.dest_local = tmp_id;
+        assign_tmp.expr = inner;
+        emit_inst(ctx, assign_tmp);
+    }
 
     /* Determine if fallback always terminates (return/break/continue/goto) */
     bool fallback_terminates = orelse_node->orelse.fallback_is_return ||

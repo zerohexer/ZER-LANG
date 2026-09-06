@@ -1,0 +1,34 @@
+// BUG-943: a value-optional GLOBAL initialised with its bare payload emitted
+// invalid C. emit_global_var's initializer branch had exactly ONE optional arm —
+// the null literal — and every other shape fell through to the scalar path:
+//
+//     ?u32 g = 5;   ->   _zer_opt_u32 g = 5;   ->   gcc: invalid initializer
+//
+// A valid ZER program that could not be BUILT. Measured on four shapes; only
+// `= null` worked, because only `= null` had an arm.
+//
+// PRE-FIX each of the four below is a GCC "invalid initializer"; the file does
+// not compile at all, so every return code here is unreachable.
+//
+// The payload is const-FOLDED when it folds, for the BUG-939 reason: a tree
+// needing _zer_shl emits a GCC statement expression, illegal at file scope. The
+// enum case does NOT fold and so exercises the emit_opt_wrap_value path instead —
+// both are covered here on purpose.
+
+enum E { a, b }
+
+?u32  g_val  = 5;
+?u32  g_null = null;
+?bool g_bool = true;
+?E    g_enum = E.b;
+?i64  g_neg  = -7;
+
+u32 main(){
+    if ((g_val orelse 0) != 5) { return 1; }
+    if ((g_null orelse 7) != 7) { return 2; }      // absent -> fallback
+    if (g_bool) |v| { if (!v) { return 3; } } else { return 4; }
+    if (g_enum) |v| { if (v != E.b) { return 5; } } else { return 6; }
+    i64 n = g_neg orelse 0;
+    if (n != -7) { return 7; }
+    return 0;
+}

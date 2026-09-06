@@ -1,0 +1,39 @@
+// BUG-944: the SUBJECT of an `orelse` was emitted as a raw AST passthrough, so a
+// call there never had its arguments decomposed — and the emitter's raw-AST
+// argument loop applies NO coercion, while the decomposed path applies four
+// (the T -> ?T optional wrap, its null form, array -> slice, slice -> pointer).
+//
+// So the coercion set differed by CONTEXT, not by the call:
+//
+//     ?u32 r = f(5);        // builds  — decomposed, wrapped
+//     return f(5) orelse 0; // GCC: "incompatible type for argument 1 of 'f'"
+//
+// PRE-FIX both `f(5) orelse` and `g(arr) orelse` fail to compile, so the file
+// does not build and every return code below is unreachable.
+//
+// This is the FIFTH raw-AST argument site; the other four were BUG-942. The fix
+// routes an ordinary call through lower_expr rather than copying the four
+// coercions into the raw-AST loop — the passthrough exists for BUILTINS, whose
+// arguments may be a bare type name, and they keep it.
+
+?u32 f(?u32 v){ return v; }
+?u32 g([*]u8 s){ u32 n = (u32)s.len; return n; }
+
+// a builtin in the same position must keep working — it still takes the
+// passthrough, which is the only reason the passthrough exists
+struct T { u32 v; }
+Slab(T) heap;
+
+u32 main(){
+    if ((f(5) orelse 0) != 5) { return 1; }        // T -> ?T wrap
+    if ((f(null) orelse 7) != 7) { return 2; }     // null -> ?T
+
+    u8[4] arr;
+    if ((g(arr) orelse 0) != 4) { return 3; }      // array -> slice
+
+    *T p = heap.alloc_ptr() orelse { return 4; };  // builtin subject, passthrough
+    p.v = 9;
+    if (p.v != 9) { return 5; }
+    heap.free_ptr(p);
+    return 0;
+}

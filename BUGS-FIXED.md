@@ -1427,6 +1427,35 @@ Tests: `tests/zer_fail/i64_literal_{above_max,below_min,over_range_sinks}.zer`,
 
 ---
 
+## Session 2026-09-06 — BUG-993: `@ptrtoint(&local)` laundered through a CALL escaped to a global (survey CLASS 10, from `vigilant-tesla-o51x9p`)
+
+Hand-applied from `2c0d4e2` (their BUG-914); the same commit's defer-body BANS (their
+BUG-913) are the answer the ledger rejected in favour of `ii7a90`'s lowering, and its enum
+guard (their BUG-915) is BUG-950, so it was not cherry-picked whole.
+
+```zer
+usize g;  usize idfn(usize x) { return x; }
+u32 main() { u32 l = 5; g = idfn(@ptrtoint(&l)); return 0; }   // was ACCEPTED
+usize leak() { u32 l = 5; return idfn(@ptrtoint(&l)); }          // was ACCEPTED
+```
+
+Every other spelling — `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a`,
+`g = m() orelse a` — is rejected. Two causes: the call-result escape sink is gated on
+`type_carries_data_pointer(result)`, false for `usize` though `@ptrtoint` exists precisely
+to make an address into one; and `expr_touches_local_derived` had an AUDIT-LOUD-exempted
+`default: return false` whose own comment said "false negative here = safety hole" —
+NODE_CALL landed there. Fixed with ONE query, `call_result_is_local_address_int`, at the
+assignment and return sinks, and the walker made exhaustive (NODE_CALL/SLICE/STRUCT_INIT/
+ASSIGN descend; the statement kinds are listed and baselined with the reason — an expression
+walker never sees them). Narrow by design: it keys on an ADDRESS-VALUED integer argument
+(`@ptrtoint`, or a Symbol that became local-derived through it), so `g_len = len_of(local_slice)`
+still compiles (`ptrtoint_call_boundary_ok`).
+
+Tests: `tests/zer_fail/ptrtoint_local_via_call_{global,alias,return}.zer`,
+`tests/zer/ptrtoint_call_boundary_ok.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

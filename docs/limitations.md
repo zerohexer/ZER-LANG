@@ -981,7 +981,12 @@ accepts.
 
 ---
 
-### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
+### ~~CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL~~ — **CLOSED 2026-09-06 as BUG-993, DO NOT REDO**
+
+> Hand-applied from `o51x9p` `2c0d4e2` (their BUG-914 only). One query
+> `call_result_is_local_address_int` at the assignment and return sinks; the
+> `expr_touches_local_derived` walker is exhaustive now. All 3 negatives reject,
+> `ptrtoint_call_boundary_ok` runs. Original:
 
     usize g = 0;
     usize idfn(usize x) { return x; }

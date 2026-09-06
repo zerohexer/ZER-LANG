@@ -1,0 +1,12 @@
+// expect-error: deadlock
+// The statement holds S's lock around the whole right-hand side, and f locks T
+// inside it — two different shared structs nested in ONE statement.
+shared struct S { u32 v; }
+shared struct T { u32 c; }
+S g;
+T t;
+u32 f() { t.c += 1; return 1; }
+u32 main() {
+    g.v = f();
+    return 0;
+}

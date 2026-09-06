@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: shared
+// expect-error: deadlock
 // BUG-789 (2026-08-12): the CALL CALLEE position was invisible to all five
 // shared-struct walkers. `g.cb(...)` reads the funcptr field `cb` out of shared
 // `g`, so this statement touches TWO shared structs and must trip the

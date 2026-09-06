@@ -105,3 +105,17 @@ checker.c:    Symbol *inline_buf[64];
 # already auto-guarded (guard_mark grows it into the arena by doubling — the
 # Rule #7 shape, not a cap). Same pattern as defer_bodies_inline right above it.
 ir_lower.c:    Node *guarded_inline[32];
+# 2026-09-05 (deadlock-rule relaxation): the statement's DIRECT shared-type set,
+# a sibling of the `Type *found[4];` scratch right above it in
+# check_block_lock_ordering. The collector stops at max_types and the only question
+# asked of this array is whether it is EMPTY (n_direct == 0 ⇒ the statement holds
+# no lock), so the bound cannot change the verdict.
+checker.c:            Type *direct[4];
+# BUG-997/998 (2026-09-06): the DIRECT and CALLEE-TRANSITIVE shared-type sets of one
+# statement, split out of the same 4-slot collector as `found[4]` above. Not a
+# silent-drop cap: the collector's `max_types` bounds them, and a statement whose
+# sets overflow four types has >= 2 distinct shared types, so the two-type deadlock
+# error (which needs only the first two of `found`) fires before the re-entry scan
+# could miss anything beyond the fourth slot.
+checker.c:        Type *direct[4];
+checker.c:            Type *callee_set[4];

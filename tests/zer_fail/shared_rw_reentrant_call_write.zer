@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: not re-entrant
+// BUG-998 (2026-09-06): the statement holds S's WRITE lock (`g.v = ...`) and calls
+// f, which takes S's write lock again on the SAME thread. pthread rwlock is not
+// re-entrant: glibc returns EDEADLK (the emitted C ignores it), f then writes
+// UNLOCKED, and f's unlock releases the CALLER's lock — measured on the pre-fix
+// build: exit 0, a silent unlocked write plus a corrupted lock. A plain `shared`
+// struct is a recursive mutex and is fine (tests/zer/shared_mutex_reentrant_call_ok).
+shared(rw) struct S { u32 v; }
+S g;
+u32 f() { g.v = 2; return 1; }
+u32 main() { g.v = f(); return 0; }

@@ -3632,7 +3632,20 @@ u32 new_count = @atomic_add_fetch(&counter, 1);  // returns counter + 1
 Interrupt-disabled block. Disables interrupts on entry, re-enables on exit.
 Per-architecture interrupt disable/enable.
 
-`return`, `break`, `continue`, and `goto` are **banned** inside `@critical` blocks — jumping out would skip the interrupt re-enable, leaving the system with interrupts permanently disabled.
+`return`, `break`, `continue`, and `goto` are **banned** inside `@critical` blocks — jumping out would skip the interrupt re-enable, leaving the system with interrupts permanently disabled. A `break` or `continue` whose target loop is itself INSIDE the block leaves only that loop, not the block, and is allowed (since 2026-09-05; the same holds for a loop inside a `defer` body or an `@once` body):
+
+```zer
+u32 g;
+u32 main() {
+    @critical {
+        for (u32 i = 0; i < 10; i += 1) {
+            if (i == 4) { break; }      // OK — exits the loop, still inside @critical
+            g += 1;
+        }
+    }
+    return 0;
+}
+```
 
 `yield`, `await`, and `spawn` are also **banned** inside `@critical` — both directly and transitively (calling a function that yields/spawns is also rejected). Yield/await would suspend with interrupts disabled (system hang). Spawn would create a thread with interrupts disabled (hardware-unsafe).
 
@@ -5022,6 +5035,28 @@ cfg.threshold = 100;       // auto write lock (exclusive)
 u32 t = cfg.threshold;     // auto read lock (multiple readers OK)
 ```
 
+A reader-writer lock is **not re-entrant**. A statement that accesses a
+`shared(rw)` struct directly holds its lock for the whole statement, so a
+function it calls in that same statement must not touch the same struct
+(directly or transitively) — that is a compile error (since 2026-09-06). A
+nested write lock on the same thread either hangs (writer waiting on its own
+read lock) or, under glibc, is refused with `EDEADLK` and the callee then
+writes unlocked. Move the call into its own statement. A plain `shared` struct
+uses a recursive mutex, so the same shape is fine there.
+
+<!-- audit: expect-error: not re-entrant -->
+```zer
+shared(rw) struct S { u32 v; }
+S g;
+u32 f() { g.v = 2; return 1; }
+u32 main() {
+    g.v = f();             // COMPILE ERROR — S locked here and again inside f
+    u32 r = f();           // OK — no lock held around the call
+    g.v = r;
+    return 0;
+}
+```
+
 ### spawn — Thread Creation
 ```zer
 // Fire-and-forget (only shared ptr or value args):
@@ -5308,6 +5343,25 @@ a.x = b.y;                 // COMPILE ERROR — one statement accesses both A an
 ```
 
 Cross-statement ordering is safe because the emitter does lock→op→unlock per statement group — no two different shared types are ever locked simultaneously.
+
+A call is checked transitively — the callee's shared accesses count as the statement's —
+but only when the statement itself holds a lock, i.e. accesses a shared struct
+directly (since 2026-09-05). A bare call holds nothing, so the callee's own
+per-statement locks cannot nest:
+
+```zer
+shared struct S { u32 v; }
+shared struct T { u32 c; }
+S g;
+T t;
+u32 f() { t.c += 1; u32 x = g.v; return x; }
+u32 main() {
+    u32 r = f();               // OK — no lock held around the call
+    return r;
+}
+```
+
+`g.v = f();` — S held around f's lock of T — is still rejected.
 
 ---
 

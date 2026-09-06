@@ -321,6 +321,24 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 
 ---
 
+## OPEN — LOW (liveness) — the two-rw-types read-only exemption ignores what the CALLEE writes
+
+BUG-500 skips the same-statement two-lock error when both types are `shared(rw)` and the
+statement is READ-ONLY — judged from the statement's SYNTAX (a var-decl, or an expression
+statement that is not an assignment). A callee's writes are invisible to that test:
+
+    shared(rw) struct S { u32 v; }   shared(rw) struct T { u32 w; }
+    u32 f() { t.w = 2; return 1; }
+    u32 main() { u32 r = g.v + f(); return 0; }   // accepted: rd(S) held, wr(T) inside f
+
+With a mirror-image statement on another thread (`t.w = h()` where `h` reads `g`) this is
+an ABBA deadlock: rd(S)+wr(T) against wr(T)+rd(S). It is a HANG, not a memory-safety hole
+(no unlocked access), so it sits on the documented liveness floor — recorded because the rule
+CLAIMS to reject same-statement two-lock shapes and this one slips it. Fix sketch: carry a
+write bit per type id in `FuncSharedTypes` (`fsc_add_type_id(fsc, id, is_write)`) and apply
+the exemption only when the direct access AND every transitive access are reads. Found while
+building BUG-998 (the same-type rw re-entry rule), which is the SAFETY half and is closed.
+
 ## OPEN — residuals recorded by the 2026-09-04 audit (BUG-946..919 fixed; these were NOT)
 
 Each was measured on main during that audit. None is an accept-unsafe hole that is SILENT on

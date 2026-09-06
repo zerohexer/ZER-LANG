@@ -1486,6 +1486,97 @@ Tests: `tests/zer/autoguard_before_shared_lock.zer` (133 → 0), `autoguard_fire
 `autoguard_struct_return_zero`, `autoguard_optional_return_none`, `autoguard_async_early_exit`,
 `tests/zer_trap/autoguard_in_critical_traps.zer`; every existing auto-guard test unchanged.
 
+### BUG-995 — defer bodies are lowered into the IR at every fire site; the raw-AST defer emitter and scanner are gone
+A defer body used to travel as raw AST: pushed by `IR_DEFER_PUSH`, snapshotted onto each
+`IR_DEFER_FIRE`, emitted by a SECOND statement emitter (`emit_defer_stmt`) and analysed by a
+SECOND handle analyzer (`ir_defer_scan_frees/uses` + the C3 return-block pass). Every safety
+rule had to be re-implemented for defer bodies, and several were not — each measured with NO
+diagnostic on the pre-fix build:
+- `if (c) { free(h); } defer free(h);` — MAYBE_FREED silently promoted to FREED (double free
+  on the `c` path);
+- an unprovable index in a defer-body VAR-DECL INIT / FOR-INIT / WHILE-COND — "auto-guard
+  inserted" warning, raw `arr[i]` emitted (the three siblings of BUG-936, now trap 133);
+- shared-struct reads in a defer-body `while`/`if`/`for` CONDITION — no mutex;
+- `switch` / `do-while` / `@critical` / `@once` inside a defer body — runtime trap
+  "compiler bug: unsupported stmt kind in defer" on VALID code;
+- the body's own `u32 z` rebound to a same-named suffixed outer local; a 31-level scanner cap;
+- and the scanner applied EVERY defer's frees to EVERY return regardless of reachability, so
+  a `defer free(t)` under an untaken `if` was reported as freed on the path that skipped it —
+  `tests/zer/defer_deep_nesting_free_seen.zer` was that leak and is now
+  `tests/zer_fail/defer_under_untaken_if_leaks.zer`.
+
+Now `lower_defer_bodies` lowers a fresh deep clone (`ast_clone`, exhaustive over NodeKind; the
+clone hook mirrors typemap / proven / auto-guard marks) of every live body, LIFO, through
+`lower_stmt` at each fire; PUSH/FIRE are markers. Registration-time ident binding plus
+registration-scope hiding of deeper locals at the fire (`defer_depths`); the F2 armed flag and
+the cleanup-label guard are IR branches tagged `defer_gate` whose skip edge zercheck_ir drops at
+merges, with a same-registration re-fire (`defer_origin` / `freed_by_origin`) idempotent. Deleted
+from the emitter: the defer stack, `emit_defer_stmt`, `emit_defers*`, `emit_auto_guards`,
+`emit_safety_early_return`, `guard_traps` / `noreturn_scope_depth` / `cur_ir_func`; from
+zercheck_ir: the defer scanners, `ir_fire_has_work_after`, `ir_defer_instance_id`,
+`freed_defer_id`. Main's BUG-937 saturation (`ir_saturate_free_site` at block tagging) was kept
+over the branch's per-free `ir_note_free_site` — one rule, one implementation. Lifted: the
+value/block `orelse` ban inside a defer body (its reason was the raw emitter). `@cstr` overflow
+now TRAPS on the AST path as it already did on the IR path (it used to early-return there).
+`tools/emit_audit.sh` gains a REQUIRED sample table (`defer_body_shared_cond_locked` needs 4
+locks; 2 pre-fix). From `vigilant-tesla-ii7a90` (their BUG-920).
+
+Tests: `tests/zer/defer_body_binds_at_registration.zer`, `defer_body_critical_once`,
+`defer_body_own_decl_not_rebound`, `defer_body_shared_cond_locked`, `defer_body_switch_do_while`,
+`defer_nested_32_levels_ok`, `defer_orelse_value_ok`; `tests/zer_fail/defer_frees_maybe_freed_handle.zer`,
+`defer_frees_maybe_freed_pool_handle`, `defer_under_untaken_if_leaks`;
+`tests/zer_trap/defer_{vardecl,for_init,while_cond}_index_guard_traps.zer`.
+
+### BUG-996 — `break`/`continue` of a loop nested INSIDE a defer body / `@critical` / `@once` was banned
+Over-rejection. The ban keyed on "inside a defer / @critical / @once" alone, so a `for` loop
+inside a defer body could not `break` out of ITSELF — though that leaves the loop, not the
+cleanup. `Checker.loop_depth` plus the loop depth at which the innermost such body began
+(`defer_loop_base` / `critical_loop_base` / `once_loop_base`) give `eff_defer_depth_for_jump` /
+`eff_critical_depth_for_jump` / `jump_leaves_once` — the depths a jump would actually LEAVE —
+and the VST-verified context predicates receive those (unchanged themselves). A `break` of a
+loop that ENCLOSES the block still leaves it and stays rejected (`tests/zer_fail/critical_break.zer`,
+`orelse_break_in_critical.zer`, `once_control_flow.zer` all still fire for their stated reason).
+Enabled by BUG-995 (a loop inside a defer body lowers like any other loop). Verified to REJECT
+on the pre-fix build. From `vigilant-tesla-ii7a90`. Tests: `tests/zer/defer_body_inner_loop_break_continue.zer`,
+`critical_inner_loop_break_continue.zer`.
+
+### BUG-997 — the same-statement deadlock rule rejected a bare call whose callee touches two shared structs
+Over-rejection. `u32 r = f();` was rejected when `f` touches two shared structs SEQUENTIALLY (in
+separate statements of its own), because the rule merged the callee's transitive shared types
+into every calling statement. A statement with no DIRECT shared access takes no lock
+(`find_shared_root_in_stmt_ir` locks only a direct root), so nothing can nest around the call;
+the callee's own statements are checked when its block is. `check_block_lock_ordering` now
+recomputes the statement's DIRECT set (`shared_collect_direct_only`) and skips the two-type
+error when it is empty. `g.v = f();` — S held around f's lock of T — stays rejected
+(`tests/zer_fail/deadlock_call_under_lock.zer`); all existing deadlock negatives unchanged and
+verified to fire for their reason. From `vigilant-tesla-ii7a90`. Test:
+`tests/zer/deadlock_rule_bare_call_ok.zer`.
+
+### BUG-998 — a `shared(rw)` struct locked by a statement AND by a function that statement calls: unlocked write / hang
+Found while re-deriving BUG-997's soundness argument ("what if the callee touches the SAME
+struct the statement holds?"). The two-type rule dedups by `type_id`, so `g.v = f()` with `f`
+touching `g` collapsed to ONE type and was never examined. For a plain `shared` struct that is
+fine — the emitted mutex is RECURSIVE. `shared(rw)` is a pthread rwlock, which is NOT
+re-entrant, measured on the pre-fix build:
+- statement holds the WRITE lock, callee takes it again → glibc returns `EDEADLK`, the emitted
+  C ignores the return, the callee WRITES UNLOCKED, and the callee's `unlock` releases the
+  CALLER's lock (exit 0, a silent unlocked write plus a corrupted rwlock);
+- statement holds the READ lock, callee takes the WRITE lock → HANG (timeout 124).
+
+Fix: a second collector mode `shared_collect_callee_only` (the complement of BUG-997's
+direct-only mode — the direct-add site is ONE place, the NODE_FIELD arm), and
+`check_block_lock_ordering` rejects any `shared(rw)` type present in BOTH the statement's
+direct set and its callee-transitive set. Read-then-read re-entry is POSIX-legal but the callee
+summary carries no write bit, so every same-type re-entry through a call is rejected; corpus
+cost measured ZERO (17 `shared(rw)` files, none newly rejected). The callee set is transitive
+(two-hop test) and the direct access may be through a `*S` pointer (pointer test).
+Residual (liveness only, recorded in limitations.md): BUG-500's "both rw and read-only"
+exemption judges read-only from the statement's SYNTAX, so `u32 r = g.v + f()` with `f` WRITING
+a second rw struct is still accepted (an ABBA hang with a mirror-image statement elsewhere).
+
+Tests: `tests/zer_fail/shared_rw_reentrant_call_write.zer`, `_read_then_write`, `_two_hop`,
+`_via_pointer`; positive `tests/zer/shared_mutex_reentrant_call_ok.zer` (recursive mutex, value-checked).
+
 ---
 
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else

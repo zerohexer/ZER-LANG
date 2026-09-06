@@ -613,114 +613,33 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
 
 /* Walk expression tree, emit auto-guard if-return statements for unproven NODE_INDEX.
  * Called BEFORE emit_expr for the containing statement. */
+/* BUG-955 (refactor M): the DESCENT moved to checker_walk_guard_sites, so the
+ * emitter and the IR lowering find guard sites with ONE walker instead of each
+ * carrying a copy. This is now only the C rendering of a site.
+ *
+ * Byte-for-byte the same output as the inline version it replaces — the site order
+ * (an access's own guard before its subexpressions, object before index) is part of
+ * the walker's contract for exactly that reason, and the whole 587-file corpus was
+ * diffed to confirm nothing moved. */
+static void emit_one_guard(void *ud, const ZerGuardSite *site) {
+    Emitter *e = (Emitter *)ud;
+    emit_indent(e);
+    if (site->freed_idx) {
+        emit(e, "if ((");
+        emit_expr(e, site->index_expr);
+        emit(e, ") == (");
+        emit_expr(e, site->freed_idx);
+        emit(e, ")) ");
+    } else {
+        emit(e, "if ((size_t)(");
+        emit_expr(e, site->index_expr);
+        emit(e, ") >= %lluu) ", (unsigned long long)site->array_size);
+    }
+    emit_safety_early_return(e, true);
+}
+
 static void emit_auto_guards(Emitter *e, Node *node) {
-    if (!node) return;
-    switch (node->kind) {
-    case NODE_INDEX: {
-        uint64_t ag_size = checker_auto_guard_size(e->checker, node);
-        if (ag_size > 0) {
-            emit_indent(e);
-            emit(e, "if ((size_t)(");
-            emit_expr(e, node->index_expr.index);
-            emit(e, ") >= %lluu) ", (unsigned long long)ag_size);
-            emit_safety_early_return(e, true);
-        }
-        emit_auto_guards(e, node->index_expr.object);
-        emit_auto_guards(e, node->index_expr.index);
-        break;
-    }
-    case NODE_FIELD:
-        /* UAF auto-guard: if handle array element may have been freed at dynamic index,
-         * emit if (use_idx == freed_idx) { return <zero>; } */
-        if (checker_auto_guard_size(e->checker, node) == UINT64_MAX &&
-            node->field.object->kind == NODE_INDEX &&
-            node->field.object->index_expr.object->kind == NODE_IDENT) {
-            const char *aname = node->field.object->index_expr.object->ident.name;
-            uint32_t alen = (uint32_t)node->field.object->index_expr.object->ident.name_len;
-            Checker *ck = e->checker;
-            for (int dfi = 0; dfi < ck->dyn_freed_count; dfi++) {
-                struct DynFreed *df = &ck->dyn_freed[dfi];
-                if (df->array_name_len == alen &&
-                    memcmp(df->array_name, aname, alen) == 0 && !df->all_freed) {
-                    emit_indent(e);
-                    emit(e, "if ((");
-                    emit_expr(e, node->field.object->index_expr.index);
-                    emit(e, ") == (");
-                    emit_expr(e, df->freed_idx);
-                    emit(e, ")) ");
-                    emit_safety_early_return(e, true);
-                    break;
-                }
-            }
-        }
-        emit_auto_guards(e, node->field.object); break;
-    case NODE_ASSIGN:
-        emit_auto_guards(e, node->assign.target);
-        emit_auto_guards(e, node->assign.value); break;
-    case NODE_BINARY:
-        emit_auto_guards(e, node->binary.left);
-        emit_auto_guards(e, node->binary.right); break;
-    case NODE_UNARY:
-        emit_auto_guards(e, node->unary.operand); break;
-    case NODE_CALL:
-        emit_auto_guards(e, node->call.callee);
-        for (int i = 0; i < node->call.arg_count; i++)
-            emit_auto_guards(e, node->call.args[i]);
-        break;
-    case NODE_ORELSE:
-        emit_auto_guards(e, node->orelse.expr);
-        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
-            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
-            emit_auto_guards(e, node->orelse.fallback);
-        break;
-    case NODE_INTRINSIC:
-        for (int i = 0; i < node->intrinsic.arg_count; i++)
-            emit_auto_guards(e, node->intrinsic.args[i]);
-        break;
-    case NODE_TYPECAST:
-        emit_auto_guards(e, node->typecast.expr);
-        break;
-    case NODE_STRUCT_INIT:
-        for (int i = 0; i < node->struct_init.field_count; i++)
-            emit_auto_guards(e, node->struct_init.fields[i].value);
-        break;
-    case NODE_SLICE:
-        emit_auto_guards(e, node->slice.object);
-        emit_auto_guards(e, node->slice.start);
-        emit_auto_guards(e, node->slice.end);
-        break;
-    /* Audit-fix (2026-06-30): descend into spawn args and await condition.
-     * Previously NODE_SPAWN and NODE_AWAIT fell through as leaf no-ops, so an
-     * unproven array index inside `spawn worker(arr[i])` or `await arr[i] != 0`
-     * never had its checker-promised auto-guard emitted — the warning printed
-     * "auto-guard inserted" but the IR emitter wrote raw `g_arr[i]` without
-     * the if(i>=N)return; guard. Same BUG-595..612 class — silent OOB on
-     * baremetal, SIGSEGV-rescued on hosted. Pair-fix with the IR gate widening
-     * at emitter.c:11241 / :11380 adding IR_AWAIT and IR_NOP. */
-    case NODE_SPAWN:
-        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
-            emit_auto_guards(e, node->spawn_stmt.args[i]);
-        break;
-    case NODE_AWAIT:
-        emit_auto_guards(e, node->await_stmt.cond);
-        break;
-    /* Leaf nodes — no sub-expressions with array indices */
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
-    /* Statement/decl nodes — emit_auto_guards only called on expressions */
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
-    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
-    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
-    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
-    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
-    case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_YIELD: case NODE_STATIC_ASSERT:
-        break;
-    }
+    checker_walk_guard_sites(e->checker, node, emit_one_guard, e);
 }
 
 static Node *find_shared_root(Emitter *e, Node *expr); /* forward decl */

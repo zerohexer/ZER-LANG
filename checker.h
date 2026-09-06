@@ -392,6 +392,28 @@ bool checker_is_proven(Checker *c, Node *node);
 /* returns array_size if this node needs auto-guard, 0 if not */
 uint64_t checker_auto_guard_size(Checker *c, Node *node);
 
+/* BUG-955 (refactor M): ONE descent over an expression tree yielding every access
+ * that needs a safety guard, so the emitter and the IR lowering ask the same
+ * question instead of each implementing "find the guardable indexes". That
+ * duplication is the multi-site shape this codebase keeps paying for, and the
+ * descent has already been extended reactively once (spawn args and await
+ * conditions, 2026-06-30) after both copies missed the same shapes.
+ *
+ * It lives in the checker because the knowledge is the checker's: which nodes were
+ * registered for a guard, and which array a dynamic free poisoned. */
+typedef struct {
+    Node    *access;      /* the NODE_INDEX / NODE_FIELD needing the guard */
+    Node    *index_expr;  /* the index expression to test */
+    uint64_t array_size;  /* BOUNDS: guard is `index >= array_size` */
+    Node    *freed_idx;   /* UAF: guard is `index == freed_idx`; NULL for BOUNDS */
+} ZerGuardSite;
+
+typedef void (*ZerGuardFn)(void *ud, const ZerGuardSite *site);
+
+/* Visits sites in EMISSION ORDER: an access's own guard before its subexpressions,
+ * object before index. Callers depend on that order — changing it changes emitted C. */
+void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud);
+
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);
 

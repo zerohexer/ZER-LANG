@@ -554,6 +554,48 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-955: ONE walker finds the guard sites (refactor M, stage A)
+
+Preparation for lowering auto-guards into the IR. The descent that finds every access
+needing a safety guard moved out of `emit_auto_guards` into
+`checker_walk_guard_sites`, and the emitter became a thin consumer that only renders a
+site as C.
+
+The point is that the IR lowering needs the SAME descent. Copying it into
+`ir_lower.c` would be a second implementation of "find the guardable indexes" — the
+multi-site shape this codebase keeps paying for, and one that has already been extended
+reactively once: spawn arguments and await conditions were added in 2026-06-30 after
+both the descent and the op-kind gate missed the same shapes.
+
+It lives in the checker because the knowledge is the checker's — which nodes were
+registered for a guard, and which array a dynamic free poisoned. As a side effect the
+emitter no longer reaches into `Checker.dyn_freed` to build a UAF guard.
+
+### The oracle for a pure refactor is byte-identity, so that is what was checked
+
+Emitted C was diffed against the pre-change compiler for every file that compiles:
+**664 identical, 0 differing.** Site ORDER is what makes that possible and is now part
+of the walker's documented contract — an access emits its own guard before its
+subexpressions, object before index. Moving it would move emitted C.
+
+### The audit caught the relocation, correctly
+
+`audit_walker_fields.sh` flagged the new walker for naming statement kinds without
+descending them, and separately the 27 `emitter.c:emit_auto_guards` rows went stale.
+Both are the same relocation: the rows were compared accessor-by-accessor before being
+moved (identical sets, 27 for 27) rather than the new ones simply being added and the
+old ones left to rot. The justification is unchanged and is now written next to them —
+this is an EXPRESSION walker, every caller hands it an expression, and the statement
+kinds exist only so `-Werror=switch` keeps working.
+
+`make check` exit 0, nine gates, 1485.
+
+### Next
+
+Stage B adds the IR visitor: the same walker, a different consumer, emitting a branch
+to an early-exit block instead of C. `checker_mark_guard_lowered` lets the two coexist
+during migration, so unlike L's stage 2 this one is incrementally landable.
+
 ## Session 2026-09-07 — BUG-953: the auto-guard gate now FAILS CLOSED (refactor M)
 
 M's structural half. The op-kind gate deciding which instructions get auto-guards was

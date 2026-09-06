@@ -20507,6 +20507,116 @@ uint64_t checker_auto_guard_size(Checker *c, Node *node) {
     return 0;
 }
 
+/* BUG-955 (refactor M): see checker.h. The descent moved here verbatim from
+ * emit_auto_guards in emitter.c, which is now a thin consumer of it. Order is
+ * load-bearing: an access emits its OWN guard before its subexpressions, and
+ * object before index — emitted C changes if that moves. */
+void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud) {
+    if (!node) return;
+    switch (node->kind) {
+    case NODE_INDEX: {
+        uint64_t ag_size = checker_auto_guard_size(c, node);
+        if (ag_size > 0) {
+            ZerGuardSite site;
+            site.access = node;
+            site.index_expr = node->index_expr.index;
+            site.array_size = ag_size;
+            site.freed_idx = NULL;
+            fn(ud, &site);
+        }
+        checker_walk_guard_sites(c, node->index_expr.object, fn, ud);
+        checker_walk_guard_sites(c, node->index_expr.index, fn, ud);
+        break;
+    }
+    case NODE_FIELD:
+        /* UAF guard: a handle array element may have been freed at a dynamic
+         * index, so the guard tests `use_idx == freed_idx`. */
+        if (checker_auto_guard_size(c, node) == UINT64_MAX &&
+            node->field.object->kind == NODE_INDEX &&
+            node->field.object->index_expr.object->kind == NODE_IDENT) {
+            const char *aname = node->field.object->index_expr.object->ident.name;
+            uint32_t alen = (uint32_t)node->field.object->index_expr.object->ident.name_len;
+            for (int dfi = 0; dfi < c->dyn_freed_count; dfi++) {
+                struct DynFreed *df = &c->dyn_freed[dfi];
+                if (df->array_name_len == alen &&
+                    memcmp(df->array_name, aname, alen) == 0 && !df->all_freed) {
+                    ZerGuardSite site;
+                    site.access = node;
+                    site.index_expr = node->field.object->index_expr.index;
+                    site.array_size = 0;
+                    site.freed_idx = df->freed_idx;
+                    fn(ud, &site);
+                    break;
+                }
+            }
+        }
+        checker_walk_guard_sites(c, node->field.object, fn, ud); break;
+    case NODE_ASSIGN:
+        checker_walk_guard_sites(c, node->assign.target, fn, ud);
+        checker_walk_guard_sites(c, node->assign.value, fn, ud); break;
+    case NODE_BINARY:
+        checker_walk_guard_sites(c, node->binary.left, fn, ud);
+        checker_walk_guard_sites(c, node->binary.right, fn, ud); break;
+    case NODE_UNARY:
+        checker_walk_guard_sites(c, node->unary.operand, fn, ud); break;
+    case NODE_CALL:
+        checker_walk_guard_sites(c, node->call.callee, fn, ud);
+        for (int i = 0; i < node->call.arg_count; i++)
+            checker_walk_guard_sites(c, node->call.args[i], fn, ud);
+        break;
+    case NODE_ORELSE:
+        checker_walk_guard_sites(c, node->orelse.expr, fn, ud);
+        if (node->orelse.fallback && !node->orelse.fallback_is_return &&
+            !node->orelse.fallback_is_break && !node->orelse.fallback_is_continue)
+            checker_walk_guard_sites(c, node->orelse.fallback, fn, ud);
+        break;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            checker_walk_guard_sites(c, node->intrinsic.args[i], fn, ud);
+        break;
+    case NODE_TYPECAST:
+        checker_walk_guard_sites(c, node->typecast.expr, fn, ud);
+        break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            checker_walk_guard_sites(c, node->struct_init.fields[i].value, fn, ud);
+        break;
+    case NODE_SLICE:
+        checker_walk_guard_sites(c, node->slice.object, fn, ud);
+        checker_walk_guard_sites(c, node->slice.start, fn, ud);
+        checker_walk_guard_sites(c, node->slice.end, fn, ud);
+        break;
+    /* Audit-fix (2026-06-30): spawn args and await conditions are descended.
+     * They used to fall through as leaf no-ops, so an unproven index inside a
+     * spawn argument or an await condition never got the guard the checker had
+     * already promised — silent OOB on baremetal. */
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            checker_walk_guard_sites(c, node->spawn_stmt.args[i], fn, ud);
+        break;
+    case NODE_AWAIT:
+        checker_walk_guard_sites(c, node->await_stmt.cond, fn, ud);
+        break;
+    /* Leaves, and statement/declaration kinds this is never called on. No
+     * default: a new NodeKind must be classified, not silently skipped. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL: case NODE_VAR_DECL:
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
+        break;
+    }
+}
+
+
 /* ================================================================
  * INTERRUPT SAFETY — track globals shared between ISR and regular code
  * ================================================================ */

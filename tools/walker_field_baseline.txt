@@ -425,34 +425,6 @@ checker.c:vrp_invalidate_loop_body_writes:NODE_INTERRUPT:interrupt.body
 checker.c:vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args
 checker.c:vrp_invalidate_loop_body_writes:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
-# --- emitter.c: emit_auto_guards ---
-emitter.c:emit_auto_guards:NODE_ASM:asm_stmt.inputs
-emitter.c:emit_auto_guards:NODE_ASM:asm_stmt.outputs
-emitter.c:emit_auto_guards:NODE_BLOCK:block.stmts
-emitter.c:emit_auto_guards:NODE_CRITICAL:critical.body
-emitter.c:emit_auto_guards:NODE_DEFER:defer.body
-emitter.c:emit_auto_guards:NODE_DO_WHILE:while_stmt.body
-emitter.c:emit_auto_guards:NODE_DO_WHILE:while_stmt.cond
-emitter.c:emit_auto_guards:NODE_EXPR_STMT:expr_stmt.expr
-emitter.c:emit_auto_guards:NODE_FILE:file.decls
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.body
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.cond
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.init
-emitter.c:emit_auto_guards:NODE_FOR:for_stmt.step
-emitter.c:emit_auto_guards:NODE_FUNC_DECL:func_decl.body
-emitter.c:emit_auto_guards:NODE_GLOBAL_VAR:var_decl.init
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.cond
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.else_body
-emitter.c:emit_auto_guards:NODE_IF:if_stmt.then_body
-emitter.c:emit_auto_guards:NODE_INTERRUPT:interrupt.body
-emitter.c:emit_auto_guards:NODE_ONCE:once.body
-emitter.c:emit_auto_guards:NODE_RETURN:ret.expr
-emitter.c:emit_auto_guards:NODE_STATIC_ASSERT:static_assert_stmt.cond
-emitter.c:emit_auto_guards:NODE_SWITCH:switch_stmt.arms
-emitter.c:emit_auto_guards:NODE_SWITCH:switch_stmt.expr
-emitter.c:emit_auto_guards:NODE_VAR_DECL:var_decl.init
-emitter.c:emit_auto_guards:NODE_WHILE:while_stmt.body
-emitter.c:emit_auto_guards:NODE_WHILE:while_stmt.cond
 
 # --- emitter.c: expr_has_side_effects ---
 emitter.c:expr_has_side_effects:NODE_ASM:asm_stmt.inputs
@@ -837,3 +809,39 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
 zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
+
+# --- checker.c: checker_walk_guard_sites ---
+# BUG-955: this is the emit_auto_guards descent, MOVED from emitter.c so the
+# emitter and the IR lowering share one walker. Same 27 rows, same reason as
+# before the move: it is an EXPRESSION walker. Every caller hands it an
+# expression — an instruction's expr, a var-decl init, an if condition — and
+# the statement kinds are listed only so -Werror=switch keeps working. They
+# have nothing to descend because control never reaches them.
+
+checker.c:checker_walk_guard_sites:NODE_ASM:asm_stmt.inputs
+checker.c:checker_walk_guard_sites:NODE_ASM:asm_stmt.outputs
+checker.c:checker_walk_guard_sites:NODE_BLOCK:block.stmts
+checker.c:checker_walk_guard_sites:NODE_CRITICAL:critical.body
+checker.c:checker_walk_guard_sites:NODE_DEFER:defer.body
+checker.c:checker_walk_guard_sites:NODE_DO_WHILE:while_stmt.body
+checker.c:checker_walk_guard_sites:NODE_DO_WHILE:while_stmt.cond
+checker.c:checker_walk_guard_sites:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:checker_walk_guard_sites:NODE_FILE:file.decls
+checker.c:checker_walk_guard_sites:NODE_FOR:for_stmt.body
+checker.c:checker_walk_guard_sites:NODE_FOR:for_stmt.cond
+checker.c:checker_walk_guard_sites:NODE_FOR:for_stmt.init
+checker.c:checker_walk_guard_sites:NODE_FOR:for_stmt.step
+checker.c:checker_walk_guard_sites:NODE_FUNC_DECL:func_decl.body
+checker.c:checker_walk_guard_sites:NODE_GLOBAL_VAR:var_decl.init
+checker.c:checker_walk_guard_sites:NODE_IF:if_stmt.cond
+checker.c:checker_walk_guard_sites:NODE_IF:if_stmt.else_body
+checker.c:checker_walk_guard_sites:NODE_IF:if_stmt.then_body
+checker.c:checker_walk_guard_sites:NODE_INTERRUPT:interrupt.body
+checker.c:checker_walk_guard_sites:NODE_ONCE:once.body
+checker.c:checker_walk_guard_sites:NODE_RETURN:ret.expr
+checker.c:checker_walk_guard_sites:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:checker_walk_guard_sites:NODE_SWITCH:switch_stmt.arms
+checker.c:checker_walk_guard_sites:NODE_SWITCH:switch_stmt.expr
+checker.c:checker_walk_guard_sites:NODE_VAR_DECL:var_decl.init
+checker.c:checker_walk_guard_sites:NODE_WHILE:while_stmt.body
+checker.c:checker_walk_guard_sites:NODE_WHILE:while_stmt.cond

@@ -1240,6 +1240,43 @@ Tests: `tests/zer_fail/{multiview_assign_uaf,multiview_branch_join_uaf,struct_in
 
 ---
 
+## Session 2026-09-06 — BUG-983/984: `bool` is the third forged-tag carrier; three quiet AST-path fallthroughs (from `vigilant-tesla-1zukjq`)
+
+Cherry-pick of `57dee75` (their BUG-922/923). The emitter conflicts resolved as for BUG-976:
+the bool switch guard rides the same goto annotation as the union one (the enum stays on
+BUG-950's IR-level branch), and BUG-959's atomic-gate comment keeps their trailing-`else`
+observation.
+
+### BUG-983 — `bool` had BOTH exposures of a closed-value type, and its one door was open
+
+`bool` is a two-variant enum in everything but spelling — the checker REQUIRES a switch on
+one to be exhaustive — and it is a `uint8_t` with nothing downstream to normalise it. The
+door: `@bitcast(bool, 2)` made `if (b)` take the TRUE branch while
+`switch (b) { true => … false => … }` matched NEITHER arm. Two constructs reading one
+value and disagreeing, no diagnostic on either side. It is the only door, verified rather
+than assumed: `(bool)n` normalises (BUG-963) and `@truncate`/`@saturate` reject a bool
+target. The use site: a bool can also arrive out of domain with no conversion at all (a
+cinclude return, an MMIO read); the switch ran nothing and execution continued. Both closed
+by extending the existing mechanisms — bool is a carrier in `type_carries_enum_e` (so
+`@bitcast` through a struct/optional/array carrying a bool is guarded too), and the switch
+totality guard grew a bool arm beside the union one. Corpus cost: zero occurrences of
+`@bitcast(bool, …)`.
+
+### BUG-984 — three AST-path intrinsic fallthroughs that failed QUIETLY in front of BUG-767's loud one
+
+`@barrier_acq_rel` and `@barrier_dma` emitted a comment and a literal 0 — a memory fence
+replaced by nothing; seven atomic ops (xchg, nand, the five `*_fetch`) matched the gate and
+emitted the EMPTY STRING. Hardening (no reachable program was measured through the
+const-initialiser-only path), but all three now land on the diagnostic.
+
+Gate: `tools/sink_matrix.sh` gains a p19 block pinning the launder family at the UAF/free
+sink (verified non-vacuous on the branch: 5 of 6 cells mismatched pre-fix).
+
+Tests: `tests/zer_trap/{bool_bitcast_forge,bool_switch_foreign_value}.zer`,
+`tests/zer/enum_union_switch_totality_ok.zer` (extended).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

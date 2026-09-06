@@ -554,6 +554,77 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-956: bounds guards are now IR BRANCHES (refactor M, stage B)
+
+The architectural half of M. A bounds guard used to be spliced into the C text by the
+emitter — `if (idx >= N) { <defers>; return X; }`. It is now lowered as a real branch
+to an early-exit block, using the same `checker_walk_guard_sites` the emitter uses
+(BUG-955), so there is one descent and two consumers.
+
+**Measured: 78 of 112 guards across the 588-file corpus (69%) migrated** from C splices
+to IR branches. The remaining 34 are declined shapes and still use the emitter's guard.
+
+### Why this is better, not just different
+
+The early exit is now an ordinary IR block that fires defers, releases any inherited
+lock, and returns — which is what `NODE_RETURN` already does. Two things follow:
+
+- **It can return where the C version could only trap.** The C guard cannot release a
+  lock, so inside a held lock it degraded to `_zer_trap("cannot return without leaking
+  it")`. The IR guard is emitted BEFORE the statement's lock (BUG-952's ordering), so
+  no lock is held and the return is legal. `tests/zer_trap/guard_in_shared_lock_traps`
+  became `tests/zer/guard_before_shared_lock_ok`: same program, now runs cleanly.
+- **Using `IR_RETURN` inherits the emitter's special cases for free** — the async
+  termination sequence, `void main()` promotion, array-to-slice coercion.
+
+### DECLINING IS ALWAYS SAFE, and that is the design
+
+Anything not marked keeps the emitter's guard, so every restriction costs precision and
+never soundness. Currently declined: inside `@critical` (an early return there would
+skip the interrupt re-enable — the construct ZER hard-errors on when a user writes it),
+async functions, non-integer/bool returns, indexes that are not an ident or literal,
+the UAF form, and statement kinds beyond expression-statement / var-decl / return.
+
+`tests/zer_trap/guard_in_critical_traps` was ADDED so the trapping path stays pinned —
+converting the shared-lock test without replacing its coverage would have quietly
+dropped it.
+
+### Three bugs the suite found in my own work
+
+**A signed comparison — accept-unsafe.** I compared `idx >= N` in the index's own type;
+the emitter casts to `size_t` first. With `for (i32 i = start; i < 4; …)` and
+`start = -2`, `-2 >= 4` is false, no guard fires, and the read goes out of bounds.
+`vrp_for_signed_neg_init_guard` caught it. The cast is now emitted, with the reason
+recorded next to it.
+
+**AST mutation versus double lowering.** The first version rewrote the access to read
+the guard's temp, for single evaluation. That breaks when the AST is lowered TWICE,
+which in-process paths do (`zercheck_run`, then `emit_file`) — the exact hazard
+CLAUDE.md records as *"never call ir_lower_func twice on the same AST"*, and the same
+class that makes L's stage 2 hard. `test_firmware_patterns2` caught it. The mutation is
+gone: only side-effect-free indexes are guarded, so evaluating twice is harmless, and
+that is what the emitter already does today.
+
+**A file-static that never reset.** The "already lowered" set was a file-static, so node
+POINTERS leaked across compilations in a harness that compiles many programs in one
+process — and a stale hit would make the emitter skip a guard that was never lowered, a
+silent OOB. It is a Checker field now, cleared by `checker_init`'s memset.
+
+### Two audits fired, and neither was baselined away
+
+`walker_default_audit` rejected the `default:` in the statement switch — a new NodeKind
+would have been silently skipped — so every kind is enumerated. `audit_type_dispatch`
+flagged four `re->kind ==` reads; they use `type_dispatch_kind` now rather than a
+baseline row, consistent with the call made in BUG-943.
+
+`make check` exit 0, nine gates, 1485.
+
+### What remains
+
+The emitter's guard is still live for the declined shapes, so `emit_auto_guards` cannot
+be deleted yet. Widening it — `@critical` needs a trap-terminator rather than a return,
+async needs its termination shape — is what finishes M and unblocks L's stage 3.
+
 ## Session 2026-09-07 — BUG-955: ONE walker finds the guard sites (refactor M, stage A)
 
 Preparation for lowering auto-guards into the IR. The descent that finds every access

@@ -148,6 +148,15 @@ typedef struct {
         uint64_t array_size; /* 0 = slice (use .len at runtime) */
     } *auto_guards;
     int auto_guard_count;
+    /* BUG-956: accesses whose guard is now an IR branch, so the emitter must not
+     * emit a second C-level one. A Checker FIELD, deliberately not a file-static:
+     * test harnesses compile many programs in ONE process, and a static list would
+     * carry node POINTERS across compilations where the arena reuses addresses —
+     * a stale hit would make the emitter skip a guard that was never lowered, i.e.
+     * a silent OOB. test_firmware_patterns2 caught exactly that. */
+    Node **guard_lowered;
+    int guard_lowered_count;
+    int guard_lowered_capacity;
     int auto_guard_capacity;
 
     /* Dynamic-index freed handles: tracks pool.free(arr[variable]) for UAF auto-guard.
@@ -413,6 +422,13 @@ typedef void (*ZerGuardFn)(void *ud, const ZerGuardSite *site);
 /* Visits sites in EMISSION ORDER: an access's own guard before its subexpressions,
  * object before index. Callers depend on that order — changing it changes emitted C. */
 void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud);
+
+/* BUG-956 (refactor M, stage B): record that this access's guard is now a real IR
+ * branch, so the emitter's C-level guard is not emitted a SECOND time for it.
+ * checker_auto_guard_size returns 0 for a marked node. Marking happens only where
+ * the branch is actually emitted, so the two paths can coexist during migration —
+ * anything unmarked keeps the emitter's guard, which is why declining is safe. */
+void checker_mark_guard_lowered(Checker *c, Node *node);
 
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);

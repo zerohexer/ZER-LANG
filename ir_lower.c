@@ -84,6 +84,12 @@ typedef struct {
      * (original depth < active_guard_below) emit `if (!flag) {...}` so the goto
      * path (flag=1) doesn't double-fire and the fall-through path (flag=0) fires
      * at the return, after eval. -1 = no active guard. */
+    /* BUG-956 (refactor M, stage B): >0 while lowering a @critical body. A bounds
+     * guard's early RETURN must never leave a @critical block — it would skip the
+     * interrupt re-enable, which is the very construct ZER hard-errors on when a
+     * user writes it. Inside one, the guard declines and the emitter's trapping
+     * form is used instead. */
+    int critical_depth;
     int active_guard_flag;
     int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
@@ -1043,6 +1049,168 @@ static void emit_defer_pop_only(LowerCtx *ctx, int base, int line) {
         emit_inst(ctx, fire);
     }
 }
+
+/* BUG-956 (refactor M, stage B): lower a bounds guard as a REAL IR BRANCH.
+ *
+ * The emitter's version splices `if (idx >= N) { <defers>; return X; }` into the C
+ * text. Two things follow from it not being in the IR: zercheck_ir cannot see the
+ * early exit at all, and the exit cannot release a lock — so inside a held lock,
+ * a @critical block or a defer body it degrades to a trap ("cannot return without
+ * leaking it"). Lowered as IR, the exit is an ordinary block that fires defers,
+ * releases any inherited lock, and returns, exactly as NODE_RETURN already does.
+ *
+ * Using IR_RETURN rather than open-coding the return is what makes this small: the
+ * emitter's IR_RETURN already handles the async termination sequence, `void main()`
+ * promotion, and array-to-slice coercion.
+ *
+ * DECLINING IS ALWAYS SAFE — the emitter's guard still fires for any site not
+ * marked, so every restriction below costs precision and never soundness. */
+typedef struct { LowerCtx *ctx; int line; } GuardLowerCtx;
+
+static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
+    GuardLowerCtx *g = (GuardLowerCtx *)ud;
+    LowerCtx *ctx = g->ctx;
+
+    /* A return here would skip the interrupt re-enable — the construct ZER
+     * hard-errors on when a user writes it. Leave it to the emitter, which traps. */
+    if (ctx->critical_depth > 0) return;
+    if (site->freed_idx) return;              /* UAF form not lowered yet */
+    if (site->array_size == 0) return;
+
+    /* Only shapes whose zero value is a plain literal. A struct or slice return
+     * needs the emitter's emit_zero_value. */
+    /* IRFunc.return_type may hold the FUNCTION type rather than the return type —
+     * ir_lower_func passes whatever the typemap had, and its own comment says so.
+     * Unwrap one level when that is what we got. */
+    Type *rty = ctx->func->return_type;
+    Type *re = rty ? type_unwrap_distinct(rty) : NULL;
+    if (re && type_dispatch_kind(re) == TYPE_FUNC_PTR) {
+        rty = re->func_ptr.ret;
+        re = rty ? type_unwrap_distinct(rty) : NULL;
+    }
+    bool void_ret = (!re || type_dispatch_kind(re) == TYPE_VOID);
+    /* Only shapes whose zero value is a plain literal. A struct or slice return
+     * needs the emitter's emit_zero_value, so decline and let it guard. */
+    if (!void_ret && !(type_is_integer(re) || type_dispatch_kind(re) == TYPE_BOOL)) return;
+    if (ctx->func->is_async) return;   /* async return shape not handled yet */
+
+    /* NO AST MUTATION. The first version rewrote the access to read the guard's
+     * temp, for single evaluation — and that broke the moment the AST was lowered
+     * TWICE, which some in-process paths do (zercheck_run then emit_file). It is
+     * the hazard CLAUDE.md records as "never call ir_lower_func twice on the same
+     * AST", and test_firmware_patterns2 caught it.
+     *
+     * Instead, only guard an index that is SIDE-EFFECT FREE, so evaluating it in
+     * the guard and again in the access is harmless. An ident or an integer
+     * literal qualifies; anything else declines and the emitter guards it, which
+     * is exactly what happens today. Nearly every auto-guard is on a plain ident
+     * (`arr[i]`), so this keeps almost all of the coverage and none of the risk. */
+    Node *ix = site->index_expr;
+    if (!ix || (ix->kind != NODE_IDENT && ix->kind != NODE_INT_LIT)) return;
+
+    int idx = lower_expr(ctx, ix);
+    if (idx < 0) return;
+
+    /* Compare UNSIGNED, exactly as the emitter's `if ((size_t)(idx) >= N)` does.
+     * A signed compare would let a NEGATIVE index through — `for (i32 i = start;
+     * i < 4; ...)` with start = -2 gives `-2 >= 4` false, no guard, and a stack
+     * OOB read. tests/zer/vrp_for_signed_neg_init_guard caught precisely that,
+     * which is why the cast is emitted rather than assumed unnecessary. */
+    int idxu = create_temp(ctx, ty_u64, g->line);
+    IRInst cast = make_inst(IR_CAST, g->line);
+    cast.dest_local = idxu;
+    cast.src1_local = idx;
+    cast.cast_type = ty_u64;
+    emit_3ac(ctx, cast);
+    idx = idxu;
+
+    int lim = create_temp(ctx, ty_u64, g->line);
+    IRInst lit = make_inst(IR_LITERAL, g->line);
+    lit.dest_local = lim;
+    lit.literal_int = (int64_t)site->array_size;
+    lit.literal_kind = 0;
+    emit_3ac(ctx, lit);
+
+    int oob = create_temp(ctx, ty_bool, g->line);
+    IRInst cmp = make_inst(IR_BINOP, g->line);
+    cmp.dest_local = oob;
+    cmp.src1_local = idx;
+    cmp.src2_local = lim;
+    cmp.op_token = TOK_GTEQ;
+    emit_3ac(ctx, cmp);
+
+    int bb_exit = ir_add_block(ctx->func, ctx->arena);
+    int bb_ok   = ir_add_block(ctx->func, ctx->arena);
+    IRInst br = make_inst(IR_BRANCH, g->line);
+    br.cond_local  = oob;
+    br.true_block  = bb_exit;
+    br.false_block = bb_ok;
+    emit_inst(ctx, br);
+
+    ctx->current_block = bb_exit;
+    emit_defer_fire(ctx, g->line);
+    if (ctx->current_stmt_shared_root) {
+        IRInst unlock = make_inst(IR_UNLOCK, g->line);
+        unlock.expr = ctx->current_stmt_shared_root;
+        emit_inst(ctx, unlock);
+    }
+    IRInst ret = make_inst(IR_RETURN, g->line);
+    if (!void_ret) {
+        int z = create_temp(ctx, rty, g->line);
+        IRInst zl = make_inst(IR_LITERAL, g->line);
+        zl.dest_local = z;
+        zl.literal_int = 0;
+        zl.literal_kind = (type_dispatch_kind(re) == TYPE_BOOL) ? 3 : 0;
+        emit_3ac(ctx, zl);
+        ret.src1_local = z;
+    }
+    emit_inst(ctx, ret);
+
+    ctx->current_block = bb_ok;
+    checker_mark_guard_lowered(ctx->checker, site->access);
+}
+
+/* Lower the guards for one statement, BEFORE its lock and its instructions —
+ * before the lock because BUG-952 established the guard must precede it, and the
+ * early return is only legal while no lock is held. Only the statement's own
+ * expressions are walked; nested statements get their own turn. */
+static void lower_stmt_guards(LowerCtx *ctx, Node *stmt) {
+    if (!stmt) return;
+    GuardLowerCtx g; g.ctx = ctx; g.line = stmt->loc.line;
+    Node *e = NULL;
+    /* No default: a new NodeKind must be classified here, not silently skipped.
+     * Everything not yet migrated is listed as an explicit no-op and keeps the
+     * emitter's guard, which is safe — declining always is. */
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: e = stmt->expr_stmt.expr; break;
+    case NODE_VAR_DECL:  e = stmt->var_decl.init;  break;
+    case NODE_RETURN:    e = stmt->ret.expr;       break;
+
+    /* NOT migrated yet. Conditions and for-clauses are lowered on paths of their
+     * own (a for-init has its own lock site), and the nested BODIES of these get
+     * their own turn through the block loop, so walking them here would
+     * double-guard. Left to the emitter until each is done deliberately. */
+    case NODE_IF: case NODE_WHILE: case NODE_DO_WHILE: case NODE_FOR:
+    case NODE_SWITCH: case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_AWAIT: case NODE_YIELD:
+    case NODE_ASM: case NODE_GOTO: case NODE_LABEL: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_STATIC_ASSERT:
+    /* Declarations and expression kinds: never a statement in a block body. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
+    }
+    if (e) checker_walk_guard_sites(ctx->checker, e, lower_one_guard_site, &g);
+}
+
 
 /* ================================================================
  * Expression ident rewriting — three-address-code foundation
@@ -2212,6 +2380,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             Node *shared_root;
             SharedRootVec shared_extra; srv_init(&shared_extra);
             Node *stmt = node->block.stmts[i];
+            /* BUG-956: bounds guards BEFORE the lock. BUG-952 established the
+             * ordering; here it also makes the early return legal, because no
+             * lock is held yet at this point. */
+            lower_stmt_guards(ctx, stmt);
             emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
             /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
              * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
@@ -3859,7 +4031,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_CRITICAL: {
         IRInst begin = make_inst(IR_CRITICAL_BEGIN, node->loc.line);
         emit_inst(ctx, begin);
+        ctx->critical_depth++;              /* BUG-956 */
         lower_stmt(ctx, node->critical.body);
+        ctx->critical_depth--;
         IRInst end = make_inst(IR_CRITICAL_END, node->loc.line);
         emit_inst(ctx, end);
         break;

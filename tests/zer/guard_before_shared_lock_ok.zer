@@ -1,0 +1,47 @@
+// BUG-956 — was tests/zer_trap/guard_in_shared_lock_traps.zer. The expectation
+// changed from "traps" to "runs cleanly", and the reason is that the DEFECT the trap
+// worked around is now impossible for this shape, not that the test was relaxed.
+//
+// History. BUG-805 (2026-08-17) found the bounds auto-guard emitting
+// `<fire defers>; return <zero>;` while a shared-struct lock was HELD — between
+// pthread_mutex_lock and its unlock — so the mutex was never released and this
+// program HUNG FOREVER (exit 124), the join waiting on a worker that could never
+// take the lock. The fix available at the time was to TRAP instead: safe, but it
+// aborts a program that did nothing wrong except index out of range.
+//
+// BUG-952 then put the guard BEFORE the lock, and BUG-956 lowered it into the IR as
+// a real branch. The emitted C for leak() is now:
+//
+//     if (i >= 4) return;                    <-- guard, no lock held yet
+//     pthread_mutex_lock(&g._zer_mtx);
+//     g.v = a[i];
+//     pthread_mutex_unlock(&g._zer_mtx);
+//
+// so the early return cannot leak a mutex it has not taken. No OOB, no leak, no
+// hang — strictly better than trapping.
+//
+// The TRAP path is still live and still needed for shapes the IR guard declines
+// (@critical, async, struct returns, a side-effecting index). It is pinned by
+// tests/zer_trap/guard_in_critical_traps.zer, added alongside this.
+
+shared struct S { u32 v; }
+S g;
+volatile u32 gs = 9;
+
+u32 seed() { return gs; }
+
+void leak(u32 i) {
+    u8[4] a;
+    g.v = a[i];          // i is 9 — the guard fires BEFORE the lock is taken
+}
+
+void worker(*S p) { p.v = 1; }
+
+u32 main() {
+    leak(seed());
+    if (g.v != 0) { return 1; }      // the guard fired: leak() wrote nothing
+    ThreadHandle th = spawn worker(&g);
+    th.join();                        // must not hang — no mutex was leaked
+    if (g.v != 1) { return 2; }       // the worker got the lock
+    return 0;
+}

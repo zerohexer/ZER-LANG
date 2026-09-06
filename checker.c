@@ -20500,7 +20500,33 @@ static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size) {
     g->array_size = array_size;
 }
 
+/* BUG-956: accesses whose guard now lives in the IR. Per-CHECKER, never a
+ * file-static — see the field comment in checker.h for what that would break. */
+void checker_mark_guard_lowered(Checker *c, Node *node) {
+    if (!c || !node) return;
+    for (int i = 0; i < c->guard_lowered_count; i++)
+        if (c->guard_lowered[i] == node) return;
+    if (c->guard_lowered_count >= c->guard_lowered_capacity) {
+        int nc = c->guard_lowered_capacity < 32 ? 32 : c->guard_lowered_capacity * 2;
+        Node **nb = (Node **)realloc(c->guard_lowered, (size_t)nc * sizeof(Node *));
+        if (!nb) return;   /* OOM: the emitter still guards it — the safe direction */
+        c->guard_lowered = nb;
+        c->guard_lowered_capacity = nc;
+    }
+    c->guard_lowered[c->guard_lowered_count++] = node;
+}
+
+static bool guard_is_lowered(Checker *c, Node *node) {
+    for (int i = 0; i < c->guard_lowered_count; i++)
+        if (c->guard_lowered[i] == node) return true;
+    return false;
+}
+
 uint64_t checker_auto_guard_size(Checker *c, Node *node) {
+    /* BUG-956: the IR already branches for this access; a second C-level guard
+     * would be dead code at best. Marking happens only where the branch is
+     * emitted, so this can only return 0 when the IR guard really exists. */
+    if (guard_is_lowered(c, node)) return 0;
     for (int i = 0; i < c->auto_guard_count; i++) {
         if (c->auto_guards[i].node == node) return c->auto_guards[i].array_size;
     }

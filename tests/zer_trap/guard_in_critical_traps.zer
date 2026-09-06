@@ -1,21 +1,22 @@
 // expect-trap
-// Runtime trap. BUG-805 — the @critical sibling of guard_in_shared_lock_traps.zer.
+// BUG-956: the trapping form of the bounds auto-guard, pinned.
 //
-// The auto-guard's `return` was emitted BETWEEN the interrupt-disable and the
-// restore. On bare metal that leaves interrupts DISABLED FOREVER — a silent hang
-// with no fault to notice it by. On hosted x86-64 the critical section degrades to
-// a compiler fence, so pre-fix this program simply returned 0 and NO test could
-// have caught the bare-metal consequence; the trap is what makes it observable at
-// both ends.
+// The IR guard (BUG-956) returns cleanly where that is legal, but it DECLINES
+// inside @critical: an early return there would skip the interrupt re-enable and
+// leave interrupts off forever — the very construct ZER hard-errors on when a user
+// writes `return` inside @critical. So the emitter's trapping form is still used,
+// and this pins it.
 //
-// MEASURED: exit 0 pre-fix, SIGTRAP post-fix.
+// It replaces the shared-lock trap test, which became a positive once the guard was
+// ordered before the lock (tests/zer/guard_before_shared_lock_ok.zer). Losing trap
+// coverage entirely would have been the wrong trade — the trap path is still how
+// three scopes are handled: @critical, a defer body, and any shape the IR guard
+// declines.
 volatile u32 gs = 9;
-
-u32 seed() { return gs; }
-
-u32 main() {
+u32 seed(){ return gs; }
+u32 sink = 0;
+void leak(u32 i){
     u8[4] a;
-    u32 i = seed();
-    @critical { a[i] = 1; }   // i is 9: the guard fires with interrupts disabled
-    return 0;
+    @critical { sink = a[i]; }    // i is 9 — must TRAP, not return
 }
+u32 main(){ leak(seed()); return 0; }

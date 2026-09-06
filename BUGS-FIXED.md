@@ -854,6 +854,69 @@ fire-and-forget spawn; a copied `shared struct` is rejected.
 
 ---
 
+## Session 2026-09-06 — BUG-958..960: the off-by-N loop, the scoped atomic window, and a silent-zero fallback
+
+Adopted from `vigilant-tesla-v7pucv` `8c8873d` (their BUG-913/915/916), applied as filtered
+hunks rather than a cherry-pick: the same commit's assign-form, deep-nesting, empty-range and
+pool-merge parts were already on main as BUG-932/933 and would have doubled. Survey CLASS 3
+and CLASS 5 close here. Every negative was measured ACCEPTED on this branch before the change
+(7 loop-counter files compiled with only a warning; 3 atomic-window files with no diagnostic).
+
+### BUG-958 — the off-by-N loop bound was a warning, and the auto-guard made it a silent early return (CLASS 3)
+
+```
+u32[4] arr;
+for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }   // warning only; at runtime main RETURNED at i == 4
+```
+
+VRP had the range ([0,4]) and the range provably reaches past the array, but a range is a
+MAY-hold fact and cannot justify an error on its own (`u32 b = 10; if (c) { b = 2; } arr4[b]`
+also straddles and is safe — `bounds_ident_proven_ok` pins that). What licenses the error is
+the WILL-hold fact a counted loop gives: constant init, positive constant step, constant
+bound, and a body that cannot skip an iteration or touch the counter — then every value of
+the sequence is really taken. `Checker.cert_loop_{name,lo,step,last,depth}` is established by
+the `for` driver (init/cond/step shape) and the `while` driver (entry value + trailing
+`v += K` as the LAST statement — with the increment first the values at the access are
+`lo+step, ...`, so no certainty is claimed), and consumed at the fixed-array index sink when
+the access sits at the body's own branch depth. `loop_body_straight_line` is a no-`default:`
+walk that answers "no" for anything it has not been taught (break/continue/return/goto/
+yield/defer/asm/spawn/orelse/@trap, a write to or `&` of the counter, a nested loop, a
+switch), so an incomplete walk can only fail to report. A new fourth verdict,
+`IDX_PARTIAL_OOB`, makes the residual MAY-hold case say what it is: the warning now states the
+range, that it runs past the end, and that the guard RETURNS EARLY with no trap and no
+message. The superseded positive `dowhile_vrp_autoguard.zer` (a certain OOB written as a
+positive) is replaced by `while_/dowhile_vrp_autoguard_runtime_bound.zer`, which keep the
+BUG-748 property alive with a runtime bound.
+
+### BUG-960 — a scoped spawn did not open the atomic-cell window (CLASS 5)
+
+```
+void worker() { u32 v = @atomic_add(&g, 1); }
+spawn worker();                  g = 5;            // REJECTED
+ThreadHandle t = spawn worker(); g = 5; t.join();  // was ACCEPTED — the same race
+```
+
+The rule's own comment gave the reason: "a SCOPED spawn is joined, so post-join access is
+safe" — true, and the code set nothing at all, so the spawn..join WINDOW was unchecked too.
+An exemption whose written justification is narrower than its code. `after_spawn_in_func`
+is now split into `ff_spawn_in_func` (never clears) and `scoped_spawn_live` (a join
+decrements it, past the same depth guard the borrow release uses, and the window closes only
+at zero with no fire-and-forget spawn). Pre-spawn and post-join access stay legal
+(`atomic_cell_scoped_spawn_join_ok`); a second live thread keeps the window open.
+
+### BUG-959 — the IR emitter's unknown-intrinsic fallback was still the silent `0`
+
+BUG-767 hardened the AST-path fallback; its IR-path twin — the only path function bodies
+use — still emitted `/* @name */ 0`. Dead today (swept), and now an undeclared identifier
+that makes GCC name the intrinsic. Also the AST atomic gate `nlen >= 10` (excluded
+`@atomic_or`; the checker fixed the same off-by-one in BUG-427) is now `>= 9`.
+
+Tests: `tests/zer_fail/loop_counter_{off_by_one,past_end,past_end_field,step_overshoot,while_past_end,dowhile_past_end}.zer`,
+`dowhile_counter_past_end_bug748.zer`, `atomic_cell_scoped_spawn_{window,two_threads,via_helper}.zer`;
+positives `atomic_cell_scoped_spawn_join_ok.zer`, `{while,dowhile}_vrp_autoguard_runtime_bound.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

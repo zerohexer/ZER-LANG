@@ -171,8 +171,25 @@ void do_work() { }
 
 **DESCRIPTION**
 Fixed-size array. Size goes between type and name (NOT after name like C).
-Every index access is bounds-checked. Out-of-bounds traps at runtime.
-Compile-time constant indices are checked at compile time.
+Every index access is bounds-checked. Compile-time constant indices, and indices
+whose range the compiler can prove, are checked at compile time.
+
+An index the compiler cannot prove gets an **auto-guard**, and the auto-guard's
+runtime form is an early `return` of the function's zero value — **not** a trap.
+That is a real behavioural difference from `[*]T`, which traps:
+
+| container | unprovable index, out of range at run time |
+|---|---|
+| `T[N]` (fixed array) | auto-guard: the enclosing function returns its zero value, silently |
+| `[*]T` (slice) | `_zer_trap` — `SIGTRAP`, with the file and line |
+
+So a fixed-array access that goes out of range does not crash: it abandons the
+rest of the function and hands the caller a zero. Inside `@critical` or a held
+lock the guard traps instead (an early return would leak the interrupt-disable or
+the mutex) — see "SAFETY RULES YOU WILL HIT". If you want the loud behaviour
+everywhere, index a slice, or write the explicit `if (i >= N) { ... }`, which
+also removes the guard entirely. A counted loop whose counter PROVABLY runs past
+the end is a compile error, not a guard — see "Bounds: four verdicts".
 
 **SYNTAX**
 ```zer
@@ -189,7 +206,7 @@ scores[3] = 200;          // OK — index 3 < 4
 scores[4] = 300;          // COMPILE ERROR — index 4 >= 4
 
 u32 i = get_index();
-scores[i] = 50;           // runtime bounds check — traps if i >= 4
+scores[i] = 50;           // auto-guard — if i >= 4 the function returns early
 
 // Range propagation: proven-safe indices have ZERO overhead
 for (u32 j = 0; j < 4; j += 1) {
@@ -4085,19 +4102,20 @@ compile error instead.
 Rules that reject code most people expect to compile. Each is here because the
 alternative is a wrong answer at run time rather than a message at compile time.
 
-### Bounds: three verdicts, not two
+### Bounds: four verdicts, not two
 
-An index gets one of three verdicts from its proven range:
+An index gets one of four verdicts:
 
 | Verdict | When | Result |
 |---|---|---|
 | PROVEN SAFE | the whole range is inside the bound | no check emitted — zero overhead |
 | PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
-| UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (runtime check) |
+| LOOP RUNS PAST THE END | the index is the counter of a counted loop that *will* take a value past the bound | **compile error** |
+| UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (early return) |
 
-The middle verdict is the one that surprises people: an index the compiler can prove is
-*always* wrong is an error, not a runtime check — including when it is reached through a
-variable, and including a range that is entirely negative.
+An index the compiler can prove is *always* wrong is an error, not a runtime
+check — including when it is reached through a variable, and including a range
+that is entirely negative.
 
 <!-- audit: skip -->
 ```zer
@@ -4114,8 +4132,76 @@ u32 negative() {
 }
 ```
 
+An **empty** range is not an error. A range whose max is below its min (a
+zero-trip loop, or a contradictory guard) says the access is unreachable, so
+nothing is diagnosed:
+
+<!-- audit: skip -->
+```zer
+u32[4] arr;
+for (u32 i = 0; i < 0; i += 1) { arr[i] = 9; }   // fine — the body never runs
+```
+
+The third verdict is the off-by-N loop bound. A *range* only says which values a
+variable MAY hold, which is why a straddling range alone is not an error. But the
+counter of a `for` whose init, bound and step are constants, with a body that
+cannot skip an iteration or change the counter, provably TAKES every value of its
+sequence — so if one of them indexes past the end, the loop provably performs an
+out-of-bounds access:
+
+<!-- audit: expect-error: the loop provably performs an out-of-bounds access -->
+```zer
+u32 main() {
+    u32[4] arr;
+    for (u32 i = 0; i < 8; i += 1) { arr[i] = i; }   // ERROR — counter runs 0..7
+    return 0;
+}
+```
+
+<!-- audit: skip -->
+```zer
+u32[4] arr;
+for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }  // ERROR — off by one
+for (u32 i = 0; i < 4; i += 1) { arr[i] = i; }   // OK — and no check is emitted
+```
+
+`while` and `do-while` get the same treatment when the counter is bumped by a
+constant in the LAST statement of the body — that position is what makes the
+values at the access `lo, lo+step, ...`; with the increment first they are
+`lo+step, ...` instead, so no certainty is claimed there.
+
+Break any premise and it falls back to the auto-guard: a `break`/`return`/`goto`
+or an `orelse` in the body, an assignment to the counter, a nested loop, a
+non-constant bound, or an access nested inside an `if` (the offending values may
+never reach it). When the range is KNOWN and straddles the end but no certainty
+holds, the warning says so and says what the guard does at runtime.
+
 Proven-safe really does mean no code: `u32 i = 2; arr[i]` emits a bare `arr[i]`. An
 unprovable index emits `if ((size_t)(i) >= 4u) { return 0; }` in front of the access.
+
+### A plain access races a SCOPED thread too, not just a fire-and-forget one
+
+Once a global is touched with `@atomic_*` anywhere it is an ATOMIC CELL, and every other
+access to it in a concurrent context must be atomic as well. The concurrent context of a
+scoped spawn is the window between the `spawn` and its `join` — not nothing:
+
+<!-- audit: expect-error: plain access to 'g_ctr' in a concurrent context -->
+```zer
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+
+u32 main() {
+    g_ctr = 0;                         // OK — before the spawn, one thread
+    ThreadHandle t = spawn worker();
+    g_ctr = 5;                         // ERROR — races the running worker
+    t.join();
+    g_ctr = g_ctr + 1;                 // OK — after the join, one thread again
+    return 0;
+}
+```
+
+With two scoped threads live, one `join` does not close the window — the other thread is
+still running.
 
 ### An out-of-bounds access inside `@critical` or a held lock TRAPS
 

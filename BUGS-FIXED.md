@@ -986,6 +986,68 @@ Tests: `tests/zer_fail/{spawn_race_factory_switch,spawn_race_factory_dowhile,isr
 
 ---
 
+## Session 2026-09-06 — BUG-966..970: two unchecked intrinsic doors and two GCC errors the user could not explain (from `vigilant-tesla-ef9cao`)
+
+Cherry-pick of `021ecaa` (their BUG-913..917). The cast-emitter conflict was resolved by
+folding their constant-expression saturation INTO the BUG-963 class-kill rather than
+re-growing site 1: `emit_cast_value`'s `CASTF_F2I` arm tries `emit_f2i_const` for an AST
+operand first. Every negative measured accepted here before the pick (11 of 11) and rejects
+for its stated reason after; 4 positives run; the trap traps; `audit_float_literal.sh` is the
+TENTH gate in `make check`. Survey CLASS 13 closes, and CLASS 1 (enum forging) closes with
+its last two doors.
+
+### BUG-969 — `@pun`'s runtime type_id check did not exist when either pointee is a primitive
+
+Only struct/enum/union carry an id; everything else packs 0, so the emitted
+`type_id != TGT && type_id != 0` folded to false. Measured, no diagnostic and no trap: an
+integer became a WORKING POINTER with no `@inttoptr` and no `mmio` declaration (wrote 42
+through it) — the grammar-level closure the safety claim rests on. Also forged an enum, a
+bool, a funcptr and a slice `len`. BH-18 #4 had found the WIDENING half and its own comment
+said the trap is skipped for a primitive pointee — it closed the out-of-bounds read and left
+the in-bounds forge. Rejected only when the check cannot fire, the pointee types differ AND
+the target carries a validity invariant, so byte views (`@pun(*u8, structptr)`) and scalar
+reinterpretation still compile (`pun_no_invariant_ok`).
+
+### BUG-970 — `@inttoptr` to an enum-carrying pointee was a fourth enum-forging route
+
+`volatile *State reg = @inttoptr(*State, a); switch (*reg)` RETURNED AN ARM on a register
+holding 200, with zero guards in the generated C. REJECTED rather than guarded: guarding
+means firing at every read through the pointer (a new N-sink surface), while rejection routes
+users to `@bitcast(State, *u32reg)`, which IS guarded (`mmio_enum_via_bitcast_trap` proves it
+still catches the forgery). Corpus cost measured: zero.
+
+### BUG-968 — `@container` had a two-valued provenance domain for a three-valued fact (CLASS 13)
+
+`&wholeObject` fell into "unknown, allow", so subtracting the field offset handed back a
+pointer BEFORE the object (stack-buffer-underflow, no diagnostic). Adds the missing state,
+and a second sink found by enumerating: the check tested `args[0]->kind == NODE_IDENT`, so
+`@container(*Outer, &i, in)` skipped every rule. One classifier for both.
+
+### BUG-966 — a float literal overflowing to infinity emitted the bare token `inf`
+
+Five sites spelling `%.17g`. One helper `emit_double_lit` renders non-finite values as GCC
+constants valid in a static initializer and under `-ffreestanding`;
+`tools/audit_float_literal.sh` fails the build on a sixth site — verified to go RED.
+
+### BUG-967 — `u32 g = (u32)1e20;` emitted the saturation guard as a statement expression at file scope
+
+Illegal C ("braced-group within expression allowed only inside a function"), blamed on the
+user's line. A constant-expression form is used for an operand that is free to re-evaluate
+(no side effects, not volatile — always true of a constant initializer); the four limits
+come from the one `f2i_limits` shared with the statement form.
+
+Also documents three measured behaviours: `u8[2][3]` is 3 rows of 2 (the rightmost bracket
+is the OUTER dimension), a non-finite float literal is a normal IEEE infinity, and a C-style
+cast target must be a keyword type.
+
+Tests: `tests/zer_fail/{container_whole_object,_alias,_direct,_global,container_array_element}.zer`,
+`tests/zer_fail/{pun_forge_enum,pun_forge_funcptr,pun_forge_pointer,pun_forge_slice}.zer`,
+`tests/zer_fail/{inttoptr_enum_target,inttoptr_enum_in_struct}.zer`,
+`tests/zer/{container_field_prov_ok,pun_no_invariant_ok,f2i_global_saturate_ok,float_literal_nonfinite_ok}.zer`,
+`tests/zer_trap/mmio_enum_via_bitcast_trap.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

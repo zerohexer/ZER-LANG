@@ -5,6 +5,85 @@ Entries removed once fixed.
 
 ---
 
+## ADOPTED 2026-09-06 — `ef9cao` `021ecaa` (their BUG-913..917 → BUG-966..970), five findings
+
+> Cherry-picked whole; the cast-emitter conflict was resolved by folding their
+> constant-expression f2i form INTO the BUG-963 class-kill (`emit_cast_value` CASTF_F2I,
+> AST operand only). All 11 negatives reject for the stated reason, 4 positives run, the
+> trap traps, `audit_float_literal.sh` is the TENTH gate. Their write-up follows.
+
+Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
+trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
+of the intrinsic surface. **`make check` exit 0**, ten gates including the new
+`audit_float_literal.sh`.
+
+Two silent safety holes, both the same shape — **an intrinsic advertises a check that is
+not emitted for certain operand types**:
+
+| bug | what was silent | consequence measured on main |
+|---|---|---|
+| BUG-969 | `@pun`'s runtime `type_id` trap is absent whenever either pointee is a primitive/slice/funcptr (only struct/enum/union carry an id, everything else packs 0 and the comparison folds to false) | an integer became a **working pointer with no `@inttoptr` and no `mmio`** — rc=42 writing through it. Also forged enum / bool / funcptr / slice-`len`. Hosted a wild address hits the SIGSEGV handler, which is `_ZER_HOSTED`-only, so **bare metal is a silent wild access** |
+| BUG-970 | `@inttoptr(*State, addr)` — the FOURTH enum-forging door, in a set documented as closed at three | switch **returned 3** on a register holding 200; zero guard emissions in the generated C |
+| BUG-968 | `@container` had a two-valued provenance domain for a three-valued fact; `&wholeObject` fell into "unknown, allow" | ASan **stack-buffer-underflow** (global source: global-buffer-underflow), no diagnostic, no trap |
+
+Plus two defects where the COMPILER'S OWN OUTPUT is invalid C, so the user sees a GCC
+error against their own `.zer` line and no ZER diagnostic ever names the cause: a
+non-finite float literal emitted as the bare token `inf` (BUG-966, five sites, now one
+helper + a gate), and the float-to-int saturation guard emitted as a statement expression
+at file scope (BUG-967).
+
+**Method note worth keeping.** Every one of the five was found by PROBING the intrinsic
+surface for "what does this actually do", not by reading for suspicious code. Three of the
+five were sitting next to a comment that already described the hazard — BH-18 #4's own
+text says *"the runtime type_id trap is skipped for an in-ZER primitive pointer ... so the
+OOB is SILENT"*, and it fixed only the out-of-bounds half. **When a fix's rationale
+describes a mechanism as broken, check whether the fix covered every consequence of that
+mechanism or only the one that was reported.**
+
+## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (LOW, unmeasured)
+
+BUG-970 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch
+downstream *elides work* on the assumption that every value is a declared variant, and that
+elision was measured turning a bad value into a wrong dispatch.
+
+The same intrinsic can produce a pointer to a struct carrying a `*T`, `[*]T`, `bool`,
+optional or `Handle`, and reading those fields forges those values from hardware bits. That
+was NOT shipped, deliberately:
+
+- `@inttoptr` **is** the sanctioned integer-to-pointer door (mmio-gated and audit-visible),
+  so a hardware register holding an address is the thing it exists to express;
+- `lib/compat.zer` depends on `@inttoptr(*opaque, ...)` for its pointer arithmetic, so the
+  blanket predicate (`type_carries_forgeable`) has a non-zero corpus cost;
+- no wrong-dispatch or wrong-elision defect has been measured for these, unlike the enum
+  case.
+
+If this is taken up, measure first: find a downstream analysis that ELIDES a check on the
+strength of one of these types, the way the exhaustive switch does for enums. Absent that,
+this is an unmeasured tightening and should stay unshipped.
+
+## NOTE — the exhaustive-enum switch's last-arm elision is the amplifier, not the hole
+
+Worth writing down because it explains why every enum-door bug reads as severe. Lowering an
+exhaustive `switch` emits the final arm as an **unconditional else**:
+
+```
+if (s == 0) -> arm0; else if (s == 1) -> arm1; else -> arm2;   /* no test on arm2 */
+```
+
+That is sound exactly while every enum value is a declared variant — which is what the
+forge doors defend. So a missed door does not merely let a strange value through; it makes
+that value *take an arm*, and the `return 77` fall-through after the switch becomes dead
+code. Every enum-forge bug to date (BUG-843, 864, 891, 910, and now 970) reports as "the
+switch silently ran its LAST arm" for this reason.
+
+Making the switch defensive (test the last arm too, fall through on no match) would remove
+the amplifier permanently and independently of door coverage. It was NOT done here: it
+costs a comparison and a branch on every enum switch, it silently does nothing on a forged
+value rather than trapping, and ZER's chosen answer is to trap at the point of forgery.
+Recorded as the alternative in case the door set ever stops being closable.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
@@ -511,7 +590,13 @@ runner passes them; a probe that ignores them measures a different program.
 
 ---
 
-### CLASS 1 — ENUM FORGING: the door set is NOT closed (HIGH, accept-unsafe)
+### ~~CLASS 1 — ENUM FORGING: the door set is NOT closed~~ — **CLOSED, all doors, as of 2026-09-06**
+
+> Literal at ten sinks BUG-927; arithmetic + `@ptrcast` BUG-928; checked route `@try_enum`
+> BUG-929; auto-zero declaration BUG-930 + the consumer-side switch trap BUG-950; `@pun` to
+> enum/bool/funcptr/pointer/slice REJECTED when the check cannot fire BUG-969; `@inttoptr` to
+> an enum-carrying pointee REJECTED BUG-970 (the door set stays at the three GUARDED
+> conversions). Every reproducer named below rejects or traps; see the CLAUDE.md row. Original:
 
 **CLAUDE.md currently states the doors are "EXACTLY THREE and the set is closed
 (@bitcast, @truncate, @saturate)". MEASURED FALSE 2026-08-20.** That sentence must be
@@ -940,7 +1025,12 @@ arm or a `do-while` body:
 
 ---
 
-### CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`
+### ~~CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT~~ — **CLOSED 2026-09-06 as BUG-968, DO NOT REDO**
+
+> Adopted from `ef9cao` `021ecaa`: the provenance domain gained its third value (whole
+> object / array element = REJECT), and a second sink (`@container(*Outer, &i, in)` with a
+> non-IDENT arg) shares the one classifier. All 5 negatives reject; `container_field_prov_ok`
+> runs. Original:
 
     struct Inner { u32 a; }
     struct Outer { u64 pad; Inner in; }

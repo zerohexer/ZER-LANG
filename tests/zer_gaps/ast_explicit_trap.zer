@@ -1,4 +1,0 @@
-u32 main() {
-    @trap();
-    return 0;
-}

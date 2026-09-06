@@ -1,3 +1,4 @@
+// gap-runtime-exit: 0
 // SILENT GAP — @critical on x86 emits memory fence, NOT cli/sti
 //
 // emitter.c:8655-8659 IR_CRITICAL_BEGIN, x86 fallback:

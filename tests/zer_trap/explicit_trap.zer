@@ -1,0 +1,8 @@
+// expect-trap
+// expect-trap-at: 8
+// Promoted from tests/zer_gaps/ast_explicit_trap.zer (2026-08-30). @trap() is
+// the one intrinsic whose entire contract is "halt here", and it had no test of
+// its own — only incidental uses inside larger programs. The gap directory was
+// holding the only direct check, where it was scored on compiling rather than on
+// trapping.
+u32 main() { @trap(); return 0; }

@@ -1315,6 +1315,26 @@ Tests: `tests/zer/{call_arg_coerce_all_stmt_forms,return_literal_is_static_ok}.z
 
 ---
 
+## Session 2026-09-06 — `tests/zer_gaps/` triaged 23 -> 11, and the runner gets the oracle that would have caught the drift (from `vigilant-tesla-lzmkhn`)
+
+Cherry-pick of `b494525`. The 2026-08-03 triage rescued the directory from being executed
+by nothing; it drifted back one axis over — the runner asked only "does it still compile",
+the WRONG oracle for a gap whose defect is a RUNTIME one (such a file keeps compiling after
+the fix and scores "gap still open" forever). Measured over the 23: 7 byte-identical
+duplicates of promoted tests, 4 genuinely CLOSED but still reported open (the worst a
+HIGH-severity silent miscompile — a defer dropped on the sibling fall-through path of a
+goto — fixed long ago, unnoticed because a miscompile compiles fine), 1 claim that could not
+reproduce (its reproducer mixed two allocators and trapped before reaching the claimed
+depth cap), 1 gap against a spec claim corrected 2026-08-10, 10 still open. Harness:
+`// gap-runtime-exit: N` records what the program DOES while the gap is open — it must
+still compile AND still produce N (verified non-vacuous by setting a wrong value). Closed
+gaps were PROMOTED where they had no equivalent: `probe_fault_returns_null` (the `@probe`
+FAULT path), `defer_goto_sibling_fallthrough_fires`, `bool_int_explicit_cast_ok`,
+`async_shared_per_statement_ok` + `async_shared_in_await_stmt` (negative),
+`defer_deep_nesting_free_seen`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

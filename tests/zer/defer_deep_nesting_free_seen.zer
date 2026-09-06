@@ -1,0 +1,34 @@
+// Promoted from tests/zer_gaps/audit2_defer_scan_nested.zer (2026-08-30).
+//
+// That file recorded a 2026-04-19 CODE-INSPECTION claim: zercheck.c's defer-body
+// pre-scan used `scan_stack[32]` with `scan_depth < 31`, so a handle allocated
+// inside more than 31 nested `if` bodies would have its `defer free` missed and
+// be reported as a false "handle leaked". The claim was never measured against a
+// build — and the analyzer it describes is the AST one, which the CFG-based
+// zercheck_ir replaced.
+//
+// Measured: 32 levels of nesting with the free in a `defer` at the bottom
+// compiles clean and runs. The original reproducer ALSO could not have shown
+// what it claimed: it allocated with `alloc(Task)` (the auto-slab) and freed
+// with `heap.free_ptr(t)` (a different Slab), so it trapped at runtime on the
+// allocator mismatch rather than exercising the depth limit at all.
+struct Task { u32 id; }
+
+u32 main() {
+    *Task t = alloc(Task) orelse { return 1; };
+    t.id = 7;
+    bool c = true;
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+        defer free(t);
+        u32 x = t.id;
+        if (x != 7) { return 2; }
+        return 0;
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    return 3;
+}

@@ -1,0 +1,30 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-995 (2026-09-06): a `defer free(t)` registered INSIDE a conditional block
+// covers only the paths that entered the block. This file was
+// tests/zer/defer_deep_nesting_free_seen.zer — a POSITIVE — until defer bodies
+// were lowered into the IR at their fire sites: the old raw-AST defer scanner
+// applied every defer's frees to every return regardless of reachability, so
+// the `return 3` path (every `if (c)` false; zercheck does not fold `c`) was
+// silently reported as freed. It leaks `t`. The 32-level positive that the old
+// gap file was about is tests/zer/defer_nested_32_levels_ok.zer.
+struct Task { u32 id; }
+
+u32 main() {
+    *Task t = alloc(Task) orelse { return 1; };
+    t.id = 7;
+    bool c = true;
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+        defer free(t);
+        u32 x = t.id;
+        if (x != 7) { return 2; }
+        return 0;
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    return 3;
+}

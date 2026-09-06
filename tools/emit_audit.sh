@@ -109,6 +109,38 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# REQUIRED sample table (from BUG-995) — "sample|pattern" (at least once) or
+# "sample|pattern|N" (at least N occurrences: for a lock that must be taken once
+# per site, where a dropped site still leaves the pattern present).
+REQUIRED=(
+    # BUG-995: three defer bodies read shared `g` in a while/if/for CONDITION
+    # (one lock each) plus the statement `g.v = 3` — the raw-AST defer emitter
+    # locked none of the conditions (2 locks total pre-fix).
+    "tests/zer/defer_body_shared_cond_locked.zer|pthread_mutex_lock\\(&g\\._zer_mtx\\)|4"
+)
+for entry in "${REQUIRED[@]}"; do
+    sample="${entry%%|*}"
+    rest="${entry#*|}"
+    pattern="${rest%%|*}"
+    min=1
+    if [ "$rest" != "$pattern" ]; then min="${rest#*|}"; fi
+    if [ ! -f "$sample" ]; then
+        echo "MISSING EMISSION: required sample missing: $sample"
+        REQ_FAIL=$((REQ_FAIL + 1))
+        continue
+    fi
+    if ! "$ZERC" "$sample" -o "$req_dir/req.c" >/dev/null 2>&1; then
+        echo "MISSING EMISSION: required sample failed to compile: $sample"
+        REQ_FAIL=$((REQ_FAIL + 1))
+        continue
+    fi
+    found=$(grep -cE "$pattern" "$req_dir/req.c" 2>/dev/null || true)
+    if [ "${found:-0}" -lt "$min" ]; then
+        echo "MISSING EMISSION: $sample: pattern '$pattern' expected >= $min time(s), found ${found:-0}"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+done
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

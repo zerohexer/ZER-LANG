@@ -1457,15 +1457,15 @@ defer {
 }
 ```
 
-`orelse` with a **value or block fallback** is banned inside a defer body — the
-defer body cannot express orelse's branch. Compute the value before the defer.
-(`orelse return` / `break` / `continue` are already banned there too, because
-they corrupt cleanup flow.)
+`orelse` with a **value fallback** is allowed inside a defer body (since
+2026-09-05 — defer bodies are lowered through the same IR as every other
+statement, so `defer cleanup(maybe() orelse 0);` works). `orelse return` /
+`break` / `continue` stay banned there, because they would leave the cleanup
+early.
 
 ```zer
-defer { u32 z = maybe() orelse g; }   // COMPILE ERROR
-u32 z = maybe() orelse g;             // OK — compute it first
-defer { use(z); }
+defer { u32 z = maybe() orelse g; use(z); }   // OK — value fallback
+defer { u32 z = maybe() orelse return; }      // COMPILE ERROR — leaves the cleanup
 ```
 
 A forward `goto` that jumps **over** a later `defer` to a label past it is a
@@ -3427,7 +3427,9 @@ const [*]u8 name = "hello";
 ```
 
 **NOTES**
-- Returns pointer to buf. If slice doesn't fit, returns zero value (auto-guard).
+- Returns pointer to buf. If the slice does not fit, the program TRAPS at
+  runtime (`@cstr buffer overflow`) — on every emission path since BUG-995
+  (before it, the AST path silently early-returned while the IR path trapped).
 - Takes exactly TWO arguments, and their shapes are an ALLOW-list, not a
   deny-list. The destination must be a fixed array `u8[N]`, a slice `[*]u8`, or
   a `volatile`/`*opaque` pointer at a hardware boundary; the source must be a

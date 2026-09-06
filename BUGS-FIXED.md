@@ -1461,7 +1461,7 @@ in C before an op-kind-gated subset of instructions. That gate was a multi-site 
 own record (IR_INDEX_READ, IR_AWAIT and IR_NOP were each once missing from it = silent OOB),
 the guard was invisible to the IR, to zercheck_ir and to any pass that reasons about control
 flow, and the emitter-side early return was the one thing that forced the emitter to keep its
-own defer stack and its own raw-AST defer-body emitter (BUG-920).
+own defer stack and its own raw-AST defer-body emitter (BUG-995).
 
 Now `ir_lower.c lower_auto_guards` runs at THE single choke point every instruction goes
 through (`emit_inst` / `emit_3ac`) and lowers, for every marked node not yet guarded:

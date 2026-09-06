@@ -257,8 +257,15 @@ through one optional level.
 
 ### TWO REFACTORS — architectural, and one closes a recorded item
 
-**L. Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
-emitter.** *(CROSS-BRANCH COMPARISON DONE 2026-09-06 — this SUPERSEDES `o51x9p`'s
+**L. ~~Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
+emitter.~~ — CLOSED 2026-09-06 as BUG-995, DO NOT REDO.** *(Cherry-picked whole after
+M. Kept main's BUG-937 saturation (block-tagging `ir_saturate_free_site`) over the
+branch's per-free `ir_note_free_site` — one rule, one implementation; only the
+`freed_by_origin` stamps were taken. The `defer_deep_nesting_free_seen` positive
+that the old scanner accepted was a REAL LEAK (a defer under an untaken `if`) and
+is now `tests/zer_fail/defer_under_untaken_if_leaks.zer`. Item C's three siblings
+now trap 133. @cstr overflow TRAPS on the AST path too — it early-returned before.)*
+*(CROSS-BRANCH COMPARISON DONE 2026-09-06 — this SUPERSEDES `o51x9p`'s
 answer to the same defect; see the corrected CLASS 8. o51x9p BANS the constructs
 in +615 lines, ii7a90 SUPPORTS them at net −386, and the Ban Decision Framework
 picks ii7a90 because the ban's only possible justification — emission
@@ -309,7 +316,7 @@ lock, so nothing can nest around the call. `g.v = f();` stays rejected.
       residual folds into K (BUG-921) — same predicate, do them together
 7. J/I/K/H/G  the smaller ones
 8. L/M  the two refactors -- deliberately, and only after 1-7 are stable
-        M CLOSED (BUG-994); L next (it depends on M's lower_auto_guards / IR_TRAP)
+        M CLOSED (BUG-994); L CLOSED (BUG-995) — both refactors landed
 ```
 
 ---
@@ -912,7 +919,7 @@ Also `multiview_branch_join_uaf`, `struct_init_field_move`.
 
 ---
 
-### CLASS 8 — `defer` BODY: **TWO BRANCHES DISAGREE. TAKE `ii7a90`, NOT `o51x9p`.**
+### CLASS 8 — `defer` BODY: **TWO BRANCHES DISAGREE. TAKE `ii7a90`, NOT `o51x9p`.** — CLOSED 2026-09-06 (BUG-995 landed ii7a90's L)
 
 > **CORRECTED 2026-09-06 by a cross-branch comparison. The heading below —
 > "restrictions not enforced" — ENCODES o51x9p's ANSWER, and that answer is the
@@ -1123,8 +1130,8 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
   CLAUDE.md's "A GATE CAN ITSELF BE BROKEN".
 - **`--track-cptrs`'s use-after-free half has NO call site, and the obvious fix is
   UNSOUND** (`fhf8rn` BUG-921).
-- **`emit_defer_stmt` is the last raw-AST STATEMENT emitter** (`o51x9p`,
-  ARCHITECTURAL).
+- ~~**`emit_defer_stmt` is the last raw-AST STATEMENT emitter** (`o51x9p`,
+  ARCHITECTURAL).~~ CLOSED (BUG-995): deleted; defer bodies lower through `lower_stmt`.
 - **`tests/zer_gaps/` triaged 23 -> 10 plus the harness oracle that let them rot**
   (`lzmkhn`) — take this wholesale.
 - **reference.md**: 34 more examples compile standalone; an audit-harness defect

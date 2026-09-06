@@ -1,4 +1,4 @@
-// expect-error: read-modify-written in a single statement
+// expect-error: read-modify-written and is shared
 // BUG-788: `g = g + 1` is the same load/add/store as `g += 1`. Only the compound
 // token was checked, so following the old diagnostic's own advice ("use explicit
 // read/mask/write") within one statement kept the torn RMW.

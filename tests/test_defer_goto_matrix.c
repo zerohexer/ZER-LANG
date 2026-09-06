@@ -50,7 +50,12 @@ static int total = 0, passed = 0, failed = 0;
 static int miscompiled = 0, wrong_value = 0, unexpected_reject = 0, unexpected_accept = 0;
 static const char *zerc_path = NULL;
 
+/* ZER_MATRIX_ZERC overrides the search: verifying that a new cell actually FIRES
+ * means running this grid against a PRE-FIX compiler, and there was no way to
+ * point it at one. All ten grids take the same override. */
 static void find_zerc(void) {
+    const char *env = getenv("ZER_MATRIX_ZERC");
+    if (env && *env) { zerc_path = env; return; }
     if (system("test -x ./zerc") == 0) { zerc_path = "./zerc"; return; }
     if (system("test -x /tmp/zerc") == 0) { zerc_path = "/tmp/zerc"; return; }
     fprintf(stderr, "ERROR: cannot find zerc\n");

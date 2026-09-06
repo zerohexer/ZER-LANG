@@ -1133,6 +1133,43 @@ error; exercises the timeout-returns-null and the already-true-predicate outcome
 
 ---
 
+## Session 2026-09-06 — BUG-974/975: the RMW rule was per-STATEMENT, so splitting it over two hid it; and ten gates that could not be pointed at a pre-fix compiler (from `vigilant-tesla-1zukjq`)
+
+Cherry-pick of `1e55f54` (their BUG-924/925). Survey CLASS 6 closes. Two checker.c conflicts
+resolved by keeping BUG-948's static-local block AND their value-taint table in one
+`rmw_alias_reset`, and BUG-948's `g_what` diagnostic form with their wording.
+
+### BUG-974 — `u32 t = g; g = t + 1;` was not a read-modify-write
+
+Four spellings of an RMW on a shared volatile global were rejected (`g += 1`,
+`g = g + 1`, `g = @truncate(u32,g) + 1`, through a pointer or a helper). The fifth was
+accepted: every form the rule knew is answerable inside ONE assignment
+(`assign_reads_own_target` asks whether the value mentions the target global); split over two
+statements the first half writes no global and the second's value never mentions `g`. On
+bare metal that is a lost update. Fixed with a NAME -> GLOBAL value taint on the same rails
+as the VarRange map, reset at the same point: a local whose value came from G carries G,
+transitively; a write to G whose value mentions such a local IS the RMW; re-binding the local
+from anything else CLEARS it. Can only ADD rejections; measured ZERO over-rejections across
+the corpus. **BOTH SINKS** (`Checker.rmw_taints` for the ISR side, `_rmw_vtaint` for the spawn
+scan, one `RmwTaintEnt` shape and one set of query helpers), and the RMW FORM grid in
+`tests/test_hw_matrix.c` is the reason: the ISR half went in first and the grid reported the
+two spawn cells FALSE-NEGATIVE. Grid: `RFORM_SPLIT_STMT` and `RFORM_SPLIT_2HOP` at both sites
+plus three POSITIVE boundary cells (taint-cleared, other-global, not-shared) — without them
+the cheapest way to pass is "any function that reads g and writes g". Verified non-vacuous:
+4 false negatives against a pre-fix build, 0 after. The diagnostic drops "in a single
+statement"; eight negatives now assert the rule's identity rather than its old wording.
+
+### BUG-975 (tooling) — all ten `tests/test_*_matrix.c` grids hardcoded `./zerc` and ignored argv
+
+Pointing one at a pre-fix compiler silently graded the CURRENT one and reported the same
+all-green either way — the step that proves a new cell is a net rather than a script was
+measuring nothing. All ten honour `ZER_MATRIX_ZERC`, the affordance `tools/sink_matrix.sh` has
+always had.
+
+Tests: `tests/zer_fail/isr_rmw_split_statements.zer`; hw-matrix 37/37.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

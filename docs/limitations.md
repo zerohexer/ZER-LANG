@@ -283,6 +283,62 @@ so `u32 r = f();` was rejected when `f` touches two
 shared structs sequentially. A statement with no DIRECT shared access takes no
 lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 
+### L — FEASIBILITY, MEASURED 2026-09-06. Read before implementing; the obvious route is the WRONG one.
+
+Design work done, implementation NOT started. Two prerequisites were discovered by
+measurement, and they rule out the route anyone would try first.
+
+**A defer body really does reach MORE THAN ONE fire site.** Measured — one `defer` with
+an early `return` emits **2 copies** of the body in one function:
+
+```zer
+void f(u32 k){ defer { g += 1; } if (k > 0) { return; } g += 10; }
+```
+
+So "lower the body at each fire site" means lowering the SAME AST N times.
+
+**PREREQUISITE 1 — lowering MUTATES the AST, so per-site lowering needs a clone.**
+`rewrite_idents` renames in place and `pre_lower_orelse` REPLACES each orelse with an
+identifier naming a temp. The second lowering therefore finds no orelse and emits no
+branch, while the identifier still refers to a temp created in the FIRST fire site's
+blocks — a dangling reference, i.e. a miscompile. This is the hazard CLAUDE.md already
+records as *"never call ir_lower_func twice on the same AST"*. **No AST cloner exists in
+the tree** (`grep` for clone_node / ast_clone / deep_copy / copy_node: nothing).
+
+**PREREQUISITE 2 — the typemap is keyed by the Node POINTER.** `typemap_set` hashes
+`(uintptr_t)node >> 3`, so a cloned node has NO type entry and `checker_get_type`
+returns NULL for it — which emission depends on everywhere. An AST cloner would have to
+copy typemap entries for every node it clones, so it needs the Checker, not just an
+Arena.
+
+Together those make the AST-clone route a 53-kind exhaustive walker PLUS typemap
+copying — large, and exactly the kind of walker where a dropped child field is silent.
+
+**THE BETTER ROUTE: clone at the IR level, not the AST level.** Measured from `ir.h`:
+an `IRInst` refers to other blocks ONLY by integer index (`true_block`, `false_block`,
+`goto_block`), locals only by id, and blocks live in a flat `func->blocks[]` array
+appended by `ir_add_block`. So duplicating a body means copying a contiguous BLOCK RANGE
+and adding an offset to those three fields. Locals are shared — same function, no
+remap needed.
+
+That route touches neither the AST nor the typemap, so BOTH prerequisites disappear, and
+it is tens of lines instead of a 53-kind walker.
+
+**Staging:**
+
+1. IR block-range cloner (`ir.c`) — copy a range, remap the three block-index fields.
+2. Lower each defer body ONCE into a detached block range at `NODE_DEFER`; at each fire
+   site splice in a clone. The change point is the THREE functions `emit_defer_fire`,
+   `emit_defer_fire_scoped`, `emit_defer_pop_only` — not the ~11 call sites.
+3. Delete `emit_defer_stmt` (214 lines) and prune `zercheck_ir.c`'s second defer
+   analyzer (~733 lines).
+
+Stage 2 must keep the existing machinery that has already paid for itself: the
+capture-on-FIRE snapshot (`ir_snapshot_defer_bodies`, the plt86m defer-goto gap), the
+per-defer ARMED flag (F2 — a forward `goto` can jump over a registration), and the
+both-reachable-cleanup-label guard (`defer_fire_guard_flag`). Each of those exists
+because a real bug got through; none of them is optional.
+
 ### ORDER OF L AND M — MEASURED 2026-09-06, do not re-derive
 
 **L FIRST, THEN M.** This reverses an earlier recommendation of mine that ordered them

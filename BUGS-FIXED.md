@@ -884,9 +884,11 @@ yield/defer/asm/spawn/orelse/@trap, a write to or `&` of the counter, a nested l
 switch), so an incomplete walk can only fail to report. A new fourth verdict,
 `IDX_PARTIAL_OOB`, makes the residual MAY-hold case say what it is: the warning now states the
 range, that it runs past the end, and that the guard RETURNS EARLY with no trap and no
-message. The superseded positive `dowhile_vrp_autoguard.zer` (a certain OOB written as a
-positive) is replaced by `while_/dowhile_vrp_autoguard_runtime_bound.zer`, which keep the
-BUG-748 property alive with a runtime bound.
+message. The superseded positives `dowhile_vrp_autoguard.zer` and `while_vrp_autoguard.zer`
+(each a certain OOB written as a positive — `while (i < 10) { arr5[i] = 99; i += 1; }`) are
+replaced by `while_/dowhile_vrp_autoguard_runtime_bound.zer`, which keep the BUG-748
+property alive with a runtime bound; the first full `make check` after the adoption caught
+the second one (the branch had removed only the do-while).
 
 ### BUG-960 — a scoped spawn did not open the atomic-cell window (CLASS 5)
 
@@ -1075,6 +1077,29 @@ trap there would break `@pun(*u8, structptr)`).
 
 Tests: `tests/zer_trap/ptrcast_opaque_prim_origin_trap.zer` (pre-fix rc=0, silently out of
 bounds), `tests/zer/ptrcast_opaque_roundtrip_ok.zer` (primitive, struct and distinct origins).
+
+---
+
+## Session 2026-09-06 — BUG-972: the Ring channel-pointer warning was 1-of-4 carriers (from `vigilant-tesla-ef9cao`)
+
+Cherry-pick of `f090c32` (their BUG-920). `Ring.push` warns when a pointer crosses a channel
+(the receiver may not be able to use it). The test was the hand-rolled disjunction
+`k == TYPE_POINTER || k == TYPE_OPAQUE` that `audit_carrier_dispatch.sh` exists to freeze —
+and it was sitting in the baseline. Of the four shapes that put a pointer through a channel
+only the bare one warned: `Ring(?*u32,N)`, `Ring([*]u8,N)` and `Ring(P,N)` with
+`struct P { *u32 p; }` were silent. Severity is ADVISORY, stated precisely: the SAFETY half
+(pushing a pointer to a LOCAL) is carrier-complete already through
+`container_push_arg_escapes`, verified rejecting all four shapes. Fixed by calling
+`type_carries_data_pointer` at both sites (push, push_checked); the obsolete baseline row is
+REMOVED in the same commit. Four `warn_check` cells in `tests/test_zer.sh`, one file per
+shape, because a single file with four pushes would pass on one surviving warning.
+
+Also corrects the CLAUDE.md "Container infinite recursion" row: a POINTER-BROKEN cycle
+(`container Node(T) { ?*Node(T) next; }`) is the legal linked-list idiom; only an all-by-value
+cycle is an error (BUG-868).
+
+Tests: `tests/zer/ring_warn_carrier_{bare,optional,slice,struct}.zer` (warning asserted, not
+the exit code).
 
 ---
 

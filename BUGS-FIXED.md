@@ -917,6 +917,75 @@ positives `atomic_cell_scoped_spawn_join_ok.zer`, `{while,dowhile}_vrp_autoguard
 
 ---
 
+## Session 2026-09-06 — BUG-961..965: five holes adopted from `vigilant-tesla-pstdqk` (their BUG-913..917)
+
+Cherry-pick of `bdac25c`; code applied clean, only docs and the walker baseline
+conflicted. Every negative measured accepted here before the pick; after it all three
+reject for their stated reason, the three positives run, the trap traps, and the two NEW
+matrices pass (14/14 shared-lock, 13/13 borrow-join) with conc-matrix 94/94. Survey
+CLASS 12 closes here. Their environment note stands for this sandbox too: **ASan is a
+no-op here** (a 4-byte array indexed at 100 reports nothing), so memory findings are
+established by reading the emitted C and by pre/post exit codes.
+
+### BUG-962 — an `&x` in a `spawn` argument did not widen the loop range → silent stack OOB
+
+```zer
+u8[4] arr;  u32 idx = 0;
+for (u32 i = 0; i < 3; i += 1) { arr[idx] = 7; ThreadHandle th = spawn bump(&idx); th.join(); }
+```
+
+The plain-call spelling emits `if ((size_t)(idx) >= 4u) { return 0; }`; the spawn spelling
+emitted NO guard, so iterations 2 and 3 wrote `arr[100]`. `vrp_widen_loop_addr_taken` was an
+if-chain whose trailing comment said SPAWN/AWAIT/ASM are leaves — false for all three
+(`spawn_stmt.args[]`, `await_stmt.cond`, asm operand exprs). BUG-826 fixed the same
+omission in the ISR and atomic walkers and did not carry it here. Both VRP walkers now
+descend all three, and the if-chain is a no-`default:` switch. **The gate had flagged it**:
+the row was in `walker_field_baseline.txt` under a bare function header with no reason.
+
+### BUG-961 — a factory returning a racing callback from a `switch` arm or `do-while` body (CLASS 12)
+
+`scan_returned_funcname` covered RETURN/BLOCK/IF/WHILE/FOR; its ISR sibling had DO_WHILE
+but not SWITCH — the two sinks one kind apart. Both are now exhaustive switches (SWITCH,
+DO_WHILE, DEFER, CRITICAL, ONCE added at both). +4 REACH cells and +2 ISR cells in
+`tests/test_conc_matrix.c`. Probe design: the discriminating factory returns a SAFE callback
+on every path except the construct under test, or the plain-RETURN arm masks the result.
+
+### BUG-963 — `(bool)x` and the `*opaque` type-id trap were missing on one of three cast emitters
+
+`b = (bool)five()` stored 5 (`if (b)` true, `b == true` false); `m = (*Motor)ctx` emitted a
+struct-to-pointer cast GCC rejects, with the type check gone. Class-kill: `classify_cast()`
++ `emit_cast_value()` hold the policy once (`CastForm` enum, no `default:`), each of the
+three sites supplies only its operand via `CastOperand`. `grep -c "type mismatch in cast"
+emitter.c` is 1.
+
+### BUG-964 — a function returning an OPTIONAL funcptr emitted an abstract declarator
+
+`?VFn maybe(u32 k)` emitted `void (*)() maybe(uint32_t k)`; GCC refused a valid program.
+Raw `ret->kind == TYPE_FUNC_PTR` missed the `?`/`distinct` wrappers — BUG-879 one sink
+over. One query `funcptr_return_shape()` at the IR signature emitter AND the prototype
+emitter (which had no funcptr-return handling at all).
+
+### BUG-965 — a braceless `switch` arm bypassed the shared-struct auto-lock
+
+`0 => g.x = 5,` emitted an unsynchronized write; `0 => { g.x = 5; }` locked. The
+per-statement lock lives in the NODE_BLOCK case, so the real guarantee was "every statement
+inside a block" — true only because the parser makes every body a block, and this was the
+one exception. Fixed in the parser (the bare arm is wrapped in a one-statement block) so the
+invariant is universal. New gate `tests/test_sharedlock_matrix.c` asks "was the mutex
+EMITTED?" across 14 body forms — the question accept/reject matrices structurally cannot
+ask; it caught a second instance (bare `default` arm). `tests/test_borrow_join_matrix.c`
+pins the scoped-borrow soundness (9 cells) and the known join-on-every-arm over-rejection
+with INVERTED expectation (2 cells) so the relaxation cannot land silently.
+
+Also: `audit_reference_examples.sh` emitted `Slab(Task) heap;` ahead of a block declaring its
+own `struct Task`, so four correct examples were baselined as broken; baseline 82 -> 74.
+
+Tests: `tests/zer_fail/{spawn_race_factory_switch,spawn_race_factory_dowhile,isr_race_factory_switch}.zer`,
+`tests/zer/{vrp_loop_addr_taken_spawn,cast_bool_canonical_all_forms,funcptr_return_all_spellings}.zer`,
+`tests/zer_trap/opaque_cast_assign_typeid.zer`.
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

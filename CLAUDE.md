@@ -396,7 +396,10 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | Wrapper hides the inner kind (`?T`, `distinct T`, array-of, by-value struct CARRYING a pointer) | keep-reg, escape sinks, spawn args, array→slice coercion | **`tools/audit_carrier_dispatch.sh` + `carrier_dispatch_baseline.txt`** (CLOSED 2026-08-01). Freezes the 33 hand-rolled carrier disjunctions; a NEW one FAILS the build. Fix by using a carrier PREDICATE (`type_carries_data_pointer` / `type_can_carry_pointer` / `escape_type_carries_ref` — all recurse optional/array/struct/union), not a hand-rolled `k == TYPE_POINTER \|\| k == TYPE_SLICE`. **NOT a blanket accessor** — see below. Exhaustive half = `LD_OPTWRAP` axis in `test_escape_matrix.c` |
 | **`volatile` race-check EXEMPTION ("is this global safely single-word?")** | spawn path (`scan_unsafe_global_access`), ISR path (`check_interrupt_safety`) | ONE predicate `volatile_global_exempt_from_race_check` + the **SITE x SHAPE volatile grid** in `tests/test_hw_matrix.c`. The grid crosses site with shape so the two sites must AGREE — fixing one and missing the sibling fails the build (that is exactly what happened 2026-08-03) |
 | **Concurrency arg gates ("does this arg let the child reach my memory?")** | spawn-arg Handle gate, spawn-arg pointer gate, stack-carrier arm, spawn transfer marking | **CARRIER GRID in `tests/test_conc_matrix.c`** (carrier x payload x sink, no-`default:` enums so a new carrier fails `-Werror=switch`). Fix by calling `type_carries_handle` / `type_carries_nonshared_pointer`, never a bare `eff->kind ==` test |
-| **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64) |
+| **Funcptr REACH ("does the callback this spawn target invokes touch a non-shared global?")** | direct name, reassigned local, struct FIELD, array element, **field-array element**, factory 1-hop, factory n-hop, **forwarded PARAM**, spawn-ARG binding — and, crossing all of those, **WHERE the factory's `return` sits** (top level / if / for / while / do-while / switch arm / defer / @critical / @once) — and the ISR sibling of every one | **REACH GRID in `tests/test_conc_matrix.c`** (reach x payload at the spawn sink, PLUS an ISR sub-grid at the interrupt sink — run it for the current cell count). Patched SEVEN times across four sessions before the axis existed; the n-hop factory, the field-array element and the forwarded param were all found BY the enumeration, never reported. Fix by extending `scan_funcname_binding` / `scan_returned_funcname` / `func_forwards_param_to_spawn`, never by adding another ad-hoc resolver. **The ISR path is a SEPARATE sink set WITH ITS OWN GRID CELLS — fix BOTH in the same commit** (`record_isr_globals` / `record_isr_funcname_binding`). All nine forms covered at both sinks as of BUG-783; ISR cells are NEGATIVE-only (GCC refuses ISRs on hosted x86-64). **BUG-961 added a SECOND axis: the statement POSITION of the factory's `return`.** `scan_returned_funcname` was an if-chain over RETURN/BLOCK/IF/WHILE/FOR, so a `return cb;` in a **switch arm** or a **do-while body** was never reached and the race was accepted; the ISR sibling had DO_WHILE but not SWITCH — the two sinks one kind apart. **Probe design is load-bearing here:** a factory that ALSO returns the racy callback on the fall-through is rejected by the plain-RETURN arm and proves nothing, which made two forms read as "already covered". Return a SAFE callback everywhere except the construct under test |
+| **Cast policy ("what does `(T)x` emit?")** | `emit_expr` NODE_TYPECAST (global inits), `emit_rewritten_node` NODE_TYPECAST (plain assigns, **defer bodies**, spawn args), `emit_ir_inst` IR_CAST (3AC) | **CLASS-KILLED 2026-09-02 (BUG-963): `classify_cast()` + `emit_cast_value()` hold the decision AND the emission once; each site supplies only its operand via `CastOperand`.** The form enum has no `default:`, so a new cast form is a build error at all three. `grep -c "type mismatch in cast" emitter.c` must stay **1** — a 2 means someone re-inlined the policy. Pre-kill, sites 1+3 had 4 behaviours and site 2 had 1, so `(bool)5` stored 5 (truthy AND != true) and a `*opaque` cast lost its type-id trap |
+| **Funcptr-return declarator ("does this function RETURN a funcptr?")** | IR signature emitter, AST prototype emitter | ONE query **`funcptr_return_shape()`** (peels `distinct` + null-sentinel `?`). BUG-964 was BUG-879 one sink over: the array-element site peeled both wrappers, the return site tested `->kind == TYPE_FUNC_PTR` raw, so `?VFn f()` emitted an abstract declarator and GCC refused a valid ZER program |
+| **Shared-struct AUTO-LOCK ("was the mutex actually EMITTED?")** | every statement-body form a shared access can sit in (function body, if/else, for, while, do-while, switch arm **braced and BARE**, `@critical`, `@once`, defer braced and bare, nested block) | **`tests/test_sharedlock_matrix.c`** (NEW 2026-09-02, BUG-965). Reads the EMITTED C, because the defect produces no diagnostic AND no single-threaded runtime signal — a data race is not observable from one thread. The accept/reject matrices structurally cannot see this class: both spellings are accepted. A bare switch arm (`0 => g.x = 5,`) emitted an unsynchronized write to shared memory |
 | **Launder peel ("does this wrapper preserve the value's provenance / allocation identity?")** | every escape/free sink in `checker.c` **AND** the alloc-identity sinks in `zercheck_ir.c` — the two files are ONE question, not two | `checker.c` → `unwrap_ptr_launder`; `zercheck_ir.c` → `ir_peel_launder`. Gate = **p15 (stack escape) + p15b (carrier x sink: heap/arena/keep) in `tools/sink_matrix.sh`**. A `orelse` is a JOIN (two nodes, not one) so it needs the PREDICATE `value_frame_bound_symbol`, not a peel. **BUG-931 found EIGHT partial peelers, each knowing a different SUBSET of carriers** (`(*T)` / `@ptrcast` / `@pun` / `@bitcast` / `@cast` / `@container` / `@cstr`), so every carrier was rejected at some sinks and accepted at others — invisible to any single-sink test. When you add a launder-aware site, CALL the shared peeler; when you add a CARRIER, add its p15b cells. Two live constraints: `zercheck_ir`'s intrinsic set is an ALLOWLIST (peeling `@ptrtoint` would alias a scalar to an allocation), and a peel that yields a bare ARRAY is a decay only when the DESTINATION is a pointer (between two arrays it is a value COPY — that over-rejection broke `test_emit`'s volatile byte-loop case) |
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). The SPELLING axis matters as much as the site axis: `g = @truncate(u32,g)+1`, `g = idfn(g)+1` and `g = maybe(g) orelse 0` were all accepted at BOTH sinks until BUG-841, because the underlying walker was an if-chain that returned "no" for unlisted node kinds |
 | **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
@@ -426,8 +429,38 @@ pick an emission form. A blanket `type_optional_kind()` would fix the safety sin
 So `emitter.c` is EXCLUDED from the gate and the linter forces a per-site choice instead of a rewrite.
 When two class-kills look alike, check whether the wrapper is representation-preserving first.
 
-**A matrix can assert a RUNTIME VALUE, not just accept/reject — use that when the defect class is a
-silent MISCOMPILE.** Eight of the nine grids check a diagnostic; `tests/test_defer_goto_matrix.c`
+**ASan MAY BE A NO-OP IN YOUR SANDBOX — verify it before trusting a clean run (2026-09-02, confirmed again 2026-09-06).**
+In the cloud/container environment this project is audited from, a hand-written
+`unsigned char a[4]; unsigned i=100; a[i]=7;` compiled with `-fsanitize=address` **runs clean and
+exits 0**. ASan needs facilities (ptrace, personality, large VA reservations) that a restricted
+sandbox can withhold, and it fails OPEN — no warning that it is inert. Several rules in this file
+say "ASan-confirmed"; that phrasing assumes a working ASan. **Before concluding "no ASan report ⇒
+no bug", run the four-line positive control above and confirm it aborts.** When ASan is inert,
+establish memory findings the way BUG-962 was: read the emitted C for the guard, and make the
+defect observable as an exit code that differs between a pre-fix and post-fix build.
+
+**A BASELINE ROW WITH NO STATED REASON IS AN UN-REVIEWED HOLE WEARING A REVIEWED BADGE
+(2026-09-02, cost a shipped silent stack-OOB).** The audit baselines (`walker_field_baseline.txt`,
+`type_dispatch_baseline.txt`, `fixed_buffer_baseline.txt`, `carrier_dispatch_baseline.txt`,
+`reference_example_baseline.txt`) exist so a flagged site becomes *a conscious decision*. That only
+holds if the decision is WRITTEN DOWN. BUG-962 was a live silent out-of-bounds stack write whose
+row — `vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args` — was already sitting in
+`walker_field_baseline.txt`, bulk-added under a bare `# --- checker.c: <function> ---` header with
+no sentence explaining why the skip was correct; BUG-941 was the same shape one row over. **The
+gate found the bug and the baseline buried it.** RULE: every row (or contiguous block of rows) you
+add needs the sentence that says why the omission is right. A block header naming the function is
+NOT a justification.
+
+**AN IF-CHAIN WALKER IS INVISIBLE TO *BOTH* KIND-LEVEL GATES — converting it IS the fix.**
+`walker_default_audit.sh` greps kind-SWITCHES and `audit_walker_fields.sh` reads `case` ARMS, so a
+walker written as `if (k == NODE_X) ... else if (k == NODE_Y) ...` is covered by neither. BUG-961
+and BUG-962 were both if-chains whose trailing comment asserted "all other kinds are leaves"; both
+assertions were false, for `NODE_SPAWN` (`spawn_stmt.args[]`), `NODE_AWAIT` (`await_stmt.cond`)
+and `NODE_ASM` (operand exprs). When you touch a safety if-chain, convert it to a no-`default:`
+switch in the same commit and baseline its intentional no-ops with reasons.
+
+**A matrix can assert a RUNTIME VALUE — or the EMITTED C — not just accept/reject. Pick the
+observable the defect actually moves.** Eight of the nine grids check a diagnostic; `tests/test_defer_goto_matrix.c`
 (2026-08-02) instead compiles, RUNS, and checks an acquire/release BALANCE, because the class it
 guards (a `defer` firing on a path whose registration never executed) produces no diagnostic at all —
 just an unbalanced lock/close/free. Two rules that made it work: pick a measurement that is INVARIANT
@@ -441,13 +474,13 @@ like a compiler failure.
 
 **WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-08-27 — do not quote from
 memory, the census in this file was once wrong by 2x).** NINE gates, each printing its own verdict
-line, plus TEN axis-crossed matrices:
+line, plus TWELVE axis-crossed matrices:
 
 | gate | verdict line it prints |
 |---|---|
 | `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
 | `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
-| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (752 baselined)` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (826 baselined)` |
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
@@ -455,7 +488,8 @@ line, plus TEN axis-crossed matrices:
 | `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 
-Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto.
+Matrices: shape / escape / keep / cflow / conc / view-alias / **sharedlock** / **borrow-join** /
+hw / async / asm / defer-goto.
 
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of

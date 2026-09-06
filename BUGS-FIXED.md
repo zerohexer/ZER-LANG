@@ -1048,6 +1048,36 @@ Tests: `tests/zer_fail/{container_whole_object,_alias,_direct,_global,container_
 
 ---
 
+## Session 2026-09-06 — BUG-971: the `*opaque` ERASURE recorded type_id 0, which is a claim, not a gap (from `vigilant-tesla-ef9cao`)
+
+Cherry-pick of `72aafad` (their BUG-918), the ROOT of BUG-969. Resolved into the BUG-963
+cast class-kill: `emit_cast_value` now takes its ids from `zer_pointee_tid`, and the
+class-kill's own aggregate-only helper is deleted, so there is ONE producer of the erasure
+id in the emitter. `grep -c "type mismatch in cast" emitter.c` stays at 1.
+
+```zer
+struct Big { u64 a; u64 b; }
+u32 use_as_big(*opaque ctx) { *Big m = @ptrcast(*Big, ctx); return (u32)m.b; }
+u32 raw = 77;  *opaque c = @ptrcast(*opaque, &raw);  use_as_big(c);   // RAN — 16-byte read of 4 bytes
+```
+
+Every unwrap guards with `type_id != EXPECTED && type_id != 0`, where 0 means "unknown
+origin, a C pointer we cannot vouch for" — the FFI floor. But the WRAP computed an id for
+struct/enum/union only, so erasing any other pointer recorded 0: a positive claim of
+ignorance about a pointer whose type the compiler knew. A sentinel meaning two different
+things, with twelve producers meaning one and the single consumer reading the other. Fixed
+at the ERASURE: non-aggregate pointees get a reserved id (`0x7F000000 + kind*256 + width`)
+in a range `next_type_id` cannot reach, width-qualified for uN/iN. Kind-granular otherwise,
+the safe direction: two types sharing an id can only fail to trap, never trap wrongly.
+`*opaque` stays 0. Two ids, not one: a DIRECT pointer-to-pointer `@pun` keeps the
+aggregate-only `zer_pointee_tid_agg` (the checker has already ruled statically; a runtime
+trap there would break `@pun(*u8, structptr)`).
+
+Tests: `tests/zer_trap/ptrcast_opaque_prim_origin_trap.zer` (pre-fix rc=0, silently out of
+bounds), `tests/zer/ptrcast_opaque_roundtrip_ok.zer` (primitive, struct and distinct origins).
+
+---
+
 ## Session 2026-08-27 — BUG-909..912: four holes `osp1a7` found that survived everything else
 
 `claude/vigilant-tesla-osp1a7` forked at `ae033cd0`, twelve commits behind, so eleven of

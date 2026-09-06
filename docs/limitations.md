@@ -324,6 +324,38 @@ remap needed.
 That route touches neither the AST nor the typemap, so BOTH prerequisites disappear, and
 it is tens of lines instead of a 53-kind walker.
 
+**STAGE 2 WAS BUILT AND MEASURED 2026-09-07, then reverted — do not re-derive any of
+this.** The splice works; it is the emitter that is not ready. What was proven, on a
+working build:
+
+- **Lazy materialisation, not eager.** Lowering each body at REGISTRATION into a
+  detached range and extracting it works, but leaves the body's temps as locals no
+  fire uses — every defer-using function grew dead declarations, and 12 of 60 defer
+  programs changed their emitted C for no benefit (for an async function locals ARE
+  the state struct). Lowering at the FIRST fire and cloning at later ones has no such
+  cost: the first copy is live.
+- **The CFG splice is correct.** Measured by making the body fire twice on purpose:
+  `defer { g += 1; }` went 11 -> 12, a two-fire-site function 12 -> 14, and a body
+  containing `for` + `if` + `break` went 106 -> 112 — exactly two extra runs, so the
+  CLONE's internal branches remapped correctly.
+- **The two runtime gates express fine as IR branches** — guard (skip when SET) outside,
+  armed (run when SET) inside, matching the emitter's nesting.
+- **Instruction arrays are arena-allocated**, so a snapshot's pointers stay valid; the
+  implementation deep-copies anyway rather than depend on that.
+- **The whole defer corpus ran with the splice on: 0 crashes, 0 hangs.** The 20
+  failures were all `zercheck failed` — the body counted TWICE, once through the new
+  CFG and once through zercheck's AST scan. That is the expected transition state and
+  confirms where the remaining work is: `zercheck_ir`'s AST defer analysis is
+  concentrated in four places (the C3 pass at ~7601, the IR_DEFER_FIRE handler at
+  ~6352, `ir_defer_instance_index` at ~2657, and the op skip at ~2633).
+- **IR_DEFER_PUSH / IR_DEFER_FIRE must STAY** for `ir_validate`'s push/fire balance
+  check; only body EMISSION moves out of the emitter.
+- **Sound to lower a defer body at all** because every `orelse` form is banned inside
+  one — value fallback, var-decl, return, break, continue, all measured — so
+  `pre_lower_orelse` is a no-op there and cannot mutate the AST out from under a later
+  fire. (Those bans exist only because the raw-AST emitter cannot express a branch;
+  after L they can be relaxed.)
+
 **Staging:**
 
 1. IR block-range cloner (`ir.c`) — copy a range, remap the three block-index fields.
@@ -341,8 +373,10 @@ because a real bug got through; none of them is optional.
 
 ### ORDER OF L AND M — MEASURED 2026-09-06, do not re-derive
 
-**L FIRST, THEN M.** This reverses an earlier recommendation of mine that ordered them
-by SIZE (M is smaller) rather than by what each actually fixes. Every line below was
+**M FIRST, THEN L** — corrected 2026-09-07; see the dependency note at the end of this
+section, which is the authoritative line. (This section first said L-before-M, itself a
+correction of an even earlier size-based ordering. The severity comparison below stands
+— L fixes more, and worse — but M is the PREREQUISITE, so it goes first.) Every line below was
 measured against main at `b925a871` by INSPECTING EMITTED C, never by exit code — the
 auto-guard is a silent `if (...) return;`, so exit 0 can mean "the guard fired". Reading
 exit codes gives the wrong answer here, and it gave me one twice during this check.
@@ -375,11 +409,29 @@ drop a guard**, because lowering funnels conditions through gated ops first. Pro
 clean: `if` / `while` conditions, for-init, IR_BINOP, `@critical`, `@once`, an async
 body, and an async `await` condition.
 
-**Dependency, measured rather than assumed:** L fixes the three unguarded defer
-positions, because lowering the body into the IR routes it through the ordinary gated
-path. M does NOT — its gate never sees a defer body. And L makes M strictly smaller and
-safer, since M's choke-point change then applies to a codebase with ONE statement
-emitter instead of two. There is no dependency in the other direction.
+**Dependency — CORRECTED 2026-09-07 by building the splice and hitting the wall. The
+order is M FIRST, THEN L.** The earlier conclusion here ("no dependency in the other
+direction") was wrong, and it was wrong because it was reasoned rather than built.
+
+L fixes the three unguarded defer positions and M does not — that half still holds. But
+**L cannot COMPLETE without M**, for a reason only visible from the emitter side:
+
+`emitter.c:540` is the auto-guard early return, and it calls `emit_defers(e)` — the
+RAW-AST path — because an out-of-bounds index must run the pending cleanup before it
+returns. That exit is synthesised as C by the emitter and does not exist in the IR at
+all. So while auto-guards live outside the IR:
+
+- if defer bodies are spliced into the CFG *and* still emitted at that exit, they
+  DOUBLE-FIRE on the guard path;
+- if they are spliced and NOT emitted there, cleanup is SKIPPED on the guard path —
+  a leak, which is worse.
+
+Either way `emit_defer_stmt` cannot be deleted. **M is exactly what removes the
+obstacle**: lowering auto-guards into the IR as branches makes every early exit an IR
+edge, after which L's splice covers all of them and the second emitter can die. (The
+same tension is already visible in that site's own code: inside a defer body or a held
+lock the auto-guard TRAPS instead of returning, with the comment *"cannot return without
+leaking it"*.)
 
 ### SUGGESTED ORDER
 

@@ -464,6 +464,62 @@ static void emit_shared_ensure_init(Emitter *e, Node *root, const char *arrow) {
 }
 static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn);
 static void emit_auto_guards(Emitter *e, Node *node);
+
+/* BUG-953 (refactor M, the structural half): does this op kind's `expr` get
+ * auto-guards emitted before it?
+ *
+ * This used to be an ALLOWLIST of eight op kinds written inline at the emission
+ * loop — in TWO copies, regular and async. An allowlist FAILS OPEN: an op kind
+ * nobody added silently got no guard, while the checker had already printed
+ * "auto-guard inserted". It was widened reactively three times, each after a
+ * measured miscompile — async emission (2026-05-03/06), IR_AWAIT and IR_NOP
+ * (2026-06-30), and IR_LOCK (BUG-952).
+ *
+ * Inverted, it FAILS CLOSED: an op kind nobody classified gets guarded, and the
+ * worst case is a redundant check that is dead on the safe path — never a missing
+ * one. That is the same conservative-default rule the rest of this compiler uses:
+ * an unclassifiable form must round toward the SAFE answer.
+ *
+ * A no-default switch is the mechanism, not an if-chain, so a NEW IROpKind is a
+ * BUILD FAILURE under -Werror=switch until someone classifies it, rather than
+ * silently inheriting a default. That is the strongest of the mechanisms
+ * CLAUDE.md lists, and it is free here because the sites are an enum. */
+static bool ir_op_takes_auto_guards(IROpKind op) {
+    switch (op) {
+    /* EXCLUDED — guarding here would be wrong, not merely redundant.
+     *
+     * IR_UNLOCK carries the same indexed shared root as IR_LOCK, but it runs with
+     * the lock HELD. emit_safety_early_return cannot return there (it would leak
+     * the mutex) so it would emit a trap — and the LOCK guard has already taken a
+     * clean early return on that path, so the check is both unreachable and
+     * misleading. IR_LOCK is guarded; its partner must not be. */
+    case IR_UNLOCK:
+        return false;
+
+    /* Everything else is guarded when it carries an expr. Listing each kind rather
+     * than writing `default: return true` is the whole point: the compiler now
+     * refuses to build when a kind is added and nobody has decided. */
+    case IR_ASSIGN: case IR_CALL: case IR_BRANCH: case IR_GOTO:
+    case IR_RETURN: case IR_YIELD: case IR_AWAIT: case IR_SPAWN:
+    case IR_LOCK:
+    case IR_POOL_ALLOC: case IR_POOL_FREE: case IR_POOL_GET:
+    case IR_SLAB_ALLOC: case IR_SLAB_FREE: case IR_SLAB_FREE_PTR:
+    case IR_SLAB_ALLOC_PTR:
+    case IR_ARENA_ALLOC: case IR_ARENA_ALLOC_SLICE: case IR_ARENA_RESET:
+    case IR_RING_PUSH: case IR_RING_POP: case IR_RING_PUSH_CHECKED:
+    case IR_CRITICAL_BEGIN: case IR_CRITICAL_END:
+    case IR_DEFER_PUSH: case IR_DEFER_FIRE:
+    case IR_LITERAL: case IR_BINOP: case IR_UNOP: case IR_COPY:
+    case IR_CAST: case IR_ADDR_OF: case IR_DEREF_READ:
+    case IR_FIELD_READ: case IR_FIELD_WRITE:
+    case IR_INDEX_READ: case IR_INDEX_WRITE: case IR_SLICE_READ:
+    case IR_INTRINSIC: case IR_INTRINSIC_DECOMP:
+    case IR_CALL_DECOMP: case IR_STRUCT_INIT_DECOMP: case IR_ORELSE_DECOMP:
+    case IR_NOP:
+        return true;
+    }
+    return true;   /* unreachable; conservative if a cast smuggles a bad value in */
+}
 static void emit_defers(Emitter *e);
 
 /* Emit the zero value for a type (used by auto-guard return, auto-orelse).
@@ -13198,10 +13254,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                  * nobody had added. The list is hand-maintained and has been widened
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP ||
-                    k == IR_LOCK) {
+                if (ir_op_takes_auto_guards(k)) {
                     emit_auto_guards(e, ins->expr);
                 }
             }
@@ -13412,10 +13465,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                  * nobody had added. The list is hand-maintained and has been widened
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
-                if (k == IR_ASSIGN || k == IR_CALL || k == IR_RETURN ||
-                    k == IR_INTRINSIC || k == IR_CALL_DECOMP ||
-                    k == IR_INDEX_READ || k == IR_AWAIT || k == IR_NOP ||
-                    k == IR_LOCK) {
+                if (ir_op_takes_auto_guards(k)) {
                     emit_auto_guards(e, ins->expr);
                 }
             }

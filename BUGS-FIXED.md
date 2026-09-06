@@ -554,6 +554,69 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-953: the auto-guard gate now FAILS CLOSED (refactor M)
+
+M's structural half. The op-kind gate deciding which instructions get auto-guards was
+an ALLOWLIST of eight kinds, written inline at the emission loop, in TWO copies
+(regular and async). It is now one exhaustive `switch` shared by both.
+
+### The point is the direction of failure, not the list
+
+An allowlist **fails open**: an op kind nobody added silently got no guard, while the
+checker had already printed *"auto-guard inserted"* — a promise the emitter did not
+keep. That failure mode is not hypothetical; the list was widened reactively THREE
+times, each after a measured miscompile:
+
+| when | added | why |
+|---|---|---|
+| 2026-05-03/06 | the whole async copy | async functions silently miscompiled unproven `arr[i]` |
+| 2026-06-30 | `IR_AWAIT`, `IR_NOP` | await conditions and spawn args |
+| 2026-09-07 | `IR_LOCK` | BUG-952 — the guard landed inside the lock |
+
+Inverted, it **fails closed**: an unclassified kind gets guarded, and the worst case is
+a redundant check that is dead on the safe path — never a missing one. That is the same
+conservative-default rule the rest of the compiler uses.
+
+The mechanism is a no-default `switch`, not an if-chain, so a NEW `IROpKind` is a BUILD
+FAILURE until someone classifies it. **Verified by adding a fake op kind:**
+
+```
+emitter.c:488:5: error: enumeration value 'IR_FAKE_NEW_OP' not handled in switch [-Werror=switch]
+```
+
+That is the strongest mechanism CLAUDE.md lists, and it is free here because the sites
+are an enum.
+
+### What it does NOT claim
+
+**It closed no live hole.** All nine ungated expr-carrying op kinds were probed
+individually (BUG-952) and every one was already covered, because an index funnels
+through an already-gated op during decomposition. The value here is entirely
+prospective — the next op kind cannot silently lose its guard. Saying otherwise would
+overstate it.
+
+### Cost, measured
+
+Across all 587 files in `tests/zer/`: **11 extra guards, 0 lost.** The extras are
+redundant, e.g. an `IR_BINOP` whose `expr` still carries `arr[b]` in the AST although
+the read was already decomposed and guarded one line above. Dead on the safe path.
+
+### One exclusion, and why
+
+`IR_UNLOCK` carries the same indexed shared root as `IR_LOCK` but runs with the lock
+HELD, so `emit_safety_early_return` could not return there (it would leak the mutex)
+and would emit a trap — unreachable anyway, because the LOCK guard already returned
+early on that path. `IR_LOCK` is guarded; its partner must not be.
+
+### Residual
+
+The gate is now complete over op KINDS, but still depends on the index being reachable
+from `ins->expr`. An op carrying a guardable index somewhere else would still be missed.
+Closing that is the remaining part of M — moving guards into the IR as branches, which
+is also what L needs.
+
+`make check` exit 0, nine gates, 1485.
+
 ## Session 2026-09-07 — BUG-952: the auto-guard fired INSIDE the lock it should precede
 
 Refactor **M**'s ordering half, and a measured instance of the gate defect M exists to

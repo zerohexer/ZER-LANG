@@ -492,12 +492,12 @@ line, plus TWELVE axis-crossed matrices:
 |---|---|
 | `walker_audit.sh` | `OK — no gaps. IR emitter covers every node kind the AST emitter does.` |
 | `walker_default_audit.sh` | `OK — no default: clauses remain in node-kind / op-kind switches.` |
-| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (856 baselined)` |
+| `audit_walker_fields.sh` | `OK — no new walker field-coverage gaps (824 baselined)` |
 | `audit_fixed_buffers.sh` | `OK — no new fixed-size buffer declarations.` |
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
 | `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
-| `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
+| `sink_matrix.sh` | `SINK MATRIX CLEAN` (111 cells) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 | `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` |
 
@@ -1740,9 +1740,9 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 593 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 775 | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 40 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 638 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 825 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 50 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED; `// gap-runtime-exit: N` pins what the program DOES meanwhile) | 11 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |

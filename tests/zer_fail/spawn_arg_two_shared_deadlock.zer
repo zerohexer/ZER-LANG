@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: deadlock: single statement accesses both 'A'
+// BUG-968 (2026-09-07): a spawn ARGUMENT is evaluated under the lock of its
+// first shared root only, so `a.x + b.y` read `b.y` with no lock at all — an
+// unsynchronized cross-thread read. The per-statement two-shared-types rule
+// treated the whole spawn statement as a no-op; it now applies per argument.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void w(u32 v) { a.x = v; }
+u32 main() { spawn w(a.x + b.y); return 0; }

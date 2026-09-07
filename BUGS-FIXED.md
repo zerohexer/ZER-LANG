@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-07 — BUG-959..973: the r3an9y class set, plus five found by writing the tests
+
+Fifteen fixes. Nine close the `loving-davinci-r3an9y` items B..I recorded in
+`docs/limitations.md` (all re-measured live on main first, per the MEASURE-FIRST rule);
+the other six were found while writing their tests — three of them silent MISCOMPILES the
+checker and GCC both accepted. Every negative carries `// expect-error:` and was run
+against a pre-fix build to prove it was a live hole; every positive was run to exit 0.
+
+| # | class | shape that compiled clean (pre-fix) | fix (one site each) | test |
+|---|---|---|---|---|
+| **959** | bounds forge | `s.len = 100; s[50] = 1;` — also `s.len += 1`, `&s.len` | `is_slice_header_field` at NODE_ASSIGN + TOK_AMP: the slice header is read-only | `zer_fail/slice_{len,ptr}_assign_forge`, `slice_len_addr_forge`, `slice_len_compound_assign_forge`; `zer/slice_header_read_ok` |
+| **960** | bare-metal TOCTOU | `arr[g_i]` with `volatile g_i`: the auto-guard reads `g_i`, the access reads it AGAIN; VRP also narrowed a volatile through `if` | volatile index is never proven/guarded (`vrp_key_root_is_volatile`); emitter takes the single-read inline trap form; MMIO index by a volatile is refused | `zer_trap/volatile_ident_index_oob_trap`, `zer/volatile_ident_index_single_eval`, `zer_fail/mmio_volatile_index_reject`; `emit_audit.sh` REQUIRED fingerprint (verified RED pre-fix) |
+| **961** | over-rejection | `S s = { .f = 5 };` at GLOBAL scope → "cannot initialize 's' with 'void'" | global-var init path now runs `validate_struct_init` | `zer/global_designated_init` |
+| **962** | null as non-null | `*T pick(?*T o){ *T t = o orelse return; return t; }` returned NULL typed `*T`; funcptr variant compiled too | `nonnull_zero_hole` on the return type at NODE_ORELSE with `fallback_is_return` | `zer_fail/orelse_return_{nonnull_ptr,funcptr}_fn`; `zer/orelse_return_optional_ptr_ok` |
+| **963** | MISCOMPILE | `{ .opt = null }` on a `?u32` field emitted `{0, 1}` — Some(0), not None | `struct_init_null_field_type` wired at all THREE struct-init emitters (AST, IR fallback, IR_STRUCT_INIT_DECOMP) | `zer/struct_init_null_field` (exit 1 pre-fix) |
+| **964** | false leak | `?*T pick(?*T o){ *T t = o orelse return; return t; }` — caller's result "never freed" | summary arm (c5): an unwrapped optional PARAM is a param view | covered by `orelse_return_optional_ptr_ok` |
+| **965** | GCC error on accepted code | `void touch(){ g = 1; } u32 g;` / `u32 (*cb)(u32) = handler; u32 handler(..)` — checker resolves top-level names in a pre-pass, emitter wrote C in source order | ONE header emitter `emit_func_header` (was three drifted copies) + `emit_func_prototypes`; main path now prototypes → globals → bodies like the module path | `zer/forward_global_ref` |
+| **965b** | INTERNAL abort on accepted code | `pick(0)(5)` — a callee that is itself a call/orelse | IR_CALL callee arm emits `(expr)(args)` | `zer/callee_expression_call` |
+| **965c** | GCC error on accepted code | `?*(u32) -> u32 f()` — optional funcptr return emitted `T (*)(A) f()` | nested-paren form for the optional wrapper too | `zer/optional_funcptr_return` |
+| **966** | UAF | `*u32 q = &p.get(h).v; p.free(h); *q = 7;` and `[*]u8 s = h.arr[0..]` / `p.get(h).arr[1..]` | `ir_view_root_handle`: walks FIELD/INDEX/SLICE/deref, resolves `.get(h)` through the compound key; called from BOTH the `&` arm and the subslice arm of IR_ASSIGN | `zer_fail/pool_slot_view_uaf`, `pool_slot_slice_view_uaf`, `slab_get_slice_view_uaf`; `zer/pool_slot_view_ok` |
+| **967** | data race / torn RMW | `void w(){ static u32 c; c += 1; } spawn w(); spawn w();` and the ISR sibling | scan-scoped `_static_alias` table pushed by ONE helper from both walkers; `resolve_write_target_global` sees statics; `IsrGlobal.static_sym` keys the ISR entry by SYMBOL; `Checker.static_locals` registry | `zer_fail/static_local_{spawn_race,spawn_transitive_race,isr_race}`; `zer/static_local_ok` |
+| **968** | unlocked shared read | `spawn w(a.x + b.y)` — second root read with no lock | the two-types rule applies PER spawn argument (the emitter's lock scope) | `zer_fail/spawn_arg_two_shared_deadlock` |
+| **969** | data race | `*u32 q = &v; ThreadHandle th = spawn w(q); v = 3;` / `*q = 3` / `[*]u8 s = buf; ... buf[1] = 2` | `spawn_arg_borrow_roots`: `&e`, a slice, or a pointer/slice-carrying local AND the storage its initialiser chain addresses (`ptr_local_storage_root`) | `zer_fail/scoped_spawn_borrow_{via_pointer,write_through,via_slice_local}`; `zer/scoped_spawn_borrow_join_ok` |
+| **970** | aliased allocator state | `Arena b = a;`, `use(Barrier)`, `return gs` (Semaphore), a struct carrying one | `type_carries_unique_resource` asked by `value_flows_to` — all eight sinks refuse together; `.over(buf)` (both the `Arena.over` and the `ar.over` spelling — `arena_backing_shapes_ok` uses the second) and a struct literal are the only by-value producers | `zer_fail/resource_copy_{arena,carrier_struct,barrier_param,semaphore_return}`; `zer/resource_construct_in_place_ok` |
+| **971** | misaligned view | `[*]u32 s = p.w[0..]`, `= p.w`, `&p.w[1]`, `fill(p.w)` on a `packed` struct | `value_is_packed_derived_into(c, v, dest, dest_is_param)`: the DESTINATION decides view vs copy (slice, or an ARRAY PARAM — by-reference in the emitted C, measured); indexing a packed-derived slice refused; a 1-byte-aligned element (`u8[N]` payload) is exempt — it cannot be misaligned, and `super_uart_parser` proved the rule must know that | `zer_fail/packed_array_field_{slice_view,coerce_view,elem_addr,callarg_view}`; `zer/packed_array_field_copy_ok` |
+| **972** | unlocked shared access | a `shared` field bound as a structured-asm operand | REJECT (Ban framework #1: a naked function has no frame for the lock) | `zer_fail/asm_shared_operand` |
+| **973** | MISCOMPILE | `u32[2] c = q.w;` — array local initialised from an array FIELD kept `{0}` (the init was emitted as the bare statement `q.w;`) | var-decl lowering synthesises `c = <init>` so it reaches the AST array-memmove emitter | `zer/array_init_from_field` (exit 2 pre-fix) |
+
+### The lessons worth keeping
+
+- **Writing the positive test is where three of the miscompiles surfaced** (963, 965c,
+  973): each was a shape the corpus never spelled. "Real code finds real bugs" held again,
+  one level down — the test for a checker fix exercises emitter paths nobody tested.
+- **An emitted-C fact decided a rule.** Whether `take(u32[2] arr)` is a view or a copy is
+  not a language question but a C-decay one; measured (`arr[0] = 42` reached the caller),
+  and the packed rule's `dest_is_param` flag exists because of that measurement.
+- **The Ban framework settled 972 in one line**: the lock cannot be emitted where there is
+  no frame, so the access is refused, not tracked.
+- **A rule that refuses a copy must leave a working alternative.** BUG-970's remedy "pass
+  `&arena`" turned out not to work for Arena METHODS (pre-existing, measured on the old
+  build) — recorded as a new OPEN entry rather than shipped as advice that fails.
+
+---
+
 ## Session 2026-09-04 — BUG-931: EIGHT partial launder peelers, one question
 
 Survey CLASS 2 (the heap/UAF launder sink, recorded from `lzmkhn` / `fhf8rn` / `1zukjq` /

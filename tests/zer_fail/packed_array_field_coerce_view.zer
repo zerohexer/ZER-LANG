@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: views a PACKED struct field
+// BUG-971 (2026-09-07): the implicit array→slice coercion spelling of the
+// same view (`[*]u32 s = p.w;`).
+packed struct P { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    [*]u32 s = p.w;
+    s[0] = 1;
+    return 0;
+}

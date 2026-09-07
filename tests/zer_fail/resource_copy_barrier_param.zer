@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot copy a 'Barrier' by value
+// BUG-970 (2026-09-07): the CALL-ARG sink. A Barrier passed by value copies
+// its mutex/condvar/count — the callee waits on a private copy nobody signals.
+// Pass `*Barrier` (the intrinsics accept the pointer form).
+void use(Barrier b) { @barrier_wait(b); }
+Barrier gb;
+u32 main() { @barrier_init(gb, 1); use(gb); return 0; }

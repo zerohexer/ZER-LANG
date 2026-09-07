@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'c'
+// BUG-967 (2026-09-07): the static local sits one call below the spawn target.
+// The scan descends into `bump`; the static declared THERE must be visible to
+// the uses that follow it in that body.
+void bump() { static u32 c = 0; c = c + 1; }
+void w() { bump(); }
+u32 main() { spawn w(); bump(); return 0; }

@@ -229,6 +229,9 @@ typedef struct {
     struct IsrGlobal {
         const char *name;
         uint32_t name_len;
+        Symbol *static_sym;     /* BUG-967: a function-scope `static` local (keyed by
+                                 * symbol, not name — two functions may each own a
+                                 * `static u32 c`); NULL for a true global */
         bool from_isr;          /* accessed inside interrupt body */
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
@@ -236,6 +239,16 @@ typedef struct {
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;
+
+    /* BUG-967: every function-scope `static` local, registered at its declaration.
+     * A static local has global STORAGE (one instance, shared by every caller and
+     * every thread/ISR that reaches the function) but a scope that closes with the
+     * function, so the race scans that walk ANOTHER function's body from the
+     * caller's scope could never resolve its name. The walkers look the symbol up
+     * by its declaration node when they visit the `static` var-decl. */
+    Symbol **static_locals;
+    int static_local_count;
+    int static_local_capacity;
 
     /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
      * recorded during check; post-check flags any whose symbol got marked

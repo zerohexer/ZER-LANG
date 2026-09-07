@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: reads or writes shared struct 'S' with no lock
+// BUG-972 (2026-09-07): a shared struct field bound as a structured-asm
+// operand is accessed RAW — every other accessor is wrapped lock/unlock per
+// statement by the emitter, so this races all of them. Banned rather than
+// tracked: asm lives only in naked functions, which have no frame in which a
+// lock could be taken.
+shared struct S { u32 v; }
+S g;
+naked u32 rd() {
+    asm {
+        instructions: "mov %0, %1"
+        inputs: { "rax" = g.v }
+        outputs: { "rbx" = g.v }
+        safety: "binds a shared field raw to demonstrate the refused shape"
+    }
+    return 0;
+}
+u32 main() { return 0; }

@@ -265,6 +265,18 @@ process(arr);              // auto-coerces: T[N] → [*]T
 - `.ptr` → *T — Raw pointer to first element
 - `.len` → usize — Number of elements
 
+Both are **read-only**. The header is what every bounds check trusts, so a
+writable `.len` would forge any bound in one line (`s.len = 100; s[50] = 1;`).
+Assigning either field, compound-assigning it, or taking its address is a
+compile error. To change what a slice covers, re-slice or re-bind it:
+
+<!-- audit: skip -->
+```zer
+[*]u8 s = buf[0..4];
+s.len = 8;             // COMPILE ERROR — slice header is read-only
+s = buf[0..8];         // OK — a new view
+```
+
 **SUB-SLICING**
 ```zer
 buf[0..3]                  // elements 0,1,2 (exclusive end)
@@ -506,6 +518,19 @@ packed struct SensorPacket {
 }   // exactly 4 bytes, no padding
 ```
 
+**NOTES**
+- Direct field access (`pkt.temperature`, `pkt.w[1]`) is always fine — the
+  compiler emits an unaligned-safe access.
+- A **reference into** a packed struct is not: the address is unaligned, and a
+  load/store through it is a hard fault on ARM/RISC-V. So every VIEW of a packed
+  field is a compile error — `&pkt.f`, `&pkt.w[i]`, a subslice `pkt.w[0..]`, the
+  implicit array→slice coercion (`[*]u32 s = pkt.w;`, `take([*]u32)` with
+  `pkt.w`), passing `pkt.w` to an ARRAY parameter (arrays are by-reference in
+  the emitted C), and returning any of those. Copy the field to an aligned
+  local first (`u32[2] c = pkt.w;` is a real copy and is allowed). A field whose
+  element is ONE byte (`u8`, `i8`, `bool`, `u8[N]`) can never be misaligned, so
+  views of a byte payload stay legal — the case a packed packet exists for.
+
 **SEE ALSO**
 struct, move struct
 
@@ -655,6 +680,28 @@ void greet([*]u8 name) {
 - `void` return = no return value.
 - `?T` return = can return `null` for failure.
 - `static` functions are module-internal (not visible to importers).
+- **Declaration order does not matter** at top level: a body may use a global
+  or call a function declared further down, and a global function-pointer
+  initializer may name a function defined below it. (The emitted C gets
+  prototypes and globals first.)
+- A function may return a **nullable function pointer** (`?*(u32) -> u32
+  f()`), and a call's callee may be any funcptr-typed expression — a call
+  result (`pick(k)(5)`) or an orelse (`(maybe(k) orelse dflt)(5)`).
+
+```zer
+void touch(u32 v) { g = v; }          // g and handler are declared below
+u32 g = 0;
+u32 (*cb)(u32) = handler;
+u32 handler(u32 x) { return x + 1; }
+*(u32) -> u32 pick(u32 k) { if (k == 0) { return handler; } return twice; }
+u32 twice(u32 x) { return x * 2; }
+u32 main() {
+    touch(9);
+    if (g != 9 || cb(1) != 2) { return 1; }
+    if (pick(1)(5) != 10) { return 2; }
+    return 0;
+}
+```
 
 ---
 
@@ -937,10 +984,21 @@ usize E = @size(u32) * 4;        // @size arithmetic
   `@mulw`, and `@truncate` to a non-native `uN`/`iN` width.
 - An assignment inside an initializer (`u32 G = (x = f());`) is reachable and is
   checked the same way.
-- Aggregates cannot be initialised at global scope: there is no array-literal
-  syntax, and a designated initializer (`S g = { .x = 1 };`) is a var-decl,
-  assignment, call-argument and return form only. Assign the fields from an init
-  function instead.
+- A **designated initializer** works at global scope (`S g = { .x = 1 };`),
+  with the same constant-only rule for each field value. Unmentioned fields are
+  zero; `.opt = null` on an optional-value field (`?u32`) is the None value.
+  There is no array-literal syntax, so an array field is filled from a function.
+
+```zer
+struct Cfg { u32 baud; ?u32 parity; bool echo; }
+Cfg cfg = { .baud = 9600, .parity = null };
+u32 main() {
+    if (cfg.baud != 9600) { return 1; }
+    if (cfg.parity) |p| { return 2 + p; }
+    if (cfg.echo) { return 3; }
+    return 0;
+}
+```
 
 **SEE ALSO**
 const, comptime, @size
@@ -962,6 +1020,15 @@ void count() {
 
 static void helper() { }    // not exported
 ```
+
+**NOTES**
+- A static local has **global storage** with a private name: one instance,
+  shared by every thread and every interrupt that reaches the function. The
+  concurrency rules treat it exactly like a global — touching it from a
+  `spawn` target is a data race unless it is a single-word `volatile` flag or
+  accessed with `@atomic_*`, and reaching it from both an `interrupt` handler
+  and main code requires `volatile` (and no read-modify-write). The rules see
+  it through helper calls, the same way they see globals.
 
 ---
 
@@ -1272,7 +1339,19 @@ u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is ba
 
 **NOTES**
 - `orelse return` has no value. The return value comes from the function's return type.
+- Which is the auto-zero of that type: `0` for an integer, `null` for `?T`,
+  nothing for `void`. It is therefore a **compile error** in a function whose
+  return type has no zero value — a non-null pointer `*T`, a non-null function
+  pointer, a slice — because the bare return would hand the caller a null
+  `*T`. Return `?*T` instead, or handle the None case explicitly.
 - For bool-returning functions, restructure to avoid orelse in return path.
+
+<!-- audit: skip -->
+```zer
+struct T { u32 v; }
+*T pick(?*T o)  { *T t = o orelse return; return t; }   // COMPILE ERROR — would return null as *T
+?*T pick2(?*T o) { *T t = o orelse return; return t; }  // OK — None is a value of ?*T
+```
 
 **SEE ALSO**
 ?T, ?*T, if-unwrap
@@ -1453,6 +1532,10 @@ u32 main() {
 - Pool does NOT use heap. Safe for ISR and bare metal.
 - `.get(h)` result is non-storable: `*Task t = tasks.get(h)` is a compile error.
   Must use inline: `tasks.get(h).field`.
+- A VIEW into the slot — `*u32 q = &tasks.get(h).id;`, a subslice of an array
+  field `tasks.get(h).buf[0..]` or `h.buf[0..]` through Handle auto-deref —
+  shares the slot's lifetime: using it after `tasks.free(h)` is a compile error
+  (use-after-free), exactly like using `h` itself. Same for `Slab`.
 - N must be a compile-time constant.
 
 **SEE ALSO**
@@ -1835,6 +1918,14 @@ ar.alloc_slice(Byte, 64);
 ```
 
 **NOTES**
+- An `Arena` (like `Pool`, `Slab`, `Ring`, `Barrier` and `Semaphore`) is a
+  **unique resource**: its header IS its state, so copying it by value —
+  `Arena b = a;`, a by-value parameter, a return, a struct that carries one
+  copied by value — is a compile error (two bump pointers over one buffer
+  would hand out the same bytes). `Arena.over(...)` and a struct literal are
+  the only by-value producers. Reach an arena from a helper through its
+  global name; passing `&arena` to a `*Arena` parameter and calling methods
+  through the pointer is not supported yet (see limitations.md).
 - Arena-derived pointers cannot be stored in global/static variables (compile error).
 - Two allocations from the SAME arena may point at each other; from DIFFERENT
   arenas they may not.
@@ -3204,6 +3295,15 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```
 
 **NOTES**
+- A `volatile` variable used as an **array index** (`arr[vi]`) gets a
+  single-read bounds check: one load into a temporary, the check and the
+  access both on that temporary (a trap on failure). The usual auto-guard
+  (`if (i >= N) return;` then `arr[i]`) reads the index twice, and whatever
+  changes a volatile between the two reads — an ISR, a thread, the peripheral
+  — would walk past the guard. A range proven by an `if` on a volatile is
+  never trusted for the same reason. Copy it to a plain local and guard that
+  to get the zero-cost form. Indexing an MMIO pointer with a volatile index is
+  a compile error (copy it first).
 - Shared globals accessed from interrupt handlers must be volatile. This holds
   even when the ISR reaches the global INDIRECTLY — through a helper, or through
   a function bound to a local function pointer (`*() fp = bump; fp();`).
@@ -3270,6 +3370,13 @@ asm("mov %0, %1" : "=r"(out) : "r"(in));
 - Prefer `@intrinsic()` calls — verified, safe, portable across archs.
 - Use `asm` only for operations not yet covered by intrinsics (new vendor extensions, experimental hardware, niche use cases).
 - For external asm code, use `cinclude "foo.S"` instead.
+
+**OPERANDS**
+- A structured-asm `inputs:` / `outputs:` operand that names a field of a
+  **`shared struct`** is a compile error. Every other access to a shared field
+  is auto-locked per statement; an asm operand is bound raw, and a naked
+  function has no frame in which a lock could be taken. Copy the field to a
+  scalar in a non-naked caller and bind that.
 
 **AUDIT**
 ```bash
@@ -3629,6 +3736,13 @@ p = { .x = 100, .y = 200 };
 func({ .x = 1, .y = 2 });
 Point make() { return { .x = 0, .y = 0 }; }
 ```
+
+**NOTES**
+- Also allowed at **global scope** (`Point origin = { .x = 0, .y = 0 };`) —
+  each field value must then be a compile-time constant.
+- `.field = null` on an **optional-value** field (`?u32`, `?bool`) sets it to
+  None, exactly like leaving it out. On an optional pointer it is the null
+  pointer.
 
 ---
 
@@ -4120,6 +4234,17 @@ borrowed by that thread until `.join()`:
 - `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
   so the child would write the parent's slot. Pass it by value instead.
 - All `&` arguments are tracked, not just the first; `.join()` releases every one.
+- The borrow follows **every spelling that hands the thread a reference**, not
+  only a literal `&x`: a pointer local (`*u32 q = &v; spawn w(q)` borrows `q`
+  AND `v`), a slice view of a local array (`[*]u8 s = buf; spawn w(s)`
+  borrows `s` and `buf`), a pointer-carrying struct, and a pointer/slice
+  parameter (which borrows the parameter itself). A write through the pointer
+  (`*q = 3`) before the join is refused like a write to `v`.
+- A **single spawn argument** that reads two different `shared struct`s
+  (`spawn w(a.x + b.y)`) is a compile error — the argument is evaluated under
+  ONE lock, so the second read would be unlocked. Read them into locals in
+  separate statements first. (Two arguments reading two structs is fine: each
+  is its own lock scope.)
 - A `.join()` **inside a branch** does not release the borrow for code after that
   branch — the other path never joined, so the thread may still be running:
   ```zer

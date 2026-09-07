@@ -1,0 +1,24 @@
+// BUG-970 (2026-09-07): the legal producers stay legal — the Arena.over
+// constructor into a local, into a struct-literal field, and a pointer to a
+// Barrier/Semaphore passed to the intrinsics. (Arena methods through a struct
+// field or a *Arena param are a separate, pre-existing gap — limitations.md.)
+struct T { u32 v; }
+struct H { u32 tag; Arena a; }
+u8[64] buf;
+u8[64] buf2;
+Barrier gb;
+Semaphore(2) gs;
+void wait_on(*Barrier b) { @barrier_wait(b); }
+void take(*Semaphore s) { @sem_acquire(s); @sem_release(s); }
+u32 main() {
+    Arena a = Arena.over(buf);
+    *T t = a.alloc(T) orelse return;
+    t.v = 3;
+    H h = { .tag = 1, .a = Arena.over(buf2) };
+    if (h.tag != 1) { return 2; }
+    @barrier_init(gb, 1);
+    wait_on(&gb);
+    take(&gs);
+    if (t.v != 3) { return 1; }
+    return 0;
+}

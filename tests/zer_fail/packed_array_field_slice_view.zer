@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: views a PACKED struct field
+// BUG-971 (2026-09-07): a subslice of an ARRAY field of a packed struct is a
+// view whose .ptr is the field's unaligned address — the slice spelling of
+// `&p.w[0]`, which BUG-833 already refused. Indexing it is the misaligned
+// access (a hard fault on ARM/RISC-V; GCC emits a plain `uint32_t*`).
+packed struct P { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    [*]u32 s = p.w[0..];
+    s[0] = 1;
+    return p.w[0] - 1;
+}

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-966 (2026-09-07): an interior pointer taken through `p.get(h)` is a
+// view into h's SLOT. After `p.free(h)` the slot is recycled, so the write
+// through `q` lands in whoever allocates next — no generation check, no
+// diagnostic. The view must alias h's tracked allocation.
+struct T { u32 v; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    *u32 q = &p.get(h).v;
+    p.free(h);
+    *q = 7;
+    return 0;
+}

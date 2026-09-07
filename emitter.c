@@ -187,6 +187,25 @@ static Type *struct_field_type_by_name(Type *si_type, const char *fname,
     return NULL;
 }
 
+/* BUG-963: `{ .opt = null }` into a VALUE-optional field (`?u32`, `?bool`, `?E`).
+ * struct_init_opt_wrap_type sees a NON-optional value type (the null literal's
+ * pointer placeholder) and wraps it as `{ 0, 1 }` — a PRESENT optional holding
+ * zero. `s.n orelse 100` then yields 0, not 100. Measured on the local var-decl
+ * form, the assignment form and the global form alike: one helper answered all
+ * three, wrongly. Returns the field's optional type when the value is the null
+ * literal and the field is an optional, so each site emits the None literal
+ * (`{0,0}` for a value optional, `NULL` for a sentinel one) instead. */
+static Type *struct_field_type_by_name(Type *si_type, const char *fname,
+                                       uint32_t fname_len);
+static Type *struct_init_null_field_type(Type *si_type, const char *fname,
+                                         uint32_t fname_len, Node *fval) {
+    if (!fval || fval->kind != NODE_NULL_LIT) return NULL;
+    Type *ft = struct_field_type_by_name(si_type, fname, fname_len);
+    Type *fe = ft ? type_unwrap_distinct(ft) : NULL;
+    if (!fe || type_dispatch_kind(fe) != TYPE_OPTIONAL) return NULL;
+    return ft;
+}
+
 /* #14/#15: if `field_type` is a slice (or an optional-of-slice) and `val_type` is
  * a fixed array, return the effective SLICE type to coerce to; else NULL. The
  * bare-array-into-slice-slot bug: an aggregate initializer emitted the raw array
@@ -2772,6 +2791,11 @@ static void emit_expr(Emitter *e, Node *node) {
                                       node->index_expr.index->kind == NODE_ASSIGN ||
                                       node->index_expr.index->kind == NODE_UNARY ||
                                       node->index_expr.index->kind == NODE_ORELSE);
+        /* BUG-960: a VOLATILE index must be read exactly once — the comma form
+         * below reads it for the check and again for the access, and anything
+         * that changes it in between (ISR, thread, peripheral) defeats the check.
+         * The IR-path twin (BUG-749) already ORs this in; the AST path did not. */
+        if (expr_is_volatile(e, node->index_expr.index)) idx_has_side_effects = true;
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {
@@ -3329,7 +3353,9 @@ static void emit_expr(Emitter *e, Node *node) {
             Node *fval = node->struct_init.fields[i].value;
             Type *fv_type = checker_get_type(e->checker, fval);
             Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len, fv_type);
-            if (wt) emit_opt_wrap_value(e, wt, fval);  /* F21 (coerces ?slice inside) */
+            Type *nt = struct_init_null_field_type(si_type, fname, fname_len, fval);
+            if (nt) emit_opt_null_literal(e, nt);       /* BUG-963: None, not {0,1} */
+            else if (wt) emit_opt_wrap_value(e, wt, fval);  /* F21 (coerces ?slice inside) */
             else {
                 /* #14 (B): bare array into a plain [*]T or ?[*]T field → coerce to
                  * a slice literal (else C brace-flattens it into .ptr/.len). */
@@ -4768,6 +4794,114 @@ static void emit_func_attributes(Emitter *e, Node *fn) {
     }
 }
 
+/* BUG-965 (2026-09-07): ONE function-header emitter for all three sites that
+ * print a C function signature — the IR definition (`emit_regular_func_from_ir`),
+ * the bodyless prototype (`emit_func_decl`), and the new whole-file prototype
+ * pass (`emit_func_prototypes`). They had drifted: the prototype path lacked
+ * the `int main(void)` promotion and the nested-paren funcptr-return form.
+ *
+ * `ret` is the function's RETURN type (already unwrapped from the TYPE_FUNC_PTR
+ * function type); NULL means void. Emits attributes + return type + mangled
+ * name + parameter list, and the `)(fp_args)` close for a funcptr return. Does
+ * NOT emit the trailing ` {` / `;` — the caller decides definition vs prototype.
+ * Returns the main-promotion verdict (top-level `void main()` → `int main`). */
+static bool emit_func_header(Emitter *e, Node *fn, Type *ret) {
+    emit_func_attributes(e, fn);
+
+    /* BUG fix (2026-04-22): ZER `void main()` auto-promoted to C
+     * `int main(void) { ... return 0; }`. Rationale: C99 requires
+     * main to return int; `void main()` leaves exit code undefined
+     * (whatever's in EAX). Caught by tests/zer_proof/A01_no_uaf —
+     * safe program was exiting with code 2 instead of 0.
+     * Only applies to the top-level main (no module prefix). */
+    bool main_promote = (!e->current_module &&
+                          fn->func_decl.name_len == 4 &&
+                          memcmp(fn->func_decl.name, "main", 4) == 0 &&
+                          (!ret || ret->kind == TYPE_VOID));
+
+    /* If `ret` is itself a funcptr, the function RETURNS a funcptr —
+     * C requires nested-paren syntax: RET (*name(params))(fp_args).
+     * Without this branch, emitter would produce invalid C like
+     * `RET (*)(fp_args) name(params)` which gcc rejects.
+     * BUG-965c: a NULLABLE funcptr return (`?*(u32) -> u32 f()`) is the same
+     * C pointer (null sentinel), so it takes the same nested-paren form —
+     * emitting it through emit_type produced `T (*)(A) f(...)`, which GCC
+     * rejects, on every program that returned an optional funcptr. */
+    if (ret && type_dispatch_kind(ret) == TYPE_OPTIONAL && ret->optional.inner &&
+        type_dispatch_kind(ret->optional.inner) == TYPE_FUNC_PTR)
+        ret = type_unwrap_distinct(ret->optional.inner);
+    bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+
+    if (main_promote) {
+        emit(e, "int ");
+    } else if (ret_is_funcptr) {
+        /* Open: RET_OF_RET (* */
+        emit_type(e, ret->func_ptr.ret);
+        emit(e, " (*");
+    } else if (ret) {
+        emit_type(e, ret);
+        emit(e, " ");
+    } else {
+        emit(e, "void ");
+    }
+
+    EMIT_MANGLED_NAME(e, fn->func_decl.name, fn->func_decl.name_len);
+
+    /* Parameters — use AST types (same resolution as AST emitter).
+     * IR local types may be ty_void for complex params (struct, pointer). */
+    emit(e, "(");
+    Type *func_type = checker_get_type(e->checker, fn);
+    if (fn->func_decl.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            ParamDecl *p = &fn->func_decl.params[i];
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                          (uint32_t)i < func_type->func_ptr.param_count) ?
+                func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            emit_type_and_name(e, ptype, p->name, p->name_len);
+        }
+        if (fn->func_decl.is_variadic) emit(e, ", ...");
+    }
+    emit(e, ")");
+
+    /* Close funcptr-return form: )(fp_args) */
+    if (ret_is_funcptr) {
+        emit(e, ")(");
+        for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, ret->func_ptr.params[i]);
+        }
+        emit(e, ")");
+    }
+    return main_promote;
+}
+
+/* BUG-965: prototype every function DEFINED in this file before any global
+ * or function body is emitted. The checker resolves top-level names in a
+ * pre-pass, so ZER source may reference a function or global before its
+ * declaration (`void touch(){ g = 1; } u32 g;` / `u32 (*cb)(u32) = handler;
+ * u32 handler(u32 x){...}`); emitting C in source order then failed in GCC
+ * with "undeclared". Globals are emitted after this pass and before bodies
+ * (the module path already did that; the main path now matches). Skipped:
+ * comptime (no C), async (emits a state-machine, not a C function of that
+ * name). A prototype next to an identical bodyless declaration is legal C. */
+static void emit_func_prototypes(Emitter *e, Node *file_node) {
+    bool any = false;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL || !d->func_decl.body) continue;
+        if (d->func_decl.is_comptime || d->func_decl.is_async) continue;
+        if (!any) { emit(e, "\n/* ZER function prototypes */\n"); any = true; }
+        Type *ft = checker_get_type(e->checker, d);
+        Type *ret = (ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR) ? ft->func_ptr.ret : NULL;
+        emit_func_header(e, d, ret);
+        emit(e, ";\n");
+    }
+    if (any) emit(e, "\n");
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
     ZTRACE("EMIT  function '%.*s'", (int)node->func_decl.name_len, node->func_decl.name);
 
@@ -4811,33 +4945,10 @@ static void emit_func_decl(Emitter *e, Node *node) {
     Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
         func_type->func_ptr.ret : NULL;
 
-    /* Function-level GCC attributes (section/static/naked).
-     * Single source of truth via helper — see emit_func_attributes(). */
-    emit_func_attributes(e, node);
-
-    emit_type(e, ret);
-    emit(e, " ");
-    EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
-    emit(e, "(");
-
-    if (node->func_decl.param_count == 0) {
-        emit(e, "void");
-    } else {
-        for (int i = 0; i < node->func_decl.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            ParamDecl *p = &node->func_decl.params[i];
-            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                          (uint32_t)i < func_type->func_ptr.param_count) ?
-                func_type->func_ptr.params[i] : resolve_tynode(e,p->type);
-            emit_type_and_name(e, ptype, p->name, p->name_len);
-        }
-        if (node->func_decl.is_variadic) emit(e, ", ...");
-    }
-    emit(e, ") ");
-
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
-     * reach here. */
+     * reach here. Header via the shared emitter (BUG-965). */
+    emit_func_header(e, node, ret);
     emit(e, ";\n\n");
 }
 
@@ -5567,6 +5678,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
 
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
+
+        /* Prototypes for every defined function (BUG-965) — a global funcptr
+         * initialiser may name a function declared later in the module. */
+        emit_func_prototypes(e, file_node);
 
         /* Pass 2a: globals first (ensures cross-module references work) */
         for (int i = 0; i < file_node->file.decl_count; i++) {
@@ -6378,12 +6493,26 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);
 
-    /* Pass 2: emit everything else (functions, globals, etc.) */
+    /* BUG-965: prototypes, then globals, then bodies — the same order the
+     * imported-module path uses. ZER resolves top-level names in a checker
+     * pre-pass, so a body may name a global declared BELOW it and a global
+     * funcptr initialiser may name a function declared below it; C needs
+     * both declared first. */
+    emit_func_prototypes(e, file_node);
+
+    /* Pass 2a: globals */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind == NODE_GLOBAL_VAR)
+            emit_top_level_decl(e, d, file_node, i);
+    }
+
+    /* Pass 2b: everything else (functions, interrupt handlers, mmio, ...) */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
             d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
-            d->kind != NODE_CONTAINER_DECL)
+            d->kind != NODE_CONTAINER_DECL && d->kind != NODE_GLOBAL_VAR)
             emit_top_level_decl(e, d, file_node, i);
     }
 }
@@ -7330,6 +7459,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * statement-expression branch. */
         if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
+        /* BUG-960: expr_is_volatile resolves the root through the CHECKER's scope,
+         * which no longer holds a function's LOCALS at emission time — so a
+         * `volatile u32 li; arr[li]` slipped it and was emitted bare (measured).
+         * The IR local carries the qualifier (IRLocal.is_volatile, #19 VOL-1). */
+        if (func && node->index_expr.index->kind == NODE_IDENT) {
+            Node *vi = node->index_expr.index;
+            for (int li = 0; li < func->local_count; li++) {
+                IRLocal *l = &func->locals[li];
+                if (l->is_volatile && l->name_len == (uint32_t)vi->ident.name_len &&
+                    memcmp(l->name, vi->ident.name, l->name_len) == 0) { idx_se = true; break; }
+            }
+        }
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
@@ -7355,7 +7496,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
-                   node->index_expr.index->kind != NODE_IDENT &&
+                   /* BUG-960: a VOLATILE ident index is NOT left to the auto-guard
+                    * (the checker no longer marks one — two reads of a volatile
+                    * defeat it). It takes the single-evaluation form below instead:
+                    * one load into `_zer_idx`, check and access both on the temp. */
+                   (node->index_expr.index->kind != NODE_IDENT || idx_se) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for
@@ -10459,7 +10604,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *fv_type = checker_get_type(e->checker, fval);
             Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len, fv_type);
             Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
-            if (wt) {
+            Type *nt = struct_init_null_field_type(si_type, fname, fname_len, fval);
+            if (nt) {
+                emit_opt_null_literal(e, nt);       /* BUG-963: None, not {0,1} */
+            } else if (wt) {
                 emit(e, "(");
                 emit_type(e, wt);
                 emit(e, "){ ");
@@ -11071,6 +11219,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 } else {
                     emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
                 }
+            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+                       inst->expr->call.callee &&
+                       (inst->expr->call.callee->kind == NODE_CALL ||
+                        inst->expr->call.callee->kind == NODE_UNARY ||
+                        inst->expr->call.callee->kind == NODE_ORELSE ||
+                        inst->expr->call.callee->kind == NODE_INTRINSIC)) {
+                /* BUG-965b (2026-09-07): a callee that is itself an EXPRESSION
+                 * yielding a funcptr — a call result (`pick(k)(5)`), a deref
+                 * (`(*fpp)(5)`), an orelse (`(opt orelse dflt)(5)`), or a cast
+                 * intrinsic. The checker accepts every funcptr-typed callee, but
+                 * this arm aborted on all of them ("cannot lower this callee
+                 * expression") — a checker-accepted program that never compiled.
+                 * Parenthesise and emit the callee through the rewritten-AST
+                 * emitter; the decomposed args follow as for any other callee. */
+                emit(e, "(");
+                emit_rewritten_node(e, inst->expr->call.callee, func);
+                emit(e, ")(");
             } else {
                 emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
             }
@@ -12816,7 +12981,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
                                                          fname_len, vt);
                     Type *vte = vt ? type_unwrap_distinct(vt) : NULL;
-                    if (wt) {
+                    Type *nt = struct_init_null_field_type(inst->cast_type, fname,
+                                   fname_len, inst->expr->struct_init.fields[i].value);
+                    if (nt) {
+                        emit_opt_null_literal(e, nt);   /* BUG-963: None, not {0,1} */
+                    } else if (wt) {
                         emit(e, "(");
                         emit_type(e, wt);
                         emit(e, "){ ");
@@ -12935,80 +13104,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * existing asm tests rely on the implicit prologue/epilogue and
          * would SIGILL if naked were re-enabled. Restoring true naked
          * semantics is tracked separately in docs/limitations.md. */
-        emit_func_attributes(e, fn);
-
-        /* Return type + name.
-         * func->return_type may be the function TYPE (func_ptr) from typemap.
-         * Extract the actual return type from func_ptr.ret. */
+        /* Return type: func->return_type may be the function TYPE (func_ptr)
+         * from typemap — extract the actual return type from func_ptr.ret.
+         * Header (attributes + main promotion + mangled name + params +
+         * funcptr-return close) via the shared emitter (BUG-965). */
         Type *ret = func->return_type;
         if (ret && ret->kind == TYPE_FUNC_PTR) ret = ret->func_ptr.ret;
-
-        /* BUG fix (2026-04-22): ZER `void main()` auto-promoted to C
-         * `int main(void) { ... return 0; }`. Rationale: C99 requires
-         * main to return int; `void main()` leaves exit code undefined
-         * (whatever's in EAX). Caught by tests/zer_proof/A01_no_uaf —
-         * safe program was exiting with code 2 instead of 0.
-         * Only applies to the top-level main (no module prefix). */
-        bool main_promote = (!func->module_prefix &&
-                              func->name_len == 4 &&
-                              memcmp(func->name, "main", 4) == 0 &&
-                              (!ret || ret->kind == TYPE_VOID));
-
-        /* If `ret` is itself a funcptr, the function RETURNS a funcptr —
-         * C requires nested-paren syntax: RET (*name(params))(fp_args).
-         * Without this branch, emitter would produce invalid C like
-         * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
-
-        if (main_promote) {
-            emit(e, "int ");
-        } else if (ret_is_funcptr) {
-            /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
-            emit(e, " (*");
-        } else if (ret) {
-            emit_type(e, ret);
-            emit(e, " ");
-        } else {
-            emit(e, "void ");
-        }
-        e->current_main_promoted = main_promote;
-
-        /* Mangled name */
-        if (func->module_prefix) {
-            emit(e, "%.*s__%.*s", (int)func->module_prefix_len, func->module_prefix,
-                 (int)func->name_len, func->name);
-        } else {
-            emit(e, "%.*s", (int)func->name_len, func->name);
-        }
-
-        /* Parameters — use AST types (same resolution as AST emitter).
-         * IR local types may be ty_void for complex params (struct, pointer). */
-        emit(e, "(");
-        Type *func_type = checker_get_type(e->checker, fn);
-        if (fn->func_decl.param_count == 0) {
-            emit(e, "void");
-        } else {
-            for (int i = 0; i < fn->func_decl.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                ParamDecl *p = &fn->func_decl.params[i];
-                Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                              (uint32_t)i < func_type->func_ptr.param_count) ?
-                    func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
-                emit_type_and_name(e, ptype, p->name, p->name_len);
-            }
-        }
-        emit(e, ")");
-
-        /* Close funcptr-return form: )(fp_args) */
-        if (ret_is_funcptr) {
-            emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
-            }
-            emit(e, ")");
-        }
+        e->current_main_promoted = emit_func_header(e, fn, ret);
         emit(e, " {\n");
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */

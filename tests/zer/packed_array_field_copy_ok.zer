@@ -1,0 +1,16 @@
+// BUG-971 (2026-09-07): what stays legal — direct element access on the packed
+// field, and every view form on an UNPACKED struct's array field.
+packed struct P { u8 a; u32[2] w; }
+struct Q { u8 a; u32[2] w; }
+u32 main() {
+    P p;
+    p.w[0] = 5; p.w[1] = 6;
+    if (p.w[0] + p.w[1] != 11) { return 1; }
+    Q q;
+    [*]u32 s = q.w[0..]; s[0] = 1;
+    [*]u32 s2 = q.w; s2[1] = 2;
+    *u32 e = &q.w[0]; *e = *e + 10;
+    if (q.w[0] != 11) { return 2; }
+    if (q.w[1] != 2) { return 3; }
+    return 0;
+}

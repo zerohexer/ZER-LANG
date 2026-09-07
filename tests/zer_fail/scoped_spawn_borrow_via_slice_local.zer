@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot write to 'buf' while it is borrowed by a scoped spawn
+// BUG-969 (2026-09-07): the slice form — `[*]u8 s = buf` is a view of `buf`,
+// so lending `s` to the thread borrows `buf` until join().
+void w([*]u8 d) { d[0] = 1; }
+u32 main() {
+    u8[4] buf;
+    [*]u8 s = buf;
+    ThreadHandle th = spawn w(s);
+    buf[1] = 2;
+    th.join();
+    return 0;
+}

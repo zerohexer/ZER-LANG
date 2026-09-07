@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-966 (2026-09-07): the `.get(h)`-rooted subslice on a Slab — the third
+// spelling of the same slot view (`&p.get(h).f`, `h.arr[..]`, `p.get(h).arr[..]`).
+struct T { u8[4] arr; }
+Slab(T) sl;
+u32 main() {
+    Handle(T) h = sl.alloc() orelse return;
+    [*]u8 s = sl.get(h).arr[1..];
+    sl.free(h);
+    s[0] = 7;
+    return 0;
+}

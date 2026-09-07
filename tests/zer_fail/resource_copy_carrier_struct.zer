@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot copy a 'H' by value
+// BUG-970 (2026-09-07): the CARRIER form — a by-value struct holding an Arena
+// copies the arena header with it. One predicate recurses the fields, so the
+// wrapper cannot launder the resource past the rule.
+struct H { u32 tag; Arena a; }
+u8[64] buf;
+u32 main() {
+    H h;
+    h.a = Arena.over(buf);
+    H h2 = h;
+    return 0;
+}

@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot take the address of a slice's '.len'
+// BUG-959: `&s.len` is the assignment sink one hop away.
+void poke(*usize p) { *p = 100; }
+u32 main() { u8[4] a; [*]u8 s = a; poke(&s.len); s[50] = 1; return 0; }

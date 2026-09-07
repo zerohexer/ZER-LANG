@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: 'orelse return' in a function returning '*T' would return a null pointer
+// BUG-962: a bare `orelse return` returns the auto-zero — NULL — through a
+// non-null pointer return type.
+struct T { u32 v; }
+*T pick(?*T o) { *T t = o orelse return; return t; }
+u32 main() { T x; x.v = 1; *T r = pick(null); return r.v; }

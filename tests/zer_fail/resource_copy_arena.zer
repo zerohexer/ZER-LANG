@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot copy a 'Arena' by value
+// BUG-970 (2026-09-07): an Arena's header IS its bump-pointer state. Copying
+// it yields two allocators over ONE buffer, so `a.alloc` and `b.alloc` hand
+// out the same bytes. BUG-225 refused Pool/Ring/Slab at the assignment sink
+// only; Arena/Barrier/Semaphore were refused nowhere.
+struct T { u32 v; }
+u8[64] buf;
+u32 main() {
+    Arena a = Arena.over(buf);
+    Arena b = a;
+    *T x = a.alloc(T) orelse return;
+    *T y = b.alloc(T) orelse return;
+    x.v = 1; y.v = 2;
+    return x.v;
+}

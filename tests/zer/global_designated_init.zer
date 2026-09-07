@@ -1,0 +1,20 @@
+// BUG-961 (2026-09-07): a designated initializer at GLOBAL scope was refused
+// for every field type ("cannot initialize 's' of type 'S' with 'void'") —
+// the global-init sink never validated a `{ .f = v }` against the struct, so
+// the node stayed untyped. The local form has always worked; now both do.
+struct Inner { u16 a; u16 b; }
+struct S { u32 f; ?u32 o; ?u32 n; bool flag; Inner in; u32 omitted; }
+S s = { .f = 5, .o = 7, .n = null, .flag = true, .in = { .a = 1, .b = 2 } };
+S t = { .f = 9 };
+u32 main() {
+    if (s.f != 5) { return 1; }
+    u32 ov = s.o orelse 100;
+    if (ov != 7) { return 2; }
+    u32 nv = s.n orelse 100;
+    if (nv != 100) { return 3; }
+    if (!s.flag) { return 4; }
+    if (s.in.a + s.in.b != 3) { return 5; }
+    if (s.omitted != 0) { return 6; }
+    if (t.f != 9 || t.flag) { return 7; }
+    return 0;
+}

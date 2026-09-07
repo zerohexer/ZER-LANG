@@ -1,0 +1,26 @@
+// BUG-963 (2026-09-07): `{ .opt = null }` into a value-optional field emitted
+// `{ 0, 1 }` — a PRESENT optional holding zero — at every designated-initializer
+// site (local var-decl, assignment, global, nested). `s.n orelse 100` gave 0.
+struct S { u32 f; ?u32 n; ?bool b; ?*S p; }
+struct W { S inner; }
+S g = { .f = 1, .n = null, .b = null, .p = null };
+u32 main() {
+    S s = { .f = 1, .n = null, .b = null };
+    u32 v = s.n orelse 100;
+    if (v != 100) { return 1; }
+    bool bb = s.b orelse true;
+    if (!bb) { return 2; }
+    S t; t = { .f = 2, .n = null };
+    u32 w = t.n orelse 100;
+    if (w != 100) { return 3; }
+    u32 gv = g.n orelse 100;
+    if (gv != 100) { return 4; }
+    if (g.p) |q| { return 5; }
+    W ww = { .inner = { .f = 3, .n = null } };
+    u32 iv = ww.inner.n orelse 100;
+    if (iv != 100) { return 6; }
+    S u = { .f = 4, .n = 7 };
+    u32 uv = u.n orelse 100;
+    if (uv != 7) { return 7; }
+    return 0;
+}

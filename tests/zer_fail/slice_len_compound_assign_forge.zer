@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to a slice's '.len'
+// BUG-959: the compound spelling of the same write.
+u32 main() { u8[4] a; [*]u8 s = a; s.len += 96; s[50] = 1; return 0; }

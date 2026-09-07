@@ -672,6 +672,36 @@ static void mark_non_storable(Checker *c, Node *n) {
     c->non_storable_nodes[c->non_storable_count++] = n;
 }
 
+/* BUG-959: is `e` the `.len` / `.ptr` HEADER FIELD of a slice?
+ *
+ * The slice header is the whole basis of `[*]T` bounds safety: every index is
+ * checked against `.len`, and `.ptr` is where that check points. Both were
+ * readable AND WRITABLE — `s.len = 100; s[50] = 1;` compiled with zero
+ * diagnostics and wrote 50 bytes past a 4-byte array, and `poke(&s.len)` handed
+ * the length out for anyone to overwrite. One line forges any bound.
+ *
+ * ONE predicate, asked at the two sinks that can produce a write: the assignment
+ * TARGET (plain and compound) and ADDRESS-OF. A read of either field stays legal;
+ * it is what `.ptr` exists for at the C boundary. Pointer-to-slice and optional
+ * wrappers are unwrapped so `p.len = 0` through a `*[*]u8` is not a side door. */
+static bool is_slice_header_field(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_FIELD) return false;
+    if (e->field.field_name_len != 3) return false;
+    if (memcmp(e->field.field_name, "len", 3) != 0 &&
+        memcmp(e->field.field_name, "ptr", 3) != 0) return false;
+    Type *ot = checker_get_type(c, e->field.object);
+    for (int guard = 0; guard < 4 && ot; guard++) {
+        Type *ue = type_unwrap_distinct(ot);
+        if (!ue) return false;
+        TypeKind uk = type_dispatch_kind(ue);
+        if (uk == TYPE_SLICE) return true;
+        if (uk == TYPE_POINTER)  { ot = ue->pointer.inner;  continue; }
+        if (uk == TYPE_OPTIONAL) { ot = ue->optional.inner; continue; }
+        return false;
+    }
+    return false;
+}
+
 static bool is_non_storable(Checker *c, Node *n) {
     for (int i = 0; i < c->non_storable_count; i++) {
         if (c->non_storable_nodes[i] == n) return true;
@@ -868,6 +898,7 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len); /* BUG-960 */
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
@@ -888,6 +919,8 @@ static int classify_return_root(Checker *c, Node *rexpr);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
+static void track_isr_global_sym(Checker *c, Symbol *s, bool is_compound);
+static int collect_shared_types_in_expr(Checker *c, Node *expr, Type **types, int max_types, int count);
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -1479,7 +1512,70 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  * CLAUDE.md names as the #1 recurring bug class, and it is exactly what let the
  * negative literal stay accepted at every one of them: there was no single place
  * to add the condition. One query now; each site keeps its own error wording. */
+/* BUG-970 (2026-09-07): a UNIQUE RESOURCE is a value whose header IS the
+ * resource's state — an Arena's bump pointer, a Barrier's mutex/condvar, a
+ * Semaphore's count, a Pool/Slab/Ring's free-list metadata. Copying the header
+ * duplicates that state:
+ *
+ *     Arena a = Arena.over(buf);
+ *     Arena b = a;                    // two bump pointers over ONE buffer
+ *     *T x = a.alloc(T);  *T y = b.alloc(T);   // x == y — silent aliasing
+ *
+ * BUG-225 refused Pool/Ring/Slab at the ASSIGNMENT sink only. Arena/Barrier/
+ * Semaphore were never refused anywhere, and a by-value STRUCT carrying any of
+ * the six slipped every sink (the carrier class). ONE predicate, asked by the
+ * ONE value-flow query, so all eight sinks refuse together. The only legal
+ * by-value producers are the constructors (`Arena.over(...)`) and a struct
+ * literal (its fields are validated one by one). */
+static bool type_carries_unique_resource(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_POOL: case TYPE_RING: case TYPE_SLAB:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE:
+        return true;
+    case TYPE_OPTIONAL: return type_carries_unique_resource(u->optional.inner, depth + 1);
+    case TYPE_ARRAY:    return type_carries_unique_resource(u->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_unique_resource(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_unique_resource(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_USIZE: case TYPE_F32: case TYPE_F64:
+    case TYPE_UINT: case TYPE_SINT: case TYPE_POINTER: case TYPE_SLICE:
+    case TYPE_OPAQUE: case TYPE_ENUM: case TYPE_FUNC_PTR: case TYPE_HANDLE:
+    case TYPE_DISTINCT:
+        return false;
+    }
+    return false;
+}
+/* The by-value producers that are a CONSTRUCTION, not a copy: a struct literal,
+ * and the `.over(buf)` constructor in BOTH spellings — `Arena.over(buf)` (type
+ * name) and `ar.over(buf)` (instance receiver; the checker types either as a
+ * fresh Arena — see arena_backing_shapes_ok). `vt` is the value's type. */
+static bool value_is_resource_construction(Node *v, Type *vt) {
+    if (!v) return false;
+    if (v->kind == NODE_STRUCT_INIT) return true;   /* fields validated one by one */
+    if (v->kind == NODE_CALL && v->call.callee && v->call.callee->kind == NODE_FIELD &&
+        v->call.callee->field.field_name_len == 4 &&
+        memcmp(v->call.callee->field.field_name, "over", 4) == 0 &&
+        vt && type_dispatch_kind(vt) == TYPE_ARENA)
+        return true;
+    return false;
+}
+
 static bool value_flows_to(Node *value, Type *vt, Type *target) {
+    /* BUG-970: a unique resource never flows BY VALUE (see the predicate). */
+    if (type_carries_unique_resource(target, 0) && !value_is_resource_construction(value, vt))
+        return false;
     if (const_negative_into_unsigned(value, target)) return false;
     if (const_int_into_enum(value, vt, target)) return false;
     if (type_equals(target, vt)) return true;
@@ -1496,6 +1592,19 @@ static bool value_flows_to(Node *value, Type *vt, Type *target) {
  * its generic message. */
 static bool report_value_flow_refusal(Checker *c, Node *value, Type *target,
                                       int line, const char *what) {
+    /* BUG-970: a unique resource copied by value. */
+    if (type_carries_unique_resource(target, 0) &&
+        !value_is_resource_construction(value, checker_get_type(c, value))) {
+        char tn[96];
+        snprintf(tn, sizeof(tn), "%s", type_name(target));
+        checker_error(c, line,
+            "%s: cannot copy a '%s' by value — it is (or carries) a unique resource "
+            "(Arena/Pool/Slab/Ring/Barrier/Semaphore) whose header IS its state, so a "
+            "copy silently duplicates the allocator/lock state. Pass a pointer (&x) "
+            "instead, or construct it in place (Arena.over(buf))",
+            what, tn);
+        return true;
+    }
     /* BUG-927: an integer flowing into an ENUM. The generic message says
      * "cannot initialize 'c' of type 'Color' with 'u32'", which is true and tells
      * the author nothing about what to write instead — and the two legitimate
@@ -2818,12 +2927,41 @@ static Type *packed_path_aggregate(Checker *c, Node *e, bool *packed_seen, int d
     }
     return NULL;
 }
+/* BUG-971: alignment 1 — a byte, a bool, a `u<=8`, or an array of those — can
+ * never be misaligned, packed or not. A byte payload inside a packed packet is
+ * THE common case (super_uart_parser), so a rule that refused it would refuse
+ * the idiom the packed struct exists for. */
+static bool type_align_is_one(Type *t) {
+    for (int i = 0; t && i < 8; i++) {
+        Type *u = type_unwrap_distinct(t);
+        if (!u) return false;
+        TypeKind k = type_dispatch_kind(u);
+        if (k == TYPE_ARRAY) { t = u->array.inner; continue; }
+        if (k == TYPE_U8 || k == TYPE_I8 || k == TYPE_BOOL) return true;
+        if ((k == TYPE_UINT || k == TYPE_SINT) && u->intn.bits <= 8) return true;
+        return false;
+    }
+    return false;
+}
 static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
     Node *op = expr->unary.operand;
-    if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
+    if (op && type_align_is_one(typemap_get(c, op))) return false;   /* BUG-971 */
+    /* BUG-971: `&p.w[0]` — an ELEMENT of an array field is inside the packed
+     * struct just as the field is; the matcher required the operand itself to
+     * be the FIELD, so every element address slipped. */
+    if (!op || (op->kind != NODE_FIELD && op->kind != NODE_INDEX)) return false;
     bool packed_seen = false;
     packed_path_aggregate(c, op, &packed_seen, 0);
+    return packed_seen;
+}
+/* BUG-971: is this lvalue chain (`p.w`, `p.w[i]`, `p.in.w`) inside a PACKED
+ * struct? The path question addr_of_is_packed_field asks, without the `&`. */
+static bool lvalue_path_is_packed(Checker *c, Node *e) {
+    if (!e || (e->kind != NODE_FIELD && e->kind != NODE_INDEX)) return false;
+    if (type_align_is_one(typemap_get(c, e))) return false;   /* BUG-971: bytes align anywhere */
+    bool packed_seen = false;
+    packed_path_aggregate(c, e, &packed_seen, 0);
     return packed_seen;
 }
 /* BUG-833: `Symbol.is_packed_derived` was WRITTEN at exactly one site (the
@@ -2853,7 +2991,41 @@ static bool value_is_packed_derived(Checker *c, Node *v) {
                                  (uint32_t)v->ident.name_len);
         return s && s->is_packed_derived;
     }
+    /* BUG-971: a SUBSLICE of an array field (`p.w[0..]`) is a view whose .ptr is
+     * the field's (unaligned) address — the slice spelling of `&p.w[0]`. And a
+     * subslice of an already packed-derived slice (`s[1..]`) inherits it. */
+    if (v->kind == NODE_SLICE) {
+        if (lvalue_path_is_packed(c, v->slice.object)) return true;
+        Node *r = v->slice.object;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+            r = (r->kind == NODE_FIELD) ? r->field.object
+              : (r->kind == NODE_INDEX) ? r->index_expr.object : r->slice.object;
+        if (r && r->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            return s && s->is_packed_derived;
+        }
+    }
     return false;
+}
+/* BUG-971: value_is_packed_derived PLUS the implicit array→slice coercion form
+ * (`[*]u32 s = p.w;` / `take_slice(p.w)`), which is a view only when the
+ * DESTINATION is a slice — into an array it is a value copy (fine). */
+static bool value_is_packed_derived_into(Checker *c, Node *v, Type *dest,
+                                         bool dest_is_param) {
+    if (value_is_packed_derived(c, v)) return true;
+    if (!v || !dest) return false;
+    TypeKind dk = type_dispatch_kind(type_unwrap_optional(dest));
+    /* An ARRAY PARAMETER is by-reference in the emitted C (the array decays to a
+     * pointer at the call — measured: a callee's `arr[0] = 42` reaches the
+     * caller's array), so `take_arr(p.w)` is a view exactly like a slice param.
+     * An array LOCAL initialised from the field is a real copy. */
+    if (dk != TYPE_SLICE && !(dest_is_param && dk == TYPE_ARRAY)) return false;
+    Node *u = unwrap_ptr_launder(v);
+    if (!u || (u->kind != NODE_FIELD && u->kind != NODE_INDEX)) return false;
+    Type *vt = typemap_get(c, u);
+    if (!vt || type_dispatch_kind(vt) != TYPE_ARRAY) return false;
+    return lvalue_path_is_packed(c, u);
 }
 
 static bool addr_of_is_local_derived(Checker *c, Node *operand) {
@@ -2897,6 +3069,110 @@ static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
             return _rmw_alias[i].global;
     return NULL;
+}
+
+/* BUG-967 (2026-09-07): scan-local `static` locals — the sibling table to
+ * `_rmw_alias`, with the same scoping discipline. A function-scope `static u32 c`
+ * is ONE storage location shared by every thread and every ISR that reaches the
+ * function, i.e. a global with a private name — yet both race sinks resolved
+ * idents through the GLOBAL scope only, so
+ *
+ *     void w() { static u32 c = 0; c += 1; }
+ *     u32 main() { spawn w(); spawn w(); return 0; }      // ACCEPTED (TSan race)
+ *     void h() { static u32 n = 0; n += 1; }
+ *     interrupt TIM1 { h(); }  u32 main() { h(); ... }     // ACCEPTED (torn RMW)
+ *
+ * compiled clean. Entries are pushed when a walker VISITS the `static` var-decl
+ * (declaration precedes use), saved/restored around every body descent, and reset
+ * at every scan entry, so a row never outlives the body it was declared in — a
+ * stale row would collide with a same-named PLAIN local of another body and
+ * produce a false race. Looked up BEFORE the global scope: a static may shadow a
+ * global of the same name. */
+#define STATIC_ALIAS_MAX 16
+static struct { const char *name; uint32_t len; Symbol *sym; } _static_alias[STATIC_ALIAS_MAX];
+static int _static_alias_count = 0;
+static Symbol *static_alias_lookup(const char *n, uint32_t l) {
+    for (int i = _static_alias_count - 1; i >= 0; i--)
+        if (_static_alias[i].len == l && memcmp(_static_alias[i].name, n, l) == 0)
+            return _static_alias[i].sym;
+    return NULL;
+}
+/* The Symbol a `static` var-decl node registered (checker.c NODE_VAR_DECL). */
+static Symbol *static_sym_for_decl(Checker *c, Node *decl) {
+    for (int i = 0; i < c->static_local_count; i++)
+        if (c->static_locals[i]->func_node == decl) return c->static_locals[i];
+    return NULL;
+}
+/* Both walkers call this from their NODE_VAR_DECL arm — ONE push site, so the
+ * spawn scan and the ISR recorder learn a static local together. */
+static void static_alias_note_decl(Checker *c, Node *decl) {
+    if (!decl || decl->kind != NODE_VAR_DECL || !decl->var_decl.is_static) return;
+    if (_static_alias_count >= STATIC_ALIAS_MAX) return;
+    Symbol *s = static_sym_for_decl(c, decl);
+    if (!s) return;
+    _static_alias[_static_alias_count].name = decl->var_decl.name;
+    _static_alias[_static_alias_count].len = (uint32_t)decl->var_decl.name_len;
+    _static_alias[_static_alias_count].sym = s;
+    _static_alias_count++;
+}
+
+/* BUG-969: the root IDENT of an lvalue chain (`b.v[i]` → `b`), or NULL. */
+static Node *lvalue_root_ident(Node *e) {
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX || e->kind == NODE_SLICE))
+        e = (e->kind == NODE_FIELD) ? e->field.object
+          : (e->kind == NODE_INDEX) ? e->index_expr.object : e->slice.object;
+    return (e && e->kind == NODE_IDENT) ? e : NULL;
+}
+/* BUG-969: which local's STORAGE does pointer/slice local `ps` address? Follows
+ * the initialiser chain (`*u32 q = &v` → v; `[*]u8 s = buf` → buf; `*u32 r = q`
+ * → v) up to 6 hops. Reassignment after the declaration is not followed (the
+ * pointer local itself is borrowed regardless — see the caller). */
+static Node *ptr_local_storage_root(Checker *c, Symbol *ps, int depth) {
+    if (!ps || depth > 6 || !ps->func_node || ps->func_node->kind != NODE_VAR_DECL) return NULL;
+    Node *init = unwrap_ptr_launder(ps->func_node->var_decl.init);
+    if (!init) return NULL;
+    if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP)
+        return lvalue_root_ident(init->unary.operand);
+    if (init->kind == NODE_SLICE) return lvalue_root_ident(init->slice.object);
+    if (init->kind != NODE_IDENT) return NULL;
+    Symbol *src = scope_lookup(c->current_scope, init->ident.name,
+                               (uint32_t)init->ident.name_len);
+    if (!src || src->is_function || !src->type) return NULL;
+    if (type_carries_nonshared_pointer(src->type, 0))
+        return ptr_local_storage_root(c, src, depth + 1);   /* pointer → follow */
+    return init;   /* an aggregate local coerced to a view (array → slice) */
+}
+/* BUG-969: the (up to two) idents a scoped-spawn ARGUMENT lets the thread reach.
+ * Returns the count; names/lens must hold 2. */
+static int spawn_arg_borrow_roots(Checker *c, Node *arg, const char **names, uint32_t *lens) {
+    int n = 0;
+    Node *pa = unwrap_ptr_launder(arg);
+    if (!pa) return 0;
+    if (pa->kind == NODE_UNARY && pa->unary.op == TOK_AMP) {
+        /* S2 (2026-08-02): walk the &-operand's field/index chain to the root
+         * ident — an INTERIOR pointer (`&b.v`) borrows the WHOLE local, a sound
+         * over-approximation (the thread holds a reference INTO its storage). */
+        Node *r = lvalue_root_ident(pa->unary.operand);
+        if (r) { names[n] = r->ident.name; lens[n] = (uint32_t)r->ident.name_len; n++; }
+        return n;
+    }
+    if (pa->kind == NODE_SLICE) {
+        Node *r = lvalue_root_ident(pa->slice.object);
+        if (r) { names[n] = r->ident.name; lens[n] = (uint32_t)r->ident.name_len; n++; }
+        return n;
+    }
+    Node *r = lvalue_root_ident(pa);
+    if (!r) return 0;
+    Symbol *ps = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+    if (!ps || ps->is_function || !ps->type) return 0;
+    if (!type_carries_nonshared_pointer(ps->type, 0)) return 0;   /* a VALUE — copied */
+    names[n] = r->ident.name; lens[n] = (uint32_t)r->ident.name_len; n++;
+    Node *root = ptr_local_storage_root(c, ps, 0);
+    if (root && !(root->ident.name_len == r->ident.name_len &&
+                  memcmp(root->ident.name, r->ident.name, r->ident.name_len) == 0)) {
+        names[n] = root->ident.name; lens[n] = (uint32_t)root->ident.name_len; n++;
+    }
+    return n;
 }
 
 static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth);
@@ -3145,9 +3421,15 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
     if (!r || r->kind != NODE_IDENT) return NULL;
     Symbol *aliased = rmw_alias_lookup(r->ident.name, (uint32_t)r->ident.name_len);
     if (aliased) return aliased;   /* a local of the body being scanned */
+    /* BUG-967: a `static` local of the body being scanned is global storage. */
+    Symbol *st_local = static_alias_lookup(r->ident.name, (uint32_t)r->ident.name_len);
+    if (st_local) return st_local;
     Symbol *s = scope_lookup(c->current_scope, r->ident.name,
                              (uint32_t)r->ident.name_len);
     if (!s || s->is_function) return NULL;
+    /* BUG-967: at CHECK time (the declaring function's own body is being
+     * checked) the static local is in scope — it is the write target itself. */
+    if (s->is_static) return s;
     Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
     if (st && type_dispatch_kind(st) == TYPE_POINTER && s->func_node &&
         (s->func_node->kind == NODE_VAR_DECL ||
@@ -5732,7 +6014,12 @@ static Type *check_expr(Checker *c, Node *node) {
         if (sym && !sym->is_function && c->current_func_ret != NULL) {
             Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
                                       (uint32_t)node->ident.name_len);
-            if (gs && gs == sym) {
+            if (sym->is_static) {
+                /* BUG-967: a function-scope `static` local is global STORAGE —
+                 * the ISR/func access tracking applies to it exactly as to a
+                 * global (keyed by symbol; see track_isr_entry). */
+                track_isr_global_sym(c, sym, false);
+            } else if (gs && gs == sym) {
                 /* this ident IS a global — track ISR/func access */
                 track_isr_global(c, node->ident.name,
                                  (uint32_t)node->ident.name_len, false);
@@ -6149,6 +6436,16 @@ static Type *check_expr(Checker *c, Node *node) {
 
         case TOK_AMP: /* address-of */
             result = type_pointer(c->arena, operand);
+            /* BUG-959: `&s.len` / `&s.ptr` hands the slice header out to be
+             * written through a pointer — the assignment sink one hop away. */
+            if (is_slice_header_field(c, node->unary.operand)) {
+                checker_error(c, node->loc.line,
+                    "cannot take the address of a slice's '.%.*s' — the slice "
+                    "header is read-only (it is what bounds checking trusts). "
+                    "Copy it to a local first",
+                    (int)node->unary.operand->field.field_name_len,
+                    node->unary.operand->field.field_name);
+            }
             /* BUG-197/228/254: walk operand to root for volatile/const propagation.
              * Handles &ident, &arr[i], &s.field, &s.arr[i].field etc. */
             {
@@ -6276,6 +6573,15 @@ static Type *check_expr(Checker *c, Node *node) {
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
+        /* BUG-959: the slice header is read-only — see is_slice_header_field. */
+        if (is_slice_header_field(c, node->assign.target)) {
+            checker_error(c, node->loc.line,
+                "cannot assign to a slice's '.%.*s' — the slice header is what "
+                "bounds checking trusts, so it is read-only. Re-slice instead "
+                "('s = s[0..n]') or build a new slice",
+                (int)node->assign.target->field.field_name_len,
+                node->assign.target->field.field_name);
+        }
         /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a WRITE to a local
          * that is currently borrowed by a scoped spawn (between `spawn
          * worker(&x)` and `th.join()`) is a data race — the thread has
@@ -6452,7 +6758,7 @@ static Type *check_expr(Checker *c, Node *node) {
                           target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                           (gs && assign_reads_own_target(node->assign.value, gs));
             if (is_rmw && gs && !gs->is_function)
-                track_isr_global(c, gs->name, gs->name_len, true);
+                track_isr_global_sym(c, gs, true);   /* BUG-967: static-aware */
         }
 
         /* BUG-294/302: reject assignment to non-lvalue.
@@ -6911,7 +7217,8 @@ static Type *check_expr(Checker *c, Node *node) {
                          * of a reused pointer, which is why this is an assignment
                          * rather than an `if (...) = true`. */
                         if (type_can_carry_pointer(tsym->type))
-                            tsym->is_packed_derived = value_is_packed_derived(c, vcheck);
+                            tsym->is_packed_derived =
+                                value_is_packed_derived_into(c, vcheck, tsym->type, false);
                     }
                     /* check if new value is an alias of local/arena-derived */
                     {
@@ -7961,6 +8268,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!func_forwards_param_to_spawn(c, tgt, ai, 0)) continue;
                     const char *fbad = NULL; uint32_t fblen = 0;
                     rmw_alias_reset();
+                    _static_alias_count = 0;   /* BUG-967: scan entry */
                     if (scan_unsafe_global_access(c, fsym->func_node->func_decl.body,
                                                   &fbad, &fblen)) {
                         ensure_func_props(c, fsym);
@@ -8082,7 +8390,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!ag || ag->kind != NODE_UNARY || ag->unary.op != TOK_AMP) continue;
                     Symbol *gg = resolve_write_target_global(c, ag->unary.operand, 0);
                     if (gg && !gg->is_function)
-                        track_isr_global(c, gg->name, gg->name_len, true);
+                        track_isr_global_sym(c, gg, true);   /* BUG-967 */
                 }
             }
         }
@@ -8881,7 +9189,7 @@ static Type *check_expr(Checker *c, Node *node) {
                          * route structurally incomplete: `poke(&g.b)` binds no name,
                          * so no Symbol exists to carry the fact and only a predicate
                          * asked on the EXPRESSION can reach it. */
-                        if (value_is_packed_derived(c, node->call.args[i])) {
+                        if (value_is_packed_derived_into(c, node->call.args[i], param, true)) {
                             checker_error(c, node->loc.line,
                                 "argument %d points into a PACKED struct field and may be "
                                 "misaligned (a hard fault on ARM/RISC-V). Pass the field "
@@ -9905,6 +10213,23 @@ static Type *check_expr(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "array index must be integer, got '%s'", type_name(idx));
         }
+        /* BUG-971: indexing a slice/pointer that VIEWS a packed struct's array
+         * field is the misaligned access itself — the sibling of the `*q` deref
+         * check, which only knew the bare-pointer spelling. */
+        if (node->index_expr.object && node->index_expr.object->kind == NODE_IDENT &&
+            escape_type_carries_ref(obj)) {   /* slice or pointer (not an array) */
+            Symbol *ds = scope_lookup(c->current_scope,
+                node->index_expr.object->ident.name,
+                (uint32_t)node->index_expr.object->ident.name_len);
+            if (ds && ds->is_packed_derived) {
+                checker_error(c, node->loc.line,
+                    "indexing '%.*s' — it views a PACKED struct field and its elements "
+                    "may be misaligned (a hard fault on ARM/RISC-V). Access the field "
+                    "directly (`s.field[i]`) or copy it to an aligned local first",
+                    (int)node->index_expr.object->ident.name_len,
+                    node->index_expr.object->ident.name);
+            }
+        }
 
         if (obj->kind == TYPE_ARRAY) {
             /* BUG-196: compile-time OOB for constant index */
@@ -9946,6 +10271,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
                  * Warn so programmer knows they can add a guard for zero overhead. */
+                /* BUG-960: NOT for a VOLATILE index. The auto-guard is
+                 * `if (i >= N) return; ... arr[i]` — TWO reads of `i`. For an
+                 * ordinary local that is one value; for a volatile it is two
+                 * loads, and whatever changes it between them (an ISR, a thread,
+                 * the peripheral) walks straight past the guard. Measured on the
+                 * emitted C: `_zer_t0 = g_i; if (_zer_t0 >= 4) ...; arr[g_i] = 7`.
+                 * Leave it UNPROVEN and UNGUARDED here so the emitter takes its
+                 * single-evaluation inline form — one load into a temp, the
+                 * bounds check and the access both on the temp (a trap, like a
+                 * slice). Both emitter paths admit a volatile ident to that form. */
+                if (!checker_is_proven(c, node) &&
+                    vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                        (uint32_t)node->index_expr.index->ident.name_len)) {
+                    checker_warning(c, node->loc.line,
+                        "volatile index '%.*s' cannot be proven in range for array of "
+                        "size %llu — a single-read bounds check (trap on failure) is "
+                        "inserted. Copy it to a non-volatile local and guard that to "
+                        "eliminate the check",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size);
+                } else
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
                     checker_warning(c, node->loc.line,
@@ -10079,6 +10426,27 @@ static Type *check_expr(Checker *c, Node *node) {
                             mark_proven(c, node);
                             break;
                         }
+                    }
+                    /* BUG-960: a VOLATILE index on an MMIO pointer has the same
+                     * two-read guard as the array case, and here there is no inline
+                     * single-read form to fall back to (a pointer index emits bare).
+                     * Ban Decision Framework: no tracking can hold a volatile value
+                     * still between the check and the use, so refuse, with the
+                     * one-line fix. */
+                    if (node->index_expr.index->kind == NODE_IDENT &&
+                        vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                            (uint32_t)node->index_expr.index->ident.name_len)) {
+                        checker_error(c, node->loc.line,
+                            "cannot index MMIO pointer with volatile '%.*s' — the "
+                            "range guard would read it once and the access again, and "
+                            "a value that changes between the two reads defeats the "
+                            "guard. Copy it to a non-volatile local first",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name);
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;   /* diagnosed once, not twice */
+                        break;
                     }
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
@@ -10296,6 +10664,30 @@ static Type *check_expr(Checker *c, Node *node) {
          * break/continue. The NODE_RETURN/NODE_BREAK/NODE_CONTINUE handlers
          * enforce these bans, but orelse fallback is a flag — those handlers
          * never run. Without these explicit checks, the bans are silent. */
+        /* BUG-962: a BARE `orelse return` hands back the function's AUTO-ZERO
+         * value, which is documented and fine for an integer / optional / struct
+         * return — but for a NON-NULL pointer or a function pointer the zero is
+         * NULL, a value the type promises can never exist:
+         *
+         *     *T pick(?*T o) { *T t = o orelse return; return t; }   // returns NULL as *T
+         *
+         * A bare `return;` in such a function is already refused ("must return
+         * '*T', not void"); this is the same question at the orelse spelling,
+         * asked with the same predicate the declaration sites use
+         * (nonnull_zero_hole — "auto-zero is not a value of this type"). */
+        if (node->orelse.fallback_is_return && c->current_func_ret) {
+            bool nz_func = false;
+            Type *nz = nonnull_zero_hole(c->current_func_ret, &nz_func);
+            if (nz) {
+                checker_error(c, node->loc.line,
+                    "'orelse return' in a function returning '%s' would return "
+                    "%s — auto-zero is not a value of that type. Return '?%s' "
+                    "instead, or handle the None case explicitly",
+                    type_name(c->current_func_ret),
+                    nz_func ? "a null function pointer" : "a null pointer",
+                    type_name(c->current_func_ret));
+            }
+        }
         if (node->orelse.fallback_is_return &&
             zer_return_allowed_in_context(c->defer_depth, c->critical_depth) == 0) {
             if (c->defer_depth > 0) {
@@ -13380,8 +13772,10 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         if (_scan_global_depth >= 32) return false;
         _scan_global_depth++;
         rmw_alias_reset();
+        int _saved_static = _static_alias_count;   /* BUG-967: nested body */
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                                out_name, out_len);
+        _static_alias_count = _saved_static;
         _scan_global_depth--;
         return found;
     }
@@ -13433,8 +13827,10 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     if (_scan_global_depth >= 32) return false;
     _scan_global_depth++;
     rmw_alias_reset();
+    int _saved_static = _static_alias_count;   /* BUG-967: nested body */
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                            out_name, out_len);
+    _static_alias_count = _saved_static;
     _scan_global_depth--;
     return found;
 }
@@ -13609,8 +14005,16 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                                        const char **out_name, uint32_t *out_len) {
     if (!node) return false;
     if (node->kind == NODE_IDENT) {
-        Symbol *sym = scope_lookup(c->global_scope,
-            node->ident.name, (uint32_t)node->ident.name_len);
+        /* BUG-967: a `static` local of the body being scanned is one storage
+         * location shared by every thread that reaches this function. Looked up
+         * BEFORE the global scope (it may shadow a global). Same exemptions as a
+         * global: const, single-word volatile. (threadlocal/shared/Barrier are
+         * not spellable on a local.) */
+        Symbol *sym = static_alias_lookup(node->ident.name,
+                                          (uint32_t)node->ident.name_len);
+        if (!sym)
+            sym = scope_lookup(c->global_scope,
+                node->ident.name, (uint32_t)node->ident.name_len);
         if (sym && !sym->is_function && sym->type) {
             /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
              * shared, Pool/Slab/Ring/Arena/Barrier */
@@ -13685,6 +14089,8 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * descend into do_inc so a later `fp()` reaching a non-shared global
          * is caught (the direct-call scan can't resolve the local callee). */
         if (scan_funcname_binding(c, node->var_decl.init, out_name, out_len)) return true;
+        /* BUG-967: a `static` local declared in the scanned body. */
+        static_alias_note_decl(c, node);
         /* BUG-792: remember `*u32 p = &counter` so a later `*p += 1` in this body
          * resolves to counter. Recorded here because the scan cannot look up
          * another function's locals through the scope chain. */
@@ -13776,6 +14182,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                          * Scoped: the count is restored after the descent, so a
                          * binding cannot leak into a sibling call. */
                         int _saved_alias = _rmw_alias_count;
+                        int _saved_static = _static_alias_count;   /* BUG-967 */
                         Node *_cfd = csym->func_node;
                         for (int _ai = 0; _ai < node->call.arg_count &&
                                           _ai < _cfd->func_decl.param_count; _ai++) {
@@ -13792,6 +14199,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                         bool found = scan_unsafe_global_access(c,
                             csym->func_node->func_decl.body, out_name, out_len);
                         _rmw_alias_count = _saved_alias;
+                        _static_alias_count = _saved_static;
                         _scan_global_depth--;
                         if (found) return true;
                     }
@@ -13821,8 +14229,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                     !asym->func_node->func_decl.body) continue;
                 if (_scan_global_depth < 32) {
                     _scan_global_depth++;
+                    int _saved_static = _static_alias_count;   /* BUG-967 */
                     bool found = scan_unsafe_global_access(c,
                         asym->func_node->func_decl.body, out_name, out_len);
+                    _static_alias_count = _saved_static;
                     _scan_global_depth--;
                     if (found) return true;
                 }
@@ -14416,6 +14826,19 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-430: store AST node for const init lookup (enables
              * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
             sym->func_node = node;
+            /* BUG-967: register the static local so the race walkers (which
+             * see only the declaration NODE when they walk this body from
+             * another function's scope) can recover its Symbol. */
+            if (node->var_decl.is_static) {
+                if (c->static_local_count >= c->static_local_capacity) {
+                    int nc = c->static_local_capacity * 2;
+                    if (nc < 16) nc = 16;
+                    c->static_locals = realloc(c->static_locals,
+                                               (size_t)nc * sizeof(Symbol *));
+                    c->static_local_capacity = nc;
+                }
+                c->static_locals[c->static_local_count++] = sym;
+            }
             /* BUG-847: `Arena a = Arena.over(buf);` — the local form. */
             if (node->var_decl.init && type &&
                 type_dispatch_kind(type) == TYPE_ARENA)
@@ -14613,6 +15036,11 @@ static void check_stmt(Checker *c, Node *node) {
                         if (value_is_packed_derived(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
+                    /* BUG-971: the slice forms (`p.w[0..]`, `p.w` → slice, `s[1..]`)
+                     * are not `&`-expressions, so the loop above never saw them. */
+                    if (sym && init && type_can_carry_pointer(type) &&
+                        value_is_packed_derived_into(c, init, type, false))
+                        sym->is_packed_derived = true;
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:
                      *   `Box b = { .ptr = &local };`        (Case `&local`)
@@ -16149,7 +16577,7 @@ static void check_stmt(Checker *c, Node *node) {
                 /* BUG-833, the RETURN sink. Rejected at the SOURCE because the fact
                  * does not cross the function boundary — the callee's signature says
                  * "aligned pointer", so the caller's deref cannot know otherwise. */
-                if (value_is_packed_derived(c, node->ret.expr)) {
+                if (value_is_packed_derived_into(c, node->ret.expr, c->current_func_ret, false)) {
                     checker_error(c, node->loc.line,
                         "cannot return a pointer into a PACKED struct field — it may be "
                         "misaligned (a hard fault on ARM/RISC-V), and the fact does not "
@@ -17023,6 +17451,32 @@ static void check_stmt(Checker *c, Node *node) {
                         "asm output '%.*s' must be integer or pointer typed "
                         "(Session B scope: scalars only)",
                         (int)op->reg_name_len, op->reg_name);
+                }
+            }
+            /* BUG-972 (2026-09-07): a SHARED struct field bound as an asm operand.
+             * Every other read/write of a shared field is wrapped lock→op→unlock by
+             * the emitter per statement; an asm operand is bound raw, so the access
+             * is UNLOCKED — a data race against every locked accessor. Ban, not
+             * track (CLAUDE.md Ban framework #1, hardware constraint): asm is legal
+             * only inside a `naked` function, which has no prologue and no frame,
+             * so there is nowhere to emit the lock/unlock calls. Copy the field out
+             * in a non-naked caller and pass the scalar. (The raw-string inline form
+             * carries its operands inside the C text where no checker can see them;
+             * that form is documented as a floor.) */
+            for (int i = 0; i < node->asm_stmt.input_count + node->asm_stmt.output_count; i++) {
+                AsmOperand *op = (i < node->asm_stmt.input_count)
+                    ? &node->asm_stmt.inputs[i]
+                    : &node->asm_stmt.outputs[i - node->asm_stmt.input_count];
+                if (!op->expr) continue;
+                Type *sh[2];
+                if (collect_shared_types_in_expr(c, op->expr, sh, 2, 0) > 0) {
+                    checker_error(c, op->loc.line,
+                        "asm operand '%.*s' reads or writes shared struct '%.*s' with no "
+                        "lock — a naked function has no frame in which to take one, so "
+                        "the access races every locked accessor. Copy the field to a "
+                        "scalar in a non-naked caller and bind that instead",
+                        (int)op->reg_name_len, op->reg_name,
+                        (int)sh[0]->struct_type.name_len, sh[0]->struct_type.name);
                 }
             }
             /* Clobbers: just register name strings — no expression to check.
@@ -18327,8 +18781,10 @@ static void check_stmt(Checker *c, Node *node) {
                  * record it on the handle so join clears it); a parent WRITE to
                  * it before join is a data race. Shared structs are excluded
                  * (auto-locked); globals/statics outlive the thread. */
+                /* BUG-969: up to TWO roots per argument (a pointer local AND
+                 * the storage it was formed from). */
                 int bcap = node->spawn_stmt.arg_count > 0
-                             ? node->spawn_stmt.arg_count : 1;
+                             ? 2 * node->spawn_stmt.arg_count : 1;
                 sym->th_borrow_names = (const char **)arena_alloc(c->arena,
                     sizeof(const char *) * (size_t)bcap);
                 sym->th_borrow_lens = (uint32_t *)arena_alloc(c->arena,
@@ -18336,32 +18792,27 @@ static void check_stmt(Checker *c, Node *node) {
                 sym->th_borrow_count = 0;
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
-                    if (!ba || ba->kind != NODE_UNARY ||
-                        ba->unary.op != TOK_AMP || !ba->unary.operand)
-                        continue;
-                    /* S2 (2026-08-02): walk the &-operand's field/index chain to
-                     * the root ident. The matcher required a BARE NODE_IDENT, so
-                     * an INTERIOR pointer (`spawn worker(&b.v)`) established NO
-                     * borrow at all — the parent could then write `b.v` before
-                     * join() and race (TSan-confirmed), while the whole-local
-                     * `&b` form was correctly rejected.
+                    /* BUG-969 (2026-09-07): the borrow was established ONLY for a
+                     * literal `&x` argument. A pointer that reaches the thread by
+                     * any other spelling —
                      *
-                     * Borrowing the WHOLE local for an interior pointer is a
-                     * sound over-approximation: the thread holds a reference
-                     * INTO that local's storage, so no part of it may be
-                     * concurrently written. Exactly the `&x` vs `&x.f` shape as
-                     * §C6 (keep call-site) — this is that same blind spot one
-                     * level down from §D5/§D7. */
-                    Node *broot = ba->unary.operand;
-                    while (broot && (broot->kind == NODE_FIELD ||
-                                     broot->kind == NODE_INDEX)) {
-                        broot = (broot->kind == NODE_FIELD)
-                                  ? broot->field.object
-                                  : broot->index_expr.object;
-                    }
-                    if (!broot || broot->kind != NODE_IDENT) continue;
-                    const char *vn = broot->ident.name;
-                    uint32_t vl = (uint32_t)broot->ident.name_len;
+                     *     *u32 q = &v;  ThreadHandle th = spawn w(q);  v = 3;  th.join();
+                     *     [*]u8 s = buf; ThreadHandle th = spawn w(s); buf[0] = 1; ...
+                     *
+                     * — lent the SAME storage with NO borrow, so the parent's write
+                     * before join() compiled (TSan-confirmed race). Resolve every
+                     * argument to the storage it lets the thread reach: `&e` → the
+                     * root of e (S2); a pointer/slice-carrying local → that local
+                     * itself (the parent must not read or re-point it while the
+                     * thread holds a copy) AND, through its initialiser chain, the
+                     * local whose storage it addresses. A root that cannot be
+                     * resolved (a param, a heap pointer) borrows only the ident —
+                     * the conservative residual is documented in limitations.md. */
+                    const char *rnames[2]; uint32_t rlens[2];
+                    int nroots = spawn_arg_borrow_roots(c, ba, rnames, rlens);
+                    for (int ri = 0; ri < nroots; ri++) {
+                    const char *vn = rnames[ri];
+                    uint32_t vl = rlens[ri];
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = scope_lookup_local(c->global_scope,
                                        vn, vl) != NULL;
@@ -18417,6 +18868,7 @@ static void check_stmt(Checker *c, Node *node) {
                         sym->th_borrows_name = vn;
                         sym->th_borrows_name_len = vl;
                     }
+                    }   /* ri — BUG-969 per-root loop */
                 }
             }
         }
@@ -18427,6 +18879,7 @@ static void check_stmt(Checker *c, Node *node) {
             func_sym->func_node->func_decl.body) {
             const char *bad_name = NULL;
             uint32_t bad_len = 0;
+            _static_alias_count = 0;   /* BUG-967: scan entry */
             if (scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
                                            &bad_name, &bad_len)) {
                 /* If function uses @atomic_* or @barrier — developer is doing manual
@@ -18513,6 +18966,7 @@ static void check_stmt(Checker *c, Node *node) {
                 !asym->func_node->func_decl.body) continue;
             const char *abad = NULL;
             uint32_t ablen = 0;
+            _static_alias_count = 0;   /* BUG-967: scan entry */
             if (scan_unsafe_global_access(c, asym->func_node->func_decl.body,
                                           &abad, &ablen)) {
                 ensure_func_props(c, asym);
@@ -19977,6 +20431,7 @@ static void check_func_body(Checker *c, Node *node) {
          * RMW → non-atomic" checks are transitive (check_stmt above only records
          * the globals lexically inside the ISR body). Runs with in_interrupt
          * still set so track_isr_global tags them from_isr. */
+        _static_alias_count = 0;   /* BUG-967: walk entry */
         record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
@@ -20037,12 +20492,35 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
 /* Push a new range entry. If an existing range exists for this var,
  * intersect (narrow) rather than replace — ensures ranges only tighten.
  * For unsigned types, min is clamped to 0 (can't be negative). */
+/* BUG-960: is the ROOT of a VRP key a `volatile` symbol? A volatile value can
+ * change between any two reads — an ISR, another thread, or the hardware itself —
+ * so no fact observed about it at one program point holds at the next. VRP was
+ * narrowing volatile variables exactly like ordinary ones:
+ *
+ *     volatile u32 g_i;  u32[4] arr;
+ *     if (g_i < 4) { arr[g_i] = 7; }     // guard ELIDED: g_i "proven" in [0,3]
+ *
+ * and the emitted C read g_i a second time for the access. An interrupt landing
+ * between the two reads writes past the array with no check, no fault, silently
+ * — the bare-metal shape this compiler exists to catch. The key may be a
+ * compound (`s.f`, `arr[0]`); the root symbol carries the qualifier. */
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len) {
+    uint32_t rl = 0;
+    while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
+    if (rl == 0) return false;
+    Symbol *s = scope_lookup(c->current_scope, name, rl);
+    if (!s) s = scope_lookup(c->global_scope, name, rl);
+    return s && s->is_volatile;
+}
+
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero) {
     /* BUG-479: skip narrowing for address-taken variables — pointer alias
      * may modify the value, so guard-narrowed range is unreliable. */
     struct VarRange *existing = find_var_range(c, name, name_len);
     if (existing && existing->address_taken) return;
+    /* BUG-960: a volatile value has no range — never record one. */
+    if (vrp_key_root_is_volatile(c, name, name_len)) return;
 
     /* clamp min to 0 for unsigned variables */
     if (min_val < 0) {
@@ -20646,11 +21124,18 @@ void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud) {
 /* ================================================================
  * INTERRUPT SAFETY — track globals shared between ISR and regular code
  * ================================================================ */
-static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound) {
+/* BUG-967: one entry table for true globals (keyed by NAME, static_sym NULL) and
+ * function-scope `static` locals (keyed by SYMBOL — two functions may each own a
+ * `static u32 c`, and a static may shadow a global of the same name). */
+static void track_isr_entry(Checker *c, const char *name, uint32_t name_len,
+                            Symbol *static_sym, bool is_compound) {
     /* find existing entry */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
-        if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+        bool same = static_sym ? (g->static_sym == static_sym)
+                               : (!g->static_sym && g->name_len == name_len &&
+                                  memcmp(g->name, name, name_len) == 0);
+        if (same) {
             if (c->in_interrupt) {
                 g->from_isr = true;
                 if (is_compound) g->compound_in_isr = true;
@@ -20672,6 +21157,7 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
     memset(g, 0, sizeof(*g));
     g->name = name;
     g->name_len = name_len;
+    g->static_sym = static_sym;
     if (c->in_interrupt) {
         g->from_isr = true;
         if (is_compound) g->compound_in_isr = true;
@@ -20679,6 +21165,15 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
     }
+}
+static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound) {
+    track_isr_entry(c, name, name_len, NULL, is_compound);
+}
+/* Callers that hold the resolved SYMBOL use this so a `static` local is keyed
+ * correctly; a true global goes through the name path unchanged. */
+static void track_isr_global_sym(Checker *c, Symbol *s, bool is_compound) {
+    if (!s) return;
+    track_isr_entry(c, s->name, s->name_len, s->is_static ? s : NULL, is_compound);
 }
 
 /* ISR-TRANS: the ISR global-access safety checks ("accessed from both ISR and
@@ -20737,8 +21232,11 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
     Symbol *fs = scope_lookup(c->global_scope, value->ident.name,
                               (uint32_t)value->ident.name_len);
     if (fs && fs->is_function && fs->func_node &&
-        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
+        int _sv_static = _static_alias_count;   /* BUG-967: nested body */
         record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+        _static_alias_count = _sv_static;
+    }
 }
 
 /* E1 (2026-08-02): descend into a function BOUND to a function pointer.
@@ -20764,6 +21262,10 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     if (!node || depth > 32) return;
     switch (node->kind) {
     case NODE_IDENT: {
+        /* BUG-967: a `static` local of the body being walked, before the global
+         * scope (it may shadow a global). */
+        Symbol *ss = static_alias_lookup(node->ident.name, (uint32_t)node->ident.name_len);
+        if (ss) { track_isr_global_sym(c, ss, false); return; }
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
                                   (uint32_t)node->ident.name_len);
         if (gs && !gs->is_function)
@@ -20780,14 +21282,14 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
              * so a form fixed at one sink cannot stay broken at the other. */
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
             if (gs && !gs->is_function)
-                track_isr_global(c, gs->name, gs->name_len, true);
+                track_isr_global_sym(c, gs, true);   /* BUG-967 */
         } else {
             /* BUG-792: `counter = counter + 1` is the same non-atomic RMW as
              * `counter += 1`; the rule tested the OPERATOR, so writing it out
              * evaded it. */
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
             if (gs && !gs->is_function && assign_reads_own_target(node->assign.value, gs))
-                track_isr_global(c, gs->name, gs->name_len, true);
+                track_isr_global_sym(c, gs, true);   /* BUG-967 */
         }
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
@@ -20813,6 +21315,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                  * params before descending, so `*p += 1` one (or n) hops away still
                  * names counter. Scoped — restored after the descent. */
                 int _sv = _rmw_alias_count;
+                int _sv_static = _static_alias_count;   /* BUG-967 */
                 for (int _ai = 0; _ai < node->call.arg_count &&
                                   _ai < cs->func_node->func_decl.param_count; _ai++) {
                     if (_rmw_alias_count >= RMW_ALIAS_MAX) break;
@@ -20827,6 +21330,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                 }
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
                 _rmw_alias_count = _sv;
+                _static_alias_count = _sv_static;
             }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
              * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
@@ -20864,6 +21368,9 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     case NODE_RETURN:    record_isr_globals(c, node->ret.expr, depth); return;
     case NODE_EXPR_STMT: record_isr_globals(c, node->expr_stmt.expr, depth); return;
     case NODE_VAR_DECL:
+        /* BUG-967: a `static` local declared in the walked body (the SAME push
+         * helper the spawn scan uses — the two sinks learn a form together). */
+        static_alias_note_decl(c, node);
         /* BUG-792 (mirrored sink): remember `*u32 p = &counter` so a later
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
@@ -21337,14 +21844,17 @@ static void check_interrupt_safety(Checker *c) {
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
         if (!g->from_isr || !g->from_func) continue; /* not shared */
-        /* shared global — check volatile */
-        Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
+        /* shared global — check volatile. BUG-967: a function-scope `static`
+         * local carries its own Symbol (it is not in the global scope). */
+        Symbol *sym = g->static_sym ? g->static_sym
+                                    : scope_lookup(c->global_scope, g->name, g->name_len);
         if (!sym) continue;
+        const char *what = g->static_sym ? "static local" : "global";
         if (!sym->is_volatile) {
             checker_error(c, sym->line,
-                "global '%.*s' is accessed from both interrupt and main code — "
+                "%s '%.*s' is accessed from both interrupt and main code — "
                 "must be declared volatile",
-                (int)g->name_len, g->name);
+                what, (int)g->name_len, g->name);
         } else if (g->compound_in_isr || g->compound_in_func) {
             /* volatile but compound assignment — race condition */
             checker_error(c, sym->line,
@@ -21352,11 +21862,11 @@ static void check_interrupt_safety(Checker *c) {
                  * the rule now also sees `g = g + 1` and writes reaching g through a
                  * pointer — so the message must describe the OPERATION, not one
                  * spelling of it. */
-                "volatile global '%.*s' is read-modify-written in a single "
+                "volatile %s '%.*s' is read-modify-written in a single "
                 "statement and is shared between interrupt and main code — "
                 "the read and the write can be split by an interrupt, losing an "
                 "update; use an explicit read/mask/write or @atomic_*",
-                (int)g->name_len, g->name);
+                what, (int)g->name_len, g->name);
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and
              * shape. The exemption exists for the SINGLE-WORD flag idiom; a
@@ -21372,12 +21882,12 @@ static void check_interrupt_safety(Checker *c) {
              * call volatile_global_exempt_from_race_check, and
              * tests/test_hw_matrix.c pins them together. */
             checker_error(c, sym->line,
-                "volatile global '%.*s' is shared between interrupt and main "
+                "volatile %s '%.*s' is shared between interrupt and main "
                 "code but is not a single-word scalar — the access lowers to "
                 "several loads/stores, so a reader can TEAR (observe half of one "
                 "write and half of another). volatile gives no atomicity. Use a "
                 "single-word scalar flag, or @atomic_* on a *shared T",
-                (int)g->name_len, g->name);
+                what, (int)g->name_len, g->name);
         }
     }
 }
@@ -22599,6 +23109,18 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
             }
+            /* BUG-961: a DESIGNATED INITIALIZER at global scope. The local var-decl
+             * sink validates a `{ .f = 5 }` against the declared struct and types the
+             * node; this sink never did, so `check_expr` left it `void` and every
+             * global `S s = { .f = 5 };` was refused with "cannot initialize 's' of
+             * type 'S' with 'void'" — for ANY field type. A valid program the
+             * compiler would not build. Same call, same order as the local sink. */
+            if (decl->var_decl.init->kind == NODE_STRUCT_INIT && type) {
+                if (validate_struct_init(c, decl->var_decl.init, type, decl->loc.line)) {
+                    init = type;
+                    typemap_set(c, decl->var_decl.init, type);
+                }
+            }
             if (!value_flows_to(decl->var_decl.init, init, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",
@@ -23632,6 +24154,23 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
         return n;
     }
     case NODE_SWITCH: return collect_shared_types_in_expr(c, stmt->switch_stmt.expr, types, max_types, 0);
+    case NODE_SPAWN: {
+        /* BUG-968 (2026-09-07): a spawn statement is NOT a no-op for this rule.
+         * The emitter evaluates each spawn ARGUMENT under the lock of that
+         * argument's first shared root (the emitted "shared-read lock for spawn
+         * arg N"), one lock per argument, released before the next. So each argument is
+         * its own lock scope — and an argument reading TWO shared structs
+         * (`spawn w(a.x + b.y)`) read the second one with no lock at all: an
+         * unsynchronized cross-thread read, the exact hazard the per-statement
+         * rule exists to refuse. Apply the rule PER ARGUMENT (the count restarts
+         * at 0 for each): the first argument touching two types reports. */
+        for (int ai = 0; ai < stmt->spawn_stmt.arg_count; ai++) {
+            int n = collect_shared_types_in_expr(c, stmt->spawn_stmt.args[ai],
+                                                 types, max_types, 0);
+            if (n >= 2) return n;
+        }
+        return 0;
+    }
     /* Stage 2 Part B (2026-04-28): exhaustive — same shape as
      * find_shared_type_in_stmt above. Statement kinds without a
      * cond/init/expr that could read a shared struct return 0. */
@@ -23642,7 +24181,7 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:

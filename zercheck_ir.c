@@ -2014,6 +2014,83 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     return IRMC_NONE;
 }
 
+/* BUG-966 (2026-09-07): the tracked handle a VIEW expression is rooted at.
+ *
+ *     *u32 q  = &p.get(h).v;      // interior pointer into the slot of h
+ *     [*]u8 s = p.get(h).arr[0..]; // subslice of the slot of h
+ *     [*]u8 s = h.arr[0..];        // same, through Handle auto-deref
+ *     p.free(h);
+ *     *q = 7; s[0] = 7;            // was ACCEPTED — slot recycled, silent UAF
+ *
+ * The two view registrations in IR_ASSIGN walked FIELD/INDEX (the `&` arm) or
+ * SLICE/INDEX (the subslice arm) to a root IDENT and aliased the destination to
+ * that local's handle. A root that is a `.get(h)` CALL, or a FIELD step on the
+ * way to a Handle local, stopped the walk with no alias, so the view escaped
+ * the slot's lifetime entirely (no compile error, no runtime generation check
+ * — the emitted C is a raw pointer into the pool array).
+ *
+ * This walks every navigation-within-the-same-allocation step (FIELD, INDEX,
+ * SLICE, `*p` deref) and, at a `.get(h)` call, resolves h through
+ * ir_extract_compound_key exactly as the IRMC_GET use-after-free check does
+ * (bare local or compound key). At a bare IDENT it returns that local's
+ * tracked handle (or its first tracked compound view). Returns NULL when the
+ * root is untracked (param, stack aggregate, global) — conservative: no alias
+ * means the pre-existing behaviour for those roots is unchanged. Only a handle
+ * with alloc_id != 0 (a real tracked allocation) is returned. */
+static IRHandleInfo *ir_view_root_handle(ZerCheck *zc, IRFunc *func,
+                                         IRPathState *ps, Node *view) {
+    Node *cur = ir_peel_launder(view);
+    int guard = 0;
+    while (cur && guard++ < 64) {
+        switch (cur->kind) {
+        case NODE_FIELD: cur = cur->field.object; continue;
+        case NODE_INDEX: cur = cur->index_expr.object; continue;
+        case NODE_SLICE: cur = cur->slice.object; continue;
+        case NODE_UNARY:
+            if (cur->unary.op == TOK_STAR) { cur = cur->unary.operand; continue; }
+            return NULL;
+        case NODE_CALL: {
+            if (ir_classify_method_call_ex(zc->checker, cur) != IRMC_GET ||
+                cur->call.arg_count < 1)
+                return NULL;
+            int root_local; const char *path; uint32_t path_len;
+            if (ir_extract_compound_key(zc, func, cur->call.args[0],
+                                        &root_local, &path, &path_len) != 0 ||
+                root_local < 0)
+                return NULL;
+            IRHandleInfo *h = (path_len == 0)
+                ? ir_arg_view_handle(ps, root_local)
+                : ir_find_compound_handle(ps, root_local, path, path_len);
+            return (h && h->alloc_id != 0) ? h : NULL;
+        }
+        case NODE_IDENT: {
+            int root_local = ir_find_local_exact_first(func, cur->ident.name,
+                                                       (uint32_t)cur->ident.name_len);
+            if (root_local < 0) return NULL;
+            IRHandleInfo *h = ir_arg_view_handle(ps, root_local);
+            return (h && h->alloc_id != 0) ? h : NULL;
+        }
+        case NODE_INTRINSIC:
+            /* a launder the peeler left in place = not a same-allocation step */
+            return NULL;
+        case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+        case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+        case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+        case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+        case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+        case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+        case NODE_DO_WHILE: case NODE_STATIC_ASSERT: case NODE_INT_LIT: case NODE_FLOAT_LIT:
+        case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+        case NODE_BINARY: case NODE_ASSIGN: case NODE_ORELSE: case NODE_CAST:
+        case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+            return NULL;
+        }
+        return NULL;
+    }
+    return NULL;
+}
+
 
 /* F3.2 (2026-05-04): extract the receiver name (Pool/Slab variable
  * name) from a builtin method call. Returns the source-level identifier
@@ -4086,6 +4163,23 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             }
                         }
                     }
+                } else if (sroot && (sroot->kind == NODE_FIELD ||
+                                     sroot->kind == NODE_CALL ||
+                                     sroot->kind == NODE_UNARY)) {
+                    /* BUG-966: the walk above stopped at a FIELD (`h.arr[0..]`
+                     * through Handle auto-deref, `b.arr[0..]` on a tracked
+                     * pointer) or at a `.get(h)` CALL (`p.get(h).arr[0..]`).
+                     * Resolve the slot the view is rooted at and alias to it. */
+                    IRHandleInfo *vsrc_h = ir_view_root_handle(zc, func, ps, slice_val);
+                    if (vsrc_h && vsrc_h->local_id != b_dest) {
+                        IRAliasSnapshot bsnap;
+                        ir_snapshot_alias(&bsnap, vsrc_h);
+                        IRHandleInfo *bdst_h = ir_add_handle(ps, b_dest);
+                        if (bdst_h) {
+                            ir_apply_alias(bdst_h, &bsnap);
+                            bdst_h->state = bsnap.state;
+                        }
+                    }
                 }
             }
         }
@@ -4817,6 +4911,22 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                 ir_apply_alias(dst_h, &snap);
                                 dst_h->state = snap.state;
                             }
+                        }
+                    }
+                } else if (target && target->kind == NODE_CALL && !used_compound &&
+                           inst->dest_local >= 0) {
+                    /* BUG-966: `&p.get(h).v` — the FIELD/INDEX walk above ends at
+                     * the `.get(h)` CALL, not an IDENT, so the interior pointer
+                     * had no alias and outlived `p.free(h)` unseen. Resolve the
+                     * slot through the get argument and alias to it. */
+                    IRHandleInfo *vsrc_h = ir_view_root_handle(zc, func, ps, addr_target);
+                    if (vsrc_h && vsrc_h->local_id != inst->dest_local) {
+                        IRAliasSnapshot snap;
+                        ir_snapshot_alias(&snap, vsrc_h);
+                        IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
+                        if (dst_h) {
+                            ir_apply_alias(dst_h, &snap);
+                            dst_h->state = snap.state;
                         }
                     }
                 }
@@ -7300,6 +7410,31 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    /* (c5) BUG-964 (2026-09-07) — the UNWRAPPED OPTIONAL PARAM.
+                     * `?*T pick(?*T o) { *T t = o orelse return; return t; }`
+                     * returns the very pointer it was given, through an orelse
+                     * unwrap and a COPY. Arm (a) needs the returned LOCAL to be the
+                     * param and (b) needs a handle a param has not got, so the
+                     * summary stayed unset, the CALL SITE registered the result as
+                     * a fresh allocation, and every caller of the canonical
+                     * "unwrap-or-bail" accessor was refused with a leak that does
+                     * not exist. ir_local_def_expr already follows the COPY chain
+                     * to the `_zer_or = o` assignment whose expr is the bare param
+                     * ident — an IDENTITY view, so it is matched exactly like (a).
+                     * (The peel below deliberately rejects a bare ident, because a
+                     * bare ident that is NOT a param is a value read; a param IS
+                     * caller memory, which is the whole reason (a) exists.) */
+                    if (match_param < 0 && vexpr && vexpr->kind == NODE_IDENT) {
+                        int uroot = ir_find_local_exact_first(func,
+                            vexpr->ident.name, (uint32_t)vexpr->ident.name_len);
+                        for (int pi = 0; pi < pc && uroot >= 0; pi++) {
+                            ParamDecl *pp = &fn->func_decl.params[pi];
+                            int pl = ir_find_local_exact_first(func,
+                                pp->name, (uint32_t)pp->name_len);
+                            if (pl >= 0 && pl == uroot) { match_param = pi; break; }
                         }
                     }
 

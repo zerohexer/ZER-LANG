@@ -92,3 +92,7 @@ zercheck_ir.c:    int view_alloc_ids[8];
 # releases it, so nothing is ever dropped). The cap it REPLACED was the bug: a
 # fixed 16 with a silent early return that emitted 15 locks for 18 shared roots.
 ir_lower.c:    Node  *inline_buf[16];
+
+# BUG-972: bounded scratch for the asm-operand shared-type probe — the decision is
+# "count > 0", so two slots are the whole state; same shape as `found[4]` above.
+checker.c:                Type *sh[2];

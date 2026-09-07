@@ -1,0 +1,16 @@
+// BUG-965b (2026-09-07): a call whose CALLEE is itself an expression yielding
+// a funcptr — a call result (`pick(k)(5)`) or an orelse. The checker accepted
+// every funcptr-typed callee, but the IR emitter had arms only for a name, a
+// struct field and an indexed array, and ABORTED ("cannot lower this callee
+// expression") on the rest — a checker-accepted program that never compiled.
+u32 inc(u32 x) { return x + 1; }
+u32 dbl(u32 x) { return x * 2; }
+*(u32) -> u32 pick(u32 k) { if (k == 0) { return inc; } return dbl; }
+?*(u32) -> u32 maybe(u32 k) { if (k == 0) { return null; } return dbl; }
+u32 main() {
+    if (pick(0)(5) != 6) { return 1; }
+    if (pick(1)(5) != 10) { return 2; }
+    if ((maybe(0) orelse inc)(3) != 4) { return 3; }
+    if ((maybe(1) orelse inc)(3) != 6) { return 4; }
+    return 0;
+}

@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot copy a 'Semaphore(2)' by value
+// BUG-970 (2026-09-07): the RETURN sink — returning a Semaphore by value
+// copies its count and lock out of the global.
+Semaphore(2) gs;
+Semaphore(2) get() { return gs; }
+u32 main() { Semaphore(2) s = get(); @sem_acquire(s); return 0; }

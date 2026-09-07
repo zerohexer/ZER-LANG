@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'c'
+// BUG-967 (2026-09-07): a function-scope `static` local is ONE storage location
+// shared by every thread that reaches the function — a global with a private
+// name. The spawn race scan resolved identifiers through the global scope only,
+// so two threads doing `c += 1` on it compiled clean (TSan-confirmed race).
+void w() { static u32 c = 0; c += 1; }
+u32 main() { spawn w(); spawn w(); return 0; }

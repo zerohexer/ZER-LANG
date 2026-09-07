@@ -1,0 +1,31 @@
+// BUG-965 (2026-09-07): the checker resolves top-level names in a pre-pass,
+// so a body may use a global declared BELOW it, and a global funcptr
+// initialiser may name a function defined BELOW it. The emitter used to write
+// C in source order, so GCC failed with "'g' undeclared" / "'handler'
+// undeclared" on programs the checker had accepted. Now: prototypes, then
+// globals, then bodies.
+void touch(u32 v) { g = v; }
+u32 g = 0;
+
+u32 (*cb)(u32) = handler;
+u32 handler(u32 x) { return x + 1; }
+
+// A static function must keep its `static` on the prototype too, or GCC
+// rejects "static declaration follows non-static".
+static u32 twice(u32 x) { return x * 2; }
+
+// Function returning a funcptr — the nested-paren header form on the
+// prototype as well as the definition.
+*(u32) -> u32 pick(u32 k) {
+    if (k == 0) { return handler; }
+    return twice;
+}
+
+u32 main() {
+    touch(9);
+    if (g != 9) { return 1; }
+    if (cb(1) != 2) { return 2; }
+    if (pick(0)(5) != 6) { return 3; }
+    if (pick(1)(5) != 10) { return 4; }
+    return 0;
+}

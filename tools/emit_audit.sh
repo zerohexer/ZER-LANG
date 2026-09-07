@@ -109,6 +109,28 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-960: a VOLATILE index must be read ONCE. The auto-guard used to emit
+# `_zer_t0 = g_i; if (_zer_t0 >= 4) return; ... arr[g_i] = 7` — two loads, and an
+# ISR landing between them walks past the guard. The emitted access must be the
+# single-evaluation inline form (one load into _zer_idx, check and access on the
+# temp) and the raw `arr[g_i]` must NOT appear. Verified RED on the pre-fix compiler.
+cat > "$req_dir/volidx.zer" <<'ZEOF'
+volatile u32 g_i = 0;
+u32[4] arr;
+u32 main() { g_i = 2; arr[g_i] = 7; volatile u32 li = 1; arr[li] = 9; return 0; }
+ZEOF
+if "$ZERC" "$req_dir/volidx.zer" -o "$req_dir/volidx.c" >/dev/null 2>&1; then
+    nraw=$(grep -cE 'arr\[(g_i|li)\]' "$req_dir/volidx.c" || true)
+    nse=$(grep -cE '_zer_idx[0-9]+ = \(size_t\)\((g_i|li)\)' "$req_dir/volidx.c" || true)
+    if [ "$nraw" -ne 0 ] || [ "$nse" -lt 2 ]; then
+        echo "MISSING EMISSION: volatile index must be single-read  raw=$nraw (want 0) single-eval=$nse (want >=2)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the volatile-index sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

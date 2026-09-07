@@ -1,0 +1,22 @@
+// BUG-967 (2026-09-07): the shapes the static-local race rule must KEEP
+// accepting — single-threaded use, atomic access from a thread, a volatile
+// single-word flag from a thread, and a PLAIN local that merely shares a name
+// with another function's static (a stale scan row would false-positive here).
+u32 next_id() { static u32 n = 0; n += 1; return n; }
+
+void atomic_w() { static u32 c = 0; @atomic_add(&c, 1); }
+
+void flag_w() { static volatile u32 flag = 0; flag = 1; }
+
+void other() { static u32 c = 0; c += 1; }
+void plain_w() { u32 c = 0; c += 1; }
+
+u32 main() {
+    next_id();
+    if (next_id() != 2) { return 1; }
+    spawn atomic_w(); spawn atomic_w();
+    spawn flag_w();
+    other();
+    spawn plain_w();
+    return 0;
+}

@@ -580,7 +580,16 @@ leaking it"*.)
 
 ---
 
-## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
+## ~~OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope~~ — CLOSED 2026-09-07 as BUG-961 (+ BUG-963), DO NOT REDO
+
+The diagnosis below was right: the global-var init path never ran
+`validate_struct_init`, so the literal was typed `void`. Fixed at that one site;
+`tests/zer/global_designated_init.zer` is the positive. Writing it found a SECOND,
+emitter-side defect the entry could not have seen: `{ .opt = null }` on an
+optional-VALUE field emitted `{0, 1}` (Some(0)) at all three struct-init emitters
+(BUG-963, `tests/zer/struct_init_null_field.zer`). Kept for the record:
+
+### (original entry)
 
 Found while measuring item J's sinks; not reported by any branch, and NOT
 optional-specific — it was checked against a plain field precisely to find out.
@@ -614,7 +623,18 @@ Tripwire: none yet — write the positive in the same commit as the fix.
 
 ---
 
-## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+## ~~OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK~~ — CLOSED 2026-09-07 as BUG-972 (REJECT, per the Ban framework), DO NOT REDO
+
+Decided with the Ban Decision Framework as the entry itself suggested: a naked
+function has no frame, so there is nowhere to emit the lock/unlock — hardware
+constraint, #1 on the list, so REJECT rather than lock. The structured-asm
+operand loop now runs `collect_shared_types_in_expr` on every input/output
+(`tests/zer_fail/asm_shared_operand.zer`). The CALL-laundered divergence the entry
+warns about is untouched. RESIDUAL FLOOR: the raw-string inline form
+(`asm("..." : "=r"(g.x))`) carries its operands inside C text no checker parses —
+same floor as any cinclude'd C. Kept for the record:
+
+### (original entry)
 
 Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
 not reported by any branch. The baseline claimed an asm operand can reach "no local, no
@@ -666,6 +686,71 @@ Tripwire: none yet — write the negative in the same commit as the fix.
 
 ---
 
+## OPEN — Arena methods through a POINTER or a STRUCT FIELD are not supported (2026-09-07, MEDIUM — over-rejection, surfaced by BUG-970)
+
+```zer
+struct T { u32 v; }
+u8[64] buf;
+void use(*Arena a) { *T t = a.alloc(T) orelse return; t.v = 3; }   // error: cannot access field 'alloc' on type '*Arena'
+struct H { u32 tag; Arena a; }
+u32 main() { H h; h.a = Arena.over(buf); *T t = h.a.alloc(T) orelse return; return 0; }
+// emitted C: `h.a.alloc` — GCC: '_zer_arena' has no member named 'alloc'
+```
+
+MEASURED on the pre-BUG-970 build too — pre-existing, not a regression. Before BUG-970
+the workaround was to copy the arena by value into a helper, which silently duplicated
+the bump pointer; now that copy is (correctly) refused, so an arena is usable only by
+its own name (global, or a local inside its declaring function). Corpus cost: zero —
+no test, example or lib file passes an arena to a function.
+
+**Fix sketch:** the builtin-method dispatch (`checker.c` ~8765 `obj->kind == TYPE_ARENA`)
+auto-derefs ONE pointer level when the pointee is a builtin container, the emitter's
+Arena method interception emits `->` for a pointer receiver, and `zercheck_ir`'s
+`ir_classify_method_call_ex` receiver validation accepts `*Arena`. The struct-field
+receiver (`h.a.alloc`) needs the emitter to spell the field path before the method.
+Three files, one question — do them together or not at all. Tripwire: promote the
+`res_ok` shape (a `*Arena` param calling `.alloc`) to `tests/zer/` when done.
+
+---
+
+## OPEN — scoped-spawn borrow RESIDUALS after BUG-969 (2026-09-07, LOW — documented conservatism)
+
+`spawn_arg_borrow_roots` resolves a pointer local's storage through its INITIALISER
+chain only. Two shapes stay unresolved and borrow only the pointer ident itself:
+
+- **Reassignment after the declaration**: `*u32 q = &a; q = &b; spawn w(q); b = 1;` —
+  `b` is not borrowed (the write to `b` compiles). `q` IS borrowed, so `*q = 1` is
+  refused; only the by-name write to the re-pointed storage slips.
+- **A pointer/slice PARAMETER or heap pointer**: the callee's own storage is unknown,
+  so only the param/pointer ident is borrowed; a parent access to the same memory by
+  another name (a second alias made before the spawn) is not seen.
+
+Both are the per-file, no-points-to model. The durable fix is a `Symbol.borrow_root`
+updated at every ASSIGNMENT to a pointer local (the declaration-site rule in CLAUDE.md
+"Scope-sensitive changes at DECLARATION sites" applies to the re-point too). Probes
+that fail today are the two shapes above; write them as negatives when the root
+tracking lands.
+
+---
+
+## OPEN — ISR-vs-main tracking counts a helper as "main" even when only the ISR calls it (pre-existing, LOW — over-rejection, now also for static locals)
+
+```zer
+u32 n = 0;
+void helper() { n += 1; }
+interrupt TIM1 { helper(); }
+u32 main() { return 0; }          // error: 'n' accessed from both interrupt and main — must be volatile
+```
+
+MEASURED on `41ebfb4b` for globals; BUG-967 inherits it for static locals by design
+(consistency over precision). `track_isr_global` records `from_func` while a helper's
+body is type-checked, with no knowledge of who calls the helper. The precise fix is a
+call-graph reachability query ("is this function reachable from a non-ISR root?") —
+the same DFS `scan_frame` / `func_rmw_param_mask` already memoise — gating the
+`from_func` mark. Over-rejection only; no soundness impact.
+
+---
+
 ## OPEN — BRANCH `loving-davinci-r3an9y` (2026-09-04): 12 holes, 35 live negatives
 
 Surveyed 2026-09-04, measured against main at `225a5b9d`. A DIFFERENT branch family
@@ -705,7 +790,12 @@ Their fix: a consumer-side `enum_nonvariant_trap` at BOTH emitter paths plus a
 declaration rule for the bare-uninitialised door. That is TRACKING (trap), which is
 right here — unlike a literal, the author wrote nothing to reject.
 
-**B. Packed-struct ARRAY field, four more doors (their BUG-922).** BUG-786 covered a
+**B. ~~Packed-struct ARRAY field, four more doors~~ — CLOSED 2026-09-07 as BUG-971.**
+Not their signature change: `value_is_packed_derived_into(c, v, dest, dest_is_param)`
+beside the existing predicate, so the DESTINATION decides whether an array-typed
+field is a view (slice, or an ARRAY PARAMETER — by-reference in the emitted C,
+measured) or a copy (an array local). Five negatives `tests/zer_fail/packed_array_field_*`
++ `tests/zer/packed_array_field_copy_ok.zer`. Kept for the record — BUG-786 covered a
 deref through `&packed.field`. An ARRAY field of a packed struct escapes the
 alignment rule at four further doors — slice, coercion, call-arg and `&elem`:
 
@@ -719,7 +809,8 @@ Note that changes the signature of the query BUG-842 introduced and BUG-927 exte
 
 ### Classes that appear in NO other branch
 
-**C. A slice's `.ptr` / `.len` are ASSIGNABLE (their BUG-920) — HIGH, defeats bounds.**
+**C. ~~A slice's `.ptr` / `.len` are ASSIGNABLE~~ — CLOSED 2026-09-07 as BUG-959** (assign,
+compound-assign and `&` at the checker; four negatives + `slice_header_read_ok`).
 
     u32 main() { u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1; return 0; }
 
@@ -727,8 +818,11 @@ The slice header is the whole basis of `[*]T` bounds safety; if `.len` is writab
 guarantee is forgeable in one line. 3 tests: `slice_len_assign_forge`,
 `slice_ptr_assign_forge`, `slice_len_addr_forge`.
 
-**D. Unique-resource COPY-BY-VALUE (their BUG-916) — 8 tests.** `Arena`, `Barrier`
-and `Semaphore` alias their state when copied:
+**D. ~~Unique-resource COPY-BY-VALUE~~ — CLOSED 2026-09-07 as BUG-970** (one carrier
+predicate `type_carries_unique_resource` asked by `value_flows_to`, so all eight sinks
+refuse together; `Arena.over` and a struct literal are the only by-value producers).
+SURFACED a pre-existing gap — see the new OPEN entry "Arena methods through a pointer".
+Kept for the record: `Arena`, `Barrier` and `Semaphore` alias their state when copied:
 
     u8[64] buf; Arena a = Arena.over(buf);
     Arena b = a;                    // two Arenas over one backing store
@@ -739,7 +833,10 @@ Doors: plain copy, by-value param, return, orelse fallback, a struct CARRYING on
 and a struct-init field. Their fix is one predicate `type_unique_resource_name` +
 `check_unique_resource_copy` at every value-flow site — the one-query shape.
 
-**E. STATIC LOCALS are invisible to the spawn race scan AND the ISR check (BUG-915).**
+**E. ~~STATIC LOCALS are invisible to the spawn race scan AND the ISR check~~ — CLOSED
+2026-09-07 as BUG-967** (scan-scoped `_static_alias` table pushed by ONE helper both
+walkers call; `IsrGlobal.static_sym` keys the ISR entry by symbol; `Checker.static_locals`
+registry). Kept for the record:
 
     void w() { static u32 c = 0; c += 1; }
     u32 main() { spawn w(); spawn w(); return 0; }
@@ -754,7 +851,10 @@ sees it. 3 tests, BOTH sinks — the ISR sibling is:
 Their fix: a scan-scoped static table + `IsrGlobal` keyed by declaration. Fix both
 sinks in the same commit — this is the mirrored-sink family.
 
-**F. Scoped-spawn borrow only ever covered a literal `&v` (their BUG-924) — 6 tests.**
+**F. ~~Scoped-spawn borrow only ever covered a literal `&v`~~ — CLOSED 2026-09-07 as
+BUG-969** (`spawn_arg_borrow_roots`: `&e`, a slice, or a pointer/slice-carrying local
+AND the storage its initialiser chain addresses; an unresolvable root borrows the ident
+— see the RESIDUAL entry below). Kept for the record:
 A pointer local, a struct carrier, a slice view, a param and a threadlocal alias all
 lend nothing, so the parent can race the child:
 
@@ -765,7 +865,9 @@ lend nothing, so the parent can race the child:
 Their fix: `Symbol.borrow_root` recorded at the declaration sites, one sink
 `scoped_spawn_borrow` for both spellings, unknown root REJECTED.
 
-**G. Views into a pool/slab slot escape UAF tracking (their BUG-919) — 5 tests.**
+**G. ~~Views into a pool/slab slot escape UAF tracking~~ — CLOSED 2026-09-07 as BUG-966**
+(`ir_view_root_handle` in zercheck_ir.c, called from both the `&` interior-pointer arm
+and the subslice arm of IR_ASSIGN; three negatives + `pool_slot_view_ok`). Kept:
 
     Handle(T) h = p.alloc() orelse return;
     *u32 q = &p.get(h).v;
@@ -787,7 +889,9 @@ spelling, which reaches the slot without calling get() at all:
     } Their fix: `ir_view_root_handle` + `pool_get_handle_root`
 at the keep sink.
 
-**H. `spawn w(a.x + b.y)` reads the second shared struct UNLOCKED (their BUG-914).**
+**H. ~~`spawn w(a.x + b.y)` reads the second shared struct UNLOCKED~~ — CLOSED 2026-09-07
+as BUG-968** (`collect_shared_types_in_stmt` applies the two-types rule PER spawn
+argument, the emitter's lock scope). Kept:
 Adjacent to BUG-795 (the callee-position walk) but a different sink: per-ARGUMENT
 shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
 
@@ -797,7 +901,8 @@ shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
     void w(u32 v) { a.x = v; }
     u32 main() { spawn w(a.x + b.y); return 0; }
 
-**I. Bare `orelse return` in a non-null-pointer or funcptr function (their BUG-918).**
+**I. ~~Bare `orelse return` in a non-null-pointer or funcptr function~~ — CLOSED
+2026-09-07 as BUG-962** (`nonnull_zero_hole` on the return type at NODE_ORELSE). Kept:
 Returned NULL as a non-null pointer, and produced a GCC error for slice/struct
 returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
@@ -813,11 +918,11 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 - **BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration
 - **BUG-923** a bit-slice write on a `uN` value did not compile
 
-### Suggested order for this branch
+### Suggested order for this branch — ALL NINE DONE (2026-09-07)
 
-~~A~~ (DONE, BUG-930) → **C** (one line forges any bound) → **G** and **F** (both
-accept-unsafe; G is UAF, F is a data race) → **D** → **E** → **B** → **H** → **I**.
-A's consumer-side residual can be picked up with B, since both are emitter work.
+~~A~~ (BUG-930) ~~C~~ (BUG-959) ~~G~~ (BUG-966) ~~F~~ (BUG-969) ~~D~~ (BUG-970) ~~E~~
+(BUG-967) ~~B~~ (BUG-971) ~~H~~ (BUG-968) ~~I~~ (BUG-962). Still open from this branch:
+A's consumer-side `enum_nonvariant_trap` residual, and the three unverified items above.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed
 

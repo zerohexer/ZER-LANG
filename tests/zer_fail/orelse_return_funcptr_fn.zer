@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: would return a null function pointer
+// BUG-962: the function-pointer sibling — a NULL callee waiting to be called.
+u32 dbl(u32 x) { return x * 2; }
+*(u32) -> u32 pick2(?u32 o) { u32 v = o orelse return; return dbl; }
+u32 main() { *(u32) -> u32 f = pick2(null); return f(2); }

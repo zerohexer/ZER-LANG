@@ -1,0 +1,14 @@
+// BUG-965c (2026-09-07): a function returning a NULLABLE funcptr
+// (`?*(u32) -> u32 f()`). The header emitter knew the nested-paren form
+// `T (*f(args))(A)` only for a bare funcptr return; the optional wrapper made
+// it fall through to `T (*)(A) f(args)`, which GCC rejects — every such
+// program failed to compile. A nullable funcptr is the same C pointer.
+u32 inc(u32 x) { return x + 1; }
+?*(u32) -> u32 maybe(u32 k) { if (k == 0) { return null; } return inc; }
+u32 main() {
+    *(u32) -> u32 f = maybe(1) orelse return;
+    if (f(1) != 2) { return 1; }
+    ?*(u32) -> u32 none = maybe(0);
+    if (none) |g| { return g(0) + 2; }
+    return 0;
+}

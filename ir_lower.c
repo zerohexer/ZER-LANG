@@ -1103,6 +1103,21 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
      * (`arr[i]`), so this keeps almost all of the coverage and none of the risk. */
     Node *ix = site->index_expr;
     if (!ix || (ix->kind != NODE_IDENT && ix->kind != NODE_INT_LIT)) return;
+    /* BUG-960: a VOLATILE ident is NOT side-effect free in the sense that matters
+     * here — evaluating it in the guard and again in the access is two loads of a
+     * value that may change in between. The checker no longer marks such an
+     * access for auto-guard at all (it takes the emitter's single-read inline
+     * check), so this is belt-and-braces: decline, never split the read. */
+    if (ix->kind == NODE_IDENT) {
+        int vl = ir_find_local(ctx->func, ix->ident.name, (uint32_t)ix->ident.name_len);
+        if (vl >= 0) {
+            if (ctx->func->locals[vl].is_volatile) return;
+        } else {
+            Symbol *vs = scope_lookup(ctx->checker->global_scope,
+                                      ix->ident.name, (uint32_t)ix->ident.name_len);
+            if (vs && vs->is_volatile) return;
+        }
+    }
 
     int idx = lower_expr(ctx, ix);
     if (idx < 0) return;
@@ -2549,6 +2564,40 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
                     inst.dest_local = local_id;
                     inst.expr = init;
+                    emit_inst(ctx, inst);
+                    break;
+                }
+                /* BUG-973 (2026-09-07): array → ARRAY init from a non-ident
+                 * expression (`u32[2] c = q.w;`, `= arr2[i]` on a 2-D array). An
+                 * IDENT init goes through lower_expr → IR_COPY → memcpy; every other
+                 * array-typed init has no local to copy from, so lower_expr emitted
+                 * it as a bare side-effect statement (`q.w;`) and the local kept its
+                 * `{0}` — a SILENT MISCOMPILE (the assignment spelling `c = q.w;` was
+                 * fine: it reaches the AST NODE_ASSIGN array memmove). Route this
+                 * spelling to that same emitter by synthesising `c = <init>`. */
+                if (init_eff && init_eff->kind == TYPE_ARRAY &&
+                    vt_unwrap && type_dispatch_kind(vt_unwrap) == TYPE_ARRAY &&
+                    init->kind != NODE_IDENT && local_id >= 0) {
+                    rewrite_idents(ctx, init);
+                    pre_lower_orelse(ctx, &init, node->loc.line);
+                    IRLocal *dloc = &ctx->func->locals[local_id];
+                    Node *dst_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(dst_id, 0, sizeof(Node));
+                    dst_id->kind = NODE_IDENT;
+                    dst_id->loc = node->loc;
+                    dst_id->ident.name = dloc->name;
+                    dst_id->ident.name_len = (size_t)dloc->name_len;
+                    checker_set_type(ctx->checker, dst_id, vt);
+                    Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(new_assign, 0, sizeof(Node));
+                    new_assign->kind = NODE_ASSIGN;
+                    new_assign->loc = node->loc;
+                    new_assign->assign.op = TOK_EQ;
+                    new_assign->assign.target = dst_id;
+                    new_assign->assign.value = init;
+                    checker_set_type(ctx->checker, new_assign, vt);
+                    IRInst inst = make_inst(IR_ASSIGN, node->loc.line);
+                    inst.expr = new_assign;
                     emit_inst(ctx, inst);
                     break;
                 }

@@ -1,0 +1,10 @@
+// expect-trap
+// BUG-960: an out-of-range VOLATILE index must TRAP (single-read inline check),
+// not take the silent early return the two-read auto-guard used to emit.
+volatile u32 g_i = 0;
+u32[4] arr;
+u32 main() {
+    g_i = 9;
+    arr[g_i] = 7;
+    return 0;
+}

@@ -12734,3 +12734,57 @@ call-result sink must use this helper, not re-inline the predicate.** The litera
 compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
+
+## Session 2026-09-07 — mechanisms added (BUG-959..973), where they live and why
+
+- **ONE function-header emitter — `emit_func_header(e, fn, ret)` (emitter.c, beside
+  `emit_func_attributes`).** The IR definition (`emit_regular_func_from_ir`), the bodyless
+  prototype (`emit_func_decl`) and the new whole-file prototype pass
+  (`emit_func_prototypes`) all print through it. They had drifted three ways (main
+  promotion, nested-paren funcptr return, variadic `...`); the optional-funcptr return
+  (`?*(u32) -> u32 f()`) was wrong in all of them. **Emission order is now prototypes →
+  globals → bodies in BOTH `emit_file_module` paths** (the imported-module path already
+  did globals-first). Reason: the checker resolves top-level names in a pre-pass, so a
+  body may name a global declared below it and a global funcptr initialiser may name a
+  function defined below it; C needs both declared first. A prototype is skipped for
+  comptime (no C) and async (no C function of that name) functions.
+- **IR_CALL callee arm for EXPRESSION callees** (`pick(k)(5)`, `(opt orelse f)(x)`):
+  emits `(<callee>)(args)` through `emit_rewritten_node`. Previously an INTERNAL abort.
+- **`ir_view_root_handle(zc, func, ps, view)` (zercheck_ir.c, after
+  `ir_classify_method_call_ex`).** THE resolver for "which tracked slot is this view
+  rooted at": walks FIELD/INDEX/SLICE/`*p`, and at a `.get(h)` call resolves `h` through
+  `ir_extract_compound_key` exactly like the IRMC_GET UAF check. Called from BOTH the `&`
+  interior-pointer arm and the subslice arm of IR_ASSIGN. When you add a view-forming
+  spelling, call it; do not add a fourth root walk.
+- **Static locals as global storage (checker.c).** `Checker.static_locals` (registered at
+  the var-decl); the scan-scoped `_static_alias` table (sibling of `_rmw_alias`, SAME
+  save/restore discipline at every body descent, reset at every scan entry) pushed by ONE
+  helper `static_alias_note_decl` from both walkers' NODE_VAR_DECL arms;
+  `resolve_write_target_global` consults it (and returns a check-time static symbol);
+  `IsrGlobal.static_sym` + `track_isr_global_sym` key the ISR entry by SYMBOL (two
+  functions may each own a `static u32 c`). A stale row would false-positive against a
+  same-named plain local of another body — that is why the table is scoped, not global.
+- **Scoped-spawn borrow roots — `spawn_arg_borrow_roots` + `ptr_local_storage_root`.**
+  Up to two roots per argument (the pointer local AND the storage its initialiser chain
+  addresses); `bcap` is `2 * arg_count`. The per-root body is the pre-existing D4/D6/D7
+  logic unchanged.
+- **Unique-resource copy — `type_carries_unique_resource` in `value_flows_to`.** The
+  ninth question the one value-flow query answers. `value_is_resource_construction`
+  exempts `Arena.over(...)` and a struct literal. Report wording lives in
+  `report_value_flow_refusal` like the other refusals.
+- **Packed views — `value_is_packed_derived_into(c, v, dest, dest_is_param)`.** The
+  destination decides whether an array-typed field expression is a view: a slice, or an
+  ARRAY PARAMETER (by-reference in the emitted C — measured). `addr_of_is_packed_field`
+  now accepts an INDEX operand (`&p.w[i]`). The NODE_INDEX handler refuses indexing a
+  packed-derived slice/pointer (the sibling of the bare-pointer deref check).
+- **Spawn arguments are lock scopes.** `collect_shared_types_in_stmt` case NODE_SPAWN runs
+  the two-types rule per ARGUMENT, because the emitter locks each argument's first shared
+  root separately (`shared-read lock for spawn arg N`).
+- **Array var-decl init from a non-ident array expression** (`u32[2] c = q.w;`):
+  `ir_lower.c` NODE_VAR_DECL synthesises `c = <init>` (IR_ASSIGN passthrough, no dest) so it
+  reaches the AST NODE_ASSIGN array memmove. The IDENT form still goes IR_COPY → memcpy.
+- **Volatile index (BUG-960).** `push_var_range` refuses a volatile root; NODE_INDEX
+  leaves a volatile index unproven AND unguarded so the emitter's single-evaluation trap
+  form runs (IR NODE_INDEX checks `func->locals[].is_volatile` because `expr_is_volatile`
+  cannot see IR locals); `lower_one_guard_site` declines a volatile ident;
+  `emit_audit.sh` has a REQUIRED fingerprint for it.

@@ -1,0 +1,27 @@
+// BUG-973 (2026-09-07): `u32[2] c = q.w;` — an ARRAY local initialised from
+// an array-typed struct field (or any non-identifier array expression) kept its
+// zero initialiser: the lowering emitted the initialiser as a bare side-effect
+// statement (`q.w;`) and the local stayed `{0}`. Silent miscompile — the
+// checker accepted it, GCC accepted it, the program read zeros. The assignment
+// spelling (`c = q.w;`) and the ident spelling (`u32[2] b = a;`) were correct.
+struct Q { u8 a; u32[2] w; }
+struct Outer { Q q; }
+u32 main() {
+    u32[2] a; a[0] = 5; a[1] = 6;
+    u32[2] b = a;
+    if (b[0] != 5 || b[1] != 6) { return 1; }
+    Q q; q.w[0] = 7; q.w[1] = 8;
+    u32[2] c = q.w;
+    if (c[0] != 7 || c[1] != 8) { return 2; }
+    c[0] = 1;
+    if (q.w[0] != 7) { return 3; }          // a COPY, not a view
+    Outer o; o.q.w[0] = 9;
+    u32[2] d = o.q.w;
+    if (d[0] != 9) { return 4; }
+    u32[2][2] grid; grid[1][0] = 11;
+    u32[2] row = grid[1];
+    if (row[0] != 11) { return 5; }
+    u32[2] e; e = q.w;
+    if (e[1] != 8) { return 6; }
+    return 0;
+}

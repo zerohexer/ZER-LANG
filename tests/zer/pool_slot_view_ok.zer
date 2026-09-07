@@ -1,0 +1,18 @@
+// BUG-966 (2026-09-07): slot views (`&p.get(h).f`, `h.arr[..]`, `p.get(h).arr[..]`)
+// are legal while the handle is alive — the alias must only bite AFTER free.
+struct T { u32 v; u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    *u32 q = &p.get(h).v;
+    *q = 7;
+    [*]u8 s = h.arr[0..];
+    s[0] = 3;
+    [*]u8 s2 = p.get(h).arr[1..];
+    s2[0] = 4;
+    if (p.get(h).v != 7) { return 1; }
+    if (p.get(h).arr[0] != 3) { return 2; }
+    if (p.get(h).arr[1] != 4) { return 3; }
+    p.free(h);
+    return 0;
+}

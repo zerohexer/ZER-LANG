@@ -428,6 +428,62 @@ working build:
   fire. (Those bans exist only because the raw-AST emitter cannot express a branch;
   after L they can be relaxed.)
 
+**STAGE 2, SECOND ATTEMPT (2026-09-07, after M landed) — got MUCH further, one blocker
+left, and it is a DESIGN question rather than a bug.** Reverted again; tree unchanged.
+
+Failures went **38 -> 7 -> 5** as three genuine bugs were found and fixed. Those fixes
+are the part worth keeping:
+
+1. **Materialising at an UNREACHABLE fire.** A block-exit fire that follows a `return`
+   is dead — the raw-AST emitter also emitted it and it was simply never reached. But
+   zercheck walks every block, so splicing the body there counted its frees a SECOND
+   time: a false "double free" plus "use after free" on
+   `defer { p.free(h); } … return 0;`, 38 fuzzer programs. **Fix: skip materialisation
+   when the current block is already terminated.** Not an optimisation — emitting a
+   body that cannot run is what makes the analysis wrong.
+2. **MUTUAL RECURSION between M and L, found by ASan as a compiler stack overflow.**
+   A bounds guard's early exit fires defers (M), and materialising a defer body lowers
+   statements that themselves carry guards (L) — `lower_stmt -> materialise -> lower_stmt`
+   forever. **Fix: a `defer_body_depth` counter; a guard inside a defer body emits
+   IR_TRAP instead of a return.** That is also the SEMANTICALLY correct answer
+   independently — an early return inside a defer body would re-fire the defer stack and
+   skip the rest of the function's cleanup, which is exactly why the emitter's
+   `guard_traps` exists.
+3. **zercheck's AST defer analysis double-counts** once bodies are real CFG. Disable
+   the `IR_DEFER_FIRE` handler's `ir_defer_scan_frees` call and the Phase C3 pass;
+   `ir_defer_scan_uses` / `_frees` / `ir_defer_instance_id` / `ir_fire_has_work_after`
+   then become dead and should be deleted with them.
+
+**THE REMAINING BLOCKER — the runtime GATES become CFG merges.** A defer body is
+wrapped in two gates: ARMED (`this registration never ran, skip it`) and the
+cleanup-label GUARD. As raw AST they were invisible to zercheck, which applied the
+body's frees unconditionally from the AST at each return block. As IR branches they are
+VISIBLE, so the analysis now sees a path where the body is skipped, and the merge of
+{freed} and {alive} is MAYBE_FREED:
+
+    tests/zer/goto_defer.zer -> "handle 'c' may not be freed on all paths"
+
+Three of the five remaining failures are this, in `goto` / shadowing shapes
+(`goto_defer`, `handle_shadow_scope`, `defer_goto_handle_leak_regression`).
+
+**The `is_orelse_fallback` exemption does NOT solve it** — that mechanism skips a whole
+RETURN block, and the armed-skip path REJOINS and shares the same return block, so no
+block-level flag reaches it. Checked before assuming.
+
+**What would:** elide the armed branch where the flag provably dominates the fire. The
+flag is set immediately after `IR_DEFER_PUSH` in the same block, and in `goto_defer`
+that block dominates the fire, so the flag is provably 1 — the branch need not exist.
+The flag is currently created for EVERY defer in a function containing ANY label,
+deliberately over-broad so soundness does not depend on the partial
+`find_goto_to_label` walk. Keeping that for EMISSION while eliding the IR BRANCH under
+dominance is sound and is the shape of the fix. It needs a dominator computation over
+`func->blocks`, which does not exist yet (`ir_compute_preds` does, so it is a short step).
+
+**One test result worth keeping either way:** `audit2_defer_scan_nested` in
+`tests/zer_gaps/` reported *"no longer exhibits its gap"* — the inverted-expectation
+harness saying the splice CLOSED a recorded gap. That is the safety win L is for,
+observed.
+
 **Staging:**
 
 1. IR block-range cloner (`ir.c`) — copy a range, remap the three block-index fields.

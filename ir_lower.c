@@ -1207,13 +1207,23 @@ static void lower_stmt_guards(LowerCtx *ctx, Node *stmt) {
     case NODE_IF:     e = stmt->if_stmt.cond;     break;
     case NODE_SWITCH: e = stmt->switch_stmt.expr; break;
 
+    /* BUG-958: a spawn's ARGUMENTS are evaluated ONCE, in the parent, at the spawn
+     * point — so hoisting their guards to just before the statement is equivalent.
+     * (An AWAIT condition looks similar and is NOT here: it is re-evaluated on
+     * every poll, so its guard belongs at the poll, exactly like a loop condition.) */
+    case NODE_SPAWN:
+        for (int si = 0; si < stmt->spawn_stmt.arg_count; si++)
+            checker_walk_guard_sites(ctx->checker, stmt->spawn_stmt.args[si],
+                                     lower_one_guard_site, &g);
+        return;
+
     /* NOT migrated. Loop conditions and for-clauses are lowered on paths of their
      * own (a for-init even has its own lock site), and nested bodies get their own
      * turn through the block loop. Left to the emitter until each is done
      * deliberately. */
     case NODE_WHILE: case NODE_DO_WHILE: case NODE_FOR:
     case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_AWAIT: case NODE_YIELD:
+    case NODE_ONCE: case NODE_AWAIT: case NODE_YIELD:
     case NODE_ASM: case NODE_GOTO: case NODE_LABEL: case NODE_BREAK:
     case NODE_CONTINUE: case NODE_STATIC_ASSERT:
     /* Declarations and expression kinds: never a statement in a block body. */

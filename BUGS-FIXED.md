@@ -554,6 +554,51 @@ with `expect-error` and each verified rejected pre-fix for the same reason.
 
 ---
 
+## Session 2026-09-07 — BUG-958: spawn args migrated; M reaches its principled limit
+
+Last widening. A spawn's ARGUMENTS are evaluated once, in the parent, at the spawn
+point, so hoisting their guards to just before the statement is equivalent. **119 of
+124 guards (95%) are now IR branches.**
+
+### The remaining five are DECLINED FOR REASONS, and that matters
+
+`emit_auto_guards` cannot be deleted, and this is the honest reason — not that the
+work was left unfinished:
+
+| shape | why the guard cannot be hoisted |
+|---|---|
+| `await g_arr[i] != 0` | the condition is RE-EVALUATED on every poll (BUG-591 exists because it once was not). A guard hoisted before the statement is checked at one state while the index changes across polls |
+| `while (arr[i] > 0)` | re-evaluated per ITERATION, same reason |
+| `?u32 f() { … return arr[i]; }` | the zero value of a value-optional is `{0,0}`, not a literal — it needs the emitter's `emit_zero_value` |
+| `JValue f() { … }` | struct return, same |
+
+The first two are one problem: a guard for a RE-EVALUATED position belongs in the block
+that re-evaluates, not before the statement. Solving it means emitting into the loop's
+condition block and into the await's poll state — a different job from hoisting, and the
+reason to stop here rather than push a hoist that would be *sound only by accident*.
+
+An `await` looks superficially like a spawn argument, which is exactly why it is called
+out: one is evaluated once and one is not, and only the second is safe to hoist.
+
+### A pre-existing over-eagerness, noticed and NOT changed
+
+`x = f() orelse arr[i]` hoists the fallback's guard, so the early return can fire even
+when `f()` succeeded and `arr[i]` was never evaluated. The emitter already behaved that
+way — `emit_auto_guards` descends into `orelse.fallback` before the instruction — so
+this is not introduced here. Recorded rather than quietly changed.
+
+### Where M ended up
+
+| | before | after |
+|---|---|---|
+| guards as C splices | 124 | 5 |
+| guard sites found by | two copies of one descent | one shared walker |
+| op-kind gate | allowlist, fails OPEN | exhaustive switch, fails CLOSED |
+| guard inside a held lock | traps | returns cleanly |
+| a new `IROpKind` | silently unguarded | build failure |
+
+`make check` exit 0, nine gates, 1486.
+
 ## Session 2026-09-07 — BUG-957: IR_TRAP, and 96% of guards migrated (refactor M, stage C)
 
 Widening stage B until almost nothing is left on the C path. **108 of 112 guards

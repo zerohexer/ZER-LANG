@@ -283,6 +283,33 @@ so `u32 r = f();` was rejected when `f` touches two
 shared structs sequentially. A statement with no DIRECT shared access takes no
 lock, so nothing can nest around the call. `g.v = f();` stays rejected.
 
+### M — STATUS 2026-09-07: 95% DONE, and the remainder is PRINCIPLED
+
+BUG-952 / 953 / 955 / 956 / 957 / 958 landed. **119 of 124 bounds guards are IR
+branches**; five remain as C splices and `emit_auto_guards` therefore still exists.
+
+**Do not try to delete it by hoisting the rest.** The five are declined for reasons:
+
+- `await g_arr[i] != 0` and `while (arr[i] > 0)` are RE-EVALUATED — per poll and per
+  iteration. A guard hoisted before the statement is checked once while the index
+  changes underneath it, which is sound only by accident. Migrating these means
+  emitting into the loop's condition block and the await's poll state, which is a
+  different job from hoisting.
+- An OPTIONAL or STRUCT return type has no literal zero — `?u32` is `{0,0}` — so the
+  exit block cannot build its return value without the emitter's `emit_zero_value`.
+
+**What L needs from M is already true.** L's blocker was that the auto-guard early
+return called `emit_defers` — the raw-AST path — from a C exit that did not exist in
+the IR. For the 95% that are now IR branches, the exit fires defers through
+`emit_defer_fire` like any other IR return. The remaining five still take the emitter's
+path, so L's stage 3 (deleting `emit_defer_stmt`) still has to account for them — but
+they are now a SHORT, ENUMERATED list rather than every guarded access in the program.
+
+Also recorded: `x = f() orelse arr[i]` hoists the fallback's guard, so an early return
+can fire even when `f()` succeeded and the fallback was never evaluated. Pre-existing —
+`emit_auto_guards` already descended into `orelse.fallback` before the instruction — and
+left alone rather than quietly changed.
+
 ### M — THE ARCHITECTURAL HALF: where the guard must be lowered (MEASURED 2026-09-07, do not re-derive)
 
 M's two contained halves are CLOSED — the ordering bug (BUG-952) and the fail-closed

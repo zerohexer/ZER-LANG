@@ -1,0 +1,38 @@
+// BUG-969 boundary: the widened borrow must lend only what actually reaches the
+// parent's memory.
+//
+// A SCALAR argument is copied, so it lends nothing and the parent may held writing the
+// variable it came from. A pointer to a GLOBAL lends no LOCAL. A pointer local that was
+// never bound to a local's address has no recorded root, so only the pointer itself is
+// lent — writing an unrelated local stays legal.
+//
+// Without these the widening would reject ordinary concurrent code, which is the cost
+// that makes an over-rejection worse than the hole it closes.
+u32 g;
+shared struct Sink { u32 v; }
+Sink sink;
+void wv(u32 v) { sink.v = v; }     // a shared struct, so the worker is race-free
+void wp(*u32 p) { *p = 5; }
+
+u32 main() {
+    u32 n = 3;
+    ThreadHandle t1 = spawn wv(n);
+    n = 4;                     // OK — the scalar was COPIED
+    t1.join();
+    if (n != 4) { return 1; }
+
+    *u32 gq = &g;
+    u32 other = 1;
+    ThreadHandle t2 = spawn wp(gq);
+    other += 1;                // OK — a global was lent, not a local
+    t2.join();
+    if (g != 5 || other != 2) { return 2; }
+
+    u32 held = 9;
+    ThreadHandle t3 = spawn wp(gq);
+    held += 1;                 // OK — unrelated local
+    t3.join();
+    if (held != 10) { return 3; }
+
+    return 0;
+}

@@ -229,6 +229,14 @@ struct Symbol {
     bool is_static;         /* static storage duration */
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    /* BUG-969: WHICH local this pointer/slice/carrier points into, by name, when that
+     * is knowable at the declaration. `is_local_derived` says THAT it points into a
+     * local; the scoped-spawn borrow needs to know WHICH one, because the race it
+     * guards is a parent write to the ROOT (`v = 3`) and not to the pointer.
+     * NULL when the value is local-derived but the root is not nameable here (a
+     * pointer parameter, a call result), which the spawn sink treats conservatively. */
+    const char *borrow_root_name;
+    uint32_t borrow_root_len;
     bool is_volatile_addr_derived; /* usize produced by @ptrtoint(<volatile ptr>) — the
                                     * volatile fact lives on the VALUE once the type
                                     * became an integer, and @inttoptr back to a

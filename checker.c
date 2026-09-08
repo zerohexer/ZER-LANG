@@ -3307,6 +3307,47 @@ static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
  * — so `s = arr; return s;` (and the g=s / &s[i] siblings) leaked. Mirrors the
  * var-decl walk exactly: roots = { value, orelse-fallback }, each walked
  * through NODE_SLICE + field/index chains to a root ident. */
+/* BUG-969: record WHICH local `sym` points into, when the root is nameable here.
+ *
+ * `is_local_derived` is a BOOLEAN — it says a pointer points into some local, which is
+ * all the escape sinks need ("does this outlive the frame?"). The scoped-spawn borrow
+ * asks a different question: the race it guards is a parent write to the ROOT
+ * (`v = 3` while a thread holds `&v`), so it must NAME the root, and a boolean cannot.
+ *
+ * That is why the borrow was established only for a literal `&v` argument, where the
+ * name is right there in the expression — every other spelling (`*u32 q = &v; spawn
+ * w(q)`, a struct carrying the pointer, a slice of a local array) lent nothing at all.
+ *
+ * Recorded at the DECLARATION, per this codebase's own rule that scope-sensitive facts
+ * belong at declaration sites and not at use sites (BUG-488/494). */
+static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
+    if (!sym || !root_expr) return;
+    Node *r = root_expr;
+    int guard = 0;
+    while (r && guard++ < 64) {
+        if (r->kind == NODE_FIELD)      { r = r->field.object;      continue; }
+        if (r->kind == NODE_INDEX)      { r = r->index_expr.object; continue; }
+        if (r->kind == NODE_SLICE)      { r = r->slice.object;      continue; }
+        break;
+    }
+    if (!r || r->kind != NODE_IDENT) return;
+    Symbol *rs = scope_lookup(c->current_scope, r->ident.name,
+                              (uint32_t)r->ident.name_len);
+    /* A GLOBAL or static root lends no local — the parent may keep writing it, and
+     * the positive boundary test depends on that staying legal. A threadlocal DOES
+     * live in global scope but is handled separately at the spawn sink (D4), which
+     * rejects it outright rather than borrowing it. */
+    if (!rs || rs->is_static) return;
+    if (scope_lookup_local(c->global_scope, rs->name, rs->name_len) != NULL) {
+        /* keep the name anyway: the spawn sink needs it to SEE a threadlocal root. */
+        sym->borrow_root_name = rs->name;
+        sym->borrow_root_len  = rs->name_len;
+        return;
+    }
+    sym->borrow_root_name = rs->name;
+    sym->borrow_root_len  = rs->name_len;
+}
+
 static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                                                 Type *sym_type, Node *value) {
     if (!sym || !value || !sym_type) return;
@@ -3339,11 +3380,20 @@ static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                 (uint32_t)sr->ident.name_len);
             if (src && src->is_local_derived) {
                 sym->is_local_derived = true;
+                /* BUG-969: inherit the root through an alias chain. */
+                if (src->borrow_root_name) {
+                    sym->borrow_root_name = src->borrow_root_name;
+                    sym->borrow_root_len  = src->borrow_root_len;
+                }
             } else if (type_dispatch_kind(root_type) == TYPE_ARRAY) {
                 bool is_global = src && scope_lookup_local(c->global_scope,
                     src->name, src->name_len) != NULL;
-                if (src && !src->is_static && !is_global)
+                if (src && !src->is_static && !is_global) {
                     sym->is_local_derived = true;
+                    /* BUG-969: `[*]u8 s = a[0..2]` lends the array `a`. */
+                    sym->borrow_root_name = src->name;
+                    sym->borrow_root_len  = src->name_len;
+                }
             }
         }
     }
@@ -7023,6 +7073,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             vlaunder->unary.op == TOK_AMP &&
                             addr_of_is_local_derived(c, vlaunder->unary.operand)) {
                             tsym->is_local_derived = true;
+                            /* BUG-969: `h.p = &v` makes the CARRIER `h` lend `v`,
+                             * which is what `spawn w(h)` then hands to the thread. */
+                            record_borrow_root(c, tsym, vlaunder->unary.operand);
                         }
                         /* BUG-833, the ASSIGNMENT sink. NOT STICKY: SET on a
                          * packed-derived RHS and CLEAR otherwise, so `q = &aligned.z;`
@@ -14723,6 +14776,8 @@ static void check_stmt(Checker *c, Node *node) {
                          * docs/universal_alloc.md. */
                         if (addr_of_is_local_derived(c, addr_exprs[ai]->unary.operand))
                             sym->is_local_derived = true;
+                        /* BUG-969: and WHICH local, for the scoped-spawn borrow. */
+                        record_borrow_root(c, sym, addr_exprs[ai]->unary.operand);
                         /* &packed_struct.field yields a possibly-MISALIGNED pointer.
                          * Carry that on the symbol so the deref/index sinks can
                          * reject it — BUG-493 already rejects the @atomic_* sink,
@@ -18444,8 +18499,10 @@ static void check_stmt(Checker *c, Node *node) {
                  * record it on the handle so join clears it); a parent WRITE to
                  * it before join is a data race. Shared structs are excluded
                  * (auto-locked); globals/statics outlive the thread. */
+                /* BUG-969: x2 — an argument can lend TWO names now, the value
+                 * handed over AND the local it points into. */
                 int bcap = node->spawn_stmt.arg_count > 0
-                             ? node->spawn_stmt.arg_count : 1;
+                             ? node->spawn_stmt.arg_count * 2 : 2;
                 sym->th_borrow_names = (const char **)arena_alloc(c->arena,
                     sizeof(const char *) * (size_t)bcap);
                 sym->th_borrow_lens = (uint32_t *)arena_alloc(c->arena,
@@ -18453,9 +18510,58 @@ static void check_stmt(Checker *c, Node *node) {
                 sym->th_borrow_count = 0;
                 for (int bi = 0; bi < node->spawn_stmt.arg_count; bi++) {
                     Node *ba = node->spawn_stmt.args[bi];
-                    if (!ba || ba->kind != NODE_UNARY ||
-                        ba->unary.op != TOK_AMP || !ba->unary.operand)
-                        continue;
+                    if (!ba) continue;
+
+                    /* BUG-969: ONE query for "what does this argument lend?", across
+                     * every spelling. The gate here used to be `ba` must be a literal
+                     * `&…`, so a pointer LOCAL bound to `&v`, a struct CARRYING the
+                     * pointer, a slice VIEW of a local array and a pointer PARAM all
+                     * lent NOTHING and the parent could race the child — measured, all
+                     * four compiled clean.
+                     *
+                     * Two names can be lent per argument and both matter:
+                     *   - the ROOT the value points into, so `v = 3` is caught
+                     *     (recorded at the declaration as Symbol.borrow_root_name);
+                     *   - the ARGUMENT itself, so a write THROUGH it, `*p = 3`, is
+                     *     caught — which is the only thing available for a pointer
+                     *     PARAM, whose root lives in the caller.
+                     * The whole set goes into th_borrow_names, so the join releases
+                     * every one (the positive boundary test depends on that). */
+                    const char *cand_n[2]; uint32_t cand_l[2]; int cand_c = 0;
+                    if (ba->kind == NODE_UNARY && ba->unary.op == TOK_AMP &&
+                        ba->unary.operand) {
+                        Node *r = ba->unary.operand;
+                        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                                     r->kind == NODE_SLICE)) {
+                            if (r->kind == NODE_FIELD)      r = r->field.object;
+                            else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+                            else                            r = r->slice.object;
+                        }
+                        if (r && r->kind == NODE_IDENT) {
+                            cand_n[cand_c] = r->ident.name;
+                            cand_l[cand_c] = (uint32_t)r->ident.name_len; cand_c++;
+                        }
+                    } else if (ba->kind == NODE_IDENT) {
+                        Symbol *as = scope_lookup(c->current_scope, ba->ident.name,
+                                                  (uint32_t)ba->ident.name_len);
+                        if (as && as->borrow_root_name) {
+                            cand_n[cand_c] = as->borrow_root_name;
+                            cand_l[cand_c] = as->borrow_root_len; cand_c++;
+                        }
+                        /* The value itself, when it can reach memory the parent also
+                         * can: a pointer or slice (or a struct carrying one). A plain
+                         * scalar argument is COPIED and lends nothing. */
+                        TypeKind ak = as ? type_dispatch_kind(as->type) : TYPE_VOID;
+                        bool reaches = as && (ak == TYPE_POINTER || ak == TYPE_SLICE ||
+                                              as->borrow_root_name != NULL);
+                        if (reaches) {
+                            cand_n[cand_c] = ba->ident.name;
+                            cand_l[cand_c] = (uint32_t)ba->ident.name_len; cand_c++;
+                        }
+                    }
+                    if (cand_c == 0) continue;
+                    for (int ci = 0; ci < cand_c; ci++) {
+                    Node *broot_syn = NULL; (void)broot_syn;
                     /* S2 (2026-08-02): walk the &-operand's field/index chain to
                      * the root ident. The matcher required a BARE NODE_IDENT, so
                      * an INTERIOR pointer (`spawn worker(&b.v)`) established NO
@@ -18469,16 +18575,8 @@ static void check_stmt(Checker *c, Node *node) {
                      * concurrently written. Exactly the `&x` vs `&x.f` shape as
                      * §C6 (keep call-site) — this is that same blind spot one
                      * level down from §D5/§D7. */
-                    Node *broot = ba->unary.operand;
-                    while (broot && (broot->kind == NODE_FIELD ||
-                                     broot->kind == NODE_INDEX)) {
-                        broot = (broot->kind == NODE_FIELD)
-                                  ? broot->field.object
-                                  : broot->index_expr.object;
-                    }
-                    if (!broot || broot->kind != NODE_IDENT) continue;
-                    const char *vn = broot->ident.name;
-                    uint32_t vl = (uint32_t)broot->ident.name_len;
+                    const char *vn = cand_n[ci];
+                    uint32_t vl = cand_l[ci];
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = scope_lookup_local(c->global_scope,
                                        vn, vl) != NULL;
@@ -18493,10 +18591,15 @@ static void check_stmt(Checker *c, Node *node) {
                     if (vs && vs->func_node &&
                         vs->func_node->kind == NODE_GLOBAL_VAR &&
                         vs->func_node->var_decl.is_threadlocal) {
+                        /* BUG-969: name the ROOT, not a fabricated `&root` spelling
+                         * — the argument may have been a pointer local bound to it,
+                         * and a diagnostic that quotes source the user did not write
+                         * sends them looking for the wrong line. */
                         checker_error(c, node->loc.line,
-                            "cannot pass '&%.*s' (threadlocal) to a scoped spawn — "
-                            "each thread has its own copy, so the child would write "
-                            "the parent's slot (data race). Pass it by value",
+                            "this argument reaches '%.*s' (threadlocal) and cannot be "
+                            "passed to a scoped spawn — each thread has its own copy, "
+                            "so the child would write the parent's slot (data race). "
+                            "Pass it by value",
                             (int)vl, vn);
                         continue;
                     }
@@ -18534,6 +18637,7 @@ static void check_stmt(Checker *c, Node *node) {
                         sym->th_borrows_name = vn;
                         sym->th_borrows_name_len = vl;
                     }
+                    }   /* BUG-969: end candidate loop */
                 }
             }
         }

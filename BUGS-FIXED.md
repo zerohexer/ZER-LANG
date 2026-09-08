@@ -5,6 +5,75 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-969: the scoped-spawn borrow covered one spelling out of six
+
+A scoped `spawn w(&v)` lends `v` to the thread until `th.join()`; a parent write in that
+window is a data race. The borrow was established ONLY for a literal `&…` argument:
+
+```c
+if (!ba || ba->kind != NODE_UNARY || ba->unary.op != TOK_AMP || !ba->unary.operand)
+    continue;               // everything else lends NOTHING
+```
+
+So five other ways of handing the SAME address to the thread compiled clean — a pointer
+local bound to `&v`, a struct CARRYING the pointer, a slice VIEW of a local array, a
+pointer PARAMETER, and a threadlocal reached through a pointer local (the D4 rule refused
+only its direct spelling).
+
+### Why the existing flag could not answer it
+
+`is_local_derived` is a BOOLEAN: "this points into SOME local". That is exactly what the
+ESCAPE sinks need — they ask "does this outlive the frame?", and the identity of the local
+is irrelevant to that. The borrow asks a different question: the race is a write to the
+ROOT (`v = 3`), so the root has to be NAMED.
+
+That distinction is the whole bug. A boolean was standing in for a name, and the code
+compensated by only handling the one spelling where the name is visible in the expression.
+
+`Symbol.borrow_root_name` now carries it, recorded at the DECLARATION — per this
+codebase's own rule that scope-sensitive facts belong at declaration sites and never at
+use sites (BUG-488/494). Three recording sites, all of which already computed the same
+walk for `is_local_derived`: the var-decl `&…` path, the slice-of-a-local path, and the
+`h.p = &v` carrier assignment.
+
+### Two names per argument, and both matter
+
+- the ROOT it points into, so `v = 3` is caught;
+- the ARGUMENT itself, so a write THROUGH it (`*p = 3`) is caught — the only thing
+  available for a pointer PARAMETER, whose root lives in the caller.
+
+Both go into `th_borrow_names`, so `join()` releases every one; `bcap` doubled to match.
+
+### The boundary is as important as the holes
+
+A SCALAR argument is COPIED and lends nothing. A pointer to a GLOBAL lends no local. An
+unrelated local stays writable. Every borrow ends at the join. Pinned by
+`tests/zer/spawn_borrow_scalar_and_global_ok.zer` and three p20 boundary cells — an
+over-rejection here would break ordinary concurrent code, which is worse than the hole.
+
+One diagnostic was reworded: the threadlocal rejection said `cannot pass '&tl'`, quoting
+source the user never wrote once the argument could be a pointer local. It now says
+"this argument reaches 'tl' (threadlocal)".
+
+### Gate
+
+**SHAPE p20 in `tools/sink_matrix.sh`** — spelling axis, 8 reject + 3 boundary. Verified
+to FIRE: against a build of the commit before the fix, 6 of the 8 report HOLE; the other
+two (`literal_amp`, `interior_ptr`) are the spellings that already worked and are kept as
+pinned baseline. All 3 boundary cells green on both sides.
+
+### The trap that cost the most time here
+
+Adding two fields to `struct Symbol` in `types.h` and running `make zerc` WITHOUT
+`rm -f *.o src/safety/*.o` produced a MIXED-ABI binary: **75 test failures**, presenting
+as GCC errors like "lvalue required as left operand of assignment" in emitted C — nothing
+resembling a checker over-rejection. CLAUDE.md documents this exactly ("after touching ANY
+.h — especially types.h/ast.h — run rm -f *.o src/safety/*.o before make zerc") because
+the Makefile has zero header dependencies. A clean rebuild took it to 1507/0 with no
+source change at all.
+
+---
+
 ## Session 2026-09-09 — BUG-968: a view into an allocation aliased nothing, in two ways
 
 "What allocation does this view point into?" was answered by a walk that peeled `NODE_FIELD`

@@ -329,6 +329,37 @@ cell p19_safe_view_before_free compile 'struct T19i{u32 v;u8[4] a;} Pool(T19i,4)
 cell p19_safe_stack_slice      compile 'u32 main(){ u8[4] loc; loc[0]=3; [*]u8 s=loc[0..]; return (u32)s[0]-3; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p20 (BUG-969): WHAT DOES A SCOPED-SPAWN ARGUMENT LEND? — the SPELLING axis.
+#
+# The borrow was established only for a LITERAL `&v` argument. Every other way of
+# handing the same address to the thread lent NOTHING, so the parent could write the
+# memory the child held: a pointer local bound to `&v`, a struct CARRYING the pointer,
+# a slice VIEW of a local array, and a pointer PARAMETER (whose root lives in the
+# caller, so the only lendable name is the pointer itself).
+#
+# `is_local_derived` could not answer this: it is a BOOLEAN saying a pointer points
+# into SOME local, which is all the escape sinks need. The race guarded here is a write
+# to the ROOT (`v = 3`), so the root must be NAMED — hence Symbol.borrow_root_name,
+# recorded at the declaration.
+echo "===== SHAPE p20 = what a scoped-spawn argument lends (spelling axis) ====="
+cell p20_literal_amp      reject 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=0; ThreadHandle t=spawn w20(&v); v=3; t.join(); return v; }'
+cell p20_ptr_local        reject 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=0; *u32 q=&v; ThreadHandle t=spawn w20(q); v=3; t.join(); return v; }'
+cell p20_write_through    reject 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=0; *u32 q=&v; ThreadHandle t=spawn w20(q); *q=3; t.join(); return v; }'
+cell p20_struct_carrier   reject 'struct H20{*u32 p;} void wh20(H20 h){*h.p=5;} u32 main(){ u32 v=0; H20 h; h.p=&v; ThreadHandle t=spawn wh20(h); v=3; t.join(); return v; }'
+cell p20_slice_view       reject 'void ws20([*]u8 s){s[0]=5;} u32 main(){ u8[4] a; [*]u8 s=a[0..2]; ThreadHandle t=spawn ws20(s); a[1]=3; t.join(); return 0; }'
+cell p20_param_ptr        reject 'void w20(*u32 p){*p=5;} void f20(*u32 p){ ThreadHandle t=spawn w20(p); *p=3; t.join(); } u32 main(){ u32 v=0; f20(&v); return 0; }'
+cell p20_threadlocal_alias reject 'threadlocal u32 tl20; void w20(*u32 p){*p=1;} u32 main(){ *u32 q=&tl20; ThreadHandle t=spawn w20(q); t.join(); return 0; }'
+cell p20_interior_ptr     reject 'struct B20{u32 v;} void w20(*u32 p){*p=5;} u32 main(){ B20 b; ThreadHandle t=spawn w20(&b.v); b.v=3; t.join(); return b.v; }'
+# BOUNDARY: lend only what actually reaches the parent's memory, and release at join.
+# A SCALAR is copied; a pointer to a GLOBAL lends no local; an unrelated local stays
+# writable; and every borrow ends at the join. Over-rejecting any of these would break
+# ordinary concurrent code.
+cell p20_safe_scalar_copy compile 'shared struct S20{u32 v;} S20 s20; void wv20(u32 v){s20.v=v;} u32 main(){ u32 n=3; ThreadHandle t=spawn wv20(n); n=4; t.join(); if(n!=4){return 1;} return 0; }'
+cell p20_safe_global_root compile 'u32 g20; void w20(*u32 p){*p=5;} u32 main(){ *u32 gq=&g20; u32 other=1; ThreadHandle t=spawn w20(gq); other+=1; t.join(); if(g20!=5||other!=2){return 1;} return 0; }'
+cell p20_safe_after_join  compile 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=0; *u32 q=&v; ThreadHandle t=spawn w20(q); t.join(); v=v+1; if(v!=6){return 1;} return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

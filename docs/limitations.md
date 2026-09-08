@@ -986,7 +986,34 @@ sees it. 3 tests, BOTH sinks — the ISR sibling is:
 Their fix: a scan-scoped static table + `IsrGlobal` keyed by declaration. Fix both
 sinks in the same commit — this is the mirrored-sink family.
 
-**F. Scoped-spawn borrow only ever covered a literal `&v` (their BUG-924) — 6 tests.**
+**F. ~~Scoped-spawn borrow only ever covered a literal `&v` (their BUG-924)~~ — CLOSED
+2026-09-09 as BUG-969.** DO NOT REDO.
+
+The borrow was established only for a LITERAL `&v` argument, so every other way of
+handing the same address to a thread lent NOTHING and the parent could write memory the
+child held — all measured compiling clean: a pointer local bound to `&v`, a struct
+CARRYING the pointer, a slice VIEW of a local array, a pointer PARAMETER, and a
+threadlocal reached through a pointer local (which the D4 rule refused only in its
+direct spelling).
+
+**Why the existing flag could not answer it.** `is_local_derived` is a BOOLEAN — "this
+points into SOME local" — which is all the ESCAPE sinks need ("does it outlive the
+frame?"). The race guarded here is a parent write to the ROOT (`v = 3`), so the root
+must be NAMED, and a boolean cannot. Hence `Symbol.borrow_root_name`, recorded at the
+DECLARATION per this codebase's own rule that scope-sensitive facts belong at
+declaration sites, never at use sites (BUG-488/494).
+
+**Two names can be lent per argument and both matter:** the ROOT it points into, so
+`v = 3` is caught; and the ARGUMENT itself, so a write THROUGH it (`*p = 3`) is caught
+— which is the only thing available for a pointer PARAMETER, whose root lives in the
+caller. Both go into `th_borrow_names`, so the join releases every one.
+
+Gated by **SHAPE p20 in `tools/sink_matrix.sh`** (spelling axis, 8 reject + 3 boundary).
+Verified to FIRE: against a build of the commit before the fix, 6 of the 8 report HOLE —
+the other two (`literal_amp`, `interior_ptr`) are the spellings that already worked and
+are kept as pinned baseline — and all 3 boundary cells stay green on both sides. The
+boundary matters as much as the holes: a SCALAR argument is copied and lends nothing, a
+pointer to a GLOBAL lends no local, and an unrelated local stays writable.
 A pointer local, a struct carrier, a slice view, a param and a threadlocal alias all
 lend nothing, so the parent can race the child:
 
@@ -1087,8 +1114,8 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ### Suggested order for this branch
 
-~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → **F** (a data
-race) → **D** → **E** → **B** → **H** → **I**.
+~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
+BUG-969) → **D** → **E** → **B** → **H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

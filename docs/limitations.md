@@ -99,6 +99,61 @@ Delete it (keep `emit_audit.sh` and `-Werror=switch` green).
 
 ---
 
+
+## PARTLY CLOSED 2026-09-08 (tooling harvested from `vigilant-tesla-o51x9p`, BUG-975) — `reference.md` error-examples: the mechanism now exists, 13 of 49 backfilled
+
+**What shipped.** `tools/audit_reference_examples.sh` gained an opt-in
+`<!-- audit: expect-error: <substring> -->` directive. A block carrying one is
+COMPILED (through the same prelude/wrap pipeline as every other block) and must be
+REJECTED with a diagnostic containing that substring. Two distinct failure reports,
+because they mean different things: *"THE DOC CLAIMS A REJECTION THE COMPILER NO
+LONGER PERFORMS"* (compiled clean) and *"REJECTED FOR THE WRONG REASON"* (rejected,
+wrong diagnostic). Verified to FIRE before being trusted, by injecting a substring
+that cannot appear.
+
+`=== reference.md example audit: 206 blocks — 75 compiled, 13 rejected-as-documented,
+36 skipped, 82 baselined, 0 failed ===`
+
+**The naive version was measured and rejected, not merely argued against.** Asserting
+"every error block must fail" would have passed vacuously: running all 27 candidates
+through the harness, most failed on SYNTAX or on `undefined identifier` — a cast of
+characters the fragment never declares — long before reaching the rule they
+illustrate. One block of BARE EXPRESSIONS (`@inttoptr(*u32, BASE + 0x2)` with no
+statement around it) failed with *"expected ';' after expression"*. The substring
+oracle is what separates "rejected" from "rejected for the documented reason", and it
+is the same discipline `// expect-error:` enforces for `tests/zer_fail/`.
+
+**It found a real doc/compiler disagreement on its first run.** Two blocks the doc
+labelled `// COMPILE ERROR` **compiled clean**:
+
+```zer
+container BNode(T) { T val; BNode(T) child; }   // doc said COMPILE ERROR
+container A(T) { B(T) x; }                       // doc said COMPILE ERROR
+container B(T) { A(T) y; }
+```
+
+The compiler is right and the doc was incomplete: a `container` is a STAMP, so
+nothing is laid out until a concrete type is instantiated, and the cycle check runs
+at instantiation. Adding `BNode(u32) b;` / `A(u32) cyc;` produces the documented
+error. A reader who copied either example would have concluded the guarantee in
+CLAUDE.md's safety table ("Container infinite recursion → compile error") did not
+exist. Both blocks now carry the instantiation and an `expect-error` directive.
+
+**What is still open — 36 blocks, one authoring pass each.** They fall into two
+groups, and the second is the reason this is not finished:
+- Blocks whose intended rule fires cleanly once wrapped — pure backfill.
+- Blocks that name identifiers the doc never declares (`go`, `BIT`, `gq`,
+  `register_callback`, `Celsius`, `local_handler`, …). These need the EXAMPLE edited
+  to be self-contained, or a prelude entry, before any assertion is meaningful.
+  Adding a directive without that edit produces a substring assertion against an
+  `undefined identifier` diagnostic — a gate that passes while testing nothing.
+
+Until each is done, treat the remaining 36 as documentation, not coverage. Do NOT
+close this entry by mass-adding directives; add them one at a time, each verified to
+fail for the RIGHT reason.
+
+---
+
 ## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): ALL 12 ITEMS CLOSED; 2 refactors + 2 relaxations REMAIN
 
 **STATUS 2026-09-06: items A–K AND both relaxations N / O are CLOSED** (BUG-934..949).
@@ -1329,7 +1384,7 @@ Forms: `defer_body_spawn`, `_critical`, `_label`, `_once`, `_switch`.
 
 </details>
 
-### CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`
+### ~~CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`~~ — **CLOSED 2026-09-08 as BUG-973 (visited-set cycle walk; `_chain_too_deep` and `_from_mutable` are BUG-972). DO NOT REDO.**
 
 **Upgraded from MEDIUM after re-measurement 2026-08-20.** This does not merely
 compile — the compiler LOOPS FOREVER in constant evaluation. Measured `exit=124` at a
@@ -1349,7 +1404,7 @@ accepts.
 
 ---
 
-### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
+### ~~CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`~~ — **CLOSED 2026-09-08 as BUG-976 (return-summary based; also the pointer-param shape). DO NOT REDO.**
 
     usize g = 0;
     usize idfn(usize x) { return x; }
@@ -1361,7 +1416,7 @@ CALL-laundered form is not.
 
 ---
 
-### CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`
+### ~~CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`~~ — **CLOSED 2026-09-08 as BUG-974 (`mmio_const_addr`, one query at four sites; the over-rejected positive compiles). DO NOT REDO.**
 
 The range and alignment checks fold a literal but not a `const` identifier:
 
@@ -1496,7 +1551,7 @@ Do not re-derive; each was run, not read.
 | `loop_counter_bounds_ok` | `v7pucv` | **CLOSED** by BUG-932 |
 | `vrp_empty_range_zero_trip_ok` | `v7pucv` | **CLOSED** by BUG-932 — same single cause, a zero-trip loop |
 | `funcptr_global_registry_ok` | `osp1a7` | **DECIDED — DO NOT "FIX".** Their whole-file rule was measured to ACCEPT an unguarded indirect call through null (no guard in the emitted C). Main's rule is the sound one and the restructure is teachable: `?u32 (*g)(u32,u32) = null;` + `if (g) \|f\|` compiles and runs. Soundness is the hard wall; over-rejection is the soft gradient |
-| `mmio_const_ident_base` | `o51x9p` | live — `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
+| `mmio_const_ident_base` | `o51x9p` | CLOSED 2026-09-08 (BUG-974) — was: `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
 | `comptime_width_conversions` | `lzmkhn` | live — the comptime evaluator cannot evaluate a C-style cast in a comptime body. Contained, evaluator-local |
 | `return_literal_is_static_ok` | `lzmkhn` | live — `return pick(b)` where the callee returns a LITERAL, not a view of the local. Genuine PRECISION work on the return summary (`ret_param_mask` / `call_result_static_given_args`), not a rule bug |
 

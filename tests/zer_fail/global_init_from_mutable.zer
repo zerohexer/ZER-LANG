@@ -1,0 +1,9 @@
+// expect-error: a global initializer must be a compile-time constant
+// BUG-916: this used to reach GCC as `uint32_t B = SRC;` —
+// "initializer element is not constant", naming a generated .c the user never
+// opened, with no ZER line. The `const` form of the same shape is FOLDED (see
+// tests/zer/global_init_const_fold_ok.zer); a mutable global genuinely is not
+// a constant, so it is rejected here.
+u32 SRC = 5;
+u32 B = SRC;
+u32 main() { return B; }

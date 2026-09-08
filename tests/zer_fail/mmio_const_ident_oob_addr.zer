@@ -1,0 +1,10 @@
+// expect-error: is outside all declared mmio ranges
+// BUG-918: an out-of-range address written as a named `const` used to fold to
+// nothing at compile time, so the diagnostic was deferred to a RUNTIME trap —
+// i.e. to first boot on the target. It is a compile error now.
+mmio 0x4000_0000..0x4000_0FFF;
+const u32 ADDR = 0x40005000;
+u32 main() {
+    volatile *u32 r = @inttoptr(*u32, ADDR);
+    return 0;
+}

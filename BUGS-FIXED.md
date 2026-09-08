@@ -5,6 +5,241 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-972..976: five holes harvested from branch `vigilant-tesla-o51x9p` (their BUG-914, 916..919)
+
+Adopted by cherry-pick of `91d4f06` plus a hand-port of their BUG-914 hunks from `2c0d4e2`
+(forked at `c8e58304`, 37 commits back). NOT taken from that branch: their BUG-913 (seven
+statement kinds inside a `defer` body — the durable fix is refactor L, which lowers the
+defer body through the ordinary statement lowering so every kind works; see limitations.md)
+and their BUG-915 (`IR_ENUM_GUARD` — the same rule landed as BUG-930's consumer-side switch
+trap from `r3an9y`; their four `enum_switch_forged_via_*` trap tests were run verbatim
+against that trap and all exit 133). Each of the five was measured live on main first:
+`const u32 A = A;` HUNG (exit 124 at 15 s), the mutual cycle SEGFAULTED (139), a global
+initialized from a mutable global compiled with no diagnostic, an MMIO base spelled as a
+`const` ident was both over-rejected (indexing) and under-checked (range/alignment deferred
+to a runtime trap), and `g = idfn(@ptrtoint(&local))` was accepted. Renumbered because main
+already used 914..919. Their write-up follows.
+
+### BUG-972 — six shapes of global initializer produced INVALID C, with no ZER diagnostic
+
+```zer
+const i32 K = -5;   i32 G = K;      // GCC: "initializer element is not constant"
+```
+`reference.md` states the rule as *"A global's initializer must be a compile-time constant
+... checked in ZER terms, at the ZER line"*. It was not: `emit_expr` emitted the NAME, and
+the failure landed on GCC pointing at a generated `.c` the user never opened — the exact
+failure BUG-911's own comment calls unacceptable.
+
+BUG-911 added a fold for this, but through three narrow gates: **integer** target,
+**non-negative** result, and `eval_const_expr_scoped`, which by design does not fold
+intrinsics. Everything outside that window still emitted the name:
+
+| shape | why the BUG-911 fold missed it |
+|---|---|
+| `const i32 K = -5; i32 G = K;` | the fold is gated `gv >= 0` |
+| `const f32 K = 1.5; f32 G = K;` | float target — `type_is_integer` false |
+| `const f32 K = 1.5; f32 G = K + 1.0;` | same, and the ident is nested |
+| `const bool K = true; bool G = K;` | bool target |
+| `const usize W = @size(u32)*4; usize B = W;` | the source's init is an intrinsic |
+| `const [*]u8 A = "hi"; const [*]u8 B = A;` | slice target |
+
+**Fix — substitution, not evaluation.** In a global-initializer context a `NODE_IDENT`
+naming a **const** global emits that global's OWN initializer instead of its name. That
+needs no evaluator and works at every type: the substituted expression already passed the
+global-initializer rules for ITS declaration, so it is emittable at file scope by
+construction. It also composes — the name may sit anywhere in the expression, so
+`SCALE + 1.0` works with no float folder. Depth-bounded (8) inside the emitter.
+
+A **mutable** global genuinely is not a compile-time constant, so `u32 SRC = 5; u32 B =
+SRC;` is now a ZER error at the ZER line instead of a GCC error in generated C. Function
+names (a funcptr global) and enum variants are unaffected — verified.
+
+Tests: `tests/zer/global_init_const_fold_ok.zer` (all six shapes, run and value-checked;
+the pre-fix compiler fails it with "initializer element is not constant") +
+`tests/zer_fail/global_init_from_mutable.zer`.
+
+### BUG-973 — a two-line program HUNG the compiler
+
+```zer
+const u32 A = A;
+u32 main() { return A; }
+```
+`zerc` never returns. The two-node form `const u32 A = B; const u32 B = A;` hangs too, and
+its arithmetic variant `const u32 A = B + 1; const u32 B = A + 1;` SEGFAULTS the pre-fix
+compiler outright (stack exhaustion).
+
+**Root cause.** `resolve_const_ident` — the identifier callback the constant evaluator uses
+— calls `eval_const_expr_ex(init, 0, resolve_const_ident, ctx)`. It passes depth **0** on
+every identifier hop, so the evaluator's own depth bound could never observe the chain. The
+recursion is unbounded by construction, not by accident of input size.
+
+Reached from four unrelated sites (global initializers, array sizes, `comptime if`, asm
+operand constraints); a file-static depth counter bounds it once rather than changing four
+signatures — the same shape CLAUDE.md already blesses for `_comptime_call_depth` and
+`_scan_global_depth`. Save/restore, not a bare increment, so an early `CONST_EVAL_FAIL`
+cannot leak depth into the next evaluation.
+
+Bounding it alone would report "cannot fold", which is the wrong thing to tell someone who
+wrote a definition that refers to itself, so `global_init_chain_verdict` reports the cycle in
+the user's terms. It descends expressions (the arithmetic form) and deliberately does not
+descend `NODE_FIELD` — `State.idle`'s "object" is a type name, not a value that can close a
+cycle.
+
+**The first cut of that detector was itself wrong, and the way it was wrong is worth
+keeping.** It called any chain deeper than 32 links CYCLIC. That is a *wrong diagnostic*, not
+a conservative one: a legitimate 60-link `const` chain was reported as "depends on itself",
+sending the reader looking for a cycle that does not exist. Depth is not evidence of a cycle.
+The shipped version is a PATH-VISITED set (`GInitChain`, `ginit_chain_push`,
+`global_init_ident_cycle_walk`) that pushes on the way in and **pops on the way out**, so a
+repeated symbol is only a cycle when it repeats *on the current path*; a DIAMOND
+(`DL = DR; DM = DR; DT = DL + DM`) legitimately visits `DR` twice and must compile. Depth is
+reported SEPARATELY, in its own words ("chains through more than 64 const globals"). Two
+distinct facts, two distinct messages — collapsing them is what made the first cut lie.
+
+Tests: `tests/zer_fail/global_init_cycle_{self,mutual}.zer` — the first HANGS the pre-fix
+compiler, the second SEGFAULTS it; `tests/zer_fail/global_init_chain_too_deep.zer` (70 links)
+for the depth verdict; and the diamond case in `tests/zer/global_init_const_fold_ok.zer`,
+which is the regression that would catch a naive global visited set.
+
+---
+
+### BUG-974 — every real firmware writes its MMIO base as a named `const`, and that was the one spelling the compiler could not fold
+
+```zer
+mmio 0x4000_0000..0x4000_000F;   // 4 u32 words
+const u32 UART = 0x40000000;
+volatile *u32 r = @inttoptr(*u32, UART);
+u32 v = r[9];        // word 9 — outside the declared window
+```
+Pre-fix this was **rejected, for the wrong reason**: *"cannot index volatile `*u32` — no
+compile-time MMIO bound is known for this pointer… A bound is derived only for a pointer
+obtained directly from `@inttoptr(*u32, <const addr>)`"* — which is exactly what the user
+wrote. Swap `UART` for the literal `0x40000000` and the same program compiles and the OOB
+index is caught precisely. The named-const spelling — the only one real firmware uses — got
+neither the bound nor the diagnostic.
+
+Two consequences, in opposite directions:
+
+- **Over-rejection.** `r[i]` was refused outright for every named-const peripheral. The
+  workaround was to paste the literal at each use site, which is worse code.
+- **A diagnostic deferred to first boot.** At the `@inttoptr` gate itself the same fold
+  failure meant a named-const address that is *outside* the declared range, or misaligned for
+  its target type, produced NO compile error — only a runtime `_zer_trap`. On a hosted host
+  that is a clean abort; on the target it is a fault at boot, found by whoever is holding the
+  board rather than by the compiler.
+
+**Root cause — the multi-site shape, again.** "What constant address does this `@inttoptr`
+designate?" was answered independently at FOUR sites (the range/alignment gate; the direct
+`@inttoptr(...)[N]` bound; the local var-decl `mmio_bound`; the global var-decl one), and all
+four called plain `eval_const_expr`, which folds literals and stops at an identifier. The
+scoped evaluator that resolves a `const` symbol through its own initializer
+(`eval_const_expr_scoped` → `resolve_const_ident`) already existed and was already used
+elsewhere in the same file.
+
+Fixed as ONE query — `mmio_const_addr(Checker*, Node*)` — with all four sites routed through
+it, so a fifth site cannot repeat the divergence. Soundness: `resolve_const_ident` resolves
+an identifier only when the symbol is `is_const` and carries its own initializer, and that
+initializer is now required to be a compile-time constant (BUG-972), so the substituted value
+is exactly the value the emitted C will hold; BUG-973's depth counter bounds the walk. The
+change strictly TIGHTENS the two error gates and strictly RELAXES the two bound derivations —
+a fold that still fails degrades to the old behaviour.
+
+Tests: `tests/zer/mmio_const_ident_base.zer` (the recovered acceptance — chained const,
+const arithmetic, and the direct-`@inttoptr` index form, all in a dead branch since a hosted
+host cannot touch 0x40000000) and `tests/zer_fail/mmio_const_ident_{oob_index,oob_addr,
+misaligned}.zer`. The last two are accepted outright by the pre-fix compiler; the first is
+MASKED there by the over-rejection above, so its `// expect-error:` directive is what makes
+it discriminate — pre-fix it fails for the wrong reason, which the exit code alone would have
+called a pass.
+
+---
+
+### BUG-975 — two documented "COMPILE ERROR" examples compiled clean, found by closing a gate that was checking nothing
+
+`tools/audit_reference_examples.sh` SKIPPED any ```zer block illustrating a rejection —
+right as far as it went (compiling one fails by design) but it left 49 blocks checked in
+NEITHER direction, so `reference.md` could keep asserting a rejection the compiler no longer
+performs. The gate gained an opt-in `<!-- audit: expect-error: <substring> -->` directive:
+the block is compiled through the same prelude/wrap pipeline and must be REJECTED with a
+diagnostic containing that substring.
+
+On its first run, two blocks the doc labelled `// COMPILE ERROR` **compiled clean**:
+
+```zer
+container BNode(T) { T val; BNode(T) child; }   // doc: COMPILE ERROR
+container A(T) { B(T) x; }                       // doc: COMPILE ERROR
+container B(T) { A(T) y; }
+```
+
+The COMPILER is right here and the DOC was wrong. A `container` is a stamp; nothing is laid
+out until a concrete type is instantiated, so the containment-cycle check runs at
+instantiation. `BNode(u32) b;` produces *"cannot contain itself by value in field 'child'"*
+and `A(u32) cyc;` produces *"closes a containment cycle"*. Both examples now carry the
+instantiation. Left uncorrected, a reader copying either would have concluded that the
+guarantee CLAUDE.md's safety table promises ("Container infinite recursion → compile error")
+did not exist.
+
+**The naive form of this gate was measured and rejected.** "Every error block must fail to
+compile" passes VACUOUSLY: run over 27 candidates, most fail on syntax or on `undefined
+identifier` — a cast of characters the fragment never declares — long before reaching the
+rule they illustrate; one block of bare expressions failed with *"expected ';' after
+expression"*. That is the weak-oracle shape `// expect-error:` exists to close for
+`tests/zer_fail/`, one level up in the harness. The substring is what makes the assertion
+mean anything. The gate was verified to FIRE (injected a substring that cannot appear) before
+being trusted.
+
+13 of 49 blocks are backfilled. The remaining 36 need the EXAMPLE made self-contained first —
+adding a directive to a block that dies on `undefined identifier` yields a gate that passes
+while testing nothing. `docs/limitations.md` carries the ledger and the explicit instruction
+not to close it by mass-adding directives.
+
+### BUG-976 — `@ptrtoint(&local)` laundered through a CALL escapes to a global
+
+```zer
+usize g = 0;
+usize idfn(usize x) { return x; }
+u32 main() { u32 local = 5; g = idfn(@ptrtoint(&local)); return 0; }   // ACCEPTED
+```
+Every other spelling of this launder is rejected — direct store, arithmetic chain, struct
+field, array element, `orelse` fallback, and the `return` sink. Only the call form was not,
+at either the assignment sink or the return sink.
+
+**Two root causes, one question answered two ways.** The call-result escape cluster is
+gated on `type_carries_data_pointer(result)`, whose own comment says *"`g_int =
+count(&local)` returns an int: no pointer escapes, don't reject"* — right for a count,
+wrong for an ADDRESS, which is exactly what `@ptrtoint` manufactures. Meanwhile the
+var-decl propagation site DOES treat a pointer-width integer as address-carrying
+(`is_ptr_int`). And `expr_touches_local_derived`, the walker that answers the propagation
+half, had the `AUDIT-LOUD`-exempted `default: return false` for `NODE_CALL`.
+
+**Fix (as landed on main, which differs from the branch's).** `expr_touches_local_derived`
+is exhaustive now (NODE_CALL / NODE_SLICE / NODE_STRUCT_INIT / NODE_ASSIGN added, no
+`default:`), and ONE query `call_result_is_local_address_int` gates the var-decl
+propagation, the assignment sink and the return sink. The branch keyed only on an
+address-VALUED integer argument, which left `usize leak(*u32 p) { return @ptrtoint(p); }`
+… `g = leak(&l)` accepted (the address goes in as a POINTER). Main's version reuses the
+per-function RETURN SUMMARY (`ret_param_mask`) the pointer sinks already use, with three
+additions: (1) a pointer-width-integer-returning function now RECORDS its summary; (2)
+`classify_return_root` peels `@ptrtoint(x)` as a view of x; (3) an integer-typed
+`return s.len` / `return arr[i]` / `return *p` classifies STATIC — reading a scalar out of
+the allocation is a value, not a view (the pointer-vs-scalar refinement), which is what
+keeps `g_len = len_of(local_slice)` accepted. A callee with no complete summary (extern C,
+funcptr) falls back to the branch's address-valued-argument rule, so the `strlen(&buf)`
+C-interop shape is not refused. Extra negative
+`tests/zer_fail/ptrtoint_local_via_call_ptr_param.zer` pins the pointer-param shape.
+
+**Deliberately NOT "any pointer-width result of a call with a local-derived arg".** That
+wider rule rejects `len_of(local_slice)`, which is safe and common — the array arm of
+`arg_is_local_derived` fires on it. The discriminator is that an ARGUMENT is
+address-valued, and the only way to make one is `@ptrtoint` (which is also the only way an
+integer Symbol becomes `is_local_derived`). Boundary pinned by
+`tests/zer/ptrtoint_call_boundary_ok.zer`: a length-of-a-local-buffer call, a scalar-result
+call, and `@ptrtoint` of a GLOBAL all still compile and run.
+Tests: `tests/zer_fail/ptrtoint_local_via_call_{global,alias,return}.zer`, all three
+verified ACCEPTED on a pre-fix build.
+
+---
+
 ## Session 2026-09-04 — BUG-961..924: twelve holes from a full-codebase read + ~130 adversarial probes
 
 Method: read every compiler source in full (checker, emitter, ir_lower, zercheck_ir, parser,

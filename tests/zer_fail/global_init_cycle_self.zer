@@ -1,0 +1,6 @@
+// expect-error: has a cyclic initializer
+// BUG-917: two lines that HUNG the compiler. resolve_const_ident handed
+// eval_const_expr_ex a fresh depth of 0 on every identifier hop, so the
+// evaluator's own bound never saw the chain: zerc never returned.
+const u32 A = A;
+u32 main() { return A; }

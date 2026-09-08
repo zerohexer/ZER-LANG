@@ -321,6 +321,88 @@ static const char *global_init_node_reason(Node *n, Type *type) {
     return NULL;
 }
 
+/* BUG-917: does this global initializer depend on itself through a chain of
+ * const globals? `const u32 A = A;` and `const u32 A = B; const u32 B = A;` both
+ * used to spin `resolve_const_ident` forever — the depth bound there stops the
+ * hang, this reports it in the user's terms.
+ *
+ * VISITED SET, not a depth bound. A first cut used depth > 32 and reported a
+ * legitimate 60-link chain (`c0 = c1; c1 = c2; … c60 = 7;`) as a CYCLE, which is
+ * a wrong diagnostic, not merely a strict one. The two conditions are genuinely
+ * different and the caller reports them differently: revisiting a symbol is a
+ * cycle; a chain longer than the substitution machinery can carry is "too deep".
+ *
+ * Stack-first per CLAUDE rule #7: 64 inline entries, arena on overflow.
+ * Descends the same expression kinds as `global_init_scan` so an ident buried in
+ * `A + 1` is found too. */
+#define GLOBAL_INIT_CHAIN_LIMIT 64
+
+typedef struct {
+    Symbol *inline_buf[64];
+    Symbol **seen;
+    int count;
+    int cap;
+    bool too_deep;     /* chain exceeded the limit — NOT a cycle */
+} GInitChain;
+
+static bool ginit_chain_push(Checker *c, GInitChain *st, Symbol *s) {
+    for (int i = 0; i < st->count; i++)
+        if (st->seen[i] == s) return false;          /* cycle */
+    if (st->count >= st->cap) {
+        int nc = st->cap * 2;
+        Symbol **nb = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return false;
+        memcpy(nb, st->seen, (size_t)st->count * sizeof(Symbol *));
+        st->seen = nb; st->cap = nc;
+    }
+    st->seen[st->count++] = s;
+    return true;
+}
+
+static bool global_init_ident_cycle_walk(Checker *c, Node *n, GInitChain *st) {
+    if (!n) return false;
+    if (n->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->global_scope,
+            n->ident.name, (uint32_t)n->ident.name_len);
+        if (!s || !s->is_const || s->is_function || !s->func_node) return false;
+        if (s->func_node->kind != NODE_VAR_DECL &&
+            s->func_node->kind != NODE_GLOBAL_VAR) return false;
+        if (!ginit_chain_push(c, st, s)) return true;          /* revisit = cycle */
+        if (st->count > GLOBAL_INIT_CHAIN_LIMIT) { st->too_deep = true; return false; }
+        bool r = global_init_ident_cycle_walk(c, s->func_node->var_decl.init, st);
+        st->count--;                                            /* pop */
+        return r;
+    }
+    #define GIC(x) do { if (global_init_ident_cycle_walk(c, (x), st)) return true; } while (0)
+    if (n->kind == NODE_BINARY) { GIC(n->binary.left); GIC(n->binary.right); }
+    else if (n->kind == NODE_UNARY) { GIC(n->unary.operand); }
+    else if (n->kind == NODE_TYPECAST) { GIC(n->typecast.expr); }
+    else if (n->kind == NODE_ORELSE) { GIC(n->orelse.expr); GIC(n->orelse.fallback); }
+    else if (n->kind == NODE_INDEX) { GIC(n->index_expr.object); GIC(n->index_expr.index); }
+    else if (n->kind == NODE_SLICE) { GIC(n->slice.object); GIC(n->slice.start); GIC(n->slice.end); }
+    else if (n->kind == NODE_INTRINSIC) {
+        for (int i = 0; i < n->intrinsic.arg_count; i++) GIC(n->intrinsic.args[i]);
+    } else if (n->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            GIC(n->struct_init.fields[i].value);
+    }
+    /* NODE_FIELD is deliberately NOT descended: `State.idle` is an enum constant
+     * whose "object" is a TYPE name, not a value that can close a cycle. */
+    #undef GIC
+    return false;
+}
+
+/* Returns 1 = cyclic, 2 = chain too deep to substitute, 0 = fine. */
+static int global_init_chain_verdict(Checker *c, Node *n) {
+    GInitChain st;
+    st.seen = st.inline_buf;
+    st.count = 0;
+    st.cap = (int)(sizeof(st.inline_buf) / sizeof(st.inline_buf[0]));
+    st.too_deep = false;
+    if (global_init_ident_cycle_walk(c, n, &st)) return 1;
+    return st.too_deep ? 2 : 0;
+}
+
 /* Walk the whole initializer tree; report the FIRST offending node. `*bad` is
  * set to that node so the caller can name the construct. */
 static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) {
@@ -2401,6 +2483,105 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* BUG-976 — the INTEGER half of the call-result escape question.
+ *
+ * `call_result_escapes` is gated by its consumers on
+ * `type_carries_data_pointer(result)`, whose comment says "`g_int = count(&local)`
+ * returns an int: no pointer escapes, don't reject". Right for a COUNT, wrong for
+ * an ADDRESS: `@ptrtoint` exists precisely to turn a pointer into a pointer-width
+ * integer, and `@inttoptr` turns it back. The var-decl propagation site already
+ * treats a pointer-width int as address-carrying (`is_ptr_int` +
+ * `expr_touches_local_derived`), so two sites answered ONE question two ways, and
+ * the call form escaped at both the global-store and the return sink:
+ *
+ *     usize g;  usize idfn(usize x) { return x; }
+ *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }        // was ACCEPTED
+ *     usize leak(){ u32 l = 5; return idfn(@ptrtoint(&l)); }   // was ACCEPTED
+ *
+ * while `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a` and
+ * `g = m() orelse a` are all rejected.
+ *
+ * The decision reuses the per-function RETURN SUMMARY (`ret_param_mask`, the same
+ * relational fact the pointer sinks use): the result may BE a frame address iff
+ * the callee may return param n and the actual argument n carries one — either
+ * a local-derived POINTER (`leak(&l)` with `usize leak(*u32 p){ return
+ * @ptrtoint(p); }` — note `classify_return_root` already peels `@ptrtoint` like
+ * any other view) or a local-derived ADDRESS INTEGER (`idfn(@ptrtoint(&l))`,
+ * or an int local that `is_local_derived` because it was made by @ptrtoint).
+ * `g_len = count(local_arr)` stays accepted: `count` returns a scalar field read
+ * or a fresh value, so its mask is empty. When the callee has NO complete
+ * summary (extern C, funcptr, unknown), only the address-valued-integer argument
+ * rule applies — a C function given a bare `&buf` and returning an int is the
+ * `strlen` shape, and rejecting it would refuse the whole C-interop idiom over
+ * a value the C-FFI floor already excludes. */
+static bool ptr_width_int_type(Checker *c, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);   /* unwraps distinct, NULL-safe */
+    if (k == TYPE_USIZE) return true;
+    if (k == TYPE_U64 && c->target_ptr_bits >= 64) return true;
+    if (k == TYPE_U32 && c->target_ptr_bits == 32) return true;
+    return false;
+}
+
+static bool arg_is_local_address_int(Checker *c, Node *arg, int depth) {
+    if (!arg || depth > 8) return false;
+    if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 8 &&
+        memcmp(arg->intrinsic.name, "ptrtoint", 8) == 0 &&
+        arg->intrinsic.arg_count > 0) {
+        /* unwrap_ptr_launder inside arg_is_local_derived peels the intrinsic to
+         * its pointer operand, so `&local` and a local-derived pointer both
+         * resolve there. Reuse it rather than re-deriving the root walk. */
+        return arg_is_local_derived(c, arg, 0);
+    }
+    if (arg->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, arg->ident.name,
+                                 (uint32_t)arg->ident.name_len);
+        return s && s->is_local_derived && ptr_width_int_type(c, s->type);
+    }
+    if (arg->kind == NODE_BINARY)
+        return arg_is_local_address_int(c, arg->binary.left, depth + 1) ||
+               arg_is_local_address_int(c, arg->binary.right, depth + 1);
+    if (arg->kind == NODE_TYPECAST)
+        return arg_is_local_address_int(c, arg->typecast.expr, depth + 1);
+    if (arg->kind == NODE_ORELSE)
+        return arg_is_local_address_int(c, arg->orelse.expr, depth + 1) ||
+               arg_is_local_address_int(c, arg->orelse.fallback, depth + 1);
+    if (arg->kind == NODE_CALL)
+        for (int i = 0; i < arg->call.arg_count; i++)
+            if (arg_is_local_address_int(c, arg->call.args[i], depth + 1))
+                return true;
+    return false;
+}
+
+/* The call hands back a pointer-width integer that may BE a frame address. */
+static bool call_result_is_local_address_int(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    if (!ptr_width_int_type(c, typemap_get(c, call))) return false;
+    Node *callee = call->call.callee;
+    Symbol *csym = NULL;
+    if (callee && callee->kind == NODE_IDENT) {
+        csym = scope_lookup(c->current_scope,
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+        if (!csym) csym = scope_lookup(c->global_scope,
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+    }
+    if (csym && csym->ret_summary_complete) {
+        uint64_t mask = csym->ret_param_mask;
+        for (int n = 0; n < 64 && mask; n++) {
+            if (!(mask & (1ull << n))) continue;
+            mask &= ~(1ull << n);
+            if (n >= call->call.arg_count) return true;   /* cannot resolve -> conservative */
+            Node *a = call->call.args[n];
+            if (arg_is_local_derived(c, a, 0) || arg_is_local_address_int(c, a, 0))
+                return true;
+        }
+        return false;
+    }
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (arg_is_local_address_int(c, call->call.args[i], 0)) return true;
+    return false;
+}
+
 /* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
  * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
  * global) copies the element's bytes into storage that outlives the frame. If
@@ -3766,14 +3947,45 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
     case NODE_ORELSE:
         return expr_touches_local_derived(c, expr->orelse.expr) ||
                expr_touches_local_derived(c, expr->orelse.fallback);
-    default:
-        /* AUDIT-LOUD exempt: this default is intentional — leaf and statement
-         * nodes can't carry a chain to a local-derived pointer. New NODE_
-         * kinds that introduce arithmetic chains should be added as explicit
-         * cases above. Walker is for stack-escape-via-arithmetic detection
-         * (EW8I0 BUG-664); false negative here = safety hole. */
+    /* BUG-976: NODE_CALL used to land in a `default: return false` and a stack
+     * address laundered through a CALL reached a pointer-width int local
+     * unflagged (`usize a = idfn(@ptrtoint(&l)); g = a;`). The default's OWN
+     * comment said "false negative here = safety hole". One query answers it:
+     * the callee's return summary crossed with its address-carrying args. */
+    case NODE_CALL:
+        return call_result_is_local_address_int(c, expr);
+    case NODE_SLICE:
+        return expr_touches_local_derived(c, expr->slice.object) ||
+               expr_touches_local_derived(c, expr->slice.start) ||
+               expr_touches_local_derived(c, expr->slice.end);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            if (expr_touches_local_derived(c, expr->struct_init.fields[i].value))
+                return true;
+        return false;
+    case NODE_ASSIGN:
+        return expr_touches_local_derived(c, expr->assign.target) ||
+               expr_touches_local_derived(c, expr->assign.value);
+    /* NO `default:` — a new NodeKind fails the BUILD here (-Werror=switch) and
+     * forces a decision instead of silently answering "cannot carry a stack
+     * address". Leaves and statement/declaration kinds carry no chain. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
         return false;
     }
+    return false;  /* unreachable (exhaustive) */
 }
 
 /* ---- ISR / @critical alloc ban helper ---- */
@@ -4048,6 +4260,38 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
         if (sy && sy->is_volatile_addr_derived) return true;
     }
     return false;
+}
+
+/* BUG-918: the ONE query for "what constant address does this `@inttoptr`
+ * address argument designate?".
+ *
+ * MULTI-SITE CLASS (CLAUDE.md's #1 recurring shape). This question was
+ * answered independently at FOUR sites — the `@inttoptr` range/alignment gate,
+ * the direct `@inttoptr(...)[N]` index-bound derivation, the local var-decl
+ * `mmio_bound` derivation, and the global var-decl one — and every one of them
+ * called plain `eval_const_expr`, which folds LITERALS but not a `const`
+ * identifier. Real firmware never writes the literal:
+ *
+ *     const u32 UART = 0x4000_0000;
+ *     volatile *u32 r = @inttoptr(*u32, UART);   // <- fold failed here
+ *
+ * so `mmio_bound` stayed 0 and `r[i]` was REJECTED outright ("no compile-time
+ * MMIO bound is known for this pointer") even though the address is perfectly
+ * constant — a payable over-rejection on the single most common bare-metal
+ * shape. At the `@inttoptr` gate itself the same fold failure DEFERRED the
+ * range and alignment errors to a runtime trap, i.e. to first boot.
+ *
+ * `eval_const_expr_scoped` resolves an identifier only when the symbol is
+ * `is_const` and carries its own initializer (`resolve_const_ident`), and that
+ * initializer is itself required to be a compile-time constant (BUG-916), so
+ * substituting it is sound; BUG-917's `_const_ident_depth` bounds the walk.
+ * Using it here strictly TIGHTENS the two error gates (more addresses become
+ * compile-time known) and strictly RELAXES the two bound derivations (a bound
+ * is derived where none was). Route every new MMIO const-address site through
+ * this function — do not re-inline `eval_const_expr`. */
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg) {
+    if (!addr_arg) return CONST_EVAL_FAIL;
+    return eval_const_expr_scoped(c, addr_arg);
 }
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
@@ -5893,6 +6137,28 @@ ct_done:
  * Looks up const symbols via scope chain, recursively evaluates init value.
  * BUG-430: enables const u32 perms = ...; comptime if (FUNC(perms)) pattern.
  * Uses eval_const_expr_ex with itself as callback — zero code duplication. */
+/* BUG-917: this callback hands `eval_const_expr_ex` a fresh depth of 0 on every
+ * identifier hop, so the evaluator's own depth bound could never see the chain.
+ * A cyclic const definition therefore recursed until the stack ran out:
+ *
+ *     const u32 A = A;                  // hangs the compiler
+ *     const u32 A = B;  const u32 B = A;  // hangs the compiler
+ *
+ * No diagnostic, no exit — `zerc` simply never returns, on two lines of source.
+ * The counter is a file-static because this evaluator is reached from several
+ * unrelated sites (global initializers, array sizes, `comptime if`, asm operand
+ * constraints) and threading a parameter through all of them would change four
+ * signatures to fix one loop; CLAUDE.md's "static globals are safe — the LSP is
+ * single-threaded" note covers the same shape for `_comptime_call_depth` and
+ * `_scan_global_depth`. Save/restore rather than a bare increment so an early
+ * CONST_EVAL_FAIL return cannot leak depth into the next evaluation.
+ *
+ * Bounding it makes a cycle evaluate to CONST_EVAL_FAIL; the SOURCE-level
+ * diagnostic for a cyclic global initializer is separate (see
+ * `global_init_ident_cycle`), because "not foldable" is the wrong thing to tell
+ * a user who wrote a definition that refers to itself. */
+static int _const_ident_depth = 0;
+
 static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len) {
     Checker *c = (Checker *)ctx;
     Symbol *sym = scope_lookup(c->current_scope, name, name_len);
@@ -5901,7 +6167,14 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
         Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
                       sym->func_node->kind == NODE_GLOBAL_VAR)
                      ? sym->func_node->var_decl.init : NULL;
-        if (init) return eval_const_expr_ex(init, 0, resolve_const_ident, ctx);
+        if (init) {
+            if (_const_ident_depth >= GLOBAL_INIT_CHAIN_LIMIT) return CONST_EVAL_FAIL;
+            int saved = _const_ident_depth;
+            _const_ident_depth++;
+            int64_t r = eval_const_expr_ex(init, 0, resolve_const_ident, ctx);
+            _const_ident_depth = saved;
+            return r;
+        }
     }
     return CONST_EVAL_FAIL;
 }
@@ -7899,6 +8172,31 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot store result of call with local-derived pointer argument — "
                         "stack memory may escape (sink outlives the local)");
+                }
+            }
+        }
+
+        /* BUG-976: the INTEGER sibling of the cluster above. The gate there is
+         * `type_carries_data_pointer(value)`, which is false for `usize` — so a
+         * frame address laundered as an INTEGER through a call
+         * (`g = idfn(@ptrtoint(&local))`) reached a global unflagged, while
+         * every non-call spelling of the same launder is rejected. */
+        if (node->assign.op == TOK_EQ && value &&
+            ptr_width_int_type(c, value)) {
+            Node *iroot = node->assign.value;
+            while (iroot && (iroot->kind == NODE_FIELD || iroot->kind == NODE_INDEX)) {
+                if (iroot->kind == NODE_FIELD) iroot = iroot->field.object;
+                else iroot = iroot->index_expr.object;
+            }
+            if (iroot && iroot->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, iroot)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of call given @ptrtoint of a local — "
+                        "the address dangles when the function returns "
+                        "(store the DATA, not the address)");
                 }
             }
         }
@@ -10513,7 +10811,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->index_expr.object->intrinsic.name_len == 8 &&
                 memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
                 node->index_expr.object->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(node->index_expr.object->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, node->index_expr.object->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -11824,7 +12122,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * --no-strict-mmio, a misaligned MMIO address is SIGBUS
                      * on ARM/RISC-V or silent corruption on Cortex-M0+. */
                     if (node->intrinsic.arg_count > 0) {
-                        int64_t cval = eval_const_expr(node->intrinsic.args[0]);
+                        int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         /* plt86m audit 2026-06-17: the range gate must account
@@ -15391,7 +15689,7 @@ static void check_stmt(Checker *c, Node *node) {
                 init_expr->intrinsic.name_len == 8 &&
                 memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
                 init_expr->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(init_expr->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, init_expr->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -16703,6 +17001,17 @@ static void check_stmt(Checker *c, Node *node) {
                         "misaligned (a hard fault on ARM/RISC-V), and the fact does not "
                         "survive the function boundary. Return the field BY VALUE instead");
                 }
+            }
+
+            /* BUG-976: the same address laundered through a CALL —
+             * `return idfn(@ptrtoint(&local));`. The direct spelling below and
+             * the indirect `usize a = @ptrtoint(&x); return a;` (caught by
+             * is_local_derived) were both covered; the call form was not. */
+            if (node->ret.expr->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, node->ret.expr)) {
+                checker_error(c, node->loc.line,
+                    "cannot return result of call given @ptrtoint of a local — "
+                    "the address dangles after the function returns");
             }
 
             /* scope escape: return @ptrtoint(&local) — address of local escapes as integer.
@@ -19709,7 +20018,7 @@ static void register_decl(Checker *c, Node *node) {
                 if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
                     memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
                     gi->intrinsic.arg_count > 0) {
-                    int64_t addr = eval_const_expr(gi->intrinsic.args[0]);
+                    int64_t addr = mmio_const_addr(c, gi->intrinsic.args[0]);
                     if (addr != CONST_EVAL_FAIL) {
                         for (int ri = 0; ri < c->mmio_range_count; ri++) {
                             if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -20483,8 +20792,16 @@ static void check_func_body(Checker *c, Node *node) {
             if (ret_eff && type_dispatch_kind(ret_eff) == TYPE_OPTIONAL)
                 ret_eff = type_unwrap_distinct(ret_eff->optional.inner);
             TypeKind rk = type_dispatch_kind(ret_eff);  /* unwraps distinct; NULL→VOID */
+            /* BUG-976: a POINTER-WIDTH INTEGER return is recorded too — the only
+             * way it can be a view of a param is `@ptrtoint`, which
+             * classify_return_root peels, so the integer call-result sink can
+             * resolve `g = leak(&local)` against `usize leak(*u32 p) { return
+             * @ptrtoint(p); }`. Every other consumer of the mask only gets MORE
+             * precise from a complete summary (keep inference skips positions
+             * the callee provably never returns). */
             if (node->func_decl.body &&
-                (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)) {
+                (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT ||
+                 ptr_width_int_type(c, ret_eff))) {
                 Symbol *fsym = scope_lookup(c->current_scope,
                     node->func_decl.name, (uint32_t)node->func_decl.name_len);
                 if (fsym) {
@@ -22818,6 +23135,24 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static int classify_return_root(Checker *c, Node *rexpr) {
     if (!rexpr) return RET_STATIC;               /* bare return — no value */
     if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
+    /* BUG-976: an INTEGER-typed return. FORMING a reference aliases; READING a
+     * value does not (CLAUDE.md, the pointer-vs-scalar refinement): `return
+     * s.len`, `return arr[i]`, `return *p` copy a scalar OUT of the param's
+     * allocation and are no view of it — only a bare param passthrough
+     * (`return x`) or `@ptrtoint(...)` (peeled in the loop below) can carry the
+     * address. Without this, `usize len_of([*]u8 s) { return s.len; }` recorded
+     * ARParam(0) and `g_len = len_of(local_slice)` was refused. */
+    {
+        Type *rt = typemap_get(c, rexpr);
+        bool is_ptrtoint = rexpr->kind == NODE_INTRINSIC &&
+            rexpr->intrinsic.name_len == 8 &&
+            memcmp(rexpr->intrinsic.name, "ptrtoint", 8) == 0;
+        if (rt && type_is_integer(rt) && !is_ptrtoint &&
+            (rexpr->kind == NODE_FIELD || rexpr->kind == NODE_INDEX ||
+             rexpr->kind == NODE_SLICE ||
+             (rexpr->kind == NODE_UNARY && rexpr->unary.op == TOK_STAR)))
+            return RET_STATIC;
+    }
     /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root */
     Node *root = rexpr;
     for (;;) {
@@ -22827,6 +23162,14 @@ static int classify_return_root(Checker *c, Node *rexpr) {
         else if (root->kind == NODE_UNARY &&
                  (root->unary.op == TOK_AMP || root->unary.op == TOK_STAR))
             root = root->unary.operand;
+        /* BUG-976: `@ptrtoint(x)` is a VIEW of x's pointee spelled as an integer
+         * — the address is the same region. Peeling it lets `usize leak(*u32 p)
+         * { return @ptrtoint(p); }` record ARParam(0), so the integer call-result
+         * sink (`g = leak(&local)`) can resolve the argument. */
+        else if (root->kind == NODE_INTRINSIC && root->intrinsic.name_len == 8 &&
+                 memcmp(root->intrinsic.name, "ptrtoint", 8) == 0 &&
+                 root->intrinsic.arg_count > 0)
+            root = root->intrinsic.args[0];
         else break;
     }
     if (!root) return RET_UNKNOWN;
@@ -23229,6 +23572,56 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             (int)decl->var_decl.name_len, decl->var_decl.name,
                             (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
                     }
+                }
+            }
+            /* BUG-916: a global initializer that NAMES a mutable global is not a
+             * compile-time constant, and C refuses it at file scope:
+             *
+             *     u32 SRC = 5;
+             *     u32 B = SRC;   // GCC: "initializer element is not constant"
+             *
+             * The `const` case is handled instead of banned — the emitter
+             * substitutes the referenced global's own initializer (see
+             * emit_expr's NODE_IDENT arm), which is what BUG-911 decided is the
+             * right answer for a value ZER considers constant. A MUTABLE global
+             * is genuinely not one, so it is rejected here, at the ZER line,
+             * rather than by GCC in a generated file.
+             *
+             * Function names (a funcptr global) and enum variants (NODE_FIELD)
+             * are unaffected. */
+            /* BUG-917: a cyclic const definition. `resolve_const_ident`'s depth
+             * bound now stops the HANG, but "cannot fold" is the wrong thing to
+             * say about a definition that refers to itself. Say what it is. */
+            {
+                int gv_verdict = global_init_chain_verdict(c, ginit);
+                if (gv_verdict == 1) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' has a cyclic initializer — it depends "
+                        "on itself through a chain of const globals",
+                        (int)decl->var_decl.name_len, decl->var_decl.name);
+                } else if (gv_verdict == 2) {
+                    /* Not a cycle — a chain longer than the substitution can
+                     * carry. Reported rather than left to GCC, which would say
+                     * "initializer element is not constant" about generated C. */
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' initializer chains through more than "
+                        "%d const globals — collapse the chain",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        GLOBAL_INIT_CHAIN_LIMIT);
+                }
+            }
+            if (ginit->kind == NODE_IDENT) {
+                Symbol *gsrc = scope_lookup(c->global_scope,
+                    ginit->ident.name, (uint32_t)ginit->ident.name_len);
+                if (gsrc && !gsrc->is_function && !gsrc->is_const) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' cannot be initialized from '%.*s' — "
+                        "a global initializer must be a compile-time constant and "
+                        "'%.*s' is mutable. Declare it 'const', or assign in an "
+                        "init function",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)ginit->ident.name_len, ginit->ident.name,
+                        (int)ginit->ident.name_len, ginit->ident.name);
                 }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */

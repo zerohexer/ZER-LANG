@@ -1,0 +1,77 @@
+// expect-error: initializer chains through more than
+// BUG-917 boundary, the other side: a 70-link chain is NOT a cycle, and saying
+// "cyclic" about it would be a wrong diagnostic (the first cut did exactly that
+// with a depth bound). It IS deeper than the substitution can carry, so it gets
+// its own message instead of reaching GCC as invalid C.
+const u32 c0 = c1;
+const u32 c1 = c2;
+const u32 c2 = c3;
+const u32 c3 = c4;
+const u32 c4 = c5;
+const u32 c5 = c6;
+const u32 c6 = c7;
+const u32 c7 = c8;
+const u32 c8 = c9;
+const u32 c9 = c10;
+const u32 c10 = c11;
+const u32 c11 = c12;
+const u32 c12 = c13;
+const u32 c13 = c14;
+const u32 c14 = c15;
+const u32 c15 = c16;
+const u32 c16 = c17;
+const u32 c17 = c18;
+const u32 c18 = c19;
+const u32 c19 = c20;
+const u32 c20 = c21;
+const u32 c21 = c22;
+const u32 c22 = c23;
+const u32 c23 = c24;
+const u32 c24 = c25;
+const u32 c25 = c26;
+const u32 c26 = c27;
+const u32 c27 = c28;
+const u32 c28 = c29;
+const u32 c29 = c30;
+const u32 c30 = c31;
+const u32 c31 = c32;
+const u32 c32 = c33;
+const u32 c33 = c34;
+const u32 c34 = c35;
+const u32 c35 = c36;
+const u32 c36 = c37;
+const u32 c37 = c38;
+const u32 c38 = c39;
+const u32 c39 = c40;
+const u32 c40 = c41;
+const u32 c41 = c42;
+const u32 c42 = c43;
+const u32 c43 = c44;
+const u32 c44 = c45;
+const u32 c45 = c46;
+const u32 c46 = c47;
+const u32 c47 = c48;
+const u32 c48 = c49;
+const u32 c49 = c50;
+const u32 c50 = c51;
+const u32 c51 = c52;
+const u32 c52 = c53;
+const u32 c53 = c54;
+const u32 c54 = c55;
+const u32 c55 = c56;
+const u32 c56 = c57;
+const u32 c57 = c58;
+const u32 c58 = c59;
+const u32 c59 = c60;
+const u32 c60 = c61;
+const u32 c61 = c62;
+const u32 c62 = c63;
+const u32 c63 = c64;
+const u32 c64 = c65;
+const u32 c65 = c66;
+const u32 c66 = c67;
+const u32 c67 = c68;
+const u32 c68 = c69;
+const u32 c69 = 7;
+u32 g = c0;
+u32 main() { return g - 7; }

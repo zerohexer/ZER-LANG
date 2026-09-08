@@ -123,6 +123,13 @@ typedef struct {
      * to _zer_trap instead of emitting an early `return`. */
     int noreturn_scope_depth;
 
+    /* BUG-916: > 0 while emitting a GLOBAL variable's initializer. C requires a
+     * file-scope initializer to be a constant expression, so a NODE_IDENT there
+     * cannot be emitted as a name — it must be replaced by the referenced
+     * `const` global's OWN initializer. Doubles as the recursion depth bound for
+     * that substitution (`const A = B; const B = A;`). */
+    int global_init_depth;
+
 } Emitter;
 
 /* ---- API ---- */

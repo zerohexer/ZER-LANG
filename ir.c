@@ -216,20 +216,20 @@ int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
     int offset = base - first;
 
     for (int i = 0; i < n; i++) {
-        IRBlock *src = &func->blocks[first + i];
+        IRBlock *sb = &func->blocks[first + i];
         IRBlock *dst = &func->blocks[base + i];
 
         /* Deliberately NOT copied: the source `label` (two blocks carrying one
          * label would emit duplicate C goto targets) and `preds` (recomputed by
          * ir_compute_preds after lowering). */
-        dst->is_orelse_fallback = src->is_orelse_fallback;
-        dst->is_early_exit      = src->is_early_exit;
+        dst->is_orelse_fallback = sb->is_orelse_fallback;
+        dst->is_early_exit      = sb->is_early_exit;
 
-        if (src->inst_count <= 0) continue;
-        dst->insts = (IRInst *)arena_alloc(arena, (size_t)src->inst_count * sizeof(IRInst));
-        memcpy(dst->insts, src->insts, (size_t)src->inst_count * sizeof(IRInst));
-        dst->inst_count = src->inst_count;
-        dst->inst_capacity = src->inst_count;
+        if (sb->inst_count <= 0) continue;
+        dst->insts = (IRInst *)arena_alloc(arena, (size_t)sb->inst_count * sizeof(IRInst));
+        memcpy(dst->insts, sb->insts, (size_t)sb->inst_count * sizeof(IRInst));
+        dst->inst_count = sb->inst_count;
+        dst->inst_capacity = sb->inst_count;
 
         for (int k = 0; k < dst->inst_count; k++) {
             IRInst *in = &dst->insts[k];
@@ -273,6 +273,54 @@ static void add_pred(IRBlock *block, Arena *arena, int pred_id) {
         block->pred_capacity = new_cap;
     }
     block->preds[block->pred_count++] = pred_id;
+}
+
+/* BUG-960: see ir.h. Classic iterative bitset fixpoint —
+ *   dom(entry) = {entry}
+ *   dom(b)     = {b} + intersection of dom(p) over preds p
+ * Every non-entry block starts as the FULL set so the first intersection is
+ * meaningful; a block that never gets a reachable pred keeps it, which is the
+ * standard treatment of unreachable code. */
+uint64_t *ir_compute_dominators(IRFunc *func, Arena *arena, int *out_words) {
+    if (!func || !arena || func->block_count <= 0) return NULL;
+    int n = func->block_count;
+    int words = (n + 63) / 64;
+    if (out_words) *out_words = words;
+
+    uint64_t *dom = (uint64_t *)arena_alloc(arena, (size_t)n * words * sizeof(uint64_t));
+    for (int b = 0; b < n; b++)
+        for (int w = 0; w < words; w++)
+            dom[b * words + w] = (b == 0) ? 0ULL : ~0ULL;
+    dom[0] = 1ULL;                        /* dom(entry) = {entry} */
+    for (int w = 1; w < words; w++) dom[w] = 0ULL;
+
+    uint64_t *tmp = (uint64_t *)arena_alloc(arena, (size_t)words * sizeof(uint64_t));
+    bool changed = true;
+    int guard = 0;
+    while (changed && guard++ < n + 8) {   /* monotone: converges in <= depth+1 */
+        changed = false;
+        for (int b = 1; b < n; b++) {
+            IRBlock *bb = &func->blocks[b];
+            if (bb->pred_count <= 0) continue;   /* unreachable: leave as FULL */
+            for (int w = 0; w < words; w++) tmp[w] = ~0ULL;
+            for (int pi = 0; pi < bb->pred_count; pi++) {
+                int p = bb->preds[pi];
+                if (p < 0 || p >= n) continue;
+                for (int w = 0; w < words; w++) tmp[w] &= dom[p * words + w];
+            }
+            tmp[b / 64] |= (1ULL << (b % 64));   /* every block dominates itself */
+            for (int w = 0; w < words; w++) {
+                if (dom[b * words + w] != tmp[w]) { changed = true; dom[b * words + w] = tmp[w]; }
+            }
+        }
+    }
+    return dom;
+}
+
+bool ir_dominates(const uint64_t *dom, int words, int a, int b) {
+    if (!dom || a < 0 || b < 0 || words <= 0) return false;
+    if (a / 64 >= words) return false;
+    return (dom[(size_t)b * words + (a / 64)] & (1ULL << (a % 64))) != 0;
 }
 
 void ir_compute_preds(IRFunc *func, Arena *arena) {

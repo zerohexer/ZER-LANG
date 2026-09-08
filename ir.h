@@ -365,6 +365,7 @@ int ir_add_block(IRFunc *func, Arena *arena);
  * computed after lowering by ir_compute_preds. */
 int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last);
 
+
 /* Add an instruction to a basic block. */
 void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst);
 
@@ -374,6 +375,22 @@ void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst);
 
 /* Compute predecessor lists for all blocks (call after lowering) */
 void ir_compute_preds(IRFunc *func, Arena *arena);
+
+/* BUG-960: dominators over the CFG, as a per-block bitset. dom[b*words + w] holds
+ * the blocks that dominate b; ir_dominates() reads it. ir_compute_preds() must have
+ * run first. Returns NULL if the function has no blocks.
+ *
+ * Needed because refactor L makes the defer body's ARMED gate a real IR branch, and
+ * a visible branch turns a merge into MAYBE_FREED — zercheck then reports "may not
+ * be freed on all paths" on correct code. The flag is SET immediately after
+ * IR_DEFER_PUSH and never cleared, so where the setting block DOMINATES the gate the
+ * flag is provably 1 and the branch need not exist at all. Where it does not, the
+ * branch stays and the analysis is right to be conservative.
+ *
+ * Unreachable blocks end up dominated by everything, which is the standard result
+ * and harmless here: eliding a branch in code that cannot run changes nothing. */
+uint64_t *ir_compute_dominators(IRFunc *func, Arena *arena, int *out_words);
+bool ir_dominates(const uint64_t *dom, int words, int a, int b);
 
 /* Check if a block's last instruction is a terminator */
 bool ir_block_is_terminated(IRBlock *block);

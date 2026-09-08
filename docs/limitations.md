@@ -428,6 +428,53 @@ working build:
   fire. (Those bans exist only because the raw-AST emitter cannot express a branch;
   after L they can be relaxed.)
 
+**STAGE 2, THIRD ATTEMPT (2026-09-08) — 5 failures down to 1, and FOUR of the five
+blockers are SOLVED with the fixes written out below. Reverted again; `ir_compute_dominators`
+LANDED (BUG-960) as the prerequisite it is.** Re-apply from here, not from scratch.
+
+**SOLVED — apply these, they are measured:**
+
+1. **The ARMED gate.** Elide it where the block that SET the flag DOMINATES the gate.
+   The flag is set immediately after `IR_DEFER_PUSH` and never cleared, so there it is
+   provably 1 and the branch need not exist. Where it does not dominate — the goto-skip
+   shape the flag exists for — the branch stays and the conservative answer is right.
+   Needs `armed_setter_block` on the branch, `defer_armed_block[di]` recorded at
+   registration, and a post-lowering pass after `ir_compute_preds` (NOT during lowering:
+   a later goto can add an edge that destroys a dominance that held at the time).
+   **Fixes `goto_defer`.**
+2. **The cleanup-label GUARD.** Do NOT lower a guarded body — keep it on the raw-AST
+   path, and have the emitter emit exactly those (same `guarded` condition, from the
+   same fields, so the two cannot disagree). Unlike the armed flag this one genuinely
+   varies, so dominance cannot help; recovering it would need guard-disjointness over a
+   REASSIGNED flag, which Level B's `ir_local_is_immutable_bool` deliberately refuses.
+   zercheck must then still scan those bodies from the AST — and WITHOUT the
+   `ir_fire_has_work_after` gate, since Phase C3 no longer runs to cover exit fires.
+   **Fixes `defer_goto_handle_leak_regression`.**
+3. **SCOPE.** Lower the template at REGISTRATION and EXTRACT it (copy the blocks aside,
+   truncate `block_count`), not at the first fire. Lowering re-resolves identifiers, and
+   the first fire can be in a NESTED scope — `{ Handle h = mh2 orelse return; }` fires
+   the outer defer from the inner block — where `pool.free(h)` resolves to the INNER
+   shadowed handle. Restoring the scope DEPTH alone does not reproduce the registration
+   context; measured, it still resolved to the shadow. **Fixes `handle_shadow_scope`.**
+   The earlier objection to eager lowering (dead locals) was measured BEFORE a consumer
+   existed — once every fire clones the template, its locals are used.
+4. **A defer body must not FIRE defers.** Guard `materialise_defers_from` on
+   `defer_body_depth > 0`.
+
+**STILL OPEN — ONE shape.** A `break` inside a defer body's own loop makes
+`ir_validate` abort: *"IR_DEFER_PUSH has no CFG-reachable IR_DEFER_FIRE"*. Minimal:
+
+```zer
+void f(){ defer { for (u32 i = 0; i < 5; i += 1) { if (i == 2) { break; } g += 1; } } }
+```
+
+Note this shape only became legal in BUG-947 (this session), so it is new ground. The
+body without the `break` validates and runs correctly, so it is the break's CFG edge —
+most likely its target leaving the extracted template range, or the reachability DFS
+losing the PUSH-to-FIRE path once the template is truncated out. Diagnose by dumping the
+CFG with the validator temporarily downgraded to a warning; `--emit-ir` is useless here
+because validation aborts first.
+
 **STAGE 2, SECOND ATTEMPT (2026-09-07, after M landed) — got MUCH further, one blocker
 left, and it is a DESIGN question rather than a bug.** Reverted again; tree unchanged.
 

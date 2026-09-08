@@ -441,9 +441,13 @@ the overwhelming majority, and where the safety wins are — get the IR treatmen
 functions with one keep exactly the behaviour they had, and a materialised body never
 carries a gate at all.
 
-**Consequence: `ir_compute_dominators` (BUG-960) had NO consumer and was reverted.** It
-was built as the prerequisite for the elision this boundary makes unnecessary. Rebuild
-it if a consumer appears; do not keep it on speculation.
+**Consequence: `ir_compute_dominators` (BUG-960) had NO consumer and was REMOVED
+(2026-09-08, the commit after L).** It was built as the prerequisite for the elision this
+boundary makes unnecessary, and a tested CFG utility with zero callers is still dead code
+in the compiler core. It was 45 lines plus four tests — the classic iterative bitset
+fixpoint over `func->blocks` on top of `ir_compute_preds` — so rebuilding it when a
+consumer appears is cheap; keeping it on speculation is not the trade this project makes.
+Its history is at `f60a803d` if it is wanted verbatim.
 
 **WHAT IT BUYS — measured, not argued.**
 

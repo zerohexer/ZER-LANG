@@ -406,95 +406,6 @@ static void test_clone_rejects_bad_range(void) {
 }
 
 
-/* ================================================================
- * BUG-960 — ir_compute_dominators / ir_dominates
- *
- * Refactor L makes the defer body's ARMED gate a real IR branch, and a visible
- * branch turns a merge into MAYBE_FREED, so zercheck reports "may not be freed on
- * all paths" on correct code. The gate can be elided exactly where the block that
- * SETS the flag dominates it. These pin the property that decision rests on.
- * ================================================================ */
-
-static void test_dom_straight_line(void) {
-    Arena a; arena_init(&a, 64*1024);
-    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
-    int b0 = ir_add_block(f, &a), b1 = ir_add_block(f, &a), b2 = ir_add_block(f, &a);
-    IRInst g0 = clean_inst(IR_GOTO); g0.goto_block = b1;
-    ir_block_add_inst(&f->blocks[b0], &a, g0);
-    IRInst g1 = clean_inst(IR_GOTO); g1.goto_block = b2;
-    ir_block_add_inst(&f->blocks[b1], &a, g1);
-    ir_block_add_inst(&f->blocks[b2], &a, clean_inst(IR_RETURN));
-    ir_compute_preds(f, &a);
-    int w = 0; uint64_t *d = ir_compute_dominators(f, &a, &w);
-    tests_run++; if (d) tests_passed++; else { printf("  FAIL: dominators returned NULL\n"); tests_failed++; }
-    expect_int(ir_dominates(d, w, b0, b2) ? 1 : 0, 1, "entry dominates a later block");
-    expect_int(ir_dominates(d, w, b1, b2) ? 1 : 0, 1, "straight-line pred dominates");
-    expect_int(ir_dominates(d, w, b2, b1) ? 1 : 0, 0, "a later block does NOT dominate an earlier");
-    expect_int(ir_dominates(d, w, b2, b2) ? 1 : 0, 1, "a block dominates itself");
-    arena_free(&a);
-}
-
-static void test_dom_diamond(void) {
-    /* b0 -> b1, b2 -> b3.  Neither arm dominates the join; the entry does. This is
-     * the case that must NOT elide an armed gate: control can reach the join
-     * without passing through the block that set the flag. */
-    Arena a; arena_init(&a, 64*1024);
-    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
-    int b0 = ir_add_block(f, &a), b1 = ir_add_block(f, &a);
-    int b2 = ir_add_block(f, &a), b3 = ir_add_block(f, &a);
-    IRInst br = clean_inst(IR_BRANCH); br.cond_local = 0; br.true_block = b1; br.false_block = b2;
-    ir_block_add_inst(&f->blocks[b0], &a, br);
-    IRInst g1 = clean_inst(IR_GOTO); g1.goto_block = b3;
-    ir_block_add_inst(&f->blocks[b1], &a, g1);
-    IRInst g2 = clean_inst(IR_GOTO); g2.goto_block = b3;
-    ir_block_add_inst(&f->blocks[b2], &a, g2);
-    ir_block_add_inst(&f->blocks[b3], &a, clean_inst(IR_RETURN));
-    ir_compute_preds(f, &a);
-    int w = 0; uint64_t *d = ir_compute_dominators(f, &a, &w);
-    expect_int(ir_dominates(d, w, b0, b3) ? 1 : 0, 1, "entry dominates the join");
-    expect_int(ir_dominates(d, w, b1, b3) ? 1 : 0, 0, "one arm does NOT dominate the join");
-    expect_int(ir_dominates(d, w, b2, b3) ? 1 : 0, 0, "the other arm does not either");
-    arena_free(&a);
-}
-
-static void test_dom_loop_backedge(void) {
-    /* b0 -> b1; b1 -> b1 (back edge) and b1 -> b2. A back edge must not make the
-     * body dominate the header's predecessor, and must still converge. */
-    Arena a; arena_init(&a, 64*1024);
-    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
-    int b0 = ir_add_block(f, &a), b1 = ir_add_block(f, &a), b2 = ir_add_block(f, &a);
-    IRInst g0 = clean_inst(IR_GOTO); g0.goto_block = b1;
-    ir_block_add_inst(&f->blocks[b0], &a, g0);
-    IRInst br = clean_inst(IR_BRANCH); br.cond_local = 0; br.true_block = b1; br.false_block = b2;
-    ir_block_add_inst(&f->blocks[b1], &a, br);
-    ir_block_add_inst(&f->blocks[b2], &a, clean_inst(IR_RETURN));
-    ir_compute_preds(f, &a);
-    int w = 0; uint64_t *d = ir_compute_dominators(f, &a, &w);
-    expect_int(ir_dominates(d, w, b1, b2) ? 1 : 0, 1, "loop header dominates the exit");
-    expect_int(ir_dominates(d, w, b2, b1) ? 1 : 0, 0, "exit does not dominate the header");
-    arena_free(&a);
-}
-
-static void test_dom_goto_into_middle(void) {
-    /* THE case the armed flag exists for: b0 branches either to b1 (which sets the
-     * flag) or straight to b2 (the fire). b1 must NOT dominate b2, so the gate is
-     * kept and the analysis stays conservative. */
-    Arena a; arena_init(&a, 64*1024);
-    IRFunc *f = ir_func_new(&a, "t", 1, ty_u32);
-    int b0 = ir_add_block(f, &a), b1 = ir_add_block(f, &a), b2 = ir_add_block(f, &a);
-    IRInst br = clean_inst(IR_BRANCH); br.cond_local = 0; br.true_block = b1; br.false_block = b2;
-    ir_block_add_inst(&f->blocks[b0], &a, br);
-    IRInst g1 = clean_inst(IR_GOTO); g1.goto_block = b2;
-    ir_block_add_inst(&f->blocks[b1], &a, g1);
-    ir_block_add_inst(&f->blocks[b2], &a, clean_inst(IR_RETURN));
-    ir_compute_preds(f, &a);
-    int w = 0; uint64_t *d = ir_compute_dominators(f, &a, &w);
-    expect_int(ir_dominates(d, w, b1, b2) ? 1 : 0, 0,
-               "a block reachable AROUND does not dominate — gate must be KEPT");
-    arena_free(&a);
-}
-
-
 int main(void) {
     Arena a; arena_init(&a, 4*1024);
     types_init(&a);
@@ -538,11 +449,6 @@ int main(void) {
     test_clone_rejects_bad_range();
 
     /* BUG-960: dominators */
-    test_dom_straight_line();
-    test_dom_diamond();
-    test_dom_loop_backedge();
-    test_dom_goto_into_middle();
-
     printf("\n=== Results: %d/%d passed, %d failed ===\n",
            tests_passed, tests_run, tests_failed);
     return tests_failed == 0 ? 0 : 1;

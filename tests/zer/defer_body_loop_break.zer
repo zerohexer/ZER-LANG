@@ -1,0 +1,35 @@
+// BUG-959 (refactor L stage 2): a `break` inside a DEFER BODY's own loop.
+//
+// HONEST SCOPE — this test does NOT discriminate against any released compiler, and it
+// is here anyway. Measured: it compiles and runs correctly on the pre-L build too. The
+// abort it pins ("IR_DEFER_PUSH has no CFG-reachable IR_DEFER_FIRE") existed only in L's
+// INTERMEDIATE third attempt, which never shipped — before the template machinery
+// existed there was nothing to bake a stray fire into.
+//
+// What it IS: a pin on a shape that is legal (only since BUG-947), non-obvious, and
+// interacts directly with the template machinery — so a future change to how a body is
+// lowered or cloned can re-break it. Recorded because the diagnosis cost a full attempt:
+// the break reached `emit_defer_fire_scoped`, which baked a stray IR_DEFER_FIRE INTO the
+// template, and every fire then cloned it, leaving the real PUSH with no fire outside a
+// body copy. Suppressing only the SPLICE was not enough — the INSTRUCTION is the half
+// that breaks validation. `defer_body_depth > 0` now returns from all three fire
+// emitters.
+//
+// The loop runs exactly twice before the break, so `g` ends at 2.
+
+u32 g;
+
+void f() {
+    defer {
+        for (u32 i = 0; i < 5; i += 1) {
+            if (i == 2) { break; }
+            g += 1;
+        }
+    }
+}
+
+u32 main() {
+    f();
+    if (g != 2) { return 1; }
+    return 0;
+}

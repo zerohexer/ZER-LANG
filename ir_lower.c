@@ -1047,10 +1047,20 @@ static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
  * as a CLONE of the template lowered at its registration. The body becomes ORDINARY
  * IR that every safety rule and every emitter path already handles, instead of raw
  * AST replayed by a SECOND statement emitter (emit_defer_stmt) implementing only
- * some of them — which is why a shared read in a defer-body condition took NO mutex,
- * why a defer-body var-decl / for-init / while-cond warned "auto-guard inserted" and
- * emitted none, and why switch / do-while / @critical there emitted a runtime trap on
- * VALID code. */
+ * some of them. MEASURED against the pre-L compiler, on the same programs:
+ *
+ *   - a shared read in a defer-body CONDITION took NO mutex — `defer { if (g.v > 3)
+ *     {…} }` emitted a bare `if ((g.v > 3))`, a data race. BUG-749 (B5) had covered
+ *     NODE_EXPR_STMT only, so the assignment form locked and the condition did not:
+ *     the partial-coverage shape, inside the partial emitter.
+ *   - `switch`, `do-while` and `@critical` in a defer body printed
+ *     `compiler bug: emit_defer_stmt has no handler for node kind N` and substituted
+ *     a `_zer_trap` for the code — VALID ZER turned into a runtime trap. This helper
+ *     covers ELEVEN node kinds; lower_stmt covers 53.
+ *
+ * NOT among the wins, though an earlier draft of this comment said so: the auto-guard
+ * was already emitted (refactor M put it there). What changes is that it is now one
+ * IR branch inside the template rather than C text re-emitted at every fire site. */
 static void materialise_defer_body(LowerCtx *ctx, int di) {
     if (di < 0 || di >= ctx->defer_bodies_cap) return;
     if (!ctx->defer_tpl_blocks[di]) return;        /* nothing lowered — nothing to fire */

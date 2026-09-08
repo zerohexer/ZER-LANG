@@ -6061,6 +6061,48 @@ Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
 as flag values fell into the validator's "out of range" check for
 functions with local_count == 0.
 
+### The slice HEADER is read-only (2026-09-08, BUG-967)
+
+`[*]T` bounds safety is ENTIRELY the `{ptr, len}` header — every index emits
+`_zer_bounds_check(i, s.len)` — so the header must not be writable. It was:
+
+```zer
+u32 main() { u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1; return 0; }
+```
+
+compiled clean, RAN clean, and wrote 46 bytes past a 4-byte array. The check dutifully
+validated 50 against the forged 100.
+
+**ONE query, `view_header_field(c, e, &container)`, at TWO sinks** — the NODE_ASSIGN
+target and `case TOK_AMP` — because those are the only two ways to write it. Seventeen
+spellings were measured live BEFORE implementing and all seventeen fall to that one query
+with no case-per-door:
+
+- both fields (`.ptr`, `.len`) and both assign forms (`=`, `+=` / `-=`) — the pair is one
+  NODE_ASSIGN differing only in `assign.op`, so it needs one test, not two
+- through a bare local, a global, a struct field, a nested struct, an array-of-struct
+  element, a pointer auto-deref, a value unwrapped from an `orelse`, a sub-slice, and a
+  write inside a defer body — all covered because the query asks the type of the object
+  IMMEDIATELY under the field, so nesting is free
+- `&s.len` / `&s.ptr`, bound to a local or passed as an argument
+
+**KEY ON THE OBJECT'S TYPE, NEVER ON THE FIELD NAME.** A user struct may perfectly well
+have a field called `ptr` or `len`, and this corpus has `JString.len`, `Packet.len` and
+`Box.ptr`. A name-keyed rule rejects all of them. `type_dispatch_kind` so a wrapper cannot
+walk a slice through the rule. (`distinct [*]u8` turns out not to be expressible — the
+grammar requires `distinct typedef` of a named type — but the unwrap is the right habit.)
+
+The ARRAY sibling `a.len = 100` is the same question and was emitting `_zer_t0 = 4U =
+100ULL;` — invalid C that only GCC rejected. Loud drift rather than a silent OOB write, so
+it is answered by the SAME query rather than a second rule that could drift.
+
+**Why reject rather than track:** corpus cost measured at ONE file, and that file
+(`range_for_len_snapshot`) was writing the header only as a convenient way to BUILD a
+slice, not because its subject needed it. It is rewritten to build by slicing and to widen
+the whole slice mid-loop — the legal route to changing a bound, same property — and the
+emitted C was checked to confirm the loop still compares against `_zer_rlen`, read once,
+so it still discriminates. Nothing else in the corpus writes a slice header at all.
+
 ### THE DEFER BODY IS IR NOW — read this before the two sections below (2026-09-08, BUG-959..966)
 
 **A defer body is lowered ONCE at its registration into a detached block range, and
@@ -6087,6 +6129,33 @@ Consequences a session touching defer code must know:
 - **A fire at an already-terminated position does not materialise.** Splicing a body that
   cannot run makes the ANALYSIS wrong (zercheck walks every block and counts the frees
   again), so this is correctness, not an optimisation.
+
+**WHAT THE SPLIT ACTUALLY BOUGHT — measured 2026-09-08 by A/B-ing against a build of the
+commit right before L, not recalled.** The number that explains the whole class:
+
+| emitter | node kinds handled |
+|---|---|
+| `emit_defer_stmt` (the defer-body emitter) | **11** — ASM, ASSIGN, BLOCK, BREAK, CONTINUE, EXPR_STMT, FOR, IF, RETURN, VAR_DECL, WHILE |
+| `lower_stmt` (every other statement in the language) | **53** |
+
+Its `default:` arm is deliberately loud — it prints `compiler bug: emit_defer_stmt has no
+handler for node kind %d` and emits a `_zer_trap` — but loud in a place nobody looks is
+still valid ZER turned into a runtime trap. Measured pre-L, each of `switch`, `do-while`
+and `@critical` inside a defer body produced that message twice and two traps; post-L,
+zero and zero.
+
+The subtler one, and a real DATA RACE: a shared read in a defer-body CONDITION took no
+mutex. `defer { if (g.v > 3) { … } }` emitted a bare `if ((g.v > 3))`. BUG-749 (B5)
+lock-wrapped the defer body's `NODE_EXPR_STMT` and nothing else, so the ASSIGNMENT form
+locked and the CONDITION did not — the partial-coverage shape, occurring inside the
+partial emitter. Post-L the body is lowered by the ordinary path and the lock is there.
+
+**NOT a win, though the first draft of this section and of the BUG-959 comment both said
+so: the auto-guard.** It was already emitted — refactor M put it there. L only changes it
+from C text re-emitted at every fire site into one IR branch inside the template. That
+claim had been inherited from `limitations.md`'s L motivation, which was measured BEFORE M
+landed, and repeated without re-measuring. It is the reason the baseline-compiler A/B is
+now a standing rule in CLAUDE.md.
 
 The two sections below describe the machinery of the LABEL path. It is unchanged and
 still load-bearing there.
@@ -12076,7 +12145,12 @@ than breaking it — that's the design key for any future lock work:
   existing `@once` body uses control flow). Freestanding (`#else`) path unchanged
   (single-core, loser does not wait).
 - **B5 defer-body lock** (BUG-749): `emit_defer_stmt` NODE_EXPR_STMT lock-wraps the
-  deferred shared access.
+  deferred shared access. **NARROWER THAN IT READS, and superseded for most functions
+  (2026-09-08):** it covered `NODE_EXPR_STMT` ONLY, so `defer { g.v = 7; }` locked while
+  `defer { if (g.v > 3) {…} }` emitted a bare unlocked read — a data race. Refactor L
+  lowers the whole body through `lower_stmt` for any function without a LABEL, so the
+  lock now comes from the ordinary path there; B5 remains the mechanism on the label
+  path. See "THE DEFER BODY IS IR NOW".
 
 ## Unified Level A product — the plan (2026-08-10)
 

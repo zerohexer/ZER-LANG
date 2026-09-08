@@ -76,9 +76,20 @@ and that a user struct with `len` / `ptr` fields still compiles.
 
 Fourth attempt, and it landed. A `defer` body used to be raw AST replayed at each exit by
 `emit_defer_stmt`, a SECOND statement emitter implementing only some of the rules — so
-inside a defer body a shared read took no mutex, an auto-guard warned and emitted nothing,
-`switch` / `do-while` / `@critical` trapped at runtime on VALID code, and the CFG-based
-safety analysis could not see the body at all. Each body is now lowered once into a
+inside a defer body a shared read in a CONDITION took no mutex, `switch` / `do-while` /
+`@critical` printed `compiler bug: emit_defer_stmt has no handler for node kind N` and
+substituted a `_zer_trap` for valid code, and the CFG-based safety analysis could not see
+the body at all. All three measured against the pre-L compiler, not recalled.
+
+`emit_defer_stmt` covers **eleven** node kinds; `lower_stmt` covers **53**. That ratio is
+the whole bug class.
+
+**One claim in the first draft of this entry was wrong and is corrected here: the
+auto-guard WAS already emitted** — refactor M put it there. What L changes is that it is
+one IR branch inside the template instead of C text re-emitted at every fire site. Caught
+by A/B-ing against a `git archive` build of the pre-L commit while writing the docs; the
+claim had been inherited from the pre-M motivation text in limitations.md and repeated
+without re-measuring. Each body is now lowered once into a
 detached block range and CLONED into the CFG at every fire.
 
 ### What it caught that nothing caught before

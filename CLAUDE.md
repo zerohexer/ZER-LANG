@@ -401,6 +401,8 @@ by the shape of the N sites — this is the "audit vs callsite vs Coq" question:
 | **Non-atomic RMW ("is this a read-modify-write on a shared global?")** | spawn scan + ISR walker + the main-checker compound site | ONE resolver `resolve_write_target_global` (sees through `*p`/`*gp` to the pointee) + `assign_reads_own_target` (a written-out `g = g + 1` is the same operation) + the **RMW FORM grid in `tests/test_hw_matrix.c`** (site x spelling). The SPELLING axis matters as much as the site axis: `g = @truncate(u32,g)+1`, `g = idfn(g)+1` and `g = maybe(g) orelse 0` were all accepted at BOTH sinks until BUG-841, because the underlying walker was an if-chain that returned "no" for unlisted node kinds |
 | **Value-flow compatibility ("may this value land in this destination?")** | var-decl init, assignment, call arg, return, spawn arg, struct-init field, orelse fallback, global init | ONE query **`value_flows_to`** (BUG-842). The three-condition chain `!type_equals && !can_implicit_coerce && !is_literal_compatible` used to be written out at all EIGHT, which is exactly why a negative constant into an unsigned type was accepted at every one of them. Each site keeps its own wording; only the DECISION is shared |
 | **Two SPELLINGS of one operation ("does the assign form track like the var-decl form?")** | `x = pool.alloc()` vs `T x = pool.alloc()`; `b = a` vs `T b = a` for a `move struct` | ONE registration helper **`ir_register_alloc_result`** called by BOTH arms. The two spellings LOWER DIFFERENTLY — var-decl gives `IR_CALL` + `COPY`, assign gives ONE passthrough `%t = ASSIGN <NODE_ASSIGN>` in which **the target local is never any instruction's `dest_local`** — so every arm keying on `dest_local` silently saw a temp (BUG-933: UAF, double-free, leak and use-after-move all accepted). When you add tracking for an operation, write BOTH spellings as a test. Related: a walk over field types must include **ARRAY** as a carrier, and **exceeding a depth guard must return the CONSERVATIVE answer** — `ir_contains_move_struct_field_depth` returned "no move struct" past depth 32, so a 34-deep nest defeated tracking by being deep |
+| **View-header write ("does this forge a bound?")** | the NODE_ASSIGN target (plain AND compound — one handler, one `assign.op`) and `&` | ONE query **`view_header_field`** (BUG-967). `[*]T` bounds safety is entirely the `{ptr,len}` header, so a writable `.len` forges any bound in one line — `s.len = 100; s[50] = 1;` compiled clean, RAN clean, wrote 46 bytes past a 4-byte array. **17 spellings measured before implementing; all 17 fall to the one query** (both fields, both assign forms, `&`, and through a struct field / nested struct / array element / pointer auto-deref / global / `orelse` unwrap / sub-slice / defer body). KEY ON THE OBJECT'S TYPE, NEVER THE FIELD NAME — user structs legitimately have `len` / `ptr` fields (`JString.len`, `Box.ptr`) |
+| **Defer-body statement coverage ("does this rule reach inside a `defer`?")** | was TWO statement emitters — `lower_stmt` (53 node kinds) and `emit_defer_stmt` (11) | Refactor L (BUG-959..966) lowers the body to IR so there is ONE path, for any function WITHOUT a label. A function WITH one keeps the AST path, gated on `IRInst.defer_fire_emit_ast` set by the sole constructor `make_defer_fire`. Before it: `switch` / `do-while` / `@critical` in a defer body became a `_zer_trap`, and a shared read in a defer-body CONDITION took no mutex (B5 covered `NODE_EXPR_STMT` only) |
 | **Use-before-init ("did this resource ever receive its state?")** | Arena backing store, Barrier target | ONE deferred pass **`check_resource_init`** + `Symbol.resource_initialized`, run beside `check_keep_inference` so it sees every module. Both resources zero-initialise into a state that is USABLE but INERT (capacity 0 / target 0), which is why the failure is silent |
 | Emitter dual dispatch (AST ~3xxx + IR ~7xxx) | every intrinsic / coercion / safety-wrapper | `grep -n '"name"' emitter.c` MUST show TWO hits; the AST→IR emission diff audit |
 | **Enum-forge doors** ("can this conversion produce a non-variant?") | `@bitcast`, `@truncate`, `@saturate` — and `@cast` verified NOT to be one | the three `tests/zer_trap/*_enum_forged_*.zer`. Patched THREE times across three sessions before the door set was written down; each fix closed one door and left the siblings |
@@ -2790,6 +2792,45 @@ first failing audit, so a later gate silently never runs.
 
 **Fetching ONE file from a branch without checking it out:** `git show <branch>:<path>`. Use this to
 run a branch's reproducer verbatim — a RECONSTRUCTED probe can CONFIRM a hole but never REFUTE one.
+
+**KEEP A BASELINE COMPILER AND A/B EVERY CLAIM AGAINST IT (2026-09-08, caught a FALSE claim
+already committed).** Build the pre-change compiler once, into a scratch dir, and keep it for the
+whole session:
+
+    rm -rf /tmp/headb && mkdir -p /tmp/headb && git archive HEAD | tar -x -C /tmp/headb
+    cd /tmp/headb && rm -f *.o src/safety/*.o && make zerc      # ~1 min
+
+Then every "X was broken, my change fixes it" is one command per side instead of a memory. This is
+the ONLY thing that distinguishes *your* fix from a DIFFERENT refactor that already fixed it. Three
+of four claimed wins for refactor L survived it; the fourth (the auto-guard) did not — refactor M had
+emitted it all along, and the claim had been inherited from a motivation section measured before M
+landed and repeated without re-measuring. **A doc's MOTIVATION text goes stale the moment a
+neighbouring refactor lands. Before writing "this fixed X", A/B X against the commit right before
+your change.**
+
+**WHEN YOU A/B, THE GREP IS THE EXPERIMENT — get it wrong and you get a confident wrong answer.**
+Both halves of that failed in one session:
+- **The diagnostic you are grepping for may not say `error:`.** `emit_defer_stmt`'s coverage gap
+  prints **`compiler bug: ... no handler for node kind N`** on stderr and emits a `_zer_trap` into
+  the C. Grepping `error:` reported "already worked pre-fix" for three constructs that were in fact
+  broken. Prefer a pattern that cannot miss: `grep -c "compiler bug"` plus
+  `sed -n '/^uint32_t main/,/^}/p' out.c | grep -c _zer_trap`.
+- **Check WHICH BINARY each row ran.** A row labelled "pre-L" that actually invoked `./zerc` is not a
+  measurement. Put the binary path in the loop, print both sides, and never label from intent.
+
+**A TRUNCATED GREP'S COUNT IS NOT EVIDENCE — read the whole list (2026-09-08, BUG-967).** Corpus cost
+was measured as 43 hits, the first 20 inspected, all benign, and the cost recorded as ZERO. It was
+ONE, and the test suite found it rather than the measurement. When justifying a tightening by corpus
+cost, enumerate every hit — or better, let the compiler classify them: compile each candidate file
+with the new rule and grep for YOUR diagnostic.
+
+**Reading a PREVIOUS session's transcript** (after a compaction, to recover what was decided and why):
+transcripts are `~/.claude/projects/<path-slug>/<session-uuid>.jsonl`, one JSON object per line with
+`message.content` blocks of type `text` / `thinking` / `tool_use` / `tool_result`. `ls -lat` that
+directory — the newest file is the CURRENT session, so the one you want is usually the SECOND. Parse
+it (a few lines of python: iterate the last N lines, pull `text` and `thinking`, truncate
+`tool_result` hard) rather than `tail`-ing raw JSON, which is unreadable and enormous. Worth doing
+when the compaction summary says a refactor "landed" or "was reverted" and you need to know which.
 
 **`// expect-error` drift between branches is a real WRONG-REASON source.** Two branches spelled the
 same diagnostic "initialised" and "initialized"; the rule fired correctly and the harness still

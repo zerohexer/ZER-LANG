@@ -463,9 +463,19 @@ Its history is at `f60a803d` if it is wanted verbatim.
   `tests/zer_fail/defer_in_branch_fallthrough_leak.zer`. It closed as a second-order
   effect of BUG-966 (below) and was briefly recorded as a `zer_gaps` entry before the
   same day's fix closed it.
-- The `switch` / `do-while` / `@critical` runtime traps on VALID code inside a defer
-  body, the un-emitted auto-guards, and the unlocked shared read in a defer-body
-  condition all go away with `emit_defer_stmt`'s partial statement emitter.
+- **A DATA RACE CLOSED: a shared read in a defer-body CONDITION took no mutex.**
+  `defer { if (g.v > 3) { … } }` emitted a bare `if ((g.v > 3))`. BUG-749 (B5) had
+  covered `NODE_EXPR_STMT` only, so the assignment form locked and the condition did
+  not — the partial-coverage shape, inside the partial emitter.
+- **`switch`, `do-while` and `@critical` in a defer body were VALID CODE TURNED INTO A
+  TRAP.** Each printed `compiler bug: emit_defer_stmt has no handler for node kind N`
+  and substituted a `_zer_trap`. That helper covers ELEVEN node kinds; `lower_stmt`
+  covers 53, which is the whole bug class in one ratio.
+- **NOT a win, though an earlier draft here claimed it: the auto-guard.** It was
+  already emitted — refactor M put it there. L only changes it from C text re-emitted
+  per fire site into one IR branch inside the template. Corrected 2026-09-08 by A/B-ing
+  against a build of the pre-L commit; the claim had been inherited from this section's
+  own pre-M motivation text and repeated without re-measuring.
 
 **FOUR BUGS FOUND ON THE WAY — each was a defect in EXISTING code that only a real CFG
 in the defer body could expose.**
@@ -594,8 +604,17 @@ LANDED (BUG-960) as the prerequisite it is.** Re-apply from here, not from scrat
 4. **A defer body must not FIRE defers.** Guard `materialise_defers_from` on
    `defer_body_depth > 0`.
 
-**STILL OPEN — ONE shape.** A `break` inside a defer body's own loop makes
-`ir_validate` abort: *"IR_DEFER_PUSH has no CFG-reachable IR_DEFER_FIRE"*. Minimal:
+**~~STILL OPEN — ONE shape.~~ CLOSED 2026-09-08 in the fourth attempt** — verified by
+running the exact program below, exit 0; pinned by `tests/zer/defer_body_loop_break.zer`.
+The cause was not the break's CFG edge as guessed here: a `break` in the body's own loop
+reached `emit_defer_fire_scoped`, which baked a stray `IR_DEFER_FIRE` INTO the template,
+and every fire then cloned it — leaving an `IR_DEFER_PUSH` whose only fires were inside
+copies of a body. Suppressing the SPLICE was not enough; the INSTRUCTION is the half that
+breaks validation. `defer_body_depth > 0` now returns from all three fire emitters. Text
+kept for the diagnosis method, which was sound. The original claim:
+
+A `break` inside a defer body's own loop makes `ir_validate` abort:
+*"IR_DEFER_PUSH has no CFG-reachable IR_DEFER_FIRE"*. Minimal:
 
 ```zer
 void f(){ defer { for (u32 i = 0; i < 5; i += 1) { if (i == 2) { break; } g += 1; } } }

@@ -1467,6 +1467,130 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
     return true;
 }
 
+/* BUG-970: is `t` a UNIQUE RESOURCE — a type whose value IS its identity, so that
+ * copying it produces two owners of one piece of state?
+ *
+ * Arena (a bump pointer over a buffer), Barrier (a rendezvous count) and Semaphore (a
+ * permit count) all alias when copied, and none of them was refused ANYWHERE. Measured:
+ *
+ *     Arena b = a;  *T x = a.alloc(T)...;  *T y = b.alloc(T)...;
+ *
+ * compiled clean and both allocations returned the SAME BYTES — `y.v` overwrote `x.v`.
+ * Pool/Ring/Slab were already refused, but at exactly ONE site (assignment, BUG-225),
+ * which is why every other value-flow spelling stayed open for all six.
+ *
+ * Recurses struct and union FIELDS: a `struct Ctx { Arena a; u32 n; }` copied whole is
+ * the same aliasing, and the carrier form is how the rule gets bypassed otherwise —
+ * the wrapper-hides-the-inner-kind class this codebase already gates elsewhere.
+ *
+ * Returns the spelling for the diagnostic, or NULL. */
+static const char *unique_resource_name(Type *t, int depth) {
+    if (!t || depth > 8) return NULL;
+    Type *e = type_unwrap_distinct(t);
+    if (!e) return NULL;
+    switch (type_dispatch_kind(e)) {
+    case TYPE_POOL:      return "Pool";
+    case TYPE_RING:      return "Ring";
+    case TYPE_SLAB:      return "Slab";
+    case TYPE_ARENA:     return "Arena";
+    case TYPE_BARRIER:   return "Barrier";
+    case TYPE_SEMAPHORE: return "Semaphore";
+    case TYPE_ARRAY:     return unique_resource_name(e->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < e->struct_type.field_count; i++) {
+            const char *r = unique_resource_name(e->struct_type.fields[i].type, depth + 1);
+            if (r) return r;
+        }
+        return NULL;
+    default: return NULL;
+    }
+}
+
+/* BUG-970: does this expression name an EXISTING resource object, as opposed to
+ * constructing a fresh one?
+ *
+ * `Arena.over(buf)` is a constructor — its result is a new bump state that nobody else
+ * owns, so binding it is not a copy. `a`, `ctx.arena`, `pool[i]` all NAME something
+ * that keeps existing after the binding, so binding those IS a copy and creates the
+ * second owner. An `orelse` is a JOIN and both arms must be asked.
+ *
+ * Getting this boundary right is the whole difficulty: refusing the constructor too
+ * would make the types unusable, which is presumably why the original rule was written
+ * against the TARGET type at a single site instead of against the VALUE. */
+static bool value_is_existing_resource(Node *v, int depth) {
+    if (!v || depth > 16) return false;
+    switch (v->kind) {
+    /* NAMES something that keeps existing after the binding. */
+    case NODE_IDENT: return true;
+    case NODE_FIELD: return value_is_existing_resource(v->field.object, depth + 1);
+    case NODE_INDEX: return value_is_existing_resource(v->index_expr.object, depth + 1);
+    case NODE_SLICE: return value_is_existing_resource(v->slice.object, depth + 1);
+    /* A JOIN: either arm can hand over an existing one. */
+    case NODE_ORELSE:
+        return value_is_existing_resource(v->orelse.expr, depth + 1) ||
+               value_is_existing_resource(v->orelse.fallback, depth + 1);
+
+    /* Everything below BUILDS a value rather than naming one, so binding it creates
+     * the only owner. Enumerated rather than left to a `default:` — a new node kind
+     * must be classified by whoever adds it, which is what -Werror=switch and the
+     * walker-default audit exist to force. Getting a new kind wrong in the "fresh"
+     * direction is an ACCEPT of a copy, so the decision should not be made by
+     * omission. */
+    case NODE_CALL: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_UNARY: case NODE_ASSIGN: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+
+    /* Not expressions — cannot appear in a value position at all. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
+/* BUG-970: the shared REPORTER for a unique-resource copy, so all eight value-flow
+ * sinks give one consistent verdict and one consistent wording. Each site passes its
+ * own `what` ("initialize", "assign", "pass", "return", …). Returns true if it
+ * reported, so callers can skip their generic message. */
+static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
+                                        int line, const char *what) {
+    if (!value || !vt) return false;
+    const char *rn = unique_resource_name(vt, 0);
+    if (!rn) return false;
+    if (!value_is_existing_resource(value, 0)) return false;   /* a fresh one is fine */
+    /* The remedy DIFFERS by type, and saying the wrong one is worse than saying
+     * nothing. MEASURED: `*Barrier` / `*Semaphore` parameters work, while
+     * `*Arena` / `*Pool` / `*Slab` / `*Ring` do NOT — `a.alloc(T)` on a pointer is
+     * "cannot access field 'alloc'". Those four are addressed BY NAME and are
+     * conventionally global, which is how the whole corpus uses them. */
+    bool ptr_ok = (rn[0] == 'B' || rn[0] == 'S');   /* Barrier, Semaphore */
+    if (rn[0] == 'S' && rn[1] == 'l') ptr_ok = false;   /* Slab, not Semaphore */
+    if (ptr_ok)
+        checker_error(c, line,
+            "cannot %s '%s' by value — resource types are not copyable, because the "
+            "value IS the state: a copy is a second owner of one count, so an "
+            "acquire or wait on the copy never pairs with the original. Pass a "
+            "pointer ('*%s')",
+            what, rn, rn);
+    else
+        checker_error(c, line,
+            "cannot %s '%s' by value — resource types are not copyable, because the "
+            "value IS the state: a copy is a second owner of one buffer, and the two "
+            "then hand out the same bytes. '%s' is addressed by NAME (a pointer to "
+            "one has no methods), so declare it where both sides can see it — "
+            "conventionally a global — or build a fresh one",
+            what, rn, rn);
+    return true;
+}
+
 /* THE value-flow compatibility question — "may a value of type `vt`, written as
  * the expression `value`, flow into a destination of type `target`?"
  *
@@ -3554,6 +3678,9 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * Same question, second sink. */
                 check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
+                if (vt && ft)
+                    reject_unique_resource_copy(c, df->value, ft,
+                                                line, "initialize");
                 if (vt && ft && !value_flows_to(df->value, vt, ft)) {
                     char what[96];
                     snprintf(what, sizeof(what), "field '.%.*s'",
@@ -9160,6 +9287,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                     }
 
+                    reject_unique_resource_copy(c, node->call.args[i], param,
+                                                node->loc.line, "pass");
                     if (!value_flows_to(node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
                         char what[48];
@@ -10569,6 +10698,8 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (rt) retype_const_int_to_target(c, node->orelse.fallback, rt);
                 }
                 /* fallback must match unwrapped type */
+                reject_unique_resource_copy(c, node->orelse.fallback, unwrapped,
+                                            node->loc.line, "use");
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
                     if (!report_value_flow_refusal(c, node->orelse.fallback, unwrapped,
                                                     node->loc.line, "orelse fallback"))
@@ -14493,6 +14624,8 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            reject_unique_resource_copy(c, node->var_decl.init, type,
+                                        node->loc.line, "initialize");
             if (!value_flows_to(node->var_decl.init, init_type, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
@@ -16811,6 +16944,30 @@ static void check_stmt(Checker *c, Node *node) {
             }
 
             if (c->current_func_ret) {
+                /* BUG-970: the RETURN sink is NARROWER than the other seven, and
+                 * deliberately so. Returning a LOCAL resource by value is a MOVE —
+                 * the local dies with the frame, so the caller becomes the only
+                 * owner and `Arena mk() { Arena a = Arena.over(b); return a; }` is
+                 * the idiomatic factory. Returning a GLOBAL or static hands the
+                 * caller a SECOND owner of state that keeps existing, which is the
+                 * copy this rule is about. Same question, different answer, because
+                 * the source's lifetime is what decides it. */
+                if (unique_resource_name(c->current_func_ret, 0) &&
+                    node->ret.expr && node->ret.expr->kind == NODE_IDENT) {
+                    Symbol *rs = scope_lookup(c->current_scope,
+                        node->ret.expr->ident.name,
+                        (uint32_t)node->ret.expr->ident.name_len);
+                    bool rglobal = rs && (rs->is_static ||
+                        scope_lookup_local(c->global_scope, rs->name,
+                                           rs->name_len) != NULL);
+                    if (rglobal)
+                        checker_error(c, node->loc.line,
+                            "cannot return '%s' by value — it names a global, so the "
+                            "caller becomes a SECOND owner of one buffer / count and "
+                            "the two then hand out the same bytes. Return a pointer, "
+                            "or build a fresh one in the function",
+                            unique_resource_name(c->current_func_ret, 0));
+                }
                 if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
                     if (!report_value_flow_refusal(c, node->ret.expr,
                                                     c->current_func_ret,
@@ -18383,6 +18540,8 @@ static void check_stmt(Checker *c, Node *node) {
                         typemap_set(c, node->spawn_stmt.args[i], param_type);
                     }
                 }
+                reject_unique_resource_copy(c, node->spawn_stmt.args[i], param_type,
+                                            node->loc.line, "pass");
                 if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
                     snprintf(what, sizeof(what), "spawn argument %d", i + 1);
@@ -22820,6 +22979,8 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
             }
+            reject_unique_resource_copy(c, decl->var_decl.init, type,
+                                        decl->loc.line, "initialize");
             if (!value_flows_to(decl->var_decl.init, init, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",

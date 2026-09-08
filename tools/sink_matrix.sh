@@ -360,6 +360,42 @@ cell p20_safe_global_root compile 'u32 g20; void w20(*u32 p){*p=5;} u32 main(){ 
 cell p20_safe_after_join  compile 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=0; *u32 q=&v; ThreadHandle t=spawn w20(q); t.join(); v=v+1; if(v!=6){return 1;} return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p21 (BUG-970): COPYING A UNIQUE RESOURCE — the value-flow SINK axis.
+#
+# Arena / Barrier / Semaphore alias their state when copied, and were refused NOWHERE.
+# Pool / Ring / Slab were refused at exactly ONE site (assignment, BUG-225), which is
+# why every other value-flow spelling stayed open for all six. Crossing TYPE x SINK is
+# what makes that visible.
+#
+# Not a would-be bug: p21_arena_copy_value returned 2 pre-fix, meaning two separate
+# `alloc(T)` calls on the two copies handed out the SAME BYTES.
+#
+# The BOUNDARY is the hard half. A FRESH value is not a copy (`Arena.over(buf)`), and
+# returning a LOCAL by value is a MOVE — the local dies with the frame, so the caller
+# becomes the only owner. Only a copy of something that OUTLIVES the copy is refused,
+# which is why the return sink asks about the source's lifetime and the others do not.
+echo "===== SHAPE p21 = copying a unique resource (type x value-flow sink) ====="
+cell p21_arena_copy_value  reject 'u32 main(){ u8[64] b21; Arena a21=Arena.over(b21); Arena c21=a21; return 0; }'
+cell p21_arena_param       reject 'void tk21(Arena a){ } u32 main(){ u8[64] b21; Arena a21=Arena.over(b21); tk21(a21); return 0; }'
+cell p21_arena_orelse      reject 'u8[64] gb21; Arena ga21; u32 main(){ ga21=Arena.over(gb21); ?Arena n21=null; Arena c21=n21 orelse ga21; return 0; }'
+cell p21_arena_ret_global  reject 'u8[64] gb21; Arena ga21; Arena get21(){ return ga21; } u32 main(){ ga21=Arena.over(gb21); Arena c21=get21(); return 0; }'
+# The copy is INITIALISED here on purpose: without that, the pre-fix compiler rejected
+# this cell via the "barrier never initialised" rule, so it would have passed on a
+# broken compiler and tested nothing. Measured — that is exactly what it did.
+cell p21_barrier_copy      reject 'Barrier gb21b; u32 main(){ @barrier_init(gb21b,1); Barrier c21=gb21b; @barrier_init(c21,1); @barrier_wait(c21); @barrier_wait(gb21b); return 0; }'
+cell p21_semaphore_copy    reject 'Semaphore(1) gs21; u32 main(){ Semaphore(1) c21=gs21; @sem_acquire(c21); @sem_release(gs21); return 0; }'
+cell p21_struct_carrier    reject 'struct C21{Arena a;u32 n;} u32 main(){ u8[64] b21; C21 x; x.a=Arena.over(b21); C21 y=x; return y.n; }'
+cell p21_struct_init_field reject 'struct C21b{Arena a;u32 n;} u8[64] gb21c; Arena ga21c; u32 main(){ ga21c=Arena.over(gb21c); C21b x={.a=ga21c,.n=1}; return x.n-1; }'
+cell p21_pool_param        reject 'struct T21{u32 v;} Pool(T21,4) gp21; void tk21(Pool(T21,4) q){ } u32 main(){ tk21(gp21); return 0; }'
+cell p21_slab_param        reject 'struct T21b{u32 v;} Slab(T21b) gsl21; void tk21(Slab(T21b) q){ } u32 main(){ tk21(gsl21); return 0; }'
+# BOUNDARY: a FRESH resource is not a copy; a LOCAL returned by value is a MOVE; and
+# Barrier/Semaphore pointer params are the remedy the diagnostic actually names.
+cell p21_safe_fresh        compile 'struct T21c{u32 v;} u8[64] gb21d; u8[64] gb21e; u32 main(){ Arena a21=Arena.over(gb21d); *T21c t=a21.alloc(T21c) orelse {return 1;}; t.v=4; a21=Arena.over(gb21e); *T21c u=a21.alloc(T21c) orelse {return 2;}; u.v=5; if(t.v+u.v!=9){return 3;} return 0; }'
+cell p21_safe_local_move   compile 'u8[64] gb21f; Arena mk21(){ Arena a=Arena.over(gb21f); return a; } u32 main(){ Arena a21=mk21(); return 0; }'
+cell p21_safe_ptr_param    compile 'Barrier gb21g; Semaphore(2) gs21b; void tb21(*Barrier b){@barrier_wait(b);} void ts21(*Semaphore s){@sem_acquire(s);@sem_release(s);} u32 main(){ @barrier_init(gb21g,1); tb21(&gb21g); ts21(&gs21b); return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

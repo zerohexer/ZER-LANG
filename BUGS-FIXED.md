@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-970: copying a unique resource made two owners of one buffer
+
+`Arena`, `Barrier` and `Semaphore` alias their state when copied, and were refused
+NOWHERE. `Pool` / `Ring` / `Slab` were refused at exactly ONE site — assignment, BUG-225
+— which is why every other value-flow spelling stayed open for all six.
+
+Not a would-be bug:
+
+```zer
+u8[64] buf; Arena a = Arena.over(buf);
+Arena b = a;
+*T x = a.alloc(T) orelse return;
+*T y = b.alloc(T) orelse return;
+x.v = 1; y.v = 2;
+return x.v;                     // compiled clean, RETURNED 2
+```
+
+Two separate allocations handed out the SAME BYTES.
+
+### One predicate, one reporter, seven sinks
+
+`unique_resource_name(t)` recurses struct/union FIELDS and array elements, so a
+`struct Ctx { Arena a; }` copied whole cannot bypass it — the wrapper-hides-the-inner-kind
+class. `reject_unique_resource_copy` is called from var-decl init, global-var init, call
+argument, orelse fallback, designated-init field, spawn argument and return, each passing
+its own verb.
+
+### The boundary is the hard half — and it is what the single-site rule was avoiding
+
+The old rule tested the TARGET TYPE at one site. That cannot be widened as-is, because
+the same type appears on both sides of a legal construction: `Arena a = Arena.over(buf)`
+is a FRESH resource nobody else owns, not a copy. So the check asks about the VALUE —
+`value_is_existing_resource`: an ident, a field, an index, or either arm of an `orelse`
+names something that keeps existing; a call or literal builds something new.
+
+The RETURN sink is deliberately NARROWER than the other six. Returning a LOCAL by value
+is a MOVE — the local dies with the frame, so the caller becomes the only owner, and
+`Arena mk() { Arena a = Arena.over(b); return a; }` is the idiomatic factory. Returning a
+GLOBAL hands the caller a SECOND owner. Same question, different answer, decided by the
+source's lifetime rather than by the type.
+
+### The remedy differs by type, so the diagnostic had to be measured
+
+The first draft said "pass a pointer ('*Arena')" for everything. Measured: `*Barrier` and
+`*Semaphore` parameters work, and `*Arena` / `*Pool` / `*Slab` / `*Ring` do NOT —
+`a.alloc(T)` through a pointer is "cannot access field 'alloc'". Those four are addressed
+BY NAME and are conventionally global, which is how the whole corpus uses them.
+
+A diagnostic that recommends something that does not compile is worse than one that
+recommends nothing: it sends the reader into a second error and makes them doubt the
+first. The message now branches, and `tests/zer/resource_pointer_param_ok.zer` pins the
+half that works so it cannot silently become wrong again.
+
+### Gate
+
+**SHAPE p21 in `tools/sink_matrix.sh`** — type x value-flow sink, 10 reject + 3 boundary.
+Verified to FIRE: all 10 report HOLE against a build of the commit before the fix, all 3
+boundary cells green on both sides.
+
+`p21_barrier_copy` had to be written with the COPY INITIALISED to discriminate. Without
+that, the pre-fix compiler rejected it through the unrelated "barrier never initialised"
+rule — the cell would have passed on a broken compiler and tested nothing. That is the
+masking trap this file already records, caught this time by running the new cells against
+the old binary rather than by reasoning about them.
+
+Tests: the branch's eight verbatim plus the boundary positives
+`arena_fresh_value_and_pointer_ok` and `resource_pointer_param_ok`.
+
+---
+
 ## Session 2026-09-09 — BUG-969: the scoped-spawn borrow covered one spelling out of six
 
 A scoped `spawn w(&v)` lends `v` to the thread until `th.join()`; a parent write in that

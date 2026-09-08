@@ -1,0 +1,23 @@
+// BUG-970 boundary: the REMEDY the diagnostic names must actually work.
+//
+// Measured while wording that message, and it differs by type — saying the wrong one
+// is worse than saying nothing. `*Barrier` and `*Semaphore` parameters work.
+// `*Arena` / `*Pool` / `*Slab` / `*Ring` do NOT: `a.alloc(T)` through a pointer is
+// "cannot access field 'alloc'". Those four are addressed BY NAME and are
+// conventionally global, which is how the whole corpus uses them — so the message
+// says that for them instead of recommending a pointer that has no methods.
+//
+// The first draft of the diagnostic recommended '*Arena' for everything. This test
+// exists so that cannot silently become wrong again.
+Barrier gb;
+Semaphore(2) gs;
+
+void tb(*Barrier b) { @barrier_wait(b); }
+void ts(*Semaphore s) { @sem_acquire(s); @sem_release(s); }
+
+u32 main() {
+    @barrier_init(gb, 1);
+    tb(&gb);
+    ts(&gs);
+    return 0;
+}

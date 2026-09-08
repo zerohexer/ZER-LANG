@@ -845,3 +845,59 @@ checker.c:checker_walk_guard_sites:NODE_SWITCH:switch_stmt.expr
 checker.c:checker_walk_guard_sites:NODE_VAR_DECL:var_decl.init
 checker.c:checker_walk_guard_sites:NODE_WHILE:while_stmt.body
 checker.c:checker_walk_guard_sites:NODE_WHILE:while_stmt.cond
+
+# BUG-970 (2026-09-09) — checker.c:value_is_existing_resource is a CLASSIFIER, not a
+# walker. It answers one question: "does this expression NAME an object that keeps
+# existing after the binding, or does it BUILD a fresh one?" For every kind listed
+# below the answer is "builds one" (or "cannot appear in a value position"), and that
+# is true REGARDLESS of the children — descending into a NODE_BINARY's operands or a
+# NODE_CALL's arguments would be wrong, not merely unnecessary, because the value they
+# produce is new whatever they were computed from.
+#
+# It recurses only through the four NAMING steps (FIELD, INDEX, SLICE, and both arms of
+# ORELSE), which is what makes the audit treat it as a walker at all. The kinds are
+# enumerated rather than left to a `default:` so that a NEW node kind must be
+# classified by whoever adds it: getting one wrong in the "fresh" direction ACCEPTS a
+# resource copy, and that decision should never be made by omission.
+checker.c:value_is_existing_resource:NODE_ASM:asm_stmt.inputs
+checker.c:value_is_existing_resource:NODE_ASM:asm_stmt.outputs
+checker.c:value_is_existing_resource:NODE_ASSIGN:assign.target
+checker.c:value_is_existing_resource:NODE_ASSIGN:assign.value
+checker.c:value_is_existing_resource:NODE_AWAIT:await_stmt.cond
+checker.c:value_is_existing_resource:NODE_BINARY:binary.left
+checker.c:value_is_existing_resource:NODE_BINARY:binary.right
+checker.c:value_is_existing_resource:NODE_BLOCK:block.stmts
+checker.c:value_is_existing_resource:NODE_CALL:call.args
+checker.c:value_is_existing_resource:NODE_CALL:call.callee
+checker.c:value_is_existing_resource:NODE_CRITICAL:critical.body
+checker.c:value_is_existing_resource:NODE_DEFER:defer.body
+checker.c:value_is_existing_resource:NODE_DO_WHILE:while_stmt.body
+checker.c:value_is_existing_resource:NODE_DO_WHILE:while_stmt.cond
+checker.c:value_is_existing_resource:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:value_is_existing_resource:NODE_FILE:file.decls
+checker.c:value_is_existing_resource:NODE_FOR:for_stmt.body
+checker.c:value_is_existing_resource:NODE_FOR:for_stmt.cond
+checker.c:value_is_existing_resource:NODE_FOR:for_stmt.init
+checker.c:value_is_existing_resource:NODE_FOR:for_stmt.step
+checker.c:value_is_existing_resource:NODE_FUNC_DECL:func_decl.body
+checker.c:value_is_existing_resource:NODE_GLOBAL_VAR:var_decl.init
+checker.c:value_is_existing_resource:NODE_IF:if_stmt.cond
+checker.c:value_is_existing_resource:NODE_IF:if_stmt.else_body
+checker.c:value_is_existing_resource:NODE_IF:if_stmt.then_body
+checker.c:value_is_existing_resource:NODE_INDEX:index_expr.index
+checker.c:value_is_existing_resource:NODE_INTERRUPT:interrupt.body
+checker.c:value_is_existing_resource:NODE_INTRINSIC:intrinsic.args
+checker.c:value_is_existing_resource:NODE_ONCE:once.body
+checker.c:value_is_existing_resource:NODE_RETURN:ret.expr
+checker.c:value_is_existing_resource:NODE_SLICE:slice.end
+checker.c:value_is_existing_resource:NODE_SLICE:slice.start
+checker.c:value_is_existing_resource:NODE_SPAWN:spawn_stmt.args
+checker.c:value_is_existing_resource:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:value_is_existing_resource:NODE_STRUCT_INIT:struct_init.fields
+checker.c:value_is_existing_resource:NODE_SWITCH:switch_stmt.arms
+checker.c:value_is_existing_resource:NODE_SWITCH:switch_stmt.expr
+checker.c:value_is_existing_resource:NODE_TYPECAST:typecast.expr
+checker.c:value_is_existing_resource:NODE_UNARY:unary.operand
+checker.c:value_is_existing_resource:NODE_VAR_DECL:var_decl.init
+checker.c:value_is_existing_resource:NODE_WHILE:while_stmt.body
+checker.c:value_is_existing_resource:NODE_WHILE:while_stmt.cond

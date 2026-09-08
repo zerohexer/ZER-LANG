@@ -959,7 +959,46 @@ Tests: the branch's three verbatim (`slice_len_assign_forge`, `slice_ptr_assign_
 which pins that reads still work AND that a user struct with `len` / `ptr` fields still
 compiles.
 
-**D. Unique-resource COPY-BY-VALUE (their BUG-916) — 8 tests.** `Arena`, `Barrier`
+**D. ~~Unique-resource COPY-BY-VALUE (their BUG-916)~~ — CLOSED 2026-09-09 as
+BUG-970.** DO NOT REDO.
+
+`Arena`, `Barrier` and `Semaphore` alias their state when copied and were refused
+NOWHERE. `Pool` / `Ring` / `Slab` were refused at exactly ONE site (assignment,
+BUG-225), which is why every other value-flow spelling stayed open for all six.
+
+**Not a would-be bug.** `Arena b = a;` then one `alloc(T)` from each compiled clean and
+the two allocations returned the SAME BYTES — the second write overwrote the first
+(measured: exit 2).
+
+Landed as ONE predicate plus ONE reporter at the value-flow sinks:
+`unique_resource_name` (recursing struct/union FIELDS and array elements, so a carrier
+cannot bypass it) and `reject_unique_resource_copy`, called from var-decl init,
+global-var init, call argument, orelse fallback, designated-init field, spawn argument
+and return.
+
+**The boundary is the hard half, and it is what the original single-site rule was
+avoiding.** A FRESH value is not a copy — `Arena.over(buf)` constructs state nobody else
+owns — so the check asks about the VALUE (`value_is_existing_resource`: an ident, field,
+index, or either arm of an `orelse`), not just the target type. And the RETURN sink is
+deliberately NARROWER than the other six: returning a LOCAL by value is a MOVE (the
+local dies with the frame, so the caller becomes the only owner — the idiomatic
+factory), while returning a GLOBAL creates a second owner. Same question, different
+answer, decided by the source's lifetime.
+
+**The remedy differs by type, and the diagnostic says which — measured, not assumed.**
+`*Barrier` / `*Semaphore` parameters work; `*Arena` / `*Pool` / `*Slab` / `*Ring` do NOT
+(`a.alloc(T)` through a pointer is "cannot access field 'alloc'"). Those four are
+addressed BY NAME and are conventionally global. The first draft of the message
+recommended `*Arena` for everything, which would have sent readers into a second error;
+`tests/zer/resource_pointer_param_ok.zer` exists so it cannot silently become wrong
+again.
+
+Gated by **SHAPE p21 in `tools/sink_matrix.sh`** (type x value-flow sink, 10 reject + 3
+boundary). Verified to FIRE: all 10 report HOLE against a build of the commit before the
+fix, and all 3 boundary cells stay green on both sides. Note `p21_barrier_copy` had to
+INITIALISE the copy to discriminate — without that the pre-fix compiler rejected it via
+the unrelated "barrier never initialised" rule, so the cell would have passed on a
+broken compiler and tested nothing. `Arena`, `Barrier`
 and `Semaphore` alias their state when copied:
 
     u8[64] buf; Arena a = Arena.over(buf);
@@ -1115,7 +1154,7 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 ### Suggested order for this branch
 
 ~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
-BUG-969) → **D** → **E** → **B** → **H** → **I**.
+BUG-969) → ~~D~~ (DONE, BUG-970) → **E** → **B** → **H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

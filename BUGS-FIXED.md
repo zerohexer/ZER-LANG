@@ -7,6 +7,79 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-987: the *opaque erasure recorded type_id 0 (harvested from `vigilant-tesla-ef9cao`, their BUG-918)
+
+Cherry-pick of `72aafad`. Measured live on the merged compiler first: the trap test ran to
+completion (a 16-byte read of a 4-byte object) and now exits 133. The three cast sites go
+through the one `emit_cast_value` policy, which now calls `zer_pointee_tid` like the twelve
+intrinsic sites — no aggregate-only chain remains in emitter.c. Their write-up follows.
+Three are silent safety holes of the same shape: **an intrinsic advertises a check that, for
+certain operand types, is not emitted at all.** The third (BUG-987) was found by applying the
+first one's lesson to the sibling intrinsic, and turned out to be the ROOT of it — the
+`*opaque` erasure recorded `type_id = 0`, which does not mean "no id" but "unknown origin,
+a C pointer we cannot vouch for", a claim the compiler had no right to make about a pointer
+whose type it knew. Two are defects where the compiler's own
+### BUG-987 — the ROOT of BUG-985: the `*opaque` erasure recorded a LIE
+
+Found by applying BUG-985's own lesson to the sibling intrinsic. `@ptrcast` is
+compile-time-checked while provenance is known, and falls back to the runtime
+`type_id` the moment the pointer crosses a function boundary — which is the case the
+mechanism exists for. Measured on main:
+
+```zer
+struct Big { u64 a; u64 b; }
+u32 use_as_big(*opaque ctx) { *Big m = @ptrcast(*Big, ctx); return (u32)m.b; }
+u32 main() {
+    u32 raw = 77;
+    *opaque c = @ptrcast(*opaque, &raw);
+    return use_as_big(c);          // 16-byte read of a 4-byte object
+}
+```
+
+**It ran.** ASan: `stack-buffer-overflow, READ of size 8`. With a `*Sensor` origin the
+same program TRAPS correctly, so the two spellings disagreed.
+
+The cause is one level below BUG-985. `_zer_opaque` carries `{ptr, type_id}` and every
+unwrap guards with `type_id != EXPECTED && type_id != 0`, where **0 means "unknown
+origin — a C pointer we cannot vouch for"**, the FFI floor. The WRAP computed an id for
+struct / enum / union only, so erasing any other pointer recorded 0 — and 0 is not
+"no id available", it is a positive claim of ignorance that the compiler had no right
+to make. Every downstream check then compared against 0 and passed.
+
+Unlike BUG-985 this cannot be fixed at the cast site: across the boundary the
+provenance genuinely IS unknown there. It has to be fixed at the ERASURE, by recording
+the truth.
+
+**Fix.** Non-aggregate pointees now get a RESERVED id (`0x7F000000 + kind*256 + width`)
+in a range `next_type_id` — which counts up from 1 — cannot reach. Width-qualified for
+`uN`/`iN`, so `*u21` and `*u48` differ; kind-granular otherwise, so `*u8[4]` and
+`*u8[8]` share one. That coarseness is deliberate and is the SAFE direction: two types
+sharing an id can only FAIL to trap, never trap wrongly. `*opaque` stays 0 — it is the
+one pointee whose origin really is unknown, and collapsing it would start trapping
+legitimate C interop.
+
+**The multi-site half.** The four-line struct/enum/union chain was written out at
+**twelve** sites, which is why one omission became twelve. They all call
+`zer_pointee_tid` now.
+
+**Two ids, not one — the part that needed care.** A DIRECT pointer-to-pointer `@pun` is
+not the dynamic situation: both types are statically known and the checker has already
+ruled (widening rejected by BH-18 #4, forging by BUG-985, everything else deliberately
+allowed). Emitting a runtime trap there would contradict a decision already made and
+would break the byte-view idiom. So `zer_pointee_tid_agg` (aggregate-only) serves the
+direct path and `zer_pointee_tid` (honest) serves the `*opaque` path — two questions,
+two functions. Verified: all four legitimate direct-pun combinations still compile and
+return correct values.
+
+Corpus impact measured by running the suite, not by argument: `make check` exit 0 with
+no test changed, which is the evidence that nothing depended on the vacuous check.
+
+Tests: `tests/zer_trap/ptrcast_opaque_prim_origin_trap.zer` (pre-fix rc=0 and silently
+out of bounds; post-fix traps) and `tests/zer/ptrcast_opaque_roundtrip_ok.zer`, which
+pins the boundary across a primitive, a struct and a `distinct typedef` origin.
+
+---
+
 ## Session 2026-09-08 — BUG-982..986: five holes harvested from branch `vigilant-tesla-ef9cao` (their BUG-913..917)
 
 Adopted by cherry-pick of `021ecaa` (forked at `c8e58304`), renumbered because main already used

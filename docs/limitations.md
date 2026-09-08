@@ -5,14 +5,14 @@ Entries removed once fixed.
 
 ---
 
-# SESSION 2026-08-27b — fresh audit (BUG-913..917), five findings
+# SESSION 2026-08-27b — fresh audit (BUG-913..918), six findings
 
 Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
 trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
 of the intrinsic surface. **`make check` exit 0**, ten gates including the new
 `audit_float_literal.sh`.
 
-Two silent safety holes, both the same shape — **an intrinsic advertises a check that is
+Three silent safety holes, all the same shape — **an intrinsic advertises a check that is
 not emitted for certain operand types**:
 
 | bug | what was silent | consequence measured on main |
@@ -20,6 +20,7 @@ not emitted for certain operand types**:
 | BUG-916 | `@pun`'s runtime `type_id` trap is absent whenever either pointee is a primitive/slice/funcptr (only struct/enum/union carry an id, everything else packs 0 and the comparison folds to false) | an integer became a **working pointer with no `@inttoptr` and no `mmio`** — rc=42 writing through it. Also forged enum / bool / funcptr / slice-`len`. Hosted a wild address hits the SIGSEGV handler, which is `_ZER_HOSTED`-only, so **bare metal is a silent wild access** |
 | BUG-917 | `@inttoptr(*State, addr)` — the FOURTH enum-forging door, in a set documented as closed at three | switch **returned 3** on a register holding 200; zero guard emissions in the generated C |
 | BUG-915 | `@container` had a two-valued provenance domain for a three-valued fact; `&wholeObject` fell into "unknown, allow" | ASan **stack-buffer-underflow** (global source: global-buffer-underflow), no diagnostic, no trap |
+| BUG-918 | the ROOT of BUG-916 — erasing a non-aggregate pointer to `*opaque` recorded `type_id = 0`, which means "unknown origin, a C pointer we cannot vouch for" rather than "no id available" | `@ptrcast(*Big, opaque_from_u32ptr)` **RAN**; ASan stack-buffer-overflow on the 16-byte read of a 4-byte object. The same program with a `*Sensor` origin traps correctly — two spellings disagreeing |
 
 Plus two defects where the COMPILER'S OWN OUTPUT is invalid C, so the user sees a GCC
 error against their own `.zer` line and no ZER diagnostic ever names the cause: a
@@ -27,13 +28,22 @@ non-finite float literal emitted as the bare token `inf` (BUG-913, five sites, n
 helper + a gate), and the float-to-int saturation guard emitted as a statement expression
 at file scope (BUG-914).
 
-**Method note worth keeping.** Every one of the five was found by PROBING the intrinsic
+**Method note worth keeping.** Every one of the six was found by PROBING the intrinsic
 surface for "what does this actually do", not by reading for suspicious code. Three of the
 five were sitting next to a comment that already described the hazard — BH-18 #4's own
 text says *"the runtime type_id trap is skipped for an in-ZER primitive pointer ... so the
 OOB is SILENT"*, and it fixed only the out-of-bounds half. **When a fix's rationale
 describes a mechanism as broken, check whether the fix covered every consequence of that
-mechanism or only the one that was reported.**
+mechanism or only the one that was reported.** BUG-918 came from a second habit worth
+keeping: **after fixing one intrinsic, run the same probe against its siblings.** `@pun`
+and `@ptrcast` share the `_zer_opaque` mechanism, and the sibling turned out to hold the
+root cause.
+
+**A sentinel that means two things is a hole waiting to happen.** `type_id == 0` carried
+both "no id available for this kind" and "unknown origin — the FFI floor". The first is a
+compiler limitation; the second is a positive claim that disables a check. Twelve sites
+produced the first while the single reader interpreted it as the second. When a fix
+introduces a sentinel, write down which of those it is.
 
 ## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (LOW, unmeasured)
 

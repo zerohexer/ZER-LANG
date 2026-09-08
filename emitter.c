@@ -24,6 +24,38 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
+/* BUG-983: render a `double` as a VALID C floating constant.
+ *
+ * `%.17g` is round-trip exact for every FINITE double, and was used verbatim at
+ * FIVE emission sites. It is wrong for the three non-finite values: glibc prints
+ * `inf` / `-inf` / `nan`, none of which is a C token. So a ZER program containing
+ * a float literal that overflows the double range —
+ *
+ *     f64 x = 1e400;          // strtod -> +inf
+ *
+ * emitted `_zer_t0 = inf;`, and the user got GCC's *"'inf' undeclared"* pointing
+ * at their own `.zer` line via `#line`. Compile-time and runtime both "miss" it
+ * in the sense that matters here: no ZER diagnostic ever names the real problem,
+ * and the failure is attributed to the C layer the user never wrote.
+ *
+ * `__builtin_inf()` / `__builtin_nan("")` are GCC constants: usable in a STATIC
+ * INITIALIZER (so the global-scope site works), available under `-ffreestanding`
+ * (so bare-metal works), and exact. ZER emits GCC-only C already (statement
+ * expressions, `__auto_type`, `__attribute__`), so this adds no new dependency.
+ *
+ * ONE helper, not five spellings — the same multi-site discipline the rest of
+ * this file follows. A new float-emitting site must call this, never `%.17g`;
+ * `tools/audit_float_literal.sh` fails the build on a raw one. */
+static void emit_double_lit(Emitter *e, double v) {
+    /* NaN first: every comparison against NaN is false, so an `isnan`-last
+     * ordering would fall through to `%.17g` and print `nan`. Same reason the
+     * float->int saturation guard tests NaN first (BUG-883). */
+    if (v != v) { emit(e, "__builtin_nan(\"\")"); return; }
+    if (v > 1.7976931348623157e308) { emit(e, "__builtin_inf()"); return; }
+    if (v < -1.7976931348623157e308) { emit(e, "(-__builtin_inf())"); return; }
+    emit(e, "%.17g", v);
+}
+
 /* emit a user-defined type name with optional module prefix for namespace mangling.
  * If prefix is set: emits "prefix_name". If NULL: emits "name". */
 static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
@@ -1057,6 +1089,32 @@ static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
     default: break;
     }
 }
+/* The four saturation limits, as C constant-expression text. Extracted so the
+ * statement-expression form (emit_f2i_close) and the CONSTANT form
+ * (emit_f2i_const) cannot drift apart — the bounds ARE the safety property, and
+ * two copies of them is the multi-site shape this codebase keeps getting bitten
+ * by. `n` is the size of EACH buffer (all four are the same size at every call). */
+static void f2i_limits(int bits, bool sg, char *lo, char *hi, char *mn, char *mx,
+                       size_t n) {
+    if (sg) {
+        snprintf(lo, n, "-0x1p%d - 1.0", bits - 1);
+        snprintf(hi, n, "0x1p%d", bits - 1);
+        if (bits == 64) {
+            snprintf(mn, n, "(-9223372036854775807LL - 1)");
+            snprintf(mx, n, "9223372036854775807LL");
+        } else {
+            snprintf(mn, n, "(-(1LL << %d))", bits - 1);
+            snprintf(mx, n, "((1LL << %d) - 1)", bits - 1);
+        }
+    } else {
+        snprintf(lo, n, "-1.0");
+        snprintf(hi, n, "0x1p%d", bits);
+        snprintf(mn, n, "0");
+        if (bits == 64) snprintf(mx, n, "18446744073709551615ULL");
+        else            snprintf(mx, n, "((1ULL << %d) - 1ULL)", bits);
+    }
+}
+
 /* Emits `({ <srcT> _v = ` — caller emits the source, then calls _close. */
 static void emit_f2i_open(Emitter *e, Type *src, int tmp) {
     emit(e, "({ ");
@@ -1087,23 +1145,7 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
      * representable value is ever clamped. */
     if (bits > 0 && bits <= 64) {
         char lo[64], hi[64], mn[64], mx[64];
-        if (sg) {
-            snprintf(lo, sizeof lo, "-0x1p%d - 1.0", bits - 1);
-            snprintf(hi, sizeof hi, "0x1p%d", bits - 1);
-            if (bits == 64) {
-                snprintf(mn, sizeof mn, "(-9223372036854775807LL - 1)");
-                snprintf(mx, sizeof mx, "9223372036854775807LL");
-            } else {
-                snprintf(mn, sizeof mn, "(-(1LL << %d))", bits - 1);
-                snprintf(mx, sizeof mx, "((1LL << %d) - 1)", bits - 1);
-            }
-        } else {
-            snprintf(lo, sizeof lo, "-1.0");
-            snprintf(hi, sizeof hi, "0x1p%d", bits);
-            snprintf(mn, sizeof mn, "0");
-            if (bits == 64) snprintf(mx, sizeof mx, "18446744073709551615ULL");
-            else            snprintf(mx, sizeof mx, "((1ULL << %d) - 1ULL)", bits);
-        }
+        f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
         emit(e, "; (_zer_f2i%d != _zer_f2i%d) ? (", tmp, tmp);
         emit_type(e, tgt); emit(e, ")0 : (_zer_f2i%d <= (%s)) ? (", tmp, lo);
         emit_type(e, tgt); emit(e, ")%s : (_zer_f2i%d >= (%s)) ? (", mn, tmp, hi);
@@ -1119,8 +1161,7 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
     emit(e, ")_zer_f2i%d; })", tmp);
 }
 
-/* ================================================================
- * CAST EMISSION — ONE POLICY, THREE CALL SITES  (BUG-979, 2026-09-02)
+/* ========================================================= * CAST EMISSION — ONE POLICY, THREE CALL SITES  (BUG-979, 2026-09-02)
  * ================================================================
  *
  * A `(T)x` cast is emitted from THREE places, and the policy had been copied
@@ -1218,6 +1259,53 @@ static CastForm classify_cast(Type *src_eff, Type *tgt_eff) {
 static void emit_cast_operand(Emitter *e, const CastOperand *op);
 static void emit_cast_value(Emitter *e, const CastOperand *op,
                             Type *src_eff, Type *tgt, Type *tgt_eff);
+
+/* BUG-982: the same saturation as a C CONSTANT EXPRESSION — no statement
+ * expression, so it is legal in a STATIC INITIALIZER.
+ *
+ *     u32 g = (u32)1e20;
+ *
+ * is a legal ZER global, and the checker accepts it, but the emitter reached the
+ * BUG-883 guard through the AST path and wrote `uint32_t g = ({ ... });` at file
+ * scope. GCC then said *"braced-group within expression allowed only inside a
+ * function"*, pointing (via `#line`) at the user's own `.zer` line. The ZER
+ * program is correct; only the emission shape was illegal there. Same class as
+ * the `inf` literal above: the compiler's own output is what fails, and no ZER
+ * diagnostic ever names the cause.
+ *
+ * The operand is emitted FOUR times, so this form is used ONLY when re-evaluating
+ * it is free and observationally identical: no side effects (`expr_has_side_effects`)
+ * and not volatile (`expr_is_volatile` — a repeated MMIO read is a hardware event,
+ * not a free re-read). A global initializer is a constant expression by the
+ * checker's own rule, so it always qualifies; anything that does not qualify keeps
+ * the statement-expression form, which is only reachable inside a function where
+ * that form is legal.
+ *
+ * Bounds come from the SAME `f2i_limits` the statement form uses — one source of
+ * truth for the four limits. */
+static bool emit_f2i_const(Emitter *e, Type *tgt, Node *operand) {
+    int bits; bool sg;
+    f2i_bounds(tgt, &bits, &sg);
+    if (bits <= 0 || bits > 64) return false;      /* u128/i128 — trap form only */
+    if (!operand) return false;
+    if (expr_has_side_effects(operand) || expr_is_volatile(e, operand)) return false;
+
+    char lo[64], hi[64], mn[64], mx[64];
+    f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
+    #define F2I_OP() do { emit(e, "("); emit_expr(e, operand); emit(e, ")"); } while (0)
+    emit(e, "(");
+    F2I_OP(); emit(e, " != "); F2I_OP(); emit(e, " ? (");
+    emit_type(e, tgt); emit(e, ")0 : ");
+    F2I_OP(); emit(e, " <= (%s) ? (", lo);
+    emit_type(e, tgt); emit(e, ")%s : ", mn);
+    F2I_OP(); emit(e, " >= (%s) ? (", hi);
+    emit_type(e, tgt); emit(e, ")%s : (", mx);
+    emit_type(e, tgt); emit(e, ")");
+    F2I_OP();
+    emit(e, ")");
+    #undef F2I_OP
+    return true;
+}
 
 /* BUG-851: five emitter GIVE-UP paths emitted a comment plus a placeholder when the
  * emitter reached a shape it could not lower. Not a live bug — a live RISK, of exactly
@@ -1756,7 +1844,7 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_FLOAT_LIT:
-        emit(e, "%.17g", node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value);
         break;
 
     case NODE_STRING_LIT:
@@ -2394,7 +2482,7 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             /* Comptime float return — emit double literal */
             if (node->call.is_comptime_float) {
-                emit(e, "%.17g", node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value);
                 break;
             }
             Type *ct = checker_get_type(e->checker, node);
@@ -6615,6 +6703,13 @@ static void emit_cast_value(Emitter *e, const CastOperand *op,
         emit(e, "))");
         break;
     case CASTF_F2I: {
+        /* BUG-982: the AST operand is the GLOBAL-INITIALIZER path, where a
+         * statement expression is illegal C (`u32 g = (u32)1e20;` failed in
+         * GCC with "braced-group within expression allowed only inside a
+         * function"). Prefer the constant-expression form there; it declines
+         * an operand that cannot be re-evaluated (side effects, volatile),
+         * which cannot occur in a constant initializer. */
+        if (op->kind == CASTOP_AST && emit_f2i_const(e, tgt, op->expr)) break;
         int tmp = e->temp_count++;
         emit_f2i_open(e, src_eff, tmp);
         emit_cast_operand(e, op);
@@ -7030,7 +7125,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
-        emit(e, "%.17g", node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value);
         return;
     case NODE_BOOL_LIT:
         emit(e, "%d", node->bool_lit.value ? 1 : 0);
@@ -8031,7 +8126,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 return;
             }
             if (node->call.is_comptime_float)
-                emit(e, "%.17g", node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value);
             else
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
@@ -12651,7 +12746,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 break;
             }
             case 1: /* float */
-                emit(e, "%.17g", inst->literal_float);
+                emit_double_lit(e, inst->literal_float);
                 break;
             case 2: /* string */
                 /* sizeof("...") - 1 so C resolves escapes; source-char

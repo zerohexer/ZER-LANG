@@ -1,0 +1,13 @@
+// BUG-993: `null` into a value-optional struct field must build the ABSENT optional
+// at every struct-init site (var-decl init, assignment); it was emitted as { 0, 1 }.
+struct S { u32 f; ?u32 n; ?*u32 p; }
+u32 main() {
+    S t = { .f = 1, .n = null, .p = null };
+    if (t.n) |v| { return 1 + v; }
+    if (t.p) |q| { return 2 + *q; }
+    S u = { .f = 2 };
+    if (u.n) |v| { return 3 + v; }
+    t = { .f = 3, .n = null };
+    if (t.n) |v| { return 4 + v; }
+    return 0;
+}

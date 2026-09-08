@@ -95,7 +95,6 @@ a5fa354db7afd8d8  reference.md:3106
 a2d212648a84bea1  reference.md:3116
 3674a4d42fd5a947  reference.md:3134
 6c6f217dfa4c2874  reference.md:3147
-3c4361ded12b0d87  reference.md:3180
 8593d17a2cd3b65f  reference.md:3226
 234f52e2805d4d61  reference.md:3277
 af4c920a8953b104  reference.md:3316
@@ -107,3 +106,7 @@ d54d84941e077f48  reference.md:3465
 40b2571e361cc858  reference.md:3593
 95f5145d30a07c57  reference.md:3602
 fdba85d6406e565e  reference.md:3618
+# Handle SYNOPSIS: a one-line fragment naming a `pool` the block never declares,
+# outside any function — illustrative, not a program (re-baselined 2026-09-08 after
+# the row was dropped by mistake; the block never compiled on its own).
+84297a2431669274  reference.md:1758

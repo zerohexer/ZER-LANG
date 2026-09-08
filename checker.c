@@ -1269,7 +1269,11 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             if (val > 0xFFFFFFFFULL) return false;
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
         case TYPE_I64:
-            return true;  /* val is uint64, positive literal fits in i64 */
+            /* BUG-991: the lexer yields a uint64, and 9223372036854775808 (2^63)
+             * is a valid uint64 that is NOT an i64 — it was accepted and stored
+             * as INT64_MIN (measured: `if (v < 0)` was true). Same "no implicit
+             * narrowing" rule every narrower type already applies. */
+            return val <= (uint64_t)INT64_MAX;
         /* Path C: arbitrary-width int — fits if within the width's max */
         case TYPE_UINT: {
             uint32_t _b = effective->intn.bits;
@@ -1307,7 +1311,7 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I8:    return val <= 128;
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
-            case TYPE_I64:   return true;
+            case TYPE_I64:   return val <= 9223372036854775808ULL;   /* BUG-991: -2^63 fits, -2^63-1 does not */
             /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
             case TYPE_SINT: {
                 uint32_t _b = effective->intn.bits;
@@ -8788,6 +8792,21 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_numeric(target) || !type_is_numeric(value)) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
+            }
+            /* BUG-990: the SAME class rule the binary form applies. `x = x + f`
+             * (u32 x, f32 f) is refused by common_numeric_type ("cannot mix
+             * integer and float"), but `x += f` passed the numeric check above
+             * and was emitted as C `x += f` — an implicit float->int truncation
+             * with no diagnostic (measured: 5 += 1.5 gave 6). Two spellings of
+             * one operation must decide alike. */
+            else if (type_is_integer(target) != type_is_integer(value) ||
+                     type_is_float(target) != type_is_float(value)) {
+                char tn[96];
+                snprintf(tn, sizeof(tn), "%s", type_name(target));
+                checker_error(c, node->loc.line,
+                    "cannot mix integer and float in a compound assignment ('%s' with "
+                    "'%s') — convert explicitly, as the binary form requires",
+                    tn, type_name(value));
             }
             /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
             if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
@@ -24220,6 +24239,18 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 /* BUG-939: retype wherever a constant FLOWS — see the assignment sink. */
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
+            }
+            /* BUG-992: a DESIGNATED INITIALIZER at global scope. check_expr types
+             * a bare `{ .f = 5 }` as `void` (its type comes from the CONTEXT), and
+             * the local var-decl path recovers that through validate_struct_init —
+             * this pass did not, so every global `S s = { .f = 5 };` was refused
+             * with "cannot initialize 's' of type 'S' with 'void'". Same query,
+             * same recording, as the local site. */
+            if (ginit->kind == NODE_STRUCT_INIT && type) {
+                if (validate_struct_init(c, ginit, type, decl->loc.line)) {
+                    init = type;
+                    typemap_set(c, ginit, type);
+                }
             }
             if (!value_flows_to(c, decl->var_decl.init, init, type)) {
                 char what[96];

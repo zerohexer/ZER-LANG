@@ -241,6 +241,14 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
  * Used for T → ?T wrapping at assignment, var-decl init.
  * opt_type is the target optional type (may be distinct). */
 static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
+    /* BUG-993: `null` into a value-optional field. The wrap below builds
+     * `{ <value>, 1 }`, and a NULL literal emits as `0`, so `{ .n = null }`
+     * became `{ 0, 1 }` — a PRESENT optional holding 0. Measured: `if (s.n)
+     * |v|` took the branch. A null is the absent optional; emit that. */
+    if (value_expr && value_expr->kind == NODE_NULL_LIT) {
+        emit_opt_null_literal(e, opt_type);
+        return;
+    }
     emit(e, "(");
     emit_type(e, opt_type);
     emit(e, "){ ");
@@ -3579,9 +3587,12 @@ static void emit_expr(Emitter *e, Node *node) {
 
     case NODE_STRUCT_INIT: {
         /* Designated initializer: emit as C99 compound literal (Type){ .x = 1 }
-         * Works in both var-decl init and assignment contexts. */
+         * Works in both var-decl init and assignment contexts.
+         * BUG-992: at FILE scope (a global's initializer) a compound literal is
+         * not a C constant expression — emit the brace list alone, which is the
+         * one form C99 accepts there; the declaration supplies the type. */
         Type *si_type = checker_get_type(e->checker, node);
-        if (si_type) {
+        if (si_type && e->global_init_depth == 0) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
@@ -10799,7 +10810,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *fv_type = checker_get_type(e->checker, fval);
             Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len, fv_type);
             Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
-            if (wt) {
+            if (wt && fval && fval->kind == NODE_NULL_LIT) {
+                /* BUG-993 (IR twin of emit_opt_wrap_value): `null` is the ABSENT
+                 * optional, not `{ 0, 1 }`. */
+                emit_opt_null_literal(e, wt);
+            } else if (wt) {
                 emit(e, "(");
                 emit_type(e, wt);
                 emit(e, "){ ");
@@ -13093,7 +13108,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
                                                          fname_len, vt);
                     Type *vte = vt ? type_unwrap_distinct(vt) : NULL;
-                    if (wt) {
+                    Node *fval_ast = inst->expr->struct_init.fields[i].value;
+                    if (wt && fval_ast && fval_ast->kind == NODE_NULL_LIT) {
+                        /* BUG-993 (third site — the var-decl DECOMP path): the
+                         * null literal was lowered into a `0` temp, so the wrap
+                         * below built `{ 0, 1 }`, a PRESENT optional. The AST
+                         * field value still says `null`; emit the absent one. */
+                        emit_opt_null_literal(e, wt);
+                    } else if (wt) {
                         emit(e, "(");
                         emit_type(e, wt);
                         emit(e, "){ ");

@@ -7,6 +7,56 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-990..993: four found by probing after the harvests (two silent miscompiles)
+
+Probes written against the merged compiler while the harvest `make check` ran; each judged by
+its diagnostic and then by RUNNING the accepted program.
+
+### BUG-990 — `x += f` (integer target, float value) compiled and truncated silently
+`x = x + f` is refused by `common_numeric_type` ("cannot mix integer and float"); the compound
+spelling passed the "both numeric" check in the NODE_ASSIGN handler and emitted C `x += f`.
+Measured: `u32 x = 5; f32 f = 1.5; x += f;` returned 6, no diagnostic. Two spellings of one
+operation must decide alike — the compound path now applies the same class rule.
+Test: `tests/zer_fail/compound_assign_int_float.zer`.
+
+### BUG-991 — `i64 v = 9223372036854775808;` accepted, stored INT64_MIN
+`is_literal_compatible` answered `return true` for every positive literal into `i64` ("val is
+uint64, positive literal fits") — false for 2^63..2^64-1. The negated form had the same hole
+(`-9223372036854775809` accepted, wrapped). Measured: `if (v < 0)` was true. Both arms now
+bound-check exactly; INT64_MAX / INT64_MIN / `u64 = 2^63` pinned by
+`tests/zer/i64_literal_boundary_ok.zer`. Tests: `tests/zer_fail/i64_literal_overflow.zer`,
+`tests/zer_fail/i64_negative_literal_overflow.zer`.
+
+### BUG-992 — a designated initializer at GLOBAL scope was refused for ANY field type
+The limitations entry from 2026-09-06 (`S s = { .f = 5 };` → "cannot initialize 's' of type
+'S' with 'void'"). Root cause exactly as the entry guessed: `check_expr(NODE_STRUCT_INIT)`
+yields `void` (its type comes from the CONTEXT), the local var-decl path recovers that through
+`validate_struct_init`, and the pass-2 global-initializer check did not. Same query, same
+recording, added there. The emitter half: a compound literal `(S){ ... }` is not a C constant
+expression at file scope, so under `global_init_depth > 0` the brace list is emitted alone.
+Test: `tests/zer/global_designated_init.zer` — plain, optional set, optional `null`, omitted,
+nested struct, `const`, plus the local and assignment forms.
+
+### BUG-993 — `{ .n = null }` into a value-optional field built a PRESENT optional
+Found by the BUG-992 test: `?u32 n` given `null` emitted `{ 0, 1 }` — `has_value = 1` with
+value 0 — so `if (s.n) |v|` took the branch. Measured on a LOCAL declaration too, so this was
+a pre-existing silent miscompile at every struct-init site, not a global-scope one. The
+optional wrap (`{ <value>, 1 }`) was written at THREE emitter sites — `emit_opt_wrap_value`
+(AST path), `emit_rewritten_node` NODE_STRUCT_INIT (assignment) and the `IR_STRUCT_INIT_DECOMP`
+handler (var-decl init, where the null literal had already been lowered into a `0` temp and only
+the retained AST still says `null`). All three now emit the absent optional for a `null`
+literal. Test: `tests/zer/struct_init_optional_null.zer`.
+
+### A build lesson re-learned, recorded so it is not re-learned a fourth time
+The first `make check` after the harvests reported 17 semantic-fuzz "expected rejection but
+compiled OK" failures that did NOT reproduce on a clean rebuild (60/60 rejections). Cause: the
+`ef9cao` cherry-pick added `Type.struct_type.uses_condvar` (a STRUCT LAYOUT change in
+`types.h`) and the build was a plain `make zerc` — the Makefile has no header dependencies, so
+the result was the MIXED-ABI binary CLAUDE.md already describes. `rm -f *.o src/safety/*.o`
+after ANY header change, including one that arrives by cherry-pick.
+
+---
+
 ## Session 2026-09-08 — BUG-988..989: two more from `vigilant-tesla-ef9cao` (their BUG-920/921), plus its closure-probe and reference fixes
 
 Cherry-picks of `f090c32`, `fbdcb1e`, `e8bcd23` (the grammar-closure probe printed OK on a

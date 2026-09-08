@@ -835,7 +835,11 @@ leaking it"*.)
 
 ---
 
-## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
+## CLOSED 2026-09-08 (BUG-992; found BUG-993 alongside) — a DESIGNATED INITIALIZER at GLOBAL scope
+
+**Fixed exactly as the entry below predicted (one missing `validate_struct_init` on the pass-2 global path) plus the emitter's file-scope brace-list form; tripwire `tests/zer/global_designated_init.zer`. Kept as the record.**
+
+### (original entry)
 
 Found while measuring item J's sinks; not reported by any branch, and NOT
 optional-specific — it was checked against a plain field precisely to find out.

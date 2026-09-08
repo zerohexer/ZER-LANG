@@ -4062,15 +4062,26 @@ static_assert(Color.red == 0, "red is 0");
 ### Designated Initializers
 
 **DESCRIPTION**
-Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, and return.
+Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, return, and at GLOBAL scope (where the initializer is emitted as a C constant brace list, so every field value must itself be a compile-time constant).
 
 **SYNTAX**
 ```zer
-Point p = { .x = 10, .y = 20 };
-p = { .x = 100, .y = 200 };
-func({ .x = 1, .y = 2 });
+struct Point { u32 x; u32 y; }
+struct Cfg { u32 baud; ?u32 parity; ?u32 stop; Point origin; }
+Cfg g_cfg = { .baud = 9600, .parity = 7, .stop = null, .origin = { .x = 1, .y = 2 } };
+void func(Point q) { }
 Point make() { return { .x = 0, .y = 0 }; }
+u32 main() {
+    Point p = { .x = 10, .y = 20 };
+    p = { .x = 100, .y = 200 };
+    func({ .x = 1, .y = 2 });
+    return 0;
+}
 ```
+
+**NOTES**
+- A value-optional field (`?u32`) given a scalar is wrapped as a PRESENT optional; given `null` it is the ABSENT optional (`if (g_cfg.stop) |v|` does not fire). This holds at every site — var-decl init, assignment, the global form.
+- Nested `{ ... }` for a struct-typed field takes the field's type as its context.
 
 ---
 
@@ -4263,6 +4274,15 @@ cinclude
 ### Arithmetic
 `+  -  *  /  %` — All integer overflow wraps (never UB).
 
+Integer and float operands never mix: `x + f` (u32 x, f32 f) is a compile error
+("cannot mix integer and float"), and so is the compound spelling `x += f` — the
+two forms decide alike. Convert explicitly (`(f32)x + f`, or `@saturate(u32, f)`).
+
+An integer literal must fit its target type exactly — there is no implicit
+narrowing, and that includes the 64-bit boundary: `i64 v = 9223372036854775808;`
+(2^63) is rejected, `i64 v = -9223372036854775808;` and `u64 v = 9223372036854775808;`
+are accepted.
+
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
 This covers negative shift counts too: a signed count that is negative
@@ -4290,6 +4310,10 @@ is still a hard error when the index is provably out of range.
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
+A compound operator obeys every rule the binary form does: no integer/float
+mixing, no narrowing without `@truncate`, `/=` and `%=` need a proven-nonzero
+divisor, and the bitwise forms need integer operands.
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8
@@ -4308,9 +4332,11 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- pointer arithmetic (`p + 1`) — index (`p[1]` on a `[*]T`) or `@ptrtoint`/`@inttoptr` under an `mmio` declaration
+- `->` — field access is `.` through values, pointers and Handles alike
+
+(C-style casts `(T)x` and `goto`/labels ARE in ZER — see "(Type)expr — C-Style Cast" and "goto + labels".)
 
 ---
 

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot mix integer and float in a compound assignment
+// BUG-990: `x = x + f` was refused ("cannot mix integer and float") but the
+// compound spelling `x += f` passed the numeric check and emitted a C `+=`
+// that truncated the float silently (5 += 1.5 gave 6).
+u32 main() {
+    u32 x = 5;
+    f32 f = 1.5;
+    x += f;
+    return x;
+}

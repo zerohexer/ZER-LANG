@@ -156,6 +156,14 @@ emission (typically `/* @intrinsic_name */ 0`) that segfaults at runtime:
 When adding a new intrinsic, mirror the existing handler (e.g., `@ptrcast`,
 `@pun`) in both locations. Verify by searching `grep -n '"intrinsic_name"' emitter.c` and confirming TWO hits.
 
+**A `defer` body is IR (refactor L, 2026-09-08).** `NODE_DEFER` lowers the body ONCE into
+a detached template and every fire splices a clone (`materialise_defers`, ir_lower.c), so a
+statement inside a defer body is handled by the SAME lowering, emission and zercheck path as
+anywhere else — do NOT add a defer-body arm to `emit_defer_stmt` or an AST scan to
+`zercheck_ir.c` for a new construct. `emit_defer_stmt` survives for ONE shape only (a body
+under the both-reachable cleanup-label guard); `defer_body_ast_emittable` says which bodies
+may take it. Full model: compiler-internals.md "Refactor L".
+
 **`type_name()` uses 2-buffer rotation (types.c:518-523).** Calling
 `type_name(t)` 3+ times in a single `printf`/`checker_error` overwrites
 earlier results because there are only TWO static buffers. Symptoms: error

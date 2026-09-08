@@ -2656,74 +2656,8 @@ static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
     return NULL;
 }
 
-/* Is there REAL WORK reachable after this defer fire?
- *
- * The discriminator between a BLOCK-scoped fire (mid-function, whose frees must
- * be applied in the forward pass so a later use is checked against them) and the
- * FUNCTION-EXIT fire (which Phase C3 already handles correctly at return blocks,
- * including the LIFO use/free interleave).
- *
- * Measured IR:
- *   block-scoped   bb3: DEFER_FIRE          -> bb4: DEFER_FIRE, CALL use, RETURN
- *   function-exit  bb1: DEFER_FIRE          -> bb3: DEFER_FIRE, RETURN
- * so "anything after the fire that is not defer bookkeeping / control flow"
- * separates them exactly.
- *
- * This matters because applying frees at a function-exit fire BREAKS the LIFO
- * contract: `defer free(p); defer use_it(p);` fires the USE first (against a
- * still-alive p), and a forward-pass free made C3's deferred-use scan report a
- * false use-after-free (tests/zer/defer_lifo_safe, defer_free_pattern_ok).
- * C3 owns that ordering; this only covers what C3 cannot see. */
-static bool ir_fire_has_work_after(IRFunc *func, IRInst *fire) {
-    if (!func || !fire) return false;
-    /* locate the fire by pointer — the walker does not carry its index */
-    int start_block = -1, start_inst = -1;
-    for (int bi0 = 0; bi0 < func->block_count && start_block < 0; bi0++) {
-        IRBlock *bb0 = &func->blocks[bi0];
-        for (int ii0 = 0; ii0 < bb0->inst_count; ii0++) {
-            if (&bb0->insts[ii0] == fire) { start_block = bi0; start_inst = ii0; break; }
-        }
-    }
-    if (start_block < 0) return false;
-    int seen_cap = func->block_count > 0 ? func->block_count : 1;
-    char *seen = (char *)calloc((size_t)seen_cap, 1);
-    if (!seen) return false;
-    int *stack = (int *)malloc((size_t)seen_cap * sizeof(int));
-    if (!stack) { free(seen); return false; }
-    int sp = 0;
-    bool found = false;
-    int bi = start_block, from_inst = start_inst + 1;
-    for (;;) {
-        if (bi >= 0 && bi < func->block_count && !seen[bi]) {
-            if (from_inst == 0) seen[bi] = 1;   /* only mark on a full visit */
-            IRBlock *bb = &func->blocks[bi];
-            for (int ii = from_inst; ii < bb->inst_count && !found; ii++) {
-                IROpKind op = bb->insts[ii].op;
-                if (op == IR_DEFER_FIRE || op == IR_DEFER_PUSH ||
-                    op == IR_GOTO || op == IR_RETURN || op == IR_BRANCH) continue;
-                found = true;
-            }
-            if (found) break;
-            /* IRBlock records PREDS, not succs — derive the successors of `bi`
-             * by finding every block that lists `bi` as a predecessor. */
-            for (int sb = 0; sb < func->block_count && sp < seen_cap; sb++) {
-                if (seen[sb]) continue;
-                IRBlock *cand = &func->blocks[sb];
-                for (int pi = 0; pi < cand->pred_count; pi++) {
-                    if (cand->preds[pi] == bi) { stack[sp++] = sb; break; }
-                }
-            }
-        }
-        if (sp == 0) break;
-        bi = stack[--sp];
-        from_inst = 0;
-    }
-    free(stack); free(seen);
-    return found;
-}
-
-/* PUSH-order index of a defer body, using the SAME ordering Phase C3 builds its
- * dfs[] with (every IR_DEFER_PUSH, block order then instruction order). Returns
+/* PUSH-order index of a defer body (every IR_DEFER_PUSH, block order then
+ * instruction order). Returns
  * index+1 as the per-defer instance id — 0 means "not found", matching C3's
  * convention where 0 is reserved for "freed by something other than a defer".
  *
@@ -2733,17 +2667,31 @@ static bool ir_fire_has_work_after(IRFunc *func, IRInst *fire) {
  * defer. */
 static int ir_defer_instance_id(IRFunc *func, Node *body) {
     if (!func || !body) return 0;
-    int k = 0;
+    /* Refactor L: the id is assigned at lowering (IRInst.defer_id on the PUSH)
+     * and stamped on every instruction of the defer's spliced clones, so a free
+     * performed by the body ON THIS PATH carries the same id the label-guarded
+     * AST scan of the same defer compares against. */
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
         for (int ii = 0; ii < bb->inst_count; ii++) {
             IRInst *in = &bb->insts[ii];
             if (in->op != IR_DEFER_PUSH || !in->defer_body) continue;
-            if (in->defer_body == body) return k + 1;
-            k++;
+            if (in->defer_body == body) return in->defer_id;
         }
     }
     return 0;
+}
+
+/* Refactor L: record which defer's clone performed this free (0 = explicit),
+ * on the handle and its alias group. See IRInst.defer_id. */
+static void ir_stamp_defer_free(IRPathState *ps, IRHandleInfo *h, IRInst *inst) {
+    if (!h || !inst) return;
+    h->freed_defer_id = inst->defer_id;
+    if (h->alloc_id != 0) {
+        for (int ai = 0; ai < ps->handle_count; ai++)
+            if (ps->handles[ai].alloc_id == h->alloc_id)
+                ps->handles[ai].freed_defer_id = inst->defer_id;
+    }
 }
 
 /* Walk a defer body. For each free found, resolve the argument to a
@@ -3845,6 +3793,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             }
             h->state = IR_HS_FREED;
             h->free_line = inst->source_line;
+            ir_stamp_defer_free(ps, h, inst);   /* refactor L */
 
             /* Mark aliases (bare or compound) with same alloc_id as FREED —
              * handled uniformly via ir_propagate_alias_state. */
@@ -5602,6 +5551,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * the IR_CALL entry point below. */
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        ir_stamp_defer_free(ps, h, inst);   /* refactor L */
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
                     }
@@ -6028,6 +5978,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         h->state = IR_HS_FREED;
                         h->free_line = inst->source_line;
+                        ir_stamp_defer_free(ps, h, inst);   /* refactor L */
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
                     }
@@ -6476,17 +6427,28 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * Return values are computed BEFORE their fire in IR order, so
          * `defer free(h); return h.field;` is unaffected (pinned by a positive
          * test). */
+        /* Refactor L (2026-09-08): a fire's bodies are REAL CFG BLOCKS, spliced
+         * by ir_lower before this instruction, so the ordinary forward pass
+         * already applied their frees and checked their uses on exactly the
+         * paths that run them. What is left for the AST scan is the one body
+         * ir_lower kept on the emitter's raw-AST path — a both-reachable
+         * cleanup-label body under the runtime guard (defer_fire_ast[i]) — and
+         * it is processed here in LIFO order, uses then frees per body, the
+         * same interleave the old function-exit pass (Phase C3) used. */
         if (inst->src2_local != 2 && inst->defer_fire_bodies &&
-            ir_fire_has_work_after(func, inst)) {
-            /* LIFO: defers fire in reverse registration order, mirroring C3. */
+            inst->defer_bodies_materialised && inst->defer_fire_ast) {
+            UafReportSet rs = {0};
             for (int dbi = inst->defer_fire_body_count - 1; dbi >= 0; dbi--) {
+                if (!inst->defer_fire_ast[dbi]) continue;
                 Node *dbody = inst->defer_fire_bodies[dbi];
                 if (!dbody) continue;
+                ir_defer_scan_uses(zc, func, ps, dbody, inst->source_line, &rs);
                 int did = ir_defer_instance_id(func, dbody);
                 if (did > 0)
                     ir_defer_scan_frees(zc, func, ps, dbody,
                                         inst->source_line, did);
             }
+            free(rs.ids);
         }
         break;
     }
@@ -7702,68 +7664,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
     }
 
-    /* Phase C3: before leak detection, scan every IR_DEFER_PUSH body in the
-     * function and mark handles freed therein as FREED in the return-block
-     * path states. Conservative: every defer's frees apply to every return
-     * block. Matches zercheck.c defer_scan_all_frees at function exit.
-     *
-     * Without this, any handle freed only inside a `defer { pool.free(h); }`
-     * would appear ALIVE at function exit and trigger a false leak error.
-     *
-     * We walk all blocks to collect defers once, then apply to each return
-     * block's state. */
-    /* plt86m audit 2026-06-17: also check defer-body USES (not just frees)
-     * against each return block's PRISTINE exit state — a deferred USE of a
-     * handle the body already freed / move-transferred is a use-after-free /
-     * use-after-move. The uses-pass runs BEFORE the frees-pass below so a
-     * `defer free(h); defer use(h)` (LIFO-valid: use fires first, against a
-     * still-ALIVE h) is not false-flagged; the shared `defer_use_rs` dedups
-     * reports per root-local across all return blocks. */
-    UafReportSet defer_use_rs = {0};
-    /* AU-1 (2026-07-01): defers fire in LIFO (reverse-registration) order at
-     * scope exit. A `defer use(h)` registered BEFORE a `defer free(h)` therefore
-     * fires AFTER it — the use sees a FREED handle (a real UAF). The old split
-     * (all-uses against pristine state, THEN all-frees) missed this: it checked
-     * every use before applying any free. Fix: collect defers in registration
-     * order, then per return block process them in FIRE order (reverse) — for
-     * each defer, check its USES against the current state, THEN apply its
-     * FREES. So a use sees exactly the frees of later-registered defers (which
-     * fire first). The safe shape `defer free(h); defer use(h)` (use fires first,
-     * against ALIVE h) still passes — its free is applied after its use is
-     * checked. Leak detection is unaffected (the FINAL state has every free
-     * applied regardless of order). */
-    IRInst **dfs = NULL; int dfn = 0, dfc = 0;
-    for (int di = 0; di < func->block_count; di++) {
-        IRBlock *db = &func->blocks[di];
-        for (int dj = 0; dj < db->inst_count; dj++) {
-            IRInst *inst = &db->insts[dj];
-            if (inst->op != IR_DEFER_PUSH || !inst->defer_body) continue;
-            if (dfn == dfc) {
-                int ndc = dfc ? dfc * 2 : 8;
-                IRInst **nd = (IRInst **)realloc(dfs, (size_t)ndc * sizeof(IRInst *));
-                if (!nd) break;
-                dfs = nd; dfc = ndc;
-            }
-            dfs[dfn++] = inst;
-        }
-    }
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        if (bb->inst_count == 0) continue;
-        IRInst *last = &bb->insts[bb->inst_count - 1];
-        if (last->op != IR_RETURN) continue;
-        IRPathState *ret_ps = &block_states[bi];
-        for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
-            ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
-                               dfs[k]->source_line, &defer_use_rs);
-            /* F1: k+1 as the per-defer instance id — 0 is reserved for
-             * "not freed by any defer" (memset-zeroed slot / explicit free). */
-            ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
-                                dfs[k]->source_line, k + 1);
-        }
-    }
-    free(dfs);
-    free(defer_use_rs.ids);
+    /* Phase C3 (the function-exit AST scan of every defer body) is GONE —
+     * refactor L (2026-09-08): a defer body is IR spliced at every fire, so the
+     * forward pass sees its frees and uses on every exit path. The only AST
+     * scan left is the label-guarded body at its IR_DEFER_FIRE (above). */
 
     /* Phase D6: ghost handle detection — compute which allocated handles
      * are NEVER read subsequently. `pool.alloc()` as a bare expression

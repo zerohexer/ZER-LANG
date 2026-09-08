@@ -1,0 +1,71 @@
+// Refactor L (2026-09-08): a defer body is lowered through the ordinary
+// statement lowering and spliced into the CFG at every fire, so EVERY statement
+// kind the language allows there works — switch, do-while, @critical, @once,
+// spawn, static_assert, nested control flow with break/continue, a var-decl,
+// and a break out of the body's OWN loop (the shape that blocked the earlier
+// attempts). Before this, seven of these hit the raw-AST defer emitter's
+// "compiler bug" trap at run time with exit 0 from zerc.
+u32 g = 0;
+shared struct Cnt { u32 n; }
+Cnt shared_cnt;
+
+void worker(u32 v) { shared_cnt.n = shared_cnt.n + v; }
+
+u32 sw(u32 k) {
+    defer {
+        switch (k) {
+            0 => { g += 1; }
+            1 => { g += 2; }
+            default => { g += 4; }
+        }
+    }
+    return k;
+}
+
+void dw() {
+    defer {
+        u32 i = 0;
+        do { g += 10; i += 1; } while (i < 3);
+    }
+}
+
+void crit() {
+    defer { @critical { g += 100; } }
+}
+
+void once_body() {
+    defer { @once { g += 1000; } }
+}
+
+void spawn_body() {
+    defer {
+        static_assert(4 == 4, "arithmetic holds");
+        ThreadHandle th = spawn worker(7);
+        th.join();
+    }
+}
+
+void brk() {
+    defer {
+        for (u32 i = 0; i < 5; i += 1) {
+            if (i == 2) { break; }
+            g += 10000;
+        }
+        u32 j = 0;
+        while (j < 4) { j += 1; if (j == 2) { continue; } g += 100000; }
+    }
+}
+
+u32 main() {
+    if (sw(0) != 0) { return 1; }          // +1
+    if (sw(1) != 1) { return 2; }          // +2
+    if (sw(9) != 9) { return 3; }          // +4        -> 7
+    dw();                                   // +30       -> 37
+    crit();                                 // +100      -> 137
+    once_body(); once_body();               // +1000 once-> 1137
+    spawn_body();                           // shared_cnt.n = 7
+    brk();                                  // +20000 (i=0,1) +300000 (j=1,3,4) -> 321137
+    if (g != 321137) { return 4; }
+    if (shared_cnt.n != 7) { return 5; }
+    return 0;
+}

@@ -1287,6 +1287,22 @@ Handle leaks are **compile errors** — allocating without `defer free()` (or re
 
 `defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
 
+A defer body is ordinary code: any statement kind that is not banned here works inside it — `switch`, `do-while`, `@critical`, `@once`, `spawn` (with a joined `ThreadHandle`), `static_assert`, nested loops with `break`/`continue`, local declarations — and every safety rule (bounds, use-after-free, the shared-struct lock) applies to it exactly as it does outside. A **label** inside a defer body is a compile error: `goto` is banned there, so it could never be a target.
+
+```zer
+u32 g = 0;
+void f(u32 k) {
+    defer {
+        switch (k) {
+            0 => { g += 1; }
+            default => { g += 2; }
+        }
+        for (u32 i = 0; i < 5; i += 1) { if (i == 2) { break; } g += 10; }
+    }
+}
+u32 main() { f(0); return g - 21; }
+```
+
 <!-- audit: expect-error: 'defer' cannot be nested inside another 'defer' body -->
 ```zer
 defer {

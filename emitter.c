@@ -728,10 +728,16 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
      * with no fault to notice it by. That asymmetry is why no existing test caught
      * either half. Trapping is the same trade-off already accepted for defer bodies,
      * and consistent with slices, which already TRAP on an out-of-range index. */
-    if (e->guard_traps || e->noreturn_scope_depth > 0) {
+    /* Refactor L (2026-09-08): the emitter no longer has a defer body it can
+     * emit — bodies are IR, spliced by ir_lower at every fire IT lowers. The
+     * guard sites refactor M declined (a loop condition, an await condition, an
+     * optional/struct-returning function) still guard here, and with a defer
+     * pending they can only trap: an early return that skipped the pending
+     * cleanup would be the silent leak this guard exists to prevent. */
+    if (e->guard_traps || e->noreturn_scope_depth > 0 || e->cur_func_has_defer) {
         if (with_braces) emit(e, "{ ");
         emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
-                "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);");
+                "or with a pending defer — cannot return without leaking it\", __FILE__, __LINE__);");
         if (with_braces) emit(e, " }\n"); else emit(e, " ");
         return;
     }
@@ -4419,38 +4425,15 @@ static void emit_defers_from(Emitter *e, int base) {
      * ("emit_defers_from reached with N pending defers") on the extremely common
      * `defer free(x); arr[i]=…` idiom. */
     if (e->defer_stack.count <= base) return;
-    if (!e->cur_ir_func) {
-        /* No IR function context (AST/global-init path) should never have a
-         * pending defer — that path has no defer statements. Loud if it does. */
-        fprintf(stderr, "INTERNAL ERROR: emit_defers_from reached with %d pending "
-                        "defers but no IR function context. Please report.\n",
-                        e->defer_stack.count - base);
-        abort();
-    }
-    IRFunc *func = (IRFunc *)e->cur_ir_func;
-    for (int di = e->defer_stack.count - 1; di >= base; di--) {
-        Node *db = e->defer_stack.stmts[di];
-        if (!db) continue;
-        if (db->kind == NODE_BLOCK) {
-            /* F4 (2026-08-02): brace-scope the block-form defer body. A defer
-             * body is emitted at EVERY exit path, so a local declared inside
-             * (`defer { u32 z = x; ... }`) otherwise lands in the SHARED C
-             * function scope and the second exit path's copy is a gcc
-             * "redefinition" error — valid ZER failed to compile, and only at
-             * the gcc stage. The single-statement form below never declares, so
-             * it needs no brace. */
-            emit_indent(e);
-            emit(e, "{\n");
-            e->indent++;
-            for (int si = 0; si < db->block.stmt_count; si++)
-                emit_defer_stmt(e, db->block.stmts[si], func);
-            e->indent--;
-            emit_indent(e);
-            emit(e, "}\n");
-        } else {
-            emit_defer_stmt(e, db, func);
-        }
-    }
+    /* Refactor L (2026-09-08): defer bodies are IR now; every exit ir_lower
+     * lowers splices them itself, and the AST-level early exits that remain
+     * (emit_safety_early_return's declined guard sites) trap when a defer is
+     * pending instead of reaching here. Reaching this with a pending defer is
+     * therefore a compiler bug — say so rather than drop the cleanup. */
+    fprintf(stderr, "INTERNAL ERROR: emit_defers_from reached with %d pending "
+                    "defers — defer bodies are lowered, not emitted. Please report.\n",
+                    e->defer_stack.count - base);
+    abort();
 }
 
 /* emit ALL defers (for return — must fire every scope's defers) */
@@ -12046,6 +12029,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         for (int di = inst->defer_fire_body_count - 1; di >= 0; di--) {
             Node *db = inst->defer_fire_bodies[di];
             if (!db) continue;
+            /* Refactor L (2026-09-08): the bodies are real CFG blocks, spliced by
+             * ir_lower BEFORE this instruction. Only a body ir_lower left on the
+             * AST path (a label-guarded one the AST emitter can express) is
+             * emitted here — see IRInst.defer_fire_ast. */
+            if (inst->defer_bodies_materialised &&
+                !(inst->defer_fire_ast && inst->defer_fire_ast[di])) continue;
             /* both-reachable cleanup-label guard (plt86m defer-goto): a body
              * whose ORIGINAL defer depth (base+di) is < guard_below was fired
              * EAGERLY by a goto (which set the flag), so emit it as
@@ -13720,11 +13709,17 @@ void emit_func_from_ir(Emitter *e, void *ir_func_ptr) {
     /* Expose the current func so a mid-body conditional early-exit can fire its
      * pending IR defer bodies (emit_defers_from) instead of aborting. */
     void *saved_ir_func = e->cur_ir_func;
+    bool saved_has_defer = e->cur_func_has_defer;
     e->cur_ir_func = func;
+    e->cur_func_has_defer = false;
+    for (int bi = 0; bi < func->block_count && !e->cur_func_has_defer; bi++)
+        for (int ii = 0; ii < func->blocks[bi].inst_count; ii++)
+            if (func->blocks[bi].insts[ii].op == IR_DEFER_PUSH) { e->cur_func_has_defer = true; break; }
     if (func->is_async) {
         emit_async_func_from_ir(e, func);
     } else {
         emit_regular_func_from_ir(e, func);
     }
     e->cur_ir_func = saved_ir_func;
+    e->cur_func_has_defer = saved_has_defer;
 }

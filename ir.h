@@ -202,6 +202,30 @@ typedef struct IRInst {
      * evaluated (BUG-442 timing). guard_flag = -1 means no guard. */
     int    defer_fire_guard_flag;
     int    defer_fire_guard_below;
+    /* Refactor L (2026-09-08): the bodies of this fire are REAL CFG blocks — a
+     * clone of the defer's lowered template, spliced in BEFORE this instruction
+     * (the fire itself now marks the point where the splice ends). Parallel to
+     * defer_fire_bodies: defer_fire_ast[i] == 1 for the (rare) body that stays
+     * on the raw-AST emitter path — a both-reachable cleanup-label body under
+     * the runtime guard (see defer_fire_guard_flag) whose statement kinds the
+     * AST emitter can express. The emitter emits ONLY those; zercheck_ir scans
+     * ONLY those from the AST (every other body is ordinary IR it already
+     * analyses). NULL when nothing was materialised (pop-only fire). */
+    uint8_t *defer_fire_ast;
+    bool     defer_bodies_materialised;
+    /* Refactor L: an IR_BRANCH that is a defer body's ARMED gate records the
+     * block that SET the flag (immediately after the IR_DEFER_PUSH). A post-
+     * lowering pass turns the branch into an unconditional IR_GOTO of its true
+     * block where that setter DOMINATES the gate — the flag is then provably 1,
+     * and zercheck no longer sees a phantom "body skipped" path. -1 = not a gate. */
+    int    armed_setter_block;
+    /* Refactor L: which DEFER this instruction belongs to. Set on the
+     * IR_DEFER_PUSH at registration (1-based, unique per function) and stamped
+     * on every instruction of every clone of that defer's template, so
+     * zercheck can tell "freed by defer D's body on this path" apart from an
+     * explicit free — the label-guarded AST scan of the SAME defer must not
+     * report its own eager (goto-path) clone as a double free. 0 = not a defer's. */
+    int    defer_id;
 
     /* Intrinsic operand */
     const char *intrinsic_name;
@@ -365,6 +389,13 @@ int ir_add_block(IRFunc *func, Arena *arena);
  * computed after lowering by ir_compute_preds. */
 int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last);
 
+/* Refactor L: the same clone from an EXTRACTED template — `src[0..n)` are block
+ * copies that were lowered at ids [src_first, src_first+n) and then truncated
+ * out of func->blocks (so those ids have since been reused). Block-index fields
+ * that point into [src_first, src_first+n) are remapped onto the clones; every
+ * other reference is left alone. ir_clone_block_range is this over a live range. */
+int ir_clone_blocks_from(IRFunc *func, Arena *arena, const IRBlock *src, int n, int src_first);
+
 
 /* Add an instruction to a basic block. */
 void ir_block_add_inst(IRBlock *block, Arena *arena, IRInst inst);
@@ -391,6 +422,10 @@ void ir_compute_preds(IRFunc *func, Arena *arena);
  * and harmless here: eliding a branch in code that cannot run changes nothing. */
 uint64_t *ir_compute_dominators(IRFunc *func, Arena *arena, int *out_words);
 bool ir_dominates(const uint64_t *dom, int words, int a, int b);
+
+/* Refactor L: elide ARMED gates proven redundant by dominance (see
+ * IRInst.armed_setter_block). Call after ir_compute_preds. */
+void ir_elide_dominated_armed_gates(IRFunc *func, Arena *arena);
 
 /* Check if a block's last instruction is a terminator */
 bool ir_block_is_terminated(IRBlock *block);

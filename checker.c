@@ -1110,6 +1110,8 @@ static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
 static void track_isr_static_local(Checker *c, Node *decl);   /* BUG-963 */
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count);   /* BUG-995 */
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -18062,6 +18064,17 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
+        /* Refactor L (2026-09-08): a label inside a defer body. `goto` is banned
+         * in a defer body, so nothing can ever jump here — and the body is now
+         * lowered into a detached template that every fire clones, while a
+         * label's block is allocated once, up front, outside that template. A
+         * clone would carry a jump into a block it does not own. Rejecting the
+         * label costs nothing: it has no possible use. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside a defer body — 'goto' is not allowed "
+                "there, so the label could never be a jump target");
+        }
         /* labels are just markers — no type checking needed. BUT a `goto` can
          * jump to this label carrying ANY value, so a value-range narrowed on the
          * fall-through path ABOVE the label does not hold at the label (the goto
@@ -18329,6 +18342,36 @@ static void check_stmt(Checker *c, Node *node) {
                     "asm `safety:` string must be at least 30 characters — "
                     "describe what the asm does and cite hardware spec/manual "
                     "(D-Alpha-7.5 S4 rule, audit-trail requirement)");
+            }
+            /* BUG-995 (2026-09-08): a `shared struct` field in an ASM OPERAND.
+             * The per-statement auto-lock never wraps an asm statement, so
+             * `inputs: { "rax" = a.x }` was emitted as a BARE read of the shared
+             * field — an unlocked access reachable from a spawned thread, the
+             * same class as BUG-935 at a site the lock collector never visits.
+             * Decided by the Ban Decision Framework as a HARDWARE constraint, not
+             * tracked: asm is only legal in a `naked` function, which has no
+             * prologue and no frame, so a `pthread_mutex_lock` call around the
+             * operand is not something the compiler can emit there. Read the
+             * field into a local in an ordinary (locked) function and pass the
+             * value in. One query — collect_shared_types_in_expr — for both
+             * operand lists, so the two cannot disagree. */
+            for (int oi = 0; oi < node->asm_stmt.input_count + node->asm_stmt.output_count; oi++) {
+                AsmOperand *aop = (oi < node->asm_stmt.input_count)
+                    ? &node->asm_stmt.inputs[oi]
+                    : &node->asm_stmt.outputs[oi - node->asm_stmt.input_count];
+                if (!aop->expr) continue;
+                Type *sh = NULL;   /* one is enough: the question is "any?" */
+                int shn = collect_shared_types_in_expr(c, aop->expr, &sh, 1, 0);
+                if (shn > 0 && sh) {
+                    char tn[96];
+                    snprintf(tn, sizeof(tn), "%s", type_name(sh));
+                    checker_error(c, node->loc.line,
+                        "asm %s operand reads shared struct '%s' without its lock — "
+                        "an asm statement is never auto-locked, and a naked function "
+                        "has no frame to take a mutex in. Read the field into a local "
+                        "in an ordinary function and pass the value to the asm",
+                        (oi < node->asm_stmt.input_count) ? "input" : "output", tn);
+                }
             }
             /* D-Alpha-7.5 Session B / H2: type-check operand bindings.
              * Each input/output must be integer-typed (Session B scope = scalars).

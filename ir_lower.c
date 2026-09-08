@@ -55,6 +55,22 @@ typedef struct {
     int defer_count_at_def;
 } IRLabelMap;
 
+/* Refactor L: one registered defer's lowered body. `blocks[0..count)` were
+ * lowered at ids [first, first+count) and then truncated out of func->blocks, so
+ * a clone remaps references in that id range. `exit` is the index (relative to
+ * first) of the block control falls out of; `armed_block` is the block that set
+ * this defer's ARMED flag (-1 = no flag); `ast_emittable` says whether the raw-
+ * AST emitter can still express the body (used only for the label-guarded case). */
+typedef struct {
+    IRBlock *blocks;
+    int count;
+    int first;
+    int exit;
+    int armed_block;
+    int id;                 /* IRInst.defer_id of this defer (1-based) */
+    bool ast_emittable;
+} DeferTpl;
+
 typedef struct {
     IRFunc *func;
     Arena *arena;
@@ -92,6 +108,18 @@ typedef struct {
     int critical_depth;
     int active_guard_flag;
     int active_guard_below;
+    /* Refactor L (2026-09-08): a defer body is lowered ONCE, at registration,
+     * into a detached TEMPLATE (a block range extracted from func->blocks), and
+     * every fire site splices in a clone of it. Parallel to defer_bodies. */
+    DeferTpl defer_tpl_inline[32];
+    DeferTpl *defer_tpl;
+    /* >0 while lowering a defer body's template. A bounds guard inside one must
+     * TRAP rather than return (an early return would re-fire the defer stack and
+     * skip the rest of the function's cleanup), and a fire inside one may only
+     * materialise defers registered INSIDE the body (index >= defer_body_base). */
+    int defer_body_depth;
+    int defer_body_base;
+    int defer_seq;            /* last IRInst.defer_id handed out in this function */
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
      * defers — the enclosing construct (loop body, if-branch, switch arm)
      * already does it with the correct semantics (no-pop for loops so
@@ -131,7 +159,23 @@ typedef struct {
 
 /* ---- Helpers ---- */
 
+/* Refactor L (2026-09-08): an instruction emitted into a block that already
+ * ENDS IN A TERMINATOR is dead code, and it did real damage: the block-exit
+ * defer fire after a `return` was appended, so the block's LAST instruction
+ * was no longer the RETURN, `ensure_terminated` then added a GOTO, and the CFG
+ * grew a phantom edge out of a returning block. zercheck followed it — a
+ * handle freed by the (now real) defer body flowed into the fall-through
+ * path as MAYBE_FREED and correct code was rejected. Dropping the instruction
+ * is exact: nothing after a terminator can execute. lower_stmt already starts
+ * a fresh (unreachable) block for a whole dead STATEMENT; this covers the
+ * sub-statement emissions (block-exit fires, joins) that append directly. */
+static bool ir_cur_block_dead(LowerCtx *ctx) {
+    IRBlock *bb = &ctx->func->blocks[ctx->current_block];
+    return bb->inst_count > 0 && ir_block_is_terminated(bb);
+}
+
 static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    if (ir_cur_block_dead(ctx)) return;
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -154,6 +198,7 @@ static IRInst make_inst(IROpKind op, int line) {
     inst.handle_local = -1;
     inst.defer_fire_guard_flag = -1;  /* no guard by default */
     inst.defer_fire_flags = NULL;     /* F2: no armed flags by default */
+    inst.armed_setter_block = -1;     /* refactor L: not an ARMED gate */
     inst.source_line = line;
     return inst;
 }
@@ -409,6 +454,7 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
 
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
+    if (ir_cur_block_dead(ctx)) return;   /* see emit_inst */
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -1016,11 +1062,217 @@ static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
     }
 }
 
+static void lower_stmt(LowerCtx *ctx, Node *node);
+
+/* Refactor L: can the raw-AST defer emitter (emitter.c emit_defer_stmt) express
+ * this body? Only the label-GUARDED fire keeps a body on that path (see
+ * materialise_defers); everything else is real IR now. Mirrors the kinds that
+ * emitter handles — a kind it cannot express is cloned under a CFG guard branch
+ * instead, which is correct code and at worst an over-rejection by zercheck. */
+static bool defer_body_ast_emittable(Node *s) {
+    if (!s) return true;
+    switch (s->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < s->block.stmt_count; i++)
+            if (!defer_body_ast_emittable(s->block.stmts[i])) return false;
+        return true;
+    case NODE_IF:
+        return defer_body_ast_emittable(s->if_stmt.then_body) &&
+               defer_body_ast_emittable(s->if_stmt.else_body);
+    case NODE_WHILE:
+        return defer_body_ast_emittable(s->while_stmt.body);
+    case NODE_FOR:
+        return defer_body_ast_emittable(s->for_stmt.init) &&
+               defer_body_ast_emittable(s->for_stmt.body);
+    case NODE_EXPR_STMT: case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+        return true;
+    /* Everything below has no arm in emit_defer_stmt (or is banned in a defer
+     * body by the checker: return / asm / goto / yield / await). */
+    case NODE_RETURN: case NODE_ASM: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN: case NODE_STATIC_ASSERT:
+    case NODE_LABEL: case NODE_GOTO: case NODE_DEFER: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
+    return false;
+}
+
+/* Refactor L: lower a defer body ONCE, at its registration point and in its
+ * registration scope, into a detached block range.
+ *
+ * Why at registration and not at the first fire: lowering re-resolves
+ * identifiers, and the first fire can sit in a NESTED scope where a same-named
+ * local shadows the one the body means (`{ Handle h = ...; }` firing an outer
+ * `defer pool.free(h)`). Measured on an earlier attempt — restoring the scope
+ * depth alone still resolved to the shadow.
+ *
+ * Why extract (copy the headers aside and truncate block_count): the template
+ * must not be emitted or analysed as itself — only its clones are reachable
+ * code. Instruction arrays are arena-allocated, so the copied headers stay valid;
+ * the ids the template was lowered at are reused by later blocks, which is why
+ * every clone remaps [first, first+count) onto its own range. */
+static void lower_defer_template(LowerCtx *ctx, Node *body, DeferTpl *out, int line) {
+    int saved_block      = ctx->current_block;
+    int saved_loop_exit  = ctx->loop_exit_block;
+    int saved_loop_cont  = ctx->loop_continue_block;
+    int saved_loop_base  = ctx->loop_defer_base;
+    int saved_managed    = ctx->block_defers_managed;
+    int saved_body_base  = ctx->defer_body_base;
+    int saved_guard_flag = ctx->active_guard_flag;
+    int saved_guard_below = ctx->active_guard_below;
+    Node *saved_shared   = ctx->current_stmt_shared_root;
+
+    ctx->loop_exit_block = -1;
+    ctx->loop_continue_block = -1;
+    ctx->loop_defer_base = ctx->defer_count;
+    ctx->block_defers_managed = 0;
+    ctx->current_stmt_shared_root = NULL;
+    ctx->defer_body_depth++;
+    ctx->defer_body_base = ctx->defer_count;
+    ctx->active_guard_flag = -1;      /* a body's own nested fires are never label-guarded */
+
+    int first = ir_add_block(ctx->func, ctx->arena);
+    ctx->current_block = first;
+
+    /* A single-statement body (`defer free(h);`) is a bare NODE_EXPR_STMT; wrap
+     * it so the per-statement machinery of NODE_BLOCK (guards before lock, lock
+     * around a shared access, unlock after) applies to it exactly as it would
+     * to the same statement written in a block. The wrapper is a fresh arena
+     * node; the original body stays on the IR_DEFER_PUSH untouched. */
+    Node *stmt = body;
+    if (body->kind != NODE_BLOCK) {
+        Node *wrap = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+        memset(wrap, 0, sizeof(Node));
+        wrap->kind = NODE_BLOCK;
+        wrap->loc = body->loc;
+        Node **one = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+        one[0] = body;
+        wrap->block.stmts = one;
+        wrap->block.stmt_count = 1;
+        stmt = wrap;
+    }
+    lower_stmt(ctx, stmt);
+
+    out->first = first;
+    out->exit = ctx->current_block - first;
+    out->count = ctx->func->block_count - first;
+    out->blocks = (IRBlock *)arena_alloc(ctx->arena, (size_t)out->count * sizeof(IRBlock));
+    memcpy(out->blocks, &ctx->func->blocks[first], (size_t)out->count * sizeof(IRBlock));
+    ctx->func->block_count = first;           /* extract */
+    out->ast_emittable = defer_body_ast_emittable(body);
+    (void)line;
+
+    ctx->current_block = saved_block;
+    ctx->loop_exit_block = saved_loop_exit;
+    ctx->loop_continue_block = saved_loop_cont;
+    ctx->loop_defer_base = saved_loop_base;
+    ctx->block_defers_managed = saved_managed;
+    ctx->current_stmt_shared_root = saved_shared;
+    ctx->defer_body_depth--;
+    ctx->defer_body_base = saved_body_base;
+    ctx->active_guard_flag = saved_guard_flag;
+    ctx->active_guard_below = saved_guard_below;
+}
+
+/* Refactor L: splice a clone of every live defer body [base, defer_count) into
+ * the CFG at the current point, LIFO (newest first), leaving ctx->current_block
+ * at the continuation. Fills `fire->defer_fire_ast` so the emitter and zercheck
+ * know which (if any) bodies stay on the AST path:
+ *
+ *  - a body under the both-reachable cleanup-label GUARD (original depth <
+ *    active_guard_below) whose kinds the AST emitter can express stays there:
+ *    the guard flag is set by a goto and tested here, so as an IR branch it
+ *    would merge {freed} with {alive} into MAYBE_FREED and zercheck would
+ *    report correct code. The emitter keeps its `if (!flag) { body }` form.
+ *  - a guarded body the AST emitter CANNOT express is cloned under an IR
+ *    branch on the flag (skip when set) — correct code, possibly over-rejected.
+ *  - every other body is cloned; its ARMED flag (if any) becomes an IR branch
+ *    that the post-lowering dominance pass elides wherever the registration
+ *    provably ran.
+ *
+ * A fire in a block that is already terminated is dead code (a block-exit fire
+ * after a `return`): nothing is spliced and nothing is marked — emitting a body
+ * that cannot run is what makes the analysis wrong, not an optimisation.
+ *
+ * The fire instruction itself is emitted by the caller AFTER this, into the
+ * continuation block: LIFO puts the guarded (oldest) bodies last, and the
+ * emitter writes them at the fire. */
+static void materialise_defers(LowerCtx *ctx, int base, IRInst *fire) {
+    int n = ctx->defer_count - base;
+    if (n <= 0) return;
+    fire->defer_fire_ast = (uint8_t *)arena_alloc(ctx->arena, (size_t)n);
+    memset(fire->defer_fire_ast, 0, (size_t)n);
+    fire->defer_bodies_materialised = true;
+
+    IRBlock *cur = &ctx->func->blocks[ctx->current_block];
+    if (cur->inst_count > 0 && ir_block_is_terminated(cur)) return;   /* dead fire */
+
+    for (int di = n - 1; di >= 0; di--) {
+        int depth = base + di;
+        if (ctx->defer_body_depth > 0 && depth < ctx->defer_body_base) continue;
+        DeferTpl *t = &ctx->defer_tpl[depth];
+        if (!t->blocks || t->count <= 0) continue;
+        bool guarded = (ctx->active_guard_flag >= 0) && (depth < ctx->active_guard_below);
+        if (guarded && t->ast_emittable) { fire->defer_fire_ast[di] = 1; continue; }
+
+        int armed = ctx->defer_flags[depth];
+        int bb_after = ir_add_block(ctx->func, ctx->arena);
+        if (guarded) {
+            int bb_run = ir_add_block(ctx->func, ctx->arena);
+            IRInst br = make_inst(IR_BRANCH, fire->source_line);
+            br.cond_local = ctx->active_guard_flag;
+            br.true_block = bb_after;          /* flag set: the goto already fired it */
+            br.false_block = bb_run;
+            emit_inst(ctx, br);
+            ctx->current_block = bb_run;
+        }
+        if (armed >= 0) {
+            int bb_run = ir_add_block(ctx->func, ctx->arena);
+            IRInst br = make_inst(IR_BRANCH, fire->source_line);
+            br.cond_local = armed;
+            br.true_block = bb_run;
+            br.false_block = bb_after;
+            br.armed_setter_block = t->armed_block;
+            emit_inst(ctx, br);
+            ctx->current_block = bb_run;
+        }
+        int clone = ir_clone_blocks_from(ctx->func, ctx->arena, t->blocks, t->count, t->first);
+        if (clone < 0) { ctx->current_block = bb_after; continue; }
+        /* Stamp the clone with this defer's id (a nested defer's own clones
+         * inside the template already carry theirs and keep it). */
+        for (int cb = clone; cb < clone + t->count; cb++) {
+            IRBlock *cbb = &ctx->func->blocks[cb];
+            for (int ci = 0; ci < cbb->inst_count; ci++)
+                if (cbb->insts[ci].defer_id == 0) cbb->insts[ci].defer_id = t->id;
+        }
+        ensure_terminated(ctx, clone);
+        int ex = clone + t->exit;
+        IRBlock *eb = &ctx->func->blocks[ex];
+        if (eb->inst_count == 0 || !ir_block_is_terminated(eb)) {
+            IRInst go = make_inst(IR_GOTO, fire->source_line);
+            go.goto_block = bb_after;
+            ir_block_add_inst(eb, ctx->arena, go);
+        }
+        ctx->current_block = bb_after;
+    }
+}
+
 /* Emit IR_DEFER_FIRE for pending defers (fire all, no pop — function/return exit) */
 static void emit_defer_fire(LowerCtx *ctx, int line) {
     if (ctx->defer_count > 0) {
         IRInst fire = make_inst(IR_DEFER_FIRE, line);
         ir_snapshot_defer_bodies(ctx, &fire, 0);
+        materialise_defers(ctx, 0, &fire);
         emit_inst(ctx, fire);
     }
 }
@@ -1034,6 +1286,7 @@ static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) 
         fire.cond_local = base;
         fire.src2_local = pop ? 0 : 1;
         ir_snapshot_defer_bodies(ctx, &fire, base);
+        materialise_defers(ctx, base, &fire);
         emit_inst(ctx, fire);
     }
 }
@@ -1086,9 +1339,20 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
         re = rty ? type_unwrap_distinct(rty) : NULL;
     }
     bool void_ret = (!re || type_dispatch_kind(re) == TYPE_VOID);
-    /* Only shapes whose zero value is a plain literal. A struct or slice return
-     * needs the emitter's emit_zero_value, so decline and let it guard. */
-    if (!void_ret && !(type_is_integer(re) || type_dispatch_kind(re) == TYPE_BOOL)) return;
+    /* An integer/bool return gets a literal 0 below. Refactor L (2026-09-08):
+     * every OTHER return type — struct, slice, optional, pointer-optional —
+     * returns a FRESH TEMP that is never assigned: ZER locals are auto-zeroed
+     * by the emitter, so the temp IS the type's zero value, and the site no
+     * longer has to decline (the emitter's guard can no longer fire pending
+     * defers, so a declined site with a defer would trap instead of return). */
+    bool literal_zero = !void_ret &&
+        (type_is_integer(re) || type_dispatch_kind(re) == TYPE_BOOL);
+    /* A funcptr/pointer return has NO zero value (non-null by type) — its guard
+     * stays with the emitter, which traps. */
+    if (!void_ret && !literal_zero) {
+        TypeKind rk0 = type_dispatch_kind(re);
+        if (rk0 == TYPE_POINTER || rk0 == TYPE_FUNC_PTR) return;
+    }
 
     /* NO AST MUTATION. The first version rewrote the access to read the guard's
      * temp, for single evaluation — and that broke the moment the AST was lowered
@@ -1150,7 +1414,11 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
      * construct ZER hard-errors on when a user writes `return` inside @critical.
      * IR_TRAP is a terminator, so the CFG knows the path ends; the emitted text is
      * the same abort the C-level guard used. */
-    if (ctx->critical_depth > 0) {
+    /* Refactor L: the same inside a DEFER BODY. An early return there would
+     * re-fire the defer stack and skip the rest of the function's cleanup —
+     * which is also why lowering it would recurse (the fire materialises bodies
+     * whose guards fire...). The trap is what the emitter's guard_traps did. */
+    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) {
         emit_inst(ctx, make_inst(IR_TRAP, g->line));
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -1166,11 +1434,14 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     IRInst ret = make_inst(IR_RETURN, g->line);
     if (!void_ret) {
         int z = create_temp(ctx, rty, g->line);
-        IRInst zl = make_inst(IR_LITERAL, g->line);
-        zl.dest_local = z;
-        zl.literal_int = 0;
-        zl.literal_kind = (type_dispatch_kind(re) == TYPE_BOOL) ? 3 : 0;
-        emit_3ac(ctx, zl);
+        if (literal_zero) {
+            IRInst zl = make_inst(IR_LITERAL, g->line);
+            zl.dest_local = z;
+            zl.literal_int = 0;
+            zl.literal_kind = (type_dispatch_kind(re) == TYPE_BOOL) ? 3 : 0;
+            emit_3ac(ctx, zl);
+        }
+        /* else: the auto-zeroed temp is the zero value (see above) */
         ret.src1_local = z;
     }
     emit_inst(ctx, ret);
@@ -4038,6 +4309,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
+        push.defer_id = ++ctx->defer_seq;      /* refactor L: see IRInst.defer_id */
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -4049,6 +4321,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int *nf = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
             memcpy(nf, ctx->defer_flags, (size_t)ctx->defer_count * sizeof(int));
             ctx->defer_flags = nf;
+            DeferTpl *nt = (DeferTpl *)arena_alloc(ctx->arena, (size_t)nc * sizeof(DeferTpl));
+            memset(nt, 0, (size_t)nc * sizeof(DeferTpl));
+            memcpy(nt, ctx->defer_tpl, (size_t)ctx->defer_count * sizeof(DeferTpl));
+            ctx->defer_tpl = nt;
             ctx->defer_bodies_cap = nc;
         }
         ctx->defer_bodies[ctx->defer_count] = node->defer.body;
@@ -4076,6 +4352,16 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         if (ctx->defer_count < ctx->defer_bodies_cap)
             ctx->defer_flags[ctx->defer_count] = armed;
+        /* Refactor L: lower the body now, in THIS scope, into a detached template
+         * every fire will clone. The armed flag was just set in the current
+         * block — record it so the dominance pass can prove the gate away. */
+        {
+            DeferTpl *t = &ctx->defer_tpl[ctx->defer_count];
+            memset(t, 0, sizeof(*t));
+            t->armed_block = (armed >= 0) ? ctx->current_block : -1;
+            t->id = push.defer_id;
+            lower_defer_template(ctx, node->defer.body, t, node->loc.line);
+        }
         ctx->defer_count++;
         break;
     }
@@ -4273,6 +4559,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_tpl = ctx.defer_tpl_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
@@ -4360,6 +4647,10 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
 
     /* Compute CFG predecessors */
     ir_compute_preds(func, arena);
+    /* Refactor L: elide the ARMED gates whose setter dominates them — AFTER the
+     * whole function is lowered (a later goto can add an edge that destroys a
+     * dominance that held at the time the gate was emitted). */
+    ir_elide_dominated_armed_gates(func, arena);
 
     return func;
 }
@@ -4386,6 +4677,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_tpl = ctx.defer_tpl_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
@@ -4404,5 +4696,6 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     }
 
     ir_compute_preds(func, ctx.arena);
+    ir_elide_dominated_armed_gates(func, ctx.arena);   /* refactor L */
     return func;
 }

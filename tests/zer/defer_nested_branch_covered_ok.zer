@@ -1,0 +1,18 @@
+// Refactor L boundary for defer_nested_branch_leak: a defer registered deep
+// inside a branch covers exactly the paths that register it; the fall-through
+// path frees explicitly, so every exit is covered and this compiles + runs.
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse return;
+    t.id = 0;
+    bool c = false;
+    if (c) { if (c) { if (c) { if (c) {
+        defer heap.free_ptr(t);
+        u32 x = t.id;
+        return x + 1;
+    }}}}
+    heap.free_ptr(t);
+    return 0;
+}

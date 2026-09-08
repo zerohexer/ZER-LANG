@@ -118,6 +118,12 @@ typedef struct {
      * function's cleanup — wrong. A trap aborts safely before the OOB access,
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
+    /* Refactor L (2026-09-08): does the IR function being emitted register ANY
+     * defer? The emitter's remaining guard sites (the ones ir_lower declines: a
+     * loop condition, an await condition, a non-null pointer return) cannot
+     * fire a defer body — bodies are IR — so with a defer in the function they
+     * trap instead of returning. Computed once per function from the IR. */
+    bool cur_func_has_defer;
     /* BUG-835: how many scopes are open that a `return` must NEVER leave — a held
      * shared lock, or an interrupt-disabled @critical block. Counted rather than
      * a bool because they nest. While non-zero, the bounds/UAF auto-guard degrades

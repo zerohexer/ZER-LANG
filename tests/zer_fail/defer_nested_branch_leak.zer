@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// Promoted from tests/zer_gaps/audit2_defer_scan_nested.zer by refactor L
+// (2026-09-08). The old function-exit AST scan applied EVERY defer's frees to
+// EVERY return block, so a `defer free` registered 32 branches deep was credited
+// to the fall-through `return 0` that never registered it — a leak accepted.
+// With the body spliced into the CFG at each fire, the fall-through path holds
+// an ALIVE handle and is reported.
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse return;
+    bool c = true;
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+    if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) { if (c) {
+        defer heap.free_ptr(t);
+        u32 x = t.id;
+        return x;
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    }}}}}}}}
+    return 0;
+}

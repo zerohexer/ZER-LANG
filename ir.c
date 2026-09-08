@@ -217,12 +217,21 @@ int ir_add_block(IRFunc *func, Arena *arena) {
 int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
     if (!func || !arena) return -1;
     if (first < 0 || last < first || last >= func->block_count) return -1;
-
     int n = last - first + 1;
+    /* Copy the range's block headers aside first: ir_clone_blocks_from appends,
+     * and ir_add_block may realloc func->blocks under the source pointers. */
+    IRBlock *tmp = (IRBlock *)arena_alloc(arena, (size_t)n * sizeof(IRBlock));
+    memcpy(tmp, &func->blocks[first], (size_t)n * sizeof(IRBlock));
+    return ir_clone_blocks_from(func, arena, tmp, n, first);
+}
 
-    /* Allocate every clone FIRST. ir_add_block reallocs func->blocks, so both the
-     * source and destination pointers must be re-read afterwards — reading them
-     * before the loop would leave them dangling on the first growth. */
+int ir_clone_blocks_from(IRFunc *func, Arena *arena, const IRBlock *src, int n, int src_first) {
+    if (!func || !arena || !src || n <= 0 || src_first < 0) return -1;
+    int first = src_first, last = src_first + n - 1;
+
+    /* Allocate every clone FIRST. ir_add_block reallocs func->blocks, so the
+     * destination pointers must be re-read afterwards — reading them before the
+     * loop would leave them dangling on the first growth. */
     int base = -1;
     for (int i = 0; i < n; i++) {
         int id = ir_add_block(func, arena);
@@ -233,7 +242,7 @@ int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
     int offset = base - first;
 
     for (int i = 0; i < n; i++) {
-        IRBlock *sb = &func->blocks[first + i];
+        const IRBlock *sb = &src[i];
         IRBlock *dst = &func->blocks[base + i];
 
         /* Deliberately NOT copied: the source `label` (two blocks carrying one
@@ -253,9 +262,42 @@ int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
             if (in->true_block  >= first && in->true_block  <= last) in->true_block  += offset;
             if (in->false_block >= first && in->false_block <= last) in->false_block += offset;
             if (in->goto_block  >= first && in->goto_block  <= last) in->goto_block  += offset;
+            /* Refactor L: a nested defer's ARMED gate inside the template names
+             * its setter block; a stale id here would let the dominance pass
+             * test the wrong block, so it is remapped like the edges. */
+            if (in->armed_setter_block >= first && in->armed_setter_block <= last)
+                in->armed_setter_block += offset;
         }
     }
     return base;
+}
+
+/* Refactor L: turn every ARMED gate whose setter block DOMINATES it into an
+ * unconditional jump into the body. Runs after ir_compute_preds; recomputes the
+ * predecessors when it changed an edge. See IRInst.armed_setter_block. */
+void ir_elide_dominated_armed_gates(IRFunc *func, Arena *arena) {
+    if (!func || func->block_count <= 0) return;
+    int words = 0;
+    uint64_t *dom = ir_compute_dominators(func, arena, &words);
+    if (!dom) return;
+    bool changed = false;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        if (bb->inst_count == 0) continue;
+        IRInst *last = &bb->insts[bb->inst_count - 1];
+        if (last->op != IR_BRANCH || last->armed_setter_block < 0) continue;
+        if (last->armed_setter_block >= func->block_count) continue;
+        if (!ir_dominates(dom, words, last->armed_setter_block, bi)) continue;
+        int body = last->true_block;
+        last->op = IR_GOTO;
+        last->goto_block = body;
+        last->true_block = -1;
+        last->false_block = -1;
+        last->cond_local = -1;
+        last->armed_setter_block = -1;
+        changed = true;
+    }
+    if (changed) ir_compute_preds(func, arena);
 }
 
 

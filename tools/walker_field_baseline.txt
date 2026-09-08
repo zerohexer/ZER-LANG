@@ -1047,3 +1047,52 @@ checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.expr
 checker.c:expr_touches_local_derived:NODE_VAR_DECL:var_decl.init
 checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.body
 checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.cond
+
+# --- ir_lower.c: defer_body_ast_emittable (refactor L, BUG-994, 2026-09-08) ---
+# A STATEMENT-shape classifier, not a walker: "can the raw-AST defer emitter
+# (emit_defer_stmt) still express this body?" It descends exactly the body-carrying
+# kinds that emitter has arms for (block / if / while / for) and answers false for
+# every other statement kind at the top of the same call. Expression children are
+# deliberately not descended — a statement kind cannot hide inside an expression,
+# and the checker bans the expression forms that would matter (orelse fallbacks).
+ir_lower.c:defer_body_ast_emittable:NODE_ASM:asm_stmt.inputs
+ir_lower.c:defer_body_ast_emittable:NODE_ASM:asm_stmt.outputs
+ir_lower.c:defer_body_ast_emittable:NODE_ASSIGN:assign.target
+ir_lower.c:defer_body_ast_emittable:NODE_ASSIGN:assign.value
+ir_lower.c:defer_body_ast_emittable:NODE_AWAIT:await_stmt.cond
+ir_lower.c:defer_body_ast_emittable:NODE_BINARY:binary.left
+ir_lower.c:defer_body_ast_emittable:NODE_BINARY:binary.right
+ir_lower.c:defer_body_ast_emittable:NODE_CALL:call.args
+ir_lower.c:defer_body_ast_emittable:NODE_CALL:call.callee
+ir_lower.c:defer_body_ast_emittable:NODE_CRITICAL:critical.body
+ir_lower.c:defer_body_ast_emittable:NODE_DEFER:defer.body
+ir_lower.c:defer_body_ast_emittable:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:defer_body_ast_emittable:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:defer_body_ast_emittable:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:defer_body_ast_emittable:NODE_FIELD:field.object
+ir_lower.c:defer_body_ast_emittable:NODE_FILE:file.decls
+ir_lower.c:defer_body_ast_emittable:NODE_FOR:for_stmt.cond
+ir_lower.c:defer_body_ast_emittable:NODE_FOR:for_stmt.step
+ir_lower.c:defer_body_ast_emittable:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:defer_body_ast_emittable:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:defer_body_ast_emittable:NODE_IF:if_stmt.cond
+ir_lower.c:defer_body_ast_emittable:NODE_INDEX:index_expr.index
+ir_lower.c:defer_body_ast_emittable:NODE_INDEX:index_expr.object
+ir_lower.c:defer_body_ast_emittable:NODE_INTERRUPT:interrupt.body
+ir_lower.c:defer_body_ast_emittable:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:defer_body_ast_emittable:NODE_ONCE:once.body
+ir_lower.c:defer_body_ast_emittable:NODE_ORELSE:orelse.expr
+ir_lower.c:defer_body_ast_emittable:NODE_ORELSE:orelse.fallback
+ir_lower.c:defer_body_ast_emittable:NODE_RETURN:ret.expr
+ir_lower.c:defer_body_ast_emittable:NODE_SLICE:slice.end
+ir_lower.c:defer_body_ast_emittable:NODE_SLICE:slice.object
+ir_lower.c:defer_body_ast_emittable:NODE_SLICE:slice.start
+ir_lower.c:defer_body_ast_emittable:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:defer_body_ast_emittable:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:defer_body_ast_emittable:NODE_STRUCT_INIT:struct_init.fields
+ir_lower.c:defer_body_ast_emittable:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:defer_body_ast_emittable:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:defer_body_ast_emittable:NODE_TYPECAST:typecast.expr
+ir_lower.c:defer_body_ast_emittable:NODE_UNARY:unary.operand
+ir_lower.c:defer_body_ast_emittable:NODE_VAR_DECL:var_decl.init
+ir_lower.c:defer_body_ast_emittable:NODE_WHILE:while_stmt.cond

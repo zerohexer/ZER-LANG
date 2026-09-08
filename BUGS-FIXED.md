@@ -7,6 +7,102 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-995: a `shared struct` field in an asm operand was an unlocked read
+
+The 2026-09-06 limitations entry, measured live: `inputs: { "rax" = a.x }` in a `naked`
+function emitted `"a"(a.x)` with no `pthread_mutex_lock`, reachable from a spawned thread.
+The per-statement auto-lock never wraps an asm statement. Ban Decision Framework, criterion
+1 (hardware constraint): asm is legal only in a naked function, which has no prologue and no
+frame, so the mutex call cannot be emitted there — REJECT, with the sanctioned spelling in
+the message (read the field into a local in an ordinary function, pass the value). One query,
+`collect_shared_types_in_expr`, over both operand lists.
+Tests: `tests/zer_fail/asm_operand_shared_read.zer`, `tests/zer/asm_operand_plain_global_ok.zer`.
+
+---
+
+## Session 2026-09-08 — BUG-994: refactor L — a `defer` body is IR, spliced at every fire (the raw-AST defer emitter and the second defer analyzer are retired from the main path)
+
+The recorded refactor (limitations.md "L — FEASIBILITY", three earlier attempts) is landed.
+A defer body used to travel as raw AST: `emit_defer_stmt` was a SECOND statement emitter
+(with its own coverage — seven statement kinds fell to a "compiler bug" trap on VALID
+code, exit 0 from zerc), and `zercheck_ir` carried a SECOND handle analyzer that scanned
+the body's AST at every return block, applying every defer's frees to every exit.
+
+### What it is now
+- **`NODE_DEFER` lowers the body ONCE, at registration, in the registration scope**, into a
+  detached TEMPLATE (`DeferTpl`: the block range is copied aside and truncated out of
+  `func->blocks`). Lowering at the first fire was measured wrong: it can sit in a nested
+  scope where a same-named local shadows the one the body means.
+- **Every fire splices a CLONE of the template** (`materialise_defers`, called by
+  `emit_defer_fire` / `emit_defer_fire_scoped`; `ir_clone_blocks_from` remaps the
+  template's block ids onto the clone). LIFO, newest first; the `IR_DEFER_FIRE` is
+  emitted AFTER the clones, in the continuation block. A fire in a block that is already
+  terminated is dead code and splices nothing.
+- **The ARMED gate is a real branch** (`armed_setter_block` on the IR_BRANCH) and a
+  post-lowering pass, `ir_elide_dominated_armed_gates`, turns it into a plain jump wherever
+  the block that set the flag DOMINATES the gate — after the whole function is lowered,
+  because a later goto can add an edge. Where it does not dominate (the forward-goto-
+  skipped-registration shape the flag exists for), the branch stays.
+- **The both-reachable cleanup-label GUARD stays on the AST path** for a body the AST
+  emitter can express (`defer_fire_ast[i]`): the flag is set by a goto and tested at the
+  label's return, so as an IR branch it merges {freed} with {alive} into MAYBE_FREED and
+  zercheck would reject correct code. A guarded body the AST emitter CANNOT express is
+  cloned under an IR branch on the flag instead — correct code, at worst over-rejected.
+- **zercheck's function-exit AST scan (Phase C3) and `ir_fire_has_work_after` are gone.**
+  The forward pass sees the body's frees and uses on exactly the paths that run it. The
+  one AST scan left is the guarded body at its fire (uses, then frees, LIFO).
+- **A bounds guard inside a defer body emits IR_TRAP** (the emitter's `guard_traps` did the
+  same) — an early return there would re-fire the defer stack; it is also what stops the
+  M/L mutual recursion.
+- **Dead instructions are dropped at emission** (`emit_inst` / `emit_3ac` into a terminated
+  block). Found by the new boundary test: the block-exit fire after a `return` was
+  appended after the RETURN, the block's last instruction was then not a terminator,
+  `ensure_terminated` added a GOTO, and the CFG had a phantom edge out of a returning
+  block through which a freed handle flowed as MAYBE_FREED.
+- **Every clone is stamped with its defer's id** (`IRInst.defer_id`, assigned on the
+  IR_DEFER_PUSH at lowering) and the ordinary free path records it on the handle
+  (`ir_stamp_defer_free`). Found by `rust_tests/rt_drop_defer_goto_cleanup`: on the goto
+  path the defer's free is now an ORDINARY free in the clone, and the label's guarded AST
+  scan of the SAME defer then saw "already freed by something else" — a false double free.
+  The scan's discriminator (`freed_defer_id == this defer`) works again because the clone's
+  free carries the same id the scan compares against.
+- **M's declined guard sites shrink from five to two**: a struct / slice / optional-
+  returning function now returns a FRESH auto-zeroed temp (the type's zero value) from the
+  IR guard. The two that remain (a loop condition, an await condition) trap when the
+  function has ANY defer — the emitter can no longer fire a body it does not have — gated
+  on `Emitter.cur_func_has_defer`, computed from the IR, not on the block-order replay
+  count.
+
+### What it closed
+- **The seven statement kinds** (`switch`, `do-while`, `@critical`, `@once`, `spawn`,
+  `static_assert`, nested loops with `break`/`continue`) now work inside a defer body —
+  `tests/zer/defer_body_all_stmt_kinds.zer` runs them all and checks the values. The
+  `o51x9p` branch had proposed BANNING five of them (+615 lines); the Ban Decision
+  Framework picked support.
+- **The `break`-in-the-body's-own-loop shape** that blocked the third attempt validates
+  and runs (it is in the same test).
+- **A real leak-acceptance hole**: `tests/zer_gaps/audit2_defer_scan_nested.zer` (a defer
+  registered 32 branches deep) reported *"no longer exhibits its gap"* under the inverted
+  harness — the old scan credited that defer's free to the fall-through `return 0` that
+  never registered it. Promoted to `tests/zer_fail/defer_nested_branch_leak.zer` ("never
+  freed") with the boundary positive `defer_nested_branch_covered_ok.zer`.
+- A label inside a defer body is now a checker error (`goto` is banned there, so it could
+  never be a target; and a label's block is allocated outside the template) —
+  `tests/zer_fail/defer_body_label.zer`.
+- `cinterop_defer_double_close` now reports through the ordinary path ("double free: local
+  %0 already freed", plus the use-after-free the same call is), exactly as the direct
+  `dev_close(dev); dev_close(dev);` spelling does; its `expect-error` was updated.
+
+### Residuals (limitations.md)
+The label-guarded AST path (`emit_defer_stmt` survives for it alone), the `orelse`-in-defer
+ban (the template is lowered once and `pre_lower_orelse` mutates the AST, which the
+AST-path copy would then see), and the two declined guard sites.
+
+make check on the exact tree: fuzz 200/0, zer 1589/0, modules 30/0, defer-goto / cflow /
+escape matrices clean.
+
+---
+
 ## Session 2026-09-08 — BUG-990..993: four found by probing after the harvests (two silent miscompiles)
 
 Probes written against the merged compiler while the harvest `make check` ran; each judged by

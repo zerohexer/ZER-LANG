@@ -6159,6 +6159,54 @@ INVARIANTS for future work:
   cleanup because they assert return values, not side-effects
   (rt_drop_defer_goto_cleanup, rt_goto_fires_defer, gen_defer_009).
 
+### Refactor L — a defer body is IR, spliced at every fire (2026-09-08, BUG-994)
+
+**Mandatory before touching defer lowering, emission or analysis.** Supersedes the
+"raw AST body, emitted by emit_defer_stmt, scanned by zercheck's Phase C3" model that
+the section above still partly describes; the capture-on-FIRE snapshot and the
+runtime flags described there are all still real — what changed is who EMITS and who
+ANALYSES a body.
+
+- **Registration (`NODE_DEFER`, ir_lower.c):** after the IR_DEFER_PUSH and the ARMED
+  flag, `lower_defer_template` lowers the body through the ordinary `lower_stmt` (a
+  single-statement body is wrapped in a synthesized NODE_BLOCK so the per-statement
+  guard/lock/unlock sequence applies) into a fresh block range, records
+  `DeferTpl{blocks,count,first,exit,armed_block,ast_emittable}` in `ctx->defer_tpl[depth]`
+  (parallel to `defer_bodies[]`), copies the block headers aside and TRUNCATES
+  `func->block_count` back. Loop context, `block_defers_managed`, the statement shared
+  root and the label guard are neutralised for the body; `defer_body_depth`/`_base`
+  are set so a fire inside the body may only materialise defers registered inside it.
+- **Fire (`materialise_defers`, called from `emit_defer_fire` and
+  `emit_defer_fire_scoped` — pop-only fires splice nothing):** for each live body,
+  newest first: dead block → nothing; label-guarded AND `ast_emittable` →
+  `fire->defer_fire_ast[i] = 1` (AST path); otherwise optional `IR_BRANCH(flag → skip)`
+  for a guarded-but-inexpressible body, optional `IR_BRANCH(armed → run)` carrying
+  `armed_setter_block`, then `ir_clone_blocks_from(template)` remapping
+  `[first, first+count)` onto the clone, GOTO into it, GOTO from its exit block to the
+  continuation. The IR_DEFER_FIRE is emitted by the caller AFTER this, into the
+  continuation, with `defer_bodies_materialised = true`.
+- **Post pass (`ir_elide_dominated_armed_gates`, ir.c, after `ir_compute_preds`):** an
+  armed gate whose setter dominates it becomes `IR_GOTO true_block`; preds recomputed.
+- **Emitter:** IR_DEFER_FIRE emits ONLY bodies with `defer_fire_ast[i]` (the
+  guarded/armed wrapping is unchanged for them). `emit_defers_from` aborts if reached
+  with a pending defer; `emit_safety_early_return` traps when `cur_func_has_defer`.
+- **zercheck_ir:** IR_DEFER_FIRE scans only `defer_fire_ast` bodies (uses then frees,
+  LIFO, `ir_defer_instance_id` for the double-free discriminator). Phase C3 and
+  `ir_fire_has_work_after` are deleted. Everything else about a defer body is ordinary
+  IR the fixpoint already analyses — including the frees a nested-branch defer does NOT
+  perform on the paths that never registered it (the promoted gap).
+- **`emit_inst` / `emit_3ac` drop an instruction emitted into a terminated block.** The
+  phantom-edge story is in BUGS-FIXED BUG-994; do not "fix" a missing dead instruction
+  by re-enabling appends after a terminator.
+- **`IRInst.defer_id`:** assigned on the PUSH (`ctx->defer_seq`, 1-based per function),
+  stamped on every instruction of a clone (a nested defer's clones keep their own), and
+  recorded by zercheck's ordinary free path via `ir_stamp_defer_free` — the label-guarded
+  AST scan skips a free its own eager (goto-path) clone already performed by comparing
+  `freed_defer_id` against `ir_defer_instance_id` (which now returns the PUSH's id).
+- **Invariants:** IR_DEFER_PUSH / IR_DEFER_FIRE stay for `ir_validate`'s balance check;
+  the template is never in `func->blocks` (only clones are); a clone's
+  `armed_setter_block` is remapped with the edges; `make_inst` sets it to -1.
+
 ### V3 target-type routing
 
 `route_alloc_to_ptr_if_needed(call, target)` and

@@ -434,8 +434,9 @@ through one optional level.
 
 ### TWO REFACTORS — architectural, and one closes a recorded item
 
-**L. Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
-emitter.** *(CROSS-BRANCH COMPARISON DONE 2026-09-06 — this SUPERSEDES `o51x9p`'s
+**L. ~~Lower DEFER BODIES into the IR at every fire site; delete the raw-AST defer
+emitter.~~ — LANDED 2026-09-08 as BUG-994 (see "L — DONE" below; the raw-AST emitter
+survives for ONE residual shape only).** Original: *(CROSS-BRANCH COMPARISON DONE 2026-09-06 — this SUPERSEDES `o51x9p`'s
 answer to the same defect; see the corrected CLASS 8. o51x9p BANS the constructs
 in +615 lines, ii7a90 SUPPORTS them at net −386, and the Ban Decision Framework
 picks ii7a90 because the ban's only possible justification — emission
@@ -562,6 +563,35 @@ emitting IR, until the emitter's is deleted.
   incrementally landable, unlike L's stage 2.
 - Restricting the first cut to void/integer/bool return types is safe: anything else
   declines and the emitter's guard still fires. Declining is always safe.
+
+### L — DONE 2026-09-08 (BUG-994). The record below is kept; do not re-derive it.
+
+Landed as the FOURTH attempt, built on the measured record that follows: template at
+REGISTRATION (extract + truncate), clone at every fire, ARMED gate elided by dominance
+(`ir_elide_dominated_armed_gates`), the label-GUARDED body kept on the AST path, IR_TRAP
+for a guard inside a body, zercheck's Phase C3 deleted. Two things the record did not
+predict, both found by tests: (1) the fourth attempt's blocker (`break` in the body's own
+loop) simply did not reproduce once the template was cloned from an extracted copy with
+its own id remap — the earlier attempts cloned a live range that the truncation had
+already reused; (2) an instruction emitted into an already-terminated block created a
+phantom CFG edge (block-exit fire after `return`, then `ensure_terminated`'s GOTO), which
+the AST scan had masked — dead instructions are dropped now.
+
+**RESIDUALS (open, LOW):**
+- **The label-guarded body is still emitted from the AST.** `emit_defer_stmt` exists for
+  exactly that: a both-reachable cleanup label (`goto done;` with a live fall-through into
+  `done:`) fires the goto-fired defers under `if (!flag)`. As IR the flag branch merges
+  {freed}/{alive} into MAYBE_FREED and zercheck rejects correct code; the only precise
+  route is tail-duplicating the label's exit per predecessor class. A guarded body the AST
+  emitter cannot express is cloned under the flag branch (sound, possibly over-rejected).
+  Statement kinds it can express: block / expr-stmt / var-decl / if / while / for /
+  break / continue — `defer_body_ast_emittable` in ir_lower.c is the single definition.
+- **`orelse` with a value fallback stays banned in a defer body.** The body is lowered
+  once and `pre_lower_orelse` REPLACES the orelse with a temp identifier in the AST; the
+  AST-path copy above would then name a temp assigned only inside the template. Lift the
+  ban together with the residual above.
+- **Two guard sites the emitter still owns** (a loop condition, an await condition) TRAP
+  instead of returning early when the function has any defer.
 
 ### L — FEASIBILITY, MEASURED 2026-09-06. Read before implementing; the obvious route is the WRONG one.
 
@@ -873,7 +903,11 @@ Tripwire: none yet — write the positive in the same commit as the fix.
 
 ---
 
-## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+## CLOSED 2026-09-08 (BUG-995) — a `shared struct` read in an ASM OPERAND takes NO LOCK
+
+**Decided by the Ban Decision Framework as a hardware constraint and REJECTED at the checker: asm is legal only in a `naked` function, which has no frame to take a mutex in, so the entry's own second hazard is the answer. One query (`collect_shared_types_in_expr`) over both operand lists. Tripwire `tests/zer_fail/asm_operand_shared_read.zer`, boundary `tests/zer/asm_operand_plain_global_ok.zer`. Item O's call-laundered shape is untouched, as the entry asked. Kept as the record.**
+
+### (original entry)
 
 Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
 not reported by any branch. The baseline claimed an asm operand can reach "no local, no

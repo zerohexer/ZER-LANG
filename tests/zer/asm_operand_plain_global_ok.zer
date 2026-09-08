@@ -1,0 +1,15 @@
+// BUG-995 boundary: an asm operand reading a PLAIN global (no shared struct) is
+// unaffected, and a shared field read into a local in an ordinary function and
+// passed by value is the sanctioned spelling. Compile + run on the host: "nop".
+shared struct A { u32 x; }
+A a;
+u32 plain = 3;
+naked void k(u32 v) {
+    asm { instructions: "nop" inputs: { "rax" = plain, "rbx" = v } safety: "no-op instruction, reads two scalar values into registers" }
+}
+u32 main() {
+    a.x = 4;
+    u32 v = a.x;      // locked read, ordinary statement
+    k(v);
+    return plain - 3;
+}

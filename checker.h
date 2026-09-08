@@ -233,6 +233,13 @@ typedef struct {
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
         bool compound_in_func;  /* compound assign in regular func */
+        /* BUG-971: this entry names a STATIC LOCAL, not a global. It is the same
+         * hazard — one object, reached from both the ISR and main — but it has no
+         * global-scope Symbol, so check_interrupt_safety cannot look it up and needs
+         * to be told, and its diagnostic names a different remedy (there is no
+         * `volatile static local` idiom to point at; the fix is to pass the value). */
+        bool is_static_local;
+        int  decl_line;
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;

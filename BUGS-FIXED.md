@@ -5,6 +5,87 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-971: a static local was invisible to BOTH race scans
+
+A `static u32 c = 0;` inside a function is ONE object for every thread that runs it, and
+for main-vs-ISR alike. The emitted C says so verbatim:
+
+```c
+void w(void) {
+    static uint32_t c = 0;      // one object, every thread
+```
+
+But it has no global-scope Symbol, and both race scans resolved names with
+`scope_lookup(c->global_scope, …)`, so neither saw it. `spawn w(); spawn w();` over a
+static-local RMW compiled clean, and so did a static local shared between an ISR and main.
+
+### The two sinks were byte-identical, which is the point
+
+`scan_unsafe_global_access` and `record_isr_globals` had the SAME NODE_VAR_DECL arm,
+character for character — confirmed by diffing, not assumed. That is the mirrored-sink
+family this file keeps recording, and it means the fix is one edit shape applied twice in
+the same commit.
+
+The static local is recorded in that arm at both sinks, beside the `*u32 p = &counter`
+alias it already records, and read at each IDENT arm. A scan-scoped table rather than a
+threaded body root, because the scan has SEVEN body-entry points — threading a root
+through all of them is exactly the multi-site risk the fix exists to remove.
+
+The ISR half needed two more things: `check_interrupt_safety` stopped `continue`-ing on a
+name with no global Symbol, and got its own diagnostic — there is no "declare it
+volatile" remedy worth pointing at for a static local; the honest fix is to stop sharing
+one object.
+
+Exemptions match what a global gets, for the same reasons: `const` is immutable and a
+single-word `volatile` is the established flag idiom.
+
+### The noun was wrong in eight places
+
+Eight spawn diagnostics hardcoded "non-shared global". Saying that about a static local
+sends the reader hunting for a global that does not exist — the same inaccuracy as
+quoting `&tl` for an argument written as `q`. One query, `scan_finding_noun()`, so the
+eight cannot drift.
+
+### A ternary between two format strings shares ONE argument list
+
+Adding `%s` to one branch of
+
+```c
+checker_error(c, line, _rmw_flagged_rmw ? "…volatile global '%.*s'…"
+                                        : "…accesses %s '%.*s'…", …);
+```
+
+made the OTHER branch read a `char *` as an `int` precision. **GCC could not warn**,
+because the format is not a literal — the ternary defeats `-Wformat`. It surfaced as five
+existing negatives failing "for the WRONG REASON", which is the harness earning its keep.
+
+Split into two calls with two argument lists. Worth remembering as a shape: a ternary
+format string is a silent `-Wformat` hole, and any edit to one branch must be mirrored in
+the other.
+
+### Gate
+
+**STATIC-LOCAL GRID in `tests/test_hw_matrix.c`** — SITE x SHAPE, the same cross-product
+as the volatile-width grid above it and for the same reason: two independent sinks with
+the identical defect, so DISAGREEMENT is a failure and not merely a miss.
+
+Verified to FIRE: both `plain-static` cells report FALSE-NEGATIVE on the pre-fix
+compiler; the two exemption cells stay green on both sides.
+
+**Harness trap worth knowing:** `test_hw_matrix` AUTO-DETECTS `./zerc` from the cwd and
+IGNORES `argv[1]`. So `/tmp/thw /path/to/old/zerc` silently measures the NEW compiler, and
+the grid appears to pass on a broken build — which is exactly what it did on the first
+attempt. Run it FROM the baseline tree. Same lesson as "check WHICH BINARY each row ran",
+one level up in the harness.
+
+Also generalised `run_vol`'s failure text: it said "a TEARING volatile access COMPILED
+CLEAN", which describes the wrong defect now that it serves two grids.
+
+Tests: the branch's three verbatim plus the boundary positive
+`spawn_static_local_exempt_ok`.
+
+---
+
 ## Session 2026-09-09 — BUG-970: copying a unique resource made two owners of one buffer
 
 `Arena`, `Barrier` and `Semaphore` alias their state when copied, and were refused

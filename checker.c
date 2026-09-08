@@ -887,7 +887,10 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static int classify_return_root(Checker *c, Node *rexpr);
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
-static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound);
+static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
+                                bool is_compound, bool is_static_local, int line);
+/* BUG-971: the original three-argument form, for the many GLOBAL call sites. */
+#define track_isr_global(c, n, l, comp) track_isr_global_ex((c), (n), (l), (comp), false, 0)
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -3099,11 +3102,56 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
 #define RMW_ALIAS_MAX 16
 static struct { const char *name; uint32_t len; Symbol *global; } _rmw_alias[RMW_ALIAS_MAX];
 static int _rmw_alias_count = 0;
+/* BUG-971: STATIC LOCALS seen while scanning reachable bodies.
+ *
+ * A `static u32 c = 0;` inside a function is ONE object for every thread that runs it
+ * and for main-vs-ISR alike — the same hazard as a non-shared global, and the emitted
+ * C says so (`static uint32_t c = 0;` in the function). But it has no global-scope
+ * Symbol, and BOTH scans resolve names with `scope_lookup(c->global_scope, …)`, so
+ * neither saw it: `spawn w(); spawn w();` over a static-local RMW compiled clean, and
+ * so did a static local shared between an ISR and main.
+ *
+ * The two scans (scan_unsafe_global_access, record_isr_globals) are the mirrored-sink
+ * family CLAUDE.md names — their NODE_VAR_DECL arms are byte-identical — so this is
+ * recorded in the SAME arm that already records the `*u32 p = &counter` alias, in both.
+ * A table rather than a threaded body root because the scan has SEVEN entry points;
+ * threading through all of them is the multi-site risk this fix exists to remove. */
+#define STATIC_LOCAL_MAX 32
+static struct { const char *name; uint32_t len; } _static_locals[STATIC_LOCAL_MAX];
+static int _static_local_count = 0;
+static bool static_local_seen(const char *n, uint32_t l) {
+    for (int i = 0; i < _static_local_count; i++)
+        if (_static_locals[i].len == l && memcmp(_static_locals[i].name, n, l) == 0)
+            return true;
+    return false;
+}
+/* The exemptions a GLOBAL gets, for the same reasons: `const` is immutable, and a
+ * single-word `volatile` is the established flag idiom (see
+ * volatile_global_exempt_from_race_check, which also states why that is not a claim of
+ * race-freedom). Anything else is one object with no lock. */
+static void static_local_record(Node *vd) {
+    if (!vd->var_decl.is_static || !vd->var_decl.name) return;
+    if (vd->var_decl.is_const || vd->var_decl.is_volatile) return;
+    if (_static_local_count >= STATIC_LOCAL_MAX) return;
+    _static_locals[_static_local_count].name = vd->var_decl.name;
+    _static_locals[_static_local_count].len  = (uint32_t)vd->var_decl.name_len;
+    _static_local_count++;
+}
 /* Set when the spawn scan flags a global specifically because of a non-atomic
  * read-modify-write, so the diagnostic can name THAT rather than the generic
  * "accesses non-shared global" (which reads as if any access were the problem). */
 static bool _rmw_flagged_rmw = false;
-static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false; }
+/* BUG-971: the scan can now flag a STATIC LOCAL as well as a non-shared global, and
+ * EIGHT diagnostics hardcoded the noun "non-shared global". Saying that about a static
+ * local sends the reader hunting for a global that does not exist — the same
+ * inaccuracy as quoting `&tl` for an argument the user wrote as `q`. One query, so the
+ * eight cannot drift apart. */
+static bool _scan_found_static_local = false;
+static const char *scan_finding_noun(void) {
+    return _scan_found_static_local ? "static local" : "non-shared global";
+}
+static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
+                                    _static_local_count = 0; _scan_found_static_local = false; /* BUG-971 */ }
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
     for (int i = 0; i < _rmw_alias_count; i++)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
@@ -5997,6 +6045,15 @@ static Type *check_expr(Checker *c, Node *node) {
         if (sym && !sym->is_function && c->current_func_ret != NULL) {
             Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
                                       (uint32_t)node->ident.name_len);
+            /* BUG-971: a STATIC LOCAL is one object for every execution of the
+             * function, so main touching it is the `from_func` half of the same
+             * sharing question a global answers. Recorded here, where the ident's
+             * own Symbol is in scope — the ISR half is recorded by
+             * record_isr_globals, which descends into called bodies. */
+            if (!gs && sym->is_static)
+                track_isr_global_ex(c, node->ident.name,
+                                    (uint32_t)node->ident.name_len, false,
+                                    true, node->loc.line);
             if (gs && gs == sym) {
                 /* this ident IS a global — track ISR/func access */
                 track_isr_global(c, node->ident.name,
@@ -8266,22 +8323,22 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (fsym->props.has_sync) {
                             checker_warning(c, node->loc.line,
                                 "'%.*s' forwards this function-pointer argument to a "
-                                "spawn, and '%.*s' accesses non-shared global '%.*s' — "
+                                "spawn, and '%.*s' accesses %s '%.*s' — "
                                 "potential data race (atomic/barrier present, verify "
                                 "ordering)",
                                 (int)node->call.callee->ident.name_len,
                                 node->call.callee->ident.name,
                                 (int)an->ident.name_len, an->ident.name,
-                                (int)fblen, fbad);
+                                scan_finding_noun(), (int)fblen, fbad);
                         } else {
                             checker_error(c, node->loc.line,
                                 "'%.*s' forwards this function-pointer argument to a "
-                                "spawn, and '%.*s' accesses non-shared global '%.*s' — "
+                                "spawn, and '%.*s' accesses %s '%.*s' — "
                                 "data race. Use shared struct, threadlocal, or @atomic_*",
                                 (int)node->call.callee->ident.name_len,
                                 node->call.callee->ident.name,
                                 (int)an->ident.name_len, an->ident.name,
-                                (int)fblen, fbad);
+                                scan_finding_noun(), (int)fblen, fbad);
                         }
                     }
                 }
@@ -13957,6 +14014,18 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             *out_len = (uint32_t)node->ident.name_len;
             return true;
         }
+        /* BUG-971: a STATIC LOCAL in a body this spawn reaches is ONE object for
+         * every thread that runs the function — the same hazard as a non-shared
+         * global, and invisible here for the same reason it was invisible to the ISR
+         * scan: it has no global-scope Symbol. static_local_record has already seen
+         * its declaration during this same walk. */
+        if (!sym && static_local_seen(node->ident.name,
+                                      (uint32_t)node->ident.name_len)) {
+            _scan_found_static_local = true;
+            *out_name = node->ident.name;
+            *out_len = (uint32_t)node->ident.name_len;
+            return true;
+        }
         return false;
     }
     /* Recurse into children */
@@ -13989,6 +14058,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         /* BUG-792: remember `*u32 p = &counter` so a later `*p += 1` in this body
          * resolves to counter. Recorded here because the scan cannot look up
          * another function's locals through the scope chain. */
+        static_local_record(node);   /* BUG-971 */
         if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
             Node *vi = unwrap_ptr_launder(node->var_decl.init);
             if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
@@ -18816,23 +18886,33 @@ static void check_stmt(Checker *c, Node *node) {
                 bool has_sync = func_sym->props.has_sync;
                 if (has_sync) {
                     checker_warning(c, node->loc.line,
-                        "spawn target '%.*s' accesses non-shared global '%.*s' — "
+                        "spawn target '%.*s' accesses %s '%.*s' — "
                         "potential data race (atomic/barrier present, verify ordering)",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                        (int)bad_len, bad_name);
+                        scan_finding_noun(), (int)bad_len, bad_name);
                 } else {
-                    checker_error(c, node->loc.line,
-                        _rmw_flagged_rmw ?
-                        "spawn target '%.*s' performs a non-atomic read-modify-write on "
-                        "volatile global '%.*s' — data race. volatile gives NO atomicity, "
-                        "so the read and the write can interleave with another thread; "
-                        "use @atomic_add / @atomic_* or a shared struct" :
-                        "spawn target '%.*s' accesses non-shared global '%.*s' — "
-                        "data race. Use shared struct, threadlocal, or @atomic_* "
-                        "(volatile is NOT synchronization — it gives no atomicity "
-                        "or ordering)",
-                        (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                        (int)bad_len, bad_name);
+                    /* BUG-971: SPLIT from a ternary between two format strings. A
+                     * ternary shares ONE argument list, so adding %s to only one
+                     * branch made the other read a char* as an int precision — five
+                     * negatives started failing "for the WRONG REASON", and the
+                     * compiler could not warn because the format is not a literal.
+                     * Two calls, two wordings, two arg lists that cannot drift. */
+                    if (_rmw_flagged_rmw)
+                        checker_error(c, node->loc.line,
+                            "spawn target '%.*s' performs a non-atomic read-modify-write "
+                            "on volatile global '%.*s' — data race. volatile gives NO "
+                            "atomicity, so the read and the write can interleave with "
+                            "another thread; use @atomic_add / @atomic_* or a shared struct",
+                            (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                            (int)bad_len, bad_name);
+                    else
+                        checker_error(c, node->loc.line,
+                            "spawn target '%.*s' accesses %s '%.*s' — "
+                            "data race. Use shared struct, threadlocal, or @atomic_* "
+                            "(volatile is NOT synchronization — it gives no atomicity "
+                            "or ordering)",
+                            (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                            scan_finding_noun(), (int)bad_len, bad_name);
                 }
             }
         }
@@ -18899,17 +18979,17 @@ static void check_stmt(Checker *c, Node *node) {
                 if (asym->props.has_sync) {
                     checker_warning(c, node->loc.line,
                         "spawn target may invoke '%.*s' (passed as a function-pointer "
-                        "argument) which accesses non-shared global '%.*s' — potential "
+                        "argument) which accesses %s '%.*s' — potential "
                         "data race (atomic/barrier present, verify ordering)",
                         (int)an->ident.name_len, an->ident.name,
-                        (int)ablen, abad);
+                        scan_finding_noun(), (int)ablen, abad);
                 } else {
                     checker_error(c, node->loc.line,
                         "spawn target may invoke '%.*s' (passed as a function-pointer "
-                        "argument) which accesses non-shared global '%.*s' — data race. "
+                        "argument) which accesses %s '%.*s' — data race. "
                         "Use shared struct, threadlocal, or @atomic_*",
                         (int)an->ident.name_len, an->ident.name,
-                        (int)ablen, abad);
+                        scan_finding_noun(), (int)ablen, abad);
                 }
             }
         }
@@ -18948,17 +19028,17 @@ static void check_stmt(Checker *c, Node *node) {
                 if (syncsym->props.has_sync) {
                     checker_warning(c, node->loc.line,
                         "spawn target '%.*s' calls through a function-pointer field "
-                        "whose bound function accesses non-shared global '%.*s' — "
+                        "whose bound function accesses %s '%.*s' — "
                         "potential data race (atomic/barrier present, verify ordering)",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                        (int)fpblen, fpbad);
+                        scan_finding_noun(), (int)fpblen, fpbad);
                 } else {
                     checker_error(c, node->loc.line,
                         "spawn target '%.*s' calls through a function-pointer field "
-                        "whose bound function accesses non-shared global '%.*s' — "
+                        "whose bound function accesses %s '%.*s' — "
                         "data race. Use shared struct, threadlocal, or @atomic_*",
                         (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
-                        (int)fpblen, fpbad);
+                        scan_finding_noun(), (int)fpblen, fpbad);
                 }
             }
         }
@@ -21026,11 +21106,14 @@ void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud) {
 /* ================================================================
  * INTERRUPT SAFETY — track globals shared between ISR and regular code
  * ================================================================ */
-static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bool is_compound) {
+static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
+                                bool is_compound, bool is_static_local, int line) {
     /* find existing entry */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
         if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+            if (is_static_local) { g->is_static_local = true;
+                                   if (!g->decl_line) g->decl_line = line; }
             if (c->in_interrupt) {
                 g->from_isr = true;
                 if (is_compound) g->compound_in_isr = true;
@@ -21052,6 +21135,8 @@ static void track_isr_global(Checker *c, const char *name, uint32_t name_len, bo
     memset(g, 0, sizeof(*g));
     g->name = name;
     g->name_len = name_len;
+    g->is_static_local = is_static_local;
+    g->decl_line = line;
     if (c->in_interrupt) {
         g->from_isr = true;
         if (is_compound) g->compound_in_isr = true;
@@ -21148,6 +21233,13 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                                   (uint32_t)node->ident.name_len);
         if (gs && !gs->is_function)
             track_isr_global(c, node->ident.name, (uint32_t)node->ident.name_len, false);
+        /* BUG-971: a STATIC LOCAL in a body this ISR reaches. It has no global-scope
+         * Symbol, which is exactly why it was invisible here; static_local_record has
+         * already seen its declaration during this same walk. */
+        else if (!gs && static_local_seen(node->ident.name,
+                                          (uint32_t)node->ident.name_len))
+            track_isr_global_ex(c, node->ident.name, (uint32_t)node->ident.name_len,
+                                false, true, node->loc.line);
         return;
     }
     case NODE_ASSIGN: {
@@ -21247,6 +21339,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         /* BUG-792 (mirrored sink): remember `*u32 p = &counter` so a later
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
+        static_local_record(node);   /* BUG-971 */
         if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
             Node *vi = unwrap_ptr_launder(node->var_decl.init);
             if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
@@ -21718,6 +21811,20 @@ static void check_interrupt_safety(Checker *c) {
         struct IsrGlobal *g = &c->isr_globals[i];
         if (!g->from_isr || !g->from_func) continue; /* not shared */
         /* shared global — check volatile */
+        /* BUG-971: a static local has no global Symbol, so the lookup below cannot
+         * find it — and `continue` silently dropped it. Its remedy is different too:
+         * there is no "declare it volatile" for a static local worth pointing at, and
+         * the honest fix is to stop sharing one object. */
+        if (g->is_static_local) {
+            checker_error(c, g->decl_line,
+                "static local '%.*s' is accessed from both interrupt and main code — "
+                "a static local is ONE object for every execution of its function, so "
+                "the interrupt can preempt main mid-update exactly as a shared global "
+                "can. Pass the value in and out, or make it a shared struct / "
+                "@atomic_* cell",
+                (int)g->name_len, g->name);
+            continue;
+        }
         Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
         if (!sym) continue;
         if (!sym->is_volatile) {

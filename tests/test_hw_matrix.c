@@ -363,6 +363,60 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     }
 }
 
+/* ================================================================
+ * STATIC-LOCAL GRID (BUG-971) — SITE x SHAPE, the same mirrored-sink shape.
+ *
+ * A `static u32 c = 0;` inside a function is ONE object for every thread that runs
+ * it and for main-vs-ISR alike — the emitted C says so (`static uint32_t c = 0;` in
+ * the function). But it has no global-scope Symbol, and BOTH race scans resolved
+ * names with `scope_lookup(c->global_scope, …)`, so NEITHER saw it:
+ *
+ *     void w() { static u32 c = 0; c += 1; }
+ *     u32 main() { spawn w(); spawn w(); return 0; }     // compiled clean
+ *
+ * Crossed with SITE for exactly the reason the volatile grid above is: the two
+ * sinks are independent code, they had the identical defect, and a fix applied to
+ * one and forgotten at the other is the recurring failure. Disagreement is a
+ * failure here, not just a miss.
+ *
+ * The POSITIVE shapes are the same exemptions a global gets — `const` is immutable
+ * and a single-word `volatile` is the established flag idiom — so the widening
+ * cannot quietly reject ordinary code.
+ * ================================================================ */
+typedef enum { SLSHAPE_PLAIN, SLSHAPE_CONST, SLSHAPE_VOLATILE, SLSHAPE_COUNT } SLShape;
+static const char *slshape_name(SLShape s) {
+    switch (s) {
+    case SLSHAPE_PLAIN:    return "plain-static";
+    case SLSHAPE_CONST:    return "static-const";
+    case SLSHAPE_VOLATILE: return "static-volatile-word";
+    case SLSHAPE_COUNT: break;
+    }
+    return "?";
+}
+/* Only the plain one is a hazard; the two exemptions must keep compiling. */
+static int slshape_is_negative(SLShape s) { return s == SLSHAPE_PLAIN; }
+static void gen_sl(VSite site, SLShape shape, char *out, size_t n) {
+    const char *decl;
+    const char *use;
+    switch (shape) {
+    case SLSHAPE_PLAIN:    decl = "static u32 c = 0;";          use = "c = c + 1;";   break;
+    case SLSHAPE_CONST:    decl = "static const u32 c = 4;";    use = "u32 z = c;";   break;
+    case SLSHAPE_VOLATILE: decl = "static volatile u32 c = 0;"; use = "c = 1;";       break;
+    case SLSHAPE_COUNT:    decl = ""; use = ""; break;
+    }
+    if (site == VSITE_SPAWN)
+        snprintf(out, n,
+            "void w(){ %s %s }\nu32 main(){ spawn w(); spawn w(); return 0; }\n",
+            decl, use);
+    else
+        /* helper() is reached from BOTH the ISR and main, which is what makes the
+         * static SHARED — the same from_isr && from_func pairing a global needs. */
+        snprintf(out, n,
+            "void helper(){ %s %s }\ninterrupt TIMER { helper(); }\n"
+            "u32 main(){ helper(); return 0; }\n",
+            decl, use);
+}
+
 /* run_neg/run_pos with per-cell zerc flags (the over-width cell needs a 32-bit
  * target). Same EMIT-ONLY contract and integrity guard as the helpers above. */
 static int run_vol(const char *name, const char *code, const char *flags, int negative) {
@@ -385,7 +439,11 @@ static int run_vol(const char *name, const char *code, const char *flags, int ne
     }
     if (rc == 0) {
         failed++; false_neg++;
-        fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — a TEARING volatile access COMPILED CLEAN\n", name);
+        /* BUG-971: run_vol now serves TWO grids (volatile width, and static locals),
+         * so the wording cannot name one of them — a failure message that describes
+         * the wrong defect sends the reader after the wrong bug. The cell NAME
+         * ("vol/..." or "sl/...") and the printed program say which. */
+        fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — an UNSYNCHRONISED SHARED ACCESS COMPILED CLEAN\n", name);
         fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
         return 0;
     }
@@ -434,6 +492,23 @@ int main(void) {
             int ok = run_vol(nm, vbuf, vshape_flags(vp), neg);
             fprintf(stderr, "  [%-5s][%-18s][%-3s] %s\n",
                     vsite_name(vs), vshape_name(vp), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
+    }
+
+    /* ---- static-local grid: SITE x SHAPE (BUG-971, both sinks must agree) ---- */
+    fprintf(stderr, "\n  -- static-local grid (spawn vs ISR must agree) --\n");
+    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+        for (SLShape sp = 0; sp < SLSHAPE_COUNT; sp++) {
+            valid_cells++;
+            int neg = slshape_is_negative(sp);
+            char nm[192];
+            snprintf(nm, sizeof(nm), "sl/%s/%s", vsite_name(vs), slshape_name(sp));
+            gen_sl(vs, sp, vbuf, sizeof(vbuf));
+            int ok = run_vol(nm, vbuf, "", neg);
+            fprintf(stderr, "  [%-5s][%-20s][%-3s] %s\n",
+                    vsite_name(vs), slshape_name(sp), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }

@@ -1010,7 +1010,45 @@ Doors: plain copy, by-value param, return, orelse fallback, a struct CARRYING on
 and a struct-init field. Their fix is one predicate `type_unique_resource_name` +
 `check_unique_resource_copy` at every value-flow site — the one-query shape.
 
-**E. STATIC LOCALS are invisible to the spawn race scan AND the ISR check (BUG-915).**
+**E. ~~STATIC LOCALS are invisible to the spawn race scan AND the ISR check
+(BUG-915)~~ — CLOSED 2026-09-09 as BUG-971.** DO NOT REDO.
+
+A `static u32 c = 0;` inside a function is ONE object for every thread that runs it and
+for main-vs-ISR alike — the emitted C says so verbatim (`static uint32_t c = 0;` inside
+the function). But it has no global-scope Symbol, and BOTH scans resolved names with
+`scope_lookup(c->global_scope, …)`, so NEITHER saw it.
+
+**The two sinks' NODE_VAR_DECL arms were byte-identical** (`scan_unsafe_global_access`
+at one, `record_isr_globals` at the other) — the mirrored-sink family, confirmed by
+diffing rather than assumed. The static local is recorded in that same arm at both,
+beside the `*u32 p = &counter` alias it already records, and read at each IDENT arm. A
+scan-scoped table rather than a threaded body root because the scan has SEVEN entry
+points; threading through all of them is the multi-site risk the fix exists to remove.
+
+The ISR half also needed `check_interrupt_safety` to stop `continue`-ing on a name with
+no global Symbol, and its own diagnostic: there is no "declare it volatile" remedy worth
+pointing at for a static local.
+
+**A diagnostic-accuracy fix came with it.** EIGHT spawn messages hardcoded the noun
+"non-shared global"; saying that about a static local sends the reader hunting for a
+global that does not exist. One query, `scan_finding_noun()`, so the eight cannot drift.
+
+**And a real trap, caught by five negatives failing "for the WRONG REASON":** one of
+those sites selected between two format strings with a `?:`. A ternary shares ONE
+argument list, so adding `%s` to only one branch made the other read a `char *` as an
+`int` precision — and the compiler could not warn, because the format is not a literal.
+It is now two calls with two arg lists.
+
+Gated by the **STATIC-LOCAL GRID in `tests/test_hw_matrix.c`** — SITE x SHAPE, the same
+cross-product as the volatile-width grid above it and for the same reason: the two sinks
+are independent code with the identical defect, so DISAGREEMENT is a failure, not just a
+miss. Verified to FIRE: run from the baseline tree, both `plain-static` cells report
+FALSE-NEGATIVE and the two exemption cells (`static const`, single-word `static
+volatile`) stay green on both sides.
+
+**Note the harness trap:** `test_hw_matrix` AUTO-DETECTS `./zerc` from the cwd and
+ignores `argv[1]`, so `/tmp/thw /path/to/old/zerc` silently measures the NEW compiler and
+the grid appears to pass on a broken build. Run it FROM the baseline tree instead.
 
     void w() { static u32 c = 0; c += 1; }
     u32 main() { spawn w(); spawn w(); return 0; }
@@ -1154,7 +1192,7 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 ### Suggested order for this branch
 
 ~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
-BUG-969) → ~~D~~ (DONE, BUG-970) → **E** → **B** → **H** → **I**.
+BUG-969) → ~~D~~ (DONE, BUG-970) → ~~E~~ (DONE, BUG-971) → **B** → **H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

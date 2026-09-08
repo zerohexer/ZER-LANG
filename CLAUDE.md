@@ -481,6 +481,15 @@ line, plus TWELVE axis-crossed matrices:
 Matrices: shape / escape / keep / cflow / conc / view-alias / **sharedlock** / **borrow-join** /
 hw / async / asm / defer-goto.
 
+**A PROBE MEASURES ITS ORACLE'S REACH, NOT ITS HEADLINE (2026-08-27).** `grammar_closure_probe.sh`
+asserts ZER's most load-bearing claim — "no integer becomes a pointer except through `@inttoptr`" —
+and printed OK on a compiler that HAD a breach (BUG-916). Its oracle is GCC's
+`-Werror=int-conversion` over an integer placed in each argument POSITION, and BUG-916 puts no
+integer in pointer position at all: it reinterprets a pointer-to-integer as a pointer-to-struct
+whose field is a pointer. Every C-level assignment is pointer-to-pointer, so GCC's front end is
+structurally blind to it. The probe now has a second axis with zerc itself as the oracle (verified
+15 breaches pre-fix, 0 after). **Before believing a gate, ask what its oracle CANNOT see.**
+
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
 `MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,
@@ -1312,7 +1321,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Unsafe pointer indexing | Indexing a non-volatile single `*T` (`ptr[i]`) is a COMPILE ERROR — `*T` has no length to bounds-check; use `[*]T` (slice) for a collection, or `*ptr`/`ptr.field` to read the single pointee. Volatile `*T` from `@inttoptr` bounds-checked against `mmio` range. |
 | Slab alloc in ISR | `slab.alloc()` in interrupt handler → compile error (calloc may deadlock). Use Pool instead. |
 | Slab/Pool/Ring from spawn | Global Pool/Slab/Ring accessed from spawned thread → compile error (non-atomic metadata). Use shared struct wrapper or single-threaded access. |
-| Container infinite recursion | `container Node(T) { ?*Node(T) next; }` → compile error (depth 32). Prevents compiler hang from self-referential monomorphization. |
+| Container infinite recursion | A cycle is infinite only if EVERY edge is BY VALUE, so that is the rule (BUG-868): `container Node(T) { Node(T) inner; }` and the mutual form `A(T){B(T) b;} B(T){A(T) a;}` are both compile errors naming the field that closes the cycle. **A POINTER-BROKEN cycle is LEGAL and is the linked-list idiom** — `container Node(T) { ?*Node(T) next; T v; }` compiles and runs. (This row previously named the pointer-broken shape as the error, which is the over-rejection BUG-857 introduced and BUG-868 replaced; verified 2026-08-27 by running all three. docs/reference.md had it right.) |
 | Naked non-asm code | Non-asm/non-return statements in naked function → compile error (stack not allocated without prologue). |
 | Comptime loop DoS | Nested comptime loops exceeding 1M total operations → compile error (global instruction budget). |
 | Move struct capture copy | `if (opt) \|k\|` value capture of move struct → compile error. Must use `\|*k\|` pointer capture. |

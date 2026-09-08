@@ -1447,6 +1447,22 @@ u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is ba
   has no zero value, so a bare `orelse return` there is a compile error — return
   `?*T` from the function, or unwrap explicitly and return a real value.
 - For bool-returning functions, restructure to avoid orelse in return path.
+- A BARE-STATEMENT `orelse` — the value discarded, used only for its effect — is
+  legal, and the BLOCK form still needs its terminating `;` because the statement
+  is an expression statement. Leaving the `;` off reports a parse error at the
+  NEXT token, which reads as though the problem were there.
+
+```zer
+?void doit(u32 k) {
+    if (k == 0) { return null; }
+    return;
+}
+u32 main() {
+    doit(1) orelse return;        // bare statement form
+    doit(1) orelse { return 7; }; // block form — note the ';'
+    return 0;
+}
+```
 
 ```zer
 struct P { u32 x; }
@@ -4669,6 +4685,21 @@ borrowed by that thread until `.join()`:
   @cond_wait(gq, gq.count > 0 && gq.shutdown);   // OK: both fields are gq's own
   ```
   Fold the extra state into the same `shared struct`, or signal on its change.
+- `@cond_timedwait` is the only one that RETURNS a value — `?void`, **null on
+  timeout**, present on success. Bind it and test it; there is no other way to
+  learn whether the wait timed out:
+  ```zer
+  shared struct C { u32 count; }
+  C g;
+  u32 main() {
+      ?void r = @cond_timedwait(g, g.count > 0, 1);   // 1 ms
+      if (r) { return 1; }        // predicate became true
+      return 0;                   // timed out
+  }
+  ```
+  `if (!r)` is a compile error — `!` needs a bool or integer, and `?void` is
+  neither. Test the optional directly and put the timeout case in the `else`
+  path (or after the `if`).
 
 ### threadlocal — Per-Thread Storage
 ```zer

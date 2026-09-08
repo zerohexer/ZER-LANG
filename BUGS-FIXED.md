@@ -7,6 +7,95 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-988..989: two more from `vigilant-tesla-ef9cao` (their BUG-920/921), plus its closure-probe and reference fixes
+
+Cherry-picks of `f090c32`, `fbdcb1e`, `e8bcd23` (the grammar-closure probe printed OK on a
+compiler that had a breach — now verified to go RED) and `9b1c3e0` (three reference.md
+behaviours stated and verified: `u8[2][3]` shape, non-finite float literals, cast targets must
+be keyword types). Measured first: `cond_timedwait_alone` failed in GCC on the merged compiler
+(`'struct C' has no member named '_zer_cond'`), and only one of the four Ring carrier forms
+warned. NOT taken from this branch: `5ea9154` (launder peel) — main's BUG-931 already unified
+the eight peelers; its one still-live shape is recorded in limitations.md.
+
+### BUG-988 — the Ring channel warning was 1-of-4, and a stale CLAUDE.md row
+
+Two small findings from walking CLAUDE.md's own safety table and running each row.
+
+**The warning.** `Ring.push` warns when a pointer crosses a channel, because the receiver
+may not be able to use it. The test was `k == TYPE_POINTER || k == TYPE_OPAQUE` — the
+hand-rolled carrier disjunction `tools/audit_carrier_dispatch.sh` exists to freeze.
+Measured: of the four shapes that put a pointer through a channel, only the bare one warned.
+
+| element type | pre-fix |
+|---|---|
+| `Ring(*u32, N)` | warns |
+| `Ring(?*u32, N)` | **silent** |
+| `Ring([*]u8, N)` — a slice carries a pointer AND a length | **silent** |
+| `Ring(P, N)`, `struct P { *u32 p; }` | **silent** |
+
+**Severity is ADVISORY, and saying so precisely is the point.** The SAFETY half — pushing a
+pointer to a LOCAL — is carrier-complete already through `container_push_arg_escapes`,
+verified rejecting all four shapes with the right diagnostic. What was 1-of-4 is the
+advisory warning, not a soundness gate. Recording it the other way round would be the kind
+of overstatement this ledger exists to prevent.
+
+Fixed by calling `type_carries_data_pointer` at both sites (`push` and `push_checked`) —
+the prescription CLAUDE.md already gives for this class. The now-obsolete baseline row was
+REMOVED from `tools/carrier_dispatch_baseline.txt` in the same commit, per the
+keep-the-gates-current rule; a stale row is a site the gate thinks still exists.
+
+Tests: `tests/zer/ring_warn_carrier_{bare,optional,slice,struct}.zer`, wired through the
+runner's `warn_check` so the WARNING is asserted rather than merely the exit code. One file
+per shape deliberately — they share one message, so a single file with four pushes would
+pass on one surviving warning. Verified: 4-of-4 warn now, 1-of-4 pre-fix.
+
+**The stale row.** The same table says container infinite recursion is
+`container Node(T) { ?*Node(T) next; }` -> compile error. It is not, and must not be: that
+is the linked-list idiom, and it compiles and runs. The real rule (BUG-868) is that a cycle
+is infinite only if EVERY edge is BY VALUE — verified by running all three shapes: by-value
+self-containment and the mutual `A{B b} B{A a}` form are both rejected with a message
+naming the closing field, the pointer-broken form is accepted. The row named the
+over-rejection BUG-857 introduced and BUG-868 replaced. `docs/reference.md` had it right;
+only CLAUDE.md was stale, and a session trusting it would have hunted a non-bug.
+
+### BUG-989 — `@cond_timedwait` alone emitted C referencing a member that was never declared
+
+```zer
+shared struct C { u32 count; }
+C g;
+u32 main() { ?void r = @cond_timedwait(g, g.count > 0, 1); return 0; }
+```
+
+GCC: *"'struct C' has no member named `_zer_cond`"* — about a member the user never
+wrote, at their own `.zer` line. Same class as BUG-913/914: the compiler's own output is
+what fails.
+
+**Which one, and why exactly one.** Which shared structs need a `pthread_cond_t _zer_cond`
+member was discovered by an emitter PRESCAN that matched a `cond_` intrinsic only when it
+was the WHOLE of a `NODE_EXPR_STMT`. `@cond_wait` / `@cond_signal` / `@cond_broadcast`
+return void and are written as statements, so they registered. **`@cond_timedwait` is the
+one that returns a value** (`?void`, null on timeout), so it is written
+`?void r = @cond_timedwait(...)` — a var-decl initializer the prescan never looked at. The
+name test was not the bug; the POSITION test was.
+
+**Why it survived.** Any program that also calls `@cond_wait` or `@cond_signal` on the same
+struct gets the member registered by that call, which masks it — verified, and the reason
+the regression test uses `@cond_timedwait` and nothing else. Adding a second condvar call
+to that test would make it pass on the broken compiler.
+
+**Fix: record the fact where every occurrence is already visited.** The CHECKER validates
+every `@cond_*` first argument in full expression context, so it sets
+`Type.struct_type.uses_condvar` there. The emitter reads the flag at its two decision sites.
+The prescan arm, `register_condvar_type`, `is_condvar_type` and the whole
+`condvar_type_ids` registry are DELETED rather than left beside the flag — two mechanisms
+for one fact is how the position dependence got in.
+
+Test: `tests/zer/cond_timedwait_alone.zer` — verified to FAIL TO BUILD on a pre-fix
+compiler with exactly that GCC error, and to exercise both outcomes (timeout returns null,
+already-true predicate returns success).
+
+---
+
 ## Session 2026-09-08 — BUG-987: the *opaque erasure recorded type_id 0 (harvested from `vigilant-tesla-ef9cao`, their BUG-918)
 
 Cherry-pick of `72aafad`. Measured live on the merged compiler first: the trap test ran to

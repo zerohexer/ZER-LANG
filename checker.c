@@ -9414,7 +9414,23 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
                         Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
-                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                        /* BUG-988: ask the CARRIER predicate, not the bare kind.
+                         *
+                         * This was `k == TYPE_POINTER || k == TYPE_OPAQUE`, the
+                         * hand-rolled disjunction tools/audit_carrier_dispatch.sh
+                         * exists to freeze. Measured: of the four shapes that put a
+                         * pointer through a channel, only ONE warned —
+                         * `Ring(?*u32,N)`, `Ring([*]u8,N)` (a slice carries a
+                         * pointer AND a length) and `Ring(P,N)` with
+                         * `struct P { *u32 p; }` were all silent.
+                         *
+                         * Severity is ADVISORY, and stating that precisely matters:
+                         * the SAFETY half — pushing a pointer to a LOCAL — is
+                         * carrier-complete already via container_push_arg_escapes,
+                         * verified rejecting all four shapes. What was 1-of-4 is
+                         * this warning, about a pointer to memory the RECEIVER may
+                         * not be able to use. */
+                        if (type_carries_data_pointer(eeff, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
@@ -9439,7 +9455,23 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
                         Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
-                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                        /* BUG-988: ask the CARRIER predicate, not the bare kind.
+                         *
+                         * This was `k == TYPE_POINTER || k == TYPE_OPAQUE`, the
+                         * hand-rolled disjunction tools/audit_carrier_dispatch.sh
+                         * exists to freeze. Measured: of the four shapes that put a
+                         * pointer through a channel, only ONE warned —
+                         * `Ring(?*u32,N)`, `Ring([*]u8,N)` (a slice carries a
+                         * pointer AND a length) and `Ring(P,N)` with
+                         * `struct P { *u32 p; }` were all silent.
+                         *
+                         * Severity is ADVISORY, and stating that precisely matters:
+                         * the SAFETY half — pushing a pointer to a LOCAL — is
+                         * carrier-complete already via container_push_arg_escapes,
+                         * verified rejecting all four shapes. What was 1-of-4 is
+                         * this warning, about a pointer to memory the RECEIVER may
+                         * not be able to use. */
+                        if (type_carries_data_pointer(eeff, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
@@ -13922,6 +13954,18 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@%.*s first argument must be a shared struct variable",
                             (int)nlen, name);
+                    }
+                    /* BUG-989: record that this struct needs a condvar member.
+                     * HERE, because this arm sees every `@cond_*` in every
+                     * expression position — the emitter prescan it replaces saw
+                     * only bare expression statements and therefore missed
+                     * @cond_timedwait, the one that returns a value. */
+                    if (ok) {
+                        Type *cvs = seff;
+                        if (type_dispatch_kind(cvs) == TYPE_POINTER)
+                            cvs = type_unwrap_distinct(cvs->pointer.inner);
+                        if (cvs && type_dispatch_kind(cvs) == TYPE_STRUCT)
+                            cvs->struct_type.uses_condvar = true;
                     }
                 }
             }

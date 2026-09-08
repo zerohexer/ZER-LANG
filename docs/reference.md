@@ -203,8 +203,11 @@ u32 hash(u32 key) { return key % 4; }
 scores[hash(42)] = 10;    // hash returns [0,3] — no bounds check, zero overhead
 ```
 
-**FIELDS**
+**FIELDS — READ-ONLY**
 `.len` → usize — Array length (compile-time constant)
+
+It is a constant, so it is not an assignment target: `a.len = n` and `&a.len` are
+compile errors.
 
 **COERCION**
 T[N] auto-coerces to [*]T at function calls, var-decl init, and return:
@@ -261,9 +264,20 @@ u32[8] arr;
 process(arr);              // auto-coerces: T[N] → [*]T
 ```
 
-**FIELDS**
+**FIELDS — READ-ONLY**
 - `.ptr` → *T — Raw pointer to first element
 - `.len` → usize — Number of elements
+
+Both are readable and neither is writable. `s.len = n`, `s.len += n`, `s.ptr = p` and
+`&s.len` / `&s.ptr` are compile errors, at every depth and through every route (a struct
+field, an array element, a global, a pointer auto-deref, a value unwrapped from an
+`orelse`). The header is what makes bounds checking mean anything — every index emits a
+check against `.len` — so a writable header forges the bound: `s.len = 100; s[50] = 1;`
+would pass the check and write past the storage.
+
+Build a view by SLICING (`a[i..j]`), which produces a header the compiler can vouch for.
+A user struct may still have fields named `ptr` or `len`; the rule applies to slices and
+arrays, not to the names.
 
 **SUB-SLICING**
 ```zer

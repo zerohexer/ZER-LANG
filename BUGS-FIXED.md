@@ -5,6 +5,73 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-08 — BUG-967: the slice header was writable, so any bound was forgeable
+
+`[*]T` bounds safety rests entirely on the `{ptr, len}` header — every index emits
+`_zer_bounds_check(i, s.len)`. The header fields were plain assignable, so the guarantee
+came apart in one line. Measured: compiles clean, RUNS clean, writes 46 bytes past a
+4-byte array with no diagnostic at either time.
+
+```zer
+u32 main() { u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1; return 0; }
+```
+
+```c
+_zer_t0 = s.len = 100ULL;
+_zer_t1 = (_zer_bounds_check((size_t)(50), s.len, __FILE__, __LINE__), s.ptr)[50] = 1;
+```
+
+Adopted from `loving-davinci-r3an9y` BUG-920 (renumbered — that branch's numbers collide
+with the `vigilant-tesla-*` family).
+
+### One query, two sinks, seventeen spellings
+
+`view_header_field(c, e, &container)` answers "does this NAME a read-only view header
+field?" It is called from the NODE_ASSIGN target check and from `case TOK_AMP`, which are
+the only two ways to write the header.
+
+All seventeen doors were measured live BEFORE implementing, and all seventeen are covered
+by that one query with no case-per-door: plain and compound assign; `.ptr` and `.len`; a
+bare local, a global, a struct field, a nested struct, an array-of-struct element, a
+pointer auto-deref, a value unwrapped from an `orelse`, a sub-slice, and a write inside a
+defer body; plus `&s.len` / `&s.ptr` bound to a local or passed as an argument.
+
+`s.len = n` and `s.len += n` are the SAME NODE_ASSIGN differing only in `assign.op`, so
+the pair needs one test rather than two — worth stating, because "two spellings of one
+operation" is a recurring hole shape here.
+
+The array sibling `a.len = 100` was emitting `_zer_t0 = 4U = 100ULL;` — invalid C that
+only GCC rejected. Loud drift rather than the slice case's silent OOB write, but the same
+question, so it is answered by the same query rather than a second rule that could drift.
+
+### Keyed on the object's TYPE, never on the field NAME
+
+A user struct may perfectly well have a field called `ptr` or `len`, and this corpus has
+`JString.len`, `Packet.len` and `Box.ptr`. A name-keyed rule would reject every one.
+`type_dispatch_kind` so a wrapper cannot walk a slice through the rule.
+
+### Why REJECT and not track
+
+Corpus cost measured at exactly ONE file. `tests/zer/range_for_len_snapshot.zer` built
+its slice by writing the header — a convenience, not its subject, which is that range-for
+snapshots the bound BEFORE the body. Rewritten to build by slicing and to widen the whole
+slice mid-loop, which is the legal route to changing the bound and tests the same
+property; verified in the emitted C that the loop compares against `_zer_rlen`, read
+once, so it still discriminates.
+
+**Process note.** The first corpus measurement inspected only the first 20 of 43 grep
+hits, saw they were all user structs with `len` fields, and concluded the cost was zero.
+It was one — found by the test suite, not by the measurement. When a grep result is
+truncated, the count is not the evidence; the full list is.
+
+Tests: `slice_len_assign_forge`, `slice_ptr_assign_forge`, `slice_len_addr_forge` (the
+branch's three, verbatim), plus four doors it did not have — `slice_len_compound_forge`,
+`slice_header_via_struct_field`, `slice_ptr_addr_forge`, `array_len_assign` — and the
+boundary positive `tests/zer/slice_header_read_ok.zer`, which pins that reads still work
+and that a user struct with `len` / `ptr` fields still compiles.
+
+---
+
 ## Session 2026-09-08 — BUG-959..966: refactor L stage 2 — the defer body becomes real IR
 
 Fourth attempt, and it landed. A `defer` body used to be raw AST replayed at each exit by

@@ -903,13 +903,42 @@ Note that changes the signature of the query BUG-842 introduced and BUG-927 exte
 
 ### Classes that appear in NO other branch
 
-**C. A slice's `.ptr` / `.len` are ASSIGNABLE (their BUG-920) — HIGH, defeats bounds.**
+**C. ~~A slice's `.ptr` / `.len` are ASSIGNABLE (their BUG-920)~~ — CLOSED 2026-09-08
+as BUG-967.** DO NOT REDO.
+
+The slice header is the whole basis of `[*]T` bounds safety, and it was writable, so the
+guarantee was forgeable in one line — this compiled clean, RAN clean, and wrote 46 bytes
+past a 4-byte array:
 
     u32 main() { u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1; return 0; }
 
-The slice header is the whole basis of `[*]T` bounds safety; if `.len` is writable the
-guarantee is forgeable in one line. 3 tests: `slice_len_assign_forge`,
-`slice_ptr_assign_forge`, `slice_len_addr_forge`.
+Landed as ONE query, `view_header_field`, at TWO sinks — the NODE_ASSIGN target and
+`&` — because those are the only ways to write the header. **Seventeen spellings were
+measured live before implementing**, and all seventeen are covered by that one query
+without a case each: plain and compound assign; `.ptr` and `.len`; a bare local, a
+global, a struct field, a nested struct, an array-of-struct element, a pointer
+auto-deref, a value unwrapped from an `orelse`, a sub-slice, and a write inside a defer
+body; plus `&s.len` / `&s.ptr` bound to a local or passed as an argument. The array
+sibling `a.len = 100` is the same question and was emitting `4U = 100ULL` — invalid C
+that only GCC rejected.
+
+**Keyed on the OBJECT'S TYPE, never on the field NAME.** A user struct may perfectly
+well have a field called `ptr` or `len`, and this corpus has `JString.len`,
+`Packet.len` and `Box.ptr`. A name-keyed rule would reject all of them.
+
+**REJECT rather than track, because the corpus cost was measured at ONE file** — and
+that file (`range_for_len_snapshot`) was writing the header only as a convenient way to
+BUILD a slice, not because its subject needed it. Rewritten to build by slicing and to
+widen the collection mid-loop, which is the legal route and tests the same property.
+Nothing else in tests/, rust_tests/, zig_tests/, lib/, examples/ or test_modules/ writes
+a slice header at all.
+
+Tests: the branch's three verbatim (`slice_len_assign_forge`, `slice_ptr_assign_forge`,
+`slice_len_addr_forge`) plus four more doors it did not have
+(`slice_len_compound_forge`, `slice_header_via_struct_field`, `slice_ptr_addr_forge`,
+`array_len_assign`) and the boundary positive `tests/zer/slice_header_read_ok.zer`,
+which pins that reads still work AND that a user struct with `len` / `ptr` fields still
+compiles.
 
 **D. Unique-resource COPY-BY-VALUE (their BUG-916) — 8 tests.** `Arena`, `Barrier`
 and `Semaphore` alias their state when copied:
@@ -999,8 +1028,8 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ### Suggested order for this branch
 
-~~A~~ (DONE, BUG-930) → **C** (one line forges any bound) → **G** and **F** (both
-accept-unsafe; G is UAF, F is a data race) → **D** → **E** → **B** → **H** → **I**.
+~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → **G** and **F** (both accept-unsafe;
+G is UAF, F is a data race) → **D** → **E** → **B** → **H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

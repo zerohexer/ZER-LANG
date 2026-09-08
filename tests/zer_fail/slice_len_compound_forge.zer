@@ -1,0 +1,14 @@
+// expect-error: cannot assign to '.len' of a slice
+// BUG-967: the COMPOUND spelling of the same forge. `s.len += 100` is the same
+// NODE_ASSIGN as `s.len = 100`, differing only in `assign.op` — so one test in the
+// checker covers both, and this pins that it does. Written down because "two
+// spellings of one operation" is a recurring shape here (see the CLAUDE.md table
+// row: `x = pool.alloc()` vs `T x = pool.alloc()` lowered differently and every
+// arm keyed on `dest_local` silently saw a temp).
+u32 main() {
+    u8[4] a;
+    [*]u8 s = a;
+    s.len += 100;
+    s[50] = 1;
+    return 0;
+}

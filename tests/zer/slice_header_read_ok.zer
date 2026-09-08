@@ -1,0 +1,40 @@
+// BUG-967 boundary: the header stays READABLE, and a user struct may still have
+// fields called `len` and `ptr`.
+//
+// The second half is the reason the rule is keyed on the OBJECT'S TYPE and never on
+// the field NAME: this corpus already contains `JString.len`, `Packet.len` and
+// `Box.ptr`, and a name-keyed rule would have rejected every one of them. Measured
+// before the rule shipped — zero legitimate writes to a SLICE header anywhere in
+// tests/, rust_tests/, zig_tests/, lib/, examples/ or test_modules/ — which is what
+// makes rejecting rather than tracking defensible here.
+
+struct JString { u8[32] chars; u32 len; }
+struct Box { *u32 ptr; }
+u32 gv;
+
+u32 main() {
+    u8[4] a;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 4;
+    [*]u8 s = a;
+
+    // reading the header — both fields, and in a loop bound
+    if (s.len != 4) { return 1; }
+    *u8 p = s.ptr;
+    if (*p != 1) { return 2; }
+    u32 total = 0;
+    for (u32 i = 0; i < (u32)s.len; i += 1) { total += s[i]; }
+    if (total != 10) { return 3; }
+    if (a.len != 4) { return 4; }
+
+    // a user struct whose fields happen to be named len / ptr
+    JString js;
+    js.len = 0;
+    js.len = js.len + 1;
+    if (js.len != 1) { return 5; }
+    Box b;
+    b.ptr = &gv;
+    *b.ptr = 7;
+    if (gv != 7) { return 6; }
+
+    return 0;
+}

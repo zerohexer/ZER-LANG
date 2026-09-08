@@ -1,0 +1,10 @@
+// expect-error: cannot assign to '.len' of an array
+// BUG-967: the ARRAY sibling. An array's `.len` is a compile-time constant, so this
+// emitted `_zer_t0 = 4U = 100ULL;` — invalid C that only GCC rejected. Loud drift
+// rather than the slice case's silent out-of-bounds write, but the same question,
+// and answered by the same query rather than a second rule that could drift.
+u32 main() {
+    u8[4] a;
+    a.len = 100;
+    return 0;
+}

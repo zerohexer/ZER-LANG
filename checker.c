@@ -2721,6 +2721,52 @@ static Node *unwrap_ptr_launder(Node *v) {
  * analyzer cannot resolve is the double-free this class is about. */
 static bool deref_launder_transfers_identity(Checker *c, Node *e);
 
+/* BUG-967: does `e` NAME a read-only VIEW HEADER field — a slice's `.ptr` / `.len`,
+ * or an array's `.len`? Returns the field name for the diagnostic (NULL if not one)
+ * and sets *container to the word for the aggregate.
+ *
+ * `[*]T` bounds safety rests ENTIRELY on the {ptr, len} header: every index emits
+ * `_zer_bounds_check(i, s.len)`, so a writable `.len` forges the guarantee in one
+ * line. Measured — this compiled clean, RAN clean, and wrote 46 bytes past a 4-byte
+ * array with no diagnostic at either time:
+ *
+ *     u8[4] a; [*]u8 s = a; s.len = 100; s[50] = 1;
+ *
+ * `.ptr` is the same door one step over: retarget the base and keep the old length.
+ * An array's `.len` is a compile-time constant and cannot be a target at all (it
+ * emitted `4U = 100ULL`, which only GCC rejected — loud drift rather than silent,
+ * but the same question).
+ *
+ * KEYED ON THE OBJECT'S TYPE, NEVER ON THE FIELD NAME. A user struct may perfectly
+ * well have a field called `ptr` or `len`, and this corpus has several — `JString.len`,
+ * `Packet.len`, `Box.ptr`. A name-keyed rule would reject all of them.
+ *
+ * REJECT rather than track, because the corpus cost is ZERO: across tests/,
+ * rust_tests/, zig_tests/, lib/, examples/ and test_modules/ there is not one write
+ * to a slice header. Nothing legitimate needs it — a view is built by slicing
+ * (`a[i..j]`), which produces a header the compiler can vouch for. */
+static const char *view_header_field(Checker *c, Node *e, const char **container) {
+    if (!e || e->kind != NODE_FIELD) return NULL;
+    if (e->field.field_name_len != 3) return NULL;
+    bool is_ptr = memcmp(e->field.field_name, "ptr", 3) == 0;
+    bool is_len = memcmp(e->field.field_name, "len", 3) == 0;
+    if (!is_ptr && !is_len) return NULL;
+    Type *obj = checker_get_type(c, e->field.object);
+    if (!obj) return NULL;
+    /* type_dispatch_kind so a `distinct [*]u8` cannot walk through the rule —
+     * the wrapper-hides-the-inner-kind class. */
+    TypeKind k = type_dispatch_kind(obj);
+    if (k == TYPE_SLICE) {
+        if (container) *container = "a slice";
+        return is_ptr ? "ptr" : "len";
+    }
+    if (k == TYPE_ARRAY && is_len) {
+        if (container) *container = "an array";
+        return "len";
+    }
+    return NULL;
+}
+
 static bool deref_ptr_launder(Checker *c, Node *e) {
     if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
     Node *inner = e->unary.operand;
@@ -6148,6 +6194,20 @@ static Type *check_expr(Checker *c, Node *node) {
             break;
 
         case TOK_AMP: /* address-of */
+            /* BUG-967: `&s.len` is the assignment door one deref later — it hands out
+             * a writable pointer to the header, and the forge happens through it. The
+             * SAME query as the assignment sink, so the two cannot drift apart. */
+            {
+                const char *container = "a slice";
+                const char *hf = view_header_field(c, node->unary.operand, &container);
+                if (hf) {
+                    checker_error(c, node->loc.line,
+                        "cannot take the address of '.%s' of %s — a writable pointer "
+                        "to the header forges the bound just as an assignment does. "
+                        "Read the value (`usize n = s.%s;`) or build a view by slicing",
+                        hf, container, hf);
+                }
+            }
             result = type_pointer(c->arena, operand);
             /* BUG-197/228/254: walk operand to root for volatile/const propagation.
              * Handles &ident, &arr[i], &s.field, &s.arr[i].field etc. */
@@ -6477,6 +6537,23 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (call_ret && call_ret->kind != TYPE_POINTER) {
                     checker_error(c, node->loc.line,
                         "cannot assign to expression — not an lvalue");
+                }
+            }
+
+            /* BUG-967: the VIEW HEADER is read-only. Both spellings land here —
+             * `s.len = n` and `s.len += n` are the same NODE_ASSIGN, differing only
+             * in `assign.op`, so one test covers the pair rather than the two-sites-
+             * one-question shape this file keeps recording. */
+            {
+                const char *container = "a slice";
+                const char *hf = view_header_field(c, node->assign.target, &container);
+                if (hf) {
+                    checker_error(c, node->loc.line,
+                        "cannot assign to '.%s' of %s — the header is what makes "
+                        "bounds checking meaningful, and writing it forges the bound "
+                        "(`s.len = 100` then `s[50]` passes the check and writes past "
+                        "the storage). Build a view by slicing instead: `a[i..j]`",
+                        hf, container);
                 }
             }
         }

@@ -295,6 +295,40 @@ cell p18_safe_stack_view    compile 'struct N18{u32 v;u32 w;} *u32 fo18(*N18 n){
 cell p18_safe_null_arm      compile '?*u32 mb18(*u32 p,bool ok){ if (ok) { return p; } return null; } u32 main(){ u32 loc=3; ?*u32 m=mb18(&loc,true); if (m) |pp| { if (*pp != 3) { return 1; } } return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p19 (BUG-968): A VIEW INTO AN ALLOCATION — the SPELLING axis.
+#
+# "What allocation does this view point into?" was answered by a walk that peeled
+# FIELD and INDEX to an ident and stopped at anything else. Two things fell out of it,
+# and crossing SPELLING x FORM is what makes them visible:
+#
+#   - `pool.get(h)` and `h` NAME THE SAME SLOT, but the get() spelling landed on a
+#     NODE_CALL, so `&pool.get(h).v` aliased nothing while `&h.v` aliased correctly.
+#   - a SLICE is a reference-forming node ("FORMING a reference aliases; READING a
+#     value does not") but the alias branch admitted only `&`, so a slice view of a
+#     field aliased nothing in EITHER spelling — including on a heap pointer, which
+#     is how the second half was found.
+#
+# The consequence is not a would-be UAF. Pre-fix, p19_slot_reuse compiled clean and
+# RETURNED 99: the stale view wrote into a freed slot that had been handed back out,
+# corrupting a live different object — the Handle generation check bypassed because a
+# view carries a raw pointer nothing re-checks.
+echo "===== SHAPE p19 = a view into an allocation (spelling x form) ====="
+cell p19_get_field_addr   reject 'struct T19{u32 v;} Pool(T19,4) p19; u32 main(){ Handle(T19) h=p19.alloc() orelse {return 1;}; *u32 q=&p19.get(h).v; p19.free(h); *q=7; return 0; }'
+cell p19_get_index_addr   reject 'struct T19b{u8[4] a;} Pool(T19b,4) p19b; u32 main(){ Handle(T19b) h=p19b.alloc() orelse {return 1;}; *u8 q=&p19b.get(h).a[0]; p19b.free(h); *q=7; return 0; }'
+cell p19_get_field_slice  reject 'struct T19c{u8[4] a;} Pool(T19c,4) p19c; u32 main(){ Handle(T19c) h=p19c.alloc() orelse {return 1;}; [*]u8 s=p19c.get(h).a[0..]; p19c.free(h); s[0]=7; return 0; }'
+cell p19_slab_get_addr    reject 'struct T19d{u32 v;} Slab(T19d) s19; u32 main(){ Handle(T19d) h=s19.alloc() orelse {return 1;}; *u32 q=&s19.get(h).v; s19.free(h); *q=7; return 0; }'
+cell p19_autoderef_slice  reject 'struct T19e{u8[4] a;} Pool(T19e,4) p19e; u32 main(){ Handle(T19e) h=p19e.alloc() orelse {return 1;}; [*]u8 s=h.a[0..]; p19e.free(h); s[0]=7; return 0; }'
+cell p19_heap_slice       reject 'struct T19f{u8[4] a;} u32 main(){ *T19f t=alloc(T19f) orelse {return 1;}; [*]u8 s=t.a[0..]; free(t); s[0]=7; return 0; }'
+cell p19_slot_reuse       reject 'struct T19g{u8[4] a;} Pool(T19g,4) p19g; u32 main(){ Handle(T19g) h1=p19g.alloc() orelse {return 1;}; [*]u8 s=h1.a[0..]; p19g.free(h1); Handle(T19g) h2=p19g.alloc() orelse {return 2;}; s[0]=99; u32 r=(u32)h2.a[0]; p19g.free(h2); return r; }'
+cell p19_keep_get_stash   reject 'struct T19h{u32 v;} Pool(T19h,4) p19h; ?*u32 gq19=null; void st19(*u32 q){ gq19=q; } u32 main(){ Handle(T19h) h=p19h.alloc() orelse {return 1;}; st19(&p19h.get(h).v); p19h.free(h); return 0; }'
+# BOUNDARY: a view into a LIVE slot is ordinary code and must stay legal, in both
+# spellings and both forms. Over-rejecting here would break the read-modify-free
+# sequence every pool user writes.
+cell p19_safe_view_before_free compile 'struct T19i{u32 v;u8[4] a;} Pool(T19i,4) p19i; u32 main(){ Handle(T19i) h=p19i.alloc() orelse {return 1;}; *u32 q=&p19i.get(h).v; *q=5; [*]u8 s=p19i.get(h).a[1..]; s[0]=9; u32 r=p19i.get(h).v+(u32)p19i.get(h).a[1]; p19i.free(h); if (r!=14) { return 2; } return 0; }'
+cell p19_safe_stack_slice      compile 'u32 main(){ u8[4] loc; loc[0]=3; [*]u8 s=loc[0..]; return (u32)s[0]-3; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

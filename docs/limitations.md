@@ -997,7 +997,47 @@ lend nothing, so the parent can race the child:
 Their fix: `Symbol.borrow_root` recorded at the declaration sites, one sink
 `scoped_spawn_borrow` for both spellings, unknown root REJECTED.
 
-**G. Views into a pool/slab slot escape UAF tracking (their BUG-919) — 5 tests.**
+**G. ~~Views into a pool/slab slot escape UAF tracking (their BUG-919)~~ — CLOSED
+2026-09-09 as BUG-968, and it was WIDER than recorded here.** DO NOT REDO.
+
+Two independent questions were tangled in one walk ("what allocation does this view
+point into?", peeled FIELD/INDEX to an ident and stopped at anything else):
+
+1. **The `get()` SPELLING.** `pool.get(h)` and `h` name the same slot, but the get()
+   form landed on a `NODE_CALL`, so `&pool.get(h).v` aliased nothing while `&h.v`
+   aliased correctly. Two spellings of one operation — the recurring shape.
+2. **A SLICE never aliased AT ALL — and this half is NOT in the survey below.** The
+   alias branch admitted only `&`, so a slice view of a field aliased nothing in
+   EITHER spelling, and **on heap `alloc(T)` pointers too**: `*T t = alloc(T); [*]u8 s
+   = t.arr[0..]; free(t); s[0] = 7;` compiled clean. Found by asking whether the gap
+   was handle-specific. It is not. CLAUDE.md already stated the rule this violated —
+   *"FORMING a reference aliases; READING a value does not"* — and a slice IS a
+   reference-forming node.
+
+**What it cost, measured rather than argued.** This compiled clean and RETURNED 99:
+
+    Handle(T) h1 = p.alloc() orelse return;  [*]u8 s = h1.arr[0..];  p.free(h1);
+    Handle(T) h2 = p.alloc() orelse return;  h2.arr[0] = 22;
+    s[0] = 99;  return h2.arr[0];            // 99 — corrupted a LIVE object
+
+The stale view wrote into a freed slot that had been handed back out. That is exactly
+what the Handle generation counter exists to prevent, bypassed because a view carries
+a raw pointer nothing re-checks. **ASan does not see it** — ZER's `alloc(T)` is an
+auto-Slab, so `free()` recycles the slot rather than returning it to libc, which is
+precisely why the compile-time tracking is the thing that matters.
+
+Landed as ONE query per file — `ir_view_root_ident` (zercheck_ir.c) and
+`keep_view_root_ident` (checker.c) — both peeling FIELD/INDEX/SLICE and seeing through
+a Pool/Slab `.get(h)` to the handle. The checker twin is DELIBERATELY not wired into
+`arg_is_local_derived`, which asks a different question ("does this point into STACK
+memory?"): a pool slot lives in the global Pool, so seeing through get() there would
+assert something false.
+
+Gated by **SHAPE p19 in `tools/sink_matrix.sh`** (spelling x form, 8 reject cells + 2
+boundary). Verified to FIRE: run against a build of the commit before the fix, all 8
+report HOLE and both boundary cells stay green. Tests: the branch's five verbatim, plus
+`handle_slice_view_uaf`, `heap_slice_view_uaf` and `pool_slot_reuse_corruption` for the
+half it did not have, and the boundary positive `pool_get_view_before_free_ok`.
 
     Handle(T) h = p.alloc() orelse return;
     *u32 q = &p.get(h).v;
@@ -1047,8 +1087,8 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ### Suggested order for this branch
 
-~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → **G** and **F** (both accept-unsafe;
-G is UAF, F is a data race) → **D** → **E** → **B** → **H** → **I**.
+~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → **F** (a data
+race) → **D** → **E** → **B** → **H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

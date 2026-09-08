@@ -1,0 +1,18 @@
+// expect-error: use after free
+// BUG-968: the same slice-view hole on a HEAP allocation, which is NOT in the branch
+// survey that prompted this fix — it was found by asking whether the gap was
+// handle-specific. It is not: `&t.v` on a heap pointer was caught and `t.arr[0..]`
+// was not, because the alias branch admitted `&` and not a slice.
+//
+// ASan does NOT see this one: ZER's alloc(T) uses an auto-Slab, so free() recycles
+// the slot rather than returning it to libc. That is exactly why the compile-time
+// tracking is what matters here — see tests/zer_fail/pool_slot_reuse_corruption.zer,
+// which demonstrates the consequence as an observable wrong value.
+struct T { u8[4] arr; }
+u32 main() {
+    *T t = alloc(T) orelse return;
+    [*]u8 s = t.arr[0..];
+    free(t);
+    s[0] = 7;
+    return 0;
+}

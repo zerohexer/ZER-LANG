@@ -1,0 +1,25 @@
+// expect-error: use after free
+// BUG-968: what the slice-view hole actually COST, measured rather than argued.
+//
+// Before the fix this compiled clean and RETURNED 99. The stale view wrote into slot
+// h1 after it was freed; the slot had been handed back out as h2; so the write
+// silently corrupted a LIVE, DIFFERENT object. That is precisely what the Handle
+// generation counter exists to prevent — bypassed because a slice view carries a raw
+// pointer that is never checked again.
+//
+// Kept as a negative rather than a runtime-trap test because the fix is to REJECT the
+// view at compile time; there is no generation check to reach.
+struct T { u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h1 = p.alloc() orelse return;
+    h1.arr[0] = 11;
+    [*]u8 s = h1.arr[0..];
+    p.free(h1);
+    Handle(T) h2 = p.alloc() orelse return;
+    h2.arr[0] = 22;
+    s[0] = 99;
+    u32 r = (u32)h2.arr[0];
+    p.free(h2);
+    return r;
+}

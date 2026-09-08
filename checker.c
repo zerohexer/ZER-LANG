@@ -1973,6 +1973,48 @@ static bool escape_type_carries_ref(Type *vt) {
  * local, an orelse fallback to &local/local, @cstr of a local, a field of a
  * local-derived struct. */
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth);
+/* BUG-968 (checker twin of zercheck_ir.c's ir_view_root_ident): walk a VIEW
+ * expression to the ident naming what it points into, seeing THROUGH
+ * `pool.get(h)` / `slab.get(h)` to the HANDLE argument.
+ *
+ * `pool.get(h)` and `h` name the SAME slot, so `&pool.get(h).v` and `&h.v` are two
+ * spellings of one operation. The keep sink's C6 walk peeled FIELD and INDEX to an
+ * ident and stopped at anything else, so the auto-deref spelling was refused
+ * ("local variable 'h' cannot satisfy 'keep' parameter") and the get() spelling was
+ * accepted — a slot-interior pointer stashed in a global, then the slot freed.
+ *
+ * DELIBERATELY NOT wired into arg_is_local_derived, which asks a DIFFERENT question:
+ * "does this point into STACK memory?" A pool slot lives in the global Pool, so
+ * seeing through get() there would assert something false. This helper exists for the
+ * keep sink, whose question is "can this pointer outlive the call?" — and a slot
+ * cannot, because the handle that owns it can be freed. */
+static Node *keep_view_root_ident(Checker *c, Node *e) {
+    int guard = 0;
+    while (e && guard++ < 64) {
+        if (e->kind == NODE_FIELD) {
+            /* `p.get` as a CALLEE is handled by the NODE_CALL arm below; a FIELD in
+             * a value position is an ordinary member step. */
+            e = e->field.object; continue;
+        }
+        if (e->kind == NODE_INDEX) { e = e->index_expr.object; continue; }
+        if (e->kind == NODE_SLICE) { e = e->slice.object;      continue; }
+        if (e->kind == NODE_CALL) {
+            Node *callee = e->call.callee;
+            if (!callee || callee->kind != NODE_FIELD) return NULL;
+            if (callee->field.field_name_len != 3 ||
+                memcmp(callee->field.field_name, "get", 3) != 0) return NULL;
+            Type *rt = checker_get_type(c, callee->field.object);
+            TypeKind rk = type_dispatch_kind(rt);
+            if (rk != TYPE_POOL && rk != TYPE_SLAB) return NULL;
+            if (e->call.arg_count < 1 || !e->call.args[0]) return NULL;
+            e = e->call.args[0];
+            continue;
+        }
+        break;
+    }
+    return (e && e->kind == NODE_IDENT) ? e : NULL;
+}
+
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     if (!arg || depth > 8) return false;
     /* BUG-815 (2026-08-22): this predicate is the LEAF of call_result_escapes and
@@ -9165,14 +9207,12 @@ static Type *check_expr(Checker *c, Node *node) {
                              * arg_is_local_derived's &local.field handling: a
                              * pointer into a local satisfies `keep` no better than
                              * a pointer to the whole local. */
-                            Node *aroot = karg->unary.operand;
-                            while (aroot && (aroot->kind == NODE_FIELD ||
-                                             aroot->kind == NODE_INDEX)) {
-                                aroot = (aroot->kind == NODE_FIELD)
-                                          ? aroot->field.object
-                                          : aroot->index_expr.object;
-                            }
-                            if (aroot && aroot->kind == NODE_IDENT) {
+                            /* BUG-968: ONE query, which also sees through
+                             * `pool.get(h)` — the get() spelling of `&h.field`
+                             * reached a NODE_CALL here and was accepted while the
+                             * auto-deref spelling was refused. */
+                            Node *aroot = keep_view_root_ident(c, karg->unary.operand);
+                            if (aroot) {
                             Symbol *arg_sym = scope_lookup(c->current_scope,
                                 aroot->ident.name,
                                 (uint32_t)aroot->ident.name_len);

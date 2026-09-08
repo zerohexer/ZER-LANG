@@ -1,0 +1,18 @@
+// expect-error: use after free
+// BUG-968: the SLICE view, in the spelling that reaches the slot WITHOUT calling
+// get() at all. Found while fixing the get() spelling, and it is the wider half of
+// the hole: the alias branch only ever admitted `&`, so a slice view of a field
+// aliased NOTHING — in this spelling and in the get() one, and for heap `alloc(T)`
+// pointers too (tests/zer_fail/heap_slice_view_uaf.zer).
+//
+// CLAUDE.md already states the rule this violated: "FORMING a reference aliases;
+// READING a value does not", and a slice IS a reference-forming node.
+struct T { u8[4] arr; }
+Pool(T, 4) p;
+u32 main() {
+    Handle(T) h = p.alloc() orelse return;
+    [*]u8 s = h.arr[0..];
+    p.free(h);
+    s[0] = 7;
+    return 0;
+}

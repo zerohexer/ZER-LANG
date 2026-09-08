@@ -2125,6 +2125,50 @@ static Node *ir_unwrap_alloc_expr(Node *expr) {
  * skip stays for value navigation and is lifted exactly when a step auto-derefs.
  *
  * Returns the sub-expression that is dereferenced, or NULL when nothing is. */
+/* BUG-968: walk a VIEW expression to the ident naming the allocation it points into,
+ * seeing THROUGH `pool.get(h)` / `slab.get(h)`.
+ *
+ * Every existing walk peeled FIELD and INDEX to an ident and stopped at anything else,
+ * so `&pool.get(h).v` landed on a NODE_CALL and no alias was ever formed — the
+ * generation-checked Handle was laundered into a raw interior pointer in one step. The
+ * auto-deref spelling `&h.v` WAS caught, which is the two-spellings-of-one-operation
+ * shape this codebase keeps hitting: `get(h)` and `h` name the same slot.
+ *
+ * NODE_SLICE is peeled here too. CLAUDE.md's own rule is "FORMING a reference aliases;
+ * READING a value does not", and a slice IS a reference-forming node — but the alias
+ * branch only ever admitted `&`, so a slice view of a field aliased nothing. Measured,
+ * that is not a would-be UAF but live corruption:
+ *
+ *     Handle(T) h1 = p.alloc() orelse return;
+ *     [*]u8 s = h1.arr[0..];   p.free(h1);
+ *     Handle(T) h2 = p.alloc() orelse return;   // same slot, new generation
+ *     h2.arr[0] = 22;   s[0] = 99;   return h2.arr[0];   // returns 99
+ *
+ * compiles clean and returns 99 — the stale view wrote into a live, DIFFERENT object.
+ * That is exactly what the Handle generation counter exists to prevent, bypassed
+ * because the view carries a raw pointer that is never checked again.
+ *
+ * Returns the root ident node, or NULL. */
+static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
+    int guard = 0;
+    while (e && guard++ < 64) {
+        if (e->kind == NODE_FIELD)      { e = e->field.object;      continue; }
+        if (e->kind == NODE_INDEX)      { e = e->index_expr.object; continue; }
+        if (e->kind == NODE_SLICE)      { e = e->slice.object;      continue; }
+        if (e->kind == NODE_CALL) {
+            /* `pool.get(h)` names slot h — keep walking from the HANDLE argument. Any
+             * other call is an opaque value and ends the walk, which is the
+             * conservative answer (no alias claimed rather than a wrong one). */
+            if (ir_classify_method_call_ex(zc->checker, e) != IRMC_GET) return NULL;
+            if (e->call.arg_count < 1 || !e->call.args[0]) return NULL;
+            e = e->call.args[0];
+            continue;
+        }
+        break;
+    }
+    return (e && e->kind == NODE_IDENT) ? e : NULL;
+}
+
 static Node *ir_addr_of_deref_target(ZerCheck *zc, Node *operand) {
     Node *cur = operand;
     int guard = 0;
@@ -4717,9 +4761,17 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
              * NODE_INTRINSIC, so without this the whole interior-pointer branch
              * was skipped and the view lost its heap alias (ASan-confirmed). */
             Node *rhs_pv = ir_peel_launder(rhs);
-            if (rhs_pv && rhs_pv->kind == NODE_UNARY && rhs_pv->unary.op == TOK_AMP) {
+            /* BUG-968: a SLICE is a reference-forming node just as `&` is — the rule
+             * this codebase already states is "FORMING a reference aliases; READING a
+             * value does not". Admitting it here is what makes `[*]u8 s = h.arr[0..]`
+             * alias the slot instead of nothing. */
+            bool rhs_is_view = rhs_pv && ((rhs_pv->kind == NODE_UNARY &&
+                                           rhs_pv->unary.op == TOK_AMP) ||
+                                          rhs_pv->kind == NODE_SLICE);
+            if (rhs_is_view) {
                 Node *rhs = rhs_pv;   /* shadow: the peeled view drives this branch */
-                Node *addr_target = rhs->unary.operand;
+                Node *addr_target = (rhs->kind == NODE_SLICE) ? rhs->slice.object
+                                                              : rhs->unary.operand;
                 /* §A #7 (HOLE-A1/A2): if the address-taken expression is a
                  * COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,
                  * alias the pointer against the COMPOUND handle so a later move
@@ -4776,14 +4828,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                 }
 
-                Node *target = rhs->unary.operand;
-                /* Walk field/index chain to the root ident */
-                while (target) {
-                    if (target->kind == NODE_FIELD) target = target->field.object;
-                    else if (target->kind == NODE_INDEX) target = target->index_expr.object;
-                    else break;
-                }
-                if (target && target->kind == NODE_IDENT && !used_compound) {
+                /* BUG-968: ONE query for the root, so the `get(h)` spelling and the
+                 * auto-deref spelling cannot diverge again. */
+                Node *target = ir_view_root_ident(zc, addr_target);
+                if (target && !used_compound) {
                     int base_local = ir_find_local_exact_first(func,
                         target->ident.name, (uint32_t)target->ident.name_len);
                     if (base_local >= 0) {

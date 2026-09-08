@@ -5,6 +5,91 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-968: a view into an allocation aliased nothing, in two ways
+
+"What allocation does this view point into?" was answered by a walk that peeled `NODE_FIELD`
+and `NODE_INDEX` to an ident and stopped at anything else. Two independent holes fell out of
+that, and the second is NOT in the branch survey that prompted the work.
+
+### 1. The `get()` SPELLING
+
+`pool.get(h)` and `h` name the same slot, but the get() form landed on a `NODE_CALL`, so the
+walk gave up:
+
+```zer
+*u32 q = &p.get(h).v;   p.free(h);   *q = 7;    // accepted
+*u32 q = &h.v;          p.free(h);   *q = 7;    // correctly rejected
+```
+
+Two spellings of one operation — the shape this file keeps recording.
+
+### 2. A SLICE never aliased AT ALL
+
+The alias branch admitted only `&`. A slice is equally a reference-forming node — CLAUDE.md
+already says *"FORMING a reference aliases; READING a value does not"* — so a slice view of a
+field aliased nothing, in BOTH spellings, and on heap pointers too:
+
+```zer
+*T t = alloc(T) orelse return;   [*]u8 s = t.arr[0..];   free(t);   s[0] = 7;   // accepted
+*T t = alloc(T) orelse return;   *u32 q = &t.v;          free(t);   *q  = 7;    // rejected
+```
+
+Found by asking whether the gap was handle-specific rather than assuming the survey's framing.
+It is not.
+
+### What it cost — measured, not argued
+
+```zer
+Handle(T) h1 = p.alloc() orelse return;  h1.arr[0] = 11;
+[*]u8 s = h1.arr[0..];   p.free(h1);
+Handle(T) h2 = p.alloc() orelse return;  h2.arr[0] = 22;   // SAME slot, new generation
+s[0] = 99;
+return (u32)h2.arr[0];                   // compiled clean, RETURNED 99
+```
+
+The stale view wrote into a freed slot that had been handed back out — silently corrupting a
+live, DIFFERENT object. That is exactly what the Handle generation counter exists to prevent,
+bypassed because a view carries a raw pointer nothing re-checks.
+
+**ASan does not see this**, and the reason is worth knowing: ZER's `alloc(T)` uses an
+auto-Slab, so `free()` recycles the slot rather than returning it to libc, and the memory
+stays owned by the process. The first attempt to demonstrate the hole with `-fsanitize=address`
+came back clean and looked like a refutation. It was not — it was the wrong instrument. The
+slot-reuse program above is the right one, because it makes the corruption an observable
+wrong VALUE rather than a memory-tool verdict.
+
+### The fix
+
+ONE query per file, both peeling FIELD / INDEX / SLICE and seeing through a Pool/Slab
+`.get(h)` to the handle argument:
+
+- `ir_view_root_ident` (zercheck_ir.c) — the interior-pointer and slice-view alias sink
+- `keep_view_root_ident` (checker.c) — the keep sink, whose C6 walk had the identical gap
+
+`NODE_SLICE` is admitted alongside `&` at the alias branch, which is what makes a slice view
+alias its allocation at all.
+
+**The checker twin is deliberately NOT wired into `arg_is_local_derived`**, which asks a
+different question — "does this point into STACK memory?" A pool slot lives in the global
+Pool, so seeing through `get()` there would assert something false. Same-looking walk,
+different question; that distinction is the whole reason the two helpers are separate.
+
+### Gate
+
+**SHAPE p19 in `tools/sink_matrix.sh`** — spelling x form, 8 reject cells + 2 boundary
+(a view into a LIVE slot, and a slice of a stack array, must both stay legal).
+
+**Verified to FIRE**: run against a `git archive` build of the commit before the fix, all 8
+report HOLE and both boundary cells stay green. A gate that has only ever passed is a script,
+not a net.
+
+Tests: the branch's five verbatim (`pool_get_field_addr_uaf`, `pool_get_index_addr_uaf`,
+`pool_get_field_slice_uaf`, `pool_get_field_addr_keep_stash`, `slab_get_field_addr_uaf`) plus
+`handle_slice_view_uaf`, `heap_slice_view_uaf` and `pool_slot_reuse_corruption` for the half
+it did not have, and the boundary positive `tests/zer/pool_get_view_before_free_ok.zer`.
+
+---
+
 ## Session 2026-09-08 — BUG-967: the slice header was writable, so any bound was forgeable
 
 `[*]T` bounds safety rests entirely on the `{ptr, len}` header — every index emits

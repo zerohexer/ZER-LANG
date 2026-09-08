@@ -172,6 +172,11 @@ typedef struct IRInst {
     int handle_local;        /* LOCAL id of handle (for free/get) */
     Type *alloc_type;        /* for arena.alloc(T) — the T */
 
+    /* BUG-965: on IR_DEFER_FIRE, true when ir_lower DECLINED to splice the bodies and
+     * the emitter must emit them from the AST instead. Set for every fire in a
+     * function containing a LABEL — see materialise_defer_body. */
+    bool defer_fire_emit_ast;
+
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
     /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this
@@ -364,6 +369,13 @@ int ir_add_block(IRFunc *func, Arena *arena);
  * duplicate goto targets in the emitted C. `preds` are left empty; they are
  * computed after lowering by ir_compute_preds. */
 int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last);
+
+/* BUG-959: append `n` copies of `src[0..n-1]`, remapping block references exactly as
+ * ir_clone_block_range does. The external-source form exists so a defer body's
+ * lowered blocks can be EXTRACTED at registration and cloned at each fire — the
+ * snapshot must be independent of the live array, which keeps growing. */
+int ir_append_block_copies(IRFunc *func, Arena *arena,
+                           const IRBlock *src, int n, int src_first);
 
 
 /* Add an instruction to a basic block. */

@@ -1,0 +1,28 @@
+// BUG-959 (refactor L stage 2): a defer nested 32 levels deep is still credited
+// with the free.
+//
+// Replaces tests/zer_gaps/audit2_defer_scan_nested.zer, whose recorded claim
+// (AUDIT2 #3, 2026-04-19 — zercheck's defer-body scan used `scan_stack[32]` with
+// `scan_depth < 31`, so a deeper defer was missed by the leak pre-scan and produced
+// a FALSE "handle leaked") did NOT reproduce: measured 2026-09-08, that file
+// compiles clean on the pre-refactor compiler too. What it actually exhibited was a
+// different bug — in the file itself, not the analysis — allocating from the
+// auto-Slab and freeing on a named one, which the post-refactor compiler now
+// catches (tests/zer_fail/defer_body_wrong_pool.zer pins that rule).
+//
+// So this positive keeps the depth claim honest — 32 levels, no false leak — while
+// no longer asserting a gap that was never there.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    defer heap.free_ptr(t);
+    bool c = true;
+    u32 x = 0;
+    if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) {     if (c) { 
+        x = t.id;
+}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}}
+    return x;
+}

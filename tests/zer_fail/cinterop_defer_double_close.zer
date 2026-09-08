@@ -1,4 +1,12 @@
-// expect-error: double free: deferred free of
+// expect-error: double free:
+// BUG-959 note: the reason is unchanged — this IS a double free and is still
+// rejected as one — but the WORDING lost the word "deferred". The old message came
+// from zercheck's AST scan of defer bodies, which knew the free came from a defer.
+// The body is now ordinary IR walked by the CFG, which reports it as any other
+// double free. The directive asserts the reason the rule is supposed to give, not
+// the phrasing, so it is relaxed to `double free:` rather than pinned to text the
+// mechanism no longer produces. The lost specificity is recorded in
+// docs/limitations.md as a known cost with a fix sketch.
 // The other half of BUG-812. Once a deferred extern destructor is recognised as
 // a free, `dev_close(dev); defer dev_close(dev);` is a genuine double free —
 // the deferred one fires at scope exit on an already-closed handle. Before

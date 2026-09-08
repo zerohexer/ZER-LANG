@@ -1,0 +1,28 @@
+// expect-error: allocated at line 21 but never freed
+// BUG-966 (refactor L stage 2): a `defer` registered INSIDE a conditional block frees
+// the handle only on the paths that ENTER that block. The fall-through path allocates
+// and never frees.
+//
+// This compiled CLEAN before — measured on the pre-refactor compiler, and verified in
+// the emitted C, where the false-branch block returns with no `_zer_slab_free_ptr` on
+// that path. So it is a leak the analysis could not see, not merely a missing report.
+//
+// It was found while triaging tests/zer_gaps/audit2_defer_scan_nested.zer and was
+// first recorded AS a gap; it then closed on the same day, as a second-order effect of
+// tagging the ENDING block of a bare `orelse return` fallback (see the BUG-966 comment
+// in lower_orelse_to_dest). The compile-time defer stack correctly pops the defer at
+// the end of the block, so no fire is emitted at the outer return — right for
+// emission, and exactly what used to leave the handle unaccounted for.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    bool c = true;
+    if (c) {
+        defer heap.free_ptr(t);
+        return t.id;
+    }
+    return 0;
+}

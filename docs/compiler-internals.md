@@ -6061,6 +6061,36 @@ Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
 as flag values fell into the validator's "out of range" check for
 functions with local_count == 0.
 
+### THE DEFER BODY IS IR NOW — read this before the two sections below (2026-09-08, BUG-959..966)
+
+**A defer body is lowered ONCE at its registration into a detached block range, and
+CLONED into the CFG at every fire — for every function that does NOT contain a LABEL.**
+`ir_lower.c`: `materialise_defer_body` / `materialise_defers_from`, the template arrays
+on `LowerCtx`, and the single query `defers_stay_on_ast(ctx)` (= `label_count > 0`).
+
+Consequences a session touching defer code must know:
+
+- **`emit_defer_stmt` and `zercheck_ir`'s AST defer analysis are now the LABEL path
+  only.** Both are gated on `IRInst.defer_fire_emit_ast`, which `make_defer_fire` — the
+  ONLY constructor of an `IR_DEFER_FIRE` — sets from that one query. Add a new fire site
+  through that constructor or the two consumers will disagree with the lowerer, which is
+  precisely how eleven goto/defer tests broke during this work.
+- **`IR_DEFER_PUSH` / `IR_DEFER_FIRE` still exist** — `ir_validate` checks their balance
+  and `e->defer_stack` still feeds `emit_defers_from` at the remaining C-level guard
+  exits. Only body EMISSION moved.
+- **Never lower a defer body on the label path.** `pre_lower_orelse` REWRITES nodes, so
+  lowering a template the emitter will also replay violates "never lower the same AST
+  twice" from inside a single lowering.
+- **A guard inside a defer body TRAPS** (`defer_body_depth`), because an early return
+  there would re-fire the defer stack. The same counter suppresses a fire emitted from
+  inside a body.
+- **A fire at an already-terminated position does not materialise.** Splicing a body that
+  cannot run makes the ANALYSIS wrong (zercheck walks every block and counts the frees
+  again), so this is correctness, not an optimisation.
+
+The two sections below describe the machinery of the LABEL path. It is unchanged and
+still load-bearing there.
+
 ### capture-on-FIRE + runtime-flag defer emission (2026-06-20 — plt86m defer-goto)
 
 **The defer body-emission model changed: each `IR_DEFER_FIRE` carries its OWN
@@ -7450,6 +7480,22 @@ created the local skipped type assignment. Downstream (emitter,
 analyzer) crashes or produces wrong C.
 
 ### Items evaluated, dropped, deferred
+
+**INVARIANT (BUG-964, 2026-09-08): a block's successors are decided by its FIRST
+TERMINATOR, not by its last instruction.** Lowering appends past a terminator — a
+`return` inside a switch arm terminates the block, and the arm's end still emits its
+`IR_DEFER_FIRE` and a GOTO to the join. Reading the last instruction gives the join a
+predecessor it does not have. `ir_compute_preds` scans for the first
+BRANCH/GOTO/RETURN/YIELD/AWAIT/TRAP; **any new CFG walk must do the same** (a second walk
+added during that work had the identical bug and followed a dead GOTO through the whole
+tail of the function). Note `IR_TRAP` is a terminator (BUG-957) and needs an explicit
+no-successor case — it used to fall into `default` and gain a phantom fall-through edge.
+
+**Do NOT "fix" this by deleting the trailing instructions.** They are unreachable but
+they are still ANALYSED: truncating them silently dropped the use-after-move report on
+`return t; u32 k = t.kind;` (`rt_move_struct_return_then_use`), and zercheck deliberately
+inherits state into a pred-less block whose predecessor ends in `IR_RETURN` for exactly
+that reason. Correct edges, every instruction intact.
 
 All 20 items from the audit, with rationale:
 

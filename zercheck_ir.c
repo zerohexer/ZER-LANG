@@ -6378,9 +6378,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * Return values are computed BEFORE their fire in IR order, so
          * `defer free(h); return h.field;` is unaffected (pinned by a positive
          * test). */
+        /* BUG-959/961: most defer BODIES are ordinary CFG blocks now — ir_lower
+         * splices a clone at this fire point — so the forward pass has already
+         * walked their frees as real instructions, and re-applying them from the AST
+         * would count every free TWICE ("double free: deferred free of %N which was
+         * already freed").
+         *
+         * The ONE exception is a body under the cleanup-label GUARD, which keeps the
+         * raw-AST path because making that guard a visible branch defeats leak
+         * analysis. The CFG cannot see those, so they must still be applied here —
+         * the same condition the emitter uses to pick which bodies it emits, read
+         * from the same fields, so the two cannot disagree.
+         *
+         * No ir_fire_has_work_after() gate: that existed because Phase C3 separately
+         * applied defer frees at RETURN blocks, so the forward pass only needed
+         * fires with code after them. C3 is gone for everything but this remnant, so
+         * a guarded fire at the function exit — which has no work after it — must be
+         * applied HERE or its free is never seen at all. */
         if (inst->src2_local != 2 && inst->defer_fire_bodies &&
-            ir_fire_has_work_after(func, inst)) {
-            /* LIFO: defers fire in reverse registration order, mirroring C3. */
+            inst->defer_fire_emit_ast && ir_fire_has_work_after(func, inst)) {
             for (int dbi = inst->defer_fire_body_count - 1; dbi >= 0; dbi--) {
                 Node *dbody = inst->defer_fire_bodies[dbi];
                 if (!dbody) continue;
@@ -7614,6 +7630,24 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      *
      * We walk all blocks to collect defers once, then apply to each return
      * block's state. */
+    /* BUG-959/965: does this function keep its defer bodies on the RAW-AST path?
+     *
+     * Bodies SPLICED into the CFG are already walked by the forward pass, so applying
+     * them again here would count every free TWICE. Only a function ir_lower declined
+     * to splice — it marks every fire `defer_fire_emit_ast`, which it does for any
+     * function containing a LABEL — still needs this pass at all.
+     *
+     * Reading it off the FIRES rather than off the pushes is safe because ir_validate
+     * requires every IR_DEFER_PUSH to have a CFG-reachable IR_DEFER_FIRE, so a
+     * function with defers always has at least one fire to read. */
+    bool func_defers_are_ast = false;
+    for (int bx = 0; bx < func->block_count && !func_defers_are_ast; bx++)
+        for (int ix = 0; ix < func->blocks[bx].inst_count; ix++)
+            if (func->blocks[bx].insts[ix].op == IR_DEFER_FIRE &&
+                func->blocks[bx].insts[ix].defer_fire_emit_ast) {
+                func_defers_are_ast = true; break;
+            }
+
     /* plt86m audit 2026-06-17: also check defer-body USES (not just frees)
      * against each return block's PRISTINE exit state — a deferred USE of a
      * handle the body already freed / move-transferred is a use-after-free /
@@ -7635,7 +7669,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * checked. Leak detection is unaffected (the FINAL state has every free
      * applied regardless of order). */
     IRInst **dfs = NULL; int dfn = 0, dfc = 0;
-    for (int di = 0; di < func->block_count; di++) {
+    for (int di = 0; func_defers_are_ast && di < func->block_count; di++) {
         IRBlock *db = &func->blocks[di];
         for (int dj = 0; dj < db->inst_count; dj++) {
             IRInst *inst = &db->insts[dj];
@@ -7658,8 +7692,6 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
             ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
                                dfs[k]->source_line, &defer_use_rs);
-            /* F1: k+1 as the per-defer instance id — 0 is reserved for
-             * "not freed by any defer" (memset-zeroed slot / explicit free). */
             ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
                                 dfs[k]->source_line, k + 1);
         }

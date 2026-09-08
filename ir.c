@@ -200,8 +200,20 @@ int ir_add_block(IRFunc *func, Arena *arena) {
 int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
     if (!func || !arena) return -1;
     if (first < 0 || last < first || last >= func->block_count) return -1;
-
+    /* Snapshot the source BEFORE appending: ir_append_block_copies calls
+     * ir_add_block, which reallocs func->blocks. */
     int n = last - first + 1;
+    IRBlock *snap = (IRBlock *)arena_alloc(arena, (size_t)n * sizeof(IRBlock));
+    memcpy(snap, &func->blocks[first], (size_t)n * sizeof(IRBlock));
+    return ir_append_block_copies(func, arena, snap, n, first);
+}
+
+int ir_append_block_copies(IRFunc *func, Arena *arena,
+                           const IRBlock *src, int n, int src_first) {
+    if (!func || !arena || !src) return -1;
+    if (n <= 0 || src_first < 0) return -1;
+    int first = src_first;
+    int last  = src_first + n - 1;
 
     /* Allocate every clone FIRST. ir_add_block reallocs func->blocks, so both the
      * source and destination pointers must be re-read afterwards — reading them
@@ -216,7 +228,7 @@ int ir_clone_block_range(IRFunc *func, Arena *arena, int first, int last) {
     int offset = base - first;
 
     for (int i = 0; i < n; i++) {
-        IRBlock *sb = &func->blocks[first + i];
+        const IRBlock *sb = &src[i];
         IRBlock *dst = &func->blocks[base + i];
 
         /* Deliberately NOT copied: the source `label` (two blocks carrying one
@@ -334,7 +346,29 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
         IRBlock *block = &func->blocks[bi];
         if (block->inst_count == 0) continue;
 
+        /* BUG-964: the successors are decided by the block's FIRST terminator, not
+         * its last instruction. Lowering can append past one — a `return` inside a
+         * switch arm terminates the block, and the arm's end still emits its
+         * IR_DEFER_FIRE and a GOTO to the switch join. Reading the last instruction
+         * gave that join a predecessor it does not really have, and once defer bodies
+         * became real IR, zercheck followed the phantom edge out of a path that had
+         * already freed a handle into one that frees it again — a false double free
+         * on `defer …; switch { arms that return }` (rt_drop_enum_variant_cleanup).
+         *
+         * Fixed HERE rather than by deleting the trailing instructions: they are
+         * unreachable, but they are still ANALYSED, and deleting them silently drops
+         * diagnostics about dead code — measured, it lost the use-after-move report on
+         * `return t; u32 k = t.kind;` (rt_move_struct_return_then_use). Correct edges,
+         * every instruction intact. */
         IRInst *last = &block->insts[block->inst_count - 1];
+        for (int ii = 0; ii < block->inst_count; ii++) {
+            IROpKind op = block->insts[ii].op;
+            if (op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN ||
+                op == IR_YIELD  || op == IR_AWAIT || op == IR_TRAP) {
+                last = &block->insts[ii];
+                break;
+            }
+        }
         switch (last->op) {
         case IR_BRANCH:
             if (last->true_block >= 0 && last->true_block < func->block_count)
@@ -365,7 +399,10 @@ void ir_compute_preds(IRFunc *func, Arena *arena) {
                 add_pred(&func->blocks[bi + 1], arena, bi);
             break;
         case IR_RETURN:
-            /* No successor */
+        case IR_TRAP:
+            /* No successor. IR_TRAP (BUG-957) is a terminator by
+             * ir_block_is_terminated, but it used to fall into `default` here and
+             * gain a phantom fall-through edge into the next block. */
             break;
         default:
             /* Non-terminator last instruction — implicit fallthrough to next block */

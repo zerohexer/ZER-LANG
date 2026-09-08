@@ -79,6 +79,31 @@ typedef struct {
      * defer_bodies (-1 = none). See ir.h defer_fire_flags. */
     int defer_flags_inline[32];
     int *defer_flags;
+    /* BUG-959: each pending defer's body, LOWERED AT REGISTRATION and extracted —
+     * the blocks copied aside and block_count truncated back, so the function is
+     * left exactly as it was. Every fire clones this. Lowering at registration
+     * rather than at the first fire is required for CORRECTNESS: lowering
+     * re-resolves identifiers, and the first fire can be in a NESTED scope, where
+     * the body's names resolve to the wrong (shadowed) locals. */
+    IRBlock *defer_tpl_blocks_inline[32];
+    IRBlock **defer_tpl_blocks;
+    int defer_tpl_count_inline[32];
+    int *defer_tpl_count;
+    int defer_tpl_first_inline[32];
+    int *defer_tpl_first;
+    /* BUG-963: the OFFSET of the template's EXIT block within the range. The last
+     * block by INDEX is not the exit whenever the body has control flow — for a
+     * `for` loop the exit block is created before the post block, so index-based
+     * resumption lands in the loop and leaves the real exit unterminated and the
+     * code after the fire unreachable. Lowering leaves current_block AT the exit,
+     * so that is what gets recorded. */
+    int defer_tpl_exit_inline[32];
+    int *defer_tpl_exit;
+    /* BUG-959: >0 while a defer BODY is being lowered. A body has no defers of its
+     * own (nested defer is banned), so it must neither materialise nor EMIT a fire;
+     * and a bounds guard inside it must TRAP rather than return, since an early
+     * return would re-fire the defer stack. */
+    int defer_body_depth;
     /* Active runtime defer-fire guard (plt86m defer-goto, both-reachable cleanup
      * label). After such a label, subsequent fires of the goto-fired defers
      * (original depth < active_guard_below) emit `if (!flag) {...}` so the goto
@@ -317,6 +342,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr);
 static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_node, int line);
 static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local, Node *node, int line);
 static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line);
+static void materialise_defers_from(LowerCtx *ctx, int base);           /* BUG-959 */
+static bool defers_stay_on_ast(LowerCtx *ctx);                          /* BUG-965 */
 
 /* BUG-944: extracted from lower_expr's NODE_CALL arm so that lower_orelse_to_dest
  * can ask the SAME question instead of re-deriving it. True when a call's
@@ -1016,10 +1043,97 @@ static void ir_snapshot_defer_bodies(LowerCtx *ctx, IRInst *fire, int base) {
     }
 }
 
+/* BUG-959 (refactor L, stage 2): splice pending defer `di`'s body into the CFG here,
+ * as a CLONE of the template lowered at its registration. The body becomes ORDINARY
+ * IR that every safety rule and every emitter path already handles, instead of raw
+ * AST replayed by a SECOND statement emitter (emit_defer_stmt) implementing only
+ * some of them — which is why a shared read in a defer-body condition took NO mutex,
+ * why a defer-body var-decl / for-init / while-cond warned "auto-guard inserted" and
+ * emitted none, and why switch / do-while / @critical there emitted a runtime trap on
+ * VALID code. */
+static void materialise_defer_body(LowerCtx *ctx, int di) {
+    if (di < 0 || di >= ctx->defer_bodies_cap) return;
+    if (!ctx->defer_tpl_blocks[di]) return;        /* nothing lowered — nothing to fire */
+
+    /* BUG-965: functions with a label keep the raw-AST path wholesale. */
+    if (defers_stay_on_ast(ctx)) return;
+
+    /* No ARMED gate here. The flag is only ever allocated when label_count > 0, and
+     * that is exactly the case this function declines above — so a materialised body
+     * never needs one. The gate stays on the AST path, where it always was. */
+    int base = ir_append_block_copies(ctx->func, ctx->arena,
+                                      ctx->defer_tpl_blocks[di],
+                                      ctx->defer_tpl_count[di],
+                                      ctx->defer_tpl_first[di]);
+    if (base >= 0) {
+        ensure_terminated(ctx, base);              /* fall into the clone */
+        ctx->current_block = base + ctx->defer_tpl_exit[di];   /* BUG-963 */
+        int cont = ir_add_block(ctx->func, ctx->arena);
+        ensure_terminated(ctx, cont);
+        ctx->current_block = cont;
+    }
+}
+
+/* Materialise defers [base, defer_count) in LIFO order — newest first, the order the
+ * raw-AST emitter fired them in. */
+static void materialise_defers_from(LowerCtx *ctx, int base) {
+    /* A fire whose position is ALREADY TERMINATED cannot execute — the canonical case
+     * is the block-exit fire following a `return`, which the raw-AST emitter also
+     * emitted and which was never reached. Splicing there appends unreachable blocks,
+     * and zercheck walks every block, so the body's frees would be counted a SECOND
+     * time: a false double-free on `defer { p.free(h); } … return 0;`, measured
+     * across 38 fuzzer programs. Emitting a body that cannot run is what makes the
+     * analysis wrong, so this is not an optimisation. */
+    if (ctx->current_block >= 0 && ctx->current_block < ctx->func->block_count &&
+        ir_block_is_terminated(&ctx->func->blocks[ctx->current_block]))
+        return;
+    for (int di = ctx->defer_count - 1; di >= base; di--)
+        materialise_defer_body(ctx, di);
+}
+
+/* BUG-965: does this function keep its defer bodies on the RAW-AST path?
+ *
+ * ONE query, consulted at the registration (skip lowering a template) and at every
+ * fire (mark the instruction so the emitter and zercheck_ir apply the AST bodies).
+ * Three fire sites answered it independently at first and two of them answered
+ * "no" by omission — the bodies then existed on NEITHER path and every handle a
+ * defer freed was reported as leaked. Same multi-site shape this codebase keeps
+ * hitting; the cure is the same, one query.
+ *
+ * `label_count > 0` is the boundary because the goto machinery does not compose
+ * with splicing:
+ *
+ *   - the plt86m cleanup-label GUARD fires a body EAGERLY at the `goto`, SETS a
+ *     flag, and runs the later fall-through fire only `if (!flag)`. Complementary
+ *     guards, so the body runs exactly once — but as IR branches that correlation
+ *     is invisible and zercheck sees a merge of {freed} and {alive}. Unlike the
+ *     ARMED flag this cannot be recovered by dominance: that one is set once and
+ *     never cleared, this one genuinely varies, which is its purpose.
+ *   - the guard only becomes active AFTER the label is seen, so at the goto's own
+ *     fire there is no way to know one is coming.
+ *
+ * It is also the trigger the ARMED flag already uses, so this splits along a
+ * boundary the compiler had drawn anyway — and a materialised body therefore never
+ * carries an armed gate. Functions WITHOUT a label (the overwhelming majority, and
+ * where the safety wins are) get the IR treatment; functions with one keep exactly
+ * the behaviour they had. */
+static bool defers_stay_on_ast(LowerCtx *ctx) {
+    return ctx->label_count > 0;
+}
+
+/* Every IR_DEFER_FIRE is built here so the flag cannot be forgotten at a new site. */
+static IRInst make_defer_fire(LowerCtx *ctx, int line) {
+    IRInst fire = make_inst(IR_DEFER_FIRE, line);
+    fire.defer_fire_emit_ast = defers_stay_on_ast(ctx);
+    return fire;
+}
+
 /* Emit IR_DEFER_FIRE for pending defers (fire all, no pop — function/return exit) */
 static void emit_defer_fire(LowerCtx *ctx, int line) {
+    if (ctx->defer_body_depth > 0) return;   /* BUG-959: see emit_defer_fire_scoped */
     if (ctx->defer_count > 0) {
-        IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        materialise_defers_from(ctx, 0);
+        IRInst fire = make_defer_fire(ctx, line);
         ir_snapshot_defer_bodies(ctx, &fire, 0);
         emit_inst(ctx, fire);
     }
@@ -1029,8 +1143,17 @@ static void emit_defer_fire(LowerCtx *ctx, int line) {
  * pop=true: remove them from emitter stack (for end of loop iteration).
  * pop=false: keep on stack (for mid-body break/continue). */
 static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) {
+    /* BUG-959: while a defer BODY is being lowered, emit NO fire at all — not the
+     * splice and not the IR_DEFER_FIRE instruction. A body has no defers of its own
+     * (nested defer is banned), but a `break` in the body's own loop reaches here,
+     * and a stray fire baked into the template is then cloned at every fire site,
+     * leaving IR_DEFER_PUSH without a well-formed reachable fire and aborting
+     * ir_validate. Suppressing only the splice is not enough — the instruction is
+     * the half that breaks validation. */
+    if (ctx->defer_body_depth > 0) return;
     if (ctx->defer_count > base) {
-        IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        materialise_defers_from(ctx, base);
+        IRInst fire = make_defer_fire(ctx, line);
         fire.cond_local = base;
         fire.src2_local = pop ? 0 : 1;
         ir_snapshot_defer_bodies(ctx, &fire, base);
@@ -1042,8 +1165,9 @@ static void emit_defer_fire_scoped(LowerCtx *ctx, int base, bool pop, int line) 
  * compile-time defer_stack count. Used at loop exit after all body paths have
  * already emitted their defer bodies (with no-pop). */
 static void emit_defer_pop_only(LowerCtx *ctx, int base, int line) {
+    if (ctx->defer_body_depth > 0) return;   /* BUG-959 */
     if (ctx->defer_count > base) {
-        IRInst fire = make_inst(IR_DEFER_FIRE, line);
+        IRInst fire = make_defer_fire(ctx, line);
         fire.cond_local = base;
         fire.src2_local = 2;
         emit_inst(ctx, fire);
@@ -1145,12 +1269,13 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
 
     ctx->current_block = bb_exit;
 
-    /* BUG-957: inside @critical the exit must ABORT, not return. A return would
-     * skip the interrupt re-enable and leave interrupts off forever — exactly the
-     * construct ZER hard-errors on when a user writes `return` inside @critical.
-     * IR_TRAP is a terminator, so the CFG knows the path ends; the emitted text is
-     * the same abort the C-level guard used. */
-    if (ctx->critical_depth > 0) {
+    /* BUG-957/959: the exit must ABORT rather than return in two scopes. Inside
+     * @critical a return would skip the interrupt re-enable — the construct ZER
+     * hard-errors on when a user writes it. Inside a DEFER BODY a return would
+     * re-fire the defer stack and skip the rest of the function's cleanup, which is
+     * exactly why the emitter's guard_traps exists. IR_TRAP is a terminator, so the
+     * CFG knows the path ends. */
+    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) {
         emit_inst(ctx, make_inst(IR_TRAP, g->line));
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -2204,6 +2329,18 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
+        /* BUG-966: tag the ENDING block too. Firing the defers now SPLICES each body
+         * into the CFG (BUG-959) and leaves current_block on a fresh continuation, so
+         * the IR_RETURN no longer lands in bb_fail and the tag missed it — the leak
+         * check then read the null-optional path as a live allocation and reported a
+         * false leak on `defer …; h2 = mh2 orelse return;` (rt_drop_enum_variant_cleanup).
+         *
+         * The BLOCK-form fallback below has always done this ("tag the ENDING block if
+         * lowering split into sub-blocks"); the bare form did not, because before the
+         * splice it never split. Same question, two sites, one of them updated — the
+         * sibling-site shape this project keeps recording. */
+        if (ctx->current_block != bb_fail)
+            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
@@ -2219,6 +2356,8 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
+        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2229,6 +2368,8 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
+        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -3948,6 +4089,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int *nf = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
             memcpy(nf, ctx->defer_flags, (size_t)ctx->defer_count * sizeof(int));
             ctx->defer_flags = nf;
+            /* BUG-959/960: every parallel array grows WITH them; one left behind is
+             * read past its end on the 33rd defer. */
+            IRBlock **ntb = (IRBlock **)arena_alloc(ctx->arena, (size_t)nc * sizeof(IRBlock *));
+            memcpy(ntb, ctx->defer_tpl_blocks, (size_t)ctx->defer_count * sizeof(IRBlock *));
+            ctx->defer_tpl_blocks = ntb;
+            int *ntc = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
+            memcpy(ntc, ctx->defer_tpl_count, (size_t)ctx->defer_count * sizeof(int));
+            ctx->defer_tpl_count = ntc;
+            int *ntf = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
+            memcpy(ntf, ctx->defer_tpl_first, (size_t)ctx->defer_count * sizeof(int));
+            ctx->defer_tpl_first = ntf;
+            int *nte = (int *)arena_alloc(ctx->arena, (size_t)nc * sizeof(int));
+            memcpy(nte, ctx->defer_tpl_exit, (size_t)ctx->defer_count * sizeof(int));
+            ctx->defer_tpl_exit = nte;
             ctx->defer_bodies_cap = nc;
         }
         ctx->defer_bodies[ctx->defer_count] = node->defer.body;
@@ -3973,8 +4128,72 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             set.literal_kind = 0;
             emit_3ac(ctx, set);
         }
-        if (ctx->defer_count < ctx->defer_bodies_cap)
+        if (ctx->defer_count < ctx->defer_bodies_cap) {
             ctx->defer_flags[ctx->defer_count] = armed;
+
+            /* BUG-959: lower the body HERE and EXTRACT it — copy the blocks aside
+             * and truncate block_count back, leaving the function exactly as it
+             * was. Every fire then clones the template.
+             *
+             * At REGISTRATION rather than at the first fire, for correctness:
+             * lowering re-resolves identifiers, and the first fire can be in a
+             * NESTED scope — `{ Handle h = mh2 orelse return; }` fires the outer
+             * defer from the inner block — where `pool.free(h)` resolved to the
+             * INNER shadowed handle. Restoring the scope DEPTH alone did not
+             * reproduce the registration context (measured: still the shadow);
+             * lowering where the defer was written does, by construction. That is
+             * the BUG-488 class, caught by handle_shadow_scope.
+             *
+             * EXTRACTED rather than left in place behind a skip flag: a template
+             * still in the array must be skipped by the emitter AND by all ten
+             * block loops in zercheck_ir, and a `pool.free(h)` sitting in an
+             * unreachable template could MASK a real leak. A removed block cannot.
+             * The body's LOCALS stay registered — they must, every clone refers to
+             * them — and they are not dead, because every fire clones the body. */
+            ctx->defer_tpl_blocks[ctx->defer_count] = NULL;
+            ctx->defer_tpl_count[ctx->defer_count]  = 0;
+            ctx->defer_tpl_first[ctx->defer_count]  = -1;
+            ctx->defer_tpl_exit[ctx->defer_count]   = 0;
+            /* BUG-965: on the raw-AST path, do not lower a template at all. Lowering
+             * would be wasted, and worse than wasted: pre_lower_orelse REWRITES the
+             * nodes it visits, so the emitter's emit_defer_stmt would then replay an
+             * AST this pass had already mutated — the "never lower the same AST
+             * twice" invariant, hit from inside one lowering. */
+            if (!defers_stay_on_ast(ctx)) {
+                int saved_block = ctx->current_block;
+                int saved_n     = ctx->defer_count;
+                int tpl_first   = ir_add_block(ctx->func, ctx->arena);
+                ctx->current_block = tpl_first;
+                ctx->defer_body_depth++;
+                lower_stmt(ctx, node->defer.body);
+                ctx->defer_body_depth--;
+                ctx->defer_count   = saved_n;
+                int tpl_n    = ctx->func->block_count - tpl_first;
+                int tpl_exit = ctx->current_block - tpl_first;   /* BUG-963 */
+                ctx->current_block = saved_block;
+                if (tpl_n > 0) {
+                    IRBlock *tpl = (IRBlock *)arena_alloc(ctx->arena,
+                                            (size_t)tpl_n * sizeof(IRBlock));
+                    memcpy(tpl, &ctx->func->blocks[tpl_first],
+                           (size_t)tpl_n * sizeof(IRBlock));
+                    for (int ti = 0; ti < tpl_n; ti++) {
+                        int ic = tpl[ti].inst_count;
+                        if (ic <= 0) { tpl[ti].insts = NULL; tpl[ti].inst_capacity = 0; continue; }
+                        IRInst *ci = (IRInst *)arena_alloc(ctx->arena,
+                                            (size_t)ic * sizeof(IRInst));
+                        memcpy(ci, tpl[ti].insts, (size_t)ic * sizeof(IRInst));
+                        tpl[ti].insts = ci;
+                        tpl[ti].inst_capacity = ic;
+                    }
+                    ctx->defer_tpl_blocks[ctx->defer_count] = tpl;
+                    ctx->defer_tpl_count[ctx->defer_count]  = tpl_n;
+                    ctx->defer_tpl_first[ctx->defer_count]  = tpl_first;
+                    ctx->defer_tpl_exit[ctx->defer_count]   =
+                        (tpl_exit >= 0 && tpl_exit < tpl_n) ? tpl_exit : tpl_n - 1;
+                }
+                ctx->func->block_count = tpl_first;   /* extract */
+            }
+        }
         ctx->defer_count++;
         break;
     }
@@ -4172,6 +4391,10 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_tpl_blocks   = ctx.defer_tpl_blocks_inline;
+    ctx.defer_tpl_count    = ctx.defer_tpl_count_inline;
+    ctx.defer_tpl_first    = ctx.defer_tpl_first_inline;
+    ctx.defer_tpl_exit     = ctx.defer_tpl_exit_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;
@@ -4257,7 +4480,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
         emit_inst(&ctx, ret);
     }
 
-    /* Compute CFG predecessors */
+    /* Compute CFG predecessors. */
     ir_compute_preds(func, arena);
 
     return func;
@@ -4285,6 +4508,10 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     ctx.loop_continue_block = -1;
     ctx.defer_bodies = ctx.defer_bodies_inline;
     ctx.defer_flags = ctx.defer_flags_inline;
+    ctx.defer_tpl_blocks   = ctx.defer_tpl_blocks_inline;
+    ctx.defer_tpl_count    = ctx.defer_tpl_count_inline;
+    ctx.defer_tpl_first    = ctx.defer_tpl_first_inline;
+    ctx.defer_tpl_exit     = ctx.defer_tpl_exit_inline;
     ctx.defer_bodies_cap = (int)(sizeof(ctx.defer_bodies_inline) / sizeof(ctx.defer_bodies_inline[0]));
     ctx.active_guard_flag = -1;
     ctx.labels = ctx.label_inline;

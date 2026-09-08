@@ -1,0 +1,24 @@
+// expect-error: wrong pool: handle was allocated from
+// BUG-959 (refactor L stage 2): freeing on the WRONG ALLOCATOR inside a defer body.
+//
+// `alloc(Task)` uses the implicit per-struct auto-Slab; `heap` is a DIFFERENT,
+// explicitly declared Slab. Freeing the one on the other is the mismatch zercheck
+// already rejected everywhere else — and silently ACCEPTED here, because a defer
+// body was raw AST that the CFG walk never saw. The wrong-pool rule simply did not
+// reach inside a defer.
+//
+// This is not a depth or a scan-limit story: it was accepted with no nesting at
+// all. Measured on the pre-fix compiler, which compiled this file clean.
+//
+// It is the accept-unsafe half of the reason the defer body is now lowered into
+// the IR: one body, one set of rules, rather than a second statement emitter that
+// implements some of them.
+
+struct Task { u32 id; }
+Slab(Task) heap;
+
+u32 main() {
+    *Task t = alloc(Task) orelse return;
+    defer heap.free_ptr(t);
+    return t.id;
+}

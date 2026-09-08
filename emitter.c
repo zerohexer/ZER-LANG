@@ -11676,8 +11676,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         int base = (inst->cond_local >= 0) ? inst->cond_local : 0;
         /* src2_local: 0 = emit+pop, 1 = emit, no pop, 2 = pop only */
         bool pop = (inst->cond_local >= 0) && (inst->src2_local != 1);
+        /* BUG-959/961: the defer BODIES are lowered into the IR — ir_lower splices a
+         * clone at this fire point — with ONE exception: a body under the
+         * cleanup-label GUARD keeps the raw-AST path, because making that guard a
+         * visible branch defeats leak analysis (see materialise_defer_body). So emit
+         * exactly the guarded bodies here and nothing else.
+         *
+         * IR_DEFER_PUSH / IR_DEFER_FIRE stay regardless: ir_validate checks their
+         * balance, and e->defer_stack still feeds emit_defers_from at the few
+         * remaining C-level guard exits, whose early return leaves the function
+         * without passing through any IR fire point. */
         bool emit_bodies = (inst->src2_local != 2);
-        if (!emit_bodies) {
+        if (!emit_bodies || !inst->defer_fire_emit_ast) {
             if (pop) e->defer_stack.count = base;
             break;
         }

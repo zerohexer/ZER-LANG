@@ -3036,7 +3036,15 @@ static Type *packed_path_aggregate(Checker *c, Node *e, bool *packed_seen, int d
 static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!expr || expr->kind != NODE_UNARY || expr->unary.op != TOK_AMP) return false;
     Node *op = expr->unary.operand;
-    if (!op || op->kind != NODE_FIELD) return false;   /* must be a FIELD access */
+    /* BUG-972: peel INDEX steps. The gate demanded a DIRECT field access, so
+     * `&p.w[0]` — one index between the field and the `&` — walked straight past the
+     * rule while `&p.w` was caught. Measured on `packed struct P { u8 a; u32[2] w; }`:
+     * offsetof(w) == 1, so the emitted `uint32_t *` addresses an ODD byte. A hard
+     * fault on ARMv7-M / RISC-V, a split access on Cortex-M0+, merely slow on x86 —
+     * which is why no hosted test could catch it. packed_path_aggregate below already
+     * peels INDEX; only this gate did not. */
+    while (op && op->kind == NODE_INDEX) op = op->index_expr.object;
+    if (!op || op->kind != NODE_FIELD) return false;   /* must reach a FIELD access */
     bool packed_seen = false;
     packed_path_aggregate(c, op, &packed_seen, 0);
     return packed_seen;
@@ -3057,6 +3065,54 @@ static bool addr_of_is_packed_field(Checker *c, Node *expr) {
  * The CALL-ARG sink is why the FLAG route was structurally incomplete rather than
  * merely under-wired: `poke(&g.b)` binds no name, so no Symbol exists to carry the
  * fact. A predicate asked on the EXPRESSION is the only thing that can reach it. */
+/* BUG-972: does this expression form a SLICE over an ARRAY FIELD of a packed struct
+ * whose ELEMENTS need more than byte alignment?
+ *
+ * A DIFFERENT operation from `&packed.field`, which is why value_is_packed_derived
+ * could not reach it: no `&` appears in the source at all. Three spellings produce the
+ * same misaligned view, and all three compiled clean —
+ *
+ *     [*]u32 s = p.w[0..];     // slice expression
+ *     [*]u32 s = p.w;          // array->slice COERCION, no slice syntax
+ *     fill(p.w);               // the same coercion at a call argument
+ *
+ * — after which every `s[i]` is a 1-byte-aligned u32 access that the callee cannot
+ * see and the checker had stopped tracking.
+ *
+ * KEYED ON THE ELEMENT'S ALIGNMENT, not on the packed attribute alone. A `u8[6]`
+ * field of a packed struct is perfectly safe to view: byte elements cannot be
+ * misaligned, and rejecting that would break the ordinary packed-wire-format idiom
+ * this language exists to serve (tests/zer/packed_u8_array_view_ok.zer pins it). That
+ * precision is the reason this is a separate predicate rather than a reuse of the
+ * address-of rule, which is deliberately unconditional. */
+static bool packed_array_field_view(Checker *c, Node *v) {
+    if (!v) return false;
+    /* A slice EXPRESSION and a bare array field both arrive here; peel the slice. */
+    if (v->kind == NODE_SLICE) v = v->slice.object;
+    if (!v || v->kind != NODE_FIELD) return false;
+    Type *ft = checker_get_type(c, v);
+    if (type_dispatch_kind(ft) != TYPE_ARRAY) return false;
+    Type *eff = type_unwrap_distinct(ft);
+    if (!eff || !eff->array.inner) return false;
+    if (type_alignment_bytes(eff->array.inner) <= 1) return false;   /* byte elems: safe */
+    bool packed_seen = false;
+    packed_path_aggregate(c, v, &packed_seen, 0);
+    return packed_seen;
+}
+
+/* The shared REPORTER, so every coercion sink words it identically. */
+static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) {
+    if (!v || type_dispatch_kind(dest) != TYPE_SLICE) return false;
+    if (!packed_array_field_view(c, v)) return false;
+    checker_error(c, line,
+        "cannot form a slice over an array field of a packed struct — the elements "
+        "are not naturally aligned, so every access through the view is a misaligned "
+        "load/store (a hard fault on ARM/RISC-V, silent on x86) and the code holding "
+        "the slice cannot see that. Copy the field to an aligned local, or view it as "
+        "bytes ([*]u8)");
+    return true;
+}
+
 static bool value_is_packed_derived(Checker *c, Node *v) {
     if (!v) return false;
     v = unwrap_ptr_launder(v);
@@ -3726,9 +3782,11 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * Same question, second sink. */
                 check_inttoptr_dest_volatile(c, df->value, ft, line);
                 Type *vt = checker_get_type(c, df->value);
-                if (vt && ft)
+                if (vt && ft) {
                     reject_unique_resource_copy(c, df->value, ft,
                                                 line, "initialize");
+                    reject_packed_array_view(c, df->value, ft, line);
+                }
                 if (vt && ft && !value_flows_to(df->value, vt, ft)) {
                     char what[96];
                     snprintf(what, sizeof(what), "field '.%.*s'",
@@ -9346,6 +9404,8 @@ static Type *check_expr(Checker *c, Node *node) {
 
                     reject_unique_resource_copy(c, node->call.args[i], param,
                                                 node->loc.line, "pass");
+                    reject_packed_array_view(c, node->call.args[i], param,
+                                             node->loc.line);
                     if (!value_flows_to(node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
                         char what[48];
@@ -10757,6 +10817,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* fallback must match unwrapped type */
                 reject_unique_resource_copy(c, node->orelse.fallback, unwrapped,
                                             node->loc.line, "use");
+                reject_packed_array_view(c, node->orelse.fallback, unwrapped,
+                                         node->loc.line);
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
                     if (!report_value_flow_refusal(c, node->orelse.fallback, unwrapped,
                                                     node->loc.line, "orelse fallback"))
@@ -14696,6 +14758,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             reject_unique_resource_copy(c, node->var_decl.init, type,
                                         node->loc.line, "initialize");
+            reject_packed_array_view(c, node->var_decl.init, type, node->loc.line);
             if (!value_flows_to(node->var_decl.init, init_type, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
@@ -17038,6 +17101,8 @@ static void check_stmt(Checker *c, Node *node) {
                             "or build a fresh one in the function",
                             unique_resource_name(c->current_func_ret, 0));
                 }
+                reject_packed_array_view(c, node->ret.expr, c->current_func_ret,
+                                         node->loc.line);
                 if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
                     if (!report_value_flow_refusal(c, node->ret.expr,
                                                     c->current_func_ret,
@@ -18612,6 +18677,8 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 reject_unique_resource_copy(c, node->spawn_stmt.args[i], param_type,
                                             node->loc.line, "pass");
+                reject_packed_array_view(c, node->spawn_stmt.args[i], param_type,
+                                         node->loc.line);
                 if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
                     snprintf(what, sizeof(what), "spawn argument %d", i + 1);
@@ -23088,6 +23155,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             }
             reject_unique_resource_copy(c, decl->var_decl.init, type,
                                         decl->loc.line, "initialize");
+            reject_packed_array_view(c, decl->var_decl.init, type, decl->loc.line);
             if (!value_flows_to(decl->var_decl.init, init, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",

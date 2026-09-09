@@ -396,6 +396,39 @@ cell p21_safe_local_move   compile 'u8[64] gb21f; Arena mk21(){ Arena a=Arena.ov
 cell p21_safe_ptr_param    compile 'Barrier gb21g; Semaphore(2) gs21b; void tb21(*Barrier b){@barrier_wait(b);} void ts21(*Semaphore s){@sem_acquire(s);@sem_release(s);} u32 main(){ @barrier_init(gb21g,1); tb21(&gb21g); ts21(&gs21b); return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p22 (BUG-972): A MISALIGNED VIEW INTO A PACKED STRUCT — the OPERATION axis.
+#
+# The packed-field alignment rule guarded `&p.field` and nothing else. Four further
+# ways to reach the identical misaligned access compiled clean, and they split into
+# TWO OPERATIONS that no single predicate could cover:
+#
+#   address-of : `&p.w[0]` — one INDEX step between the field and the `&`, which the
+#                gate (which demanded a DIRECT field access) walked straight past.
+#   slice view : `p.w[0..]`, `[*]u32 s = p.w`, `fill(p.w)` — no `&` appears at all,
+#                so the address-of predicate could never reach them.
+#
+# Measured on `packed struct P { u8 a; u32[2] w; }`: offsetof(w) == 1, so the emitted
+# `uint32_t *` addresses an ODD byte. A hard fault on ARMv7-M / RISC-V, a split access
+# on Cortex-M0+, and merely SLOW on x86 — which is why no hosted test could catch it.
+#
+# The BOUNDARY is the precision half and it is what the packed feature exists for: a
+# BYTE array field is safe to view, because u8 elements cannot be misaligned. The
+# slice rule keys on type_alignment_bytes, not on the packed attribute alone.
+echo "===== SHAPE p22 = a misaligned view into a packed struct (operation axis) ====="
+cell p22_elem_addr      reject 'packed struct P22{u8 a; u32[2] w;} u32 main(){ P22 p; *u32 q=&p.w[0]; *q=1; return p.w[0]-1; }'
+cell p22_slice_expr     reject 'packed struct P22b{u8 a; u32[2] w;} u32 main(){ P22b p; [*]u32 s=p.w[0..]; s[0]=1; return p.w[0]-1; }'
+cell p22_coerce_decl    reject 'packed struct P22c{u8 a; u32[2] w;} u32 main(){ P22c p; [*]u32 s=p.w; s[1]=1; return p.w[1]-1; }'
+cell p22_call_arg       reject 'packed struct P22d{u8 a; u32[2] w;} void fl22([*]u32 s){s[0]=1;} u32 main(){ P22d p; fl22(p.w); return p.w[0]-1; }'
+cell p22_scalar_field   reject 'packed struct P22e{u8 a; u32 w;} u32 main(){ P22e p; *u32 q=&p.w; *q=1; return p.w-1; }'
+cell p22_nested_packed  reject 'packed struct I22{u8 a; u32[2] w;} struct O22{I22 i;} u32 main(){ O22 o; [*]u32 s=o.i.w[0..]; s[0]=1; return o.i.w[0]-1; }'
+# BOUNDARY: a BYTE array field is safe to view — u8 elements cannot be misaligned, and
+# rejecting that would break the packed-wire-format idiom the feature exists for. An
+# UNPACKED struct is naturally aligned and must stay viewable in every spelling.
+cell p22_safe_u8_view   compile 'packed struct F22{u8 k; u8[6] pay; u16 crc;} u32 sm22([*]u8 s){u32 t=0; for (u8 b in s) { t+=b; } return t;} u32 main(){ F22 f; f.pay[0]=1; f.pay[1]=2; [*]u8 v=f.pay; [*]u8 t=f.pay[0..2]; if (sm22(v)!=3) { return 1; } if (sm22(t)!=3) { return 2; } if (sm22(f.pay)!=3) { return 3; } return 0; }'
+cell p22_safe_unpacked  compile 'struct U22{u8 a; u32[2] w;} u32 main(){ U22 u; u.w[0]=5; [*]u32 s=u.w; if (s[0]!=5) { return 1; } return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

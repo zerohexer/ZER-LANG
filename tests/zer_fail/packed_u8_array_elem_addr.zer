@@ -1,0 +1,33 @@
+// expect-error: points into a PACKED struct field
+// BUG-972: THIS REJECTION IS AN OVER-REJECTION, pinned deliberately.
+//
+// `&p.w[0]` where `w` is a BYTE array cannot be misaligned — u8 has alignment 1. The
+// file is here, as a negative, because that is what the compiler DOES today and the
+// behaviour should not drift silently; it is not here because the rejection is right.
+//
+// Why it is accepted as a cost: peeling INDEX in addr_of_is_packed_field closed the
+// real hole (`&p.w[0]` on a `u32[2]` field — offsetof 1, a misaligned 32-bit store,
+// tests/zer_fail/packed_array_elem_addr.zer) and made the byte case rejected as a side
+// effect. That is UNIFORM with pre-existing behaviour: `&p.b` on a plain `u8` field of
+// a packed struct was already rejected. So it adds no new inconsistency, and the
+// measured corpus cost is zero — the suite is green across the 18 files using packed
+// structs.
+//
+// Note the deliberate ASYMMETRY with the SLICE half of the same fix, which IS
+// alignment-aware (`packed_array_field_view` keys on type_alignment_bytes, so
+// `[*]u8 v = f.payload;` compiles — tests/zer/packed_u8_array_view_ok.zer). The slice
+// rule is new, so its precision was designed in; the address-of rule is old, and
+// making it alignment-aware would RELAX a shipped rule — the accept-unsafe change
+// class, which belongs in its own commit with its own negative matrix.
+//
+// FIX SKETCH: gate addr_of_is_packed_field on type_alignment_bytes(target) > 1, which
+// also relaxes `&p.b`. Do it as a standalone relaxation per the "sound relaxation"
+// discipline in docs/compiler-internals.md. When that lands, DELETE this file.
+
+packed struct P { u8 a; u8[4] w; }
+u32 main() {
+    P p;
+    *u8 q = &p.w[0];
+    *q = 1;
+    return (u32)p.w[0] - 1;
+}

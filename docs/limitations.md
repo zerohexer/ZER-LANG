@@ -908,7 +908,51 @@ Their fix: a consumer-side `enum_nonvariant_trap` at BOTH emitter paths plus a
 declaration rule for the bare-uninitialised door. That is TRACKING (trap), which is
 right here — unlike a literal, the author wrote nothing to reject.
 
-**B. Packed-struct ARRAY field, four more doors (their BUG-922).** BUG-786 covered a
+**B. ~~Packed-struct ARRAY field, four more doors (their BUG-922)~~ — CLOSED
+2026-09-09 as BUG-972.** DO NOT REDO.
+
+BUG-786 covered a deref through `&packed.field`. An ARRAY field escaped it at four
+further doors, and they split into TWO OPERATIONS that no single predicate could cover:
+
+- **address-of:** `&p.w[0]` — one INDEX step between the field and the `&`, which the
+  gate (it demanded a DIRECT field access) walked straight past. `packed_path_aggregate`
+  already peeled INDEX; only that gate did not.
+- **slice view:** `p.w[0..]`, `[*]u32 s = p.w`, `fill(p.w)` — no `&` appears in the
+  source at all, so the address-of predicate could never reach them. New predicate
+  `packed_array_field_view` + one reporter at the seven value-flow sinks.
+
+Measured on `packed struct P { u8 a; u32[2] w; }`: `offsetof(w) == 1`, so the emitted
+`uint32_t *` addresses an ODD byte — a hard fault on ARMv7-M / RISC-V, a split access on
+Cortex-M0+, and merely SLOW on x86, which is why no hosted test could have caught it.
+
+**The precision half is what the packed feature exists for.** A BYTE array field is safe
+to view — u8 elements cannot be misaligned — so the slice rule keys on
+`type_alignment_bytes`, not on the packed attribute alone
+(`tests/zer/packed_u8_array_view_ok.zer` pins it).
+
+Gated by **SHAPE p22 in `tools/sink_matrix.sh`** (operation axis, 6 reject + 2 boundary).
+Verified to FIRE: 5 of the 6 report HOLE against the pre-fix build — the sixth is
+BUG-786's already-covered door, kept as pinned baseline — and both boundary cells stay
+green on both sides. A `nested_packed` cell (a packed struct inside a plain one) was
+added; it is not in the branch's set and it fires too.
+
+**KNOWN OVER-REJECTION, recorded rather than hidden:** peeling INDEX also rejects
+`&p.w[0]` where `w` is a BYTE array. That is UNIFORM with pre-existing behaviour (`&p.b`
+on a plain `u8` field of a packed struct was already rejected), so it adds no new
+inconsistency, and the corpus cost is zero — the suite is green across the 18 files using
+packed structs.
+
+Pinned as `tests/zer_fail/packed_u8_array_elem_addr.zer`, whose header states plainly
+that the rejection IS the over-rejection and carries the fix sketch: gate
+`addr_of_is_packed_field` on `type_alignment_bytes(target) > 1`, which also relaxes
+`&p.b`. NOT filed under `tests/zer_gaps/` — that directory's contract is "compile-clean
+IS the gap", the opposite of an over-rejection, and the harness said so.
+
+Deliberately NOT fixed here: relaxing a shipped rule is the accept-unsafe change class and
+belongs in its own commit with its own negative matrix. The resulting ASYMMETRY is
+deliberate — the SLICE rule is alignment-aware because it is new and its precision is
+load-bearing; the ADDRESS-OF rule is not, because it is old and relaxing it is a separate
+decision. BUG-786 covered a
 deref through `&packed.field`. An ARRAY field of a packed struct escapes the
 alignment rule at four further doors — slice, coercion, call-arg and `&elem`:
 
@@ -1192,7 +1236,8 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 ### Suggested order for this branch
 
 ~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
-BUG-969) → ~~D~~ (DONE, BUG-970) → ~~E~~ (DONE, BUG-971) → **B** → **H** → **I**.
+BUG-969) → ~~D~~ (DONE, BUG-970) → ~~E~~ (DONE, BUG-971) → ~~B~~ (DONE, BUG-972) →
+**H** → **I**.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

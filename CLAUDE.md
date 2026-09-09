@@ -1679,8 +1679,8 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 607 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 800 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 608 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 803 | `tests/test_zer.sh` |
 | `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 42 | `tests/test_zer.sh` |
 | `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 22 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |

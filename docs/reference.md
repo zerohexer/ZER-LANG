@@ -1444,6 +1444,10 @@ return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak
   A struct value carries its allocations wherever it goes — a plain copy
   (`H b = a;`), an initializer field (`H h = { .inner = i };`, or the nested
   literal `{ .inner = { .p = alloc(T) } }`), or a field store (`h.inner = i;`).
+  A pointer to a local aggregate is a **view** of it: after `*H hp = &h;`,
+  `hp.p` and `h.p` are one slot, so filling it through the view and freeing
+  through the local (or the reverse) is one allocation, not two — and a
+  union variant freed through its switch capture `|q|` is freed.
 - A callee may free an **optional** parameter, or an optional field of a
   parameter, by unwrapping it: `void drop(?*T p) { *T q = p orelse return;
   free(q); }`. The caller sees that free — `drop(mp)` discharges `mp`, and a

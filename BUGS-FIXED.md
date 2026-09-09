@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-981: a pointer VIEW of a local aggregate named different slots than the aggregate itself
+
+**Symptom (measured — silent).**
+
+```zer
+H h;  *H hp = &h;
+hp.p = alloc(T);
+*T q = hp.p orelse return;  free(q);
+*T r = h.p orelse return;   return r.v;      // compiled clean, ran, read freed memory
+```
+
+`hp.p` keyed on `hp`, `h.p` keyed on `h` — two compound roots for ONE slot, so a free
+through one was invisible through the other. The same view is what the union / optional
+switch lowering hoists (`%t = &u`), so a union variant freed through its switch capture
+was reported as a LEAK of `u` (the capture read `sw_ref.p` off the temp), and a second
+switch that read the freed variant was never seen.
+
+**Fix — ONE re-rooting in the ONE key query.** `IRHandleInfo.view_root_local`: set on
+the pointer's entry by the view arm when `%t = &<local aggregate>` (struct / union /
+array with no allocation of its own — `ir_local_is_aggregate`) and by the ASSIGN
+spelling `hp = &h;` (`hp = <anything else>` ends it); inherited by pointer copies through
+the alias snapshot; joined as "same root or AMBIGUOUS (-2)" at CFG merges, and -2 never
+re-roots (the conservative fallback is the old per-pointer tracking). `ir_extract_
+compound_key` — now taking the path state — re-roots a PROJECTION (`hp.p`, never the bare
+`hp`) onto the aggregate's local, so all ~36 sinks (free, alias, read, store, summary)
+agree by construction.
+
+**Tests.** `tests/zer_fail/view_of_local_store_then_read_via_local_uaf.zer`,
+`view_of_local_copy_uaf.zer` (both accepted by the pre-fix build — measured),
+`union_capture_free_then_reread_uaf.zer` (was a wrong-reason leak); positive
+`tests/zer/view_of_local_ok.zer` (fill through the view / free through the local, an
+ambiguous two-root view, a union variant freed through its capture — runs, exits 0).
+
+**Residual (limitations.md).** The POINTER capture `|*q|` of a union variant (`&sw_ref.p`,
+then `*q`) is not aliased — a free through it is still a false leak.
+
+---
+
 ## Session 2026-09-09 — BUG-980: six TYPE / AST-nesting depth guards failed OPEN — flipped to fail closed
 
 The BUG-973 ledger listed every walker that answers the NON-conservative answer past its

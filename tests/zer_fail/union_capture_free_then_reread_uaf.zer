@@ -1,0 +1,19 @@
+// expect-error: maybe-freed
+// BUG-981: the hoisted `&u` of a union switch is a view of u, so the variant capture
+// |q| aliases (u, ".p"): a free through the capture and a second switch that reads the
+// variant is a use of maybe-freed memory (before: a false leak, and the real UAF unseen).
+struct T { u32 v; }
+union U { ?*T p; u32 n; }
+u32 main() {
+    U u;
+    u.p = alloc(T);
+    switch (u) {
+        .p => |q| { *T t = q orelse return; free(t); }
+        .n => |n| { return n; }
+    }
+    switch (u) {
+        .p => |q| { *T t = q orelse return; return t.v; }
+        .n => |n| { return n; }
+    }
+    return 0;
+}

@@ -11439,6 +11439,18 @@ reset (`h.p = null;` inside the callee), merged definite-only-if-all-preds;
 is not a use — the FREED state is kept). What still stays MAYBE: the
 if-capture form (limitations.md).
 
+**A pointer VIEW of a local aggregate re-roots its projections (BUG-981).**
+`*H hp = &h;` and the hoisted `%t = &u` of a union / optional switch are
+views: `hp.p` and `h.p` are ONE slot. `IRHandleInfo.view_root_local` (set by
+the view arm for `&<struct|union|array local>` with no allocation of its own,
+and by the ASSIGN spelling `hp = &h;`; inherited through the alias snapshot;
+merged as same-or-AMBIGUOUS) is consulted by `ir_extract_compound_key` — which
+now takes the path state — to re-root a PROJECTION onto the aggregate's local.
+The bare pointer is never re-rooted (it is its own variable), and an ambiguous
+view (-2) falls back to the old per-pointer keying. Because the re-rooting
+lives in the one key query, every sink agrees by construction; the pointer
+capture `|*q|` (an address OF a slot, then a deref) is the remaining residual.
+
 Scoping lesson (recorded because the first scoping was WRONG): the
 original fix sketch said "needs a per-PathState global table touching the
 fixed-point lattice — dedicated-session surgery." The pseudo-root reuse

@@ -783,27 +783,26 @@ leaking it"*.)
 
 ---
 
-## OPEN — freeing a UNION variant through its switch capture is a false leak (2026-09-09, LOW — over-rejection)
+## OPEN — freeing a UNION variant through its POINTER capture `|*q|` is a false leak (2026-09-09, LOW — over-rejection; the value capture `|q|` is CLOSED as BUG-981)
 
-**Symptom (measured, pre- and post-BUG-975).**
+**Symptom (measured).**
 
 ```zer
 union U { ?*T p; u32 n; }
-U u;  u.p = alloc(T) orelse return;
-switch (u) { .p => |q| { *T t = q orelse return; free(t); }  .n => |n| { return n; } }
+U u;  u.p = alloc(T);
+switch (u) { .p => |*q| { *T t = *q orelse return; free(t); }  .n => |n| { } }
 return 0;      // zercheck: handle %0 (local 'u') allocated at line 5 but never freed
 ```
 
-The variant store registers the compound `(u, ".p")` (the same slot machinery as a struct
-field), but the switch capture `|q|` is a COPY of the variant value that aliases nothing —
-so the free through `q` never reaches the compound, and the exit pass reports it alive.
-The real use-after-free (a second `switch (u)` reading `.p` after the free) is therefore
-also invisible; the program is rejected only by accident of the leak rule.
+The value capture (`|q|`, a read of `sw_ref.p` off the hoisted `&u` view) aliases the
+variant slot since BUG-981 and is accepted. The pointer capture is `&sw_ref.p` — a
+pointer TO the slot — and the later `*q` deref read is not routed through the slot's
+compound, so the free never reaches `(u, ".p")`.
 
-**Fix sketch.** The union-switch capture lowering yields the captured value into a local
-(a FIELD_READ-like read of the variant); alias that local to `(u, ".variant")` exactly as
-the struct-field read arm does (`ir_type_reads_as_ref` gate), so the free propagates and
-the second read is a UAF. Gate: the two programs above as a positive and a negative.
+**Fix sketch.** Treat `*q` where `q`'s entry records "address of slot (root, path)" as a
+read of that slot: give the `&<projection>` view arm a slot-address form of
+`view_root_local` (root + path), and let the DEREF read arm re-root through it. Gate: the
+program above as a positive, plus `free(t); *T t2 = *q orelse return; t2.v` as a negative.
 
 ## OPEN — a callee freeing an optional field through the IF-CAPTURE form stays MAYBE (2026-09-09, LOW — over-rejection; the `orelse return` form is CLOSED as BUG-979)
 

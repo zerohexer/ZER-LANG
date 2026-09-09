@@ -1,0 +1,34 @@
+// BUG-981 positives: a pointer view of a local aggregate names the aggregate's own
+// slots — fill through the view, free through the local (no leak); an AMBIGUOUS view
+// (two roots joined) falls back to tracking through the pointer itself; a union
+// variant freed through its switch capture is not a leak.
+struct T { u32 v; }
+struct H { ?*T p; }
+union U { ?*T p; u32 n; }
+u32 pick() { return 1; }
+u32 main() {
+    H h;
+    *H hp = &h;
+    hp.p = alloc(T);
+    *T q = h.p orelse return;
+    q.v = 1;
+    u32 v = q.v;
+    free(q);
+
+    H h1; H h2;
+    *H hx = &h1;
+    if (pick() == 1) { hx = &h2; }
+    hx.p = alloc(T);
+    *T qx = hx.p orelse return;
+    qx.v = 2;
+    v += qx.v;
+    free(qx);
+
+    U u;
+    u.p = alloc(T);
+    switch (u) {
+        .p => |c| { *T t = c orelse return; t.v = 3; v += t.v; free(t); }
+        .n => |n| { v += n; }
+    }
+    return v - 6;
+}

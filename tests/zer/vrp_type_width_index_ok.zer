@@ -1,0 +1,37 @@
+// BUG-974 (relaxation): an index whose TYPE or SHAPE bounds it below the array size
+// is PROVEN without any range fact — a u8 cannot reach 256, `x >> 30` cannot reach 4,
+// `x & 3` and unsigned `x % 4` cannot reach 4, a bit-extract `x[3..0]` cannot reach 16,
+// and a const-ident modulus `x % M` cannot reach M. Before this every one of these paid
+// a runtime bounds check (or an auto-guard + warning) that no value could trip.
+// Runtime: every access is in range by construction; the test exits 0 and the
+// emitted C carries no _zer_bounds_check for these accesses (A/B'd against the
+// pre-fix build — see BUGS-FIXED.md; the guard's ABSENCE is the relaxation, the trap
+// siblings tests/zer_trap/vrp_type_width_*_trap.zer pin the boundaries).
+const u32 M = 4;
+u32[256] big;
+u32[4] small;
+u32[16] nib;
+u32 pick() { return 0xFFFFFFFF; }
+u32 main() {
+    u32 x = pick();
+    u8 b = @truncate(u8, x);
+    big[b] = 1;
+    small[x >> 30] = 2;
+    small[x & 3] = 3;
+    small[x % 4] = 4;
+    small[x % M] = 5;
+    small[x & (M - 1)] = 6;
+    u16 h = @truncate(u16, x);
+    u32[65536] wide;
+    wide[h] = 7;
+    nib[x[3..0]] = 8;
+    u32 k = x[7..4];
+    nib[k] = 9;
+    u64 wx = (u64)x;
+    small[wx % 4] = 10;
+    if (big[255] != 1) { return 1; }
+    if (small[3] != 10) { return 2; }
+    if (wide[65535] != 7) { return 3; }
+    if (nib[15] != 9) { return 4; }
+    return 0;
+}

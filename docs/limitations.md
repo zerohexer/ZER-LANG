@@ -783,6 +783,93 @@ leaking it"*.)
 
 ---
 
+## OPEN — a callee that frees an OPTIONAL param/field through an `orelse return` unwrap is not summarised as freeing it (2026-09-09, MEDIUM — over-rejection, valid program refused)
+
+**Symptom (measured on the pre-BUG-975 build too — pre-existing).**
+
+```zer
+struct T { u32 v; }
+void drop(?*T p) { *T q = p orelse return; free(q); }
+u32 main() { ?*T mp = alloc(T); drop(mp); return 0; }
+// zercheck: handle %0 (local 'mp') allocated at line 3 but never freed
+```
+
+Same for a field through a pointer param (`void drop(*H h){ *T q = h.p orelse return;
+free(q); h.p = null; }`), through a by-value struct param, and for the `if (h.p) |q| {
+free(q); }` capture form. The DIRECT spelling `void drop(H h){ free(h.p); }` on a
+non-optional `*T` field IS summarised (`frees_param_field`) and the caller compiles. An
+optional field cannot be freed without unwrapping, so for `?*T` fields there is no spelling
+the summary accepts: the caller must free the field itself.
+
+**Why it is newly VISIBLE.** BUG-975 tracks the bare spelling `h.p = alloc(T);` (before, it
+was untracked, so `drop(&h)` after it compiled — by accident, alongside the UAFs). The
+orelse spelling always hit this.
+
+**Root cause (two halves).** (a) In the callee, `*T q = p orelse return` for a PARAM lowers
+to a passthrough `%t = ASSIGN <p>` / `<h.p>`; the passthrough alias arm finds no handle for
+a param root and forms no alias, whereas the IR_FIELD_READ lowering has the 2026-08-16
+"create the param compound, mint an alloc_id, alias" sibling. So `free(q)` never reaches a
+handle rooted at the param, and the summary sees no param free. (b) Even with the alias, the
+`orelse return` path is a path on which the param is NOT freed, so the summary builder would
+classify it as MAYBE — the caller's ALIVE handle would become MAYBE_FREED and the leak check
+would still complain "may not be freed on all paths". For an optional, the null path holds
+nothing to free: a free on every path where the value was non-null IS a definite free of the
+allocation the caller passed.
+
+**Fix sketch.** (a) Mirror the FIELD_READ param-compound sibling into the passthrough
+`NODE_FIELD`/`NODE_IDENT` alias arms of IR_ASSIGN (the two-lowerings-of-one-read shape the
+2026-08-16 comment itself names). (b) In the summary builder, treat an exit reached only
+through the `orelse return` / `if (opt)`-else arm of the unwrap of param `i` as not
+contradicting `frees_param[i]` — the free is definite for a non-null argument. Gate: the
+five shapes above as positives, plus a negative where the callee frees on one REAL branch
+only (`if (c) { free(q); }`) which must stay MAYBE.
+
+**Tripwire.** `tests/zer/alloc_field_bare_spelling_ok.zer` frees every field-stored
+allocation in the function that allocated it; when this closes, add a `drop(&h)` positive.
+
+## OPEN — depth-guard ledger: which walkers still FAIL OPEN past their cap (2026-09-09, BUG-973 residue)
+
+BUG-973 converted the four call-descent caps that had a MEASURED accept-unsafe
+reproducer (spawn race scan, ISR walker + funcname siblings, post-spawn atomic-cell
+walk, `func_rmw_param_mask`). `grep -n "depth > [0-9]" checker.c zercheck_ir.c emitter.c`
+lists every remaining guard; each below returns the NON-conservative answer past its cap.
+None has a reproducer yet — most bound AST/TYPE nesting (a struct nested 33 deep, a
+9-deep cast launder chain), which the corpus never approaches — but the rule is that a
+guard must fail closed, so they are written down rather than assumed harmless.
+
+| walker (checker.c unless noted) | cap | answer past cap | what it could miss |
+|---|---|---|---|
+| `type_carries_data_pointer` / `type_carries_handle` / `type_carries_nonshared_pointer` | 32 type levels | `false` = "carries none" | a pointer/Handle 33 struct levels deep slips the spawn-arg carrier gate and the escape sinks |
+| `tynode_keeps_storage_inline` | 32 | `false` | resource-copy rule on a 33-deep nest |
+| `unique_resource_name` | 8 | `NULL` = "not unique" | a Pool/Arena 9 fields deep copied (BUG-970 class) |
+| `arg_is_local_derived` / `call_has_local_derived_arg` / `call_has_nonkeep_derived_arg` / `infer_keep_from_call_args` | 8 nested calls | `false` = "not frame-bound" | `g = f1(f2(...f9(&local)))` — 9 nested call launders escape a local |
+| `value_frame_bound_symbol` | 8 | `NULL` | same class at the scoped-spawn borrow |
+| `resolve_write_target_global` | 6 | `NULL` | an RMW target reached through >6 pointer hops is not a global |
+| `expr_mentions_name` / `expr_mentions_global` | 16 / 12 | `false` | `g = <16-deep tree mentioning g>` not seen as RMW |
+| `rmw_scan_body` | 24 AST levels | returns | an RMW 25 statement-levels deep in a callee body |
+| `packed_path_aggregate` | 64 | `NULL` | a packed field 65 projections deep not flagged misaligned |
+| `node_forwards_param_to_spawn` / `func_forwards_param_to_spawn` | 8 | `false` | a funcptr forwarded 9 hops to a spawn |
+| `scan_returned_funcname` / `record_isr_returned_funcname` | 8 AST levels in a factory | `false` / flag | (ISR one now sets the flag) a `return fn` 9 ifs deep in a factory |
+| `body_calls_funcptr_field` / `scan_funcptr_field_bindings` | 8 | `false` | funcptr-field REACH 9 hops away |
+| zercheck_ir.c `ir_register_nested_handles` | 32 | returns | a Handle field 33 levels deep in a param struct is untracked (UAF miss) |
+| emitter.c 868 / 942 | 32 / 8 | `false` / returns | emission-side carrier walks |
+
+**Why not just flip them all now.** Flipping a TYPE walk to "assume carrier" past 32 is
+free (BUG-933 did exactly that). Flipping the CALL-CHAIN walks (`arg_is_local_derived`
+at 8, the funcptr REACH walks at 8) is an over-rejection of every program with a
+9-deep nested-call launder or a 9-hop forward — plausible in real code — so each wants
+its own corpus-cost measurement and a message, not a blanket change.
+
+**The durable fix is a per-function MEMO, not a bigger cap.** Every one of the call-chain
+walks answers a question whose truth is per-FUNCTION ("which globals does f reach,
+transitively", "does f forward param i to a spawn"), so the answer can be computed once
+by a call-graph DFS with a visited set (cycles terminate, depth is irrelevant, cost is
+linear) and read at every site. `func_rmw_param_mask` and `compute_func_shared_types`
+already have that shape; the spawn scan and the ISR walker do not, because their
+RMW-through-parameter facts (`_rmw_alias`) are per-CALL-SITE bindings. Split the two
+questions — a binding-free "globals reached" memo plus the existing per-site alias
+binding for RMW — and the 32-call cap becomes unnecessary for the first half.
+
 ## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
 
 Found while measuring item J's sinks; not reported by any branch, and NOT

@@ -1109,6 +1109,24 @@ switch (ready) {
 }
 ```
 
+An arm body is either a `{ block }` or a **single expression followed by a comma**:
+
+```zer
+u32 classify(u32 code) {
+    u32 k = 0;
+    switch (code) {
+        0 => k = 1,               // expression arm — note the trailing comma
+        1, 2 => { k = 2; }        // block arm — comma optional
+        default => k = 3,
+    }
+    return k;
+}
+```
+
+The expression form is the same statement as the block form for every safety rule:
+a shared-struct access in it takes the auto-lock, and an unprovable index in it gets
+the bounds guard (BUG-972 — both were skipped before 2026-09-09).
+
 **NOTES**
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
@@ -1179,7 +1197,12 @@ done:
 **SYNTAX**
 ```zer
 defer statement;
+defer { statements... }
 ```
+
+Both forms are the same body for every safety rule: `defer g.v += 1;` on a
+`shared struct` takes the auto-lock exactly as `defer { g.v += 1; }` does, and an
+unprovable index in either traps at fire time (BUG-972).
 
 **EXAMPLE**
 ```zer
@@ -1407,6 +1430,20 @@ return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak
   interrupt handler → compile error; use `Pool` there).
 - `free` needs a `*T` or `[*]T` — a cinclude `free(ptr)` on a raw C pointer is
   left alone (routes to C's `free`).
+- An allocation stored straight into a **struct field or array element** is
+  tracked exactly like one held in a local, in every spelling: `h.p = alloc(T);`
+  (an optional field keeping the `?*T` result), `h.p = alloc(T) orelse return;`,
+  `H h = { .p = alloc(T) };`, `arr[0] = alloc(T);`, and a global root `g.p = …`.
+  Unwrap it, free through the unwrapped pointer, and the slot knows: a second
+  unwrap after the free is a use-after-free, a slot never freed is a leak, and
+  re-filling a live slot leaks the first allocation. Writing the slot is a
+  **reset**, not a use — `h.p = null;` after the free (the line the dangling-global
+  message asks for) and `h.p = alloc(T);` to re-fill both compile. Copying one
+  slot into another (`b.p = a.p`) makes them aliases of one allocation. Returning
+  the struct, or storing it in a global, hands its allocations to the receiver.
+  A struct value carries its allocations wherever it goes — a plain copy
+  (`H b = a;`), an initializer field (`H h = { .inner = i };`, or the nested
+  literal `{ .inner = { .p = alloc(T) } }`), or a field store (`h.inner = i;`).
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), Arena, alloc_ptr
@@ -3912,6 +3949,32 @@ u32 negative() {
 
 Proven-safe really does mean no code: `u32 i = 2; arr[i]` emits a bare `arr[i]`. An
 unprovable index emits `if ((size_t)(i) >= 4u) { return 0; }` in front of the access.
+
+The proof does not need a range fact. An index whose **type** or **shape** cannot reach
+the bound is proven as it stands: a `u8` cannot index past 255, `x >> 30` cannot reach 4,
+`x & 3` cannot reach 4, an unsigned `x % 4` (or `x % M` with `const u32 M = 4`) cannot
+reach 4, and a bit-extract `x[3..0]` cannot reach 16. Each of these compiles to the bare
+access with no guard and no check.
+
+```zer
+u32[256] table;
+u32[4] quad;
+
+u32 lookup(u32 x) {
+    u8 b = @truncate(u8, x);
+    u32 a = table[b];          // proven — a u8 never reaches 256
+    a += quad[x >> 30];        // proven — at most 3
+    a += quad[x & 3];          // proven — at most 3
+    a += quad[x % 4];          // proven — unsigned dividend, at most 3
+    return a;
+}
+
+u32 main() { return lookup(0xFFFFFFFF); }   // every array is zero — exits 0
+```
+
+Two things do NOT prove: a signed dividend (`i32 x; quad[x % 4]` can be `-3`, so the
+check stays and traps) and an arbitrary-width integer (`u9 i; table[i]` keeps its check —
+its width is a mask, not a carrier, and the compiler will not bet safety on it).
 
 ### An out-of-bounds access inside `@critical` or a held lock TRAPS
 

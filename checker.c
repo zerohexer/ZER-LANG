@@ -865,6 +865,92 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
     return IDX_UNKNOWN;
 }
 
+/* BUG-974 (RELAXATION, 2026-09-09): the largest value an index EXPRESSION can hold,
+ * proven from its static TYPE and SHAPE alone — no VarRange needed. Returns false
+ * when nothing is provable. Sound because every arm is a fact about the emitted C
+ * value, not about the program's history:
+ *
+ *   unsigned native width w    a uint8_t/16/32 C object holds at most 2^w - 1
+ *   e >> K   (unsigned e)      at most (bound(e)) >> K; `_zer_shr` yields 0 past w
+ *   e & MASK (MASK >= 0)       at most MASK, whatever e is (two's complement)
+ *   e % N    (unsigned e, N>0) at most N - 1
+ *   (T)e / @truncate(T, e)     the result type's bound — covered by the type arm
+ *
+ * Before this, `u8 b = @truncate(u8, x); arr256[b]` and `arr4[x >> 30]` carried a
+ * runtime bounds check (or an auto-guard + warning) that no value could ever trip.
+ * "Prove, don't guard" is the stated bounds philosophy; this is the cheapest proof
+ * there is.
+ *
+ * DELIBERATELY EXCLUDED: uN/iN (non-native) widths. Their C carrier is WIDER than N
+ * and relies on emit_intn_mask at every producing site to keep the high bits clear;
+ * proving from the declared width would make an unmasked emission path a silent
+ * OOB instead of a wrong value. Native widths self-wrap in C, so no emission path can
+ * violate the bound. Signed types are excluded because a negative value is out of
+ * bounds. `usize` is included (it is a native unsigned width). */
+static bool index_expr_type_bound(Checker *c, Node *e, uint64_t *out_max) {
+    if (!e) return false;
+    Type *t = typemap_get(c, e);
+    Type *te = t ? type_unwrap_distinct(t) : NULL;
+    bool is_native_unsigned = false;
+    int w = 0;
+    if (te && type_is_unsigned(te)) {
+        TypeKind k = type_dispatch_kind(te);
+        if (k == TYPE_U8 || k == TYPE_U16 || k == TYPE_U32 || k == TYPE_U64 ||
+            k == TYPE_USIZE) {
+            is_native_unsigned = true;
+            w = type_width(te);
+        }
+    }
+    uint64_t type_max = 0;
+    bool have = false;
+    if (is_native_unsigned && w > 0 && w < 64) {
+        type_max = ((uint64_t)1 << w) - 1;
+        have = true;
+    }
+    if (e->kind == NODE_BINARY) {
+        /* eval_const_expr_scoped, not eval_const_expr: the RHS may be a const
+         * IDENT or an expression of one (`x % M`, `x & (M - 1)`), which the
+         * unscoped evaluator cannot see (measured: both stayed guarded). */
+        int64_t rv = eval_const_expr_scoped(c, e->binary.right);
+        uint64_t lmax = 0;
+        bool lhave = index_expr_type_bound(c, e->binary.left, &lmax);
+        if (e->binary.op == TOK_RSHIFT && lhave && rv != CONST_EVAL_FAIL && rv >= 0 && rv < 64) {
+            uint64_t sm = lmax >> (unsigned)rv;
+            if (!have || sm < type_max) { type_max = sm; have = true; }
+        } else if (e->binary.op == TOK_AMP && rv != CONST_EVAL_FAIL && rv >= 0) {
+            if (!have || (uint64_t)rv < type_max) { type_max = (uint64_t)rv; have = true; }
+        } else if (e->binary.op == TOK_PERCENT && rv != CONST_EVAL_FAIL && rv > 0) {
+            /* UNSIGNED dividend only — that is what makes the C `%` result
+             * non-negative. Any unsigned width qualifies (a u64 dividend has no
+             * type bound of its own but `u64 % 8` is still below 8). */
+            Type *lt = typemap_get(c, e->binary.left);
+            if (lt && type_is_unsigned(type_unwrap_distinct(lt))) {
+                if (!have || (uint64_t)(rv - 1) < type_max) { type_max = (uint64_t)(rv - 1); have = true; }
+            }
+        }
+    }
+    if (e->kind == NODE_SLICE && e->slice.object && e->slice.start && e->slice.end) {
+        /* BIT EXTRACTION `x[hi..lo]` on an integer: the result is
+         * `(x >> lo) & (2^w - 1)` with w = hi - lo + 1, so it is below 2^w
+         * whatever the operand's sign or width (the mask is applied last). A
+         * sub-slice of an array/slice is a different node meaning (its object
+         * is not an integer) and is left alone. */
+        Type *ot = typemap_get(c, e->slice.object);
+        if (ot && type_is_integer(type_unwrap_distinct(ot))) {
+            int64_t hi = eval_const_expr_scoped(c, e->slice.start);
+            int64_t lo = eval_const_expr_scoped(c, e->slice.end);
+            if (hi != CONST_EVAL_FAIL && lo != CONST_EVAL_FAIL &&
+                lo >= 0 && hi >= lo && hi - lo + 1 <= 63) {
+                uint64_t bm = ((uint64_t)1 << (unsigned)(hi - lo + 1)) - 1;
+                if (!have || bm < type_max) { type_max = bm; have = true; }
+            }
+        }
+    }
+    if (!have) return false;
+    *out_max = type_max;
+    return true;
+}
+
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
@@ -923,7 +1009,22 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
 
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
-    if (!expr || expr->kind != NODE_BINARY) return false;
+    if (!expr) return false;
+    /* BUG-974: a BIT-EXTRACT bound to a variable (`u32 k = x[3..0];`) is in
+     * [0, 2^w-1] by shape — the same fact the inline-index helper proves.
+     * ONLY the slice shape is routed through it here: a general type-width
+     * fallback would pre-empt the more precise call-range path below
+     * (`slot = hash(key)` must keep its `[0, N-1]`, not get `[0, 2^32-1]`). */
+    if (expr->kind == NODE_SLICE) {
+        uint64_t bm;
+        if (index_expr_type_bound(c, expr, &bm) && bm <= (uint64_t)INT64_MAX) {
+            *out_min = 0;
+            *out_max = (int64_t)bm;
+            return true;
+        }
+        return false;
+    }
+    if (expr->kind != NODE_BINARY) return false;
     Node *rhs = expr->binary.right;
     int64_t rval = eval_const_expr(rhs);
     /* try const symbol lookup for ident RHS (e.g., MAP_SIZE) */
@@ -3147,11 +3248,38 @@ static bool _rmw_flagged_rmw = false;
  * inaccuracy as quoting `&tl` for an argument the user wrote as `q`. One query, so the
  * eight cannot drift apart. */
 static bool _scan_found_static_local = false;
+/* BUG-973: the spawn race scan bounds its callee descent at ZER_SCAN_CALL_DEPTH_MAX
+ * levels, and at the cap it used to `return false` — "no unsafe access found" — for
+ * a body it had NOT LOOKED AT. MEASURED: a plain global RMW 40 calls below a spawn
+ * target compiled with ZERO diagnostics, while the same program 11 deep was
+ * rejected. A depth guard exists to bound recursion, not to answer the question;
+ * when it fires, the honest answer is "cannot prove it safe", which is a REJECTION
+ * (the BUG-933 rule: exceeding a depth guard must return the CONSERVATIVE answer).
+ * The noun below makes the diagnostic say exactly that instead of naming a global
+ * the scan never reached. */
+static bool _scan_depth_exceeded = false;
+#define ZER_SCAN_CALL_DEPTH_MAX 32
+/* BUG-973, the ISR sibling: set by record_isr_globals & co. when their call-descent
+ * cap fires; reset before each interrupt walk and reported after it (the walker has
+ * no ISR line to blame, so it cannot report itself). Declared here beside the spawn
+ * scan's flag because the two are one class at two sinks. */
+static bool _isr_scan_depth_exceeded = false;
+#define ZER_ISR_CALL_DEPTH_MAX 32
+static bool scan_depth_cap_hit(Symbol *callee, const char **out_name, uint32_t *out_len) {
+    _scan_depth_exceeded = true;
+    *out_name = callee->name;
+    *out_len = callee->name_len;
+    return true;
+}
 static const char *scan_finding_noun(void) {
+    if (_scan_depth_exceeded)
+        return "an UNANALYZED call chain (deeper than the 32-call analysis limit, so it "
+               "cannot be proven to touch no non-shared global — flatten the chain) through";
     return _scan_found_static_local ? "static local" : "non-shared global";
 }
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
-                                    _static_local_count = 0; _scan_found_static_local = false; /* BUG-971 */ }
+                                    _static_local_count = 0; _scan_found_static_local = false; /* BUG-971 */
+                                    _scan_depth_exceeded = false; /* BUG-973 */ }
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
     for (int i = 0; i < _rmw_alias_count; i++)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
@@ -3336,15 +3464,27 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
     }
 }
 
+/* BUG-973: the depth cap here had TWO defects. It returned 0 — "this callee
+ * read-modify-writes through no parameter" — for a body it had not scanned; and
+ * because the caller MEMOISES its own result, that 0 was cached on every function
+ * up the chain, so a later shallow query got the wrong answer too. Past the cap
+ * the answer is now "every parameter may be" (~0), and a mask computed under a
+ * cap is NOT cached, so a fresh query from a shallower site recomputes it. */
+static bool _rmw_mask_capped = false;
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth) {
-    if (!fn || !fn->is_function || !fn->func_node || depth > 8) return 0;
+    if (!fn || !fn->is_function || !fn->func_node) return 0;
+    if (depth > 8) { _rmw_mask_capped = true; return ~0ULL; }
     if (fn->rmw_summary_done) return fn->rmw_param_mask;
     Node *fd = fn->func_node;
     if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return 0;
     fn->rmw_summary_done = true;     /* set FIRST: recursion guard */
+    bool saved_capped = _rmw_mask_capped;
+    _rmw_mask_capped = false;
     uint64_t m = 0;
     rmw_scan_body(c, fd->func_decl.body, fd, &m, 0);
     fn->rmw_param_mask = m;
+    if (_rmw_mask_capped) fn->rmw_summary_done = false;   /* conservative, not cached */
+    _rmw_mask_capped = saved_capped || _rmw_mask_capped;
     return m;
 }
 
@@ -10299,6 +10439,14 @@ static Type *check_expr(Checker *c, Node *node) {
                         (long long)r->min_val, (long long)r->max_val);
                     mark_proven(c, node);   /* diagnosed — do not also auto-guard */
                 }
+                /* BUG-974: no VarRange (or an unhelpful one) — the index's TYPE may
+                 * still prove it: a `u8` can never reach 256. */
+                if (!checker_is_proven(c, node)) {
+                    uint64_t tb;
+                    if (index_expr_type_bound(c, node->index_expr.index, &tb) &&
+                        tb < obj->array.size)
+                        mark_proven(c, node);
+                }
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
                  * Warn so programmer knows they can add a guard for zero overhead. */
@@ -10327,6 +10475,18 @@ static Type *check_expr(Checker *c, Node *node) {
              *
              * Pre-fix only (a) was handled and (b) silently corrupted
              * memory at runtime. Now (b) is a hard compile error. */
+            /* BUG-974: an EXPRESSION index (`arr[x >> 30]`, `arr[x & 3]`,
+             * `arr[@truncate(u8, x)]`) proven by its type/shape. The ident arm above
+             * handles `arr[i]`; this covers every other shape, which otherwise gets
+             * an inline runtime `_zer_bounds_check` no value can trip. */
+            if (!checker_is_proven(c, node) &&
+                node->index_expr.index->kind != NODE_IDENT &&
+                node->index_expr.index->kind != NODE_INT_LIT) {
+                uint64_t tb;
+                if (index_expr_type_bound(c, node->index_expr.index, &tb) &&
+                    tb < obj->array.size)
+                    mark_proven(c, node);
+            }
             if (!checker_is_proven(c, node) &&
                 node->index_expr.index->kind == NODE_CALL &&
                 node->index_expr.index->call.callee &&
@@ -13735,7 +13895,8 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         if (!fs || !fs->is_function || !fs->func_node ||
             fs->func_node->kind != NODE_FUNC_DECL ||
             !fs->func_node->func_decl.body) return false;
-        if (_scan_global_depth >= 32) return false;
+        if (_scan_global_depth >= ZER_SCAN_CALL_DEPTH_MAX)
+            return scan_depth_cap_hit(fs, out_name, out_len);   /* BUG-973 */
         _scan_global_depth++;
         rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
@@ -13773,8 +13934,9 @@ static bool scan_funcname_binding(Checker *c, Node *n,
         Symbol *gs = scope_lookup(c->global_scope, n->call.callee->ident.name,
                                   (uint32_t)n->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
-            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body &&
-            _scan_global_depth < 32) {
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body) {
+            if (_scan_global_depth >= ZER_SCAN_CALL_DEPTH_MAX)
+                return scan_depth_cap_hit(gs, out_name, out_len);   /* BUG-973 */
             _scan_global_depth++;
             bool f = scan_returned_funcname(c, gs->func_node->func_decl.body, 0,
                                             out_name, out_len);
@@ -13788,7 +13950,8 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     if (!fs || !fs->is_function || !fs->func_node ||
         fs->func_node->kind != NODE_FUNC_DECL ||
         !fs->func_node->func_decl.body) return false;
-    if (_scan_global_depth >= 32) return false;
+    if (_scan_global_depth >= ZER_SCAN_CALL_DEPTH_MAX)
+        return scan_depth_cap_hit(fs, out_name, out_len);   /* BUG-973 */
     _scan_global_depth++;
     rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
@@ -14136,8 +14299,12 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                     csym->func_node->kind == NODE_FUNC_DECL &&
                     csym->func_node->func_decl.body) {
                     /* Phase A3 fix: raised from 8 to 32. Real call graphs can easily
-                     * exceed 8 levels (handler → validator → parser → helper → ...). */
-                    if (_scan_global_depth < 32) {
+                     * exceed 8 levels (handler → validator → parser → helper → ...).
+                     * BUG-973: and at the cap the descent now REFUSES rather than
+                     * silently reporting the unscanned body clean. */
+                    if (_scan_global_depth >= ZER_SCAN_CALL_DEPTH_MAX)
+                        return scan_depth_cap_hit(csym, out_name, out_len);
+                    {
                         _scan_global_depth++;
                         /* BUG-792: bind each `f(&counter)` argument to the callee's
                          * PARAM name before descending, so a `*p += 1` inside the
@@ -14190,7 +14357,9 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 if (!asym || !asym->is_function || !asym->func_node ||
                     asym->func_node->kind != NODE_FUNC_DECL ||
                     !asym->func_node->func_decl.body) continue;
-                if (_scan_global_depth < 32) {
+                if (_scan_global_depth >= ZER_SCAN_CALL_DEPTH_MAX)
+                    return scan_depth_cap_hit(asym, out_name, out_len);   /* BUG-973 */
+                {
                     _scan_global_depth++;
                     bool found = scan_unsafe_global_access(c,
                         asym->func_node->func_decl.body, out_name, out_len);
@@ -20437,7 +20606,22 @@ static void check_func_body(Checker *c, Node *node) {
          * RMW → non-atomic" checks are transitive (check_stmt above only records
          * the globals lexically inside the ISR body). Runs with in_interrupt
          * still set so track_isr_global tags them from_isr. */
+        _isr_scan_depth_exceeded = false;   /* BUG-973 */
         record_isr_globals(c, node->interrupt.body, 0);
+        if (_isr_scan_depth_exceeded) {
+            /* BUG-973: part of the ISR's call graph was NOT walked. Every global
+             * it touches beyond the cap is invisible to check_interrupt_safety, so
+             * accepting the program would be a silent tearing / lost-update race
+             * on bare metal. Refuse instead; the remedy is structural. */
+            checker_error(c, node->loc.line,
+                "interrupt handler '%.*s' reaches a call chain deeper than the "
+                "%d-call analysis limit — the globals it touches beyond that depth "
+                "cannot be checked against main code (a shared global would need "
+                "'volatile' and a non-atomic read-modify-write would be a lost update). "
+                "Flatten the chain below the handler",
+                (int)node->interrupt.name_len, node->interrupt.name,
+                ZER_ISR_CALL_DEPTH_MAX);
+        }
         pop_scope(c);
         c->in_interrupt = false;
         c->current_func_ret = NULL;
@@ -21162,9 +21346,18 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
  * returned function reaches. ISR mirror of scan_returned_funcname on the spawn
  * path (ac97e11a). Partial if-chain by design: an unlisted kind records nothing,
  * which is today's behaviour and never a new rejection. */
+/* BUG-973: the ISR walker's call-descent cap. `record_isr_globals` bounds the
+ * callee chain at 32 and used to `return` silently past it — so a global written
+ * 34 calls below an interrupt handler was never recorded as ISR-accessed, and the
+ * "accessed from both interrupt and main — must be declared volatile" rule never
+ * fired (MEASURED: 30 deep rejected, 34 deep accepted, zero diagnostics). The
+ * sibling of the spawn scan's cap, closed in the same commit as CLAUDE.md's
+ * mirrored-sink rule requires. The flag is reset before each ISR walk and read
+ * after it; the walker cannot report itself because it has no ISR line to blame. */
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
-    if (!c || !n || depth > 8) return;
+    if (!c || !n) return;
+    if (depth > ZER_ISR_CALL_DEPTH_MAX) { _isr_scan_depth_exceeded = true; return; }
     if (n->kind == NODE_RETURN) { record_isr_funcname_binding(c, n->ret.expr, depth); return; }
     if (n->kind == NODE_BLOCK) {
         for (int i = 0; i < n->block.stmt_count; i++)
@@ -21183,19 +21376,24 @@ static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
 }
 
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
-    if (!c || !value || depth > 32) return;
+    if (!c || !value) return;
+    if (depth > ZER_ISR_CALL_DEPTH_MAX) { _isr_scan_depth_exceeded = true; return; }   /* BUG-973 */
     /* ISR funcptr from a FACTORY CALL — `*() fp = mk(); fp();` inside an ISR,
      * where `mk` returns the racing function (directly, or via another factory).
      * The spawn path gained this in ac97e11a; the ISR path did not, leaving the
      * last two of the nine REACH forms live on the ISR side. Resolve through the
      * callee's return sites, exactly as the spawn resolver does. */
     if (value->kind == NODE_CALL && value->call.callee &&
-        value->call.callee->kind == NODE_IDENT && depth < 8) {
+        value->call.callee->kind == NODE_IDENT) {
         Symbol *gs = scope_lookup(c->global_scope, value->call.callee->ident.name,
                                   (uint32_t)value->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
-            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body)
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body) {
+            /* BUG-973: this arm was gated `depth < 8` and silently did nothing
+             * past it — a factory chain 9 deep resolved to no function at all. */
+            if (depth >= ZER_ISR_CALL_DEPTH_MAX) { _isr_scan_depth_exceeded = true; return; }
             record_isr_returned_funcname(c, gs->func_node->func_decl.body, depth + 1);
+        }
         return;
     }
     if (value->kind != NODE_IDENT) return;
@@ -21226,7 +21424,8 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth);
 
 static void record_isr_globals(Checker *c, Node *node, int depth) {
-    if (!node || depth > 32) return;
+    if (!node) return;
+    if (depth > ZER_ISR_CALL_DEPTH_MAX) { _isr_scan_depth_exceeded = true; return; }   /* BUG-973 */
     switch (node->kind) {
     case NODE_IDENT: {
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
@@ -21559,8 +21758,16 @@ static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
  *
  * Partial if/switch walk with an explicit `default: return` — an unrecognised
  * kind records NOTHING, i.e. today's behaviour, never a new rejection. */
+/* BUG-973: past the cap the walker used to return silently, so a plain write to an
+ * atomic cell 9 calls below a post-spawn call was never recorded (MEASURED: 3 deep
+ * rejected, 10 deep accepted). It cannot decide anything itself — whether an atomic
+ * cell even exists is known only after the whole file is checked — so it records a
+ * SENTINEL entry (sym == NULL) and check_atomic_cell_safety refuses the program iff
+ * some atomic cell exists. Precise: a program with no @atomic_* is untouched. */
+#define ZER_ATOMIC_CALLEE_DEPTH_MAX 16
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
-    if (!node || depth > 8) return;
+    if (!node) return;
+    if (depth > ZER_ATOMIC_CALLEE_DEPTH_MAX) { record_atomic_plain_write(c, NULL, node->loc.line); return; }
     switch (node->kind) {
     case NODE_IDENT: {
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
@@ -21684,7 +21891,7 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
 }
 
 static void record_atomic_plain_write(Checker *c, Symbol *sym, int line) {
-    if (!sym) return;
+    /* BUG-973: sym == NULL is the "unanalyzed call chain" sentinel — kept. */
     if (c->atomic_plain_write_count >= c->atomic_plain_write_capacity) {
         int nc = c->atomic_plain_write_capacity < 8 ? 8
                  : c->atomic_plain_write_capacity * 2;
@@ -21792,9 +21999,30 @@ static void check_atomic_cell_safety(Checker *c) {
                 (int)e->s->name_len, e->s->name, (int)e->field_len, e->field);
         }
     }
+    /* BUG-973: does ANY atomic cell exist? Only then does an unanalyzed call chain
+     * (a NULL-symbol sentinel from record_atomic_plain_in_callee) matter. */
+    bool any_atomic_cell = false;
+    for (uint32_t gi = 0; c->global_scope && gi < c->global_scope->symbol_count; gi++)
+        if (c->global_scope->symbols[gi].is_atomic_cell) { any_atomic_cell = true; break; }
+    for (int i = 0; i < c->atomic_field_count && !any_atomic_cell; i++)
+        if (c->atomic_fields[i].atomic_used) any_atomic_cell = true;
+    bool chain_reported = false;
     for (int i = 0; i < c->atomic_plain_write_count; i++) {
         Symbol *s = c->atomic_plain_writes[i].sym;
-        if (s && s->is_atomic_cell) {
+        if (!s) {
+            if (any_atomic_cell && !chain_reported) {
+                checker_error(c, c->atomic_plain_writes[i].line,
+                    "call made after a fire-and-forget spawn reaches a call chain "
+                    "deeper than the %d-call analysis limit, and this program has an "
+                    "atomic cell (a global used with @atomic_*) — a plain access to it "
+                    "beyond that depth cannot be ruled out, which would be a mixed "
+                    "atomic/non-atomic data race. Flatten the chain",
+                    ZER_ATOMIC_CALLEE_DEPTH_MAX);
+                chain_reported = true;
+            }
+            continue;
+        }
+        if (s->is_atomic_cell) {
             checker_error(c, c->atomic_plain_writes[i].line,
                 "plain access to '%.*s' in a concurrent context — it is used with "
                 "@atomic_* elsewhere, so it is an atomic cell and must be accessed "

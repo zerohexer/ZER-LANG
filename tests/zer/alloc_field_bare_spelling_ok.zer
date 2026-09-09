@@ -1,0 +1,63 @@
+// BUG-975 / BUG-976 positives: the bare spelling is tracked, and every SAFE use
+// of a field-stored allocation still compiles — free through the unwrapped
+// local; the taught null reset after a free (local AND global root); re-filling
+// a slot after its free; returning a struct that carries the allocation (it
+// leaves with the struct — not a leak); two fields; a deferred free.
+struct T { u32 v; }
+struct H { ?*T p; }
+struct Pair { ?*T a; ?*T b; }
+H g;
+
+H make() { H h; h.p = alloc(T); return h; }
+
+u32 two_fields() {
+    Pair pr;
+    pr.a = alloc(T);
+    pr.b = alloc(T);
+    *T qa = pr.a orelse return;
+    *T qb = pr.b orelse return;
+    qa.v = 1;
+    qb.v = 2;
+    u32 s = qa.v + qb.v;
+    free(qa);
+    free(qb);
+    return s;
+}
+
+u32 deferred() {
+    H h;
+    h.p = alloc(T);
+    *T q = h.p orelse return;
+    defer free(q);
+    q.v = 4;
+    return q.v;
+}
+
+u32 main() {
+    H h;
+    h.p = alloc(T);
+    *T q = h.p orelse return;
+    q.v = 7;
+    u32 v = q.v;
+    free(q);
+    h.p = null;                        // reset is a write to the slot, not a use
+
+    g.p = alloc(T);
+    *T gq = g.p orelse return;
+    gq.v = 5;
+    v += gq.v;
+    free(gq);
+    g.p = alloc(T);                    // re-fill after the free
+    *T gr = g.p orelse return;
+    free(gr);
+    g.p = null;                        // the taught reset
+
+    H m = make();
+    *T mq = m.p orelse return;
+    free(mq);
+
+    v += two_fields();                 // 3
+    v += deferred();                   // 4
+    if (v != 7 + 5 + 3 + 4) { return 1; }
+    return 0;
+}

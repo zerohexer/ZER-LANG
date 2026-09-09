@@ -5,6 +5,309 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-977: a struct VALUE carries its allocations at FOUR sites, and only the plain copy knew
+
+**Symptom (measured, three shapes, all on the pre-fix build).**
+
+```zer
+struct In { ?*T p; }   struct H { In inner; }
+H h = { .inner = { .p = alloc(T) } };          // nested designated initializer
+*T q = h.inner.p orelse return;  free(q);
+*T r = h.inner.p orelse return;  return r.v;   // compiled clean — read freed memory
+```
+
+The same with `alloc(T) orelse return` in the nested literal; and the two struct-LOCAL
+forms `In i = { .p = alloc(T) }; H h = { .inner = i };` and `In i; i.p = alloc(T); h.inner
+= i;` where a free through `h.inner.p` and a read through `i.p` were reported — when at
+all — as a LEAK of `i`, never as the use-after-free they are.
+
+**Root cause.** "A struct value moved somewhere carries the allocations it holds" was
+answered at ONE of its four sites: the plain copy `H b = a` (§A #6, inline in IR_COPY).
+The struct-init decomposition (J3) and the field/index STORE sinks looked for a BARE
+handle on the value — a struct has none; its allocations live on COMPOUND rows (`(i,
+".p")`, or `(temp, ".p")` for a nested literal) — found nothing, and registered nothing.
+The per-sink-patchwork class, in its "same question, N sites" form.
+
+**Fix.** ONE helper, `ir_carry_compounds(src_root, dest_root, prefix)`: replicate every
+compound row rooted at the source onto the destination under an optional path prefix,
+each aliasing the source's allocation (two-pass, snapshot-then-add, arena-allocated
+prefixed paths). Used at all four sites: IR_COPY (prefix none — the §A #6 inline code is
+now this call), STRUCT_INIT_DECOMP when the field value has no bare handle (prefix
+`.field` — this is what reaches the nested literal's temp), and `ir_store_struct_value_
+into_slot` at the passthrough-ASSIGN and IR_FIELD_WRITE store sinks (prefix = the slot's
+own key, so `g.inner = i` lands as `g.inner.p` under the global pseudo-root).
+
+**Tests.** `tests/zer_fail/alloc_nested_init_uaf.zer`, `alloc_nested_init_orelse_uaf.zer`,
+`alloc_struct_value_into_slot_uaf.zer` (each accepted / wrong-reason on the pre-fix build);
+positive `tests/zer/alloc_nested_init_carry_ok.zer` (a struct placed into an initializer
+field and freed through the outer path is not a leak of the inner variable).
+
+**A regression the matrices caught on the way (recorded so the rule is not re-learned).**
+The first cut of BUG-976's "untracked store clears the slot" ran in arm order and wiped the
+alias the view-alias arm had just formed for `kk.p = &s[0]` — four view-alias matrix cells
+went FALSE-NEGATIVE. The clear is now gated by the VALUE'S KIND (`ir_value_clears_slot`:
+never for `&x`, a slice, a call, a field/index, an intrinsic or a struct literal — each is
+some arm's business), not by where it sits among the arms. A handler whose arms run in
+source order must not let a later arm undo an earlier one's work on the same instruction.
+
+---
+
+## Session 2026-09-09 — BUG-975 / BUG-976: an allocation stored into a FIELD or ELEMENT slot — the bare spelling was untracked, and a GLOBAL slot was tracked at the store only
+
+Found by probing the two-spellings class BUG-933 wrote down, one level in: not `x = alloc(T)`
+vs `T x = alloc(T)`, but the TARGET being a slot instead of a local.
+
+### BUG-975 — `h.p = alloc(T);` registered nothing (UAF, leak, double-alloc all accepted)
+
+**Symptom (measured, twelve shapes).** With `struct H { ?*T p; }`:
+
+```zer
+H h;
+h.p = alloc(T);                    // optional field keeps the ?*T result
+*T q = h.p orelse return;
+free(q);
+*T r = h.p orelse return;
+return r.v;                        // compiled clean, ran, read freed memory
+```
+
+Also accepted: the same with no free at all (a silent leak), `h.p = alloc(T); h.p = alloc(T);`
+(the first allocation leaked), the INDEX sibling `arr[0] = alloc(T)`, and the GLOBAL root
+`g.p = alloc(T)` (freed through the unwrapped local, left dangling, no diagnostic). Every
+one is caught when spelled `h.p = alloc(T) orelse return;` or `H h = { .p = alloc(T) };`.
+
+**Root cause.** BUG-933's assign arm resolves the target with `ir_find_value_local`, which
+answers only a BARE IDENT. A FIELD / INDEX target returned -1 and `ir_register_alloc_result`
+refused a negative dest. The `orelse` spelling survives only because it lowers through a
+temp local that the field-write alias arm then registers as the compound — the bare
+spelling has no temp, so no arm ever saw the allocation.
+
+**Fix.** `ir_register_alloc_result_compound`: when the target is not a bare local, key it
+with `ir_extract_compound_key` and register the (root, path) compound as a FRESH allocation
+— ALIVE, minted `alloc_id`, colour + pool name — reporting overwrite-while-alive exactly as
+the bare arm does. A global root lands under `IR_GLOBAL_ROOT_ID`. Everything downstream
+(unwrap alias, free propagation, exit leak / dangling checks) then carries it unchanged.
+Two companions so the tracked slot behaves like a tracked local:
+- `ir_mark_local_escaped` now escapes EVERY entry rooted at the local — the compounds a
+  returned or globally-stored by-value struct CARRIES leave with it. Before, `H make(){ H h;
+  h.p = alloc(T) orelse return; return h; }` was a false "never freed" (pre-existing for the
+  orelse spelling; newly REACHED by the bare one). Wired at both RETURN arms.
+- (see BUG-976 for the reset rule the tracked slot needs).
+
+### BUG-976 — a global-rooted projection resolved at the STORE sinks only
+
+**Symptom (measured).** `g.p = alloc(T) orelse return; free(g.p); return g.p.v;` compiled
+clean, as did unwrap / free-through-local / re-unwrap on `g.p`. G5 (2026-08) registered
+`(IR_GLOBAL_ROOT_ID, "g.p")` at the three STORE sinks, but `ir_extract_compound_key` — the
+query every OTHER sink uses (free, get, orelse read-back, field-read UAF walk, alias) —
+returned "unkeyable" for a global root, so the entry was written and never read.
+
+**Fix — ONE query.** `ir_global_projection_key` (extracted from G5, so the store and the
+lookups cannot disagree on the key form) and `ir_extract_compound_key` now returns
+`(IR_GLOBAL_ROOT_ID, "g.p")` for an unshadowed global-rooted FIELD/INDEX projection. All
+~30 callers gain it at once; a bare global ident is unchanged (its arms key the plain name).
+The `escaped=true` invariant on global entries is now enforced IN THE CONSTRUCTOR
+(`ir_add_compound_handle`), since any caller may now create one. One caller that indexed
+`locals[root]` behind a `< local_count` check without `>= 0` got the guard.
+
+**Three consequences fixed in the same change**, each measured as a would-be over-rejection
+of the taught fix or as a sibling hole:
+- **A slot RESET is not a use.** `g.p = null;` after the free — the exact line the
+  dangling-global diagnostic prescribes — was rejected as a use-after-free, on local roots
+  too (pre-existing: `h.p = null` was flagged for the orelse spelling as well), and so was
+  re-filling the slot (`g.p = alloc(T)`). `ir_assign_target_is_tracked_slot`: a plain `=`
+  whose target IS a tracked slot walks only the slot's OBJECT chain (`hp.p = null` through a
+  FREED `hp` stays rejected — pinned by `slot_reset_through_freed_pointer.zer`). A local
+  slot receiving an untracked value is cleared (mirror of G5's clear), and an alloc call is
+  left to the registration arm so the overwrite-while-alive report survives.
+- **A slot-to-slot COPY aliases.** `b.p = a.p` (and `g.p = a.p`, `arr[1] = arr[0]`) formed no
+  alias — the passthrough arm keyed on a bare-ident RHS — so free-through-one /
+  read-through-other was silent. `ir_alias_slot_to_slot`, placed AFTER G5 so a global target
+  keeps the alias.
+- The diagnostic named a global root `'?'`; `ir_root_display` prints the key (`'g.p'`).
+
+**Tests.** Negatives (each A/B'd: accepted by the pre-fix build, rejected for the stated
+reason now): `tests/zer_fail/alloc_field_bare_spelling_{uaf,leak,overwrite}.zer`,
+`alloc_index_bare_spelling_uaf.zer`, `alloc_global_field_bare_spelling_dangling.zer`,
+`global_projection_free_then_read.zer`, `global_projection_reunwrap_uaf.zer`,
+`slot_copy_alias_uaf.zer`, `slot_copy_alias_global_uaf.zer`; boundary
+`slot_reset_through_freed_pointer.zer`. Positive `tests/zer/alloc_field_bare_spelling_ok.zer`
+(free through the unwrapped local, null reset on local and global roots, re-fill after
+free, returning a carrying struct, two fields, a deferred free — runs, exits 0).
+
+**Residual (pre-existing, recorded in limitations.md).** A callee that frees an OPTIONAL
+param or field through an `orelse return` unwrap (`void drop(?*T p){ *T q = p orelse return;
+free(q); }`) is not summarised as freeing it, so the caller reports a leak — for a bare
+optional param too, on the pre-fix build. The bare field spelling now reaches the same
+over-rejection its orelse sibling always had.
+
+---
+
+## Session 2026-09-09 — BUG-974 (relaxation): an index bounded by its TYPE or SHAPE is proven, not guarded
+
+**Symptom (over-rejection, measured).** `u8 b = …; big[b]` into a `u32[256]` got an
+auto-guard plus the "not proven in range" warning; `small[x >> 30]`, `small[x & 3]` and
+`small[x % 4]` (unsigned `x`) into a `u32[4]` each paid an inline `_zer_bounds_check`.
+No value can trip any of them: a `u8` cannot reach 256, a `u32 >> 30` cannot reach 4.
+On the pre-fix compiler `tests/zer/vrp_type_width_index_ok.zer` emitted three bounds
+checks and two auto-guards in `main`; it now emits none.
+
+**Root cause.** Bounds proof was VarRange-only. `derive_expr_range` narrows `x % N` /
+`x & MASK` only when the result is BOUND TO A VARIABLE (var-decl init, assignment);
+an inline expression index had no range and the declared width of the index type was
+never consulted at all. So the cheapest proof there is — the type's own maximum — was
+unavailable, and "prove, don't guard" fell to the guard.
+
+**Fix.** `index_expr_type_bound(c, e, &max)` (checker.c, beside `derive_expr_range`)
+returns the largest value an expression can hold from its type and shape: a native
+unsigned width below 64 (`u8`/`u16`/`u32`/`usize`, distinct-unwrapped) gives `2^w-1`;
+`e >> K` gives `bound(e) >> K`; `e & MASK` gives `MASK`; `e % N` with an unsigned
+dividend gives `N-1`. The TYPE_ARRAY arm of NODE_INDEX consults it in BOTH index arms
+(bare ident when the VarRange did not decide; every other expression shape) and marks
+the node proven when `max < size`, so neither the auto-guard nor the inline check is
+emitted. The existing ALWAYS-OOB error and the VarRange path run first and are untouched.
+
+**Two more shapes in the same helper (same session).** A const IDENT or const expression
+on the right (`x % M`, `x & (M - 1)`) — measured still guarded, because the helper used
+the unscoped `eval_const_expr`; it now uses `eval_const_expr_scoped`. And a BIT-EXTRACT
+`x[hi..lo]` on an integer: the result is `(x >> lo) & (2^w - 1)`, so it is below `2^w`
+whatever the operand's sign or width — `nib[x[3..0]]` into 16 is proven inline, and
+`u32 k = x[7..4]; nib[k]` through `derive_expr_range` (which routes ONLY the slice shape
+through the helper — a general type-width fallback there would pre-empt the more precise
+call-range path for `slot = hash(key)`). The `%` arm now needs only an UNSIGNED dividend
+of any width (`u64 % 4` is below 4). Boundary: `tests/zer_trap/vrp_type_width_bitextract_
+into_15_trap.zer`. A/B of the extended positive: 7 checks + 3 guards before, 0 + 0 after.
+
+**Deliberately excluded (soundness).** `uN`/`iN` non-native widths — their C carrier
+is wider than N and depends on `emit_intn_mask` at every producing site; proving from
+the declared width would turn an unmasked emission path into a silent OOB instead of a
+wrong value. Signed types — a negative index is out of bounds, so `i32 % 4` (C result
+`-3` for `-3 % 4`) keeps its check. `u64`/`u128` — no bound below any array size.
+
+**Tests.** `tests/zer/vrp_type_width_index_ok.zer` (exits 0; the relaxation is the
+ABSENCE of the check — A/B'd against the baseline build: 3 checks + 2 guards before,
+0 + 0 after). Boundaries pinned as traps: `tests/zer_trap/vrp_type_width_u8_into_255_trap.zer`
+(a u8 into `u32[255]` — bound 255 is not below 255, so the check stays and fires; the
+index is written as an expression on purpose, because an unproven bare ident takes the
+silent auto-guard path and exits 0) and `tests/zer_trap/vrp_type_width_signed_mod_trap.zer`
+(signed `x % 4` with `x = -3`). Both trap on the pre-fix and the fixed compiler.
+
+---
+
+## Session 2026-09-09 — BUG-973: three call-descent depth caps failed OPEN, and one poisoned its own memo
+
+Every transitive race scan bounds how deep it follows callees, and three of them
+answered "nothing found" for the part they had NOT walked. Measured, one shape each,
+all with zero diagnostics on the pre-fix compiler while the same program a few calls
+shallower was rejected:
+
+| walker | cap | shallow (rejected) | deep (ACCEPTED) |
+|---|---|---|---|
+| spawn race scan `scan_unsafe_global_access` | 32 | `counter += 1` 11 calls below a spawn target | 40 calls below |
+| ISR walker `record_isr_globals` | 32 | `counter += 1` 30 calls below an interrupt | 34 calls below |
+| post-spawn atomic-cell walk `record_atomic_plain_in_callee` | 8 | plain write to an atomic cell 3 calls below a call made after `spawn` | 10 calls below |
+
+This is the rule BUG-933 already wrote down for a TYPE walk — *exceeding a depth guard
+must return the CONSERVATIVE answer* — applied to the CALL-GRAPH walks, where it had
+not been. A guard exists to bound recursion, not to answer the question; when it fires
+the honest answer is "cannot prove it safe", which is a rejection.
+
+### The fix, per walker
+
+- **Spawn scan.** Every `_scan_global_depth` gate (five sites: direct call, function-name
+  argument, funcptr binding, factory return, factory call) routes through ONE
+  `scan_depth_cap_hit`, which sets `_scan_depth_exceeded` and returns the callee at the
+  cap as the finding. `scan_finding_noun()` — the one query the eight spawn diagnostics
+  already share — then says *"an UNANALYZED call chain (deeper than the 32-call analysis
+  limit …) through 'd33'"* instead of naming a global the scan never reached.
+- **ISR walker.** `record_isr_globals` and both funcname-binding siblings set
+  `_isr_scan_depth_exceeded` at the cap (the factory arm was gated `depth < 8` and did
+  nothing past it — same defect). The walker has no ISR line to blame, so the interrupt
+  handler's own check reads the flag after the walk and refuses the handler.
+- **Atomic-cell walk.** Cap widened 8 -> 16, and past it a SENTINEL plain-write entry
+  (`sym == NULL`) is recorded. `check_atomic_cell_safety` refuses the program iff an
+  atomic cell actually exists — a program with no `@atomic_*` is untouched, which is
+  what keeps this precise rather than a blanket "no deep chains after a spawn".
+
+### The memo defect found beside them
+
+`func_rmw_param_mask` returned 0 past ITS cap — "this callee read-modify-writes through
+no parameter" — for a body it had not scanned, and because every caller memoises its
+own result, that 0 was cached on every function up the chain: a later query from a
+shallow site got the wrong answer permanently. It was masked by the alias-binding path
+(`_rmw_alias`) catching the same programs. Past the cap it now returns ~0 ("every
+parameter may be"), and a mask computed under a cap is not cached.
+
+### Over-rejection cost, stated
+
+A spawn target or interrupt handler with a call chain deeper than 32 is now refused
+even when the chain touches nothing; same for a post-spawn call deeper than 16 in a
+program with an atomic cell. Corpus cost: zero (`make check` unchanged). The durable
+precision fix — a per-function memo of "globals reached, transitively" so depth is
+irrelevant — is recorded in `docs/limitations.md` with the remaining fail-open guards.
+
+Tests: `tests/zer_fail/spawn_race_deep_chain_unanalyzed.zer`,
+`isr_deep_chain_unanalyzed.zer`, `atomic_plain_callee_20deep_unanalyzed.zer`,
+`atomic_plain_callee_10deep.zer` (all accepted pre-fix, verified) and the boundary
+positive `tests/zer/spawn_deep_chain_clean_ok.zer` (30 deep, touches nothing).
+
+---
+
+## Session 2026-09-09 — BUG-972: two single-statement bodies bypassed the per-statement lock and guard
+
+The IR lowering wrapped every statement — bounds guards, then the shared-struct lock,
+then the statement, then the unlock — inside the NODE_BLOCK loop and nowhere else. Two
+grammar forms fill a body position with a bare statement instead of a block:
+
+```zer
+defer g.v += 1;                    // statement-form defer body   (NODE_EXPR_STMT)
+switch (x) { 1 => g.v = 5, ... }   // expression-form switch arm  (NODE_EXPR_STMT)
+```
+
+The defer template and the switch-arm lowering handed that node straight to `lower_stmt`,
+so it got NONE of the wrapper. Measured in the emitted C on the pre-fix compiler:
+
+```c
+_zer_bb1:;                       // defer g.v += 1;   -- statement form
+    g.v += _zer_t0;              // no mutex
+_zer_bb2:;                       // defer { g.v += 1; }   -- block form, one keyword away
+    pthread_mutex_lock(&g._zer_mtx);
+    g.v += _zer_t0;
+    pthread_mutex_unlock(&g._zer_mtx);
+```
+
+A data race in the emitted program, and the two-spellings-of-one-program class at the
+lock sink. The guard half had the same gap: the statement-form defer got no IR guard,
+fell back to the emitter's raw-AST guard, and that guard's early-return path called
+`emit_defers`, which re-emitted the defer body INSIDE its own guard.
+
+### One function, every site
+
+`lower_stmt_in_block` is now the wrapper, called by the block loop AND by `lower_body`,
+which every position that may hold either a block or a bare statement goes through
+(defer template, switch arm). A third grammar form cannot repeat this by forgetting.
+
+### The miscompile found while fixing it
+
+The switch-arm lowering raised `block_defers_managed` for EVERY arm, but only a
+NODE_BLOCK body consumes it. An expression-form arm left the counter raised, so the
+NEXT block anywhere in the function believed an enclosing construct managed its defers
+and skipped its own block-exit fire:
+
+```zer
+switch (x) { 1 => k = 1, default => { k = 2; } }
+{ defer k += 10; }       // fired at FUNCTION exit instead of block exit
+return k - 11;           // returned -10 (exit 246) on the pre-fix compiler
+```
+
+`tests/zer/switch_arm_expr_form_ok.zer` pins it (exit 0 now, 246 before). The counter
+is raised only for a block body.
+
+Gate: `tools/emit_audit.sh` gained a REQUIRED fingerprint — both forms must show a
+`pthread_mutex_lock` around their shared access — verified red on the pre-fix compiler
+(f: 1 lock, arm: 0). Also `tests/zer_trap/defer_stmt_form_index_trap.zer`.
+
+---
+
 ## Session 2026-09-09 — BUG-971: a static local was invisible to BOTH race scans
 
 A `static u32 c = 0;` inside a function is ONE object for every thread that runs it, and

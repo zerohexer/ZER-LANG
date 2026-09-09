@@ -1,0 +1,21 @@
+// BUG-977 positive: a struct value placed into an initializer field carries its
+// allocations into the new aggregate — freeing through the outer path is not a
+// leak of the inner variable, and the nested-literal form frees cleanly too.
+struct T { u32 v; }
+struct In { ?*T p; }
+struct H { In inner; }
+u32 main() {
+    In i = { .p = alloc(T) };
+    H h = { .inner = i };
+    *T q = h.inner.p orelse return;
+    q.v = 2;
+    u32 v = q.v;
+    free(q);
+
+    H h2 = { .inner = { .p = alloc(T) } };
+    *T r = h2.inner.p orelse return;
+    r.v = 3;
+    v += r.v;
+    free(r);
+    return v - 5;
+}

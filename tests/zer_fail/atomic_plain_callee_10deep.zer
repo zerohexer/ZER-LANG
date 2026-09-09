@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'g'
+// BUG-973: 10 deep was ACCEPTED on the pre-fix compiler (cap was 8, fail-open);
+// the widened cap (16) reaches it and names the cell.
+u32 g = 0;
+void d10() { g = 5; }
+void d9() { d10(); }
+void d8() { d9(); }
+void d7() { d8(); }
+void d6() { d7(); }
+void d5() { d6(); }
+void d4() { d5(); }
+void d3() { d4(); }
+void d2() { d3(); }
+void d1() { d2(); }
+void w() { @atomic_add(&g, 1); }
+u32 main() { spawn w(); d1(); return 0; }

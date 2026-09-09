@@ -2563,7 +2563,45 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 **`scan_unsafe_global_access(c, node, &name, &len)`** — recursive AST walker. Finds NODE_IDENT matching global scope symbols that are not safe for concurrent access. Skips: const, volatile (explicit opt-in), threadlocal, shared/shared(rw) structs, Pool/Slab/Ring/Arena/Barrier. Skips `@atomic_*` intrinsic arguments (atomic ops are thread-safe).
 
-**Transitive scanning:** When NODE_CALL is encountered, follows the callee into its function body (depth limit 8). Catches `spawn worker()` where `worker()` calls `helper()` which accesses a global.
+**Transitive scanning:** When NODE_CALL is encountered, follows the callee into its function body (depth limit 32, `ZER_SCAN_CALL_DEPTH_MAX`). Catches `spawn worker()` where `worker()` calls `helper()` which accesses a global.
+
+**The cap FAILS CLOSED (BUG-973, 2026-09-09).** Every one of the five `_scan_global_depth`
+gates (direct call, function-name argument, funcptr binding, factory return, factory call)
+routes through `scan_depth_cap_hit`, which sets `_scan_depth_exceeded`, names the callee at
+the cap as the finding and returns TRUE. `scan_finding_noun()` then words the diagnostic as
+*"an UNANALYZED call chain (deeper than the 32-call analysis limit …) through 'dNN'"*. Before
+this it returned FALSE past the cap — "clean" for a body it had not walked — and a global RMW
+40 calls below a spawn target compiled with zero diagnostics. The same rule and the same
+commit cover the ISR walker (`record_isr_globals` + its two funcname siblings set
+`_isr_scan_depth_exceeded`; the NODE_INTERRUPT check reads it after the walk and refuses the
+handler), the post-spawn atomic-cell walk (`record_atomic_plain_in_callee` records a
+`sym == NULL` sentinel past `ZER_ATOMIC_CALLEE_DEPTH_MAX`, and `check_atomic_cell_safety`
+refuses iff an atomic cell exists), and `func_rmw_param_mask` (returns ~0 past its cap and
+does NOT memoise a capped result — it used to cache 0 up the whole chain). The remaining
+fail-open guards and the per-function memo that would retire the caps are ledgered in
+`docs/limitations.md` "depth-guard ledger".
+
+## Single-statement body positions — `lower_stmt_in_block` / `lower_body` (BUG-972, 2026-09-09)
+
+The per-statement wrapper in `ir_lower.c` — bounds guards (`lower_stmt_guards`), then the
+shared-struct lock (`emit_shared_lock_if_needed`), the statement, the unlock, plus the
+`return <shared-expr>` special case — is ONE function, `lower_stmt_in_block`. The NODE_BLOCK
+loop calls it per statement; `lower_body` calls it for any body position that the grammar may
+fill with a BARE statement instead of a block. Two such positions exist today, both produced
+by the parser as a bare `NODE_EXPR_STMT`: the statement-form defer body (`defer stmt;`,
+parser.c ~2040) and the expression-form switch arm (`1 => expr,`, parser.c ~1786). Before
+this both were handed straight to `lower_stmt` and got no lock and no IR guard — measured as
+an unlocked `shared struct` write in the emitted C. `if`/`for`/`while`/`@critical`/`@once`
+bodies are always blocks (braces are mandatory), an `orelse { }` fallback is a block, and
+the for-init has its own lock site. **A parser change that produces a bare statement in a
+new body position must route it through `lower_body`**; the REQUIRED fingerprints in
+`tools/emit_audit.sh` pin the two known forms.
+
+Found beside it: the switch-arm lowering raised `block_defers_managed` unconditionally, but
+only a NODE_BLOCK body decrements it, so an expression-form arm left the counter raised and
+the next block in the function skipped its own block-exit defer fire (a real miscompile,
+pinned by `tests/zer/switch_arm_expr_form_ok.zer`). The counter is now raised only for a
+block body.
 
 **Error vs Warning:** `has_atomic_or_barrier(node)` scans the spawned function body for `@atomic_*` or `@barrier*` intrinsics. If found → **warning** (developer is doing manual synchronization, lock-free pattern possible). If not found → **error** (no synchronization at all, definitely unsafe).
 
@@ -3301,6 +3339,25 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 **Narrowing events:** literal init (`u32 d = 5` → {5,5,true}), for-loop condition (`i < N` → {0,N-1}), guard pattern (`if (i >= N) return` → {0,N-1} after if), comparison in then-block, modulo (`x % N` → {0,N-1}), bitwise AND (`x & MASK` → {0,MASK}).
 
 **Expression-derived ranges:** `derive_expr_range(c, expr, &min, &max)` handles `TOK_PERCENT` and `TOK_AMP` with constant RHS (including const global symbol lookup). Used at both var-decl init and NODE_ASSIGN reassignment paths. This eliminates false "index not proven" warnings for hash map patterns like `slot = hash % TABLE_SIZE; arr[slot]`.
+
+**Type/shape-proven indices (BUG-974, 2026-09-09):** `index_expr_type_bound(c, expr, &max)`
+(beside `derive_expr_range`) is the VarRange-FREE proof: the largest value an index
+expression can hold from its TYPE and SHAPE. Native unsigned width `< 64` (`u8`/`u16`/`u32`/
+`usize`, distinct-unwrapped) → `2^w-1`; `e >> K` → `bound(e) >> K`; `e & MASK` → `MASK`;
+`e % N` with an UNSIGNED dividend (any width) → `N-1`; a bit-extract `e[hi..lo]` on an
+integer → `2^(hi-lo+1)-1` (sign-independent — the mask is applied last). The constant
+side is evaluated with `eval_const_expr_scoped`, so a const IDENT (`x % M`, `x & (M-1)`)
+counts. `derive_expr_range` routes ONLY the slice shape through it (`u32 k = x[3..0]`
+gets `[0, 15]`); a general type-width fallback there would pre-empt the more precise
+call-range path (`slot = hash(key)`). The TYPE_ARRAY arm of NODE_INDEX consults it in
+both index arms — the bare-ident arm after the VarRange verdict did not decide, and a
+separate arm for every other expression shape (so `arr[x >> 30]` / `arr[x & 3]` /
+`arr[@truncate(u8, x)]` are proven inline, where before only a value BOUND to a variable
+could carry a `derive_expr_range` fact). `uN`/`iN` are EXCLUDED on purpose: their carrier
+is wider than N and relies on `emit_intn_mask` at every producing site, so a width-based
+proof would turn an unmasked path into a silent OOB rather than a wrong value. Signed
+types are excluded (negative is out of bounds). Pinned by `tests/zer/vrp_type_width_index_ok.zer`
+(zero checks emitted) and two `tests/zer_trap/vrp_type_width_*` boundary traps.
 
 **Proven nodes:** `mark_proven(c, node)` adds to `proven_safe` array. `checker_is_proven()` exposed to emitter. Emitter skips `_zer_bounds_check` for proven NODE_INDEX, skips div trap for proven NODE_BINARY.
 
@@ -11322,6 +11379,43 @@ only after the `if (h->escaped) continue;` skip — the -2 sentinel would be
 an OOB read there. Read-back aliases inherit escaped via the snapshot, so
 they don't false-flag as leaks either. If you ever add code that clears
 escaped on handles wholesale, exclude `local_id == IR_GLOBAL_ROOT_ID`.
+
+**Since BUG-976 (2026-09-09) the invariant is enforced by the CONSTRUCTOR**:
+`ir_add_compound_handle` sets `escaped` when `local_id == IR_GLOBAL_ROOT_ID`.
+Reason: `ir_extract_compound_key` now resolves a global-rooted PROJECTION
+(`g.p`, `g_arr[0].q`) to `(IR_GLOBAL_ROOT_ID, "g.p")` through the shared
+`ir_global_projection_key` (the same key G5's store sinks write), so any of
+its ~30 callers may create a global entry — the free sink, the orelse
+read-back, the field-read UAF walk, the alias arms. Before, G5 wrote entries
+nothing else could find: `g.p = n orelse return; free(g.p); g.p.v` was clean.
+A BARE global ident still returns -1 from the extractor (its arms key the
+plain name, above). Three rules that came with it, all in the IR_ASSIGN
+passthrough handler: (1) a plain `=` whose target IS a tracked slot is a
+RESET, not a use — `ir_assign_target_is_tracked_slot` makes the UAF walker
+descend only the slot's object chain, so the taught `g.p = null;` / `h.p =
+null;` compiles while `hp.p = null` through a freed `hp` still fails; a
+local slot receiving an untracked value is cleared (G5 already cleared the
+global); (2) a slot-to-slot copy `b.p = a.p` aliases (`ir_alias_slot_to_slot`,
+after G5 so a global target keeps it); (3) the bare assign spelling
+`h.p = alloc(T);` — target a slot, not a local — registers through
+`ir_register_alloc_result_compound` (BUG-975), and `ir_mark_local_escaped`
+escapes every entry rooted at the local so a returned / globally-stored
+struct takes its carried allocations with it. Diagnostics name a global root
+by its key via `ir_root_display` (was `'?'`).
+
+**A struct VALUE carries its compounds — `ir_carry_compounds` (BUG-977).**
+The question "this aggregate moved; what allocations went with it?" has FOUR
+sites and one answer: `H b = a` (IR_COPY, prefix none), `H h = { .inner = i }`
+and the nested literal `{ .inner = { .p = alloc(T) } }` (STRUCT_INIT_DECOMP,
+prefix `.field` — a nested literal is a temp whose own decomposition already
+registered `(temp, ".p")`), and `h.inner = i` / `g.inner = i`
+(`ir_store_struct_value_into_slot` at the passthrough-ASSIGN and FIELD_WRITE
+sinks, prefix = the slot's key). Only the first existed before. A struct value
+has NO bare handle — an arm that tests `ir_find_handle(value_local)` and stops
+sees nothing; carry the rows rooted at it instead. The slot-clear rule
+(`ir_value_clears_slot`) is gated on the VALUE'S KIND so it can never undo an
+alias another arm of the same instruction formed — the view-alias matrix
+caught the arm-order version of that mistake.
 
 Scoping lesson (recorded because the first scoping was WRONG): the
 original fix sketch said "needs a per-PathState global table touching the

@@ -1,0 +1,36 @@
+// BUG-973 boundary: a 30-deep call chain that touches NO global is below the 32-call
+// analysis cap and must still compile — the fail-closed cap refuses only what it
+// could not analyze.
+u32 leaf_calls = 0;
+void d30() { }
+void d29() { d30(); }
+void d28() { d29(); }
+void d27() { d28(); }
+void d26() { d27(); }
+void d25() { d26(); }
+void d24() { d25(); }
+void d23() { d24(); }
+void d22() { d23(); }
+void d21() { d22(); }
+void d20() { d21(); }
+void d19() { d20(); }
+void d18() { d19(); }
+void d17() { d18(); }
+void d16() { d17(); }
+void d15() { d16(); }
+void d14() { d15(); }
+void d13() { d14(); }
+void d12() { d13(); }
+void d11() { d12(); }
+void d10() { d11(); }
+void d9() { d10(); }
+void d8() { d9(); }
+void d7() { d8(); }
+void d6() { d7(); }
+void d5() { d6(); }
+void d4() { d5(); }
+void d3() { d4(); }
+void d2() { d3(); }
+void d1() { d2(); }
+void w() { d1(); }
+u32 main() { ThreadHandle th = spawn w(); th.join(); return 0; }

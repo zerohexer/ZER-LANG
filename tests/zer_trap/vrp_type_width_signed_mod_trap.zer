@@ -1,0 +1,10 @@
+// expect-trap
+// BUG-974 boundary: `x % 4` bounds the index only for an UNSIGNED dividend. A signed
+// -3 % 4 is -3 in C, so the guard must stay — and here it fires.
+u32[4] arr;
+i32 pick() { return -3; }
+u32 main() {
+    i32 x = pick();
+    arr[x % 4] = 1;
+    return 0;
+}

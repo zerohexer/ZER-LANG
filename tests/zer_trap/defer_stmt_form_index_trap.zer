@@ -1,0 +1,12 @@
+// expect-trap
+// BUG-972: `defer stmt;` is a bare NODE_EXPR_STMT body. It bypassed the per-statement
+// wrapper, so it got no IR bounds guard (the emitter's raw-AST guard fired instead and
+// re-emitted the defer body inside its own early-return path). It now takes the same
+// trapping IR guard as `defer { stmt; }`.
+u32[4] arr;
+u32 main() {
+    u32 i = 0;
+    defer arr[i] = 7;
+    i = 100;
+    return 0;
+}

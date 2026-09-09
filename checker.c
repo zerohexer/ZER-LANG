@@ -40,7 +40,12 @@ static int zer_sym_region_tag(bool is_local_derived, bool is_arena_derived) {
  * If-chain (not switch) so the walker-default audit is unaffected;
  * type_dispatch_kind keeps the distinct-unwrap CI gate green. */
 static bool type_carries_data_pointer(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    /* BUG-980: past the depth cap the honest answer is "cannot prove it does
+     * NOT carry one" — fail CLOSED (the BUG-933/973 rule). A 33-deep nest
+     * then over-rejects at the escape / spawn-arg sinks instead of slipping
+     * them; the corpus never approaches the cap, so the cost is zero. */
+    if (depth > 32) return true;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -78,7 +83,8 @@ static bool type_carries_data_pointer(Type *t, int depth) {
  * member of the "wrapper hides the inner kind" family is covered by one call
  * (CLAUDE.md, the class killed by tools/audit_carrier_dispatch.sh). */
 static bool type_carries_handle(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    if (depth > 32) return true;   /* BUG-980: fail closed past the cap */
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -208,7 +214,10 @@ static Type *fold_decl_qualifiers(Checker *c, Type *type, bool is_const, bool is
  * edge can only over-reject a cycle, whereas a mis-classified inline edge
  * restores the compiler crash this guard exists to prevent. */
 static bool tynode_keeps_storage_inline(TypeNode *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    /* BUG-980: the comment above names INLINE as the safe direction — so past
+     * the cap answer INLINE, not "reference". */
+    if (depth > 32) return true;
     switch (t->kind) {
     /* Wrappers that keep the element inline — peel and re-ask. */
     case TYNODE_ARRAY:    return tynode_keeps_storage_inline(t->array.elem, depth + 1);
@@ -493,7 +502,8 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
 }
 
 static bool type_carries_nonshared_pointer(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    if (depth > 32) return true;   /* BUG-980: fail closed past the cap */
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -1589,7 +1599,16 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  *
  * Returns the spelling for the diagnostic, or NULL. */
 static const char *unique_resource_name(Type *t, int depth) {
-    if (!t || depth > 8) return NULL;
+    if (!t) return NULL;
+    /* BUG-980: past the cap, "cannot prove there is no unique resource in
+     * here" — name it so the copy is REFUSED rather than silently allowed
+     * (an Arena nine fields deep copied is the BUG-970 class). The cap is
+     * 64, not the 32 of the carrier walks: the copy sinks ask THIS question
+     * for every by-value flow, and a fail-closed answer at 32 refused the
+     * suite's own 34-deep move-struct nest (BUG-917) as "a resource" before
+     * the move rule could speak. A by-value type cannot recurse, so the cap
+     * is only a stack bound; 64 is beyond anything written. */
+    if (depth > 64) return "a resource nested too deeply to name";
     Type *e = type_unwrap_distinct(t);
     if (!e) return NULL;
     switch (type_dispatch_kind(e)) {
@@ -2141,7 +2160,8 @@ static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below */
  * kind-switch because it is a focused predicate, not a walker: it deliberately does
  * NOT descend loop bodies or blocks, which cannot appear in an init anyway. */
 static bool for_init_has_loop_jump(Node *n, int depth) {
-    if (!n || depth > 32) return false;
+    if (!n) return false;
+    if (depth > 32) return true;   /* BUG-980: fail closed — assume a jump */
     if (n->kind == NODE_BREAK || n->kind == NODE_CONTINUE) return true;
     if (n->kind == NODE_ORELSE) {
         if (n->orelse.fallback_is_break || n->orelse.fallback_is_continue) return true;

@@ -1,0 +1,82 @@
+// expect-error: resource types are not copyable
+// BUG-980: unique_resource_name answered "no resource" past its recursion cap,
+// so an Arena nested deeper than the cap was copied by value — two owners of one
+// bump cursor (the BUG-970 class). The walk now fails CLOSED past its cap (64 —
+// beyond anything written; the suite's own deepest nest is 34): a 70-deep nest is
+// refused as a resource too deep to name. The pre-flip build (cap 8, fail-open)
+// accepted this program.
+struct R0 { Arena a; }
+struct R1 { R0 inner; }
+struct R2 { R1 inner; }
+struct R3 { R2 inner; }
+struct R4 { R3 inner; }
+struct R5 { R4 inner; }
+struct R6 { R5 inner; }
+struct R7 { R6 inner; }
+struct R8 { R7 inner; }
+struct R9 { R8 inner; }
+struct R10 { R9 inner; }
+struct R11 { R10 inner; }
+struct R12 { R11 inner; }
+struct R13 { R12 inner; }
+struct R14 { R13 inner; }
+struct R15 { R14 inner; }
+struct R16 { R15 inner; }
+struct R17 { R16 inner; }
+struct R18 { R17 inner; }
+struct R19 { R18 inner; }
+struct R20 { R19 inner; }
+struct R21 { R20 inner; }
+struct R22 { R21 inner; }
+struct R23 { R22 inner; }
+struct R24 { R23 inner; }
+struct R25 { R24 inner; }
+struct R26 { R25 inner; }
+struct R27 { R26 inner; }
+struct R28 { R27 inner; }
+struct R29 { R28 inner; }
+struct R30 { R29 inner; }
+struct R31 { R30 inner; }
+struct R32 { R31 inner; }
+struct R33 { R32 inner; }
+struct R34 { R33 inner; }
+struct R35 { R34 inner; }
+struct R36 { R35 inner; }
+struct R37 { R36 inner; }
+struct R38 { R37 inner; }
+struct R39 { R38 inner; }
+struct R40 { R39 inner; }
+struct R41 { R40 inner; }
+struct R42 { R41 inner; }
+struct R43 { R42 inner; }
+struct R44 { R43 inner; }
+struct R45 { R44 inner; }
+struct R46 { R45 inner; }
+struct R47 { R46 inner; }
+struct R48 { R47 inner; }
+struct R49 { R48 inner; }
+struct R50 { R49 inner; }
+struct R51 { R50 inner; }
+struct R52 { R51 inner; }
+struct R53 { R52 inner; }
+struct R54 { R53 inner; }
+struct R55 { R54 inner; }
+struct R56 { R55 inner; }
+struct R57 { R56 inner; }
+struct R58 { R57 inner; }
+struct R59 { R58 inner; }
+struct R60 { R59 inner; }
+struct R61 { R60 inner; }
+struct R62 { R61 inner; }
+struct R63 { R62 inner; }
+struct R64 { R63 inner; }
+struct R65 { R64 inner; }
+struct R66 { R65 inner; }
+struct R67 { R66 inner; }
+struct R68 { R67 inner; }
+struct R69 { R68 inner; }
+R69 g;
+u32 main() {
+    R69 copy = g;
+    return 0;
+}

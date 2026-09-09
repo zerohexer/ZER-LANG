@@ -824,21 +824,27 @@ optional's false edge, whose temp aliases param i, does not demote param i's def
 Gate: `tests/zer_fail/opt_param_capture_form_stays_maybe.zer` — it fails loudly (compiles)
 the moment this closes; promote it to a positive then.
 
-## OPEN — depth-guard ledger: which walkers still FAIL OPEN past their cap (2026-09-09, BUG-973 residue)
+## OPEN — depth-guard ledger: which walkers still FAIL OPEN past their cap (2026-09-09, BUG-973 / BUG-980 residue)
 
 BUG-973 converted the four call-descent caps that had a MEASURED accept-unsafe
 reproducer (spawn race scan, ISR walker + funcname siblings, post-spawn atomic-cell
-walk, `func_rmw_param_mask`). `grep -n "depth > [0-9]" checker.c zercheck_ir.c emitter.c`
-lists every remaining guard; each below returns the NON-conservative answer past its cap.
-None has a reproducer yet — most bound AST/TYPE nesting (a struct nested 33 deep, a
-9-deep cast launder chain), which the corpus never approaches — but the rule is that a
-guard must fail closed, so they are written down rather than assumed harmless.
+walk, `func_rmw_param_mask`). BUG-980 flipped every TYPE / AST-nesting walk whose
+conservative answer is free: `type_carries_data_pointer`, `type_carries_handle`,
+`type_carries_nonshared_pointer` (past 32 levels: "carries"), `tynode_keeps_storage_inline`
+(past 32: INLINE — its own comment names that as the safe direction), `unique_resource_name`
+(cap raised 8 -> 64, past it: a named too-deep resource, so the copy is refused — at 8 or 32
+a fail-closed answer refused the suite's own 34-deep move-struct nest at every copy sink), `for_init_has_loop_jump`
+(past 32: assume a jump). Two generated negatives pin the first and the fifth
+(`tests/zer_fail/deep_nest_{spawn_carrier,arena_copy}_fails_closed.zer` — 36- and 70-deep nests
+that the pre-flip build ACCEPTED).
+
+`grep -n "depth > [0-9]" checker.c zercheck_ir.c emitter.c` lists what remains; each
+below still returns the NON-conservative answer past its cap. None has a reproducer —
+they bound CALL-CHAIN depth, where flipping is an over-rejection of plausible code and
+wants a corpus-cost measurement and a message, not a blanket change.
 
 | walker (checker.c unless noted) | cap | answer past cap | what it could miss |
 |---|---|---|---|
-| `type_carries_data_pointer` / `type_carries_handle` / `type_carries_nonshared_pointer` | 32 type levels | `false` = "carries none" | a pointer/Handle 33 struct levels deep slips the spawn-arg carrier gate and the escape sinks |
-| `tynode_keeps_storage_inline` | 32 | `false` | resource-copy rule on a 33-deep nest |
-| `unique_resource_name` | 8 | `NULL` = "not unique" | a Pool/Arena 9 fields deep copied (BUG-970 class) |
 | `arg_is_local_derived` / `call_has_local_derived_arg` / `call_has_nonkeep_derived_arg` / `infer_keep_from_call_args` | 8 nested calls | `false` = "not frame-bound" | `g = f1(f2(...f9(&local)))` — 9 nested call launders escape a local |
 | `value_frame_bound_symbol` | 8 | `NULL` | same class at the scoped-spawn borrow |
 | `resolve_write_target_global` | 6 | `NULL` | an RMW target reached through >6 pointer hops is not a global |
@@ -848,17 +854,12 @@ guard must fail closed, so they are written down rather than assumed harmless.
 | `node_forwards_param_to_spawn` / `func_forwards_param_to_spawn` | 8 | `false` | a funcptr forwarded 9 hops to a spawn |
 | `scan_returned_funcname` / `record_isr_returned_funcname` | 8 AST levels in a factory | `false` / flag | (ISR one now sets the flag) a `return fn` 9 ifs deep in a factory |
 | `body_calls_funcptr_field` / `scan_funcptr_field_bindings` | 8 | `false` | funcptr-field REACH 9 hops away |
-| zercheck_ir.c `ir_register_nested_handles` | 32 | returns | a Handle field 33 levels deep in a param struct is untracked (UAF miss) |
-| emitter.c 868 / 942 | 32 / 8 | `false` / returns | emission-side carrier walks |
+| `ct_expr_bits` | 32 | `0` = "no declared width" | a comptime expression 33 deep computes in the fallback width |
+| zercheck_ir.c `ir_register_nested_handles` | 32 | returns | a Handle field 33 levels deep in a param struct is untracked (UAF miss); the walker has no `zc` to report through — give it one and refuse the function |
+| emitter.c `type_carries_enum` twin / `emit_enum_variant_guard_path` | 32 / 8 | `false` / returns | an enum 9 projections deep in a `@bitcast` target gets no runtime variant guard; the fix is a CHECKER-side error at the three doors when the carrier walk exceeds the guard emitter's reach, never a runtime trap on a valid program |
 
-**Why not just flip them all now.** Flipping a TYPE walk to "assume carrier" past 32 is
-free (BUG-933 did exactly that). Flipping the CALL-CHAIN walks (`arg_is_local_derived`
-at 8, the funcptr REACH walks at 8) is an over-rejection of every program with a
-9-deep nested-call launder or a 9-hop forward — plausible in real code — so each wants
-its own corpus-cost measurement and a message, not a blanket change.
-
-**The durable fix is a per-function MEMO, not a bigger cap.** Every one of the call-chain
-walks answers a question whose truth is per-FUNCTION ("which globals does f reach,
+**The durable fix for the call-chain rows is a per-function MEMO, not a bigger cap.** Every
+one of them answers a question whose truth is per-FUNCTION ("which globals does f reach,
 transitively", "does f forward param i to a spawn"), so the answer can be computed once
 by a call-graph DFS with a visited set (cycles terminate, depth is irrelevant, cost is
 linear) and read at every site. `func_rmw_param_mask` and `compute_func_shared_types`

@@ -5,6 +5,44 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-980: six TYPE / AST-nesting depth guards failed OPEN — flipped to fail closed
+
+The BUG-973 ledger listed every walker that answers the NON-conservative answer past its
+recursion cap. The type-walk rows are free to flip (the corpus never approaches 32
+levels; a wrong answer there only over-rejects), so this closes them:
+
+| walker | cap | was | now |
+|---|---|---|---|
+| `type_carries_data_pointer` | 32 | "carries none" | "carries" |
+| `type_carries_handle` | 32 | "carries none" | "carries" |
+| `type_carries_nonshared_pointer` | 32 | "carries none" | "carries" |
+| `tynode_keeps_storage_inline` | 32 | "reference" | INLINE (its own comment names that the safe direction) |
+| `unique_resource_name` | 8 → **64** | `NULL` = "no resource" | a named too-deep resource (copy refused) |
+| `for_init_has_loop_jump` | 32 | "no jump" | "jump" |
+
+**Measured.** A heap `?*T` field 36 struct levels deep passed by value to a fire-and-forget
+`spawn` compiled clean on the pre-flip build (the carrier gate walked 32 levels, found
+nothing, and let the copy of the pointer cross the thread); an `Arena` 70 struct levels
+deep was copied by value (two owners of one bump cursor). Both are refused now:
+`tests/zer_fail/deep_nest_spawn_carrier_fails_closed.zer`,
+`tests/zer_fail/deep_nest_arena_copy_fails_closed.zer` (generated nests).
+
+**A cap is not free to flip at ANY depth.** The first cut failed `unique_resource_name`
+closed at its original cap of 8 — and `make check` refused the suite's own 34-deep
+move-struct nest as "a resource too deep to name" (the copy sinks ask this question
+for EVERY by-value flow) — and at 32 it still refused that 34-deep nest before the move
+rule could speak. A fail-closed answer is only free where the cap is beyond anything real
+code writes; for a question asked at every copy that is 64, not 8 or 32. The carrier walks
+stay at 32 (a 34-deep struct is not passed to a spawn or escaped anywhere in the corpus).
+
+What still fails open — the CALL-CHAIN walks (8-deep nested-call launders, funcptr
+forwarding, RMW target hops), `ir_register_nested_handles`, and the emitter's enum-guard
+pair — stays in the ledger (`docs/limitations.md`) with the per-function-memo design;
+flipping those is an over-rejection of plausible code and wants a corpus-cost measurement
+each.
+
+---
+
 ## Session 2026-09-09 — BUG-979 (relaxation): a callee freeing an OPTIONAL param through `orelse return` is summarised as freeing it
 
 **Symptom (over-rejection, measured on the pre-fix build).**

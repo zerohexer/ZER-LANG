@@ -1444,6 +1444,13 @@ return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak
   A struct value carries its allocations wherever it goes — a plain copy
   (`H b = a;`), an initializer field (`H h = { .inner = i };`, or the nested
   literal `{ .inner = { .p = alloc(T) } }`), or a field store (`h.inner = i;`).
+- A callee may free an **optional** parameter, or an optional field of a
+  parameter, by unwrapping it: `void drop(?*T p) { *T q = p orelse return;
+  free(q); }`. The caller sees that free — `drop(mp)` discharges `mp`, and a
+  later unwrap of `mp` or a second free is an error. The `orelse return` path
+  is the null path: nothing was there to free. A free under a real branch
+  (`if (c) { free(q); }`) is still "may not be freed on all paths", and so is
+  the `if (p) |q| { free(q); }` capture form.
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), Arena, alloc_ptr

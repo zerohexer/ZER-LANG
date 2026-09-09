@@ -783,49 +783,46 @@ leaking it"*.)
 
 ---
 
-## OPEN — a callee that frees an OPTIONAL param/field through an `orelse return` unwrap is not summarised as freeing it (2026-09-09, MEDIUM — over-rejection, valid program refused)
+## OPEN — freeing a UNION variant through its switch capture is a false leak (2026-09-09, LOW — over-rejection)
 
-**Symptom (measured on the pre-BUG-975 build too — pre-existing).**
+**Symptom (measured, pre- and post-BUG-975).**
 
 ```zer
-struct T { u32 v; }
-void drop(?*T p) { *T q = p orelse return; free(q); }
-u32 main() { ?*T mp = alloc(T); drop(mp); return 0; }
-// zercheck: handle %0 (local 'mp') allocated at line 3 but never freed
+union U { ?*T p; u32 n; }
+U u;  u.p = alloc(T) orelse return;
+switch (u) { .p => |q| { *T t = q orelse return; free(t); }  .n => |n| { return n; } }
+return 0;      // zercheck: handle %0 (local 'u') allocated at line 5 but never freed
 ```
 
-Same for a field through a pointer param (`void drop(*H h){ *T q = h.p orelse return;
-free(q); h.p = null; }`), through a by-value struct param, and for the `if (h.p) |q| {
-free(q); }` capture form. The DIRECT spelling `void drop(H h){ free(h.p); }` on a
-non-optional `*T` field IS summarised (`frees_param_field`) and the caller compiles. An
-optional field cannot be freed without unwrapping, so for `?*T` fields there is no spelling
-the summary accepts: the caller must free the field itself.
+The variant store registers the compound `(u, ".p")` (the same slot machinery as a struct
+field), but the switch capture `|q|` is a COPY of the variant value that aliases nothing —
+so the free through `q` never reaches the compound, and the exit pass reports it alive.
+The real use-after-free (a second `switch (u)` reading `.p` after the free) is therefore
+also invisible; the program is rejected only by accident of the leak rule.
 
-**Why it is newly VISIBLE.** BUG-975 tracks the bare spelling `h.p = alloc(T);` (before, it
-was untracked, so `drop(&h)` after it compiled — by accident, alongside the UAFs). The
-orelse spelling always hit this.
+**Fix sketch.** The union-switch capture lowering yields the captured value into a local
+(a FIELD_READ-like read of the variant); alias that local to `(u, ".variant")` exactly as
+the struct-field read arm does (`ir_type_reads_as_ref` gate), so the free propagates and
+the second read is a UAF. Gate: the two programs above as a positive and a negative.
 
-**Root cause (two halves).** (a) In the callee, `*T q = p orelse return` for a PARAM lowers
-to a passthrough `%t = ASSIGN <p>` / `<h.p>`; the passthrough alias arm finds no handle for
-a param root and forms no alias, whereas the IR_FIELD_READ lowering has the 2026-08-16
-"create the param compound, mint an alloc_id, alias" sibling. So `free(q)` never reaches a
-handle rooted at the param, and the summary sees no param free. (b) Even with the alias, the
-`orelse return` path is a path on which the param is NOT freed, so the summary builder would
-classify it as MAYBE — the caller's ALIVE handle would become MAYBE_FREED and the leak check
-would still complain "may not be freed on all paths". For an optional, the null path holds
-nothing to free: a free on every path where the value was non-null IS a definite free of the
-allocation the caller passed.
+## OPEN — a callee freeing an optional field through the IF-CAPTURE form stays MAYBE (2026-09-09, LOW — over-rejection; the `orelse return` form is CLOSED as BUG-979)
 
-**Fix sketch.** (a) Mirror the FIELD_READ param-compound sibling into the passthrough
-`NODE_FIELD`/`NODE_IDENT` alias arms of IR_ASSIGN (the two-lowerings-of-one-read shape the
-2026-08-16 comment itself names). (b) In the summary builder, treat an exit reached only
-through the `orelse return` / `if (opt)`-else arm of the unwrap of param `i` as not
-contradicting `frees_param[i]` — the free is definite for a non-null argument. Gate: the
-five shapes above as positives, plus a negative where the callee frees on one REAL branch
-only (`if (c) { free(q); }`) which must stay MAYBE.
+**Symptom (measured).** `void drop(*H h) { if (h.p) |q| { free(q); } h.p = null; }` called as
+`drop(&h)`: "handle 'h' may not be freed on all paths". The `orelse return` spelling of the
+same callee (`*T q = h.p orelse return; free(q); h.p = null;`) is accepted since BUG-979.
 
-**Tripwire.** `tests/zer/alloc_field_bare_spelling_ok.zer` frees every field-stored
-allocation in the function that allocated it; when this closes, add a `drop(&h)` positive.
+**Root cause.** The capture form joins the freed path and the null path INSIDE the callee
+(`GOTO bb_join`), so at the return block the field is MAYBE_FREED and the summary is
+`maybe_frees_param_field`. BUG-979's null-path skip keys on `IRBlock.orelse_fallback_local`,
+which only an `orelse return/break/continue` fallback block carries; an if-capture's else
+edge is an ordinary CFG edge with no "this is the null path of THAT optional" tag.
+
+**Fix sketch.** Tag the if-capture's false edge the same way (the BRANCH's `cond_local` is
+the optional temp; record it on the join's incoming state, or split the join's
+contribution per predecessor in the summary builder: a predecessor reached only via the
+optional's false edge, whose temp aliases param i, does not demote param i's definite free).
+Gate: `tests/zer_fail/opt_param_capture_form_stays_maybe.zer` — it fails loudly (compiles)
+the moment this closes; promote it to a positive then.
 
 ## OPEN — depth-guard ledger: which walkers still FAIL OPEN past their cap (2026-09-09, BUG-973 residue)
 

@@ -11417,6 +11417,28 @@ sees nothing; carry the rows rooted at it instead. The slot-clear rule
 alias another arm of the same instruction formed — the view-alias matrix
 caught the arm-order version of that mistake.
 
+**A PARAM gets its identity at its first unwrap; a fallback block knows WHOSE
+null path it is (BUG-979).** `void drop(?*T p){ *T q = p orelse return;
+free(q); }` was a caller-side "never freed": the unwrap is a passthrough
+`_zer_or = p` from a bare param ident with no handle, so no alias formed and
+`free(q)` reached nothing rooted at `p`. Now (1) the passthrough bare-ident
+and field arms create the param's handle / compound (ALIVE, minted id,
+`escaped` — a param is never the callee's leak) before aliasing, through the
+ONE predicate `ir_type_reads_as_ref` (looks through `?`; shared with the
+IR_FIELD_READ arm, which also marks a param's fresh compound ALIVE so an
+if-capture free joins to MAYBE rather than vanishing at UNKNOWN + FREED);
+(2) `IRBlock.orelse_fallback_local` (set by ir_lower beside every
+`is_orelse_fallback` tag) names the optional temp the branch tested, and the
+summary builder skips a fallback return for param i only when that temp
+shares an alloc_id with an entry rooted at i — its OWN null path, where the
+caller's argument was null and there was nothing to free; (3) the summary's
+kind gate unwraps `?`; (4) `IRHandleInfo.freed_then_reset` /
+`maybe_freed_then_reset` keep the fact of a free across the BUG-976 slot
+reset (`h.p = null;` inside the callee), merged definite-only-if-all-preds;
+(5) a bare tracked ident is a reset target too (`mp = null;` after the free
+is not a use — the FREED state is kept). What still stays MAYBE: the
+if-capture form (limitations.md).
+
 Scoping lesson (recorded because the first scoping was WRONG): the
 original fix sketch said "needs a per-PathState global table touching the
 fixed-point lattice — dedicated-session surgery." The pseudo-root reuse

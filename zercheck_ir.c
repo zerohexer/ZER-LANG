@@ -80,6 +80,15 @@ typedef struct {
      * through merges (sound: a genuine complementary coverage admits no
      * still-alive path). */
     int freed_all_paths;
+    /* BUG-979: this SLOT entry was FREED (resp. MAYBE_FREED) and then RESET
+     * (`h.p = null;` — the taught idiom), which clears its state so the next
+     * read is not a false use-after-free. The FuncSummary builder still needs
+     * to know the allocation the slot held WAS freed on this path — a callee's
+     * `free(q); h.p = null;` frees the caller's field — so the fact survives
+     * the reset here. Per-entry (not aliased). Merge: definite only if BOTH
+     * preds are definite, else maybe. */
+    bool freed_then_reset;
+    bool maybe_freed_then_reset;
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
     /* bh18_1b (2026-07-01): this handle (or its alias group) tracks a
@@ -1027,6 +1036,19 @@ static bool ir_target_root_escapes(ZerCheck *zc, Node *target) {
 }
 
 /* Mark a local's handle (if tracked) as escaped. */
+/* BUG-979: does reading a value of this type yield a REFERENCE into an
+ * allocation (so the read must ALIAS rather than copy)? Pointer, slice,
+ * opaque — looking THROUGH `?` and `distinct`, because `?*T` is the field
+ * type every orelse-unwrap read goes through. The ONE predicate for the
+ * two field-read alias arms (IR_FIELD_READ and the passthrough ASSIGN);
+ * the syntactic kind test it replaces missed every optional-pointer field. */
+static bool ir_type_reads_as_ref(Type *t) {
+    if (!t) return false;
+    Type *in = type_unwrap_optional(t);
+    TypeKind k = in ? type_dispatch_kind(in) : TYPE_VOID;
+    return k == TYPE_POINTER || k == TYPE_SLICE || k == TYPE_OPAQUE;
+}
+
 /* Mark a local's allocation as escaped (no longer this function's to free).
  *
  * BUG-975: EVERY entry rooted at the local escapes with it — the bare handle
@@ -1295,6 +1317,15 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * handle alive), so a pred without it cannot contribute an alive
              * path that this would wrongly mask. */
             if (ph->freed_all_paths) rh->freed_all_paths = 1;
+            /* BUG-979: freed-then-reset is DEFINITE only when every pred says
+             * so; one pred lacking it demotes the join to MAYBE. */
+            {
+                bool r_def = rh->freed_then_reset, p_def = ph->freed_then_reset;
+                bool r_any = r_def || rh->maybe_freed_then_reset;
+                bool p_any = p_def || ph->maybe_freed_then_reset;
+                rh->freed_then_reset = r_def && p_def;
+                rh->maybe_freed_then_reset = (r_any || p_any) && !(r_def && p_def);
+            }
             /* BUG-933: POOL IDENTITY across the join. Only when BOTH preds name a
              * pool and they DIFFER — so a single-pool program is untouched and this
              * can only reject a handle that genuinely may come from either. */
@@ -2434,6 +2465,15 @@ static void ir_root_display(IRFunc *func, int root_local, const char *path,
 static bool ir_assign_target_is_tracked_slot(ZerCheck *zc, IRFunc *func,
                                              IRPathState *ps, Node *target) {
     if (!target) return false;
+    if (target->kind == NODE_IDENT) {
+        /* BUG-979: the BARE sibling — `p = null;` after `free(q)` where `q`
+         * was unwrapped from `p` overwrites the variable, it does not read
+         * the pointee. The store arm keeps the FREED state (so a later read
+         * is still a use-after-free and the summary still sees the free). */
+        int l = ir_find_local_exact_first(func, target->ident.name,
+                                          (uint32_t)target->ident.name_len);
+        return l >= 0 && ir_find_handle(ps, l) != NULL;
+    }
     if (target->kind != NODE_FIELD && target->kind != NODE_INDEX) return false;
     int root;
     const char *path;
@@ -2556,10 +2596,11 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             Node *t = expr->assign.target;
             if (t->kind == NODE_FIELD) {
                 ir_check_expr_uaf(zc, func, ps, t->field.object, line, rs);
-            } else {
+            } else if (t->kind == NODE_INDEX) {
                 ir_check_expr_uaf(zc, func, ps, t->index_expr.object, line, rs);
                 ir_check_expr_uaf(zc, func, ps, t->index_expr.index, line, rs);
             }
+            /* a bare ident target has no object chain to walk */
         } else {
             ir_check_expr_uaf(zc, func, ps, expr->assign.target, line, rs);
         }
@@ -3428,7 +3469,12 @@ static bool ir_register_global_field_store(ZerCheck *zc, IRPathState *ps,
          * `g.p = n; free(n); g.p = null;` doesn't false-positive. */
         IRHandleInfo *gh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID,
                                                    gpath, total);
-        if (gh) { gh->state = IR_HS_UNKNOWN; gh->alloc_id = 0; }
+        if (gh) {
+            if (gh->state == IR_HS_FREED) gh->freed_then_reset = true;   /* BUG-979 */
+            else if (gh->state == IR_HS_MAYBE_FREED) gh->maybe_freed_then_reset = true;
+            gh->state = IR_HS_UNKNOWN;
+            gh->alloc_id = 0;
+        }
     }
     return true;
 }
@@ -4186,9 +4232,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * the value read out IS a reference into whatever the struct carries.
          * move_user's Token has only scalar fields, so it is unaffected. */
         if (inst->expr && inst->expr->kind == NODE_FIELD && inst->dest_local >= 0) {
-            Type *ft = checker_get_type(zc->checker, inst->expr);
-            TypeKind fk = ft ? type_dispatch_kind(ft) : TYPE_VOID;
-            if (fk == TYPE_POINTER || fk == TYPE_SLICE || fk == TYPE_OPAQUE) {
+            /* BUG-979: the shared predicate — `?*T` fields now alias too. */
+            if (ir_type_reads_as_ref(checker_get_type(zc->checker, inst->expr))) {
                 int froot; const char *fpath; uint32_t fplen;
                 if (ir_extract_compound_key(zc, func, inst->expr->field.object,
                                              &froot, &fpath, &fplen) == 0) {
@@ -4225,6 +4270,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             && wplen > 0) {
                             IRHandleInfo *wh = ir_find_compound_handle(ps, wroot,
                                                                        wpath, wplen);
+                            bool wfresh = (wh == NULL);
                             if (!wh) wh = ir_add_compound_handle(ps, wroot, wpath, wplen);
                             /* A freshly-created compound carries NO allocation
                              * identity, and aliasing to alloc_id 0 shares nothing.
@@ -4232,6 +4278,20 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                              * in the SAME alias group — that group is what carries a
                              * free in either direction. */
                             if (wh && wh->alloc_id == 0) wh->alloc_id = _ir_next_alloc_id++;
+                            /* BUG-979: a PARAM's field is a LIVE value the caller
+                             * handed over (never this function's leak). Left
+                             * UNKNOWN, the join UNKNOWN + FREED after an
+                             * `if (h.p) |q| { free(q); }` stayed UNKNOWN and the
+                             * free vanished from the summary; ALIVE joins to
+                             * MAYBE_FREED, which is the truthful answer. Same
+                             * identity the passthrough-ASSIGN sibling gives. */
+                            if (wh && wfresh && wroot >= 0 && wroot < func->local_count &&
+                                func->locals[wroot].is_param) {
+                                wh->state = IR_HS_ALIVE;
+                                wh->alloc_line = inst->source_line;
+                                wh->source_color = ZC_COLOR_UNKNOWN;
+                                wh->escaped = true;
+                            }
                             if (wh) {
                                 IRAliasSnapshot wsnap;
                                 ir_snapshot_alias(&wsnap, wh);
@@ -4761,7 +4821,13 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                              &cr, &cp, &cpl) == 0 &&
                     cpl > 0 && cr != IR_GLOBAL_ROOT_ID) {
                     IRHandleInfo *ch = ir_find_compound_handle(ps, cr, cp, cpl);
-                    if (ch) { ch->state = IR_HS_UNKNOWN; ch->alloc_id = 0; }
+                    if (ch) {
+                        /* BUG-979: keep the FACT that it was freed for the summary */
+                        if (ch->state == IR_HS_FREED) ch->freed_then_reset = true;
+                        else if (ch->state == IR_HS_MAYBE_FREED) ch->maybe_freed_then_reset = true;
+                        ch->state = IR_HS_UNKNOWN;
+                        ch->alloc_id = 0;
+                    }
                 }
             }
 
@@ -5207,6 +5273,28 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     fsrc_path_len > 0) {
                     IRHandleInfo *fsrc_h = ir_find_compound_handle(ps, fsrc_root,
                         fsrc_path, fsrc_path_len);
+                    /* BUG-979: a PARAM's field read through THIS lowering
+                     * (`*T q = h.p orelse return` with `*H h` / `H h` a param)
+                     * had no compound to alias, so the free of `q` never reached
+                     * `(h, ".p")` and frees_param_field stayed unset. Create the
+                     * compound with a minted identity — the sibling of the
+                     * IR_FIELD_READ arm's 2026-08-16 fix, for the passthrough
+                     * lowering it explicitly says it does not cover. Gated on the
+                     * field being pointer-carrying (a scalar read aliases nothing). */
+                    if (!fsrc_h && fsrc_root >= 0 && fsrc_root < func->local_count &&
+                        func->locals[fsrc_root].is_param) {
+                        if (ir_type_reads_as_ref(checker_get_type(zc->checker, rhs))) {
+                            fsrc_h = ir_add_compound_handle(ps, fsrc_root,
+                                                            fsrc_path, fsrc_path_len);
+                            if (fsrc_h) {
+                                fsrc_h->state = IR_HS_ALIVE;
+                                fsrc_h->alloc_line = inst->source_line;
+                                fsrc_h->alloc_id = _ir_next_alloc_id++;
+                                fsrc_h->source_color = ZC_COLOR_UNKNOWN;
+                                fsrc_h->escaped = true;
+                            }
+                        }
+                    }
                     if (fsrc_h && fsrc_h->alloc_id != 0) {
                         IRAliasSnapshot fsnap;
                         ir_snapshot_alias(&fsnap, fsrc_h);
@@ -5414,6 +5502,27 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * alloc goes through ?Handle (which decomposes via
                          * IR_ASSIGN-with-NODE_IDENT temps). Unified via
                          * ir_apply_alias. */
+                        /* BUG-979: a PARAM read into a local — the orelse
+                         * unwrap `*T q = p orelse return` lowers to exactly
+                         * this (`_zer_or = p`) — had no handle to alias, so
+                         * `free(q)` never reached `p` and the summary saw no
+                         * param free (a caller then reported a leak). Give the
+                         * param its identity now: ALIVE (the caller handed a
+                         * live value), minted alloc_id, escaped (a param is
+                         * never this function's leak). Same move the
+                         * IR_FIELD_READ arm makes for a param's FIELD
+                         * (2026-08-16). */
+                        if (!src_h && src_local < func->local_count &&
+                            func->locals[src_local].is_param) {
+                            src_h = ir_add_handle(ps, src_local);
+                            if (src_h) {
+                                src_h->state = IR_HS_ALIVE;
+                                src_h->alloc_line = inst->source_line;
+                                src_h->alloc_id = _ir_next_alloc_id++;
+                                src_h->source_color = ZC_COLOR_UNKNOWN;
+                                src_h->escaped = true;
+                            }
+                        }
                         if (src_h && src_h->state == IR_HS_ALIVE) {
                             IRAliasSnapshot snap;
                             ir_snapshot_alias(&snap, src_h);
@@ -7413,6 +7522,30 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         all_ret_field_freed[i] = false;
                         continue;
                     }
+                    /* BUG-979: this return is the NULL PATH of param i's OWN
+                     * unwrap (`*T q = p orelse return;`) — the optional the
+                     * branch tested aliases param i's allocation. On that path
+                     * the caller's argument was null: there is nothing to free,
+                     * and "not freed here" must not demote a definite free on
+                     * the live path to MAYBE. Some OTHER optional's null path
+                     * (the temp aliases a different allocation, or nothing) is
+                     * NOT skipped — there param i really was not freed. */
+                    if (bb->is_orelse_fallback && bb->orelse_fallback_local >= 0) {
+                        IRHandleInfo *oh = ir_find_handle(ps, bb->orelse_fallback_local);
+                        bool own_null_path = false;
+                        if (oh && oh->alloc_id != 0) {
+                            /* the bare handle OR any compound rooted at the param
+                             * (`*T q = h.p orelse return` unwraps a FIELD) */
+                            for (int hh = 0; hh < ps->handle_count; hh++) {
+                                IRHandleInfo *e = &ps->handles[hh];
+                                if (e->local_id == plocal && e->alloc_id == oh->alloc_id) {
+                                    own_null_path = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (own_null_path) continue;
+                    }
                     /* rdh99l field-free scan — runs for EVERY param kind
                      * (including by-value STRUCT/UNION, which the bare type
                      * gate below skips). A callee freeing `param.field`
@@ -7425,8 +7558,13 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         for (int hh = 0; hh < ps->handle_count; hh++) {
                             IRHandleInfo *ch = &ps->handles[hh];
                             if (ch->local_id != plocal || ch->path_len == 0) continue;
-                            if (ch->state == IR_HS_FREED) block_field_freed = true;
-                            else if (ch->state == IR_HS_MAYBE_FREED) block_field_maybe = true;
+                            /* BUG-979: a slot freed and then RESET (`h.p = null;`)
+                             * still freed the caller's allocation. */
+                            if (ch->state == IR_HS_FREED || ch->freed_then_reset)
+                                block_field_freed = true;
+                            else if (ch->state == IR_HS_MAYBE_FREED ||
+                                     ch->maybe_freed_then_reset)
+                                block_field_maybe = true;
                         }
                         if (block_field_freed || block_field_maybe) any_field_freed[i] = true;
                         if (!block_field_freed) all_ret_field_freed[i] = false;
@@ -7438,8 +7576,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                      * TYNODE_POINTER/TYNODE_HANDLE silently skipped any typedef'd
                      * destructor parameter — frees_param never set, so caller's
                      * UAF/double-free both passed silently. */
+                    /* BUG-979: look through `?` — an OPTIONAL pointer param
+                     * (`void drop(?*T p)`) is freed through its unwrap, and the
+                     * bare kind gate below silently excluded it from the summary
+                     * (type_unwrap_optional also unwraps distinct). */
                     Type *pt_eff = func->locals[plocal].type
-                        ? type_unwrap_distinct(func->locals[plocal].type) : NULL;
+                        ? type_unwrap_optional(func->locals[plocal].type) : NULL;
                     if (!pt_eff ||
                         (pt_eff->kind != TYPE_POINTER &&
                          pt_eff->kind != TYPE_HANDLE &&

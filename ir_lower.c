@@ -2336,6 +2336,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         orelse_node->orelse.fallback_is_break ||
         orelse_node->orelse.fallback_is_continue) {
         ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+        ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-979 */
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
@@ -2349,8 +2350,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
          * lowering split into sub-blocks"); the bare form did not, because before the
          * splice it never split. Same question, two sites, one of them updated — the
          * sibling-site shape this project keeps recording. */
-        if (ctx->current_block != bb_fail)
+        if (ctx->current_block != bb_fail) {
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
@@ -2366,8 +2369,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2378,8 +2383,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2427,10 +2434,12 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
             IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
             if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
                 ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+                ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-979 */
                 /* Also tag the ending block if it's different from bb_fail
                  * (block lowering may have split into sub-blocks) */
                 if (ctx->current_block != bb_fail) {
                     ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+                    ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;
                 }
             }
         }

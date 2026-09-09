@@ -5,6 +5,82 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-09 — BUG-979 (relaxation): a callee freeing an OPTIONAL param through `orelse return` is summarised as freeing it
+
+**Symptom (over-rejection, measured on the pre-fix build).**
+
+```zer
+void drop(?*T p) { *T q = p orelse return; free(q); }
+u32 main() { ?*T mp = alloc(T); drop(mp); return 0; }
+// zercheck: handle %0 (local 'mp') allocated at line 3 but never freed
+```
+
+Same for an optional FIELD of a pointer param (`void drop(*H h){ *T q = h.p orelse return;
+free(q); h.p = null; }` + `drop(&h)`) and of a by-value struct param. An optional field
+cannot be freed without unwrapping, so no spelling was accepted: the caller had to free
+the field itself. Also refused: the RESET `mp = null;` after the free of the unwrapped
+pointer ("use after free: 'mp'").
+
+**Root cause — three halves, each a missing finite variable.**
+1. The unwrap `*T q = p orelse return` lowers to `_zer_or = p` — a passthrough ASSIGN
+   from a bare PARAM ident. A param has no handle until something registers one, so no
+   alias formed, `free(q)` reached nothing rooted at `p`, and the summary saw no param
+   free. The FIELD form (`_zer_or = h.p`) had the same gap in the passthrough arm — the
+   IR_FIELD_READ arm's 2026-08-16 "create the param compound" fix names this lowering as
+   the one it does not cover.
+2. The summary's bare kind gate (`POINTER | HANDLE | OPAQUE | SLICE`) excluded `?*T`
+   params outright.
+3. Even with the alias, the `orelse return` block is a return on which the param is not
+   freed, so the summary would demote a definite free to MAYBE — and the caller's leak
+   check rejects MAYBE. On that path the caller's argument was NULL: there is nothing to
+   free, and nothing to demote. The IR did not record WHICH optional's null path a
+   fallback block was.
+
+**Fix.**
+- **Identity for a param at its unwrap.** The passthrough bare-ident arm gives a param a
+  handle (ALIVE, minted `alloc_id`, `escaped` — a param is never this function's leak)
+  before aliasing; the passthrough field arm creates the param's compound the same way
+  (gated on `ir_type_reads_as_ref`, the ONE predicate now shared with the IR_FIELD_READ
+  arm — which thereby also sees `?*T` fields). The FIELD_READ arm marks a param's fresh
+  compound ALIVE too, so `if (h.p) |q| { free(q); }` joins to MAYBE instead of the
+  free vanishing at an UNKNOWN + FREED join.
+- **`IRBlock.orelse_fallback_local`** (ir.h / ir.c / ir_lower.c, set beside every
+  `is_orelse_fallback` tag): the `_zer_or` temp the branch tested. The summary builder
+  skips a fallback return block for param i iff that temp shares an alloc_id with an
+  entry rooted at param i — its OWN null path. Another optional's null path is not
+  skipped (pinned: `opt_param_other_optional_null_path_maybe.zer`), nor is a real
+  runtime branch (`opt_param_real_branch_free_maybe.zer`).
+- **The kind gate looks through `?`** (`type_unwrap_optional`).
+- **`freed_then_reset` / `maybe_freed_then_reset`** on the entry: the callee's own
+  `h.p = null;` after the free runs the BUG-976 slot reset, which cleared the FREED state
+  the summary needed. The fact survives the reset now (definite only if every
+  predecessor agrees, else maybe), and the field-free scan counts it.
+- **The bare-ident RESET.** `mp = null;` where `mp` is a tracked (freed) local overwrites
+  the variable and reads no pointee — `ir_assign_target_is_tracked_slot` accepts a bare
+  ident; the FREED state is kept, so a later read is still a UAF and the summary still
+  sees the free.
+
+**Tests.** Positive `tests/zer/opt_param_unwrap_free_ok.zer` (all shapes, runs, exits 0).
+Negatives `tests/zer_fail/opt_param_drop_then_caller_{uaf,double_free}.zer` (the summary
+is CONSUMED: a caller that re-unwraps or frees again after `drop` is refused),
+`opt_local_reset_after_reunwrap_uaf.zer`, and the two MAYBE boundaries above.
+
+**Residual (limitations.md).** The `if (h.p) |q| { free(q); }` capture form joins the
+freed and the null path inside the callee, so it stays MAYBE ("may not be freed on all
+paths") — pinned by `opt_param_capture_form_stays_maybe.zer`.
+
+## Session 2026-09-09 — BUG-978: the Ring "pointer through channel" warning missed a struct CARRIER
+
+`Ring(*T, 4).push(t)` warned; `Ring(Msg, 4).push(m)` with `struct Msg { ?*T p; }` did
+not — the site tested the element's bare kind (`POINTER | OPAQUE`), the
+wrapper-hides-the-inner-kind class. Both `push` and `push_checked` now use
+`type_carries_data_pointer` (the carrier audit's own recommendation); the two
+hand-rolled rows leave `tools/carrier_dispatch_baseline.txt`. Warning-only by design
+(a channel crossing is tracked, not banned) — measured with `scratch v04`: free the
+pointee, pop the message, read through it: no diagnostic before, the warning now.
+
+---
+
 ## Session 2026-09-09 — BUG-977: a struct VALUE carries its allocations at FOUR sites, and only the plain copy knew
 
 **Symptom (measured, three shapes, all on the pre-fix build).**

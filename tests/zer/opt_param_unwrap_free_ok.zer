@@ -1,0 +1,37 @@
+// BUG-979 (relaxation): a callee that frees an OPTIONAL param — or an optional
+// FIELD of a pointer / by-value struct param — through the `orelse return` unwrap
+// is summarised as freeing it, so the caller is not told the allocation leaked.
+// Also: `p = null;` / `mp = null;` after the free is a RESET of the variable, not
+// a use of the freed pointee (it was rejected as a use-after-free before).
+// Every shape here was refused on the pre-fix build; each is a valid program.
+struct T { u32 v; }
+struct H { ?*T p; }
+
+void drop_opt(?*T p) { *T q = p orelse return; free(q); }
+void drop_opt_reset(?*T p) { *T q = p orelse return; free(q); p = null; }
+void drop_field_ptr(*H h) { *T q = h.p orelse return; free(q); h.p = null; }
+void drop_field_val(H h) { *T q = h.p orelse return; free(q); }
+
+u32 main() {
+    ?*T a = alloc(T);
+    drop_opt(a);
+
+    ?*T b = alloc(T);
+    drop_opt_reset(b);
+
+    H h1;
+    h1.p = alloc(T);
+    drop_field_ptr(&h1);
+
+    H h2;
+    h2.p = alloc(T) orelse return;
+    drop_field_val(h2);
+
+    ?*T c = alloc(T);
+    *T q = c orelse return;
+    q.v = 1;
+    u32 v = q.v;
+    free(q);
+    c = null;                          // reset, not a use
+    return v - 1;
+}

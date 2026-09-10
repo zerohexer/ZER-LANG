@@ -379,6 +379,35 @@ struct Symbol {
      * test_firmware_patterns for >4 minutes. */
     bool rmw_summary_done;
     uint64_t rmw_param_mask;
+    /* BUG-977: per-function MEMO + ON-PATH marks for the transitive call-hop scans
+     * (spawn race scan, ISR global recording, atomic-cell recording, the funcptr
+     * REACH walks). These scans used to re-descend every callee body at every call
+     * site under a fixed depth cap — exponential on a recursive callee (`fib`
+     * reachable from a spawn target hung the compiler) and SILENT past the cap (a
+     * 33-deep distinct call chain was never scanned at all). A scan result is a
+     * property of the CALLEE (its body), so it is computed once and memoised here;
+     * `walk_on_path` bits cut cycles (a callee already on the current path is not
+     * re-entered — its binding-dependent RMW facts are applied from
+     * rmw_param_mask instead). One bit per walker family so nested walkers over the
+     * same Symbol cannot confuse each other's path marks. */
+    uint8_t walk_on_path;          /* ZER_WALK_* bits: callee is on the current path */
+    uint8_t race_scan_state;       /* 0 = unscanned, 2 = memoised (spawn race scan) */
+    bool race_scan_found;
+    bool race_scan_rmw;            /* the finding was a volatile RMW */
+    bool race_scan_static;         /* the finding was a static local */
+    bool race_scan_too_deep;       /* the finding was an unanalysable call chain */
+    const char *race_scan_name;    /* the offending global / static local */
+    uint32_t race_scan_len;
+    bool isr_scan_visited;         /* record_isr_globals already recorded this body */
+    bool atomic_scan_visited;      /* record_atomic_plain_in_callee already did */
+    uint8_t fpf_calls_state;       /* body_calls_funcptr_field memo: bit0 done, bit1 result */
+    uint64_t fwd_spawn_done_mask;  /* func_forwards_param_to_spawn: bit n = param n computed */
+    uint64_t fwd_spawn_mask;       /* bit n = param n is forwarded into a spawn */
+    uint64_t fwd_on_path_mask;     /* bit n = (fn, param n) is on the current forward walk */
+    uint8_t fpb_state;             /* scan_funcptr_field_bindings memo: 0 / 2 */
+    bool fpb_found;
+    const char *fpb_name; uint32_t fpb_len;
+    Symbol *fpb_fn;
 
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;

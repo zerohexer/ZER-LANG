@@ -1,0 +1,45 @@
+// EXPECTED: compile error
+// expect-error: accesses static local 's32'
+// BUG-976: the static-local table was a fixed array of 32; the 33rd static local in a
+// spawn target was silently not recorded, so an RMW on it compiled clean.
+void w() {
+    static u32 s0 = 0;
+    static u32 s1 = 0;
+    static u32 s2 = 0;
+    static u32 s3 = 0;
+    static u32 s4 = 0;
+    static u32 s5 = 0;
+    static u32 s6 = 0;
+    static u32 s7 = 0;
+    static u32 s8 = 0;
+    static u32 s9 = 0;
+    static u32 s10 = 0;
+    static u32 s11 = 0;
+    static u32 s12 = 0;
+    static u32 s13 = 0;
+    static u32 s14 = 0;
+    static u32 s15 = 0;
+    static u32 s16 = 0;
+    static u32 s17 = 0;
+    static u32 s18 = 0;
+    static u32 s19 = 0;
+    static u32 s20 = 0;
+    static u32 s21 = 0;
+    static u32 s22 = 0;
+    static u32 s23 = 0;
+    static u32 s24 = 0;
+    static u32 s25 = 0;
+    static u32 s26 = 0;
+    static u32 s27 = 0;
+    static u32 s28 = 0;
+    static u32 s29 = 0;
+    static u32 s30 = 0;
+    static u32 s31 = 0;
+    static u32 s32 = 0;
+    s32 += 1;
+}
+u32 main() {
+    spawn w();
+    spawn w();
+    return 0;
+}

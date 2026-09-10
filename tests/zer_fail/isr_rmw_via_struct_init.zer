@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement and is shared between interrupt and main
+// BUG-975: ISR sibling of spawn_rmw_via_struct_init.zer.
+struct W { u32 a; }
+volatile u32 g;
+W pick(W w) { return w; }
+interrupt TIMER1 { g = pick({ .a = g }).a + 1; }
+u32 main() { g = 1; return 0; }

@@ -12854,3 +12854,54 @@ call-result sink must use this helper, not re-inline the predicate.** The litera
 compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
+
+## Bounded walks and the call-hop scans — the two shapes and the rule for each (BUG-975/977, 2026-09-10)
+
+Every recursive predicate in `checker.c` / `zercheck_ir.c` / `emitter.c` has a guard.
+There are exactly two shapes, and they need different treatment; conflating them is how
+nine accept-unsafe holes and a compiler hang coexisted.
+
+**Shape 1 — walks over SYNTAX or TYPE structure (acyclic).** Expression/statement nesting
+is bounded by the parser (256; `parse_precedence` / `parse_unary` / `parse_type`; blocks
+64), and by-value type nesting is acyclic because a struct containing itself by value is
+rejected. So the guard is a safety net, never a semantic boundary. Rules:
+- the limit sits ABOVE the parser bound: `ZER_EXPR_WALK_LIMIT` (300) for expression
+  walks, `ZER_TYPE_WALK_LIMIT` (512) for type walks (checker.c top; zercheck_ir.c and
+  emitter.c use the literals with a BUG-975 comment);
+- when it trips anyway, return the CONSERVATIVE answer for the CALLER's question
+  (carries a pointer / is frame-bound / is an RMW / is a resource / emit a trap);
+- if the predicate answers two questions with opposite safe directions (the Z1 case:
+  "move-tracked?" vs "exempt from the leak check?" — both read
+  `ir_contains_move_struct_field_depth`), there is no conservative value; unreachability
+  is the only fix;
+- a walk that only RECORDS (`ir_register_nested_handles`, `infer_keep_from_call_args`)
+  has no answer to round, so its limit must simply be unreachable.
+
+**Shape 2 — walks that descend CALLEES (cyclic).** The call graph has cycles, so a depth
+cap is the wrong tool twice over: recursion consumes it (and re-descends exponentially —
+`fib` from a spawn target was 2^32 walks), and a long distinct chain exhausts it silently.
+The pattern that fixes both, used by `scan_callee_body` (spawn race scan) and
+`isr_descend_callee` (ISR recorder):
+1. `Symbol.walk_on_path` bit per walker family — a callee already on the path is NOT
+   re-entered (cycle cut). Its binding-dependent facts (which param it RMWs through) come
+   from `func_rmw_param_mask`, which is itself memoised.
+2. per-Symbol memo of the callee's verdict for BINDING-FREE descents (`race_scan_*`,
+   `isr_scan_visited`, `atomic_scan_visited`, `fpf_calls_state`, `fpb_*`,
+   `fwd_spawn_done_mask`). Not stored when `_walk_cut_epoch` moved during the descent —
+   inside a strongly-connected component the cut member's answer is still being computed.
+3. the scan tables (`_rmw_alias`, `_static_locals`) are growable and BASE-SCOPED: saved,
+   base-shifted for the callee, restored. Never `rmw_alias_reset()` mid-scan (BUG-977 P6).
+4. a LOUD cap on DISTINCT path length: the callee is reported as unanalysable
+   (`scan_finding_noun()` → "function (call chain too deep to analyze)"), never skipped.
+`func_forwards_param_to_spawn` memoises per (function, param) with `fwd_on_path_mask`;
+per function alone misses `f(a,b){ f(b,a); spawn w(a); }`.
+
+**Known imprecision the memo inherits (documented, not new):** the spawn scan resolves
+identifiers against the SPAWNING function's `current_scope`, so a callee's verdict can in
+principle differ by caller only through a caller-local shadowing a global of the same
+name. That imprecision predates the memo; the memo freezes whichever caller scanned first.
+Globals resolve identically everywhere, which is the case that matters.
+
+**How to check a new guard.** Grep `depth > ` and `guard++ <` in the file, read the
+value returned on the trip, and ask: for the caller, is that the reject side? If the
+walk descends callees, it needs the Shape-2 pattern, not a number.

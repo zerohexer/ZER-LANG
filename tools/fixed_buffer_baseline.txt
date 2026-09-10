@@ -106,3 +106,8 @@ ir_lower.c:    Node  *inline_buf[16];
 # it just stops collecting, which is the conservative direction (fewer types found =
 # no false deadlock report).
 checker.c:        Type *scratch[4] = {0};
+# LSP-only (not on the compile path): a 65th open document is refused (returns NULL, no
+# diagnostics for it) and diagnostics past 256 are not forwarded to the editor. Editor-side
+# degradation only; no safety analysis reads either table. Matched by the BUG-976 macro-size rule.
+zer_lsp.c:static Document documents[MAX_DOCUMENTS];
+zer_lsp.c:static LspDiagnostic diag_buf[MAX_DIAGS];

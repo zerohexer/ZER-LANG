@@ -47,6 +47,13 @@ for f in $FILES; do
     # uint8_t/uint32_t arrays whose name suggests collection
     grep -E '^\s*(uint8_t|uint16_t|uint32_t|uint64_t|int)\s+\w*(stack|nodes|items|args|ids|covered|reported|checks|list|set|stmts|decls|arr)\w*\[[0-9]+\]' "$f" | \
         sed "s|^|$f:|"
+    # BUG-976: any array sized by a *_MAX / *_CAP / *_LIMIT macro, whatever its
+    # element type. The two spawn/ISR scan tables (`_rmw_alias[RMW_ALIAS_MAX]`,
+    # `_static_locals[STATIC_LOCAL_MAX]`) were struct arrays, matched neither
+    # pattern above, and dropped their 17th / 33rd entry silently — a spawn target
+    # RMW through the dropped alias compiled clean.
+    grep -E '^\s*(static\s+)?(struct\s*\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)\s*\**\s*\w+\[[A-Z_0-9]*(MAX|CAP|LIMIT)[A-Z_0-9]*\]' "$f" | \
+        sed "s|^|$f:|"
 done | tr -d '\r' | sort -u > "$CURRENT"
 
 # Compare against baseline. Lines in CURRENT but not BASELINE = new.

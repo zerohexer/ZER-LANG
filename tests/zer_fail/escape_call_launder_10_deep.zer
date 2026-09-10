@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot store result of call with local-derived pointer argument
+// BUG-975: arg_is_local_derived answered "not local" past depth 8, so ten nested
+// identity calls laundered `&x` into a global.
+?*u32 g_p = null;
+*u32 id(*u32 p) { return p; }
+void stash() {
+    u32 x = 5;
+    g_p = id(id(id(id(id(id(id(id(id(id(&x))))))))));
+}
+u32 main() { stash(); return 0; }

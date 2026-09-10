@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot store local-derived pointer 'x' in static/global variable 'g_p'
+// BUG-975: value_frame_bound_symbol gave up at depth 8, so an orelse chain 11 long
+// ending in `&local` was stored into a global.
+?*u32 g_p = null;
+?*u32 mk() { return null; }
+void stash() {
+    u32 x = 5;
+    g_p = mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (&x))))))))));
+}
+u32 main() { stash(); return 0; }

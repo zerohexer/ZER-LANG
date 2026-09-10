@@ -1,0 +1,34 @@
+// expect-trap
+// BUG-975: the emitter's enum variant guard walker stopped at depth 8, so an enum
+// forged 11 structs deep via @bitcast was never guarded and the non-variant value RAN
+// (the same forge 3 deep trapped). Must trap now.
+enum Color { red, green }
+struct E0 { Color c; }
+struct E1 { E0 in; }
+struct E2 { E1 in; }
+struct E3 { E2 in; }
+struct E4 { E3 in; }
+struct E5 { E4 in; }
+struct E6 { E5 in; }
+struct E7 { E6 in; }
+struct E8 { E7 in; }
+struct E9 { E8 in; }
+struct E10 { E9 in; }
+struct Raw0 { u32 c; }
+struct Raw1 { Raw0 in; }
+struct Raw2 { Raw1 in; }
+struct Raw3 { Raw2 in; }
+struct Raw4 { Raw3 in; }
+struct Raw5 { Raw4 in; }
+struct Raw6 { Raw5 in; }
+struct Raw7 { Raw6 in; }
+struct Raw8 { Raw7 in; }
+struct Raw9 { Raw8 in; }
+struct Raw10 { Raw9 in; }
+u32 main() {
+    Raw10 r;
+    r.in.in.in.in.in.in.in.in.in.in.c = 7;
+    E10 e = @bitcast(E10, r);
+    if (e.in.in.in.in.in.in.in.in.in.in.c == Color.red) { return 1; }
+    return 2;
+}

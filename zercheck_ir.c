@@ -905,8 +905,17 @@ static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
      * honest answer is "assume it might", which can only OVER-reject (a copy of a
      * deeply-nested NON-move struct starts being move-tracked). Corpus cost is
      * zero — nothing here nests anywhere near this. Same direction as the VRP
-     * verdict: trusting the analysis to prove DANGER is the safe side. */
-    if (depth > 32) return true;
+     * verdict: trusting the analysis to prove DANGER is the safe side.
+     *
+     * BUG-975 (2026-09-10): "conservative" is RELATIVE TO THE QUESTION, and this
+     * predicate answers two. "Contains a move struct" enables move tracking (where
+     * `true` is the safe side) but ALSO exempts the local from the leak check
+     * (where `true` is the ACCEPT side): a Handle 34 structs deep was registered
+     * alive and its leak went unreported, because past the old cap of 32 the
+     * local read as move-carrying. By-value nesting is acyclic (the checker
+     * rejects a struct containing itself by value), so the guard is a safety net
+     * and the only correct setting is one no real program reaches. */
+    if (depth > 512) return true;
     Type *eff = type_unwrap_distinct(t);
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
@@ -1485,7 +1494,7 @@ static bool ir_tynode_is_ref_producing(TypeNode *t) {
  * The loop interleaves both carriers, so a two-hop `(*N)@pun(*N, n)` peels fully. */
 static Node *ir_peel_launder(Node *v) {
     int guard = 0;
-    while (v && guard++ < 32) {
+    while (v && guard++ < 300) {   /* BUG-975: above the parser nesting bound */
         Node *prev = v;
         if (v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0) {
             const char *n = v->intrinsic.name;
@@ -1577,7 +1586,7 @@ static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
                                         IRPathState *ps, Node *arg) {
     if (!arg) return NULL;
     int guard = 0;
-    while (arg && guard++ < 32) {
+    while (arg && guard++ < 300) {   /* BUG-975 */
         Node *prev = arg;
         if (arg->kind == NODE_ORELSE) arg = arg->orelse.expr;
         arg = ir_peel_launder(arg);   /* BUG-931: one peeler, both carriers */
@@ -2151,7 +2160,7 @@ static Node *ir_unwrap_alloc_expr(Node *expr) {
  * Returns the root ident node, or NULL. */
 static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
     int guard = 0;
-    while (e && guard++ < 64) {
+    while (e && guard++ < 300) {   /* BUG-975 */
         if (e->kind == NODE_FIELD)      { e = e->field.object;      continue; }
         if (e->kind == NODE_INDEX)      { e = e->index_expr.object; continue; }
         if (e->kind == NODE_SLICE)      { e = e->slice.object;      continue; }
@@ -2172,7 +2181,7 @@ static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
 static Node *ir_addr_of_deref_target(ZerCheck *zc, Node *operand) {
     Node *cur = operand;
     int guard = 0;
-    while (cur && guard++ < 32) {
+    while (cur && guard++ < 300) {   /* BUG-975 */
         Node *obj = NULL;
         if (cur->kind == NODE_FIELD)       obj = cur->field.object;
         else if (cur->kind == NODE_INDEX)  obj = cur->index_expr.object;
@@ -4244,7 +4253,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             bool forms_ref = (rv && ((rv->kind == NODE_UNARY && rv->unary.op == TOK_AMP) ||
                                      rv->kind == NODE_SLICE));
             if (forms_ref) {
-                while (rv && peeled < 32) {
+                while (rv && peeled < 300) {   /* BUG-975: above the parser nesting bound */
                     if (rv->kind == NODE_UNARY && rv->unary.op == TOK_AMP) rv = rv->unary.operand;
                     else if (rv->kind == NODE_INDEX) rv = rv->index_expr.object;
                     else if (rv->kind == NODE_SLICE) rv = rv->slice.object;
@@ -6527,12 +6536,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
  * Without this, function params of nested-struct types never have
  * their inner handles tracked → use-after-free goes undetected.
  *
- * Depth-limited at 32 to prevent infinite recursion on malformed
- * recursive types. */
+ * Depth guard: by-value struct nesting is ACYCLIC (the checker rejects a struct
+ * that contains itself by value), so the walk terminates on its own; the guard
+ * is a safety net only. BUG-975: it used to be 32, and a Handle 35 structs deep
+ * was simply never registered — its leak went unreported. A registration walk
+ * has no conservative answer to give past its limit, which is why the limit sits
+ * far above any real nesting rather than merely "large". */
 static void ir_register_nested_handles(IRPathState *ps, void *arena_ptr,
     int local_id, Type *t, const char *path, uint32_t path_len, int depth)
 {
-    if (depth > 32 || !t) return;
+    if (depth > 512 || !t) return;
     Type *eff = type_unwrap_distinct(t);
     if (!eff) return;
     Arena *arena = (Arena *)arena_ptr;
@@ -7392,7 +7405,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                            rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_OPAQUE; })) {
                         Node *fr = vexpr;
                         int fpeel = 0;
-                        while (fr && fpeel < 32 &&
+                        while (fr && fpeel < 300 &&
                                (fr->kind == NODE_FIELD || fr->kind == NODE_INDEX)) {
                             fr = (fr->kind == NODE_FIELD) ? fr->field.object
                                                           : fr->index_expr.object;
@@ -7426,7 +7439,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             /* the store target must be a field OF the returned local */
                             Node *tr = e->assign.target;
                             int tpeel = 0;
-                            while (tr && tpeel < 32 &&
+                            while (tr && tpeel < 300 &&
                                    (tr->kind == NODE_FIELD || tr->kind == NODE_INDEX)) {
                                 tr = (tr->kind == NODE_FIELD) ? tr->field.object
                                                               : tr->index_expr.object;
@@ -7440,7 +7453,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                             if (!sv || !((sv->kind == NODE_UNARY && sv->unary.op == TOK_AMP) ||
                                          sv->kind == NODE_SLICE)) continue;
                             int speel = 0;
-                            while (sv && speel < 32) {
+                            while (sv && speel < 300) {   /* BUG-975 */
                                 if (sv->kind == NODE_UNARY && sv->unary.op == TOK_AMP) sv = sv->unary.operand;
                                 else if (sv->kind == NODE_INDEX) sv = sv->index_expr.object;
                                 else if (sv->kind == NODE_SLICE) sv = sv->slice.object;
@@ -7466,7 +7479,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     int peel = 0;
                     if (vexpr && ((vexpr->kind == NODE_UNARY && vexpr->unary.op == TOK_AMP) ||
                                   vexpr->kind == NODE_SLICE)) {
-                        while (vexpr && peel < 32) {
+                        while (vexpr && peel < 300) {   /* BUG-975 */
                             if (vexpr->kind == NODE_UNARY && vexpr->unary.op == TOK_AMP)
                                 vexpr = vexpr->unary.operand;
                             else if (vexpr->kind == NODE_INDEX) vexpr = vexpr->index_expr.object;

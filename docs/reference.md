@@ -967,6 +967,13 @@ const, comptime, @size
 On local variables: persists across function calls (like C).
 On functions: internal to module (not visible to importers).
 
+A static local is ONE object for every execution of its function, so it is
+shared state exactly like a global: a function containing one cannot be a
+spawn target (or be reached from one), and it cannot be touched from both an
+interrupt handler and main code. `const` and single-word `volatile` static
+locals get the same exemptions a global gets. The rule holds at any nesting
+depth of the call chain and for any number of static locals.
+
 **SYNTAX**
 ```zer
 void count() {
@@ -975,6 +982,19 @@ void count() {
 }
 
 static void helper() { }    // not exported
+```
+
+```zer
+// COMPILE ERROR: static local 'hits' is one object for both threads
+void worker() {
+    static u32 hits;
+    hits += 1;
+}
+u32 main() {
+    spawn worker();
+    spawn worker();
+    return 0;
+}
 ```
 
 ---
@@ -1910,9 +1930,27 @@ u32 main() {
 Reinterpret the bits of val as type T. Same bit width required.
 Checks qualifier preservation (const, volatile).
 
+The SOURCE may be an array (its bytes are copied); the TARGET may not be
+an array type — wrap the array in a struct and bitcast to that. A target
+that carries an enum (directly, in a struct field, an optional payload or
+an array element, at any depth) is checked at runtime: a value that is not
+a declared variant traps.
+
 **EXAMPLE**
 ```zer
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
+```
+
+```zer
+struct Words { u32[2] w; }
+u32 main() {
+    u8[8] raw;
+    raw[0] = 42;
+    u64 v = @bitcast(u64, raw);          // array source: the 8 bytes
+    Words ws = @bitcast(Words, raw);     // array target must be wrapped
+    if (@truncate(u8, v) != 42 || ws.w[0] != 42) { return 1; }
+    return 0;
+}
 ```
 
 ---

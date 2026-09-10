@@ -1,0 +1,15 @@
+// BUG-977: a recursive function with TWO self-calls reachable from a spawn target made
+// the race scan re-descend 2^32 paths (the compiler hung on this program, >30 s on the
+// baseline). With the callee memoised and cycles cut it compiles instantly. The ISR
+// recorder had the identical blow-up; interrupt bodies cannot run hosted, so that
+// sibling is pinned by the same program compiled with -o (see BUGS-FIXED.md BUG-977).
+u32 fib(u32 n) { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
+shared struct Out { u32 v; }
+Out out;
+void w(u32 n) { out.v = fib(n); }
+u32 main() {
+    ThreadHandle th = spawn w(10);
+    th.join();
+    if (out.v != 55) { return 1; }
+    return 0;
+}

@@ -1,0 +1,47 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-975: past depth 32 the move-containment walk said "contains a move struct", which
+// EXEMPTED the local from the leak check — the handle was registered alive and its leak
+// went unreported. One predicate, two questions, opposite safe directions.
+struct T { u32 v; }
+Pool(T, 4) pool;
+struct H0 { Handle(T) h; }
+struct H1 { H0 in; }
+struct H2 { H1 in; }
+struct H3 { H2 in; }
+struct H4 { H3 in; }
+struct H5 { H4 in; }
+struct H6 { H5 in; }
+struct H7 { H6 in; }
+struct H8 { H7 in; }
+struct H9 { H8 in; }
+struct H10 { H9 in; }
+struct H11 { H10 in; }
+struct H12 { H11 in; }
+struct H13 { H12 in; }
+struct H14 { H13 in; }
+struct H15 { H14 in; }
+struct H16 { H15 in; }
+struct H17 { H16 in; }
+struct H18 { H17 in; }
+struct H19 { H18 in; }
+struct H20 { H19 in; }
+struct H21 { H20 in; }
+struct H22 { H21 in; }
+struct H23 { H22 in; }
+struct H24 { H23 in; }
+struct H25 { H24 in; }
+struct H26 { H25 in; }
+struct H27 { H26 in; }
+struct H28 { H27 in; }
+struct H29 { H28 in; }
+struct H30 { H29 in; }
+struct H31 { H30 in; }
+struct H32 { H31 in; }
+struct H33 { H32 in; }
+struct H34 { H33 in; }
+u32 main() {
+    H34 w;
+    w.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.h = pool.alloc() orelse return;
+    return 0;
+}

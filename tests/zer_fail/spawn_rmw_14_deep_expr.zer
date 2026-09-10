@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+// BUG-975: expr_mentions_global gave up at depth 12, so the read of `g` 14 binary
+// levels down was invisible and the store was classed as a plain store.
+volatile u32 g;
+void w() { g = 0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (g + 1)))))))))))))); }
+u32 main() { spawn w(); spawn w(); return 0; }

@@ -783,6 +783,31 @@ leaking it"*.)
 
 ---
 
+## OPEN — bounded-walk residue after BUG-975/977 (2026-09-10, LOW): three walks with no conservative answer, and a memo that inherits a scope imprecision
+
+BUG-975 made every depth-guarded predicate round toward reject past its limit, and
+BUG-977 replaced the call-hop depth caps with cycle cuts + memos. What that leaves:
+
+- **Record-only walks cannot round.** `ir_register_nested_handles` (zercheck_ir.c),
+  `infer_keep_from_call_args` and the ISR/atomic RECORDERS have no answer to make
+  conservative when a limit trips — they simply record nothing. Their limits are set
+  above the parser bounds (300 / 512), so no well-formed program reaches them; a change
+  to the parser's nesting limits must revisit these. `record_isr_globals` reports a
+  loud error at its cap; the other three are silent by construction.
+- **The spawn-scan memo is keyed on the callee, but identifiers resolve against the
+  SPAWNING function's `current_scope`.** A caller local shadowing a global of the same
+  name could make one caller's scan of a callee differ from another's; the memo freezes
+  whichever scanned first. Pre-existing imprecision (the scan always did this); the
+  durable fix is resolving through `global_scope` plus the base-scoped alias table only.
+  No reproducer produces a wrong verdict for a real global — it would need a caller local
+  named exactly like the racing global AND a body that reads it through the callee.
+- **`ZER_TYPE_WALK_LIMIT` is a constant, not derived.** The right end-state is no cap at
+  all for by-value type walks (acyclic by construction). Kept as a safety net against a
+  future container/typedef form that re-introduces a cycle; document any such form here.
+
+Gate: the fourteen `tests/zer_fail/` negatives listed in BUGS-FIXED.md BUG-975..977 plus
+`tests/zer/spawn_recursive_callee_compiles.zer` (the 2^32 hang, must compile).
+
 ## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
 
 Found while measuring item J's sinks; not reported by any branch, and NOT

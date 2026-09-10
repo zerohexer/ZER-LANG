@@ -5,6 +5,104 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-10 — BUG-975..979: BOUNDED WALKS THAT ROUNDED TOWARD ACCEPT (a class), the call-hop scans that hung on recursion, and two `@bitcast` miscompiles
+
+**Reading method that found them.** Every recursive predicate in the checker carries a
+depth guard. Grepping `depth > N` and reading the value each returns when it trips was
+the whole audit: `type_carries_data_pointer` said "no pointer", `arg_is_local_derived`
+said "not local", `expr_mentions_global` said "not an RMW", `unique_resource_name` said
+"not a resource", the emitter's enum-guard walker emitted NOTHING. Each guard was there
+for termination and had been written as if it were a semantic boundary. Measured, all
+live on the baseline (`da45edd`):
+
+| # | reproducer | cap | what compiled clean |
+|---|---|---|---|
+| D1g | by-value struct 34 levels deep carrying `*u32` | `type_carries_nonshared_pointer` >32 | passed to a fire-and-forget spawn — race on the pointee |
+| D2 | `g = id(id(...id(&x)))`, 10 deep | `arg_is_local_derived` >8 | stack pointer stored in a global |
+| D3 / D3i | `g = 0+(0+(...(g+1)))`, 14 levels | `expr_mentions_global` >12 | RMW unseen at BOTH the spawn and ISR sinks |
+| D3s / D3si | `g = pick({ .a = g }).a + 1` | NODE_STRUCT_INIT unlisted in the if-chain | same, both sinks |
+| D4 | `orelse` chain 11 long ending in `&x` | `value_frame_bound_symbol` >8 | stack pointer stored in a global |
+| D6 | Arena 11 structs deep, `B b = a;` | `unique_resource_name` >8 | second owner of one buffer |
+| Z1 | Handle 34 structs deep, never freed | `ir_contains_move_struct_field_depth` >32 → **true** | leak unreported (see below) |
+| E1 | enum forged 11 structs deep via `@bitcast` | `emit_enum_variant_guard_path` >8 | non-variant value RAN (3 deep trapped) |
+| E2 | `Color[5000]` forged via `@bitcast` | array guard skipped for `size > 4096` | unguarded |
+
+**BUG-975 — the fix is a RULE, not nine patches.** Two facts make the guards unreachable
+for well-formed input: the parser bounds expression and type nesting at 256, and a
+struct cannot contain itself by value (rejected), so by-value type walks are acyclic.
+`ZER_TYPE_WALK_LIMIT` (512) and `ZER_EXPR_WALK_LIMIT` (300) now sit above those bounds —
+AND every guard that trips returns the CONSERVATIVE answer for its caller (carries /
+frame-bound / is an RMW / is a resource / trap), because a limit is a claim about today's
+parser, not a law. The path-walk `guard++ < 32` loops in zercheck_ir.c and the
+`peel < 32` loops were raised the same way. `expr_mentions_name` and
+`expr_mentions_global` are now ONE exhaustive no-`default:` walker (`expr_mentions_ident`),
+which is what closed D3s. The emitter walker traps unconditionally past its limit, builds
+its paths on the heap (the old `char sub[256]` truncated long paths silently), and no
+longer caps the array loop. `@bitcast` to a struct wrapping a 5000-element enum array now
+traps.
+
+**Z1 is the lesson worth keeping.** `ir_contains_move_struct_field_depth` had ALREADY been
+fixed (BUG-933) to return `true` past its cap — the conservative answer for "should this
+be move-tracked?". But the same predicate decides "is this local exempt from the leak
+check?", where `true` is the ACCEPT answer. One predicate, two questions, opposite safe
+directions: no polarity is conservative for both, so the only correct guard is one no
+program reaches. "Conservative" is relative to the QUESTION; when a predicate feeds two,
+check both.
+
+**BUG-976 — two fixed scan tables dropped their 17th / 33rd entry silently.**
+`_rmw_alias[16]` and `_static_locals[32]` (the spawn/ISR race scans) overflowed with a
+bare `return` / `break`: the 33rd `static` local in a spawn target, and `*p16 += 1`
+through the 17th `volatile *u32 p16 = &g16` alias, both compiled clean (P1, P2v). Rule #7
+in CLAUDE.md, and `tools/audit_fixed_buffers.sh` had no pattern for a struct array. Both
+tables are now growable and BASE-SCOPED (lookups see only the body being scanned, newest
+first), and the audit matches any `name[FOO_MAX]` / `_CAP` / `_LIMIT` array.
+
+**BUG-977 — the call-hop scans: exponential on recursion, silent past depth 32.** Three
+scans re-walked every callee body at every call site under a shared cap of 32:
+`scan_unsafe_global_access`, `record_isr_globals`, `record_atomic_plain_in_callee`, plus
+the four funcptr REACH walkers at depth 8. Consequences, all measured:
+- `fib` (two self-calls) reachable from a spawn target or an ISR: 2^32 paths — **the
+  compiler hung** (>30 s, killed) on a five-line program. BUG-801 had already hit this
+  exact blow-up in the RMW walker and memoised THAT one; the siblings were left.
+- a 35-function distinct call chain: the write at the end was never entered (C1, C1i).
+- `scan_funcname_binding` called `rmw_alias_reset()` MID-SCAN, so a `*() fp = f;` between
+  `volatile *u32 p = &g` and `*p += 1` wiped the alias and the RMW went unflagged (P6).
+Fix: a scan result is a property of the CALLEE, so `scan_callee_body` /
+`isr_descend_callee` compute it ONCE — cycle cut via `Symbol.walk_on_path` (one bit per
+walker family), binding-dependent RMW facts applied at a cut from the memoised
+`func_rmw_param_mask`, a per-Symbol memo for binding-free descents (not stored when a cut
+happened beneath it: inside an SCC the cut member's answer is still in progress), tables
+saved/base-shifted/restored instead of wiped, and a LOUD cap on distinct path length
+(`"function (call chain too deep to analyze)"`) instead of a silent skip. The funcptr
+REACH walkers memoise per callee (`fpf_calls_state`, `fpb_*`) and
+`func_forwards_param_to_spawn` per (function, param) — per function alone would miss
+`f(a,b){ f(b,a); spawn w(a); }` forwarding its second parameter. `fib` from a spawn now
+compiles in 18 ms and is a positive test.
+
+**BUG-978 — `@bitcast` to an ARRAY type.** Emitted `int32_t[50] _zer_bco0` (the type
+before the name), a GCC error with no ZER diagnostic. With the declarator fixed the value
+was silently DISCARDED — an array is not an assignable C value and a block-scoped array
+cannot escape the statement expression — so the checker now rejects an array target with
+the struct-wrapper remedy. Corpus cost zero.
+
+**BUG-979 — `@bitcast` FROM an array copied the bytes of a POINTER.** `__auto_type b = a`
+DECAYS the array (measured: `sizeof b == 8`), so `memcpy(&bco, &b, N)` read the pointer's
+bytes: `@bitcast(u64, u8[8] a)` yielded the address of `a`, and a wider target read past
+the pointer on the stack. Both emitter paths now copy from the array expression itself.
+
+**Tests.** `tests/zer_fail/`: `spawn_static_local_33rd`, `spawn_rmw_alias_17th`,
+`spawn_rmw_alias_survives_funcptr_binding`, `spawn_carrier_34_deep`,
+`escape_call_launder_10_deep`, `spawn_rmw_14_deep_expr`, `isr_rmw_14_deep_expr`,
+`spawn_rmw_via_struct_init`, `isr_rmw_via_struct_init`, `escape_orelse_chain_11_deep`,
+`arena_copy_11_deep`, `spawn_call_chain_35_deep`, `isr_call_chain_35_deep`,
+`leak_handle_34_structs_deep`, `bitcast_array_target` — each with `// expect-error:` and
+each verified ACCEPTED by the baseline compiler (the ISR ones are GCC-masked on the
+baseline, which is exactly why the directive is there). `tests/zer/`:
+`spawn_recursive_callee_compiles`, `bitcast_array_source_ok`. `tests/zer_trap/`:
+`bitcast_enum_forged_11_deep`, `bitcast_enum_array_5000_forged`.
+
+---
+
 ## Session 2026-09-10 — BUG-974: the zero of a bare `orelse return` was `0` for every type
 
 `orelse return` is bare by design — "no value; the return value comes from the function's

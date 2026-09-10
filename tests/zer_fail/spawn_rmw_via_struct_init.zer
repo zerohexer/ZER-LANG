@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+// BUG-975: NODE_STRUCT_INIT was an unlisted kind in the (if-chain) RMW walker, so a read
+// of `g` inside a struct-literal argument did not count as reading it.
+struct W { u32 a; }
+volatile u32 g;
+W pick(W w) { return w; }
+void w() { g = pick({ .a = g }).a + 1; }
+u32 main() { spawn w(); spawn w(); return 0; }

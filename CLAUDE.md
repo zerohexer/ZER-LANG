@@ -2845,6 +2845,16 @@ Both halves of that failed in one session:
 - **Check WHICH BINARY each row ran.** A row labelled "pre-L" that actually invoked `./zerc` is not a
   measurement. Put the binary path in the loop, print both sides, and never label from intent.
 
+**A DEPTH CAP THAT IS RESET ON A HOP IS NOT A CAP (2026-09-10, BUG-975).** `eval_const_expr_ex`
+had `if (depth > 256) return CONST_EVAL_FAIL;` and incremented properly down unary/binary
+nodes — and `const u32 A = A;` still HUNG the compiler, while the two-node form SEGFAULTED.
+The IDENT arm called the resolver with no depth, and the resolver restarted the evaluator at
+**0**, so every identifier hop zeroed the counter. **Reading "is there a bound?" is not the
+check; the check is "does the bound survive every hop the recursion can take".** Grep the
+recursion for a literal `0` passed where a depth belongs. Related: a cycle and an
+over-long chain need DIFFERENT diagnostics — a depth bound alone reports a 70-link chain as
+"cyclic", which is a wrong answer, not a rough one.
+
 **A TERNARY BETWEEN TWO FORMAT STRINGS IS A SILENT `-Wformat` HOLE (2026-09-09, BUG-971).**
 `checker_error(c, line, cond ? "…'%.*s'…" : "…%s '%.*s'…", args…)` shares ONE argument
 list, and GCC cannot check it because the format is not a literal. Adding a `%s` to one

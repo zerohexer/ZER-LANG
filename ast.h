@@ -664,7 +664,13 @@ void ast_print(Node *node, int indent);
 /* Optional ident resolver callback for eval_const_expr_ex.
  * When provided, NODE_IDENT is resolved via this callback instead of failing.
  * Breaks circular dependency: ast.h doesn't need Checker, caller provides resolver. */
-typedef int64_t (*ConstIdentResolver)(void *ctx, const char *name, uint32_t name_len);
+/* BUG-975: the resolver takes the CURRENT DEPTH. Without it the bound below was
+ * reset out of effect: the IDENT arm called resolve() with no depth, the checker's
+ * resolver restarted eval_const_expr_ex at 0, and `const u32 A = A;` recursed until
+ * the process died. The bound existed the whole time; nothing carried it across the
+ * identifier hop. */
+typedef int64_t (*ConstIdentResolver)(void *ctx, const char *name, uint32_t name_len,
+                                      int depth);
 
 /* Extended constant expression evaluator with optional ident resolution.
  * Pass resolve=NULL and resolve_ctx=NULL for basic evaluation (same as eval_const_expr). */
@@ -676,7 +682,8 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
         return n->call.comptime_value;
     /* Ident resolution via callback */
     if (n->kind == NODE_IDENT && resolve)
-        return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len);
+        return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len,
+                       depth + 1);   /* BUG-975: an identifier hop IS a level */
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_ex(n->unary.operand, depth + 1, resolve, resolve_ctx);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;

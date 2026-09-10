@@ -1,0 +1,5 @@
+// expect-error: has a cyclic initializer
+// BUG-975 (adopted from loving-davinci-qo0mm9 / vgonmt BUG-917): two lines that HUNG
+// the compiler — zerc never returned, no diagnostic, no exit code.
+const u32 A = A;
+u32 main() { return A; }

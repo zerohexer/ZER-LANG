@@ -1,0 +1,13 @@
+// BUG-975 boundary: ordinary const chains must still FOLD. The cycle stack and the
+// threaded depth only stop a chain that does not terminate or runs past 64 links; a
+// three-link chain feeding an ARRAY SIZE — which requires real compile-time folding —
+// is unaffected.
+const u32 K = 4;
+const u32 D = K * 2;
+const u32 T = D + K;
+u32 main() {
+    u8[T] buf;
+    buf[0] = 1;
+    if (T != 12) { return 1; }
+    return (u32)buf[0] - 1;
+}

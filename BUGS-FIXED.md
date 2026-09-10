@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-10 — BUG-975: a const-init cycle hung the compiler, and its bound could never fire
+
+Two programs, two and three lines, that did not produce a diagnostic because the compiler
+never got that far:
+
+```zer
+const u32 A = A;                            // HUNG — zerc never returned
+const u32 A = B + 1;  const u32 B = A + 1;  // SIGSEGV
+```
+
+### The guard was there the whole time and structurally could not fire
+
+`eval_const_expr_ex` (ast.h) opens with `if (!n || depth > 256) return CONST_EVAL_FAIL;`
+and increments `depth` descending unary and binary nodes. So the bound looks fine.
+
+The IDENT arm called `resolve(resolve_ctx, name, len)` — **no depth** — and the checker's
+`resolve_const_ident` called back with `eval_const_expr_ex(init, 0, …)`. Every identifier
+hop reset the counter to zero, so the chain `A -> eval(init) -> resolve(A) -> eval(init)`
+advanced no bound at all.
+
+**That is the fail-open shape, in its purest form: not a missing guard, a guard that
+cannot reach the recursion it is supposed to bound.** Worth keeping in mind when reading
+any depth-limited walk in this codebase — the question is not "is there a cap" but "does
+the cap survive every hop the recursion can take". The branch survey's biggest class (17
+reproducers, walkers that return "safe" past their cap) is the same defect at scale.
+
+### Two mechanisms, because a cycle and a long chain are different answers
+
+The branch that found this recorded that its first cut used a depth bound alone and
+therefore reported a 70-link chain as "cyclic". That is a WRONG diagnostic, not a rough
+one — it sends the reader looking for a self-reference that does not exist.
+
+- **Threading the depth** (`ConstIdentResolver` takes it; one call site in `ast.h`) makes
+  the existing bound real, and is what stops a long non-cyclic chain.
+- **A name stack** in `resolve_const_ident` detects an actual cycle, which no depth bound
+  can name correctly.
+
+Both are needed; neither subsumes the other.
+
+### Boundary
+
+Ordinary const chains must still FOLD — `const K = 4; const D = K * 2; const T = D + K;`
+used as an ARRAY SIZE requires real compile-time evaluation, so a fix that merely bailed
+out early would break it silently. Pinned by `tests/zer/global_init_const_chain_ok.zer`.
+
+### A/B
+
+Against a build of the previous commit: `self` HANG -> rejected, `mutual` SIGSEGV ->
+rejected, the 70-link chain compiled clean -> rejected with the chain message. The
+positive runs 0 on both sides.
+
+### Note
+
+`ast.h` changed, so this needed `rm -f *.o src/safety/*.o` before rebuilding — the
+zero-header-dependency trap CLAUDE.md records, which cost 75 phantom failures earlier in
+this session.
+
+---
+
 ## Session 2026-09-10 — BUG-974: the zero of a bare `orelse return` was `0` for every type
 
 `orelse return` is bare by design — "no value; the return value comes from the function's

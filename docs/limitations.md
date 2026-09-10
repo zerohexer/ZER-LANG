@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 102 LIVE holes, grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 100 LIVE holes (2 closed as BUG-975), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -65,16 +65,26 @@ r3an9y class set. Of 165 distinct negatives: 31 already exist in main, 22 are re
 the right reason, 10 are rejected with different WORDING for a rule main already has. Do
 not re-harvest those 63 — the 102 below are what is left.
 
-### 🔴 FIRST: TWO compiler-availability bugs, both from a const-init cycle (`qo0mm9`, `vgonmt`)
+### ~~🔴 FIRST: TWO compiler-availability bugs~~ — CLOSED 2026-09-10 as BUG-975
 
-    const u32 A = A;                        // global_init_cycle_self  -> HANGS (never returns)
-    const u32 A = B + 1; const u32 B = A+1; // global_init_cycle_mutual -> SIGSEGV
+    const u32 A = A;                        // HUNG the compiler (never returned)
+    const u32 A = B + 1; const u32 B = A+1; // SIGSEGV
 
-Two and three lines. The branch names the cause, and it is worth reading before fixing:
-`resolve_const_ident` handed `eval_const_expr_ex` **a fresh depth of 0 on every identifier
-hop**, so the evaluator's own bound never saw the chain. That is the SAME fail-open shape
-as class 1 below — a bound that exists but is reset out of effect — so fix it with class 1
-in mind rather than as a one-off.
+Cause, exactly as the branch recorded it: `eval_const_expr_ex` has always had a
+`depth > 256` bound, and it never applied — the IDENT arm called the resolver with no
+depth and `resolve_const_ident` restarted the evaluator at **0**, so the bound was RESET
+OUT OF EFFECT on every identifier hop. **The guard was present and structurally could not
+fire** — the same fail-open shape as class 1 below.
+
+Fixed with TWO mechanisms, because a cycle and a long chain are different diagnostics and
+saying "cyclic" about a 70-link chain is a wrong answer, not a rough one:
+`ConstIdentResolver` now takes the depth (one call site, `ast.h`) so the existing bound is
+real, AND a name stack in `resolve_const_ident` detects an actual cycle. Tests
+`global_init_cycle_self` / `_mutual` / `global_init_chain_too_deep` plus the boundary
+positive `tests/zer/global_init_const_chain_ok.zer` (ordinary chains must still FOLD — a
+const chain feeding an array size needs real compile-time folding).
+
+**Class 1 below is the same shape at scale — start there next.**
 
 ### The 97, by class — and which branch to take
 

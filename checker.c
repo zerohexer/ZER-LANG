@@ -5823,7 +5823,31 @@ ct_done:
  * Looks up const symbols via scope chain, recursively evaluates init value.
  * BUG-430: enables const u32 perms = ...; comptime if (FUNC(perms)) pattern.
  * Uses eval_const_expr_ex with itself as callback — zero code duplication. */
-static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len) {
+/* BUG-975: the names currently being resolved, innermost last. A const initializer
+ * that reaches its OWN name is a cycle, and there is no value to compute. */
+#define CONST_CHAIN_MAX 64
+static const char *_cident_name[CONST_CHAIN_MAX];
+static uint32_t    _cident_len[CONST_CHAIN_MAX];
+static int         _cident_depth = 0;
+
+/* BUG-975: two ways for a const chain not to terminate, and they are DIFFERENT
+ * diagnostics — saying "cyclic" about a long chain is a wrong answer, not a rough one.
+ *
+ *     const u32 A = A;                          -> HUNG the compiler (never returned)
+ *     const u32 A = B + 1; const u32 B = A + 1; -> SIGSEGV
+ *
+ * `eval_const_expr_ex` has always had a `depth > 256` bound. It never applied, because
+ * the IDENT arm called this resolver with no depth and this resolver restarted the
+ * evaluator at 0 — the bound was RESET OUT OF EFFECT on every identifier hop. That is
+ * the same fail-open shape as a walk that returns "safe" past its cap: the guard is
+ * present, and structurally cannot fire.
+ *
+ * So the fix is two things, and both are needed. Threading `depth` makes the existing
+ * bound real (it stops a long NON-cyclic chain, which is not an error of the same
+ * kind). The name stack detects an actual CYCLE, which no depth bound can name
+ * correctly. */
+static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len,
+                                   int depth) {
     Checker *c = (Checker *)ctx;
     Symbol *sym = scope_lookup(c->current_scope, name, name_len);
     if (!sym) sym = scope_lookup(c->global_scope, name, name_len);
@@ -5831,7 +5855,32 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
         Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
                       sym->func_node->kind == NODE_GLOBAL_VAR)
                      ? sym->func_node->var_decl.init : NULL;
-        if (init) return eval_const_expr_ex(init, 0, resolve_const_ident, ctx);
+        if (init) {
+            for (int i = 0; i < _cident_depth; i++) {
+                if (_cident_len[i] == name_len &&
+                    memcmp(_cident_name[i], name, name_len) == 0) {
+                    checker_error(c, sym->line,
+                        "const '%.*s' has a cyclic initializer — it is defined in terms "
+                        "of itself, so there is no value to compute",
+                        (int)name_len, name);
+                    return CONST_EVAL_FAIL;
+                }
+            }
+            if (_cident_depth >= CONST_CHAIN_MAX) {
+                checker_error(c, sym->line,
+                    "const '%.*s' initializer chains through more than %d other "
+                    "constants — fold the chain, or give it a literal value",
+                    (int)name_len, name, CONST_CHAIN_MAX);
+                return CONST_EVAL_FAIL;
+            }
+            _cident_name[_cident_depth] = name;
+            _cident_len[_cident_depth]  = name_len;
+            _cident_depth++;
+            /* `depth`, NOT 0 — that reset is what made the bound useless. */
+            int64_t v = eval_const_expr_ex(init, depth, resolve_const_ident, ctx);
+            _cident_depth--;
+            return v;
+        }
     }
     return CONST_EVAL_FAIL;
 }

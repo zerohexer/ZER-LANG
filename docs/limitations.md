@@ -917,7 +917,7 @@ Tripwire: none yet — write the negative in the same commit as the fix.
 
 ---
 
-## OPEN — BRANCH `loving-davinci-r3an9y` (2026-09-04): 12 holes, 35 live negatives
+## ~~OPEN~~ CLOSED — BRANCH `loving-davinci-r3an9y` (2026-09-04): all 9 surveyed items fixed 2026-09-08..10; 3 unverified residuals remain
 
 Surveyed 2026-09-04, measured against main at `225a5b9d`. A DIFFERENT branch family
 from the `vigilant-tesla-*` set above, but it forked at the SAME base (`c8e58304`),
@@ -1295,7 +1295,42 @@ shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
     void w(u32 v) { a.x = v; }
     u32 main() { spawn w(a.x + b.y); return 0; }
 
-**I. Bare `orelse return` in a non-null-pointer or funcptr function (their BUG-918).**
+**I. ~~Bare `orelse return` in a non-null-pointer or funcptr function (their
+BUG-918)~~ — CLOSED 2026-09-10 as BUG-974. THE LAST ITEM IN THIS SURVEY.** DO NOT REDO.
+
+`orelse return` is bare by design — "no value; the return value comes from the function's
+return type". The emitter's fallback for a valueless return was `return 0;` for EVERY
+non-optional type, which is THREE different answers collapsed into one, and two were
+wrong:
+
+| return type | `return 0;` | correct |
+|---|---|---|
+| integer / bool / float | 0 is the zero | already right |
+| slice / struct / union | not a value of that type — GCC refused it, so VALID ZER did not compile | `(T){0}` |
+| `*T` / funcptr | a NULL of a type that promises non-null | REJECT: there is no zero |
+
+**Both directions of the same defect.** The pointer half is accept-unsafe (the caller
+dereferences NULL — a fault when hosted, a read of address 0 on bare metal); the
+aggregate half is an over-rejection so complete the program would not build, and the
+diagnostic came from GCC rather than from ZER, which is the worst place for it.
+
+**Why the orelse spelling escaped:** a PLAIN bare `return;` in such a function was
+already rejected ("function must return '*T', not void"). The orelse fallback is a FLAG,
+so it reaches no NODE_RETURN handler — precisely the reason the `defer` / `@critical`
+bans had to be repeated for it, in a comment sitting a few lines above where this check
+now goes. One flag, three checks the statement form gets for free.
+
+`?*T` is untouched and stays legal: its zero IS the null sentinel, which is the None the
+propagation intends.
+
+Gated by **SHAPE p24 in `tools/sink_matrix.sh`** (return-type axis, 3 reject + 4
+boundary). Verified to FIRE: against the pre-fix build the two pointer cells report HOLE
+AND the slice/struct cells report OVER-REJECT — one grid capturing both directions.
+
+**Note on writing that boundary:** the first `?*T` cell called the function and bound the
+result, which zercheck's ownership model reports as a leak — a pre-existing rejection on
+BOTH builds, unrelated to this rule. A boundary cell must isolate the rule under test, or
+it measures something else.
 Returned NULL as a non-null pointer, and produced a GCC error for slice/struct
 returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
@@ -1315,7 +1350,12 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
 BUG-969) → ~~D~~ (DONE, BUG-970) → ~~E~~ (DONE, BUG-971) → ~~B~~ (DONE, BUG-972) →
-~~H~~ (DONE, BUG-973) → **I** (the last one).
+~~H~~ (DONE, BUG-973) → ~~I~~ (DONE, BUG-974).
+
+**ALL NINE ITEMS IN THIS SURVEY ARE NOW CLOSED** (A=BUG-930, C=967, G=968, F=969, D=970,
+E=971, B=972, H=973, I=974). What remains from this branch is only its three unverified
+residuals listed below (BUG-913 / 921 / 923), which have no live negative here and must
+be measured before adoption, plus A's consumer-side `enum_nonvariant_trap` residual.
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

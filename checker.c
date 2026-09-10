@@ -10722,6 +10722,34 @@ static Type *check_expr(Checker *c, Node *node) {
                     "cannot use 'orelse return' inside @critical block — interrupts would not be re-enabled");
             }
         }
+        /* BUG-974: a bare `orelse return` returns the function's ZERO value — that is
+         * the documented semantics ("no value; the return value comes from the
+         * function's return type"). Some types HAVE no zero: `*T` is non-null BY
+         * DEFINITION, and so is a funcptr. The emitter's fallback for a valueless
+         * return is `return 0;`, so both produced a NULL of a type that promises
+         * non-null, and the caller dereferenced it — a memory fault when hosted, a
+         * read of address 0 on bare metal.
+         *
+         * A PLAIN bare `return;` in such a function was already rejected ("function
+         * must return '*T', not void"). This is the same question at the orelse
+         * spelling, which reaches no NODE_RETURN handler — the very reason given in
+         * the comment above for why the defer/@critical bans had to be repeated here.
+         * One flag, three checks that the statement form gets for free.
+         *
+         * `?*T` is fine and stays: its zero IS the null sentinel, which is the None
+         * the propagation intends. */
+        if (node->orelse.fallback_is_return && c->current_func_ret) {
+            TypeKind rk = type_dispatch_kind(c->current_func_ret);
+            if (rk == TYPE_POINTER || rk == TYPE_FUNC_PTR) {
+                checker_error(c, node->loc.line,
+                    "bare 'orelse return' in a function returning non-null '%s' — the "
+                    "value it would return is the type's zero, and the zero of a "
+                    "non-null pointer is the NULL the type forbids. Return an explicit "
+                    "value ('orelse return <expr>' is not a thing; use `if (x) |v| { … }` "
+                    "and return something), or make the return type optional ('?%s')",
+                    type_name(c->current_func_ret), type_name(c->current_func_ret));
+            }
+        }
         if (node->orelse.fallback_is_break &&
             zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
                                           c->in_loop ? 1 : 0) == 0) {

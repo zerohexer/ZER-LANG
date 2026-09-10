@@ -223,6 +223,24 @@ static void emit_return_null(Emitter *e) {
         emit(e, "return ");
         emit_opt_null_literal(e, ret);
         emit(e, "; ");
+    } else if (type_dispatch_kind(eff) == TYPE_SLICE ||
+               type_dispatch_kind(eff) == TYPE_STRUCT ||
+               type_dispatch_kind(eff) == TYPE_UNION ||
+               type_dispatch_kind(eff) == TYPE_ARRAY) {
+        /* BUG-974: `return 0;` is not a value of an aggregate type — GCC refused it
+         * ("incompatible types when returning type 'int'"), so a bare `orelse return`
+         * in a function returning a SLICE or a STRUCT failed to compile at all. Valid
+         * ZER, rejected by the C compiler rather than by ZER, which is the worst place
+         * for a diagnostic to come from.
+         *
+         * The zero of these types EXISTS and is well defined — an empty slice, a zeroed
+         * struct — so emit it as a compound literal. That is the same "the return value
+         * comes from the function's return type" rule the integer case already follows;
+         * only the SPELLING of zero differs. Contrast the non-null pointer and funcptr
+         * cases, which have no zero at all and are rejected in the checker. */
+        emit(e, "return (");
+        emit_type(e, eff);
+        emit(e, "){0}; ");
     } else {
         emit(e, "return 0; ");
     }

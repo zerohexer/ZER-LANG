@@ -1,6 +1,21 @@
 // Rust pattern: dangling pointer through orelse fallback.
 // ZER: orelse &local = scope escape error.
 // EXPECTED: compile error
+// expect-error: cannot return pointer to local
+//
+// 2026-09-10 (BUG-974): this test did NOT test what it says, and had not for a long
+// time. Its body was `*Sensor s = ms orelse return;` — no `&local` anywhere, and
+// `local` was declared, assigned, and never used. It was rejected by the LEAK rule
+// ("handle 's' allocated but never freed"), so it passed for a reason unrelated to
+// its subject; the header's claim about scope escape was never exercised.
+//
+// Found because BUG-974's new rule began rejecting it FIRST — a masking that only
+// showed up because the corpus-cost measurement listed every file the new diagnostic
+// touched, and this one was not one of the two intended negatives.
+//
+// Restored to the stated subject: the orelse FALLBACK hands back `&local`, and the
+// function returns it. `// expect-error:` added so the reason is pinned and it cannot
+// drift again.
 
 struct Sensor { u32 reading; }
 
@@ -12,7 +27,7 @@ struct Sensor { u32 reading; }
     Sensor local;
     local.reading = 0;
     ?*Sensor ms = get_sensor();
-    *Sensor s = ms orelse return;
+    *Sensor s = ms orelse &local;   // dangling: `local` dies at the return
     return s;
 }
 

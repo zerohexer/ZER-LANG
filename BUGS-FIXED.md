@@ -5,6 +5,90 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-10 — BUG-974: the zero of a bare `orelse return` was `0` for every type
+
+`orelse return` is bare by design — "no value; the return value comes from the function's
+return type". `emit_return_null`'s fallback was `return 0;` for EVERY non-optional type.
+That is three different answers collapsed into one, and two of them were wrong.
+
+| return type | what was emitted | correct |
+|---|---|---|
+| integer / bool / float | `return 0;` | already right |
+| slice / struct / union | `return 0;` — GCC: *"incompatible types when returning type 'int'"* | `(T){0}` |
+| `*T` / funcptr | `return 0;` — a NULL of a type that promises non-null | REJECT: there is no zero |
+
+### Both directions of one defect
+
+The pointer half is ACCEPT-UNSAFE: the caller dereferences NULL — a memory fault when
+hosted, a read of address 0 on bare metal.
+
+The aggregate half is an OVER-REJECTION so complete the program would not build at all,
+and the diagnostic came from GCC rather than from ZER. That is the worst place for a
+diagnostic to come from: it names a C type the author never wrote, in a file they did not
+write, about a construct the language documents as legal.
+
+### Why the orelse spelling escaped
+
+A PLAIN bare `return;` in such a function was already rejected — *"function must return
+'*T', not void"*. The orelse fallback is a FLAG, so it reaches no NODE_RETURN handler.
+
+That is exactly the reason given, in a comment a few lines above where this check now
+goes, for why the `defer` and `@critical` bans had to be repeated for orelse:
+
+> "the NODE_RETURN/NODE_BREAK/NODE_CONTINUE handlers enforce these bans, but orelse
+> fallback is a flag — those handlers never run. Without these explicit checks, the bans
+> are silent."
+
+Three checks the statement form gets for free, and the third was still missing. Worth
+generalising: when a construct is modelled as a FLAG on another node rather than as its
+own node kind, every rule the real node carries has to be re-stated, and the list is easy
+to leave incomplete.
+
+`?*T` is untouched and stays legal — its zero IS the null sentinel, which is the None the
+propagation intends.
+
+### Gate
+
+**SHAPE p24 in `tools/sink_matrix.sh`** — return-type axis, 3 reject + 4 boundary.
+Verified to FIRE, and it captures BOTH directions in one grid: against the pre-fix build
+the two pointer cells report HOLE while the slice and struct cells report OVER-REJECT.
+
+**Note on writing the boundary:** the first `?*T` cell called the function and bound its
+result, which zercheck's ownership model reports as a leak — a pre-existing rejection on
+BOTH builds, unrelated to this rule. It looked like my change over-rejecting. A boundary
+cell has to isolate the rule under test or it measures something else entirely.
+
+### The corpus-cost measurement earned its keep twice
+
+Run AFTER shipping the rule rather than before, which is the wrong order — CLAUDE.md says
+to measure an over-rejection's corpus cost first. `make check` found the first hit anyway,
+but the second would have been invisible.
+
+**A genuine latent NULL-deref, caught in the corpus.**
+`rust_tests/rt_test_400_full_lifecycle.zer` declared
+
+```zer
+*Sensor create_sensor(u32 reading, u32 cal) {   // NON-NULL
+    ?*Sensor ms = heap.alloc_ptr();
+    *Sensor s = ms orelse return;               // returns NULL on alloc failure
+```
+
+and `main` then freed that pointer, `@ptrcast`'d it, and read `.reading` through it —
+three NULL accesses on the allocation-failure path. The test was unsound ZER, not a
+casualty of the rule; corrected to return `?*Sensor`, which is what it always was.
+
+**A vacuous test, exposed by the same list.** `rust_tests/rt_scope_escape_orelse.zer`
+says it tests "orelse &local = scope escape error". Its body contained no `&local` at
+all — `local` was declared, assigned and never used — and it was rejected by the LEAK
+rule, so it had been passing for an unrelated reason. It only surfaced because the
+corpus scan listed every file the new diagnostic touched and this one was not among the
+two intended negatives. Restored to its stated subject, with an `// expect-error:` so
+the reason is pinned.
+
+Neither would have been found by "the suite is green".
+
+---
+
 ## Session 2026-09-10 — BUG-973: a spawn argument read the second shared struct unlocked
 
 ZER's shared structs are auto-locked, and the emitter takes ONE lock per statement — which

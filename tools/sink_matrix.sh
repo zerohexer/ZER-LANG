@@ -462,6 +462,44 @@ cell p23_safe_per_arg  compile 'shared struct A23d{u32 x;} shared struct B23d{u3
 cell p23_safe_one_type compile 'shared struct A23e{u32 x;u32 z;} A23e a23e; void w23e(u32 v){a23e.x=v;} u32 main(){ a23e.x=1; a23e.z=2; ThreadHandle t=spawn w23e(a23e.x + a23e.z); t.join(); return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p24 (BUG-974): THE ZERO OF A BARE `orelse return` — the RETURN-TYPE axis.
+#
+# `orelse return` is bare by design: "no value; the return value comes from the
+# function's return type". The emitter's fallback for a valueless return was
+# `return 0;` for EVERY non-optional type, which is three different answers collapsed
+# into one, and two of them are wrong:
+#
+#   integer / bool / float : 0 is the zero.                        correct
+#   slice / struct / union : `return 0;` is not a value of that type — GCC refused it
+#                            ("incompatible types when returning type 'int'"), so
+#                            VALID ZER failed to compile. Now `(T){0}`.
+#   *T / funcptr           : the type is non-null BY DEFINITION, so it has NO zero.
+#                            `return 0;` handed the caller a NULL of a type that
+#                            promises non-null. Rejected in the checker.
+#
+# A PLAIN bare `return;` in such a function was already rejected ("function must
+# return '*T', not void"). The orelse spelling reaches no NODE_RETURN handler — the
+# same reason the defer / @critical bans had to be repeated for it — so the axis here
+# is the RETURN TYPE, crossed against both spellings.
+echo "===== SHAPE p24 = the zero of a bare orelse return (return-type axis) ====="
+cell p24_nonnull_ptr    reject 'struct T24{u32 v;} *T24 pk24(?*T24 o){ *T24 t=o orelse return; return t; } u32 main(){ return 0; }'
+cell p24_funcptr        reject 'u32 db24(u32 x){return x*2;} *(u32) -> u32 pk24b(?u32 o){ u32 v=o orelse return; return db24; } u32 main(){ return 0; }'
+cell p24_plain_bare_ptr reject 'struct T24c{u32 v;} *T24c pk24c(bool c){ if (c) { return; } T24c t; return &t; } u32 main(){ return 0; }'
+# BOUNDARY: the types whose zero EXISTS must keep working, and the value must be the
+# real zero — an EMPTY slice and a ZEROED struct, not whatever `return 0` compiled to.
+# The slice/struct cells did not compile at all before this fix.
+cell p24_safe_slice     compile '[*]u8 pk24d(?[*]u8 o){ [*]u8 s=o orelse return; return s; } u32 main(){ ?[*]u8 n=null; [*]u8 r=pk24d(n); if (r.len!=0) { return 1; } return 0; }'
+cell p24_safe_struct    compile 'struct P24{u32 x;} P24 pk24e(?u32 o){ u32 v=o orelse return; P24 p; p.x=v; return p; } u32 main(){ ?u32 n=null; P24 r=pk24e(n); if (r.x!=0) { return 1; } return 0; }'
+cell p24_safe_int       compile 'u32 pk24f(?u32 o){ u32 v=o orelse return; return v; } u32 main(){ ?u32 n=null; if (pk24f(n)!=0) { return 1; } ?u32 s=7; if (pk24f(s)!=7) { return 2; } return 0; }'
+# The ?*T arm is the one the checker rule must NOT fire on: the null sentinel IS its
+# zero, which is exactly the None the propagation intends. Written WITHOUT calling the
+# function, because binding a pointer-returning call's result makes zercheck's ownership
+# model report a leak — a pre-existing rejection on both builds, unrelated to this rule,
+# which is what a first draft of this cell measured.
+cell p24_safe_opt_ptr   compile 'struct T24g{u32 v;} ?*T24g pk24g(?*T24g o){ *T24g t=o orelse return; return t; } u32 main(){ return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

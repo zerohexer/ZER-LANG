@@ -30,10 +30,17 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 97 LIVE holes, grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 102 LIVE holes, grouped, with the branch to take each from
 
-**START HERE.** Measured, not read: every negative below was run against main at `7b40d8e6`
-and main COMPILED IT CLEAN. Nothing here needs re-deriving; pick a class and go.
+**START HERE.** Measured, not read. Two passes, because one is not enough:
+
+1. **main COMPILES IT CLEAN** — unambiguously a hole. 97 of these.
+2. **main rejects it, but for a DIFFERENT reason than the test's own `// expect-error:`** —
+   a MASKED hole, still open. 5 more, listed under "masked" below. The other 10 that looked
+   masked are only WORDING differences on rules main already has (BUG-967/970/971/972) and
+   are genuinely closed — do not chase them.
+
+Nothing here needs re-deriving; pick a class and go.
 
 Fetch any reproducer without checking out:
 
@@ -54,16 +61,20 @@ findings. Renumber on adoption.
 
 **MOST OF WHAT THESE BRANCHES DID IS ALREADY IN MAIN.** `vgonmt` and `qo0mm9` each
 independently redid refactor L; `vgonmt` also redid refactor M; three of them redid the
-r3an9y class set. Of 165 distinct negatives, 31 already exist in main and 37 more are
-already rejected. Do not re-harvest those — the 97 below are what is left.
+r3an9y class set. Of 165 distinct negatives: 31 already exist in main, 22 are rejected for
+the right reason, 10 are rejected with different WORDING for a rule main already has. Do
+not re-harvest those 63 — the 102 below are what is left.
 
-### 🔴 FIRST: a compiler SEGFAULT (`qo0mm9`, `vgonmt` — `global_init_cycle_mutual`)
+### 🔴 FIRST: TWO compiler-availability bugs, both from a const-init cycle (`qo0mm9`, `vgonmt`)
 
-    const u32 A = B + 1;
-    const u32 B = A + 1;
-    u32 main() { return A; }
+    const u32 A = A;                        // global_init_cycle_self  -> HANGS (never returns)
+    const u32 A = B + 1; const u32 B = A+1; // global_init_cycle_mutual -> SIGSEGV
 
-Six lines, SIGSEGV. Highest severity in the set.
+Two and three lines. The branch names the cause, and it is worth reading before fixing:
+`resolve_const_ident` handed `eval_const_expr_ex` **a fresh depth of 0 on every identifier
+hop**, so the evaluator's own bound never saw the chain. That is the SAME fail-open shape
+as class 1 below — a bound that exists but is reset out of effect — so fix it with class 1
+in mind rather than as a one-off.
 
 ### The 97, by class — and which branch to take
 
@@ -134,6 +145,21 @@ An allocation stored into a field, index or slot loses tracking.
 - asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
   **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
   these are its reproducers.
+
+### MASKED — main rejects these, but for the WRONG reason, so the hole is still open (3)
+
+Found by re-running the "already rejected" bucket against each test's own `expect-error`.
+A rejection is not a closure until the REASON matches.
+
+- `mmio_const_ident_oob_index` (`qo0mm9`, `vgonmt`) — wants *"MMIO index 9 is out of range"*,
+  gets *"cannot index volatile '*u32'"*. A different rule fires first; the MMIO range check
+  is never reached. Pairs with `mmio_const_ident_oob_addr` / `_misaligned` in class 10.
+- `opt_param_drop_then_caller_uaf` (`3sdup9`) — wants *"use after free"*, gets a LEAK report.
+- `opt_param_other_optional_null_path_maybe` (`3sdup9`) — wants *"may not be freed on all
+  paths"*, gets a leak report at a different line.
+
+Both `opt_param_*` belong with class 9 (optional-param drop), which already has two live
+siblings — likely one fix.
 
 ### limitations.md entries worth taking (deduped against main's own)
 

@@ -30,6 +30,136 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 97 LIVE holes, grouped, with the branch to take each from
+
+**START HERE.** Measured, not read: every negative below was run against main at `7b40d8e6`
+and main COMPILED IT CLEAN. Nothing here needs re-deriving; pick a class and go.
+
+Fetch any reproducer without checking out:
+
+    git show origin/claude/loving-davinci-<branch>:tests/zer_fail/<name>.zer
+
+### Fork points — this decides everything else
+
+| branch | forked at | date | commits | live holes |
+|---|---|---|---|---|
+| `v6o9c5` | `da45edd6` (BUG-974) | 09-10 | 1 | 15 |
+| `3sdup9` | `efee9006` (BUG-971) | 09-09 | 4 | 23 |
+| `qo0mm9` | `f60a803d` | 09-08 | 8 | 28 (22 shared with vgonmt) |
+| `ppnatu` | `70c81001` | 09-07 | 1 | 2 |
+| `vgonmt` | `aeea0cd5` | 09-06 | 26 | 51 (22 shared with qo0mm9) |
+
+**BUG NUMBERS COLLIDE** with main and with each other — they run to BUG-1003 for different
+findings. Renumber on adoption.
+
+**MOST OF WHAT THESE BRANCHES DID IS ALREADY IN MAIN.** `vgonmt` and `qo0mm9` each
+independently redid refactor L; `vgonmt` also redid refactor M; three of them redid the
+r3an9y class set. Of 165 distinct negatives, 31 already exist in main and 37 more are
+already rejected. Do not re-harvest those — the 97 below are what is left.
+
+### 🔴 FIRST: a compiler SEGFAULT (`qo0mm9`, `vgonmt` — `global_init_cycle_mutual`)
+
+    const u32 A = B + 1;
+    const u32 B = A + 1;
+    u32 main() { return A; }
+
+Six lines, SIGSEGV. Highest severity in the set.
+
+### The 97, by class — and which branch to take
+
+**1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers, the biggest systemic class.**
+A depth guard returns "safe" instead of "unknown" past its limit, so nesting deeper than
+the cap silently passes. **TAKE `v6o9c5`'s fix** (forked newest, and its commit states the
+principle: bounded walks must round TOWARD REJECT) **plus `3sdup9`'s OPEN entry**
+"depth-guard ledger: which walkers still FAIL OPEN past their cap", which enumerates the
+remaining walkers.
+`v6o9c5` (11): `escape_call_launder_10_deep` `escape_orelse_chain_11_deep` `arena_copy_11_deep`
+`isr_rmw_14_deep_expr` `spawn_rmw_14_deep_expr` `spawn_rmw_alias_17th` `spawn_static_local_33rd`
+`spawn_carrier_34_deep` `leak_handle_34_structs_deep` `isr_call_chain_35_deep` `spawn_call_chain_35_deep`
+`3sdup9` (6): `deep_nest_arena_copy_fails_closed` `deep_nest_spawn_carrier_fails_closed`
+`atomic_plain_callee_10deep` `atomic_plain_callee_20deep_unanalyzed` `isr_deep_chain_unanalyzed`
+`spawn_race_deep_chain_unanalyzed`
+
+**2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling. TAKE `3sdup9`.**
+An allocation stored into a field, index or slot loses tracking.
+`alloc_field_bare_spelling_uaf` `_leak` `_overwrite` `alloc_index_bare_spelling_uaf`
+`alloc_global_field_bare_spelling_dangling` `alloc_struct_value_into_slot_uaf`
+`alloc_nested_init_uaf` `alloc_nested_init_orelse_uaf` `slot_copy_alias_uaf` `slot_copy_alias_global_uaf`
+
+**3. `shared(rw)` RE-ENTRANCY — 6, data race. TAKE `vgonmt` (only branch with it).**
+`shared_rw_reentrant_call_write` `_two_hop` `_via_pointer` `_read_then_write`
+`shared_rw_reentrant_funcptr_call` `shared_rw_funcptr_field_call`
+
+**4. LOOP COUNTER PAST END — 7, bounds. TAKE `vgonmt`.**
+`loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
+`_dowhile_past_end` `dowhile_counter_past_end_bug748`
+
+**5. FORGING DOORS — 11. TAKE `qo0mm9`** (forked 2 days later than `vgonmt`; both have these
+22 shared cells, compare per item at adoption).
+`@pun` (4): `pun_forge_enum` `_slice` `_funcptr` `_pointer`
+`@inttoptr` → enum (2): `inttoptr_enum_target` `inttoptr_enum_in_struct`
+`@container` (5): `container_whole_object` `_alias` `_direct` `_global` `container_array_element`
+
+**6. ATOMIC CELL x SCOPED SPAWN — 3, race window. TAKE `vgonmt`.**
+`atomic_cell_scoped_spawn_window` `_via_helper` `_two_threads`
+
+**7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4, escape. TAKE `qo0mm9`** (has the 4th).
+`ptrtoint_local_via_call_alias` `_global` `_return` `_ptr_param`
+
+**8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
+`spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
+
+**9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7. TAKE `3sdup9`.**
+`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
+`global_projection_reunwrap_uaf` `global_projection_free_then_read`
+`opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
+`union_capture_free_then_reread_uaf`
+
+**10. SMALLER CLASSES**
+- i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
+- `bool` minting via `@ptrcast`/`@inttoptr` (2) — `vgonmt`: `bool_mint_ptrcast` `bool_mint_inttoptr`
+- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s `mmio_volatile_index_reject`
+- global init (2) — `qo0mm9`: `global_init_from_mutable` `global_init_chain_too_deep`
+- multiview UAF (2) — `vgonmt`: `multiview_assign_uaf` `multiview_branch_join_uaf`
+- struct-init field (2) — `vgonmt`: `struct_init_field_uaf` `struct_init_field_move`
+- compound float↔int (2) — TAKE `vgonmt`: `compound_float_into_int` `compound_int_into_float`; `qo0mm9`'s single is `compound_assign_int_float`
+- RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init`
+- `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target`
+- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding`
+- ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements`
+- param-local double free (1) — `vgonmt`: `param_local0_double_free`
+- spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown`
+- defer body with a label (1) — `qo0mm9`: `defer_body_label` (**relevant to main's own label-path
+  split, BUG-965 — check whether it is the same shape before fixing**)
+- asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
+  **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
+  these are its reproducers.
+
+### limitations.md entries worth taking (deduped against main's own)
+
+- `3sdup9`: the **depth-guard ledger** (pairs with class 1); "a callee freeing an optional field
+  through the IF-CAPTURE form stays MAYBE"; "freeing a UNION variant through its POINTER capture
+  `|*q|` is a false leak" — both OVER-rejections
+- `ppnatu`: "Arena methods through a POINTER or a STRUCT FIELD are not supported"; "ISR-vs-main
+  tracking counts a helper as 'main' even when only the ISR calls it"
+- `qo0mm9` / `vgonmt`: "`@inttoptr` to a pointer-carrying <type>"; the unverified-audit-lead lists
+  ("2026-09-02 audit", "`pstdqk` audit leads") — leads, NOT findings; measure before believing
+- **STALE, do not take:** the `BRANCH loving-davinci-r3an9y` entries in `3sdup9` / `ppnatu`, and
+  `ppnatu`'s "scoped-spawn borrow RESIDUALS after BUG-969". That survey is CLOSED in main
+  (BUG-967..974).
+
+### `ppnatu` is superseded
+
+One commit, 2 live holes, both duplicated elsewhere. Harvest `mmio_volatile_index_reject` and the
+asm reproducer; skip the rest.
+
+### Suggested order
+
+Segfault → class 1 (systemic, 17 reproducers) → classes 3 and 6 (data races) → class 2 (UAF/leak)
+→ class 5 (forging doors) → the rest.
+
+---
+
 ## OPEN — BRANCH `loving-davinci-ii7a90` (2026-09-06): ALL 12 ITEMS CLOSED; 2 refactors + 2 relaxations REMAIN
 
 **STATUS 2026-09-06: items A–K AND both relaxations N / O are CLOSED** (BUG-934..949).

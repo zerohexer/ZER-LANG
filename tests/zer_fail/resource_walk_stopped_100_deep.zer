@@ -1,0 +1,116 @@
+// EXPECTED: compile error
+// expect-error: nests deeper than the resource walk follows
+// BUG-977: an OVER-REJECTION, pinned on purpose. `H100 b = a;` on a plain struct is a
+// valid copy; the resource walk gives up at 64 and rounds toward reject (BUG-976), so
+// it is refused. What changed here is only the SENTENCE: BUG-976 returned the literal
+// name "resource" past the cap, so the diagnostic told the author to "declare it where
+// both sides can see it — conventionally a global" about a struct that carries no
+// resource at all. The verdict was right and the explanation was fiction. See
+// docs/limitations.md.
+//
+// This file and deep_nest_arena_copy_fails_closed.zer now get the SAME message, and
+// that is the honest outcome rather than a defect: one carries an Arena past the cap
+// and one carries nothing, and the walk stops before it can tell them apart. A message
+// that distinguished them would be claiming knowledge the compiler does not have.
+struct H0 { u32 v; }
+struct H1 { H0 in; }
+struct H2 { H1 in; }
+struct H3 { H2 in; }
+struct H4 { H3 in; }
+struct H5 { H4 in; }
+struct H6 { H5 in; }
+struct H7 { H6 in; }
+struct H8 { H7 in; }
+struct H9 { H8 in; }
+struct H10 { H9 in; }
+struct H11 { H10 in; }
+struct H12 { H11 in; }
+struct H13 { H12 in; }
+struct H14 { H13 in; }
+struct H15 { H14 in; }
+struct H16 { H15 in; }
+struct H17 { H16 in; }
+struct H18 { H17 in; }
+struct H19 { H18 in; }
+struct H20 { H19 in; }
+struct H21 { H20 in; }
+struct H22 { H21 in; }
+struct H23 { H22 in; }
+struct H24 { H23 in; }
+struct H25 { H24 in; }
+struct H26 { H25 in; }
+struct H27 { H26 in; }
+struct H28 { H27 in; }
+struct H29 { H28 in; }
+struct H30 { H29 in; }
+struct H31 { H30 in; }
+struct H32 { H31 in; }
+struct H33 { H32 in; }
+struct H34 { H33 in; }
+struct H35 { H34 in; }
+struct H36 { H35 in; }
+struct H37 { H36 in; }
+struct H38 { H37 in; }
+struct H39 { H38 in; }
+struct H40 { H39 in; }
+struct H41 { H40 in; }
+struct H42 { H41 in; }
+struct H43 { H42 in; }
+struct H44 { H43 in; }
+struct H45 { H44 in; }
+struct H46 { H45 in; }
+struct H47 { H46 in; }
+struct H48 { H47 in; }
+struct H49 { H48 in; }
+struct H50 { H49 in; }
+struct H51 { H50 in; }
+struct H52 { H51 in; }
+struct H53 { H52 in; }
+struct H54 { H53 in; }
+struct H55 { H54 in; }
+struct H56 { H55 in; }
+struct H57 { H56 in; }
+struct H58 { H57 in; }
+struct H59 { H58 in; }
+struct H60 { H59 in; }
+struct H61 { H60 in; }
+struct H62 { H61 in; }
+struct H63 { H62 in; }
+struct H64 { H63 in; }
+struct H65 { H64 in; }
+struct H66 { H65 in; }
+struct H67 { H66 in; }
+struct H68 { H67 in; }
+struct H69 { H68 in; }
+struct H70 { H69 in; }
+struct H71 { H70 in; }
+struct H72 { H71 in; }
+struct H73 { H72 in; }
+struct H74 { H73 in; }
+struct H75 { H74 in; }
+struct H76 { H75 in; }
+struct H77 { H76 in; }
+struct H78 { H77 in; }
+struct H79 { H78 in; }
+struct H80 { H79 in; }
+struct H81 { H80 in; }
+struct H82 { H81 in; }
+struct H83 { H82 in; }
+struct H84 { H83 in; }
+struct H85 { H84 in; }
+struct H86 { H85 in; }
+struct H87 { H86 in; }
+struct H88 { H87 in; }
+struct H89 { H88 in; }
+struct H90 { H89 in; }
+struct H91 { H90 in; }
+struct H92 { H91 in; }
+struct H93 { H92 in; }
+struct H94 { H93 in; }
+struct H95 { H94 in; }
+struct H96 { H95 in; }
+struct H97 { H96 in; }
+struct H98 { H97 in; }
+struct H99 { H98 in; }
+struct H100 { H99 in; }
+u32 main() { H100 a; H100 b = a; return b.in.v + a.in.v; }

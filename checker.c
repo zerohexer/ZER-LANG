@@ -1493,6 +1493,15 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  * the wrapper-hides-the-inner-kind class this codebase already gates elsewhere.
  *
  * Returns the spelling for the diagnostic, or NULL. */
+/* BUG-977: the name returned past the cap is a SENTINEL, compared by POINTER (same
+ * device as `_ir_pool_mixed`). BUG-976 returned the literal "resource" here, which
+ * reads in the diagnostic as if it were a resource type's actual name — measured on a
+ * 100-deep by-value struct nest, which is not a resource at all and was told to
+ * "declare it where both sides can see it, conventionally a global". The verdict
+ * (reject) is right; the SENTENCE was wrong, and a wrong diagnostic is worse than the
+ * permissive answer it replaced. The reporter now says what actually happened. */
+static const char _res_walk_stopped[] = "<walk stopped>";
+
 static const char *unique_resource_name(Type *t, int depth) {
     /* BUG-976: MY OWN fail-open cap, written in BUG-970 three days ago. NULL means
      * "not a resource", i.e. ACCEPT the copy — so a struct nesting an Arena 9 deep
@@ -1506,7 +1515,7 @@ static const char *unique_resource_name(Type *t, int depth) {
      * are not alternatives: the cap has to be past anything real, so that reaching it
      * is genuinely pathological, and only THEN does rounding toward reject cost
      * nothing. */
-    if (depth > 64) return "resource";
+    if (depth > 64) return _res_walk_stopped;
     if (!t) return NULL;
     Type *e = type_unwrap_distinct(t);
     if (!e) return NULL;
@@ -1594,6 +1603,16 @@ static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
      * `*Arena` / `*Pool` / `*Slab` / `*Ring` do NOT — `a.alloc(T)` on a pointer is
      * "cannot access field 'alloc'". Those four are addressed BY NAME and are
      * conventionally global, which is how the whole corpus uses them. */
+    if (rn == _res_walk_stopped) {
+        checker_error(c, line,
+            "cannot %s this value — the type nests deeper than the resource walk "
+            "follows (64), so the compiler cannot establish whether it carries a "
+            "Pool / Slab / Ring / Arena / Barrier / Semaphore, and copying one of "
+            "those silently creates a second owner of one buffer. Flatten the type "
+            "or bind through a pointer",
+            what);
+        return true;
+    }
     bool ptr_ok = (rn[0] == 'B' || rn[0] == 'S');   /* Barrier, Semaphore */
     if (rn[0] == 'S' && rn[1] == 'l') ptr_ok = false;   /* Slab, not Semaphore */
     if (ptr_ok)
@@ -3553,14 +3572,41 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
  * sink that peels to the primary silently drops the fallback. Both directions were
  * live: `g = t orelse &g_dummy` (primary local) and `g = mk() orelse &loc.f`
  * (fallback local) each compiled. */
-static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth) {
-    if (!v || depth > 8) return NULL;
+/* BUG-978: the walk's ONLY recursion is through the two arms of an `orelse`, so
+ * `depth` is exactly the orelse nesting depth — and a cap of 8 was FAR below what a
+ * program can spell. NULL is the ACCEPT direction ("nothing frame-bound in here"),
+ * so a chain 9 deep ending in `&local` was stored into a global and compiled clean
+ * (`tests/zer_fail/escape_orelse_chain_11_deep.zer`).
+ *
+ * Unlike the eleven booleans BUG-976 flipped, this one cannot simply return the
+ * other value: the caller USES the returned Symbol to name the offending local in
+ * the diagnostic, and past the cap there is no Symbol to name. So this is the
+ * REPORT remedy, the same one BUG-976 applied to the spawn / ISR race scans: the
+ * walk now says it STOPPED, and the caller reports the refusal naming the
+ * DESTINATION (which it always has) instead of the source.
+ *
+ * MEASURED first, per the BUG-976 rule that a generous cap and a conservative
+ * answer are not alternatives. The reachable window is depth 9..95: past that the
+ * program is refused anyway, loudly and for an unrelated reason — a parenthesised
+ * chain hits the parser's "expression nesting too deep (limit 256)" at 84, and a
+ * flat one hits zercheck's "did not converge within 96 iterations" at 96. So a cap
+ * of 256 covers everything spellable today, and the report covers the rest if
+ * either of those limits ever moves. */
+#define ESCAPE_ORELSE_WALK_MAX 256
+
+static Symbol *value_frame_bound_symbol(Checker *c, Node *v, int depth,
+                                        bool *gave_up) {
+    if (!v) return NULL;
+    if (depth > ESCAPE_ORELSE_WALK_MAX) {
+        if (gave_up) *gave_up = true;
+        return NULL;
+    }
     v = unwrap_ptr_launder(v);
     if (!v) return NULL;
     if (v->kind == NODE_ORELSE) {
-        Symbol *s = value_frame_bound_symbol(c, v->orelse.expr, depth + 1);
+        Symbol *s = value_frame_bound_symbol(c, v->orelse.expr, depth + 1, gave_up);
         if (s) return s;
-        return value_frame_bound_symbol(c, v->orelse.fallback, depth + 1);
+        return value_frame_bound_symbol(c, v->orelse.fallback, depth + 1, gave_up);
     }
     if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
         if (!addr_of_is_local_derived(c, v->unary.operand)) return NULL;
@@ -7222,7 +7268,31 @@ static Type *check_expr(Checker *c, Node *node) {
                     Symbol *ots = NULL; bool og = false, op_ = false;
                     classify_escape_sink(c, node->assign.target, &ots, &og, &op_);
                     if (og || op_) {
-                        Symbol *bad = value_frame_bound_symbol(c, aval, 0);
+                        bool esc_gave_up = false;
+                        Symbol *bad = value_frame_bound_symbol(c, aval, 0,
+                                                               &esc_gave_up);
+                        /* BUG-978: the walk stopped before it could answer. Say so
+                         * — "did not look" must not read as "found nothing". Two
+                         * separate calls, not one ternary format: a ternary between
+                         * two format strings shares ONE argument list and -Wformat
+                         * cannot check it (BUG-971). */
+                        if (!bad && esc_gave_up && ots && op_) {
+                            checker_error(c, node->loc.line,
+                                "cannot prove the value stored through pointer "
+                                "parameter '%.*s' is not frame-bound — the orelse "
+                                "chain nests deeper than the escape walk follows "
+                                "(%d); split it into named steps",
+                                (int)ots->name_len, ots->name,
+                                ESCAPE_ORELSE_WALK_MAX);
+                        } else if (!bad && esc_gave_up && ots) {
+                            checker_error(c, node->loc.line,
+                                "cannot prove the value stored in static/global "
+                                "variable '%.*s' is not frame-bound — the orelse "
+                                "chain nests deeper than the escape walk follows "
+                                "(%d); split it into named steps",
+                                (int)ots->name_len, ots->name,
+                                ESCAPE_ORELSE_WALK_MAX);
+                        }
                         if (bad && ots) {
                             /* BUG-816: name the ARENA when that is the lifetime, so a
                              * user with no local in sight is not sent looking for one. */

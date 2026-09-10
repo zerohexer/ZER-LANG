@@ -2868,11 +2868,46 @@ Flipping `unique_resource_name` at its cap of 8 made a 34-deep nested struct rea
 resource and MASKED a use-after-move test. A wrong diagnostic is worse than the permissive
 answer it replaced. Raise the cap past anything real FIRST, then round toward reject.
 
-**AND CHECK THE POLARITY AT EVERY CALLER BEFORE FLIPPING.**
-`ir_contains_move_struct_field_depth` fails closed for the COPY sink (`true` = "assume it
-might") and that same `true` is fail-OPEN at the LEAK sink, where move-tracked locals are
-EXEMPT from leak checking. A predicate feeding two rules of opposite polarity has no single
-fail-safe default — it needs a tri-state. See the OPEN entry at the top of limitations.md.
+**"FAIL CLOSED" IS NOT A PROPERTY OF A PREDICATE — IT IS A PROPERTY OF THE PREDICATE PLUS
+THE RULE READING IT (2026-09-11, BUG-977). CHECK THE POLARITY AT EVERY CALLER BEFORE
+FLIPPING.** `ir_contains_move_struct_field_depth` fails closed for the COPY sink (`true` =
+"assume it might") and that same `true` is fail-OPEN at the LEAK sink, where move-tracked
+locals are EXEMPT from leak checking — so a `Handle` nested 34 structs deep leaked in
+silence. A predicate feeding two rules of opposite polarity has no single fail-safe
+default: make the walk **TRI-STATE** (`YES` / `NO` / `UNKNOWN`) and let each sink pick its
+own reading of UNKNOWN. Two things the audit of its other 25 callers turned up:
+- **A MARK AND ITS UNDO MUST USE THE SAME READING** or the undo silently fails to undo
+  (`zercheck_ir.c:5303` undoes a same-line transfer materialisation — its `true` enters
+  the accept path and is nonetheless CORRECT). A third polarity is not automatically a
+  third bug.
+- **Widening alone can NEVER close it when the construct has no syntactic limit.** Struct
+  nesting has none — you can always declare one more level — so the cap raise (32 -> 256)
+  only bought depths 33..256 and `leak_handle_300_structs_deep.zer` is caught by the
+  tri-state. Contrast BUG-978's orelse chain, which the parser bounds at ~84: **when
+  another limit already bounds the construct below your cap, the hole is closed by
+  construction** and the conservative answer is a backstop. Measure which case you are in.
+
+**WHEN THE WALK RETURNS A POINTER THE DIAGNOSTIC NEEDS, IT CANNOT BE FLIPPED — REPORT
+INSTEAD (2026-09-11, BUG-978).** `value_frame_bound_symbol` returns the `Symbol *` the
+caller NAMES; past the cap there is no Symbol to name, so it sets a `gave_up` flag and the
+caller reports the refusal naming the DESTINATION, which it always has. **A report path no
+program can reach must still be verified to FIRE** — temporarily lower the cap, confirm
+every branch prints, restore. A path that has never executed is not a net.
+
+**THE VERDICT CAN BE RIGHT AND THE SENTENCE STILL FICTION (2026-09-11, BUG-977b).** BUG-976
+had `unique_resource_name` return the literal name `"resource"` past its cap, so a 100-deep
+plain struct — carrying no resource at all — was told `'resource'` "is addressed by NAME
+... conventionally a global". Return a POINTER-COMPARED SENTINEL past the cap (the
+`_ir_pool_mixed` device) and give the reporter its own sentence. This is the "a wrong
+diagnostic is worse than the permissive answer" rule one level up, and it is easier to ship
+because the verdict looks correct in the test — **the author reads the sentence, not the
+exit code.**
+
+**THE DURABLE END-STATE FOR A WALK OVER A TYPE IS NO CAP AT ALL.** The type graph is finite
+and acyclic — the checker rejects self-containment ("struct 'A' cannot contain itself by
+value") and a by-value field cannot forward-reference, so mutual recursion is unspellable.
+A visited-set walk keyed on `Type *` terminates and needs no depth bound. Every type walk
+in checker.c / zercheck_ir.c is carrying a cap it does not need.
 
 **A DEPTH CAP THAT IS RESET ON A HOP IS NOT A CAP (2026-09-10, BUG-975).** `eval_const_expr_ex`
 had `if (depth > 256) return CONST_EVAL_FAIL;` and incremented properly down unary/binary

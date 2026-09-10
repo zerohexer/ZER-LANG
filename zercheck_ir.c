@@ -896,27 +896,57 @@ static bool ir_is_move_struct_type(Type *t) {
  * because Outer wasn't recognized as move-tracking. Depth-limited
  * recursion (32 max) prevents infinite recursion on malformed types
  * while catching nested cases. */
-static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
-    if (!t) return false;
-    /* BUG-933: EXCEEDING THE GUARD MUST BE CONSERVATIVE. Returning false said
-     * "contains no move struct", which disables move tracking entirely — so a
-     * 34-deep nest defeated use-after-move detection by being deep. The guard
-     * exists to bound recursion, not to answer the question; when it fires the
-     * honest answer is "assume it might", which can only OVER-reject (a copy of a
-     * deeply-nested NON-move struct starts being move-tracked). Corpus cost is
-     * zero — nothing here nests anywhere near this. Same direction as the VRP
-     * verdict: trusting the analysis to prove DANGER is the safe side. */
-    if (depth > 32) return true;
+/* BUG-977: the walk answers THREE things, not two.
+ *
+ * BUG-933 made this predicate fail CLOSED (`true` past the cap) reasoning that
+ * "assume it might" can only over-reject. That reasoning is correct AT THE COPY
+ * SINK and BACKWARDS AT THE LEAK SINK: there `true` means "this local is
+ * move-tracked", and move-tracked locals are EXEMPT from leak checking, so
+ * "assume it might" silently exempts the handle and its leak is never reported
+ * (`tests/zer_fail/leak_handle_34_structs_deep.zer` — a Handle nested 34 structs
+ * deep, allocated and never freed, compiled clean).
+ *
+ * A PREDICATE THAT FEEDS TWO RULES OF OPPOSITE POLARITY HAS NO SINGLE FAIL-SAFE
+ * DEFAULT. "Fail closed" is not a property of the predicate at all — it is a
+ * property of the predicate PLUS the rule reading it. So the walk now returns
+ * what it actually knows and each sink picks its own conservative reading:
+ *
+ *   IR_MOVE_YES      proved: a move struct is in there somewhere
+ *   IR_MOVE_NO       proved: walked the whole type, none
+ *   IR_MOVE_UNKNOWN  the walk STOPPED (depth cap) — the answer is not known
+ *
+ * The cap itself is raised 32 -> 256 first, per the BUG-976 rule (a generous cap
+ * and a conservative answer are not alternatives; you need both — flipping at a
+ * cap of 8 there produced a WRONG diagnostic on a 34-deep nest, which is worse
+ * than the permissive answer it replaced). 256 is past anything real: a by-value
+ * struct nest is necessarily FINITE and ACYCLIC because the checker rejects
+ * self-containment ("struct 'A' cannot contain itself by value") and a by-value
+ * field cannot forward-reference, so mutual recursion cannot be spelled either.
+ * The cap survives only as a guard against a malformed type built during error
+ * recovery. */
+typedef enum {
+    IR_MOVE_NO = 0,
+    IR_MOVE_YES,
+    IR_MOVE_UNKNOWN
+} IRMoveVerdict;
+
+#define IR_MOVE_WALK_MAX 256
+
+static IRMoveVerdict ir_move_verdict_depth(Type *t, int depth) {
+    if (!t) return IR_MOVE_NO;
+    if (depth > IR_MOVE_WALK_MAX) return IR_MOVE_UNKNOWN;
+    IRMoveVerdict acc = IR_MOVE_NO;
     Type *eff = type_unwrap_distinct(t);
     if (eff->kind == TYPE_STRUCT) {
         for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
             Type *ft = eff->struct_type.fields[i].type;
-            if (ir_is_move_struct_type(ft)) return true;
+            if (ir_is_move_struct_type(ft)) return IR_MOVE_YES;
             Type *ft_eff = ft ? type_unwrap_distinct(ft) : NULL;
             if (ft_eff && (ft_eff->kind == TYPE_STRUCT ||
                            ft_eff->kind == TYPE_UNION)) {
-                if (ir_contains_move_struct_field_depth(ft, depth + 1))
-                    return true;
+                IRMoveVerdict v = ir_move_verdict_depth(ft, depth + 1);
+                if (v == IR_MOVE_YES) return IR_MOVE_YES;
+                if (v == IR_MOVE_UNKNOWN) acc = IR_MOVE_UNKNOWN;
             }
         }
     }
@@ -927,30 +957,46 @@ static bool ir_contains_move_struct_field_depth(Type *t, int depth) {
      * array arm was the missing one here. */
     if (eff->kind == TYPE_ARRAY) {
         Type *et = eff->array.inner;
-        if (ir_is_move_struct_type(et)) return true;
-        return ir_contains_move_struct_field_depth(et, depth + 1);
+        if (ir_is_move_struct_type(et)) return IR_MOVE_YES;
+        IRMoveVerdict v = ir_move_verdict_depth(et, depth + 1);
+        return v == IR_MOVE_NO ? acc : v;
     }
     if (eff->kind == TYPE_UNION) {
         for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
             Type *vt = eff->union_type.variants[i].type;
-            if (ir_is_move_struct_type(vt)) return true;
+            if (ir_is_move_struct_type(vt)) return IR_MOVE_YES;
             Type *vt_eff = vt ? type_unwrap_distinct(vt) : NULL;
             if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||
                            vt_eff->kind == TYPE_UNION)) {
-                if (ir_contains_move_struct_field_depth(vt, depth + 1))
-                    return true;
+                IRMoveVerdict v = ir_move_verdict_depth(vt, depth + 1);
+                if (v == IR_MOVE_YES) return IR_MOVE_YES;
+                if (v == IR_MOVE_UNKNOWN) acc = IR_MOVE_UNKNOWN;
             }
         }
     }
-    return false;
+    return acc;
 }
 
+/* THE COPY / TRANSFER READING: an unfinished walk reads as YES, so a value whose
+ * shape could not be established is move-TRACKED. Over-rejects at worst (a copy of
+ * a deeply-nested non-move struct starts being tracked). This is BUG-933's
+ * behaviour, unchanged. */
 static bool ir_contains_move_struct_field(Type *t) {
-    return ir_contains_move_struct_field_depth(t, 0);
+    return ir_move_verdict_depth(t, 0) != IR_MOVE_NO;
 }
 
 static bool ir_should_track_move(Type *t) {
     return t && (ir_is_move_struct_type(t) || ir_contains_move_struct_field(t));
+}
+
+/* THE LEAK READING: only a PROVED move struct exempts a local from leak checking.
+ * An unfinished walk reads as NO, so the leak is reported. The two readings differ
+ * ONLY past the cap; below it they are identical, so nothing that used to be
+ * exempt stops being exempt. */
+static bool ir_move_exempts_leak_check(Type *t) {
+    if (!t) return false;
+    if (ir_is_move_struct_type(t)) return true;
+    return ir_move_verdict_depth(t, 0) == IR_MOVE_YES;
 }
 
 /* Allocation ID counter for move struct new-ownership chains.
@@ -8040,7 +8086,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (h->local_id >= 0 && h->local_id < func->local_count) {
                 IRLocal *loc = &func->locals[h->local_id];
                 Type *lt = loc->type;
-                if (ir_should_track_move(lt)) continue;
+                /* BUG-977: the LEAK reading, not the copy one — see
+                 * ir_move_exempts_leak_check. `true` here EXEMPTS, so the
+                 * conservative answer is the opposite of the copy sink's. */
+                if (ir_move_exempts_leak_check(lt)) continue;
                 if (loc->is_temp) continue;
                 if (loc->is_param) continue;
             }

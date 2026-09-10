@@ -1,10 +1,16 @@
-// expect-error: resource types are not copyable
-// BUG-980: unique_resource_name answered "no resource" past its recursion cap,
-// so an Arena nested deeper than the cap was copied by value — two owners of one
-// bump cursor (the BUG-970 class). The walk now fails CLOSED past its cap (64 —
-// beyond anything written; the suite's own deepest nest is 34): a 70-deep nest is
-// refused as a resource too deep to name. The pre-flip build (cap 8, fail-open)
+// expect-error: nests deeper than the resource walk follows
+// BUG-976: unique_resource_name answered "no resource" past its recursion cap, so an
+// Arena nested deeper than the cap was copied by value — two owners of one bump cursor
+// (the BUG-970 class). The walk now fails CLOSED past its cap (64 — beyond anything
+// written; the suite's own deepest nest is 34). The pre-flip build (cap 8, fail-open)
 // accepted this program.
+//
+// BUG-977b changed the SENTENCE, not the verdict. This nest is 69 deep, so the walk
+// stops BEFORE reaching the Arena — the compiler does not know a resource is in there,
+// it only knows it could not finish looking, and the diagnostic now says that. The old
+// wording ("resource types are not copyable") named a resource type the walk had never
+// seen. A REAL resource within the cap still names itself: `struct Outer { Inner i; }`
+// with an Arena two levels down reports "cannot initialize 'Arena' by value".
 struct R0 { Arena a; }
 struct R1 { R0 inner; }
 struct R2 { R1 inner; }

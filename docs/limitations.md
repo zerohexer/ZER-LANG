@@ -30,41 +30,37 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — the last 2 of the fail-open class, and the finding that blocks them (2026-09-10, after BUG-976)
+## OPEN — a plain struct nested deeper than 64 cannot be COPIED (2026-09-11, LOW — over-rejection, valid program refused)
 
-BUG-976 closed 15 of the 17 class-1 reproducers. Two remain, and they are **not more of
-the same** — they need a design decision, which is why they were not rushed.
+**Symptom.** `H100 b = a;` where `H100` is a plain by-value struct nest 100 levels deep is
+refused: *"cannot initialize this value — the type nests deeper than the resource walk
+follows (64)"*. Nothing in it is a Pool / Slab / Ring / Arena / Barrier / Semaphore.
 
-**`leak_handle_34_structs_deep` — THE SAME PREDICATE IS CONSERVATIVE IN OPPOSITE
-DIRECTIONS AT TWO SINKS.** `ir_contains_move_struct_field_depth` (zercheck_ir.c:909)
-already fails CLOSED — it returns `true` past depth 32, with a comment reasoning that
-"assume it might" can only over-reject. That is correct **for the copy sink**. At the
-LEAK sink it is backwards: `true` means "this is move-tracked", and move-tracked locals
-are EXEMPT from leak checking, so `true` past the cap silently exempts the handle and its
-leak is never reported.
+**Root cause, and why the fix is not "raise the cap".** `unique_resource_name` (checker.c)
+walks a type looking for a unique-resource field. BUG-976 made it round toward reject past
+its cap, which is correct — a fail-open answer there means a resource is copied and two
+owners hand out the same bytes. But struct nesting has NO syntactic limit, so any finite
+cap is reachable and the reject is permanent for types past it. Raising 8 -> 64 already
+bought everything real; going further just moves the boundary.
 
-So there is no single fail-safe default. The fix is a TRI-STATE (`yes` / `no` /
-`unknown`) with each sink choosing its own conservative reading of `unknown` — the copy
-sink reads it as yes, the leak sink as no. Widening the cap only moves the boundary.
+**What was fixed and what was not.** BUG-977b fixed the DIAGNOSTIC — past the cap the walk
+now returns a sentinel and the reporter says the walk stopped, instead of naming a
+fictional resource type called `"resource"` and telling the author to make it a global.
+The over-rejection itself stands, deliberately: it is the conservative direction, corpus
+cost is zero (measured over 1534 files), and 64 levels of by-value nesting is not a shape
+anyone writes.
 
-**Worth generalising before touching it:** when a predicate feeds two rules with opposite
-polarity, "fail closed" is not a property of the predicate at all. Grep for other
-predicates with more than one caller before assuming a flip is safe — this one was found
-only because a test at depth 34 happened to exercise the leak sink.
+**If it ever matters**, the real fix is a memoised walk keyed on `Type *` so the cap can go
+away entirely — the type graph is finite and acyclic (the checker rejects self-containment
+and a by-value field cannot forward-reference), so a visited-set walk always terminates and
+needs no depth bound at all. That is the durable end-state for every one of these type
+walks, not just this one.
 
-**`escape_orelse_chain_11_deep` — `value_frame_bound_symbol` returns a Symbol\*, and the
-conservative answer needs a Symbol it cannot invent.** Past depth 8 it returns NULL
-("not frame-bound", the accept direction). Unlike the boolean predicates it cannot simply
-return the other value: callers use the returned Symbol to NAME the local in the
-diagnostic. Options: return the outermost root walked so far (approximate but real, the
-same trade as BUG-976's rmw-alias fallback), or split into a `bool` predicate plus a
-separate name lookup.
-
-Reproducers: `git show origin/claude/loving-davinci-v6o9c5:tests/zer_fail/<name>.zer`
+**Tripwire:** `tests/zer_fail/resource_walk_stopped_100_deep.zer`.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 85 LIVE holes (2 closed as BUG-975, 15 as BUG-976), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 83 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -120,20 +116,36 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97, by class — and which branch to take
+### The 97 (now 83 live), by class — and which branch to take
 
-**1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers, the biggest systemic class.**
-A depth guard returns "safe" instead of "unknown" past its limit, so nesting deeper than
-the cap silently passes. **TAKE `v6o9c5`'s fix** (forked newest, and its commit states the
-principle: bounded walks must round TOWARD REJECT) **plus `3sdup9`'s OPEN entry**
-"depth-guard ledger: which walkers still FAIL OPEN past their cap", which enumerates the
-remaining walkers.
-`v6o9c5` (11): `escape_call_launder_10_deep` `escape_orelse_chain_11_deep` `arena_copy_11_deep`
-`isr_rmw_14_deep_expr` `spawn_rmw_14_deep_expr` `spawn_rmw_alias_17th` `spawn_static_local_33rd`
-`spawn_carrier_34_deep` `leak_handle_34_structs_deep` `isr_call_chain_35_deep` `spawn_call_chain_35_deep`
-`3sdup9` (6): `deep_nest_arena_copy_fails_closed` `deep_nest_spawn_carrier_fails_closed`
-`atomic_plain_callee_10deep` `atomic_plain_callee_20deep_unanalyzed` `isr_deep_chain_unanalyzed`
-`spawn_race_deep_chain_unanalyzed`
+### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
+
+All 17 rejected: 15 as **BUG-976** (nineteen guards enumerated, three remedies — FLIP a
+boolean, REPORT that the walk stopped, WIDEN when there is no conservative value), and the
+last 2 as **BUG-977/978**, which needed a design decision and are the part worth reading:
+
+- **BUG-977** — a predicate feeding two rules of OPPOSITE polarity has no single fail-safe
+  default. `ir_contains_move_struct_field_depth` already failed CLOSED for the copy sink,
+  and that same `true` EXEMPTS at the leak sink. Fixed by making the walk TRI-STATE
+  (`YES`/`NO`/`UNKNOWN`) with each sink choosing its own reading of UNKNOWN. **Struct
+  nesting has no syntactic limit, so a cap raise alone could never have closed it** —
+  `leak_handle_300_structs_deep.zer` is past the raised cap and is caught by the tri-state.
+- **BUG-978** — `value_frame_bound_symbol` returns a `Symbol *` the caller NAMES in the
+  diagnostic, so it could not be flipped; it now sets a `gave_up` flag and the caller
+  reports the refusal naming the DESTINATION. The reachable window was measured first
+  (9..95 — the parser and zercheck's convergence check bound it past that), which is why
+  the report is a backstop rather than the fix.
+
+**Two things to carry forward, not re-derive.** (a) *"Fail closed" is not a property of a
+predicate — it is a property of the predicate PLUS the rule reading it.* Grep for other
+predicates with more than one caller before assuming a flip is safe; a mark and its UNDO
+must use the same reading or the undo silently fails to undo (zercheck_ir.c:5303 is such a
+pair). (b) A walk over a TYPE never needs a depth cap at all: the type graph is finite and
+acyclic, so a visited-set walk terminates. That is the durable end-state for all of these.
+
+Residual: one over-rejection, entered separately above (a plain struct nested past 64
+cannot be copied). `3sdup9`'s "depth-guard ledger" OPEN entry is superseded — the
+enumeration was done on main and is recorded in BUGS-FIXED.md under BUG-976.
 
 **2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling. TAKE `3sdup9`.**
 An allocation stored into a field, index or slot loses tracking.
@@ -207,7 +219,8 @@ siblings — likely one fix.
 
 ### limitations.md entries worth taking (deduped against main's own)
 
-- `3sdup9`: the **depth-guard ledger** (pairs with class 1); "a callee freeing an optional field
+- `3sdup9`: ~~the depth-guard ledger~~ (SUPERSEDED — the enumeration was done on main, BUG-976);
+  "a callee freeing an optional field
   through the IF-CAPTURE form stays MAYBE"; "freeing a UNION variant through its POINTER capture
   `|*q|` is a false leak" — both OVER-rejections
 - `ppnatu`: "Arena methods through a POINTER or a STRUCT FIELD are not supported"; "ISR-vs-main
@@ -225,7 +238,7 @@ asm reproducer; skip the rest.
 
 ### Suggested order
 
-Segfault → class 1 (systemic, 17 reproducers) → classes 3 and 6 (data races) → class 2 (UAF/leak)
+Segfault (done) → class 1 (done) → classes 3 and 6 (data races) → class 2 (UAF/leak)
 → class 5 (forging doors) → the rest.
 
 ---

@@ -5,6 +5,103 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-11 — BUG-977/978: the last 2 of the fail-open class, and why they were not more of the same
+
+BUG-976 closed 15 of the 17 class-1 reproducers by flipping, reporting or widening.
+These two would not yield to any of those three, and the reason each resisted is the
+finding — both are about what happens when a walk STOPS, but neither could answer with
+the other boolean.
+
+### BUG-977 — one predicate, two questions, opposite safe directions
+
+`ir_contains_move_struct_field_depth` (zercheck_ir.c) already failed CLOSED: BUG-933 made
+it return `true` past depth 32, reasoning that "assume it might" can only over-reject.
+That reasoning is right **at the copy sink** and backwards **at the leak sink**, where
+`true` means "this local is move-tracked" and move-tracked locals are EXEMPT from leak
+checking. So `true` past the cap silently exempted the handle and its leak was never
+reported: a `Handle(T)` nested 34 structs deep, allocated and never freed, compiled clean.
+
+**"Fail closed" is not a property of a predicate. It is a property of the predicate PLUS
+the rule reading it.** A predicate feeding two rules of opposite polarity has no single
+fail-safe default, so widening the cap only moves the boundary — and unlike the orelse
+chain below, struct nesting has NO syntactic limit (you can always declare one more
+level), so a cap raise alone could never have closed this.
+
+The walk now returns what it knows — `IR_MOVE_YES` / `IR_MOVE_NO` / `IR_MOVE_UNKNOWN` —
+and each sink picks its own reading of UNKNOWN: the copy sink reads it as YES (BUG-933's
+behaviour, unchanged), the leak sink as NO. Below the cap the two readings are identical,
+so nothing that used to be exempt stops being exempt.
+
+The cap was raised 32 -> 256 first, per BUG-976's rule that a generous cap and a
+conservative answer are not alternatives. 256 is past anything real: a by-value struct
+nest is necessarily FINITE and ACYCLIC, because the checker rejects self-containment
+("struct 'A' cannot contain itself by value") and a by-value field cannot forward-
+reference, so mutual recursion cannot be spelled either. The cap survives only as a guard
+against a malformed type built during error recovery.
+
+**Auditing the other 25 call sites turned up a third polarity, and it must NOT be
+changed.** `zercheck_ir.c:5303` UNDOES a same-line transfer materialisation, so `true`
+there enters the accept path. It reads UNKNOWN as YES like the copy sink — and that is
+correct, because **a mark and its undo must use the SAME reading or the undo silently
+fails to undo.** Only the leak exemption is genuinely inverted.
+
+Tests: `tests/zer_fail/leak_handle_34_structs_deep.zer` (the branch reproducer, body
+verbatim) and `leak_handle_300_structs_deep.zer` — the second is PAST the raised cap, so
+it is caught by the tri-state and not by the wider walk. Both fail on a pre-fix build.
+
+### BUG-977b — the conservative answer was right and its SENTENCE was fiction
+
+Measured while A/B-ing the above: a 100-deep plain struct copy was refused by
+`unique_resource_name`, which BUG-976 taught to return the literal name `"resource"` past
+its cap of 64. The diagnostic therefore told the author that `'resource'` "is addressed
+by NAME (a pointer to one has no methods), so declare it where both sides can see it —
+conventionally a global" about a struct carrying no resource at all. The VERDICT was
+right; the explanation was invented. Past the cap the name is now a pointer-compared
+sentinel (`_res_walk_stopped`, the `_ir_pool_mixed` device) and the reporter says what
+actually happened. Pinned by `tests/zer_fail/resource_walk_stopped_100_deep.zer`, which is
+labelled an over-rejection and carries an entry in limitations.md.
+
+**This is the BUG-976 lesson recurring one level up.** There it was "a wrong diagnostic is
+worse than the permissive answer it replaced", measured on a verdict. Here the verdict was
+correct and only the wording was wrong — which is easier to ship and just as misleading,
+because the author reads the sentence, not the verdict.
+
+### BUG-978 — the walk could not return the other value, so it had to say it stopped
+
+`value_frame_bound_symbol` recurses ONLY through the two arms of an `orelse`, so its
+`depth` is exactly the orelse nesting depth — and its cap was 8. NULL is the ACCEPT
+direction, so a chain 9 deep ending in `&local` was stored into a global and compiled
+clean.
+
+It could not be flipped: the caller USES the returned `Symbol *` to name the offending
+local in the diagnostic, and past the cap there is no Symbol to name. So this is BUG-976's
+REPORT remedy — the same one applied there to the spawn and ISR race scans. The walk sets
+a `gave_up` flag, and the caller reports the refusal naming the DESTINATION, which it
+always has.
+
+**The window was MEASURED before the cap was chosen**, and the measurement is the useful
+part: the hole is reachable at depths 9..95 and no further, because past that the program
+is refused anyway, loudly and for an unrelated reason — a parenthesised chain trips the
+parser's "expression nesting too deep (limit 256)" at 84, and a flat one trips zercheck's
+"did not converge within 96 iterations" at 96. **When another limit already bounds the
+construct below your cap, the fail-open hole is closed by construction** and the report is
+a backstop for the day either limit moves. Since no program can reach it, it was verified
+the only way such a path can be: by temporarily lowering the cap to 3, confirming BOTH
+branches fire (global sink and pointer-parameter sink) with the right destination named,
+and restoring. A path that has never executed is not a net.
+
+Tests: `escape_orelse_chain_11_deep.zer` (branch reproducer, body verbatim) and
+`escape_orelse_chain_40_deep.zer` — five times the old cap, pinning that the fix is not
+"cap 8 -> cap 12".
+
+### Measurements
+
+- Corpus: 1534 files compiled under both binaries, stderr compared for every diagnostic
+  either change can emit. **Zero differences.**
+- A/B: all four reproducers ACCEPTED on `git archive HEAD` (d5d76528), all four rejected
+  after. All five new negatives fail their `expect-error` on the pre-fix build.
+- Reachable windows: orelse 9..95; struct nesting unbounded (300 and 500 both tested).
+
 ## Session 2026-09-10 — BUG-976: fifteen bounded walks answered "safe" past their cap
 
 The class BUG-975 was one instance of, at scale. A depth-limited walk that returns the

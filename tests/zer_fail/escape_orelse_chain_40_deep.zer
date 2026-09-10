@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot store local-derived pointer 'x' in static/global variable 'g_p'
+// BUG-978: 40 deep — five times the old cap, well inside the reachable window (which
+// ends at 84, where the parser's "expression nesting too deep (limit 256)" takes over).
+?*u32 g_p = null;
+?*u32 mk() { return null; }
+void stash() {
+    u32 x = 5;
+    g_p = (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (&x)))))))))))))))))))))))))))))))))))))))));
+}
+u32 main() { stash(); return 0; }

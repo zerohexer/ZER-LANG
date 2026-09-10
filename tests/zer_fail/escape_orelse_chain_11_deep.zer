@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot store local-derived pointer 'x' in static/global variable 'g_p'
+// BUG-978: value_frame_bound_symbol recursed ONLY through the two arms of an orelse,
+// so its `depth` was exactly the orelse nesting depth — and its cap was 8. NULL is the
+// ACCEPT direction, so a chain 9 deep ending in `&local` was stored into a global and
+// compiled clean. Cap raised to 256 (measured: the reachable window is 9..95 — past
+// that the parser or zercheck's convergence check refuses the program anyway), and the
+// walk now REPORTS when it stops rather than answering "found nothing".
+// Reproducer from claude/loving-davinci-v6o9c5 (body verbatim).
+?*u32 g_p = null;
+?*u32 mk() { return null; }
+void stash() {
+    u32 x = 5;
+    g_p = mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (mk() orelse (&x))))))))));
+}
+u32 main() { stash(); return 0; }

@@ -458,7 +458,7 @@ line, plus TEN axis-crossed matrices:
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
 | `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
-| `sink_matrix.sh` | `SINK MATRIX CLEAN` (88 cells) |
+| `sink_matrix.sh` | `SINK MATRIX CLEAN` (154 cells as of 2026-09-10 — this number drifts, RUN the gate) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 
 Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto.

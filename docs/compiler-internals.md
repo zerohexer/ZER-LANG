@@ -2463,7 +2463,7 @@ All shared structs now use **recursive pthread_mutex** instead of spinlock:
 - `emit_opt_null_check(e, tmp_id, type)` — emits `!tmp` (null sentinel) or `!tmp.has_value` (struct optional). Available for incremental migration at ~20 branching sites.
 - `emit_opt_unwrap(e, tmp_id, type)` — emits `tmp` (null sentinel), `tmp.value` (struct), or `(void)0` (?void).
 - `emit_opt_null_literal(e, type)` — emits `(T*)0`, `{ 0 }` (?void), or `{ 0, 0 }` (?T struct). Replaced 6 manual literal emission sites.
-- `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar. Replaced 6 duplicate return-null code blocks.
+- `emit_return_null(e)` — emits `return <zero>` for current function's return type. Handles ?void, ?T struct, ?*T, void, scalar, **and (BUG-974) aggregates: a slice/struct/union/array gets `(T){0}`, because `return 0;` is not a value of those types and GCC refused it outright.** A **non-null `*T` or funcptr has NO zero** and is rejected in the checker instead — see "The zero of a valueless return" below. Replaced 6 duplicate return-null code blocks.
 
 ### Full Refactoring Summary (2026-04-09/10/11)
 16 helpers added across zercheck.c/checker.c/emitter.c. 39 scattered sites unified. ~250 lines of duplicated code eliminated. All 9 gaps from `docs/refactoring_gaps.md` complete. Adding a new handle state, move-like type, optional variant, escape flag, ISR-banned method, or volatile-checked intrinsic now requires updating ONE helper function instead of finding N scattered sites.
@@ -5418,7 +5418,23 @@ Both propagate through aliases, if-unwrap captures, switch captures, orelse unwr
 
 **Algorithm (BUG-464 model, NOT the old ascending-type_id one):** the emitter locks per-statement (lock→op→unlock around each shared access group), releasing between statements, so cross-statement ordering is deadlock-free by construction. The ONLY real deadlock is a SINGLE statement accessing TWO DIFFERENT shared types — the emitter locks one and leaves the other unprotected, and a thread locking them in the opposite order deadlocks. So the check rejects exactly that: `collect_shared_types_in_stmt(stmt)` returns ≥2 distinct shared `type_id`s → compile error "deadlock: single statement accesses both 'A' and 'B' — split into separate statements." (`shared(rw)` read-only statements are exempt — concurrent readers don't deadlock.)
 
-**Helpers:** `check_block_lock_ordering()` iterates a block's statements, runs `collect_shared_types_in_stmt()` on each, and recurses into EVERY body-bearing statement kind (block/if/for/while/do-while/switch-arms/@critical/@once/defer) via a no-default exhaustive switch — a multi-shared statement nested anywhere is caught (2026-06-27: closed switch-arm + do-while holes here; the prior if-chain missed those bodies). `collect_shared_types_in_stmt`/`collect_shared_types_in_expr` (the all-shared-types collector, also exhaustive switches under `-Werror=switch`) and `scan_body_shared_types` (the transitive per-function cache) descend casts/intrinsics/index/slice/orelse/struct-init so a shared read hidden in a subexpression can't evade the check. (The legacy `find_shared_type_in_expr/_in_stmt` "first shared type" helpers were dead since BUG-464 and removed 2026-06-27.)
+**Helpers:** `check_block_lock_ordering()` iterates a block's statements, runs `collect_shared_types_in_stmt()` on each, and recurses into EVERY body-bearing statement kind (block/if/for/while/do-while/switch-arms/@critical/@once/defer) via a no-default exhaustive switch — a multi-shared statement nested anywhere is caught (2026-06-27: closed switch-arm + do-while holes here; the prior if-chain missed those bodies). `collect_shared_types_in_stmt`/`collect_shared_types_in_expr` (the all-shared-types collector, also exhaustive switches under `-Werror=switch`) and `scan_body_shared_types` (the transitive per-function cache) descend casts/intrinsics/index/slice/orelse/struct-init **and spawn ARGUMENTS** so a shared read hidden in a subexpression can't evade the check.
+
+**SPAWN IS THE ONE EXCEPTION TO "ONE LOCK PER STATEMENT" — and it is per ARGUMENT (verified from emitted C, 2026-09-10).** The emitter marshals each spawn argument under its own lock scope, and labels them:
+
+```c
+{ /* spawn w */
+    /* shared-read lock for spawn arg 0 */
+    pthread_mutex_lock(&a._zer_mtx);   _sa->a0 = a.x;   pthread_mutex_unlock(&a._zer_mtx);
+    /* shared-read lock for spawn arg 1 */
+    pthread_mutex_lock(&b._zer_mtx);   _sa->a1 = b.y;   pthread_mutex_unlock(&b._zer_mtx);
+    pthread_create(&th, NULL, _zer_spawn_wrap_0, (void*)_sa);
+}
+```
+
+So `spawn w(a.x, b.y)` is TWO correctly-held locks and must stay legal, while `spawn w(a.x + b.y)` is the hazard — one lock, two structs read. **A per-STATEMENT check is therefore wrong for spawn in both directions**: it rejects the safe form and, if you simply omit spawn, misses the unsafe one. `collect_shared_in_spawn_args` (BUG-973) runs the collector per argument and reports the first argument that alone touches two.
+
+**`NODE_SPAWN` was in the collector's "returns 0" list until BUG-973** — an EXPLICIT classification, because the no-default discipline requires every kind to be named, and simply the wrong one: a spawn's arguments are parent-evaluated expressions of that statement. `spawn w(a.x + b.y)` emitted `_sa->a0 = (a.x + b.y);` inside A's lock only. Worth remembering when reading these exhaustive switches: **they prove every kind was CONSIDERED, not that each was considered correctly.** Both spellings need the arm — the bare statement reaches `collect_shared_types_in_stmt`, the scoped `ThreadHandle th = spawn …` arrives as a var-decl initializer and reaches `collect_shared_types_in_expr`. (The legacy `find_shared_type_in_expr/_in_stmt` "first shared type" helpers were dead since BUG-464 and removed 2026-06-27.)
 
 **Declaration order = lock order:** `type_id` is assigned during `register_decl` in declaration order. Earlier declared struct = lower ID = must be locked first.
 
@@ -6060,6 +6076,98 @@ to the exception list in `ir_validate` (ir.c lines ~320 and ~335).
 Both exceptions surfaced after BUG-594's auto-lock work — 0 and 1
 as flag values fell into the validator's "out of range" check for
 functions with local_count == 0.
+
+### The `loving-davinci-r3an9y` run (2026-09-08..10, BUG-967..974) — what is durable
+
+Nine holes from one survey, closed in three days. The per-bug detail is in BUGS-FIXED.md
+and the ledger is in limitations.md; what follows is only the part a future session needs
+in its head, plus the mechanisms it must not re-derive.
+
+**Every one was the same shape: ONE semantic question answered at N sites, or answered for
+one SPELLING of an operation and not its siblings.** That is the class CLAUDE.md's
+multi-site table exists for, and the run is nine more rows of evidence for it.
+
+| bug | the question | how it was under-answered |
+|---|---|---|
+| 967 | "does this write a view header?" | `.len`/`.ptr` writable — bounds forgeable in one line |
+| 968 | "what allocation does this view point into?" | walk stopped at `pool.get(h)`; a SLICE never aliased at all |
+| 969 | "what does this spawn argument LEND?" | only a literal `&v` established a borrow |
+| 970 | "does this copy a unique resource?" | Arena/Barrier/Semaphore nowhere; Pool/Ring/Slab at ONE site |
+| 971 | "is this shared state?" | static locals invisible to BOTH race scans |
+| 972 | "can an access through this fault?" | packed rule saw `&p.field`, not `&p.w[0]` nor a slice view |
+| 973 | "which mutex is held?" | spawn args excluded from the same-statement rule |
+| 974 | "what is the zero of this type?" | `return 0;` for every type, three answers collapsed into one |
+
+#### Four mechanisms worth reusing verbatim
+
+**A BOOLEAN CANNOT ANSWER A "WHICH ONE" QUESTION (BUG-969).** `is_local_derived` says a
+pointer points into SOME local — exactly right for the ESCAPE sinks, which ask whether a
+value outlives the frame and do not care which local. The scoped-spawn borrow asks a
+different question: the race is a parent write to the ROOT (`v = 3`), so the root must be
+NAMED. The code had compensated by handling only the one spelling where the name is
+visible in the expression. `Symbol.borrow_root_name` carries it, recorded at the
+DECLARATION per the BUG-488/494 rule — three sites, each of which already computed the
+same walk for `is_local_derived`: the var-decl `&…` path and the `h.p = &v` carrier
+assignment (both via `record_borrow_root`), and the slice-of-a-local path (which sets the
+field directly, since it already has the root symbol in hand). **When a rule handles exactly one syntactic form,
+check whether the fact it needs is even representable in the state it is reading.**
+
+**TEST THE VALUE, NOT THE DESTINATION TYPE (BUG-970).** The unique-resource rule lived at
+one site because the same TYPE appears on both sides of a legal construction: `Arena a =
+Arena.over(buf)` is FRESH, not a copy. Widening a target-type test would reject the
+constructor. Asking about the VALUE (`value_is_existing_resource`: an ident/field/index or
+either arm of an `orelse` NAMES something that outlives the binding; a call builds
+something new) is what let one predicate serve six sinks through the shared reporter
+`reject_unique_resource_copy` — var-decl init, global init, call arg, orelse fallback,
+struct-init field, spawn arg — plus the RETURN sink, which is a separate inline check
+because its answer differs (see below).
+
+**THE SAME QUESTION CAN HAVE DIFFERENT ANSWERS BY LIFETIME (BUG-970).** The RETURN sink is
+deliberately narrower than the other six: returning a LOCAL resource by value is a MOVE
+(the idiomatic factory), returning a GLOBAL is a copy. Do not "unify" it.
+
+**TWO SINKS WITH BYTE-IDENTICAL CODE ARE ONE FIX, NOT TWO (BUG-971).**
+`scan_unsafe_global_access` and `record_isr_globals` had the same `NODE_VAR_DECL` arm
+character for character — confirmed by diffing, not assumed. Both resolve names with
+`scope_lookup(c->global_scope, …)`, which is why a `static` LOCAL (one object per function,
+shared by every thread AND between ISR and main) was invisible to both. A scan-scoped table
+rather than a threaded body root, because the scan has SEVEN body-entry points.
+
+#### Two operations that look like one
+
+**`&packed.field` and a SLICE over a packed array field are DIFFERENT operations (BUG-972).**
+No `&` appears in `[*]u32 s = p.w;` at all, so no address-of predicate can reach it. They
+need two predicates, and their PRECISION differs on purpose: the slice rule keys on
+`type_alignment_bytes(elem)` (a `u8[]` view is safe and is what `packed` exists for), the
+address-of rule is deliberately unconditional because relaxing it would be an accept-unsafe
+change. That asymmetry is recorded as an OPEN over-rejection in limitations.md.
+
+#### The zero of a valueless return (BUG-974)
+
+`orelse return` is bare by design — "the return value comes from the function's return
+type". `emit_return_null`'s fallback was `return 0;` for every non-optional type, which is
+three answers in one: correct for integers, INVALID C for aggregates (GCC refused it, so
+valid ZER did not build), and a NULL from a non-null type for `*T`/funcptr.
+
+**A construct modelled as a FLAG re-states every rule the real node kind carries — and the
+list is easy to leave incomplete.** `orelse.fallback_is_return` reaches no `NODE_RETURN`
+handler, which is why the `defer` and `@critical` bans are repeated beside the flag. The
+RETURN-TYPE check was the third such rule and was missing; a plain bare `return;` in a `*T`
+function had been rejected all along. The same shape applies to `orelse break` / `orelse
+continue`.
+
+#### Gates added
+
+`tools/sink_matrix.sh` grew SHAPES **p19–p24** — 100 → 154 declared cells, counted with
+`grep -c '^cell ' tools/sink_matrix.sh` at `7bf3fb90~1` and at HEAD (the runtime line
+`matrix: 154 ok` agrees). Do not quote a cell count from prose; run the gate. Each was **run against a
+build of the commit before its fix** and confirmed to report HOLE; the boundary cells were
+confirmed green on BOTH sides. `tests/test_hw_matrix.c` grew the STATIC-LOCAL grid
+(SITE x SHAPE, so spawn-vs-ISR disagreement fails the build).
+
+**`test_hw_matrix` AUTO-DETECTS `./zerc` from the CWD and IGNORES `argv[1]`.** Passing an
+old binary silently measures the NEW compiler and the grid appears to pass on a broken
+build — which is exactly what it did on the first attempt. Run it FROM the baseline tree.
 
 ### The slice HEADER is read-only (2026-09-08, BUG-967)
 

@@ -5,6 +5,73 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-10 — BUG-973: a spawn argument read the second shared struct unlocked
+
+ZER's shared structs are auto-locked, and the emitter takes ONE lock per statement — which
+is why a same-statement multi-shared-type access is a compile error (the deadlock rule).
+`NODE_SPAWN` was classified in that collector as "no cond/init/expr that could read a
+shared struct". Measured:
+
+```c
+pthread_mutex_lock(&a._zer_mtx);
+_sa->a0 = (a.x + b.y);            //  b.y read with only A's mutex held
+pthread_mutex_unlock(&a._zer_mtx);
+```
+
+A spawn's arguments are evaluated IN THE PARENT, in that one statement, so they are
+exactly the expressions the collector exists to see.
+
+### What this says about the -Werror=switch gate
+
+That classification was EXPLICIT — `NODE_SPAWN` was written out in the "returns 0" list,
+because the no-default discipline requires every kind to be named. So the gate did its job:
+it converted "silently missed" into "visibly wrong".
+
+What a gate of that kind cannot do is check that an explicit answer is the RIGHT one. Worth
+remembering when reading the exhaustive switches in this codebase as if they were proofs of
+coverage: they prove every kind was CONSIDERED, not that each was considered correctly.
+
+### Two spellings, two walkers
+
+The bare `spawn w(…)` statement reaches the STATEMENT collector. The scoped
+`ThreadHandle th = spawn w(…)` arrives as a var-decl INITIALIZER and reaches the EXPRESSION
+collector. Fixing one leaves the other open; both now route through one helper,
+`collect_shared_in_spawn_args`. The scoped form is not in the branch's test set and is added
+as `tests/zer_fail/spawn_arg_two_shared_scoped.zer`.
+
+### The boundary is PER-ARGUMENT, and the first draft got it wrong
+
+The emitter locks one shared root per ARGUMENT, not per statement. Verified in the emitted C
+for `spawn w(a.x, b.y)`:
+
+```c
+pthread_mutex_lock(&a._zer_mtx);   _sa->a0 = a.x;   pthread_mutex_unlock(&a._zer_mtx);
+pthread_mutex_lock(&b._zer_mtx);   _sa->a1 = b.y;   pthread_mutex_unlock(&b._zer_mtx);
+```
+
+Both correctly held. My first version accumulated across arguments and rejected that —
+caught immediately by the branch's own boundary positive. The hazard is two shared types
+inside ONE argument, where the single per-argument lock covers only the first.
+
+### Process note
+
+The first edit to `checker.c` was reported written, built, and measured working — and then
+turned out not to be in the file (`git diff` clean, `grep -c BUG-973` = 0). Re-applied with
+`git diff --stat` checked IMMEDIATELY after the write, before building. CLAUDE.md already
+records "verify the edit LANDED and RUNS, not that the script printed ok"; this is that,
+and the cheap check is a `git diff` right after the write rather than a build minutes later.
+
+The re-apply then failed twice on anchor text — a continuation line indented 41 spaces where
+I had written 40. Anchor on a single line when the wrapping is not certain.
+
+### Gate
+
+**SHAPE p23 in `tools/sink_matrix.sh`** — spelling axis, 3 reject + 2 boundary. Verified to
+FIRE: all 3 report HOLE against the pre-fix build; both boundary cells (one shared root per
+argument, and two fields of the SAME shared struct in one argument) stay green on both sides.
+
+---
+
 ## Session 2026-09-09 — BUG-972: an ARRAY field of a packed struct escaped the alignment rule
 
 BUG-786 covered a deref through `&packed.field`. An ARRAY field escaped it at four more

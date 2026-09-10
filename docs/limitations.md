@@ -817,6 +817,54 @@ Tripwire: none yet — write the positive in the same commit as the fix.
 
 ---
 
+## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned (2026-09-09, LOW — over-rejection, valid program refused)
+
+**Symptom.** Taking the address of a BYTE-typed member of a packed struct is refused,
+in both spellings:
+
+    packed struct P { u8 a; u8[4] w; }
+    *u8 q = &p.w[0];          // rejected — `points into a PACKED struct field`
+    packed struct Q { u8 a; u32 w; u8 b; }
+    *u8 q = &p.b;             // rejected, and has been since BUG-786
+
+A `u8` has alignment 1, so no access through either pointer can ever be misaligned.
+Both are valid programs.
+
+**Root cause.** `addr_of_is_packed_field` (checker.c) asks only whether the access path
+crosses a packed aggregate. It never consults the alignment of the thing whose address
+is being taken, so it cannot tell `&p.u32_field` (a real hazard) from `&p.u8_field`
+(harmless).
+
+**Why the obvious fix was not bundled with BUG-972.** BUG-972 peeled INDEX in that gate
+to close the REAL hole (`&p.w[0]` on a `u32[2]` field — offsetof 1, a misaligned 32-bit
+store) and the byte case became rejected as a side effect. Making the gate
+alignment-aware would RELAX a shipped rule, which is the accept-unsafe change class:
+per "Sound relaxation (reject→accept)" in docs/compiler-internals.md, a bug there is a
+shipped fault rather than a harmless refusal, so it needs its own commit, its own
+negative matrix, and its own measurement. Bundling it into a hole-closing commit is
+exactly the mistake that discipline exists to prevent.
+
+Note the SLICE half of BUG-972 IS alignment-aware — `packed_array_field_view` keys on
+`type_alignment_bytes`, so `[*]u8 v = f.payload;` compiles (pinned by
+`tests/zer/packed_u8_array_view_ok.zer`). The asymmetry is deliberate: that rule is new,
+so its precision was designed in.
+
+**Measured cost: ZERO.** `make check` is green across the 18 corpus files that use packed
+structs, so nothing real is being refused today. That is what makes deferring it correct
+rather than lazy.
+
+**Fix sketch.** Gate `addr_of_is_packed_field` on `type_alignment_bytes(target) > 1`,
+where `target` is the type of the addressed member (the array ELEMENT type when an INDEX
+step was peeled). That also relaxes `&p.b`. Verify against
+`tests/zer_fail/packed_array_elem_addr.zer` and the p22 cells, which must all still
+reject, and add a positive for each newly-accepted byte spelling.
+
+**Tripwire.** `tests/zer_fail/packed_u8_array_elem_addr.zer` pins the CURRENT rejection
+and says in its header that the rejection is the over-rejection. **DELETE that file when
+this is fixed** — leaving it would turn a deliberate record into a rule nobody meant.
+
+---
+
 ## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
 
 Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
@@ -942,17 +990,14 @@ on a plain `u8` field of a packed struct was already rejected), so it adds no ne
 inconsistency, and the corpus cost is zero — the suite is green across the 18 files using
 packed structs.
 
-Pinned as `tests/zer_fail/packed_u8_array_elem_addr.zer`, whose header states plainly
-that the rejection IS the over-rejection and carries the fix sketch: gate
-`addr_of_is_packed_field` on `type_alignment_bytes(target) > 1`, which also relaxes
-`&p.b`. NOT filed under `tests/zer_gaps/` — that directory's contract is "compile-clean
-IS the gap", the opposite of an over-rejection, and the harness said so.
+Pinned as `tests/zer_fail/packed_u8_array_elem_addr.zer` and tracked as its OWN entry —
+**"## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned"** above,
+which carries the symptom, root cause, fix sketch and tripwire. It is filed there rather
+than only here because a closed section is the wrong home for open work: a session
+grepping `## OPEN` for what is left would never find it.
 
-Deliberately NOT fixed here: relaxing a shipped rule is the accept-unsafe change class and
-belongs in its own commit with its own negative matrix. The resulting ASYMMETRY is
-deliberate — the SLICE rule is alignment-aware because it is new and its precision is
-load-bearing; the ADDRESS-OF rule is not, because it is old and relaxing it is a separate
-decision. BUG-786 covered a
+NOT filed under `tests/zer_gaps/` either — that directory's contract is "compile-clean IS
+the gap", the opposite of an over-rejection, and the harness said so when it was tried. BUG-786 covered a
 deref through `&packed.field`. An ARRAY field of a packed struct escapes the
 alignment rule at four further doors — slice, coercion, call-arg and `&elem`:
 
@@ -1207,7 +1252,40 @@ spelling, which reaches the slot without calling get() at all:
     } Their fix: `ir_view_root_handle` + `pool_get_handle_root`
 at the keep sink.
 
-**H. `spawn w(a.x + b.y)` reads the second shared struct UNLOCKED (their BUG-914).**
+**H. ~~`spawn w(a.x + b.y)` reads the second shared struct UNLOCKED (their BUG-914)~~ —
+CLOSED 2026-09-10 as BUG-973.** DO NOT REDO.
+
+The same-statement multi-shared-type rule exists because the emitter takes ONE lock per
+statement. `NODE_SPAWN` was classified in its collector as "no cond/init/expr that could
+read a shared struct" — an EXPLICIT classification, because the exhaustive-switch gate
+forced one — and it was simply wrong: a spawn's arguments are parent-evaluated
+expressions of that statement. Measured:
+
+    spawn w(a.x + b.y);
+    -> pthread_mutex_lock(&a._zer_mtx);
+       _sa->a0 = (a.x + b.y);        //  b.y read with only A's mutex held
+       pthread_mutex_unlock(&a._zer_mtx);
+
+**Worth stating: the `-Werror=switch` gate did its job.** It made the classification
+explicit rather than an omission. What it cannot do is check that an explicit answer is
+the RIGHT one — so a no-default switch converts "silently missed" into "visibly wrong",
+which is a real improvement and not a guarantee.
+
+**TWO SPELLINGS, TWO WALKERS.** The bare `spawn w(…)` statement reaches the STATEMENT
+collector; the scoped `ThreadHandle th = spawn w(…)` arrives as a var-decl INITIALIZER
+and reaches the EXPRESSION collector. Fixing one leaves the other open — the scoped form
+is not in the branch's test set and is added here as
+`tests/zer_fail/spawn_arg_two_shared_scoped.zer`.
+
+**The boundary is PER-ARGUMENT and getting it wrong rejects correct code.** The emitter
+locks one shared root per ARGUMENT — verified in the emitted C: `a0 = a.x` under A's
+mutex, then `a1 = b.y` under B's, separately — so `spawn w(a.x, b.y)` is two correctly
+held locks. A first draft accumulated across arguments and rejected it; the hazard is
+only two shared types inside ONE argument.
+
+Gated by **SHAPE p23 in `tools/sink_matrix.sh`** (spelling axis, 3 reject + 2 boundary).
+Verified to FIRE: all 3 report HOLE against the pre-fix build, both boundary cells green
+on both sides.
 Adjacent to BUG-795 (the callee-position walk) but a different sink: per-ARGUMENT
 shared-type collection at NODE_SPAWN. 1 test, `spawn_arg_two_shared_types`.
 
@@ -1237,7 +1315,7 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 
 ~~A~~ (DONE, BUG-930) → ~~C~~ (DONE, BUG-967) → ~~G~~ (DONE, BUG-968) → ~~F~~ (DONE,
 BUG-969) → ~~D~~ (DONE, BUG-970) → ~~E~~ (DONE, BUG-971) → ~~B~~ (DONE, BUG-972) →
-**H** → **I**.
+~~H~~ (DONE, BUG-973) → **I** (the last one).
 A's consumer-side residual can be picked up with B, since both are emitter work.
 
 ## OPEN — BRANCH SURVEY 2026-08-20: 11 `vigilant-tesla-*` branches, ~100 live holes NOT yet fixed

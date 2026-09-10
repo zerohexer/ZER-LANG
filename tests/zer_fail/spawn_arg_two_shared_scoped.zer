@@ -1,0 +1,10 @@
+// expect-error: deadlock: single statement accesses both
+// BUG-973: the SCOPED spelling of the same statement. `ThreadHandle th = spawn …`
+// reaches the collector as a var-decl INITIALIZER rather than as a statement, so it
+// walks the EXPRESSION arm instead of the statement arm — two arms, one question, and
+// only fixing the statement one would leave this open. Not in the branch's set.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void w(u32 v) { a.x = v; }
+u32 main() { ThreadHandle th = spawn w(a.x + b.y); th.join(); return 0; }

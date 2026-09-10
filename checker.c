@@ -23988,6 +23988,40 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
     return NULL;
 }
 
+/* BUG-973: collect the shared-struct types a spawn's ARGUMENTS touch — PER ARGUMENT.
+ *
+ * The emitter locks ONE shared root per ARGUMENT, not per statement. Measured in the
+ * emitted C for `spawn w(a.x, b.y)`: `a0 = a.x` under A's mutex, then `a1 = b.y` under
+ * B's, separately. So two shared types in DIFFERENT arguments are each correctly locked
+ * and must stay legal — accumulating across arguments rejects that, which is exactly
+ * what a first draft of this did.
+ *
+ * The hazard is two shared types inside ONE argument, where the single per-argument
+ * lock covers only the first:
+ *
+ *     spawn w(a.x + b.y);
+ *     -> pthread_mutex_lock(&a._zer_mtx);
+ *        _sa->a0 = (a.x + b.y);        //  b.y read with only A's mutex held
+ *        pthread_mutex_unlock(&a._zer_mtx);
+ *
+ * Reports the FIRST offending argument's pair, which is what the caller needs to name
+ * both structs; contributes nothing otherwise, since a read locked on its own cannot
+ * combine with anything else in the statement. */
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count);
+static int collect_shared_in_spawn_args(Checker *c, Node *sp,
+                                        Type **types, int max_types, int count) {
+    for (int si = 0; si < sp->spawn_stmt.arg_count; si++) {
+        Type *scratch[4] = {0};
+        int n = collect_shared_types_in_expr(c, sp->spawn_stmt.args[si], scratch, 4, 0);
+        if (n >= 2) {
+            for (int k = 0; k < n && count < max_types; k++) types[count++] = scratch[k];
+            return count;
+        }
+    }
+    return count;
+}
+
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
                                          Type **types, int max_types, int count) {
     if (!expr || count >= max_types) return count;
@@ -24164,7 +24198,12 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
     case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
     case NODE_SWITCH: case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
     case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL:
-    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    /* BUG-973: reached in the SCOPED form `ThreadHandle th = spawn w(a.x + b.y);`,
+     * where the var-decl arm hands the spawn here as an initializer. */
+    case NODE_SPAWN:
+        count = collect_shared_in_spawn_args(c, expr, types, max_types, count);
+        break;
+    case NODE_ONCE: case NODE_YIELD: case NODE_AWAIT:
     case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -24198,8 +24237,13 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
     case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    /* BUG-973: NODE_SPAWN was classified here as "no cond/init/expr that could read a
+     * shared struct". The exhaustive switch forced an explicit decision and the
+     * decision was WRONG — a spawn's arguments are parent-evaluated expressions of
+     * this very statement. The gate worked as designed; the classification did not. */
+    case NODE_SPAWN: return collect_shared_in_spawn_args(c, stmt, types, max_types, 0);
     case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
-    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD: case NODE_AWAIT:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:

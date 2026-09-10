@@ -429,6 +429,39 @@ cell p22_safe_u8_view   compile 'packed struct F22{u8 k; u8[6] pay; u16 crc;} u3
 cell p22_safe_unpacked  compile 'struct U22{u8 a; u32[2] w;} u32 main(){ U22 u; u.w[0]=5; [*]u32 s=u.w; if (s[0]!=5) { return 1; } return 0; }'
 
 
+# ---------------------------------------------------------------------------
+# SHAPE p23 (BUG-973): TWO SHARED STRUCTS IN ONE SPAWN ARGUMENT — the SPELLING axis.
+#
+# The same-statement multi-shared-type rule (which exists because the emitter takes
+# ONE lock per statement) had NODE_SPAWN classified as "no cond/init/expr that could
+# read a shared struct". The exhaustive switch forced that classification to be
+# explicit — the gate worked as designed — and the classification was simply WRONG: a
+# spawn's arguments are parent-evaluated expressions of that statement. Measured:
+#
+#     spawn w(a.x + b.y);
+#     -> pthread_mutex_lock(&a._zer_mtx);
+#        _sa->a0 = (a.x + b.y);        //  b.y read with only A's mutex held
+#        pthread_mutex_unlock(&a._zer_mtx);
+#
+# TWO SPELLINGS, TWO WALKERS. The bare statement goes through the STATEMENT arm; the
+# scoped `ThreadHandle th = spawn …` arrives as a var-decl INITIALIZER and goes
+# through the EXPRESSION arm. Fixing one leaves the other open, which is why the
+# spelling is the axis.
+#
+# The BOUNDARY is per-ARGUMENT, and getting it wrong rejects correct code: the emitter
+# locks one shared root per ARGUMENT, so `spawn w(a.x, b.y)` is two separate,
+# correctly-held locks. A first draft accumulated across arguments and rejected it.
+echo "===== SHAPE p23 = two shared structs in ONE spawn argument (spelling axis) ====="
+cell p23_bare_stmt     reject 'shared struct A23{u32 x;} shared struct B23{u32 y;} A23 a23; B23 b23; void w23(u32 v){a23.x=v;} u32 main(){ spawn w23(a23.x + b23.y); return 0; }'
+cell p23_scoped_decl   reject 'shared struct A23b{u32 x;} shared struct B23b{u32 y;} A23b a23b; B23b b23b; void w23b(u32 v){a23b.x=v;} u32 main(){ ThreadHandle t=spawn w23b(a23b.x + b23b.y); t.join(); return 0; }'
+cell p23_second_arg    reject 'shared struct A23c{u32 x;} shared struct B23c{u32 y;} A23c a23c; B23c b23c; void w23c(u32 p,u32 q){a23c.x=p+q;} u32 main(){ spawn w23c(1, a23c.x + b23c.y); return 0; }'
+# BOUNDARY: one shared root PER ARGUMENT is locked separately and is correct code.
+# Rejecting this would be worse than the hole — it is the ordinary way to hand two
+# shared values to a thread.
+cell p23_safe_per_arg  compile 'shared struct A23d{u32 x;} shared struct B23d{u32 y;} A23d a23d; B23d b23d; void w23d(u32 v,u32 z){a23d.x=v+z;} u32 main(){ a23d.x=1; b23d.y=2; ThreadHandle t=spawn w23d(a23d.x, b23d.y); t.join(); if (a23d.x!=3) { return 1; } return 0; }'
+cell p23_safe_one_type compile 'shared struct A23e{u32 x;u32 z;} A23e a23e; void w23e(u32 v){a23e.x=v;} u32 main(){ a23e.x=1; a23e.z=2; ThreadHandle t=spawn w23e(a23e.x + a23e.z); t.join(); return 0; }'
+
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

@@ -97,3 +97,12 @@ zercheck_ir.c:    int view_alloc_ids[8];
 # releases it, so nothing is ever dropped). The cap it REPLACED was the bug: a
 # fixed 16 with a silent early return that emitted 15 locks for 18 shared roots.
 ir_lower.c:    Node  *inline_buf[16];
+
+# BUG-973 — the per-ARGUMENT scratch in collect_shared_in_spawn_args. Mirrors the
+# CALLER's own bound exactly: check_deadlock passes `Type *found[4]` with max_types=4,
+# and the rule only ever needs the FIRST TWO entries (it names two structs in the
+# diagnostic). Bounded by the same constant as the thing it feeds, short-lived, and
+# collect_shared_types_in_expr stops at max_types — a longer argument cannot overrun it,
+# it just stops collecting, which is the conservative direction (fewer types found =
+# no false deadlock report).
+checker.c:        Type *scratch[4] = {0};

@@ -1,0 +1,47 @@
+// EXPECTED: compile error
+// expect-error: carries a non-shared pointer/slice to a fire-and-forget
+// BUG-976: type_carries_nonshared_pointer answered "no pointer" past depth 32, so a
+// by-value struct 34 levels deep carrying `*u32` to a non-shared global went to a spawn.
+struct L0 { *u32 p; }
+struct L1 { L0 in; }
+struct L2 { L1 in; }
+struct L3 { L2 in; }
+struct L4 { L3 in; }
+struct L5 { L4 in; }
+struct L6 { L5 in; }
+struct L7 { L6 in; }
+struct L8 { L7 in; }
+struct L9 { L8 in; }
+struct L10 { L9 in; }
+struct L11 { L10 in; }
+struct L12 { L11 in; }
+struct L13 { L12 in; }
+struct L14 { L13 in; }
+struct L15 { L14 in; }
+struct L16 { L15 in; }
+struct L17 { L16 in; }
+struct L18 { L17 in; }
+struct L19 { L18 in; }
+struct L20 { L19 in; }
+struct L21 { L20 in; }
+struct L22 { L21 in; }
+struct L23 { L22 in; }
+struct L24 { L23 in; }
+struct L25 { L24 in; }
+struct L26 { L25 in; }
+struct L27 { L26 in; }
+struct L28 { L27 in; }
+struct L29 { L28 in; }
+struct L30 { L29 in; }
+struct L31 { L30 in; }
+struct L32 { L31 in; }
+struct L33 { L32 in; }
+struct L34 { L33 in; }
+u32 g_target = 1;
+void w(L34 v) { *v.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.p = 9; }
+u32 main() {
+    L34 d;
+    d.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.p = &g_target;
+    spawn w(d);
+    return 0;
+}

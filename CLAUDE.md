@@ -2845,6 +2845,35 @@ Both halves of that failed in one session:
 - **Check WHICH BINARY each row ran.** A row labelled "pre-L" that actually invoked `./zerc` is not a
   measurement. Put the binary path in the loop, print both sides, and never label from intent.
 
+**A BOUNDED WALK MUST ROUND TOWARD REJECT — AND THAT IS THREE DIFFERENT REMEDIES
+(2026-09-10, BUG-976).** Nineteen depth guards in checker.c / zercheck_ir.c were
+enumerated (`grep -nE "depth *> *[0-9]+\)"`, then map each to its enclosing function and
+its return value). **Every one returned the SAFE answer past its cap** — so nesting past
+the cap was a supported way to get anything through the rule. Pick the remedy by asking
+what the walk PRODUCES:
+- **a boolean predicate** -> FLIP it (return the dangerous answer). 11 of them; zero corpus cost.
+- **a walk that reports nothing** (the spawn race scan, its ISR mirror) -> make it REPORT,
+  naming the callee it refused to descend into. "Did not look" must not read as "found nothing".
+- **a walk that RECORDS names for a later rule** (`record_atomic_plain_in_callee`) -> WIDEN it.
+  It cannot be flipped: there is no conservative value ("assume every global is an atomic
+  cell" rejects everything). When a fail-open cap has no conservative value, a cap past
+  anything real IS the fix.
+
+**A FIXED TABLE THAT SILENTLY DROPS IS THE SAME DEFECT** (`_rmw_alias[16]`,
+`_static_locals[32]` — the 17th alias and 33rd static local were never seen). Set an
+overflow flag and make the LOOKUP answer conservatively once set.
+
+**A GENEROUS CAP AND A CONSERVATIVE ANSWER ARE NOT ALTERNATIVES — you need both.**
+Flipping `unique_resource_name` at its cap of 8 made a 34-deep nested struct read as a
+resource and MASKED a use-after-move test. A wrong diagnostic is worse than the permissive
+answer it replaced. Raise the cap past anything real FIRST, then round toward reject.
+
+**AND CHECK THE POLARITY AT EVERY CALLER BEFORE FLIPPING.**
+`ir_contains_move_struct_field_depth` fails closed for the COPY sink (`true` = "assume it
+might") and that same `true` is fail-OPEN at the LEAK sink, where move-tracked locals are
+EXEMPT from leak checking. A predicate feeding two rules of opposite polarity has no single
+fail-safe default — it needs a tri-state. See the OPEN entry at the top of limitations.md.
+
 **A DEPTH CAP THAT IS RESET ON A HOP IS NOT A CAP (2026-09-10, BUG-975).** `eval_const_expr_ex`
 had `if (depth > 256) return CONST_EVAL_FAIL;` and incremented properly down unary/binary
 nodes — and `const u32 A = A;` still HUNG the compiler, while the two-node form SEGFAULTED.

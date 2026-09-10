@@ -1,0 +1,50 @@
+// EXPECTED: compile error
+// NOTE: main names A global the function aliases, not necessarily `g16`. Once the
+// 16-entry alias table overflows there is no right Symbol to recover, so the fallback is
+// the last one recorded — the OPERATION is reported truthfully (a non-atomic RMW in a
+// spawned context) and the NAME is approximate. Silence was the alternative.
+// expect-error: performs a non-atomic read-modify-write
+// BUG-976: the pointer-alias table was a fixed array of 16; `*p16 += 1` through the 17th
+// alias resolved to nothing and the volatile RMW race compiled clean.
+volatile u32 g0;
+volatile u32 g1;
+volatile u32 g2;
+volatile u32 g3;
+volatile u32 g4;
+volatile u32 g5;
+volatile u32 g6;
+volatile u32 g7;
+volatile u32 g8;
+volatile u32 g9;
+volatile u32 g10;
+volatile u32 g11;
+volatile u32 g12;
+volatile u32 g13;
+volatile u32 g14;
+volatile u32 g15;
+volatile u32 g16;
+void w() {
+    volatile *u32 p0 = &g0;
+    volatile *u32 p1 = &g1;
+    volatile *u32 p2 = &g2;
+    volatile *u32 p3 = &g3;
+    volatile *u32 p4 = &g4;
+    volatile *u32 p5 = &g5;
+    volatile *u32 p6 = &g6;
+    volatile *u32 p7 = &g7;
+    volatile *u32 p8 = &g8;
+    volatile *u32 p9 = &g9;
+    volatile *u32 p10 = &g10;
+    volatile *u32 p11 = &g11;
+    volatile *u32 p12 = &g12;
+    volatile *u32 p13 = &g13;
+    volatile *u32 p14 = &g14;
+    volatile *u32 p15 = &g15;
+    volatile *u32 p16 = &g16;
+    *p16 += 1;
+}
+u32 main() {
+    spawn w();
+    spawn w();
+    return 0;
+}

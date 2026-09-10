@@ -40,7 +40,11 @@ static int zer_sym_region_tag(bool is_local_derived, bool is_arena_derived) {
  * If-chain (not switch) so the walker-default audit is unaffected;
  * type_dispatch_kind keeps the distinct-unwrap CI gate green. */
 static bool type_carries_data_pointer(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    /* BUG-976: past the cap the answer is UNKNOWN, and the conservative reading of
+     * "does this carry a pointer?" is YES. Returning false here said "no pointer",
+     * which is the ACCEPT direction — a deeply nested carrier walked out of the rule. */
+    if (depth > 32) return true;
+    if (!t) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -78,7 +82,8 @@ static bool type_carries_data_pointer(Type *t, int depth) {
  * member of the "wrapper hides the inner kind" family is covered by one call
  * (CLAUDE.md, the class killed by tools/audit_carrier_dispatch.sh). */
 static bool type_carries_handle(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (depth > 32) return true;   /* BUG-976: unknown -> assume it carries one */
+    if (!t) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -493,7 +498,8 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
 }
 
 static bool type_carries_nonshared_pointer(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (depth > 32) return true;   /* BUG-976: unknown -> assume it carries one */
+    if (!t) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -1488,7 +1494,20 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  *
  * Returns the spelling for the diagnostic, or NULL. */
 static const char *unique_resource_name(Type *t, int depth) {
-    if (!t || depth > 8) return NULL;
+    /* BUG-976: MY OWN fail-open cap, written in BUG-970 three days ago. NULL means
+     * "not a resource", i.e. ACCEPT the copy — so a struct nesting an Arena 9 deep
+     * copied freely. Past the cap the honest answer is unknown, and the conservative
+     * reading is that it IS one. The name is only used for the diagnostic.
+     *
+     * The cap is 64, not the original 8, and BOTH halves matter. Failing closed at 8
+     * over-rejected a 34-layer nested move struct and MASKED the use-after-move test
+     * on it (`move_struct_deep_nesting_uam`) — a wrong diagnostic is worse than the
+     * permissive answer it replaced. A generous cap and a conservative answer past it
+     * are not alternatives: the cap has to be past anything real, so that reaching it
+     * is genuinely pathological, and only THEN does rounding toward reject cost
+     * nothing. */
+    if (depth > 64) return "resource";
+    if (!t) return NULL;
     Type *e = type_unwrap_distinct(t);
     if (!e) return NULL;
     switch (type_dispatch_kind(e)) {
@@ -1521,7 +1540,8 @@ static const char *unique_resource_name(Type *t, int depth) {
  * would make the types unusable, which is presumably why the original rule was written
  * against the TARGET type at a single site instead of against the VALUE. */
 static bool value_is_existing_resource(Node *v, int depth) {
-    if (!v || depth > 16) return false;
+    if (depth > 64) return true;   /* BUG-976: unknown -> assume it NAMES one; cap raised with unique_resource_name's, same reason */
+    if (!v) return false;
     switch (v->kind) {
     /* NAMES something that keeps existing after the binding. */
     case NODE_IDENT: return true;
@@ -2143,7 +2163,10 @@ static Node *keep_view_root_ident(Checker *c, Node *e) {
 }
 
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
-    if (!arg || depth > 8) return false;
+    /* BUG-976: ten nested identity calls laundered `&x` into a global because this
+     * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED. */
+    if (depth > 8) return true;
+    if (!arg) return false;
     /* BUG-815 (2026-08-22): this predicate is the LEAF of call_result_escapes and
      * of the Ring-push / spawn-arg gates, and it was the only "is this value
      * frame-bound?" question in the file that never called the shared peeler. So
@@ -2354,7 +2377,8 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
  * under-rejection guard used by the escape sinks). Behavior-preserving loop over
  * the extracted per-argument predicate. */
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
-    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    if (depth > 8) return true;   /* BUG-976: unknown -> assume it does */
+    if (!call || call->kind != NODE_CALL) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
         if (arg_is_local_derived(c, call->call.args[i], depth)) return true;
     }
@@ -2531,7 +2555,8 @@ static bool struct_init_frame_bound(Checker *c, Node *init, bool *is_arena) {
 }
 
 static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
-    if (!call || call->kind != NODE_CALL || depth > 8) return false;
+    if (depth > 8) return true;   /* BUG-976: unknown -> assume it does */
+    if (!call || call->kind != NODE_CALL) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
         Node *arg = call->call.args[i];
         /* unwrap value-side intrinsic launders. MUST use the shared helper:
@@ -3158,6 +3183,7 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
 #define RMW_ALIAS_MAX 16
 static struct { const char *name; uint32_t len; Symbol *global; } _rmw_alias[RMW_ALIAS_MAX];
 static int _rmw_alias_count = 0;
+static bool _rmw_alias_overflow = false;   /* BUG-976: the table filled */
 /* BUG-971: STATIC LOCALS seen while scanning reachable bodies.
  *
  * A `static u32 c = 0;` inside a function is ONE object for every thread that runs it
@@ -3175,11 +3201,18 @@ static int _rmw_alias_count = 0;
 #define STATIC_LOCAL_MAX 32
 static struct { const char *name; uint32_t len; } _static_locals[STATIC_LOCAL_MAX];
 static int _static_local_count = 0;
+/* BUG-976: set when the table filled. MY OWN fail-open cap, from BUG-971 yesterday:
+ * `static_local_record` silently dropped the 33rd static local, so it was never SEEN
+ * and its RMW compiled clean. A table that quietly stops recording is the same defect
+ * as a depth guard that returns "safe" — the walk stopped and the answer did not say
+ * so. Once it has overflowed the table is no longer authoritative, so every lookup
+ * must answer conservatively. */
+static bool _static_local_overflow = false;
 static bool static_local_seen(const char *n, uint32_t l) {
     for (int i = 0; i < _static_local_count; i++)
         if (_static_locals[i].len == l && memcmp(_static_locals[i].name, n, l) == 0)
             return true;
-    return false;
+    return _static_local_overflow;
 }
 /* The exemptions a GLOBAL gets, for the same reasons: `const` is immutable, and a
  * single-word `volatile` is the established flag idiom (see
@@ -3188,7 +3221,7 @@ static bool static_local_seen(const char *n, uint32_t l) {
 static void static_local_record(Node *vd) {
     if (!vd->var_decl.is_static || !vd->var_decl.name) return;
     if (vd->var_decl.is_const || vd->var_decl.is_volatile) return;
-    if (_static_local_count >= STATIC_LOCAL_MAX) return;
+    if (_static_local_count >= STATIC_LOCAL_MAX) { _static_local_overflow = true; return; }
     _static_locals[_static_local_count].name = vd->var_decl.name;
     _static_locals[_static_local_count].len  = (uint32_t)vd->var_decl.name_len;
     _static_local_count++;
@@ -3203,15 +3236,39 @@ static bool _rmw_flagged_rmw = false;
  * inaccuracy as quoting `&tl` for an argument the user wrote as `q`. One query, so the
  * eight cannot drift apart. */
 static bool _scan_found_static_local = false;
+/* BUG-976: the scan gave up descending past 32 calls and reported NOTHING, which is
+ * the ACCEPT direction. It now reports, naming the callee it refused to enter — but
+ * that is a different FINDING from an actual global, so it needs its own noun. */
+static bool _scan_depth_exceeded = false;
+/* BUG-976: the ISR scan's sibling flag — reported at most once per interrupt, so a
+ * deep chain does not produce a diagnostic at every node on the way down. */
+static bool _isr_depth_reported = false;
 static const char *scan_finding_noun(void) {
+    if (_scan_depth_exceeded)
+        return "state reachable through a call chain too deep to analyse (>32), via";
     return _scan_found_static_local ? "static local" : "non-shared global";
 }
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
-                                    _static_local_count = 0; _scan_found_static_local = false; /* BUG-971 */ }
+                                    _rmw_alias_overflow = false;
+                                    _static_local_count = 0; _static_local_overflow = false;
+                                    _scan_found_static_local = false;
+                                    _scan_depth_exceeded = false; /* BUG-971/976 */ }
+/* BUG-976: set when the alias table filled. Same defect as the static-local table
+ * above: past 16 aliases a `*p16 += 1` resolved to NOTHING and the volatile RMW race
+ * compiled clean. A lookup that misses because the table is FULL is not the same
+ * answer as one that misses because the name is not an alias, and returning NULL for
+ * both is the accept direction.
+ *
+ * The conservative answer needs a Symbol to name in the diagnostic, and there is no
+ * right one to invent — so the fallback is the LAST global recorded. It is a real
+ * global the function does alias, the message stays true about the operation being a
+ * non-atomic RMW, and the alternative (silence) is a shipped data race. */
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
     for (int i = 0; i < _rmw_alias_count; i++)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
             return _rmw_alias[i].global;
+    if (_rmw_alias_overflow && _rmw_alias_count > 0)
+        return _rmw_alias[_rmw_alias_count - 1].global;
     return NULL;
 }
 
@@ -3236,7 +3293,8 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt);
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
-    if (!e || !nm || depth > 16) return false;
+    if (depth > 16) return true;   /* BUG-976: unknown -> assume it mentions it */
+    if (!e || !nm) return false;
     if (e->kind == NODE_IDENT)
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
     if (e->kind == NODE_BINARY)
@@ -3251,7 +3309,9 @@ static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) 
 }
 
 static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    if (!e || !g || depth > 12) return false;
+    /* BUG-976: a read of `g` 14 levels into an expression is still a read of `g`. */
+    if (depth > 12) return true;
+    if (!e || !g) return false;
     if (e->kind == NODE_IDENT)
         return e->ident.name_len == g->name_len &&
                memcmp(e->ident.name, g->name, g->name_len) == 0;
@@ -3393,7 +3453,10 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
 }
 
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth) {
-    if (!fn || !fn->is_function || !fn->func_node || depth > 8) return 0;
+    /* BUG-976: 0 means "no param is read-modify-written", the ACCEPT direction.
+     * Unknown must mean "assume every param might be". */
+    if (depth > 8) return ~(uint64_t)0;
+    if (!fn || !fn->is_function || !fn->func_node) return 0;
     if (fn->rmw_summary_done) return fn->rmw_param_mask;
     Node *fd = fn->func_node;
     if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return 0;
@@ -13828,7 +13891,8 @@ static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
 }
 
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth) {
-    if (!fn || !fn->is_function || !fn->func_node || depth > 8) return false;
+    if (depth > 8) return true;   /* BUG-976: unknown -> assume it forwards */
+    if (!fn || !fn->is_function || !fn->func_node) return false;
     Node *fd = fn->func_node;
     if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return false;
     if (pidx < 0 || pidx >= fd->func_decl.param_count) return false;
@@ -14198,6 +14262,11 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * resolves to counter. Recorded here because the scan cannot look up
          * another function's locals through the scope chain. */
         static_local_record(node);   /* BUG-971 */
+        /* BUG-976: record the overflow at BOTH scans — the two NODE_VAR_DECL arms are
+         * the mirrored sink pair, so a flag set at one and not the other is exactly
+         * the drift this class is made of. */
+        if (node->var_decl.name && _rmw_alias_count >= RMW_ALIAS_MAX)
+            _rmw_alias_overflow = true;
         if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
             Node *vi = unwrap_ptr_launder(node->var_decl.init);
             if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
@@ -14276,6 +14345,16 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                     csym->func_node->func_decl.body) {
                     /* Phase A3 fix: raised from 8 to 32. Real call graphs can easily
                      * exceed 8 levels (handler → validator → parser → helper → ...). */
+                    /* BUG-976: past the cap we do not know what the callee touches,
+                     * and "did not look" must not read as "found nothing". Report,
+                     * naming the callee we refused to descend into — that is the
+                     * actionable half, and the noun says why. */
+                    if (_scan_global_depth >= 32) {
+                        _scan_depth_exceeded = true;
+                        *out_name = node->call.callee->ident.name;
+                        *out_len  = (uint32_t)node->call.callee->ident.name_len;
+                        return true;
+                    }
                     if (_scan_global_depth < 32) {
                         _scan_global_depth++;
                         /* BUG-792: bind each `f(&counter)` argument to the callee's
@@ -20581,6 +20660,7 @@ static void check_func_body(Checker *c, Node *node) {
          * RMW → non-atomic" checks are transitive (check_stmt above only records
          * the globals lexically inside the ISR body). Runs with in_interrupt
          * still set so track_isr_global tags them from_isr. */
+        _isr_depth_reported = false;   /* BUG-976: per interrupt */
         record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
@@ -21370,7 +21450,25 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth);
 
 static void record_isr_globals(Checker *c, Node *node, int depth) {
-    if (!node || depth > 32) return;
+    if (!node) return;
+    /* BUG-976: this scan RECORDS what an ISR touches, so returning early past the cap
+     * recorded NOTHING — "did not look" read as "touches nothing", the accept
+     * direction, and the mirrored spawn scan had the identical defect. It cannot
+     * report by returning a value (it is void), so it says so directly.
+     *
+     * The remedy is real: the ISR/main sharing rule works on what this records, and if
+     * the walk stops early the rule silently has nothing to work with. */
+    if (depth > 32) {
+        if (c->in_interrupt && !_isr_depth_reported) {
+            _isr_depth_reported = true;
+            checker_error(c, node->loc.line,
+                "this interrupt handler reaches a call chain deeper than 32 — the "
+                "shared-global analysis cannot see what the far end touches, so it "
+                "cannot tell you whether it races main code. Shorten the chain, or "
+                "move the work out of the handler");
+        }
+        return;
+    }
     switch (node->kind) {
     case NODE_IDENT: {
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
@@ -21484,6 +21582,11 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
         static_local_record(node);   /* BUG-971 */
+        /* BUG-976: record the overflow at BOTH scans — the two NODE_VAR_DECL arms are
+         * the mirrored sink pair, so a flag set at one and not the other is exactly
+         * the drift this class is made of. */
+        if (node->var_decl.name && _rmw_alias_count >= RMW_ALIAS_MAX)
+            _rmw_alias_overflow = true;
         if (node->var_decl.name && _rmw_alias_count < RMW_ALIAS_MAX) {
             Node *vi = unwrap_ptr_launder(node->var_decl.init);
             if (vi && vi->kind == NODE_UNARY && vi->unary.op == TOK_AMP) {
@@ -21704,7 +21807,13 @@ static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
  * Partial if/switch walk with an explicit `default: return` — an unrecognised
  * kind records NOTHING, i.e. today's behaviour, never a new rejection. */
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
-    if (!node || depth > 8) return;
+    /* BUG-976: WIDENED from 8 to 32 rather than flipped, and the difference matters.
+     * This walk RECORDS which globals are touched plainly so the atomic-cell rule can
+     * NAME the cell; there is no conservative value to return, because "assume every
+     * global is an atomic cell" would reject essentially every program. When a
+     * fail-open cap cannot be flipped, the remedy is a cap past anything real — 32
+     * matches the spawn and ISR scans, which descend the same call graphs. */
+    if (!node || depth > 32) return;
     switch (node->kind) {
     case NODE_IDENT: {
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize 'Arena' by value
+// BUG-976: unique_resource_name answered "not a resource" past depth 8, so an Arena
+// eleven structs deep was copied — a second owner of one buffer.
+struct A0 { Arena ar; }
+struct A1 { A0 in; }
+struct A2 { A1 in; }
+struct A3 { A2 in; }
+struct A4 { A3 in; }
+struct A5 { A4 in; }
+struct A6 { A5 in; }
+struct A7 { A6 in; }
+struct A8 { A7 in; }
+struct A9 { A8 in; }
+struct A10 { A9 in; }
+A10 a;
+u32 main() {
+    A10 b = a;
+    return 0;
+}

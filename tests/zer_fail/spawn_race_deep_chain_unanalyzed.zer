@@ -1,0 +1,48 @@
+// EXPECTED: compile error
+// expect-error: call chain too deep to analyse
+// BUG-976: the spawn race scan bounds its callee descent at 32 calls and used to
+// report the unscanned remainder CLEAN. A global RMW 40 calls below the spawn
+// target compiled with zero diagnostics. The cap now fails CLOSED.
+u32 counter = 0;
+void d40() { counter += 1; }
+void d39() { d40(); }
+void d38() { d39(); }
+void d37() { d38(); }
+void d36() { d37(); }
+void d35() { d36(); }
+void d34() { d35(); }
+void d33() { d34(); }
+void d32() { d33(); }
+void d31() { d32(); }
+void d30() { d31(); }
+void d29() { d30(); }
+void d28() { d29(); }
+void d27() { d28(); }
+void d26() { d27(); }
+void d25() { d26(); }
+void d24() { d25(); }
+void d23() { d24(); }
+void d22() { d23(); }
+void d21() { d22(); }
+void d20() { d21(); }
+void d19() { d20(); }
+void d18() { d19(); }
+void d17() { d18(); }
+void d16() { d17(); }
+void d15() { d16(); }
+void d14() { d15(); }
+void d13() { d14(); }
+void d12() { d13(); }
+void d11() { d12(); }
+void d10() { d11(); }
+void d9() { d10(); }
+void d8() { d9(); }
+void d7() { d8(); }
+void d6() { d7(); }
+void d5() { d6(); }
+void d4() { d5(); }
+void d3() { d4(); }
+void d2() { d3(); }
+void d1() { d2(); }
+void w() { d1(); }
+u32 main() { spawn w(); spawn w(); return 0; }

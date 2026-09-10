@@ -1,0 +1,45 @@
+// EXPECTED: compile error
+// NOTE: the source branch made the scan REACH 35 and report the real global. Main stops
+// at 32 and says so instead. Both are sound; main's is the weaker of the two — it
+// over-rejects a 33+ deep chain rather than analysing it. The safety fix is that it is
+// now LOUD instead of silently reporting nothing.
+// expect-error: reaches a call chain deeper than 32
+// BUG-976: ISR sibling of spawn_call_chain_35_deep.zer (record_isr_globals depth cap).
+u32 g_plain = 0;
+void fn34() { g_plain = 1; }
+void fn0() { fn1(); }
+void fn1() { fn2(); }
+void fn2() { fn3(); }
+void fn3() { fn4(); }
+void fn4() { fn5(); }
+void fn5() { fn6(); }
+void fn6() { fn7(); }
+void fn7() { fn8(); }
+void fn8() { fn9(); }
+void fn9() { fn10(); }
+void fn10() { fn11(); }
+void fn11() { fn12(); }
+void fn12() { fn13(); }
+void fn13() { fn14(); }
+void fn14() { fn15(); }
+void fn15() { fn16(); }
+void fn16() { fn17(); }
+void fn17() { fn18(); }
+void fn18() { fn19(); }
+void fn19() { fn20(); }
+void fn20() { fn21(); }
+void fn21() { fn22(); }
+void fn22() { fn23(); }
+void fn23() { fn24(); }
+void fn24() { fn25(); }
+void fn25() { fn26(); }
+void fn26() { fn27(); }
+void fn27() { fn28(); }
+void fn28() { fn29(); }
+void fn29() { fn30(); }
+void fn30() { fn31(); }
+void fn31() { fn32(); }
+void fn32() { fn33(); }
+void fn33() { fn34(); }
+interrupt TIMER1 { fn0(); }
+u32 main() { g_plain = 2; return 0; }

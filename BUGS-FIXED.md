@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-10 — BUG-976: fifteen bounded walks answered "safe" past their cap
+
+The class BUG-975 was one instance of, at scale. A depth-limited walk that returns the
+SAFE answer past its limit does not merely lose precision — it ACCEPTS, and nesting past
+the cap is a supported way to get anything through the rule.
+
+Nineteen guards were enumerated first (`grep -nE "depth *> *[0-9]+\)"` over checker.c and
+zercheck_ir.c, then each mapped to its enclosing function and return value). **Every one
+returned the safe answer.** Fifteen of the seventeen branch reproducers are now rejected;
+the two that remain need a design decision and are recorded in limitations.md.
+
+### Three different remedies, and the difference is the point
+
+**FLIP (11 predicates).** `arg_is_local_derived`, `call_has_local_derived_arg`,
+`call_has_nonkeep_derived_arg`, `type_carries_data_pointer`, `type_carries_handle`,
+`type_carries_nonshared_pointer`, `expr_mentions_global`, `expr_mentions_name`,
+`func_rmw_param_mask`, `func_forwards_param_to_spawn`, `value_is_existing_resource` —
+past the cap, return the DANGEROUS answer. Corpus cost measured at zero.
+
+**REPORT (4 walks).** The spawn race scan and its ISR mirror return nothing useful, so
+"did not look" read as "found nothing". They now report, naming the callee they refused
+to descend into, with their own noun (`scan_finding_noun` gained a third case). Fixing
+both in one commit is the mirrored-sink rule; the ISR one is `void` and had to report
+directly rather than by returning a value.
+
+**WIDEN (2 walks).** `record_atomic_plain_in_callee` was capped at 8 and CANNOT be
+flipped: it records which globals are touched so the rule can NAME the atomic cell, and
+"assume every global is a cell" rejects every program. Widened 8 -> 32, matching the
+scans that walk the same call graphs. **When a fail-open cap has no conservative value to
+return, the remedy is a cap past anything real — not a flip.**
+
+### Two of the caps were mine, from this same session
+
+`unique_resource_name` (BUG-970, depth 8) and the `_static_locals[32]` table (BUG-971). I
+wrote two instances of the class three days before fixing it. Recording that plainly
+because it is the useful part: the shape is easy to write without noticing, which is why
+the enumeration matters more than the individual fixes.
+
+### A TABLE that silently drops is the same defect as a depth cap
+
+`_rmw_alias[16]` and `_static_locals[32]` stopped recording when full, so the 17th alias
+and the 33rd static local were never SEEN. Both now set an overflow flag, and their
+lookups answer conservatively once set. For the alias table the conservative answer needs
+a Symbol that cannot be invented, so it falls back to the last global recorded: the
+OPERATION is reported truthfully and the NAME is approximate. Silence was the alternative.
+
+### The flip that was wrong, and what it taught
+
+Flipping `unique_resource_name` at its original cap of 8 made a 34-layer nested move
+struct read as a resource and MASKED the use-after-move test on it. A wrong diagnostic is
+worse than the permissive answer it replaced.
+
+**A generous cap and a conservative answer past it are not alternatives.** The cap has to
+be past anything real — so that reaching it is genuinely pathological — and only then does
+rounding toward reject cost nothing. Raised to 64; the suite went green and the move test
+recovered its own reason.
+
+### Six directives updated, and where main is weaker
+
+The branches' `expect-error` strings describe THEIR fixes. Main's wording differs, and in
+two cases so does the outcome — recorded in the test headers rather than papered over:
+main reports the 32-call limit where the branch analysed to 35 (sound, weaker: it
+over-rejects a 33+ chain instead of analysing it), and names an approximate global for the
+overflowed alias table. In one case main is BETTER: the atomic walk was widened rather
+than capped, so a 20-deep chain is reached and the diagnostic names the actual cell.
+
+Corpus cost across all of it: zero. 1544 -> 1559 ZER tests.
+
+---
+
 ## Session 2026-09-10 — BUG-975: a const-init cycle hung the compiler, and its bound could never fire
 
 Two programs, two and three lines, that did not produce a diagnostic because the compiler

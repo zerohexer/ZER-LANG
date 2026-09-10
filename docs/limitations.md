@@ -30,7 +30,41 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 100 LIVE holes (2 closed as BUG-975), grouped, with the branch to take each from
+## OPEN — the last 2 of the fail-open class, and the finding that blocks them (2026-09-10, after BUG-976)
+
+BUG-976 closed 15 of the 17 class-1 reproducers. Two remain, and they are **not more of
+the same** — they need a design decision, which is why they were not rushed.
+
+**`leak_handle_34_structs_deep` — THE SAME PREDICATE IS CONSERVATIVE IN OPPOSITE
+DIRECTIONS AT TWO SINKS.** `ir_contains_move_struct_field_depth` (zercheck_ir.c:909)
+already fails CLOSED — it returns `true` past depth 32, with a comment reasoning that
+"assume it might" can only over-reject. That is correct **for the copy sink**. At the
+LEAK sink it is backwards: `true` means "this is move-tracked", and move-tracked locals
+are EXEMPT from leak checking, so `true` past the cap silently exempts the handle and its
+leak is never reported.
+
+So there is no single fail-safe default. The fix is a TRI-STATE (`yes` / `no` /
+`unknown`) with each sink choosing its own conservative reading of `unknown` — the copy
+sink reads it as yes, the leak sink as no. Widening the cap only moves the boundary.
+
+**Worth generalising before touching it:** when a predicate feeds two rules with opposite
+polarity, "fail closed" is not a property of the predicate at all. Grep for other
+predicates with more than one caller before assuming a flip is safe — this one was found
+only because a test at depth 34 happened to exercise the leak sink.
+
+**`escape_orelse_chain_11_deep` — `value_frame_bound_symbol` returns a Symbol\*, and the
+conservative answer needs a Symbol it cannot invent.** Past depth 8 it returns NULL
+("not frame-bound", the accept direction). Unlike the boolean predicates it cannot simply
+return the other value: callers use the returned Symbol to NAME the local in the
+diagnostic. Options: return the outermost root walked so far (approximate but real, the
+same trade as BUG-976's rmw-alias fallback), or split into a `bool` predicate plus a
+separate name lookup.
+
+Reproducers: `git show origin/claude/loving-davinci-v6o9c5:tests/zer_fail/<name>.zer`
+
+---
+
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 85 LIVE holes (2 closed as BUG-975, 15 as BUG-976), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 

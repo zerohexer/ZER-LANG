@@ -1,0 +1,33 @@
+// EXPECTED: compile error
+// NOTE: the source branch capped this walk at 16 and reported a LIMIT. Main widened it
+// to 32 instead, so a 20-deep chain is REACHED and the diagnostic names the actual cell —
+// strictly better, and the reason this walk was widened rather than flipped: there is no
+// conservative value to return ("assume every global is an atomic cell" rejects everything).
+// expect-error: plain access to 'g' in a concurrent context
+// BUG-973 (atomic-cell sibling): record_atomic_plain_in_callee returned silently past
+// its cap, so a plain write to an atomic cell 10 calls below a post-spawn call was
+// never recorded. Past the (widened) cap it now records a sentinel that refuses the
+// program iff an atomic cell exists.
+u32 g = 0;
+void d20() { g = 5; }
+void d19() { d20(); }
+void d18() { d19(); }
+void d17() { d18(); }
+void d16() { d17(); }
+void d15() { d16(); }
+void d14() { d15(); }
+void d13() { d14(); }
+void d12() { d13(); }
+void d11() { d12(); }
+void d10() { d11(); }
+void d9() { d10(); }
+void d8() { d9(); }
+void d7() { d8(); }
+void d6() { d7(); }
+void d5() { d6(); }
+void d4() { d5(); }
+void d3() { d4(); }
+void d2() { d3(); }
+void d1() { d2(); }
+void w() { @atomic_add(&g, 1); }
+u32 main() { spawn w(); d1(); return 0; }

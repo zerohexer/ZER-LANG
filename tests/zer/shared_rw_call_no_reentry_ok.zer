@@ -1,0 +1,26 @@
+// BUG-980 boundary: the re-entrancy rule must be about the SAME rwlock, reached
+// through THIS statement's call. Everything here is legal and must keep compiling:
+//   - a plain `shared` root re-entering (PTHREAD_MUTEX_RECURSIVE — that is the point)
+//   - a shared(rw) statement whose callee touches no shared struct at all
+//   - a shared(rw) statement calling a BODYLESS EXTERN (C cannot name a ZER rwlock)
+//   - the call hoisted out of the locked statement, which is the fix the message names
+shared struct M { u32 v; }
+shared(rw) struct S { u32 v; }
+M m;
+S g;
+u32 ext_like(u32 a) { return a; }
+u32 touches_m() { m.v = 2; return 1; }
+u32 pure() { return 7; }
+u32 main() {
+    m.v = touches_m();          /* recursive mutex: legal */
+    g.v = pure();               /* callee touches nothing shared */
+    g.v = ext_like(3);          /* ordinary call, no shared access */
+    u32 r = pure();
+    g.v = r;                    /* call hoisted out of the locked statement */
+    /* The callee wrote 2 under the re-entered lock, then this statement's own
+     * assignment overwrote it with the return value 1 — so 1 is the evidence that
+     * BOTH writes happened, in order, which is what a recursive mutex permits. */
+    if (m.v != 1) { return 1; }
+    if (g.v != 7) { return 2; }
+    return 0;
+}

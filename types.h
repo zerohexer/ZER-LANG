@@ -280,6 +280,11 @@ struct Symbol {
     const char **th_borrow_names;
     uint32_t *th_borrow_lens;
     int th_borrow_count;
+    /* BUG-979: this handle currently contributes to Checker.live_scoped_threads.
+     * Set at the scoped spawn, cleared at the join that decrements — so a second
+     * join on the same handle cannot drive the count negative and re-open the
+     * concurrent window early. */
+    bool th_live;
     /* A6-full atomic-cell inclusion (2026-06-21): set on a scalar GLOBAL the
      * first time it is the target of an `@atomic_*`. Strict (Rust) model: once a
      * location is atomic, ALL access must be atomic — a plain access anywhere

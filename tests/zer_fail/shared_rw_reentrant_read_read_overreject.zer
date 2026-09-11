@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: not re-entrant
+// BUG-980: an OVER-REJECTION, pinned on purpose. Both accesses here are READS, and
+// POSIX lets a thread hold several concurrent read locks — measured: glibc's default
+// (reader-preferring, which is what a zero-initialised pthread_rwlock_t is) returns 0
+// for a recursive rdlock, so this program would run.
+//
+// Refused anyway, for two measured reasons. (1) POSIX leaves it UNSPECIFIED whether a
+// recursive rdlock succeeds when a writer is waiting, and under glibc's documented
+// PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP it deadlocks — so accepting it makes
+// the program's correctness depend on an attribute ZER does not set. (2) The rule
+// CANNOT SEE whether the callee reads or writes: FuncSharedTypes records type ids
+// only, so "callee reads it too" is not a fact available here, and guessing it is the
+// direction that ACCEPTS. The escape is one line — read into a local first.
+//
+// The fix sketch (a writes-bit per type in the summary) is in docs/limitations.md.
+shared(rw) struct S { u32 v; }
+S g;
+u32 f() { return g.v; }
+u32 main() { u32 r = g.v + f(); return r - r; }

@@ -5,6 +5,142 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-11 — BUG-979/980: two concurrency rules that were exempting the thing they existed to catch
+
+Survey classes 6 (3 reproducers) and 3 (6 reproducers), both from
+`claude/loving-davinci-vgonmt`. All nine compiled clean on main; all nine now reject.
+Different subsystems, and the same shape underneath: an exemption whose WRITTEN
+RATIONALE was narrower than its code.
+
+### BUG-979 — the scoped-spawn window was exempt because the code forgot its own reason
+
+`checker.c`, NODE_SPAWN:
+
+    /* A SCOPED spawn (ThreadHandle) is joined, so post-join access is safe; the
+     * spawn..join window is the narrower scoped-borrow concern, not this. */
+    if (node->spawn_stmt.handle_name == NULL) c->after_spawn_in_func = true;
+
+The sentence is TRUE — post-join access IS safe. The code does not implement it: it
+sets nothing at all for a scoped spawn, so the spawn..JOIN WINDOW is unchecked too.
+
+    ThreadHandle t = spawn worker();   // worker does @atomic_add(&g_ctr, 1)
+    g_ctr = 5;                         // plain write, RACING — compiled clean
+    t.join();
+
+The byte-identical fire-and-forget spelling was rejected. **The same race was accepted
+purely for its spelling.** Nor was it covered elsewhere: the spawn-body scan EXEMPTS
+`@atomic_*` (that is the whole point of the atomic-cell model), and the scoped-BORROW
+rule (BUG-969) tracks locals lent by reference, not globals touched by name.
+
+Fixed by making the flag REFCOUNTED rather than latched: a scoped spawn opens the
+window, and the join closes it — but only the LAST live one
+(`a.join(); g = 5; b.join();` still races b) and never when a fire-and-forget spawn
+also ran, since nothing can join that. The release sits past the join's existing
+conditional-nesting guard, so a join on SOME paths leaves the window open, which is the
+same conservative direction that guard already takes for the borrow.
+
+**This is the exemption-audit rule from CLAUDE.md paying off exactly as written:** *"for
+each exemption in a safety gate, read its stated justification and check every qualifier
+in that sentence is actually tested."* The qualifier here was the word "post-join".
+
+### BUG-980 — a `shared(rw)` lock is not re-entrant, and the whole deadlock model assumed it was
+
+The statement-level rule rejects two DIFFERENT shared types in one statement, reasoning
+that a deadlock needs two locks at once. That holds for a plain `shared` struct, which
+emits a `PTHREAD_MUTEX_RECURSIVE` mutex. A `shared(rw)` struct emits a
+`pthread_rwlock_t`, which is NOT recursive — so ONE type is enough, and the same-type
+case is precisely what the rule's `id0 != id1` guard excluded.
+
+Both outcomes were MEASURED on the pre-fix build, and both are bad:
+
+| program | result |
+|---|---|
+| `g.v = f();` (write lock held, callee write-locks) | **exit 0, silent corruption** |
+| `u32 r = g.v + f();` (read lock held, callee write-locks) | **HANG** (timeout 124) |
+
+The first is the worse one. A direct probe of glibc explains it: the second `wrlock`
+returns **EDEADLK (35)**, and the emitted C ignores the return value — so the callee
+writes with NO lock held. Worse, the callee's `unlock` then **succeeds (0)**, releasing
+the CALLER's lock, so every later access in the caller's statement is unlocked too. A
+compiler whose stated property is deadlock-freedom by construction was emitting the
+deadlock.
+
+**Why the existing check could never see it: the test is an INTERSECTION, not a count.**
+The full collection pass DEDUPES the callee's copy of a type the statement already
+touches directly, so `n` stayed at 1. The fix adds `lockchk_callee_only` — the mirror of
+the existing `lockchk_direct_only` — and intersects the two sets. No new walker: both
+modes run the SAME exhaustive collector, so there is no second place for a node kind to
+go missing.
+
+**BUG-980b — the one callee form no summary can resolve.** A call through a function
+pointer has no body to consult, so the statement's lock behaviour across it is unknown;
+it is now refused while a `shared(rw)` lock is held. Two boundaries had to be measured
+rather than assumed:
+
+- **A BARE NAME IS NOT NECESSARILY A FUNCTION.** `*() -> u32 fp = f; ... g.v = fp();`
+  has a `NODE_IDENT` callee naming a funcptr LOCAL, and the transitive lookup would
+  create an empty cache entry for it and contribute nothing — silently, which is the
+  failure mode the flag exists to prevent. One of the six reproducers was exactly this
+  and passed until the condition asked for a real function symbol.
+- **A BODYLESS EXTERN IS NOT OPAQUE FOR THIS QUESTION.** A first draft required a body,
+  which rejected `printf(...)` inside any statement holding a `shared(rw)` lock. A
+  cinclude'd C function can do anything, but it cannot take a ZER `shared(rw)` lock: the
+  rwlock is an emitter-generated FIELD of a ZER global, C has no name for it, and ZER
+  never hands out its address. Only an UNKNOWN TARGET is the hazard.
+
+Scoped to `shared(rw)` deliberately — a plain `shared` root re-entering is legal and
+common, and the callback-table idiom (`g.cb()`) must keep compiling. Both are pinned by
+`tests/zer/shared_rw_call_no_reentry_ok.zer`.
+
+### One over-rejection, taken deliberately
+
+Read-lock re-entry (`u32 r = g.v + f();` where `f` only READS) is refused too. Measured:
+glibc's default reader-preferring rwlock — which is what a zero-initialised
+`pthread_rwlock_t` is — returns 0 for a recursive `rdlock`, so the program would run.
+Refused for two reasons, both measured rather than argued: POSIX leaves it UNSPECIFIED
+whether a recursive rdlock succeeds while a writer waits (and glibc's documented
+`PREFER_WRITER_NONRECURSIVE_NP` deadlocks), and **the rule cannot see whether the callee
+reads or writes** — `FuncSharedTypes` records type ids only, so "the callee only reads"
+is not a fact available here, and guessing it is the direction that ACCEPTS. Pinned by
+`tests/zer_fail/shared_rw_reentrant_read_read_overreject.zer`; the fix sketch (a
+writes-bit per type in the summary) is in limitations.md.
+
+### The completeness gates
+
+Both classes are multi-site questions, so both got a grid in `tests/test_conc_matrix.c`
+rather than only a set of negatives (the matrix grew to 114 cells):
+
+- **CONCURRENT-WINDOW GRID** — position x spawn-kind x access-kind. A new way to start or
+  await a thread needs a cell.
+- **SHARED(RW) RE-ENTRY GRID** — callee form x lock kind. The PLAIN column is what proves
+  the rule is scoped; a new callee form needs a cell.
+
+**Both were verified to FIRE**, which is the only thing that distinguishes a gate from a
+script: built against `git archive HEAD` and run from that tree, the matrix reports **8
+false negatives** — exactly the 8 hazard cells (3 window, 5 re-entry) — and exits 1. Every
+other new cell passes on both builds, as it should.
+
+Two probe bugs were found and fixed while building them, both the same failure this file
+exists to catch, one level down:
+- The window grid's atomic cell used an atomic READ with an early `return`, which left the
+  ThreadHandle unjoined on that path — correctly rejected by a DIFFERENT rule. The two
+  accesses are now the same operation in two spellings (`g_ctr = 5;` vs
+  `@atomic_store(&g_ctr, 5);`), so the cell varies only the thing it names.
+- The bodyless-extern cell cannot LINK by construction, and `-o /dev/null` is not a `.c`
+  path so zerc builds an executable — ld's undefined symbol was being reported as an
+  over-rejection. That cell now runs through a new `run_pos_check_only`, which emits C so
+  the verdict is the CHECKER's.
+
+### Measurements
+
+- Corpus: 2341 files under both binaries, stderr compared for every diagnostic either
+  change can emit. **Zero differences.** Non-vacuous: 17 corpus files use `shared(rw)`.
+- All nine reproducers ACCEPTED on `git archive HEAD` (a27ab526); all nine rejected
+  after, each matching its own `expect-error`.
+- Boundary matrices run for both rules (7 cells each) — pre-spawn init, post-join
+  access, atomic-in-window, join-in-branch, plain-`shared` re-entry, hoisted call,
+  bodyless extern.
+
 ## Session 2026-09-11 — BUG-977/978: the last 2 of the fail-open class, and why they were not more of the same
 
 BUG-976 closed 15 of the 17 class-1 reproducers by flipping, reporting or widening.

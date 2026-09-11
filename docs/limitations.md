@@ -30,6 +30,37 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — a `shared(rw)` READ statement cannot call a function that also READS it (2026-09-11, LOW — over-rejection)
+
+**Symptom.** `u32 r = g.v + f();` where `g` is `shared(rw)` and `f` only READS `g.v` is
+refused with "a 'shared(rw)' lock is not re-entrant". Both accesses take a READ lock, and
+POSIX lets one thread hold several concurrent read locks.
+
+**Why it is refused anyway**, both measured rather than argued:
+1. POSIX leaves it UNSPECIFIED whether a recursive `rdlock` succeeds while a writer is
+   waiting. glibc's default is reader-preferring — and a zero-initialised
+   `pthread_rwlock_t`, which is what the emitter produces, IS the default — so it returns
+   0 today. Under glibc's documented `PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP` it
+   deadlocks. Accepting it makes correctness depend on an attribute ZER does not set.
+2. **The rule cannot see whether the callee reads or writes.** `FuncSharedTypes` records
+   TYPE IDS only. "The callee only reads it" is not a fact available at the check, and
+   guessing it is the direction that ACCEPTS — which is how the write/write case
+   (BUG-980, silent corruption) would come back.
+
+**Fix sketch.** Give `FuncSharedTypes` a parallel `writes[]` bit per recorded type, set in
+`scan_body_shared_types` when the shared field access is an assignment target. Then exempt
+direct-read + callee-read-only, mirroring the `both_rw && is_read_only` exemption the
+two-type deadlock rule already has. Note that rule's exemption is a STATEMENT-LEVEL
+heuristic (`stmt->kind != NODE_ASSIGN`) and does not know the callee either, so the
+writes-bit would improve both.
+
+**Corpus cost: zero** — measured over 2341 files, 17 of which use `shared(rw)`. The escape
+is one line: read into a local first.
+
+**Tripwire:** `tests/zer_fail/shared_rw_reentrant_read_read_overreject.zer`.
+
+---
+
 ## OPEN — a plain struct nested deeper than 64 cannot be COPIED (2026-09-11, LOW — over-rejection, valid program refused)
 
 **Symptom.** `H100 b = a;` where `H100` is a plain by-value struct nest 100 levels deep is
@@ -60,7 +91,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 83 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -116,7 +147,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 83 live), by class — and which branch to take
+### The 97 (now 74 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -153,9 +184,20 @@ An allocation stored into a field, index or slot loses tracking.
 `alloc_global_field_bare_spelling_dangling` `alloc_struct_value_into_slot_uaf`
 `alloc_nested_init_uaf` `alloc_nested_init_orelse_uaf` `slot_copy_alias_uaf` `slot_copy_alias_global_uaf`
 
-**3. `shared(rw)` RE-ENTRANCY — 6, data race. TAKE `vgonmt` (only branch with it).**
-`shared_rw_reentrant_call_write` `_two_hop` `_via_pointer` `_read_then_write`
-`shared_rw_reentrant_funcptr_call` `shared_rw_funcptr_field_call`
+### ~~3. `shared(rw)` RE-ENTRANCY — 6, data race~~ — CLOSED 2026-09-11 as BUG-980
+
+A `pthread_rwlock` is NOT recursive, so the statement-level deadlock rule's premise
+("a deadlock needs TWO locks") was false for `shared(rw)`: ONE type is enough, and the
+same-type case is exactly what its `id0 != id1` guard excluded. Measured on the pre-fix
+build: a held WRITE lock gave **exit 0 with silent corruption** (the second `wrlock`
+returns EDEADLK unchecked, so the callee runs unlocked AND its unlock releases the
+caller's lock), a held READ lock **HUNG**. The test is an INTERSECTION of the statement's
+direct types with what its callees reach — a count can never see it, because the full
+collection pass dedupes the callee's copy. Implemented as `lockchk_callee_only`, the
+mirror of the existing `lockchk_direct_only`, so both modes run the SAME collector.
+Gate: the RE-ENTRY GRID in `tests/test_conc_matrix.c` (callee form x lock kind — the
+PLAIN column is what proves the rule is scoped). Residual over-rejection (read/read)
+entered separately above.
 
 **4. LOOP COUNTER PAST END — 7, bounds. TAKE `vgonmt`.**
 `loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
@@ -167,8 +209,14 @@ An allocation stored into a field, index or slot loses tracking.
 `@inttoptr` → enum (2): `inttoptr_enum_target` `inttoptr_enum_in_struct`
 `@container` (5): `container_whole_object` `_alias` `_direct` `_global` `container_array_element`
 
-**6. ATOMIC CELL x SCOPED SPAWN — 3, race window. TAKE `vgonmt`.**
-`atomic_cell_scoped_spawn_window` `_via_helper` `_two_threads`
+### ~~6. ATOMIC CELL x SCOPED SPAWN — 3, race window~~ — CLOSED 2026-09-11 as BUG-979
+
+An exemption whose written rationale was narrower than its code: the comment said
+"a SCOPED spawn is joined, so post-join access is safe" (true) and the code set NOTHING,
+so the spawn..JOIN WINDOW was exempt too — the same race accepted purely for its
+spelling. The flag is now REFCOUNTED: the join closes the window, but only the last live
+one, and never when a fire-and-forget spawn also ran. Gate: the CONCURRENT-WINDOW GRID
+in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 
 **7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4, escape. TAKE `qo0mm9`** (has the 4th).
 `ptrtoint_local_via_call_alias` `_global` `_return` `_ptr_param`
@@ -238,7 +286,7 @@ asm reproducer; skip the rest.
 
 ### Suggested order
 
-Segfault (done) → class 1 (done) → classes 3 and 6 (data races) → class 2 (UAF/leak)
+Segfault (done) → class 1 (done) → classes 3 and 6 (done) → class 2 (UAF/leak)
 → class 5 (forging doors) → the rest.
 
 ---

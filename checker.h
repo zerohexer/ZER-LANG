@@ -222,6 +222,22 @@ typedef struct {
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
+    /* BUG-979: the SCOPED half of the same question. A scoped spawn opens a
+     * concurrent window that a join CLOSES, so unlike a fire-and-forget spawn the
+     * flag above cannot simply stay set — it has to be released, and only when the
+     * LAST live scoped thread is joined. `unbounded_spawn_in_func` records that a
+     * fire-and-forget spawn also ran, in which case no join may ever clear it. */
+    int live_scoped_threads;
+    bool unbounded_spawn_in_func;
+    /* BUG-980: the mirror of lockchk_direct_only — collect ONLY what the
+     * statement's CALLEES touch, skipping its own direct accesses. Intersecting
+     * the two sets is what makes same-type re-entry visible: the full pass
+     * DEDUPES the callee's copy of a type the statement already touches
+     * directly, which is exactly why `n >= 2` could never see it.
+     * lockchk_saw_opaque_call records a call whose callee is not a plain name,
+     * so the transitive summary could not be consulted at all. */
+    bool lockchk_callee_only;
+    bool lockchk_saw_opaque_call;
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */

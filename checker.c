@@ -8922,6 +8922,23 @@ static Type *check_expr(Checker *c, Node *node) {
                             typemap_set(c, field_node, result);
                             break;
                         }
+                        /* BUG-979: this join closes THIS thread's concurrent
+                         * window. It only closes the FUNCTION's window when no
+                         * other scoped thread is still running (`a.join(); g = 5;
+                         * b.join();` is still a race against b) and when no
+                         * fire-and-forget spawn ran, which nothing can join.
+                         * Guarded by th_live so a second join on the same handle
+                         * cannot drive the count negative. Reached only past the
+                         * conditional-nesting check above, so a join on SOME paths
+                         * leaves the window open — the same conservative direction
+                         * that check already takes for the borrow. */
+                        if (osym2->th_live) {
+                            osym2->th_live = false;
+                            if (c->live_scoped_threads > 0) c->live_scoped_threads--;
+                            if (c->live_scoped_threads == 0 &&
+                                !c->unbounded_spawn_in_func)
+                                c->after_spawn_in_func = false;
+                        }
                         for (int bi = 0; bi < osym2->th_borrow_count; bi++) {
                             Symbol *bv = scope_lookup(c->current_scope,
                                 osym2->th_borrow_names[bi],
@@ -18630,10 +18647,27 @@ static void check_stmt(Checker *c, Node *node) {
         /* spawn func(args); — validate function, check arg safety.
          * Also: scan spawned function body for non-shared global access (data race). */
         /* A6-full atomic-cell: a FIRE-AND-FORGET spawn runs unbounded — from here
-         * on in this function, a plain access to an atomic cell could race it. A
-         * SCOPED spawn (ThreadHandle) is joined, so post-join access is safe; the
-         * spawn..join window is the narrower scoped-borrow concern, not this. */
-        if (node->spawn_stmt.handle_name == NULL) c->after_spawn_in_func = true;
+         * on in this function, a plain access to an atomic cell could race it.
+         *
+         * BUG-979: AN EXEMPTION WHOSE WRITTEN RATIONALE WAS NARROWER THAN ITS CODE
+         * — the exact shape CLAUDE.md tells you to probe for. The old comment read
+         * "a SCOPED spawn (ThreadHandle) is joined, so post-join access is safe",
+         * which is TRUE and is not what the code did: it set NOTHING for a scoped
+         * spawn, so the spawn..JOIN WINDOW was unchecked too. `ThreadHandle t =
+         * spawn worker(); g_ctr = 5; t.join();` raced an @atomic_add in the worker
+         * and compiled clean, while the byte-identical fire-and-forget spelling was
+         * rejected — the same race accepted purely for its spelling.
+         *
+         * It is not covered elsewhere: the spawn-body scan EXEMPTS @atomic_* (that
+         * is the point of the atomic-cell model), and the scoped-BORROW rule
+         * (BUG-969) tracks locals lent by reference, not globals touched by name.
+         *
+         * So a scoped spawn opens the window too, and the join CLOSES it — but only
+         * the last one, and never if a fire-and-forget spawn also ran. */
+        if (node->spawn_stmt.handle_name == NULL) {
+            c->after_spawn_in_func = true;
+            c->unbounded_spawn_in_func = true;
+        }
         Symbol *func_sym = scope_lookup(c->global_scope,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
@@ -19014,6 +19048,17 @@ static void check_stmt(Checker *c, Node *node) {
             if (sym) {
                 sym->is_const = false;
                 sym->is_thread_handle = true;
+                /* BUG-979: the scoped spawn opens the concurrent window HERE. It is
+                 * closed by the join, not by the end of the function, so the flag is
+                 * refcounted rather than latched. th_spawn_branch_depth is recorded
+                 * for EVERY scoped spawn, not only one that borrows a local (the
+                 * borrow loop below sets it again to the same value) — the join's
+                 * conditional-nesting guard needs it whether or not anything was
+                 * lent by reference. */
+                sym->th_live = true;
+                sym->th_spawn_branch_depth = c->branch_depth;
+                c->live_scoped_threads++;
+                c->after_spawn_in_func = true;
                 typemap_set(c, node, ty_u64);
                 /* Scoped-borrow exclusivity: a non-shared stack local lent via
                  * `&x` to a scoped spawn is exclusively borrowed by the thread
@@ -20541,6 +20586,12 @@ static void check_func_body(Checker *c, Node *node) {
          * by >=2 threads" — a pre-spawn write is reached by only one). */
         bool saved_after_spawn = c->after_spawn_in_func;
         c->after_spawn_in_func = false;
+        /* BUG-979: the scoped-window counters are per-function too. Functions do
+         * not nest, but save/restore mirrors the flag above rather than assuming it. */
+        int saved_live_threads = c->live_scoped_threads;
+        bool saved_unbounded = c->unbounded_spawn_in_func;
+        c->live_scoped_threads = 0;
+        c->unbounded_spawn_in_func = false;
         /* Stage 1->2 escape summary: start complete with an empty param mask;
          * the NODE_RETURN handler classifies each valued return below (UNKNOWN
          * clears `complete`, ARParam(n) sets mask bit n; read into the Symbol
@@ -20568,6 +20619,8 @@ static void check_func_body(Checker *c, Node *node) {
          * param n), like ret_param_mask, computed once per function instead of
          * re-walking callee bodies per caller. Tracked in docs/limitations.md. */
         c->after_spawn_in_func = saved_after_spawn;
+        c->live_scoped_threads = saved_live_threads;
+        c->unbounded_spawn_in_func = saved_unbounded;
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
         c->in_naked = false;
@@ -24316,6 +24369,9 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                     if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
                         shared = inner;
                 }
+                /* BUG-980: in CALLEE-ONLY mode the statement's own accesses are
+                 * not the subject — only what its callees reach is. */
+                if (shared && c->lockchk_callee_only) shared = NULL;
                 if (shared) {
                     bool dup = false;
                     for (int i = 0; i < count; i++) {
@@ -24405,6 +24461,36 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
          * unlock, so a callee touching a second shared type really does nest. With
          * no direct access the statement emits no lock at all, so nothing can nest
          * and the callee's own per-statement locks are taken and released alone. */
+        /* BUG-980: a callee that is not a plain name — a funcptr local, a funcptr
+         * FIELD (`g.cb()`) — cannot be resolved to a body, so the transitive
+         * summary below simply does not run and the statement's lock behaviour
+         * across that call is UNKNOWN. Record that, rather than letting "did not
+         * look" read as "found nothing". */
+        if (c->lockchk_callee_only && expr->call.callee) {
+            if (expr->call.callee->kind != NODE_IDENT) {
+                c->lockchk_saw_opaque_call = true;
+            } else {
+                /* A BARE NAME IS NOT NECESSARILY A FUNCTION. `*() -> u32 fp = f;
+                 * ... fp()` has a NODE_IDENT callee that names a funcptr LOCAL, and
+                 * the transitive lookup below would create an empty cache entry for
+                 * it and contribute nothing — silently, which is the failure mode
+                 * this flag exists to prevent. Resolve it and require a real
+                 * function symbol with a body. */
+                Symbol *cs = scope_lookup(c->global_scope,
+                    expr->call.callee->ident.name,
+                    (uint32_t)expr->call.callee->ident.name_len);
+                /* A BODYLESS EXTERN IS NOT OPAQUE FOR THIS QUESTION. A cinclude'd C
+                 * function can do anything, but it cannot take a ZER `shared(rw)`
+                 * lock: the rwlock is an emitter-generated FIELD of a ZER global
+                 * and C has no name for it, and ZER never hands out its address. So
+                 * only a call whose TARGET IS UNKNOWN — a funcptr — is the hazard.
+                 * Measured while building this: requiring a body rejected
+                 * `printf(...)` inside any statement holding a shared(rw) lock,
+                 * which is a large over-rejection bought for nothing. */
+                if (!cs || !cs->is_function)
+                    c->lockchk_saw_opaque_call = true;
+            }
+        }
         if (!c->lockchk_direct_only &&
             count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {
             const char *cn = expr->call.callee->ident.name;
@@ -24555,6 +24641,87 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
         c->lockchk_direct_only = true;
         int ndirect = collect_shared_types_in_stmt(c, stmt, found, 4);
         c->lockchk_direct_only = false;
+
+        /* BUG-980: A `shared(rw)` LOCK IS NOT RE-ENTRANT, AND THE WHOLE DEADLOCK
+         * MODEL ASSUMED IT WAS.
+         *
+         * The rule above rejects two DIFFERENT shared types in one statement, on
+         * the reasoning that a deadlock needs two locks held at once. A plain
+         * `shared` struct emits a PTHREAD_MUTEX_RECURSIVE mutex, so the same lock
+         * taken twice on one thread is fine and that reasoning holds. A
+         * `shared(rw)` struct emits a pthread_rwlock, which is NOT recursive —
+         * so ONE type is enough, and the same-type case was the one shape the
+         * `id0 != id1` guard explicitly excluded.
+         *
+         * MEASURED on the pre-fix build, and the two outcomes are both bad:
+         *   `shared(rw) struct S { u32 v; } S g;
+         *    u32 f() { g.v = 2; return 1; }
+         *    u32 main() { g.v = f(); return 0; }`     -> exit 0, SILENT CORRUPTION
+         * glibc's second wrlock returns EDEADLK (35) and the emitted C ignores the
+         * return value, so f writes g.v with NO lock held; worse, f's unlock
+         * SUCCEEDS and releases the CALLER's lock, so every later access in main's
+         * statement is unlocked too. And with a read lock held instead:
+         *   `u32 r = g.v + f();`                       -> HANG (timeout)
+         * the writer waits for a reader that is itself. A compiler whose stated
+         * property is deadlock-freedom by construction was emitting the deadlock.
+         *
+         * The test is an INTERSECTION, not a count: a type touched DIRECTLY by
+         * this statement and ALSO reached through one of its calls. That is why
+         * the existing `n >= 2` pass could never see it — its transitive merge
+         * dedupes the callee's copy of a type already in the list.
+         *
+         * Scoped to shared(rw) deliberately. A plain `shared` root re-entering is
+         * legal and common, and rejecting it would break the callback-table idiom. */
+        if (ndirect > 0) {
+            Type *direct_rw[4]; int nrw = 0;
+            for (int di = 0; di < ndirect && di < 4; di++)
+                if (found[di]->struct_type.is_shared_rw) direct_rw[nrw++] = found[di];
+            if (nrw > 0) {
+                Type *viacall[4];
+                bool saved_opaque = c->lockchk_saw_opaque_call;
+                c->lockchk_saw_opaque_call = false;
+                c->lockchk_callee_only = true;
+                int nvia = collect_shared_types_in_stmt(c, stmt, viacall, 4);
+                bool opaque = c->lockchk_saw_opaque_call;
+                c->lockchk_callee_only = false;
+                c->lockchk_saw_opaque_call = saved_opaque;
+                for (int ri = 0; ri < nrw; ri++) {
+                    Type *T = direct_rw[ri];
+                    bool reentered = false;
+                    for (int vi = 0; vi < nvia; vi++)
+                        if (viacall[vi]->struct_type.type_id == T->struct_type.type_id) {
+                            reentered = true; break;
+                        }
+                    if (reentered) {
+                        checker_error(c, stmt->loc.line,
+                            "a 'shared(rw)' lock is not re-entrant: this statement "
+                            "holds '%.*s' and calls a function that takes '%.*s' "
+                            "again on the same thread — the second lock fails "
+                            "(EDEADLK, unchecked) so the callee runs UNLOCKED and "
+                            "its unlock releases this statement's lock; with a read "
+                            "lock held it deadlocks instead. Read the field into a "
+                            "local first, or call before the locked statement",
+                            (int)T->struct_type.name_len, T->struct_type.name,
+                            (int)T->struct_type.name_len, T->struct_type.name);
+                    } else if (opaque) {
+                        /* BUG-980b: the one callee form the summary cannot resolve.
+                         * Refusing it is the conservative direction and costs only
+                         * the funcptr-under-a-shared(rw)-lock shape — measured at
+                         * zero across the corpus. A plain `shared` root is
+                         * unaffected, so the callback-table idiom still compiles. */
+                        checker_error(c, stmt->loc.line,
+                            "this statement holds the 'shared(rw)' lock on '%.*s' "
+                            "and calls through a function pointer — the target is "
+                            "not known here, so the compiler cannot rule out that "
+                            "it takes '%.*s' again, which an rwlock does not "
+                            "survive (the callee would run unlocked, or deadlock). "
+                            "Call through the pointer outside the locked statement",
+                            (int)T->struct_type.name_len, T->struct_type.name,
+                            (int)T->struct_type.name_len, T->struct_type.name);
+                    }
+                }
+            }
+        }
         /* NOTE: this must gate the CHECK ONLY, never the recursion below. A first
          * draft used `continue` here and silently stopped descending into nested
          * bodies whose OWN statements had a direct access — `do { a.x = b.y; }

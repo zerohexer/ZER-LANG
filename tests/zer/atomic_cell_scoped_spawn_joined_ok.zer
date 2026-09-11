@@ -1,0 +1,21 @@
+// BUG-979 boundary: the scoped spawn opens the concurrent window and the JOIN closes
+// it. That is the exemption's real rationale, which the code did not implement before
+// (it exempted the spawn..join window too). Everything here must keep compiling:
+//   - a plain access BEFORE any spawn (single-threaded init)
+//   - a plain access AFTER the last join
+//   - an ATOMIC access inside the window
+//   - sequential spawn / join / spawn / join
+u32 g_ctr;
+void worker() { u32 v = @atomic_add(&g_ctr, 1); }
+u32 main() {
+    g_ctr = 0;                              /* pre-spawn init */
+    ThreadHandle a = spawn worker();
+    u32 seen = @atomic_load(&g_ctr);        /* atomic inside the window */
+    a.join();
+    ThreadHandle b = spawn worker();
+    b.join();
+    g_ctr = 5;                              /* post-join: window closed */
+    if (seen > 2) { return 1; }
+    if (g_ctr != 5) { return 2; }
+    return 0;
+}

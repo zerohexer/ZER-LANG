@@ -106,3 +106,13 @@ ir_lower.c:    Node  *inline_buf[16];
 # it just stops collecting, which is the conservative direction (fewer types found =
 # no false deadlock report).
 checker.c:        Type *scratch[4] = {0};
+
+# BUG-980 — the two scratch sets the shared(rw) re-entrancy check intersects. Both
+# mirror the CALLER's own bound exactly (collect_shared_types_in_stmt is passed
+# max_types=4 and refuses to write past it), the same justification as the
+# `Type *found[4]` above that they sit beside. The bound cannot hide a case: a
+# statement with two or more DISTINCT shared types is already reported by the
+# two-type deadlock rule, so this check only has work to do when there is exactly
+# one — and the read-only rw exemption tops out at the same 4.
+checker.c:            Type *direct_rw[4]; int nrw = 0;
+checker.c:                Type *viacall[4];

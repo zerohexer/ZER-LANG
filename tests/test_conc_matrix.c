@@ -95,6 +95,33 @@ static int run_neg(const char *name, const char *code) {
     return 0;
 }
 
+/* POSITIVE, CHECKER ONLY (2026-09-11). Emits C instead of building an executable,
+ * so the verdict is the CHECKER's and not the linker's. Needed for a cell whose
+ * whole point is a BODYLESS extern: `-o /dev/null` is not a .c path, so zerc builds
+ * an exe and ld fails on the undefined symbol — a link error reported as an
+ * over-rejection, which is the "rejected for a DIFFERENT reason" trap this file
+ * exists to catch, one level down. Per CLAUDE.md, `-o out.c` is the way to isolate
+ * the checker's verdict from GCC's, and emit-C mode does return non-zero on a
+ * checker error. */
+static int run_pos_check_only(const char *name, const char *code) {
+    total++;
+    FILE *f = fopen("/tmp/_zer_co.zer", "w");
+    if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
+    fputs(code, f); fclose(f);
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "%s /tmp/_zer_co.zer -o /tmp/_zer_co_out.c 2>/tmp/_zer_co.err", zerc_path);
+    if (system(cmd) == 0) { passed++; return 1; }
+    failed++; over_reject++;
+    char eb[4096]; eb[0] = 0;
+    FILE *e = fopen("/tmp/_zer_co.err", "r");
+    if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
+    fprintf(stderr, "  FAIL [OVER-REJECT] %s — safe pattern REJECTED BY THE CHECKER:\n", name);
+    fprintf(stderr, "    %.160s\n", eb);
+    fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
+    return 0;
+}
+
 /* POSITIVE: a correctly-synchronized pattern must compile. */
 static int run_pos(const char *name, const char *code) {
     total++;
@@ -618,6 +645,236 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
         extra, body);
 }
 
+/* ============================================================
+ * CONCURRENT-WINDOW GRID (2026-09-11, BUG-979)
+ *
+ * The atomic-cell rule asks "could this plain access be concurrent?", and the
+ * answer depends on TWO things the old code conflated into one: WHERE the access
+ * sits relative to the spawn, and WHETHER the thread has been joined. A scoped
+ * spawn was exempted wholesale on the reasoning that "post-join access is safe" —
+ * true of the position AFTER the join, and false of the window before it, which is
+ * how `ThreadHandle t = spawn worker(); g = 5; t.join();` compiled clean while the
+ * byte-identical fire-and-forget spelling was rejected.
+ *
+ * So the axes are POSITION x SPAWN-KIND x ACCESS-KIND, and the grid exists to keep
+ * the four true cells and the four false ones apart as spellings are added. A new
+ * way to start or await a thread needs a cell HERE.
+ * ============================================================ */
+typedef enum {
+    WP_BEFORE,          /* plain access before any spawn — single-threaded init */
+    WP_WINDOW,          /* between spawn and join (or after a fire-and-forget)   */
+    WP_WINDOW_HELPER,   /* same, but the access is inside a callee               */
+    WP_AFTER_JOIN,      /* after the join — the exemption's actual rationale     */
+    WP_BETWEEN_JOINS,   /* two threads, one joined: the other is still running   */
+    WP_COUNT
+} WinPos;
+typedef enum { WK_SCOPED, WK_FIRE, WK_COUNT } WinKind;
+typedef enum { WA_PLAIN, WA_ATOMIC, WA_COUNT } WinAccess;
+
+static const char *wp_name(WinPos p) {
+    switch (p) {
+    case WP_BEFORE:        return "before-spawn";
+    case WP_WINDOW:        return "in-window";
+    case WP_WINDOW_HELPER: return "in-window-helper";
+    case WP_AFTER_JOIN:    return "after-join";
+    case WP_BETWEEN_JOINS: return "between-joins";
+    case WP_COUNT:         break;
+    }
+    return "?";
+}
+static const char *wk_name(WinKind k) {
+    switch (k) {
+    case WK_SCOPED: return "scoped";
+    case WK_FIRE:   return "fire-and-forget";
+    case WK_COUNT:  break;
+    }
+    return "?";
+}
+static const char *wa_name(WinAccess a) {
+    switch (a) {
+    case WA_PLAIN:  return "plain";
+    case WA_ATOMIC: return "atomic";
+    case WA_COUNT:  break;
+    }
+    return "?";
+}
+
+/* A fire-and-forget thread is never joined, so the two join-relative positions do
+ * not exist for it. */
+static int win_cell_valid(WinPos p, WinKind k) {
+    if (k == WK_FIRE && (p == WP_AFTER_JOIN || p == WP_BETWEEN_JOINS)) return 0;
+    return 1;
+}
+
+/* NEGATIVE exactly when the access is PLAIN and genuinely concurrent. */
+static int win_is_negative(WinPos p, WinKind k, WinAccess a) {
+    (void)k;
+    if (a == WA_ATOMIC) return 0;          /* atomic access is the remedy, never a race */
+    switch (p) {
+    case WP_BEFORE:        return 0;       /* one thread exists */
+    case WP_AFTER_JOIN:    return 0;       /* the thread is done */
+    case WP_WINDOW:        return 1;
+    case WP_WINDOW_HELPER: return 1;
+    case WP_BETWEEN_JOINS: return 1;       /* the SECOND thread is still running */
+    case WP_COUNT:         break;
+    }
+    return 0;
+}
+
+static void gen_window(WinPos p, WinKind k, WinAccess a, char *out, size_t n) {
+    /* The two accesses are deliberately the SAME operation in two spellings, so
+     * the only thing the cell varies is plain-vs-atomic. An earlier draft used an
+     * atomic READ with an early `return`, which left the ThreadHandle unjoined on
+     * that path and was correctly rejected for a DIFFERENT rule — a probe that
+     * measures the wrong thing, which is the failure this whole file guards. */
+    const char *acc = (a == WA_PLAIN) ? "g_ctr = 5;" : "@atomic_store(&g_ctr, 5);";
+    const char *helper_decl = (p == WP_WINDOW_HELPER)
+        ? ((a == WA_PLAIN) ? "void poke() { g_ctr = 5; }\n"
+                           : "void poke() { @atomic_store(&g_ctr, 5); }\n")
+        : "";
+    char body[768]; body[0] = 0;
+    const char *start = (k == WK_SCOPED) ? "ThreadHandle t = spawn worker();"
+                                         : "spawn worker();";
+    switch (p) {
+    case WP_BEFORE:
+        snprintf(body, sizeof(body), "%s\n    %s\n    %s", acc, start,
+                 (k == WK_SCOPED) ? "t.join();" : "");
+        break;
+    case WP_WINDOW:
+        snprintf(body, sizeof(body), "%s\n    %s\n    %s", start, acc,
+                 (k == WK_SCOPED) ? "t.join();" : "");
+        break;
+    case WP_WINDOW_HELPER:
+        snprintf(body, sizeof(body), "%s\n    poke();\n    %s", start,
+                 (k == WK_SCOPED) ? "t.join();" : "");
+        break;
+    case WP_AFTER_JOIN:
+        snprintf(body, sizeof(body), "%s\n    t.join();\n    %s", start, acc);
+        break;
+    case WP_BETWEEN_JOINS:
+        snprintf(body, sizeof(body),
+                 "ThreadHandle a = spawn worker();\n"
+                 "    ThreadHandle b = spawn worker();\n"
+                 "    a.join();\n    %s\n    b.join();", acc);
+        break;
+    case WP_COUNT: break;
+    }
+    snprintf(out, n,
+        "u32 g_ctr;\n"
+        "void worker() { u32 v = @atomic_add(&g_ctr, 1); }\n"
+        "%s"
+        "u32 main() {\n    %s\n    return 0;\n}\n",
+        helper_decl, body);
+}
+
+/* ============================================================
+ * SHARED(RW) RE-ENTRY GRID (2026-09-11, BUG-980)
+ *
+ * A `pthread_rwlock` is NOT recursive; a plain `shared` mutex IS
+ * (PTHREAD_MUTEX_RECURSIVE). The whole statement-level deadlock rule was built on
+ * "a deadlock needs two DIFFERENT locks", which is true only for the recursive
+ * one — so the lock KIND is a real axis and every callee form has to be asked
+ * against both. The callee axis is the other half: the transitive summary resolves
+ * a named function and cannot resolve a funcptr, and a bare NAME can be either.
+ *
+ * A new callee form needs a cell HERE.
+ * ============================================================ */
+typedef enum {
+    RC_DIRECT,        /* statement calls f, f touches the same root            */
+    RC_TWO_HOP,       /* ... through an intermediate that touches nothing      */
+    RC_VIA_POINTER,   /* both accesses go through a *S pointer                 */
+    RC_FUNCPTR_LOCAL, /* callee is a NODE_IDENT naming a funcptr local         */
+    RC_FUNCPTR_FIELD, /* callee is a field of the shared struct itself         */
+    RC_NO_SHARED,     /* callee touches nothing shared — must compile          */
+    RC_EXTERN,        /* bodyless extern: C cannot name a ZER rwlock           */
+    RC_COUNT
+} ReCallee;
+typedef enum { RL_RW, RL_PLAIN, RL_COUNT } ReLock;
+
+static const char *rc_name(ReCallee c) {
+    switch (c) {
+    case RC_DIRECT:        return "direct";
+    case RC_TWO_HOP:       return "two-hop";
+    case RC_VIA_POINTER:   return "via-pointer";
+    case RC_FUNCPTR_LOCAL: return "funcptr-local";
+    case RC_FUNCPTR_FIELD: return "funcptr-field";
+    case RC_NO_SHARED:     return "callee-touches-none";
+    case RC_EXTERN:        return "bodyless-extern";
+    case RC_COUNT:         break;
+    }
+    return "?";
+}
+static const char *rl_name(ReLock l) {
+    switch (l) {
+    case RL_RW:    return "shared(rw)";
+    case RL_PLAIN: return "shared";
+    case RL_COUNT: break;
+    }
+    return "?";
+}
+
+/* A funcptr FIELD has to live on the shared struct, so that form needs the struct
+ * to carry it in both lock kinds — always valid. Everything else is valid too; the
+ * grid is deliberately full so the PLAIN column proves the rule is scoped. */
+static int re_is_negative(ReCallee c, ReLock l) {
+    if (l == RL_PLAIN) return 0;           /* recursive mutex: every form is legal */
+    switch (c) {
+    case RC_DIRECT:        return 1;
+    case RC_TWO_HOP:       return 1;
+    case RC_VIA_POINTER:   return 1;
+    case RC_FUNCPTR_LOCAL: return 1;       /* unknown target under a held rwlock */
+    case RC_FUNCPTR_FIELD: return 1;
+    case RC_NO_SHARED:     return 0;
+    case RC_EXTERN:        return 0;
+    case RC_COUNT:         break;
+    }
+    return 0;
+}
+
+static void gen_reentry(ReCallee c, ReLock l, char *out, size_t n) {
+    const char *kw = (l == RL_RW) ? "shared(rw) struct" : "shared struct";
+    const char *fields = (c == RC_FUNCPTR_FIELD) ? "*() -> u32 cb; u32 v;" : "u32 v;";
+    const char *extra = "";
+    const char *stmt = "";
+    switch (c) {
+    case RC_DIRECT:
+        extra = "u32 f() { g.v = 2; return 1; }\n";
+        stmt  = "g.v = f();";
+        break;
+    case RC_TWO_HOP:
+        extra = "u32 f() { g.v = 2; return 1; }\nu32 outer() { return f(); }\n";
+        stmt  = "g.v = outer();";
+        break;
+    case RC_VIA_POINTER:
+        extra = "u32 f(*S p) { p.v = 2; return 1; }\n";
+        stmt  = "*S p = &g; p.v = f(p);";
+        break;
+    case RC_FUNCPTR_LOCAL:
+        extra = "u32 f() { g.v = 2; return 1; }\n";
+        stmt  = "*() -> u32 fp = f; g.v = fp();";
+        break;
+    case RC_FUNCPTR_FIELD:
+        extra = "u32 f() { g.v = 2; return 1; }\n";
+        stmt  = "g.cb = f; u32 r = g.cb(); if (r > 9) { return 1; }";
+        break;
+    case RC_NO_SHARED:
+        extra = "u32 pure() { return 7; }\n";
+        stmt  = "g.v = pure();";
+        break;
+    case RC_EXTERN:
+        extra = "u32 ext(u32 a);\n";
+        stmt  = "g.v = ext(1);";
+        break;
+    case RC_COUNT: break;
+    }
+    snprintf(out, n,
+        "%s S { %s }\n"
+        "S g;\n"
+        "%s"
+        "u32 main() { %s return 0; }\n",
+        kw, fields, extra, stmt);
+}
+
 int main(void) {
     find_zerc();
     fprintf(stderr, "=== Concurrency (data-race / spawn / deadlock) matrix ===\n");
@@ -688,6 +945,49 @@ int main(void) {
         int ok = run_neg(nm, ibuf);
         fprintf(stderr, "  [%-18s][isr] %s\n", isr_name(r), ok ? "ok" : "*** FAIL ***");
         if (!ok) grid_ok = 0;
+    }
+
+    /* ---- concurrent-window grid (BUG-979) ---- */
+    fprintf(stderr, "\n  -- concurrent-window grid (position x spawn-kind x access-kind) --\n");
+    char wbuf[2048];
+    for (WinPos p = 0; p < WP_COUNT; p++) {
+        for (WinKind k = 0; k < WK_COUNT; k++) {
+            if (!win_cell_valid(p, k)) continue;
+            for (WinAccess a = 0; a < WA_COUNT; a++) {
+                valid_cells++;
+                int neg = win_is_negative(p, k, a);
+                char nm[192];
+                snprintf(nm, sizeof(nm), "window/%s/%s/%s",
+                         wp_name(p), wk_name(k), wa_name(a));
+                gen_window(p, k, a, wbuf, sizeof(wbuf));
+                int ok = neg ? run_neg(nm, wbuf) : run_pos(nm, wbuf);
+                fprintf(stderr, "  [%-16s][%-15s][%-6s][%-3s] %s\n",
+                        wp_name(p), wk_name(k), wa_name(a), neg ? "neg" : "pos",
+                        ok ? "ok" : "*** FAIL ***");
+                if (!ok) grid_ok = 0;
+            }
+        }
+    }
+
+    /* ---- shared(rw) re-entry grid (BUG-980) ---- */
+    fprintf(stderr, "\n  -- shared(rw) re-entry grid (callee form x lock kind) --\n");
+    char ebuf[2048];
+    for (ReCallee rc = 0; rc < RC_COUNT; rc++) {
+        for (ReLock rl = 0; rl < RL_COUNT; rl++) {
+            valid_cells++;
+            int neg = re_is_negative(rc, rl);
+            char nm[192];
+            snprintf(nm, sizeof(nm), "reentry/%s/%s", rc_name(rc), rl_name(rl));
+            gen_reentry(rc, rl, ebuf, sizeof(ebuf));
+            /* The bodyless-extern cell cannot LINK by construction. */
+            int ok = neg ? run_neg(nm, ebuf)
+                         : (rc == RC_EXTERN ? run_pos_check_only(nm, ebuf)
+                                            : run_pos(nm, ebuf));
+            fprintf(stderr, "  [%-20s][%-10s][%-3s] %s\n",
+                    rc_name(rc), rl_name(rl), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
+            if (!ok) grid_ok = 0;
+        }
     }
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);

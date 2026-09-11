@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: not re-entrant
+// BUG-980 (from claude/loving-davinci-vgonmt, body verbatim): the direct access and the callee's access both go
+// through a `*S` POINTER, not the global by name — the shape the AUDIT-2026-06-28
+// object-type walk exists for.
+shared(rw) struct S { u32 v; }
+S g;
+u32 f(*S p) { p.v = 2; return 1; }
+u32 main() { *S p = &g; p.v = f(p); return 0; }

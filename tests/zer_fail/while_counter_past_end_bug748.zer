@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: loop provably performs an out-of-bounds access
+// BUG-748 (2026-06-18) made this a WARNING + auto-guard (the body used to be
+// checked under the outer [0,0] range of `i`, eliding the guard — silent stack
+// OOB). BUG-981 (2026-09-11): the auto-guard's runtime form is a silent early
+// RETURN, so the canonical off-by-N loop was still silent at run time. A counted
+// loop with a constant entry value, a constant bound and a trailing constant
+// increment gives the WILL-hold fact: `i` takes every value 0..9, and 5..9 index
+// past the end of a 5-element array — a proven OOB, now a compile error. The
+// runtime-bound sibling (tests/zer/while_vrp_autoguard_runtime_bound.zer) keeps
+// the warning + guard path covered.
+u32 main() {
+    u32 i = 0;
+    u32[5] arr;
+    while (i < 10) {
+        arr[i] = 99;
+        i += 1;
+    }
+    return 0;
+}

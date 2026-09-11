@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: enum or bool
+// BUG-1012 (2026-09-11): `@ptrcast(*bool, *u8)` minted a *bool; the load through
+// it was 2, so `b == true` and `b == false` were BOTH false — measured exit 3 on
+// the pre-fix build (from vigilant-tesla-fhf8rn, their BUG-918).
+u8 raw() { return 2; }
+u32 main() { u8 r = raw(); *u8 q = &r; *bool p = @ptrcast(*bool, q); bool b = *p;
+if (b == true) { return 1; } if (b == false) { return 2; } return 3; }

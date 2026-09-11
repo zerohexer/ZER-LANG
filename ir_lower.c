@@ -157,6 +157,9 @@ typedef struct {
 /* ---- Helpers ---- */
 
 static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    /* BUG-1030: mark every instruction lowered inside a defer body; clones
+     * copy the struct, so every spliced fire site carries it. */
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -436,6 +439,10 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
 
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
+    /* BUG-1030: the 3AC twin of emit_inst — a decomposed operand read inside a
+     * defer body (`_zer_t1 = arr[i]` from a loop condition) must carry the
+     * marker too, or its emitter guard takes the early return. */
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
 }
 
@@ -2336,6 +2343,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         orelse_node->orelse.fallback_is_break ||
         orelse_node->orelse.fallback_is_continue) {
         ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+        ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-988 */
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
@@ -2349,8 +2357,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
          * lowering split into sub-blocks"); the bare form did not, because before the
          * splice it never split. Same question, two sites, one of them updated — the
          * sibling-site shape this project keeps recording. */
-        if (ctx->current_block != bb_fail)
+        if (ctx->current_block != bb_fail) {
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-988 */
+        }
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
@@ -2366,8 +2376,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-988 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2378,8 +2390,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-988 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2427,10 +2441,12 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
             IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
             if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
                 ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+                ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-988 */
                 /* Also tag the ending block if it's different from bb_fail
                  * (block lowering may have split into sub-blocks) */
                 if (ctx->current_block != bb_fail) {
                     ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+                    ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;
                 }
             }
         }
@@ -2525,6 +2541,86 @@ static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local,
     ctx->current_block = bb_join;
 }
 
+/* BUG-972: THE per-statement wrapper — bounds guards, then the shared-struct
+ * lock, then the statement, then the unlock. It used to be the body of the
+ * NODE_BLOCK loop only, so a statement that is lowered WITHOUT passing through a
+ * NODE_BLOCK got none of it. Two grammar forms produce exactly such a statement:
+ *
+ *     defer g.v += 1;                    // statement-form defer body (NODE_EXPR_STMT)
+ *     switch (x) { 1 => g.v = 5, ... }   // expression-form switch arm (NODE_EXPR_STMT)
+ *
+ * The parser wraps both in a bare NODE_EXPR_STMT rather than a NODE_BLOCK, and the
+ * defer template / switch arm lowering handed that node straight to lower_stmt.
+ * MEASURED on the pre-fix compiler: both wrote the shared struct with NO mutex
+ * while the brace-form twins one keyword away locked correctly — the
+ * two-spellings-of-one-program class, at the lock sink. The guard half had the
+ * same gap: the statement-form defer body got no IR guard and fell back to the
+ * emitter's raw-AST guard, which re-emitted the defer body INSIDE the guard's
+ * early-return path.
+ *
+ * ONE function, called from the block loop AND from every site that lowers a
+ * single statement outside a block, so a third grammar form cannot repeat this. */
+static void lower_stmt_in_block(LowerCtx *ctx, Node *stmt) {
+    if (!stmt) return;
+    Node *shared_root;
+    SharedRootVec shared_extra; srv_init(&shared_extra);
+    /* BUG-956: bounds guards BEFORE the lock. BUG-952 established the
+     * ordering; here it also makes the early return legal, because no
+     * lock is held yet at this point. */
+    lower_stmt_guards(ctx, stmt);
+    emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
+    /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
+     * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
+     * IR_RETURN terminates the block. Cross-thread access then
+     * deadlocks waiting for the never-released mutex. Lower the
+     * return expression to a temp local first, emit IR_UNLOCK,
+     * then emit IR_RETURN. The deferred-fire and IR_RETURN bits
+     * mirror lower_stmt's NODE_RETURN handler. */
+    if (shared_root && stmt->kind == NODE_RETURN) {
+        Node *ret_expr = stmt->ret.expr;
+        IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
+        if (ret_expr) {
+            rewrite_idents(ctx, ret_expr);
+            ret.src1_local = lower_expr(ctx, ret_expr);
+            if (ret.src1_local < 0) ret.expr = ret_expr;
+        }
+        emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
+        emit_defer_fire(ctx, stmt->loc.line);
+        emit_inst(ctx, ret);
+        srv_free(&shared_extra);
+        return;
+    }
+    /* Expose the active root to lower_stmt so exit statements
+     * (other than NODE_RETURN above) can also release the lock.
+     *
+     * When the current inner stmt has no lock of its own
+     * (shared_root NULL) but an outer stmt's lock is still active
+     * (prev_shared non-NULL), INHERIT prev_shared so a nested
+     * early-exit (e.g., `x = outer.field orelse { return; }`
+     * block-fallback path containing a plain `return;`) still
+     * releases the outer lock before the IR_RETURN. Without
+     * inheritance, the inner return sees current_stmt_shared_root=
+     * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
+     * deadlock. */
+    Node *prev_shared = ctx->current_stmt_shared_root;
+    ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
+    lower_stmt(ctx, stmt);
+    ctx->current_stmt_shared_root = prev_shared;
+    emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
+    /* BUG-935: the vector is per-STATEMENT and may have grown onto the
+     * heap, so it is released at the end of every use. */
+    srv_free(&shared_extra);
+}
+
+/* BUG-972: a BODY position that the grammar may fill with either a block or a
+ * single statement. A block routes every statement through lower_stmt_in_block
+ * via its own loop; a bare statement must be routed there explicitly. */
+static void lower_body(LowerCtx *ctx, Node *body) {
+    if (!body) return;
+    if (body->kind == NODE_BLOCK) lower_stmt(ctx, body);
+    else lower_stmt_in_block(ctx, body);
+}
+
 /* Lower a single statement */
 static void lower_stmt(LowerCtx *ctx, Node *node) {
     if (!node) return;
@@ -2558,57 +2654,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool managed_by_enclosing = (ctx->block_defers_managed > 0);
         if (managed_by_enclosing) ctx->block_defers_managed--;
         ctx->func->current_scope++;
-        for (int i = 0; i < node->block.stmt_count; i++) {
-            Node *shared_root;
-            SharedRootVec shared_extra; srv_init(&shared_extra);
-            Node *stmt = node->block.stmts[i];
-            /* BUG-956: bounds guards BEFORE the lock. BUG-952 established the
-             * ordering; here it also makes the early return legal, because no
-             * lock is held yet at this point. */
-            lower_stmt_guards(ctx, stmt);
-            emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
-            /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
-             * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
-             * IR_RETURN terminates the block. Cross-thread access then
-             * deadlocks waiting for the never-released mutex. Lower the
-             * return expression to a temp local first, emit IR_UNLOCK,
-             * then emit IR_RETURN. The deferred-fire and IR_RETURN bits
-             * mirror lower_stmt's NODE_RETURN handler. */
-            if (shared_root && stmt->kind == NODE_RETURN) {
-                Node *ret_expr = stmt->ret.expr;
-                IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
-                if (ret_expr) {
-                    rewrite_idents(ctx, ret_expr);
-                    ret.src1_local = lower_expr(ctx, ret_expr);
-                    if (ret.src1_local < 0) ret.expr = ret_expr;
-                }
-                emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
-                shared_root = NULL;
-                emit_defer_fire(ctx, stmt->loc.line);
-                emit_inst(ctx, ret);
-                continue;
-            }
-            /* Expose the active root to lower_stmt so exit statements
-             * (other than NODE_RETURN above) can also release the lock.
-             *
-             * When the current inner stmt has no lock of its own
-             * (shared_root NULL) but an outer stmt's lock is still active
-             * (prev_shared non-NULL), INHERIT prev_shared so a nested
-             * early-exit (e.g., `x = outer.field orelse { return; }`
-             * block-fallback path containing a plain `return;`) still
-             * releases the outer lock before the IR_RETURN. Without
-             * inheritance, the inner return sees current_stmt_shared_root=
-             * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
-             * deadlock. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
-            lower_stmt(ctx, stmt);
-            ctx->current_stmt_shared_root = prev_shared;
-            emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
-            /* BUG-935: the vector is per-STATEMENT and may have grown onto the
-             * heap, so it is released at the end of every iteration. */
-            srv_free(&shared_extra);
-        }
+        /* BUG-972: the per-statement guard/lock/unlock wrapper is ONE function
+         * (lower_stmt_in_block) shared with every non-block body position. */
+        for (int i = 0; i < node->block.stmt_count; i++)
+            lower_stmt_in_block(ctx, node->block.stmts[i]);
         /* Fire defers pushed inside THIS block at block exit.
          *
          * Same ordering problem as loops (BUG-544): if we fire+POP here and
@@ -3315,6 +3364,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          *   captures &sw_ref->variant persist to the original.
          *   For everything else: sw_ref is NODE_IDENT to a value local. */
         Node *sw_ref = NULL;
+        /* BUG-950: LOCAL holding the hoisted switch value for the non-union
+         * path. Needed by the exhaustive-enum totality guard below — see the
+         * `elide_compare` comment. -1 when there is no such local (unions). */
+        int sw_val_local = -1;
         if (is_union) {
             Node *sw_expr = node->switch_stmt.expr;
             /* B2: when the union switch root is a shared struct, do NOT take the
@@ -3380,6 +3433,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *pl = &ctx->func->locals[ptr_local];
+            sw_val_local = ptr_local;   /* BUG-1031 union totality guard */
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
             sw_ref->kind = NODE_IDENT;
@@ -3394,6 +3448,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
+            sw_val_local = val_local;
             sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
             memset(sw_ref, 0, sizeof(Node));
             sw_ref->kind = NODE_IDENT;
@@ -3429,6 +3484,51 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         bool is_exhaustive_enum = is_enum && !has_default &&
                                   node->switch_stmt.arm_count > 0;
+
+        /* BUG-1031: the UNION sibling of BUG-950. A union switch with no default
+         * is checked exhaustive over the declared variants, so every value is
+         * promised an arm. A tag that is not a declared variant index — a union
+         * read from an MMIO register or handed over by a cinclude function —
+         * matches NO arm and the switch silently does nothing, with no
+         * diagnostic and no fault on hosted or bare metal. Measured: a union
+         * read through `@inttoptr(*U, addr)` with tag 77 fell straight through
+         * to the statement after the switch.
+         *
+         * Different shape from the enum case, so a different placement: the
+         * union chain keeps its last comparison (only the ENUM chain elides
+         * one), so there is nothing to attach to at the tail. The check goes in
+         * front of the whole chain instead, in its own block reached by an
+         * unconditional goto. One block, one edge, exactly one predecessor —
+         * no join is created, so the CFG merge and the leak/MAYBE_FREED
+         * fixpoint see the same shape they saw before. */
+        /* BUG-1023: the BOOL sibling of the union guard below. The checker
+         * REQUIRES a bool switch to handle both `true` and `false`, so every
+         * value is promised an arm — but a bool is a `uint8_t` and one carrying
+         * 2 (a cinclude function returning a non-normalised byte, an MMIO read)
+         * matched NEITHER arm while `if (b)` on the same value took the TRUE
+         * branch. Same placement and the same one-block/one-edge shape as the
+         * union guard. */
+        bool is_bool_sw = sw_eff && type_dispatch_kind(sw_eff) == TYPE_BOOL;
+        if (is_bool_sw && !has_default && node->switch_stmt.arm_count > 0 &&
+            sw_val_local >= 0) {
+            int bb_bguard = ir_add_block(ctx->func, ctx->arena);
+            IRInst bg = make_inst(IR_GOTO, node->loc.line);
+            bg.goto_block = bb_bguard;
+            bg.cast_type = sw_eff;
+            bg.src1_local = sw_val_local;
+            emit_inst(ctx, bg);
+            ctx->current_block = bb_bguard;
+        }
+        if (is_union && !has_default && node->switch_stmt.arm_count > 0 &&
+            sw_val_local >= 0 && sw_eff && sw_eff->union_type.variant_count > 0) {
+            int bb_guard = ir_add_block(ctx->func, ctx->arena);
+            IRInst ug = make_inst(IR_GOTO, node->loc.line);
+            ug.goto_block = bb_guard;
+            ug.cast_type = sw_eff;
+            ug.src1_local = sw_val_local;
+            emit_inst(ctx, ug);
+            ctx->current_block = bb_guard;
+        }
 
         /* BUG-840: the dispatch chain is built arm-by-arm and the DEFAULT arm's
          * entry is an UNCONDITIONAL goto. Emitting it in the MIDDLE of the chain
@@ -3468,9 +3568,42 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             if (arm->is_default) {
                 ensure_terminated(ctx, bb_arm);
             } else if (elide_compare) {
-                /* Unconditional entry — last arm of exhaustive enum */
+                /* Unconditional entry — last arm of exhaustive enum.
+                 *
+                 * BUG-950: the premise above ("the condition is always true for
+                 * the remaining variant") holds only for a value that IS one of
+                 * the declared variants. It is not the compiler's to assume: an
+                 * enum value can reach here carrying a non-variant bit pattern
+                 * through a boundary the language does not own —
+                 *   - a cinclude/extern C function returning the enum type
+                 *     (`HAL_Status st = HAL_UART_Transmit(...)`),
+                 *   - an MMIO read: `volatile *St r = @inttoptr(*St, ADDR); *r`,
+                 *   - `@pun(*St, p)` followed by a deref.
+                 * The three CONVERSION doors (@bitcast/@truncate/@saturate) each
+                 * trap at the point of forgery (BUG-843/864/891/910), but a LOAD
+                 * is not a conversion and none of them sees it. With the compare
+                 * elided the non-variant then silently executed the LAST arm —
+                 * no diagnostic, no fault, and on bare metal no crash either:
+                 * just the wrong action. Measured: all three routes above ran
+                 * the `.c` arm for a value of 99.
+                 *
+                 * The CFG must stay as it is — the elision exists so bb_exit
+                 * gains no spurious predecessor carrying pre-switch state (that
+                 * caused MAYBE_FREED false positives on `rt_borrowck_switch_all_free`).
+                 * So the guard is emitted INSIDE the dispatch block, ahead of
+                 * the unconditional goto, exactly like every other `_zer_trap`
+                 * wrapper: no new edge, no new block, CFG identical.
+                 *
+                 * The guard is BUG-1022's BRANCH -> bb_trap inside the arm (see
+                 * "re-check the value INSIDE the arm" at the arm body). */
                 IRInst go = make_inst(IR_GOTO, node->loc.line);
                 go.goto_block = bb_arm;
+                /* The ENUM totality guard is BUG-1022's IR-level BRANCH at the
+                 * top of this arm (below, "re-check the value INSIDE the arm"),
+                 * so it is a real CFG edge zercheck sees. The goto-annotation
+                 * form (cast_type on this goto, read by the emitter) is kept
+                 * for the UNION and BOOL siblings only, whose guard is not
+                 * spellable in AST. */
                 emit_inst(ctx, go);
             } else {
                 /* Build per-arm comparison: OR of equality checks */
@@ -3687,6 +3820,94 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Arm body */
             ctx->current_block = bb_arm;
 
+            /* BUG-1022: the elided compare above assumed the switch value IS one
+             * of the variants. It need not be: `enum E { a = 1, b = 2 }` in a
+             * calloc'd / pool / arena struct is 0, and a forged value from a
+             * cinclude'd C function or an MMIO load is anything. All of them
+             * silently ran THIS arm (measured: `alloc(S)` carrying such an enum,
+             * `switch (p.e) { .a => 1, .b => 2 }` returned 2). The comment at the
+             * elision above had described this guard as "below" since BUG-950 was
+             * adopted; the guard itself never was. Keep the elided entry — it is
+             * what keeps the zercheck CFG free of a spurious bb_exit predecessor
+             * (see is_exhaustive_enum) — but re-check the value INSIDE the arm and
+             * trap on a mismatch. The guard's join carries an identical state on
+             * both edges, so the flow lattice is unaffected. Same trap-at-the-
+             * consumer stance as the enum-forge doors; this closes the doors no
+             * conversion opens. */
+            if (elide_compare && is_enum) {
+                Node *gcmp = NULL;
+                for (int vi = 0; vi < arm->value_count; vi++) {
+                    const char *vname = NULL;
+                    size_t vlen = 0;
+                    if (arm->values[vi]->kind == NODE_IDENT) {
+                        vname = arm->values[vi]->ident.name;
+                        vlen = arm->values[vi]->ident.name_len;
+                    } else if (arm->values[vi]->kind == NODE_FIELD) {
+                        vname = arm->values[vi]->field.field_name;
+                        vlen = arm->values[vi]->field.field_name_len;
+                    }
+                    int64_t variant_value = 0;
+                    bool found_v = false;
+                    if (vname) {
+                        for (uint32_t ei = 0; ei < sw_eff->enum_type.variant_count; ei++) {
+                            if (sw_eff->enum_type.variants[ei].name_len == vlen &&
+                                memcmp(sw_eff->enum_type.variants[ei].name, vname, vlen) == 0) {
+                                variant_value = (int64_t)sw_eff->enum_type.variants[ei].value;
+                                found_v = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!found_v) { gcmp = NULL; break; }   /* unknown spelling — no guard */
+                    Node *glit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(glit, 0, sizeof(Node));
+                    glit->kind = NODE_INT_LIT;
+                    glit->loc = node->loc;
+                    glit->int_lit.value = (uint64_t)variant_value;
+                    Node *geq = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(geq, 0, sizeof(Node));
+                    geq->kind = NODE_BINARY;
+                    geq->loc = node->loc;
+                    geq->binary.op = TOK_EQEQ;
+                    geq->binary.left = sw_ref;
+                    geq->binary.right = glit;
+                    if (!gcmp) {
+                        gcmp = geq;
+                    } else {
+                        Node *gor = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                        memset(gor, 0, sizeof(Node));
+                        gor->kind = NODE_BINARY;
+                        gor->loc = node->loc;
+                        gor->binary.op = TOK_PIPEPIPE;
+                        gor->binary.left = gcmp;
+                        gor->binary.right = geq;
+                        gcmp = gor;
+                    }
+                }
+                if (gcmp) {
+                    int bb_ok = ir_add_block(ctx->func, ctx->arena);
+                    int bb_trap = ir_add_block(ctx->func, ctx->arena);
+                    IRInst gbr = make_inst(IR_BRANCH, node->loc.line);
+                    gbr.cond_local = lower_expr(ctx, gcmp);
+                    gbr.true_block = bb_ok;
+                    gbr.false_block = bb_trap;
+                    emit_inst(ctx, gbr);
+                    ctx->current_block = bb_trap;
+                    Node *trap = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(trap, 0, sizeof(Node));
+                    trap->kind = NODE_INTRINSIC;
+                    trap->loc = node->loc;
+                    trap->intrinsic.name = "enum_nonvariant_trap";
+                    trap->intrinsic.name_len = 20;
+                    IRInst tr = make_inst(IR_ASSIGN, node->loc.line);
+                    tr.dest_local = -1;
+                    tr.expr = trap;
+                    emit_inst(ctx, tr);
+                    ensure_terminated(ctx, bb_ok);
+                    ctx->current_block = bb_ok;
+                }
+            }
+
             /* Capture */
             if (arm->capture_name && !is_void_opt) {
                 /* Determine capture type and source expression */
@@ -3825,8 +4046,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             }
 
             int arm_defer_base = ctx->defer_count;
-            ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-972: an expression-form arm (`1 => g.v = 5,`) is a bare
+             * NODE_EXPR_STMT, not a block — route it through the per-statement
+             * wrapper so it takes the shared lock and the bounds guard exactly
+             * as the brace form does. block_defers_managed is consumed only by a
+             * NODE_BLOCK body, so it is raised only for one. */
+            if (arm->body && arm->body->kind == NODE_BLOCK)
+                ctx->block_defers_managed++;  /* switch arm body: we manage */
+            lower_body(ctx, arm->body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4175,7 +4402,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
                 ctx->current_block = tpl_first;
                 ctx->defer_body_depth++;
-                lower_stmt(ctx, node->defer.body);
+                /* BUG-972: `defer stmt;` is a bare NODE_EXPR_STMT body. Route it
+                 * through the per-statement wrapper so it takes the shared lock
+                 * and an IR (trapping) bounds guard exactly as `defer { stmt; }`
+                 * does — measured, the statement form wrote a shared struct with
+                 * NO mutex while the block form locked. */
+                lower_body(ctx, node->defer.body);
                 ctx->defer_body_depth--;
                 ctx->defer_count   = saved_n;
                 int tpl_n    = ctx->func->block_count - tpl_first;

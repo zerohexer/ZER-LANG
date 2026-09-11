@@ -1,0 +1,14 @@
+// expect-trap
+// BUG-1029: the enum guard loop was skipped for arrays larger than 4096 elements, so a
+// Color[5000] forged through @bitcast ran unguarded. Must trap now. (The arrays are
+// wrapped in structs because an array is not a bitcast TARGET — see BUG-1027.)
+enum Color { red, green }
+struct Raw { u32[5000] r; }
+struct Big { Color[5000] cs; }
+u32 main() {
+    Raw raw;
+    raw.r[4999] = 7;
+    Big b = @bitcast(Big, raw);
+    if (b.cs[4999] == Color.red) { return 1; }
+    return 2;
+}

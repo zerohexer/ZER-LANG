@@ -23,6 +23,19 @@ typedef struct {
     char message[256];
 } Diagnostic;
 
+/* BUG-1015: one entry of the read-modify-write value taint — "this LOCAL's value
+ * came from that GLOBAL". Declared here, outside Checker, because the SAME table
+ * shape is used at both RMW sinks: the per-function map below (the ISR sink,
+ * populated while the body is checked) and a per-scan static table in checker.c
+ * (the spawn sink, populated while a CALLEE body is walked out of order). One
+ * shape, one set of query helpers, so the two sinks cannot drift — which is
+ * exactly what happened to every earlier form of this rule. */
+typedef struct {
+    const char *name;
+    uint32_t name_len;
+    Symbol *global;      /* the global this local's value came from */
+} RmwTaintEnt;
+
 /* typemap entry — maps AST Node* to resolved Type* */
 typedef struct {
     Node *key;
@@ -56,6 +69,18 @@ typedef struct {
                              * around its calls and the transitive set is
                              * irrelevant. Single-threaded compiler; set and
                              * cleared at the one decision point. */
+    bool lockchk_callee_only; /* BUG-979: while set, collect_shared_types_in_expr
+                             * skips the statement's DIRECT shared accesses and
+                             * collects ONLY the callee-transitive types — the set
+                             * a call inside this statement will lock while the
+                             * statement's own lock is held. Complement of the
+                             * flag above; same one decision point. */
+    bool lockchk_saw_indirect_call; /* BUG-980: set by collect_shared_types_in_expr
+                             * when the statement calls THROUGH A FUNCTION POINTER
+                             * (the callee is not a named function). The transitive
+                             * summary cannot see such a callee, so a statement
+                             * holding a shared(rw) lock around it cannot be proven
+                             * free of a nested lock. */
     int  block_entry_loop_depth; /* BUG-947: loop_depth at the moment the INNERMOST
                              * defer / @critical / @once body was entered. A break or
                              * continue targets a loop nested INSIDE that body iff
@@ -71,6 +96,25 @@ typedef struct {
      * NOT increment it: only the taken branch is checked and the other is
      * stripped, so a join there is unconditional. */
     int branch_depth;
+    /* BUG-981 — loop-induction CERTAINTY. A VRP range says which values a
+     * variable MAY hold; these say which values a counted loop's counter WILL
+     * hold. Set only while checking the body of a `for` (or `while`/do-while)
+     * whose init, bound and step are integer constants with a positive step and
+     * whose body is straight-line (no break/continue/return/goto/yield/defer/asm/
+     * orelse and no write to or address-of the counter) — so every value of the
+     * sequence cert_loop_lo, +step, ... <= cert_loop_last really is executed.
+     *
+     * `cert_loop_name == NULL` (the memset default, and the value restored on
+     * every path that cannot establish the shape) means NO certainty, which
+     * degrades to the plain warning + auto-guard. Only the INNERMOST such loop is
+     * tracked; an outer counter used inside a nested loop loses certainty, which
+     * is the conservative direction. */
+    const char *cert_loop_name;
+    uint32_t cert_loop_name_len;
+    int64_t cert_loop_lo;
+    int64_t cert_loop_step;   /* 0 = no certainty */
+    int64_t cert_loop_last;
+    int cert_loop_depth;      /* branch_depth at which the body is unconditional */
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */
@@ -135,6 +179,34 @@ typedef struct {
     } *var_ranges;
     int var_range_count;
     int var_range_capacity;
+
+    /* BUG-1015: cross-statement read-modify-write taint for the ISR / spawn
+     * sharing rule.
+     *
+     * The RMW check is per-STATEMENT — it asks whether ONE assignment both reads
+     * and writes the same global (`g += 1`, `g = g + 1`, `g = idfn(g) + 1`, a
+     * bit-range write). Splitting the same operation over two statements
+     * (`u32 t = g; g = t + 1;`) answered "no" at both, so the identical program
+     * in its two-statement spelling was accepted while the one-statement
+     * spelling was rejected. On bare metal that is a lost update: the ISR fires
+     * between the read and the write and its store is discarded, with no
+     * diagnostic and no fault.
+     *
+     * This is a NAME -> GLOBAL taint, valid within one function body and reset
+     * at entry beside `var_range_count`: a local whose value came from global G
+     * (directly, or from another local already tainted with G) carries G, and a
+     * write to G whose value mentions such a local IS the read-modify-write.
+     * Reassigning the local from something else CLEARS the taint, so
+     * `u32 t = g; t = 5; g = t;` stays accepted.
+     *
+     * Only ever ADDS rejections, so the failure direction is over-rejection,
+     * never a shipped race. Name-keyed with no scope discriminator, exactly like
+     * VarRange above, with the same consequence: a shadowing local of the same
+     * name in a sibling scope can inherit a taint it did not earn. That
+     * over-rejects; it cannot under-reject. */
+    RmwTaintEnt *rmw_taints;
+    int rmw_taint_count;
+    int rmw_taint_capacity;
 
     /* Nodes proven safe by range propagation — emitter skips runtime checks */
     Node **proven_safe;
@@ -222,6 +294,12 @@ typedef struct {
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
+    /* BUG-982: the two halves of `after_spawn_in_func`, kept apart so a join can
+     * close the SCOPED window without clearing a fire-and-forget one. A
+     * fire-and-forget spawn runs unbounded, so its flag never clears; a scoped
+     * spawn is concurrent only between the spawn and its join. */
+    bool ff_spawn_in_func;    /* a fire-and-forget spawn happened in this body */
+    int  scoped_spawn_live;   /* scoped threads spawned and not yet joined here */
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */

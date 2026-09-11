@@ -1,0 +1,11 @@
+// expect-error: use after free
+// BUG-988: the callee's summary now records the free of its optional param, so the
+// caller's re-unwrap after `drop(mp)` is a use-after-free (it was a silent read before).
+struct T { u32 v; }
+void drop(?*T p) { *T q = p orelse return; free(q); }
+u32 main() {
+    ?*T mp = alloc(T);
+    drop(mp);
+    *T r = mp orelse return;
+    return r.v;
+}

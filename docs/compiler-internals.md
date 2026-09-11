@@ -66,6 +66,39 @@ Arena allocations excluded from handle tracking (arena.alloc() does
 not need individual free — arena.reset() frees everything).
 ```
 
+## Session 2026-09-11 harvest — the mechanisms that landed (pointer map)
+
+Where each new query lives, so nobody re-implements it at a second site. Full symptom /
+fix / test per bug: BUGS-FIXED.md "Session 2026-09-11".
+
+| question | ONE place | notes |
+|---|---|---|
+| "does this statement hold a `shared(rw)` lock that a callee (or an unknown funcptr callee) takes again?" | `check_block_lock_ordering` — the THIRD probe (`Checker.lockchk_callee_only`) beside BUG-948's direct-only probe, plus `lockchk_saw_indirect_call` set in `collect_shared_types_in_expr`'s NODE_CALL arm | BUG-979/980. Plain `shared` is a recursive mutex and is exempt on purpose |
+| "does this loop counter provably TAKE every value of its sequence?" | `Checker.cert_loop_*`, established in the `for` and `while`/`do-while` drivers; `loop_body_straight_line` (no-default walk, answers "no" for anything untaught); consumed at the fixed-array index sink | BUG-981. A PROOF OF DANGER: an incomplete walk can only fail to report. `IDX_PARTIAL_OOB` is the straddling-range verdict that only WARNS |
+| "is a scoped spawn's window still open?" | `ff_spawn_in_func` + `scoped_spawn_live`; `th.join()` decrements past the borrow depth guard | BUG-982 |
+| "does this non-block body position get the per-statement wrapper?" | `lower_stmt_in_block` (guards, lock, statement, unlock) via `lower_body` — the block loop, `defer stmt;`, and switch arms (which the parser now always makes blocks) | BUG-990/1002. Gate: `tests/test_sharedlock_matrix.c` |
+| "does this expression READ name X?" (both RMW spellings) | `expr_mentions` — one exhaustive switch; `expr_mentions_name` / `expr_mentions_global` are wrappers | BUG-1017 |
+| "did this local's value come from global G?" (the split-statement RMW) | `Checker.rmw_taints` (ISR sink) and `_rmw_vtaint` (spawn sink), one `RmwTaintEnt` shape and one set of helpers (`rmw_tab_set`, `rmw_value_source_global`, `rmw_value_taints_global`), both growable | BUG-1015 |
+| "may the scan descend into a funcptr target without losing the caller's alias rows?" | the two descents in `scan_returned_funcname` / `scan_funcname_binding` SCOPE `_rmw_alias_count` / `_rmw_vtaint_count` / `_static_local_count` (save, descend, restore) — never `rmw_alias_reset()` mid-scan | BUG-1018 |
+| "which local does this carrier lend?" — and "more than one?" | `record_borrow_root_ex(..., whole)`: a field store MERGES (two different roots -> `Symbol.borrow_root_unknown`), a whole re-binding REPLACES; the spawn sink refuses unknown | BUG-1026; sink-matrix p26 |
+| "is this an alloc into a FIELD / INDEX / GLOBAL slot?" | `ir_register_alloc_result_compound`; `ir_global_projection_key`; `ir_carry_compounds` | BUG-984/985/986 |
+| "which aggregate does this pointer VIEW?" | `IRHandleInfo.view_root_local` (-1 none, -2 ambiguous) + ONE re-rooting in `ir_extract_compound_key(zc, func, ps, …)` — note the extra `ps` argument | BUG-989 |
+| "was this instruction lowered inside a defer body?" | `IRInst.in_defer_body`, set in BOTH `emit_inst` and `emit_3ac`; the IR emission loops set `guard_traps` for it | BUG-1030. Clones copy the struct, so every fire site carries it |
+| "what does this `*opaque` really point at?" | `zer_pointee_tid` (reserved ids for non-aggregate pointees); `zer_pointee_tid_agg` for the direct `@pun` | BUG-1021 |
+| "how is a `(T)x` cast emitted?" | `classify_cast` + `emit_cast_value` (`CastOperand`: AST / rewritten / local) — three thin sites | BUG-1000 |
+| "is this pointee a constrained type a mint must not target?" | `type_carries_enum_c` / `type_carries_bool_c` (checker), `type_carries_enum_e` (emitter, bool included) | BUG-1007/1012/1023. Past the walk cap all three answer YES |
+| "is the switch value really one of the variants?" | ir_lower's IR_BRANCH -> `enum_nonvariant_trap` inside the elided last arm (enum); the goto-annotated guard block (union tag range test, bool `> 1`) | BUG-1022/1023 |
+| "is this a VOLATILE index?" | the checker leaves it unguarded and warns; both emitter paths take the single-evaluation form; `IRLocal.is_volatile` for locals | BUG-1025 |
+| "what address does this `@inttoptr` designate?" | `mmio_const_addr` at the four sites | BUG-992 |
+| "does this integer call result carry a local's address?" | `call_result_is_local_address_int` over the return summary | BUG-993; sink-matrix p25 |
+
+Gates added or grown this session: `tools/audit_float_literal.sh` (10th gate),
+`tests/test_sharedlock_matrix.c` (14), `tests/test_borrow_join_matrix.c` (13), sink matrix
+p25/p26 (161 cells), hw-matrix RFORM split/2-hop cells (43), REACH grid +2 forms, the
+`warn_check` for the Ring carrier warning, and `<!-- audit: expect-error -->` in the
+reference audit. All matrices honour `ZER_MATRIX_ZERC` (BUG-1016) so a pre-fix compiler
+can be graded — that is how each "was live before" claim above was measured.
+
 ## Universal `alloc` / `free` — implementation pointer (2026-07-08)
 
 The brainless default allocation surface — `alloc(T)` → `?*T`, `alloc(T, n)` →
@@ -2088,6 +2121,51 @@ time error where statically known (cheap, immediate, no runtime cost),
 runtime check where genuinely unknowable (uses the existing `_zer_opaque`
 machinery which already has `type_id`), no fat pointers, no ABI changes,
 no compiler-side semantic judgment.
+
+### Cast EMISSION is one function, not three (BUG-1000, 2026-09-02)
+
+The rules above describe what a cast MEANS. Where they are turned into C, there
+are three entry points, and they must not drift:
+
+| # | Emitter | Reached by |
+|---|---|---|
+| 1 | `emit_expr` `NODE_TYPECAST` | global / const initializers (they must be C constant expressions, so they never take the IR path) |
+| 2 | `emit_rewritten_node` `NODE_TYPECAST` | the IR expression path — **plain assignments**, **defer bodies**, spawn args |
+| 3 | `emit_ir_inst` `IR_CAST` | the decomposed 3AC path (var-decl inits, most expressions) |
+
+Four behaviours have to hold at all three: wrap to `*opaque` with a `type_id`,
+unwrap from `*opaque` with the runtime `type_id` trap, `(uint8_t)!!` to `bool`,
+and the saturating float→int guard. Sites 1 and 3 implemented all four. Site 2
+implemented one — so `b = (bool)five();` stored `5` (truthy under `if (b)` AND
+unequal to `true`), and `m = (*Motor)ctx;` emitted a direct cast of the
+`_zer_opaque` STRUCT to a pointer, which GCC rejects and which had lost the
+type-id trap on the way.
+
+**The fix is a class-kill, not a fourth copy.** `classify_cast()` returns a
+`CastForm` (a no-`default:` enum, so a new form is a build error at every site),
+and `emit_cast_value()` performs the emission once. A site supplies only its own
+way of producing the operand, through `CastOperand`:
+
+```c
+typedef enum { CASTOP_AST, CASTOP_REWRITTEN, CASTOP_LOCAL } CastOperandKind;
+```
+
+Each call site is now ~6 lines. The invariant a future session can check in one
+command: **`grep -c "type mismatch in cast" emitter.c` must be 1.** A 2 means
+someone re-inlined the policy at a site instead of extending the shared one.
+
+Same shape as `value_flows_to` in `checker.c` (one decision, eight sinks): the
+DECISION is shared and only the site-local mechanics differ. Prefer this over
+"add the missing arm" whenever a policy already exists in more than one place —
+adding the arm fixes today's bug and leaves the next divergence just as
+invisible.
+
+Related, same session: `funcptr_return_shape()` is the one-query form of "does
+this function RETURN a function pointer?", used by both signature emitters. It
+peels `distinct` and the null-sentinel `?`, because `?FuncPtr` IS the pointer at
+runtime and needs the identical `RET (*name(params))(args)` declarator. Testing
+`ret->kind == TYPE_FUNC_PTR` raw made `?VFn f()` emit an abstract declarator
+(BUG-1001) — BUG-879 one sink over.
 
 ### Track-don't-judge applied to casts
 

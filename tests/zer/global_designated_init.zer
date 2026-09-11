@@ -1,0 +1,21 @@
+// BUG-1010: designated initializers at GLOBAL scope, every field shape the
+// limitations entry measured as refused: plain, optional set, optional null,
+// field omitted, nested struct, and a const global.
+struct In { u32 a; u32 b; }
+struct S { u32 f; ?u32 o; ?u32 n; u32 z; In in; }
+S s = { .f = 5, .o = 7, .n = null, .in = { .a = 1, .b = 2 } };
+const S k = { .f = 9 };
+S[2] arr;
+u32 main() {
+    if (s.f != 5) { return 1; }
+    u32 ov = s.o orelse 0;
+    if (ov != 7) { return 2; }
+    if (s.n) |v| { return 3 + v; }
+    if (s.z != 0) { return 4; }
+    if (s.in.b != 2) { return 5; }
+    if (k.f != 9) { return 6; }
+    S t = { .f = 11 };            // local form still works
+    arr[1] = { .f = 12 };         // assignment form still works
+    if (t.f + arr[1].f != 23) { return 7; }
+    return 0;
+}

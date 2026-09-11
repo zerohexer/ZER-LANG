@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: asm input operand reads shared struct
+// BUG-1013: the per-statement auto-lock never wraps an asm statement, so a shared
+// field in an operand was emitted as a bare, unlocked read reachable from a
+// spawned thread. A naked function has no frame to take the mutex in, so the
+// access is rejected rather than locked.
+shared struct A { u32 x; }
+A a;
+naked void k() {
+    asm { instructions: "nop" inputs: { "rax" = a.x } safety: "no-op instruction, reads a.x into rax for the probe" }
+}
+void worker() { k(); a.x = 1; }
+u32 main() { ThreadHandle t = spawn worker(); t.join(); return 0; }

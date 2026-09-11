@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-984: the bare spelling `h.p = alloc(T);` (an optional field keeping the
+// optional result) stored the allocation into a struct field and tracked it
+// NOWHERE — unwrap, free through the local, re-unwrap, read: compiled clean and
+// read freed memory. The sibling `h.p = alloc(T) orelse return;` was tracked.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    h.p = alloc(T);
+    *T q = h.p orelse return;
+    free(q);
+    *T r = h.p orelse return;
+    return r.v;
+}

@@ -1,0 +1,11 @@
+// expect-error: freed
+// BUG-988: freeing in the caller what `drop` already freed is a double free.
+struct T { u32 v; }
+void drop(?*T p) { *T q = p orelse return; free(q); }
+u32 main() {
+    ?*T mp = alloc(T);
+    drop(mp);
+    *T r = mp orelse return;
+    free(r);
+    return 0;
+}

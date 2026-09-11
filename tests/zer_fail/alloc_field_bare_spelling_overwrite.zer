@@ -1,0 +1,13 @@
+// expect-error: overwritten while alive
+// BUG-984: re-filling a field that still holds a live allocation leaks the
+// first one — the bare spelling never saw either.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    h.p = alloc(T);
+    h.p = alloc(T);
+    *T q = h.p orelse return;
+    free(q);
+    return 0;
+}

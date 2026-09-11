@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize
+// BUG-1009: -(2^63 + 1) is below INT64_MIN; the unary-minus literal path
+// answered "fits" for every i64 magnitude.
+u32 main() {
+    i64 v = -9223372036854775809;
+    if (v > 0) { return 1; }
+    return 0;
+}

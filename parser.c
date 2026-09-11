@@ -1787,7 +1787,38 @@ static Node *parse_switch_stmt(Parser *p) {
             /* wrap in expr_stmt */
             Node *stmt = new_node(p, NODE_EXPR_STMT);
             stmt->expr_stmt.expr = expr;
-            arm->body = stmt;
+            /* BUG-1002 (2026-09-02): and then wrap THAT in a single-statement
+             * NODE_BLOCK. Every other statement body in the language is a
+             * NODE_BLOCK by construction (if/else, for, while, do-while,
+             * @critical, @once, function bodies), and analyses rely on it:
+             * ir_lower's per-statement shared-struct auto-lock lives in the
+             * NODE_BLOCK case, so a body that is NOT a block never reaches it.
+             *
+             * The bare switch-arm expression was the one exception, and it was
+             * a live SILENT DATA RACE — measured:
+             *
+             *     0 => g.x = 5,        ->  g.x = 5;                  (no mutex)
+             *     0 => { g.x = 5; }    ->  lock; g.x = 5; unlock;
+             *
+             * Same program, two spellings, one of them unsynchronized with no
+             * diagnostic. Fixing it at the LOCK site would have fixed the lock
+             * and left every other "bodies are blocks" assumption still wrong
+             * for this one form; making the invariant universal fixes the class.
+             *
+             * (`defer <stmt>;` builds a bare EXPR_STMT the same way. On the
+             * branch that wrote this it measured unaffected, because defer
+             * bodies were then replayed through the raw-AST path; once refactor L
+             * lowered defer bodies into the IR the same gap opened there and was
+             * closed at the lowering — `lower_body` / `lower_stmt_in_block` in
+             * ir_lower.c, BUG-990 — so both non-block body positions now share
+             * ONE per-statement wrapper. The shared-lock matrix's `defer-bare`
+             * cell is the gate.) */
+            Node **arm_stmts = (Node **)arena_alloc(p->arena, sizeof(Node *));
+            arm_stmts[0] = stmt;
+            Node *arm_block = new_node(p, NODE_BLOCK);
+            arm_block->block.stmts = arm_stmts;
+            arm_block->block.stmt_count = 1;
+            arm->body = arm_block;
             consume(p, TOK_COMMA, "expected ',' after switch arm expression");
         }
         if (p->current.start == before.start && p->current.type == before.type) {

@@ -106,3 +106,10 @@ ir_lower.c:    Node  *inline_buf[16];
 # it just stops collecting, which is the conservative direction (fewer types found =
 # no false deadlock report).
 checker.c:        Type *scratch[4] = {0};
+
+# BUG-979 — the callee-transitive probe in check_block_lock_ordering. Same bound as
+# the `Type *found[4]` it is compared against (max_types=4, the collector stops at the
+# cap — fewer types found is the conservative direction: no false re-entrancy report,
+# and a statement locking more than four distinct shared structs already fails the
+# two-type rule). Short-lived scratch, one decision point.
+checker.c:            Type *callee_set[4];

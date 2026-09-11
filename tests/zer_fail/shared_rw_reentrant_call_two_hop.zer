@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: not re-entrant
+// BUG-979 (2026-09-11): the re-entry is TRANSITIVE — the statement's callee
+// `outer` does not touch S itself, its callee `f` does. The callee summary
+// (compute_func_shared_types) is transitive, so the rule sees it. The direct
+// access sits in an `if` CONDITION, one of the statement kinds the collector
+// covers.
+shared(rw) struct S { u32 v; }
+S g;
+u32 f() { g.v = 2; return 1; }
+u32 outer() { return f(); }
+u32 main() { if (g.v == outer()) { return 1; } return 0; }

@@ -5,6 +5,127 @@
 
 ---
 
+## LEXICAL
+
+### Comments
+
+**DESCRIPTION**
+`//` runs to end of line. `/* ... */` spans lines and does **not** nest — the
+first `*/` closes it, so a `/*` inside a block comment is ordinary text and the
+comment ends early.
+
+**SYNTAX**
+```zer
+// line comment
+/* block
+   comment */
+u32 counter;
+```
+
+**SEE ALSO**
+comptime if
+
+---
+
+### Integer literals
+
+**DESCRIPTION**
+Decimal, hexadecimal (`0x`), and binary (`0b`). `_` may separate digits anywhere
+after the first and is ignored. **There is no octal** — a leading `0` is not
+special, so `0755` is decimal 755, not 493.
+
+**SYNTAX**
+```zer
+u32 dec  = 1000;
+u32 grp  = 1_000_000;
+u32 hex  = 0xDEAD_BEEF;
+u32 bin  = 0b1010_0101;
+u32 addr = 0x4002_0014;
+```
+
+**NOTES**
+- `0x` and `0b` must be followed by at least one digit — `0x;` is a lex error.
+- A literal too large for its destination type is a compile error, not a wrap.
+
+**SEE ALSO**
+u8..u64, i8..i64, @truncate
+
+---
+
+### Character literals
+
+**DESCRIPTION**
+`'c'` is a `u8`. The escape set is closed — exactly `\n \t \r \\ \' \" \0` and
+`\xNN` (two hex digits required). Anything else is a lex error. An empty `''` is
+an error.
+
+**SYNTAX**
+```zer
+u8 a    = 'A';
+u8 nl   = '\n';
+u8 tab  = '\t';
+u8 nul  = '\0';
+u8 byte = '\x41';
+```
+
+**SEE ALSO**
+u8, string literals
+
+---
+
+### String literals
+
+**DESCRIPTION**
+A string literal has type `[*]u8` — a slice with `.ptr` and `.len`, not a
+NUL-terminated `char*`. `.len` excludes any terminator.
+
+The escape set is closed and is **narrower than C's**: exactly
+`\n \t \r \\ \" \0` and `\xNN`. `\a`, `\v`, `\f`, `\b`, `\e`, `\u`, and `\'` are
+**lex errors**, not silently-accepted characters.
+
+**SYNTAX**
+```zer
+const [*]u8 msg = "Hello\n";
+u32 n = (u32)msg.len;        // 6 — the escape is one byte
+```
+
+A string literal lives in read-only memory, so it binds only to a `const`
+slice — `[*]u8 s = "x";` is rejected ("string literal is read-only").
+
+**SEE ALSO**
+[*]T, @cstr
+
+---
+
+### Identifiers
+
+**DESCRIPTION**
+Letters, digits and `_`, not starting with a digit. The prefix `_zer_` is
+RESERVED for compiler-generated names and is rejected in user source.
+
+**SYNTAX**
+<!-- audit: skip -->
+```zer
+u32 _zer_count;    // COMPILE ERROR — reserved prefix
+```
+
+**SEE ALSO**
+declarations
+
+---
+
+### `as`
+
+**DESCRIPTION**
+`as` is not a cast operator. Its only use in the grammar is naming the emitted
+symbol of an `interrupt` handler. ZER's conversion spellings are `(T)x`,
+`@truncate`, `@saturate`, `@bitcast` and `@cast`.
+
+**SEE ALSO**
+interrupt, C-style casts
+
+---
+
 ## PRIMITIVE TYPES
 
 ### u8, u16, u32, u64
@@ -121,6 +242,17 @@ f64 precise = 3.14159265358979;
 - Digit-group underscores are allowed in numeric literals for readability and
   are ignored by the value: `1_000.5`, `3.141_592`, `1e1_0` (and `1_000_000`
   for integers).
+- A literal too large for the type becomes an **infinity**, which is a normal
+  IEEE value and works at both global and function scope:
+  ```zer
+  f64 huge = 1e400;         // +inf
+  f64 low  = -1e400;        // -inf
+  f64 tiny = 1e-400;        // underflows to 0.0
+  ```
+  This is the same "arithmetic gets a defined value" rule that makes integer
+  overflow wrap and float-to-int saturate — no trap, no undefined behaviour.
+- Converting a float to an integer SATURATES and maps NaN to 0. See
+  *Converting a float to an integer* in the SAFETY section.
 
 ---
 
@@ -137,6 +269,7 @@ bool done = false;
 ```
 
 **EXAMPLE**
+<!-- audit: expect-error: cannot initialize 'x' of type 'u32' with 'bool' -->
 ```zer
 bool flag = true;
 if (flag) { go(); }      // OK
@@ -181,7 +314,37 @@ Compile-time constant indices are checked at compile time.
 u8[256] buf;              // 256 bytes, auto-zeroed
 u32[4] values;            // 4 u32s
 i32[3][3] matrix;         // 3x3 multi-dimensional
+u8[2][3] grid;            // 3 rows of 2 — see "Multi-dimensional order" below
 ```
+
+**MULTI-DIMENSIONAL ORDER**
+Each bracket wraps the type built so far, exactly as the single-dimension form
+reads ("`u8[256]` = array of 256 `u8`"). So in `T[A][B]` the **rightmost**
+bracket is the **outer** dimension:
+
+```zer
+u32 main() {
+    u8[2][3] grid;            // array of 3, of (array of 2, of u8)
+    if ((u32)grid.len    != 3) { return 1; }  // OUTER = the rightmost bracket
+    if ((u32)grid[0].len != 2) { return 2; }  // INNER = the leftmost
+
+    u32 n = 0;
+    for (u32 i = 0; i < 3; i += 1) {          // i indexes the OUTER dimension
+        for (u32 j = 0; j < 2; j += 1) {      // j indexes the INNER
+            grid[i][j] = (u8)n;
+            n += 1;
+        }
+    }
+    if ((u32)grid[1][0] != 2) { return 3; }
+    return 0;
+}
+```
+
+This is the reverse of C, where `uint8_t g[2][3]` means 2 rows of 3 — the same
+ZER declaration emits `uint8_t grid[3][2]`. A square declaration (`i32[3][3]`)
+hides the difference, so check any rectangular one. Getting it backwards is not
+a memory-safety problem — every index is still bounds-checked, and the wrong
+index simply traps or is rejected — but it is a correctness one.
 
 **EXAMPLE**
 ```zer
@@ -260,8 +423,11 @@ void process([*]u32 data) {
     }
 }
 
-u32[8] arr;
-process(arr);              // auto-coerces: T[N] → [*]T
+u32 main() {
+    u32[8] arr;
+    process(arr);          // auto-coerces: T[N] -> [*]T
+    return arr[0] - 1;     // 0
+}
 ```
 
 **FIELDS — READ-ONLY**
@@ -322,8 +488,14 @@ Auto-derefs for field access: `ptr.field` works (no `->` needed).
 
 **SYNTAX**
 ```zer
-*Task t = &my_task;
-t.priority = 5;            // auto-deref, like ptr->priority in C
+struct Task { u32 id; u32 priority; }
+
+u32 main() {
+    Task my_task;
+    *Task t = &my_task;
+    t.priority = 5;        // auto-deref, like ptr->priority in C
+    return t.priority - 5; // 0
+}
 ```
 
 **EXAMPLE**
@@ -336,6 +508,7 @@ void set_priority(*Task t, u32 p) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: non-null pointer '*Task' requires an initializer -->
 ```zer
 *Task t;                   // COMPILE ERROR — non-null pointer requires initializer
                            // use ?*Task for nullable
@@ -937,10 +1110,47 @@ C file-scope initializer. This is checked in ZER terms, at the ZER line, over th
 const u32 BASE = 0x10;
 
 u32 A = 5;                       // literal
-u32 B = BASE;                    // ERROR — a const is a C `const` var, not a constant
+u32 B = BASE;                    // a const global — folded to its own initializer
 u32 C = @truncate(u32, 300);     // native-width @truncate folds
 u32 D = @popcount(0xF0);         // bit query with a constant argument
 usize E = @size(u32) * 4;        // @size arithmetic
+```
+
+Naming a **const** global is fine at any type — the compiler substitutes that global's
+own initializer, which already had to be a valid global initializer for ITS declaration:
+
+```zer
+const i32   NEG    = -5;
+const f32   SCALE  = 1.5;
+const bool  FLAG   = true;
+const usize WORDS  = @size(u32) * 4;
+const [*]u8 BANNER = "boot ok";
+
+i32   g_neg    = NEG;
+f32   g_scale  = SCALE + 1.0;    // the name may sit anywhere in the expression
+bool  g_flag   = FLAG;
+usize g_words  = WORDS;
+const [*]u8 g_banner = BANNER;
+
+u32 main() {
+    if (!g_flag) { return 1; }
+    if (g_neg != -5) { return 2; }
+    if (g_scale != 2.5) { return 3; }
+    if (g_words != 16) { return 4; }
+    if (g_banner.len != 7) { return 5; }
+    return 0;
+}
+```
+
+Naming a **mutable** global is not, and neither is a definition that refers to itself:
+
+<!-- audit: skip -->
+```zer
+u32 SRC = 5;
+u32 B = SRC;                     // ERROR — 'SRC' is mutable, not a constant
+
+const u32 X = Y;
+const u32 Y = X;                 // ERROR — cyclic initializer
 ```
 
 **NOTES**
@@ -1003,6 +1213,7 @@ if (a) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected '{' at 'return' -->
 ```zer
 if (x > 5) return 1;      // COMPILE ERROR — braces required
 ```
@@ -1023,6 +1234,7 @@ for (u32 i = 0; i < 10; i += 1) {
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected expression at '+' -->
 ```zer
 for (u32 i = 0; i < 10; i++) { }   // COMPILE ERROR — no ++
 ```
@@ -1134,6 +1346,7 @@ Handle leaks are **compile errors** — allocating without `defer free()` (or re
 
 `defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
 
+<!-- audit: expect-error: 'defer' cannot be nested inside another 'defer' body -->
 ```zer
 defer {
     defer { cleanup(); }   // COMPILE ERROR — 'defer' cannot be nested
@@ -1250,7 +1463,7 @@ duplicate labels           // COMPILE ERROR — label 'x' already defined
 
 **NOTES**
 - Labels are function-scoped — cannot goto between functions.
-- Max 128 labels per function.
+- No fixed label limit — the label table grows (the old "max 128 labels" note described a cap that no longer exists).
 - goto fires ALL pending defers before jumping — same as return/break/continue.
 - Labels work inside switch arms, defer bodies, and @critical blocks.
 - Backward goto is just a loop — same as `while(true)` with condition.
@@ -1280,6 +1493,7 @@ u32 val = get_value() orelse {            // block fallback
 ```
 
 **ERRORS**
+<!-- audit: expect-error: expected ';' after variable declaration at '1' -->
 ```zer
 u32 val = get_value() orelse return 1;    // PARSE ERROR — orelse return is bare
 ```
@@ -1684,6 +1898,15 @@ Task.free_ptr(t);
 - `T.alloc_ptr()` → `?*T` — explicit pointer form (same as `T.alloc()` with `*T` target)
 - `T.free_ptr(p)` → `void` — explicit pointer form (same as `T.free(p)` when p is `*T`)
 
+**RESERVED METHOD NAMES**
+These four names are intercepted on ANY struct type, so a struct that declares a
+function-pointer field called `alloc`, `free`, `alloc_ptr` or `free_ptr` cannot
+be CALLED through that field — `s.alloc(x)` is read as the auto-slab method and
+reports *"Ops.alloc() takes no arguments"*. Reading and assigning the field still
+work; only the call is taken. Rename the field, or call through a local
+(`*(u32) -> u32 f = s.alloc; f(x);`). Every other field name, `join` included, is
+yours.
+
 **EXAMPLE**
 ```zer
 struct Task { u32 id; u32 priority; }
@@ -1894,6 +2117,7 @@ u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
   argument — it does not produce a compile-time-constant value at file scope.
   Use a literal, or compute it inside a function body. The same restriction
   applies to `@addc`, `@subb` and `@mulw`.
+<!-- audit: expect-error: initializer cannot use @saturate -->
 ```zer
 u8 sat = @saturate(u8, 300);       // COMPILE ERROR — global initializer
 u32 main() {
@@ -1962,6 +2186,24 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   still emitted for variable addresses (alignment is a property of the
   target pointer type, not of mmio declarations), and constant
   addresses are alignment-checked at compile time regardless.
+- "Constant address" means any COMPILE-TIME CONSTANT, not just a literal — a
+  named `const`, a `const` defined from another `const`, and arithmetic over
+  them are all folded and checked at compile time. Only an address the compiler
+  cannot fold (a runtime value, or a MUTABLE global) falls back to the runtime
+  range + alignment trap:
+
+<!-- audit: expect-error: is not aligned to 4 bytes -->
+```zer
+mmio 0x40020000..0x40020FFF;
+const u32 BASE = 0x40020000;
+
+u32 folds() {
+    volatile *u32 ok  = @inttoptr(*u32, BASE + 0x14);    // OK — 0x40020014
+    volatile *u32 bad = @inttoptr(*u32, BASE + 0x2);     // COMPILE ERROR — misaligned for u32
+    volatile *u32 out = @inttoptr(*u32, BASE + 0x5000);  // COMPILE ERROR — outside the declared range
+    return 0;
+}
+```
 - For tests: `mmio 0x0..0xFFFFFFFFFFFFFFFF;` (allow all addresses).
 
 **SEE ALSO**
@@ -1988,6 +2230,7 @@ Cast pointer to a different pointer type. Provenance-tracked: the compiler
 remembers what type went in through `*opaque` round-trips.
 
 **EXAMPLE**
+<!-- audit: expect-error: @ptrcast type mismatch: source has provenance -->
 ```zer
 *opaque ctx = @ptrcast(*opaque, &sensor);  // provenance = *Sensor
 *Sensor s = @ptrcast(*Sensor, ctx);        // OK — matches
@@ -2028,10 +2271,53 @@ type confusion before any memory read.
                                    // "@pun type mismatch" before m is used
 ```
 
+**THE RUNTIME CHECK ONLY EXISTS BETWEEN struct / enum / union TYPES**
+Only those three carry a runtime `type_id`. When either pointee is anything
+else — `u32`, `f64`, a slice, a funcptr — the emitted check compares against
+`0` ("unknown provenance") and can never fire. So `@pun` is checked between
+two named aggregate types, and **unchecked** in every other combination. Two
+compile-time rules cover what the runtime check cannot:
+
+- **Widening is rejected.** A target pointee LARGER than the source pointee
+  reads past the source object:
+  ```zer
+  struct Big { u64 a; u64 b; }
+  u32 small = 7;  *u32 sp = &small;
+  *Big bp = @pun(*Big, sp);      // ERROR — 16-byte target, 4-byte source
+  ```
+- **Forging is rejected.** If the runtime check cannot fire, the pointee types
+  differ, and the TARGET carries a value whose validity the rest of the program
+  trusts — a pointer, slice, funcptr, enum, `bool`, optional, `Handle`, or any
+  struct/array containing one — the pun is refused:
+  ```zer
+  struct P { *u32 p; }
+  u64 addr = 0x1000;  *u64 ap = &addr;
+  *P pp = @pun(*P, ap);          // ERROR — would forge a pointer from an integer
+  ```
+  This is what keeps `@inttoptr` (with its mandatory `mmio` declaration) the
+  only way an integer becomes a pointer, and keeps a forged enum out of an
+  exhaustive `switch`. Use `@inttoptr` for an address, a `[*]u8` slice to parse
+  bytes, or pun between two struct types (which IS runtime-checked).
+
+Reinterpreting bits as plain integers or floats forges nothing — every bit
+pattern is a legal `u32` — so those puns still compile in both directions:
+
+```zer
+struct A { u32 x; }
+A a;  *A pa = &a;
+*u8 bytes = @pun(*u8, pa);       // OK — byte view of a struct
+
+u32 raw = 9;  *u32 rp = &raw;
+struct Plain { u32 y; }
+*Plain pl = @pun(*Plain, rp);    // OK — target carries no invariant
+```
+
 **NOTES**
 - Compile-time: target must be a pointer, source must be a pointer,
-  const stripping rejected, volatile stripping rejected.
-- Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")`.
+  const stripping rejected, volatile stripping rejected, plus the widening
+  and forging rules above.
+- Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")` —
+  only between struct/enum/union pointees, see above.
 - For raw byte access (parsing, serialization), use `[*]u8` slices —
   not pointer casting. Slices are bounds-checked, len-carrying, and the
   right tool for byte-level data.
@@ -2073,6 +2359,34 @@ struct Device { u32 id; ListHead list; }
 *ListHead ptr = &dev.list;
 *Device d = @container(*Device, ptr, list);   // OK
 ```
+
+**THE POINTER MUST POINT AT A FIELD**
+`@container` subtracts the field's offset. The compiler tracks where a pointer
+came from and knows three answers, not two:
+
+| where the pointer came from | verdict |
+|---|---|
+| `&outer.field` — a field of the named struct | OK |
+| `&outer.other` / a field of a *different* struct | compile error (wrong field / wrong struct) |
+| `&wholeObject`, `&arr[i]` — a complete object that is nobody's field | compile error |
+| a parameter, a `cinclude` pointer — unknown | allowed (cannot be proven wrong) |
+
+```zer
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+
+Inner i;
+*Inner ip = &i;
+*Outer o = @container(*Outer, ip, in);   // ERROR — `i` is nobody's field;
+                                         // this would read BEFORE the object
+```
+
+The whole-object case is rejected because subtracting the field offset from the
+address of a complete object produces a pointer *before* it — every read through
+it is out of bounds. The fact rides through aliases (`*Inner b = a;`) and is
+cleared when the pointer is re-pointed at a real field, so the correct program
+still compiles. An element of an array (`&arr[i]`) is a complete object too, and
+is rejected for the same reason.
 
 ---
 
@@ -2978,19 +3292,116 @@ Explicit type conversion using C-style syntax. Narrowing truncates by default.
 
 **EXAMPLE**
 ```zer
-u8 small = 42;
-u32 big = (u32)small;          // widening
-u16 trunc = (u16)big;          // narrowing (truncate)
-f32 ratio = (f32)big;          // int → float value convert
-(*Motor)opaque_ctx             // pointer cast (provenance checked)
-(*opaque)sensor_ptr            // type erase
+struct Motor { u32 rpm; }
+
+u32 main() {
+    u8 small = 42;
+    u32 big = (u32)small;          // widening
+    u16 trunc = (u16)big;          // narrowing (truncate)
+    f32 ratio = (f32)big;          // int -> float value convert
+
+    Motor m; m.rpm = 7;
+    *opaque erased = (*opaque)&m;  // type erase (records the source type)
+    *Motor back = (*Motor)erased;  // restore (runtime type_id check)
+    return back.rpm - 7;
+}
 ```
+
+**THE TARGET MUST BE A KEYWORD TYPE — a bare user type name is NOT a cast**
+`(Name)expr` is parsed as the parenthesised expression `(Name)` followed by
+`expr`, because `(x)` has to keep meaning "the variable x". Only these start a
+cast: the primitive keywords (`u8`..`u64`, `i8`..`i64`, `usize`, `f32`, `f64`,
+`bool`, `void`, `opaque`), `?`, `const`, `volatile`, and `*`. So a POINTER to a
+user type works and a bare user type does not:
+
+```zer
+(*Motor)ctx        // OK — the `*` makes it unambiguous
+(Motor)x           // NOT a cast — the compiler reports a syntax error at `x`
+(State)n           // NOT a cast — and int -> enum needs a checked door anyway
+(Meters)n          // NOT a cast — use @cast for a distinct typedef
+```
+
+Use the named intrinsic for each of these: `@cast(Meters, n)` for a distinct
+typedef, `@bitcast(State, n)` for an enum (checked at runtime against the
+variant set), `@ptrcast` / `@pun` between pointer types, `@inttoptr` for an
+address.
 
 **NOTES**
 - Widening: always safe, no data loss.
 - Narrowing: always truncates (keeps low bits). Use `@saturate` for clamping.
+- float -> int SATURATES to the destination range and NaN becomes 0 (defined; see
+  the float section). It is not C's undefined conversion.
+- `bool` <-> integer IS allowed through this cast (`(u32)flag`, `(bool)n`) — it is
+  the only conversion between them; there is still no implicit coercion.
 - `@bitcast` required for raw bit reinterpretation (e.g., u32 bits → f32).
 - `@truncate`, `@ptrcast`, `@inttoptr` still work — `(Type)expr` is sugar.
+- Float → integer **saturates**, and NaN becomes 0. See
+  "Converting a float to an integer" below for the full rule.
+
+**CASTING TO `bool` — the canonical-value guarantee**
+
+`(bool)x` on an integer, float or pointer yields exactly `true` or `false`,
+never the raw value. This matters because ZER emits `bool` as a byte: without
+the normalization a value like `5` would be truthy under `if (b)` and yet
+compare unequal to `true`, so the *same* value would read two ways.
+
+```zer
+u32 five() { return 5; }
+
+u32 main() {
+    u32 n = five();
+    bool a = (bool)n;              // var-decl init
+    bool b = false;
+    b = (bool)n;                   // plain assignment
+    if (a != true)  { return 1; }
+    if (b != true)  { return 2; }
+    if (a != b)     { return 3; }  // every form agrees
+    return 0;
+}
+```
+
+The guarantee holds in **every** position a cast can appear — variable
+initializer, plain assignment, store to a global, `return`, call argument, and
+inside a `defer` body. (Before 2026-09-02 the assignment and `defer` forms
+skipped the normalization; see BUGS-FIXED BUG-1000.)
+
+**CASTING FROM `*opaque` — the runtime type check**
+
+Casting a `*opaque` back to a typed pointer is checked at runtime against the
+type the pointer was erased from. A mismatch **traps**; it is not undefined
+behaviour and it is not silent.
+
+```zer
+struct Sensor { u32 a; }
+struct Motor  { u32 b; }
+
+u32 read_motor(*opaque ctx, *Motor seed) {
+    *Motor m = seed;
+    m = (*Motor)ctx;               // traps if ctx did not come from a *Motor
+    return m.b;
+}
+```
+
+A `*opaque` that entered from C (`cinclude`) carries type id 0 = "unknown" and
+is allowed through, because ZER cannot know what C put there — that boundary is
+a documented floor, not a checked edge. Like the `bool` rule above, the check is
+applied at every cast form.
+
+**WHAT THIS CAST CANNOT DO** — each of these is a hard compile error naming the
+intrinsic to use instead. `(Type)expr` is NOT general sugar for the pointer
+intrinsics:
+
+| spelling | verdict | use |
+|---|---|---|
+| `(*u32)addr` — integer to pointer | ERROR | `@inttoptr(*u32, addr)` (mmio-checked) |
+| `(u32)ptr` — pointer to integer | ERROR | `@ptrtoint(ptr)` |
+| `(*B)a_ptr` — one pointee to another | ERROR | `@pun(*B, a_ptr)` (runtime type_id check) |
+| `(*u32)volatile_ptr` — strip `volatile` | ERROR | keep the qualifier |
+| `(*u32)const_ptr` — strip `const` | ERROR | keep the qualifier |
+
+What it DOES do for pointers is the `*T` <-> `*opaque` round trip, which is
+provenance-checked: `(*opaque)sensor` records the origin type and `(*Motor)ctx`
+verifies it. An identity cast `(*T)p` where `p` is already `*T` is elided.
 
 ---
 
@@ -3119,6 +3530,23 @@ check written the obvious way falls straight through to the raw cast — the exa
 removed. `u128` / `i128` keep a trap for NaN instead: the bounds are not expressible as
 literals at that width.
 
+**It works in a global initializer too**, where the value is a compile-time constant:
+
+```zer
+u32 gbig = (u32)1e20;      // 4294967295
+u32 gneg = (u32)(-1.5);    // 0
+i8  gmin = (i8)(-1e20);    // -128
+u32 main() {
+    if (gbig != 4294967295) { return 1; }
+    if (gneg != 0)          { return 2; }
+    if ((i32)gmin != -128)  { return 3; }
+    return 0;
+}
+```
+
+A literal that does not fit is a **warning**, not an error — rejecting `(u32)(-1.5)` while
+the same value through a variable is defined would be two spellings disagreeing.
+
 **`@truncate` on a float is a compile error.** `@truncate` means "keep the low bits" and a
 float has none; giving one primitive two unrelated meanings by operand type is the kind of
 overload this language avoids. Use the cast or `@saturate`, which already say it:
@@ -3165,6 +3593,25 @@ u32 main() {
 
 `@bitcast(State, 7)` compiles and traps at run time with
 `@bitcast produced a value that is not a declared variant of this enum`.
+
+### ...and the switch itself is total
+
+The three conversion doors above are the ones ZER can see. A non-variant can also
+arrive without any conversion at all, through a boundary the language does not own:
+
+- a `cinclude` / extern C function whose return type is the enum
+  (`Status st = HAL_Transmit(...);`),
+- an MMIO read — `volatile *Status r = @inttoptr(*Status, ADDR); Status s = *r;`,
+- a `@pun`'d pointer that is then dereferenced.
+
+None of those is a conversion, so no forge guard sees them. So the SWITCH carries
+its own check: an exhaustive enum switch that reaches a value matching no declared
+variant traps with `switch on a value that is not a declared variant of this enum`,
+instead of running its last arm. The union form traps with `switch on a union whose
+tag is not a declared variant` instead of silently running no arm at all.
+
+This costs one comparison per exhaustive switch and is the use-site half of the
+guarantee: a foreign value is caught where it is USED, not assumed away.
 
 ### Argument counts are checked
 
@@ -3221,13 +3668,31 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 - Shared globals accessed from interrupt handlers must be volatile. This holds
   even when the ISR reaches the global INDIRECTLY — through a helper, or through
   a function bound to a local function pointer (`*() fp = bump; fp();`).
-- Compound assign (`reg |= 1`) on shared volatile → compile error (non-atomic RMW).
+- A READ-MODIFY-WRITE of a shared volatile global is a compile error, in every
+  spelling — the interrupt can land between the read and the write and the
+  update is lost. It does not matter how the RMW is written or how far apart
+  the halves are:
+
+  ```
+  g += 1;                        // rejected
+  g = g + 1;                     // rejected
+  g = @truncate(u32, g) + 1;     // rejected
+  *p += 1;   // p bound to &g    // rejected
+  bump(&g);  // helper does += 1 // rejected, transitively
+  u32 t = g; g = t + 1;          // rejected — split over two statements
+  ```
+
+  The rule follows the VALUE, so re-binding the local from something else clears
+  it (`u32 t = g; t = 5; g = t;` is fine), and a local carrying a DIFFERENT
+  global is not this one's RMW. Use `@atomic_add` and friends, a `shared struct`,
+  or do the read/modify/write inside `@critical`.
 - INDEXING a volatile `*T` (`reg[i]`) is bounds-checked against the `mmio`
   declaration, but only when the compiler can DERIVE the bound — which it can do
   only for a pointer obtained directly from `@inttoptr(*T, <const addr>)` inside
   a declared range. A parameter, alias or struct field carries no bound, so
   indexing one is a compile error rather than an unguarded access:
 
+<!-- audit: expect-error: no compile-time MMIO bound is known for this pointer -->
 ```zer
 mmio 0x40020000..0x40020FFF;
 
@@ -3240,6 +3705,27 @@ u32 bad(volatile *u32 reg, u32 i) {
     return reg[i];                        // COMPILE ERROR — no bound for a param
 }
 ```
+
+- "`<const addr>`" means any COMPILE-TIME CONSTANT, not just a literal. A named
+  `const`, a `const` defined from another `const`, and arithmetic over them all
+  fold, so the idiomatic firmware spelling derives a bound exactly like the
+  literal does:
+
+```zer
+mmio 0x40020000..0x4002001F;              // 8 u32 words
+
+const u32 PERIPH = 0x40020000;
+const u32 UART   = PERIPH;                // chained const — folds
+
+u32 named() {
+    volatile *u32 r = @inttoptr(*u32, UART);
+    return r[7];                          // OK — last in-range word
+}
+```
+
+  A `const` is required. A plain (mutable) global or a local variable does not
+  fold, so a pointer built from one carries no bound and indexing it is the
+  compile error above.
 
 ---
 
@@ -3290,21 +3776,120 @@ asm("mov %0, %1" : "=r"(out) : "r"(in));
 grep -rnE "\basm\s*[(]" src/
 ```
 
+**SEE ALSO**
+structured asm, naked functions, cinclude
+
+---
+
+### structured asm — `asm { ... }`
+
+**DESCRIPTION**
+The second, preferred spelling of inline assembly. Instead of GCC's constraint
+mini-language it binds operands to NAMED REGISTERS and carries a mandatory
+`safety:` rationale, so every asm block in a tree is greppable and reviewable.
+The operand bindings are what let UAF / bounds / move / provenance / qualifier /
+MMIO tracking stay live across the asm boundary.
+
+Like `asm("...")` it is allowed only inside a `naked` function, which means it
+has no locals to bind — bind globals.
+
+**SYNTAX**
+```zer
+u64 g_result = 0;
+u64 g_input = 7;
+
+naked void load_constant() {
+    asm {
+        instructions: "movq $42, %0"
+        outputs: { "rax" = g_result }
+        safety: "Test asm output binding by loading immediate 42 into rax register"
+    }
+}
+
+naked void double_input() {
+    asm {
+        instructions: "leaq (%1, %1), %0"
+        outputs: { "rax" = g_doubled }
+        inputs:  { "rcx" = g_input }
+        clobbers: ["memory"]
+        safety: "Double g_input via leaq — used as a portable shift-by-1 idiom"
+    }
+}
+
+u64 g_doubled = 0;
+
+i32 main() { return 0; }
+```
+
+**KEYS**
+
+| key | required | form |
+|---|---|---|
+| `instructions:` | YES | one string, `\n`-separated for multiple instructions |
+| `safety:` | YES | one string, **at least 30 characters** |
+| `inputs:` | no | `{ "reg" = expr, ... }` — expr evaluated, placed in `reg` |
+| `outputs:` | no | `{ "reg" = lvalue, ... }` — `reg` written back to `lvalue` |
+| `clobbers:` | no | `[ "reg", "memory", "cc" ]` |
+
+Operands are referenced positionally in `instructions:` as `%0`, `%1`, ... —
+outputs first, then inputs, in declaration order.
+
+**RULES** (each is a compile error)
+- `instructions:` missing or empty; `safety:` missing or under 30 characters.
+- More than **16** instructions in one block.
+- A LABEL inside the asm text.
+- An operand that is not integer- or pointer-typed.
+- An output that is not a writable lvalue, or is `const`.
+- The same register bound twice.
+- A `%N` reference with no matching operand.
+- An empty clobber entry, or a register name the target architecture does not
+  have (validated per `--target-arch`).
+- An instruction whose CPU feature is not enabled by `--target-features`.
+- `asm` inside a `defer` body, or inside an `async` function.
+- An asm INPUT binding a pointer parameter that is not `keep`.
+
+Load-linked / store-conditional pairs (`lr.w`/`sc.w`, `ldxr`/`stxr`,
+`monitor`/`mwait`) are tracked as a state machine — an unpaired half is
+reported.
+
+**SEE ALSO**
+asm, naked functions, --target-arch, --target-features
+
 ---
 
 ### naked functions
 
 **DESCRIPTION**
-Function with no compiler-generated prologue/epilogue.
-Body must be pure `asm(...)` statements plus `return`.
+`naked` is what grants a function PERMISSION TO CONTAIN `asm`. That is the
+whole of what it does today, and the compiler says so: every `naked` function
+produces a warning that the `__attribute__((naked))` is **not emitted**, so GCC
+still generates a prologue and epilogue.
+
+You therefore do NOT get your own frame layout, your own `ret`/`iret`/`eret`, or
+untouched callee-saved registers. **For true naked semantics — a reset handler,
+a vector-table entry, a context-switch primitive — write the function in C and
+bring it in with `cinclude`.** Why it is not simply restored: GCC permits only
+BASIC asm inside a naked function, while ZER's structured `asm { inputs: ... }`
+lowers to EXTENDED asm, and the operand tracking that keeps UAF / VRP /
+provenance live across the asm boundary is built on those operands.
 
 **SYNTAX**
 ```zer
-naked void reset_handler() {
-    asm("ldr sp, =_stack_top");
-    asm("b main");
+naked void spin_hint() {
+    asm("nop");
 }
+
+i32 main() { return 0; }
 ```
+
+**RULES**
+- A `naked` body may contain ONLY `asm` statements and `return` — anything else
+  is a compile error ("non-asm code uses stack that was never allocated").
+- `asm` is allowed ONLY inside a `naked` function.
+- Local variables are therefore unavailable; bind asm operands to globals.
+
+**SEE ALSO**
+asm, structured asm, cinclude, interrupt
 
 ---
 
@@ -3634,15 +4219,26 @@ static_assert(Color.red == 0, "red is 0");
 ### Designated Initializers
 
 **DESCRIPTION**
-Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, and return.
+Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, return, and at GLOBAL scope (where the initializer is emitted as a C constant brace list, so every field value must itself be a compile-time constant).
 
 **SYNTAX**
 ```zer
-Point p = { .x = 10, .y = 20 };
-p = { .x = 100, .y = 200 };
-func({ .x = 1, .y = 2 });
+struct Point { u32 x; u32 y; }
+struct Cfg { u32 baud; ?u32 parity; ?u32 stop; Point origin; }
+Cfg g_cfg = { .baud = 9600, .parity = 7, .stop = null, .origin = { .x = 1, .y = 2 } };
+void func(Point q) { }
 Point make() { return { .x = 0, .y = 0 }; }
+u32 main() {
+    Point p = { .x = 10, .y = 20 };
+    p = { .x = 100, .y = 200 };
+    func({ .x = 1, .y = 2 });
+    return 0;
+}
 ```
+
+**NOTES**
+- A value-optional field (`?u32`) given a scalar is wrapped as a PRESENT optional; given `null` it is the ABSENT optional (`if (g_cfg.stop) |v|` does not fire). This holds at every site — var-decl init, assignment, the global form.
+- Nested `{ ... }` for a struct-typed field takes the field's type as its context.
 
 ---
 
@@ -3691,17 +4287,27 @@ a.val = 10; b.val = 20; a.next = &b;
 ```
   `*LNode(T)`, `?*LNode(T)` and `[*]LNode(T)` self-fields are all fine.
 - BY-VALUE self-reference is a compile error — it would be an infinite-size
-  struct. Use a pointer field instead:
+  struct. Use a pointer field instead. The error is reported at the
+  INSTANTIATION, not at the template: a `container` is a stamp, and nothing is
+  laid out until a concrete type is stamped from it, so a template that is
+  declared and never used is accepted:
+<!-- audit: expect-error: cannot contain itself by value in field 'child' -->
 ```zer
-container BNode(T) { T val; BNode(T) child; }   // COMPILE ERROR
-container BNode(T) { T val; ?*BNode(T) child; } // OK
+container BNode(T) { T val; BNode(T) child; }
+BNode(u32) b;                                   // COMPILE ERROR — infinite size
+```
+```zer
+container BOk(T) { T val; ?*BOk(T) child; }     // OK — pointer field
+BOk(u32) ok_node;
 ```
 - A by-value CYCLE through several containers is the same error, at any cycle
-  length. Only the direct case used to be caught, and the two-container form
-  crashed the compiler (BUG-864):
+  length, and likewise reported at the instantiation. Only the direct case used
+  to be caught, and the two-container form crashed the compiler (BUG-864):
+<!-- audit: expect-error: closes a containment cycle -->
 ```zer
-container A(T) { B(T) x; }    // COMPILE ERROR — closes a containment cycle
+container A(T) { B(T) x; }
 container B(T) { A(T) y; }
+A(u32) cyc;                   // COMPILE ERROR — closes a containment cycle
 ```
   Make any one link a pointer and the cycle is finite and legal:
 ```zer
@@ -3825,6 +4431,15 @@ cinclude
 ### Arithmetic
 `+  -  *  /  %` — All integer overflow wraps (never UB).
 
+Integer and float operands never mix: `x + f` (u32 x, f32 f) is a compile error
+("cannot mix integer and float"), and so is the compound spelling `x += f` — the
+two forms decide alike. Convert explicitly (`(f32)x + f`, or `@saturate(u32, f)`).
+
+An integer literal must fit its target type exactly — there is no implicit
+narrowing, and that includes the 64-bit boundary: `i64 v = 9223372036854775808;`
+(2^63) is rejected, `i64 v = -9223372036854775808;` and `u64 v = 9223372036854775808;`
+are accepted.
+
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
 This covers negative shift counts too: a signed count that is negative
@@ -3852,6 +4467,10 @@ is still a hard error when the index is provably out of range.
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
+A compound operator obeys every rule the binary form does: no integer/float
+mixing, no narrowing without `@truncate`, `/=` and `%=` need a proven-nonzero
+divisor, and the bitwise forms need integer operands.
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8
@@ -3870,9 +4489,11 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- pointer arithmetic (`p + 1`) — index (`p[1]` on a `[*]T`) or `@ptrtoint`/`@inttoptr` under an `mmio` declaration
+- `->` — field access is `.` through values, pointers and Handles alike
+
+(C-style casts `(T)x` and `goto`/labels ARE in ZER — see "(Type)expr — C-Style Cast" and "goto + labels".)
 
 ---
 
@@ -4035,7 +4656,7 @@ the `Handle` by value rather than a pointer to it.
 | Use-after-free | Handle generation counter + zercheck compile-time analysis |
 | Null dereference | `*T` non-null by type. `?*T` forces unwrap. |
 | Double free | zercheck: compile error |
-| Memory leak | zercheck: compile warning (alloc without free) |
+| Memory leak | zercheck: compile ERROR (an allocation alive or maybe-freed at function exit, unless it escaped) |
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must use @truncate or @saturate explicitly |
@@ -4075,7 +4696,34 @@ zerc source.zer --target-features=aes,sha,bmi1    # enable x86 CPU extensions (c
 zerc source.zer --probe-mode=hosted               # @probe with signal handler (default)
 zerc source.zer --probe-mode=raw                  # @probe direct read, no fault recovery
 zerc source.zer --probe-mode=disabled             # reject any @probe usage at compile time
+zerc source.zer --emit-ir                # print the IR and exit (debugging)
+zerc source.zer --stack-limit 4096       # error when a stack budget is exceeded
+zerc source.zer --track-cptrs            # track C-interop pointers
+zerc source.zer --trace                  # compiler tracing
+zerc source.zer --trace-calls            # compiler call tracing
+zerc source.zer --release                # accepted, currently a NO-OP
+zerc --help                              # usage
 ```
+
+### Argument rules
+
+- **The source file must be the FIRST argument.** `zerc --run foo.zer` fails with
+  *"unknown option 'foo.zer'"*; write `zerc foo.zer --run`.
+- An **unknown flag is a hard error**, not silently ignored.
+- `--stack-limit` requires a positive integer; anything else is a hard error.
+- `-o` decides the mode by EXTENSION: a `.c` path emits C and keeps it; any other
+  path builds an executable and deletes the intermediate `.c`. Note that for a
+  non-`.c` `-o` path the executable is written NEXT TO THE SOURCE, not at the
+  `-o` path.
+
+### --target-features
+
+Accepted values (comma-separated): `avx512f, sse, sse2, avx, avx2, aes, sha,
+bmi1` (alias `bmi`), `bmi2, lzcnt, popcnt, invpcid, pku, xsave, smap`.
+
+The x86_64 baseline is `sse,sse2` even with no flag. `--target-arch=aarch64` and
+`--target-arch=riscv64` CLEAR the feature set to empty. The set gates which
+instructions a structured `asm` block may use.
 
 ### Pipeline
 
@@ -4104,6 +4752,13 @@ g.total = g.value + 1;     // same lock scope (consecutive access grouped)
   snapshot. A **mutable pointer capture `|*x|` of a shared union variant** is a
   compile error (it would alias the shared bytes past the auto-lock) — copy the
   field into a local, mutate it, then assign it back as its own statement.
+- The lock is emitted **per statement, in every statement position** — a function
+  body, either arm of an `if`, a loop body, a `switch` arm whether or not it is
+  braced, a `@critical` or `@once` body, and a `defer` body. There is no spelling
+  of a shared access that skips it. (Before 2026-09-02 a braceless switch arm,
+  `0 => g.x = 5,`, did skip it and emitted an unsynchronized write; the braced
+  form of the same line locked correctly. See BUGS-FIXED BUG-1002, and
+  `tests/test_sharedlock_matrix.c`, which now checks every form.)
 
 ### shared(rw) struct — Reader-Writer Lock
 ```zer
@@ -4169,7 +4824,13 @@ borrowed by that thread until `.join()`:
   (`o.cb = bump; o.cb();`), a funcptr array element, or a funcptr obtained from
   a factory (`*() fp = get_fp(); fp();`, including a factory that returns
   another factory's result). A callback that touches nothing, touches only
-  `threadlocal`, or synchronizes with `@atomic_*` compiles as usual
+  `threadlocal`, or synchronizes with `@atomic_*` compiles as usual.
+  A factory's `return` is found **wherever it sits** — top level, or inside an
+  `if`, `for`, `while`, `do-while`, `switch` arm, `defer`, `@critical` or
+  `@once` body. (Before 2026-09-02 the `switch`-arm and `do-while` positions
+  were not searched, so a factory returning the racing callback from either one
+  compiled clean; see BUGS-FIXED BUG-998. The identical rule and the identical
+  fix apply at the `interrupt` sink.)
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)
@@ -4300,6 +4961,7 @@ make sense inside async functions. Using them in a regular function
 emits nothing useful (no state machine exists), so the compiler rejects
 at the use site rather than silently stripping.
 
+<!-- audit: expect-error: 'yield' only allowed inside async function -->
 ```zer
 void regular() {
     yield;   // COMPILE ERROR — 'yield' only allowed inside async function
@@ -4370,7 +5032,9 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- C-style casts EXIST but are restricted — `(T)x` converts between numeric types
+  and does `*T` <-> `*opaque`; it CANNOT cross the integer/pointer line, strip
+  `const`/`volatile`, or retype one pointee to another (see C-STYLE CASTS)
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

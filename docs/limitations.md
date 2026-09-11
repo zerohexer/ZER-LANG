@@ -5,6 +5,101 @@ Entries removed once fixed.
 
 ---
 
+# SESSION 2026-08-27b — fresh audit (BUG-913..918), six findings — LANDED ON MAIN 2026-09-11
+
+**STATUS 2026-09-11.** The section below describes the `vigilant-tesla-ef9cao` branch's
+session and reached main's ledger before its CODE did: every reproducer it names was
+MEASURED to compile clean on main at `a27ab52`. The six are now on main under main's own
+numbers — BUG-1003 (f2i saturation at file scope), BUG-1004 (non-finite float literal +
+`audit_float_literal.sh`, the 10th gate), BUG-1005 (`@container` whole object, three-valued
+provenance), BUG-1006 (`@pun` with a primitive pointee), BUG-1007 (`@inttoptr` to an
+enum-carrying pointee), BUG-1021 (`*opaque` erasure records the true pointee id). Their
+tests are `tests/zer_fail/{container_*,pun_forge_*,inttoptr_enum_*}.zer`,
+`tests/zer_trap/{mmio_enum_via_bitcast,ptrcast_opaque_prim_origin}_trap.zer` and four
+positives. Read the rest as history.
+
+Not a harvest. All nine `vigilant-tesla` branches are consumed and all three harvest
+trackers are closed (see the HANDOFF below, still accurate). This was a probe-driven audit
+of the intrinsic surface. **`make check` exit 0**, ten gates including the new
+`audit_float_literal.sh`.
+
+Three silent safety holes, all the same shape — **an intrinsic advertises a check that is
+not emitted for certain operand types**:
+
+| bug | what was silent | consequence measured on main |
+|---|---|---|
+| BUG-916 | `@pun`'s runtime `type_id` trap is absent whenever either pointee is a primitive/slice/funcptr (only struct/enum/union carry an id, everything else packs 0 and the comparison folds to false) | an integer became a **working pointer with no `@inttoptr` and no `mmio`** — rc=42 writing through it. Also forged enum / bool / funcptr / slice-`len`. Hosted a wild address hits the SIGSEGV handler, which is `_ZER_HOSTED`-only, so **bare metal is a silent wild access** |
+| BUG-917 | `@inttoptr(*State, addr)` — the FOURTH enum-forging door, in a set documented as closed at three | switch **returned 3** on a register holding 200; zero guard emissions in the generated C |
+| BUG-915 | `@container` had a two-valued provenance domain for a three-valued fact; `&wholeObject` fell into "unknown, allow" | ASan **stack-buffer-underflow** (global source: global-buffer-underflow), no diagnostic, no trap |
+| BUG-918 | the ROOT of BUG-916 — erasing a non-aggregate pointer to `*opaque` recorded `type_id = 0`, which means "unknown origin, a C pointer we cannot vouch for" rather than "no id available" | `@ptrcast(*Big, opaque_from_u32ptr)` **RAN**; ASan stack-buffer-overflow on the 16-byte read of a 4-byte object. The same program with a `*Sensor` origin traps correctly — two spellings disagreeing |
+
+Plus two defects where the COMPILER'S OWN OUTPUT is invalid C, so the user sees a GCC
+error against their own `.zer` line and no ZER diagnostic ever names the cause: a
+non-finite float literal emitted as the bare token `inf` (BUG-913, five sites, now one
+helper + a gate), and the float-to-int saturation guard emitted as a statement expression
+at file scope (BUG-914).
+
+**Method note worth keeping.** Every one of the six was found by PROBING the intrinsic
+surface for "what does this actually do", not by reading for suspicious code. Three of the
+five were sitting next to a comment that already described the hazard — BH-18 #4's own
+text says *"the runtime type_id trap is skipped for an in-ZER primitive pointer ... so the
+OOB is SILENT"*, and it fixed only the out-of-bounds half. **When a fix's rationale
+describes a mechanism as broken, check whether the fix covered every consequence of that
+mechanism or only the one that was reported.** BUG-918 came from a second habit worth
+keeping: **after fixing one intrinsic, run the same probe against its siblings.** `@pun`
+and `@ptrcast` share the `_zer_opaque` mechanism, and the sibling turned out to hold the
+root cause.
+
+**A sentinel that means two things is a hole waiting to happen.** `type_id == 0` carried
+both "no id available for this kind" and "unknown origin — the FFI floor". The first is a
+compiler limitation; the second is a positive claim that disables a check. Twelve sites
+produced the first while the single reader interpreted it as the second. When a fix
+introduces a sentinel, write down which of those it is.
+
+## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (LOW, unmeasured)
+
+BUG-917 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch
+downstream *elides work* on the assumption that every value is a declared variant, and that
+elision was measured turning a bad value into a wrong dispatch.
+
+The same intrinsic can produce a pointer to a struct carrying a `*T`, `[*]T`, `bool`,
+optional or `Handle`, and reading those fields forges those values from hardware bits. That
+was NOT shipped, deliberately:
+
+- `@inttoptr` **is** the sanctioned integer-to-pointer door (mmio-gated and audit-visible),
+  so a hardware register holding an address is the thing it exists to express;
+- `lib/compat.zer` depends on `@inttoptr(*opaque, ...)` for its pointer arithmetic, so the
+  blanket predicate (`type_carries_forgeable`) has a non-zero corpus cost;
+- no wrong-dispatch or wrong-elision defect has been measured for these, unlike the enum
+  case.
+
+If this is taken up, measure first: find a downstream analysis that ELIDES a check on the
+strength of one of these types, the way the exhaustive switch does for enums. Absent that,
+this is an unmeasured tightening and should stay unshipped.
+
+## NOTE — the exhaustive-enum switch's last-arm elision is the amplifier, not the hole
+
+Worth writing down because it explains why every enum-door bug reads as severe. Lowering an
+exhaustive `switch` emits the final arm as an **unconditional else**:
+
+```
+if (s == 0) -> arm0; else if (s == 1) -> arm1; else -> arm2;   /* no test on arm2 */
+```
+
+That is sound exactly while every enum value is a declared variant — which is what the
+forge doors defend. So a missed door does not merely let a strange value through; it makes
+that value *take an arm*, and the `return 77` fall-through after the switch becomes dead
+code. Every enum-forge bug to date (BUG-843, 864, 891, 910, and now 917) reports as "the
+switch silently ran its LAST arm" for this reason.
+
+Making the switch defensive (test the last arm too, fall through on no match) would remove
+the amplifier permanently and independently of door coverage. It was NOT done here: it
+costs a comparison and a branch on every enum switch, it silently does nothing on a forged
+value rather than trapping, and ZER's chosen answer is to trap at the point of forgery.
+Recorded as the alternative in case the door set ever stops being closable.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
@@ -60,7 +155,96 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 83 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978), grouped, with the branch to take each from
+## OPEN — residuals recorded while closing the 2026-09-10 survey (2026-09-11, all LOW; none is an accept-unsafe)
+
+- **A plain `shared` funcptr call under a held lock (liveness, not memory safety).**
+  BUG-980 refuses `g.v = fp();` only for `shared(rw)`. For a plain `shared` root the
+  recursive mutex makes same-root re-entry harmless, and the callback-table idiom
+  (`go.cb();`, a funcptr PARAM called under a shared root — measured, 2 corpus programs)
+  must keep compiling. What remains: the unknown callee may lock a SECOND shared struct
+  while this statement holds the first — the two-lock ordering hazard the deadlock rule
+  exists for, invisible because the summary cannot see through a funcptr. Fix sketch: the
+  REACH machinery (`scan_funcname_binding` / `scan_returned_funcname`) already resolves a
+  funcptr's possible targets for the race scan; feed its shared-type union into the
+  callee-transitive set instead of refusing. Liveness is a named floor; entered here so
+  the residual is not mistaken for coverage.
+- **Optional-param free through the IF-CAPTURE form stays MAYBE (over-rejection).**
+  BUG-988 summarises `*T t = p orelse return; free(t);` as a definite free of param `p`;
+  `if (p) |t| { free(t); }` stays MAYBE (pinned by
+  `tests/zer_fail/opt_param_capture_form_stays_maybe.zer`). The null path of an
+  if-capture is a real runtime branch, so it would need the same
+  `orelse_fallback_local`-style marking on the capture's else-edge. Workaround: spell the
+  unwrap with `orelse return`.
+- **Freeing a UNION variant through its POINTER capture `|*q|` is a false leak.** BUG-989
+  re-roots a projection through a VALUE capture onto the aggregate; the pointer capture
+  is a separate hoisted local and is not yet re-rooted. Workaround: free through the
+  value capture or the union itself.
+- **BUG-1030 covers the IR-lowered defer path only.** A function containing a LABEL keeps
+  the raw-AST defer path (`IRInst.defer_fire_emit_ast`), where `emit_defer_stmt` already
+  sets `guard_traps` itself — so both paths trap, but by two mechanisms. When refactor L's
+  label residual is closed, delete the AST one.
+- **The auto-guard inside a held shared lock is an early return BEFORE the lock, by
+  design.** `vgonmt`'s refactor M expected it to TRAP (`guard_in_shared_lock_traps`);
+  main orders the guard ahead of the lock (BUG-956), so the documented silent early
+  return applies and no mutex leaks. Recorded so the next harvest does not re-open it.
+- **`ZER_ENUM_GUARD_DEPTH` (256) and the volatile MMIO-index refusal are caps with a
+  conservative answer** — past 256 nested carriers the `@bitcast` guard traps
+  unconditionally (BUG-1029); a volatile ident indexing an MMIO pointer is refused
+  outright (BUG-1025) because a pointer index has no single-read inline form. Both are
+  over-rejections by construction, listed for the day someone hits them.
+
+---
+
+## ~~OPEN~~ CLOSED 2026-09-11 — FIVE BRANCHES SURVEYED 2026-09-10: all 83 live holes and the 3 masked ones are on main
+
+**STATUS 2026-09-11 — every class below is closed; the survey is history.** Every
+reproducer was re-measured against `a27ab52` first (162 branch negatives extracted and
+run: 123 compiled clean, 16 rejected for a different reason, 23 already right), then the
+fix was cherry-picked or hand-ported, renumbered, A/B'd against a from-HEAD build, and
+its tests installed. Where a class was taken from:
+
+| class | main's numbers | mechanism |
+|---|---|---|
+| 2 allocation bare spelling / global projection / struct carry | BUG-984 / 985 / 986 | `ir_register_alloc_result_compound`, `ir_global_projection_key`, `ir_carry_compounds` |
+| 3 `shared(rw)` re-entrancy (call, two-hop, pointer, read-then-write, funcptr, funcptr field) | BUG-979 / 980 | callee-only probe + indirect-call flag in `check_block_lock_ordering` |
+| 4 loop counter past end (7 forms incl. while / do-while) | BUG-981 | `Checker.cert_loop_*` loop-induction certainty + `IDX_PARTIAL_OOB` |
+| 5 forging doors — `@pun` x4, `@inttoptr` enum x2, `@container` x5 | BUG-1006 / 1007 / 1005 | `pun_type_id_check_can_fire`, `type_carries_enum_c`, `Symbol.is_whole_object_addr` |
+| 6 atomic cell x scoped spawn | BUG-982 | `ff_spawn_in_func` + `scoped_spawn_live`, a join closes the window |
+| 7 `@ptrtoint(&local)` through a call (4) | BUG-993 | `call_result_is_local_address_int`; sink-matrix p25 |
+| 8 factory reach through switch / do-while, spawn + ISR | BUG-998 | exhaustive `scan_returned_funcname` / `record_isr_returned_funcname`; REACH grid cells |
+| 9 view of local / global projection / optional param / union capture | BUG-989 / 985 / 988 | `IRHandleInfo.view_root_local`, `orelse_fallback_local`, `freed_then_reset` |
+| 10 i64 literal range | BUG-1009 | exact INT64 bounds at both literal arms |
+| 10 bool minting via `@ptrcast` / `@inttoptr` | BUG-1012 | `type_carries_bool_c` |
+| 10 MMIO const ident (addr / misaligned / **index — the masked one**) | BUG-992 | `mmio_const_addr` at four sites |
+| 10 global init from a mutable global; const substitution | BUG-991 | checker rule + `Emitter.global_init_depth` |
+| 10 multiview UAF (assign, branch join) | BUG-1035 | `ir_fill_multiview_set` at both sinks, UNION merge |
+| 10 struct-init field UAF / move | BUG-1020 | `IR_STRUCT_INIT_DECOMP` runs the UAF walkers + `ir_mark_transferred` |
+| 10 compound float<->int | BUG-1008 | the binary form's class rule at the compound arm |
+| 10 RMW via struct-init, split statements, alias survives funcptr binding | BUG-1017 / 1015 / 1018 | one `expr_mentions` walker; value taint; scoped (not wiped) scan tables |
+| 10 `@bitcast` array target (and array SOURCE miscompile) | BUG-1027 / 1028 | checker reject + declarator/memcpy-from-array at both emitter paths |
+| 10 param-local0 double free | BUG-1034 | `ir_alloc_id_of_local` (id + 1) — 0 is only the sentinel |
+| 10 spawn borrow with two roots | BUG-1026 | `Symbol.borrow_root_unknown`; sink-matrix p26 |
+| 10 defer body with a label | BUG-1014 | rejected |
+| 10 asm operand shared read | BUG-1013 | rejected (naked function has no frame for a mutex) |
+| masked `opt_param_drop_then_caller_uaf` / `_other_optional_null_path_maybe` | BUG-988 | optional-param free through `orelse return` is summarised |
+
+Found while running the branches' TRAP tests against main (a trap test that exits 0 is a
+silent miscompile): BUG-1022 (auto-zeroed enum in a calloc'd struct ran the last switch
+arm), BUG-1023 (`@bitcast(bool, 2)`), BUG-1025 (a VOLATILE index read twice around the
+guard), BUG-1029 (the enum guard walker stopped at depth 8 / 4096 elements), BUG-1030 (a
+guard inside a defer-body loop header REPLAYED the defer body — including the guarded
+access — as its early return). See BUGS-FIXED.md "Session 2026-09-11".
+
+**NOT adopted, on purpose:** `vgonmt`'s refactor M cells that expect a bounds guard to
+TRAP inside a held shared lock (`guard_in_shared_lock_traps`) — main's design emits the
+guard BEFORE the lock (BUG-956 ordering) and takes the documented silent early return
+there, which is not a leak and not a hole; `ppnatu`'s `asm_shared_operand` (same hole as
+BUG-1013, different wording); `acafecf`'s `bool_switch_foreign_value` (its route is now
+rejected at the mint by BUG-1012); the 3sdup9 `vrp_type_width_*` traps (they pin the
+boundary of a RELAXATION main does not have — the guards are simply still there).
+
+The original survey follows, for the record.
+
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -240,6 +424,61 @@ asm reproducer; skip the rest.
 
 Segfault (done) → class 1 (done) → classes 3 and 6 (data races) → class 2 (UAF/leak)
 → class 5 (forging doors) → the rest.
+
+---
+
+
+## PARTLY CLOSED 2026-09-11 (tooling harvested from `vigilant-tesla-o51x9p`, BUG-994) — `reference.md` error-examples: the mechanism now exists, 13 of 49 backfilled
+
+**What shipped.** `tools/audit_reference_examples.sh` gained an opt-in
+`<!-- audit: expect-error: <substring> -->` directive. A block carrying one is
+COMPILED (through the same prelude/wrap pipeline as every other block) and must be
+REJECTED with a diagnostic containing that substring. Two distinct failure reports,
+because they mean different things: *"THE DOC CLAIMS A REJECTION THE COMPILER NO
+LONGER PERFORMS"* (compiled clean) and *"REJECTED FOR THE WRONG REASON"* (rejected,
+wrong diagnostic). Verified to FIRE before being trusted, by injecting a substring
+that cannot appear.
+
+`=== reference.md example audit: 206 blocks — 75 compiled, 13 rejected-as-documented,
+36 skipped, 82 baselined, 0 failed ===`
+
+**The naive version was measured and rejected, not merely argued against.** Asserting
+"every error block must fail" would have passed vacuously: running all 27 candidates
+through the harness, most failed on SYNTAX or on `undefined identifier` — a cast of
+characters the fragment never declares — long before reaching the rule they
+illustrate. One block of BARE EXPRESSIONS (`@inttoptr(*u32, BASE + 0x2)` with no
+statement around it) failed with *"expected ';' after expression"*. The substring
+oracle is what separates "rejected" from "rejected for the documented reason", and it
+is the same discipline `// expect-error:` enforces for `tests/zer_fail/`.
+
+**It found a real doc/compiler disagreement on its first run.** Two blocks the doc
+labelled `// COMPILE ERROR` **compiled clean**:
+
+```zer
+container BNode(T) { T val; BNode(T) child; }   // doc said COMPILE ERROR
+container A(T) { B(T) x; }                       // doc said COMPILE ERROR
+container B(T) { A(T) y; }
+```
+
+The compiler is right and the doc was incomplete: a `container` is a STAMP, so
+nothing is laid out until a concrete type is instantiated, and the cycle check runs
+at instantiation. Adding `BNode(u32) b;` / `A(u32) cyc;` produces the documented
+error. A reader who copied either example would have concluded the guarantee in
+CLAUDE.md's safety table ("Container infinite recursion → compile error") did not
+exist. Both blocks now carry the instantiation and an `expect-error` directive.
+
+**What is still open — 36 blocks, one authoring pass each.** They fall into two
+groups, and the second is the reason this is not finished:
+- Blocks whose intended rule fires cleanly once wrapped — pure backfill.
+- Blocks that name identifiers the doc never declares (`go`, `BIT`, `gq`,
+  `register_callback`, `Celsius`, `local_handler`, …). These need the EXAMPLE edited
+  to be self-contained, or a prelude entry, before any assertion is meaningful.
+  Adding a directive without that edit produces a substring assertion against an
+  `undefined identifier` diagnostic — a gate that passes while testing nothing.
+
+Until each is done, treat the remaining 36 as documentation, not coverage. Do NOT
+close this entry by mass-adding directives; add them one at a time, each verified to
+fail for the RIGHT reason.
 
 ---
 
@@ -996,7 +1235,11 @@ leaking it"*.)
 
 ---
 
-## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
+## CLOSED 2026-09-11 (BUG-1010; found BUG-1011 alongside) — a DESIGNATED INITIALIZER at GLOBAL scope
+
+**Fixed exactly as the entry below predicted (one missing `validate_struct_init` on the pass-2 global path) plus the emitter's file-scope brace-list form; tripwire `tests/zer/global_designated_init.zer`. Kept as the record.**
+
+### (original entry)
 
 Found while measuring item J's sinks; not reported by any branch, and NOT
 optional-specific — it was checked against a plain field precisely to find out.
@@ -1078,7 +1321,15 @@ this is fixed** — leaving it would turn a deliberate record into a rule nobody
 
 ---
 
-## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+## ~~OPEN~~ CLOSED 2026-09-11 as BUG-1013 — a `shared struct` read in an ASM OPERAND takes NO LOCK
+
+Decided by the Ban Decision Framework as a HARDWARE constraint: asm is only legal in a
+`naked` function, which has no prologue and no frame, so a `pthread_mutex_lock` around
+the operand is not something the compiler can emit there. REJECTED, one query
+(`collect_shared_types_in_expr`) over both operand lists so the two cannot disagree.
+Tests: `tests/zer_fail/asm_operand_shared_read.zer`, `tests/zer/asm_operand_plain_global_ok.zer`.
+The original entry follows.
+
 
 Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
 not reported by any branch. The baseline claimed an asm operand can reach "no local, no
@@ -1874,7 +2125,12 @@ The atomic-cell rule does not cover the window between `spawn` and `.join()`:
 
 ---
 
-### CLASS 6 — RMW SPLIT OVER TWO STATEMENTS (MEDIUM, bare-metal) — `1zukjq`
+### ~~CLASS 6 — RMW SPLIT OVER TWO STATEMENTS~~ — **CLOSED 2026-09-11 as BUG-1015, DO NOT REDO**
+
+> Cherry-picked `1zukjq` `1e55f54`: a NAME -> GLOBAL value taint at BOTH sinks (ISR
+> `Checker.rmw_taints`, spawn `_rmw_vtaint`), `RFORM_SPLIT_STMT`/`_2HOP` cells + three positive
+> boundary cells in the hw-matrix (37/37). Also BUG-975: all ten matrices honour
+> `ZER_MATRIX_ZERC`. Original:
 
 **Direct residual of BUG-792.** That fix made the rule catch the written-out
 single-statement form (`g = g + 1`); splitting the same operation over two statements
@@ -1890,7 +2146,14 @@ still evades it, because the rule is per-STATEMENT:
 
 ---
 
-### CLASS 7 — VIEW / STRUCT-INIT FIELD (HIGH, accept-unsafe) — `1zukjq`
+### ~~CLASS 7 — VIEW / STRUCT-INIT FIELD~~ — **CLOSED 2026-09-11 as BUG-1020 / BUG-1034 / BUG-1035, DO NOT REDO**
+
+> Cherry-picked `1zukjq` `c060f36` (BUG-976..982), reconciled: their enum totality guard
+> is BUG-950 (only the UNION half taken, as BUG-976), their `@cast` launder is BUG-931, their
+> alloc registration is BUG-933. All five CLASS 7 negatives reject; `param_local0_double_free`
+> was the alloc_id-0 sentinel collision (BUG-979). The branch's `enum_switch_foreign_value`
+> trap test is NOT taken: its route (`@inttoptr(*St, addr)`) is rejected by BUG-970, and the
+> guarded route is pinned by `mmio_enum_via_bitcast_trap.zer`. Original:
 
     // multiview_assign_uaf — a reassigned slice view loses which allocation it names
     [*]u8 pick([*]u8 a, [*]u8 b, bool fl) { if (fl) { return b[0..1]; } return a[0..1]; }
@@ -1961,7 +2224,7 @@ Forms: `defer_body_spawn`, `_critical`, `_label`, `_once`, `_switch`.
 
 </details>
 
-### CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`
+### ~~CLASS 9 — GLOBAL INITIALIZERS: a self-cycle **HANGS THE COMPILER** (HIGH, DoS) — `o51x9p`~~ — **CLOSED — the cycle is main's BUG-975 (2026-09-10); `_from_mutable` and the const-substitution emitter are BUG-991 (2026-09-11). DO NOT REDO.**
 
 **Upgraded from MEDIUM after re-measurement 2026-08-20.** This does not merely
 compile — the compiler LOOPS FOREVER in constant evaluation. Measured `exit=124` at a
@@ -1981,7 +2244,7 @@ accepts.
 
 ---
 
-### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
+### ~~CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`~~ — **CLOSED 2026-09-11 as BUG-993 (return-summary based; also the pointer-param shape; sink-matrix p25). DO NOT REDO.**
 
     usize g = 0;
     usize idfn(usize x) { return x; }
@@ -1993,7 +2256,7 @@ CALL-laundered form is not.
 
 ---
 
-### CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`
+### ~~CLASS 11 — MMIO ADDRESS VIA A `const` IDENT (MEDIUM, bare-metal) — `o51x9p`~~ — **CLOSED 2026-09-11 as BUG-992 (`mmio_const_addr`, one query at four sites; the over-rejected positive compiles). DO NOT REDO.**
 
 The range and alignment checks fold a literal but not a `const` identifier:
 
@@ -2006,7 +2269,7 @@ Companion positive `mmio_const_ident_base` is currently OVER-REJECTED (below).
 
 ---
 
-### CLASS 12 — FUNCPTR FACTORY THROUGH switch / do-while (MEDIUM) — `pstdqk`
+### ~~CLASS 12 — FUNCPTR FACTORY THROUGH switch / do-while (MEDIUM) — `pstdqk`~~ — **CLOSED 2026-09-11 as BUG-998 (both sinks, +4 REACH +2 ISR cells). DO NOT REDO.**
 
 Extends the funcptr REACH class. `scan_returned_funcname` does not descend a `switch`
 arm or a `do-while` body:
@@ -2026,7 +2289,7 @@ arm or a `do-while` body:
 
 ---
 
-### CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`
+### ~~CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`~~ — **CLOSED 2026-09-11 as BUG-1005 (three-valued provenance, both sinks). DO NOT REDO.**
 
     struct Inner { u32 a; }
     struct Outer { u64 pad; Inner in; }
@@ -2128,7 +2391,7 @@ Do not re-derive; each was run, not read.
 | `loop_counter_bounds_ok` | `v7pucv` | **CLOSED** by BUG-932 |
 | `vrp_empty_range_zero_trip_ok` | `v7pucv` | **CLOSED** by BUG-932 — same single cause, a zero-trip loop |
 | `funcptr_global_registry_ok` | `osp1a7` | **DECIDED — DO NOT "FIX".** Their whole-file rule was measured to ACCEPT an unguarded indirect call through null (no guard in the emitted C). Main's rule is the sound one and the restructure is teachable: `?u32 (*g)(u32,u32) = null;` + `if (g) \|f\|` compiles and runs. Soundness is the hard wall; over-rejection is the soft gradient |
-| `mmio_const_ident_base` | `o51x9p` | live — `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
+| `mmio_const_ident_base` | `o51x9p` | CLOSED 2026-09-08 (BUG-974) — was: `@inttoptr(*u32, UART)` with a `const` ident base derives no bound. Same shape as the documented `const u32 N; x % N` division case: resolve the const's init. Contained |
 | `comptime_width_conversions` | `lzmkhn` | live — the comptime evaluator cannot evaluate a C-style cast in a comptime body. Contained, evaluator-local |
 | `return_literal_is_static_ok` | `lzmkhn` | live — `return pick(b)` where the callee returns a LITERAL, not a view of the local. Genuine PRECISION work on the return summary (`ret_param_mask` / `call_result_static_given_args`), not a rule bug |
 
@@ -3300,6 +3563,139 @@ root cause is systemic, not accidental. **Until the Makefile grows header deps, 
 
 ---
 
+## OPEN — 2026-09-02 audit: leads NOT yet verified (hypotheses, not findings)
+
+These came out of full-file structural reads of `zercheck_ir.c`, `ir_lower.c` and
+`emitter.c` during the 2026-09-02 audit. **None has a reproducer.** Four items from the
+same sweep WERE verified and are fixed (BUG-913..916, see BUGS-FIXED.md); four others
+were verified as NOT bugs and are recorded there too. What is left is this list.
+
+Treat every row as a HYPOTHESIS. This file's own MEASURE-FIRST protocol applies: build
+the reproducer against current main and read the DIAGNOSTIC before implementing
+anything. Four of six entries in a previous OPEN list turned out to be already closed.
+
+**Ordered by the severity they WOULD have if real.**
+
+### A. `ir_merge_states` (zercheck_ir.c:1095) merges a SUBSET of `IRHandleInfo`
+
+The join copies `state`, `free_block`, `freed_all_paths` and (for 3 of 9 arms) `free_line`
+for handles already present in the result; every other field keeps whatever
+`states[first_live]` had, i.e. **is decided by predecessor order**:
+`escaped`, `alloc_id`, `source_color`, `pool_name`, `is_move_local`, `is_thread_handle`,
+`alloc_line`, `freed_defer_id`, and the BUG-849 `view_alloc_ids`/`view_count`/`view_overflow`
+set. `escaped` drives the leak skip and the overwrite check; the view set drives UAF
+reporting. Order-dependence in either direction is the concern.
+
+Related, same function: the state table covers **9 of 25** (state × state) pairs. Identity
+pairs and `rh == MAYBE_FREED` are correct by fall-through, but every pair involving
+`IR_HS_UNKNOWN` is unhandled — `(UNKNOWN, ALIVE)` keeps UNKNOWN, which would untrack an
+allocation at a join. Reachability is narrow (a pred needs an explicit UNKNOWN entry, which
+today only the global-store clear at 2934/4225 produces), so build the probe around that.
+
+Also: the convergence test (6519) compares only `handle_count`, per-handle `state`,
+`thread_count` and per-thread `joined`. An iteration that changes only `escaped` or the
+view set reports "converged".
+
+### B. `IRPathState.critical_depth` is not merged at all
+
+`ir_ps_copy` supplies it from `states[first_live]`; there is no max/join. If one
+predecessor is inside `@critical` and another is not, the `@critical` spawn/slab bans
+(2959, 3073, 5869) would read the wrong depth on the merged path.
+
+### C. `ir_ps_copy` forces `terminated = false`, making three merge branches dead
+
+`ir_ps_copy` (line 186) hard-codes it, and the driver always feeds the merge through
+`ir_ps_copy` — so `states[si].terminated` is always false and the `first_live` search
+(1104), the "all preds terminated ⇒ unreachable" branch (1108) and the dead-path skip
+(1144) never fire. Either the field is doing nothing, or it is meant to and does not.
+Establish which before touching it.
+
+### D. Terminator/opcode enumerations that disagree with each other
+
+- `ir_block_is_terminated` (ir.c:287) lists BRANCH/GOTO/RETURN/YIELD. `ir_compute_preds`,
+  `dfs_reachable` and `cfg_reaches_fire` all treat `IR_AWAIT` as a terminator. One of the
+  four is wrong.
+- `ir_fire_has_work_after` skip-list (2401) has 5 opcodes and omits `IR_NOP` — which
+  lowering emits, and which is the carrier for spawn/asm passthrough. A stray NOP after a
+  defer fire would make a function-exit fire look block-scoped.
+- `ir_type_is_ptrish` (1509) covers POINTER/OPAQUE/HANDLE but not `TYPE_SLICE`, although
+  3634 and 7022 both treat SLICE as reference-producing.
+- `ir.c` has `default:` in 3 of its 4 opcode switches (243, 315, 353), while
+  `zercheck_ir.c` has none anywhere. A new opcode is silently absorbed on the `ir.c` side.
+
+### E. `ir_lower_interrupt` and defers — **REFUTED, measured 2026-09-02**
+
+The hypothesis was that `ir_lower_interrupt` (3949) drops pending defers because it lacks
+the explicit fire that `ir_lower_func` has (3904-3908). Measured on the emitted C: it does
+not. A `defer release();` in an `interrupt` body emits `release()` on the fall-through
+path, and on an early-`return` path as well — exactly once on each, two call sites for the
+two paths. The block-scope fire covers what the implicit-return fire would have.
+
+Left in this list, marked refuted rather than deleted, because the reasoning that produced
+it (reading one function's exit path in isolation) is the same reasoning that will produce
+it again.
+
+### F. `pre_lower_orelse` on `await_stmt.cond` defeats `IR_AWAIT` re-evaluation
+
+`IR_AWAIT`'s design (comment at ir_lower.c:3685) is that the emitter re-evaluates the
+condition on every poll. `pre_lower_orelse` at 3704 hoists an orelse in that condition into
+the block BEFORE the await, so on resume the emitter re-reads a temp that is never
+recomputed. `await (poll() orelse false);` would latch its first value.
+
+### G. Bare-expression switch arm and the shared lock — **CONFIRMED and FIXED (BUG-1002 on main; the `defer stmt;` sibling is BUG-990)**
+
+Measured, and it was a silent data race:
+
+    0 => g.x = 5,        ->  g.x = 5;                       (no mutex)
+    0 => { g.x = 5; }    ->  lock; g.x = 5; unlock;
+
+Same program, two spellings, one unsynchronized with no diagnostic. Fixed in the PARSER by
+wrapping the bare arm expression in a single-statement `NODE_BLOCK`, which makes "every
+statement body is a NODE_BLOCK" universal rather than true-with-one-exception. See
+BUGS-FIXED.md BUG-917.
+
+The same entry speculated that `defer <stmt>;` (which builds a bare `NODE_EXPR_STMT` the
+same way) and `NODE_AWAIT` conditions were unlocked for the same reason. **`defer` was
+measured and is NOT affected** — it locks correctly in both spellings, because defer bodies
+are replayed through a different path. The AWAIT condition is still unmeasured; note that
+`await` only exists in `async` functions, where a shared access in a statement containing
+the suspend is already a compile error, so the reachable window is narrow.
+
+### ~~H. `expr_mentions_name` still has the gap its twin had~~ — CLOSED 2026-09-11 as BUG-1017: ONE exhaustive `expr_mentions` walker behind both (and it found NODE_STRUCT_INIT missing from BOTH twins)
+
+`expr_mentions_global` (checker.c:2674) was widened by BUG-856 to cover INTRINSIC / CALL /
+ORELSE / SLICE. `expr_mentions_name` (2659) covers only IDENT / BINARY / UNARY / FIELD /
+INDEX / TYPECAST. It feeds `rmw_scan_body`. Two functions, one question, one of them fixed.
+
+### I. Depth and width caps with no diagnostic on exhaustion
+
+`resolve_write_target_global` bails at **depth > 6** — the tightest bound of any shared
+safety resolver, at both RMW sinks. `RMW_ALIAS_MAX 16` silently drops bindings past 16
+(overflow checks at 13287/13378/20139/20191) and a dropped binding is a MISSED race, i.e.
+the unsafe direction. `Type *found[4]` caps shared types per statement at 4.
+`Symbol.rmw_param_mask` at 7742 has no conservative fallback past index 63.
+
+### J. Two allocator-name enumerations that will rot
+
+`ir_classify_method_call_ex` knows 8 method names and none of the Ring ones, although
+`IR_RING_PUSH`/`POP`/`PUSH_CHECKED` exist in `ir.h`. The cstdlib allocator list is
+`malloc`/`calloc`/`realloc` only — `strdup`, `aligned_alloc`, `reallocarray` fall to
+`ZC_COLOR_UNKNOWN`. And `ThreadHandle` recognizes only `join`, while two diagnostics tell
+the user to "add th.join() or detach explicitly" — `detach` is not recognized, so following
+the advice does not silence the error.
+
+### K. Large parts of `ir_check_inst` are dead in the current pipeline
+
+Lowering emits 22 opcodes. `IR_SPAWN`, `IR_FIELD_WRITE` and `IR_INDEX_WRITE` are not among
+them (spawn goes through `IR_NOP` + `NODE_SPAWN`; the writes go through `IR_ASSIGN`), yet
+each has a full handler. Consequence worth checking: `is_thread_handle` is set ONLY at 5911
+inside the dead `IR_SPAWN` handler, so the "ThreadHandle not joined" branch at 7689 may be
+unreachable and the live check may be the name-based pass at 7759. A fix applied to any of
+these three handlers would be silently ineffective — which is the reason to resolve this
+one even though it is not itself a bug.
+
+---
+
 ## OPEN — the four 2026-08-11 residuals, all measured 2026-08-16
 
 Two CLOSED, one CONFIRMED LIVE with a precise narrowing, one confirmed live and awaiting a
@@ -3949,6 +4345,29 @@ where a bug ships a race rather than an over-rejection. It should follow the
 documented accept-unsafe discipline: build the exhaustive branch x join-position
 grid FIRST, verify it fires against the pre-fix build, then relax. The
 over-rejection is safe to live with meanwhile.
+
+**UPDATE 2026-09-02 — the grid now EXISTS: `tests/test_borrow_join_matrix.c`**
+(in `make check`). That was the prescribed first step and it is done, so the next
+session starts from a fixed contract instead of inventing one:
+
+- **Nine hard-gated negatives** pin the soundness that exists today (then-only,
+  else-only, no-else, neither, nested-in-one-arm, nested-in-both, loop body,
+  switch arms, and a two-handle cell that forces the release to be keyed
+  per-HANDLE rather than per-branch). All nine pass — measured, not assumed.
+- **Two PENDING cells** are this over-rejection, with the expectation INVERTED
+  (`tests/zer_gaps/` semantics): they must currently be REJECTED **and for the
+  borrow reason**, so the cell cannot pass vacuously. The day the relaxation
+  lands, the grid FAILS with "GAP CLOSED — promote this cell". A closing gap that
+  silently starts passing is the failure mode this convention exists to prevent.
+
+The mechanism is small (record a handle whose join was refused at exactly
+`th_spawn_branch_depth + 1`, once per arm; release after the if when BOTH arms
+recorded the SAME handle). The **soundness obligation is not**, and it is written
+out in full in the matrix file's header — five conditions, of which two (a
+different handle declared inside an arm borrowing the same local, and the
+break/continue/return/goto interaction with a linear tracker) must be MEASURED
+before any code is written. They were not measured this session, which is why the
+relaxation was specified rather than shipped.
 
 **Tripwire.** `tests/zer/scoped_borrow_branch_shapes.zer` pins the four shapes
 that must keep compiling, so the guard cannot broaden unnoticed.

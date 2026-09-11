@@ -1,0 +1,16 @@
+// BUG-979 (2026-09-11): the POSITIVE half of the shared(rw) re-entry rule. A plain
+// `shared` struct is a RECURSIVE pthread mutex, so a statement that holds S's
+// lock and calls a function that locks S again on the same thread is fine —
+// the rule fires only for `shared(rw)` (a non-re-entrant rwlock). The value
+// check proves both writes landed in order.
+shared struct S { u32 v; }
+S g;
+u32 f() { g.v = 2; return 5; }
+u32 main() {
+    g.v = f();            // f sets 2 under the nested lock, then the statement stores 5
+    if (g.v != 5) { return 1; }
+    u32 r = g.v + f();    // read-locked statement, f write-locks inside: recursive mutex
+    if (r != 10) { return 2; }
+    if (g.v != 2) { return 3; }
+    return 0;
+}

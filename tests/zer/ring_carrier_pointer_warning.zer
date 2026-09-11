@@ -1,0 +1,18 @@
+// BUG-987 (2026-09-11): the "pushing pointer through Ring channel" warning
+// tested the element's BARE kind, so an element STRUCT carrying a `?*T` field
+// crossed the channel with no warning at all — the wrapper-hides-the-inner-kind
+// class. Both push and push_checked now ask the carrier predicate. Verified by
+// the warn_check line in tests/test_zer.sh (must compile, warn, and exit 0).
+struct Payload { u32 v; }
+struct Msg { u32 tag; ?*Payload p; }
+Ring(Msg, 4) q;
+Payload g_pay;
+u32 main() {
+    Msg m;
+    m.tag = 1;
+    m.p = &g_pay;
+    q.push(m);
+    ?Msg got = q.pop();
+    if (got) |r| { return r.tag - 1; }
+    return 2;
+}

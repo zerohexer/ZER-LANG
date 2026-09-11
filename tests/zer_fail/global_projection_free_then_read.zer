@@ -1,0 +1,13 @@
+// expect-error: use after free
+// BUG-985: a global-rooted projection (`g.p`) was REGISTERED at the store sinks
+// (G5) but resolved at no other sink — `free(g.p)` was an untracked free and
+// the read after it a silent use-after-free. The compound-key query now yields
+// the same (global pseudo-root, "g.p") entry at every sink.
+struct T { u32 v; }
+struct H { *T p; }
+H g;
+u32 main() {
+    g.p = alloc(T) orelse return;
+    free(g.p);
+    return g.p.v;
+}

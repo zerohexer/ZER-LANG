@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: @bitcast cannot target an array type
+// BUG-1027: an array TARGET produced invalid C (`int32_t[50] _zer_bco0`, a GCC error with
+// no ZER diagnostic); with the declarator fixed the value was DISCARDED and the array
+// stayed zero, because an array is not an assignable value and a block-scoped array
+// cannot escape the statement expression. Rejected with the struct-wrapper remedy.
+enum Color { red, green }
+u32 main() {
+    u32[50] raw;
+    Color[50] cs = @bitcast(Color[50], raw);
+    if (cs[0] == Color.red) { return 0; }
+    return 1;
+}

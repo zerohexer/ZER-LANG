@@ -1,0 +1,17 @@
+// BUG-1009 boundary: INT64_MAX and INT64_MIN are exactly representable and
+// must keep compiling; a float compound-assign on a float target is fine.
+u32 main() {
+    i64 hi = 9223372036854775807;
+    i64 lo = -9223372036854775808;
+    u64 big = 9223372036854775808;
+    if (hi < 0) { return 1; }
+    if (lo > 0) { return 2; }
+    if (big < 100) { return 3; }
+    f32 f = 1.5;
+    f += 2.5;
+    if (f < 3.9) { return 4; }
+    u32 x = 5;
+    x += 2;
+    if (x != 7) { return 5; }
+    return 0;
+}

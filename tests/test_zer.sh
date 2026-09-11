@@ -273,6 +273,7 @@ warn_check() {
 
 warn_check tests/zer/dyn_array_autoguard_crash.zer "auto-guard inserted" "autoguard-warning-emitted"
 warn_check tests/zer/dyn_array_guard.zer "auto-guard inserted" "dynguard-warning-emitted"
+warn_check tests/zer/ring_carrier_pointer_warning.zer "pushing pointer through Ring channel" "ring-carrier-pointer-warning"
 
 echo ""
 echo "=== ZER No-Warning Verification (must compile + NO warnings + exit 0) ==="

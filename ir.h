@@ -176,6 +176,16 @@ typedef struct IRInst {
      * the emitter must emit them from the AST instead. Set for every fire in a
      * function containing a LABEL — see materialise_defer_body. */
     bool defer_fire_emit_ast;
+    /* BUG-1030: this instruction was lowered INSIDE a defer body (the template,
+     * and therefore every clone spliced at a fire point — the flag rides the
+     * struct copy). The emitter's per-instruction auto-guard must TRAP there,
+     * never take the early return: the return path re-fires the defer stack,
+     * which replays THIS body's raw AST — including the very access the guard
+     * was refusing — and then leaves the function. Measured on a loop condition
+     * inside a defer body: the "guard" executed `arr[100]` itself. Lowering
+     * already traps for the statement kinds it guards; loop and await
+     * conditions are left to the emitter, which needs this bit to know. */
+    bool in_defer_body;
 
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
@@ -267,6 +277,12 @@ typedef struct {
      * alloc returned null). zercheck_ir leak detection skips these
      * blocks entirely — they can't leak what was never allocated. */
     bool is_orelse_fallback;
+    /* BUG-988: for an is_orelse_fallback block, the LOCAL holding the optional
+     * whose null-ness selected it (the `_zer_or` temp the branch tested); -1
+     * otherwise. Lets the FuncSummary builder tell "this return is the null
+     * path of param i's own unwrap" (nothing to free there) from "this return
+     * is some other optional's null path" (param i simply was not freed). */
+    int orelse_fallback_local;
 
     /* Phase E: set by ir_lower when this block is part of an if-then or
      * switch-arm body whose always-exits terminator (return/break/

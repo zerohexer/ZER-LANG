@@ -26,7 +26,27 @@
 #   <!-- audit: skip -->        not compilable on purpose (error illustration)
 #   <!-- audit: fragment -->    wrap in main() even if it looks top-level
 #
-# Exit 0 iff every non-skipped block compiles.
+# ASSERT A REJECTION per block (2026-08-29):
+#   <!-- audit: expect-error: <substring> -->
+#
+# A block illustrating a rejection is skipped by default — compiling it would
+# fail by design. That left ~36 blocks checked in NEITHER direction, so the doc
+# could keep claiming a rejection the compiler no longer performs. (Measured:
+# one did, and chasing it found BUG-991 and BUG-975.)
+#
+# The naive upgrade — "every error block must fail to compile" — is a WEAK
+# ORACLE and is deliberately NOT what this implements: most of these blocks are
+# FRAGMENTS, so they fail on syntax long before reaching the rule they
+# illustrate, and the gate would pass vacuously forever. This is the same shape
+# `// expect-error:` exists to close for tests/zer_fail. So the directive names
+# the SUBSTRING the diagnostic must contain, exactly like a negative test, and
+# is opt-in per block so the 36 can be backfilled highest-value-first.
+#
+# Write the substring the rule is SUPPOSED to say, not whatever the compiler
+# currently prints — pasting current output freezes a wrong reason into the gate.
+#
+# Exit 0 iff every non-skipped block compiles AND every expect-error block is
+# rejected for the stated reason.
 
 set -u
 cd "$(dirname "$0")/.."
@@ -52,6 +72,9 @@ while i < len(lines):
     m = re.match(r'\s*<!--\s*audit:\s*(skip|fragment)\s*-->\s*$', l)
     if m:
         mode = m.group(1); i += 1; continue
+    m = re.match(r'\s*<!--\s*audit:\s*expect-error:\s*(.+?)\s*-->\s*$', l)
+    if m:
+        mode = 'expect:' + m.group(1); i += 1; continue
     if l.strip() == '```zer':
         start = i + 1
         j = i + 1
@@ -78,7 +101,7 @@ with open(os.path.join(tmp, 'index'), 'w', encoding='utf-8') as ix:
         ix.write('%d\t%s\t%s\t%s\n' % (ln, md or '-', f, h))
 PY
 
-TOTAL=0; OK=0; SKIP=0; FAILED=0; KNOWN=0
+TOTAL=0; OK=0; SKIP=0; FAILED=0; KNOWN=0; REJ=0
 BASELINE="tools/reference_example_baseline.txt"
 : > "$TMP/seen"; : > "$TMP/nowok"
 FAILLOG="$TMP/fail.log"; : > "$FAILLOG"
@@ -105,13 +128,28 @@ PRELUDE_DECLS=(
 # declares its own `struct Task` must not get a second one, and a block that
 # declares its own mmio range must not overlap the catch-all.
 make_prelude() {
-    local blk="$1" out="$2" name decl
+    local blk="$1" out="$2" name decl skipped_task=0
     : > "$out"
     grep -qE '^[[:space:]]*mmio[[:space:]]' "$blk" || \
         echo "mmio 0x0..0xFFFFFFFFFFFFFFFF;" >> "$out"
     for entry in "${PRELUDE_DECLS[@]}"; do
         name="${entry%%|*}"; decl="${entry#*|}"
-        grep -qE "(struct|union|enum|container)[[:space:]]+$name\b|\b$name[[:space:]]*[;=]|\)[[:space:]]+$name[[:space:]]*;" "$blk" && continue
+        if grep -qE "(struct|union|enum|container)[[:space:]]+$name\b|\b$name[[:space:]]*[;=]|\)[[:space:]]+$name[[:space:]]*;" "$blk"; then
+            [ "$name" = "Task" ] && skipped_task=1
+            continue
+        fi
+        # 2026-09-02: `heap` and `pool` are Slab(Task)/Pool(Task,8) — they DEPEND on
+        # the Task declaration. When a block supplies its own `struct Task`, the
+        # Task entry above is skipped but these two were still emitted, ahead of the
+        # block, referencing a type that does not exist yet: "undefined type 'Task'"
+        # at two prelude lines. The block was blamed and pushed into the baseline.
+        # A self-contained example is the thing this audit exists to encourage, so a
+        # prelude that punishes one is worse than no prelude. Skip the dependents
+        # with their dependency; the block declares Task, so a block that also wants
+        # an allocator can declare it too.
+        if [ "$skipped_task" = "1" ] && { [ "$name" = "heap" ] || [ "$name" = "pool" ]; }; then
+            continue
+        fi
         echo "$decl" >> "$out"
     done
 }
@@ -126,13 +164,22 @@ is_toplevel() {
     return 1
 }
 
+EXPECT=""
 while IFS=$'\t' read -r LN MODE F HASH; do
     TOTAL=$((TOTAL+1))
+    EXPECT=""
+    case "$MODE" in
+        expect:*) EXPECT="${MODE#expect:}"; MODE="fragment_or_toplevel" ;;
+    esac
     if [ "$MODE" = "skip" ]; then SKIP=$((SKIP+1)); continue; fi
-    # blocks that are pure signature/prose tables have no ZER statement at all
-    if ! grep -qE '[;{]' "$F"; then SKIP=$((SKIP+1)); continue; fi
-    # a block that illustrates a rejection documents the rejection, not a program
-    if grep -qiE '(COMPILE ERROR|PARSE ERROR|ERROR —|// ERROR)' "$F"; then SKIP=$((SKIP+1)); continue; fi
+    if [ -z "$EXPECT" ]; then
+        # blocks that are pure signature/prose tables have no ZER statement at all
+        if ! grep -qE '[;{]' "$F"; then SKIP=$((SKIP+1)); continue; fi
+        # a block that illustrates a rejection documents the rejection, not a
+        # program. Give it an `audit: expect-error:` directive to assert the
+        # rejection instead of skipping it.
+        if grep -qiE '(COMPILE ERROR|PARSE ERROR|ERROR —|// ERROR)' "$F"; then SKIP=$((SKIP+1)); continue; fi
+    fi
 
     SRC="$TMP/u_$(basename "$F")"
     make_prelude "$F" "$TMP/prelude.zer"
@@ -148,6 +195,31 @@ while IFS=$'\t' read -r LN MODE F HASH; do
             echo "return 0; }"
         fi
     } > "$SRC"
+
+    if [ -n "$EXPECT" ]; then
+        OUT=$("$ZERC" "$SRC" -o "$SRC.c" 2>&1)
+        if ! echo "$OUT" | grep -q ': error:'; then
+            FAILED=$((FAILED+1))
+            {
+                echo "--- $DOC:$LN (expect-error block) ---"
+                echo "    THE DOC CLAIMS A REJECTION THE COMPILER NO LONGER PERFORMS."
+                echo "    expected a diagnostic containing: $EXPECT"
+                echo "    got: (compiled clean)"
+            } >> "$FAILLOG"
+        elif ! echo "$OUT" | grep -qF -- "$EXPECT"; then
+            FAILED=$((FAILED+1))
+            {
+                echo "--- $DOC:$LN (expect-error block) ---"
+                echo "    REJECTED FOR THE WRONG REASON (or the wording drifted)."
+                echo "    expected a diagnostic containing: $EXPECT"
+                echo "    actual:"
+                echo "$OUT" | grep ': error:' | head -3 | sed 's/^/      /'
+            } >> "$FAILLOG"
+        else
+            REJ=$((REJ+1))
+        fi
+        continue
+    fi
 
     if OUT=$("$ZERC" "$SRC" -o "$SRC.c" 2>&1) && ! echo "$OUT" | grep -q ': error:'; then
         OK=$((OK+1))
@@ -166,7 +238,7 @@ while IFS=$'\t' read -r LN MODE F HASH; do
     fi
 done < "$TMP/index"
 
-echo "=== ${DOC##*/} example audit: $TOTAL blocks — $OK compiled, $SKIP skipped, $KNOWN baselined, $FAILED failed ==="
+echo "=== ${DOC##*/} example audit: $TOTAL blocks — $OK compiled, $REJ rejected-as-documented, $SKIP skipped, $KNOWN baselined, $FAILED failed ==="
 
 # A baseline row whose block now COMPILES (or no longer exists) is stale. Report
 # it: a frozen list that outlives its entries is the false-confidence failure

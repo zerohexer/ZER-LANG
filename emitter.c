@@ -24,6 +24,38 @@ static void emit(Emitter *e, const char *fmt, ...) {
     va_end(args);
 }
 
+/* BUG-1004: render a `double` as a VALID C floating constant.
+ *
+ * `%.17g` is round-trip exact for every FINITE double, and was used verbatim at
+ * FIVE emission sites. It is wrong for the three non-finite values: glibc prints
+ * `inf` / `-inf` / `nan`, none of which is a C token. So a ZER program containing
+ * a float literal that overflows the double range —
+ *
+ *     f64 x = 1e400;          // strtod -> +inf
+ *
+ * emitted `_zer_t0 = inf;`, and the user got GCC's *"'inf' undeclared"* pointing
+ * at their own `.zer` line via `#line`. Compile-time and runtime both "miss" it
+ * in the sense that matters here: no ZER diagnostic ever names the real problem,
+ * and the failure is attributed to the C layer the user never wrote.
+ *
+ * `__builtin_inf()` / `__builtin_nan("")` are GCC constants: usable in a STATIC
+ * INITIALIZER (so the global-scope site works), available under `-ffreestanding`
+ * (so bare-metal works), and exact. ZER emits GCC-only C already (statement
+ * expressions, `__auto_type`, `__attribute__`), so this adds no new dependency.
+ *
+ * ONE helper, not five spellings — the same multi-site discipline the rest of
+ * this file follows. A new float-emitting site must call this, never `%.17g`;
+ * `tools/audit_float_literal.sh` fails the build on a raw one. */
+static void emit_double_lit(Emitter *e, double v) {
+    /* NaN first: every comparison against NaN is false, so an `isnan`-last
+     * ordering would fall through to `%.17g` and print `nan`. Same reason the
+     * float->int saturation guard tests NaN first (BUG-883). */
+    if (v != v) { emit(e, "__builtin_nan(\"\")"); return; }
+    if (v > 1.7976931348623157e308) { emit(e, "__builtin_inf()"); return; }
+    if (v < -1.7976931348623157e308) { emit(e, "(-__builtin_inf())"); return; }
+    emit(e, "%.17g", v);
+}
+
 /* emit a user-defined type name with optional module prefix for namespace mangling.
  * If prefix is set: emits "prefix_name". If NULL: emits "name". */
 static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
@@ -49,6 +81,87 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
         fprintf((e)->out, "%.*s", (int)(name_len), (name)); \
     } \
 } while(0)
+
+/* BUG-1021: the runtime provenance id of a POINTER's pointee — ONE definition.
+ *
+ * `_zer_opaque` carries `{ptr, type_id}` and every `@ptrcast` / `@pun` out of an
+ * `*opaque` guards with `type_id != EXPECTED && type_id != 0`, where 0 means
+ * "unknown origin — a C pointer we cannot vouch for", which is the FFI floor.
+ *
+ * The bug: this computed an id for struct / enum / union ONLY, so erasing ANY
+ * other pointer recorded 0 — a LIE, because the compiler knew exactly what it
+ * was. Every downstream check then compared against 0 and passed. Measured:
+ *
+ *     u32 raw = 77;
+ *     *opaque c = @ptrcast(*opaque, &raw);
+ *     *Big m = @ptrcast(*Big, c);        // 16-byte read of a 4-byte object
+ *
+ * runs, with ASan reporting stack-buffer-overflow. The cast site cannot catch it
+ * — across a function boundary the provenance IS unknown there, which is exactly
+ * why the runtime id exists. The fix has to be at the ERASURE, by recording the
+ * truth.
+ *
+ * Non-aggregate pointees get a RESERVED id, in a range `next_type_id` (which
+ * counts up from 1) cannot reach. The id is derived from the type KIND plus the
+ * bit width for `uN`/`iN`, so `*u32` and `*f32` are distinguished but `*u8[4]`
+ * and `*u8[8]` are not. That is deliberate and it is the SAFE direction: two
+ * types sharing an id can only FAIL to trap, never trap wrongly, so the
+ * approximation costs precision and never soundness.
+ *
+ * `*opaque` stays 0. It is the one pointee whose origin genuinely is unknown,
+ * and collapsing it into "known" would start trapping legitimate C interop.
+ *
+ * Twelve sites had spelled the struct/enum/union chain out by hand, which is why
+ * one omission became twelve. They all call this now. */
+#define ZER_TID_RESERVED_BASE 0x7F000000u
+
+static uint32_t zer_pointee_tid(Type *ptr_type) {
+    if (!ptr_type) return 0;
+    Type *p = type_unwrap_distinct(ptr_type);
+    if (!p || type_dispatch_kind(p) != TYPE_POINTER || !p->pointer.inner) return 0;
+    Type *inner = type_unwrap_distinct(p->pointer.inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT) return inner->struct_type.type_id;
+    if (k == TYPE_ENUM)   return inner->enum_type.type_id;
+    if (k == TYPE_UNION)  return inner->union_type.type_id;
+    /* The FFI floor: an untyped hardware/C pointer really is unknown. */
+    if (k == TYPE_OPAQUE) return 0;
+    /* Every other KNOWN pointee: a reserved id, width-qualified for uN/iN. */
+    uint32_t width = 0;
+    if (k == TYPE_UINT || k == TYPE_SINT) width = (uint32_t)inner->intn.bits & 0xFFu;
+    return ZER_TID_RESERVED_BASE + ((uint32_t)k * 256u) + width;
+}
+
+/* The AGGREGATE-ONLY id — a DIFFERENT question, kept as its own function.
+ *
+ * `zer_pointee_tid` answers "what does this pointer really point at?", which is
+ * what an `*opaque` round-trip needs: there the provenance is genuinely dynamic
+ * and the recorded id is the only evidence.
+ *
+ * A DIRECT pointer-to-pointer `@pun` is not that situation — both types are
+ * statically known at the call, and the checker has ALREADY ruled on it: it
+ * rejects a widening pun (BH-18 #4) and a forging one (BUG-985), and DELIBERATELY
+ * accepts the rest, because reinterpreting bits as plain integers forges nothing.
+ * Emitting a runtime trap for those would contradict a decision already made and
+ * would break the byte-view idiom `@pun(*u8, structptr)`.
+ *
+ * So the direct path keeps the historical aggregate-only ids: between two named
+ * aggregates the trap encodes @pun's audit-visible "you claimed wrong" policy;
+ * everywhere else the compile-time rules are the whole answer. Two questions,
+ * two functions — the same discipline the type_carries_* predicates follow. */
+static uint32_t zer_pointee_tid_agg(Type *ptr_type) {
+    if (!ptr_type) return 0;
+    Type *p = type_unwrap_distinct(ptr_type);
+    if (!p || type_dispatch_kind(p) != TYPE_POINTER || !p->pointer.inner) return 0;
+    Type *inner = type_unwrap_distinct(p->pointer.inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT) return inner->struct_type.type_id;
+    if (k == TYPE_ENUM)   return inner->enum_type.type_id;
+    if (k == TYPE_UNION)  return inner->union_type.type_id;
+    return 0;
+}
 
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
@@ -128,6 +241,14 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
  * Used for T → ?T wrapping at assignment, var-decl init.
  * opt_type is the target optional type (may be distinct). */
 static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
+    /* BUG-1011: `null` into a value-optional field. The wrap below builds
+     * `{ <value>, 1 }`, and a NULL literal emits as `0`, so `{ .n = null }`
+     * became `{ 0, 1 }` — a PRESENT optional holding 0. Measured: `if (s.n)
+     * |v|` took the branch. A null is the absent optional; emit that. */
+    if (value_expr && value_expr->kind == NODE_NULL_LIT) {
+        emit_opt_null_literal(e, opt_type);
+        return;
+    }
     emit(e, "(");
     emit_type(e, opt_type);
     emit(e, "){ ");
@@ -882,12 +1003,26 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * no header for these predicates). Same shape, same depth limit; keep them in
  * step — they answer the same question for the same rule, the checker deciding
  * whether to care and the emitter deciding where to look. */
+/* BUG-1023: `bool` is a two-variant enum in everything but spelling, and it has
+ * the SAME forge door. `@bitcast(bool, n)` with n = 2 produced a `bool` for
+ * which `if (b)` took the TRUE branch while `switch (b) { true => … false => … }`
+ * — which the checker REQUIRES to be exhaustive — matched neither arm and ran
+ * nothing. Two constructs reading one value and disagreeing, with no diagnostic
+ * on either side. `bool` is `uint8_t` in the emitted C, so there is nothing
+ * downstream to normalise it.
+ *
+ * It is the only door: `(bool)n` normalises (it emits `!= 0` and yields 1), and
+ * `@truncate` / `@saturate` reject a bool target outright ("must be an integer
+ * type"). Corpus cost of guarding it: ZERO — `@bitcast(bool, …)` does not occur
+ * anywhere in tests/, rust_tests/, zig_tests/, test_modules/, lib/, examples/
+ * or the reference. */
 static bool type_carries_enum_e(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    if (depth > 32) return true;   /* unknown -> guard (the reject direction) */
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
-    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_ENUM || k == TYPE_BOOL) return true;
     if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
     if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
     if (k == TYPE_STRUCT) {
@@ -955,12 +1090,34 @@ static void emit_try_enum_close(Emitter *e, Type *t) {
     emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
 }
 
+/* BUG-1029: this walker used to answer the ACCEPT side at three of its own
+ * limits — `depth > 8` returned silently (an enum forged 11 structs deep ran
+ * unguarded while the same forge 3 deep trapped), an array past 4096 elements
+ * skipped its guard loop (a `Color[5000]` forged through @bitcast ran
+ * unguarded), and the path was built in a fixed `char[256]`, which silently
+ * truncated a long projection into a DIFFERENT lvalue. Every one of those is
+ * the fail-open shape BUG-976 closed elsewhere: a walk that stops must say so.
+ * Now a depth past the (generous) cap emits an unconditional trap, the array
+ * loop has no size cap, and the path is heap-built. */
+#define ZER_ENUM_GUARD_DEPTH 256
 static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                                          const char *what, int depth) {
-    if (!t || depth > 8) return;
+    if (!t) return;
+    if (depth > ZER_ENUM_GUARD_DEPTH) {
+        emit(e, "_zer_trap(\"%s produced an enum-carrying value nested too deep "
+                "to guard (>%d levels)\", __FILE__, __LINE__); ", what, ZER_ENUM_GUARD_DEPTH);
+        return;
+    }
     Type *u = type_unwrap_distinct(t);
     if (!u) return;
     TypeKind k = type_dispatch_kind(u);
+    if (k == TYPE_BOOL) {
+        /* BUG-1023 — see type_carries_enum_e. The variant set of `bool` is
+         * {0, 1} and the emitted representation is `uint8_t`. */
+        emit(e, "if ((unsigned)(%s) > 1u) _zer_trap(\"%s produced a bool that is "
+                "neither true nor false\", __FILE__, __LINE__); ", path, what);
+        return;
+    }
     if (k == TYPE_ENUM) {
         if (u->enum_type.variant_count == 0) return;
         emit(e, "if (!(");
@@ -976,11 +1133,15 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
         for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
             Type *ft = u->struct_type.fields[i].type;
             if (!type_carries_enum_e(ft, 0)) continue;
-            char sub[256];
-            snprintf(sub, sizeof(sub), "%s.%.*s", path,
+            size_t plen = strlen(path);
+            size_t n = plen + 1 + u->struct_type.fields[i].name_len + 1;
+            char *sub = (char *)malloc(n);
+            if (!sub) return;
+            snprintf(sub, n, "%s.%.*s", path,
                      (int)u->struct_type.fields[i].name_len,
                      u->struct_type.fields[i].name);
             emit_enum_variant_guard_path(e, ft, sub, what, depth + 1);
+            free(sub);
         }
         return;
     }
@@ -989,24 +1150,30 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
         if (!type_carries_enum_e(in, 0)) return;
         /* Only the payload of a PRESENT optional is meaningful; a null one
          * carries whatever the zeroing left, which is not a forged variant. */
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s.value", path);
+        size_t n = strlen(path) + 7;
+        char *sub = (char *)malloc(n);
+        if (!sub) return;
+        snprintf(sub, n, "%s.value", path);
         emit(e, "if (%s.has_value) { ", path);
         emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
+        free(sub);
         return;
     }
     if (k == TYPE_ARRAY) {
         Type *in = u->array.inner;
         if (!type_carries_enum_e(in, 0)) return;
-        if (u->array.size == 0 || u->array.size > 4096) return;
+        if (u->array.size == 0) return;   /* no elements, nothing to guard */
         int li = e->temp_count++;
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s[_zer_egi%d]", path, li);
+        size_t n = strlen(path) + 32;
+        char *sub = (char *)malloc(n);
+        if (!sub) return;
+        snprintf(sub, n, "%s[_zer_egi%d]", path, li);
         emit(e, "for (size_t _zer_egi%d = 0; _zer_egi%d < %llu; _zer_egi%d++) { ",
              li, li, (unsigned long long)u->array.size, li);
         emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
+        free(sub);
         return;
     }
     /* A UNION is TAGGED in ZER, so its payload is only readable through the
@@ -1059,6 +1226,32 @@ static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
     default: break;
     }
 }
+/* The four saturation limits, as C constant-expression text. Extracted so the
+ * statement-expression form (emit_f2i_close) and the CONSTANT form
+ * (emit_f2i_const) cannot drift apart — the bounds ARE the safety property, and
+ * two copies of them is the multi-site shape this codebase keeps getting bitten
+ * by. `n` is the size of EACH buffer (all four are the same size at every call). */
+static void f2i_limits(int bits, bool sg, char *lo, char *hi, char *mn, char *mx,
+                       size_t n) {
+    if (sg) {
+        snprintf(lo, n, "-0x1p%d - 1.0", bits - 1);
+        snprintf(hi, n, "0x1p%d", bits - 1);
+        if (bits == 64) {
+            snprintf(mn, n, "(-9223372036854775807LL - 1)");
+            snprintf(mx, n, "9223372036854775807LL");
+        } else {
+            snprintf(mn, n, "(-(1LL << %d))", bits - 1);
+            snprintf(mx, n, "((1LL << %d) - 1)", bits - 1);
+        }
+    } else {
+        snprintf(lo, n, "-1.0");
+        snprintf(hi, n, "0x1p%d", bits);
+        snprintf(mn, n, "0");
+        if (bits == 64) snprintf(mx, n, "18446744073709551615ULL");
+        else            snprintf(mx, n, "((1ULL << %d) - 1ULL)", bits);
+    }
+}
+
 /* Emits `({ <srcT> _v = ` — caller emits the source, then calls _close. */
 static void emit_f2i_open(Emitter *e, Type *src, int tmp) {
     emit(e, "({ ");
@@ -1089,23 +1282,7 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
      * representable value is ever clamped. */
     if (bits > 0 && bits <= 64) {
         char lo[64], hi[64], mn[64], mx[64];
-        if (sg) {
-            snprintf(lo, sizeof lo, "-0x1p%d - 1.0", bits - 1);
-            snprintf(hi, sizeof hi, "0x1p%d", bits - 1);
-            if (bits == 64) {
-                snprintf(mn, sizeof mn, "(-9223372036854775807LL - 1)");
-                snprintf(mx, sizeof mx, "9223372036854775807LL");
-            } else {
-                snprintf(mn, sizeof mn, "(-(1LL << %d))", bits - 1);
-                snprintf(mx, sizeof mx, "((1LL << %d) - 1)", bits - 1);
-            }
-        } else {
-            snprintf(lo, sizeof lo, "-1.0");
-            snprintf(hi, sizeof hi, "0x1p%d", bits);
-            snprintf(mn, sizeof mn, "0");
-            if (bits == 64) snprintf(mx, sizeof mx, "18446744073709551615ULL");
-            else            snprintf(mx, sizeof mx, "((1ULL << %d) - 1ULL)", bits);
-        }
+        f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
         emit(e, "; (_zer_f2i%d != _zer_f2i%d) ? (", tmp, tmp);
         emit_type(e, tgt); emit(e, ")0 : (_zer_f2i%d <= (%s)) ? (", tmp, lo);
         emit_type(e, tgt); emit(e, ")%s : (_zer_f2i%d >= (%s)) ? (", mn, tmp, hi);
@@ -1119,6 +1296,137 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
          tmp, tmp);
     emit_type(e, tgt);
     emit(e, ")_zer_f2i%d; })", tmp);
+}
+
+/* ========================================================= * CAST EMISSION — ONE POLICY, THREE CALL SITES  (BUG-1000, 2026-09-02)
+ * ================================================================
+ *
+ * A `(T)x` cast is emitted from THREE places, and the policy had been copied
+ * into each by hand:
+ *
+ *   1. emit_expr           NODE_TYPECAST  — global/const initializers
+ *   2. emit_rewritten_node NODE_TYPECAST  — the IR expression path: plain
+ *                                           assignments, defer bodies, spawn args
+ *   3. emit_ir_inst        IR_CAST        — the decomposed 3AC path
+ *
+ * Sites 1 and 3 implemented FOUR behaviours. Site 2 implemented ONE. Measured
+ * on main, both live and both silent-to-the-user:
+ *
+ *   bool a = false;  a = (bool)pick();      // pick() returns 5
+ *       -> site 2 emitted `a = ((uint8_t)pick())`, so `a` holds 5.
+ *          `if (a)` is TRUE and `a == true` is FALSE — the same value reading
+ *          two ways. The probe returned 9 where it must return 0.
+ *          (This is BUG-586, fixed at sites 1 and 3, never at site 2.)
+ *
+ *   *Motor m = seed;  m = (*Motor)ctx;      // ctx is *opaque
+ *       -> site 2 emitted `((struct Motor*)ctx)`, casting the `_zer_opaque`
+ *          STRUCT straight to a pointer. GCC rejects it ("cannot convert to a
+ *          pointer type"), so a valid ZER program does not build; and had it
+ *          built, the runtime `type_id` check that site 3 emits — the whole
+ *          mechanism that stops a wrong-typed `*opaque` being dereferenced —
+ *          would have been absent.
+ *
+ * Adding the missing arms to site 2 would have made a fourth copy and left the
+ * next divergence just as invisible. Instead the DECISION and the EMISSION now
+ * live here once; each site supplies only its own way of emitting the operand,
+ * through CastOperand. This is the same class-kill shape as `value_flows_to`
+ * (checker.c) — one query, N thin sites — and it is what makes the parity
+ * structural rather than remembered.
+ *
+ * The form switch has no `default:`, so a new cast form is a build error rather
+ * than a silent fall-through to a plain C cast at whichever site was forgotten.
+ */
+typedef enum {
+    CASTF_TO_OPAQUE,    /* *T -> *opaque : wrap as (_zer_opaque){ptr, type_id} */
+    CASTF_FROM_OPAQUE,  /* *opaque -> *T : unwrap .ptr, trap on type_id mismatch */
+    CASTF_TO_BOOL,      /* int/float/ptr -> bool : (uint8_t)!!x, NOT a plain cast */
+    CASTF_F2I,          /* float -> integer : saturating (BUG-883) */
+    CASTF_PLAIN         /* everything else : ((T)x) */
+} CastForm;
+
+/* How the ONE emitter below gets at the value being cast. */
+typedef enum { CASTOP_AST, CASTOP_REWRITTEN, CASTOP_LOCAL } CastOperandKind;
+typedef struct {
+    CastOperandKind kind;
+    Node   *expr;       /* CASTOP_AST / CASTOP_REWRITTEN */
+    IRFunc *func;       /* CASTOP_REWRITTEN / CASTOP_LOCAL */
+    int     local;      /* CASTOP_LOCAL */
+} CastOperand;
+
+static bool cast_type_is_opaque_ptr(Type *eff) {
+    if (!eff) return false;
+    if (type_dispatch_kind(eff) == TYPE_OPAQUE) return true;
+    return type_dispatch_kind(eff) == TYPE_POINTER && eff->pointer.inner &&
+           type_dispatch_kind(eff->pointer.inner) == TYPE_OPAQUE;
+}
+
+/* THE policy. Order matters and is the order sites 1 and 3 already used:
+ * opaque handling outranks bool/float because an opaque round-trip is about
+ * representation, not value. */
+static CastForm classify_cast(Type *src_eff, Type *tgt_eff) {
+    if (type_dispatch_kind(src_eff) == TYPE_POINTER &&
+        type_dispatch_kind(tgt_eff) == TYPE_POINTER && tgt_eff->pointer.inner &&
+        type_dispatch_kind(tgt_eff->pointer.inner) == TYPE_OPAQUE)
+        return CASTF_TO_OPAQUE;
+    if (type_dispatch_kind(tgt_eff) == TYPE_POINTER && cast_type_is_opaque_ptr(src_eff))
+        return CASTF_FROM_OPAQUE;
+    if (type_dispatch_kind(tgt_eff) == TYPE_BOOL && src_eff &&
+        (type_is_integer(src_eff) || type_is_float(src_eff) ||
+         type_dispatch_kind(src_eff) == TYPE_POINTER))
+        return CASTF_TO_BOOL;
+    if (f2i_needs_guard(src_eff, tgt_eff)) return CASTF_F2I;
+    return CASTF_PLAIN;
+}
+
+static void emit_cast_operand(Emitter *e, const CastOperand *op);
+static void emit_cast_value(Emitter *e, const CastOperand *op,
+                            Type *src_eff, Type *tgt, Type *tgt_eff);
+
+/* BUG-1003: the same saturation as a C CONSTANT EXPRESSION — no statement
+ * expression, so it is legal in a STATIC INITIALIZER.
+ *
+ *     u32 g = (u32)1e20;
+ *
+ * is a legal ZER global, and the checker accepts it, but the emitter reached the
+ * BUG-883 guard through the AST path and wrote `uint32_t g = ({ ... });` at file
+ * scope. GCC then said *"braced-group within expression allowed only inside a
+ * function"*, pointing (via `#line`) at the user's own `.zer` line. The ZER
+ * program is correct; only the emission shape was illegal there. Same class as
+ * the `inf` literal above: the compiler's own output is what fails, and no ZER
+ * diagnostic ever names the cause.
+ *
+ * The operand is emitted FOUR times, so this form is used ONLY when re-evaluating
+ * it is free and observationally identical: no side effects (`expr_has_side_effects`)
+ * and not volatile (`expr_is_volatile` — a repeated MMIO read is a hardware event,
+ * not a free re-read). A global initializer is a constant expression by the
+ * checker's own rule, so it always qualifies; anything that does not qualify keeps
+ * the statement-expression form, which is only reachable inside a function where
+ * that form is legal.
+ *
+ * Bounds come from the SAME `f2i_limits` the statement form uses — one source of
+ * truth for the four limits. */
+static bool emit_f2i_const(Emitter *e, Type *tgt, Node *operand) {
+    int bits; bool sg;
+    f2i_bounds(tgt, &bits, &sg);
+    if (bits <= 0 || bits > 64) return false;      /* u128/i128 — trap form only */
+    if (!operand) return false;
+    if (expr_has_side_effects(operand) || expr_is_volatile(e, operand)) return false;
+
+    char lo[64], hi[64], mn[64], mx[64];
+    f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
+    #define F2I_OP() do { emit(e, "("); emit_expr(e, operand); emit(e, ")"); } while (0)
+    emit(e, "(");
+    F2I_OP(); emit(e, " != "); F2I_OP(); emit(e, " ? (");
+    emit_type(e, tgt); emit(e, ")0 : ");
+    F2I_OP(); emit(e, " <= (%s) ? (", lo);
+    emit_type(e, tgt); emit(e, ")%s : ", mn);
+    F2I_OP(); emit(e, " >= (%s) ? (", hi);
+    emit_type(e, tgt); emit(e, ")%s : (", mx);
+    emit_type(e, tgt); emit(e, ")");
+    F2I_OP();
+    emit(e, ")");
+    #undef F2I_OP
+    return true;
 }
 
 /* BUG-851: five emitter GIVE-UP paths emitted a comment plus a placeholder when the
@@ -1456,6 +1764,35 @@ static void emit_type(Emitter *e, Type *t) {
 }
 
 /* emit type with variable name (handles arrays and func ptrs) */
+/* BUG-1001 (2026-09-02): a function whose RETURN TYPE is a function pointer needs
+ * C's nested-declarator form `RET (*name(params))(fp_args)`. Both signature
+ * emitters tested for that with a RAW type-kind comparison against TYPE_FUNC_PTR
+ * (no distinct/optional unwrap), so a return
+ * type wearing a `?` or `distinct` wrapper missed the branch and fell through to
+ * the plain `emit_type(ret); " "; name` form, producing
+ *
+ *     void (*)() maybe(uint32_t k) { ... }
+ *
+ * an abstract declarator with a name glued on. GCC rejects it, so a valid ZER
+ * program simply did not build — measured for both spellings of the type,
+ * `?VFn` (2A typedef) and `?*() -> void` (2C).
+ *
+ * This is BUG-879 one sink over. That fix peeled exactly these two wrappers so a
+ * funcptr ARRAY ELEMENT got the right declarator; the function-return sink was
+ * not carried along. Peeling is correct rather than merely convenient: `?FuncPtr`
+ * IS the pointer at runtime (null sentinel, no `.has_value` field), so the C
+ * declarator shape is identical to the non-optional one.
+ *
+ * Returns the underlying TYPE_FUNC_PTR, or NULL when the return type is not a
+ * function pointer. ONE query, used by every signature site. */
+static Type *funcptr_return_shape(Type *ret) {
+    Type *t = ret ? type_unwrap_distinct(ret) : NULL;
+    while (t && type_dispatch_kind(t) == TYPE_OPTIONAL &&
+           is_null_sentinel(t->optional.inner))
+        t = type_unwrap_distinct(t->optional.inner);
+    return (type_dispatch_kind(t) == TYPE_FUNC_PTR) ? t : NULL;
+}
+
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
 
@@ -1629,7 +1966,7 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_FLOAT_LIT:
-        emit(e, "%.17g", node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value);
         break;
 
     case NODE_STRING_LIT:
@@ -1662,6 +1999,41 @@ static void emit_expr(Emitter *e, Node *node) {
         break;
 
     case NODE_IDENT: {
+        /* BUG-991: inside a GLOBAL initializer a name is not a C constant
+         * expression. BUG-911 folds the common case — but only for an INTEGER
+         * target, only a NON-NEGATIVE result, and only through
+         * `eval_const_expr_scoped`, which does not fold intrinsics. Everything
+         * outside that window emitted the NAME and GCC refused it, with no ZER
+         * diagnostic and a line number in a .c file the user never opened —
+         * exactly the failure BUG-911's own comment says is unacceptable:
+         *
+         *     const i32 K = -5;      i32 G = K;              // negative
+         *     const f32 K = 1.5;     f32 G = K + 1.0;        // float target
+         *     const bool K = true;   bool G = K;             // bool target
+         *     const usize B = @size(u32) * 4;  usize C = B;  // intrinsic init
+         *     const [*]u8 A = "hi";  const [*]u8 B = A;      // slice target
+         *
+         * Substituting the referenced global's OWN initializer is correct by
+         * construction and needs no evaluator: that expression already passed
+         * the global-initializer rules for ITS declaration, so it is emittable
+         * at file scope, whatever its type. It also composes — the ident may sit
+         * anywhere in the expression, so `K + 1.0` works without a float folder.
+         *
+         * Restricted to a `const` global. A MUTABLE one is genuinely not a
+         * compile-time constant and is rejected in the checker instead. */
+        if (e->global_init_depth > 0 && e->global_init_depth < 64) {
+            Symbol *gs = scope_lookup(e->checker->global_scope,
+                node->ident.name, (uint32_t)node->ident.name_len);
+            if (gs && gs->is_const && !gs->is_function && gs->func_node &&
+                gs->func_node->kind == NODE_GLOBAL_VAR &&
+                gs->func_node->var_decl.init &&
+                gs->func_node->var_decl.init != node) {
+                e->global_init_depth++;
+                emit_expr(e, gs->func_node->var_decl.init);
+                e->global_init_depth--;
+                break;
+            }
+        }
         /* Async local promotion: emit self->name for promoted locals */
         if (is_async_local(e, node->ident.name, node->ident.name_len)) {
             emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
@@ -2232,7 +2604,7 @@ static void emit_expr(Emitter *e, Node *node) {
             }
             /* Comptime float return — emit double literal */
             if (node->call.is_comptime_float) {
-                emit(e, "%.17g", node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value);
                 break;
             }
             Type *ct = checker_get_type(e->checker, node);
@@ -2790,6 +3162,11 @@ static void emit_expr(Emitter *e, Node *node) {
                                       node->index_expr.index->kind == NODE_ASSIGN ||
                                       node->index_expr.index->kind == NODE_UNARY ||
                                       node->index_expr.index->kind == NODE_ORELSE);
+        /* BUG-1025: a VOLATILE index must be read exactly once — the comma form
+         * below reads it for the check and again for the access, and anything
+         * that changes it in between (ISR, thread, peripheral) defeats the check.
+         * The IR-path twin (BUG-749) already ORs this in; the AST path did not. */
+        if (expr_is_volatile(e, node->index_expr.index)) idx_has_side_effects = true;
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {
@@ -3250,90 +3627,23 @@ static void emit_expr(Emitter *e, Node *node) {
     }
 
     case NODE_TYPECAST: {
-        /* (Type)expr — emit as C cast for primitives.
-         * For *opaque round-trips, emit the _zer_opaque unwrap/wrap. */
+        /* Site 1 of 3. All cast policy lives in emit_cast_value (BUG-1000). */
         Type *tgt = checker_get_type(e->checker, node);
         Type *src = checker_get_type(e->checker, node->typecast.expr);
-        Type *tgt_eff = tgt ? type_unwrap_distinct(tgt) : NULL;
-        Type *src_eff = src ? type_unwrap_distinct(src) : NULL;
-
-        /* pointer ↔ *opaque: use _zer_opaque wrap/unwrap (same as @ptrcast) */
-        if (tgt_eff && src_eff &&
-            tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-            type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-            src_eff->kind == TYPE_POINTER) {
-            /* casting TO *opaque — wrap with type_id */
-            uint32_t tid = 0;
-            if (src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-            }
-            emit(e, "(_zer_opaque){(void*)(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "), %u}", (unsigned)tid);
-        } else if (tgt_eff && src_eff &&
-                   tgt_eff->kind == TYPE_POINTER &&
-                   ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                     type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                    src_eff->kind == TYPE_OPAQUE)) {
-            /* casting FROM *opaque — unwrap .ptr with type check */
-            uint32_t expected_tid = 0;
-            if (tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-            }
-            if (expected_tid > 0) {
-                int tmp = e->temp_count++;
-                emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
-                emit_expr(e, node->typecast.expr);
-                emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
-                     "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); "
-                     "(", tmp, (unsigned)expected_tid, tmp);
-                emit_type(e, tgt);
-                emit(e, ")_zer_pc%d.ptr; })", tmp);
-            } else {
-                emit(e, "((");
-                emit_type(e, tgt);
-                emit(e, ")(");
-                emit_expr(e, node->typecast.expr);
-                emit(e, ").ptr)");
-            }
-        } else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && src_eff &&
-                   (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                    src_eff->kind == TYPE_POINTER)) {
-            /* To bool: use truthy conversion (!!x), not plain integer cast.
-             * ZER emits bool as uint8_t so (uint8_t)5 gives 5, not 1 —
-             * BUG-586 fixed this in IR_CAST but the AST path (used for
-             * global initializers, which must be constant expressions and
-             * therefore cannot take the IR path) was missed. */
-            emit(e, "((uint8_t)!!(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "))");
-        } else if (f2i_needs_guard(src_eff, tgt_eff)) {
-            int tmp = e->temp_count++;                    /* BUG-845 site 1 (AST) */
-            emit_f2i_open(e, src_eff, tmp);
-            emit_expr(e, node->typecast.expr);
-            emit_f2i_close(e, tgt, tmp);
-        } else {
-            /* Simple C cast for primitives, pointer↔pointer, int↔ptr */
-            emit(e, "((");
-            emit_type(e, tgt);
-            emit(e, ")(");
-            emit_expr(e, node->typecast.expr);
-            emit(e, "))");
-        }
+        CastOperand op = { CASTOP_AST, node->typecast.expr, NULL, -1 };
+        emit_cast_value(e, &op, src ? type_unwrap_distinct(src) : NULL,
+                        tgt, tgt ? type_unwrap_distinct(tgt) : NULL);
         break;
     }
 
     case NODE_STRUCT_INIT: {
         /* Designated initializer: emit as C99 compound literal (Type){ .x = 1 }
-         * Works in both var-decl init and assignment contexts. */
+         * Works in both var-decl init and assignment contexts.
+         * BUG-1010: at FILE scope (a global's initializer) a compound literal is
+         * not a C constant expression — emit the brace list alone, which is the
+         * one form C99 accepts there; the declaration supplies the type. */
         Type *si_type = checker_get_type(e->checker, node);
-        if (si_type) {
+        if (si_type && e->global_init_depth == 0) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
@@ -3430,13 +3740,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 tgt_eff->pointer.inner && type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE) {
                 /* casting TO *opaque — wrap with type_id */
                 /* determine source type's ID */
-                uint32_t tid = 0;
-                if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
+                uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-1021 */
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
                     emit_expr(e, node->intrinsic.args[0]);
@@ -3445,13 +3749,7 @@ static void emit_expr(Emitter *e, Node *node) {
                        src_eff->pointer.inner &&
                        type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) {
                 /* casting FROM *opaque — check type_id + unwrap .ptr */
-                uint32_t expected_tid = 0;
-                if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
+                uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-1021 */
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -3503,26 +3801,21 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
 
-            /* determine source type_id */
-            uint32_t src_tid = 0;
-            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
-            } else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
-                /* source already *opaque — its type_id flows through directly */
-                src_tid = 0; /* will be read from the source's actual struct field */
-            }
-
-            /* determine target type_id */
-            uint32_t tgt_tid = 0;
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
-            }
+            /* BUG-1021: TWO ids, because @pun has two situations.
+             *
+             * `tgt_tid_dyn` is the honest provenance id, used ONLY on the
+             * already-`*opaque` path, where the source's real origin is dynamic
+             * and the recorded id is the only evidence there is.
+             *
+             * `src_tid` / `tgt_tid` are the historical aggregate-only ids, used
+             * on the DIRECT pointer-to-pointer path, where both types are
+             * statically known and the checker has already ruled (widening
+             * rejected by BH-18 #4, forging by BUG-916, everything else
+             * deliberately allowed). Using the honest id there would emit a trap
+             * contradicting that ruling and would break `@pun(*u8, structptr)`. */
+            uint32_t tgt_tid_dyn = zer_pointee_tid(tgt_eff);
+            uint32_t src_tid = zer_pointee_tid_agg(src_eff);
+            uint32_t tgt_tid = zer_pointee_tid_agg(tgt_eff);
 
             /* If source is already *opaque, reuse its existing type_id and just
              * unwrap with check (single FROM-*opaque step). */
@@ -3532,7 +3825,11 @@ static void emit_expr(Emitter *e, Node *node) {
                  src_eff->kind == TYPE_OPAQUE));
 
             if (src_is_opaque) {
-                /* @pun on already-opaque source — only emit the FROM-*opaque check */
+                /* @pun on already-opaque source — only emit the FROM-*opaque check.
+                 * BUG-1021: the DYNAMIC id here — the source's true origin is only
+                 * known at runtime, so a `*opaque` that really holds a `*u32`
+                 * must trap when claimed as any other pointee, aggregate or not. */
+                uint32_t tgt_tid = tgt_tid_dyn;
                 if (tgt_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
@@ -3580,13 +3877,34 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; ");
-                emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                /* BUG-1028: an ARRAY source DECAYS under `__auto_type` (`__auto_type
+                 * b = a` makes b a `uint8_t *`, sizeof 8), so `memcpy(&bco, &bci, N)`
+                 * copied the POINTER's bytes — a wrong value for `@bitcast(u64, u8[8])`
+                 * and an over-read past the pointer for anything wider. An array
+                 * expression already denotes its bytes, so copy from it directly.
+                 * BUG-1027: the target is declared with a DECLARATOR
+                 * (`int32_t _zer_bco0[50]`), not the type spelled before the name;
+                 * an array target is rejected by the checker, but the declarator
+                 * form is the correct spelling for every target. Both dispatch paths. */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_expr(e, bsrc);
+                    emit(e, "; ");
+                }
+                { char bco[40]; int bl = snprintf(bco, sizeof bco, "_zer_bco%d", tmp);
+                  emit_type_and_name(e, t, bco, (size_t)bl); }
+                if (src_is_array) {
+                    emit(e, "; memcpy(&_zer_bco%d, (", tmp);
+                    emit_expr(e, bsrc);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, "; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
@@ -3792,13 +4110,25 @@ static void emit_expr(Emitter *e, Node *node) {
             else emit(e, "0");
             emit_try_enum_close(e, node->intrinsic.type_arg
                                    ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
+        } else if (nlen == 20 && memcmp(name, "enum_nonvariant_trap", 20) == 0) {
+            /* BUG-1022: synthesized by ir_lower at the last arm of an exhaustive
+             * enum switch (AST-path twin of the IR handler; unreachable from a
+             * global initializer, kept for the dual-dispatch rule). */
+            emit(e, "_zer_trap(\"switch on an enum value outside its variant set "
+                    "(auto-zeroed storage, or a forged value)\", __FILE__, __LINE__)");
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
                 emit_expr(e, node->intrinsic.args[0]);
             emit(e, "))");
-        } else if (nlen >= 10 && memcmp(name, "atomic_", 7) == 0) {
-            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission */
+        } else if (nlen >= 9 && memcmp(name, "atomic_", 7) == 0) {
+            /* @atomic_add/sub/or/and/xor/load/store/cas — dual-path emission.
+             * BUG-983: was `nlen >= 10`, which excludes `@atomic_or` (9 chars) —
+             * the checker fixed exactly that off-by-one in BUG-427 and this copy
+             * never followed. Unreachable today (the checker rejects any atomic
+             * in a global initialiser, the only context that still reaches this
+             * AST path) but it is the same predicate written twice with two
+             * different answers. The IR path already uses `>= 7`. */
             const char *op = name + 7;
             int oplen = nlen - 7;
             bool is_load = (oplen == 4 && memcmp(op, "load", 4) == 0);
@@ -3840,6 +4170,12 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
                 emit(e, ", __ATOMIC_SEQ_CST)");
+            } else {
+                /* BUG-1024: no trailing `else` here meant the seven ops the IR
+                 * path handles and this one does not (xchg, nand, the five
+                 * *_fetch forms) emitted the EMPTY STRING. Fail loudly. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → (T*)((char*)(ptr) - offsetof(T, field))
@@ -4023,7 +4359,13 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, "%s_zer_cond); (void)0; })", ar);
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* BUG-1024: this emitted a C comment naming the intrinsic followed by
+                 * a literal zero — for @barrier_acq_rel / @barrier_dma, which the
+                 * checker accepts and only the IR path implements, a MEMORY FENCE
+                 * silently replaced by nothing, reached BEFORE the loud BUG-767
+                 * fallthrough that exists to stop exactly this. Fail loudly. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen >= 8 && memcmp(name, "barrier_", 8) == 0) {
             const char *bop = name + 8;
@@ -4046,7 +4388,13 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 emit(e, ")");
             } else {
-                emit(e, "/* @%.*s — missing args */0", (int)nlen, name);
+                /* BUG-1024: this emitted a C comment naming the intrinsic followed by
+                 * a literal zero — for @barrier_acq_rel / @barrier_dma, which the
+                 * checker accepts and only the IR path implements, a MEMORY FENCE
+                 * silently replaced by nothing, reached BEFORE the loud BUG-767
+                 * fallthrough that exists to stop exactly this. Fail loudly. */
+                emit(e, "__zer_intrinsic_%.*s_unsupported_in_constant_context",
+                     (int)nlen, name);
             }
         } else if (nlen == 11 && memcmp(name, "sem_acquire", 11) == 0 &&
                    node->intrinsic.arg_count >= 1) {
@@ -4833,8 +5181,17 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * Single source of truth via helper — see emit_func_attributes(). */
     emit_func_attributes(e, node);
 
-    emit_type(e, ret);
-    emit(e, " ");
+    /* BUG-1001: the prototype path had NO funcptr-return handling at all, so a
+     * bodyless `*() -> void mk();` (or the `?`/`distinct` forms) emitted an
+     * abstract declarator here too. Same shared query as the IR site. */
+    Type *proto_ret_fp = funcptr_return_shape(ret);
+    if (proto_ret_fp) {
+        emit_type(e, proto_ret_fp->func_ptr.ret);
+        emit(e, " (*");
+    } else {
+        emit_type(e, ret);
+        emit(e, " ");
+    }
     EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
     emit(e, "(");
 
@@ -4851,7 +5208,16 @@ static void emit_func_decl(Emitter *e, Node *node) {
         }
         if (node->func_decl.is_variadic) emit(e, ", ...");
     }
-    emit(e, ") ");
+    emit(e, ")");
+    if (proto_ret_fp) {
+        emit(e, ")(");
+        for (uint32_t i = 0; i < proto_ret_fp->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, proto_ret_fp->func_ptr.params[i]);
+        }
+        emit(e, ")");
+    }
+    emit(e, " ");
 
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
@@ -5009,7 +5375,12 @@ static void emit_global_var(Emitter *e, Node *node) {
             }
             if (!emitted_const) {
                 emit(e, " = ");
+                /* BUG-991: mark the global-initializer context so a NODE_IDENT
+                 * naming a const global is replaced by that global's own
+                 * initializer rather than emitted as a name (invalid C). */
+                e->global_init_depth++;
                 emit_expr(e, node->var_decl.init);
+                e->global_init_depth--;
             }
         }
     } else {
@@ -6442,12 +6813,86 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
 
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward */
+
+/* --- the shared cast emitter declared beside classify_cast (BUG-1000) --- */
+static void emit_cast_operand(Emitter *e, const CastOperand *op) {
+    switch (op->kind) {
+    case CASTOP_AST:       emit_expr(e, op->expr); break;
+    case CASTOP_REWRITTEN: emit_rewritten_node(e, op->expr, op->func); break;
+    case CASTOP_LOCAL:     emit_local_name(e, op->func, op->local); break;
+    }
+}
+
+static void emit_cast_value(Emitter *e, const CastOperand *op,
+                            Type *src_eff, Type *tgt, Type *tgt_eff) {
+    switch (classify_cast(src_eff, tgt_eff)) {
+    case CASTF_TO_OPAQUE: {
+        uint32_t tid = zer_pointee_tid(src_eff);        /* BUG-1021: ONE id definition */
+        emit(e, "(_zer_opaque){(void*)(");
+        emit_cast_operand(e, op);
+        emit(e, "), %u}", (unsigned)tid);
+        break;
+    }
+    case CASTF_FROM_OPAQUE: {
+        uint32_t expected = zer_pointee_tid(tgt_eff);   /* BUG-1021 */
+        if (expected > 0) {
+            int tmp = e->temp_count++;
+            emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
+            emit_cast_operand(e, op);
+            emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
+                    "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
+                 tmp, (unsigned)expected, tmp);
+            emit_type(e, tgt);
+            emit(e, ")_zer_pc%d.ptr; })", tmp);
+        } else {
+            /* type_id 0 = extern/cinclude provenance: nothing to check against,
+             * but the `.ptr` unwrap is still required — the operand is a struct. */
+            emit(e, "((");
+            emit_type(e, tgt);
+            emit(e, ")(");
+            emit_cast_operand(e, op);
+            emit(e, ").ptr)");
+        }
+        break;
+    }
+    case CASTF_TO_BOOL:
+        /* ZER emits bool as uint8_t, so a plain `(uint8_t)5` yields 5 and the
+         * value is simultaneously truthy and != true. `!!` restores the single
+         * canonical representation the language promises. */
+        emit(e, "((uint8_t)!!(");
+        emit_cast_operand(e, op);
+        emit(e, "))");
+        break;
+    case CASTF_F2I: {
+        /* BUG-1003: the AST operand is the GLOBAL-INITIALIZER path, where a
+         * statement expression is illegal C (`u32 g = (u32)1e20;` failed in
+         * GCC with "braced-group within expression allowed only inside a
+         * function"). Prefer the constant-expression form there; it declines
+         * an operand that cannot be re-evaluated (side effects, volatile),
+         * which cannot occur in a constant initializer. */
+        if (op->kind == CASTOP_AST && emit_f2i_const(e, tgt, op->expr)) break;
+        int tmp = e->temp_count++;
+        emit_f2i_open(e, src_eff, tmp);
+        emit_cast_operand(e, op);
+        emit_f2i_close(e, tgt, tmp);
+        break;
+    }
+    case CASTF_PLAIN:
+        emit(e, "((");
+        emit_type(e, tgt);
+        emit(e, ")(");
+        emit_cast_operand(e, op);
+        emit(e, "))");
+        break;
+    }
+}
+
 /* ================================================================
  * Builtin Call Emitter — emit pool/slab/ring/arena/Task inline C
  * Extracted from emit_expr NODE_CALL. Uses emit_rewritten_node for args.
  * Returns true if handled, false if not a recognized builtin.
  * ================================================================ */
-static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func); /* forward */
 static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     if (!node || node->kind != NODE_CALL || !node->call.callee ||
         node->call.callee->kind != NODE_FIELD || !node->call.callee->field.object ||
@@ -6842,7 +7287,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
-        emit(e, "%.17g", node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value);
         return;
     case NODE_BOOL_LIT:
         emit(e, "%d", node->bool_lit.value ? 1 : 0);
@@ -7348,6 +7793,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * statement-expression branch. */
         if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
+        /* BUG-1025: expr_is_volatile resolves the root through the CHECKER's scope,
+         * which no longer holds a function's LOCALS at emission time — so a
+         * `volatile u32 li; arr[li]` slipped it and was emitted bare. The IR
+         * local carries the qualifier (IRLocal.is_volatile, #19 VOL-1). */
+        if (func && node->index_expr.index->kind == NODE_IDENT) {
+            Node *vi = node->index_expr.index;
+            for (int li = 0; li < func->local_count; li++) {
+                IRLocal *l = &func->locals[li];
+                if (l->is_volatile && l->name_len == (uint32_t)vi->ident.name_len &&
+                    memcmp(l->name, vi->ident.name, l->name_len) == 0) { idx_se = true; break; }
+            }
+        }
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
@@ -7373,7 +7830,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
-                   node->index_expr.index->kind != NODE_IDENT &&
+                   /* BUG-1025: a VOLATILE ident index is NOT left to the auto-guard
+                    * (the checker no longer marks one — two reads of a volatile
+                    * defeat it). It takes the single-evaluation form below instead:
+                    * one load into `_zer_idx`, check and access both on the temp. */
+                   (node->index_expr.index->kind != NODE_IDENT || idx_se) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for
@@ -7837,7 +8298,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 return;
             }
             if (node->call.is_comptime_float)
-                emit(e, "%.17g", node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value);
             else
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
@@ -7890,17 +8351,6 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         if (node->call.callee && node->call.callee->kind == NODE_FIELD &&
             node->call.callee->field.object &&
             node->call.callee->field.object->kind == NODE_IDENT) {
-            /* ThreadHandle.join() → pthread_join(th, NULL).
-             * Detect: field name "join" + object type is thread handle.
-             * Thread handles are emitted as pthread_t — check checker_get_type. */
-            if (node->call.callee->field.field_name_len == 4 &&
-                memcmp(node->call.callee->field.field_name, "join", 4) == 0) {
-                /* ThreadHandle — emit pthread_join directly */
-                emit(e, "pthread_join(");
-                emit_rewritten_node(e, node->call.callee->field.object, func);
-                emit(e, ", NULL)");
-                return;
-            }
             Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
             if (!ot) {
                 Symbol *sym = scope_lookup(e->checker->global_scope,
@@ -7918,6 +8368,35 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                         break;
                     }
                 }
+            }
+            /* ThreadHandle.join() → pthread_join(th, NULL).
+             *
+             * BUG-1032: the comment here used to say "field name `join` + object
+             * type is thread handle", but `ot` was computed BELOW this block, so
+             * the only actual gate was the NAME. Any `s.join(...)` on an ident
+             * was rewritten to `pthread_join(s, NULL)` — the receiver passed as
+             * a pthread_t and every argument DROPPED. Measured on
+             * `struct Ops { *(u32) -> u32 join; }`: `s.join(41)` emitted
+             * `pthread_join(s, NULL)`. GCC rejects that particular spelling
+             * (incompatible type), so it surfaced as a confusing error inside
+             * generated code rather than a wrong answer — but the AST path
+             * (emitter.c ~2545) had always gated this on the receiver being a
+             * registered scoped-spawn handle, so the two paths disagreed, which
+             * is the dual-dispatch class this file keeps re-learning.
+             *
+             * A ThreadHandle is declared as a plain `u64` symbol carrying
+             * Symbol.is_thread_handle (checker.c ~17785); nothing else that can
+             * own a `.join` FIELD is an integer, so requiring an integer
+             * receiver separates the two with no lookup into a scope that has
+             * already been popped by emission time. */
+            if (node->call.callee->field.field_name_len == 4 &&
+                memcmp(node->call.callee->field.field_name, "join", 4) == 0 &&
+                ot && type_dispatch_kind(ot) == TYPE_U64) {
+                /* ThreadHandle — emit pthread_join directly */
+                emit(e, "pthread_join(");
+                emit_rewritten_node(e, node->call.callee->field.object, func);
+                emit(e, ", NULL)");
+                return;
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
@@ -8116,13 +8595,34 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "; ");
-                emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                /* BUG-1028: an ARRAY source DECAYS under `__auto_type` (`__auto_type
+                 * b = a` makes b a `uint8_t *`, sizeof 8), so `memcpy(&bco, &bci, N)`
+                 * copied the POINTER's bytes — a wrong value for `@bitcast(u64, u8[8])`
+                 * and an over-read past the pointer for anything wider. An array
+                 * expression already denotes its bytes, so copy from it directly.
+                 * BUG-1027: the target is declared with a DECLARATOR
+                 * (`int32_t _zer_bco0[50]`), not the type spelled before the name;
+                 * an array target is rejected by the checker, but the declarator
+                 * form is the correct spelling for every target. Both dispatch paths. */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_rewritten_node(e, bsrc, func);
+                    emit(e, "; ");
+                }
+                { char bco[40]; int bl = snprintf(bco, sizeof bco, "_zer_bco%d", tmp);
+                  emit_type_and_name(e, t, bco, (size_t)bl); }
+                if (src_is_array) {
+                    emit(e, "; memcpy(&_zer_bco%d, (", tmp);
+                    emit_rewritten_node(e, bsrc, func);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, "; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
@@ -8171,6 +8671,16 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, ")");
         } else if (nlen == 4 && memcmp(name, "trap", 4) == 0) {
             emit(e, "_zer_trap(\"trap\", __FILE__, __LINE__)");
+        } else if (nlen == 20 && memcmp(name, "enum_nonvariant_trap", 20) == 0) {
+            /* BUG-1022: the last arm of an exhaustive enum switch is entered
+             * UNCONDITIONALLY (the compare is elided because the checker proved
+             * every variant is covered). That proof assumes the value IS a
+             * variant; auto-zeroed / calloc'd storage carrying an enum with no
+             * zero variant, and every load through a boundary the language does
+             * not own, are not. ir_lower keeps the elided entry but re-checks the
+             * value inside the arm and traps here on a mismatch. */
+            emit(e, "_zer_trap(\"switch on an enum value outside its variant set "
+                    "(auto-zeroed storage, or a forged value)\", __FILE__, __LINE__)");
         } else if (nlen == 7 && memcmp(name, "ptrcast", 7) == 0) {
             /* @ptrcast(*T, expr) — cast with type_id check */
             Type *tgt_type = node->intrinsic.type_arg ?
@@ -8184,13 +8694,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
                 src_eff && src_eff->kind == TYPE_POINTER) {
                 /* To *opaque — wrap with type_id */
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
+                uint32_t tid = zer_pointee_tid(src_eff);   /* BUG-1021 */
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -8201,13 +8705,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                          type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
                         src_eff->kind == TYPE_OPAQUE)) {
                 /* From *opaque — unwrap .ptr with type check */
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
+                uint32_t expected_tid = zer_pointee_tid(tgt_eff);   /* BUG-1021 */
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
@@ -8246,21 +8744,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *tgt_eff = tgt_type ? type_unwrap_distinct(tgt_type) : NULL;
             Type *src_eff = src_type ? type_unwrap_distinct(src_type) : NULL;
 
-            uint32_t src_tid = 0;
-            if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
-            }
-
-            uint32_t tgt_tid = 0;
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
-                Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
-            }
+            /* BUG-1021: TWO ids, because @pun has two situations.
+             *
+             * `tgt_tid_dyn` is the honest provenance id, used ONLY on the
+             * already-`*opaque` path, where the source's real origin is dynamic
+             * and the recorded id is the only evidence there is.
+             *
+             * `src_tid` / `tgt_tid` are the historical aggregate-only ids, used
+             * on the DIRECT pointer-to-pointer path, where both types are
+             * statically known and the checker has already ruled (widening
+             * rejected by BH-18 #4, forging by BUG-916, everything else
+             * deliberately allowed). Using the honest id there would emit a trap
+             * contradicting that ruling and would break `@pun(*u8, structptr)`. */
+            uint32_t tgt_tid_dyn = zer_pointee_tid(tgt_eff);
+            uint32_t src_tid = zer_pointee_tid_agg(src_eff);
+            uint32_t tgt_tid = zer_pointee_tid_agg(tgt_eff);
 
             bool src_is_opaque = (src_eff &&
                 ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
@@ -8268,7 +8766,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  src_eff->kind == TYPE_OPAQUE));
 
             if (src_is_opaque) {
-                /* @pun on already-opaque source — FROM-*opaque check only */
+                /* @pun on already-opaque source — FROM-*opaque check only.
+                 * BUG-1021: the DYNAMIC id — see the AST sibling. */
+                uint32_t tgt_tid = tgt_tid_dyn;
                 if (tgt_tid > 0) {
                     int tmp = e->temp_count++;
                     emit(e, "({ _zer_opaque _zer_pn%d = ", tmp);
@@ -10196,8 +10696,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_rewritten_node(e, node->intrinsic.args[0], func); emit(e, ", ");
             emit_rewritten_node(e, node->intrinsic.args[1], func); emit(e, ")");
         } else {
-            /* Truly unknown intrinsic — should not reach here */
-            emit(e, "/* @%.*s */ 0", (int)nlen, name);
+            /* BUG-983: this is the IR-path TWIN of the AST-path fallback that
+             * BUG-767 hardened, and it was left on the pre-BUG-767 silent-`0`
+             * form — in the ONLY path function bodies use. An intrinsic added to
+             * the checker's dispatch chain without a matching arm here would
+             * therefore compile to the literal 0: a privileged register read, an
+             * MMIO probe or an atomic would silently become "zero", with no
+             * diagnostic at compile time and nothing to notice at run time. That
+             * is precisely the failure BUG-767 was raised for. Dead today (every
+             * checker-accepted name has an arm above — swept), and it must FAIL
+             * LOUD the moment it stops being dead: an undeclared identifier makes
+             * GCC name the intrinsic instead of emitting a zero. */
+            emit(e, "__zer_intrinsic_%.*s_has_no_IR_emitter_handler", (int)nlen, name);
         }
         return;
     }
@@ -10385,22 +10895,24 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * REACHABLE third emission path, not a theoretical fallback — pmytnl
          * reports nearly missing it, and a guard at two of three sites leaves the
          * UB live in exactly the scope that is hardest to notice. */
+        /* Site 2 of 3 — the one that used to implement only the f2i guard.
+         * The target comes from the TYNODE here (not the typemap) because a
+         * defer body is re-emitted from raw AST; the source still comes from
+         * the typemap. Both feed the one shared policy. */
         Type *t3 = node->typecast.target_type
                      ? resolve_tynode(e, node->typecast.target_type) : NULL;
         Type *s3 = checker_get_type(e->checker, node->typecast.expr);
-        if (t3 && f2i_needs_guard(s3 ? type_unwrap_distinct(s3) : NULL,
-                                  type_unwrap_distinct(t3))) {
-            int tmp = e->temp_count++;
-            emit_f2i_open(e, type_unwrap_distinct(s3), tmp);
+        if (!t3) {   /* unresolvable target: keep the historical bare emission */
+            emit(e, "(");
             emit_rewritten_node(e, node->typecast.expr, func);
-            emit_f2i_close(e, t3, tmp);
+            emit(e, ")");
             return;
         }
-        emit(e, "((");
-        if (t3) emit_type(e, t3);
-        emit(e, ")");
-        emit_rewritten_node(e, node->typecast.expr, func);
-        emit(e, ")");
+        {
+            CastOperand op = { CASTOP_REWRITTEN, node->typecast.expr, func, -1 };
+            emit_cast_value(e, &op, s3 ? type_unwrap_distinct(s3) : NULL,
+                            t3, type_unwrap_distinct(t3));
+        }
         return;
     }
 
@@ -10477,7 +10989,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             Type *fv_type = checker_get_type(e->checker, fval);
             Type *wt = struct_init_opt_wrap_type(si_type, fname, fname_len, fv_type);
             Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
-            if (wt) {
+            if (wt && fval && fval->kind == NODE_NULL_LIT) {
+                /* BUG-1011 (IR twin of emit_opt_wrap_value): `null` is the ABSENT
+                 * optional, not `{ 0, 1 }`. */
+                emit_opt_null_literal(e, wt);
+            } else if (wt) {
                 emit(e, "(");
                 emit_type(e, wt);
                 emit(e, "){ ");
@@ -11019,7 +11535,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                             obj_id = li; break;
                         }
                     }
-                    if (obj_id >= 0) {
+                    Type *hot = (obj_id >= 0) ? func->locals[obj_id].type : NULL;
+                    if (!hot) {
+                        Symbol *gs = scope_lookup(e->checker->global_scope,
+                            callee->field.object->ident.name,
+                            (uint32_t)callee->field.object->ident.name_len);
+                        if (gs) hot = gs->type;
+                    }
+                    if (hot && type_dispatch_kind(hot) == TYPE_HANDLE) {
+                        /* BUG-1033: calling a function-pointer FIELD through a
+                         * Handle. Handle auto-deref (`h.f` -> `((T*)get(&slab,h))->f`)
+                         * is implemented once, in emit_rewritten_node's NODE_FIELD
+                         * case; this decomposed-call site re-implements field
+                         * emission by hand and its hand-rolled version knew only
+                         * `.` and `->`, so it emitted `h.fn(...)` — `h` is a
+                         * uint64_t, so GCC rejected the generated C with
+                         * "request for member 'fn' in something not a structure",
+                         * pointing at the ZER line. Reading and WRITING the same
+                         * field both worked, because both go through the shared
+                         * NODE_FIELD path. Delegate the callee to it rather than
+                         * teaching a second copy about handles. */
+                        emit_rewritten_node(e, callee, func);
+                        emit(e, "(");
+                    } else if (obj_id >= 0) {
                         Type *ot = func->locals[obj_id].type;
                         Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
                         emit_local_name(e, func, obj_id);
@@ -11260,6 +11798,46 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
     case IR_GOTO: {
         emit_indent(e);
+        /* BUG-1031: union switch totality guard (1zukjq's BUG-1031). ir_lower.c
+         * parks the hoisted union POINTER local in `src1_local` and the union
+         * Type in `cast_type` on exactly one goto — the unconditional entry to
+         * the dispatch chain — so this is the one place the tag can be tested
+         * before any arm runs. Every other IR_GOTO leaves cast_type NULL. (The
+         * ENUM sibling is BUG-950's IR-level BRANCH inside the elided arm, not
+         * a goto annotation.) */
+        if (inst->cast_type && inst->src1_local >= 0 &&
+            inst->src1_local < func->local_count) {
+            Type *et = type_unwrap_distinct(inst->cast_type);
+            /* BUG-1023: the BOOL sibling. `bool` is a `uint8_t` in the emitted C
+             * and the checker promises both arms of an exhaustive bool switch,
+             * so a byte that is neither 0 nor 1 — from a cinclude return or an
+             * MMIO read — matched no arm and the switch silently ran nothing,
+             * while `if (b)` on the same value took the true branch. */
+            if (et && type_dispatch_kind(et) == TYPE_BOOL) {
+                IRLocal *sv = &func->locals[inst->src1_local];
+                const char *sp = func->is_async ? "self->" : "";
+                emit(e, "if ((unsigned)(%s%.*s) > 1u) "
+                        "_zer_trap(\"switch on a bool that is neither true nor "
+                        "false\", __FILE__, __LINE__);\n",
+                     sp, (int)sv->name_len, sv->name);
+                emit_indent(e);
+            }
+            /* `src1_local` holds the POINTER local
+             * the union switch hoisted, and the discriminant is its `_tag`
+             * field; indices are 0..variant_count-1 by construction, so one
+             * unsigned range test covers every non-variant tag. */
+            if (et && type_dispatch_kind(et) == TYPE_UNION &&
+                et->union_type.variant_count > 0) {
+                IRLocal *sv = &func->locals[inst->src1_local];
+                const char *sp = func->is_async ? "self->" : "";
+                emit(e, "if ((unsigned)(%s%.*s->_tag) >= %uu) "
+                        "_zer_trap(\"switch on a union whose tag is not a declared "
+                        "variant\", __FILE__, __LINE__);\n",
+                     sp, (int)sv->name_len, sv->name,
+                     (unsigned)et->union_type.variant_count);
+                emit_indent(e);
+            }
+        }
         emit(e, "goto _zer_bb%d;\n", inst->goto_block);
         break;
     }
@@ -12452,7 +13030,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 break;
             }
             case 1: /* float */
-                emit(e, "%.17g", inst->literal_float);
+                emit_double_lit(e, inst->literal_float);
                 break;
             case 2: /* string */
                 /* sizeof("...") - 1 so C resolves escapes; source-char
@@ -12730,75 +13308,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
 
-            /* To *opaque: wrap with type_id */
-            if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner &&
-                type_unwrap_distinct(tgt_eff->pointer.inner)->kind == TYPE_OPAQUE &&
-                src_eff && src_eff->kind == TYPE_POINTER) {
-                uint32_t tid = 0;
-                if (src_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
-                }
-                emit(e, "(_zer_opaque){(void*)(");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, "), %u}", (unsigned)tid);
-            }
-            /* From *opaque: unwrap .ptr with type check */
-            else if (tgt_eff && tgt_eff->kind == TYPE_POINTER &&
-                     src_eff &&
-                     ((src_eff->kind == TYPE_POINTER && src_eff->pointer.inner &&
-                       type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_OPAQUE) ||
-                      src_eff->kind == TYPE_OPAQUE)) {
-                uint32_t expected_tid = 0;
-                if (tgt_eff->pointer.inner) {
-                    Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
-                }
-                if (expected_tid > 0 && inst->src1_local >= 0) {
-                    int tmp = e->temp_count++;
-                    emit(e, "({ _zer_opaque _zer_pc%d = ", tmp);
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, "; if (_zer_pc%d.type_id != %u && _zer_pc%d.type_id != 0) "
-                         "_zer_trap(\"type mismatch in cast\", __FILE__, __LINE__); (",
-                         tmp, (unsigned)expected_tid, tmp);
-                    emit_type(e, tgt);
-                    emit(e, ")_zer_pc%d.ptr; })", tmp);
-                } else if (inst->src1_local >= 0) {
-                    emit(e, "((");
-                    emit_type(e, tgt);
-                    emit(e, ")(");
-                    emit_local_name(e, func, inst->src1_local);
-                    emit(e, ").ptr)");
-                }
-            }
-            /* To bool: use truthy conversion (!!x), not plain integer cast.
-             * In C, `_Bool` has special conversion rules (non-zero → 1), but
-             * ZER emits bool as uint8_t so a plain `(uint8_t)5` gives 5, not 1.
-             * BUG-586: test expects `(bool)5 == true`. */
-            else if (tgt_eff && tgt_eff->kind == TYPE_BOOL && inst->src1_local >= 0 &&
-                     src_eff && (type_is_integer(src_eff) || type_is_float(src_eff) ||
-                                 src_eff->kind == TYPE_POINTER)) {
-                emit(e, "((uint8_t)!!(");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, "))");
-            }
-            /* Simple C cast */
-            else if (inst->src1_local >= 0 && f2i_needs_guard(src_eff, tgt_eff)) {
-                int tmp = e->temp_count++;                /* BUG-845 site 2 (IR_CAST) */
-                emit_f2i_open(e, src_eff, tmp);
-                emit_local_name(e, func, inst->src1_local);
-                emit_f2i_close(e, tgt, tmp);
-            }
-            else if (inst->src1_local >= 0) {
-                emit(e, "((");
-                emit_type(e, tgt);
-                emit(e, ")");
-                emit_local_name(e, func, inst->src1_local);
-                emit(e, ")");
+            /* Site 3 of 3 — see emit_cast_value (BUG-1000). The operand is a
+             * LOCAL here rather than an AST expression; that is the only thing
+             * this site still decides for itself. */
+            if (inst->src1_local >= 0) {
+                CastOperand op = { CASTOP_LOCAL, NULL, func, inst->src1_local };
+                emit_cast_value(e, &op, src_eff, tgt, tgt_eff);
             }
             emit(e, ";\n");
             /* BUG-946: Path C — a cast to a non-native uN/iN must be wrapped to N
@@ -12844,7 +13359,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
                                                          fname_len, vt);
                     Type *vte = vt ? type_unwrap_distinct(vt) : NULL;
-                    if (wt) {
+                    Node *fval_ast = inst->expr->struct_init.fields[i].value;
+                    if (wt && fval_ast && fval_ast->kind == NODE_NULL_LIT) {
+                        /* BUG-1011 (third site — the var-decl DECOMP path): the
+                         * null literal was lowered into a `0` temp, so the wrap
+                         * below built `{ 0, 1 }`, a PRESENT optional. The AST
+                         * field value still says `null`; emit the absent one. */
+                        emit_opt_null_literal(e, wt);
+                    } else if (wt) {
                         emit(e, "(");
                         emit_type(e, wt);
                         emit(e, "){ ");
@@ -12986,13 +13508,14 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
          * Without this branch, emitter would produce invalid C like
          * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
+        Type *ret_fp = main_promote ? NULL : funcptr_return_shape(ret);
+        bool ret_is_funcptr = (ret_fp != NULL);
 
         if (main_promote) {
             emit(e, "int ");
         } else if (ret_is_funcptr) {
             /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
+            emit_type(e, ret_fp->func_ptr.ret);
             emit(e, " (*");
         } else if (ret) {
             emit_type(e, ret);
@@ -13031,9 +13554,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* Close funcptr-return form: )(fp_args) */
         if (ret_is_funcptr) {
             emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
+            for (uint32_t i = 0; i < ret_fp->func_ptr.param_count; i++) {
                 if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
+                emit_type(e, ret_fp->func_ptr.params[i]);
             }
             emit(e, ")");
         }
@@ -13214,7 +13737,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
                 if (ir_op_takes_auto_guards(k)) {
+                    /* BUG-1030: inside a defer-body clone the guard must trap —
+                     * the early return re-fires the defer stack, replaying this
+                     * body's raw AST (the guarded access included). */
+                    bool saved_gt = e->guard_traps;
+                    if (ins->in_defer_body) e->guard_traps = true;
                     emit_auto_guards(e, ins->expr);
+                    e->guard_traps = saved_gt;
                 }
             }
             emit_ir_inst(e, ins, func);
@@ -13425,7 +13954,13 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
                 if (ir_op_takes_auto_guards(k)) {
+                    /* BUG-1030: inside a defer-body clone the guard must trap —
+                     * the early return re-fires the defer stack, replaying this
+                     * body's raw AST (the guarded access included). */
+                    bool saved_gt = e->guard_traps;
+                    if (ins->in_defer_body) e->guard_traps = true;
                     emit_auto_guards(e, ins->expr);
+                    e->guard_traps = saved_gt;
                 }
             }
             emit_ir_inst(e, ins, func);

@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: cannot mix integer and float in a compound assignment
+// BUG-1008 (2026-09-11): the other direction, for the same reason `f = a` is refused.
+u32 main() { f32 f = 1.0; u32 a = 2; f += a; return (u32)f; }

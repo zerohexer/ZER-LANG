@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: calls through a function pointer
+// BUG-980 (2026-09-11): the funcptr is a FIELD of the shared(rw) struct itself —
+// `g.cb()` reads the field under g's write lock and calls through it while the
+// lock is held (the BUG-795 callee-position form). A callback that touches g
+// re-enters the rwlock.
+shared(rw) struct S { *() -> u32 cb; u32 v; }
+S g;
+u32 f() { g.v = 2; return 1; }
+u32 main() { g.cb = f; u32 r = g.cb(); return r - 1; }

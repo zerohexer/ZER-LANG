@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-989: a COPY of a view (`*H hq = hp;`) views the same aggregate — the root is
+// inherited through the alias snapshot, so a free through h is seen through hq.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    *H hp = &h;
+    *H hq = hp;
+    hq.p = alloc(T);
+    *T q = h.p orelse return;
+    free(q);
+    *T r = hq.p orelse return;
+    return r.v;
+}

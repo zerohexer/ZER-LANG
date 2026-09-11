@@ -499,6 +499,29 @@ cell p24_safe_int       compile 'u32 pk24f(?u32 o){ u32 v=o orelse return; retur
 # which is what a first draft of this cell measured.
 cell p24_safe_opt_ptr   compile 'struct T24g{u32 v;} ?*T24g pk24g(?*T24g o){ *T24g t=o orelse return; return t; } u32 main(){ return 0; }'
 
+# p25 — @ptrtoint(&local) LAUNDERED THROUGH A CALL (2026-09-11, BUG-993).
+# The direct forms `g = @ptrtoint(&l)` / `return @ptrtoint(&l)` were rejected; the same
+# address handed to an integer-returning identity function and stored, returned, aliased
+# or passed on through a pointer param reached a global with no diagnostic. ONE query
+# (call_result_is_local_address_int) over the existing return summary. Pinned here so a
+# new integer-laundering spelling needs its cell.
+echo "===== SHAPE p25 = @ptrtoint(&local) laundered through a call ====="
+cell p25_call_global   reject 'usize id25(usize x){ return x; } usize g25; u32 main(){ u32 l=1; g25 = id25(@ptrtoint(&l)); return 0; }'
+cell p25_call_return   reject 'usize id25b(usize x){ return x; } usize lk25(){ u32 l=1; return id25b(@ptrtoint(&l)); } u32 main(){ usize v = lk25(); return (u32)(v == 0); }'
+cell p25_call_alias    reject 'usize id25c(usize x){ return x; } usize g25c; u32 main(){ u32 l=1; usize a = id25c(@ptrtoint(&l)); g25c = a; return 0; }'
+cell p25_call_ptr_param reject 'usize id25d(*u32 p){ return @ptrtoint(p); } usize g25d; u32 main(){ u32 l=1; g25d = id25d(&l); return 0; }'
+# BOUNDARY: an integer that is a VALUE read (a length, a field) is not an address.
+cell p25_safe_len      compile 'usize ln25([*]u8 s){ return s.len; } usize g25e; u32 main(){ u8[4] b; g25e = ln25(b[0..2]); if (g25e != 2) { return 1; } return 0; }'
+
+# p26 — a CARRIER holding pointers into TWO different locals at the scoped-spawn sink
+# (2026-09-11, BUG-1026). A field store used to OVERWRITE the recorded borrow root, so
+# `h.p = &v; h.q = &x; spawn w(h);` lent only `x` and the parent's write to `v` before
+# the join raced the child. Now the root is UNKNOWN and the sink refuses.
+echo "===== SHAPE p26 = two borrow roots in one scoped-spawn carrier ====="
+cell p26_two_roots     reject 'struct H26 { *u32 p; *u32 q; } void w26(H26 h) { *h.p = 5; *h.q = 6; } u32 main(){ u32 v=0; u32 x=0; H26 h; h.p=&v; h.q=&x; ThreadHandle th = spawn w26(h); th.join(); return 0; }'
+# BOUNDARY: two pointers into ONE local are one borrow; a whole re-binding replaces it.
+cell p26_safe_one_root compile 'struct P26 { u32 a; u32 b; } struct H26b { *u32 p; *u32 q; } void w26b(H26b h) { *h.p = 5; *h.q = 6; } u32 main(){ P26 v; H26b h; h.p=&v.a; h.q=&v.b; ThreadHandle th = spawn w26b(h); th.join(); if (v.a != 5 || v.b != 6) { return 1; } return 0; }'
+
 
 echo ""
 echo "==================================================================="

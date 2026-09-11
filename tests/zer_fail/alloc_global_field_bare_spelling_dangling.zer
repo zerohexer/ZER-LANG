@@ -1,0 +1,12 @@
+// expect-error: left dangling at function exit
+// BUG-984: the GLOBAL-root sibling — `g.p = alloc(T);` registered nothing, so a
+// free through the unwrapped local left g.p dangling with no diagnostic.
+struct T { u32 v; }
+struct H { ?*T p; }
+H g;
+u32 main() {
+    g.p = alloc(T);
+    *T q = g.p orelse return;
+    free(q);
+    return 0;
+}

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize
+// BUG-1009: 2^63 is a valid u64 literal but not an i64; it was accepted and stored
+// as INT64_MIN (the program measured `v < 0`). No implicit narrowing.
+u32 main() {
+    i64 v = 9223372036854775808;
+    if (v < 0) { return 1; }
+    return 0;
+}

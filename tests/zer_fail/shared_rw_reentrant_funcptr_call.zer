@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: calls through a function pointer
+// BUG-980 (2026-09-11): the BUG-979 hole through the ONE callee form the
+// transitive summary cannot resolve — a call through a FUNCTION POINTER. `fp`
+// is bound to a function that write-locks S; the statement already holds S's
+// write lock. Measured on the pre-fix build: exit 0, the callee's write
+// unlocked (EDEADLK ignored) and its unlock releasing the caller's lock.
+// Scoped to shared(rw): a plain `shared` root is a recursive mutex, and the
+// callback-table idiom (`go.cb();`) must keep compiling.
+shared(rw) struct S { u32 v; }
+S g;
+u32 f() { g.v = 2; return 1; }
+u32 main() { *() -> u32 fp = f; g.v = fp(); return 0; }

@@ -71,6 +71,25 @@ typedef struct {
      * NOT increment it: only the taken branch is checked and the other is
      * stripped, so a join there is unconditional. */
     int branch_depth;
+    /* BUG-990 — loop-induction CERTAINTY. A VRP range says which values a
+     * variable MAY hold; these say which values a counted loop's counter WILL
+     * hold. Set only while checking the body of a `for` whose init, bound and
+     * step are integer constants with a positive step and whose body is
+     * straight-line (no break/continue/return/goto/yield/defer/asm/orelse and no
+     * write to or address-of the counter) — so every value of the sequence
+     * cert_loop_lo, +step, ... <= cert_loop_last really is executed.
+     *
+     * `cert_loop_name == NULL` (the memset default, and the value restored on
+     * every path that cannot establish the shape) means NO certainty, which
+     * degrades to today's behaviour. Only the INNERMOST such loop is tracked;
+     * an outer counter used inside a nested loop loses certainty, which is the
+     * conservative direction. */
+    const char *cert_loop_name;
+    uint32_t cert_loop_name_len;
+    int64_t cert_loop_lo;
+    int64_t cert_loop_step;   /* 0 = no certainty */
+    int64_t cert_loop_last;
+    int cert_loop_depth;      /* branch_depth at which the body is unconditional */
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
     const char *union_switch_var;  /* variable name being switched on (union only) */

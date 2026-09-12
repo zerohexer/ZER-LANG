@@ -5,6 +5,55 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-990/991: the off-by-N loop is a compile error; the IR intrinsic fallback is loud
+
+Adopted from `claude/loving-davinci-vgonmt` `a40104b` (its BUG-958/959; originally
+`vigilant-tesla-v7pucv`), by cherry-pick with the same commit's scoped-atomic-window half
+resolved to MAIN's implementation (BUG-979, `live_scoped_threads` / `unbounded_spawn_in_func`)
+— two implementations of one rule must not coexist. All seven survey class-4 reproducers
+compiled with only a warning on main; all reject now.
+
+### BUG-990 — the off-by-N loop bound was a warning, and the auto-guard made it a silent early return
+
+```zer
+u32[4] arr;
+for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }   // warning only; at runtime main RETURNED at i == 4
+```
+
+VRP had the range and it provably reaches past the array, but a range is a MAY-hold fact
+(`u32 b = 10; if (c) { b = 2; } arr4[b]` straddles and is safe). What licenses an error is
+the WILL-hold fact a counted loop gives: constant init, positive constant step, constant
+bound, and a body that cannot skip an iteration or touch the counter — every value of the
+sequence really is taken. `Checker.cert_loop_{name,lo,step,last,depth}` is established by
+the `for` driver and the `while` / `do-while` driver (entry value + a trailing `v += K` as
+the LAST statement) and consumed at the fixed-array index sink when the access sits at the
+body's own branch depth. `loop_body_straight_line` is a no-`default:` walk that answers
+"no" for anything it has not been taught, so an incomplete walk can only fail to report.
+A fourth verdict `IDX_PARTIAL_OOB` makes the residual MAY-hold case say what it is: the
+warning states the range, that it runs past the end, and that the guard RETURNS EARLY with
+no trap. The superseded positives `dowhile_vrp_autoguard.zer` / `while_vrp_autoguard.zer`
+(each a certain OOB written as a positive) become `{while,dowhile}_vrp_autoguard_runtime_bound.zer`.
+Tests: `tests/zer_fail/loop_counter_{off_by_one,past_end,past_end_field,step_overshoot,while_past_end,dowhile_past_end}.zer`,
+`dowhile_counter_past_end_bug748.zer` (promoted from a positive that asserted the silent return).
+
+### BUG-991 — the IR emitter's unknown-intrinsic fallback was still the silent `0`
+
+BUG-767 hardened the AST-path fallback; its IR-path twin — the only path function bodies
+use — still emitted `/* @name */ 0`. Dead today (swept), and now an undeclared identifier
+that makes GCC name the intrinsic. Also the AST atomic gate `nlen >= 10` (excluded
+`@atomic_or`; the checker fixed the same off-by-one in BUG-427) is now `>= 9`.
+
+### Tooling
+
+`tools/audit_reference_examples.sh` gains `<!-- audit: expect-error: <substring> -->`
+(the branch's BUG-945): a reference block illustrating a rejection can assert the
+rejection AND its reason instead of being skipped. The verdict line now reports
+`rejected-as-documented`; five stale baseline rows the sharper script no longer needs are
+dropped. Reference.md documents the four bounds verdicts and the scoped-spawn window with
+the directive.
+
+---
+
 ## Session 2026-09-12 — BUG-987..989: three forging doors — `@pun` with no runtime check, `@inttoptr` to an enum, `@container` of a whole object
 
 Adopted from `claude/loving-davinci-qo0mm9` (its BUG-984..986, themselves from

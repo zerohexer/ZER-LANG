@@ -280,9 +280,14 @@ Gate: the RE-ENTRY GRID in `tests/test_conc_matrix.c` (callee form x lock kind �
 PLAIN column is what proves the rule is scoped). Residual over-rejection (read/read)
 entered separately above.
 
-**4. LOOP COUNTER PAST END — 7, bounds. TAKE `vgonmt`.**
-`loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
-`_dowhile_past_end` `dowhile_counter_past_end_bug748`
+### ~~4. LOOP COUNTER PAST END — 7, bounds~~ — CLOSED 2026-09-12 as BUG-990 (from `vgonmt`)
+
+A counted loop whose counter PROVABLY takes a value past a fixed array's end is a compile
+error for `for` / `while` / `do-while` (`Checker.cert_loop_*`, `loop_body_straight_line`,
+`while_counter_step`); a MAY-hold straddling range still only warns, now with the
+`IDX_PARTIAL_OOB` wording that says the auto-guard is a silent early return. The
+superseded positive `dowhile_vrp_autoguard.zer` (a certain OOB written as a positive) is
+replaced by the `_runtime_bound` pair.
 
 ### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-12 as BUG-987/988/989 (from `qo0mm9`)
 
@@ -1923,7 +1928,17 @@ live holes", which is the same conclusion from the other side.
 
 </details>
 
-### CLASS 3 — LOOP COUNTER PAST END / OFF BY ONE (HIGH, silent OOB) — `v7pucv`
+### ~~CLASS 3 — LOOP COUNTER PAST END / OFF BY ONE~~ — **CLOSED 2026-09-12 as BUG-990, DO NOT REDO**
+
+> Adopted from `v7pucv` `8c8873d` (their BUG-913), hunk-applied (the same commit's
+> assign-form / pool-merge / depth-cap parts were already on main as BUG-933). A counted
+> loop whose counter PROVABLY takes a value past the end is a compile error for
+> for / while / do-while (`Checker.cert_loop_*`, `loop_body_straight_line`,
+> `while_counter_step`); a MAY-hold straddling range still only warns — with the new
+> `IDX_PARTIAL_OOB` wording that says the guard is a silent early return. All 7
+> negatives reject, `loop_counter_bounds_ok` (11 boundary premises) runs. The superseded
+> `dowhile_vrp_autoguard.zer` (a certain OOB written as a positive) is replaced by the
+> `_runtime_bound` pair. Original:
 
 7 tests: `loop_counter_off_by_one`, `_past_end`, `_past_end_field`,
 `_step_overshoot`, `_while_past_end`, `loop_counter_dowhile_past_end`,
@@ -1987,7 +2002,12 @@ Also `v7pucv`: `move_struct_deep_nesting_uam`, `wrong_pool_across_branch`.
 
 </details>
 
-### CLASS 5 — ATOMIC CELL vs SCOPED SPAWN (HIGH, silent race) — `v7pucv`
+### ~~CLASS 5 — ATOMIC CELL vs SCOPED SPAWN~~ — **CLOSED 2026-09-11 as BUG-979 (main), DO NOT REDO**
+
+> Same adoption. The scoped spawn now opens the atomic-cell window
+> (`Checker.live_scoped_threads`, `unbounded_spawn_in_func`); `.join()` closes it only when no
+> scoped thread is left live and no fire-and-forget spawn happened. All 3 negatives
+> reject; `atomic_cell_scoped_spawn_join_ok` pins pre-spawn and post-join access. Original:
 
 The atomic-cell rule does not cover the window between `spawn` and `.join()`:
 
@@ -2283,6 +2303,72 @@ accept-unsafe class.
 5. **The global-init self-cycle HANG** — small fix, but it is a compiler DoS and
    any negative test for it will time out `make check` until it is fixed.
 6. Everything else, per class above.
+
+## OPEN — four findings `v7pucv` MEASURED but deliberately did not change (adopted 2026-09-12 with BUG-990/991; the window half is main BUG-979)
+
+Recorded with the measurement so the next session does not re-derive it. None is an
+accept-unsafe hole. (Their fifth finding — `ir_merge_states` field coverage — is already
+answered under NON-TEST FINDINGS above: measured, mostly refuted, the one real field closed.)
+
+### 1. The auto-guard's runtime form is a SILENT EARLY RETURN — a language-semantics call
+
+An unprovable index into a fixed array compiles to `if (i >= N) { <defers>; return <zero>; }`.
+Measured consequences, all with no runtime diagnostic: a struct-returning function returns
+`{0}`; a `?u32` function returns None (an OOB read becomes "no value"); a guard inside a LOOP
+returns from the whole FUNCTION, so the loop silently truncates and everything after it is
+skipped — in `main` the exit code is 0. This contradicts the rule recorded under "DECIDED"
+for float→int (*memory violations halt; arithmetic gets a defined value*), and `[*]T` already
+traps on the same logical error one container away. BUG-835 already traps inside
+`@critical` / a held lock / a defer body. **Measured corpus cost of making the guard always
+trap: 27 tests** (`vrp_*_guarded` / `autoguard_*` / `mmio_var_idx_guard`, all written to
+assert the silent-return semantics) — so it is a deliberate semantic and changing it is the
+owner's call, like float→int. BUG-990 closed the sharpest edge (the off-by-N loop is now a
+compile error, and the KNOWN-range warning now says the guard returns early with no trap).
+What remains is the genuinely unprovable index.
+
+### 2. Re-defining a CONSUMED move struct is over-rejected (pre-existing; verify before fixing)
+
+```
+Token b;  b = a;  consume(b);  b = make_token();   // ERROR: "use after move: 'b'"
+```
+
+Assigning a fresh value to a move local that has itself been consumed is a DEFINITION, not a
+use — the same argument BUG-933's target-skip makes for handles. Comes from the move-transfer
+sinks marking the destination's own entry; closing it needs "a bare `=` target is a
+definition" applied there, plus a negative matrix proving a genuine use-after-move through
+each source shape still fires.
+
+### 3. The emitted preamble needs a hosted libc's HEADERS even for a program that uses none of it
+
+```
+gcc -ffreestanding -nostdinc -isystem $(gcc -print-file-name=include) -c out.c
+out.c:19:10: fatal error: string.h: No such file or directory
+```
+
+`<string.h>`, `<stdio.h>` and `<stdlib.h>` sit OUTSIDE the `_ZER_HOSTED` gate, and none is a
+freestanding header. `memset`/`memcpy` are for auto-zero and the Slab runtime; `calloc`/`free`
+are used ONLY by the Slab runtime, **which is emitted unconditionally even when the program
+contains no Slab.** Loud (a compile error), not silent. Survived because `arm-none-eabi`
+ships newlib's headers, so the QEMU examples build; bites a true `-nostdlib` kernel/EFI
+target. Fix sketch: (1) emit the Slab/pool heap runtime only when used (the emitter already
+knows — it emits auto-slabs per struct type); (2) move `<stdio.h>`/`<stdlib.h>` inside
+`#if _ZER_HOSTED`; (3) under `#else`, DECLARE `memset`/`memcpy` so a freestanding link fails
+on a missing SYMBOL, not a missing HEADER. Verify with the line above plus the QEMU examples.
+
+### 4. An ISR/main-shared `volatile` AGGREGATE is rejected on the whole type's width
+
+`volatile_global_exempt_from_race_check` admits only a single-word SCALAR, so
+`volatile u32[4] buf;` touched from both an ISR and main is a hard error even when every
+access is `buf[i]` (one aligned 32-bit access, which cannot tear). Sound, but the check asks
+the width of the TYPE while the hazard is the width of the ACCESS. Measured: there is
+currently **no way to write an ISR→main buffer of more than one word** (`@atomic_*` and
+`shared struct` both hit the "must be volatile" rule first, and the diagnostic's advice names
+`*shared T`, which is not constructible). Relaxation shape: keep the check at the declaration
+but drive it from the ACCESS SHAPES the ISR pass already collects — admit only when every
+recorded access on either side is a field/index whose lvalue is a single-word scalar, no
+whole-aggregate access, address never taken, not `packed`; anything unclassified counts as
+whole-aggregate. The RMW rule stays. Widens an ACCEPT, so it needs the access-shape
+collection + its negative matrix in `tests/test_hw_matrix.c` FIRST.
 
 ## Where main stands
 

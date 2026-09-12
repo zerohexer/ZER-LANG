@@ -2131,7 +2131,14 @@ accepts.
 
 ---
 
-### CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL (MEDIUM) — `o51x9p`
+### ~~CLASS 10 — `@ptrtoint(&local)` LAUNDERED THROUGH A CALL~~ — **CLOSED 2026-09-12 as BUG-1004, DO NOT REDO**
+
+> Taken from `vgonmt` `298579a` plus the summary-mask half of `qo0mm9` `87107f5`
+> (both from `o51x9p` `2c0d4e2`). One query `call_result_is_local_address_int` at
+> the assignment and return sinks, relational through `ret_param_mask` (so the
+> pointer-param form `g = leak(&l)` is caught too); `expr_touches_local_derived`
+> is exhaustive now. All 4 negatives reject, `ptrtoint_call_boundary_ok` runs,
+> sink-matrix shape p25 (8 cells). Original:
 
     usize g = 0;
     usize idfn(usize x) { return x; }

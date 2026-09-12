@@ -499,6 +499,32 @@ cell p24_safe_int       compile 'u32 pk24f(?u32 o){ u32 v=o orelse return; retur
 # which is what a first draft of this cell measured.
 cell p24_safe_opt_ptr   compile 'struct T24g{u32 v;} ?*T24g pk24g(?*T24g o){ *T24g t=o orelse return; return t; } u32 main(){ return 0; }'
 
+# SHAPE p25 (BUG-1004): A FRAME ADDRESS LAUNDERED AS AN INTEGER THROUGH A CALL.
+#
+# Every direct spelling of `@ptrtoint(&local)` reaching a global or a return was
+# rejected (`g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a`). The CALL
+# spelling was not: the call-result escape sink is gated on the result type CARRYING
+# a data pointer, and `usize` carries none — so `g = idfn(@ptrtoint(&l))` and
+# `return idfn(@ptrtoint(&l))` compiled, and so did `g = leak(&l)` against
+# `usize leak(*u32 p) { return @ptrtoint(p); }` (the pointer went in, the address
+# came out as an integer). ONE query `call_result_is_local_address_int`: with a
+# complete return summary the decision is relational (callee may return param n AND
+# arg n is a frame address, pointer or integer); without one, an address-valued
+# integer argument. The boundary cells are what keep the rule narrow: a scalar
+# READ (`s.len`) is not a view, and a bare `&buf` handed to a function that returns
+# a plain count is the `strlen` shape.
+echo "===== SHAPE p25 = frame address as an INTEGER through a call ====="
+cell p25_idfn_global     reject 'usize g25; usize idfn25(usize x){ return x; } u32 main(){ u32 l=5; g25 = idfn25(@ptrtoint(&l)); return 0; }'
+cell p25_idfn_return     reject 'usize idfn25b(usize x){ return x; } usize leak25b(){ u32 l=5; return idfn25b(@ptrtoint(&l)); } u32 main(){ return 0; }'
+cell p25_ptr_param       reject 'usize g25c; usize leak25c(*u32 p){ return @ptrtoint(p); } u32 main(){ u32 l=5; g25c = leak25c(&l); return 0; }'
+cell p25_int_alias       reject 'usize g25d; usize idfn25d(usize x){ return x; } u32 main(){ u32 l=5; usize a=@ptrtoint(&l); g25d = idfn25d(a); return 0; }'
+cell p25_arith_arg       reject 'usize g25e; usize idfn25e(usize x){ return x; } u32 main(){ u32 l=5; g25e = idfn25e(@ptrtoint(&l) + 4); return 0; }'
+# BOUNDARY: a scalar field read is RET_STATIC (no view); a callee returning a fresh
+# count from a pointer param has an empty mask; a global's address is not frame-bound.
+cell p25_safe_len_read   compile 'usize g25f; usize len25f([*]u8 s){ return s.len; } u32 main(){ u8[4] b; g25f = len25f(b); return (u32)(g25f - 4); }'
+cell p25_safe_count      compile 'usize g25g; usize cnt25g(*u32 p){ if (*p == 0) { return 0; } return 1; } u32 main(){ u32 l=5; g25g = cnt25g(&l); return (u32)(g25g - 1); }'
+cell p25_safe_global_addr compile 'usize g25h; u32 gv25h; usize idfn25h(usize x){ return x; } u32 main(){ g25h = idfn25h(@ptrtoint(&gv25h)); return 0; }'
+
 
 echo ""
 echo "==================================================================="

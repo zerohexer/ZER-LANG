@@ -1,0 +1,6 @@
+// expect-error: cannot store result of call given @ptrtoint of a local
+// BUG-1004: the callee takes the address as a POINTER and returns it as an integer;
+// the return summary peels @ptrtoint so the sink resolves the argument.
+usize g = 0;
+usize leak(*u32 p) { return @ptrtoint(p); }
+u32 main() { u32 l = 5; g = leak(&l); return 0; }

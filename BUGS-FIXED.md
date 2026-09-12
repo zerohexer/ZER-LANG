@@ -5,6 +5,52 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1004: `@ptrtoint(&local)` laundered through a CALL escaped to a global (survey class 10)
+
+Two branches fixed this from `vigilant-tesla-o51x9p` `2c0d4e2`: `vgonmt` `298579a`
+(cherry-picked: the predicates, the exhaustive `expr_touches_local_derived`, three
+negatives and the positive) and `qo0mm9` `87107f5` (hand-ported: the return-summary
+half, which is what catches the POINTER-PARAM form the first version missed). Measured
+on main first: all four negatives compiled clean.
+
+### BUG-1004 — a frame address as a pointer-width INTEGER through a call reached a global / a return
+
+```zer
+usize g;
+usize idfn(usize x) { return x; }
+usize leak(*u32 p)  { return @ptrtoint(p); }
+u32 main() {
+    u32 l = 5;
+    g = idfn(@ptrtoint(&l));      // accepted
+    g = leak(&l);                 // accepted — pointer in, address out as an integer
+    return 0;
+}
+```
+
+while `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a` and `g = m() orelse a`
+were all rejected. Two causes: the call-result escape sink is gated on
+`type_carries_data_pointer(result)`, false for `usize`; and `expr_touches_local_derived`
+answered "no" for `NODE_CALL` through a `default:` whose own comment called that a
+safety hole.
+
+Fix: ONE query `call_result_is_local_address_int` at the assignment and the return
+sinks. With a complete return summary it is RELATIONAL — the callee may return param n
+(`ret_param_mask`, now recorded for pointer-width integer returns too, with
+`classify_return_root` peeling `@ptrtoint` as the view it is) AND argument n is a frame
+address, whether a local-derived pointer or an address-valued integer. Without a summary
+(extern C, funcptr) only the address-valued-integer argument rule applies, so a C
+function handed `&buf` that returns a count (the `strlen` shape) is untouched. A scalar
+READ in a return (`return s.len`, `return arr[i]`, `return *p`) is RET_STATIC — forming a
+reference aliases, reading a value does not — which is what keeps `g_len =
+len_of(local_slice)` compiling. The walker is a no-`default:` switch (statement kinds
+baselined with the reason).
+
+Tests: `tests/zer_fail/ptrtoint_local_via_call_{global,return,alias,ptr_param}.zer`,
+`tests/zer/ptrtoint_call_boundary_ok.zer`, sink-matrix shape **p25** (5 reject + 3
+boundary cells).
+
+---
+
 ## Session 2026-09-12 — BUG-1002/1003: two float emissions GCC refused, held until the cast policy landed
 
 Both from `claude/loving-davinci-qo0mm9` `afcc7ee` (its 982/983, harvested there from

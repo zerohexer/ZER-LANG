@@ -1,0 +1,36 @@
+// BUG-1005 regression. The two call-ARGUMENT adaptations — T[N] into a [*]T param
+// (wrap in {ptr,len}) and [*]T into a *T extern-C param (pass .ptr) — must be
+// emitted in EVERY position a call can sit, not only the var-decl init. The plain
+// assignment, the defer body and the compound-expression forms go through the
+// IR-rewritten call emitter, which had neither adaptation: GCC was handed a bare
+// `uint8_t *` for a `_zer_slice_u8` parameter and refused a valid program.
+i32 puts(const *u8 s);
+usize len_of([*]u8 s) { return s.len; }
+u32 first_plus(u32 add, [*]u8 s) { return (u32)s[0] + add; }
+usize g_len = 0;
+u32 g_v = 0;
+
+u32 main() {
+    u8[4] b;
+    b[0] = 7;
+    const [*]u8 msg = "call_arg_coerce_all_forms";
+    usize n = len_of(b);                 // var-decl init (decomposed path)
+    if (n != 4) { return 1; }
+    n = 0;
+    n = len_of(b);                       // plain assignment (rewritten path)
+    if (n != 4) { return 2; }
+    g_len = len_of(b);                   // global store
+    if (g_len != 4) { return 3; }
+    g_v = first_plus(3, b) + 1;          // compound expression, non-first arg
+    if (g_v != 11) { return 4; }
+    if (len_of(b) != 4) { return 5; }    // condition
+    i32 r = 0;
+    r = puts(msg);                       // slice -> *T decay, assignment form
+    if (r < 0) { return 6; }
+    u32 seen = 0;
+    {
+        defer { seen = (u32)len_of(b) + (u32)puts(msg); }   // both, in a defer body
+    }
+    if (seen < 4) { return 7; }
+    return 0;
+}

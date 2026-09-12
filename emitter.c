@@ -830,6 +830,37 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
     emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
 
+/* BUG-1005: ONE decision for how a call ARGUMENT is adapted to the callee's
+ * parameter type — at both call emitters. Two adaptations exist:
+ *   CARG_ARR_TO_SLICE  T[N] into a [*]T param: wrap in a {ptr,len} literal.
+ *   CARG_DECAY         [*]T into a *T param (extern C): pass `.ptr`.
+ * The AST emitter (`emit_expr` NODE_CALL) had both; the IR-rewritten emitter
+ * (`emit_rewritten_node` NODE_CALL — a call inside a plain ASSIGNMENT `n = len(b)`,
+ * a `defer` body, a spawn arg) had neither, so `u8[4] b; n = len(b);` handed GCC a
+ * bare `uint8_t *` where a `_zer_slice_u8` was declared — a VALID program refused
+ * in the generated C, while the var-decl spelling `usize n = len(b);` of the same
+ * call (the decomposed IR_CALL path, which coerces) built fine. Same shape as
+ * every "emitter dual dispatch" entry in CLAUDE.md: the decision was copied into
+ * one site and not the other. `param_out` is the callee's declared param type,
+ * for the slice literal's type. */
+typedef enum { CARG_PLAIN, CARG_DECAY, CARG_ARR_TO_SLICE } CallArgForm;
+static CallArgForm call_arg_form(Emitter *e, Type *callee_type, Node *arg, int i,
+                                 Type **arg_type_out, Type **param_out) {
+    Type *eff_callee = callee_type ? type_unwrap_distinct(callee_type) : NULL;
+    Type *arg_type_raw = checker_get_type(e->checker, arg);
+    Type *arg_type = arg_type_raw ? type_unwrap_distinct(arg_type_raw) : NULL;
+    if (arg_type_out) *arg_type_out = arg_type;
+    if (param_out) *param_out = NULL;
+    if (!arg_type || !eff_callee || eff_callee->kind != TYPE_FUNC_PTR ||
+        (uint32_t)i >= eff_callee->func_ptr.param_count)
+        return CARG_PLAIN;
+    Type *param = eff_callee->func_ptr.params[i];
+    if (param_out) *param_out = param;
+    if (arg_type->kind == TYPE_SLICE && param->kind == TYPE_POINTER) return CARG_DECAY;
+    if (arg_type->kind == TYPE_ARRAY && param->kind == TYPE_SLICE) return CARG_ARR_TO_SLICE;
+    return CARG_PLAIN;
+}
+
 /* Path C: emit the C carrier type for an arbitrary-width integer.
  * Carrier = smallest native int that holds `bits` (odd widths are masked
  * to `bits` at arithmetic/read sites in Phase C). */
@@ -2870,26 +2901,21 @@ static void emit_expr(Emitter *e, Node *node) {
             Type *callee_type = checker_get_type(e->checker,node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
                 if (i > 0) emit(e, ", ");
-                /* unwrap distinct for callee type */
-                Type *eff_callee = type_unwrap_distinct(callee_type);
-                /* slice→pointer decay: emit .ptr when passing []T to *T */
-                Type *arg_type_raw = checker_get_type(e->checker,node->call.args[i]);
-                Type *arg_type = arg_type_raw ? type_unwrap_distinct(arg_type_raw) : NULL;
-                bool need_decay = arg_type && arg_type->kind == TYPE_SLICE &&
-                    eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
-                    (uint32_t)i < eff_callee->func_ptr.param_count &&
-                    eff_callee->func_ptr.params[i]->kind == TYPE_POINTER;
-                /* array→slice coercion: wrap T[N] in slice compound literal */
-                bool need_arr_coerce = arg_type && arg_type->kind == TYPE_ARRAY &&
-                    eff_callee && eff_callee->kind == TYPE_FUNC_PTR &&
-                    (uint32_t)i < eff_callee->func_ptr.param_count &&
-                    eff_callee->func_ptr.params[i]->kind == TYPE_SLICE;
-                if (need_arr_coerce) {
-                    emit_array_as_slice(e, node->call.args[i], arg_type,
-                                        eff_callee->func_ptr.params[i]);
-                } else {
+                /* Site 1 of 2 — the decision lives in call_arg_form (BUG-1005). */
+                Type *arg_type = NULL, *param = NULL;
+                CallArgForm form = call_arg_form(e, callee_type, node->call.args[i], i,
+                                                 &arg_type, &param);
+                switch (form) {
+                case CARG_ARR_TO_SLICE:
+                    emit_array_as_slice(e, node->call.args[i], arg_type, param);
+                    break;
+                case CARG_DECAY:
                     emit_expr(e, node->call.args[i]);
-                    if (need_decay) emit(e, ".ptr");
+                    emit(e, ".ptr");
+                    break;
+                case CARG_PLAIN:
+                    emit_expr(e, node->call.args[i]);
+                    break;
                 }
             }
             emit(e, ")");
@@ -8220,9 +8246,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         }
         emit_rewritten_node(e, node->call.callee, func);
         emit(e, "(");
-        for (int i = 0; i < node->call.arg_count; i++) {
-            if (i > 0) emit(e, ", ");
-            emit_rewritten_node(e, node->call.args[i], func);
+        {
+            Type *callee_type = checker_get_type(e->checker, node->call.callee);
+            for (int i = 0; i < node->call.arg_count; i++) {
+                if (i > 0) emit(e, ", ");
+                /* Site 2 of 2 — same decision as the AST call emitter (BUG-1005). */
+                Type *arg_type = NULL, *param = NULL;
+                CallArgForm form = call_arg_form(e, callee_type, node->call.args[i], i,
+                                                 &arg_type, &param);
+                switch (form) {
+                case CARG_ARR_TO_SLICE:
+                    /* An array is an IR passthrough (never renamed), so the AST
+                     * emitter inside emit_array_as_slice names it correctly —
+                     * the decomposed IR_CALL arm relies on the same fact. */
+                    emit_array_as_slice(e, node->call.args[i], arg_type, param);
+                    break;
+                case CARG_DECAY:
+                    emit_rewritten_node(e, node->call.args[i], func);
+                    emit(e, ".ptr");
+                    break;
+                case CARG_PLAIN:
+                    emit_rewritten_node(e, node->call.args[i], func);
+                    break;
+                }
+            }
         }
         emit(e, ")");
         return;

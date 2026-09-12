@@ -5,6 +5,46 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1005: the IR-rewritten call emitter adapted no argument (found by a sink-matrix boundary cell)
+
+Not from any branch. The p25 boundary cell `g = len_of(local_array)` was written to prove
+BUG-1004 stays narrow and came back OVER-REJECT — from GCC, not the checker. A/B against
+the pre-session baseline: identical, so a long-standing miscompile that no test exercised
+because every existing array-argument test used the var-decl spelling.
+
+### BUG-1005 — `n = len_of(b)` handed GCC a bare `uint8_t *` for a `[*]u8` parameter
+
+```zer
+usize len_of([*]u8 s) { return s.len; }
+u32 main() {
+    u8[4] b;
+    usize n = len_of(b);     // fine: decomposed IR_CALL path coerces T[N] -> {ptr,len}
+    n = len_of(b);           // GCC: incompatible type for argument 1 of 'len_of'
+    return 0;
+}
+```
+
+The same for the extern-C decay: `r = puts(msg)` with `const [*]u8 msg` passed the slice
+struct where `puts` wanted `const char *`, while `i32 r = puts(msg)` passed `.ptr`. A
+call inside a plain assignment, a `defer` body, a spawn argument or any compound
+expression is emitted by `emit_rewritten_node` NODE_CALL, whose argument loop was a bare
+`emit_rewritten_node(arg)` — the AST call emitter had both adaptations, the decomposed
+IR_CALL arm had the array one, and the rewritten arm had neither. Loud (GCC refuses),
+but the diagnostic names a generated file and the program is valid ZER.
+
+Fix: ONE decision `call_arg_form()` (CARG_PLAIN / CARG_DECAY / CARG_ARR_TO_SLICE, a
+no-`default:` enum) called by both call emitters; each site keeps only its way of
+producing the operand. `emit_array_as_slice` uses the AST emitter for the array itself,
+which is correct on the rewritten path because an array is an IR passthrough and is
+never renamed — the decomposed arm already relied on that.
+
+Test: `tests/zer/call_arg_coerce_all_forms.zer` — both adaptations crossed with var-decl
+init, plain assignment, global store, compound expression (non-first arg), condition
+and a `defer` body. Fails to build on the baseline, exits 0 now. The p25 boundary cell
+is the gate.
+
+---
+
 ## Session 2026-09-12 — BUG-1004: `@ptrtoint(&local)` laundered through a CALL escaped to a global (survey class 10)
 
 Two branches fixed this from `vigilant-tesla-o51x9p` `2c0d4e2`: `vgonmt` `298579a`

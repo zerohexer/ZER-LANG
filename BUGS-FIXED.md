@@ -5,6 +5,104 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-998..1001: factory reach through switch/do-while, `&x` in a spawn arg, one cast policy, optional funcptr return
+
+Cherry-picked from `claude/loving-davinci-qo0mm9` `2864761` (its 977..980, harvested there
+from `vigilant-tesla-pstdqk` 913..916), renumbered. Its fifth item (a braceless switch arm
+skipping the shared lock, their 981) is main's BUG-981 — the PARSER half of that commit was
+dropped, since main closes the same hole one layer down in `ir_lower.c` (`lower_body`), and
+the `test_sharedlock_matrix` gate it ships passes 14/14 on main's fix. Each of the four
+was measured live on main before adoption: the three factory negatives compiled clean,
+`cast_bool_canonical_all_forms` exited 2, `funcptr_return_all_spellings` did not build,
+and `vrp_loop_addr_taken_spawn` ran to exit 42. Survey class 12 closes. New gates in
+`make check`: `tests/test_sharedlock_matrix.c` (14 forms, asks whether the mutex was
+EMITTED) and `tests/test_borrow_join_matrix.c` (13 cells). Conc matrix 114 -> 124 cells.
+
+### BUG-998 — a factory returning a racing callback from a `switch` arm or `do-while` body
+
+```zer
+u32 g;
+void cb() { g += 1; }
+void nop() { }
+*() -> void mk(u32 k) {
+    switch (k) { 0 => { return cb; } default => { } }
+    return nop;
+}
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }
+```
+
+Accepted. `scan_returned_funcname` was an if/else chain over RETURN / BLOCK / IF / WHILE /
+FOR; a `return` in a switch arm or a do-while body was never reached. The ISR sibling
+`record_isr_returned_funcname` had DO_WHILE but not SWITCH — one kind apart, the drift
+CLAUDE.md names for this exact pair. Both are no-`default:` exhaustive switches now
+(SWITCH, DO_WHILE, DEFER, CRITICAL, ONCE added at both).
+
+Probe design: a factory that ALSO returns the racy callback on the fall-through is caught
+by the plain-RETURN arm and proves nothing — the discriminating shape returns a safe
+`nop` on every path except the construct under test.
+
+Tests: `tests/zer_fail/spawn_race_factory_switch.zer`, `spawn_race_factory_dowhile.zer`,
+`isr_race_factory_switch.zer` (all `// expect-error:`), plus four REACH cells and two ISR
+cells in `tests/test_conc_matrix.c`.
+
+### BUG-999 — an `&x` in a `spawn` argument / `await` condition / asm operand did not widen the loop range
+
+```zer
+void bump(*u32 p) { *p = 100; }
+u32 run() {
+    u8[4] arr; u32 idx = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        arr[idx] = 7;                       // guard ELIDED
+        ThreadHandle th = spawn bump(&idx); th.join();
+    }
+    return 42;
+}
+```
+
+With a plain `bump(&idx);` the emitter writes `if ((size_t)(idx) >= 4u) { return 0; }`;
+the `spawn` spelling emitted NO guard, so iterations 2 and 3 wrote `arr[100]` on a 4-byte
+stack array. `vrp_widen_loop_addr_taken` closed with a comment claiming spawn/await/asm
+carry no `&` subtree — false (`spawn_stmt.args`, `await_stmt.cond`, asm operands). Both
+it and `vrp_invalidate_loop_body_writes` now descend all three; the widener is an
+exhaustive switch. Over-widening only ADDS a guard, so descending more is always sound.
+The walker-field audit HAD flagged these rows — they sat in the baseline with no reason.
+
+Test: `tests/zer/vrp_loop_addr_taken_spawn.zer` (exit 42 pre-fix, 0 post-fix).
+
+### BUG-1000 — `(bool)x` and the `*opaque` type-id trap missing on one of three cast emitters
+
+```zer
+u32 five() { return 5; }
+bool b = false;
+b = (bool)five();        // emitted  b = ((uint8_t)five())  -> b holds 5
+```
+
+`if (b)` true and `b == true` false at once (BUG-586 fixed twice, never at the third
+site). The same site emitted `m = (*Motor)ctx;` as a direct cast of the `_zer_opaque`
+STRUCT — GCC rejects it and the runtime type-id check was gone. Cast policy had been
+copied into `emit_expr` NODE_TYPECAST, `emit_rewritten_node` NODE_TYPECAST and
+`emit_ir_inst` IR_CAST; site 2 implemented one of four behaviours.
+
+Class-kill: `classify_cast()` + `emit_cast_value()` hold the decision and emission once;
+each site supplies a `CastOperand` (AST / rewritten / local). No-`default:` form enum.
+Invariant: `grep -c "type mismatch in cast" emitter.c` is 1.
+
+Tests: `tests/zer/cast_bool_canonical_all_forms.zer` (six emission forms, exit 2
+pre-fix), `tests/zer_trap/opaque_cast_assign_typeid.zer` (trap restored, 133).
+
+### BUG-1001 — a function returning an OPTIONAL function pointer emitted invalid C
+
+`?VFn maybe(u32 k)` emitted `void (*)() maybe(uint32_t k)` — an abstract declarator with a
+name glued on. `ret_is_funcptr` tested `ret->kind == TYPE_FUNC_PTR` raw, so the `?` /
+`distinct` wrappers hid it (BUG-879 one sink over). One `funcptr_return_shape()` query
+now serves both signature emitters; the bodyless-prototype path had no funcptr-return
+handling at all and uses it too.
+
+Test: `tests/zer/funcptr_return_all_spellings.zer` (both spellings x bare/optional).
+
+---
+
 ## Session 2026-09-12 — BUG-996/997: the MMIO base nobody could fold, and a global initialized from a global
 
 Hand-applied from `claude/loving-davinci-vgonmt` `565f1b1` (its 944/942, from

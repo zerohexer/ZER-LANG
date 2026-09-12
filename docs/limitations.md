@@ -2156,7 +2156,7 @@ Companion positive `mmio_const_ident_base` is currently OVER-REJECTED (below).
 
 ---
 
-### CLASS 12 — FUNCPTR FACTORY THROUGH switch / do-while (MEDIUM) — `pstdqk`
+### ~~CLASS 12 — FUNCPTR FACTORY THROUGH switch / do-while (MEDIUM) — `pstdqk`~~ — **CLOSED 2026-09-12 as BUG-998 (both sinks, +4 REACH +2 ISR cells). DO NOT REDO.**
 
 Extends the funcptr REACH class. `scan_returned_funcname` does not descend a `switch`
 arm or a `do-while` body:

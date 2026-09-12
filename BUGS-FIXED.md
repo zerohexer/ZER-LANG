@@ -5,6 +5,27 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1020: five use-after-free reporters named an IR local number instead of the variable
+
+### BUG-1020 — `use after free: local %0 is transferred (freed at line 11)`
+
+Found while adopting BUG-1012: the new struct-init negative was rejected correctly and
+the sentence was fiction — `%0` is the IR slot of the first local, `local` is not what
+the author wrote, and a TRANSFERRED handle is not "freed". The sibling reporters two
+hundred lines away said `'a' is transferred` / `use after move: 'a' ownership
+transferred at line 11`. Five sites (the FIELD_READ prefix walk, `IR_POOL_GET`, two
+call-argument checks, and the IR_CALL arg walk) printed the raw number. CLAUDE.md's
+rule applies: the verdict can be right and the sentence still fiction, and the author
+reads the sentence.
+
+Fix: ONE reporter `ir_report_invalid_use` (names the root through `ir_root_display` —
+a local, the `IR_GLOBAL_ROOT_ID` pseudo-root, or `?` — plus the compound path) and uses
+the move-sink wording for a TRANSFERRED handle. No negative depended on the raw number;
+one (`move_assign_form_ident`) had frozen "is transferred" and now expects "ownership
+transferred", the wording every other move negative already uses.
+
+---
+
 ## Session 2026-09-12 — BUG-1015..1019: the struct-init laundered RMW, `@bitcast` and arrays (three ways), and a recursive callee the race scans could not finish
 
 Taken from `claude/loving-davinci-v6o9c5` `318bf05` (its 975..979, the parts not already

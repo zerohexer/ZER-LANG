@@ -2649,6 +2649,33 @@ static void ir_root_display(IRFunc *func, int root_local, const char *path,
     }
 }
 
+/* BUG-1020: ONE reporter for "this (bare or compound) handle is used while
+ * FREED / MAYBE_FREED / TRANSFERRED". Five sites used to print the raw IR local
+ * number — `use after free: local %0 is transferred` — which names nothing the
+ * author wrote (an IR temp, or `%0` for the first local) while the sibling
+ * reporters two hundred lines away said `'a' is transferred`. The verdict was
+ * right and the sentence was fiction; the author reads the sentence. Names the
+ * root through ir_root_display (locals, the IR_GLOBAL_ROOT_ID pseudo-root, or
+ * `?` when the root is unnameable), and the compound path when there is one. */
+static void ir_report_invalid_use(ZerCheck *zc, IRFunc *func, int line,
+                                  int root_local, const char *path,
+                                  uint32_t path_len, IRHandleInfo *h) {
+    const char *nm; int nl;
+    ir_root_display(func, root_local, path, path_len, &nm, &nl);
+    if (h->state == IR_HS_TRANSFERRED) {
+        /* the wording the four move-sink reporters already use */
+        ir_zc_error(zc, line, "use after move: '%.*s' ownership transferred at line %d",
+                    nl, nm, h->free_line);
+    } else if (path_len == 0 || root_local == IR_GLOBAL_ROOT_ID) {
+        ir_zc_error(zc, line, "use after free: '%.*s' is %s (freed at line %d)",
+                    nl, nm, ir_state_name(h->state), h->free_line);
+    } else {
+        ir_zc_error(zc, line,
+            "use after free: compound '%.*s' on local '%.*s' is %s (freed at line %d)",
+            (int)path_len, path, nl, nm, ir_state_name(h->state), h->free_line);
+    }
+}
+
 /* BUG-976: is `target` EXACTLY the slot of a tracked compound entry? A plain
  * `=` into such a slot OVERWRITES the slot — it never reads the allocation the
  * slot used to point at — so it is a RESET, not a use. Without this the fix the
@@ -4349,11 +4376,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         int target = inst->handle_local;
         if (target >= 0) {
             IRHandleInfo *h = ir_find_handle(ps, target);
-            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                ir_zc_error(zc, inst->source_line,
-                    "use after free: %%%d is %s (freed at line %d)",
-                    target, ir_state_name(h->state), h->free_line);
-            }
+            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h))
+                ir_report_invalid_use(zc, func, inst->source_line, target, NULL, 0, h);
         }
         break;
     }
@@ -4514,16 +4538,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h = ir_find_compound_handle(ps, root_local, path, path_len);
                     }
                     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                        if (path_len == 0) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after free: local %%%d is %s (freed at line %d)",
-                                root_local, ir_state_name(h->state), h->free_line);
-                        } else {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after free: compound '%.*s' on local %%%d is %s (freed at line %d)",
-                                (int)path_len, path, root_local,
-                                ir_state_name(h->state), h->free_line);
-                        }
+                        ir_report_invalid_use(zc, func, inst->source_line,
+                                              root_local, path, path_len, h);
                         break; /* found — don't report parent prefixes too */
                     }
                 }
@@ -5595,11 +5611,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             IRHandleInfo *h;
                             if (path_len == 0) h = ir_find_handle(ps, root_local);
                             else h = ir_find_compound_handle(ps, root_local, path, path_len);
-                            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "use after free: local %%%d is %s (freed at line %d)",
-                                    root_local, ir_state_name(h->state), h->free_line);
-                            }
+                            if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h))
+                                ir_report_invalid_use(zc, func, inst->source_line,
+                                                      root_local, path, path_len, h);
                             /* F3.2: cross-pool misuse — handle came from
                              * a different Pool/Slab than the receiver. */
                             /* F3.2 wrong-pool check is centralized in
@@ -6310,11 +6324,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *h;
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
-                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use after free: local %%%d is %s (freed at line %d)",
-                            root_local, ir_state_name(h->state), h->free_line);
-                    }
+                    if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h))
+                        ir_report_invalid_use(zc, func, inst->source_line,
+                                              root_local, path, path_len, h);
                     /* F3.2 wrong-pool check centralized in walker. */
                 }
                 break;

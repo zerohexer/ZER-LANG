@@ -1,4 +1,4 @@
-// expect-error: is transferred
+// expect-error: ownership transferred
 // BUG-920: a move-struct TRANSFER written as an ASSIGNMENT rather than a var-decl
 // INITIALIZER transferred nothing — the initializer spelling of the same program
 // is rejected. Same root cause as BUG-919: the initializer lowers to IR_COPY

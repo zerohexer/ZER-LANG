@@ -121,6 +121,18 @@ f64 precise = 3.14159265358979;
 - Digit-group underscores are allowed in numeric literals for readability and
   are ignored by the value: `1_000.5`, `3.141_592`, `1e1_0` (and `1_000_000`
   for integers).
+- A literal too large for the type becomes an **infinity**, which is a normal
+  IEEE value and works at both global and function scope:
+  ```zer
+  f64 huge = 1e400;         // +inf
+  f64 low  = -1e400;        // -inf
+  f64 tiny = 1e-400;        // underflows to 0.0
+  ```
+  This is the same "arithmetic gets a defined value" rule that makes integer
+  overflow wrap and float-to-int saturate — no trap, no undefined behaviour.
+  (Before BUG-1003 the emitter wrote the bare token `inf`, which GCC refused.)
+- Converting a float to an integer SATURATES and maps NaN to 0. See
+  *Converting a float to an integer* in the SAFETY section.
 - Converting a float to an integer SATURATES and maps NaN to 0. See
   *Converting a float to an integer* in the SAFETY section.
 
@@ -3445,6 +3457,24 @@ u32 main() {
 check written the obvious way falls straight through to the raw cast — the exact UB being
 removed. `u128` / `i128` keep a trap for NaN instead: the bounds are not expressible as
 literals at that width.
+
+**It works in a global initializer too**, where the value is a compile-time constant:
+
+```zer
+u32 gbig = (u32)1e20;      // 4294967295
+u32 gneg = (u32)(-1.5);    // 0
+i8  gmin = (i8)(-1e20);    // -128
+u32 main() {
+    if (gbig != 4294967295) { return 1; }
+    if (gneg != 0)          { return 2; }
+    if ((i32)gmin != -128)  { return 3; }
+    return 0;
+}
+```
+
+A literal that does not fit is a **warning**, not an error — rejecting `(u32)(-1.5)` while
+the same value through a variable is defined would be two spellings disagreeing. (Before
+BUG-1002 the global form emitted a statement expression at file scope, which GCC refused.)
 
 **`@truncate` on a float is a compile error.** `@truncate` means "keep the low bits" and a
 float has none; giving one primitive two unrelated meanings by operand type is the kind of

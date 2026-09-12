@@ -5,6 +5,40 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1002/1003: two float emissions GCC refused, held until the cast policy landed
+
+Both from `claude/loving-davinci-qo0mm9` `afcc7ee` (its 982/983, harvested there from
+`vigilant-tesla-ef9cao`); the other three items of that commit are main's BUG-987..989.
+Held back earlier this session because BUG-1002 lives inside `emit_cast_value`, which
+did not exist on main until BUG-1000. Measured live on main right before adoption: both
+positives failed in GCC (`braced-group within expression allowed only inside a function`
+and `'inf' undeclared`). Tenth gate in `make check`: `tools/audit_float_literal.sh`
+(verified to fire on an injected raw `%.17g` site).
+
+### BUG-1002 — `u32 g = (u32)1e20;` emitted the saturation guard as a statement expression at file scope
+
+The BUG-883 float->int guard is a GCC `({ ... })`, illegal in a static initializer. The
+checker accepts the global (it is a constant), so the failure was GCC's, pointed at the
+user's `.zer` line through `#line`. `emit_f2i_const` now emits the same saturation as a
+C CONSTANT EXPRESSION for the AST operand (the global-initializer path), declining an
+operand with side effects or a volatile read (which re-evaluation would repeat) — neither
+can occur in a constant initializer. The four limits are ONE function `f2i_limits`,
+shared with the statement form, so the two cannot drift.
+
+Test: `tests/zer/f2i_global_saturate_ok.zer`.
+
+### BUG-1003 — a float literal overflowing the double range emitted the bare token `inf`
+
+`%.17g` is exact for finite doubles and prints `inf` / `-inf` / `nan` for the three that
+are not — none a C token. It was spelled at FIVE sites. One helper `emit_double_lit`
+renders them as `__builtin_inf()` / `(-__builtin_inf())` / `__builtin_nan("")` (static-
+initializer-safe, freestanding-safe), NaN tested first. `tools/audit_float_literal.sh`
+fails the build on any float conversion specifier outside the helper.
+
+Test: `tests/zer/float_literal_nonfinite_ok.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-998..1001: factory reach through switch/do-while, `&x` in a spawn arg, one cast policy, optional funcptr return
 
 Cherry-picked from `claude/loving-davinci-qo0mm9` `2864761` (its 977..980, harvested there

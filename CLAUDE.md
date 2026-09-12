@@ -1279,7 +1279,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 | Uninitialized memory | Everything auto-zeroed |
 | Integer overflow | Wraps (defined), never UB |
 | Float -> int out of range | **SATURATES** (defined 2026-08-26, BUG-883, matching Rust `as`). `(u32)1e20` = 4294967295, `(u32)-1.5` = 0, **NaN -> 0** (tested FIRST — every comparison against NaN is false, so without an explicit `v != v` it falls through to the raw cast, which is the UB being removed). Identical at -O0 and -O2; the same program gave 4294967295 and 0 before. u128/i128 keep a NaN trap (the bounds are not expressible at that width). |
-| Silent truncation | Must `@truncate` or `@saturate` explicitly |
+| Silent truncation | Must `@truncate` or `@saturate` explicitly. The COMPOUND spelling follows the plain one: `a += f` (int += float, or float += int) is rejected like `a = f` (BUG-995 — it used to be a raw C conversion that bypassed the float->int saturation) |
 | Missing switch case | Exhaustive check for enums and bools |
 | Dangling pointer | Scope escape analysis (walks field/index chains, catches struct fields + globals + orelse fallbacks + @cstr buffers + array→slice coercion + struct wrapper returns + @ptrtoint(&local) direct and indirect escape) |
 | Union type confusion | Cannot mutate union variant during mutable switch capture |

@@ -5,6 +5,50 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-992..995: an i64 literal that only fit at 64 bits, every trap pointing at the wrong line, a minted `*bool`, and `a += f`
+
+Adopted from `claude/loving-davinci-vgonmt` `f1265ee` + `085671b` (its 991/992 and
+1001/1002; originally `vigilant-tesla-lzmkhn` / `-fhf8rn`). Survey class-10 rows: i64 literal
+range (3), bool minting (2), compound float/int (3). Every reproducer compiled clean on main.
+
+### BUG-992 — an over-range literal was rejected at every signed width except i64
+
+`is_literal_compatible` said `return true;` for `TYPE_I64` ("positive literal fits in i64") —
+false above 2^63-1 — so `i64 x = 18446744073709551615;` compiled and `x` was -1 at every sink
+that routes through the predicate (var-decl, assignment, struct-literal field, call argument,
+return, global init), while `i16 a = 40000;` is a hard error. The `iN` sibling had `>= 64`
+(65..128 bits genuinely always fit; exactly 64 needs the signed bound) and the NEGATIVE half
+wrapped to 1. Corpus cost zero. Boundary asserted at runtime by
+`tests/zer/int_literal_signed_bounds_ok.zer`; negatives `tests/zer_fail/i64_literal_{above_max,below_min,over_range_sinks}.zer`.
+
+### BUG-993 — every runtime trap named a line that does not exist
+
+Function bodies are IR-only and block emission switched `#line` mapping off wholesale (the
+BUG-418 collision with goto labels and statement expressions), so a 7-line file reported
+"line 15" — the function's line plus the offset in the generated C. The trap fired
+correctly; only the location lied, which is why nothing caught it. `emit_line_map`
+re-anchors per INSTRUCTION (regular and async IR emitters), between statements at column 0,
+BEFORE the auto-guards. `tests/test_zer.sh` gains `// expect-trap-at: N` (the trap runner
+used to discard stderr entirely). Measured after: an OOB slice index on line 4 reports line 4.
+
+### BUG-994 — `@ptrcast(*bool, u8ptr)` and `@inttoptr(*bool, addr)` minted a pointer to a bool that is neither true nor false
+
+The two pointer-minting doors were closed for an ENUM pointee and open for the other
+constrained type: a load through a minted `*bool` yielded 2, and `b == true` / `b == false`
+were BOTH false. `@ptrcast` fires when either pointee is an enum or a bool and the pointees
+differ; `@inttoptr` uses `type_carries_bool_c`, the bool twin of `type_carries_enum_c`.
+`@pun` was already closed for bool by BUG-987. Tests: `tests/zer_fail/bool_mint_{ptrcast,inttoptr}.zer`.
+
+### BUG-995 — `a += f` (int += float) bypassed the float->int saturation
+
+`a = f` is refused; `a += f` was accepted as a raw C conversion, undefined out of range
+(measured with `f = 1e20`: 0 at -O0, 255 at -O2). The compound arm of NODE_ASSIGN now rejects
+a float/integer domain mix, naming the explicit form (`a += (u32)f` saturates). Corpus cost
+zero. Tests: `tests/zer_fail/compound_{float_into_int,int_into_float}.zer`; positive
+`tests/zer/compound_assign_same_domain_ok.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-990/991: the off-by-N loop is a compile error; the IR intrinsic fallback is loud
 
 Adopted from `claude/loving-davinci-vgonmt` `a40104b` (its BUG-958/959; originally

@@ -5,6 +5,39 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-996/997: the MMIO base nobody could fold, and a global initialized from a global
+
+Hand-applied from `claude/loving-davinci-vgonmt` `565f1b1` (its 944/942, from
+`vigilant-tesla-o51x9p`); the same commit's const-cycle hang is main's BUG-975 and its
+reference-audit directive landed with BUG-990, so the commit was not cherry-picked whole.
+Survey class-10 rows MMIO const-ident (3, one of them MASKED) and global-init (1) close.
+
+### BUG-996 — a `const`-named MMIO base was the one spelling nobody could fold
+
+"What constant address does this `@inttoptr` designate?" was answered at FOUR sites with
+plain `eval_const_expr`, which stops at an identifier. So `const u32 UART = 0x4000_0000;
+volatile *u32 r = @inttoptr(*u32, UART);` derived no bound — `r[i]` was REJECTED outright
+("no compile-time MMIO bound is known for this pointer") — and an out-of-range or misaligned
+const address DEFERRED its diagnostic to a runtime trap on first boot. ONE query
+`mmio_const_addr` (over `eval_const_expr_scoped`, bounded by BUG-975's depth-threaded
+resolver) at all four sites: strictly tightens the two error gates, strictly relaxes the two
+bound derivations. Tests: `tests/zer_fail/mmio_const_ident_{oob_addr,misaligned,oob_index}.zer`
+(the third was MASKED by the over-rejection), positive `tests/zer/mmio_const_ident_base.zer`.
+
+### BUG-997 — six invalid-C global-initializer shapes, and one that must be refused
+
+A global initialized from a `const` of any type other than a non-negative integer emitted
+the NAME at file scope and GCC refused it ("initializer element is not constant") in a
+file the user never opened: a negative const, a float, a bool, an intrinsic init
+(`@size(u32) * 4`), a slice, and the name anywhere inside an expression (`K + 1.0`). The
+emitter now substitutes the referenced `const` global's OWN initializer
+(`Emitter.global_init_depth`) — correct by construction, that expression already passed the
+global-initializer rules for ITS declaration. A MUTABLE global is genuinely not a constant
+and is rejected at the ZER line. Tests: `tests/zer/global_init_const_fold_ok.zer`,
+`tests/zer_fail/global_init_from_mutable.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-992..995: an i64 literal that only fit at 64 bits, every trap pointing at the wrong line, a minted `*bool`, and `a += f`
 
 Adopted from `claude/loving-davinci-vgonmt` `f1265ee` + `085671b` (its 991/992 and

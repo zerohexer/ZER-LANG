@@ -322,13 +322,13 @@ The two MASKED `opt_param_*` entries below are closed by the same change. Two re
 recorded as their own OPEN entries above the survey.
 
 **10. SMALLER CLASSES**
-- i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
-- `bool` minting via `@ptrcast`/`@inttoptr` (2) — `vgonmt`: `bool_mint_ptrcast` `bool_mint_inttoptr`
-- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s `mmio_volatile_index_reject`
-- global init (2) — `qo0mm9`: `global_init_from_mutable` `global_init_chain_too_deep`
+- ~~i64 literal range (3)~~ — CLOSED 2026-09-12 as BUG-992
+- ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED 2026-09-12 as BUG-994
+- ~~MMIO const-ident (2)~~ — CLOSED 2026-09-12 as BUG-996 (`mmio_const_addr`, one query at four sites; the MASKED `_oob_index` below closes with it); `ppnatu`'s `mmio_volatile_index_reject` still open
+- ~~global init (2)~~ — CLOSED: `global_init_chain_too_deep` as BUG-975, `global_init_from_mutable` 2026-09-12 as BUG-997 (a const global's initializer is substituted by the emitter; a mutable one is rejected at the ZER line)
 - multiview UAF (2) — `vgonmt`: `multiview_assign_uaf` `multiview_branch_join_uaf`
 - struct-init field (2) — `vgonmt`: `struct_init_field_uaf` `struct_init_field_move`
-- compound float↔int (2) — TAKE `vgonmt`: `compound_float_into_int` `compound_int_into_float`; `qo0mm9`'s single is `compound_assign_int_float`
+- ~~compound float↔int (2)~~ — CLOSED 2026-09-12 as BUG-995
 - RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init`
 - `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target`
 - funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding`
@@ -346,9 +346,8 @@ recorded as their own OPEN entries above the survey.
 Found by re-running the "already rejected" bucket against each test's own `expect-error`.
 A rejection is not a closure until the REASON matches.
 
-- `mmio_const_ident_oob_index` (`qo0mm9`, `vgonmt`) — wants *"MMIO index 9 is out of range"*,
-  gets *"cannot index volatile '*u32'"*. A different rule fires first; the MMIO range check
-  is never reached. Pairs with `mmio_const_ident_oob_addr` / `_misaligned` in class 10.
+- ~~`mmio_const_ident_oob_index`~~ — CLOSED 2026-09-12 with BUG-996: the const base now
+  derives the bound, so the index rule fires with its own reason.
 - ~~`opt_param_drop_then_caller_uaf`~~ / ~~`opt_param_other_optional_null_path_maybe`~~ —
   CLOSED 2026-09-12 with class 9 (BUG-985): both now report the wanted reason.
 

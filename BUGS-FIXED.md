@@ -5,6 +5,80 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1008..1014: seven holes from `vigilant-tesla-1zukjq` via `vgonmt` (survey class 7)
+
+Cherry-picked `claude/loving-davinci-vgonmt` `e867110` (its 976..982, from `1zukjq`
+`c060f36` 913..921), renumbered. Measured on main first: `multiview_assign_uaf`,
+`multiview_branch_join_uaf`, `param_local0_double_free`, `struct_init_field_uaf` and
+`struct_init_field_move` compiled clean; `struct_field_method_names_ok` failed in GCC
+(both BUG-1009 and BUG-1010); `union_switch_foreign_tag` ran to exit 0 instead of
+trapping. The two `cast_launder_*` negatives were already rejected on main (BUG-931) and
+are kept as regression pins. One conflict: the struct-init alias loop keeps main's
+BUG-984 shape (a value with no bare handle may still CARRY allocations, so no early
+`continue`), with the branch's move-transfer half added in front of it.
+
+### BUG-1008 — a union `switch` with a non-variant tag matched NO arm and silently did nothing
+
+A union read through `@inttoptr(*U, addr)` with tag 77 fell through to the statement
+after the switch — no diagnostic, no fault. The union chain keeps its last comparison
+(only the ENUM chain elides one), so the guard goes in FRONT of the whole chain, in its
+own block reached by an unconditional goto carrying the union type in `cast_type` and the
+hoisted pointer local in `src1_local`; the emitter's IR_GOTO renders
+`if ((unsigned)(p->_tag) >= N) _zer_trap(...)`. One block, one edge, one predecessor — no
+join, so the CFG merge sees the shape it saw before. Test:
+`tests/zer_trap/union_switch_foreign_tag.zer`; `tests/zer/enum_union_switch_totality_ok.zer`.
+
+### BUG-1009 — the IR emitter rewrote ANY `<ident>.join(...)` to `pthread_join` on the NAME alone
+
+`struct Ops { *(u32) -> u32 join; }` — `s.join(41)` emitted `pthread_join(s, NULL)`,
+every argument dropped. Its own comment claimed a type check; `ot` was computed below
+the branch. Now gated on the receiver being the `u64` a ThreadHandle is declared as.
+
+### BUG-1010 — a function-pointer FIELD called through a Handle emitted `h.fn(...)` on a `uint64_t`
+
+Reads and writes auto-dereffed through the shared NODE_FIELD path; only the decomposed
+CALL site had a second, hand-rolled copy of field emission. Delegated to the shared path.
+Test for both: `tests/zer/struct_field_method_names_ok.zer`.
+
+### BUG-1011 — alloc_id 0 was both the "untracked" sentinel AND a legal id minted from local 0
+
+`void f(Holder hd) { Handle(Item) k = hd.h; free(k); free(hd.h); }` compiled clean while
+`void f(u32 pad, Holder hd)` was rejected — a double free accepted or rejected by
+parameter position alone, because `hd` is local 0 and its compound handle got alloc_id 0,
+which two propagation sites `return` on. Fixed by making the id spaces disjoint
+(`ir_alloc_id_of_local` = id + 1, ONE function at every minting site, including
+`ir_register_alloc_result`'s two), not by special-casing the collision. Test:
+`tests/zer_fail/param_local0_double_free.zer`.
+
+### BUG-1012 — `IR_STRUCT_INIT_DECOMP` never ran the UAF walkers, and never reached the move sink
+
+`pool.free_ptr(t); Holder h = { .t = t };` was accepted (the assignment spelling was
+rejected); `Holder h = { .t = a };` for a `move struct a` consumed nothing. The walkers
+already descend NODE_STRUCT_INIT; the case now calls them, and routes a move-struct
+operand through `ir_mark_transferred` like every other consume sink. Tests:
+`tests/zer_fail/struct_init_field_{uaf,move}.zer`.
+
+### BUG-1013 — the multi-view call result was registered only at the var-decl sink, and the merge dropped the view set
+
+`[*]u8 h = x; h = pick(x, y, f); free(y); h[0]` was accepted (the var-decl spelling
+rejected); and `if (c) { h = pick(x, y, f); }` erased the set at the join. ONE function
+`ir_fill_multiview_set` serves both sinks; the merge is a UNION with the overflow flag
+ORed. Tests: `tests/zer_fail/multiview_{assign,branch_join}_uaf.zer`.
+
+### BUG-1014 (latent) — leak-report sites indexed `func->locals[h->local_id]` with no bounds check
+
+`IR_GLOBAL_ROOT_ID` (-2) is a legal `local_id`, kept out only by a convention stated as a
+request in a comment. Now a check. Also two NULL derefs of `type_unwrap_distinct` in the
+move predicates.
+
+Also from the same commit: reference.md gains a LEXICAL chapter (comments, char and
+string escape sets, `0x`/`0b` and the absence of octal, the reserved prefix), the
+structured `asm { }` block rules, the missing CLI flags and argument-order rule, the
+reserved auto-slab method names, the switch totality guarantee, and the "what a C-style
+cast cannot do" table. Reference audit: 224 blocks, 0 failed.
+
+---
+
 ## Session 2026-09-12 — BUG-1006/1007: the RMW rule was per-STATEMENT, so splitting it over two hid it (survey class 6); matrices honour ZER_MATRIX_ZERC
 
 Cherry-picked from `claude/loving-davinci-vgonmt` `27e4987` (its 974/975, from

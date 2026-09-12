@@ -2045,7 +2045,14 @@ still evades it, because the rule is per-STATEMENT:
 
 ---
 
-### CLASS 7 — VIEW / STRUCT-INIT FIELD (HIGH, accept-unsafe) — `1zukjq`
+### ~~CLASS 7 — VIEW / STRUCT-INIT FIELD~~ — **CLOSED 2026-09-06 as BUG-1011..981, DO NOT REDO**
+
+> Cherry-picked `1zukjq` `c060f36` (BUG-1008..982), reconciled: their enum totality guard
+> is BUG-950 (only the UNION half taken, as BUG-1008), their `@cast` launder is BUG-931, their
+> alloc registration is BUG-933. All five CLASS 7 negatives reject; `param_local0_double_free`
+> was the alloc_id-0 sentinel collision (BUG-1011). The branch's `enum_switch_foreign_value`
+> trap test is NOT taken: its route (`@inttoptr(*St, addr)`) is rejected by BUG-970, and the
+> guarded route is pinned by `mmio_enum_via_bitcast_trap.zer`. Original:
 
     // multiview_assign_uaf — a reassigned slice view loses which allocation it names
     [*]u8 pick([*]u8 a, [*]u8 b, bool fl) { if (fl) { return b[0..1]; } return a[0..1]; }

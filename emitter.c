@@ -947,7 +947,10 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * step — they answer the same question for the same rule, the checker deciding
  * whether to care and the emitter deciding where to look. */
 static bool type_carries_enum_e(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    /* BUG-975: by-value nesting is acyclic, so the guard is a safety net; past it
+     * answer "carries" so the guard walker below is still asked. */
+    if (depth > 512) return true;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
@@ -1019,9 +1022,39 @@ static void emit_try_enum_close(Emitter *e, Type *t) {
     emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
 }
 
+/* Build "<path><suffix>" on the heap. BUG-975: the old `char sub[256]` silently
+ * TRUNCATED a long access path (snprintf), so past ~256 characters the guard was
+ * emitted against the wrong lvalue (or did not compile). Rule #7: no fixed
+ * buffers for data the program sizes. Caller frees. */
+static char *enum_guard_subpath(const char *path, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int suffix_len = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    size_t plen = strlen(path);
+    char *out = (char *)malloc(plen + (size_t)(suffix_len < 0 ? 0 : suffix_len) + 1);
+    if (!out) { va_end(ap2); fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+    memcpy(out, path, plen);
+    vsnprintf(out + plen, (size_t)(suffix_len < 0 ? 0 : suffix_len) + 1, fmt, ap2);
+    va_end(ap2);
+    return out;
+}
+
 static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                                          const char *what, int depth) {
-    if (!t || depth > 8) return;
+    if (!t) return;
+    /* BUG-975: this walker STOPPED at depth 8 — so an enum forged 11 structs
+     * deep via @bitcast was never guarded and the non-variant value ran (the
+     * shallow control trapped). By-value nesting is acyclic, so the limit is a
+     * safety net; if it ever trips, trap unconditionally rather than skip: a
+     * guard that cannot be emitted is a value that cannot be vouched for. */
+    if (depth > 512) {
+        emit(e, "_zer_trap(\"%s produced a value nested too deeply for the enum "
+                "variant guard to verify\", __FILE__, __LINE__); ", what);
+        return;
+    }
     Type *u = type_unwrap_distinct(t);
     if (!u) return;
     TypeKind k = type_dispatch_kind(u);
@@ -1040,11 +1073,11 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
         for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
             Type *ft = u->struct_type.fields[i].type;
             if (!type_carries_enum_e(ft, 0)) continue;
-            char sub[256];
-            snprintf(sub, sizeof(sub), "%s.%.*s", path,
+            char *sub = enum_guard_subpath(path, ".%.*s",
                      (int)u->struct_type.fields[i].name_len,
                      u->struct_type.fields[i].name);
             emit_enum_variant_guard_path(e, ft, sub, what, depth + 1);
+            free(sub);
         }
         return;
     }
@@ -1053,24 +1086,27 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
         if (!type_carries_enum_e(in, 0)) return;
         /* Only the payload of a PRESENT optional is meaningful; a null one
          * carries whatever the zeroing left, which is not a forged variant. */
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s.value", path);
+        char *sub = enum_guard_subpath(path, ".value");
         emit(e, "if (%s.has_value) { ", path);
         emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
+        free(sub);
         return;
     }
     if (k == TYPE_ARRAY) {
         Type *in = u->array.inner;
         if (!type_carries_enum_e(in, 0)) return;
-        if (u->array.size == 0 || u->array.size > 4096) return;
+        /* BUG-975: `size > 4096 -> return` was a silent skip — a `Color[5000]`
+         * forged through @bitcast was never guarded. The guard is a runtime
+         * loop, so its cost is the array's, not the compiler's; no cap. */
+        if (u->array.size == 0) return;
         int li = e->temp_count++;
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s[_zer_egi%d]", path, li);
+        char *sub = enum_guard_subpath(path, "[_zer_egi%d]", li);
         emit(e, "for (size_t _zer_egi%d = 0; _zer_egi%d < %llu; _zer_egi%d++) { ",
              li, li, (unsigned long long)u->array.size, li);
         emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
         emit(e, "} ");
+        free(sub);
         return;
     }
     /* A UNION is TAGGED in ZER, so its payload is only readable through the
@@ -3791,13 +3827,34 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; ");
-                emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                /* BUG-979: an ARRAY source DECAYS under `__auto_type` (`__auto_type
+                 * b = a` makes b a `uint8_t *`, sizeof 8), so `memcpy(&bco, &bci, N)`
+                 * copied the POINTER's bytes — a wrong value for `@bitcast(u64, u8[8])`
+                 * and an over-read past the pointer for anything wider. An array
+                 * expression already denotes its bytes, so copy from it directly. */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_expr(e, bsrc);
+                    emit(e, "; ");
+                }
+                /* BUG-978: an ARRAY target (`@bitcast(Color[50], raw)`) needs a C
+                 * DECLARATOR (`int32_t _zer_bco0[50]`), not the type spelled before
+                 * the name; emit_type alone produced `int32_t[50] _zer_bco0` and GCC
+                 * rejected the generated file with no ZER diagnostic. */
+                { char bco[40]; int bl = snprintf(bco, sizeof bco, "_zer_bco%d", tmp);
+                  emit_type_and_name(e, t, bco, (size_t)bl); }
+                if (src_is_array) {
+                    emit(e, "; memcpy(&_zer_bco%d, (", tmp);
+                    emit_expr(e, bsrc);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, "; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
@@ -8470,13 +8527,28 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "; ");
-                emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                /* BUG-979 / BUG-978: IR twin of the AST-path handler above — an
+                 * array SOURCE is copied from directly (it decays under
+                 * `__auto_type`), an array TARGET is declared with a declarator. */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_rewritten_node(e, bsrc, func);
+                    emit(e, "; ");
+                }
+                { char bco[40]; int bl = snprintf(bco, sizeof bco, "_zer_bco%d", tmp);
+                  emit_type_and_name(e, t, bco, (size_t)bl); }
+                if (src_is_array) {
+                    emit(e, "; memcpy(&_zer_bco%d, (", tmp);
+                    emit_rewritten_node(e, bsrc, func);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, "; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)

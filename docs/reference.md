@@ -2207,6 +2207,20 @@ Checks qualifier preservation (const, volatile).
 u32 bits = @bitcast(u32, my_i32);  // same bits, different type
 ```
 
+**ARRAYS**
+- `@bitcast` cannot TARGET an array type. An array is not an assignable C value,
+  so `Color[50] cs = @bitcast(Color[50], raw);` has nothing to hand back — before
+  BUG-1016 it emitted invalid C (a GCC error at a generated line), and with the
+  declarator fixed the value would simply have been discarded. Wrap the array in a
+  struct (`struct W { T[N] a; }`) and bitcast to that; the bits are the same.
+- `@bitcast` FROM an array copies the array's BYTES: `u64 v = @bitcast(u64, a);`
+  with `u8[8] a` yields the eight bytes of `a`. (Before BUG-1018 it copied the
+  bytes of the decayed POINTER — the address of `a` — and over-read past it for a
+  wider target.)
+- The enum variant guard a `@bitcast` emits walks EVERY element of an array target
+  and every nesting level of a struct target; there is no size or depth past
+  which a forged variant goes unchecked (BUG-1019).
+
 ---
 
 ### @cast(T, val)

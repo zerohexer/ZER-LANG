@@ -3553,6 +3553,13 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
 #define RMW_ALIAS_MAX 16
 static struct { const char *name; uint32_t len; Symbol *global; } _rmw_alias[RMW_ALIAS_MAX];
 static int _rmw_alias_count = 0;
+/* BUG-1017: entries below the base belong to an ENCLOSING scan scope. A callee
+ * entered through a funcptr binding (no arguments, no bindings) must not see the
+ * caller's `p -> g` rows — the old code called rmw_alias_reset() mid-scan for
+ * that, which WIPED the table for the rest of the caller too, so a
+ * `*() fp = noop;` between `volatile *u32 p = &g` and `*p += 1` unflagged the
+ * RMW. Base-shift on entry, restore on exit; nothing is ever lost. */
+static int _rmw_alias_base = 0;
 static bool _rmw_alias_overflow = false;   /* BUG-976: the table filled */
 /* BUG-971: STATIC LOCALS seen while scanning reachable bodies.
  *
@@ -3627,7 +3634,7 @@ static const char *scan_finding_noun(void) {
  * a fixed table that silently drops its 17th row is the BUG-976 defect. */
 static RmwTaintEnt *_rmw_vtaint = NULL;
 static int _rmw_vtaint_count = 0, _rmw_vtaint_cap = 0;
-static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
+static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_alias_base = 0; _rmw_flagged_rmw = false;
                                     _rmw_vtaint_count = 0; /* BUG-1006 */
                                     _rmw_alias_overflow = false;
                                     _static_local_count = 0; _static_local_overflow = false;
@@ -3644,7 +3651,8 @@ static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = fal
  * global the function does alias, the message stays true about the operation being a
  * non-atomic RMW, and the alternative (silence) is a shipped data race. */
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
-    for (int i = 0; i < _rmw_alias_count; i++)
+    /* newest binding first, and never below the current scope's base (BUG-1017) */
+    for (int i = _rmw_alias_count - 1; i >= _rmw_alias_base; i--)
         if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
             return _rmw_alias[i].global;
     if (_rmw_alias_overflow && _rmw_alias_count > 0)
@@ -3672,68 +3680,91 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
 static bool assign_reads_own_target(Node *value, Symbol *tgt);
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
-static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
-    if (depth > 16) return true;   /* BUG-976: unknown -> assume it mentions it */
+/* Does this expression mention the identifier `nm`? Used to recognise a
+ * WRITTEN-OUT read-modify-write (`*p = *p + 1` / `g = g + 1`) at both race sinks.
+ *
+ * BUG-1015 (the BUG-856 sibling): this was TWO if-chains (one keyed on a name, one
+ * on a Symbol) that each listed a handful of node kinds and answered "no" for the
+ * rest. Both were live holes at BOTH sinks (spawn and ISR):
+ *
+ *     g = pick({ .a = g }).a + 1;        // struct-init: an unlisted kind -> "no"
+ *
+ * so the read of `g` was invisible, the store was classed as a plain store, and a
+ * lost-update race compiled clean. ONE walker now, a no-`default:` switch so a
+ * new NodeKind fails the build under -Werror=switch, every kind that can carry an
+ * expression descends, and the overflow answer is "mentioned" — the reject
+ * direction (BUG-976). Statement kinds are descended too (mirrors global_init_scan)
+ * so the walk stays TOTAL if the AST ever grows an expression-bearing statement. */
+static bool expr_mentions_ident(Node *e, const char *nm, uint32_t nl, int depth) {
     if (!e || !nm) return false;
-    if (e->kind == NODE_IDENT)
+    if (depth > 256) return true;   /* unverifiable => assume mentioned */
+    #define EM(x) do { if (expr_mentions_ident((x), nm, nl, depth + 1)) return true; } while (0)
+    switch (e->kind) {
+    case NODE_IDENT:
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
-               expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
-}
-
-static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    /* BUG-976: a read of `g` 14 levels into an expression is still a read of `g`. */
-    if (depth > 12) return true;
-    if (!e || !g) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    /* BUG-856: INTRINSIC / CALL / ORELSE were missing, so a read of the global
-     * laundered through any of them did not count as reading it and the write was
-     * classified as a plain store rather than a read-modify-write:
-     *     g = @truncate(u32, g) + 1;    // ACCEPTED at both the spawn and ISR sinks
-     *     g = g + 1;                    // correctly REJECTED
-     * An interrupt or a concurrent thread landing between the load and the store
-     * loses the update, silently.
-     *
-     * This function is an if/else CHAIN, which is why NEITHER gate could see the
-     * gap: walker_default_audit greps kind-SWITCHES, and audit_walker_fields reads
-     * `case` arms. 39294y called that out explicitly and it held — the field audit
-     * reported this file's OTHER walkers and never this one. Recorded here so the
-     * next person knows the chain form is a blind spot, not a clean bill. */
-    if (e->kind == NODE_INTRINSIC) {
-        for (int i = 0; i < e->intrinsic.arg_count; i++)
-            if (expr_mentions_global(e->intrinsic.args[i], g, depth + 1)) return true;
+    case NODE_BINARY:   EM(e->binary.left); EM(e->binary.right); return false;
+    case NODE_UNARY:    EM(e->unary.operand); return false;
+    case NODE_FIELD:    EM(e->field.object); return false;
+    case NODE_INDEX:    EM(e->index_expr.object); EM(e->index_expr.index); return false;
+    case NODE_TYPECAST: EM(e->typecast.expr); return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) EM(e->intrinsic.args[i]);
+        return false;
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++) EM(e->call.args[i]);
+        EM(e->call.callee);
+        return false;
+    case NODE_ORELSE:   EM(e->orelse.expr); EM(e->orelse.fallback); return false;
+    case NODE_SLICE:    EM(e->slice.object); EM(e->slice.start); EM(e->slice.end); return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) EM(e->struct_init.fields[i].value);
+        return false;
+    case NODE_ASSIGN:   EM(e->assign.target); EM(e->assign.value); return false;
+    case NODE_ASM:
+        for (int i = 0; i < e->asm_stmt.input_count; i++)  EM(e->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < e->asm_stmt.output_count; i++) EM(e->asm_stmt.outputs[i].expr);
+        return false;
+    /* Statement kinds — an RMW value is an expression, so none can occur below one;
+     * descended anyway so the walk is total (see global_init_scan). */
+    case NODE_FILE:      for (int i = 0; i < e->file.decl_count; i++) EM(e->file.decls[i]); return false;
+    case NODE_FUNC_DECL: EM(e->func_decl.body); return false;
+    case NODE_INTERRUPT: EM(e->interrupt.body); return false;
+    case NODE_BLOCK:     for (int i = 0; i < e->block.stmt_count; i++) EM(e->block.stmts[i]); return false;
+    case NODE_IF:        EM(e->if_stmt.cond); EM(e->if_stmt.then_body); EM(e->if_stmt.else_body); return false;
+    case NODE_FOR:       EM(e->for_stmt.init); EM(e->for_stmt.cond); EM(e->for_stmt.step); EM(e->for_stmt.body); return false;
+    case NODE_WHILE: case NODE_DO_WHILE: EM(e->while_stmt.cond); EM(e->while_stmt.body); return false;
+    case NODE_SWITCH:
+        EM(e->switch_stmt.expr);
+        for (int i = 0; i < e->switch_stmt.arm_count; i++) EM(e->switch_stmt.arms[i].body);
+        return false;
+    case NODE_GLOBAL_VAR: case NODE_VAR_DECL: EM(e->var_decl.init); return false;
+    case NODE_RETURN:    EM(e->ret.expr); return false;
+    case NODE_DEFER:     EM(e->defer.body); return false;
+    case NODE_CRITICAL:  EM(e->critical.body); return false;
+    case NODE_ONCE:      EM(e->once.body); return false;
+    case NODE_AWAIT:     EM(e->await_stmt.cond); return false;
+    case NODE_STATIC_ASSERT: EM(e->static_assert_stmt.cond); return false;
+    case NODE_SPAWN:     for (int i = 0; i < e->spawn_stmt.arg_count; i++) EM(e->spawn_stmt.args[i]); return false;
+    case NODE_EXPR_STMT: EM(e->expr_stmt.expr); return false;
+    /* genuine leaves — exhaustive, no default: */
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL:
+    case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO:
+    case NODE_CONTAINER_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
-    if (e->kind == NODE_CALL) {
-        for (int i = 0; i < e->call.arg_count; i++)
-            if (expr_mentions_global(e->call.args[i], g, depth + 1)) return true;
-        return expr_mentions_global(e->call.callee, g, depth + 1);
-    }
-    if (e->kind == NODE_ORELSE)
-        return expr_mentions_global(e->orelse.expr, g, depth + 1) ||
-               expr_mentions_global(e->orelse.fallback, g, depth + 1);
-    if (e->kind == NODE_SLICE)
-        return expr_mentions_global(e->slice.object, g, depth + 1) ||
-               expr_mentions_global(e->slice.start, g, depth + 1) ||
-               expr_mentions_global(e->slice.end, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    #undef EM
+    return false;
+}
+static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
+    return expr_mentions_ident(e, nm, nl, depth);
+}
+static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
+    if (!g) return false;
+    return expr_mentions_ident(e, g->name, g->name_len, depth);
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
     return expr_mentions_global(value, tgt, 0);
@@ -9150,8 +9181,12 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body &&
+                !(cs->walk_on_path & ZER_WALK_ATOMIC)) {   /* BUG-1017 cycle cut */
+                cs->walk_on_path |= ZER_WALK_ATOMIC;
                 record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, 0);
+                cs->walk_on_path &= (uint8_t)~ZER_WALK_ATOMIC;
+            }
         }
 
         /* 8th funcptr REACH form (2026-08-10): a CALLER-supplied funcptr FORWARDED
@@ -12491,6 +12526,18 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-1016: an ARRAY target is not expressible. The old emission
+                 * (`int32_t[50] _zer_bco0`) was a GCC error with no ZER diagnostic;
+                 * with the declarator fixed the value was silently DISCARDED — an
+                 * array is not an assignable C value, and the block-scoped array a
+                 * statement expression would hand back dies with the block. The
+                 * struct-wrapper spelling is the same bits with a real value type.
+                 * Corpus cost: zero. */
+                if (type_dispatch_kind(result) == TYPE_ARRAY) {
+                    checker_error(c, node->loc.line,
+                        "@bitcast cannot target an array type — wrap the array in a "
+                        "struct (`struct W { T[N] a; }`) and bitcast to that");
+                }
                 /* validate same width */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
@@ -14855,6 +14902,62 @@ static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int d
 static int _scan_global_depth = 0;
 static bool scan_unsafe_global_access(Checker *c, Node *node,
                                       const char **out_name, uint32_t *out_len);
+/* BUG-1017: the CYCLE CUT for the spawn race scan. Returns true when `cs` is
+ * already on the current descent path, in which case the caller must NOT
+ * re-enter it: its body is being scanned right now, with its own bindings. What
+ * a re-walk WOULD add is only the binding-dependent half — an RMW through a
+ * parameter that THIS call binds to a global — and that comes from the memoised
+ * per-function summary (`func_rmw_param_mask`, BUG-801) instead. `*found` says
+ * whether the cut itself yielded a finding.
+ *
+ * Before this, a recursive callee reachable from a spawn target (`fib`) walked
+ * itself until the depth cap tripped and was then REPORTED as a call chain too
+ * deep to analyse — a valid program refused — and two self-calls made the walk
+ * exponential on the way there. `call` may be NULL (a funcptr-bound function:
+ * no arguments, no bindings). */
+static bool spawn_scan_cycle_cut(Checker *c, Symbol *cs, Node *call,
+                                 const char **out_name, uint32_t *out_len,
+                                 bool *found) {
+    *found = false;
+    if (!(cs->walk_on_path & ZER_WALK_RACE)) return false;
+    if (!call || call->kind != NODE_CALL) return true;
+    uint64_t m = func_rmw_param_mask(c, cs, 0);
+    for (int ai = 0; m && ai < call->call.arg_count && ai < 64; ai++) {
+        if (!(m & (1ULL << ai))) continue;
+        Symbol *tg = rmw_arg_target_global(c, call->call.args[ai]);
+        if (!tg || tg->is_function || tg->is_const) continue;
+        if (tg->is_volatile) _rmw_flagged_rmw = true;
+        *out_name = tg->name; *out_len = tg->name_len;
+        *found = true;
+        return true;
+    }
+    return true;
+}
+/* The three funcname descents (factory return, funcptr binding, function-name
+ * argument) enter a callee with NO bindings. One helper: cycle cut, loud depth
+ * cap (BUG-976 — "did not look" must not read as "found nothing"), base-shifted
+ * alias table, on-path mark. */
+static bool spawn_scan_enter_unbound(Checker *c, Symbol *fs,
+                                     const char **out_name, uint32_t *out_len) {
+    bool cut_found;
+    if (spawn_scan_cycle_cut(c, fs, NULL, out_name, out_len, &cut_found))
+        return cut_found;
+    if (_scan_global_depth >= 32) {
+        _scan_depth_exceeded = true;
+        *out_name = fs->name; *out_len = fs->name_len;
+        return true;
+    }
+    int saved_base = _rmw_alias_base, saved_count = _rmw_alias_count;
+    _rmw_alias_base = _rmw_alias_count;
+    fs->walk_on_path |= ZER_WALK_RACE;
+    _scan_global_depth++;
+    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+                                           out_name, out_len);
+    _scan_global_depth--;
+    fs->walk_on_path &= (uint8_t)~ZER_WALK_RACE;
+    _rmw_alias_count = saved_count; _rmw_alias_base = saved_base;
+    return found;
+}
 /* SPAWN-FP: if `n` is a function NAME (ident → a global function with a body),
  * descend into that body. A function bound to a LOCAL funcptr and then called
  * (`*() fp = do_inc; fp();`), or stored in a funcptr struct field, has callee
@@ -14884,13 +14987,7 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         if (!fs || !fs->is_function || !fs->func_node ||
             fs->func_node->kind != NODE_FUNC_DECL ||
             !fs->func_node->func_decl.body) return false;
-        if (_scan_global_depth >= 32) return false;
-        _scan_global_depth++;
-        rmw_alias_reset();
-    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
-                                               out_name, out_len);
-        _scan_global_depth--;
-        return found;
+        return spawn_scan_enter_unbound(c, fs, out_name, out_len);   /* BUG-1017 */
     }
     /* BUG-998 (2026-09-12): this was an if/else CHAIN over five kinds
      * (RETURN/BLOCK/IF/WHILE/FOR). A `return <racy funcname>` sitting in any
@@ -14988,13 +15085,7 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     if (!fs || !fs->is_function || !fs->func_node ||
         fs->func_node->kind != NODE_FUNC_DECL ||
         !fs->func_node->func_decl.body) return false;
-    if (_scan_global_depth >= 32) return false;
-    _scan_global_depth++;
-    rmw_alias_reset();
-    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
-                                           out_name, out_len);
-    _scan_global_depth--;
-    return found;
+    return spawn_scan_enter_unbound(c, fs, out_name, out_len);   /* BUG-1017 */
 }
 
 /* SPAWN funcptr-STRUCT-FIELD race (2026-08-03). Two helpers, used together as a
@@ -15372,13 +15463,18 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                      * and "did not look" must not read as "found nothing". Report,
                      * naming the callee we refused to descend into — that is the
                      * actionable half, and the noun says why. */
-                    if (_scan_global_depth >= 32) {
+                    /* BUG-1017: a callee already on the path is not re-entered;
+                     * its RMW-through-param facts for THIS call's bindings come
+                     * from the memoised summary. */
+                    bool cut_found;
+                    if (spawn_scan_cycle_cut(c, csym, node, out_name, out_len, &cut_found)) {
+                        if (cut_found) return true;
+                    } else if (_scan_global_depth >= 32) {
                         _scan_depth_exceeded = true;
                         *out_name = node->call.callee->ident.name;
                         *out_len  = (uint32_t)node->call.callee->ident.name_len;
                         return true;
-                    }
-                    if (_scan_global_depth < 32) {
+                    } else {
                         _scan_global_depth++;
                         /* BUG-792: bind each `f(&counter)` argument to the callee's
                          * PARAM name before descending, so a `*p += 1` inside the
@@ -15388,6 +15484,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                          * Scoped: the count is restored after the descent, so a
                          * binding cannot leak into a sibling call. */
                         int _saved_alias = _rmw_alias_count;
+                        int _saved_base = _rmw_alias_base;
                         Node *_cfd = csym->func_node;
                         for (int _ai = 0; _ai < node->call.arg_count &&
                                           _ai < _cfd->func_decl.param_count; _ai++) {
@@ -15401,9 +15498,14 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                             _rmw_alias[_rmw_alias_count].global = _tg;
                             _rmw_alias_count++;
                         }
+                        /* only THIS call's bindings are visible in the callee */
+                        _rmw_alias_base = _saved_alias;
+                        csym->walk_on_path |= ZER_WALK_RACE;
                         bool found = scan_unsafe_global_access(c,
                             csym->func_node->func_decl.body, out_name, out_len);
+                        csym->walk_on_path &= (uint8_t)~ZER_WALK_RACE;
                         _rmw_alias_count = _saved_alias;
+                        _rmw_alias_base = _saved_base;
                         _scan_global_depth--;
                         if (found) return true;
                     }
@@ -15431,13 +15533,8 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 if (!asym || !asym->is_function || !asym->func_node ||
                     asym->func_node->kind != NODE_FUNC_DECL ||
                     !asym->func_node->func_decl.body) continue;
-                if (_scan_global_depth < 32) {
-                    _scan_global_depth++;
-                    bool found = scan_unsafe_global_access(c,
-                        asym->func_node->func_decl.body, out_name, out_len);
-                    _scan_global_depth--;
-                    if (found) return true;
-                }
+                if (spawn_scan_enter_unbound(c, asym, out_name, out_len))   /* BUG-1017 */
+                    return true;
             }
         }
         return false;
@@ -22899,16 +22996,30 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
         Symbol *gs = scope_lookup(c->global_scope, value->call.callee->ident.name,
                                   (uint32_t)value->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
-            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body)
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body &&
+            !(gs->walk_on_path & ZER_WALK_ISR)) {
+            gs->walk_on_path |= ZER_WALK_ISR;
             record_isr_returned_funcname(c, gs->func_node->func_decl.body, depth + 1);
+            gs->walk_on_path &= (uint8_t)~ZER_WALK_ISR;
+        }
         return;
     }
     if (value->kind != NODE_IDENT) return;
     Symbol *fs = scope_lookup(c->global_scope, value->ident.name,
                               (uint32_t)value->ident.name_len);
+    /* BUG-1017: a body already being recorded on this path is not re-entered
+     * (a funcptr-bound function has no bindings, so the cut loses nothing).
+     * The alias table is base-shifted so the caller's rows stay invisible. */
     if (fs && fs->is_function && fs->func_node &&
-        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body &&
+        !(fs->walk_on_path & ZER_WALK_ISR)) {
+        int saved_base = _rmw_alias_base, saved_count = _rmw_alias_count;
+        _rmw_alias_base = _rmw_alias_count;
+        fs->walk_on_path |= ZER_WALK_ISR;
         record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+        fs->walk_on_path &= (uint8_t)~ZER_WALK_ISR;
+        _rmw_alias_count = saved_count; _rmw_alias_base = saved_base;
+    }
 }
 
 /* E1 (2026-08-02): descend into a function BOUND to a function pointer.
@@ -23003,11 +23114,26 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             Symbol *cs = scope_lookup(c->global_scope,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body &&
+                (cs->walk_on_path & ZER_WALK_ISR)) {
+                /* BUG-1017 cycle cut: the body is being recorded already. The
+                 * only thing a re-walk would add is an RMW through a parameter
+                 * THIS call binds to a global — taken from the memoised summary,
+                 * exactly as the main-code call site does (BUG-801). */
+                uint64_t rm = func_rmw_param_mask(c, cs, 0);
+                for (int i = 0; rm && i < node->call.arg_count && i < 64; i++) {
+                    if (!(rm & (1ULL << i))) continue;
+                    Symbol *tg = rmw_arg_target_global(c, node->call.args[i]);
+                    if (tg && !tg->is_function)
+                        track_isr_global(c, tg->name, tg->name_len, true);
+                }
+            } else if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
                 /* BUG-792 (mirrored sink): bind `f(&counter)` args to the callee's
                  * params before descending, so `*p += 1` one (or n) hops away still
                  * names counter. Scoped — restored after the descent. */
                 int _sv = _rmw_alias_count;
+                int _svb = _rmw_alias_base;
                 for (int _ai = 0; _ai < node->call.arg_count &&
                                   _ai < cs->func_node->func_decl.param_count; _ai++) {
                     if (_rmw_alias_count >= RMW_ALIAS_MAX) break;
@@ -23020,8 +23146,12 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                     _rmw_alias[_rmw_alias_count].global = _tg;
                     _rmw_alias_count++;
                 }
+                _rmw_alias_base = _sv;   /* only THIS call's bindings are visible */
+                cs->walk_on_path |= ZER_WALK_ISR;
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                cs->walk_on_path &= (uint8_t)~ZER_WALK_ISR;
                 _rmw_alias_count = _sv;
+                _rmw_alias_base = _svb;
             }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
              * VARIABLE — `*() g_cb = bump; interrupt { g_cb(); }` — the canonical
@@ -23323,8 +23453,12 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
             Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body &&
+                !(cs->walk_on_path & ZER_WALK_ATOMIC)) {   /* BUG-1017 cycle cut */
+                cs->walk_on_path |= ZER_WALK_ATOMIC;
                 record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, depth + 1);
+                cs->walk_on_path &= (uint8_t)~ZER_WALK_ATOMIC;
+            }
         }
         return;
     }

@@ -5,6 +5,72 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1015..1019: the struct-init laundered RMW, `@bitcast` and arrays (three ways), and a recursive callee the race scans could not finish
+
+Taken from `claude/loving-davinci-v6o9c5` `318bf05` (its 975..979, the parts not already
+on main as BUG-976..978): the emitter hunks and the fixed-buffer-audit widening
+cherry-picked, the checker parts hand-ported onto main's BUG-976 loud caps. Measured on
+main first: both `*_rmw_via_struct_init` negatives and `spawn_rmw_alias_survives_funcptr_binding`
+compiled clean, `bitcast_array_target` produced a GCC error, `bitcast_array_source_ok`
+exited 1 (wrong value), both enum-forge traps ran to exit 2 instead of trapping, and
+`spawn_recursive_callee_compiles` was REFUSED with "a call chain too deep to analyse".
+
+### BUG-1015 — `g = pick({ .a = g }).a + 1;` was not a read-modify-write at either sink
+
+`expr_mentions_name` / `expr_mentions_global` were two if-chains listing a handful of
+node kinds and answering "no" for the rest; `NODE_STRUCT_INIT` was unlisted, so the
+read of `g` inside a struct-literal argument did not count as reading it and the store
+was a plain store. ONE walker `expr_mentions_ident` now, a no-`default:` switch over
+every kind (statement kinds descended too, so it stays total), overflow = "mentioned".
+Tests: `tests/zer_fail/{isr,spawn}_rmw_via_struct_init.zer`.
+
+### BUG-1016 — `@bitcast(Color[50], raw)`: an array TARGET is not expressible
+
+Emitted `int32_t[50] _zer_bco0` (GCC error, no ZER diagnostic); with the declarator
+fixed the value would be DISCARDED, since an array is not an assignable C value and the
+block-scoped array dies with the statement expression. Rejected with the struct-wrapper
+remedy. Zero corpus cost. Test: `tests/zer_fail/bitcast_array_target.zer`.
+
+### BUG-1017 — a recursive callee reachable from a spawn target or an ISR was refused; a funcptr binding wiped the alias table mid-scan
+
+Every transitive call-hop scan (spawn race scan, ISR recorder, atomic-cell recorder)
+re-descended a callee body at every call site under a depth cap. `fib` reachable from a
+spawn target walked itself to the cap and was then reported as "a call chain too deep to
+analyse" (BUG-976 made the cap loud, which turned a hang into an over-rejection); two
+self-calls made the walk exponential on the way there. And the two funcname descents
+called `rmw_alias_reset()` MID-SCAN, so `*() fp = noop;` between `volatile *u32 p = &g`
+and `*p += 1` unflagged the RMW.
+
+Fix: `Symbol.walk_on_path` (one bit per walker family, `ZER_WALK_RACE/ISR/ATOMIC`) — a
+callee already on the path is not re-entered; the only thing a re-walk would add, an RMW
+through a parameter THIS call binds to a global, is applied from the memoised
+`func_rmw_param_mask` (BUG-801) at both the spawn and ISR sinks. The alias table is
+BASE-SHIFTED (`_rmw_alias_base`): a callee sees only its own call's bindings, the caller's
+rows are never wiped. The three unbound descents share `spawn_scan_enter_unbound`, which
+also makes their depth cap loud (it used to `return false`).
+Tests: `tests/zer/spawn_recursive_callee_compiles.zer` (an ISR sibling was verified
+compile-only: `interrupt TIMER1 { out = fib(5); }` builds to C),
+`tests/zer_fail/spawn_rmw_alias_survives_funcptr_binding.zer`.
+
+### BUG-1018 — `@bitcast(u64, a)` from an array copied the decayed POINTER's bytes
+
+`__auto_type b = a` decays to a `uint8_t *`, so `memcpy(&bco, &bci, 8)` copied the
+address of `a`, and a wider target read past the pointer. Both emitter paths now copy
+from the array expression directly. Test: `tests/zer/bitcast_array_source_ok.zer`.
+
+### BUG-1019 — the enum variant guard skipped arrays over 4096 elements, structs nested past 8, and paths over 256 chars
+
+`Color[5000]` forged through `@bitcast` ran unguarded; an enum 11 structs deep was never
+guarded (the same forge 3 deep trapped); a long access path was silently TRUNCATED by a
+`char sub[256]`. The array cap is gone (the guard is a runtime loop whose cost is the
+array's), the depth cap is 512 with an unconditional trap past it (a guard that cannot be
+emitted is a value that cannot be vouched for), paths are built on the heap.
+`tools/audit_fixed_buffers.sh` now also matches MACRO-sized arrays; three pre-existing
+tables it surfaced are baselined on the strength of their overflow flags.
+Tests: `tests/zer_trap/bitcast_enum_array_5000_forged.zer`, `bitcast_enum_forged_11_deep.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-1008..1014: seven holes from `vigilant-tesla-1zukjq` via `vgonmt` (survey class 7)
 
 Cherry-picked `claude/loving-davinci-vgonmt` `e867110` (its 976..982, from `1zukjq`

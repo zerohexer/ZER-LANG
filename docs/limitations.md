@@ -326,14 +326,14 @@ recorded as their own OPEN entries above the survey.
 - ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED 2026-09-12 as BUG-994
 - ~~MMIO const-ident (2)~~ — CLOSED 2026-09-12 as BUG-996 (`mmio_const_addr`, one query at four sites; the MASKED `_oob_index` below closes with it); `ppnatu`'s `mmio_volatile_index_reject` still open
 - ~~global init (2)~~ — CLOSED: `global_init_chain_too_deep` as BUG-975, `global_init_from_mutable` 2026-09-12 as BUG-997 (a const global's initializer is substituted by the emitter; a mutable one is rejected at the ZER line)
-- multiview UAF (2) — `vgonmt`: `multiview_assign_uaf` `multiview_branch_join_uaf`
-- struct-init field (2) — `vgonmt`: `struct_init_field_uaf` `struct_init_field_move`
+- ~~multiview UAF (2)~~ — CLOSED 2026-09-12 as BUG-1013
+- ~~struct-init field (2)~~ — CLOSED 2026-09-12 as BUG-1012
 - ~~compound float↔int (2)~~ — CLOSED 2026-09-12 as BUG-995
-- RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init`
-- `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target`
-- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding`
-- ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements`
-- param-local double free (1) — `vgonmt`: `param_local0_double_free`
+- ~~RMW via struct-init (2)~~ — CLOSED 2026-09-12 as BUG-1015 (one exhaustive `expr_mentions_ident` at both sinks)
+- ~~`@bitcast` array target miscompile (1)~~ — CLOSED 2026-09-12 as BUG-1016 (rejected; the array SOURCE miscompile is BUG-1018, the enum-guard caps BUG-1019)
+- ~~funcptr-binding alias survival (1)~~ — CLOSED 2026-09-12 as BUG-1017 (base-shifted alias table; the same change cuts cycles so a recursive callee reachable from a spawn target or an ISR compiles)
+- ~~ISR RMW split across statements (1)~~ — CLOSED 2026-09-12 as BUG-1006
+- ~~param-local double free (1)~~ — CLOSED 2026-09-12 as BUG-1011
 - spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown`
 - defer body with a label (1) — `qo0mm9`: `defer_body_label` (**relevant to main's own label-path
   split, BUG-965 — check whether it is the same shape before fixing**)
@@ -2230,7 +2230,7 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 - **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,
   `_tilde`. NB: distinct from the ALLOWED unsigned ops `~0` / `0 - 1`; see the
   corpus-cost rule in CLAUDE.md before widening.
-- **misc** (`yzhu1s`): `bitcast_bare_array_source`, `stack_limit_root_entry`.
+- **misc** (`yzhu1s`): ~~`bitcast_bare_array_source`~~ (CLOSED 2026-09-12 as BUG-1018), `stack_limit_root_entry`.
 - ~~**bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).~~ — **CLOSED
   2026-09-12 as BUG-994** (`@ptrcast` and `@inttoptr` bool pointee; `@pun` was already
   BUG-987). NOT taken from `fhf8rn`: `enum_mint_pun` from a `*W` struct source — main

@@ -116,3 +116,20 @@ checker.c:        Type *scratch[4] = {0};
 # one — and the read-only rw exemption tops out at the same 4.
 checker.c:            Type *direct_rw[4]; int nrw = 0;
 checker.c:                Type *viacall[4];
+# LSP-only (not on the compile path): a 65th open document is refused (returns NULL, no
+# diagnostics for it) and diagnostics past 256 are not forwarded to the editor. Editor-side
+# degradation only; no safety analysis reads either table. Matched by the BUG-976 macro-size rule.
+zer_lsp.c:static Document documents[MAX_DOCUMENTS];
+zer_lsp.c:static LspDiagnostic diag_buf[MAX_DIAGS];
+
+# BUG-1019 (2026-09-12) — the fixed-buffer audit now matches MACRO-sized arrays too
+# (`T name[SOME_MAX]`), which surfaced three tables that predate the rule. Each is
+# bounded by an OVERFLOW FLAG that makes the lookup answer conservatively once the
+# table is full (BUG-976: a fixed table that silently drops its 17th row is a
+# missed rejection; these do not drop — `_rmw_alias_overflow` returns the last
+# recorded global, `_static_local_overflow` treats every unknown name as shared,
+# and CONST_CHAIN_MAX past its cap reports the chain as too long rather than
+# folding it). The overflow flag, not the size, is the justification.
+checker.c:static struct { const char *name; uint32_t len; Symbol *global; } _rmw_alias[RMW_ALIAS_MAX];
+checker.c:static struct { const char *name; uint32_t len; } _static_locals[STATIC_LOCAL_MAX];
+checker.c:static uint32_t    _cident_len[CONST_CHAIN_MAX];

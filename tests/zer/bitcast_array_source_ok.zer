@@ -1,0 +1,20 @@
+// BUG-1018: @bitcast FROM an array copied the bytes of a decayed POINTER (`__auto_type
+// b = a` is a `u8 *`), so `@bitcast(u64, a)` yielded the address of `a`, not its
+// contents, and a wider target read past the pointer. Both emitter paths fixed.
+struct Pair { u32 lo; u32 hi; }
+struct Big { u32[4] w; }
+u32 main() {
+    u8[8] a;
+    a[0] = 42;
+    a[4] = 7;
+    u64 v = @bitcast(u64, a);
+    if (@truncate(u8, v) != 42) { return 1; }
+    Pair p = @bitcast(Pair, a);
+    if (p.lo != 42 || p.hi != 7) { return 2; }
+    u8[16] wide;
+    wide[0] = 3;
+    wide[12] = 9;
+    Big b = @bitcast(Big, wide);
+    if (b.w[0] != 3 || b.w[3] != 9) { return 3; }
+    return 0;
+}

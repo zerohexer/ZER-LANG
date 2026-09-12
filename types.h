@@ -18,6 +18,10 @@
 
 /* ---- Forward declarations ---- */
 typedef struct Type Type;
+#define ZER_WALK_RACE   1u   /* scan_unsafe_global_access (spawn sink) */
+#define ZER_WALK_ISR    2u   /* record_isr_globals */
+#define ZER_WALK_ATOMIC 4u   /* record_atomic_plain_in_callee */
+
 typedef struct Symbol Symbol;
 typedef struct Scope Scope;
 
@@ -333,7 +337,19 @@ struct Symbol {
      * site that writes either — see `set_container_prov_*` in checker.c. Keeping
      * them as one pair with one writer is what stops the "set one, forget to
      * clear the other" drift. */
-    bool is_whole_object_addr;       /* provably `&wholeObject`, never `&x.field` */
+    bool is_whole_object_addr;
+    /* BUG-1017: ON-PATH marks for the transitive call-hop scans (spawn race scan,
+     * ISR global recording, atomic-cell recording). Each scan re-descends a callee
+     * body at every call site under a depth cap; with no cycle cut a RECURSIVE
+     * callee reachable from a spawn target or an ISR walked itself until the cap
+     * tripped and was then REPORTED as "a call chain too deep to analyse" — a valid
+     * program refused (two self-calls, as in `fib`, also made the walk
+     * exponential). A callee already on the current path is not re-entered: its
+     * body is being scanned with its own bindings, and its binding-dependent RMW
+     * facts are applied from the memoised `rmw_param_mask` instead. One bit per
+     * walker family so nested walkers over the same Symbol cannot confuse each
+     * other's marks. */
+    uint8_t walk_on_path;       /* provably `&wholeObject`, never `&x.field` */
 
     /* for functions */
     bool is_function;

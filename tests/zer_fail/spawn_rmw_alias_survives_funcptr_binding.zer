@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+// BUG-1017: a funcptr binding (`*() fp = noop;`) between the alias declaration and the
+// RMW used to WIPE the alias table (rmw_alias_reset mid-scan), so `*p += 1` went unflagged.
+volatile u32 g;
+void noop() { }
+void w() {
+    volatile *u32 p = &g;
+    *() fp = noop;
+    fp();
+    *p += 1;
+}
+u32 main() { spawn w(); spawn w(); return 0; }

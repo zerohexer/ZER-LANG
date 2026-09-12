@@ -1,0 +1,12 @@
+// expect-trap
+// BUG-1027: `@bitcast(bool, u8)` of 5 minted a bool that was TRUE under `if (b)` and
+// UNEQUAL to `true` — the same value reading two ways. A bool is a two-variant enum
+// for the forging guard: anything but 0 or 1 traps at the @bitcast, like an enum.
+u32 five() { return 5; }
+u32 main() {
+    u8 raw = @truncate(u8, five());
+    bool b = @bitcast(bool, raw);
+    if (b == true) { return 0; }
+    if (b) { return 1; }
+    return 2;
+}

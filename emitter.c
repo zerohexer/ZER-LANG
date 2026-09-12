@@ -955,6 +955,13 @@ static bool type_carries_enum_e(Type *t, int depth) {
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     if (k == TYPE_ENUM) return true;
+    /* BUG-1027: a bool is a two-variant enum for this question. `@bitcast(bool,
+     * u8)` of 5 minted a bool that was TRUE under `if (b)` and UNEQUAL to `true`
+     * — the same value reading two ways, the BUG-586/BUG-1000 canonical-bool
+     * guarantee broken through the one door the enum guard did not watch.
+     * `@truncate`/`@saturate` refuse a bool target, `@pun` traps on type_id,
+     * `@ptrcast`/`@inttoptr` are BUG-994 — so @bitcast was the whole gap. */
+    if (k == TYPE_BOOL) return true;
     if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
     if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
     if (k == TYPE_STRUCT) {
@@ -1067,6 +1074,12 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
         }
         emit(e, ")) _zer_trap(\"%s produced a value that is not a declared variant "
                 "of this enum\", __FILE__, __LINE__); ", what);
+        return;
+    }
+    if (k == TYPE_BOOL) {
+        /* BUG-1027: the bool leaf — its variants are exactly 0 and 1. */
+        emit(e, "if ((unsigned)(%s) > 1u) _zer_trap(\"%s produced a value that is "
+                "neither true nor false\", __FILE__, __LINE__); ", path, what);
         return;
     }
     if (k == TYPE_STRUCT) {

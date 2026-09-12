@@ -5,6 +5,32 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1027: `@bitcast` to `bool` minted a value that was neither true nor false
+
+### BUG-1027 — the enum-forging guard did not know a bool is a two-variant enum
+
+```zer
+u8 raw = 5;
+bool b = @bitcast(bool, raw);
+if (b == true) { return 0; }   // false
+if (b) { return 1; }           // taken — the same value reads two ways
+```
+
+Also through a struct target (`@bitcast(B, r)` with `struct B { bool b; }`) and a present
+optional (`@bitcast(?bool, r)`). BUG-586/BUG-1000 make `(bool)x` canonical; BUG-994
+refuses minting a `*bool` through `@ptrcast`/`@inttoptr`; `@truncate`/`@saturate` refuse
+a bool target; `@pun` traps on type_id. `@bitcast` was the one door left — the same
+door the enum guard (BUG-843) already watches for enums.
+
+Fix: `type_carries_enum_e` answers "carries" for TYPE_BOOL and the guard walker has a bool
+leaf — `if ((unsigned)b > 1u) _zer_trap(...)` — so the existing struct / optional / array
+recursion and the three door wirings cover every carrier. Tracked, not banned: a bool read
+from a register through @bitcast still works when it IS 0 or 1.
+Tests: `tests/zer_trap/bitcast_bool_forged{,_struct,_optional}.zer`,
+`tests/zer/bitcast_bool_valid_ok.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-1025/1026: two holes found by probing after the harvest, not by any branch
 
 ### BUG-1025 — a parameter re-bound to a fresh allocation leaked with no diagnostic

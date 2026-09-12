@@ -2221,6 +2221,9 @@ u32 bits = @bitcast(u32, my_i32);  // same bits, different type
   with `u8[8] a` yields the eight bytes of `a`. (Before BUG-1018 it copied the
   bytes of the decayed POINTER — the address of `a` — and over-read past it for a
   wider target.)
+- A `bool` target is guarded like an enum with two variants: a bitcast whose bits
+  are neither 0 nor 1 **traps** (BUG-1027), so a bool is always exactly `true` or
+  `false` — the same guarantee `(bool)x` gives.
 - The enum variant guard a `@bitcast` emits walks EVERY element of an array target
   and every nesting level of a struct target; there is no size or depth past
   which a forged variant goes unchecked (BUG-1019).

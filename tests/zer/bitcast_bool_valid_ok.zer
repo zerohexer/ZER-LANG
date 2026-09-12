@@ -1,0 +1,14 @@
+// BUG-1027 boundary: a bitcast of 0 or 1 into a bool is a valid bool, both ways.
+u32 one() { return 1; }
+u32 zero() { return 0; }
+u32 main() {
+    u8 r1 = @truncate(u8, one());
+    u8 r0 = @truncate(u8, zero());
+    bool b1 = @bitcast(bool, r1);
+    bool b0 = @bitcast(bool, r0);
+    if (b1 != true)  { return 1; }
+    if (b0 != false) { return 2; }
+    u8 back = @bitcast(u8, b1);
+    if (back != 1)   { return 3; }
+    return 0;
+}

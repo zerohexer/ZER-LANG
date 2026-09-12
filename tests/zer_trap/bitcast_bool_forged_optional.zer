@@ -1,0 +1,16 @@
+// expect-trap
+// BUG-1027: the guard walks the payload of a PRESENT optional — `?bool` forged with
+// has_value set and a payload of 5.
+struct R { u8 a; u8 b; }
+u32 five() { return 5; }
+u32 main() {
+    R r;
+    r.a = @truncate(u8, five());
+    r.b = 1;
+    ?bool o = @bitcast(?bool, r);
+    if (o) |v| {
+        if (v == true) { return 0; }
+        if (v) { return 1; }
+    }
+    return 2;
+}

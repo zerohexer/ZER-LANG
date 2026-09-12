@@ -1,0 +1,13 @@
+// expect-trap
+// BUG-1027: the guard walks struct fields — a bool forged INSIDE a struct target.
+struct B { bool b; }
+struct R { u8 r; }
+u32 five() { return 5; }
+u32 main() {
+    R r;
+    r.r = @truncate(u8, five());
+    B x = @bitcast(B, r);
+    if (x.b == true) { return 0; }
+    if (x.b) { return 1; }
+    return 2;
+}

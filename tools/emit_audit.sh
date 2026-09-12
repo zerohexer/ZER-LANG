@@ -109,6 +109,34 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-972: the two grammar forms that produce a SINGLE STATEMENT where a block is
+# usual — `defer stmt;` and `1 => expr,` — used to bypass the per-statement wrapper
+# in ir_lower, so a shared-struct access inside them took NO mutex while the brace
+# form one keyword away locked. Each must show a lock around its access. Verified
+# RED on the pre-fix compiler (1 lock in f, 0 in the arm).
+cat > "$req_dir/forms.zer" <<'ZEOF'
+shared struct S { u32 v; }
+S g;
+void f() { defer g.v += 1; g.v = 2; }
+void h(u32 x) { switch (x) { 1 => g.v = 5, default => { } } }
+u32 main() { f(); h(1); return 0; }
+ZEOF
+if "$ZERC" "$req_dir/forms.zer" -o "$req_dir/forms.c" >/dev/null 2>&1; then
+    nf=$(sed -n '/^void f(void)/,/^}/p' "$req_dir/forms.c" | grep -c 'pthread_mutex_lock(&g\._zer_mtx)' || true)
+    nh=$(sed -n '/^void h(uint32_t x)/,/^}/p' "$req_dir/forms.c" | grep -c 'pthread_mutex_lock(&g\._zer_mtx)' || true)
+    if [ "$nf" -lt 2 ]; then
+        echo "MISSING EMISSION: statement-form defer body took no shared lock (f: $nf locks, want >=2)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+    if [ "$nh" -lt 1 ]; then
+        echo "MISSING EMISSION: expression-form switch arm took no shared lock (h: $nh locks, want >=1)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the single-statement-body sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

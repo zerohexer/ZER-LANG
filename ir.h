@@ -267,6 +267,12 @@ typedef struct {
      * alloc returned null). zercheck_ir leak detection skips these
      * blocks entirely — they can't leak what was never allocated. */
     bool is_orelse_fallback;
+    /* BUG-979: for an is_orelse_fallback block, the LOCAL holding the optional
+     * whose null-ness selected it (the `_zer_or` temp the branch tested); -1
+     * otherwise. Lets the FuncSummary builder tell "this return is the null
+     * path of param i's own unwrap" (nothing to free there) from "this return
+     * is some other optional's null path" (param i simply was not freed). */
+    int orelse_fallback_local;
 
     /* Phase E: set by ir_lower when this block is part of an if-then or
      * switch-arm body whose always-exits terminator (return/break/

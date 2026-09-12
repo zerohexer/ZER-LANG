@@ -5,6 +5,112 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-981..986: slot-stored allocations, global projections, struct values that carry allocations, optional-param frees, pointer views of locals — and two single-statement bodies that took no lock
+
+Adopted from `claude/loving-davinci-3sdup9` (its BUG-972 / 975 / 976 / 977 / 979 / 981),
+cherry-picked per the harvest protocol: each reproducer confirmed ACCEPTED on main
+first (measured with the extracted `tests/zer_fail/` files, 20 of them), each rejected
+for its stated `// expect-error:` reason after. The branch's depth-cap work (its 973 /
+980) was NOT taken — main closed the same walkers as BUG-976/977 — and its VRP
+type-width relaxation (its 974) is held back for a separate measured adoption.
+Numbers renumbered onto main's sequence.
+
+### BUG-981 — `defer stmt;` and an expression-form switch arm took NO shared lock (ir_lower.c)
+
+The per-statement wrapper (bounds guards, shared lock, statement, unlock) lived only in
+the NODE_BLOCK loop. Two grammar forms fill a body position with a bare statement:
+
+```zer
+{ defer g.v += 1; }                      // statement-form defer body
+switch (x) { 1 => g.v = 5, default => { } }   // expression-form switch arm
+```
+
+Measured on main's emitted C: the deferred `g.v += _zer_t0` and the arm's `g.v = 5`
+both ran with no `pthread_mutex_lock` while the brace form one keyword away locked. A
+silent data race, in the two-spellings class. ONE entry `lower_stmt_in_block` is now
+called by the block loop AND by both single-statement positions (`lower_body`). The
+switch arm also stops leaking `block_defers_managed` for a non-block body. Gate: a
+required-emission fingerprint in `tools/emit_audit.sh` (verified red on the pre-fix
+build: 1 lock in `f`, 0 in the arm). Positive `tests/zer/switch_arm_expr_form_ok.zer`;
+trap `tests/zer_trap/defer_stmt_form_index_trap.zer` (the statement-form body now gets
+an IR guard that traps instead of the emitter's raw-AST guard).
+
+### BUG-982 — `h.p = alloc(T);` into a FIELD / INDEX / GLOBAL slot was untracked (zercheck_ir.c)
+
+The BUG-933 assign arm resolved its target with `ir_find_value_local`, which answers
+only a bare ident, so a slot target returned -1 and nothing was registered: UAF through
+unwrap/free/re-unwrap, a never-freed slot, and a double fill (`h.p = alloc(T); h.p =
+alloc(T);`) were all accepted. `ir_register_alloc_result_compound` keys the target with
+`ir_extract_compound_key` and registers the compound as a fresh allocation (ALIVE,
+minted `alloc_id`, colour + pool name, overwrite-while-alive reported). A global root
+lands under `IR_GLOBAL_ROOT_ID`. `ir_mark_local_escaped` now escapes every entry rooted
+at the local so a returned / globally-stored struct takes its compounds with it.
+Tests: `alloc_field_bare_spelling_{uaf,leak,overwrite}.zer`, `alloc_index_bare_spelling_uaf.zer`,
+`alloc_global_field_bare_spelling_dangling.zer`; positive `alloc_field_bare_spelling_ok.zer`.
+
+### BUG-983 — a global-rooted projection (`g.p`) resolved at the STORE sinks only
+
+G5 registered `(IR_GLOBAL_ROOT_ID, "g.p")` at the three store sinks, but the query every
+other sink uses (`ir_extract_compound_key`) returned "unkeyable" for a global root, so
+`free(g.p); return g.p.v;` was clean. ONE key function `ir_global_projection_key`, used by
+the store and by the query, so they cannot disagree; the `escaped=true` invariant on
+global entries is enforced in the constructor. Three consequences fixed with it: a plain
+`=` into a tracked slot is a RESET, not a use (`g.p = null;` — the taught fix — compiles;
+`ir_assign_target_is_tracked_slot`, walking only the slot's object chain so `hp.p = null`
+through a FREED `hp` stays rejected); a slot-to-slot copy `b.p = a.p` / `g.p = a.p` aliases
+(`ir_alias_slot_to_slot`); diagnostics name the key instead of `'?'` (`ir_root_display`).
+Tests: `global_projection_{free_then_read,reunwrap_uaf}.zer`, `slot_copy_alias_{uaf,global_uaf}.zer`,
+boundary `slot_reset_through_freed_pointer.zer`.
+
+### BUG-984 — a struct VALUE carries its allocations at FOUR sites; only the plain copy knew
+
+`H h = { .inner = { .p = alloc(T) } }` (nested designated initializer), and `In i; i.p =
+alloc(T); h.inner = i;` — the inner allocation lives on a COMPOUND row, the struct has no
+bare handle, and the struct-init decomposition and the field/index store sinks looked
+for a bare one. ONE helper `ir_carry_compounds(src_root, dest_root, prefix)` at IR_COPY,
+STRUCT_INIT_DECOMP and both store sinks (`ir_store_struct_value_into_slot`). Slot clears
+are gated on the VALUE's kind (`ir_value_clears_slot`), because an arm-order clear had
+wiped the alias a previous arm formed. Tests: `alloc_nested_init_uaf.zer`,
+`alloc_nested_init_orelse_uaf.zer`, `alloc_struct_value_into_slot_uaf.zer`; positive
+`alloc_nested_init_carry_ok.zer`.
+
+### BUG-985 — RELAXATION: a callee freeing an OPTIONAL param through `orelse return` is summarised as freeing it
+
+`void drop(?*T p) { *T q = p orelse return; free(q); }` made every caller report a leak
+(and the caller's own `mp = null;` a use-after-free). Three missing variables: a param
+had no identity at its unwrap (`_zer_or = p` is a passthrough from a bare param — now
+registered via `ir_type_reads_as_ref`, shared with the IR_FIELD_READ arm which thereby
+sees `?*T` fields); the summary's kind gate excluded `?*T`; and the `orelse return` block
+counted as a not-freed path — `IRBlock.orelse_fallback_local` records WHOSE null path a
+fallback block is, so the summary skips only the param's own. `freed_then_reset` keeps the
+fact of a free across the callee's `h.p = null;`. Boundaries pinned: another optional's
+null path and a real runtime branch stay MAYBE (`opt_param_other_optional_null_path_maybe.zer`,
+`opt_param_real_branch_free_maybe.zer`); the summary is CONSUMED
+(`opt_param_drop_then_caller_{uaf,double_free}.zer`, `opt_local_reset_after_reunwrap_uaf.zer`).
+Positive `opt_param_unwrap_free_ok.zer`. Residual: the `if (h.p) |q| { free(q); }` capture
+form stays MAYBE (`opt_param_capture_form_stays_maybe.zer`, limitations.md). Same commit:
+the Ring "pointer through channel" warning now uses `type_carries_data_pointer` (a
+`struct Msg { ?*T p; }` element crossed silently); two rows leave the carrier baseline.
+
+### BUG-986 — a pointer VIEW of a local aggregate named different slots than the aggregate
+
+`*H hp = &h; hp.p = alloc(T); free(unwrapped hp.p); h.p …` compiled clean and read
+freed memory: `hp.p` keyed on `hp`, `h.p` on `h`. The union / optional switch hoists the
+same `&u` view, so a variant freed through its capture was a false leak and a re-read of
+the freed variant unseen. `IRHandleInfo.view_root_local` — set by the view arm on `%t =
+&<local aggregate>` and by `hp = &h;`, inherited by pointer copies, joined as
+same-or-AMBIGUOUS at merges — and ONE re-rooting in `ir_extract_compound_key` (which now
+takes the path state). Tests: `view_of_local_store_then_read_via_local_uaf.zer`,
+`view_of_local_copy_uaf.zer`, `union_capture_free_then_reread_uaf.zer`; positive
+`view_of_local_ok.zer`. Residual: the pointer capture `|*q|` of a union variant.
+
+### Verification
+
+`tests/test_zer.sh` 1604/0 (was 1576), `test_modules` 30/0, `rust_tests` 784/0, `zig_tests`
+36/0, `tools/sink_matrix.sh` 154 ok / SINK MATRIX CLEAN, all six audit gates OK.
+
+---
+
 ## Session 2026-09-11 — BUG-979/980: two concurrency rules that were exempting the thing they existed to catch
 
 Survey classes 6 (3 reproducers) and 3 (6 reproducers), both from

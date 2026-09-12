@@ -1109,6 +1109,24 @@ switch (ready) {
 }
 ```
 
+An arm body is either a `{ block }` or a **single expression followed by a comma**:
+
+```zer
+u32 classify(u32 code) {
+    u32 k = 0;
+    switch (code) {
+        0 => k = 1,               // expression arm — note the trailing comma
+        1, 2 => { k = 2; }        // block arm — comma optional
+        default => k = 3,
+    }
+    return k;
+}
+```
+
+The expression form is the same statement as the block form for every safety rule:
+a shared-struct access in it takes the auto-lock, and an unprovable index in it gets
+the bounds guard (BUG-981 — both were skipped before 2026-09-12).
+
 **NOTES**
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
@@ -1179,7 +1197,12 @@ done:
 **SYNTAX**
 ```zer
 defer statement;
+defer { statements... }
 ```
+
+Both forms are the same body for every safety rule: `defer g.v += 1;` on a
+`shared struct` takes the auto-lock exactly as `defer { g.v += 1; }` does, and an
+unprovable index in either traps at fire time (BUG-981).
 
 **EXAMPLE**
 ```zer
@@ -1407,6 +1430,31 @@ return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak
   interrupt handler → compile error; use `Pool` there).
 - `free` needs a `*T` or `[*]T` — a cinclude `free(ptr)` on a raw C pointer is
   left alone (routes to C's `free`).
+- An allocation stored straight into a **struct field or array element** is
+  tracked exactly like one held in a local, in every spelling: `h.p = alloc(T);`
+  (an optional field keeping the `?*T` result), `h.p = alloc(T) orelse return;`,
+  `H h = { .p = alloc(T) };`, `arr[0] = alloc(T);`, and a global root `g.p = …`.
+  Unwrap it, free through the unwrapped pointer, and the slot knows: a second
+  unwrap after the free is a use-after-free, a slot never freed is a leak, and
+  re-filling a live slot leaks the first allocation. Writing the slot is a
+  **reset**, not a use — `h.p = null;` after the free (the line the dangling-global
+  message asks for) and `h.p = alloc(T);` to re-fill both compile. Copying one
+  slot into another (`b.p = a.p`) makes them aliases of one allocation. Returning
+  the struct, or storing it in a global, hands its allocations to the receiver.
+  A struct value carries its allocations wherever it goes — a plain copy
+  (`H b = a;`), an initializer field (`H h = { .inner = i };`, or the nested
+  literal `{ .inner = { .p = alloc(T) } }`), or a field store (`h.inner = i;`).
+  A pointer to a local aggregate is a **view** of it: after `*H hp = &h;`,
+  `hp.p` and `h.p` are one slot, so filling it through the view and freeing
+  through the local (or the reverse) is one allocation, not two — and a
+  union variant freed through its switch capture `|q|` is freed.
+- A callee may free an **optional** parameter, or an optional field of a
+  parameter, by unwrapping it: `void drop(?*T p) { *T q = p orelse return;
+  free(q); }`. The caller sees that free — `drop(mp)` discharges `mp`, and a
+  later unwrap of `mp` or a second free is an error. The `orelse return` path
+  is the null path: nothing was there to free. A free under a real branch
+  (`if (c) { free(q); }`) is still "may not be freed on all paths", and so is
+  the `if (p) |q| { free(q); }` capture form.
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), Arena, alloc_ptr

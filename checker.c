@@ -9054,11 +9054,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'push' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push() takes exactly 1 argument");
-                    /* Warn if pushing pointer through Ring (channel safety) */
+                    /* Warn if pushing pointer through Ring (channel safety).
+                     * BUG-978: the CARRIER predicate, not a bare kind test — a
+                     * struct element carrying a `?*T` / `[*]T` field
+                     * (`Ring(Msg, 4)` with `struct Msg { ?*T p; }`) crossed the
+                     * channel with no warning at all, the wrapper-hides-the-
+                     * inner-kind class. */
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
-                        Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
-                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                        if (elt && type_carries_data_pointer(elt, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
@@ -9079,11 +9083,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             "cannot call mutating method 'push_checked' on const Ring");
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "ring.push_checked() takes exactly 1 argument");
-                    /* Same pointer warning for push_checked */
+                    /* Same pointer warning for push_checked (BUG-978: carrier
+                     * predicate — the push sibling, fixed in the same commit). */
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
-                        Type *eeff = elt ? type_unwrap_distinct(elt) : NULL;
-                        if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
+                        if (elt && type_carries_data_pointer(elt, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");

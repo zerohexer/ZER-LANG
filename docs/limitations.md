@@ -91,6 +91,41 @@ walks, not just this one.
 
 ---
 
+## OPEN — a callee freeing an optional field through the IF-CAPTURE form is summarised as MAYBE (2026-09-12, LOW — over-rejection)
+
+**Symptom.** `void drop(*H h) { if (h.p) |q| { free(q); } h.p = null; }` + `H h; h.p =
+alloc(T); drop(&h);` is refused: *"handle 'h' may not be freed on all paths"*. The
+`orelse return` unwrap form of the same callee is accepted (BUG-985).
+
+**Root cause.** The capture form joins the freed path and the null path INSIDE the callee
+(a plain if/else CFG join), so the param compound is MAYBE_FREED at every return; the
+`orelse return` form has a DEDICATED fallback block tagged `orelse_fallback_local`, which
+is what lets the summary skip the param's own null path. The if-capture has no such tag.
+
+**Fix sketch.** Tag the if-unwrap's else edge the same way (`IRBlock.orelse_fallback_local`
+on the not-taken block of a capture `if`), so the summary builder can recognise "the null
+path of param i's own optional" there too. Corpus cost of the over-rejection: zero.
+
+**Tripwire:** `tests/zer_fail/opt_param_capture_form_stays_maybe.zer` (expects the MAYBE
+report; flips when the relaxation lands).
+
+---
+
+## OPEN — the POINTER capture `|*q|` of a union variant is not aliased to the variant slot (2026-09-12, LOW — false leak)
+
+**Symptom.** `switch (u) { .p => |*q| { *T t = *q orelse return; free(t); } … }` reports
+the allocation held in `u.p` as never freed. The VALUE capture `|q|` is aliased (BUG-986
+re-roots the hoisted `&u` view onto `u`), the pointer capture — `&sw_ref.p` then `*q` —
+is not: the deref of a pointer-to-optional-pointer is the `**p` shape the analyzer
+deliberately does not follow.
+
+**Fix sketch.** Register the pointer capture as a view of `(u, ".p")` at the capture COPY
+(the compound is known at lowering: the arm's variant name), so a later `*q` resolves
+to that slot. Until then: free through the value capture, or through `u.p` after the
+switch.
+
+---
+
 ## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
@@ -178,11 +213,13 @@ Residual: one over-rejection, entered separately above (a plain struct nested pa
 cannot be copied). `3sdup9`'s "depth-guard ledger" OPEN entry is superseded — the
 enumeration was done on main and is recorded in BUGS-FIXED.md under BUG-976.
 
-**2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling. TAKE `3sdup9`.**
-An allocation stored into a field, index or slot loses tracking.
-`alloc_field_bare_spelling_uaf` `_leak` `_overwrite` `alloc_index_bare_spelling_uaf`
-`alloc_global_field_bare_spelling_dangling` `alloc_struct_value_into_slot_uaf`
-`alloc_nested_init_uaf` `alloc_nested_init_orelse_uaf` `slot_copy_alias_uaf` `slot_copy_alias_global_uaf`
+### ~~2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling~~ — CLOSED 2026-09-12 as BUG-982/983/984
+
+Adopted from `3sdup9` (its 975/976/977). `h.p = alloc(T);` into a field / index / global
+slot is registered as a fresh allocation on the compound key; a global-rooted projection
+is ONE key (`ir_global_projection_key`) at every sink; a struct VALUE carries its compound
+rows at all four value-flow sites (`ir_carry_compounds`). All ten reproducers reject for
+their stated reason; the taught reset `g.p = null;` compiles.
 
 ### ~~3. `shared(rw)` RE-ENTRANCY — 6, data race~~ — CLOSED 2026-09-11 as BUG-980
 
@@ -224,11 +261,13 @@ in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 **8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
 `spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
 
-**9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7. TAKE `3sdup9`.**
-`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
-`global_projection_reunwrap_uaf` `global_projection_free_then_read`
-`opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
-`union_capture_free_then_reread_uaf`
+### ~~9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7~~ — CLOSED 2026-09-12 as BUG-983/985/986
+
+`view_root_local` re-roots a projection through `*H hp = &h` onto `h` (BUG-986, also the
+union-switch hoist); global projections resolve at every sink (BUG-983); an optional param
+freed through `orelse return` is summarised (BUG-985 — a RELAXATION, boundaries pinned).
+The two MASKED `opt_param_*` entries below are closed by the same change. Two residuals
+recorded as their own OPEN entries above the survey.
 
 **10. SMALLER CLASSES**
 - i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
@@ -258,12 +297,8 @@ A rejection is not a closure until the REASON matches.
 - `mmio_const_ident_oob_index` (`qo0mm9`, `vgonmt`) — wants *"MMIO index 9 is out of range"*,
   gets *"cannot index volatile '*u32'"*. A different rule fires first; the MMIO range check
   is never reached. Pairs with `mmio_const_ident_oob_addr` / `_misaligned` in class 10.
-- `opt_param_drop_then_caller_uaf` (`3sdup9`) — wants *"use after free"*, gets a LEAK report.
-- `opt_param_other_optional_null_path_maybe` (`3sdup9`) — wants *"may not be freed on all
-  paths"*, gets a leak report at a different line.
-
-Both `opt_param_*` belong with class 9 (optional-param drop), which already has two live
-siblings — likely one fix.
+- ~~`opt_param_drop_then_caller_uaf`~~ / ~~`opt_param_other_optional_null_path_maybe`~~ —
+  CLOSED 2026-09-12 with class 9 (BUG-985): both now report the wanted reason.
 
 ### limitations.md entries worth taking (deduped against main's own)
 
@@ -286,8 +321,8 @@ asm reproducer; skip the rest.
 
 ### Suggested order
 
-Segfault (done) → class 1 (done) → classes 3 and 6 (done) → class 2 (UAF/leak)
-→ class 5 (forging doors) → the rest.
+Segfault (done) → class 1 (done) → classes 3 and 6 (done) → classes 2 and 9 (done
+2026-09-12) → class 5 (forging doors) → the rest.
 
 ---
 

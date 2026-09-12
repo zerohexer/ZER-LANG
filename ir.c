@@ -186,6 +186,7 @@ int ir_add_block(IRFunc *func, Arena *arena) {
     IRBlock *block = &func->blocks[func->block_count++];
     memset(block, 0, sizeof(IRBlock));
     block->id = id;
+    block->orelse_fallback_local = -1;   /* BUG-979: 0 is a valid local */
 
     /* Pre-allocate instruction array */
     block->inst_capacity = 8;

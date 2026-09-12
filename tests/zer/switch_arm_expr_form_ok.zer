@@ -1,0 +1,15 @@
+// BUG-972: an expression-form switch arm (`1 => k = 1,`) is a bare NODE_EXPR_STMT
+// body. It now goes through the same per-statement wrapper as a block arm, and the
+// arm no longer leaks a block_defers_managed increment that no NODE_BLOCK consumed.
+// Runtime: k = 1 from the arm, +10 from the block-scoped defer at block exit, -11 = 0.
+shared struct S { u32 v; }
+S g;
+u32 main() {
+    u32 k = 0;
+    u32 x = 1;
+    switch (x) { 1 => k = 1, 2 => g.v = 7, default => { k = 2; } }
+    { defer k += 10; }
+    defer g.v += 1;
+    g.v = k;
+    return k - 11;
+}

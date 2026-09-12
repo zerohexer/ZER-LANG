@@ -1,0 +1,11 @@
+// expect-error: may not be freed on all paths
+// BUG-979 boundary: the early return is ANOTHER optional's null path (o, not p), so
+// p is genuinely not freed there — the summary must stay MAYBE, not definite.
+struct T { u32 v; }
+void f(?*T p, ?*T o) { *T x = o orelse return; x.v = 1; *T q = p orelse return; free(q); }
+u32 main() {
+    ?*T mp = alloc(T);
+    ?*T mo = null;
+    f(mp, mo);
+    return 0;
+}

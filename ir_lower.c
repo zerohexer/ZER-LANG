@@ -2336,6 +2336,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         orelse_node->orelse.fallback_is_break ||
         orelse_node->orelse.fallback_is_continue) {
         ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+        ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-979 */
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
@@ -2349,8 +2350,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
          * lowering split into sub-blocks"); the bare form did not, because before the
          * splice it never split. Same question, two sites, one of them updated — the
          * sibling-site shape this project keeps recording. */
-        if (ctx->current_block != bb_fail)
+        if (ctx->current_block != bb_fail) {
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
@@ -2366,8 +2369,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_break && ctx->loop_exit_block >= 0) {
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2378,8 +2383,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         emit_inst(ctx, go);
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
-        if (ctx->current_block != bb_fail)   /* BUG-966, see above */
+        if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-979 */
+        }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
             unlock.expr = ctx->current_stmt_shared_root;
@@ -2427,10 +2434,12 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
             IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
             if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
                 ctx->func->blocks[bb_fail].is_orelse_fallback = true;
+                ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-979 */
                 /* Also tag the ending block if it's different from bb_fail
                  * (block lowering may have split into sub-blocks) */
                 if (ctx->current_block != bb_fail) {
                     ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
+                    ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;
                 }
             }
         }
@@ -2525,6 +2534,86 @@ static void lower_shortcircuit_to_dest(LowerCtx *ctx, int dest_local,
     ctx->current_block = bb_join;
 }
 
+/* BUG-972: THE per-statement wrapper — bounds guards, then the shared-struct
+ * lock, then the statement, then the unlock. It used to be the body of the
+ * NODE_BLOCK loop only, so a statement that is lowered WITHOUT passing through a
+ * NODE_BLOCK got none of it. Two grammar forms produce exactly such a statement:
+ *
+ *     defer g.v += 1;                    // statement-form defer body (NODE_EXPR_STMT)
+ *     switch (x) { 1 => g.v = 5, ... }   // expression-form switch arm (NODE_EXPR_STMT)
+ *
+ * The parser wraps both in a bare NODE_EXPR_STMT rather than a NODE_BLOCK, and the
+ * defer template / switch arm lowering handed that node straight to lower_stmt.
+ * MEASURED on the pre-fix compiler: both wrote the shared struct with NO mutex
+ * while the brace-form twins one keyword away locked correctly — the
+ * two-spellings-of-one-program class, at the lock sink. The guard half had the
+ * same gap: the statement-form defer body got no IR guard and fell back to the
+ * emitter's raw-AST guard, which re-emitted the defer body INSIDE the guard's
+ * early-return path.
+ *
+ * ONE function, called from the block loop AND from every site that lowers a
+ * single statement outside a block, so a third grammar form cannot repeat this. */
+static void lower_stmt_in_block(LowerCtx *ctx, Node *stmt) {
+    if (!stmt) return;
+    Node *shared_root;
+    SharedRootVec shared_extra; srv_init(&shared_extra);
+    /* BUG-956: bounds guards BEFORE the lock. BUG-952 established the
+     * ordering; here it also makes the early return legal, because no
+     * lock is held yet at this point. */
+    lower_stmt_guards(ctx, stmt);
+    emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
+    /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
+     * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
+     * IR_RETURN terminates the block. Cross-thread access then
+     * deadlocks waiting for the never-released mutex. Lower the
+     * return expression to a temp local first, emit IR_UNLOCK,
+     * then emit IR_RETURN. The deferred-fire and IR_RETURN bits
+     * mirror lower_stmt's NODE_RETURN handler. */
+    if (shared_root && stmt->kind == NODE_RETURN) {
+        Node *ret_expr = stmt->ret.expr;
+        IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
+        if (ret_expr) {
+            rewrite_idents(ctx, ret_expr);
+            ret.src1_local = lower_expr(ctx, ret_expr);
+            if (ret.src1_local < 0) ret.expr = ret_expr;
+        }
+        emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
+        emit_defer_fire(ctx, stmt->loc.line);
+        emit_inst(ctx, ret);
+        srv_free(&shared_extra);
+        return;
+    }
+    /* Expose the active root to lower_stmt so exit statements
+     * (other than NODE_RETURN above) can also release the lock.
+     *
+     * When the current inner stmt has no lock of its own
+     * (shared_root NULL) but an outer stmt's lock is still active
+     * (prev_shared non-NULL), INHERIT prev_shared so a nested
+     * early-exit (e.g., `x = outer.field orelse { return; }`
+     * block-fallback path containing a plain `return;`) still
+     * releases the outer lock before the IR_RETURN. Without
+     * inheritance, the inner return sees current_stmt_shared_root=
+     * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
+     * deadlock. */
+    Node *prev_shared = ctx->current_stmt_shared_root;
+    ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
+    lower_stmt(ctx, stmt);
+    ctx->current_stmt_shared_root = prev_shared;
+    emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
+    /* BUG-935: the vector is per-STATEMENT and may have grown onto the
+     * heap, so it is released at the end of every use. */
+    srv_free(&shared_extra);
+}
+
+/* BUG-972: a BODY position that the grammar may fill with either a block or a
+ * single statement. A block routes every statement through lower_stmt_in_block
+ * via its own loop; a bare statement must be routed there explicitly. */
+static void lower_body(LowerCtx *ctx, Node *body) {
+    if (!body) return;
+    if (body->kind == NODE_BLOCK) lower_stmt(ctx, body);
+    else lower_stmt_in_block(ctx, body);
+}
+
 /* Lower a single statement */
 static void lower_stmt(LowerCtx *ctx, Node *node) {
     if (!node) return;
@@ -2558,57 +2647,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool managed_by_enclosing = (ctx->block_defers_managed > 0);
         if (managed_by_enclosing) ctx->block_defers_managed--;
         ctx->func->current_scope++;
-        for (int i = 0; i < node->block.stmt_count; i++) {
-            Node *shared_root;
-            SharedRootVec shared_extra; srv_init(&shared_extra);
-            Node *stmt = node->block.stmts[i];
-            /* BUG-956: bounds guards BEFORE the lock. BUG-952 established the
-             * ordering; here it also makes the early return legal, because no
-             * lock is held yet at this point. */
-            lower_stmt_guards(ctx, stmt);
-            emit_shared_lock_if_needed(ctx, stmt, &shared_root, &shared_extra);
-            /* SILENT-GAP FIX: when a statement is `return <shared-reading-expr>`
-             * the IR_UNLOCK emitted AFTER lower_stmt is dead code because
-             * IR_RETURN terminates the block. Cross-thread access then
-             * deadlocks waiting for the never-released mutex. Lower the
-             * return expression to a temp local first, emit IR_UNLOCK,
-             * then emit IR_RETURN. The deferred-fire and IR_RETURN bits
-             * mirror lower_stmt's NODE_RETURN handler. */
-            if (shared_root && stmt->kind == NODE_RETURN) {
-                Node *ret_expr = stmt->ret.expr;
-                IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
-                if (ret_expr) {
-                    rewrite_idents(ctx, ret_expr);
-                    ret.src1_local = lower_expr(ctx, ret_expr);
-                    if (ret.src1_local < 0) ret.expr = ret_expr;
-                }
-                emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
-                shared_root = NULL;
-                emit_defer_fire(ctx, stmt->loc.line);
-                emit_inst(ctx, ret);
-                continue;
-            }
-            /* Expose the active root to lower_stmt so exit statements
-             * (other than NODE_RETURN above) can also release the lock.
-             *
-             * When the current inner stmt has no lock of its own
-             * (shared_root NULL) but an outer stmt's lock is still active
-             * (prev_shared non-NULL), INHERIT prev_shared so a nested
-             * early-exit (e.g., `x = outer.field orelse { return; }`
-             * block-fallback path containing a plain `return;`) still
-             * releases the outer lock before the IR_RETURN. Without
-             * inheritance, the inner return sees current_stmt_shared_root=
-             * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
-             * deadlock. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
-            lower_stmt(ctx, stmt);
-            ctx->current_stmt_shared_root = prev_shared;
-            emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
-            /* BUG-935: the vector is per-STATEMENT and may have grown onto the
-             * heap, so it is released at the end of every iteration. */
-            srv_free(&shared_extra);
-        }
+        /* BUG-972: the per-statement guard/lock/unlock wrapper is ONE function
+         * (lower_stmt_in_block) shared with every non-block body position. */
+        for (int i = 0; i < node->block.stmt_count; i++)
+            lower_stmt_in_block(ctx, node->block.stmts[i]);
         /* Fire defers pushed inside THIS block at block exit.
          *
          * Same ordering problem as loops (BUG-544): if we fire+POP here and
@@ -3825,8 +3867,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             }
 
             int arm_defer_base = ctx->defer_count;
-            ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-972: an expression-form arm (`1 => g.v = 5,`) is a bare
+             * NODE_EXPR_STMT, not a block — route it through the per-statement
+             * wrapper so it takes the shared lock and the bounds guard exactly
+             * as the brace form does. block_defers_managed is consumed only by a
+             * NODE_BLOCK body, so it is raised only for one. */
+            if (arm->body && arm->body->kind == NODE_BLOCK)
+                ctx->block_defers_managed++;  /* switch arm body: we manage */
+            lower_body(ctx, arm->body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4175,7 +4223,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
                 ctx->current_block = tpl_first;
                 ctx->defer_body_depth++;
-                lower_stmt(ctx, node->defer.body);
+                /* BUG-972: `defer stmt;` is a bare NODE_EXPR_STMT body. Route it
+                 * through the per-statement wrapper so it takes the shared lock
+                 * and an IR (trapping) bounds guard exactly as `defer { stmt; }`
+                 * does — measured, the statement form wrote a shared struct with
+                 * NO mutex while the block form locked. */
+                lower_body(ctx, node->defer.body);
                 ctx->defer_body_depth--;
                 ctx->defer_count   = saved_n;
                 int tpl_n    = ctx->func->block_count - tpl_first;

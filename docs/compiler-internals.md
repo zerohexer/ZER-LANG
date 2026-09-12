@@ -2563,7 +2563,29 @@ When `spawn func()` is used, the checker scans the spawned function's body for n
 
 **`scan_unsafe_global_access(c, node, &name, &len)`** — recursive AST walker. Finds NODE_IDENT matching global scope symbols that are not safe for concurrent access. Skips: const, volatile (explicit opt-in), threadlocal, shared/shared(rw) structs, Pool/Slab/Ring/Arena/Barrier. Skips `@atomic_*` intrinsic arguments (atomic ops are thread-safe).
 
-**Transitive scanning:** When NODE_CALL is encountered, follows the callee into its function body (depth limit 8). Catches `spawn worker()` where `worker()` calls `helper()` which accesses a global.
+**Transitive scanning:** When NODE_CALL is encountered, follows the callee into its function body (depth limit 32). Catches `spawn worker()` where `worker()` calls `helper()` which accesses a global.
+
+## Single-statement body positions — `lower_stmt_in_block` / `lower_body` (BUG-981, adopted 2026-09-12)
+
+The per-statement wrapper in `ir_lower.c` — bounds guards (`lower_stmt_guards`), then the
+shared-struct lock (`emit_shared_lock_if_needed`), the statement, the unlock, plus the
+`return <shared-expr>` special case — is ONE function, `lower_stmt_in_block`. The NODE_BLOCK
+loop calls it per statement; `lower_body` calls it for any body position that the grammar may
+fill with a BARE statement instead of a block. Two such positions exist today, both produced
+by the parser as a bare `NODE_EXPR_STMT`: the statement-form defer body (`defer stmt;`,
+parser.c ~2040) and the expression-form switch arm (`1 => expr,`, parser.c ~1786). Before
+this both were handed straight to `lower_stmt` and got no lock and no IR guard — measured as
+an unlocked `shared struct` write in the emitted C. `if`/`for`/`while`/`@critical`/`@once`
+bodies are always blocks (braces are mandatory), an `orelse { }` fallback is a block, and
+the for-init has its own lock site. **A parser change that produces a bare statement in a
+new body position must route it through `lower_body`**; the REQUIRED fingerprints in
+`tools/emit_audit.sh` pin the two known forms.
+
+Found beside it: the switch-arm lowering raised `block_defers_managed` unconditionally, but
+only a NODE_BLOCK body decrements it, so an expression-form arm left the counter raised and
+the next block in the function skipped its own block-exit defer fire (a real miscompile,
+pinned by `tests/zer/switch_arm_expr_form_ok.zer`). The counter is now raised only for a
+block body.
 
 **Error vs Warning:** `has_atomic_or_barrier(node)` scans the spawned function body for `@atomic_*` or `@barrier*` intrinsics. If found → **warning** (developer is doing manual synchronization, lock-free pattern possible). If not found → **error** (no synchronization at all, definitely unsafe).
 
@@ -11430,6 +11452,77 @@ only after the `if (h->escaped) continue;` skip — the -2 sentinel would be
 an OOB read there. Read-back aliases inherit escaped via the snapshot, so
 they don't false-flag as leaks either. If you ever add code that clears
 escaped on handles wholesale, exclude `local_id == IR_GLOBAL_ROOT_ID`.
+
+**Since BUG-983 (2026-09-09) the invariant is enforced by the CONSTRUCTOR**:
+`ir_add_compound_handle` sets `escaped` when `local_id == IR_GLOBAL_ROOT_ID`.
+Reason: `ir_extract_compound_key` now resolves a global-rooted PROJECTION
+(`g.p`, `g_arr[0].q`) to `(IR_GLOBAL_ROOT_ID, "g.p")` through the shared
+`ir_global_projection_key` (the same key G5's store sinks write), so any of
+its ~30 callers may create a global entry — the free sink, the orelse
+read-back, the field-read UAF walk, the alias arms. Before, G5 wrote entries
+nothing else could find: `g.p = n orelse return; free(g.p); g.p.v` was clean.
+A BARE global ident still returns -1 from the extractor (its arms key the
+plain name, above). Three rules that came with it, all in the IR_ASSIGN
+passthrough handler: (1) a plain `=` whose target IS a tracked slot is a
+RESET, not a use — `ir_assign_target_is_tracked_slot` makes the UAF walker
+descend only the slot's object chain, so the taught `g.p = null;` / `h.p =
+null;` compiles while `hp.p = null` through a freed `hp` still fails; a
+local slot receiving an untracked value is cleared (G5 already cleared the
+global); (2) a slot-to-slot copy `b.p = a.p` aliases (`ir_alias_slot_to_slot`,
+after G5 so a global target keeps it); (3) the bare assign spelling
+`h.p = alloc(T);` — target a slot, not a local — registers through
+`ir_register_alloc_result_compound` (BUG-982), and `ir_mark_local_escaped`
+escapes every entry rooted at the local so a returned / globally-stored
+struct takes its carried allocations with it. Diagnostics name a global root
+by its key via `ir_root_display` (was `'?'`).
+
+**A struct VALUE carries its compounds — `ir_carry_compounds` (BUG-984).**
+The question "this aggregate moved; what allocations went with it?" has FOUR
+sites and one answer: `H b = a` (IR_COPY, prefix none), `H h = { .inner = i }`
+and the nested literal `{ .inner = { .p = alloc(T) } }` (STRUCT_INIT_DECOMP,
+prefix `.field` — a nested literal is a temp whose own decomposition already
+registered `(temp, ".p")`), and `h.inner = i` / `g.inner = i`
+(`ir_store_struct_value_into_slot` at the passthrough-ASSIGN and FIELD_WRITE
+sinks, prefix = the slot's key). Only the first existed before. A struct value
+has NO bare handle — an arm that tests `ir_find_handle(value_local)` and stops
+sees nothing; carry the rows rooted at it instead. The slot-clear rule
+(`ir_value_clears_slot`) is gated on the VALUE'S KIND so it can never undo an
+alias another arm of the same instruction formed — the view-alias matrix
+caught the arm-order version of that mistake.
+
+**A PARAM gets its identity at its first unwrap; a fallback block knows WHOSE
+null path it is (BUG-985).** `void drop(?*T p){ *T q = p orelse return;
+free(q); }` was a caller-side "never freed": the unwrap is a passthrough
+`_zer_or = p` from a bare param ident with no handle, so no alias formed and
+`free(q)` reached nothing rooted at `p`. Now (1) the passthrough bare-ident
+and field arms create the param's handle / compound (ALIVE, minted id,
+`escaped` — a param is never the callee's leak) before aliasing, through the
+ONE predicate `ir_type_reads_as_ref` (looks through `?`; shared with the
+IR_FIELD_READ arm, which also marks a param's fresh compound ALIVE so an
+if-capture free joins to MAYBE rather than vanishing at UNKNOWN + FREED);
+(2) `IRBlock.orelse_fallback_local` (set by ir_lower beside every
+`is_orelse_fallback` tag) names the optional temp the branch tested, and the
+summary builder skips a fallback return for param i only when that temp
+shares an alloc_id with an entry rooted at i — its OWN null path, where the
+caller's argument was null and there was nothing to free; (3) the summary's
+kind gate unwraps `?`; (4) `IRHandleInfo.freed_then_reset` /
+`maybe_freed_then_reset` keep the fact of a free across the BUG-983 slot
+reset (`h.p = null;` inside the callee), merged definite-only-if-all-preds;
+(5) a bare tracked ident is a reset target too (`mp = null;` after the free
+is not a use — the FREED state is kept). What still stays MAYBE: the
+if-capture form (limitations.md).
+
+**A pointer VIEW of a local aggregate re-roots its projections (BUG-986).**
+`*H hp = &h;` and the hoisted `%t = &u` of a union / optional switch are
+views: `hp.p` and `h.p` are ONE slot. `IRHandleInfo.view_root_local` (set by
+the view arm for `&<struct|union|array local>` with no allocation of its own,
+and by the ASSIGN spelling `hp = &h;`; inherited through the alias snapshot;
+merged as same-or-AMBIGUOUS) is consulted by `ir_extract_compound_key` — which
+now takes the path state — to re-root a PROJECTION onto the aggregate's local.
+The bare pointer is never re-rooted (it is its own variable), and an ambiguous
+view (-2) falls back to the old per-pointer keying. Because the re-rooting
+lives in the one key query, every sink agrees by construction; the pointer
+capture `|*q|` (an address OF a slot, then a deref) is the remaining residual.
 
 Scoping lesson (recorded because the first scoping was WRONG): the
 original fix sketch said "needs a per-PathState global table touching the

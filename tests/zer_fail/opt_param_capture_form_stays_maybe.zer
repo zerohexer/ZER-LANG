@@ -1,0 +1,8 @@
+// expect-error: may not be freed on all paths
+// BUG-979 residual (documented in limitations.md): the `if (h.p) |q| { free(q); }`
+// capture form joins the freed and the null path INSIDE the callee, so the summary
+// is MAYBE and the caller is told the field may not be freed on all paths.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop(*H h) { if (h.p) |q| { free(q); } h.p = null; }
+u32 main() { H h; h.p = alloc(T); drop(&h); return 0; }

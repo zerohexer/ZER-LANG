@@ -447,9 +447,9 @@ script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE
 `-o` path (CLAUDE.md "zerc -o gotchas") — getting this wrong yields exit 127 on every cell and looks
 like a compiler failure.
 
-**WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-08-27 — do not quote from
-memory, the census in this file was once wrong by 2x).** NINE gates, each printing its own verdict
-line, plus TEN axis-crossed matrices:
+**WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-09-12 — do not quote from
+memory, the census in this file was once wrong by 2x).** TEN gates, each printing its own verdict
+line, plus TWELVE axis-crossed matrices:
 
 | gate | verdict line it prints |
 |---|---|
@@ -460,11 +460,13 @@ line, plus TEN axis-crossed matrices:
 | `audit_type_dispatch.sh` | `OK — no new raw type-dispatch sites.` |
 | `audit_carrier_dispatch.sh` | `OK — no new hand-rolled carrier dispatches.` |
 | `emit_audit.sh` | `OK — no dead-stub markers in emitted C across 5 samples.` |
-| `sink_matrix.sh` | `SINK MATRIX CLEAN` (154 cells as of 2026-09-10 — this number drifts, RUN the gate) |
+| `sink_matrix.sh` | `SINK MATRIX CLEAN` (162 cells as of 2026-09-12 — this number drifts, RUN the gate) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
+| `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` (10th gate, BUG-1003) |
 
-Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto. (The conc
-matrix prints its own `=== conc-matrix: N/N cells correct ===` line — 114 as of 2026-09-11, and like
+Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto /
+sharedlock / borrow-join (the last two added 2026-09-12 with BUG-998..1001). (The conc matrix
+prints its own `=== conc-matrix: N/N cells correct ===` line — 124 as of 2026-09-12, and like
 every count in this file that number drifts: RUN it.)
 
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
@@ -1700,10 +1702,10 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 566 | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 680 | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 37 | `tests/test_zer.sh` |
-| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 23 | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 634 | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 897 | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 48 | `tests/test_zer.sh` |
+| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 22 | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 70 | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |

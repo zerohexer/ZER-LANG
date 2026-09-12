@@ -197,7 +197,17 @@ switch.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980), grouped, with the branch to take each from
+## ~~OPEN~~ CLOSED 2026-09-12 — FIVE BRANCHES SURVEYED 2026-09-10: all 74 live holes taken (BUG-975..1024), plus BUG-1025..1027 found by probing afterwards
+
+**Status 2026-09-12:** every class and every residue row below is struck through with the
+BUG number that closed it; the full re-run of the 105 extracted branch negatives against
+the merged compiler reports no HOLE and no MASKED entry that is not a wording difference on
+a rule main already had. Nothing remains to harvest from `v6o9c5` / `3sdup9` / `qo0mm9` /
+`ppnatu` / `vgonmt`. The three OPEN residuals that came out of the work (keep-arg false
+leak, post-free-loop read, if-capture optional-param summary) are their own entries above.
+The original survey follows, kept as the ledger of what was measured.
+
+### (original heading) FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes, grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 

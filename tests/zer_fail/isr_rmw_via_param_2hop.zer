@@ -1,4 +1,4 @@
-// expect-error: read-modify-written in a single statement
+// expect-error: read-modify-written and is shared
 // BUG-785 transitivity: the parameter is forwarded one more call before the RMW.
 volatile u32 counter;
 void inner(volatile *u32 p) { *p += 1; }

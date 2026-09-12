@@ -5,6 +5,43 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1006/1007: the RMW rule was per-STATEMENT, so splitting it over two hid it (survey class 6); matrices honour ZER_MATRIX_ZERC
+
+Cherry-picked from `claude/loving-davinci-vgonmt` `27e4987` (its 974/975, from
+`vigilant-tesla-1zukjq` 924/925). Measured on main first: `isr_rmw_split_statements`
+compiled clean. Conflicts: main's BUG-971/976 static-local table and depth-exceeded
+flags kept; the spawn-sink taint table is GROWABLE here rather than the branch's fixed
+`[RMW_ALIAS_MAX]` (a fixed table that drops its 17th row is the BUG-976 defect, and the
+ISR-sink table was already growable — one `rmw_tab_set`, no fixed path).
+
+### BUG-1006 — `u32 t = g; g = t + 1;` was not a read-modify-write at either sink
+
+Every form the rule knew — `g += 1`, `g = g + 1`, `g = @truncate(u32, g) + 1`,
+`*p += 1` through an alias, a helper doing `+= 1` — was answerable inside ONE
+assignment. The identical operation over two statements answered "no" at both, so the
+two-statement spelling was accepted while the one-statement spelling was rejected. On
+bare metal that is a lost update with no diagnostic and no fault.
+
+Fix: a NAME -> GLOBAL value taint (`RmwTaintEnt`, checker.h): a local whose value came
+from global G — directly or from a local already carrying G — carries G, and a write to
+G whose value mentions such a local IS the RMW. Re-binding the local from something else
+clears it, so `u32 t = g; t = 5; g = t;` stays accepted. Both sinks share one entry
+shape and one set of query helpers: the ISR sink (`Checker.rmw_taints`, filled while the
+body is checked) and the spawn sink (`_rmw_vtaint`, filled while a CALLEE body is
+walked). The diagnostic dropped "in a single statement" (nine negatives re-worded).
+
+Tests: `tests/zer_fail/isr_rmw_split_statements.zer`; hw-matrix `RFORM_SPLIT_STMT` /
+`RFORM_SPLIT_2HOP` at both sites plus three positive boundary cells (taint cleared,
+other global, non-shared) — 43/43. Zero corpus cost.
+
+### BUG-1007 (tooling) — every `tests/test_*_matrix.c` ignored argv and graded `./zerc`
+
+Pointing a grid at a pre-fix compiler to prove a new cell FIRES measured the current one.
+All matrices now honour `ZER_MATRIX_ZERC`, the same affordance `tools/sink_matrix.sh`
+has always had.
+
+---
+
 ## Session 2026-09-12 — BUG-1005: the IR-rewritten call emitter adapted no argument (found by a sink-matrix boundary cell)
 
 Not from any branch. The p25 boundary cell `g = len_of(local_array)` was written to prove

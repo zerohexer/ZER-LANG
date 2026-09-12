@@ -2024,7 +2024,12 @@ The atomic-cell rule does not cover the window between `spawn` and `.join()`:
 
 ---
 
-### CLASS 6 — RMW SPLIT OVER TWO STATEMENTS (MEDIUM, bare-metal) — `1zukjq`
+### ~~CLASS 6 — RMW SPLIT OVER TWO STATEMENTS~~ — **CLOSED 2026-09-12 as BUG-1006, DO NOT REDO**
+
+> Cherry-picked `1zukjq` `1e55f54`: a NAME -> GLOBAL value taint at BOTH sinks (ISR
+> `Checker.rmw_taints`, spawn `_rmw_vtaint`), `RFORM_SPLIT_STMT`/`_2HOP` cells + three positive
+> boundary cells in the hw-matrix (43/43). Also BUG-1007: all matrices honour
+> `ZER_MATRIX_ZERC`. Original:
 
 **Direct residual of BUG-792.** That fix made the rule catch the written-out
 single-statement form (`g = g + 1`); splitting the same operation over two statements

@@ -5,6 +5,65 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-987..989: three forging doors — `@pun` with no runtime check, `@inttoptr` to an enum, `@container` of a whole object
+
+Adopted from `claude/loving-davinci-qo0mm9` (its BUG-984..986, themselves from
+`vigilant-tesla-ef9cao`). All eleven survey reproducers (class 5) compiled clean on main
+— measured with the extracted files — and reject for their stated reason now. The commit's
+two emitter defects (a non-finite float literal emitted as the bare token `inf`; the
+float-to-int saturation guard emitted as a statement expression at file scope) depend on
+the cast-policy unification main does not have yet and are held for the next step.
+
+### BUG-987 — `@pun`'s runtime `type_id` check does not exist when either pointee is a primitive
+
+The emitter writes `if (pn.type_id != TGT && pn.type_id != 0) trap`, and only struct /
+enum / union pointees carry a `type_id` — everything else packs 0, so the comparison
+folds to false. Measured on main, all accepted with no diagnostic and no trap: `struct P
+{ *u32 p; }` from `*u64` (an integer became a working pointer — wrote 42 through it),
+`struct Box { State s; }` from `*u32` (a forged enum dispatched to the LAST switch arm),
+a `bool` holding 200, a funcptr from `*u64`, a forged slice `len`. The first is an
+integer-to-pointer conversion with no `@inttoptr` and no `mmio` — the grammar-level
+closure. Fix: reject only when the runtime check *cannot fire* (`pun_type_id_check_can_fire`),
+the pointee types differ, and the TARGET carries a value with a validity invariant
+(`type_carries_forgeable`: pointer / opaque / slice / funcptr / enum / bool / optional /
+Handle / builtin container, recursing arrays, structs and unions; exhaustive switch, no
+`default:`). Reinterpreting bits as plain integers forges nothing, so the byte-view idiom
+still compiles (`tests/zer/pun_no_invariant_ok.zer`). Tests:
+`tests/zer_fail/pun_forge_{pointer,enum,slice,funcptr}.zer`.
+
+### BUG-988 — the FOURTH enum-forging door: `@inttoptr` to an enum-carrying pointee
+
+The door set was documented closed at three (`@bitcast` / `@truncate` / `@saturate`) on
+the reasoning "ZER has no int->enum cast". `@inttoptr` IS an int-to-pointer cast, and
+dereferencing its result reads an enum out of foreign bits — measured with the register
+holding 200: no guard emitted, the exhaustive switch returned 3. REJECTED rather than
+guarded (guarding would mean firing at every read through the pointer — a fresh N-sink
+surface); the diagnostic routes to the guarded idiom `State s = @bitcast(State, *r)`,
+which `tests/zer_trap/mmio_enum_via_bitcast_trap.zer` proves still traps. Corpus cost
+zero. Tests: `tests/zer_fail/inttoptr_enum_{target,in_struct}.zer`.
+
+### BUG-989 — `@container` had a two-valued domain for a three-valued fact
+
+`*Inner ip = &i;` where `i` is a standalone `Inner` is not "unknown provenance": the
+compiler saw the address formed and knows it is a WHOLE object that is nobody's field.
+`@container` then subtracts the field offset and hands back a pointer BEFORE the object
+(ASan: stack-buffer-underflow). `Symbol.is_whole_object_addr` is the third state, written
+only through `set_container_prov_{field,whole,unknown}` so the pair cannot drift; both
+sinks (`@container(*O, ip, f)` and the inline `@container(*O, &i, f)`, which skipped every
+check) resolve through one classifier `classify_amp_operand`. `&arr[i]` is WHOLE for the
+same reason. Tests: `tests/zer_fail/container_whole_object{,_direct,_alias,_global}.zer`,
+`container_array_element.zer`; positive `tests/zer/container_field_prov_ok.zer`
+(re-pointing both ways, an alias, a parameter).
+
+### A trap re-learned on the way
+
+`types.h` gained a `Symbol` field and only `checker.o` was rebuilt: the mixed-ABI binary
+turned two sink-matrix cells into a HOLE and an OVER-REJECT that had nothing to do with
+the change. `rm -f *.o src/safety/*.o` before `make zerc` after ANY header edit — CLAUDE.md
+already says so, and it cost a loop anyway.
+
+---
+
 ## Session 2026-09-12 — BUG-981..986: slot-stored allocations, global projections, struct values that carry allocations, optional-param frees, pointer views of locals — and two single-statement bodies that took no lock
 
 Adopted from `claude/loving-davinci-3sdup9` (its BUG-972 / 975 / 976 / 977 / 979 / 981),

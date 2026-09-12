@@ -5,6 +5,50 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (2026-09-12, LOW, unmeasured)
+
+BUG-988 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch
+downstream *elides work* on the assumption that every value is a declared variant, and that
+elision was measured turning a bad value into a wrong dispatch.
+
+The same intrinsic can produce a pointer to a struct carrying a `*T`, `[*]T`, `bool`,
+optional or `Handle`, and reading those fields forges those values from hardware bits. That
+was NOT shipped, deliberately:
+
+- `@inttoptr` **is** the sanctioned integer-to-pointer door (mmio-gated and audit-visible),
+  so a hardware register holding an address is the thing it exists to express;
+- `lib/compat.zer` depends on `@inttoptr(*opaque, ...)` for its pointer arithmetic, so the
+  blanket predicate (`type_carries_forgeable`) has a non-zero corpus cost;
+- no wrong-dispatch or wrong-elision defect has been measured for these, unlike the enum
+  case.
+
+If this is taken up, measure first: find a downstream analysis that ELIDES a check on the
+strength of one of these types, the way the exhaustive switch does for enums. Absent that,
+this is an unmeasured tightening and should stay unshipped.
+
+## NOTE — the exhaustive-enum switch's last-arm elision is the amplifier, not the hole
+
+Worth writing down because it explains why every enum-door bug reads as severe. Lowering an
+exhaustive `switch` emits the final arm as an **unconditional else**:
+
+```
+if (s == 0) -> arm0; else if (s == 1) -> arm1; else -> arm2;   /* no test on arm2 */
+```
+
+That is sound exactly while every enum value is a declared variant — which is what the
+forge doors defend. So a missed door does not merely let a strange value through; it makes
+that value *take an arm*, and the `return 77` fall-through after the switch becomes dead
+code. Every enum-forge bug to date (BUG-843, 864, 891, 910, and now 988) reports as "the
+switch silently ran its LAST arm" for this reason.
+
+Making the switch defensive (test the last arm too, fall through on no match) would remove
+the amplifier permanently and independently of door coverage. It was NOT done here: it
+costs a comparison and a branch on every enum switch, it silently does nothing on a forged
+value rather than trapping, and ZER's chosen answer is to trap at the point of forgery.
+Recorded as the alternative in case the door set ever stops being closable.
+
+---
+
 # HANDOFF — read this first (updated 2026-08-26: TRACKER 3 IS CLOSED)
 
 **ALL NINE `vigilant-tesla` BRANCHES ARE FULLY CONSUMED. Every row of all three harvest
@@ -240,11 +284,14 @@ entered separately above.
 `loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
 `_dowhile_past_end` `dowhile_counter_past_end_bug748`
 
-**5. FORGING DOORS — 11. TAKE `qo0mm9`** (forked 2 days later than `vgonmt`; both have these
-22 shared cells, compare per item at adoption).
-`@pun` (4): `pun_forge_enum` `_slice` `_funcptr` `_pointer`
-`@inttoptr` → enum (2): `inttoptr_enum_target` `inttoptr_enum_in_struct`
-`@container` (5): `container_whole_object` `_alias` `_direct` `_global` `container_array_element`
+### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-12 as BUG-987/988/989 (from `qo0mm9`)
+
+`@pun` is refused when its runtime `type_id` check cannot fire and the target carries a
+value with a validity invariant (BUG-987, `type_carries_forgeable`); `@inttoptr` to an
+enum-carrying pointee is refused with a route to the guarded `@bitcast` (BUG-988, the door
+set stays closed at three); `@container` provenance is three-valued, so `&wholeObject` /
+`&arr[i]` is rejected at both sinks (BUG-989, `Symbol.is_whole_object_addr`). The two
+`bool_mint_*` cells in class 10 are the bool sibling and are still open.
 
 ### ~~6. ATOMIC CELL x SCOPED SPAWN — 3, race window~~ — CLOSED 2026-09-11 as BUG-979
 
@@ -2109,7 +2156,7 @@ arm or a `do-while` body:
 
 ---
 
-### CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`
+### ~~CLASS 13 — `@container` WHOLE-OBJECT / ARRAY ELEMENT (MEDIUM) — `ef9cao`~~ — **CLOSED 2026-09-12 as BUG-989 (three-valued provenance, both sinks). DO NOT REDO.**
 
     struct Inner { u32 a; }
     struct Outer { u64 pad; Inner in; }

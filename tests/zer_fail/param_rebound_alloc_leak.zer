@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1025: a parameter re-bound to a FRESH allocation. The leak check exempted every
+// param (the caller owns what it names) — but the caller's pointer is unchanged and
+// nobody holds the new allocation. Leaked with no diagnostic.
+struct T { u32 v; }
+void f(*T p) {
+    p = alloc(T) orelse return;
+    p.v = 1;
+}
+u32 main() { T t; f(&t); return 0; }

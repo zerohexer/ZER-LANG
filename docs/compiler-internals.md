@@ -7108,6 +7108,34 @@ All changes confined to `zercheck_ir.c`:
 - **Phase F** — delete zercheck.c (Makefile, zerc_main, zercheck.h),
   tag v0.5.0.
 
+### The wildcard array slot `(root, "[*]")` (BUG-1026, 2026-09-12)
+
+A variable-index store `arr[i] = p` cannot register a nameable compound, so it used to
+register nothing (the value was marked `escaped` for the LEAK question only). Now it
+registers `(arr, "[*]")` — or `(IR_GLOBAL_ROOT_ID, "g_arr[*]")` for a global array or a
+global projection — through `ir_register_wild_index_view`, called from BOTH store arms
+(IR_INDEX_WRITE, and the IR_ASSIGN "Phase E untrackable target" arm). Three rules keep it
+sound and quiet:
+
+1. **It is a view SET, never an alias.** Each store ADDS the value's `alloc_id` to
+   `view_alloc_ids` (overflow flag past 8 = every tracked allocation is a candidate).
+   An alias would remember only the last store.
+2. **Only USE sites read it.** `ir_check_ident_uaf` consults it in two places: when
+   `ir_extract_compound_key` fails on a NODE_INDEX (a variable index — sibling scan over
+   every `[k]` and `[*]` of the same prefix, `ir_find_invalid_index_slot(any_slot=true)`),
+   and when a literal-index lookup finds no invalid entry (`any_slot=false`: `[*]` only).
+   `ir_add_compound_handle` / the free path never match `[*]` — BUG-741 owns
+   variable-index frees and a free-everything loop must stay clean.
+3. **DEFINITELY invalid only** (`ir_definitely_invalid`: FREED / TRANSFERRED, guard not
+   disjoint). MAYBE_FREED is exactly the loop-merge state of `for (k) free(arr[k])`, and
+   five positives (`arr_free_loop_ok`, `handle_array`, `dyn_array_guard`, ...) broke under
+   a draft that reported it. The post-loop read is the recorded residual.
+
+It owns nothing (`alloc_id` 0, `escaped` true, unknown color), so no leak reporter can
+name it. If you add a new READ sink for index expressions, call
+`ir_find_invalid_index_slot`; if you add a new STORE arm, call
+`ir_register_wild_index_view` — the two halves are one fact.
+
 ### What NOT to do in zercheck_ir.c
 
 - Do NOT invoke zercheck_ir from zerc_main.c yet — that is Phase E.

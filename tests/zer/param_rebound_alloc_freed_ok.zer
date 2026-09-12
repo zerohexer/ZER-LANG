@@ -1,0 +1,18 @@
+// BUG-1025 boundary: a parameter re-bound to a fresh allocation that IS freed, and
+// a parameter that keeps naming the caller's object (never a leak).
+struct T { u32 v; }
+u32 f(*T p) {
+    p = alloc(T) orelse return;
+    p.v = 5;
+    u32 v = p.v;
+    free(p);
+    return v;
+}
+void g(*T p) { p.v = 9; }
+u32 main() {
+    T t;
+    g(&t);
+    if (f(&t) != 5) { return 1; }
+    if (t.v != 9) { return 2; }
+    return 0;
+}

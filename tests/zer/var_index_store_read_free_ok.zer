@@ -1,0 +1,24 @@
+// BUG-1026 boundary: fill an array through variable indices, read every slot, then
+// free every element through a variable index (BUG-741's path). The wildcard slot
+// must not turn the free-everything loop into a use-after-free: only a DEFINITELY
+// freed slot is reported, never the MAYBE the loop's own back-edge produces.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T p = alloc(T) orelse return;
+        p.v = i + 1;
+        arr[i] = p;
+    }
+    u32 sum = 0;
+    for (u32 j = 0; j < 4; j += 1) {
+        *T q = arr[j] orelse return;
+        sum += q.v;
+    }
+    for (u32 k = 0; k < 4; k += 1) {
+        *T q = arr[k] orelse return;
+        free(q);
+    }
+    if (sum != 10) { return 1; }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: a slot of 'arr' holds a pointer that is freed
+// BUG-1026: the wildcard is a view SET, not an alias of the LAST store — freeing the
+// FIRST of two pointers stored through variable indices must still be seen.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] arr;
+    u32 i = 1;
+    u32 j = 2;
+    *T p = alloc(T) orelse return;
+    *T q = alloc(T) orelse return;
+    arr[i] = p;
+    arr[j] = q;
+    free(p);
+    *T r = arr[j] orelse return;
+    u32 v = r.v;
+    free(q);
+    return v;
+}

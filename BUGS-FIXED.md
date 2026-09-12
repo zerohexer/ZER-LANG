@@ -5,6 +5,53 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1025/1026: two holes found by probing after the harvest, not by any branch
+
+### BUG-1025 — a parameter re-bound to a fresh allocation leaked with no diagnostic
+
+```zer
+void f(*T p) { p = alloc(T) orelse return; p.v = 1; }   // accepted
+```
+
+The exit-time leak check exempted every `is_param` local — right while the parameter
+still names the caller's object, wrong once it has been re-bound to an allocation this
+function made: the caller's pointer is unchanged, nobody holds the new one. The
+exemption is now conditional on the entry having NO allocation origin (unknown color, no
+alloc line); an entry that records this function's own allocation is leak-checked
+whatever local it sits in. Free / store-to-global / return still cover it.
+Tests: `tests/zer_fail/param_rebound_alloc_leak.zer`, `tests/zer/param_rebound_alloc_freed_ok.zer`.
+
+### BUG-1026 — a pointer stored into an array at a VARIABLE index vanished from the analysis
+
+```zer
+?*T[4] arr;  u32 i = 1;
+*T p = alloc(T) orelse return;
+arr[i] = p;  free(p);
+*T r = arr[1] orelse return;  r.v        // ran, exit 0 — silent UAF
+```
+
+A variable-index store was "untrackable": the value was marked escaped (no false leak)
+and NO compound was registered, so every later read of the array — literal or variable
+index — was a use of nothing. All four store x read spellings were accepted, and the
+global-array sibling. ASan cannot see it (`alloc(T)` is an auto-Slab that recycles).
+
+Fix: the slot cannot be NAMED but it can be BOUNDED. The store registers a WILDCARD
+compound `(arr, "[*]")` (or `(IR_GLOBAL_ROOT_ID, "g_arr[*]")`) that VIEWS every
+allocation ever stored through a variable index — a view SET (the BUG-849 machinery),
+because an alias would remember only the LAST store and `free(first)` would go unseen.
+Only the USE sites consult it: a variable-index read asks whether ANY slot of the array
+is DEFINITELY freed (a sibling scan over `[k]` and `[*]`); a literal-index read asks the
+exact slot first, then `[*]`. Two deliberate limits: MAYBE_FREED is not reported through
+the wildcard, because that is what the free-everything loop `for (k) free(arr[k])`
+produces at its own back-edge and reading `arr[k]` there is the next element (five
+existing positives measured this: they broke under a first draft that reported MAYBE);
+and the free path never sees the wildcard (BUG-741 owns variable-index frees), so it
+owns nothing and is escaped from birth — UAF only, never a leak report.
+Tests: `tests/zer_fail/var_index_store_uaf_{var_read,lit_read,global,first_of_two}.zer`,
+`tests/zer/var_index_store_read_free_ok.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-1021..1024: the last four survey residue holes — label in a defer body, shared field in an asm operand, a volatile index read twice, a carrier lending two locals
 
 The survey's residue list (`qo0mm9` `d0e6b11` / `99c922c`, `ppnatu`, `f079806`). Each

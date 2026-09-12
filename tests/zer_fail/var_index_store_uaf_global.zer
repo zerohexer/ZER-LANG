@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: a slot of 'g_arr' holds a pointer that is freed
+// BUG-1026: the GLOBAL-array sibling — the wildcard slot is rooted at the
+// IR_GLOBAL_ROOT_ID pseudo-root, like every other global projection.
+struct T { u32 v; }
+?*T[4] g_arr;
+u32 main() {
+    u32 i = 1;
+    u32 j = 1;
+    *T p = alloc(T) orelse return;
+    p.v = 7;
+    g_arr[i] = p;
+    free(p);
+    *T r = g_arr[j] orelse return;
+    return r.v;
+}

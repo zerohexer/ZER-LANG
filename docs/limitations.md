@@ -5,6 +5,33 @@ Entries removed once fixed.
 
 ---
 
+## OPEN — passing a fresh allocation to a `keep` parameter is reported as a LEAK (2026-09-12, LOW — over-rejection, pre-existing)
+
+```zer
+?*T g_p;
+void keep_it(keep *T q) { g_p = q; }
+void k2() { *T p = alloc(T) orelse return; keep_it(p); }   // zercheck: 'p' never freed
+```
+
+The direct store `g_p = p;` escapes `p` (no leak report); the same store one call away
+through a `keep` parameter does not — zercheck's per-function summary records what a
+callee FREES (`frees_param`), not what it STORES, so the caller sees a pointer that was
+neither freed nor escaped. Measured identical on the pre-session baseline; found while
+writing the BUG-1025 boundary. Fix sketch: a `stores_param[i]` bit on `FuncSummary`
+(set when the body escapes param i to a global / static / keep sink — the checker already
+INFERS `keep` from exactly those sinks, so the fact exists one layer up), consumed at the
+call site as `ir_mark_local_escaped` on the argument. Workaround: store through a global
+directly, or free in the caller.
+
+## OPEN — a read after a free-everything loop over a variable-index array is not reported (2026-09-12, LOW — precision residual of BUG-1026)
+
+`for (k) free(arr[k]); ... arr[j].v` — after the loop every slot is MAYBE_FREED (the
+loop merge), and the BUG-1026 wildcard reports only DEFINITELY freed slots, because the
+same MAYBE is what the loop's own back-edge sees before its next element. Unchanged
+from before BUG-1026 (nothing was tracked at all). A path-sensitive answer needs the
+loop's exit state distinguished from its head state, which the per-block lattice does
+not carry today.
+
 ## OPEN — `@inttoptr` to a pointer-carrying (not enum-carrying) pointee (2026-09-12, LOW, unmeasured)
 
 BUG-988 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch

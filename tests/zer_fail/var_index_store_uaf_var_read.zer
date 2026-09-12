@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: a slot of 'arr' holds a pointer that is freed
+// BUG-1026: a pointer stored into an array at a VARIABLE index had no slot entry, so
+// after free(p) a read of the array at any index was a use of nothing. Ran, exit 0.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] arr;
+    u32 i = 1;
+    u32 j = 1;
+    *T p = alloc(T) orelse return;
+    p.v = 7;
+    arr[i] = p;
+    free(p);
+    *T r = arr[j] orelse return;
+    return r.v;
+}

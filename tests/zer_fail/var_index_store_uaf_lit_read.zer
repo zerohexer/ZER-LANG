@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'arr' is freed
+// BUG-1026: the LITERAL-index read of a slot filled through a variable index. The
+// exact slot `[1]` has no entry; the wildcard the variable store registered does.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] arr;
+    u32 i = 1;
+    *T p = alloc(T) orelse return;
+    p.v = 7;
+    arr[i] = p;
+    free(p);
+    *T r = arr[1] orelse return;
+    return r.v;
+}

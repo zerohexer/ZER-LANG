@@ -2706,6 +2706,107 @@ static bool ir_assign_target_is_tracked_slot(ZerCheck *zc, IRFunc *func,
     return ir_find_compound_handle(ps, root, path, plen) != NULL;
 }
 
+/* BUG-1026: a pointer stored into an array at a VARIABLE index.
+ *
+ *     arr[i] = p;  free(p);  *T r = arr[1] orelse return;  r.v   // ran, exit 0
+ *
+ * A variable-index store is "untrackable": the value was marked escaped and no
+ * compound was registered, so the slot the freed pointer sits in had no entry
+ * and every later read of the array — at a literal OR a variable index — was
+ * a use of nothing. Silent UAF; ASan cannot see it (an auto-Slab recycles).
+ *
+ * The slot cannot be NAMED, but it can be BOUNDED: whatever index the store
+ * used, the pointer is somewhere in `arr`. So the store registers a WILDCARD
+ * compound `(arr, "[*]")` that VIEWS every allocation ever stored through a
+ * variable index (a view SET, the BUG-849 machinery — an alias would remember
+ * only the last store), and the USE sites — only the use sites — consult it:
+ * a read at a variable index asks "is ANY slot of this array DEFINITELY freed?"
+ * (a sibling scan over `[k]` and `[*]`), a read at a literal index asks the
+ * exact slot first and then `[*]`. DEFINITELY: a MAYBE_FREED slot is what the
+ * free-everything loop `for (i) free(arr[i])` produces at its own back-edge,
+ * and reading `arr[i]` there is the loop's next element, not a UAF — so MAYBE
+ * is not reported here (it is not reported today either). The free path never
+ * sees the wildcard (BUG-741 owns variable-index frees). Owns nothing, escaped
+ * from birth: its job is UAF only, never a leak report. */
+static int ir_wild_index_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                             Node *index_expr, int *out_root,
+                             const char **out_path, uint32_t *out_len) {
+    if (!index_expr || index_expr->kind != NODE_INDEX) return -1;
+    Node *obj = index_expr->index_expr.object;
+    int root; const char *pre = NULL; uint32_t plen = 0;
+    if (ir_extract_compound_key(zc, func, ps, obj, &root, &pre, &plen) != 0) {
+        /* a GLOBAL array (`g_arr[i]`) or a projection of one (`g.arr[i]`) */
+        if (obj && obj->kind == NODE_IDENT &&
+            ir_ident_is_unshadowed_global(zc, func, obj)) {
+            pre = obj->ident.name; plen = (uint32_t)obj->ident.name_len;
+        } else if (!ir_global_projection_key(zc, func, obj, &pre, &plen)) {
+            return -1;
+        }
+        root = IR_GLOBAL_ROOT_ID;
+    }
+    char *path = (char *)arena_alloc(zc->arena, (size_t)plen + 4);
+    if (!path) return -1;
+    if (plen) memcpy(path, pre, plen);
+    memcpy(path + plen, "[*]", 4);
+    *out_root = root; *out_path = path; *out_len = plen + 3;
+    return 0;
+}
+static void ir_register_wild_index_view(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                        Node *target_expr, int rhs_local) {
+    if (!target_expr || target_expr->kind != NODE_INDEX || rhs_local < 0) return;
+    if (!target_expr->index_expr.index ||
+        target_expr->index_expr.index->kind == NODE_INT_LIT) return;
+    IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
+    if (!rh || rh->state != IR_HS_ALIVE || rh->alloc_id == 0) return;
+    int aid = rh->alloc_id;   /* read BEFORE the realloc-capable add below */
+    int root; const char *wp; uint32_t wl;
+    if (ir_wild_index_key(zc, func, ps, target_expr, &root, &wp, &wl) != 0) return;
+    IRHandleInfo *ch = ir_add_compound_handle(ps, root, wp, wl);
+    if (!ch) return;
+    ch->state = IR_HS_ALIVE;
+    ch->escaped = true;
+    const int vcap = (int)(sizeof(ch->view_alloc_ids) / sizeof(ch->view_alloc_ids[0]));
+    for (int k = 0; k < ch->view_count; k++)
+        if (ch->view_alloc_ids[k] == aid) return;
+    if (ch->view_count >= vcap) { ch->view_overflow = true; return; }
+    ch->view_alloc_ids[ch->view_count++] = aid;
+}
+/* DEFINITELY freed (or moved): the state the use sites report. */
+static bool ir_definitely_invalid(ZerCheck *zc, IRHandleInfo *h) {
+    if (h->state != IR_HS_FREED && h->state != IR_HS_TRANSFERRED) return false;
+    return !ir_use_guard_disjoint(zc, h);
+}
+/* The use-site half: an invalid slot of `arr` reachable from this index read.
+ * `any_slot` = the index is not a literal, so every `[k]` sibling is a
+ * candidate. Returns the handle whose state/line the report should name. */
+static IRHandleInfo *ir_find_invalid_index_slot(ZerCheck *zc, IRFunc *func,
+                                                IRPathState *ps, Node *index_expr,
+                                                bool any_slot) {
+    int root; const char *wp; uint32_t wl;
+    if (ir_wild_index_key(zc, func, ps, index_expr, &root, &wp, &wl) != 0) return NULL;
+    uint32_t plen = wl - 3;   /* the prefix before "[*]" */
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h->local_id != root || h->path_len <= plen) continue;
+        if (plen && memcmp(h->path, wp, plen) != 0) continue;
+        if (h->path[plen] != '[') continue;
+        bool is_wild = h->path_len == wl && memcmp(h->path, wp, wl) == 0;
+        if (!any_slot && !is_wild) continue;
+        if (ir_definitely_invalid(zc, h)) return h;
+        if (!is_wild) continue;
+        /* the wildcard VIEWS the stored allocations — is any of them gone? */
+        for (int j = 0; j < ps->handle_count; j++) {
+            IRHandleInfo *vh = &ps->handles[j];
+            if (vh == h || vh->alloc_id == 0) continue;
+            bool viewed = h->view_overflow;   /* overflow: sound superset */
+            for (int k = 0; !viewed && k < h->view_count; k++)
+                if (h->view_alloc_ids[k] == vh->alloc_id) viewed = true;
+            if (viewed && ir_definitely_invalid(zc, vh)) return vh;
+        }
+    }
+    return NULL;
+}
+
 static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                 Node *expr, int line, UafReportSet *rs) {
     if (!expr) return;
@@ -2713,7 +2814,24 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     const char *path;
     uint32_t path_len;
     if (ir_extract_compound_key(zc, func, ps, expr,
-                                 &root_local, &path, &path_len) != 0) return;
+                                 &root_local, &path, &path_len) != 0) {
+        /* BUG-1026: a VARIABLE index has no key — ask the slot set instead. */
+        if (expr->kind == NODE_INDEX) {
+            IRHandleInfo *sh = ir_find_invalid_index_slot(zc, func, ps, expr, true);
+            int wroot; const char *wp; uint32_t wl;
+            if (sh && ir_wild_index_key(zc, func, ps, expr, &wroot, &wp, &wl) == 0 &&
+                !urs_has(rs, wroot)) {
+                const char *nm; int nl;
+                ir_root_display(func, wroot, wp, wl - 3, &nm, &nl);   /* name, not "[*]" */
+                ir_zc_error(zc, line,
+                    "use after free: a slot of '%.*s' holds a pointer that is %s "
+                    "(freed at line %d) and this variable index may read it",
+                    nl, nm, ir_state_name(sh->state), sh->free_line);
+                urs_add(rs, wroot);
+            }
+        }
+        return;
+    }
     if (urs_has(rs, root_local)) return;
     IRHandleInfo *h;
     if (path_len == 0) h = ir_find_handle(ps, root_local);
@@ -2721,6 +2839,12 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!h) {
         /* Try root-only when a compound key wasn't found */
         if (path_len > 0) h = ir_find_handle(ps, root_local);
+    }
+    /* BUG-1026: `arr[1]` after `arr[i] = p; free(p);` — the exact slot has no
+     * entry, but the wildcard registered by the variable-index store does. */
+    if (expr->kind == NODE_INDEX && (!h || !ir_is_invalid(h))) {
+        IRHandleInfo *sh = ir_find_invalid_index_slot(zc, func, ps, expr, false);
+        if (sh) h = sh;
     }
     /* BUG-849 — MULTI-VIEW pull. A handle that VIEWS a set of allocations owns
      * none of them, so no free sink updates it. Ask, at the use site, whether
@@ -5001,6 +5125,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 target_expr->index_expr.index &&
                 target_expr->index_expr.index->kind != NODE_INT_LIT) {
                 ir_mark_local_escaped(ps, rhs_local);
+                /* BUG-1026: escaped for the LEAK question; still a slot of the
+                 * array for the USE question. */
+                ir_register_wild_index_view(zc, func, ps, target_expr, rhs_local);
             }
             /* Compound key registration: `container.field = h`
              *
@@ -7058,6 +7185,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * the FIELD_WRITE sibling above. Self-gating; variable indices are
          * skipped by ir_measure_key_path. */
         ir_register_global_field_store(zc, ps, func, target_expr, rhs_local);
+        /* BUG-1026: the VARIABLE-index store registers the wildcard slot. */
+        ir_register_wild_index_view(zc, func, ps, target_expr, rhs_local);
         break;
     }
 
@@ -8807,7 +8936,17 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                  * conservative answer is the opposite of the copy sink's. */
                 if (ir_move_exempts_leak_check(lt)) continue;
                 if (loc->is_temp) continue;
-                if (loc->is_param) continue;
+                /* BUG-1025: a PARAM is exempt because the allocation it names
+                 * belongs to the caller — but only while it still names THAT
+                 * allocation. `void f(*T p) { p = alloc(T) orelse return; }`
+                 * re-binds the parameter to a FRESH allocation this function
+                 * made; the caller's pointer is unchanged, nobody else holds
+                 * the new one, and it leaked with no diagnostic. An entry with
+                 * a known allocation origin (a color and a line) is this
+                 * function's, whatever local it sits in. */
+                if (loc->is_param &&
+                    (h->source_color == ZC_COLOR_UNKNOWN || h->alloc_line <= 0))
+                    continue;
             }
             /* Compound entities (s.h, arr[0]): historically skipped wholesale,
              * which laundered real leaks — `b.h = gp.alloc()` never freed

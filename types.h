@@ -241,6 +241,10 @@ struct Symbol {
      * pointer parameter, a call result), which the spawn sink treats conservatively. */
     const char *borrow_root_name;
     uint32_t borrow_root_len;
+    /* BUG-1024: the carrier was made to point into TWO different locals
+     * (`h.p = &v; h.q = &x;`), so there is no single root to lend; the
+     * scoped-spawn sink refuses such an argument (cannot prove => reject). */
+    bool borrow_root_unknown;
     bool is_volatile_addr_derived; /* usize produced by @ptrtoint(<volatile ptr>) — the
                                     * volatile fact lives on the VALUE once the type
                                     * became an integer, and @inttoptr back to a

@@ -3106,7 +3106,10 @@ static void emit_expr(Emitter *e, Node *node) {
         bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
                                       node->index_expr.index->kind == NODE_ASSIGN ||
                                       node->index_expr.index->kind == NODE_UNARY ||
-                                      node->index_expr.index->kind == NODE_ORELSE);
+                                      node->index_expr.index->kind == NODE_ORELSE ||
+                                      /* BUG-1023: a VOLATILE index is a read that
+                                       * may differ between the check and the use */
+                                      expr_is_volatile(e, node->index_expr.index));
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {
@@ -7745,7 +7748,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
-                   node->index_expr.index->kind != NODE_IDENT &&
+                   /* BUG-1023: a bare IDENT index normally relies on the
+                    * statement-level auto-guard (`if (i >= N) return`), which
+                    * READS THE INDEX TWICE — once in the guard, once in the
+                    * access. For a VOLATILE index the two reads can differ (an
+                    * ISR or another thread stores between them), so the guard
+                    * proves nothing about the access; route it through the
+                    * single-eval trap form below, which reads it exactly once. */
+                   (node->index_expr.index->kind != NODE_IDENT || idx_se) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for

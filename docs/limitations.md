@@ -324,7 +324,7 @@ recorded as their own OPEN entries above the survey.
 **10. SMALLER CLASSES**
 - ~~i64 literal range (3)~~ — CLOSED 2026-09-12 as BUG-992
 - ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED 2026-09-12 as BUG-994
-- ~~MMIO const-ident (2)~~ — CLOSED 2026-09-12 as BUG-996 (`mmio_const_addr`, one query at four sites; the MASKED `_oob_index` below closes with it); `ppnatu`'s `mmio_volatile_index_reject` still open
+- ~~MMIO const-ident (2)~~ — CLOSED 2026-09-12 as BUG-996 (`mmio_const_addr`, one query at four sites; the MASKED `_oob_index` below closes with it); `ppnatu`'s `mmio_volatile_index_reject` CLOSED 2026-09-12 as BUG-1023 (with the array-index single-read form)
 - ~~global init (2)~~ — CLOSED: `global_init_chain_too_deep` as BUG-975, `global_init_from_mutable` 2026-09-12 as BUG-997 (a const global's initializer is substituted by the emitter; a mutable one is rejected at the ZER line)
 - ~~multiview UAF (2)~~ — CLOSED 2026-09-12 as BUG-1013
 - ~~struct-init field (2)~~ — CLOSED 2026-09-12 as BUG-1012
@@ -334,12 +334,9 @@ recorded as their own OPEN entries above the survey.
 - ~~funcptr-binding alias survival (1)~~ — CLOSED 2026-09-12 as BUG-1017 (base-shifted alias table; the same change cuts cycles so a recursive callee reachable from a spawn target or an ISR compiles)
 - ~~ISR RMW split across statements (1)~~ — CLOSED 2026-09-12 as BUG-1006
 - ~~param-local double free (1)~~ — CLOSED 2026-09-12 as BUG-1011
-- spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown`
-- defer body with a label (1) — `qo0mm9`: `defer_body_label` (**relevant to main's own label-path
-  split, BUG-965 — check whether it is the same shape before fixing**)
-- asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
-  **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
-  these are its reproducers.
+- ~~spawn borrow, two unknown roots (1)~~ — CLOSED 2026-09-12 as BUG-1024 (`Symbol.borrow_root_unknown`, set at the second differing root, refused at the spawn sink)
+- ~~defer body with a label (1)~~ — CLOSED 2026-09-12 as BUG-1021 (rejected in the checker: goto is banned there, so the label has no possible use)
+- ~~asm operand shared read (1)~~ — CLOSED 2026-09-12 as BUG-1022 (both reproducers adopted)
 
 ### MASKED — main rejects these, but for the WRONG reason, so the hole is still open (3)
 
@@ -367,8 +364,7 @@ A rejection is not a closure until the REASON matches.
 
 ### `ppnatu` is superseded
 
-One commit, 2 live holes, both duplicated elsewhere. Harvest `mmio_volatile_index_reject` and the
-asm reproducer; skip the rest.
+One commit, 2 live holes, both duplicated elsewhere. Both harvested 2026-09-12 (BUG-1023, BUG-1022).
 
 ### Suggested order
 
@@ -1212,57 +1208,15 @@ this is fixed** — leaving it would turn a deliberate record into a rule nobody
 
 ---
 
-## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+## ~~OPEN~~ CLOSED 2026-09-12 as BUG-1022 — a `shared struct` read in an ASM OPERAND takes NO LOCK
 
-Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
-not reported by any branch. The baseline claimed an asm operand can reach "no local, no
-loop and no effect"; the third was false, and this is what is behind it.
-
-The emitter's per-statement `shared struct` auto-locking does not wrap an `asm`
-statement, so a shared field read in an OPERAND is emitted bare:
-
-```zer
-shared struct A { u32 x; }
-A a;
-naked void k(){
-    asm { instructions: "nop" inputs: { "rax" = a.x } safety: "..." }
-}
-void worker(){ k(); }
-u32 main(){ ThreadHandle t = spawn worker(); t.join(); return 0; }
-```
-
-MEASURED on main at `aeea0cd5` — accepted with **no diagnostic**, and the emitted C is:
-
-```c
-void k(void) { _zer_bb0:; __asm__ __volatile__ ("nop" :  : "a"(a.x)); return; }
-```
-
-no `pthread_mutex_lock`, while the identical read in an ordinary statement emits
-`_zer_mtx_ensure_init` + `pthread_mutex_lock` + read (verified side by side). The whole
-contract of `shared` is that the lock is automatic, so this is an unlocked shared access
-reachable from a spawned thread — the same class as BUG-935, at a site the collector
-never visits.
-
-**Not to be confused with the CALL-laundered shape**, which behaves differently and is
-NOT a hole: a call in an operand reaching two shared structs (`"rax" = touch_both()`) is
-ACCEPTED while the same call in an ordinary statement is REJECTED by the deadlock rule.
-That divergence is the OVER-REJECTION item **O** in the ii7a90 survey proposes to relax
-(a statement with no DIRECT shared access takes no lock, so nothing can nest around the
-call) — the asm site is accidentally already on the relaxed side. Do not "fix" that one
-by tightening asm; fix it by doing O.
-
-**Fix sketch:** the shared-root collector (`find_all_shared_roots_expr`, the
-`SharedRootVec` from BUG-935) does not run on `asm_stmt.inputs` / `.outputs`. Running it
-there and emitting the lock/unlock around the asm statement is the shape of the fix.
-Two hazards to check before shipping it: a lock around an `asm` block inside `@critical`
-(the interrupt-disabled window), and whether locking is even legal in a `naked` function
-under the S1 restriction — this may be a case where REJECTING a direct shared access in
-an operand is the right answer rather than locking it, since a naked function has no
-frame. Decide with the Ban Decision Framework; do not assume the lock.
-
-Tripwire: none yet — write the negative in the same commit as the fix.
-
----
+Rejected, not tracked: `asm` is only legal in a `naked` function, which has no frame to
+take a mutex in (Ban Decision Framework: hardware constraint). One query
+`collect_shared_types_in_expr` over both operand lists. Tests:
+`tests/zer_fail/asm_operand_shared_read.zer`, `tests/zer_fail/asm_shared_operand.zer`
+(the `qo0mm9` and `ppnatu` reproducers). The original entry is retired; the emitter's
+per-statement auto-lock still never wraps an asm statement, which is now a checked fact
+rather than a hole.
 
 ## ~~OPEN~~ CLOSED — BRANCH `loving-davinci-r3an9y` (2026-09-04): all 9 surveyed items fixed 2026-09-08..10; 3 unverified residuals remain
 

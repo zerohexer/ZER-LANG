@@ -1,0 +1,14 @@
+// expect-trap
+// BUG-1023: a VOLATILE index on a fixed array used to get the statement-level
+// auto-guard, which reads the index twice — `if (gi >= 4) { return 0; }` and then
+// `a[gi]` — so a store between the two reads (an ISR, another thread) defeated the
+// guard, and an in-range check let an out-of-range access through. It now takes the
+// single-read inline form: one load, the check and the access both on that load, a
+// TRAP on failure. This test pins the trap: pre-fix the auto-guard returned 0 early
+// (exit 0, no diagnostic); post-fix the out-of-range index traps (exit 133).
+volatile u32 gi = 9;
+u32 main() {
+    u8[4] a;
+    a[gi] = 1;
+    return a[0];
+}

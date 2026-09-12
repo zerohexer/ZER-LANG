@@ -5,6 +5,63 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-12 — BUG-1021..1024: the last four survey residue holes — label in a defer body, shared field in an asm operand, a volatile index read twice, a carrier lending two locals
+
+The survey's residue list (`qo0mm9` `d0e6b11` / `99c922c`, `ppnatu`, `f079806`). Each
+measured live on main first: all five reproducers compiled clean. The asm and label rules
+are the branch's (hand-applied onto main's `check_stmt`); the volatile-index and two-root
+rules are main-shaped implementations of the same findings.
+
+### BUG-1021 — a label inside a `defer` body
+
+`goto` is banned in a defer body, so nothing can ever jump to a label there — and the
+body is lowered into a detached template every fire clones, while a label's block is
+allocated once outside it. Rejected in `check_stmt` NODE_LABEL under `defer_depth > 0`.
+Test: `tests/zer_fail/defer_body_label.zer`.
+
+### BUG-1022 — a `shared struct` field in an asm OPERAND was a bare, unlocked access
+
+`inputs: { "rax" = a.x }` was emitted with no mutex — every other accessor of `a.x`
+is wrapped lock/unlock per statement, so this raced all of them. Ban Decision Framework:
+a HARDWARE constraint (asm lives only in `naked` functions, which have no frame to take
+the mutex in), so rejected rather than tracked; one query `collect_shared_types_in_expr`
+over both operand lists. Closes main's own OPEN ledger entry for this. Tests:
+`tests/zer_fail/asm_operand_shared_read.zer`, `asm_shared_operand.zer`.
+
+### BUG-1023 — a VOLATILE index was guarded by a check that read it once and an access that read it again
+
+```zer
+volatile u32 gi = 0;
+u32 main() { u8[4] a; a[gi] = 1; return a[0]; }
+// emitted:  _zer_t0 = gi; if (_zer_t0 >= 4) return 0;  ...  a[gi] = 1;
+```
+
+An ISR or another thread storing to `gi` between the two reads defeats the guard: a
+4-byte stack array writable past its end, no diagnostic. The same two-read shape sat
+on the MMIO pointer index. Fix: a volatile ident index on a fixed array takes the
+single-evaluation inline form (one load into a temp; the bounds check and the access
+both on the temp; a TRAP on failure) on both emitter paths — the IR path used to exclude
+a bare IDENT from that form and rely on the statement-level auto-guard — and the checker
+skips the auto-guard for it with its own warning. An MMIO pointer index has no inline
+form, so a volatile index there is a compile error with the one-line fix (copy to a
+non-volatile local). A volatile GLOBAL is never range-narrowed by VRP (verified: the
+guard was still emitted under `if (gi < 4)`), so this is the complete set.
+Tests: `tests/zer_trap/volatile_index_single_read_trap.zer` (exit 0 on the baseline —
+the guard returned early — 133 now), `tests/zer_fail/mmio_volatile_index_reject.zer`.
+
+### BUG-1024 — a carrier pointing into TWO different locals lent only the last one
+
+`h.p = &v; h.q = &x; ThreadHandle th = spawn w(h);` recorded `x` as the borrow root
+(BUG-969 keeps ONE name per symbol), so `v = 3` before the join raced the thread's
+`*h.p = 5`. There is no single root to lend, so it is unresolvable: `record_borrow_root`
+sets `Symbol.borrow_root_unknown` when a second, DIFFERENT root is recorded (inherited
+through alias chains), and the scoped-spawn sink refuses such an argument — cannot prove,
+so reject; `&v` / `&x` spell it. Two pointers into the SAME local keep working.
+Tests: `tests/zer_fail/spawn_borrow_two_roots_unknown.zer`,
+`tests/zer/spawn_borrow_carrier_same_root_ok.zer`.
+
+---
+
 ## Session 2026-09-12 — BUG-1020: five use-after-free reporters named an IR local number instead of the variable
 
 ### BUG-1020 — `use after free: local %0 is transferred (freed at line 11)`

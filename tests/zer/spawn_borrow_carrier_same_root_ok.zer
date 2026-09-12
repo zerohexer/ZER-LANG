@@ -1,0 +1,14 @@
+// BUG-1024 boundary: a carrier whose two pointers point into the SAME local has one
+// root and lends it; only two DIFFERENT locals behind one carrier are refused.
+struct H { *u32 p; *u32 q; }
+void w(H h) { *h.p = 5; *h.q = *h.q + 1; }
+u32 main() {
+    u32 v = 0;
+    H h;
+    h.p = &v;
+    h.q = &v;
+    ThreadHandle th = spawn w(h);
+    th.join();
+    if (v != 6) { return 1; }
+    return 0;
+}

@@ -1402,6 +1402,10 @@ u32 z = maybe() orelse g;             // OK — compute it first
 defer { use(z); }
 ```
 
+A label cannot be placed inside a `defer` body (BUG-1021): `goto` is banned there,
+so the label could never be a jump target, and the body is lowered into a template
+that every fire clones.
+
 A forward `goto` that jumps **over** a later `defer` to a label past it is a
 compile error: on that path the defer never registered, so firing it at the
 label would run cleanup that was never set up. Register the defer before the
@@ -3940,6 +3944,10 @@ outputs first, then inputs, in declaration order.
 - An instruction whose CPU feature is not enabled by `--target-features`.
 - `asm` inside a `defer` body, or inside an `async` function.
 - An asm INPUT binding a pointer parameter that is not `keep`.
+- An operand that reads or writes a `shared struct` field. An asm statement is
+  never auto-locked and a naked function has no frame to take the mutex in, so
+  the access would race every locked accessor (BUG-1022). Read the field into a
+  local in an ordinary function and pass the value in.
 
 Load-linked / store-conditional pairs (`lr.w`/`sc.w`, `ldxr`/`stxr`,
 `monitor`/`mwait`) are tracked as a state machine — an unpaired half is
@@ -4588,10 +4596,18 @@ An index gets one of four verdicts:
 | PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
 | LOOP RUNS PAST THE END | the index is the counter of a counted loop that *will* take a value past the bound | **compile error** |
 | UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (early return) |
+| UNKNOWN, **volatile** index | as above, but the index is a `volatile` variable | single-read bounds check — **trap** on failure, never an early return (BUG-1023) |
 
 An index the compiler can prove is *always* wrong is an error, not a runtime
 check — including when it is reached through a variable, and including a range
 that is entirely negative.
+
+The auto-guard reads the index twice — once in `if (i >= N) { return; }` and again
+in the access — which is fine for an ordinary variable and wrong for a `volatile`
+one, whose value can change between the two reads (an interrupt, another thread).
+A volatile index is therefore loaded ONCE into a temporary, and the check and the
+access both use that load. On an MMIO pointer, which has no inline form, a
+volatile index is a compile error: copy it to a non-volatile local first.
 
 <!-- audit: skip -->
 ```zer

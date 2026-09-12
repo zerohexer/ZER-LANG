@@ -909,6 +909,8 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line);
 /* BUG-971: the original three-argument form, for the many GLOBAL call sites. */
 #define track_isr_global(c, n, l, comp) track_isr_global_ex((c), (n), (l), (comp), false, 0)
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count);   /* BUG-1022 */
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -4190,6 +4192,15 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
      * live in global scope but is handled separately at the spawn sink (D4), which
      * rejects it outright rather than borrowing it. */
     if (!rs || rs->is_static) return;
+    /* BUG-1024: a carrier that already points into a DIFFERENT local
+     * (`h.p = &v; h.q = &x;`) has no single root to lend. Recording only the
+     * latest name lent `x` and left `v` writable while the thread ran through
+     * `h.p`. One fact, not one name: mark it unresolvable and let the spawn sink
+     * refuse the argument (cannot prove => reject; `&v` / `&x` spell it). */
+    if (sym->borrow_root_name &&
+        (sym->borrow_root_len != rs->name_len ||
+         memcmp(sym->borrow_root_name, rs->name, rs->name_len) != 0))
+        sym->borrow_root_unknown = true;
     if (scope_lookup_local(c->global_scope, rs->name, rs->name_len) != NULL) {
         /* keep the name anyway: the spawn sink needs it to SEE a threadlocal root. */
         sym->borrow_root_name = rs->name;
@@ -4236,6 +4247,7 @@ static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                 if (src->borrow_root_name) {
                     sym->borrow_root_name = src->borrow_root_name;
                     sym->borrow_root_len  = src->borrow_root_len;
+                    if (src->borrow_root_unknown) sym->borrow_root_unknown = true;
                 }
             } else if (type_dispatch_kind(root_type) == TYPE_ARRAY) {
                 bool is_global = src && scope_lookup_local(c->global_scope,
@@ -11249,6 +11261,28 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)obj->array.size);
                     mark_proven(c, node);   /* diagnosed — do not also auto-guard */
                 }
+                Symbol *vidx = scope_lookup(c->current_scope,
+                    node->index_expr.index->ident.name,
+                    (uint32_t)node->index_expr.index->ident.name_len);
+                if (!checker_is_proven(c, node) && vidx && vidx->is_volatile) {
+                    /* BUG-1023: the statement-level auto-guard READS THE INDEX
+                     * TWICE (`if (i >= N) return;` then `arr[i]`). For a VOLATILE
+                     * index the two reads can differ — an ISR or another thread
+                     * stores between them — so the guard proves nothing about the
+                     * access and a stack array was writable past its end with no
+                     * diagnostic. No auto-guard here: the emitter routes a
+                     * volatile ident through the single-evaluation inline form
+                     * (one load into a temp, the bounds check and the access both
+                     * on the temp — a trap, like a slice). */
+                    checker_warning(c, node->loc.line,
+                        "volatile index '%.*s' cannot be proven in range for array of "
+                        "size %llu — a single-read bounds check (trap on failure) is "
+                        "inserted. Copy it to a non-volatile local and guard that to "
+                        "eliminate the check",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size);
+                } else
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
                     if (iv == IDX_PARTIAL_OOB) {
@@ -11411,6 +11445,28 @@ static Type *check_expr(Checker *c, Node *node) {
                             break;
                         }
                     }
+                    /* BUG-1023: a VOLATILE index on an MMIO pointer has the same
+                     * two-read guard as the array case, and here there is no
+                     * inline single-read form to fall back to (a pointer index
+                     * emits bare). Ban Decision Framework: no tracking can hold a
+                     * volatile value still between the check and the use, so
+                     * refuse, with the one-line fix. */
+                    Symbol *mvs = node->index_expr.index->kind == NODE_IDENT
+                        ? scope_lookup(c->current_scope,
+                              node->index_expr.index->ident.name,
+                              (uint32_t)node->index_expr.index->ident.name_len)
+                        : NULL;
+                    if (mvs && mvs->is_volatile) {
+                        checker_error(c, node->loc.line,
+                            "cannot index MMIO pointer with volatile '%.*s' — the "
+                            "range guard would read it once and the access again, and "
+                            "a value that changes between the two reads defeats the "
+                            "guard. Copy it to a non-volatile local first",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name);
+                        ptr_proven = true;
+                        mark_proven(c, node);   /* diagnosed once, not twice */
+                    } else {
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
                     checker_warning(c, node->loc.line,
@@ -11421,6 +11477,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             node->index_expr.index->ident.name : "?",
                         (unsigned long long)mmio_bound - 1);
                     ptr_proven = true;
+                    }
                 }
             }
             /* I1 (2026-08-02): a VOLATILE `*T` with NO derived bound is just as
@@ -18727,6 +18784,17 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
+        /* BUG-1021: a label inside a defer body. `goto` is banned in a defer
+         * body, so nothing can ever jump here — and the body is lowered into a
+         * detached template that every fire clones (refactor L), while a label's
+         * block is allocated once, up front, outside that template: a clone
+         * would carry a jump into a block it does not own. Rejecting the label
+         * costs nothing: it has no possible use. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside a defer body — 'goto' is not allowed "
+                "there, so the label could never be a jump target");
+        }
         /* labels are just markers — no type checking needed. BUT a `goto` can
          * jump to this label carrying ANY value, so a value-range narrowed on the
          * fall-through path ABOVE the label does not hold at the label (the goto
@@ -18994,6 +19062,35 @@ static void check_stmt(Checker *c, Node *node) {
                     "asm `safety:` string must be at least 30 characters — "
                     "describe what the asm does and cite hardware spec/manual "
                     "(D-Alpha-7.5 S4 rule, audit-trail requirement)");
+            }
+            /* BUG-1022: a `shared struct` field in an ASM OPERAND. The
+             * per-statement auto-lock never wraps an asm statement, so
+             * `inputs: { "rax" = a.x }` was emitted as a BARE read of the shared
+             * field — an unlocked access reachable from a spawned thread, the
+             * same class as BUG-935 at a site the lock collector never visits.
+             * Decided by the Ban Decision Framework as a HARDWARE constraint, not
+             * tracked: asm is only legal in a `naked` function, which has no
+             * prologue and no frame, so a `pthread_mutex_lock` call around the
+             * operand is not something the compiler can emit there. Read the
+             * field into a local in an ordinary (locked) function and pass the
+             * value in. One query — collect_shared_types_in_expr — for both
+             * operand lists, so the two cannot disagree. */
+            for (int oi = 0; oi < node->asm_stmt.input_count + node->asm_stmt.output_count; oi++) {
+                AsmOperand *aop = (oi < node->asm_stmt.input_count)
+                    ? &node->asm_stmt.inputs[oi]
+                    : &node->asm_stmt.outputs[oi - node->asm_stmt.input_count];
+                if (!aop->expr) continue;
+                Type *sh = NULL;   /* one is enough: the question is "any?" */
+                int shn = collect_shared_types_in_expr(c, aop->expr, &sh, 1, 0);
+                if (shn > 0 && sh) {
+                    checker_error(c, node->loc.line,
+                        "asm %s operand reads or writes shared struct '%s' with no lock — "
+                        "an asm statement is never auto-locked, and a naked function "
+                        "has no frame to take a mutex in. Read the field into a local "
+                        "in an ordinary function and pass the value to the asm",
+                        (oi < node->asm_stmt.input_count) ? "input" : "output",
+                        type_name(sh));
+                }
             }
             /* D-Alpha-7.5 Session B / H2: type-check operand bindings.
              * Each input/output must be integer-typed (Session B scope = scalars).
@@ -20419,6 +20516,20 @@ static void check_stmt(Checker *c, Node *node) {
                     } else if (ba->kind == NODE_IDENT) {
                         Symbol *as = scope_lookup(c->current_scope, ba->ident.name,
                                                   (uint32_t)ba->ident.name_len);
+                        if (as && as->borrow_root_unknown) {
+                            /* BUG-1024: two different locals behind one carrier —
+                             * no single root to lend, so the borrow cannot be
+                             * established. Cannot prove => reject. */
+                            checker_error(c, node->loc.line,
+                                "spawn argument %d references a local whose identity "
+                                "the compiler cannot resolve (a carrier holding pointers "
+                                "into two different locals), so the exclusive borrow "
+                                "until .join() cannot be established — a parent write to "
+                                "that local before the join would be a data race. Pass "
+                                "'&local' arguments directly, or copy the data by value",
+                                bi + 1);
+                            continue;
+                        }
                         if (as && as->borrow_root_name) {
                             cand_n[cand_c] = as->borrow_root_name;
                             cand_l[cand_c] = as->borrow_root_len; cand_c++;

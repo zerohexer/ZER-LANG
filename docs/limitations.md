@@ -254,15 +254,11 @@ Both funcname walkers are exhaustive switches now; +4 REACH / +2 ISR cells in
 - ~~i64 literal range (3+2)~~ — CLOSED as BUG-988 (both branches' sets adopted; they are
   different boundaries: 2^64-1 vs exactly 2^63)
 - ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED as BUG-985 / BUG-983
-- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s
-  `mmio_volatile_index_reject`. **STILL OPEN but LOUD:** both trap at runtime
-  ("@inttoptr: address outside mmio range" / "unaligned address", exit 133). The branch's
-  fix folds `const` identifiers at the four `@inttoptr` const-address sites
-  (`mmio_const_addr` → `eval_const_expr_scoped`) so the error moves to compile time and
-  `r[i]` gains a bound. Precision, not soundness.
-- global init (2) — `qo0mm9`: `global_init_from_mutable` (STILL OPEN, loud: GCC error
-  "initializer element is not constant" naming generated C) and
-  `global_init_chain_too_deep` (already rejected on main by BUG-975's chain bound)
+- ~~MMIO const-ident (2)~~ — CLOSED as BUG-996 (`mmio_const_addr` at the four sites; the
+  errors moved from a first-boot trap to compile time and `r[i]` gains a bound).
+  `ppnatu`'s `mmio_volatile_index_reject` not re-measured.
+- global init (2) — ~~`global_init_from_mutable`~~ CLOSED as BUG-998;
+  `global_init_chain_too_deep` was already rejected on main by BUG-975's chain bound
 - ~~multiview UAF (2)~~ — CLOSED as BUG-989
 - ~~struct-init field (2)~~ — CLOSED as BUG-991
 - ~~compound float↔int (2+1)~~ — CLOSED as BUG-986
@@ -280,24 +276,19 @@ Both funcname walkers are exhaustive switches now; +4 REACH / +2 ISR cells in
   **NOT A HOLE on main**: the race variant (`x = 7` between spawn and join, with a carrier
   holding `&v` and `&x`) is rejected ("cannot write to 'x' while it is borrowed"). The
   branch's "cannot resolve" rejection is unnecessary here.
-- defer body with a label (1) — `qo0mm9`: `defer_body_label` — STILL OPEN but LOUD: it
-  compiles and then TRAPS at runtime ("compiler bug: unsupported stmt kind in defer") — the
-  BUG-965 "bodies on neither path" hazard: the label puts the function on the AST defer
-  path (`defers_stay_on_ast`), whose statement emitter has no NODE_LABEL arm. A `goto` is
-  already banned inside a defer body, so a label there is useless; reject it at the checker
-  ("cannot place a label inside a defer body").
+- ~~defer body with a label (1)~~ — CLOSED as BUG-997 (rejected at the checker; it used to
+  compile and TRAP at runtime, the BUG-965 "bodies on neither path" hazard).
 - asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
   **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
   these are its reproducers.
 
-### MASKED — main rejects these, but for the WRONG reason, so the hole is still open (3)
+### MASKED — main rejects these, but for the WRONG reason, so the hole is still open (2)
 
 Found by re-running the "already rejected" bucket against each test's own `expect-error`.
 A rejection is not a closure until the REASON matches.
 
-- `mmio_const_ident_oob_index` (`qo0mm9`, `vgonmt`) — wants *"MMIO index 9 is out of range"*,
-  gets *"cannot index volatile '*u32'"*. A different rule fires first; the MMIO range check
-  is never reached. Pairs with `mmio_const_ident_oob_addr` / `_misaligned` in class 10.
+- ~~`mmio_const_ident_oob_index`~~ — rejects for its OWN reason since BUG-996 (the const
+  address now folds, so the MMIO index bound is derived and the range rule fires first).
 - `opt_param_drop_then_caller_uaf` (`3sdup9`) — wants *"use after free"*, gets a LEAK report.
 - `opt_param_other_optional_null_path_maybe` (`3sdup9`) — wants *"may not be freed on all
   paths"*, gets a leak report at a different line.

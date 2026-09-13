@@ -1246,6 +1246,7 @@ done:
 ```zer
 goto nowhere;              // COMPILE ERROR — label 'nowhere' not found
 goto inside defer block    // COMPILE ERROR — cannot use goto inside defer
+label inside defer block   // COMPILE ERROR — nothing could ever jump to it
 duplicate labels           // COMPILE ERROR — label 'x' already defined
 ```
 
@@ -1962,6 +1963,10 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```
 
 **NOTES**
+- The address may be a `const` identifier or constant arithmetic on one
+  (`@inttoptr(*u32, BASE + 0x14)` with `const u32 BASE = 0x4000_0000;`): it folds
+  at compile time, so range and alignment are checked at compile time and
+  indexing through the pointer (`r[i]`) gets a compile-time bound.
 - `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
   it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
   still emitted for variable addresses (alignment is a property of the

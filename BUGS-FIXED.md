@@ -88,6 +88,17 @@ stated-reason after, every positive run. Branch numbers were renumbered on adopt
 | **BUG-994** | `&x` in a SPAWN argument (also an `await` condition and asm operands) did not widen the loop range — `vrp_widen_loop_addr_taken` and `vrp_invalidate_loop_body_writes` listed NODE_SPAWN/AWAIT/ASM as leaves. Measured: the guard on `arr[idx]` was ELIDED and `arr[100] = 7` written to a 4-byte stack array | both walkers descend the three kinds' expressions (over-widening only ever ADDS a guard) | `tests/zer/vrp_loop_addr_taken_spawn.zer` |
 | **BUG-995** (found on top, this session) | `u8 small = 1; *u32 p = @ptrcast(*u32, &small); return *p;` compiled and RAN (exit 1) — three bytes read past a one-byte stack object; a write through `p` corrupts the frame, silently on bare metal. `@pun` had the widening test (BH-18 #4); `@ptrcast` — the door whose comment DOCUMENTS the primitive byte-view as allowed — and `@bitcast` had no sibling. The byte view NARROWS; nobody had written down that the reverse direction is a different question | ONE helper `reject_pointee_widening` at `@ptrcast` and `@bitcast` (both pointees concrete with known sizes, target larger → error; *opaque / unknown keeps today's behaviour = the FFI floor). Narrowing and identity untouched. **The round-trip is TRACKED, not banned**: the first cut rejected `test_emit`'s `*u32 → *u8 → *u32` (the static `*u8` is not the whole truth about `raw`), so a byte view now records what it views (`Symbol.byteview_origin`, set at var-decl init / assignment / alias copy by `byteview_origin_of`) and widening back to at most that object is allowed; widening PAST it is still the error | `ptrcast_widens_pointee.zer`, `bitcast_widens_pointee.zer`, `ptrcast_widens_past_origin.zer`, `tests/zer/{ptrcast_narrows_pointee_ok,ptrcast_byteview_roundtrip_ok}.zer` |
 
+### BUG-996..998 — three LOUD holes from the same ledger, closed as a second batch
+
+| # | before | now | tests |
+|---|---|---|---|
+| **BUG-996** | `@inttoptr(*u32, BASE + OFF)` with `const` identifiers: the four `@inttoptr` const-address sites (range/alignment gate, direct `@inttoptr(...)[N]` bound, local and global var-decl `mmio_bound`) all called plain `eval_const_expr`, which folds literals but not a `const` ident — so the range and alignment ERRORS were deferred to a runtime trap at first boot, and `r[i]` through a const-addressed pointer had no compile-time bound (rejected outright as "cannot index volatile"). Real firmware never writes the literal | ONE query `mmio_const_addr` (→ `eval_const_expr_scoped`, which substitutes a `const` symbol's own constant initializer; BUG-975 bounds the chain) at all four sites. Strictly tightens the two error gates, strictly relaxes the two bound derivations. The previously MASKED `mmio_const_ident_oob_index` now rejects for its own reason | `mmio_const_ident_{misaligned,oob_addr,oob_index}.zer`, `tests/zer/mmio_const_ident_base.zer` |
+| **BUG-997** | `defer { here: g += 1; }` compiled, then TRAPPED at runtime "compiler bug: unsupported stmt kind in defer" — the BUG-965 "bodies on neither path" hazard: a label anywhere in the function puts its defers on the AST emit path, whose statement emitter has no NODE_LABEL arm. `goto` is already banned in a defer body, so a label there can never be a target | rejected at the checker's NODE_LABEL arm when `defer_depth > 0` | `defer_body_label.zer` |
+| **BUG-998** | `u32 SRC = 5; u32 B = SRC;` reached GCC as `uint32_t B = SRC;` — "initializer element is not constant", naming a generated .c the user never opened. The `const` form of the same shape is folded by the emitter; a mutable global genuinely is not a constant | rejected in the global-initializer pass with the ZER line and the remedy (declare it `const`, or assign in an init function) | `global_init_from_mutable.zer` |
+
+Corpus cost of all three: zero (the two `rust_tests` files the diagnostic grep matched are
+existing negatives already rejected on the baseline for the same reason).
+
 Not adopted, and why (each recorded in `docs/limitations.md`):
 - `isr_rmw_split_statements` (`u32 t = g; g = t + 1;` as an RMW): the existing RMW
   diagnostic literally recommends "an explicit read/mask/write" — adopting the branch's rule
@@ -96,10 +107,8 @@ Not adopted, and why (each recorded in `docs/limitations.md`):
   that returns early. Not silent (the warning names it), not unsafe (the guard fires); the
   branch's upgrade to an error is desirable but is a 300-line change (`Checker.cert_loop_*`)
   left for its own session.
-- `defer_body_label`: compiles, then traps at runtime "compiler bug: unsupported stmt kind in
-  defer" — loud, not silent. `mmio_const_ident_*`: trap at runtime (loud). `global_init_from_mutable`:
-  a GCC error naming generated C (loud, poor wording). `asm_operand_shared_read`: already an
-  OPEN entry. All four stay open.
+- `asm_operand_shared_read`: already an OPEN entry (a `shared struct` read in an asm operand
+  takes no lock); stays open.
 
 ---
 

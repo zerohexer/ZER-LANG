@@ -113,6 +113,7 @@ static bool type_carries_handle(Type *t, int depth) {
  * machinery). Needed up here by the size fold, which must resolve a `const`
  * identifier — the non-scoped evaluator cannot. */
 static int64_t eval_const_expr_scoped(Checker *c, Node *n);
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg);   /* BUG-996 */
 
 /* BUG-873: evaluate a declared SIZE/COUNT expression, resolving `const`
  * identifiers, and FOLD THE RESULT IN PLACE.
@@ -3109,6 +3110,32 @@ static bool pun_type_id_check_can_fire(Type *src_pointee, Type *tgt_pointee) {
 }
 
 static int64_t compute_type_size(Type *t);   /* defined below; BUG-995 uses it early */
+
+/* BUG-996: THE one query for "what constant address does this `@inttoptr`
+ * address argument designate?".
+ *
+ * Answered independently at FOUR sites — the `@inttoptr` range/alignment gate,
+ * the direct `@inttoptr(...)[N]` index-bound derivation, the local var-decl
+ * `mmio_bound` derivation and the global var-decl one — and every one called
+ * plain `eval_const_expr`, which folds LITERALS but not a `const` identifier.
+ * Real firmware never writes the literal:
+ *
+ *     const u32 UART = 0x4000_0000;
+ *     volatile *u32 r = @inttoptr(*u32, UART);   // fold failed here
+ *
+ * so the range and alignment errors were DEFERRED to a runtime trap (measured:
+ * `@inttoptr(*u32, BASE + OFF)` with a misaligned const sum compiled clean and
+ * trapped at first boot), and `mmio_bound` stayed 0 so `r[i]` had no bound.
+ * `eval_const_expr_scoped` resolves an identifier only when the symbol is
+ * `is_const` and carries its own initializer, and that initializer is itself a
+ * compile-time constant, so substituting it is sound; BUG-975 bounds the chain.
+ * Strictly TIGHTENS the two error gates and strictly RELAXES the two bound
+ * derivations. Route every new MMIO const-address site through this — never
+ * re-inline `eval_const_expr`. (Adopted from loving-davinci-qo0mm9.) */
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg) {
+    if (!addr_arg) return CONST_EVAL_FAIL;
+    return eval_const_expr_scoped(c, addr_arg);
+}
 
 /* BUG-995: what object is this byte view a view OF? For a var-decl init or an
  * assignment value that is `@ptrcast`/`@bitcast(*T, src)` between two concrete
@@ -11240,7 +11267,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->index_expr.object->intrinsic.name_len == 8 &&
                 memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
                 node->index_expr.object->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(node->index_expr.object->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, node->index_expr.object->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -12703,7 +12730,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * --no-strict-mmio, a misaligned MMIO address is SIGBUS
                      * on ARM/RISC-V or silent corruption on Cortex-M0+. */
                     if (node->intrinsic.arg_count > 0) {
-                        int64_t cval = eval_const_expr(node->intrinsic.args[0]);
+                        int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         /* plt86m audit 2026-06-17: the range gate must account
@@ -16374,7 +16401,7 @@ static void check_stmt(Checker *c, Node *node) {
                 init_expr->intrinsic.name_len == 8 &&
                 memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
                 init_expr->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(init_expr->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, init_expr->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -18282,6 +18309,17 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
+        /* BUG-997: a label inside a defer body. `goto` is banned in a defer body,
+         * so nothing can ever jump here — and the label put the function on the
+         * AST defer path (`defers_stay_on_ast` counts labels), whose statement
+         * emitter has no NODE_LABEL arm: the program compiled and then TRAPPED at
+         * runtime with "compiler bug: unsupported stmt kind in defer". A label
+         * there has no possible use, so reject it at the checker. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside a defer body — 'goto' is not allowed "
+                "there, so the label could never be a jump target");
+        }
         /* labels are just markers — no type checking needed. BUT a `goto` can
          * jump to this label carrying ANY value, so a value-range narrowed on the
          * fall-through path ABOVE the label does not hold at the label (the goto
@@ -20776,7 +20814,7 @@ static void register_decl(Checker *c, Node *node) {
                 if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
                     memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
                     gi->intrinsic.arg_count > 0) {
-                    int64_t addr = eval_const_expr(gi->intrinsic.args[0]);
+                    int64_t addr = mmio_const_addr(c, gi->intrinsic.args[0]);
                     if (addr != CONST_EVAL_FAIL) {
                         for (int ri = 0; ri < c->mmio_range_count; ri++) {
                             if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -24496,6 +24534,27 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             (int)decl->var_decl.name_len, decl->var_decl.name,
                             (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
                     }
+                }
+            }
+            /* BUG-998: a global initialized from a MUTABLE global. This used to
+             * reach GCC as `uint32_t B = SRC;` — "initializer element is not
+             * constant", naming a generated .c the user never opened, with no ZER
+             * line. The `const` form of the same shape is FOLDED (the emitter
+             * substitutes the referenced global's own initializer); a mutable
+             * global genuinely is not a constant, so say so here. Function names
+             * (a funcptr global) and enum variants (NODE_FIELD) are unaffected. */
+            if (ginit->kind == NODE_IDENT) {
+                Symbol *gsrc = scope_lookup(c->global_scope,
+                    ginit->ident.name, (uint32_t)ginit->ident.name_len);
+                if (gsrc && !gsrc->is_function && !gsrc->is_const) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' cannot be initialized from '%.*s' — "
+                        "a global initializer must be a compile-time constant and "
+                        "'%.*s' is mutable. Declare it 'const', or assign in an "
+                        "init function",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)ginit->ident.name_len, ginit->ident.name,
+                        (int)ginit->ident.name_len, ginit->ident.name);
                 }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */

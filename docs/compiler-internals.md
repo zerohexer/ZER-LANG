@@ -12875,6 +12875,7 @@ mixed). Run it against a pre-fix build: 7 false negatives, then 0.
 | "may this pointer-width INTEGER call result be a frame address?" | `call_result_is_local_address_int` = address-valued-integer ARGUMENT (arm 1) ∨ callee `ret_addr_param_mask` bit n × local-derived pointer arg n (arm 2) | the assignment and return sinks (BUG-987). `ret_addr_param_mask` is accumulated by `return_addr_param` in the NODE_RETURN handler and stored for EVERY body (the view mask is only stored for pointer-returning functions) |
 | "which allocation id does local n mint?" | `ir_alloc_id_of_local` (= n + 1; 0 is the untracked SENTINEL) | every minting site in zercheck_ir.c (BUG-990). Never write `alloc_id = dest_local` again |
 | "record a multi-view call result's candidate set" | `ir_fill_multiview_set` | IR_CALL (var-decl) and IR_ASSIGN (assignment) sinks; `ir_merge_states` UNIONs the sets (BUG-989) |
+| "what constant address does this `@inttoptr` argument designate?" (a `const` ident folds) | `mmio_const_addr` (→ `eval_const_expr_scoped`) | the `@inttoptr` range/alignment gate, the direct `@inttoptr(...)[N]` bound, the local and global var-decl `mmio_bound` derivations (BUG-996). Never re-inline `eval_const_expr` at an MMIO site |
 
 Two things learned harvesting: (1) a branch's checker hunks apply with `patch --fuzz=3`
 even when the commit as a whole conflicts (their emitter refactors were the conflict, not

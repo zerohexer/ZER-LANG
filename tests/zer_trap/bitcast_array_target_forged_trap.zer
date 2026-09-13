@@ -1,0 +1,15 @@
+// expect-trap
+// BUG-1005: `@bitcast(Color[4], raw)` — an ARRAY target — used to emit
+// `int32_t[4] _zer_bco0` (no C declarator) and GCC refused the generated file
+// with no ZER diagnostic. It now emits a declarator, the array SOURCE is copied
+// from directly (an `__auto_type` copy of an array DECAYS to a pointer), and the
+// enum variant guard loops over the target — so a forged element traps here
+// instead of dispatching an exhaustive switch to the wrong arm.
+enum Color { red, green }
+u32 main() {
+    u32[4] raw;
+    raw[2] = 9;
+    Color[4] cs = @bitcast(Color[4], raw);
+    if (cs[0] == Color.red) { return 0; }
+    return 1;
+}

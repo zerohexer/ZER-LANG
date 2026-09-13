@@ -178,11 +178,14 @@ Residual: one over-rejection, entered separately above (a plain struct nested pa
 cannot be copied). `3sdup9`'s "depth-guard ledger" OPEN entry is superseded — the
 enumeration was done on main and is recorded in BUGS-FIXED.md under BUG-976.
 
-**2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling. TAKE `3sdup9`.**
-An allocation stored into a field, index or slot loses tracking.
-`alloc_field_bare_spelling_uaf` `_leak` `_overwrite` `alloc_index_bare_spelling_uaf`
-`alloc_global_field_bare_spelling_dangling` `alloc_struct_value_into_slot_uaf`
-`alloc_nested_init_uaf` `alloc_nested_init_orelse_uaf` `slot_copy_alias_uaf` `slot_copy_alias_global_uaf`
+### ~~2. ALLOCATION "BARE SPELLING" FAMILY — 10~~ — CLOSED 2026-09-13 as BUG-1000/1001/1002
+
+Adopted from `3sdup9` (`8b1227c`, the zercheck_ir half): `ir_register_alloc_result_compound`
+(slot-stored allocation), `ir_global_projection_key` (a global projection is ONE key at
+every sink; a plain `=` into a tracked slot is a reset, a slot-to-slot copy aliases) and
+`ir_carry_compounds` (a struct value carries its allocations at all four sites). The same
+commit's BUG-1003 (`defer stmt;` / `1 => expr,` took no shared lock) was measured live
+from the emitted C and adopted with its emit-audit fingerprint.
 
 ### ~~3. `shared(rw)` RE-ENTRANCY — 6, data race~~ — CLOSED 2026-09-11 as BUG-980
 
@@ -244,11 +247,18 @@ frame-bound query the pointer return uses. Low priority — the diagnostic is lo
 Both funcname walkers are exhaustive switches now; +4 REACH / +2 ISR cells in
 `tests/test_conc_matrix.c`.
 
-**9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7. TAKE `3sdup9`.**
-`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
-`global_projection_reunwrap_uaf` `global_projection_free_then_read`
-`opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
-`union_capture_free_then_reread_uaf`
+### ~~9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7~~ — CLOSED 2026-09-13 as BUG-999 / BUG-1001 / BUG-1004
+
+`IRHandleInfo.view_root_local` re-roots a projection through a `&local` view onto the
+aggregate (BUG-999); global projections are BUG-1001; the optional-param free through
+`orelse return` is now summarised (BUG-1004, a relaxation with pinned boundaries).
+
+**Residuals (recorded by the branch, still true here):**
+- The POINTER capture `|*q|` of a union variant is not re-rooted onto the union — a free
+  through it is not seen by a later switch on the union. Value capture `|q|` is.
+- The `if (h.p) |q| { free(q); }` CAPTURE form of an optional-param free stays MAYBE at the
+  caller (only the `orelse return` unwrap is summarised). Test:
+  `tests/zer_fail/opt_param_capture_form_stays_maybe.zer` pins the current verdict.
 
 **10. SMALLER CLASSES** (status 2026-09-13 — each was re-run against this tree before deciding)
 - ~~i64 literal range (3+2)~~ — CLOSED as BUG-988 (both branches' sets adopted; they are

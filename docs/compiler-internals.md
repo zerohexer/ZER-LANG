@@ -11476,6 +11476,21 @@ global src root never carried. Diagnostics name a global root by its key via
 `ir_root_display` (was `'?'`). Gate: **SHAPE p25 in `tools/sink_matrix.sh`** (spelling
 x root; verified to fire — 12 HOLEs + 1 OVER-REJECT on the pre-fix build).
 
+**A pointer VIEW of a local aggregate re-roots onto the aggregate (BUG-984, 2026-09-13,
+from `3sdup9`).** `*H hp = &h;` makes `hp.p` and `h.p` ONE slot, but the compound key
+rooted them on different locals, so a free through one was invisible through the other
+— and the hoisted `&u` a union / optional `switch` reads its capture through is the same
+view, so a variant freed through its capture was a false leak. `IRHandleInfo.view_root_local`
+(-1 = not a view, -2 = AMBIGUOUS) is set by the view arm on `%t = &<local aggregate>`
+(`ir_local_is_aggregate`: struct / union / array — a `&scalar` is a view of a VARIABLE,
+not of slots) and by the ASSIGN spelling `hp = &h;`, inherited through `IRAliasSnapshot`,
+and joined at merges as same-or-ambiguous. **ONE re-rooting**, in `ir_extract_compound_key`
+(which now takes the `IRPathState *`): a PROJECTION through a view (`hp.p`, never the
+bare `hp`) is keyed on the aggregate's local. Every sink that keys a projection goes
+through the extractor, so they agree by construction; an ambiguous view falls back to
+per-pointer keying (conservative). Residual — the POINTER capture `|*q|` of a union
+variant — is an OPEN entry in limitations.md.
+
 ### Argument-precise barrier (BUG-740, principle reused in BUG-741)
 
 Principle: **anything HANDED to an operation the analyzer can't resolve may

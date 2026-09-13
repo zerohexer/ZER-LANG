@@ -30,6 +30,30 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — freeing a UNION variant through its POINTER capture `|*q|` is a false leak (2026-09-13, LOW — over-rejection; the value capture `|q|` is CLOSED as BUG-984)
+
+**Symptom (measured on main after BUG-984).**
+
+    U u;  u.p = alloc(T);
+    switch (u) { .p => |*q| { *T t = *q orelse return; free(t); }  .n => |n| { } }
+    // zercheck: handle %0 (local 'u') allocated at line 5 but never freed
+
+The value capture (`|q|`, a read of `sw_ref.p` off the hoisted `&u` view) aliases the
+variant slot since BUG-984 and is accepted. The pointer capture is `&sw_ref.p` — a pointer
+TO the slot — and the later `*q` deref read is not routed through the slot's compound, so
+the free never reaches `(u, ".p")`.
+
+**Fix sketch.** Treat `*q`, where `q`'s entry records "address of slot (root, path)", as a
+read of that slot: give the `&<projection>` view arm a slot-address form of
+`view_root_local` (root + path), and let the DEREF read arm re-root through it. Gate: the
+program above as a positive, plus `free(t); *T t2 = *q orelse return; t2.v` as a negative.
+Not pinned as a `zer_fail` — that would freeze a WRONG diagnostic ("never freed" on a
+program that frees) into the suite.
+
+(Carried from `claude/loving-davinci-3sdup9`'s own OPEN entry, re-measured here.)
+
+---
+
 ## OPEN — a `shared(rw)` READ statement cannot call a function that also READS it (2026-09-11, LOW — over-rejection)
 
 **Symptom.** `u32 r = g.v + f();` where `g` is `shared(rw)` and `f` only READS `g.v` is
@@ -91,7 +115,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 62 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 59 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -147,7 +171,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 62 live), by class — and which branch to take
+### The 97 (now 59 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -227,14 +251,16 @@ in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 **8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
 `spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
 
-**9. VIEW OF A LOCAL / ~~GLOBAL PROJECTION~~ / OPTIONAL PARAM / UNION CAPTURE — 5 left of 7. TAKE `3sdup9`.**
-`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
+**9. ~~VIEW OF A LOCAL / GLOBAL PROJECTION~~ / OPTIONAL PARAM / ~~UNION CAPTURE~~ — 2 left of 7. TAKE `3sdup9`.**
+~~`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`~~ (closed 2026-09-13, BUG-984)
 ~~`global_projection_reunwrap_uaf` `global_projection_free_then_read`~~ (closed 2026-09-13, BUG-982)
 `opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
-`union_capture_free_then_reread_uaf`
-The three view/union ones are `3sdup9` commit `d17f9417` (its BUG-981 — a pointer view of
-a local aggregate re-rooted onto the aggregate's own slots, `IRHandleInfo.view_root_local`;
-built ON TOP of `8b1227c9`, so apply after it). The two `opt_param_*` are its `92cc9dfd`.
+~~`union_capture_free_then_reread_uaf`~~ (closed 2026-09-13, BUG-984; the POINTER-capture
+residual is its own OPEN entry above)
+The two `opt_param_*` are `3sdup9`'s `92cc9dfd` ("relax BUG-979 optional-param free through
+`orelse return`" — note that commit is a RELAXATION plus a limitations entry, so read what
+it actually claims before adopting: its `freed_then_reset` / `ir_type_reads_as_ref` symbols
+were deliberately NOT taken with BUG-984).
 
 **10. SMALLER CLASSES**
 - i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
@@ -275,8 +301,8 @@ siblings — likely one fix.
 
 - `3sdup9`: ~~the depth-guard ledger~~ (SUPERSEDED — the enumeration was done on main, BUG-976);
   "a callee freeing an optional field
-  through the IF-CAPTURE form stays MAYBE"; "freeing a UNION variant through its POINTER capture
-  `|*q|` is a false leak" — both OVER-rejections
+  through the IF-CAPTURE form stays MAYBE"; ~~"freeing a UNION variant through its POINTER capture
+  `|*q|` is a false leak"~~ (TAKEN 2026-09-13, own OPEN entry above) — both OVER-rejections
 - `ppnatu`: "Arena methods through a POINTER or a STRUCT FIELD are not supported"; "ISR-vs-main
   tracking counts a helper as 'main' even when only the ISR calls it"
 - `qo0mm9` / `vgonmt`: "`@inttoptr` to a pointer-carrying <type>"; the unverified-audit-lead lists

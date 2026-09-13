@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// (from claude/loving-davinci-3sdup9 d17f9417, body verbatim; its BUG-981 -> main BUG-984)
+// BUG-984: `*H hp = &h;` is a VIEW of h — a slot filled through hp and read through h
+// is ONE slot. The two roots were strangers: the free through hp never reached
+// (h, ".p"), and the read through h was a silent use-after-free (ran, read freed memory).
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    *H hp = &h;
+    hp.p = alloc(T);
+    *T q = hp.p orelse return;
+    free(q);
+    *T r = h.p orelse return;
+    return r.v;
+}

@@ -5,6 +5,51 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-984: a pointer VIEW of a local aggregate names the aggregate's own slots (3 more of class 9, from `3sdup9`)
+
+`claude/loving-davinci-3sdup9` commit `d17f9417` (its BUG-981), applied on top of
+BUG-981/982/983 the way the branch built it. Three conflicts, all the SAME shape and all
+resolved the same way: the branch's context lines carried an intermediate commit
+(`92cc9dfd` — `freed_then_reset`, `ir_type_reads_as_ref`) that main does not have and this
+fix does not use, so git's 3-way offered those lines as "theirs". Only the
+`view_root_local` parts were kept; the other symbols are referenced by nothing in the
+applied hunks (checked, not assumed) and belong to the `opt_param_*` items still open.
+
+**The hole.** `*H hp = &h; hp.p = alloc(T); free(hp.p-unwrapped); h.p ...` compiled clean
+and read freed memory: `hp.p` was keyed on `hp` and `h.p` on `h` — two roots for ONE slot,
+so a free through one was invisible through the other. The same hoisted `&u` view is what
+a union / optional `switch` reads its capture through, so a variant freed through its
+capture was a FALSE LEAK, and a later re-read of the freed variant went unseen behind it.
+
+**The fix is one fact and one re-rooting.** `IRHandleInfo.view_root_local` is set by the
+view arm on `%t = &<local struct|union|array>` and by the ASSIGN spelling `hp = &h;`,
+inherited by pointer copies through the alias snapshot, and joined at merges as
+same-or-AMBIGUOUS (`-2`, never re-rooted — the conservative answer, pinned by the positive's
+`if (pick()) { hx = &h2; }` case, which falls back to per-pointer keying). Then ONE
+re-rooting in `ir_extract_compound_key`, which now takes the path state: a PROJECTION
+through a view is keyed on the aggregate. All ~36 sinks agree by construction — there is
+no second place for a sink to disagree.
+
+**Measured on `git archive HEAD` (207ab846):**
+| test | pre-fix | now |
+|---|---|---|
+| `view_of_local_store_then_read_via_local_uaf` | **ACCEPTED** (ran, read freed memory) | use after free |
+| `view_of_local_copy_uaf` | rejected for the WRONG reason (false "never freed" on `hq`) | use after free |
+| `union_capture_free_then_reread_uaf` | rejected for the WRONG reason (false leak of `u`) | maybe-freed |
+| `view_of_local_ok` (positive) | **exit 1** — two false "never freed" | runs, exit 0 |
+
+The two wrong-reason rows are the `// expect-error:` rule earning its keep: an exit-code
+harness would have called them "already rejected".
+
+**Residual, recorded as OPEN in limitations.md:** the POINTER capture `|*q|` of a union
+variant is `&sw_ref.p` — a pointer TO the slot — and the later `*q` read is not routed
+through the slot's compound, so `free(t)` never reaches `(u, ".p")` and the program is a
+false leak. The fix sketch (a slot-address form of `view_root_local`) is in the entry.
+
+- Corpus: 2371 files under both binaries; the only differences are the four new files.
+- `make check` exit 0; the view-alias matrix (which caught a first draft of this on the
+  branch) is green.
+
 ## Session 2026-09-13 — BUG-981/982/983: an allocation stored into a SLOT was tracked nowhere (12 holes, one commit from `3sdup9`)
 
 Survey class 2 (10 reproducers) plus the two global-projection items of class 9, all

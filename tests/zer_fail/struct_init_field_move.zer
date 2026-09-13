@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: transferred
+// (from claude/loving-davinci-vgonmt e8671108 = vigilant-tesla-1zukjq; its BUG-980 -> main BUG-1007, body verbatim)
+// BUG-1007 (move half): a move struct handed to a designated initializer is
+// consumed exactly as `h.t = a;` consumes it, but this sink never reached
+// ir_mark_transferred, so the use after it compiled and ran.
+move struct Tok { u32 k; }
+struct Holder { Tok t; }
+
+u32 main() {
+    Tok a;
+    a.k = 1;
+    Holder h = { .t = a };
+    return a.k;
+}

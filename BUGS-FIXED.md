@@ -5,6 +5,126 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-996..1008: fourteen of the survey's "smaller classes", plus three live bugs found beside them
+
+Batch one of survey class 10, taken by COMMIT rather than by class so each hunk was read
+in its own context. Every negative ACCEPTED on `git archive HEAD` (1696cb9c); the four
+positives all FAIL there (three would not build, one was an over-rejection). Corpus:
+2467 files under both binaries — the only verdict changes are the new tests, and the only
+emission changes beyond the new `#line` anchors are the `@bitcast` array-source copy and a
+whitespace reflow of the non-array `@bitcast` form.
+
+### BUG-996 — a named `const` MMIO base folded to nothing at FOUR sites (`qo0mm9` / o51x9p)
+
+`const u32 UART = 0x4000_0000; volatile *u32 r = @inttoptr(*u32, UART);` — every one of
+the four `@inttoptr` address sites (the range/alignment gate, the direct `[N]` index bound,
+the local var-decl `mmio_bound`, the global var-decl one) called plain `eval_const_expr`,
+which folds LITERALS and not a `const` ident. So an out-of-range or misaligned address
+written as a named const was DEFERRED to a runtime trap — first boot on the target — and
+`r[i]` was REJECTED outright ("no compile-time MMIO bound") on the single most common
+bare-metal shape, which real firmware ALWAYS writes with a name. ONE query
+`mmio_const_addr` (= `eval_const_expr_scoped`, sound because a const's initializer is
+itself required to be constant, BUG-997) at all four. Strictly tightens the two gates and
+strictly relaxes the two derivations. The masked `mmio_const_ident_oob_index` now names
+the index instead of refusing to analyse.
+
+### BUG-997 — a global initialized from another global: const was invalid C, mutable was GCC's error (`qo0mm9` / o51x9p)
+
+`u32 B = SRC;` reached GCC as `uint32_t B = SRC;` — *"initializer element is not
+constant"*, in a generated file, no ZER line. And the `const` case — `i32 g = NEG;`,
+`f32 g = SCALE + 1.0;`, `bool g = FLAG;`, `usize g = WORDS;` (an intrinsic init),
+`const [*]u8 g = BANNER;` — all emitted the NAME and GCC refused every one; the existing
+fold covered only an integer that `eval_const_expr` could evaluate. Fix: inside a global
+initializer (`Emitter.global_init_depth > 0`) a NODE_IDENT naming a `const` global is
+replaced by that global's OWN initializer — correct by construction (that expression
+already passed the file-scope rules for its declaration) and composable (the ident may
+sit anywhere in the expression). A MUTABLE global is genuinely not a constant and is
+refused in the checker, at the ZER line. `global_init_const_fold_ok.zer` (six shapes plus
+a diamond) failed to build on main.
+
+### BUG-998 — a funcptr binding mid-scan WIPED the caller's alias table (`v6o9c5`)
+
+`volatile *u32 p = &g; *() fp = noop; fp(); *p += 1;` — the spawn race scan descends into
+a bound / returned function from the MIDDLE of the caller's scan and called
+`rmw_alias_reset()` so the callee starts clean, which also emptied the CALLER's aliases:
+`p -> g` was gone by the time `*p += 1` was reached and the RMW was never flagged. Snapshot
+the two tables around the descent (`RmwScanCtx`); the FINDING flags are deliberately not
+part of the snapshot — a callee's finding must propagate out. Also found there: both
+descents returned FALSE past the 32-call cap (the BUG-976 fail-open, on two sites the
+enumeration had not listed); they report now.
+
+### BUG-999 — TWO if-chain walkers for "does this expression mention `g`?", neither listing NODE_STRUCT_INIT (`v6o9c5`)
+
+`g = pick({ .a = g }).a + 1;` was accepted at BOTH race sinks — a read of `g` inside a
+struct-literal argument did not count as reading it, so the write was a plain store
+rather than an RMW. `expr_mentions_name` and `expr_mentions_global` were separate
+if/else chains with DIFFERENT coverage (BUG-856 had extended only the second). ONE
+no-`default:` exhaustive walker now, with the REJECT polarity written down: statement
+kinds and the depth cap answer TRUE. BUG-856's own comment records that the if-chain form
+is invisible to both walker audits — this is the third time that note has been earned.
+
+### BUG-1000 / BUG-1001 — `@bitcast` with an array on either side (`v6o9c5`)
+
+Target: `@bitcast(Color[50], raw)` emitted `int32_t[50] _zer_bco0` — a GCC error with no
+ZER diagnostic; with the declarator fixed the value was DISCARDED (an array is not an
+assignable C value). Refused, with the struct-wrapper remedy. Source: `@bitcast(u64, a)`
+where `a` is `u8[8]` copied the bytes of a DECAYED POINTER (`__auto_type b = a` is a
+`uint8_t *`), so the result was `a`'s address, and a wider target read past it. A silent
+miscompile — `bitcast_array_source_ok.zer` ran and returned 1 on main. An array
+expression already denotes its bytes; both emitter paths copy from it directly (the two
+dispatch paths verified: `grep -c '"bitcast"' emitter.c` = 2).
+
+### BUG-1002 — `is_literal_compatible` said "fits" unconditionally at exactly 64 bits (`vgonmt` / lzmkhn)
+
+`i64 x = 18446744073709551615;` was accepted at every value-flow sink and became -1; the
+negative half wrapped to 1. Every NARROWER signed width rejected the same shape — the same
+rule with a hole at the widest width, the mirror of BUG-863. Bounded at INT64_MAX /
+INT64_MAX+1, iN at exactly 64 the same. Pinned at three sinks including struct-init field
+and call argument, which have no check of their own.
+
+### BUG-1003 — every runtime trap named a line that does not exist (`vgonmt` / lzmkhn)
+
+Function bodies are IR-only and IR block emission switched `#line` off wholesale (the
+BUG-418 collision with labels and statement expressions), so every trap reported
+"function's line + offset in the generated C": a 7-line file said `tl.zer:14`, a 21-line
+trap test said line 25. The number looks plausible, which is exactly why nothing caught
+it. Re-anchored per INSTRUCTION (`emit_line_map`, both IR emitters, BEFORE the
+auto-guards) — safe where the wholesale form was not, because that point is always
+between statements at column 0. The trap runner gained `// expect-trap-at: N`; four trap
+tests pin their real lines, and the check FAILS against the pre-fix compiler.
+
+### BUG-1004 / BUG-1005 — a minted `*bool`, and `a += f` (`vgonmt` / fhf8rn)
+
+The two pointer-minting doors were closed for an ENUM pointee and open for the other
+constrained type: `@ptrcast(*bool, u8ptr)` minted a `*bool` whose load was 2, so
+`b == true` and `b == false` were BOTH false (measured exit 3); `@inttoptr(*bool, addr)`
+the same. `type_carries_bool_c` is the twin of `type_carries_enum_c` (cap rounds toward
+reject, per BUG-994) at the `@inttoptr` gate; `@ptrcast` fires when either pointee is
+enum-or-bool and they differ. And `a += f`: `a = f` is refused, the compound form was
+accepted and emitted a raw C conversion — UB out of range (1e20: 0 at -O0, 255 at -O2),
+bypassing the saturation BUG-883 defines. Both directions refused; the same-domain
+positive pins `+=` on ints, floats, uN.
+
+### BUG-1006 / 1007 / 1008 — alloc_id 0 was two things, `{ .t = freed }`, multi-view at the assignment sink (`vgonmt` / 1zukjq)
+
+`alloc_id` 0 was the "untracked" sentinel AND a legal id minted from local 0, so
+whichever handle landed on local 0 stopped propagating frees to its aliases — the same
+double free was rejected with a `u32 pad` parameter ahead of the struct param and
+accepted without it. ONE `ir_alloc_id_of_local` (id + 1) at every minting site.
+`IR_STRUCT_INIT_DECOMP` was the only value-consuming opcode that never ran the UAF
+walkers nor reached `ir_mark_transferred`, so `{ .t = freed }` read freed memory and
+`{ .t = moved }` used a moved value while the assignment spellings were refused. The
+multi-view call result (a callee whose every return is a view of MORE THAN ONE param)
+was registered only at the var-decl sink — `h = pick(x, y, f); free(y); h[0]` compiled
+clean — and `ir_merge_states` copied the view set from ONE predecessor: a MAY-alias set
+joins as UNION. One conflict against today's BUG-983 (the struct-init carry) — resolved
+by keeping only the transfer block; the old early-`continue` would have defeated the
+carry. `ir_extract_compound_key` now takes the path state (BUG-984), so one call needed
+the extra argument — caught by the build.
+
+- `make check` exit 0; 29 justified rows for the unified walker in
+  `tools/walker_field_baseline.txt`.
+
 ## Session 2026-09-13 — BUG-994/995: factory reach through switch / do-while, and `@ptrtoint(&local)` laundered through a call (classes 7 and 8 closed)
 
 Both from `qo0mm9`, both originally `vigilant-tesla` harvests, both applied as filtered

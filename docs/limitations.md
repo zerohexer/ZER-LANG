@@ -182,7 +182,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 32 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989, 7 as BUG-992, 7 as BUG-994/995), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 11 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989, 7 as BUG-992, 7 as BUG-994/995, 18 + 3 masked as BUG-996..1008), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -238,7 +238,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 32 live), by class — and which branch to take
+### The 97 (now 11 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -345,18 +345,18 @@ own OPEN entry above: the union POINTER capture `|*q|` (false leak) and re-unwra
 `p = null;` (false UAF).
 
 **10. SMALLER CLASSES**
-- i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
-- `bool` minting via `@ptrcast`/`@inttoptr` (2) — `vgonmt`: `bool_mint_ptrcast` `bool_mint_inttoptr`
-- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s `mmio_volatile_index_reject`
-- global init (2) — `qo0mm9`: `global_init_from_mutable` `global_init_chain_too_deep`
-- multiview UAF (2) — `vgonmt`: `multiview_assign_uaf` `multiview_branch_join_uaf`
-- struct-init field (2) — `vgonmt`: `struct_init_field_uaf` `struct_init_field_move`
-- compound float↔int (2) — TAKE `vgonmt`: `compound_float_into_int` `compound_int_into_float`; `qo0mm9`'s single is `compound_assign_int_float`
-- RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init`
-- `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target`
-- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding`
+- ~~i64 literal range (3)~~ — CLOSED 2026-09-13 as BUG-1002
+- ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED 2026-09-13 as BUG-1004
+- ~~MMIO const-ident (2)~~ — CLOSED 2026-09-13 as BUG-996 (and the masked `_oob_index`); `ppnatu`'s `mmio_volatile_index_reject` still OPEN
+- ~~global init (2)~~ — `global_init_from_mutable` CLOSED 2026-09-13 as BUG-997; `global_init_chain_too_deep` was already closed by BUG-975
+- ~~multiview UAF (2)~~ — CLOSED 2026-09-13 as BUG-1008
+- ~~struct-init field (2)~~ — CLOSED 2026-09-13 as BUG-1007
+- ~~compound float↔int (2)~~ — CLOSED 2026-09-13 as BUG-1005
+- ~~RMW via struct-init (2)~~ — CLOSED 2026-09-13 as BUG-999
+- ~~`@bitcast` array target miscompile (1)~~ — CLOSED 2026-09-13 as BUG-1000 (and the array-SOURCE miscompile beside it, BUG-1001)
+- ~~funcptr-binding alias survival (1)~~ — CLOSED 2026-09-13 as BUG-998
 - ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements`
-- param-local double free (1) — `vgonmt`: `param_local0_double_free`
+- ~~param-local double free (1)~~ — CLOSED 2026-09-13 as BUG-1006
 - spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown`
 - defer body with a label (1) — `qo0mm9`: `defer_body_label` (**relevant to main's own label-path
   split, BUG-965 — check whether it is the same shape before fixing**)
@@ -369,12 +369,9 @@ own OPEN entry above: the union POINTER capture `|*q|` (false leak) and re-unwra
 Found by re-running the "already rejected" bucket against each test's own `expect-error`.
 A rejection is not a closure until the REASON matches.
 
-- `mmio_const_ident_oob_index` (`qo0mm9`, `vgonmt`) — wants *"MMIO index 9 is out of range"*,
-  gets *"cannot index volatile '*u32'"*. A different rule fires first; the MMIO range check
-  is never reached. Pairs with `mmio_const_ident_oob_addr` / `_misaligned` in class 10.
-- `opt_param_drop_then_caller_uaf` (`3sdup9`) — wants *"use after free"*, gets a LEAK report.
-- `opt_param_other_optional_null_path_maybe` (`3sdup9`) — wants *"may not be freed on all
-  paths"*, gets a leak report at a different line.
+- ~~`mmio_const_ident_oob_index`~~ — CLOSED 2026-09-13 as BUG-996 (names the index now).
+- ~~`opt_param_drop_then_caller_uaf`~~ / ~~`opt_param_other_optional_null_path_maybe`~~ —
+  CLOSED 2026-09-13 as BUG-985.
 
 Both `opt_param_*` belong with class 9 (optional-param drop), which already has two live
 siblings — likely one fix.

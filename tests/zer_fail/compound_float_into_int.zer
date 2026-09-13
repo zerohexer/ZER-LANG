@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: compound assignment mixes
+// (from claude/loving-davinci-vgonmt 085671b5 = vigilant-tesla-fhf8rn, body verbatim; its BUG-1002 -> main BUG-1005)
+// BUG-1005: `a += f` did what `a = f` is refused, and bypassed the
+// float->int saturation BUG-883 defines: measured 0 at -O0 and 255 at -O2 for
+// f = 1e20 (from vigilant-tesla-fhf8rn, their BUG-915).
+u32 main() { u32 a = 1; f32 f = 2.5; a += f; return a; }

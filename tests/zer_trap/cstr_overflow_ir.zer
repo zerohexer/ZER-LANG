@@ -1,4 +1,5 @@
 // REGRESSION: @cstr in IR emission path silently skipped bounds check, allowing
+// expect-trap-at: 16
 // stack-buffer overflow at runtime (memcpy(buf, src.ptr, src.len) with no
 // guard on src.len > sizeof(buf)). The AST sibling at emitter.c:3174 had the
 // check; the IR path (used for ALL function bodies since 2026-04-19) silently

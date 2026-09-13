@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize 'a' of type 'i64'
+// (from claude/loving-davinci-vgonmt f1265ee5 = vigilant-tesla-lzmkhn; its BUG-991 -> main BUG-1002, body verbatim)
+// BUG-1002, the NEGATIVE half. The magnitude must fit, exactly as it must at
+// every narrower width. Before the fix this compiled and a was 1.
+u32 main() {
+    i64 a = -18446744073709551615;
+    if (a > 0) { return 1; }
+    return 0;
+}

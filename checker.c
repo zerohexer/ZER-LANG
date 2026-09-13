@@ -1067,8 +1067,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_I32:
             if (val > 0xFFFFFFFFULL) return false;
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
+        /* BUG-1002 (from vgonmt f1265ee5 / vigilant-tesla-lzmkhn, its BUG-991/915): this said `return true;` with the comment
+         * "val is uint64, positive literal fits in i64" — false above 2^63-1.
+         * `i64 x = 18446744073709551615;` was ACCEPTED at every one of the
+         * value-flow sinks that route through this predicate and silently
+         * became -1, while every NARROWER signed width rejected the same shape.
+         * Not "no rule at 64 bits": the SAME rule with a hole at the widest
+         * width — the mirror of BUG-863. Corpus cost measured: zero. */
         case TYPE_I64:
-            return true;  /* val is uint64, positive literal fits in i64 */
+            return val <= (uint64_t)INT64_MAX;
         /* Path C: arbitrary-width int — fits if within the width's max */
         case TYPE_UINT: {
             uint32_t _b = effective->intn.bits;
@@ -1077,7 +1084,10 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         }
         case TYPE_SINT: {
             uint32_t _b = effective->intn.bits;
-            if (_b >= 64) return true;
+            /* BUG-1002, the iN sibling: at 65..128 bits a u64 literal always fits;
+             * exactly 64 needs the signed bound. */
+            if (_b > 64) return true;
+            if (_b == 64) return val <= (uint64_t)INT64_MAX;
             return val <= ((1ULL << (_b - 1)) - 1ULL);
         }
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
@@ -1106,11 +1116,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I8:    return val <= 128;
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
-            case TYPE_I64:   return true;
+            /* BUG-1002, the NEGATIVE half: the magnitude must fit, exactly as at
+             * every narrower width. `i64 x = -18446744073709551615;` was accepted
+             * and wrapped to 1. */
+            case TYPE_I64:   return val <= (uint64_t)INT64_MAX + 1ULL;
             /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
             case TYPE_SINT: {
                 uint32_t _b = effective->intn.bits;
-                if (_b >= 64) return true;
+                if (_b > 64) return true;
+                if (_b == 64) return val <= (uint64_t)INT64_MAX + 1ULL;
                 return val <= (1ULL << (_b - 1));
             }
             /* unsigned types: negative literals never fit */
@@ -3088,6 +3102,36 @@ static bool type_carries_enum_c(Type *t, int depth) {
     return false;
 }
 
+/* BUG-1004 (from vgonmt 085671b5 / vigilant-tesla-fhf8rn, its BUG-1001): the bool
+ * sibling of type_carries_enum_c, for the pointer-MINTING doors. `bool` is a uint8_t
+ * in the emitted C whose legal values are 0/1; a load through a minted `*bool` yields
+ * a value that is neither `true` nor `false` (measured: `b == true` and `b == false`
+ * BOTH false, exit 3). Same wrappers as every other carrier predicate; the cap rounds
+ * toward REJECT like its sibling (BUG-994). */
+static bool type_carries_bool_c(Type *t, int depth) {
+    if (!t) return false;
+    if (depth > 32) return true;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_BOOL) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_bool_c(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_bool_c(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_bool_c(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_bool_c(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
 /* Can the @pun runtime type_id trap the emitter writes actually FIRE?
  *
  * It emits `pn.type_id = SRC_TID; if (pn.type_id != TGT_TID && pn.type_id != 0) trap`
@@ -3582,6 +3626,32 @@ static const char *scan_finding_noun(void) {
         return "state reachable through a call chain too deep to analyse (>32), via";
     return _scan_found_static_local ? "static local" : "non-shared global";
 }
+/* BUG-998: the scan CONTEXT a callee descent must not destroy. scan_returned_funcname
+ * and scan_funcname_binding descend into a bound / returned function's body from the
+ * MIDDLE of the caller's scan, and reset the tables so the callee starts clean — which
+ * also wiped the CALLER's aliases, so `volatile *u32 p = &g; *() fp = noop; fp();
+ * *p += 1;` lost `p -> g` at the binding and the RMW was never flagged. Snapshot the
+ * two TABLES (aliases, static locals) around the descent; the FINDING flags are not
+ * part of the snapshot on purpose — a callee's finding must propagate out. */
+typedef struct {
+    struct { const char *name; uint32_t len; Symbol *global; } alias[RMW_ALIAS_MAX];
+    int alias_count; bool alias_overflow;
+    struct { const char *name; uint32_t len; } statics[STATIC_LOCAL_MAX];
+    int static_count; bool static_overflow;
+} RmwScanCtx;
+static void rmw_ctx_save(RmwScanCtx *k) {
+    memcpy(k->alias, _rmw_alias, sizeof _rmw_alias);
+    k->alias_count = _rmw_alias_count; k->alias_overflow = _rmw_alias_overflow;
+    memcpy(k->statics, _static_locals, sizeof _static_locals);
+    k->static_count = _static_local_count; k->static_overflow = _static_local_overflow;
+}
+static void rmw_ctx_restore(const RmwScanCtx *k) {
+    memcpy(_rmw_alias, k->alias, sizeof _rmw_alias);
+    _rmw_alias_count = k->alias_count; _rmw_alias_overflow = k->alias_overflow;
+    memcpy(_static_locals, k->statics, sizeof _static_locals);
+    _static_local_count = k->static_count; _static_local_overflow = k->static_overflow;
+}
+
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
                                     _rmw_alias_overflow = false;
                                     _static_local_count = 0; _static_local_overflow = false;
@@ -3626,68 +3696,76 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
 static bool assign_reads_own_target(Node *value, Symbol *tgt);
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
+/* BUG-999 (from v6o9c5, its BUG-975): ONE exhaustive walker for "does this
+ * expression mention the name `nm`?". It was TWO if/else chains — expr_mentions_name
+ * (IDENT/BINARY/UNARY/FIELD/INDEX/TYPECAST) and expr_mentions_global (those plus
+ * INTRINSIC/CALL/ORELSE/SLICE, added by BUG-856) — answering one question with two
+ * coverages, and NEITHER listed NODE_STRUCT_INIT, so a read of the global inside a
+ * struct-literal argument did not count as reading it:
+ *
+ *     g = pick({ .a = g }).a + 1;      // ACCEPTED at both the spawn and ISR sinks
+ *     g = g + 1;                       // correctly REJECTED
+ *
+ * An interrupt or a concurrent thread landing between the load and the store loses
+ * the update, silently. BUG-856's own comment records why neither audit saw the gap:
+ * the if-chain form is invisible to both. A no-default switch under -Werror=switch
+ * closes that for good — a new NodeKind must be classified here.
+ *
+ * Polarity: this feeds a REJECT (the RMW rule), so "unknown" rounds to TRUE — the
+ * depth cap (BUG-976) and the statement kinds an expression never contains both
+ * answer "assume it mentions it"; only kinds that provably cannot name a value
+ * answer false. */
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
     if (depth > 16) return true;   /* BUG-976: unknown -> assume it mentions it */
     if (!e || !nm) return false;
-    if (e->kind == NODE_IDENT)
+    #define EMN(x) expr_mentions_name((x), nm, nl, depth + 1)
+    switch (e->kind) {
+    case NODE_IDENT:
         return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
-               expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    case NODE_BINARY:   return EMN(e->binary.left) || EMN(e->binary.right);
+    case NODE_UNARY:    return EMN(e->unary.operand);
+    case NODE_FIELD:    return EMN(e->field.object);
+    case NODE_INDEX:    return EMN(e->index_expr.object) || EMN(e->index_expr.index);
+    case NODE_TYPECAST: return EMN(e->typecast.expr);
+    case NODE_CAST:     return true;   /* checker-inserted, no payload walked here: assume */
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (EMN(e->intrinsic.args[i])) return true;
+        return false;
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (EMN(e->call.args[i])) return true;
+        return EMN(e->call.callee);
+    case NODE_ORELSE:   return EMN(e->orelse.expr) || EMN(e->orelse.fallback);
+    case NODE_SLICE:    return EMN(e->slice.object) || EMN(e->slice.start) || EMN(e->slice.end);
+    case NODE_STRUCT_INIT:   /* the missing kind */
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (EMN(e->struct_init.fields[i].value)) return true;
+        return false;
+    case NODE_ASSIGN:   return EMN(e->assign.target) || EMN(e->assign.value);
+    /* Leaves that cannot name a value. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF:
+        return false;
+    /* Statement / declaration kinds: an expression walker is never handed one. If
+     * it ever is, the conservative answer for a REJECT-feeding predicate is TRUE. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    #undef EMN
+    return true;
 }
 
 static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    /* BUG-976: a read of `g` 14 levels into an expression is still a read of `g`. */
-    if (depth > 12) return true;
-    if (!e || !g) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    /* BUG-856: INTRINSIC / CALL / ORELSE were missing, so a read of the global
-     * laundered through any of them did not count as reading it and the write was
-     * classified as a plain store rather than a read-modify-write:
-     *     g = @truncate(u32, g) + 1;    // ACCEPTED at both the spawn and ISR sinks
-     *     g = g + 1;                    // correctly REJECTED
-     * An interrupt or a concurrent thread landing between the load and the store
-     * loses the update, silently.
-     *
-     * This function is an if/else CHAIN, which is why NEITHER gate could see the
-     * gap: walker_default_audit greps kind-SWITCHES, and audit_walker_fields reads
-     * `case` arms. 39294y called that out explicitly and it held — the field audit
-     * reported this file's OTHER walkers and never this one. Recorded here so the
-     * next person knows the chain form is a blind spot, not a clean bill. */
-    if (e->kind == NODE_INTRINSIC) {
-        for (int i = 0; i < e->intrinsic.arg_count; i++)
-            if (expr_mentions_global(e->intrinsic.args[i], g, depth + 1)) return true;
-        return false;
-    }
-    if (e->kind == NODE_CALL) {
-        for (int i = 0; i < e->call.arg_count; i++)
-            if (expr_mentions_global(e->call.args[i], g, depth + 1)) return true;
-        return expr_mentions_global(e->call.callee, g, depth + 1);
-    }
-    if (e->kind == NODE_ORELSE)
-        return expr_mentions_global(e->orelse.expr, g, depth + 1) ||
-               expr_mentions_global(e->orelse.fallback, g, depth + 1);
-    if (e->kind == NODE_SLICE)
-        return expr_mentions_global(e->slice.object, g, depth + 1) ||
-               expr_mentions_global(e->slice.start, g, depth + 1) ||
-               expr_mentions_global(e->slice.end, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    if (!g) return false;
+    return expr_mentions_name(e, g->name, g->name_len, depth);
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
     return expr_mentions_global(value, tgt, 0);
@@ -4433,6 +4511,36 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
         if (sy && sy->is_volatile_addr_derived) return true;
     }
     return false;
+}
+
+/* BUG-996 (from qo0mm9 / vigilant-tesla-o51x9p): the ONE query for "what constant
+ * address does this `@inttoptr` address argument designate?".
+ *
+ * MULTI-SITE CLASS. This question was answered independently at FOUR sites — the
+ * `@inttoptr` range/alignment gate, the direct `@inttoptr(...)[N]` index-bound
+ * derivation, the local var-decl `mmio_bound` derivation, and the global var-decl
+ * one — and every one of them called plain `eval_const_expr`, which folds LITERALS
+ * but not a `const` identifier. Real firmware never writes the literal:
+ *
+ *     const u32 UART = 0x4000_0000;
+ *     volatile *u32 r = @inttoptr(*u32, UART);   // <- fold failed here
+ *
+ * so `mmio_bound` stayed 0 and `r[i]` was REJECTED outright ("no compile-time MMIO
+ * bound is known for this pointer") even though the address is perfectly constant
+ * — an over-rejection on the single most common bare-metal shape. At the `@inttoptr`
+ * gate itself the same fold failure DEFERRED the range and alignment errors to a
+ * runtime trap, i.e. to first boot on the target.
+ *
+ * `eval_const_expr_scoped` resolves an identifier only when the symbol is
+ * `is_const` and carries its own initializer, and that initializer is itself
+ * required to be a compile-time constant (BUG-997), so substituting it is sound;
+ * BUG-975's cycle stack bounds the walk. Using it here strictly TIGHTENS the two
+ * error gates (more addresses become compile-time known) and strictly RELAXES the
+ * two bound derivations (a bound is derived where none was). Route every new MMIO
+ * const-address site through this function — do not re-inline `eval_const_expr`. */
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg) {
+    if (!addr_arg) return CONST_EVAL_FAIL;
+    return eval_const_expr_scoped(c, addr_arg);
 }
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
@@ -8789,6 +8897,18 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
             }
+            /* BUG-1005 (from vgonmt 085671b5 / vigilant-tesla-fhf8rn, its BUG-1002):
+             * `a += f` did what `a = f` is refused, and so bypassed the float->int
+             * SATURATION that BUG-845/883 define — the emitted `a += f` is a raw C
+             * conversion, UB out of range (measured with f = 1e20: 0 at -O0, 255 at
+             * -O2). The other direction (`f += n`) is the same plain/compound split.
+             * Convert explicitly: `a += (u32)f` saturates, `f += (f32)n` converts. */
+            else if (type_is_float(target) != type_is_float(value)) {
+                checker_error(c, node->loc.line,
+                    "compound assignment mixes '%s' and '%s' (float and integer) — "
+                    "convert explicitly: '(T)x' saturates a float into an integer",
+                    type_name(target), type_name(value));
+            }
             /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
             if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
                 node->assign.op == TOK_CARETEQ || node->assign.op == TOK_LSHIFTEQ ||
@@ -11078,7 +11198,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->index_expr.object->intrinsic.name_len == 8 &&
                 memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
                 node->index_expr.object->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(node->index_expr.object->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, node->index_expr.object->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -12030,14 +12150,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                  * provenance cannot be proven wrong); this fires only
                                  * when both pointees are concrete and exactly one is an
                                  * enum. Corpus cost: no @ptrcast to an enum pointee. */
-                                if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
-                                    (g1_sk == TYPE_ENUM) != (g1_tk == TYPE_ENUM)) {
-                                    checker_error(c, node->loc.line,
-                                        "@ptrcast between '%s' and '%s' reinterprets an "
-                                        "integer as an enum — the dereference would yield "
-                                        "a value that is not a declared variant. Read the "
-                                        "carrier and use @bitcast, which is variant-checked",
-                                        type_name(val_type), type_name(result));
+                                /* BUG-1004: `bool` is the other CONSTRAINED type (its
+                                 * legal values are 0/1 in a u8 carrier), so
+                                 * `@ptrcast(*bool, u8ptr)` minted a *bool whose load is
+                                 * neither true nor false — measured: `b == true` and
+                                 * `b == false` both false, exit 3. Fires when either
+                                 * pointee is constrained and the pointees differ. */
+                                {
+                                    bool g1_s_con = (g1_sk == TYPE_ENUM || g1_sk == TYPE_BOOL);
+                                    bool g1_t_con = (g1_tk == TYPE_ENUM || g1_tk == TYPE_BOOL);
+                                    if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
+                                        (g1_s_con || g1_t_con) &&
+                                        !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                                     type_unwrap_distinct(g1_tgt->pointer.inner))) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between '%s' and '%s' reinterprets an "
+                                            "integer as an enum or bool — the dereference would "
+                                            "yield a value that is not a declared variant. Read "
+                                            "the carrier and use @bitcast, which is variant-checked",
+                                            type_name(val_type), type_name(result));
+                                    }
                                 }
                                 if (g1_s_agg && g1_t_agg) {
                                     Type *g1_si = type_unwrap_distinct(eff->pointer.inner);
@@ -12232,6 +12364,18 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 7 && memcmp(name, "bitcast", 7) == 0) {
             if (node->intrinsic.type_arg) {
                 result = resolve_type(c, node->intrinsic.type_arg);
+                /* BUG-1000 (from v6o9c5, its BUG-978): an ARRAY target is not
+                 * expressible. The old emission (`int32_t[50] _zer_bco0`) was a GCC
+                 * error with no ZER diagnostic; with the declarator fixed the value
+                 * was silently DISCARDED — an array is not an assignable C value, and
+                 * the block-scoped array a statement expression would hand back dies
+                 * with the block. The struct-wrapper spelling is the same bits with a
+                 * real value type. Corpus cost: zero. */
+                if (type_dispatch_kind(result) == TYPE_ARRAY) {
+                    checker_error(c, node->loc.line,
+                        "@bitcast cannot target an array type — wrap the array in a "
+                        "struct (`struct W { T[N] a; }`) and bitcast to that");
+                }
                 /* validate same width */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
@@ -12445,10 +12589,14 @@ static Type *check_expr(Checker *c, Node *node) {
                      * docs/limitations.md. */
                     if (type_dispatch_kind(res_eff) == TYPE_POINTER &&
                         res_eff->pointer.inner &&
-                        type_carries_enum_c(res_eff->pointer.inner, 0)) {
+                        (type_carries_enum_c(res_eff->pointer.inner, 0) ||
+                         type_carries_bool_c(res_eff->pointer.inner, 0))) {
+                        /* BUG-1004: `bool` is the other constrained pointee — the same
+                         * door, the same measured consequence (a byte that is neither
+                         * 0 nor 1 matched no switch arm and no comparison). */
                         checker_error(c, node->loc.line,
                             "@inttoptr cannot produce a pointer to '%s' — it carries "
-                            "an enum, and the bits at a hardware address are not "
+                            "an enum or bool, and the bits at a hardware address are not "
                             "guaranteed to be a declared variant, which an exhaustive "
                             "switch relies on. Read the register as an integer and "
                             "convert: 'volatile *u32 r = @inttoptr(*u32, addr); "
@@ -12500,7 +12648,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * --no-strict-mmio, a misaligned MMIO address is SIGBUS
                      * on ARM/RISC-V or silent corruption on Cortex-M0+. */
                     if (node->intrinsic.arg_count > 0) {
-                        int64_t cval = eval_const_expr(node->intrinsic.args[0]);
+                        int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         /* plt86m audit 2026-06-17: the range gate must account
@@ -14640,11 +14788,20 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         if (!fs || !fs->is_function || !fs->func_node ||
             fs->func_node->kind != NODE_FUNC_DECL ||
             !fs->func_node->func_decl.body) return false;
-        if (_scan_global_depth >= 32) return false;
+        /* BUG-998: past the call cap this returned FALSE — "the returned function
+         * touches nothing" — the same fail-open the NODE_CALL arm of the scan had
+         * (BUG-976). Report through the same flag, naming the function. */
+        if (_scan_global_depth >= 32) {
+            _scan_depth_exceeded = true;
+            *out_name = v->ident.name; *out_len = (uint32_t)v->ident.name_len;
+            return true;
+        }
         _scan_global_depth++;
+        RmwScanCtx k; rmw_ctx_save(&k);   /* BUG-998: the caller's aliases survive */
         rmw_alias_reset();
-    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+        bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                                out_name, out_len);
+        if (!found) rmw_ctx_restore(&k);
         _scan_global_depth--;
         return found;
     }
@@ -14744,11 +14901,17 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     if (!fs || !fs->is_function || !fs->func_node ||
         fs->func_node->kind != NODE_FUNC_DECL ||
         !fs->func_node->func_decl.body) return false;
-    if (_scan_global_depth >= 32) return false;
+    if (_scan_global_depth >= 32) {   /* BUG-998: report, do not answer "nothing" */
+        _scan_depth_exceeded = true;
+        *out_name = n->ident.name; *out_len = (uint32_t)n->ident.name_len;
+        return true;
+    }
     _scan_global_depth++;
+    RmwScanCtx k; rmw_ctx_save(&k);   /* BUG-998: the caller's aliases survive */
     rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                            out_name, out_len);
+    if (!found) rmw_ctx_restore(&k);
     _scan_global_depth--;
     return found;
 }
@@ -16344,7 +16507,7 @@ static void check_stmt(Checker *c, Node *node) {
                 init_expr->intrinsic.name_len == 8 &&
                 memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
                 init_expr->intrinsic.arg_count > 0) {
-                int64_t addr = eval_const_expr(init_expr->intrinsic.args[0]);
+                int64_t addr = mmio_const_addr(c, init_expr->intrinsic.args[0]);
                 if (addr != CONST_EVAL_FAIL) {
                     for (int ri = 0; ri < c->mmio_range_count; ri++) {
                         if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -20845,7 +21008,7 @@ static void register_decl(Checker *c, Node *node) {
                 if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
                     memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
                     gi->intrinsic.arg_count > 0) {
-                    int64_t addr = eval_const_expr(gi->intrinsic.args[0]);
+                    int64_t addr = mmio_const_addr(c, gi->intrinsic.args[0]);
                     if (addr != CONST_EVAL_FAIL) {
                         for (int ri = 0; ri < c->mmio_range_count; ri++) {
                             if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
@@ -24491,6 +24654,32 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             (int)decl->var_decl.name_len, decl->var_decl.name,
                             (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
                     }
+                }
+            }
+            /* BUG-997: a global initializer that NAMES a mutable global is not a
+             * compile-time constant, and C refuses it at file scope:
+             *
+             *     u32 SRC = 5;
+             *     u32 B = SRC;   // GCC: "initializer element is not constant"
+             *
+             * The `const` case is handled instead of banned — the emitter
+             * substitutes the referenced global's own initializer (emit_expr's
+             * NODE_IDENT arm). A MUTABLE global is genuinely not a constant, so it
+             * is rejected here, at the ZER line, rather than by GCC in a generated
+             * file. Function names (a funcptr global) and enum variants
+             * (NODE_FIELD) are unaffected. */
+            if (ginit->kind == NODE_IDENT) {
+                Symbol *gsrc = scope_lookup(c->global_scope,
+                    ginit->ident.name, (uint32_t)ginit->ident.name_len);
+                if (gsrc && !gsrc->is_function && !gsrc->is_const) {
+                    checker_error(c, decl->loc.line,
+                        "global variable '%.*s' cannot be initialized from '%.*s' — "
+                        "a global initializer must be a compile-time constant and "
+                        "'%.*s' is mutable. Declare it 'const', or assign in an "
+                        "init function",
+                        (int)decl->var_decl.name_len, decl->var_decl.name,
+                        (int)ginit->ident.name_len, ginit->ident.name,
+                        (int)ginit->ident.name_len, ginit->ident.name);
                 }
             }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */

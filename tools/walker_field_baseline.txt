@@ -1063,3 +1063,41 @@ checker.c:scan_returned_funcname:NODE_TYPECAST:typecast.expr
 checker.c:scan_returned_funcname:NODE_UNARY:unary.operand
 checker.c:scan_returned_funcname:NODE_VAR_DECL:var_decl.init
 checker.c:scan_returned_funcname:NODE_WHILE:while_stmt.cond
+
+# 2026-09-13 — BUG-999 `checker.c:expr_mentions_name` became ONE no-default exhaustive
+# walker (it was two if/else chains — expr_mentions_name and expr_mentions_global —
+# with different coverage, and NEITHER listed NODE_STRUCT_INIT, so a read of a global
+# inside a struct-literal argument did not count as a read and the RMW compiled at
+# both race sinks). It answers "does this EXPRESSION mention the name?" and feeds a
+# REJECT, so every STATEMENT kind — which an expression walker is never handed —
+# answers TRUE without descending: the conservative direction, and there is nothing
+# to learn from children it should never see.
+checker.c:expr_mentions_name:NODE_ASM:asm_stmt.inputs
+checker.c:expr_mentions_name:NODE_ASM:asm_stmt.outputs
+checker.c:expr_mentions_name:NODE_AWAIT:await_stmt.cond
+checker.c:expr_mentions_name:NODE_BLOCK:block.stmts
+checker.c:expr_mentions_name:NODE_CRITICAL:critical.body
+checker.c:expr_mentions_name:NODE_DEFER:defer.body
+checker.c:expr_mentions_name:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_mentions_name:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_mentions_name:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_mentions_name:NODE_FILE:file.decls
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.body
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.cond
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.init
+checker.c:expr_mentions_name:NODE_FOR:for_stmt.step
+checker.c:expr_mentions_name:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_mentions_name:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_mentions_name:NODE_IF:if_stmt.cond
+checker.c:expr_mentions_name:NODE_IF:if_stmt.else_body
+checker.c:expr_mentions_name:NODE_IF:if_stmt.then_body
+checker.c:expr_mentions_name:NODE_INTERRUPT:interrupt.body
+checker.c:expr_mentions_name:NODE_ONCE:once.body
+checker.c:expr_mentions_name:NODE_RETURN:ret.expr
+checker.c:expr_mentions_name:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_mentions_name:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_mentions_name:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_mentions_name:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_mentions_name:NODE_VAR_DECL:var_decl.init
+checker.c:expr_mentions_name:NODE_WHILE:while_stmt.body
+checker.c:expr_mentions_name:NODE_WHILE:while_stmt.cond

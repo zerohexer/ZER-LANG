@@ -1,4 +1,5 @@
 // Audit 2026-05-26: `arr[s.field]` where s.field is OOB silently read
+// expect-trap-at: 20
 // garbage pre-fix because auto-guard only fired for NODE_IDENT/NODE_CALL
 // index expressions. NODE_FIELD/NODE_INDEX/NODE_BINARY indices had no
 // runtime bounds check (and the emit_rewritten_node IR path emits arrays

@@ -1,4 +1,5 @@
 // expect-trap
+// expect-trap-at: 16
 // BUG-843 — @bitcast could FORGE an out-of-variant enum, and the switch then
 // silently ran its LAST arm: `@bitcast(State, 7)` took `.done` while
 // `s == State.done` was false. It was the only route in — ZER has no int->enum

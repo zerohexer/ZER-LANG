@@ -1754,6 +1754,40 @@ static void emit_expr(Emitter *e, Node *node) {
             emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
             break;
         }
+        /* BUG-997 (from qo0mm9 / vigilant-tesla-o51x9p): inside a GLOBAL
+         * initializer a name is not a C constant expression. The fold below in
+         * emit_global_var covers only an INTEGER initializer that eval_const_expr
+         * can evaluate; everything else emitted the NAME and GCC refused it, with
+         * no ZER diagnostic and a line number in a .c file the user never opened:
+         *
+         *     const i32 K = -5;      i32 G = K;              // negative
+         *     const f32 K = 1.5;     f32 G = K + 1.0;        // float target
+         *     const bool K = true;   bool G = K;             // bool target
+         *     const usize B = @size(u32) * 4;  usize C = B;  // intrinsic init
+         *     const [*]u8 A = "hi";  const [*]u8 B = A;      // slice target
+         *
+         * Substituting the referenced global's OWN initializer is correct by
+         * construction and needs no evaluator: that expression already passed the
+         * global-initializer rules for ITS declaration, so it is emittable at file
+         * scope, whatever its type. It composes — the ident may sit anywhere in
+         * the expression, so `K + 1.0` works without a float folder.
+         *
+         * Restricted to a `const` global. A MUTABLE one is genuinely not a
+         * compile-time constant and is rejected in the checker instead. The
+         * depth bound is a backstop: a cycle never reaches here (BUG-975). */
+        if (e->global_init_depth > 0 && e->global_init_depth < 64) {
+            Symbol *gs = scope_lookup(e->checker->global_scope,
+                node->ident.name, (uint32_t)node->ident.name_len);
+            if (gs && gs->is_const && !gs->is_function && gs->func_node &&
+                gs->func_node->kind == NODE_GLOBAL_VAR &&
+                gs->func_node->var_decl.init &&
+                gs->func_node->var_decl.init != node) {
+                e->global_init_depth++;
+                emit_expr(e, gs->func_node->var_decl.init);
+                e->global_init_depth--;
+                break;
+            }
+        }
         /* BUG-218/222/229/233: module-aware identifier emission.
          * When inside a module body (current_module set), PREFER the mangled key
          * for the current module. This prevents cross-module collision where raw
@@ -3675,13 +3709,31 @@ static void emit_expr(Emitter *e, Node *node) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; ");
+                /* BUG-1001 (from v6o9c5, its BUG-979): an ARRAY source DECAYS under
+                 * `__auto_type` (`__auto_type b = a` makes b a `uint8_t *`, sizeof 8),
+                 * so `memcpy(&bco, &bci, N)` copied the POINTER's bytes — a wrong
+                 * value for `@bitcast(u64, u8[8])` and an over-read past the pointer
+                 * for anything wider. An array expression already denotes its bytes,
+                 * so copy from it directly. (An array TARGET is refused by the
+                 * checker, BUG-1000.) */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_expr(e, bsrc);
+                    emit(e, "; ");
+                }
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                if (src_is_array) {
+                    emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, (", tmp, tmp);
+                    emit_expr(e, bsrc);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
@@ -4961,7 +5013,16 @@ static void emit_func_decl(Emitter *e, Node *node) {
     emit(e, ";\n\n");
 }
 
+static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
+    /* BUG-997: mark the global-initializer context for the whole emission, so a
+     * NODE_IDENT naming a const global anywhere in the initializer is replaced by
+     * that global's own initializer rather than emitted as a name (invalid C). */
+    e->global_init_depth++;
+    emit_global_var_inner(e, node);
+    e->global_init_depth--;
+}
+static void emit_global_var_inner(Emitter *e, Node *node) {
     Type *type = checker_get_type(e->checker,node);
     /* threadlocal */
     if (node->var_decl.is_threadlocal) {
@@ -8218,13 +8279,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *t = resolve_tynode(e, node->intrinsic.type_arg);
                 int tmp = e->temp_count++;
                 int tmp2 = e->temp_count++;
-                emit(e, "({__auto_type _zer_bci%d = ", tmp2);
-                if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "; ");
+                /* BUG-1001: IR twin of the AST-path handler above — an array SOURCE
+                 * is copied from directly (it decays under `__auto_type`). */
+                Node *bsrc = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                bool src_is_array = bsrc &&
+                    type_dispatch_kind(checker_get_type(e->checker, bsrc)) == TYPE_ARRAY;
+                emit(e, "({ ");
+                if (!src_is_array) {
+                    emit(e, "__auto_type _zer_bci%d = ", tmp2);
+                    if (bsrc) emit_rewritten_node(e, bsrc, func);
+                    emit(e, "; ");
+                }
                 emit_type(e, t);
-                emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
-                     tmp, tmp, tmp2, tmp);
+                if (src_is_array) {
+                    emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, (", tmp, tmp);
+                    emit_rewritten_node(e, bsrc, func);
+                    emit(e, "), sizeof(_zer_bco%d)); ", tmp);
+                } else {
+                    emit(e, " _zer_bco%d; memcpy(&_zer_bco%d, &_zer_bci%d, sizeof(_zer_bco%d)); ",
+                         tmp, tmp, tmp2, tmp);
+                }
                 /* #17: non-native uN/iN target — mask/sign-extend the punned carrier.
                  * The memcpy copies the full carrier (e.g. all 8 bits of a u5's
                  * uint8_t), leaving an over-width / un-sign-extended value; mask (uN)
@@ -13043,6 +13117,36 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     }
 }
 
+/* BUG-1003 (from vgonmt f1265ee5 / vigilant-tesla-lzmkhn, its BUG-992/917): re-anchor the C preprocessor's line counter to
+ * the ZER source line of the instruction about to be emitted.
+ *
+ * Function BODIES are IR-only, and IR block emission sets `e->source_file` to
+ * NULL — source mapping was switched off wholesale because `#line` collided with
+ * goto labels and statement expressions (the BUG-418 class). The consequence was
+ * never written down: with ONE `#line` per function (at its declaration) and none
+ * inside, every line inside every function body mapped to "function's line +
+ * offset in the generated C", so EVERY runtime trap named a line that does not
+ * exist (a 7-line file reported "ln1.zer:15"). The trap fires correctly; only
+ * the location lies, which is why nothing caught it — the number is plausible.
+ *
+ * Emitting the directive HERE is safe where the wholesale approach was not: this
+ * is called between instructions, at column 0, never inside a `({...})` statement
+ * expression and never on the same line as a `{` or a label (the block label is
+ * emitted with its own trailing newline).
+ *
+ * It is emitted for EVERY instruction, not only when the ZER line changes:
+ * `#line N` numbers the NEXT line N and then counts up, so an instruction that
+ * expands to three C lines leaves the counter at N+3 — a second instruction on
+ * the SAME ZER line would be misreported without its own anchor. An instruction
+ * with no location (0) re-anchors to the last known line rather than drifting. */
+static void emit_line_map(Emitter *e, const char *src_file, int line, int *last) {
+    if (!src_file) return;
+    if (line <= 0) line = *last;
+    if (line <= 0) return;
+    emit(e, "#line %d \"%s\"\n", line, src_file);
+    *last = line;
+}
+
 /* Emit a regular (non-async) function from IR */
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
@@ -13206,10 +13310,13 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
-    /* Disable source mapping during IR block emission — #line directives
-     * collide with goto labels and statement expressions (BUG-418 class). */
+    /* Wholesale source mapping stays OFF during IR block emission — an
+     * unconditional #line collides with goto labels and statement expressions
+     * (BUG-418 class). BUG-1003 re-anchors it per INSTRUCTION instead, which is
+     * safe because that point is always between statements at column 0. */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -13298,6 +13405,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
             IRInst *ins = &bb->insts[ii];
+            /* BUG-1003: anchor the line counter BEFORE the guards, so an
+             * auto-guard trap reports the access's line, not the previous one. */
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
@@ -13485,9 +13595,11 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         add_async_local(e, func->locals[li].name, func->locals[li].name_len);
     }
 
-    /* Disable source mapping during IR blocks */
+    /* Disable source mapping during IR blocks (see the BUG-1003 note on the
+     * regular path — the per-instruction re-anchor below replaces it). */
     const char *saved_source = e->source_file;
     e->source_file = NULL;
+    int last_mapped_line = -1;
 
     /* BUG-863: IR_RETURN reads this to decide whether the async termination
      * also stores a result. The regular-function path sets it; this one never
@@ -13511,6 +13623,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
              * same way as the regular path; emit_auto_guard_return_body
              * emits `self->_zer_state = -1; return 1;` for async returns. */
             IRInst *ins = &bb->insts[ii];
+            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
             if (ins->expr) {
                 IROpKind k = ins->op;
                 /* Audit-fix (2026-06-30): paired with the regular-path gate

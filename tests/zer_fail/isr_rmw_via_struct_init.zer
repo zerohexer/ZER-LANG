@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement and is shared between interrupt and main
+// (from claude/loving-davinci-v6o9c5 318bf058; its BUG-975 -> main BUG-999, body verbatim)
+// BUG-999: ISR sibling of spawn_rmw_via_struct_init.zer.
+struct W { u32 a; }
+volatile u32 g;
+W pick(W w) { return w; }
+interrupt TIMER1 { g = pick({ .a = g }).a + 1; }
+u32 main() { g = 1; return 0; }

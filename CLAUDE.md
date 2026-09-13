@@ -2794,9 +2794,10 @@ because a rejection is a rejection whether or not your patch caused it.
 
 - **Reproduce on main FIRST**, before reading the fix sketch. Already rejects → mark it closed with
   the measurement; do not implement.
-- **Read the REASON, not the exit code.** `zerc f.zer -o out.c` exits 0 even on checker errors AND
-  prints a success line `zerc: in.zer -> out.c` — non-empty output is NOT an error. Grep for
-  `error`/`zercheck`, then check it is YOUR rule.
+- **Read the REASON, not the exit code.** (~~`-o out.c` exits 0 on checker errors~~ — it exits 1,
+  corrected 2026-08-17 in "zerc -o gotchas"; the rule stands because a non-zero exit never says
+  WHICH rule fired.) It also prints a success line `zerc: in.zer -> out.c` — non-empty output is
+  NOT an error. Grep for `error`/`zercheck`, then check it is YOUR rule.
 - **Masking is the dominant failure mode.** 3 of the 6 reproducers were rejected by an unrelated
   stronger rule (one masked TWICE). Route around it, then re-probe.
 - **AN EDIT THAT APPEARS TO APPLY AND DOESN'T — four distinct forms hit in ONE session

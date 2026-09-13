@@ -30,6 +30,75 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — an array index in a LOOP CONDITION is proved under the PRE-loop range (2026-09-13, HIGH — accept-unsafe, ASan-confirmed silent OOB)
+
+Found while verifying a compiler-internals.md claim about where loop-condition guards land.
+**Not fixed yet** — recorded the same hour, with the fix shape, so it is not re-derived.
+
+**Symptom.** All of these compile with NO diagnostic, and the condition's `arr[i]` is
+emitted with NO bounds check and NO auto-guard:
+
+```zer
+u32[4] arr;
+u32 f(u32 n) { u32 i = 0; while (arr[i] > 0) { i += n; } return i; }      // ASan: global-buffer-overflow
+u32 g(u32 n) { u32 i = 0; do { i += n; } while (arr[i] > 0); return i; }
+u32 h(u32 n) { u32 i = 0; for (u32 k = 0; arr[i] > 0; k += 1) { i += n; } return i; }
+u32 j()      { u32 i = 0; while (arr[i] > 0) { i += 1; } return i; }      // constant step, no bound — same
+```
+
+Emitted C for `f`: `_zer_bb1: _zer_t1 = arr[i]; …` — the read is bare. With `arr` all
+non-zero, ASan reports `READ of size 4 … global-buffer-overflow` at the condition's line.
+Measured on `9ce61193` and on the session baseline; it is old, not a regression of this run.
+By contrast `u32 i = n; while (arr[i] > 0) …` (an UNKNOWN entry value) gets the emitter's
+guard inside the condition block, per iteration — so the emission path is fine; the
+CHECKER's proof is wrong.
+
+**Root cause.** All three loop drivers in `check_stmt` (checker.c, `case NODE_WHILE` /
+`NODE_DO_WHILE`, `case NODE_FOR`) call `check_expr(c, cond)` BEFORE
+`vrp_invalidate_loop_body_writes(c, body)` (and, for `for`, before `check_expr(step)`).
+The condition is therefore range-checked under `i in [0,0]` — the value BEFORE the loop —
+`arr[i]` is marked proven-safe on that node, and the elision decision is permanent. The
+condition is evaluated on EVERY iteration under the loop-carried value. BUG-748
+(2026-06-18) fixed exactly this for the loop BODY and did not touch the condition;
+BUG-D (2026-07-16) fixed the do-while body's cond-derived narrowing. The condition itself
+was never on either list.
+
+**Fix sketch (small, an ordering change):** in each driver, run
+`vrp_invalidate_loop_body_writes(body)` — and for `for`, the step's invalidation — BEFORE
+`check_expr(cond)`, and keep the cond-derived NARROWING push (`i < N` -> `[lo, N-1]`, which
+is for the BODY) AFTER the cond check as it is now: at the condition, `i` is exactly what the
+condition is about to test, so it must NOT be checked under the narrowing. `w_entry_lo`
+(BUG-992's while half) is captured before the widening already and is unaffected. The
+BUG-748/B7 companion `vrp_widen_loop_addr_taken` runs after the narrowing and can stay.
+Then: (1) the four shapes above must WARN + guard (the `while` cond guard lands inside the
+condition block, as the `i = n` shape already does); (2) `tests/zer/*_runtime_bound.zer`
+and the 11-shape `loop_counter_bounds_ok.zer` must be unchanged; (3) corpus scan under both
+binaries for the new warnings — a cond index whose variable the body does not write must
+NOT start warning; (4) a `zer_trap` positive with `expect-trap-at` for the while shape.
+
+**Tripwire:** none yet — write the negative/trap tests as part of the fix.
+
+## OPEN — the BUG-976 depth-cap enumeration is NOT closed: caps still answering in the ACCEPT direction (2026-09-13, MEDIUM — unmeasured)
+
+`grep -nE "depth *> *[0-9]+\)" checker.c zercheck_ir.c` on 2026-09-13 lists caps whose
+past-cap answer is the accept direction and that carry no BUG-976/994 polarity comment:
+
+| function | cap | past-cap answer | reachable? |
+|---|---|---|---|
+| `resolve_write_target_global` | `depth > 6 -> NULL` | "not a global" — the RMW/ISR write target is not seen | 7 pointer hops; unmeasured |
+| `node_forwards_param_to_spawn` | `depth > 8 -> false` | "does not forward" (the REACH forwarded-PARAM form); its `depth` MIXES AST nesting with call-graph hops (`func_forwards_param_to_spawn(c, cs, i, depth + 1)`) | a spawn nine ifs deep in the callee — the BUG-994 shape; unmeasured |
+| `body_calls_funcptr_field` / `scan_funcptr_field_bindings` | `depth > 8 -> false` | "no funcptr field call / no binding" at the spawn sink | AST nesting 9..63; unmeasured |
+| `global_init_scan` | `depth > 128 -> NULL` | "nothing offending" in a global initializer | parser allows expression nesting 256, so 129..256; unmeasured |
+| `for_init_has_loop_jump` | `depth > 32 -> false` | "no loop jump in the for-init" (BUG-854's refusal) | an init nested 33 deep; unmeasured |
+| `packed_path_aggregate` | `depth > 64 -> NULL` | "not packed" — misaligned access accepted | its own comment says the parser bounds it; verify the bound is < 64 |
+| `zbi_scan` | `depth > 256 -> return` | "no resource use recorded" (init check) | bounded by the parser at 256; probably closed by construction |
+| `tynode_keeps_storage_inline` | `depth > 32 -> false` | "indirect" — its comment says INLINE is the safe direction, so this one IS backwards by its own reasoning | type nesting cap is 256; unmeasured |
+
+Do exactly what BUG-976 did: measure each window with a generated program on both sides
+of the cap, then FLIP / REPORT / WIDEN by what the walk produces (compiler-internals.md
+"Bounded walks — the fail-open class"). The ones bounded by another limit below the cap are
+closed by construction and need only a comment saying so.
+
 ## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
 
 BUG-989 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch

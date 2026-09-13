@@ -116,3 +116,7 @@ checker.c:        Type *scratch[4] = {0};
 # one — and the read-only rw exemption tops out at the same 4.
 checker.c:            Type *direct_rw[4]; int nrw = 0;
 checker.c:                Type *viacall[4];
+# BUG-1008: the asm-operand shared-root probe only asks "is there AT LEAST ONE shared
+# root in this operand?" — the collector is capped at max_types=2 by its own argument, so
+# the scratch can never overflow; nothing is stored past the check.
+checker.c:                Type *sh[2];

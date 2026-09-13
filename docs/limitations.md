@@ -274,7 +274,8 @@ aggregate (BUG-999); global projections are BUG-1001; the optional-param free th
 - ~~compound float↔int (2+1)~~ — CLOSED as BUG-986
 - RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init` (not re-measured this session)
 - `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target` (not re-measured)
-- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding` (not re-measured)
+- ~~funcptr-binding alias survival (1)~~ — CLOSED as BUG-1009 (the funcname-binding scan
+  reset the caller's alias table in place; now snapshot/restore)
 - ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements` — **DELIBERATELY
   NOT ADOPTED (design question).** `u32 t = g; g = t + 1;` IS a lost-update window against an
   ISR, but the compiler's own RMW diagnostic tells the user to "use an explicit
@@ -288,22 +289,24 @@ aggregate (BUG-999); global projections are BUG-1001; the optional-param free th
   branch's "cannot resolve" rejection is unnecessary here.
 - ~~defer body with a label (1)~~ — CLOSED as BUG-997 (rejected at the checker; it used to
   compile and TRAP at runtime, the BUG-965 "bodies on neither path" hazard).
-- asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
-  **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
-  these are its reproducers.
+- ~~asm operand shared read (1)~~ — CLOSED as BUG-1008 (rejected: a naked function has no
+  frame to take the lock in; Ban #1). `ppnatu`'s `asm_shared_operand` adopted as the test.
+- **volatile index read twice** (not in the survey — found by running `ppnatu`'s
+  `volatile_ident_index_oob_trap` on this tree: exit 0, the two-read auto-guard's silent
+  early return) — CLOSED as BUG-1007.
 
-### MASKED — main rejects these, but for the WRONG reason, so the hole is still open (2)
+### ~~MASKED — main rejects these, but for the WRONG reason~~ — all three closed 2026-09-13
 
 Found by re-running the "already rejected" bucket against each test's own `expect-error`.
 A rejection is not a closure until the REASON matches.
 
 - ~~`mmio_const_ident_oob_index`~~ — rejects for its OWN reason since BUG-996 (the const
   address now folds, so the MMIO index bound is derived and the range rule fires first).
-- `opt_param_drop_then_caller_uaf` (`3sdup9`) — wants *"use after free"*, gets a LEAK report.
-- `opt_param_other_optional_null_path_maybe` (`3sdup9`) — wants *"may not be freed on all
-  paths"*, gets a leak report at a different line.
+- ~~`opt_param_drop_then_caller_uaf`~~ / ~~`opt_param_other_optional_null_path_maybe`~~ —
+  reject for their own reason since BUG-1004 (the optional-param free through `orelse
+  return` is summarised, so the caller sees the free rather than a leak).
 
-Both `opt_param_*` belong with class 9 (optional-param drop), which already has two live
+Both `opt_param_*` belonged with class 9 (optional-param drop), which already had two live
 siblings — likely one fix.
 
 ### limitations.md entries worth taking (deduped against main's own)
@@ -1167,57 +1170,17 @@ this is fixed** — leaving it would turn a deliberate record into a rule nobody
 
 ---
 
-## OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK (2026-09-06, MEDIUM — narrow but a real data race)
+## ~~OPEN~~ CLOSED 2026-09-13 as BUG-1008 — a `shared struct` read in an ASM OPERAND takes NO LOCK
 
-Found while correcting `tools/walker_field_baseline.txt`'s asm rationale during BUG-942,
-not reported by any branch. The baseline claimed an asm operand can reach "no local, no
-loop and no effect"; the third was false, and this is what is behind it.
-
-The emitter's per-statement `shared struct` auto-locking does not wrap an `asm`
-statement, so a shared field read in an OPERAND is emitted bare:
-
-```zer
-shared struct A { u32 x; }
-A a;
-naked void k(){
-    asm { instructions: "nop" inputs: { "rax" = a.x } safety: "..." }
-}
-void worker(){ k(); }
-u32 main(){ ThreadHandle t = spawn worker(); t.join(); return 0; }
-```
-
-MEASURED on main at `aeea0cd5` — accepted with **no diagnostic**, and the emitted C is:
-
-```c
-void k(void) { _zer_bb0:; __asm__ __volatile__ ("nop" :  : "a"(a.x)); return; }
-```
-
-no `pthread_mutex_lock`, while the identical read in an ordinary statement emits
-`_zer_mtx_ensure_init` + `pthread_mutex_lock` + read (verified side by side). The whole
-contract of `shared` is that the lock is automatic, so this is an unlocked shared access
-reachable from a spawned thread — the same class as BUG-935, at a site the collector
-never visits.
-
-**Not to be confused with the CALL-laundered shape**, which behaves differently and is
-NOT a hole: a call in an operand reaching two shared structs (`"rax" = touch_both()`) is
-ACCEPTED while the same call in an ordinary statement is REJECTED by the deadlock rule.
-That divergence is the OVER-REJECTION item **O** in the ii7a90 survey proposes to relax
-(a statement with no DIRECT shared access takes no lock, so nothing can nest around the
-call) — the asm site is accidentally already on the relaxed side. Do not "fix" that one
-by tightening asm; fix it by doing O.
-
-**Fix sketch:** the shared-root collector (`find_all_shared_roots_expr`, the
-`SharedRootVec` from BUG-935) does not run on `asm_stmt.inputs` / `.outputs`. Running it
-there and emitting the lock/unlock around the asm statement is the shape of the fix.
-Two hazards to check before shipping it: a lock around an `asm` block inside `@critical`
-(the interrupt-disabled window), and whether locking is even legal in a `naked` function
-under the S1 restriction — this may be a case where REJECTING a direct shared access in
-an operand is the right answer rather than locking it, since a naked function has no
-frame. Decide with the Ban Decision Framework; do not assume the lock.
-
-Tripwire: none yet — write the negative in the same commit as the fix.
-
----
+The emitter's per-statement auto-lock never wrapped an `asm` statement, so a shared field
+bound as an operand (`inputs: { "rax" = a.x }`) was emitted as a bare read. Decided by the
+Ban framework (#1, hardware constraint) rather than tracked: `asm` is legal only inside a
+`naked` function, which has no prologue and no frame in which to take the mutex. The
+checker's NODE_ASM arm now runs `collect_shared_types_in_expr` over every input and output
+operand and rejects a shared root; the remedy is to copy the field to a scalar in a
+non-naked caller. Test: `tests/zer_fail/asm_shared_operand.zer`. The CALL-laundered shape
+noted here before (`"rax" = touch_both()`) is unchanged — it is the over-rejection item O,
+not a hole.
 
 ## ~~OPEN~~ CLOSED — BRANCH `loving-davinci-r3an9y` (2026-09-04): all 9 surveyed items fixed 2026-09-08..10; 3 unverified residuals remain
 

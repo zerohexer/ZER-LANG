@@ -12881,6 +12881,8 @@ mixed). Run it against a pre-fix build: 7 false negatives, then 0.
 | "a struct VALUE moved somewhere carries the allocations it holds" | `ir_carry_compounds(zc, ps, src_root, dest_root, prefix)` (BUG-1002) | IR_COPY, both STRUCT_INIT sites, and the slot store (`ir_store_struct_value_into_slot`) |
 | "is this plain `=` into a tracked slot a RESET or a use?" | `ir_assign_target_is_tracked_slot` + `ir_value_clears_slot` (BUG-1001) — a reference-forming or arm-handled value never clears | the IR_ASSIGN UAF walk and the slot-clear arm |
 | "lower ONE statement with its guards, lock and unlock" | `lower_stmt_in_block` / `lower_body` (ir_lower.c, BUG-1003) | the NODE_BLOCK loop, switch arms, defer bodies — every single-statement body position. A third grammar form that yields a bare statement must go through `lower_body` |
+| "may this VRP key's value change between two reads?" (its ROOT is `volatile`) | `vrp_key_root_is_volatile` (BUG-1007) | `push_var_range` (never narrow), the array auto-guard sink (leave UNGUARDED so the emitter's single-read inline form is taken), the MMIO index sink (refuse). A volatile index must be loaded EXACTLY ONCE: never add a guard form that evaluates the index expression twice |
+| "scan a callee body with a fresh alias table, then get MINE back" | `rmw_scan_snapshot` / `rmw_scan_restore` (BUG-1009) | the two funcname-binding resolvers in the spawn scan; the direct-call arm saves/restores its own count. A new nested-scan site must snapshot, never bare `rmw_alias_reset()` |
 
 Two things learned harvesting: (1) a branch's checker hunks apply with `patch --fuzz=3`
 even when the commit as a whole conflicts (their emitter refactors were the conflict, not

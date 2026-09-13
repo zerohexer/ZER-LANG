@@ -875,6 +875,8 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len); /* BUG-1007 */
+static int collect_shared_types_in_expr(Checker *c, Node *expr, Type **types, int max_types, int count); /* BUG-1008 */
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
@@ -3686,6 +3688,38 @@ static const char *scan_finding_noun(void) {
     if (_scan_depth_exceeded)
         return "state reachable through a call chain too deep to analyse (>32), via";
     return _scan_found_static_local ? "static local" : "non-shared global";
+}
+/* BUG-1009: the funcname-binding resolvers (`fp = noop; fp();` and the factory
+ * form) scan the bound callee's body with a FRESH alias table — correct for the
+ * callee — but they RESET the table in place and never restored it, so an alias
+ * established earlier in the SAME body (`volatile *u32 p = &g;`) was wiped by the
+ * indirect call and the `*p += 1` after it resolved to nothing:
+ *
+ *     void w() { volatile *u32 p = &g; *() fp = noop; fp(); *p += 1; }   // ACCEPTED
+ *
+ * while the same body without `fp();` was rejected. Snapshot the scan tables
+ * around the nested scan and restore them after. (v6o9c5 rewrote the scans as a
+ * memoised walk; this is the minimal sound form of the same fix.) */
+typedef struct {
+    struct { const char *name; uint32_t len; Symbol *global; } alias[RMW_ALIAS_MAX];
+    int alias_count;
+    bool alias_overflow;
+    struct { const char *name; uint32_t len; } statics[STATIC_LOCAL_MAX];
+    int static_count;
+} RmwScanSnap;
+static void rmw_scan_snapshot(RmwScanSnap *sv) {
+    memcpy(sv->alias, _rmw_alias, sizeof(sv->alias));
+    sv->alias_count = _rmw_alias_count;
+    sv->alias_overflow = _rmw_alias_overflow;
+    memcpy(sv->statics, _static_locals, sizeof(sv->statics));
+    sv->static_count = _static_local_count;
+}
+static void rmw_scan_restore(const RmwScanSnap *sv) {
+    memcpy(_rmw_alias, sv->alias, sizeof(sv->alias));
+    _rmw_alias_count = sv->alias_count;
+    _rmw_alias_overflow = sv->alias_overflow;
+    memcpy(_static_locals, sv->statics, sizeof(sv->statics));
+    _static_local_count = sv->static_count;
 }
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
                                     _rmw_alias_overflow = false;
@@ -11188,6 +11222,28 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* Auto-guard: if not proven, mark for auto-guard insertion in emitter.
                  * Compiler inserts if (idx >= size) { return <zero>; } invisibly.
                  * Warn so programmer knows they can add a guard for zero overhead. */
+                /* BUG-1007: NOT for a VOLATILE index. The auto-guard is
+                 * `if (i >= N) return; ... arr[i]` — TWO reads of `i`. For an
+                 * ordinary local that is one value; for a volatile it is two
+                 * loads, and whatever changes it between them (an ISR, a thread,
+                 * the peripheral) walks straight past the guard. Measured on the
+                 * emitted C: `_zer_t0 = g_i; if (_zer_t0 >= 4) ...; arr[g_i] = 7`.
+                 * Leave it UNPROVEN and UNGUARDED here so the emitter takes its
+                 * single-evaluation inline form — one load into a temp, the
+                 * bounds check and the access both on the temp (a trap, like a
+                 * slice). Both emitter paths admit a volatile ident to that form. */
+                if (!checker_is_proven(c, node) &&
+                    vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                        (uint32_t)node->index_expr.index->ident.name_len)) {
+                    checker_warning(c, node->loc.line,
+                        "volatile index '%.*s' cannot be proven in range for array of "
+                        "size %llu — a single-read bounds check (trap on failure) is "
+                        "inserted. Copy it to a non-volatile local and guard that to "
+                        "eliminate the check",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size);
+                } else
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
                     checker_warning(c, node->loc.line,
@@ -11321,6 +11377,27 @@ static Type *check_expr(Checker *c, Node *node) {
                             mark_proven(c, node);
                             break;
                         }
+                    }
+                    /* BUG-1007: a VOLATILE index on an MMIO pointer has the same
+                     * two-read guard as the array case, and here there is no inline
+                     * single-read form to fall back to (a pointer index emits bare).
+                     * Ban Decision Framework: no tracking can hold a volatile value
+                     * still between the check and the use, so refuse, with the
+                     * one-line fix. */
+                    if (node->index_expr.index->kind == NODE_IDENT &&
+                        vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                            (uint32_t)node->index_expr.index->ident.name_len)) {
+                        checker_error(c, node->loc.line,
+                            "cannot index MMIO pointer with volatile '%.*s' — the "
+                            "range guard would read it once and the access again, and "
+                            "a value that changes between the two reads defeats the "
+                            "guard. Copy it to a non-volatile local first",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name);
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;   /* diagnosed once, not twice */
+                        break;
                     }
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
@@ -14857,9 +14934,11 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
             !fs->func_node->func_decl.body) return false;
         if (_scan_global_depth >= 32) return false;
         _scan_global_depth++;
+        RmwScanSnap _sv1; rmw_scan_snapshot(&_sv1);   /* BUG-1009 */
         rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                                out_name, out_len);
+        rmw_scan_restore(&_sv1);
         _scan_global_depth--;
         return found;
     }
@@ -14961,9 +15040,11 @@ static bool scan_funcname_binding(Checker *c, Node *n,
         !fs->func_node->func_decl.body) return false;
     if (_scan_global_depth >= 32) return false;
     _scan_global_depth++;
+    RmwScanSnap _sv2; rmw_scan_snapshot(&_sv2);   /* BUG-1009 */
     rmw_alias_reset();
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                            out_name, out_len);
+    rmw_scan_restore(&_sv2);
     _scan_global_depth--;
     return found;
 }
@@ -18637,6 +18718,32 @@ static void check_stmt(Checker *c, Node *node) {
                         (int)op->reg_name_len, op->reg_name);
                 }
             }
+            /* BUG-1008: a SHARED struct field bound as an asm operand. Every other
+             * read/write of a shared field is wrapped lock→op→unlock by the emitter
+             * per statement; an asm operand is bound raw, so the access is
+             * UNLOCKED — a data race against every locked accessor. Ban, not track
+             * (CLAUDE.md Ban framework #1, hardware constraint): asm is legal only
+             * inside a `naked` function, which has no prologue and no frame, so
+             * there is nowhere to emit the lock/unlock calls. Copy the field out in
+             * a non-naked caller and pass the scalar. (The raw-string inline form
+             * carries its operands inside the C text where no checker can see them;
+             * that form is documented as a floor.) Adopted from ppnatu. */
+            for (int i = 0; i < node->asm_stmt.input_count + node->asm_stmt.output_count; i++) {
+                AsmOperand *op = (i < node->asm_stmt.input_count)
+                    ? &node->asm_stmt.inputs[i]
+                    : &node->asm_stmt.outputs[i - node->asm_stmt.input_count];
+                if (!op->expr) continue;
+                Type *sh[2];
+                if (collect_shared_types_in_expr(c, op->expr, sh, 2, 0) > 0) {
+                    checker_error(c, op->loc.line,
+                        "asm operand '%.*s' reads or writes shared struct '%.*s' with no "
+                        "lock — a naked function has no frame in which to take one, so "
+                        "the access races every locked accessor. Copy the field to a "
+                        "scalar in a non-naked caller and bind that instead",
+                        (int)op->reg_name_len, op->reg_name,
+                        (int)sh[0]->struct_type.name_len, sh[0]->struct_type.name);
+                }
+            }
             /* Clobbers: just register name strings — no expression to check.
              * Per-arch validity deferred to Session C. Session B accepts any
              * non-empty string. */
@@ -21758,12 +21865,36 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
 /* Push a new range entry. If an existing range exists for this var,
  * intersect (narrow) rather than replace — ensures ranges only tighten.
  * For unsigned types, min is clamped to 0 (can't be negative). */
+/* BUG-1007: is the ROOT of a VRP key a `volatile` symbol? A volatile value can
+ * change between any two reads — an ISR, another thread, or the hardware itself —
+ * so no fact observed about it at one program point holds at the next. VRP was
+ * narrowing volatile variables exactly like ordinary ones:
+ *
+ *     volatile u32 g_i;  u32[4] arr;
+ *     if (g_i < 4) { arr[g_i] = 7; }     // guard ELIDED: g_i "proven" in [0,3]
+ *
+ * and the emitted C read g_i a second time for the access. An interrupt landing
+ * between the two reads writes past the array with no check, no fault, silently
+ * — the bare-metal shape this compiler exists to catch. The key may be a
+ * compound (`s.f`, `arr[0]`); the root symbol carries the qualifier.
+ * (Adopted from loving-davinci-ppnatu.) */
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len) {
+    uint32_t rl = 0;
+    while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
+    if (rl == 0) return false;
+    Symbol *s = scope_lookup(c->current_scope, name, rl);
+    if (!s) s = scope_lookup(c->global_scope, name, rl);
+    return s && s->is_volatile;
+}
+
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero) {
     /* BUG-479: skip narrowing for address-taken variables — pointer alias
      * may modify the value, so guard-narrowed range is unreliable. */
     struct VarRange *existing = find_var_range(c, name, name_len);
     if (existing && existing->address_taken) return;
+    /* BUG-1007: never narrow a VOLATILE — see vrp_key_root_is_volatile. */
+    if (vrp_key_root_is_volatile(c, name, name_len)) return;
 
     /* clamp min to 0 for unsigned variables */
     if (min_val < 0) {

@@ -2826,6 +2826,11 @@ static void emit_expr(Emitter *e, Node *node) {
                                       node->index_expr.index->kind == NODE_ASSIGN ||
                                       node->index_expr.index->kind == NODE_UNARY ||
                                       node->index_expr.index->kind == NODE_ORELSE);
+        /* BUG-1007: a VOLATILE index must be read exactly once — the comma form
+         * below reads it for the check and again for the access, and anything
+         * that changes it in between (ISR, thread, peripheral) defeats the check.
+         * The IR-path twin (BUG-749) already ORs this in; the AST path did not. */
+        if (expr_is_volatile(e, node->index_expr.index)) idx_has_side_effects = true;
         /* check if base object has side effects (e.g. get_slice()[0]) */
         bool obj_has_side_effects = false;
         {
@@ -7405,6 +7410,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * statement-expression branch. */
         if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
+        /* BUG-1007: expr_is_volatile resolves the root through the CHECKER's scope,
+         * which no longer holds a function's LOCALS at emission time — so a
+         * `volatile u32 li; arr[li]` slipped it and was emitted bare (measured).
+         * The IR local carries the qualifier (IRLocal.is_volatile, #19 VOL-1). */
+        if (func && node->index_expr.index->kind == NODE_IDENT) {
+            Node *vi = node->index_expr.index;
+            for (int li = 0; li < func->local_count; li++) {
+                IRLocal *l = &func->locals[li];
+                if (l->is_volatile && l->name_len == (uint32_t)vi->ident.name_len &&
+                    memcmp(l->name, vi->ident.name, l->name_len) == 0) { idx_se = true; break; }
+            }
+        }
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
@@ -7430,7 +7447,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
-                   node->index_expr.index->kind != NODE_IDENT &&
+                   /* BUG-1007: a VOLATILE ident index is NOT left to the auto-guard
+                    * (the checker no longer marks one — two reads of a volatile
+                    * defeat it). It takes the single-evaluation form below instead:
+                    * one load into `_zer_idx`, check and access both on the temp. */
+                   (node->index_expr.index->kind != NODE_IDENT || idx_se) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for

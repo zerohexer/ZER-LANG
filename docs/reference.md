@@ -1967,6 +1967,11 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   (`@inttoptr(*u32, BASE + 0x14)` with `const u32 BASE = 0x4000_0000;`): it folds
   at compile time, so range and alignment are checked at compile time and
   indexing through the pointer (`r[i]`) gets a compile-time bound.
+- An MMIO pointer cannot be indexed by a `volatile` variable (`reg[g_i]` with
+  `volatile u32 g_i`): the range guard would read it once and the access again,
+  and a value that changes between the two reads defeats the guard. Copy it to a
+  non-volatile local first. (A fixed ARRAY indexed by a volatile compiles: the
+  index is loaded exactly once and bounds-checked with a trap.)
 - `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
   it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
   still emitted for variable addresses (alignment is a property of the

@@ -1237,6 +1237,26 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
      * (`arr[i]`), so this keeps almost all of the coverage and none of the risk. */
     Node *ix = site->index_expr;
     if (!ix || (ix->kind != NODE_IDENT && ix->kind != NODE_INT_LIT)) return;
+    /* BUG-1007: a VOLATILE ident is NOT side-effect free in the sense that matters
+     * here — evaluating it in the guard and again in the access is two loads of a
+     * value that may change in between. The checker no longer marks such an
+     * access for auto-guard at all (it takes the emitter's single-read inline
+     * check), so this is belt-and-braces: decline, never split the read. */
+    if (ix->kind == NODE_IDENT) {
+        int vl = -1;
+        for (int li = 0; li < ctx->func->local_count; li++) {
+            IRLocal *l = &ctx->func->locals[li];
+            if (l->name_len == (uint32_t)ix->ident.name_len &&
+                memcmp(l->name, ix->ident.name, l->name_len) == 0) { vl = li; break; }
+        }
+        if (vl >= 0) {
+            if (ctx->func->locals[vl].is_volatile) return;
+        } else {
+            Symbol *vs = scope_lookup(ctx->checker->global_scope,
+                                      ix->ident.name, (uint32_t)ix->ident.name_len);
+            if (vs && vs->is_volatile) return;
+        }
+    }
 
     int idx = lower_expr(ctx, ix);
     if (idx < 0) return;

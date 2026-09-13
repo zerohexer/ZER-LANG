@@ -30,26 +30,28 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — the BUG-976 depth-cap enumeration is NOT closed: caps still answering in the ACCEPT direction (2026-09-13, MEDIUM — unmeasured)
+## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 
-`grep -nE "depth *> *[0-9]+\)" checker.c zercheck_ir.c` on 2026-09-13 lists caps whose
-past-cap answer is the accept direction and that carry no BUG-976/994 polarity comment:
+All eight caps the 2026-09-13 audit listed as answering in the ACCEPT direction are now
+measured and fixed. Kept as a record of the method (the how-to lives in compiler-internals.md
+"Bounded walks — the fail-open class"; the shared bounds `ZER_EXPR_WALK_MAX` /
+`ZER_STMT_NEST_MAX` / `ZER_TYPE_NEST_MAX` are defined at the top of checker.c after the
+includes):
 
-| function | cap | past-cap answer | reachable? |
+| function | was | now | measured hole? |
 |---|---|---|---|
-| `resolve_write_target_global` | `depth > 6 -> NULL` | "not a global" — the RMW/ISR write target is not seen | 7 pointer hops; unmeasured |
-| `node_forwards_param_to_spawn` | `depth > 8 -> false` | "does not forward" (the REACH forwarded-PARAM form); its `depth` MIXES AST nesting with call-graph hops (`func_forwards_param_to_spawn(c, cs, i, depth + 1)`) | a spawn nine ifs deep in the callee — the BUG-994 shape; unmeasured |
-| `body_calls_funcptr_field` / `scan_funcptr_field_bindings` | `depth > 8 -> false` | "no funcptr field call / no binding" at the spawn sink | AST nesting 9..63; unmeasured |
-| `global_init_scan` | `depth > 128 -> NULL` | "nothing offending" in a global initializer | parser allows expression nesting 256, so 129..256; unmeasured |
-| `for_init_has_loop_jump` | `depth > 32 -> false` | "no loop jump in the for-init" (BUG-854's refusal) | an init nested 33 deep; unmeasured |
-| `packed_path_aggregate` | `depth > 64 -> NULL` | "not packed" — misaligned access accepted | its own comment says the parser bounds it; verify the bound is < 64 |
-| `zbi_scan` | `depth > 256 -> return` | "no resource use recorded" (init check) | bounded by the parser at 256; probably closed by construction |
-| `tynode_keeps_storage_inline` | `depth > 32 -> false` | "indirect" — its comment says INLINE is the safe direction, so this one IS backwards by its own reasoning | type nesting cap is 256; unmeasured |
+| `packed_path_aggregate` / `packed_step_aggregate` | `> 64 -> NULL` / `i < 8` (accept) | expr bound, past it REPORT packed | **YES** — `&p.a.a…w[0]` on a struct nested 70 deep gave a `uint32_t*` on an odd byte, ACCEPTED (`packed_field_addr_70_deep_bug1016`) |
+| `body_calls_funcptr_field` / `scan_funcptr_field_bindings` | `> 8 -> false` (accept) | WIDEN to 32 (call-graph, matches spawn scan) | **YES** — a racy funcptr-field binding 9 calls deep from the spawner was missed (`funcptr_field_binding_9deep_bug1016`) |
+| `for_init_has_loop_jump` | `> 32 -> false` + if-chain missing INDEX/SLICE/FIELD | exhaustive switch, expr bound, past it TRUE | **YES** — `orelse break` 34 deep, and inside an array index, slipped the BUG-854 ambiguity ban (`for_init_loop_jump_34deep_bug1016`, `_index_bug1016`) |
+| `compute_max_depth` (stack) | `> 256 -> 0` (under-reports) | bound = frame count (acyclic; cycle is is_recursive) | **YES** — a 300-deep non-recursive chain under-reported stack (19200B) and slipped `--stack-limit 17000` (`stack_chain_300_deep_bug1016`) |
+| `global_init_scan` | `> 128 -> NULL` ("nothing offending") | expr bound, past it an OFFENCE | availability — a call 200 terms down a flat chain reached GCC as "initializer element is not constant"; now the ZER line (`global_init_call_deep_bug1016`) |
+| `rmw_value_source_global` / `_taints_global` / `rmw_scan_body` | `> 256` / `> 16` / `> 24` | expr / stmt bound | hardening — the source cap (256) was below check_expr's reachable expression depth for a flat chain; no clean live discriminator (every reproducer trips a masking rule), but the cap was demonstrably below the reachable AST depth |
+| `resolve_write_target_global` | `> 6 -> NULL` (accept) | type-nesting bound (pointer-init hops) | hardening — `**…u32` chains are bounded by the parser's type nesting; no clean reproducer (volatile rules mask the deep-pointer shapes) |
+| `node_forwards_param_to_spawn` / `func_forwards_param_to_spawn` / `ct_expr_bits` / `tynode_keeps_storage_inline` / `unique_resource_name`'s `value_is_existing_resource` | mixed (`> 8 -> false`, `> 32`, `> 16`) | rounded to the conservative direction at the right bound | hardening — polarity/consistency; `tynode_keeps_storage_inline` was backwards by its own comment (INLINE is safe), now rounds to INLINE |
 
-Do exactly what BUG-976 did: measure each window with a generated program on both sides
-of the cap, then FLIP / REPORT / WIDEN by what the walk produces (compiler-internals.md
-"Bounded walks — the fail-open class"). The ones bounded by another limit below the cap are
-closed by construction and need only a comment saying so.
+Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The five
+measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
+on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
 ## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
 

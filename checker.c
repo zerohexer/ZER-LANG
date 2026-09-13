@@ -16,6 +16,30 @@
 #include "src/safety/concurrency_rules.h"  /* C/D/F concurrency predicates */
 #include "src/safety/asm_register_tables.h" /* zer_asm_register_valid — F2/F7 register name lookup */
 #include "src/safety/asm_instruction_table.h" /* zer_asm_instruction_info — F4 per-instruction safety dispatch */
+
+/* BUG-1016 (2026-09-14): THE bounds for a bounded walk, tied to the limits that already
+ * refuse the program before the walk runs — so a cap at or above them is closed BY
+ * CONSTRUCTION and needs no conservative answer of its own (it still gets one).
+ *
+ *   ZER_EXPR_WALK_MAX  — a walk over an EXPRESSION tree. check_expr refuses any
+ *                        expression deeper than ZER_EXPR_NESTING_LIMIT (1000, VST-verified
+ *                        in src/safety/comptime_rules.c). The PARSER's 256 is NOT that
+ *                        bound: a left-associative chain `g + 1 + 1 + ...` parses
+ *                        iteratively, so a 300-term chain reaches AST depth 300 under the
+ *                        parser's counter — measured: rmw_value_source_global's old cap of
+ *                        256 lost the taint on `u32 t = g + 1 + ... (300); g = t;` and an
+ *                        ISR read-modify-write was accepted.
+ *   ZER_STMT_NEST_MAX  — a walk over STATEMENT nesting (the parser's "nesting too deep
+ *                        (limit 64)"). Note a walk that counts BOTH the block and the
+ *                        statement inside it sees ~2 levels per source level.
+ *   ZER_TYPE_NEST_MAX  — a walk over a TYPE's syntactic wrappers (pointer / array /
+ *                        optional; the parser's "type nesting too deep (limit 256)").
+ *                        By-value STRUCT nesting has NO syntactic limit — a type walk
+ *                        through struct fields must still round toward reject past its
+ *                        cap (BUG-977), or use a visited set. */
+#define ZER_EXPR_WALK_MAX (ZER_EXPR_NESTING_LIMIT + 8)
+#define ZER_STMT_NEST_MAX 64
+#define ZER_TYPE_NEST_MAX 256
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -213,7 +237,12 @@ static Type *fold_decl_qualifiers(Checker *c, Type *type, bool is_const, bool is
  * edge can only over-reject a cycle, whereas a mis-classified inline edge
  * restores the compiler crash this guard exists to prevent. */
 static bool tynode_keeps_storage_inline(TypeNode *t, int depth) {
-    if (!t || depth > 32) return false;
+    /* BUG-1016: the syntactic wrappers this walk peels are bounded by the parser at
+     * ZER_TYPE_NEST_MAX, so the cap is unreachable; past it the answer rounds toward
+     * INLINE — the direction the comment above names as safe. The old `> 32 -> false`
+     * was the unsafe direction by that same reasoning. */
+    if (!t) return false;
+    if (depth > ZER_TYPE_NEST_MAX) return true;
     switch (t->kind) {
     /* Wrappers that keep the element inline — peel and re-ask. */
     case TYNODE_ARRAY:    return tynode_keeps_storage_inline(t->array.elem, depth + 1);
@@ -329,7 +358,16 @@ static const char *global_init_node_reason(Node *n, Type *type) {
 /* Walk the whole initializer tree; report the FIRST offending node. `*bad` is
  * set to that node so the caller can name the construct. */
 static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) {
-    if (!n || depth > 128) return NULL;
+    if (!n) return NULL;
+    /* BUG-1016: NULL past the cap read as "nothing offending", so a call hidden 200
+     * terms down a flat chain (`u32 g = f() + 1 + ... ;`) passed this scan and reached
+     * GCC as an "initializer element is not constant" against a generated file. The
+     * cap is now above check_expr's own bound (closed by construction) and past it
+     * the answer is an offence, not an absence. */
+    if (depth > ZER_EXPR_WALK_MAX) {
+        *bad = n;
+        return "nests deeper than the constant-initializer walk follows";
+    }
     const char *r = global_init_node_reason(n, type);
     if (r) { *bad = n; return r; }
     #define GI(x) do { const char *_r = global_init_scan((x), type, depth+1, bad); \
@@ -1578,7 +1616,7 @@ static const char *unique_resource_name(Type *t, int depth) {
  * would make the types unusable, which is presumably why the original rule was written
  * against the TARGET type at a single site instead of against the VALUE. */
 static bool value_is_existing_resource(Node *v, int depth) {
-    if (depth > 64) return true;   /* BUG-976: unknown -> assume it NAMES one; cap raised with unique_resource_name's, same reason */
+    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-976 polarity; BUG-1016: an expression walk, bounded by check_expr */
     if (!v) return false;
     switch (v->kind) {
     /* NAMES something that keeps existing after the binding. */
@@ -2108,38 +2146,58 @@ static Node *unwrap_ptr_launder(Node *v);   /* fwd: defined below */
  * kind-switch because it is a focused predicate, not a walker: it deliberately does
  * NOT descend loop bodies or blocks, which cannot appear in an init anyway. */
 static bool for_init_has_loop_jump(Node *n, int depth) {
-    if (!n || depth > 32) return false;
-    if (n->kind == NODE_BREAK || n->kind == NODE_CONTINUE) return true;
-    if (n->kind == NODE_ORELSE) {
+    /* BUG-1016: was an if-CHAIN (invisible to both walker audits) with two defects:
+     * `> 32 -> false` was the ACCEPT direction on a REJECT-feeding rule (BUG-854 bans a
+     * break/continue in a for-init because it is ambiguous which loop it targets), and it
+     * did not descend INDEX / SLICE / FIELD — so `for (u32 x = arr[mk() orelse break]; ...)`
+     * slipped the ban and picked a loop-binding silently. Now a no-`default:` exhaustive
+     * switch, expression bound, past-cap -> true. */
+    if (!n) return false;
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    #define FILJ(x) for_init_has_loop_jump((x), depth + 1)
+    switch (n->kind) {
+    case NODE_BREAK: case NODE_CONTINUE: return true;
+    case NODE_ORELSE:
         if (n->orelse.fallback_is_break || n->orelse.fallback_is_continue) return true;
-        return for_init_has_loop_jump(n->orelse.expr, depth + 1) ||
-               for_init_has_loop_jump(n->orelse.fallback, depth + 1);
-    }
-    if (n->kind == NODE_VAR_DECL)  return for_init_has_loop_jump(n->var_decl.init, depth + 1);
-    if (n->kind == NODE_EXPR_STMT) return for_init_has_loop_jump(n->expr_stmt.expr, depth + 1);
-    if (n->kind == NODE_ASSIGN)
-        return for_init_has_loop_jump(n->assign.target, depth + 1) ||
-               for_init_has_loop_jump(n->assign.value, depth + 1);
-    if (n->kind == NODE_BINARY)
-        return for_init_has_loop_jump(n->binary.left, depth + 1) ||
-               for_init_has_loop_jump(n->binary.right, depth + 1);
-    if (n->kind == NODE_UNARY)     return for_init_has_loop_jump(n->unary.operand, depth + 1);
-    if (n->kind == NODE_TYPECAST)  return for_init_has_loop_jump(n->typecast.expr, depth + 1);
-    if (n->kind == NODE_CALL) {
-        for (int i = 0; i < n->call.arg_count; i++)
-            if (for_init_has_loop_jump(n->call.args[i], depth + 1)) return true;
+        return FILJ(n->orelse.expr) || FILJ(n->orelse.fallback);
+    case NODE_VAR_DECL:  return FILJ(n->var_decl.init);
+    case NODE_EXPR_STMT: return FILJ(n->expr_stmt.expr);
+    case NODE_ASSIGN:    return FILJ(n->assign.target) || FILJ(n->assign.value);
+    case NODE_BINARY:    return FILJ(n->binary.left) || FILJ(n->binary.right);
+    case NODE_UNARY:     return FILJ(n->unary.operand);
+    case NODE_TYPECAST:  return FILJ(n->typecast.expr);
+    case NODE_FIELD:     return FILJ(n->field.object);
+    case NODE_INDEX:     return FILJ(n->index_expr.object) || FILJ(n->index_expr.index);
+    case NODE_SLICE:     return FILJ(n->slice.object) || FILJ(n->slice.start) || FILJ(n->slice.end);
+    case NODE_CALL:
+        for (int i = 0; i < n->call.arg_count; i++) if (FILJ(n->call.args[i])) return true;
+        return FILJ(n->call.callee);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) if (FILJ(n->intrinsic.args[i])) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) if (FILJ(n->struct_init.fields[i].value)) return true;
+        return false;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) if (FILJ(n->block.stmts[i])) return true;
+        return false;
+    /* Leaves — cannot carry a jump. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_SIZEOF:
+    case NODE_CAST:
+        return false;
+    /* A nested loop / switch body has its OWN loop to bind to, so a jump there is not
+     * this init's ambiguity; a declaration cannot appear in an init. Not descended. */
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_IF: case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_ASM: case NODE_GOTO: case NODE_LABEL:
+    case NODE_RETURN: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
         return false;
     }
-    if (n->kind == NODE_INTRINSIC) {
-        for (int i = 0; i < n->intrinsic.arg_count; i++)
-            if (for_init_has_loop_jump(n->intrinsic.args[i], depth + 1)) return true;
-        return false;
-    }
-    if (n->kind == NODE_BLOCK) {
-        for (int i = 0; i < n->block.stmt_count; i++)
-            if (for_init_has_loop_jump(n->block.stmts[i], depth + 1)) return true;
-        return false;
-    }
+    #undef FILJ
     return false;
 }
 
@@ -2212,8 +2270,10 @@ static Node *keep_view_root_ident(Checker *c, Node *e) {
 
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     /* BUG-976: ten nested identity calls laundered `&x` into a global because this
-     * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED. */
-    if (depth > 8) return true;
+     * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED.
+     * BUG-1016: the cap is an EXPRESSION bound (nested call arguments), so it sits
+     * above check_expr's — a 9-deep chain no longer over-rejects for depth alone. */
+    if (depth > ZER_EXPR_WALK_MAX) return true;
     if (!arg) return false;
     /* BUG-815 (2026-08-22): this predicate is the LEAF of call_result_escapes and
      * of the Ring-push / spawn-arg gates, and it was the only "is this value
@@ -2425,7 +2485,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
  * under-rejection guard used by the escape sinks). Behavior-preserving loop over
  * the extracted per-argument predicate. */
 static bool call_has_local_derived_arg(Checker *c, Node *call, int depth) {
-    if (depth > 8) return true;   /* BUG-976: unknown -> assume it does */
+    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-976 polarity; BUG-1016 bound */
     if (!call || call->kind != NODE_CALL) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
         if (arg_is_local_derived(c, call->call.args[i], depth)) return true;
@@ -2528,8 +2588,8 @@ static bool arg_is_local_address_int(Checker *c, Node *arg, int depth) {
     /* BUG-976 rule: this is a proof of danger feeding a REJECT, and expression
      * nesting is spellable far past 8, so past the cap the answer is "assume it
      * is" — over-rejects a 9-deep arithmetic chain around a laundered address,
-     * never accepts one. */
-    if (depth > 8) return true;
+     * never accepts one. (BUG-1016: bound raised to check_expr's.) */
+    if (depth > ZER_EXPR_WALK_MAX) return true;
     if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 8 &&
         memcmp(arg->intrinsic.name, "ptrtoint", 8) == 0 &&
         arg->intrinsic.arg_count > 0) {
@@ -2707,7 +2767,7 @@ static bool struct_init_frame_bound(Checker *c, Node *init, bool *is_arena) {
 }
 
 static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
-    if (depth > 8) return true;   /* BUG-976: unknown -> assume it does */
+    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-976 polarity; BUG-1016 bound */
     if (!call || call->kind != NODE_CALL) return false;
     for (int i = 0; i < call->call.arg_count; i++) {
         Node *arg = call->call.args[i];
@@ -2764,7 +2824,11 @@ static void infer_mark_param_keep(Checker *c, int idx) {
  * (idfn's param i would be keep, propagating to the caller's param). Conservative:
  * an incomplete summary treats every position as maybe-returned (no under-inference). */
 static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
-    if (!call || call->kind != NODE_CALL || depth > 8) return;
+    /* BUG-1016: nested call arguments are expression nesting, bounded by check_expr
+     * before this runs; the old cap of 8 stopped inferring keep on the 9th nested
+     * identity call (masked in practice by the store sink's own flip, but a walk must
+     * not depend on a neighbour for its polarity). */
+    if (!call || call->kind != NODE_CALL || depth > ZER_EXPR_WALK_MAX) return;
     Symbol *csym = NULL;
     if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
         csym = scope_lookup(c->current_scope, call->call.callee->ident.name,
@@ -3393,7 +3457,10 @@ static bool deref_launder_transfers_identity(Checker *c, Node *e) {
 /* Peel pointer/optional/array wrappers to the aggregate underneath, so one step
  * of an access path yields the struct it actually designates. */
 static Type *packed_step_aggregate(Type *t) {
-    for (int i = 0; t && i < 8; i++) {
+    /* BUG-1016: the wrappers peeled here are bounded by the parser's type-nesting
+     * limit; the old `i < 8` gave up on the 9th wrapper and answered "not an
+     * aggregate" — the accept direction. */
+    for (int i = 0; t && i < ZER_TYPE_NEST_MAX; i++) {
         Type *u = type_unwrap_distinct(t);
         if (!u) return NULL;
         TypeKind k = type_dispatch_kind(u);
@@ -3412,7 +3479,12 @@ static Type *packed_step_aggregate(Type *t) {
  * accepting a misaligned address. Recursion is bounded by the parser's own nesting
  * limit, so there is no cap to truncate at. */
 static Type *packed_path_aggregate(Checker *c, Node *e, bool *packed_seen, int depth) {
-    if (!e || depth > 64) return NULL;
+    if (!e) return NULL;
+    /* BUG-1016: the comment above was right that the parser bounds this — but at
+     * check_expr's 1000, not 64: a packed struct nested 70 deep, `&p.a.a....w[0]`,
+     * walked past the old cap and the misaligned address was ACCEPTED (measured).
+     * Past the real bound the walk stops and REPORTS packed, never NULL-as-safe. */
+    if (depth > ZER_EXPR_WALK_MAX) { *packed_seen = true; return NULL; }
     if (e->kind == NODE_IDENT) {
         Symbol *sym = scope_lookup(c->current_scope, e->ident.name,
                                    (uint32_t)e->ident.name_len);
@@ -3729,7 +3801,7 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt);
  * answer "assume it mentions it"; only kinds that provably cannot name a value
  * answer false. */
 static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
-    if (depth > 16) return true;   /* BUG-976: unknown -> assume it mentions it */
+    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-976 polarity; BUG-1016 bound — at 16, a 17-term sum stored to a global read as an RMW of it */
     if (!e || !nm) return false;
     #define EMN(x) expr_mentions_name((x), nm, nl, depth + 1)
     switch (e->kind) {
@@ -3840,8 +3912,11 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
                                        Node *e, int depth) {
     /* The walk RECORDS a source for a later rule; there is no conservative
      * value to return past the cap ("came from every global" cannot be a row),
-     * so the remedy is a cap past anything real (parser bound 256, BUG-976). */
-    if (!e || depth > 256) return NULL;
+     * so the remedy is a cap past anything real. BUG-1016: "anything real" is
+     * check_expr's bound, NOT the parser's 256 — a flat `g + 1 + ... (300 terms)`
+     * parses iteratively, reached depth 300 here, lost the taint, and
+     * `u32 t = <that>; g = t;` was accepted at both race sinks. */
+    if (!e || depth > ZER_EXPR_WALK_MAX) return NULL;
     #define RVS(x) rmw_value_source_global(c, tab, n, (x), depth + 1)
     switch (e->kind) {
     case NODE_IDENT: {
@@ -3896,7 +3971,7 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
 static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
                                     Symbol *g, int depth) {
     if (!e || !g) return false;
-    if (depth > 16) return true;
+    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-1010 polarity; BUG-1016 bound */
     #define RVT(x) rmw_value_taints_global(tab, n, (x), g, depth + 1)
     switch (e->kind) {
     case NODE_IDENT:
@@ -3956,7 +4031,12 @@ static Node *rmw_target_root_ident(Node *t) {
 }
 
 static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int depth) {
-    if (!n || depth > 24) return;
+    if (!n) return;
+    /* BUG-1016: a void scan that stops recording past its cap under-reports the mask
+     * (accept direction). The walk counts the block AND the statement inside it, so a
+     * source nesting of ZER_STMT_NEST_MAX is ~2x that here; past the cap every param
+     * is assumed read-modify-written — the same answer func_rmw_param_mask gives. */
+    if (depth > 4 * ZER_STMT_NEST_MAX) { *mask = ~(uint64_t)0; return; }
     if (n->kind == NODE_ASSIGN) {
         Node *root = rmw_target_root_ident(n->assign.target);
         if (root) {
@@ -4084,7 +4164,11 @@ static bool target_is_bit_range(Checker *c, Node *target) {
 }
 
 static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) {
-    if (!target || depth > 6) return NULL;
+    /* BUG-1016: `depth` counts pointer-initialiser hops (`*u32 p1 = &g; **u32 p2 =
+     * &p1; ...`), and each hop's local carries one more `*` in its type, so the chain is
+     * bounded by the parser's type-nesting limit — closed by construction at
+     * ZER_TYPE_NEST_MAX. The old cap of 6 answered "not a global" (accept) at hop 7. */
+    if (!target || depth > ZER_TYPE_NEST_MAX) return NULL;
     Node *r = target;
     /* BUG-834: NODE_SLICE was missing. A BIT-RANGE target `flags[3..0] = 5` parses
      * as a slice, so THE shared "which global does this write land on?" resolver
@@ -5972,7 +6056,9 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
  * `u8 + u32` uses the wider, matching ZER's usual-arithmetic behaviour. */
 static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
                              bool *is_signed, int depth) {
-    if (!n || depth > 32) return 0;
+    /* BUG-1016: 0 past the cap means "no width" = no wrap; an expression walk, so the
+     * bound is check_expr's (closed by construction). */
+    if (!n || depth > ZER_EXPR_WALK_MAX) return 0;
     if (n->kind == NODE_IDENT) {
         for (int i = 0; i < param_count; i++)
             if (params[i].name_len == (uint32_t)n->ident.name_len &&
@@ -14910,7 +14996,8 @@ static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int d
 
 static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
                                          uint32_t pnlen, int depth) {
-    if (!n || depth > 8) return false;
+    if (!n) return false;
+    if (depth > 32) return true;   /* BUG-1016: was `> 8 -> false` (accept); see func_forwards */
     if (n->kind == NODE_SPAWN) {
         for (int i = 0; i < n->spawn_stmt.arg_count; i++) {
             Node *a = n->spawn_stmt.args[i];
@@ -14963,7 +15050,13 @@ static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
 }
 
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth) {
-    if (depth > 8) return true;   /* BUG-976: unknown -> assume it forwards */
+    /* BUG-1016: WIDEN, do not close-by-construction — `depth` counts call-graph hops
+     * (func_forwards -> node_forwards -> func_forwards on a callee), which is not
+     * syntactically bounded. 32 matches the spawn scan's own call-graph cap (BUG-976),
+     * past anything real; the direction is already the conservative one (assume it
+     * forwards) — its sibling node_forwards_param_to_spawn returned FALSE at the cap,
+     * the accept direction, and is corrected below. */
+    if (depth > 32) return true;
     if (!fn || !fn->is_function || !fn->func_node) return false;
     Node *fd = fn->func_node;
     if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return false;
@@ -15189,7 +15282,11 @@ static bool funcptr_field_access(Node *n) {
 }
 
 static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
-    if (!n || depth > 8) return false;
+    if (!n) return false;
+    /* BUG-1016: WIDEN a call-graph cap (this descends directly-called globals) to 32,
+     * and round the past-cap answer toward TRUE — it gates whether the binding scan
+     * runs, so "assume it might call through a field" only costs a scan. */
+    if (depth > 32) return true;
     if (n->kind == NODE_CALL) {
         /* the tell: callee reads a funcptr field (`o.cb()` or `o.fns[0]()`) */
         if (n->call.callee && funcptr_field_access(n->call.callee)) return true;
@@ -15249,7 +15346,12 @@ static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
 static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
                                         const char **out_name, uint32_t *out_len,
                                         Symbol **out_fn) {
-    if (!n || depth > 8) return false;
+    /* BUG-1016: WIDEN a call-graph cap to 32 (matches body_calls_funcptr_field and the
+     * spawn scan). This produces a binding to NAME in the diagnostic, so there is no
+     * conservative value to return past the cap — it stays false there, which is why the
+     * cap must sit past any real call chain. A binding 9+ hops from the spawner used to
+     * be missed at 8 (fb_9), so the callback's racy access went unreported. */
+    if (!n || depth > 32) return false;
     if (n->kind == NODE_ASSIGN) {
         if (n->assign.target && funcptr_field_access(n->assign.target) &&
             scan_funcname_binding(c, n->assign.value, out_name, out_len)) {
@@ -24154,7 +24256,12 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
 /* DFS to find max stack depth — detect recursion via visited array */
 static uint32_t compute_max_depth(Checker *c, struct StackFrame *frame,
                                    bool *visited, int depth) {
-    if (depth > 256) return 0; /* safety limit */
+    /* BUG-1016: an acyclic DFS visits each frame at most once per path, so the true
+     * bound is the frame count — a cycle is caught below by `visited[]` and reported as
+     * is_recursive. The old fixed `> 256` returned 0 (adds no stack) past 256 frames, so
+     * a 300-deep non-recursive chain UNDER-reported its stack and slipped --stack-limit
+     * (measured: 300 * 64B = 19200B accepted under a 17000 limit). */
+    if (depth > c->stack_frame_count + 1) return 0;
     /* find frame index */
     int idx = (int)(frame - c->stack_frames);
     if (idx < 0 || idx >= c->stack_frame_count) return 0;

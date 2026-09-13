@@ -1101,3 +1101,38 @@ checker.c:expr_mentions_name:NODE_SWITCH:switch_stmt.expr
 checker.c:expr_mentions_name:NODE_VAR_DECL:var_decl.init
 checker.c:expr_mentions_name:NODE_WHILE:while_stmt.body
 checker.c:expr_mentions_name:NODE_WHILE:while_stmt.cond
+
+# 2026-09-14 — BUG-1016 `checker.c:for_init_has_loop_jump` became a no-default exhaustive
+# walker (it was an if-chain capped at 32 with `false` past it — the ACCEPT direction on a
+# rule that REJECTS an ambiguous break/continue in a for-loop initialiser — and it never
+# descended INDEX/SLICE/FIELD, so `for (u32 x = arr[mk() orelse break]; …)` slipped the ban).
+# It classifies an EXPRESSION (the init), so a nested LOOP/SWITCH body has its OWN loop to
+# bind to and a break there is not THIS init's ambiguity — those arms return false without
+# descending, deliberately; and a declaration kind is never handed to it. Nothing to learn
+# from the children of a kind it either must not descend or can never see.
+checker.c:for_init_has_loop_jump:NODE_ASM:asm_stmt.inputs
+checker.c:for_init_has_loop_jump:NODE_ASM:asm_stmt.outputs
+checker.c:for_init_has_loop_jump:NODE_AWAIT:await_stmt.cond
+checker.c:for_init_has_loop_jump:NODE_CRITICAL:critical.body
+checker.c:for_init_has_loop_jump:NODE_DEFER:defer.body
+checker.c:for_init_has_loop_jump:NODE_DO_WHILE:while_stmt.body
+checker.c:for_init_has_loop_jump:NODE_DO_WHILE:while_stmt.cond
+checker.c:for_init_has_loop_jump:NODE_FILE:file.decls
+checker.c:for_init_has_loop_jump:NODE_FOR:for_stmt.body
+checker.c:for_init_has_loop_jump:NODE_FOR:for_stmt.cond
+checker.c:for_init_has_loop_jump:NODE_FOR:for_stmt.init
+checker.c:for_init_has_loop_jump:NODE_FOR:for_stmt.step
+checker.c:for_init_has_loop_jump:NODE_FUNC_DECL:func_decl.body
+checker.c:for_init_has_loop_jump:NODE_GLOBAL_VAR:var_decl.init
+checker.c:for_init_has_loop_jump:NODE_IF:if_stmt.cond
+checker.c:for_init_has_loop_jump:NODE_IF:if_stmt.else_body
+checker.c:for_init_has_loop_jump:NODE_IF:if_stmt.then_body
+checker.c:for_init_has_loop_jump:NODE_INTERRUPT:interrupt.body
+checker.c:for_init_has_loop_jump:NODE_ONCE:once.body
+checker.c:for_init_has_loop_jump:NODE_RETURN:ret.expr
+checker.c:for_init_has_loop_jump:NODE_SPAWN:spawn_stmt.args
+checker.c:for_init_has_loop_jump:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:for_init_has_loop_jump:NODE_SWITCH:switch_stmt.arms
+checker.c:for_init_has_loop_jump:NODE_SWITCH:switch_stmt.expr
+checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.body
+checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.cond

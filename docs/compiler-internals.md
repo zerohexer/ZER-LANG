@@ -6618,15 +6618,42 @@ unspellable. A visited-set walk keyed on `Type *` terminates. Every type walk in
 carrying a bound it does not need; the caps survive only as guards against a malformed
 type built during error recovery.
 
-**The enumeration is NOT closed (2026-09-13, found while writing this).** Today's grep
-lists caps whose past-cap answer is the ACCEPT direction and carries no polarity
-justification — `resolve_write_target_global` (`depth > 6 -> NULL`, "not a global"),
-`node_forwards_param_to_spawn` (`depth > 8 -> false`, and its `depth` mixes AST nesting
-with call-graph hops), `body_calls_funcptr_field` / `scan_funcptr_field_bindings` (`> 8 ->
-false`), `global_init_scan` (`> 128 -> NULL`, "nothing offending", on a construct the
-parser bounds at 256), `for_init_has_loop_jump`, `packed_path_aggregate`, `zbi_scan`. Some
-are bounded by another limit, some may be reachable; none has been measured. Recorded as
-an OPEN entry in limitations.md — do not assume BUG-976 covered them.
+**The enumeration is CLOSED (2026-09-14, BUG-1016).** The 2026-09-13 grep listed eight caps
+answering in the ACCEPT direction; all eight are now measured and fixed, FIVE of them live.
+The durable output is a set of SHARED BOUNDS at the top of checker.c, so a walk's cap is
+tied to the limit that already refuses the program rather than a magic number:
+
+- `ZER_EXPR_WALK_MAX` (= `ZER_EXPR_NESTING_LIMIT` + 8) — a walk over an EXPRESSION tree.
+  **`check_expr`'s bound is 1000, NOT the parser's 256** — a left-associative chain
+  `g + 1 + 1 + …` parses ITERATIVELY, so a 300-term chain reaches AST depth 300 under the
+  parser's per-node counter; `rmw_value_source_global`'s old 256 was below that and lost an
+  RMW taint, and `packed_path_aggregate`'s 64 let a 70-deep misaligned `&p.a…w[0]` through.
+- `ZER_TYPE_NEST_MAX` (256) — a TYPE's syntactic wrappers (pointer/array/optional). **BY-VALUE
+  STRUCT nesting has NO syntactic limit**, so a type walk through struct fields must still
+  round toward reject past its cap (BUG-977's tri-state) or use a visited set — the bound
+  covers only wrapper depth.
+- `ZER_STMT_NEST_MAX` (64) — statement nesting. A walk that counts BOTH the block and the
+  statement inside it sees ~2 levels per source level.
+
+The five live: `packed_path_aggregate` (misaligned access at depth 70), the funcptr-field
+binding scan (`body_calls_funcptr_field`/`scan_funcptr_field_bindings`, a racy binding 9
+calls deep — WIDENED to 32, a call-graph cap not a syntactic one), `for_init_has_loop_jump`
+(if-chain, cap 32 fail-open AND missing INDEX/SLICE/FIELD — now a no-`default:` switch),
+`compute_max_depth` (stack under-reported past 256 frames, slipping `--stack-limit` — bound
+is the frame count, since an acyclic DFS visits each once and a cycle is caught as
+`is_recursive`), and `global_init_scan` (availability: a call 200 terms deep reached GCC
+instead of the ZER line). The three hardenings (`rmw_*`, `resolve_write_target_global`,
+`node_forwards_param_to_spawn`/`tynode_keeps_storage_inline`/`ct_expr_bits`) had no clean
+discriminator — the cap was below reachable depth or already the accept direction with a
+masking rule in front. Full table + reproducers: limitations.md "CLOSED — the BUG-976
+depth-cap enumeration is closed". Zero corpus cost (2621 files, both binaries).
+
+**Two things a fresh session must not re-derive.** (1) The bound for an expression walk is
+check_expr's 1000, not the parser's 256 — the parser counts NESTING and a flat chain has
+depth-1 nesting but N-term AST depth. (2) `tynode_keeps_storage_inline` and every `type_carries_*`
+walk over STRUCT FIELDS is NOT closed by `ZER_TYPE_NEST_MAX` — struct nesting is unbounded;
+those round toward reject past the cap (BUG-977), the type-nesting bound only covers the
+pointer/array/optional wrapper walks (`packed_step_aggregate`, `resolve_write_target_global`).
 
 ### Concurrency rules that changed in the run (BUG-948, 973, 979, 980, 1010, 1013, 1014)
 

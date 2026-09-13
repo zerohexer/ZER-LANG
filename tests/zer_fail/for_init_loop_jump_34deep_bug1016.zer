@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: for-loop INITIALISER is ambiguous
+// BUG-1016: for_init_has_loop_jump was an if-chain capped at 32 (false past it = accept)
+// and never descended INDEX. A break 34 wrappers deep in the init slipped the BUG-854 ban.
+?u32 mk() { return null; }
+u32 main() { u32 s = 0; while (s < 3) { for (u32 x = (((((((((((((((((((((((((((((((((((mk() orelse break) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1) + 1); x < 2; x += 1) { s += 1; } s += 1; } return s; }

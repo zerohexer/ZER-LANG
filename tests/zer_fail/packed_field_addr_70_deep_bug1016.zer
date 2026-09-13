@@ -1,0 +1,77 @@
+// EXPECTED: compile error
+// expect-error: points into a PACKED struct field
+// BUG-1016: packed_path_aggregate capped its walk at 64, so a packed struct nested
+// 70 deep let &p.a.a...w[0] through — a uint32_t* on an odd byte, ACCEPTED. The cap
+// is check_expr's bound now, and past it the walk reports packed rather than NULL-as-safe.
+packed struct P0 { u8 b; u32[2] w; }
+packed struct P1 { u8 pad; P0 a; }
+packed struct P2 { u8 pad; P1 a; }
+packed struct P3 { u8 pad; P2 a; }
+packed struct P4 { u8 pad; P3 a; }
+packed struct P5 { u8 pad; P4 a; }
+packed struct P6 { u8 pad; P5 a; }
+packed struct P7 { u8 pad; P6 a; }
+packed struct P8 { u8 pad; P7 a; }
+packed struct P9 { u8 pad; P8 a; }
+packed struct P10 { u8 pad; P9 a; }
+packed struct P11 { u8 pad; P10 a; }
+packed struct P12 { u8 pad; P11 a; }
+packed struct P13 { u8 pad; P12 a; }
+packed struct P14 { u8 pad; P13 a; }
+packed struct P15 { u8 pad; P14 a; }
+packed struct P16 { u8 pad; P15 a; }
+packed struct P17 { u8 pad; P16 a; }
+packed struct P18 { u8 pad; P17 a; }
+packed struct P19 { u8 pad; P18 a; }
+packed struct P20 { u8 pad; P19 a; }
+packed struct P21 { u8 pad; P20 a; }
+packed struct P22 { u8 pad; P21 a; }
+packed struct P23 { u8 pad; P22 a; }
+packed struct P24 { u8 pad; P23 a; }
+packed struct P25 { u8 pad; P24 a; }
+packed struct P26 { u8 pad; P25 a; }
+packed struct P27 { u8 pad; P26 a; }
+packed struct P28 { u8 pad; P27 a; }
+packed struct P29 { u8 pad; P28 a; }
+packed struct P30 { u8 pad; P29 a; }
+packed struct P31 { u8 pad; P30 a; }
+packed struct P32 { u8 pad; P31 a; }
+packed struct P33 { u8 pad; P32 a; }
+packed struct P34 { u8 pad; P33 a; }
+packed struct P35 { u8 pad; P34 a; }
+packed struct P36 { u8 pad; P35 a; }
+packed struct P37 { u8 pad; P36 a; }
+packed struct P38 { u8 pad; P37 a; }
+packed struct P39 { u8 pad; P38 a; }
+packed struct P40 { u8 pad; P39 a; }
+packed struct P41 { u8 pad; P40 a; }
+packed struct P42 { u8 pad; P41 a; }
+packed struct P43 { u8 pad; P42 a; }
+packed struct P44 { u8 pad; P43 a; }
+packed struct P45 { u8 pad; P44 a; }
+packed struct P46 { u8 pad; P45 a; }
+packed struct P47 { u8 pad; P46 a; }
+packed struct P48 { u8 pad; P47 a; }
+packed struct P49 { u8 pad; P48 a; }
+packed struct P50 { u8 pad; P49 a; }
+packed struct P51 { u8 pad; P50 a; }
+packed struct P52 { u8 pad; P51 a; }
+packed struct P53 { u8 pad; P52 a; }
+packed struct P54 { u8 pad; P53 a; }
+packed struct P55 { u8 pad; P54 a; }
+packed struct P56 { u8 pad; P55 a; }
+packed struct P57 { u8 pad; P56 a; }
+packed struct P58 { u8 pad; P57 a; }
+packed struct P59 { u8 pad; P58 a; }
+packed struct P60 { u8 pad; P59 a; }
+packed struct P61 { u8 pad; P60 a; }
+packed struct P62 { u8 pad; P61 a; }
+packed struct P63 { u8 pad; P62 a; }
+packed struct P64 { u8 pad; P63 a; }
+packed struct P65 { u8 pad; P64 a; }
+packed struct P66 { u8 pad; P65 a; }
+packed struct P67 { u8 pad; P66 a; }
+packed struct P68 { u8 pad; P67 a; }
+packed struct P69 { u8 pad; P68 a; }
+packed struct P70 { u8 pad; P69 a; }
+u32 main() { P70 p; *u32 q = &p.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.a.w[0]; *q = 1; return 0; }

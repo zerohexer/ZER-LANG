@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: for-loop INITIALISER is ambiguous
+// BUG-1016: the if-chain did not descend NODE_INDEX, so an orelse-break inside an array
+// index in the init was invisible to the BUG-854 ambiguity ban.
+?u32 mk() { return null; }
+u32[4] arr;
+u32 main() { u32 s = 0; while (s < 3) { for (u32 x = arr[mk() orelse break]; x < 2; x += 1) { s += 1; } s += 1; } return s; }

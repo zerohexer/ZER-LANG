@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: function-pointer field whose bound function accesses
+// BUG-1016: the funcptr-field binding scan capped its call-graph walk at 8, so a
+// binding done 9 calls deep from the spawner was missed and the racy callback
+// slipped through. Widened to 32 (matches the spawn scan's own call-graph cap).
+u32 g = 0;
+u32 racy() { g += 1; return g; }
+shared struct Ops { *() -> u32 cb; }
+Ops ops;
+void worker() { u32 v = ops.cb(); }
+void b9() { ops.cb = racy; }
+void b8() { b9(); }
+void b7() { b8(); }
+void b6() { b7(); }
+void b5() { b6(); }
+void b4() { b5(); }
+void b3() { b4(); }
+void b2() { b3(); }
+void b1() { b2(); }
+u32 main() { b1(); spawn worker(); return 0; }

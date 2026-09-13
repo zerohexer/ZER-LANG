@@ -5,6 +5,78 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
+
+The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered
+in the ACCEPT direction and none had been measured. Measured all eight (generated programs
+on both sides of each cap); FIVE were live and three were hardenings below the reachable
+depth. The unifying fix is a set of shared bounds tied to the limits that already refuse the
+program — `ZER_EXPR_WALK_MAX` (= check_expr's `ZER_EXPR_NESTING_LIMIT` + 8),
+`ZER_STMT_NEST_MAX`, `ZER_TYPE_NEST_MAX` — defined at the top of checker.c, so a walk over a
+syntactically-bounded construct is closed BY CONSTRUCTION and a call-graph walk is WIDENED to
+match its siblings.
+
+### The five measured-live holes
+
+- **`packed_path_aggregate` capped at 64** (its own comment claimed the parser bounded it —
+  at 64, but the real bound is check_expr's 1000). A packed struct nested 70 deep,
+  `&p.a.a…w[0]`, walked past the cap and returned "not packed", so a `uint32_t*` on an ODD
+  byte was ACCEPTED — a hard fault on ARM/RISC-V. Past the real bound the walk stops and
+  REPORTS packed (`packed_step_aggregate`'s inner `i < 8` loop was the same defect and is
+  raised to the type-nesting bound). `packed_field_addr_70_deep_bug1016`.
+- **The funcptr-field REACH binding scan capped at 8** (`body_calls_funcptr_field` /
+  `scan_funcptr_field_bindings`). A racy `ops.cb = racy` binding done 9 calls deep from the
+  spawning function was never found, so the callback's non-shared-global access went
+  unreported — a data race. WIDENED to 32 (a call-graph cap, not syntactic — matches the
+  spawn scan's own BUG-976 cap); `body_calls_funcptr_field` also rounds past-cap to TRUE
+  (it gates whether the binding scan runs). `funcptr_field_binding_9deep_bug1016`.
+- **`for_init_has_loop_jump` was an if-chain capped at 32** with `false` past it — the ACCEPT
+  direction on a rule that REJECTS an ambiguous break/continue in a for-loop initialiser
+  (BUG-854) — AND it never descended INDEX/SLICE/FIELD. So `orelse break` 34 wrappers deep,
+  and `for (u32 x = arr[mk() orelse break]; …)`, both slipped the ban and picked a
+  loop-binding silently. Now a no-`default:` exhaustive switch (the if-chain form both walker
+  audits are blind to), expression-bounded, past-cap TRUE, descending every expression kind.
+  `for_init_loop_jump_34deep_bug1016`, `for_init_loop_jump_index_bug1016`.
+- **`compute_max_depth` (stack) capped its acyclic DFS at 256 frames**, returning 0 past it.
+  A 300-deep non-recursive call chain under-reported its stack as 16384B (256 × 64) and
+  slipped `--stack-limit 17000` while really using 19200B. The bound is the frame count now
+  (an acyclic DFS visits each frame once per path; a cycle is caught separately and reported
+  as `is_recursive`). `stack_chain_300_deep_bug1016`.
+- **`global_init_scan` capped at 128**, returning "nothing offending" past it. A function
+  call 200 terms down a flat global-initializer chain (`u32 g = f() + 1 + … ;`) passed the
+  scan and reached GCC as "initializer element is not constant" against a generated file with
+  no ZER line. It is caught at the ZER line now (availability, not a soundness hole — both
+  builds reject, but only the fix gives the right diagnostic). `global_init_call_deep_bug1016`.
+
+### The three hardenings (no clean live discriminator; cap was below reachable depth)
+
+- **`rmw_value_source_global` capped at 256** — a flat `g + 1 + … (300 terms)` parses
+  iteratively and reaches AST depth 300, above the cap, so the source lookup lost the taint
+  on `u32 t = <that>; g = t;`. Raised to check_expr's bound. Every reproducer trips a masking
+  rule (the spawn data-race rule, or a spurious ISR-arg error on the 300-chain), so no clean
+  A/B — but the cap was demonstrably below the reachable expression depth. `rmw_value_taints_global`
+  (16) and `rmw_scan_body` (24, a void scan under-reporting its mask) raised the same way.
+- **`resolve_write_target_global` capped at 6** — `depth` counts pointer-initialiser hops
+  (`*u32 p1 = &g; **u32 p2 = &p1; …`), each hop's local carrying one more `*`, so the chain
+  is bounded by the parser's type nesting. Raised there; volatile rules mask the deep-pointer
+  shapes so no clean reproducer.
+- **`tynode_keeps_storage_inline` (32), `ct_expr_bits` (32), `node_forwards_param_to_spawn`
+  (8), `value_is_existing_resource` (64)** — polarity/consistency. `tynode_keeps_storage_inline`
+  was backwards by its OWN comment ("erring toward INLINE is the safe direction" while
+  returning the indirect answer past the cap); `node_forwards_param_to_spawn` returned FALSE
+  (accept) where its mutually-recursive partner `func_forwards_param_to_spawn` already
+  returned TRUE (BUG-976).
+
+### Measurements
+
+- Corpus: 2621 files under both binaries, stderr diffed for every diagnostic — **zero
+  differences** (every widening only reduces over-rejection or was polarity-TRUE already).
+- Five `*_bug1016.zer` negatives, each ACCEPTED on `git archive HEAD` (e0803450) and rejected
+  on the fix (the stack and global-init ones via `// zerc-flags:` / reason-match).
+- `tools/walker_field_baseline.txt`: 26 justified rows for the `for_init_has_loop_jump`
+  classifier (statement kinds it must not descend / can never see).
+- `make check` exit 0, ten gates.
+
 ## Session 2026-09-13 — BUG-1015: an array index in a LOOP CONDITION was proved under the PRE-loop range (found while auditing the docs)
 
 Found while verifying a compiler-internals.md sentence about where a loop condition's

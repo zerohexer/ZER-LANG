@@ -1,0 +1,17 @@
+// BUG-1010 (relaxation): returning @ptrtoint of a field reached THROUGH A POINTER
+// PARAM is the caller's memory, exactly as returning `&p.b` is (BUG-764). The
+// return-site rule used to ask "is the root a global?" and rejected `p` as a
+// "local". The frame-bound query answers the real question; `&local.b` is still
+// rejected (tests/zer_fail/ptrtoint_local_via_call_return.zer covers the local).
+struct S { u32 a; u32 b; }
+usize addr_of_b(*S p) { return @ptrtoint(&p.b); }
+usize addr_of_elem([*]u32 s) { return @ptrtoint(&s[1]); }
+S gs;
+u32 main() {
+    usize x = addr_of_b(&gs);
+    u32[4] arr;
+    usize y = addr_of_elem(arr);
+    if (x == 0 || y == 0) { return 1; }
+    if (x != @ptrtoint(&gs.b)) { return 2; }
+    return 0;
+}

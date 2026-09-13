@@ -202,9 +202,14 @@ Gate: the RE-ENTRY GRID in `tests/test_conc_matrix.c` (callee form x lock kind �
 PLAIN column is what proves the rule is scoped). Residual over-rejection (read/read)
 entered separately above.
 
-**4. LOOP COUNTER PAST END — 7, bounds. TAKE `vgonmt`.**
-`loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
-`_dowhile_past_end` `dowhile_counter_past_end_bug748`
+### ~~4. LOOP COUNTER PAST END — 7~~ — CLOSED 2026-09-13 as BUG-1011
+
+The loop-induction certainty half of `vgonmt` a40104b (its BUG-960 half was already this
+tree's BUG-979). A provably out-of-bounds counted loop is a compile error; a MAY-hold
+straddling range keeps the auto-guard with a warning that now says the guard RETURNS
+EARLY. Residual precision: only the canonical shapes (constant init/bound/step, `<` or
+`<=`, straight-line body, while/do-while with a TRAILING `i += K`) are certain; a
+counter modified in the body or a non-constant bound falls back to the guard.
 
 ### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-13 as BUG-982/983/984 (+ BUG-985 bool, BUG-995 widening)
 

@@ -3953,6 +3953,21 @@ An index gets one of three verdicts from its proven range:
 | PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
 | UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (runtime check) |
 
+A counted loop is the fourth case. When the counter's init, bound and step are constants
+with a positive step and the body is straight-line (no `break` / `continue` / `return` /
+`goto` / `orelse` and no write to the counter), the compiler knows every value of the
+sequence WILL be taken — so an index by that counter that reaches the array size is a
+**compile error**, not a guarded access:
+<!-- audit: skip -->
+```zer
+u32[4] arr;
+for (u32 i = 0; i <= 4; i += 1) { arr[i] = i; }   // COMPILE ERROR — i runs 0..4, size 4
+```
+Applies to `for`, `while` and `do-while` (with a trailing `i += K`). A range that merely
+straddles the end (`u32 b = 10; if (c) { b = 2; } arr4[b]`) keeps the auto-guard, and the
+warning now says what the guard does: the enclosing function RETURNS EARLY at the
+offending index, with no trap and no message.
+
 The middle verdict is the one that surprises people: an index the compiler can prove is
 *always* wrong is an error, not a runtime check — including when it is reached through a
 variable, and including a range that is entirely negative.

@@ -23,7 +23,6 @@ checker.c:eff->kind == TYPE_STRUCT || eff->kind == TYPE_UNION ||
 checker.c:eff_pl->kind == TYPE_ARRAY ||
 checker.c:eff_pl->kind == TYPE_SLICE ||
 checker.c:(eff_r->kind == TYPE_SLICE || eff_r->kind == TYPE_ARRAY)) {
-checker.c:if (eeff && (eeff->kind == TYPE_POINTER || eeff->kind == TYPE_OPAQUE))
 checker.c:if ((eff_l->kind == TYPE_SLICE || eff_l->kind == TYPE_ARRAY) ||
 checker.c:if (et && (et->kind == TYPE_STRUCT || et->kind == TYPE_ENUM ||
 checker.c:if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return 4; /* null sentinel */

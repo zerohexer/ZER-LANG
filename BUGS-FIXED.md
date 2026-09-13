@@ -5,6 +5,74 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-985/986: a callee's free of an OPTIONAL param never reached the summary — a relaxation with a double-free hole inside it (class 9 closed)
+
+`claude/loving-davinci-3sdup9` commit `92cc9dfd` (its BUG-979 + BUG-978), read in full
+before adopting because the survey flagged it as a RELAXATION — the one change class where
+a bug is a shipped UAF. It is a relaxation and a tightening at once, and the tightening is
+the part that matters:
+
+    void drop(?*T p) { *T q = p orelse return; free(q); }
+    u32 main() { ?*T mp = alloc(T); drop(mp); *T r = mp orelse return; free(r); return 0; }
+
+compiled clean on main and RAN — a double free, exit 0. The same shape re-unwrapping `mp`
+instead was refused, but for the WRONG reason (a false "never freed" on `mp`) — which is
+what the survey's "masked" bucket was for. And every honest caller of `drop` was told its
+argument leaked, so the positive `opt_param_unwrap_free_ok.zer` failed with FIVE errors
+on main: four false leaks and `c = null;` after a free reported as a use-after-free.
+
+### Why the summary never saw the free
+
+The unwrap lowers to a passthrough `_zer_or = p` from a bare param ident with no handle,
+so no alias formed and `free(q)` reached nothing rooted at `p`; the summary's kind gate
+excluded `?*T` params; and the `orelse return` block counted as "a path on which the param
+was not freed", demoting even a tracked free to MAYBE. Five pieces close it, all in
+zercheck_ir.c and the IR: a PARAM gets its identity at its first unwrap (ALIVE, minted id,
+`escaped` — never the callee's leak) through ONE predicate `ir_type_reads_as_ref` shared
+with the IR_FIELD_READ arm; `IRBlock.orelse_fallback_local` records WHOSE null path a
+fallback block is, so the summary skips only the param's OWN null path (nothing to free
+there) and stays MAYBE on another optional's; the kind gate unwraps `?`;
+`freed_then_reset` keeps the fact of a free across the callee's own `h.p = null;` reset;
+and a bare tracked ident is a reset target (`mp = null;` is not a use).
+
+### The accept-unsafe discipline, applied
+
+Read the whole diff first (15 hunks) and classified each piece by DIRECTION: identity-at-
+unwrap and the `?` gate are MORE tracking (only tighten); the own-null-path skip is the one
+piece that can relax a MAYBE to definite, and it is sound because on that path the
+caller's argument was null — pinned by `opt_param_other_optional_null_path_maybe` (another
+optional's null path stays MAYBE) and `opt_param_real_branch_free_maybe` (a runtime branch
+stays MAYBE). Then a seven-cell boundary probe on both builds; every cell correct, and one
+of them was a hole the branch's tests did not pin — a callee freeing through the
+IF-CAPTURE form followed by the caller freeing was ACCEPTED on main (the MAYBE never
+reached the summary). Added as `opt_param_capture_free_then_caller_free.zer`.
+
+Three conflicts, the mirror image of BUG-984's: this time BOTH sides were wanted
+(`view_root_local` from BUG-984, `freed_then_reset` / `ir_type_reads_as_ref` from here),
+so each was resolved by keeping both in the branch's own order.
+
+### Deliberate over-rejection, unchanged from main
+
+`free(q); mp = null; *T r = mp orelse return;` is still refused as a use-after-free — the
+reset keeps the FREED state so the summary still sees the free. A re-unwrap after a null
+reset takes the null path at runtime, so this is a false positive, and it was one before
+too. Recorded in limitations.md with the fix sketch (a "reset to null" state).
+
+### BUG-986 — the Ring "pointer through channel" WARNING tested the element's bare kind
+
+`Ring(Msg, 4)` with `struct Msg { ?*T p; }` crossed the channel with no warning at all —
+the wrapper-hides-the-inner-kind class. Both `push` and `push_checked` use
+`type_carries_data_pointer` now, and the two hand-rolled rows leave the carrier baseline.
+A warning, not a verdict; two existing negatives about local-derived pushes now also print
+it, which is correct.
+
+### Measurements
+
+- All seven negatives: three ACCEPTED on `git archive HEAD` (207ab846), two rejected for
+  the WRONG reason, two already right (boundaries). All reject for their own reason now.
+- 2379 corpus files under both binaries: no non-test file changed a handle diagnostic.
+- `make check` exit 0.
+
 ## Session 2026-09-13 — BUG-984: a pointer VIEW of a local aggregate names the aggregate's own slots (3 more of class 9, from `3sdup9`)
 
 `claude/loving-davinci-3sdup9` commit `d17f9417` (its BUG-981), applied on top of

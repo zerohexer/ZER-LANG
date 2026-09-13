@@ -30,6 +30,30 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — re-unwrapping an optional after `p = null;` following a free is refused (2026-09-13, LOW — over-rejection, unchanged from before BUG-985)
+
+**Symptom.** `*T q = mp orelse return; free(q); mp = null; *T r = mp orelse return;` is
+refused as a use-after-free of `mp`. At runtime the second unwrap takes the null path; the
+freed pointee is never touched.
+
+**Why.** BUG-985 made `mp = null;` a RESET (not a use) but deliberately KEEPS the FREED
+state on `mp`, so that the FuncSummary builder still sees the free when `mp` is a param
+(`free(q); p = null;` in a callee frees the caller's allocation). The slot form has a
+separate fact for this (`freed_then_reset`); the bare-ident form reuses the state itself.
+
+**Fix sketch.** Give the bare ident the same treatment as the slot: on `mp = null;` set
+`freed_then_reset` from the FREED state and move the state to a "known null" value the
+orelse read treats as the null path; the summary reads the flag. Corpus cost of the
+current over-rejection is zero (measured, 2379 files). The if-capture form
+(`if (h.p) |q| { free(q); }`) staying MAYBE at the caller is the other residual of the same
+commit and is a precision limit, not a bug: the callee's join really does merge a freed
+and a null path.
+
+**Tripwire:** none pinned — freezing a wrong "use after free" into `zer_fail` would freeze
+the wrong reason.
+
+---
+
 ## OPEN — freeing a UNION variant through its POINTER capture `|*q|` is a false leak (2026-09-13, LOW — over-rejection; the value capture `|q|` is CLOSED as BUG-984)
 
 **Symptom (measured on main after BUG-984).**
@@ -115,7 +139,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 59 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 57 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -171,7 +195,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 59 live), by class — and which branch to take
+### The 97 (now 57 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -251,16 +275,13 @@ in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 **8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
 `spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
 
-**9. ~~VIEW OF A LOCAL / GLOBAL PROJECTION~~ / OPTIONAL PARAM / ~~UNION CAPTURE~~ — 2 left of 7. TAKE `3sdup9`.**
-~~`view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`~~ (closed 2026-09-13, BUG-984)
-~~`global_projection_reunwrap_uaf` `global_projection_free_then_read`~~ (closed 2026-09-13, BUG-982)
-`opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
-~~`union_capture_free_then_reread_uaf`~~ (closed 2026-09-13, BUG-984; the POINTER-capture
-residual is its own OPEN entry above)
-The two `opt_param_*` are `3sdup9`'s `92cc9dfd` ("relax BUG-979 optional-param free through
-`orelse return`" — note that commit is a RELAXATION plus a limitations entry, so read what
-it actually claims before adopting: its `freed_then_reset` / `ir_type_reads_as_ref` symbols
-were deliberately NOT taken with BUG-984).
+### ~~9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7~~ — CLOSED 2026-09-13
+
+`global_projection_*` as BUG-982; `view_of_local_*` + `union_capture_*` as BUG-984;
+`opt_param_*` as BUG-985 (`3sdup9`'s `92cc9dfd`, read in full first — a relaxation with a
+DOUBLE FREE inside it: `drop(mp); free(mp-unwrapped)` ran on main). Two residuals, each its
+own OPEN entry above: the union POINTER capture `|*q|` (false leak) and re-unwrapping after
+`p = null;` (false UAF).
 
 **10. SMALLER CLASSES**
 - i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
@@ -300,8 +321,8 @@ siblings — likely one fix.
 ### limitations.md entries worth taking (deduped against main's own)
 
 - `3sdup9`: ~~the depth-guard ledger~~ (SUPERSEDED — the enumeration was done on main, BUG-976);
-  "a callee freeing an optional field
-  through the IF-CAPTURE form stays MAYBE"; ~~"freeing a UNION variant through its POINTER capture
+  ~~"a callee freeing an optional field
+  through the IF-CAPTURE form stays MAYBE"~~ (TAKEN 2026-09-13 into the BUG-985 residual entry); ~~"freeing a UNION variant through its POINTER capture
   `|*q|` is a false leak"~~ (TAKEN 2026-09-13, own OPEN entry above) — both OVER-rejections
 - `ppnatu`: "Arena methods through a POINTER or a STRUCT FIELD are not supported"; "ISR-vs-main
   tracking counts a helper as 'main' even when only the ISR calls it"

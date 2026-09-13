@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: freed
+// (from claude/loving-davinci-3sdup9 92cc9dfd, body verbatim; its BUG-979 -> main BUG-985)
+// BUG-985 boundary: a free under a REAL runtime branch is MAYBE — the null-path skip
+// applies only to the param's own `orelse return`.
+struct T { u32 v; }
+u32 pick() { return 0; }
+void f(?*T p) { *T q = p orelse return; if (pick() == 1) { free(q); } }
+u32 main() {
+    ?*T mp = alloc(T);
+    f(mp);
+    return 0;
+}

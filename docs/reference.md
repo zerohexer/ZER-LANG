@@ -1407,6 +1407,15 @@ return 0;              // COMPILE ERROR — 'y' never freed, never escaped (leak
   interrupt handler → compile error; use `Pool` there).
 - `free` needs a `*T` or `[*]T` — a cinclude `free(ptr)` on a raw C pointer is
   left alone (routes to C's `free`).
+- A callee may free an **optional** parameter, or an optional field of a parameter,
+  by unwrapping it: `void drop(?*T p) { *T q = p orelse return; free(q); }`. The
+  caller sees that free — `drop(mp)` discharges `mp`, and a later unwrap of `mp`
+  or a second free is an error. The `orelse return` path is the null path: nothing
+  was there to free. A free under a real branch (`if (c) { free(q); }`) is still
+  "may not be freed on all paths", and so is the `if (p) |q| { free(q); }` capture
+  form.
+- After a free, `p = null;` / `h.p = null;` is a RESET of the variable or slot, not a
+  use of the freed pointee. Re-unwrapping it after the reset is still refused.
 
 **SEE ALSO**
 Slab(T), Pool(T,N), Handle(T), Arena, alloc_ptr

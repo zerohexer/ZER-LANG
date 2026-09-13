@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-985 boundary, found by probing: the callee frees the field through the IF-CAPTURE
+// form (`if (h.p) |q| { free(q); }`), so its summary is MAYBE — and a MAYBE-freed field
+// that the caller then frees is a possible double free and must be refused. On the
+// pre-fix build the callee's free never reached the summary at all, and this compiled.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop(*H h) { if (h.p) |q| { free(q); } }
+u32 main() { H h; h.p = alloc(T); drop(&h); *T r = h.p orelse return; free(r); return 0; }

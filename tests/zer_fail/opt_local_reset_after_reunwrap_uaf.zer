@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// (from claude/loving-davinci-3sdup9 92cc9dfd, body verbatim; its BUG-979 -> main BUG-985)
+// BUG-985 boundary: the reset rule exempts the ASSIGNMENT `mp = null;` only — the
+// re-unwrap `mp orelse return` before it still reads the freed allocation.
+struct T { u32 v; }
+u32 main() {
+    ?*T mp = alloc(T);
+    *T q = mp orelse return;
+    free(q);
+    *T r = mp orelse return;
+    mp = null;
+    return r.v;
+}

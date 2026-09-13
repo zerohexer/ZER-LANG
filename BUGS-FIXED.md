@@ -5,6 +5,75 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-992/993: the off-by-N loop is a compile error, and the IR intrinsic fallback is loud (class 4 closed)
+
+Survey class 4, 7 reproducers, from `vgonmt`'s `a40104b8` (its BUG-958, itself adopted
+from `vigilant-tesla-v7pucv` `8c8873d`). Filtered to the loop-rule hunks: the same commit's
+BUG-960 half is main's BUG-979 (already done, and implemented differently — its
+`ff_spawn_in_func` / `scoped_spawn_live` fields were NOT taken; main has
+`unbounded_spawn_in_func` / `live_scoped_threads`). Two conflicts, both "keep both" beside
+main's BUG-947 `loop_depth--`.
+
+### BUG-992 — `for (u32 i = 0; i < 8; i += 1) { arr4[i] = i; }` was a WARNING, and the guard is a silent early return
+
+Measured on main: all seven accepted with *"index 'i' not proven in range — auto-guard
+inserted"*, and the auto-guard's runtime form is an early `return` of the function's zero
+value. So the canonical off-by-N buffer overflow was silent at compile time AND at run
+time: the loop stopped at `i == 4`, every statement after it never ran, and `main` exited
+0 — "success" with half the loop never executed. On bare metal there is no trap and no
+message to notice it by.
+
+**What licenses an ERROR where a range cannot.** VRP proves the RANGE `[0,7]`, but a range
+is a MAY-hold fact — `u32 b = 10; if (c) { b = 2; } arr4[b]` also straddles and is safe
+(`bounds_ident_proven_ok.zer` pins that). The stronger WILL-hold fact comes from the loop:
+constant init, positive constant step, constant bound, and a body that cannot skip an
+iteration or change the counter — then every value of the sequence is really taken, and
+if one of them indexes past the end the program provably performs an OOB access.
+`Checker.cert_loop_*` carries that fact for the INNERMOST counted loop only; the access
+must sit at the loop body's own `branch_depth` (an access nested in an `if` may be
+unreachable for the offending values) and not in short-circuit RHS position.
+
+**Everything here is a PROOF OF DANGER, so an incomplete walk can only fail to report.**
+`loop_body_straight_line` is a no-`default:` walk that answers NO for every kind it has
+not been taught (`break`/`continue`/`return`/`goto`/`yield`/`defer`/`asm`/`spawn`/
+`orelse`/`@trap`/nested loops/switch, a write to or `&` of the counter, a shadowing
+re-declaration). The `while`/`do-while` half recognises ONLY the canonical shape — the
+increment is the LAST top-level statement — because with the increment first the values
+at the access are `lo+step, ...`, and a rule that assumed otherwise would be wrong in the
+ACCEPT direction. A new `IDX_PARTIAL_OOB` verdict also rewords the WARNING when the range
+is known and straddles but no certainty holds, and says what the guard does at runtime.
+
+**Over-rejection boundary, 11 shapes, one positive** (`loop_counter_bounds_ok.zer`): the
+correct bound, an access nested in an `if`, a `break`, a write to the counter, a step that
+skips past the end, a runtime bound, a slice, a zero-trip loop, `while` with the increment
+FIRST, a correct `while`, a conditional increment.
+
+**Two existing positives were certain-OOB programs pinning the guard's silent return.**
+`while_vrp_autoguard.zer` / `dowhile_vrp_autoguard.zer` (BUG-748) are now rejected — the
+stronger property — and replaced by `_runtime_bound` twins that keep BUG-748's actual
+subject (the body must not be checked under the counter's outer init-range; the guard
+must still be inserted — verified: the warning still prints). The do-while one is also
+promoted to `zer_fail` as `dowhile_counter_past_end_bug748.zer`.
+
+### BUG-993 — the IR-path unknown-intrinsic fallback emitted a silent `0`
+
+BUG-767 hardened the AST-path fallback into a loud undeclared identifier and left the IR
+twin — the only path function bodies use — on `/* @name */ 0`. An intrinsic added to the
+checker without an emitter arm would compile to zero: a privileged register read or an
+MMIO probe silently "zero". Dead today (every accepted name has an arm — swept), and it
+must fail LOUD the moment it is not: `__zer_intrinsic_<name>_has_no_IR_emitter_handler`.
+Beside it the AST atomic gate's `nlen >= 10` off-by-one (excluded `@atomic_or`; the
+checker fixed the same thing in BUG-427 and the emitter copy never followed) is `>= 9`.
+
+### Measurements
+
+- Corpus: 2433 files; the new ERROR fires on exactly the two certain-OOB positives being
+  replaced and nowhere else. The reworded warning appears in 11 files that already got the
+  old wording (count unchanged).
+- `tools/walker_field_baseline.txt`: 26 justified rows for the new walker (kinds that
+  return NO outright — nothing to learn from their children).
+- `make check` exit 0.
+
 ## Session 2026-09-13 — BUG-990/991: two legal ZER programs whose EMITTED C did not build (found beside class 5, not in the survey)
 
 The emitter half of `qo0mm9`'s `afcc7ee1` (its BUG-982/983), measured live on main while

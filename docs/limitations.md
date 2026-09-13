@@ -182,7 +182,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 46 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 39 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989, 7 as BUG-992), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -238,7 +238,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 46 live), by class — and which branch to take
+### The 97 (now 39 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -293,9 +293,14 @@ Gate: the RE-ENTRY GRID in `tests/test_conc_matrix.c` (callee form x lock kind �
 PLAIN column is what proves the rule is scoped). Residual over-rejection (read/read)
 entered separately above.
 
-**4. LOOP COUNTER PAST END — 7, bounds. TAKE `vgonmt`.**
-`loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
-`_dowhile_past_end` `dowhile_counter_past_end_bug748`
+### ~~4. LOOP COUNTER PAST END — 7, bounds~~ — CLOSED 2026-09-13 as BUG-992
+
+`vgonmt`'s `a40104b8` loop-rule hunks (its BUG-958). A counted loop whose counter WILL take
+a value past a fixed array's end is a compile error — the auto-guard's runtime form is a
+silent early RETURN, so pre-fix `main` exited 0 with half the loop never run. Licensed by
+the loop's WILL-hold fact, not by the MAY-hold range; `loop_body_straight_line` is a
+proof-of-danger walk (no default, answers NO for anything untaught). Over-rejection
+boundary pinned by 11 shapes in `tests/zer/loop_counter_bounds_ok.zer`.
 
 ### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-13 as BUG-987/988/989
 

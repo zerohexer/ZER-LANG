@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: loop provably performs an out-of-bounds access
+// (from claude/loving-davinci-vgonmt a40104b8 = vigilant-tesla-v7pucv 8c8873d, body verbatim; its BUG-958 -> main BUG-992)
+// BUG-992, `while` half. Same defect as the `for` spelling: before this rule the
+// loop silently stopped at i == 4 and main returned 0 = "success".
+u32 main() {
+    u32[4] arr;
+    u32 i = 0;
+    while (i < 8) { arr[i] = i; i += 1; }
+    return 0;
+}

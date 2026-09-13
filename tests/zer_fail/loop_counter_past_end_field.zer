@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: loop provably performs an out-of-bounds access
+// (from claude/loving-davinci-vgonmt a40104b8 = vigilant-tesla-v7pucv 8c8873d, body verbatim; its BUG-958 -> main BUG-992)
+// The array is a STRUCT FIELD — same verdict, the index is what is proven.
+struct Box { u32[4] data; }
+u32 main() {
+    Box b;
+    for (u32 i = 0; i < 6; i += 1) { b.data[i] = i; }
+    return 0;
+}

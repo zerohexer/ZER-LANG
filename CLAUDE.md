@@ -1277,7 +1277,7 @@ When considering new features, apply the **primitives test**: if the use case ca
 ### Safety Guarantees
 | Bug Class | Prevention |
 |---|---|
-| Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted) |
+| Buffer overflow | Inline bounds check on every array/slice access; proven-safe indices skip check (range propagation); unsafe indices get auto-guard (silent if-return inserted). **A counted loop whose counter PROVABLY runs past a fixed array's end is a compile ERROR, not a guard** (BUG-992, 2026-09-13) — the guard's silent early return had made the canonical off-by-N overflow invisible at compile time AND run time (`main` exited 0 with half the loop never run). Licensed by the loop's WILL-hold fact (`Checker.cert_loop_*`: constant init/step/bound, straight-line body, access at the body's own branch depth), never by the MAY-hold VRP range alone. `loop_body_straight_line` is a PROOF-OF-DANGER walk: no `default:`, answers NO for anything untaught, so an incomplete walk can only fail to report |
 | Use-after-free | Handle generation counter + ZER-CHECK (MAYBE_FREED + leak detection + loop pass + cross-function summaries) + Level 1-5 *opaque tracking (compile-time zercheck + poison-after-free + inline header + global malloc interception) |
 | Null dereference | `*T` non-null by default, `?T` requires unwrapping, local function pointer requires initializer |
 | Uninitialized memory | Everything auto-zeroed |

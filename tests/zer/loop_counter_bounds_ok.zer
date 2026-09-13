@@ -1,4 +1,4 @@
-// BUG-913 OVER-REJECTION BOUNDARY. Every loop here must COMPILE and RUN: the
+// BUG-992 OVER-REJECTION BOUNDARY (from claude/loving-davinci-vgonmt, body verbatim). Every loop here must COMPILE and RUN: the
 // certain-OOB error is licensed only by "the counter WILL take a value past the
 // end", so each shape below breaks one premise and must fall back to today's
 // behaviour (proven-safe, or a warning + auto-guard).

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-988: a forged function pointer — an indirect call to an arbitrary address.
+struct FW { *(u32) -> u32 f; }
+u32 main() {
+    u64 addr = 0;
+    *u64 ap = &addr;
+    *FW fp = @pun(*FW, ap);
+    return fp.f(3);
+}

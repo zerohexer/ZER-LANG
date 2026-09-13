@@ -5,6 +5,91 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-987/988/989: three forging doors, each an intrinsic whose ADVERTISED runtime check did not exist for the operands that mattered (class 5 closed)
+
+Survey class 5, 11 reproducers, bodies byte-identical on `qo0mm9` and `vgonmt` (both are
+cherry-picks of `vigilant-tesla-ef9cao` `021ecaa`); adopted from `qo0mm9`'s `afcc7ee1`,
+checker.c + types.h only — the same commit's emitter half is two other live bugs, taken in
+the next commit. All eleven ACCEPTED on `git archive HEAD` (fdedfe27); all eleven reject
+for their own reason now, three positives run on both builds, the trap test traps (133).
+Corpus: 2417 files under both binaries, ZERO differences; non-vacuous — 9 files use `@pun`,
+57 `@inttoptr`, 11 `@container`.
+
+### BUG-988 — `@pun`'s runtime check folds to false whenever either pointee is a primitive
+
+The emitter writes `pn.type_id = SRC; if (pn.type_id != TGT && pn.type_id != 0) trap`,
+and only struct / enum / union pointees carry a `type_id` — everything else packs 0, and
+`!= 0` is exactly the escape. Measured on main, all four ran with no diagnostic and no trap:
+
+| probe | main |
+|---|---|
+| `struct P { *u32 p; }` from `*u64` | an integer became a working pointer — **wrote 42 through it, exit 42** |
+| `struct Box { State s; }` from `*u32` holding 200 | forged enum; the switch **returned 3** — dispatched to `.done` |
+| `struct S { [*]u8 s; }` from `*[*]u8` | a forged slice `len`, the value every bounds check trusts |
+| `struct FW { *(u32)->u32 f; }` from `*u64` | an indirect call through forged bits |
+
+The first row is the one that matters: an integer-to-pointer conversion with no
+`@inttoptr` and no `mmio` declaration — the grammar-level closure ZER's safety claim rests
+on, bypassed by an intrinsic whose own sibling diagnostic (`@ptrcast`'s) sends users to it
+"for an explicit **runtime-checked** pun". Hosted, a wild address is caught by the SIGSEGV
+handler, which is `_ZER_HOSTED`-only; bare metal is a silent wild access.
+
+**The tell, worth generalising:** BH-18 #4 had already closed the WIDENING half
+(`@pun(*Big, *u32)` reads past the source) and its commit even records that the trap is
+skipped for in-ZER primitive pointers. It closed the case that reads OUT of bounds and left
+the case that reads IN bounds and forges a value — a comment that names the mechanism as
+broken while fixing one consequence of it.
+
+Fix: reject only when the check CANNOT fire (`pun_type_id_check_can_fire` — mirrors the
+emitter and must change with it), the pointee types differ, and the TARGET carries a value
+with a validity invariant (`type_carries_forgeable`: pointer / opaque / slice / funcptr /
+enum / bool / optional / Handle / builtin container / tagged union, recursing arrays and
+structs; exhaustive switch, no `default:`). Reinterpreting bits as plain integers forges
+nothing, so the byte-view idiom `@pun(*u8, structptr)` and `@pun(*Plain, *u32)` still
+compile — pinned by `pun_no_invariant_ok.zer`. Struct-to-struct puns are untouched; and
+measured while here: a struct-to-struct pun between DIFFERENT structs always traps (the
+ids differ statically), so "runtime-checked" there means "runtime-refused".
+
+### BUG-989 — `@inttoptr` to an enum-carrying pointee was a FOURTH enum-forging door
+
+CLAUDE.md recorded the door set as closed at three on the reasoning at
+`emit_enum_variant_guard_path`: *"ZER has no int->enum cast, so every other path to an enum
+value is a declared variant."* `@inttoptr` IS an int-to-pointer cast, and a deref of what it
+returns is an enum out of foreign bits. Measured on main with the register holding 200:
+zero guard emissions, the switch returned 3. Same through a struct field.
+
+**REJECTED rather than guarded, and that is the call worth recording.** Guarding would
+mean firing at every READ through the pointer — deref, field, index, nested — a fresh
+N-sink surface of exactly the kind this project keeps paying for. The idiom the docs
+already teach goes through a door that IS guarded, so the rejection routes users there and
+the guarded set stays at three. `tests/zer_trap/mmio_enum_via_bitcast_trap.zer` proves the
+replacement both compiles and still catches the forgery (`volatile *u32 r = @inttoptr(*u32,
+a); State s = @bitcast(State, *r);` traps). Scoped to enums on purpose — a pointer-carrying
+MMIO struct is a different question with a non-zero corpus cost (`lib/compat.zer`) and no
+measured wrong-dispatch behind it; recorded as OPEN in limitations.md.
+
+### BUG-987 — `@container` had a two-valued domain for a three-valued fact
+
+Its provenance check knew "came from `&outer.field`" and NULL, read as *unknown, cannot
+prove wrong, allow*. But `*Inner ip = &i;` where `i` is a standalone `Inner` is not unknown:
+the compiler SAW the address being formed and knows it points at a whole object that is
+nobody's field. `@container` subtracts the field offset and hands back a pointer BEFORE the
+object — ASan: `stack-buffer-underflow` (a global source: `global-buffer-underflow`),
+silent on an ordinary build. A missing abstract state that folds a KNOWN-BAD case into
+"unknown" is what the MAX-oracle standard calls a soundness hole, so the state is now
+represented: `Symbol.is_whole_object_addr`, mutually exclusive with `container_struct`
+and written ONLY through `set_container_prov_{field,whole,unknown}` so a re-pointed
+pointer cannot keep a stale claim (pinned by `container_field_prov_ok.zer`, which
+re-points both ways, aliases, and passes as a param).
+
+**Second sink, found by enumeration:** the block tested `args[0]->kind == NODE_IDENT`, so
+`@container(*Outer, &i, in)` — the `&` written straight into the call — skipped EVERY
+check, including the pre-existing wrong-struct and wrong-field ones. Both sinks resolve
+through one `classify_amp_operand`. `&arr[i]` is WHOLE for the same reason a standalone
+object is.
+
+- `make check` exit 0; 15 tests added (11 negatives, 3 positives, 1 trap).
+
 ## Session 2026-09-13 — BUG-985/986: a callee's free of an OPTIONAL param never reached the summary — a relaxation with a double-free hole inside it (class 9 closed)
 
 `claude/loving-davinci-3sdup9` commit `92cc9dfd` (its BUG-979 + BUG-978), read in full

@@ -2037,10 +2037,53 @@ type confusion before any memory read.
                                    // "@pun type mismatch" before m is used
 ```
 
+**THE RUNTIME CHECK ONLY EXISTS BETWEEN struct / enum / union TYPES**
+Only those three carry a runtime `type_id`. When either pointee is anything
+else — `u32`, `f64`, a slice, a funcptr — the emitted check compares against
+`0` ("unknown provenance") and can never fire. So `@pun` is checked between
+two named aggregate types, and **unchecked** in every other combination. Two
+compile-time rules cover what the runtime check cannot:
+
+- **Widening is rejected.** A target pointee LARGER than the source pointee
+  reads past the source object:
+  ```zer
+  struct Big { u64 a; u64 b; }
+  u32 small = 7;  *u32 sp = &small;
+  *Big bp = @pun(*Big, sp);      // ERROR — 16-byte target, 4-byte source
+  ```
+- **Forging is rejected.** If the runtime check cannot fire, the pointee types
+  differ, and the TARGET carries a value whose validity the rest of the program
+  trusts — a pointer, slice, funcptr, enum, `bool`, optional, `Handle`, or any
+  struct/array containing one — the pun is refused:
+  ```zer
+  struct P { *u32 p; }
+  u64 addr = 0x1000;  *u64 ap = &addr;
+  *P pp = @pun(*P, ap);          // ERROR — would forge a pointer from an integer
+  ```
+  This is what keeps `@inttoptr` (with its mandatory `mmio` declaration) the
+  only way an integer becomes a pointer, and keeps a forged enum out of an
+  exhaustive `switch`. Use `@inttoptr` for an address, a `[*]u8` slice to parse
+  bytes, or pun between two struct types (which IS runtime-checked).
+
+Reinterpreting bits as plain integers or floats forges nothing — every bit
+pattern is a legal `u32` — so those puns still compile in both directions:
+
+```zer
+struct A { u32 x; }
+A a;  *A pa = &a;
+*u8 bytes = @pun(*u8, pa);       // OK — byte view of a struct
+
+u32 raw = 9;  *u32 rp = &raw;
+struct Plain { u32 y; }
+*Plain pl = @pun(*Plain, rp);    // OK — target carries no invariant
+```
+
 **NOTES**
 - Compile-time: target must be a pointer, source must be a pointer,
-  const stripping rejected, volatile stripping rejected.
-- Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")`.
+  const stripping rejected, volatile stripping rejected, plus the widening
+  and forging rules above.
+- Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")` —
+  only between struct/enum/union pointees, see above.
 - For raw byte access (parsing, serialization), use `[*]u8` slices —
   not pointer casting. Slices are bounds-checked, len-carrying, and the
   right tool for byte-level data.
@@ -2082,6 +2125,34 @@ struct Device { u32 id; ListHead list; }
 *ListHead ptr = &dev.list;
 *Device d = @container(*Device, ptr, list);   // OK
 ```
+
+**THE POINTER MUST POINT AT A FIELD**
+`@container` subtracts the field's offset. The compiler tracks where a pointer
+came from and knows three answers, not two:
+
+| where the pointer came from | verdict |
+|---|---|
+| `&outer.field` — a field of the named struct | OK |
+| `&outer.other` / a field of a *different* struct | compile error (wrong field / wrong struct) |
+| `&wholeObject`, `&arr[i]` — a complete object that is nobody's field | compile error |
+| a parameter, a `cinclude` pointer — unknown | allowed (cannot be proven wrong) |
+
+```zer
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+
+Inner i;
+*Inner ip = &i;
+*Outer o = @container(*Outer, ip, in);   // ERROR — `i` is nobody's field;
+                                         // this would read BEFORE the object
+```
+
+The whole-object case is rejected because subtracting the field offset from the
+address of a complete object produces a pointer *before* it — every read through
+it is out of bounds. The fact rides through aliases (`*Inner b = a;`) and is
+cleared when the pointer is re-pointed at a real field, so the correct program
+still compiles. An element of an array (`&arr[i]`) is a complete object too, and
+is rejected for the same reason.
 
 ---
 
@@ -2994,6 +3065,25 @@ f32 ratio = (f32)big;          // int → float value convert
 (*Motor)opaque_ctx             // pointer cast (provenance checked)
 (*opaque)sensor_ptr            // type erase
 ```
+
+**THE TARGET MUST BE A KEYWORD TYPE — a bare user type name is NOT a cast**
+`(Name)expr` is parsed as the parenthesised expression `(Name)` followed by
+`expr`, because `(x)` has to keep meaning "the variable x". Only these start a
+cast: the primitive keywords (`u8`..`u64`, `i8`..`i64`, `usize`, `f32`, `f64`,
+`bool`, `void`, `opaque`), `?`, `const`, `volatile`, and `*`. So a POINTER to a
+user type works and a bare user type does not:
+
+```zer
+(*Motor)ctx        // OK — the `*` makes it unambiguous
+(Motor)x           // NOT a cast — the compiler reports a syntax error at `x`
+(State)n           // NOT a cast — and int -> enum needs a checked door anyway
+(Meters)n          // NOT a cast — use @cast for a distinct typedef
+```
+
+Use the named intrinsic for each of these: `@cast(Meters, n)` for a distinct
+typedef, `@bitcast(State, n)` for an enum (checked at runtime against the
+variant set), `@ptrcast` / `@pun` between pointer types, `@inttoptr` for an
+address.
 
 **NOTES**
 - Widening: always safe, no data loss.

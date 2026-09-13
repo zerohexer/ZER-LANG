@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: it carries an enum
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-989 carrier half: an enum nested in an MMIO register struct forges exactly
+// as well as the bare spelling — the wrapper-hides-the-inner-kind family.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+enum State { idle, running, done }
+struct Regs { State s; }
+usize gaddr;
+u32 store;
+u32 main() {
+    store = 200;
+    gaddr = @ptrtoint(&store);
+    volatile *Regs r = @inttoptr(*Regs, gaddr);
+    State s = r.s;
+    switch (s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+    return 77;
+}

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-987: the whole-object fact must ride an alias exactly as the field fact
+// does, or one copy launders it.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+u32 main() {
+    Inner i; i.a = 3;
+    *Inner p1 = &i;
+    *Inner p2 = p1;
+    *Outer o = @container(*Outer, p2, in);
+    return (u32)o.pad;
+}

@@ -30,6 +30,49 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
+
+BUG-989 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch
+downstream *elides work* on the assumption that every value is a declared variant, and
+that elision was measured turning a bad value into a wrong dispatch.
+
+The same intrinsic can produce a pointer to a struct carrying a `*T`, `[*]T`, `bool`,
+optional or `Handle`, and reading those fields forges those values from hardware bits.
+That was NOT shipped, deliberately:
+
+- `@inttoptr` **is** the sanctioned integer-to-pointer door (mmio-gated and audit-visible),
+  so a hardware register holding an address is the thing it exists to express;
+- `lib/compat.zer` depends on `@inttoptr(*opaque, ...)` for its pointer arithmetic, so the
+  blanket predicate (`type_carries_forgeable`) has a non-zero corpus cost;
+- no wrong-dispatch or wrong-elision defect has been measured for these, unlike the enum
+  case.
+
+If this is taken up, measure first: find a downstream analysis that ELIDES a check on the
+strength of one of these types, the way the exhaustive switch does for enums. Absent that,
+this is an unmeasured tightening and should stay unshipped. (Carried from `qo0mm9` /
+`vigilant-tesla-ef9cao`.)
+
+## NOTE — the exhaustive-enum switch's last-arm elision is the AMPLIFIER, not the hole
+
+Worth writing down because it explains why every enum-door bug reads as severe. Lowering
+an exhaustive `switch` emits the final arm as an **unconditional else**:
+
+    if (s == 0) -> arm0; else if (s == 1) -> arm1; else -> arm2;   /* no test on arm2 */
+
+That is sound exactly while every enum value is a declared variant — which is what the
+forge doors defend. So a missed door does not merely let a strange value through; it makes
+that value *take an arm*, and the `return 77` fall-through after the switch becomes dead
+code. Every enum-forge bug to date (BUG-843, 864, 891, 910, and now 988/989) reports as
+"the switch silently ran its LAST arm" for this reason.
+
+Making the switch defensive (test the last arm too, fall through on no match) would remove
+the amplifier permanently and independently of door coverage. It was NOT done: it costs a
+comparison and a branch on every enum switch, it silently does nothing on a forged value
+rather than trapping, and ZER's chosen answer is to trap at the point of forgery. Recorded
+as the alternative in case the door set ever stops being closable.
+
+---
+
 ## OPEN — re-unwrapping an optional after `p = null;` following a free is refused (2026-09-13, LOW — over-rejection, unchanged from before BUG-985)
 
 **Symptom.** `*T q = mp orelse return; free(q); mp = null; *T r = mp orelse return;` is
@@ -139,7 +182,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 57 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 46 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -195,7 +238,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 57 live), by class — and which branch to take
+### The 97 (now 46 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -254,11 +297,18 @@ entered separately above.
 `loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
 `_dowhile_past_end` `dowhile_counter_past_end_bug748`
 
-**5. FORGING DOORS — 11. TAKE `qo0mm9`** (forked 2 days later than `vgonmt`; both have these
-22 shared cells, compare per item at adoption).
-`@pun` (4): `pun_forge_enum` `_slice` `_funcptr` `_pointer`
-`@inttoptr` → enum (2): `inttoptr_enum_target` `inttoptr_enum_in_struct`
-`@container` (5): `container_whole_object` `_alias` `_direct` `_global` `container_array_element`
+### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-13 as BUG-987/988/989
+
+Bodies byte-identical on `qo0mm9` and `vgonmt` (both cherry-picked `vigilant-tesla-ef9cao`
+`021ecaa`); taken from `qo0mm9`'s `afcc7ee1`, checker.c + types.h hunks only (the same
+commit's emitter half is two OTHER live bugs — a global `(u32)1e20` and a `1e400` literal
+both make the emitted C fail to build — taken next). Three rules, all statically decided:
+`@pun` refused when its runtime type_id check CANNOT FIRE and the target carries a value
+with a validity invariant (`type_carries_forgeable`); `@inttoptr` to an enum-carrying
+pointee refused, routing to the guarded `@bitcast` idiom (door set stays at three);
+`@container` on a WHOLE object refused (`Symbol.is_whole_object_addr`, the missing third
+provenance state), at BOTH sinks. Pre-fix: an integer became a working pointer (wrote 42),
+a forged enum dispatched to an arm, `@container(&i)` read BEFORE the object.
 
 ### ~~6. ATOMIC CELL x SCOPED SPAWN — 3, race window~~ — CLOSED 2026-09-11 as BUG-979
 

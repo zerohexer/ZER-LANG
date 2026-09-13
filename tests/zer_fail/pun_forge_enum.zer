@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-988: a forged enum. The exhaustive-switch lowering emits the LAST arm as an
+// unconditional else (sound only while every enum value IS a declared variant), so
+// pre-fix this returned 3 — a value in no variant DISPATCHED TO `.done`.
+enum State { idle, running, done }
+struct Box { State s; }
+u32 main() {
+    u32 wild = 200;
+    *u32 p = &wild;
+    *Box bp = @pun(*Box, p);
+    switch (bp.s) {
+        .idle => { return 1; }
+        .running => { return 2; }
+        .done => { return 3; }
+    }
+    return 77;
+}

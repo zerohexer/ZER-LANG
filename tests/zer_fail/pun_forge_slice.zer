@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-988: a slice's `len` is what every bounds check trusts. Forging one from
+// unrelated bytes forges the bound itself.
+struct S { [*]u8 s; }
+u32 main() {
+    u8[16] buf;
+    [*]u8 sl = buf[0..16];
+    *[*]u8 slp = &sl;
+    *S sp = @pun(*S, slp);
+    return (u32)sp.s.len;
+}

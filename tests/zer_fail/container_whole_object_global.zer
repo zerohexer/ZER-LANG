@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+// (from claude/loving-davinci-qo0mm9 afcc7ee1 = vigilant-tesla-ef9cao 021ecaa, body verbatim; 984/985/986 -> 987/988/989)
+// BUG-987: a global source gives global-buffer-underflow rather than
+// stack-buffer-underflow — same defect, different segment.
+struct Inner { u32 a; }
+struct Outer { u64 pad; Inner in; }
+Inner gi;
+u32 main() {
+    *Inner ip = &gi;
+    *Outer o = @container(*Outer, ip, in);
+    return (u32)o.pad;
+}

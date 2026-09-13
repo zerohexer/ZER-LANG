@@ -5,6 +5,71 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-1015: an array index in a LOOP CONDITION was proved under the PRE-loop range (found while auditing the docs)
+
+Found while verifying a compiler-internals.md sentence about where a loop condition's
+guard lands — the probe for the sentence read past the array.
+
+### The hole
+
+```zer
+u32[4] arr;
+u32 f(u32 n) { u32 i = 0; while (arr[i] > 0) { i += n; } return i; }
+```
+
+Compiled with NO diagnostic, and the emitted C for the condition was a bare `_zer_t1 =
+arr[i];` — no `_zer_bounds_check`, no auto-guard. With `arr` all ones, ASan reports
+`READ of size 4 … global-buffer-overflow` at the condition's line. The same for `do { …
+} while (arr[i] > 0)`, for `for (…; arr[i] > 0; …)` with the write in the BODY, for the
+loop var written by the STEP (`for (i = 0; arr[i] > 0; i += 1)`), and for a body that
+mutates the index through `&i`. Old, not a regression of this run — measured on the
+session baseline too. **The corpus contained one instance: `examples/cve-demos/
+baron_samedit_safe.zer`, whose parse loop `for (src_idx = 0; arg0[src_idx] != 0;
+src_idx += 1)` read its 7-byte buffer in the CONDITION with no check** — the demo of
+CVE-2021-3156 carried the CVE's own shape in its condition while its body was checked.
+
+### Root cause — an ordering, the BUG-748 shape one node over
+
+All three loop drivers in `check_stmt` called `check_expr(cond)` FIRST, before
+`vrp_invalidate_loop_body_writes(body)` (and, for `for`, before `check_expr(step)`). The
+condition was therefore range-checked under `i in [0,0]` — the value BEFORE the loop —
+`arr[i]` was marked proven-safe on that node, and the decision is permanent. The
+condition is evaluated on EVERY iteration under the loop-carried value. BUG-748
+(2026-06-18) fixed exactly this for the loop BODY, VRP#4 (2026-07-16) for non-loop vars
+in a `for` body, BUG-D for the do-while body's cond narrowing. Nobody had listed the
+condition itself.
+
+By contrast `u32 i = n; while (arr[i] > 0) …` — an UNKNOWN entry value — was fine all
+along: unproven, so the emitter's guard landed inside the condition block and ran per
+iteration. The emission path was never the problem; the checker's proof was.
+
+### Fix
+
+Reorder the three drivers: widen the body's writes (and the `&i` address-taken set —
+B7's `vrp_widen_loop_addr_taken`, idempotent with its later call) and, for `for`, check
+the STEP, all BEFORE `check_expr(cond)`; keep the cond-derived NARROWING push
+(`i < N -> [lo, N-1]`, which is for the BODY) AFTER the check — at the condition, `i` is
+exactly what the condition is about to test and must not be checked under the narrowing
+it establishes. BUG-992's `w_entry_lo` is captured before the widening, as before.
+
+### Measured
+
+- Seven hole shapes: 0 warnings / 0 guards on the baseline -> 1 warning / a guard in the
+  condition block on the fix; each helper returns the guard's zero at `i == 4`.
+- Boundaries unchanged: a condition index whose variable the body does NOT write keeps
+  its proof (no warning); `while (i < 4 && arr[i] > 0) { i += 1; }` returns 4 through the
+  condition (the guard sits in the `&&` RHS block, which `i < 4` never enters at 4 — it
+  does now get a warning + guard, the same as the `if (i < 4 && arr[i])` form always has,
+  because ZER does no `&&`-narrowing of the RHS).
+- Corpus: 2622 files under both binaries, stderr diffed for every `auto-guard` /
+  `error` / `warning` line. **Exactly one file changes: the CVE demo above**, which now
+  warns and guards its condition. `loop_counter_bounds_ok.zer` (11 shapes) and the
+  BUG-748 `_runtime_bound` twins are unchanged.
+- `tests/zer/loop_cond_index_guard_bug1015.zer`: exit 1 on the baseline (the first
+  helper read past the array), exit 0 with 8 auto-guard warnings on the fix.
+
+---
+
 ## Session 2026-09-13 — BUG-1010..1014: the last five of the survey — the five-branch survey is CLOSED (102/102)
 
 ### BUG-1010 — the RMW rule was per-STATEMENT, so splitting the operation over two hid it (`vgonmt` / 1zukjq)

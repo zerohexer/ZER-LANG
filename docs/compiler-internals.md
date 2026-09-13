@@ -6876,19 +6876,21 @@ everywhere) was fixed inside `is_literal_compatible` and reached all nine at onc
 - **`a += f` where `a` is int and `f` float** (1005): the compound form emitted a raw C
   conversion (UB out of range) where `a = f` was refused; both directions refused now.
 
-### Two findings from the doc audit itself (2026-09-13) — recorded, not fixed here
+### Two findings from the doc audit itself (2026-09-13)
 
-1. **An array index in a LOOP CONDITION is range-checked under the PRE-loop range.** All
-   three loop drivers call `check_expr(cond)` BEFORE `vrp_invalidate_loop_body_writes(body)`
-   (and, for `for`, before `check_expr(step)`), so `u32 i = 0; while (arr[i] > 0) { i +=
-   n; }` proves `arr[i]` against `i in [0,0]`, marks it proven, and emits `_zer_t1 = arr[i];`
-   with NO bounds check, NO auto-guard and NO warning. ASan `global-buffer-overflow` on a
-   4-element array; same for `do { … } while (arr[i] > 0)` and `for (…; arr[i] > 0; …)`
-   with the write in the body. BUG-748 fixed exactly this for the BODY and left the
-   CONDITION, which is evaluated per iteration under the loop-carried value. Measured on
-   `9ce61193` and on the session baseline. OPEN entry in limitations.md with the
-   reproducers; the fix is an ordering change in the three drivers.
-2. **The BUG-976 cap enumeration is not closed** — see the cap map above.
+1. **FIXED the same day as BUG-1015 — an array index in a LOOP CONDITION was range-checked
+   under the PRE-loop range.** All three loop drivers called `check_expr(cond)` BEFORE
+   `vrp_invalidate_loop_body_writes(body)` (and, for `for`, before `check_expr(step)`), so
+   `u32 i = 0; while (arr[i] > 0) { i += n; }` proved `arr[i]` against `i in [0,0]`, marked
+   it proven, and emitted `_zer_t1 = arr[i];` with NO bounds check, NO auto-guard and NO
+   warning — ASan `global-buffer-overflow`. BUG-748 had fixed exactly this for the BODY.
+   **The rule for the VRP loop drivers, now that both halves have been hit: a loop
+   CONDITION is evaluated per iteration under the loop-carried range — widen the body's
+   (and step's, and `&i`'s) writes BEFORE checking it, and push the cond-derived narrowing
+   (which is for the BODY) AFTER.** The one corpus instance was the CVE-2021-3156 demo's
+   own parse loop. Test: `tests/zer/loop_cond_index_guard_bug1015.zer`.
+2. **The BUG-976 cap enumeration is not closed** — see the cap map above; OPEN in
+   limitations.md.
 
 ## 2026-04-19 (continued): V3 routing, Task.alloc/free rename, QEMU MMIO test infrastructure
 

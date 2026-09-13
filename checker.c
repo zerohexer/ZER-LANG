@@ -17349,13 +17349,17 @@ static void check_stmt(Checker *c, Node *node) {
                 check_expr(c, node->for_stmt.init);
             }
         }
-        if (node->for_stmt.cond) {
-            Type *fcond = check_expr(c, node->for_stmt.cond);
-            if (!type_equals(fcond, ty_bool)) {
-                checker_error(c, node->loc.line,
-                    "for condition must be bool, got '%s'", type_name(fcond));
-            }
-        }
+        /* BUG-1015 (2026-09-13): the CONDITION is checked AFTER the step and the
+         * body have widened every variable they write, and BEFORE the cond-derived
+         * narrowing below. It used to be checked FIRST, under the init range —
+         * `for (i = 0; arr[i] > 0; i += 1)` proved `arr[i]` against `i in [0,0]`,
+         * the value before the loop, marked the node proven-safe for good, and the
+         * emitted C read `arr[i]` with no check, no guard and no warning (ASan
+         * global-buffer-overflow). The condition runs on EVERY iteration under the
+         * loop-carried value; BUG-748 / VRP#4 fixed exactly this for the BODY and
+         * never touched the condition. The narrowing push stays after the check on
+         * purpose: at the condition `i` is what the condition is about to test, so
+         * it must not be checked under the narrowing the condition establishes. */
         if (node->for_stmt.step) check_expr(c, node->for_stmt.step);
 
         /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
@@ -17369,6 +17373,16 @@ static void check_stmt(Checker *c, Node *node) {
          * body-written var BEFORE checking, then re-push the narrow loop-var range
          * below so the counter keeps its proven [init, bound-1]. */
         vrp_invalidate_loop_body_writes(c, node->for_stmt.body);
+        /* BUG-1015: an index whose variable the body mutates through `&i` (B7) is
+         * loop-carried at the condition too. Idempotent with the B7 call below. */
+        vrp_widen_loop_addr_taken(c, node->for_stmt.body);
+        if (node->for_stmt.cond) {
+            Type *fcond = check_expr(c, node->for_stmt.cond);
+            if (!type_equals(fcond, ty_bool)) {
+                checker_error(c, node->loc.line,
+                    "for condition must be bool, got '%s'", type_name(fcond));
+            }
+        }
         if (node->for_stmt.cond && node->for_stmt.cond->kind == NODE_BINARY) {
             Node *fc = node->for_stmt.cond;
             TokenType fop = fc->binary.op;
@@ -17501,13 +17515,12 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_WHILE:
     case NODE_DO_WHILE: {
-        Type *cond = check_expr(c, node->while_stmt.cond);
-        if (!type_equals(cond, ty_bool)) {
-            checker_error(c, node->loc.line,
-                "%s condition must be bool, got '%s'",
-                node->kind == NODE_DO_WHILE ? "do-while" : "while",
-                type_name(cond));
-        }
+        /* BUG-1015 (2026-09-13): the condition is checked AFTER the body's writes
+         * have been widened (below), not before. `u32 i = 0; while (arr[i] > 0)
+         * { i += n; }` used to prove `arr[i]` against the PRE-loop `i in [0,0]`
+         * and emit the read with no check at all — the condition is evaluated on
+         * every iteration under the loop-carried value, for `while` and for
+         * `do-while` alike. See the for-loop driver for the full note. */
 
         /* BUG-748 (2026-06-18): while/do-while body was checked under any
          * outer init-range for variables it writes. `u32 i = 0;
@@ -17537,6 +17550,17 @@ static void check_stmt(Checker *c, Node *node) {
                 w_entry_lo = wr->min_val;
         }
         vrp_invalidate_loop_body_writes(c, node->while_stmt.body);
+        /* BUG-1015: `&i` in the body (B7) is a loop-carried write at the condition
+         * too. Idempotent with the B7 call after the narrowing. */
+        vrp_widen_loop_addr_taken(c, node->while_stmt.body);
+
+        Type *cond = check_expr(c, node->while_stmt.cond);
+        if (!type_equals(cond, ty_bool)) {
+            checker_error(c, node->loc.line,
+                "%s condition must be bool, got '%s'",
+                node->kind == NODE_DO_WHILE ? "do-while" : "while",
+                type_name(cond));
+        }
 
         /* BUG-D (2026-07-16): the cond-derived narrowing below is SOUND for
          * `while` (condition checked BEFORE the body) but UNSOUND for `do-while`

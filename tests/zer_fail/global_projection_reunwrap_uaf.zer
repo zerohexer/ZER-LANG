@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// (from claude/loving-davinci-3sdup9, body verbatim; renumbered 975/976/977 -> 981/982/983)
+// BUG-982: unwrap a global's optional field, free through the local, re-unwrap
+// the field and read — accepted before, because the read of `g.p` found no entry.
+struct T { u32 v; }
+struct H { ?*T p; }
+H g;
+u32 main() {
+    g.p = alloc(T) orelse return;
+    *T q = g.p orelse return;
+    free(q);
+    *T r = g.p orelse return;
+    return r.v;
+}

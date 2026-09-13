@@ -11437,6 +11437,45 @@ fixed-point lattice — dedicated-session surgery." The pseudo-root reuse
 avoided ALL of it (~120 lines). For any future "track a non-local entity"
 need (e.g. per-module state), try a sentinel-keyed compound root FIRST.
 
+**Since BUG-982 (2026-09-13, from `claude/loving-davinci-3sdup9`) the invariant is
+enforced by the CONSTRUCTOR**: `ir_add_compound_handle` sets `escaped` when
+`local_id == IR_GLOBAL_ROOT_ID`. Reason: `ir_extract_compound_key` now resolves a
+global-rooted PROJECTION (`g.p`, `g_arr[0].q`) to `(IR_GLOBAL_ROOT_ID, "g.p")` through
+the ONE shared `ir_global_projection_key` (the same key G5's store sinks write), so any
+of its ~30 callers may create a global entry — the free sink, the orelse read-back, the
+field-read UAF walk, the alias arms. Before, G5 wrote entries nothing else could find:
+`g.p = n orelse return; free(g.p); g.p.v` was clean. A BARE global ident still returns
+-1 from the extractor (its arms key the plain name, above). Three rules came with it,
+all in the IR_ASSIGN passthrough handler:
+
+1. **A plain `=` whose target IS a tracked slot is a RESET, not a use** —
+   `ir_assign_target_is_tracked_slot` makes the UAF walker descend only the slot's
+   OBJECT chain, so the taught `g.p = null;` / `h.p = null;` compiles while
+   `hp.p = null` through a freed `hp` still fails. A local slot receiving an untracked
+   value is cleared (`ir_value_clears_slot` decides by KIND, not arm order — a first
+   draft cleared after the view-alias arm had aliased and the view-alias matrix caught
+   it). G5 already cleared the global.
+2. **A slot-to-slot copy `b.p = a.p` aliases** (`ir_alias_slot_to_slot`, placed AFTER
+   G5 so a global target keeps the alias rather than G5's clear-on-untracked).
+3. **The bare assign spelling `h.p = alloc(T);`** — target a slot, not a local —
+   registers through `ir_register_alloc_result_compound` (BUG-981), the slot sibling
+   of BUG-933's `ir_register_alloc_result`. `ir_mark_local_escaped` now escapes EVERY
+   entry rooted at the local, so a returned / globally-stored struct takes its carried
+   allocations with it (was a false "never freed" for `H make(){ H h; h.p = alloc(T);
+   return h; }`).
+
+**A struct VALUE carries its compounds — ONE helper, `ir_carry_compounds` (BUG-983).**
+Four sites ask "what allocations does this struct value bring with it": `H b = a;`
+(IR_COPY, no prefix), `{ .inner = i }` (struct-init, prefix `.inner`), the nested
+literal `{ .inner = { .p = alloc(T) } }` (the inner temp's rows land under `.inner`),
+and `h.inner = i` / `g.inner = i` (field/index write, prefix = the target's key).
+Only the first existed, inline in IR_COPY; the other three looked for a BARE handle on
+the struct value, found none, and registered nothing. Two-pass (snapshot rows first —
+`ir_add_compound_handle` may realloc `ps->handles`), prefixed paths arena-allocated, a
+global src root never carried. Diagnostics name a global root by its key via
+`ir_root_display` (was `'?'`). Gate: **SHAPE p25 in `tools/sink_matrix.sh`** (spelling
+x root; verified to fire — 12 HOLEs + 1 OVER-REJECT on the pre-fix build).
+
 ### Argument-precise barrier (BUG-740, principle reused in BUG-741)
 
 Principle: **anything HANDED to an operation the analyzer can't resolve may

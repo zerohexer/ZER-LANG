@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// (from claude/loving-davinci-3sdup9, body verbatim; renumbered 975/976/977 -> 981/982/983)
+// BUG-981: an allocation stored straight into a field and never freed was not
+// a leak — nothing tracked it.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H h;
+    h.p = alloc(T);
+    return 0;
+}

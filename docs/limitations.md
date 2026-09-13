@@ -91,7 +91,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 62 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -147,7 +147,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 74 live), by class — and which branch to take
+### The 97 (now 62 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -178,11 +178,14 @@ Residual: one over-rejection, entered separately above (a plain struct nested pa
 cannot be copied). `3sdup9`'s "depth-guard ledger" OPEN entry is superseded — the
 enumeration was done on main and is recorded in BUGS-FIXED.md under BUG-976.
 
-**2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling. TAKE `3sdup9`.**
-An allocation stored into a field, index or slot loses tracking.
-`alloc_field_bare_spelling_uaf` `_leak` `_overwrite` `alloc_index_bare_spelling_uaf`
-`alloc_global_field_bare_spelling_dangling` `alloc_struct_value_into_slot_uaf`
-`alloc_nested_init_uaf` `alloc_nested_init_orelse_uaf` `slot_copy_alias_uaf` `slot_copy_alias_global_uaf`
+### ~~2. ALLOCATION "BARE SPELLING" FAMILY — 10, UAF / leak / dangling~~ — CLOSED 2026-09-13 as BUG-981/982/983
+
+`3sdup9`'s zercheck_ir.c hunks from `8b1227c9` applied verbatim (three mechanisms: the
+bare `slot = alloc(T)` spelling registers a compound; a GLOBAL projection is keyed by ONE
+query at every sink, not just the store; a struct VALUE carries its compounds through
+`ir_carry_compounds` at all four sites). Pre-fix the UAF RAN and returned a different
+live object's value (99). Gate: **SHAPE p25 in `tools/sink_matrix.sh`**. Also closed the
+two `global_projection_*` items of class 9 below (same mechanism).
 
 ### ~~3. `shared(rw)` RE-ENTRANCY — 6, data race~~ — CLOSED 2026-09-11 as BUG-980
 
@@ -224,11 +227,14 @@ in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 **8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
 `spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
 
-**9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7. TAKE `3sdup9`.**
+**9. VIEW OF A LOCAL / ~~GLOBAL PROJECTION~~ / OPTIONAL PARAM / UNION CAPTURE — 5 left of 7. TAKE `3sdup9`.**
 `view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
-`global_projection_reunwrap_uaf` `global_projection_free_then_read`
+~~`global_projection_reunwrap_uaf` `global_projection_free_then_read`~~ (closed 2026-09-13, BUG-982)
 `opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
 `union_capture_free_then_reread_uaf`
+The three view/union ones are `3sdup9` commit `d17f9417` (its BUG-981 — a pointer view of
+a local aggregate re-rooted onto the aggregate's own slots, `IRHandleInfo.view_root_local`;
+built ON TOP of `8b1227c9`, so apply after it). The two `opt_param_*` are its `92cc9dfd`.
 
 **10. SMALLER CLASSES**
 - i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
@@ -286,7 +292,7 @@ asm reproducer; skip the rest.
 
 ### Suggested order
 
-Segfault (done) → class 1 (done) → classes 3 and 6 (done) → class 2 (UAF/leak)
+Segfault (done) → class 1 (done) → classes 3 and 6 (done) → class 2 (done)
 → class 5 (forging doors) → the rest.
 
 ---

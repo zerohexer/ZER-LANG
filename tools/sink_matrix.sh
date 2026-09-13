@@ -500,6 +500,49 @@ cell p24_safe_int       compile 'u32 pk24f(?u32 o){ u32 v=o orelse return; retur
 cell p24_safe_opt_ptr   compile 'struct T24g{u32 v;} ?*T24g pk24g(?*T24g o){ *T24g t=o orelse return; return t; } u32 main(){ return 0; }'
 
 
+
+# ---------------------------------------------------------------------------
+# SHAPE p25 (BUG-981/982/983): AN ALLOCATION STORED INTO A SLOT — SPELLING x ROOT.
+#
+# "Which entry tracks this allocation?" has to give the SAME answer for every
+# spelling that stores it and every root the slot hangs off. It did not:
+#
+#   h.p = alloc(T);                 bare `=` into a field  -> tracked NOWHERE (BUG-981)
+#   h.p = alloc(T) orelse return;   the orelse spelling    -> tracked (through a temp)
+#   g.p = ...  /  free(g.p)         a GLOBAL root          -> registered at the store
+#                                    sink, resolvable at NO other sink (BUG-982)
+#   b.p = a.p;                      slot-to-slot copy      -> no alias (BUG-982)
+#   h.inner = i;  { .inner = i }    a struct VALUE         -> its compounds not
+#   { .inner = { .p = alloc(T) } }  carried (BUG-983)
+#
+# The consequence is a real UAF with an observable wrong value: pre-fix,
+# p25_slot_reuse compiled clean and RETURNED 99 — the stale field read the value of
+# a DIFFERENT live object that had been handed the recycled slot. ASan cannot see it
+# (`alloc(T)` is an auto-Slab; free() recycles rather than returning to libc).
+#
+# Each spelling that carries an allocation into a slot needs a cell HERE, crossed
+# with the root it can hang off (local struct field / local array index / global).
+echo "===== SHAPE p25 = an allocation stored into a slot (spelling x root) ====="
+cell p25_bare_field_uaf      reject 'struct T25{u32 v;} struct H25{?*T25 p;} u32 main(){ H25 h; h.p=alloc(T25); *T25 q=h.p orelse {return 1;}; free(q); *T25 r=h.p orelse {return 2;}; return r.v; }'
+cell p25_bare_field_leak     reject 'struct T25a{u32 v;} struct H25a{?*T25a p;} u32 main(){ H25a h; h.p=alloc(T25a); return 0; }'
+cell p25_bare_field_overwrite reject 'struct T25b{u32 v;} struct H25b{?*T25b p;} u32 main(){ H25b h; h.p=alloc(T25b); h.p=alloc(T25b); *T25b q=h.p orelse {return 1;}; free(q); return 0; }'
+cell p25_bare_index_uaf      reject 'struct T25c{u32 v;} u32 main(){ ?*T25c[2] arr; arr[0]=alloc(T25c); *T25c q=arr[0] orelse {return 1;}; free(q); *T25c r=arr[0] orelse {return 2;}; return r.v; }'
+cell p25_bare_global_dangling reject 'struct T25d{u32 v;} struct H25d{?*T25d p;} H25d g25d; u32 main(){ g25d.p=alloc(T25d); *T25d q=g25d.p orelse {return 1;}; free(q); return 0; }'
+cell p25_global_free_reread  reject 'struct T25e{u32 v;} struct H25e{*T25e p;} H25e g25e; u32 main(){ g25e.p=alloc(T25e) orelse {return 1;}; free(g25e.p); return g25e.p.v; }'
+cell p25_slot_copy_uaf       reject 'struct T25f{u32 v;} struct H25f{?*T25f p;} u32 main(){ H25f a; H25f b; a.p=alloc(T25f) orelse {return 1;}; b.p=a.p; *T25f q=a.p orelse {return 2;}; free(q); *T25f r=b.p orelse {return 3;}; return r.v; }'
+cell p25_slot_copy_global_uaf reject 'struct T25g{u32 v;} struct H25g{?*T25g p;} H25g g25g; u32 main(){ H25g a; a.p=alloc(T25g); g25g.p=a.p; *T25g q=a.p orelse {return 1;}; free(q); *T25g r=g25g.p orelse {return 2;}; return r.v; }'
+cell p25_struct_into_slot_uaf reject 'struct T25h{u32 v;} struct I25h{?*T25h p;} struct H25h{I25h inner;} u32 main(){ I25h i; i.p=alloc(T25h); H25h h; h.inner=i; *T25h q=h.inner.p orelse {return 1;}; free(q); *T25h r=i.p orelse {return 2;}; return r.v; }'
+cell p25_nested_init_uaf     reject 'struct T25i{u32 v;} struct I25i{?*T25i p;} struct H25i{I25i inner;} u32 main(){ H25i h={ .inner={ .p=alloc(T25i) } }; *T25i q=h.inner.p orelse {return 1;}; free(q); *T25i r=h.inner.p orelse {return 2;}; return r.v; }'
+cell p25_nested_init_orelse_uaf reject 'struct T25j{u32 v;} struct I25j{*T25j p;} struct H25j{I25j inner;} u32 main(){ H25j h={ .inner={ .p=alloc(T25j) orelse {return 1;} } }; free(h.inner.p); return h.inner.p.v; }'
+cell p25_slot_reuse          reject 'struct T25k{u32 v;} struct H25k{?*T25k p;} u32 main(){ H25k h; h.p=alloc(T25k); *T25k q=h.p orelse {return 1;}; q.v=7; free(q); *T25k o=alloc(T25k) orelse {return 2;}; o.v=99; *T25k r=h.p orelse {return 3;}; u32 seen=r.v; free(o); return seen; }'
+# BOUNDARY: every SAFE use of a slot-stored allocation must stay legal — the taught
+# `slot = null` reset after a free (local AND global root), re-filling after a free,
+# a returned struct carrying the allocation out (not a leak), a struct value placed
+# in an initializer and freed through the outer path (not a false leak of the inner).
+cell p25_safe_reset_refill   compile 'struct T25l{u32 v;} struct H25l{?*T25l p;} H25l g25l; u32 main(){ H25l h; h.p=alloc(T25l); *T25l q=h.p orelse {return 1;}; q.v=7; u32 v=q.v; free(q); h.p=null; g25l.p=alloc(T25l); *T25l gq=g25l.p orelse {return 2;}; free(gq); g25l.p=alloc(T25l); *T25l gr=g25l.p orelse {return 3;}; free(gr); g25l.p=null; return v-7; }'
+cell p25_safe_return_carries compile 'struct T25m{u32 v;} struct H25m{?*T25m p;} H25m mk25(){ H25m h; h.p=alloc(T25m); return h; } u32 main(){ H25m m=mk25(); *T25m q=m.p orelse {return 1;}; free(q); return 0; }'
+cell p25_safe_carry_free_outer compile 'struct T25n{u32 v;} struct I25n{?*T25n p;} struct H25n{I25n inner;} u32 main(){ I25n i={ .p=alloc(T25n) }; H25n h={ .inner=i }; *T25n q=h.inner.p orelse {return 1;}; q.v=2; u32 v=q.v; free(q); return v-2; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

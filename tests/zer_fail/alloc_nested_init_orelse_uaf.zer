@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// (from claude/loving-davinci-3sdup9, body verbatim; renumbered 975/976/977 -> 981/982/983)
+// BUG-983: the orelse spelling of the nested initializer — same hole.
+struct T { u32 v; }
+struct In { *T p; }
+struct H { In inner; }
+u32 main() {
+    H h = { .inner = { .p = alloc(T) orelse return } };
+    free(h.inner.p);
+    return h.inner.p.v;
+}

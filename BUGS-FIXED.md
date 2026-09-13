@@ -5,6 +5,82 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-981/982/983: an allocation stored into a SLOT was tracked nowhere (12 holes, one commit from `3sdup9`)
+
+Survey class 2 (10 reproducers) plus the two global-projection items of class 9, all
+from `claude/loving-davinci-3sdup9` commit `8b1227c9` — its zercheck_ir.c hunks applied
+verbatim (branch numbers 975/976/977 -> main 981/982/983; the same commit's checker.c and
+ir_lower.c halves are OTHER survey items and were not taken). All twelve compiled clean on
+main; all twelve now reject for their own reason. Adopted by MEASUREMENT, not by trust:
+every negative was run against a `git archive HEAD` build first (all accepted), the two
+positives were run on both builds, and the corpus was scanned under both binaries.
+
+**The UAF is real and observable.** Pre-fix, this compiled clean, RAN, and returned 99:
+
+    H h;  h.p = alloc(T);  *T q = h.p orelse return;  q.v = 7;  free(q);
+    *T other = alloc(T) orelse return;  other.v = 99;      // recycles the slot
+    *T r = h.p orelse return;  return r.v;                  // 99 — a DIFFERENT live object
+
+ASan cannot see it (`alloc(T)` is an auto-Slab; `free()` recycles rather than returning
+to libc) — which is why the demonstration has to be slot REUSE with a wrong value, the
+same device BUG-968 needed.
+
+### BUG-981 — the bare assign spelling into a slot registered nothing
+
+`h.p = alloc(T);` (an optional field keeping the optional result), `arr[0] = alloc(T);`,
+`g.p = alloc(T);` — BUG-933 registered the assign spelling against a BARE local target
+only (`ir_find_value_local` returns -1 for a projection), so an allocation stored
+straight into a field or element was tracked NOWHERE: no leak at exit, no overwrite
+report, and a free through the unwrapped local followed by a re-unwrap read freed
+memory. The sibling `h.p = alloc(T) orelse return;` WAS tracked (it lowers through a
+temp the field-write alias arm registers) — the two-spellings-of-one-program
+disagreement from CLAUDE.md's table, again. `ir_register_alloc_result_compound` is the
+slot sibling of `ir_register_alloc_result`, minting an alloc_id the existing unwrap /
+free-propagation / exit machinery then carries. `ir_mark_local_escaped` now escapes
+EVERY entry rooted at the local, so a returned struct takes its allocations with it
+(the old single-entry mark was a false "never freed" for `H make(){ h.p = alloc(T);
+return h; }`).
+
+### BUG-982 — a global projection was registered at the store sink and resolvable at no other
+
+G5 registered `(IR_GLOBAL_ROOT_ID, "g.p")` at the STORE, but `ir_extract_compound_key`
+returned "unkeyable" for a global root, so `free(g.p)` was an untracked free and `g.p.v`
+after it a silent UAF. The key is now ONE query, `ir_global_projection_key`, used by the
+extractor AND by G5 — so the entry the store writes is the entry every other sink finds.
+The `escaped` invariant on global entries moved into the CONSTRUCTOR, because ~30 callers
+can now create one. Three rules came with it: a plain `=` into a tracked slot is a RESET
+not a use (so the diagnostic's own prescription `g.p = null;` compiles); a slot-to-slot
+copy `b.p = a.p` ALIASES (the passthrough arm keyed on a bare-ident RHS only); and a
+global root is named in diagnostics instead of `'?'`.
+
+### BUG-983 — a struct VALUE carries its allocations at four sites and only one knew
+
+`H b = a;` replicated compound rows (inline in IR_COPY). `{ .inner = i }`,
+`{ .inner = { .p = alloc(T) } }` and `h.inner = i` each looked for a BARE handle on the
+struct value, found none, and registered nothing — so `h.inner.p` was untracked (the
+nested literal read freed memory after a free-then-re-unwrap; the struct-local forms
+reported the INNER variable as a leak after it had been freed through the OUTER path,
+which is a wrong diagnostic on a correct program). ONE helper, `ir_carry_compounds`,
+at all four.
+
+### Gate
+
+**SHAPE p25 in `tools/sink_matrix.sh`** — spelling x root, 12 reject cells + 3 boundary
+positives (reset-and-refill on local and global roots, a returned struct carrying its
+allocation, a carried struct freed through the outer path). Verified to FIRE: against
+the pre-fix build the matrix reports 12 HOLEs and 1 OVER-REJECT (the false inner-leak),
+and exits 1. Sink matrix 154 -> 169 cells.
+
+### Measurements
+
+- Corpus: 2353 files under both binaries, stderr compared for every handle diagnostic
+  (`use after free` / `never freed` / `overwritten while alive` / `left dangling` /
+  `use after move`). **Zero differences.**
+- `make check` exit 0 — nine gates, view-alias / shape / escape / keep matrices green.
+- The branch's harvesting trap did not bite this time, and it was checked: none of the
+  eight new helpers existed on main under any name (`grep` before the apply), and the
+  `IR_GLOBAL_ROOT_ID` definition moved rather than duplicated.
+
 ## Session 2026-09-11 — BUG-979/980: two concurrency rules that were exempting the thing they existed to catch
 
 Survey classes 6 (3 reproducers) and 3 (6 reproducers), both from

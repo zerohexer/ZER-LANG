@@ -75,6 +75,7 @@ u3  narrow = (u3)wide;   // C-style cast — truncates to 3 bits, so 4
 
 **NOTES**
 - Widths 1..128. Same no-implicit-narrowing rule as u8..u64 — narrow explicitly with either `@truncate(u21, big)` or a C-style cast `(u21)big`. Both wrap to N bits, not to the carrier width (BUG-946: `(u3)300` is 4, not 44).
+- A literal must FIT its target at every width, including 64 bits: `i64 x = 9223372036854775808;` (2^63) and `i64 y = -9223372036854775809;` are compile errors, exactly as `i8 z = 128;` is. The extremes `9223372036854775807` and `-9223372036854775808` are accepted.
 - Arithmetic on bare integer literals is `u32`, so `u21 x = 1000 + 500;` is rejected (u32→u21 narrowing). Write a fitting literal (`u21 x = 1500;`) or use `uN`-typed operands (`u21 a = 1000; u21 x = a + 500;` — this wraps at 2^N).
 - Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
 - A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.
@@ -1954,6 +1955,10 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
 ```zer
 @inttoptr(*u32, 0x12345678)        // COMPILE ERROR — no mmio range declared
 @inttoptr(*u32, 0x40020001)        // COMPILE ERROR — misaligned for u32
+@inttoptr(*State, 0x40020000)      // COMPILE ERROR — pointee carries an enum (or bool):
+                                   // the bits at a hardware address are not guaranteed
+                                   // to be a declared variant. Read a u32 and convert
+                                   // with @bitcast(State, *r), which is variant-checked.
 ```
 
 **NOTES**
@@ -2000,6 +2005,18 @@ remembers what type went in through `*opaque` round-trips.
 - `@ptrcast` between two DIFFERENT struct/union pointee types is a compile
   error — "type confusion — use @pun(...)". Identity casts,
   primitive byte-views (`*u32 → *u8`), and `*opaque` round-trips stay allowed.
+- A byte view NARROWS. The reverse — a target pointee LARGER than the source
+  (`@ptrcast(*u32, &u8_local)`) — is a compile error at all three pointer-cast
+  doors (`@ptrcast`, `@bitcast`, `@pun`): every dereference would read past the
+  source object. The ROUND-TRIP is tracked: `*u8 raw = @ptrcast(*u8, p)` with
+  `*u32 p` remembers that it views a `u32`, so `@ptrcast(*u32, raw)` (also
+  through an alias of `raw`) compiles — widening back to at most the object the
+  view was taken from. Widening past it (a `*u8` view of a `u16` cast to `*u32`)
+  is still the error.
+- A pointee that is an `enum` or a `bool` cannot be minted from a different
+  pointee type (`@ptrcast(*bool, u8ptr)`, `@ptrcast(*Color, u32ptr)`): a load
+  through it could be a value in no variant. Read the carrier and convert with
+  `@bitcast`, which is variant-checked.
 
 **SEE ALSO**
 *opaque, @pun, @container
@@ -2032,6 +2049,15 @@ type confusion before any memory read.
 - Compile-time: target must be a pointer, source must be a pointer,
   const stripping rejected, volatile stripping rejected.
 - Runtime: traps on type_id mismatch via `_zer_trap("@pun type mismatch")`.
+- Only struct / enum / union pointees carry a runtime `type_id`, so the trap can
+  fire only when BOTH pointees do. When it cannot (a primitive on either side) and
+  the target carries a pointer, slice, funcptr, enum, bool, optional or handle, the
+  pun is a **compile error** ("@pun cannot forge") — it would manufacture a value
+  the rest of the program trusts (an integer becoming a working pointer with no
+  `@inttoptr` and no `mmio`, an enum in no variant). `@pun(*u8, structptr)` — the
+  byte-view idiom into plain integers/floats — still compiles.
+- A pun that WIDENS the pointee (target larger than source) is a compile error:
+  it would read past the source object.
 - For raw byte access (parsing, serialization), use `[*]u8` slices —
   not pointer casting. Slices are bounds-checked, len-carrying, and the
   right tool for byte-level data.
@@ -2073,6 +2099,19 @@ struct Device { u32 id; ListHead list; }
 *ListHead ptr = &dev.list;
 *Device d = @container(*Device, ptr, list);   // OK
 ```
+
+**ERRORS**
+```zer
+ListHead standalone;
+*ListHead p2 = &standalone;
+*Device d2 = @container(*Device, p2, list);   // COMPILE ERROR — the pointer is the
+                                              // address of a WHOLE object, not of a
+                                              // field inside a Device: subtracting the
+                                              // field offset reads before the object
+```
+The provenance is tracked through aliases (`*ListHead p3 = p2;`), through a direct
+`&standalone` argument, and for array elements (`&arr[i]` is a whole object).
+A pointer of unknown provenance (a parameter, a cinclude result) is allowed.
 
 ---
 
@@ -3852,6 +3891,15 @@ is still a hard error when the index is provably out of range.
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
+A compound assignment decides exactly as its written-out binary form does. In
+particular an integer target with a float value (or the reverse) is a compile
+error — `x += f` is `x = x + f`, which "cannot mix integer and float":
+```zer
+u32 x = 5; f32 f = 1.5;
+x += (u32)f;               // OK — the cast saturates (see "(Type)expr")
+f += (f32)x;               // OK
+```
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8
@@ -3870,9 +3918,13 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- `ptr + n` — pointer arithmetic — index a `[*]T` slice instead
+- `a += f` mixing an integer and a float (either direction) — convert
+  explicitly: `a += (u32)f` saturates, `f += (f32)n` converts. The binary form
+  `a = a + f` was always rejected; the compound spelling now decides the same way.
+
+(`(T)x` value casts and `goto` ARE in ZER — see "C-style casts" and "goto".)
 
 ---
 
@@ -4092,7 +4144,8 @@ source.zer → Lexer → Parser → AST → Checker → ZER-CHECK → Emitter �
 shared struct Counter { u32 value; u32 total; }
 Counter g;
 g.value = 42;              // auto: lock → write → unlock
-g.total = g.value + 1;     // same lock scope (consecutive access grouped)
+g.total = g.value + 1;     // a SEPARATE lock scope — locking is per STATEMENT, not
+                           // grouped; the lock is released between the two lines
 ```
 - Copying a **whole shared struct by value** (`Counter c = g;`, an assignment, a
   return, or a by-value argument) is a compile error — the embedded lock would be
@@ -4370,7 +4423,7 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- No implicit int/float mixing (`a += f` is an error; cast explicitly)
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

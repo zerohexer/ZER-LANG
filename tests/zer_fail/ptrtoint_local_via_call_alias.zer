@@ -1,0 +1,10 @@
+// expect-error: cannot store result of call given @ptrtoint of a local
+// Same hole reached through an intermediate is_local_derived binding.
+usize g = 0;
+usize idfn(usize x) { return x; }
+u32 main() {
+    u32 local = 5;
+    usize a = @ptrtoint(&local);
+    g = idfn(a);
+    return 0;
+}

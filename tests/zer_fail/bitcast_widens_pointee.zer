@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: @bitcast widens the pointee
+// BUG-995, the @bitcast sibling of ptrcast_widens_pointee.zer.
+u32 main() { u16 small = 1; *u16 sp = &small; *u64 p = @bitcast(*u64, sp); return (u32)*p; }

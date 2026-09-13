@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: @ptrcast widens the pointee
+// BUG-995: the round-trip relaxation allows widening back to the ORIGIN object,
+// no further — this view was taken from a u16 and is widened to u32.
+u32 main() { u16 h = 7; *u8 v = @ptrcast(*u8, &h); *u32 w = @ptrcast(*u32, v); return *w; }

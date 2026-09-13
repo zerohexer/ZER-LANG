@@ -308,11 +308,39 @@ struct Symbol {
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */
     Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
+    /* BUG-995: the ORIGIN of a primitive byte view. `*u8 raw = @ptrcast(*u8, p)`
+     * with `*u32 p` records `*u32` here, so the round-trip `@ptrcast(*u32, raw)`
+     * — a WIDENING by static type — is allowed: it widens back to no more than
+     * the object the view was taken from. Rides aliases like provenance_type.
+     * NULL = not a byte view of anything known. Kept separate from
+     * provenance_type so the *opaque mismatch rule never sees it. */
+    Type *byteview_origin;
 
     /* @container provenance: tracks which struct+field this pointer points inside */
     Type *container_struct;          /* NULL = unknown */
     const char *container_field;
     uint32_t container_field_len;
+
+    /* BUG-984: the MISSING third state of @container provenance.
+     *
+     * The domain had exactly two elements — `container_struct != NULL` (this
+     * pointer came from `&outer.field`) and NULL, read as "unknown, cannot
+     * prove wrong, allow". But `*Inner ip = &i;` where `i` is a standalone
+     * `Inner` is not unknown: the compiler saw the address being formed and
+     * knows it points at a WHOLE object that is nobody's field. `@container`
+     * on it subtracts the field offset and hands back a pointer BEFORE the
+     * object — an out-of-bounds read with no diagnostic and no trap
+     * (ASan: stack-buffer-underflow / global-buffer-underflow).
+     *
+     * A missing abstract state that collapses a KNOWN-BAD case into "unknown"
+     * is the exact shape CLAUDE.md's MAX-oracle standard calls a soundness
+     * hole, so the state is now represented instead of inferred away.
+     *
+     * The two flags are MUTUALLY EXCLUSIVE and are maintained together at every
+     * site that writes either — see `set_container_prov_*` in checker.c. Keeping
+     * them as one pair with one writer is what stops the "set one, forget to
+     * clear the other" drift. */
+    bool is_whole_object_addr;       /* provably `&wholeObject`, never `&x.field` */
 
     /* for functions */
     bool is_function;
@@ -377,6 +405,13 @@ struct Symbol {
      * {false, 0} → the taint stays unless proven (no under-rejection, T4). */
     bool ret_summary_complete;
     uint64_t ret_param_mask;
+    /* BUG-987: bit n set iff some return path returns the ADDRESS of (a view of)
+     * parameter n as an INTEGER — `return @ptrtoint(p)`, or that laundered
+     * through a local. Separate from ret_param_mask, which also carries scalar
+     * field READS (`return t.id`) and is only stored for pointer-returning
+     * functions; this one is stored for every function with a body. A set bit is
+     * a positive fact, so it needs no "complete" flag. */
+    uint64_t ret_addr_param_mask;
     /* BUG-801: bit n set iff this function performs a NON-ATOMIC read-modify-write
      * through pointer parameter n (directly or transitively). Memoised, exactly like
      * ret_param_mask above — the naive alternative (re-walking every callee body per

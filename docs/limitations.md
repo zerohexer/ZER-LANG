@@ -203,11 +203,15 @@ entered separately above.
 `loop_counter_past_end` `_off_by_one` `_past_end_field` `_step_overshoot` `_while_past_end`
 `_dowhile_past_end` `dowhile_counter_past_end_bug748`
 
-**5. FORGING DOORS — 11. TAKE `qo0mm9`** (forked 2 days later than `vgonmt`; both have these
-22 shared cells, compare per item at adoption).
-`@pun` (4): `pun_forge_enum` `_slice` `_funcptr` `_pointer`
-`@inttoptr` → enum (2): `inttoptr_enum_target` `inttoptr_enum_in_struct`
-`@container` (5): `container_whole_object` `_alias` `_direct` `_global` `container_array_element`
+### ~~5. FORGING DOORS — 11~~ — CLOSED 2026-09-13 as BUG-982/983/984 (+ BUG-985 bool, BUG-995 widening)
+
+All 11 adopted from `qo0mm9` as filtered checker hunks (`afcc7ee`), plus `vgonmt`'s bool
+minting pair and a hole found on top: `@ptrcast(*u32, &u8_local)` — the door that
+DOCUMENTS the byte view as allowed — had no widening check at all (`@pun` had BH-18 #4),
+so it read three bytes past a one-byte stack object. One helper `reject_pointee_widening`
+at all three pointer-cast doors now. Residual over-rejection: none measured (corpus cost
+of the three forge rules was ZERO across tests/zer, test_modules, rust_tests, zig_tests,
+lib, examples).
 
 ### ~~6. ATOMIC CELL x SCOPED SPAWN — 3, race window~~ — CLOSED 2026-09-11 as BUG-979
 
@@ -218,11 +222,27 @@ spelling. The flag is now REFCOUNTED: the join closes the window, but only the l
 one, and never when a fire-and-forget spawn also ran. Gate: the CONCURRENT-WINDOW GRID
 in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 
-**7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4, escape. TAKE `qo0mm9`** (has the 4th).
-`ptrtoint_local_via_call_alias` `_global` `_return` `_ptr_param`
+### ~~7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4~~ — CLOSED 2026-09-13 as BUG-987
 
-**8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
-`spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
+`vgonmt`'s address-valued-integer-argument rule covered three; the fourth (`_ptr_param`,
+the callee itself does the `@ptrtoint`) needed a NEW per-function summary
+`Symbol.ret_addr_param_mask` rather than a widening of the view mask — the view mask
+also carries scalar field READS (`return t.id`), so keying the integer sink on it would
+have rejected `g_len = len_of(local_slice)`. Bodyless externs have no summary, so
+`g = strlen(&buf)` is the C-FFI floor and still compiles.
+
+**Residual over-rejection (pre-existing, measured on the baseline too):** `usize f(*S p)
+{ return @ptrtoint(&p.b); }` is rejected as "cannot return @ptrtoint of local 'p'" —
+`p` is a POINTER PARAM, so `&p.b` is the caller's memory and returning its address is
+as safe as returning `&p.b` itself (BUG-764). The return-site @ptrtoint rule predates the
+BUG-764 relaxation and tests the wrong predicate (it should ask `value_frame_bound_symbol`,
+not "is the root a non-global"). Fix sketch: route that sink through the same
+frame-bound query the pointer return uses. Low priority — the diagnostic is loud.
+
+### ~~8. FACTORY REACH through switch / do-while — 3~~ — CLOSED 2026-09-13 as BUG-993
+
+Both funcname walkers are exhaustive switches now; +4 REACH / +2 ISR cells in
+`tests/test_conc_matrix.c`.
 
 **9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7. TAKE `3sdup9`.**
 `view_of_local_copy_uaf` `view_of_local_store_then_read_via_local_uaf`
@@ -230,22 +250,42 @@ in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 `opt_param_capture_form_stays_maybe` `opt_param_drop_then_caller_double_free`
 `union_capture_free_then_reread_uaf`
 
-**10. SMALLER CLASSES**
-- i64 literal range (3) — TAKE `vgonmt` (`i64_literal_above_max` `_below_min` `_over_range_sinks`); `qo0mm9`'s weaker pair is `i64_literal_overflow` + `i64_negative_literal_overflow`
-- `bool` minting via `@ptrcast`/`@inttoptr` (2) — `vgonmt`: `bool_mint_ptrcast` `bool_mint_inttoptr`
-- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s `mmio_volatile_index_reject`
-- global init (2) — `qo0mm9`: `global_init_from_mutable` `global_init_chain_too_deep`
-- multiview UAF (2) — `vgonmt`: `multiview_assign_uaf` `multiview_branch_join_uaf`
-- struct-init field (2) — `vgonmt`: `struct_init_field_uaf` `struct_init_field_move`
-- compound float↔int (2) — TAKE `vgonmt`: `compound_float_into_int` `compound_int_into_float`; `qo0mm9`'s single is `compound_assign_int_float`
-- RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init`
-- `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target`
-- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding`
-- ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements`
-- param-local double free (1) — `vgonmt`: `param_local0_double_free`
-- spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown`
-- defer body with a label (1) — `qo0mm9`: `defer_body_label` (**relevant to main's own label-path
-  split, BUG-965 — check whether it is the same shape before fixing**)
+**10. SMALLER CLASSES** (status 2026-09-13 — each was re-run against this tree before deciding)
+- ~~i64 literal range (3+2)~~ — CLOSED as BUG-988 (both branches' sets adopted; they are
+  different boundaries: 2^64-1 vs exactly 2^63)
+- ~~`bool` minting via `@ptrcast`/`@inttoptr` (2)~~ — CLOSED as BUG-985 / BUG-983
+- MMIO const-ident (2) — `qo0mm9`: `mmio_const_ident_oob_addr` `_misaligned`; plus `ppnatu`'s
+  `mmio_volatile_index_reject`. **STILL OPEN but LOUD:** both trap at runtime
+  ("@inttoptr: address outside mmio range" / "unaligned address", exit 133). The branch's
+  fix folds `const` identifiers at the four `@inttoptr` const-address sites
+  (`mmio_const_addr` → `eval_const_expr_scoped`) so the error moves to compile time and
+  `r[i]` gains a bound. Precision, not soundness.
+- global init (2) — `qo0mm9`: `global_init_from_mutable` (STILL OPEN, loud: GCC error
+  "initializer element is not constant" naming generated C) and
+  `global_init_chain_too_deep` (already rejected on main by BUG-975's chain bound)
+- ~~multiview UAF (2)~~ — CLOSED as BUG-989
+- ~~struct-init field (2)~~ — CLOSED as BUG-991
+- ~~compound float↔int (2+1)~~ — CLOSED as BUG-986
+- RMW via struct-init (2) — `v6o9c5`: `isr_rmw_via_struct_init` `spawn_rmw_via_struct_init` (not re-measured this session)
+- `@bitcast` array target miscompile (1) — `v6o9c5`: `bitcast_array_target` (not re-measured)
+- funcptr-binding alias survival (1) — `v6o9c5`: `spawn_rmw_alias_survives_funcptr_binding` (not re-measured)
+- ISR RMW split across statements (1) — `vgonmt`: `isr_rmw_split_statements` — **DELIBERATELY
+  NOT ADOPTED (design question).** `u32 t = g; g = t + 1;` IS a lost-update window against an
+  ISR, but the compiler's own RMW diagnostic tells the user to "use an explicit
+  read/mask/write or @atomic_*" — the branch's rule would reject the very remedy the
+  compiler prints. Either the remedy wording must change (the honest advice is `@critical`
+  or `@atomic_*`) or the rule must stay as is. Decide before implementing.
+- ~~param-local double free (1)~~ — CLOSED as BUG-990
+- spawn borrow, two unknown roots (1) — `qo0mm9`: `spawn_borrow_two_roots_unknown` —
+  **NOT A HOLE on main**: the race variant (`x = 7` between spawn and join, with a carrier
+  holding `&v` and `&x`) is rejected ("cannot write to 'x' while it is borrowed"). The
+  branch's "cannot resolve" rejection is unnecessary here.
+- defer body with a label (1) — `qo0mm9`: `defer_body_label` — STILL OPEN but LOUD: it
+  compiles and then TRAPS at runtime ("compiler bug: unsupported stmt kind in defer") — the
+  BUG-965 "bodies on neither path" hazard: the label puts the function on the AST defer
+  path (`defers_stay_on_ast`), whose statement emitter has no NODE_LABEL arm. A `goto` is
+  already banned inside a defer body, so a label there is useless; reject it at the checker
+  ("cannot place a label inside a defer body").
 - asm operand shared read (1) — `qo0mm9` `asm_operand_shared_read` / `ppnatu` `asm_shared_operand`.
   **ALREADY an OPEN entry in main** ("a `shared struct` read in an ASM OPERAND takes NO LOCK") —
   these are its reproducers.

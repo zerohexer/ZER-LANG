@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement
+// BUG-981: the per-function RMW summary (what a MAIN-side `bump(&counter, 0)` is
+// attributed through) did not descend into switch arms, so an RMW through the
+// param inside one set no bit and "shared between interrupt and main" never fired.
+volatile u32 counter;
+void bump(volatile *u32 p, u32 k) {
+    switch (k) {
+        0 => { *p += 1; }
+        default => { }
+    }
+}
+interrupt TIM2 { counter = 1; }
+u32 main() { bump(&counter, 0); return 0; }

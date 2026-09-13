@@ -100,10 +100,12 @@ a2d212648a84bea1  reference.md:3116
 234f52e2805d4d61  reference.md:3277
 af4c920a8953b104  reference.md:3316
 394fdfac3247114c  reference.md:3363
-e246a3334d5820c5  reference.md:3447
 d54d84941e077f48  reference.md:3465
 01adc7b7eff191c4  reference.md:3552
 22e9fa9c766877a3  reference.md:3578
 40b2571e361cc858  reference.md:3593
 95f5145d30a07c57  reference.md:3602
 fdba85d6406e565e  reference.md:3618
+# 2026-09-13: the shared-struct fragment (statements at file scope, illustrating the
+# per-statement lock scope — re-hashed after the wording fix, BUG-981 session)
+06aeb00db7489028  reference.md:4144

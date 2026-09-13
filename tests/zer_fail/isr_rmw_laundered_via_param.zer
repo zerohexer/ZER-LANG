@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement
+// BUG-981, ISR sink: the helper launders the read of `*p` through a call before
+// storing back through the same pointer — an RMW the param-summary walker missed.
+volatile u32 counter;
+u32 idfn(u32 x) { return x; }
+void bump(volatile *u32 p) { *p = idfn(*p) + 1; }
+interrupt TIM2 { bump(&counter); }
+u32 main() { counter = 5; return 0; }

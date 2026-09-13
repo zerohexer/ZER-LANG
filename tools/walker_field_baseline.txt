@@ -45,6 +45,155 @@
 #     the AST safety walkers".
 #
 
+# --- checker.c: expr_reads_place ---
+#   An EXPRESSION walker (BUG-981: "does this expression read a place?"). The four
+#   top-level declaration kinds are listed only so -Werror=switch keeps the switch
+#   exhaustive; a file, a function declaration, an interrupt block or a global
+#   declaration can never be a subexpression of an assignment's value, so their
+#   bodies/initializers are not places this expression reads.
+checker.c:expr_reads_place:NODE_FILE:file.decls
+checker.c:expr_reads_place:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_reads_place:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_reads_place:NODE_INTERRUPT:interrupt.body
+
+# --- checker.c: expr_touches_local_derived ---
+#   An EXPRESSION walker: "may this VALUE carry a pointer into the frame, through an
+#   arithmetic/cast/call chain?" (BUG-987 made it a no-default exhaustive switch —
+#   NODE_CALL used to fall into a `default: return false` whose own comment called
+#   that a safety hole). Statement kinds are listed only for -Werror=switch
+#   totality: a statement produces NO value, so nothing flows out of it into the
+#   sink being checked. The one way a statement reaches this walker is as an
+#   `orelse { … }` BLOCK fallback, and a block fallback yields no value — it exits
+#   (return/break/continue) or falls through to the tried expression's unwrapped
+#   value, which the NODE_ORELSE arm already walks. A nested assignment's VALUE is
+#   walked; its TARGET is where the value goes, not what flows. Top-level
+#   declarations cannot occur inside an expression.
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.inputs
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.outputs
+checker.c:expr_touches_local_derived:NODE_ASSIGN:assign.target
+checker.c:expr_touches_local_derived:NODE_AWAIT:await_stmt.cond
+checker.c:expr_touches_local_derived:NODE_BLOCK:block.stmts
+checker.c:expr_touches_local_derived:NODE_CRITICAL:critical.body
+checker.c:expr_touches_local_derived:NODE_DEFER:defer.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_touches_local_derived:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_touches_local_derived:NODE_FILE:file.decls
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.body
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.cond
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.init
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.step
+checker.c:expr_touches_local_derived:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_touches_local_derived:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.cond
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.else_body
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.then_body
+checker.c:expr_touches_local_derived:NODE_INTERRUPT:interrupt.body
+checker.c:expr_touches_local_derived:NODE_ONCE:once.body
+checker.c:expr_touches_local_derived:NODE_RETURN:ret.expr
+checker.c:expr_touches_local_derived:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_touches_local_derived:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_touches_local_derived:NODE_VAR_DECL:var_decl.init
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.cond
+
+# --- checker.c: scan_returned_funcname ---
+#   Asks "does this BODY contain `return <funcname>`?" (the funcptr REACH factory
+#   form, BUG-993 made it a no-default exhaustive switch). Only a statement BODY can
+#   contain a return statement; conditions, steps, arguments, operands and every
+#   other expression cannot — an `orelse return` inside one is a BARE return that
+#   carries no value, so no funcname can be returned through it. Top-level
+#   declarations never appear inside a body. Listed for -Werror=switch totality.
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:scan_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:scan_returned_funcname:NODE_BINARY:binary.left
+checker.c:scan_returned_funcname:NODE_BINARY:binary.right
+checker.c:scan_returned_funcname:NODE_CALL:call.args
+checker.c:scan_returned_funcname:NODE_CALL:call.callee
+checker.c:scan_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:scan_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:scan_returned_funcname:NODE_FIELD:field.object
+checker.c:scan_returned_funcname:NODE_FILE:file.decls
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:scan_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:scan_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:scan_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:scan_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:scan_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:scan_returned_funcname:NODE_RETURN:ret.expr
+checker.c:scan_returned_funcname:NODE_SLICE:slice.end
+checker.c:scan_returned_funcname:NODE_SLICE:slice.object
+checker.c:scan_returned_funcname:NODE_SLICE:slice.start
+checker.c:scan_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:scan_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:scan_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:scan_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:scan_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:scan_returned_funcname:NODE_UNARY:unary.operand
+checker.c:scan_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:scan_returned_funcname:NODE_WHILE:while_stmt.cond
+
+# --- checker.c: record_isr_returned_funcname ---
+#   The ISR sibling of scan_returned_funcname — same question, same reasoning, same
+#   rows (BUG-993). The two sinks are kept as mirror images on purpose.
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:record_isr_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.left
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.right
+checker.c:record_isr_returned_funcname:NODE_CALL:call.args
+checker.c:record_isr_returned_funcname:NODE_CALL:call.callee
+checker.c:record_isr_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_FIELD:field.object
+checker.c:record_isr_returned_funcname:NODE_FILE:file.decls
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:record_isr_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:record_isr_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:record_isr_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:record_isr_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.end
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.object
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.start
+checker.c:record_isr_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:record_isr_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:record_isr_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:record_isr_returned_funcname:NODE_UNARY:unary.operand
+checker.c:record_isr_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_WHILE:while_stmt.cond
+
+# --- checker.c: vrp_widen_loop_addr_taken ---
+#   A loop-BODY walker looking for `&x` (BUG-994 made it exhaustive). The four
+#   top-level declaration kinds cannot occur inside a loop body; a static_assert
+#   condition is a compile-time constant expression and cannot take an address.
+checker.c:vrp_widen_loop_addr_taken:NODE_FILE:file.decls
+checker.c:vrp_widen_loop_addr_taken:NODE_FUNC_DECL:func_decl.body
+checker.c:vrp_widen_loop_addr_taken:NODE_GLOBAL_VAR:var_decl.init
+checker.c:vrp_widen_loop_addr_taken:NODE_INTERRUPT:interrupt.body
+checker.c:vrp_widen_loop_addr_taken:NODE_STATIC_ASSERT:static_assert_stmt.cond
+
 # --- checker.c: all_paths_return ---
 #   Loop CONDITIONS carry no `return`. (`while (m() orelse return)` makes SOME
 #   path return, never all of them, so ignoring it is the conservative answer
@@ -415,14 +564,10 @@ checker.c:validate_gotos:NODE_VAR_DECL:var_decl.init
 checker.c:validate_gotos:NODE_WHILE:while_stmt.cond
 
 # --- checker.c: vrp_invalidate_loop_body_writes ---
-checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.inputs
-checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.outputs
-checker.c:vrp_invalidate_loop_body_writes:NODE_AWAIT:await_stmt.cond
 checker.c:vrp_invalidate_loop_body_writes:NODE_FILE:file.decls
 checker.c:vrp_invalidate_loop_body_writes:NODE_FUNC_DECL:func_decl.body
 checker.c:vrp_invalidate_loop_body_writes:NODE_GLOBAL_VAR:var_decl.init
 checker.c:vrp_invalidate_loop_body_writes:NODE_INTERRUPT:interrupt.body
-checker.c:vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args
 checker.c:vrp_invalidate_loop_body_writes:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 

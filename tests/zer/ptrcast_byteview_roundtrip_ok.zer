@@ -1,0 +1,15 @@
+// BUG-995 boundary: a byte view widened BACK to the object it was taken from is
+// tracked (Symbol.byteview_origin), not banned — the static `*u8` of `raw` is not
+// the whole truth. Through an alias too.
+u32 main() {
+    u32 x = 42;
+    *u32 p = &x;
+    *u8 raw = @ptrcast(*u8, p);
+    *u8 raw2 = raw;
+    *u32 back = @ptrcast(*u32, raw2);
+    u16 h = 7;
+    *u8 hv = @ptrcast(*u8, &h);
+    *u16 hb = @bitcast(*u16, hv);
+    if (*hb != 7) { return 1; }
+    return *back - 42;
+}

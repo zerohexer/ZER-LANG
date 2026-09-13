@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'counter'
+// BUG-981: the target is the global BY NAME and the read goes through the alias —
+// `counter = *p + 1`. The reverse mix (`*p = counter + 1`) was already rejected
+// because the value happened to contain the name; this one contains `p`.
+volatile u32 counter;
+void worker() { volatile *u32 p = &counter; counter = *p + 1; }
+u32 main() { spawn worker(); counter = 5; return 0; }

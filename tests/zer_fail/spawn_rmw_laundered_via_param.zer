@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'counter'
+// BUG-981: BUG-856 taught the GLOBAL-name walker about @intrinsic / call / orelse
+// laundering of the read; the PARAM-name walker used by the per-function RMW
+// summary never got those arms, so `*p = @truncate(u32, *p) + 1` in a helper set
+// no rmw bit and the race through it compiled at both sinks.
+volatile u32 counter;
+void bump(volatile *u32 p) { *p = @truncate(u32, *p) + 1; }
+void worker() { bump(&counter); }
+u32 main() { spawn worker(); counter = 5; return 0; }

@@ -5,6 +5,104 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-981: the two halves of one statement were judged by different rules
+
+### BUG-981 — a written-out RMW through an alias was a "plain store" at every sink
+
+The non-atomic read-modify-write rule (spawn sink, ISR sink, and the main-side site)
+asks one question of an assignment: *is the RHS a read of the target?* BUG-792 taught
+the TARGET side to resolve `*p` / `p.f` / `p[i]` through the alias table to the global
+the write lands on. The VALUE side kept comparing identifier NAMES against the global:
+
+    volatile *u32 p = &counter;
+    *p += 1;            // target -> counter                          REJECTED
+    *p = *p + 1;        // target -> counter; value names `p`, not `counter`  ACCEPTED
+    counter = *p + 1;   // same                                           ACCEPTED
+
+Measured on the pre-fix build, 22 spellings across the three sites: **10 accepted**, all
+the same load / add / store the compound spelling was TSan-confirmed racing for. The
+accepted set was every written-out form reached through an alias — a local pointer, a
+pointer param (`bump(&counter)` with `*p = *p + 1` in the helper), and the mixed
+`counter = *p + 1` — at the spawn sink, the ISR sink and the main-side site alike.
+
+A second, sibling defect in the same predicate family: the per-function RMW summary
+(`rmw_scan_body`, what a main-side `bump(&g)` is attributed through) used its OWN
+name walker, `expr_mentions_name`, which never received BUG-856's `@intrinsic` /
+call / `orelse` / slice arms. So `*p = @truncate(u32, *p) + 1` in a helper set no rmw
+bit and compiled at both sinks. Its descent also skipped `switch` arms and `@once`.
+
+**Fix — ONE walker, `expr_reads_place`, exhaustive over `NodeKind`** (no `default:`, so
+a new kind fails the build under `-Werror=switch` — the old if-chains structurally could
+not be gated, and the BUG-856 comment had recorded exactly that blind spot). It hands
+every PLACE (ident / field / index / slice / deref) to a predicate and then descends
+into the place's own sub-reads. Two predicates:
+
+- `place_is_global` — a bare ident naming the global (the old test, kept: a bare
+  pointer ident reads the POINTER) **or a deref/field/index/slice whose referent
+  `resolve_write_target_global` lands on it**. The value side now asks the same
+  question, through the same resolver, as the target side.
+- `place_rooted_at_ident` — for the param summary: the place is rooted at the same
+  param the target is written through.
+
+Verified: the 10 accepted cells reject; the 12 already-rejected cells are unchanged;
+the positive corpus (tests/zer, test_modules, rust_tests, zig_tests, lib, examples)
+produces no new RMW diagnostic. Gate: **four new columns in the RMW FORM grid**
+(`tests/test_hw_matrix.c`: `local *p=*p+1`, `param *p=*p+1`, `param *p=@tr(*p)+1`,
+`local g=*p+1`) — run against the pre-fix build it reports **7 false negatives**
+(the ISR `param *p=*p+1` cell was already caught by the ISR scan's transitive param
+binding), clean after. Negatives: `tests/zer_fail/{spawn,isr,main}_rmw_written_out_via_local_alias.zer`,
+`spawn_rmw_written_out_via_param.zer`, `{spawn,isr}_rmw_laundered_via_param.zer`,
+`spawn_rmw_mixed_spelling.zer`, `isr_rmw_in_switch_arm_via_param.zer`.
+
+**The generalisable lesson:** when a rule compares TWO sides of one statement, both
+sides must go through the same resolver. BUG-792 upgraded one side from "name" to
+"referent" and left the other on "name"; the mismatch is invisible to any test that
+spells both sides the same way (`g = g + 1`, `*p += 1`), which is all the grid had.
+The cell that finds it crosses the SPELLING axis with the REACH axis.
+
+### BUG-982..994 — thirteen holes harvested from `loving-davinci-{qo0mm9,vgonmt}`
+
+The ledger in `docs/limitations.md` listed 74 live reproducers on those two branches. All
+of them were re-run against this tree FIRST (the measure-first protocol): 41 still
+compiled clean. The thirteen classes below were adopted as filtered hunks
+(`patch --fuzz=3` of the branch's checker/zercheck_ir diff, never the whole commit — the
+commits also carried an emitter cast refactor, a float-literal audit and refactor L/M
+redo's this tree already has), every negative measured ACCEPT before and REJECT-for-the-
+stated-reason after, every positive run. Branch numbers were renumbered on adoption
+(theirs ran to BUG-1003 and collided with this tree's BUG-979..981).
+
+| # | hole (all measured accepted pre-fix) | rule now | tests |
+|---|---|---|---|
+| **BUG-982** | `@pun(*P, u64ptr)` with `struct P { *u32 p; }` — an integer became a working pointer with no `@inttoptr` and no `mmio`; same with an enum (a value in no variant DISPATCHES to the last switch arm), a `bool` holding 200, a funcptr called. The emitted trap is `type_id != TGT && type_id != 0` and a primitive pointee packs 0, so the advertised runtime check could not fire | `type_carries_forgeable` (exhaustive TypeKind switch) × `pun_type_id_check_can_fire`: reject when the trap cannot fire, the pointees differ and the target carries a pointer/slice/funcptr/enum/bool/optional/handle. `@pun(*u8, structptr)` still compiles | `pun_forge_{enum,funcptr,pointer,slice}.zer`, `tests/zer/pun_no_invariant_ok.zer` |
+| **BUG-983** | `volatile *State reg = @inttoptr(*State, addr); switch (*reg)` — a fourth enum-forging door: a LOAD is not a conversion, so none of the three guarded doors sees it, and exhaustive-enum lowering emits the last arm unconditionally (measured: register 200 returned 3). Same through a struct field | rejected at the mint via `type_carries_enum_c` / `type_carries_bool_c`; the idiom is `@inttoptr(*u32, …)` then `@bitcast(State, *r)`, which IS guarded. Kept the guarded door set at three instead of adding a per-read guard surface | `inttoptr_enum_{target,in_struct}.zer`, `bool_mint_inttoptr.zer`, `tests/zer_trap/mmio_enum_via_bitcast_trap.zer` |
+| **BUG-984** | `*Inner ip = &i; @container(*Outer, ip, in)` where `i` is a standalone `Inner` — subtracts the field offset and reads BEFORE the object (ASan stack/global-buffer-underflow). The provenance domain had two states (from-`&outer.field`, unknown) and collapsed the KNOWN-BAD whole-object case into "unknown, allow" | third state `Symbol.is_whole_object_addr`, one classifier `classify_amp_operand` (`&x` / `&arr[i]` = WHOLE, `&x.f` = FIELD) at the var-decl sink, the assignment sink, the alias copy AND a direct `&i` argument (which the old check skipped entirely — it tested `kind == NODE_IDENT`) | `container_whole_object{,_alias,_direct,_global}.zer`, `container_array_element.zer`, `tests/zer/container_field_prov_ok.zer` |
+| **BUG-985** | `@ptrcast(*bool, u8ptr)` minted a `*bool` whose load was 2 — `b == true` and `b == false` BOTH false (exit 3). BUG-928 closed the enum pointee and left the other constrained type | fires when either pointee is enum or bool and the pointees differ | `bool_mint_ptrcast.zer` |
+| **BUG-986** | `a += f` (u32 a, f32 f) compiled — the compound spelling of a mix the binary form `a = a + f` refuses. It saturates today (the emitter routes it through the BUG-883 guard), but two spellings of one operation must decide alike, and `f += n` silently converts | compound arm applies the binary rule: integer/float mix is an error, both directions | `compound_{float_into_int,int_into_float}.zer`, `tests/zer/compound_assign_same_domain_ok.zer` |
+| **BUG-987** | `g = idfn(@ptrtoint(&local))`, `return idfn(@ptrtoint(&local))`, and `g = leak(&local)` with `usize leak(*u32 p){ return @ptrtoint(p); }` — a frame address laundered through a CALL as an INTEGER escaped, while every non-call spelling (`g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a`, orelse) was rejected. The call-result sinks are gated on `type_carries_data_pointer`, false for `usize`, and `expr_touches_local_derived` answered "no" for NODE_CALL through a `default:` whose own comment called that a safety hole | `call_result_is_local_address_int` at the assignment and return sinks: arm 1 keys on an ADDRESS-VALUED integer argument (so `g_len = len_of(local_slice)` still compiles); arm 2 is a NEW per-function summary `Symbol.ret_addr_param_mask` (bit n: a return is `@ptrtoint` of a view of param n, under casts or laundered through a local) crossed with a local-derived pointer argument. A bodyless extern has no summary, so `g = strlen(&buf)` keeps compiling (C-FFI floor). `expr_touches_local_derived` is now an exhaustive switch. `classify_return_root` also peels launders via the shared `unwrap_ptr_launder`, so `return @ptrcast(*u32, p)` is ARParam(0) rather than UNKNOWN | `ptrtoint_local_via_call_{alias,global,return,ptr_param}.zer`, `tests/zer/ptrtoint_call_boundary_ok.zer` |
+| **BUG-988** | `i64 x = 18446744073709551615;` became -1, `i64 v = 9223372036854775808;` became INT64_MIN, `-18446744073709551615` became 1 — `is_literal_compatible` said `return true` for i64 and `iN` at exactly 64 bits while every narrower width bounded the literal | bounded at INT64_MAX / INT64_MAX+1 (the negative magnitude), both arms | `i64_literal_{above_max,below_min,over_range_sinks,overflow}.zer`, `i64_negative_literal_overflow.zer`, `tests/zer/{int_literal_signed_bounds_ok,i64_literal_boundary_ok}.zer` |
+| **BUG-989** | multi-view call result (`h = pick(x, y, fl)` where every return of `pick` is a view of a DIFFERENT param) registered its view set only at the var-decl sink; the assignment spelling recorded nothing, and `ir_merge_states` copied `view_alloc_ids` from ONE predecessor, so a join erased the sets — `free(y); h[0]` read freed slab memory in both shapes | one `ir_fill_multiview_set` at both sinks; the merge is a UNION with the overflow flag ORed (a view set is a MAY-alias fact) | `multiview_{assign,branch_join}_uaf.zer` |
+| **BUG-990** | `alloc_id` 0 is the "untracked" sentinel AND was a legal id minted from local 0, so whichever handle landed on local 0 stopped propagating frees to its aliases. Measured: `void f(Holder hd){ Handle k = hd.h; free(k); free(hd.h); }` compiled clean, and the SAME body with a `u32 pad` param ahead of `hd` was rejected — a double free decided by parameter position | `ir_alloc_id_of_local` (id + 1) at every minting site; ids are only ever compared for equality | `param_local0_double_free.zer` |
+| **BUG-991** | `Holder h = { .t = t };` after `free_ptr(t)` — `IR_STRUCT_INIT_DECOMP` was the only value-consuming opcode that never ran the UAF / wrong-pool walkers, and it never reached `ir_mark_transferred`, so a move struct handed to a designated initializer stayed usable | both walkers run over the initializer; each move-tracked field value is transferred like every other consume sink | `struct_init_field_{uaf,move}.zer` |
+| **BUG-992** | (latent) the leak-report sites indexed `func->locals[h->local_id]` with no bounds check; `local_id` is legally `IR_GLOBAL_ROOT_ID` (-2) and only a convention kept those out | an explicit range check | — |
+| **BUG-993** | a factory returning a racing callback from a `switch` arm or a `do-while` body reached a spawned thread and an ISR undetected — `scan_returned_funcname` was an if-chain over five kinds and its ISR sibling covered do-while but not switch (the two sinks had drifted by one kind) | both are no-`default:` exhaustive switches; `+4` REACH and `+2` ISR cells in `tests/test_conc_matrix.c` | `spawn_race_factory_{switch,dowhile}.zer`, `isr_race_factory_switch.zer` |
+| **BUG-994** | `&x` in a SPAWN argument (also an `await` condition and asm operands) did not widen the loop range — `vrp_widen_loop_addr_taken` and `vrp_invalidate_loop_body_writes` listed NODE_SPAWN/AWAIT/ASM as leaves. Measured: the guard on `arr[idx]` was ELIDED and `arr[100] = 7` written to a 4-byte stack array | both walkers descend the three kinds' expressions (over-widening only ever ADDS a guard) | `tests/zer/vrp_loop_addr_taken_spawn.zer` |
+| **BUG-995** (found on top, this session) | `u8 small = 1; *u32 p = @ptrcast(*u32, &small); return *p;` compiled and RAN (exit 1) — three bytes read past a one-byte stack object; a write through `p` corrupts the frame, silently on bare metal. `@pun` had the widening test (BH-18 #4); `@ptrcast` — the door whose comment DOCUMENTS the primitive byte-view as allowed — and `@bitcast` had no sibling. The byte view NARROWS; nobody had written down that the reverse direction is a different question | ONE helper `reject_pointee_widening` at `@ptrcast` and `@bitcast` (both pointees concrete with known sizes, target larger → error; *opaque / unknown keeps today's behaviour = the FFI floor). Narrowing and identity untouched. **The round-trip is TRACKED, not banned**: the first cut rejected `test_emit`'s `*u32 → *u8 → *u32` (the static `*u8` is not the whole truth about `raw`), so a byte view now records what it views (`Symbol.byteview_origin`, set at var-decl init / assignment / alias copy by `byteview_origin_of`) and widening back to at most that object is allowed; widening PAST it is still the error | `ptrcast_widens_pointee.zer`, `bitcast_widens_pointee.zer`, `ptrcast_widens_past_origin.zer`, `tests/zer/{ptrcast_narrows_pointee_ok,ptrcast_byteview_roundtrip_ok}.zer` |
+
+Not adopted, and why (each recorded in `docs/limitations.md`):
+- `isr_rmw_split_statements` (`u32 t = g; g = t + 1;` as an RMW): the existing RMW
+  diagnostic literally recommends "an explicit read/mask/write" — adopting the branch's rule
+  would contradict the remedy the compiler prints. Needs a design decision, not a patch.
+- `loop_counter_*` (7): a provably-out-of-bounds counted loop is a WARNING plus an auto-guard
+  that returns early. Not silent (the warning names it), not unsafe (the guard fires); the
+  branch's upgrade to an error is desirable but is a 300-line change (`Checker.cert_loop_*`)
+  left for its own session.
+- `defer_body_label`: compiles, then traps at runtime "compiler bug: unsupported stmt kind in
+  defer" — loud, not silent. `mmio_const_ident_*`: trap at runtime (loud). `global_init_from_mutable`:
+  a GCC error naming generated C (loud, poor wording). `asm_operand_shared_read`: already an
+  OPEN entry. All four stay open.
+
+---
+
 ## Session 2026-09-11 — BUG-979/980: two concurrency rules that were exempting the thing they existed to catch
 
 Survey classes 6 (3 reproducers) and 3 (6 reproducers), both from

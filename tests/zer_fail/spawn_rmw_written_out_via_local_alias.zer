@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'counter'
+// BUG-981: `*p += 1` through a local alias was rejected (BUG-792), but the
+// written-out `*p = *p + 1` was not: the target resolved through the alias to
+// `counter`, while the VALUE was searched for the NAME `counter` — and it names `p`.
+// Same load / add / store, same lost update under a concurrent thread.
+volatile u32 counter;
+void worker() { volatile *u32 p = &counter; *p = *p + 1; }
+u32 main() { spawn worker(); counter = 5; return 0; }

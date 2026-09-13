@@ -304,6 +304,11 @@ static const char *vshape_flags(VShape s) {
  * ------------------------------------------------------------------------- */
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
+               /* BUG-981: the WRITTEN-OUT spelling crossed with the ALIASED reach.
+                * The target side resolved `*p` to `g`; the value side was searched
+                * for the NAME `g` — and it names `p`. Four cells, all accepted. */
+               RFORM_WRITTEN_LOCAL_ALIAS, RFORM_WRITTEN_PTR_PARAM,
+               RFORM_LAUNDERED_PTR_PARAM, RFORM_MIXED_ALIAS_READ,
                RFORM_COUNT } RForm;
 static const char *rform_name(RForm f) {
     switch (f) {
@@ -313,6 +318,10 @@ static const char *rform_name(RForm f) {
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
+    case RFORM_WRITTEN_LOCAL_ALIAS: return "local *p=*p+1";
+    case RFORM_WRITTEN_PTR_PARAM:   return "param *p=*p+1";
+    case RFORM_LAUNDERED_PTR_PARAM: return "param *p=@tr(*p)+1";
+    case RFORM_MIXED_ALIAS_READ:    return "local g=*p+1";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -327,6 +336,10 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
                                                                                  *body = "mid(&g);";      break;
     case RFORM_GLOBAL_ALIAS:   *helper = "volatile *u32 gp = &g;";              *body = "*gp += 1;";      break;
+    case RFORM_WRITTEN_LOCAL_ALIAS: *helper = "";                               *body = "volatile *u32 p = &g; *p = *p + 1;"; break;
+    case RFORM_WRITTEN_PTR_PARAM:   *helper = "void bump(volatile *u32 p){ *p = *p + 1; }"; *body = "bump(&g);"; break;
+    case RFORM_LAUNDERED_PTR_PARAM: *helper = "void bump(volatile *u32 p){ *p = @truncate(u32, *p) + 1; }"; *body = "bump(&g);"; break;
+    case RFORM_MIXED_ALIAS_READ:    *helper = "";                               *body = "volatile *u32 p = &g; g = *p + 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
@@ -523,7 +536,7 @@ int main(void) {
             snprintf(rnm, sizeof(rnm), "rmw/%s/%s", vsite_name(vs), rform_name(rf));
             gen_rmw(vs, rf, rbuf, sizeof(rbuf));
             int ok = run_vol(rnm, rbuf, "", 1);
-            fprintf(stderr, "  [%-5s][%-15s][neg] %s\n",
+            fprintf(stderr, "  [%-5s][%-19s][neg] %s\n",
                     vsite_name(vs), rform_name(rf), ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }

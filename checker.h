@@ -47,6 +47,7 @@ typedef struct {
      * (incl. orelse-block returns checked via check_stmt) and runs in-scope. */
     bool cur_ret_summary_complete; /* false once any return is not classifiable (STATIC/PARAM(n)) */
     uint64_t cur_ret_param_mask;   /* bit n: a return may be a view of parameter n */
+    uint64_t cur_ret_addr_param_mask; /* BUG-987: bit n: a return is @ptrtoint of a view of param n */
     bool in_loop;           /* true when inside for/while (for break/continue checking) */
     int  loop_depth;        /* BUG-947: loop NESTING count, not just "in one". */
     bool lockchk_direct_only; /* BUG-948: while set, collect_shared_types_in_expr

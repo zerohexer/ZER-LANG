@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'counter'
+// BUG-981: the helper spells the RMW out through its pointer PARAM. The spawn scan
+// binds `p` to `counter` at the call and resolved the TARGET `*p`; the value `*p + 1`
+// was compared against the name `counter` and never matched.
+volatile u32 counter;
+void bump(volatile *u32 p) { *p = *p + 1; }
+void worker() { bump(&counter); }
+u32 main() { spawn worker(); counter = 5; return 0; }

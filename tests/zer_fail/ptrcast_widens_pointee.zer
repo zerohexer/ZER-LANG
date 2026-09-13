@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: @ptrcast widens the pointee
+// BUG-995: the @pun widening rule (BH-18 #4) had no @ptrcast sibling, and @ptrcast
+// is the door that documents the primitive byte-view as allowed. The byte view
+// NARROWS; this WIDENS — the deref reads three bytes past a one-byte stack object,
+// with no diagnostic and no runtime check (measured: compiled and ran, exit 1).
+u32 main() { u8 small = 1; *u32 p = @ptrcast(*u32, &small); return *p; }

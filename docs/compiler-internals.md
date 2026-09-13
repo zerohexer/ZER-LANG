@@ -12824,6 +12824,65 @@ verdict; `compile` cells still build a real binary.
    over-rejection. The fixed-buffer audit caught it. Before calling a fallback
    "conservative", ask which way the failure actually rounds.
 
+### The RMW "is the RHS a read of the target?" predicate — ONE walker (BUG-981)
+
+The non-atomic read-modify-write rule is asked at THREE sites (spawn scan
+`scan_unsafe_global_access` NODE_ASSIGN, ISR walker `record_isr_globals` NODE_ASSIGN,
+and the main-side `check_expr` NODE_ASSIGN that feeds `track_isr_global`), plus the
+per-function summary `rmw_scan_body` / `func_rmw_param_mask` that attributes a
+main-side `bump(&g)` to `g`. All of them decide "is this an RMW?" as
+
+    op != TOK_EQ  ||  target_is_bit_range(target)  ||  assign_reads_own_target(c, value, gs)
+
+where `gs = resolve_write_target_global(c, target, 0)` — the target resolved through
+the alias table (`_rmw_alias`: local `p = &g` and params bound at the call). **The value
+side must resolve the same way.** Until BUG-981 it compared identifier NAMES against
+`gs`, so `*p = *p + 1` (value names `p`) was a plain store at every site while `*p += 1`
+was rejected — 10 of 22 spellings accepted.
+
+`assign_reads_own_target` is now `expr_reads_place(c, value, place_is_global, gs)`:
+
+- `expr_reads_place(c, e, pred, ctx, depth)` — THE expression walker for "does `e` read
+  a place satisfying `pred`?". Exhaustive `switch` over `NodeKind`, no `default:`
+  (gated by `-Werror=switch`; the two if-chains it replaced were the blind spot the
+  BUG-856 comment recorded). Places = IDENT / FIELD / INDEX / SLICE / `*` deref; the
+  predicate sees the whole place, then the walk descends into the place's own
+  sub-reads (an index expression or slice bound is a read). Statement kinds are walked
+  because an `orelse { … }` block fallback contains them. Past depth 24 it answers
+  TRUE (unknown rounds toward "it reads it").
+- `place_is_global(c, place, gs)` — a bare IDENT is matched by NAME (a bare pointer
+  ident reads the pointer, not the pointee — deliberately not resolved); any other
+  place is `resolve_write_target_global(c, place, 0) == gs`.
+- `place_rooted_at_ident(c, place, param_ident)` — the summary's predicate: the place
+  is rooted (through deref/field/index/slice) at the same param the target is.
+
+**When you add a fourth site, call `assign_reads_own_target`; when you add a form of
+reaching the global, add a column to the RMW FORM grid** (`tests/test_hw_matrix.c`,
+site x spelling). The grid crossed SPELLING (`g += 1` vs `g = g + 1`) with REACH
+(named / local alias / param / 2-hop / global alias) only along one diagonal; BUG-981's
+four columns are the off-diagonal cells (written-out x alias, laundered x param,
+mixed). Run it against a pre-fix build: 7 false negatives, then 0.
+
+### Harvest 2026-09-13 (BUG-982..995) — the new one-query helpers a session must reuse
+
+| question | ONE query | used at |
+|---|---|---|
+| "does this type carry a value with a VALIDITY INVARIANT (pointer/slice/funcptr/enum/bool/optional/handle/tagged union/container)?" | `type_carries_forgeable` (exhaustive TypeKind switch) | the `@pun` forge rule; reuse for any future reinterpretation door |
+| "can the emitted `@pun` type_id trap actually FIRE?" (only struct/enum/union pointees pack an id) | `pun_type_id_check_can_fire` — MIRRORS the emitter's `type_id != TGT && type_id != 0`; change both together | `@pun` |
+| "does this pointee carry an enum / a bool at any depth?" | `type_carries_enum_c` / `type_carries_bool_c` | `@inttoptr` mint rejection; `@ptrcast` uses the flat kind test |
+| "does this pointer cast WIDEN the pointee?" | `reject_pointee_widening(c, line, door, src_pointee, tgt_pointee)` | `@ptrcast`, `@bitcast` (BUG-995); `@pun` keeps its older inline BH-18 #4 form with the identical test |
+| "what does this `&expr` point at, for `@container`?" — a THREE-valued fact | `classify_amp_operand` → CPROV_FIELD / CPROV_WHOLE / CPROV_UNKNOWN, written through `set_container_prov_{field,whole,unknown}` (the two Symbol flags `container_struct` / `is_whole_object_addr` are mutually exclusive — never set one by hand) | var-decl init, assignment, alias copy, and the direct `&i` argument |
+| "may this pointer-width INTEGER call result be a frame address?" | `call_result_is_local_address_int` = address-valued-integer ARGUMENT (arm 1) ∨ callee `ret_addr_param_mask` bit n × local-derived pointer arg n (arm 2) | the assignment and return sinks (BUG-987). `ret_addr_param_mask` is accumulated by `return_addr_param` in the NODE_RETURN handler and stored for EVERY body (the view mask is only stored for pointer-returning functions) |
+| "which allocation id does local n mint?" | `ir_alloc_id_of_local` (= n + 1; 0 is the untracked SENTINEL) | every minting site in zercheck_ir.c (BUG-990). Never write `alloc_id = dest_local` again |
+| "record a multi-view call result's candidate set" | `ir_fill_multiview_set` | IR_CALL (var-decl) and IR_ASSIGN (assignment) sinks; `ir_merge_states` UNIONs the sets (BUG-989) |
+
+Two things learned harvesting: (1) a branch's checker hunks apply with `patch --fuzz=3`
+even when the commit as a whole conflicts (their emitter refactors were the conflict, not
+the rules) — extract `git show <sha> -- checker.c` and dry-run it before reaching for
+`cherry-pick`; (2) **never edit a source file while `make check` runs** — make compiles
+each test binary from the sources AS THEY ARE at that moment, so an edit mid-run produced
+a link error against a helper that had a caller but not yet a body, and the run was lost.
+
 
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 

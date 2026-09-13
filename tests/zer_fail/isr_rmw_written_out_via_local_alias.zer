@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written in a single statement
+// BUG-981, ISR sink (the mirrored sink of spawn_rmw_written_out_via_local_alias):
+// `*p = *p + 1` in the ISR body through a local alias of the volatile global.
+volatile u32 counter;
+interrupt TIM2 { volatile *u32 p = &counter; *p = *p + 1; }
+u32 main() { counter = 5; return 0; }

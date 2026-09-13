@@ -891,6 +891,7 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 #define RET_STATIC  (-1)
 #define RET_UNKNOWN (-2)
 static int classify_return_root(Checker *c, Node *rexpr);
+static int return_addr_param(Checker *c, Node *rexpr);   /* BUG-987 */
 static Type *find_param_cast_type(Checker *c, Node *node, const char *param_name, uint32_t param_len);
 static void add_prov_summary(Checker *c, const char *name, uint32_t name_len, Type *prov);
 static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
@@ -1055,8 +1056,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         case TYPE_I32:
             if (val > 0xFFFFFFFFULL) return false;
             return zer_literal_fits_u(0x7FFFFFFFU, (unsigned int)val) != 0;
+        /* BUG-988 (harvested from vigilant-tesla-lzmkhn via loving-davinci-vgonmt): this said `return true;` with the comment
+         * "val is uint64, positive literal fits in i64" — false above 2^63-1.
+         * `i64 x = 18446744073709551615;` was ACCEPTED at every one of the
+         * value-flow sinks that route through this predicate and silently
+         * became -1, while every NARROWER signed width rejected the same shape.
+         * Not "no rule at 64 bits": the SAME rule with a hole at the widest
+         * width — the mirror of BUG-863. Corpus cost measured: zero. */
         case TYPE_I64:
-            return true;  /* val is uint64, positive literal fits in i64 */
+            return val <= (uint64_t)INT64_MAX;
         /* Path C: arbitrary-width int — fits if within the width's max */
         case TYPE_UINT: {
             uint32_t _b = effective->intn.bits;
@@ -1065,7 +1073,10 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         }
         case TYPE_SINT: {
             uint32_t _b = effective->intn.bits;
-            if (_b >= 64) return true;
+            /* BUG-988, the iN sibling: at 65..128 bits a u64 literal always fits;
+             * exactly 64 needs the signed bound. */
+            if (_b > 64) return true;
+            if (_b == 64) return val <= (uint64_t)INT64_MAX;
             return val <= ((1ULL << (_b - 1)) - 1ULL);
         }
         /* Stage 2 Part B (2026-04-28): exhaustive — non-numeric types
@@ -1094,11 +1105,15 @@ static bool is_literal_compatible(Node *expr, Type *target) {
             case TYPE_I8:    return val <= 128;
             case TYPE_I16:   return val <= 32768;
             case TYPE_I32:   return val <= 2147483648ULL;
-            case TYPE_I64:   return true;
+            /* BUG-988, the NEGATIVE half: the magnitude must fit, exactly as at
+             * every narrower width. `i64 x = -18446744073709551615;` was accepted
+             * and wrapped to 1. */
+            case TYPE_I64:   return val <= (uint64_t)INT64_MAX + 1ULL;
             /* Path C: signed arbitrary-width — -val fits if val <= 2^(bits-1) */
             case TYPE_SINT: {
                 uint32_t _b = effective->intn.bits;
-                if (_b >= 64) return true;
+                if (_b > 64) return true;
+                if (_b == 64) return val <= (uint64_t)INT64_MAX + 1ULL;
                 return val <= (1ULL << (_b - 1));
             }
             /* unsigned types: negative literals never fit */
@@ -2454,6 +2469,94 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* BUG-987 (limitations.md survey class 7, harvested via loving-davinci-vgonmt) — the INTEGER half of the escape
+ * question.
+ *
+ * `call_result_escapes` above is gated by its consumers on
+ * `type_carries_data_pointer(result)`, whose own comment says "`g_int =
+ * count(&local)` returns an int: no pointer escapes, don't reject". That is
+ * right for a COUNT and wrong for an ADDRESS: `@ptrtoint` exists precisely to
+ * turn a pointer into a pointer-width integer, and `@inttoptr` turns it back.
+ * The var-decl propagation site already treats a pointer-width int as
+ * address-carrying (`is_local_derived` via `expr_touches_local_derived`), so the
+ * two sites answered ONE question two ways — and the call form escaped:
+ *
+ *     usize g;  usize idfn(usize x) { return x; }
+ *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }        // was ACCEPTED
+ *     usize leak(){ u32 l = 5; return idfn(@ptrtoint(&l)); }   // was ACCEPTED
+ *
+ * while `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a` and
+ * `g = m() orelse a` are all rejected.
+ *
+ * Deliberately NOT "any pointer-width-int result of a call with a local-derived
+ * arg": that would reject `g_len = sum(local_arr)`, a common and safe pattern.
+ * The discriminator is that an argument is an ADDRESS-VALUED integer — the only
+ * way to make one is `@ptrtoint`, and the only way an integer Symbol becomes
+ * `is_local_derived` is through it. */
+static bool ptr_width_int_type(Checker *c, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);   /* unwraps distinct, NULL-safe */
+    if (k == TYPE_USIZE) return true;
+    if (k == TYPE_U64 && c->target_ptr_bits >= 64) return true;
+    if (k == TYPE_U32 && c->target_ptr_bits == 32) return true;
+    return false;
+}
+
+static bool arg_is_local_address_int(Checker *c, Node *arg, int depth) {
+    if (!arg || depth > 8) return false;
+    if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 8 &&
+        memcmp(arg->intrinsic.name, "ptrtoint", 8) == 0 &&
+        arg->intrinsic.arg_count > 0) {
+        /* unwrap_ptr_launder inside arg_is_local_derived peels the intrinsic to
+         * its pointer operand, so `&local` and a local-derived pointer both
+         * resolve there. Reuse it rather than re-deriving the root walk. */
+        return arg_is_local_derived(c, arg, 0);
+    }
+    if (arg->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, arg->ident.name,
+                                 (uint32_t)arg->ident.name_len);
+        return s && s->is_local_derived && ptr_width_int_type(c, s->type);
+    }
+    if (arg->kind == NODE_BINARY)
+        return arg_is_local_address_int(c, arg->binary.left, depth + 1) ||
+               arg_is_local_address_int(c, arg->binary.right, depth + 1);
+    if (arg->kind == NODE_TYPECAST)
+        return arg_is_local_address_int(c, arg->typecast.expr, depth + 1);
+    if (arg->kind == NODE_ORELSE)
+        return arg_is_local_address_int(c, arg->orelse.expr, depth + 1) ||
+               arg_is_local_address_int(c, arg->orelse.fallback, depth + 1);
+    if (arg->kind == NODE_CALL)
+        for (int i = 0; i < arg->call.arg_count; i++)
+            if (arg_is_local_address_int(c, arg->call.args[i], depth + 1))
+                return true;
+    return false;
+}
+
+/* The call hands back a pointer-width integer and was given a frame ADDRESS as
+ * an integer — so the result may BE that address. */
+static bool call_result_is_local_address_int(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    if (!ptr_width_int_type(c, typemap_get(c, call))) return false;
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (arg_is_local_address_int(c, call->call.args[i], 0)) return true;
+    /* Arm 2: the callee itself takes the address — `usize leak(*u32 p){ return
+     * @ptrtoint(p); }` given `&local`. The per-function ADDRESS summary
+     * (`ret_addr_param_mask`, a positive fact per param) says which params it
+     * does that to; a bodyless extern has none, so `g_len = c_strlen(&buf)`
+     * keeps compiling — the C-FFI floor, not a rule this sink can see past. */
+    if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
+        Symbol *fs = scope_lookup(c->global_scope, call->call.callee->ident.name,
+                                  (uint32_t)call->call.callee->ident.name_len);
+        if (fs && fs->is_function && fs->ret_addr_param_mask) {
+            for (int i = 0; i < call->call.arg_count && i < 64; i++) {
+                if (!(fs->ret_addr_param_mask & (1ull << i))) continue;
+                if (arg_is_local_derived(c, call->call.args[i], 0)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
  * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
  * global) copies the element's bytes into storage that outlives the frame. If
@@ -2823,6 +2926,296 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
      * sink (see below) — a reused pointer must re-clear when it is pointed at
      * aligned memory. */
     if (src->is_packed_derived) dst->is_packed_derived = true;
+}
+
+/* ================================================================
+ * BUG-984: @container pointer provenance — ONE writer for the pair
+ *
+ * `Symbol.container_struct` (came from `&outer.field`) and
+ * `Symbol.is_whole_object_addr` (came from `&wholeObject`) are the two KNOWN
+ * states of one three-valued fact; both clear means UNKNOWN. They are mutually
+ * exclusive, so every write must set one and clear the other — a variable
+ * re-pointed from `&o.in` to `&i` that kept the stale field provenance would
+ * report the WRONG diagnostic, and one re-pointed the other way would report
+ * none at all.
+ *
+ * Three call sites write this fact (var-decl init, assignment, alias copy), and
+ * the field-provenance half was already duplicated across two of them. Routing
+ * all three through these two setters is what keeps the pair consistent.
+ * ================================================================ */
+static void set_container_prov_field(Symbol *sym, Type *st,
+                                     const char *fname, uint32_t flen) {
+    if (!sym) return;
+    sym->container_struct = st;
+    sym->container_field = fname;
+    sym->container_field_len = flen;
+    sym->is_whole_object_addr = false;
+}
+static void set_container_prov_whole(Symbol *sym) {
+    if (!sym) return;
+    sym->container_struct = NULL;
+    sym->container_field = NULL;
+    sym->container_field_len = 0;
+    sym->is_whole_object_addr = true;
+}
+static void set_container_prov_unknown(Symbol *sym) {
+    if (!sym) return;
+    sym->container_struct = NULL;
+    sym->container_field = NULL;
+    sym->container_field_len = 0;
+    sym->is_whole_object_addr = false;
+}
+
+/* ================================================================
+ * BUG-982: does this type carry a value with a VALIDITY INVARIANT —
+ * one for which NOT every bit pattern is a legal value?
+ *
+ * The question the `@pun` rule needs. A `u32` has no invariant: all 2^32
+ * patterns are legal `u32`s, so reinterpreting foreign bytes as one produces a
+ * VALUE — possibly a surprising one, never an illegal one. A pointer, a slice
+ * (its `len` is what every bounds check trusts), a funcptr, an enum (its
+ * variant set is what exhaustive `switch` lowering trusts), a `bool` (0/1), an
+ * optional (its `has_value` byte) and a Handle all have one: a wrong bit
+ * pattern manufactures a CAPABILITY the rest of the compiler then believes.
+ *
+ * Sibling of `type_carries_data_pointer` / `type_carries_handle`, deliberately
+ * separate for the reason recorded there: three different questions, three
+ * predicates. This one is the union of "what can a forge produce that some
+ * other analysis is entitled to trust?".
+ *
+ * Exhaustive switch, no `default:` — a new TypeKind fails the build under
+ * -Werror=switch and forces this question to be answered for it, which is the
+ * completeness half CLAUDE.md asks a carrier predicate to have.
+ * ================================================================ */
+static bool type_carries_forgeable(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(t)) {
+    /* Values whose validity some later analysis trusts. */
+    case TYPE_POINTER: case TYPE_OPAQUE: case TYPE_SLICE:
+    case TYPE_FUNC_PTR: case TYPE_ENUM: case TYPE_BOOL:
+    case TYPE_HANDLE: case TYPE_OPTIONAL:
+        return true;
+    /* Builtin containers carry internal bookkeeping (indices, generation
+     * counters, capacities) that their own operations trust. */
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA:
+    case TYPE_BARRIER: case TYPE_SLAB: case TYPE_SEMAPHORE:
+        return true;
+    /* Aggregates: forgeable iff some member is. */
+    case TYPE_ARRAY:
+        return type_carries_forgeable(u->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_forgeable(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    case TYPE_UNION:
+        /* A ZER union is TAGGED, and the tag itself is an invariant. */
+        return true;
+    /* Every bit pattern is a legal value of these. */
+    case TYPE_VOID:
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64:
+    case TYPE_UINT: case TYPE_SINT:
+        return false;
+    /* Unwrapped by type_dispatch_kind, so unreachable; listed so the switch
+     * stays total. */
+    case TYPE_DISTINCT:
+        return false;
+    }
+    return false;
+}
+
+/* Does a pointee type carry a runtime `type_id`? Only struct / enum / union do —
+ * everything else packs 0, which the emitted @pun check reads as "unknown
+ * provenance, allow". Kept next to the predicate above because the pair is what
+ * decides whether @pun's advertised runtime check can fire at all. */
+static bool pun_pointee_has_type_id(Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_UNION;
+}
+
+/* Does this type carry an ENUM at any nesting depth?
+ *
+ * The checker-side twin of the emitter's `type_carries_enum_e`, which decides
+ * where the variant guard is emitted. Kept as its own predicate rather than
+ * folded into `type_carries_forgeable` because the two answer different
+ * questions: this one is "does an exhaustive switch downstream depend on these
+ * bits being a declared variant?", which is narrower and is the only half with
+ * a measured wrong-dispatch behind it (BUG-983). Recurses the same wrappers as
+ * every other carrier predicate in this file. */
+static bool type_carries_enum_c(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_ENUM) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_enum_c(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_enum_c(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_enum_c(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_enum_c(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
+/* BUG-985 (2026-09-06): the bool sibling of type_carries_enum_c, for the
+ * pointer-MINTING doors. `bool` is a uint8_t in the emitted C whose legal values
+ * are 0/1; a load through a minted `*bool` yields a value that is neither
+ * `true` nor `false` (measured: `b == true` and `b == false` BOTH false). Same
+ * wrappers as every other carrier predicate. */
+static bool type_carries_bool_c(Type *t, int depth) {
+    if (!t || depth > 32) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_BOOL) return true;
+    if (k == TYPE_OPTIONAL) return type_carries_bool_c(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_bool_c(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_bool_c(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_bool_c(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    }
+    return false;
+}
+
+/* Can the @pun runtime type_id trap the emitter writes actually FIRE?
+ *
+ * It emits `pn.type_id = SRC_TID; if (pn.type_id != TGT_TID && pn.type_id != 0) trap`
+ * — and takes a plain-cast path with no check at all when TGT_TID is 0. So the
+ * trap is reachable only when BOTH pointees carry an id. This mirrors the
+ * emitter, and if that emission ever changes this predicate must change with it. */
+static bool pun_type_id_check_can_fire(Type *src_pointee, Type *tgt_pointee) {
+    return pun_pointee_has_type_id(src_pointee) &&
+           pun_pointee_has_type_id(tgt_pointee);
+}
+
+static int64_t compute_type_size(Type *t);   /* defined below; BUG-995 uses it early */
+
+/* BUG-995: what object is this byte view a view OF? For a var-decl init or an
+ * assignment value that is `@ptrcast`/`@bitcast(*T, src)` between two concrete
+ * pointer types, the origin is src's OWN origin if it has one (a view of a view
+ * still views the original object), else src's static pointer type. NULL when
+ * nothing is known. */
+static Type *byteview_origin_of(Checker *c, Node *value) {
+    if (!value) return NULL;
+    Node *v = value;
+    if (v->kind == NODE_ORELSE) v = v->orelse.expr;
+    if (!v || v->kind != NODE_INTRINSIC || v->intrinsic.arg_count < 1) return NULL;
+    bool is_pc = (v->intrinsic.name_len == 7 && memcmp(v->intrinsic.name, "ptrcast", 7) == 0);
+    bool is_bc = (v->intrinsic.name_len == 7 && memcmp(v->intrinsic.name, "bitcast", 7) == 0);
+    if (!is_pc && !is_bc) return NULL;
+    Node *src = v->intrinsic.args[0];
+    Type *st = typemap_get(c, src);
+    if (!st || type_dispatch_kind(st) != TYPE_POINTER) return NULL;
+    Type *se = type_unwrap_distinct(st);
+    if (!se->pointer.inner || type_dispatch_kind(se->pointer.inner) == TYPE_OPAQUE) return NULL;
+    Node *root = unwrap_ptr_launder(src);
+    if (root && root->kind == NODE_IDENT) {
+        Symbol *ss = scope_lookup(c->current_scope, root->ident.name,
+                                  (uint32_t)root->ident.name_len);
+        if (ss && ss->byteview_origin) return ss->byteview_origin;
+    }
+    return st;
+}
+
+/* BUG-995: ONE widening test for the three pointer-cast doors (@pun had it as
+ * BH-18 #4; @ptrcast and @bitcast did not). A cast whose TARGET pointee is larger
+ * than its SOURCE pointee reads past the source object on every dereference — a
+ * silent stack/global OOB that no runtime check sees, because a pointer cast is
+ * not a bounds-checked access. Decidable only when BOTH sizes are known and the
+ * source is concrete: an *opaque or unknown-size source (cinclude, target-
+ * dependent) keeps today's behaviour, which is the FFI floor. Narrowing casts
+ * (`*u32 -> *u8`, struct -> `*u8`) — the byte-view idiom — are untouched. */
+static void reject_pointee_widening(Checker *c, int line, const char *door,
+                                    Node *src_expr,
+                                    Type *src_pointee, Type *tgt_pointee) {
+    if (!src_pointee || !tgt_pointee) return;
+    if (type_dispatch_kind(src_pointee) == TYPE_OPAQUE) return;
+    if (type_dispatch_kind(tgt_pointee) == TYPE_OPAQUE) return;
+    int64_t src_sz = compute_type_size(src_pointee);
+    int64_t dst_sz = compute_type_size(tgt_pointee);
+    if (src_sz <= 0 || dst_sz == CONST_EVAL_FAIL) return;
+    /* The round-trip: a byte view widened back to (at most) the object it was
+     * taken from. `Symbol.byteview_origin` is recorded where the view was made
+     * (var-decl init / assignment / alias copy), so the static `*u8` is not the
+     * whole truth about `raw` — TRACK, don't ban. */
+    Node *se = src_expr ? unwrap_ptr_launder(src_expr) : NULL;
+    if (se && se->kind == NODE_IDENT) {
+        Symbol *ss = scope_lookup(c->current_scope, se->ident.name,
+                                  (uint32_t)se->ident.name_len);
+        Type *bo = (ss && ss->byteview_origin) ? type_unwrap_distinct(ss->byteview_origin) : NULL;
+        if (bo && type_dispatch_kind(bo) == TYPE_POINTER && bo->pointer.inner) {
+            int64_t origin_sz = compute_type_size(bo->pointer.inner);
+            if (origin_sz > 0 && origin_sz > src_sz) src_sz = origin_sz;
+        }
+    }
+    if (dst_sz > src_sz) {
+        checker_error(c, line,
+            "%s widens the pointee — the %lld-byte target reads past the %lld-byte "
+            "source (out-of-bounds). Narrow instead (a byte view is `*u8`), or copy "
+            "the bytes into a wider value with @bitcast on VALUES",
+            door, (long long)dst_sz, (long long)src_sz);
+    }
+}
+
+/* Classify the operand of a `&` for @container purposes.
+ *
+ *   &x            (x a plain variable)            -> WHOLE   (never a field)
+ *   &arr[i]       (arr an array/slice of Inner)   -> WHOLE   (element, not field)
+ *   &x.f  / &p.f  / &arr[i].f                     -> FIELD   (with struct + name)
+ *   anything else                                 -> UNKNOWN
+ *
+ * `&arr[i]` is WHOLE deliberately: an element of an `Inner[N]` is a complete
+ * `Inner` that is nobody's member, so subtracting a field offset from it walks
+ * out of the array exactly as it walks out of a standalone object. A chain that
+ * ENDS in a field (`&arr[i].f`) is FIELD and is handled by the field arm. */
+typedef enum { CPROV_UNKNOWN = 0, CPROV_FIELD, CPROV_WHOLE } ContainerProv;
+
+static ContainerProv classify_amp_operand(Checker *c, Node *operand,
+                                          Type **out_struct,
+                                          const char **out_field,
+                                          uint32_t *out_field_len) {
+    if (!operand) return CPROV_UNKNOWN;
+    if (operand->kind == NODE_FIELD) {
+        Type *ot = typemap_get(c, operand->field.object);
+        if (!ot) return CPROV_UNKNOWN;
+        Type *st = type_unwrap_distinct(ot);
+        if (st && type_dispatch_kind(st) == TYPE_POINTER)
+            st = type_unwrap_distinct(st->pointer.inner);
+        if (!st || type_dispatch_kind(st) != TYPE_STRUCT) return CPROV_UNKNOWN;
+        if (out_struct) *out_struct = st;
+        if (out_field) *out_field = operand->field.field_name;
+        if (out_field_len) *out_field_len = (uint32_t)operand->field.field_name_len;
+        return CPROV_FIELD;
+    }
+    if (operand->kind == NODE_IDENT) return CPROV_WHOLE;
+    if (operand->kind == NODE_INDEX) {
+        /* `&arr[i]` — an ELEMENT is a whole object. Only claim this when the
+         * indexed thing is itself a plain variable; a longer chain we have not
+         * modelled stays UNKNOWN (conservative: allow, as before). */
+        Node *obj = operand->index_expr.object;
+        if (obj && obj->kind == NODE_IDENT) return CPROV_WHOLE;
+    }
+    return CPROV_UNKNOWN;
 }
 
 /* Given the operand of a `&` (address-of), decide whether the resulting
@@ -3308,74 +3701,168 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
  * written-out `x = x + 1` — identical semantics, identical non-atomicity. The
  * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
  * out in full evaded it at every sink. */
-static bool assign_reads_own_target(Node *value, Symbol *tgt);
-/* Does this expression mention the identifier `nm`? Used to recognise a
- * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
-static bool expr_mentions_name(Node *e, const char *nm, uint32_t nl, int depth) {
-    if (depth > 16) return true;   /* BUG-976: unknown -> assume it mentions it */
-    if (!e || !nm) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == nl && memcmp(e->ident.name, nm, nl) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_name(e->binary.left, nm, nl, depth + 1) ||
-               expr_mentions_name(e->binary.right, nm, nl, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_name(e->unary.operand, nm, nl, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_name(e->field.object, nm, nl, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_name(e->index_expr.object, nm, nl, depth + 1) ||
-                                       expr_mentions_name(e->index_expr.index, nm, nl, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_name(e->typecast.expr, nm, nl, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
-}
+static bool assign_reads_own_target(Checker *c, Node *value, Symbol *tgt);
 
-static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
-    /* BUG-976: a read of `g` 14 levels into an expression is still a read of `g`. */
-    if (depth > 12) return true;
-    if (!e || !g) return false;
-    if (e->kind == NODE_IDENT)
-        return e->ident.name_len == g->name_len &&
-               memcmp(e->ident.name, g->name, g->name_len) == 0;
-    if (e->kind == NODE_BINARY)
-        return expr_mentions_global(e->binary.left, g, depth + 1) ||
-               expr_mentions_global(e->binary.right, g, depth + 1);
-    if (e->kind == NODE_UNARY)  return expr_mentions_global(e->unary.operand, g, depth + 1);
-    if (e->kind == NODE_FIELD)  return expr_mentions_global(e->field.object, g, depth + 1);
-    if (e->kind == NODE_INDEX)  return expr_mentions_global(e->index_expr.object, g, depth + 1) ||
-                                       expr_mentions_global(e->index_expr.index, g, depth + 1);
-    if (e->kind == NODE_TYPECAST) return expr_mentions_global(e->typecast.expr, g, depth + 1);
-    /* BUG-856: INTRINSIC / CALL / ORELSE were missing, so a read of the global
-     * laundered through any of them did not count as reading it and the write was
-     * classified as a plain store rather than a read-modify-write:
-     *     g = @truncate(u32, g) + 1;    // ACCEPTED at both the spawn and ISR sinks
-     *     g = g + 1;                    // correctly REJECTED
-     * An interrupt or a concurrent thread landing between the load and the store
-     * loses the update, silently.
-     *
-     * This function is an if/else CHAIN, which is why NEITHER gate could see the
-     * gap: walker_default_audit greps kind-SWITCHES, and audit_walker_fields reads
-     * `case` arms. 39294y called that out explicitly and it held — the field audit
-     * reported this file's OTHER walkers and never this one. Recorded here so the
-     * next person knows the chain form is a blind spot, not a clean bill. */
-    if (e->kind == NODE_INTRINSIC) {
+/* BUG-981: THE walker for "does this expression READ a place satisfying `pred`?"
+ *
+ * Two walkers used to answer the "is the write's RHS a read of its own target?"
+ * question, and both compared NAMES: `expr_mentions_global` looked for the
+ * GLOBAL's identifier in the value, `expr_mentions_name` for a PARAM's. But the
+ * target side had already learned (BUG-792) to resolve `*p` / `p.f` / `p[i]`
+ * through the alias table to the global it lands on — so the two halves of one
+ * statement were judged by different rules:
+ *
+ *     volatile *u32 p = &counter;
+ *     *p += 1;          // target resolves to `counter`             -> REJECTED
+ *     *p = *p + 1;      // target resolves to `counter`, value names `p` -> ACCEPTED
+ *     counter = *p + 1; // same                                       -> ACCEPTED
+ *
+ * at BOTH sinks and the main-side site, for a local alias AND a pointer param
+ * (10 of 22 spellings measured accepted, all the same lost-update race BUG-792
+ * TSan-confirmed for the compound spelling). The param walker had additionally
+ * never received BUG-856's INTRINSIC / CALL / ORELSE / SLICE arms, so a helper
+ * `*p = @truncate(u32, *p) + 1` set no rmw bit at all.
+ *
+ * ONE walker now, exhaustive over NodeKind (no `default:` — a new kind fails the
+ * build under -Werror=switch, which the old if-chains structurally could not
+ * do; the BUG-856 comment recorded that blind spot). It hands every PLACE (ident,
+ * field, index, slice, deref) to `pred`, then descends into the place's own
+ * sub-reads (an index or a slice bound is itself a read). Statement kinds are
+ * reachable only as an `orelse { … }` block fallback and are walked for the
+ * reads they contain; top-level declarations cannot appear and read nothing. */
+typedef bool (*PlacePred)(Checker *c, Node *place, void *ctx);
+
+static bool expr_reads_place(Checker *c, Node *e, PlacePred pred, void *ctx, int depth) {
+    /* BUG-976: past the cap the answer is UNKNOWN, which must round toward "it
+     * reads it" — a missed read is a missed race. */
+    if (depth > 24) return true;
+    if (!e) return false;
+    switch (e->kind) {
+    /* ---- places ---- */
+    case NODE_IDENT:
+        return pred(c, e, ctx);
+    case NODE_FIELD:
+        return pred(c, e, ctx) ||
+               expr_reads_place(c, e->field.object, pred, ctx, depth + 1);
+    case NODE_INDEX:
+        return pred(c, e, ctx) ||
+               expr_reads_place(c, e->index_expr.object, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->index_expr.index, pred, ctx, depth + 1);
+    case NODE_SLICE:
+        return pred(c, e, ctx) ||
+               expr_reads_place(c, e->slice.object, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->slice.start, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->slice.end, pred, ctx, depth + 1);
+    case NODE_UNARY:
+        if (e->unary.op == TOK_STAR && pred(c, e, ctx)) return true;
+        return expr_reads_place(c, e->unary.operand, pred, ctx, depth + 1);
+    /* ---- composite expressions ---- */
+    case NODE_BINARY:
+        return expr_reads_place(c, e->binary.left, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->binary.right, pred, ctx, depth + 1);
+    case NODE_ASSIGN:
+        return expr_reads_place(c, e->assign.target, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->assign.value, pred, ctx, depth + 1);
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (expr_reads_place(c, e->call.args[i], pred, ctx, depth + 1)) return true;
+        return expr_reads_place(c, e->call.callee, pred, ctx, depth + 1);
+    case NODE_INTRINSIC:
         for (int i = 0; i < e->intrinsic.arg_count; i++)
-            if (expr_mentions_global(e->intrinsic.args[i], g, depth + 1)) return true;
+            if (expr_reads_place(c, e->intrinsic.args[i], pred, ctx, depth + 1)) return true;
+        return false;
+    case NODE_TYPECAST:
+        return expr_reads_place(c, e->typecast.expr, pred, ctx, depth + 1);
+    case NODE_ORELSE:
+        return expr_reads_place(c, e->orelse.expr, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->orelse.fallback, pred, ctx, depth + 1);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (expr_reads_place(c, e->struct_init.fields[i].value, pred, ctx, depth + 1))
+                return true;
+        return false;
+    /* ---- leaves that read no place ---- */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    /* ---- statements: reachable as an `orelse { … }` block fallback ---- */
+    case NODE_BLOCK:
+        for (int i = 0; i < e->block.stmt_count; i++)
+            if (expr_reads_place(c, e->block.stmts[i], pred, ctx, depth + 1)) return true;
+        return false;
+    case NODE_EXPR_STMT:
+        return expr_reads_place(c, e->expr_stmt.expr, pred, ctx, depth + 1);
+    case NODE_VAR_DECL:
+        return expr_reads_place(c, e->var_decl.init, pred, ctx, depth + 1);
+    case NODE_RETURN:
+        return expr_reads_place(c, e->ret.expr, pred, ctx, depth + 1);
+    case NODE_IF:
+        return expr_reads_place(c, e->if_stmt.cond, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->if_stmt.then_body, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->if_stmt.else_body, pred, ctx, depth + 1);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return expr_reads_place(c, e->while_stmt.cond, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->while_stmt.body, pred, ctx, depth + 1);
+    case NODE_FOR:
+        return expr_reads_place(c, e->for_stmt.init, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->for_stmt.cond, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->for_stmt.step, pred, ctx, depth + 1) ||
+               expr_reads_place(c, e->for_stmt.body, pred, ctx, depth + 1);
+    case NODE_SWITCH:
+        if (expr_reads_place(c, e->switch_stmt.expr, pred, ctx, depth + 1)) return true;
+        for (int i = 0; i < e->switch_stmt.arm_count; i++)
+            if (expr_reads_place(c, e->switch_stmt.arms[i].body, pred, ctx, depth + 1))
+                return true;
+        return false;
+    case NODE_DEFER:
+        return expr_reads_place(c, e->defer.body, pred, ctx, depth + 1);
+    case NODE_CRITICAL:
+        return expr_reads_place(c, e->critical.body, pred, ctx, depth + 1);
+    case NODE_ONCE:
+        return expr_reads_place(c, e->once.body, pred, ctx, depth + 1);
+    case NODE_SPAWN:
+        for (int i = 0; i < e->spawn_stmt.arg_count; i++)
+            if (expr_reads_place(c, e->spawn_stmt.args[i], pred, ctx, depth + 1)) return true;
+        return false;
+    case NODE_AWAIT:
+        return expr_reads_place(c, e->await_stmt.cond, pred, ctx, depth + 1);
+    case NODE_STATIC_ASSERT:
+        return expr_reads_place(c, e->static_assert_stmt.cond, pred, ctx, depth + 1);
+    case NODE_ASM:
+        /* an asm block reads its input operands (Z-rules keep tracking through them) */
+        for (int i = 0; i < e->asm_stmt.input_count; i++)
+            if (expr_reads_place(c, e->asm_stmt.inputs[i].expr, pred, ctx, depth + 1)) return true;
+        for (int i = 0; i < e->asm_stmt.output_count; i++)
+            if (expr_reads_place(c, e->asm_stmt.outputs[i].expr, pred, ctx, depth + 1)) return true;
+        return false;
+    /* control transfers carry no operand */
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+        return false;
+    /* top-level declarations never occur inside an expression */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
         return false;
     }
-    if (e->kind == NODE_CALL) {
-        for (int i = 0; i < e->call.arg_count; i++)
-            if (expr_mentions_global(e->call.args[i], g, depth + 1)) return true;
-        return expr_mentions_global(e->call.callee, g, depth + 1);
-    }
-    if (e->kind == NODE_ORELSE)
-        return expr_mentions_global(e->orelse.expr, g, depth + 1) ||
-               expr_mentions_global(e->orelse.fallback, g, depth + 1);
-    if (e->kind == NODE_SLICE)
-        return expr_mentions_global(e->slice.object, g, depth + 1) ||
-               expr_mentions_global(e->slice.start, g, depth + 1) ||
-               expr_mentions_global(e->slice.end, g, depth + 1);
-    return false;   /* partial by design: unlisted kinds yield "no", never a new rejection */
+    return false;
 }
-static bool assign_reads_own_target(Node *value, Symbol *tgt) {
-    return expr_mentions_global(value, tgt, 0);
+
+/* Predicate 1 — the place IS global `ctx`: a bare identifier naming it (the
+ * pre-BUG-981 test, kept: a bare pointer ident reads the POINTER, not what it
+ * aliases, so it is deliberately not resolved), or a deref / field / index /
+ * slice whose referent the SHARED resolver lands on it. The value side now asks
+ * the same question, through the same resolver, as the target side. */
+static bool place_is_global(Checker *c, Node *place, void *ctx) {
+    Symbol *g = (Symbol *)ctx;
+    if (!place || !g) return false;
+    if (place->kind == NODE_IDENT)
+        return place->ident.name_len == g->name_len &&
+               memcmp(place->ident.name, g->name, g->name_len) == 0;
+    return resolve_write_target_global(c, place, 0) == g;
+}
+
+static bool assign_reads_own_target(Checker *c, Node *value, Symbol *tgt) {
+    return expr_reads_place(c, value, place_is_global, tgt, 0);
 }
 
 /* BUG-801: does this function read-modify-write through pointer parameter n?
@@ -3386,15 +3873,33 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt) {
  * cached on the Symbol; a call site then just tests a bit. */
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth);
 
-/* Root ident of an assignment target, seeing through deref/field/index. */
+/* Root ident of an assignment target, seeing through deref/field/index/slice
+ * (a bit-range write `p[3..0] = v` is a slice node — BUG-834). */
 static Node *rmw_target_root_ident(Node *t) {
     while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX ||
+                 t->kind == NODE_SLICE ||
                  (t->kind == NODE_UNARY && t->unary.op == TOK_STAR))) {
         if (t->kind == NODE_FIELD) t = t->field.object;
         else if (t->kind == NODE_INDEX) t = t->index_expr.object;
+        else if (t->kind == NODE_SLICE) t = t->slice.object;
         else t = t->unary.operand;
     }
     return (t && t->kind == NODE_IDENT) ? t : NULL;
+}
+
+static bool target_is_bit_range(Checker *c, Node *target);
+
+/* Predicate 2 — the place is rooted at the identifier `ctx` (a Node *ident):
+ * the per-function summary asks whether a written-out RMW reads through the
+ * same PARAM its target is reached through (`*p = *p + 1`, `*p = @truncate(u32,
+ * *p) + 1`, `p.f = idfn(p.f) + 1`). Name-rooted, not resolved: inside a summary
+ * the param is bound to nothing yet — the call SITE binds it. */
+static bool place_rooted_at_ident(Checker *c, Node *place, void *ctx) {
+    (void)c;
+    Node *want = (Node *)ctx;
+    Node *r = rmw_target_root_ident(place);
+    return r && want && r->ident.name_len == want->ident.name_len &&
+           memcmp(r->ident.name, want->ident.name, r->ident.name_len) == 0;
 }
 
 static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int depth) {
@@ -3402,16 +3907,16 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
     if (n->kind == NODE_ASSIGN) {
         Node *root = rmw_target_root_ident(n->assign.target);
         if (root) {
-            bool is_rmw = (n->assign.op != TOK_EQ);
+            bool is_rmw = (n->assign.op != TOK_EQ) ||
+                          target_is_bit_range(c, n->assign.target);   /* BUG-834 */
             if (!is_rmw) {
-                /* written-out `*p = *p + 1` — the value mentions the same root.
-                 * Recursive, not an explicit stack: a fixed stack that overflows
-                 * would stop looking and report NO rmw, and a missed rmw is a
-                 * missed race (the same "which way does the bail-out round?"
-                 * question the atomic-cell path walk answered). Mirrors
-                 * expr_mentions_global above. */
-                is_rmw = expr_mentions_name(n->assign.value, root->ident.name,
-                                            (uint32_t)root->ident.name_len, 0);
+                /* written-out `*p = *p + 1` — the value reads a place rooted at
+                 * the same param. BUG-981: THE shared walker; the private
+                 * `expr_mentions_name` this used never got BUG-856's intrinsic /
+                 * call / orelse / slice arms, so `*p = @truncate(u32, *p) + 1`
+                 * in a helper set no bit and the race through it compiled. */
+                is_rmw = expr_reads_place(c, n->assign.value, place_rooted_at_ident,
+                                          root, 0);
             }
             if (is_rmw) {
                 for (int pi = 0; pi < fd->func_decl.param_count && pi < 64; pi++) {
@@ -3468,6 +3973,14 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
         rmw_scan_body(c, n->critical.body, fd, mask, depth + 1);
     } else if (n->kind == NODE_DEFER) {
         rmw_scan_body(c, n->defer.body, fd, mask, depth + 1);
+    } else if (n->kind == NODE_ONCE) {
+        rmw_scan_body(c, n->once.body, fd, mask, depth + 1);
+    } else if (n->kind == NODE_SWITCH) {
+        /* BUG-981: switch arms were not descended — an RMW inside one set no bit */
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            rmw_scan_body(c, n->switch_stmt.arms[i].body, fd, mask, depth + 1);
+    } else if (n->kind == NODE_RETURN) {
+        rmw_scan_body(c, n->ret.expr, fd, mask, depth + 1);
     }
 }
 
@@ -3802,14 +4315,55 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
     case NODE_ORELSE:
         return expr_touches_local_derived(c, expr->orelse.expr) ||
                expr_touches_local_derived(c, expr->orelse.fallback);
-    default:
-        /* AUDIT-LOUD exempt: this default is intentional — leaf and statement
-         * nodes can't carry a chain to a local-derived pointer. New NODE_
-         * kinds that introduce arithmetic chains should be added as explicit
-         * cases above. Walker is for stack-escape-via-arithmetic detection
-         * (EW8I0 BUG-664); false negative here = safety hole. */
+    /* BUG-987: NODE_CALL used to land in a `default: return false` here, so a
+     * stack address laundered through a CALL escaped to a global unflagged:
+     *
+     *     usize g;  usize idfn(usize x) { return x; }
+     *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }   // was ACCEPTED
+     *
+     * Every sibling launder form — arithmetic, cast, intrinsic, field store,
+     * array element, orelse, struct-init — was caught; only the call form was
+     * not, because the walker's default answered "no" for every kind nobody had
+     * thought of, and its OWN comment said "false negative here = safety hole".
+     * Conservative by construction (the argument-precise barrier principle,
+     * BUG-740): a callee HANDED a local-derived value may return it, and this
+     * per-file + summaries model has no integer-provenance summary to prove
+     * otherwise. Answering "yes" can only OVER-reject. No `default:` — a new
+     * NodeKind fails the build here. */
+    case NODE_CALL:
+        if (expr_touches_local_derived(c, expr->call.callee)) return true;
+        for (int i = 0; i < expr->call.arg_count; i++)
+            if (expr_touches_local_derived(c, expr->call.args[i])) return true;
+        return false;
+    case NODE_SLICE:
+        return expr_touches_local_derived(c, expr->slice.object) ||
+               expr_touches_local_derived(c, expr->slice.start) ||
+               expr_touches_local_derived(c, expr->slice.end);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            if (expr_touches_local_derived(c, expr->struct_init.fields[i].value))
+                return true;
+        return false;
+    case NODE_ASSIGN:
+        return expr_touches_local_derived(c, expr->assign.value);
+    /* Leaves and statements: nothing to chain through. Listed explicitly so a
+     * new kind is a build error, not a silent "no". */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
+    return false;
 }
 
 /* ---- ISR / @critical alloc ban helper ---- */
@@ -7002,7 +7556,7 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
             bool is_rmw = (node->assign.op != TOK_EQ) ||
                           target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
-                          (gs && assign_reads_own_target(node->assign.value, gs));
+                          (gs && assign_reads_own_target(c, node->assign.value, gs));
             if (is_rmw && gs && !gs->is_function)
                 track_isr_global(c, gs->name, gs->name_len, true);
         }
@@ -7442,9 +7996,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
-                        tsym->container_struct = NULL;
-                        tsym->container_field = NULL;
-                        tsym->container_field_len = 0;
+                        /* BUG-984: clears BOTH halves of the @container fact —
+                         * a reassigned pointer must not keep a stale
+                         * whole-object claim any more than a stale field one. */
+                        set_container_prov_unknown(tsym);
                         /* HOLE FIX (§B #10): whole-ident slice target assigned a
                          * local array / slice-of-local — mark local-derived so
                          * `s = arr; return s;` (and g=s / &s[i]) is caught. The
@@ -7545,10 +8100,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                             /* provenance propagation through alias (compile-time belt) */
                             if (src && src->provenance_type) tsym->provenance_type = src->provenance_type;
+                            if (src && src->byteview_origin) tsym->byteview_origin = src->byteview_origin;  /* BUG-995 */
                             if (src && src->container_struct) {
-                                tsym->container_struct = src->container_struct;
-                                tsym->container_field = src->container_field;
-                                tsym->container_field_len = src->container_field_len;
+                                set_container_prov_field(tsym, src->container_struct,
+                                    src->container_field, src->container_field_len);
+                            } else if (src && src->is_whole_object_addr) {
+                                /* BUG-984: the whole-object fact rides an alias
+                                 * exactly as the field fact does — `*Inner a = &i;
+                                 * *Inner b = a;` must still reject @container(b). */
+                                set_container_prov_whole(tsym);
                             }
                         }
                         /* BUG-750: `tmp.ref = local[0..]` field-store of a slice
@@ -7579,6 +8139,9 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* BUG-995: re-pointed — the byte-view origin is re-derived
+                         * from the new value (NULL when it is not a view). */
+                        tsym->byteview_origin = byteview_origin_of(c, vcheck);
                         /* @ptrcast provenance on assignment (compile-time belt) */
                         if (vcheck->kind == NODE_INTRINSIC &&
                             vcheck->intrinsic.name_len == 7 &&
@@ -7608,19 +8171,16 @@ static Type *check_expr(Checker *c, Node *node) {
                                 if (tkey.len > 0) prov_map_set(c, tkey.str, (uint32_t)tkey.len, src->provenance_type);
                             }
                         }
-                        /* @container provenance: val = &struct.field */
-                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP &&
-                            vcheck->unary.operand->kind == NODE_FIELD) {
-                            Node *fn = vcheck->unary.operand;
-                            Type *ot = typemap_get(c, fn->field.object);
-                            if (ot) {
-                                Type *st = type_unwrap_distinct(ot);
-                                if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
-                                if (st && st->kind == TYPE_STRUCT) {
-                                    tsym->container_struct = st;
-                                    tsym->container_field = fn->field.field_name;
-                                    tsym->container_field_len = (uint32_t)fn->field.field_name_len;
-                                }
+                        /* @container provenance: val = &struct.field, or
+                         * (BUG-984) val = &wholeObject — same classifier as the
+                         * var-decl sink so the two cannot diverge. */
+                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP) {
+                            Type *st = NULL; const char *cfn = NULL; uint32_t cfl = 0;
+                            switch (classify_amp_operand(c, vcheck->unary.operand,
+                                                         &st, &cfn, &cfl)) {
+                            case CPROV_FIELD: set_container_prov_field(tsym, st, cfn, cfl); break;
+                            case CPROV_WHOLE: set_container_prov_whole(tsym); break;
+                            case CPROV_UNKNOWN: break;
                             }
                         }
                         /* @ptrtoint(&local) on assignment → mark target as local-derived.
@@ -8022,6 +8582,30 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
         }
+        /* BUG-987: the INTEGER sibling of the cluster above. The gate there is
+         * `type_carries_data_pointer(value)`, which is false for `usize` — so a
+         * frame address laundered as an INTEGER through a call
+         * (`g = idfn(@ptrtoint(&local))`) reached a global unflagged, while
+         * every non-call spelling of the same launder is rejected. */
+        if (node->assign.op == TOK_EQ && value &&
+            ptr_width_int_type(c, value)) {
+            Node *iroot = node->assign.value;
+            while (iroot && (iroot->kind == NODE_FIELD || iroot->kind == NODE_INDEX)) {
+                if (iroot->kind == NODE_FIELD) iroot = iroot->field.object;
+                else iroot = iroot->index_expr.object;
+            }
+            if (iroot && iroot->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, iroot)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of call given @ptrtoint of a local — "
+                        "the address dangles when the function returns "
+                        "(store the DATA, not the address)");
+                }
+            }
+        }
 
         /* BUG-240/377: nested array→slice escape via assignment to global/static.
          * global_s = s.arr where s is local — walk value chain to root.
@@ -8415,6 +8999,18 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_numeric(target) || !type_is_numeric(value)) {
                 checker_error(c, node->loc.line,
                     "compound assignment requires numeric types");
+            }
+            /* BUG-986 (2026-09-06): `a += f` did what `a = f` is refused, and so
+             * bypassed the float->int SATURATION that BUG-845/883 define — the
+             * emitted `a += f` is a raw C conversion, UB out of range (measured
+             * with f = 1e20: 0 at -O0, 255 at -O2). The other direction
+             * (`f += n`) is the same plain/compound split. Convert explicitly:
+             * `a += (u32)f` saturates, `f += (f32)n` converts. */
+            else if (type_is_float(target) != type_is_float(value)) {
+                checker_error(c, node->loc.line,
+                    "compound assignment mixes '%s' and '%s' (float and integer) — "
+                    "convert explicitly: '(T)x' saturates a float into an integer",
+                    type_name(target), type_name(value));
             }
             /* bitwise compound (&= |= ^= <<= >>=) require integer, not float */
             if (node->assign.op == TOK_AMPEQ || node->assign.op == TOK_PIPEEQ ||
@@ -11596,15 +12192,45 @@ static Type *check_expr(Checker *c, Node *node) {
                                  * provenance cannot be proven wrong); this fires only
                                  * when both pointees are concrete and exactly one is an
                                  * enum. Corpus cost: no @ptrcast to an enum pointee. */
-                                if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
-                                    (g1_sk == TYPE_ENUM) != (g1_tk == TYPE_ENUM)) {
-                                    checker_error(c, node->loc.line,
-                                        "@ptrcast between '%s' and '%s' reinterprets an "
-                                        "integer as an enum — the dereference would yield "
-                                        "a value that is not a declared variant. Read the "
-                                        "carrier and use @bitcast, which is variant-checked",
-                                        type_name(val_type), type_name(result));
+                                /* BUG-985: `bool` is the other CONSTRAINED type (its
+                                 * legal values are 0/1 in a u8 carrier), so
+                                 * `@ptrcast(*bool, u8ptr)` minted a *bool whose load is
+                                 * neither true nor false — measured: `b == true` and
+                                 * `b == false` both false, exit 3. Fires when either
+                                 * pointee is constrained and the pointees differ. */
+                                {
+                                    bool g1_s_con = (g1_sk == TYPE_ENUM || g1_sk == TYPE_BOOL);
+                                    bool g1_t_con = (g1_tk == TYPE_ENUM || g1_tk == TYPE_BOOL);
+                                    if (g1_sk != TYPE_OPAQUE && g1_tk != TYPE_OPAQUE &&
+                                        (g1_s_con || g1_t_con) &&
+                                        !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                                     type_unwrap_distinct(g1_tgt->pointer.inner))) {
+                                        checker_error(c, node->loc.line,
+                                            "@ptrcast between '%s' and '%s' reinterprets an "
+                                            "integer as an enum or bool — the dereference would "
+                                            "yield a value that is not a declared variant. Read "
+                                            "the carrier and use @bitcast, which is variant-checked",
+                                            type_name(val_type), type_name(result));
+                                    }
                                 }
+                                /* BUG-995 (2026-09-13): the @pun widening rule (BH-18 #4)
+                                 * never had a @ptrcast sibling, and this is the door that
+                                 * DOCUMENTS the primitive byte-view as allowed. The
+                                 * byte-view idiom NARROWS (`*u32 -> *u8`, struct -> `*u8`);
+                                 * the reverse WIDENS and reads past the object:
+                                 *
+                                 *     u8 small = 1;  *u32 p = @ptrcast(*u32, &small);  *p
+                                 *
+                                 * compiled clean and read three bytes past a one-byte
+                                 * stack object (a write through it corrupts the frame,
+                                 * silently on bare metal). Same statically-decidable
+                                 * test as @pun: both pointees concrete with known sizes,
+                                 * target larger. *opaque / unknown sizes keep today's
+                                 * behaviour. Shared with @bitcast below. */
+                                reject_pointee_widening(c, node->loc.line, "@ptrcast",
+                                                        node->intrinsic.args[0],
+                                                        eff->pointer.inner,
+                                                        g1_tgt->pointer.inner);
                                 if (g1_s_agg && g1_t_agg) {
                                     Type *g1_si = type_unwrap_distinct(eff->pointer.inner);
                                     Type *g1_ti = type_unwrap_distinct(g1_tgt->pointer.inner);
@@ -11725,6 +12351,70 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "reads past the %lld-byte source (out-of-bounds)",
                                     (long long)dst_sz, (long long)src_sz);
                             }
+
+                            /* BUG-982: the SAME-SIZE half of the same defect.
+                             *
+                             * BH-18 #4 (just above) closed the case where a
+                             * type_id-less pun reads PAST the source. It left the
+                             * case where it reads exactly IN BOUNDS and forges a
+                             * value the rest of the compiler trusts. Measured on
+                             * the pre-fix compiler, all accepted with no
+                             * diagnostic and no trap:
+                             *
+                             *   struct P { *u32 p; }   *P pp = @pun(*P, u64ptr);
+                             *       -> an integer became a working pointer, with
+                             *          no @inttoptr and no `mmio` declaration. That
+                             *          is the grammar-level closure ZER's safety
+                             *          claim rests on, bypassed by an intrinsic.
+                             *   struct Box { State s; } -> a forged enum, and the
+                             *          exhaustive-switch lowering emits the LAST arm
+                             *          as an unconditional else, so a value in no
+                             *          variant DISPATCHES TO AN ARM (measured).
+                             *   struct BW { bool b; }  -> a `bool` holding 200.
+                             *   struct FW { *(u32)->u32 f; } -> a call through it.
+                             *
+                             * Hosted, a wild address is caught by the SIGSEGV
+                             * handler; freestanding there is no handler, so on
+                             * bare metal it is a silent wild access. And a forged
+                             * pointer that happens to be VALID is silent everywhere.
+                             *
+                             * Why it was invisible: the emitted check is
+                             * `type_id != TGT && type_id != 0`, and only
+                             * struct/enum/union pointees carry an id. With a
+                             * primitive on either side the constant is 0 and the
+                             * check is vacuous — while @ptrcast's own diagnostic
+                             * tells users to reach for "@pun ... for an explicit
+                             * runtime-checked pun". The advertised check did not
+                             * exist for these sources.
+                             *
+                             * Scope, deliberately narrow: only when the runtime
+                             * check CANNOT fire, only when the pointee types
+                             * actually differ, and only when the TARGET carries a
+                             * value with a validity invariant. Reinterpreting bytes
+                             * into plain integers/floats forges nothing, so
+                             * `@pun(*u8, structptr)` — the byte-view idiom — still
+                             * compiles. An *opaque source is excluded above: that
+                             * is the FFI floor, where the check IS dynamic. */
+                            if (tgt_eff_pun_strip &&
+                                !pun_type_id_check_can_fire(eff->pointer.inner,
+                                                            tgt_eff_pun_strip->pointer.inner) &&
+                                !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                             type_unwrap_distinct(tgt_eff_pun_strip->pointer.inner)) &&
+                                type_carries_forgeable(tgt_eff_pun_strip->pointer.inner, 0)) {
+                                char tgtbuf[128];
+                                snprintf(tgtbuf, sizeof tgtbuf, "%s",
+                                         type_name(tgt_eff_pun_strip->pointer.inner));
+                                checker_error(c, node->loc.line,
+                                    "@pun cannot forge '%s' from '%s' — the target "
+                                    "carries a pointer, slice, enum, bool, optional "
+                                    "or handle, whose validity the rest of the "
+                                    "program trusts, and neither pointee carries a "
+                                    "runtime type_id so the @pun check cannot fire. "
+                                    "Use @inttoptr for an address, a [*]u8 slice to "
+                                    "parse bytes, or pun between two struct types "
+                                    "(which IS runtime-checked)",
+                                    tgtbuf, type_name(eff->pointer.inner));
+                            }
                         }
                     }
                 }
@@ -11782,6 +12472,13 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (src_eff && tgt_eff_b &&
                             type_dispatch_kind(src_eff) == TYPE_POINTER &&
                             type_dispatch_kind(tgt_eff_b) == TYPE_POINTER) {
+                            /* BUG-995: the third pointer-cast door — same widening test
+                             * as @pun and @ptrcast (`@bitcast(*u32, u8ptr)` read past the
+                             * object exactly as @ptrcast did). */
+                            reject_pointee_widening(c, node->loc.line, "@bitcast",
+                                                    node->intrinsic.args[0],
+                                                    src_eff->pointer.inner,
+                                                    tgt_eff_b->pointer.inner);
                             TypeKind bc_sk = type_dispatch_kind(src_eff->pointer.inner);
                             TypeKind bc_tk = type_dispatch_kind(tgt_eff_b->pointer.inner);
                             bool bc_s_agg = (bc_sk == TYPE_STRUCT || bc_sk == TYPE_UNION);
@@ -11908,6 +12605,59 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@inttoptr target must be a pointer type, got '%s'",
                             type_name(result));
+                    }
+                    /* BUG-983: the FOURTH enum-forging door.
+                     *
+                     * The enum-forge door set was documented as closed at three
+                     * (@bitcast, @truncate, @saturate), on the reasoning recorded
+                     * at emit_enum_variant_guard_path: "ZER has no int->enum cast,
+                     * so every other path to an enum value is a declared variant."
+                     * @inttoptr IS an int->pointer cast, and dereferencing what it
+                     * returns produces an enum value out of arbitrary foreign bits:
+                     *
+                     *     volatile *State reg = @inttoptr(*State, addr);
+                     *     switch (*reg) { .idle => ... .running => ... .done => ... }
+                     *
+                     * Measured pre-fix with the register holding 200: no diagnostic,
+                     * no guard emitted, and the switch RETURNED 3. Exhaustive-enum
+                     * lowering emits the LAST arm as an unconditional else — sound
+                     * only while every enum value really is a declared variant — so
+                     * a value in no variant DISPATCHES TO AN ARM. Same through a
+                     * struct field (`*Regs` with a `State` member). Bare metal makes
+                     * it worse, not better: there is no fault handler, so nothing
+                     * downstream ever notices.
+                     *
+                     * REJECTED rather than guarded, deliberately. The guard would
+                     * have to fire at every READ through the pointer (deref, field,
+                     * index, nested) — a new N-sink surface — whereas the idiom the
+                     * documentation already teaches goes through a door that IS
+                     * guarded: read the register as an integer, then convert.
+                     * Rejecting therefore keeps the door set CLOSED AT THREE instead
+                     * of adding a fourth that needs its own guard everywhere.
+                     * Corpus cost measured before shipping: ZERO — no test, example
+                     * or library file names an enum-carrying @inttoptr target.
+                     *
+                     * Scoped to ENUMS on purpose. A pointer-carrying MMIO struct is
+                     * a different question (@inttoptr IS the sanctioned int->pointer
+                     * door, and `lib/compat.zer` relies on `@inttoptr(*opaque, ...)`),
+                     * and no wrong-dispatch defect has been measured for it. See
+                     * docs/limitations.md. */
+                    if (type_dispatch_kind(res_eff) == TYPE_POINTER &&
+                        res_eff->pointer.inner &&
+                        (type_carries_enum_c(res_eff->pointer.inner, 0) ||
+                         type_carries_bool_c(res_eff->pointer.inner, 0))) {
+                        /* BUG-985: `bool` is the other constrained pointee — the
+                         * same door, the same measured consequence (a byte that is
+                         * neither 0 nor 1 matched no switch arm / no comparison). */
+                        checker_error(c, node->loc.line,
+                            "@inttoptr cannot produce a pointer to '%s' — it carries "
+                            "an enum or bool, and the bits at a hardware address are not "
+                            "guaranteed to be a declared variant, which an exhaustive "
+                            "switch relies on. Read the register as an integer and "
+                            "convert: 'volatile *u32 r = @inttoptr(*u32, addr); "
+                            "State s = @bitcast(State, *r);' — that conversion is "
+                            "checked at runtime",
+                            type_name(res_eff->pointer.inner));
                     }
                 }
                 if (node->intrinsic.arg_count > 0) {
@@ -13210,36 +13960,85 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
                 /* provenance check: if source pointer has container provenance,
-                 * target struct + field must match */
-                if (node->intrinsic.arg_count > 0 &&
-                    node->intrinsic.args[0]->kind == NODE_IDENT) {
-                    Symbol *src_sym = scope_lookup(c->current_scope,
-                        node->intrinsic.args[0]->ident.name,
-                        (uint32_t)node->intrinsic.args[0]->ident.name_len);
-                    if (src_sym && src_sym->container_struct) {
-                        /* check struct matches */
-                        if (tgt && tgt->kind == TYPE_STRUCT &&
-                            tgt != src_sym->container_struct) {
-                            checker_error(c, node->loc.line,
-                                "@container: pointer provenance is struct '%.*s' "
-                                "but target is '%.*s'",
-                                (int)src_sym->container_struct->struct_type.name_len,
-                                src_sym->container_struct->struct_type.name,
-                                (int)tgt->struct_type.name_len, tgt->struct_type.name);
+                 * target struct + field must match.
+                 *
+                 * BUG-984: resolve the provenance from EITHER shape of arg0 —
+                 * a variable carrying the fact, or a `&expr` written straight
+                 * into the call. `@container(*Outer, &i, in)` used to skip this
+                 * block entirely (it tested `kind == NODE_IDENT`), so the direct
+                 * spelling of the very thing being checked was unchecked. One
+                 * resolution, one set of rules, both sinks. */
+                Type *prov_struct = NULL;
+                const char *prov_field = NULL;
+                uint32_t prov_field_len = 0;
+                bool prov_whole = false;
+                if (node->intrinsic.arg_count > 0) {
+                    Node *a0 = node->intrinsic.args[0];
+                    if (a0->kind == NODE_IDENT) {
+                        Symbol *src_sym = scope_lookup(c->current_scope,
+                            a0->ident.name, (uint32_t)a0->ident.name_len);
+                        if (src_sym) {
+                            prov_struct = src_sym->container_struct;
+                            prov_field = src_sym->container_field;
+                            prov_field_len = src_sym->container_field_len;
+                            prov_whole = src_sym->is_whole_object_addr;
                         }
-                        /* check field matches */
-                        if (node->intrinsic.arg_count > 1 &&
-                            node->intrinsic.args[1]->kind == NODE_IDENT) {
-                            const char *fn = node->intrinsic.args[1]->ident.name;
-                            uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
-                            if (src_sym->container_field_len != fl ||
-                                memcmp(src_sym->container_field, fn, fl) != 0) {
-                                checker_error(c, node->loc.line,
-                                    "@container: pointer was derived from field '%.*s' "
-                                    "but used with field '%.*s'",
-                                    (int)src_sym->container_field_len, src_sym->container_field,
-                                    (int)fl, fn);
-                            }
+                    } else if (a0->kind == NODE_UNARY && a0->unary.op == TOK_AMP) {
+                        switch (classify_amp_operand(c, a0->unary.operand,
+                                                     &prov_struct, &prov_field,
+                                                     &prov_field_len)) {
+                        case CPROV_WHOLE:   prov_whole = true; break;
+                        case CPROV_FIELD:   break;   /* fields already written out */
+                        case CPROV_UNKNOWN: prov_struct = NULL; break;
+                        }
+                    }
+                }
+                if (prov_whole) {
+                    /* The pointer is the address of a COMPLETE object, so it is
+                     * nobody's member. @container subtracts the field offset and
+                     * hands back a pointer BEFORE that object: every read through
+                     * it is out of bounds. Measured pre-fix: accepted with no
+                     * diagnostic, no trap, and ASan reporting stack-buffer-underflow
+                     * (a global source gives global-buffer-underflow). Statically
+                     * decidable, so reject — same call the @pun widening rule makes
+                     * for the same reason. */
+                    checker_error(c, node->loc.line,
+                        "@container: the pointer is the address of a whole object, "
+                        "not of a field inside a '%.*s' — subtracting the field "
+                        "offset reads before the object. Pass a pointer obtained as "
+                        "'&outer.%.*s'",
+                        (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT)
+                            ? (int)tgt->struct_type.name_len : 6,
+                        (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT)
+                            ? tgt->struct_type.name : "struct",
+                        (node->intrinsic.arg_count > 1 &&
+                         node->intrinsic.args[1]->kind == NODE_IDENT)
+                            ? (int)node->intrinsic.args[1]->ident.name_len : 5,
+                        (node->intrinsic.arg_count > 1 &&
+                         node->intrinsic.args[1]->kind == NODE_IDENT)
+                            ? node->intrinsic.args[1]->ident.name : "field");
+                } else if (prov_struct) {
+                    /* check struct matches */
+                    if (tgt && type_dispatch_kind(tgt) == TYPE_STRUCT &&
+                        tgt != prov_struct) {
+                        checker_error(c, node->loc.line,
+                            "@container: pointer provenance is struct '%.*s' "
+                            "but target is '%.*s'",
+                            (int)prov_struct->struct_type.name_len,
+                            prov_struct->struct_type.name,
+                            (int)tgt->struct_type.name_len, tgt->struct_type.name);
+                    }
+                    /* check field matches */
+                    if (node->intrinsic.arg_count > 1 &&
+                        node->intrinsic.args[1]->kind == NODE_IDENT && prov_field) {
+                        const char *fn = node->intrinsic.args[1]->ident.name;
+                        uint32_t fl = (uint32_t)node->intrinsic.args[1]->ident.name_len;
+                        if (prov_field_len != fl ||
+                            memcmp(prov_field, fn, fl) != 0) {
+                            checker_error(c, node->loc.line,
+                                "@container: pointer was derived from field '%.*s' "
+                                "but used with field '%.*s'",
+                                (int)prov_field_len, prov_field, (int)fl, fn);
                         }
                     }
                 }
@@ -14033,21 +14832,72 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         _scan_global_depth--;
         return found;
     }
-    if (n->kind == NODE_BLOCK) {
+    /* BUG-993 (2026-09-02): this was an if/else CHAIN over five kinds
+     * (RETURN/BLOCK/IF/WHILE/FOR). A `return <racy funcname>` sitting in any
+     * OTHER body-bearing statement was invisible, so the factory looked like it
+     * returned nothing reachable and the spawn was ACCEPTED. Measured live on
+     * main with a discriminating probe (the factory's only racy return inside
+     * the construct, a safe `return nop;` on the fall-through so no other arm
+     * can mask the result):
+     *
+     *     switch (k) { 0 => { return cb; } default => { } }   -> ACCEPTED
+     *     do { if (k == 9) { return cb; } } while (k > 0);    -> ACCEPTED
+     *
+     * where `cb` does `g += 1` on a non-shared global — a real data race from
+     * the spawned thread, with no diagnostic.
+     *
+     * Now a no-`default:` exhaustive switch, so -Werror=switch forces every
+     * future NodeKind to be classified here instead of silently answering "no".
+     * That is the durable half of the fix: the if-chain form is invisible to
+     * both tools/walker_default_audit.sh and tools/audit_walker_fields.sh, which
+     * is why two of the eleven forms survived four sessions of REACH work. */
+    switch (n->kind) {
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             if (scan_returned_funcname(c, n->block.stmts[i], depth, out_name, out_len))
                 return true;
         return false;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         if (scan_returned_funcname(c, n->if_stmt.then_body, depth + 1, out_name, out_len))
             return true;
         return scan_returned_funcname(c, n->if_stmt.else_body, depth + 1, out_name, out_len);
-    }
-    if (n->kind == NODE_WHILE)
+    case NODE_WHILE:
+    case NODE_DO_WHILE:   /* DO_WHILE was the missing sibling of WHILE. */
         return scan_returned_funcname(c, n->while_stmt.body, depth + 1, out_name, out_len);
-    if (n->kind == NODE_FOR)
+    case NODE_FOR:
         return scan_returned_funcname(c, n->for_stmt.body, depth + 1, out_name, out_len);
+    case NODE_SWITCH:
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (scan_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1,
+                                       out_name, out_len))
+                return true;
+        return false;
+    case NODE_DEFER:
+        return scan_returned_funcname(c, n->defer.body, depth + 1, out_name, out_len);
+    case NODE_CRITICAL:
+        return scan_returned_funcname(c, n->critical.body, depth + 1, out_name, out_len);
+    case NODE_ONCE:
+        return scan_returned_funcname(c, n->once.body, depth + 1, out_name, out_len);
+    /* Kinds that cannot CONTAIN a `return` statement. NODE_RETURN itself is
+     * handled above. Listed explicitly (no `default:`) so a new body-bearing
+     * NodeKind fails the build here rather than reopening this hole. */
+    case NODE_RETURN:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
     return false;
 }
 
@@ -14387,7 +15237,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * one immediately). */
             bool _is_rmw = (node->assign.op != TOK_EQ) ||
                            target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
-                           (ts && assign_reads_own_target(node->assign.value, ts));
+                           (ts && assign_reads_own_target(c, node->assign.value, ts));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
                                             _is_rmw ? 1 : 0) == 0) {
@@ -15370,6 +16220,8 @@ static void check_stmt(Checker *c, Node *node) {
                         if (src_type) sym->provenance_type = src_type;
                     }
                 }
+                /* BUG-995: a primitive byte view remembers what it views */
+                sym->byteview_origin = byteview_origin_of(c, init);
                 /* C-style cast to *opaque — same provenance as @ptrcast */
                 if (init->kind == NODE_TYPECAST) {
                     Type *eff = type_unwrap_distinct(type);
@@ -15396,10 +16248,13 @@ static void check_stmt(Checker *c, Node *node) {
                             prov_root->ident.name, (uint32_t)prov_root->ident.name_len);
                         if (src && src->provenance_type)
                             sym->provenance_type = src->provenance_type;
+                        if (src && src->byteview_origin)
+                            sym->byteview_origin = src->byteview_origin;   /* BUG-995 */
                         if (src && src->container_struct) {
-                            sym->container_struct = src->container_struct;
-                            sym->container_field = src->container_field;
-                            sym->container_field_len = src->container_field_len;
+                            set_container_prov_field(sym, src->container_struct,
+                                src->container_field, src->container_field_len);
+                        } else if (src && src->is_whole_object_addr) {
+                            set_container_prov_whole(sym);
                         }
                     }
                 }
@@ -15444,22 +16299,17 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
-            /* @container provenance: track struct+field when ptr = &struct.field */
+            /* @container provenance: track struct+field when ptr = &struct.field,
+             * and (BUG-984) the WHOLE-OBJECT case when ptr = &wholeObject. */
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
-                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP &&
-                    init->unary.operand->kind == NODE_FIELD) {
-                    Node *field_node = init->unary.operand;
-                    Type *obj_type = typemap_get(c, field_node->field.object);
-                    if (obj_type) {
-                        Type *st = type_unwrap_distinct(obj_type);
-                        /* walk through pointer auto-deref */
-                        if (st && st->kind == TYPE_POINTER) st = type_unwrap_distinct(st->pointer.inner);
-                        if (st && st->kind == TYPE_STRUCT) {
-                            sym->container_struct = st;
-                            sym->container_field = field_node->field.field_name;
-                            sym->container_field_len = (uint32_t)field_node->field.field_name_len;
-                        }
+                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                    Type *st = NULL; const char *fn = NULL; uint32_t fl = 0;
+                    switch (classify_amp_operand(c, init->unary.operand,
+                                                 &st, &fn, &fl)) {
+                    case CPROV_FIELD:   set_container_prov_field(sym, st, fn, fl); break;
+                    case CPROV_WHOLE:   set_container_prov_whole(sym); break;
+                    case CPROV_UNKNOWN: break;
                     }
                 }
             }
@@ -16789,6 +17639,9 @@ static void check_stmt(Checker *c, Node *node) {
                 int rc = classify_return_root(c, node->ret.expr);
                 if (rc == RET_UNKNOWN) c->cur_ret_summary_complete = false;
                 else if (rc >= 0) c->cur_ret_param_mask |= (1ull << rc);
+                /* BUG-987: the ADDRESS-as-integer summary (see return_addr_param) */
+                int ra = return_addr_param(c, node->ret.expr);
+                if (ra >= 0) c->cur_ret_addr_param_mask |= (1ull << ra);
             }
 
             /* string literal returned as mutable slice → .rodata write risk
@@ -16863,6 +17716,16 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
+            }
+            /* BUG-987: the same address laundered through a CALL —
+             * `return idfn(@ptrtoint(&local));`. The direct spelling above and
+             * the indirect `usize a = @ptrtoint(&x); return a;` (caught by
+             * is_local_derived) were both covered; the call form was not. */
+            if (node->ret.expr->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, node->ret.expr)) {
+                checker_error(c, node->loc.line,
+                    "cannot return result of call given @ptrtoint of a local — "
+                    "the address dangles after the function returns");
             }
 
             /* scope escape: return local array as slice → dangling pointer
@@ -20598,6 +21461,7 @@ static void check_func_body(Checker *c, Node *node) {
          * after the body). */
         c->cur_ret_summary_complete = true;
         c->cur_ret_param_mask = 0;
+        c->cur_ret_addr_param_mask = 0;   /* BUG-987 */
         /* §C #15: reset the value-range map at each function-body entry. VarRange
          * is keyed by variable NAME with no scope discriminator, so ranges derived
          * in an EARLIER function (e.g. `if (i >= 16) return;` narrowing param `i`
@@ -20695,6 +21559,14 @@ static void check_func_body(Checker *c, Node *node) {
             if (ret_eff && type_dispatch_kind(ret_eff) == TYPE_OPTIONAL)
                 ret_eff = type_unwrap_distinct(ret_eff->optional.inner);
             TypeKind rk = type_dispatch_kind(ret_eff);  /* unwraps distinct; NULL→VOID */
+            /* BUG-987: the address-as-integer summary is stored for EVERY body —
+             * the function that returns @ptrtoint(p) returns an integer, which is
+             * exactly the kind the view summary below is not kept for. */
+            if (node->func_decl.body) {
+                Symbol *asym = scope_lookup(c->current_scope,
+                    node->func_decl.name, (uint32_t)node->func_decl.name_len);
+                if (asym) asym->ret_addr_param_mask = c->cur_ret_addr_param_mask;
+            }
             if (node->func_decl.body &&
                 (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)) {
                 Symbol *fsym = scope_lookup(c->current_scope,
@@ -21107,6 +21979,27 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_ONCE:
         vrp_invalidate_loop_body_writes(c, body->once.body);
         break;
+    /* BUG-994 (2026-09-02): SPAWN args, the AWAIT condition and the ASM operand
+     * expressions are EXPRESSIONS, not leaves — `spawn_stmt.args[]`,
+     * `await_stmt.cond` and `asm_stmt.inputs/outputs[].expr` (ast.h). All three
+     * sat in the no-op group below. BUG-826 fixed exactly this omission in the
+     * ISR walker (record_isr_globals) and the atomic-cell walker
+     * (record_atomic_plain_in_callee) but did not carry it to the VRP pair —
+     * the textbook multi-site miss. See the sibling pass for the measured
+     * consequence. */
+    case NODE_SPAWN:
+        for (int i = 0; i < body->spawn_stmt.arg_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        vrp_invalidate_loop_body_writes(c, body->await_stmt.cond);
+        break;
+    case NODE_ASM:
+        for (int i = 0; i < body->asm_stmt.input_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < body->asm_stmt.output_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->asm_stmt.outputs[i].expr);
+        break;
     /* Expression kinds walked only so a NESTED orelse (or assignment) is
      * reached — they write nothing themselves. */
     case NODE_BINARY:
@@ -21159,7 +22052,7 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_YIELD:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -21185,12 +22078,37 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
  * with a full range, so no later narrowing applies anywhere in the loop.
  * Over-widening is SOUND for VRP — it can only ADD a guard, never remove one —
  * and only address-taken vars are touched, so plain counters keep the precise
- * join. Mirrors the sibling's if/else-chain form (NOT a switch) so the
- * walker-default audit stays untouched. */
+ * join.
+ *
+ * BUG-994 (2026-09-02): this used to be an if/else CHAIN, whose trailing comment
+ * asserted that "all other NodeKind values are leaves ... no `&` subtree". That
+ * was FALSE for three kinds — NODE_SPAWN (`spawn_stmt.args[]`), NODE_AWAIT
+ * (`await_stmt.cond`) and NODE_ASM (operand exprs) all carry expressions. The
+ * measured consequence, verified on main:
+ *
+ *     u8[4] arr;  u32 idx = 0;
+ *     for (u32 i = 0; i < 3; i += 1) {
+ *         arr[idx] = 7;                                 // <- guard ELIDED
+ *         ThreadHandle th = spawn bump(&idx);           // bump does *p = 100
+ *         th.join();
+ *     }
+ *
+ * The identical program with a plain `bump(&idx);` emits
+ * `if ((size_t)(idx) >= 4u) { return 0; }`; the spawn form emitted NO guard at
+ * all, so iterations 2 and 3 executed `arr[100] = 7` — an out-of-bounds stack
+ * write with no compile-time diagnostic and no runtime check. On bare metal
+ * that is silent corruption with nothing to fault on.
+ *
+ * Converted to a no-`default:` exhaustive switch: -Werror=switch now forces
+ * every future NodeKind to be classified, which is what an if-chain can never
+ * do (it is invisible to tools/walker_default_audit.sh as well). Over-widening
+ * is SOUND for VRP — it can only ADD a guard, never remove one — so descending
+ * more is always the safe direction. */
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
     if (!n) return;
     NodeKind k = n->kind;
-    if (k == NODE_UNARY) {
+    switch (k) {
+    case NODE_UNARY:
         if (n->unary.op == TOK_AMP) {
             Node *root = n->unary.operand;
             while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -21209,71 +22127,117 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
             }
         }
         vrp_widen_loop_addr_taken(c, n->unary.operand);
-    } else if (k == NODE_BLOCK) {
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
-    } else if (k == NODE_IF) {
+        break;
+    case NODE_IF:
         vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
         vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
-    } else if (k == NODE_FOR) {
+        break;
+    case NODE_FOR:
         vrp_widen_loop_addr_taken(c, n->for_stmt.init);
         vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->for_stmt.step);
         vrp_widen_loop_addr_taken(c, n->for_stmt.body);
-    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
         vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->while_stmt.body);
-    } else if (k == NODE_SWITCH) {
+        break;
+    case NODE_SWITCH:
         vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
         for (int i = 0; i < n->switch_stmt.arm_count; i++)
             vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
-    } else if (k == NODE_EXPR_STMT) {
+        break;
+    case NODE_EXPR_STMT:
         vrp_widen_loop_addr_taken(c, n->expr_stmt.expr);
-    } else if (k == NODE_DEFER) {
+        break;
+    case NODE_DEFER:
         vrp_widen_loop_addr_taken(c, n->defer.body);
-    } else if (k == NODE_CRITICAL) {
+        break;
+    case NODE_CRITICAL:
         vrp_widen_loop_addr_taken(c, n->critical.body);
-    } else if (k == NODE_ONCE) {
+        break;
+    case NODE_ONCE:
         vrp_widen_loop_addr_taken(c, n->once.body);
-    } else if (k == NODE_VAR_DECL) {
+        break;
+    case NODE_VAR_DECL:
         vrp_widen_loop_addr_taken(c, n->var_decl.init);
-    } else if (k == NODE_RETURN) {
+        break;
+    case NODE_RETURN:
         vrp_widen_loop_addr_taken(c, n->ret.expr);
-    } else if (k == NODE_ASSIGN) {
+        break;
+    case NODE_ASSIGN:
         vrp_widen_loop_addr_taken(c, n->assign.target);
         vrp_widen_loop_addr_taken(c, n->assign.value);
-    } else if (k == NODE_CALL) {
+        break;
+    case NODE_CALL:
         /* THE case this pass exists for: `bump(&i)`. */
         vrp_widen_loop_addr_taken(c, n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->call.args[i]);
-    } else if (k == NODE_INTRINSIC) {
+        break;
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
-    } else if (k == NODE_BINARY) {
+        break;
+    case NODE_BINARY:
         vrp_widen_loop_addr_taken(c, n->binary.left);
         vrp_widen_loop_addr_taken(c, n->binary.right);
-    } else if (k == NODE_FIELD) {
+        break;
+    case NODE_FIELD:
         vrp_widen_loop_addr_taken(c, n->field.object);
-    } else if (k == NODE_INDEX) {
+        break;
+    case NODE_INDEX:
         vrp_widen_loop_addr_taken(c, n->index_expr.object);
         vrp_widen_loop_addr_taken(c, n->index_expr.index);
-    } else if (k == NODE_ORELSE) {
+        break;
+    case NODE_ORELSE:
         vrp_widen_loop_addr_taken(c, n->orelse.expr);
         vrp_widen_loop_addr_taken(c, n->orelse.fallback);
-    } else if (k == NODE_SLICE) {
+        break;
+    case NODE_SLICE:
         vrp_widen_loop_addr_taken(c, n->slice.object);
         vrp_widen_loop_addr_taken(c, n->slice.start);
         vrp_widen_loop_addr_taken(c, n->slice.end);
-    } else if (k == NODE_TYPECAST) {
+        break;
+    case NODE_TYPECAST:
         vrp_widen_loop_addr_taken(c, n->typecast.expr);
-    } else if (k == NODE_STRUCT_INIT) {
+        break;
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++)
             vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+        break;
+    /* THE BUG-994 kinds: these are NOT leaves. */
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        vrp_widen_loop_addr_taken(c, n->await_stmt.cond);
+        break;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++)
+            vrp_widen_loop_addr_taken(c, n->asm_stmt.outputs[i].expr);
+        break;
+    /* Genuine leaves — no expression subtree that could contain `&x`. Listed
+     * explicitly (no `default:`) so a new NodeKind is a build error here. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
     }
-    /* All other NodeKind values are leaves (literals, idents, break/continue/
-     * goto/label/yield/await/spawn/asm/static_assert) — no `&` subtree. */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */
@@ -21512,21 +22476,66 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
     if (!c || !n || depth > 8) return;
-    if (n->kind == NODE_RETURN) { record_isr_funcname_binding(c, n->ret.expr, depth); return; }
-    if (n->kind == NODE_BLOCK) {
+    /* BUG-993 — the ISR SIBLING of scan_returned_funcname. Same defect, one kind
+     * apart: this chain did cover DO_WHILE but not SWITCH, so
+     *
+     *     *() -> void mk() { switch (k) { 0 => { return bump; } default => { } }
+     *                        return nop; }
+     *     interrupt TIM1 { *() -> void fp = mk(); fp(); }
+     *
+     * was ACCEPTED with `bump` doing `g += 1` on a non-volatile global also
+     * touched by main — the missing-volatile ISR race, silent on bare metal.
+     * Converted to the same no-`default:` exhaustive switch so the two sinks
+     * can no longer drift apart by a kind (they already had). */
+    switch (n->kind) {
+    case NODE_RETURN:
+        record_isr_funcname_binding(c, n->ret.expr, depth);
+        return;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             record_isr_returned_funcname(c, n->block.stmts[i], depth);
         return;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         record_isr_returned_funcname(c, n->if_stmt.then_body, depth + 1);
         record_isr_returned_funcname(c, n->if_stmt.else_body, depth + 1);
         return;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1);
+        return;
+    case NODE_FOR:
+        record_isr_returned_funcname(c, n->for_stmt.body, depth + 1);
+        return;
+    case NODE_SWITCH:   /* the missing kind on this sink */
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            record_isr_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1);
+        return;
+    case NODE_DEFER:
+        record_isr_returned_funcname(c, n->defer.body, depth + 1);
+        return;
+    case NODE_CRITICAL:
+        record_isr_returned_funcname(c, n->critical.body, depth + 1);
+        return;
+    case NODE_ONCE:
+        record_isr_returned_funcname(c, n->once.body, depth + 1);
+        return;
+    /* Cannot contain a `return`. No `default:` — see the spawn sibling. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
     }
-    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) {
-        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1); return;
-    }
-    if (n->kind == NODE_FOR) { record_isr_returned_funcname(c, n->for_stmt.body, depth + 1); return; }
 }
 
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
@@ -21623,7 +22632,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
              * `counter += 1`; the rule tested the OPERATOR, so writing it out
              * evaded it. */
             Symbol *gs = resolve_write_target_global(c, node->assign.target, 0);
-            if (gs && !gs->is_function && assign_reads_own_target(node->assign.value, gs))
+            if (gs && !gs->is_function && assign_reads_own_target(c, node->assign.value, gs))
                 track_isr_global(c, gs->name, gs->name_len, true);
         }
         record_isr_globals(c, node->assign.target, depth);
@@ -23037,9 +24046,18 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static int classify_return_root(Checker *c, Node *rexpr) {
     if (!rexpr) return RET_STATIC;               /* bare return — no value */
     if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
-    /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root */
+    /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root.
+     * BUG-987: a LAUNDER is a view too — `return @ptrcast(*u32, p)` /
+     * `return @container(*Outer, p, f)` / `return (*u32)p` are the same
+     * allocation as `p`. They were not peeled, so they classified UNKNOWN —
+     * merely conservative at the pointer sinks, but it left the summary
+     * incomplete for no reason. Same shared peeler as every escape sink.
+     * (`@ptrtoint(p)` is NOT a view — it is p's ADDRESS as an integer — and is
+     * summarised separately in `ret_addr_param_mask`, see return_addr_param.) */
     Node *root = rexpr;
     for (;;) {
+        Node *peeled = unwrap_ptr_launder(root);
+        if (peeled != root) { root = peeled; continue; }
         if (root->kind == NODE_FIELD)      root = root->field.object;
         else if (root->kind == NODE_INDEX) root = root->index_expr.object;
         else if (root->kind == NODE_SLICE) root = root->slice.object;
@@ -23091,6 +24109,36 @@ static int classify_return_root(Checker *c, Node *rexpr) {
     /* a plain local pointer/slice (returning it is already a compile error for the
      * relevant types) — conservatively unknown. */
     return RET_UNKNOWN;
+}
+
+/* BUG-987: does this returned value carry the ADDRESS of parameter n as an
+ * integer? Returns n, or -1. Recognises `@ptrtoint(<view of param n>)`, under
+ * any integer casts, and the same laundered through a plain local
+ * (`usize a = @ptrtoint(p); return a;`). The classification of the operand is
+ * the ordinary return-root walk, so `@ptrtoint(&p.f)`, `@ptrtoint(p[i..])` and
+ * the launders it peels all resolve. An unclassifiable operand (a LOCAL's
+ * address) is already rejected at the return sink itself, so -1 is right here. */
+static int return_addr_param(Checker *c, Node *rexpr) {
+    Node *v = rexpr;
+    for (int hop = 0; v && hop < 8; hop++) {
+        while (v && v->kind == NODE_TYPECAST) v = v->typecast.expr;
+        if (v && v->kind == NODE_INTRINSIC && v->intrinsic.arg_count > 0 &&
+            v->intrinsic.name_len == 8 &&
+            memcmp(v->intrinsic.name, "ptrtoint", 8) == 0) {
+            int rc = classify_return_root(c, v->intrinsic.args[0]);
+            return rc >= 0 ? rc : -1;
+        }
+        if (!v || v->kind != NODE_IDENT) return -1;
+        /* laundered through a local: follow its initializer once per hop */
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        Symbol *g = scope_lookup_local(c->global_scope, v->ident.name,
+                                       (uint32_t)v->ident.name_len);
+        if (!s || s == g || s->is_function || !s->func_node ||
+            s->func_node->kind != NODE_VAR_DECL) return -1;
+        v = s->func_node->var_decl.init;
+    }
+    return -1;
 }
 
 /* Find what type a *opaque parameter is cast to inside a function body.

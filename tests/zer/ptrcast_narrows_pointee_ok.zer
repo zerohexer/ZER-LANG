@@ -1,0 +1,12 @@
+// BUG-995 boundary: NARROWING is the byte-view idiom and stays allowed at all three
+// doors — the target never reads past the source. (struct -> *u8 goes through
+// *opaque or @pun by the BUG-735 rule; the primitive byte view is the direct form.)
+u32 main() {
+    u32 w = 0x01020304;
+    *u8 b = @ptrcast(*u8, &w);           // 4 -> 1: fine
+    *u16 h = @ptrcast(*u16, &w);         // 4 -> 2: fine
+    *u32 same = @bitcast(*u32, &w);      // identity width: fine
+    if (*same != 0x01020304) { return 2; }
+    if (*b != 4 && *b != 1) { return 3; }
+    return (u32)*h & 0;
+}

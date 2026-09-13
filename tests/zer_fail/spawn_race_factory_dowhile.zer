@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: non-shared global
+// (from claude/loving-davinci-qo0mm9 28647618 = vigilant-tesla-pstdqk, body verbatim; its BUG-977 -> main BUG-994)
+// BUG-994, sibling form. Same factory, the racy `return cb;` inside a DO-WHILE
+// body. scan_returned_funcname handled NODE_WHILE but not NODE_DO_WHILE — the
+// two kinds share a struct and were one `||` apart.
+u32 g;
+void cb() { g += 1; }
+void nop() { }
+
+*() -> void mk(u32 k) {
+    do {
+        if (k == 9) { return cb; }
+    } while (k > 0);
+    return nop;
+}
+
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }

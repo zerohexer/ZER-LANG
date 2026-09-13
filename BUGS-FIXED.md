@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-994/995: factory reach through switch / do-while, and `@ptrtoint(&local)` laundered through a call (classes 7 and 8 closed)
+
+Both from `qo0mm9`, both originally `vigilant-tesla` harvests, both applied as filtered
+hunks (the surrounding commits bundle four other bugs each). Seven reproducers, all
+ACCEPTED on `git archive HEAD` (ec2b4bb6); all reject for their own reason now. Corpus:
+2449 files, zero non-test differences.
+
+### BUG-994 — the two factory walks were if/else chains, one kind apart
+
+`scan_returned_funcname` (spawn sink) walked RETURN / BLOCK / IF / WHILE / FOR;
+`record_isr_returned_funcname` (ISR sink) walked those plus DO_WHILE. So a factory whose
+only `return <racy funcname>` sat in a SWITCH arm was invisible at both sinks, and one in
+a DO-WHILE body at the spawn sink — the spawned data race and the missing-`volatile` ISR
+race both compiled clean. Both are no-`default:` exhaustive switches now (SWITCH, DEFER,
+CRITICAL, ONCE added; every non-body kind listed), so a new body-bearing NodeKind fails
+the build at both. **The if-chain form is invisible to both `walker_default_audit.sh` and
+`audit_walker_fields.sh`** — which is how two of the REACH forms survived four sessions of
+work on that axis. Gate: two new REACH forms (`factory-switch-arm`, `factory-dowhile-body`)
+x 4 payloads + 2 ISR cells in `tests/test_conc_matrix.c` (114 -> 124); against the pre-fix
+build it reports 2 false negatives + 1 wrong-reason and exits 1.
+
+**Found while adopting: the NESTING cap on both walks was fail-open, and the branch left
+it.** `depth > 8 -> return false` counts if/loop/switch nesting inside the factory body, and
+the parser allows 64 — measured: a `return cb;` nine ifs deep was ACCEPTED at both sinks,
+up to 63. This is the BUG-976 class on a walk the BUG-976 enumeration classified as safe
+because its cap is over AST nesting rather than a call graph — it is reachable all the
+same. `FACTORY_NEST_MAX` is now 64 (the parser's own bound, so closed by construction,
+the BUG-978 argument) and past it both walks REPORT through the BUG-976 mechanism (the
+spawn one via `_scan_depth_exceeded`, the ISR one directly) — verified to fire by lowering
+the cap to 3. A third silent cap on the ISR side, `record_isr_funcname_binding`'s
+`depth > 32`, then showed itself (if-depth 32..63 still accepted with only the "unknown
+target" warning, because it gave up before the callback resolved); it reports now too, and
+the whole ISR window 9..63 rejects. `spawn_race_factory_20_deep.zer` pins the window.
+
+### BUG-995 — `g = idfn(@ptrtoint(&local))`: the CALL form of the launder was the one spelling not rejected
+
+Direct store, arithmetic chain, struct field, array element, `orelse` fallback and the
+`return` sink all refused `@ptrtoint(&local)`; the call form escaped at both the global
+store and the return sink. Two root causes, one question answered two ways: the
+call-result escape cluster is gated on `type_carries_data_pointer(result)` — right for a
+COUNT, wrong for an ADDRESS, which is what `@ptrtoint` manufactures — while the var-decl
+propagation site already treated a pointer-width integer as address-carrying; and
+`expr_touches_local_derived` had an AUDIT-LOUD-exempted `default: return false` covering
+NODE_CALL.
+
+ONE query, `call_result_is_local_address_int`, at the var-decl propagation, the assignment
+sink and the return sink, reusing the per-function RETURN SUMMARY (`ret_param_mask`) the
+pointer sinks use — so `usize leak(*u32 p) { return @ptrtoint(p); } g = leak(&l)` (the
+address goes in as a POINTER) is caught too, where the branch's original argument-only rule
+missed it. `classify_return_root` peels `@ptrtoint` as a view; an integer-returning
+function now records its summary; an integer `return s.len` classifies as a VALUE (the
+pointer-vs-scalar refinement), which is what keeps `g_len = len_of(local_slice)` accepted.
+A callee with no summary (extern C, funcptr) falls back to the address-valued-argument
+rule, so `strlen(&buf)` is not refused. `expr_touches_local_derived` is exhaustive now.
+Boundary pinned by `ptrtoint_call_boundary_ok.zer`. Its expression walk's `depth > 8`
+was flipped to `true` on adoption (proof of danger — over-rejects a 9-deep chain, never
+accepts one).
+
+**Also from the re-run enumeration:** the two class-5 type walks adopted this morning,
+`type_carries_forgeable` and `type_carries_enum_c`, arrived with `depth > 32 -> false` on a
+construct with no syntactic limit — an enum 40 structs deep was forgeable through `@pun`
+and reachable through `@inttoptr` (measured, both accepted). Both now answer "assume it
+is" past the cap; `pun_forge_enum_40_deep.zer` / `inttoptr_enum_40_deep.zer` pin it. A
+harvested branch brings its own caps with it.
+
+- 104 justified rows added to `tools/walker_field_baseline.txt` for the three now-exhaustive
+  walkers (statement kinds an expression walker never sees; expression children of arms
+  whose only subject is a `return` statement; NODE_CALL delegating to the summary query).
+- `make check` exit 0.
+
 ## Session 2026-09-13 — BUG-992/993: the off-by-N loop is a compile error, and the IR intrinsic fallback is loud (class 4 closed)
 
 Survey class 4, 7 reproducers, from `vgonmt`'s `a40104b8` (its BUG-958, itself adopted

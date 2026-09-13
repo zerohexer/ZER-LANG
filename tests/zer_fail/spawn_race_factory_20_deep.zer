@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: non-shared global
+// BUG-994 backstop: the factory's racy `return cb;` sits 20 ifs deep. The old cap on
+// scan_returned_funcname was 8 and returned FALSE past it, so this spelling of the
+// spawn race compiled clean (measured: accepted at if-depth 9..63; the parser refuses
+// 64). The cap is now the parser's own bound, and past it the walk REPORTS.
+u32 g;
+void cb() { g += 1; }
+void nop() { }
+*() -> void mk(u32 k) { if (k < 120) { if (k < 119) { if (k < 118) { if (k < 117) { if (k < 116) { if (k < 115) { if (k < 114) { if (k < 113) { if (k < 112) { if (k < 111) { if (k < 110) { if (k < 109) { if (k < 108) { if (k < 107) { if (k < 106) { if (k < 105) { if (k < 104) { if (k < 103) { if (k < 102) { if (k < 101) { return cb; } } } } } } } } } } } } } } } } } } } } return nop; }
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }

@@ -1,0 +1,48 @@
+// EXPECTED: compile error
+// expect-error: it carries an enum
+// BUG-994 adoption audit: the @inttoptr sibling — type_carries_enum_c's cap of 32 said
+// "no enum" for an enum 40 structs deep.
+enum State { idle, running, done }
+struct H0 { State s; }
+struct H1 { H0 in; }
+struct H2 { H1 in; }
+struct H3 { H2 in; }
+struct H4 { H3 in; }
+struct H5 { H4 in; }
+struct H6 { H5 in; }
+struct H7 { H6 in; }
+struct H8 { H7 in; }
+struct H9 { H8 in; }
+struct H10 { H9 in; }
+struct H11 { H10 in; }
+struct H12 { H11 in; }
+struct H13 { H12 in; }
+struct H14 { H13 in; }
+struct H15 { H14 in; }
+struct H16 { H15 in; }
+struct H17 { H16 in; }
+struct H18 { H17 in; }
+struct H19 { H18 in; }
+struct H20 { H19 in; }
+struct H21 { H20 in; }
+struct H22 { H21 in; }
+struct H23 { H22 in; }
+struct H24 { H23 in; }
+struct H25 { H24 in; }
+struct H26 { H25 in; }
+struct H27 { H26 in; }
+struct H28 { H27 in; }
+struct H29 { H28 in; }
+struct H30 { H29 in; }
+struct H31 { H30 in; }
+struct H32 { H31 in; }
+struct H33 { H32 in; }
+struct H34 { H33 in; }
+struct H35 { H34 in; }
+struct H36 { H35 in; }
+struct H37 { H36 in; }
+struct H38 { H37 in; }
+struct H39 { H38 in; }
+struct H40 { H39 in; }
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+u32 main() { volatile *H40 r = @inttoptr(*H40, 0x1000); return 0; }

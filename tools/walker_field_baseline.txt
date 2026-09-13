@@ -934,3 +934,132 @@ checker.c:loop_body_straight_line:NODE_SWITCH:switch_stmt.arms
 checker.c:loop_body_straight_line:NODE_SWITCH:switch_stmt.expr
 checker.c:loop_body_straight_line:NODE_WHILE:while_stmt.body
 checker.c:loop_body_straight_line:NODE_WHILE:while_stmt.cond
+
+# 2026-09-13 — BUG-995 `checker.c:expr_touches_local_derived` became a no-default
+# exhaustive switch (it had the AUDIT-LOUD-exempted `default: return false`, which is
+# how the NODE_CALL form of a laundered `@ptrtoint(&local)` reached a global unseen).
+# The predicate answers "may this EXPRESSION carry a frame address?". Two justified
+# non-descents: NODE_CALL delegates the whole question to
+# call_result_is_local_address_int, which walks the arguments itself against the
+# callee's RETURN SUMMARY (descending args here too would answer the question twice,
+# the second time without the summary — the wider rule the entry rejects); and every
+# STATEMENT kind (block, asm, await, critical, defer, for, if, once, spawn, switch,
+# while, var-decl, return...) is not an expression, so an expression walker returns
+# false there — the value-flow sinks that call this hand it expressions only.
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.inputs
+checker.c:expr_touches_local_derived:NODE_ASM:asm_stmt.outputs
+checker.c:expr_touches_local_derived:NODE_AWAIT:await_stmt.cond
+checker.c:expr_touches_local_derived:NODE_BLOCK:block.stmts
+checker.c:expr_touches_local_derived:NODE_CALL:call.args
+checker.c:expr_touches_local_derived:NODE_CALL:call.callee
+checker.c:expr_touches_local_derived:NODE_CRITICAL:critical.body
+checker.c:expr_touches_local_derived:NODE_DEFER:defer.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_DO_WHILE:while_stmt.cond
+checker.c:expr_touches_local_derived:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:expr_touches_local_derived:NODE_FILE:file.decls
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.body
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.cond
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.init
+checker.c:expr_touches_local_derived:NODE_FOR:for_stmt.step
+checker.c:expr_touches_local_derived:NODE_FUNC_DECL:func_decl.body
+checker.c:expr_touches_local_derived:NODE_GLOBAL_VAR:var_decl.init
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.cond
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.else_body
+checker.c:expr_touches_local_derived:NODE_IF:if_stmt.then_body
+checker.c:expr_touches_local_derived:NODE_INTERRUPT:interrupt.body
+checker.c:expr_touches_local_derived:NODE_ONCE:once.body
+checker.c:expr_touches_local_derived:NODE_RETURN:ret.expr
+checker.c:expr_touches_local_derived:NODE_SPAWN:spawn_stmt.args
+checker.c:expr_touches_local_derived:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.arms
+checker.c:expr_touches_local_derived:NODE_SWITCH:switch_stmt.expr
+checker.c:expr_touches_local_derived:NODE_VAR_DECL:var_decl.init
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.body
+checker.c:expr_touches_local_derived:NODE_WHILE:while_stmt.cond
+
+# 2026-09-13 — BUG-994 scan_returned_funcname / record_isr_returned_funcname became
+# no-default exhaustive switches (from qo0mm9 / vigilant-tesla-pstdqk; they were
+# if/else chains, one kind apart, and a `return <racy funcname>` inside a SWITCH arm
+# or a DO-WHILE body was invisible to both). They are the spawn-sink and ISR-sink
+# FACTORY walkers and look for exactly one thing: a `return <funcname>;` STATEMENT in
+# a factory body, so they descend statement BODIES and nothing else. Every accessor
+# below is either an expression child of a handled arm (`if_stmt.cond`,
+# `for_stmt.init/cond/step`, `while_stmt.cond`, `switch_stmt.expr`) or a child of a
+# kind that cannot contain a return statement at all — ZER has no statement-
+# expressions. The two lists are IDENTICAL apart from the spawn walker's extra
+# NODE_RETURN row (it consumes `ret.expr` through a different helper); a future
+# divergence between the two blocks is itself the signal that the sinks drifted.
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:record_isr_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:record_isr_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:record_isr_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.left
+checker.c:record_isr_returned_funcname:NODE_BINARY:binary.right
+checker.c:record_isr_returned_funcname:NODE_CALL:call.args
+checker.c:record_isr_returned_funcname:NODE_CALL:call.callee
+checker.c:record_isr_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_FIELD:field.object
+checker.c:record_isr_returned_funcname:NODE_FILE:file.decls
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:record_isr_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:record_isr_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:record_isr_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:record_isr_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:record_isr_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:record_isr_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:record_isr_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.end
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.object
+checker.c:record_isr_returned_funcname:NODE_SLICE:slice.start
+checker.c:record_isr_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:record_isr_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:record_isr_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:record_isr_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:record_isr_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:record_isr_returned_funcname:NODE_UNARY:unary.operand
+checker.c:record_isr_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:record_isr_returned_funcname:NODE_WHILE:while_stmt.cond
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.inputs
+checker.c:scan_returned_funcname:NODE_ASM:asm_stmt.outputs
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.target
+checker.c:scan_returned_funcname:NODE_ASSIGN:assign.value
+checker.c:scan_returned_funcname:NODE_AWAIT:await_stmt.cond
+checker.c:scan_returned_funcname:NODE_BINARY:binary.left
+checker.c:scan_returned_funcname:NODE_BINARY:binary.right
+checker.c:scan_returned_funcname:NODE_CALL:call.args
+checker.c:scan_returned_funcname:NODE_CALL:call.callee
+checker.c:scan_returned_funcname:NODE_DO_WHILE:while_stmt.cond
+checker.c:scan_returned_funcname:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:scan_returned_funcname:NODE_FIELD:field.object
+checker.c:scan_returned_funcname:NODE_FILE:file.decls
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.cond
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.init
+checker.c:scan_returned_funcname:NODE_FOR:for_stmt.step
+checker.c:scan_returned_funcname:NODE_FUNC_DECL:func_decl.body
+checker.c:scan_returned_funcname:NODE_GLOBAL_VAR:var_decl.init
+checker.c:scan_returned_funcname:NODE_IF:if_stmt.cond
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.index
+checker.c:scan_returned_funcname:NODE_INDEX:index_expr.object
+checker.c:scan_returned_funcname:NODE_INTERRUPT:interrupt.body
+checker.c:scan_returned_funcname:NODE_INTRINSIC:intrinsic.args
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.expr
+checker.c:scan_returned_funcname:NODE_ORELSE:orelse.fallback
+checker.c:scan_returned_funcname:NODE_RETURN:ret.expr
+checker.c:scan_returned_funcname:NODE_SLICE:slice.end
+checker.c:scan_returned_funcname:NODE_SLICE:slice.object
+checker.c:scan_returned_funcname:NODE_SLICE:slice.start
+checker.c:scan_returned_funcname:NODE_SPAWN:spawn_stmt.args
+checker.c:scan_returned_funcname:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:scan_returned_funcname:NODE_STRUCT_INIT:struct_init.fields
+checker.c:scan_returned_funcname:NODE_SWITCH:switch_stmt.expr
+checker.c:scan_returned_funcname:NODE_TYPECAST:typecast.expr
+checker.c:scan_returned_funcname:NODE_UNARY:unary.operand
+checker.c:scan_returned_funcname:NODE_VAR_DECL:var_decl.init
+checker.c:scan_returned_funcname:NODE_WHILE:while_stmt.cond

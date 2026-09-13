@@ -182,7 +182,7 @@ walks, not just this one.
 
 ---
 
-## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 39 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989, 7 as BUG-992), grouped, with the branch to take each from
+## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 32 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980, 12 as BUG-981/982/983, 3 as BUG-984, 2 as BUG-985, 11 as BUG-987/988/989, 7 as BUG-992, 7 as BUG-994/995), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:
 
@@ -238,7 +238,7 @@ const chain feeding an array size needs real compile-time folding).
 
 **Class 1 below is the same shape at scale — start there next.**
 
-### The 97 (now 39 live), by class — and which branch to take
+### The 97 (now 32 live), by class — and which branch to take
 
 ### ~~1. BOUNDED WALKS FAIL OPEN PAST THEIR CAP — 17 reproducers~~ — CLOSED 2026-09-10/11
 
@@ -325,11 +325,16 @@ spelling. The flag is now REFCOUNTED: the join closes the window, but only the l
 one, and never when a fire-and-forget spawn also ran. Gate: the CONCURRENT-WINDOW GRID
 in `tests/test_conc_matrix.c` (position x spawn-kind x access-kind).
 
-**7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4, escape. TAKE `qo0mm9`** (has the 4th).
-`ptrtoint_local_via_call_alias` `_global` `_return` `_ptr_param`
+### ~~7. `@ptrtoint(&local)` LAUNDERED THROUGH A CALL — 4~~ — CLOSED 2026-09-13 as BUG-995
 
-**8. FACTORY REACH through switch / do-while — 3, spawn+ISR sinks. TAKE `qo0mm9`.**
-`spawn_race_factory_switch` `_dowhile` `isr_race_factory_switch`
+ONE query `call_result_is_local_address_int` over the existing return summary, at the
+three sinks; `expr_touches_local_derived` made exhaustive. Boundary: `ptrtoint_call_boundary_ok`.
+
+### ~~8. FACTORY REACH through switch / do-while — 3~~ — CLOSED 2026-09-13 as BUG-994
+
+Both factory walks are exhaustive switches now, and — found on adoption — their nesting
+cap (8, fail-open, reachable 9..63) is the parser's bound with a report past it; a third
+silent cap on the ISR binding walk reports too. REACH grid 114 -> 124 cells.
 
 ### ~~9. VIEW OF A LOCAL / GLOBAL PROJECTION / OPTIONAL PARAM / UNION CAPTURE — 7~~ — CLOSED 2026-09-13
 

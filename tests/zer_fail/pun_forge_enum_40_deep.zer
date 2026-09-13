@@ -1,0 +1,49 @@
+// EXPECTED: compile error
+// expect-error: @pun cannot forge
+// BUG-994 adoption audit: the enum sits 40 structs deep. type_carries_forgeable arrived
+// (BUG-988, from a harvested branch) with a cap of 32 that answered "not forgeable" past
+// it — so this forge was ACCEPTED while the same program 30 deep was refused. Struct
+// nesting has no syntactic limit (BUG-977), so the cap now rounds toward reject.
+enum State { idle, running, done }
+struct H0 { State s; }
+struct H1 { H0 in; }
+struct H2 { H1 in; }
+struct H3 { H2 in; }
+struct H4 { H3 in; }
+struct H5 { H4 in; }
+struct H6 { H5 in; }
+struct H7 { H6 in; }
+struct H8 { H7 in; }
+struct H9 { H8 in; }
+struct H10 { H9 in; }
+struct H11 { H10 in; }
+struct H12 { H11 in; }
+struct H13 { H12 in; }
+struct H14 { H13 in; }
+struct H15 { H14 in; }
+struct H16 { H15 in; }
+struct H17 { H16 in; }
+struct H18 { H17 in; }
+struct H19 { H18 in; }
+struct H20 { H19 in; }
+struct H21 { H20 in; }
+struct H22 { H21 in; }
+struct H23 { H22 in; }
+struct H24 { H23 in; }
+struct H25 { H24 in; }
+struct H26 { H25 in; }
+struct H27 { H26 in; }
+struct H28 { H27 in; }
+struct H29 { H28 in; }
+struct H30 { H29 in; }
+struct H31 { H30 in; }
+struct H32 { H31 in; }
+struct H33 { H32 in; }
+struct H34 { H33 in; }
+struct H35 { H34 in; }
+struct H36 { H35 in; }
+struct H37 { H36 in; }
+struct H38 { H37 in; }
+struct H39 { H38 in; }
+struct H40 { H39 in; }
+u32 main() { u32 w = 200; *u32 p = &w; *H40 bp = @pun(*H40, p); return 0; }

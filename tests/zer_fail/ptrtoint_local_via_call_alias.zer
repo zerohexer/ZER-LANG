@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot store result of call given @ptrtoint of a local
+// (from claude/loving-davinci-qo0mm9 87107f5f = vigilant-tesla-o51x9p, body verbatim; its BUG-976 -> main BUG-995)
+// Same hole reached through an intermediate is_local_derived binding.
+usize g = 0;
+usize idfn(usize x) { return x; }
+u32 main() {
+    u32 local = 5;
+    usize a = @ptrtoint(&local);
+    g = idfn(a);
+    return 0;
+}

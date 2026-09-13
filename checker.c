@@ -2466,6 +2466,110 @@ static bool call_result_escapes(Checker *c, Node *call) {
            !call_result_static_given_args(c, call);
 }
 
+/* BUG-995 — the INTEGER half of the call-result escape question.
+ *
+ * `call_result_escapes` is gated by its consumers on
+ * `type_carries_data_pointer(result)`, whose comment says "`g_int = count(&local)`
+ * returns an int: no pointer escapes, don't reject". Right for a COUNT, wrong for
+ * an ADDRESS: `@ptrtoint` exists precisely to turn a pointer into a pointer-width
+ * integer, and `@inttoptr` turns it back. The var-decl propagation site already
+ * treats a pointer-width int as address-carrying (`is_ptr_int` +
+ * `expr_touches_local_derived`), so two sites answered ONE question two ways, and
+ * the call form escaped at both the global-store and the return sink:
+ *
+ *     usize g;  usize idfn(usize x) { return x; }
+ *     u32 main(){ u32 l = 5; g = idfn(@ptrtoint(&l)); }        // was ACCEPTED
+ *     usize leak(){ u32 l = 5; return idfn(@ptrtoint(&l)); }   // was ACCEPTED
+ *
+ * while `g = @ptrtoint(&l)`, `g = a + 0`, `g.f = a`, `arr[0] = a` and
+ * `g = m() orelse a` are all rejected.
+ *
+ * The decision reuses the per-function RETURN SUMMARY (`ret_param_mask`, the same
+ * relational fact the pointer sinks use): the result may BE a frame address iff
+ * the callee may return param n and the actual argument n carries one — either
+ * a local-derived POINTER (`leak(&l)` with `usize leak(*u32 p){ return
+ * @ptrtoint(p); }` — note `classify_return_root` already peels `@ptrtoint` like
+ * any other view) or a local-derived ADDRESS INTEGER (`idfn(@ptrtoint(&l))`,
+ * or an int local that `is_local_derived` because it was made by @ptrtoint).
+ * `g_len = count(local_arr)` stays accepted: `count` returns a scalar field read
+ * or a fresh value, so its mask is empty. When the callee has NO complete
+ * summary (extern C, funcptr, unknown), only the address-valued-integer argument
+ * rule applies — a C function given a bare `&buf` and returning an int is the
+ * `strlen` shape, and rejecting it would refuse the whole C-interop idiom over
+ * a value the C-FFI floor already excludes. */
+static bool ptr_width_int_type(Checker *c, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);   /* unwraps distinct, NULL-safe */
+    if (k == TYPE_USIZE) return true;
+    if (k == TYPE_U64 && c->target_ptr_bits >= 64) return true;
+    if (k == TYPE_U32 && c->target_ptr_bits == 32) return true;
+    return false;
+}
+
+static bool arg_is_local_address_int(Checker *c, Node *arg, int depth) {
+    if (!arg) return false;
+    /* BUG-976 rule: this is a proof of danger feeding a REJECT, and expression
+     * nesting is spellable far past 8, so past the cap the answer is "assume it
+     * is" — over-rejects a 9-deep arithmetic chain around a laundered address,
+     * never accepts one. */
+    if (depth > 8) return true;
+    if (arg->kind == NODE_INTRINSIC && arg->intrinsic.name_len == 8 &&
+        memcmp(arg->intrinsic.name, "ptrtoint", 8) == 0 &&
+        arg->intrinsic.arg_count > 0) {
+        /* unwrap_ptr_launder inside arg_is_local_derived peels the intrinsic to
+         * its pointer operand, so `&local` and a local-derived pointer both
+         * resolve there. Reuse it rather than re-deriving the root walk. */
+        return arg_is_local_derived(c, arg, 0);
+    }
+    if (arg->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, arg->ident.name,
+                                 (uint32_t)arg->ident.name_len);
+        return s && s->is_local_derived && ptr_width_int_type(c, s->type);
+    }
+    if (arg->kind == NODE_BINARY)
+        return arg_is_local_address_int(c, arg->binary.left, depth + 1) ||
+               arg_is_local_address_int(c, arg->binary.right, depth + 1);
+    if (arg->kind == NODE_TYPECAST)
+        return arg_is_local_address_int(c, arg->typecast.expr, depth + 1);
+    if (arg->kind == NODE_ORELSE)
+        return arg_is_local_address_int(c, arg->orelse.expr, depth + 1) ||
+               arg_is_local_address_int(c, arg->orelse.fallback, depth + 1);
+    if (arg->kind == NODE_CALL)
+        for (int i = 0; i < arg->call.arg_count; i++)
+            if (arg_is_local_address_int(c, arg->call.args[i], depth + 1))
+                return true;
+    return false;
+}
+
+/* The call hands back a pointer-width integer that may BE a frame address. */
+static bool call_result_is_local_address_int(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    if (!ptr_width_int_type(c, typemap_get(c, call))) return false;
+    Node *callee = call->call.callee;
+    Symbol *csym = NULL;
+    if (callee && callee->kind == NODE_IDENT) {
+        csym = scope_lookup(c->current_scope,
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+        if (!csym) csym = scope_lookup(c->global_scope,
+            callee->ident.name, (uint32_t)callee->ident.name_len);
+    }
+    if (csym && csym->ret_summary_complete) {
+        uint64_t mask = csym->ret_param_mask;
+        for (int n = 0; n < 64 && mask; n++) {
+            if (!(mask & (1ull << n))) continue;
+            mask &= ~(1ull << n);
+            if (n >= call->call.arg_count) return true;   /* cannot resolve -> conservative */
+            Node *a = call->call.args[n];
+            if (arg_is_local_derived(c, a, 0) || arg_is_local_address_int(c, a, 0))
+                return true;
+        }
+        return false;
+    }
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (arg_is_local_address_int(c, call->call.args[i], 0)) return true;
+    return false;
+}
+
 /* Ring/Pool/Slab element-store escape (the "rare unverified sink" noted in
  * BUG-764): pushing a BY-VALUE element into a GLOBAL container (Ring is always
  * global) copies the element's bytes into storage that outlives the frame. If
@@ -2897,7 +3001,12 @@ static void set_container_prov_unknown(Symbol *sym) {
  * completeness half CLAUDE.md asks a carrier predicate to have.
  * ================================================================ */
 static bool type_carries_forgeable(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    /* BUG-994 (adoption audit): this predicate feeds a REJECT, struct nesting has
+     * no syntactic limit (BUG-977: 300 deep is spellable), and the branch's cap
+     * answered "not forgeable" past 32 — a forge 33 structs deep was let through.
+     * Past the cap the answer is "assume it is": over-rejects, never accepts. */
+    if (depth > 32) return true;
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     switch (type_dispatch_kind(t)) {
@@ -2956,7 +3065,8 @@ static bool pun_pointee_has_type_id(Type *t) {
  * a measured wrong-dispatch behind it (BUG-989). Recurses the same wrappers as
  * every other carrier predicate in this file. */
 static bool type_carries_enum_c(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    if (!t) return false;
+    if (depth > 32) return true;   /* BUG-994: same reasoning as type_carries_forgeable */
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     TypeKind k = type_dispatch_kind(t);
@@ -4007,14 +4117,45 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
     case NODE_ORELSE:
         return expr_touches_local_derived(c, expr->orelse.expr) ||
                expr_touches_local_derived(c, expr->orelse.fallback);
-    default:
-        /* AUDIT-LOUD exempt: this default is intentional — leaf and statement
-         * nodes can't carry a chain to a local-derived pointer. New NODE_
-         * kinds that introduce arithmetic chains should be added as explicit
-         * cases above. Walker is for stack-escape-via-arithmetic detection
-         * (EW8I0 BUG-664); false negative here = safety hole. */
+    /* BUG-995: NODE_CALL used to land in a `default: return false` and a stack
+     * address laundered through a CALL reached a pointer-width int local
+     * unflagged (`usize a = idfn(@ptrtoint(&l)); g = a;`). The default's OWN
+     * comment said "false negative here = safety hole". One query answers it:
+     * the callee's return summary crossed with its address-carrying args. */
+    case NODE_CALL:
+        return call_result_is_local_address_int(c, expr);
+    case NODE_SLICE:
+        return expr_touches_local_derived(c, expr->slice.object) ||
+               expr_touches_local_derived(c, expr->slice.start) ||
+               expr_touches_local_derived(c, expr->slice.end);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < expr->struct_init.field_count; i++)
+            if (expr_touches_local_derived(c, expr->struct_init.fields[i].value))
+                return true;
+        return false;
+    case NODE_ASSIGN:
+        return expr_touches_local_derived(c, expr->assign.target) ||
+               expr_touches_local_derived(c, expr->assign.value);
+    /* NO `default:` — a new NodeKind fails the BUILD here (-Werror=switch) and
+     * forces a decision instead of silently answering "cannot carry a stack
+     * address". Leaves and statement/declaration kinds carry no chain. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
         return false;
     }
+    return false;  /* unreachable (exhaustive) */
 }
 
 /* ---- ISR / @critical alloc ban helper ---- */
@@ -8226,6 +8367,31 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "cannot store result of call with local-derived pointer argument — "
                         "stack memory may escape (sink outlives the local)");
+                }
+            }
+        }
+
+        /* BUG-995: the INTEGER sibling of the cluster above. The gate there is
+         * `type_carries_data_pointer(value)`, which is false for `usize` — so a
+         * frame address laundered as an INTEGER through a call
+         * (`g = idfn(@ptrtoint(&local))`) reached a global unflagged, while
+         * every non-call spelling of the same launder is rejected. */
+        if (node->assign.op == TOK_EQ && value &&
+            ptr_width_int_type(c, value)) {
+            Node *iroot = node->assign.value;
+            while (iroot && (iroot->kind == NODE_FIELD || iroot->kind == NODE_INDEX)) {
+                if (iroot->kind == NODE_FIELD) iroot = iroot->field.object;
+                else iroot = iroot->index_expr.object;
+            }
+            if (iroot && iroot->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, iroot)) {
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store result of call given @ptrtoint of a local — "
+                        "the address dangles when the function returns "
+                        "(store the DATA, not the address)");
                 }
             }
         }
@@ -14440,9 +14606,28 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
 static bool scan_funcname_binding(Checker *c, Node *n,
                                   const char **out_name, uint32_t *out_len);
 
+/* BUG-994: the NESTING cap on the two factory walks. `depth` here counts
+ * if / loop / switch / defer / critical / once nesting inside the factory body,
+ * and the parser refuses a body nested deeper than 64 ("nesting too deep (limit
+ * 64)", parser.c) — so 64 is the bound past which nothing is spellable, the same
+ * closed-by-construction argument as BUG-978's orelse chain. The old cap was 8
+ * and returned FALSE past it: a `return cb;` nine ifs deep was invisible and the
+ * spawned race compiled clean. MEASURED: reachable at depths 9..63, parser
+ * refuses at 64. The branch that made these walks exhaustive left the cap. */
+#define FACTORY_NEST_MAX 64
+
 static bool scan_returned_funcname(Checker *c, Node *n, int depth,
                                    const char **out_name, uint32_t *out_len) {
-    if (!n || depth > 8) return false;
+    if (!n) return false;
+    if (depth > FACTORY_NEST_MAX) {
+        /* Past anything real, and rounds toward REJECT anyway: report that the
+         * factory could not be analysed, through the same flag and noun the
+         * call-depth cap uses (BUG-976), naming the construct we stopped at. */
+        _scan_depth_exceeded = true;
+        *out_name = "a factory body nested too deep to analyse";
+        *out_len = (uint32_t)strlen(*out_name);
+        return true;
+    }
     if (n->kind == NODE_RETURN) {
         Node *v = n->ret.expr;
         /* A factory that returns ANOTHER factory's result (`return get_b();`).
@@ -14463,21 +14648,72 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         _scan_global_depth--;
         return found;
     }
-    if (n->kind == NODE_BLOCK) {
+    /* BUG-994 (from qo0mm9 / vigilant-tesla-pstdqk, its BUG-977): this was an if/else CHAIN over five kinds
+     * (RETURN/BLOCK/IF/WHILE/FOR). A `return <racy funcname>` sitting in any
+     * OTHER body-bearing statement was invisible, so the factory looked like it
+     * returned nothing reachable and the spawn was ACCEPTED. Measured live on
+     * main with a discriminating probe (the factory's only racy return inside
+     * the construct, a safe `return nop;` on the fall-through so no other arm
+     * can mask the result):
+     *
+     *     switch (k) { 0 => { return cb; } default => { } }   -> ACCEPTED
+     *     do { if (k == 9) { return cb; } } while (k > 0);    -> ACCEPTED
+     *
+     * where `cb` does `g += 1` on a non-shared global — a real data race from
+     * the spawned thread, with no diagnostic.
+     *
+     * Now a no-`default:` exhaustive switch, so -Werror=switch forces every
+     * future NodeKind to be classified here instead of silently answering "no".
+     * That is the durable half of the fix: the if-chain form is invisible to
+     * both tools/walker_default_audit.sh and tools/audit_walker_fields.sh, which
+     * is why two of the eleven forms survived four sessions of REACH work. */
+    switch (n->kind) {
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             if (scan_returned_funcname(c, n->block.stmts[i], depth, out_name, out_len))
                 return true;
         return false;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         if (scan_returned_funcname(c, n->if_stmt.then_body, depth + 1, out_name, out_len))
             return true;
         return scan_returned_funcname(c, n->if_stmt.else_body, depth + 1, out_name, out_len);
-    }
-    if (n->kind == NODE_WHILE)
+    case NODE_WHILE:
+    case NODE_DO_WHILE:   /* DO_WHILE was the missing sibling of WHILE. */
         return scan_returned_funcname(c, n->while_stmt.body, depth + 1, out_name, out_len);
-    if (n->kind == NODE_FOR)
+    case NODE_FOR:
         return scan_returned_funcname(c, n->for_stmt.body, depth + 1, out_name, out_len);
+    case NODE_SWITCH:
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (scan_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1,
+                                       out_name, out_len))
+                return true;
+        return false;
+    case NODE_DEFER:
+        return scan_returned_funcname(c, n->defer.body, depth + 1, out_name, out_len);
+    case NODE_CRITICAL:
+        return scan_returned_funcname(c, n->critical.body, depth + 1, out_name, out_len);
+    case NODE_ONCE:
+        return scan_returned_funcname(c, n->once.body, depth + 1, out_name, out_len);
+    /* Kinds that cannot CONTAIN a `return` statement. NODE_RETURN itself is
+     * handled above. Listed explicitly (no `default:`) so a new body-bearing
+     * NodeKind fails the build here rather than reopening this hole. */
+    case NODE_RETURN:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
     return false;
 }
 
@@ -17521,6 +17757,17 @@ static void check_stmt(Checker *c, Node *node) {
                         "misaligned (a hard fault on ARM/RISC-V), and the fact does not "
                         "survive the function boundary. Return the field BY VALUE instead");
                 }
+            }
+
+            /* BUG-995: the same address laundered through a CALL —
+             * `return idfn(@ptrtoint(&local));`. The direct spelling below and
+             * the indirect `usize a = @ptrtoint(&x); return a;` (caught by
+             * is_local_derived) were both covered; the call form was not. */
+            if (node->ret.expr->kind == NODE_CALL &&
+                call_result_is_local_address_int(c, node->ret.expr)) {
+                checker_error(c, node->loc.line,
+                    "cannot return result of call given @ptrtoint of a local — "
+                    "the address dangles after the function returns");
             }
 
             /* scope escape: return @ptrtoint(&local) — address of local escapes as integer.
@@ -21380,8 +21627,16 @@ static void check_func_body(Checker *c, Node *node) {
             if (ret_eff && type_dispatch_kind(ret_eff) == TYPE_OPTIONAL)
                 ret_eff = type_unwrap_distinct(ret_eff->optional.inner);
             TypeKind rk = type_dispatch_kind(ret_eff);  /* unwraps distinct; NULL→VOID */
+            /* BUG-995: a POINTER-WIDTH INTEGER return is recorded too — the only
+             * way it can be a view of a param is `@ptrtoint`, which
+             * classify_return_root peels, so the integer call-result sink can
+             * resolve `g = leak(&local)` against `usize leak(*u32 p) { return
+             * @ptrtoint(p); }`. Every other consumer of the mask only gets MORE
+             * precise from a complete summary (keep inference skips positions
+             * the callee provably never returns). */
             if (node->func_decl.body &&
-                (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT)) {
+                (rk == TYPE_POINTER || rk == TYPE_SLICE || rk == TYPE_STRUCT ||
+                 ptr_width_int_type(c, ret_eff))) {
                 Symbol *fsym = scope_lookup(c->current_scope,
                     node->func_decl.name, (uint32_t)node->func_decl.name_len);
                 if (fsym) {
@@ -22196,26 +22451,103 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
  * which is today's behaviour and never a new rejection. */
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
-    if (!c || !n || depth > 8) return;
-    if (n->kind == NODE_RETURN) { record_isr_funcname_binding(c, n->ret.expr, depth); return; }
-    if (n->kind == NODE_BLOCK) {
+    if (!c || !n) return;
+    /* BUG-994: the ISR mirror of the FACTORY_NEST_MAX cap — same bound, same
+     * reason; it is void, so it reports directly, once per interrupt, exactly as
+     * record_isr_globals does for its call-depth cap. */
+    if (depth > FACTORY_NEST_MAX) {
+        if (c->in_interrupt && !_isr_depth_reported) {
+            _isr_depth_reported = true;
+            checker_error(c, n->loc.line,
+                "this interrupt handler's callback comes from a factory nested deeper "
+                "than %d — the shared-global analysis cannot see what it returns, so it "
+                "cannot tell you whether the callback races main code. Flatten the "
+                "factory", FACTORY_NEST_MAX);
+        }
+        return;
+    }
+    /* BUG-994 — the ISR SIBLING of scan_returned_funcname. Same defect, one kind
+     * apart: this chain did cover DO_WHILE but not SWITCH, so
+     *
+     *     *() -> void mk() { switch (k) { 0 => { return bump; } default => { } }
+     *                        return nop; }
+     *     interrupt TIM1 { *() -> void fp = mk(); fp(); }
+     *
+     * was ACCEPTED with `bump` doing `g += 1` on a non-volatile global also
+     * touched by main — the missing-volatile ISR race, silent on bare metal.
+     * Converted to the same no-`default:` exhaustive switch so the two sinks
+     * can no longer drift apart by a kind (they already had). */
+    switch (n->kind) {
+    case NODE_RETURN:
+        record_isr_funcname_binding(c, n->ret.expr, depth);
+        return;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             record_isr_returned_funcname(c, n->block.stmts[i], depth);
         return;
-    }
-    if (n->kind == NODE_IF) {
+    case NODE_IF:
         record_isr_returned_funcname(c, n->if_stmt.then_body, depth + 1);
         record_isr_returned_funcname(c, n->if_stmt.else_body, depth + 1);
         return;
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1);
+        return;
+    case NODE_FOR:
+        record_isr_returned_funcname(c, n->for_stmt.body, depth + 1);
+        return;
+    case NODE_SWITCH:   /* the missing kind on this sink */
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            record_isr_returned_funcname(c, n->switch_stmt.arms[i].body, depth + 1);
+        return;
+    case NODE_DEFER:
+        record_isr_returned_funcname(c, n->defer.body, depth + 1);
+        return;
+    case NODE_CRITICAL:
+        record_isr_returned_funcname(c, n->critical.body, depth + 1);
+        return;
+    case NODE_ONCE:
+        record_isr_returned_funcname(c, n->once.body, depth + 1);
+        return;
+    /* Cannot contain a `return`. No `default:` — see the spawn sibling. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
     }
-    if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) {
-        record_isr_returned_funcname(c, n->while_stmt.body, depth + 1); return;
-    }
-    if (n->kind == NODE_FOR) { record_isr_returned_funcname(c, n->for_stmt.body, depth + 1); return; }
 }
 
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
-    if (!c || !value || depth > 32) return;
+    if (!c || !value) return;
+    /* BUG-994: this walk shares ONE `depth` counter with record_isr_globals and
+     * record_isr_returned_funcname (nesting and calls both increment it), and it
+     * was the one link in that chain that gave up SILENTLY past 32 — so a factory
+     * whose `return bump;` sat 32 constructs deep reached this cap first, the
+     * callback was never resolved, and the ISR compiled with only the "unknown
+     * target" WARNING (measured: if-depth 32..63 accepted; 31 was caught by
+     * record_isr_globals' own report). Same remedy as its two siblings: say so. */
+    if (depth > 32) {
+        if (c->in_interrupt && !_isr_depth_reported) {
+            _isr_depth_reported = true;
+            checker_error(c, value->loc.line,
+                "this interrupt handler's callback is bound through a chain deeper "
+                "than 32 — the shared-global analysis cannot resolve what it calls, "
+                "so it cannot tell you whether the callback races main code. "
+                "Flatten the factory or bind the callback directly");
+        }
+        return;
+    }
     /* ISR funcptr from a FACTORY CALL — `*() fp = mk(); fp();` inside an ISR,
      * where `mk` returns the racing function (directly, or via another factory).
      * The spawn path gained this in ac97e11a; the ISR path did not, leaving the
@@ -23722,6 +24054,24 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static int classify_return_root(Checker *c, Node *rexpr) {
     if (!rexpr) return RET_STATIC;               /* bare return — no value */
     if (rexpr->kind == NODE_NULL_LIT) return RET_STATIC;
+    /* BUG-995: an INTEGER-typed return. FORMING a reference aliases; READING a
+     * value does not (CLAUDE.md, the pointer-vs-scalar refinement): `return
+     * s.len`, `return arr[i]`, `return *p` copy a scalar OUT of the param's
+     * allocation and are no view of it — only a bare param passthrough
+     * (`return x`) or `@ptrtoint(...)` (peeled in the loop below) can carry the
+     * address. Without this, `usize len_of([*]u8 s) { return s.len; }` recorded
+     * ARParam(0) and `g_len = len_of(local_slice)` was refused. */
+    {
+        Type *rt = typemap_get(c, rexpr);
+        bool is_ptrtoint = rexpr->kind == NODE_INTRINSIC &&
+            rexpr->intrinsic.name_len == 8 &&
+            memcmp(rexpr->intrinsic.name, "ptrtoint", 8) == 0;
+        if (rt && type_is_integer(rt) && !is_ptrtoint &&
+            (rexpr->kind == NODE_FIELD || rexpr->kind == NODE_INDEX ||
+             rexpr->kind == NODE_SLICE ||
+             (rexpr->kind == NODE_UNARY && rexpr->unary.op == TOK_STAR)))
+            return RET_STATIC;
+    }
     /* follow view (.field / [i] / [a..b]) and deref/addr (* / &) to the root */
     Node *root = rexpr;
     for (;;) {
@@ -23731,6 +24081,14 @@ static int classify_return_root(Checker *c, Node *rexpr) {
         else if (root->kind == NODE_UNARY &&
                  (root->unary.op == TOK_AMP || root->unary.op == TOK_STAR))
             root = root->unary.operand;
+        /* BUG-995: `@ptrtoint(x)` is a VIEW of x's pointee spelled as an integer
+         * — the address is the same region. Peeling it lets `usize leak(*u32 p)
+         * { return @ptrtoint(p); }` record ARParam(0), so the integer call-result
+         * sink (`g = leak(&local)`) can resolve the argument. */
+        else if (root->kind == NODE_INTRINSIC && root->intrinsic.name_len == 8 &&
+                 memcmp(root->intrinsic.name, "ptrtoint", 8) == 0 &&
+                 root->intrinsic.arg_count > 0)
+            root = root->intrinsic.args[0];
         else break;
     }
     if (!root) return RET_UNKNOWN;

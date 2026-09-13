@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: a free-everything loop (wild index i) then a LITERAL read of a slot
+// it may have freed. Don't mix literal- and variable-index access after a
+// variable-index free (the BUG-741 discipline); the wild read side of the
+// same loop is accepted — see tests/zer/var_index_fill_free_loop_ok.zer.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    for (u32 i = 0; i < 2; i += 1) {
+        if (hs[i].p) |q| { free(q); }
+    }
+    *T r = hs[1].p orelse return;
+    return r.v;
+}

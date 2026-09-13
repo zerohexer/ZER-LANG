@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: a tracked allocation STORED into a variable-indexed slot (hs[k].p = a.p)
+// was untracked — the slot had no literal key — so a free through the other
+// spelling and a read through this one compiled and read freed slab memory.
+// The array's ROOT now carries a may-alias view set; the read pulls it.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H a; H[2] hs;
+    a.p = alloc(T);
+    u32 k = pick();
+    hs[k].p = a.p;
+    *T q = a.p orelse return;
+    free(q);
+    *T r = hs[k].p orelse return;
+    return r.v;
+}

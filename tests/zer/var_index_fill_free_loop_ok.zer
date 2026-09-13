@@ -1,0 +1,16 @@
+// BUG-1012 positive: THE idiom — fill every slot through a loop index, free every
+// slot through a loop index. The wild slot "[?].p" is widened by the first free
+// and a WILD read never reports an index-widened member (a wild free of a wild
+// read is the loop itself), so this compiles, runs and leaks nothing.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H[4] hs;
+    for (u32 i = 0; i < 4; i += 1) { hs[i].p = alloc(T); }
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = hs[i].p orelse return;
+        q.v = i;
+        free(q);
+    }
+    return 0;
+}

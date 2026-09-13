@@ -1,0 +1,18 @@
+// BUG-1012 positive: the callee frees every element of a PARAM array through a
+// loop index. The wild param slot is minted on first read (as BUG-1004 mints a
+// literal param field), widened by the loop's free, and counted as a DEFINITE
+// field free in the summary — so the caller's cleanup(hs) is not a leak.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+void cleanup([*]H hs) {
+    for (u32 i = 0; i < hs.len; i += 1) {
+        if (hs[i].p) |q| { free(q); }
+    }
+}
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    cleanup(hs);
+    return 0;
+}

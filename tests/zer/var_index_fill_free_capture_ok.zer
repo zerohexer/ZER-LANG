@@ -1,0 +1,12 @@
+// BUG-1012 positive: the if-capture spelling of the free-everything loop.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H[4] hs;
+    for (u32 i = 0; i < 4; i += 1) { hs[i].p = alloc(T); }
+    u32 sum = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        if (hs[i].p) |q| { sum += q.v; free(q); }
+    }
+    return sum;
+}

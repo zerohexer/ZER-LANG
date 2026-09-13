@@ -91,6 +91,41 @@ walks, not just this one.
 
 ---
 
+## OPEN — BUG-1012 residuals: variable-index slots (2026-09-13, measured; none accepts a program the baseline rejected)
+
+The symbolic/wild index-key discipline (BUGS-FIXED.md BUG-1012) tracks `hs[k].p` at every
+zercheck_ir sink. What it does NOT do, each measured on this tree:
+
+1. **A GLOBAL-rooted variable-index slot is untracked** — `g_hs[k].p = alloc(T);` registers
+   nothing (`ir_global_projection_key` builds literal keys only, mode 0), so it neither leaks
+   nor aliases. Same as before BUG-1012. Fix sketch: give `ir_global_projection_key` the
+   symbolic/wild modes and let the G5 store arm register under `(IR_GLOBAL_ROOT_ID, "g_hs[?].p")`.
+2. **A struct VALUE copied through a variable index carries no view** — `H tmp = hs[k]; …
+   free(unwrap hs[1].p); tmp.p …` is accepted: the load hooks gate on `ir_type_reads_as_ref`
+   (a pointer/slice/opaque/optional-of-those value), and a by-value struct is not one. The
+   literal twin `H tmp = hs[1]` is carried by `ir_carry_compounds`. Fix sketch: in the
+   INDEX_READ / ASSIGN load arms, when the value type CARRIES a pointer, register the view
+   under each pointer-carrying field of the destination (`tmp.p` ← view of `hs[?].p`).
+3. **A wild read after a wild free of the SAME slot is accepted by design** —
+   `q = hs[i].p; free(q); r = hs[i].p; r.v` with `i` NOT index-stable (a loop counter, a
+   reassigned local). Deciding it needs a relation between the two index values, which the
+   analysis does not have; reporting it would reject the free-everything loop (`for i:
+   q = hs[i].p; free(q)`), whose second iteration is the same shape. With `i` stable the
+   slot is keyed symbolically and the same program IS rejected
+   (`tests/zer_fail/var_index_same_var_uaf.zer`). Rice-bounded; the precise fix is an
+   index-relational domain (see the MAX-oracle notes).
+4. **Precision: the don't-mix policy is coarse** — after a variable-index free, a LITERAL
+   read of any slot that may alias it is "use of maybe-freed" even when the indices provably
+   differ (`free(unwrap hs[k].p)` with k == 1 by VRP, then `hs[0].p`), and a symbolic reset
+   (`hs[k].p = null;`) does not un-widen the literal siblings. Two DIFFERENT stable indices
+   (`hs[j]` after `free(unwrap hs[k].p)`) are likewise rejected. This is BUG-741's policy
+   unchanged (verified on the baseline); restructure to one index spelling, or free and
+   re-read through the same stable local. Fix sketch: feed VRP's index range into
+   `ir_key_may_alias` (two provably-disjoint ranges → no alias).
+5. **Index stability is per FUNCTION and name-based** — a local reassigned anywhere in the
+   body (even after its last use as an index) is unstable everywhere, and a shadowed name is
+   never stable. Both are over-approximations toward the wild key (the sound direction).
+
 ## OPEN — FIVE BRANCHES SURVEYED 2026-09-10: 74 LIVE holes (2 closed as BUG-975, 17 as BUG-976/977/978, 9 as BUG-979/980), grouped, with the branch to take each from
 
 **START HERE.** Measured, not read. Two passes, because one is not enough:

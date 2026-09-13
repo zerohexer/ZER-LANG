@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: q = hs[k].p (no entry for slot k) is a VIEW of every slot that may
+// alias it — slot 1 here — so free(q) widens slot 1 to maybe-freed and the
+// literal read hs[1].p is rejected. Before: the free was untracked and the
+// file was rejected for the WRONG reason (a leak).
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    u32 k = pick();
+    *T q = hs[k].p orelse return;
+    free(q);
+    *T r = hs[1].p orelse return;
+    return r.v;
+}

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: SYMBOLIC key. k is index-stable (never reassigned, defined once,
+// outside any loop), so hs[k].p is ONE slot at every use: store, alias to q,
+// free(q), re-read — a definite use-after-free, not a may-alias guess.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    u32 k = pick();
+    hs[k].p = alloc(T);
+    *T q = hs[k].p orelse return;
+    free(q);
+    *T r = hs[k].p orelse return;
+    return r.v;
+}

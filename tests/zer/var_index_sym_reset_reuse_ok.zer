@@ -1,0 +1,20 @@
+// BUG-1012 positive: symbolic slot freed, reset to null, re-filled and reused.
+// Navigating to the VALUE hs[k] on the way to .p reads no allocation.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    u32 k = pick();
+    hs[k].p = alloc(T);
+    *T q = hs[k].p orelse return;
+    q.v = 4;
+    free(q);
+    hs[k].p = null;
+    hs[k].p = alloc(T);
+    *T r = hs[k].p orelse return;
+    r.v = 2;
+    u32 out = r.v;
+    free(r);
+    return out - 2;
+}

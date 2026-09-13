@@ -1,0 +1,14 @@
+// BUG-1012 positive: a variable-index store, then a LITERAL read + free of a slot
+// that may be it. The literal read with no entry of its own is a view of the
+// aliasing symbolic slot, so the free reaches the allocation: no leak reported.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    u32 k = pick();
+    hs[k].p = alloc(T);
+    *T q = hs[1].p orelse return;
+    free(q);
+    return 0;
+}

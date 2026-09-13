@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: the EXTERN-destructor free sink — destroy(q) with q read through a
+// variable index widens the aliasing literal slot; reading it is rejected.
+struct T { u32 v; }
+struct H { ?*T p; }
+void destroy(*T t);
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    u32 k = pick();
+    *T q = hs[k].p orelse return;
+    destroy(q);
+    *T r = hs[1].p orelse return;
+    return r.v;
+}

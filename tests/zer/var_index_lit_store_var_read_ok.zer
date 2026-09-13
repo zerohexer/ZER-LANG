@@ -1,0 +1,15 @@
+// BUG-1012 positive: literal store, variable-index read while alive, literal free.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    u32 k = pick();
+    *T q = hs[k].p orelse return;
+    q.v = 7;
+    u32 r = q.v;
+    *T w = hs[1].p orelse return;
+    free(w);
+    return r - 7;
+}

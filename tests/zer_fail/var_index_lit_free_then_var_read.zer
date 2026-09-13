@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: literal free, then a read through a variable index that may name
+// the freed slot: hs[k].p is a view of slot 1 and the pull sees it FREED.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    hs[1].p = alloc(T);
+    *T q = hs[1].p orelse return;
+    free(q);
+    u32 k = pick();
+    *T r = hs[k].p orelse return;
+    return r.v;
+}

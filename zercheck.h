@@ -160,6 +160,17 @@ typedef struct {
     void *gr_block_guards;
     int gr_block_count;
     int gr_cur_block;
+
+    /* BUG-1012: per-function caches for the SYMBOLIC-INDEX key discipline —
+     * which locals are index-stable (never reassigned or address-taken,
+     * defined at most once, outside any CFG cycle, uniquely named) and which
+     * blocks lie on a cycle. Keyed by the IRFunc under analysis; recomputed
+     * lazily when it changes (opaque to callers outside zercheck_ir.c). */
+    void *idx_stable_func;
+    signed char *idx_stable;
+    int idx_stable_count;
+    signed char *blk_cyclic;
+    int blk_cyclic_count;
 } ZerCheck;
 
 /* ---- API ---- */

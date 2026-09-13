@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1012: the LOAD spelling — a.p = hs[k].p aliases whatever slot k names.
+// With k index-stable the slot is keyed symbolically ("[k].p") and the alias
+// is exact; the free through a.p reaches it and the read is a definite UAF.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs; H a;
+    u32 k = pick();
+    hs[k].p = alloc(T);
+    a.p = hs[k].p;
+    *T q = a.p orelse return;
+    free(q);
+    *T r = hs[k].p orelse return;
+    return r.v;
+}

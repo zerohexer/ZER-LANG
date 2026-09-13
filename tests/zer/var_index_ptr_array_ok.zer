@@ -1,0 +1,12 @@
+// BUG-1012 positive: a bare pointer array (?*T[2]) filled and freed by index.
+struct T { u32 v; }
+u32 pick() { return 1; }
+u32 main() {
+    ?*T[2] ps;
+    for (u32 i = 0; i < 2; i += 1) { ps[i] = alloc(T); }
+    u32 k = pick();
+    *T q = ps[k] orelse return;
+    q.v = 5;
+    for (u32 i = 0; i < 2; i += 1) { if (ps[i]) |x| { free(x); } }
+    return 0;
+}

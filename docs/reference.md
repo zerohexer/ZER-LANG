@@ -1646,9 +1646,16 @@ t.id = 1;             // COMPILE ERROR — the compiler knows destroy() frees it
   consume-maybe — after `fp(h)`, freeing or using `h` is a compile error.
   Pass data (`pool.get(h).field`) if the caller keeps ownership, or hand
   ownership entirely (caller stops touching `h`).
-- VARIABLE-INDEX FREES: `heap.free(arr[k])` may free any tracked
-  element of `arr` — mixing literal- and variable-index frees on the same
-  array is a compile error in both orders.
+- VARIABLE-INDEX SLOTS: `hs[k].p = alloc(T)`, `q = hs[k].p`, `free(q)`
+  are tracked. If `k` is never reassigned (and not a loop counter) the
+  slot is tracked exactly, like `hs[1].p`. Otherwise the analysis treats
+  the access as "some slot": a free through a variable index may have
+  freed any element that could alias it, so a LITERAL read or free of such
+  an element afterwards is a compile error ("don't mix literal- and
+  variable-index access on the same array", in both orders). The idiom
+  that fills every slot in one loop and frees every slot in another
+  compiles as is, and so does a callee that frees every element of an
+  array parameter in a loop.
 
 **SEE ALSO**
 Handle(T), Pool(T,N), Slab(T)

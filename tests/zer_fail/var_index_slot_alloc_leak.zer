@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1012: hs[k].p = alloc(T) registered the allocation NOWHERE (unkeyable
+// slot), so never freeing it was silent. Keyed "[k].p" (k stable) or the wild
+// "[?].p" (k mutated), it leaks like any literal slot.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 pick() { return 1; }
+u32 main() {
+    H[2] hs;
+    u32 k = pick();
+    hs[k].p = alloc(T);
+    return 0;
+}

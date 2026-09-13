@@ -302,7 +302,8 @@ entered separately above.
 Bodies byte-identical on `qo0mm9` and `vgonmt` (both cherry-picked `vigilant-tesla-ef9cao`
 `021ecaa`); taken from `qo0mm9`'s `afcc7ee1`, checker.c + types.h hunks only (the same
 commit's emitter half is two OTHER live bugs — a global `(u32)1e20` and a `1e400` literal
-both make the emitted C fail to build — taken next). Three rules, all statically decided:
+both make the emitted C fail to build — taken as BUG-990/991 in the following commit). Three
+rules, all statically decided:
 `@pun` refused when its runtime type_id check CANNOT FIRE and the target carries a value
 with a validity invariant (`type_carries_forgeable`); `@inttoptr` to an enum-carrying
 pointee refused, routing to the guarded `@bitcast` idiom (door set stays at three);

@@ -5,6 +5,45 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-990/991: two legal ZER programs whose EMITTED C did not build (found beside class 5, not in the survey)
+
+The emitter half of `qo0mm9`'s `afcc7ee1` (its BUG-982/983), measured live on main while
+taking class 5 and not in the survey ledger (they are availability bugs — the checker
+accepts, GCC refuses — not accept-unsafe). Both `tests/zer` positives fail to BUILD on
+`git archive HEAD` (1696cb9c) and run now. Applied BY HAND against main's text: the
+branch's hunks were written against its own cast-emission refactor (`CastOperand` /
+`emit_cast_value` / `CASTF_F2I`, its BUG-979 of 2026-09-02) which main does not have, so a
+3-way apply produced two whole-section duplicates with EMPTY "ours" sides — the harvesting
+trap in its purest form, caught by the build. The AST-path site (`emit_expr`
+NODE_TYPECAST, "BUG-845 site 1") is main's global-initializer path and is where the hook
+went.
+
+### BUG-991 — a non-finite float literal reached emitted C as the bare token `inf`
+
+`f64 x = 1e400;` — `strtod` gives +inf; `%.17g` prints `inf`, which is not a C token; GCC
+said *"'inf' undeclared"* pointing through `#line` at the user's `.zer` line. The spelling
+was at FIVE emission sites, so it was five defects. ONE helper `emit_double_lit` renders
+the non-finite values as `__builtin_inf()` / `(-__builtin_inf())` / `__builtin_nan("")` —
+GCC constants valid in a static initializer and under `-ffreestanding`. NaN tested first,
+for the BUG-883 reason. **Gated**: `tools/audit_float_literal.sh` fails the build on any
+float conversion specifier outside the helper — wired into `make check` (the 10th gate)
+and verified to go RED by reverting one site.
+
+### BUG-990 — the float-to-int saturation guard is illegal at file scope
+
+`u32 g = (u32)1e20;` is a legal ZER global the checker accepts, but the BUG-883 guard is
+a GCC statement expression, so the emitter wrote `uint32_t g = ({ ... });` at file scope:
+*"braced-group within expression allowed only inside a function"*. `emit_f2i_const` is the
+same saturation as a constant expression, used at the AST typecast path when the operand
+can be re-evaluated for free (no side effects, not volatile — a global initializer always
+qualifies). The four limits are now ONE `f2i_limits` shared with the statement form; the
+bounds are the safety property and two copies of them is the drift shape.
+
+- Corpus: 1583 files, emitted C compared byte-for-byte under both binaries — only the two
+  new positives differ (no corpus file has a global f2i cast or a non-finite literal, which
+  follows: none could have been in a passing suite).
+- `make check` exit 0, ten gates.
+
 ## Session 2026-09-13 — BUG-987/988/989: three forging doors, each an intrinsic whose ADVERTISED runtime check did not exist for the operands that mattered (class 5 closed)
 
 Survey class 5, 11 reproducers, bodies byte-identical on `qo0mm9` and `vgonmt` (both are

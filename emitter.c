@@ -7536,7 +7536,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         } else if (idx_array && !checker_is_proven(e->checker, node) &&
                    node->index_expr.index->kind != NODE_INT_LIT &&
-                   node->index_expr.index->kind != NODE_IDENT &&
+                   /* BUG-1011: a bare IDENT index normally relies on the auto-guard
+                    * pre-pass — but a VOLATILE ident is left unguarded by the checker
+                    * on purpose (the guard would read it once and the access again),
+                    * so it must take THIS single-evaluation form instead: one load
+                    * into a temp, the check and the access both on the temp. */
+                   (node->index_expr.index->kind != NODE_IDENT ||
+                    expr_is_volatile(e, node->index_expr.index)) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for

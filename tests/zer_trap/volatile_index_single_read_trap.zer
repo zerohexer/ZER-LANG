@@ -1,0 +1,8 @@
+// expect-trap
+// expect-trap-at: 8
+// BUG-1011: a VOLATILE index on a fixed array used to get the auto-guard — which
+// reads the index once for the check and AGAIN for the access, so a value that
+// changes between the two reads walks past the guard. Now it takes the single-read
+// inline form: one load into a temp, the check and the access both on the temp.
+volatile u32 g_i = 9;
+u32 main() { u32[8] a; a[g_i] = 1; return 0; }

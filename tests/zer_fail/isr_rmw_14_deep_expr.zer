@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: read-modify-written in a single statement and is shared between interrupt and main
+// expect-error: read-modify-written and is shared between interrupt and main
 // BUG-976: ISR sibling of spawn_rmw_14_deep_expr.zer — same walker, same cap.
 volatile u32 g;
 interrupt TIMER1 { g = 0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (0 + (g + 1)))))))))))))); }

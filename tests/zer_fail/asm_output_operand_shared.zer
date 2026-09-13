@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: asm output operand reads shared struct 'S' without its lock
+// BUG-1013, the OUTPUT half (adapted from claude/loving-davinci-ppnatu's
+// asm_shared_operand.zer, which bound the field in both lists): an output operand
+// binds the shared field RAW exactly as an input does — the per-statement auto-lock
+// never wraps an asm statement, and a naked function has no frame for a mutex.
+shared struct S { u32 v; }
+S g;
+naked u32 wr() {
+    asm {
+        instructions: "mov %0, 1"
+        outputs: { "rbx" = g.v }
+        safety: "binds a shared field raw as an OUTPUT to demonstrate the refused shape"
+    }
+    return 0;
+}
+u32 main() { return 0; }

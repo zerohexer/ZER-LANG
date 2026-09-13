@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+// BUG-1010, the SPAWN sink twin of isr_rmw_split_statements.zer: the same lost update
+// split over two statements inside a spawned body. The hw-matrix crosses site with
+// spelling so the two sinks cannot drift; this pins the sink the reproducer did not.
+volatile u32 g;
+void w() { u32 t = g; g = t + 1; }
+u32 main() { spawn w(); spawn w(); return 0; }

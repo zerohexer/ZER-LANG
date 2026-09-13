@@ -1,0 +1,13 @@
+// BUG-1010 boundary: the cross-statement RMW taint is cleared by a re-binding from
+// no global — `u32 t = g; t = 5; g = t;` stores a constant, not a stale read — and a
+// local read from ONE global does not taint a write to ANOTHER. Both must compile.
+volatile u32 g;
+volatile u32 h;
+u32 main() {
+    u32 t = g;
+    t = 5;
+    g = t;
+    u32 u = g;
+    h = u + 1;      // reads g, writes h: not an RMW of either
+    return g + h - 11;
+}

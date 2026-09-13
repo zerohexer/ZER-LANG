@@ -237,6 +237,12 @@ struct Symbol {
      * pointer parameter, a call result), which the spawn sink treats conservatively. */
     const char *borrow_root_name;
     uint32_t borrow_root_len;
+    /* BUG-1014: set when a SECOND, DIFFERENT local root was recorded for this
+     * carrier (`h.p = &v; h.q = &x;`). borrow_root_name holds ONE name, so a
+     * carrier into two locals would lend only the last one and a parent write to
+     * the other raced unseen (measured). Cannot prove -> the spawn sink refuses;
+     * lending every root is the fix sketch in limitations.md. */
+    bool borrow_root_ambiguous;
     bool is_volatile_addr_derived; /* usize produced by @ptrtoint(<volatile ptr>) — the
                                     * volatile fact lives on the VALUE once the type
                                     * became an integer, and @inttoptr back to a

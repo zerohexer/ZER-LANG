@@ -5,6 +5,86 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-13 — BUG-1010..1014: the last five of the survey — the five-branch survey is CLOSED (102/102)
+
+### BUG-1010 — the RMW rule was per-STATEMENT, so splitting the operation over two hid it (`vgonmt` / 1zukjq)
+
+`g += 1`, `g = g + 1`, `g = idfn(g) + 1` were all rejected at both race sinks; `u32 t = g;
+g = t + 1;` was accepted at both — the first statement writes no global and the second's
+value never mentions `g`. On bare metal that is a lost update: the ISR fires between the
+read and the write and its store is discarded. A NAME -> GLOBAL value taint now rides the
+VarRange rails: a local whose value came from global G (directly, or from another local
+already tainted with G) carries G; a write to G whose value mentions such a local IS the
+read-modify-write; a re-binding from no global CLEARS it (`u32 t = g; t = 5; g = t;` stays
+accepted, pinned). Both sinks share one entry shape and one set of query helpers — the
+ISR sink's per-function map and the spawn sink's per-scan table — and the hw-matrix
+gained the split-statement and 2-hop forms at BOTH sites (39 -> 43 cells; 4 false
+negatives against the pre-fix compiler).
+
+Adopted with three changes, each a rule this file already carries: the two query walkers
+arrived as if/else chains and are exhaustive switches (BUG-999's rule, the same day); the
+spawn sink's fixed table (`[RMW_ALIAS_MAX]`, silent drop at 17) is growable; and the
+depth caps round the right way — the SOURCE lookup has no conservative value, so its cap
+is the parser bound, while the taint TEST feeds a reject and rounds to TRUE. The
+diagnostic dropped "in a single statement" (it would now describe a shape it does not
+always name); seven negatives updated to the new wording.
+
+**Tooling taken with it:** every `tests/test_*_matrix.c` grid honours `ZER_MATRIX_ZERC`.
+Until now all ten auto-detected `./zerc` and IGNORED argv — CLAUDE.md recorded that trap
+for the hw grid — so "run it against the baseline" silently graded the current compiler.
+`ZER_MATRIX_ZERC=/tmp/headb/zerc ./test_hw_matrix` is how the four new cells were shown
+to fire.
+
+### BUG-1011 — a VOLATILE index defeated the auto-guard by being read twice (`ppnatu` + the array half no branch pinned)
+
+The auto-guard is `if (i >= N) return; ... arr[i]` — two reads of `i`. For an ordinary
+local that is one value; for a volatile it is two loads, and whatever changes it between
+them (an ISR, a thread, the peripheral) walks straight past the guard. Measured on the
+emitted C for a fixed array: `_zer_t3 = g_i; ... a[g_i] = 1`. `ppnatu` pinned only the
+MMIO-pointer form, which is REFUSED (a pointer index has no inline single-read form to
+fall back to — the Ban Decision Framework's "no tracking can hold a volatile value still
+between the check and the use"). The fixed-ARRAY form was live too and is not refused: the
+checker leaves a volatile ident UNPROVEN and UNGUARDED, and the emitter's single-evaluation
+inline form — one load into a temp, the check and the access both on the temp — now admits
+a volatile ident where it admitted only compound indices before. An out-of-range volatile
+index TRAPS (`volatile_index_single_read_trap.zer`, exit 133) where it used to return
+silently. Defensive with it: a volatile value never gets a VRP range recorded.
+
+**A trap found on the way, and worth its own line: I changed `checker.h` and ran
+`make zerc` without `rm -f *.o`.** The Makefile has no header dependencies, so the
+linked binary mixed two `Checker` layouts and SEGFAULTED inside `resolve_type_inner` at
+-O2 only — clean under ASan, clean at -O0, exactly the phantom CLAUDE.md describes. The
+module test caught it; a clean rebuild made it vanish. Not a bug in the compiler.
+
+### BUG-1012 — a label inside a defer body (`qo0mm9`)
+
+Refactor L lowers a defer body into a template every fire clones, but a function WITH a
+label keeps the AST defer path, and that path had no LABEL handler: the compiler printed
+`compiler bug: emit_defer_stmt has no handler for node kind 23` and emitted a `_zer_trap`.
+`goto` is banned in a defer body, so the label could never be a jump target; refused.
+
+### BUG-1013 — a `shared struct` field in an ASM OPERAND was read with no lock (`qo0mm9` / `ppnatu`; main's own OPEN entry)
+
+The per-statement auto-lock never wraps an asm statement, so `inputs: { "rax" = a.x }`
+was a bare read of the shared field reachable from a spawned thread. REJECTED by the Ban
+Decision Framework's first branch — a hardware constraint: asm is legal only in a `naked`
+function, which has no frame to take a mutex in. Both operand lists through the one
+query `collect_shared_types_in_expr`; the output half pinned separately (adapted from
+`ppnatu`'s body, which bound both lists — its `expect-error` wording differed, so main's
+is asserted).
+
+### BUG-1014 — a scoped-spawn carrier into TWO locals lent only one (`qo0mm9` / r3an9y)
+
+`Symbol.borrow_root_name` holds one name, the last field write wins: `h.p = &v; h.q = &x;
+spawn w(h); v = 1;` lent `x` and let the write to `v` race (measured — only `x = 1` was
+refused). A second, different root now sets `borrow_root_ambiguous`, and the spawn sink
+refuses the argument with the fix (pass `&v` and `&x` directly). Two pointers into the
+SAME local still compile. Lending every root is the precision fix, recorded OPEN.
+
+- Corpus: 2467 files, only the seven new negatives change verdict; no corpus file gets
+  the volatile-index warning.
+- `make check` exit 0.
+
 ## Session 2026-09-13 — BUG-996..1008: fourteen of the survey's "smaller classes", plus three live bugs found beside them
 
 Batch one of survey class 10, taken by COMMIT rather than by class so each hunk was read

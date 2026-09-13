@@ -883,6 +883,7 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
 }
 
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len); /* BUG-1011 */
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
@@ -909,6 +910,8 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line);
 /* BUG-971: the original three-argument form, for the many GLOBAL call sites. */
 #define track_isr_global(c, n, l, comp) track_isr_global_ex((c), (n), (l), (comp), false, 0)
+static int collect_shared_types_in_expr(Checker *c, Node *expr,
+                                         Type **types, int max_types, int count);   /* BUG-1013 */
 static void record_isr_globals(Checker *c, Node *node, int depth);
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -3652,11 +3655,21 @@ static void rmw_ctx_restore(const RmwScanCtx *k) {
     _static_local_count = k->static_count; _static_local_overflow = k->static_overflow;
 }
 
+/* BUG-1010 (from vgonmt 27e49871 / vigilant-tesla-1zukjq, its BUG-1010): the spawn
+ * sink's copy of the cross-statement VALUE taint. Same entry shape and same query
+ * helpers as `Checker.rmw_taints` (the ISR sink) — the table is separate only
+ * because this one is filled while a CALLEE's body is walked out of order, not
+ * while the enclosing function is checked. Growable (the branch shipped a fixed
+ * table that silently dropped its 17th row — the BUG-976 shape); reset with the
+ * alias table for the same reason. */
+static RmwTaintEnt *_rmw_vtaint = NULL;
+static int _rmw_vtaint_count = 0, _rmw_vtaint_cap = 0;
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
                                     _rmw_alias_overflow = false;
                                     _static_local_count = 0; _static_local_overflow = false;
                                     _scan_found_static_local = false;
-                                    _scan_depth_exceeded = false; /* BUG-971/976 */ }
+                                    _scan_depth_exceeded = false; /* BUG-971/976 */
+                                    _rmw_vtaint_count = 0; /* BUG-1010 */ }
 /* BUG-976: set when the alias table filled. Same defect as the static-local table
  * above: past 16 aliases a `*p16 += 1` resolved to NOTHING and the volatile RMW race
  * compiled clean. A lookup that misses because the table is FULL is not the same
@@ -3769,6 +3782,158 @@ static bool expr_mentions_global(Node *e, Symbol *g, int depth) {
 }
 static bool assign_reads_own_target(Node *value, Symbol *tgt) {
     return expr_mentions_global(value, tgt, 0);
+}
+
+/* BUG-1010 — cross-statement RMW taint. See `struct RmwTaint` in checker.h for
+ * why this exists and which direction it can be wrong in. Three operations:
+ *
+ *   rmw_taint_of(c, expr, &g)   does this expression read a tainted local, and
+ *                               if so which global does it carry?
+ *   rmw_taint_set(c, name, g)   record (or, with g == NULL, clear) a local's taint
+ *   rmw_value_taints_global     the query the RMW site asks: does this value
+ *                               expression carry global `g` through a local?
+ */
+static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n,
+                              const char *nm, uint32_t nl) {
+    for (int i = n - 1; i >= 0; i--)
+        if (tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
+            return tab[i].global;
+    return NULL;
+}
+
+/* Set (or, with g == NULL, clear) a local's taint in `*tab`. `cap` is the
+ * capacity cell for the growable table and may be NULL for a FIXED one, in which
+ * case a full table silently drops the row — which costs a missed rejection,
+ * never a wrong one. */
+static void rmw_tab_set(RmwTaintEnt **tab, int *n, int *cap, int fixed_max,
+                        const char *nm, uint32_t nl, Symbol *g) {
+    if (!nm || nl == 0) return;
+    for (int i = 0; i < *n; i++) {
+        if ((*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0) {
+            (*tab)[i].global = g;   /* NULL clears */
+            return;
+        }
+    }
+    if (!g) return;   /* nothing to record */
+    if (cap) {
+        if (*n >= *cap) {
+            int nc = *cap ? *cap * 2 : 8;
+            RmwTaintEnt *nt = (RmwTaintEnt *)realloc(*tab, (size_t)nc * sizeof(*nt));
+            if (!nt) return;
+            *tab = nt;
+            *cap = nc;
+        }
+    } else if (*n >= fixed_max) {
+        return;
+    }
+    (*tab)[*n].name = nm;
+    (*tab)[*n].name_len = nl;
+    (*tab)[*n].global = g;
+    (*n)++;
+}
+
+/* Which global (if any) does this expression's value come from? A direct read of
+ * a global, or a read of a local already carrying one. Depth-limited, partial by
+ * design like `expr_mentions_global` — an unlisted node kind yields "none", which
+ * costs a missed rejection and never a wrong one. */
+static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
+                                       Node *e, int depth) {
+    /* The walk RECORDS a source for a later rule; there is no conservative
+     * value to return past the cap ("came from every global" cannot be a row),
+     * so the remedy is a cap past anything real (parser bound 256, BUG-976). */
+    if (!e || depth > 256) return NULL;
+    #define RVS(x) rmw_value_source_global(c, tab, n, (x), depth + 1)
+    switch (e->kind) {
+    case NODE_IDENT: {
+        Symbol *t = rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len);
+        if (t) return t;
+        /* A GLOBAL read. Same test `resolve_write_target_global` uses on the
+         * WRITE side, so the two halves of the RMW agree on what a global is. */
+        Symbol *sym = scope_lookup(c->current_scope, e->ident.name,
+                                   (uint32_t)e->ident.name_len);
+        if (!sym || sym->is_function) return NULL;
+        return scope_lookup_local(c->global_scope, sym->name, sym->name_len);
+    }
+    case NODE_UNARY:    return RVS(e->unary.operand);
+    case NODE_TYPECAST: return RVS(e->typecast.expr);
+    case NODE_FIELD:    return RVS(e->field.object);
+    case NODE_INDEX: {  Symbol *l = RVS(e->index_expr.object); return l ? l : RVS(e->index_expr.index); }
+    case NODE_SLICE: {  Symbol *l = RVS(e->slice.object); if (l) return l;
+                        l = RVS(e->slice.start); return l ? l : RVS(e->slice.end); }
+    case NODE_BINARY: { Symbol *l = RVS(e->binary.left); return l ? l : RVS(e->binary.right); }
+    case NODE_ASSIGN: { Symbol *l = RVS(e->assign.value); return l ? l : RVS(e->assign.target); }
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) { Symbol *r = RVS(e->intrinsic.args[i]); if (r) return r; }
+        return NULL;
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++) { Symbol *r = RVS(e->call.args[i]); if (r) return r; }
+        return NULL;
+    case NODE_ORELSE: { Symbol *l = RVS(e->orelse.expr); return l ? l : RVS(e->orelse.fallback); }
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) { Symbol *r = RVS(e->struct_init.fields[i].value); if (r) return r; }
+        return NULL;
+    /* Leaves that cannot carry a global's value, and statement kinds an
+     * expression walker is never handed. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return NULL;
+    }
+    #undef RVS
+    return NULL;
+}
+
+/* Does this value expression carry `g` through a tainted LOCAL? (A direct
+ * mention of `g` itself is `assign_reads_own_target`'s job, not this one.)
+ * Feeds a REJECT, so the cap and the statement kinds round to TRUE. */
+static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
+                                    Symbol *g, int depth) {
+    if (!e || !g) return false;
+    if (depth > 16) return true;
+    #define RVT(x) rmw_value_taints_global(tab, n, (x), g, depth + 1)
+    switch (e->kind) {
+    case NODE_IDENT:
+        return rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len) == g;
+    case NODE_UNARY:    return RVT(e->unary.operand);
+    case NODE_TYPECAST: return RVT(e->typecast.expr);
+    case NODE_FIELD:    return RVT(e->field.object);
+    case NODE_INDEX:    return RVT(e->index_expr.object) || RVT(e->index_expr.index);
+    case NODE_SLICE:    return RVT(e->slice.object) || RVT(e->slice.start) || RVT(e->slice.end);
+    case NODE_BINARY:   return RVT(e->binary.left) || RVT(e->binary.right);
+    case NODE_ASSIGN:   return RVT(e->assign.target) || RVT(e->assign.value);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) if (RVT(e->intrinsic.args[i])) return true;
+        return false;
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++) if (RVT(e->call.args[i])) return true;
+        return RVT(e->call.callee);
+    case NODE_ORELSE:   return RVT(e->orelse.expr) || RVT(e->orelse.fallback);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) if (RVT(e->struct_init.fields[i].value)) return true;
+        return false;
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF:
+        return false;
+    case NODE_CAST:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    #undef RVT
+    return true;
 }
 
 /* BUG-801: does this function read-modify-write through pointer parameter n?
@@ -4074,6 +4239,12 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
         sym->borrow_root_len  = rs->name_len;
         return;
     }
+    /* BUG-1014: a second, DIFFERENT local root on the same carrier. One name
+     * cannot lend two locals; remember that the answer is "more than one". */
+    if (sym->borrow_root_name &&
+        (sym->borrow_root_len != rs->name_len ||
+         memcmp(sym->borrow_root_name, rs->name, rs->name_len) != 0))
+        sym->borrow_root_ambiguous = true;
     sym->borrow_root_name = rs->name;
     sym->borrow_root_len  = rs->name_len;
 }
@@ -7457,8 +7628,34 @@ static Type *check_expr(Checker *c, Node *node) {
             bool is_rmw = (node->assign.op != TOK_EQ) ||
                           target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                           (gs && assign_reads_own_target(node->assign.value, gs));
+            /* BUG-1010: the SAME read-modify-write, split over two statements.
+             * `u32 t = g; g = t + 1;` answered "not an RMW" at both halves —
+             * the first writes no global, the second's value never mentions `g`
+             * — while `g += 1` and `g = g + 1` were both rejected. On bare metal
+             * the two-statement spelling is a lost update: the ISR fires between
+             * them and its store is discarded. */
+            if (!is_rmw && gs &&
+                rmw_value_taints_global(c->rmw_taints, c->rmw_taint_count,
+                                        node->assign.value, gs, 0))
+                is_rmw = true;
             if (is_rmw && gs && !gs->is_function)
                 track_isr_global(c, gs->name, gs->name_len, true);
+
+            /* BUG-1010: maintain the taint. A plain `local = <expr>` SETS the
+             * local's taint to whichever global the expression's value came
+             * from, and CLEARS it when the value came from none — so
+             * `u32 t = g; t = 5; g = t;` is not an RMW. Only a bare local ident
+             * target: a write through a projection is not a rebinding. */
+            if (node->assign.op == TOK_EQ &&
+                node->assign.target && node->assign.target->kind == NODE_IDENT &&
+                !gs) {
+                rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
+                            &c->rmw_taint_capacity, 0,
+                            node->assign.target->ident.name,
+                            (uint32_t)node->assign.target->ident.name_len,
+                            rmw_value_source_global(c, c->rmw_taints,
+                                c->rmw_taint_count, node->assign.value, 0));
+            }
         }
 
         /* BUG-294/302: reject assignment to non-lvalue.
@@ -11087,6 +11284,29 @@ static Type *check_expr(Checker *c, Node *node) {
                         (unsigned long long)obj->array.size);
                     mark_proven(c, node);   /* diagnosed — do not also auto-guard */
                 }
+                /* BUG-1011: NOT for a VOLATILE index. The auto-guard is
+                 * `if (i >= N) return; ... arr[i]` — TWO reads of `i`. For an
+                 * ordinary local that is one value; for a volatile it is two
+                 * loads, and whatever changes it between them (an ISR, a thread,
+                 * the peripheral) walks straight past the guard. Measured on the
+                 * emitted C: `_zer_t3 = g_i; if (...) ...; a[g_i] = 1`. Leave it
+                 * UNPROVEN and UNGUARDED here so the emitter takes its
+                 * single-evaluation inline form — one load into a temp, the
+                 * bounds check and the access both on the temp (a trap, like a
+                 * slice). Both emitter paths admit a volatile ident to that form. */
+                if (!checker_is_proven(c, node) &&
+                    node->index_expr.index->kind == NODE_IDENT &&
+                    vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                        (uint32_t)node->index_expr.index->ident.name_len)) {
+                    checker_warning(c, node->loc.line,
+                        "volatile index '%.*s' cannot be proven in range for array of "
+                        "size %llu — a single-read bounds check (trap on failure) is "
+                        "inserted. Copy it to a non-volatile local and guard that to "
+                        "eliminate the check",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name,
+                        (unsigned long long)obj->array.size);
+                } else
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
                     if (iv == IDX_PARTIAL_OOB) {
@@ -11248,6 +11468,27 @@ static Type *check_expr(Checker *c, Node *node) {
                             mark_proven(c, node);
                             break;
                         }
+                    }
+                    /* BUG-1011: a VOLATILE index on an MMIO pointer has the same
+                     * two-read guard as the array case, and here there is no inline
+                     * single-read form to fall back to (a pointer index emits bare).
+                     * Ban Decision Framework: no tracking can hold a volatile value
+                     * still between the check and the use, so refuse, with the
+                     * one-line fix. */
+                    if (node->index_expr.index->kind == NODE_IDENT &&
+                        vrp_key_root_is_volatile(c, node->index_expr.index->ident.name,
+                            (uint32_t)node->index_expr.index->ident.name_len)) {
+                        checker_error(c, node->loc.line,
+                            "cannot index MMIO pointer with volatile '%.*s' — the "
+                            "range guard would read it once and the access again, and "
+                            "a value that changes between the two reads defeats the "
+                            "guard. Copy it to a non-volatile local first",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name);
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;   /* diagnosed once, not twice */
+                        break;
                     }
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
@@ -11475,7 +11716,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     "cannot use 'orelse return' inside @critical block — interrupts would not be re-enabled");
             }
         }
-        /* BUG-974: a bare `orelse return` returns the function's ZERO value — that is
+        /* BUG-1010: a bare `orelse return` returns the function's ZERO value — that is
          * the documented semantics ("no value; the return value comes from the
          * function's return type"). Some types HAVE no zero: `*T` is non-null BY
          * DEFINITION, and so is a funcptr. The emitter's fallback for a valueless
@@ -15195,6 +15436,14 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 }
             }
         }
+        /* BUG-1010: seed the VALUE taint for the split-statement RMW —
+         * `u32 t = g;` inside a spawned body makes `t` carry `g`. Uses the same
+         * query helper as the ISR sink; only the table differs. */
+        if (node->var_decl.init && node->var_decl.name)
+            rmw_tab_set(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap, 0,
+                         node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                         rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
+                                                 node->var_decl.init, 0));
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
         /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
@@ -15217,6 +15466,24 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             bool _is_rmw = (node->assign.op != TOK_EQ) ||
                            target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                            (ts && assign_reads_own_target(node->assign.value, ts));
+            /* BUG-1010: the split-statement spelling, at the SPAWN sink. Added in
+             * the same commit as the ISR one — the RMW grid in
+             * tests/test_hw_matrix.c crosses site with spelling precisely so a
+             * form taught to one sink and not the other fails the build, and it
+             * caught this the moment the ISR half went in. */
+            if (!_is_rmw && ts &&
+                rmw_value_taints_global(_rmw_vtaint, _rmw_vtaint_count,
+                                        node->assign.value, ts, 0))
+                _is_rmw = true;
+            /* Maintain the taint: a plain `local = <expr>` re-binds it, and a
+             * value from no global CLEARS it. */
+            if (node->assign.op == TOK_EQ && !ts &&
+                node->assign.target->kind == NODE_IDENT)
+                rmw_tab_set(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap, 0,
+                             node->assign.target->ident.name,
+                             (uint32_t)node->assign.target->ident.name_len,
+                             rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
+                                                     node->assign.value, 0));
             if (ts && !ts->is_function && !ts->is_const &&
                 zer_volatile_compound_valid(ts->is_volatile ? 1 : 0,
                                             _is_rmw ? 1 : 0) == 0) {
@@ -15775,6 +16042,17 @@ static void check_stmt(Checker *c, Node *node) {
              * type-driven and reads the operand's type from the typemap, which is
              * not populated until the init has been checked. Running here missed
              * every non-ident operand (`*h.pp`). */
+        /* BUG-1010: seed the cross-statement RMW taint. `u32 t = g;` makes `t`
+         * carry `g`, so a later `g = t + 1` is recognised as the
+         * read-modify-write it is. Done here rather than after check_expr
+         * because the query is name resolution only — it never reads the
+         * typemap — and the init's own identifiers are already in scope. */
+        if (node->kind == NODE_VAR_DECL && node->var_decl.init && node->var_decl.name)
+            rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
+                        &c->rmw_taint_capacity, 0,
+                        node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                        rmw_value_source_global(c, c->rmw_taints,
+                            c->rmw_taint_count, node->var_decl.init, 0));
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -18514,6 +18792,19 @@ static void check_stmt(Checker *c, Node *node) {
         break;
 
     case NODE_LABEL:
+        /* BUG-1012 (from qo0mm9 d0e6b116): a label inside a defer body. `goto` is
+         * banned in a defer body, so nothing can ever jump here — and refactor L
+         * lowers the body into a detached template that every fire clones, while
+         * a label's block is allocated once, up front, outside that template
+         * (main keeps the AST defer path for a function WITH a label, and that
+         * path had no LABEL handler: "compiler bug: emit_defer_stmt has no
+         * handler for node kind 23" plus a _zer_trap in the emitted C). Rejecting
+         * the label costs nothing: it has no possible use. */
+        if (c->defer_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside a defer body — 'goto' is not allowed "
+                "there, so the label could never be a jump target");
+        }
         /* labels are just markers — no type checking needed. BUT a `goto` can
          * jump to this label carrying ANY value, so a value-range narrowed on the
          * fall-through path ABOVE the label does not hold at the label (the goto
@@ -18781,6 +19072,38 @@ static void check_stmt(Checker *c, Node *node) {
                     "asm `safety:` string must be at least 30 characters — "
                     "describe what the asm does and cite hardware spec/manual "
                     "(D-Alpha-7.5 S4 rule, audit-trail requirement)");
+            }
+            /* BUG-1013 (from qo0mm9 d0e6b116, its BUG-995; the survey's
+             * asm_operand_shared_read / ppnatu's asm_shared_operand): a `shared
+             * struct` field in an ASM OPERAND. The per-statement auto-lock never
+             * wraps an asm statement, so `inputs: { "rax" = a.x }` was emitted as
+             * a BARE read of the shared field — an unlocked access reachable from
+             * a spawned thread, the same class as BUG-935 at a site the lock
+             * collector never visits (main's OPEN entry "a shared struct read in
+             * an ASM OPERAND takes NO LOCK"). Decided by the Ban Decision
+             * Framework as a HARDWARE constraint, not tracked: asm is only legal
+             * in a `naked` function, which has no prologue and no frame, so a
+             * pthread_mutex_lock call around the operand is not something the
+             * compiler can emit there. Read the field into a local in an ordinary
+             * (locked) function and pass the value in. One query —
+             * collect_shared_types_in_expr — for both operand lists. */
+            for (int oi = 0; oi < node->asm_stmt.input_count + node->asm_stmt.output_count; oi++) {
+                AsmOperand *aop = (oi < node->asm_stmt.input_count)
+                    ? &node->asm_stmt.inputs[oi]
+                    : &node->asm_stmt.outputs[oi - node->asm_stmt.input_count];
+                if (!aop->expr) continue;
+                Type *sh = NULL;   /* one is enough: the question is "any?" */
+                int shn = collect_shared_types_in_expr(c, aop->expr, &sh, 1, 0);
+                if (shn > 0 && sh) {
+                    char tn[96];
+                    snprintf(tn, sizeof(tn), "%s", type_name(sh));
+                    checker_error(c, node->loc.line,
+                        "asm %s operand reads shared struct '%s' without its lock — "
+                        "an asm statement is never auto-locked, and a naked function "
+                        "has no frame to take a mutex in. Read the field into a local "
+                        "in an ordinary function and pass the value to the asm",
+                        (oi < node->asm_stmt.input_count) ? "input" : "output", tn);
+                }
             }
             /* D-Alpha-7.5 Session B / H2: type-check operand bindings.
              * Each input/output must be integer-typed (Session B scope = scalars).
@@ -20206,6 +20529,23 @@ static void check_stmt(Checker *c, Node *node) {
                     } else if (ba->kind == NODE_IDENT) {
                         Symbol *as = scope_lookup(c->current_scope, ba->ident.name,
                                                   (uint32_t)ba->ident.name_len);
+                        /* BUG-1014 (from qo0mm9 c10dc386 / r3an9y, its BUG-971): a
+                         * carrier holding pointers into TWO different locals has
+                         * no single nameable root — borrow_root_name kept only the
+                         * LAST one, so `h.p = &v; h.q = &x; spawn w(h); v = 1;`
+                         * lent `x` and let the write to `v` race (measured).
+                         * Cannot prove -> reject, with the one-line fix. */
+                        if (as && as->borrow_root_ambiguous) {
+                            checker_error(c, node->loc.line,
+                                "spawn argument %d references locals whose identity "
+                                "the compiler cannot resolve (a carrier holding "
+                                "pointers into two different locals), so the "
+                                "exclusive borrow until .join() cannot be established "
+                                "— a parent write to either local before the join "
+                                "would be a data race. Pass '&local' arguments "
+                                "directly, or copy the data by value", bi + 1);
+                            continue;
+                        }
                         if (as && as->borrow_root_name) {
                             cand_n[cand_c] = as->borrow_root_name;
                             cand_l[cand_c] = as->borrow_root_len; cand_c++;
@@ -21703,6 +22043,7 @@ static void check_func_body(Checker *c, Node *node) {
          * reset re-clears them. Functions never nest, so nothing between here and
          * that next reset consults a stale range. */
         c->var_range_count = 0;
+        c->rmw_taint_count = 0;   /* BUG-1010: per-function, same lifetime as VarRange */
         check_stmt(c, node->func_decl.body);
         /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
          * every REGULAR function body, so an RMW reached from main through a
@@ -21880,6 +22221,7 @@ static void check_func_body(Checker *c, Node *node) {
          * fixed-array index "proven", and elided the bounds auto-guard inside the
          * ISR -> silent bare-metal stack OOB. Mirrors the func_decl reset. */
         c->var_range_count = 0;
+        c->rmw_taint_count = 0;   /* BUG-1010 */
         check_stmt(c, node->interrupt.body);
         /* ISR-TRANS: also record globals reached through helper calls so the
          * "accessed from both ISR and main → volatile" and "volatile compound
@@ -21947,12 +22289,28 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
 /* Push a new range entry. If an existing range exists for this var,
  * intersect (narrow) rather than replace — ensures ranges only tighten.
  * For unsigned types, min is clamped to 0 (can't be negative). */
+/* BUG-1011 (from ppnatu 99c922c7, its BUG-960): is the ROOT variable of this VRP
+ * key `volatile`? A volatile value is re-read at every use, so no fact about it
+ * survives from one read to the next. */
+static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len) {
+    uint32_t rl = 0;
+    while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
+    if (rl == 0) return false;
+    Symbol *s = scope_lookup(c->current_scope, name, rl);
+    if (!s) s = scope_lookup(c->global_scope, name, rl);
+    return s && s->is_volatile;
+}
+
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero) {
     /* BUG-479: skip narrowing for address-taken variables — pointer alias
      * may modify the value, so guard-narrowed range is unreliable. */
     struct VarRange *existing = find_var_range(c, name, name_len);
     if (existing && existing->address_taken) return;
+    /* BUG-1011: a volatile value has no range — never record one. (Defensive:
+     * measured not live for the `if (g_i < 4) { a[g_i] }` shape on main, but a
+     * range on a value that changes between reads can only elide a guard.) */
+    if (vrp_key_root_is_volatile(c, name, name_len)) return;
 
     /* clamp min to 0 for unsigned variables */
     if (min_val < 0) {
@@ -23395,10 +23753,14 @@ static void check_interrupt_safety(Checker *c) {
                  * the rule now also sees `g = g + 1` and writes reaching g through a
                  * pointer — so the message must describe the OPERATION, not one
                  * spelling of it. */
-                "volatile global '%.*s' is read-modify-written in a single "
-                "statement and is shared between interrupt and main code — "
-                "the read and the write can be split by an interrupt, losing an "
-                "update; use an explicit read/mask/write or @atomic_*",
+                /* BUG-1010: and no longer only within ONE statement — the taint
+                 * catches `u32 t = g; g = t + 1;` too, so "in a single
+                 * statement" would now name a shape the diagnostic does not
+                 * always describe. */
+                "volatile global '%.*s' is read-modify-written and is shared "
+                "between interrupt and main code — the read and the write can be "
+                "split by an interrupt, losing an update; use an explicit "
+                "read/mask/write inside @critical, or @atomic_*",
                 (int)g->name_len, g->name);
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and

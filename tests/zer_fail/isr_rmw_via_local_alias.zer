@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: read-modify-written in a single statement
+// expect-error: read-modify-written and is shared
 // RMW-LAUNDER, ISR sink, no call at all: the alias is a local pointer in the
 // ISR body itself. The weakest form of the class, and it was accepted too.
 volatile u32 counter;

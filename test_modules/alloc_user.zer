@@ -1,0 +1,7 @@
+import alloc_lib;
+u32 main() {
+    [*]Task s = make(3) orelse return;
+    defer free(s);
+    s[2].id = 7;
+    return s[2].id - 7;
+}

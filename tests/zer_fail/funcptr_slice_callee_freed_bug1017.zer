@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1017: an INDEXED callee reads the function pointer out of the allocation
+// before calling through it. `free(cbs); cbs[0](1)` compiled clean: the callee is
+// never lowered and the UAF walker only descended a FIELD callee's object.
+typedef u32 (*Op)(u32);
+u32 one(u32 a) { return a + 1; }
+u32 main() {
+    [*]Op cbs = alloc(Op, 2) orelse return;
+    cbs[0] = one;
+    free(cbs);
+    return cbs[0](1);
+}

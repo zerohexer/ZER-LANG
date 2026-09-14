@@ -1,0 +1,21 @@
+// BUG-1018 boundary: copying a pointer param into a local and using it is fine,
+// and a callee that frees through the alias makes the CALLER's ownership end —
+// no false leak, no false use-after-free. Must compile, run, exit 0.
+struct T { u32 v; }
+u32 peek(*T p) {
+    *T q = p;
+    q.v += 1;
+    return q.v;
+}
+void drop(*T p) {
+    *T q = p;
+    free(q);
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    x.v = 1;
+    u32 r = peek(x);
+    drop(x);
+    if (r != 2) { return 1; }
+    return 0;
+}

@@ -1,0 +1,17 @@
+// expect-trap
+// BUG-1019b: a call through an INDEXED SLICE of function pointers, `s[i](args)`,
+// was emitted by a hand-rolled `name[index]` path in the IR call emitter that
+// never went through the NODE_INDEX emitter — so a slice callee had no
+// `_zer_bounds_check` at all (and no `.ptr`). An out-of-range index must trap.
+typedef u32 (*Op)(u32);
+u32 dbl(u32 x) { return x * 2; }
+u32 pick(u32 n) { return n; }
+
+u32 main() {
+    Op[2] ops;
+    ops[0] = dbl;
+    ops[1] = dbl;
+    [*]Op s = ops;
+    u32 i = pick(9);
+    return s[i](4);
+}

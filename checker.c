@@ -138,6 +138,28 @@ static bool type_carries_handle(Type *t, int depth) {
  * identifier — the non-scoped evaluator cannot. */
 static int64_t eval_const_expr_scoped(Checker *c, Node *n);
 
+/* BUG-1025: the builtin-container type kinds, by display name (NULL for any other
+ * kind). Exhaustive so a new TypeKind is a build failure, not a silent "not a
+ * container". */
+static const char *builtin_container_kind_name(int kind) {
+    switch ((TypeKind)kind) {
+    case TYPE_ARENA:     return "Arena";
+    case TYPE_BARRIER:   return "Barrier";
+    case TYPE_SEMAPHORE: return "Semaphore";
+    case TYPE_POOL:      return "Pool";
+    case TYPE_SLAB:      return "Slab";
+    case TYPE_RING:      return "Ring";
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32:
+    case TYPE_I64: case TYPE_F32: case TYPE_F64: case TYPE_POINTER: case TYPE_OPTIONAL:
+    case TYPE_SLICE: case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_ENUM: case TYPE_UNION:
+    case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_HANDLE: case TYPE_DISTINCT:
+    case TYPE_UINT: case TYPE_SINT:
+        return NULL;
+    }
+    return NULL;
+}
+
 /* BUG-873: evaluate a declared SIZE/COUNT expression, resolving `const`
  * identifiers, and FOLD THE RESULT IN PLACE.
  *
@@ -5411,6 +5433,22 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                 "nested optional '??T' is not supported");
             return inner; /* return the inner ?T, not ??T */
         }
+        /* BUG-1025: an optional of a builtin CONTAINER (Arena / Barrier / Semaphore /
+         * Pool / Slab / Ring) has no meaning — these are unique resources addressed
+         * by name, not values — and no C type: the emitter's `?T` typedef switch has
+         * no arm for them, so `?Arena a;` was declared as `_zer_opt_u8 a` (the
+         * fall-through arm read `intn.bits` of a non-intn type) and compiled with a
+         * type far too small for what it claimed to hold. Refuse at the type. */
+        {
+            const char *bc = builtin_container_kind_name(inner_unwrapped_kind);
+            if (bc) {
+                checker_error(c, tn->loc.line,
+                    "optional of '%s' is not supported — a builtin container is a unique "
+                    "resource, not a value; declare the '%s' itself, or hold a '*%s'",
+                    bc, bc, bc);
+                return inner;
+            }
+        }
         return type_optional(c->arena, inner);
     }
 
@@ -6191,8 +6229,22 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
         case TOK_STAR:   return CTW(l * r);
         case TOK_SLASH:  return r == 0 ? CONST_EVAL_FAIL : CTW(l / r);
         case TOK_PERCENT: return r == 0 ? CONST_EVAL_FAIL : CTW(l % r);
-        case TOK_LSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : CTW((int64_t)((uint64_t)l << r));
-        case TOK_RSHIFT: return r < 0 || r >= 63 ? CONST_EVAL_FAIL : l >> r;
+        /* BUG-1023: a shift by a NEGATIVE count or by >= the operand's width is
+         * 0 in ZER (`_zer_shl`/`_zer_shr`, Gap 26) — fold it to 0 instead of
+         * CONST_EVAL_FAIL. A failed fold of a GLOBAL `const u32 S = 1 << 200;`
+         * emitted `_zer_shl(1, 200)`, a statement expression, at FILE scope, and
+         * GCC refused the program while blaming the user's line. The width is the
+         * typed operand's when one is known (`_ctb`); a bare literal has none
+         * (0), and then only a count >= 128 is provably over-width for every
+         * width the literal can take (it is retyped by its destination, so
+         * `u64 x = 1 << 40` is 2^40 and must keep folding to that; ast.h's
+         * untyped evaluator applies the same 128 bound). */
+        case TOK_LSHIFT:
+            if (r < 0 || r >= 128 || (_ctb > 0 && r >= _ctb)) return 0;
+            return r >= 63 ? CONST_EVAL_FAIL : CTW((int64_t)((uint64_t)l << r));
+        case TOK_RSHIFT:
+            if (r < 0 || r >= 128 || (_ctb > 0 && r >= _ctb)) return 0;
+            return r >= 63 ? CONST_EVAL_FAIL : l >> r;
         case TOK_AMP:    return l & r;
         case TOK_PIPE:   return l | r;
         case TOK_CARET:  return l ^ r;

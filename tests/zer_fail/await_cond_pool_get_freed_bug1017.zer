@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1017: the Handle spelling of await_cond_reads_freed — gp.get(h) inside the
+// await condition after gp.free(h).
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+async void w() {
+    Handle(Item) h = gp.alloc() orelse return;
+    gp.free(h);
+    await gp.get(h).id == 7;
+}
+u32 main() { _zer_async_w t; _zer_async_w_init(&t); return 0; }

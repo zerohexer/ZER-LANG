@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-1018: `*T q = p;` (p a param) lowers to IR_COPY from a local with no handle,
+// so no alias formed and free(q) was untracked: f's FuncSummary never learned it
+// frees its parameter, and the caller's second free RAN (exit 0, no diagnostic).
+struct T { u32 v; }
+void f(*T p) {
+    *T q = p;
+    free(q);
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    f(x);
+    free(x);
+    return 0;
+}

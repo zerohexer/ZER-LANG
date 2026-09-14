@@ -5,6 +5,128 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-14b — BUG-1017..1024: raw-AST positions the UAF walker never saw, exotic-element slices named `_zer_slice_u128`, and file-scope folds that disagreed with the function body
+
+Full-codebase audit session. Every fix below is A/B'd against a from-HEAD baseline build
+(`scratchpad/headb/zerc`); the tests named are in the tree and each was shown to FAIL (or reject
+for the WRONG reason) on that baseline before the fix.
+
+### BUG-1017 — spawn args, await conditions and an INDEXED callee never reached the UAF walker (SOUNDNESS)
+
+`ir_lower.c` leaves five argument positions as raw AST on the instruction (builtin method args,
+`free(...)`, spawn args, asm operands, orelse subject) and the await condition on `IR_AWAIT`.
+The spawn args (`IR_NOP` carrying the NODE_SPAWN) and the await condition were never handed to
+`ir_check_expr_uaf` / `ir_check_expr_wrong_pool`, so `free(h); spawn w(h.field);` compiled,
+RAN and read the recycled slot (ASan cannot see it — `alloc(T)` recycles), and
+`free(h); await h.ready;` likewise. Third form: both walkers' NODE_CALL arm descended a
+NODE_FIELD callee but not a NODE_INDEX one, so `free(s); s[0](x)` through a freed slice of
+funcptrs was unwalked (the baseline only "rejected" it because GCC choked on BUG-1019's
+invalid C — `-o x.c` accepted it). Fix: the NODE_SPAWN handler runs both walkers over every
+arg before the transfer marking; `IR_AWAIT` is its own case running both over `inst->expr`;
+both NODE_CALL arms descend a NODE_INDEX callee. Tests: 9 negatives `*_bug1017.zer`
+(`spawn_arg_reads_freed_field`, `scoped_spawn_arg_reads_freed_field`, `await_cond_reads_freed`,
+`await_cond_pool_get_freed`, `spawn_arg_freed_handle_field`, `spawn_arg_freed_slice_index`,
+`spawn_arg_deref_freed`, `spawn_arg_call_reads_freed`, `funcptr_slice_callee_freed`) + positives
+`spawn_arg_field_read_live_ok_bug1017`, `await_cond_live_ok_bug1017`. Two stale
+`walker_field_baseline.txt` rows (the `call.callee` gaps) removed.
+
+### BUG-1018 — `*T q = p;` from a PARAM minted no identity: intra-function UAF was a false leak, cross-function double free ran (SOUNDNESS)
+
+Param identity is minted on first sight at the IR_ASSIGN ident arm and IR_FIELD_READ, but NOT
+at IR_COPY, so the plain alias `*T q = p;` gave `q` no `IRHandleInfo`. `free(q); p.v` was then
+reported only as "never freed" (a false LEAK — the real UAF diagnostic never fired), and
+`f(x); free(x);` where `f(*T p){ *T q = p; free(q); }` was a silent DOUBLE FREE (exit 0). Fix:
+IR_COPY mints the entry for a reference-typed / Handle param source (ALIVE, UNKNOWN colour,
+`escaped = true` — a param is the caller's). Tests: `param_alias_free_double_free_bug1018`,
+`param_alias_free_intra_uaf_bug1018`, `param_alias_free_caller_uaf_bug1018`,
+`param_alias_callee_frees_caller_uaf_bug1018` (negatives, `expect-error: use after free` — the
+directive is what discriminates, the baseline rejected three of them for the wrong reason),
+positive `param_alias_copy_ok_bug1018`.
+
+### BUG-1019 — every slice whose element is not primitive/struct/union was `_zer_slice_u128` (SILENT MISCOMPILE)
+
+Three hand-rolled suffix switches (emit_type TYPE_SLICE, emit_type `?[*]T`, the NODE_SLICE
+literal) listed the primitive/struct/union element kinds and let every other kind fall through
+an exhaustive case list into the G1 `TYPE_UINT` arm, which read `intn.bits` out of a non-intn
+Type. Measured on VALID programs: `[*]State` (enum) read with a 16-byte stride — wrong
+element, then a stack OOB read; `[*]?*Task` read two pointers as one element; `[*]Handle(T)`
+trapped; `[*]?u32` / `[*]?Task` / `?[*]State` did not compile; a funcptr element emitted the
+invalid cast `(uint32_t (*)(uint32_t)*)`. The corpus only ever sliced `u*`/`i*`/struct. Fix:
+ONE query `emit_slice_name` (enum -> `_zer_slice_i32`, Handle -> `_zer_slice_u64`, struct/union
+by name, everything else an on-demand `_zer_xslice_<mangled>` triple emitted by
+`collect_exotic_slices` / `flush_exotic_slices` before first use and after the definitions it
+needs — see compiler-internals.md "Naming Conventions"), plus `emit_ptr_to_elem[_named]` for
+the `ret (**ptr)(params)` / `T (*ptr)[N]` declarators. Tests: `slice_elem_enum_bug1019`,
+`slice_elem_optptr_bug1019`, `slice_elem_optval_bug1019`, `slice_elem_funcptr_bug1019`.
+
+### BUG-1019b — `s[i](args)` on a SLICE of funcptrs had no `.ptr` and no bounds check
+
+The IR call emitter hand-rolled the indexed callee as `name[index]`, never going through the
+NODE_INDEX emitter. A fixed-array callee was safe (the checker's auto-guard lowers to an IR
+branch), a slice callee lost its `_zer_bounds_check` entirely. Routed through
+`emit_rewritten_node`. Test: `tests/zer_trap/slice_funcptr_call_oob_bug1019b` (must trap).
+
+### BUG-1020 — `if (?*opaque) |v|` never compiled
+
+The value capture of an optional `*opaque` has capture type `*opaque` — TYPE_POINTER, but the C
+VALUE type `_zer_opaque` — so IR_COPY's mutable-capture heuristic emitted `v = &o.value;` and
+GCC refused every such program (local, struct field, array element). Fix: the address form is
+taken only when the capture's pointee is not `opaque`. Test: `opaque_opt_capture_bug1020`.
+
+### BUG-1021 — `alloc(T, n)` inside an IMPORTED module: `sizeof(struct Task)` of an incomplete type
+
+The universal-alloc emission spelled `sizeof(struct <bare name>)` while the struct is emitted as
+`struct lib__Task`. Every `alloc(T, n)` inside a module was a GCC error. Fix: `emit_type(elem)`
+(module-prefixed) + the BUG-1019 declarator for the cast. Test: `test_modules/alloc_user`
+(+ `alloc_lib`), wired into `run_tests.sh`.
+
+### BUG-1022 — the NON-nullable 2C funcptr array `*(u32) -> u32 [4] ops;` did not parse
+
+reference.md and CLAUDE.md both document it; `?*(u32) -> u32 [4]` worked because the `?`
+handler has its own suffix check, while parse_type's `*(` branch returned the funcptr type
+without reaching the array-suffix branch. ONE helper `parse_array_suffix` now serves the base
+type, `?T` and the 2C branch, honouring `no_array_suffix` (BUG-878) so `*() -> ?u32 [3]` is an
+array of funcptrs returning `?u32`. Test: `funcptr_2c_array_nonnull_bug1022`.
+
+### BUG-1023 — a global `const u32 S = 1 << 200;` emitted `_zer_shl(1, 200)` at FILE scope
+
+The untyped folder gave up at a count of 63, so the emitter wrote the statement-expression
+macro at file scope and GCC refused the program while blaming the user's line. ZER defines an
+over-width or negative shift as 0. Three sites: ast.h's untyped evaluator folds a count that is
+over-width for EVERY width (>= 128, or < 0); checker.c's typed evaluator folds `>= _ctb` for a
+typed operand; the emitter's global-initializer shift arm uses the LEFT operand's type — a
+constant count `>= width` emits `((T)0)`, an in-range one a plain `<<` with no guard. Test:
+`global_const_shift_overwidth_bug1023`.
+
+### BUG-1024 — a folded GLOBAL initializer was emitted UNWRAPPED: `const u8 B = 200; const u32 P = B + 100;` was 300 at file scope and 44 in a function
+
+The same expression had two values depending on where it was written (the local path wraps by
+assigning into a u8 IR temp). `fold_wrap_to_type` wraps the folded value to the checker's type
+of the initializer expression at both file-scope fold sites (plain and `?T` payload). Test:
+`global_const_fold_wraps_bug1024`. Residual over-rejection recorded in limitations.md (the
+checker's fits-check on a const-global init still uses the unwrapped fold).
+
+### BUG-1025 — `?Arena` / `?Pool` / `?Slab` / `?Ring` / `?Barrier` / `?Semaphore` declared as `_zer_opt_u8`
+
+Found by asking BUG-1019's question of the SIBLING switch (emit_type's `?T` typedef list has
+the same shape: an exhaustive case list whose last arm is the G1 `TYPE_UINT` carrier). An
+optional of a builtin container has no arm, fell into it, and `?Arena a;` compiled as
+`_zer_opt_u8 a` — a declaration of the wrong, far smaller type (any USE then failed at GCC).
+A container is a unique resource addressed by name, not a value, so the type is refused at
+resolution (`builtin_container_kind_name`, an exhaustive kind switch). Tests:
+`opt_of_{arena,pool,slab_field,semaphore_local}_rejected_bug1025`. `?T[N]` (an array of
+optionals) and `?Handle(T)` are unaffected.
+
+### Docs
+
+reference.md: the operators section now states the shift RESULT-TYPE rule (common type, no
+promotion — `u8 a = 200; a << 4` is 128) with a compiled example; `[*]T` gains an "ANY ELEMENT
+TYPE" section with a compiled example; "NOT in ZER" no longer lists C-style casts and `goto`
+(both supported). CLAUDE.md's two "No C-style casts" lines corrected. compiler-internals.md:
+the exotic-slice registry, and the raw-AST-position / three-mint-site rules for zercheck_ir.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

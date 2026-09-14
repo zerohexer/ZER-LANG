@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1017: a spawn's arguments are parent-evaluated raw-AST expressions; the
+// UAF walker never saw them, so `spawn w(p.v)` after free(p) compiled and RAN
+// (the argument struct was filled from the freed slot).
+struct T { u32 v; }
+void w(u32 x) { }
+u32 main() {
+    *T p = alloc(T) orelse return;
+    p.v = 5;
+    free(p);
+    spawn w(p.v);
+    return 0;
+}

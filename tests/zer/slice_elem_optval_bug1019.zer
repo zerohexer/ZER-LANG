@@ -1,0 +1,41 @@
+// BUG-1019: slices of VALUE optionals (`[*]?u32`, `[*]?Task`, `[*]?Handle(T)`) did
+// not compile — the element typedef name was `_zer_slice_u128`, so the array->slice
+// coercion assigned an `__int128` into a `_zer_opt_u32`. Also `?[*]?u32`
+// (optional of an on-demand slice) and a nested exotic slice as a param type.
+struct Task { u32 id; }
+struct Item { u32 v; }
+Pool(Item, 4) items;
+
+void f([*][*]?u32 x) { }
+
+u32 main() {
+    ?u32[3] a;
+    a[1] = 5;
+    [*]?u32 s = a;
+    u32 v = s[1] orelse 9;
+    if (v != 5) { return 1; }
+    u32 w = s[0] orelse 9;
+    if (w != 9) { return 2; }
+    ?[*]?u32 m = s;
+    [*]?u32 u = m orelse return;
+    u32 z = u[1] orelse 0;
+    if (z != 5) { return 3; }
+
+    ?Task[2] ta;
+    Task t;
+    t.id = 3;
+    ta[0] = t;
+    [*]?Task ts = ta;
+    if (ts[0]) |x| { if (x.id != 3) { return 4; } } else { return 5; }
+    if (ts[1]) |x| { return 6; }
+
+    ?Handle(Item)[2] hs;
+    Handle(Item) h = items.alloc() orelse return;
+    hs[1] = h;
+    [*]?Handle(Item) hsl = hs;
+    items.get(h).v = 8;
+    u32 r = 1;
+    if (hsl[1]) |k| { r = items.get(k).v - 8; }
+    items.free(h);
+    return r;
+}

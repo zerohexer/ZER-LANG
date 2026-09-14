@@ -816,14 +816,18 @@ static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
+static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile); /* BUG-1019, defined below */
+
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
     emit(e, "((");
     emit_type(e, slice_type);
     emit(e, "){ (");
-    if (slice_type && slice_type->slice.is_volatile) emit(e, "volatile ");
-    emit_type(e, array_type->array.inner);
-    emit(e, "*)");
+    /* BUG-1019: a funcptr/array element needs the `ret (**)(..)` / `T (*)[N]`
+     * declarator spelling — `emit_type(inner)*` is invalid C for those. */
+    emit_ptr_to_elem(e, array_type->array.inner,
+                     slice_type && slice_type->slice.is_volatile);
+    emit(e, ")");
     emit_expr(e, array_expr);
     emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
@@ -864,6 +868,470 @@ static const char *intn_carrier_suffix(uint32_t bits, bool is_signed) {
                (bits <= 32) ? "i32" : (bits <= 64) ? "i64" : "i128";
     return (bits <= 8) ? "u8" : (bits <= 16) ? "u16" :
            (bits <= 32) ? "u32" : (bits <= 64) ? "u64" : "u128";
+}
+
+/* ================================================================
+ * BUG-1019 (2026-09-14): ONE query for the name of a slice typedef, for EVERY
+ * element type — and the machinery that emits the typedef when no earlier
+ * site already did.
+ *
+ * Three hand-rolled suffix switches (emit_type TYPE_SLICE, emit_type ?[*]T,
+ * the NODE_SLICE literal) each listed the primitive/struct/union element kinds
+ * and let every OTHER kind fall through an exhaustive case list into the G1
+ * `TYPE_UINT` arm, which read `intn.bits` out of a non-intn Type (a pointer's
+ * low bits, an array's inner pointer) and named the slice `_zer_slice_u128`.
+ * Measured on a valid program: `[*]State s = arr; s[2]` read with a 16-byte
+ * stride over a 4-byte enum array (wrong value, then a stack OOB read);
+ * `[*]?*Task` read two pointers as one; `[*]Handle(T)` trapped; a funcptr
+ * element emitted `(uint32_t (*)(uint32_t)*)` and did not compile. The corpus
+ * only ever sliced `u*`/`i*`/struct, so no test exercised the fallthrough.
+ *
+ * Classification of an element type E:
+ *   - primitive / bool / uN,iN / enum (int32_t) / Handle (uint64_t):
+ *     reuse the PREAMBLE typedef `_zer_slice_<carrier>`
+ *   - struct / union: `_zer_slice_<user name>`, emitted at the declaration
+ *   - EXOTIC (pointer, optional value, funcptr, array, nested slice, *opaque,
+ *     builtin containers): `_zer_xslice_<mangled>`, emitted by
+ *     flush_exotic_slices once its named dependencies exist. Separate prefix
+ *     (`x`) + length-prefixed user names keep the mangling injective, so a
+ *     user struct named `p_Task` can never collide with `[*]*Task`.
+ * ================================================================ */
+
+/* growable byte buffer for building a mangled suffix (no fixed buffers) */
+typedef struct { char *p; size_t len; size_t cap; } XSBuf;
+
+static void xsb_put(XSBuf *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 64;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *np = (char *)realloc(b->p, nc);
+        if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        b->p = np; b->cap = nc;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+static void xsb_puts(XSBuf *b, const char *s) { xsb_put(b, s, strlen(s)); }
+static void xsb_putu(XSBuf *b, unsigned long long v) {
+    char tmp[32]; /* a u64 has at most 20 decimal digits — bounded, not dynamic */
+    int n = snprintf(tmp, sizeof tmp, "%llu", v);
+    xsb_put(b, tmp, (size_t)n);
+}
+/* `<tag><len>_<prefix__name>` — length-prefixed so a user name containing '_'
+ * cannot be confused with the grammar tokens around it */
+static void xsb_user(XSBuf *b, const char *tag, const char *prefix, uint32_t plen,
+                     const char *name, uint32_t nlen) {
+    size_t total = (prefix && plen) ? (size_t)plen + 2 + nlen : nlen;
+    xsb_puts(b, tag); xsb_putu(b, total); xsb_puts(b, "_");
+    if (prefix && plen) { xsb_put(b, prefix, plen); xsb_puts(b, "__"); }
+    xsb_put(b, name, nlen);
+}
+
+/* The mangled suffix of ANY type (exhaustive — a new TypeKind fails the build). */
+static void xslice_suffix_append(XSBuf *b, Type *t) {
+    t = type_unwrap_distinct(t);
+    if (!t) { xsb_puts(b, "void"); return; }
+    switch (t->kind) {
+    case TYPE_VOID:   xsb_puts(b, "void"); break;
+    case TYPE_BOOL:   xsb_puts(b, "u8"); break;   /* bool = uint8_t */
+    case TYPE_U8:     xsb_puts(b, "u8"); break;
+    case TYPE_U16:    xsb_puts(b, "u16"); break;
+    case TYPE_U32:    xsb_puts(b, "u32"); break;
+    case TYPE_U64:    xsb_puts(b, "u64"); break;
+    case TYPE_USIZE:  xsb_puts(b, "usize"); break;
+    case TYPE_I8:     xsb_puts(b, "i8"); break;
+    case TYPE_I16:    xsb_puts(b, "i16"); break;
+    case TYPE_I32:    xsb_puts(b, "i32"); break;
+    case TYPE_I64:    xsb_puts(b, "i64"); break;
+    case TYPE_F32:    xsb_puts(b, "f32"); break;
+    case TYPE_F64:    xsb_puts(b, "f64"); break;
+    case TYPE_UINT:   xsb_puts(b, intn_carrier_suffix(t->intn.bits, false)); break;
+    case TYPE_SINT:   xsb_puts(b, intn_carrier_suffix(t->intn.bits, true)); break;
+    case TYPE_ENUM:   xsb_puts(b, "i32"); break;   /* enums are int32_t */
+    case TYPE_HANDLE: xsb_puts(b, "u64"); break;   /* Handle = uint64_t */
+    case TYPE_OPAQUE: xsb_puts(b, "opq"); break;
+    case TYPE_POINTER: {
+        Type *in = type_unwrap_distinct(t->pointer.inner);
+        if (type_dispatch_kind(in) == TYPE_OPAQUE) {
+            /* *opaque is the VALUE type _zer_opaque, not a C pointer */
+            xsb_puts(b, t->pointer.is_const ? (t->pointer.is_volatile ? "cvopq" : "copq")
+                                            : (t->pointer.is_volatile ? "vopq" : "opq"));
+        } else {
+            xsb_puts(b, "p");
+            if (t->pointer.is_const) xsb_puts(b, "c");
+            if (t->pointer.is_volatile) xsb_puts(b, "v");
+            xsb_puts(b, "_");
+            xslice_suffix_append(b, t->pointer.inner);
+        }
+        break;
+    }
+    case TYPE_OPTIONAL:
+        /* ?*T / ?funcptr have the SAME C type as the inner (null sentinel) */
+        if (!is_null_sentinel(t->optional.inner)) xsb_puts(b, "o_");
+        xslice_suffix_append(b, t->optional.inner);
+        break;
+    case TYPE_SLICE:
+        xsb_puts(b, t->slice.is_volatile ? "sv_" : "s_");
+        xslice_suffix_append(b, t->slice.inner);
+        break;
+    case TYPE_ARRAY:
+        if (t->array.sizeof_type) {
+            xsb_puts(b, "az_"); xslice_suffix_append(b, t->array.sizeof_type); xsb_puts(b, "_");
+        } else {
+            xsb_puts(b, "a"); xsb_putu(b, t->array.size); xsb_puts(b, "_");
+        }
+        xslice_suffix_append(b, t->array.inner);
+        break;
+    case TYPE_STRUCT:
+        xsb_user(b, "N", t->struct_type.module_prefix, t->struct_type.module_prefix_len,
+                 t->struct_type.name, t->struct_type.name_len);
+        break;
+    case TYPE_UNION:
+        xsb_user(b, "M", t->union_type.module_prefix, t->union_type.module_prefix_len,
+                 t->union_type.name, t->union_type.name_len);
+        break;
+    case TYPE_FUNC_PTR:
+        xsb_puts(b, t->func_ptr.is_variadic ? "fv" : "f");
+        xsb_putu(b, t->func_ptr.param_count);
+        xsb_puts(b, "_");
+        xslice_suffix_append(b, t->func_ptr.ret);
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
+            xsb_puts(b, "_");
+            xslice_suffix_append(b, t->func_ptr.params[i]);
+        }
+        break;
+    case TYPE_POOL:
+        xsb_puts(b, "pool"); xsb_putu(b, t->pool.count); xsb_puts(b, "_");
+        xslice_suffix_append(b, t->pool.elem);
+        break;
+    case TYPE_RING:
+        xsb_puts(b, "ring"); xsb_putu(b, t->ring.count); xsb_puts(b, "_");
+        xslice_suffix_append(b, t->ring.elem);
+        break;
+    case TYPE_ARENA:     xsb_puts(b, "arena"); break;
+    case TYPE_BARRIER:   xsb_puts(b, "barrier"); break;
+    case TYPE_SEMAPHORE: xsb_puts(b, "sem"); break;
+    case TYPE_SLAB:      xsb_puts(b, "slab"); break;
+    case TYPE_DISTINCT:  xslice_suffix_append(b, t->distinct.underlying); break; /* unwrapped above */
+    }
+}
+
+/* Does `[*]elem` need an emitted-on-demand typedef (no preamble/declaration one)? */
+static bool slice_elem_is_exotic(Type *elem) {
+    elem = type_unwrap_distinct(elem);
+    if (!elem) return true;
+    switch (elem->kind) {
+    case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64:
+    case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64: case TYPE_UINT: case TYPE_SINT:
+    case TYPE_ENUM: case TYPE_HANDLE:           /* preamble carrier typedef */
+    case TYPE_STRUCT: case TYPE_UNION:          /* emitted at the declaration */
+        return false;
+    case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+    case TYPE_ARRAY: case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
+    case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SLAB:
+    case TYPE_SEMAPHORE:
+        return true;
+    case TYPE_DISTINCT:
+        return slice_elem_is_exotic(elem->distinct.underlying); /* unwrapped above */
+    }
+    return true;
+}
+
+/* THE query: emit the typedef name of the slice over `elem`.
+ * is_opt selects the `?[*]T` wrapper typedef; is_volatile the `volatile [*]T` one. */
+static void emit_slice_name(Emitter *e, Type *elem, bool is_volatile, bool is_opt) {
+    elem = type_unwrap_distinct(elem);
+    XSBuf b = {0};
+    if (slice_elem_is_exotic(elem)) {
+        xslice_suffix_append(&b, elem);
+        emit(e, "%s%s", is_opt ? "_zer_xopt_slice_" : is_volatile ? "_zer_xvslice_" : "_zer_xslice_",
+             b.p ? b.p : "");
+        free(b.p);
+        return;
+    }
+    emit(e, "%s", is_opt ? "_zer_opt_slice_" : is_volatile ? "_zer_vslice_" : "_zer_slice_");
+    if (type_dispatch_kind(elem) == TYPE_STRUCT) { EMIT_STRUCT_NAME(e, elem); return; }
+    if (type_dispatch_kind(elem) == TYPE_UNION)  { EMIT_UNION_NAME(e, elem); return; }
+    xslice_suffix_append(&b, elem);   /* primitive / uN / enum / Handle carrier */
+    emit(e, "%s", b.p ? b.p : "");
+    free(b.p);
+}
+
+/* Emit the C type "pointer to elem" — the `ptr` field of a slice over `elem`
+ * (name = "ptr") or the cast an array→slice coercion applies (name = NULL, an
+ * abstract declarator). A funcptr element needs `ret (**name)(params)` and an
+ * array element `base (*name)[N]`; `emit_type(elem)* name` is only right for
+ * the other kinds. */
+static void emit_ptr_to_elem_named(Emitter *e, Type *elem, bool is_volatile, const char *name) {
+    elem = type_unwrap_distinct(elem);
+    const char *nm = name ? name : "";
+    if (type_dispatch_kind(elem) == TYPE_FUNC_PTR) {
+        emit_type(e, elem->func_ptr.ret);
+        emit(e, is_volatile ? " (* volatile *%s)(" : " (**%s)(", nm);
+        for (uint32_t i = 0; i < elem->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, elem->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+    if (type_dispatch_kind(elem) == TYPE_ARRAY) {
+        Type *base = elem;
+        while (base->kind == TYPE_ARRAY) base = base->array.inner;
+        if (is_volatile) emit(e, "volatile ");
+        emit_type(e, base);
+        emit(e, " (*%s)", nm);
+        for (Type *dim = elem; type_dispatch_kind(dim) == TYPE_ARRAY; dim = dim->array.inner) {
+            if (dim->array.sizeof_type) {
+                emit(e, "[sizeof("); emit_type(e, dim->array.sizeof_type); emit(e, ")]");
+            } else {
+                emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            }
+        }
+        return;
+    }
+    if (is_volatile) emit(e, "volatile ");
+    emit_type(e, elem);
+    emit(e, "*");
+    if (name) emit(e, " %s", name);
+}
+static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile) {
+    emit_ptr_to_elem_named(e, elem, is_volatile, NULL);
+}
+
+/* ---- the exotic-slice registry ---- */
+
+static bool user_type_same(Type *a, Type *b) {
+    a = type_unwrap_distinct(a); b = type_unwrap_distinct(b);
+    if (!a || !b || a->kind != b->kind) return false;
+    const char *an, *bn, *ap, *bp; uint32_t anl, bnl, apl, bpl;
+    if (type_dispatch_kind(a) == TYPE_STRUCT) {
+        an = a->struct_type.name; anl = a->struct_type.name_len;
+        ap = a->struct_type.module_prefix; apl = a->struct_type.module_prefix_len;
+        bn = b->struct_type.name; bnl = b->struct_type.name_len;
+        bp = b->struct_type.module_prefix; bpl = b->struct_type.module_prefix_len;
+    } else if (type_dispatch_kind(a) == TYPE_UNION) {
+        an = a->union_type.name; anl = a->union_type.name_len;
+        ap = a->union_type.module_prefix; apl = a->union_type.module_prefix_len;
+        bn = b->union_type.name; bnl = b->union_type.name_len;
+        bp = b->union_type.module_prefix; bpl = b->union_type.module_prefix_len;
+    } else {
+        return a == b;
+    }
+    if (anl != bnl || memcmp(an, bn, anl) != 0) return false;
+    if (!ap) apl = 0;
+    if (!bp) bpl = 0;
+    if (apl != bpl) return false;
+    return apl == 0 || memcmp(ap, bp, apl) == 0;
+}
+
+/* Called by every site that emits a struct/union DEFINITION (declaration,
+ * container stamp) so flush_exotic_slices knows which names are complete. */
+static void record_user_type_emitted(Emitter *e, Type *t) {
+    if (!t) return;
+    if (e->emitted_user_count == e->emitted_user_capacity) {
+        int nc = e->emitted_user_capacity ? e->emitted_user_capacity * 2 : 32;
+        Type **np = (Type **)realloc(e->emitted_user_types, (size_t)nc * sizeof(Type *));
+        if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        e->emitted_user_types = np; e->emitted_user_capacity = nc;
+    }
+    e->emitted_user_types[e->emitted_user_count++] = t;
+}
+
+static bool user_type_emitted(Emitter *e, Type *t) {
+    for (int i = 0; i < e->emitted_user_count; i++)
+        if (user_type_same(e->emitted_user_types[i], t)) return true;
+    return false;
+}
+
+static struct XSlice *xslice_find(Emitter *e, const char *suffix) {
+    for (int i = 0; i < e->xslice_count; i++)
+        if (strcmp(e->xslices[i].suffix, suffix) == 0) return &e->xslices[i];
+    return NULL;
+}
+
+static void xslice_register(Emitter *e, Type *elem) {
+    XSBuf b = {0};
+    xslice_suffix_append(&b, elem);
+    if (!b.p) return;
+    if (!xslice_find(e, b.p)) {
+        if (e->xslice_count == e->xslice_capacity) {
+            int nc = e->xslice_capacity ? e->xslice_capacity * 2 : 16;
+            struct XSlice *np = (struct XSlice *)realloc(e->xslices, (size_t)nc * sizeof(struct XSlice));
+            if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+            e->xslices = np; e->xslice_capacity = nc;
+        }
+        char *owned = (char *)arena_alloc(e->arena, b.len + 1);
+        memcpy(owned, b.p, b.len + 1);
+        struct XSlice *x = &e->xslices[e->xslice_count++];
+        x->suffix = owned;
+        x->elem = type_unwrap_distinct(elem);
+        x->emitted = false;
+    }
+    free(b.p);
+}
+
+/* pointer set (open addressing) — the visited set for the type walk; the type
+ * graph is cyclic through struct fields (`struct N { ?*N next; }`) */
+typedef struct { Type **keys; size_t cap; size_t count; } XPtrSet;
+
+static bool xptrset_add(XPtrSet *s, Type *k) {
+    if (s->count * 2 >= s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 1024;
+        Type **nk = (Type **)calloc(nc, sizeof(Type *));
+        if (!nk) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        for (size_t i = 0; i < s->cap; i++) {
+            Type *o = s->keys[i];
+            if (!o) continue;
+            size_t j = ((uintptr_t)o >> 4) % nc;
+            while (nk[j]) j = (j + 1) % nc;
+            nk[j] = o;
+        }
+        free(s->keys); s->keys = nk; s->cap = nc;
+    }
+    size_t j = ((uintptr_t)k >> 4) % s->cap;
+    while (s->keys[j]) {
+        if (s->keys[j] == k) return false;
+        j = (j + 1) % s->cap;
+    }
+    s->keys[j] = k; s->count++;
+    return true;
+}
+
+/* Walk every type reachable from `t`, registering each exotic slice element. */
+static void collect_walk(Emitter *e, XPtrSet *seen, Type *t) {
+    if (!t || !xptrset_add(seen, t)) return;
+    switch (t->kind) {
+    case TYPE_SLICE:
+        if (slice_elem_is_exotic(t->slice.inner)) xslice_register(e, t->slice.inner);
+        collect_walk(e, seen, t->slice.inner);
+        break;
+    case TYPE_POINTER:  collect_walk(e, seen, t->pointer.inner); break;
+    case TYPE_OPTIONAL: collect_walk(e, seen, t->optional.inner); break;
+    case TYPE_ARRAY:
+        collect_walk(e, seen, t->array.inner);
+        collect_walk(e, seen, t->array.sizeof_type);
+        break;
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < t->struct_type.field_count; i++)
+            collect_walk(e, seen, t->struct_type.fields[i].type);
+        break;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++)
+            collect_walk(e, seen, t->union_type.variants[i].type);
+        break;
+    case TYPE_FUNC_PTR:
+        collect_walk(e, seen, t->func_ptr.ret);
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++)
+            collect_walk(e, seen, t->func_ptr.params[i]);
+        break;
+    case TYPE_POOL:     collect_walk(e, seen, t->pool.elem); break;
+    case TYPE_RING:     collect_walk(e, seen, t->ring.elem); break;
+    case TYPE_HANDLE:   collect_walk(e, seen, t->handle.elem); break;
+    case TYPE_SLAB:     collect_walk(e, seen, t->slab.elem); break;
+    case TYPE_DISTINCT: collect_walk(e, seen, t->distinct.underlying); break;
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32:
+    case TYPE_I64: case TYPE_F32: case TYPE_F64: case TYPE_ENUM: case TYPE_OPAQUE:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE: case TYPE_UINT:
+    case TYPE_SINT:
+        break;  /* leaves: nothing nested */
+    }
+}
+
+/* Register every exotic slice type the program names anywhere: the checker's
+ * typemap holds the resolved type of every node AND every resolved type node
+ * (RF3), so all slice types the emitter can ever spell are reachable from it;
+ * container stamps are walked too. Idempotent — the registry dedupes. */
+static void collect_exotic_slices(Emitter *e) {
+    if (!e->checker) return;
+    XPtrSet seen = {0};
+    Checker *c = e->checker;
+    for (uint32_t i = 0; i < c->type_map_size; i++)
+        if (c->type_map[i].key) collect_walk(e, &seen, c->type_map[i].type);
+    for (int i = 0; i < c->container_inst_count; i++) {
+        collect_walk(e, &seen, c->container_instances[i].stamped_struct);
+        collect_walk(e, &seen, c->container_instances[i].concrete_type);
+    }
+    free(seen.keys);
+}
+
+/* Can `[*]elem`'s typedef be emitted NOW? Every struct/union it names by VALUE
+ * (or under an array, which C requires complete) must already be defined, and
+ * every nested exotic slice typedef must already be emitted. A struct reached
+ * only through a pointer needs no definition (`struct T*` may be incomplete),
+ * which is what lets `struct Task { [*]?*Task kids; }` compile. */
+static bool xslice_deps_ready(Emitter *e, Type *t) {
+    t = type_unwrap_distinct(t);
+    if (!t) return true;
+    switch (t->kind) {
+    case TYPE_STRUCT: case TYPE_UNION:
+        return user_type_emitted(e, t);
+    case TYPE_POINTER: {
+        Type *in = type_unwrap_distinct(t->pointer.inner);
+        if (type_dispatch_kind(in) == TYPE_STRUCT || type_dispatch_kind(in) == TYPE_UNION) return true;
+        return xslice_deps_ready(e, in);
+    }
+    case TYPE_OPTIONAL: {
+        Type *in = type_unwrap_distinct(t->optional.inner);
+        return xslice_deps_ready(e, in);   /* value optional: `_zer_opt_X` needs X; ?*X same as *X */
+    }
+    case TYPE_SLICE: {
+        if (slice_elem_is_exotic(t->slice.inner)) {
+            XSBuf b = {0};
+            xslice_suffix_append(&b, t->slice.inner);
+            struct XSlice *x = b.p ? xslice_find(e, b.p) : NULL;
+            free(b.p);
+            return x && x->emitted;
+        }
+        return xslice_deps_ready(e, t->slice.inner);
+    }
+    case TYPE_ARRAY:
+        return xslice_deps_ready(e, t->array.inner) &&
+               xslice_deps_ready(e, t->array.sizeof_type);
+    case TYPE_FUNC_PTR:
+        if (!xslice_deps_ready(e, t->func_ptr.ret)) return false;
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++)
+            if (!xslice_deps_ready(e, t->func_ptr.params[i])) return false;
+        return true;
+    case TYPE_POOL:   return xslice_deps_ready(e, t->pool.elem);
+    case TYPE_RING:   return xslice_deps_ready(e, t->ring.elem);
+    case TYPE_DISTINCT: return xslice_deps_ready(e, t->distinct.underlying);
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32:
+    case TYPE_I64: case TYPE_F32: case TYPE_F64: case TYPE_ENUM: case TYPE_OPAQUE:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+    case TYPE_SEMAPHORE: case TYPE_UINT: case TYPE_SINT:
+        return true;
+    }
+    return true;
+}
+
+/* Emit every registered exotic slice typedef whose dependencies are satisfied.
+ * Called before each pass-1 declaration and after pass 1 / the container
+ * stamps, so a typedef lands before its first use and after the definitions
+ * it needs. Iterates to a fixpoint so `[*][*]?u32` follows `[*]?u32`. */
+static void flush_exotic_slices(Emitter *e) {
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int i = 0; i < e->xslice_count; i++) {
+            struct XSlice *x = &e->xslices[i];
+            if (x->emitted || !xslice_deps_ready(e, x->elem)) continue;
+            emit(e, "typedef struct { ");
+            emit_ptr_to_elem_named(e, x->elem, false, "ptr");
+            emit(e, "; size_t len; } _zer_xslice_%s;\n", x->suffix);
+            emit(e, "typedef struct { ");
+            emit_ptr_to_elem_named(e, x->elem, true, "ptr");
+            emit(e, "; size_t len; } _zer_xvslice_%s;\n", x->suffix);
+            emit(e, "typedef struct { _zer_xslice_%s value; uint8_t has_value; } _zer_xopt_slice_%s;\n",
+                 x->suffix, x->suffix);
+            x->emitted = true;
+            progress = true;
+        }
+    }
 }
 
 /* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
@@ -1346,52 +1814,10 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "_zer_opt_");
             EMIT_UNION_NAME(e, opt_inner);
             break;
-        case TYPE_SLICE: {
-            /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
-            Type *elem = type_unwrap_distinct(opt_inner->slice.inner);
-            switch (elem->kind) {
-            case TYPE_U8:
-            case TYPE_BOOL:  emit(e, "_zer_opt_slice_u8"); break; /* bool = uint8_t */
-            case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;
-            case TYPE_U32:   emit(e, "_zer_opt_slice_u32"); break;
-            case TYPE_U64:   emit(e, "_zer_opt_slice_u64"); break;
-            case TYPE_I8:    emit(e, "_zer_opt_slice_i8"); break;
-            case TYPE_I16:   emit(e, "_zer_opt_slice_i16"); break;
-            case TYPE_I32:   emit(e, "_zer_opt_slice_i32"); break;
-            case TYPE_I64:   emit(e, "_zer_opt_slice_i64"); break;
-            case TYPE_USIZE: emit(e, "_zer_opt_slice_usize"); break;
-            case TYPE_F32:   emit(e, "_zer_opt_slice_f32"); break;
-            case TYPE_F64:   emit(e, "_zer_opt_slice_f64"); break;
-            case TYPE_STRUCT:
-                emit(e, "_zer_opt_slice_");
-                EMIT_STRUCT_NAME(e, elem);
-                break;
-            case TYPE_UNION:
-                emit(e, "_zer_opt_slice_");
-                EMIT_UNION_NAME(e, elem);
-                break;
-            /* Stage 2 Part B (2026-04-28): exhaustive — any other elem
-             * type uses anonymous struct fallback (rare). */
-            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
-            case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
-            case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
-            case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
-            case TYPE_DISTINCT:
-            /* G1: ?[*]uN → the carrier's named optional-slice typedef (same
-             * C layout). Split UINT/SINT so signedness comes from the case
-             * label, not a raw type-kind comparison. */
-            case TYPE_UINT:
-                emit(e, "_zer_opt_slice_%s",
-                     intn_carrier_suffix(elem->intn.bits, false));
-                break;
-            case TYPE_SINT:
-                emit(e, "_zer_opt_slice_%s",
-                     intn_carrier_suffix(elem->intn.bits, true));
-                break;
-            }
+        case TYPE_SLICE:
+            /* ?[*]T → _zer_opt_slice_T / _zer_xopt_slice_<mangled> (BUG-1019: one query) */
+            emit_slice_name(e, opt_inner->slice.inner, false, true);
             break;
-        }
         /* Stage 2 Part B (2026-04-28): exhaustive — fallback to
          * anonymous struct for any TYPE_KIND not handled above
          * (rare: ?FuncPtr, ?array, etc.). */
@@ -1410,50 +1836,10 @@ static void emit_type(Emitter *e, Type *t) {
         }
         break;
 
-    case TYPE_SLICE: {
-        /* Unwrap TYPE_DISTINCT for named typedef lookup */
-        Type *sl_inner = type_unwrap_distinct(t->slice.inner);
-        const char *prefix = t->slice.is_volatile ? "_zer_vslice_" : "_zer_slice_";
-        switch (sl_inner->kind) {
-        case TYPE_U8:
-        case TYPE_BOOL:  emit(e, "%su8", prefix); break; /* bool = uint8_t */
-        case TYPE_U16:   emit(e, "%su16", prefix); break;
-        case TYPE_U32:   emit(e, "%su32", prefix); break;
-        case TYPE_U64:   emit(e, "%su64", prefix); break;
-        case TYPE_I8:    emit(e, "%si8", prefix); break;
-        case TYPE_I16:   emit(e, "%si16", prefix); break;
-        case TYPE_I32:   emit(e, "%si32", prefix); break;
-        case TYPE_I64:   emit(e, "%si64", prefix); break;
-        case TYPE_USIZE: emit(e, "%susize", prefix); break;
-        case TYPE_F32:   emit(e, "%sf32", prefix); break;
-        case TYPE_F64:   emit(e, "%sf64", prefix); break;
-        case TYPE_STRUCT:
-            emit(e, "%s", prefix);
-            EMIT_STRUCT_NAME(e, sl_inner);
-            break;
-        case TYPE_UNION:
-            emit(e, "%s", prefix);
-            EMIT_UNION_NAME(e, sl_inner);
-            break;
-        /* Stage 2 Part B (2026-04-28): exhaustive — anonymous struct
-         * fallback for any other elem type. */
-        case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-        case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
-        case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
-        case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
-        case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
-        case TYPE_DISTINCT:
-        /* G1: [*]uN → the carrier's named slice typedef (prefix already
-         * selects _zer_slice_ vs _zer_vslice_ for volatile). */
-        case TYPE_UINT:
-            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, false));
-            break;
-        case TYPE_SINT:
-            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, true));
-            break;
-        }
+    case TYPE_SLICE:
+        /* [*]T / volatile [*]T → the named typedef, for EVERY element kind (BUG-1019) */
+        emit_slice_name(e, t->slice.inner, t->slice.is_volatile, false);
         break;
-    }
 
     case TYPE_ARRAY: {
         /* BUG-297: emit full array type with dimensions for sizeof() context.
@@ -1681,6 +2067,24 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * EXPRESSION EMISSION
  * ================================================================ */
 
+/* BUG-1024: wrap a FOLDED integer value into the width/signedness the checker
+ * gave the folded EXPRESSION. The untyped evaluator computes in int64, so
+ * `const u8 B = 200; const u32 P = B + 100;` folded to 300 at file scope while
+ * the same expression in a function is a u8 add and gives 44 — one program, two
+ * values for one expression, decided by where it was written. The local path
+ * wraps by assigning into a u8 IR temp; this is the file-scope twin of that. */
+static int64_t fold_wrap_to_type(int64_t v, Type *t) {
+    Type *eff = t ? type_unwrap_distinct(t) : NULL;
+    if (!eff || !type_is_integer(eff)) return v;
+    int w = type_width(eff);
+    if (w <= 0 || w >= 64) return v;
+    uint64_t mask = (1ULL << w) - 1ULL;
+    uint64_t u = (uint64_t)v & mask;
+    if (type_is_signed(eff) && (u >> (w - 1)) & 1ULL)
+        return (int64_t)(u | ~mask);          /* sign-extend */
+    return (int64_t)u;
+}
+
 /* BUG-939: emit an integer literal AT ITS RESOLVED WIDTH.
  *
  * Both AST literal emitters printed a bare `%llu` for any value fitting in 32 bits,
@@ -1871,6 +2275,31 @@ static void emit_expr(Emitter *e, Node *node) {
         }
         /* shift operators use safe macros (ZER spec: shift >= width = 0) */
         if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
+            /* BUG-1023: inside a GLOBAL initializer the `_zer_shl` statement
+             * expression is illegal C ("braced-group within expression allowed
+             * only inside a function"), and the generic fold cannot decide a count
+             * in [63,127] without the operand's width. Here the left operand's
+             * TYPE is known: a constant count >= its width (or negative) is 0 by
+             * the ZER rule, and an in-range constant count needs no guard. */
+            if (e->global_init_depth > 0) {
+                int64_t sc = eval_const_expr(node->binary.right);
+                Type *lt = checker_get_type(e->checker, node->binary.left);
+                Type *lte = lt ? type_unwrap_distinct(lt) : NULL;
+                int lw = (lte && type_is_integer(lte)) ? type_width(lte) : 0;
+                if (sc != CONST_EVAL_FAIL && lw > 0) {
+                    if (sc < 0 || sc >= lw) {
+                        emit(e, "((");
+                        emit_type(e, lte);
+                        emit(e, ")0)");
+                    } else {
+                        emit(e, "(");
+                        emit_expr(e, node->binary.left);
+                        emit(e, " %s %lld)", node->binary.op == TOK_LSHIFT ? "<<" : ">>",
+                             (long long)sc);
+                    }
+                    break;
+                }
+            }
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
             emit_expr(e, node->binary.left);
             emit(e, ", ");
@@ -3113,51 +3542,19 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         }
 
-        /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
+        /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix).
+         * BUG-1019: ONE query (emit_slice_name) names the typedef for EVERY
+         * element kind — the per-site switch here used to leave enum / Handle /
+         * pointer / optional / funcptr / array / nested-slice elements to the
+         * anonymous-struct fallback below, an incompatible C type at each site. */
         bool slice_type_emitted = false;
         if (slice_needs_runtime_check && !slice_obj_side_effect_early) {
             /* skip the normal struct literal — we'll wrap in stmt expr */
         } else if (eff_elem && !slice_obj_side_effect_early) {
-            const char *sname = NULL;
-            switch (eff_elem->kind) {
-            case TYPE_U8:    sname = "_zer_slice_u8"; break;
-            case TYPE_U16:   sname = "_zer_slice_u16"; break;
-            case TYPE_U32:   sname = "_zer_slice_u32"; break;
-            case TYPE_U64:   sname = "_zer_slice_u64"; break;
-            case TYPE_I8:    sname = "_zer_slice_i8"; break;
-            case TYPE_I16:   sname = "_zer_slice_i16"; break;
-            case TYPE_I32:   sname = "_zer_slice_i32"; break;
-            case TYPE_I64:   sname = "_zer_slice_i64"; break;
-            case TYPE_USIZE: sname = "_zer_slice_usize"; break;
-            case TYPE_F32:   sname = "_zer_slice_f32"; break;
-            case TYPE_F64:   sname = "_zer_slice_f64"; break;
-            case TYPE_BOOL:  sname = "_zer_slice_u8"; break; /* bool = uint8_t */
-            /* Stage 2 Part B (2026-04-28): exhaustive — non-primitive
-             * elem types fall through to STRUCT/UNION handlers below,
-             * or anonymous struct emission. */
-            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_STRUCT:
-            case TYPE_ENUM: case TYPE_UNION: case TYPE_FUNC_PTR:
-            case TYPE_OPAQUE: case TYPE_POOL: case TYPE_RING:
-            case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE:
-            case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
-            case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice literal */
-                break;
-            }
-            if (sname) {
-                emit(e, "((%s){ ", sname);
-                slice_type_emitted = true;
-            } else if (eff_elem->kind == TYPE_STRUCT) {
-                emit(e, "((_zer_slice_");
-                EMIT_STRUCT_NAME(e, eff_elem);
-                emit(e, "){ ");
-                slice_type_emitted = true;
-            } else if (eff_elem->kind == TYPE_UNION) {
-                emit(e, "((_zer_slice_");
-                EMIT_UNION_NAME(e, eff_elem);
-                emit(e, "){ ");
-                slice_type_emitted = true;
-            }
+            emit(e, "((");
+            emit_slice_name(e, eff_elem, false, false);
+            emit(e, "){ ");
+            slice_type_emitted = true;
         }
         if (!slice_type_emitted && !slice_obj_side_effect_early && !slice_needs_runtime_check) {
             emit(e, "((struct { ");
@@ -4566,6 +4963,7 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
     }
     e->indent--;
     emit(e, "};\n\n");
+    record_user_type_emitted(e, st);   /* BUG-1019: exotic-slice dependency set */
 }
 
 /* Emit all stamped container struct declarations, topologically ordered so a
@@ -4669,6 +5067,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     if (st) EMIT_STRUCT_NAME(e, st);
     else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
     emit(e, ";\n\n");
+    record_user_type_emitted(e, st);   /* BUG-1019: exotic-slice dependency set */
 }
 
 /* ================================================================
@@ -5136,6 +5535,7 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * T -> ?T query (the same one assignment and struct-field init use). */
             int64_t oval = eval_const_expr(node->var_decl.init);
             if (oval != CONST_EVAL_FAIL) {
+                oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1024 */
                 emit(e, " = (");
                 emit_type(e, type);
                 if (oval < 0) emit(e, "){ (%lld), 1 }", (long long)oval);
@@ -5162,6 +5562,7 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
             {
                 int64_t cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
+                    cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1024 */
                     if (cval < 0) {
                         emit(e, " = (%lld)", (long long)cval);
                     } else {
@@ -5589,6 +5990,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         emit(e, "typedef struct { _zer_slice_"); EMIT_UNAME();
         emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); EMIT_UNAME();
         emit(e, ";\n\n");
+        record_user_type_emitted(e, ut);   /* BUG-1019: exotic-slice dependency set */
         break;
         #undef EMIT_UNAME
     }
@@ -5734,17 +6136,25 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         for (int i = 0; i < file_node->file.decl_count; i++)
             prescan_spawn_in_node(e, file_node->file.decls[i]);
 
+        /* BUG-1019: register every exotic slice type, then flush the ones whose
+         * dependencies are ready before each declaration that may name one. */
+        collect_exotic_slices(e);
+
         /* Pass 1: struct/enum/union/typedef declarations */
         for (int i = 0; i < file_node->file.decl_count; i++) {
             Node *d = file_node->file.decls[i];
             if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
             if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
-                d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF)
+                d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
+                flush_exotic_slices(e);
                 emit_top_level_decl(e, d, file_node, i);
+            }
         }
+        flush_exotic_slices(e);
 
         /* Emit stamped container struct declarations */
         emit_container_structs(e);
+        flush_exotic_slices(e);
 
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
@@ -6532,16 +6942,24 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     for (int i = 0; i < file_node->file.decl_count; i++)
         prescan_spawn_in_node(e, file_node->file.decls[i]);
 
+    /* BUG-1019: register every exotic slice type, then flush the ones whose
+     * dependencies are ready before each declaration that may name one. */
+    collect_exotic_slices(e);
+
     /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
-            d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF)
+            d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
+            flush_exotic_slices(e);
             emit_top_level_decl(e, d, file_node, i);
+        }
     }
+    flush_exotic_slices(e);
 
     /* Emit stamped container struct declarations — after regular structs */
     emit_container_structs(e);
+    flush_exotic_slices(e);
 
     /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions */
     if (e->checker->auto_slab_count > 0) {
@@ -8028,17 +8446,19 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *sl = type_unwrap_distinct(rt)->optional.inner;  /* [*]T  */
                 if (sl && type_dispatch_kind(sl) == TYPE_SLICE) {
                     Type *elem = type_unwrap_distinct(sl)->slice.inner; /* T */
-                    Type *ee = type_unwrap_distinct(elem);
                     int t = e->temp_count++;
                     emit(e, "({size_t _zer_hn%d=", t);
                     emit_rewritten_node(e, node->call.args[1], func);
                     emit(e, ";void *_zer_hp%d=calloc(_zer_hn%d,sizeof(", t, t);
-                    if (type_dispatch_kind(elem) == TYPE_STRUCT)
-                        emit(e, "struct %.*s", (int)ee->struct_type.name_len, ee->struct_type.name);
-                    else emit_type(e, elem);
+                    /* BUG-1021: emit_type spells a struct WITH its module prefix
+                     * (`struct lib__Task`); the bare `struct Task` used here made
+                     * every alloc(T,n) inside an imported module a GCC
+                     * "incomplete type" error. BUG-1019: the cast needs the
+                     * funcptr/array declarator spelling, not `emit_type(T)*`. */
+                    emit_type(e, elem);
                     emit(e, "));_zer_hp%d?(", t);
                     emit_type(e, rt); emit(e, "){("); emit_type(e, sl); emit(e, "){(");
-                    emit_type(e, type_pointer(e->arena, elem));
+                    emit_ptr_to_elem(e, elem, false);
                     emit(e, ")_zer_hp%d,_zer_hn%d},1}:(", t, t);
                     emit_type(e, rt); emit(e, "){0};})");
                     return;
@@ -11231,56 +11651,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                        inst->expr->call.callee &&
                        inst->expr->call.callee->kind == NODE_INDEX) {
-                /* Array-indexed funcptr: arr[i](args) */
-                Node *idx_callee = inst->expr->call.callee;
-                if (idx_callee->index_expr.object->kind == NODE_IDENT) {
-                    int arr_id = -1;
-                    for (int li = 0; li < func->local_count; li++) {
-                        if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.object->ident.name_len &&
-                            memcmp(func->locals[li].name, idx_callee->index_expr.object->ident.name,
-                                   func->locals[li].name_len) == 0) {
-                            arr_id = li; break;
-                        }
-                    }
-                    if (arr_id >= 0) {
-                        emit_local_name(e, func, arr_id);
-                    } else {
-                        /* Global array */
-                        emit(e, "%.*s", (int)idx_callee->index_expr.object->ident.name_len,
-                             idx_callee->index_expr.object->ident.name);
-                    }
-                    emit(e, "[");
-                    /* Index expression — support NODE_IDENT (local or global)
-                     * and NODE_INT_LIT (constant). BUG-587: the old "non-ident
-                     * fallback" emitted literal `0` for every non-ident index,
-                     * so `ops[0](...)` and `ops[1](...)` both became `ops[0](...)`. */
-                    Node *idx_node = idx_callee->index_expr.index;
-                    if (idx_node->kind == NODE_IDENT) {
-                        int idx_id = -1;
-                        for (int li = 0; li < func->local_count; li++) {
-                            if (func->locals[li].name_len == (uint32_t)idx_node->ident.name_len &&
-                                memcmp(func->locals[li].name, idx_node->ident.name,
-                                       func->locals[li].name_len) == 0) {
-                                idx_id = li; break;
-                            }
-                        }
-                        if (idx_id >= 0)
-                            emit_local_name(e, func, idx_id);
-                        else
-                            emit(e, "%.*s", (int)idx_node->ident.name_len,
-                                 idx_node->ident.name);
-                    } else if (idx_node->kind == NODE_INT_LIT) {
-                        emit(e, "%llu", (unsigned long long)idx_node->int_lit.value);
-                    } else {
-                        /* Fallback: emit the index expression via the rewritten
-                         * AST emitter. Handles complex cases like arr[i+1] or
-                         * arr[func()]. */
-                        emit_rewritten_node(e, idx_node, func);
-                    }
-                    emit(e, "](");
-                } else {
-                    emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
-                }
+                /* Indexed funcptr callee: arr[i](args) / slice[i](args).
+                 * BUG-1019b: this used to be a hand-rolled `name[index]` spelling
+                 * that never went through the NODE_INDEX emitter, so a SLICE
+                 * callee lost its `.ptr` and its `_zer_bounds_check` (GCC then
+                 * refused `s[i](..)`; a fixed array is guarded by the IR branch
+                 * the checker's auto-guard lowers to, so that form was safe).
+                 * Route the callee through the one index emitter instead. */
+                emit_rewritten_node(e, inst->expr->call.callee, func);
+                emit(e, "(");
             } else {
                 emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
             }
@@ -12523,7 +12902,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             bool need_addr_capture = (dst && dst->is_capture &&
                                      dst_eff && dst_eff->kind == TYPE_POINTER &&
                                      src_eff && src_eff->kind == TYPE_OPTIONAL &&
-                                     !is_null_sentinel(src_eff->optional.inner));
+                                     !is_null_sentinel(src_eff->optional.inner) &&
+                                     /* BUG-1020: a VALUE capture `|v|` of `?*opaque` has
+                                      * capture type `*opaque`, which is TYPE_POINTER but
+                                      * the C VALUE type _zer_opaque — it is the unwrap
+                                      * `v = o.value`, not `&o.value` (which GCC refused,
+                                      * so every `if (?*opaque) |v|` failed to compile).
+                                      * A `|*v|` capture has pointee `*opaque`, not
+                                      * `opaque`, so it still takes the address. */
+                                     type_dispatch_kind(dst_eff->pointer.inner) != TYPE_OPAQUE);
 
             const char *sp = func->is_async ? "self->" : "";
 

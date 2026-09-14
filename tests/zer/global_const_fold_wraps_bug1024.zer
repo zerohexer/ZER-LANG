@@ -1,0 +1,31 @@
+// BUG-1024: a GLOBAL initializer folded by the untyped int64 evaluator was emitted
+// UNWRAPPED, so `const u8 B = 200; const u32 P = B + 100;` was 300 at file scope
+// while the identical expression inside a function (a u8 add, wrapped by the u8
+// IR temp) is 44 — one expression, two values, decided by where it was written.
+// The folded value is now wrapped to the checker's type of the initializer
+// expression (fold_wrap_to_type), the file-scope twin of the local u8 temp.
+const u8 B = 200;
+const u32 P = B + 100;       // u8 + literal is a u8 add: 300 wraps to 44
+const u32 M = B * 2;         // 400 wraps to 144
+const u32 SH = B << 4;       // 3200 wraps to 128
+const i8 S = 100;
+const i32 N = S + 100;       // i8 add: 200 wraps to -56
+const u16 H = 65535;
+const u32 HH = H + 1;        // 0
+const u64 W = 1 << 40;       // literal retyped by its u64 destination: 2^40 stays
+const i64 NEG = -(1 << 4);   // -16
+
+u32 main() {
+    u32 p = B + 100;
+    if (P != p) { return 1; }
+    if (P != 44) { return 2; }
+    if (M != 144) { return 3; }
+    if (SH != 128) { return 4; }
+    i32 n = S + 100;
+    if (N != n) { return 5; }
+    if (N != -56) { return 6; }
+    if (HH != 0) { return 7; }
+    if (W != 1099511627776) { return 8; }
+    if (NEG != -16) { return 9; }
+    return 0;
+}

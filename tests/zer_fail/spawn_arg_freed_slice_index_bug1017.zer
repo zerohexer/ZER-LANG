@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1017: an element read of a freed heap slice in a spawn argument.
+void w(u8 x) { }
+u32 main() {
+    [*]u8 s = alloc(u8, 4) orelse return;
+    s[0] = 1;
+    free(s);
+    spawn w(s[0]);
+    return 0;
+}

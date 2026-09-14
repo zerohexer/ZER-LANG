@@ -53,6 +53,33 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — the checker's fits-check on a `const` GLOBAL initializer uses the UNWRAPPED fold (2026-09-14, LOW — over-rejection, BUG-1024 residual)
+
+`const u32 A = 4000000000; const u32 AA = A + A;` is refused with "integer literal 8000000000
+does not fit in 'u32'", and `const u8 B = 200; const u8 P = B + 100;` with "300 does not fit in
+'u8'" — while the same expressions in a function body wrap (3705032704 and 44) and, since
+BUG-1024, the EMITTED file-scope value wraps too. The checker's literal-fits check folds the
+initializer with the untyped int64 evaluator and compares the unwrapped result against the
+declared type. Not a soundness hole (a wrapping const init is refused, never mis-valued), and
+arguably a useful overflow diagnostic — but it is inconsistent with the language rule that
+integer arithmetic wraps. Fix sketch: wrap the folded value to the checker's type of the
+initializer EXPRESSION (the emitter's `fold_wrap_to_type` twin) before the fits comparison, or
+keep the rejection and document it as an intentional const-init overflow check. Decide, then
+make the two agree. Tripwire: `tests/zer/global_const_fold_wraps_bug1024.zer` covers the
+shapes that DO compile.
+
+## OPEN — a struct whose SLICE field holds VALUE optionals of itself, `struct T { [*]?T kids; }`, is a GCC "unknown type" (2026-09-14, LOW — loud, valid program refused)
+
+`[*]?T` needs the typedef `_zer_xslice_o_<T>` whose `ptr` field is `_zer_opt_T*`, and
+`_zer_opt_T` is an ANONYMOUS-struct typedef emitted after `struct T` — so it cannot be named
+before `struct T` is complete, and the field inside `struct T` needs it first. The pointer form
+`struct T { [*]?*T kids; }` compiles (a `struct T*` may be incomplete; `xslice_deps_ready`
+knows this). Fix sketch: give the optional typedefs a struct TAG (`typedef struct _zer_opt_T_s
+{...} _zer_opt_T;`) and forward-declare `struct _zer_opt_T_s;` from the exotic-slice flush, so
+a pointer to it can be named before the definition. Measured: GCC error (`unknown type name
+'_zer_xslice_o_N4_Task'` — the registry never flushes the slice typedef because its
+dependency, `struct Task`, is the struct being defined), never a wrong program.
+
 ## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
 
 BUG-989 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch

@@ -1,0 +1,36 @@
+// BUG-1020: `if (?*opaque) |v|` — the value capture of an optional *opaque —
+// emitted `v = &o.value;` (the mutable-capture form) because the capture's type
+// `*opaque` is TYPE_POINTER, while its C type is the VALUE `_zer_opaque`. GCC
+// refused every such program. Three shapes: local, struct field, array element;
+// plus `|*v|` which must still take the address.
+struct Task { u32 id; }
+struct H { ?*opaque o; }
+Task gb;
+
+u32 main() {
+    Task a;
+    a.id = 6;
+    ?*opaque o = @ptrcast(*opaque, &a);
+    if (o) |v| {
+        *Task p = @ptrcast(*Task, v);
+        if (p.id != 6) { return 1; }
+    } else { return 2; }
+    H h;
+    h.o = @ptrcast(*opaque, &a);
+    if (h.o) |v| {
+        *Task p = @ptrcast(*Task, v);
+        if (p.id != 6) { return 3; }
+    } else { return 4; }
+    ?*opaque[1] arr;
+    arr[0] = @ptrcast(*opaque, &a);
+    if (arr[0]) |v| {
+        *Task p = @ptrcast(*Task, v);
+        if (p.id != 6) { return 5; }
+    } else { return 6; }
+    gb.id = 9;
+    if (o) |*v| { *v = @ptrcast(*opaque, &gb); }
+    *opaque w = o orelse return;
+    *Task q = @ptrcast(*Task, w);
+    if (q.id != 9) { return 7; }
+    return 0;
+}

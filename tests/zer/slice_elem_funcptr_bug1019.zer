@@ -1,0 +1,30 @@
+// BUG-1019: a slice of function pointers emitted the cast `(uint32_t (*)(uint32_t)*)`
+// (invalid C) and its typedef needed the `ret (**ptr)(params)` declarator. Also
+// BUG-1019b: `s[i](args)` on a SLICE callee was hand-rolled as `s[i]` (no `.ptr`,
+// no bounds check) — routed through the index emitter now. And alloc(Op, n).
+typedef u32 (*Op)(u32);
+u32 dbl(u32 x) { return x * 2; }
+u32 inc(u32 x) { return x + 1; }
+u32 pick(u32 n) { return n; }
+
+u32 main() {
+    Op[2] ops;
+    ops[0] = dbl;
+    ops[1] = inc;
+    [*]Op s = ops;
+    if (s[0](4) != 8) { return 1; }
+    if (s[1](4) != 5) { return 2; }
+    u32 i = pick(1);
+    if (s[i](10) != 11) { return 3; }
+    if (ops[i](10) != 11) { return 4; }
+    [*]Op hs = alloc(Op, 3) orelse return;
+    defer free(hs);
+    hs[2] = dbl;
+    if (hs[2](3) != 6) { return 5; }
+    *(u32) -> u32 [2] ops2;
+    ops2[0] = inc;
+    ops2[1] = dbl;
+    [*]*(u32) -> u32 s2 = ops2;
+    if (s2[1](7) != 14) { return 6; }
+    return 0;
+}

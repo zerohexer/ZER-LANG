@@ -1,0 +1,29 @@
+// expect-error: use after free
+// BUG-1024: a factory's allocation stored into a SLOT was registered nowhere.
+//
+// `ir_register_alloc_result_compound` (BUG-981) only ever ran for a DIRECT builtin
+// allocation — `h.p = alloc(T)` — so a USER FACTORY's result landing in a field
+// was tracked by nothing, and `free(h.s); h.s[0]` compiled clean. ASan:
+// heap-use-after-free.
+//
+// The shape is SLICE-ONLY, which is why nobody had written it. `[*]u32 mk() { ...
+// orelse return; ... }` is expressible because the zero of a slice ({null, 0}) is a
+// legal slice value; the pointer spelling of the very same function is refused
+// outright by BUG-974, because the zero of a non-null `*T` is the NULL its type
+// forbids. And `slot = <non-optional call>` lowers to ONE passthrough ASSIGN — no
+// IR_CALL, no IR_FIELD_WRITE — so neither the call-result arm nor the field-write
+// arm ever saw it. The BUG-933 two-spellings shape, a third time.
+struct Box { [*]u32 s; }
+
+[*]u32 make() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    return s;
+}
+
+u32 run() {
+    Box b;
+    b.s = make();
+    free(b.s);
+    return b.s[0];        // use after free
+}
+u32 main() { return run(); }

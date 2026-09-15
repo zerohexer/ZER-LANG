@@ -2454,6 +2454,58 @@ static Node *ir_unwrap_alloc_expr(Node *expr) {
     return expr;
 }
 
+/* BUG-1024: does a call to a USER FUNCTION hand the caller an allocation it now
+ * owns?  ONE query, so the plain-local sink and the SLOT sink cannot disagree.
+ *
+ * The slot sink (BUG-981's `ir_register_alloc_result_compound`) only ever ran for
+ * a DIRECT builtin allocation — `h.p = alloc(T)` — so a FACTORY result stored into
+ * a field, an index or a global was registered nowhere:
+ *
+ *     [*]u32 mk() { [*]u32 s = alloc(u32, 4) orelse return; return s; }
+ *     u32 run()   { H h; h.s = mk(); free(h.s); return h.s[0]; }
+ *
+ * compiled clean; ASan: heap-use-after-free. Same for `g = mk()` on a global.
+ *
+ * WHY THE SHAPE IS SLICE-ONLY, which is why nobody had written it: `mk()` above
+ * returns a NON-OPTIONAL `[*]u32`, and that is only expressible for a slice —
+ * the zero of a slice (`{null, 0}`) is a legal slice value, while the zero of a
+ * non-null `*T` is the NULL the type forbids, so BUG-974 rejects the pointer
+ * spelling of this very function outright. The lowering of
+ * `slot = <non-optional call>` is a single passthrough `%t = ASSIGN`, with no
+ * IR_CALL and no IR_FIELD_WRITE, so neither the call-result arm nor the
+ * field-write arm ever sees it — the BUG-933 two-spellings shape again.
+ *
+ * Conditions mirror the plain-local registration: a real summary (bodyless
+ * externs are outside the boundary and have their own heuristic), NOT arena-
+ * colored, and `!ret_is_borrow` — the callee actually makes an allocation-capable
+ * call. That last one is what keeps a view/literal factory from acquiring a false
+ * "never freed", and is why the corpus cost is zero. */
+static bool ir_call_result_is_owned_alloc(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL) return false;
+    Node *callee = call->call.callee;
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    FuncSummary *summary = NULL;
+    for (int si = 0; si < zc->summary_count; si++) {
+        if (zc->summaries[si].func_name_len == (uint32_t)callee->ident.name_len &&
+            memcmp(zc->summaries[si].func_name, callee->ident.name,
+                   (size_t)callee->ident.name_len) == 0) {
+            summary = &zc->summaries[si]; break;
+        }
+    }
+    if (!summary) return false;
+    if (summary->returns_color == ZC_COLOR_ARENA) return false;
+    if (summary->ret_is_borrow) return false;      /* allocates nothing */
+    if (summary->returns_all_views) return false;  /* hands back a param's memory */
+    if (ir_call_returns_static(zc, call)) return false;
+    Type *ret = checker_get_type(zc->checker, call);
+    Type *eff = ret ? type_unwrap_distinct(ret) : NULL;
+    if (type_dispatch_kind(eff) == TYPE_OPTIONAL)
+        eff = type_unwrap_distinct(eff)->optional.inner;
+    TypeKind k = type_dispatch_kind(eff);
+    return k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_SLICE ||
+           k == TYPE_HANDLE;
+}
+
 /* BUG-982: slot-to-slot copy — `b.p = a.p`, `g.q = h.arr[0]`. The value is a
  * tracked compound (a field / literal-index slot holding an allocation) and
  * the target is another slot: the target now ALIASES that allocation, so a
@@ -5212,6 +5264,23 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                                           inst->expr->assign.target,
                                                           inst->source_line);
                     }
+                } else if (ir_call_result_is_owned_alloc(zc, acall)) {
+                    /* BUG-1024: the same store, but the value comes from a USER
+                     * FACTORY rather than a builtin allocation. Registered
+                     * through the SAME two helpers, so the factory spelling and
+                     * the direct spelling cannot disagree. IRMC_ALLOC_PTR is the
+                     * right kind for both carriers here: the caller owns one
+                     * allocation and frees it with `free`. */
+                    int atgt = ir_find_value_local(func, inst->expr->assign.target);
+                    if (atgt >= 0)
+                        ir_register_alloc_result(zc, func, ps, acall,
+                                                 IRMC_ALLOC_PTR, atgt,
+                                                 inst->source_line);
+                    else
+                        ir_register_alloc_result_compound(zc, func, ps, acall,
+                                                          IRMC_ALLOC_PTR,
+                                                          inst->expr->assign.target,
+                                                          inst->source_line);
                 }
             }
         }

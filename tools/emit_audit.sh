@@ -154,6 +154,50 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1020 — the @critical interrupt-disable cascade, per TARGET.
+#
+# `@critical` must disable interrupts on bare metal and must NOT try to on a
+# hosted target, where the instruction is privileged. Getting that wrong is
+# invisible to a host test run in both directions: the hosted-ARM arms did not
+# BUILD at all (so no ZER test could reach them), and hosted RISC-V built clean
+# and would have faulted at run time in user mode.
+#
+# No cross-toolchain needed: the choice is made entirely by the preprocessor, so
+# defining the target's own macros and asking `gcc -E` which arm survives tests
+# the real cascade. Measured against actual aarch64 / armhf / riscv64 GCC when
+# this was written; the simulation agreed with all of them.
+cat > "$req_dir/crit.zer" <<'ZEOF'
+shared struct Counter { u32 val; }
+Counter c;
+i32 main() { @critical { c.val += 1; } return 0; }
+ZEOF
+if "$ZERC" "$req_dir/crit.zer" -o "$req_dir/crit.c" >/dev/null 2>&1; then
+    # target-name | preprocessor macros | instruction that MUST appear
+    while IFS='|' read -r tname tmacros twant; do
+        [ -z "$tname" ] && continue
+        got=$(gcc -E $tmacros -x c "$req_dir/crit.c" 2>/dev/null \
+              | sed -n '/int32_t main/,/^}/p' \
+              | grep -oE 'primask|daifset|cpsid|csrrci|cli|__atomic_thread_fence' \
+              | sort -u | tr '\n' ' ')
+        case " $got " in
+            *" $twant "*) ;;
+            *) echo "MISSING EMISSION: @critical on $tname picked '${got:-nothing}', want '$twant'"
+               REQ_FAIL=$((REQ_FAIL + 1)) ;;
+        esac
+    done <<'TARGETS'
+cortex-m (bare)|-D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=77 -ffreestanding|primask
+aarch64 (bare)|-D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65 -ffreestanding|daifset
+aarch64 (hosted)|-D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65|__atomic_thread_fence
+arm A-profile (bare)|-D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=65 -ffreestanding|cpsid
+riscv (bare)|-D__riscv=1 -ffreestanding|csrrci
+riscv (hosted)|-D__riscv=1|__atomic_thread_fence
+x86 (bare)|-ffreestanding|cli
+TARGETS
+else
+    echo "MISSING EMISSION: the @critical cascade sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

@@ -17462,7 +17462,24 @@ static void check_stmt(Checker *c, Node *node) {
          * never touched the condition. The narrowing push stays after the check on
          * purpose: at the condition `i` is what the condition is about to test, so
          * it must not be checked under the narrowing the condition establishes. */
-        if (node->for_stmt.step) check_expr(c, node->for_stmt.step);
+        /* BUG-1017 (2026-09-15): the STEP used to be CHECKED here, first, under
+         * the INIT range — the very defect BUG-1015 closed for the condition, at
+         * the one loop POSITION that fix did not cover. Measured:
+         * `for (u32 k = 0; k < 8; k += a[k])` on a `u32[4]` proved `a[k]` against
+         * k in [0,0], marked the node proven for good, and emitted a bare
+         * `k += a[k];` with no bounds check, no auto-guard and NO WARNING —
+         * ASan stack-buffer-overflow, exit 0. A slice keeps its dynamic `.len`
+         * check so only fixed arrays miscompiled, same as BUG-1015.
+         *
+         * Two obligations, and they cannot be the same call:
+         *   (a) the step's WRITE must widen the counter BEFORE the condition is
+         *       checked, or the condition regresses to the BUG-1015 hole;
+         *   (b) the step's own READS must be checked under the LOOP-CARRIED
+         *       range, which is the cond-narrowed range — the step runs at the
+         *       end of an iteration, so the condition held to get there.
+         * So: WIDEN here, CHECK below (after the cond narrowing). */
+        if (node->for_stmt.step)
+            vrp_invalidate_loop_body_writes(c, node->for_stmt.step);
 
         /* Value range propagation: for (i = 0; i < N; ...) → i in [0, N-1] */
         int saved_range_count = c->var_range_count;
@@ -17536,6 +17553,21 @@ static void check_stmt(Checker *c, Node *node) {
          * too late for a use that precedes the `&`. Runs AFTER the cond narrowing
          * so it overrides a loop-var range the alias can invalidate. */
         vrp_widen_loop_addr_taken(c, node->for_stmt.body);
+
+        /* BUG-1017 obligation (b): CHECK the step here — after the cond narrowing,
+         * which is exactly the range the counter holds when the step runs. The
+         * snapshot/restore keeps the body's environment intact: `check_expr` on
+         * `k += ...` re-widens `k` as a side effect, and the body (which runs
+         * BEFORE the step in each iteration) is entitled to the narrow
+         * [init, bound-1] the condition established. */
+        if (node->for_stmt.step) {
+            int st_saved = c->var_range_count;
+            struct VarRange *st_pre = vrp_snap_take(c, st_saved);
+            check_expr(c, node->for_stmt.step);
+            c->var_range_count = st_saved;
+            vrp_snap_restore(c, st_pre, st_saved);
+            free(st_pre);
+        }
 
         /* BUG-992: establish loop-induction CERTAINTY for the counter, if the
          * loop's shape proves every value of the sequence is really taken.

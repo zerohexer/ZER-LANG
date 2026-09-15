@@ -75,6 +75,73 @@ and 0 against the fixed compiler.
 
 ---
 
+## Session 2026-09-15 — BUG-1018: a constant whose signed and unsigned readings differ compiled silently, with the wrong one
+
+**Symptom.** Zero diagnostics, wrong answer:
+
+    u32 main() {
+        u32 x = -4 / -2;      // the author wrote 2
+        return x;
+    }
+
+returns **0**. Bare integer literals are u32, so the emitter renders
+`-(uint32_t)4 / -(uint32_t)2` — 0xFFFFFFFC / 0xFFFFFFFE, which is 0 in unsigned
+division. Meanwhile `eval_const_expr` folds the same tree with SIGNED 64-bit
+semantics and gets 2, so every compile-time decision downstream is made on a value
+the program never computes.
+
+**Root cause.** `const_negative_into_unsigned` exists to catch exactly this family —
+its trigger is "the tree has an explicit unary minus and the destination is
+unsigned" — but it decides on the FOLDED RESULT, and the fold here is +2. The
+OPERANDS are what get sign-converted, not the result. Same shape CLAUDE.md records
+as "an exemption whose written rationale is narrower than its code": the sentence
+says negative *constant*, the code tests the negative *result*.
+
+Which trees diverge was already written down one screen up in the same file:
+`lit_tree_ops_commute_with_wrap` lists `/`, `%` and `>>` as not homomorphic — the
+only three operators whose result depends on operand signedness. `+ - * & | ^ <<`
+give the same bits either way, which is why `u32 x = -4 * -2;` is 8 both ways and
+stays accepted.
+
+**Fix.** `const_signedness_divergent_into_unsigned` — an explicit `-` anywhere in a
+pure-literal tree that also contains one of those three operators, flowing into an
+unsigned destination, is refused. Added to `value_flows_to`, which is the ONE query
+behind all eight value-flow sinks, so var-decl init, assignment, call argument,
+return, orelse fallback, struct-init field, spawn argument and global init are all
+covered by the one line.
+
+REJECT rather than "emit the signed reading": ZER already refuses `u32 x = -1;` with
+"no implicit sign conversion", and silently picking either reading is the defect. The
+author says which they meant — a signed type, or `@bitcast(u32, ...)` for the bits.
+
+**Diagnostic.** Its own sentence, and tried SECOND. The two predicates overlap
+(`u32 x = -8 >> 1;` both diverges and folds negative); where they do, "negative
+constant -4 does not fit unsigned type 'u32'" is the more useful thing to say, with a
+concrete `@bitcast(u32, -4)` to paste. The new rule takes only the residual — a
+non-negative fold — which is exactly the case the older rule cannot see. Reusing the
+old message would have printed "negative constant 2", which is a lie.
+
+**Corpus cost: ZERO.** Measured the way CLAUDE.md prescribes — compiler-classified,
+not grep: every one of 2495 corpus files compiled with the pre-fix and post-fix
+binaries and the (exit status, diagnostic count) pairs diffed. The only file that
+changes verdict is this session's own new test.
+
+**Not a memory-safety hole, and the boundary is worth recording.** The ARRAY-INDEX
+position emits the same expression as raw C `int` arithmetic (`a[-4 / -2]` really
+does index 2) and bounds-checks against that same value, so the checker and the
+program agree there. The divergence is specific to the value-flow sinks, where the
+3AC path renders the literal as `-(uint32_t)4`. The two renderings of one literal are
+recorded in limitations.md as a consistency residual.
+
+**Tests.** `const_signed_unsigned_divergent_bug1018` (`/`),
+`const_divergent_mod_bug1018` (`%`, folds to +1 where unsigned gives 9),
+`const_divergent_shift_bug1018` (`>>`, folds to 0 where unsigned gives 0x80000000) —
+all three accepted with the wrong value pre-fix, rejected post-fix. Plus
+`tests/zer/const_divergent_homomorphic_ok_bug1018.zer`, the precision pin that fails
+if the rule widens past the three operators.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

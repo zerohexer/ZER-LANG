@@ -53,6 +53,37 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — one integer literal has TWO renderings in the emitted C (2026-09-15, LOW — consistency residual of BUG-1018)
+
+**Symptom.** The same source expression is emitted with different C types depending on
+the position it appears in:
+
+    u32 x = -4 / -2;    // 3AC/value path: `-(uint32_t)4 / -(uint32_t)2`  -> 0
+    a[-4 / -2]          // index path:     raw C `(-4 / -2)`              -> 2
+
+BUG-1018 closed the OBSERVABLE half: the value-flow sinks now refuse a literal tree
+whose signed and unsigned readings differ, so the silent wrong value is gone. The
+index position is left alone because it is SELF-CONSISTENT — it emits the signed
+reading and bounds-checks against that same signed value, so the checker's belief and
+the program's behaviour agree, and the access is guarded either way (verified:
+`a[-8 / -2]` on a `u32[4]` traps "array index out of bounds" at runtime).
+
+**Why it is still worth recording.** Two renderings of one literal is a latent source
+of exactly the class BUG-1018 was: any future rule that folds with `eval_const_expr`
+(signed int64) and then reasons about what the emitted code does can be wrong at one
+position and right at the other, with nothing to tell the author which it got.
+
+**Fix sketch.** Make the literal rendering one function of (literal, expression type),
+used by both the 3AC path and `emit_rewritten_node`'s index arm, so the type a literal
+is rendered at comes from one place. Then the divergence rule can be narrowed to
+"reject only where the two readings genuinely differ" rather than "reject the whole
+non-homomorphic family", recovering `u32 x = (-4 * -2) / 2;` (4 under both readings).
+
+**Corpus cost of the current over-rejection: zero** — measured over 2495 files, only
+BUG-1018's own new tests change verdict.
+
+---
+
 ## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
 
 BUG-989 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch

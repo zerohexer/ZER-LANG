@@ -80,6 +80,12 @@ riscv64-linux-gnu-gcc|-ffreestanding|riscv64 bare
 #                            floor, not a bug; BUG-1022 made the resulting GCC
 #                            error name the reason instead of reporting a missing
 #                            typedef in generated C. Only the `bare` rows fail.
+#   rt_sem_*/rt_conc_*/    — the same floor across the rust_tests corpus, plus
+#   rc_cond_*/rt_cond_*      `@cond_timedwait`, which needs `struct timespec` and
+#                            `clock_gettime`. Those still report the raw C message
+#                            ("storage size of '_zer_ts0' isn't known") rather than
+#                            a named reason — a message-quality residual of
+#                            BUG-1022, recorded in limitations.md. Only `bare`.
 is_expected() {
     case "$1" in
         asm_*|orelse_in_asm_operand_ok) return 0 ;;
@@ -88,6 +94,7 @@ is_expected() {
         dalpha4_context_switch)         return 0 ;;
         dalpha12_privileged_transitions) return 0 ;;
         barrier_*|sem_*|resource_pointer_param_ok) return 0 ;;
+        rt_sem_*|rc_sem_*|rt_conc_*|rc_cond_*|rt_cond_*) return 0 ;;
     esac
     return 1
 }

@@ -1,0 +1,18 @@
+// expect-error: never freed
+// BUG-1023, the leak half. The same untracked call result means a heap slice a
+// factory hands back can simply be dropped with nothing said.
+//
+// This one also pins the SECOND root cause: `ir_type_is_ptrish` omitted SLICE too,
+// so a function that allocates a slice was reported as making NO
+// allocation-capable call. `ret_is_borrow` then claimed the result was a BORROW of
+// caller memory and suppressed leak tracking — which is why fixing only the
+// registration looked like it worked and did not.
+[*]u32 make() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    return s;
+}
+u32 run() {
+    [*]u32 s = make();
+    return s[0];          // never freed
+}
+u32 main() { return run(); }

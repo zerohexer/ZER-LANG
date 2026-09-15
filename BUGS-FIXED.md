@@ -381,6 +381,67 @@ Result after the fixes: **0 unexpected failures across all six target rows.**
 
 ---
 
+## Session 2026-09-15 — BUG-1023: a heap slice arriving as a CALL RESULT was not tracked at all
+
+**Symptom.** Zero diagnostics, and ASan says heap-use-after-free:
+
+    [*]u32 make() { [*]u32 s = alloc(u32, 4) orelse return; return s; }
+    u32 run()     { [*]u32 s = make(); free(s); return s[0]; }
+
+The DOUBLE FREE and the LEAK of the same value were accepted too. Meanwhile all
+three written DIRECTLY inside one function (`s = alloc(...); free(s); s[0]`) were
+correctly rejected — so the machinery existed and simply never saw this value.
+
+**Two root causes, and the first one alone does not fix it.**
+
+1. The call-result allocation registration (`zercheck_ir.c`, the
+   `summary_non_arena` arm) computed `is_ptr_return` from a hand-written list:
+   `TYPE_POINTER`, `TYPE_OPAQUE`, `TYPE_HANDLE`. **No `TYPE_SLICE`.** But
+   `alloc(T, n)` returns `?[*]T`, and returning it from a factory is the
+   documented idiom, so the most natural way to hand a heap slice out of a
+   function produced a value with no tracked allocation behind it. One carrier
+   handled, its sibling missed, at the one sink where the carrier set is written
+   out by hand — the multi-site shape CLAUDE.md names as the #1 recurring class.
+
+2. `ir_type_is_ptrish` had the SAME omission, and that one contradicted its own
+   stated premise: its comment says "every allocation form is such a call", yet
+   with SLICE missing, a body that calls `alloc(T, n)` was reported as making NO
+   allocation-capable call. `ret_is_borrow` therefore concluded the result was a
+   BORROW of caller memory and suppressed the tracking again. Adding SLICE only to
+   (1) looked like it worked and did not — the tests still passed.
+
+**Fix.** `TYPE_SLICE` added to `ir_type_is_ptrish` (which makes `ret_is_borrow`
+FALSE for strictly more functions — the conservative direction, less suppression),
+and slice returns registered at the call-result sink **gated on
+`!summary->ret_is_borrow`** — the precise "this callee can actually allocate"
+condition.
+
+**Why the gate, rather than registering unconditionally as the pointer arms do.**
+The pointer arms rely on three downstream suppressions (`returns_all_views`,
+`ret_is_borrow && ret_is_content`, `ir_call_returns_static`) to undo the
+registration for views. Those were written for `*T` and do not all recognise the
+slice forms. Measured: registering slices unconditionally put a false "never
+freed" on three corpus files — `const [*]u8 name() { return "ZER"; }` (a literal
+in .rodata), a param-view `?[*]u8 pick(bool, [*]u8)`, and `const_slice_return`.
+Gating up front is both narrower and the only version with zero cost.
+
+**Corpus cost: ZERO**, compiler-classified over 2492 files — the exit status and
+diagnostic count of every one compared against the pre-fix binary, with no
+difference outside this session's own new tests.
+
+**Tests.** `heap_slice_call_result_uaf_bug1023` and `_leak_bug1023` (both accepted
+pre-fix, rejected after), plus `tests/zer/heap_slice_factory_ok_bug1023.zer`, the
+precision pin covering all four shapes at once: a real factory used correctly, a
+string literal, a param subslice, and a param passthrough through an optional.
+
+**Gate — SHAPE p26 in `tools/sink_matrix.sh`** (the prescribed gate for anything
+touching an escape/free sink; the matrix is a permanent `make check` gate). Seven
+cells on the CARRIER axis: four defects and three boundary cells, because the
+boundary is what keeps the fix honest here. **Verified to FIRE**: exactly four
+holes against the pre-fix build, 0 after. Matrix is 176 cells, CLEAN.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

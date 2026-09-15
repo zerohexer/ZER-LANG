@@ -1,0 +1,21 @@
+// expect-error: use after free
+// BUG-1023: a heap slice that arrives as a CALL RESULT was not tracked at all.
+//
+// `alloc(T, n)` returns `?[*]T`, and "returnable from a factory" is the documented
+// idiom for it. But the call-result allocation registration listed POINTER, OPAQUE
+// and HANDLE — not SLICE — so the result was never registered as a tracked
+// allocation and the whole Model-1 lifecycle silently skipped it. UAF, double-free
+// and leak were ALL accepted, while the same three written DIRECTLY inside one
+// function were correctly rejected.
+//
+// Pre-fix this compiled with zero diagnostics; ASan reported heap-use-after-free.
+[*]u32 make() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    return s;
+}
+u32 run() {
+    [*]u32 s = make();
+    free(s);
+    return s[0];          // use after free
+}
+u32 main() { return run(); }

@@ -9,7 +9,14 @@
 # Usage: test_zer.sh [extra-flags]
 #   e.g. test_zer.sh --some-future-flag
 
-ZERC="./zerc"
+# ZER_MATRIX_ZERC overrides the compiler under test, exactly as all ten
+# tests/test_*_matrix.c grids accept it (CLAUDE.md records why: verifying that a
+# new test actually FIRES means running it against a PRE-FIX compiler, and a
+# harness that hardcodes ./zerc silently grades the current one instead — so a
+# run "against the baseline" proves nothing). The integration runner was the last
+# harness without the override; added 2026-09-15 while proving BUG-1019's trap
+# tests discriminate.
+ZERC="${ZER_MATRIX_ZERC:-./zerc}"
 EXTRA_FLAGS="$1"
 PASS=0
 FAIL=0
@@ -98,6 +105,18 @@ for f in tests/zer_trap/*.zer; do
     #    caught it. `// expect-trap-at: N` asserts the reported location; the
     #    optional-directive shape matches `expect-error` and `expect-trap`.
     want_line=$(head -8 "$f" | grep -oE '// expect-trap-at: *[0-9]+' | grep -oE '[0-9]+' | head -1)
+    #  * WHICH trap fired was invisible. `expect-trap` demands SIGTRAP and
+    #    `expect-trap-at` demands a line, but NEITHER says which safety rule
+    #    produced it — so a trap test passes when a DIFFERENT rule traps on the
+    #    same program. That is the weak-oracle class this file already documents
+    #    for negatives ("a negative test proves nothing until you read the
+    #    diagnostic"), one directory over, and it was live: BUG-1019's null
+    #    function-pointer call trapped identically before and after the fix,
+    #    because HOSTED the raw jump to address 0 faults and ZER's SIGSEGV
+    #    handler traps — a different mechanism, the same exit code, and on bare
+    #    metal no trap at all. `// expect-trap-msg: <substring>` asserts the
+    #    reason, same optional-directive shape as `expect-error`.
+    want_msg=$(head -8 "$f" | sed -n 's|^// expect-trap-msg: *||p' | head -1)
     trap_out=$(timeout "${ZER_RUN_TIMEOUT:-20}" $ZERC "$f" $EXTRA_FLAGS $file_flags --run 2>&1)
     ret=$?
     if [ $ret -eq 124 ]; then
@@ -106,6 +125,9 @@ for f in tests/zer_trap/*.zer; do
     elif [ "$want_trap" -gt 0 ] && [ $ret -ne 133 ]; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (expected SIGTRAP/133, got exit $ret)"
+    elif [ -n "$want_msg" ] && ! printf '%s' "$trap_out" | grep -qF -- "$want_msg"; then
+        FAIL=$((FAIL + 1))
+        echo "  FAIL: $name (expected trap message '$want_msg', got: $(printf '%s' "$trap_out" | grep -o 'ZER TRAP:.*' | head -1))"
     elif [ -n "$want_line" ] && ! printf '%s' "$trap_out" | grep -qE "\.zer:$want_line\b"; then
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (expected trap at line $want_line, got: $(printf '%s' "$trap_out" | grep -o 'ZER TRAP:.*' | head -1))"

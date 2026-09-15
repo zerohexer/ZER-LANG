@@ -159,6 +159,26 @@ if (x) { }                // COMPILE ERROR — x is u32, not bool
 **NOTES**
 - Switch on bool must be exhaustive: both `true` and `false` arms required.
 - Comparisons (`==`, `<`, etc.) return bool.
+- An EXPLICIT C-style cast converts in both directions and is well-defined —
+  what is banned is the *implicit* coercion above, not the conversion:
+
+```zer
+u32 main() {
+    bool t = true;
+    u32 n = 42;
+    u32 a = (u32)t;        // 1  — a bool is always exactly 0 or 1
+    bool c = (bool)n;      // true — any non-zero becomes true
+    bool d = (bool)0;      // false
+    if (a != 1) { return 1; }
+    if (!c) { return 2; }
+    if (d) { return 3; }
+    return 0;
+}
+```
+
+  `(bool)n` is emitted as `!!n`, so a cast can never produce a bool holding a
+  value outside {0, 1} — the exhaustive `switch` on a bool stays sound, and
+  there is no bool analogue of the enum-forging doors.
 
 ---
 
@@ -780,8 +800,20 @@ A NON-nullable element type (`BinOp[3]`, `*(u32) -> u32 [3]`) is accepted but
 should be avoided: auto-zero fills the array with NULL and ZER has no array
 initializer, so every element starts out holding the one value its type forbids.
 Assign every element before any use, or — better — use the `?` element type
-above, where the unwrap makes the not-yet-registered case explicit. See
-`tests/zer_gaps/funcptr_array_null_element.zer`.
+above, where the unwrap makes the not-yet-registered case explicit.
+
+Calling an element that was never assigned is **caught at run time** (BUG-1019):
+every indirect call through a function pointer carries a null guard and traps
+with `call through a null function pointer`. The guard is compiled in, so it
+fires on bare metal too — where a raw jump through address 0 would otherwise land
+on the reset vector or ordinary memory with nothing to notice it. The same guard
+covers a struct field of funcptr type, and a plain local that was assigned from
+either carrier. `__typeof__` is used to hoist the callee, so a side-effecting
+callee expression such as `table[next()](a, b)` still evaluates exactly once. A
+DIRECT call by name is never guarded.
+
+This is a runtime check, not a compile-time proof: prefer `?BinOp[3]` with an
+`if (ops[i]) |f|` unwrap, which turns the same question into a compile-time one.
 
 `keep` on a funcptr parameter is written `*(keep *Handler)` — see the `keep`
 section. An INDIRECT call cannot see its target, so ZER worst-cases every
@@ -4101,6 +4133,65 @@ holds, the warning says so and says what the guard does at runtime.
 
 Proven-safe really does mean no code: `u32 i = 2; arr[i]` emits a bare `arr[i]`. An
 unprovable index emits `if ((size_t)(i) >= 4u) { return 0; }` in front of the access.
+
+**Every position a loop evaluates is checked under the value the counter holds
+THERE**, not the value it had before the loop. That means the body, the
+condition, and the STEP — all three run once per iteration under the
+loop-carried value:
+
+```zer
+u32 main() {
+    u32[4] a;
+    a[0] = 1; a[1] = 1; a[2] = 1; a[3] = 1;
+
+    // the index in the STEP is checked against k in [0,7], not k in [0,0]:
+    // warns, auto-guard inserted, so the loop returns early at k == 4
+    for (u32 k = 0; k < 8; k += a[k] + 1) { }
+
+    // the loop's own bound proves this one, so nothing is emitted:
+    for (u32 j = 0; j < 4; j += a[j]) { }
+
+    return 0;
+}
+```
+
+  The init is the exception, and only because it genuinely runs once before the
+  loop exists, so the pre-loop range is the right one there.
+
+### A negative literal in an unsigned destination
+
+`u32 x = -1;` is a compile error — ZER has no implicit sign conversion — and the
+rule looks at the whole constant expression, not just a lone literal.
+
+There is a second, less obvious half. Bare integer literals are `u32`, so `/`,
+`%` and `>>` on a negated operand compute a DIFFERENT value than the same
+expression read as signed arithmetic:
+
+<!-- audit: expect-error: reads differently signed and unsigned -->
+```zer
+u32 main() {
+    u32 x = -4 / -2;      // ERROR — signed this is 2, unsigned it is 0
+    return x;
+}
+```
+
+  Signed, `-4 / -2` is 2. Unsigned, it is `0xFFFFFFFC / 0xFFFFFFFE`, which is 0.
+  ZER will not pick one silently. Write the signed reading with a signed type
+  (`i32 y = -4; i32 z = -2; u32 x = (u32)(y / z);`), or `@bitcast(u32, ...)` for
+  the unsigned bit pattern.
+
+  Only those three operators are affected — they are the only ones whose result
+  depends on the signedness of the operands. `+ - * & | ^ <<` produce the same
+  bits either way and are untouched:
+
+<!-- audit: skip -->
+```zer
+u32 a = -4 * -2;      // 8 — fine, one unambiguous answer
+u32 b = -4 ^ -2;      // 2 — fine
+u32 c = -4 + -2;      // ERROR — folds to -6, a negative constant
+```
+
+---
 
 ### A plain access races a SCOPED thread too, not just a fire-and-forget one
 

@@ -1,0 +1,19 @@
+// expect-trap
+// expect-trap-msg: call through a null function pointer
+// expect-trap-at: 19
+// BUG-1019: calling an unassigned element of a non-null function-pointer array.
+//
+// Auto-zero fills the array with NULL and the non-null-requires-an-initializer
+// rule does not reach an array element (extending it there was implemented and
+// REVERTED — ZER has no array-initializer syntax, so the rule would have removed
+// the dispatch-table idiom rather than initialise it).
+//
+// Pre-fix the emitted C was a RAW indirect call, `_zer_t3 = g_ops[0](a, b);`.
+// Hosted, that faults and ZER's SIGSEGV handler prints a trap, which is why the
+// hole looked handled. On BARE METAL with no MMU there is no handler and no
+// fault: address 0 is the reset vector or ordinary memory and the jump silently
+// goes somewhere. The guard is COMPILED IN, so it now traps on both.
+typedef u32 (*BinOp)(u32, u32);
+u32 add(u32 a, u32 b) { return a + b; }
+BinOp[3] g_ops;
+u32 main() { g_ops[1] = add; return g_ops[0](1, 2); }

@@ -1,0 +1,49 @@
+// BUG-1019 precision pin: the null-funcptr guard must not change the meaning of
+// any VALID indirect call, and must evaluate the callee exactly ONCE.
+//
+// The guard is `({ __typeof__(CALLEE) t = CALLEE; if (!t) trap; t; })(args)`.
+// `__typeof__` does not evaluate its operand, so emitting the callee text twice
+// still runs it once — the RF13 / BUG-661 double-evaluation class. `pick()` below
+// is the witness: it bumps a counter, and a double-eval shows up as calls == 2.
+typedef u32 (*BinOp)(u32, u32);
+struct Ops { BinOp f; }
+
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+
+u32 calls;
+u32 pick() { calls += 1; return 1; }
+
+u32 apply(*(u32, u32) -> u32 op, u32 x, u32 y) { return op(x, y); }
+
+BinOp[3] table;
+
+u32 main() {
+    table[0] = add;
+    table[1] = mul;
+    table[2] = add;
+
+    // array element, constant index
+    if (table[0](20, 22) != 42) { return 1; }
+
+    // array element, SIDE-EFFECTING index — must run exactly once
+    if (table[pick()](6, 7) != 42) { return 2; }
+    if (calls != 1) { return 3; }
+
+    // struct field
+    Ops o;
+    o.f = add;
+    if (o.f(40, 2) != 42) { return 4; }
+
+    // bare-name local
+    BinOp g = table[2];
+    if (g(40, 2) != 42) { return 5; }
+
+    // funcptr PARAM (non-null by the caller's type; guard must be harmless)
+    if (apply(add, 40, 2) != 42) { return 6; }
+
+    // direct call — never guarded
+    if (add(40, 2) != 42) { return 7; }
+
+    return 0;
+}

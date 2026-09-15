@@ -6282,6 +6282,31 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    pthread_cond_signal(&s->_zer_cond);\n");
     emit(e, "    pthread_mutex_unlock(&s->_zer_mtx);\n");
     emit(e, "}\n");
+    /* BUG-1022: name the REASON in the non-hosted branch.
+     *
+     * Barrier / Semaphore / shared struct / spawn / condvar are all pthread-based,
+     * so they genuinely cannot work freestanding — that part is a floor, not a
+     * bug. What WAS a bug is what the author saw: the types simply vanished and
+     * GCC said `error: unknown type name '_zer_barrier'` pointing at a line of
+     * GENERATED C, with nothing naming the ZER feature or the reason. Same defect
+     * BUG-991 records for float literals, where GCC blamed the user's .zer line
+     * for an emitter problem; here it blames a file the user never wrote.
+     *
+     * zerc cannot know at compile time whether the emitted C will be built with
+     * -ffreestanding (that is a GCC flag applied later, or ZER_FREESTANDING), so
+     * it cannot diagnose this itself. But it can put the REASON inside the error
+     * GCC is going to print, which is what these macros do: the name that shows
+     * up in "unknown type name" now says what went wrong and why.
+     *
+     * A macro, not an `#error`, precisely so a bare-metal program that does NOT
+     * use threads is unaffected — which is the common firmware case and must keep
+     * building. Nothing fires unless the program actually names one of them. */
+    emit(e, "#else\n");
+    emit(e, "/* Freestanding: pthreads do not exist, so Barrier/Semaphore cannot. These\n");
+    emit(e, "   macros put the reason into GCC's \"unknown type name\" message rather than\n");
+    emit(e, "   leaving the author staring at a missing typedef in generated C. */\n");
+    emit(e, "#  define _zer_barrier   ZER_Barrier_requires_a_HOSTED_target__pthreads_are_unavailable_on_bare_metal\n");
+    emit(e, "#  define _zer_semaphore ZER_Semaphore_requires_a_HOSTED_target__pthreads_are_unavailable_on_bare_metal\n");
     emit(e, "#endif\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.
@@ -9072,8 +9097,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"int3\");\n"
-                "#elif defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"brk #0\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"bkpt #0\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ebreak\");\n"
                 "#else\n"
@@ -9905,7 +9932,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"cli\" ::: \"memory\");\n"
-                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr daifset, #2\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
                 "    __asm__ __volatile__ (\"cpsid i\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrci mstatus, 8\" ::: \"memory\");\n"
@@ -9918,7 +9947,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"sti\" ::: \"memory\");\n"
-                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr daifclr, #2\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
                 "    __asm__ __volatile__ (\"cpsie i\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrsi mstatus, 8\" ::: \"memory\");\n"
@@ -9946,8 +9977,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"pushfl; popl %0\" : \"=r\"(_zer_istate) :: \"memory\");\n"
                 "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"mrs %0, daif\" : \"=r\"(_zer_istate) :: \"memory\");\n"
-                "#elif defined(__ARM_ARCH)\n"
+                "#elif defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n"
                 "    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, primask\" : \"=r\"(_zer_p) :: \"memory\"); _zer_istate = _zer_p; }\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, cpsr\" : \"=r\"(_zer_p) :: \"memory\"); _zer_istate = _zer_p; }\n"
                 "#elif defined(__riscv)\n"
                 "    { unsigned long _zer_m; __asm__ __volatile__ (\"csrr %0, mstatus\" : \"=r\"(_zer_m) :: \"memory\"); _zer_istate = _zer_m; }\n"
                 "#else\n"
@@ -10246,8 +10279,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"pushl %0; popfl\" :: \"r\"(_zer_r32) : \"memory\", \"cc\"); }\n"
                 "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"msr daif, %0\" :: \"r\"(_zer_rstate) : \"memory\");\n"
-                "#elif defined(__ARM_ARCH)\n"
+                "#elif defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n"
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr primask, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr cpsr_c, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
                 "#elif defined(__riscv)\n"
                 "    { unsigned long _zer_m = (unsigned long)_zer_rstate; __asm__ __volatile__ (\"csrw mstatus, %0\" :: \"r\"(_zer_m) : \"memory\"); }\n"
                 "#else\n"

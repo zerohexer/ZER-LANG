@@ -543,6 +543,40 @@ cell p25_safe_reset_refill   compile 'struct T25l{u32 v;} struct H25l{?*T25l p;}
 cell p25_safe_return_carries compile 'struct T25m{u32 v;} struct H25m{?*T25m p;} H25m mk25(){ H25m h; h.p=alloc(T25m); return h; } u32 main(){ H25m m=mk25(); *T25m q=m.p orelse {return 1;}; free(q); return 0; }'
 cell p25_safe_carry_free_outer compile 'struct T25n{u32 v;} struct I25n{?*T25n p;} struct H25n{I25n inner;} u32 main(){ I25n i={ .p=alloc(T25n) }; H25n h={ .inner=i }; *T25n q=h.inner.p orelse {return 1;}; q.v=2; u32 v=q.v; free(q); return v-2; }'
 
+# SHAPE p26 (BUG-1023): AN ALLOCATION THAT ARRIVES AS A CALL RESULT — the CARRIER axis.
+#
+# `alloc(T, n)` returns `?[*]T`, and "returnable from a factory" is the DOCUMENTED
+# idiom for it. But the call-result registration listed POINTER / OPAQUE / HANDLE and
+# NOT SLICE, so a heap slice arriving from a call was never registered as a tracked
+# allocation and the ENTIRE Model-1 lifecycle silently did not apply to it:
+#
+#     [*]u32 mk() { [*]u32 s = alloc(u32, 4) orelse return; return s; }
+#     u32 run()   { [*]u32 s = mk(); free(s); return s[0]; }   /* compiled CLEAN */
+#
+# ASan: heap-use-after-free. The double-free and the leak were accepted too — while
+# the DIRECT spelling of all three, inside one function, was correctly rejected. One
+# carrier handled, its sibling missed, at the one sink where the carrier set was
+# written out by hand.
+#
+# `ir_type_is_ptrish` had the SAME omission, which is why the first fix looked like
+# it worked and did not: with SLICE missing there, a function that allocates a slice
+# was reported as making no allocation-capable call, so `ret_is_borrow` claimed its
+# result was a BORROW of caller memory and suppressed the tracking again.
+#
+# The BOUNDARY cells are what keep the fix honest: a slice-returning function that
+# allocates NOTHING (a string literal, a subslice of a param, a view) must not
+# acquire a false "never freed". Measured corpus cost of the shipped form: ZERO over
+# 2492 files; an earlier, ungated draft cost three.
+echo "===== SHAPE p26 = an allocation arriving as a CALL RESULT (carrier axis) ====="
+cell p26_slice_call_uaf    reject '[*]u32 mk26() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26(){ [*]u32 s = mk26(); free(s); return s[0]; } u32 main(){ return run26(); }'
+cell p26_slice_call_double reject '[*]u32 mk26b() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26b(){ [*]u32 s = mk26b(); free(s); free(s); return 0; } u32 main(){ return run26b(); }'
+cell p26_slice_call_leak   reject '[*]u32 mk26c() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26c(){ [*]u32 s = mk26c(); return s[0]; } u32 main(){ return run26c(); }'
+cell p26_optslice_call_uaf reject '?[*]u32 mk26d() { return alloc(u32, 4); } u32 run26d(){ [*]u32 s = mk26d() orelse return; free(s); return s[0]; } u32 main(){ return run26d(); }'
+# BOUNDARY: a slice-returning function that allocates nothing is NOT an allocation.
+cell p26_safe_literal      compile 'const [*]u8 nm26() { return "ZER"; } u32 main(){ const [*]u8 n = nm26(); if (n.len != 3) { return 1; } return 0; }'
+cell p26_safe_param_view   compile '[*]u8 tr26([*]u8 s) { return s[1..3]; } u32 main(){ u8[4] b; b[1] = 9; [*]u8 t = tr26(b[0..4]); if (t[0] != 9) { return 1; } return 0; }'
+cell p26_safe_factory_ok   compile '[*]u32 mk26e() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26e(){ [*]u32 s = mk26e(); s[0] = 7; u32 v = s[0]; free(s); return v; } u32 main(){ if (run26e() != 7) { return 1; } return 0; }'
+
 echo ""
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

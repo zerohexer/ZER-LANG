@@ -1933,12 +1933,22 @@ static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
  * type_dispatch_kind (unwraps distinct, NULL-safe) so it adds no raw type-kind
  * dispatch site (no literal kind comparison against a raw field). */
 static bool ir_type_is_ptrish(Type *t) {
+    /* BUG-1023: TYPE_SLICE belongs here, and its absence made this predicate
+     * contradict its OWN premise — "every allocation form is such a call".
+     * `alloc(T, n)` returns `?[*]T`, a SLICE, so a function that allocates a
+     * heap slice was reported as making NO allocation-capable call, and
+     * `ret_is_borrow` therefore claimed its result was a borrow of caller
+     * memory. That suppressed leak tracking on a genuinely owned allocation.
+     * Adding SLICE makes ret_is_borrow FALSE for strictly more functions, which
+     * is the conservative direction (less suppression, more tracking). */
     TypeKind k = type_dispatch_kind(t);
-    if (k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_HANDLE) return true;
+    if (k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_SLICE ||
+        k == TYPE_HANDLE) return true;
     if (k == TYPE_OPTIONAL) {
         Type *e = type_unwrap_distinct(t);
         TypeKind ik = type_dispatch_kind(e->optional.inner);
-        return ik == TYPE_POINTER || ik == TYPE_OPAQUE || ik == TYPE_HANDLE;
+        return ik == TYPE_POINTER || ik == TYPE_OPAQUE || ik == TYPE_SLICE ||
+               ik == TYPE_HANDLE;
     }
     return false;
 }
@@ -6452,7 +6462,29 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret_eff = ret ? type_unwrap_distinct(ret) : NULL;
                 bool is_ptr_return = false;
                 /* p3Qz0 Gap 38 (2026-05-16): TYPE_HANDLE added to register
-                 * function-returned handles for double-free tracking. */
+                 * function-returned handles for double-free tracking.
+                 *
+                 * BUG-1023 (2026-09-15): TYPE_SLICE added. `alloc(T, n)` returns
+                 * `?[*]T`, and "returnable from a factory" is the DOCUMENTED
+                 * idiom for it — but a slice return was not a `is_ptr_return`, so
+                 * the call result was never registered as a tracked allocation
+                 * and the whole Model-1 lifecycle silently did not apply to it:
+                 *
+                 *     [*]u32 mk() { [*]u32 s = alloc(u32, 4) orelse return; return s; }
+                 *     u32 run() { [*]u32 s = mk(); free(s); return s[0]; }
+                 *
+                 * compiled with ZERO diagnostics — ASan: heap-use-after-free. The
+                 * double-free and the leak were accepted too, while the DIRECT
+                 * spelling (`s = alloc(...)` in the same function) was correctly
+                 * rejected at all three. A carrier handled for `*T` and missed for
+                 * its `[*]T` sibling: the multi-site shape, at the one sink where
+                 * the carrier set was written out by hand.
+                 *
+                 * A slice return that is a VIEW rather than an allocation is
+                 * already handled by the three suppressions below
+                 * (`returns_all_views` above, `ret_is_borrow && ret_is_content`,
+                 * `ir_call_returns_static`) — the same ones that keep `*T` factory
+                 * results from reporting false leaks. */
                 if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
                                 ret_eff->kind == TYPE_OPAQUE ||
                                 ret_eff->kind == TYPE_HANDLE))
@@ -6463,6 +6495,42 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                                   inner->kind == TYPE_OPAQUE ||
                                   inner->kind == TYPE_HANDLE))
                         is_ptr_return = true;
+                }
+                /* BUG-1023: a SLICE return, gated on the callee actually being
+                 * able to allocate.
+                 *
+                 * `!ret_is_borrow` means the body makes an allocation-capable
+                 * call, which is the precise "this result may be a fresh
+                 * allocation" condition — the same fact PART 6 already computes.
+                 * A slice-returning function that allocates NOTHING (a string
+                 * literal, a subslice of a param, a view of a global) is left
+                 * alone, so none of them acquires a false "never freed".
+                 *
+                 * The pointer arms above register unconditionally and rely on the
+                 * three suppressions below to undo it for views; those
+                 * suppressions were written for `*T` and do not all recognise the
+                 * slice forms, so gating UP FRONT is both narrower and the only
+                 * version with zero corpus cost (measured: gating on `is_ptr_return`
+                 * alone put a false leak on `const [*]u8 get_name() { return "ZER"; }`
+                 * and on a param-view `?[*]u8 pick(bool, [*]u8)`).
+                 *
+                 * Why it was needed at all: `alloc(T, n)` returns `?[*]T` and
+                 * "returnable from a factory" is the documented idiom for it, yet
+                 * a slice return was not `is_ptr_return`, so the result was never
+                 * registered and the entire Model-1 lifecycle silently skipped it.
+                 * `[*]u32 s = mk(); free(s); s[0]` compiled with ZERO diagnostics
+                 * (ASan: heap-use-after-free); so did the double-free and the leak,
+                 * while the DIRECT spelling in one function was correctly rejected
+                 * at all three. A carrier handled for `*T` and missed for `[*]T`. */
+                if (!is_ptr_return && summary && !summary->ret_is_borrow) {
+                    /* type_dispatch_kind, not a raw `->kind ==`: NULL-safe and
+                     * unwraps distinct, so a `distinct typedef [*]u8 Name`
+                     * factory is covered too (and it adds no raw dispatch site
+                     * for tools/audit_type_dispatch.sh to flag). */
+                    Type *sl = ret_eff;
+                    if (type_dispatch_kind(sl) == TYPE_OPTIONAL)
+                        sl = type_unwrap_distinct(sl)->optional.inner;
+                    if (type_dispatch_kind(sl) == TYPE_SLICE) is_ptr_return = true;
                 }
                 if (is_ptr_return) {
                     IRHandleInfo *h = ir_add_handle(ps, inst->dest_local);

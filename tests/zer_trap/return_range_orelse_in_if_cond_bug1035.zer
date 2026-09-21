@@ -1,0 +1,19 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1035: a `return` inside an orelse-BLOCK in a IF CONDITION was never unioned
+// into the callee's return-range summary: pick(200) returns 9, the summary said
+// [0,3], and `arr[pick(k)]` on a u32[4] was emitted with NO bounds check (ASan
+// stack-buffer-overflow at index 9; pre-fix this program exited 1, silently).
+// Now the index is unproven and the inline bounds check traps.
+?u32 mb(u32 x) { if (x > 100) { return null; } return x; }
+u32 pick(u32 x) {
+    if ((mb(x) orelse { return 9; }) > 0) { return x % 4; }
+    return 0;
+}
+u32 main() {
+    volatile u32 k = 200;
+    u32 kk = k;
+    u32[4] arr;
+    arr[pick(kk)] = 1;
+    return 1;
+}

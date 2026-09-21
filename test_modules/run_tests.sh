@@ -95,6 +95,28 @@ run_test comptime_user 0
 run_test enum_user 0
 # BUG-1029: alloc(T,n) inside an imported module
 run_test alloc_user 0
+# BUG-1037: the post passes run over EVERY module. An arena declared + used in a
+# module and backed in main is whole-program-initialised (must compile) ...
+run_test arena_user 0
+# ... a two-shared-struct statement inside an IMPORTED function is the same
+# deadlock it is in main (must reject, and for THAT reason) ...
+output=$($ZERC deadlock_user_negative.zer -o /dev/null 2>&1)
+if [ $? -ne 0 ] && echo "$output" | grep -q "deadlock: single statement accesses both"; then
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: deadlock_user_negative (cross-module two-shared-struct statement not rejected as a deadlock)"
+    echo "$output" | head -3
+    FAIL=$((FAIL+1))
+fi
+# ... and --stack-limit counts an imported callee's frame in main's chain.
+output=$($ZERC stack_user_negative.zer -o /dev/null --stack-limit 500 2>&1)
+if [ $? -ne 0 ] && echo "$output" | grep -q "max call chain stack .* exceeds --stack-limit"; then
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: stack_user_negative (imported 1000-byte frame not counted under --stack-limit)"
+    echo "$output" | head -3
+    FAIL=$((FAIL+1))
+fi
 
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*

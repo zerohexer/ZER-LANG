@@ -1464,6 +1464,18 @@ free(xs);                                    // release a [*]T
   primitive: `alloc(u8, n)`, `alloc(u32, n)`, `alloc(Node, n)`). Memory is
   auto-zeroed (calloc semantics).
 - `free(x)` → `void` — releases a `*T` or a `[*]T`. Dispatches on the shape.
+- Neither may run inside an `interrupt` handler or a `@critical` block — the
+  libc heap lock may deadlock there — and the ban is TRANSITIVE: a helper that
+  allocates or frees cannot be called from either context (BUG-1036: the
+  `alloc(T, n)` / `free(slice)` forms were missed through a helper while the
+  direct spelling and the `alloc(T)` form were caught).
+
+<!-- audit: expect-error: cannot allocate inside interrupt handler -->
+```zer
+void helper() { ?[*]u8 b = alloc(u8, 16); if (b) |bb| { free(bb); } }
+interrupt IRQ1 { helper(); }        // COMPILE ERROR — alloc reachable from an ISR
+u32 main() { return 0; }
+```
 
 **EXAMPLE**
 ```zer
@@ -2098,6 +2110,24 @@ Convert pointer to usize integer.
 usize addr = @ptrtoint(my_ptr);
 ```
 
+**NOTES**
+- The integer is TRACKED like the pointer it came from: `@ptrtoint(&local)`
+  cannot be stored in a global or through a pointer parameter, and neither can
+  any arithmetic or cast on it — `g = a + 0`, `g = 0 - a`, `g = -a`,
+  `g = (usize)a` and `g = f(a)` are all refused (BUG-1039 closed the direct
+  arithmetic spellings). Store the DATA, not the address.
+
+<!-- audit: expect-error: integer derived from @ptrtoint of a local -->
+```zer
+usize g;
+u32 main() {
+    u32 l = 5;
+    usize a = @ptrtoint(&l);
+    g = 0 - a;               // COMPILE ERROR — a frame address, laundered
+    return 0;
+}
+```
+
 ---
 
 ### @ptrcast(*T, ptr)
@@ -2274,6 +2304,26 @@ Returns the size of type T in bytes as usize. Like C's sizeof.
 **EXAMPLE**
 ```zer
 usize s = @size(Task);     // e.g., 12
+```
+
+**NOTES**
+- The operand may be a type name, a `uN`/`iN` spelling, or a VARIABLE — for a
+  variable it is the size of the variable's type (BUG-1038: `@size(x)` used to
+  be spelled `sizeof(struct x)` and `@size(u21)` was an undefined identifier).
+  A `uN` reports its CARRIER: `@size(u21)` is 4, `@size(u3)` is 1.
+
+```zer
+struct Job { u32 id; u64 pad; }
+u32 main() {
+    u21 x = 5;
+    Job t;
+    usize a = @size(Job);    // 16
+    usize b = @size(t);      // 16 — a variable: the size of its type
+    usize c = @size(u21);    // 4  — the carrier of a uN
+    usize d = @size(x);      // 4
+    if (a != b || c != 4 || d != 4) { return 1; }
+    return 0;
+}
 ```
 
 ---
@@ -3575,6 +3625,20 @@ u32 main() {
 }
 ```
 
+**WHOLE-PROGRAM CHECKS**
+The rules that need to see the whole program run over EVERY module, not just
+the main file (BUG-1037): the per-statement deadlock check on `shared` structs,
+`--stack-limit` (an imported function's frame counts in main's chain), the
+Arena / Barrier "never initialised" check (an arena declared and used in a
+module may receive its backing store in main), and `*opaque` call-site
+provenance. A container global (`Pool`, `Ring`, `Slab`, `Arena`) declared in a
+module is addressable from its importers like any other global — `scratch =
+Arena.over(mem);` in main for a module's `Arena scratch;` compiles (BUG-1040).
+
+Known limit: two modules declaring the same NON-static global name resolve to
+whichever was registered first inside the checker — see `docs/limitations.md`.
+Make such globals `static`, or give them distinct names.
+
 **QUALIFIED CALLS**
 Both unqualified and module-qualified calls work:
 ```zer
@@ -4235,6 +4299,36 @@ u32 main() {
 
   The init is the exception, and only because it genuinely runs once before the
   loop exists, so the pre-loop range is the right one there.
+
+**The LOWER bound of a counter is trusted only while the counter is monotone.**
+`for (i32 i = 2; i < 4; ...)` proves `i >= 2` only if the step is the counter's
+sole writer and is a non-negative constant increment (`i += C`, `i = i + C`,
+`i = C + i`). A body that writes the counter, or a decrementing step, drops the
+lower bound to "unknown" and the index is guarded (BUG-1034 — before this the
+range stayed `[2,3]` while `i` went negative, and the store landed BELOW the
+array). An UNSIGNED counter is unaffected: its minimum is 0 by type. The upper
+bound never depends on this — the condition is re-tested before every body entry.
+
+```zer
+u32 main() {
+    u32[4] a;
+    u32 n = 0;
+    // a SIGNED counter the body LOWERS: i = 2, then -2, -6 ... — [2,3] is not
+    // true any more, so a[i] is guarded (warning + auto-guard, returns early)
+    for (i32 i = 2; i < 4; i += 1) { a[i] = 1; i -= 5; n += 1; if (n > 3) { break; } }
+    // only a non-negative constant step writes the counter: proven, no code
+    for (i32 j = 0; j < 4; j = j + 1) { a[j] = 2; }
+    return 0;
+}
+```
+
+**A `return` in an `orelse { ... }` block counts wherever the block sits** —
+in a statement, or in a CONDITION (`if`, `while`, the `switch` subject, the for
+init/cond/step, an `await` condition, a `spawn` argument). The callee's
+return-range summary unions it in, so `arr[pick(k)]` keeps its check when
+`pick` can return 9 from inside `if ((mb(x) orelse { return 9; }) > 0)`
+(BUG-1035 — the condition positions were skipped and the index was emitted
+with no check at all).
 
 ### A negative literal in an unsigned destination
 

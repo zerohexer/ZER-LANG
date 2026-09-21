@@ -53,6 +53,40 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — two modules declaring the same NON-static global name resolve to the first-registered symbol in the checker (2026-09-21, MEDIUM — wrong-type resolution, loud today)
+
+**Symptom.** `pool_twin_a.zer` and `pool_twin_b.zer` each declare `Pool(ItemX, 4) items;`
+(different element types); inside module b, `?Handle(ItemB) h = items.alloc();` is refused
+with "cannot initialize 'h' of type '?Handle(ItemB)' with '?Handle(ItemA)'" — module b's
+`items` resolved to module a's. The same happens for any non-static global: the raw name is
+registered once per module into the ONE global scope (`register_decl`), so a raw lookup
+returns whichever module registered first. Static globals are re-registered into the
+module's own scope by `checker_push_module_scope` and are correct.
+
+**Why it matters more now.** BUG-1040 made the EMITTER spell container globals with their
+module prefix, so the emitted C would be right — the checker is the remaining wrong layer.
+Loud today (a type error), but two modules with same-named globals of the SAME type would
+silently type-check against the wrong instance's VRP/handle state.
+
+**Fix sketch.** Re-register every module global (not only statics) into the module scope in
+`checker_push_module_scope`, mirroring what it does for statics, and make the emitter's
+BUG-229 mangled-key fallback the only global-scope route. Measure with `test_modules`
+(`gcoll`, `collision_test`, `static_coll` are the existing collision tests).
+
+---
+
+## OPEN — AST-path container-method receivers are not module-prefixed (2026-09-21, LOW — reachable only from a global initializer or a labelled function's defer body)
+
+BUG-1040 prefixed the IR-path receiver (`emit_builtin_inline`) and the declaration arms. The
+AST emitter's arena / pool / slab method arms (`emit_expr` NODE_CALL, `aname` / `sname`)
+still spell the raw name. That path runs for global initializers (where only `Arena.over`
+— no receiver — is legal) and for defer bodies in functions WITH a label. A module function
+with a label whose defer body calls `pool.free(h)` would emit the bare name. Fix: the same
+local-vs-global mangling as the IR receiver; the AST path has no `IRFunc`, so the local
+check must use the checker's scope instead.
+
+---
+
 ## OPEN — one integer literal has TWO renderings in the emitted C (2026-09-15, LOW — consistency residual of BUG-1018)
 
 **Symptom.** The same source expression is emitted with different C types depending on

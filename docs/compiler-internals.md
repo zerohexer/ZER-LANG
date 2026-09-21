@@ -13786,3 +13786,73 @@ call-result sink must use this helper, not re-inline the predicate.** The litera
 compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape analysis
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
+
+
+## 2026-09-21 session — whole-program post passes, the for-loop lower bound, and module container globals (BUG-1034..1040)
+
+**Post passes are whole-program now (BUG-1037).** `checker_post_passes_files(Checker *,
+const CheckerFile *files, int n)` (checker.h) is the entry point; `zerc_main.c` builds the
+array from the modules in topological order (dependencies first, main LAST) with each
+module's `ast / file_name / source / module / module_len`. Inside:
+
+- per-file passes run under `ZER_ENTER_FILE(i)` (switches `c->file_name`, `c->source`,
+  `c->current_module`) so a diagnostic names the right file and echoes the right line:
+  `check_call_provenance` (every decl of every file) and `check_lock_ordering`;
+- whole-program passes run once: `check_interrupt_safety` / `check_atomic_cell_safety`
+  (global state, unchanged), `check_stack_depth_files` (frames from EVERY file; ISR
+  detection via `files_declare_isr` across all of them; frames are keyed by NAME, so two
+  modules' same-named functions share one frame whose size is the SUM — conservative), and
+  `check_builtin_init_files` (ONE `ZerInitSet` over every file — an arena declared and
+  allocated from in a module and backed in main is initialised; each entry remembers its
+  declaring file for the diagnostic).
+- `checker_post_passes(c, file)` is the one-file wrapper, kept for `checker_check` (the
+  C unit tests / LSP path).
+
+Add a new post pass INSIDE `checker_post_passes_files`, never as a second call in the driver.
+
+**The for-loop lower bound (BUG-1034).** In `case NODE_FOR`, the counter's `[init,
+bound-1]` push is now gated: `lo_sound` = `!ast_name_mutated_or_addrd(body, counter)` and
+the step is either not a writer of the counter or a non-negative constant increment
+(`i += C`, `i = i + C`, `i = C + i`, `eval_const_expr(C) >= 0`). Otherwise the seed is
+`INT64_MIN` (unsigned counters clamp to 0 in `push_var_range`, so only a signed counter that
+is really lowered loses precision). `ast_name_mutated_or_addrd` (zercheck_ir.c, the Level-B
+guard-stability walker) is exported through checker.h for this — it is the one exhaustive
+no-default "is this name written or address-taken anywhere in here?" walk in the tree; do
+not write another.
+
+**`find_return_range` reaches every expression position (BUG-1035).**
+`scan_expr_orelse_returns` is now called on the if / while / do-while condition, the for
+init (through `find_return_range`, since it may be a statement) / cond / step, the switch
+subject, the await condition and each spawn argument, and it descends `NODE_ASSIGN`. The
+rule that keeps it sound is unchanged: a buried return with no derivable range makes the
+whole summary give up.
+
+**FuncProps sees the universal builtins (BUG-1036).** `scan_func_props`'s NODE_CALL arm
+recognises `alloc` / `free` with a bare NODE_IDENT callee and no function Symbol — the same
+by-name recognition `scan_frame` uses — as `can_alloc` + `has_direct_alloc`. `alloc(T)` on
+a struct was already caught because the checker rewrites it to the `T.alloc_ptr()` method
+form; `alloc(T, n)` and `free(slice)` are not rewritten.
+
+**`@size` operand (BUG-1038).** The checker resolves a `uN`/`iN` ident operand as the type
+it names (`zer_is_intn_type_name` → a synthesised `TYNODE_NAMED` → `resolve_type`) and
+`checker_set_type`s it on the ident; both emitter `@size` arms (AST ~3690, IR ~8340) read
+`checker_get_type(args[0])` FIRST and `emit_type` it — a variable's size is its type's.
+The old name-based `struct <name>` fallback is still there for anything the checker did not
+type.
+
+**Address-int arithmetic at the assignment sink (BUG-1039).** The BUG-995 arm in
+`NODE_ASSIGN` now has an `else if` for a non-ident, non-call root: `expr_touches_local_derived`
+on the whole value (the same walker the var-decl sink uses to taint `usize b = a + 1`).
+
+**Module container globals (BUG-1040).** `emit_module_global_name(e, name, len)` spells
+`mod__name` inside a module and is used by the Pool / Ring / Arena / Slab declaration arms
+of `emit_global_var_inner`. `emit_builtin_inline` (the IR builtin-method emitter) re-spells
+its receiver `on/ol` by the ident emitter's rule (a local of `func` keeps its name; a global
+with `module_prefix` gets `current_module` inside a module or its own prefix from main; an
+unknown name inside a module gets `current_module`). `emit_alloc_sym_cname(e, sym)` spells
+an allocator found by `find_unique_allocator` at the three Handle auto-deref sites — the
+lookup can return either of BUG-233's two Symbols (raw or mangled key), so the prefix is
+added only when the name does not already carry it. The arena `alloc` / `alloc_slice`
+element is spelled with `emit_type` (module-prefixed), not a hand-rolled `struct <name>`.
+Residuals: limitations.md "AST-path container-method receivers" and "same NON-static global
+name in two modules".

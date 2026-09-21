@@ -1,0 +1,8 @@
+// BUG-1037: the per-statement deadlock check ran on the MAIN module only. This
+// function — one statement touching two different shared structs — was accepted
+// when it lived in an imported module and rejected when it lived in main.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A ga;
+B gb;
+void bad() { ga.x = gb.y; }

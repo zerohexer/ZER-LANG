@@ -8906,6 +8906,27 @@ static Type *check_expr(Checker *c, Node *node) {
                         "the address dangles when the function returns "
                         "(store the DATA, not the address)");
                 }
+            } else if (iroot && iroot->kind != NODE_IDENT && iroot->kind != NODE_CALL &&
+                       expr_touches_local_derived(c, node->assign.value)) {
+                /* BUG-1039 (2026-09-21): the same launder by ARITHMETIC. The bare
+                 * ident (`g = a`) is refused by the local-derived store rule above,
+                 * and the VAR-DECL sink taints `usize b = a + 1` so `g = b` is
+                 * refused — but the DIRECT store of the composed expression
+                 * (`g = a + 0`, `g = 0 - a`, `g = -a`, `g = (usize)a`, `g = a * 1`)
+                 * had no arm: the store rule peels FIELD/INDEX to a root and a
+                 * BINARY/UNARY/TYPECAST root is not an ident, so it fell through.
+                 * One question, answered by the SAME walker the var-decl taint uses
+                 * (expr_touches_local_derived), at the sink that was missing it. */
+                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
+                if (tgt_global || tgt_param) {
+                    checker_error(c, node->loc.line,
+                        "cannot store an integer derived from @ptrtoint of a local in "
+                        "%s%s%.*s' — the address dangles when the function returns "
+                        "(store the DATA, not the address)",
+                        tgt_param ? "pointer parameter '" : "global/static variable '",
+                        "", tsym ? (int)tsym->name_len : 0, tsym ? tsym->name : "");
+                }
             }
         }
 
@@ -12305,6 +12326,27 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* last arg is a field name — don't look up as variable */
                 continue;
             }
+            /* BUG-1038 (2026-09-21): `@size(u21)`. A uN/iN spelling is an IDENT,
+             * not a keyword, so the parser hands it here as an expression and it
+             * died as "undefined identifier 'u21'" — while `u21` works as a
+             * declaration type everywhere else. Resolve it as the TYPE it names
+             * (the same mapping resolve_type applies to a declaration) and record
+             * it on the node, which is what the @size arm and both emitters read. */
+            if (i == 0 && nlen == 4 && memcmp(name, "size", 4) == 0 &&
+                node->intrinsic.args[0]->kind == NODE_IDENT &&
+                zer_is_intn_type_name(node->intrinsic.args[0]->ident.name,
+                                      (uint32_t)node->intrinsic.args[0]->ident.name_len,
+                                      NULL, NULL)) {
+                TypeNode *tn = (TypeNode *)arena_alloc(c->arena, sizeof(TypeNode));
+                memset(tn, 0, sizeof(TypeNode));
+                tn->kind = TYNODE_NAMED;
+                tn->named.name = node->intrinsic.args[0]->ident.name;
+                tn->named.name_len = node->intrinsic.args[0]->ident.name_len;
+                tn->loc = node->loc;
+                Type *it = resolve_type(c, tn);
+                if (it) checker_set_type(c, node->intrinsic.args[0], it);
+                continue;
+            }
             bool bless = (atomic_intr && i == 0);
             bool saved_atomic_arg = c->in_atomic_intrinsic_arg;
             if (bless) c->in_atomic_intrinsic_arg = true;
@@ -14869,6 +14911,36 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                     }
                 }
                 if (heap_backed) {
+                    parent_sym->props.can_alloc = true;
+                    parent_sym->props.has_direct_alloc = true;
+                }
+            }
+        }
+
+        /* BUG-1036 (2026-09-21): the UNIVERSAL builtins `alloc(T, n)` and
+         * `free(slice)` have a bare NODE_IDENT callee and NO Symbol (they are
+         * intercepted by name, not declared), so neither the method arm above
+         * (NODE_FIELD receiver) nor the transitive arm below (needs a function
+         * Symbol) ever saw them. `alloc(T)` on a single struct is rewritten to
+         * the `T.alloc_ptr()` method form and WAS caught; the slice form was
+         * not, so
+         *     void helper() { ?[*]u8 b = alloc(u8, 16); ... free(bb); }
+         *     interrupt IRQ1 { helper(); }          // accepted
+         *     u32 main()     { @critical { helper(); } ... }   // accepted
+         * while the DIRECT spelling in the ISR / @critical body was rejected one
+         * line away. calloc under a disabled-interrupt section or in an ISR is
+         * the deadlock those bans exist for. Recognised exactly as the
+         * stack-depth scan recognises them (by name, no Symbol). has_direct_alloc
+         * so the function holding the call reports it at the call (check_isr_ban)
+         * and its callers report the transitive form. */
+        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
+            const char *ucn = node->call.callee->ident.name;
+            uint32_t ucl = (uint32_t)node->call.callee->ident.name_len;
+            bool universal = (ucl == 5 && memcmp(ucn, "alloc", 5) == 0) ||
+                             (ucl == 4 && memcmp(ucn, "free", 4) == 0);
+            if (universal) {
+                Symbol *usym = scope_lookup(c->global_scope, ucn, ucl);
+                if (!usym || !usym->is_function) {
                     parent_sym->props.can_alloc = true;
                     parent_sym->props.has_direct_alloc = true;
                 }
@@ -17658,6 +17730,60 @@ static void check_stmt(Checker *c, Node *node) {
              * invariant and loses no precision — only a signed loop var widens,
              * which is exactly the unsound case. */
             if (!init_known) init_val = INT64_MIN;
+            /* BUG-1034 (2026-09-21): the LOWER bound [init, ...] assumed the
+             * counter only ever goes UP. Nothing checked that. Two spellings
+             * lowered it below `init` and kept the proven range:
+             *     for (i32 i = 2; i < 4; i += 1) { arr[i] = 7; i -= 5; }
+             *     for (i32 i = 2; i < 4; i -= 1) { arr[i] = 7; }
+             * Both proved `arr[i]` in [2,3] on a u32[4], emitted a bare store,
+             * and wrote at index -2 / -1 (ASan stack-buffer-underflow, exit 0).
+             * The body-write widening above runs BEFORE this push and is
+             * overridden by it; the B7 address-taken widening after it covers
+             * only `&i`. The UPPER bound is sound regardless (the condition is
+             * re-tested before every body entry); only the lower bound rests on
+             * monotonicity, so that is the one fact gated here: the counter is
+             * written by the STEP alone, and the step is `i += C` / `i = i + C`
+             * with a constant C >= 0. Otherwise seed INT64_MIN exactly as the
+             * non-const init does — push_var_range clamps an UNSIGNED counter to
+             * 0, so only a signed counter loses precision, and only when it is
+             * really being lowered. */
+            if (loop_var && bound_val != CONST_EVAL_FAIL) {
+                bool lo_sound = !ast_name_mutated_or_addrd(node->for_stmt.body,
+                                                           loop_var, loop_var_len);
+                Node *st = node->for_stmt.step;
+                if (lo_sound && st && ast_name_mutated_or_addrd(st, loop_var, loop_var_len)) {
+                    bool nonneg_inc = false;
+                    if (st->kind == NODE_ASSIGN && st->assign.target &&
+                        st->assign.target->kind == NODE_IDENT &&
+                        (uint32_t)st->assign.target->ident.name_len == loop_var_len &&
+                        memcmp(st->assign.target->ident.name, loop_var, loop_var_len) == 0) {
+                        Node *inc = NULL;
+                        if (st->assign.op == TOK_PLUSEQ) {
+                            inc = st->assign.value;
+                        } else if (st->assign.op == TOK_EQ && st->assign.value &&
+                                   st->assign.value->kind == NODE_BINARY &&
+                                   st->assign.value->binary.op == TOK_PLUS) {
+                            /* `i = i + C` or `i = C + i` */
+                            Node *l = st->assign.value->binary.left;
+                            Node *r = st->assign.value->binary.right;
+                            bool l_is = l && l->kind == NODE_IDENT &&
+                                (uint32_t)l->ident.name_len == loop_var_len &&
+                                memcmp(l->ident.name, loop_var, loop_var_len) == 0;
+                            bool r_is = r && r->kind == NODE_IDENT &&
+                                (uint32_t)r->ident.name_len == loop_var_len &&
+                                memcmp(r->ident.name, loop_var, loop_var_len) == 0;
+                            if (l_is && !r_is) inc = r;
+                            else if (r_is && !l_is) inc = l;
+                        }
+                        if (inc) {
+                            int64_t cinc = eval_const_expr(inc);
+                            nonneg_inc = cinc != CONST_EVAL_FAIL && cinc >= 0;
+                        }
+                    }
+                    lo_sound = nonneg_inc;
+                }
+                if (!lo_sound) init_val = INT64_MIN;
+            }
 
             if (loop_var && bound_val != CONST_EVAL_FAIL) {
                 if (fop == TOK_LT) {
@@ -24445,28 +24571,56 @@ static uint32_t compute_max_depth(Checker *c, struct StackFrame *frame,
     return frame->frame_size + max_child;
 }
 
-/* Build call graph and report stack depth + recursion warnings */
-static void check_stack_depth(Checker *c, Node *file_node) {
-    if (!file_node || file_node->kind != NODE_FILE) return;
-    /* build frames for all functions and interrupts */
-    for (int i = 0; i < file_node->file.decl_count; i++) {
-        Node *decl = file_node->file.decls[i];
-        if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body && !decl->func_decl.is_comptime) {
-            struct StackFrame *f = find_or_add_frame(c, decl->func_decl.name,
-                (uint32_t)decl->func_decl.name_len);
-            /* add param sizes */
-            for (int p = 0; p < decl->func_decl.param_count; p++) {
-                Type *pt = NULL;
-                if (decl->func_decl.params[p].type)
-                    pt = typemap_get(c, (Node *)decl->func_decl.params[p].type);
-                f->frame_size += pt ? estimate_type_size(pt) : 4;
-            }
-            scan_frame(c, f, decl->func_decl.body);
+/* BUG-1037: is `name` an interrupt handler declared in ANY file of the program? */
+static bool files_declare_isr(const CheckerFile *files, int count,
+                              const char *name, uint32_t len) {
+    for (int fi = 0; fi < count; fi++) {
+        Node *fn = files[fi].ast;
+        if (!fn || fn->kind != NODE_FILE) continue;
+        for (int d = 0; d < fn->file.decl_count; d++) {
+            Node *dn = fn->file.decls[d];
+            if (dn->kind == NODE_INTERRUPT && dn->interrupt.name_len == len &&
+                memcmp(dn->interrupt.name, name, len) == 0) return true;
         }
-        if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
-            struct StackFrame *f = find_or_add_frame(c, decl->interrupt.name,
-                (uint32_t)decl->interrupt.name_len);
-            scan_frame(c, f, decl->interrupt.body);
+    }
+    return false;
+}
+
+/* Build call graph and report stack depth + recursion warnings.
+ *
+ * BUG-1037 (2026-09-21): over EVERY file of the program. This used to take the
+ * MAIN module's AST only, so an imported function had no StackFrame at all: the
+ * callee lookup in compute_max_depth found nothing and added 0, and
+ *     import modstk;               // u32 deep(u32 n) { u8[1000] buf; ... }
+ *     u32 main() { return deep(1); }
+ * passed `--stack-limit 500` — the direction that AFFIRMS a budget the target
+ * cannot honour, the exact failure BUG-836 records for the ISR sum. Frames are
+ * keyed by function NAME, so two modules each defining `init` share one frame
+ * whose size is the SUM of both — an over-estimate, the conservative side. */
+static void check_stack_depth_files(Checker *c, const CheckerFile *files, int count) {
+    /* build frames for all functions and interrupts, in every file */
+    for (int fi = 0; fi < count; fi++) {
+        Node *file_node = files[fi].ast;
+        if (!file_node || file_node->kind != NODE_FILE) continue;
+        for (int i = 0; i < file_node->file.decl_count; i++) {
+            Node *decl = file_node->file.decls[i];
+            if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body && !decl->func_decl.is_comptime) {
+                struct StackFrame *f = find_or_add_frame(c, decl->func_decl.name,
+                    (uint32_t)decl->func_decl.name_len);
+                /* add param sizes */
+                for (int p = 0; p < decl->func_decl.param_count; p++) {
+                    Type *pt = NULL;
+                    if (decl->func_decl.params[p].type)
+                        pt = typemap_get(c, (Node *)decl->func_decl.params[p].type);
+                    f->frame_size += pt ? estimate_type_size(pt) : 4;
+                }
+                scan_frame(c, f, decl->func_decl.body);
+            }
+            if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
+                struct StackFrame *f = find_or_add_frame(c, decl->interrupt.name,
+                    (uint32_t)decl->interrupt.name_len);
+                scan_frame(c, f, decl->interrupt.body);
+            }
         }
     }
     /* compute max depth from main and each interrupt */
@@ -24497,14 +24651,7 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                 if (!f->is_recursive &&
                     zer_stack_frame_valid((int)c->stack_limit, (int)max_depth) == 0) {
                     bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
-                    bool is_isr = false;
-                    for (int d = 0; d < file_node->file.decl_count; d++) {
-                        if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
-                            file_node->file.decls[d]->interrupt.name_len == f->name_len &&
-                            memcmp(file_node->file.decls[d]->interrupt.name, f->name, f->name_len) == 0) {
-                            is_isr = true; break;
-                        }
-                    }
+                    bool is_isr = files_declare_isr(files, count, f->name, f->name_len);
                     if (is_main || is_isr) {
                         checker_error(c, 0,
                             "%s '%.*s' max call chain stack %u bytes exceeds --stack-limit %u",
@@ -24533,7 +24680,7 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                     (int)f->name_len, f->name);
             }
         }
-        
+
         /* BUG-836: every check above measures ONE entry point against the FULL
          * limit, and they are never SUMMED. On bare metal `main` and every ISR
          * share ONE stack: an interrupt frame is pushed ON TOP of whatever main
@@ -24561,13 +24708,7 @@ static void check_stack_depth(Checker *c, Node *file_node) {
                 struct StackFrame *f2 = &c->stack_frames[i];
                 if (f2->is_recursive) continue;
                 bool is_main = (f2->name_len == 4 && memcmp(f2->name, "main", 4) == 0);
-                bool is_isr = false;
-                for (int d = 0; d < file_node->file.decl_count; d++) {
-                    if (file_node->file.decls[d]->kind == NODE_INTERRUPT &&
-                        file_node->file.decls[d]->interrupt.name_len == f2->name_len &&
-                        memcmp(file_node->file.decls[d]->interrupt.name,
-                               f2->name, f2->name_len) == 0) { is_isr = true; break; }
-                }
+                bool is_isr = files_declare_isr(files, count, f2->name, f2->name_len);
                 if (!is_main && !is_isr) continue;
                 memset(visited, 0, c->stack_frame_count * sizeof(bool));
                 uint32_t d2 = compute_max_depth(c, f2, visited, 0);
@@ -24678,6 +24819,12 @@ static bool scan_expr_orelse_returns(Checker *c, Node *e, int64_t *out_min,
     }
     if (e->kind == NODE_TYPECAST)
         return scan_expr_orelse_returns(c, e->typecast.expr, out_min, out_max, found);
+    /* BUG-1035: an assignment EXPRESSION inside a condition —
+     * `if ((x = mb() orelse { return 9; }) > 0)` */
+    if (e->kind == NODE_ASSIGN) {
+        if (!scan_expr_orelse_returns(c, e->assign.target, out_min, out_max, found)) return false;
+        return scan_expr_orelse_returns(c, e->assign.value, out_min, out_max, found);
+    }
     if (e->kind == NODE_INTRINSIC) {
         for (int i = 0; i < e->intrinsic.arg_count; i++)
             if (!scan_expr_orelse_returns(c, e->intrinsic.args[i], out_min, out_max, found)) return false;
@@ -24791,6 +24938,21 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         return true;
     }
     if (node->kind == NODE_IF) {
+        /* BUG-1035 (2026-09-21): the CONDITION is an expression position too, and
+         * an orelse-BLOCK inside it can `return`:
+         *     u32 pick(u32 x) {
+         *         if ((mb(x) orelse { return 9; }) > 0) { return x % 4; }
+         *         return 0;
+         *     }
+         * The 9 was never unioned in — this arm walked only the two BODIES — so the
+         * summary read [0,3] and `arr[pick(k)] = 1` on a u32[4] was emitted with no
+         * check, no guard, no warning (ASan global-buffer-overflow at index 9). Same
+         * class as B9 (the statement positions), at the condition positions: if,
+         * while / do-while, the for init/cond/step, the switch subject, the await
+         * condition and spawn arguments are all scanned now. Giving up (false) when
+         * a buried return has no derivable range keeps this conservative. */
+        if (!scan_expr_orelse_returns(c, node->if_stmt.cond, out_min, out_max, found))
+            return false;
         /* returns inside either arm are branch-local — in_branch=true (their
          * VarRange snapshot at body-end does NOT reflect the arm's guard). */
         if (!find_return_range(c, node->if_stmt.then_body, out_min, out_max, found, true))
@@ -24798,6 +24960,8 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
         return find_return_range(c, node->if_stmt.else_body, out_min, out_max, found, true);
     }
     if (node->kind == NODE_SWITCH) {
+        if (!scan_expr_orelse_returns(c, node->switch_stmt.expr, out_min, out_max, found))
+            return false;   /* BUG-1035 */
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             if (!find_return_range(c, node->switch_stmt.arms[i].body, out_min, out_max, found, true))
                 return false;
@@ -24810,8 +24974,29 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
          * let a `return` inside a do-while body escape the scan, so the return
          * range UNDER-approximated and call sites elided the bounds check on
          * `arr[f()]` — a silent OOB. Loop-body returns are branch-local (true). */
+        /* BUG-1035: the loop's own expression positions. The for INIT may be a
+         * statement (var-decl) or an expression; find_return_range handles both
+         * (its var-decl / assign arms scan a buried orelse). */
+        if (node->kind == NODE_FOR) {
+            if (!find_return_range(c, node->for_stmt.init, out_min, out_max, found, in_branch))
+                return false;
+            if (!scan_expr_orelse_returns(c, node->for_stmt.cond, out_min, out_max, found))
+                return false;
+            if (!scan_expr_orelse_returns(c, node->for_stmt.step, out_min, out_max, found))
+                return false;
+        } else if (!scan_expr_orelse_returns(c, node->while_stmt.cond, out_min, out_max, found)) {
+            return false;
+        }
         Node *body = (node->kind == NODE_FOR) ? node->for_stmt.body : node->while_stmt.body;
         return find_return_range(c, body, out_min, out_max, found, true);
+    }
+    if (node->kind == NODE_AWAIT)   /* BUG-1035: `await (mb() orelse { return 9; }) > 0;` */
+        return scan_expr_orelse_returns(c, node->await_stmt.cond, out_min, out_max, found);
+    if (node->kind == NODE_SPAWN) { /* BUG-1035: a spawn ARGUMENT is parent-evaluated */
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            if (!scan_expr_orelse_returns(c, node->spawn_stmt.args[i], out_min, out_max, found))
+                return false;
+        return true;
     }
     if (node->kind == NODE_CRITICAL) {
         return find_return_range(c, node->critical.body, out_min, out_max, found, true);
@@ -26731,6 +26916,7 @@ typedef struct {
     const char *name; uint32_t name_len;
     ZerInitKind kind;
     int decl_line;
+    const char *file; /* BUG-1037: the declaring file, for the diagnostic */
     bool used;        /* alloc() / @barrier_wait() seen */
     bool inited;      /* .over(...) assigned / @barrier_init() seen */
 } ZerInitUse;
@@ -26748,7 +26934,8 @@ static ZerInitUse *zbi_find(ZerInitSet *st, const char *n, uint32_t l) {
         if (st->v[i].name_len == l && memcmp(st->v[i].name, n, l) == 0) return &st->v[i];
     return NULL;
 }
-static void zbi_add(ZerInitSet *st, const char *n, uint32_t l, ZerInitKind k, int line) {
+static void zbi_add(ZerInitSet *st, const char *n, uint32_t l, ZerInitKind k, int line,
+                    const char *file) {
     if (zbi_find(st, n, l)) { /* name collision -> treat as initialised */
         zbi_find(st, n, l)->inited = true; return;
     }
@@ -26761,7 +26948,7 @@ static void zbi_add(ZerInitSet *st, const char *n, uint32_t l, ZerInitKind k, in
         st->v = nv; st->cap = nc;
     }
     ZerInitUse *e = &st->v[st->n++];
-    e->name = n; e->name_len = l; e->kind = k; e->decl_line = line;
+    e->name = n; e->name_len = l; e->kind = k; e->decl_line = line; e->file = file;
     e->used = false; e->inited = false;
 }
 static void zbi_mark(ZerInitSet *st, Node *e, bool used, bool inited) {
@@ -26833,9 +27020,9 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
         Type *t = n->var_decl.type ? resolve_type(c, n->var_decl.type) : NULL;
         Type *u = t ? type_unwrap_distinct(t) : NULL;
         if (u && type_dispatch_kind(u) == TYPE_ARENA)
-            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_ARENA, n->loc.line);
+            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_ARENA, n->loc.line, c->file_name);
         else if (u && type_dispatch_kind(u) == TYPE_BARRIER)
-            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_BARRIER, n->loc.line);
+            zbi_add(st, n->var_decl.name, (uint32_t)n->var_decl.name_len, ZBI_BARRIER, n->loc.line, c->file_name);
         /* `Arena a = Arena.over(buf);` initialises at the declaration */
         if (n->var_decl.init) zbi_mark(st, NULL, false, false);
         if (u && type_dispatch_kind(u) == TYPE_ARENA && n->var_decl.init) {
@@ -26891,12 +27078,23 @@ static void zbi_scan(Checker *c, ZerInitSet *st, Node *n, int depth) {
     zbi_scan_children(c, st, n, depth);
 }
 
-static void check_builtin_init(Checker *c, Node *file_node) {
+/* BUG-1037: ONE scan over every file, ONE set — an arena declared and used in an
+ * imported module and given its backing store in main (or the reverse) is the
+ * whole-program answer this pass was always meant to give. Scanning the main
+ * module alone (as before) never saw an imported declaration at all; scanning
+ * each module separately would false-positive the cross-module init. */
+static void check_builtin_init_files(Checker *c, const CheckerFile *files, int count) {
     ZerInitSet st; zbi_init(&st);
-    zbi_scan(c, &st, file_node, 0);
+    const char *sv_fn = c->file_name;
+    for (int fi = 0; fi < count; fi++) {
+        if (!files[fi].ast) continue;
+        c->file_name = files[fi].file_name ? files[fi].file_name : sv_fn;
+        zbi_scan(c, &st, files[fi].ast, 0);
+    }
     for (int i = 0; i < st.n; i++) {
         ZerInitUse *e = &st.v[i];
         if (!e->used || e->inited) continue;
+        c->file_name = e->file ? e->file : sv_fn;
         if (e->kind == ZBI_ARENA)
             checker_error(c, e->decl_line,
                 "arena '%.*s' is allocated from but never given a backing store, so "
@@ -26910,36 +27108,75 @@ static void check_builtin_init(Checker *c, Node *file_node) {
                 "happens and it reports SUCCESS. Add '@barrier_init(%.*s, N);'",
                 (int)e->name_len, e->name, (int)e->name_len, e->name);
     }
+    c->file_name = sv_fn;
     zbi_free(&st);
 }
 
-void checker_post_passes(Checker *c, Node *file_node) {
-    if (!file_node || file_node->kind != NODE_FILE) return;
+void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) {
+    if (!files || count <= 0) return;
+    /* The main module's context is what the caller left in the checker; every
+     * per-file pass switches to its file so a diagnostic names the right file and
+     * echoes the right source line, and the whole-program passes run under main's. */
+    const char *sv_fn = c->file_name, *sv_src = c->source, *sv_mod = c->current_module;
+    uint32_t sv_ml = c->current_module_len;
+    #define ZER_ENTER_FILE(i) do { \
+        c->file_name = files[i].file_name ? files[i].file_name : sv_fn; \
+        c->source = files[i].source; \
+        c->current_module = files[i].module; \
+        c->current_module_len = files[i].module_len; } while (0)
+    #define ZER_LEAVE_FILE() do { c->file_name = sv_fn; c->source = sv_src; \
+        c->current_module = sv_mod; c->current_module_len = sv_ml; } while (0)
 
-    /* Whole-program *opaque param provenance validation */
+    /* Whole-program *opaque param provenance validation — every call site, in
+     * every module (BUG-1037: was the main module's only). */
     if (c->param_expect_count > 0) {
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            check_call_provenance(c, file_node->file.decls[i]);
+        for (int fi = 0; fi < count; fi++) {
+            Node *fn = files[fi].ast;
+            if (!fn || fn->kind != NODE_FILE) continue;
+            ZER_ENTER_FILE(fi);
+            for (int i = 0; i < fn->file.decl_count; i++)
+                check_call_provenance(c, fn->file.decls[i]);
         }
+        ZER_LEAVE_FILE();
     }
 
-    /* Interrupt safety — validate shared globals */
+    /* Interrupt safety — validate shared globals (global state, collected while
+     * every body was checked) */
     if (c->isr_global_count > 0) {
         check_interrupt_safety(c);
     }
     /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
     check_atomic_cell_safety(c);
 
-    /* Stack depth analysis — detect recursion */
-    check_stack_depth(c, file_node);
+    /* Stack depth analysis — detect recursion; --stack-limit over the WHOLE
+     * program (BUG-1037: imported functions had no frame before) */
+    check_stack_depth_files(c, files, count);
 
-    /* Deadlock detection — lock ordering on shared structs.
-     * Within any block, shared struct accesses must be in ascending type_id order.
-     * If A (type_id=1) is accessed, then B (type_id=2), then A again after B → OK.
-     * But if B is accessed first, then A → "potential deadlock: lock ordering violation." */
-    check_lock_ordering(c, file_node);
+    /* Deadlock detection — lock ordering on shared structs, in every module.
+     * BUG-1037 (2026-09-21): ran on the main module ONLY, so
+     *     // modx.zer:  void bad() { ga.x = gb.y; }     // A and B both shared
+     *     import modx;  u32 main() { bad(); return 0; }
+     * compiled clean while the same function in main.zer was rejected. The
+     * emitter then locked A and read B unlocked — the cross-struct race/deadlock
+     * this pass exists to refuse, reachable by moving the function to a module. */
+    for (int fi = 0; fi < count; fi++) {
+        if (!files[fi].ast) continue;
+        ZER_ENTER_FILE(fi);
+        check_lock_ordering(c, files[fi].ast);
+    }
+    ZER_LEAVE_FILE();
 
     /* BUG-848/849: Arena + Barrier need an initialisation their TYPE does not
      * state. Deferred to here because it legitimately follows the use. */
-    check_builtin_init(c, file_node);
+    check_builtin_init_files(c, files, count);
+    ZER_LEAVE_FILE();
+    #undef ZER_ENTER_FILE
+    #undef ZER_LEAVE_FILE
+}
+
+void checker_post_passes(Checker *c, Node *file_node) {
+    if (!file_node || file_node->kind != NODE_FILE) return;
+    CheckerFile one = { file_node, c->file_name, c->source, c->current_module,
+                        c->current_module_len };
+    checker_post_passes_files(c, &one, 1);
 }

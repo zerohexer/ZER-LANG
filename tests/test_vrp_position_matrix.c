@@ -141,12 +141,15 @@ typedef enum {
     VP_GOTO_BACK,         /* backward goto re-enters with a changed index */
     VP_SWITCH_ARM,        /* switch arm under a loop-widened index */
     VP_ADDR_TAKEN,        /* B7 — index mutated through `&k` in the body */
+    VP_FOR_BODY_LOWERED,  /* BUG-1034 — a SIGNED counter lowered in the body */
+    VP_FOR_STEP_DEC,      /* BUG-1034 — a SIGNED counter with a DECREMENTING step */
 
     /* ---- PROVEN: the construct's own bound really does prove it ---- */
     VP_FOR_BODY_OK,       /* counter in the body, bounded by the loop condition */
     VP_FOR_STEP_OK,       /* counter in the STEP, bounded by the loop condition */
     VP_WHILE_BODY_OK,     /* counter in a while body, bounded by the condition */
     VP_CONST_OK,          /* a literal index inside the array */
+    VP_FOR_SIGNED_OK,     /* BUG-1034 pin: signed counter, `i = i + 1` step, read-only body */
     VPSCEN_COUNT
 } VPScenario;
 
@@ -157,9 +160,10 @@ static int scenario_is_stale(VPScenario s) {
         case VP_WHILE_COND: case VP_WHILE_BODY:
         case VP_DOWHILE_COND: case VP_DOWHILE_BODY:
         case VP_GOTO_BACK: case VP_SWITCH_ARM: case VP_ADDR_TAKEN:
+        case VP_FOR_BODY_LOWERED: case VP_FOR_STEP_DEC:
             return 1;
         case VP_FOR_BODY_OK: case VP_FOR_STEP_OK:
-        case VP_WHILE_BODY_OK: case VP_CONST_OK:
+        case VP_WHILE_BODY_OK: case VP_CONST_OK: case VP_FOR_SIGNED_OK:
             return 0;
         case VPSCEN_COUNT: break;
     }
@@ -181,10 +185,13 @@ static const char *scen_name(VPScenario s) {
         case VP_GOTO_BACK:         return "goto/back-edge";
         case VP_SWITCH_ARM:        return "switch/arm";
         case VP_ADDR_TAKEN:        return "for/body(&k alias)";
+        case VP_FOR_BODY_LOWERED:  return "for/body(signed counter lowered)";
+        case VP_FOR_STEP_DEC:      return "for/step(signed counter decremented)";
         case VP_FOR_BODY_OK:       return "for/body PROVEN";
         case VP_FOR_STEP_OK:       return "for/step PROVEN";
         case VP_WHILE_BODY_OK:     return "while/body PROVEN";
         case VP_CONST_OK:          return "literal index PROVEN";
+        case VP_FOR_SIGNED_OK:     return "for/body(signed, i = i + 1) PROVEN";
         case VPSCEN_COUNT:         break;
     }
     return "?";
@@ -319,6 +326,40 @@ static void gen(VPScenario s, char *buf, size_t n) {
             "    return t;\n}\n");
         break;
 
+    case VP_FOR_BODY_LOWERED:
+        /* BUG-1034: the lower bound [init, ...] assumed the counter only goes UP.
+         * i = 2, then -3+1 = -2 < 4: a[-2] was written with no check (ASan
+         * stack-buffer-underflow). An UNSIGNED counter is safe here — push_var_range
+         * clamps its minimum to 0 — so the cell is deliberately signed. */
+        snprintf(buf, n,
+            "u32 main() {\n"
+            "    u32[4] a;\n"
+            "    u32 t = 0;\n"
+            "    u32 g = 0;\n"
+            "    for (i32 i = 2; i < 4; i += 1) { t += a[i]; i -= 5; g += 1; if (g > 3) { return t; } }\n"
+            "    return t;\n}\n");
+        break;
+    case VP_FOR_STEP_DEC:
+        /* BUG-1034: the STEP itself lowers the counter: 3, 2, 1, 0, -1 ... */
+        snprintf(buf, n,
+            "u32 main() {\n"
+            "    u32[4] a;\n"
+            "    u32 t = 0;\n"
+            "    u32 g = 0;\n"
+            "    for (i32 i = 3; i < 4; i -= 1) { t += a[i]; g += 1; if (g > 6) { return t; } }\n"
+            "    return t;\n}\n");
+        break;
+    case VP_FOR_SIGNED_OK:
+        /* BUG-1034 precision pin: a signed counter whose only writer is a
+         * non-negative constant increment, spelled `i = i + 1`, keeps its
+         * proven [0,3] and the body read emits nothing. */
+        snprintf(buf, n,
+            "u32 main() {\n"
+            "    u32[4] a;\n"
+            "    u32 s = 0;\n"
+            "    for (i32 i = 0; i < 4; i = i + 1) { s += a[i]; }\n"
+            "    return s;\n}\n");
+        break;
     case VP_FOR_BODY_OK:
         snprintf(buf, n,
             "u32 main() {\n"

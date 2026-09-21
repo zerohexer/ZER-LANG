@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: cannot heap-allocate or free inside @critical block
+// BUG-1036: the @critical sibling of the ISR ban — calloc with interrupts disabled.
+void inner() { ?[*]u32 b = alloc(u32, 8); if (b) |bb| { free(bb); } }
+void helper() { inner(); }
+u32 main() { @critical { helper(); } return 0; }

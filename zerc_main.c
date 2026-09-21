@@ -638,8 +638,26 @@ int main(int argc, char **argv) {
      * so forward-referenced/cross-module/transitive keeps are handled soundly). */
     check_keep_inference(&checker);
 
-    /* Post-passes on main file: stack depth + interrupt safety + lock ordering */
-    checker_post_passes(&checker, main_mod->ast);
+    /* Post-passes over EVERY module (BUG-1037): stack depth, interrupt safety,
+     * lock ordering, *opaque provenance, Arena/Barrier init. Dependencies first,
+     * main last — the order the bodies were checked in. */
+    {
+        CheckerFile *pfiles = (CheckerFile *)calloc((size_t)topo_count, sizeof(CheckerFile));
+        int pn = 0;
+        for (int ti = 0; ti < topo_count; ti++) {
+            int idx = topo_order[ti];
+            Module *m = &cc.modules[idx];
+            if (!m->ast) continue;
+            pfiles[pn].ast = m->ast;
+            pfiles[pn].file_name = m->path;
+            pfiles[pn].source = m->source;
+            pfiles[pn].module = (idx == 0) ? NULL : m->name;
+            pfiles[pn].module_len = (idx == 0) ? 0 : (uint32_t)strlen(m->name);
+            pn++;
+        }
+        checker_post_passes_files(&checker, pfiles, pn);
+        free(pfiles);
+    }
     if (checker.error_count > 0) {
         fprintf(stderr, "error: type check failed\n");
         free(cc.modules);

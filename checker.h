@@ -462,10 +462,28 @@ void checker_register_file(Checker *c, Node *file_node); /* register declaration
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
 void check_keep_inference(Checker *c);
+/* zercheck_ir.c: does any statement in `n` ASSIGN to `name` (any assign op) or take
+ * `&name`? Exhaustive no-default AST walk, conservative (true) on opaque kinds. The
+ * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
+bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */
 void checker_post_passes(Checker *c, Node *file_node); /* stack depth + interrupt safety (after all bodies checked) */
+/* BUG-1037: the whole-program form. One entry per module, dependencies first, the
+ * main module LAST (its context is restored afterwards). The per-file passes
+ * (lock ordering, *opaque call provenance) run on each AST under that file's
+ * name/source so diagnostics point into the right file; the whole-program
+ * passes (stack depth, Arena/Barrier initialisation) see every module at once.
+ * checker_post_passes(c, f) is the one-file wrapper (checker_check / LSP). */
+typedef struct {
+    Node *ast;
+    const char *file_name;
+    const char *source;
+    const char *module;        /* NULL for the main module */
+    uint32_t module_len;
+} CheckerFile;
+void checker_post_passes_files(Checker *c, const CheckerFile *files, int count);
 void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
 void checker_pop_module_scope(Checker *c); /* pop module scope */
 

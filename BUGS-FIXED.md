@@ -5,6 +5,156 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-21 — BUG-1034..1040: a counter that goes DOWN, a return the summary never saw, two whole-program passes that saw one file, and a module's Arena spelled two ways
+
+Audit session: full read of the compiler (parser / checker / ir_lower / zercheck_ir /
+emitter / driver), then probes of every candidate against a from-HEAD baseline build,
+then a harvest of the two live audit branches (`friendly-galileo-1hkj1n` → BUG-1017..1024,
+`loving-davinci-bdorfl` → BUG-1025..1033, renumbered on adoption). The seven below are
+this session's own; each was A/B'd against the baseline (`/tmp/headb/zerc`) before and
+after, and each test was shown to FAIL on the baseline.
+
+### BUG-1034 — the for-loop LOWER bound assumed the counter only ever goes up (SILENT OOB)
+
+**Symptom.** Zero diagnostics, a store BELOW the array, exit 0:
+
+    u32[4] arr;
+    for (i32 i = 2; i < 4; i += 1) { arr[i] = 7; i -= 5; }   // i = 2, then -2, -6 ...
+    for (i32 j = 3; j < 4; j -= 1) { arr[j] = 7; }            // j = 3, 2, 1, 0, -1 ...
+
+ASan: `stack-buffer-underflow ... WRITE of size 4`. Both loops proved `arr[i]` in `[2,3]`
+/ `[3,3]` and emitted a bare store.
+
+**Root cause.** `case NODE_FOR` pushes `[init, bound-1]` for the counter whenever the
+init is a constant. The UPPER bound is sound unconditionally (the condition is re-tested
+before every body entry); the LOWER bound rests on the counter being MONOTONE, and
+nothing checked that: `vrp_invalidate_loop_body_writes` widens the body's writes BEFORE
+the push and is then overridden by it, and the B7 `&i` widening after it covers only the
+address-taken form. A decrementing STEP was never considered at all. An UNSIGNED counter
+was safe by accident — `push_var_range` clamps its minimum to 0 — which is why every
+existing test (all `u32` counters) passed.
+
+**Fix (checker.c, `case NODE_FOR`).** `lo_sound` = the body does not write or
+address-take the counter (`ast_name_mutated_or_addrd`, the Level-B guard-stability walker,
+now exported from zercheck_ir.c) AND the step is either not a writer of it or a
+non-negative constant increment (`i += C`, `i = i + C`, `i = C + i`). Otherwise the seed
+is `INT64_MIN`, exactly as a non-constant init already does. Precision kept: every `+= 1`
+/ `i = i + 1` counted loop is unchanged; only a signed counter that is really being
+lowered loses its lower bound.
+
+**Tests.** `tests/zer/for_signed_counter_lowered_guarded_bug1034.zer` (baseline: HANGS —
+the underflowing stores clobber the loop's own locals; fixed: guard returns early, exit
+0), `for_signed_counter_monotone_proven_bug1034.zer` (the precision pin, runs the loops).
+**Gate:** three cells in `tests/test_vrp_position_matrix.c` — `for/body(signed counter
+lowered)` and `for/step(signed counter decremented)` STALE, `for/body(signed, i = i + 1)`
+PROVEN. Verified to FIRE: 14/20 against the pre-fix build (the two new STALE cells plus
+BUG-1017's four), 20/20 after.
+
+### BUG-1035 — a `return` inside an orelse-BLOCK in a CONDITION never reached the return-range summary (SILENT OOB)
+
+**Symptom.**
+
+    u32 pick(u32 x) { if ((mb(x) orelse { return 9; }) > 0) { return x % 4; } return 0; }
+    u32[4] arr;  arr[pick(200)] = 1;     // pick(200) == 9
+
+compiled with no bounds check, no guard, no warning; ASan global-buffer-overflow at index
+9; without ASan it ran and exited 0.
+
+**Root cause.** `find_return_range` unions every `return` it can reach, and B9 (2026-08-01)
+taught it the orelse-block returns buried in a var-decl / expr-stmt / assignment. Its
+`NODE_IF` arm walked only the two BODIES; the condition — an expression position that can
+hold the same orelse block — was skipped. Same for the while / do-while condition, the
+for init / cond / step, the switch subject, the await condition and spawn arguments. The 9
+was silently dropped, the summary read `[0,3]`, and the caller elided the check.
+
+**Fix.** `scan_expr_orelse_returns` at every one of those positions (and a NODE_ASSIGN arm
+in it, for `if ((x = mb() orelse { return 9; }) > 0)`). Giving up the whole summary when a
+buried return has no derivable range keeps the change conservative.
+
+**Tests.** `tests/zer_trap/return_range_orelse_in_{if_cond,while_cond,switch_subject}_bug1035.zer`
+— `// expect-trap-msg: array index out of bounds`; the baseline exits 1 silently on all three.
+
+### BUG-1036 — `alloc(T, n)` / `free(slice)` reached through a helper were invisible to the ISR and @critical bans
+
+**Symptom.** `void helper() { ?[*]u8 b = alloc(u8, 16); ... free(bb); }  interrupt IRQ1 {
+helper(); }` compiled; so did `@critical { helper(); }`. The DIRECT spelling in the ISR
+body was rejected, and `alloc(T)` through the same helper was rejected — because
+`alloc(T)` on a struct is rewritten to the `T.alloc_ptr()` METHOD form, which
+`scan_func_props` recognises, while the slice form and `free(slice)` keep a bare
+`NODE_IDENT` callee with NO Symbol (they are intercepted by name) and so matched neither
+the method arm nor the transitive-callee arm.
+
+**Fix.** `scan_func_props` recognises the two universal builtins exactly as the stack-depth
+scan does (by name, no function Symbol) and sets `can_alloc` + `has_direct_alloc`, so the
+holder reports at the call and every caller reports the transitive form.
+
+**Tests.** `tests/zer_fail/isr_alloc_slice_via_helper_bug1036.zer`,
+`critical_alloc_slice_via_helper_bug1036.zer` (two hops).
+
+### BUG-1037 — four whole-program passes ran on the MAIN module only
+
+**Symptom.** In an imported module:
+
+    void bad() { ga.x = gb.y; }        // A and B both `shared` — accepted
+    u32 deep(u32 n) { u8[1000] buf; ... }   // main calls it under --stack-limit 500 — accepted
+
+The same `bad` in main.zer is rejected as a deadlock; the same `deep` in main.zer fails the
+limit. The emitter then locked A and read B unlocked; the stack budget was AFFIRMED short
+by 1000 bytes (the BUG-836 direction, worse than not checking).
+
+**Root cause.** `zerc_main.c` called `checker_post_passes(&checker, main_mod->ast)` — the
+deadlock check, `--stack-limit`, the Arena/Barrier init check and `*opaque` call-site
+provenance all walked that one AST. The interrupt / atomic-cell passes are global state and
+were fine.
+
+**Fix.** `checker_post_passes_files(c, files, n)` takes every module in topo order (main
+last): the per-file passes run under each file's name/source so diagnostics land in the
+right file; `check_stack_depth_files` builds frames from every module (ISR detection across
+all of them); `check_builtin_init_files` scans every module into ONE set, so an arena
+declared and used in a module and backed in main is initialised. `checker_post_passes` is
+the one-file wrapper (checker_check / LSP path).
+
+**Tests.** `test_modules/deadlock_user_negative.zer` (rejected AS a deadlock),
+`stack_user_negative.zer` (`--stack-limit 500`), `arena_user.zer` (cross-module init, must
+compile).
+
+### BUG-1038 — `@size(x)` on a variable emitted `sizeof(struct x)`; `@size(u21)` was an undefined identifier
+
+`u32 x; @size(x)` reached GCC as `sizeof(struct x)` ("incomplete type", at the user's line);
+`@size(u21)` died in the checker because a uN spelling is an IDENT the parser hands over
+as an expression. The checker now resolves a uN ident in `@size` as the type it names and
+records it on the node; both emitter paths (AST + IR — the dual-dispatch rule) read the
+checker's resolved type first, so a variable's size is its type's. Test:
+`tests/zer/size_of_variable_and_uN_bug1038.zer` (baseline: 5 errors).
+
+### BUG-1039 — an address integer laundered by ARITHMETIC at the assignment sink
+
+`g = a` (a = `@ptrtoint(&local)`) was refused, `usize b = a + 1; g = b;` was refused (the
+var-decl sink taints `b`), `g = f(a)` was refused (BUG-995) — but `g = a + 0`, `g = 0 - a`,
+`g = -a`, `g = (usize)a`, `g = a * 1` were ACCEPTED: the store rule peels FIELD/INDEX to a
+root ident, and a BINARY/UNARY/TYPECAST root is not an ident. The BUG-995 arm now falls
+through to `expr_touches_local_derived` — the SAME walker the var-decl taint uses — for a
+composed value. Corpus cost: ZERO (compiler-classified over 2,500 files). Tests:
+`tests/zer_fail/addr_int_{arith,cast}_store_global_bug1039.zer`.
+
+### BUG-1040 — a module's container global was spelled two ways
+
+`Arena scratch;` in `arena_lib.zer` was emitted as bare `scratch` while main's `scratch =
+Arena.over(mem)` referenced `arena_lib__scratch` (GCC: undeclared); and the module's own
+`scratch.alloc(Node)` spelled `sizeof(struct Node)` for a struct emitted as `struct
+arena_lib__Node` (incomplete type — BUG-1029's defect, at the arena site). The Pool / Ring
+/ Arena / Slab declaration arms of `emit_global_var_inner` bypassed the module-prefix
+mangling every other global has had since BUG-218; the IR builtin-method receiver and the
+three Handle auto-deref sites (`h.field` → `pool.get(h)`) spelled the raw name to match.
+Fix: `emit_module_global_name` at the declaration arms, the receiver mangled by the same
+rule the ident emitter uses (locals excluded), `emit_alloc_sym_cname` at the three
+auto-deref sites (the allocator Symbol may be either of BUG-233's two keys), and
+`emit_type` for the element in the arena alloc / alloc_slice sizeof. Test:
+`test_modules/arena_user.zer`. Residual (recorded in limitations.md): the CHECKER resolves
+two modules' same-named non-static globals to whichever registered first.
+
+---
+
 ## Session 2026-09-15 — BUG-1017: an array index in the for-loop STEP was checked under the PRE-loop range
 
 **Symptom.** Compiles clean, ZERO warnings, real out-of-bounds read:

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: integer derived from @ptrtoint of a local
+// BUG-1039: `g = a` was refused and `usize b = a + 0; g = b;` was refused, but the
+// DIRECT store of the composed expression had no arm at the assignment sink.
+usize g;
+u32 main() {
+    u32 l = 5;
+    usize a = @ptrtoint(&l);
+    g = 0 - a;
+    return 0;
+}

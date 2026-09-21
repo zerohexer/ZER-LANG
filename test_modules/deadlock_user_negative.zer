@@ -1,0 +1,2 @@
+import deadlock_lib;
+u32 main() { bad(); return 0; }

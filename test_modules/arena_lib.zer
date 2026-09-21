@@ -1,0 +1,5 @@
+// BUG-1037: the Arena/Barrier init check is whole-program now. An arena declared
+// and allocated from in a module, given its backing store in main, must compile.
+struct Node { u32 v; }
+Arena scratch;
+u32 take() { ?*Node n = scratch.alloc(Node); if (n) |p| { p.v = 3; return p.v; } return 0; }

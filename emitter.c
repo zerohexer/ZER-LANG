@@ -573,6 +573,8 @@ static bool ir_op_takes_auto_guards(IROpKind op) {
 }
 static void emit_local_name(Emitter *e, IRFunc *func, int local_id);
 static void emit_unreachable(Emitter *e, const char *what, Node *n);
+static void emit_module_global_name(Emitter *e, const char *name, uint32_t len);   /* BUG-1040 */
+static void emit_alloc_sym_cname(Emitter *e, Symbol *sym);                         /* BUG-1040 */
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
 
 /* BUG-1019: the IR_CALL callee text, factored out of the four inline branches
@@ -3401,20 +3403,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (at->kind == TYPE_SLAB) {
                     emit(e, "((");
                     emit_type(e, at->slab.elem);
-                    emit(e, "*)_zer_slab_get(&%.*s, ",
-                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit(e, "*)_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                     emit_expr(e, node->field.object);
                     emit(e, "))->%.*s",
                          (int)node->field.field_name_len, node->field.field_name);
                 } else if (at->kind == TYPE_POOL) {
                     emit(e, "((");
                     emit_type(e, at->pool.elem);
-                    emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                         "sizeof(%.*s.slots[0]), ",
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit(e, "*)_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                     emit_expr(e, node->field.object);
                     emit(e, ", %llu))->%.*s",
                          (unsigned long long)at->pool.count,
@@ -4044,6 +4040,14 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT &&
+                       checker_get_type(e->checker, node->intrinsic.args[0])) {
+                /* BUG-1038: the checker resolved the operand — a type name, a uN
+                 * spelling, OR a VARIABLE (`u32 x; @size(x)`), whose type is what
+                 * sizeof wants. The name-based fallback below spelled the variable
+                 * as `struct x` (GCC: incomplete type). IR-path twin below. */
+                emit_type(e, checker_get_type(e->checker, node->intrinsic.args[0]));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* named type passed as identifier (e.g. @size(MyStruct)) */
@@ -5590,8 +5594,8 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         emit_type(e, type->pool.elem);
         emit(e, " slots[%llu]; uint32_t gen[%llu]; uint8_t used[%llu]; } ",
              (unsigned long long)type->pool.count, (unsigned long long)type->pool.count, (unsigned long long)type->pool.count);
-        emit(e, "%.*s = {0};\n\n",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = {0};\n\n");
         return;
     }
 
@@ -5601,15 +5605,15 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         emit_type(e, type->ring.elem);
         emit(e, " data[%llu]; uint32_t head; uint32_t tail; uint32_t count; } ",
              (unsigned long long)type->ring.count);
-        emit(e, "%.*s = {0};\n\n",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = {0};\n\n");
         return;
     }
 
     /* Arena → _zer_arena */
     if (type && type->kind == TYPE_ARENA) {
-        emit(e, "_zer_arena %.*s",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit(e, "_zer_arena ");
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
         if (node->var_decl.init) {
             emit(e, " = ");
             emit_expr(e, node->var_decl.init);
@@ -5622,8 +5626,9 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
 
     /* Slab(T) → _zer_slab with slot_size */
     if (type && type->kind == TYPE_SLAB) {
-        emit(e, "_zer_slab %.*s = { .slot_size = sizeof(",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit(e, "_zer_slab ");
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = { .slot_size = sizeof(");
         emit_type(e, type->slab.elem);
         emit(e, ") };\n\n");
         return;
@@ -7183,6 +7188,35 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
  * All IR instruction emission uses local IDs. This helper emits
  * the C name for a local, with async self-> prefix when needed.
  * ================================================================ */
+/* BUG-1040 (2026-09-21): the C name of a GLOBAL declared in the module being
+ * emitted — `mod__name` inside a module, the bare name in main. The general
+ * global-var path has mangled this way since BUG-218/222; the Pool / Ring /
+ * Arena / Slab declaration arms bypassed it, so a module's `Arena scratch` was
+ * emitted as bare `scratch` while every reference from main was
+ * `arena_lib__scratch` (GCC: undeclared), and two modules each declaring
+ * `Pool(T, 4) items` collided at link (redefinition). */
+static void emit_module_global_name(Emitter *e, const char *name, uint32_t len) {
+    if (e->current_module)
+        emit(e, "%.*s__%.*s", (int)e->current_module_len, e->current_module, (int)len, name);
+    else
+        emit(e, "%.*s", (int)len, name);
+}
+
+/* BUG-1040: the C name of an ALLOCATOR found by type (find_unique_allocator) —
+ * the Handle auto-deref `h.field` spells `pool.get(h)` with it. The lookup can
+ * return either of a module global's two Symbols (raw key or mangled key, BUG-233),
+ * so the prefix is added only when the name does not already carry it. */
+static void emit_alloc_sym_cname(Emitter *e, Symbol *sym) {
+    if (sym->module_prefix) {
+        uint32_t pl = sym->module_prefix_len;
+        bool already = sym->name_len > pl + 2 &&
+            memcmp(sym->name, sym->module_prefix, pl) == 0 &&
+            sym->name[pl] == '_' && sym->name[pl + 1] == '_';
+        if (!already) emit(e, "%.*s__", (int)pl, sym->module_prefix);
+    }
+    emit(e, "%.*s", (int)sym->name_len, sym->name);
+}
+
 static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
     IRLocal *l = &func->locals[local_id];
@@ -7209,6 +7243,41 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
     if (!ot) { Symbol *s = scope_lookup(e->checker->global_scope, on, ol); if (s) ot = s->type; }
     if (!ot) return false;
+    /* BUG-1040: every `%.*s` below spells the RECEIVER. A local (`Arena a` in
+     * this function) keeps its name; a global is spelled exactly as the ident
+     * emitter spells every other global — with the module prefix that the
+     * declaration (emit_module_global_name) now carries. Before this, a
+     * module's `scratch.alloc(Node)` emitted `&scratch` against a declaration
+     * main referenced as `arena_lib__scratch`. */
+    {
+        bool is_local = false;
+        if (func) {
+            for (int li = 0; li < func->local_count; li++) {
+                IRLocal *l = &func->locals[li];
+                if ((l->name_len == ol && memcmp(l->name, on, ol) == 0) ||
+                    (l->orig_name && l->orig_name_len == ol && memcmp(l->orig_name, on, ol) == 0)) {
+                    is_local = true; break;
+                }
+            }
+        }
+        if (!is_local) {
+            Symbol *gs = scope_lookup(e->checker->global_scope, on, ol);
+            const char *pfx = NULL; uint32_t pl = 0;
+            if (gs && gs->module_prefix) {
+                if (e->current_module) { pfx = e->current_module; pl = e->current_module_len; }
+                else { pfx = gs->module_prefix; pl = gs->module_prefix_len; }
+            } else if (!gs && e->current_module) {
+                pfx = e->current_module; pl = e->current_module_len;
+            }
+            if (pfx) {
+                uint32_t ml2 = pl + 2 + ol;
+                char *m = (char *)arena_alloc(e->arena, ml2 + 1);
+                memcpy(m, pfx, pl); m[pl] = '_'; m[pl + 1] = '_';
+                memcpy(m + pl + 2, on, ol); m[ml2] = '\0';
+                on = m; ol = ml2;
+            }
+        }
+    }
     Type *te = type_unwrap_distinct(ot);
     #define BA(i) emit_rewritten_node(e, node->call.args[i], func)
     /* Pool */
@@ -7359,14 +7428,18 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
         }
         if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
-            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
-                if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type);
-                emit(e,"),_Alignof("); if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type); emit(e,")))"); return true; }
+            /* BUG-1040: emit_type spells a struct WITH its module prefix (`struct
+             * arena_lib__Node`); the hand-rolled `struct Node` here was an
+             * incomplete type inside an imported module (same defect BUG-1029
+             * fixed for alloc(T, n)). */
+            if (ts&&ts->type) { emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
+                emit_type(e,ts->type);
+                emit(e,"),_Alignof("); emit_type(e,ts->type); emit(e,")))"); return true; }
         }
         if (ml==11 && !memcmp(mn,"alloc_slice",11) && node->call.arg_count>1 && node->call.args[0]->kind==NODE_IDENT) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
-            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
+            if (ts&&ts->type) { int t=e->temp_count++;
                 /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
                  * computed with an overflow check. The AST path has done this
                  * since BUG-266; this IR path — the only one that runs for a
@@ -7392,10 +7465,10 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
                  * a wrapper whose absence produces a WRONG LENGTH defeats every
                  * downstream guard rather than merely removing one. */
                 emit(e,"size_t _zer_asz%d; uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t,t);
-                if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);}
+                emit_type(e,ts->type);   /* BUG-1040: module-prefixed spelling */
                 emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
-                emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
+                emit(e,"_Alignof("); emit_type(e,ts->type); emit(e,"));");
                 /* wrap in ?[]T */
                 emit(e,"_zer_ap%d?(",t);
                 Type *slice_t=type_slice(e->arena,ts->type); Type *opt_t=type_optional(e->arena,slice_t);
@@ -7887,20 +7960,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                         if (alloc_type->kind == TYPE_SLAB) {
                             emit(e, "((");
                             emit_type(e, type_pointer(e->arena, elem));
-                            emit(e, ")_zer_slab_get(&%.*s, ",
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                             emit_rewritten_node(e, node->field.object, func);
                             emit(e, "))->%.*s",
                                  (int)node->field.field_name_len, node->field.field_name);
                         } else if (alloc_type->kind == TYPE_POOL) {
                             emit(e, "((");
                             emit_type(e, type_pointer(e->arena, elem));
-                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                                 "sizeof(%.*s.slots[0]), ",
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                             emit_rewritten_node(e, node->field.object, func);
                             emit(e, ", %llu))->%.*s",
                                  (unsigned long long)alloc_type->pool.count,
@@ -8035,15 +8102,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                         emit(e, "((");
                         emit_type(e, type_pointer(e->arena, elem));
                         if (alloc_type->kind == TYPE_SLAB) {
-                            emit(e, ")_zer_slab_get(&%.*s, ",
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                         } else if (alloc_type->kind == TYPE_POOL) {
-                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                                 "sizeof(%.*s.slots[0]), ",
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                         }
                         emit_rewritten_node(e, node->field.object, func);
                         if (alloc_type->kind == TYPE_POOL)
@@ -8748,6 +8809,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     Type *t = resolve_type_for_emit(e, ta);
                     if (t) emit_type(e, t);
                 }
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT &&
+                       checker_get_type(e->checker, node->intrinsic.args[0])) {
+                /* BUG-1038 — IR-path twin of the AST-path arm: the checker's
+                 * resolved type of the operand (type name / uN / variable). */
+                emit_type(e, checker_get_type(e->checker, node->intrinsic.args[0]));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* @size(TypeName) — type name passed as ident arg */

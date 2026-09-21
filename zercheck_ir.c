@@ -426,7 +426,7 @@ static int ir_resolve_cond_root(IRFunc *func, int cond_local, bool *polarity) {
  * -Werror=switch): a new NodeKind forces a decision here; opaque/rare kinds
  * (cast/asm/static_assert/declarations) return true (assume mutation) so a gap
  * can only OVER-reject, never accept a mutated condition. */
-static bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
+bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
     if (!n) return false;
     switch (n->kind) {
     case NODE_ASSIGN: {

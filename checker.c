@@ -1451,6 +1451,51 @@ static bool const_negative_into_unsigned(Node *value, Type *target) {
     return v < 0;
 }
 
+/* BUG-1018 (2026-09-15): the SIBLING hole in the rule directly above, and the one
+ * case where the compiler and the emitted program disagree about the value of a
+ * constant with NO diagnostic at all.
+ *
+ *     u32 x = -4 / -2;      // the author wrote 2
+ *
+ * compiles clean, zero warnings, and RETURNS 0. Bare integer literals are u32, so
+ * the emitter renders `-(uint32_t)4 / -(uint32_t)2` — 0xFFFFFFFC / 0xFFFFFFFE,
+ * which is 0 in unsigned division. Meanwhile `eval_const_expr` folds the same tree
+ * with SIGNED 64-bit semantics and gets 2. Every compile-time decision downstream
+ * (this rule, VRP ranges, bounds proofs, the `if` that folds away) is made on the
+ * 2 the program never computes.
+ *
+ * `const_negative_into_unsigned` was meant to catch exactly this family — its
+ * trigger is "the tree has an explicit unary minus and the destination is
+ * unsigned" — but it decides on the FOLDED RESULT, and the fold here is +2. The
+ * operands are what get sign-converted, not the result. Same shape CLAUDE.md
+ * records for an exemption whose code is wider than its stated rationale.
+ *
+ * WHICH TREES DIVERGE is already written down one screen up:
+ * `lit_tree_ops_commute_with_wrap` lists `/`, `%` and `>>` as NOT homomorphic —
+ * the only three operators whose result depends on the signedness of the
+ * operands. (`+ - * & | ^ <<` give the same bits either way, which is why
+ * `u32 x = -4 * -2;` is 8 both ways and stays accepted.) So: an explicit `-`
+ * anywhere in a pure-literal tree that also contains one of those three, flowing
+ * into an unsigned destination, is refused.
+ *
+ * REJECT rather than "emit the signed reading": ZER already refuses `u32 x = -1;`
+ * with "no implicit sign conversion", and silently picking either reading of
+ * `-4 / -2` is the actual defect. The author says which they meant — `i32`, or
+ * `@bitcast(u32, ...)` for the bit pattern.
+ *
+ * Cost is the rare tree where the two readings happen to coincide
+ * (`u32 x = (-4 * -2) / 2;` is 4 both ways). Measured over the corpus: ZERO
+ * files change verdict. */
+static bool const_signedness_divergent_into_unsigned(Node *value, Type *target) {
+    if (!value || !unsigned_int_destination(target)) return false;
+    if (!is_pure_int_literal_expr(value)) return false;
+    if (!literal_tree_has_unary_minus(value)) return false;
+    if (literal_tree_has_huge_operand(value)) return false;
+    /* homomorphic tree ⇒ signed and unsigned readings agree ⇒ nothing to report */
+    if (lit_tree_ops_commute_with_wrap(value)) return false;
+    return eval_const_expr(value) != CONST_EVAL_FAIL;
+}
+
 /* BUG-928: arithmetic and bitwise operators on ENUM operands produce values that are
  * not declared variants.
  *
@@ -1714,6 +1759,7 @@ static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
  * to add the condition. One query now; each site keeps its own error wording. */
 static bool value_flows_to(Node *value, Type *vt, Type *target) {
     if (const_negative_into_unsigned(value, target)) return false;
+    if (const_signedness_divergent_into_unsigned(value, target)) return false;  /* BUG-1018 */
     if (const_int_into_enum(value, vt, target)) return false;
     if (type_equals(target, vt)) return true;
     if (can_implicit_coerce(vt, target)) return true;
@@ -1752,7 +1798,31 @@ static bool report_value_flow_refusal(Checker *c, Node *value, Type *target,
             return true;
         }
     }
-    if (!const_negative_into_unsigned(value, target)) return false;
+    /* BUG-1018: the divergent-reading refusal. It needs its OWN sentence — the
+     * message below would say "negative constant 2", which is a lie: 2 is what
+     * the author meant and is not negative. What went wrong is that the two
+     * readings of the SAME tree disagree, so the diagnostic has to name both.
+     *
+     * Tried SECOND, deliberately. The two predicates overlap — `u32 x = -8 >> 1;`
+     * both diverges AND folds negative — and where they do, "negative constant -4
+     * does not fit unsigned type 'u32'" is the more direct thing to tell an
+     * author, with a concrete @bitcast(u32, -4) to paste. This one takes only the
+     * residual: a tree whose fold is NON-negative, which is exactly the case the
+     * older rule cannot see and the case that used to compile silently. */
+    if (!const_negative_into_unsigned(value, target)) {
+        if (!const_signedness_divergent_into_unsigned(value, target)) return false;
+        long long sv = (long long)eval_const_expr(value);
+        char tn[96];
+        snprintf(tn, sizeof(tn), "%s", type_name(target));
+        checker_error(c, line,
+            "%s: this constant reads differently signed and unsigned — as written "
+            "it is %lld, but bare integer literals are unsigned, so '/', '%%' and "
+            "'>>' on a negated operand compute a different value in '%s'. ZER will "
+            "not pick one silently: use a signed type for the signed reading, or "
+            "@bitcast(%s, ...) for the unsigned bit pattern",
+            what, sv, tn, tn);
+        return true;
+    }
     long long v = (long long)eval_const_expr(value);
     /* type_name() rotates only TWO static buffers — capture before formatting
      * (CLAUDE.md "type_name() uses 2-buffer rotation"). */

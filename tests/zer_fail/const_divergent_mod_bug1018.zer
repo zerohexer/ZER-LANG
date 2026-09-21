@@ -1,0 +1,13 @@
+// expect-error: reads differently signed and unsigned
+// BUG-1018, the `%` door.
+//
+//   signed  : 9 % -4  ==  1
+//   unsigned: 9 % 0xFFFFFFFC == 9
+//
+// The fold is +1 — NON-negative — so `const_negative_into_unsigned` (which decides on
+// the folded result) cannot see it. This is exactly the residual the divergence rule
+// exists for: the two readings disagree while neither is negative.
+u32 main() {
+    u32 x = 9 % -4;
+    return x;
+}

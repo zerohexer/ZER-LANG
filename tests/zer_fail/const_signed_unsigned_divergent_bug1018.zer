@@ -1,0 +1,18 @@
+// expect-error: reads differently signed and unsigned
+// BUG-1018: `u32 x = -4 / -2;` used to compile with ZERO diagnostics and return 0.
+//
+// Bare integer literals are u32, so the emitter rendered `-(uint32_t)4 / -(uint32_t)2`
+// — 0xFFFFFFFC / 0xFFFFFFFE, which is 0 in unsigned division. But `eval_const_expr`
+// folds the same tree with SIGNED 64-bit semantics and gets 2, so every compile-time
+// decision downstream was made on a value the program never computes.
+//
+// `const_negative_into_unsigned` was meant to catch this family — its trigger is
+// "explicit unary minus, unsigned destination" — but it decides on the FOLDED RESULT,
+// and the fold here is +2. The OPERANDS are what get sign-converted, not the result.
+//
+// Only `/`, `%` and `>>` diverge (the three operators whose result depends on operand
+// signedness); `+ - * & | ^ <<` give the same bits either way and stay accepted.
+u32 main() {
+    u32 x = -4 / -2;      // the author wrote 2; the machine computes 0
+    return x;
+}

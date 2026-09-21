@@ -1,0 +1,22 @@
+// BUG-1018 precision pin: the divergence rule must fire ONLY for `/`, `%` and `>>`.
+//
+// `+ - * & | ^ <<` produce the same BITS whether the operands are read signed or
+// unsigned (two's complement is a ring homomorphism for them), so a negated literal
+// under those operators has one unambiguous answer and must keep compiling. This is
+// the same predicate `lit_tree_ops_commute_with_wrap` already uses for retyping.
+//
+// If this file starts failing, the divergence rule has widened past the three
+// operators whose result actually depends on signedness.
+u32 main() {
+    u32 a = -4 * -2;          // 8 both ways
+    u32 b = -4 ^ -2;          // 0xFFFFFFFC ^ 0xFFFFFFFE == 2, and 2 signed
+    u32 c = -1 & 255;         // 255 both ways
+    u32 d = (-2 * -3) + 1;    // 7 both ways
+    u32 e = 8 / 2;            // no negation at all — untouched
+    if (a != 8)   { return 1; }
+    if (b != 2)   { return 2; }
+    if (c != 255) { return 3; }
+    if (d != 7)   { return 4; }
+    if (e != 4)   { return 5; }
+    return 0;
+}

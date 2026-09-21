@@ -115,13 +115,41 @@ legitimate register-context-then-callback pattern — so the widening has a real
 false-positive surface and must be measured, not argued. That is why it was not
 bolted onto BUG-1024.
 
-**Fix sketch.** Give `ir_global_projection_key` a bare-ident arm producing the key
-`(IR_GLOBAL_ROOT_ID, "g")`, gated on `ir_ident_is_unshadowed_global`, then measure
-the corpus compiler-classified (the `tools/`-style sweep: compile every corpus file
-with both binaries and diff exit status + diagnostic count). Expect the leak-at-exit
-rule to need the same escaped=true treatment `IR_GLOBAL_ROOT_ID` entries already
-carry — CLAUDE.md's invariant is that those entries ALWAYS carry `escaped=true`, so
-the UAF and double-free halves can land without the leak half.
+**Fix sketch — ATTEMPTED 2026-09-15 and deliberately REVERTED; read this before
+trying again, it is most of the work.** The one-line part is easy: give
+`ir_global_projection_key` a bare-ident arm producing the key
+`(IR_GLOBAL_ROOT_ID, "g")`, gated on `ir_ident_is_unshadowed_global`. Measured with
+that in place:
+
+- The three defects are caught — bare global slice with a direct alloc, the same
+  via a factory, and a bare global pointer double-free. So the key really is the
+  only thing missing on the detection side.
+- The `escaped = true` invariant is NOT a hazard: `ir_add_compound_handle` sets it
+  by construction for `IR_GLOBAL_ROOT_ID`, so no widening of the key set can reach
+  the `func->locals[-2]` access the invariant exists to prevent.
+
+**What stops it are two SIBLING RULES that have never seen a bare global**, and
+both produce a WRONG SENTENCE rather than an over-rejection — the failure mode
+CLAUDE.md records as worse than the permissive answer:
+
+1. **The dangling-at-exit rule prescribes a remedy that does not compile.** It says
+   *"reset it (`g = null;`) after the free"*. For a NON-OPTIONAL global — `[*]u32 g`
+   or `*T g`, which is what a bare global carrying an allocation usually is — `g =
+   null;` is `error: cannot assign 'void' to '[]u32'`. The advice is unfollowable,
+   so the rule becomes an inescapable over-rejection. It needs a carrier-aware
+   sentence: for a non-optional global the real remedy is to declare it `?[*]u32` /
+   `?*T` so it CAN hold the reset.
+2. **`g = null;` is not taught as a RESET for the bare form.** With the key added,
+   `?[*]u32 g; ... free(s); g = null;` reports *"use after free: 'g' is freed"* —
+   on the very line the first rule just told the author to write. BUG-985 added
+   exactly this reset arm (`freed_then_reset`) for the SLOT form `g.p = null;`; the
+   bare-ident form reuses the state itself and has no equivalent.
+
+So the order is: teach (2) the bare form, fix (1)'s wording per carrier, THEN add
+the key, THEN measure the corpus compiler-classified (compile every corpus file
+with both binaries and diff exit status + diagnostic count). Landing the key alone
+trades an ASan-confirmed UAF for a diagnostic that contradicts itself, which is not
+a trade worth making.
 
 **Gate when it lands:** cells in SHAPE p26 of `tools/sink_matrix.sh` crossing
 {bare global, global field} x {direct alloc, factory} x {UAF, double-free}.

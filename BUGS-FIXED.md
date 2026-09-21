@@ -240,6 +240,79 @@ with every precision pin passing on both sides.
 
 ---
 
+## Session 2026-09-15 — BUG-1020: `@critical` emitted PRIVILEGED instructions on hosted ARM and RISC-V
+
+**Symptom, measured with real cross-toolchains rather than argued:**
+
+| target | before |
+|---|---|
+| `aarch64-linux-gnu-gcc` (hosted) | **BUILD FAILS** — `unknown or missing system register name ... 'mrs x0,primask'`, `unknown mnemonic 'cpsid'` |
+| `arm-linux-gnueabihf-gcc` (hosted) | **BUILD FAILS** — "selected processor does not support requested special purpose register" |
+| `riscv64-linux-gnu-gcc` (hosted) | **BUILDS CLEAN** — and `csrrci mstatus` is a MACHINE-mode CSR, so it faults at run time in user mode |
+| `x86_64` (hosted) | correct — falls back to a fence |
+
+So `@critical` could not be compiled at all for 64-bit Raspberry Pi OS, Apple
+silicon Linux or Graviton, and on hosted RISC-V it compiled to something that
+faults. Bare-metal aarch64 and bare-metal ARM A-profile did not build either.
+
+**Root cause — the asymmetry, and the comment that blessed it.** x86 was gated on
+`!_ZER_HOSTED` (Gap 10, 2026-05-16) because `cli` is privileged. ARM and RISC-V
+keyed on the ARCH macro ALONE. The emitter's own comment recorded this as measured
+and deliberate:
+
+> "Scope, measured rather than assumed: ARM, RISC-V and AVR @critical key on the
+> ARCH macro and have always emitted the correct interrupt-disable sequence
+> regardless of `__STDC_HOSTED__`. The real exposure is bare-metal x86."
+
+That sentence is true of BARE METAL and says nothing about hosted — where the
+correct sequence is the fence, because user mode cannot mask interrupts. It is the
+same shape CLAUDE.md records as "an exemption whose written rationale is narrower
+than its code", with one addition worth noting: the word **"measured"** in a
+comment refers to the direction that was measured, and here only one direction
+was. The other had never been compiled.
+
+**Fix.** The M-profile arm is now selected by PROFILE, not by hosted-ness, because
+that is the precise fact: PRIMASK exists only on ARM M-profile, so `mrs primask`
+is wrong on A-profile and aarch64 whether or not the build is hosted. The
+remaining privileged arms are gated on `!_ZER_HOSTED` like x86's, and two arms
+that never existed are added:
+
+| target | now |
+|---|---|
+| Cortex-M (any) | `mrs primask` + `cpsid i` — unchanged |
+| aarch64 bare metal | `mrs daif` + `msr daifset, #2` — NEW |
+| ARM A/R bare metal | `mrs cpsr` + `cpsid i` — NEW |
+| AVR | `SREG` + `cli` — unchanged, deliberately NOT gated (see below) |
+| RISC-V bare metal | `csrrci mstatus` — unchanged |
+| x86 bare metal | `pushf`/`cli` — unchanged |
+| anything hosted | `__atomic_thread_fence` |
+
+`IR_CRITICAL_END` mirrors the cascade arm for arm; restoring the whole saved word
+(PRIMASK / DAIF / CPSR / mstatus / EFLAGS) rather than unconditionally re-enabling
+is what keeps nesting correct.
+
+**AVR is deliberately NOT gated on `_ZER_HOSTED`.** avr-gcc reports
+`__STDC_HOSTED__ == 1` by default, so gating it would silently downgrade every AVR
+build that does not pass `-ffreestanding` to a fence — which is exactly the
+regression the x86 arm was written to fix. Widening a gate is not automatically
+safe; the right gate is the one that names the real fact.
+
+**Gate — a per-TARGET required-fingerprint case in `tools/emit_audit.sh`.** The
+choice is made entirely by the preprocessor, so defining a target's own macros and
+asking `gcc -E` which arm survives tests the real cascade with NO cross-toolchain.
+Seven targets, each asserting the instruction that must appear. The simulation was
+checked against actual aarch64 / armhf / riscv64 GCC and agreed with all of them.
+
+**Verified to FIRE**: against the pre-fix build it reports exactly the three broken
+targets — `aarch64 (bare)` picked primask, `aarch64 (hosted)` picked primask,
+`riscv (hosted)` picked csrrci — and nothing on the four that were already right.
+
+This also retires `tests/zer_gaps/audit_2026-06-12_critical_hosted_arm.zer`, whose
+diagnosis was right and whose predicted symptom (SIGILL) was wrong: on ARM it is a
+build failure, and SIGILL is the RISC-V case it did not mention.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

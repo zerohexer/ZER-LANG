@@ -11897,20 +11897,59 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit(e, "{ /* @critical */\n");
         e->indent++;
         emit_indent(e);
-        emit(e, "#if defined(__ARM_ARCH)\n");
-        emit_indent(e);
-        /* A7-6 (2026-07-03): the "memory" clobber makes the interrupt-disable a
+        /* BUG-1020 (2026-09-15): the ARM and RISC-V arms used to key on the ARCH
+         * macro ALONE, while x86 was gated on `!_ZER_HOSTED`. That asymmetry was
+         * recorded as deliberate ("ARM, RISC-V and AVR have always emitted the
+         * correct interrupt-disable sequence regardless of __STDC_HOSTED__") —
+         * true for BARE METAL, and wrong for hosted, where the correct sequence
+         * is the fence because user mode cannot mask interrupts. Measured with
+         * real cross-toolchains rather than argued:
+         *
+         *   aarch64-linux-gnu-gcc : BUILD FAILS — `mrs x0, primask` / `cpsid i`
+         *                           are ARMv7-M encodings that do not exist on
+         *                           ARMv8-A. So `@critical` could not be compiled
+         *                           at all for 64-bit Raspberry Pi OS, Apple
+         *                           silicon Linux, Graviton, …
+         *   arm-linux-gnueabihf   : BUILD FAILS — "selected processor does not
+         *                           support requested special purpose register"
+         *                           (PRIMASK is M-profile only).
+         *   riscv64-linux-gnu-gcc : BUILDS CLEAN — and `csrrci mstatus` is a
+         *                           MACHINE-mode CSR, so it faults at run time in
+         *                           user mode. That is the silent one.
+         *
+         * PRIMASK exists only on ARM M-profile, so the M arm is selected by
+         * PROFILE rather than by hosted-ness — that is the precise fact, and it
+         * keeps Cortex-M bare metal working whether or not the build passes
+         * -ffreestanding. A/R-profile and aarch64 bare metal get their own
+         * correct sequences (CPSR + `cpsid i`, and DAIF + `msr daifset, #2`),
+         * which previously did not build either.
+         *
+         * AVR is deliberately NOT gated on _ZER_HOSTED: avr-gcc reports
+         * __STDC_HOSTED__ == 1 by default, so gating it would silently downgrade
+         * every AVR build that does not pass -ffreestanding to a fence — the exact
+         * regression this arm's x86 sibling was written to fix.
+         *
+         * A7-6 (2026-07-03): the "memory" clobber makes the interrupt-disable a
          * COMPILER barrier — without it GCC may hoist non-volatile loads/stores
          * across `cpsid i`/`cli`/`csrrci`, defeating the critical section for
-         * anything the volatile-global rule misses. The x86 arms already had it
-         * (Gap 10, 2026-05-16); ARM/AVR/RISC-V did not. */
+         * anything the volatile-global rule misses. */
+        emit(e, "#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n");
+        emit_indent(e);
         emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask) :: \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "uint64_t _zer_daif; __asm__ __volatile__(\"mrs %%0, daif\\n\\tmsr daifset, #2\" : \"=r\"(_zer_daif) :: \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "uint32_t _zer_cpsr; __asm__ __volatile__(\"mrs %%0, cpsr\\n\\tcpsid i\" : \"=r\"(_zer_cpsr) :: \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
         emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\" ::: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
         emit_indent(e);
         emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus) :: \"memory\");\n");
         emit_indent(e);
@@ -11937,9 +11976,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_CRITICAL_END: {
         if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;   /* BUG-835 */
         emit_indent(e);
-        emit(e, "#if defined(__ARM_ARCH)\n");
+        /* BUG-1020: mirrors IR_CRITICAL_BEGIN's cascade exactly — the two must
+         * agree arm for arm, or a block saves state one way and restores it
+         * another. Restoring the WHOLE saved word (PRIMASK / DAIF / CPSR /
+         * mstatus / EFLAGS) rather than unconditionally re-enabling is what makes
+         * nesting safe: an inner @critical inside an outer one leaves interrupts
+         * disabled on exit, as it must. */
+        emit(e, "#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr daif, %%0\" :: \"r\"(_zer_daif) : \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr cpsr_c, %%0\" :: \"r\"(_zer_cpsr) : \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
@@ -11947,7 +12000,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * complete before interrupts return (SREG= is not a compiler barrier). */
         emit(e, "__asm__ __volatile__(\"\" ::: \"memory\"); SREG = _zer_sreg;\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus) : \"memory\");\n");
         emit_indent(e);

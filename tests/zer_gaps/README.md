@@ -43,7 +43,6 @@ trap fired.
 | `ast_signed_div_overflow.zer` | clean | rc=133 | **closed at run time** — traps "signed division overflow" |
 | `ast_slice_empty_range.zer` | clean | rc=133 | **closed at run time** — traps "slice start > end" |
 | `audit2026-05-24_bool_int_cast.zer` | clean | rc=1 | **NOT a safety gap** — see below |
-| `audit2026-05-24_critical_x86_no_cli.zer` | clean | rc=0 | LIVE — `@critical` emits a fence, not `cli`/`sti`, on hosted x86 |
 | `audit2026-05-24_spawn_alias_args.zer` | REJECTED | — | BIT-ROTTED — uses a `*shared T` spelling the grammar never accepted |
 | `audit2_nested_if_chain.zer` | REJECTED | — | masked by the wrong-pool rule; the transfer question is untested |
 | `audit2_slice_alloc_safety.zer` | REJECTED | — | masked by a UAF elsewhere in the file |
@@ -51,7 +50,6 @@ trap fired.
 | `audit2_slice_star_oob.zer` | clean | rc=133 | **closed at run time** — same |
 | `audit_2026-06-02_nostrict_mmio_no_runtime.zer` | REJECTED | — | masked by the strict-mmio requirement; needs `--no-strict-mmio` to probe |
 | `audit_2026-06-02_slice_oob.zer` | clean | rc=133 | **closed at run time** — traps "slice end > len" |
-| `audit_2026-06-12_critical_hosted_arm.zer` | clean | rc=0 | LIVE — hosted-ARM `@critical` cascade |
 | `audit_2026-06-17_defer_goto_fallthrough_drops.zer` | clean | rc=1 | needs re-derivation after refactor L moved defer bodies onto the IR path |
 | `gap4_async_shared_across_yield.zer` | clean | rc=0 | LIVE at the checker; see CLAUDE.md — locking is PER-STATEMENT, so the blanket claim it tests is itself wrong |
 | `prec2_opaque_wrong_type.zer` | clean | rc=133 | **closed at run time** — the `@ptrcast` type_id check traps |
@@ -69,6 +67,19 @@ converts bool<->int in both directions while the *implicit* coercion is banned.
 That is deliberate and is now written down in `docs/reference.md` under `bool`.
 
 ### Retired 2026-09-15
+
+- `audit2026-05-24_critical_x86_no_cli.zer` — **was already CLOSED** and the row
+  was stale. Gap 10 (2026-05-16) gave bare-metal x86 real `pushf`/`cli` and
+  `push`/`popf`, gated on `!_ZER_HOSTED`; hosted x86 keeps the fence, which is
+  correct there because `cli` is privileged. Verified by preprocessing the
+  emitted C with `-ffreestanding`.
+
+- `audit_2026-06-12_critical_hosted_arm.zer` — **CLOSED** by BUG-1020. Its
+  diagnosis (the ARM arm lacked the hosted guard that x86 had) was right; its
+  predicted symptom was not. Measured with real cross-toolchains: on hosted ARM
+  it is a BUILD FAILURE, not SIGILL, because PRIMASK is M-profile only — and the
+  SIGILL case it did not mention is hosted RISC-V, which built clean and would
+  have faulted on a machine-mode CSR.
 
 - `funcptr_array_null_element.zer` — **CLOSED** by BUG-1019. Calling an
   unassigned element of a non-null funcptr array now traps with "call through a

@@ -478,8 +478,21 @@ every count in this file that number drifts: RUN it.)
 **Grep for the SPECIFIC line you expect, never for `OK — no`** — several gates match that prefix, so a
 loose grep reports an EARLIER gate's success as your own (this is how a four-commit run of
 `MAKE_CHECK_EXIT=2` was reported green). And these are the gates; `tools/ubsan_sweep.sh`,
-`tools/ub_sweep.sh`, `tools/grammar_closure_probe.sh` and `tools/qualifier_closure_probe.sh` are
-MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do not count them as coverage.
+`tools/ub_sweep.sh`, `tools/grammar_closure_probe.sh`, `tools/qualifier_closure_probe.sh` and
+`tools/cross_target_sweep.sh` are MEASUREMENT SWEEPS, run by hand, NOT in `make check` — do not
+count them as coverage.
+
+**NOTHING in `make check` COMPILES THE EMITTED C FOR ANY TARGET BUT THE HOST (2026-09-15).** The
+emitter has per-arch `#if` cascades for `@critical`, the `@cpu_*` intrinsics, the barriers and the
+trap, and a wrong arm in one of them is invisible to every gate above: the host takes a different
+branch and the suite stays green. Measured on exactly such a green tree — `@critical` could not be
+compiled AT ALL for hosted or bare-metal aarch64 (BUG-1020), and four more intrinsic arms had the
+same defect (BUG-1021). **After touching any per-arch emission, run
+`bash tools/cross_target_sweep.sh`** (`apt-get install gcc-aarch64-linux-gnu
+gcc-arm-linux-gnueabihf gcc-riscv64-linux-gnu`; absent toolchains SKIP). The `emit_audit.sh`
+per-target fingerprint case is its complement and runs in `make check`: that one proves the right
+arm is CHOSEN (via the preprocessor, no toolchain), this one proves the chosen arm ASSEMBLES —
+which is the half that failed in every one of those bugs.
 
 **AN EXHAUSTIVE SWITCH PROVES EVERY KIND WAS CONSIDERED, NOT THAT EACH WAS CONSIDERED
 CORRECTLY (2026-09-10, BUG-973).** The same-statement shared-lock collector listed

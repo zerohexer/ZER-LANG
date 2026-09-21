@@ -313,6 +313,74 @@ build failure, and SIGILL is the RISC-V case it did not mention.
 
 ---
 
+## Session 2026-09-15 — BUG-1021 / BUG-1022: the rest of the cross-target sweep
+
+BUG-1020 was found by cross-compiling ONE program. Installing the toolchains and
+cross-compiling the whole positive corpus for aarch64 / ARM A-profile / RISC-V,
+hosted and freestanding, found the rest of the family — on a tree where
+`make check` was fully green, because nothing in `make check` had ever compiled
+the emitted C for any target but the host.
+
+### BUG-1021 — four more per-arch `#if` arms selecting an instruction the target does not have
+
+| intrinsic | was | target it broke |
+|---|---|---|
+| `@cpu_disable_int` / `@cpu_enable_int` | `#elif defined(__ARM_ARCH) \|\| defined(__aarch64__)` -> `cpsid i` / `cpsie i` | **aarch64** — those mnemonics do not exist on ARMv8-A. Now `msr daifset, #2` / `msr daifclr, #2` |
+| `@cpu_save_int_state` / `@cpu_restore_int_state` | `#elif defined(__ARM_ARCH)` -> `mrs primask` | **ARM A-profile** — PRIMASK is M-profile only. Now split by `__ARM_ARCH_PROFILE`, with CPSR for A/R |
+| `@cpu_breakpoint` | `#elif defined(__aarch64__) \|\| defined(__ARM_ARCH)` -> `brk #0` | **ARMv7** — the mnemonic there is `bkpt`. Now split |
+
+Every one is the BUG-1020 shape: two architectures sharing an arm because their
+macros were OR-ed, when the instruction only exists on one of them. Note
+`@cpu_save_int_state` already had a correct separate `__aarch64__` arm — the
+pattern was known IN THE SAME FUNCTION and simply not applied to its siblings,
+which is the multi-site shape CLAUDE.md names as the #1 recurring class.
+
+Verified: `dalpha3_interrupt_control` and `dalpha7_multi_core` now build on
+aarch64, ARM, RISC-V and x86-64.
+
+### BUG-1022 — a bare-metal build using `Barrier` or `Semaphore` failed with a missing typedef in generated C
+
+`Barrier` / `Semaphore` are pthread-based, so they genuinely cannot exist on a
+freestanding target — that part is a floor. What was a bug is what the author saw:
+
+    /tmp/out.c:433:1: error: unknown type name '_zer_barrier'
+
+a line of GENERATED C, with nothing naming the ZER feature or the reason. Same
+defect BUG-991 records for float literals, where GCC blamed the user's `.zer` line
+for an emitter problem; here it blames a file the author never wrote. Arch-
+INDEPENDENT — it happens on x86 `-ffreestanding` too.
+
+zerc cannot diagnose this itself: whether the emitted C is built freestanding is a
+GCC flag applied later. But it can put the reason inside the error GCC is going to
+print, so the non-hosted branch now defines the names to something that says so:
+
+    error: unknown type name
+      'ZER_Barrier_requires_a_HOSTED_target__pthreads_are_unavailable_on_bare_metal'
+
+A macro rather than an `#error`, deliberately: nothing fires unless the program
+actually names one of them, so a bare-metal program that does not touch threads is
+completely unaffected — which is the common firmware case and must keep building
+(verified).
+
+### The gate — `tools/cross_target_sweep.sh`
+
+A measurement sweep, like `ubsan_sweep.sh`: builds the emitted C for every
+available cross-target (six rows: aarch64/ARM/RISC-V x hosted/bare) and reports
+anything that does not assemble, against a short justified list of programs that
+are x86-only by design. Absent toolchains SKIP rather than fail, so it is safe to
+run anywhere; it is NOT in `make check`, because it depends on toolchains a
+checkout has no right to assume.
+
+It is the complement of the per-target case added to `tools/emit_audit.sh` for
+BUG-1020, and both are needed: that one asks the PREPROCESSOR which arm is
+selected and needs no toolchain, proving the right arm is CHOSEN. This one proves
+the chosen arm ASSEMBLES — the half that failed in every bug above, since each
+broken arm was correctly chosen and simply was not a real instruction there.
+
+Result after the fixes: **0 unexpected failures across all six target rows.**
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

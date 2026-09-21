@@ -1,0 +1,8 @@
+// expect-error: optional of 'Arena'
+// BUG-1033: `?Arena` (and ?Pool / ?Slab / ?Ring / ?Barrier / ?Semaphore) resolved to
+// an optional whose emitted C type came from the emit_type fall-through arm —
+// `_zer_opt_u8 a` for an Arena — so a declaration compiled with a wrong, far too
+// small type. A builtin container is a unique resource, not a value; an optional
+// of one has no meaning and is refused at the type.
+?Arena scratch;
+u32 main() { return 0; }

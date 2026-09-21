@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1026: the callee frees its param through a local alias; the caller reads
+// the pointee afterwards. The summary must carry the free through the alias.
+struct T { u32 v; }
+void f(*T p) {
+    *T q = p;
+    free(q);
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    x.v = 3;
+    f(x);
+    return x.v;
+}

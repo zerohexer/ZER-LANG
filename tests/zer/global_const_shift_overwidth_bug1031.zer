@@ -1,0 +1,29 @@
+// BUG-1031: a GLOBAL initializer with a constant shift count >= the operand's
+// width (`const u32 S = 1 << 200;`) did not fold — the untyped evaluator gave up
+// at 63 — so the emitter wrote `_zer_shl(1, 200)`, a statement expression, at FILE
+// scope and GCC refused the program ("braced-group within expression allowed
+// only inside a function") while pointing at the user's line. ZER defines an
+// over-width or negative shift as 0; every spelling below must fold to that or
+// to the plain in-range value, with no runtime guard at file scope.
+const u32 S200 = 1 << 200;
+const u32 S70 = 1 << 70;
+const u32 R70 = 1 >> 70;
+const u8 B = 200;
+const u32 SB = B << 8;
+const u32 SB4 = B << 4;
+const u64 W40 = 1 << 40;
+u32 g = 3 << 2;
+
+u32 main() {
+    if (S200 != 0) { return 1; }
+    if (S70 != 0) { return 2; }
+    if (R70 != 0) { return 3; }
+    if (SB != 0) { return 4; }        // u8 << 4 wraps in u8: 200 << 4 = 3200 & 0xFF
+    if (SB4 != 128) { return 5; }
+    if (W40 != 1099511627776) { return 6; }
+    if (g != 12) { return 7; }
+    u32 n = 70;
+    u32 x = 1 << n;
+    if (x != 0) { return 8; }
+    return 0;
+}

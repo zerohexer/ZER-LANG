@@ -334,6 +334,51 @@ buf[2..]                   // element 2 through end
 buf[..5]                   // elements 0-4
 ```
 
+**ANY ELEMENT TYPE**
+The element may be anything a variable can have: a primitive, `uN`, an enum, a
+struct, a union, a `Handle(T)`, a pointer (`[*]?*T`), a value optional
+(`[*]?u32`), a function pointer, or another `[*]T`. Each element type gets one
+named C typedef, so two views of the same element type are the same C type and
+may be assigned, passed and returned freely. (Before BUG-1027 every element kind
+past primitive/struct/union was named `_zer_slice_u128` and read with a 16-byte
+stride — an enum slice returned the wrong element.)
+
+```zer
+enum State { idle, run }
+struct Job { u32 id; }
+typedef u32 (*Op)(u32);
+u32 dbl(u32 x) { return x * 2; }
+
+u32 count_run([*]State s) {
+    u32 n = 0;
+    for (u32 i = 0; i < s.len; i += 1) { if (s[i] == State.run) { n += 1; } }
+    return n;
+}
+
+u32 main() {
+    State[3] st;
+    st[1] = State.run;
+    st[2] = State.run;
+    if (count_run(st) != 2) { return 1; }        // T[N] -> [*]T for an enum element
+    Job a; Job b;
+    a.id = 5; b.id = 7;
+    ?*Job[2] ptrs;
+    ptrs[0] = &a; ptrs[1] = &b;
+    [*]?*Job view = ptrs;                       // pointer elements
+    if (view[1]) |t| { if (t.id != 7) { return 2; } } else { return 3; }
+    ?u32[2] maybe;
+    maybe[0] = 9;
+    [*]?u32 mv = maybe;                          // value-optional elements
+    u32 got = mv[0] orelse 0;
+    if (got != 9) { return 4; }
+    Op[2] ops;
+    ops[0] = dbl; ops[1] = dbl;
+    [*]Op fns = ops;                             // function-pointer elements
+    if (fns[1](4) != 8) { return 5; }            // indexed call is bounds-checked
+    return 0;
+}
+```
+
 **NOTES**
 - `[]T` is deprecated. Use `[*]T` instead. `[]T` emits a warning.
 - String literals are `const [*]u8`, not `char*`.
@@ -469,6 +514,11 @@ u32 result = safe_divide(10, 3) orelse 0;  // default to 0
   `if (x == 0)` would pass silently on a value that is not there. Unwrap first:
   `if (x) |v| { … v == 5 … }` or `x orelse 0 == 5`. A NULL-SENTINEL optional
   (`?*T`, `?FuncPtr`) IS the pointer at runtime and compares normally.
+- `??T` (an optional of an optional) is a compile error, and so is an optional of a
+  builtin CONTAINER — `?Arena`, `?Pool(T, N)`, `?Slab(T)`, `?Ring(T, N)`, `?Barrier`,
+  `?Semaphore(N)` — a container is a unique resource addressed by name, not a value
+  (declare the container itself, or hold a `*Barrier` / `*Semaphore`). `?T[N]` is an
+  ARRAY of optionals and `?Handle(T)` / `?[*]T` / `?*opaque` are all fine.
 
 **SEE ALSO**
 ?*T, orelse, if-unwrap
@@ -4007,6 +4057,30 @@ This covers negative shift counts too: a signed count that is negative
 (e.g. `i32 n = -1; x << n`) returns 0 rather than falling into C
 undefined behavior.
 
+**The width is the RESULT type's, and a shift does not promote.** The result of
+`a << n` has the common type of `a` and `n` (a literal count takes `a`'s type),
+exactly like `+`; there is no C-style promotion to `int`. So `u8 a = 200;
+u32 x = a << 4;` is a u8 shift — 3200 wraps to 128 — and `a << 8` is 0, where C
+would give 3200 and 51200. Widen first when you want the wide result:
+`u32 x = (u32)a << 4;` is 3200. The same rule folds at file scope: a global
+`const u32 S = B << 4;` with `const u8 B = 200;` is 128, and a constant count at
+or beyond the width (`const u32 Z = 1 << 200;`) folds to 0.
+
+```zer
+const u8 B = 200;
+const u32 S = B << 4;           // 128 — a u8 shift, wrapped
+const u32 Z = 1 << 200;         // 0 — over-width, folded at file scope
+u32 main() {
+    u8 a = 200;
+    u32 x = a << 4;             // 128
+    u32 y = (u32)a << 4;        // 3200 — widened first
+    u32 n = 40;
+    u32 z = 1 << n;             // 0 — count >= 32 at run time
+    if (x != 128 || y != 3200 || z != 0 || S != 128 || Z != 0) { return 1; }
+    return 0;
+}
+```
+
 ### Comparison
 `==  !=  <  >  <=  >=` — Returns bool.
 
@@ -4046,9 +4120,13 @@ compile error instead.
 
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
-- `(T)x` — C-style casts — use @truncate, @saturate, @bitcast
 - `,` — Comma operator
-- `goto` — Use structured control flow
+- Pointer arithmetic (`p + 1`) — index instead (`p[1]` on a `[*]T`)
+- Implicit narrowing or sign conversion — `(T)x` / `@truncate` / `@saturate` are
+  the explicit routes (C-style casts ARE supported — see "Casts")
+- `(*U)p` between two different pointer types — `@pun(*U, p)` is the audit-visible form
+
+(`goto` IS in ZER — see "goto + labels" above.)
 
 ---
 
@@ -4674,7 +4752,8 @@ Cross-statement ordering is safe because the emitter does lock→op→unlock per
 - No implicit narrowing or sign conversion
 - No undefined behavior
 - No `++` / `--`, no comma operator
-- No C-style casts
+- No C-style cast between two DIFFERENT pointer types (`@pun` is the explicit
+  route); value casts `(T)x` exist and are explicit, checked conversions
 - No header files (use `import`)
 - No preprocessor (use `comptime`)
 - No pointer arithmetic

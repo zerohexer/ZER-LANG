@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1025: the SCOPED spelling of spawn_arg_reads_freed_field — same raw-AST
+// argument position, same missed read.
+struct T { u32 v; }
+void w(u32 x) { }
+u32 main() {
+    *T p = alloc(T) orelse return;
+    p.v = 5;
+    free(p);
+    ThreadHandle th = spawn w(p.v);
+    th.join();
+    return 0;
+}

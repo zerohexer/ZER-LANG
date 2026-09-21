@@ -2827,6 +2827,14 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
              * chain, not the field access itself. */
             ir_check_expr_uaf(zc, func, ps, expr->call.callee->field.object,
                               line, rs);
+        } else if (expr->call.callee && expr->call.callee->kind == NODE_INDEX) {
+            /* BUG-1025: an INDEXED callee — `cbs[0](1)` on a heap slice of
+             * function pointers — READS the pointer out of the allocation
+             * before calling through it. `free(cbs); cbs[0](1)` compiled
+             * clean: the callee is never lowered (ir_lower decomposes only the
+             * arguments), and this arm walked only a FIELD callee's object. The
+             * whole index expression is a read, so walk it as one. */
+            ir_check_expr_uaf(zc, func, ps, expr->call.callee, line, rs);
         }
         break;
     case NODE_UNARY:
@@ -2974,6 +2982,10 @@ static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
         for (int i = 0; i < expr->call.arg_count; i++)
             ir_check_expr_wrong_pool(zc, func, ps, expr->call.args[i],
                                      line, rs);
+        /* BUG-1025: mirror the UAF walker — an indexed callee is a read of
+         * the slot it indexes (`pb.get(h).cbs[0]()` on a pa-allocated h). */
+        if (expr->call.callee && expr->call.callee->kind == NODE_INDEX)
+            ir_check_expr_wrong_pool(zc, func, ps, expr->call.callee, line, rs);
         break;
     case NODE_FIELD:
         ir_check_expr_wrong_pool(zc, func, ps, expr->field.object, line, rs);
@@ -3983,6 +3995,34 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          * ir_extract_compound_key to resolve both shapes uniformly,
          * mirroring the FIELD_WRITE move-transfer path (line 3119+) and
          * the IR_CALL extern_free path. */
+        /* BUG-1025 (2026-09-14): a spawn's arguments are PARENT-evaluated
+         * expressions read from the raw AST (one of the five raw-AST argument
+         * positions — see ir_lower.c call_bypasses_arg_lowering / NODE_SPAWN),
+         * so no IR_FIELD_READ / IR_INDEX_READ / IR_CALL is ever emitted for
+         * them and the generic UAF walker never saw them. The loop below only
+         * resolves the argument ITSELF to a handle: `spawn w(p.v)` after
+         * `free(p)` keyed (p, ".v"), found no compound, and asked nothing about
+         * `p`. Measured accepted, both spellings: `spawn w(p.v)`, `ThreadHandle
+         * th = spawn w(p.v)`, `spawn w(h.id)` (Handle auto-deref), `spawn
+         * w(s[0])` (freed heap slice), `spawn w(*p)`, `spawn w(rd(p))`. The
+         * emitted C reads the freed slot into the argument struct and the
+         * thread starts on it. Run the same two walkers every other
+         * value-consuming instruction runs, BEFORE the transfer marking below
+         * (which would otherwise overwrite the FREED state it is meant to
+         * report). */
+        {
+            UafReportSet sp_rs = {0};
+            UafReportSet sp_pool_rs = {0};
+            for (int i = 0; i < sp->spawn_stmt.arg_count; i++) {
+                if (!sp->spawn_stmt.args[i]) continue;
+                ir_check_expr_uaf(zc, func, ps, sp->spawn_stmt.args[i],
+                                  inst->source_line, &sp_rs);
+                ir_check_expr_wrong_pool(zc, func, ps, sp->spawn_stmt.args[i],
+                                         inst->source_line, &sp_pool_rs);
+            }
+            free(sp_rs.ids);
+            free(sp_pool_rs.ids);
+        }
         for (int i = 0; i < sp->spawn_stmt.arg_count; i++) {
             Node *arg = sp->spawn_stmt.args[i];
             if (!arg) continue;
@@ -4210,6 +4250,41 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         ir_carry_compounds(zc, ps, inst->src1_local, inst->dest_local, NULL, 0);
 
         IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
+        /* BUG-1026 (2026-09-14): a POINTER/slice/opaque/Handle PARAM copied into a
+         * local — `*T q = p;` — lowers to exactly this instruction, and a param
+         * has no handle until something gives it one. BUG-985 minted that
+         * identity at the ORELSE-unwrap spelling (`*T q = p orelse return;`,
+         * an IR_ASSIGN with a NODE_IDENT expr) and at the FIELD-read spelling
+         * (IR_FIELD_READ); the plain-copy spelling stayed a silent `break`, so
+         * no alias formed and `free(q)` afterwards was UNTRACKED:
+         *
+         *     void f(*T p) { *T q = p; free(q); q.v = 1; }   // UAF, accepted
+         *     void f(*T p) { *T q = p; free(q); }
+         *     u32 main() { *T x = alloc(T) …; f(x); free(x); }  // double free,
+         *                                          // ran clean, no diagnostic
+         *
+         * and the FuncSummary never learned that `f` frees its parameter, so the
+         * caller saw a false LEAK of `x` instead of the UAF it actually has. Same
+         * mint as the two sibling sites: ALIVE (the caller handed a live value),
+         * minted alloc_id, UNKNOWN color, escaped (a param is never this
+         * function's leak). Gated on the type carrying a reference, so a scalar
+         * param copy registers nothing. */
+        if (!src_h && inst->src1_local < func->local_count &&
+            func->locals[inst->src1_local].is_param) {
+            Type *pt = func->locals[inst->src1_local].type;
+            Type *pt_in = pt ? type_unwrap_optional(pt) : NULL;
+            TypeKind pk = pt_in ? type_dispatch_kind(pt_in) : TYPE_VOID;
+            if (ir_type_reads_as_ref(pt) || pk == TYPE_HANDLE) {
+                src_h = ir_add_handle(ps, inst->src1_local);
+                if (src_h) {
+                    src_h->state = IR_HS_ALIVE;
+                    src_h->alloc_line = inst->source_line;
+                    src_h->alloc_id = _ir_next_alloc_id++;
+                    src_h->source_color = ZC_COLOR_UNKNOWN;
+                    src_h->escaped = true;
+                }
+            }
+        }
         if (!src_h) break;
         /* Error if source is invalid */
         if (ir_is_invalid(src_h)) {
@@ -7189,7 +7264,26 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     /* Stage 2 Part B (2026-04-28): exhaustive — IR ops that don't
      * affect handle/move/lock state are no-ops here. Adding a new IR_
      * forces a deliberate decision (does it allocate/free/transfer?). */
-    case IR_BRANCH: case IR_GOTO: case IR_YIELD: case IR_AWAIT:
+    /* BUG-1025 (2026-09-14): an AWAIT condition is re-evaluated on every poll
+     * from the raw AST (ir_lower.c NODE_AWAIT keeps `expr`, cond_local = -1 —
+     * BUG-591), so nothing was decomposed into instructions the walker could
+     * see, and IR_AWAIT sat in the no-op list. `free(p); await p.id == 7;`
+     * compiled clean and the emitted poll read `self->p->id` on every resume.
+     * Same for `await gp.get(h).id == 7` after `gp.free(h)`. The existing
+     * negative (await_orelse_cond_uaf) only tested a use AFTER the await. */
+    case IR_AWAIT: {
+        if (inst->expr) {
+            UafReportSet rs = {0};
+            ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
+            UafReportSet pool_rs = {0};
+            ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
+                                     inst->source_line, &pool_rs);
+            free(pool_rs.ids);
+            free(rs.ids);
+        }
+        break;
+    }
+    case IR_BRANCH: case IR_GOTO: case IR_YIELD:
     case IR_LOCK: case IR_UNLOCK:
     case IR_ARENA_RESET: case IR_RING_PUSH: case IR_RING_POP:
     case IR_RING_PUSH_CHECKED:

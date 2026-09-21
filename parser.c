@@ -267,6 +267,29 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
  * Produces same TYNODE_FUNC_PTR shape as 2A — downstream code
  * (checker, IR lowering, emitter, zercheck_ir) is operator-agnostic.
  * ---------------------------------------------------------------- */
+/* Array suffix after a type: T[N] or T[N][M] (multi-dim: array of M elements of
+ * T[N]). ONE helper for the three places a declaration's `[N]` can follow a type
+ * (base type, `?T`, and the 2C funcptr `*(..) -> R`) — BUG-1030: the third of
+ * these had none, so the documented NON-nullable typedef-free array
+ * `*(u32) -> u32 [4] ops;` did not parse while `?*(u32) -> u32 [4] ops;` did.
+ * Honours `no_array_suffix` (BUG-878): inside a 2C RETURN type a `[` belongs to
+ * the declaration, not to the return type. Returns `base` unchanged otherwise. */
+static TypeNode *parse_array_suffix(Parser *p, TypeNode *base) {
+    if (p->no_array_suffix != 0 || !match(p, TOK_LBRACKET)) return base;
+    TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
+    arr->array.elem = base;
+    arr->array.size_expr = parse_expression(p);
+    consume(p, TOK_RBRACKET, "expected ']' after array size");
+    while (match(p, TOK_LBRACKET)) {
+        TypeNode *outer = new_type_node(p, TYNODE_ARRAY);
+        outer->array.elem = arr;
+        outer->array.size_expr = parse_expression(p);
+        consume(p, TOK_RBRACKET, "expected ']' after array size");
+        arr = outer;
+    }
+    return arr;
+}
+
 static TypeNode *parse_func_ptr_2c(Parser *p) {
     /* '*' already consumed. Consume '(' for parameter list. */
     consume(p, TOK_LPAREN, "expected '(' after '*' in funcptr type");
@@ -550,7 +573,9 @@ static TypeNode *parse_type_inner(Parser *p) {
         advance(p); /* consume '*' */
         bool is_2c = check(p, TOK_LPAREN);
         if (is_2c) {
-            return parse_func_ptr_2c(p);
+            /* BUG-1030: `*(u32) -> u32 [4] ops` — the array suffix belongs to the
+             * declaration (parse_func_ptr_2c leaves it, BUG-878). */
+            return parse_array_suffix(p, parse_func_ptr_2c(p));
         }
         /* Not 2C — restore and fall through to normal *T handling.
          * Restoring lets the existing match(TOK_STAR) below re-consume. */
@@ -609,15 +634,10 @@ static TypeNode *parse_type_inner(Parser *p) {
             }
         }
         /* Also handle ?T[N] where [N] is a suffix after the inner type
-         * (for named types like ?MyStruct[4]) */
-        if (match(p, TOK_LBRACKET)) {
-            TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
-            arr->array.elem = t;
-            arr->array.size_expr = parse_expression(p);
-            consume(p, TOK_RBRACKET, "expected ']' after array size");
-            return arr;
-        }
-        return t;
+         * (for named types like ?MyStruct[4], and `?*(..) -> R [N]`). Honours
+         * no_array_suffix so `*() -> ?u32 [3] ops` is an ARRAY of funcptrs
+         * returning ?u32, not a funcptr returning `?u32[3]` (BUG-878 class). */
+        return parse_array_suffix(p, t);
     }
 
     /* []T or [*]T — slice/dynamic pointer type */
@@ -653,23 +673,7 @@ static TypeNode *parse_type_inner(Parser *p) {
     /* BUG-878: inside a 2C funcptr RETURN type, a `[` belongs to the
      * DECLARATION (an array OF funcptrs), not to the return type — a ZER
      * function cannot return an array. Leave it for the caller. */
-    if (p->no_array_suffix == 0 && match(p, TOK_LBRACKET)) {
-        TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
-        arr->array.elem = base;
-        arr->array.size_expr = parse_expression(p);
-        consume(p, TOK_RBRACKET, "expected ']' after array size");
-        /* multi-dim: T[N][M] → array of M elements of T[N] */
-        while (match(p, TOK_LBRACKET)) {
-            TypeNode *outer = new_type_node(p, TYNODE_ARRAY);
-            outer->array.elem = arr;
-            outer->array.size_expr = parse_expression(p);
-            consume(p, TOK_RBRACKET, "expected ']' after array size");
-            arr = outer;
-        }
-        return arr;
-    }
-
-    return base;
+    return parse_array_suffix(p, base);
 }
 
 /* ================================================================

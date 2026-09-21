@@ -722,11 +722,19 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
             if (r == 0) return CONST_EVAL_FAIL;
             if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
             return l % r;
+        /* BUG-1031: a shift by a negative count, or by >= the operand width, is 0
+         * in ZER (`_zer_shl`/`_zer_shr`). This evaluator is UNTYPED, so only a
+         * count that is over-width for EVERY ZER integer width (uN goes to 128)
+         * can be folded here; [63,127] stays CONST_EVAL_FAIL and is decided by a
+         * typed site (checker.c eval_const_expr_subst knows the operand width;
+         * the emitter's global-initializer path knows the left operand's type). */
         case TOK_LSHIFT:
-            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            if (r < 0 || r >= 128) return 0;
+            if (r >= 63) return CONST_EVAL_FAIL;
             return (int64_t)((uint64_t)l << r);
         case TOK_RSHIFT:
-            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            if (r < 0 || r >= 128) return 0;
+            if (r >= 63) return CONST_EVAL_FAIL;
             return l >> r;
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;

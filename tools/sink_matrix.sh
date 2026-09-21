@@ -575,6 +575,21 @@ cell p26_optslice_call_uaf reject '?[*]u32 mk26d() { return alloc(u32, 4); } u32
 # BOUNDARY: a slice-returning function that allocates nothing is NOT an allocation.
 cell p26_safe_literal      compile 'const [*]u8 nm26() { return "ZER"; } u32 main(){ const [*]u8 n = nm26(); if (n.len != 3) { return 1; } return 0; }'
 cell p26_safe_param_view   compile '[*]u8 tr26([*]u8 s) { return s[1..3]; } u32 main(){ u8[4] b; b[1] = 9; [*]u8 t = tr26(b[0..4]); if (t[0] != 9) { return 1; } return 0; }'
+# p26, the SLOT half (BUG-1024): the same factory result stored into a SLOT rather
+# than a plain local. `ir_register_alloc_result_compound` only ever ran for a DIRECT
+# builtin allocation (`h.p = alloc(T)`), so a FACTORY result landing in a field or an
+# array element was registered nowhere.
+#
+# The shape is SLICE-ONLY, which is why nobody had written it: `[*]u32 mk() { ...
+# orelse return; ... }` is expressible because the zero of a slice is a legal slice
+# value, while the pointer spelling of the same function is refused outright by
+# BUG-974 (the zero of a non-null `*T` is the NULL its type forbids). And
+# `slot = <non-optional call>` lowers to ONE passthrough ASSIGN — no IR_CALL, no
+# IR_FIELD_WRITE — so neither the call-result arm nor the field-write arm saw it.
+cell p26_slot_field_uaf    reject 'struct H26{[*]u32 s;} [*]u32 mk26f() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26f(){ H26 h; h.s = mk26f(); free(h.s); return h.s[0]; } u32 main(){ return run26f(); }'
+cell p26_slot_index_uaf    reject '[*]u32 mk26g() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26g(){ [*]u32[2] a; a[0] = mk26g(); free(a[0]); return a[0][0]; } u32 main(){ return run26g(); }'
+cell p26_safe_slot_view    compile 'struct H26b{[*]u8 s;} [*]u8 tr26b([*]u8 s) { return s[1..3]; } u32 main(){ u8[4] b; b[1]=9; H26b h; h.s = tr26b(b[0..4]); if (h.s[0]!=9) { return 1; } return 0; }'
+cell p26_safe_slot_freed   compile 'struct H26c{[*]u32 s;} [*]u32 mk26h() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26h(){ H26c h; h.s = mk26h(); h.s[0]=7; u32 v=h.s[0]; free(h.s); return v; } u32 main(){ if (run26h()!=7) { return 1; } return 0; }'
 cell p26_safe_factory_ok   compile '[*]u32 mk26e() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26e(){ [*]u32 s = mk26e(); s[0] = 7; u32 v = s[0]; free(s); return v; } u32 main(){ if (run26e() != 7) { return 1; } return 0; }'
 
 echo ""

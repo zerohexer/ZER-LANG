@@ -142,6 +142,104 @@ if the rule widens past the three operators.
 
 ---
 
+## Session 2026-09-15 — BUG-1019: an indirect call through a NULL function pointer was silent on bare metal
+
+**Symptom.** Compiles clean, and the emitted C is a raw indirect call through address 0:
+
+    typedef u32 (*BinOp)(u32, u32);
+    BinOp[3] g_ops;                       // auto-zero fills it with NULL
+    u32 main() { g_ops[1] = add; return g_ops[0](1, 2); }
+
+    _zer_t3 = g_ops[0](_zer_t1, _zer_t2);   /* no guard */
+
+**Why it looked handled.** HOSTED, the jump faults and ZER's own SIGSEGV handler
+(installed for `@probe`) prints `ZER TRAP: memory access fault`, exit 133 — so a
+casual run looks safe. On BARE METAL with no MMU there is no handler and no fault:
+address 0 is the reset vector or ordinary memory, and the jump silently goes
+somewhere. Missed at compile time AND at run time, on the target that matters.
+
+**Why the compile-time rule does not reach it.** ZER keeps the non-null promise for
+a SCALAR funcptr structurally — `BinOp f;` is rejected with "function pointer
+requires an initializer" (BUG-866) at both local and global scope. Auto-zero fills an
+ARRAY ELEMENT and a STRUCT FIELD with NULL and neither is covered. Extending the
+initializer rule through the array was implemented and REVERTED before this session:
+ZER has no array-initializer syntax, so the rule would not say "initialize it", it
+would say "this type is unusable" — a feature removal (the dispatch-table idiom)
+traded for a partial safety gain, which the Ban Decision Framework says not to do
+when a tracking system can cover it.
+
+**Fix — TRACK, do not ban** (fix #1 in the gap file's own sketch). An indirect call
+emits
+
+    ({ __typeof__(CALLEE) _zer_fpN = CALLEE;
+       if (!_zer_fpN) _zer_trap("call through a null function pointer", __FILE__, __LINE__);
+       _zer_fpN; })(args)
+
+One predictable branch; GCC elides it wherever it can see the assignment. `_zer_trap`
+has a freestanding branch, so the guard is compiled in and fires on bare metal too —
+which is the whole point.
+
+**Single evaluation.** `__typeof__` does not evaluate its operand, so emitting the
+callee text twice still runs it exactly once. Pinned by a side-effecting index
+(`table[pick()](6, 7)` with a call counter) — the RF13 / BUG-661 double-eval class.
+
+**WHICH calls: every one whose callee is not a DIRECT function name.** Deliberately
+not an enumeration of the null-producing carriers. `BinOp f = g_ops[1]; f(1, 2);`
+launders an array element's NULL into a bare name through a perfectly type-correct
+assignment, so "guard INDEX and FIELD" would already have been wrong — the
+multi-site shape that keeps leaking in this codebase. Pinned by
+`funcptr_null_launder_bare_name_bug1019`.
+
+**Three emitter paths**, per CLAUDE.md's two-dispatch-paths rule (there are three
+here): the AST `emit_expr` NODE_CALL, the IR-rewritten `emit_rewritten_node`
+NODE_CALL, and the decomposed `IR_CALL` — which is the one that actually emitted the
+raw call. IR_CALL's callee emission was four inline branches that each emitted the
+callee text together with the opening `(`; they are now one helper
+`emit_ir_call_callee` (callee only, no paren) so the guard can wrap it. That
+factoring removed the duplication that made the site hard to touch.
+
+**Tests.** `tests/zer_trap/funcptr_null_array_element_bug1019.zer` and
+`funcptr_null_launder_bare_name_bug1019.zer` (both trap with the new message);
+`tests/zer/funcptr_null_guard_precision_bug1019.zer` — array element with a constant
+index, with a side-effecting index, struct field, bare-name local, funcptr param, and
+a direct call, all still correct.
+
+### The harness gap this exposed — `// expect-trap-msg:` and `ZER_MATRIX_ZERC`
+
+Proving the trap tests discriminate turned up two holes in the test harness itself,
+both fixed here.
+
+**`tests/zer_trap/` could not assert WHICH trap fired.** `expect-trap` demands
+SIGTRAP and `expect-trap-at` demands a line; neither says which safety rule produced
+it, so a trap test passes when a DIFFERENT rule traps on the same program. That is
+exactly the weak-oracle class CLAUDE.md documents for negatives ("a negative test
+proves nothing until you read the diagnostic"), one directory over — and it was LIVE:
+BUG-1019's program traps with exit 133 both before and after the fix, by two
+completely different mechanisms (signal handler vs compiled-in guard), one of which
+does not exist on bare metal. `// expect-trap-msg: <substring>` now asserts the
+reason, same optional shape as `expect-error`.
+
+**`tests/test_zer.sh` hardcoded `./zerc`.** So the integration suite could not be
+pointed at a pre-fix build — and running a new test "against the baseline" silently
+graded the current compiler instead. CLAUDE.md records this exact defect being fixed
+across all ten matrix grids (BUG-1010); the integration runner was the last harness
+without it. It now honours `ZER_MATRIX_ZERC`, and that is how every regression test
+in this session was shown to FIRE:
+
+    ZER_MATRIX_ZERC=/tmp/headb/zerc bash tests/test_zer.sh
+
+    FAIL: loop_step_index_guarded_bug1017 (exit 8)
+    FAIL: funcptr_null_array_element_bug1019 (expected trap message '...', got:
+          ZER TRAP: memory access fault — invalid MMIO or pointer)
+    FAIL: funcptr_null_launder_bare_name_bug1019 (same)
+    FAIL: const_divergent_mod_bug1018 (should have been rejected but compiled!)
+    FAIL: const_divergent_shift_bug1018 (should have been rejected but compiled!)
+    FAIL: const_signed_unsigned_divergent_bug1018 (should have been rejected but compiled!)
+
+with every precision pin passing on both sides.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

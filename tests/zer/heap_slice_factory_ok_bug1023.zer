@@ -1,0 +1,48 @@
+// BUG-1023 precision pin. Tracking a slice call result must not cost the idioms
+// that return a slice WITHOUT allocating one — a string literal, a subslice of a
+// parameter, a view. Each of those would otherwise acquire a false "never freed".
+//
+// An ungated first draft of the fix cost exactly three corpus files this way
+// (const_slice_return, optional_slice_coerce, gen_const_002); the shipped form
+// gates registration on the callee actually being able to allocate, and its
+// measured corpus cost is zero over 2492 files.
+
+// allocates -> tracked -> must be freed exactly once (and is)
+[*]u32 make() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    return s;
+}
+
+// allocates nothing: a literal in .rodata
+const [*]u8 name() { return "ZER"; }
+
+// allocates nothing: a subslice of the caller's memory
+[*]u8 trim([*]u8 s) { return s[1..3]; }
+
+// allocates nothing: a param passthrough through an optional
+?[*]u8 pick(bool b, [*]u8 s) { if (b) { return s; } return; }
+
+u32 run() {
+    [*]u32 s = make();
+    s[0] = 7;
+    u32 v = s[0];
+    free(s);
+    return v;
+}
+
+u32 main() {
+    if (run() != 7) { return 1; }
+
+    const [*]u8 n = name();
+    if (n.len != 3) { return 2; }
+
+    u8[4] b;
+    b[1] = 9;
+    [*]u8 t = trim(b[0..4]);
+    if (t[0] != 9) { return 3; }
+
+    ?[*]u8 r = pick(true, b[0..4]);
+    if (r) |v| { if (v.len != 4) { return 4; } } else { return 5; }
+
+    return 0;
+}

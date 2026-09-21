@@ -442,6 +442,56 @@ holes against the pre-fix build, 0 after. Matrix is 176 cells, CLEAN.
 
 ---
 
+## Session 2026-09-15 — BUG-1024: a factory's allocation stored into a SLOT was registered nowhere
+
+**Symptom.** Zero diagnostics; ASan: heap-use-after-free.
+
+    struct Box { [*]u32 s; }
+    [*]u32 make() { [*]u32 s = alloc(u32, 4) orelse return; return s; }
+    u32 run()     { Box b; b.s = make(); free(b.s); return b.s[0]; }
+
+**Root cause.** `ir_register_alloc_result_compound` (BUG-981) only ever ran for a
+DIRECT builtin allocation — `h.p = alloc(T)` — because the arm that calls it first
+requires `ir_classify_method_call_ex` to return `IRMC_ALLOC` / `ALLOC_PTR` /
+`ARENA_ALLOC`. A call to a USER FACTORY is none of those, so the store into the
+slot registered nothing. BUG-1023 had just fixed the same value landing in a plain
+LOCAL; this is its slot sibling.
+
+**Why the shape is SLICE-ONLY, which is why nobody had written it.** `[*]u32 mk()
+{ ... orelse return; ... }` is expressible because the zero of a slice
+(`{null, 0}`) is a legal slice value. The POINTER spelling of the very same
+function is refused outright by BUG-974 — the zero of a non-null `*T` is the NULL
+its type forbids — so there is no `*W mk()` factory to write, and the shape simply
+never came up for the carrier everyone tests.
+
+And `slot = <non-optional call>` lowers to ONE passthrough `%t = ASSIGN`, with no
+`IR_CALL` and no `IR_FIELD_WRITE` (confirmed with `--emit-ir`), so neither the
+call-result arm nor the field-write arm ever saw it. That is the BUG-933
+two-spellings-of-one-program shape for the third time.
+
+**Fix.** `ir_call_result_is_owned_alloc` — ONE query for "does this call hand the
+caller an allocation it now owns?" — and the existing arm now uses it to reach the
+SAME two helpers (`ir_register_alloc_result` for a plain target,
+`ir_register_alloc_result_compound` for a slot), so the factory spelling and the
+direct spelling cannot disagree. Conditions mirror the plain-local registration: a
+real summary, not arena-colored, `!ret_is_borrow`, not `returns_all_views`, not
+returning a static.
+
+**Corpus cost: ZERO**, compiler-classified over 2492 files.
+
+**Tests.** `heap_slice_factory_into_field_uaf_bug1024` (baseline ACCEPTS and reads
+freed memory, exit 8; now rejected) and
+`tests/zer/heap_slice_factory_into_field_ok_bug1024.zer`, the precision pin for the
+two slot stores that are NOT allocations — a view of the caller's array and a
+literal — plus correct use of a real factory.
+
+**Gate.** Four more cells in SHAPE p26 of `tools/sink_matrix.sh` (now 180 cells,
+CLEAN). Verified to FIRE: `p26_slot_field_uaf` is a HOLE on the pre-fix build.
+`p26_slot_index_uaf` passes on BOTH — the array-element spelling was already
+covered, and the cell is kept as coverage, not claimed as a fix.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

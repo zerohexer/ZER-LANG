@@ -84,6 +84,50 @@ BUG-1018's own new tests change verdict.
 
 ---
 
+## OPEN — an allocation stored in a BARE GLOBAL is tracked by nothing (2026-09-15, MEDIUM — measured UAF, carrier-independent)
+
+**Symptom (ASan-confirmed, compiles with zero diagnostics):**
+
+    [*]u32 g;
+    u32 run() { g = alloc(u32, 4) orelse return; free(g); return g[0]; }
+
+    AddressSanitizer: heap-use-after-free ... #0 in run ... gbl2.zer:2
+
+The POINTER spelling (`?*W g; g = alloc(W); ... free(q); ... g`) is accepted too;
+it does not show under ASan only because `alloc(T)` for a single object is an
+auto-Slab that recycles rather than returning to libc — the tracking gap is the
+same. Not specific to the factory forms fixed as BUG-1023/1024: the DIRECT
+`g = alloc(...)` is equally untracked.
+
+**Root cause.** `ir_global_projection_key` — the G5 mechanism that lets a global's
+storage be a tracked slot — opens with
+
+    if (expr->kind != NODE_FIELD && expr->kind != NODE_INDEX) return false;
+
+so it registers `g.p` and `g.arr[0]` and deliberately NOT bare `g`. Every sink
+resolves globals through `ir_extract_compound_key`, which is the only caller, so a
+bare global has no key anywhere and no sink can see it.
+
+**Why the obvious fix needs measuring first.** Admitting a bare global ident would
+make ~36 sinks start seeing bare globals at once. CLAUDE.md records that
+MAYBE_FREED globals at exit are deliberately NOT flagged, because that noises the
+legitimate register-context-then-callback pattern — so the widening has a real
+false-positive surface and must be measured, not argued. That is why it was not
+bolted onto BUG-1024.
+
+**Fix sketch.** Give `ir_global_projection_key` a bare-ident arm producing the key
+`(IR_GLOBAL_ROOT_ID, "g")`, gated on `ir_ident_is_unshadowed_global`, then measure
+the corpus compiler-classified (the `tools/`-style sweep: compile every corpus file
+with both binaries and diff exit status + diagnostic count). Expect the leak-at-exit
+rule to need the same escaped=true treatment `IR_GLOBAL_ROOT_ID` entries already
+carry — CLAUDE.md's invariant is that those entries ALWAYS carry `escaped=true`, so
+the UAF and double-free halves can land without the leak half.
+
+**Gate when it lands:** cells in SHAPE p26 of `tools/sink_matrix.sh` crossing
+{bare global, global field} x {direct alloc, factory} x {UAF, double-free}.
+
+---
+
 ## OPEN — `@inttoptr` to a POINTER-carrying (not enum-carrying) pointee is not refused (2026-09-13, LOW — unmeasured tightening, deliberately unshipped)
 
 BUG-989 rejects `@inttoptr` to a type that carries an ENUM, because an exhaustive switch

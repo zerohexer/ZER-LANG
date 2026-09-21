@@ -1,0 +1,38 @@
+// BUG-1024 precision pin. Tracking a factory result stored into a SLOT must not
+// cost the two slot stores that are NOT allocations — a view of the caller's
+// memory, and a literal — nor the correct use of a real factory.
+struct Box  { [*]u32 s; }
+struct View { [*]u8  s; }
+struct Name { const [*]u8 s; }
+
+[*]u32 make() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    return s;
+}
+[*]u8 trim([*]u8 s) { return s[1..3]; }
+const [*]u8 name() { return "ZER"; }
+
+u32 run() {
+    Box b;
+    b.s = make();
+    b.s[0] = 7;
+    u32 v = b.s[0];
+    free(b.s);            // freed exactly once — no leak, no double free
+    return v;
+}
+
+u32 main() {
+    if (run() != 7) { return 1; }
+
+    u8[4] raw;
+    raw[1] = 9;
+    View vw;
+    vw.s = trim(raw[0..4]);     // a view of main's own array, not an allocation
+    if (vw.s[0] != 9) { return 2; }
+
+    Name nm;
+    nm.s = name();              // a literal in .rodata, not an allocation
+    if (nm.s.len != 3) { return 3; }
+
+    return 0;
+}

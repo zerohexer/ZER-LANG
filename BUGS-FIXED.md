@@ -5,6 +5,76 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-15 — BUG-1017: an array index in the for-loop STEP was checked under the PRE-loop range
+
+**Symptom.** Compiles clean, ZERO warnings, real out-of-bounds read:
+
+    u32 main() {
+        u32[4] a;
+        a[0]=1; a[1]=1; a[2]=1; a[3]=1;
+        u32 last = 0;
+        for (u32 k = 0; k < 8; k += a[k]) { last = k; }   // a[4]..a[7]
+        return last;
+    }
+
+ASan: `stack-buffer-overflow ... READ of size 4 ... 'a' (line 2) <== Memory access at
+offset 48 overflows this variable`. The emitted step was a bare `k += a[k];` — no
+`_zer_bounds_check`, no auto-guard, no diagnostic.
+
+**Root cause.** In the `NODE_FOR` handler the step was CHECKED first, immediately after
+the init and BEFORE `vrp_invalidate_loop_body_writes` widened anything, so `a[k]` was
+proved against `k in [0,0]` — the counter's value *before* the loop. `mark_proven` is
+sticky, so the node stayed proven for the rest of compilation and the emitter dropped the
+check.
+
+This is BUG-1015 (2026-09-13, the CONDITION) at the one loop POSITION that fix did not
+cover. BUG-1015's own comment even reads "the CONDITION is checked AFTER the step and the
+body have widened every variable they write" — true of the ORDER, but the step's *own
+reads* were never re-checked under the widened environment. A slice keeps its dynamic
+`.len` check whatever VRP concludes, so as with BUG-1015 only FIXED ARRAYS miscompiled,
+which is why no slice-based test could see it.
+
+**Fix (checker.c, `case NODE_FOR`).** The step carries two obligations that cannot be the
+same call, so they are now two:
+
+- the step's WRITE must widen the counter BEFORE the condition is checked, or the
+  condition regresses to the BUG-1015 hole — so the early `check_expr(step)` is replaced
+  by `vrp_invalidate_loop_body_writes(c, step)`, which performs exactly that widening;
+- the step's READS must be checked under the LOOP-CARRIED range — so `check_expr(step)`
+  now runs AFTER the cond-derived narrowing, which is precisely the range the counter
+  holds when the step executes (the body only runs when the condition held).
+
+The later check is wrapped in `vrp_snap_take`/`vrp_snap_restore`: `check_expr` on
+`k += ...` re-widens `k` as a side effect, and the body — which runs BEFORE the step in
+each iteration — is entitled to keep the narrow `[init, bound-1]` the condition
+established. Without the snapshot the fix would have cost precision on every counted loop.
+
+**Precision kept.** `for (j = 0; j < 4; j += a[j])` on a `u32[4]` still emits nothing: the
+loop bound proves the index. Verified by reading the emitted C, not just the exit code.
+
+**Tests.**
+- `tests/zer/loop_step_index_guarded_bug1017.zer` — discriminates: pre-fix 0 warnings and
+  exit 7 (loop completes, 4 OOB reads); post-fix 1 warning and exit 0 (guard returns early).
+- `tests/zer/loop_step_index_proven_bug1017.zer` — the precision pin; fails if the fix
+  over-widens either the step or the body.
+
+**The gate — `tests/test_vrp_position_matrix.c` (11th matrix, in `make check`).** ZER's VRP
+runs on the AST, so every construct hand-manages the range environment at every POSITION it
+evaluates an expression. CLAUDE.md listed this class with "NO auto-gate — checklist every
+control-flow kind, and every POSITION a loop evaluates (init / cond / step / body)". The
+checklist has now leaked twice, so it is a gate: 17 cells crossing construct x position,
+13 STALE (the compiler must SAY SOMETHING — guard warning or error) and 4 PROVEN (the
+compiler must say NOTHING, elision kept). The oracle works because a proven fixed-array
+index emits literally nothing, so "compiled in silence" is the exact signature of both
+correct elision and the hole.
+
+**Verified to FIRE**, per the "a gate that has only ever passed is a script, not a net"
+rule: against a pre-fix build (`ZER_MATRIX_ZERC=/tmp/headb/zerc`) it reports **4 silent
+holes** — `for/step`, `for/step(expr-init)`, `for/step(call-arg)`, `for/step(nested)` —
+and 0 against the fixed compiler.
+
+---
+
 ## Session 2026-09-14 — BUG-1016: the BUG-976 depth-cap enumeration was not closed — eight more fail-open caps
 
 The 2026-09-13 doc audit had recorded (limitations.md) that eight depth caps still answered

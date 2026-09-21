@@ -1,0 +1,12 @@
+// expect-error: reads differently signed and unsigned
+// BUG-1018, the `>>` door — arithmetic vs logical shift.
+//
+//   signed  : (-8 >> 1) + 4  ==  -4 + 4  ==  0
+//   unsigned: (0xFFFFFFF8 >> 1) + 4  ==  0x7FFFFFFC + 4  ==  0x80000000
+//
+// The fold is 0, so again the folded-result rule is blind to it and the program used
+// to compile silently with the two readings 2147483648 apart.
+u32 main() {
+    u32 x = (-8 >> 1) + 4;
+    return x;
+}

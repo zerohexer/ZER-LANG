@@ -130,6 +130,30 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+
+    /* BUG-1027: slice typedefs for element types that have NO pre-emitted named
+     * typedef — pointer, optional-value, funcptr, array, nested slice, *opaque.
+     * Primitives/uN/enum/Handle reuse the preamble typedefs; struct/union get
+     * theirs at the declaration. Everything else used to fall through emit_type's
+     * exhaustive case list into the TYPE_UINT arm, which read `intn.bits` from a
+     * non-intn Type and named the slice `_zer_slice_u128` — a 16-byte stride over
+     * a 4-byte element (silent wrong reads, stack OOB, or a GCC error).
+     * Each entry is one structural element type, keyed by its mangled suffix;
+     * the typedef triple (`_zer_xslice_S`, `_zer_xvslice_S`, `_zer_xopt_slice_S`)
+     * is emitted once its named dependencies (structs/unions, inner exotic
+     * slices) have been emitted — see collect_exotic_slices / flush_exotic_slices. */
+    struct XSlice {
+        const char *suffix;     /* arena-owned mangled suffix */
+        Type *elem;             /* the element type (distinct-unwrapped) */
+        bool emitted;
+    } *xslices;
+    int xslice_count;
+    int xslice_capacity;
+    /* user struct/union types whose C definition has been emitted (the
+     * dependency set for flush_exotic_slices; compared by module prefix + name) */
+    Type **emitted_user_types;
+    int emitted_user_count;
+    int emitted_user_capacity;
 } Emitter;
 
 /* ---- API ---- */

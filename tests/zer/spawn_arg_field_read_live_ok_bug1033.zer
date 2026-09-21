@@ -1,0 +1,15 @@
+// BUG-1025 boundary: a scalar field read of a LIVE pointer in a spawn argument is
+// a value copy and must stay accepted; freeing after the spawn is fine.
+struct T { u32 v; }
+shared struct Box { u32 seen; }
+Box g;
+void w(u32 x) { g.seen = x; }
+u32 main() {
+    *T p = alloc(T) orelse return;
+    p.v = 5;
+    ThreadHandle th = spawn w(p.v);
+    th.join();
+    free(p);
+    if (g.seen != 5) { return 1; }
+    return 0;
+}

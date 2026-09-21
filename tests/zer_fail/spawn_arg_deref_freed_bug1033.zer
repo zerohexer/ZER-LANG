@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1025: `*p` (whole-struct copy) of a freed pointer in a spawn argument.
+struct T { u32 v; }
+void w(T x) { }
+u32 main() {
+    *T p = alloc(T) orelse return;
+    free(p);
+    spawn w(*p);
+    return 0;
+}

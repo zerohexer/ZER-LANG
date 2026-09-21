@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1025: Handle auto-deref in a spawn argument after the handle was freed.
+struct Item { u32 id; }
+Pool(Item, 4) gp;
+void w(u32 x) { }
+u32 main() {
+    Handle(Item) h = gp.alloc() orelse return;
+    gp.get(h).id = 3;
+    gp.free(h);
+    spawn w(h.id);
+    return 0;
+}

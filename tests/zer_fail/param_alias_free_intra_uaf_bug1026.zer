@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1026: the intra-function form — the alias of a param is freed and then
+// read inside the same body. Before the fix the only diagnostic was a FALSE
+// "never freed" leak on the caller's x.
+struct T { u32 v; }
+u32 f(*T p) {
+    *T q = p;
+    free(q);
+    q.v = 1;
+    return q.v;
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    return f(x);
+}

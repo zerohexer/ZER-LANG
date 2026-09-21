@@ -679,7 +679,6 @@ zercheck_ir.c:ir_check_expr_wrong_pool:NODE_ASM:asm_stmt.inputs
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_ASM:asm_stmt.outputs
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_AWAIT:await_stmt.cond
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_BLOCK:block.stmts
-zercheck_ir.c:ir_check_expr_wrong_pool:NODE_CALL:call.callee
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_CRITICAL:critical.body
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_DEFER:defer.body
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_DO_WHILE:while_stmt.body
@@ -808,7 +807,6 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # `pool` on every builtin method call. The arm descends `callee->field.object`
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
-zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
 
 # --- checker.c: checker_walk_guard_sites ---
 # BUG-955: this is the emit_auto_guards descent, MOVED from emitter.c so the

@@ -1,0 +1,37 @@
+// BUG-1027: `[*]?*T` (and `?[*]?*T`, a param, a volatile slice, a self-referential
+// field) emitted `_zer_slice_u128`: two pointers were read as one 16-byte element,
+// so s[1] read past a 2-element array. Now `_zer_xslice_p_N4_Task` with a
+// `struct Task**` ptr field, emitted on demand before its first use.
+struct Task { u32 id; [*]?*Task kids; }
+
+u32 sum([*]?*Task ts) {
+    u32 t = 0;
+    for (u32 i = 0; i < ts.len; i += 1) {
+        if (ts[i]) |p| { t += p.id; }
+    }
+    return t;
+}
+
+u32 main() {
+    Task a; Task b; Task c;
+    a.id = 2; b.id = 5; c.id = 11;
+    ?*Task[3] arr;
+    arr[0] = &a;
+    arr[2] = &b;
+    [*]?*Task s = arr;
+    if (s[1]) |x| { return 1; }
+    if (s[2]) |x| { if (x.id != 5) { return 2; } } else { return 3; }
+    if (sum(arr) != 7) { return 4; }
+    ?[*]?*Task m = s;
+    [*]?*Task u = m orelse return;
+    if (u[0]) |x| { if (x.id != 2) { return 5; } } else { return 6; }
+    volatile ?*Task[2] varr;
+    varr[1] = &c;
+    volatile [*]?*Task vs = varr;
+    if (vs[1]) |x| { if (x.id != 11) { return 7; } } else { return 8; }
+    ?*Task[1] kids;
+    kids[0] = &c;
+    a.kids = kids;
+    if (a.kids[0]) |k| { if (k.id != 11) { return 9; } } else { return 10; }
+    return 0;
+}

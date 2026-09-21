@@ -93,6 +93,8 @@ run_test handle_user 0
 run_test comptime_user 0
 # Multi-module: enum + switch across modules
 run_test enum_user 0
+# BUG-1029: alloc(T,n) inside an imported module
+run_test alloc_user 0
 
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*

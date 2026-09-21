@@ -1,0 +1,3 @@
+// expect-error: optional of 'Semaphore'
+// BUG-1033 sibling, LOCAL position: the same fall-through named `_zer_opt_u8 s`.
+u32 main() { ?Semaphore(2) s; return 0; }

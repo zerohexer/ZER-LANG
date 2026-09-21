@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1026: two hops — f copies its param into q and hands q to g, which frees it.
+struct T { u32 v; }
+void g(*T p) { free(p); }
+void f(*T p) {
+    *T q = p;
+    g(q);
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    x.v = 3;
+    f(x);
+    return x.v;
+}

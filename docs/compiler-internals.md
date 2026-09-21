@@ -1997,8 +1997,35 @@ Enums emit as `#define` constants, not C enums:
 - User types: as-is (`Task`, `State`, `Packet`)
 - Enum values: `_ZER_EnumName_variant` (e.g., `_ZER_State_idle`)
 - Optional typedefs: `_zer_opt_T` (e.g., `_zer_opt_u32`, `_zer_opt_StructName`, `_zer_opt_UnionName`)
-- Slice typedefs: `_zer_slice_T` (all primitives + `_zer_slice_StructName`, `_zer_slice_UnionName`)
+- Slice typedefs: `_zer_slice_T` (all primitives + `_zer_slice_StructName`, `_zer_slice_UnionName`);
+  enum elements reuse `_zer_slice_i32`, `Handle` elements `_zer_slice_u64`, `uN` the carrier's
 - Optional slice typedefs: `_zer_opt_slice_T` (all primitives + struct/union names)
+- **EXOTIC-element slice typedefs (BUG-1027, 2026-09-14): `_zer_xslice_<mangled>` /
+  `_zer_xvslice_<mangled>` / `_zer_xopt_slice_<mangled>`** for every element kind that has no
+  pre-emitted named typedef — pointer, value optional, funcptr, array, nested slice, `*opaque`,
+  builtin containers. ONE query names every slice: `emit_slice_name(e, elem, is_volatile, is_opt)`
+  (emitter.c, next to `intn_carrier_suffix`); the three hand-rolled suffix switches it replaced
+  (emit_type TYPE_SLICE, emit_type `?[*]T`, the NODE_SLICE literal) each let the non-primitive
+  kinds fall through an exhaustive case list into the G1 `TYPE_UINT` arm, which read `intn.bits`
+  from a non-intn Type and named EVERY such slice `_zer_slice_u128` — a 16-byte stride over a
+  4-byte enum element (measured: wrong value, then a stack OOB read), two pointers read as one,
+  a trapping `[*]Handle(T)`, and invalid C for a funcptr element. The mangling is injective
+  (`p`/`pc`/`pv`/`pcv` pointer, `o_` value optional, `s_`/`sv_` slice, `a<N>_` array,
+  `f<n>_<ret>_<params>` funcptr, `N<len>_<name>` struct / `M<len>_<name>` union — length-prefixed
+  so a user struct named `p_Task` cannot collide with `[*]*Task`, and the `x` prefix keeps the
+  namespace separate from the user-name typedefs). Emission: `collect_exotic_slices` walks the
+  checker's typemap + container stamps once per module (visited-set over `Type *`, the graph is
+  cyclic through struct fields) into `Emitter.xslices`; `flush_exotic_slices` runs BEFORE each
+  pass-1 declaration and after pass 1 / the container stamps, emitting each entry once its named
+  dependencies exist (`xslice_deps_ready`: a struct reached by VALUE or under an ARRAY must be
+  defined — C needs it complete — but one reached only through a POINTER need not be, which is
+  what lets `struct Task { [*]?*Task kids; }` compile; a nested exotic slice must be emitted
+  first, so the flush iterates to a fixpoint). `record_user_type_emitted` at the struct, union and
+  container-stamp emitters is the dependency set. `emit_ptr_to_elem[_named]` spells the `ptr`
+  field / the array->slice cast — `ret (**ptr)(params)` for a funcptr element and `T (*ptr)[N]`
+  for an array element; `emit_type(elem)*` is wrong for both. **Adding a slice-naming site? Call
+  `emit_slice_name`. Adding an element KIND? It is one arm in `xslice_suffix_append` (exhaustive,
+  `-Werror=switch`) and one in `slice_elem_is_exotic`.**
 - Temporaries: `_zer_tmp0`, `_zer_uw0` (unwrap), `_zer_or0` (orelse), `_zer_sat0` (saturate)
 - Pool helpers: `_zer_pool_alloc`, `_zer_pool_get`, `_zer_pool_free`
 - Ring helper: `_zer_ring_push`
@@ -7373,6 +7400,33 @@ From analysis of Rust's test tree, these categories stress ZER's model the harde
 When adding new tests, prioritize these categories. Skip: closures, generics, traits, iterators, async runtime (Rust-specific features ZER doesn't have).
 
 ---
+
+## zercheck_ir.c — RAW-AST POSITIONS must run the expression walkers (BUG-1025, 2026-09-14)
+
+`ir_lower.c` decomposes most expressions into IR locals, and the handle-state checks run on
+the instruction stream. FIVE argument positions are NOT decomposed and stay as raw AST on the
+instruction: builtin method args, universal `free(...)`, **spawn args** (an `IR_NOP` whose
+`expr` is the NODE_SPAWN), asm operands and the orelse subject; the **await condition** stays
+as AST on `IR_AWAIT` (re-evaluated per poll). Every one of these must be walked by
+`ir_check_expr_uaf` + `ir_check_expr_wrong_pool` explicitly, or a freed handle read inside it
+is invisible. Spawn args and await conditions were not (`spawn w(h.field)` after `free(h)` ran
+and read the recycled slot; `await h.ready` likewise), and the NODE_CALL arm of both walkers
+descended a NODE_FIELD callee but not a NODE_INDEX one, so `s[i](x)` through a freed slice
+was unwalked. **When you add an instruction that carries raw AST, add the two walker calls in
+the same commit; when you add a callee form to the parser, add it to both NODE_CALL arms** —
+`tools/audit_walker_fields.sh` baselines the field-coverage gaps, so a new unvisited field is
+a baseline change you have to justify.
+
+**Param identity is minted at THREE sites, not one (BUG-1026).** A pointer/handle PARAM has no
+allocation event, so its `IRHandleInfo` is created on first sight. The sites: the IR_ASSIGN
+ident arm, IR_FIELD_READ, and (missing until BUG-1026) **IR_COPY** — the plain `*T q = p;`
+alias. Without the third, `q` had no identity, `free(q)` then `p.v` was reported only as a
+false "never freed" LEAK (the real UAF diagnostic never fired), and the cross-function form
+`f(x); free(x)` where `f` frees its param ran as a silent double free (exit 0). A minted param
+entry is ALIVE, `source_color = ZC_COLOR_UNKNOWN`, `escaped = true` (a param is the caller's,
+so it is never a leak here). Gate: `param_alias_*_bug1026` negatives with `expect-error: use
+after free` — the directive is what makes them discriminate, since the pre-fix build also
+rejected them, for the wrong reason.
 
 ## zercheck_ir.c architecture (2026-04-19, CFG migration Phases B+C)
 

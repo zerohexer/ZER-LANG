@@ -1,0 +1,18 @@
+// BUG-1025 boundary: an await condition reading a LIVE heap pointer is accepted;
+// the free happens after the await completes.
+struct Item { u32 id; }
+u32 g_done;
+async void w() {
+    *Item p = alloc(Item) orelse return;
+    p.id = 7;
+    await p.id == 7;
+    g_done = 1;
+    free(p);
+}
+u32 main() {
+    _zer_async_w t;
+    _zer_async_w_init(&t);
+    while (_zer_async_w_poll(&t) == 0) { }
+    if (g_done != 1) { return 1; }
+    return 0;
+}

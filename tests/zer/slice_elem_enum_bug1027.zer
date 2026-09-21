@@ -1,0 +1,31 @@
+// BUG-1027: a slice whose element is an ENUM emitted `_zer_slice_u128` — the
+// exhaustive case list in emit_type fell through into the uN carrier arm and read
+// `intn.bits` from a non-intn Type. A 16-byte stride over 4-byte elements: s[1]
+// read the wrong element and s[2] read past the array. Four spellings: plain
+// array->slice, sub-slice, struct field, container field.
+enum State { idle, run }
+struct Holder { [*]State st; }
+container Box(T) { [*]T items; u32 n; }
+
+u32 main() {
+    State[4] a;
+    a[1] = State.run;
+    a[3] = State.run;
+    [*]State s = a;
+    if (s[1] != State.run) { return 1; }
+    if (s[2] != State.idle) { return 2; }
+    if (s[3] != State.run) { return 3; }
+    [*]State t = a[1..];
+    if (t[2] != State.run) { return 4; }
+    Holder h;
+    h.st = a;
+    if (h.st[3] != State.run) { return 5; }
+    Box(State) b;
+    b.items = a;
+    b.n = 4;
+    if (b.items[1] != State.run) { return 6; }
+    ?[*]State m = s;
+    [*]State u = m orelse return;
+    if (u[3] != State.run) { return 7; }
+    return 0;
+}

@@ -84,6 +84,36 @@ BUG-1018's own new tests change verdict.
 
 ---
 
+## OPEN — `@cond_timedwait` on a freestanding build reports a raw C message (2026-09-15, LOW — message quality only)
+
+**Symptom.** A bare-metal build of a program using `@cond_timedwait`:
+
+    out.c:22:167: error: storage size of '_zer_ts0' isn't known
+
+The feature genuinely cannot exist freestanding — it needs `struct timespec` and
+`clock_gettime` — so refusing is right. What is wrong is that the refusal names a
+temporary in generated C rather than the ZER feature and the reason. Same defect
+BUG-1022 fixed for `Barrier` / `Semaphore`, at the one sibling it did not reach.
+
+**Why it was not fixed with the others.** BUG-1022's trick is a `#define` in the
+non-hosted branch that puts the reason into the type NAME GCC prints. That works
+because `_zer_barrier` is a plain typedef name. `struct timespec` is a struct TAG
+used inline at two emission sites, and GCC's "storage size isn't known" prints the
+VARIABLE, not the type, so redefining the tag does not improve the message.
+
+**Fix sketch.** Emit a guarded `#error` at the two `@cond_timedwait` emission
+sites (`emitter.c` ~4301 and ~10545) — emitted only where a timedwait actually
+occurs, so a freestanding program that does not use one is unaffected, exactly as
+BUG-1022's macros are. The mechanical part is that both sites emit mid-expression
+(`({ struct timespec ... `), so the directive has to be written on its own lines
+before the statement expression opens.
+
+**Measured**: 38 files in `rust_tests` hit this on each `bare` row of
+`tools/cross_target_sweep.sh` (the Barrier/Semaphore floor plus these); all
+`hosted` rows are 544/544 clean on every target.
+
+---
+
 ## OPEN — an allocation stored in a BARE GLOBAL is tracked by nothing (2026-09-15, MEDIUM — measured UAF, carrier-independent)
 
 **Symptom (ASan-confirmed, compiles with zero diagnostics):**

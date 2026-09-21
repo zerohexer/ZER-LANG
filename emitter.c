@@ -571,6 +571,119 @@ static bool ir_op_takes_auto_guards(IROpKind op) {
     }
     return true;   /* unreachable; conservative if a cast smuggles a bad value in */
 }
+static void emit_local_name(Emitter *e, IRFunc *func, int local_id);
+static void emit_unreachable(Emitter *e, const char *what, Node *n);
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
+
+/* BUG-1019: the IR_CALL callee text, factored out of the four inline branches
+ * that used to emit it together with the opening `(`. Emits ONLY the callee —
+ * no paren — so the caller can either open the arg list directly or wrap the
+ * callee in the null-funcptr guard. Four shapes: a direct/mangled name, a
+ * struct-field funcptr, an array-element funcptr, and the unreachable
+ * fallback. */
+static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
+    /* Emit callee: simple ident or field access (funcptr through struct) */
+    if (inst->func_name) {
+        /* Check for cross-module function needing mangled name */
+        Symbol *fsym = scope_lookup(e->checker->global_scope,
+            inst->func_name, inst->func_name_len);
+        if (fsym && fsym->is_function && fsym->module_prefix) {
+            emit(e, "%.*s__%.*s",
+                 (int)fsym->module_prefix_len, fsym->module_prefix,
+                 (int)inst->func_name_len, inst->func_name);
+        } else {
+            emit(e, "%.*s", (int)inst->func_name_len, inst->func_name);
+        }
+    } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+               inst->expr->call.callee &&
+               inst->expr->call.callee->kind == NODE_FIELD) {
+        /* Struct field callee: obj.method or obj->method */
+        Node *callee = inst->expr->call.callee;
+        /* Emit object name from local or rewritten ident */
+        if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
+            int obj_id = -1;
+            for (int li = 0; li < func->local_count; li++) {
+                if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
+                    memcmp(func->locals[li].name, callee->field.object->ident.name,
+                           func->locals[li].name_len) == 0) {
+                    obj_id = li; break;
+                }
+            }
+            if (obj_id >= 0) {
+                Type *ot = func->locals[obj_id].type;
+                Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
+                emit_local_name(e, func, obj_id);
+                emit(e, "%s%.*s",
+                     (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
+                     (int)callee->field.field_name_len, callee->field.field_name);
+            } else {
+                /* Global/extern funcptr */
+                emit(e, "%.*s.%.*s",
+                     (int)callee->field.object->ident.name_len,
+                     callee->field.object->ident.name,
+                     (int)callee->field.field_name_len, callee->field.field_name);
+            }
+        } else {
+            emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
+        }
+    } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+               inst->expr->call.callee &&
+               inst->expr->call.callee->kind == NODE_INDEX) {
+        /* Array-indexed funcptr: arr[i](args) */
+        Node *idx_callee = inst->expr->call.callee;
+        if (idx_callee->index_expr.object->kind == NODE_IDENT) {
+            int arr_id = -1;
+            for (int li = 0; li < func->local_count; li++) {
+                if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.object->ident.name_len &&
+                    memcmp(func->locals[li].name, idx_callee->index_expr.object->ident.name,
+                           func->locals[li].name_len) == 0) {
+                    arr_id = li; break;
+                }
+            }
+            if (arr_id >= 0) {
+                emit_local_name(e, func, arr_id);
+            } else {
+                /* Global array */
+                emit(e, "%.*s", (int)idx_callee->index_expr.object->ident.name_len,
+                     idx_callee->index_expr.object->ident.name);
+            }
+            emit(e, "[");
+            /* Index expression — support NODE_IDENT (local or global)
+             * and NODE_INT_LIT (constant). BUG-587: the old "non-ident
+             * fallback" emitted literal `0` for every non-ident index,
+             * so `ops[0](...)` and `ops[1](...)` both became `ops[0](...)`. */
+            Node *idx_node = idx_callee->index_expr.index;
+            if (idx_node->kind == NODE_IDENT) {
+                int idx_id = -1;
+                for (int li = 0; li < func->local_count; li++) {
+                    if (func->locals[li].name_len == (uint32_t)idx_node->ident.name_len &&
+                        memcmp(func->locals[li].name, idx_node->ident.name,
+                               func->locals[li].name_len) == 0) {
+                        idx_id = li; break;
+                    }
+                }
+                if (idx_id >= 0)
+                    emit_local_name(e, func, idx_id);
+                else
+                    emit(e, "%.*s", (int)idx_node->ident.name_len,
+                         idx_node->ident.name);
+            } else if (idx_node->kind == NODE_INT_LIT) {
+                emit(e, "%llu", (unsigned long long)idx_node->int_lit.value);
+            } else {
+                /* Fallback: emit the index expression via the rewritten
+                 * AST emitter. Handles complex cases like arr[i+1] or
+                 * arr[func()]. */
+                emit_rewritten_node(e, idx_node, func);
+            }
+            emit(e, "]");
+        } else {
+            emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
+        }
+    } else {
+        emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
+    }
+}
+
 static void emit_defers(Emitter *e);
 
 /* Emit the zero value for a type (used by auto-guard return, auto-orelse).
@@ -1232,6 +1345,62 @@ static void emit_unreachable(Emitter *e, const char *what, Node *n) {
             n ? " at line " : "", n ? "" : "");
     if (n) fprintf(stderr, "  (source line %d)\n", n->loc.line);
     abort();
+}
+
+/* ================================================================
+ * BUG-1019 — the null-function-pointer guard
+ *
+ * ZER promises a non-null `*T`, and for a SCALAR funcptr it keeps that promise
+ * structurally: `B f;` and `B g;` at global scope are both rejected ("function
+ * pointer requires an initializer", BUG-866). But auto-zero fills an ARRAY
+ * ELEMENT and a STRUCT FIELD of funcptr type with NULL, and neither carrier is
+ * covered by that rule — ZER has no array-initializer syntax, so extending the
+ * rule through the array was implemented and REVERTED (it would have removed the
+ * dispatch-table idiom rather than initialise it; see tests/zer_gaps/
+ * funcptr_array_null_element.zer for that history).
+ *
+ * So the value really can be NULL, and until now the emitted C was a raw
+ * indirect call: `_zer_t3 = g_ops[0](_zer_t1, _zer_t2);`. HOSTED, that faults
+ * and ZER's SIGSEGV handler prints a trap — which is why it looked handled. On
+ * BARE METAL with no MMU there is no handler and no fault: address 0 is the
+ * reset vector or ordinary memory, and the jump silently goes somewhere. That is
+ * the silent-on-target class: missed at compile time AND at run time.
+ *
+ * TRACK, do not ban — the Ban Decision Framework's answer, and the one the gap
+ * file names as fix #1. One predictable branch before an indirect call; GCC
+ * elides it wherever it can see the assignment.
+ *
+ * WHICH CALLS. Every call whose callee is not a DIRECT function name. Not an
+ * enumeration of the null-producing carriers — enumerating them is the
+ * multi-site shape that keeps leaking here (a bare `B f = g_ops[0];` launders an
+ * array element's NULL into a scalar name, so "only guard INDEX and FIELD"
+ * would already be wrong). Unless the callee resolves to a function symbol, it
+ * is guarded.
+ *
+ * SINGLE EVALUATION. `__typeof__` does not evaluate its operand, so emitting the
+ * callee text twice — once inside `__typeof__`, once as the initialiser — still
+ * evaluates it exactly once at run time. That matters: a callee like
+ * `ops[next()]` must not run `next()` twice (the RF13 / BUG-661 double-eval
+ * class).
+ * ================================================================ */
+
+/* Does `callee` name a function DIRECTLY (so the call is not indirect)? */
+static bool callee_is_direct_function(Emitter *e, Node *callee) {
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    if (!e->checker) return false;
+    Symbol *s = scope_lookup(e->checker->global_scope, callee->ident.name,
+                             (uint32_t)callee->ident.name_len);
+    return s && s->is_function;
+}
+
+/* Is this call an INDIRECT call through a non-optional function pointer?
+ * An OPTIONAL funcptr (`?B`) is not guarded here: it cannot be called without
+ * being unwrapped first, and the unwrap is what proves it non-null. */
+static bool call_needs_null_funcptr_guard(Emitter *e, Node *callee) {
+    if (!callee) return false;
+    if (callee_is_direct_function(e, callee)) return false;
+    Type *t = e->checker ? checker_get_type(e->checker, callee) : NULL;
+    return t && type_dispatch_kind(t) == TYPE_FUNC_PTR;
 }
 
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
@@ -2732,7 +2901,21 @@ static void emit_expr(Emitter *e, Node *node) {
 
         if (!handled) {
             /* normal function call */
-            emit_expr(e, node->call.callee);
+            /* BUG-1019: guard an indirect call through a possibly-NULL funcptr.
+             * AST dispatch path (the defer-body / spawn-arg emitter); the IR
+             * paths carry the same guard — CLAUDE.md's "two emitter dispatch
+             * paths" rule. */
+            if (call_needs_null_funcptr_guard(e, node->call.callee)) {
+                int fpt = e->temp_count++;
+                emit(e, "({ __typeof__(");
+                emit_expr(e, node->call.callee);
+                emit(e, ") _zer_fp%d = ", fpt);
+                emit_expr(e, node->call.callee);
+                emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                        "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
+            } else {
+                emit_expr(e, node->call.callee);
+            }
             emit(e, "(");
             Type *callee_type = checker_get_type(e->checker,node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
@@ -8099,7 +8282,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
         }
-        emit_rewritten_node(e, node->call.callee, func);
+        /* BUG-1019: same guard on the IR-rewritten dispatch path. */
+        if (call_needs_null_funcptr_guard(e, node->call.callee)) {
+            int fpt = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->call.callee, func);
+            emit(e, ") _zer_fp%d = ", fpt);
+            emit_rewritten_node(e, node->call.callee, func);
+            emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                    "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
+        } else {
+            emit_rewritten_node(e, node->call.callee, func);
+        }
         emit(e, "(");
         for (int i = 0; i < node->call.arg_count; i++) {
             if (i > 0) emit(e, ", ");
@@ -11184,105 +11378,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
                 }
             }
-            /* Emit callee: simple ident or field access (funcptr through struct) */
-            if (inst->func_name) {
-                /* Check for cross-module function needing mangled name */
-                Symbol *fsym = scope_lookup(e->checker->global_scope,
-                    inst->func_name, inst->func_name_len);
-                if (fsym && fsym->is_function && fsym->module_prefix) {
-                    emit(e, "%.*s__%.*s(",
-                         (int)fsym->module_prefix_len, fsym->module_prefix,
-                         (int)inst->func_name_len, inst->func_name);
+            /* Emit callee (BUG-1019: guarded when the call is indirect — this is
+             * the path that emitted the raw `g_ops[0](...)` through NULL). */
+            {
+                Node *icallee = (inst->expr && inst->expr->kind == NODE_CALL)
+                                  ? inst->expr->call.callee : NULL;
+                bool guard = icallee && call_needs_null_funcptr_guard(e, icallee);
+                if (guard) {
+                    int fpt = e->temp_count++;
+                    emit(e, "({ __typeof__(");
+                    emit_ir_call_callee(e, inst, func);
+                    emit(e, ") _zer_fp%d = ", fpt);
+                    emit_ir_call_callee(e, inst, func);
+                    emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                            "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
                 } else {
-                    emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+                    emit_ir_call_callee(e, inst, func);
                 }
-            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
-                       inst->expr->call.callee &&
-                       inst->expr->call.callee->kind == NODE_FIELD) {
-                /* Struct field callee: obj.method or obj->method */
-                Node *callee = inst->expr->call.callee;
-                /* Emit object name from local or rewritten ident */
-                if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
-                    int obj_id = -1;
-                    for (int li = 0; li < func->local_count; li++) {
-                        if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
-                            memcmp(func->locals[li].name, callee->field.object->ident.name,
-                                   func->locals[li].name_len) == 0) {
-                            obj_id = li; break;
-                        }
-                    }
-                    if (obj_id >= 0) {
-                        Type *ot = func->locals[obj_id].type;
-                        Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
-                        emit_local_name(e, func, obj_id);
-                        emit(e, "%s%.*s(",
-                             (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
-                             (int)callee->field.field_name_len, callee->field.field_name);
-                    } else {
-                        /* Global/extern funcptr */
-                        emit(e, "%.*s.%.*s(",
-                             (int)callee->field.object->ident.name_len,
-                             callee->field.object->ident.name,
-                             (int)callee->field.field_name_len, callee->field.field_name);
-                    }
-                } else {
-                    emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
-                }
-            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
-                       inst->expr->call.callee &&
-                       inst->expr->call.callee->kind == NODE_INDEX) {
-                /* Array-indexed funcptr: arr[i](args) */
-                Node *idx_callee = inst->expr->call.callee;
-                if (idx_callee->index_expr.object->kind == NODE_IDENT) {
-                    int arr_id = -1;
-                    for (int li = 0; li < func->local_count; li++) {
-                        if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.object->ident.name_len &&
-                            memcmp(func->locals[li].name, idx_callee->index_expr.object->ident.name,
-                                   func->locals[li].name_len) == 0) {
-                            arr_id = li; break;
-                        }
-                    }
-                    if (arr_id >= 0) {
-                        emit_local_name(e, func, arr_id);
-                    } else {
-                        /* Global array */
-                        emit(e, "%.*s", (int)idx_callee->index_expr.object->ident.name_len,
-                             idx_callee->index_expr.object->ident.name);
-                    }
-                    emit(e, "[");
-                    /* Index expression — support NODE_IDENT (local or global)
-                     * and NODE_INT_LIT (constant). BUG-587: the old "non-ident
-                     * fallback" emitted literal `0` for every non-ident index,
-                     * so `ops[0](...)` and `ops[1](...)` both became `ops[0](...)`. */
-                    Node *idx_node = idx_callee->index_expr.index;
-                    if (idx_node->kind == NODE_IDENT) {
-                        int idx_id = -1;
-                        for (int li = 0; li < func->local_count; li++) {
-                            if (func->locals[li].name_len == (uint32_t)idx_node->ident.name_len &&
-                                memcmp(func->locals[li].name, idx_node->ident.name,
-                                       func->locals[li].name_len) == 0) {
-                                idx_id = li; break;
-                            }
-                        }
-                        if (idx_id >= 0)
-                            emit_local_name(e, func, idx_id);
-                        else
-                            emit(e, "%.*s", (int)idx_node->ident.name_len,
-                                 idx_node->ident.name);
-                    } else if (idx_node->kind == NODE_INT_LIT) {
-                        emit(e, "%llu", (unsigned long long)idx_node->int_lit.value);
-                    } else {
-                        /* Fallback: emit the index expression via the rewritten
-                         * AST emitter. Handles complex cases like arr[i+1] or
-                         * arr[func()]. */
-                        emit_rewritten_node(e, idx_node, func);
-                    }
-                    emit(e, "](");
-                } else {
-                    emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
-                }
-            } else {
-                emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
+                emit(e, "(");
             }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");

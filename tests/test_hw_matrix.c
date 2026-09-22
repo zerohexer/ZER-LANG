@@ -314,7 +314,28 @@ static const char *vshape_flags(VShape s) {
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
+               RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
+               RFORM_PARAM_CALL_ARG, RFORM_PARAM_RETURN, RFORM_PARAM_IF_COND,
                RFORM_COUNT } RForm;
+/* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
+ * walker are exhaustive descents of the body that performs the RMW; the MAIN
+ * side is different code — plain main-line code calling a helper, answered by
+ * the per-function summary func_rmw_param_mask (BUG-801) — and that summary was
+ * a partial if-chain. Six POSITIONS of `*p += 1` inside the helper were invisible
+ * to it and only to it, so a grid with two sites could not have shown the hole:
+ * the ISR and spawn cells for those forms pass on the pre-fix compiler. RSite is
+ * separate from VSite so the volatile-width and static-local grids, whose
+ * `else` branch means "ISR", are untouched. */
+typedef enum { RSITE_SPAWN, RSITE_ISR, RSITE_MAIN, RSITE_COUNT } RSite;
+static const char *rsite_name(RSite s) {
+    switch (s) {
+    case RSITE_SPAWN: return "spawn";
+    case RSITE_ISR:   return "isr";
+    case RSITE_MAIN:  return "main";
+    case RSITE_COUNT: break;
+    }
+    return "?";
+}
 static const char *rform_name(RForm f) {
     switch (f) {
     case RFORM_NAMED_COMPOUND:  return "named g+=1";
@@ -325,6 +346,12 @@ static const char *rform_name(RForm f) {
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
     case RFORM_SPLIT_STMT:      return "split t=g;g=t+1";
     case RFORM_SPLIT_2HOP:      return "split 2-hop";
+    case RFORM_PARAM_SWITCH:    return "param in switch";
+    case RFORM_PARAM_ONCE:      return "param in @once";
+    case RFORM_PARAM_ORELSE:    return "param in orelse{}";
+    case RFORM_PARAM_CALL_ARG:  return "param as call arg";
+    case RFORM_PARAM_RETURN:    return "param in return";
+    case RFORM_PARAM_IF_COND:   return "param in if cond";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -345,18 +372,47 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
      * pins the taint being TRANSITIVE — a local reading a local that read g. */
     case RFORM_SPLIT_STMT:     *helper = "";                                    *body = "u32 t = g; g = t + 1;"; break;
     case RFORM_SPLIT_2HOP:     *helper = "";                                    *body = "u32 t = g; u32 u = t; g = u + 1;"; break;
+    /* BUG-1043: the SAME `*p += 1` through a pointer param, in six POSITIONS the
+     * main-side summary walk never descended. Each was accepted at the main site
+     * (a torn ISR/main update, silent on bare metal) while the plain
+     * RFORM_PTR_PARAM body was rejected — the position axis, not the spelling one. */
+    case RFORM_PARAM_SWITCH:   *helper = "void bump(volatile *u32 p, u32 k){ switch (k) { 0 => { *p += 1; } default => { } } }";
+                                                                                 *body = "bump(&g, 0);";   break;
+    case RFORM_PARAM_ONCE:     *helper = "void bump(volatile *u32 p){ @once { *p += 1; } }"; *body = "bump(&g);"; break;
+    case RFORM_PARAM_ORELSE:   *helper = "?u32 mb(u32 x){ if (x > 0) { return x; } return null; }\n"
+                                         "void bump(volatile *u32 p, u32 k){ u32 v = mb(k) orelse { *p += 1; return; }; }";
+                                                                                 *body = "bump(&g, 0);";   break;
+    case RFORM_PARAM_CALL_ARG: *helper = "void take(u32 x){ }\nvoid bump(volatile *u32 p){ take((*p += 1)); }";
+                                                                                 *body = "bump(&g);";      break;
+    case RFORM_PARAM_RETURN:   *helper = "u32 bump(volatile *u32 p){ return (*p += 1); }";
+                                                                                 *body = "u32 r = bump(&g);"; break;
+    case RFORM_PARAM_IF_COND:  *helper = "void bump(volatile *u32 p){ if ((*p += 1) > 3) { } }";
+                                                                                 *body = "bump(&g);";      break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
-static void gen_rmw(VSite site, RForm f, char *out, size_t n) {
+static void gen_rmw(RSite site, RForm f, char *out, size_t n) {
     const char *helper; const char *body;
     rform_parts(f, &helper, &body);
-    if (site == VSITE_SPAWN)
+    switch (site) {
+    case RSITE_SPAWN:
         snprintf(out, n, "volatile u32 g;\n%s\nvoid w(){ %s }\n"
                          "u32 main(){ spawn w(); u32 x = g; return x & 1; }\n", helper, body);
-    else
+        break;
+    case RSITE_ISR:
         snprintf(out, n, "volatile u32 g;\n%s\ninterrupt TIMER { %s }\n"
                          "u32 main(){ u32 x = g; return x & 1; }\n", helper, body);
+        break;
+    /* BUG-1043: the RMW is in MAIN-line code (a helper main calls) and the ISR
+     * does a plain write — the BUG-801 shape, answered by the per-function
+     * summary rather than by either body scan. */
+    case RSITE_MAIN:
+        snprintf(out, n, "volatile u32 g;\n%s\nvoid w(){ %s }\n"
+                         "interrupt TIMER { g = 1; }\n"
+                         "u32 main(){ w(); return 0; }\n", helper, body);
+        break;
+    case RSITE_COUNT: out[0] = 0; break;
+    }
 }
 
 static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
@@ -532,17 +588,31 @@ int main(void) {
         }
     }
 
-    /* RMW FORM grid (BUG-792) — every cell negative; both sinks must agree. */
+    /* RMW FORM grid (BUG-792) — every cell negative; all THREE sinks must agree
+     * (BUG-1043 added the main-side summary as a site of its own). */
     fprintf(stderr, "\n--- RMW form grid (site x spelling) ---\n");
-    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+    for (RSite vs = 0; vs < RSITE_COUNT; vs++) {
         for (RForm rf = 0; rf < RFORM_COUNT; rf++) {
             valid_cells++;
             char rbuf[1024], rnm[192];
-            snprintf(rnm, sizeof(rnm), "rmw/%s/%s", vsite_name(vs), rform_name(rf));
+            snprintf(rnm, sizeof(rnm), "rmw/%s/%s", rsite_name(vs), rform_name(rf));
             gen_rmw(vs, rf, rbuf, sizeof(rbuf));
-            int ok = run_vol(rnm, rbuf, "", 1);
-            fprintf(stderr, "  [%-5s][%-15s][neg] %s\n",
-                    vsite_name(vs), rform_name(rf), ok ? "ok" : "*** FAIL ***");
+            /* The ONE positive cell, and it is the grid's boundary pin: at the
+             * SPAWN sink a `@once` body is real synchronisation — it runs exactly
+             * once program-wide and every later arrival waits for its release
+             * publish (B4, once_loser_wait.zer) — so the RMW inside it has ONE
+             * writer and main's single-word volatile read is the sanctioned flag
+             * idiom. scan_unsafe_global_access keeps @once a leaf for that
+             * reason, and this cell fails if someone "fixes" that. At the ISR
+             * and MAIN sites the same body is a race: an interrupt can land
+             * inside the once-body's read-modify-write (ISR site), or the ISR's
+             * own store can (MAIN site), and @once orders nothing against an
+             * interrupt. */
+            int neg = !(vs == RSITE_SPAWN && rf == RFORM_PARAM_ONCE);
+            int ok = run_vol(rnm, rbuf, "", neg);
+            fprintf(stderr, "  [%-5s][%-18s][%s] %s\n",
+                    rsite_name(vs), rform_name(rf), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
     }

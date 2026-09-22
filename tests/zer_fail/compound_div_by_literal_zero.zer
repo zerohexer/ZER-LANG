@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: division by zero
+// BUG-1042: `x /= 0` compiled and TRAPPED AT RUN TIME while `x / 0` has been a
+// compile error since BUG-269. Same operation, two spellings, two answers.
+u32 main() { u32 x = 5; x /= 0; return x; }

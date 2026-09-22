@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: division by zero
+// BUG-1042: the `%=` sibling of comptime_compound_div_zero.
+comptime u32 F(u32 a) { u32 x = a; x %= 0; return x; }
+u32 main() { return F(5); }

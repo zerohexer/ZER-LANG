@@ -13544,11 +13544,21 @@ Two resolvers, one per sink, deliberately mirrored:
 | forwarded param | `func_forwards_param_to_spawn` | n/a |
 | terminal action | `scan_unsafe_global_access` | `record_isr_globals` |
 
-The walks are **partial if-chains by design** — an unlisted kind yields "not found", which
-is today's behaviour and never a new rejection. That is why they are NOT no-`default:`
-switches: a no-default switch there would be a false promise of exhaustiveness. (Contrast
-`record_atomic_plain_in_callee`, which IS exhaustive because a missed carrier there loses a
-recorded ACCESS, not merely a resolution — see BUG-771.)
+The binding / forwarding / field walks are **partial if-chains by design** — an unlisted
+kind yields "not found", which is today's behaviour and never a new rejection. That is why
+they are NOT no-`default:` switches: a no-default switch there would be a false promise of
+exhaustiveness. (Contrast `record_atomic_plain_in_callee`, which IS exhaustive because a
+missed carrier there loses a recorded ACCESS, not merely a resolution — see BUG-771. The two
+factory-return walks became exhaustive in BUG-994 after two missing kinds were measured live.)
+
+**Every one of them starts with `for_each_orelse_block` (BUG-1044).** An orelse-BLOCK
+fallback (`u32 v = mb(k) orelse { return cb; };`) is a statement body reachable only
+THROUGH an expression, and none of these walks looked inside expressions: the factory
+return, the forwarded spawn, the field call and the field binding were all invisible when
+they sat in one. The helper visits a statement's expression positions (never its bodies,
+which stay the walker's own) and every sub-expression, and hands each NODE_BLOCK fallback
+to a re-entry callback. When you write a NEW statement-shaped walk over spawn/ISR bodies,
+call it first; do not add a NODE_ORELSE arm of your own.
 
 Recursion is depth-bounded (the shared `_scan_global_depth` on the spawn side, an explicit
 depth on the ISR side), so a self-recursive factory terminates — verified.
@@ -13787,6 +13797,38 @@ compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape
 = under-rejection = UAF, for a no-behavior-change optimization saving a trivial re-walk.
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
 
+
+## 2026-09-22 session — assignment-as-value lowering, the RMW summary walk, orelse blocks in five walkers, the keep trace peel (BUG-1041..1045)
+
+**`LowerCtx.assign_stmt_pos` — the ONE place a NODE_ASSIGN's result is discarded
+(BUG-1041).** `lower_expr`'s NODE_ASSIGN arm serves both `x += 1;` (statement, via the
+NODE_EXPR_STMT arm) and `(x += 1) > 3` (value). The flag is set by the expression-statement
+arm around its single `lower_expr` call and read-and-cleared at the top of the assign arm.
+Compound in VALUE position: the synthesized `target op= tmp` node gets a typemap entry
+(`checker_set_type`, the assignment's type else the target's) and goes through the
+passthrough WITH a dest temp — `_zer_tN = (target op= tmp)` — which is why the uN / union /
+shared statement-expression emissions need nothing new: their value is the store. Compound
+in STATEMENT position still emits the void IR_ASSIGN (no dead temps). The for STEP is a
+direct passthrough and never reaches the arm. If you add another statement-level caller of
+`lower_expr` on a NODE_ASSIGN, set the flag around it or every `x += 1` there grows a temp.
+
+**`rmw_scan_body` is exhaustive (BUG-1043).** The main-side "does this function RMW through
+param n?" summary (`func_rmw_param_mask`, BUG-801) descends every child now. The RMW FORM
+grid in `tests/test_hw_matrix.c` has a third site, `RSITE_MAIN` (helper called from main,
+ISR stores plainly), because the spawn and ISR sinks are exhaustive body scans and could
+not show a summary-only hole. `rmw/spawn/param in @once` is the grid's one POSITIVE cell:
+`scan_unsafe_global_access` keeps NODE_ONCE a leaf on purpose (a once-body has one writer
+and publishes with release) and the cell pins that decision; at the ISR and MAIN sites the
+same body is rejected, because an interrupt orders nothing against a once-body.
+
+**`keep_arg_caller_root` peels through `unwrap_ptr_launder` (BUG-1045).** It had its own
+"last argument is the pointer" rule, wrong for `@container` (last arg = field name). Any
+future trace that needs "the pointer an intrinsic carries" asks the shared peeler. Its
+orelse arm follows BOTH arms (a join), recursing on each; a non-expression fallback is -1.
+
+**Compound division guard reports a folded-zero divisor (BUG-1042)** with the same
+"division by zero" as the binary site; `ct_apply_assign_op` fails (never folds 0) on `/= 0`,
+`%= 0` and `INT64_MIN / -1`.
 
 ## 2026-09-21 session — whole-program post passes, the for-loop lower bound, and module container globals (BUG-1034..1040)
 

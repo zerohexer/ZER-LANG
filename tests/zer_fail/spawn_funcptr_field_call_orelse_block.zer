@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: function-pointer field whose bound function accesses non-shared global
+// BUG-1044: the spawn target calls its by-value struct's funcptr field INSIDE an
+// orelse-block fallback. body_calls_funcptr_field (the "tell" half of the
+// two-sided funcptr-field gate) never looked inside an expression, so the gate
+// did not fire and the racy callback ran on the thread.
+u32 g;
+struct Ops { *() -> void cb; }
+?u32 mb(u32 x) { if (x > 0) { return x; } return null; }
+void bump() { g += 1; }
+void worker(Ops o) { u32 v = mb(0) orelse { o.cb(); return; }; }
+u32 main() { Ops ops; ops.cb = bump; spawn worker(ops); return 0; }

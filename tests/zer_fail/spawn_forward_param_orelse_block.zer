@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: forwards this function-pointer argument to a spawn
+// BUG-1044: `run` forwards its funcptr parameter to a spawn INSIDE an orelse-block
+// fallback. node_forwards_param_to_spawn never looked inside an expression, so
+// `run(cb)` was accepted while the bare `spawn worker(f)` spelling was refused.
+u32 g;
+?u32 mb(u32 x) { if (x > 0) { return x; } return null; }
+void cb() { g += 1; }
+void worker(*() -> void f) { f(); }
+void run(*() -> void f) { u32 v = mb(0) orelse { spawn worker(f); return; }; }
+u32 main() { run(cb); return 0; }

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: non-shared global
+// BUG-1044: the factory's only `return cb;` sits inside an orelse-BLOCK fallback —
+// a statement body reachable only THROUGH an expression. scan_returned_funcname
+// classified NODE_VAR_DECL as "cannot contain a return", so the racy callback was
+// never resolved and the spawn was ACCEPTED. The fall-through returns the safe
+// `nop`, so a rejection here can only come from descending the orelse block.
+u32 g;
+?u32 mb(u32 x) { if (x > 0) { return x; } return null; }
+void cb() { g += 1; }
+void nop() { }
+*() -> void mk(u32 k) {
+    u32 v = mb(k) orelse { return cb; };
+    return nop;
+}
+void worker() { *() -> void fp = mk(0); fp(); }
+u32 main() { spawn worker(); return 0; }

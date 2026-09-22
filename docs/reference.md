@@ -4166,6 +4166,20 @@ is still a hard error when the index is provably out of range.
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
 
+An assignment is an expression whose value is the stored value, as in C, and the
+target is evaluated once:
+```zer
+u32 main() {
+    u32 x = 0;
+    u32 y = (x += 1) + 2;          // x = 1, y = 3
+    if ((x += 1) > 3) { return 1; } // x = 2
+    u32 z = (x = 7) + 1;           // x = 7, z = 8
+    return y + z - 11;             // 0
+}
+```
+`x /= 0` and `x %= 0` with a divisor that folds to zero are compile errors, exactly
+like `x / 0`; a divisor the compiler cannot prove nonzero is one too (see "SAFETY GUARANTEES").
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8

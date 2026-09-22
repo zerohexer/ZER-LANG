@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: division by zero
+// BUG-1042: inside a comptime function `x /= 0` was FOLDED TO 0 — a wrong
+// constant baked into the emitted C, no diagnostic, exit 0. `return a / 0;` in
+// the same interpreter was already rejected.
+comptime u32 F(u32 a) { u32 x = a; x /= 0; return x; }
+u32 main() { return F(5); }

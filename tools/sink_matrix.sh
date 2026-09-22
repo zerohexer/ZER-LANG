@@ -206,6 +206,11 @@ cell p15b_structlit_cast     reject 'struct H9{?*u32 p;} H9 gh9b; void c(){ u32 
 cell p15b_arena_ccast        reject 'struct N9{u32 v;} ?*N9 ga9; void c(){ u8[256] bk; Arena a9=Arena.over(bk); *N9 x=a9.alloc(N9) orelse return; ga9=(*N9)x; } u32 main(){c();return 0;}'
 cell p15b_arena_twohop       reject 'struct N9{u32 v;} ?*N9 ga9b; void c(){ u8[256] bk; Arena a9=Arena.over(bk); *N9 x=a9.alloc(N9) orelse return; *N9 y=(*N9)x; ga9b=y; } u32 main(){c();return 0;}'
 cell p15b_cstr_local_array   reject '?*u8 gc9; void c(){ u8[8] b; const [*]u8 s="hi"; gc9=@cstr(b,s); } u32 main(){c();return 0;}'
+# BUG-1045: the keep-INFERENCE trace (keep_arg_caller_root) peeled every intrinsic to its
+# LAST argument — the FIELD NAME for @container — so the transitive keep through a
+# container_of launder was lost and a pointer into the caller's frame reached a global.
+cell p15b_keep_container_trans reject 'struct L9{u32 x;} struct D9{u32 a; L9 list;} ?*D9 gd9; void in9(*D9 d){ gd9=d; } void out9(*L9 p){ in9(@container(*D9, p, list)); } u32 main(){ D9 d; out9(&d.list); return 0; }'
+cell p15b_keep_cstr_trans      reject '?*u8 gc9c; void in9c(*u8 q){ gc9c=q; } void out9c([*]u8 b){ const [*]u8 s="hi"; in9c(@cstr(b,s)); } u32 main(){ u8[8] l; out9c(l); return 0; }'
 # BOUNDARY: the peel must not turn a legitimate single free through a laundered name
 # into a leak report, and a launder of GLOBAL storage stays legal at every sink.
 cell p15b_safe_free_once     compile 'distinct typedef [*]u8 Buf9; u32 r9b; void f(){ [*]u8 b=alloc(u8,4) orelse return; b[0]=7; Buf9 c=@cast(Buf9,b); r9b=(u32)c[0]; free(c); } u32 main(){f(); if(r9b!=7){return 2;} return 0;}'

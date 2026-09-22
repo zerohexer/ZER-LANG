@@ -5,6 +5,178 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-22 — BUG-1041..1045: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block five walkers never entered, and a keep trace that peeled to a field name
+
+Audit session continued from 2026-09-21: the remaining ~4k lines of checker.c read, then
+every probe candidate collected during the read run against `./zerc` AND a from-HEAD baseline
+build (`git archive HEAD` -> `$S/headb/zerc`). Eleven candidates; five were real (below), the
+rest were already covered — notably every VRP-alias probe (`*u32 p = &s.d; if (s.d != 0) {
+*p = 0; 10 / s.d }`) was safe because the emitter keeps the runtime division trap for every
+non-constant divisor, proven or not, and the struct-field bounds check is likewise still
+emitted (recorded in docs/limitations.md as a LOW precision residual). Each fix was shown to
+FAIL on the baseline: every new negative's `expect-error` string has zero hits there and one
+hit here, the two new grid columns fail on the baseline (`ZER_MATRIX_ZERC=$S/headb/zerc`), and
+the two new sink-matrix cells read HOLE there and ok here.
+
+### BUG-1041 — a compound assignment used as a VALUE aborted the compiler (CRASH)
+
+**Symptom.** `if ((x += 1) > 3) { }`, `u32 y = (x += 1) + 2;`, `if ((*p += 1) > 3)`,
+`u32 s = (g.v += 2) + 1;` on a shared struct — all of them:
+`IR VALIDATION ERROR: bb0 BINOP missing operand (dest=4 src1=-1 src2=3) ... Aborted (134)`.
+The plain form `u32 y = (x = 5) + 1;` worked, and so did a compound assignment as a CALL
+argument (the call path tolerates a missing operand).
+
+**Root cause.** `lower_expr`'s NODE_ASSIGN arm decomposes a compound assignment's RHS into a
+temp and emits the synthesized `target op= tmp` as a VOID IR_ASSIGN, returning -1
+("statement-like"). The BINOP / BRANCH consumer stored -1 as an operand and `ir_validate`
+refused the function. The arm is shared by statement position (`x += 1;`, through the
+NODE_EXPR_STMT arm) and value position, and only the first was ever exercised.
+
+**Fix.** `LowerCtx.assign_stmt_pos`, set by the expression-statement arm for the one call
+whose result is discarded, read and cleared at the top of the NODE_ASSIGN arm. In value
+position the synthesized node is typed (`checker_set_type`, the assignment's own type, else
+the target's) and routed through the existing passthrough WITH a destination temp, so the
+emitter writes `_zer_tN = (target op= tmp)` — C semantics, one evaluation of the target
+(a side-effecting index runs once), and the uN / union / shared statement-expression
+emissions keep working because their value is the store. Statement position is unchanged:
+no dead temp for every `x += 1;` in the tree.
+
+**Test.** `tests/zer/compound_assign_as_value.zer` — condition operand, binary operand,
+through a pointer, call argument, side-effecting target (the call counter proves ONE
+evaluation), shared struct (the per-statement lock wraps the whole statement, verified in
+the emitted C), and a `u3` target that wraps. Aborts the pre-fix compiler.
+
+### BUG-1042 — `x /= 0` compiled and trapped at run time; in a comptime function it folded to 0
+
+**Symptom.** `u32 x = 5; x /= 0;` compiled (runtime `ZER TRAP: division by zero`) while
+`x / 0` has been a compile error since BUG-269. Worse, `comptime u32 F(u32 a) { u32 x = a;
+x /= 0; return x; }` returned **0** — `ct_apply_assign_op` had `rhs ? cur / rhs : 0`, a wrong
+constant baked into the emitted C with no diagnostic (`%=` the same).
+
+**Root cause.** The compound division guard folded the divisor, saw 0, set nothing, fell
+through to the range proof, found none, and then — because the divisor is a LITERAL — the
+"complex divisor" branch that reports for everything else deliberately excludes literals.
+Two spellings of one operation, two answers.
+
+**Fix.** A divisor that folds to 0 reports "division by zero" at the compound site, exactly
+like the binary site. `ct_apply_assign_op` returns false (the call reports "could not be
+evaluated at compile time") for a zero divisor and for `INT64_MIN / -1`, instead of
+inventing 0.
+
+**Tests.** `tests/zer_fail/compound_div_by_literal_zero.zer`,
+`comptime_compound_div_zero.zer`, `comptime_compound_mod_zero.zer` (all `expect-error:
+division by zero`; all compile on the baseline).
+
+### BUG-1043 — the RMW-through-parameter summary walk answered "no" for six positions (SILENT torn RMW, bare metal)
+
+**Symptom.** With `interrupt TIM2 { g = 1; }` and main calling `bump(&g)`:
+```
+void bump(volatile *u32 p, u32 k) { switch (k) { 0 => { *p += 1; } default => { } } }
+void bump(volatile *u32 p) { @once { *p += 1; } }
+void bump(volatile *u32 p, u32 k) { u32 v = mb(k) orelse { *p += 1; return; }; }
+void bump(volatile *u32 p) { take((*p += 1)); }
+u32  bump(volatile *u32 p) { return (*p += 1); }
+void bump(volatile *u32 p) { if ((*p += 1) > 3) { } }     // and BUG-1041 aborted on this one
+```
+all ACCEPTED, while `void bump(volatile *u32 p) { *p += 1; }` was rejected (BUG-801). The
+interrupt can land between the load and the store: a lost update, no diagnostic, and on
+bare metal nothing crashes.
+
+**Root cause.** `rmw_scan_body` (the walk behind `func_rmw_param_mask`) was a PARTIAL
+if-chain — BLOCK / IF bodies / loop bodies / EXPR_STMT / VAR_DECL / CRITICAL / DEFER — with a
+comment saying an unlisted kind "yields no bit, which means no rejection — today's
+behaviour". No bit is the ACCEPT direction of a race rule. The ISR walker
+(`record_isr_globals`) and the spawn scan are exhaustive, which is why only the MAIN-side
+sink had the hole and why the existing two-site RMW grid could not show it.
+
+**Fix.** A no-`default:` exhaustive switch that descends every child (conditions, the for
+init/step, switch subject and arms, @once, return values, call arguments, orelse fallbacks,
+spawn args, await). Same conversion as BUG-994 / BUG-999: an if-chain in a safety walker is
+invisible to both walker audits, so it is converted, not extended.
+
+**Tests.** Six `tests/zer_fail/main_rmw_via_param_{switch_arm,once_body,orelse_block,
+call_arg,return_value,if_cond}.zer`. **Gate:** the RMW FORM grid in `tests/test_hw_matrix.c`
+now has THREE sites (`RSite`: spawn / isr / **main** — the BUG-801 shape, a helper main calls
+while the ISR does a plain store) and six new position forms; 69 cells, 62/69 on the baseline.
+One cell is deliberately POSITIVE and is the grid's boundary pin: `rmw/spawn/param in @once`
+— at the SPAWN sink a `@once` body is genuine synchronisation (runs once program-wide,
+loser-waits on the release publish, B4 / `once_loser_wait.zer`), so its RMW has one writer and
+main's single-word volatile read is the sanctioned flag idiom; `scan_unsafe_global_access`
+keeps NODE_ONCE a leaf on purpose and the cell fails if that is ever "fixed". At the ISR and
+MAIN sites the same body IS a race (an interrupt orders nothing against a once-body) and both
+reject.
+
+### BUG-1044 — an orelse-BLOCK fallback is a statement body five spawn/ISR walkers never entered (SILENT data race)
+
+**Symptom.** With `cb` doing `g += 1` on a non-shared global, each ACCEPTED on main:
+```
+*() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }
+   void worker() { *() -> void fp = mk(0); fp(); }  spawn worker();       // spawn factory
+   interrupt TIM1 { *() -> void fp = mk(0); fp(); }                       // ISR factory
+void run(*() -> void f) { u32 v = mb(0) orelse { spawn worker(f); return; }; }  run(cb);
+void worker(Ops o) { u32 v = mb(0) orelse { o.cb(); return; }; }          // field call
+void setup(*Ops o) { u32 v = mb(0) orelse { o.cb = bump; return; }; }      // field binding
+```
+The sibling without the orelse block is rejected in every case.
+
+**Root cause.** `scan_returned_funcname` / `record_isr_returned_funcname` (BUG-994 made
+them exhaustive over statement KINDS — and classified NODE_VAR_DECL / EXPR_STMT / ORELSE as
+"cannot contain a return"), `node_forwards_param_to_spawn`, `body_calls_funcptr_field` and
+`scan_funcptr_field_bindings` all descend bodies by statement kind and never look inside an
+expression; an orelse-block fallback is a body reachable only THROUGH one. The same construct
+BUG-1035 closed for the return-range summary, at five more walkers.
+
+**Fix.** ONE walk, `for_each_orelse_block(c, node, fn, ud, depth)`: exhaustive (no
+`default:`) over every kind, visiting a statement's EXPRESSION positions only (bodies stay
+the caller's job, so nothing is visited twice) and every sub-expression of an expression,
+handing each NODE_BLOCK fallback to `fn`, which re-enters the caller's walk on it (so a
+block inside a block needs no extra code). Past the expression cap it answers "found" — the
+reject direction for every caller. Each of the five walkers calls it once at the top with a
+tiny re-entry callback carrying its own arguments.
+
+**Tests.** `tests/zer_fail/spawn_race_factory_orelse_block.zer`,
+`isr_race_factory_orelse_block.zer`, `spawn_forward_param_orelse_block.zer`,
+`spawn_funcptr_field_call_orelse_block.zer`, `spawn_funcptr_field_binding_orelse_block.zer`.
+**Gate:** `RCH_FACTORY_ORELSE` + `IR_FACTORY_ORELSE` in the conc-matrix REACH grids (129
+cells, 127/129 on the baseline). The forwarding and field forms have no grid frame — inside
+the grid's spawned `worker` a bare function-name argument is scanned by the name-arg descent
+and would reject for the wrong reason — so they are pinned by the zer_fail files.
+
+### BUG-1045 — keep inference lost its transitivity through `@container` (stack pointer into a global)
+
+**Symptom.**
+```
+void inner(*D d) { g = d; }                          // keep inferred
+void outer(*L p) { inner(@container(*D, p, list)); }
+u32 main() { D d; outer(&d.list); return 0; }        // ACCEPTED
+```
+while `void outer(*D p) { inner(p); }` / `outer(&d)` was refused. A pointer into main's frame
+reached a global through container_of.
+
+**Root cause.** `keep_arg_caller_root` (the trace from a call argument back to the caller's
+parameter, which is what makes `outer`'s param keep when `inner`'s is) peeled every intrinsic
+to its LAST argument. Right for `@ptrcast` / `@pun` / `@bitcast` / `@cast`; for
+`@container(*T, ptr, field)` the last argument is the FIELD NAME, an ident naming no symbol,
+so the trace answered -1 and no keep edge was recorded. `unwrap_ptr_launder` has known which
+argument each launder carries since BUG-931; this was a private copy of that rule, wrong for
+one carrier — the LAUNDER class again.
+
+**Fix.** The arm calls `unwrap_ptr_launder`; a peeler that cannot peel returns its input,
+which ends the trace.
+
+**Second form, same trace (found by asking what else the walk peels).** Its NODE_ORELSE arm
+followed only the TRIED side, so `inner(mb(0) orelse p)` recorded no edge from `p` either —
+an orelse is a JOIN and either arm can hand the parameter over. Both arms are followed now;
+a return / break / continue / block fallback stays unmodelled (-1).
+
+**Tests.** `tests/zer_fail/keep_transitive_via_container.zer`,
+`keep_transitive_via_orelse_fallback.zer`; sink-matrix cells
+`p15b_keep_container_trans` (HOLE on the baseline) and `p15b_keep_cstr_trans` (a slice
+destination — the `*u8` spelling is refused by @cstr's own bounds rule first, which made the
+first draft of the cell vacuous; measured before keeping it).
+
+---
+
 ## Session 2026-09-21 — BUG-1034..1040: a counter that goes DOWN, a return the summary never saw, two whole-program passes that saw one file, and a module's Arena spelled two ways
 
 Audit session: full read of the compiler (parser / checker / ir_lower / zercheck_ir /

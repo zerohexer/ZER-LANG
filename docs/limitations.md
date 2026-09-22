@@ -53,6 +53,30 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — a PROVEN struct-field index still emits its runtime bounds check (2026-09-22, LOW — precision only, no safety consequence)
+
+**Symptom.** Measured while ruling out a VRP-alias candidate:
+
+    struct S { u32 i; }
+    u32 main() { u32[4] arr; S s; s.i = 1; if (s.i < 4) { arr[s.i] = 7; } ... }
+
+emits `_zer_bounds_check((size_t)(s.i), 4, ...)` although the checker accepted the access
+without a diagnostic, while the scalar spelling (`u32 i = 1; if (i < 4) { arr[i] = 7; }`)
+elides the check. The compound-key range (`"s.i"`) is pushed by the guard, but the
+proven-mark / guard-lowering path on the IR side keys the access differently, so the
+emitter's default (check) wins. Division is not a sibling: the runtime `division by zero`
+trap is emitted for EVERY non-constant divisor, scalar or field, proven or not — that is
+belt-and-suspenders by design, not a field-key gap.
+
+**Why it is not a hole.** The direction is a redundant check, never a missing one. It is
+why every `*u32 p = &s.d; if (s.d != 0) { *p = 0; ... / s.d }` alias probe this session
+was safe: the trap fired.
+
+**Fix sketch.** Find where `mark_proven` is consulted for NODE_INDEX on the IR emission
+path and confirm it looks up the compound key (`build_expr_key_a`) the checker pushed, not
+only a bare ident; then A/B the emitted C for the two spellings above. Measure the corpus
+delta in emitted `_zer_bounds_check` count before and after.
+
 ## OPEN — two modules declaring the same NON-static global name resolve to the first-registered symbol in the checker (2026-09-21, MEDIUM — wrong-type resolution, loud today)
 
 **Symptom.** `pool_twin_a.zer` and `pool_twin_b.zer` each declare `Pool(ItemX, 4) items;`

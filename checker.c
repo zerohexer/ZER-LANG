@@ -3012,12 +3012,43 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
         case NODE_FIELD:     n = n->field.object; break;
         case NODE_INDEX:     n = n->index_expr.object; break;
         case NODE_SLICE:     n = n->slice.object; break;
-        case NODE_ORELSE:    n = n->orelse.expr; break;
+        /* BUG-1045 (second form): an orelse is a JOIN — EITHER arm can hand the
+         * caller's parameter to the keep position. Following only the tried
+         * expression let `inner(mb(0) orelse p)` drop the edge from p, and
+         * `outer(&d)` then stored a pointer to main's frame in a global. A
+         * return / break / continue fallback supplies no value; a block
+         * fallback's value is the block's last expression, which this trace
+         * does not model — that side stays -1, the direction of BUG-1045's own
+         * over-approximation rule (a missed edge is the accept side, so the
+         * expression-fallback case is the one that must be followed). */
+        case NODE_ORELSE: {
+            int r = keep_arg_caller_root(c, n->orelse.expr);
+            if (r >= 0) return r;
+            Node *fb = n->orelse.fallback;
+            if (!fb || fb->kind == NODE_BLOCK || n->orelse.fallback_is_return ||
+                n->orelse.fallback_is_break || n->orelse.fallback_is_continue)
+                return -1;
+            return keep_arg_caller_root(c, fb);
+        }
         case NODE_TYPECAST:  n = n->typecast.expr; break;
-        case NODE_INTRINSIC:
-            n = (n->intrinsic.arg_count > 0)
-                ? n->intrinsic.args[n->intrinsic.arg_count - 1] : NULL;
+        /* BUG-1045: THE SHARED PEELER, not a private rule. This arm took every
+         * intrinsic's LAST argument as "the pointer" — right for @ptrcast / @pun /
+         * @bitcast / @cast, wrong for @container(*T, ptr, field), whose last
+         * argument is the FIELD NAME. The trace landed on an ident that names
+         * no symbol and answered -1 ("not a caller param"), so
+         *     void inner(*D d) { g = d; }                       // keep inferred
+         *     void outer(*L p) { inner(@container(*D, p, list)); }
+         *     u32 main() { D d; outer(&d.list); }               // ACCEPTED
+         * stored a pointer to main's frame in a global, while the direct
+         * spelling `inner(p)` was refused. unwrap_ptr_launder already knows
+         * which argument each launder carries (BUG-931 made it the one query);
+         * a peeler that cannot peel returns its input, which ends the trace. */
+        case NODE_INTRINSIC: {
+            Node *pn = unwrap_ptr_launder(n);
+            if (pn == n) return -1;
+            n = pn;
             break;
+        }
         case NODE_IDENT: {
             Symbol *s = scope_lookup(c->current_scope,
                 n->ident.name, (uint32_t)n->ident.name_len);
@@ -4174,31 +4205,87 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
             }
         }
     }
-    /* Generic descent. PARTIAL walk by design, so it is an IF-CHAIN rather than a
-     * no-default switch (same convention as scan_funcname_binding): an unlisted
-     * kind simply yields no bit, which means no rejection — today's behaviour. A
-     * `default:` in a ->kind switch trips tools/walker_default_audit.sh, and
-     * enumerating all 53 kinds here would claim an exhaustiveness this walk does
-     * not need. */
-    if (n->kind == NODE_BLOCK) {
-        for (int i = 0; i < n->block.stmt_count; i++)
-            rmw_scan_body(c, n->block.stmts[i], fd, mask, depth + 1);
-    } else if (n->kind == NODE_IF) {
-        rmw_scan_body(c, n->if_stmt.then_body, fd, mask, depth + 1);
-        rmw_scan_body(c, n->if_stmt.else_body, fd, mask, depth + 1);
-    } else if (n->kind == NODE_WHILE || n->kind == NODE_DO_WHILE) {
-        rmw_scan_body(c, n->while_stmt.body, fd, mask, depth + 1);
-    } else if (n->kind == NODE_FOR) {
-        rmw_scan_body(c, n->for_stmt.body, fd, mask, depth + 1);
-    } else if (n->kind == NODE_EXPR_STMT) {
-        rmw_scan_body(c, n->expr_stmt.expr, fd, mask, depth + 1);
-    } else if (n->kind == NODE_VAR_DECL) {
-        rmw_scan_body(c, n->var_decl.init, fd, mask, depth + 1);
-    } else if (n->kind == NODE_CRITICAL) {
-        rmw_scan_body(c, n->critical.body, fd, mask, depth + 1);
-    } else if (n->kind == NODE_DEFER) {
-        rmw_scan_body(c, n->defer.body, fd, mask, depth + 1);
+    /* BUG-1043: this was a PARTIAL if-chain (BLOCK / IF bodies / loop bodies /
+     * EXPR_STMT / VAR_DECL / CRITICAL / DEFER) written on the reasoning that an
+     * unlisted kind "yields no bit, which means no rejection — today's behaviour".
+     * Today's behaviour was the hole. Every position it did not list was a place
+     * an RMW through the parameter went unrecorded, and "no bit" is the ACCEPT
+     * direction of a race rule. Measured on main, each ACCEPTED at the main-side
+     * sink with an ISR writing the same volatile global — a torn read-modify-write
+     * that loses interrupt counts, silent on bare metal:
+     *     switch (k) { 0 => { *p += 1; } default => { } }     switch ARM
+     *     @once { *p += 1; }                                    @once body
+     *     u32 v = mb(k) orelse { *p += 1; return; };            orelse-BLOCK
+     *     take((*p += 1));                                      call ARGUMENT
+     *     return (*p += 1);                                     return VALUE
+     * plus every condition position (if / while / for) and the spawn / await
+     * expressions. The same shape as BUG-994 and BUG-999: an if-chain in a safety
+     * walker is invisible to both walker audits, so it is converted, not extended.
+     * A no-`default:` exhaustive switch — a new NodeKind is a build error here. */
+    #define RMWD(x) rmw_scan_body(c, (x), fd, mask, depth + 1)
+    switch (n->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) RMWD(n->block.stmts[i]);
+        return;
+    case NODE_IF:
+        RMWD(n->if_stmt.cond); RMWD(n->if_stmt.then_body); RMWD(n->if_stmt.else_body);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        RMWD(n->while_stmt.cond); RMWD(n->while_stmt.body);
+        return;
+    case NODE_FOR:
+        RMWD(n->for_stmt.init); RMWD(n->for_stmt.cond);
+        RMWD(n->for_stmt.step); RMWD(n->for_stmt.body);
+        return;
+    case NODE_SWITCH:
+        RMWD(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            RMWD(n->switch_stmt.arms[i].body);
+        return;
+    case NODE_EXPR_STMT: RMWD(n->expr_stmt.expr);  return;
+    case NODE_VAR_DECL:  RMWD(n->var_decl.init);   return;
+    case NODE_RETURN:    RMWD(n->ret.expr);        return;
+    case NODE_CRITICAL:  RMWD(n->critical.body);   return;
+    case NODE_DEFER:     RMWD(n->defer.body);      return;
+    case NODE_ONCE:      RMWD(n->once.body);       return;
+    case NODE_AWAIT:     RMWD(n->await_stmt.cond); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) RMWD(n->spawn_stmt.args[i]);
+        return;
+    /* expression composition — an assignment can sit inside any of these */
+    case NODE_ASSIGN:    RMWD(n->assign.target); RMWD(n->assign.value); return;
+    case NODE_BINARY:    RMWD(n->binary.left); RMWD(n->binary.right); return;
+    case NODE_UNARY:     RMWD(n->unary.operand); return;
+    case NODE_CALL:
+        RMWD(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) RMWD(n->call.args[i]);
+        return;
+    case NODE_FIELD:     RMWD(n->field.object); return;
+    case NODE_INDEX:     RMWD(n->index_expr.object); RMWD(n->index_expr.index); return;
+    case NODE_SLICE:     RMWD(n->slice.object); RMWD(n->slice.start); RMWD(n->slice.end); return;
+    case NODE_ORELSE:    RMWD(n->orelse.expr); RMWD(n->orelse.fallback); return;
+    case NODE_TYPECAST:  RMWD(n->typecast.expr); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) RMWD(n->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            RMWD(n->struct_init.fields[i].value);
+        return;
+    /* Leaves, declarations, and kinds that carry no expression. NODE_ASM operands
+     * are the tree-wide latent gap (asm is naked-only). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return;
     }
+    #undef RMWD
 }
 
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth) {
@@ -6347,8 +6434,16 @@ static bool ct_apply_assign_op(int op, int64_t cur, int64_t rhs, int64_t *out) {
     case TOK_PLUSEQ:    *out = cur + rhs; return true;
     case TOK_MINUSEQ:   *out = cur - rhs; return true;
     case TOK_STAREQ:    *out = cur * rhs; return true;
-    case TOK_SLASHEQ:   *out = rhs ? cur / rhs : 0; return true;
-    case TOK_PERCENTEQ: *out = rhs ? cur % rhs : 0; return true;
+    /* BUG-1042: a zero divisor is NOT modelled — it used to fold to 0, a wrong
+     * constant baked into the emitted C, while the binary `a / 0` of the same
+     * interpreter answers CONST_EVAL_FAIL. Returning false makes the call
+     * report "could not be evaluated at compile time" (the checker's own
+     * literal-zero rule fires first for every spellable case). INT64_MIN / -1
+     * is the same UB one step over, in the COMPILER's own process. */
+    case TOK_SLASHEQ:   if (rhs == 0 || (rhs == -1 && cur == INT64_MIN)) return false;
+                        *out = cur / rhs; return true;
+    case TOK_PERCENTEQ: if (rhs == 0 || (rhs == -1 && cur == INT64_MIN)) return false;
+                        *out = cur % rhs; return true;
     case TOK_LSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; return true;
     case TOK_RSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? cur >> rhs : 0; return true;
     case TOK_AMPEQ:     *out = cur & rhs; return true;
@@ -9367,6 +9462,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
                 if (dv != CONST_EVAL_FAIL && dv != 0) div_ok = true;
+                /* BUG-1042: a divisor that folds to ZERO. The binary form
+                 * `a / 0` has reported "division by zero" since BUG-269; this
+                 * compound sibling fell through to the range proof, found none,
+                 * and — because the divisor is a LITERAL — reported nothing at
+                 * all: `x /= 0;` compiled and trapped at run time, and inside a
+                 * comptime function it folded to 0 (see ct_apply_assign_op). The
+                 * two spellings of one operation now give the same answer. */
+                if (dv != CONST_EVAL_FAIL && dv == 0) {
+                    checker_error(c, node->loc.line, "division by zero");
+                    div_ok = true;   /* reported; no second diagnostic below */
+                }
                 /* @size(T) is always positive */
                 if (!div_ok && divisor->kind == NODE_INTRINSIC &&
                     divisor->intrinsic.name_len == 4 &&
@@ -15188,10 +15294,113 @@ static void check_body_effects(Checker *c, Node *body, int line,
  * own body plus the same summary on its direct callees, depth-bounded. */
 static bool func_forwards_param_to_spawn(Checker *c, Symbol *fn, int pidx, int depth);
 
+/* BUG-1044: an orelse-BLOCK fallback is a STATEMENT BODY nested inside an
+ * EXPRESSION — `u32 v = mb(k) orelse { return cb; };` — and five spawn/ISR walkers
+ * that visit statement bodies (the two factory `return <funcname>` walks, the
+ * param-forwarding walk, the funcptr-field call tell and the funcptr-field binding
+ * collector) descended bodies by statement KIND and never looked inside an
+ * expression, so a body hidden in one was invisible to all five. Measured on main,
+ * each ACCEPTED with `cb` doing `g += 1` on a non-shared global:
+ *     *() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }
+ *         worker() { *() -> void fp = mk(0); fp(); }  spawn worker();      (spawn factory)
+ *         interrupt TIM1 { *() -> void fp = mk(0); fp(); }                 (ISR factory)
+ *     void run(*() -> void f) { u32 v = mb(0) orelse { spawn w(f); return; }; }  run(cb);
+ *     void worker(Ops o) { u32 v = mb(0) orelse { o.cb(); return; }; }     (field call)
+ *     void setup(*Ops o) { u32 v = mb(0) orelse { o.cb = bump; return; }; } (field binding)
+ * The same class as BUG-994 (the switch arm and do-while body these walks did not
+ * descend) and BUG-1035 (the return-range summary's orelse blocks), one construct
+ * over: the block is reachable only THROUGH an expression.
+ *
+ * ONE walk answers "which orelse blocks does this node's EXPRESSION positions
+ * hold?" — for a statement kind, only its expression positions (the bodies are
+ * the caller's own walk, so nothing is visited twice); for an expression kind,
+ * every sub-expression. `fn` receives each NODE_BLOCK fallback and re-enters the
+ * caller's walk on it, which is what makes an orelse block inside an orelse block
+ * work with no extra code. Returns true when `fn` did, so a boolean walk can stop
+ * on the first find; a void walk returns false from `fn` and sees every block.
+ * Exhaustive, no `default:`; past the expression cap the answer rounds toward
+ * "found" — the reject direction for every caller. */
+typedef bool (*OrelseBlockFn)(Checker *c, Node *block, void *ud);
+static bool for_each_orelse_block(Checker *c, Node *e, OrelseBlockFn fn, void *ud,
+                                  int depth) {
+    if (!e) return false;
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    #define FEOB(x) do { if (for_each_orelse_block(c, (x), fn, ud, depth + 1)) return true; } while (0)
+    switch (e->kind) {
+    case NODE_ORELSE:
+        FEOB(e->orelse.expr);
+        if (e->orelse.fallback && e->orelse.fallback->kind == NODE_BLOCK) {
+            if (fn(c, e->orelse.fallback, ud)) return true;
+        } else {
+            FEOB(e->orelse.fallback);   /* a VALUE fallback can nest another orelse */
+        }
+        return false;
+    /* expression composition */
+    case NODE_BINARY:    FEOB(e->binary.left); FEOB(e->binary.right); return false;
+    case NODE_UNARY:     FEOB(e->unary.operand); return false;
+    case NODE_ASSIGN:    FEOB(e->assign.target); FEOB(e->assign.value); return false;
+    case NODE_CALL:
+        FEOB(e->call.callee);
+        for (int i = 0; i < e->call.arg_count; i++) FEOB(e->call.args[i]);
+        return false;
+    case NODE_FIELD:     FEOB(e->field.object); return false;
+    case NODE_INDEX:     FEOB(e->index_expr.object); FEOB(e->index_expr.index); return false;
+    case NODE_SLICE:     FEOB(e->slice.object); FEOB(e->slice.start); FEOB(e->slice.end); return false;
+    case NODE_TYPECAST:  FEOB(e->typecast.expr); return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) FEOB(e->intrinsic.args[i]);
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) FEOB(e->struct_init.fields[i].value);
+        return false;
+    /* statement kinds: their EXPRESSION positions only — bodies belong to the caller */
+    case NODE_EXPR_STMT: FEOB(e->expr_stmt.expr); return false;
+    case NODE_VAR_DECL:  FEOB(e->var_decl.init);  return false;
+    case NODE_RETURN:    FEOB(e->ret.expr);       return false;
+    case NODE_IF:        FEOB(e->if_stmt.cond);   return false;
+    case NODE_WHILE: case NODE_DO_WHILE:
+                         FEOB(e->while_stmt.cond); return false;
+    case NODE_FOR:       FEOB(e->for_stmt.init); FEOB(e->for_stmt.cond); FEOB(e->for_stmt.step); return false;
+    case NODE_SWITCH:    FEOB(e->switch_stmt.expr); return false;
+    case NODE_SPAWN:
+        for (int i = 0; i < e->spawn_stmt.arg_count; i++) FEOB(e->spawn_stmt.args[i]);
+        return false;
+    case NODE_AWAIT:         FEOB(e->await_stmt.cond); return false;
+    case NODE_STATIC_ASSERT: FEOB(e->static_assert_stmt.cond); return false;
+    /* body-only statements (the caller walks the body), leaves, declarations */
+    case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    }
+    #undef FEOB
+    return false;
+}
+
+/* BUG-1044 re-entry callbacks — one per walker, carrying that walker's arguments. */
+typedef struct { const char *pname; uint32_t pnlen; int depth; } FwdOrelseUd;
+static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
+                                         uint32_t pnlen, int depth);
+static bool fwd_orelse_cb(Checker *c, Node *block, void *ud) {
+    FwdOrelseUd *u = (FwdOrelseUd *)ud;
+    return node_forwards_param_to_spawn(c, block, u->pname, u->pnlen, u->depth);
+}
+
 static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
                                          uint32_t pnlen, int depth) {
     if (!n) return false;
     if (depth > 32) return true;   /* BUG-1016: was `> 8 -> false` (accept); see func_forwards */
+    {   /* BUG-1044: a spawn inside an orelse-block fallback of this statement */
+        FwdOrelseUd u = { pname, pnlen, depth };
+        if (for_each_orelse_block(c, n, fwd_orelse_cb, &u, 0)) return true;
+    }
     if (n->kind == NODE_SPAWN) {
         for (int i = 0; i < n->spawn_stmt.arg_count; i++) {
             Node *a = n->spawn_stmt.args[i];
@@ -15292,9 +15501,21 @@ static bool scan_funcname_binding(Checker *c, Node *n,
  * refuses at 64. The branch that made these walks exhaustive left the cap. */
 #define FACTORY_NEST_MAX 64
 
+typedef struct { int depth; const char **out_name; uint32_t *out_len; } SrfOrelseUd;
+static bool scan_returned_funcname(Checker *c, Node *n, int depth,
+                                   const char **out_name, uint32_t *out_len);
+static bool srf_orelse_cb(Checker *c, Node *block, void *ud) {
+    SrfOrelseUd *u = (SrfOrelseUd *)ud;
+    return scan_returned_funcname(c, block, u->depth, u->out_name, u->out_len);
+}
+
 static bool scan_returned_funcname(Checker *c, Node *n, int depth,
                                    const char **out_name, uint32_t *out_len) {
     if (!n) return false;
+    {   /* BUG-1044: a `return <funcname>` inside an orelse-block fallback */
+        SrfOrelseUd u = { depth + 1, out_name, out_len };
+        if (for_each_orelse_block(c, n, srf_orelse_cb, &u, 0)) return true;
+    }
     if (depth > FACTORY_NEST_MAX) {
         /* Past anything real, and rounds toward REJECT anyway: report that the
          * factory could not be analysed, through the same flag and noun the
@@ -15475,8 +15696,16 @@ static bool funcptr_field_access(Node *n) {
     return false;
 }
 
+static bool body_calls_funcptr_field(Checker *c, Node *n, int depth);
+static bool bcff_orelse_cb(Checker *c, Node *block, void *ud) {
+    return body_calls_funcptr_field(c, block, *(int *)ud);
+}
 static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
     if (!n) return false;
+    {   /* BUG-1044: `o.cb()` inside an orelse-block fallback */
+        int d = depth;
+        if (for_each_orelse_block(c, n, bcff_orelse_cb, &d, 0)) return true;
+    }
     /* BUG-1016: WIDEN a call-graph cap (this descends directly-called globals) to 32,
      * and round the past-cap answer toward TRUE — it gates whether the binding scan
      * runs, so "assume it might call through a field" only costs a scan. */
@@ -15537,9 +15766,21 @@ static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
  * Collects BINDINGS ONLY, never global accesses: scanning the enclosing body
  * wholesale would flag the spawning function's OWN global writes, which are not
  * themselves a race. */
+typedef struct { int depth; const char **out_name; uint32_t *out_len; Symbol **out_fn; } SffbOrelseUd;
+static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
+                                        const char **out_name, uint32_t *out_len,
+                                        Symbol **out_fn);
+static bool sffb_orelse_cb(Checker *c, Node *block, void *ud) {
+    SffbOrelseUd *u = (SffbOrelseUd *)ud;
+    return scan_funcptr_field_bindings(c, block, u->depth, u->out_name, u->out_len, u->out_fn);
+}
 static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
                                         const char **out_name, uint32_t *out_len,
                                         Symbol **out_fn) {
+    if (n && depth <= 32) {   /* BUG-1044: `o.cb = bump` inside an orelse-block fallback */
+        SffbOrelseUd u = { depth, out_name, out_len, out_fn };
+        if (for_each_orelse_block(c, n, sffb_orelse_cb, &u, 0)) return true;
+    }
     /* BUG-1016: WIDEN a call-graph cap to 32 (matches body_calls_funcptr_field and the
      * spawn scan). This produces a binding to NAME in the diagnostic, so there is no
      * conservative value to return past the cap — it stays false there, which is why the
@@ -23377,8 +23618,17 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
  * path (ac97e11a). Partial if-chain by design: an unlisted kind records nothing,
  * which is today's behaviour and never a new rejection. */
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
+static void record_isr_returned_funcname(Checker *c, Node *n, int depth);
+static bool isr_rf_orelse_cb(Checker *c, Node *block, void *ud) {
+    record_isr_returned_funcname(c, block, *(int *)ud);
+    return false;   /* void walk: see every block */
+}
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth) {
     if (!c || !n) return;
+    {   /* BUG-1044: the ISR sibling — a `return <funcname>` in an orelse block */
+        int d = depth + 1;
+        for_each_orelse_block(c, n, isr_rf_orelse_cb, &d, 0);
+    }
     /* BUG-994: the ISR mirror of the FACTORY_NEST_MAX cap — same bound, same
      * reason; it is void, so it reports directly, once per interrupt, exactly as
      * record_isr_globals does for its call-depth cap. */

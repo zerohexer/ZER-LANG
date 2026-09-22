@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1045 (second form): the keep trace followed only the TRIED side of an
+// orelse. `inner(mb(0) orelse p)` hands the caller's parameter to a retaining
+// callee on the fallback side, so `outer`'s param must become keep and
+// `outer(&d)` must be refused — it stored a pointer to main's frame in a global.
+struct D { u32 a; }
+?*D g;
+?*D mb(u32 x) { if (x > 0) { return g; } return null; }
+void inner(*D d) { g = d; }
+void outer(*D p) { inner(mb(0) orelse p); }
+u32 main() { D d; outer(&d); return 0; }

@@ -152,6 +152,14 @@ typedef struct {
      * locks do not nest within one condition (conditions are expressions), so
      * one slot suffices. */
     Node *cond_shared_saved;
+    /* BUG-1041: set by the expression-STATEMENT arm for the one lower_expr call
+     * whose NODE_ASSIGN result is discarded. Everywhere else a NODE_ASSIGN sits in
+     * VALUE position — `if ((x += 1) > 3)`, `y = (x += 1) + 2` — and the compound
+     * arm used to answer -1 ("statement-like"), which the BINOP / BRANCH consumer
+     * then stored as an operand: an IR validation ABORT of the compiler. Read and
+     * cleared at the top of the NODE_ASSIGN arm, so a nested assignment inside the
+     * RHS is correctly in value position again. */
+    bool assign_stmt_pos;
 } LowerCtx;
 
 /* ---- Helpers ---- */
@@ -903,6 +911,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * compound ops which need the original target + op preserved. */
     case NODE_ASSIGN: {
         bool plain_sc = false;
+        bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
+        ctx->assign_stmt_pos = false;
         if (expr->assign.op == TOK_EQ) {
             /* G6 (2026-08-01): plain `x = Y` normally passes through. EXCEPTION:
              * a short-circuit `&&`/`||` RHS carrying a nested `orelse` must be
@@ -935,6 +945,26 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         new_assign->assign.op = expr->assign.op;
         new_assign->assign.target = expr->assign.target;
         new_assign->assign.value = tmp_id;
+        /* BUG-1041: a COMPOUND assignment in VALUE position yields the stored
+         * value, exactly as in C. Measured on the pre-fix compiler:
+         *     if ((x += 1) > 3) { }        -> IR VALIDATION ERROR ... Aborted (134)
+         *     u32 y = (x += 1) + 2;        -> same
+         *     if ((*p += 1) > 3) { }       -> same   (`u32 y = (x = 5) + 1;` worked)
+         * The synthesized `target op= tmp` goes through the passthrough below WITH
+         * a destination temp, so the emitter writes `_zer_tN = (target op= tmp)` —
+         * one evaluation of the target (a side-effecting index runs once), and the
+         * uN / union / shared forms keep their statement-expression emission, whose
+         * value is the store. The synthesized node has no typemap entry, so it is
+         * given the assignment's own type first (the target's, when the assignment
+         * itself was not typed). Statement position keeps the void form: no dead
+         * temp for every `x += 1;` in the tree. */
+        if (!plain_sc && !stmt_pos) {
+            Type *at = checker_get_type(ctx->checker, expr);
+            if (!at) at = checker_get_type(ctx->checker, expr->assign.target);
+            if (at) checker_set_type(ctx->checker, new_assign, at);
+            expr = new_assign;
+            goto passthrough;
+        }
         /* Emit as void IR_ASSIGN — compound assign result is statement-like. */
         IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
         inst.expr = new_assign;
@@ -2839,7 +2869,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Unified: route ALL expressions through lower_expr.
          * Calls → IR_CALL, assignments → IR_ASSIGN passthrough,
          * everything else → decomposed or passthrough. */
+        ctx->assign_stmt_pos = (expr->kind == NODE_ASSIGN);   /* BUG-1041 */
         lower_expr(ctx, expr);
+        ctx->assign_stmt_pos = false;
         break;
     }
 

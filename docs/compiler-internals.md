@@ -13558,7 +13558,11 @@ return, the forwarded spawn, the field call and the field binding were all invis
 they sat in one. The helper visits a statement's expression positions (never its bodies,
 which stay the walker's own) and every sub-expression, and hands each NODE_BLOCK fallback
 to a re-entry callback. When you write a NEW statement-shaped walk over spawn/ISR bodies,
-call it first; do not add a NODE_ORELSE arm of your own.
+call it first; do not add a NODE_ORELSE arm of your own. It is wired into six walkers as
+of BUG-1047: the five above plus `check_block_lock_ordering` (the per-statement deadlock
+check — `orelse { a.x = b.y; ... }` was unchecked, BUG-1047). `rmw_scan_body` and the
+exhaustive expression walkers reach the block by descending everything, so they need no
+callback.
 
 Recursion is depth-bounded (the shared `_scan_global_depth` on the spawn side, an explicit
 depth on the ISR side), so a self-recursive factory terminates — verified.
@@ -13798,7 +13802,7 @@ compute-once-CACHE-on-node variant was DECLINED: a stale cached region in escape
 The "unify call-result provenance" durable-fix entry in limitations.md is RESOLVED.
 
 
-## 2026-09-22 session — assignment-as-value lowering, the RMW summary walk, orelse blocks in five walkers, the keep trace peel (BUG-1041..1045)
+## 2026-09-22 session — assignment-as-value lowering, the RMW summary walk, orelse blocks in six walkers, the keep trace peel, RMW reach, the comptime folder (BUG-1041..1048)
 
 **`LowerCtx.assign_stmt_pos` — the ONE place a NODE_ASSIGN's result is discarded
 (BUG-1041).** `lower_expr`'s NODE_ASSIGN arm serves both `x += 1;` (statement, via the
@@ -13821,10 +13825,44 @@ not show a summary-only hole. `rmw/spawn/param in @once` is the grid's one POSIT
 and publishes with release) and the cell pins that decision; at the ISR and MAIN sites the
 same body is rejected, because an interrupt orders nothing against a once-body.
 
+**RMW REACH — one fact, one barrier, three sinks (BUG-1046).** The "which global does
+this call ARGUMENT designate?" question is answered by `rmw_arg_target_global` (scans:
+`&g`, alias-table name) and `rmw_arg_target_global_main` (main: `&g`, carrier-table name,
+pointer local's `&g` init hop — never a global pointer itself). The CARRIER fact —
+`h.p = &g` / `H h = { .p = &g }` / `q = &g` binds the local's ROOT name to `g` — is
+recorded by `rmw_bind_carrier_scan` / `rmw_bind_carrier_scan_name` into `_rmw_alias`
+(update in place: `rmw_alias_lookup` returns the FIRST match) and by
+`rmw_bind_carrier_main` / the var-decl seed into `Checker.rmw_ptr_carriers` (per
+function, reset beside `rmw_taints`; a bare-ident target rebinds or clears, a projection
+target only adds). `carrier_value_global` is the one walk over the VALUE (`&g` through
+launders, an IDENT that is itself an alias / carrier — a pointer or carrier COPY — a
+struct literal's fields, both orelse arms; its `main_side` flag picks which argument
+resolver an IDENT goes through). A callee the analysis cannot
+name — `callee_is_opaque_funcptr`: an IDENT that is not a global function nor
+`alloc`/`free`, or a FIELD/INDEX typed as a funcptr — makes every global handed by
+pointer a MAY-RMW: `track_isr_global_opaque` (ISR + main, `IsrGlobal.opaque_in_*`, its
+own branch in `check_interrupt_safety`) and `_rmw_flagged_opaque` (spawn, its own
+sentence in the spawn report). At the main sink the FIELD/INDEX callee form lives after
+`normal_call:` because the callee is typed only there. When you add a vehicle by which a
+pointer can reach a helper, teach `carrier_value_global` (a value shape) or the two
+`rmw_arg_target_global*` twins (an argument shape) — not a sink.
+
 **`keep_arg_caller_root` peels through `unwrap_ptr_launder` (BUG-1045).** It had its own
 "last argument is the pointer" rule, wrong for `@container` (last arg = field name). Any
 future trace that needs "the pointer an intrinsic carries" asks the shared peeler. Its
-orelse arm follows BOTH arms (a join), recursing on each; a non-expression fallback is -1.
+orelse arm follows BOTH arms (a join), recursing on each; a non-expression fallback is -1;
+its NODE_CALL arm follows the arguments the callee's `ret_param_mask` names (all of them
+when `ret_summary_complete` is false); its NODE_STRUCT_INIT arm traces every field value.
+
+**The comptime interpreter fails closed (BUG-1048).** `eval_comptime_block` signals through
+`ComptimeCtx.failed` / `brk` / `cont`: `CT_FAIL()` for every failure (a nested body's
+failure is the caller's failure — the old "CONST_EVAL_FAIL from a nested body means no
+return here" conflation is gone), `CT_AFTER_BODY` / `CT_AFTER_LOOP_BODY` after every
+nested evaluation, `CT_UNSUPPORTED(what, line)` for a statement it does not model (the
+kind list is a no-`default:` switch; `comptime_report_unsupported` appends the reason to
+the "could not be evaluated" error). `break` / `continue` are real. If you teach the
+interpreter a new statement kind, remove it from the unsupported switch AND make sure every
+failure inside it goes through `CT_FAIL`.
 
 **Compound division guard reports a folded-zero divisor (BUG-1042)** with the same
 "division by zero" as the binary site; `ct_apply_assign_op` fails (never folds 0) on `/= 0`,

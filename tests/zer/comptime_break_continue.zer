@@ -1,0 +1,16 @@
+// BUG-1048: `break` and `continue` inside a comptime loop were SKIPPED by the
+// interpreter (they were not modelled, and an unmodelled statement fell off the
+// dispatch chain), so this `while` ran to the iteration cap and folded 100 for
+// F, and the `for` counted 4 for G. Both fold correctly now, and the runtime
+// checks the folded values.
+comptime u32 F(u32 a) { u32 x = a; while (x < 100) { x += 1; if (x == 5) { break; } } return x; }
+comptime u32 G() { u32 n = 0; for (u32 i = 0; i < 4; i += 1) { if (i == 1) { continue; } n += 1; } return n; }
+comptime u32 H() { u32 n = 0; u32 i = 0; do { i += 1; if (i == 2) { continue; } n += 1; } while (i < 5); return n; }
+comptime u32 S(u32 k) { u32 x = 0; switch (k) { 1 => { x = 9; } default => { x = 7; } } return x; }
+u32 main() {
+    if (F(1) != 5) { return 1; }
+    if (G() != 3) { return 2; }
+    if (H() != 4) { return 3; }
+    if (S(1) != 9 || S(2) != 7) { return 4; }
+    return 0;
+}

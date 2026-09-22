@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: to a call through a function pointer
+// BUG-1046 (RMW REACH): the pointer to `g` reaches the read-modify-write through
+// a vehicle the resolvers never followed — a call through a local function pointer, at the spawn sink. Accepted on main before the fix
+// (measured); a torn read-modify-write that loses an update, silent on bare metal.
+volatile u32 g;
+void bump(volatile *u32 p) { *p += 1; }
+void w() { *(volatile *u32) fp = bump; fp(&g); }
+u32 main() { spawn w(); u32 x = g; return x & 1; return 0; }

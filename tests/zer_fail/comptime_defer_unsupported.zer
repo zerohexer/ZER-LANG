@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: is not supported in a comptime body
+// BUG-1048: the comptime interpreter SKIPPED a scoped `defer` and folded a
+// WRONG constant into the emitted C (measured: F(1) folded 2 instead of 3). It now refuses the body
+// and names the construct.
+comptime u32 F(u32 a) { u32 x = a; { defer x += 1; x += 1; } return x; }
+u32 main() { return F(1); }

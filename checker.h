@@ -195,6 +195,14 @@ typedef struct {
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;
+    /* BUG-1046: the main-side POINTER-CARRIER table — `h.p = &g` / `H h = { .p =
+     * &g }` / `q = &g` bind the local's ROOT name to the global it now points at,
+     * so a later `bump(h)` / `bump(q)` resolves to `g` at the RMW-through-param
+     * sink. Same entry shape and lifetime as rmw_taints (per function). The scans
+     * keep the same fact in their own alias table (_rmw_alias). */
+    RmwTaintEnt *rmw_ptr_carriers;
+    int rmw_ptr_carrier_count;
+    int rmw_ptr_carrier_capacity;
 
     /* Nodes proven safe by range propagation — emitter skips runtime checks */
     Node **proven_safe;
@@ -309,6 +317,12 @@ typedef struct {
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
         bool compound_in_func;  /* compound assign in regular func */
+        /* BUG-1046: passed BY POINTER to a call whose target the analysis cannot
+         * see (a function-pointer callee). That call may read-modify-write it;
+         * "did not look" must not read as "no RMW", but the sentence must not
+         * claim an RMW either, so it is its own flag with its own wording. */
+        bool opaque_in_isr;
+        bool opaque_in_func;
         /* BUG-971: this entry names a STATIC LOCAL, not a global. It is the same
          * hazard — one object, reached from both the ISR and main — but it has no
          * global-scope Symbol, so check_interrupt_safety cannot look it up and needs

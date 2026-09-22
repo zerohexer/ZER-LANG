@@ -53,6 +53,31 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — three RMW-reach residuals after BUG-1046 (2026-09-22, LOW/MEDIUM — two accept-side, one precision)
+
+**1. A carrier that points at TWO globals binds the first only (accept-side, LOW).**
+`carrier_value_global` returns ONE symbol, and the alias / carrier tables map a name to ONE
+global, so `H h = { .p = &g1, .q = &g2 }; bump(h)` resolves `h` to `g1`; an RMW through
+`h.q` in `bump` is attributed to nothing. Fix sketch: let a carrier name map to a small
+SET (or bind `h.p` / `h.q` as compound keys, the way the atomic-cell path keys do) and have
+`rmw_arg_target_global` return all of them for the callee's param binding.
+
+**2. A funcptr FIELD callee inside a spawn target declared AFTER its spawner is not treated
+as opaque (accept-side, MEDIUM).** `callee_is_opaque_funcptr` recognises `o.cb(&g)` by the
+callee's TYPEMAP type, which exists only once that body has been checked; the spawn scan
+runs from the spawner's body, so a target declared later has no entry yet. The IDENT forms
+(`fp(&g)`, `gfp(&g)`) do not depend on the typemap and are caught in either order; the ISR
+scan runs after every body and is unaffected. Fix sketch: resolve the field's type from the
+object's declared struct type (walk `struct_type.fields`) instead of the typemap, or run
+the spawn scans as a post pass like ISR-TRANS.
+
+**3. A GLOBAL funcptr rebound in another function is resolved through its declaration
+initializer (pre-existing, accept-side, LOW).** ISR "facet 1" descends the function named
+by `*() gcb = nop;` when the handler calls `gcb()`; `main() { gcb = bump; }` is not seen.
+Today this is masked for a non-volatile `gcb` ("accessed from both interrupt and main —
+must be declared volatile"); a `volatile` funcptr global would slip. Whole-program binding
+collection for global funcptrs (a post pass over every body, like BUG-1037's) closes it.
+
 ## OPEN — a PROVEN struct-field index still emits its runtime bounds check (2026-09-22, LOW — precision only, no safety consequence)
 
 **Symptom.** Measured while ruling out a VRP-alias candidate:

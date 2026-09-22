@@ -1,0 +1,9 @@
+// BUG-1046 boundary: a struct CARRIER handed to a helper that only READS through
+// it is not a read-modify-write. The carrier binding makes `rd(h)` resolve to
+// `g`, and the callee's RMW summary (no bit set) is what keeps this accepted at
+// every site. A single-word volatile read from a thread is the sanctioned idiom.
+volatile u32 g;
+struct H { volatile *u32 p; }
+u32 rd(H h) { return *h.p; }
+void w() { H h; h.p = &g; u32 v = rd(h); if (v > 100) { g = 1; } }
+u32 main() { g = 7; spawn w(); u32 x = g; return x - 7; }

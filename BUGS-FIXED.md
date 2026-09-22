@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-22 — BUG-1041..1045: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block five walkers never entered, and a keep trace that peeled to a field name
+## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model
 
 Audit session continued from 2026-09-21: the remaining ~4k lines of checker.c read, then
 every probe candidate collected during the read run against `./zerc` AND a from-HEAD baseline
@@ -167,13 +167,141 @@ which ends the trace.
 **Second form, same trace (found by asking what else the walk peels).** Its NODE_ORELSE arm
 followed only the TRIED side, so `inner(mb(0) orelse p)` recorded no edge from `p` either —
 an orelse is a JOIN and either arm can hand the parameter over. Both arms are followed now;
-a return / break / continue / block fallback stays unmodelled (-1).
+a return / break / continue / block fallback stays unmodelled (-1). **Third form:** the
+argument is a CALL whose result is a view of the caller's parameter — `inner(idf(p))` with
+`*D idf(*D p) { return p; }` — and the trace answered -1 for every NODE_CALL. It now follows
+the arguments the callee's return summary (`ret_param_mask`) says the result may alias, and
+EVERY argument when the summary is incomplete (the over-approximating side). **Fourth form:**
+a struct LITERAL carrying the parameter, `inner({ .p = p })` — the by-value-local spelling
+was traced through the local's non-keep root, the literal has no local. Every field value is
+traced now. (The by-value carrier `W w; w.p = p; inner(w);` and a field of a by-value param
+`inner(w.p)` were measured already refused.)
 
 **Tests.** `tests/zer_fail/keep_transitive_via_container.zer`,
-`keep_transitive_via_orelse_fallback.zer`; sink-matrix cells
+`keep_transitive_via_orelse_fallback.zer`, `keep_transitive_via_identity_call.zer`,
+`keep_transitive_via_struct_literal_arg.zer`; sink-matrix cells
 `p15b_keep_container_trans` (HOLE on the baseline) and `p15b_keep_cstr_trans` (a slice
 destination — the `*u8` spelling is refused by @cstr's own bounds rule first, which made the
 first draft of the cell vacuous; measured before keeping it).
+
+### BUG-1046 — RMW REACH: the pointer to the global arrived through a vehicle no resolver followed (SILENT torn RMW at all three sinks)
+
+**Symptom.** Found by asking, after BUG-1043, "and how else can the pointer get to the
+helper?" With `bump(volatile *u32 p) { *p += 1; }` and an ISR storing `g` (or `g` read by
+main across a spawn):
+```
+volatile *u32 q = &g; bump(q);                 main: ACCEPTED   (scans: rejected)
+volatile *u32 q = &g2; q = &g; bump(q);        main: ACCEPTED
+H h; h.p = &g; bump(h);   / H h = { .p = &g }  main, ISR, spawn: ACCEPTED
+*(volatile *u32) fp = bump; fp(&g);            main, ISR, spawn: ACCEPTED
+gfp(&g)  (global funcptr) / o.cb(&g) (field)   main, ISR, spawn: ACCEPTED
+```
+Ten probes, every one exit 0 on the baseline, every one a lost update on bare metal.
+
+**Root cause.** Three different resolvers, each knowing ONE vehicle. The scans' alias table
+(`_rmw_alias`, BUG-792) learns `*u32 q = &g` at a var-decl and nothing at an assignment,
+so a struct field set to `&g` bound nothing. The main-side call site (BUG-801) matched a
+LITERAL `&g` argument only. And every sink resolved the callee by name to a global
+FUNCTION — a funcptr local / global / field named no body, so the call fell through all
+three as "nothing to bind, nothing to summarise".
+
+**Fix — one fact and one barrier.** (1) A CARRIER binding: `h.p = &g`, `H h = { .p = &g }`,
+`q = &g` record "this local's ROOT name now designates g" — in the scans' alias table
+(`rmw_bind_carrier_scan`, update-in-place because the lookup returns the first match) and
+in a new per-function main-side table (`Checker.rmw_ptr_carriers`, same shape and
+lifetime as the BUG-1010 taint). `rmw_arg_target_global_main` is the main-side twin of
+`rmw_arg_target_global`: `&g`, a carrier name, or a pointer local's `&g` init hop — and
+never a global pointer ITSELF, so the diagnostic cannot name `gp` for a write that lands on
+`*gp`. (2) The argument-precise barrier (BUG-740) for a callee the analysis cannot see:
+`callee_is_opaque_funcptr` (an IDENT that is not a global function nor `alloc`/`free`; a
+FIELD / INDEX whose type is a funcptr — a builtin METHOD is never typed as one) makes every
+global handed by pointer a MAY-RMW, recorded under its own flag (`IsrGlobal.opaque_in_*`,
+`_rmw_flagged_opaque`) with its own sentence ("passed by pointer to a call through a
+function pointer — the analysis cannot see that callee"), because it is not a proven RMW
+and the verdict must not say one happened.
+
+**Fourth vehicle, found by asking the same question once more:** a COPY. `volatile *u32 r
+= q;` and `H k = h;` designate whatever `q` / `h` designated, and `carrier_value_global`
+looked only for `&g`, a struct literal or an orelse. Measured accepted at the main and ISR
+sinks; an IDENT value now resolves through the same argument resolvers (alias table in a
+scan, carrier table + init hop on the main side). **Fifth:** the carrier's FIELD handed
+directly, `bump(h.p)` — both argument resolvers now resolve a projection through its ROOT
+name (any field of a carrier bound to `g` is taken to designate `g`, the over-approximating
+side).
+
+**Boundary.** A helper that only READS through the carrier (`u32 rd(H h) { return *h.p; }`)
+keeps compiling at every site — the binding resolves `h` to `g`, and the callee's RMW summary
+has no bit. Cost of the barrier: `fp(&g)` where `fp`'s target only reads and `g` is shared
+with an ISR / thread is now refused; the remedy the message names (call the helper by name)
+is a teachable one. Measured corpus cost: zero.
+
+**Tests.** Eighteen `tests/zer_fail/{main,isr,spawn}_rmw_via_{local_alias_arg,
+alias_reassigned,struct_carrier,struct_carrier_literal,funcptr_local,funcptr_global,
+funcptr_field,pointer_copy,carrier_copy,carrier_field_arg}.zer` (the combinations measured
+live), `tests/zer/rmw_carrier_readonly_ok.zer`. **Gate:** ten new RFORM columns in the
+hw-matrix RMW grid (nine negative at all three sites, `carrier read-only` positive at all
+three); 99 cells.
+
+### BUG-1047 — a two-shared-type statement inside an orelse BLOCK evaded the deadlock check (SILENT cross-struct race)
+
+**Symptom.** `u32 v = mb(0) orelse { a.x = b.y; return 1; };` with `A` and `B` both
+`shared` compiled clean; `a.x = b.y;` as a plain statement is refused ("deadlock: single
+statement accesses both"). The emitter locks A for the inner statement and reads `b.y`
+unlocked — the exact cross-struct race/deadlock the per-statement model exists to refuse.
+
+**Root cause.** `check_block_lock_ordering` recursed into nested BODIES by statement kind
+(if / loops / switch / defer / critical / once) and never into an expression; an
+orelse-block fallback is a body that lives inside an expression. The statement-level
+collector does reach the orelse, but a NODE_BLOCK fallback is (rightly) a no-op there —
+the block's statements are separate statements with separate lock scopes, so they must be
+checked as statements, which nothing did. Found by asking which OTHER statement-kind
+walkers the BUG-1044 helper should have been wired into.
+
+**Fix.** `for_each_orelse_block` at the top of the per-statement loop, re-entering
+`check_block_lock_ordering` on each fallback block. Nested forms (`orelse { if (..) {
+a.x = b.y; } ... }`) follow from the re-entry.
+
+**Test.** `tests/zer_fail/deadlock_in_orelse_block.zer` (compiles on the baseline).
+
+### BUG-1048 — the comptime interpreter SKIPPED every statement it did not model, folding a wrong constant (SILENT)
+
+**Symptom.** Each of these type-checks, folds, and bakes the wrong number into the binary:
+```
+comptime u32 F(u32 a) { u32 x = a; while (x < 100) { x += 1; if (x == 5) { break; } } return x; }   // 100, not 5
+... for (u32 i = 0; i < 4; i += 1) { if (i == 1) { continue; } n += 1; } return n;                   // 4, not 3
+... x += 1; goto done; x += 100; done: return x;                                                     // 102, not 2
+... { defer x += 1; x += 1; } return x;                                                              // 2, not 3
+... @critical { x += 1; } return x;                                                                  // 1, not 2
+... poke(); return x;               // the run-time call and its side effect simply vanished
+```
+Found by asking, after BUG-1042's `x /= 0` fold, what ELSE the folder does with a statement
+it cannot model.
+
+**Root cause.** `eval_comptime_block`'s statement dispatch was an if-chain ending in nothing:
+an unlisted kind fell off the end and the loop `continue`d — the statement was not executed.
+Two further conflations compounded it: a nested body's `CONST_EVAL_FAIL` meant "no return
+here, carry on" (so a genuine failure inside an `if` / loop / switch body was masked), and
+an `if` whose condition did not fold, or a loop condition that did not fold, was skipped /
+treated as false rather than refused.
+
+**Fix.** `ComptimeCtx` carries `failed` / `brk` / `cont`. Every failure goes through
+`CT_FAIL()` (sets `failed`, unwinds), so a nested failure is a failure at every level;
+`break` / `continue` are modelled (the loop drivers consume them, so `continue` still runs
+the for-step); a non-folding `if` / loop / switch condition, a non-folding `return`, a
+non-folding expression statement and every unmodelled statement kind refuse the body, and
+the report now names the construct ("because `goto` is not supported in a comptime body …",
+`comptime_report_unsupported`). The unmodelled-kind classification is a no-`default:`
+switch, so a new NodeKind must be classified. The switch driver also takes a `default` arm
+only after every value arm was tested (its source position is not C fall-through).
+
+**Tests.** `tests/zer/comptime_break_continue.zer` (folds 5 / 3 / 4 and checks them at run
+time — wrong on the baseline), `tests/zer_fail/comptime_{goto,defer,critical,call_stmt}_
+unsupported.zer` (all compile on the baseline).
+
+**Residuals (docs/limitations.md).** A carrier struct pointing at TWO globals binds the first
+only; a funcptr FIELD callee inside a spawn target declared AFTER its spawner has no typemap
+entry yet at scan time and is not treated as opaque; a GLOBAL funcptr rebound in another
+function is resolved by the ISR path through its declaration initializer (pre-existing).
 
 ---
 

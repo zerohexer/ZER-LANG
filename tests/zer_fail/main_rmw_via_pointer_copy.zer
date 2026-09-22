@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written and is shared
+// BUG-1046 (fourth vehicle): a COPY of a pointer or carrier that already
+// designates `g` designates the same global — a pointer local copied from an alias, at the main sink. Accepted before the copy
+// arm of carrier_value_global existed (measured); a torn RMW, silent on bare metal.
+volatile u32 g;
+void bump(volatile *u32 p) { *p += 1; }
+interrupt TIM2 { g = 1; }
+u32 main() { volatile *u32 q = &g; volatile *u32 r = q; bump(r); return 0; }

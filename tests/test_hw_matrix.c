@@ -316,6 +316,10 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
                RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
                RFORM_PARAM_CALL_ARG, RFORM_PARAM_RETURN, RFORM_PARAM_IF_COND,
+               RFORM_ALIAS_ARG, RFORM_CARRIER, RFORM_CARRIER_LIT,
+               RFORM_FUNCPTR_LOCAL, RFORM_FUNCPTR_GLOBAL, RFORM_FUNCPTR_FIELD,
+               RFORM_ALIAS_COPY, RFORM_CARRIER_COPY, RFORM_CARRIER_FIELD_ARG,
+               RFORM_CARRIER_READONLY,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -352,6 +356,16 @@ static const char *rform_name(RForm f) {
     case RFORM_PARAM_CALL_ARG:  return "param as call arg";
     case RFORM_PARAM_RETURN:    return "param in return";
     case RFORM_PARAM_IF_COND:   return "param in if cond";
+    case RFORM_ALIAS_ARG:       return "alias q=&g;bump(q)";
+    case RFORM_CARRIER:         return "carrier h.p=&g";
+    case RFORM_CARRIER_LIT:     return "carrier {.p=&g}";
+    case RFORM_FUNCPTR_LOCAL:   return "funcptr fp(&g)";
+    case RFORM_FUNCPTR_GLOBAL:  return "funcptr gfp(&g)";
+    case RFORM_FUNCPTR_FIELD:   return "funcptr o.cb(&g)";
+    case RFORM_ALIAS_COPY:      return "alias copy r=q";
+    case RFORM_CARRIER_COPY:    return "carrier copy k=h";
+    case RFORM_CARRIER_FIELD_ARG: return "carrier field bump(h.p)";
+    case RFORM_CARRIER_READONLY:return "carrier read-only";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -388,6 +402,36 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
                                                                                  *body = "u32 r = bump(&g);"; break;
     case RFORM_PARAM_IF_COND:  *helper = "void bump(volatile *u32 p){ if ((*p += 1) > 3) { } }";
                                                                                  *body = "bump(&g);";      break;
+    /* BUG-1046: the RMW REACH axis — the pointer to g arrives at the RMW through a
+     * vehicle the resolvers did not follow. The alias-as-argument form was live at
+     * the MAIN site only (the scans had an alias table, the main sink matched a
+     * literal `&g`); the carrier and the three funcptr-callee forms were live at
+     * ALL THREE sites. The funcptr forms are refused as "handed to a call the
+     * analysis cannot see" — a may-RMW, worded as such, not a proven one. */
+    case RFORM_ALIAS_ARG:      *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "volatile *u32 q = &g; bump(q);"; break;
+    case RFORM_CARRIER:        *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h; h.p = &g; bump(h);"; break;
+    case RFORM_CARRIER_LIT:    *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h = { .p = &g }; bump(h);"; break;
+    case RFORM_FUNCPTR_LOCAL:  *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "*(volatile *u32) fp = bump; fp(&g);"; break;
+    case RFORM_FUNCPTR_GLOBAL: *helper = "void bump(volatile *u32 p){ *p += 1; }\n*(volatile *u32) gfp = bump;";
+                                                                                 *body = "gfp(&g);"; break;
+    case RFORM_FUNCPTR_FIELD:  *helper = "struct Ops { *(volatile *u32) cb; }\nvoid bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "Ops o; o.cb = bump; o.cb(&g);"; break;
+    /* The fourth vehicle: a COPY of a pointer / carrier that already designates g. */
+    case RFORM_ALIAS_COPY:     *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "volatile *u32 q = &g; volatile *u32 r = q; bump(r);"; break;
+    case RFORM_CARRIER_COPY:   *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h; h.p = &g; H k = h; bump(k);"; break;
+    /* The fifth vehicle: the carrier's FIELD handed directly. */
+    case RFORM_CARRIER_FIELD_ARG: *helper = "struct H { volatile *u32 p; }\nvoid bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "H h; h.p = &g; bump(h.p);"; break;
+    /* The boundary pin for the carrier binding: a helper that only READS through
+     * the carrier has no RMW bit, so the binding alone must not reject. */
+    case RFORM_CARRIER_READONLY: *helper = "struct H { volatile *u32 p; }\nu32 rd(H h){ return *h.p; }";
+                                                                                 *body = "H h; h.p = &g; u32 v = rd(h); if (v > 100) { g = 1; }"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
@@ -608,9 +652,10 @@ int main(void) {
              * inside the once-body's read-modify-write (ISR site), or the ISR's
              * own store can (MAIN site), and @once orders nothing against an
              * interrupt. */
-            int neg = !(vs == RSITE_SPAWN && rf == RFORM_PARAM_ONCE);
+            int neg = !(vs == RSITE_SPAWN && rf == RFORM_PARAM_ONCE) &&
+                      rf != RFORM_CARRIER_READONLY;   /* BUG-1046 boundary, every site */
             int ok = run_vol(rnm, rbuf, "", neg);
-            fprintf(stderr, "  [%-5s][%-18s][%s] %s\n",
+            fprintf(stderr, "  [%-5s][%-24s][%s] %s\n",
                     rsite_name(vs), rform_name(rf), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;

@@ -3833,6 +3833,28 @@ u32 y = BIT(x);            // COMPILE ERROR — x is not compile-time constant
   recursion depth (16) — split the computation, hoist constants, or
   reduce recursion depth`. Restructure to use iteration or split into
   multiple smaller comptime functions.
+- A comptime body may use variable declarations, assignments (including
+  compound and array-element forms), `if` / `else`, `for` / `while` /
+  `do-while` with `break` and `continue`, `switch`, nested blocks and
+  `return`. `goto`, labels, `defer`, `@critical`, `@once`, `spawn`, `asm`,
+  a call to a run-time (non-comptime) function, and any condition or
+  return value that does not fold to a constant are compile errors that
+  name the construct (`... is not supported in a comptime body`). The
+  interpreter never skips a statement it cannot model.
+- A divisor that folds to zero (`x / 0`, `x /= 0`, `x %= 0`) is a compile
+  error, not a folded 0.
+
+```zer
+comptime u32 FIRST_OVER(u32 limit) {
+    u32 x = 0;
+    while (x < 100) {
+        x += 3;
+        if (x > limit) { break; }
+    }
+    return x;
+}
+u32 main() { return FIRST_OVER(10) - 12; }   // 0
+```
 
 ---
 

@@ -3073,10 +3073,40 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
         case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
         case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
         case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        /* BUG-1045 (third form): `inner(idf(p))` — the argument is a CALL whose
+         * result is a VIEW of one of its own arguments (`*D idf(*D p) { return
+         * p; }`). The Stage-2 return summary already says which positions the
+         * result may alias (`ret_param_mask`); trace those arguments. A callee
+         * with an INCOMPLETE summary may return anything it was handed, so every
+         * argument is traced — the over-approximating side, never the accept
+         * side a bare -1 was. */
+        case NODE_CALL: {
+            Node *cal = n->call.callee;
+            Symbol *cs = (cal && cal->kind == NODE_IDENT)
+                ? scope_lookup(c->global_scope, cal->ident.name, (uint32_t)cal->ident.name_len)
+                : NULL;
+            if (!cs || !cs->is_function) return -1;
+            for (int i = 0; i < n->call.arg_count && i < 64; i++) {
+                if (cs->ret_summary_complete && !(cs->ret_param_mask & (1ULL << i))) continue;
+                int r = keep_arg_caller_root(c, n->call.args[i]);
+                if (r >= 0) return r;
+            }
+            return -1;
+        }
+        /* BUG-1045 (fourth form): `inner({ .p = p })` — a struct LITERAL carrying
+         * the parameter in a field. Same fact as the by-value carrier `W w; w.p =
+         * p; inner(w);` (already traced through w's nonkeep root), spelled
+         * without the local. Trace every field value. */
+        case NODE_STRUCT_INIT:
+            for (int i = 0; i < n->struct_init.field_count; i++) {
+                int r = keep_arg_caller_root(c, n->struct_init.fields[i].value);
+                if (r >= 0) return r;
+            }
+            return -1;
         case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
         case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-        case NODE_BINARY: case NODE_ASSIGN: case NODE_CALL:
-        case NODE_CAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        case NODE_BINARY: case NODE_ASSIGN:
+        case NODE_CAST: case NODE_SIZEOF:
             return -1;
         }
     }
@@ -3806,6 +3836,11 @@ static void static_local_record(Node *vd) {
  * read-modify-write, so the diagnostic can name THAT rather than the generic
  * "accesses non-shared global" (which reads as if any access were the problem). */
 static bool _rmw_flagged_rmw = false;
+/* BUG-1046: the spawn scan flagged a volatile global because it was handed BY
+ * POINTER to a call through a function pointer — a callee the scan cannot enter,
+ * so it cannot rule out a read-modify-write there. Its own flag, its own sentence. */
+static bool _rmw_flagged_opaque = false;
+static void track_isr_global_opaque(Checker *c, const char *name, uint32_t name_len);
 /* BUG-971: the scan can now flag a STATIC LOCAL as well as a non-shared global, and
  * EIGHT diagnostics hardcoded the noun "non-shared global". Saying that about a static
  * local sends the reader hunting for a global that does not exist — the same
@@ -3860,6 +3895,7 @@ static void rmw_ctx_restore(const RmwScanCtx *k) {
 static RmwTaintEnt *_rmw_vtaint = NULL;
 static int _rmw_vtaint_count = 0, _rmw_vtaint_cap = 0;
 static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = false;
+                                    _rmw_flagged_opaque = false; /* BUG-1046 */
                                     _rmw_alias_overflow = false;
                                     _static_local_count = 0; _static_local_overflow = false;
                                     _scan_found_static_local = false;
@@ -3892,9 +3928,170 @@ static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
     if (!arg) return NULL;
     if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
         return resolve_write_target_global(c, arg->unary.operand, 0);
-    if (arg->kind == NODE_IDENT)
+    /* BUG-1046 (fifth vehicle): the carrier's FIELD / element passed directly —
+     * `h.p = &g; bump(h.p);`. The carrier fact is keyed by the ROOT name, so a
+     * projection resolves through its root (any field of a carrier bound to g is
+     * taken to designate g — the over-approximating side). */
+    while (arg && (arg->kind == NODE_FIELD || arg->kind == NODE_INDEX))
+        arg = (arg->kind == NODE_FIELD) ? arg->field.object : arg->index_expr.object;
+    if (arg && arg->kind == NODE_IDENT)
         return rmw_alias_lookup(arg->ident.name, (uint32_t)arg->ident.name_len);
     return NULL;
+}
+
+/* ---- BUG-1046: RMW REACH — the pointer to the global arrives at the read-modify-
+ * write through a VEHICLE the resolvers above never followed. Three forms, each
+ * measured live at the sinks named, each a torn update silent on bare metal:
+ *
+ *   h.p = &g; bump(h);        struct CARRIER            spawn, ISR, main
+ *   q  = &g; bump(q);         local alias as ARGUMENT   main   (the scans had it)
+ *   fp = bump; fp(&g);        call through a FUNCPTR    spawn, ISR, main
+ *   gfp(&g) / o.cb(&g)        global / field funcptr    spawn, ISR, main
+ *
+ * The carrier is ONE fact recorded at the binding — the local's ROOT name now
+ * designates `g` — kept in the scans' alias table and in the main-side carrier
+ * table (Checker.rmw_ptr_carriers), so `rmw_arg_target_global` resolves `h` and
+ * `q` exactly as it resolves `&g`. The funcptr call is answered by the
+ * argument-precise barrier (BUG-740): a call whose target cannot be seen may
+ * read-modify-write anything handed to it by pointer, and ONLY that — flagged
+ * with its own wording, because it is not a proven RMW. ---- */
+static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n, const char *nm, uint32_t nl);
+static void rmw_tab_set(RmwTaintEnt **tab, int *n, int *cap, int fixed_max,
+                        const char *nm, uint32_t nl, Symbol *g);
+static Node *carrier_root_ident(Node *t) {
+    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX))
+        t = (t->kind == NODE_FIELD) ? t->field.object : t->index_expr.object;
+    return (t && t->kind == NODE_IDENT) ? t : NULL;
+}
+
+/* The global a VALUE makes its receiver point at: `&g` (through any launder), a
+ * struct literal with such a field, or either arm of an orelse. NULL otherwise. */
+static Symbol *rmw_arg_target_global_main(Checker *c, Node *arg);
+static Symbol *carrier_value_global(Checker *c, Node *value, int depth, bool main_side) {
+    if (!value || depth > ZER_EXPR_WALK_MAX) return NULL;
+    Node *v = unwrap_ptr_launder(value);
+    if (!v) return NULL;
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP)
+        return resolve_write_target_global(c, v->unary.operand, 0);
+    /* A COPY of a pointer or carrier that already designates a global —
+     * `volatile *u32 r = q;`, `H k = h;` — designates the same one. Measured
+     * accepted at the main and ISR sinks before this arm existed. */
+    if (v->kind == NODE_IDENT)
+        return main_side ? rmw_arg_target_global_main(c, v) : rmw_arg_target_global(c, v);
+    if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++) {
+            Symbol *g = carrier_value_global(c, v->struct_init.fields[i].value, depth + 1, main_side);
+            if (g) return g;   /* one global per carrier — see limitations.md */
+        }
+        return NULL;
+    }
+    if (v->kind == NODE_ORELSE) {
+        Symbol *g = carrier_value_global(c, v->orelse.expr, depth + 1, main_side);
+        return g ? g : carrier_value_global(c, v->orelse.fallback, depth + 1, main_side);
+    }
+    return NULL;
+}
+
+/* Scan-side binding into _rmw_alias: update in place (the lookup returns the
+ * FIRST match, so an append could never rebind), else append, else overflow. */
+static void rmw_alias_bind(const char *name, uint32_t len, Symbol *g) {
+    if (!name || len == 0 || !g) return;
+    for (int i = 0; i < _rmw_alias_count; i++)
+        if (_rmw_alias[i].len == len && memcmp(_rmw_alias[i].name, name, len) == 0) {
+            _rmw_alias[i].global = g; return;
+        }
+    if (_rmw_alias_count >= RMW_ALIAS_MAX) { _rmw_alias_overflow = true; return; }
+    _rmw_alias[_rmw_alias_count].name = name;
+    _rmw_alias[_rmw_alias_count].len = len;
+    _rmw_alias[_rmw_alias_count].global = g;
+    _rmw_alias_count++;
+}
+/* `target = value` inside a scanned body: a LOCAL root (a global carrier is
+ * whole-program flow, not this table) that now designates a global. */
+static void rmw_bind_carrier_scan(Checker *c, Node *target, Node *value) {
+    Node *r = carrier_root_ident(target);
+    if (!r) return;
+    if (scope_lookup_local(c->global_scope, r->ident.name, (uint32_t)r->ident.name_len))
+        return;
+    Symbol *g = carrier_value_global(c, value, 0, false);
+    if (g) rmw_alias_bind(r->ident.name, (uint32_t)r->ident.name_len, g);
+}
+static void rmw_bind_carrier_scan_name(Checker *c, const char *name, uint32_t len, Node *value) {
+    Symbol *g = carrier_value_global(c, value, 0, false);
+    if (g) rmw_alias_bind(name, len, g);
+}
+/* Main-side binding. A bare-ident target REBINDS (and a value from no global
+ * clears — `q = other;`); a projection target only ever ADDS (`h.n = 5` must not
+ * forget that `h.p` points at g). */
+static void rmw_bind_carrier_main(Checker *c, Node *target, Node *value) {
+    Node *r = carrier_root_ident(target);
+    if (!r) return;
+    Symbol *rs = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+    Symbol *gs = scope_lookup_local(c->global_scope, r->ident.name, (uint32_t)r->ident.name_len);
+    if (!rs || rs == gs) return;   /* a global carrier: not this table */
+    Symbol *g = carrier_value_global(c, value, 0, true);
+    if (!g && target->kind != NODE_IDENT) return;
+    rmw_tab_set(&c->rmw_ptr_carriers, &c->rmw_ptr_carrier_count,
+                &c->rmw_ptr_carrier_capacity, 0,
+                r->ident.name, (uint32_t)r->ident.name_len, g);
+}
+/* The main-side twin of rmw_arg_target_global: `&g`, a carrier-table name, or a
+ * pointer local whose declaration bound it to `&g` (the init hop the shared
+ * resolver already follows). A VALUE argument copies and designates nothing; a
+ * bare global pointer designates its pointee only through that init hop, never
+ * ITSELF — that is what the `r == s` test refuses, so the diagnostic can never
+ * name `gp` for a write that lands on `*gp`. */
+static Symbol *rmw_arg_target_global_main(Checker *c, Node *arg) {
+    Node *a = unwrap_ptr_launder(arg);
+    if (!a) return NULL;
+    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP)
+        return resolve_write_target_global(c, a->unary.operand, 0);
+    /* BUG-1046 (fifth vehicle): `bump(h.p)` — resolve a projection through its
+     * root name, as the scan-side twin does. The init-hop fallback below is for
+     * a bare pointer local only. */
+    bool projected = false;
+    while (a && (a->kind == NODE_FIELD || a->kind == NODE_INDEX)) {
+        a = (a->kind == NODE_FIELD) ? a->field.object : a->index_expr.object;
+        projected = true;
+    }
+    if (!a || a->kind != NODE_IDENT) return NULL;
+    Symbol *g = rmw_tab_lookup(c->rmw_ptr_carriers, c->rmw_ptr_carrier_count,
+                               a->ident.name, (uint32_t)a->ident.name_len);
+    if (g) return g;
+    if (projected) return NULL;
+    Symbol *s = scope_lookup(c->current_scope, a->ident.name, (uint32_t)a->ident.name_len);
+    if (!s || s->is_function || !s->type) return NULL;
+    if (!type_carries_data_pointer(s->type, 0)) return NULL;
+    Symbol *r = resolve_write_target_global(c, a, 0);
+    if (!r || r == s || r->is_function) return NULL;
+    return r;
+}
+/* Is this call's target invisible to the RMW analysis? A direct global function
+ * is not (its body is summarised or descended). The universal builtins (`alloc`,
+ * `free`) have no Symbol and are not. Everything else the callee position can
+ * hold — a funcptr local / param / global, a funcptr field or element — is: the
+ * scans and the summary can name no body for it. A FIELD / INDEX callee is
+ * recognised by its typemap type, so a builtin METHOD (`pool.free(h)`, which the
+ * checker intercepts and never types as a funcptr) is left alone. */
+static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
+    if (!callee) return false;
+    if (callee->kind == NODE_IDENT) {
+        Symbol *gsym = scope_lookup_local(c->global_scope, callee->ident.name,
+                                          (uint32_t)callee->ident.name_len);
+        if (gsym && gsym->is_function) return false;
+        if ((callee->ident.name_len == 5 && memcmp(callee->ident.name, "alloc", 5) == 0) ||
+            (callee->ident.name_len == 4 && memcmp(callee->ident.name, "free", 4) == 0))
+            return false;
+        Symbol *s = scope_lookup(c->current_scope, callee->ident.name,
+                                 (uint32_t)callee->ident.name_len);
+        if (s && s->is_function) return false;
+        return true;
+    }
+    if (callee->kind == NODE_FIELD || callee->kind == NODE_INDEX) {
+        Type *t = checker_get_type(c, callee);
+        return t && type_dispatch_kind(t) == TYPE_FUNC_PTR;
+    }
+    return false;
 }
 
 /* Is this assignment a read-modify-write? `x += 1` is one, and so is the
@@ -5348,12 +5545,24 @@ typedef struct {
     ComptimeParam *locals;     /* points to stack or malloc'd buffer */
     int count;
     int capacity;
+    /* BUG-1048: control-flow signals that used to be CONFLATED with "this block
+     * returned nothing". `failed` is a genuine evaluation failure anywhere below
+     * (a nested body's CONST_EVAL_FAIL used to read as "no return here" and the
+     * walk carried on, so a statement the interpreter could not model was simply
+     * SKIPPED and a wrong constant was folded into the emitted C — `break`,
+     * `continue`, `goto`, `defer`, `@critical`, an `if` on a non-constant
+     * condition, a call statement, all measured); `brk` / `cont` are a pending
+     * break / continue travelling up to the innermost loop. */
+    bool failed;
+    bool brk;
+    bool cont;
 } ComptimeCtx;
 
 static void ct_ctx_init(ComptimeCtx *ctx, ComptimeParam *params, int param_count) {
     ctx->capacity = 8;
     ctx->locals = ctx->stack;
     ctx->count = 0;
+    ctx->failed = false; ctx->brk = false; ctx->cont = false;   /* BUG-1048 */
     memset(ctx->stack, 0, sizeof(ctx->stack));
     if (param_count > 8) {
         ctx->capacity = param_count + 8;
@@ -5425,6 +5634,21 @@ static Checker *_comptime_checker;
  * depth >16 hit; surfaced as explicit checker_error by outermost caller. */
 static bool _comptime_depth_exceeded = false;
 static int _comptime_diag_line = 0;
+/* BUG-1048: the construct the interpreter refused, so the "could not be evaluated"
+ * report can say WHY instead of leaving the author to guess which statement of a
+ * body that type-checks fine is the one the folder does not model. Reset at the
+ * outermost eval_comptime_block entry; read by comptime_report_unsupported. */
+static const char *_comptime_unsupported = NULL;
+static int _comptime_unsupported_line = 0;
+static void comptime_report_unsupported(Checker *c) {
+    if (!_comptime_unsupported) return;
+    checker_error(c, _comptime_unsupported_line,
+        "  because %s is not supported in a comptime body — the interpreter "
+        "used to skip it and fold a WRONG constant; restructure with if / "
+        "while / for / switch / return, or compute the value at run time",
+        _comptime_unsupported);
+    _comptime_unsupported = NULL;
+}
 
 /* Recursive TypeNode substitution: clone the TypeNode tree with type param T replaced.
  * Used by container monomorphization to handle arbitrarily nested T references:
@@ -6640,17 +6864,73 @@ static void ct_ctx_set_array(ComptimeCtx *ctx, const char *name, uint32_t name_l
     ctx->count++;
 }
 
+/* BUG-1048: the noun for a statement the comptime interpreter does not model.
+ * A classification, not a walk — it descends nothing — kept OUT of the recursive
+ * evaluator so the walker field-coverage audit does not read its arms as a
+ * walker that skips every child. No `default:`: a new NodeKind must be
+ * classified here (modelled kinds are listed too, for -Werror=switch). */
+static const char *comptime_unsupported_noun(Node *stmt) {
+    switch (stmt->kind) {
+    case NODE_GOTO:     return "`goto`";
+    case NODE_LABEL:    return "a label";
+    case NODE_DEFER:    return "`defer`";
+    case NODE_CRITICAL: return "`@critical`";
+    case NODE_ONCE:     return "`@once`";
+    case NODE_SPAWN:    return "`spawn`";
+    case NODE_YIELD:    return "`yield`";
+    case NODE_AWAIT:    return "`await`";
+    case NODE_ASM:      return "`asm`";
+    case NODE_STATIC_ASSERT: return "`static_assert`";
+    case NODE_RETURN:   return "a bare `return`";
+    case NODE_VAR_DECL: case NODE_EXPR_STMT: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_IF: case NODE_BLOCK:
+    case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        break;
+    }
+    return "this statement";
+}
+
 static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
     static int depth = 0;
     static int64_t _comptime_ops = 0;  /* global instruction budget */
     if (!block) return CONST_EVAL_FAIL;
-    if (depth++ > 32) { depth--; return CONST_EVAL_FAIL; }
-    if (depth == 1) _comptime_ops = 0;  /* reset on top-level call */
+    if (depth++ > 32) { depth--; ctx->failed = true; return CONST_EVAL_FAIL; }
+    if (depth == 1) { _comptime_ops = 0; _comptime_unsupported = NULL; }  /* reset on top-level call */
 
     /* Save count for block scoping — locals added inside are popped on exit.
      * Loop bodies do NOT save/restore (mutations must persist across iterations). */
     int saved_count = ctx->count;
     int64_t result = CONST_EVAL_FAIL;
+    /* BUG-1048: every failure goes through here, so a nested body's failure is a
+     * FAILURE at the caller too, never "no return, carry on". */
+    #define CT_FAIL() do { ctx->failed = true; result = CONST_EVAL_FAIL; goto ct_done; } while (0)
+    #define CT_UNSUPPORTED(what, ln) do { if (!_comptime_unsupported) { _comptime_unsupported = (what); _comptime_unsupported_line = (ln); } CT_FAIL(); } while (0)
+    /* After a nested body: a return value ends the block; a failure or a pending
+     * break / continue unwinds to whoever handles it. */
+    #define CT_AFTER_BODY(r) do { if (ctx->failed) CT_FAIL(); \
+        if ((r) != CONST_EVAL_FAIL) { result = (r); goto ct_done; } \
+        if (ctx->brk || ctx->cont) goto ct_done; } while (0)
+    /* After a LOOP body: a break ends the loop (a legitimate exit), a continue is
+     * consumed here so the step / condition runs. */
+    /* NOT a do/while(0) wrapper: the `break` must leave the ENCLOSING iteration
+     * loop, and a do/while(0) would swallow it (measured: `break` was a no-op on
+     * the first build of this fix — a wrapper-swallowed break is exactly the
+     * "silent skip" this bug is about). */
+    #define CT_AFTER_LOOP_BODY(r, exited) \
+        { if (ctx->failed) CT_FAIL(); \
+          if ((r) != CONST_EVAL_FAIL) { result = (r); goto ct_done; } \
+          if (ctx->cont) ctx->cont = false; } \
+        if (ctx->brk) { ctx->brk = false; (exited) = true; break; }
 
     if (block->kind == NODE_BLOCK) {
         for (int i = 0; i < block->block.stmt_count; i++) {
@@ -6698,16 +6978,33 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             if (stmt->kind == NODE_EXPR_STMT && stmt->expr_stmt.expr &&
                 stmt->expr_stmt.expr->kind == NODE_ASSIGN) {
                 if (ct_eval_assign(ctx, stmt->expr_stmt.expr) == CONST_EVAL_FAIL)
-                    { goto ct_done; }
+                    CT_FAIL();
                 continue;
             }
+            /* BUG-1048: any OTHER expression statement — a call, a bare
+             * expression — must itself fold, or the body cannot be evaluated. A
+             * call to a comptime function folds through eval_const_expr_subst; a
+             * call to a run-time function (which the interpreter used to skip,
+             * side effects and all) does not. */
+            if (stmt->kind == NODE_EXPR_STMT) {
+                if (!stmt->expr_stmt.expr ||
+                    eval_const_expr_subst(stmt->expr_stmt.expr, ctx->locals, ctx->count)
+                        == CONST_EVAL_FAIL)
+                    CT_UNSUPPORTED("this expression statement (it does not fold to a constant)",
+                                   stmt->loc.line);
+                continue;
+            }
+            /* BUG-1048: break / continue — were SKIPPED, so `while (..) { ..;
+             * if (x == 5) { break; } }` ran to the iteration cap and folded 100. */
+            if (stmt->kind == NODE_BREAK)    { ctx->brk = true;  goto ct_done; }
+            if (stmt->kind == NODE_CONTINUE) { ctx->cont = true; goto ct_done; }
 
             /* For loop */
             if (stmt->kind == NODE_FOR) {
                 if (stmt->for_stmt.init && stmt->for_stmt.init->kind == NODE_VAR_DECL &&
                     stmt->for_stmt.init->var_decl.init) {
                     int64_t val = eval_const_expr_subst(stmt->for_stmt.init->var_decl.init, ctx->locals, ctx->count);
-                    if (val == CONST_EVAL_FAIL) { goto ct_done; }
+                    if (val == CONST_EVAL_FAIL) CT_FAIL();
                     ct_ctx_set(ctx, stmt->for_stmt.init->var_decl.name,
                         (uint32_t)stmt->for_stmt.init->var_decl.name_len, val);
                 }
@@ -6725,27 +7022,30 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 for (iter = 0; iter < 10000; iter++) {
                     /* SAFETY: zer_comptime_ops_valid in src/safety/comptime_rules.c (R06) */
                     ++_comptime_ops;
-                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) { result = CONST_EVAL_FAIL; goto ct_done; }
+                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) CT_FAIL();
                     if (stmt->for_stmt.cond) {
                         int64_t cond = eval_const_expr_subst(stmt->for_stmt.cond, ctx->locals, ctx->count);
-                        if (cond == CONST_EVAL_FAIL || !cond) { exited_via_cond = true; break; }
+                        /* BUG-1048: a condition that does not FOLD is a failure,
+                         * not "false" — it used to end the loop silently. */
+                        if (cond == CONST_EVAL_FAIL) CT_FAIL();
+                        if (!cond) { exited_via_cond = true; break; }
                     } else {
                         /* no cond = infinite loop from the point of view of
                          * comptime eval; guarantee iter-limit exit handling */
                     }
                     /* body — recursive call shares ctx (mutations persist) */
                     int64_t r = eval_comptime_block(stmt->for_stmt.body, ctx);
-                    if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                    CT_AFTER_LOOP_BODY(r, exited_via_cond);
                     /* step */
                     if (stmt->for_stmt.step && stmt->for_stmt.step->kind == NODE_ASSIGN) {
                         if (ct_eval_assign(ctx, stmt->for_stmt.step) == CONST_EVAL_FAIL)
-                            { goto ct_done; }
+                            CT_FAIL();
+                    } else if (stmt->for_stmt.step) {
+                        CT_UNSUPPORTED("this for-step (only an assignment is modelled)",
+                                       stmt->loc.line);
                     }
                 }
-                if (iter == 10000 && !exited_via_cond) {
-                    result = CONST_EVAL_FAIL;
-                    goto ct_done;
-                }
+                if (iter == 10000 && !exited_via_cond) CT_FAIL();
                 }
                 continue;
             }
@@ -6760,47 +7060,51 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
                 for (iter = 0; iter < 10000; iter++) {
                     /* SAFETY: zer_comptime_ops_valid in src/safety/comptime_rules.c (R06) */
                     ++_comptime_ops;
-                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) { result = CONST_EVAL_FAIL; goto ct_done; }
+                    if (zer_comptime_ops_valid((int)_comptime_ops) == 0) CT_FAIL();
                     /* do-while: execute body before checking condition on first iteration */
                     if (stmt->kind == NODE_DO_WHILE && iter == 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
-                        if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                        CT_AFTER_LOOP_BODY(r, exited_via_cond);
                     }
                     int64_t cond = eval_const_expr_subst(stmt->while_stmt.cond, ctx->locals, ctx->count);
-                    if (cond == CONST_EVAL_FAIL || !cond) { exited_via_cond = true; break; }
+                    if (cond == CONST_EVAL_FAIL) CT_FAIL();   /* BUG-1048 */
+                    if (!cond) { exited_via_cond = true; break; }
                     if (stmt->kind == NODE_WHILE || iter > 0) {
                         int64_t r = eval_comptime_block(stmt->while_stmt.body, ctx);
-                        if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                        CT_AFTER_LOOP_BODY(r, exited_via_cond);
                     }
                 }
-                if (iter == 10000 && !exited_via_cond) {
-                    result = CONST_EVAL_FAIL;
-                    goto ct_done;
-                }
+                if (iter == 10000 && !exited_via_cond) CT_FAIL();
                 continue;
             }
 
             /* Switch */
             if (stmt->kind == NODE_SWITCH) {
                 int64_t sw_val = eval_const_expr_subst(stmt->switch_stmt.expr, ctx->locals, ctx->count);
-                if (sw_val != CONST_EVAL_FAIL) {
+                /* BUG-1048: a subject or arm value that does not fold is a failure;
+                 * the whole switch used to be skipped. A default arm is taken only
+                 * after every value arm has been tested (source order of the
+                 * default is not the fall-through position it is in C). */
+                if (sw_val == CONST_EVAL_FAIL) CT_FAIL();
+                {
                     bool matched = false;
-                    for (int ai = 0; ai < stmt->switch_stmt.arm_count; ai++) {
+                    SwitchArm *dflt = NULL;
+                    for (int ai = 0; ai < stmt->switch_stmt.arm_count && !matched; ai++) {
                         SwitchArm *arm = &stmt->switch_stmt.arms[ai];
-                        if (arm->is_default) {
-                            int64_t r = eval_comptime_block(arm->body, ctx);
-                            if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
-                            matched = true; break;
-                        }
+                        if (arm->is_default) { dflt = arm; continue; }
                         for (int vi = 0; vi < arm->value_count; vi++) {
                             int64_t arm_val = eval_const_expr_subst(arm->values[vi], ctx->locals, ctx->count);
-                            if (arm_val != CONST_EVAL_FAIL && arm_val == sw_val) {
+                            if (arm_val == CONST_EVAL_FAIL) CT_FAIL();
+                            if (arm_val == sw_val) {
                                 int64_t r = eval_comptime_block(arm->body, ctx);
-                                if (r != CONST_EVAL_FAIL) { result = r; goto ct_done; }
+                                CT_AFTER_BODY(r);
                                 matched = true; break;
                             }
                         }
-                        if (matched) break;
+                    }
+                    if (!matched && dflt) {
+                        int64_t r = eval_comptime_block(dflt->body, ctx);
+                        CT_AFTER_BODY(r);
                     }
                 }
                 continue;
@@ -6809,20 +7113,24 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             /* Return */
             if (stmt->kind == NODE_RETURN && stmt->ret.expr) {
                 result = eval_const_expr_subst(stmt->ret.expr, ctx->locals, ctx->count);
+                if (result == CONST_EVAL_FAIL) CT_FAIL();   /* BUG-1048: a return that does not fold */
                 break;
             }
 
             /* If/else */
             if (stmt->kind == NODE_IF) {
                 int64_t cond = eval_const_expr_subst(stmt->if_stmt.cond, ctx->locals, ctx->count);
-                if (cond != CONST_EVAL_FAIL) {
-                    if (cond) {
-                        int64_t r = eval_comptime_block(stmt->if_stmt.then_body, ctx);
-                        if (r != CONST_EVAL_FAIL) { result = r; break; }
-                    } else if (stmt->if_stmt.else_body) {
-                        int64_t r = eval_comptime_block(stmt->if_stmt.else_body, ctx);
-                        if (r != CONST_EVAL_FAIL) { result = r; break; }
-                    }
+                /* BUG-1048: a non-constant condition was SKIPPED with its whole
+                 * statement — both arms — and the fold carried on. */
+                if (cond == CONST_EVAL_FAIL)
+                    CT_UNSUPPORTED("an `if` whose condition does not fold to a constant",
+                                   stmt->loc.line);
+                if (cond) {
+                    int64_t r = eval_comptime_block(stmt->if_stmt.then_body, ctx);
+                    CT_AFTER_BODY(r);
+                } else if (stmt->if_stmt.else_body) {
+                    int64_t r = eval_comptime_block(stmt->if_stmt.else_body, ctx);
+                    CT_AFTER_BODY(r);
                 }
                 continue;
             }
@@ -6830,9 +7138,14 @@ static int64_t eval_comptime_block(Node *block, ComptimeCtx *ctx) {
             /* Nested block */
             if (stmt->kind == NODE_BLOCK) {
                 int64_t r = eval_comptime_block(stmt, ctx);
-                if (r != CONST_EVAL_FAIL) { result = r; break; }
+                CT_AFTER_BODY(r);
                 continue;
             }
+
+            /* BUG-1048: everything else the interpreter does not model. It used to
+             * fall off the end of this chain and `continue` — the statement was
+             * simply not executed. Named, so the report says which one. */
+            CT_UNSUPPORTED(comptime_unsupported_noun(stmt), stmt->loc.line);
         }
     } else if (block->kind == NODE_RETURN && block->ret.expr) {
         result = eval_const_expr_subst(block->ret.expr, ctx->locals, ctx->count);
@@ -6853,6 +7166,10 @@ ct_done:
     }
     ctx->count = saved_count; /* pop block-local vars */
     depth--;
+    #undef CT_FAIL
+    #undef CT_UNSUPPORTED
+    #undef CT_AFTER_BODY
+    #undef CT_AFTER_LOOP_BODY
     return result;
 }
 
@@ -7959,6 +8276,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             rmw_value_source_global(c, c->rmw_taints,
                                 c->rmw_taint_count, node->assign.value, 0));
             }
+            /* BUG-1046: `h.p = &g` / `q = &g` — the local now designates g. */
+            if (node->assign.op == TOK_EQ && node->assign.target)
+                rmw_bind_carrier_main(c, node->assign.target, node->assign.value);
         }
 
         /* BUG-294/302: reject assignment to non-lvalue.
@@ -9692,18 +10012,31 @@ static Type *check_expr(Checker *c, Node *node) {
          * MEMOISED per-function summary, so this costs one bit test per argument —
          * the naive version (re-walking callee bodies per caller) was exponential
          * and hung test_firmware_patterns. */
-        if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *rc = scope_lookup(c->global_scope, node->call.callee->ident.name,
-                                      (uint32_t)node->call.callee->ident.name_len);
+        if (node->call.callee) {
+            Node *cal = node->call.callee;
+            Symbol *rc = (cal->kind == NODE_IDENT)
+                ? scope_lookup(c->global_scope, cal->ident.name, (uint32_t)cal->ident.name_len)
+                : NULL;
             if (rc && rc->is_function) {
                 uint64_t rm = func_rmw_param_mask(c, rc, 0);
                 for (int i = 0; rm && i < node->call.arg_count && i < 64; i++) {
                     if (!(rm & (1ULL << i))) continue;
-                    Node *ag = unwrap_ptr_launder(node->call.args[i]);
-                    if (!ag || ag->kind != NODE_UNARY || ag->unary.op != TOK_AMP) continue;
-                    Symbol *gg = resolve_write_target_global(c, ag->unary.operand, 0);
+                    /* BUG-1046: `&g`, a local alias `q` (bound `&g` at its
+                     * declaration), or a carrier `h` (`h.p = &g`) — the ISR and
+                     * spawn scans already resolved the alias; this sink matched
+                     * only the literal `&g`. */
+                    Symbol *gg = rmw_arg_target_global_main(c, node->call.args[i]);
                     if (gg && !gg->is_function)
                         track_isr_global(c, gg->name, gg->name_len, true);
+                }
+            } else if (callee_is_opaque_funcptr(c, cal)) {
+                /* BUG-1046: a call through a function pointer — no body to
+                 * summarise, so every global handed by pointer MAY be read-
+                 * modify-written there. Recorded under its own flag/wording. */
+                for (int i = 0; i < node->call.arg_count; i++) {
+                    Symbol *gg = rmw_arg_target_global_main(c, node->call.args[i]);
+                    if (gg && !gg->is_function)
+                        track_isr_global_opaque(c, gg->name, gg->name_len);
                 }
             }
         }
@@ -10403,6 +10736,18 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *callee_type = check_expr(c, node->call.callee);
         /* unwrap distinct typedef for call dispatch */
         Type *effective_callee = type_unwrap_distinct(callee_type);
+        /* BUG-1046: a FIELD / INDEX callee (`o.cb(&g)`, `tbl[i](&g)`) is typed
+         * only HERE, after the builtin-method interception above, so the opaque-
+         * call rule for it lives here rather than beside the IDENT form. */
+        if (node->call.callee &&
+            (node->call.callee->kind == NODE_FIELD || node->call.callee->kind == NODE_INDEX) &&
+            effective_callee && type_dispatch_kind(effective_callee) == TYPE_FUNC_PTR) {
+            for (int i = 0; i < node->call.arg_count; i++) {
+                Symbol *gg = rmw_arg_target_global_main(c, node->call.args[i]);
+                if (gg && !gg->is_function)
+                    track_isr_global_opaque(c, gg->name, gg->name_len);
+            }
+        }
 
         /* Async functions are compiled as state-machine init/poll pairs
          * (_zer_async_FN_init + _zer_async_FN_poll). Calling them by their
@@ -11070,6 +11415,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     checker_error(c, node->loc.line,
                                         "comptime function '%.*s' body could not be evaluated at compile time",
                                         (int)callee_sym->name_len, callee_sym->name);
+                                    comptime_report_unsupported(c);   /* BUG-1048 */
                                 }
                             } else {
                                 /* Try float return: comptime f32/f64 functions */
@@ -11089,6 +11435,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     checker_error(c, node->loc.line,
                                         "comptime function '%.*s' body could not be evaluated at compile time",
                                         (int)callee_sym->name_len, callee_sym->name);
+                                    comptime_report_unsupported(c);   /* BUG-1048 */
                                 }
                             }
                         }
@@ -15973,6 +16320,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 }
             }
         }
+        /* BUG-1046: `H h = { .p = &g };` — the struct-literal carrier. */
+        if (node->var_decl.name)
+            rmw_bind_carrier_scan_name(c, node->var_decl.name,
+                                       (uint32_t)node->var_decl.name_len, node->var_decl.init);
         /* BUG-1010: seed the VALUE taint for the split-statement RMW —
          * `u32 t = g;` inside a spawned body makes `t` carry `g`. Uses the same
          * query helper as the ISR sink; only the table differs. */
@@ -16030,6 +16381,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 return true;
             }
         }
+        rmw_bind_carrier_scan(c, node->assign.target, node->assign.value);   /* BUG-1046 */
         if (scan_unsafe_global_access(c, node->assign.target, out_name, out_len)) return true;
         /* SPAWN-FP: `s.fp = do_inc;` binds a function to a funcptr field. */
         if (scan_funcname_binding(c, node->assign.value, out_name, out_len)) return true;
@@ -16103,6 +16455,21 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                         _rmw_alias_count = _saved_alias;
                         _scan_global_depth--;
                         if (found) return true;
+                    }
+                }
+            }
+            /* BUG-1046: a call through a FUNCTION POINTER — `fp(&g)`, `gfp(&g)`,
+             * `o.cb(&g)`. The direct-call descent above cannot name a body, so
+             * a volatile global handed to it by pointer may be read-modify-
+             * written where the scan cannot see (measured: accepted). The
+             * argument-precise barrier: exactly what was handed, nothing else. */
+            if (callee_is_opaque_funcptr(c, node->call.callee)) {
+                for (int i = 0; i < node->call.arg_count; i++) {
+                    Symbol *tg = rmw_arg_target_global(c, node->call.args[i]);
+                    if (tg && tg->is_volatile && !tg->is_const && !tg->is_function) {
+                        _rmw_flagged_opaque = true;
+                        *out_name = tg->name; *out_len = tg->name_len;
+                        return true;
                     }
                 }
             }
@@ -16590,6 +16957,14 @@ static void check_stmt(Checker *c, Node *node) {
                         node->var_decl.name, (uint32_t)node->var_decl.name_len,
                         rmw_value_source_global(c, c->rmw_taints,
                             c->rmw_taint_count, node->var_decl.init, 0));
+        /* BUG-1046: `H h = { .p = &g };` / `volatile *u32 q = &g;` — a carrier.
+         * Name-keyed like the taint above; the declaring name rebinds (or clears,
+         * for a value from no global), so a shadowing local cannot inherit. */
+        if (node->kind == NODE_VAR_DECL && node->var_decl.name)
+            rmw_tab_set(&c->rmw_ptr_carriers, &c->rmw_ptr_carrier_count,
+                        &c->rmw_ptr_carrier_capacity, 0,
+                        node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                        carrier_value_global(c, node->var_decl.init, 0, true));
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {
@@ -21325,6 +21700,16 @@ static void check_stmt(Checker *c, Node *node) {
                             "another thread; use @atomic_add / @atomic_* or a shared struct",
                             (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
                             (int)bad_len, bad_name);
+                    else if (_rmw_flagged_opaque)   /* BUG-1046 */
+                        checker_error(c, node->loc.line,
+                            "spawn target '%.*s' passes volatile global '%.*s' by pointer "
+                            "to a call through a function pointer — the analysis cannot "
+                            "see that callee, so it cannot rule out a read-modify-write "
+                            "there, which is a data race from a thread (volatile gives NO "
+                            "atomicity). Call the helper by name so its body can be "
+                            "checked, or use @atomic_*",
+                            (int)node->spawn_stmt.func_name_len, node->spawn_stmt.func_name,
+                            (int)bad_len, bad_name);
                     else
                         checker_error(c, node->loc.line,
                             "spawn target '%.*s' accesses %s '%.*s' — "
@@ -22691,6 +23076,7 @@ static void check_func_body(Checker *c, Node *node) {
          * that next reset consults a stale range. */
         c->var_range_count = 0;
         c->rmw_taint_count = 0;   /* BUG-1010: per-function, same lifetime as VarRange */
+        c->rmw_ptr_carrier_count = 0;   /* BUG-1046 */
         check_stmt(c, node->func_decl.body);
         /* NOT DONE — the mirror of ISR-TRANS (a transitive global-access walk over
          * every REGULAR function body, so an RMW reached from main through a
@@ -22869,6 +23255,7 @@ static void check_func_body(Checker *c, Node *node) {
          * ISR -> silent bare-metal stack OOB. Mirrors the func_decl reset. */
         c->var_range_count = 0;
         c->rmw_taint_count = 0;   /* BUG-1010 */
+        c->rmw_ptr_carrier_count = 0;   /* BUG-1046 */
         check_stmt(c, node->interrupt.body);
         /* ISR-TRANS: also record globals reached through helper calls so the
          * "accessed from both ISR and main → volatile" and "volatile compound
@@ -23601,6 +23988,21 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
     }
 }
 
+/* BUG-1046: record that a global was handed BY POINTER to a call whose target the
+ * analysis cannot see, from whichever context is checking. It is an ACCESS too
+ * (from_isr / from_func), so "must be declared volatile" still fires for a
+ * non-volatile one; the opaque flags add the may-RMW finding for a volatile one. */
+static void track_isr_global_opaque(Checker *c, const char *name, uint32_t name_len) {
+    track_isr_global_ex(c, name, name_len, false, false, 0);
+    for (int i = 0; i < c->isr_global_count; i++) {
+        struct IsrGlobal *g = &c->isr_globals[i];
+        if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+            if (c->in_interrupt) g->opaque_in_isr = true; else g->opaque_in_func = true;
+            return;
+        }
+    }
+}
+
 /* ISR-TRANS: the ISR global-access safety checks ("accessed from both ISR and
  * main → must be volatile", "volatile compound RMW → non-atomic") only saw the
  * globals lexically inside the `interrupt {}` body. If the ISR touched a global
@@ -23820,6 +24222,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             if (gs && !gs->is_function && assign_reads_own_target(node->assign.value, gs))
                 track_isr_global(c, gs->name, gs->name_len, true);
         }
+        rmw_bind_carrier_scan(c, node->assign.target, node->assign.value);   /* BUG-1046 */
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
         record_isr_funcname_binding(c, node->assign.value, depth);  /* E1 */
@@ -23871,6 +24274,14 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                      cs->func_node->var_decl.init)
                 record_isr_funcname_binding(c, cs->func_node->var_decl.init, depth);
         }
+        /* BUG-1046: the ISR sibling of the spawn scan's opaque-call rule. */
+        if (callee_is_opaque_funcptr(c, node->call.callee)) {
+            for (int i = 0; i < node->call.arg_count; i++) {
+                Symbol *tg = rmw_arg_target_global(c, node->call.args[i]);
+                if (tg && !tg->is_function)
+                    track_isr_global_opaque(c, tg->name, tg->name_len);
+            }
+        }
         return;
     }
     case NODE_BLOCK:
@@ -23916,6 +24327,9 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                 }
             }
         }
+        if (node->var_decl.name)   /* BUG-1046: struct-literal carrier */
+            rmw_bind_carrier_scan_name(c, node->var_decl.name,
+                                       (uint32_t)node->var_decl.name_len, node->var_decl.init);
         record_isr_globals(c, node->var_decl.init, depth);
         record_isr_funcname_binding(c, node->var_decl.init, depth);  /* E1 */
         return;
@@ -24418,6 +24832,17 @@ static void check_interrupt_safety(Checker *c) {
                 "split by an interrupt, losing an update; use an explicit "
                 "read/mask/write inside @critical, or @atomic_*",
                 (int)g->name_len, g->name);
+        } else if (g->opaque_in_isr || g->opaque_in_func) {
+            /* BUG-1046: not a proven RMW, so it does not say one happened. */
+            checker_error(c, sym->line,
+                "volatile global '%.*s' is shared between interrupt and main code "
+                "and is passed by pointer to a call through a function pointer%s — "
+                "the analysis cannot see that callee, so it cannot rule out a "
+                "read-modify-write there, which an interrupt can split, losing an "
+                "update. Call the helper by name so its body can be checked, or "
+                "use @atomic_*",
+                (int)g->name_len, g->name,
+                g->opaque_in_isr ? " inside the interrupt handler" : "");
         } else if (!volatile_global_exempt_from_race_check(c, sym)) {
             /* 2026-08-03: `volatile` alone was accepted here at ANY width and
              * shape. The exemption exists for the SINGLE-WORD flag idiom; a
@@ -26913,6 +27338,18 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     return 0;
 }
 
+/* BUG-1047: an orelse-BLOCK fallback holds statements of its own — each with its
+ * own per-statement lock scope in the emitted C — and this walker descended bodies
+ * by statement KIND only, so `u32 v = mb() orelse { a.x = b.y; return 1; };`
+ * carried a two-shared-type statement the check never saw: the emitter locked A
+ * and read B unlocked. Same construct as BUG-1044, one more walker. */
+static void check_block_lock_ordering(Checker *c, Node *block);
+static bool cblo_orelse_cb(Checker *c, Node *blk, void *ud) {
+    (void)ud;
+    check_block_lock_ordering(c, blk);
+    return false;   /* void walk: see every block */
+}
+
 static void check_block_lock_ordering(Checker *c, Node *block) {
     if (!block || block->kind != NODE_BLOCK) return;
 
@@ -27069,6 +27506,9 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
                     (int)hi->struct_type.name_len, hi->struct_type.name, hi->struct_type.type_id);
             }
         }
+
+        /* BUG-1047: the statement bodies hidden in this statement's EXPRESSIONS. */
+        for_each_orelse_block(c, stmt, cblo_orelse_cb, NULL, 0);
 
         /* Recurse into nested bodies. EVERY body-bearing statement kind must be
          * descended, or a multi-shared deadlock statement nested inside it

@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: deadlock: single statement accesses both
+// BUG-1047: the two-shared-type statement sits inside an orelse-BLOCK fallback.
+// check_block_lock_ordering descended bodies by statement kind and never looked
+// inside an expression, so the statement was never checked — the emitter locks A
+// and reads B unlocked, the cross-struct race/deadlock this pass exists to refuse.
+// The same statement one line up is rejected.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a;
+B b;
+?u32 mb(u32 k) { if (k > 0) { return k; } return null; }
+u32 main() {
+    u32 v = mb(0) orelse { a.x = b.y; return 1; };
+    return 0;
+}

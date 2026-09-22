@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: is not supported in a comptime body
+// BUG-1048: the comptime interpreter SKIPPED a `goto` and folded a
+// WRONG constant into the emitted C (measured: F(1) folded 102 instead of 2). It now refuses the body
+// and names the construct.
+comptime u32 F(u32 a) { u32 x = a; x += 1; goto done; x += 100; done: return x; }
+u32 main() { return F(1); }

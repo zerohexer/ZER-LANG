@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write
+// BUG-1046 (fifth vehicle): the carrier's FIELD passed directly — `h.p = &g;
+// bump(h.p);` — at the spawn sink. The carrier fact is keyed by the root name, so the
+// projection had to resolve through its root. Accepted before (measured).
+volatile u32 g;
+struct H { volatile *u32 p; }
+void bump(volatile *u32 p) { *p += 1; }
+void w() { H h; h.p = &g; bump(h.p); }
+u32 main() { spawn w(); u32 x = g; return x & 1; return 0; }

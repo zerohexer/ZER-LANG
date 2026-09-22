@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1045 (third form): the argument to the retaining callee is a CALL whose
+// result is a VIEW of `outer`'s own parameter (`idf` returns what it is given;
+// the return summary says so). The keep trace answered -1 for every NODE_CALL,
+// so no edge was recorded, `outer`'s param never became keep, and `outer(&d)`
+// stored a pointer to main's frame in a global.
+struct D { u32 a; }
+?*D g;
+*D idf(*D p) { return p; }
+void inner(*D d) { g = d; }
+void outer(*D p) { inner(idf(p)); }
+u32 main() { D d; outer(&d); return 0; }

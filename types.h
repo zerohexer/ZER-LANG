@@ -512,6 +512,9 @@ void type_print(Type *t);
  * ================================================================ */
 
 Scope *scope_new(Arena *a, Scope *parent);
+/* BUG-1120: insert an EXISTING Symbol (stable since BUG-1119) under its own name;
+ * false if the name is already bound in this scope. */
+bool scope_insert(Arena *a, Scope *s, Symbol *sym);
 Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
                   Type *type, uint32_t line, const char *file);
 Symbol *scope_lookup(Scope *s, const char *name, uint32_t name_len);

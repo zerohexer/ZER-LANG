@@ -1,0 +1,4 @@
+// BUG-1120: module d reads module c's global; it was emitted as an undeclared d__ name.
+import xref1120_c;
+import xref1120_d;
+u32 main() { u32 r = d_use(); if (r != 5) { return 1; } return 0; }

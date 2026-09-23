@@ -462,6 +462,21 @@ reproduced; the hazard is structural. Now `Symbol **` with individually arena-al
 only the pointer array moves. 8 sites. Corpus (tests/, rust_tests/, zig_tests/, lib/,
 examples/, test_modules/) compiles byte-identically in verdict and first diagnostic.
 
+### BUG-1120 — same-named non-static globals / functions in two modules cross-contaminated both
+
+`Pool(IA,4) items;` in module a and `Pool(IB,4) items;` in module b: b's bodies saw a's type
+("cannot initialize 'h' of type 'Handle(IB)' with 'Handle(IA)'"), a `u64 counter` read as a's
+`u32`, and b's `bump()` CALLED a's in the emitted C (`ma__bump()`). Root cause at registration:
+`add_symbol_impl` answered a raw-name collision by returning the other module's Symbol, and
+`register_decl` then overwrote that Symbol's fields with b's declaration. Separately, the emitter
+assumed function names are unique across modules and that any variable named inside a module
+belongs to it — so module d reading module c's global emitted an undeclared `md__...`. Fix: a
+colliding imported declaration gets its OWN Symbol (private scope -> `Checker.module_own` ->
+inserted into the module scope via the new `scope_insert`, possible because BUG-1119 made Symbol
+addresses stable); all 120 checker global-scope lookups go through `global_decl_lookup`; the
+emitter uses ONE rule (mangled key `<module>__<name>` exists -> this module's, else the raw
+owner's). Tests: `test_modules/twin1120.zer`, `test_modules/xref1120.zer`.
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

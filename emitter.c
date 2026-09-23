@@ -7796,26 +7796,36 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  * This matches EMIT_MANGLED_NAME for the current module's own
                  * symbols, and symbol->module_prefix for cross-module calls. */
                 Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
-                if (sym && sym->module_prefix) {
-                    /* Symbol found in scope with module prefix.
-                     * If it's a function, always use its own module_prefix.
-                     * If it's a variable and we're in a module, use current_module
-                     * (prevents wrong module's same-named variable being used). */
-                    if (sym->is_function) {
-                        emit(e, "%.*s__%.*s",
-                             (int)sym->module_prefix_len, sym->module_prefix,
-                             (int)ilen, iname);
-                    } else if (e->current_module) {
-                        /* Variable in current module context */
-                        emit(e, "%.*s__%.*s",
-                             (int)e->current_module_len, e->current_module,
-                             (int)ilen, iname);
-                    } else {
-                        /* Main module referencing imported variable */
-                        emit(e, "%.*s__%.*s",
-                             (int)sym->module_prefix_len, sym->module_prefix,
-                             (int)ilen, iname);
+                /* BUG-1120: ONE rule for which module a non-local name belongs to.
+                 * If the current module registered it (its own global, function or
+                 * static all have the mangled key `<module>__<name>`), it is this
+                 * module's; otherwise it is whoever owns the raw entry. The old
+                 * split guessed: a FUNCTION always took the raw entry's module
+                 * (two modules each defining `bump()` made module b call module
+                 * a's), and a VARIABLE always took the current module (module b
+                 * reading module a's `shared_total` emitted an undeclared
+                 * `mb__shared_total`). */
+                if (e->current_module) {
+                    uint32_t mkl = e->current_module_len + 2 + ilen;
+                    char *mk = (char *)arena_alloc(e->arena, mkl + 1);
+                    if (mk) {
+                        memcpy(mk, e->current_module, e->current_module_len);
+                        mk[e->current_module_len] = '_';
+                        mk[e->current_module_len + 1] = '_';
+                        memcpy(mk + e->current_module_len + 2, iname, ilen);
+                        mk[mkl] = '\0';
+                        if (scope_lookup_local(e->checker->global_scope, mk, mkl)) {
+                            emit(e, "%.*s__%.*s",
+                                 (int)e->current_module_len, e->current_module,
+                                 (int)ilen, iname);
+                            return;
+                        }
                     }
+                }
+                if (sym && sym->module_prefix) {
+                    emit(e, "%.*s__%.*s",
+                         (int)sym->module_prefix_len, sym->module_prefix,
+                         (int)ilen, iname);
                     return;
                 }
                 /* No symbol found — if in a module context, assume

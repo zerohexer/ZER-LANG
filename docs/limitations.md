@@ -155,25 +155,18 @@ path and confirm it looks up the compound key (`build_expr_key_a`) the checker p
 only a bare ident; then A/B the emitted C for the two spellings above. Measure the corpus
 delta in emitted `_zer_bounds_check` count before and after.
 
-## OPEN — two modules declaring the same NON-static global name resolve to the first-registered symbol in the checker (2026-09-21, MEDIUM — wrong-type resolution, loud today)
+## CLOSED 2026-09-23 (BUG-1120) — two modules declaring the same NON-static global / function name
 
-**Symptom.** `pool_twin_a.zer` and `pool_twin_b.zer` each declare `Pool(ItemX, 4) items;`
-(different element types); inside module b, `?Handle(ItemB) h = items.alloc();` is refused
-with "cannot initialize 'h' of type '?Handle(ItemB)' with '?Handle(ItemA)'" — module b's
-`items` resolved to module a's. The same happens for any non-static global: the raw name is
-registered once per module into the ONE global scope (`register_decl`), so a raw lookup
-returns whichever module registered first. Static globals are re-registered into the
-module's own scope by `checker_push_module_scope` and are correct.
-
-**Why it matters more now.** BUG-1040 made the EMITTER spell container globals with their
-module prefix, so the emitted C would be right — the checker is the remaining wrong layer.
-Loud today (a type error), but two modules with same-named globals of the SAME type would
-silently type-check against the wrong instance's VRP/handle state.
-
-**Fix sketch.** Re-register every module global (not only statics) into the module scope in
-`checker_push_module_scope`, mirroring what it does for statics, and make the emitter's
-BUG-229 mangled-key fallback the only global-scope route. Measure with `test_modules`
-(`gcoll`, `collision_test`, `static_coll` are the existing collision tests).
+Worse than recorded: on the raw-name collision `add_symbol_impl` returned the OTHER module's
+Symbol and `register_decl` overwrote its fields with this module's declaration. Fixed at the
+declaration: a colliding imported declaration gets its own Symbol (registered into a private
+scope, listed in `Checker.module_own`), inserted into its module scope; the checker's 120 direct
+global-scope lookups go through `global_decl_lookup`, and the emitter's non-local name rule is
+ONE rule (the current module's mangled key exists -> this module's; else the raw owner's), which
+also fixed module d reading module c's global (`d__x` undeclared). Tests:
+`test_modules/twin1120.zer`, `test_modules/xref1120.zer`. Residual: post passes run with
+`current_module == NULL`, so a whole-program pass that resolves a colliding name by string gets
+the first-registered module's.
 
 ---
 

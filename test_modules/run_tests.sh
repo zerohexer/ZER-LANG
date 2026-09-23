@@ -37,6 +37,8 @@ run_test diamond2 30
 run_test collision_test 170
 run_test static_coll 30
 run_test gcoll 30
+run_test twin1120 0
+run_test xref1120 0
 run_test transitive 3
 run_test opaque_wrap 0
 run_test opaque_deep_ok 0

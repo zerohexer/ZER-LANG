@@ -1,0 +1,14 @@
+// expect-error: cannot place a label inside an @once block
+// BUG-1121: pre-fix this compiled and the @once body ran THREE times (n == 3).
+u32 n;
+void f(u32 k) {
+    if (k == 1) { goto again; }
+    @once {
+    again:
+        n += 1;
+    }
+}
+u32 main() {
+    f(0); f(1); f(1);
+    return n;
+}

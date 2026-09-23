@@ -1471,10 +1471,10 @@ duplicate labels           // COMPILE ERROR — label 'x' already defined
 - Labels work inside switch arms. A label inside a `defer` body is a compile
   error ("cannot place a label inside a defer body") — goto is banned there, so it
   could never be a jump target.
-- Do not put a label inside a `@critical` block. The checker currently accepts it,
-  but the emitted C does not build once the function has any branch (a known
-  compiler defect); `goto` is banned inside `@critical`, so such a label has no
-  legitimate use.
+- A label inside a `@critical` or `@once` block is also a compile error. `goto` is
+  banned inside both, so the only jump that could reach such a label comes from
+  OUTSIDE — it would enter the section without disabling interrupts, or run the
+  `@once` body again without its one-time guard.
 - Backward goto is just a loop — same as `while(true)` with condition.
 
 ```zer
@@ -5184,9 +5184,10 @@ zerc source.zer --release                         # accepted, currently a NO-OP 
 zerc -h                                           # usage (also --help)
 ```
 
-- **The input file comes FIRST**, options after it: `zerc source.zer --target-bits 32`.
-  `zerc --target-bits 32 source.zer` does not work — the first argument is always
-  taken as the input, and the options are then misreported ("unknown option '32'").
+- Options may come before or after the input: `zerc --target-bits 32 source.zer` and
+  `zerc source.zer --target-bits 32` are the same. The input is the one argument that
+  is not an option or an option's value; a second one is an error ("more than one
+  input file" — zerc takes one entry file and finds its imports from it).
 - `-o path.c` (or `--emit-c`) emits C and stops; any other `-o` path — `/dev/null`
   included — builds an executable through GCC.
 

@@ -1,0 +1,11 @@
+// expect-error: cannot place a label inside a @critical block
+// BUG-1121: a goto from OUTSIDE entered the block past the interrupt disable.
+u32 main() {
+    u32 n = 0;
+    goto inner;
+    @critical {
+    inner:
+        n += 1;
+    }
+    return n - 1;
+}

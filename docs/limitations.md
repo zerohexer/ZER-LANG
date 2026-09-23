@@ -336,46 +336,17 @@ before the statement expression opens.
 
 ---
 
-## OPEN — a LABEL inside `@critical` is accepted by the checker and emits C that does not build (2026-09-23, LOW — loud, found by the reference.md audit)
+## CLOSED 2026-09-23 (BUG-1121..1123) — three defects the reference.md audit found
 
-**Symptom.** Checker-clean, GCC-rejected, whenever the function has any branch:
-
-    u32 main() {
-        u32 x = 1; u32 n = 0;
-        if (x == 1) { n += 1; }
-        @critical {
-        inner:
-            n += 1;
-        }
-        return n - 2;
-    }
-
-GCC: `label '_zer_bb3' used but not defined`. With `goto inner;` from OUTSIDE the
-block the checker also accepts it; the emitted C shows the label's IR block split
-across the `{ /* @critical */ ... }` C brace block (the interrupt-restore epilogue and
-the closing `}` land BEFORE the rest of the function), so the braces no longer pair.
-A lone label with no other branch (`@critical { inner: n += 1; }`) happens to build.
-
-**Expected.** Reject a label inside a `@critical` body at the checker, exactly as a
-label inside a `defer` body already is ("cannot place a label inside a defer body").
-`goto` is banned inside `@critical`, so the only possible jump to such a label comes
-from outside the block and would ENTER it past the interrupt-disable — a label there
-has no legitimate use. No silent miscompile today (it never builds), which is why it
-is LOW. reference.md "goto + labels" tells users not to do it.
-
-## OPEN — two small CLI / message defects (2026-09-23, LOW — found by the reference.md audit)
-
-- `zerc --target-bits 32 f.zer` reports `unknown option '32'`, and `zerc --emit-c f.zer`
-  reports `unknown option 'f.zer'`: `zerc_main.c` takes `argv[1]` as the input
-  unconditionally, so an option placed before the input is misreported. Either accept
-  options anywhere or say "the input file must come first". reference.md documents the
-  input-first rule.
-- The dangling-global remedy (BUG-1049) spells the type with the deprecated `[]`:
-  `a non-optional '[]u32' global cannot be reset; declare it '?[]u32 g'` for a
-  `[*]u32 g` (BUG-1115 fixed the same spelling in the string-literal advice). And
-  `t.name = "worker"` into a `[*]u8` field prints a third, self-contradictory line,
-  `cannot assign '[]u8' to '[]u8'` (the const qualifier is dropped by the type
-  renderer).
+- **BUG-1121** a label inside `@critical` / `@once` is now a checker error (as a label in
+  a `defer` body already was). The `@critical` case built C that GCC rejected; the
+  `@once` case was a SILENT miscompile — `goto` from outside to a label in the body ran
+  it every time (measured: three calls, `n == 3`). Tests `*_bug1121.zer`.
+- **BUG-1122** `zerc` takes options before or after the input; a second positional is
+  "more than one input file".
+- **BUG-1123** `type_name` renders a slice as `[*]T` and prints `const` (the remedy text
+  said `'[]u32'`, and a string literal into a `[*]u8` field read "cannot assign '[]u8'
+  to '[]u8'").
 
 ## CLOSED 2026-09-23 (BUG-1049) — an allocation stored in a BARE GLOBAL is tracked
 

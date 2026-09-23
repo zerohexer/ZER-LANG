@@ -241,7 +241,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    const char *input_path = argv[1];
+    /* BUG-1122: the input is the one POSITIONAL argument, wherever it sits.
+     * `argv[1]` was taken unconditionally, so `zerc --target-bits 32 f.zer`
+     * compiled a file named `--target-bits` and reported `unknown option '32'`. */
+    const char *input_path = NULL;
     const char *output_path = NULL;
     bool do_run = false;
     bool emit_c = false;
@@ -270,7 +273,7 @@ int main(int argc, char **argv) {
     int zer_target_arch_id = 1;  /* ZER_ARCH_X86_64 = 1 default; 2=aarch64, 3=riscv64 */
     const char *zer_target_arch_gcc = NULL;  /* override gcc binary for cross-arch */
 
-    for (int i = 2; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_path = argv[++i];
         } else if (strcmp(argv[i], "--run") == 0) {
@@ -394,6 +397,14 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             zer_print_usage();
             return 0;
+        } else if (argv[i][0] != '-') {
+            if (input_path) {
+                fprintf(stderr, "error: more than one input file ('%s' and '%s') — "
+                        "zerc compiles one entry file; its imports are found "
+                        "from it\n", input_path, argv[i]);
+                return 1;
+            }
+            input_path = argv[i];
         } else {
             /* BUG-855: there was NO final else — every unrecognised option was
              * SILENTLY IGNORED. Measured on main: `--totally-bogus-flag`,
@@ -404,6 +415,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "error: unknown option '%s' (try --help)\n", argv[i]);
             return 1;
         }
+    }
+
+    if (!input_path) {
+        fprintf(stderr, "error: no input file\n");
+        zer_print_usage();
+        return 1;
     }
 
     /* auto-detect target pointer width from GCC if not explicitly set */

@@ -20733,6 +20733,26 @@ static void check_stmt(Checker *c, Node *node) {
                 "cannot place a label inside a defer body — 'goto' is not allowed "
                 "there, so the label could never be a jump target");
         }
+        /* BUG-1121: a label inside a @critical / @once body. `goto` is banned
+         * inside both, so the only jump that could reach the label comes from
+         * OUTSIDE and would ENTER the block past its prologue: the interrupt
+         * disable (@critical — the epilogue then restores a state that was never
+         * saved) or the one-time guard (@once — the body runs again and publishes
+         * completion twice). And the IR places the label's block across the C
+         * brace block the region is emitted as, so with any other branch in the
+         * function the C did not build at all ("label '_zer_bbN' used but not
+         * defined"). Same shape, same answer as the defer-body label above. */
+        if (c->critical_depth > 0) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside a @critical block — 'goto' is not "
+                "allowed there, and a jump from outside would enter the block "
+                "without disabling interrupts");
+        } else if (c->in_once) {
+            checker_error(c, node->loc.line,
+                "cannot place a label inside an @once block — 'goto' is not "
+                "allowed there, and a jump from outside would run the body "
+                "without the one-time guard");
+        }
         /* labels are just markers — no type checking needed. BUT a `goto` can
          * jump to this label carrying ANY value, so a value-range narrowed on the
          * fall-through path ABOVE the label does not hold at the label (the goto

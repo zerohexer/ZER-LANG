@@ -3044,8 +3044,9 @@ main already covers the shape — never soften the rule to match a directive.
   Grep the SPECIFIC line you expect (`no default: clauses`), and always print `MAKE_CHECK_EXIT=$?`.
 - `grep -c 'error' build.log` **lies** — `CFLAGS` has `-Werror=switch`, so the echoed gcc command
   line matches. Use `grep -cE '^[^ ]*\.c:[0-9]+:[0-9]+: error:'`.
-- **Never run a `tests/test_*_matrix` binary while `make check` runs** — several share the fixed
-  temp path `/tmp/_zer_co.zer`; concurrent runs yield phantom failures.
+- **The matrix grids are safe to run concurrently since 2026-09-23** — each works in its own
+  `mkdtemp` dir via `tests/zer_tmp.h` (`ZT("/tmp/_zer_x.zer")`). They used to share fixed
+  `/tmp/_zer_*` paths and a second run yielded phantom failures. A NEW grid must use `ZT()`.
 - **A RECONSTRUCTED reproducer can CONFIRM a hole, never REFUTE one.** If the branch/entry names a
   file, fetch it: `git show origin/claude/<branch>:tests/zer_gaps/<file>.zer`. Measured 2026-08-09 —
   G3 was recorded "did not reproduce in 5 shapes" from hand-written probes that all used a

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "zer_tmp.h"
 
 static unsigned int rng_state;
 static int rng(int max) {
@@ -43,7 +44,7 @@ static void find_zerc(void) {
 
 static void run_test(const char *name, const char *code, int expect_fail) {
     total++;
-    FILE *f = fopen("/tmp/_zer_fuzz.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_fuzz.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return; }
     fputs(code, f);
     fclose(f);
@@ -52,7 +53,7 @@ static void run_test(const char *name, const char *code, int expect_fail) {
     int result;
 
     if (expect_fail) {
-        snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_fuzz.zer -o /dev/null 2>/dev/null", zerc_path);
+        snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_fuzz.zer -o /dev/null 2>/dev/null"), zerc_path);
         result = system(cmd);
         if (result != 0) {
             passed++;
@@ -62,18 +63,18 @@ static void run_test(const char *name, const char *code, int expect_fail) {
             fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
         }
     } else {
-        snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_fuzz.zer --run 2>/dev/null", zerc_path);
+        snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_fuzz.zer --run 2>/dev/null"), zerc_path);
         result = system(cmd);
         if (result == 0) {
             passed++;
         } else {
-            snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_fuzz.zer -o /dev/null 2>/dev/null", zerc_path);
+            snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_fuzz.zer -o /dev/null 2>/dev/null"), zerc_path);
             int compile_result = system(cmd);
             if (compile_result != 0) {
                 failed++;
                 fprintf(stderr, "  FAIL: %s — safe program rejected by compiler\n", name);
-                snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_fuzz.zer -o /dev/null 2>&1 | head -5", zerc_path);
-                system(cmd);
+                snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_fuzz.zer -o /dev/null 2>&1 | head -5"), zerc_path);
+                if (system(cmd) != 0) { /* output already shown */ }
             } else {
                 failed++;
                 fprintf(stderr, "  FAIL: %s — compiled but crashed at runtime!\n", name);

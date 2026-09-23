@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
@@ -54,11 +55,11 @@ static int has_asm_reason(const char *eb) {
 
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_am.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_am.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_am.zer -o /tmp/_zer_am.c 2>/tmp/_zer_am.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_am.zer -o /tmp/_zer_am.c 2>/tmp/_zer_am.err"), zerc_path);
     if (system(cmd) == 0) {
         failed++; false_neg++;
         fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — asm-unsafe construct ACCEPTED\n", name);
@@ -66,7 +67,7 @@ static int run_neg(const char *name, const char *code) {
         return 0;
     }
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_am.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_am.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
@@ -83,15 +84,15 @@ static int run_neg(const char *name, const char *code) {
 
 static int run_pos(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_am.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_am.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_am.zer -o /tmp/_zer_am.c 2>/tmp/_zer_am.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_am.zer -o /tmp/_zer_am.c 2>/tmp/_zer_am.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_am.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_am.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — valid asm construct REJECTED:\n", name);
     fprintf(stderr, "    %.110s\n", eb);

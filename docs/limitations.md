@@ -53,16 +53,14 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
-## OPEN — the `tests/test_*_matrix.c` grids write fixed `/tmp/_zer_*` paths (2026-09-23, LOW — harness)
+## CLOSED 2026-09-23 — the matrix grids wrote fixed `/tmp/_zer_*` paths
 
-Twelve grids (`test_hw_matrix`, `test_conc_matrix`, ... `test_semantic_fuzz`) write their probe
-program and read their diagnostics through fixed paths such as `/tmp/_zer_hw.zer` /
-`/tmp/_zer_hw.err`. Two `make check` runs at once (two worktrees, or a make check beside a
-hand-run grid) read each other's files and report phantom failures. `tests/test_zer.sh` had
-the same defect and was fixed with `mktemp` (BUG-1058 harness note; 84 phantom "WRONG REASON"
-failures measured). Fix sketch: one helper header (`tests/zer_tmp.h`) that builds a per-process
-prefix once (`mkdtemp`), and every grid formats its paths from it. Until then: never run two
-grid-running `make check`s concurrently.
+Every grid now includes `tests/zer_tmp.h`: a per-process `mkdtemp` directory (removed at
+exit) and `ZT()`, which rewrites the `/tmp/_zer_` prefix of each path / command literal into
+it. The literals keep their old spelling so a grep for a grid's file still finds it.
+`test_vrp_fact_matrix` already used its own `mkdtemp`. Measured: all 12 grids green with a
+second `make check` running in another worktree at the same time, and no directory left behind.
+A NEW grid must include `zer_tmp.h` and wrap its paths — a fixed path is the defect back.
 
 ## OPEN — an interrupt handler's own read-modify-write is refused even when only main READS (2026-09-23, LOW/MEDIUM — over-rejection of the tick-counter idiom)
 

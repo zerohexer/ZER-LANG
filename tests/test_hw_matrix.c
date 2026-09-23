@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
@@ -60,11 +61,11 @@ static int has_hw_reason(const char *eb) {
 /* NEG: must reject for a program-consequence reason. EMIT-ONLY harness. */
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"), zerc_path);
     if (system(cmd) == 0) {
         failed++; false_neg++;
         fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — program-consequence violation ACCEPTED\n", name);
@@ -72,7 +73,7 @@ static int run_neg(const char *name, const char *code) {
         return 0;
     }
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
@@ -90,15 +91,15 @@ static int run_neg(const char *name, const char *code) {
 /* POS: a structurally-valid hardware access must be accepted (emit succeeds). */
 static int run_pos(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — valid hardware access REJECTED:\n", name);
     fprintf(stderr, "    %.110s\n", eb);
@@ -539,15 +540,15 @@ static void gen_sl(VSite site, SLShape shape, char *out, size_t n) {
  * target). Same EMIT-ONLY contract and integrity guard as the helpers above. */
 static int run_vol(const char *name, const char *code, const char *flags, int negative) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[640];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer %s -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err",
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer %s -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"),
              zerc_path, flags);
     int rc = system(cmd);
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (!negative) {
         if (rc == 0) { passed++; return 1; }

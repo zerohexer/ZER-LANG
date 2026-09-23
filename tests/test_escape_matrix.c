@@ -29,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, suspect = 0;
@@ -56,14 +57,14 @@ static void find_zerc(void) {
 /* Returns 1 if rejected FOR THE ESCAPE REASON, 0 otherwise (logged). */
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_esc.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_esc.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f);
     fclose(f);
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_esc.zer -o /dev/null 2>/tmp/_zer_esc.err", zerc_path);
+             ZT("%s /tmp/_zer_esc.zer -o /dev/null 2>/tmp/_zer_esc.err"), zerc_path);
     int rc = system(cmd);
 
     if (rc == 0) {
@@ -75,7 +76,7 @@ static int run_neg(const char *name, const char *code) {
 
     /* rejected — read stderr and classify the reason */
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_esc.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_esc.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
 
     /* parse/type error masking the escape check = INVALID probe (generator bug) */

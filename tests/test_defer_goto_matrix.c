@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int miscompiled = 0, wrong_value = 0, unexpected_reject = 0, unexpected_accept = 0;
@@ -214,7 +215,7 @@ static void gen(DeferPos d, GotoKind g, Nest n, char *buf, size_t cap) {
 /* Must compile, run, and exit 0 (balance correct). */
 static int run_value(const char *nm, const char *src, int want_bal) {
     total++;
-    FILE *f = fopen("/tmp/_zer_dg.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_dg.zer"), "w");
     if (!f) { failed++; return 0; }
     fputs(src, f); fclose(f);
 
@@ -225,13 +226,13 @@ static int run_value(const char *nm, const char *src, int want_bal) {
      * path and then running it is the trap — it yields exit 127 on every cell
      * and looks like a compiler failure. */
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_dg.zer -o /tmp/_zer_dg >/tmp/_zer_dg.err 2>&1", zerc_path);
+             ZT("%s /tmp/_zer_dg.zer -o /tmp/_zer_dg >/tmp/_zer_dg.err 2>&1"), zerc_path);
     if (system(cmd) != 0) {
         fprintf(stderr, "      %s: REJECTED but should compile (bal should be %d)\n",
                 nm, want_bal);
         unexpected_reject++; failed++; return 0;
     }
-    int rc = system("/tmp/_zer_dg >/dev/null 2>&1");
+    int rc = system(ZT("/tmp/_zer_dg >/dev/null 2>&1"));
     int code = (rc == -1) ? -1 : ((rc >> 8) & 0xff);
     if (code == 0) { passed++; return 1; }
     if (code == 200) {
@@ -250,18 +251,18 @@ static int run_value(const char *nm, const char *src, int want_bal) {
  * masking it (the integrity guard every matrix here uses). */
 static int run_reject(const char *nm, const char *src) {
     total++;
-    FILE *f = fopen("/tmp/_zer_dg.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_dg.zer"), "w");
     if (!f) { failed++; return 0; }
     fputs(src, f); fclose(f);
 
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_dg.zer -o /tmp/_zer_dg >/tmp/_zer_dg.err 2>&1", zerc_path);
+             ZT("%s /tmp/_zer_dg.zer -o /tmp/_zer_dg >/tmp/_zer_dg.err 2>&1"), zerc_path);
     if (system(cmd) == 0) {
         fprintf(stderr, "      %s: COMPILED but the interim reject should fire\n", nm);
         unexpected_accept++; failed++; return 0;
     }
-    if (system("grep -q \"skips the registration of a\" /tmp/_zer_dg.err") != 0) {
+    if (system(ZT("grep -q \"skips the registration of a\" /tmp/_zer_dg.err")) != 0) {
         fprintf(stderr, "      %s: rejected for the WRONG reason "
                         "(a parse/type error is masking the check)\n", nm);
         failed++; return 0;

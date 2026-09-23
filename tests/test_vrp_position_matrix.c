@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int silent_hole = 0, invalid_probe = 0, over_reject = 0;
@@ -63,16 +64,16 @@ static void find_zerc(void) {
 
 /* Run the compiler on `code`; capture stderr into `eb`. Returns the exit status. */
 static int compile_probe(const char *code, char *eb, size_t ebsz) {
-    FILE *f = fopen("/tmp/_zer_vp.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_vp.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); exit(2); }
     fputs(code, f); fclose(f);
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_vp.zer -o /tmp/_zer_vp.c >/dev/null 2>/tmp/_zer_vp.err",
+             ZT("%s /tmp/_zer_vp.zer -o /tmp/_zer_vp.c >/dev/null 2>/tmp/_zer_vp.err"),
              zerc_path);
     int rc = system(cmd);
     eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_vp.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_vp.err"), "r");
     if (e) { size_t r = fread(eb, 1, ebsz - 1, e); eb[r] = 0; fclose(e); }
     return rc;
 }

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static const char *zerc_path = NULL;
@@ -49,24 +50,24 @@ static void find_zerc(void) {
 /* Returns 1 on expected outcome, 0 on failure (already logged). */
 static int run_one(const char *name, const char *code, int expect_fail) {
     total++;
-    FILE *f = fopen("/tmp/_zer_shape.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_shape.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f);
     fclose(f);
 
     char cmd[512];
     if (expect_fail) {
-        snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_shape.zer -o /dev/null 2>/dev/null", zerc_path);
+        snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_shape.zer -o /dev/null 2>/dev/null"), zerc_path);
         if (system(cmd) != 0) { passed++; return 1; }
         failed++;
         fprintf(stderr, "  FAIL: %s — violating program COMPILED (analyzer gap)\n", name);
         fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
         return 0;
     } else {
-        snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_shape.zer --run 2>/dev/null", zerc_path);
+        snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_shape.zer --run 2>/dev/null"), zerc_path);
         if (system(cmd) == 0) { passed++; return 1; }
         failed++;
-        snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_shape.zer -o /dev/null 2>/dev/null", zerc_path);
+        snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_shape.zer -o /dev/null 2>/dev/null"), zerc_path);
         if (system(cmd) != 0)
             fprintf(stderr, "  FAIL: %s — SAFE program rejected (over-rejection)\n", name);
         else

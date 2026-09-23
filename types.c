@@ -628,7 +628,7 @@ Scope *scope_new(Arena *a, Scope *parent) {
     s->parent = parent;
     s->symbol_count = 0;
     s->symbol_capacity = 16;
-    s->symbols = (Symbol *)arena_alloc(a, s->symbol_capacity * sizeof(Symbol));
+    s->symbols = (Symbol **)arena_alloc(a, s->symbol_capacity * sizeof(Symbol *));
     return s;
 }
 
@@ -638,16 +638,18 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
     Symbol *existing = scope_lookup_local(s, name, name_len);
     if (existing) return NULL; /* caller handles error */
 
-    /* grow if needed */
+    /* grow if needed — only the POINTER array moves; Symbols never do (BUG-1119) */
     if (s->symbol_count >= s->symbol_capacity) {
         uint32_t new_cap = s->symbol_capacity * 2;
-        Symbol *new_syms = (Symbol *)arena_alloc(a, new_cap * sizeof(Symbol));
-        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol));
+        Symbol **new_syms = (Symbol **)arena_alloc(a, new_cap * sizeof(Symbol *));
+        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol *));
         s->symbols = new_syms;
         s->symbol_capacity = new_cap;
     }
 
-    Symbol *sym = &s->symbols[s->symbol_count++];
+    Symbol *sym = (Symbol *)arena_alloc(a, sizeof(Symbol));
+    if (!sym) return NULL;
+    s->symbols[s->symbol_count++] = sym;
     memset(sym, 0, sizeof(Symbol));
     sym->name = name;
     sym->name_len = name_len;
@@ -659,9 +661,9 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
 
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len) {
     for (uint32_t i = 0; i < s->symbol_count; i++) {
-        if (s->symbols[i].name_len == name_len &&
-            memcmp(s->symbols[i].name, name, name_len) == 0) {
-            return &s->symbols[i];
+        if (s->symbols[i]->name_len == name_len &&
+            memcmp(s->symbols[i]->name, name, name_len) == 0) {
+            return s->symbols[i];
         }
     }
     return NULL;

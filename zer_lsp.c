@@ -1122,7 +1122,7 @@ static void handle_completion(int id, const char *params) {
             /* add symbols from global scope */
             Scope *scope = checker.global_scope;
             for (uint32_t i = 0; i < scope->symbol_count; i++) {
-                Symbol *sym = &scope->symbols[i];
+                Symbol *sym = scope->symbols[i];
                 if (count > 0) sb_append(&sb, ",");
                 sb_append(&sb, "{\"label\":");
                 /* need to null-terminate the name */

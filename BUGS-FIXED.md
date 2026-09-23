@@ -448,6 +448,20 @@ idiom `p20_safe_global_root` still compiles. Residual in limitations.md: a calle
 naming the global during the window. (`tests/zer_fail/scoped_spawn_global_ptr_bug1118.zer`,
 `tests/zer/scoped_spawn_global_ptr_join_ok_bug1118.zer`)
 
+### BUG-1119 — Scope stored Symbols BY VALUE in an array copied on growth (latent: stale `Symbol*`)
+
+Found reading `scope_add` while fixing the multi-module global entry. `Scope.symbols` was a
+`Symbol[]` that `scope_add` copied into a larger array when full, so every `Symbol*` obtained
+before the growth pointed at the OLD copy: later lookups returned the new copy, reads through the
+old pointer saw stale flags, writes through it were lost. The global scope DOES grow during body
+checking — an auto-slab (`alloc(T)` / `Task.alloc()`) registers `_zer_auto_slab_T` there
+mid-body — and handlers routinely hold a target Symbol across `check_expr` of a value that may
+contain `alloc(T)`, and caches keep Symbol pointers across the whole compile
+(`auto_slabs[].slab_sym`, `field.handle_alloc`, borrow lists). No live miscompile was
+reproduced; the hazard is structural. Now `Symbol **` with individually arena-allocated Symbols:
+only the pointer array moves. 8 sites. Corpus (tests/, rust_tests/, zig_tests/, lib/,
+examples/, test_modules/) compiles byte-identically in verdict and first diagnostic.
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

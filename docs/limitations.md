@@ -100,6 +100,37 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 
 ---
 
+## OPEN — residuals of the 2026-09-23g audit (measured; reproducers inline)
+
+1. **A callee frees an allocation through a GLOBAL, the caller reads its LOCAL alias**
+   (MEDIUM — accept-unsafe, silent). `g = a; drop_g(); a.v` where `void drop_g() { if (g) |p|
+   { free(p); } g = null; }` compiles, and the read returns a recycled object's value. The
+   store marks `a` escaped and no FuncSummary says "frees what global g points to" (the callee
+   frees a capture of a global it never tracked). Sibling of the BUG-1049 residual "a global
+   freed in one function and read in another". Fix sketch: a summary bit per global name
+   ("may free the allocation global X holds", set when a free's argument traces to a read of
+   X), applied at the call by freeing every caller handle aliased by the `(IR_GLOBAL_ROOT_ID,
+   "X")` entry. The Handle spellings trap at run time (generation check), so the raw-pointer
+   forms are the live ones.
+2. **The atomic-cell rule is blind to WHOLE-AGGREGATE access** (MEDIUM — data race, silent).
+   With a thread doing `@atomic_add(&s.n, 1)` / `@atomic_add(&cnts[1], 1)`, main's `S t = s;`,
+   `s = { .n = 3 };`, `u32[4] c = cnts;`, `[*]u32 v = cnts[0..]; v[1] = 9;`, `clear(cnts)` and
+   `reset(&s)` (callee writes `p.n`) are accepted; only field- and element-precise keys are
+   checked. Fix sketch: record a whole-object plain access as the empty path, which
+   `atomic_paths_may_alias` must treat as aliasing every path of the symbol.
+3. **An indirect call widens arena allocations to MAYBE_FREED** whenever any function in the
+   program resets a non-local arena (BUG-1172). Sound, but a funcptr call in a function that
+   keeps using an arena pointer is then refused even when the target never resets. Precision
+   would need the funcptr-binding resolution the spawn scan already has.
+4. **`*u32[4]` (pointer to an array) emits invalid C** (`uint32_t[4]* p`) — LOW, loud (GCC
+   rejects). Accepted by the checker as a param, local or field.
+5. **The out-param rule (BUG-1173) reports at the function's line** for an implicit return at
+   the end of a void function — cosmetic.
+6. Over-rejections seen during the audit, not fixed: `u = t; t = u; consume(u); t.k` (t was
+   re-initialized); a one-iteration loop that frees reported as a double free; a false leak
+   after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
+   auto-slab global.
+
 ## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 
 All eight caps the 2026-09-13 audit listed as answering in the ACCEPT direction are now
@@ -1614,31 +1645,16 @@ ARRAY named bare is its address, a constant; indexing it is a read) — and the 
 value-flow site lacked the array -> slice coercion (`[*]u8 s = buf;` emitted `s = buf`).
 Tests: `tests/zer/global_designated_init_bug1127.zer`, `tests/zer_fail/global_init_mutable_*_bug1127.zer`.
 
-## OPEN — a non-null `*T` / funcptr FIELD is zero (NULL) wherever a struct is zero-initialized (2026-09-23, MEDIUM — accept-unsafe; loud on hosted, SILENT on bare metal)
+## CLOSED 2026-09-23g — a non-null `*T` FIELD / ELEMENT was NULL wherever its aggregate is zero-initialized (BUG-1152)
 
-`nonnull_zero_hole` (BUG-866/893) refuses `*u32 p;` — a declaration whose zero is a NULL the
-type forbids. The same zero reaches a non-null FIELD through every other zero-initialization,
-and none is refused. MEASURED, each compiles clean and dereferences address 0:
-
-    struct H { u32 a; *u32 p; }
-    H w;                    return *w.p;     // local or global plain declaration
-    *H h = alloc(H) ...;    *h.p             // heap / Pool / Slab / Arena slot (zeroed)
-    H[2] hs;                *hs[1].p         // array element
-
-On a hosted build the preamble's SIGSEGV handler turns the read into a trap (exit 133, no
-message). On bare metal reading address 0 SUCCEEDS (on Cortex-M it is the initial stack
-pointer) — a silent wrong value, and a write there is a silent corruption.
-
-BUG-1126 closed the one spelling where the author explicitly wrote an initializer and left the
-field out (`H w = { .a = 1 };`, including a nested by-value struct, at every value-flow sink).
-The rest is a LANGUAGE decision, not a missed site: `alloc(T)` and `Pool` slots are zeroed by
-design, so a non-null field in an allocatable struct is incoherent with universal auto-zero
-unless something establishes it before first use. Options, none taken: (a) refuse a struct
-with a non-null pointer field wherever it is zero-initialized (measured by the BUG-893 author
-at 34 affected corpus files — "a much wider rule"); (b) a definite-initialization analysis per
-object (Rust's route; a new analysis); (c) guard every read of a non-null FIELD with a null
-check (cheap, loud on bare metal too, but it makes `*T` non-null only by trap). Needs the
-owner's call; (c) is the smallest sound step.
+Option (c) of the old entry was taken: every LOAD of a non-optional `*T` out of memory (a
+field, an array/slice element, `*pp`) is checked, so the value that reaches a local, a param or
+an operand is never NULL; it traps with "read of a null non-null pointer" on hosted AND bare
+metal. Guarding the load (not the dereference) is what makes it complete — see the emitter's
+BUG-1152 comment. Zero corpus cost. The same mechanism guards a no-zero-variant ENUM loaded out
+of memory (BUG-1175). What remains is a design note, not a hole: `*T` in an aggregate is
+non-null "by trap", not by construction. A definite-initialization analysis (option (b)) would
+move the report to compile time; nothing depends on it for soundness.
 
 ## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned (2026-09-09, LOW — over-rejection, valid program refused)
 

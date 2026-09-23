@@ -1,0 +1,20 @@
+// expect-error: returning a value whose
+// BUG-1173: a returned struct carried a FIELD pointing at freed memory; the
+// return check looked only at the bare local.
+struct T { u32 v; }
+struct W { *T p; }
+?W mk() {
+    *T a = alloc(T) orelse return;
+
+    W w = { .p = a };
+    free(a);
+    return w;
+}
+u32 main() {
+    W w = mk() orelse return;
+    *T d = alloc(T) orelse return;
+    d.v = 9;
+    u32 r = w.p.v;
+    free(d);
+    return r;
+}

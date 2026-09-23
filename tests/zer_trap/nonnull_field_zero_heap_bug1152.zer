@@ -1,0 +1,15 @@
+// expect-trap
+// expect-trap-msg: read of a null non-null pointer
+// expect-trap-at: 12
+// BUG-1152: alloc(T) zero-fills the slot, so a non-null `*T` field of a
+// freshly allocated struct is NULL until assigned. Written through here —
+// on bare metal that was a silent store to address 0.
+struct V { u32 v; }
+struct H { u32 a; *V p; }
+
+u32 main() {
+    *H h = alloc(H) orelse return;
+    h.p.v = 7;
+    free(h);
+    return 0;
+}

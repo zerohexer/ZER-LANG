@@ -1,0 +1,12 @@
+// expect-error: cannot give a WRITABLE
+// BUG-1165: a writable primitive @pun view over a source carrying an
+// invariant (enum / pointer / bool) forged it by a store.
+u32 main() {
+    bool b = false;
+    *u8 p = @pun(*u8, &b);
+    *p = 2;
+    u32 r = 0;
+    if (b == true) { r += 1; }
+    if (b == false) { r += 2; }
+    return r;
+}

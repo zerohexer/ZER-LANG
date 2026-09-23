@@ -14117,3 +14117,51 @@ Parallel-work note: this session ran fix-agents in `.claude/worktrees/` under th
 `.claude/` to `.git/info/exclude` before `git add -A`, and keep scratch tooling in a PRIVATE
 subdirectory — one agent overwrote a shared `corpus.sh`, and every concurrent
 `tests/test_*_matrix` run shares fixed `/tmp/_zer_*` paths (limitations.md).
+
+## 2026-09-23g session — the emitter entry wrappers, the load guard, and five shared queries (BUG-1152..1175)
+
+**`emit_expr` / `emit_rewritten_node` are now thin WRAPPERS** over `emit_expr_impl` /
+`emit_rewritten_node_impl`. Every recursive emission passes through the wrapper, which is the
+one place three cross-cutting facts are applied:
+1. **The load guard** (`nn_guard_wanted` → `load_guard_kind`): a FIELD / INDEX / `*pp` whose
+   type is a non-optional `*T` (BUG-1152) or a no-zero-variant enum (BUG-1175) is emitted as
+   `({ __auto_type _zer_nnN = LOAD; if (!_zer_nnN) _zer_trap(...); _zer_nnN; })`. The
+   wrapper sets `Emitter.nn_bypass = node` before recursing so the node's own emission is not
+   wrapped twice (a node emitted twice inside `__typeof__` stays unwrapped — typeof does not
+   evaluate). `__auto_type` drops only the top-level qualifier of the pointer VALUE.
+2. **Lvalue exemption**: `nn_lvalue_of(node)` names the assignment target / `&` operand of the
+   node being emitted; the wrapper stores it in `Emitter.nn_lvalue` for the duration, so the
+   same Node is never guarded as a load. Save/restore makes nesting safe.
+3. **The union reset prefix** (`union_partial_write_target` + `emit_union_reset_prefix`,
+   BUG-1161): a compound op or partial write into a union variant is emitted as
+   `((reset-if-variant-changes, 0), <assignment>)`.
+Skipped at file scope (`global_init_depth > 0`): a statement expression is illegal there.
+The IR's own decomposed loads (IR_FIELD_READ / IR_INDEX_READ / IR_UNOP deref) are statements,
+so they get `emit_nonnull_local_check` on the SAME C line as the load (the trap's `__LINE__`
+must be the load's `#line`, which BUG-1003 made per-instruction).
+
+**`emit_intn_store`** (BUG-1162..1164) is the one uN/iN store path for both emitters: compute
+and mask in a carrier temp, store ONCE (a volatile register sees one store), set the union
+tag when the target is a variant, and leave a bit-slice target to its own SET case.
+
+**`opaque_type_id` / `opaque_type_id_nominal`** (BUG-1166) replace seven copies of the
+struct/enum/union type-id triple. The wrap/unwrap sites use the full one (scalars get reserved
+high-bit ids so a `*u32` wrapped in a callee cannot be unwrapped as `*Big`); `@pun` uses the
+nominal one, mirrored by the checker's `pun_type_id_check_can_fire`.
+
+**Checker shared queries added:** `container_prov_of_value` (the @container provenance of a
+value, following a single-param return summary — BUG-1167); `value_reaches_threadlocal`
+(BUG-1170, reads the recorded `borrow_root_name`, which deliberately keeps global roots);
+`record_borrow_roots_from_struct_init` (BUG-1169); `borrow_alias_reaches_lent_root` +
+`target_path_derefs` (a write/read THROUGH a pointer bound to a lent local); the struct-literal
+field gate in `struct_init_has_local_derived` (BUG-1158); `reject_packed_view_in_literal`
+(BUG-1171, called from `type_struct_literal`, so every literal sink gets it).
+
+**zercheck_ir:** `FuncSummary.resets_arena` + `ZerCheck.cur_resets_arena` (BUG-1172; the flag
+is set while analysing a function and stored into its summary, so the iterative summary build
+closes it transitively); `ir_check_returned_compounds` (BUG-1173); the out-param
+FREED-at-exit rule restricted to allocations made in the function (a field the CALLER put
+there is a hand-off reported by `frees_param_field` at the call site — the reference gate
+caught the unrestricted first draft on `kv_table_free`). Return summaries and the join check
+no longer skip orelse-fallback blocks (BUG-1155). `IRLocal.snapshot_of_plus1` marks the
+return-value snapshot temp (BUG-1154) so diagnostics name the local it copies.

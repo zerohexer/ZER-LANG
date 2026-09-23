@@ -1,0 +1,8 @@
+// expect-error: address of a whole object
+// BUG-1167: an identity call laundered the whole-object provenance that
+// BUG-987 rejects for `&solo` directly; @container then wrote before solo.
+struct LH { u32 k; }
+struct Dev { u64[8] pad; LH list; }
+LH solo;
+*LH pick(*LH a) { return a; }
+u32 main() { *LH p = pick(&solo); *Dev d = @container(*Dev, p, list); d.pad[0] = 5; return 0; }

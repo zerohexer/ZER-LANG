@@ -1,0 +1,17 @@
+// expect-error: maybe-freed
+// BUG-1172: the reset reached through a function POINTER (two hops).
+struct T { u32 v; }
+Arena gar;
+u8[256] buf;
+void rs() { gar.reset(); }
+void rs2() { rs(); }
+u32 main() {
+    gar = Arena.over(buf);
+    *T p = gar.alloc(T) orelse return;
+    p.v = 5;
+    *() fp = rs2;
+    fp();
+    *T q = gar.alloc(T) orelse return;
+    q.v = 9;
+    return p.v;
+}

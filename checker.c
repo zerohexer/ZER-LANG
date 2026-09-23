@@ -2483,6 +2483,7 @@ static Node *keep_view_root_ident(Checker *c, Node *e) {
     return (e && e->kind == NODE_IDENT) ? e : NULL;
 }
 
+static bool struct_init_has_local_derived(Checker *c, Node *init);
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     /* BUG-976: ten nested identity calls laundered `&x` into a global because this
      * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED.
@@ -2507,6 +2508,12 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
      * peel exposes the orelse node and that arm then handles it. */
     arg = unwrap_ptr_launder(arg);
     if (!arg) return false;
+    /* BUG-1160: a struct/union LITERAL argument carries whatever its fields
+     * carry. The spawn sink's comment (D1) already claimed this predicate
+     * handled `spawn w({ .p = &x })`; it had no such case, and the child read a
+     * clobbered stack slot. One case here serves every sink routed through it. */
+    if (arg->kind == NODE_STRUCT_INIT)
+        return struct_init_has_local_derived(c, arg);
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -2958,6 +2965,39 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
         /* Case D: call-result launder of a local-derived arg */
         if (fv->kind == NODE_CALL && call_has_local_derived_arg(c, fv, 0))
             return true;
+        /* BUG-1158: Cases A-D above were four hand-picked shapes. A field
+         * VALUE is exactly an argument-shaped expression, and the question is
+         * the one arg_is_local_derived answers for every other sink — so a
+         * bare local ARRAY coerced into a [*]T field (`g = { .s = a }`), a
+         * FIELD value (`{ .p = h.q }` with h local-derived), an ORELSE value
+         * (`{ .p = none() orelse &x }`) and an INDEX value (`{ .p = ps[0] }`
+         * of a local array of pointers) all escaped a stack pointer. Gated on
+         * the DESTINATION field's type carrying a reference, so a scalar read
+         * out of a local (`{ .n = arr[0] }`) is not flagged. */
+        {
+            Type *st = typemap_get(c, init);
+            Type *se = st ? type_unwrap_distinct(st) : NULL;
+            Type *ft = NULL;
+            const char *fn = init->struct_init.fields[fi].name;
+            uint32_t fl = (uint32_t)init->struct_init.fields[fi].name_len;
+            if (se && type_dispatch_kind(se) == TYPE_STRUCT) {
+                for (uint32_t k = 0; k < se->struct_type.field_count; k++)
+                    if (se->struct_type.fields[k].name_len == fl &&
+                        memcmp(se->struct_type.fields[k].name, fn, fl) == 0) {
+                        ft = se->struct_type.fields[k].type; break;
+                    }
+            } else if (se && type_dispatch_kind(se) == TYPE_UNION) {
+                for (uint32_t k = 0; k < se->union_type.variant_count; k++)
+                    if (se->union_type.variants[k].name_len == fl &&
+                        memcmp(se->union_type.variants[k].name, fn, fl) == 0) {
+                        ft = se->union_type.variants[k].type; break;
+                    }
+            }
+            if (!ft || escape_type_carries_ref(ft) || type_carries_data_pointer(ft, 0)) {
+                if (arg_is_local_derived(c, init->struct_init.fields[fi].value, 0))
+                    return true;
+            }
+        }
     }
     return false;
 }
@@ -3523,6 +3563,45 @@ static ContainerProv classify_amp_operand(Checker *c, Node *operand,
          * modelled stays UNKNOWN (conservative: allow, as before). */
         Node *obj = operand->index_expr.object;
         if (obj && obj->kind == NODE_IDENT) return CPROV_WHOLE;
+    }
+    return CPROV_UNKNOWN;
+}
+
+/* BUG-1167: the container provenance of a pointer VALUE — the one resolver
+ * for the var-decl sink and the @container arg. Handles `&expr`, a variable
+ * carrying the fact, and (new) a CALL whose return summary says it returns
+ * exactly one parameter: the result then carries that argument's provenance.
+ * Before, `*LH p = pick(&solo);` read as UNKNOWN (allowed), so the BUG-987
+ * whole-object rejection was bypassed by an identity function and
+ * `@container(*Dev, p, list)` wrote before `solo` (ASan global underflow). */
+static ContainerProv container_prov_of_value(Checker *c, Node *v, int depth,
+                                             Type **st, const char **fn,
+                                             uint32_t *fl) {
+    if (!v || depth > ZER_EXPR_WALK_MAX) return CPROV_UNKNOWN;
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP)
+        return classify_amp_operand(c, v->unary.operand, st, fn, fl);
+    if (v->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        if (!s) return CPROV_UNKNOWN;
+        if (s->container_struct) {
+            if (st) *st = s->container_struct;
+            if (fn) *fn = s->container_field;
+            if (fl) *fl = s->container_field_len;
+            return CPROV_FIELD;
+        }
+        return s->is_whole_object_addr ? CPROV_WHOLE : CPROV_UNKNOWN;
+    }
+    if (v->kind == NODE_CALL && v->call.callee && v->call.callee->kind == NODE_IDENT) {
+        Symbol *fs = scope_lookup(c->current_scope, v->call.callee->ident.name,
+                                  (uint32_t)v->call.callee->ident.name_len);
+        if (!fs || !fs->is_function || !fs->ret_summary_complete) return CPROV_UNKNOWN;
+        uint64_t m = fs->ret_param_mask;
+        if (m == 0 || (m & (m - 1)) != 0) return CPROV_UNKNOWN;   /* exactly one */
+        int pi = 0;
+        while (!(m & 1)) { m >>= 1; pi++; }
+        if (pi >= v->call.arg_count) return CPROV_UNKNOWN;
+        return container_prov_of_value(c, v->call.args[pi], depth + 1, st, fn, fl);
     }
     return CPROV_UNKNOWN;
 }
@@ -4704,7 +4783,18 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
         if (!sym || sym->is_function) return NULL;
         return global_decl_lookup(c, sym->name, sym->name_len);
     }
-    case NODE_UNARY:    return RVS(e->unary.operand);
+    case NODE_UNARY:
+        /* BUG-1168: a READ through a pointer names the POINTEE, exactly as the
+         * write side resolves it. `u32 t = *gp; *gp = t + 1;` with a GLOBAL
+         * `volatile *u32 gp = &g` recorded the taint as `gp` (the pointer)
+         * while the write resolved to `g`, so the split RMW was accepted at the
+         * ISR, spawn and main sinks. A LOCAL pointer worked only because its
+         * var-decl seeds the taint `p -> g`. Same resolver both halves. */
+        if (e->unary.op == TOK_STAR) {
+            Symbol *pt = resolve_write_target_global(c, e, 0);
+            if (pt) return pt;
+        }
+        return RVS(e->unary.operand);
     case NODE_TYPECAST: return RVS(e->typecast.expr);
     case NODE_FIELD:    return RVS(e->field.object);
     case NODE_INDEX: {  Symbol *l = RVS(e->index_expr.object); return l ? l : RVS(e->index_expr.index); }
@@ -5020,12 +5110,24 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
                              (uint32_t)r->ident.name_len);
     if (!s || s->is_function) return NULL;
     Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
-    if (st && type_dispatch_kind(st) == TYPE_POINTER && s->func_node &&
+    if (st && (type_dispatch_kind(st) == TYPE_POINTER ||
+               type_dispatch_kind(st) == TYPE_SLICE) && s->func_node &&
         (s->func_node->kind == NODE_VAR_DECL ||
          s->func_node->kind == NODE_GLOBAL_VAR)) {
         Node *init = unwrap_ptr_launder(s->func_node->var_decl.init);
         if (init && init->kind == NODE_UNARY && init->unary.op == TOK_AMP)
             return resolve_write_target_global(c, init->unary.operand, depth + 1);
+        /* BUG-1174: a SLICE view names the array it views — `[*]u32 gs =
+         * buf[0..];` or the coercion `= buf`. The ISR sharing rule resolved a
+         * write `gs[0] = 5` to `gs` (the header), never to `buf`, so an ISR
+         * writing through the view and main reading `buf` was accepted. */
+        if (init && type_dispatch_kind(st) == TYPE_SLICE) {
+            if (init->kind == NODE_SLICE)
+                return resolve_write_target_global(c, init->slice.object, depth + 1);
+            if (init->kind == NODE_IDENT &&
+                type_dispatch_kind(typemap_get(c, init)) == TYPE_ARRAY)
+                return resolve_write_target_global(c, init, depth + 1);
+        }
     }
     return global_decl_lookup(c, s->name, s->name_len);
 }
@@ -5075,6 +5177,8 @@ static bool write_target_reassign_visit(Node *value, int kind, void *ud) {
         write_targets_of_node(u->w, v->unary.operand, u->depth + 1, false);
     else if (v->kind == NODE_IDENT)   /* `p = q`: p now points where q does */
         write_targets_of_node(u->w, v, u->depth + 1, true);
+    else if (v->kind == NODE_SLICE)   /* BUG-1174: `s = arr[a..b]` views arr */
+        write_targets_of_node(u->w, v->slice.object, u->depth + 1, false);
     else if (v->kind == NODE_ORELSE) {
         write_target_reassign_visit(v->orelse.expr, ANW_ASSIGN, ud);
         write_target_reassign_visit(v->orelse.fallback, ANW_ASSIGN, ud);
@@ -5321,6 +5425,101 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
         sym->borrow_root_ambiguous = true;
     sym->borrow_root_name = rs->name;
     sym->borrow_root_len  = rs->name_len;
+}
+
+/* BUG-1169: a struct LITERAL carrier lends what its fields point into —
+ * `H h = { .p = &v }; spawn w(h); v = 7;` was accepted while the field-assign
+ * spelling `h.p = &v;` was refused (p20_struct_carrier). Record each field's
+ * root on the carrier, exactly as the field-assign sink does. */
+static void record_borrow_roots_from_struct_init(Checker *c, Symbol *sym, Node *init,
+                                                 int depth) {
+    if (!sym || !init || init->kind != NODE_STRUCT_INIT || depth > ZER_EXPR_WALK_MAX)
+        return;
+    for (int i = 0; i < init->struct_init.field_count; i++) {
+        Node *fv = unwrap_ptr_launder(init->struct_init.fields[i].value);
+        if (!fv) continue;
+        if (fv->kind == NODE_STRUCT_INIT) {
+            record_borrow_roots_from_struct_init(c, sym, fv, depth + 1);
+        } else if (fv->kind == NODE_UNARY && fv->unary.op == TOK_AMP) {
+            record_borrow_root(c, sym, fv->unary.operand);
+        } else if (fv->kind == NODE_SLICE) {
+            record_borrow_root(c, sym, fv);
+        } else if (fv->kind == NODE_IDENT) {
+            Symbol *fs = scope_lookup(c->current_scope, fv->ident.name,
+                                      (uint32_t)fv->ident.name_len);
+            if (fs && fs->borrow_root_ambiguous) sym->borrow_root_ambiguous = true;
+            if (fs && fs->borrow_root_name) {
+                if (sym->borrow_root_name &&
+                    (sym->borrow_root_len != fs->borrow_root_len ||
+                     memcmp(sym->borrow_root_name, fs->borrow_root_name,
+                            fs->borrow_root_len) != 0))
+                    sym->borrow_root_ambiguous = true;
+                sym->borrow_root_name = fs->borrow_root_name;
+                sym->borrow_root_len = fs->borrow_root_len;
+            } else if (fs && type_dispatch_kind(fs->type) == TYPE_ARRAY) {
+                record_borrow_root(c, sym, fv);   /* array -> [*]T field */
+            }
+        }
+    }
+}
+
+/* BUG-1170: does this VALUE carry the address of a THREADLOCAL — directly
+ * (`&tl`, `&tl.f`), through a pointer / carrier bound to it earlier (the root
+ * is recorded as borrow_root_name, which deliberately keeps global roots for
+ * exactly this), or inside a struct literal? Returns the threadlocal Symbol.
+ * A5 (BUG-757) caught only the literal `g = &tl`; `*u32 q = &tl; g = q;`,
+ * `g = { .p = &tl }` and a carrier `H loc = { .p = &tl }; sh.h = loc;` put
+ * this thread's TLS address where another thread reads it after this thread
+ * exits (measured: the read returned another thread's slot). */
+static bool sym_is_threadlocal(Symbol *s) {
+    return s && s->func_node &&
+           (s->func_node->kind == NODE_VAR_DECL || s->func_node->kind == NODE_GLOBAL_VAR) &&
+           s->func_node->var_decl.is_threadlocal;
+}
+static Symbol *value_reaches_threadlocal(Checker *c, Node *v, int depth) {
+    if (!v || depth > ZER_EXPR_WALK_MAX) return NULL;
+    v = unwrap_ptr_launder(v);
+    if (!v) return NULL;
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
+        Node *r = v->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+            if (r->kind == NODE_FIELD) r = r->field.object;
+            else r = r->index_expr.object;
+        }
+        if (r && r->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                     (uint32_t)r->ident.name_len);
+            if (sym_is_threadlocal(s)) return s;
+        }
+        return NULL;
+    }
+    if (v->kind == NODE_ORELSE) {
+        Symbol *s = value_reaches_threadlocal(c, v->orelse.expr, depth + 1);
+        return s ? s : value_reaches_threadlocal(c, v->orelse.fallback, depth + 1);
+    }
+    if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++) {
+            Symbol *s = value_reaches_threadlocal(c, v->struct_init.fields[i].value, depth + 1);
+            if (s) return s;
+        }
+        return NULL;
+    }
+    /* a name (or a field / element of it) bound to a threadlocal earlier */
+    Node *r = v;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else r = r->index_expr.object;
+    }
+    if (r && r->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, r->ident.name,
+                                 (uint32_t)r->ident.name_len);
+        if (s && !sym_is_threadlocal(s) && s->borrow_root_name) {
+            Symbol *rs = scope_lookup(c->current_scope, s->borrow_root_name,
+                                      s->borrow_root_len);
+            if (sym_is_threadlocal(rs)) return rs;
+        }
+    }
+    return NULL;
 }
 
 static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
@@ -5685,6 +5884,30 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
  * refused ("designated initializer requires struct type, got '?P'"). ONE
  * function sets the literal's type for every sink, so no sink can record the
  * optional by mistake. */
+/* BUG-1171: a pointer into a PACKED field (possibly misaligned — `&gp.w` with
+ * `packed struct P { u8 a; u32 w; }` is at an odd address) stored into a struct
+ * FIELD loses its misalignment fact: a field has no Symbol to carry
+ * is_packed_derived, so `H h = { .p = &gp.w }; *h.p = 7;` was a misaligned
+ * 4-byte store — a hard fault on Cortex-M0 / strict RISC-V, silent on x86.
+ * The variable sinks TRACK the fact; an aggregate cannot, so it is refused. */
+static void reject_packed_view_in_literal(Checker *c, Node *sinit, int line, int depth) {
+    if (!sinit || sinit->kind != NODE_STRUCT_INIT || depth > ZER_EXPR_WALK_MAX) return;
+    for (int i = 0; i < sinit->struct_init.field_count; i++) {
+        Node *fv = sinit->struct_init.fields[i].value;
+        if (!fv) continue;
+        if (fv->kind == NODE_STRUCT_INIT) {
+            reject_packed_view_in_literal(c, fv, line, depth + 1);
+        } else if (value_is_packed_derived(c, fv)) {
+            checker_error(c, line,
+                "field '%.*s': a pointer into a packed struct's field may be misaligned, "
+                "and a struct field cannot carry that fact, so a later access through it "
+                "could fault on strict-alignment targets. Copy the value out of the packed "
+                "field, or keep the pointer in a local",
+                (int)sinit->struct_init.fields[i].name_len, sinit->struct_init.fields[i].name);
+        }
+    }
+}
+
 static Type *type_struct_literal(Checker *c, Node *sinit, Type *target, int line) {
     if (!sinit || !target) return NULL;
     Type *lt = target;
@@ -5694,6 +5917,7 @@ static Type *type_struct_literal(Checker *c, Node *sinit, Type *target, int line
         lt = u->optional.inner;
     if (!validate_struct_init(c, sinit, lt, line)) return NULL;
     typemap_set(c, sinit, lt);
+    reject_packed_view_in_literal(c, sinit, line, 0);   /* BUG-1171 */
     return lt;
 }
 
@@ -8685,6 +8909,97 @@ static void route_free_to_ptr_if_needed(Checker *c, Node *call) {
     callee->field.field_name_len = new_len;
 }
 
+/* Does evaluating this lvalue path run a call / assignment / orelse /
+ * intrinsic (anything a second evaluation would repeat)? */
+static bool union_path_has_side_effect(Node *n, int depth) {
+    if (!n || depth > ZER_EXPR_WALK_MAX) return n != NULL;
+    switch (n->kind) {
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
+        return false;
+    case NODE_FIELD: return union_path_has_side_effect(n->field.object, depth + 1);
+    case NODE_INDEX: return union_path_has_side_effect(n->index_expr.object, depth + 1) ||
+                            union_path_has_side_effect(n->index_expr.index, depth + 1);
+    case NODE_UNARY: return union_path_has_side_effect(n->unary.operand, depth + 1);
+    case NODE_BINARY: return union_path_has_side_effect(n->binary.left, depth + 1) ||
+                             union_path_has_side_effect(n->binary.right, depth + 1);
+    /* A value computed by a call / assignment / orelse (may call) / intrinsic,
+     * or any statement-level kind an lvalue path never holds: treat as having a
+     * side effect (the conservative answer — it only refuses). */
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_TYPECAST: case NODE_CAST: case NODE_SLICE: case NODE_STRUCT_INIT:
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_NULL_LIT: case NODE_SIZEOF:
+    case NODE_ASM: case NODE_AWAIT: case NODE_BLOCK: case NODE_BREAK:
+    case NODE_CINCLUDE: case NODE_CONTAINER_DECL: case NODE_CONTINUE:
+    case NODE_CRITICAL: case NODE_DEFER: case NODE_DO_WHILE: case NODE_ENUM_DECL:
+    case NODE_EXPR_STMT: case NODE_FILE: case NODE_FOR: case NODE_FUNC_DECL:
+    case NODE_GLOBAL_VAR: case NODE_GOTO: case NODE_IF: case NODE_IMPORT:
+    case NODE_INTERRUPT: case NODE_LABEL: case NODE_MMIO: case NODE_ONCE:
+    case NODE_RETURN: case NODE_SPAWN: case NODE_STATIC_ASSERT:
+    case NODE_STRUCT_DECL: case NODE_SWITCH: case NODE_TYPEDEF:
+    case NODE_UNION_DECL: case NODE_VAR_DECL: case NODE_WHILE: case NODE_YIELD:
+        return true;
+    }
+    return true;
+}
+
+/* BUG-1161: a union variant reached while checking an assignment TARGET that
+ * is not the WHOLE target of a plain `=` — a COMPOUND op (`w.n += 4`, which
+ * READS the variant) or a write into a SUB-field / element (`w.pp.b = 1`).
+ * Both used to switch the active variant (or not switch it at all, for the
+ * compound op) while the union's other bytes still held the PREVIOUS variant:
+ * `w.p = &b.a; w.n += 4;` moved a pointer by integer arithmetic, and
+ * `w.n = addr; w.pp.b = 1;` made an integer into `pp.a`, a pointer — both then
+ * dereferenced in a switch arm. TRACKED, not banned: the emitter now RESETS the
+ * union to zero whenever such a write changes the active variant (`if (tag !=
+ * v) { zero; tag = v; }`), so the other bytes can never be read as the new
+ * variant. That emission evaluates the union's lvalue path twice, so a path with
+ * a side effect (`arr[next()].pp.b = 1`) is refused with the one-line remedy. */
+static bool union_variant_write_is_partial(Checker *c, Node *node,
+                                           size_t flen, const char *fname) {
+    if (!c->in_assign_target) return false;
+    bool whole = node == c->assign_target_top;
+    if (whole && c->assign_target_op == (int)TOK_EQ) return false;
+    if (!union_path_has_side_effect(node->field.object, 0)) return false;
+    checker_error(c, node->loc.line,
+        "%s union variant '%.*s' through a path with a side effect — the variant "
+        "change is checked on the union first, which would evaluate the path twice. "
+        "Take a pointer to the union in a local first",
+        whole ? "compound assignment to" : "a write into part of",
+        (int)flen, fname);
+    return true;
+}
+
+/* BUG-1169: is `alias` a name whose recorded borrow ROOT is currently lent to a
+ * scoped spawn (while `alias` itself is not the lent name)? */
+static bool borrow_alias_reaches_lent_root(Checker *c, Symbol *alias) {
+    if (!alias || alias->is_borrowed_by_thread || !alias->borrow_root_name) return false;
+    Symbol *rs = scope_lookup(c->current_scope, alias->borrow_root_name,
+                              alias->borrow_root_len);
+    return rs && rs != alias && rs->is_borrowed_by_thread;
+}
+
+/* Does this lvalue / value path DEREFERENCE something on its way to the root —
+ * an explicit `*`, or a field / element reached through a pointer or slice?
+ * (`h.x = 3` on a by-value struct writes h itself; `h.p.x` / `*q` / `s[i]` on a
+ * slice write the memory they point to.) */
+static bool target_path_derefs(Checker *c, Node *n) {
+    while (n) {
+        if (n->kind == NODE_UNARY && n->unary.op == TOK_STAR) return true;
+        if (n->kind == NODE_FIELD) {
+            TypeKind k = type_dispatch_kind(typemap_get(c, n->field.object));
+            if (k == TYPE_POINTER || k == TYPE_HANDLE) return true;
+            n = n->field.object; continue;
+        }
+        if (n->kind == NODE_INDEX) {
+            TypeKind k = type_dispatch_kind(typemap_get(c, n->index_expr.object));
+            if (k == TYPE_POINTER || k == TYPE_SLICE) return true;
+            n = n->index_expr.object; continue;
+        }
+        break;
+    }
+    return false;
+}
+
 static Type *check_expr(Checker *c, Node *node) {
     if (!node) return ty_void;
 
@@ -8760,6 +9075,19 @@ static Type *check_expr(Checker *c, Node *node) {
          * rarer; the obvious race is a plain read). The borrow is cleared at
          * `.join()`, so reads after the join are fine. Linear (same-block) like the
          * write-side; cross-block stays the documented CFG residual. */
+        /* BUG-1169: the READ side of the alias case — a pointer / slice bound to
+         * the lent local before the spawn; using it reads the lent memory. */
+        if (sym && !c->in_assign_target && !c->in_amp &&
+            borrow_alias_reaches_lent_root(c, sym)) {
+            TypeKind ak = type_dispatch_kind(sym->type);
+            if (ak == TYPE_POINTER || ak == TYPE_SLICE)
+                checker_error(c, node->loc.line,
+                    "cannot use '%.*s' while '%.*s', which it points into, is borrowed "
+                    "by a scoped spawn — the thread may be writing it until its "
+                    ".join() (data race). Join first",
+                    (int)node->ident.name_len, node->ident.name,
+                    (int)sym->borrow_root_len, sym->borrow_root_name);
+        }
         if (sym && sym->is_borrowed_by_thread && !c->in_assign_target && !c->in_amp) {
             checker_error(c, node->loc.line,
                 "cannot read '%.*s' while it is borrowed by a scoped spawn — the "
@@ -9336,9 +9664,15 @@ static Type *check_expr(Checker *c, Node *node) {
                 "free through either name would be a use-after-free. Alias the pointer "
                 "directly ('*T k = p;') instead");
         }
+        Node *sv_att = c->assign_target_top;
+        int sv_ato = c->assign_target_op;
+        c->assign_target_top = node->assign.target;     /* BUG-1161 */
+        c->assign_target_op = (int)node->assign.op;
         c->in_assign_target = true;
         Type *target = check_expr(c, node->assign.target);
         c->in_assign_target = false;
+        c->assign_target_top = sv_att;
+        c->assign_target_op = sv_ato;
         /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a WRITE to a local
          * that is currently borrowed by a scoped spawn (between `spawn
          * worker(&x)` and `th.join()`) is a data race — the thread has
@@ -9363,6 +9697,18 @@ static Type *check_expr(Checker *c, Node *node) {
                         "spawn — the thread has exclusive access until its "
                         ".join() (data race). Join first, or copy the value",
                         (int)troot->ident.name_len, troot->ident.name);
+                } else if (bts && borrow_alias_reaches_lent_root(c, bts) &&
+                           target_path_derefs(c, node->assign.target)) {
+                    /* BUG-1169: a write THROUGH a pointer that was bound to the
+                     * lent local BEFORE the spawn (`*u32 alias = &v; spawn w(&v);
+                     * *alias = 7;`). The root check keyed on `alias`, which is
+                     * not lent — its borrow_root_name `v` is. */
+                    checker_error(c, node->loc.line,
+                        "cannot write through '%.*s' — it points into '%.*s', which is "
+                        "borrowed by a scoped spawn until its .join() (data race). "
+                        "Join first",
+                        (int)troot->ident.name_len, troot->ident.name,
+                        (int)bts->borrow_root_len, bts->borrow_root_name);
                 }
             }
         }
@@ -9942,6 +10288,43 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-1171: the field-assign twin of the literal rule — `q.p = &gp.i;`
+         * stores a possibly-misaligned pointer where no Symbol can carry the fact.
+         * A bare ident target tracks it (is_packed_derived) and is not refused. */
+        if (node->assign.op == TOK_EQ && node->assign.target &&
+            node->assign.target->kind != NODE_IDENT &&
+            value_is_packed_derived(c, node->assign.value)) {
+            checker_error(c, node->loc.line,
+                "a pointer into a packed struct's field may be misaligned, and a struct "
+                "field or array element cannot carry that fact, so a later access through "
+                "it could fault on strict-alignment targets. Copy the value out of the "
+                "packed field, or keep the pointer in a local");
+        }
+
+        /* BUG-1170: the general form of A5 — a value that REACHES a threadlocal's
+         * address through an alias, a carrier or a literal, stored where another
+         * thread can read it. The direct `&tl` spelling is A5's own diagnostic
+         * above, so it is skipped here. */
+        if (node->assign.op == TOK_EQ && node->assign.value) {
+            Node *av = unwrap_ptr_launder(node->assign.value);
+            bool direct_amp = av && av->kind == NODE_UNARY && av->unary.op == TOK_AMP;
+            Symbol *tls = direct_amp ? NULL : value_reaches_threadlocal(c, node->assign.value, 0);
+            if (tls) {
+                Symbol *tsym = NULL; bool tg = false, tp = false;
+                classify_escape_sink(c, node->assign.target, &tsym, &tg, &tp);
+                if ((tg || tp) && !sym_is_threadlocal(tsym)) {
+                    checker_error(c, node->loc.line,
+                        "this value carries the address of threadlocal '%.*s' and is "
+                        "stored in %s '%.*s' — each thread has its own copy, so the "
+                        "pointer escapes to other threads and dangles when this thread "
+                        "exits. Pass the value, or use a shared struct",
+                        (int)tls->name_len, tls->name,
+                        tp ? "pointer parameter" : "static/global",
+                        (int)(tsym ? tsym->name_len : 0), tsym ? tsym->name : "");
+                }
+            }
+        }
+
         /* BUG-194: On plain assignment, clear+recompute safety flags on target.
          * Without this: p = &local; p = &global; return p → false positive.
          * Also: p = &global; p = &local; return p → false negative. */
@@ -10321,6 +10704,17 @@ static Type *check_expr(Checker *c, Node *node) {
          * Reuse the recursive struct_init_has_local_derived helper (AU-3's fix).
          * Gated on classify_escape_sink (global/param) so a LOCAL target is fine. */
         bool si_arena_a = false;
+        /* BUG-1158: type the literal against the target BEFORE the escape
+         * question — the field-type gate in struct_init_has_local_derived needs
+         * it (an untyped literal fell to the conservative answer and refused
+         * `g = { .n = local_arr[0] }`, a scalar copy). Typed once: the later
+         * BUG-1150 site sees the typemap entry and skips. */
+        if (node->assign.op == TOK_EQ && node->assign.value &&
+            node->assign.value->kind == NODE_STRUCT_INIT && target &&
+            type_dispatch_kind(typemap_get(c, node->assign.value)) == TYPE_VOID) {
+            Type *lt0 = type_struct_literal(c, node->assign.value, target, node->loc.line);
+            if (lt0) value = lt0;
+        }
         if (node->assign.op == TOK_EQ &&
             node->assign.value && node->assign.value->kind == NODE_STRUCT_INIT &&
             struct_init_frame_bound(c, node->assign.value, &si_arena_a)) {
@@ -10335,6 +10729,31 @@ static Type *check_expr(Checker *c, Node *node) {
                     tgt_p ? "pointer-parameter field" : "global/static variable",
                     (int)tgt_sym->name_len, tgt_sym->name,
                     si_arena ? " (an arena-derived pointer also dies at arena.reset())" : "");
+            } else {
+                /* BUG-1159: a LOCAL target now CARRIES the frame-bound pointer —
+                 * the var-decl spelling `R r = { .p = &x };` marks r, and the
+                 * assignment spelling `R r; r = { .p = &x };` marked nothing,
+                 * so a later `return r;` / `g = r;` / `*out = r;` / Ring push
+                 * escaped a stack pointer (ASan stack-use-after-return, the
+                 * return read back a clobbered 77 for 5). Taint the target's
+                 * ROOT local, exactly as the var-decl sink taints the new name
+                 * (a field target `r.inner = {...}` taints `r`). */
+                Node *troot = node->assign.target;
+                while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
+                    if (troot->kind == NODE_FIELD) troot = troot->field.object;
+                    else troot = troot->index_expr.object;
+                }
+                if (troot && troot->kind == NODE_IDENT &&
+                    !global_decl_lookup(c, troot->ident.name,
+                                        (uint32_t)troot->ident.name_len)) {
+                    Symbol *ts = scope_lookup(c->current_scope, troot->ident.name,
+                                              (uint32_t)troot->ident.name_len);
+                    if (ts && !ts->is_static) {
+                        if (si_arena) ts->is_arena_derived = true;
+                        else ts->is_local_derived = true;
+                        record_borrow_roots_from_struct_init(c, ts, node->assign.value, 0);   /* BUG-1169 */
+                    }
+                }
             }
         }
 
@@ -10920,9 +11339,13 @@ static Type *check_expr(Checker *c, Node *node) {
             reject_array_view_hazards(c, node->assign.value, target, node->loc.line);
 
         /* Designated initializer in assignment: validate fields */
-        if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target) {
+        if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target &&
+            type_dispatch_kind(typemap_get(c, node->assign.value)) == TYPE_VOID) {
             Type *lt = type_struct_literal(c, node->assign.value, target, node->loc.line);
             if (lt) value = lt;   /* BUG-1150 */
+        } else if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT) {
+            Type *lt = typemap_get(c, node->assign.value);   /* BUG-1158: typed above */
+            if (lt) value = lt;
         }
 
         /* BUG-847: `a = Arena.over(buf);` is how a GLOBAL arena is given its
@@ -12499,6 +12922,18 @@ static Type *check_expr(Checker *c, Node *node) {
                                 }
                             }
                         }
+                        /* BUG-1160: a struct LITERAL argument carrying a frame-bound
+                         * pointer — `stash({ .p = &x })` into a by-value param the
+                         * callee stores to a global. The same struct passed as a
+                         * named local is rejected; the literal reached no case above. */
+                        if (edge_vkind == KV_NONE && arg_node &&
+                            arg_node->kind == NODE_STRUCT_INIT) {
+                            bool sl_arena = false;
+                            if (struct_init_frame_bound(c, arg_node, &sl_arena)) {
+                                edge_vkind = sl_arena ? KV_ARENA : KV_LOCAL_DERIVED;
+                                edge_argname = "struct literal"; edge_argname_len = 14;
+                            }
+                        }
                         /* transitivity: does the arg trace to a non-keep caller param? */
                         int caller_root = keep_arg_caller_root(c, arg_node);
                         record_keep_edge(c, effective_callee, i, is_fn_ptr_call,
@@ -13038,6 +13473,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
             }
+            if (union_variant_write_is_partial(c, node, flen, fname)) {   /* BUG-1161 */
+                result = ty_void;
+                break;
+            }
             Type *inner = type_unwrap_distinct(obj->pointer.inner);
             for (uint32_t i = 0; i < inner->union_type.variant_count; i++) {
                 SUVariant *v = &inner->union_type.variants[i];
@@ -13083,6 +13522,10 @@ static Type *check_expr(Checker *c, Node *node) {
              * In assignment target = writing (sets active tag, not reading) = SWITCH mode.
              * Otherwise = reading outside switch = DIRECT (rejected). */
             int urm = c->in_assign_target ? ZER_URM_SWITCH : ZER_URM_DIRECT;
+            if (union_variant_write_is_partial(c, node, flen, fname)) {
+                result = ty_void;
+                break;
+            }
             if (zer_union_read_mode_safe(urm) == 0) {
                 checker_error(c, node->loc.line,
                     "cannot read union variant '%.*s' directly — must use switch",
@@ -14579,6 +15022,38 @@ static Type *check_expr(Checker *c, Node *node) {
                                     "parse bytes, or pun between two struct types "
                                     "(which IS runtime-checked)",
                                     tgtbuf, type_name(eff->pointer.inner));
+                            }
+                            /* BUG-1165: the SOURCE side of the same door. BUG-988
+                             * asked only whether the TARGET carries an invariant;
+                             * a WRITABLE primitive view over a source that does is
+                             * the same forge done by a store instead of a read:
+                             *   State s; *u32 p = @pun(*u32, &s); *p = 200;
+                             *       -> a non-variant enum, the switch takes an arm
+                             *   *u64 raw = @pun(*u64, &h); *raw = @ptrtoint(&x);
+                             *       -> h.p is now a pointer made from an integer,
+                             *          with no @inttoptr and no mmio
+                             * (also a slice's .ptr/.len, a bool holding 2). A CONST
+                             * target is a read-only view — the byte-view idiom —
+                             * and forges nothing, so it stays allowed. */
+                            else if (tgt_eff_pun_strip &&
+                                !tgt_eff_pun_strip->pointer.is_const &&
+                                !pun_type_id_check_can_fire(eff->pointer.inner,
+                                                            tgt_eff_pun_strip->pointer.inner) &&
+                                !type_equals(type_unwrap_distinct(eff->pointer.inner),
+                                             type_unwrap_distinct(tgt_eff_pun_strip->pointer.inner)) &&
+                                type_carries_forgeable(eff->pointer.inner, 0)) {
+                                char srcbuf[128];
+                                snprintf(srcbuf, sizeof srcbuf, "%s",
+                                         type_name(eff->pointer.inner));
+                                checker_error(c, node->loc.line,
+                                    "@pun cannot give a WRITABLE '%s' view of '%s' — "
+                                    "the source carries a pointer, slice, enum, bool, "
+                                    "optional or handle, and a store through the view "
+                                    "would forge it (no runtime type_id check can fire "
+                                    "here). Use a const target (`const %s`) for a "
+                                    "read-only byte view, or write the field itself",
+                                    type_name(tgt_eff_pun_strip->pointer.inner), srcbuf,
+                                    type_name(tgt_eff_pun_strip));
                             }
                         }
                     }
@@ -16172,10 +16647,11 @@ static Type *check_expr(Checker *c, Node *node) {
                             prov_field_len = src_sym->container_field_len;
                             prov_whole = src_sym->is_whole_object_addr;
                         }
-                    } else if (a0->kind == NODE_UNARY && a0->unary.op == TOK_AMP) {
-                        switch (classify_amp_operand(c, a0->unary.operand,
-                                                     &prov_struct, &prov_field,
-                                                     &prov_field_len)) {
+                    } else if ((a0->kind == NODE_UNARY && a0->unary.op == TOK_AMP) ||
+                               a0->kind == NODE_CALL) {             /* BUG-1167 */
+                        switch (container_prov_of_value(c, a0, 0,
+                                                        &prov_struct, &prov_field,
+                                                        &prov_field_len)) {
                         case CPROV_WHOLE:   prov_whole = true; break;
                         case CPROV_FIELD:   break;   /* fields already written out */
                         case CPROV_UNKNOWN: prov_struct = NULL; break;
@@ -18941,6 +19417,8 @@ static void check_stmt(Checker *c, Node *node) {
                         if (struct_init_has_local_derived(c, init))
                             sym->is_local_derived = true;
                     }
+                    if (init && init->kind == NODE_STRUCT_INIT)
+                        record_borrow_roots_from_struct_init(c, sym, init, 0);   /* BUG-1169 */
                 }
             }
 
@@ -19075,10 +19553,10 @@ static void check_stmt(Checker *c, Node *node) {
              * and (BUG-987) the WHOLE-OBJECT case when ptr = &wholeObject. */
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
-                if (init->kind == NODE_UNARY && init->unary.op == TOK_AMP) {
+                if ((init->kind == NODE_UNARY && init->unary.op == TOK_AMP) ||
+                    init->kind == NODE_CALL) {                    /* BUG-1167 */
                     Type *st = NULL; const char *fn = NULL; uint32_t fl = 0;
-                    switch (classify_amp_operand(c, init->unary.operand,
-                                                 &st, &fn, &fl)) {
+                    switch (container_prov_of_value(c, init, 0, &st, &fn, &fl)) {
                     case CPROV_FIELD:   set_container_prov_field(sym, st, fn, fl); break;
                     case CPROV_WHOLE:   set_container_prov_whole(sym); break;
                     case CPROV_UNKNOWN: break;
@@ -19753,8 +20231,14 @@ static void check_stmt(Checker *c, Node *node) {
             /* try to get init value for min */
             int64_t init_val = 0; /* default min */
             bool init_known = false;
+            /* BUG-1153: the init is the COUNTER's only when it DECLARES the
+             * counter. `for (u32 j = 0; i < 4; i += 1)` used j's `0` as i's lower
+             * bound, proved `a[i]` in [0,3] for an i that entered at -3, and
+             * elided the check (3 silent writes before the array). */
             if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
-                node->for_stmt.init->var_decl.init) {
+                node->for_stmt.init->var_decl.init && loop_var &&
+                (uint32_t)node->for_stmt.init->var_decl.name_len == loop_var_len &&
+                memcmp(node->for_stmt.init->var_decl.name, loop_var, loop_var_len) == 0) {
                 int64_t iv = vrp_const_value(c, node->for_stmt.init->var_decl.init, NULL);   /* BUG-1090 */
                 if (iv != CONST_EVAL_FAIL) { init_val = iv; init_known = true; }
             }
@@ -19826,6 +20310,43 @@ static void check_stmt(Checker *c, Node *node) {
                                            ? (int64_t)inc->int_lit.value
                                            : vrp_const_value(c, inc, NULL);
                             nonneg_inc = cinc != CONST_EVAL_FAIL && cinc >= 0;
+                            /* BUG-1153: "only goes UP" also needs the step not
+                             * to WRAP. The largest value the body sees is the
+                             * bound (`<=`) or bound-1 (`<`); one more step from
+                             * there must still fit the counter's type, else it
+                             * wraps (i8: 127 + 1 = -128, still `< 120`) and the
+                             * sequence re-enters the loop BELOW init. Measured:
+                             * `for (i8 i = 0; i < 120; i += 100)` and the
+                             * everyday `for (i8 i = 0; i <= 127; i += 1)` both
+                             * wrote at negative indices with the check elided.
+                             * An unsigned counter wraps to a small value too,
+                             * which keeps the index in bounds but breaks
+                             * min = init (and known_nonzero), so the rule is
+                             * width-based for both signednesses. */
+                            if (nonneg_inc && bound_val != CONST_EVAL_FAIL) {
+                                Symbol *lvs = scope_lookup(c->current_scope,
+                                                           loop_var, loop_var_len);
+                                Type *lvt = lvs ? lvs->type : NULL;
+                                int w = lvt ? type_width(lvt) : 0;
+                                bool sgn = lvt && type_is_signed(lvt);
+                                int64_t top = fop == TOK_LTEQ ? bound_val : bound_val - 1;
+                                if (w <= 0 || w > 64) {
+                                    nonneg_inc = false;
+                                } else {
+                                    /* type max as a u64 so a 64-bit unsigned fits */
+                                    uint64_t tmax = sgn ? ((w == 64) ? (uint64_t)INT64_MAX
+                                                                     : ((1ULL << (w - 1)) - 1ULL))
+                                                        : ((w == 64) ? UINT64_MAX
+                                                                     : ((1ULL << w) - 1ULL));
+                                    if (top < 0) {
+                                        /* never re-enters above a negative top via a
+                                         * non-negative step without passing it */
+                                    } else if ((uint64_t)top > tmax ||
+                                               (uint64_t)cinc > tmax - (uint64_t)top) {
+                                        nonneg_inc = false;
+                                    }
+                                }
+                            }
                         }
                     }
                     lo_sound = nonneg_inc;
@@ -22631,6 +23152,22 @@ static void check_stmt(Checker *c, Node *node) {
         for (int i = 0; i < node->spawn_stmt.arg_count; i++) {
             Type *arg_type = check_expr(c, node->spawn_stmt.args[i]);
             if (!arg_type) continue;
+            /* BUG-1160: a struct LITERAL has no type of its own (check_expr
+             * returns void; the context supplies it). Type it against the
+             * target parameter HERE, before the pointer-safety gates below —
+             * it used to be typed only at the type-mismatch check further
+             * down, so every gate saw `void` and `spawn w({ .p = &x })`
+             * handed the thread a pointer into this frame. */
+            if (node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT &&
+                func_sym->func_node && func_sym->func_node->kind == NODE_FUNC_DECL &&
+                i < func_sym->func_node->func_decl.param_count) {
+                Type *spt = resolve_type(c, func_sym->func_node->func_decl.params[i].type);
+                if (spt) {
+                    Type *lt = type_struct_literal(c, node->spawn_stmt.args[i], spt,
+                                                   node->loc.line);
+                    if (lt) arg_type = lt;
+                }
+            }
             /* A7: string literal to mutable slice — same check as regular call (line 3871).
              * String data is in .rodata, spawned thread writing it = segfault. */
             if (node->spawn_stmt.args[i]->kind == NODE_STRING_LIT &&
@@ -22855,7 +23392,11 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 /* Type mismatch */
                 /* A15: add is_literal_compatible + validate_struct_init (match regular call) */
-                if (node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT && param_type) {
+                Type *si_prev = node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT
+                              ? typemap_get(c, node->spawn_stmt.args[i]) : NULL;
+                if (si_prev && type_dispatch_kind(si_prev) != TYPE_VOID) {
+                    arg_type = si_prev;   /* BUG-1160: typed before the gates */
+                } else if (node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT && param_type) {
                     Type *lt = type_struct_literal(c, node->spawn_stmt.args[i], param_type,
                                                    node->loc.line);
                     if (lt) arg_type = lt;   /* BUG-1150 */
@@ -22994,7 +23535,7 @@ static void check_stmt(Checker *c, Node *node) {
                 /* BUG-969: x2 — an argument can lend TWO names now, the value
                  * handed over AND the local it points into. */
                 int bcap = node->spawn_stmt.arg_count > 0
-                             ? node->spawn_stmt.arg_count * 2 : 2;
+                             ? node->spawn_stmt.arg_count * 3 : 3;   /* BUG-1169: up to 3 names per arg */
                 sym->th_borrow_names = (const char **)arena_alloc(c->arena,
                     sizeof(const char *) * (size_t)bcap);
                 sym->th_borrow_lens = (uint32_t *)arena_alloc(c->arena,
@@ -23019,7 +23560,7 @@ static void check_stmt(Checker *c, Node *node) {
                      *     PARAM, whose root lives in the caller.
                      * The whole set goes into th_borrow_names, so the join releases
                      * every one (the positive boundary test depends on that). */
-                    const char *cand_n[2]; uint32_t cand_l[2]; int cand_c = 0;
+                    const char *cand_n[3]; uint32_t cand_l[3]; int cand_c = 0;
                     if (ba->kind == NODE_UNARY && ba->unary.op == TOK_AMP &&
                         ba->unary.operand) {
                         Node *r = ba->unary.operand;
@@ -23032,6 +23573,23 @@ static void check_stmt(Checker *c, Node *node) {
                         if (r && r->kind == NODE_IDENT) {
                             cand_n[cand_c] = r->ident.name;
                             cand_l[cand_c] = (uint32_t)r->ident.name_len; cand_c++;
+                            /* BUG-1169: `&carrier` also lends what the carrier
+                             * points into (`h.p = &v; spawn w(&h); v = 7;`). */
+                            Symbol *crs = scope_lookup(c->current_scope, r->ident.name,
+                                                       (uint32_t)r->ident.name_len);
+                            if (crs && crs->borrow_root_ambiguous) {
+                                checker_error(c, node->loc.line,
+                                    "spawn argument %d references locals whose identity "
+                                    "the compiler cannot resolve (a carrier holding "
+                                    "pointers into two different locals), so the "
+                                    "exclusive borrow until .join() cannot be established "
+                                    "— pass '&local' arguments directly", bi + 1);
+                                continue;
+                            }
+                            if (crs && crs->borrow_root_name) {
+                                cand_n[cand_c] = crs->borrow_root_name;
+                                cand_l[cand_c] = crs->borrow_root_len; cand_c++;
+                            }
                         }
                     } else if (ba->kind == NODE_IDENT) {
                         Symbol *as = scope_lookup(c->current_scope, ba->ident.name,
@@ -25723,7 +26281,11 @@ static void track_isr_pointee_of(Checker *c, Node *ident) {
     if (!ident || ident->kind != NODE_IDENT) return;
     Symbol *ps = global_decl_lookup(c, ident->ident.name,
                               (uint32_t)ident->ident.name_len);
-    if (!ps || ps->is_function || type_dispatch_kind(ps->type) != TYPE_POINTER) return;
+    /* BUG-1174: a global SLICE view reaches the array it views, same as a
+     * pointer reaches its pointee (`[*]u32 gs = buf[0..];`). */
+    if (!ps || ps->is_function ||
+        (type_dispatch_kind(ps->type) != TYPE_POINTER &&
+         type_dispatch_kind(ps->type) != TYPE_SLICE)) return;
     /* BUG-1124: every target, not only the initializer's — a retargeted pointer
      * reaches each global it was ever pointed at. */
     for_each_write_target_ex(c, ident, true, isr_pointee_visit, ps);

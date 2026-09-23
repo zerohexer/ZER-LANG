@@ -1,0 +1,23 @@
+// expect-error: may be a view of an allocation
+// BUG-1155: struct-carrier form of the orelse-fallback return summary skip.
+struct T { u32 v; }
+struct H { *T p; }
+H mk(*T a, *T b, ?u32 m) {
+    H hb = { .p = b };
+    u32 v = m orelse { return hb; };
+    H ha = { .p = a };
+    return ha;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 5;
+    H r = mk(a, b, null);
+    free(b);
+    *T d = alloc(T) orelse { free(a); return 1; };
+    d.v = 9;
+    u32 x = r.p.v;
+    free(d);
+    free(a);
+    return x;
+}

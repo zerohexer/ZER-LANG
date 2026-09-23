@@ -1,0 +1,15 @@
+// expect-error: cannot give a WRITABLE
+// BUG-1165: a writable primitive @pun view over a source carrying an
+// invariant (enum / pointer / bool) forged it by a store.
+struct Node { u32 v; }
+struct Holder { *Node p; }
+u32 g_secret = 7;
+u32 main() {
+    Node n;
+    n.v = 1;
+    Holder h = { .p = &n };
+    *u64 raw = @pun(*u64, &h);
+    *raw = @ptrtoint(&g_secret);   // forge: h.p now points at a u32 global
+    h.p.v = 99;                    // writes through forged *Node
+    return g_secret;               // 99
+}

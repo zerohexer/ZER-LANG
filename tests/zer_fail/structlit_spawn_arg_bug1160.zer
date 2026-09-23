@@ -1,0 +1,9 @@
+// expect-error: dangles once the frame returns
+// BUG-1160: struct-literal escape class — see BUGS-FIXED.md.
+struct M { *u32 p; }
+i32 printf(const *u8 fmt, ...);
+i32 usleep(u32 us);
+void w(M m) { usleep(100000); printf("child reads %u (want 5)\n", *m.p); }
+void f() { u32 x = 5; spawn w({ .p = &x }); }
+u32 clobber(u32 k) { u32[64] z; for (u32 i = 0; i < 64; i += 1) { z[i] = k; } return z[k % 64]; }
+u32 main() { f(); clobber(77); usleep(300000); return 0; }

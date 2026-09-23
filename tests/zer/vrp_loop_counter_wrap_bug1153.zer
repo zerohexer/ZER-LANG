@@ -1,0 +1,38 @@
+// BUG-1153: two for-loop lower-bound facts that were not true.
+//  (a) a counter whose step WRAPS re-enters the loop below `init`
+//      (i8: 127 + 1 = -128, still `<= 127`) — was proven in [0,127], the
+//      bounds check elided, 72 writes landed before the array;
+//  (b) the init of a DIFFERENT variable (`u32 j = 0`) was used as the
+//      counter's lower bound.
+// Each loop runs in a helper; the auto-guard's early return stops it, and
+// main checks the canary bytes before the array are untouched.
+struct S { u8[128] pre; u8[128] a; }
+S s;
+i32 start() { return -3; }
+
+void wrap_lteq() {
+    for (i8 i = 0; i <= 127; i += 1) { s.a[i] = 7; }
+}
+void wrap_big_step() {
+    for (i8 i = 0; i < 120; i += 100) { s.a[i] = 7; }
+}
+void wrap_i4() {
+    for (i4 i = 0; i < 7; i += 5) { s.a[i] = 7; }
+}
+void other_init() {
+    i32 i = start();
+    for (u32 j = 0; i < 4; i += 1) { s.a[i] = 7; }
+}
+
+u32 main() {
+    wrap_lteq();
+    wrap_big_step();
+    wrap_i4();
+    other_init();
+    for (u32 k = 0; k < 128; k += 1) {
+        if (s.pre[k] != 0) { return 1; }
+    }
+    // the in-range loops still ran their in-range iterations
+    if (s.a[0] != 7) { return 2; }
+    return 0;
+}

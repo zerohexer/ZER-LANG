@@ -1338,3 +1338,54 @@ zercheck_ir.c:ast_name_bind_count:NODE_FILE:file.decls
 zercheck_ir.c:ast_name_bind_count:NODE_FUNC_DECL:func_decl.body
 zercheck_ir.c:ast_name_bind_count:NODE_GLOBAL_VAR:var_decl.init
 zercheck_ir.c:ast_name_bind_count:NODE_INTERRUPT:interrupt.body
+
+# 2026-09-23g (BUG-1161): union_path_has_side_effect answers TRUE ("may have a side
+# effect") for every kind it does not descend — the conservative answer, which can only
+# refuse. Descending those children could never change a TRUE, so none is skipped wrongly.
+checker.c:union_path_has_side_effect:NODE_ASM:asm_stmt.inputs
+checker.c:union_path_has_side_effect:NODE_ASM:asm_stmt.outputs
+checker.c:union_path_has_side_effect:NODE_ASSIGN:assign.target
+checker.c:union_path_has_side_effect:NODE_ASSIGN:assign.value
+checker.c:union_path_has_side_effect:NODE_AWAIT:await_stmt.cond
+checker.c:union_path_has_side_effect:NODE_BLOCK:block.stmts
+checker.c:union_path_has_side_effect:NODE_CALL:call.args
+checker.c:union_path_has_side_effect:NODE_CALL:call.callee
+checker.c:union_path_has_side_effect:NODE_CRITICAL:critical.body
+checker.c:union_path_has_side_effect:NODE_DEFER:defer.body
+checker.c:union_path_has_side_effect:NODE_DO_WHILE:while_stmt.body
+checker.c:union_path_has_side_effect:NODE_DO_WHILE:while_stmt.cond
+checker.c:union_path_has_side_effect:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:union_path_has_side_effect:NODE_FILE:file.decls
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.body
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.cond
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.init
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.step
+checker.c:union_path_has_side_effect:NODE_FUNC_DECL:func_decl.body
+checker.c:union_path_has_side_effect:NODE_GLOBAL_VAR:var_decl.init
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.cond
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.else_body
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.then_body
+checker.c:union_path_has_side_effect:NODE_INTERRUPT:interrupt.body
+checker.c:union_path_has_side_effect:NODE_INTRINSIC:intrinsic.args
+checker.c:union_path_has_side_effect:NODE_ONCE:once.body
+checker.c:union_path_has_side_effect:NODE_ORELSE:orelse.expr
+checker.c:union_path_has_side_effect:NODE_ORELSE:orelse.fallback
+checker.c:union_path_has_side_effect:NODE_RETURN:ret.expr
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.end
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.object
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.start
+checker.c:union_path_has_side_effect:NODE_SPAWN:spawn_stmt.args
+checker.c:union_path_has_side_effect:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:union_path_has_side_effect:NODE_STRUCT_INIT:struct_init.fields
+checker.c:union_path_has_side_effect:NODE_SWITCH:switch_stmt.arms
+checker.c:union_path_has_side_effect:NODE_SWITCH:switch_stmt.expr
+checker.c:union_path_has_side_effect:NODE_TYPECAST:typecast.expr
+checker.c:union_path_has_side_effect:NODE_VAR_DECL:var_decl.init
+checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.body
+checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.cond
+
+# 2026-09-23g: emit_defer_stmt's NODE_ASM arm hands the whole node to emit_structured_asm,
+# which walks inputs/outputs itself. (The audit started seeing this function once the
+# emitter's brace-in-string layout around the new load-guard helpers changed.)
+emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.inputs
+emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.outputs

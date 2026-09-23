@@ -1,0 +1,5 @@
+// expect-error: through pointer parameter
+// BUG-1159: struct-literal escape class — see BUGS-FIXED.md.
+struct R { *u32 p; }
+void f(*R out) { u32 x = 5; R r; r = { .p = &x }; *out = r; }
+u32 main() { u32 y = 1; R r = { .p = &y }; f(&r); return *r.p; }

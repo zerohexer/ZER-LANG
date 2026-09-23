@@ -5,6 +5,143 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23g — BUG-1152..1176: a harvested branch plus a five-area audit (silent holes at run time AND compile time, several silent on bare metal only)
+
+**Harvest.** `claude/loving-bohr-8rby10` (34 commits, forked AT main) was fast-forwarded in; it
+already carries `stoic-mendel-p4i854` / `-mzqgy6` and the renumbered `friendly-galileo-1hkj1n`
+fixes, and `loving-davinci-bdorfl`'s single commit is an earlier copy of its `ccd53970`. make
+check green on the merged tree before any change here. Three built binaries the branch had
+committed by accident (`zer-lsp`, `test`, `test1`) are untracked and ignored.
+
+**Audit.** Five read-only agents (emitter, UAF/move, bounds, concurrency + bare metal, escape +
+provenance), each finding reproduced here against a from-HEAD baseline build before fixing.
+Every negative below COMPILED on the baseline; every runtime test FAILED (or hung) on it.
+
+### BUG-1152 — a non-null `*T` FIELD / ELEMENT is NULL wherever its aggregate is zero-initialized
+Closes the MEDIUM OPEN entry. `H w; *w.p`, `alloc(H)` then `h.p.v = 7`, `*u32 q = g.p; *q`
+(the launder) and the `.ptr` of a zero slice all dereferenced address 0 — a SIGSEGV-handler trap
+hosted, a silent read/write of address 0 on bare metal. **Tracked, not banned** (option (c) of
+the entry; the BUG-1019 precedent for funcptrs): every LOAD of a non-optional `*T` out of memory
+(field, element, `*pp`) is checked — `({ __auto_type t = LOAD; if (!t) _zer_trap(...); t; })` in
+`emit_expr` / `emit_rewritten_node` (one wrapper each, in front of the old bodies, now
+`*_impl`), and a same-line statement check after the IR's own IR_FIELD_READ / IR_INDEX_READ /
+deref. Guarding the LOAD, not the dereference, is what makes it complete: a local / param `*T`
+is non-null by construction, so a NULL can only enter through one of those loads. The
+assignment target and the `&` operand are exempt (they name a location). `*opaque` is the
+`{ptr,type_id}` struct, so its test reads `.ptr`. Corpus cost: zero (1105 positive files,
+identical exit codes). Tests: `tests/zer_trap/nonnull_*_bug1152.zer` (4),
+`tests/zer/nonnull_field_guard_precision_bug1152.zer`.
+
+### BUG-1153 — two for-loop lower bounds that were not true
+(a) A counter whose step WRAPS re-enters below `init`: `for (i8 i = 0; i <= 127; i += 1)` (the
+everyday 0..=127) and `i += 100` both proved `s.a[i]` in range and wrote at negative indices.
+The monotone lower bound now also requires `top + step <= TYPE_MAX` for the counter's width
+(both signednesses; `uN`/`iN` included). (b) The init of a DIFFERENT variable (`for (u32 j = 0;
+i < 4; i += 1)`) was taken as the counter's lower bound. Test:
+`tests/zer/vrp_loop_counter_wrap_bug1153.zer` (the baseline never terminates — it writes out
+of bounds forever).
+
+### BUG-1154 — `return v;` read `v` after the defers ran
+A bare named local lowered to its own id, so `u32 v = 4; defer v = 8; return v;` returned 8,
+and a VRP-proven return range became a silent out-of-bounds write at the caller. The named
+local is snapshotted into a temp when a defer is pending (`IRLocal.snapshot_of_plus1` keeps
+diagnostics naming `v`). Test: `tests/zer/return_named_local_before_defer_bug1154.zer`.
+
+### BUG-1155 — orelse FALLBACK blocks were skipped by the return summaries and the join check
+Six return-summary loops and the ThreadHandle join check skipped `is_orelse_fallback` blocks,
+so `m orelse { return b; }` returned a param view the summary never saw (UAF through a recycled
+slot) and `u32 v = maybe(k) orelse return;` left a spawned thread writing into the returned
+frame. A bare `orelse return` carries no value, which the no-value test already skips. Tests:
+`join_skipped_by_orelse_return_bug1155`, `ret_view_from_orelse_fallback_bug1155`,
+`ret_field_view_from_orelse_fallback_bug1155`.
+
+### BUG-1156 — a braceless `defer stmt;` bypassed every per-statement lock rule
+The body was a bare NODE_EXPR_STMT and the lock machinery iterates BLOCK statements, so `defer
+c.n += 1;` on a shared struct took no lock (2M increments from two threads lost updates) and
+the two-lock and `shared(rw)` re-entry checks never ran. The parser now wraps it in a block.
+
+### BUG-1157 — a struct literal whose field value is an ARRAY miscompiled silently
+`R r = { .s = ga };` (global array into `[*]T`) emitted `.s = 0` (len 0); `{ .arr = l }` into
+an array field put an address in `arr[0]`. All three emission paths now emit the value (with
+the array→slice coercion) and copy array fields by `memcpy` after the literal.
+
+### BUG-1158/1159/1160 — the struct-literal escape class
+The literal walker knew four field shapes; now the DESTINATION field type gates a call to the
+shared `arg_is_local_derived` (a local array coerced to a slice, a field / orelse / index
+value). `R r; r = { .p = &x }` now taints `r` like the var-decl spelling. `arg_is_local_derived`
+gained a NODE_STRUCT_INIT case (the spawn gate's comment already claimed it), and a spawn
+literal is typed BEFORE the pointer-safety gates. Gate: SHAPE p35 in `tools/sink_matrix.sh`.
+
+### BUG-1161 — a partial or compound write into a union variant forged the other variant
+`w.p = &b.a; w.n += 4;` did pointer arithmetic and left the tag `.p`; `w.n = addr; w.pp.b =
+1;` made an integer into `pp.a`. **Tracked, not banned** (a ban broke the `m.a.x = 1` idiom on
+a fresh union): such a write RESETS the union to zero when it changes the active variant, so
+stale bytes can never be read as the new variant — and BUG-1152 then traps a zeroed `*T`. A
+path with a side effect is refused (the reset evaluates it twice).
+
+### BUG-1162/1163/1164 — the uN/iN store intercept
+It ran before the union-tag case (`w.t = 5` into a `u3` variant never set `_tag`), before the
+bit-slice SET case (`x[2..1] = 3` on a `u5` was invalid C), and stored twice (a `volatile u12`
+compound saw the unmasked value written). Both paths now call ONE `emit_intn_store`: value
+masked in a carrier temp, stored once, union tag set.
+
+### BUG-1165 — `@pun` gave a WRITABLE primitive view of a source carrying an invariant
+`*u32 p = @pun(*u32, &state); *p = 200;` (enum), `*u64` over a struct holding a pointer (an
+integer became a pointer with no `@inttoptr`/`mmio`), a slice header, a bool. BUG-988 checked
+only the target. A `const` target (the byte-view idiom) stays allowed.
+
+### BUG-1166 — a primitive pointee packed `type_id 0` into `*opaque`
+`*opaque mk(*u32 p) { return (*opaque)p; }` then `(*Big)mk(&x)` wrote 80 bytes over a `u32`.
+Seven copies of the type-id computation are now `opaque_type_id()`, giving scalars a reserved
+high-bit id; `@pun` keeps its NOMINAL check (`opaque_type_id_nominal`).
+
+### BUG-1167 — `@container` whole-object provenance laundered through a call
+`*LH p = pick(&solo);` read as unknown; `container_prov_of_value` follows a call whose return
+summary names exactly one parameter.
+
+### BUG-1168 — a split RMW through a GLOBAL pointer
+`u32 t = *gp; *gp = t + 1;` recorded its read as `gp`, not the pointee, at the ISR, spawn and
+main sinks. The read side now asks `resolve_write_target_global` like the write side.
+
+### BUG-1169 — three scoped-borrow spellings
+A pointer bound to the local BEFORE the spawn (`*alias = 7`, `sp.a = 7`), a struct-LITERAL
+carrier, and `&carrier`. Gate: three p20 cells.
+
+### BUG-1170 — a threadlocal's address escaped through an alias, a carrier or a literal
+A5 caught only `g = &tl`. `value_reaches_threadlocal` follows the recorded `borrow_root_name`.
+
+### BUG-1171 — a pointer into a packed field stored in a struct field
+`H h = { .p = &gp.w }; *h.p = 7;` — a misaligned store (hard fault on Cortex-M0 / strict
+RISC-V). A field cannot carry `is_packed_derived`, so the literal and field-assign sinks refuse
+it. Gate: two p22 cells.
+
+### BUG-1172 — an arena RESET inside a callee was invisible to the caller
+New `FuncSummary.resets_arena` (a non-local arena, transitively); a call to such a function
+frees the caller's arena-coloured handles, and an indirect call widens them to MAYBE_FREED when
+any function resets one.
+
+### BUG-1173 — a dangling pointer handed to the caller inside a struct or an out-param
+The return check looked at the returned local's bare entry only; its compounds (`w.p`) are now
+checked too. A field reached through a POINTER param that is FREED at return is refused.
+
+### BUG-1174 — the ISR sharing rule did not follow a global SLICE view to its array
+`[*]u32 gs = buf[0..];` written in an ISR while main read `buf`.
+
+### BUG-1176 — the compiler read `locals[-2]` at a spawn argument that is a global
+The move-struct auto-registration after the spawn-transfer marking tested `root_local <
+func->local_count` only; a GLOBAL root is `IR_GLOBAL_ROOT_ID (-2)`, so `spawn worker(tls)`
+(a threadlocal by value, `tests/zer/g4_threadlocal_byvalue_ok.zer`) read before the locals
+array and SEGFAULTED once this session's changes moved the heap layout. Latent before; found
+by the corpus A/B, not by a sanitizer. Guarded `root_local >= 0`. The compiler ASan+UBSan
+sweep (`tools/compiler_asan_sweep.sh`) is clean over the whole corpus afterwards.
+
+### BUG-1175 — a no-zero-variant enum zero-initialized inside an aggregate
+`enum E { a = 5, b = 6 }` in a struct field / array element / `alloc(S)` / omitted designated
+field took a switch ARM. Loads of such an enum out of memory are guarded like BUG-1152 (0 is the
+only value auto-zero can forge; every other forge is guarded at its door).
+
+---
+
 ## Session 2026-09-23f — BUG-1130..1133: an array slot at a variable index had no identity, and a struct value lost its allocations on the way through an element, a field, an assigned literal or a chained wrapper
 
 Closes the two OPEN entries BUG-1074 / BUG-1080 left (docs/limitations.md). Every negative

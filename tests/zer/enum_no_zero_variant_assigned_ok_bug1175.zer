@@ -1,0 +1,17 @@
+// BUG-1175 boundary: once assigned, a no-zero-variant enum in a carrier reads
+// normally; an enum WITH a zero variant is never guarded (zero is valid).
+enum E { a = 5, b = 6 }
+enum Z { off, on }
+struct S { E e; Z z; }
+u32 main() {
+    S s;
+    s.e = E.b;
+    E[2] arr;
+    arr[1] = E.a;
+    u32 r = 0;
+    switch (s.e) { .a => { r = 1; } .b => { r = 2; } }
+    switch (arr[1]) { .a => { r += 10; } .b => { r += 20; } }
+    switch (s.z) { .off => { r += 100; } .on => { r += 200; } }
+    if (r != 112) { return 1; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// expect-error: field 'p': a pointer into a packed struct
+// BUG-1171: a pointer into a packed field stored in a struct field lost its
+// misalignment fact; the later access was a misaligned store.
+packed struct P { u8 a; u32 w; }
+struct H { *u32 p; }
+P gp;
+u32 main() {
+    H h = { .p = &gp.w };        // accepted: pointer into packed field via struct literal
+    *h.p = 7;                    // misaligned 4-byte store (hard fault on Cortex-M0 / strict RISC-V)
+    u32 mis = (u32)(@ptrtoint(h.p) % 4);
+    return mis;                  // 1 = odd address
+}

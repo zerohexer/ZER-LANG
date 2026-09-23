@@ -2052,7 +2052,18 @@ static Node *parse_statement(Parser *p) {
             consume(p, TOK_SEMICOLON, "expected ';' after defer statement");
             Node *stmt = new_node(p, NODE_EXPR_STMT);
             stmt->expr_stmt.expr = expr;
-            n->defer.body = stmt;
+            /* BUG-1156: wrap in a BLOCK, exactly as `defer { stmt; }`. The
+             * per-statement machinery (shared-struct auto-lock in the IR block
+             * loop, the same-statement two-lock deadlock check, the shared(rw)
+             * re-entry check) iterates a block's statements, so a bare
+             * NODE_EXPR_STMT body was never seen: `defer c.n += 1;` on a
+             * shared struct ran with NO lock (lost updates under two threads)
+             * while the braced spelling locked. One spelling, one AST. */
+            Node *blk = new_node(p, NODE_BLOCK);
+            blk->block.stmts = (Node **)arena_alloc(p->arena, sizeof(Node *));
+            blk->block.stmts[0] = stmt;
+            blk->block.stmt_count = 1;
+            n->defer.body = blk;
         }
         return n;
     }

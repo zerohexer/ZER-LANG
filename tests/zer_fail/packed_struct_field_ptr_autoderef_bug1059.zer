@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: it points into a PACKED struct field
+// BUG-1059f: auto-deref field access through a pointer to a packed struct's
+// struct-typed field — the misaligned access *q is refused for, spelled q.x.
+struct In { u32 x; u32 y; }
+packed struct P { u8 a; In inner; }
+P gp;
+u32 main() { *In q = &gp.inner; return q.x; }

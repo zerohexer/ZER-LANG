@@ -970,6 +970,7 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line);
 /* BUG-971: the original three-argument form, for the many GLOBAL call sites. */
 #define track_isr_global(c, n, l, comp) track_isr_global_ex((c), (n), (l), (comp), false, 0)
+static void track_isr_pointee_of(Checker *c, Node *ident);   /* BUG-1059 */
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
                                          Type **types, int max_types, int count);   /* BUG-1013 */
 static void record_isr_globals(Checker *c, Node *node, int depth);
@@ -5341,9 +5342,12 @@ static bool mmio_bound_name_stable_in(Node *body, const char *name, uint32_t len
     return ast_name_bind_count(body, name, len) == expected_binds;
 }
 
-static bool mmio_global_bound_stable(Checker *c, Symbol *sym) {
+/* BUG-1056/1059e: is this GLOBAL never assigned or address-taken in ANY
+ * registered body? Anything that trusts a global's DECLARATION initializer (an
+ * MMIO bound, a funcptr's target) asks this. Cached on the Symbol. */
+static bool global_name_never_mutated(Checker *c, Symbol *sym) {
     if (!sym) return false;
-    if (sym->mmio_bound_checked != 0) return sym->mmio_bound_checked > 0;
+    if (sym->never_mutated_cache != 0) return sym->never_mutated_cache > 0;
     bool ok = true;
     for (int fi = 0; ok && fi < c->reg_file_count; fi++) {
         Node *f = c->reg_files[fi];
@@ -5356,8 +5360,12 @@ static bool mmio_global_bound_stable(Checker *c, Symbol *sym) {
                 ok = false;
         }
     }
-    sym->mmio_bound_checked = ok ? 1 : -1;
+    sym->never_mutated_cache = ok ? 1 : -1;
     return ok;
+}
+
+static bool mmio_global_bound_stable(Checker *c, Symbol *sym) {
+    return global_name_never_mutated(c, sym);
 }
 
 static void record_registered_file(Checker *c, Node *file_node) {
@@ -5604,26 +5612,13 @@ static int64_t compute_type_size(Type *t) {
         }
         int64_t total = 4; /* int32_t _tag */
         /* BUG-364: align union data to max variant ALIGNMENT, not size.
-         * For arrays, alignment = element alignment (same fix as BUG-350 for structs). */
+         * BUG-1059h: asked of type_alignment_bytes (linear, recursive). The
+         * hand-rolled version re-ran compute_type_size on every nested field to
+         * guess an alignment — 2^depth calls for a 40-deep nest (17 s) — and
+         * guessed wrong for a nested field wider than 8 bytes (alignment 1). */
         int data_align = 4; /* minimum: tag alignment */
         for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
-            Type *vt = type_unwrap_distinct(t->union_type.variants[i].type);
-            int va;
-            if (vt && vt->kind == TYPE_ARRAY) {
-                Type *elem = vt->array.inner;
-                while (elem && elem->kind == TYPE_ARRAY) elem = elem->array.inner;
-                int64_t esz = compute_type_size(elem);
-                va = (esz > 0 && esz <= 8) ? (int)esz : 1;
-            } else if (vt && vt->kind == TYPE_STRUCT && vt->struct_type.field_count > 0) {
-                va = 1;
-                for (uint32_t k = 0; k < vt->struct_type.field_count; k++) {
-                    int64_t ks = compute_type_size(vt->struct_type.fields[k].type);
-                    if (ks > 0 && ks <= 8 && (int)ks > va) va = (int)ks;
-                }
-            } else {
-                int64_t vs = compute_type_size(vt);
-                va = (int)(vs > 8 ? 8 : (vs > 0 ? vs : 1));
-            }
+            int va = type_alignment_bytes(t->union_type.variants[i].type);
             if (va > data_align) data_align = va;
         }
         if (data_align > 1 && (total % data_align) != 0)
@@ -5645,29 +5640,10 @@ static int64_t compute_type_size(Type *t) {
             if (fsize == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
             if (fsize <= 0) fsize = 4; /* fallback for unknown types */
             /* BUG-350: alignment must be based on element type, not total size.
-             * u8[10] has alignment 1 (element u8), not 8 (capped size). */
-            int falign;
-            if (is_packed) {
-                falign = 1;
-            } else {
-                Type *ft = type_unwrap_distinct(t->struct_type.fields[fi].type);
-                if (ft->kind == TYPE_ARRAY) {
-                    /* array alignment = element alignment */
-                    Type *elem = ft->array.inner;
-                    while (elem && elem->kind == TYPE_ARRAY) elem = elem->array.inner;
-                    int64_t elem_sz = compute_type_size(elem);
-                    falign = (elem_sz > 0 && elem_sz <= 8) ? (int)elem_sz : 1;
-                } else if (ft->kind == TYPE_STRUCT && ft->struct_type.field_count > 0) {
-                    /* struct alignment = max field alignment */
-                    falign = 1;
-                    for (uint32_t k = 0; k < ft->struct_type.field_count; k++) {
-                        int64_t ks = compute_type_size(ft->struct_type.fields[k].type);
-                        if (ks > 0 && ks <= 8 && (int)ks > falign) falign = (int)ks;
-                    }
-                } else {
-                    falign = (int)(fsize > 8 ? 8 : (fsize > 0 ? fsize : 1));
-                }
-            }
+             * BUG-1059h: type_alignment_bytes — see the union arm above. */
+            int falign = is_packed ? 1
+                : type_alignment_bytes(t->struct_type.fields[fi].type);
+            if (falign < 1) falign = 1;
             if (falign > max_align) max_align = falign;
             if (!is_packed && falign > 1 && (total % falign) != 0)
                 total += falign - (total % falign);
@@ -7719,6 +7695,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* this ident IS a global — track ISR/func access */
                 track_isr_global(c, node->ident.name,
                                  (uint32_t)node->ident.name_len, false);
+                track_isr_pointee_of(c, node);   /* BUG-1059 */
                 /* A6-full slice 2: record a plain VALUE read of a scalar global
                  * after a spawn (concurrent context). Post-check flags it if the
                  * global is an atomic cell. Skip `&g` (in_amp — address-take, not
@@ -11652,6 +11629,23 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *rfs; const char *rff; uint32_t rfl;
             if (atomic_struct_field_target(c, node, &rfs, &rff, &rfl))
                 track_atomic_field(c, rfs, rff, rfl, false, node->loc.line);
+        }
+
+        /* BUG-1059f: `q.x` through a pointer formed by `&packed.inner` is the same
+         * misaligned access `*q` is refused for (BUG-833) — auto-deref spells the
+         * dereference without a `*`, so the deref sink never saw it. Measured: a
+         * `struct In { u32 x; }` view at offset 1 of a packed struct, accepted. */
+        if (node->field.object && node->field.object->kind == NODE_IDENT) {
+            Symbol *ps = scope_lookup(c->current_scope, node->field.object->ident.name,
+                                      (uint32_t)node->field.object->ident.name_len);
+            if (ps && ps->is_packed_derived &&
+                type_dispatch_kind(ps->type) == TYPE_POINTER)
+                checker_error(c, node->loc.line,
+                    "accessing a field through '%.*s' — it points into a PACKED struct "
+                    "field and may be misaligned (a hard fault on ARM/RISC-V). Access "
+                    "the field directly (`s.inner.x`) or copy it to an aligned local first",
+                    (int)node->field.object->ident.name_len,
+                    node->field.object->ident.name);
         }
 
         /* BUG-432: module-qualified variable access: config.VERSION
@@ -19072,6 +19066,23 @@ static void check_stmt(Checker *c, Node *node) {
                 if (expr_eff->kind == TYPE_UNION) {
                     c->union_switch_type = expr;
                     Node *sw_expr = node->switch_stmt.expr;
+                    /* BUG-1059f: a union switch is lowered through the ADDRESS of
+                     * the switched union (captures bind into it). For a union that
+                     * is a field of a PACKED struct that address is misaligned —
+                     * the `&p.u` BUG-833 refuses, spelled as a switch. Only the
+                     * union's own alignment matters: a byte-aligned union is safe. */
+                    if (arm && sw_expr && type_alignment_bytes(expr_eff) > 1) {
+                        Node *pr = sw_expr;
+                        while (pr && pr->kind == NODE_INDEX) pr = pr->index_expr.object;
+                        bool pk = false;
+                        if (pr && pr->kind == NODE_FIELD) packed_path_aggregate(c, pr, &pk, 0);
+                        if (pk && i == 0)
+                            checker_error(c, node->loc.line,
+                                "cannot switch on a union that is a field of a PACKED "
+                                "struct — the switch works through the union's address, "
+                                "which is misaligned there (a hard fault on ARM/RISC-V). "
+                                "Copy the union to an aligned local and switch on that");
+                    }
                     /* BUG-392: build full expression key for precise locking.
                      * switch(msgs[0]) → key "msgs[0]", allows msgs[1] mutation.
                      * walk to root ident for backward-compat root lock too. */
@@ -24081,6 +24092,15 @@ void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud) {
  * ================================================================ */
 static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line) {
+    /* BUG-1059c: a read-modify-write in MAIN code inside `@critical` cannot be
+     * split by an interrupt — interrupts are off for exactly its duration. The
+     * rule's own diagnostic prescribes that remedy ("an explicit read/mask/write
+     * inside @critical") and then rejected it, because this flag ignored the
+     * context. The access is still recorded (the volatile rule still applies);
+     * only the RMW half is dropped. The same holds inside an ISR: `@critical`
+     * there masks the nested interrupts that could split it. */
+    if (is_compound && c->critical_depth > 0)
+        is_compound = false;
     /* find existing entry */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
@@ -24090,6 +24110,9 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
             if (c->in_interrupt) {
                 g->from_isr = true;
                 if (is_compound) g->compound_in_isr = true;
+                if (!g->first_isr_body) g->first_isr_body = c->current_body;
+                else if (c->current_body && g->first_isr_body != c->current_body)
+                    g->multi_isr = true;
             } else {
                 g->from_func = true;
                 if (is_compound) g->compound_in_func = true;
@@ -24113,10 +24136,34 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
     if (c->in_interrupt) {
         g->from_isr = true;
         if (is_compound) g->compound_in_isr = true;
+        g->first_isr_body = c->current_body;
     } else {
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
     }
+}
+
+/* BUG-1059: naming a GLOBAL POINTER whose initializer is `&g` reaches `g`.
+ *
+ *     u32 g;  *u32 gp = &g;
+ *     interrupt TIM2 { *gp = 5; }
+ *     u32 main() { while (g == 0) { } return 0; }   // -O2: an infinite loop
+ *
+ * The ISR side recorded `gp` and main recorded `g`, so the two never met and the
+ * "must be declared volatile" rule never fired (the spawn sibling rejected the
+ * same shape). Record the pointee too, at BOTH sides, through the one resolver
+ * the RMW rules use (`resolve_write_target_global`, which follows a pointer's
+ * `&x` initializer). Over-approximate on purpose: naming the pointer at all
+ * counts as reaching its target. A global pointer REASSIGNED elsewhere is not
+ * followed — see docs/limitations.md. */
+static void track_isr_pointee_of(Checker *c, Node *ident) {
+    if (!ident || ident->kind != NODE_IDENT) return;
+    Symbol *ps = scope_lookup(c->global_scope, ident->ident.name,
+                              (uint32_t)ident->ident.name_len);
+    if (!ps || ps->is_function || type_dispatch_kind(ps->type) != TYPE_POINTER) return;
+    Symbol *t = resolve_write_target_global(c, ident, 0);
+    if (t && t != ps && !t->is_function)
+        track_isr_global(c, t->name, t->name_len, false);
 }
 
 /* BUG-1046: record that a global was handed BY POINTER to a call whose target the
@@ -24323,8 +24370,10 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     case NODE_IDENT: {
         Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
                                   (uint32_t)node->ident.name_len);
-        if (gs && !gs->is_function)
+        if (gs && !gs->is_function) {
             track_isr_global(c, node->ident.name, (uint32_t)node->ident.name_len, false);
+            track_isr_pointee_of(c, node);   /* BUG-1059 */
+        }
         /* BUG-971: a STATIC LOCAL in a body this ISR reaches. It has no global-scope
          * Symbol, which is exactly why it was invisible here; static_local_record has
          * already seen its declaration during this same walk. */
@@ -24498,8 +24547,29 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         }
         return;
     case NODE_DEFER:    record_isr_globals(c, node->defer.body, depth); return;
-    case NODE_CRITICAL: record_isr_globals(c, node->critical.body, depth); return;
-    case NODE_ONCE:     record_isr_globals(c, node->once.body, depth); return;
+    case NODE_CRITICAL:
+        /* BUG-1059c: this walk runs outside the checker's own nesting, so the
+         * @critical context must be re-established for track_isr_global_ex. */
+        c->critical_depth++;
+        record_isr_globals(c, node->critical.body, depth);
+        c->critical_depth--;
+        return;
+    case NODE_ONCE:
+        /* BUG-1059b: `@once` reachable from an interrupt handler. Its state is a
+         * compiler-generated flag no sharing rule sees. Freestanding it is a
+         * plain test-and-set, so an interrupt between the test and the set runs
+         * the body TWICE, and one arriving after the set skips while main's body
+         * is half done ("the loser does not wait"); hosted, the loser's spin
+         * inside the ISR never ends. Neither can be tracked away — the handler
+         * cannot wait for the code it preempted — so it is refused. */
+        if (c->in_interrupt)
+            checker_error(c, node->loc.line,
+                "@once is reachable from an interrupt handler — an interrupt that "
+                "lands while main is inside the same @once either runs the body a "
+                "second time or proceeds on half-initialised state (and hosted, "
+                "spins forever). Initialise before enabling the interrupt instead");
+        record_isr_globals(c, node->once.body, depth);
+        return;
     case NODE_SWITCH:
         record_isr_globals(c, node->switch_stmt.expr, depth);
         for (int i = 0; i < node->switch_stmt.arm_count; i++)
@@ -24924,7 +24994,9 @@ static void check_atomic_cell_safety(Checker *c) {
 static void check_interrupt_safety(Checker *c) {
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
-        if (!g->from_isr || !g->from_func) continue; /* not shared */
+        /* shared = touched from an ISR AND from main, or from TWO ISRs (BUG-1059d) */
+        if (!g->from_isr || (!g->from_func && !g->multi_isr)) continue;
+        const char *other = g->from_func ? "main" : "another interrupt handler";
         /* shared global — check volatile */
         /* BUG-971: a static local has no global Symbol, so the lookup below cannot
          * find it — and `continue` silently dropped it. Its remedy is different too:
@@ -24942,11 +25014,26 @@ static void check_interrupt_safety(Checker *c) {
         }
         Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
         if (!sym) continue;
-        if (!sym->is_volatile) {
+        TypeKind gk = type_dispatch_kind(sym->type);
+        if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
+            gk == TYPE_ARENA) {
+            /* BUG-1059g: "declare it volatile" was the advice here, and following
+             * it produced a second error ("not a single-word scalar") — the
+             * advice was unfollowable. The allocator's metadata (slot bitmaps,
+             * head/tail/count) is updated in several non-atomic steps, so an
+             * interrupt landing mid-update corrupts it whatever the qualifier. */
             checker_error(c, sym->line,
-                "global '%.*s' is accessed from both interrupt and main code — "
+                "'%.*s' (%s) is used from both interrupt and %s code — its "
+                "internal bookkeeping is updated in several non-atomic steps, so an "
+                "interrupt landing mid-operation corrupts it, and 'volatile' cannot "
+                "fix that. Give each context its own, or hand values across in a "
+                "volatile single-word variable / @atomic_* cell",
+                (int)g->name_len, g->name, type_name(sym->type), other);
+        } else if (!sym->is_volatile) {
+            checker_error(c, sym->line,
+                "global '%.*s' is accessed from both interrupt and %s code — "
                 "must be declared volatile",
-                (int)g->name_len, g->name);
+                (int)g->name_len, g->name, other);
         } else if (g->compound_in_isr || g->compound_in_func) {
             /* volatile but compound assignment — race condition */
             checker_error(c, sym->line,
@@ -24959,10 +25046,10 @@ static void check_interrupt_safety(Checker *c) {
                  * statement" would now name a shape the diagnostic does not
                  * always describe. */
                 "volatile global '%.*s' is read-modify-written and is shared "
-                "between interrupt and main code — the read and the write can be "
+                "between interrupt and %s code — the read and the write can be "
                 "split by an interrupt, losing an update; use an explicit "
                 "read/mask/write inside @critical, or @atomic_*",
-                (int)g->name_len, g->name);
+                (int)g->name_len, g->name, other);
         } else if (g->opaque_in_isr || g->opaque_in_func) {
             /* BUG-1046: not a proven RMW, so it does not say one happened. */
             checker_error(c, sym->line,
@@ -25040,7 +25127,11 @@ static void add_callee(struct StackFrame *f, const char *name, uint32_t name_len
 }
 
 /* estimate type size for stack frame calculation */
-static uint32_t estimate_type_size(Type *t) {
+/* BUG-1059e: pointer-shaped sizes were hard-coded to 4 ("conservative: 32-bit"),
+ * which UNDER-counts on a 64-bit target — the direction that lets --stack-limit
+ * affirm a budget the target cannot meet (`?*u32[40]` estimated 164, GCC 400).
+ * `pb` is the target's pointer size in bytes. */
+static uint32_t estimate_type_size(Type *t, uint32_t pb) {
     if (!t) return 0;
     t = type_unwrap_distinct(t);
     switch (t->kind) {
@@ -25057,33 +25148,33 @@ static uint32_t estimate_type_size(Type *t) {
         if (_b <= 64) return 8;
         return 16; /* __int128 */
     }
-    case TYPE_POINTER: case TYPE_OPAQUE: return 4; /* conservative: 32-bit */
+    case TYPE_POINTER: case TYPE_OPAQUE: return pb;
     case TYPE_HANDLE: return 8; /* u64 */
-    case TYPE_ARRAY: return (uint32_t)(t->array.size * estimate_type_size(t->array.inner));
-    case TYPE_SLICE: return 8; /* ptr + len */
+    case TYPE_ARRAY: return (uint32_t)(t->array.size * estimate_type_size(t->array.inner, pb));
+    case TYPE_SLICE: return 2 * pb; /* ptr + len */
     case TYPE_OPTIONAL: {
         Type *inner = type_unwrap_distinct(t->optional.inner);
-        if (inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR) return 4; /* null sentinel */
+        if (type_dispatch_kind(inner) == TYPE_POINTER || type_dispatch_kind(inner) == TYPE_FUNC_PTR) return pb; /* null sentinel */
         if (inner->kind == TYPE_VOID) return 1; /* has_value only */
-        return estimate_type_size(inner) + 1; /* value + has_value */
+        return estimate_type_size(inner, pb) + 1; /* value + has_value */
     }
     case TYPE_STRUCT: {
         uint32_t total = 0;
         for (uint32_t i = 0; i < t->struct_type.field_count; i++)
-            total += estimate_type_size(t->struct_type.fields[i].type);
+            total += estimate_type_size(t->struct_type.fields[i].type, pb);
         return total;
     }
     /* Stage 2 Part B (2026-04-28): exhaustive — kinds with no fixed
      * size for stack frame estimation. Conservative 4 bytes for
      * pointer-shaped types, 0 for VOID, otherwise return ptr-size. */
     case TYPE_VOID: return 0;
-    case TYPE_FUNC_PTR: return 4;  /* pointer */
+    case TYPE_FUNC_PTR: return pb;  /* pointer */
     case TYPE_ENUM: return 4;       /* int variant tag */
     case TYPE_UNION: {
         /* Tagged union: max variant size + tag byte */
         uint32_t maxv = 0;
         for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
-            uint32_t s = estimate_type_size(t->union_type.variants[i].type);
+            uint32_t s = estimate_type_size(t->union_type.variants[i].type, pb);
             if (s > maxv) maxv = s;
         }
         return maxv + 1;
@@ -25095,9 +25186,14 @@ static uint32_t estimate_type_size(Type *t) {
     case TYPE_DISTINCT:
         /* Should be unwrapped above by type_unwrap_distinct, but
          * defensive fallback. */
-        return estimate_type_size(t->distinct.underlying);
+        return estimate_type_size(t->distinct.underlying, pb);
     }
     return 4;
+}
+
+static uint32_t stack_ptr_bytes(Checker *c) {
+    int b = c->target_ptr_bits > 0 ? c->target_ptr_bits : 64;
+    return (uint32_t)(b / 8 > 0 ? b / 8 : 4);
 }
 
 /* scan function body for local variable sizes and callee names */
@@ -25108,7 +25204,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
         Type *t = typemap_get(c, node);
         if (!t && node->var_decl.type) t = typemap_get(c, (Node *)node->var_decl.type);
         /* rough estimate: resolve type from the type node name */
-        if (t) frame->frame_size += estimate_type_size(t);
+        if (t) frame->frame_size += estimate_type_size(t, stack_ptr_bytes(c));
         else frame->frame_size += 4; /* unknown, assume 4 */
         if (node->var_decl.init) scan_frame(c, frame, node->var_decl.init);
         break;
@@ -25126,7 +25222,11 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                 /* Function pointer call: check if variable was initialized with a known function.
                  * Enables indirect recursion detection: void (*fp)() = func_a; fp(); */
                 bool resolved = false;
+                /* BUG-1059e: the initializer names the target only while nothing
+                 * reassigns the pointer — `gfp = big;` in another function made the
+                 * chain through `gfp(1)` a different, larger one. */
                 if (sym->func_node &&
+                    global_name_never_mutated(c, sym) &&
                     (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
                     sym->func_node->var_decl.init &&
                     sym->func_node->var_decl.init->kind == NODE_IDENT) {
@@ -25165,6 +25265,15 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                 if (!builtin_alloc_leaf) frame->has_indirect_call = true;
             }
         }
+        /* BUG-1059e: a FIELD / INDEX (or any non-ident) callee whose type is a
+         * function pointer — `o.f(1)`, `tbl[i](x)`, `gops.f(n)` — is exactly as
+         * unresolvable as a funcptr local, and was never marked: --stack-limit
+         * affirmed a 200-byte budget for a 352-byte chain, and a recursion through
+         * `gops.f` was invisible. Builtin method calls (`pool.alloc()`) are typed
+         * as their result, never as a funcptr, so they are unaffected. */
+        if (node->call.callee && node->call.callee->kind != NODE_IDENT &&
+            type_dispatch_kind(checker_get_type(c, node->call.callee)) == TYPE_FUNC_PTR)
+            frame->has_indirect_call = true;
         for (int i = 0; i < node->call.arg_count; i++)
             scan_frame(c, frame, node->call.args[i]);
         /* BUG-825: a callee EXPRESSION (`ops.fn()`, `tbl[i]()`) may itself contain
@@ -25418,7 +25527,7 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                     Type *pt = NULL;
                     if (decl->func_decl.params[p].type)
                         pt = typemap_get(c, (Node *)decl->func_decl.params[p].type);
-                    f->frame_size += pt ? estimate_type_size(pt) : 4;
+                    f->frame_size += pt ? estimate_type_size(pt, stack_ptr_bytes(c)) : stack_ptr_bytes(c);
                 }
                 scan_frame(c, f, decl->func_decl.body);
             }
@@ -25470,10 +25579,15 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                  * unresolvable function pointer calls, stack depth is unverifiable */
                 if (f->has_indirect_call && !f->is_recursive) {
                     bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
-                    if (is_main) {
+                    /* BUG-1059e: an interrupt handler is an entry point too — its
+                     * warning was suppressed under --stack-limit and no error
+                     * replaced it. */
+                    bool is_isr = files_declare_isr(files, count, f->name, f->name_len);
+                    if (is_main || is_isr) {
                         checker_error(c, 0,
-                            "entry '%.*s' call chain contains function pointer call with "
+                            "%s '%.*s' call chain contains function pointer call with "
                             "unknown target — stack depth unverifiable with --stack-limit",
+                            is_isr ? "interrupt" : "entry",
                             (int)f->name_len, f->name);
                     }
                 }

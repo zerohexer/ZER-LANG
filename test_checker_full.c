@@ -1742,6 +1742,20 @@ static void test_negative_sweep(void) {
     ok("volatile u8[16] hw_regs;\n"
        "u32 main() { volatile []u8 s = hw_regs; return 0; }",
        "volatile array to volatile slice var-decl accepted");
+    /* BUG-1059c: an RMW inside @critical cannot be split by an interrupt — the
+     * remedy the ISR-sharing diagnostic itself prescribes must compile. */
+    ok("volatile u32 g;\n"
+       "interrupt TIM2 { @critical { g += 1; } }\n"
+       "u32 main() { @critical { u32 t = g; g = t | 4; } return 0; }",
+       "ISR/main RMW both inside @critical accepted (BUG-1059c)");
+    err("volatile u32 g;\n"
+        "interrupt TIM2 { @critical { g += 1; } }\n"
+        "u32 main() { g += 4; return 0; }",
+        "main RMW outside @critical still rejected (BUG-1059c)");
+    err("volatile u32 g;\n"
+        "interrupt TIM2 { g += 1; }\n"
+        "u32 main() { @critical { g = 3; } return 0; }",
+        "ISR RMW outside @critical still rejected (BUG-1059c)");
 
     /* Slab(T) type checking */
     ok("struct Item { u32 val; }\nstatic Slab(Item) items;\n"

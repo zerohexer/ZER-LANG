@@ -1,0 +1,13 @@
+// zerc-flags: --stack-limit 200
+// EXPECTED: compile error
+// expect-error: call chain contains function pointer call with unknown target
+// BUG-1059e: a call through a funcptr struct FIELD (`o.f(1)`) was never marked indirect, so --stack-limit 200 affirmed a 352-byte chain.
+u32 big(u32 n) { u8[190] buf; buf[0] = 1; return n + buf[0]; }
+struct Ops { *(u32) -> u32 f; }
+volatile u32 sink;
+u32 callit(Ops o) { return o.f(1); }
+u32 main() {
+    Ops o = { .f = big };
+    sink = callit(o);
+    return 0;
+}

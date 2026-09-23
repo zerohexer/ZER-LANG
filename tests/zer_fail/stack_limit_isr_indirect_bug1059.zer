@@ -1,0 +1,9 @@
+// zerc-flags: --stack-limit 200
+// EXPECTED: compile error
+// expect-error: call chain contains function pointer call with unknown target
+// BUG-1059e: an interrupt handler is an entry point too — its indirect-call finding was a warning suppressed under --stack-limit with no error in its place.
+u32 big(u32 n) { u8[190] buf; buf[0] = 1; return n + buf[0]; }
+u32 run(*(u32) -> u32 f) { return f(1); }
+volatile u32 sink;
+interrupt TIM2 { sink = run(big); }
+u32 main() { return 0; }

@@ -152,6 +152,46 @@ running beside a hand run read the other run's diagnostics: 84 correct negatives
 `tests/test_*_matrix.c` grids still use fixed `/tmp/_zer_*` paths — recorded in
 docs/limitations.md; do not run two grid-running `make check`s at once.
 
+### BUG-1059 — the bare-metal batch: eight silent gaps found by the freestanding audit
+
+All measured compile-clean (or wrong) on the harvested HEAD; each has a regression file.
+
+- **(a) ISR access through a global pointer's initializer.** `u32 g; *u32 gp = &g; interrupt
+  { *gp = 5; } main() { while (g == 0) {} }` — at -O2 main compiled to `jmp .`. The ISR side
+  recorded `gp`, main recorded `g`. `track_isr_pointee_of` records the pointee at BOTH sides
+  through `resolve_write_target_global`. (`isr_global_ptr_init_pointee_bug1059.zer`)
+- **(b) `@once` reachable from an interrupt handler** — its state is a compiler-generated flag
+  no sharing rule saw; freestanding the body can run twice or be observed half-done, hosted
+  the ISR spins forever. Refused in `record_isr_globals` (`isr_reaches_once_bug1059.zer`).
+- **(c) the `@critical` remedy the ISR-RMW diagnostic prescribes was itself rejected.** An RMW
+  inside `@critical` (main or ISR) no longer sets the RMW flag; the post-pass walk
+  re-establishes `critical_depth` for `NODE_CRITICAL`. (C unit tests in test_checker_full.c.)
+- **(d) two interrupt handlers read-modify-writing one volatile** were accepted (the rule was
+  ISR-vs-main only; nested priorities preempt). `IsrGlobal.first_isr_body` / `multi_isr`, and
+  the "shared" test is ISR+main OR two ISRs (`isr_two_handlers_rmw_bug1059.zer`).
+- **(e) `--stack-limit` affirmed budgets it could not verify**: a FIELD/INDEX funcptr callee
+  (`o.f(1)`, `gops.f(n)`) was never marked indirect; a global funcptr was resolved through its
+  initializer although another function reassigns it (now only when `global_name_never_mutated`
+  — the Symbol-cached whole-program query BUG-1056 introduced, generalised); an interrupt
+  entry's indirect call was a suppressed warning with no error; pointer-shaped locals were
+  sized at 4 bytes on a 64-bit target. (`stack_limit_*_bug1059.zer`)
+- **(f) packed struct-typed views**: `*In q = &gp.inner; q.x` (auto-deref spells the deref the
+  BUG-833 rule refuses) and `switch (gp.u)` on a packed union field (lowered through its
+  misaligned address). (`packed_struct_field_ptr_autoderef_bug1059.zer`,
+  `packed_union_field_switch_bug1059.zer`)
+- **(g) Pool / Ring / Slab / Arena shared ISR<->main** were told "must be declared volatile",
+  and following that produced a second error. The diagnostic now says what is actually wrong.
+- **(h) `compute_type_size` guessed alignment** by re-running itself on every nested field and
+  capping sizes at 8: `u8[@size(O)]` for `struct O { u8 b; In i; }`, `In { u64[2] a; }`, was 17
+  bytes where C's sizeof is 24; and the guess was 2^depth (a 40-deep nest took 17 s, 34 s once
+  BUG-1056 added a second call). Both arms now ask `type_alignment_bytes`, which also learned
+  that a ZER union is at least 4-aligned (its `int32_t _tag`).
+  (`tests/zer/size_nested_wide_field_align_bug1059.zer`)
+
+Corpus: compiled every file under tests/, rust_tests/, zig_tests/, lib/, examples/ and
+test_modules/ with the pre-session and the new compiler — the ONLY verdict changes are this
+session's own new tests.
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

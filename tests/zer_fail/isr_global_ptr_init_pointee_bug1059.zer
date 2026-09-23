@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: global 'g' is accessed from both interrupt and main code
+// BUG-1059: the ISR writes `g` through a global pointer whose initializer is `&g`;
+// main reads `g` by name. The ISR side recorded `gp`, main recorded `g`, so the
+// sharing rule never saw one global touched from both — and at -O2 main's loop
+// compiled to `jmp .` (the ISR's store is never observed).
+u32 g;
+*u32 gp = &g;
+interrupt TIM2 { *gp = 5; }
+u32 main() { while (g == 0) { } return 0; }

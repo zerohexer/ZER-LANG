@@ -3748,6 +3748,36 @@ static bool packed_array_field_view(Checker *c, Node *v) {
  * array / struct step continues to its object; the root Symbol contributes its
  * own. Conservative on nothing — an unknown step simply contributes nothing,
  * which is the same answer the old rule gave. */
+/* BUG-1117: does this lvalue PATH pass through a `shared struct` (or shared(rw))
+ * — at any step, not just its root? A reference formed into that memory (`&p`,
+ * or a slice VIEW over an array field) outlives the per-statement auto-lock, so
+ * later accesses through it take no lock. Every object step is asked: a
+ * shared struct VALUE, or a pointer to one (auto-deref). */
+static bool type_is_shared_struct(Type *t) {
+    if (type_dispatch_kind(t) == TYPE_POINTER)
+        t = type_unwrap_distinct(t)->pointer.inner;
+    if (type_dispatch_kind(t) != TYPE_STRUCT) return false;
+    Type *st = type_unwrap_distinct(t);
+    return st->struct_type.is_shared || st->struct_type.is_shared_rw;
+}
+static bool lvalue_path_through_shared(Checker *c, Node *v) {
+    if (v && v->kind == NODE_SLICE) v = v->slice.object;
+    for (int depth = 0; v && depth <= ZER_EXPR_WALK_MAX; depth++) {
+        Node *obj = NULL;
+        if (v->kind == NODE_FIELD) obj = v->field.object;
+        else if (v->kind == NODE_INDEX) obj = v->index_expr.object;
+        else return false;
+        if (type_is_shared_struct(checker_get_type(c, obj))) return true;
+        if (obj->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, obj->ident.name,
+                                     (uint32_t)obj->ident.name_len);
+            return s && type_is_shared_struct(s->type);
+        }
+        v = obj;
+    }
+    return false;
+}
+
 static void array_view_qualifiers(Checker *c, Node *v, bool *is_vol, bool *is_const) {
     *is_vol = false;
     *is_const = false;
@@ -3833,7 +3863,25 @@ static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) 
 /* BUG-1057: every hazard of forming a slice over an array, at one call. */
 static bool reject_array_view_hazards(Checker *c, Node *v, Type *dest, int line) {
     if (reject_packed_array_view(c, v, dest, line)) return true;
-    return reject_array_view_qualifier_drop(c, v, dest, line);
+    if (reject_array_view_qualifier_drop(c, v, dest, line)) return true;
+    /* BUG-1117: a slice view into a shared struct's array field is the `&s.a[i]`
+     * that BUG A6/#5 refuses, spelled as a coercion — `[*]u32 s = g.a;` then
+     * `s[0] += 1` beside a thread took NO lock. */
+    Type *d = type_unwrap_distinct(dest);
+    while (d && type_dispatch_kind(d) == TYPE_OPTIONAL)
+        d = type_unwrap_distinct(d->optional.inner);
+    if (v && d && type_dispatch_kind(d) == TYPE_SLICE) {
+        Node *src = v->kind == NODE_SLICE ? v->slice.object : v;
+        if (type_dispatch_kind(checker_get_type(c, src)) == TYPE_ARRAY &&
+            lvalue_path_through_shared(c, v)) {
+            checker_error(c, line,
+                "cannot form a slice over an array inside a shared struct — the view "
+                "would outlive the per-statement auto-lock, so accesses through it take "
+                "no lock. Index the array directly under the auto-lock, or copy it out");
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool value_is_packed_derived(Checker *c, Node *v) {
@@ -8232,23 +8280,12 @@ static Type *check_expr(Checker *c, Node *node) {
                      * address of the WHOLE shared struct (`&s`, operand is the
                      * bare IDENT) is still allowed — that is how a shared struct
                      * is passed/spawned, auto-locked. shared(rw) included. */
+                    /* BUG-1117: any step of the path, not only the root — a
+                     * shared struct nested in a plain one (`&o.s.v`) was exempt. */
                     if (sym && sym->type &&
                         (node->unary.operand->kind == NODE_FIELD ||
                          node->unary.operand->kind == NODE_INDEX)) {
-                        Type *st = type_unwrap_distinct(sym->type);
-                        bool root_is_shared = false;
-                        if (st->kind == TYPE_STRUCT &&
-                            (st->struct_type.is_shared ||
-                             st->struct_type.is_shared_rw)) {
-                            root_is_shared = true;
-                        } else if (st->kind == TYPE_POINTER) {
-                            Type *inner = type_unwrap_distinct(st->pointer.inner);
-                            if (inner && inner->kind == TYPE_STRUCT &&
-                                (inner->struct_type.is_shared ||
-                                 inner->struct_type.is_shared_rw))
-                                root_is_shared = true;
-                        }
-                        if (root_is_shared) {
+                        if (lvalue_path_through_shared(c, node->unary.operand)) {
                             checker_error(c, node->loc.line,
                                 "cannot take address of a shared struct's "
                                 "interior (field or element) — the pointer "
@@ -21800,7 +21837,24 @@ static void check_stmt(Checker *c, Node *node) {
                             (int)vl, vn);
                         continue;
                     }
-                    if (!vs || vs->is_static || vglobal || !vs->type) continue;
+                    /* BUG-1118: a non-shared GLOBAL lent by pointer to a scoped
+                     * spawn was skipped ("a global root lends no local"), so
+                     * `ThreadHandle th = spawn w(&counter); counter += 1;` raced
+                     * with no diagnostic. It is now BORROWED exactly like a local:
+                     * the parent's own access to it before join() is refused by
+                     * the existing borrow rule, while the idiom the sink matrix
+                     * pins (lend `&g`, touch something else, join, then read `g`)
+                     * still compiles. A `const` global is read-only, a shared
+                     * struct is auto-locked, and Semaphore / Barrier ARE the
+                     * synchronisation. Residual (limitations.md): a CALLEE of the
+                     * parent that names the global during the window. */
+                    bool lendable_global = vglobal && vs && vs->type && !vs->is_const &&
+                        !vs->is_function && !type_is_shared_struct(vs->type) &&
+                        type_dispatch_kind(vs->type) != TYPE_SEMAPHORE &&
+                        type_dispatch_kind(vs->type) != TYPE_BARRIER;
+                    if (!vs || !vs->type) continue;
+                    if (vglobal && !lendable_global) continue;
+                    if (!vglobal && vs->is_static) continue;
                     Type *vt = type_unwrap_distinct(vs->type);
                     bool vshared = vt && vt->kind == TYPE_STRUCT &&
                         (vt->struct_type.is_shared || vt->struct_type.is_shared_rw);

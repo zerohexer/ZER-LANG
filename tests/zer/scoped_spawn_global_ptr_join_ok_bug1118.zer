@@ -1,0 +1,14 @@
+// BUG-1118: a global lent BY POINTER to a scoped spawn is borrowed until join() —
+// after the join the parent may use it again, and lending it to a second thread
+// after the first join is fine.
+u32 counter;
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    ThreadHandle t1 = spawn w(&counter);
+    t1.join();
+    counter += 10;
+    ThreadHandle t2 = spawn w(&counter);
+    t2.join();
+    if (counter != 12) { return 1; }
+    return 0;
+}

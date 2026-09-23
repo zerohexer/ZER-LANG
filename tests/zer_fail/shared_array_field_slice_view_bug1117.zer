@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot form a slice over an array inside a shared struct
+// BUG-1117: an array->slice VIEW of a shared struct's array field is the `&g.a[i]`
+// the auto-lock rule refuses, spelled without `&` — `s[0] += 1` took no lock.
+shared struct C { u32[4] a; }
+C g;
+void w() { g.a[0] += 1; }
+u32 main() {
+    [*]u32 s = g.a;
+    ThreadHandle th = spawn w();
+    s[0] += 1;
+    th.join();
+    return 0;
+}

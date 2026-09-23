@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-23e — BUG-1121..1125: three defects the reference.md audit found (one silent), a retargeted pointer, and a lent global reached through a callee
+## Session 2026-09-23e — BUG-1121..1128: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global designated initializers, missing prototypes
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
 **Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
@@ -32,6 +32,40 @@ and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[
 now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
 `type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
 refuses any non-identifier spelling, so no emitted name changes.
+
+### BUG-1126 — a designated initializer that OMITTED a non-null field produced a NULL `*T`
+`struct H { u32 a; *u32 p; } ... H w = { .a = 1 }; return *w.p;` compiled clean and
+dereferenced address 0 (a trap on the host through the SIGSEGV handler, a silent read on bare
+metal). An omitted field is zero, and the zero of a `*T` / funcptr is exactly the value the type
+forbids. `validate_struct_init` — the one struct-literal checker every sink calls (var-decl,
+assignment, argument, return, spawn arg, nested field) — now refuses an omitted field whose
+zero contains a non-null pointer (`zero_value_nonnull_leaf`: recurses by-value structs and
+arrays, no cap — the type graph is acyclic), naming the innermost field. Corpus: 0 files.
+The wider hole (plain declaration / alloc / pool / array of such a struct) is a language
+decision — limitations.md. Tests: `tests/zer_fail/designated_init_omits_nonnull_*_bug1126.zer`.
+
+### BUG-1127 — a designated initializer at GLOBAL scope was refused for every field type
+`S s = { .f = 5 };` at file scope: "cannot initialize 's' of type 'S' with 'void'" (open since
+2026-09-06). The global path never called `validate_struct_init`, so the literal kept
+`check_expr`'s placeholder type. Fixed, and the two defects behind it with it:
+- a MUTABLE global anywhere in a global initializer (`u32 x = m + 1;`, `{ .f = m }`, `&arr[i]`)
+  reached GCC as "initializer element is not constant" — BUG-997 tested only a bare top-level
+  name. `global_init_scan` now takes the Checker and resolves identifiers; a global ARRAY named
+  bare is its ADDRESS (constant) and indexing it is a read; `&x` / `&x.f` are address constants;
+  an assignment's VALUE is visited before its target so the specific reason wins.
+- the global value-flow site lacked the array -> slice coercion: `[*]u8 s = buf;` emitted
+  `s = buf` (GCC "invalid initializer") — masked because BUG-997's name rule refused it first.
+Tests: `tests/zer/global_designated_init_bug1127.zer`, `tests/zer_fail/global_init_mutable_{in_expr,in_field,index}_bug1127.zer`.
+
+### BUG-1128 — calling a function defined LATER did not build for any non-`int` return
+The checker registers every declaration before checking a body, so ZER allows use before
+definition — and the emitter wrote NO prototypes, leaving C's implicit `int f()`. `u64 later()`
+called from an earlier `main` was "conflicting types for 'later'"; a struct / optional / pointer
+return the same; a funcptr global initialised with a later function "undeclared". (GCC 14 makes
+the implicit declaration itself an error.) `emit_func_prototype` emits one for every function
+with a body, after the type passes and before any function or global, through the same
+attribute / head / name / params / tail helpers as the definition. Test:
+`tests/zer/forward_call_nonint_bug1128.zer`.
 
 ### BUG-1124 — a pointer RETARGETED after its declaration hid its real target from the race rules
 **Symptom.** `volatile *u32 gp = &d; void aim() { gp = &g; }` then `*gp += 1` in main with an

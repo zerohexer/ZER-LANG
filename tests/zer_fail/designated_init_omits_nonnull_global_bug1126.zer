@@ -1,0 +1,5 @@
+// expect-error: designated initializer omits field '.p'
+// BUG-1126: the same at global scope (reachable since BUG-1127).
+struct H { u32 a; *u32 p; }
+H w = { .a = 1 };
+u32 main(){ return *w.p; }

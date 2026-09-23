@@ -5636,6 +5636,33 @@ static void emit_func_decl(Emitter *e, Node *node) {
     emit(e, ";\n\n");
 }
 
+/* BUG-1128: a PROTOTYPE for every function with a body, emitted before any
+ * function or global that could name it. The checker registers every
+ * declaration before checking any body, so ZER lets a function be used before
+ * its definition — and the emitter wrote no prototype, leaving C's implicit
+ * `int f()` declaration: `u64 later()` called from an earlier `main` was
+ * "conflicting types for 'later'", a struct / optional / pointer return the same,
+ * and a funcptr global initialised with a later function "undeclared". GCC 14
+ * makes the implicit declaration itself an error. Same helpers as the definition
+ * (attributes, head, mangled name, params, tail), so the two cannot disagree.
+ * `main` is skipped (its return type may be promoted to int); comptime and async
+ * functions do not exist as plain C functions. */
+static void emit_func_prototype(Emitter *e, Node *node) {
+    if (node->kind != NODE_FUNC_DECL || !node->func_decl.body) return;
+    if (node->func_decl.is_comptime || node->func_decl.is_async) return;
+    if (!e->current_module && node->func_decl.name_len == 4 &&
+        memcmp(node->func_decl.name, "main", 4) == 0) return;
+    Type *func_type = checker_get_type(e->checker, node);
+    Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
+        func_type->func_ptr.ret : NULL;
+    emit_func_attributes(e, node);
+    emit_func_decl_head(e, ret, false);
+    EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
+    emit_func_decl_params(e, node, func_type);
+    emit_func_decl_tail(e, ret, false);
+    emit(e, ";\n");
+}
+
 static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
     /* BUG-997: mark the global-initializer context for the whole emission, so a
@@ -5825,7 +5852,17 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
             }
             if (!emitted_const) {
                 emit(e, " = ");
-                emit_expr(e, node->var_decl.init);
+                /* BUG-1127: the array -> slice coercion, at the GLOBAL value-flow
+                 * site. `[*]u8 s = buf;` emitted `s = buf;` ("invalid initializer"
+                 * from GCC) — masked until now because BUG-997's checker rule
+                 * refused the bare global name before the emitter saw it. */
+                Type *gd = type_unwrap_distinct(type);
+                Type *gv = gi_type ? type_unwrap_distinct(gi_type) : NULL;
+                if (gd && gv && type_dispatch_kind(gd) == TYPE_SLICE &&
+                    type_dispatch_kind(gv) == TYPE_ARRAY)
+                    emit_array_as_slice(e, node->var_decl.init, gv, gd);
+                else
+                    emit_expr(e, node->var_decl.init);
             }
         }
     } else {
@@ -7257,6 +7294,13 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         }
         emit(e, "\n");
     }
+
+    /* BUG-1128: prototypes for every function with a body — after every type
+     * they can name, before any function or global initializer that names them. */
+    emit(e, "\n/* ZER function prototypes */\n");
+    for (int i = 0; i < file_node->file.decl_count; i++)
+        emit_func_prototype(e, file_node->file.decls[i]);
+    emit(e, "\n");
 
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);

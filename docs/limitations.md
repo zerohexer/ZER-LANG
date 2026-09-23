@@ -1586,39 +1586,41 @@ leaking it"*.)
 
 ---
 
-## OPEN — a DESIGNATED INITIALIZER does not work at GLOBAL scope, for ANY field type (2026-09-06, MEDIUM — over-rejection, valid program refused)
+## CLOSED 2026-09-23 (BUG-1127) — a designated initializer at GLOBAL scope
 
-Found while measuring item J's sinks; not reported by any branch, and NOT
-optional-specific — it was checked against a plain field precisely to find out.
+The global path now types the literal from its destination (`validate_struct_init`, as the
+local path does). Closing it exposed two neighbours, fixed with it: a MUTABLE global named
+anywhere inside a global initializer (`u32 x = m + 1;`, `{ .f = m }`, `&arr[i]`) reached GCC
+as "initializer element is not constant" — `global_init_scan` now resolves identifiers (an
+ARRAY named bare is its address, a constant; indexing it is a read) — and the global
+value-flow site lacked the array -> slice coercion (`[*]u8 s = buf;` emitted `s = buf`).
+Tests: `tests/zer/global_designated_init_bug1127.zer`, `tests/zer_fail/global_init_mutable_*_bug1127.zer`.
 
-```zer
-struct S { u32 f; }
-S s = { .f = 5 };            // global
-u32 main(){ return s.f; }
-```
+## OPEN — a non-null `*T` / funcptr FIELD is zero (NULL) wherever a struct is zero-initialized (2026-09-23, MEDIUM — accept-unsafe; loud on hosted, SILENT on bare metal)
 
-MEASURED on main at `41ebfb4b`:
+`nonnull_zero_hole` (BUG-866/893) refuses `*u32 p;` — a declaration whose zero is a NULL the
+type forbids. The same zero reaches a non-null FIELD through every other zero-initialization,
+and none is refused. MEASURED, each compiles clean and dereferences address 0:
 
-```
-error: cannot initialize 's' of type 'S' with 'void'
-```
+    struct H { u32 a; *u32 p; }
+    H w;                    return *w.p;     // local or global plain declaration
+    *H h = alloc(H) ...;    *h.p             // heap / Pool / Slab / Arena slot (zeroed)
+    H[2] hs;                *hs[1].p         // array element
 
-The identical initializer in a LOCAL declaration builds and returns 5. Measured across
-four field shapes — plain `u32`, `?u32 = 5`, `?u32 = null`, and the field omitted
-entirely — all four are rejected at global scope with the same message.
+On a hosted build the preamble's SIGSEGV handler turns the read into a trap (exit 133, no
+message). On bare metal reading address 0 SUCCEEDS (on Cortex-M it is the initial stack
+pointer) — a silent wrong value, and a write there is a silent corruption.
 
-The message is the tell: the struct-init expression is typed **`void`** at global scope,
-i.e. the checker never typed it at all, rather than typing it and finding a mismatch. So
-this is likely one missing `check_expr` on the global-var init path, not a coercion gap.
-
-`docs/reference.md` shows designated initializers only in function scope
-(`Point p = { .x = 10, .y = 20 };`, assignment, call argument, return), and NO test in
-the tree performs one at global scope — which is why it has survived. It is an
-over-rejection, not a soundness hole: the program is refused, never miscompiled.
-
-Tripwire: none yet — write the positive in the same commit as the fix.
-
----
+BUG-1126 closed the one spelling where the author explicitly wrote an initializer and left the
+field out (`H w = { .a = 1 };`, including a nested by-value struct, at every value-flow sink).
+The rest is a LANGUAGE decision, not a missed site: `alloc(T)` and `Pool` slots are zeroed by
+design, so a non-null field in an allocatable struct is incoherent with universal auto-zero
+unless something establishes it before first use. Options, none taken: (a) refuse a struct
+with a non-null pointer field wherever it is zero-initialized (measured by the BUG-893 author
+at 34 affected corpus files — "a much wider rule"); (b) a definite-initialization analysis per
+object (Rust's route; a new analysis); (c) guard every read of a non-null FIELD with a null
+check (cheap, loud on bare metal too, but it makes `*T` non-null only by trap). Needs the
+owner's call; (c) is the smallest sound step.
 
 ## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned (2026-09-09, LOW — over-rejection, valid program refused)
 

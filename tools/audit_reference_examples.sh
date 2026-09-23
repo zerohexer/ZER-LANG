@@ -245,6 +245,22 @@ while IFS=$'\t' read -r LN MODE F HASH ARG; do
         fail "$LN" "    'expect-trap' needs a block with its own main()"
         continue
     fi
+    # A block that is NOT run is still BUILT by GCC (syntax only): the checker
+    # accepting it is not evidence the emitted C is valid. Measured 2026-09-23:
+    # a @pun example at global scope passed here for months while emitting a
+    # statement expression at file scope. Exempt only what a hosted GCC cannot
+    # judge: an `interrupt` handler (GCC refuses ISRs on hosted x86-64) and a
+    # `cinclude` of a header that exists only in the reader's project.
+    if ! { [ $TOP = 1 ] && has_main "$F"; } || [ "$MODE" = "compile-only" ]; then
+        if ! grep -qE '^[[:space:]]*(interrupt|cinclude)[[:space:]]' "$F"; then
+            GOUT=$(gcc -std=c99 -fwrapv -fno-strict-aliasing -fsyntax-only "$SRC.c" 2>&1)
+            if [ $? -ne 0 ]; then
+                fail "$LN" "    passes the checker but the emitted C does not BUILD:" \
+                     "$(echo "$GOUT" | grep -m3 'error')"
+                continue
+            fi
+        fi
+    fi
     [ $TOP = 1 ] && has_main "$F" || continue
     if [ "$MODE" = "compile-only" ]; then NORUN=$((NORUN+1)); continue; fi
     [ "$RUN" = "1" ] || continue

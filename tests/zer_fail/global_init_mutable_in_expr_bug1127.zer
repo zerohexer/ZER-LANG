@@ -1,0 +1,5 @@
+// expect-error: cannot be initialized from 'm'
+// BUG-1127: a MUTABLE global inside a global initializer reached GCC as "initializer element is not constant" (BUG-997 checked only a bare top-level name).
+u32 m = 3;
+u32 x = m + 1;
+u32 main(){ return x - 4; }

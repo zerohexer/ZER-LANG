@@ -379,7 +379,12 @@ static const char *global_init_node_reason(Node *n, Type *type) {
 
 /* Walk the whole initializer tree; report the FIRST offending node. `*bad` is
  * set to that node so the caller can name the construct. */
-static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) {
+/* BUG-1127: `c` resolves identifiers — a MUTABLE global named anywhere in the tree
+ * is not a compile-time constant (BUG-997 checked only a bare top-level ident, so
+ * `u32 x = m + 1;` and `S s = { .f = m };` reached GCC as "initializer element is
+ * not constant" against the generated file). */
+static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t name_len);
+static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, Node **bad) {
     if (!n) return NULL;
     /* BUG-1016: NULL past the cap read as "nothing offending", so a call hidden 200
      * terms down a flat chain (`u32 g = f() + 1 + ... ;`) passed this scan and reached
@@ -392,16 +397,56 @@ static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) 
     }
     const char *r = global_init_node_reason(n, type);
     if (r) { *bad = n; return r; }
-    #define GI(x) do { const char *_r = global_init_scan((x), type, depth+1, bad); \
+    #define GI(x) do { const char *_r = global_init_scan(c, (x), type, depth+1, bad); \
                        if (_r) return _r; } while (0)
     switch (n->kind) {
     case NODE_BINARY: GI(n->binary.left); GI(n->binary.right); break;
-    case NODE_UNARY: GI(n->unary.operand); break;
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP) {
+            /* `&g`, `&g.f`, `&g[2]` are ADDRESS constants: the root names the
+             * object, it does not read it. An index expression is still a read. */
+            Node *r = n->unary.operand;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+                if (r->kind == NODE_INDEX) GI(r->index_expr.index);
+                r = (r->kind == NODE_FIELD) ? r->field.object : r->index_expr.object;
+            }
+            if (r && r->kind != NODE_IDENT) GI(r);
+            break;
+        }
+        GI(n->unary.operand);
+        break;
     case NODE_TYPECAST: GI(n->typecast.expr); break;
     case NODE_ORELSE: GI(n->orelse.expr); GI(n->orelse.fallback); break;
-    case NODE_INDEX: GI(n->index_expr.object); GI(n->index_expr.index); break;
+    case NODE_INDEX: {
+        /* Indexing READS the element. A global ARRAY named bare is its address
+         * (see NODE_IDENT), so the root of an index chain is checked here, as a
+         * read, rather than by the identifier arm. */
+        Node *r = n;
+        while (r && (r->kind == NODE_INDEX || r->kind == NODE_FIELD))
+            r = (r->kind == NODE_INDEX) ? r->index_expr.object : r->field.object;
+        if (c && r && r->kind == NODE_IDENT) {
+            Symbol *gs = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
+            if (gs && !gs->is_function && !gs->is_const && gs->func_node &&
+                gs->func_node->kind == NODE_GLOBAL_VAR) {
+                *bad = r;
+                return "names a MUTABLE global, which is not a compile-time constant";
+            }
+        }
+        GI(n->index_expr.object); GI(n->index_expr.index);
+        break;
+    }
     case NODE_SLICE: GI(n->slice.object); GI(n->slice.start); GI(n->slice.end); break;
-    case NODE_FIELD: GI(n->field.object); break;
+    case NODE_FIELD:
+        /* `arr.len` of a FIXED array is its size — a constant, not a read. */
+        if (c && n->field.field_name_len == 3 &&
+            memcmp(n->field.field_name, "len", 3) == 0 && n->field.object &&
+            n->field.object->kind == NODE_IDENT) {
+            Symbol *os = global_decl_lookup(c, n->field.object->ident.name,
+                                            (uint32_t)n->field.object->ident.name_len);
+            if (os && os->type && type_dispatch_kind(os->type) == TYPE_ARRAY) break;
+        }
+        GI(n->field.object);
+        break;
     case NODE_CALL:
         GI(n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++) GI(n->call.args[i]);
@@ -413,7 +458,9 @@ static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) 
         for (int i = 0; i < n->struct_init.field_count; i++)
             GI(n->struct_init.fields[i].value);
         break;
-    case NODE_ASSIGN: GI(n->assign.target); GI(n->assign.value); break;
+    /* value FIRST: `u32 G = (x = f());` is refused for the call (the specific
+     * reason); `(x = 5)` is still refused, for naming the mutable `x`. */
+    case NODE_ASSIGN: GI(n->assign.value); GI(n->assign.target); break;
     /* A global initializer is an EXPRESSION, so no statement kind can occur
      * below here. They are still descended rather than listed as no-op leaves:
      * the walker-field audit's rule is that an arm naming a kind must visit its
@@ -452,7 +499,21 @@ static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) 
     case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_IDENT:
+        if (c) {
+            Symbol *gs = global_decl_lookup(c, n->ident.name, (uint32_t)n->ident.name_len);
+            /* A global ARRAY named bare is its ADDRESS (array-to-slice/pointer
+             * decay, `buf[0..2]`) — a constant. Reads of it are indexing, above;
+             * copying a whole array into a global array is refused separately. */
+            if (gs && !gs->is_function && !gs->is_const && gs->func_node &&
+                gs->func_node->kind == NODE_GLOBAL_VAR &&
+                !(gs->type && type_dispatch_kind(gs->type) == TYPE_ARRAY)) {
+                *bad = n;
+                return "names a MUTABLE global, which is not a compile-time constant";
+            }
+        }
+        break;
+    case NODE_CAST: case NODE_SIZEOF:
         break;
     }
     #undef GI
@@ -476,7 +537,9 @@ static const char *global_init_scan(Node *n, Type *type, int depth, Node **bad) 
  * `*is_func` distinguishes the two messages. Declaration level only: a non-null
  * pointer FIELD inside a struct is the same hazard but a much wider rule, and
  * that variant was measured at 34 affected corpus files, so it is deliberately
- * out of scope here (see docs/limitations.md). */
+ * out of scope here — docs/limitations.md "a non-null `*T` / funcptr FIELD is
+ * zero (NULL) wherever a struct is zero-initialized". The designated-initializer
+ * spelling of it IS refused (BUG-1126, zero_value_nonnull_leaf). */
 static Type *nonnull_zero_hole(Type *t, bool *is_func) {
     *is_func = false;
     if (!t) return NULL;
@@ -5460,6 +5523,36 @@ static const char *auto_slab_method_label(Checker *c, Type *obj, const char *met
  * Checks: all field names exist, all field value types match.
  * Used at 4 value-flow sites: var-decl, assignment, call arg, return. */
 static void check_inttoptr_dest_volatile(Checker *c, Node *init, Type *dest, int line);  /* fwd */
+/* BUG-1126: does the ZERO value of this type contain a pointer the type promises
+ * is non-null? A `*T` / funcptr is one itself; a by-value struct or an array
+ * holds one if any member does. A union's zero is not read without a tag and an
+ * optional's zero is `null`, a legal value, so neither counts. No depth cap: a
+ * by-value struct cannot contain itself (the checker refuses it), so the walk
+ * over the type graph terminates on its own. `*leaf` names the offending field
+ * of the innermost struct (NULL when `t` itself is the pointer). */
+static Type *zero_value_nonnull_leaf(Type *t, const SField **leaf) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (!u) return NULL;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_POINTER: case TYPE_FUNC_PTR:
+        return u;
+    case TYPE_ARRAY:
+        return zero_value_nonnull_leaf(u->array.inner, leaf);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
+            const SField *f = &u->struct_type.fields[i];
+            Type *hit = zero_value_nonnull_leaf(f->type, leaf);
+            if (hit) {
+                if (!*leaf) *leaf = f;
+                return hit;
+            }
+        }
+        return NULL;
+    default:
+        return NULL;
+    }
+}
+
 static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
     Type *st = type_unwrap_distinct(target_type);
     if (st->kind != TYPE_STRUCT) {
@@ -5528,6 +5621,41 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                 "struct '%s' has no field '%.*s'",
                 type_name(target_type), (int)df->name_len, df->name);
         }
+    }
+    /* BUG-1126: an OMITTED field is zero. When that zero is a NULL the field's type
+     * forbids, the initializer has produced a value the type system promises cannot
+     * exist — `H w = { .a = 1 };` with `*u32 p` then `*w.p` dereferenced address 0
+     * (a trap on the host; on bare metal a silent read of the vector table). The
+     * author wrote an initializer, so naming the missing field is the whole fix. */
+    for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
+        const SField *sf = &st->struct_type.fields[si];
+        bool named = false;
+        for (int fi = 0; fi < sinit->struct_init.field_count && !named; fi++) {
+            DesigField *df = &sinit->struct_init.fields[fi];
+            named = sf->name_len == (uint32_t)df->name_len &&
+                    memcmp(sf->name, df->name, sf->name_len) == 0;
+        }
+        if (named) continue;
+        const SField *leaf = NULL;
+        Type *hit = zero_value_nonnull_leaf(sf->type, &leaf);
+        if (!hit) continue;
+        char tb[128];
+        snprintf(tb, sizeof(tb), "%s", type_name(hit));
+        if (!leaf) {
+            checker_error(c, line,
+                "designated initializer omits field '.%.*s' — its type '%s' is "
+                "non-null, and an omitted field is zero (NULL). Initialize it, or "
+                "declare the field '?%s'",
+                (int)sf->name_len, sf->name, tb, tb);
+        } else {
+            checker_error(c, line,
+                "designated initializer omits field '.%.*s', whose field '.%.*s' is "
+                "a non-null '%s' — an omitted field is zero (NULL). Initialize "
+                "'.%.*s', or declare '.%.*s' as '?%s'",
+                (int)sf->name_len, sf->name, (int)leaf->name_len, leaf->name, tb,
+                (int)sf->name_len, sf->name, (int)leaf->name_len, leaf->name, tb);
+        }
+        return false;
     }
     return true;
 }
@@ -27912,9 +28040,18 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             Node *ginit = decl->var_decl.init;
             {
                 Node *bad = NULL;
-                const char *reason = global_init_scan(ginit, type, 0, &bad);
+                const char *reason = global_init_scan(c, ginit, type, 0, &bad);
                 if (reason && bad) {
-                    if (bad->kind == NODE_CALL) {
+                    if (bad->kind == NODE_IDENT) {
+                        checker_error(c, decl->loc.line,
+                            "global variable '%.*s' cannot be initialized from '%.*s' — "
+                            "a global initializer must be a compile-time constant and "
+                            "'%.*s' is mutable. Declare it 'const', or assign in an "
+                            "init function",
+                            (int)decl->var_decl.name_len, decl->var_decl.name,
+                            (int)bad->ident.name_len, bad->ident.name,
+                            (int)bad->ident.name_len, bad->ident.name);
+                    } else if (bad->kind == NODE_CALL) {
                         checker_error(c, decl->loc.line,
                             "global variable '%.*s' initializer must be a constant "
                             "expression — %s",
@@ -27940,20 +28077,8 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * is rejected here, at the ZER line, rather than by GCC in a generated
              * file. Function names (a funcptr global) and enum variants
              * (NODE_FIELD) are unaffected. */
-            if (ginit->kind == NODE_IDENT) {
-                Symbol *gsrc = global_decl_lookup(c,
-                    ginit->ident.name, (uint32_t)ginit->ident.name_len);
-                if (gsrc && !gsrc->is_function && !gsrc->is_const) {
-                    checker_error(c, decl->loc.line,
-                        "global variable '%.*s' cannot be initialized from '%.*s' — "
-                        "a global initializer must be a compile-time constant and "
-                        "'%.*s' is mutable. Declare it 'const', or assign in an "
-                        "init function",
-                        (int)decl->var_decl.name_len, decl->var_decl.name,
-                        (int)ginit->ident.name_len, ginit->ident.name,
-                        (int)ginit->ident.name_len, ginit->ident.name);
-                }
-            }
+            /* BUG-997's top-level `ginit->kind == NODE_IDENT` check lives inside
+             * global_init_scan_c now (BUG-1127), at EVERY node of the tree. */
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */
             if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {
                 checker_error(c, decl->loc.line,
@@ -27965,6 +28090,16 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 /* BUG-939: retype wherever a constant FLOWS — see the assignment sink. */
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
+            }
+            /* Designated initializer: the struct literal is typed by its
+             * DESTINATION, exactly as at a local declaration (check_expr leaves
+             * it `void` — context supplies the type). This call was missing here,
+             * so every `S s = { .f = 5 };` at file scope was refused as "cannot
+             * initialize 's' of type 'S' with 'void'". */
+            if (decl->var_decl.init->kind == NODE_STRUCT_INIT && type &&
+                validate_struct_init(c, decl->var_decl.init, type, decl->loc.line)) {
+                init = type;
+                typemap_set(c, decl->var_decl.init, type);
             }
             reject_unique_resource_copy(c, decl->var_decl.init, type,
                                         decl->loc.line, "initialize");

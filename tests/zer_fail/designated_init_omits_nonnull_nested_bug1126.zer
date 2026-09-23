@@ -1,0 +1,7 @@
+// expect-error: omits field '.in', whose field '.q' is a non-null
+// BUG-1126: through an omitted nested by-value struct.
+struct In { *u32 q; }
+struct H { u32 a; In in; }
+u32 c;
+H w = { .a = 1 };
+u32 main(){ return *w.in.q; }

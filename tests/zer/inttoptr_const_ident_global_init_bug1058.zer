@@ -1,0 +1,8 @@
+// BUG-1058: a `const`-ident address in a GLOBAL initializer. The checker folds it
+// (BUG-996), but the emitter treated anything that was not a literal as a runtime
+// address and emitted a statement expression at file scope ("braced-group within
+// expression allowed only inside a function").
+mmio 0x40000000..0x400000FF;
+const u32 BASE = 0x40000000;
+volatile *u32 greg = @inttoptr(*u32, BASE);
+u32 main() { return 0; }

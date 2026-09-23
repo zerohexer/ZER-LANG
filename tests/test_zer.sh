@@ -16,6 +16,13 @@
 # run "against the baseline" proves nothing). The integration runner was the last
 # harness without the override; added 2026-09-15 while proving BUG-1019's trap
 # tests discriminate.
+# Per-run diagnostic files. These were the fixed paths /tmp/_zer_neg_err.txt and
+# /tmp/_zer_gap_err.txt, so two concurrent runs (a `make check` beside a hand run,
+# or two worktrees) read each other's diagnostics and reported "rejected, but for
+# the WRONG REASON" on correct negatives — 84 of them in one measured collision.
+NEG_ERR=$(mktemp "${TMPDIR:-/tmp}/zer_neg_err.XXXXXX")
+GAP_ERR=$(mktemp "${TMPDIR:-/tmp}/zer_gap_err.XXXXXX")
+trap 'rm -f "$NEG_ERR" "$GAP_ERR"' EXIT
 ZERC="${ZER_MATRIX_ZERC:-./zerc}"
 EXTRA_FLAGS="$1"
 PASS=0
@@ -167,7 +174,7 @@ for f in tests/zer_fail/*.zer; do
     # exit-code-only behaviour, so nothing breaks and it can be backfilled
     # highest-value-first.
     want=$(head -5 "$f" | grep -oE '// expect-error: .*$' | sed 's|// expect-error: ||')
-    $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>/tmp/_zer_neg_err.txt
+    $ZERC "$f" $EXTRA_FLAGS $file_flags -o /dev/null 2>"$NEG_ERR"
     ret=$?
     if [ $ret -ne 0 ]; then
         # `-- ` before the pattern: without it grep parses an expect-error string
@@ -176,11 +183,11 @@ for f in tests/zer_fail/*.zer; do
         # "--stack-limit must be a positive integer" — the diagnostic contained it
         # verbatim and the test still reported WRONG REASON. Any rule whose message
         # opens with a flag name was untestable through this harness.
-        if [ -n "$want" ] && ! grep -qF -- "$want" /tmp/_zer_neg_err.txt; then
+        if [ -n "$want" ] && ! grep -qF -- "$want" "$NEG_ERR"; then
             FAIL=$((FAIL + 1))
             echo "  FAIL: $name (rejected, but for the WRONG REASON)"
             echo "        expected to contain: $want"
-            echo "        actual: $(head -1 /tmp/_zer_neg_err.txt | cut -c1-100)"
+            echo "        actual: $(head -1 "$NEG_ERR" | cut -c1-100)"
         else
             PASS=$((PASS + 1))
             echo "  PASS: $name (correctly rejected)"
@@ -189,7 +196,7 @@ for f in tests/zer_fail/*.zer; do
         FAIL=$((FAIL + 1))
         echo "  FAIL: $name (should have been rejected but compiled!)"
     fi
-    rm -f /tmp/_zer_neg_err.txt 2>/dev/null
+    : > "$NEG_ERR"
     rm -f "${f%.zer}.c" 2>/dev/null
 done
 
@@ -215,7 +222,7 @@ for f in tests/zer_gaps/*.zer; do
     name=$(basename "$f" .zer)
     GAP_TOTAL=$((GAP_TOTAL + 1))
     maskby=$(head -3 "$f" | grep -oE '// gap-masked-by: .*$' | sed 's|// gap-masked-by: ||')
-    $ZERC "$f" $EXTRA_FLAGS -o /dev/null 2>/tmp/_zer_gap_err.txt
+    $ZERC "$f" $EXTRA_FLAGS -o /dev/null 2>"$GAP_ERR"
     gret=$?
     # `-o /dev/null` is a NON-.c path, so zerc builds the exe NEXT TO THE SOURCE
     # (CLAUDE.md "zerc -o gotchas"). Clean both artefacts or the tree fills with
@@ -229,18 +236,18 @@ for f in tests/zer_gaps/*.zer; do
     # its own options. The two sites answer the same question and must not
     # drift; fixing only the one that had been measured is the sibling-site
     # mistake this project keeps recording.
-    elif [ -n "$maskby" ] && grep -qF -- "$maskby" /tmp/_zer_gap_err.txt; then
+    elif [ -n "$maskby" ] && grep -qF -- "$maskby" "$GAP_ERR"; then
         GAP_OK=$((GAP_OK + 1))
         echo "  ok:   $name (known masking: $maskby)"
     else
         GAP_FAIL=$((GAP_FAIL + 1))
         echo "  FAIL: $name — no longer exhibits its gap"
-        echo "        $(head -1 /tmp/_zer_gap_err.txt | cut -c1-96)"
+        echo "        $(head -1 "$GAP_ERR" | cut -c1-96)"
         echo "        -> if the gap CLOSED: verify it is the right rule, move to"
         echo "           tests/zer_fail/ with an // expect-error:, update limitations.md"
         echo "        -> if a DIFFERENT rule now masks it: add // gap-masked-by: <substring>"
     fi
-    rm -f /tmp/_zer_gap_err.txt 2>/dev/null
+    : > "$GAP_ERR"
 done
 echo "  gaps: $GAP_OK/$GAP_TOTAL accounted for, $GAP_FAIL needing triage"
 if [ $GAP_FAIL -ne 0 ]; then

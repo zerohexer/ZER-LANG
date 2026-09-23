@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot form a mutable slice over a const array field
+// BUG-1057, const sibling: a writable view into a `const` struct's array field.
+struct R { u32[4] arr; }
+u32 main() { const R cr; [*]u32 t = cr.arr; t[1] = 2; return cr.arr[1]; }

@@ -1,0 +1,23 @@
+// BUG-1057: a slice over an array FIELD keeps the memory's qualifiers — the
+// accepted spellings: a `volatile [*]T` view of a volatile block's field, a
+// `const [*]T` view of a const struct's field, and an ordinary field view.
+struct Fifo { u32[4] slot; }
+volatile Fifo gdev;
+struct Tab { u32[4] v; }
+
+void kick(volatile [*]u32 s) { s[0] = 1; s[0] = 2; }
+u32 sum(const [*]u32 s) { u32 t = 0; for (u32 i = 0; i < s.len; i += 1) { t += s[i]; } return t; }
+void fill([*]u32 s) { s[1] = 7; }
+
+u32 main() {
+    kick(gdev.slot);
+    volatile [*]u32 w = gdev.slot;
+    w[1] = 3;
+    const Tab ct;
+    Tab loc;
+    fill(loc.v);
+    if (gdev.slot[0] != 2 || gdev.slot[1] != 3) { return 1; }
+    if (sum(ct.v) != 0) { return 2; }
+    if (loc.v[1] != 7) { return 3; }
+    return 0;
+}

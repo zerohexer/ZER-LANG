@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot form a slice over an array field of a packed struct
+// BUG-1057: the ASSIGN sink never called the packed-view reporter (BUG-972 wired
+// seven other sinks), so `s = p.w;` formed a misaligned u32 view.
+packed struct P { u8 a; u32[2] w; }
+P gp;
+u32 main() { [*]u32 s = gp.w[0..0]; s = gp.w; return s[0]; }

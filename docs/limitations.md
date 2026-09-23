@@ -137,17 +137,6 @@ resolver answers the same question with `global_name_never_mutated` (refuses to 
 reassigned funcptr), which is the conservative form; the data-pointer rules could adopt it
 (treat such a pointer as "may designate any address-taken global") if a program ever needs it.
 
-## OPEN — `u8[K] buf;` with a local `const usize K = @size(T);` is refused as "not a compile-time constant" (2026-09-23, LOW — over-rejection)
-
-`u8[@size(T)] buf;` works (folded through `compute_type_size`); binding the same value to a
-`const` first does not. Found writing BUG-1059h's test.
-
-## OPEN — `opt_struct = { .x = 1 };` into a `?Struct` is refused (2026-09-23, LOW — over-rejection)
-
-"designated initializer requires struct type, got '?P'" — the var-decl / assignment sink does
-not unwrap the optional before validating the literal. Workaround: build the struct, then
-assign it.
-
 ## OPEN — the preamble includes `<string.h>`, `<stdio.h>`, `<stdlib.h>` unconditionally (2026-09-23, LOW — loud)
 
 C99 4.6 guarantees only the freestanding headers; a `-nostdinc` bare-metal toolchain fails on
@@ -1585,6 +1574,12 @@ leaking it"*.)
 ```
 
 ---
+
+## CLOSED 2026-09-23 (BUG-1150, BUG-1151) — `opt = { .x = 1 }` into a `?Struct`; `u8[K]` with `const K = @size(T)`
+
+Both were over-rejections; the second hid four wrong-size computations, one of them an OOB read
+(BUGS-FIXED BUG-1151). Only a `@size(T)` whose size is the PLATFORM's (a Semaphore / Barrier /
+allocator member) is still refused as an array size — honestly, instead of a length-0 array.
 
 ## CLOSED 2026-09-23 (BUG-1127) — a designated initializer at GLOBAL scope
 

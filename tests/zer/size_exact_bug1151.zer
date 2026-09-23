@@ -1,0 +1,28 @@
+// BUG-1151: the checker's @size disagreed with C's sizeof. `width / 8` sized a u21
+// at 2 bytes (carrier uint32_t = 4) and a u3 at 0; unknown members were GUESSED
+// (4 bytes); an optional's alignment was taken from its SIZE; and a pointer-family
+// @size was deferred to sizeof while the checker modelled the array as length 0.
+// Every compile-time size below is asserted against the RUNTIME @size (sizeof).
+struct Q { u3 a; u8 b; }
+struct R { u21 v; }
+struct S3 { u8 a; u8 b; u8 c; }
+struct F { u8 a; *(u32) -> u32 cb; }
+struct T { u32 a; u32 b; }
+const usize GK = @size(T);
+u32 main() {
+    u8[@size(Q)] q;      usize rq = @size(Q);
+    u8[@size(R)] r;      usize rr = @size(R);
+    u8[@size(u21)] w;    usize rw = @size(u21);
+    u8[@size(?S3)] o;    usize ro = @size(?S3);
+    u8[@size(*u32)] p;   usize rp = @size(*u32);
+    u8[@size(F)] f;      usize rf = @size(F);
+    const usize K = @size(T);
+    u8[K] k;
+    u8[GK] gk;
+    u8[@size(T) * 2] twice;
+    if (q.len != rq || r.len != rr || w.len != rw) { return 1; }
+    if (o.len != ro || p.len != rp || f.len != rf) { return 2; }
+    if (k.len != 8 || gk.len != 8 || twice.len != 16) { return 3; }
+    p[rp - 1] = 1;       // the last byte of a pointer-sized array is in bounds
+    return 0;
+}

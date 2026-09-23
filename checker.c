@@ -4174,8 +4174,11 @@ static void rmw_alias_reset(void) { _rmw_alias_count = 0; _rmw_flagged_rmw = fal
  * global the function does alias, the message stays true about the operation being a
  * non-atomic RMW, and the alternative (silence) is a shipped data race. */
 static Symbol *rmw_alias_lookup(const char *n, uint32_t l) {
+    /* BUG-1129: a name may hold several rows (one per global it designates) and a
+     * REBIND clears the old ones to NULL, so the answer is the first live row. */
     for (int i = 0; i < _rmw_alias_count; i++)
-        if (_rmw_alias[i].len == l && memcmp(_rmw_alias[i].name, n, l) == 0)
+        if (_rmw_alias[i].global && _rmw_alias[i].len == l &&
+            memcmp(_rmw_alias[i].name, n, l) == 0)
             return _rmw_alias[i].global;
     if (_rmw_alias_overflow && _rmw_alias_count > 0)
         return _rmw_alias[_rmw_alias_count - 1].global;
@@ -4187,22 +4190,30 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth);
 typedef void (*WriteTargetFn)(Checker *c, Symbol *g, void *ud);
 static void for_each_write_target_ex(Checker *c, Node *target, bool names_pointee,
                                      WriteTargetFn fn, void *ud);
-/* Which global does this call ARGUMENT designate? `&counter` directly, or an
- * ident already bound to one (so `mid(p)` forwards the binding to `inner`). */
-static Symbol *rmw_arg_target_global(Checker *c, Node *arg) {
-    arg = unwrap_ptr_launder(arg);
-    if (!arg) return NULL;
-    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
-        return resolve_write_target_global(c, arg->unary.operand, 0);
-    /* BUG-1046 (fifth vehicle): the carrier's FIELD / element passed directly —
-     * `h.p = &g; bump(h.p);`. The carrier fact is keyed by the ROOT name, so a
-     * projection resolves through its root (any field of a carrier bound to g is
-     * taken to designate g — the over-approximating side). */
-    while (arg && (arg->kind == NODE_FIELD || arg->kind == NODE_INDEX))
-        arg = (arg->kind == NODE_FIELD) ? arg->field.object : arg->index_expr.object;
-    if (arg && arg->kind == NODE_IDENT)
-        return rmw_alias_lookup(arg->ident.name, (uint32_t)arg->ident.name_len);
-    return NULL;
+/* A stack-first Symbol set (16 inline, doubled into the arena past that). */
+typedef struct {
+    Symbol **v;
+    int n, cap;
+    Symbol *stack[16];
+} SymSet;
+static void symset_init(SymSet *ss) {
+    ss->v = ss->stack; ss->n = 0;
+    ss->cap = (int)(sizeof(ss->stack) / sizeof(ss->stack[0]));
+}
+/* true when `s` was already present (or cannot be recorded) */
+static bool symset_add(Checker *c, SymSet *ss, Symbol *s) {
+    for (int i = 0; i < ss->n; i++)
+        if (ss->v[i] == s) return true;
+    if (ss->n >= ss->cap) {
+        int nc = ss->cap * 2;
+        Symbol **nb = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return true;   /* cannot record: stop rather than loop */
+        memcpy(nb, ss->v, (size_t)ss->n * sizeof(Symbol *));
+        ss->v = nb;
+        ss->cap = nc;
+    }
+    ss->v[ss->n++] = s;
+    return false;
 }
 typedef struct { Symbol *self; WriteTargetFn fn; void *ud; } ArgTargetUd;
 static void arg_target_filter(Checker *c, Symbol *g, void *ud) {
@@ -4231,7 +4242,7 @@ static void rmw_arg_targets(Checker *c, Node *arg, WriteTargetFn fn, void *ud) {
     if (!a || a->kind != NODE_IDENT) return;
     bool any = false;
     for (int i = 0; i < _rmw_alias_count; i++)
-        if (_rmw_alias[i].len == (uint32_t)a->ident.name_len &&
+        if (_rmw_alias[i].global && _rmw_alias[i].len == (uint32_t)a->ident.name_len &&
             memcmp(_rmw_alias[i].name, a->ident.name, _rmw_alias[i].len) == 0) {
             fn(c, _rmw_alias[i].global, ud);
             any = true;
@@ -4282,8 +4293,9 @@ static void isr_opaque_visit(Checker *c, Symbol *g, void *ud) {
  *
  * The carrier is ONE fact recorded at the binding — the local's ROOT name now
  * designates `g` — kept in the scans' alias table and in the main-side carrier
- * table (Checker.rmw_ptr_carriers), so `rmw_arg_target_global` resolves `h` and
- * `q` exactly as it resolves `&g`. The funcptr call is answered by the
+ * table (Checker.rmw_ptr_carriers), so `rmw_arg_targets` / `rmw_arg_targets_main`
+ * resolve `h` and `q` exactly as they resolve `&g` (every global a name holds —
+ * BUG-1129 — not only the first). The funcptr call is answered by the
  * argument-precise barrier (BUG-740): a call whose target cannot be seen may
  * read-modify-write anything handed to it by pointer, and ONLY that — flagged
  * with its own wording, because it is not a proven RMW. ---- */
@@ -4298,46 +4310,96 @@ static Node *carrier_root_ident(Node *t) {
 
 /* The global a VALUE makes its receiver point at: `&g` (through any launder), a
  * struct literal with such a field, or either arm of an orelse. NULL otherwise. */
-static Symbol *rmw_arg_target_global_main(Checker *c, Node *arg);
-static Symbol *carrier_value_global(Checker *c, Node *value, int depth, bool main_side) {
-    if (!value || depth > ZER_EXPR_WALK_MAX) return NULL;
+/* BUG-1129: EVERY global a carrier value designates. It returned the FIRST, so
+ * `H h = { .p = &g1, .q = &g2 }; bump(h);` bound `h` to g1 alone and an RMW through
+ * `h.q` in bump landed on nothing (accepted at the main and ISR sites, and named
+ * the wrong global at the spawn site). Every struct-literal field and both orelse
+ * arms contribute; a copied pointer / carrier contributes every target of its
+ * source (the enumerating argument resolvers). */
+static void rmw_arg_targets_main(Checker *c, Node *arg, WriteTargetFn fn, void *ud);
+static void cvg_collect(Checker *c, Symbol *g, void *ud) {
+    if (g && !g->is_function) symset_add(c, (SymSet *)ud, g);
+}
+static void carrier_value_globals(Checker *c, Node *value, int depth, bool main_side,
+                                  SymSet *out) {
+    if (!value || depth > ZER_EXPR_WALK_MAX) return;
     Node *v = unwrap_ptr_launder(value);
-    if (!v) return NULL;
-    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP)
-        return resolve_write_target_global(c, v->unary.operand, 0);
-    /* A COPY of a pointer or carrier that already designates a global —
-     * `volatile *u32 r = q;`, `H k = h;` — designates the same one. Measured
-     * accepted at the main and ISR sinks before this arm existed. */
-    if (v->kind == NODE_IDENT)
-        return main_side ? rmw_arg_target_global_main(c, v) : rmw_arg_target_global(c, v);
+    if (!v) return;
+    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
+        Symbol *g = resolve_write_target_global(c, v->unary.operand, 0);
+        if (g) cvg_collect(c, g, out);
+        return;
+    }
+    /* A COPY of a pointer or carrier that already designates globals —
+     * `volatile *u32 r = q;`, `H k = h;` — designates the same ones. */
+    if (v->kind == NODE_IDENT) {
+        if (main_side) rmw_arg_targets_main(c, v, cvg_collect, out);
+        else rmw_arg_targets(c, v, cvg_collect, out);
+        return;
+    }
     if (v->kind == NODE_STRUCT_INIT) {
-        for (int i = 0; i < v->struct_init.field_count; i++) {
-            Symbol *g = carrier_value_global(c, v->struct_init.fields[i].value, depth + 1, main_side);
-            if (g) return g;   /* one global per carrier — see limitations.md */
-        }
-        return NULL;
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            carrier_value_globals(c, v->struct_init.fields[i].value, depth + 1, main_side, out);
+        return;
     }
     if (v->kind == NODE_ORELSE) {
-        Symbol *g = carrier_value_global(c, v->orelse.expr, depth + 1, main_side);
-        return g ? g : carrier_value_global(c, v->orelse.fallback, depth + 1, main_side);
+        carrier_value_globals(c, v->orelse.expr, depth + 1, main_side, out);
+        carrier_value_globals(c, v->orelse.fallback, depth + 1, main_side, out);
     }
-    return NULL;
 }
 
-/* Scan-side binding into _rmw_alias: update in place (the lookup returns the
- * FIRST match, so an append could never rebind), else append, else overflow. */
-static void rmw_alias_bind(const char *name, uint32_t len, Symbol *g) {
-    if (!name || len == 0 || !g) return;
+/* Scan-side: bind `name` to the SET (rebind — its old rows are cleared first). */
+static void rmw_alias_bind_value(Checker *c, const char *name, uint32_t len, Node *value) {
+    if (!name || len == 0) return;
+    SymSet ss; symset_init(&ss);
+    carrier_value_globals(c, value, 0, false, &ss);
+    if (ss.n == 0) return;
     for (int i = 0; i < _rmw_alias_count; i++)
-        if (_rmw_alias[i].len == len && memcmp(_rmw_alias[i].name, name, len) == 0) {
-            _rmw_alias[i].global = g; return;
-        }
-    if (_rmw_alias_count >= RMW_ALIAS_MAX) { _rmw_alias_overflow = true; return; }
-    _rmw_alias[_rmw_alias_count].name = name;
-    _rmw_alias[_rmw_alias_count].len = len;
-    _rmw_alias[_rmw_alias_count].global = g;
-    _rmw_alias_count++;
+        if (_rmw_alias[i].len == len && memcmp(_rmw_alias[i].name, name, len) == 0)
+            _rmw_alias[i].global = NULL;
+    for (int k = 0; k < ss.n; k++) {
+        if (_rmw_alias_count >= RMW_ALIAS_MAX) { _rmw_alias_overflow = true; return; }
+        _rmw_alias[_rmw_alias_count].name = name;
+        _rmw_alias[_rmw_alias_count].len = len;
+        _rmw_alias[_rmw_alias_count].global = ss.v[k];
+        _rmw_alias_count++;
+    }
 }
+/* Main-side: `rebind` clears the name's rows first (a declaration or a bare-name
+ * assignment); a projection target only ADDS (`h.n = 5` must not forget that
+ * `h.p` points at g). */
+static void carrier_tab_bind_value(Checker *c, const char *name, uint32_t len,
+                                   Node *value, bool rebind) {
+    if (!name || len == 0) return;
+    SymSet ss; symset_init(&ss);
+    carrier_value_globals(c, value, 0, true, &ss);
+    if (rebind)
+        for (int i = 0; i < c->rmw_ptr_carrier_count; i++)
+            if (c->rmw_ptr_carriers[i].name_len == len &&
+                memcmp(c->rmw_ptr_carriers[i].name, name, len) == 0)
+                c->rmw_ptr_carriers[i].global = NULL;
+    for (int k = 0; k < ss.n; k++) {
+        bool have = false;
+        for (int i = 0; i < c->rmw_ptr_carrier_count && !have; i++)
+            have = c->rmw_ptr_carriers[i].global == ss.v[k] &&
+                   c->rmw_ptr_carriers[i].name_len == len &&
+                   memcmp(c->rmw_ptr_carriers[i].name, name, len) == 0;
+        if (have) continue;
+        if (c->rmw_ptr_carrier_count >= c->rmw_ptr_carrier_capacity) {
+            int nc = c->rmw_ptr_carrier_capacity ? c->rmw_ptr_carrier_capacity * 2 : 8;
+            RmwTaintEnt *nt = (RmwTaintEnt *)realloc(c->rmw_ptr_carriers,
+                                                    (size_t)nc * sizeof(*nt));
+            if (!nt) return;
+            c->rmw_ptr_carriers = nt;
+            c->rmw_ptr_carrier_capacity = nc;
+        }
+        c->rmw_ptr_carriers[c->rmw_ptr_carrier_count].name = name;
+        c->rmw_ptr_carriers[c->rmw_ptr_carrier_count].name_len = len;
+        c->rmw_ptr_carriers[c->rmw_ptr_carrier_count].global = ss.v[k];
+        c->rmw_ptr_carrier_count++;
+    }
+}
+
 /* `target = value` inside a scanned body: a LOCAL root (a global carrier is
  * whole-program flow, not this table) that now designates a global. */
 static void rmw_bind_carrier_scan(Checker *c, Node *target, Node *value) {
@@ -4345,12 +4407,10 @@ static void rmw_bind_carrier_scan(Checker *c, Node *target, Node *value) {
     if (!r) return;
     if (global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len))
         return;
-    Symbol *g = carrier_value_global(c, value, 0, false);
-    if (g) rmw_alias_bind(r->ident.name, (uint32_t)r->ident.name_len, g);
+    rmw_alias_bind_value(c, r->ident.name, (uint32_t)r->ident.name_len, value);   /* BUG-1129 */
 }
 static void rmw_bind_carrier_scan_name(Checker *c, const char *name, uint32_t len, Node *value) {
-    Symbol *g = carrier_value_global(c, value, 0, false);
-    if (g) rmw_alias_bind(name, len, g);
+    rmw_alias_bind_value(c, name, len, value);   /* BUG-1129 */
 }
 /* Main-side binding. A bare-ident target REBINDS (and a value from no global
  * clears — `q = other;`); a projection target only ever ADDS (`h.n = 5` must not
@@ -4361,68 +4421,45 @@ static void rmw_bind_carrier_main(Checker *c, Node *target, Node *value) {
     Symbol *rs = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
     Symbol *gs = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
     if (!rs || rs == gs) return;   /* a global carrier: not this table */
-    Symbol *g = carrier_value_global(c, value, 0, true);
-    if (!g && target->kind != NODE_IDENT) return;
-    rmw_tab_set(&c->rmw_ptr_carriers, &c->rmw_ptr_carrier_count,
-                &c->rmw_ptr_carrier_capacity, 0,
-                r->ident.name, (uint32_t)r->ident.name_len, g);
+    carrier_tab_bind_value(c, r->ident.name, (uint32_t)r->ident.name_len, value,
+                           target->kind == NODE_IDENT);   /* BUG-1129 */
 }
-/* The main-side twin of rmw_arg_target_global: `&g`, a carrier-table name, or a
- * pointer local whose declaration bound it to `&g` (the init hop the shared
- * resolver already follows). A VALUE argument copies and designates nothing; a
- * bare global pointer designates its pointee only through that init hop, never
- * ITSELF — that is what the `r == s` test refuses, so the diagnostic can never
- * name `gp` for a write that lands on `*gp`. */
-static Symbol *rmw_arg_target_global_main(Checker *c, Node *arg) {
+/* BUG-1124/1129: what a call ARGUMENT designates, on the main side — `&g`, every
+ * carrier-table row for the argument's root name (a carrier may hold several
+ * globals), and for a bare pointer name every target it was ever aimed at
+ * (`void aim(){ gp = &g; } ... bump(gp);`). A VALUE argument designates nothing;
+ * the pointer itself is never named for a write that lands on its pointee. */
+static void rmw_arg_targets_main(Checker *c, Node *arg, WriteTargetFn fn, void *ud) {
     Node *a = unwrap_ptr_launder(arg);
-    if (!a) return NULL;
-    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP)
-        return resolve_write_target_global(c, a->unary.operand, 0);
-    /* BUG-1046 (fifth vehicle): `bump(h.p)` — resolve a projection through its
-     * root name, as the scan-side twin does. The init-hop fallback below is for
-     * a bare pointer local only. */
+    if (!a) return;
+    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP) {
+        Symbol *g = resolve_write_target_global(c, a->unary.operand, 0);
+        if (g && !g->is_function) fn(c, g, ud);
+        return;
+    }
+    /* `bump(h.p)` resolves through the carrier ROOT (any field of a carrier is
+     * taken to designate every global the carrier holds — the over-approximating
+     * side, as on the scan side). */
     bool projected = false;
     while (a && (a->kind == NODE_FIELD || a->kind == NODE_INDEX)) {
         a = (a->kind == NODE_FIELD) ? a->field.object : a->index_expr.object;
         projected = true;
     }
-    if (!a || a->kind != NODE_IDENT) return NULL;
-    Symbol *g = rmw_tab_lookup(c->rmw_ptr_carriers, c->rmw_ptr_carrier_count,
-                               a->ident.name, (uint32_t)a->ident.name_len);
-    if (g) return g;
-    if (projected) return NULL;
+    if (!a || a->kind != NODE_IDENT) return;
     Symbol *s = scope_lookup(c->current_scope, a->ident.name, (uint32_t)a->ident.name_len);
-    if (!s || s->is_function || !s->type) return NULL;
-    if (!type_carries_data_pointer(s->type, 0)) return NULL;
-    Symbol *r = resolve_write_target_global(c, a, 0);
-    if (!r || r == s || r->is_function) return NULL;
-    return r;
-}
-/* BUG-1124: the ENUMERATING twin, for the three sinks that act on what a call
- * argument designates. Identical to rmw_arg_target_global_main except for a bare
- * pointer name, which designates EVERY target the pointer was ever aimed at
- * (`void aim(){ gp = &g; } ... bump(gp);` handed `g` to bump while the single
- * resolver named only the initializer's `&d`). A carrier-table hit stays one
- * global: the table records the latest binding in this body. */
-static void rmw_arg_targets_main(Checker *c, Node *arg, WriteTargetFn fn, void *ud) {
-    Node *a = unwrap_ptr_launder(arg);
-    if (!a) return;
-    bool bare = a->kind == NODE_IDENT;
-    Symbol *s = bare ? scope_lookup(c->current_scope, a->ident.name,
-                                    (uint32_t)a->ident.name_len) : NULL;
-    if (bare && s && !s->is_function && s->type && type_carries_data_pointer(s->type, 0)) {
-        /* The carrier table holds this body's LATEST binding; the enumerator adds
-         * every other aim (declaration initializer, reassignments, and through a
-         * copied pointer, ITS aims). Both are reported: the union is the answer. */
-        Symbol *cg = rmw_tab_lookup(c->rmw_ptr_carriers, c->rmw_ptr_carrier_count,
-                                    a->ident.name, (uint32_t)a->ident.name_len);
-        ArgTargetUd u = { s, fn, ud };
-        if (cg) arg_target_filter(c, cg, &u);
+    ArgTargetUd u = { s, fn, ud };
+    /* BUG-1129: EVERY carrier row for the name (a carrier may designate several). */
+    for (int i = 0; i < c->rmw_ptr_carrier_count; i++)
+        if (c->rmw_ptr_carriers[i].global &&
+            c->rmw_ptr_carriers[i].name_len == (uint32_t)a->ident.name_len &&
+            memcmp(c->rmw_ptr_carriers[i].name, a->ident.name,
+                   c->rmw_ptr_carriers[i].name_len) == 0)
+            arg_target_filter(c, c->rmw_ptr_carriers[i].global, &u);
+    if (projected) return;
+    /* BUG-1124: a bare pointer name designates every target it was ever aimed at
+     * (declaration initializer, reassignments, and through a copy, its source's). */
+    if (s && !s->is_function && s->type && type_carries_data_pointer(s->type, 0))
         for_each_write_target_ex(c, a, true, arg_target_filter, &u);
-        return;
-    }
-    Symbol *g = rmw_arg_target_global_main(c, arg);
-    if (g && !g->is_function) fn(c, g, ud);
 }
 static void track_rmw_arg_visit(Checker *c, Symbol *g, void *ud) {
     (void)ud;
@@ -4602,8 +4639,11 @@ static bool assign_reads_own_target(Node *value, Symbol *tgt) {
  */
 static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n,
                               const char *nm, uint32_t nl) {
+    /* BUG-1129: the carrier table may hold several rows per name; a cleared row
+     * is NULL. (The taint table keeps one row per name, so for it this is the
+     * same answer as before.) */
     for (int i = n - 1; i >= 0; i--)
-        if (tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
+        if (tab[i].global && tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
             return tab[i].global;
     return NULL;
 }
@@ -5013,31 +5053,6 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
  * followed, which is the same floor an unresolvable pointer PARAM already sits on
  * (docs/limitations.md). A visited set over pointer Symbols ends `p = q; q = p;`.
  */
-/* A stack-first Symbol set (16 inline, doubled into the arena past that). */
-typedef struct {
-    Symbol **v;
-    int n, cap;
-    Symbol *stack[16];
-} SymSet;
-static void symset_init(SymSet *ss) {
-    ss->v = ss->stack; ss->n = 0;
-    ss->cap = (int)(sizeof(ss->stack) / sizeof(ss->stack[0]));
-}
-/* true when `s` was already present (or cannot be recorded) */
-static bool symset_add(Checker *c, SymSet *ss, Symbol *s) {
-    for (int i = 0; i < ss->n; i++)
-        if (ss->v[i] == s) return true;
-    if (ss->n >= ss->cap) {
-        int nc = ss->cap * 2;
-        Symbol **nb = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
-        if (!nb) return true;   /* cannot record: stop rather than loop */
-        memcpy(nb, ss->v, (size_t)ss->n * sizeof(Symbol *));
-        ss->v = nb;
-        ss->cap = nc;
-    }
-    ss->v[ss->n++] = s;
-    return false;
-}
 typedef struct {
     Checker *c;
     WriteTargetFn fn;
@@ -5094,7 +5109,7 @@ static void write_targets_of_node(WriteTargetWalk *w, Node *target, int depth,
         /* A scan alias bound to several globals (a param handed a retargeted
          * pointer): every entry is a target. */
         for (int i = 0; i < _rmw_alias_count; i++)
-            if (_rmw_alias[i].len == (uint32_t)r->ident.name_len &&
+            if (_rmw_alias[i].global && _rmw_alias[i].len == (uint32_t)r->ident.name_len &&
                 memcmp(_rmw_alias[i].name, r->ident.name, _rmw_alias[i].len) == 0 &&
                 !symset_add(c, &w->emitted, _rmw_alias[i].global))
                 w->fn(c, _rmw_alias[i].global, w->ud);
@@ -18327,10 +18342,9 @@ static void check_stmt(Checker *c, Node *node) {
          * Name-keyed like the taint above; the declaring name rebinds (or clears,
          * for a value from no global), so a shadowing local cannot inherit. */
         if (node->kind == NODE_VAR_DECL && node->var_decl.name)
-            rmw_tab_set(&c->rmw_ptr_carriers, &c->rmw_ptr_carrier_count,
-                        &c->rmw_ptr_carrier_capacity, 0,
-                        node->var_decl.name, (uint32_t)node->var_decl.name_len,
-                        carrier_value_global(c, node->var_decl.init, 0, true));
+            carrier_tab_bind_value(c, node->var_decl.name,
+                                   (uint32_t)node->var_decl.name_len,
+                                   node->var_decl.init, true);   /* BUG-1129 */
         Type *type = resolve_type(c, node->var_decl.type);
         /* void variables are invalid — void is for return types only */
         if (type && type->kind == TYPE_VOID) {

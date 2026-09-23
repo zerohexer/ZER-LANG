@@ -1,0 +1,20 @@
+// expect-trap
+// expect-trap-msg: signed division overflow
+// expect-trap-at: 17
+// BUG-1062: MIN / -1 of a NON-NATIVE signed width was not trapped. Every division
+// site picked the MIN with an 8/16/32/else-64 switch, so an i5 (MIN -16, carried
+// in an int8_t) was compared against INT64_MIN and never matched: `-16 / -1` gave
+// 16 — a value no i5 can hold — on the var-decl path, and -16 on the field path.
+// Now ONE helper spells the MIN of the actual width. The trap also has to name
+// THIS line (BUG-1066: the overflow test used to sit one emitted C line below the
+// zero test, under the same #line, so it reported line + 1).
+u32 main() {
+    volatile i5 va = -16;
+    volatile i5 vb = -1;
+    i5 a = va;
+    i5 b = vb;
+    if (b == 0) { return 9; }
+    i5 r = a / b;
+    if (r > 0) { return 7; }
+    return 0;
+}

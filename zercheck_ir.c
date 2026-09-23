@@ -566,9 +566,16 @@ int ast_name_bind_count(Node *n, const char *name, uint32_t len) {
     if (!n) return 0;
 #define ABC(x) ast_name_bind_count((x), name, len)
 #define SAME(p, l) ((p) && (uint32_t)(l) == len && memcmp((p), name, len) == 0)
+    /* Every child is descended, expressions included. An expression binds no name
+     * ITSELF, but it can CARRY a statement body that does — an orelse BLOCK
+     * fallback (`x orelse { bool c = ...; }`), which is the BUG-1044 lesson: a
+     * body reachable only THROUGH an expression is invisible to a walk over
+     * statement kinds. Counting more is the conservative direction here (callers
+     * ask "exactly one?", so an extra binding can only withhold the relaxation). */
     switch (n->kind) {
     case NODE_VAR_DECL:
-        return (SAME(n->var_decl.name, n->var_decl.name_len) ? 1 : 0);
+        return (SAME(n->var_decl.name, n->var_decl.name_len) ? 1 : 0) +
+               ABC(n->var_decl.init);
     case NODE_BLOCK: {
         int k = 0;
         for (int i = 0; i < n->block.stmt_count; i++) k += ABC(n->block.stmts[i]);
@@ -576,17 +583,20 @@ int ast_name_bind_count(Node *n, const char *name, uint32_t len) {
     }
     case NODE_IF:
         return (SAME(n->if_stmt.capture_name, n->if_stmt.capture_name_len) ? 1 : 0) +
+               ABC(n->if_stmt.cond) +
                ABC(n->if_stmt.then_body) + ABC(n->if_stmt.else_body);
     case NODE_FOR:
-        return ABC(n->for_stmt.init) + ABC(n->for_stmt.body);
+        return ABC(n->for_stmt.init) + ABC(n->for_stmt.cond) +
+               ABC(n->for_stmt.step) + ABC(n->for_stmt.body);
     case NODE_WHILE:
     case NODE_DO_WHILE:
-        return ABC(n->while_stmt.body);
+        return ABC(n->while_stmt.cond) + ABC(n->while_stmt.body);
     case NODE_SWITCH: {
-        int k = 0;
+        int k = ABC(n->switch_stmt.expr);
         for (int i = 0; i < n->switch_stmt.arm_count; i++) {
             SwitchArm *a = &n->switch_stmt.arms[i];
             if (SAME(a->capture_name, a->capture_name_len)) k++;
+            for (int v = 0; v < a->value_count; v++) k += ABC(a->values[v]);
             k += ABC(a->body);
         }
         return k;
@@ -594,19 +604,56 @@ int ast_name_bind_count(Node *n, const char *name, uint32_t len) {
     case NODE_DEFER:    return ABC(n->defer.body);
     case NODE_CRITICAL: return ABC(n->critical.body);
     case NODE_ONCE:     return ABC(n->once.body);
-    /* Expression / leaf / jump kinds bind nothing. */
-    case NODE_ASSIGN: case NODE_UNARY: case NODE_BINARY: case NODE_CALL:
-    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
-    case NODE_TYPECAST: case NODE_INTRINSIC: case NODE_STRUCT_INIT:
-    case NODE_RETURN: case NODE_EXPR_STMT: case NODE_AWAIT: case NODE_SPAWN:
+    /* Expressions: bind nothing themselves, descended for carried bodies. */
+    case NODE_ASSIGN:   return ABC(n->assign.target) + ABC(n->assign.value);
+    case NODE_UNARY:    return ABC(n->unary.operand);
+    case NODE_BINARY:   return ABC(n->binary.left) + ABC(n->binary.right);
+    case NODE_CALL: {
+        int k = ABC(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) k += ABC(n->call.args[i]);
+        return k;
+    }
+    case NODE_FIELD:    return ABC(n->field.object);
+    case NODE_INDEX:    return ABC(n->index_expr.object) + ABC(n->index_expr.index);
+    case NODE_SLICE:
+        return ABC(n->slice.object) + ABC(n->slice.start) + ABC(n->slice.end);
+    case NODE_ORELSE:   return ABC(n->orelse.expr) + ABC(n->orelse.fallback);
+    case NODE_TYPECAST: return ABC(n->typecast.expr);
+    case NODE_INTRINSIC: {
+        int k = 0;
+        for (int i = 0; i < n->intrinsic.arg_count; i++) k += ABC(n->intrinsic.args[i]);
+        return k;
+    }
+    case NODE_STRUCT_INIT: {
+        int k = 0;
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            k += ABC(n->struct_init.fields[i].value);
+        return k;
+    }
+    case NODE_RETURN:   return ABC(n->ret.expr);
+    case NODE_EXPR_STMT: return ABC(n->expr_stmt.expr);
+    case NODE_AWAIT:    return ABC(n->await_stmt.cond);
+    case NODE_SPAWN: {
+        int k = 0;
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) k += ABC(n->spawn_stmt.args[i]);
+        return k;
+    }
+    case NODE_ASM: {
+        int k = 0;
+        for (int i = 0; i < n->asm_stmt.input_count; i++) k += ABC(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) k += ABC(n->asm_stmt.outputs[i].expr);
+        return k;
+    }
+    case NODE_STATIC_ASSERT: return ABC(n->static_assert_stmt.cond);
     case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_YIELD: case NODE_SIZEOF: case NODE_CAST: case NODE_ASM:
-    case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_SIZEOF: case NODE_CAST:
         return 0;
     /* Declarations never appear inside a body; count as a rebinding so a
-     * caller asking "exactly one?" rounds toward "no". */
+     * caller asking "exactly one?" rounds toward "no". Their children are not
+     * walked: the answer is already the conservative one (baselined in
+     * tools/walker_field_baseline.txt). */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:

@@ -1,0 +1,17 @@
+// expect-trap
+// expect-trap-msg: signed division overflow
+// expect-trap-at: 14
+// BUG-1066: the IR_BINOP division emitted its zero test and its MIN / -1 test
+// as TWO C statements under ONE `#line`, so the second trap reported the source
+// line PLUS ONE — this file used to say line 15. A trap's line number is part of
+// its diagnostic (BUG-1003); plausible numbers are the ones nobody checks.
+u32 main() {
+    volatile i32 va = -2147483647 - 1;
+    volatile i32 vb = -1;
+    i32 a = va;
+    i32 b = vb;
+    if (b == 0) { return 9; }
+    i32 r = a / b;
+    if (r != 0) { return 7; }
+    return 0;
+}

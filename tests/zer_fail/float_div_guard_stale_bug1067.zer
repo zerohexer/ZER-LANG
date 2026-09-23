@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: divisor 'y' not proven nonzero — add 'if (y == 0.0)
+// BUG-1067 boundary: a float guard proves the divisor nonzero only until the
+// variable is written again. `y = y - 4.0` can make it zero, so the proof must
+// not survive the assignment (and the diagnostic must prescribe a guard that
+// compiles for an f64: `== 0.0`, not `== 0`).
+u32 main() {
+    volatile f64 v = 4.0;
+    f64 y = v;
+    if (y == 0.0) { return 1; }
+    y = y - 4.0;
+    f64 x = 1.0 / y;
+    if (x > 0.0) { return 0; }
+    return 2;
+}

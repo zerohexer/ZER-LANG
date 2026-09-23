@@ -1,0 +1,64 @@
+// BUG-1063: a literal the checker typed u32 was printed as a bare C decimal on
+// the AST-passthrough path (plain assign, field store, global store, index,
+// call argument inside an assignment), so C typed it `int` and the expression
+// ran in SIGNED 32-bit arithmetic — while the var-decl path, whose IR temps are
+// `uint32_t`, ran it unsigned. One expression, two answers depending on where it
+// was written. Every row below compares the passthrough spelling against the
+// var-decl spelling AND against the value the u32 arithmetic gives.
+struct R { u32 m; }
+u32 g;
+u32 id(u32 x) { return x; }
+
+u32 main() {
+    R r;
+    u32 a = 0;
+    // (1 << 31) >> 28: an arithmetic shift of INT_MIN gave 4294967288
+    u32 v1 = (1 << 31) >> 28;
+    r.m = (1 << 31) >> 28;
+    a = (1 << 31) >> 28;
+    if (v1 != 8) { return 1; }
+    if (r.m != 8) { return 2; }
+    if (a != 8) { return 3; }
+    // ~0 >> 28: ~0 was the C int -1
+    g = ~0 >> 28;
+    if (g != 15) { return 4; }
+    a = ~0 >> 28;
+    if (a != 15) { return 5; }
+    a = id(~0 >> 28);
+    if (a != 15) { return 6; }
+    // signed-int overflow, then a negative %
+    u32 v4 = (2000000000 + 2000000000) % 7;
+    a = (2000000000 + 2000000000) % 7;
+    if (v4 != 3) { return 7; }
+    if (a != 3) { return 8; }
+    // (2147483647 + 1) / 2: INT_MAX + 1 wrapped negative before the divide
+    a = (2147483647 + 1) / 2;
+    if (a != 1073741824) { return 9; }
+    // (3000000000 * 3) >> 4 must wrap at 32 bits before the shift
+    u32 v2 = (3000000000 * 3) >> 4;
+    a = (3000000000 * 3) >> 4;
+    if (v2 != 25629088) { return 10; }
+    if (a != 25629088) { return 11; }
+    // an index the checker folded to 15 indexed -1 (and trapped) at runtime
+    u32[16] arr;
+    arr[~0 >> 28] = 9;
+    if (arr[15] != 9) { return 12; }
+    u32[4] arr4;
+    arr4[1] = ~0 >> 30;
+    if (arr4[1] != 3) { return 13; }
+    // a variable mixed in
+    volatile u32 vy = 1;
+    u32 y = vy;
+    a = y | ((1 << 31) >> 28);
+    if (a != 9) { return 14; }
+    // signed contexts are unaffected
+    i32 sn = -5;
+    i32 sb = 0;
+    sb = sn / 5 + 3;
+    if (sb != 2) { return 15; }
+    if (sn >= 0) { return 16; }
+    i64 l = 0;
+    l = -2147483648 - 1;
+    if (l != -2147483649) { return 17; }
+    return 0;
+}

@@ -1,0 +1,73 @@
+// BUG-1065: a shift count >= the ZER width must give 0 (the spec rule, and what
+// comptime folds). `_zer_shl` / `_zer_shr` compared the count against the C
+// CARRIER width `sizeof(a) * 8`, so:
+//   (a) an iN (`i5` lives in an int8_t) accepted counts 5..7, and an arithmetic
+//       right shift of a negative value gave -1;
+//   (b) an i8 / i16 whose left operand is a `/` or `%` subexpression — emitted as
+//       a statement expression of type `int` — accepted counts up to 31, so
+//       `s.f = (x / y) >> 8` gave -1.
+// Every emission form is exercised: var-decl init, plain assign, field store,
+// global store, compound `>>=`, return, call argument.
+struct S { i5 q; i8 f; i16 h; }
+i5 gq;
+i8 gf;
+i5 ret_shr(i5 v, i5 n) { return v >> n; }
+i5 take(i5 v) { return v; }
+
+u32 main() {
+    volatile i5 vm = -16;
+    i5 m = vm;
+    volatile i5 vn5 = 5;
+    i5 n5 = vn5;
+    volatile i5 vn7 = 7;
+    i5 n7 = vn7;
+    i5 a = m >> 5;
+    if (a != 0) { return 1; }
+    i5 b = m >> n7;
+    if (b != 0) { return 2; }
+    i5 c = 0;
+    c = m >> n5;
+    if (c != 0) { return 3; }
+    S s;
+    s.q = m >> n5;
+    if (s.q != 0) { return 4; }
+    gq = m >> n7;
+    if (gq != 0) { return 5; }
+    i5 d = m;
+    d >>= n5;
+    if (d != 0) { return 6; }
+    s.q = m;
+    s.q >>= n7;
+    if (s.q != 0) { return 7; }
+    if (ret_shr(m, n5) != 0) { return 8; }
+    if (take(m >> n5) != 0) { return 9; }
+    // in-range counts are unchanged: -16 >> 4 = -1, -16 >> 1 = -8
+    i5 e = m >> 4;
+    if (e != -1) { return 10; }
+    i5 f = m >> 1;
+    if (f != -8) { return 11; }
+    // left shift past the width is 0 too
+    i5 one = 1;
+    i5 g = one << n5;
+    if (g != 0) { return 12; }
+    // (b) a promoted narrow left operand
+    volatile i8 vx = -100;
+    i8 x = vx;
+    volatile i8 vy = 3;
+    i8 y = vy;
+    if (y == 0) { return 20; }
+    if (y == -1) { return 21; }
+    i8 v1 = (x / y) >> 8;
+    if (v1 != 0) { return 22; }
+    s.f = (x / y) >> 8;
+    if (s.f != 0) { return 23; }
+    gf = (x % y) >> 8;
+    if (gf != 0) { return 24; }
+    s.f = (x / y) >> 7;
+    if (s.f != -1) { return 25; }
+    volatile i16 vh = -1000;
+    i16 hx = vh;
+    s.h = (hx / 3) >> 16;
+    if (s.h != 0) { return 26; }
+    return 0;
+}

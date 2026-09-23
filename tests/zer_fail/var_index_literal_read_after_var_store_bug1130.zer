@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: element read through an index may be
+// BUG-1130: a LITERAL read `arr[0]` after `arr[k] = a; free(a)` — k may be 0.
+// Literal reads never consulted what a variable index stored. Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    arr[k] = a;
+    free(a);
+    *T q = arr[0] orelse return;
+    return q.v;
+}
+u32 main() { return run(0); }

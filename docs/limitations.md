@@ -30,50 +30,73 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — a variable-index SLOT loses identity: three residuals after BUG-1074 (2026-09-23c, HIGH — two accept-unsafe, one leak-silent)
+## CLOSED 2026-09-23f — the variable-index SLOT residuals of BUG-1074 (BUG-1130) and the struct wrapper through an ARRAY ELEMENT (BUG-1131/1132/1133)
 
-BUG-1074 made a variable-index store record WHERE the allocation went (the array's wildcard
-slot `(root, P"[*]")`) and a variable-index read a VIEW of that set, so `arr[k] = a; free(a);
-*T q = arr[k] orelse return; q.v` is refused. What it does NOT do, all measured:
+Both former OPEN entries are closed; the residuals that remain are the narrowed OPEN entry
+just below. Measured against the pre-change build (`6a64d4b1`): every probe below COMPILED
+there and is refused now; SHAPES p33 (17 cells, 10 HOLE pre-change) and p34 (11 cells, 7 HOLE
+and 1 OVER-REJECT pre-change) in `tools/sink_matrix.sh` pin them.
 
-1. **A free THROUGH a slot read does not invalidate the slot.**
-   `arr[k] = alloc(T); *T a = arr[k] orelse return; free(a); ... *T q = arr[k] orelse return; q.v`
-   compiles (probe: scratch `h7b.zer`; same for `a = alloc; arr[k] = a;` when the free goes
-   through a slot read). Root cause: allocation ids are per LOCAL, so every allocation a loop
-   stores shares ONE id; if freeing through a slot view widened that id, the canonical
-   free-every-slot loop (`tests/zer/var_index_free_loop_ok.zer`) would be refused on its second
-   iteration. So `ir_view_free_barrier` only REPORTS for a slot view, and `ir_use_blocker` lets a
-   slot view pass a MAYBE_FREED member.
-2. **A conditional free before a slot read is invisible** — `arr[k] = a; if (c) { free(a); }
-   *T q = arr[k] orelse return; q.v` compiles, for the same MAYBE rule.
-3. **Storing into a LOCAL array at a variable index exempts the allocation from leak checking**
-   — `?*T[4] arr; arr[k] = alloc(T); return 0;` and `arr[k] = a;` compile (the store marks the
-   value escaped, the pre-BUG-1074 "untrackable array assignment" rule). The DIRECT spelling
-   `arr[k] = alloc(T)` is also never registered as an allocation at all.
+- **(1) free THROUGH a slot read / (2) conditional free before a slot read.** The missing
+  variable was the INDEX: `arr[k]` with `k` a *trackable index local* (an integer local whose
+  every write is visible — not address-taken, not static, the only local of that name) is now a
+  precise key like `arr[3]`, so every sink sees it. Demoted to the wildcard the moment an
+  instruction writes `k`. The canonical free-every-slot loop still compiles.
+- **(3) leaks.** A store into THIS function's array is no longer an escape; `arr[k] = alloc(T)`
+  and `arr[f(i)] = alloc(T)` are registered. The free-every-slot loop is a DRAIN (exempts what
+  the array received at a variable index).
+- **Found beside them:** a LITERAL read `arr[0]` never consulted what `arr[k]` stored (k may be
+  0); `arr[k] = null` after freeing the slot's allocation was a false "use after free" (a store
+  into an element is not a read of it).
+- **BUG-1131.** A struct VALUE read out of an element or a field carries its allocations
+  (`ir_carry_projection`); a MAY backstop covers a returned value whose fields the analysis could
+  not follow (address-taken, read through a deref). **BUG-1132:** a struct LITERAL stored by
+  ASSIGNMENT (`hs[0] = { .p = a }`, `h = { .p = a }`) registered NOTHING — a single-function
+  use-after-free compiled. **BUG-1133:** the old entry's claim that chained wrappers
+  (`H mk2(*T a) { return mk(a); }`) worked was FALSE — measured on the pre-change build, the
+  chain dropped the view (the param handed on had no identity).
 
-**Fix sketch.** The missing variable is the INDEX, not the allocation: record on a slot view the
-`(array, index local)` it was read through, plus the index's stability (the Level B
-`ast_name_mutated_or_addrd` gate). A free through that view marks the slot `(array, k)` FREED;
-a later read `arr[k]` with the same stable `k` is blocked by it. Residual 3 needs a per-array
-"holds live allocations" fact checked at the array's own scope exit (a local array going out of
-scope with a live slot is a leak; a global one is not). No tripwire test pinned — freezing an
-accept into `zer_gaps` for a HIGH hole is the next session's first step.
+Mechanism: compiler-internals.md "Array slots — the three precisions".
 
 ---
 
-## OPEN — a struct-returning wrapper whose returned value came through an ARRAY ELEMENT keeps no field views (2026-09-23c, MEDIUM — accept-unsafe, narrow)
+## OPEN — what the variable-index slot and struct-wrapper fixes still cannot see (2026-09-23f, MEDIUM — accept-unsafe, narrowed; LOW — leak-silent / over-rejection)
 
-BUG-1080 records, per live return, which FIELD of the returned local holds which param's
-allocation (UNION over returns; MUST pairs alias at the call site, MAY pairs are views). A return
-whose value carries no compound entry naming the param contributes no pairs. MEASURED:
-`H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }` then `H h = mk(a); free(a);
-return h.p.v;` compiles (the struct went through an array element, whose field entries are
-keyed `hs[0].p`, not on the returned temp). `return { .p = a };` and chained wrappers
-(`H mk2(*T a) { return mk(a); }`) DO work — the returned temp carries the views. Fix sketch:
-carry compound entries through an element READ of a struct array (the dual of
-`ir_carry_compounds`), and, as the backstop, when a live return's value has no entries and the
-return type carries a pointer field, make every pointer field of the call result a MAY view of
-every pointer-carrying argument (the argument-precise barrier). Measure the corpus cost first.
+Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`).
+
+1. **A slot freed through an index and read back after the index was WRITTEN.**
+   `for (i..) { *T q = tbl[i] orelse return; free(q); } for (j..) { *T r = tbl[j] orelse return; r.v }`
+   compiles — dangling pointers are left in every slot. The `tbl[i]` FREED fact is dropped when
+   `i` is written (ir_kill_index_facts). Keeping it as a "some slot holds a freed pointer" fact
+   was drafted and dropped: it would refuse every loop that frees or consumes one slot per
+   iteration (`for (i..) { q = tbl[i]; use(q); free(q); }`, pinned as a positive by
+   `p33_safe_consume_no_reset`), because the analysis cannot tell that `i` never comes back. Fix sketch: a relational fact on the counter (monotone `i` with `i > i_free`) — the
+   `disjoint_lattice.v` direction. The reset idiom (`tbl[i] = null;` after the free) is what the
+   diagnostics teach where they fire.
+2. **An UNTRACKABLE index keeps the BUG-1074 posture.** An index that is an expression
+   (`g[k % 4]`), an address-taken local, or a name two locals share has no key: a free through a
+   read of such a slot is not recorded, and a MAYBE member of the wildcard is not blocking.
+   `g[k % 4] = x; a = g[k % 4]; free(a); q = g[k % 4]; q.v` compiles. Fix sketch: key an index
+   EXPRESSION by its syntactic form when every local in it is trackable (kill on any of them).
+3. **A drain exempts the whole array.** Which slots a free-through-a-variable-index loop
+   reached is unknowable, so `for (i < 2) { free(arr[i]) }` over a 4-slot array leaks two
+   allocations silently; so does handing the array to a callee (`drain(arr)` — needed, else a
+   callee that frees every slot is a false leak). Leak-only (never a use-after-free); before
+   BUG-1130 nothing stored at a variable index was leak-checked at all.
+4. **A leak on an early return INSIDE the fill loop** (`for (i..) { *T a = alloc(T) orelse
+   return; arr[i] = a; }`) is invisible: allocation ids are per LOCAL, so the null-edge drop of
+   `a` (BUG-1071) also drops the earlier iterations' allocations that share its id.
+5. **A draining callee's UAF side.** After `drain(arr)` frees the elements, a read of a
+   precise slot (`arr[0]` stored by literal) is not refused — no FuncSummary says a callee frees
+   through a slice param at a variable index. Widening the elements at the call would refuse
+   every read-only callee (`sum(arr); a.v`).
+6. **A struct PARAM's field copied into the returned struct** (`H mk(G g) { H h; h.p = g.p;
+   return h; }`, then `free(a)` where `g.p == a`, then `mk(g).p.v`) compiles: the backstop covers
+   only direct reference params, and a by-value struct param has no bare handle to view.
+7. **The dynamic-freed auto-guard's return leaks.** `pool.free(handles[k]); handles[j].f` gets a
+   runtime `if (j == k) return;` (checker.c, Handle arrays) that the leak pass does not report,
+   although the remaining handles leak when it fires (`tests/zer/dyn_array_autoguard_crash.zer`
+   compiles clean and its case 2 takes that return with three handles live).
 
 ---
 

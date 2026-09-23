@@ -7,6 +7,11 @@ struct Obj { u32 val; u32 tag; }
 Pool(Obj, 8) pool;
 
 u32 try_crash(u32 free_idx, u32 use_idx) {
+    // BUG-1130: the handles array is leak-checked now; an unproven index here
+    // got a bounds auto-guard whose early return leaked every handle. Prove
+    // the indices before allocating.
+    if (free_idx >= 4) { return 0; }
+    if (use_idx >= 4) { return 0; }
     Handle(Obj)[4] handles;
     for (u32 i = 0; i < 4; i += 1) {
         ?Handle(Obj) mh = pool.alloc();

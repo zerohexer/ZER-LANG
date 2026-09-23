@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: may be a view of
+// BUG-1131 backstop: a returned struct whose field the analysis cannot account for
+// (here `return *hp;`) is a MAY view of every reference param. Pre-fix: compiled.
+struct T { u32 v; }
+struct H { *T p; }
+H mk(*T a) { H h = { .p = a }; *H hp = &h; return *hp; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a);
+    free(a);
+    return h.p.v;
+}

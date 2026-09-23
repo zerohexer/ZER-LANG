@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1131: the same through an untrackable index — the field is a MAY view. Pre-fix: compiled.
+struct T { u32 v; }
+struct H { *T p; }
+struct W { H h; u32 n; }
+H mk(*T a, u32 k) { H[2] hs; hs[k % 2] = { .p = a }; return hs[k % 2]; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a, 1);
+    free(a);
+    return h.p.v;
+}

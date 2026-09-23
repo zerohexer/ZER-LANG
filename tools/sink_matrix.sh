@@ -690,6 +690,55 @@ cell p32_safe_other_global compile 'u32 g32; u32 o32; void w32(*u32 p){*p+=1;} v
 cell p32_safe_after_join   compile 'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ g32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); t.join(); bump32(); if(g32!=2){return 1;} return 0; }'
 cell p32_safe_before_spawn compile 'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ g32 += 1; } u32 main(){ bump32(); ThreadHandle t=spawn w32(&g32); t.join(); if(g32!=2){return 1;} return 0; }'
 
+echo ""
+# SHAPE p33 (BUG-1130): a slot at a TRACKABLE index local (`arr[k]`, k never
+# address-taken) is a precise entry like `arr[3]`, valid until k is written; any
+# two indices of one array may meet except two distinct literals; storing into a
+# LOCAL array is not an escape. All HOLE cells compiled on the pre-change build.
+echo "===== SHAPE p33 = variable-index slot identity (free-through-read, maybe-free, leak) ====="
+cell p33_free_via_read          reject 'struct T33a{u32 v;} u32 r33a(u32 k){ if (k >= 4) { return 0; } ?*T33a[4] arr; arr[k] = alloc(T33a); *T33a a = arr[k] orelse return; free(a); *T33a q = arr[k] orelse return; return q.v; } u32 main(){ return r33a(1); }'
+cell p33_free_via_read_loop     reject 'struct T33b{u32 v;} ?*T33b[4] t33b; u32 main(){ for (u32 i = 0; i < 4; i += 1) { *T33b a = alloc(T33b) orelse return; t33b[i] = a; } u32 s = 0; for (u32 i = 0; i < 4; i += 1) { *T33b q = t33b[i] orelse return; free(q); *T33b r = t33b[i] orelse return; s += r.v; t33b[i] = null; } return s; }'
+cell p33_double_free_via_read   reject 'struct T33c{u32 v;} u32 r33c(u32 k){ if (k >= 4) { return 0; } ?*T33c[4] arr; *T33c x = alloc(T33c) orelse return; arr[k] = x; *T33c a = arr[k] orelse return; free(a); *T33c b = arr[k] orelse return; free(b); return 0; } u32 main(){ return r33c(1); }'
+cell p33_cond_free_same_index   reject 'struct T33d{u32 v;} u32 r33d(u32 k, bool c){ if (k >= 4) { return 0; } ?*T33d[4] arr; *T33d a = alloc(T33d) orelse return; arr[k] = a; if (c) { free(a); } *T33d q = arr[k] orelse return; return q.v; } u32 main(){ return r33d(1, true); }'
+cell p33_cond_free_other_index  reject 'struct T33e{u32 v;} u32 r33e(u32 k, u32 j, bool c){ if (k >= 4) { return 0; } if (j >= 4) { return 0; } ?*T33e[4] arr; *T33e a = alloc(T33e) orelse return; arr[k] = a; if (c) { free(a); } *T33e q = arr[j] orelse return; return q.v; } u32 main(){ return r33e(1, 1, true); }'
+cell p33_literal_read_var_store reject 'struct T33f{u32 v;} u32 r33f(u32 k){ if (k >= 4) { return 0; } ?*T33f[4] arr; *T33f a = alloc(T33f) orelse return; arr[k] = a; free(a); *T33f q = arr[0] orelse return; return q.v; } u32 main(){ return r33f(0); }'
+cell p33_leak_keyed_direct      reject 'struct T33g{u32 v;} u32 r33g(u32 k){ if (k >= 4) { return 0; } ?*T33g[4] arr; arr[k] = alloc(T33g); return 0; } u32 main(){ return r33g(1); }'
+cell p33_leak_keyed_stored      reject 'struct T33h{u32 v;} u32 r33h(u32 k){ if (k >= 4) { return 0; } ?*T33h[4] arr; *T33h a = alloc(T33h) orelse return; arr[k] = a; return 0; } u32 main(){ return r33h(1); }'
+cell p33_leak_loop              reject 'struct T33i{u32 v;} u32 r33i(){ ?*T33i[4] arr; for (u32 i = 0; i < 4; i += 1) { arr[i] = alloc(T33i); } return 0; } u32 main(){ return r33i(); }'
+cell p33_leak_unkeyed_index     reject 'struct T33j{u32 v;} u32 r33j(u32 k){ ?*T33j[4] arr; arr[k % 4] = alloc(T33j); return 0; } u32 main(){ return r33j(1); }'
+# BOUNDARY: the fill/drain loop over a LOCAL array (with and without the null
+# reset), a direct free loop, the got-counter idiom that stores one iteration's
+# allocation and frees another's, a slot reset then re-read, a callee that drains
+# the array through a slice, and two distinct param indices.
+cell p33_safe_fill_drain        compile 'struct T33k{u32 v;} u32 r33k(){ ?*T33k[4] arr; for (u32 i = 0; i < 4; i += 1) { *T33k a = alloc(T33k) orelse return; a.v = i; arr[i] = a; } u32 s = 0; for (u32 i = 0; i < 4; i += 1) { *T33k q = arr[i] orelse return; s += q.v; free(q); arr[i] = null; } return s - 6; } u32 main(){ return r33k(); }'
+cell p33_safe_consume_no_reset  compile 'struct T33l{u32 v;} u32 r33l(){ ?*T33l[4] arr; for (u32 i = 0; i < 4; i += 1) { *T33l a = alloc(T33l) orelse return; a.v = i; arr[i] = a; } u32 s = 0; for (u32 i = 0; i < 4; i += 1) { *T33l q = arr[i] orelse return; s += q.v; free(q); } return s - 6; } u32 main(){ return r33l(); }'
+cell p33_safe_direct_free_loop  compile 'struct T33m{u32 v;} u32 r33m(){ ?*T33m[4] arr; for (u32 i = 0; i < 4; i += 1) { arr[i] = alloc(T33m); } for (u32 i = 0; i < 4; i += 1) { free(arr[i] orelse return); } return 0; } u32 main(){ return r33m(); }'
+cell p33_safe_got_counter       compile 'struct T33n{u32 v;} ?*T33n[8] h33n; u32 main(){ u32 got = 0; for (u32 n = 0; n < 12; n += 1) { *T33n k = alloc(T33n) orelse return; if (got < 8) { h33n[got] = k; got += 1; } else { free(k); } } for (u32 j = 0; j < 8; j += 1) { *T33n q = h33n[j] orelse return; free(q); h33n[j] = null; } return 0; }'
+cell p33_safe_reset_reread      compile 'struct T33o{u32 v;} u32 r33o(u32 k){ if (k >= 4) { return 0; } ?*T33o[4] arr; *T33o x = alloc(T33o) orelse return; arr[k] = x; *T33o a = arr[k] orelse return; free(a); arr[k] = null; if (arr[k]) |q| { return q.v; } return 0; } u32 main(){ return r33o(1); }'
+cell p33_safe_drain_by_callee   compile 'struct T33q{u32 v;} void dr33q([*]?*T33q s){ for (u32 i = 0; i < s.len; i += 1) { *T33q q = s[i] orelse return; free(q); s[i] = null; } } u32 main(){ ?*T33q[4] arr; for (u32 i = 0; i < 4; i += 1) { *T33q a = alloc(T33q) orelse return; arr[i] = a; } dr33q(arr); return 0; }'
+cell p33_safe_two_param_slots   compile 'struct T33p{u32 v;} u32 r33p(u32 k, u32 j){ if (k >= 4) { return 0; } if (j >= 4) { return 0; } ?*T33p[4] arr; *T33p a = alloc(T33p) orelse return; defer free(a); a.v = 1; arr[k] = a; *T33p q = arr[k] orelse return; return q.v - 1; } u32 main(){ return r33p(1, 2); }'
+
+echo ""
+# SHAPE p34 (BUG-1131/1132/1133): a struct VALUE that reached the return through an
+# element, a field, an assigned literal, a chained wrapper, a pointer deref or a
+# callee that filled it through `*H` still carries the param's allocation in its
+# field (ir_carry_projection / ir_store_struct_literal / the MAY backstop).
+echo "===== SHAPE p34 = struct wrapper whose value came through an element / field / chain ====="
+cell p34_elem_literal           reject 'struct T34a{u32 v;} struct H34a{*T34a p;} H34a mk34a(*T34a a){ H34a[2] hs; hs[0] = { .p = a }; return hs[0]; } u32 main(){ *T34a a = alloc(T34a) orelse return; H34a h = mk34a(a); free(a); return h.p.v; }'
+cell p34_elem_unkeyed           reject 'struct T34b{u32 v;} struct H34b{*T34b p;} H34b mk34b(*T34b a, u32 k){ H34b[2] hs; hs[k % 2] = { .p = a }; return hs[k % 2]; } u32 main(){ *T34b a = alloc(T34b) orelse return; H34b h = mk34b(a, 1); free(a); return h.p.v; }'
+cell p34_nested_field           reject 'struct T34c{u32 v;} struct H34c{*T34c p;} struct W34c{H34c h; u32 n;} H34c mk34c(*T34c a){ W34c w; w.h = { .p = a }; return w.h; } u32 main(){ *T34c a = alloc(T34c) orelse return; H34c h = mk34c(a); free(a); return h.p.v; }'
+cell p34_assign_literal_same_fn reject 'struct T34d{u32 v;} struct H34d{*T34d p;} u32 main(){ *T34d a = alloc(T34d) orelse return; H34d[2] hs; hs[0] = { .p = a }; free(a); return hs[0].p.v; }'
+cell p34_chained_wrapper        reject 'struct T34e{u32 v;} struct H34e{*T34e p;} H34e mk34e(*T34e a){ return { .p = a }; } H34e mk34e2(*T34e a){ return mk34e(a); } u32 main(){ *T34e a = alloc(T34e) orelse return; H34e h = mk34e2(a); free(a); return h.p.v; }'
+cell p34_deref_backstop         reject 'struct T34f{u32 v;} struct H34f{*T34f p;} H34f mk34f(*T34f a){ H34f h = { .p = a }; *H34f hp = &h; return *hp; } u32 main(){ *T34f a = alloc(T34f) orelse return; H34f h = mk34f(a); free(a); return h.p.v; }'
+cell p34_callee_fill_backstop   reject 'struct T34g{u32 v;} struct H34g{*T34g p;} void fl34g(*H34g o, *T34g a){ o.p = a; } H34g mk34g(*T34g a){ H34g h; fl34g(&h, a); return h; } u32 main(){ *T34g a = alloc(T34g) orelse return; H34g h = mk34g(a); free(a); return h.p.v; }'
+# BOUNDARY: use before the free, free through the returned field, a field set to
+# a GLOBAL (the backstop is gated on an opaque value), and a field holding a
+# DIFFERENT param than the one freed.
+cell p34_safe_elem_use_first    compile 'struct T34h{u32 v;} struct H34h{*T34h p;} H34h mk34h(*T34h a){ H34h[2] hs; hs[0] = { .p = a }; return hs[0]; } u32 main(){ *T34h a = alloc(T34h) orelse return; a.v = 5; H34h h = mk34h(a); u32 r = h.p.v; free(a); return r - 5; }'
+cell p34_safe_elem_free_field   compile 'struct T34i{u32 v;} struct H34i{*T34i p;} H34i mk34i(*T34i a){ H34i[2] hs; hs[0] = { .p = a }; return hs[0]; } u32 main(){ *T34i a = alloc(T34i) orelse return; a.v = 5; H34i h = mk34i(a); u32 r = h.p.v; free(h.p); return r - 5; }'
+cell p34_safe_global_field      compile 'struct T34k{u32 v;} struct H34k{*T34k p;} T34k g34k; H34k mk34k(*T34k a){ H34k h; h.p = &g34k; u32 x = a.v; return h; } u32 main(){ *T34k a = alloc(T34k) orelse return; g34k.v = 4; H34k h = mk34k(a); free(a); return h.p.v - 4; }'
+cell p34_safe_other_param       compile 'struct T34j{u32 v;} struct H34j{*T34j p;} H34j mk34j(*T34j a, *T34j b){ H34j[2] hs; hs[0] = { .p = b }; u32 x = a.v; return hs[0]; } u32 main(){ *T34j b = alloc(T34j) orelse return; defer free(b); *T34j a = alloc(T34j) orelse return; b.v = 3; H34j h = mk34j(a, b); free(a); return h.p.v - 3; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

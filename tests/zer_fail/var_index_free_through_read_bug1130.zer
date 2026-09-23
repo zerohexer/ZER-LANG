@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free: element
+// BUG-1130 (1): a free THROUGH a variable-index slot read did not invalidate the slot —
+// `a = arr[k]; free(a); q = arr[k]; q.v` read freed memory. Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T x = alloc(T) orelse return;
+    arr[k] = x;
+    *T a = arr[k] orelse return;
+    free(a);
+    *T q = arr[k] orelse return;
+    return q.v;
+}
+u32 main() { return run(1); }

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1130 (3): the same at an UNTRACKABLE index (`arr[k % 4]`). Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    ?*T[4] arr;
+    arr[k % 4] = alloc(T);
+    return 0;
+}
+u32 main() { return run(1); }

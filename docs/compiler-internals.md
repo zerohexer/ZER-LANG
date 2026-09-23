@@ -2457,7 +2457,7 @@ that case the leak is reported at exit instead, on the holder. Allocation ids ar
 ### Views and the one use query (BUG-1074/1075/1080, 2026-09-23c)
 A VIEW is an entry with `alloc_id == 0` and a `view_alloc_ids` set — it owns nothing and names the
 allocations it MAY be. Three producers: the multi-param return pick (BUG-849, `ir_fill_multiview_set`),
-a VARIABLE-INDEX array read (`ir_var_index_read_alias`, from the array's WILDCARD slot
+a VARIABLE-INDEX array read (`ir_slot_read` since BUG-1130, from the array's WILDCARD slot
 `(root, P"[*]")` that every variable-index store adds to — `view_is_slot`), and a MAY field of a
 struct-returning wrapper (`FuncSummary.ret_field`, a UNION over the returns: a pair on EVERY return is
 a MUST and becomes an ALIAS at the call site, `ir_apply_ret_field_views`; otherwise a VIEW). Two
@@ -2470,6 +2470,57 @@ queries consume them, and every sink calls them rather than reading the state it
   report. The limits of the slot rules are docs/limitations.md "variable-index slot".
 A move-carrying value consumed WHOLE while one of its move FIELDS was already moved out is refused by
 `ir_check_partial_move` at every whole-consume sink (copy, assign, by-value arg, return) — BUG-1073.
+
+### Array slots — the three precisions (BUG-1130/1131, 2026-09-23f) — supersedes the slot text above
+An element slot is tracked, from most to least precise, as:
+- `arr[3]` — a LITERAL slot, a compound entry like any field;
+- `arr[k]` — a slot at a **trackable index local** (`ir_index_local_keyable`: an integer local, not
+  static, the ONLY local answering to that name, address never taken — the addr-only mode of
+  `ast_name_mutated_or_addrd` plus the IR_ADDR_OF backup). `ir_measure_key_path` /
+  `ir_build_key_path` take the `IRFunc` and key it `[k]`, so EVERY sink that calls
+  `ir_extract_compound_key` treats it like `arr[3]` by construction: store = alias, read = alias,
+  free through a read = the slot FREED, a re-read of `arr[k]` sees it, a leak at exit is reported on
+  it. The key is only as good as "k has not changed": `ir_check_inst` is now the core transfer plus
+  **`ir_kill_index_facts`**, which, after any instruction that writes k (`dest_local`, an assignment
+  anywhere in its expression — the same exhaustive walk — or conservatively an AST-path defer fire),
+  DEMOTES every entry naming `[k]`: its allocation joins the wildcard, the entry itself survives as the
+  owned `arr[*#L]` only when nothing else holds the allocation, and a FREED slot fact is DROPPED (see
+  limitations.md — keeping it refuses every loop that frees one slot per iteration);
+- `arr[*]` — the WILDCARD view set (alloc 0) for an untrackable index or a demoted slot, plus owned
+  `arr[*#L]` entries for `arr[f(i)] = alloc(T)` (`ir_register_alloc_into_wild_slot`, one per store site).
+Two indices of one array may meet unless both are distinct literals, so a READ of any slot
+(`ir_slot_read`, also re-run by the field/index alias arms after they alias) aliases its own precise
+entry AND views every other slot's allocation (`ir_slot_collect`), a USE checks the same candidates
+(`ir_report_slot_use`, called at every NODE_INDEX of the UAF walker and the FIELD_READ prefix walk),
+and a FREE through an element widens the PRECISE candidates (`ir_slot_free_siblings` for a direct
+`free(arr[i])`, `ir_view_free_barrier` through a read; only wildcard members are exempt — the
+free-every-slot loop). The wildcard MAYBE-skip in `ir_use_blocker` applies only to a member no
+precise slot holds (`ir_aid_held_by_precise_slot`). A pure view remembers the slot it came through
+(`IRHandleInfo.has_slot` / `slot_key_path`); freeing it records `(root, key)` FREED
+(`ir_slot_view_freed`, hooked at all four free sinks). A plain `=` into an element never reads the
+element (`arr[i] = null` is a reset, not a use).
+**Leaks.** Storing into THIS function's own array (`ir_index_target_is_local_array`: every step from a
+non-param local a value step) is no longer an escape. A free through a variable-index read of a local
+array marks its wildcard `slot_drained` (ORed at joins — a drain loop's header joins the undrained
+entry edge), and the exit pass exempts an allocation that is a member of a drained array: WHICH slots
+the loop reached is unknowable, so a partial drain leaks silently (limitations.md). A HANDLE element
+freed directly (`pool.free(handles[k])`) records no slot fact: the checker's dynamic-freed
+auto-guard owns the later `handles[j].f` (a runtime `j == k` check on top of the generation check).
+A move out of `arr[k]` stays the hard "variable-index move" error even though k keys — the
+TRANSFERRED fact would be dropped when k changes.
+**Struct values (BUG-1131/1132/1133).** A struct VALUE read out of a field or element (`H r = hs[0];`,
+`return w.h;`, `hs[k % 2]`) replicates the entries under the source key onto the destination —
+`ir_carry_projection`, the dual of `ir_carry_compounds`; the other slots an element index may name
+contribute VIEWS. A struct LITERAL stored by assignment (`h = { .p = a }`, `hs[0] = { .p = a }`) is
+registered by `ir_store_struct_literal` (the var-decl spelling lowers to IR_STRUCT_INIT_DECOMP; the
+assignment spelling is one passthrough IR_ASSIGN nothing looked inside), and at an untrackable index
+by `ir_store_struct_literal_wild` into `hs[*].p`. A param handed straight to a struct-returning callee
+gets its identity at the call (`ir_apply_ret_field_views`), so chained wrappers keep the view. And the
+**backstop**: a live return whose value carries no entry for a reference field of the return type
+(`ir_collect_ref_field_paths`: `.p`, `.inner.q`, `.ps[*]`) makes that field a MAY view of every
+reference param — the argument-precise barrier for a field filled through a pointer deref or by a
+callee through `*H`. MAY only, so it can refuse a use after the caller frees an argument and never
+accept one. Gates: SHAPES p33 + p34 in `tools/sink_matrix.sh`.
 
 ### Cross-Function Analysis (Change 4)
 Pre-scan builds `FuncSummary` for each function with Handle params:

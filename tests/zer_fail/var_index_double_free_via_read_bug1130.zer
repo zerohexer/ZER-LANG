@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1130 (1): two reads of the same slot, each freed — a double free. Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T x = alloc(T) orelse return;
+    arr[k] = x;
+    *T a = arr[k] orelse return;
+    free(a);
+    *T b = arr[k] orelse return;
+    free(b);
+    return 0;
+}
+u32 main() { return run(1); }

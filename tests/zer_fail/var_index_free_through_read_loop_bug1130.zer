@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: use after free: element
+// BUG-1130 (1): the loop form — freed through `tbl[i]` and re-read through `tbl[i]`
+// with i unchanged, in the same iteration. Pre-fix: compiled.
+struct T { u32 v; }
+?*T[4] tbl;
+u32 main() {
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        tbl[i] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = tbl[i] orelse return;
+        free(q);
+        *T r = tbl[i] orelse return;
+        s += r.v;
+        tbl[i] = null;
+    }
+    return s;
+}

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-23e — BUG-1121..1128: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global designated initializers, missing prototypes
+## Session 2026-09-23e — BUG-1121..1129: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global designated initializers, missing prototypes
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
 **Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
@@ -32,6 +32,19 @@ and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[
 now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
 `type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
 refuses any non-identifier spelling, so no emitted name changes.
+
+### BUG-1129 — a carrier holding TWO globals designated only one
+`H h = { .p = &g1, .q = &g2 }; bump(h);` with `bump` doing `*h.q += 1` beside an ISR writing
+`g2` compiled clean at the MAIN and ISR sites — `carrier_value_global` returned the first
+global it found. The two-assignment spelling `h.p = &g; h.q = &d;` had the dual defect: each
+projection store REPLACED the carrier row, so only the last survived. Fixed with
+`carrier_value_globals` (every struct-literal field, both orelse arms, a copied carrier's whole
+set) and multi-row tables on both sides: a rebind clears a name's rows, a projection
+assignment adds; `rmw_alias_lookup` / `rmw_tab_lookup` read the first live row, and the
+argument resolvers (`rmw_arg_targets`, `rmw_arg_targets_main`) read every row — the single-
+target `rmw_arg_target_global{,_main}` are gone. RMW grid: `carrier {.p=&d,.q=&g}`,
+`carrier h.p=&d;h.q=&g` x3 sites, 4 holes pre-fix. Corpus: 0 verdict changes. Residual
+(wording at the spawn site) in limitations.md.
 
 ### BUG-1126 — a designated initializer that OMITTED a non-null field produced a NULL `*T`
 `struct H { u32 a; *u32 p; } ... H w = { .a = 1 }; return *w.p;` compiled clean and

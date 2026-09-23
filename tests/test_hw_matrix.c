@@ -322,6 +322,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_ALIAS_COPY, RFORM_CARRIER_COPY, RFORM_CARRIER_FIELD_ARG,
                RFORM_CARRIER_READONLY, RFORM_GLOBAL_RETARGET, RFORM_LOCAL_RETARGET,
                RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
+               RFORM_CARRIER_TWO_LIT, RFORM_CARRIER_TWO_ASSIGN,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -373,6 +374,8 @@ static const char *rform_name(RForm f) {
     case RFORM_RETARGET_ARG:    return "retargeted gp as arg";
     case RFORM_RETARGET_COPY_ARG:   return "r=gp copy as arg";
     case RFORM_RETARGET_COPY_DEREF: return "r=gp copy *r+=1";
+    case RFORM_CARRIER_TWO_LIT:     return "carrier {.p=&d,.q=&g}";
+    case RFORM_CARRIER_TWO_ASSIGN:  return "carrier h.p=&d;h.q=&g";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -458,6 +461,15 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
                                                                                  *body = "aim(); volatile *u32 r = gp; bump(r);"; break;
     case RFORM_RETARGET_COPY_DEREF: *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }";
                                                                                  *body = "aim(); volatile *u32 r = gp; *r += 1;"; break;
+    /* BUG-1129: a carrier holding TWO globals bound only the first (the literal)
+     * or only the LAST (two field assignments replaced the row). The RMW is
+     * through the field aimed at `g`. */
+    case RFORM_CARRIER_TWO_LIT:     *helper = "volatile u32 d;\nstruct H2 { volatile *u32 p; volatile *u32 q; }\n"
+                                              "void bump2(H2 h){ *h.q += 1; }";
+                                                                                 *body = "H2 h = { .p = &d, .q = &g }; bump2(h);"; break;
+    case RFORM_CARRIER_TWO_ASSIGN:  *helper = "volatile u32 d;\nstruct H2 { volatile *u32 p; volatile *u32 q; }\n"
+                                              "void bump2(H2 h){ *h.p += 1; }";
+                                                                                 *body = "H2 h; h.p = &g; h.q = &d; bump2(h);"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

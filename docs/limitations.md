@@ -165,25 +165,25 @@ cap. Gate: SHAPE p32 in `tools/sink_matrix.sh` (6 of its reject cells are holes 
 build). Corpus: 0 verdict changes over 2580 files. Residual (precision): the name match is
 lexical, so a callee LOCAL that shadows the lent global's name is over-rejected.
 
-## OPEN — three RMW-reach residuals after BUG-1046 (2026-09-22, LOW/MEDIUM — two accept-side, one precision)
+## OPEN — one RMW-reach residual after BUG-1046 / BUG-1129, and one masked (2026-09-23, LOW — wording + latent)
 
-**1. A carrier that points at TWO globals binds the first only (accept-side, LOW).**
-`carrier_value_global` returns ONE symbol, and the alias / carrier tables map a name to ONE
-global, so `H h = { .p = &g1, .q = &g2 }; bump(h)` resolves `h` to `g1`; an RMW through
-`h.q` in `bump` is attributed to nothing. Fix sketch: let a carrier name map to a small
-SET (or bind `h.p` / `h.q` as compound keys, the way the atomic-cell path keys do) and have
-`rmw_arg_target_global` return all of them for the callee's param binding.
+**1. ~~A carrier that points at TWO globals binds the first only~~ — CLOSED (BUG-1129).**
+`carrier_value_globals` enumerates every field of a struct literal and both orelse arms; the
+scans' alias table and the main-side carrier table hold several rows per name (a rebind
+clears, a projection assignment adds). 4 RMW-grid cells were holes pre-fix (ISR and MAIN
+sites). **Residual (wording only):** carriers are keyed by the ROOT name, so every field of
+`h` designates every global `h` holds — at the SPAWN site `*h.q += 1` with `h = { .p = &g1,
+.q = &g2 }` is refused (correctly) but the message names `g1`. Field-keyed rows (the
+atomic-cell path's compound keys) would make the sentence exact.
 
-**2. ~~A funcptr FIELD callee inside a spawn target declared AFTER its spawner is not treated
-as opaque~~ — CLOSED 2026-09-23 (BUG-1052):** an untyped FIELD/INDEX callee now rounds toward
-opaque in `callee_is_opaque_funcptr`.
+**2. ~~funcptr FIELD callee in a later-declared spawn target~~ — CLOSED (BUG-1052).**
 
-**3. A GLOBAL funcptr rebound in another function is resolved through its declaration
-initializer (pre-existing, accept-side, LOW).** ISR "facet 1" descends the function named
-by `*() gcb = nop;` when the handler calls `gcb()`; `main() { gcb = bump; }` is not seen.
-Today this is masked for a non-volatile `gcb` ("accessed from both interrupt and main —
-must be declared volatile"); a `volatile` funcptr global would slip. Whole-program binding
-collection for global funcptrs (a post pass over every body, like BUG-1037's) closes it.
+**3. A GLOBAL funcptr rebound in another function (latent, MASKED — measured unreachable).**
+ISR "facet 1" and the spawn funcptr descent follow `*() gcb = nop;`'s initializer only, so
+`main() { gcb = bump; }` is not followed. MEASURED 2026-09-23: no spelling reaches it — a plain
+global funcptr touched from both contexts is refused as non-volatile / non-shared, and a
+`volatile` one as "not a single-word scalar". If either rule is ever relaxed, extend the
+descent with `ast_name_writes` over every body (the BUG-1124 mechanism) in the same commit.
 
 ## OPEN — a PROVEN struct-field index still emits its runtime bounds check (2026-09-22, LOW — precision only, no safety consequence)
 

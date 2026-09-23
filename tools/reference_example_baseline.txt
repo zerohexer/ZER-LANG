@@ -16,6 +16,15 @@
 # the file and dies the moment the block's text changes — which is exactly when
 # it needs re-reviewing. The trailing `reference.md:<line>` is a human hint only.
 #
+# 2026-09-23: 82 -> 70. Twelve rows retired because their blocks now compile or
+# were rewritten to be self-contained: the prelude no longer injects `Pool(Task, 8)`
+# / `Slab(Task)` ahead of a block that declares its OWN `struct Task` (the entry
+# names its dependency), a one-line function definition at column 0 now marks a
+# block top-level, and the struct / cinclude / funcptr examples were rewritten.
+# The same change made the gate RUN every block that has its own `main` (it must
+# exit 0) and enforce `<!-- audit: expect-error: ... -->` / `expect-trap`, which
+# had been written in the doc but never checked.
+#
 # 2026-08-25: 86 -> 84. Two rows retired because their blocks now COMPILE — the
 # funcptr syntax catalogues, rewritten to be self-contained after BUG-878/879
 # made arrays of function pointers actually work. That is the baseline shrinking
@@ -27,17 +36,13 @@
 # ListHead / Command / heap / pool) plus a catch-all mmio range.
 de87cd773e12d8d9  reference.md:42
 dfa8ccb992bdfc47  reference.md:93
-cbf973809ab90199  reference.md:158
 dd5fdde401db71ce  reference.md:210
 a6ebf1e6f152d059  reference.md:221
 fada445f41559b48  reference.md:251
 6ef265d9e0172d35  reference.md:308
-652a795e1b0c8729  reference.md:314
 a88161d6ee26cd71  reference.md:347
 c50576dbc5c2a59b  reference.md:388
 44069030d6a04a51  reference.md:415
-c06cc35ad5af93f6  reference.md:447
-7eb20e4b46c67ca2  reference.md:457
 c48ac2be266d6950  reference.md:544
 f4ef00cd72e06770  reference.md:578
 92c5fd99fd346712  reference.md:682
@@ -59,13 +64,10 @@ f6aacb1c7407ada0  reference.md:1129
 122efc1c95771253  reference.md:1158
 47f803c951ed58ab  reference.md:1240
 5e14fe2966596dc4  reference.md:1293
-72ee3e99afd59bec  reference.md:1310
 84297a2431669274  reference.md:1350
 bec093813c5f183d  reference.md:1355
 e41d7631cbfce5eb  reference.md:1378
-aa63b3222878de43  reference.md:1406
 b06fafd5daf9214b  reference.md:1472
-919bf4b635112a98  reference.md:1495
 bd7964125ba9ebee  reference.md:1534
 75de8470de7afd97  reference.md:1544
 de40d7f59a7c8237  reference.md:1619
@@ -90,17 +92,12 @@ f9764f4cb5d9f483  reference.md:2724
 cf1f45799e6f465a  reference.md:2857
 9077b704b75e0c84  reference.md:2872
 dcd613ebaca835de  reference.md:2894
-197eeeb88fb3a812  reference.md:3096
-a5fa354db7afd8d8  reference.md:3106
-a2d212648a84bea1  reference.md:3116
-3674a4d42fd5a947  reference.md:3134
 6c6f217dfa4c2874  reference.md:3147
 3c4361ded12b0d87  reference.md:3180
 8593d17a2cd3b65f  reference.md:3226
 234f52e2805d4d61  reference.md:3277
 af4c920a8953b104  reference.md:3316
 394fdfac3247114c  reference.md:3363
-e246a3334d5820c5  reference.md:3447
 d54d84941e077f48  reference.md:3465
 01adc7b7eff191c4  reference.md:3552
 22e9fa9c766877a3  reference.md:3578

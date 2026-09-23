@@ -628,14 +628,17 @@ ir_lower.c:rewrite_idents:NODE_VAR_DECL:var_decl.init
 ir_lower.c:rewrite_idents:NODE_WHILE:while_stmt.body
 ir_lower.c:rewrite_idents:NODE_WHILE:while_stmt.cond
 
-# --- zercheck_ir.c: ast_name_mutated_or_addrd ---
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_FILE:file.decls
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_STATIC_ASSERT:static_assert_stmt.cond
+# --- zercheck_ir.c: ast_name_writes_r (the core of ast_name_mutated_or_addrd, BUG-1124) ---
+# An unwalked arm answers "a write whose value cannot be followed" (fn(NULL)): the
+# conservative answer for both clients (the predicate says "mutated"; the
+# write-target enumerator treats it as the documented unresolvable floor).
+zercheck_ir.c:ast_name_writes_r:NODE_ASM:asm_stmt.inputs
+zercheck_ir.c:ast_name_writes_r:NODE_ASM:asm_stmt.outputs
+zercheck_ir.c:ast_name_writes_r:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_writes_r:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_writes_r:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_writes_r:NODE_INTERRUPT:interrupt.body
+zercheck_ir.c:ast_name_writes_r:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- zercheck_ir.c: ast_name_bind_count ---
 # Top-level declaration kinds never occur inside a function body; the arm returns

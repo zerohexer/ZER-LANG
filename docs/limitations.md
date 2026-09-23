@@ -121,13 +121,21 @@ no target fact saying "single core". The accepted spellings today are `@atomic_a
 or `@critical { ticks += 1; }` in the handler. Fix sketch if taken up: a `--single-core`
 (or target-derived) fact that licenses dropping `compound_in_isr` when `!multi_isr`.
 
-## OPEN — the ISR / stack rules follow a GLOBAL pointer's initializer without checking it is never reassigned (2026-09-23, LOW — accept-side)
+## CLOSED 2026-09-23 (BUG-1124) — a pointer RETARGETED after its declaration was followed to its initializer only
 
-BUG-1059a records the pointee of `*u32 gp = &g;` as touched when `gp` is named; a later
-`gp = &h;` elsewhere is not followed, so an ISR writing `*gp` after the reassignment reaches
-`h` unseen. The funcptr stack resolver was hardened the same session with
-`global_name_never_mutated`; `resolve_write_target_global` (shared by the RMW rules) should ask
-the same question and answer "unknown" (every global) when the pointer is reassigned.
+Every RMW / ISR-sharing resolver followed `*u32 gp = &g;` and nothing else, so `gp = &h`
+elsewhere (a global pointer, in any function), `p = &d; p = &g;` (a local), and a local COPY
+`volatile *u32 r = gp;` all hid the real target — 9 hazard cells accepted across the spawn /
+ISR / main sites (RMW FORM grid, `tests/test_hw_matrix.c`) plus the ISR "must be volatile" rule
+(`tests/zer_fail/isr_retargeted_global_ptr_bug1124.zer`). Now one set query,
+`for_each_write_target`. Corpus: 0 verdict changes over 2583 files.
+
+**Floor that remains (same as an unresolvable pointer PARAM):** an aim whose VALUE cannot be
+followed — a call result (`gp = pick();`), `&gp` handed to a function that stores through it,
+a compound write, an asm output operand — contributes no target. The stack rule's funcptr
+resolver answers the same question with `global_name_never_mutated` (refuses to trust any
+reassigned funcptr), which is the conservative form; the data-pointer rules could adopt it
+(treat such a pointer as "may designate any address-taken global") if a program ever needs it.
 
 ## OPEN — `u8[K] buf;` with a local `const usize K = @size(T);` is refused as "not a compile-time constant" (2026-09-23, LOW — over-rejection)
 

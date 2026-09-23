@@ -520,6 +520,9 @@ void check_keep_inference(Checker *c);
  * `&name`? Exhaustive no-default AST walk, conservative (true) on opaque kinds. The
  * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
+/* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
+typedef bool (*AstNameWriteFn)(Node *value, void *ud);
+bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is

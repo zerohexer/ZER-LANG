@@ -1,0 +1,12 @@
+// expect-error: global 'h' is accessed from both interrupt and main code
+// BUG-1124: gp is retargeted to &h in another function; the ISR's *gp write reaches h.
+volatile u32 g;
+u32 h;
+volatile *u32 gp = &g;
+interrupt TIM2 { *gp = 5; }
+void retarget() { gp = &h; }
+u32 main() {
+    retarget();
+    u32 t = h;
+    return t;
+}

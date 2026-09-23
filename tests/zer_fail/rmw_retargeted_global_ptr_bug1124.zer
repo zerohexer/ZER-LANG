@@ -1,0 +1,12 @@
+// expect-error: volatile global 'h' is read-modify-written and is shared
+// BUG-1124: main's *gp += 1 lands on h after retarget(); the resolver followed only &g.
+volatile u32 g;
+volatile u32 h;
+volatile *u32 gp = &g;
+interrupt TIM2 { h = 1; }
+void retarget() { gp = &h; }
+u32 main() {
+    retarget();
+    *gp += 1;
+    return 0;
+}

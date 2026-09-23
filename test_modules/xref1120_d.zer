@@ -1,0 +1,2 @@
+import xref1120_c;
+u32 d_use() { add_total(5); return shared_total; }

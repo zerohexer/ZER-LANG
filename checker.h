@@ -55,6 +55,13 @@ typedef struct {
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
     Node *current_body;      /* BUG-1056: body (function OR interrupt) being checked */
     Node **reg_files;        /* BUG-1056: every NODE_FILE registered (whole-program scans) */
+    /* BUG-1120: an imported module's non-static global / function whose RAW
+     * name another module registered first gets its OWN Symbol (registered
+     * into a private scope), inserted into that module's scope when its bodies
+     * are checked. */
+    struct ModuleOwnSym { Node *decl; Symbol *sym; } *module_own;
+    int module_own_count;
+    int module_own_cap;
     int reg_file_count;
     int reg_file_cap;
     /* Stage 1->2 escape summary accumulators (set at func-body-check entry, updated

@@ -1,0 +1,2 @@
+u32 shared_total;
+u32 add_total(u32 v) { shared_total += v; return shared_total; }

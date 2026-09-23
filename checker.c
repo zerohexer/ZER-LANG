@@ -766,6 +766,28 @@ static Symbol *add_symbol_internal(Checker *c, const char *name, uint32_t name_l
 /* Internal: add_symbol implementation parameterized by reserved-prefix
  * enforcement. Public wrapper add_symbol() always enforces; the synthetic
  * variant add_symbol_synth() bypasses for parser-emitted desugaring (Gap 30). */
+/* BUG-1120: THE lookup of a top-level name. Inside an imported module whose
+ * global / function shares its raw name with another module's, the raw
+ * global-scope entry is the OTHER module's (first registration wins); this
+ * module's own Symbol lives in `module_own`. Every checker site that used to
+ * read `c->global_scope` directly (120 of them — callee resolution, spawn
+ * targets, ISR descents, FuncProps, summaries) got the other module's
+ * declaration, so module b's `bump()` was scanned, summarised and typed as
+ * module a's. Outside that case this is exactly scope_lookup_local on the
+ * global scope. */
+static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t len) {
+    if (c->current_module) {
+        for (int mi = 0; mi < c->module_own_count; mi++) {
+            Symbol *ms = c->module_own[mi].sym;
+            if (ms && ms->name_len == len && memcmp(ms->name, name, len) == 0 &&
+                ms->module_prefix_len == c->current_module_len && ms->module_prefix &&
+                memcmp(ms->module_prefix, c->current_module, c->current_module_len) == 0)
+                return ms;
+        }
+    }
+    return scope_lookup_local(c->global_scope, name, len);
+}
+
 static Symbol *add_symbol_impl(Checker *c, const char *name, uint32_t name_len,
                                Type *type, int line, bool enforce_reserved) {
     /* BUG-276: warn on _zer_ prefixed names — reserved for compiler internals */
@@ -2166,7 +2188,7 @@ static void classify_escape_sink(Checker *c, Node *target,
     *out_sym = ts;
     if (!ts) return;
     bool g = ts->is_static ||
-             scope_lookup_local(c->global_scope, ts->name, ts->name_len) != NULL;
+             global_decl_lookup(c, ts->name, ts->name_len) != NULL;
     *is_global = g;
     if (!g && through_deref) {
         /* Sink categories that outlive a local borrow:
@@ -2418,7 +2440,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                 else root = root->index_expr.object;
             }
             if (root && root->kind == NODE_IDENT) {
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                 Symbol *src = scope_lookup(c->current_scope,
                     root->ident.name, (uint32_t)root->ident.name_len);
@@ -2439,7 +2461,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                 return true;
             /* local array passed as slice → points to stack */
             if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     arg->ident.name, (uint32_t)arg->ident.name_len) != NULL;
                 if (!src->is_static && !is_global) return true;
             }
@@ -2459,7 +2481,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
             if (root && root->kind == NODE_IDENT) {
                 Symbol *src = scope_lookup(c->current_scope,
                     root->ident.name, (uint32_t)root->ident.name_len);
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                 if (src && !src->is_static && !is_global &&
                     (src->is_local_derived || src->is_arena_derived ||
@@ -2501,7 +2523,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                     else root = root->index_expr.object;
                 }
                 if (root && root->kind == NODE_IDENT) {
-                    bool is_global = scope_lookup_local(c->global_scope,
+                    bool is_global = global_decl_lookup(c,
                         root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                     Symbol *src = scope_lookup(c->current_scope,
                         root->ident.name, (uint32_t)root->ident.name_len);
@@ -2528,7 +2550,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                             else root = root->index_expr.object;
                         }
                         if (root && root->kind == NODE_IDENT) {
-                            bool is_global = scope_lookup_local(c->global_scope,
+                            bool is_global = global_decl_lookup(c,
                                 root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                             Symbol *src = scope_lookup(c->current_scope,
                                 root->ident.name, (uint32_t)root->ident.name_len);
@@ -2555,7 +2577,7 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
                 else buf = buf->index_expr.object;
             }
             if (buf && buf->kind == NODE_IDENT) {
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     buf->ident.name, (uint32_t)buf->ident.name_len) != NULL;
                 Symbol *src = scope_lookup(c->current_scope,
                     buf->ident.name, (uint32_t)buf->ident.name_len);
@@ -2632,7 +2654,7 @@ static bool call_result_static_given_args(Checker *c, Node *call) {
     if (!callee || callee->kind != NODE_IDENT) return false;
     Symbol *csym = scope_lookup(c->current_scope,
         callee->ident.name, (uint32_t)callee->ident.name_len);
-    if (!csym) csym = scope_lookup(c->global_scope,
+    if (!csym) csym = global_decl_lookup(c,
         callee->ident.name, (uint32_t)callee->ident.name_len);
     if (!csym || !csym->ret_summary_complete) return false;
     uint64_t mask = csym->ret_param_mask;
@@ -2744,7 +2766,7 @@ static bool call_result_is_local_address_int(Checker *c, Node *call) {
     if (callee && callee->kind == NODE_IDENT) {
         csym = scope_lookup(c->current_scope,
             callee->ident.name, (uint32_t)callee->ident.name_len);
-        if (!csym) csym = scope_lookup(c->global_scope,
+        if (!csym) csym = global_decl_lookup(c,
             callee->ident.name, (uint32_t)callee->ident.name_len);
     }
     if (csym && csym->ret_summary_complete) {
@@ -2821,7 +2843,7 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
                 else root = root->index_expr.object;
             }
             if (root && root->kind == NODE_IDENT) {
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                 Symbol *src = scope_lookup(c->current_scope,
                     root->ident.name, (uint32_t)root->ident.name_len);
@@ -2848,7 +2870,7 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
             if (sroot && sroot->kind == NODE_IDENT) {
                 Symbol *srcs = scope_lookup(c->current_scope,
                     sroot->ident.name, (uint32_t)sroot->ident.name_len);
-                bool is_global = scope_lookup_local(c->global_scope,
+                bool is_global = global_decl_lookup(c,
                     sroot->ident.name, (uint32_t)sroot->ident.name_len) != NULL;
                 Type *rt = typemap_get(c, sroot);
                 bool rt_is_array = (type_dispatch_kind(rt) == TYPE_ARRAY);
@@ -2950,7 +2972,7 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
     if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
         csym = scope_lookup(c->current_scope, call->call.callee->ident.name,
                             (uint32_t)call->call.callee->ident.name_len);
-        if (!csym) csym = scope_lookup(c->global_scope, call->call.callee->ident.name,
+        if (!csym) csym = global_decl_lookup(c, call->call.callee->ident.name,
                                        (uint32_t)call->call.callee->ident.name_len);
     }
     bool complete = csym && csym->ret_summary_complete;
@@ -3108,7 +3130,7 @@ static int keep_arg_caller_root(Checker *c, Node *arg) {
         case NODE_CALL: {
             Node *cal = n->call.callee;
             Symbol *cs = (cal && cal->kind == NODE_IDENT)
-                ? scope_lookup(c->global_scope, cal->ident.name, (uint32_t)cal->ident.name_len)
+                ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len)
                 : NULL;
             if (!cs || !cs->is_function) return -1;
             for (int i = 0; i < n->call.arg_count && i < 64; i++) {
@@ -3929,7 +3951,7 @@ static bool addr_of_is_local_derived(Checker *c, Node *operand) {
         else root = root->index_expr.object;
     }
     if (!root || root->kind != NODE_IDENT) return false;
-    bool is_global = scope_lookup_local(c->global_scope,
+    bool is_global = global_decl_lookup(c,
         root->ident.name, (uint32_t)root->ident.name_len) != NULL;
     Symbol *src = scope_lookup(c->current_scope,
         root->ident.name, (uint32_t)root->ident.name_len);
@@ -3959,7 +3981,7 @@ static bool _rmw_alias_overflow = false;   /* BUG-976: the table filled */
  * A `static u32 c = 0;` inside a function is ONE object for every thread that runs it
  * and for main-vs-ISR alike — the same hazard as a non-shared global, and the emitted
  * C says so (`static uint32_t c = 0;` in the function). But it has no global-scope
- * Symbol, and BOTH scans resolve names with `scope_lookup(c->global_scope, …)`, so
+ * Symbol, and BOTH scans resolve names with `global_decl_lookup(c, …)`, so
  * neither saw it: `spawn w(); spawn w();` over a static-local RMW compiled clean, and
  * so did a static local shared between an ISR and main.
  *
@@ -4175,7 +4197,7 @@ static void rmw_alias_bind(const char *name, uint32_t len, Symbol *g) {
 static void rmw_bind_carrier_scan(Checker *c, Node *target, Node *value) {
     Node *r = carrier_root_ident(target);
     if (!r) return;
-    if (scope_lookup_local(c->global_scope, r->ident.name, (uint32_t)r->ident.name_len))
+    if (global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len))
         return;
     Symbol *g = carrier_value_global(c, value, 0, false);
     if (g) rmw_alias_bind(r->ident.name, (uint32_t)r->ident.name_len, g);
@@ -4191,7 +4213,7 @@ static void rmw_bind_carrier_main(Checker *c, Node *target, Node *value) {
     Node *r = carrier_root_ident(target);
     if (!r) return;
     Symbol *rs = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
-    Symbol *gs = scope_lookup_local(c->global_scope, r->ident.name, (uint32_t)r->ident.name_len);
+    Symbol *gs = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
     if (!rs || rs == gs) return;   /* a global carrier: not this table */
     Symbol *g = carrier_value_global(c, value, 0, true);
     if (!g && target->kind != NODE_IDENT) return;
@@ -4240,7 +4262,7 @@ static Symbol *rmw_arg_target_global_main(Checker *c, Node *arg) {
 static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
     if (!callee) return false;
     if (callee->kind == NODE_IDENT) {
-        Symbol *gsym = scope_lookup_local(c->global_scope, callee->ident.name,
+        Symbol *gsym = global_decl_lookup(c, callee->ident.name,
                                           (uint32_t)callee->ident.name_len);
         if (gsym && gsym->is_function) return false;
         if ((callee->ident.name_len == 5 && memcmp(callee->ident.name, "alloc", 5) == 0) ||
@@ -4268,7 +4290,7 @@ static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
         if (callee->kind == NODE_INDEX) return true;
         Node *obj = callee->field.object;
         if (obj && obj->kind == NODE_IDENT) {
-            Symbol *os = scope_lookup(c->global_scope, obj->ident.name,
+            Symbol *os = global_decl_lookup(c, obj->ident.name,
                                       (uint32_t)obj->ident.name_len);
             if (os && os->type) {
                 switch (type_dispatch_kind(os->type)) {
@@ -4439,7 +4461,7 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
         Symbol *sym = scope_lookup(c->current_scope, e->ident.name,
                                    (uint32_t)e->ident.name_len);
         if (!sym || sym->is_function) return NULL;
-        return scope_lookup_local(c->global_scope, sym->name, sym->name_len);
+        return global_decl_lookup(c, sym->name, sym->name_len);
     }
     case NODE_UNARY:    return RVS(e->unary.operand);
     case NODE_TYPECAST: return RVS(e->typecast.expr);
@@ -4574,7 +4596,7 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
         }
     }
     if (n->kind == NODE_CALL && n->call.callee && n->call.callee->kind == NODE_IDENT) {
-        Symbol *cs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+        Symbol *cs = global_decl_lookup(c, n->call.callee->ident.name,
                                   (uint32_t)n->call.callee->ident.name_len);
         if (cs && cs->is_function) {
             uint64_t cm = func_rmw_param_mask(c, cs, depth + 1);
@@ -4764,7 +4786,7 @@ static Symbol *resolve_write_target_global(Checker *c, Node *target, int depth) 
         if (init && init->kind == NODE_UNARY && init->unary.op == TOK_AMP)
             return resolve_write_target_global(c, init->unary.operand, depth + 1);
     }
-    return scope_lookup_local(c->global_scope, s->name, s->name_len);
+    return global_decl_lookup(c, s->name, s->name_len);
 }
 
 /* THE single query for "may this value expression evaluate to something FRAME-BOUND?"
@@ -4885,7 +4907,7 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
      * live in global scope but is handled separately at the spawn sink (D4), which
      * rejects it outright rather than borrowing it. */
     if (!rs || rs->is_static) return;
-    if (scope_lookup_local(c->global_scope, rs->name, rs->name_len) != NULL) {
+    if (global_decl_lookup(c, rs->name, rs->name_len) != NULL) {
         /* keep the name anyway: the spawn sink needs it to SEE a threadlocal root. */
         sym->borrow_root_name = rs->name;
         sym->borrow_root_len  = rs->name_len;
@@ -4939,7 +4961,7 @@ static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
                     sym->borrow_root_len  = src->borrow_root_len;
                 }
             } else if (type_dispatch_kind(root_type) == TYPE_ARRAY) {
-                bool is_global = src && scope_lookup_local(c->global_scope,
+                bool is_global = src && global_decl_lookup(c,
                     src->name, src->name_len) != NULL;
                 if (src && !src->is_static && !is_global) {
                     sym->is_local_derived = true;
@@ -5000,7 +5022,7 @@ static bool expr_touches_local_derived(Checker *c, Node *expr) {
                     else root = root->index_expr.object;
                 }
                 if (root && root->kind == NODE_IDENT) {
-                    bool is_global = scope_lookup_local(c->global_scope,
+                    bool is_global = global_decl_lookup(c,
                         root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                     Symbol *src = scope_lookup(c->current_scope,
                         root->ident.name, (uint32_t)root->ident.name_len);
@@ -7452,7 +7474,7 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
                                    int depth) {
     Checker *c = (Checker *)ctx;
     Symbol *sym = scope_lookup(c->current_scope, name, name_len);
-    if (!sym) sym = scope_lookup(c->global_scope, name, name_len);
+    if (!sym) sym = global_decl_lookup(c, name, name_len);
     if (sym && sym->is_const && sym->func_node) {
         Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
                       sym->func_node->kind == NODE_GLOBAL_VAR)
@@ -7506,7 +7528,7 @@ static int64_t resolve_enum_field(Checker *c, Node *n) {
         n->field.object->kind != NODE_IDENT) return CONST_EVAL_FAIL;
     Symbol *esym = scope_lookup(c->current_scope,
         n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
-    if (!esym) esym = scope_lookup(c->global_scope,
+    if (!esym) esym = global_decl_lookup(c,
         n->field.object->ident.name, (uint32_t)n->field.object->ident.name_len);
     if (!esym || !esym->type || esym->type->kind != TYPE_ENUM) return CONST_EVAL_FAIL;
     uint32_t vlen = (uint32_t)n->field.field_name_len;
@@ -7801,7 +7823,7 @@ static Type *check_expr(Checker *c, Node *node) {
         }
         /* interrupt safety: track global variable access from ISR vs regular code */
         if (sym && !sym->is_function && c->current_func_ret != NULL) {
-            Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+            Symbol *gs = global_decl_lookup(c, node->ident.name,
                                       (uint32_t)node->ident.name_len);
             /* BUG-971: a STATIC LOCAL is one object for every execution of the
              * function, so main touching it is the `from_func` half of the same
@@ -8503,7 +8525,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     Symbol *vsym = scope_lookup(c->current_scope,
                         vroot->ident.name, (uint32_t)vroot->ident.name_len);
                     val_is_local = vsym && !vsym->is_static &&
-                        !scope_lookup_local(c->global_scope, vsym->name, vsym->name_len);
+                        !global_decl_lookup(c, vsym->name, vsym->name_len);
                 }
                 if (val_is_local) {
                     /* Check if target is global/static */
@@ -8516,7 +8538,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         Symbol *tsym = scope_lookup(c->current_scope,
                             troot->ident.name, (uint32_t)troot->ident.name_len);
                         bool target_is_global = tsym &&
-                            (tsym->is_static || scope_lookup_local(c->global_scope,
+                            (tsym->is_static || global_decl_lookup(c,
                                 tsym->name, tsym->name_len) != NULL);
                         if (target_is_global) {
                             checker_error(c, node->loc.line,
@@ -8925,7 +8947,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     opv->ident.name,
                     (uint32_t)opv->ident.name_len);
                 bool val_is_global = val_sym &&
-                    scope_lookup_local(c->global_scope, val_sym->name, val_sym->name_len) != NULL;
+                    global_decl_lookup(c, val_sym->name, val_sym->name_len) != NULL;
                 if ((tgt_global || tgt_param) && val_sym &&
                     !val_sym->is_static && !val_is_global) {
                     checker_error(c, node->loc.line,
@@ -9100,7 +9122,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 (node->assign.target->kind == NODE_FIELD ||
                                  node->assign.target->kind == NODE_INDEX)) {
                                 Type *src_eff = type_unwrap_distinct(src->type);
-                                bool src_is_global = scope_lookup_local(c->global_scope,
+                                bool src_is_global = global_decl_lookup(c,
                                     src->name, src->name_len) != NULL;
                                 if (src_eff && src_eff->kind == TYPE_ARRAY &&
                                     !src->is_static && !src_is_global &&
@@ -9140,7 +9162,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             if (sroot && sroot->kind == NODE_IDENT) {
                                 Symbol *src = scope_lookup(c->current_scope,
                                     sroot->ident.name, (uint32_t)sroot->ident.name_len);
-                                bool src_is_global = src && scope_lookup_local(c->global_scope,
+                                bool src_is_global = src && global_decl_lookup(c,
                                     src->name, src->name_len) != NULL;
                                 if (src && (src->is_local_derived ||
                                             (!src->is_static && !src_is_global))) {
@@ -9203,7 +9225,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     else root = root->index_expr.object;
                                 }
                                 if (root && root->kind == NODE_IDENT) {
-                                    bool is_global = scope_lookup_local(c->global_scope,
+                                    bool is_global = global_decl_lookup(c,
                                         root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                                     Symbol *src = scope_lookup(c->current_scope,
                                         root->ident.name, (uint32_t)root->ident.name_len);
@@ -9304,7 +9326,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* Slice-borrow root: a non-static non-global ident is a
                          * local (mirrors checker.c:10186 promotion in the return
                          * escape walker). */
-                        bool sym_is_global = scope_lookup_local(c->global_scope,
+                        bool sym_is_global = global_decl_lookup(c,
                             val_sym->name, val_sym->name_len) != NULL;
                         if (!val_sym->is_static && !sym_is_global) val_is_local = true;
                     }
@@ -9485,7 +9507,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     fb->unary.operand->ident.name,
                     (uint32_t)fb->unary.operand->ident.name_len);
                 bool src_is_global = src && (src->is_static ||
-                    scope_lookup_local(c->global_scope, src->name, src->name_len) != NULL);
+                    global_decl_lookup(c, src->name, src->name_len) != NULL);
                 if (src && !src_is_global) fb_is_local = true;
             }
             if (fb && fb->kind == NODE_IDENT) {
@@ -9534,7 +9556,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         Symbol *src = scope_lookup(c->current_scope,
                             vroot->ident.name, (uint32_t)vroot->ident.name_len);
                         bool src_global = src && (src->is_static ||
-                            scope_lookup_local(c->global_scope, src->name, src->name_len) != NULL);
+                            global_decl_lookup(c, src->name, src->name_len) != NULL);
                         if (src && !src_global) {
                             checker_error(c, node->loc.line,
                                 "cannot store pointer to local '%.*s' through function call — "
@@ -9664,7 +9686,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     Symbol *vsym = scope_lookup(c->current_scope,
                         vroot->ident.name, (uint32_t)vroot->ident.name_len);
                     bool val_is_global = vsym &&
-                        (vsym->is_static || scope_lookup_local(c->global_scope,
+                        (vsym->is_static || global_decl_lookup(c,
                             vsym->name, vsym->name_len) != NULL);
                     if (vsym && !val_is_global) {
                         /* value root is local — reject if target is global/static OR
@@ -9740,7 +9762,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                     if (obj->kind == NODE_IDENT) {
                                         Symbol *asrc = scope_lookup(c->current_scope,
                                             obj->ident.name, (uint32_t)obj->ident.name_len);
-                                        if (!asrc) asrc = scope_lookup(c->global_scope,
+                                        if (!asrc) asrc = global_decl_lookup(c,
                                             obj->ident.name, (uint32_t)obj->ident.name_len);
                                         tsym->arena_source = asrc;
                                     }
@@ -9829,7 +9851,7 @@ static Type *check_expr(Checker *c, Node *node) {
             uint32_t vlen = (uint32_t)vroot_esc->ident.name_len;
             Symbol *val_sym = scope_lookup(c->current_scope, vname, vlen);
             bool val_is_global = val_sym &&
-                scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                global_decl_lookup(c, vname, vlen) != NULL;
             /* A by-reference array PARAM points at CALLER memory, so storing a
              * view of it is safe at this frame — the escape is gated at the CALL
              * SITE instead (the BUG-764 param-view relaxation). Excluding it here
@@ -9856,7 +9878,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         root->ident.name, (uint32_t)root->ident.name_len);
                     bool tgt_is_global = tgt_sym &&
                         (tgt_sym->is_static ||
-                         scope_lookup_local(c->global_scope, tgt_sym->name, tgt_sym->name_len) != NULL);
+                         global_decl_lookup(c, tgt_sym->name, tgt_sym->name_len) != NULL);
                     if (tgt_is_global) {
                         checker_error(c, node->loc.line,
                             "cannot store local array '%.*s' in global/static slice — "
@@ -10139,7 +10161,7 @@ static Type *check_expr(Checker *c, Node *node) {
          * (check_atomic_cell_safety) still decides; this only supplies accesses. */
         if (c->after_spawn_in_func && node->call.callee &&
             node->call.callee->kind == NODE_IDENT) {
-            Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+            Symbol *cs = global_decl_lookup(c, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
@@ -10155,13 +10177,13 @@ static Type *check_expr(Checker *c, Node *node) {
          * forwards THIS parameter position into a spawn, and if so scan the named
          * function exactly as the direct spawn-arg path does. */
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *tgt = scope_lookup(c->global_scope, node->call.callee->ident.name,
+            Symbol *tgt = global_decl_lookup(c, node->call.callee->ident.name,
                                        (uint32_t)node->call.callee->ident.name_len);
             if (tgt && tgt->is_function) {
                 for (int ai = 0; ai < node->call.arg_count; ai++) {
                     Node *an = node->call.args[ai];
                     if (!an || an->kind != NODE_IDENT) continue;
-                    Symbol *fsym = scope_lookup(c->global_scope, an->ident.name,
+                    Symbol *fsym = global_decl_lookup(c, an->ident.name,
                                                 (uint32_t)an->ident.name_len);
                     if (!fsym || !fsym->is_function || !fsym->func_node ||
                         fsym->func_node->kind != NODE_FUNC_DECL ||
@@ -10282,7 +10304,7 @@ static Type *check_expr(Checker *c, Node *node) {
         if (node->call.callee) {
             Node *cal = node->call.callee;
             Symbol *rc = (cal->kind == NODE_IDENT)
-                ? scope_lookup(c->global_scope, cal->ident.name, (uint32_t)cal->ident.name_len)
+                ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len)
                 : NULL;
             if (rc && rc->is_function) {
                 uint64_t rm = func_rmw_param_mask(c, rc, 0);
@@ -10422,7 +10444,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *rs = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        bool rs_global = rs && scope_lookup_local(c->global_scope,
+                        bool rs_global = rs && global_decl_lookup(c,
                             rs->name, rs->name_len) != NULL;
                         /* The root's own type must itself be INLINE storage — an
                          * array or an aggregate holding one. A root that IS a
@@ -10476,7 +10498,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     mangled[maybe_mod_len + 1] = '_';
                     memcpy(mangled + maybe_mod_len + 2, func_name, func_len);
                     mangled[mang_len] = '\0';
-                    Symbol *mod_func = scope_lookup(c->global_scope, mangled, mang_len);
+                    Symbol *mod_func = global_decl_lookup(c, mangled, mang_len);
                     if (mod_func && mod_func->is_function) {
                         /* rewrite callee to raw function name — the existing
                          * unqualified resolution finds it in global scope */
@@ -11328,7 +11350,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                 (uint32_t)aroot->ident.name_len);
                             if (arg_sym && !arg_sym->is_static) {
                                 /* BUG-317: check both raw AND mangled keys for imported globals */
-                                bool is_global = scope_lookup_local(c->global_scope,
+                                bool is_global = global_decl_lookup(c,
                                     arg_sym->name, arg_sym->name_len) != NULL;
                                 if (!is_global && c->current_module) {
                                     /* try mangled: module__name (BUG-332: double underscore) */
@@ -11339,7 +11361,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                         mk[c->current_module_len] = '_';
                                         mk[c->current_module_len + 1] = '_';
                                         memcpy(mk + c->current_module_len + 2, arg_sym->name, arg_sym->name_len);
-                                        is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
+                                        is_global = global_decl_lookup(c, mk, mkl) != NULL;
                                     }
                                 }
                                 if (!is_global && edge_vkind == KV_NONE) {
@@ -11424,7 +11446,7 @@ static Type *check_expr(Checker *c, Node *node) {
                                  * is_local_derived (a local ARRAY ident is plain), but
                                  * `local[0..]` still borrows stack memory. */
                                 if (ld_via_slice && arg_sym && !arg_sym->is_static && edge_vkind == KV_NONE) {
-                                    bool sym_is_global = scope_lookup_local(c->global_scope,
+                                    bool sym_is_global = global_decl_lookup(c,
                                         arg_sym->name, arg_sym->name_len) != NULL;
                                     if (!sym_is_global && !arg_sym->is_local_derived) {
                                         edge_vkind = KV_SLICE_LOCAL;
@@ -11450,7 +11472,7 @@ static Type *check_expr(Checker *c, Node *node) {
                             if (arg_sym && !arg_sym->is_static &&
                                 type_dispatch_kind(arg_sym->type) == TYPE_ARRAY &&
                                 edge_vkind == KV_NONE) {
-                                bool sym_is_global = scope_lookup_local(c->global_scope,
+                                bool sym_is_global = global_decl_lookup(c,
                                     arg_sym->name, arg_sym->name_len) != NULL;
                                 if (!sym_is_global) {
                                     edge_vkind = KV_LOCAL_ARRAY;
@@ -11717,7 +11739,7 @@ static Type *check_expr(Checker *c, Node *node) {
             for (int ri = 0; ri < c->var_range_count; ri++) {
                 struct VarRange *r = &c->var_ranges[ri];
                 /* Check if this range entry is for a global variable */
-                Symbol *rsym = scope_lookup_local(c->global_scope, r->name, r->name_len);
+                Symbol *rsym = global_decl_lookup(c, r->name, r->name_len);
                 if (rsym && !rsym->is_function && !rsym->is_const) {
                     r->min_val = INT64_MIN;
                     r->max_val = INT64_MAX;
@@ -11781,7 +11803,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     mangled[maybe_mod_len + 1] = '_';
                     memcpy(mangled + maybe_mod_len + 2, fname, flen);
                     mangled[mang_len] = '\0';
-                    Symbol *gsym = scope_lookup(c->global_scope, mangled, mang_len);
+                    Symbol *gsym = global_decl_lookup(c, mangled, mang_len);
                     if (gsym && gsym->type) {
                         /* rewrite to NODE_IDENT with the raw field name.
                          * The emitter resolves via mangled lookup in global scope.
@@ -12320,7 +12342,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *csym = scope_lookup(c->current_scope,
                     node->index_expr.index->call.callee->ident.name,
                     (uint32_t)node->index_expr.index->call.callee->ident.name_len);
-                if (!csym) csym = scope_lookup(c->global_scope,
+                if (!csym) csym = global_decl_lookup(c,
                     node->index_expr.index->call.callee->ident.name,
                     (uint32_t)node->index_expr.index->call.callee->ident.name_len);
                 if (csym && csym->has_return_range &&
@@ -14811,7 +14833,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         else root = root->index_expr.object;
                     }
                     if (root && root->kind == NODE_IDENT) {
-                        bool is_glob = scope_lookup_local(c->global_scope,
+                        bool is_glob = global_decl_lookup(c,
                             root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                         Symbol *rs = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
@@ -15629,7 +15651,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 bool heap_backed = false;
                 Node *recv = node->call.callee->field.object;
                 if (recv && recv->kind == NODE_IDENT) {
-                    Symbol *rs = scope_lookup(c->global_scope,
+                    Symbol *rs = global_decl_lookup(c,
                         recv->ident.name, (uint32_t)recv->ident.name_len);
                     if (rs && rs->type) {
                         Type *rt = type_unwrap_distinct(rs->type);
@@ -15670,7 +15692,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
             bool universal = (ucl == 5 && memcmp(ucn, "alloc", 5) == 0) ||
                              (ucl == 4 && memcmp(ucn, "free", 4) == 0);
             if (universal) {
-                Symbol *usym = scope_lookup(c->global_scope, ucn, ucl);
+                Symbol *usym = global_decl_lookup(c, ucn, ucl);
                 if (!usym || !usym->is_function) {
                     parent_sym->props.can_alloc = true;
                     parent_sym->props.has_direct_alloc = true;
@@ -15680,7 +15702,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
 
         /* Transitive: follow direct function calls */
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *callee = scope_lookup(c->global_scope,
+            Symbol *callee = global_decl_lookup(c,
                 node->call.callee->ident.name,
                 (uint32_t)node->call.callee->ident.name_len);
             if (callee && callee->is_function) {
@@ -15706,7 +15728,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         for (int ai = 0; ai < node->call.arg_count; ai++) {
             Node *arg = node->call.args[ai];
             if (!arg || arg->kind != NODE_IDENT) continue;
-            Symbol *fs = scope_lookup(c->global_scope,
+            Symbol *fs = global_decl_lookup(c,
                 arg->ident.name, (uint32_t)arg->ident.name_len);
             if (fs && fs->is_function) {
                 ensure_func_props(c, fs);
@@ -15732,7 +15754,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 memcpy(mangled, mod, modl);
                 mangled[modl] = '_'; mangled[modl+1] = '_';
                 memcpy(mangled + modl + 2, fn, fnl);
-                Symbol *callee = scope_lookup(c->global_scope, mangled, modl + 2 + fnl);
+                Symbol *callee = global_decl_lookup(c, mangled, modl + 2 + fnl);
                 if (callee && callee->is_function) {
                     ensure_func_props(c, callee);
                     if (callee->props.can_yield) parent_sym->props.can_yield = true;
@@ -16037,7 +16059,7 @@ static bool node_forwards_param_to_spawn(Checker *c, Node *n, const char *pname,
     if (n->kind == NODE_CALL) {
         /* forwarded one hop further: `mid(fp)` where mid spawns with ITS param */
         if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
-            Symbol *cs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+            Symbol *cs = global_decl_lookup(c, n->call.callee->ident.name,
                                       (uint32_t)n->call.callee->ident.name_len);
             if (cs && cs->is_function) {
                 for (int i = 0; i < n->call.arg_count; i++) {
@@ -16157,7 +16179,7 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         if (v && v->kind == NODE_CALL)
             return scan_funcname_binding(c, v, out_name, out_len);
         if (!v || v->kind != NODE_IDENT) return false;
-        Symbol *fs = scope_lookup(c->global_scope, v->ident.name,
+        Symbol *fs = global_decl_lookup(c, v->ident.name,
                                   (uint32_t)v->ident.name_len);
         if (!fs || !fs->is_function || !fs->func_node ||
             fs->func_node->kind != NODE_FUNC_DECL ||
@@ -16257,7 +16279,7 @@ static bool scan_funcname_binding(Checker *c, Node *n,
      * returned, the race is reachable. */
     if (n && n->kind == NODE_CALL && n->call.callee &&
         n->call.callee->kind == NODE_IDENT) {
-        Symbol *gs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+        Symbol *gs = global_decl_lookup(c, n->call.callee->ident.name,
                                   (uint32_t)n->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
             gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body &&
@@ -16270,7 +16292,7 @@ static bool scan_funcname_binding(Checker *c, Node *n,
         }
     }
     if (!n || n->kind != NODE_IDENT) return false;
-    Symbol *fs = scope_lookup(c->global_scope, n->ident.name,
+    Symbol *fs = global_decl_lookup(c, n->ident.name,
                               (uint32_t)n->ident.name_len);
     if (!fs || !fs->is_function || !fs->func_node ||
         fs->func_node->kind != NODE_FUNC_DECL ||
@@ -16342,7 +16364,7 @@ static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
             if (body_calls_funcptr_field(c, n->call.args[i], depth)) return true;
         /* descend into a directly-called global function */
         if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
-            Symbol *fs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+            Symbol *fs = global_decl_lookup(c, n->call.callee->ident.name,
                                       (uint32_t)n->call.callee->ident.name_len);
             if (fs && fs->is_function && fs->func_node &&
                 fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
@@ -16419,7 +16441,7 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
              * props: an @atomic/@barrier in the CALLBACK is the manual-sync
              * signal, not one in the spawn target. */
             if (out_fn && n->assign.value && n->assign.value->kind == NODE_IDENT)
-                *out_fn = scope_lookup(c->global_scope, n->assign.value->ident.name,
+                *out_fn = global_decl_lookup(c, n->assign.value->ident.name,
                                        (uint32_t)n->assign.value->ident.name_len);
             return true;
         }
@@ -16430,7 +16452,7 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
             if (scan_funcname_binding(c, n->struct_init.fields[i].value, out_name, out_len)) {
                 Node *fv = n->struct_init.fields[i].value;
                 if (out_fn && fv && fv->kind == NODE_IDENT)
-                    *out_fn = scope_lookup(c->global_scope, fv->ident.name,
+                    *out_fn = global_decl_lookup(c, fv->ident.name,
                                            (uint32_t)fv->ident.name_len);
                 return true;
             }
@@ -16441,7 +16463,7 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
             if (scan_funcptr_field_bindings(c, n->call.args[i], depth, out_name, out_len, out_fn))
                 return true;
         if (n->call.callee && n->call.callee->kind == NODE_IDENT) {
-            Symbol *fs = scope_lookup(c->global_scope, n->call.callee->ident.name,
+            Symbol *fs = global_decl_lookup(c, n->call.callee->ident.name,
                                       (uint32_t)n->call.callee->ident.name_len);
             if (fs && fs->is_function && fs->func_node &&
                 fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
@@ -16489,7 +16511,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                                        const char **out_name, uint32_t *out_len) {
     if (!node) return false;
     if (node->kind == NODE_IDENT) {
-        Symbol *sym = scope_lookup(c->global_scope,
+        Symbol *sym = global_decl_lookup(c,
             node->ident.name, (uint32_t)node->ident.name_len);
         if (sym && !sym->is_function && sym->type) {
             /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
@@ -16688,7 +16710,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             /* Transitive: follow direct function calls into callee body.
              * This catches helper() accessing non-shared globals from spawned context. */
             if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-                Symbol *csym = scope_lookup(c->global_scope,
+                Symbol *csym = global_decl_lookup(c,
                     node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
                 if (csym && csym->is_function && csym->func_node &&
                     csym->func_node->kind == NODE_FUNC_DECL &&
@@ -16768,7 +16790,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             for (int i = 0; i < node->call.arg_count; i++) {
                 Node *a = node->call.args[i];
                 if (!a || a->kind != NODE_IDENT) continue;
-                Symbol *asym = scope_lookup(c->global_scope,
+                Symbol *asym = global_decl_lookup(c,
                     a->ident.name, (uint32_t)a->ident.name_len);
                 if (!asym || !asym->is_function || !asym->func_node ||
                     asym->func_node->kind != NODE_FUNC_DECL ||
@@ -16955,7 +16977,7 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
             const char *vn = root->ident.name;
             uint32_t vl = (uint32_t)root->ident.name_len;
             Symbol *s = scope_lookup(c->current_scope, vn, vl);
-            bool is_global = scope_lookup_local(c->global_scope, vn, vl) != NULL;
+            bool is_global = global_decl_lookup(c, vn, vl) != NULL;
             if (s && !s->is_static && !is_global) return true;
         }
         return false;
@@ -16965,7 +16987,7 @@ static bool spawn_arg_is_stack_derived(Checker *c, Node *arg) {
                                  (uint32_t)e->ident.name_len);
         if (s) {
             if (s->is_local_derived || s->is_arena_derived) return true;
-            bool is_global = scope_lookup_local(c->global_scope, e->ident.name,
+            bool is_global = global_decl_lookup(c, e->ident.name,
                                  (uint32_t)e->ident.name_len) != NULL;
             if (!s->is_static && !is_global && s->type) {
                 Type *st = type_unwrap_distinct(s->type);
@@ -17561,7 +17583,7 @@ static void check_stmt(Checker *c, Node *node) {
                              * (global arenas outlive functions, pointers safe to return) */
                             bool arena_is_global = false;
                             if (obj->kind == NODE_IDENT) {
-                                arena_is_global = scope_lookup_local(c->global_scope,
+                                arena_is_global = global_decl_lookup(c,
                                     obj->ident.name, (uint32_t)obj->ident.name_len) != NULL;
                             }
                             if (!arena_is_global)
@@ -17574,7 +17596,7 @@ static void check_stmt(Checker *c, Node *node) {
                             if (obj->kind == NODE_IDENT) {
                                 Symbol *asrc = scope_lookup(c->current_scope,
                                     obj->ident.name, (uint32_t)obj->ident.name_len);
-                                if (!asrc) asrc = scope_lookup(c->global_scope,
+                                if (!asrc) asrc = global_decl_lookup(c,
                                     obj->ident.name, (uint32_t)obj->ident.name_len);
                                 sym->arena_source = asrc;
                             }
@@ -17585,7 +17607,7 @@ static void check_stmt(Checker *c, Node *node) {
                                 Symbol *alloc_src = scope_lookup(c->current_scope,
                                     obj->ident.name, (uint32_t)obj->ident.name_len);
                                 if (!alloc_src)
-                                    alloc_src = scope_lookup(c->global_scope,
+                                    alloc_src = global_decl_lookup(c,
                                         obj->ident.name, (uint32_t)obj->ident.name_len);
                                 if (alloc_src) sym->slab_source = alloc_src;
                             }
@@ -17776,7 +17798,7 @@ static void check_stmt(Checker *c, Node *node) {
                         else root = root->index_expr.object;
                     }
                     if (root && root->kind == NODE_IDENT) {
-                        bool is_global = scope_lookup_local(c->global_scope,
+                        bool is_global = global_decl_lookup(c,
                             root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                         Symbol *src = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
@@ -17881,7 +17903,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (buf && buf->kind == NODE_IDENT) {
                     Symbol *bsym = scope_lookup(c->current_scope,
                         buf->ident.name, (uint32_t)buf->ident.name_len);
-                    bool is_global = scope_lookup_local(c->global_scope,
+                    bool is_global = global_decl_lookup(c,
                         buf->ident.name, (uint32_t)buf->ident.name_len) != NULL;
                     if (bsym && !bsym->is_static && !is_global)
                         sym->is_local_derived = true;
@@ -19502,7 +19524,7 @@ static void check_stmt(Checker *c, Node *node) {
                         else root = root->index_expr.object;
                     }
                     if (root && root->kind == NODE_IDENT) {
-                        bool is_global = scope_lookup_local(c->global_scope,
+                        bool is_global = global_decl_lookup(c,
                             root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                         if (!is_global) {
                             checker_error(c, node->loc.line,
@@ -19536,7 +19558,7 @@ static void check_stmt(Checker *c, Node *node) {
                     const char *vname = root->ident.name;
                     uint32_t vlen = (uint32_t)root->ident.name_len;
                     Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
-                    bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                    bool is_global = global_decl_lookup(c, vname, vlen) != NULL;
                     /* RELAXATION (2026-07-20, BUG-764 class): a `u8[N]` array PARAM
                      * is passed BY-REFERENCE (it decays to a pointer into the
                      * CALLER's array — empirically verified: mutating the param is
@@ -19599,7 +19621,7 @@ static void check_stmt(Checker *c, Node *node) {
                         if (inner && inner->kind == NODE_IDENT) {
                             Symbol *sym = scope_lookup(c->current_scope,
                                 inner->ident.name, (uint32_t)inner->ident.name_len);
-                            bool is_global = scope_lookup_local(c->global_scope,
+                            bool is_global = global_decl_lookup(c,
                                 inner->ident.name, (uint32_t)inner->ident.name_len) != NULL;
                             /* RELAXATION: `return &s[0]` where s is a slice/pointer
                              * param/external (NOT local-derived) points into the
@@ -19664,7 +19686,7 @@ static void check_stmt(Checker *c, Node *node) {
                              * binding. Covers `return arr[0..]` AND
                              * `return s.f[0..]` (field-of-local-struct). */
                             if (sliced_borrow && region == ZER_REGION_STATIC) {
-                                bool is_global = scope_lookup_local(c->global_scope,
+                                bool is_global = global_decl_lookup(c,
                                     sym->name, sym->name_len) != NULL;
                                 /* RELAXATION (return-borrow-from-param): a slice/
                                  * pointer ROOT here has region STATIC, i.e. it is NOT
@@ -19716,7 +19738,7 @@ static void check_stmt(Checker *c, Node *node) {
                     const char *vname = root->ident.name;
                     uint32_t vlen = (uint32_t)root->ident.name_len;
                     Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
-                    bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                    bool is_global = global_decl_lookup(c, vname, vlen) != NULL;
                     /* RELAXATION: `return &s[0]` where s is a slice/pointer PARAM (or
                      * any slice/pointer that is NOT local-derived) points into the
                      * CALLER's memory — safe at the function level; the call site
@@ -19774,7 +19796,7 @@ static void check_stmt(Checker *c, Node *node) {
                         if (root && root->kind == NODE_IDENT) {
                             Symbol *sym = scope_lookup(c->current_scope,
                                 root->ident.name, (uint32_t)root->ident.name_len);
-                            bool is_global = scope_lookup_local(c->global_scope,
+                            bool is_global = global_decl_lookup(c,
                                 root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                             if (sym && !sym->is_static && !is_global) {
                                 checker_error(c, node->loc.line,
@@ -19841,7 +19863,7 @@ static void check_stmt(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         Symbol *sym = scope_lookup(c->current_scope,
                             root->ident.name, (uint32_t)root->ident.name_len);
-                        bool is_global = scope_lookup_local(c->global_scope,
+                        bool is_global = global_decl_lookup(c,
                             root->ident.name, (uint32_t)root->ident.name_len) != NULL;
                         if (sym && !sym->is_static && !is_global) {
                             checker_error(c, node->loc.line,
@@ -19934,7 +19956,7 @@ static void check_stmt(Checker *c, Node *node) {
                     if (root && root->kind == NODE_IDENT) {
                         const char *vname = root->ident.name;
                         uint32_t vlen = (uint32_t)root->ident.name_len;
-                        bool is_global = scope_lookup_local(c->global_scope, vname, vlen) != NULL;
+                        bool is_global = global_decl_lookup(c, vname, vlen) != NULL;
                         Symbol *sym = scope_lookup(c->current_scope, vname, vlen);
                         if (sym && !sym->is_static && !is_global) {
                             checker_error(c, node->loc.line,
@@ -19983,7 +20005,7 @@ static void check_stmt(Checker *c, Node *node) {
                         node->ret.expr->ident.name,
                         (uint32_t)node->ret.expr->ident.name_len);
                     bool rglobal = rs && (rs->is_static ||
-                        scope_lookup_local(c->global_scope, rs->name,
+                        global_decl_lookup(c, rs->name,
                                            rs->name_len) != NULL);
                     if (rglobal)
                         checker_error(c, node->loc.line,
@@ -20677,7 +20699,7 @@ static void check_stmt(Checker *c, Node *node) {
                      * Naked-fn-only restriction means non-keep ptr params are
                      * the typical case here. */
                     if (sym->is_static) continue;
-                    if (scope_lookup_local(c->global_scope, sym->name, sym->name_len)) continue;
+                    if (global_decl_lookup(c, sym->name, sym->name_len)) continue;
                     if (sym->is_local_derived || sym->is_arena_derived) continue;
                     checker_error(c, op->loc.line,
                         "asm input '%.*s' binds non-keep pointer parameter "
@@ -21362,7 +21384,7 @@ static void check_stmt(Checker *c, Node *node) {
             c->after_spawn_in_func = true;
             c->unbounded_spawn_in_func = true;
         }
-        Symbol *func_sym = scope_lookup(c->global_scope,
+        Symbol *func_sym = global_decl_lookup(c,
             node->spawn_stmt.func_name, (uint32_t)node->spawn_stmt.func_name_len);
         if (!func_sym || !func_sym->is_function) {
             checker_error(c, node->loc.line,
@@ -21675,7 +21697,7 @@ static void check_stmt(Checker *c, Node *node) {
                             karg->unary.operand->ident.name,
                             (uint32_t)karg->unary.operand->ident.name_len);
                         if (asym && !asym->is_static) {
-                            bool is_global = scope_lookup_local(c->global_scope,
+                            bool is_global = global_decl_lookup(c,
                                 asym->name, asym->name_len) != NULL;
                             if (!is_global && c->current_module) {
                                 uint32_t mkl = c->current_module_len + 2 + asym->name_len;
@@ -21685,7 +21707,7 @@ static void check_stmt(Checker *c, Node *node) {
                                     mk[c->current_module_len] = '_';
                                     mk[c->current_module_len + 1] = '_';
                                     memcpy(mk + c->current_module_len + 2, asym->name, asym->name_len);
-                                    is_global = scope_lookup_local(c->global_scope, mk, mkl) != NULL;
+                                    is_global = global_decl_lookup(c, mk, mkl) != NULL;
                                 }
                             }
                             if (!is_global) {
@@ -21708,7 +21730,7 @@ static void check_stmt(Checker *c, Node *node) {
                         } else if (asym && !asym->is_static &&
                                    asym->type &&
                                    type_dispatch_kind(asym->type) == TYPE_ARRAY) {
-                            bool sym_is_global = scope_lookup_local(c->global_scope,
+                            bool sym_is_global = global_decl_lookup(c,
                                 asym->name, asym->name_len) != NULL;
                             if (!sym_is_global) {
                                 edge_vkind = KV_LOCAL_ARRAY;
@@ -21856,7 +21878,7 @@ static void check_stmt(Checker *c, Node *node) {
                     const char *vn = cand_n[ci];
                     uint32_t vl = cand_l[ci];
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
-                    bool vglobal = scope_lookup_local(c->global_scope,
+                    bool vglobal = global_decl_lookup(c,
                                        vn, vl) != NULL;
                     /* D4 (2026-08-01): a THREADLOCAL lives in global_scope, so the
                      * `vglobal` skip below silently dropped it — no borrow was
@@ -22009,7 +22031,7 @@ static void check_stmt(Checker *c, Node *node) {
         for (int ai = 0; ai < node->spawn_stmt.arg_count; ai++) {
             Node *an = node->spawn_stmt.args[ai];
             if (!an || an->kind != NODE_IDENT) continue;
-            Symbol *asym = scope_lookup(c->global_scope, an->ident.name,
+            Symbol *asym = global_decl_lookup(c, an->ident.name,
                                         (uint32_t)an->ident.name_len);
             /* 2026-08-06: the arg may be a LOCAL funcptr VARIABLE rather than a
              * bare function name — `*() fp = bump; spawn w(fp);`. The lookup
@@ -22036,7 +22058,7 @@ static void check_stmt(Checker *c, Node *node) {
                     lsym->func_node->var_decl.init &&
                     lsym->func_node->var_decl.init->kind == NODE_IDENT) {
                     Node *bnd = lsym->func_node->var_decl.init;
-                    Symbol *bsym = scope_lookup(c->global_scope, bnd->ident.name,
+                    Symbol *bsym = global_decl_lookup(c, bnd->ident.name,
                                                 (uint32_t)bnd->ident.name_len);
                     if (bsym && bsym->is_function) {
                         asym = bsym;
@@ -23176,7 +23198,7 @@ static void check_func_body(Checker *c, Node *node) {
         c->current_func_node = node;
         c->current_body = node->func_decl.body;   /* BUG-1056 */
         {
-            Symbol *fsym = scope_lookup_local(c->global_scope, node->func_decl.name,
+            Symbol *fsym = global_decl_lookup(c, node->func_decl.name,
                                               (uint32_t)node->func_decl.name_len);
             c->current_func_sig = (fsym && fsym->type &&
                 type_dispatch_kind(fsym->type) == TYPE_FUNC_PTR) ? fsym->type : NULL;
@@ -23442,7 +23464,7 @@ static void check_func_body(Checker *c, Node *node) {
                         (int)node->func_decl.name_len, node->func_decl.name);
                     if (rl >= (int)sizeof(rn)) rl = (int)sizeof(rn) - 1;
                     Symbol *rsym = scope_lookup(c->current_scope, rn, (uint32_t)rl);
-                    if (!rsym) rsym = scope_lookup(c->global_scope, rn, (uint32_t)rl);
+                    if (!rsym) rsym = global_decl_lookup(c, rn, (uint32_t)rl);
                     if (rsym) {
                         rsym->ret_summary_complete = c->cur_ret_summary_complete;
                         rsym->ret_param_mask = c->cur_ret_param_mask;
@@ -23583,7 +23605,7 @@ static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name
     while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
     if (rl == 0) return false;
     Symbol *s = scope_lookup(c->current_scope, name, rl);
-    if (!s) s = scope_lookup(c->global_scope, name, rl);
+    if (!s) s = global_decl_lookup(c, name, rl);
     return s && s->is_volatile;
 }
 
@@ -24268,7 +24290,7 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
  * followed — see docs/limitations.md. */
 static void track_isr_pointee_of(Checker *c, Node *ident) {
     if (!ident || ident->kind != NODE_IDENT) return;
-    Symbol *ps = scope_lookup(c->global_scope, ident->ident.name,
+    Symbol *ps = global_decl_lookup(c, ident->ident.name,
                               (uint32_t)ident->ident.name_len);
     if (!ps || ps->is_function || type_dispatch_kind(ps->type) != TYPE_POINTER) return;
     Symbol *t = resolve_write_target_global(c, ident, 0);
@@ -24422,7 +24444,7 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
      * callee's return sites, exactly as the spawn resolver does. */
     if (value->kind == NODE_CALL && value->call.callee &&
         value->call.callee->kind == NODE_IDENT && depth < 8) {
-        Symbol *gs = scope_lookup(c->global_scope, value->call.callee->ident.name,
+        Symbol *gs = global_decl_lookup(c, value->call.callee->ident.name,
                                   (uint32_t)value->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
             gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body)
@@ -24430,7 +24452,7 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
         return;
     }
     if (value->kind != NODE_IDENT) return;
-    Symbol *fs = scope_lookup(c->global_scope, value->ident.name,
+    Symbol *fs = global_decl_lookup(c, value->ident.name,
                               (uint32_t)value->ident.name_len);
     if (fs && fs->is_function && fs->func_node &&
         fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
@@ -24478,7 +24500,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
     }
     switch (node->kind) {
     case NODE_IDENT: {
-        Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+        Symbol *gs = global_decl_lookup(c, node->ident.name,
                                   (uint32_t)node->ident.name_len);
         if (gs && !gs->is_function) {
             track_isr_global(c, node->ident.name, (uint32_t)node->ident.name_len, false);
@@ -24529,7 +24551,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
             record_isr_funcname_binding(c, node->call.args[i], depth);
         }
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *cs = scope_lookup(c->global_scope,
+            Symbol *cs = global_decl_lookup(c,
                 node->call.callee->ident.name, (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
@@ -24759,7 +24781,7 @@ static bool atomic_path_key(Checker *c, Node *e, Symbol **out_s,
         cur = (cur->kind == NODE_FIELD) ? cur->field.object : cur->index_expr.object;
     }
     if (!cur || cur->kind != NODE_IDENT || n == 0) return false;
-    Symbol *gs = scope_lookup_local(c->global_scope, cur->ident.name,
+    Symbol *gs = global_decl_lookup(c, cur->ident.name,
                                     (uint32_t)cur->ident.name_len);
     if (!gs || gs->is_function) return false;
     /* measure, then fill (no fixed buffer — Rule #7) */
@@ -24818,7 +24840,7 @@ static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
     if (e && e->kind == NODE_UNARY && e->unary.op == TOK_AMP)
         e = e->unary.operand;
     if (e && e->kind == NODE_IDENT) {
-        Symbol *gs = scope_lookup(c->global_scope, e->ident.name,
+        Symbol *gs = global_decl_lookup(c, e->ident.name,
                                   (uint32_t)e->ident.name_len);
         if (gs && !gs->is_function && gs->type && type_is_integer(gs->type))
             return gs;
@@ -24858,7 +24880,7 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
     if (!node || depth > 32) return;
     switch (node->kind) {
     case NODE_IDENT: {
-        Symbol *gs = scope_lookup(c->global_scope, node->ident.name,
+        Symbol *gs = global_decl_lookup(c, node->ident.name,
                                   (uint32_t)node->ident.name_len);
         if (gs && !gs->is_function)
             record_atomic_plain_write(c, gs, node->loc.line);
@@ -24881,7 +24903,7 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
         if (node->call.callee && node->call.callee->kind != NODE_IDENT)
             record_atomic_plain_in_callee(c, node->call.callee, depth);
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *cs = scope_lookup(c->global_scope, node->call.callee->ident.name,
+            Symbol *cs = global_decl_lookup(c, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
@@ -25003,7 +25025,7 @@ static bool atomic_struct_field_target(Checker *c, Node *e, Symbol **out_s,
         e = e->unary.operand;
     if (!e || e->kind != NODE_FIELD) return false;
     if (!e->field.object || e->field.object->kind != NODE_IDENT) return false;
-    Symbol *gs = scope_lookup(c->global_scope, e->field.object->ident.name,
+    Symbol *gs = global_decl_lookup(c, e->field.object->ident.name,
                               (uint32_t)e->field.object->ident.name_len);
     if (!gs || gs->is_function || !gs->type) return false;
     Type *st = type_unwrap_distinct(gs->type);
@@ -25122,7 +25144,7 @@ static void check_interrupt_safety(Checker *c) {
                 (int)g->name_len, g->name);
             continue;
         }
-        Symbol *sym = scope_lookup(c->global_scope, g->name, g->name_len);
+        Symbol *sym = global_decl_lookup(c, g->name, g->name_len);
         if (!sym) continue;
         TypeKind gk = type_dispatch_kind(sym->type);
         if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
@@ -25321,7 +25343,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
     }
     case NODE_CALL:
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
-            Symbol *sym = scope_lookup(c->global_scope,
+            Symbol *sym = global_decl_lookup(c,
                 node->call.callee->ident.name,
                 (uint32_t)node->call.callee->ident.name_len);
             if (sym && sym->is_function) {
@@ -25342,7 +25364,7 @@ static void scan_frame(Checker *c, struct StackFrame *frame, Node *node) {
                     sym->func_node->var_decl.init->kind == NODE_IDENT) {
                     const char *target = sym->func_node->var_decl.init->ident.name;
                     uint32_t tlen = (uint32_t)sym->func_node->var_decl.init->ident.name_len;
-                    Symbol *tsym = scope_lookup(c->global_scope, target, tlen);
+                    Symbol *tsym = global_decl_lookup(c, target, tlen);
                     if (tsym && tsym->is_function) {
                         add_callee(frame, target, tlen);
                         resolved = true;
@@ -25924,7 +25946,7 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
             Symbol *csym = scope_lookup(c->current_scope,
                 node->ret.expr->call.callee->ident.name,
                 (uint32_t)node->ret.expr->call.callee->ident.name_len);
-            if (!csym) csym = scope_lookup(c->global_scope,
+            if (!csym) csym = global_decl_lookup(c,
                 node->ret.expr->call.callee->ident.name,
                 (uint32_t)node->ret.expr->call.callee->ident.name_len);
             if (csym && csym->has_return_range) {
@@ -26140,7 +26162,7 @@ static int classify_return_root(Checker *c, Node *rexpr) {
         if (ic && ic->kind == NODE_IDENT) {
             Symbol *icsym = scope_lookup(c->current_scope,
                 ic->ident.name, (uint32_t)ic->ident.name_len);
-            if (!icsym) icsym = scope_lookup(c->global_scope,
+            if (!icsym) icsym = global_decl_lookup(c,
                 ic->ident.name, (uint32_t)ic->ident.name_len);
             if (icsym && icsym->ret_summary_complete && icsym->ret_param_mask == 0)
                 return RET_STATIC;
@@ -26151,7 +26173,7 @@ static int classify_return_root(Checker *c, Node *rexpr) {
     /* resolve the binding — innermost wins, so a param SHADOWS a same-named global */
     Symbol *src  = scope_lookup(c->current_scope,
         root->ident.name, (uint32_t)root->ident.name_len);
-    Symbol *gsym = scope_lookup_local(c->global_scope,
+    Symbol *gsym = global_decl_lookup(c,
         root->ident.name, (uint32_t)root->ident.name_len);
     if (src && src == gsym) return RET_STATIC;    /* the name resolves to the global */
     if (src && src->is_static) return RET_STATIC; /* static-duration local */
@@ -26363,7 +26385,47 @@ void checker_register_file(Checker *c, Node *file_node) {
             if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_static) continue;
             if (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static) continue;
         }
-        register_decl(c, decl);
+        /* BUG-1120: a non-static global / function of an IMPORTED module whose
+         * raw name is already taken by another module. register_decl used to hit
+         * the collision in add_symbol_impl, get the OTHER module's Symbol back,
+         * and overwrite ITS fields with this declaration (func_node, qualifiers,
+         * MMIO bound...) — while this module's bodies then resolved the raw name
+         * to the other module's type: `Pool(IB, 4) items;` typed as `Pool(IA, 4)`,
+         * `u64 counter` as `u32`. Register it into a PRIVATE scope instead; the
+         * module scope picks it up (checker_push_module_scope). */
+        const char *own_n = NULL;
+        uint32_t own_l = 0;
+        if (c->current_module && decl->kind == NODE_FUNC_DECL) {
+            own_n = decl->func_decl.name; own_l = (uint32_t)decl->func_decl.name_len;
+        } else if (c->current_module && decl->kind == NODE_GLOBAL_VAR) {
+            own_n = decl->var_decl.name; own_l = (uint32_t)decl->var_decl.name_len;
+        }
+        if (own_n && scope_lookup_local(c->global_scope, own_n, own_l)) {
+            Scope *priv = scope_new(c->arena, c->global_scope);
+            Scope *saved = c->current_scope;
+            c->current_scope = priv;
+            register_decl(c, decl);
+            c->current_scope = saved;
+            Symbol *mine = scope_lookup_local(priv, own_n, own_l);
+            if (mine) {
+                if (c->module_own_count >= c->module_own_cap) {
+                    int nc = c->module_own_cap ? c->module_own_cap * 2 : 8;
+                    struct ModuleOwnSym *na = (struct ModuleOwnSym *)arena_alloc(
+                        c->arena, (size_t)nc * sizeof(struct ModuleOwnSym));
+                    if (na && c->module_own)
+                        memcpy(na, c->module_own,
+                               (size_t)c->module_own_count * sizeof(struct ModuleOwnSym));
+                    if (na) { c->module_own = na; c->module_own_cap = nc; }
+                }
+                if (c->module_own_count < c->module_own_cap) {
+                    c->module_own[c->module_own_count].decl = decl;
+                    c->module_own[c->module_own_count].sym = mine;
+                    c->module_own_count++;
+                }
+            }
+        } else {
+            register_decl(c, decl);
+        }
 
         /* BUG-233: also register imported non-static functions/globals under MANGLED key.
          * Without this, two modules with same-named functions (e.g., both have init())
@@ -26430,6 +26492,10 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
                           t, decl->loc.line, c->file_name);
             }
         }
+        /* BUG-1120: this module's own symbol for a name another module took. */
+        for (int mi = 0; mi < c->module_own_count; mi++)
+            if (c->module_own[mi].decl == decl)
+                scope_insert(c->arena, c->current_scope, c->module_own[mi].sym);
         /* BUG-222: register static functions and globals into module scope
          * AND into global scope (with module prefix for emitter lookup).
          * Module scope is for checker body-check; global scope is for emitter. */
@@ -26547,7 +26613,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * file. Function names (a funcptr global) and enum variants
              * (NODE_FIELD) are unaffected. */
             if (ginit->kind == NODE_IDENT) {
-                Symbol *gsrc = scope_lookup(c->global_scope,
+                Symbol *gsrc = global_decl_lookup(c,
                     ginit->ident.name, (uint32_t)ginit->ident.name_len);
                 if (gsrc && !gsrc->is_function && !gsrc->is_const) {
                     checker_error(c, decl->loc.line,
@@ -26665,7 +26731,7 @@ static void check_call_provenance(Checker *c, Node *node) {
             }
             /* ident with known provenance */
             if (!arg_prov && arg->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(c->global_scope, arg->ident.name,
+                Symbol *sym = global_decl_lookup(c, arg->ident.name,
                     (uint32_t)arg->ident.name_len);
                 if (sym && sym->provenance_type) arg_prov = sym->provenance_type;
             }
@@ -27063,7 +27129,7 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
     if (fsc->computed || fsc->in_progress) return; /* memoized or cycle */
     fsc->in_progress = true;
 
-    Symbol *sym = scope_lookup(c->global_scope, fname, flen);
+    Symbol *sym = global_decl_lookup(c, fname, flen);
     if (!sym || !sym->is_function || !sym->func_node ||
         sym->func_node->kind != NODE_FUNC_DECL || !sym->func_node->func_decl.body) {
         fsc->computed = true;
@@ -27111,7 +27177,7 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
             Node *obj = cur->field.object;
             Type *ot = obj ? typemap_get(c, obj) : NULL;
             if (!ot && obj && obj->kind == NODE_IDENT) {
-                Symbol *sym = scope_lookup(c->global_scope,
+                Symbol *sym = global_decl_lookup(c,
                     obj->ident.name, (uint32_t)obj->ident.name_len);
                 if (!sym) sym = scope_lookup(c->current_scope,
                     obj->ident.name, (uint32_t)obj->ident.name_len);
@@ -27587,7 +27653,7 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                  * it and contribute nothing — silently, which is the failure mode
                  * this flag exists to prevent. Resolve it and require a real
                  * function symbol with a body. */
-                Symbol *cs = scope_lookup(c->global_scope,
+                Symbol *cs = global_decl_lookup(c,
                     expr->call.callee->ident.name,
                     (uint32_t)expr->call.callee->ident.name_len);
                 /* A BODYLESS EXTERN IS NOT OPAQUE FOR THIS QUESTION. A cinclude'd C

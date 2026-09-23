@@ -1,0 +1,5 @@
+struct IB { u64 w; u64 x; }
+Pool(IB, 4) items;
+u64 counter;
+u64 bump() { counter += 100; return counter; }
+u32 b_use() { Handle(IB) h = items.alloc() orelse return; items.get(h).w = 7; u64 r = items.get(h).w; items.free(h); return (u32)(r + bump()); }

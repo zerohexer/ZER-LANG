@@ -659,6 +659,20 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
     return sym;
 }
 
+bool scope_insert(Arena *a, Scope *s, Symbol *sym) {
+    if (!sym || scope_lookup_local(s, sym->name, sym->name_len)) return false;
+    if (s->symbol_count >= s->symbol_capacity) {
+        uint32_t new_cap = s->symbol_capacity * 2;
+        Symbol **new_syms = (Symbol **)arena_alloc(a, new_cap * sizeof(Symbol *));
+        if (!new_syms) return false;
+        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol *));
+        s->symbols = new_syms;
+        s->symbol_capacity = new_cap;
+    }
+    s->symbols[s->symbol_count++] = sym;
+    return true;
+}
+
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len) {
     for (uint32_t i = 0; i < s->symbol_count; i++) {
         if (s->symbols[i]->name_len == name_len &&

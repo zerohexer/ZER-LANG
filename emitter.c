@@ -883,6 +883,60 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
     if (t) return t;
     return resolve_type_for_emit(e, tn);  /* fallback for uncached TypeNodes */
 }
+
+static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len);
+/* BUG-1111: ONE function-declarator emitter for the prototype path and the IR
+ * definition path. A function RETURNING a function pointer needs C's nested
+ * declarator `RET (*name(params))(fp_args)`; only the definition path knew, so a
+ * bodyless prototype `*(u32, u32) -> u32 select_op(u32 kind);` emitted
+ * `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);`, which GCC
+ * refuses. Split as head / params / tail so each caller keeps its own name
+ * spelling (the IR path mangles from IRFunc, the prototype from the AST). */
+static bool func_ret_is_funcptr(Type *ret, bool main_promote) {
+    return !main_promote && ret && type_dispatch_kind(ret) == TYPE_FUNC_PTR;
+}
+static void emit_func_decl_head(Emitter *e, Type *ret, bool main_promote) {
+    if (main_promote) {
+        emit(e, "int ");
+    } else if (func_ret_is_funcptr(ret, main_promote)) {
+        emit_type(e, type_unwrap_distinct(ret)->func_ptr.ret);
+        emit(e, " (*");
+    } else if (ret) {
+        emit_type(e, ret);
+        emit(e, " ");
+    } else {
+        emit(e, "void ");
+    }
+}
+static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
+    emit(e, "(");
+    if (fn->func_decl.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            ParamDecl *p = &fn->func_decl.params[i];
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                          (uint32_t)i < func_type->func_ptr.param_count) ?
+                func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            emit_type_and_name(e, ptype, p->name, p->name_len);
+        }
+        if (fn->func_decl.is_variadic) emit(e, ", ...");
+    }
+    emit(e, ")");
+}
+static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
+    if (!func_ret_is_funcptr(ret, main_promote)) return;
+    Type *r = type_unwrap_distinct(ret);
+    emit(e, ")(");
+    if (r->func_ptr.param_count == 0) emit(e, "void");
+    for (uint32_t i = 0; i < r->func_ptr.param_count; i++) {
+        if (i > 0) emit(e, ", ");
+        emit_type(e, r->func_ptr.params[i]);
+    }
+    emit(e, ")");
+}
+
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
@@ -5467,25 +5521,11 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * Single source of truth via helper — see emit_func_attributes(). */
     emit_func_attributes(e, node);
 
-    emit_type(e, ret);
-    emit(e, " ");
+    emit_func_decl_head(e, ret, false);                 /* BUG-1111 */
     EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
-    emit(e, "(");
-
-    if (node->func_decl.param_count == 0) {
-        emit(e, "void");
-    } else {
-        for (int i = 0; i < node->func_decl.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            ParamDecl *p = &node->func_decl.params[i];
-            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                          (uint32_t)i < func_type->func_ptr.param_count) ?
-                func_type->func_ptr.params[i] : resolve_tynode(e,p->type);
-            emit_type_and_name(e, ptype, p->name, p->name_len);
-        }
-        if (node->func_decl.is_variadic) emit(e, ", ...");
-    }
-    emit(e, ") ");
+    emit_func_decl_params(e, node, func_type);
+    emit_func_decl_tail(e, ret, false);
+    emit(e, " ");
 
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
@@ -5571,6 +5611,22 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     /* volatile on non-pointer scalars (pointers handled above) */
     if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
         emit(e, "volatile ");
+    /* BUG-1115: a ZER `const` global is read-only by the checker's rules and was
+     * emitted as a plain C object — so it occupied RAM (.data) rather than flash
+     * (.rodata), contrary to the reference. Emit C `const` for value-shaped
+     * types. Pointer / slice / funcptr kinds are left alone: there `const` in
+     * ZER qualifies the POINTEE, which the type already spells. */
+    if (node->var_decl.is_const && type) {
+        switch (type_dispatch_kind(type)) {
+        case TYPE_POINTER: case TYPE_SLICE: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+        case TYPE_OPTIONAL: case TYPE_POOL: case TYPE_RING: case TYPE_SLAB:
+        case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE: case TYPE_HANDLE:
+            break;
+        default:
+            emit(e, "const ");
+            break;
+        }
+    }
 
     /* BUG-218/222: mangle global var names for imported modules (including static) */
     if (e->current_module) {
@@ -13840,20 +13896,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
          * Without this branch, emitter would produce invalid C like
          * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
-
-        if (main_promote) {
-            emit(e, "int ");
-        } else if (ret_is_funcptr) {
-            /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
-            emit(e, " (*");
-        } else if (ret) {
-            emit_type(e, ret);
-            emit(e, " ");
-        } else {
-            emit(e, "void ");
-        }
+        emit_func_decl_head(e, ret, main_promote);          /* BUG-1111 */
         e->current_main_promoted = main_promote;
 
         /* Mangled name */
@@ -13866,31 +13909,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Parameters — use AST types (same resolution as AST emitter).
          * IR local types may be ty_void for complex params (struct, pointer). */
-        emit(e, "(");
-        Type *func_type = checker_get_type(e->checker, fn);
-        if (fn->func_decl.param_count == 0) {
-            emit(e, "void");
-        } else {
-            for (int i = 0; i < fn->func_decl.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                ParamDecl *p = &fn->func_decl.params[i];
-                Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                              (uint32_t)i < func_type->func_ptr.param_count) ?
-                    func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
-                emit_type_and_name(e, ptype, p->name, p->name_len);
-            }
-        }
-        emit(e, ")");
-
-        /* Close funcptr-return form: )(fp_args) */
-        if (ret_is_funcptr) {
-            emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
-            }
-            emit(e, ")");
-        }
+        emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
+        emit_func_decl_tail(e, ret, main_promote);
         emit(e, " {\n");
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */

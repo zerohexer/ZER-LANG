@@ -1,0 +1,17 @@
+// BUG-1110: `comptime if` and `static_assert` refused `true`, `false` and any
+// `const bool` — the documented `comptime if (DEBUG)` idiom did not compile.
+const bool DEBUG = true;
+const bool TRACE = false;
+const u32 LEVEL = 2;
+static_assert(true, "literal true");
+static_assert(DEBUG, "const bool");
+static_assert(!TRACE && LEVEL == 2, "combined");
+u32 main() {
+    u32 r = 5;
+    comptime if (DEBUG) { r = 0; }
+    comptime if (TRACE) { r = 9; }
+    comptime if (!DEBUG || TRACE) { r = 8; }
+    comptime if (true) { r += 0; } else { r = 7; }
+    static_assert(DEBUG == true, "in body");
+    return r;
+}

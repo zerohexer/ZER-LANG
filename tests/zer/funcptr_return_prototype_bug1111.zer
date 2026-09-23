@@ -1,0 +1,17 @@
+// BUG-1111: a bodyless PROTOTYPE of a function returning a function pointer
+// emitted `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);` (GCC:
+// "expected identifier"). The definition path had the nested-declarator form; the
+// prototype path now shares it.
+u32 add(u32 a, u32 b) { return a + b; }
+u32 mul(u32 a, u32 b) { return a * b; }
+*(u32, u32) -> u32 select_op(u32 kind);
+*() -> u32 zero_fn();
+u32 use() { *(u32, u32) -> u32 f = select_op(1); return f(6, 3); }
+*(u32, u32) -> u32 select_op(u32 kind) { if (kind == 0) { return add; } return mul; }
+u32 zero() { return 0; }
+*() -> u32 zero_fn() { return zero; }
+u32 main() {
+    *() -> u32 z = zero_fn();
+    if (use() != 18) { return 1; }
+    return z();
+}

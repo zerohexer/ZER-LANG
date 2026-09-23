@@ -475,6 +475,9 @@ typedef struct {
         int callee_capacity;
         bool is_recursive;      /* part of a call cycle */
         bool has_indirect_call; /* calls through function pointer with unknown target */
+        int line;               /* BUG-1114: declaration line + file, so the stack */
+        const char *file_name;  /* diagnostics stop printing `file:0` */
+        const char *source;
     } *stack_frames;
     int stack_frame_count;
     int stack_frame_capacity;

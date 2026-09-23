@@ -192,6 +192,34 @@ Corpus: compiled every file under tests/, rust_tests/, zig_tests/, lib/, example
 test_modules/ with the pre-session and the new compiler — the ONLY verdict changes are this
 session's own new tests.
 
+### BUG-1110..1115 — six defects the reference.md audit tripped over
+
+- **BUG-1110** — `comptime if (true)`, `static_assert(true)` and any `const bool` condition
+  (the documented `comptime if (DEBUG)` idiom) were refused as "not a compile-time constant":
+  the integer folder has no bool arm. ONE `comptime_cond_value` (bool literals, const idents
+  through their initializer, `!`, `&&`, `||`, `==`, `!=`, resolved comptime calls, else the
+  scoped integer fold) at the comptime-if and both static_assert sites; deliberately not in the
+  shared integer evaluator, so a bool never folds into an array size.
+  (`tests/zer/comptime_if_const_bool_bug1110.zer`)
+- **BUG-1111** — a bodyless prototype of a function RETURNING a function pointer emitted
+  `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);`. The definition path had the
+  nested declarator; ONE head/params/tail declarator (`emit_func_decl_head/params/tail`) now
+  serves both. (`tests/zer/funcptr_return_prototype_bug1111.zer`)
+- **BUG-1112** — `Arena` as a struct field / union variant was accepted and every method call
+  on it emitted a raw C member call. Added to the BUG-287/386 ban.
+  (`tests/zer_fail/arena_struct_field_bug1112.zer`)
+- **BUG-1113** — every value-returning `async` function was warned "the value is unreachable";
+  `_zer_async_NAME_result(&task)` has delivered it since the `_zer_result` field landed. Retired.
+- **BUG-1114** — every stack-analysis diagnostic (recursion, `--stack-limit`, the ISR peak) was
+  reported at `file:0`. `StackFrame` records its declaration line and file.
+  (`tests/zer_fail/stack_diag_has_line_bug1114.zer`)
+- **BUG-1115** — a `const` global was emitted as a plain C object (RAM / `.data`), contrary
+  to the reference's "read-only data". Value-shaped `const` globals now emit C `const`.
+  (`tests/zer/const_global_emitted_const_bug1115.zer`)
+- Messages: the read-only string literal advice now names `const [*]u8` (not the deprecated
+  `[]u8`); the `@truncate`-on-float advice says a `(T)x` cast SATURATES (it said
+  "range-checked at runtime").
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

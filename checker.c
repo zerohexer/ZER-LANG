@@ -7479,6 +7479,55 @@ static int64_t eval_const_expr_scoped(Checker *c, Node *n) {
     return eval_const_expr_ex(n, 0, resolve_const_ident, c);
 }
 
+/* BUG-1110: the ONE fold for a compile-time CONDITION (`comptime if`,
+ * `static_assert`). eval_const_expr folds integers only, so `comptime if (true)`,
+ * `static_assert(true)` and a `const bool DEBUG = true;` guard — the idiom the
+ * reference documents — were refused as "not a compile-time constant". Handles
+ * bool literals, `const` idents (bool or integer, through their initializer),
+ * `!`, `&&`, `||`, `==` / `!=` between two such values, and resolved comptime
+ * calls, falling back to the scoped integer fold for everything else. Deliberately
+ * NOT added to the shared integer evaluator, so a bool never folds into an array
+ * size or arithmetic. */
+static int64_t comptime_cond_value(Checker *c, Node *e, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return CONST_EVAL_FAIL;
+    /* An if-chain, not a kind switch, on purpose: every kind not named here is
+     * handed to the COMPLETE integer evaluator below, so there is no unlisted
+     * kind that silently answers wrong — only kinds that answer better here. */
+    if (e->kind == NODE_BOOL_LIT) return e->bool_lit.value ? 1 : 0;
+    if (e->kind == NODE_IDENT) {
+        Symbol *cs = scope_lookup(c->current_scope, e->ident.name,
+                                  (uint32_t)e->ident.name_len);
+        if (cs && cs->is_const && cs->func_node &&
+            (cs->func_node->kind == NODE_VAR_DECL || cs->func_node->kind == NODE_GLOBAL_VAR) &&
+            cs->func_node->var_decl.init) {
+            Node *init = cs->func_node->var_decl.init;
+            if (init->kind == NODE_CALL && init->call.is_comptime_resolved)
+                return init->call.comptime_value;
+            if (init == e) return CONST_EVAL_FAIL;
+            return comptime_cond_value(c, init, depth + 1);
+        }
+        return eval_const_expr_scoped(c, e);
+    }
+    if (e->kind == NODE_CALL && e->call.is_comptime_resolved) return e->call.comptime_value;
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_BANG) {
+        int64_t v = comptime_cond_value(c, e->unary.operand, depth + 1);
+        return v == CONST_EVAL_FAIL ? CONST_EVAL_FAIL : (v ? 0 : 1);
+    }
+    if (e->kind == NODE_BINARY) {
+        TokenType op = e->binary.op;
+        if (op == TOK_AMPAMP || op == TOK_PIPEPIPE || op == TOK_EQEQ || op == TOK_BANGEQ) {
+            int64_t l = comptime_cond_value(c, e->binary.left, depth + 1);
+            int64_t r = comptime_cond_value(c, e->binary.right, depth + 1);
+            if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+            if (op == TOK_AMPAMP) return (l && r) ? 1 : 0;
+            if (op == TOK_PIPEPIPE) return (l || r) ? 1 : 0;
+            if (op == TOK_EQEQ) return l == r ? 1 : 0;
+            return l != r ? 1 : 0;
+        }
+    }
+    return eval_const_expr_scoped(c, e);
+}
+
 /* ================================================================
  * V3 allocator sugar — target-type based routing (2026-04-19)
  *
@@ -8681,7 +8730,7 @@ static Type *check_expr(Checker *c, Node *node) {
             target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
             !type_unwrap_distinct(target)->slice.is_const) {
             checker_error(c, node->loc.line,
-                "string literal is read-only — use 'const []u8' for string storage");
+                "string literal is read-only — use 'const [*]u8' for string storage");
         }
 
         /* scope escape: storing &local in static/global var OR pointer-param field.
@@ -13576,7 +13625,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (effective && type_is_float(effective)) {
                         checker_error(c, node->loc.line,
                             "@truncate has no meaning on a float — a float has no low bits "
-                            "to keep. Use a value cast '(%s)x' (range-checked at runtime), "
+                            "to keep. Use a value cast '(%s)x' (saturates to the target range), "
                             "or @saturate to clamp",
                             type_name(result));
                     }
@@ -17231,7 +17280,7 @@ static void check_stmt(Checker *c, Node *node) {
             if (node->var_decl.init->kind == NODE_STRING_LIT &&
                 type && type->kind == TYPE_SLICE && !node->var_decl.is_const) {
                 checker_error(c, node->loc.line,
-                    "string literal is read-only — use 'const []u8' instead of '[]u8'");
+                    "string literal is read-only — use 'const [*]u8' instead of '[*]u8'");
             }
 
             /* const slice/pointer → mutable variable: blocked (prevents write to .rodata) */
@@ -17873,35 +17922,7 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->if_stmt.is_comptime) {
             /* type-check the condition first so comptime calls get resolved */
             check_expr(c, node->if_stmt.cond);
-            int64_t cval = eval_const_expr(node->if_stmt.cond);
-            if (cval == CONST_EVAL_FAIL) {
-                /* try resolved comptime call: comptime if (FUNC()) */
-                if (node->if_stmt.cond->kind == NODE_CALL &&
-                    node->if_stmt.cond->call.is_comptime_resolved) {
-                    cval = node->if_stmt.cond->call.comptime_value;
-                }
-            }
-            if (cval == CONST_EVAL_FAIL) {
-                /* try looking up const bool/int ident */
-                if (node->if_stmt.cond->kind == NODE_IDENT) {
-                    Symbol *cs = scope_lookup(c->current_scope,
-                        node->if_stmt.cond->ident.name,
-                        (uint32_t)node->if_stmt.cond->ident.name_len);
-                    if (cs && cs->is_const) {
-                        /* const variable — try to resolve init value.
-                         * Covers: const bool X = true, const u32 P = COMPTIME_FUNC() */
-                        if (cs->func_node && cs->func_node->var_decl.init) {
-                            cval = eval_const_expr(cs->func_node->var_decl.init);
-                            /* If init is a resolved comptime call, use its value */
-                            if (cval == CONST_EVAL_FAIL &&
-                                cs->func_node->var_decl.init->kind == NODE_CALL &&
-                                cs->func_node->var_decl.init->call.is_comptime_resolved) {
-                                cval = cs->func_node->var_decl.init->call.comptime_value;
-                            }
-                        }
-                    }
-                }
-            }
+            int64_t cval = comptime_cond_value(c, node->if_stmt.cond, 0);   /* BUG-1110 */
             if (cval == CONST_EVAL_FAIL) {
                 checker_error(c, node->loc.line,
                     "comptime if condition must be a compile-time constant");
@@ -20089,7 +20110,7 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_STATIC_ASSERT: {
         /* Type-check the condition first — resolves comptime calls */
         check_expr(c, node->static_assert_stmt.cond);
-        int64_t val = eval_const_expr_scoped(c, node->static_assert_stmt.cond);
+        int64_t val = comptime_cond_value(c, node->static_assert_stmt.cond, 0);   /* BUG-1110 */
         /* SAFETY: zer_static_assert_holds in src/safety/comptime_rules.c (R04) */
         int sa_const = (val == CONST_EVAL_FAIL) ? 0 : 1;
         int sa_value = (val == 0) ? 0 : 1;
@@ -22099,12 +22120,17 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-287: Pool/Ring/Slab as struct fields not yet supported */
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T02) */
+                /* BUG-1112: Arena too — it was accepted as a field, and then every
+                 * method call on it (`s.a.reset()`, `s.a.alloc(T)`) was emitted as a
+                 * raw C member call GCC refuses; the builtin-method interception
+                 * only recognises a NAMED arena. */
                 if (sf->type && (type_dispatch_kind(sf->type) == TYPE_POOL ||
                                  type_dispatch_kind(sf->type) == TYPE_RING ||
-                                 type_dispatch_kind(sf->type) == TYPE_SLAB) &&
+                                 type_dispatch_kind(sf->type) == TYPE_SLAB ||
+                                 type_dispatch_kind(sf->type) == TYPE_ARENA) &&
                     zer_container_position_valid(ZER_DP_FIELD) == 0) {
                     checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab cannot be struct fields — must be global or static variables");
+                        "Pool/Ring/Slab/Arena cannot be struct fields — must be global or static variables");
                 }
                 /* BUG-498: synchronization primitives in packed struct → misaligned.
                  * pthread_mutex_t requires natural alignment. Packed structs can place
@@ -22265,10 +22291,11 @@ static void register_decl(Checker *c, Node *node) {
                 /* SAFETY: zer_container_position_valid in src/safety/container_rules.c (T03) */
                 if (sv->type && (type_dispatch_kind(sv->type) == TYPE_POOL ||
                                  type_dispatch_kind(sv->type) == TYPE_RING ||
-                                 type_dispatch_kind(sv->type) == TYPE_SLAB) &&
+                                 type_dispatch_kind(sv->type) == TYPE_SLAB ||
+                                 type_dispatch_kind(sv->type) == TYPE_ARENA) &&   /* BUG-1112 */
                     zer_container_position_valid(ZER_DP_VARIANT) == 0) {
                     checker_error(c, node->loc.line,
-                        "Pool/Ring/Slab cannot be union variants — must be global or static variables");
+                        "Pool/Ring/Slab/Arena cannot be union variants — must be global or static variables");
                 }
                 /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {
@@ -22365,26 +22392,11 @@ static void register_decl(Checker *c, Node *node) {
         typemap_set(c, node,func_type);
 
         /* Async function: register state struct type + init/poll functions */
-        if (node->func_decl.is_async && node->func_decl.return_type) {
-            /* BUG-853: `async u32 compute() { yield; return 42; }` compiles, runs and
-             * finalises its state machine correctly — and the 42 is UNREACHABLE. The
-             * poll protocol is an `int` done-flag; the value lands in an internal temp
-             * whose name depends on how the body happened to lower, so there is not
-             * even an unstable thing to reach for.
-             *
-             * A WARNING rather than a reject, and the reject was MEASURED before being
-             * rejected: corpus cost is 1 file, and it is the one file that must keep
-             * compiling — tests/zer/bh18_10_async_value_return_idempotent.zer, the
-             * regression guard for BH-18 #10 (a value-returning async that failed to
-             * finalise and re-ran its tail on every later poll). Rejecting would delete
-             * the guard along with the footgun. */
-            Type *art = resolve_type(c, node->func_decl.return_type);
-            if (art && type_dispatch_kind(art) != TYPE_VOID)
-                checker_warning(c, node->loc.line,
-                    "async function returns '%s', but the poll protocol has no way to "
-                    "deliver it — the value is unreachable. Return void and write the "
-                    "result to a global or a caller-owned struct", type_name(art));
-        }
+        /* BUG-853's warning ("an async function's return value is unreachable")
+         * is RETIRED (BUG-1113): the value lands in the state struct's
+         * `_zer_result` field and `_zer_async_NAME_result(&task)` reads it
+         * (emitter.c, async result path), so every value-returning async was being
+         * told something false. */
         if (node->func_decl.is_async && sym) {
             /* Build mangled name: _zer_async_funcname */
             char aname[256];
@@ -25522,6 +25534,8 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
             if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body && !decl->func_decl.is_comptime) {
                 struct StackFrame *f = find_or_add_frame(c, decl->func_decl.name,
                     (uint32_t)decl->func_decl.name_len);
+                if (!f->line) { f->line = decl->loc.line; f->file_name = files[fi].file_name;
+                                f->source = files[fi].source; }
                 /* add param sizes */
                 for (int p = 0; p < decl->func_decl.param_count; p++) {
                     Type *pt = NULL;
@@ -25534,6 +25548,8 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
             if (decl->kind == NODE_INTERRUPT && decl->interrupt.body) {
                 struct StackFrame *f = find_or_add_frame(c, decl->interrupt.name,
                     (uint32_t)decl->interrupt.name_len);
+                if (!f->line) { f->line = decl->loc.line; f->file_name = files[fi].file_name;
+                                f->source = files[fi].source; }
                 scan_frame(c, f, decl->interrupt.body);
             }
         }
@@ -25544,8 +25560,10 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
         for (int i = 0; i < c->stack_frame_count; i++) {
             struct StackFrame *f = &c->stack_frames[i];
             uint32_t max_depth = compute_max_depth(c, f, visited, 0);
+            const char *sv_fn = c->file_name, *sv_src = c->source;
+            if (f->file_name) { c->file_name = f->file_name; c->source = f->source; }
             if (f->is_recursive) {
-                checker_warning(c, 0,
+                checker_warning(c, f->line,
                     "function '%.*s' is recursive — unbounded stack growth on embedded",
                     (int)f->name_len, f->name);
             }
@@ -25556,7 +25574,7 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                 /* Per-function frame size check (catches big local arrays).
                  * SAFETY: zer_stack_frame_valid in src/safety/stack_rules.c (S01) */
                 if (zer_stack_frame_valid((int)c->stack_limit, (int)f->frame_size) == 0) {
-                    checker_error(c, 0,
+                    checker_error(c, f->line,
                         "function '%.*s' local stack %u bytes exceeds --stack-limit %u",
                         (int)f->name_len, f->name,
                         (unsigned)f->frame_size, (unsigned)c->stack_limit);
@@ -25568,7 +25586,7 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                     bool is_main = (f->name_len == 4 && memcmp(f->name, "main", 4) == 0);
                     bool is_isr = files_declare_isr(files, count, f->name, f->name_len);
                     if (is_main || is_isr) {
-                        checker_error(c, 0,
+                        checker_error(c, f->line,
                             "%s '%.*s' max call chain stack %u bytes exceeds --stack-limit %u",
                             is_isr ? "interrupt" : "entry",
                             (int)f->name_len, f->name,
@@ -25584,7 +25602,7 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                      * replaced it. */
                     bool is_isr = files_declare_isr(files, count, f->name, f->name_len);
                     if (is_main || is_isr) {
-                        checker_error(c, 0,
+                        checker_error(c, f->line,
                             "%s '%.*s' call chain contains function pointer call with "
                             "unknown target — stack depth unverifiable with --stack-limit",
                             is_isr ? "interrupt" : "entry",
@@ -25594,11 +25612,13 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
             }
             /* Without --stack-limit: warn about indirect calls in any function */
             if (c->stack_limit == 0 && f->has_indirect_call && !f->is_recursive) {
-                checker_warning(c, 0,
+                checker_warning(c, f->line,
                     "function '%.*s' calls through function pointer with unknown target — "
                     "stack depth not verifiable",
                     (int)f->name_len, f->name);
             }
+            c->file_name = sv_fn;
+            c->source = sv_src;
         }
 
         /* BUG-836: every check above measures ONE entry point against the FULL
@@ -25624,6 +25644,7 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
         if (c->stack_limit > 0) {
             uint32_t main_depth = 0, isr_total = 0;
             int isr_count = 0;
+            struct StackFrame *main_f = NULL;
             for (int i = 0; i < c->stack_frame_count; i++) {
                 struct StackFrame *f2 = &c->stack_frames[i];
                 if (f2->is_recursive) continue;
@@ -25632,12 +25653,16 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                 if (!is_main && !is_isr) continue;
                 memset(visited, 0, c->stack_frame_count * sizeof(bool));
                 uint32_t d2 = compute_max_depth(c, f2, visited, 0);
-                if (is_main) main_depth = d2;
+                if (is_main) { main_depth = d2; main_f = f2; }
                 else { isr_total += d2; isr_count++; }
             }
             uint32_t peak = main_depth + isr_total;
             if (isr_count > 0 && peak > c->stack_limit) {
-                checker_error(c, 0,
+                const char *sv_fn = c->file_name, *sv_src = c->source;
+                if (main_f && main_f->file_name) {
+                    c->file_name = main_f->file_name; c->source = main_f->source;
+                }
+                checker_error(c, main_f ? main_f->line : 0,
                     "concurrent stack peak %u bytes exceeds --stack-limit %u: main's "
                     "chain uses %u and %d interrupt handler%s add %u on top of it — on "
                     "bare metal they share ONE stack. The hardware exception frame is "
@@ -25645,6 +25670,8 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                     (unsigned)peak, (unsigned)c->stack_limit,
                     (unsigned)main_depth, isr_count, isr_count == 1 ? "" : "s",
                     (unsigned)isr_total);
+                c->file_name = sv_fn;
+                c->source = sv_src;
             }
         }
         free(visited);
@@ -26360,7 +26387,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
         /* Top-level static_assert — evaluate during body checking phase */
         if (decl->kind == NODE_STATIC_ASSERT) {
             check_expr(c, decl->static_assert_stmt.cond);
-            int64_t val = eval_const_expr_scoped(c, decl->static_assert_stmt.cond);
+            int64_t val = comptime_cond_value(c, decl->static_assert_stmt.cond, 0);   /* BUG-1110 */
             /* SAFETY: zer_static_assert_holds in src/safety/comptime_rules.c (R04) */
             int sa_const = (val == CONST_EVAL_FAIL) ? 0 : 1;
             int sa_value = (val == 0) ? 0 : 1;

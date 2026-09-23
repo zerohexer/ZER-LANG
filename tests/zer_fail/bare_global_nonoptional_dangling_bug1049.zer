@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: a non-optional '[]u32' global cannot be reset
+// expect-error: a non-optional '[*]u32' global cannot be reset
 // BUG-1049: the dangling-global rule's remedy (`g = null;`) does not compile for
 // a non-optional global, so the diagnostic names the real remedy instead:
 // declare the global optional.

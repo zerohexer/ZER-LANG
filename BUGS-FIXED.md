@@ -5,6 +5,34 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23e — BUG-1121..1123: three defects the reference.md audit found (one silent)
+
+### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
+**Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
+`f(0); f(1); f(1);` left `n == 3` — the "execute exactly once" body ran three times, no
+diagnostic. The `@critical` form either built C GCC rejected ("label '_zer_bb3' used but not
+defined", whenever the function had another branch) or, with no other branch, let a jump from
+outside ENTER the section past the interrupt disable, so its epilogue restored a state that was
+never saved.
+**Root cause.** `goto` is banned inside both bodies, and a label inside a `defer` body was
+already refused (BUG-1012) — but a label inside the other two regions was not, so the only jump
+that could reach it came from OUTSIDE and skipped the region's prologue.
+**Fix.** `NODE_LABEL` in `check_stmt` rejects a label while `critical_depth > 0` or `in_once`.
+A label there has no legitimate use (nothing inside can jump to it).
+**Tests.** `tests/zer_fail/{label_in_critical,goto_into_critical,goto_into_once}_bug1121.zer`.
+
+### BUG-1122 — `zerc --target-bits 32 f.zer` reported `unknown option '32'`
+`zerc_main.c` took `argv[1]` as the input unconditionally. The input is now the one positional
+argument (options may come anywhere); two positionals are "more than one input file", none is
+"no input file" plus usage. reference.md "CLI" updated.
+
+### BUG-1123 — `type_name` spelled a slice `[]T` and dropped `const`
+The dangling-global remedy told users to declare `'?[]u32 g'` (a spelling that itself warns),
+and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[]u8'". Slices
+now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
+`type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
+refuses any non-identifier spelling, so no emitted name changes.
+
 ## Session 2026-09-23d — BUG-1090..1101: bounds-check elision trusted facts that were not true — a wrong constant, another variable's range, a stale range, a guard tested too early, a summary read at the wrong point
 
 An audit of the VRP elision path (the analysis that decides a fixed-array index is in

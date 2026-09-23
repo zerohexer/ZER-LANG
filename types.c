@@ -554,8 +554,14 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         pos = tn_append(buf, pos, max, "?");
         return type_name_write(t->optional.inner, buf, pos, max);
     case TYPE_SLICE:
+        /* BUG-1123: rendered the DEPRECATED `[]T` spelling (the diagnostics then
+         * told users to write a form that itself warns "use [*]T instead") and
+         * dropped `const`, so assigning a string literal to a `[*]u8` field read
+         * "cannot assign '[]u8' to '[]u8'" — a mismatch between two identical
+         * spellings. Same lesson as BUG-830 for pointers. */
         if (t->slice.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
-        pos = tn_append(buf, pos, max, "[]");
+        if (t->slice.is_const)    pos = tn_append(buf, pos, max, "const ");
+        pos = tn_append(buf, pos, max, "[*]");
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:
         pos = type_name_write(t->array.inner, buf, pos, max);

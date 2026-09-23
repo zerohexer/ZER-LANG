@@ -1,0 +1,11 @@
+// expect-error: cannot place a label inside a @critical block
+// BUG-1121: the label split the C brace block; with another branch the C did not build.
+u32 main() {
+    u32 x = 1; u32 n = 0;
+    if (x == 1) { n += 1; }
+    @critical {
+    inner:
+        n += 1;
+    }
+    return n - 2;
+}

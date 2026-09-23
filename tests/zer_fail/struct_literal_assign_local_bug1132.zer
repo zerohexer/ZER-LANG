@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1132: `h = { .p = a }; return h;` — the assignment spelling of the literal. Pre-fix: compiled.
+struct T { u32 v; }
+struct H { *T p; }
+struct W { H h; u32 n; }
+H mk(*T a) { H h; h = { .p = a }; return h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a);
+    free(a);
+    return h.p.v;
+}

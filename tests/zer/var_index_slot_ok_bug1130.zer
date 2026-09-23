@@ -1,0 +1,203 @@
+// BUG-1130 boundaries: a slot at a trackable index local is a precise entry
+// until the index is written, and a LOCAL array's variable-index slots are
+// leak-checked — the idioms below must keep compiling and running.
+struct T { u32 v; }
+?*T[8] held;
+?*T[4] gtbl;
+
+// fill / drain a LOCAL array, with the null reset
+u32 fill_drain() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        a.v = i;
+        arr[i] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = arr[i] orelse return;
+        s += q.v;
+        free(q);
+        arr[i] = null;
+    }
+    return s - 6;
+}
+
+// consume loop WITHOUT the reset (each slot read once, then freed)
+u32 consume_no_reset() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        a.v = i;
+        arr[i] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = arr[i] orelse return;
+        s += q.v;
+        free(q);
+    }
+    return s - 6;
+}
+
+// direct `arr[i] = alloc(T)` and a direct free loop
+u32 direct_free_loop() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        arr[i] = alloc(T);
+    }
+    for (u32 i = 0; i < 4; i += 1) {
+        free(arr[i] orelse return);
+    }
+    return 0;
+}
+
+// free through a read, reset, re-read (the reset clears the slot fact)
+u32 reset_reread(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T x = alloc(T) orelse return;
+    x.v = 3;
+    arr[k] = x;
+    *T a = arr[k] orelse return;
+    u32 r = a.v;
+    free(a);
+    arr[k] = null;
+    if (arr[k]) |q| { r += q.v; }
+    return r - 3;
+}
+
+// free through the owner, then the null reset (was a false "use after free")
+u32 free_via_owner(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    a.v = 4;
+    arr[k] = a;
+    *T q = arr[k] orelse return;
+    u32 r = q.v;
+    free(a);
+    arr[k] = null;
+    return r - 4;
+}
+
+// stores one iteration's allocation, frees another's
+u32 got_counter() {
+    u32 got = 0;
+    for (u32 n = 0; n < 12; n += 1) {
+        *T k = alloc(T) orelse return;
+        k.v = n;
+        if (got < 8) { held[got] = k; got += 1; } else { free(k); }
+    }
+    u32 s = 0;
+    for (u32 j = 0; j < 8; j += 1) {
+        *T q = held[j] orelse return;
+        s += q.v;
+        free(q);
+        held[j] = null;
+    }
+    return s - 28;
+}
+
+// two distinct param indices
+u32 two_slots(u32 k, u32 j) {
+    if (k >= 4) { return 0; }
+    if (j >= 4) { return 0; }
+    if (k == j) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    defer free(a);
+    *T b = alloc(T) orelse return;
+    defer free(b);
+    a.v = 1;
+    b.v = 2;
+    arr[k] = a;
+    arr[j] = b;
+    *T q = arr[k] orelse return;
+    return q.v - 1;
+}
+
+// an index declared inside the loop body (re-bound every iteration)
+u32 loop_body_index() {
+    ?*T[4] arr;
+    for (u32 n = 0; n < 4; n += 1) {
+        u32 k = (3 - n) % 4;
+        *T a = alloc(T) orelse return;
+        a.v = n;
+        arr[k] = a;
+    }
+    u32 s = 0;
+    for (u32 n = 0; n < 4; n += 1) {
+        u32 k = n % 4;
+        *T q = arr[k] orelse return;
+        s += q.v;
+        free(q);
+        arr[k] = null;
+    }
+    return s - 6;
+}
+
+// untrackable index, fill / drain
+u32 unkeyed_fill_drain() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        a.v = i;
+        arr[(i + 1) % 4] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = arr[(i + 1) % 4] orelse return;
+        s += q.v;
+        free(q);
+        arr[(i + 1) % 4] = null;
+    }
+    return s - 6;
+}
+
+// global table fill / drain
+u32 global_fill_drain() {
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        a.v = i;
+        gtbl[i] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = gtbl[i] orelse return;
+        s += q.v;
+        free(q);
+        gtbl[i] = null;
+    }
+    return s - 6;
+}
+
+// a callee drains the array through a slice (a DRAIN — not a false leak)
+void drain([*]?*T s) {
+    for (u32 i = 0; i < s.len; i += 1) {
+        *T q = s[i] orelse return;
+        free(q);
+        s[i] = null;
+    }
+}
+u32 drain_by_callee() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) { *T a = alloc(T) orelse return; arr[i] = a; }
+    drain(arr);
+    return 0;
+}
+
+u32 main() {
+    if (fill_drain() != 0) { return 1; }
+    if (consume_no_reset() != 0) { return 2; }
+    if (direct_free_loop() != 0) { return 3; }
+    if (reset_reread(1) != 0) { return 4; }
+    if (free_via_owner(2) != 0) { return 5; }
+    if (got_counter() != 0) { return 6; }
+    if (two_slots(1, 2) != 0) { return 7; }
+    if (loop_body_index() != 0) { return 8; }
+    if (unkeyed_fill_drain() != 0) { return 9; }
+    if (global_fill_drain() != 0) { return 10; }
+    if (drain_by_callee() != 0) { return 11; }
+    return 0;
+}

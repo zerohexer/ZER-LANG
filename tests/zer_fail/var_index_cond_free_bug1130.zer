@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1130 (2): a CONDITIONAL free after a slot store was invisible to a read of the
+// same slot (a slot view skipped MAYBE members). Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k, bool c) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    arr[k] = a;
+    if (c) { free(a); }
+    *T q = arr[k] orelse return;
+    return q.v;
+}
+u32 main() { return run(1, true); }

@@ -184,6 +184,26 @@ typedef struct {
      * as much as the one read, so freeing through it cannot widen them (that
      * would refuse the free-every-slot loop); see ir_view_free_barrier. */
     bool view_is_slot;
+    /* BUG-1130: WHICH array slot a view was read through, when no precise
+     * entry for that slot existed at the read. `slot_key_path` is the
+     * per-index key (`arr[k]` for a trackable index local k, see
+     * ir_index_local_keyable) or NULL; `slot_arr_path` is the ARRAY's own key.
+     * A free through the view records the slot `(slot_root, slot_key_path)`
+     * as FREED, so re-reading `arr[k]` with k unchanged is refused; a free
+     * through a view of a LOCAL array marks that array DRAINED (the leak
+     * rule for its variable-index slots, see ir_slot_view_freed). Cleared
+     * when k is written (ir_kill_index_facts). */
+    bool has_slot;
+    int slot_root;
+    const char *slot_arr_path;
+    uint32_t slot_arr_plen;
+    const char *slot_key_path;
+    uint32_t slot_key_plen;
+    /* BUG-1130: on an array's WILDCARD entry (`arr[*]`): a free through a
+     * variable-index read of this LOCAL array happened on this path — the
+     * program empties the array through a loop, so the allocations stored
+     * into it at a variable index are not reported as leaks. */
+    bool slot_drained;
     /* BUG-1077 (H8): the FIRING (one IR_DEFER_FIRE application in the forward
      * pass) that last freed this handle through a defer body; 0 = none. Tells
      * "the other branch of the SAME firing" (legit) from "the same defer body
@@ -356,6 +376,9 @@ static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
  * (ahead of its documentation block below) because the constructor enforces
  * its invariant. */
 #define IR_GLOBAL_ROOT_ID (-2)
+/* BUG-1132: nesting bound for a struct literal walk — the parser bounds
+ * expression nesting far below this, so it is never reached by a real program. */
+#define ZER_IR_STRUCT_LIT_DEPTH 256
 static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
                                  const char *path, uint32_t plen);
 
@@ -380,6 +403,64 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
         if (local_id == IR_GLOBAL_ROOT_ID) h->escaped = true;
     }
     return h;
+}
+
+/* BUG-1130: is this entry a PRECISE array slot — its last path component an
+ * index (`[3]`, or `[k]` for a trackable index local) and not the wildcard
+ * `[*]` family? Such an entry's state is its own per-path fact, unlike a
+ * wildcard member whose alloc_id is shared by every allocation a loop made. */
+static bool ir_entry_is_precise_slot(const IRHandleInfo *h) {
+    if (!h || !h->path || h->path_len < 3) return false;
+    if (h->path[h->path_len - 1] != ']') return false;
+    uint32_t i = h->path_len - 1;
+    while (i > 0 && h->path[i] != '[') i--;
+    if (h->path[i] != '[') return false;
+    return h->path[i + 1] != '*';
+}
+
+/* BUG-1130: the join of the slot facts two predecessors hold for ONE entry.
+ * The view's slot identity survives only when both agree (a free through a
+ * view that may have come from either slot names neither — the conservative
+ * answer is "no per-index fact"); `slot_drained` ORs — a drain loop's own
+ * header joins the not-yet-drained entry edge with the drained back edge, so
+ * an AND would never let the idiom through (it is a leak exemption, never a
+ * memory-safety one; see the exit pass). And a precise slot whose two
+ * predecessors hold DIFFERENT allocations may hold either after the join:
+ * the one this entry did not keep becomes a VIEW member, so a free of it is
+ * still seen by a read of the slot (`arr[0] = b; if (c) { arr[0] = a; }
+ * free(b); arr[0]...` read b's freed memory on the else path). */
+static void ir_merge_slot_facts(IRHandleInfo *rh, const IRHandleInfo *ph) {
+    if (rh->has_slot && ph->has_slot) {
+        bool same_arr = rh->slot_root == ph->slot_root &&
+            rh->slot_arr_plen == ph->slot_arr_plen &&
+            (rh->slot_arr_plen == 0 ||
+             memcmp(rh->slot_arr_path, ph->slot_arr_path, rh->slot_arr_plen) == 0);
+        bool same_key = same_arr && rh->slot_key_plen == ph->slot_key_plen &&
+            (rh->slot_key_plen == 0 ||
+             (rh->slot_key_path && ph->slot_key_path &&
+              memcmp(rh->slot_key_path, ph->slot_key_path, rh->slot_key_plen) == 0));
+        if (!same_arr) rh->has_slot = false;
+        if (!same_key) { rh->slot_key_path = NULL; rh->slot_key_plen = 0; }
+    } else if (!rh->has_slot && ph->has_slot) {
+        rh->has_slot = true;
+        rh->slot_root = ph->slot_root;
+        rh->slot_arr_path = ph->slot_arr_path;
+        rh->slot_arr_plen = ph->slot_arr_plen;
+        rh->slot_key_path = ph->slot_key_path;
+        rh->slot_key_plen = ph->slot_key_plen;
+    }
+    if (ph->slot_drained) rh->slot_drained = true;
+    if (ir_entry_is_precise_slot(rh) && rh->alloc_id != 0 && ph->alloc_id != 0 &&
+        rh->alloc_id != ph->alloc_id) {
+        const int cap = (int)(sizeof(rh->view_alloc_ids) / sizeof(rh->view_alloc_ids[0]));
+        bool dup = false;
+        for (int k = 0; k < rh->view_count; k++)
+            if (rh->view_alloc_ids[k] == ph->alloc_id) { dup = true; break; }
+        if (!dup) {
+            if (rh->view_count < cap) rh->view_alloc_ids[rh->view_count++] = ph->alloc_id;
+            else rh->view_overflow = true;
+        }
+    }
 }
 
 /* ================================================================
@@ -478,7 +559,7 @@ static bool ast_name_writes_r(Node *n, const char *name, uint32_t len,
             memcmp(t->ident.name, name, len) == 0) {
             /* reassignment: a plain `=` hands the visitor its VALUE; a
              * compound operator has no value that could be followed */
-            if (fn(n->assign.op == TOK_EQ ? n->assign.value : NULL, ud)) return true;
+            if (fn(n->assign.op == TOK_EQ ? n->assign.value : NULL, ANW_ASSIGN, ud)) return true;
             return ast_name_writes_r(n->assign.value, name, len, fn, ud);
         }
         return ast_name_writes_r(n->assign.target, name, len, fn, ud) ||
@@ -489,7 +570,7 @@ static bool ast_name_writes_r(Node *n, const char *name, uint32_t len,
             n->unary.operand->kind == NODE_IDENT &&
             (uint32_t)n->unary.operand->ident.name_len == len &&
             memcmp(n->unary.operand->ident.name, name, len) == 0)
-            return fn(NULL, ud);                    /* address taken */
+            return fn(NULL, ANW_ADDR, ud);          /* address taken */
         return ast_name_writes_r(n->unary.operand, name, len, fn, ud);
     case NODE_BINARY:
         return ast_name_writes_r(n->binary.left, name, len, fn, ud) ||
@@ -564,9 +645,9 @@ static bool ast_name_writes_r(Node *n, const char *name, uint32_t len,
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-        return fn(NULL, ud);
+        return fn(NULL, ANW_OPAQUE, ud);
     }
-    return fn(NULL, ud);  /* unreachable (exhaustive) — conservative */
+    return fn(NULL, ANW_OPAQUE, ud);  /* unreachable (exhaustive) — conservative */
 }
 
 
@@ -581,11 +662,25 @@ bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn,
     return ast_name_writes_r(n, name, len, fn, ud);
 }
 
-static bool anw_stop_at_first(Node *value, void *ud) { (void)value; (void)ud; return true; }
+static bool anw_stop_at_first(Node *value, int kind, void *ud) {
+    (void)value; (void)kind; (void)ud;
+    return true;
+}
+/* BUG-1130: "is `&name` formed anywhere inside `n`?" — a reassignment does not
+ * count; an opaque node the walk does not model still does (the conservative
+ * answer). A visitor on the ONE exhaustive walker, not a second copy of it. */
+static bool anw_stop_at_addr(Node *value, int kind, void *ud) {
+    (void)value; (void)ud;
+    return kind != ANW_ASSIGN;
+}
 
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
     return ast_name_writes_r(n, name, len, anw_stop_at_first, NULL);
 }
+static bool ast_name_addr_taken(Node *n, const char *name, uint32_t len) {
+    return ast_name_writes_r(n, name, len, anw_stop_at_addr, NULL);
+}
+
 
 /* BUG-1055: how many times is `name` BOUND inside `n` — a var-decl, an
  * if-unwrap capture, or a switch-arm capture? ast_name_mutated_or_addrd answers
@@ -1022,6 +1117,12 @@ typedef struct {
     bool view_overflow;
     int view_root_local;  /* BUG-984: a pointer copy views what its source views */
     bool view_is_slot;    /* BUG-1074 */
+    bool has_slot;        /* BUG-1130: the slot a view was read through */
+    int slot_root;
+    const char *slot_arr_path;
+    uint32_t slot_arr_plen;
+    const char *slot_key_path;
+    uint32_t slot_key_plen;
     IRHandleState state;  /* snapshot of source state, available if caller wants to inherit */
 } IRAliasSnapshot;
 
@@ -1043,6 +1144,12 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
         snap->view_alloc_ids[i] = src->view_alloc_ids[i];
     snap->view_root_local = src->view_root_local;
     snap->view_is_slot = src->view_is_slot;
+    snap->has_slot = src->has_slot;
+    snap->slot_root = src->slot_root;
+    snap->slot_arr_path = src->slot_arr_path;
+    snap->slot_arr_plen = src->slot_arr_plen;
+    snap->slot_key_path = src->slot_key_path;
+    snap->slot_key_plen = src->slot_key_plen;
     snap->state = src->state;
 }
 
@@ -1067,6 +1174,12 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
         dst->view_alloc_ids[i] = snap->view_alloc_ids[i];
     dst->view_root_local = snap->view_root_local;   /* BUG-984 */
     dst->view_is_slot = snap->view_is_slot;         /* BUG-1074 */
+    dst->has_slot = snap->has_slot;                 /* BUG-1130 */
+    dst->slot_root = snap->slot_root;
+    dst->slot_arr_path = snap->slot_arr_path;
+    dst->slot_arr_plen = snap->slot_arr_plen;
+    dst->slot_key_path = snap->slot_key_path;
+    dst->slot_key_plen = snap->slot_key_plen;
 }
 
 /* ================================================================
@@ -1652,6 +1765,7 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * "more suspected views", the direction that can only over-report. */
             if (ph->view_overflow) rh->view_overflow = 1;
             if (ph->view_is_slot) rh->view_is_slot = 1;   /* BUG-1074 */
+            ir_merge_slot_facts(rh, ph);                  /* BUG-1130 */
             for (int vi = 0; vi < ph->view_count; vi++) {
                 int cap = (int)(sizeof(rh->view_alloc_ids) /
                                 sizeof(rh->view_alloc_ids[0]));
@@ -1929,28 +2043,107 @@ static IRPathState ir_block_entry_state(ZerCheck *zc, IRFunc *func, int bi,
  * if bare local); *out_path_len = length of path (0 for bare local).
  * ================================================================ */
 
-static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_len);
+static int ir_build_key_path(IRFunc *func, Node *expr, char *buf, int bufsize,
+                             int *out_base_len);
+
+/* BUG-1130: a TRACKABLE INDEX LOCAL — the missing variable of the
+ * variable-index slot class. `arr[k]` names ONE slot for as long as `k` is not
+ * written, so the slot can be keyed `arr[k]` exactly like `arr[3]`: a store
+ * aliases it, a free through a read of it marks it, a re-read of it sees that.
+ * Before, every variable index was unkeyable and fell to the array's wildcard
+ * (BUG-1074), which cannot tell one slot from another — so a free THROUGH a
+ * slot read, and a conditional free after a slot store, were invisible.
+ *
+ * The key is only as good as "k has not changed", so the local must be one
+ * whose every write the analysis SEES: an integer local (param or not), not
+ * static (a recursive call writes a static), the ONLY local answering to that
+ * name (no shadow can be confused for it), and whose ADDRESS is never taken
+ * (no write through a pointer — the source walk, plus the IR_ADDR_OF backup
+ * ir_local_is_immutable_bool uses). Every key naming k is killed when an
+ * instruction writes k (ir_kill_index_facts). Returns the local, or -1.
+ * Cached per function (the cache is keyed on the IRFunc pointer). */
+static IRFunc *_ir_kx_func = NULL;
+static int8_t *_ir_kx_cache = NULL;
+static int _ir_kx_cap = 0;
+
+static int ir_index_local_keyable(IRFunc *func, const char *name, uint32_t len) {
+    if (!func || !name || len == 0) return -1;
+    int found = -1;
+    for (int i = 0; i < func->local_count; i++) {
+        IRLocal *l = &func->locals[i];
+        bool m = (l->name && l->name_len == len && memcmp(l->name, name, len) == 0) ||
+                 (l->orig_name && l->orig_name_len == len &&
+                  memcmp(l->orig_name, name, len) == 0);
+        if (!m) continue;
+        if (found >= 0) return -1;          /* two locals answer to the name */
+        found = i;
+    }
+    if (found < 0) return -1;
+    if (_ir_kx_func != func || _ir_kx_cap < func->local_count) {
+        int nc = func->local_count > 16 ? func->local_count : 16;
+        int8_t *nb = (int8_t *)realloc(_ir_kx_cache, (size_t)nc);
+        if (!nb) return -1;
+        _ir_kx_cache = nb;
+        _ir_kx_cap = nc;
+        memset(_ir_kx_cache, 0, (size_t)nc);
+        _ir_kx_func = func;
+    }
+    if (_ir_kx_cache[found] != 0) return _ir_kx_cache[found] == 1 ? found : -1;
+    bool ok = true;
+    IRLocal *l = &func->locals[found];
+    if (l->is_static || l->is_temp || !l->type || !type_is_integer(l->type)) ok = false;
+    if (ok && (!func->ast_node || func->ast_node->kind != NODE_FUNC_DECL)) ok = false;
+    if (ok) {
+        const char *on = l->orig_name ? l->orig_name : l->name;
+        uint32_t onl = l->orig_name ? l->orig_name_len : l->name_len;
+        Node *body = func->ast_node->func_decl.body;
+        if (ast_name_addr_taken(body, on, onl)) ok = false;
+        if (ok && (onl != l->name_len || memcmp(on, l->name, onl) != 0) &&
+            ast_name_addr_taken(body, l->name, l->name_len)) ok = false;
+    }
+    for (int bi = 0; ok && bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++)
+            if (bb->insts[ii].op == IR_ADDR_OF && bb->insts[ii].src1_local == found) {
+                ok = false; break;
+            }
+    }
+    _ir_kx_cache[found] = ok ? 1 : 2;
+    return ok ? found : -1;
+}
+
+/* The index of `idx` as a key component: a literal, or a trackable local. */
+static bool ir_index_is_keyable(IRFunc *func, Node *idx) {
+    if (!idx) return false;
+    if (idx->kind == NODE_INT_LIT) return true;
+    if (idx->kind == NODE_IDENT)
+        return ir_index_local_keyable(func, idx->ident.name,
+                                      (uint32_t)idx->ident.name_len) >= 0;
+    return false;
+}
 
 /* Stage 3 (2026-04-28): measure pass for ir_extract_compound_key.
  * Walks the same shapes as ir_build_key_path but only counts chars,
  * needs no buffer. Caller allocates exactly this many + 1 bytes.
  * Returns -1 if the expression isn't keyable. */
-static int ir_measure_key_path(Node *expr) {
+static int ir_measure_key_path(IRFunc *func, Node *expr) {
     if (!expr) return -1;
     if (expr->kind == NODE_IDENT) return 0;  /* bare ident — empty path */
     if (expr->kind == NODE_FIELD) {
-        int base = ir_measure_key_path(expr->field.object);
+        int base = ir_measure_key_path(func, expr->field.object);
         if (base < 0) return -1;
         return base + 1 + (int)expr->field.field_name_len;
     }
     if (expr->kind == NODE_INDEX) {
-        if (!expr->index_expr.index ||
-            expr->index_expr.index->kind != NODE_INT_LIT) return -1;
-        int base = ir_measure_key_path(expr->index_expr.object);
+        Node *ix = expr->index_expr.index;
+        if (!ir_index_is_keyable(func, ix)) return -1;
+        int base = ir_measure_key_path(func, expr->index_expr.object);
         if (base < 0) return -1;
+        if (ix->kind == NODE_IDENT)       /* BUG-1130: `[k]` */
+            return base + 2 + (int)ix->ident.name_len;
         char tmp[32];
         int idx_chars = snprintf(tmp, sizeof(tmp), "[%llu]",
-            (unsigned long long)expr->index_expr.index->int_lit.value);
+            (unsigned long long)ix->int_lit.value);
         if (idx_chars <= 0) return -1;
         return base + idx_chars;
     }
@@ -1960,14 +2153,16 @@ static int ir_measure_key_path(Node *expr) {
 /* Build the path component. Returns number of chars written (not including NUL),
  * or -1 if expression can't be keyed. `out_base_len` receives the length of
  * the root-ident portion (always 0 here; root ident is NOT part of path). */
-static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_len) {
+static int ir_build_key_path(IRFunc *func, Node *expr, char *buf, int bufsize,
+                             int *out_base_len) {
     if (!expr) return -1;
     if (expr->kind == NODE_IDENT) {
         if (out_base_len) *out_base_len = 0;
         return 0;  /* bare ident — empty path */
     }
     if (expr->kind == NODE_FIELD) {
-        int parent_len = ir_build_key_path(expr->field.object, buf, bufsize, out_base_len);
+        int parent_len = ir_build_key_path(func, expr->field.object, buf, bufsize,
+                                           out_base_len);
         if (parent_len < 0) return -1;
         int fnlen = (int)expr->field.field_name_len;
         if (parent_len + 1 + fnlen >= bufsize) return -1;
@@ -1978,13 +2173,18 @@ static int ir_build_key_path(Node *expr, char *buf, int bufsize, int *out_base_l
         return total;
     }
     if (expr->kind == NODE_INDEX) {
-        if (!expr->index_expr.index ||
-            expr->index_expr.index->kind != NODE_INT_LIT) return -1;
-        int parent_len = ir_build_key_path(expr->index_expr.object, buf, bufsize, out_base_len);
+        Node *ix = expr->index_expr.index;
+        if (!ir_index_is_keyable(func, ix)) return -1;
+        int parent_len = ir_build_key_path(func, expr->index_expr.object, buf, bufsize,
+                                           out_base_len);
         if (parent_len < 0) return -1;
-        uint64_t idx = expr->index_expr.index->int_lit.value;
-        int written = snprintf(buf + parent_len, bufsize - parent_len,
-                               "[%llu]", (unsigned long long)idx);
+        int written;
+        if (ix->kind == NODE_IDENT)       /* BUG-1130: `[k]` */
+            written = snprintf(buf + parent_len, bufsize - parent_len, "[%.*s]",
+                               (int)ix->ident.name_len, ix->ident.name);
+        else
+            written = snprintf(buf + parent_len, bufsize - parent_len,
+                               "[%llu]", (unsigned long long)ix->int_lit.value);
         if (written <= 0 || parent_len + written >= bufsize) return -1;
         return parent_len + written;
     }
@@ -2099,14 +2299,14 @@ static bool ir_global_projection_key(ZerCheck *zc, IRFunc *func, Node *expr,
     Node *root = ir_key_root_ident(expr);
     if (!root) return false;
     if (!ir_ident_is_unshadowed_global(zc, func, root)) return false;
-    int rel = ir_measure_key_path(expr);
+    int rel = ir_measure_key_path(func, expr);
     if (rel <= 0) return false;   /* unkeyable (e.g. variable index) */
     uint32_t rootlen = (uint32_t)root->ident.name_len;
     uint32_t total = rootlen + (uint32_t)rel;
     char *gpath = (char *)arena_alloc(zc->arena, total + 1);
     if (!gpath) return false;
     memcpy(gpath, root->ident.name, rootlen);
-    int w = ir_build_key_path(expr, gpath + rootlen, rel + 1, NULL);
+    int w = ir_build_key_path(func, expr, gpath + rootlen, rel + 1, NULL);
     if (w != rel) return false;
     gpath[total] = '\0';
     *out_path = gpath;
@@ -2182,11 +2382,11 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
      * then allocate exactly that and fill. No fixed buffer, no retry,
      * no arbitrary cap — bounded only by available memory.
      * Replaces the previous 256-byte fixed buffer. */
-    int need = ir_measure_key_path(expr);
+    int need = ir_measure_key_path(func, expr);
     if (need < 0) return -1;  /* unkeyable */
     char *path = (char *)arena_alloc(zc->arena, need + 1);
     if (!path) return -1;
-    int wrote = ir_build_key_path(expr, path, need + 1, NULL);
+    int wrote = ir_build_key_path(func, expr, path, need + 1, NULL);
     if (wrote != need) return -1;  /* invariant violation */
     *out_path = path;
     *out_path_len = (uint32_t)need;
@@ -2301,6 +2501,19 @@ static void ir_apply_ret_field_views(ZerCheck *zc, IRFunc *func, IRPathState *ps
             int pi = rv->param;
             if (pi < 0 || pi >= call->call.arg_count) continue;
             IRHandleInfo *ah = ir_view_arg_handle(zc, func, ps, call->call.args[pi]);
+            /* BUG-1133: a PARAM handed straight on (`H mk2(*T a) { return mk(a); }`)
+             * has no handle until something gives it one — give it its identity,
+             * so the chained wrapper's own summary names the param. Before, the
+             * chain dropped every field view and `free(a); mk2(a).p.v` compiled. */
+            if (!ah) {
+                Node *pa = ir_peel_launder(call->call.args[pi]);
+                if (pa && pa->kind == NODE_IDENT) {
+                    int pl = ir_find_local_exact_first(func, pa->ident.name,
+                                                       (uint32_t)pa->ident.name_len);
+                    if (pl >= 0 && pl < func->local_count && func->locals[pl].is_param)
+                        ah = ir_param_identity(func, ps, pl, call->loc.line);
+                }
+            }
             if (!ah || ah->alloc_id == 0) continue;
             uint32_t fl = rv->plen;
             char *path = (char *)arena_alloc(zc->arena, dest_plen + fl + 1);
@@ -2920,6 +3133,168 @@ static bool ir_register_alloc_result(ZerCheck *zc, IRFunc *func, IRPathState *ps
  * existing unwrap-alias / free-propagation / exit machinery carries it. A
  * global root lands under IR_GLOBAL_ROOT_ID (born escaped) — the exit and
  * call-window dangling rules then apply exactly as for a bare global. */
+enum { IR_SLOT_LIT = 0, IR_SLOT_SYM = 1, IR_SLOT_UNKEYED = 2 };
+
+typedef struct {
+    int root;
+    const char *apath; uint32_t aplen;   /* the ARRAY's key path (relative to root) */
+    const char *comp;  uint32_t complen; /* "[3]" / "[k]"; NULL when UNKEYED */
+    const char *rest;  uint32_t restlen; /* field steps after the index ("" if none) */
+    const char *full;  uint32_t fulllen; /* apath + comp + rest; NULL when UNKEYED */
+    int kind;
+} IRSlotRef;
+
+static char *ir_cat3(ZerCheck *zc, const char *a, uint32_t al, const char *b,
+                     uint32_t bl, const char *c, uint32_t cl) {
+    char *p = (char *)arena_alloc(zc->arena, (size_t)al + bl + cl + 1);
+    if (!p) return NULL;
+    if (al) memcpy(p, a, al);
+    if (bl) memcpy(p + al, b, bl);
+    if (cl) memcpy(p + al + bl, c, cl);
+    p[al + bl + cl] = '\0';
+    return p;
+}
+
+/* The wildcard entry `apath[*]rest` of an array (created on demand). */
+static IRHandleInfo *ir_slot_wild_at(ZerCheck *zc, IRPathState *ps, int root,
+                                     const char *apath, uint32_t aplen,
+                                     const char *rest, uint32_t restlen,
+                                     bool create) {
+    char *wp = ir_cat3(zc, apath, aplen, "[*]", 3, rest, restlen);
+    if (!wp) return NULL;
+    uint32_t wl = aplen + 3 + restlen;
+    IRHandleInfo *w = ir_find_compound_handle(ps, root, wp, wl);
+    if (!w && create) {
+        w = ir_add_compound_handle(ps, root, wp, wl);
+        if (w) {
+            w->state = IR_HS_ALIVE;
+            w->escaped = true;       /* owns nothing, never leak-checked */
+            w->alloc_id = 0;
+            w->view_is_slot = true;
+        }
+    }
+    return w;
+}
+
+/* BUG-1074 (H7): the WILDCARD slot of an array expression. Returns NULL when
+ * the array expression has no key. */
+static IRHandleInfo *ir_wild_slot(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                  Node *array_expr, bool create,
+                                  int *out_root, const char **out_path,
+                                  uint32_t *out_plen) {
+    int root; const char *path; uint32_t plen;
+    if (!array_expr ||
+        ir_extract_compound_key(zc, func, ps, array_expr, &root, &path, &plen) != 0)
+        return NULL;
+    if (out_root) *out_root = root;
+    if (out_path) *out_path = path;
+    if (out_plen) *out_plen = plen;
+    return ir_slot_wild_at(zc, ps, root, path ? path : "", plen, "", 0, create);
+}
+
+/* Split an element access `A[i]` or `A[i].f.g` into its array, index and the
+ * field steps after it. False when the array itself has no key. */
+static bool ir_slot_decompose(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                              Node *e, IRSlotRef *r) {
+    memset(r, 0, sizeof(*r));
+    e = ir_peel_launder(e);
+    Node *cur = e;
+    uint32_t restlen = 0;
+    while (cur && cur->kind == NODE_FIELD) {
+        restlen += 1 + (uint32_t)cur->field.field_name_len;
+        cur = cur->field.object;
+    }
+    if (!cur || cur->kind != NODE_INDEX || !cur->index_expr.index) return false;
+    Node *ix = cur->index_expr.index;
+    int root; const char *ap; uint32_t apl;
+    if (ir_extract_compound_key(zc, func, ps, cur->index_expr.object,
+                                &root, &ap, &apl) != 0)
+        return false;
+    char *rest = (char *)arena_alloc(zc->arena, restlen + 1);
+    if (!rest) return false;
+    uint32_t pos = restlen;
+    for (Node *c = e; c && c->kind == NODE_FIELD; c = c->field.object) {
+        uint32_t fl = (uint32_t)c->field.field_name_len;
+        pos -= fl;
+        memcpy(rest + pos, c->field.field_name, fl);
+        pos -= 1;
+        rest[pos] = '.';
+    }
+    rest[restlen] = '\0';
+    r->root = root;
+    r->apath = ap ? ap : "";
+    r->aplen = apl;
+    r->rest = rest;
+    r->restlen = restlen;
+    int cl = -1;
+    if (ix->kind == NODE_INT_LIT) {
+        r->kind = IR_SLOT_LIT;
+        cl = snprintf(NULL, 0, "[%llu]", (unsigned long long)ix->int_lit.value);
+    } else if (ir_index_is_keyable(func, ix)) {
+        r->kind = IR_SLOT_SYM;
+    } else {
+        r->kind = IR_SLOT_UNKEYED;
+        return true;
+    }
+    char *comp;
+    if (r->kind == IR_SLOT_SYM) {
+        comp = ir_cat3(zc, "[", 1, ix->ident.name, (uint32_t)ix->ident.name_len, "]", 1);
+        cl = (int)ix->ident.name_len + 2;
+    } else {
+        if (cl <= 0) return false;
+        comp = (char *)arena_alloc(zc->arena, (size_t)cl + 1);
+        if (comp) snprintf(comp, (size_t)cl + 1, "[%llu]",
+                           (unsigned long long)ix->int_lit.value);
+    }
+    if (!comp) return false;
+    r->comp = comp;
+    r->complen = (uint32_t)cl;
+    char *full = ir_cat3(zc, r->apath, r->aplen, comp, (uint32_t)cl, rest, restlen);
+    if (!full) return false;
+    r->full = full;
+    r->fulllen = r->aplen + (uint32_t)cl + restlen;
+    return true;
+}
+
+/* BUG-1130 (residual 3): `arr[f(i)] = alloc(T)` — an UNTRACKABLE index.
+ * Nothing but the array holds the result, so keep it as the array's OWNED
+ * entry `arr[*#line]` (one per store site, joined across loop iterations) and
+ * a wildcard member. Before, it was registered nowhere: no read could see it
+ * and it could never be reported as a leak. */
+static bool ir_register_alloc_into_wild_slot(ZerCheck *zc, IRFunc *func,
+                                             IRPathState *ps, Node *call,
+                                             IRMethodKind mc, Node *target,
+                                             int line) {
+    IRSlotRef r;
+    if (!ir_slot_decompose(zc, func, ps, target, &r) || r.kind != IR_SLOT_UNKEYED)
+        return false;
+    int tl = snprintf(NULL, 0, "[*#%d]", line);
+    char *tag = tl > 0 ? (char *)arena_alloc(zc->arena, (size_t)tl + 1) : NULL;
+    if (!tag) return false;
+    snprintf(tag, (size_t)tl + 1, "[*#%d]", line);
+    char *op = ir_cat3(zc, r.apath, r.aplen, tag, (uint32_t)tl, r.rest, r.restlen);
+    if (!op) return false;
+    uint32_t ol = r.aplen + (uint32_t)tl + r.restlen;
+    IRHandleInfo *prev = ir_find_compound_handle(ps, r.root, op, ol);
+    int aid = prev ? prev->alloc_id : _ir_next_alloc_id++;
+    IRHandleInfo *w = ir_slot_wild_at(zc, ps, r.root, r.apath, r.aplen,
+                                      r.rest, r.restlen, true);
+    if (w) ir_view_add(w, aid);
+    IRHandleInfo *h = ir_find_compound_handle(ps, r.root, op, ol);
+    if (!h) h = ir_add_compound_handle(ps, r.root, op, ol);
+    if (!h) return false;
+    h->alloc_id = aid;
+    h->state = IR_HS_ALIVE;
+    h->alloc_line = line;
+    if (mc == IRMC_ARENA_ALLOC) {
+        h->source_color = ZC_COLOR_ARENA;
+    } else {
+        h->source_color = ZC_COLOR_POOL;
+        ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);
+    }
+    return true;
+}
+
 static bool ir_register_alloc_result_compound(ZerCheck *zc, IRFunc *func,
                                               IRPathState *ps, Node *call,
                                               IRMethodKind mc, Node *target,
@@ -2931,7 +3306,7 @@ static bool ir_register_alloc_result_compound(ZerCheck *zc, IRFunc *func,
     uint32_t plen;
     if (ir_extract_compound_key(zc, func, ps, target, &root, &path, &plen) != 0 ||
         plen == 0)
-        return false;
+        return ir_register_alloc_into_wild_slot(zc, func, ps, call, mc, target, line);
     IRHandleInfo *h = ir_add_compound_handle(ps, root, path, plen);
     if (!h) return false;
     ir_report_overwrite(zc, func, ps, h, -1, line);   /* -1: a fresh id is minted below */
@@ -3193,6 +3568,16 @@ static void urs_add(UafReportSet *s, int id) {
 static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                Node *expr, int line, UafReportSet *rs);
 
+/* BUG-1130: does a key path carry a TRACKABLE-local index component (`[k]`)? */
+static bool ir_path_has_symbolic_index(const char *p, uint32_t pl) {
+    for (uint32_t i = 0; p && i + 1 < pl; i++) {
+        if (p[i] != '[') continue;
+        char c = p[i + 1];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') return true;
+    }
+    return false;
+}
+
 /* The name a diagnostic should print for a key root: the local's name, or —
  * for a GLOBAL projection keyed under IR_GLOBAL_ROOT_ID (BUG-982) — the full
  * key itself ("g.p"), which used to come out as '?'. */
@@ -3248,6 +3633,16 @@ static bool ir_assign_target_is_tracked_slot(ZerCheck *zc, IRFunc *func,
     return ir_find_compound_handle(ps, root, path, plen) != NULL;
 }
 
+/* BUG-1130: is allocation `aid` currently held by a PRECISE slot entry
+ * (see ir_entry_is_precise_slot)? */
+static bool ir_aid_held_by_precise_slot(IRPathState *ps, int aid) {
+    if (aid == 0) return false;
+    for (int i = 0; i < ps->handle_count; i++)
+        if (ps->handles[i].alloc_id == aid && ir_entry_is_precise_slot(&ps->handles[i]))
+            return true;
+    return false;
+}
+
 /* BUG-1075: THE use question for a handle entry — "is using the value this
  * entry names unsafe right now?" — ONE query for every use sink.
  *
@@ -3277,7 +3672,12 @@ static IRHandleInfo *ir_use_blocker(ZerCheck *zc, IRFunc *func, IRPathState *ps,
          * { held[got] = k; } else { free(k); }` — leaves the shared id
          * MAYBE_FREED although nothing stored was freed. The conditional-free
          * case this gives up is recorded in docs/limitations.md. */
-        if (h->view_is_slot && vh->state == IR_HS_MAYBE_FREED) continue;
+        /* BUG-1130: ...unless the member is held by a PRECISE slot entry
+         * (`arr[3]`, `arr[k]` with k unchanged): that entry's state is its own
+         * per-path fact, so a MAYBE there is a real "stored, then maybe freed"
+         * (`arr[k] = a; if (c) { free(a); } q = arr[j]; q.v`). */
+        if (h->view_is_slot && vh->state == IR_HS_MAYBE_FREED &&
+            !ir_aid_held_by_precise_slot(ps, vh->alloc_id)) continue;
         if (ir_use_guard_disjoint(zc, vh)) continue;
         /* Name the allocation by a user-visible entry when one exists — the
          * first match is often the `_zer_t` temp it was allocated into. */
@@ -3291,10 +3691,6 @@ static IRHandleInfo *ir_use_blocker(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         return vh;
     }
     return NULL;
-}
-
-static bool ir_handle_is_view(const IRHandleInfo *h) {
-    return h && h->alloc_id == 0 && (h->view_count > 0 || h->view_overflow);
 }
 
 /* Add alloc_id `aid` to h's view set (dedup; overflow is the sound fallback). */
@@ -3317,10 +3713,14 @@ static void ir_view_add(IRHandleInfo *h, int aid) {
  * was a clean double free. */
 static void ir_view_free_barrier(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                  IRHandleInfo *h, int line) {
-    if (!ir_handle_is_view(h) && !(h && h->view_is_slot && h->view_count > 0)) return;
+    /* BUG-1130: an ALIAS may carry views too — a read of a precise slot
+     * `arr[k]` aliases that slot's allocation AND views what an aliasing store
+     * (`arr[j] = b`, j possibly == k) may have put there. */
+    if (!h || (h->view_count == 0 && !h->view_overflow)) return;
     for (int i = 0; i < ps->handle_count; i++) {
         IRHandleInfo *vh = &ps->handles[i];
         if (vh == h || vh->alloc_id == 0) continue;
+        if (vh->alloc_id == h->alloc_id) continue;   /* its own allocation */
         bool member = h->view_overflow;
         for (int vi = 0; !member && vi < h->view_count; vi++)
             if (vh->alloc_id == h->view_alloc_ids[vi]) member = true;
@@ -3341,7 +3741,10 @@ static void ir_view_free_barrier(ZerCheck *zc, IRFunc *func, IRPathState *ps,
          * BUG-741 posture for variable-index frees, recorded in
          * docs/limitations.md. A definite double free (the member was freed
          * through its own name) is still reported just above. */
-        if (h->view_is_slot) continue;
+        /* BUG-1130: a candidate held by a PRECISE slot is widened like any
+         * view candidate — `arr[0] = a; arr[k] = b; free(arr[k]); free(a);`
+         * double-frees when k == 0. Only the wildcard's members are exempt. */
+        if (h->view_is_slot && !ir_aid_held_by_precise_slot(ps, vh->alloc_id)) continue;
         if (vh->state == IR_HS_ALIVE) {
             vh->state = IR_HS_MAYBE_FREED;
             vh->free_line = line;
@@ -3349,123 +3752,122 @@ static void ir_view_free_barrier(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     }
 }
 
-/* BUG-1074 (H7): the WILDCARD slot of an array — the compound (root, P"[*]")
- * where P is the array's own key path. Every allocation stored through a
- * VARIABLE index is recorded in its view set; it owns nothing (alloc_id 0,
- * escaped). A variable-index store used to mark the stored value escaped and
- * record NOTHING about where it went, so a read back through a variable index
- * aliased nothing: `arr[k] = a; free(a); *T q = arr[k] orelse return; q.v`
- * read a recycled slot (another object's value). Returns NULL when the array
- * expression has no key. */
-static IRHandleInfo *ir_wild_slot(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                  Node *array_expr, bool create,
-                                  int *out_root, const char **out_path,
-                                  uint32_t *out_plen) {
-    int root; const char *path; uint32_t plen;
-    if (!array_expr ||
-        ir_extract_compound_key(zc, func, ps, array_expr, &root, &path, &plen) != 0)
-        return NULL;
-    char *wp = (char *)arena_alloc(zc->arena, plen + 4);
-    if (!wp) return NULL;
-    if (plen > 0) memcpy(wp, path, plen);
-    memcpy(wp + plen, "[*]", 3);
-    wp[plen + 3] = '\0';
-    if (out_root) *out_root = root;
-    if (out_path) *out_path = path;
-    if (out_plen) *out_plen = plen;
-    IRHandleInfo *w = ir_find_compound_handle(ps, root, wp, plen + 3);
-    if (!w && create) {
-        w = ir_add_compound_handle(ps, root, wp, plen + 3);
-        if (w) {
-            w->state = IR_HS_ALIVE;
-            w->escaped = true;       /* owns nothing, never leak-checked */
-            w->alloc_id = 0;
-            w->view_is_slot = true;
-        }
-    }
-    return w;
-}
+/* ================================================================
+ * Array SLOTS (BUG-1074, BUG-1130)
+ *
+ * An array's element slots are tracked three ways, from most to least precise:
+ *
+ *   arr[3]      a LITERAL slot — a compound entry like any field;
+ *   arr[k]      a slot at a TRACKABLE index local k (ir_index_local_keyable) —
+ *               the same kind of entry, valid while k is not written; every
+ *               entry naming k is demoted when an instruction writes k
+ *               (ir_kill_index_facts);
+ *   arr[*]      the WILDCARD — a view set (alloc_id 0, owns nothing) of every
+ *               allocation that may sit in SOME slot no precise entry
+ *               describes: stored at an untrackable index, or demoted from
+ *               `arr[k]` when k changed. `arr[*#L]` is an allocation that ONLY
+ *               the array holds (`arr[i] = alloc(T)`), kept as an owned entry
+ *               so the leak check still sees it.
+ *
+ * Two indices of one array may name the same slot unless both are distinct
+ * literals, so a READ of a slot views every other entry that may alias it
+ * (ir_slot_collect) on top of aliasing its own precise entry, and a FREE
+ * through one widens the precise candidates (ir_view_free_barrier).
+ * ================================================================ */
 
-/* Is `e` a variable-index element read `A[i]` (i not a literal)? */
-static bool ir_is_var_index(Node *e) {
-    return e && e->kind == NODE_INDEX && e->index_expr.index &&
-           e->index_expr.index->kind != NODE_INT_LIT;
-}
-
-/* BUG-1074: the candidate set a variable-index READ of `A[i]` may name — the
- * wildcard members plus every literal slot `A[n]` of the same array — written
- * into `dh`'s view set. */
-static void ir_fill_var_index_view(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                   Node *index_expr, IRHandleInfo *dh) {
-    if (!dh || !ir_is_var_index(index_expr)) return;
-    int root = -1; const char *path = NULL; uint32_t plen = 0;
-    IRHandleInfo *w = ir_wild_slot(zc, func, ps, index_expr->index_expr.object,
-                                   false, &root, &path, &plen);
-    if (root < 0 && !w) {
-        int r2; const char *p2; uint32_t l2;
-        if (ir_extract_compound_key(zc, func, ps, index_expr->index_expr.object,
-                                    &r2, &p2, &l2) != 0) return;
-        root = r2; path = p2; plen = l2;
-    }
+/* The allocations a slot access through `r` may name besides its own precise
+ * entry: every OTHER slot of the array that its index may equal (all of them,
+ * except that two distinct literals never meet), and the wildcard's members.
+ * Written into `out`'s view set; `exclude_aid` is the own entry's allocation. */
+static void ir_slot_collect(ZerCheck *zc, IRPathState *ps, const IRSlotRef *r,
+                            int exclude_aid, IRHandleInfo *out) {
+    IRHandleInfo *w = ir_slot_wild_at(zc, ps, r->root, r->apath, r->aplen,
+                                      r->rest, r->restlen, false);
     if (w) {
-        for (int k = 0; k < w->view_count; k++) ir_view_add(dh, w->view_alloc_ids[k]);
-        if (w->view_overflow) dh->view_overflow = true;
+        for (int k = 0; k < w->view_count; k++)
+            if (w->view_alloc_ids[k] != exclude_aid) ir_view_add(out, w->view_alloc_ids[k]);
+        if (w->view_overflow) out->view_overflow = true;
     }
     for (int i = 0; i < ps->handle_count; i++) {
         IRHandleInfo *c = &ps->handles[i];
-        if (c->local_id != root || c->alloc_id == 0) continue;
-        if (c->path_len <= plen || !c->path || c->path[plen] != '[') continue;
-        if (plen > 0 && (!path || memcmp(c->path, path, plen) != 0)) continue;
-        ir_view_add(dh, c->alloc_id);
+        if (c->local_id != r->root || c->alloc_id == 0 || c->alloc_id == exclude_aid) continue;
+        if (!c->path || c->path_len <= r->aplen + 1) continue;
+        if (r->aplen > 0 && memcmp(c->path, r->apath, r->aplen) != 0) continue;
+        if (c->path[r->aplen] != '[') continue;
+        uint32_t j = r->aplen;
+        while (j < c->path_len && c->path[j] != ']') j++;
+        if (j >= c->path_len) continue;
+        uint32_t ccl = j - r->aplen + 1;
+        uint32_t reml = c->path_len - j - 1;
+        if (reml != r->restlen ||
+            (reml > 0 && memcmp(c->path + j + 1, r->rest, reml) != 0)) continue;
+        const char *cc = c->path + r->aplen;
+        if (r->kind != IR_SLOT_UNKEYED && ccl == r->complen &&
+            memcmp(cc, r->comp, ccl) == 0) continue;           /* its own slot */
+        if (r->kind == IR_SLOT_LIT && ccl > 2 && cc[1] >= '0' && cc[1] <= '9')
+            continue;                                          /* another literal */
+        ir_view_add(out, c->alloc_id);
     }
 }
 
-/* BUG-1074: a USE through a variable-index element (`A[i].v`, `A[i][0]`,
- * `*A[i]`): the element may be any allocation the array holds. */
-static IRHandleInfo *ir_var_index_blocker(ZerCheck *zc, IRFunc *func,
-                                          IRPathState *ps, Node *expr) {
-    Node *e = expr;
-    while (e && !ir_is_var_index(e)) {
-        if (e->kind == NODE_FIELD) e = e->field.object;
-        else if (e->kind == NODE_INDEX) e = e->index_expr.object;
-        else if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR) e = e->unary.operand;
-        else return NULL;
-    }
-    if (!e) return NULL;
-    IRHandleInfo tmp;
-    memset(&tmp, 0, sizeof(tmp));
-    tmp.free_block = -1;
-    tmp.view_root_local = -1;
-    tmp.view_is_slot = true;
-    ir_fill_var_index_view(zc, func, ps, e, &tmp);
-    if (tmp.view_count == 0 && !tmp.view_overflow) return NULL;
-    return ir_use_blocker(zc, func, ps, &tmp);
+/* Is the element read `expr` (a slot of an array) reading a value that can
+ * reference an allocation? */
+static bool ir_slot_reads_ref(ZerCheck *zc, Node *e) {
+    Type *et = checker_get_type(zc->checker, e);
+    Type *ein = et ? type_unwrap_optional(et) : NULL;
+    return ir_type_reads_as_ref(et) || (ein && type_dispatch_kind(ein) == TYPE_HANDLE);
 }
 
-/* BUG-1074: `dest = A[i]` (or `A[i] orelse ...`) with a variable i and a
- * REFERENCE element type: dest becomes a VIEW of every allocation the array may
- * hold at i. A scalar element is a value read and aliases nothing (CLAUDE.md
- * "FORMING a reference aliases; READING a value does not"). */
-static void ir_var_index_read_alias(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                    Node *expr, int dest, int line) {
+/* BUG-1074/1130: `dest = A[i]` (or `A[i] orelse ...`, `A[i].p`) with a
+ * REFERENCE element type. dest aliases the slot's own precise entry when there
+ * is one, and VIEWS every other allocation the slot may hold (ir_slot_collect).
+ * With no precise entry, dest is a pure VIEW that remembers WHICH slot it came
+ * through (`has_slot`), so a free through it can record that slot as freed
+ * (ir_slot_view_freed). A scalar element is a value read and aliases nothing
+ * (CLAUDE.md "FORMING a reference aliases; READING a value does not").
+ * Idempotent — the field/index alias arms call it again after aliasing, so
+ * their plain alias does not drop the candidates. */
+static void ir_slot_read(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                         Node *expr, int dest, int line) {
     if (dest < 0 || dest >= func->local_count || !expr) return;
     Node *e = expr;
     if (e->kind == NODE_ORELSE) e = e->orelse.expr;
     e = ir_peel_launder(e);
-    if (!ir_is_var_index(e)) return;
-    Type *et = checker_get_type(zc->checker, e);
-    Type *ein = et ? type_unwrap_optional(et) : NULL;
-    if (!ir_type_reads_as_ref(et) &&
-        !(ein && type_dispatch_kind(ein) == TYPE_HANDLE)) return;
+    if (!e || (e->kind != NODE_INDEX && e->kind != NODE_FIELD)) return;
+    if (!ir_slot_reads_ref(zc, e)) return;
+    IRSlotRef r;
+    if (!ir_slot_decompose(zc, func, ps, e, &r)) return;
+    IRHandleInfo *E = r.full ? ir_find_compound_handle(ps, r.root, r.full, r.fulllen) : NULL;
+    if (E && E->alloc_id == 0) E = NULL;    /* a reset slot holds nothing tracked */
     IRHandleInfo tmp;
     memset(&tmp, 0, sizeof(tmp));
     tmp.free_block = -1;
     tmp.view_root_local = -1;
-    ir_fill_var_index_view(zc, func, ps, e, &tmp);
-    if (tmp.view_count == 0 && !tmp.view_overflow) return;
+    ir_slot_collect(zc, ps, &r, E ? E->alloc_id : 0, &tmp);
+    bool has_c = tmp.view_count > 0 || tmp.view_overflow;
+    if (E) {
+        IRAliasSnapshot snap;
+        ir_snapshot_alias(&snap, E);
+        IRHandleState st = E->state;
+        IRHandleInfo *prev = ir_find_handle(ps, dest);
+        if (prev && prev->alloc_id != snap.alloc_id)
+            ir_report_overwrite(zc, func, ps, prev, snap.alloc_id, line);
+        IRHandleInfo *dh = ir_add_handle(ps, dest);      /* may realloc: E is stale */
+        if (!dh) return;
+        ir_apply_alias(dh, &snap);
+        dh->state = st;
+        if (has_c) {
+            for (int k = 0; k < tmp.view_count; k++) ir_view_add(dh, tmp.view_alloc_ids[k]);
+            if (tmp.view_overflow) dh->view_overflow = true;
+            dh->view_is_slot = true;
+        }
+        return;
+    }
+    if (!has_c) return;
+    IRHandleInfo *prev = ir_find_handle(ps, dest);
+    ir_report_overwrite(zc, func, ps, prev, -1, line);
     IRHandleInfo *dh = ir_add_handle(ps, dest);
     if (!dh) return;
-    ir_report_overwrite(zc, func, ps, dh, -1, line);
     dh->state = IR_HS_ALIVE;
     dh->alloc_line = line;
     dh->alloc_id = 0;          /* a view owns nothing */
@@ -3474,6 +3876,380 @@ static void ir_var_index_read_alias(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     dh->view_count = 0;
     dh->view_overflow = tmp.view_overflow;
     for (int k = 0; k < tmp.view_count; k++) ir_view_add(dh, tmp.view_alloc_ids[k]);
+    dh->has_slot = true;
+    dh->slot_root = r.root;
+    dh->slot_arr_path = r.apath;
+    dh->slot_arr_plen = r.aplen;
+    dh->slot_key_path = (r.kind != IR_SLOT_UNKEYED && r.restlen == 0) ? r.full : NULL;
+    dh->slot_key_plen = dh->slot_key_path ? r.fulllen : 0;
+}
+
+/* BUG-1074/1130: a USE of an element `A[i]` (read, deref, field access
+ * through it): the element may be any allocation another slot of the array
+ * holds. The own precise entry is checked by the caller; this answers for the
+ * candidates. */
+static IRHandleInfo *ir_slot_use_blocker(ZerCheck *zc, IRFunc *func,
+                                         IRPathState *ps, Node *e) {
+    if (!e || e->kind != NODE_INDEX) return NULL;
+    IRSlotRef r;
+    if (!ir_slot_decompose(zc, func, ps, e, &r)) return NULL;
+    IRHandleInfo *E = r.full ? ir_find_compound_handle(ps, r.root, r.full, r.fulllen) : NULL;
+    IRHandleInfo tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.free_block = -1;
+    tmp.view_root_local = -1;
+    tmp.view_is_slot = true;
+    ir_slot_collect(zc, ps, &r, (E && E->alloc_id != 0) ? E->alloc_id : 0, &tmp);
+    if (tmp.view_count == 0 && !tmp.view_overflow) return NULL;
+    return ir_use_blocker(zc, func, ps, &tmp);
+}
+
+/* Is local `root` storage of THIS function (a non-param local whose type is a
+ * value aggregate) — so its slots go out of scope with the function? */
+static bool ir_slot_root_is_local_storage(IRFunc *func, int root) {
+    if (root < 0 || root >= func->local_count) return false;
+    if (func->locals[root].is_param || func->locals[root].is_static) return false;
+    return ir_local_is_aggregate(func, root);
+}
+
+/* Is the store target `A[i]` (any index) an element of this function's own
+ * storage — every step from the root local a VALUE step (no pointer, slice or
+ * param on the way)? Then an allocation stored there is still this function's
+ * to free, not escaped. */
+static bool ir_index_target_is_local_array(ZerCheck *zc, IRFunc *func, Node *target) {
+    if (!target || target->kind != NODE_INDEX) return false;
+    Node *o = target->index_expr.object;
+    while (o) {
+        Type *t = checker_get_type(zc->checker, o);
+        TypeKind k = t ? type_dispatch_kind(t) : TYPE_VOID;
+        if (k != TYPE_ARRAY && k != TYPE_STRUCT && k != TYPE_UNION) return false;
+        if (o->kind == NODE_IDENT) {
+            int l = ir_find_local_exact_first(func, o->ident.name,
+                                              (uint32_t)o->ident.name_len);
+            return l >= 0 && ir_slot_root_is_local_storage(func, l);
+        }
+        if (o->kind == NODE_FIELD) o = o->field.object;
+        else if (o->kind == NODE_INDEX) o = o->index_expr.object;
+        else return false;
+    }
+    return false;
+}
+
+/* BUG-1130: a free went through `h`. When h is a VIEW read through a slot with
+ * no precise entry, that slot now holds a freed pointer: record `(root, key)`
+ * FREED so a re-read of `A[k]` (k unchanged) or a second free through it is
+ * refused. And a free through a view of a LOCAL array marks the array DRAINED —
+ * the leak exemption for what it received at a variable index (see the exit
+ * pass). `hin` is a copy taken before the free sink changed anything. */
+static void ir_slot_view_freed(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                               const IRHandleInfo *hin, int line) {
+    if (!hin || !hin->has_slot) return;
+    int root = hin->slot_root;
+    const char *ap = hin->slot_arr_path;
+    uint32_t apl = hin->slot_arr_plen;
+    const char *key = hin->slot_key_path;
+    uint32_t kl = hin->slot_key_plen;
+    if (key && kl > 0) {
+        IRHandleInfo *E = ir_find_compound_handle(ps, root, key, kl);
+        if (!E) {
+            E = ir_add_compound_handle(ps, root, key, kl);
+            if (E) {
+                E->state = IR_HS_FREED;
+                E->alloc_line = line;
+                E->free_line = line;
+                E->alloc_id = _ir_next_alloc_id++;
+                E->escaped = true;           /* records a fact, owns nothing */
+            }
+        }
+    }
+    if (ir_slot_root_is_local_storage(func, root)) {
+        IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, ap ? ap : "", apl, "", 0, true);
+        if (w) w->slot_drained = true;
+    }
+}
+
+/* BUG-1130: a LOCAL array handed to a user call (`drain(arr)`, `f(arr[0..])`,
+ * `f(&arr)`) may be emptied by it — the callee frees through a slice at a
+ * variable index, which no FuncSummary expresses. Before BUG-1130 nothing
+ * stored at a variable index was leak-checked at all; handing the array on
+ * keeps that posture for it (a DRAIN, the leak exemption), so a callee that
+ * frees every slot is not a false leak. Elements are NOT widened to
+ * MAYBE_FREED here: that would refuse every read-only callee
+ * (`sum(arr); a.v`). The UAF side of a draining callee is the documented
+ * limit (docs/limitations.md). */
+static void ir_call_hands_local_array(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                      Node *call) {
+    if (!call || call->kind != NODE_CALL) return;
+    if (ir_classify_method_call_ex(zc->checker, call) != IRMC_NONE) return;
+    for (int i = 0; i < call->call.arg_count; i++) {
+        Node *a = ir_peel_launder(call->call.args[i]);
+        if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP) a = a->unary.operand;
+        if (a && a->kind == NODE_SLICE) a = a->slice.object;
+        if (!a) continue;
+        Type *t = checker_get_type(zc->checker, a);
+        if (!t || type_dispatch_kind(t) != TYPE_ARRAY) continue;
+        int root; const char *path; uint32_t plen;
+        if (ir_extract_compound_key(zc, func, ps, a, &root, &path, &plen) != 0) continue;
+        if (!ir_slot_root_is_local_storage(func, root)) continue;
+        IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, path ? path : "", plen, "", 0, true);
+        if (w) w->slot_drained = true;
+    }
+}
+
+/* Is allocation `aid` a member of a DRAINED local array's wildcard? */
+static bool ir_aid_in_drained_array(IRPathState *ps, int aid) {
+    if (aid == 0) return false;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *w = &ps->handles[i];
+        if (!w->slot_drained) continue;
+        if (w->view_overflow) return true;
+        for (int k = 0; k < w->view_count; k++)
+            if (w->view_alloc_ids[k] == aid) return true;
+        /* a slot entry of the same array (`arr[3]`, `arr[k]`, `arr[*#L]`) */
+        uint32_t al = w->path_len >= 3 ? w->path_len - 3 : 0;
+        for (int j = 0; j < ps->handle_count; j++) {
+            IRHandleInfo *c = &ps->handles[j];
+            if (c->alloc_id != aid || c->local_id != w->local_id || !c->path) continue;
+            if (c->path_len > al && (al == 0 || memcmp(c->path, w->path, al) == 0) &&
+                c->path[al] == '[')
+                return true;
+        }
+    }
+    return false;
+}
+
+/* Does `path` contain the index component `[name]`? Returns its offset or -1. */
+static int ir_path_index_name_at(const char *path, uint32_t plen,
+                                 const char *nm, uint32_t nl) {
+    if (!path || !nm || nl == 0 || plen < nl + 2) return -1;
+    for (uint32_t i = 0; i + nl + 2 <= plen; i++)
+        if (path[i] == '[' && path[i + nl + 1] == ']' &&
+            memcmp(path + i + 1, nm, nl) == 0)
+            return (int)i;
+    return -1;
+}
+
+/* BUG-1130: index local `nm` was WRITTEN — every fact keyed on its old value
+ * is now about some slot we can no longer name. Views forget which slot they
+ * came through (a free through them can no longer say which slot it emptied).
+ * A precise entry `A[nm]...` is DEMOTED: its allocation joins the wildcard
+ * `A[*]...`; the entry itself survives, as `A[*#L]`, only when it is the one
+ * thing holding its allocation (`A[i] = alloc(T)`), so the leak check still
+ * reports it. Anything else is dropped — a reset slot holds nothing, another
+ * entry carries an allocation it shares, and a FREED slot fact is LOST: a slot
+ * freed through `A[i]` and read back after `i` moved on is the documented
+ * limit (docs/limitations.md). Keeping it would refuse every loop that frees
+ * or consumes one slot per iteration — the analysis cannot tell `i` never
+ * comes back. */
+static void ir_slot_demote_into(ZerCheck *zc, IRPathState *ps, const IRHandleInfo *copy,
+                                uint32_t at, const char *rest, uint32_t restlen,
+                                char tagc, int tagline, IRHandleInfo *w) {
+    int tl = snprintf(NULL, 0, "[*%c%d]", tagc, tagline);
+    if (tl <= 0) return;
+    char *tag = (char *)arena_alloc(zc->arena, (size_t)tl + 1);
+    if (!tag) return;
+    snprintf(tag, (size_t)tl + 1, "[*%c%d]", tagc, tagline);
+    char *op = ir_cat3(zc, copy->path, at, tag, (uint32_t)tl, rest, restlen);
+    if (!op) return;
+    uint32_t ol = at + (uint32_t)tl + restlen;
+    IRHandleInfo *o = ir_find_compound_handle(ps, copy->local_id, op, ol);
+    if (o) {
+        if (o->state != copy->state) o->state = IR_HS_MAYBE_FREED;
+        if (w) ir_view_add(w, o->alloc_id);
+        return;
+    }
+    o = ir_alloc_handle_slot(ps);
+    if (!o) return;
+    *o = *copy;
+    o->path = op;
+    o->path_len = ol;
+    o->has_slot = false;
+}
+
+static void ir_kill_index_name(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                               const char *nm, uint32_t nl) {
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h->slot_key_path &&
+            ir_path_index_name_at(h->slot_key_path, h->slot_key_plen, nm, nl) >= 0) {
+            h->slot_key_path = NULL;
+            h->slot_key_plen = 0;
+        }
+    }
+    for (int i = ps->handle_count - 1; i >= 0; i--) {
+        if (i >= ps->handle_count) continue;
+        IRHandleInfo *h = &ps->handles[i];
+        int at = ir_path_index_name_at(h->path, h->path_len, nm, nl);
+        if (at < 0) continue;
+        IRHandleInfo copy = *h;
+        /* "sole" = no OTHER user-visible entry holds the allocation (an
+         * `orelse` temp does not count: temps are never leak-checked). */
+        bool sole = copy.alloc_id != 0;
+        for (int j = 0; sole && j < ps->handle_count; j++) {
+            IRHandleInfo *o = &ps->handles[j];
+            if (j == i || o->alloc_id != copy.alloc_id) continue;
+            if (o->path_len == 0 && o->local_id >= 0 &&
+                o->local_id < func->local_count &&
+                func->locals[o->local_id].is_temp) continue;
+            sole = false;
+        }
+        memmove(&ps->handles[i], &ps->handles[i + 1],
+                (size_t)(ps->handle_count - i - 1) * sizeof(IRHandleInfo));
+        ps->handle_count--;
+        if (copy.alloc_id == 0) continue;            /* a reset slot: nothing held */
+        const char *rest = copy.path + at + nl + 2;
+        uint32_t restlen = copy.path_len - (uint32_t)at - nl - 2;
+        IRHandleInfo *w = ir_slot_wild_at(zc, ps, copy.local_id, copy.path, (uint32_t)at,
+                                          rest, restlen, true);
+        if (w) ir_view_add(w, copy.alloc_id);
+        if (sole && !copy.escaped &&
+                   (copy.state == IR_HS_ALIVE || copy.state == IR_HS_MAYBE_FREED)) {
+            w = ir_slot_wild_at(zc, ps, copy.local_id, copy.path, (uint32_t)at,
+                                rest, restlen, false);
+            ir_slot_demote_into(zc, ps, &copy, (uint32_t)at, rest, restlen, '#',
+                                copy.alloc_line, w);
+        }
+    }
+}
+
+/* BUG-1130: after instruction `inst`, drop every fact keyed on an index local
+ * the instruction WROTE (dest_local, an assignment anywhere in its expression,
+ * or — conservatively — an AST-path defer body). Only locals that actually key
+ * something are asked about. */
+static void ir_kill_index_facts(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                IRInst *inst) {
+    bool all = inst->op == IR_DEFER_FIRE && inst->defer_fire_emit_ast;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < ps->handle_count; i++) {
+            const char *p = pass == 0 ? ps->handles[i].path : ps->handles[i].slot_key_path;
+            uint32_t pl = pass == 0 ? ps->handles[i].path_len : ps->handles[i].slot_key_plen;
+            if (!p) continue;
+            for (uint32_t k = 0; k + 2 < pl; k++) {
+                if (p[k] != '[') continue;
+                char c0 = p[k + 1];
+                if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
+                    continue;
+                uint32_t e = k + 1;
+                while (e < pl && p[e] != ']') e++;
+                if (e >= pl) break;
+                const char *nm = p + k + 1;
+                uint32_t nl = e - k - 1;
+                int loc = ir_index_local_keyable(func, nm, nl);
+                bool written = all || loc < 0 || inst->dest_local == loc ||
+                    (inst->expr && ast_name_mutated_or_addrd(inst->expr, nm, nl));
+                if (!written && loc >= 0) {
+                    IRLocal *l = &func->locals[loc];
+                    if (l->orig_name && (l->orig_name_len != nl ||
+                                         memcmp(l->orig_name, nm, nl) != 0) &&
+                        inst->expr && ast_name_mutated_or_addrd(inst->expr,
+                                              l->orig_name, l->orig_name_len))
+                        written = true;
+                }
+                if (!written) continue;
+                /* Copy the name: the kill may delete the entry holding p. */
+                char *nn = (char *)arena_alloc(zc->arena, nl + 1);
+                if (!nn) return;
+                memcpy(nn, nm, nl);
+                nn[nl] = 0;
+                ir_kill_index_name(zc, func, ps, nn, nl);
+                i = -1;          /* the table changed — rescan from the start */
+                break;
+            }
+        }
+    }
+}
+
+/* GAP-6 (BUG-741) / BUG-1130: an element free `free(A[i])`. The slot it
+ * releases may be ANY slot `i` can equal — every other index except, for a
+ * literal, another literal. The argument-precise barrier:
+ *  (1) a candidate slot already definitely FREED -> this free may be its
+ *      second (`free(arr[0]); free(arr[k])`, and `free(arr[j])` after
+ *      `free(arr[k])`);
+ *  (2) ALIVE candidates (and their alias groups) widen to MAYBE_FREED +
+ *      escaped — a later free of one errors, the exit pass stays quiet;
+ *  (3) the wildcard's members — allocations stored at an untrackable index —
+ *      are candidates too (the view barrier; its members are not widened, or
+ *      the free-every-slot loop is refused on its second iteration).
+ * A free of a LOCAL array's element through a variable index also marks the
+ * array DRAINED (the leak exemption for what it received at a variable
+ * index). `own` is the freed slot's own key (NULL when untrackable). */
+static void ir_slot_free_siblings(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                  Node *arg, const char *own, uint32_t ownl,
+                                  int line) {
+    IRSlotRef r;
+    if (!ir_slot_decompose(zc, func, ps, arg, &r)) return;
+    {
+        IRHandleInfo wtmp;
+        memset(&wtmp, 0, sizeof(wtmp));
+        wtmp.free_block = -1;
+        wtmp.view_root_local = -1;
+        wtmp.view_is_slot = true;
+        IRHandleInfo *wv = ir_slot_wild_at(zc, ps, r.root, r.apath, r.aplen,
+                                           r.rest, r.restlen, false);
+        if (wv && (wv->view_count > 0 || wv->view_overflow)) {
+            for (int k = 0; k < wv->view_count; k++)
+                ir_view_add(&wtmp, wv->view_alloc_ids[k]);
+            wtmp.view_overflow = wv->view_overflow;
+            ir_view_free_barrier(zc, func, ps, &wtmp, line);
+        }
+    }
+    for (int vhi = 0; vhi < ps->handle_count; vhi++) {
+        IRHandleInfo *vh = &ps->handles[vhi];
+        if (vh->local_id != r.root || vh->alloc_id == 0 || !vh->path) continue;
+        if (own && vh->path_len == ownl && memcmp(vh->path, own, ownl) == 0) continue;
+        if (vh->path_len <= r.aplen + 1) continue;
+        if (r.aplen > 0 && memcmp(vh->path, r.apath, r.aplen) != 0) continue;
+        if (vh->path[r.aplen] != '[') continue;
+        uint32_t j = r.aplen;
+        while (j < vh->path_len && vh->path[j] != ']') j++;
+        if (j >= vh->path_len) continue;
+        uint32_t reml = vh->path_len - j - 1;
+        if (reml != r.restlen ||
+            (reml > 0 && memcmp(vh->path + j + 1, r.rest, reml) != 0)) continue;
+        const char *cc = vh->path + r.aplen;
+        if (r.kind == IR_SLOT_LIT && cc[1] >= '0' && cc[1] <= '9') continue;
+        if (vh->state == IR_HS_FREED) {
+            ir_zc_error(zc, line,
+                "variable-index free may double-free %s, already freed at line %d "
+                "— two indices of one array may name the same slot; don't mix "
+                "literal- and variable-index frees on the same array",
+                ir_local_desc(zc, func, vh->local_id, vh->path, vh->path_len),
+                vh->free_line);
+        } else if (vh->state == IR_HS_ALIVE) {
+            vh->state = IR_HS_MAYBE_FREED;
+            vh->free_line = line;
+            vh->escaped = true;
+            int vaid = vh->alloc_id;
+            for (int vgi = 0; vgi < ps->handle_count; vgi++) {
+                IRHandleInfo *vg = &ps->handles[vgi];
+                if (vg == vh || vg->alloc_id != vaid) continue;
+                if (ir_is_invalid(vg)) continue;
+                vg->state = IR_HS_MAYBE_FREED;
+                vg->free_line = line;
+                vg->escaped = true;
+            }
+        }
+    }
+    if (r.kind != IR_SLOT_LIT && ir_slot_root_is_local_storage(func, r.root)) {
+        IRHandleInfo *w = ir_slot_wild_at(zc, ps, r.root, r.apath, r.aplen, "", 0, true);
+        if (w) w->slot_drained = true;
+    }
+}
+
+/* BUG-1074/1130: report a USE of the element `expr` (a NODE_INDEX) blocked by
+ * an allocation another slot of the array may hand it. Returns true when it
+ * reported. */
+static bool ir_report_slot_use(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                               Node *expr, int line) {
+    if (!expr || expr->kind != NODE_INDEX) return false;
+    IRHandleInfo *vb = ir_slot_use_blocker(zc, func, ps, expr);
+    if (!vb) return false;
+    ir_zc_error(zc, line,
+        "use after free: an element read through an index may be %s, which is "
+        "%s (freed at line %d)",
+        ir_local_desc(zc, func, vb->local_id, vb->path, vb->path_len),
+        ir_state_name(vb->state), vb->free_line);
+    return true;
 }
 
 static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
@@ -3484,16 +4260,11 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     uint32_t path_len;
     if (ir_extract_compound_key(zc, func, ps, expr,
                                  &root_local, &path, &path_len) != 0) {
-        /* BUG-1074: an element reached through a VARIABLE index has no key,
-         * but it may be any allocation the array holds. */
-        IRHandleInfo *vb = ir_var_index_blocker(zc, func, ps, expr);
-        if (vb) {
-            ir_zc_error(zc, line,
-                "use after free: an element read through a variable index may be "
-                "%s, which is %s (freed at line %d)",
-                ir_local_desc(zc, func, vb->local_id, vb->path, vb->path_len),
-                ir_state_name(vb->state), vb->free_line);
-        }
+        /* BUG-1074: an element reached through an untrackable index has no
+         * key, but it may be any allocation the array holds. A FIELD chain
+         * over the element is reached again at its NODE_INDEX (the walker
+         * descends), which is where the question is asked. */
+        ir_report_slot_use(zc, func, ps, expr, line);
         return;
     }
     if (urs_has(rs, root_local)) return;
@@ -3525,6 +4296,13 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         const char *name;
         int nlen;
         ir_root_display(func, root_local, path, path_len, &name, &nlen);
+        if (h == blk && h->path && ir_path_has_symbolic_index(h->path, h->path_len)) {
+            /* BUG-1130: name the SLOT, not just the array */
+            ir_zc_error(zc, line,
+                "use after free: element %s (variable index) is %s (freed at line %d)",
+                ir_local_desc(zc, func, h->local_id, h->path, h->path_len),
+                ir_state_name(h->state), h->free_line);
+        } else
         ir_zc_error(zc, line,
             "use after free: '%.*s' is %s (freed at line %d)",
             nlen, name, ir_state_name(h->state), h->free_line);
@@ -3532,7 +4310,12 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             ZTRACE("CHECK    -> UAF FIRED: '%.*s' is %s (alloc_id %d, freed@line %d) used@line %d",
                    nlen, name, ir_state_name(h->state), h->alloc_id, h->free_line, line);
         urs_add(rs, root_local);
+        return;
     }
+    /* BUG-1130: a keyed element (`arr[0]`, `arr[k]`) may still hold what
+     * ANOTHER index stored — any two indices may meet, except two distinct
+     * literals. */
+    if (ir_report_slot_use(zc, func, ps, expr, line)) urs_add(rs, root_local);
 }
 
 static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
@@ -3592,8 +4375,13 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
          * BUG-982: a plain `=` whose target IS a tracked slot overwrites the
          * slot rather than reading through it — walk only the slot's object
          * chain (a freed pointer on the way is still a use). */
+        /* BUG-1130: a plain `=` into an ELEMENT (`arr[i] = x`) never reads the
+         * element either, tracked or not — only its array expression and the
+         * index are evaluated. (Reading it would ask whether some OTHER slot's
+         * allocation is freed, which a store cannot care about.) */
         if (expr->assign.op == TOK_EQ &&
-            ir_assign_target_is_tracked_slot(zc, func, ps, expr->assign.target)) {
+            (ir_assign_target_is_tracked_slot(zc, func, ps, expr->assign.target) ||
+             (expr->assign.target && expr->assign.target->kind == NODE_INDEX))) {
             Node *t = expr->assign.target;
             if (t->kind == NODE_FIELD) {
                 ir_check_expr_uaf(zc, func, ps, t->field.object, line, rs);
@@ -4061,6 +4849,10 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                         }
                     }
                 }
+                {   /* BUG-1130: a deferred free through a slot view */
+                    IRHandleInfo hc = *h;
+                    ir_slot_view_freed(zc, func, ps, &hc, defer_line);
+                }
             } else if (h && h->state == IR_HS_FREED &&
                        (g_defer_fire_token
                             ? h->freed_fire_token != g_defer_fire_token   /* BUG-1077 */
@@ -4527,6 +5319,25 @@ static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
         snprintf(b, cap, "field '%.*s' of a temporary", (int)plen, path);
         return b;
     }
+    /* BUG-1130: an unnameable slot key (`[*]`, `[*#L]`) prints as `[...]`. */
+    char *pp = NULL;
+    if (path && plen > 0) {
+        pp = (char *)arena_alloc(zc->arena, (size_t)plen * 2 + 6);
+        if (!pp) return "'?'";
+        uint32_t o = 0;
+        for (uint32_t i = 0; i < plen; i++) {
+            if (path[i] == '[' && i + 1 < plen && path[i + 1] == '*') {
+                while (i < plen && path[i] != ']') i++;
+                memcpy(pp + o, "[...]", 5);
+                o += 5;
+                continue;
+            }
+            pp[o++] = path[i];
+        }
+        pp[o] = 0;
+        path = pp;
+        plen = o;
+    }
     size_t cap = (size_t)nl + plen + 3;
     char *b = (char *)arena_alloc(zc->arena, cap);
     if (!b) return "'?'";
@@ -4734,6 +5545,304 @@ static void ir_carry_compounds(ZerCheck *zc, IRPathState *ps, int src_root,
     if (rows != stack_rows) free(rows);
 }
 
+/* BUG-1131: every REFERENCE field path of a returned struct type — `.p`,
+ * `.inner.q`, and `.ps[*]` for an array of references (a caller's read of any
+ * `.ps[i]` meets the `[*]` wildcard view). The by-value type graph is finite
+ * and acyclic (a struct cannot contain itself by value; a reference field is a
+ * leaf), so the walk terminates; the depth bound is a backstop. */
+typedef struct { const char **p; uint32_t *l; int n, cap; } IRPathList;
+
+/* BUG-1131: could this local's FIELDS have been written where the analysis
+ * does not see it? True for: no local at all; an address-taken local (`&h`
+ * handed to a callee, `*H hp = &h`); a value defined by a pointer DEREF; and
+ * (recursively) a copy of such a value. Conservative on the depth bound. */
+static bool ir_value_is_opaque(ZerCheck *zc, IRFunc *func, int local, int depth) {
+    (void)zc;
+    if (local < 0 || local >= func->local_count) return true;
+    if (depth > 16) return true;
+    IRLocal *l = &func->locals[local];
+    if (func->ast_node && func->ast_node->kind == NODE_FUNC_DECL) {
+        Node *body = func->ast_node->func_decl.body;
+        if (l->name && ast_name_addr_taken(body, l->name, l->name_len)) return true;
+        if (l->orig_name && ast_name_addr_taken(body, l->orig_name, l->orig_name_len))
+            return true;
+    }
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_ADDR_OF && in->src1_local == local) return true;
+            if (in->dest_local != local) continue;
+            if (in->op == IR_DEREF_READ) return true;
+            Node *x = in->expr ? ir_peel_launder(in->expr) : NULL;
+            if (x && x->kind == NODE_ORELSE) x = ir_peel_launder(x->orelse.expr);
+            if (x && x->kind == NODE_UNARY && x->unary.op == TOK_STAR) return true;
+            if (in->op == IR_COPY && in->src1_local >= 0 && in->src1_local != local &&
+                ir_value_is_opaque(zc, func, in->src1_local, depth + 1))
+                return true;
+        }
+    }
+    return false;
+}
+
+static void ir_pathlist_add(IRPathList *pl, const char *p, uint32_t l) {
+    if (pl->n >= pl->cap) {
+        int nc = pl->cap ? pl->cap * 2 : 8;
+        const char **np = (const char **)realloc(pl->p, (size_t)nc * sizeof(*np));
+        uint32_t *nl = (uint32_t *)realloc(pl->l, (size_t)nc * sizeof(*nl));
+        if (np) pl->p = np;
+        if (nl) pl->l = nl;
+        if (!np || !nl) return;
+        pl->cap = nc;
+    }
+    pl->p[pl->n] = p;
+    pl->l[pl->n] = l;
+    pl->n++;
+}
+
+static bool ir_type_is_ref_leaf(Type *t) {
+    Type *in = t ? type_unwrap_optional(t) : NULL;
+    return ir_type_reads_as_ref(t) || (in && type_dispatch_kind(in) == TYPE_HANDLE);
+}
+
+static void ir_collect_ref_field_paths(ZerCheck *zc, Type *t, const char *pre,
+                                       uint32_t prel, IRPathList *out, int depth) {
+    if (!t || depth > ZER_IR_STRUCT_LIT_DEPTH) return;
+    Type *e = type_unwrap_distinct(t);
+    TypeKind k = e ? type_dispatch_kind(e) : TYPE_VOID;
+    if (k == TYPE_STRUCT) {
+        for (uint32_t fi = 0; fi < e->struct_type.field_count; fi++) {
+            SField *sf = &e->struct_type.fields[fi];
+            char *np = ir_cat3(zc, pre, prel, ".", 1, sf->name, sf->name_len);
+            if (!np) continue;
+            uint32_t nl = prel + 1 + sf->name_len;
+            if (ir_type_is_ref_leaf(sf->type)) ir_pathlist_add(out, np, nl);
+            else ir_collect_ref_field_paths(zc, sf->type, np, nl, out, depth + 1);
+        }
+        return;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t vi = 0; vi < e->union_type.variant_count; vi++) {
+            SUVariant *uv = &e->union_type.variants[vi];
+            char *np = ir_cat3(zc, pre, prel, ".", 1, uv->name, uv->name_len);
+            if (!np) continue;
+            uint32_t nl = prel + 1 + uv->name_len;
+            if (ir_type_is_ref_leaf(uv->type)) ir_pathlist_add(out, np, nl);
+            else ir_collect_ref_field_paths(zc, uv->type, np, nl, out, depth + 1);
+        }
+        return;
+    }
+    if (k == TYPE_ARRAY && prel > 0) {
+        char *np = ir_cat3(zc, pre, prel, "[*]", 3, "", 0);
+        if (!np) return;
+        if (ir_type_is_ref_leaf(e->array.inner)) ir_pathlist_add(out, np, prel + 3);
+        else ir_collect_ref_field_paths(zc, e->array.inner, np, prel + 3, out, depth + 1);
+    }
+}
+
+/* BUG-1132: a struct LITERAL stored by ASSIGNMENT — `h = { .p = a };`,
+ * `hs[0] = { .p = a };`, `g.h = { .p = a };`. The var-decl spelling lowers to
+ * IR_STRUCT_INIT_DECOMP, which registers each field; the assignment spelling
+ * is ONE passthrough IR_ASSIGN whose value is the raw NODE_STRUCT_INIT, and
+ * nothing looked inside it — so `hs[0] = { .p = a }; free(a); hs[0].p.v`
+ * read freed memory with no diagnostic (the two-spellings shape, BUG-933).
+ * Each field whose value is a tracked (or param) local aliases
+ * `target + .field`; a struct-valued local carries its compounds there; a
+ * nested literal recurses. */
+static void ir_store_struct_literal(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                    int root, const char *path, uint32_t plen,
+                                    Node *si, int line, int depth) {
+    if (!si || si->kind != NODE_STRUCT_INIT || depth > ZER_IR_STRUCT_LIT_DEPTH) return;
+    for (int i = 0; i < si->struct_init.field_count; i++) {
+        const char *fname = si->struct_init.fields[i].name;
+        uint32_t fl = (uint32_t)si->struct_init.fields[i].name_len;
+        Node *v = ir_peel_launder(si->struct_init.fields[i].value);
+        if (!fname || fl == 0 || !v) continue;
+        char *np = ir_cat3(zc, path ? path : "", plen, ".", 1, fname, fl);
+        if (!np) continue;
+        uint32_t npl = plen + 1 + fl;
+        if (v->kind == NODE_STRUCT_INIT) {
+            ir_store_struct_literal(zc, func, ps, root, np, npl, v, line, depth + 1);
+            continue;
+        }
+        if (v->kind != NODE_IDENT) continue;
+        int vloc = ir_find_local_exact_first(func, v->ident.name,
+                                             (uint32_t)v->ident.name_len);
+        if (vloc < 0 || vloc == root) continue;
+        IRHandleInfo *vh = ir_find_handle(ps, vloc);
+        if (!vh) vh = ir_param_identity(func, ps, vloc, line);
+        if (!vh) {
+            ir_carry_compounds(zc, ps, vloc, root, np, npl);
+            continue;
+        }
+        if (vh->alloc_id == 0 && vh->view_count == 0 && !vh->view_overflow) continue;
+        IRAliasSnapshot snap;
+        ir_snapshot_alias(&snap, vh);
+        IRHandleState st = vh->state;
+        IRHandleInfo *ch = ir_add_compound_handle(ps, root, np, npl);
+        if (ch) {
+            ir_apply_alias(ch, &snap);
+            ch->state = st;
+        }
+    }
+}
+
+/* BUG-1132: the same store at an UNTRACKABLE index (`hs[f(k)] = { .p = a }`):
+ * which slot got it is unknown, so each field's allocation joins the
+ * wildcard `hs[*].p` as a VIEW member — a later read of any slot's `.p`, or
+ * of a whole element (ir_carry_projection), may be it. */
+static void ir_store_struct_literal_wild(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                         Node *target, Node *si, int line) {
+    if (!target || !si || si->kind != NODE_STRUCT_INIT) return;
+    IRSlotRef r;
+    if (!ir_slot_decompose(zc, func, ps, target, &r) || r.kind != IR_SLOT_UNKEYED) return;
+    for (int i = 0; i < si->struct_init.field_count; i++) {
+        const char *fname = si->struct_init.fields[i].name;
+        uint32_t fl = (uint32_t)si->struct_init.fields[i].name_len;
+        Node *v = ir_peel_launder(si->struct_init.fields[i].value);
+        if (!fname || fl == 0 || !v || v->kind != NODE_IDENT) continue;
+        int vloc = ir_find_local_exact_first(func, v->ident.name,
+                                             (uint32_t)v->ident.name_len);
+        if (vloc < 0) continue;
+        IRHandleInfo *vh = ir_find_handle(ps, vloc);
+        if (!vh) vh = ir_param_identity(func, ps, vloc, line);
+        if (!vh) continue;
+        IRHandleInfo vc = *vh;             /* the adds below may realloc */
+        char *rest = ir_cat3(zc, r.rest, r.restlen, ".", 1, fname, fl);
+        if (!rest) continue;
+        IRHandleInfo *w = ir_slot_wild_at(zc, ps, r.root, r.apath, r.aplen,
+                                          rest, r.restlen + 1 + fl, true);
+        if (!w) continue;
+        ir_view_add(w, vc.alloc_id);
+        for (int k = 0; k < vc.view_count; k++) ir_view_add(w, vc.view_alloc_ids[k]);
+        if (vc.view_overflow) w->view_overflow = true;
+    }
+}
+
+/* BUG-1131: the DUAL of ir_carry_compounds — a struct VALUE read OUT of a
+ * projection (`H r = hs[0];`, `return w.h;`, `H r = hs[k];`) carries the
+ * allocations its fields hold. The entries live under the SOURCE's key
+ * (`hs[0].p`, `w.h.p`), and the value landed in a fresh local that had none,
+ * so a wrapper returning a struct that came through an ARRAY ELEMENT or a
+ * FIELD kept no field views (BUG-1080 reads the returned local's entries):
+ * `H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }` then
+ * `free(a); h.p.v` read freed memory.
+ *
+ * Each entry `src + tail` is replicated as `dest + tail`, aliasing (same
+ * alloc_id). When the source is an ELEMENT, the other slots its index may
+ * name (ir_slot_collect's rule: any two indices meet except two distinct
+ * literals, and an untrackable index meets them all) contribute their `tail`
+ * allocations as VIEWS of `dest + tail` — the value may have come from any of
+ * them. Only a value-aggregate read carries: a reference read is the alias
+ * arms' job. `dest_root`/`dprefix` name where the value landed (a bare local:
+ * prefix NULL). */
+static void ir_carry_projection(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                Node *src_expr, int dest_root,
+                                const char *dprefix, uint32_t dplen) {
+    if (!src_expr) return;
+    Node *e = src_expr;
+    if (e->kind == NODE_ORELSE) e = e->orelse.expr;
+    e = ir_peel_launder(e);
+    if (!e || (e->kind != NODE_FIELD && e->kind != NODE_INDEX)) return;
+    Type *vt = checker_get_type(zc->checker, e);
+    Type *ve = vt ? type_unwrap_optional(vt) : NULL;
+    TypeKind vk = ve ? type_dispatch_kind(ve) : TYPE_VOID;
+    if (vk != TYPE_STRUCT && vk != TYPE_UNION && vk != TYPE_ARRAY) return;
+    /* A move-struct value is a TRANSFER, not a copy (Gap A3 / BUG-1073 own it);
+     * carrying its rows would hand the moved-from state to the new owner. */
+    if (ir_should_track_move(vt)) return;
+    if (dest_root < 0 && dest_root != IR_GLOBAL_ROOT_ID) return;
+    int sroot = -1; const char *spath = NULL; uint32_t splen = 0;
+    bool keyed = ir_extract_compound_key(zc, func, ps, e, &sroot, &spath, &splen) == 0 &&
+                 splen > 0;
+    IRSlotRef r;
+    bool elem = false;
+    Node *ie = e;
+    while (ie && ie->kind == NODE_FIELD) ie = ie->field.object;
+    if (ie && ie->kind == NODE_INDEX) elem = ir_slot_decompose(zc, func, ps, e, &r);
+    if (!keyed && !elem) return;
+    /* Pass 1: collect (tail, snapshot, is_own) rows — adds below may realloc. */
+    typedef struct { const char *tail; uint32_t tl; IRAliasSnapshot snap; bool own; } Row;
+    int cap = 0, n = 0;
+    Row *rows = NULL;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *c = &ps->handles[i];
+        if (!c->path || (c->alloc_id == 0 && c->view_count == 0)) continue;
+        const char *tail = NULL; uint32_t tl = 0; bool own = false;
+        if (keyed && c->local_id == sroot && c->path_len > splen &&
+            memcmp(c->path, spath, splen) == 0 &&
+            (c->path[splen] == '.' || c->path[splen] == '[')) {
+            tail = c->path + splen; tl = c->path_len - splen; own = true;
+        } else if (elem && c->local_id == r.root && c->path_len > r.aplen + 1 &&
+                   (r.aplen == 0 || memcmp(c->path, r.apath, r.aplen) == 0) &&
+                   c->path[r.aplen] == '[') {
+            /* another slot of the same array: `apath[X]` + rest + tail */
+            uint32_t j = r.aplen;
+            while (j < c->path_len && c->path[j] != ']') j++;
+            if (j >= c->path_len) continue;
+            const char *cc = c->path + r.aplen;
+            uint32_t ccl = j - r.aplen + 1;
+            if (r.kind != IR_SLOT_UNKEYED && ccl == r.complen &&
+                memcmp(cc, r.comp, ccl) == 0) continue;            /* own slot */
+            if (r.kind == IR_SLOT_LIT && cc[1] >= '0' && cc[1] <= '9') continue;
+            uint32_t after = j + 1;
+            if (c->path_len - after < r.restlen ||
+                (r.restlen > 0 && memcmp(c->path + after, r.rest, r.restlen) != 0))
+                continue;
+            after += r.restlen;
+            if (after >= c->path_len) continue;
+            if (c->path[after] != '.' && c->path[after] != '[') continue;
+            tail = c->path + after; tl = c->path_len - after;
+        } else {
+            continue;
+        }
+        if (n >= cap) {
+            int nc = cap ? cap * 2 : 8;
+            Row *nr = (Row *)realloc(rows, (size_t)nc * sizeof(Row));
+            if (!nr) break;
+            rows = nr; cap = nc;
+        }
+        rows[n].tail = tail; rows[n].tl = tl; rows[n].own = own;
+        ir_snapshot_alias(&rows[n].snap, c);
+        rows[n].snap.state = c->state;
+        n++;
+    }
+    /* Own rows first (they alias), then the other slots' rows (they view). */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int k = 0; k < n; k++) {
+            if (rows[k].own != (pass == 0)) continue;
+            char *np = (char *)arena_alloc(zc->arena, (size_t)dplen + rows[k].tl + 1);
+            if (!np) continue;
+            if (dplen) memcpy(np, dprefix, dplen);
+            memcpy(np + dplen, rows[k].tail, rows[k].tl);
+            np[dplen + rows[k].tl] = 0;
+            uint32_t nl = dplen + rows[k].tl;
+            IRHandleInfo *d = ir_find_compound_handle(ps, dest_root, np, nl);
+            if (pass == 0) {
+                if (!d) d = ir_add_compound_handle(ps, dest_root, np, nl);
+                if (!d) continue;
+                ir_apply_alias(d, &rows[k].snap);
+                d->state = rows[k].snap.state;
+                continue;
+            }
+            if (!d) {
+                d = ir_add_compound_handle(ps, dest_root, np, nl);
+                if (!d) continue;
+                d->state = IR_HS_ALIVE;
+                d->alloc_id = 0;
+                d->escaped = true;
+                d->alloc_line = rows[k].snap.alloc_line;
+            }
+            ir_view_add(d, rows[k].snap.alloc_id);
+            for (int v = 0; v < rows[k].snap.view_count; v++)
+                ir_view_add(d, rows[k].snap.view_alloc_ids[v]);
+            if (rows[k].snap.view_overflow) d->view_overflow = true;
+            d->view_is_slot = true;
+        }
+    }
+    free(rows);
+}
+
 /* BUG-983: `slot = struct_value` — the target is a FIELD / INDEX slot and the
  * value a struct LOCAL that carries compounds (it has no bare handle of its
  * own): replicate them under the slot's key. Shared by the passthrough
@@ -4753,7 +5862,7 @@ static void ir_store_struct_value_into_slot(ZerCheck *zc, IRFunc *func,
     ir_carry_compounds(zc, ps, rhs_local, tr, tp, tpl);
 }
 
-static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
+static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
     (void)zc; /* used for error reporting */
     if (g_zer_trace && !zc->building_summary)
         fprintf(stderr, "[check] %-8s @line %d\n", ir_op_name(inst->op), inst->source_line);
@@ -5396,6 +6505,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             /* Mark aliases (bare or compound) with same alloc_id as FREED —
              * handled uniformly via ir_propagate_alias_state. */
             ir_propagate_alias_state(ps, h, IR_HS_FREED, inst->source_line);
+            IRHandleInfo hc = *h;   /* BUG-1130: a free through a slot view */
+            ir_slot_view_freed(zc, func, ps, &hc, inst->source_line);
         }
         break;
     }
@@ -5427,12 +6538,16 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * the base local shares alloc_id with b; when b is freed, the base
      * is FREED too and reading it should trigger UAF. */
     case IR_INDEX_READ: {
+        /* BUG-1131: a struct element read carries the element's allocations. */
+        if (inst->dest_local >= 0 && inst->expr)
+            ir_carry_projection(zc, func, ps, inst->expr, inst->dest_local, NULL, 0);
         if (inst->expr) {
             UafReportSet rs = {0};
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
-            /* BUG-1074: a variable-index element read into a local is a VIEW. */
-            ir_var_index_read_alias(zc, func, ps, inst->expr, inst->dest_local,
-                                    inst->source_line);
+            /* BUG-1074/1130: an element read into a local aliases its slot and
+             * views what other slots may hand it. */
+            ir_slot_read(zc, func, ps, inst->expr, inst->dest_local,
+                         inst->source_line);
             UafReportSet pool_rs = {0};
             ir_check_expr_wrong_pool(zc, func, ps, inst->expr,
                                      inst->source_line, &pool_rs);
@@ -5467,6 +6582,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
     }
 
     case IR_FIELD_READ: {
+        /* BUG-1131: a struct field read carries the field's allocations. */
+        if (inst->dest_local >= 0 && inst->expr)
+            ir_carry_projection(zc, func, ps, inst->expr, inst->dest_local, NULL, 0);
         /* 2026-08-06: reading a POINTER-typed field out of a struct that has a
          * tracked handle yields a VIEW of that allocation, so the destination
          * must inherit the alias.
@@ -5600,18 +6718,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         }
                         break; /* found — don't report parent prefixes too */
                     }
-                } else if (ir_is_var_index(cur)) {
-                    /* BUG-1074: a variable-index element has no key. */
-                    IRHandleInfo *vb = ir_var_index_blocker(zc, func, ps, cur);
-                    if (vb) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use after free: an element read through a variable "
-                            "index may be %s, which is %s (freed at line %d)",
-                            ir_local_desc(zc, func, vb->local_id, vb->path, vb->path_len),
-                            ir_state_name(vb->state), vb->free_line);
-                        break;
-                    }
                 }
+                /* BUG-1074/1130: an element may hold what another index stored. */
+                if (ir_report_slot_use(zc, func, ps, cur, inst->source_line)) break;
                 /* Step up one level in the chain */
                 if (cur->kind == NODE_FIELD) cur = cur->field.object;
                 else if (cur->kind == NODE_INDEX) cur = cur->index_expr.object;
@@ -5653,6 +6762,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         ir_apply_alias(dst_h, &snap);
                         dst_h->state = snap.state;
                     }
+                    /* BUG-1130: keep the slot's other candidates (the plain
+                     * alias above replaced the view set). */
+                    ir_slot_read(zc, func, ps, inst->expr, inst->dest_local,
+                                 inst->source_line);
                 }
             }
         }
@@ -5699,6 +6812,27 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
      * inside the assign's expression — these are collapsed into IR_ASSIGN
      * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* BUG-1131: a struct VALUE read out of a field / element — into the
+         * instruction's dest (`H r = hs[0];`, the orelse temp) or, for the
+         * passthrough assignment `r = hs[0];`, into the target — carries the
+         * allocations its fields hold. */
+        if (inst->dest_local >= 0 && inst->expr && inst->expr->kind != NODE_ASSIGN)
+            ir_carry_projection(zc, func, ps, inst->expr, inst->dest_local, NULL, 0);
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+            inst->expr->assign.op == TOK_EQ && inst->expr->assign.target) {
+            int cr; const char *cp; uint32_t cpl;
+            if (ir_extract_compound_key(zc, func, ps, inst->expr->assign.target,
+                                        &cr, &cp, &cpl) == 0) {
+                ir_carry_projection(zc, func, ps, inst->expr->assign.value, cr, cp, cpl);
+                ir_store_struct_literal(zc, func, ps, cr, cp, cpl,
+                                        ir_peel_launder(inst->expr->assign.value),
+                                        inst->source_line, 0);
+            } else {
+                ir_store_struct_literal_wild(zc, func, ps, inst->expr->assign.target,
+                                             ir_peel_launder(inst->expr->assign.value),
+                                             inst->source_line);
+            }
+        }
         /* [B] 2026-07-09: a subslice `sub = base[a..b]` of a tracked HEAP slice
          * is a VIEW sharing the base's lifetime — register it as an alloc_id
          * alias of the base so use-after-free / double-free THROUGH the subslice
@@ -5767,9 +6901,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
          *
          * Replicate from the tried expression's root so the rest of the existing
          * chain does the work. */
-        /* BUG-1074: a variable-index element read into a local is a VIEW. */
-        ir_var_index_read_alias(zc, func, ps, inst->expr, inst->dest_local,
-                                inst->source_line);
+        /* BUG-1074/1130: an element read into a local aliases its slot and
+         * views what other slots may hand it. */
+        ir_slot_read(zc, func, ps, inst->expr, inst->dest_local,
+                     inst->source_line);
         if (inst->dest_local >= 0 && inst->expr) {
             /* The orelse TEMP assignment lowers to an IR_ASSIGN whose expr is the
              * tried expression itself — measured: a bare NODE_IDENT (`_zer_or = a`),
@@ -6089,15 +7224,32 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 target_expr->index_expr.index &&
                 target_expr->index_expr.index->kind != NODE_INT_LIT) {
                 /* BUG-1074: record WHERE it went — the array's wildcard slot —
-                 * so a variable-index read back aliases it (see ir_wild_slot). */
+                 * so a variable-index read back aliases it (see ir_wild_slot).
+                 * BUG-1130: a TRACKABLE index (`arr[k]`) is a precise slot
+                 * instead, registered by the compound arm just below; a view
+                 * being stored hands on what it views. */
                 IRHandleInfo *sv = ir_find_handle(ps, rhs_local);
-                int sv_aid = sv ? sv->alloc_id : 0;
-                if (sv_aid != 0) {
-                    IRHandleInfo *w = ir_wild_slot(zc, func, ps,
-                        target_expr->index_expr.object, true, NULL, NULL, NULL);
-                    ir_view_add(w, sv_aid);
+                if (sv && !ir_index_is_keyable(func, target_expr->index_expr.index)) {
+                    IRHandleInfo svc = *sv;      /* the add below may realloc */
+                    IRHandleInfo *w = (svc.alloc_id != 0 || svc.view_count > 0 ||
+                                       svc.view_overflow)
+                        ? ir_wild_slot(zc, func, ps, target_expr->index_expr.object,
+                                       true, NULL, NULL, NULL)
+                        : NULL;
+                    if (w) {
+                        ir_view_add(w, svc.alloc_id);
+                        for (int k = 0; k < svc.view_count; k++)
+                            ir_view_add(w, svc.view_alloc_ids[k]);
+                        if (svc.view_overflow) w->view_overflow = true;
+                    }
                 }
-                ir_mark_local_escaped(ps, rhs_local);
+                /* BUG-1130 (residual 3): storing into THIS function's own array
+                 * is not an escape — the allocation is still ours to free, and
+                 * the array going out of scope with it still live is a leak.
+                 * Only a slot reached through a pointer / param / global leaves
+                 * the function. */
+                if (!ir_index_target_is_local_array(zc, func, target_expr))
+                    ir_mark_local_escaped(ps, rhs_local);
             }
             /* Compound key registration: `container.field = h`
              *
@@ -6407,7 +7559,14 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 int root_local;
                 const char *path;
                 uint32_t path_len;
-                if (ir_extract_compound_key(zc, func, ps, rhs,
+                /* BUG-1130: a TRACKABLE variable index (`arr[k]`) now keys, but a
+                 * move out of it stays the hard error below — the moved slot's
+                 * TRANSFERRED fact would be dropped as soon as k changes
+                 * (ir_kill_index_facts), and a later `arr[0]` may be it. */
+                bool var_move = rhs->kind == NODE_INDEX && rhs->index_expr.index &&
+                                rhs->index_expr.index->kind != NODE_INT_LIT;
+                if (!var_move &&
+                    ir_extract_compound_key(zc, func, ps, rhs,
                                              &root_local, &path, &path_len) == 0 &&
                     path_len > 0) {
                     IRHandleInfo *ch = ir_find_compound_handle(ps, root_local,
@@ -6422,9 +7581,7 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (ch) {
                         ir_mark_transferred(ps, ch, inst->source_line);
                     }
-                } else if (rhs->kind == NODE_INDEX &&
-                           rhs->index_expr.index &&
-                           rhs->index_expr.index->kind != NODE_INT_LIT) {
+                } else if (var_move) {
                     /* Companion to BUG-741 (the variable-index FREE barrier): a
                      * VARIABLE-index MOVE out of a move-struct array element —
                      * `Token m = arr[i]`. Key extraction only accepts literal
@@ -6688,6 +7845,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             ir_apply_alias(fdst_h, &fsnap);
                             fdst_h->state = fsnap.state;
                         }
+                        /* BUG-1130: keep the slot's other candidates. */
+                        ir_slot_read(zc, func, ps, rhs, inst->dest_local,
+                                     inst->source_line);
                     }
                 }
             }
@@ -7118,6 +8278,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             free(pool_rs.ids);
             free(rs.ids);
         }
+        /* BUG-1130: a local array HANDED to a call may be emptied by it. */
+        ir_call_hands_local_array(zc, func, ps, inst->expr);
         /* Phase D3/E: ThreadHandle.join() — mark thread as joined.
          * ThreadHandles don't have IR locals (emitter owns their
          * pthread_t decl), so tracking is by name via IRThreadTrack. */
@@ -7319,6 +8481,33 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             h->source_color = ZC_COLOR_UNKNOWN;
                         }
                     }
+                    /* BUG-1130: `free(arr[k])` at a trackable index with no
+                     * entry for that slot yet — record the slot itself, so a
+                     * second free or a re-read of `arr[k]` sees it. */
+                    Node *parg = ir_peel_launder(arg);
+                    bool elem_free = parg && parg->kind == NODE_INDEX;
+                    /* Not for a HANDLE element: `pool.free(handles[k])` then
+                     * `handles[j].f` is the checker's dynamic-freed AUTO-GUARD
+                     * (a runtime `j == k` check), on top of the generation
+                     * check every Handle use carries. */
+                    Type *pet = elem_free ? checker_get_type(zc->checker, parg) : NULL;
+                    bool handle_elem = pet && type_dispatch_kind(pet) == TYPE_HANDLE;
+                    if (!h && elem_free && !handle_elem && path_len > 0 &&
+                        root_local != IR_GLOBAL_ROOT_ID &&
+                        !(root_local >= 0 && root_local < func->local_count &&
+                          func->locals[root_local].is_param) &&
+                        parg->index_expr.index &&
+                        parg->index_expr.index->kind != NODE_INT_LIT) {
+                        h = ir_add_compound_handle(ps, root_local, path, path_len);
+                        if (h) {
+                            h->state = IR_HS_ALIVE;
+                            h->alloc_line = inst->source_line;
+                            h->alloc_id = _ir_next_alloc_id++;
+                            h->escaped = true;       /* records a fact, owns nothing */
+                        }
+                    }
+                    IRHandleInfo hcopy;
+                    memset(&hcopy, 0, sizeof(hcopy));
                     if (h) {
                         ir_view_free_barrier(zc, func, ps, h, inst->source_line);   /* BUG-1075 */
                         if (h->state == IR_HS_FREED) {
@@ -7343,96 +8532,21 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->free_line = inst->source_line;
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
+                        hcopy = *h;
                     }
-                } else if (arg && arg->kind == NODE_INDEX &&
-                           arg->index_expr.index &&
-                           arg->index_expr.index->kind != NODE_INT_LIT) {
-                    /* GAP-6 (BUG-741, 2026-06-10, 6u360k audit): free through
-                     * a VARIABLE index — `heap.free(arr[k])`. Key extraction
-                     * only accepts literal indices, so this free was
-                     * previously untracked entirely: `free(arr[k]);
-                     * free(arr[0])` with k==0 was a silent double free
-                     * (and _zer_slab_free no-ops the second free at runtime).
-                     *
-                     * Rule (same principle as the BUG-740 indirect-call
-                     * barrier): an operation the analyzer can't resolve may
-                     * consume ANY tracked element of that array.
-                     *  (1) a literal-indexed sibling already definitely
-                     *      FREED → this free may target it → error
-                     *      (catches `free(arr[0]); free(arr[k])`).
-                     *  (2) widen ALIVE literal-indexed siblings (and their
-                     *      alias groups) to MAYBE_FREED + escaped — a later
-                     *      literal free errors (`free(arr[k]); free(arr[0])`,
-                     *      the reproducer), the exit pass stays quiet.
-                     * Free-everything loops stay clean: variable-index
-                     * STORES already escape-untrack their values (no
-                     * '['-entries exist), and widened MAYBE siblings do not
-                     * re-trigger (1), which fires on definite FREED only. */
-                    Node *aroot = arg->index_expr.object;
-                    while (aroot && (aroot->kind == NODE_FIELD ||
-                                     aroot->kind == NODE_INDEX)) {
-                        if (aroot->kind == NODE_FIELD)
-                            aroot = aroot->field.object;
-                        else
-                            aroot = aroot->index_expr.object;
-                    }
-                    int aloc = (aroot && aroot->kind == NODE_IDENT)
-                        ? ir_find_local_exact_first(func, aroot->ident.name,
-                              (uint32_t)aroot->ident.name_len)
-                        : -1;
-                    /* BUG-1074: the allocations stored through a VARIABLE
-                     * index are candidates too (the wildcard slot's set). */
-                    {
-                        IRHandleInfo *wv = NULL;
-                        IRHandleInfo wtmp;
-                        memset(&wtmp, 0, sizeof(wtmp));
-                        wtmp.free_block = -1;
-                        wtmp.view_root_local = -1;
-                        wtmp.view_is_slot = true;
-                        wv = ir_wild_slot(zc, func, ps, arg->index_expr.object,
-                                          false, NULL, NULL, NULL);
-                        if (wv && (wv->view_count > 0 || wv->view_overflow)) {
-                            for (int k = 0; k < wv->view_count; k++)
-                                ir_view_add(&wtmp, wv->view_alloc_ids[k]);
-                            wtmp.view_overflow = wv->view_overflow;
-                            ir_view_free_barrier(zc, func, ps, &wtmp, inst->source_line);
-                        }
-                    }
-                    if (aloc >= 0 && aloc < func->local_count) {
-                        for (int vhi = 0; vhi < ps->handle_count; vhi++) {
-                            IRHandleInfo *vh = &ps->handles[vhi];
-                            if (vh->local_id != aloc) continue;
-                            if (vh->path_len == 0 || !vh->path ||
-                                vh->path[0] != '[') continue;
-                            if (vh->state == IR_HS_FREED) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "variable-index free may double-free "
-                                    "'%.*s%.*s' already freed at line %d — "
-                                    "don't mix literal- and variable-index "
-                                    "frees on the same array",
-                                    (int)func->locals[aloc].name_len,
-                                    func->locals[aloc].name,
-                                    (int)vh->path_len, vh->path,
-                                    vh->free_line);
-                            } else if (vh->state == IR_HS_ALIVE) {
-                                vh->state = IR_HS_MAYBE_FREED;
-                                vh->free_line = inst->source_line;
-                                vh->escaped = true;
-                                int vaid = vh->alloc_id;
-                                if (vaid != 0) {
-                                    for (int vgi = 0; vgi < ps->handle_count; vgi++) {
-                                        IRHandleInfo *vg = &ps->handles[vgi];
-                                        if (vg == vh || vg->alloc_id != vaid)
-                                            continue;
-                                        if (ir_is_invalid(vg)) continue;
-                                        vg->state = IR_HS_MAYBE_FREED;
-                                        vg->free_line = inst->source_line;
-                                        vg->escaped = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    /* BUG-1130: an element free may release what ANOTHER
+                     * index stored (the two may meet); a free through a slot
+                     * view records the slot it came through. */
+                    if (elem_free)
+                        ir_slot_free_siblings(zc, func, ps, parg, path, path_len,
+                                              inst->source_line);
+                    ir_slot_view_freed(zc, func, ps, &hcopy, inst->source_line);
+                } else if (arg && ir_peel_launder(arg) &&
+                           ir_peel_launder(arg)->kind == NODE_INDEX) {
+                    /* GAP-6 (BUG-741): free through an UNTRACKABLE index —
+                     * see ir_slot_free_siblings. */
+                    ir_slot_free_siblings(zc, func, ps, ir_peel_launder(arg), NULL, 0,
+                                          inst->source_line);
                 }
                 break;  /* Don't fall through to FuncSummary apply */
             }
@@ -7841,6 +8955,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         h->free_line = inst->source_line;
                         ir_propagate_alias_state(ps, h, IR_HS_FREED,
                                                   inst->source_line);
+                        IRHandleInfo hc = *h;   /* BUG-1130 */
+                        ir_slot_view_freed(zc, func, ps, &hc, inst->source_line);
                     }
                 }
             }
@@ -8645,8 +9761,19 @@ static bool ir_return_is_null_literal(IRFunc *func, IRBlock *bb, IRInst *last,
     return def->op == IR_LITERAL && def->literal_kind == 4;
 }
 
+/* One forward-pass step: the transfer function, then (BUG-1130) the facts
+ * keyed on an index local this instruction wrote are demoted — `arr[k]` names
+ * a different slot once k changes. */
+static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
+    ir_check_inst_core(zc, ps, inst, func);
+    ir_kill_index_facts(zc, func, ps, inst);
+}
+
 bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     if (!func || func->block_count == 0) return true;
+    /* BUG-1130: the trackable-index cache is per analysis of ONE function —
+     * never trust it across calls (an IRFunc address can be reused). */
+    _ir_kx_func = NULL;
     if (!zc->building_summary)
         ZTRACE("CHECK  zercheck_ir: '%.*s'  (%d blocks, %d locals) -- handle-lattice fixpoint",
                (int)func->name_len, func->name, func->block_count, func->local_count);
@@ -9469,6 +10596,87 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     }
                 }
             }
+            /* BUG-1131 backstop — the argument-precise barrier for a field the
+             * analysis cannot account for. A live return whose value carries NO
+             * entry for a reference field (the value came through a pointer
+             * deref, a callee that filled it through `*H`, ...) may still hold a
+             * param's allocation there: every such field becomes a MAY view of
+             * every reference param. MAY only — never an alias — so it can only
+             * refuse a use after the caller frees an argument, never accept one. */
+            {
+                IRPathList rpl = {0};
+                /* IRFunc.return_type holds the FUNCTION type (ir_lower.c). */
+                Type *rt = func->return_type;
+                if (rt && type_dispatch_kind(rt) == TYPE_FUNC_PTR)
+                    rt = type_unwrap_distinct(rt)->func_ptr.ret;
+                ir_collect_ref_field_paths(zc, rt, "", 0, &rpl, 0);
+                for (int bi = 0; rpl.n > 0 && bi < func->block_count; bi++) {
+                    IRBlock *bb = &func->blocks[bi];
+                    if (!ir_block_is_live_return(func, bi)) continue;
+                    if (bb->is_orelse_fallback) continue;
+                    IRInst *last = &bb->insts[bb->inst_count - 1];
+                    int rlocal = last->src1_local >= 0 ? last->src1_local :
+                        (last->expr && last->expr->kind == NODE_IDENT)
+                            ? ir_find_local_exact_first(func, last->expr->ident.name,
+                                  (uint32_t)last->expr->ident.name_len) : -1;
+                    IRPathState *rps = &block_states[bi];
+                    /* Only a value whose fields the analysis could not follow:
+                     * address-taken (a callee / pointer wrote it), read through
+                     * a pointer deref, or not resolvable to a local at all. A
+                     * value built by field stores it saw (`h.p = &gt;`) keeps
+                     * exactly the entries it has. */
+                    if (!ir_value_is_opaque(zc, func, rlocal, 0)) continue;
+                    for (int q = 0; q < rpl.n; q++) {
+                        const char *fp = rpl.p[q];
+                        uint32_t fl = rpl.l[q];
+                        uint32_t cov = fl;      /* the prefix that must match */
+                        for (uint32_t x = 0; x + 2 < fl; x++)
+                            if (fp[x] == '[' && fp[x + 1] == '*' && fp[x + 2] == ']') {
+                                cov = x; break;
+                            }
+                        bool covered = false;
+                        for (int hi = 0; rlocal >= 0 && hi < rps->handle_count; hi++) {
+                            IRHandleInfo *c = &rps->handles[hi];
+                            if (c->local_id != rlocal || !c->path || c->path_len < cov) continue;
+                            if (c->alloc_id == 0 && c->view_count == 0 && !c->view_overflow)
+                                continue;
+                            if (memcmp(c->path, fp, cov) == 0 &&
+                                (cov < fl || c->path_len == fl)) { covered = true; break; }
+                        }
+                        if (covered) continue;
+                        for (int pi = 0; pi < pc; pi++) {
+                            ParamDecl *pd = &fn->func_decl.params[pi];
+                            int pl = ir_find_local_exact_first(func, pd->name,
+                                                               (uint32_t)pd->name_len);
+                            if (pl < 0 || pl >= func->local_count) continue;
+                            Type *ptp = func->locals[pl].type;
+                            Type *pin = ptp ? type_unwrap_optional(ptp) : NULL;
+                            if (!ir_type_reads_as_ref(ptp) &&
+                                !(pin && type_dispatch_kind(pin) == TYPE_HANDLE)) continue;
+                            int k = 0;
+                            for (; k < rf_n; k++)
+                                if (rf[k].param == pi && rf[k].plen == fl &&
+                                    memcmp(rf[k].path, fp, fl) == 0) break;
+                            if (k < rf_n) continue;
+                            if (rf_n >= rf_cap) {
+                                int nc = rf_cap ? rf_cap * 2 : 8;
+                                struct ZcRetFieldView *nr = (struct ZcRetFieldView *)
+                                    realloc(rf, (size_t)nc * sizeof(*rf));
+                                int *nh = (int *)realloc(rf_hits, (size_t)nc * sizeof(int));
+                                if (nr) rf = nr;
+                                if (nh) rf_hits = nh;
+                                if (!nr || !nh) { unresolved_return = true; continue; }
+                                rf_cap = nc;
+                            }
+                            rf[rf_n].path = fp; rf[rf_n].plen = fl;
+                            rf[rf_n].param = pi; rf[rf_n].must = false;
+                            rf_n++;
+                        }
+                    }
+                }
+                free(rpl.p);
+                free(rpl.l);
+            }
             /* MUST = the field holds that param's allocation, ALIVE, on EVERY
              * live return. */
             if (rf_n > 0 && !unresolved_return) {
@@ -10001,6 +11209,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     o->state == IR_HS_TRANSFERRED) { covered = true; break; }
             }
             if (covered) continue;
+            /* BUG-1130: an allocation a LOCAL array received at a variable
+             * index is exempt once the array was emptied through a variable
+             * index (the free-every-slot loop) — which slots that loop reached
+             * is not known, so a loop that frees only some of them leaks
+             * silently (docs/limitations.md). Before, every such store was an
+             * "escape" and nothing stored at a variable index was ever
+             * leak-checked at all. */
+            if (ir_aid_in_drained_array(ps, h->alloc_id)) continue;
 
             /* Skip if we already reported this alloc_id */
             bool reported = false;

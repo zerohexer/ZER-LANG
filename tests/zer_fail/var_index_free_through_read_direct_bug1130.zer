@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free: element
+// BUG-1130 (1): the direct spelling `arr[k] = alloc(T)` was never registered at all,
+// so the free through a read of the slot was invisible. Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    arr[k] = alloc(T);
+    *T a = arr[k] orelse return;
+    free(a);
+    *T q = arr[k] orelse return;
+    return q.v;
+}
+u32 main() { return run(1); }

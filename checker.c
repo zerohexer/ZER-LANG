@@ -5066,7 +5066,8 @@ static void write_targets_of_node(WriteTargetWalk *w, Node *target, int depth,
 static bool global_name_never_mutated(Checker *c, Symbol *sym);
 
 typedef struct { WriteTargetWalk *w; int depth; } WriteTargetReassignUd;
-static bool write_target_reassign_visit(Node *value, void *ud) {
+static bool write_target_reassign_visit(Node *value, int kind, void *ud) {
+    (void)kind;   /* only an assigned VALUE can be followed; the rest is the floor */
     WriteTargetReassignUd *u = (WriteTargetReassignUd *)ud;
     Node *v = value ? unwrap_ptr_launder(value) : NULL;
     if (!v) return false;   /* unfollowable write: the documented floor */
@@ -5075,8 +5076,8 @@ static bool write_target_reassign_visit(Node *value, void *ud) {
     else if (v->kind == NODE_IDENT)   /* `p = q`: p now points where q does */
         write_targets_of_node(u->w, v, u->depth + 1, true);
     else if (v->kind == NODE_ORELSE) {
-        write_target_reassign_visit(v->orelse.expr, ud);
-        write_target_reassign_visit(v->orelse.fallback, ud);
+        write_target_reassign_visit(v->orelse.expr, ANW_ASSIGN, ud);
+        write_target_reassign_visit(v->orelse.fallback, ANW_ASSIGN, ud);
     }
     return false;           /* keep walking: every write contributes */
 }
@@ -5125,7 +5126,7 @@ static void write_targets_of_node(WriteTargetWalk *w, Node *target, int depth,
     if (s->func_node && (s->func_node->kind == NODE_VAR_DECL ||
                          s->func_node->kind == NODE_GLOBAL_VAR) &&
         s->func_node->var_decl.init)
-        write_target_reassign_visit(s->func_node->var_decl.init, &u);
+        write_target_reassign_visit(s->func_node->var_decl.init, ANW_ASSIGN, &u);
     Symbol *gs = global_decl_lookup(c, s->name, s->name_len);
     if (gs == s) {
         if (global_name_never_mutated(c, s)) return;   /* cached fast path */

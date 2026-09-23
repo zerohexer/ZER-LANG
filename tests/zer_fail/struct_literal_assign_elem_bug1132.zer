@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1132: `hs[0] = { .p = a };` — a struct LITERAL stored by ASSIGNMENT registered
+// nothing (only the var-decl spelling did), in a single function. Pre-fix: compiled.
+struct T { u32 v; }
+struct H { *T p; }
+struct W { H h; u32 n; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H[2] hs;
+    hs[0] = { .p = a };
+    free(a);
+    return hs[0].p.v;
+}

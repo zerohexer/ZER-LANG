@@ -521,7 +521,10 @@ void check_keep_inference(Checker *c);
  * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
 /* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
-typedef bool (*AstNameWriteFn)(Node *value, void *ud);
+/* `kind`: ANW_ASSIGN (`value` is the assigned value for `=`, NULL for a compound
+ * operator), ANW_ADDR (`&name`), ANW_OPAQUE (a node the walk cannot see into). */
+enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
+typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module

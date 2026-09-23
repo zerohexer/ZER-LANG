@@ -1,23 +1,37 @@
 // Rust pattern: Vec<Box<T>> — array of heap allocations
 // ZER: Handle(Task)[4] with Pool
+// BUG-1130: the array's slots are leak-checked now — every filled slot is freed
+// before the one return (the old `orelse return` / early `return 1;` leaked the
+// handles already stored, which Rust's Vec drop would have freed).
 
 struct Task { u32 id; }
 Pool(Task, 8) pool;
 
 u32 main() {
     Handle(Task)[4] handles;
+    u32 n = 0;
 
     for (u32 i = 0; i < 4; i += 1) {
         ?Handle(Task) mh = pool.alloc();
-        handles[i] = mh orelse return;
-        pool.get(handles[i]).id = i * 10;
+        if (mh) |h| {
+            handles[i] = h;
+            pool.get(handles[i]).id = i * 10;
+            n += 1;
+        } else {
+            break;
+        }
     }
 
-    if (pool.get(handles[0]).id != 0) { return 1; }
-    if (pool.get(handles[3]).id != 30) { return 2; }
+    u32 rc = 0;
+    if (n != 4) {
+        rc = 3;
+    } else {
+        if (pool.get(handles[0]).id != 0) { rc = 1; }
+        if (pool.get(handles[3]).id != 30) { rc = 2; }
+    }
 
-    for (u32 i = 0; i < 4; i += 1) {
+    for (u32 i = 0; i < n; i += 1) {
         pool.free(handles[i]);
     }
-    return 0;
+    return rc;
 }

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1131: a struct-returning wrapper whose value came through an ARRAY ELEMENT kept
+// no field views — `free(a); h.p.v` read freed memory. Pre-fix: compiled.
+struct T { u32 v; }
+struct H { *T p; }
+struct W { H h; u32 n; }
+H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a);
+    free(a);
+    return h.p.v;
+}

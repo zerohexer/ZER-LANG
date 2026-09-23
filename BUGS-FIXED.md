@@ -5,6 +5,125 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23f — BUG-1130..1133: an array slot at a variable index had no identity, and a struct value lost its allocations on the way through an element, a field, an assigned literal or a chained wrapper
+
+Closes the two OPEN entries BUG-1074 / BUG-1080 left (docs/limitations.md). Every negative
+below COMPILED on the pre-change build (`6a64d4b1`, kept at `/tmp/vib/zerc` for the A/B) and is
+refused now for the reason its `// expect-error:` names. Gate: SHAPES p33 + p34 in
+`tools/sink_matrix.sh` — 28 cells, 17 HOLE and 1 OVER-REJECT on the pre-change build, 0 now.
+
+### BUG-1130 — a VARIABLE-INDEX slot lost its identity (three residuals of BUG-1074, plus two found beside them)
+
+**Symptom.** (1) `arr[k] = alloc(T); *T a = arr[k] orelse return; free(a); *T q = arr[k]
+orelse return; q.v` compiled (also with `arr[k] = x;`, in a loop over `tbl[i]`, and as a double
+free through two reads). (2) `arr[k] = a; if (c) { free(a); } q = arr[k]; q.v` compiled, also
+through a different index `arr[j]`. (3) `?*T[4] arr; arr[k] = alloc(T); return 0;`,
+`arr[k] = a; return 0;`, the loop form and `arr[k % 4] = alloc(T)` compiled — no leak. Found
+beside them: a LITERAL read `arr[0]` after `arr[k] = a; free(a)` compiled (k may be 0), and
+`arr[k] = null;` after freeing the slot's allocation through its owner was a FALSE "use after
+free" (`tests/zer/var_index_slot_ok_bug1130.zer`'s `free_via_owner` was rejected pre-change).
+
+**Root cause.** Key extraction accepted literal indices only, so every variable index fell to
+BUG-1074's wildcard view set — which names the array's allocations but not WHICH slot, so a
+free through a read could not mark the slot, and its MAYBE members had to be skipped (the loop
+that stores one iteration's allocation and frees another's shares one per-local id). A store at
+a variable index was an "escape", so nothing it stored was ever leak-checked, and `arr[k] =
+alloc(T)` was registered nowhere. A literal read never looked at what a variable index stored.
+And the store `arr[i] = x` was walked as a READ of the element.
+
+**Fix.** The missing variable was the INDEX. `ir_index_local_keyable`: an integer local whose
+every write is visible (not address-taken — the addr-only mode of `ast_name_mutated_or_addrd` +
+IR_ADDR_OF — not static, the only local of that name) keys `arr[k]` like `arr[3]`, in
+`ir_measure_key_path` / `ir_build_key_path`, so every sink that asks `ir_extract_compound_key`
+agrees by construction. `ir_check_inst` = the transfer + `ir_kill_index_facts`, which demotes
+every fact keyed on `k` after any instruction that writes `k` (the allocation joins the
+wildcard; an allocation only the slot held survives as the owned `arr[*#L]`; a FREED slot fact
+is dropped — see limitations.md). Any two indices meet unless both are distinct literals: a read
+aliases its own entry and views the others (`ir_slot_read` / `ir_slot_collect`), a use checks
+them (`ir_report_slot_use`), a free widens the precise ones (`ir_slot_free_siblings`,
+`ir_view_free_barrier`); the wildcard MAYBE-skip applies only to a member no precise slot holds.
+A pure view remembers its slot (`IRHandleInfo.has_slot` / `slot_key_path`), and a free through
+it records that slot FREED at all four free sinks (`ir_slot_view_freed`). Storing into this
+function's own array is not an escape (`ir_index_target_is_local_array`); a free through a
+variable-index read, or handing the array to a call, DRAINS it (`slot_drained`, the leak
+exemption). A plain `=` into an element is not a read of it. A move out of `arr[k]` stays the
+hard variable-index-move error (the TRANSFERRED fact would not survive a write of k); a HANDLE
+element freed directly keeps the checker's dynamic-freed runtime guard.
+
+**Corpus (compiler-classified, 2613 files, baseline vs new).** Five POSITIVES were REAL leaks
+that the store-as-escape rule had hidden, each on an early-return path while the array still
+held allocations: `tests/zer/handle_array.zer` (`return 2..4` after the checks and an
+`orelse { return 1; }` mid-fill), `rust_tests/rt_handle_array_alloc.zer` (same shape),
+`tests/zer/const_compile_time_sizes.zer` (`if (got != CAP) { return 6; }` before freeing
+`held`), and `tests/zer/dyn_array_guard.zer` / `dyn_array_autoguard_crash.zer` (a bounds
+auto-guard on the unproven free index returned early with every handle live). Each fixed the
+way the diagnostic says (compute a result code and free before the one return; prove the
+indices before allocating). Two negatives changed only their message
+(`arr_var_index_dfree_rev`, `var_index_slot_uaf_bug1074` — whose `expect-error: variable index`
+still holds: "use after free: element 'arr[k]' (variable index) is freed"). One negative went
+GREEN on a draft and was the reason the variable-index move stays an error
+(`move_array_var_index.zer`). No other verdict changed.
+
+**Tests.** `tests/zer_fail/var_index_{free_through_read,free_through_read_direct,
+free_through_read_loop,double_free_via_read,cond_free,cond_free_other_index,
+literal_read_after_var_store,leak_keyed,leak_direct_loop,leak_unkeyed}_bug1130.zer`,
+`tests/zer/var_index_slot_ok_bug1130.zer` (eleven idioms that must keep compiling and running,
+including a callee that drains the array through a slice — without the call-site drain that one
+became a false leak); p33.
+
+### BUG-1131 — a struct value read out of an ELEMENT or a FIELD carried nothing
+
+**Symptom.** `H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }` then `H h = mk(a);
+free(a); return h.p.v;` compiled — also `H r = hs[0]; return r;`, `return hs[k];`,
+`hs[k % 2]`, `hs[1].p = a; return hs[1];`, `W w; w.h = { .p = a }; return w.h;`, a struct inside
+a struct, a two-level array, a switch arm return. `free(h.p)` on the result was a false leak of
+`a`.
+
+**Root cause.** BUG-1080 reads the field entries of the RETURNED local; the value landed in a
+fresh temp while its entries stayed keyed on the source (`hs[0].p`, `w.h.p`).
+
+**Fix.** `ir_carry_projection` — the dual of `ir_carry_compounds` — at IR_ASSIGN (both
+spellings), IR_FIELD_READ and IR_INDEX_READ: entries under the source key are replicated onto the
+destination; the other slots an element index may name contribute VIEWS; move-struct values are
+excluded (a transfer, not a copy). The **backstop** from the fix sketch, gated: a live return
+whose value's fields the analysis could not follow (`ir_value_is_opaque` — address-taken, read
+through a deref, or unresolvable) and which carries no entry for a reference field
+(`ir_collect_ref_field_paths`) makes that field a MAY view of every reference param. Ungated it
+refused `h.p = &global; return h;` after `free(a)` — so the gate is load-bearing.
+
+**Tests.** `tests/zer_fail/struct_wrapper_{elem,elem_unkeyed,nested_field,deref_backstop,
+callee_fill_backstop}_bug1131.zer`, `tests/zer/struct_wrapper_elem_ok_bug1131.zer`; p34.
+
+### BUG-1132 — a struct LITERAL stored by ASSIGNMENT registered nothing
+
+**Symptom.** `H[2] hs; hs[0] = { .p = a }; free(a); return hs[0].p.v;` — ONE function —
+compiled; so did `H h; h = { .p = a }; return h;` in a wrapper.
+
+**Root cause.** The var-decl spelling lowers to IR_STRUCT_INIT_DECOMP, which registers each
+field; the assignment spelling is one passthrough IR_ASSIGN whose value is the raw
+NODE_STRUCT_INIT, and no arm looked inside it — the BUG-933 two-spellings shape.
+
+**Fix.** `ir_store_struct_literal` (fields naming a tracked or param local alias
+`target + .field`, struct locals carry, nested literals recurse) and, at an untrackable index,
+`ir_store_struct_literal_wild` into `hs[*].field`.
+
+**Tests.** `tests/zer_fail/struct_literal_assign_{elem,local}_bug1132.zer`.
+
+### BUG-1133 — a CHAINED struct wrapper dropped the field view (the old entry said it worked)
+
+**Symptom.** `H mk(*T a) { return { .p = a }; } H mk2(*T a) { return mk(a); }` then `free(a);
+mk2(a).p.v` compiled — on the pre-change build too, although docs/limitations.md recorded
+chained wrappers as working (a claim never measured).
+
+**Root cause.** `ir_apply_ret_field_views` needs the argument's handle; a param handed straight
+on has none until something gives it one, so mk2's own summary named no param.
+
+**Fix.** Give the param its identity at the call (`ir_param_identity`), as the field-store sink
+already did.
+
+**Tests.** `tests/zer_fail/struct_wrapper_chained_bug1133.zer`; the `chained()` case of
+`tests/zer/struct_wrapper_elem_ok_bug1131.zer`.
+
 ## Session 2026-09-23e — BUG-1121..1129, 1150..1151: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global and optional designated initializers, missing prototypes, @size vs sizeof
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)

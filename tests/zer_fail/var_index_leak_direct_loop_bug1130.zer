@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1130 (3): `arr[i] = alloc(T)` in a loop into a local array — registered nowhere,
+// never reported. Pre-fix: compiled.
+struct T { u32 v; }
+u32 run() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        arr[i] = alloc(T);
+    }
+    return 0;
+}
+u32 main() { return run(); }

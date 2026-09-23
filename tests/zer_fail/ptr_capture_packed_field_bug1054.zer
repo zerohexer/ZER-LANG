@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: of a packed struct field would be a misaligned pointer
+packed struct P { u8 a; ?u32 w; }
+P gp;
+u32 main() {
+    gp.w = 5;
+    if (gp.w) |*v| { *v = 3; }
+    return 0;
+}

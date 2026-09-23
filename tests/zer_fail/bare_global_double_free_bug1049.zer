@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: double free: 'g' already freed
+[*]u32 g;
+u32 main() { g = alloc(u32, 4) orelse return; free(g); free(g); return 0; }

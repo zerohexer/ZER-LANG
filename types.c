@@ -672,3 +672,19 @@ Symbol *scope_lookup(Scope *s, const char *name, uint32_t name_len) {
     }
     return NULL;
 }
+
+/* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
+ * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix).
+ * Moved from emitter.c (BUG-1054) so IR lowering asks the same question. */
+bool type_is_null_sentinel(Type *inner) {
+    if (!inner) return false;
+    TypeKind k = type_dispatch_kind(inner);   /* BUG-279: unwraps ALL distinct levels */
+    /* BUG-393: *opaque is _zer_opaque struct, not a pointer — NOT null sentinel */
+    if (k == TYPE_POINTER) {
+        Type *e = type_unwrap_distinct(inner);
+        if (e->pointer.inner && type_dispatch_kind(e->pointer.inner) == TYPE_OPAQUE)
+            return false;
+        return true;
+    }
+    return k == TYPE_FUNC_PTR;
+}

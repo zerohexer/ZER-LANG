@@ -5,6 +5,116 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23 — BUG-1049..1056: a bare global held an allocation nothing tracked, three silent miscompiles, a stale MMIO bound, a Level-B guard that was two variables
+
+Audit session. First the four newest audit branches were surveyed: all forked at the then-HEAD
+and `stoic-mendel-p4i854` is a linear superset of the other three (`mzqgy6` and
+`friendly-galileo-1hkj1n` are tree-identical to two of its ancestors; `loving-davinci-bdorfl`
+is its `ccd53970` renumbered, including the BUG-1019b indexed-funcptr callee, which it carries
+as `slice_funcptr_call_oob_bug1027b`). It was fast-forwarded after its own `make check`
+printed `MAKE_CHECK_EXIT=0`. Then five read-only audit agents (value semantics, UAF/leak,
+bounds elision, bare metal, reference.md) and a hand read of zercheck_ir.c. Every fix below
+was shown to FAIL against the pre-change build (`$S/br/zerc`, the harvested HEAD).
+
+### BUG-1049 — an allocation held by a BARE global was tracked by nothing (accept-unsafe UAF / double free)
+
+**Symptom (ASan heap-use-after-free, zero diagnostics):**
+
+    [*]u32 g;
+    u32 run() { g = alloc(u32, 4) orelse return; free(g); return g[0]; }
+
+and — found beside it, not in the open entry — `g = s; free(g); return s[0];`, where the
+alias came from a LOCAL but the free went THROUGH the global.
+
+**Root cause.** `ir_extract_compound_key` keyed `g.p` / `g[0]` (`ir_global_projection_key`)
+but returned -1 for a bare global ident, so only the BUG-739 store arm could name the
+`(IR_GLOBAL_ROOT_ID, "g")` entry; the free, use, alias and exit sinks all saw nothing.
+
+**Fix.** The bare-ident arm in `ir_extract_compound_key` (the one key every sink shares), plus
+the two sibling rules the 2026-09-15 attempt recorded as blocking it: `g = null;` is an
+OVERWRITE (`ir_assign_target_is_tracked_slot` bare-global arm) and keeps the freed fact for the
+summary (`freed_then_reset`, as the slot resets do); and ONE sentence for a dangling global
+(`ir_report_dangling_global`, both the exit and call boundaries) whose remedy is carrier-aware
+— for a NON-optional global, `g = null;` does not compile, so it says to declare `?[*]u32 g`.
+Corpus cost: ZERO verdict changes over 2585 files. Gate: SHAPE p27 in `tools/sink_matrix.sh`
+(7 HOLE cells on the pre-fix build, 4 SAFE cells). Tests: `tests/zer_fail/bare_global_*_bug1049.zer`,
+`tests/zer/bare_global_alloc_reset_bug1049.zer`.
+
+### BUG-1050 — 33 zercheck diagnostics printed raw IR ids (`local %-2`, `handle %6`)
+
+A global printed as `local %-2`; a UAF seen through an orelse temp printed a second and third
+report `use of freed handle %6`. ONE renderer, `ir_local_desc` (a name, a global key, or "an
+unnamed temporary"), and ONE reporter `ir_zc_error_for(zc, func, id, line, ...)` that drops a
+report whose only subject is a compiler temporary when a diagnostic has already been issued on
+that line (the temp is an alias of what that report named). `use of %s handle` became `use of
+%s value`. One test's `expect-error` was the old IR-id wording and was updated.
+
+### BUG-1051 — `target = X orelse ...;` into an OPTIONAL global / field / element emitted C GCC refused
+
+`?u32 g; g = f() orelse return;` emitted `g = _zer_t0;` — a `uint32_t` into `_zer_opt_u32`.
+The statement lowers through a synthesized identifier for the unwrapped temp, and that site
+never registered its TYPE (BUG-942 fixed the same omission at one sibling), so the emitter's
+`T -> ?T` wrap saw no value type. Seven sites built such an identifier by hand; all now call
+ONE `make_local_ident` (ir_lower.c), which carries the local's type by construction. Test:
+`tests/zer/orelse_assign_into_optional_target_bug1051.zer` (6 GCC errors pre-fix).
+
+### BUG-1052 — a funcptr FIELD callee in a spawn target declared AFTER its spawner was not opaque
+
+`callee_is_opaque_funcptr` read the callee's type from the TYPEMAP, which is empty for a body
+not yet checked, so `o.cb(&g)` (volatile `g`, handed by pointer to an unseen callee) was
+rejected with the thread body declared first and ACCEPTED declared second. An untyped
+FIELD/INDEX callee now rounds toward opaque (an index callee can only be a funcptr; a field
+callee is a method only when its object names a global builtin or a type). Every caller is an
+argument-precise barrier, so a real method call costs nothing. Closes residual #2 of the
+BUG-1046 entry in limitations.md.
+
+### BUG-1053 — Handle auto-deref emitted a literal `0` when two allocators of the type exist (SILENT MISCOMPILE)
+
+`Pool(Task,4) pool; Pool(Task,4) pool2; Handle(Task) h = pool.alloc() orelse return;
+pool.get(h).id = 5; u32 r = h.id;` compiled and returned 0 — the emitted C was
+`/* handle auto-deref no alloc */ 0`; the write form `h.id = 5` emitted `0 = 5`. The CHECKER
+resolves the allocator through `h`'s `slab_source`; both IR emitter sites re-searched for a
+UNIQUE allocator, found two, and fell back. The checker now records its answer on the node
+(`field.handle_alloc`) and all three emitter sites read it. Test:
+`tests/zer/handle_autoderef_two_allocators_bug1053.zer`.
+
+### BUG-1054 — `if (x) |*v| { *v = ...; }` wrote into a COPY for any non-local `x` (SILENT MISCOMPILE)
+
+For a global, a field, an array element or a deref, `lower_expr` copied the condition into a
+temp and the mutable capture pointed into the copy: `if (g) |*v| { *v = 3; }` left `g`
+unchanged. The branch now evaluates the lvalue's ADDRESS once, branches on a read through it,
+and binds the capture to it (`IR_COPY` adapts `*?T -> *T` as `&p->value`). A packed-struct
+field is refused (the capture would be the misaligned pointer `&p.w` already is).
+`is_null_sentinel` moved to types.c as `type_is_null_sentinel` so ir_lower asks the emitter's
+question. Tests: `tests/zer/ptr_capture_writes_through_bug1054.zer` (every form wrong pre-fix),
+`tests/zer_fail/ptr_capture_packed_field_bug1054.zer`.
+
+### BUG-1055 — a Level-B guard NAME redeclared in a sibling scope was trusted as one value (accept-unsafe UAF + double free)
+
+`{ bool c = x == 1; if (c) { free(a); } } ... { bool c = y == 1; if (!c) { r = a.v; free(a); } }`
+compiled and returned 99 (another object's value in the recycled slot). The two `c`s share one
+IR local; `ast_name_mutated_or_addrd` asks whether a binding is WRITTEN, never whether the
+name is BOUND twice. New exhaustive walker `ast_name_bind_count` (var-decl, if-capture,
+switch-capture); the stability gate requires exactly one binding (zero for a param). Tests:
+`tests/zer_fail/guarded_re{declared,captured}_guard_bug1055.zer`.
+
+### BUG-1056 — the MMIO index bound outlived a reassignment of the pointer (accept-unsafe out-of-range MMIO)
+
+`volatile *u32 r = @inttoptr(*u32, 0x40000000); r = @inttoptr(*u32, 0x400000F0); return r[10];`
+read 0x40000118 — outside every declared range — with no check: `Symbol.mmio_bound` was
+set at the declaration and nothing ever revisited it (the global form, reassigned in another
+function, likewise). A per-statement update cannot be sound (a reassignment later in a loop
+reaches an earlier index on the back edge), so a declaration-derived bound is kept only for a
+pointer that is never reassigned or address-taken — in its function body (and bound exactly
+once) for a local, in any registered body for a global (`mmio_global_bound_stable`, cached,
+using the new `Checker.reg_files`). Otherwise the I1 rule refuses the index. The three
+copies of the bound derivation are ONE `mmio_inttoptr_bound`, which also sizes a STRUCT element
+correctly (it used `type_width`, 0 for a struct, so `volatile *Regs r = @inttoptr(...); r[i].sr`
+was refused outright). Tests: `tests/zer_fail/mmio_bound_stale_*_bug1056.zer` (all three
+accepted pre-fix), `tests/zer/mmio_struct_block_bound_bug1056.zer` (refused pre-fix).
+
+---
+
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model
 
 Audit session continued from 2026-09-21: the remaining ~4k lines of checker.c read, then

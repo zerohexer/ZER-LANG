@@ -1,0 +1,42 @@
+// BUG-1054: a MUTABLE if-capture `|*v|` must write THROUGH to the optional the
+// condition names. For anything but a plain local the condition was copied into
+// a temp and `v` pointed into the COPY, so the write was silently lost.
+struct S { ?u32 w; }
+struct P { u32 x; }
+?u32 g;
+?P gs;
+?u32[2] garr;
+
+void set(*S p) { if (p.w) |*v| { *v = 3; } }
+u32 idx() { return 1; }
+
+u32 main() {
+    ?u32[2] arr;
+    arr[1] = 5;
+    if (arr[1]) |*v| { *v = 4; }
+    S s;
+    s.w = 5;
+    set(&s);
+    S t;
+    t.w = 1;
+    if (t.w) |*v| { *v += 10; }
+    g = 5;
+    if (g) |*v| { *v = 6; }
+    P one = { .x = 1 };
+    gs = one;
+    if (gs) |*v| { v.x = 8; }
+    garr[1] = 2;
+    if (garr[idx()]) |*v| { *v = 9; }
+    ?u32 loc = 1;
+    if (loc) |*v| { *v = 2; }
+    u32 a = arr[1] orelse 99;
+    u32 b = s.w orelse 99;
+    u32 c = t.w orelse 99;
+    u32 d = g orelse 99;
+    P dflt = { .x = 99 };
+    P pe = gs orelse dflt;
+    u32 f = garr[1] orelse 99;
+    u32 h = loc orelse 99;
+    if (a != 4 || b != 3 || c != 11 || d != 6 || pe.x != 8 || f != 9 || h != 2) { return 1; }
+    return 0;
+}

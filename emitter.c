@@ -83,13 +83,7 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
-    if (!inner) return false;
-    /* BUG-279: unwrap ALL levels of distinct, not just one */
-    while (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;
-    /* BUG-393: *opaque is _zer_opaque struct, not a pointer — NOT null sentinel */
-    if (inner->kind == TYPE_POINTER && inner->pointer.inner &&
-        type_unwrap_distinct(inner->pointer.inner)->kind == TYPE_OPAQUE) return false;
-    return inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR;
+    return type_is_null_sentinel(inner);   /* BUG-1054: one definition, types.c */
 }
 #define IS_NULL_SENTINEL(inner_kind) \
     ((inner_kind) == TYPE_POINTER || (inner_kind) == TYPE_FUNC_PTR)
@@ -3374,8 +3368,8 @@ static void emit_expr(Emitter *e, Node *node) {
         if (obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_HANDLE) {
             Type *handle_type = type_unwrap_distinct(obj_type);
             /* find the allocator symbol — first try slab_source on the variable */
-            Symbol *alloc_sym = NULL;
-            if (node->field.object->kind == NODE_IDENT) {
+            Symbol *alloc_sym = node->field.handle_alloc;   /* BUG-1053 */
+            if (!alloc_sym && node->field.object->kind == NODE_IDENT) {
                 Symbol *hsym = scope_lookup(e->checker->current_scope,
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
@@ -7954,7 +7948,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (ot_eff->kind == TYPE_HANDLE) {
                     Type *elem = ot_eff->handle.elem;
                     /* Find allocator for this handle */
-                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    /* BUG-1053: the checker's resolution (slab_source first), not
+                     * a fresh unique-allocator search, which is NULL as soon as
+                     * two allocators of this element type exist and used to
+                     * emit a literal `0` for the read (and `0 = v` for a write). */
+                    Symbol *alloc_sym = node->field.handle_alloc
+                        ? node->field.handle_alloc
+                        : find_unique_allocator(e->checker->global_scope, elem);
                     if (alloc_sym) {
                         Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
                         if (alloc_type->kind == TYPE_SLAB) {
@@ -8096,7 +8096,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 /* Handle auto-deref: emit get() → -> */
                 if (oe->kind == TYPE_HANDLE) {
                     Type *elem = oe->handle.elem;
-                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    Symbol *alloc_sym = node->field.handle_alloc   /* BUG-1053 */
+                        ? node->field.handle_alloc
+                        : find_unique_allocator(e->checker->global_scope, elem);
                     if (alloc_sym) {
                         Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
                         emit(e, "((");
@@ -13182,6 +13184,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                       * `opaque`, so it still takes the address. */
                                      type_dispatch_kind(dst_eff->pointer.inner) != TYPE_OPAQUE);
 
+            /* BUG-1054: mutable capture bound to the ADDRESS of the optional
+             * (a non-local lvalue condition): dst is *T, src is *?T. */
+            bool need_addr_capture_via_ptr = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_eff && type_dispatch_kind(src_eff) == TYPE_POINTER &&
+                                     src_eff->pointer.inner &&
+                                     type_dispatch_kind(src_eff->pointer.inner) == TYPE_OPTIONAL &&
+                                     !is_null_sentinel(type_unwrap_distinct(src_eff->pointer.inner)->optional.inner));
+
             const char *sp = func->is_async ? "self->" : "";
 
             /* Array→array copy: use memcpy (C can't assign arrays).
@@ -13207,7 +13218,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->pointer.inner &&
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
-            if (need_addr_capture) {
+            if (need_addr_capture_via_ptr) {
+                emit(e, "&%s%.*s->value;\n",
+                     sp, (int)src->name_len, src->name);
+            } else if (need_addr_capture) {
                 emit(e, "&%s%.*s.value;\n",
                      sp, (int)src->name_len, src->name);
             } else if (need_slice) {

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1055: the Level-B guarded relaxation (`if (c) { free } if (!c) { use }`)
+// requires ONE stable value behind the guard name. Two sibling-scope `c`s share
+// one IR local, so the pair looked disjoint and a use-after-free (exit 99, the
+// value of a different live object in the recycled slot) plus a double free
+// compiled clean.
+struct T { u32 v; }
+u32 run(u32 x, u32 y) {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    { bool c = x == 1; if (c) { free(a); } }
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    { bool c = y == 1; if (!c) { r = a.v; free(a); } }
+    free(b);
+    return r;
+}
+u32 main() { return run(1, 0); }

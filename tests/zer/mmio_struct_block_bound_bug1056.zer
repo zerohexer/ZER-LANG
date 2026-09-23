@@ -1,0 +1,13 @@
+// BUG-1056: a bound for a STRUCT register block. The element was sized with
+// type_width(), which is 0 for a struct, so `r[1].sr` on a `*Regs` from a
+// constant @inttoptr was refused as having "no compile-time MMIO bound".
+// Compile-only in effect: the OOB index takes the auto-guard, never touching
+// the address (the mmio_var_idx_guard.zer pattern).
+mmio 0x40000000..0x400000FF;
+struct Regs { u32 cr; u32 sr; u32 dr; u32 pad; }
+u32 pick(u32 i) { return i; }
+u32 main() {
+    volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+    u32 i = pick(99);
+    return r[i].sr;
+}

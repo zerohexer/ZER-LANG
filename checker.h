@@ -53,6 +53,10 @@ typedef struct {
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
+    Node *current_body;      /* BUG-1056: body (function OR interrupt) being checked */
+    Node **reg_files;        /* BUG-1056: every NODE_FILE registered (whole-program scans) */
+    int reg_file_count;
+    int reg_file_cap;
     /* Stage 1->2 escape summary accumulators (set at func-body-check entry, updated
      * at each valued return in the NODE_RETURN handler, read into
      * Symbol.ret_summary_complete / ret_param_mask after the body). Sound by
@@ -480,6 +484,7 @@ void check_keep_inference(Checker *c);
  * `&name`? Exhaustive no-default AST walk, conservative (true) on opaque kinds. The
  * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
+int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */

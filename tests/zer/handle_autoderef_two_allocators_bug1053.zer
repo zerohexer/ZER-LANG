@@ -1,0 +1,26 @@
+// BUG-1053: Handle auto-deref `h.f` when TWO allocators of the element type
+// exist. The checker resolves the allocator through `h`'s slab_source; the IR
+// emitter re-searched for a UNIQUE allocator, found none, and emitted a literal
+// `0` for the read (the program returned 0 instead of the stored value) and
+// `0 = v` for a write.
+struct Task { u32 id; }
+Pool(Task, 4) pool;
+Pool(Task, 4) pool2;
+Slab(Task) slab;
+
+u32 main() {
+    Handle(Task) h = pool.alloc() orelse return;
+    h.id = 5;
+    u32 r = h.id;
+    pool.free(h);
+    Handle(Task) h2 = pool2.alloc() orelse return;
+    h2.id = 6;
+    r += h2.id;
+    pool2.free(h2);
+    Handle(Task) h3 = slab.alloc() orelse return;
+    h3.id = 7;
+    r += h3.id;
+    slab.free(h3);
+    if (r != 18) { return 1; }
+    return 0;
+}

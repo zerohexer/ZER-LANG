@@ -1,0 +1,36 @@
+// BUG-1049: the taught remedy for an allocation held by a bare global — reset it
+// after the free — must compile at every spelling, now that the bare global is
+// tracked. Includes a cross-function init/fini pair and a per-iteration reset.
+struct W { u32 v; }
+?[*]u32 gs;
+?*W gp;
+
+void init() { gs = alloc(u32, 4) orelse return; }
+u32 fini() {
+    [*]u32 s = gs orelse return;
+    s[0] = 5;
+    u32 v = s[0];
+    free(s);
+    gs = null;
+    return v;
+}
+
+u32 main() {
+    init();
+    if (fini() != 5) { return 1; }
+    for (u32 i = 0; i < 3; i += 1) {
+        gs = alloc(u32, 4) orelse return;
+        [*]u32 s = gs orelse return;
+        s[0] = i;
+        free(s);
+        gs = null;
+    }
+    gp = alloc(W);
+    *W q = gp orelse return;
+    q.v = 7;
+    u32 r = q.v;
+    free(q);
+    gp = null;
+    if (r != 7) { return 2; }
+    return 0;
+}

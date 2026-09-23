@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after free: 's' is freed
+// BUG-1049: `g = s` aliased the global to the local's allocation, but the free
+// went THROUGH the global, which had no key — the read through `s` was a
+// silent use-after-free.
+[*]u32 g;
+u32 main() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    g = s;
+    free(g);
+    return s[0];
+}

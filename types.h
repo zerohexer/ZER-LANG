@@ -227,6 +227,13 @@ struct Symbol {
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
+    /* BUG-1095: `&x` was taken somewhere at or before this program point. A
+     * pointer alias may then change x at ANY later store through a pointer, so
+     * VRP never again records a range for it. Lives on the Symbol, not on a
+     * VarRange entry: an entry is popped at block exit, and the alias is not. */
+    bool vrp_addr_taken;
+    /* BUG-1099: declared by a parser desugaring (add_symbol_synth). */
+    bool is_synthetic_var;
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
     /* BUG-969: WHICH local this pointer/slice/carrier points into, by name, when that

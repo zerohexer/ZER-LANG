@@ -1,0 +1,55 @@
+// BUG-1092: value ranges were keyed by NAME, so a shadowing declaration read — and
+// an assignment to it mutated — the OUTER variable's range. Every probe below is
+// out of bounds at run time; pre-fix each one was PROVEN in range (no check) and
+// wrote past the array (ASan). Now each access is auto-guarded, the guard returns
+// 0 from its function, and main sees 0 everywhere. A 42 would mean the access ran.
+u32[4] arr;
+u32 get(u32 a) { return a; }
+union U { u32 a; u32 b; }
+u32 block_shadow() {
+    u32 i = 1;
+    if (true) { u32 i = get(5); arr[i] = 7; }
+    return 42;
+}
+u32 loop_shadow() {
+    u32 i = get(1);
+    if (i < 4) {
+        u32 j = 0;
+        while (j < 1) { u32 i = get(5); arr[i] = 7; j += 1; }
+    }
+    return 42;
+}
+u32 intersect_shadow() {
+    u32 i = get(1);
+    if (i < 4) { if (true) { u32 i = get(5) % 100; arr[i] = 7; } }
+    return 42;
+}
+u32 capture_shadow() {
+    u32 i = 1;
+    ?u32 m = get(5);
+    if (m) |i| { arr[i] = 7; }
+    return 42;
+}
+u32 union_capture_shadow() {
+    u32 a = 1;
+    U u;
+    u.a = get(5);
+    switch (u) {
+        .a => |a| { arr[a] = 7; }
+        .b => |b| { }
+    }
+    return 42;
+}
+u32 inner_assign_mutates_outer() {
+    u32 i = get(9);
+    if (i < 100) {
+        { u32 i = get(0); i = get(0) % 4; }
+        arr[i] = 7;
+    }
+    return 42;
+}
+u32 main() {
+    u32 r = block_shadow() + loop_shadow() + intersect_shadow() +
+            capture_shadow() + union_capture_shadow() + inner_assign_mutates_outer();
+    return r;
+}

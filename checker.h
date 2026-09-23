@@ -171,6 +171,15 @@ typedef struct {
     struct VarRange {
         const char *name;
         uint32_t name_len;
+        /* BUG-1092: the scope that DECLARES the key's root variable — the
+         * variable's identity. A range used to be found by NAME alone, so a
+         * shadowing declaration read (and assignments to it mutated) the OUTER
+         * variable's range. Resolved at push and at every lookup through the
+         * scope chain; NULL only when the root has no Symbol at all. */
+        Scope *owner;
+        /* BUG-1093: the root is a non-const GLOBAL or a `static` local — storage
+         * a call, a store through a pointer, or a suspension can change. */
+        bool root_global_like;
         int64_t min_val;
         int64_t max_val;
         bool known_nonzero;
@@ -199,10 +208,11 @@ typedef struct {
      * `u32 t = g; t = 5; g = t;` stays accepted.
      *
      * Only ever ADDS rejections, so the failure direction is over-rejection,
-     * never a shipped race. Name-keyed with no scope discriminator, exactly like
-     * VarRange above, with the same consequence: a shadowing local of the same
-     * name in a sibling scope can inherit a taint it did not earn. That
-     * over-rejects; it cannot under-reject. */
+     * never a shipped race. Name-keyed with no scope discriminator (VarRange
+     * above WAS too, until BUG-1092 — there a shadow could inherit a RANGE and
+     * elide a check; here the consequence is only that a shadowing local of the
+     * same name can inherit a taint it did not earn, which over-rejects and
+     * cannot under-reject). */
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;
@@ -300,6 +310,10 @@ typedef struct {
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
+    /* BUG-1098: the expression an auto-guard for an access inside it would be
+     * HOISTED in front of (a statement's expression, a loop condition / step).
+     * NULL = unknown, which never hoists. */
+    Node *guard_stmt_root;
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
     /* BUG-979: the SCOPED half of the same question. A scoped spawn opens a
      * concurrent window that a join CLOSES, so unlike a fire-and-forget spawn the
@@ -536,6 +550,16 @@ bool checker_is_proven(Checker *c, Node *node);
 
 /* returns array_size if this node needs auto-guard, 0 if not */
 uint64_t checker_auto_guard_size(Checker *c, Node *node);
+
+/* BUG-1098: was this access given an auto-guard at all (hoisted into the C, or
+ * lowered into the IR)? An unproven fixed-array access WITHOUT one must carry
+ * its own inline single-evaluation bounds check. */
+bool checker_has_auto_guard(Checker *c, Node *node);
+
+/* BUG-1090: fold an integer expression at its CHECKER types, wrapping every
+ * intermediate exactly as the emitted code does. False when the tree is not a
+ * constant this fold models. */
+bool checker_fold_const_typed(Checker *c, Node *n, int64_t *out);
 
 /* BUG-955 (refactor M): ONE descent over an expression tree yielding every access
  * that needs a safety guard, so the emitter and the IR lowering ask the same

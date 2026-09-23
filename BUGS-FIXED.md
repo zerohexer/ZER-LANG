@@ -5,6 +5,173 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23d — BUG-1090..1101: bounds-check elision trusted facts that were not true — a wrong constant, another variable's range, a stale range, a guard tested too early, a summary read at the wrong point
+
+An audit of the VRP elision path (the analysis that decides a fixed-array index is in
+range and emits NO check) produced ~30 ASan-verified out-of-bounds writes, every one
+compiling clean with zero diagnostics. They fall into six reasons a recorded range stops
+being a TRUE fact about the variable at the access. Measured with a harness that compiles
+each probe, builds it with `-fsanitize=address`, and runs it: 32 probes ASan-OOB against
+`3c5e6eaa`, 0 after (the rest now trap, guard, or are refused at compile time as
+provably out of bounds).
+
+### BUG-1090 — constants folded in the wrong arithmetic (typed fold)
+
+`eval_const_expr` folds in untyped signed int64; the program computes every node in its
+CHECKER type. `u32 i = (0 - 1) / 1073741824;` is 0 untyped and RUNS as
+0xFFFFFFFF / 2^30 = 3 — VRP recorded [0,0], `arr2[i]` was emitted bare, arr2[3] was
+written. Same at every sink that trusted a constant: a `% N` / `& MASK` operand, an
+if / while / for bound, a local `const`, a GLOBAL const (folded IN PLACE, untyped, so the
+global held 0 while a local spelled identically held 3), and the return summary.
+
+Fix: ONE typed fold, `tfold` (checker.c), that evaluates each node at its typemap type —
+width, signedness, the `_zer_shl` carrier rule for shifts, u64 carried as its bit pattern —
+wrapping every intermediate exactly as the 3AC temps do, and FAILING on anything it does
+not model (a zero divisor, a signed MIN / -1, mixed-signedness division, a non-integer
+node). `vrp_const_value` is the VRP-sink query; `checker_fold_const_typed` is the
+emitter's, used for global initializers so a global and a local agree.
+
+The first cut trusted the typed value at the PLAIN-ASSIGNMENT sink too, and
+`i = (0 - 1) % 7;` then wrote arr[0xFFFFFFFF]: a plain `x = <tree>` is not decomposed into
+typed temps, it is emitted as ONE C expression in which a literal is a bare `int`
+(`emit_int_literal`), so the program computes -1. That sink — and a defer body, which a
+function with a label emits through the AST path — trusts only a RENDERING-INVARIANT
+constant (`vrp_const_value_untyped_render` / `tfold_exact`: every intermediate is the
+exact mathematical value, fits `int`, and equals the typed value, so int, unsigned, long
+and the typed temps all agree). The fact matrix's `constant/plain-assign-rendering` cell
+pins it and was shown to fire against that first cut.
+
+### BUG-1091 — comptime folded a literal subtree with no width
+
+`comptime u32 F() { return (0 - 1) / 1073741824; }` gave 0 at compile time; the identical
+runtime function returns 3. `ct_expr_bits` returned "no width" for a literal, so a
+pure-literal subtree folded in int64. A literal now carries the width the checker typed
+it at.
+
+### BUG-1092 — ranges were keyed by NAME (identity)
+
+`find_var_range` / `push_var_range` matched the name only, so a shadowing declaration
+read — and an assignment to it mutated IN PLACE — the outer variable's range:
+`u32 i = 1; if (true) { u32 i = get(5); arr[i] = 7; }` elided against [1,1]; likewise a
+loop-body shadow, an intersecting inner narrowing, an `if (m) |i|` capture, a union
+`.a => |a|` capture, and `{ u32 i = get(0); i = get(0) % 4; } arr[i]` which left the OUTER
+entry at [0,3]. Fix: an entry is keyed by the SCOPE that declares its root
+(`vrp_key_root`, `VarRange.owner`), resolved at push and at every lookup — scope pointers
+are arena-allocated and unique, so (owner, key) names one variable. A declaration pushes
+`fresh` (never intersects).
+
+### BUG-1093 — a store through a pointer did not invalidate a narrowed global
+
+`void f(*u32 p) { if (g < 4) { *p = 4; arr[g] = 7; } }` called as `f(&g)` kept g in
+[0,3]. Globals were widened only at a CALL, and only for a bare-name key (a compound
+`gs.i` key was never widened even there). Fix: `VarRange.root_global_like` (a non-const
+global, a `static` local, or a key read through a pointer) + ONE widening,
+`vrp_widen_global_like`, called at a call, at any store through a pointer
+(`vrp_store_through_pointer`), and at an intrinsic that may write memory
+(`vrp_intrinsic_may_store`, over the shared value-only list).
+
+### BUG-1094 — a call inside a loop body did not widen at the back edge
+
+`if (g < 4) { while (n < 2) { arr[g] = 7; bump(); n += 1; } }` proved arr[g] on every
+iteration: the call widens g in program order, AFTER the access. Fix: the loop pre-pass
+(`vrp_invalidate_loop_body_writes`) widens global-like ranges when the body contains a
+non-comptime call, a non-plain-variable store, a writing intrinsic, a yield / await or a
+spawn.
+
+### BUG-1095 — an address taken inside a block was forgotten at the block's end
+
+The `address_taken` bit lived on the VarRange entry, which is popped at block exit:
+`if (true) { q = &i; }` then `if (i < 4) { *p = 4; arr[i] = 7; }` narrowed i again with q
+still aliasing it. Fix: `Symbol.vrp_addr_taken` (permanent, set at `&x` of a local and by
+the loop pre-pass); an address-taken local has no range at all.
+
+### BUG-1096 — a yield / await did not invalidate narrowed globals
+
+Across a suspension the poller runs and may write any global:
+`if (g < 4) { yield; arr[g] = 7; }` with main setting g = 4 between polls. Fix: widen at
+`yield`, and before checking an `await` condition.
+
+### BUG-1097 — the return-range summary read the ranges at the END of the body
+
+`find_return_range` credited `return x` with the range x had after the whole body, so
+`if (x > 50) { goto tail; } return x; tail: if (x >= 2) { return 1; } return 0;` got
+[0,1] (the tail guard's inverse) and `two[f(2)]` was unchecked; an inner shadow's
+`return x` resolved to the parameter. Fix: the NODE_RETURN handler records the range AT
+the return (`vrp_record_return_range` -> `Node.ret.vrp_state/min/max`, joined over
+repeated visits); the summary only unions what was recorded, and a return never reached
+gives the summary up.
+
+### BUG-1098 — the auto-guard was hoisted before the statement that changed the index
+
+`u32 v = g() + arr[gi];` with g writing gi: the guard tested gi == 1 at the start of the
+statement, the access read 4. Same for `g(&i) + arr[i]`, `g() > 0 && arr[gi] == 0`,
+`(i = get(4)) > 0 && arr[i] == 0`, and the emitter's C guard in a struct-returning
+function. Fix: `Checker.guard_stmt_root` (the expression a guard is hoisted in front of,
+set per statement and per for clause) + `vrp_guard_hoist_sound`: when the statement can
+change the index first (an assignment to it, `&` of it, or — for a global / static /
+address-taken index — any call, store through a pointer, writing intrinsic, or orelse
+block), no auto-guard is registered and the emitter gives the access its single-read
+inline check (`*({ size_t _i = idx; check(_i); &a[_i]; })`, one load, whatever order C
+evaluates the rest). The statement's OWN top-level assignment stores last and does not
+count (`k += a[k] + 1` stays guarded). An MMIO index in that position is refused (a
+pointer index has no inline form).
+
+### BUG-1099 — the for-in desugaring's variables were readable; its index warning named them
+
+`arr[_zer_ri] = x;` compiled (the `_zer_` prefix blocked declaring, not referencing).
+Now a reference to a variable declared by `add_symbol_synth` from a non-synthetic ident
+is an error (`ident.is_synthetic`, `Symbol.is_synthetic_var`). The typed fold knows `.len`
+of a FIXED array and a loop bound may be a variable whose range is a single value, so a
+for-in over an array is proven outright; if not, the warning no longer names `_zer_ri`.
+
+### BUG-1100 — `arr[f() orelse 0]` had no bounds check at all
+
+The orelse is lowered into a temp and the index REWRITTEN to that ident; the IR emitter
+skipped the inline check for any ident index, trusting an auto-guard the checker had never
+registered (the index was not an ident when it was checked). It wrote arr[9] and read it
+back. Fix (general rule, `emitter.c` NODE_INDEX): an unproven fixed-array access with NO
+auto-guard (`checker_has_auto_guard`) carries its own single-read inline check — this is
+also what BUG-1098 and the BUG-1011 volatile case rely on.
+
+### BUG-1101 (same defect as BUG-1068, fixed independently in two worktrees; the harvested code is BUG-1068's) — `ast_name_bind_count` never looked inside an expression
+
+(Found because the walker-field audit was RED at `3c5e6eaa`, which also masks every later
+`make check` gate.) BUG-1055's "is this name bound exactly once?" returned 0 for every
+expression kind, so a `bool c` inside an orelse BLOCK was not counted, two `c`s read as
+one immutable guard, and the Level-B relaxation accepted `if (c) { free(a); }` ...
+`if (!c) { a.v = 5; }` — pre-fix only an unrelated leak was reported. Every expression
+child is descended now.
+
+### Tests
+
+- `tests/test_vrp_fact_matrix.c` — NEW gate (12th matrix, in `make check`): identity /
+  constant / invalidate / hoist / summary x 29 catch cells + 3 proven cells, RUNTIME oracle
+  (each access is OOB at run time and returns 42 right after it). Verified to FIRE: 28
+  silent holes against `3c5e6eaa`, 1 against the typed-assign first cut, 0 after.
+- `tests/zer_trap/`: `hoist_call_writes_global_index_bug1098`, `hoist_addr_arg_index_bug1098`,
+  `hoist_assign_in_condition_bug1098`, `orelse_index_unchecked_bug1100`,
+  `return_range_goto_tail_bug1097`, `return_range_inner_shadow_bug1097`.
+- `tests/zer/`: `vrp_shadow_identity_bug1092`, `vrp_invalidation_bug1093`,
+  `vrp_yield_widens_global_bug1096`, `vrp_typed_constant_sinks_bug1090`,
+  `comptime_typed_fold_bug1091`, `range_for_array_proven_bug1099` (each ASan-OOB or wrong
+  value on `3c5e6eaa`).
+- `tests/zer_fail/`: `vrp_typed_const_always_oob_bug1090`, `vrp_const_ident_always_oob_bug1090`,
+  `return_range_typed_const_bug1090`, `comptime_typed_fold_oob_bug1091`,
+  `range_for_reserved_index_read_bug1099`, `mmio_index_changes_in_statement_bug1098`,
+  `guarded_orelse_block_rebind_bug1101`.
+
+### Precision cost, measured
+
+Over the 1,521 files of `tests/zer`, `tests/zer_trap`, `rust_tests`, `zig_tests`: ZERO
+files change compile verdict; auto-guard warnings 129 -> 120 (the typed `.len` fold and
+single-value loop bounds prove for-in loops and `i < CONST` loops outright); inline bounds
+checks 1499 -> 1500 (the one added is BUG-1100's orelse index in
+`single_eval_guarantees.zer`, which was unchecked). No new rejection of a positive test.
+
+---
+
+---
+
 ## Session 2026-09-23b — BUG-1060..1068: seven silent value miscompiles and one unsatisfiable guard in the integer/float emission helpers, each one question answered at N sites
 
 Fix session over an auditor's probe set (value semantics of @saturate, literals, iN

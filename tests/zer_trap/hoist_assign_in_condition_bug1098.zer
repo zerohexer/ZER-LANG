@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1098: `(i = get(4)) > 0 && arr[i] == 0` — the condition assigns the index,
+// then reads through it. The guard hoisted in front of the `if` tested the OLD i.
+u32 get(u32 a) { return a; }
+u32 main() {
+    u32[4] arr;
+    u32 i = get(1);
+    u32 v = 0;
+    if ((i = get(4)) > 0 && arr[i] == 0) { v = 1; }
+    return 42 + v;
+}

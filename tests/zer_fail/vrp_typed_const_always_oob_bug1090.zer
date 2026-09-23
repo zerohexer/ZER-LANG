@@ -1,0 +1,10 @@
+// expect-error: always out of bounds
+// BUG-1090: `(0 - 1) / 1073741824` RUNS as 3 in u32; the untyped fold said 0 and
+// the access `two[i]` was proven in range and emitted unchecked (ASan). The typed
+// fold gives the true value, which is always out of bounds for a u32[2].
+u32 main() {
+    u32[2] two;
+    u32 i = (0 - 1) / 1073741824;
+    two[i] = 7;
+    return i;
+}

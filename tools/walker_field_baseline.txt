@@ -1201,3 +1201,137 @@ checker.c:rmw_scan_body:NODE_FUNC_DECL:func_decl.body
 checker.c:rmw_scan_body:NODE_GLOBAL_VAR:var_decl.init
 checker.c:rmw_scan_body:NODE_INTERRUPT:interrupt.body
 checker.c:rmw_scan_body:NODE_STATIC_ASSERT:static_assert_stmt.cond
+
+# 2026-09-23 (BUG-1090/1098): three new exhaustive walkers, none of which descends
+# the arms listed below - by design, and each arm's answer is the SAFE one:
+#   * tfold / tfold_exact - the TYPED constant fold. Every listed kind is "not a
+#     constant this fold models" and returns false (FAIL => no range => the access
+#     keeps its runtime check). A call is folded only when comptime-resolved (its
+#     VALUE, never its arguments); an index / assign / orelse / intrinsic is never
+#     a constant here.
+#   * vrp_expr_may_write_var - "can this expression change variable X before a
+#     later read?". Every STATEMENT kind reaching it answers the conservative YES
+#     (do not hoist the guard) without descending; ASM operands are naked-only.
+checker.c:tfold:NODE_ASM:asm_stmt.inputs
+checker.c:tfold:NODE_ASM:asm_stmt.outputs
+checker.c:tfold:NODE_ASSIGN:assign.target
+checker.c:tfold:NODE_ASSIGN:assign.value
+checker.c:tfold:NODE_AWAIT:await_stmt.cond
+checker.c:tfold:NODE_BLOCK:block.stmts
+checker.c:tfold:NODE_CALL:call.args
+checker.c:tfold:NODE_CALL:call.callee
+checker.c:tfold:NODE_CRITICAL:critical.body
+checker.c:tfold:NODE_DEFER:defer.body
+checker.c:tfold:NODE_DO_WHILE:while_stmt.body
+checker.c:tfold:NODE_DO_WHILE:while_stmt.cond
+checker.c:tfold:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:tfold:NODE_FILE:file.decls
+checker.c:tfold:NODE_FOR:for_stmt.body
+checker.c:tfold:NODE_FOR:for_stmt.cond
+checker.c:tfold:NODE_FOR:for_stmt.init
+checker.c:tfold:NODE_FOR:for_stmt.step
+checker.c:tfold:NODE_FUNC_DECL:func_decl.body
+checker.c:tfold:NODE_GLOBAL_VAR:var_decl.init
+checker.c:tfold:NODE_IF:if_stmt.cond
+checker.c:tfold:NODE_IF:if_stmt.else_body
+checker.c:tfold:NODE_IF:if_stmt.then_body
+checker.c:tfold:NODE_INDEX:index_expr.index
+checker.c:tfold:NODE_INDEX:index_expr.object
+checker.c:tfold:NODE_INTERRUPT:interrupt.body
+checker.c:tfold:NODE_INTRINSIC:intrinsic.args
+checker.c:tfold:NODE_ONCE:once.body
+checker.c:tfold:NODE_ORELSE:orelse.expr
+checker.c:tfold:NODE_ORELSE:orelse.fallback
+checker.c:tfold:NODE_RETURN:ret.expr
+checker.c:tfold:NODE_SLICE:slice.end
+checker.c:tfold:NODE_SLICE:slice.object
+checker.c:tfold:NODE_SLICE:slice.start
+checker.c:tfold:NODE_SPAWN:spawn_stmt.args
+checker.c:tfold:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:tfold:NODE_STRUCT_INIT:struct_init.fields
+checker.c:tfold:NODE_SWITCH:switch_stmt.arms
+checker.c:tfold:NODE_SWITCH:switch_stmt.expr
+checker.c:tfold:NODE_VAR_DECL:var_decl.init
+checker.c:tfold:NODE_WHILE:while_stmt.body
+checker.c:tfold:NODE_WHILE:while_stmt.cond
+checker.c:tfold_exact:NODE_ASM:asm_stmt.inputs
+checker.c:tfold_exact:NODE_ASM:asm_stmt.outputs
+checker.c:tfold_exact:NODE_ASSIGN:assign.target
+checker.c:tfold_exact:NODE_ASSIGN:assign.value
+checker.c:tfold_exact:NODE_AWAIT:await_stmt.cond
+checker.c:tfold_exact:NODE_BLOCK:block.stmts
+checker.c:tfold_exact:NODE_CALL:call.args
+checker.c:tfold_exact:NODE_CALL:call.callee
+checker.c:tfold_exact:NODE_CRITICAL:critical.body
+checker.c:tfold_exact:NODE_DEFER:defer.body
+checker.c:tfold_exact:NODE_DO_WHILE:while_stmt.body
+checker.c:tfold_exact:NODE_DO_WHILE:while_stmt.cond
+checker.c:tfold_exact:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:tfold_exact:NODE_FIELD:field.object
+checker.c:tfold_exact:NODE_FILE:file.decls
+checker.c:tfold_exact:NODE_FOR:for_stmt.body
+checker.c:tfold_exact:NODE_FOR:for_stmt.cond
+checker.c:tfold_exact:NODE_FOR:for_stmt.init
+checker.c:tfold_exact:NODE_FOR:for_stmt.step
+checker.c:tfold_exact:NODE_FUNC_DECL:func_decl.body
+checker.c:tfold_exact:NODE_GLOBAL_VAR:var_decl.init
+checker.c:tfold_exact:NODE_IF:if_stmt.cond
+checker.c:tfold_exact:NODE_IF:if_stmt.else_body
+checker.c:tfold_exact:NODE_IF:if_stmt.then_body
+checker.c:tfold_exact:NODE_INDEX:index_expr.index
+checker.c:tfold_exact:NODE_INDEX:index_expr.object
+checker.c:tfold_exact:NODE_INTERRUPT:interrupt.body
+checker.c:tfold_exact:NODE_INTRINSIC:intrinsic.args
+checker.c:tfold_exact:NODE_ONCE:once.body
+checker.c:tfold_exact:NODE_ORELSE:orelse.expr
+checker.c:tfold_exact:NODE_ORELSE:orelse.fallback
+checker.c:tfold_exact:NODE_RETURN:ret.expr
+checker.c:tfold_exact:NODE_SLICE:slice.end
+checker.c:tfold_exact:NODE_SLICE:slice.object
+checker.c:tfold_exact:NODE_SLICE:slice.start
+checker.c:tfold_exact:NODE_SPAWN:spawn_stmt.args
+checker.c:tfold_exact:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:tfold_exact:NODE_STRUCT_INIT:struct_init.fields
+checker.c:tfold_exact:NODE_SWITCH:switch_stmt.arms
+checker.c:tfold_exact:NODE_SWITCH:switch_stmt.expr
+checker.c:tfold_exact:NODE_VAR_DECL:var_decl.init
+checker.c:tfold_exact:NODE_WHILE:while_stmt.body
+checker.c:tfold_exact:NODE_WHILE:while_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_ASM:asm_stmt.inputs
+checker.c:vrp_expr_may_write_var:NODE_ASM:asm_stmt.outputs
+checker.c:vrp_expr_may_write_var:NODE_BLOCK:block.stmts
+checker.c:vrp_expr_may_write_var:NODE_CRITICAL:critical.body
+checker.c:vrp_expr_may_write_var:NODE_DEFER:defer.body
+checker.c:vrp_expr_may_write_var:NODE_DO_WHILE:while_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_DO_WHILE:while_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:vrp_expr_may_write_var:NODE_FILE:file.decls
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.init
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.step
+checker.c:vrp_expr_may_write_var:NODE_FUNC_DECL:func_decl.body
+checker.c:vrp_expr_may_write_var:NODE_GLOBAL_VAR:var_decl.init
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.else_body
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.then_body
+checker.c:vrp_expr_may_write_var:NODE_INTERRUPT:interrupt.body
+checker.c:vrp_expr_may_write_var:NODE_ONCE:once.body
+checker.c:vrp_expr_may_write_var:NODE_RETURN:ret.expr
+checker.c:vrp_expr_may_write_var:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_SWITCH:switch_stmt.arms
+checker.c:vrp_expr_may_write_var:NODE_SWITCH:switch_stmt.expr
+checker.c:vrp_expr_may_write_var:NODE_VAR_DECL:var_decl.init
+checker.c:vrp_expr_may_write_var:NODE_WHILE:while_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_WHILE:while_stmt.cond
+
+# 2026-09-23 (BUG-1101): zercheck_ir.c:ast_name_bind_count (BUG-1055) shipped with
+# every EXPRESSION arm answering 0 without descending, so an orelse BLOCK binding
+# (`x = m() orelse { bool c = ...; }`) was never counted and make check's walker
+# audit was RED at 3c5e6eaa. It now descends every expression child; what remains
+# is declarations that never appear in a body (counted as a rebinding, 2), asm
+# operands (naked-only) and a static_assert condition (a constant expression).
+zercheck_ir.c:ast_name_bind_count:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_bind_count:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_bind_count:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_bind_count:NODE_INTERRUPT:interrupt.body

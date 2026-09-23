@@ -457,7 +457,15 @@ struct Node {
         } switch_stmt;
 
         /* NODE_RETURN: return expr; */
-        struct { Node *expr; /* NULL for bare return */ } ret;
+        struct {
+            Node *expr; /* NULL for bare return */
+            /* BUG-1097: the value range of `expr` AT THIS RETURN, recorded by the
+             * checker when it reaches the statement (0 = never reached, 1 = range
+             * in vrp_min/vrp_max, 2 = no derivable range). The cross-function
+             * summary reads this, never the ranges live at the end of the body. */
+            uint8_t vrp_state;
+            int64_t vrp_min, vrp_max;
+        } ret;
 
         /* NODE_DEFER: defer stmt; or defer { block } */
         struct { Node *body; } defer;
@@ -563,6 +571,10 @@ struct Node {
         struct {
             const char *name;
             size_t name_len;
+            /* BUG-1099: a reference the PARSER made to one of its own desugaring
+             * variables (the for-in `_zer_ri` / `_zer_rlen`). Only such a
+             * reference may name a synthetic variable; user code may not. */
+            bool is_synthetic;
         } ident;
 
         /* NODE_BINARY: left op right */

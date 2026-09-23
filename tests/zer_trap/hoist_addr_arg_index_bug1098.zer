@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1098: `g(&i) + arr[i]` — g writes 4 through the pointer before arr[i] is
+// read; the hoisted guard had tested i == 1 (ASan stack-buffer-overflow pre-fix).
+u32 g(*u32 p) { *p = 4; return 0; }
+u32 get(u32 a) { return a; }
+u32 main() {
+    u32[4] arr;
+    u32 i = get(1);
+    u32 v = g(&i) + arr[i];
+    return 42 + v;
+}

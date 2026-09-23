@@ -1578,7 +1578,7 @@ static Node *parse_for_stmt(Parser *p) {
                     _c->field.field_name = collection->field.field_name; \
                     _c->field.field_name_len = collection->field.field_name_len; \
                 } _c; })
-            #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "_zer_ri"; _r->ident.name_len = 7; _r; })
+            #define MKREF_RI() ({ Node *_r = new_node(p, NODE_IDENT); _r->ident.name = "_zer_ri"; _r->ident.name_len = 7; _r->ident.is_synthetic = true; _r; })
 
             /* for init: usize _zer_ri = 0 */
             Node *idx_init = new_node(p, NODE_VAR_DECL);
@@ -1667,6 +1667,7 @@ static Node *parse_for_stmt(Parser *p) {
             Node *rlen_ref = new_node(p, NODE_IDENT);
             rlen_ref->ident.name = "_zer_rlen";
             rlen_ref->ident.name_len = 9;
+            rlen_ref->ident.is_synthetic = true;   /* BUG-1099 */
             cond->binary.right = rlen_ref;
             /* Wrap [len_snapshot, n] in a BLOCK so they share scope */
             Node **wrap_stmts = (Node **)arena_alloc(p->arena, 2 * sizeof(Node *));

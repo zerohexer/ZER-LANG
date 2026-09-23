@@ -5774,7 +5774,12 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * `_zer_shl` emits a GCC statement expression, which is illegal at
              * file scope. When it does not fold, emit_opt_wrap_value is the shared
              * T -> ?T query (the same one assignment and struct-field init use). */
-            int64_t oval = eval_const_expr(node->var_decl.init);
+            /* BUG-1090: the TYPED fold first — the value a local of the same
+             * spelling computes. The untyped fold is the fallback for a tree
+             * the typed one does not model. */
+            int64_t oval;
+            if (!checker_fold_const_typed(e->checker, node->var_decl.init, &oval))
+                oval = eval_const_expr(node->var_decl.init);
             if (oval != CONST_EVAL_FAIL) {
                 oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1032 */
                 emit(e, " = (");
@@ -5801,7 +5806,13 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * CONST_EVAL_FAIL for anything with a variable in it, so widening the
              * gate cannot fold something it should not. */
             {
-                int64_t cval = eval_const_expr(node->var_decl.init);
+                /* BUG-1090: typed fold first (see the optional arm above).
+                 * `const u32 K = (0 - 1) / 1073741824;` emitted `K = 0` — the
+                 * untyped int64 reading — while the same initializer on a
+                 * LOCAL computes 3 at run time. */
+                int64_t cval;
+                if (!checker_fold_const_typed(e->checker, node->var_decl.init, &cval))
+                    cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
                     cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1032 */
                     if (cval < 0) {
@@ -8346,6 +8357,15 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * statement-expression branch. */
         if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
+        /* BUG-1098: an ident index the checker declined to auto-guard because the
+         * statement may change it — the check and the access must read it ONCE,
+         * whatever order C evaluates the rest of the statement in (the comma form
+         * reads it twice, and `(check(i), a)[i] = g()` leaves g() unsequenced
+         * against both reads). */
+        if (idx_array && node->index_expr.index->kind == NODE_IDENT &&
+            !checker_is_proven(e->checker, node) &&
+            !checker_has_auto_guard(e->checker, node))
+            idx_se = true;
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
@@ -8376,8 +8396,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     * on purpose (the guard would read it once and the access again),
                     * so it must take THIS single-evaluation form instead: one load
                     * into a temp, the check and the access both on the temp. */
+                   /* BUG-1098: and an IDENT the checker declined to auto-guard
+                    * (the statement can change it before this read, so a hoisted
+                    * guard would test a stale value) — the general rule is that
+                    * an unproven access with no guard carries its own check. */
                    (node->index_expr.index->kind != NODE_IDENT ||
-                    expr_is_volatile(e, node->index_expr.index)) &&
+                    expr_is_volatile(e, node->index_expr.index) ||
+                    !checker_has_auto_guard(e->checker, node)) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for

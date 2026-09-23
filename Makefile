@@ -173,11 +173,21 @@ test_defer_goto_matrix: tests/test_defer_goto_matrix.c
 test_vrp_position_matrix: tests/test_vrp_position_matrix.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# BUG-1090..1100: the VRP FACT-VALIDITY grid — the other half of the position
+# matrix. Not "is the index checked under the range that holds where it is
+# evaluated?" but "is the recorded range still a TRUE fact about this variable?"
+# (identity / constant / invalidation / hoist / summary). RUNTIME oracle: each
+# cell's access is out of bounds at run time and returns 42 right after it, so
+# exit 42 is an unchecked access. Verified to FIRE: 28 silent holes against the
+# pre-fix build, 0 after.
+test_vrp_fact_matrix: tests/test_vrp_fact_matrix.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 test_ir_validate: test_ir_validate.c $(LIB_SRCS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # ---- Run all tests ----
-check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_vrp_position_matrix test_ir_validate
+check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_full test_extra test_gaps test_emit test_firmware test_firmware2 test_firmware3 test_production test_fuzz test_semantic_fuzz test_shape_matrix test_escape_matrix test_keep_matrix test_cflow_matrix test_conc_matrix test_view_alias_matrix test_hw_matrix test_async_matrix test_asm_matrix test_defer_goto_matrix test_vrp_position_matrix test_vrp_fact_matrix test_ir_validate
 	./test_lexer
 	./test_parser
 	./test_parser_edge
@@ -203,6 +213,7 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	./test_asm_matrix
 	./test_defer_goto_matrix
 	./test_vrp_position_matrix
+	./test_vrp_fact_matrix
 	./test_ir_validate
 	@echo "=== Module import tests ==="
 	@cd test_modules && ./run_tests.sh

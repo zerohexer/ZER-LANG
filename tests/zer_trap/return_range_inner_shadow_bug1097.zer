@@ -1,0 +1,18 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1097 + BUG-1092: `return x` names the INNER x (get(3)), but the body-end
+// summary pass resolved the name to the PARAMETER, whose guard left it [0,1].
+// Summary [0,1]; f(1) returns 3; `two[f(1)]` was unchecked (ASan pre-fix).
+u32 get(u32 a) { return a; }
+u32 f(u32 x) {
+    if (x >= 2) { return 0; }
+    {
+        u32 x = get(3);
+        return x;
+    }
+}
+u32 main() {
+    u32[2] two;
+    two[f(1)] = 7;
+    return 42;
+}

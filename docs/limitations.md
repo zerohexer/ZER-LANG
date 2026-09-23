@@ -253,6 +253,57 @@ saturates if later converted to an integer). The owner's call. If adopted: the c
 is the `TOK_SLASH`/`TOK_PERCENT` arm of `check_expr` NODE_BINARY and the compound arm; the
 emitter zero tests sit beside each of the seven `signed_min_text` call sites.
 
+**2026-09-23 (BUG-1090) — the rendering split now has a SAFETY consumer, and is handled
+at it.** VRP trusts constants, so it must know which rendering RUNS. There are THREE, not
+two: the 3AC path (var-decl init, conditions, returns, compound-assign RHS) computes each
+node in its typed temp; a PLAIN assignment `x = <tree>` and the index arm are one C
+expression with bare-`int` literals; and a defer body in a function with a label goes
+through the AST emitter (the same bare-literal rendering). The typed fold (`tfold`)
+models the first. The plain-assignment sink and any defer body trust only a constant for
+which all three agree (`tfold_exact`: every intermediate exact, fits `int`, equals the
+typed value) — measured necessary: trusting the typed value there let
+`i = (0 - 1) % 7; arr[i]` write arr[0xFFFFFFFF]. The fix sketch above (one rendering
+function of (literal, type)) is still the durable end-state; it would let the
+plain-assignment sink use the typed fold directly.
+
+---
+
+## OPEN — untyped constant folds that remain at compile-time-only decisions (2026-09-23, LOW)
+
+BUG-1090 routed every VRP ELISION sink (a range that removes a runtime check) through
+the typed fold. These still fold with the untyped int64 `eval_const_expr*`:
+
+- the compile-time division-by-zero proof (checker.c NODE_BINARY `/` `%`, compound
+  `/=` `%=`) — the IR and AST emitters ALWAYS emit the runtime zero-divisor trap, so a
+  wrong proof cannot remove a check; it can only mis-report (`x / ((0-1)/1073741824 - 3)`
+  divides by 0 at run time and traps, with no compile-time error);
+- `comptime if` / `static_assert` conditions and array / Pool / Ring / Semaphore sizes —
+  checker and emitter use the SAME untyped value, so the program is self-consistent, but
+  `comptime if ((0 - 1) / 1073741824 == 3)` takes the branch the untyped reading picks,
+  which disagrees with the same expression at run time;
+- the asm NONZERO / BOUNDED operand constraints (naked-only asm).
+
+Fix sketch: `vrp_const_value` at the division proof (typed first, untyped fallback — the
+error then fires on the TRUE zero); a typed fold for comptime-if needs the condition's
+typemap, which the dead branch never gets, so it must fold before the branch is chosen.
+
+## OPEN — a VRP range cannot hold a u64 at or above 2^63 (2026-09-23, precision only)
+
+`VarRange` is `int64_t`, so `tfold` carries a u64 as its bit pattern and
+`vrp_const_value` REFUSES a result that reads negative (`u64 i = 0 - 1;` gets no range).
+Refusing only drops elision; no check is removed. Fix sketch: an unsigned flag on the
+entry, or `uint64_t` bounds for unsigned roots.
+
+## OPEN — a hoist-unsafe index gets a TRAP, not the early-return guard (2026-09-23, behavior note)
+
+BUG-1098 gives an index the statement can change before reading (`g() + arr[gi]`, `g(&i)
++ arr[i]`) the inline single-read check, which TRAPS on failure, instead of the hoisted
+auto-guard, which returns early. Both are safe; the difference is observable (exit 133
+instead of a silent early return). An IR-level guard placed immediately before the
+access (after the call) would restore the early-return form — that needs the guard
+lowering to emit at the ACCESS's instruction, not the statement's start (refactor M
+stage C). Corpus cost of the current form: zero files (no test relies on it).
+
 ---
 
 ## OPEN — `@cond_timedwait` on a freestanding build reports a raw C message (2026-09-15, LOW — message quality only)

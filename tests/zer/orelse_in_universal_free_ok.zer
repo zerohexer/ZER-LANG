@@ -25,8 +25,9 @@ u32 main(){
     ?[*]u8 got = alloc(u8, 4);
     [*]u8 s = got orelse { return 1; };
     s[0] = 3;
-    if (s[0] != 3) { return 2; }
-    free(s);
+    u8 first = s[0];
+    free(s);                       // BUG-1071: free BEFORE the early return
+    if (first != 3) { return 2; }
 
     ctrl_flow();
     if (reached != 0) { return 3; }

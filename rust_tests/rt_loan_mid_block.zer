@@ -8,6 +8,7 @@ Pool(Data, 4) pool;
 u32 main() {
     ?Handle(Data) md = pool.alloc();
     Handle(Data) h = md orelse return;
+    defer pool.free(h);   // BUG-1071: also on the early returns below
     pool.get(h).a = 1;
     pool.get(h).b = 2;
     pool.get(h).c = 3;
@@ -20,6 +21,5 @@ u32 main() {
     if (pool.get(h).a != 30) { return 1; }
     if (pool.get(h).b != 2) { return 2; }
 
-    pool.free(h);
     return 0;
 }

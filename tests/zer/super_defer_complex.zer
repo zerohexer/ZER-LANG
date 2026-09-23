@@ -26,9 +26,9 @@ u32 block_defer() {
     ?Handle(Sensor) ms = sensors.alloc();
     Handle(Sensor) s = ms orelse return;
     ?Handle(Motor) mm = motors.alloc();
-    Handle(Motor) m = mm orelse return;
+    Handle(Motor) m = mm orelse { sensors.free(s); return 0; };   // BUG-1071
     ?Handle(Logger) ml = loggers.alloc();
-    Handle(Logger) l = ml orelse return;
+    Handle(Logger) l = ml orelse { sensors.free(s); motors.free(m); return 0; };
     defer {
         sensors.free(s);
         motors.free(m);

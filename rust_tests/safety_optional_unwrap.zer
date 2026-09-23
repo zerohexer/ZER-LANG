@@ -8,6 +8,7 @@ u32 main() {
     // alloc returns ?Handle — must unwrap
     ?Handle(Val) mh = pool.alloc();
     Handle(Val) h = mh orelse return;
+    defer pool.free(h);   // BUG-1071: also on the early returns below
     pool.get(h).data = 42;
 
     // orelse with default
@@ -19,10 +20,8 @@ u32 main() {
     if (mh2) |h2| {
         pool.get(h2).data = 99;
         u32 v2 = pool.get(h2).data;
-        if (v2 != 99) { return 2; }
         pool.free(h2);
+        if (v2 != 99) { return 2; }
     }
-
-    pool.free(h);
     return 0;
 }

@@ -17,6 +17,7 @@ u32 main() {
     Outer(P) ou; ou.n = 3;
 
     Handle(P) h = pl.alloc() orelse { return 1; };
+    defer pl.free(h);   // every early return below frees it too
     h.x = 5;
 
     b.v = h;
@@ -28,6 +29,5 @@ u32 main() {
     if (ou.i.h.x != 5) { return 4; }
     if (ou.n != 3)     { return 5; }
 
-    pl.free(h);
     return 0;
 }

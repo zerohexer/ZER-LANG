@@ -15,8 +15,9 @@ u32 two_fields() {
     Pair pr;
     pr.a = alloc(T);
     pr.b = alloc(T);
-    *T qa = pr.a orelse return;
-    *T qb = pr.b orelse return;
+    /* BUG-1071: on each null path the OTHER field's allocation is still live */
+    *T qa = pr.a orelse { *T fb = pr.b orelse { return 0; }; free(fb); return 0; };
+    *T qb = pr.b orelse { free(qa); return 0; };
     qa.v = 1;
     qb.v = 2;
     u32 s = qa.v + qb.v;

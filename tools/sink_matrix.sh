@@ -616,6 +616,59 @@ cell p27_safe_ptr_reset     compile 'struct T27i{u32 v;} ?*T27i g27i; u32 main()
 cell p27_safe_init_fini     compile '?[*]u32 g27j; void init27() { g27j = alloc(u32, 4) orelse return; } void fini27() { [*]u32 s = g27j orelse return; free(s); g27j = null; } u32 main(){ init27(); fini27(); return 0; }'
 cell p27_safe_loop_reset    compile '?[*]u32 g27k; u32 main(){ for (u32 i = 0; i < 3; i += 1) { g27k = alloc(u32, 4) orelse return; [*]u32 s = g27k orelse return; s[0] = i; free(s); g27k = null; } return 0; }'
 
+echo ""
+# SHAPE p28 (BUG-1070/1071): a LEAK on ONE PATH — the path axis. The leak pass looked
+# only at a block whose LAST instruction was RETURN (a `defer` put its body after
+# it, so any function with a defer was exempt), skipped returns tagged "early exit",
+# and merged coverage across returns (freed on SOME path counted for all). Every
+# HOLE cell compiled pre-fix. The SAFE cells pin the remedies (defer, free-before-return).
+echo "===== SHAPE p28 = a leak on ONE return path ====="
+cell p28_leak_with_defer      reject 'u32 main(){ u32 n = 0; defer n += 1; [*]u32 a = alloc(u32, 4) orelse return; a[0] = 1; return 0; }'
+cell p28_leak_if_return       reject 'u32 r28(u32 k){ [*]u32 a = alloc(u32, 4) orelse return; if (k == 1) { return 1; } free(a); return 0; } u32 main(){ return r28(1) - 1; }'
+cell p28_leak_orelse_fallback reject 'struct T28{u32 v;} u32 main(){ *T28 a = alloc(T28) orelse return; *T28 b = alloc(T28) orelse { return 1; }; free(a); free(b); return 0; }'
+cell p28_leak_switch_arm      reject 'enum M28 { a, b } u32 r28s(M28 m){ [*]u32 x = alloc(u32, 4) orelse return; switch (m) { .a => { return 1; } .b => { x[0] = 1; } } free(x); return 0; } u32 main(){ return r28s(M28.b); }'
+cell p28_summary_through_defer reject 'u32 n28 = 0; void z28([*]u32 p){ defer n28 += 1; free(p); return; } u32 main(){ [*]u32 a = alloc(u32, 4) orelse return; z28(a); free(a); return 0; }'
+cell p28_safe_defer_free      compile 'struct T28b{u32 v;} u32 r28b(u32 k){ *T28b a = alloc(T28b) orelse return; defer free(a); if (k == 1) { return 1; } return 0; } u32 main(){ return r28b(1) - 1; }'
+cell p28_safe_free_each_path  compile 'u32 r28c(u32 k){ [*]u32 a = alloc(u32, 4) orelse return; if (k == 1) { free(a); return 1; } free(a); return 0; } u32 main(){ return r28c(1) - 1; }'
+
+echo ""
+# SHAPE p29 (BUG-1072): OVERWRITE of a live holder — spelling axis. Only
+# `x = alloc(...)` was checked; the alias and slot spellings dropped the only
+# reference silently.
+echo "===== SHAPE p29 = overwrite of a live allocation holder ====="
+cell p29_alias_slice          reject 'u32 main(){ [*]u32 a = alloc(u32, 4) orelse return; defer free(a); [*]u32 b = alloc(u32, 4) orelse return; b = a; b[0] = 1; return 0; }'
+cell p29_alias_ptr            reject 'struct T29{u32 v;} u32 main(){ *T29 a = alloc(T29) orelse return; defer free(a); *T29 b = alloc(T29) orelse return; b = a; return b.v; }'
+cell p29_slot_alias           reject 'struct T29b{u32 v;} struct H29b{*T29b p;} u32 main(){ *T29b a = alloc(T29b) orelse return; defer free(a); H29b h; h.p = alloc(T29b) orelse return; h.p = a; return h.p.v; }'
+cell p29_slot_twice           reject 'struct T29c{u32 v;} struct H29c{*T29c p;} u32 main(){ H29c h; h.p = alloc(T29c) orelse return; h.p = alloc(T29c) orelse return; free(h.p); return 0; }'
+cell p29_safe_alias_after_free compile 'u32 main(){ [*]u32 a = alloc(u32, 4) orelse return; defer free(a); [*]u32 b = alloc(u32, 4) orelse return; free(b); b = a; b[0] = 1; return 0; }'
+cell p29_safe_second_holder   compile 'u32 main(){ [*]u32 a = alloc(u32, 4) orelse return; [*]u32 c = a; [*]u32 b = alloc(u32, 4) orelse { free(a); return 1; }; defer free(b); c = b; c[0] = 1; free(a); return 0; }'
+
+echo ""
+# SHAPE p30 (BUG-1075/1080/1076): a VIEW that arrives through a CALL — the
+# multi-param pick (either param may come back), a struct-returning wrapper
+# (the param comes back in a FIELD), and a callee that frees a FIELD through a
+# pointer VIEW of the struct — crossed with the sink (field read / copy / free).
+echo "===== SHAPE p30 = a view arriving through a call, at every sink ====="
+cell p30_pick_field_read      reject 'struct T30{u32 v;} *T30 pk30(*T30 x, *T30 y, bool c){ if (c) { return x; } return y; } u32 main(){ *T30 a = alloc(T30) orelse return; *T30 d = alloc(T30) orelse { free(a); return 1; }; *T30 c = pk30(d, a, false); free(a); u32 r = c.v; free(d); return r; }'
+cell p30_pick_copy            reject 'struct T30b{u32 v;} *T30b pk30b(*T30b x, *T30b y, bool c){ if (c) { return x; } return y; } u32 main(){ *T30b a = alloc(T30b) orelse return; *T30b d = alloc(T30b) orelse { free(a); return 1; }; *T30b c = pk30b(d, a, false); free(a); *T30b e = c; u32 r = e.v; free(d); return r; }'
+cell p30_pick_free            reject 'struct T30c{u32 v;} *T30c pk30c(*T30c x, *T30c y, bool c){ if (c) { return x; } return y; } u32 main(){ *T30c a = alloc(T30c) orelse return; *T30c d = alloc(T30c) orelse { free(a); return 1; }; *T30c c = pk30c(d, a, false); free(c); free(a); free(d); return 0; }'
+cell p30_wrap_field_uaf       reject 'struct T30d{u32 v;} struct H30d{*T30d p;} H30d mk30d(*T30d a){ H30d h = { .p = a }; return h; } u32 main(){ *T30d a = alloc(T30d) orelse return; H30d h = mk30d(a); free(a); return h.p.v; }'
+cell p30_wrap_free_field      reject 'struct H30e{[*]u32 p;} H30e mk30e([*]u32 a){ H30e h = { .p = a }; return h; } u32 main(){ [*]u32 a = alloc(u32, 4) orelse return; H30e h = mk30e(a); free(h.p); u32 r = a[0]; free(a); return r; }'
+cell p30_callee_field_ptrview reject 'struct T30f{u32 v;} struct H30f{*T30f p;} void z30f(*H30f h){ free(h.p); } u32 main(){ *T30f a = alloc(T30f) orelse return; H30f h = { .p = a }; *H30f hp = &h; z30f(hp); u32 r = h.p.v; free(a); return r; }'
+cell p30_wrap_may_field       reject 'struct T30i{u32 v;} struct H30i{*T30i p;} T30i g30i; H30i mk30i(*T30i a, bool c){ if (c) { H30i h = { .p = a }; return h; } H30i k = { .p = &g30i }; return k; } u32 main(){ *T30i a = alloc(T30i) orelse return; H30i h = mk30i(a, true); free(a); return h.p.v; }'
+cell p30_safe_wrap_may_field  compile 'struct T30j{u32 v;} struct H30j{*T30j p;} T30j g30j; H30j mk30j(*T30j a, bool c){ if (c) { H30j h = { .p = a }; return h; } H30j k = { .p = &g30j }; return k; } u32 main(){ *T30j a = alloc(T30j) orelse return; a.v = 7; H30j h = mk30j(a, true); u32 r = h.p.v; free(a); return r - 7; }'
+cell p30_safe_pick_use_first  compile 'struct T30g{u32 v;} *T30g pk30g(*T30g x, *T30g y, bool c){ if (c) { return x; } return y; } u32 main(){ *T30g a = alloc(T30g) orelse return; *T30g d = alloc(T30g) orelse { free(a); return 1; }; *T30g c = pk30g(d, a, false); u32 r = c.v; free(a); free(d); return r; }'
+cell p30_safe_wrap_free_field compile 'struct T30h{u32 v;} struct H30h{*T30h p;} H30h mk30h(*T30h a){ H30h h = { .p = a }; return h; } u32 main(){ *T30h a = alloc(T30h) orelse return; a.v = 7; H30h h = mk30h(a); u32 r = h.p.v; free(h.p); return r - 7; }'
+
+echo ""
+# SHAPE p31 (BUG-1073/1074): partial move then whole copy, and a slot addressed by
+# a VARIABLE index.
+echo "===== SHAPE p31 = partial move / variable-index slot ====="
+cell p31_partial_move_copy    reject 'move struct K31{u32 k;} struct W31{K31 t; u32 x;} void c31(K31 t){ } u32 main(){ W31 w; w.t.k = 5; K31 a = w.t; W31 w2 = w; c31(w2.t); c31(a); return 0; }'
+cell p31_partial_move_arg     reject 'move struct K31b{u32 k;} struct W31b{K31b t; u32 x;} void c31b(K31b t){ } void tk31b(W31b w){ c31b(w.t); } u32 main(){ W31b w; w.t.k = 5; K31b a = w.t; tk31b(w); c31b(a); return 0; }'
+cell p31_var_index_uaf        reject 'struct T31{u32 v;} u32 r31(u32 k){ if (k >= 4) { return 0; } ?*T31[4] arr; *T31 a = alloc(T31) orelse return; arr[k] = a; free(a); *T31 q = arr[k] orelse return; return q.v; } u32 main(){ return r31(1); }'
+cell p31_safe_var_index_loop  compile 'struct T31b{u32 v;} ?*T31b[4] t31b; u32 main(){ for (u32 i = 0; i < 4; i += 1) { *T31b a = alloc(T31b) orelse return; a.v = i; t31b[i] = a; } for (u32 i = 0; i < 4; i += 1) { *T31b q = t31b[i] orelse return; free(q); t31b[i] = null; } return 0; }'
+cell p31_safe_field_use       compile 'move struct K31c{u32 k;} struct W31c{K31c t; u32 x;} void c31c(K31c t){ } u32 main(){ W31c w; w.t.k = 5; w.x = 3; K31c a = w.t; u32 y = w.x; c31c(a); return y - 3; }'
 
 # ---------------------------------------------------------------------------
 # SHAPE p32 (BUG-1125): a GLOBAL lent to a scoped spawn, reached by a CALLEE of the

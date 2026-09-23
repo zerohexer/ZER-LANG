@@ -216,6 +216,184 @@ checks 1499 -> 1500 (the one added is BUG-1100's orelse index in
 
 ---
 
+## Session 2026-09-23c — BUG-1070..1081: no function with a `defer` was leak-checked, a leak on an early return was invisible, and eight ways an allocation's identity was lost at a use, free, copy or move sink
+
+UAF / leak / move audit of `zercheck_ir.c`, from a verified hole list (H1..H10, O1, M1, M2).
+Every negative below was run against the pre-change build (`ede0646a`, `/tmp/base_zc/zerc`) and
+COMPILED there; every hole was also shown to be real at run time (ASan / LSan, or a recycled
+slot returning another object's value). Gate: SHAPES p28..p31 in `tools/sink_matrix.sh` — 25 new
+cells, 20 of them HOLE on the pre-change build and one (`p30_safe_wrap_free_field`) an
+OVER-REJECT there.
+
+### BUG-1070 (H1) — a `defer` disabled leak detection AND the FuncSummary for the whole function
+
+**Symptom.** `u32 n = 0; defer n += 1; [*]u32 a = alloc(u32, 4) orelse return; return 0;`
+compiled (LSan: 16-byte leak). `void zap([*]u32 p) { defer cnt += 1; free(p); return; }` then
+`zap(a); free(a);` compiled (ASan: attempting double-free) — the callee's free was not in its
+summary.
+
+**Root cause.** A `return` with a pending defer lowered as `RETURN; DEFER_FIRE; GOTO` in ONE
+block, and every exit consumer (leak pass, FuncSummary builder, return-value summaries, defer
+scan, ThreadHandle check) asked "is the LAST instruction IR_RETURN?". With a defer it never was.
+ir_validate's own gap table had considered "dead code after terminator" and rejected enforcing it
+as "not a safety hole".
+
+**Fix.** A terminator is always its block's last instruction: every append goes through
+`ir_add_inst_checked` (ir_lower.c), which opens a fresh block after one, and `ir_validate` errors
+otherwise. Predecessor edges come only from REACHABLE blocks (`ir_block_succs` +
+`ir_compute_preds`), so the lowerer's dead tails no longer join an empty state into live code;
+user code written after a `return` records `IRBlock.dead_code_seed` and is analysed from the
+returning block's state (ID adjacency was used before, and gave a spliced defer body an unrelated
+return's state — a false double free on `rt_cfg_if_both_return`). Every exit consumer asks ONE
+`ir_block_is_live_return`; both passes take their entry state from ONE `ir_block_entry_state`
+(they were two hand-copied ~45-line blocks). Tests: `defer_return_leak_bug1070.zer`,
+`defer_return_summary_double_free_bug1070.zer`; p28 `leak_with_defer`, `summary_through_defer`.
+
+### BUG-1071 (H2) — a leak on an early return (or an orelse fallback, or a switch arm) was never reported
+
+**Symptom.** `[*]u32 a = alloc(u32, 4) orelse return; if (k == 1) { return 1; } free(a);` —
+compiled, LSan leak on `run(1)`. The same in a switch arm and in `*T b = alloc(T) orelse
+{ return 1; };` with `a` live.
+
+**Root cause.** Three precision devices, each hiding real leaks: (1) the if-body return blocks
+were tagged `is_early_exit` and SKIPPED by the leak check; (2) orelse-fallback blocks were
+skipped; (3) coverage was a UNION over returns — an allocation freed at ANY return counted as
+freed at every return. All three existed to avoid a false leak on the NULL path of an optional,
+which the lattice could not represent.
+
+**Fix.** Represent the null path: a BRANCH on an OPTIONAL-typed local (the lowering of `if (m)
+|x|` AND of every `orelse`) drops that local, its compounds and its alias group on the FALSE edge
+(`ir_drop_null_optional` via `ir_edge_state`). Then every reachable return is checked on its own
+state; `is_early_exit` is deleted. The FuncSummary's own-null-path rule for an optional PARAM now
+reads `IRBlock.orelse_subject_local` (recorded by the lowerer, `tag_orelse_fallback`) rather than
+the state the drop just changed. A return synthesised by a bounds AUTO-GUARD carries
+`IRInst.ret_from_guard` so its message says the guard leaks, and what to do. Leak messages now name
+the field path (`h.p`, `arr[0]`). Tests: `early_return_leak_bug1071.zer`,
+`early_return_switch_arm_leak_bug1071.zer`; p28 `leak_if_return`, `leak_orelse_fallback`,
+`leak_switch_arm`, and two SAFE cells.
+
+**Corpus (measured, compiler-classified over 2626 files).** 74 POSITIVE tests (49 `tests/zer`, 23
+`rust_tests`, 2 `test_modules`) were REAL leaks on an early-return / orelse-fallback / auto-guard
+path — every one read by hand, none a false positive (one, `g5_global_field_maybe_free_ok`, was a
+DEFINITE dangling global on its early return and is rewritten to the MAYBE shape its own comment
+claims). Each is fixed the way the diagnostic says (a `defer`, a
+free in the fallback, or reading the value before the free and returning after). Three
+`rust_tests` negatives (`rt_double_alloc_overwrite`, `rt_handle_leak_overwrite`,
+`rt_handle_overwrite_leak`) lost their FIRST diagnostic — `h = mh2 orelse return;` over an `h`
+unwrapped from a still-live `?Handle mh1` is no longer "overwritten while alive", because the
+optional still holds the allocation (BUG-1072's holder exemption); the "never freed" report on
+`mh1` at exit still rejects them. One negative is now correctly accepted and was
+promoted: `opt_param_capture_form_stays_maybe` -> `tests/zer/opt_param_capture_form_frees_ok.zer`
+(the `if (h.p) |q| { free(q); }` callee's join is now FREED, not MAYBE). Every other verdict change
+is a message change on an already-rejected negative.
+
+### BUG-1072 (H10) — an alias or slot ASSIGNMENT over a live allocation dropped it silently
+
+**Symptom.** `[*]u32 b = alloc(u32, 4) orelse return; b = a;`, `*T b = ...; b = a;`,
+`h.p = alloc(T) orelse return; h.p = a;` and `h.p = alloc(T) orelse return; h.p = alloc(T) orelse
+return;` all compiled (LSan leak). Only `x = alloc(...)` over a live `x` was checked.
+
+**Fix.** ONE query `ir_report_overwrite(zc, func, ps, prev, new_alloc_id, line)` at every site that
+writes an entry (the six allocation arms, both alloc-result registrations, IR_COPY, and the
+assignment alias / view / slice arms that never asked). It exempts escaped / move / arena
+entries, compiler temps, and an allocation still held by another user-visible entry (then the leak
+is reported at exit, on the holder). Tests: four `overwrite_*_bug1072.zer`; p29.
+
+### BUG-1073 (H9) — a move struct with a moved-out FIELD could be copied whole: two owners of one token
+
+**Symptom.** `Tok a = w.t; W w2 = w; consume(w2.t); consume(a);` compiled — also as `take(w)` and
+`w2 = w;`.
+
+**Fix.** `ir_check_partial_move` at every whole-consume sink (copy, assign, by-value argument,
+return): a TRANSFERRED move-typed child (or a MAYBE one whose path resolves to a move-carrying type,
+via `ir_compound_path_type`) refuses the consume — "use of partially moved value 'w': its field
+'.t' was moved out at line N". Tests: three `partial_move_copy_*_bug1073.zer`; p31.
+
+### BUG-1074 (H7) — a store / read at a VARIABLE index lost the allocation
+
+**Symptom.** `arr[k] = a; free(a); *T b = alloc(T) orelse return; *T q = arr[k] orelse return;
+return q.v;` compiled and returned 99 — the recycled slot's NEW object.
+
+**Fix.** A variable-index store adds the allocation to the array's WILDCARD slot
+`(root, P"[*]")` (`ir_wild_slot`); a variable-index read into a local is a VIEW of that set
+(`ir_var_index_read_alias`, `view_is_slot`); a USE through `A[i].v` consults the set
+(`ir_var_index_blocker`). A slot view is blocked only by a DEFINITELY freed member and a free
+through it does not widen, so the free-every-slot loop still compiles
+(`tests/zer/var_index_free_loop_ok.zer`). Residuals: docs/limitations.md "variable-index SLOT".
+Tests: `var_index_slot_uaf_bug1074.zer`; p31.
+
+### BUG-1075 (H5) — a multi-param return pick was honoured only at a bare-ident use
+
+**Symptom.** With `*T pick(*T x, *T y, bool c)`, `*T c = pick(d, a, false); free(a); u32 r = c.v;`
+(a FIELD read), `*T e = c;` (a COPY), and `free(c); free(a);` (a double free — ASan confirmed on
+the slice form) all compiled. `ir_check_ident_uaf` was the only sink that read the view set.
+
+**Fix.** ONE use query `ir_use_blocker` (FIELD_READ walk, IR_COPY source, ident use) and ONE free
+query `ir_view_free_barrier` (a FREED member is a double free; an ALIVE member widens to
+MAYBE_FREED — the argument-precise barrier). Tests: seven `multi_view_*_bug1075.zer`; p30.
+
+### BUG-1076 (H4) — a callee freeing a FIELD of its param was invisible through a pointer VIEW
+
+**Symptom.** `void zap(*H h) { free(h.p); }` then `*H hp = &h; zap(hp); ... h.p.v` compiled and
+returned 99; also through an intermediate `*H x = h; zap(x);` and `free(x.p)` in the callee.
+
+**Fix.** At the call, a BARE pointer view hands over the slots of its `view_root_local`; inside the
+callee, a pointer COPY of a stable pointer-to-aggregate PARAM (`ir_is_stable_aggregate_ptr_param`,
+gated by the Level B `ast_name_mutated_or_addrd` walk) re-roots its projections onto the param, so
+the field free reaches the summary. Tests: three `callee_frees_field_*_bug1076.zer`; p30.
+
+### BUG-1077 (H8) — an AST-path defer (a function with a label) firing more than once double-freed silently
+
+**Symptom.** In a function containing a label, `while (i < 2) { defer free(a); i += 1; }` and a
+block with `defer free(a)` re-entered by a backward `goto` compiled.
+
+**Fix.** Each IR_DEFER_FIRE application in the forward pass gets a firing TOKEN; a deferred free of
+a handle already freed by a DIFFERENT firing, or MAYBE_FREED, is a double free ("a defer in a loop
+or re-entered by a backward goto fires once per pass"). The per-body id rule is kept for the Phase
+C3 re-application and for the plt86m cleanup-label guard (`if (!flag)`, complementary to the eager
+fire). Tests: two `defer_*_double_free_bug1077.zer`.
+
+### BUG-1078 (O1) — `Tok b = pass(a); b.k` was refused as a use-after-move of a compiler temp
+
+Over-rejection: the MOVE result of a call was aliased to the consumed argument and inherited its
+TRANSFERRED state. The result is a fresh sole owner now. Tests: `move_pass_through_ok.zer`,
+`move_pass_through_assign_ok.zer`.
+
+### BUG-1079 (M1, M2) — two diagnostics described code the user did not write
+
+M1: an allocation assigned to a local that is never read said "ghost handle: allocation discarded
+... never assigned" — it WAS assigned; now "allocated at line N but never used or freed — remove
+the allocation, or free it". M2: `free(a)` inside `@critical` named `Task.free_ptr()`, the
+desugared form; `auto_slab_method_label` now names what the user wrote, and the remedy says
+"move the call outside @critical". Tests: `alloc_never_used_message_bug1079.zer`,
+`free_in_critical_message_bug1079.zer`.
+
+### BUG-1080 (H6) — a struct-returning wrapper did not carry the param's allocation in its FIELD
+
+**Symptom.** `H mk(*T a) { H h = { .p = a }; return h; }` then `H h = mk(a); free(a); return
+h.p.v;` compiled (read freed memory); `free(h.p); ... a[0]` compiled (ASan heap-use-after-free);
+and the correct `free(h.p)` release was a FALSE leak of `a`.
+
+**Fix.** `FuncSummary.ret_field` — per live return, which field of the returned local holds which
+param's allocation, a UNION over the returns; a pair on EVERY return (ALIVE) is MUST and makes
+`(dest, path)` an ALIAS at the call site, any other pair makes it a VIEW (so `mk(*T a, bool c)`
+returning `{ .p = a }` on one path and `{ .p = &gt }` on the other still refuses `h.p.v` after
+`free(a)`). ONE `ir_apply_ret_field_views` for the var-decl and assignment spellings; a param gets
+an identity at first need (`ir_param_identity`). Arena array, no cap. Residual (array-element
+holder): docs/limitations.md. Tests: four `struct_wrapper_return_*_bug1080.zer`,
+`struct_wrapper_return_ok.zer`, `struct_wrapper_return_may_field_ok.zer`; p30.
+
+### BUG-1081 — BUG-1055's one-binding walk stopped at expressions (found by the walker field audit)
+
+`ast_name_bind_count` (landed with BUG-1055 in `ede0646a`) classified every expression kind as
+"binds nothing" and did not descend it — but an expression can hold a STATEMENT body, the orelse
+block. A second `bool c` declared inside `none() orelse { bool c = ...; if (!c) { a.v } }` was
+not counted, the name looked like one stable guard, and Level B accepted the read of a freed `a`
+(the base build reported only a leak on that file). `tools/audit_walker_fields.sh` had flagged
+all 36 undescended fields and `make check` was RED at that gate on `ede0646a` itself. Every
+expression child is descended now; the four declaration kinds (which return the conservative
+2) are baselined with that justification. Test: `guard_rebound_in_orelse_block_bug1081.zer`.
+
 ## Session 2026-09-23b — BUG-1060..1068: seven silent value miscompiles and one unsatisfiable guard in the integer/float emission helpers, each one question answered at N sites
 
 Fix session over an auditor's probe set (value semantics of @saturate, literals, iN

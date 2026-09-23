@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: overwritten while alive
+// BUG-1072 (H10): pointer spelling of the alias-overwrite leak.
+struct T { u32 v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    defer free(a);
+    *T b = alloc(T) orelse return;
+    b = a;
+    return b.v;
+}

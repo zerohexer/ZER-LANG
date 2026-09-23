@@ -2713,8 +2713,13 @@ only (targets in range, no duplicate local IDs). Hardened with:
 **For fresh sessions / when editing `ir_lower.c`:**
 - If new IR op added, add a field-invariant case in `ir_validate`'s
   `switch(inst->op)` (around `ir.c:445`).
-- Don't try to enforce "dead code after terminator" — lowerer emits
-  legitimate `RETURN; DEFER_FIRE; GOTO bb_post` cleanup patterns.
+- **A terminator is ALWAYS the last instruction of its block — ENFORCED since
+  BUG-1070 (2026-09-23c).** The old `RETURN; DEFER_FIRE; GOTO bb_post` shape
+  made "last instruction is IR_RETURN" false for every function with a defer,
+  and the leak pass + FuncSummary builder silently skipped all of them. Every
+  append goes through `ir_add_inst_checked` (opens a fresh block after a
+  terminator); `ir_validate` errors on anything after one. Exit consumers ask
+  `ir_block_is_live_return`, never "last op == RETURN" by hand.
 - Don't try to enforce "reachability" as error — see above.
 - Defer push without reachable fire = **hard error**, aborts compile.
   If a lowerer change trips this, investigate the push path.

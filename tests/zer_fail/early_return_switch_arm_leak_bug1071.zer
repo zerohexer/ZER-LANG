@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1071 (H2): the same early-exit skip covered a `return` inside a SWITCH ARM —
+// mode .fast returns with `a` still allocated while the other arms fall through
+// to the free.
+enum Mode { slow, fast, off }
+struct T { u32 v; }
+u32 run(Mode m) {
+    *T a = alloc(T) orelse return;
+    a.v = 1;
+    switch (m) {
+        .slow => { a.v = 2; }
+        .fast => { return 1; }
+        .off => { a.v = 3; }
+    }
+    free(a);
+    return 0;
+}
+u32 main() { return run(Mode.fast) - 1; }

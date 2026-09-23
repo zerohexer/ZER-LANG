@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: may already be freed
+// BUG-1075 (H5): FREE sink — `free(c)` of a view, then `free(a)` of a member.
+// Pre-fix: compiled.
+struct T { u32 v; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T d = alloc(T) orelse { free(a); return 1; };
+    a.v = 7;
+    *T c = pick(d, a, false);
+    free(c);
+    free(a);
+    free(d);
+    return 0;
+}

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: may be a view of
+// BUG-1075 (H5): same, with the freed member in the FIRST param position.
+struct T { u32 v; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T d = alloc(T) orelse { free(a); return 1; };
+    a.v = 7;
+    *T c = pick(a, d, false);
+    free(a);
+    u32 r = c.v;
+    free(d);
+    return r;
+}

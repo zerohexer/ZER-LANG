@@ -14,8 +14,9 @@ u32 main() {
     ?Handle(Task) mh = tasks.alloc();
     Handle(Task) h = mh orelse return;
     tasks.get(h).id = 42;
-    if (tasks.get(h).id != 42) { return 1; }
-    tasks.free(h);
+    u32 got = tasks.get(h).id;
+    tasks.free(h);                       // BUG-1071: before the early return
+    if (got != 42) { return 1; }
 
     // Buffer has 32 bytes
     buffer[0] = 1;

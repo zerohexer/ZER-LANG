@@ -14,8 +14,9 @@ u32 main() {
     // Pool with comptime size
     Handle(Item) h = items.alloc() orelse { return 1; };
     items.get(h).val = 42;
-    if (items.get(h).val != 42) { return 2; }
+    u32 got = items.get(h).val;
     items.free(h);
+    if (got != 42) { return 2; }
 
     // Ring with comptime size
     Msg m;

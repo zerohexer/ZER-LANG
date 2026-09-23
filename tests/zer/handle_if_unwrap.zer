@@ -8,9 +8,11 @@ u32 main() {
     if (maybe) |t| {
         t.id = 42;
         t.priority = 3;
-        if (t.id != 42) { return 1; }
-        if (t.priority != 3) { return 2; }
+        u32 id = t.id;
+        u32 pri = t.priority;
         heap.free(t);
+        if (id != 42) { return 1; }
+        if (pri != 3) { return 2; }
     }
     return 0;
 }

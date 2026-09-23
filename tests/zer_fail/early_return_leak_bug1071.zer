@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1071 (H2): a return inside an if-body was tagged "early exit" and skipped by
+// the leak check, on the reasoning that another path frees. A leak is per PATH —
+// run(1) returns with `a` still allocated. Pre-fix: compiled, LSan leak.
+u32 run(u32 k) {
+    [*]u32 a = alloc(u32, 4) orelse return;
+    a[0] = 5;
+    if (k == 1) { return 1; }
+    free(a);
+    return 0;
+}
+u32 main() { return run(1) - 1; }

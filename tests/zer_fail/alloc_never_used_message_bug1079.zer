@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: never used or freed
+// BUG-1079 (M1): an allocation assigned to a local that is then never read was
+// reported as "discarded ... never assigned" — which describes the bare-expression
+// form the checker already refuses. The result WAS assigned; it was never used.
+struct T { u32 v; }
+Pool(T, 4) pool;
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    return 0;
+}

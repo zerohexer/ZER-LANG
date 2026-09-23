@@ -1,0 +1,10 @@
+// BUG-1078 (O1): `Tok b = pass(a); b.k` was refused as a use-after-move — the
+// call-result temp was marked transferred along with `a`. The result is a FRESH owner.
+move struct Tok { u32 k; }
+Tok pass(Tok t) { return t; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    Tok b = pass(a);
+    return b.k - 3;
+}

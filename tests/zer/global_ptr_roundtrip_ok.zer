@@ -31,7 +31,7 @@ u32 s3() {
     *Item p = heap.alloc_ptr() orelse return;
     g_ptr = p;
     heap.free_ptr(p);
-    *Item q = heap.alloc_ptr() orelse return;
+    *Item q = heap.alloc_ptr() orelse { g_ptr = null; return 0; };   // BUG-1071: g_ptr dangles here
     q.value = 3;
     g_ptr = q;
     *Item gp = g_ptr orelse return;

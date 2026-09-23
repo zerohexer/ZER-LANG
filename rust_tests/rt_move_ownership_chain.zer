@@ -18,9 +18,10 @@ u32 main() {
     Handle(Triple) baz = bar;
     Handle(Triple) quux = baz;
 
-    if (pool.get(quux).c != 3) { return 1; }
-    if (pool.get(quux).a != 1) { return 2; }
-
-    pool.free(quux);
+    u32 c = pool.get(quux).c;
+    u32 a = pool.get(quux).a;
+    pool.free(quux);                     // BUG-1071: before the early returns
+    if (c != 3) { return 1; }
+    if (a != 1) { return 2; }
     return 0;
 }

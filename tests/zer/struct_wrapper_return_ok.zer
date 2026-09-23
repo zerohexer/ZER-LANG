@@ -1,0 +1,13 @@
+// BUG-1080 boundary: freeing through the RETURNED field is the correct release of
+// the param's allocation. Pre-fix this was a false leak of `a`.
+struct T { u32 v; }
+struct H { *T p; }
+H mk(*T a) { H h = { .p = a }; return h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = mk(a);
+    u32 r = h.p.v;
+    free(h.p);
+    return r - 7;
+}

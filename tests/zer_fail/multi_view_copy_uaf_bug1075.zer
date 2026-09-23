@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: may be a view of
+// BUG-1075 (H5): COPY sink — `*T e = c;` of a view whose member is freed.
+struct T { u32 v; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T d = alloc(T) orelse { free(a); return 1; };
+    *T c = pick(d, a, false);
+    free(a);
+    *T e = c;
+    u32 r = e.v;
+    free(d);
+    return r;
+}

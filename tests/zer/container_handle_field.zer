@@ -22,6 +22,7 @@ u32 main() {
     s.used = false;
 
     Handle(Task) h = pool.alloc() orelse { return 1; };
+    defer pool.free(h);   // every early return below frees it too
     h.id = 7;
     h.pri = 3;
 
@@ -34,7 +35,6 @@ u32 main() {
     s.h.id = 9;                          // write through the field
     if (h.id != 9)    { return 4; }      // visible via the original handle
 
-    pool.free(h);
     if (!s.used)      { return 5; }
     return 0;
 }

@@ -6,18 +6,22 @@ struct Sensor { u32 val; }
 u32 main() {
     // Handle with bare orelse
     Handle(Task) t1 = Task.alloc() orelse return;
+    defer Task.free(t1);   // BUG-1071: also on the early returns below
     t1.id = 10;
 
     // Handle with block orelse
     Handle(Task) t2 = Task.alloc() orelse { return 1; };
+    defer Task.free(t2);
     t2.id = 20;
 
     // Pointer with bare orelse
     *Sensor s1 = alloc(Sensor) orelse return;
+    defer free(s1);
     s1.val = 100;
 
     // Pointer with block orelse
     *Sensor s2 = alloc(Sensor) orelse { return 2; };
+    defer free(s2);
     s2.val = 200;
 
     // Verify all values
@@ -26,9 +30,5 @@ u32 main() {
     if (s1.val != 100) { return 5; }
     if (s2.val != 200) { return 6; }
 
-    Task.free(t1);
-    Task.free(t2);
-    free(s1);
-    free(s2);
     return 0;
 }

@@ -1018,6 +1018,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                                       const char **out_name, uint32_t *out_len);
 static void ensure_func_props(Checker *c, Symbol *fn);
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth);
+static void check_call_vs_lent_globals(Checker *c, Node *call);   /* BUG-1125 */
 static Symbol *atomic_scalar_global_target(Checker *c, Node *e);
 static bool atomic_path_key(Checker *c, Node *e, Symbol **out_s,
                             const char **out_path, uint32_t *out_len);
@@ -4302,6 +4303,27 @@ static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
         if (callee->kind == NODE_INDEX) return true;
         Node *obj = callee->field.object;
         if (obj && obj->kind == NODE_IDENT) {
+            /* BUG-1125: a LOCAL (or param) object with a declared type answers the
+             * question without a typemap entry: a ThreadHandle's `join` is a
+             * method, and a struct's field is a funcptr exactly when its declared
+             * type is one. Only an object the scope cannot type falls through to
+             * the rounding below. */
+            Symbol *ls = scope_lookup(c->current_scope, obj->ident.name,
+                                      (uint32_t)obj->ident.name_len);
+            if (ls && ls->is_thread_handle) return false;
+            if (ls && ls->type && !ls->is_function) {
+                Type *ot = type_unwrap_distinct(ls->type);
+                if (ot && type_dispatch_kind(ot) == TYPE_POINTER)
+                    ot = type_unwrap_distinct(ot->pointer.inner);
+                if (ot && type_dispatch_kind(ot) == TYPE_STRUCT) {
+                    for (uint32_t fi = 0; fi < ot->struct_type.field_count; fi++) {
+                        SField *sf = &ot->struct_type.fields[fi];
+                        if (sf->name_len == (uint32_t)callee->field.field_name_len &&
+                            memcmp(sf->name, callee->field.field_name, sf->name_len) == 0)
+                            return type_dispatch_kind(sf->type) == TYPE_FUNC_PTR;
+                    }
+                }
+            }
             Symbol *os = global_decl_lookup(c, obj->ident.name,
                                       (uint32_t)obj->ident.name_len);
             if (os && os->type) {
@@ -10561,6 +10583,7 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Function call ---- */
     case NODE_CALL: {
+        check_call_vs_lent_globals(c, node);   /* BUG-1125 */
         /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
          * descend the callee and record its plain global accesses, so moving a
          * statement into a helper cannot change whether it races. The post-check
@@ -22598,6 +22621,22 @@ static void check_stmt(Checker *c, Node *node) {
                         continue;
                     }
                     vs->is_borrowed_by_thread = true;
+                    if (vglobal) {   /* BUG-1125: the parent's CALLEES are checked too */
+                        if (c->lent_global_count >= c->lent_global_cap) {
+                            int nc = c->lent_global_cap ? c->lent_global_cap * 2 : 8;
+                            Symbol **nl = (Symbol **)arena_alloc(c->arena,
+                                (size_t)nc * sizeof(Symbol *));
+                            if (nl) {
+                                if (c->lent_global_count)
+                                    memcpy(nl, c->lent_globals,
+                                           (size_t)c->lent_global_count * sizeof(Symbol *));
+                                c->lent_globals = nl;
+                                c->lent_global_cap = nc;
+                            }
+                        }
+                        if (c->lent_global_count < c->lent_global_cap)
+                            c->lent_globals[c->lent_global_count++] = vs;
+                    }
                     /* D7: record EVERY borrow (was: first only, then `break`), so
                      * join() releases each. First entry mirrors the legacy field. */
                     if (sym->th_borrow_names && sym->th_borrow_lens &&
@@ -23988,6 +24027,8 @@ static void check_func_body(Checker *c, Node *node) {
         bool saved_unbounded = c->unbounded_spawn_in_func;
         c->live_scoped_threads = 0;
         c->unbounded_spawn_in_func = false;
+        int saved_lent_globals = c->lent_global_count;
+        c->lent_global_count = 0;   /* BUG-1125 */
         /* Stage 1->2 escape summary: start complete with an empty param mask;
          * the NODE_RETURN handler classifies each valued return below (UNKNOWN
          * clears `complete`, ARParam(n) sets mask bit n; read into the Symbol
@@ -24016,6 +24057,7 @@ static void check_func_body(Checker *c, Node *node) {
         c->after_spawn_in_func = saved_after_spawn;
         c->live_scoped_threads = saved_live_threads;
         c->unbounded_spawn_in_func = saved_unbounded;
+        c->lent_global_count = saved_lent_globals;   /* BUG-1125 */
         c->in_comptime_body = saved_comptime;
         c->in_async = saved_async;
         c->in_naked = false;
@@ -25717,133 +25759,281 @@ static Symbol *atomic_scalar_global_target(Checker *c, Node *e) {
  *
  * Partial if/switch walk with an explicit `default: return` — an unrecognised
  * kind records NOTHING, i.e. today's behaviour, never a new rejection. */
-static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
-    /* BUG-976: WIDENED from 8 to 32 rather than flipped, and the difference matters.
-     * This walk RECORDS which globals are touched plainly so the atomic-cell rule can
-     * NAME the cell; there is no conservative value to return, because "assume every
-     * global is an atomic cell" would reject essentially every program. When a
-     * fail-open cap cannot be flipped, the remedy is a cap past anything real — 32
-     * matches the spawn and ISR scans, which descend the same call graphs. */
-    if (!node || depth > 32) return;
+/* ONE walk for "which globals does this code name — including through every
+ * function it calls directly?" (2026-09-23, BUG-1125). It was
+ * record_atomic_plain_in_callee, the G3 walk that feeds the atomic-cell rule; the
+ * scoped-spawn borrow needed the same question (does a call made while a global
+ * is LENT reach that global?) and a second walker would be the two-coverage drift
+ * BUG-999 removed from expr_mentions_name. Clients differ only in the visitor, in
+ * whether `@atomic_*`'s first argument counts (the atomic rule blesses it, a
+ * borrow does not), and in whether an unresolvable call is reported.
+ *
+ * TERMINATION is a visited set over function BODIES, not a depth cap: the call
+ * graph is finite, so every body is walked at most once. The old cap of 32
+ * returned silently past it (BUG-976 widened it rather than flipped it because
+ * this walk records names and has no conservative value) — a set has no cap to
+ * be past. */
+typedef struct CalleeGlobalWalk {
+    void (*visit)(Checker *c, Symbol *g, int line, void *ud);
+    void (*on_opaque_call)(Checker *c, Node *call, void *ud);   /* NULL = ignore */
+    void *ud;
+    bool skip_atomic_target;
+    Node **seen;
+    int seen_count, seen_cap;
+    Node *seen_stack[16];
+} CalleeGlobalWalk;
+
+static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w);
+
+static void callee_global_walk_init(CalleeGlobalWalk *w) {
+    w->seen = w->seen_stack;
+    w->seen_count = 0;
+    w->seen_cap = (int)(sizeof(w->seen_stack) / sizeof(w->seen_stack[0]));
+}
+
+static void walk_callee_globals_body(Checker *c, Node *body, CalleeGlobalWalk *w) {
+    if (!body) return;
+    for (int i = 0; i < w->seen_count; i++)
+        if (w->seen[i] == body) return;
+    if (w->seen_count >= w->seen_cap) {
+        int nc = w->seen_cap * 2;
+        Node **nb = (Node **)arena_alloc(c->arena, (size_t)nc * sizeof(Node *));
+        if (!nb) return;
+        memcpy(nb, w->seen, (size_t)w->seen_count * sizeof(Node *));
+        w->seen = nb;
+        w->seen_cap = nc;
+    }
+    w->seen[w->seen_count++] = body;
+    walk_callee_globals(c, body, w);
+}
+
+static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
+    if (!node) return;
     switch (node->kind) {
     case NODE_IDENT: {
         Symbol *gs = global_decl_lookup(c, node->ident.name,
                                   (uint32_t)node->ident.name_len);
         if (gs && !gs->is_function)
-            record_atomic_plain_write(c, gs, node->loc.line);
+            w->visit(c, gs, node->loc.line, w->ud);
         return;
     }
     case NODE_INTRINSIC: {
         bool atomic_intr = (node->intrinsic.name_len >= 7 &&
                             memcmp(node->intrinsic.name, "atomic_", 7) == 0);
         for (int i = 0; i < node->intrinsic.arg_count; i++) {
-            if (atomic_intr && i == 0) continue;   /* blessed target */
-            record_atomic_plain_in_callee(c, node->intrinsic.args[i], depth);
+            if (w->skip_atomic_target && atomic_intr && i == 0) continue;   /* blessed target */
+            walk_callee_globals(c, node->intrinsic.args[i], w);
         }
         return;
     }
     case NODE_CALL: {
         for (int i = 0; i < node->call.arg_count; i++)
-            record_atomic_plain_in_callee(c, node->call.args[i], depth);
+            walk_callee_globals(c, node->call.args[i], w);
         /* BUG-820: same gap — a plain (non-atomic) access to an atomic cell hiding
          * in the callee EXPRESSION rather than in an argument. */
         if (node->call.callee && node->call.callee->kind != NODE_IDENT)
-            record_atomic_plain_in_callee(c, node->call.callee, depth);
+            walk_callee_globals(c, node->call.callee, w);
         if (node->call.callee && node->call.callee->kind == NODE_IDENT) {
             Symbol *cs = global_decl_lookup(c, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
                 cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
-                record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, depth + 1);
+                walk_callee_globals_body(c, cs->func_node->func_decl.body, w);
         }
+        if (w->on_opaque_call && callee_is_opaque_funcptr(c, node->call.callee))
+            w->on_opaque_call(c, node, w->ud);
         return;
     }
     case NODE_ASSIGN:
-        record_atomic_plain_in_callee(c, node->assign.target, depth);
-        record_atomic_plain_in_callee(c, node->assign.value, depth);
+        walk_callee_globals(c, node->assign.target, w);
+        walk_callee_globals(c, node->assign.value, w);
         return;
-    case NODE_FIELD:  record_atomic_plain_in_callee(c, node->field.object, depth); return;
+    case NODE_FIELD:  walk_callee_globals(c, node->field.object, w); return;
     case NODE_INDEX:
-        record_atomic_plain_in_callee(c, node->index_expr.object, depth);
-        record_atomic_plain_in_callee(c, node->index_expr.index, depth);
+        walk_callee_globals(c, node->index_expr.object, w);
+        walk_callee_globals(c, node->index_expr.index, w);
         return;
-    case NODE_UNARY:  record_atomic_plain_in_callee(c, node->unary.operand, depth); return;
+    case NODE_UNARY:  walk_callee_globals(c, node->unary.operand, w); return;
     case NODE_BINARY:
-        record_atomic_plain_in_callee(c, node->binary.left, depth);
-        record_atomic_plain_in_callee(c, node->binary.right, depth);
+        walk_callee_globals(c, node->binary.left, w);
+        walk_callee_globals(c, node->binary.right, w);
         return;
-    case NODE_VAR_DECL: record_atomic_plain_in_callee(c, node->var_decl.init, depth); return;
-    case NODE_RETURN:   record_atomic_plain_in_callee(c, node->ret.expr, depth); return;
-    case NODE_EXPR_STMT: record_atomic_plain_in_callee(c, node->expr_stmt.expr, depth); return;
+    case NODE_VAR_DECL: walk_callee_globals(c, node->var_decl.init, w); return;
+    case NODE_RETURN:   walk_callee_globals(c, node->ret.expr, w); return;
+    case NODE_EXPR_STMT: walk_callee_globals(c, node->expr_stmt.expr, w); return;
     /* --- child-carriers that the original `default:` silently skipped (2026-08-10).
      * Each of these can hold a plain atomic-cell access in a helper body; without
      * them the access was never recorded and the race slipped. --- */
     case NODE_SWITCH:
-        record_atomic_plain_in_callee(c, node->switch_stmt.expr, depth);
+        walk_callee_globals(c, node->switch_stmt.expr, w);
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             SwitchArm *a = &node->switch_stmt.arms[i];
             for (int j = 0; j < a->value_count; j++)
-                record_atomic_plain_in_callee(c, a->values[j], depth);
-            record_atomic_plain_in_callee(c, a->body, depth);
+                walk_callee_globals(c, a->values[j], w);
+            walk_callee_globals(c, a->body, w);
         }
         return;
-    case NODE_DEFER:    record_atomic_plain_in_callee(c, node->defer.body, depth); return;
-    case NODE_CRITICAL: record_atomic_plain_in_callee(c, node->critical.body, depth); return;
-    case NODE_ONCE:     record_atomic_plain_in_callee(c, node->once.body, depth); return;
+    case NODE_DEFER:    walk_callee_globals(c, node->defer.body, w); return;
+    case NODE_CRITICAL: walk_callee_globals(c, node->critical.body, w); return;
+    case NODE_ONCE:     walk_callee_globals(c, node->once.body, w); return;
     case NODE_SPAWN:
         for (int i = 0; i < node->spawn_stmt.arg_count; i++)
-            record_atomic_plain_in_callee(c, node->spawn_stmt.args[i], depth);
+            walk_callee_globals(c, node->spawn_stmt.args[i], w);
         return;
     case NODE_DO_WHILE:
-        record_atomic_plain_in_callee(c, node->while_stmt.cond, depth);
-        record_atomic_plain_in_callee(c, node->while_stmt.body, depth);
+        walk_callee_globals(c, node->while_stmt.cond, w);
+        walk_callee_globals(c, node->while_stmt.body, w);
         return;
     case NODE_ORELSE:
-        record_atomic_plain_in_callee(c, node->orelse.expr, depth);
-        record_atomic_plain_in_callee(c, node->orelse.fallback, depth);
+        walk_callee_globals(c, node->orelse.expr, w);
+        walk_callee_globals(c, node->orelse.fallback, w);
         return;
     case NODE_SLICE:
-        record_atomic_plain_in_callee(c, node->slice.object, depth);
-        record_atomic_plain_in_callee(c, node->slice.start, depth);
-        record_atomic_plain_in_callee(c, node->slice.end, depth);
+        walk_callee_globals(c, node->slice.object, w);
+        walk_callee_globals(c, node->slice.start, w);
+        walk_callee_globals(c, node->slice.end, w);
         return;
     case NODE_STRUCT_INIT:
         for (int i = 0; i < node->struct_init.field_count; i++)
-            record_atomic_plain_in_callee(c, node->struct_init.fields[i].value, depth);
+            walk_callee_globals(c, node->struct_init.fields[i].value, w);
         return;
-    case NODE_TYPECAST: record_atomic_plain_in_callee(c, node->typecast.expr, depth); return;
-    case NODE_AWAIT:    record_atomic_plain_in_callee(c, node->await_stmt.cond, depth); return;
+    case NODE_TYPECAST: walk_callee_globals(c, node->typecast.expr, w); return;
+    case NODE_AWAIT:    walk_callee_globals(c, node->await_stmt.cond, w); return;
     /* --- leaves and declarations: nothing to descend. ENUMERATED, not `default:`,
      * so a NEW NodeKind fails the -Werror=switch build instead of being skipped. --- */
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_YIELD: case NODE_ASM: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_YIELD: case NODE_SIZEOF: case NODE_CAST:
     case NODE_STATIC_ASSERT:
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
         return;
+    case NODE_ASM:
+        /* An operand binding is a ZER expression: `inputs: { "rax" = counter }`
+         * reads the global as surely as `u32 v = counter;` does. */
+        for (int i = 0; i < node->asm_stmt.input_count; i++)
+            walk_callee_globals(c, node->asm_stmt.inputs[i].expr, w);
+        for (int i = 0; i < node->asm_stmt.output_count; i++)
+            walk_callee_globals(c, node->asm_stmt.outputs[i].expr, w);
+        return;
     case NODE_BLOCK:
         for (int i = 0; i < node->block.stmt_count; i++)
-            record_atomic_plain_in_callee(c, node->block.stmts[i], depth);
+            walk_callee_globals(c, node->block.stmts[i], w);
         return;
     case NODE_IF:
-        record_atomic_plain_in_callee(c, node->if_stmt.cond, depth);
-        record_atomic_plain_in_callee(c, node->if_stmt.then_body, depth);
-        record_atomic_plain_in_callee(c, node->if_stmt.else_body, depth);
+        walk_callee_globals(c, node->if_stmt.cond, w);
+        walk_callee_globals(c, node->if_stmt.then_body, w);
+        walk_callee_globals(c, node->if_stmt.else_body, w);
         return;
     case NODE_WHILE:
-        record_atomic_plain_in_callee(c, node->while_stmt.cond, depth);
-        record_atomic_plain_in_callee(c, node->while_stmt.body, depth);
+        walk_callee_globals(c, node->while_stmt.cond, w);
+        walk_callee_globals(c, node->while_stmt.body, w);
         return;
     case NODE_FOR:
-        record_atomic_plain_in_callee(c, node->for_stmt.init, depth);
-        record_atomic_plain_in_callee(c, node->for_stmt.cond, depth);
-        record_atomic_plain_in_callee(c, node->for_stmt.step, depth);
-        record_atomic_plain_in_callee(c, node->for_stmt.body, depth);
+        walk_callee_globals(c, node->for_stmt.init, w);
+        walk_callee_globals(c, node->for_stmt.cond, w);
+        walk_callee_globals(c, node->for_stmt.step, w);
+        walk_callee_globals(c, node->for_stmt.body, w);
         return;
+    }
+}
+
+static void atomic_plain_visit(Checker *c, Symbol *g, int line, void *ud) {
+    (void)ud;
+    record_atomic_plain_write(c, g, line);
+}
+static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
+    (void)depth;
+    CalleeGlobalWalk w;
+    memset(&w, 0, sizeof(w));
+    callee_global_walk_init(&w);
+    w.visit = atomic_plain_visit;
+    w.skip_atomic_target = true;
+    walk_callee_globals_body(c, node, &w);
+}
+
+/* BUG-1125: a global LENT to a scoped spawn (BUG-1118) is refused to the parent's
+ * own statements until join(), and was NOT refused to the functions the parent
+ * CALLS in that window:
+ *
+ *     ThreadHandle th = spawn worker(&counter);
+ *     bump();          // void bump() { counter += 1; }   -- raced, compiled clean
+ *     th.join();
+ *
+ * Moving a statement into a helper must not change whether it races (the G3
+ * rule, same shape). Ask the one callee walk whether the call reaches a lent
+ * global; an unresolvable call (a funcptr) could reach any of them, so while a
+ * global is lent it is refused too — argument-precise would need the funcptr's
+ * target set, which the analysis does not have. */
+typedef struct { Symbol *hit; Node *opaque; } LentHitUd;
+static void lent_global_visit(Checker *c, Symbol *g, int line, void *ud) {
+    (void)line;
+    LentHitUd *u = (LentHitUd *)ud;
+    if (u->hit || !g || !g->is_borrowed_by_thread) return;
+    for (int i = 0; i < c->lent_global_count; i++)
+        if (c->lent_globals[i] == g) { u->hit = g; return; }
+}
+static void lent_opaque_visit(Checker *c, Node *call, void *ud) {
+    (void)c;
+    LentHitUd *u = (LentHitUd *)ud;
+    if (!u->opaque) u->opaque = call;
+}
+static void check_call_vs_lent_globals(Checker *c, Node *call) {
+    if (!call || c->lent_global_count == 0) return;
+    bool any_live = false;
+    for (int i = 0; i < c->lent_global_count; i++)
+        if (c->lent_globals[i]->is_borrowed_by_thread) { any_live = true; break; }
+    if (!any_live) return;
+    Node *callee = call->call.callee;
+    const char *cn = "the callee";
+    int cnl = 10;
+    if (callee && callee->kind == NODE_IDENT) {
+        cn = callee->ident.name;
+        cnl = (int)callee->ident.name_len;
+    }
+    if (callee_is_opaque_funcptr(c, callee)) {
+        Symbol *g = NULL;
+        for (int i = 0; i < c->lent_global_count && !g; i++)
+            if (c->lent_globals[i]->is_borrowed_by_thread) g = c->lent_globals[i];
+        checker_error(c, call->loc.line,
+            "cannot call through a function pointer while '%.*s' is lent to a scoped "
+            "spawn — the target is unknown and may access it while the thread does "
+            "(data race). join() first, or call the function by name",
+            (int)g->name_len, g->name);
+        return;
+    }
+    if (!callee || callee->kind != NODE_IDENT) return;
+    Symbol *fs = global_decl_lookup(c, callee->ident.name, (uint32_t)callee->ident.name_len);
+    if (!fs || !fs->is_function || !fs->func_node ||
+        fs->func_node->kind != NODE_FUNC_DECL || !fs->func_node->func_decl.body)
+        return;
+    LentHitUd u = { NULL, NULL };
+    CalleeGlobalWalk w;
+    memset(&w, 0, sizeof(w));
+    callee_global_walk_init(&w);
+    w.visit = lent_global_visit;
+    w.on_opaque_call = lent_opaque_visit;
+    w.ud = &u;
+    w.skip_atomic_target = false;   /* an atomic access still races the thread's plain one */
+    walk_callee_globals_body(c, fs->func_node->func_decl.body, &w);
+    if (u.hit) {
+        checker_error(c, call->loc.line,
+            "cannot call '%.*s' while '%.*s' is lent to a scoped spawn — '%.*s' "
+            "(or a function it calls) accesses it while the thread does (data race). "
+            "join() first",
+            cnl, cn, (int)u.hit->name_len, u.hit->name, cnl, cn);
+    } else if (u.opaque) {
+        Symbol *g = NULL;
+        for (int i = 0; i < c->lent_global_count && !g; i++)
+            if (c->lent_globals[i]->is_borrowed_by_thread) g = c->lent_globals[i];
+        checker_error(c, call->loc.line,
+            "cannot call '%.*s' while '%.*s' is lent to a scoped spawn — it makes a "
+            "call through a function pointer (line %d) whose target is unknown and may "
+            "access it while the thread does (data race). join() first",
+            cnl, cn, (int)g->name_len, g->name, u.opaque->loc.line);
     }
 }
 

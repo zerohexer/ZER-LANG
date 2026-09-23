@@ -100,14 +100,15 @@ C99 4.6 guarantees only the freestanding headers; a `-nostdinc` bare-metal toolc
 emitted code uses `memcpy`/`memset` in both modes, so the fix is to gate stdio/stdlib on
 `_ZER_HOSTED` and route mem* through `__builtin_memcpy`/`__builtin_memset`.
 
-## OPEN — a global lent to a scoped spawn is not protected from the parent's CALLEES (2026-09-23, LOW/MEDIUM — accept-side residual of BUG-1118)
+## CLOSED 2026-09-23 (BUG-1125) — a global lent to a scoped spawn, reached by the parent's CALLEES
 
-BUG-1118 borrows a global handed by pointer to a scoped spawn, so the PARENT's own access before
-`join()` is refused. A function the parent calls during the window that names the global
-(`void bump() { counter += 1; }`) is not checked against the borrow — per-statement borrow
-tracking cannot see into callee bodies. Fix sketch: at a call made while a GLOBAL is borrowed,
-ask the spawn scan's reachability (`scan_unsafe_global_access` over the callee) whether it names
-that global; refuse if so.
+A call made while a global is lent (BUG-1118) asks ONE callee walk — `walk_callee_globals`,
+the G3 atomic-cell walk generalized with a visitor — whether it reaches that global, directly
+or through any function it calls; a call through a function pointer is refused while a global
+is lent (its target is unknown). The walk terminates by a visited set over bodies, not a depth
+cap. Gate: SHAPE p32 in `tools/sink_matrix.sh` (6 of its reject cells are holes on the pre-fix
+build). Corpus: 0 verdict changes over 2580 files. Residual (precision): the name match is
+lexical, so a callee LOCAL that shadows the lent global's name is over-rejected.
 
 ## OPEN — three RMW-reach residuals after BUG-1046 (2026-09-22, LOW/MEDIUM — two accept-side, one precision)
 

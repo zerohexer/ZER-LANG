@@ -1,0 +1,11 @@
+// expect-error: cannot call 'bump' while 'counter' is lent to a scoped spawn
+// BUG-1125: the parent's own 'counter += 1' was refused (BUG-1118); the same write in a helper compiled.
+u32 counter;
+void worker(*u32 p) { *p += 1; }
+void bump() { counter += 1; }
+u32 main() {
+    ThreadHandle th = spawn worker(&counter);
+    bump();
+    th.join();
+    return 0;
+}

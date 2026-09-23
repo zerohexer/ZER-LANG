@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-23e — BUG-1121..1123: three defects the reference.md audit found (one silent)
+## Session 2026-09-23e — BUG-1121..1125: three defects the reference.md audit found (one silent), and a lent global reached through a callee
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
 **Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
@@ -32,6 +32,22 @@ and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[
 now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
 `type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
 refuses any non-identifier spelling, so no emitted name changes.
+
+### BUG-1125 — a global LENT to a scoped spawn was unprotected from the parent's CALLEES
+**Symptom.** `ThreadHandle th = spawn worker(&counter); bump(); th.join();` with
+`void bump() { counter += 1; }` compiled clean — the parent's own `counter += 1` in the same
+position was refused (BUG-1118). A read through `deeper() -> peek()` and a call through a
+function pointer were accepted the same way.
+**Root cause.** The borrow is a per-statement flag on the Symbol; nothing asked what a CALL in
+the window reaches. The G3 rule had the identical asymmetry for atomic cells and answered it with
+`record_atomic_plain_in_callee`.
+**Fix.** That walk is now `walk_callee_globals` (visitor + atomic-target flag + opaque-call hook,
+visited set instead of the fail-open depth-32 cap) and serves both rules. `check_call_vs_lent_globals`
+runs at every NODE_CALL while a global is lent. `callee_is_opaque_funcptr` resolves a FIELD
+callee through the object's declared type when the typemap has no entry yet (a ThreadHandle's
+`join`, a struct's non-funcptr field), instead of rounding to opaque.
+**Tests.** `tests/zer_fail/lent_global_{callee_write,callee_transitive,funcptr_call}_bug1125.zer`,
+`tests/zer/lent_global_callee_other_bug1125.zer`, SHAPE p32 (9 cells).
 
 ## Session 2026-09-23d — BUG-1090..1101: bounds-check elision trusted facts that were not true — a wrong constant, another variable's range, a stale range, a guard tested too early, a summary read at the wrong point
 

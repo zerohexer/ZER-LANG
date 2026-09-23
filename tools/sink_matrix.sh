@@ -616,6 +616,27 @@ cell p27_safe_ptr_reset     compile 'struct T27i{u32 v;} ?*T27i g27i; u32 main()
 cell p27_safe_init_fini     compile '?[*]u32 g27j; void init27() { g27j = alloc(u32, 4) orelse return; } void fini27() { [*]u32 s = g27j orelse return; free(s); g27j = null; } u32 main(){ init27(); fini27(); return 0; }'
 cell p27_safe_loop_reset    compile '?[*]u32 g27k; u32 main(){ for (u32 i = 0; i < 3; i += 1) { g27k = alloc(u32, 4) orelse return; [*]u32 s = g27k orelse return; s[0] = i; free(s); g27k = null; } return 0; }'
 
+
+# ---------------------------------------------------------------------------
+# SHAPE p32 (BUG-1125): a GLOBAL lent to a scoped spawn, reached by a CALLEE of the
+# parent during the window. BUG-1118 refused the parent's own `counter += 1` and
+# accepted the same statement moved into `bump()` — the G3 asymmetry (moving a
+# statement into a helper must not change whether it races). The reach axis is the
+# callee FORM: direct, transitive, recursive, read-only, @atomic (still a race with
+# the thread's plain write), and a funcptr call (target unknown -> refused).
+echo "===== SHAPE p32 = a lent global reached through the parent's callees ====="
+cell p32_direct_write     reject  'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ g32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); return 0; }'
+cell p32_read             reject  'u32 g32; void w32(*u32 p){*p+=1;} u32 peek32(){ return g32; } u32 main(){ ThreadHandle t=spawn w32(&g32); u32 v=peek32(); t.join(); return v; }'
+cell p32_transitive       reject  'u32 g32; void w32(*u32 p){*p+=1;} u32 peek32(){ return g32; } u32 mid32(){ return peek32(); } u32 main(){ ThreadHandle t=spawn w32(&g32); u32 v=mid32(); t.join(); return v; }'
+cell p32_recursive        reject  'u32 g32; void w32(*u32 p){*p+=1;} u32 walk32(u32 n){ if(n==0){return g32;} return walk32(n-1); } u32 main(){ ThreadHandle t=spawn w32(&g32); u32 v=walk32(3); t.join(); return v; }'
+cell p32_atomic_in_callee reject  'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ @atomic_add(&g32, 1); } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); return 0; }'
+cell p32_funcptr_call     reject  'u32 g32; void w32(*u32 p){*p+=1;} void noop32(){ } u32 main(){ *() fp=noop32; ThreadHandle t=spawn w32(&g32); fp(); t.join(); return 0; }'
+# BOUNDARY: a callee touching ANOTHER global, a call after the join, and a call
+# before the spawn are all fine — and a ThreadHandle's own join() is not a funcptr.
+cell p32_safe_other_global compile 'u32 g32; u32 o32; void w32(*u32 p){*p+=1;} void bump32(){ o32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); if(g32!=1||o32!=1){return 1;} return 0; }'
+cell p32_safe_after_join   compile 'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ g32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); t.join(); bump32(); if(g32!=2){return 1;} return 0; }'
+cell p32_safe_before_spawn compile 'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ g32 += 1; } u32 main(){ bump32(); ThreadHandle t=spawn w32(&g32); t.join(); if(g32!=2){return 1;} return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

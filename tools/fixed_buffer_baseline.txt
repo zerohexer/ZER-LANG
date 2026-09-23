@@ -116,3 +116,6 @@ checker.c:        Type *scratch[4] = {0};
 # one — and the read-only rw exemption tops out at the same 4.
 checker.c:            Type *direct_rw[4]; int nrw = 0;
 checker.c:                Type *viacall[4];
+# BUG-1125: walk_callee_globals' visited set is STACK-FIRST, not fixed — 16 inline
+# slots, doubled into the arena past that (walk_callee_globals_body). Rule #7 pattern.
+checker.c:    Node *seen_stack[16];

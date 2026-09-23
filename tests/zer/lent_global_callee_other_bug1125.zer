@@ -1,0 +1,12 @@
+// BUG-1125 boundary: a callee touching ANOTHER global, and calls after join, stay legal.
+u32 counter;
+u32 other;
+void worker(*u32 p) { *p += 1; }
+void bump_other() { other += 1; }
+u32 main() {
+    ThreadHandle th = spawn worker(&counter);
+    bump_other();
+    th.join();
+    bump_other();
+    return counter - 1;
+}

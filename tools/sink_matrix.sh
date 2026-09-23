@@ -598,6 +598,24 @@ cell p26_safe_slot_freed   compile 'struct H26c{[*]u32 s;} [*]u32 mk26h() { [*]u
 cell p26_safe_factory_ok   compile '[*]u32 mk26e() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 run26e(){ [*]u32 s = mk26e(); s[0] = 7; u32 v = s[0]; free(s); return v; } u32 main(){ if (run26e() != 7) { return 1; } return 0; }'
 
 echo ""
+# SHAPE p27 (BUG-1049): an allocation held by a BARE GLOBAL — carrier x spelling x
+# violation. `ir_global_projection_key` keyed `g.p` / `g[0]` but not bare `g`, so a
+# free THROUGH the global resolved to no entry and every one of these HOLE cells
+# compiled clean (the slice forms were ASan heap-use-after-free). The SAFE cells
+# pin the taught remedy (`g = null;` after the free) and ordinary use.
+echo "===== SHAPE p27 = an allocation held by a BARE global ====="
+cell p27_slice_direct_uaf   reject '[*]u32 g27a; u32 main(){ g27a = alloc(u32, 4) orelse return; free(g27a); return g27a[0]; }'
+cell p27_slice_alias_uaf    reject '[*]u32 g27b; u32 main(){ [*]u32 s = alloc(u32, 4) orelse return; g27b = s; free(g27b); return s[0]; }'
+cell p27_slice_factory_uaf  reject '[*]u32 g27c; [*]u32 mk27c() { [*]u32 s = alloc(u32, 4) orelse return; return s; } u32 main(){ g27c = mk27c(); free(g27c); return g27c[0]; }'
+cell p27_slice_double_free  reject '[*]u32 g27d; u32 main(){ g27d = alloc(u32, 4) orelse return; free(g27d); free(g27d); return 0; }'
+cell p27_slice_dangling     reject '[*]u32 g27e; u32 main(){ g27e = alloc(u32, 4) orelse return; g27e[0] = 1; free(g27e); return 0; }'
+cell p27_ptr_direct_uaf     reject 'struct T27{u32 v;} ?*T27 g27f; u32 main(){ g27f = alloc(T27); *T27 q = g27f orelse return; free(q); *T27 r = g27f orelse return; return r.v; }'
+cell p27_ptr_free_through   reject 'struct T27g{u32 v;} ?*T27g g27g; u32 main(){ *T27g p = alloc(T27g) orelse return; g27g = p; *T27g q = g27g orelse return; free(q); return p.v; }'
+cell p27_safe_reset         compile '?[*]u32 g27h; u32 main(){ [*]u32 s = alloc(u32, 4) orelse return; g27h = s; s[0] = 3; u32 v = s[0]; free(s); g27h = null; if (v != 3) { return 1; } return 0; }'
+cell p27_safe_ptr_reset     compile 'struct T27i{u32 v;} ?*T27i g27i; u32 main(){ g27i = alloc(T27i); *T27i q = g27i orelse return; q.v = 1; free(q); g27i = null; return 0; }'
+cell p27_safe_init_fini     compile '?[*]u32 g27j; void init27() { g27j = alloc(u32, 4) orelse return; } void fini27() { [*]u32 s = g27j orelse return; free(s); g27j = null; } u32 main(){ init27(); fini27(); return 0; }'
+cell p27_safe_loop_reset    compile '?[*]u32 g27k; u32 main(){ for (u32 i = 0; i < 3; i += 1) { g27k = alloc(u32, 4) orelse return; [*]u32 s = g27k orelse return; s[0] = i; free(s); g27k = null; } return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

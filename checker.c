@@ -4089,7 +4089,35 @@ static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
     }
     if (callee->kind == NODE_FIELD || callee->kind == NODE_INDEX) {
         Type *t = checker_get_type(c, callee);
-        return t && type_dispatch_kind(t) == TYPE_FUNC_PTR;
+        if (t) return type_dispatch_kind(t) == TYPE_FUNC_PTR;
+        /* BUG-1052: NO typemap entry — the body holding this call has not been
+         * checked yet (the spawn scan descends into a target declared AFTER its
+         * spawner). Answering "not a funcptr" made the verdict depend on
+         * declaration ORDER: `o.cb(&g)` in a later-declared thread body was
+         * accepted, the same body declared first was rejected. Round toward
+         * OPAQUE. An INDEXED callee can only be a function pointer (a function
+         * is not indexable). A FIELD callee is a builtin/type method only when
+         * its object names a global builtin or a type; anything else is
+         * unknown, and every caller of this predicate is an argument-precise
+         * barrier (it acts only on a volatile global handed BY POINTER), so
+         * the conservative answer costs nothing on a real method call. */
+        if (callee->kind == NODE_INDEX) return true;
+        Node *obj = callee->field.object;
+        if (obj && obj->kind == NODE_IDENT) {
+            Symbol *os = scope_lookup(c->global_scope, obj->ident.name,
+                                      (uint32_t)obj->ident.name_len);
+            if (os && os->type) {
+                switch (type_dispatch_kind(os->type)) {
+                case TYPE_POOL: case TYPE_SLAB: case TYPE_RING: case TYPE_ARENA:
+                case TYPE_BARRIER: case TYPE_SEMAPHORE:
+                    return false;
+                default:
+                    break;
+                }
+            }
+            if (os && !os->type) return false;   /* a type name: `Task.alloc()` */
+        }
+        return true;
     }
     return false;
 }
@@ -5172,6 +5200,87 @@ static bool inttoptr_addr_is_volatile_derived(Checker *c, Node *addr) {
 static int64_t mmio_const_addr(Checker *c, Node *addr_arg) {
     if (!addr_arg) return CONST_EVAL_FAIL;
     return eval_const_expr_scoped(c, addr_arg);
+}
+
+static int64_t compute_type_size(Type *t);
+/* BUG-1056: the ONE derivation of "how many elements of `ptr_type`'s pointee
+ * fit between this `@inttoptr(*T, CONST)` address and the end of its declared
+ * mmio range?" It was written out THREE times (the direct `@inttoptr(..)[N]`
+ * index, the local var-decl, the global var-decl), and all three sized the
+ * element with type_width(), which is 0 for a STRUCT — so the canonical
+ * register-block idiom `volatile *Regs r = @inttoptr(*Regs, BASE); r[1].sr`
+ * got no bound at all and was refused as "no compile-time MMIO bound". Returns
+ * 0 when no bound can be derived. */
+static uint64_t mmio_inttoptr_bound(Checker *c, Node *expr, Type *ptr_type) {
+    if (!expr || !ptr_type) return 0;
+    if (expr->kind != NODE_INTRINSIC || expr->intrinsic.name_len != 8 ||
+        memcmp(expr->intrinsic.name, "inttoptr", 8) != 0 ||
+        expr->intrinsic.arg_count < 1)
+        return 0;
+    if (type_dispatch_kind(ptr_type) != TYPE_POINTER) return 0;
+    int64_t addr = mmio_const_addr(c, expr->intrinsic.args[0]);
+    if (addr == CONST_EVAL_FAIL) return 0;
+    Type *pe = type_unwrap_distinct(ptr_type)->pointer.inner;
+    int64_t esz = pe ? compute_type_size(pe) : 0;
+    if (esz <= 0 && pe) esz = type_width(pe) / 8;
+    if (esz <= 0) return 0;
+    for (int ri = 0; ri < c->mmio_range_count; ri++) {
+        if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
+            (uint64_t)addr <= c->mmio_ranges[ri][1]) {
+            uint64_t rsz = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
+            return rsz / (uint64_t)esz;
+        }
+    }
+    return 0;
+}
+
+/* BUG-1056: a bound derived from the DECLARATION's initializer describes the
+ * pointer only while it keeps that value. `r = @inttoptr(*u32, 0x400000F0);
+ * r[10]` used the declaration's 64-element bound and read past every declared
+ * range with no check. A per-statement update cannot fix it (a reassignment
+ * later in a loop body reaches an earlier index on the back edge), so the
+ * bound is kept only for a pointer that is NEVER reassigned or address-taken:
+ * for a local, anywhere in its function body (and bound exactly once there);
+ * for a global, anywhere in the whole program. Otherwise the pointer is
+ * treated as having no compile-time bound, which the I1 rule then refuses. */
+static bool mmio_bound_name_stable_in(Node *body, const char *name, uint32_t len,
+                                      int expected_binds) {
+    if (!body) return false;
+    if (ast_name_mutated_or_addrd(body, name, len)) return false;
+    return ast_name_bind_count(body, name, len) == expected_binds;
+}
+
+static bool mmio_global_bound_stable(Checker *c, Symbol *sym) {
+    if (!sym) return false;
+    if (sym->mmio_bound_checked != 0) return sym->mmio_bound_checked > 0;
+    bool ok = true;
+    for (int fi = 0; ok && fi < c->reg_file_count; fi++) {
+        Node *f = c->reg_files[fi];
+        for (int di = 0; ok && di < f->file.decl_count; di++) {
+            Node *d = f->file.decls[di];
+            Node *body = NULL;
+            if (d->kind == NODE_FUNC_DECL) body = d->func_decl.body;
+            else if (d->kind == NODE_INTERRUPT) body = d->interrupt.body;
+            if (body && ast_name_mutated_or_addrd(body, sym->name, sym->name_len))
+                ok = false;
+        }
+    }
+    sym->mmio_bound_checked = ok ? 1 : -1;
+    return ok;
+}
+
+static void record_registered_file(Checker *c, Node *file_node) {
+    for (int i = 0; i < c->reg_file_count; i++)
+        if (c->reg_files[i] == file_node) return;
+    if (c->reg_file_count >= c->reg_file_cap) {
+        int nc = c->reg_file_cap ? c->reg_file_cap * 2 : 8;
+        Node **nf = (Node **)arena_alloc(c->arena, (size_t)nc * sizeof(Node *));
+        if (!nf) return;
+        if (c->reg_files) memcpy(nf, c->reg_files, (size_t)c->reg_file_count * sizeof(Node *));
+        c->reg_files = nf;
+        c->reg_file_cap = nc;
+    }
+    c->reg_files[c->reg_file_count++] = file_node;
 }
 
 /* Check if a cast/intrinsic strips volatile from source pointer.
@@ -11626,6 +11735,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!alloc_sym)
                         alloc_sym = find_unique_allocator(c->global_scope, obj->handle.elem);
                 }
+                node->field.handle_alloc = alloc_sym;   /* BUG-1053 */
                 if (!alloc_sym) {
                     checker_error(c, node->loc.line,
                         "no Pool or Slab found for Handle(%.*s) — cannot auto-deref. "
@@ -12092,27 +12202,14 @@ static Type *check_expr(Checker *c, Node *node) {
                 Symbol *psym = scope_lookup(c->current_scope,
                     node->index_expr.object->ident.name,
                     (uint32_t)node->index_expr.object->ident.name_len);
-                if (psym && psym->mmio_bound > 0)
+                if (psym && psym->mmio_bound > 0 &&
+                    (!psym->is_global_var_mmio || mmio_global_bound_stable(c, psym)))
                     mmio_bound = psym->mmio_bound;
             }
             /* Path 2: direct @inttoptr(...)[N] — no variable, compute bound inline */
-            if (mmio_bound == 0 && node->index_expr.object->kind == NODE_INTRINSIC &&
-                node->index_expr.object->intrinsic.name_len == 8 &&
-                memcmp(node->index_expr.object->intrinsic.name, "inttoptr", 8) == 0 &&
-                node->index_expr.object->intrinsic.arg_count > 0) {
-                int64_t addr = mmio_const_addr(c, node->index_expr.object->intrinsic.args[0]);
-                if (addr != CONST_EVAL_FAIL) {
-                    for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                        if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
-                            (uint64_t)addr <= c->mmio_ranges[ri][1]) {
-                            uint64_t rsz = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
-                            int esz = type_width(obj->pointer.inner) / 8;
-                            if (esz > 0) mmio_bound = rsz / (uint64_t)esz;
-                            break;
-                        }
-                    }
-                }
-            }
+            if (mmio_bound == 0)
+                mmio_bound = mmio_inttoptr_bound(c, node->index_expr.object,
+                    checker_get_type(c, node->index_expr.object));   /* BUG-1056 */
 
             /* Check index against mmio_bound */
             if (mmio_bound > 0) {
@@ -12205,8 +12302,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     "known for this pointer, so the access cannot be range-checked "
                     "against any 'mmio' declaration. A bound is derived only for a "
                     "pointer obtained directly from '@inttoptr(*%s, <const addr>)' "
-                    "inside a declared mmio range; a parameter, alias or struct "
-                    "field carries none. Index the '@inttoptr' pointer directly, "
+                    "inside a declared mmio range and never reassigned (or "
+                    "address-taken); a parameter, alias, struct field or a "
+                    "reassigned pointer carries none. Index the '@inttoptr' pointer directly, "
                     "or pass an index already proven in range.",
                     vinner, vinner);
             }
@@ -17689,31 +17787,13 @@ static void check_stmt(Checker *c, Node *node) {
             }
         }
 
-        /* MMIO pointer bound: if init is @inttoptr, derive bound from mmio range */
+        /* MMIO pointer bound: if init is @inttoptr, derive bound from mmio range.
+         * BUG-1056: only for a pointer its body never reassigns. */
         if (node->var_decl.init && sym && type &&
-            type_unwrap_distinct(type)->kind == TYPE_POINTER) {
-            Node *init_expr = node->var_decl.init;
-            if (init_expr->kind == NODE_INTRINSIC &&
-                init_expr->intrinsic.name_len == 8 &&
-                memcmp(init_expr->intrinsic.name, "inttoptr", 8) == 0 &&
-                init_expr->intrinsic.arg_count > 0) {
-                int64_t addr = mmio_const_addr(c, init_expr->intrinsic.args[0]);
-                if (addr != CONST_EVAL_FAIL) {
-                    for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                        if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
-                            (uint64_t)addr <= c->mmio_ranges[ri][1]) {
-                            uint64_t range_size = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
-                            Type *inner = type_unwrap_distinct(type);
-                            int elem_size = type_width(inner->pointer.inner) / 8;
-                            if (elem_size > 0) {
-                                sym->mmio_bound = range_size / (uint64_t)elem_size;
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+            type_dispatch_kind(type) == TYPE_POINTER &&
+            mmio_bound_name_stable_in(c->current_body, node->var_decl.name,
+                                      (uint32_t)node->var_decl.name_len, 1))
+            sym->mmio_bound = mmio_inttoptr_bound(c, node->var_decl.init, type);
 
         /* BUG-479: address_taken VRP invalidation now handled in check_expr
          * TOK_AMP handler — covers ALL &var sites (var-decl, assign, call arg,
@@ -17816,6 +17896,23 @@ static void check_stmt(Checker *c, Node *node) {
                 bool cap_const;
                 if (node->if_stmt.capture_is_ptr) {
                     cap_type = type_pointer(c->arena, unwrapped);
+                    /* BUG-1054: `|*v|` binds a pointer INTO the optional the
+                     * condition names — for a packed-struct field that is the
+                     * same misaligned address `&p.w` is refused for. */
+                    {
+                        Node *pr = node->if_stmt.cond;
+                        while (pr && pr->kind == NODE_INDEX) pr = pr->index_expr.object;
+                        bool pk = false;
+                        if (pr && pr->kind == NODE_FIELD)
+                            packed_path_aggregate(c, pr, &pk, 0);
+                        if (pk)
+                            checker_error(c, node->loc.line,
+                                "mutable capture '|*%.*s|' of a packed struct field would "
+                                "be a misaligned pointer — capture by value '|%.*s|' and "
+                                "assign the field back",
+                                (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name,
+                                (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name);
+                    }
                     /* BUG-305: if source is const, capture pointer must be const */
                     cap_const = false;
                     {
@@ -22374,26 +22471,12 @@ static void register_decl(Checker *c, Node *node) {
             sym->is_volatile = node->var_decl.is_volatile;
             sym->is_static = node->var_decl.is_static;
             sym->func_node = node; /* store AST node for const init lookup */
-            /* MMIO pointer bound for globals */
-            if (node->var_decl.init && type && type_unwrap_distinct(type)->kind == TYPE_POINTER) {
-                Node *gi = node->var_decl.init;
-                if (gi->kind == NODE_INTRINSIC && gi->intrinsic.name_len == 8 &&
-                    memcmp(gi->intrinsic.name, "inttoptr", 8) == 0 &&
-                    gi->intrinsic.arg_count > 0) {
-                    int64_t addr = mmio_const_addr(c, gi->intrinsic.args[0]);
-                    if (addr != CONST_EVAL_FAIL) {
-                        for (int ri = 0; ri < c->mmio_range_count; ri++) {
-                            if ((uint64_t)addr >= c->mmio_ranges[ri][0] &&
-                                (uint64_t)addr <= c->mmio_ranges[ri][1]) {
-                                uint64_t rsz = c->mmio_ranges[ri][1] - (uint64_t)addr + 1;
-                                Type *inn = type_unwrap_distinct(type);
-                                int esz = type_width(inn->pointer.inner) / 8;
-                                if (esz > 0) sym->mmio_bound = rsz / (uint64_t)esz;
-                                break;
-                            }
-                        }
-                    }
-                }
+            /* MMIO pointer bound for globals (BUG-1056: one derivation; validity
+             * against reassignment is decided at the first index use, once every
+             * body is registered — mmio_global_bound_stable). */
+            if (node->var_decl.init && type) {
+                sym->mmio_bound = mmio_inttoptr_bound(c, node->var_decl.init, type);
+                sym->is_global_var_mmio = sym->mmio_bound > 0;
             }
             /* BUG-218/222: store module prefix for name mangling (including static) */
             sym->module_prefix = c->current_module;
@@ -22926,6 +23009,7 @@ static void check_func_body(Checker *c, Node *node) {
          * keep edges can name the enclosing function for the transitivity pass.
          * Resolved from the symbol so it is the SAME Type* call sites read. */
         c->current_func_node = node;
+        c->current_body = node->func_decl.body;   /* BUG-1056 */
         {
             Symbol *fsym = scope_lookup_local(c->global_scope, node->func_decl.name,
                                               (uint32_t)node->func_decl.name_len);
@@ -23234,6 +23318,7 @@ static void check_func_body(Checker *c, Node *node) {
         pop_scope(c);
         c->current_func_ret = NULL;
         c->current_func_node = NULL;
+        c->current_body = NULL;
         c->current_func_sig = NULL;
     }
 
@@ -23246,6 +23331,7 @@ static void check_func_body(Checker *c, Node *node) {
             true, "cannot allocate inside interrupt handler — heap allocation may deadlock");
         c->current_func_ret = ty_void;
         c->in_interrupt = true;
+        c->current_body = node->interrupt.body;   /* BUG-1056 */
         push_scope(c);
         /* SS-C #15 sibling: interrupt bodies are checked in the same source-order
          * pass-2 loop as functions, but were the one checked body that never reset
@@ -23266,6 +23352,7 @@ static void check_func_body(Checker *c, Node *node) {
         record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
+        c->current_body = NULL;
         c->current_func_ret = NULL;
     }
 }
@@ -25982,6 +26069,7 @@ static bool body_always_exits(Node *body) {
 
 void checker_register_file(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
+    record_registered_file(c, file_node);   /* BUG-1056 */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         /* skip imports — they're handled by the compiler driver */
@@ -26602,6 +26690,7 @@ static void register_builtin_pair_types(Checker *c) {
 
 bool checker_check(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return false;
+    record_registered_file(c, file_node);   /* BUG-1056 */
 
     /* Pass 1: register all top-level declarations */
     for (int i = 0; i < file_node->file.decl_count; i++) {

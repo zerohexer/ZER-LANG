@@ -602,6 +602,10 @@ struct Node {
             Node *object;
             const char *field_name;
             size_t field_name_len;
+            /* BUG-1053: the allocator a Handle auto-deref `h.f` resolves to,
+             * recorded by the CHECKER (which alone sees `h`'s slab_source) so
+             * the emitter's paths read ONE answer instead of re-deriving it. */
+            struct Symbol *handle_alloc;
         } field;
 
         /* NODE_INDEX: expr[index] */

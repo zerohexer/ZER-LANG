@@ -20,10 +20,38 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
+static int _ir_last_err_line = -1;
+static const char *_ir_last_err_file = NULL;
+
 /* Local error reporting — mirrors zercheck.c's zc_error but accessible here */
 static void ir_zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
     if (zc->building_summary) return;
     zc->error_count++;
+    _ir_last_err_line = line;
+    _ir_last_err_file = zc->file_name;
+    fprintf(stderr, "%s:%d: zercheck: ", zc->file_name, line);
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(stderr, fmt, args);
+    va_end(args);
+    fprintf(stderr, "\n");
+}
+
+/* BUG-1050: a report about IR local `id`. When `id` is a compiler TEMPORARY
+ * (the `_zer_tN` an orelse / unwrap lowers through) and a diagnostic has
+ * already been issued on this very line, the temporary is an alias of the
+ * value that report already named — the second report is the same defect
+ * seen through a temp, and used to print as a bare `handle %6`. Drop it.
+ * A temporary is still reported when it is the ONLY witness on its line. */
+static void ir_zc_error_for(ZerCheck *zc, IRFunc *func, int id, int line,
+                            const char *fmt, ...) {
+    if (zc->building_summary) return;
+    if (func && id >= 0 && id < func->local_count && func->locals[id].is_temp &&
+        _ir_last_err_line == line && _ir_last_err_file == zc->file_name)
+        return;
+    zc->error_count++;
+    _ir_last_err_line = line;
+    _ir_last_err_file = zc->file_name;
     fprintf(stderr, "%s:%d: zercheck: ", zc->file_name, line);
     va_list args;
     va_start(args, fmt);
@@ -317,6 +345,8 @@ static IRHandleInfo *ir_add_handle(IRPathState *ps, int local_id) {
  * (ahead of its documentation block below) because the constructor enforces
  * its invariant. */
 #define IR_GLOBAL_ROOT_ID (-2)
+static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
+                                 const char *path, uint32_t plen);
 
 /* Add a compound handle entry (or return existing). path must be arena-
  * allocated by the caller — this struct just stores the pointer.
@@ -523,6 +553,71 @@ bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
     return true;  /* unreachable (exhaustive) — conservative */
 }
 
+/* BUG-1055: how many times is `name` BOUND inside `n` — a var-decl, an
+ * if-unwrap capture, or a switch-arm capture? ast_name_mutated_or_addrd answers
+ * "is this binding ever written?", which is only half of "does this NAME denote
+ * ONE stable value?": ZER reuses the IR local for a redeclaration in a sibling
+ * scope, so `{ bool c = x == 1; if (c) { free(a); } } { bool c = y == 1;
+ * if (!c) { use(a); } }` looked like one immutable guard and the Level-B
+ * relaxation accepted a use-after-free. Bindings occur only at statement level
+ * (no expression binds a name), but the switch is still exhaustive so a new
+ * kind must be classified. Callers ask "is the count exactly the one I expect". */
+int ast_name_bind_count(Node *n, const char *name, uint32_t len) {
+    if (!n) return 0;
+#define ABC(x) ast_name_bind_count((x), name, len)
+#define SAME(p, l) ((p) && (uint32_t)(l) == len && memcmp((p), name, len) == 0)
+    switch (n->kind) {
+    case NODE_VAR_DECL:
+        return (SAME(n->var_decl.name, n->var_decl.name_len) ? 1 : 0);
+    case NODE_BLOCK: {
+        int k = 0;
+        for (int i = 0; i < n->block.stmt_count; i++) k += ABC(n->block.stmts[i]);
+        return k;
+    }
+    case NODE_IF:
+        return (SAME(n->if_stmt.capture_name, n->if_stmt.capture_name_len) ? 1 : 0) +
+               ABC(n->if_stmt.then_body) + ABC(n->if_stmt.else_body);
+    case NODE_FOR:
+        return ABC(n->for_stmt.init) + ABC(n->for_stmt.body);
+    case NODE_WHILE:
+    case NODE_DO_WHILE:
+        return ABC(n->while_stmt.body);
+    case NODE_SWITCH: {
+        int k = 0;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            SwitchArm *a = &n->switch_stmt.arms[i];
+            if (SAME(a->capture_name, a->capture_name_len)) k++;
+            k += ABC(a->body);
+        }
+        return k;
+    }
+    case NODE_DEFER:    return ABC(n->defer.body);
+    case NODE_CRITICAL: return ABC(n->critical.body);
+    case NODE_ONCE:     return ABC(n->once.body);
+    /* Expression / leaf / jump kinds bind nothing. */
+    case NODE_ASSIGN: case NODE_UNARY: case NODE_BINARY: case NODE_CALL:
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_TYPECAST: case NODE_INTRINSIC: case NODE_STRUCT_INIT:
+    case NODE_RETURN: case NODE_EXPR_STMT: case NODE_AWAIT: case NODE_SPAWN:
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_SIZEOF: case NODE_CAST: case NODE_ASM:
+    case NODE_STATIC_ASSERT:
+        return 0;
+    /* Declarations never appear inside a body; count as a rebinding so a
+     * caller asking "exactly one?" rounds toward "no". */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return 2;
+    }
+#undef ABC
+#undef SAME
+    return 2;   /* unreachable (exhaustive) — conservative */
+}
+
 /* A local is a TRACKABLE guard root iff bool-typed and NEITHER reassigned NOR
  * address-taken anywhere in the function (so its value is identical at the free's
  * branch and the use's branch — the soundness gate for the guarded refinement).
@@ -538,6 +633,12 @@ static bool ir_local_is_immutable_bool(IRFunc *func, int local) {
     if (!lname || lname_len == 0) return false;
     if (!func->ast_node || func->ast_node->kind != NODE_FUNC_DECL) return false;
     if (ast_name_mutated_or_addrd(func->ast_node->func_decl.body, lname, lname_len))
+        return false;
+    /* BUG-1055: the NAME must denote ONE binding — a sibling-scope redeclaration
+     * (or a capture of the same name) reuses this IR local with a second value. */
+    if (!func->locals[local].is_temp &&
+        ast_name_bind_count(func->ast_node->func_decl.body, lname, lname_len) !=
+        (func->locals[local].is_param ? 0 : 1))
         return false;
     for (int bi = 0; bi < func->block_count; bi++) {
         IRBlock *bb = &func->blocks[bi];
@@ -1783,6 +1884,20 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             *out_path_len = glen;
             return 0;
         }
+        /* BUG-1049: a BARE global ident resolves to the SAME
+         * (IR_GLOBAL_ROOT_ID, "g") entry the BUG-739 store arm registers
+         * under the plain name. Before, only that one arm could name the
+         * entry: `g = alloc(u32, 4) orelse return; free(g); g[0]` and
+         * `g = s; free(g); s[0]` compiled clean (ASan: heap-use-after-free),
+         * because the free through `g` resolved to no key at all. One key,
+         * so every sink (free, use, alias, store, exit) agrees. */
+        if (expr->kind == NODE_IDENT &&
+            ir_ident_is_unshadowed_global(zc, func, expr)) {
+            *out_local = IR_GLOBAL_ROOT_ID;
+            *out_path = expr->ident.name;
+            *out_path_len = (uint32_t)expr->ident.name_len;
+            return 0;
+        }
         return -1;
     }
     *out_local = local;
@@ -2375,8 +2490,8 @@ static bool ir_register_alloc_result(ZerCheck *zc, IRFunc *func, IRPathState *ps
         if (h) {
             if (h->state == IR_HS_ALIVE && dest < func->local_count &&
                 !func->locals[dest].is_temp) {
-                ir_zc_error(zc, line,
-                    "handle %%%d overwritten while alive — previous leaked", dest);
+                ir_zc_error_for(zc, func, dest, line,
+                    "handle %s overwritten while alive — previous leaked", ir_local_desc(zc, func, dest, NULL, 0));
             }
             h->state = IR_HS_ALIVE;
             h->alloc_line = line;
@@ -2729,7 +2844,15 @@ static bool ir_assign_target_is_tracked_slot(ZerCheck *zc, IRFunc *func,
          * is still a use-after-free and the summary still sees the free). */
         int l = ir_find_local_exact_first(func, target->ident.name,
                                           (uint32_t)target->ident.name_len);
-        return l >= 0 && ir_find_handle(ps, l) != NULL;
+        if (l >= 0) return ir_find_handle(ps, l) != NULL;
+        /* BUG-1049: a bare GLOBAL is keyed now, so `g = null;` — the reset
+         * the dangling-global rule prescribes — must be an overwrite, not a
+         * read of the freed target. */
+        if (ir_ident_is_unshadowed_global(zc, func, target))
+            return ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID,
+                       target->ident.name,
+                       (uint32_t)target->ident.name_len) != NULL;
+        return false;
     }
     if (target->kind != NODE_FIELD && target->kind != NODE_INDEX) return false;
     int root;
@@ -3648,6 +3771,85 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
  * excluded: builtins cannot read user globals; externs are outside the
  * safety boundary (cinclude territory). The fix the rule teaches is
  * one line: reset the global ('g = null;') right after the free. */
+/* BUG-1049: the ONE sentence for a dangling global, at both boundaries (a
+ * call that may observe it, the function exit). Its remedy is `g = null;` —
+ * which only COMPILES when the global can hold null. A bare global of a
+ * non-optional type (`[*]u32 g`, `*T g`) cannot, and advising it is an
+ * unfollowable remedy; there the real fix is to declare the global optional.
+ * Projections (`g.p`) keep the old wording: the slot's type is not looked
+ * up here, and every G5 slot that receives an allocation today is `?`. */
+/* BUG-1050: ONE rendering of an IR local in a diagnostic. 33 sites used to
+ * print the raw IR id (`local %5`, `handle %-2`) — meaningless to a user, and
+ * for a global pseudo-root literally `%-2`. A named local prints as 'name'
+ * (with its projection path, if any), a global root as its key, and a
+ * compiler temporary says so instead of leaking `_zer_tN`. */
+static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
+                                 const char *path, uint32_t plen) {
+    const char *nm = NULL;
+    uint32_t nl = 0;
+    bool temp = false;
+    if (id >= 0 && id < func->local_count) {
+        nm = func->locals[id].name;
+        nl = (uint32_t)func->locals[id].name_len;
+        temp = func->locals[id].is_temp;
+    } else if (id == IR_GLOBAL_ROOT_ID && path && plen > 0) {
+        nm = path;          /* the global key already includes the root */
+        nl = plen;
+        path = NULL;
+        plen = 0;
+    }
+    if (!nm || temp) {
+        if (path && plen > 0 && path[0] == '.') { path++; plen--; }
+        if (!path || plen == 0) return "an unnamed temporary";
+        size_t cap = plen + 32;
+        char *b = (char *)arena_alloc(zc->arena, cap);
+        if (!b) return "an unnamed temporary";
+        snprintf(b, cap, "field '%.*s' of a temporary", (int)plen, path);
+        return b;
+    }
+    size_t cap = (size_t)nl + plen + 3;
+    char *b = (char *)arena_alloc(zc->arena, cap);
+    if (!b) return "'?'";
+    snprintf(b, cap, "'%.*s%.*s'", (int)nl, nm, (int)(path ? plen : 0),
+             path ? path : "");
+    return b;
+}
+
+static void ir_report_dangling_global(ZerCheck *zc, int line,
+                                      IRHandleInfo *h, bool at_call) {
+    bool bare = true;
+    for (uint32_t k = 0; k < h->path_len; k++) {
+        if (h->path[k] == '.' || h->path[k] == '[') { bare = false; break; }
+    }
+    Symbol *gs = bare ? scope_lookup(zc->checker->global_scope, h->path,
+                                     h->path_len) : NULL;
+    Type *gt = gs ? gs->type : NULL;
+    if (gt && !type_is_optional(gt)) {
+        /* type_name rotates TWO buffers, so exactly two calls are safe. */
+        ir_zc_error(zc, line,
+            "%s dangling global '%.*s' (target freed at line %d) — a "
+            "non-optional '%s' global cannot be reset; declare it '?%s %.*s' "
+            "and reset it ('%.*s = null;') after the free",
+            at_call ? "call may observe" : "function exits with",
+            (int)h->path_len, h->path, h->free_line, type_name(gt), type_name(gt),
+            (int)h->path_len, h->path, (int)h->path_len, h->path);
+        return;
+    }
+    if (at_call)
+        ir_zc_error(zc, line,
+            "call may observe dangling global '%.*s' (target freed at "
+            "line %d) — reset it ('%.*s = null;') before making calls",
+            (int)h->path_len, h->path, h->free_line,
+            (int)h->path_len, h->path);
+    else
+        ir_zc_error(zc, line,
+            "global '%.*s' left dangling at function exit — its "
+            "target was freed at line %d; reset it ('%.*s = null;') "
+            "after the free, or free through it before returning",
+            (int)h->path_len, h->path, h->free_line,
+            (int)h->path_len, h->path);
+}
+
 static void ir_check_dangling_globals_at_call(ZerCheck *zc, IRPathState *ps,
                                               int line) {
     for (int i = 0; i < ps->handle_count; i++) {
@@ -3655,11 +3857,7 @@ static void ir_check_dangling_globals_at_call(ZerCheck *zc, IRPathState *ps,
         if (h->local_id != IR_GLOBAL_ROOT_ID) continue;
         if (h->state != IR_HS_FREED) continue;
         if (h->path_len == 0) continue;
-        ir_zc_error(zc, line,
-            "call may observe dangling global '%.*s' (target freed at "
-            "line %d) — reset it ('%.*s = null;') before making calls",
-            (int)h->path_len, h->path, h->free_line,
-            (int)h->path_len, h->path);
+        ir_report_dangling_global(zc, line, h, true);
     }
 }
 
@@ -3873,9 +4071,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (h->state == IR_HS_ALIVE &&
                     inst->dest_local < func->local_count &&
                     !func->locals[inst->dest_local].is_temp) {
-                    ir_zc_error(zc, inst->source_line,
-                        "handle %%%d overwritten while alive — previous allocation leaked",
-                        inst->dest_local);
+                    ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                        "handle %s overwritten while alive — previous allocation leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                 }
                 h->state = IR_HS_ALIVE;
                 h->alloc_line = inst->source_line;
@@ -3943,11 +4140,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 /* Z1: invalid handle (FREED/MAYBE_FREED/TRANSFERRED)
                  * used as asm operand → UAF / use-after-move. */
                 if (ir_is_invalid(h)) {
-                    ir_zc_error(zc, inst->source_line,
-                        "asm input '%.*s' uses %s handle %%%d "
+                    ir_zc_error_for(zc, func, op_local, inst->source_line,
+                        "asm input '%.*s' uses %s handle %s "
                         "(Z1 rule — handle must be ALIVE at asm operand)",
                         (int)op->reg_name_len, op->reg_name,
-                        ir_state_name(h->state), op_local);
+                        ir_state_name(h->state), ir_local_desc(zc, func, op_local, NULL, 0));
                 }
                 /* Z2: if local's type is a move struct, asm consumes
                  * the value — mark TRANSFERRED so subsequent uses
@@ -4288,9 +4485,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         if (!src_h) break;
         /* Error if source is invalid */
         if (ir_is_invalid(src_h)) {
-            ir_zc_error(zc, inst->source_line,
-                "use of %s handle %%%d",
-                ir_state_name(src_h->state), inst->src1_local);
+            ir_zc_error_for(zc, func, inst->src1_local, inst->source_line,
+                "use of %s value %s",
+                ir_state_name(src_h->state), ir_local_desc(zc, func, inst->src1_local, NULL, 0));
         }
         /* Alias: dest inherits source's alloc_id and state.
          *
@@ -4320,9 +4517,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 inst->dest_local < func->local_count &&
                 !func->locals[inst->dest_local].is_temp &&
                 prev_dst->alloc_id != snap.alloc_id) {
-                ir_zc_error(zc, inst->source_line,
-                    "handle %%%d overwritten while alive — previous allocation leaked",
-                    inst->dest_local);
+                ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                    "handle %s overwritten while alive — previous allocation leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
             }
         }
         IRHandleInfo *dst_h = ir_add_handle(ps, inst->dest_local);
@@ -4371,9 +4567,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         }
         if (!src_h) break;
         if (ir_is_invalid(src_h)) {
-            ir_zc_error(zc, inst->source_line,
-                "use of %s handle %%%d in cast",
-                ir_state_name(src_h->state), inst->src1_local);
+            ir_zc_error_for(zc, func, inst->src1_local, inst->source_line,
+                "use of %s value %s in cast",
+                ir_state_name(src_h->state), ir_local_desc(zc, func, inst->src1_local, NULL, 0));
         }
         /* UAF GUARD + alias-copy unification (audit 2026-06-04):
          * snapshot fields before realloc-capable add. Pre-fix this site
@@ -4652,13 +4848,11 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
                         if (path_len == 0) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after free: local %%%d is %s (freed at line %d)",
-                                root_local, ir_state_name(h->state), h->free_line);
+                            ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                "use after free: %s is %s (freed at line %d)", ir_local_desc(zc, func, root_local, path, path_len), ir_state_name(h->state), h->free_line);
                         } else {
-                            ir_zc_error(zc, inst->source_line,
-                                "use after free: compound '%.*s' on local %%%d is %s (freed at line %d)",
-                                (int)path_len, path, root_local,
+                            ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                "use after free: %s is %s (freed at line %d)", ir_local_desc(zc, func, root_local, path, (uint32_t)(path_len)),
                                 ir_state_name(h->state), h->free_line);
                         }
                         break; /* found — don't report parent prefixes too */
@@ -4728,10 +4922,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     IRHandleInfo *ch = ir_find_compound_handle(ps,
                         root_local, path, path_len);
                     if (ch && ch->state == IR_HS_TRANSFERRED) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use after move: '%.*s' on local %%%d "
-                            "ownership transferred at line %d",
-                            (int)path_len, path, root_local,
+                        ir_zc_error_for(zc, func, root_local, inst->source_line,
+                            "use after move: %s "
+                            "ownership transferred at line %d", ir_local_desc(zc, func, root_local, path, (uint32_t)(path_len)),
                             ch->free_line);
                     }
                     if (!ch) ch = ir_add_compound_handle(ps, root_local,
@@ -5245,6 +5438,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         IR_GLOBAL_ROOT_ID, target_expr->ident.name,
                         (uint32_t)target_expr->ident.name_len);
                     if (gh) {
+                        /* BUG-1049: keep the freed FACT for the summary, as
+                         * the slot resets do (BUG-985). */
+                        if (gh->state == IR_HS_FREED) gh->freed_then_reset = true;
+                        else if (gh->state == IR_HS_MAYBE_FREED) gh->maybe_freed_then_reset = true;
                         gh->state = IR_HS_UNKNOWN;
                         gh->alloc_id = 0;
                     }
@@ -5268,9 +5465,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 if (ir_should_track_move(rhs_type)) {
                     IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
                     if (rh && ir_is_invalid(rh)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use of %s value (local %%%d) in field/index write",
-                            ir_state_name(rh->state), rhs_local);
+                        ir_zc_error_for(zc, func, rhs_local, inst->source_line,
+                            "use of %s value (%s) in field/index write",
+                            ir_state_name(rh->state), ir_local_desc(zc, func, rhs_local, NULL, 0));
                     }
                     if (!rh) rh = ir_add_handle(ps, rhs_local);
                     if (rh) {
@@ -5750,9 +5947,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             if (path_len == 0) h = ir_find_handle(ps, root_local);
                             else h = ir_find_compound_handle(ps, root_local, path, path_len);
                             if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "use after free: local %%%d is %s (freed at line %d)",
-                                    root_local, ir_state_name(h->state), h->free_line);
+                                ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                    "use after free: %s is %s (freed at line %d)", ir_local_desc(zc, func, root_local, path, path_len), ir_state_name(h->state), h->free_line);
                             }
                             /* F3.2: cross-pool misuse — handle came from
                              * a different Pool/Slab than the receiver. */
@@ -5781,9 +5977,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (h) {
                             if (h->state == IR_HS_ALIVE &&
                                 !func->locals[inst->dest_local].is_temp) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "handle %%%d overwritten while alive — previous leaked",
-                                    inst->dest_local);
+                                ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                                    "handle %s overwritten while alive — previous leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                             }
                             h->state = IR_HS_ALIVE;
                             h->alloc_line = inst->source_line;
@@ -5817,9 +6012,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (h) {
                             if (h->state == IR_HS_ALIVE &&
                                 !func->locals[inst->dest_local].is_temp) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "handle %%%d overwritten while alive — previous leaked",
-                                    inst->dest_local);
+                                ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                                    "handle %s overwritten while alive — previous leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                             }
                             h->state = IR_HS_ALIVE;
                             h->alloc_line = inst->source_line;
@@ -5849,9 +6043,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         if (h) {
                             if (h->state == IR_HS_ALIVE &&
                                 !func->locals[inst->dest_local].is_temp) {
-                                ir_zc_error(zc, inst->source_line,
-                                    "handle %%%d overwritten while alive — previous leaked",
-                                    inst->dest_local);
+                                ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                                    "handle %s overwritten while alive — previous leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                             }
                             h->state = IR_HS_ALIVE;
                             h->alloc_line = inst->source_line;
@@ -5877,13 +6070,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (is_move) {
                         /* Move transfer: source → TRANSFERRED, dest → new ALIVE */
                         if (src_h && src_h->state == IR_HS_TRANSFERRED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use of transferred value (local %%%d) — ownership already moved",
-                                src_local);
+                            ir_zc_error_for(zc, func, src_local, inst->source_line,
+                                "use of transferred value (%s) — ownership already moved", ir_local_desc(zc, func, src_local, NULL, 0));
                         } else if (src_h && ir_is_invalid(src_h)) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use of %s handle %%%d",
-                                ir_state_name(src_h->state), src_local);
+                            ir_zc_error_for(zc, func, src_local, inst->source_line,
+                                "use of %s value %s",
+                                ir_state_name(src_h->state), ir_local_desc(zc, func, src_local, NULL, 0));
                         }
                         /* Ensure source exists as handle so we can mark it */
                         if (!src_h) src_h = ir_add_handle(ps, src_local);
@@ -5945,9 +6137,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                         /* Check use of invalid handle — only reachable when the
                          * alive-add branch did NOT run, so src_h is still valid. */
                         else if (src_h && ir_is_invalid(src_h)) {
-                            ir_zc_error(zc, inst->source_line,
-                                "use of %s handle %%%d",
-                                ir_state_name(src_h->state), src_local);
+                            ir_zc_error_for(zc, func, src_local, inst->source_line,
+                                "use of %s value %s",
+                                ir_state_name(src_h->state), ir_local_desc(zc, func, src_local, NULL, 0));
                         }
                     }
                 } else if (ir_ident_is_unshadowed_global(zc, func,
@@ -6004,9 +6196,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             Type *ret_type = func->locals[ret_local_direct].type;
             if (ir_should_track_move(ret_type)) {
                 if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                    ir_zc_error(zc, inst->source_line,
-                        "returning %s value (local %%%d)",
-                        ir_state_name(h->state), ret_local_direct);
+                    ir_zc_error_for(zc, func, ret_local_direct, inst->source_line,
+                        "returning %s value (%s)",
+                        ir_state_name(h->state), ir_local_desc(zc, func, ret_local_direct, NULL, 0));
                 }
                 if (!h) h = ir_add_handle(ps, ret_local_direct);
                 if (h) {
@@ -6015,10 +6207,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 }
             } else {
                 if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                    ir_zc_error(zc, inst->source_line,
-                        "returning %s pointer (local %%%d, freed at line %d) — "
+                    ir_zc_error_for(zc, func, ret_local_direct, inst->source_line,
+                        "returning %s pointer (%s, freed at line %d) — "
                         "caller would receive dangling pointer",
-                        ir_state_name(h->state), ret_local_direct, h->free_line);
+                        ir_state_name(h->state), ir_local_desc(zc, func, ret_local_direct, NULL, 0), h->free_line);
                 }
                 /* BUG-981: the compounds a returned by-value aggregate
                  * carries leave with it (same as case (a) below). */
@@ -6036,9 +6228,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 Type *ret_type = func->locals[ret_local].type;
                 if (ir_should_track_move(ret_type)) {
                     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "returning %s value (local %%%d)",
-                            ir_state_name(h->state), ret_local);
+                        ir_zc_error_for(zc, func, ret_local, inst->source_line,
+                            "returning %s value (%s)",
+                            ir_state_name(h->state), ir_local_desc(zc, func, ret_local, NULL, 0));
                     }
                     if (!h) h = ir_add_handle(ps, ret_local);
                     if (h) {
@@ -6051,10 +6243,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                      * hand to the caller. This catches `free(p); return p;`
                      * and any alias of a freed allocation. */
                     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "returning %s pointer (local %%%d, freed at line %d) — "
+                        ir_zc_error_for(zc, func, ret_local, inst->source_line,
+                            "returning %s pointer (%s, freed at line %d) — "
                             "caller would receive dangling pointer",
-                            ir_state_name(h->state), ret_local, h->free_line);
+                            ir_state_name(h->state), ir_local_desc(zc, func, ret_local, NULL, 0), h->free_line);
                     }
                     /* BUG-981: the bare entry AND the compounds a returned
                      * by-value aggregate carries all leave with it. */
@@ -6279,9 +6471,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (h->state == IR_HS_ALIVE &&
                         inst->dest_local < func->local_count &&
                         !func->locals[inst->dest_local].is_temp) {
-                        ir_zc_error(zc, inst->source_line,
-                            "handle %%%d overwritten while alive — previous leaked",
-                            inst->dest_local);
+                        ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                            "handle %s overwritten while alive — previous leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                     }
                     h->state = IR_HS_ALIVE;
                     h->alloc_line = inst->source_line;
@@ -6354,22 +6545,19 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (h) {
                         if (h->state == IR_HS_FREED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "double free: local %%%d already freed at line %d",
-                                root_local, h->free_line);
+                            ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                "double free: %s already freed at line %d", ir_local_desc(zc, func, root_local, path, path_len), h->free_line);
                         } else if (h->state == IR_HS_MAYBE_FREED) {
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
                                     ir_mark_freed_all_paths(ps, h);
                             } else {
-                                ir_zc_error(zc, inst->source_line,
-                                    "freeing local %%%d which may already be freed",
-                                    root_local);
+                                ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                    "freeing %s which may already be freed", ir_local_desc(zc, func, root_local, path, path_len));
                             }
                         } else if (h->state == IR_HS_TRANSFERRED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "freeing local %%%d which was already transferred",
-                                root_local);
+                            ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                "freeing %s which was already transferred", ir_local_desc(zc, func, root_local, path, path_len));
                         }
                         /* F3.2 wrong-pool check is centralized in
                          * ir_check_expr_wrong_pool walker invoked at
@@ -6465,9 +6653,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
                     if (h && ir_is_invalid(h) && !ir_use_guard_disjoint(zc, h)) {
-                        ir_zc_error(zc, inst->source_line,
-                            "use after free: local %%%d is %s (freed at line %d)",
-                            root_local, ir_state_name(h->state), h->free_line);
+                        ir_zc_error_for(zc, func, root_local, inst->source_line,
+                            "use after free: %s is %s (freed at line %d)", ir_local_desc(zc, func, root_local, path, path_len), ir_state_name(h->state), h->free_line);
                     }
                     /* F3.2 wrong-pool check centralized in walker. */
                 }
@@ -6764,9 +6951,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (h->state == IR_HS_ALIVE &&
                         inst->dest_local < func->local_count &&
                         !func->locals[inst->dest_local].is_temp) {
-                        ir_zc_error(zc, inst->source_line,
-                            "handle %%%d overwritten while alive — previous allocation leaked",
-                            inst->dest_local);
+                        ir_zc_error_for(zc, func, inst->dest_local, inst->source_line,
+                            "handle %s overwritten while alive — previous allocation leaked", ir_local_desc(zc, func, inst->dest_local, NULL, 0));
                     }
                     h->state = IR_HS_ALIVE;
                     h->alloc_line = inst->source_line;
@@ -6826,17 +7012,15 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     }
                     if (h) {
                         if (h->state == IR_HS_FREED) {
-                            ir_zc_error(zc, inst->source_line,
-                                "double free: local %%%d already freed at line %d",
-                                root_local, h->free_line);
+                            ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                "double free: %s already freed at line %d", ir_local_desc(zc, func, root_local, path, path_len), h->free_line);
                         } else if (h->state == IR_HS_MAYBE_FREED) {
                             if (ir_use_guard_disjoint(zc, h)) {
                                 if (ir_free_completes_coverage(zc, h))
                                     ir_mark_freed_all_paths(ps, h);
                             } else {
-                                ir_zc_error(zc, inst->source_line,
-                                    "freeing local %%%d which may already be freed",
-                                    root_local);
+                                ir_zc_error_for(zc, func, root_local, inst->source_line,
+                                    "freeing %s which may already be freed", ir_local_desc(zc, func, root_local, path, path_len));
                             }
                         }
                         h->state = IR_HS_FREED;
@@ -6954,9 +7138,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (h) {
             /* Error on using an already-invalid handle */
             if (ir_is_invalid(h)) {
-                ir_zc_error(zc, inst->source_line,
-                    "passing %s handle %%%d to function that frees it",
-                    ir_state_name(h->state), arg_local);
+                ir_zc_error_for(zc, func, arg_local, inst->source_line,
+                    "passing %s handle %s to function that frees it",
+                    ir_state_name(h->state), ir_local_desc(zc, func, arg_local, NULL, 0));
             }
 
             /* Apply summary: definite free → FREED; maybe → MAYBE_FREED */
@@ -7136,9 +7320,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (ir_should_track_move(rhs_type)) {
                 IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
                 if (rh && ir_is_invalid(rh)) {
-                    ir_zc_error(zc, inst->source_line,
-                        "use of %s value (local %%%d) in field write",
-                        ir_state_name(rh->state), rhs_local);
+                    ir_zc_error_for(zc, func, rhs_local, inst->source_line,
+                        "use of %s value (%s) in field write",
+                        ir_state_name(rh->state), ir_local_desc(zc, func, rhs_local, NULL, 0));
                 }
                 if (!rh) rh = ir_add_handle(ps, rhs_local);
                 if (rh) {
@@ -7215,9 +7399,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
             if (ir_should_track_move(rhs_type)) {
                 IRHandleInfo *rh = ir_find_handle(ps, rhs_local);
                 if (rh && ir_is_invalid(rh)) {
-                    ir_zc_error(zc, inst->source_line,
-                        "use of %s value (local %%%d) in array write",
-                        ir_state_name(rh->state), rhs_local);
+                    ir_zc_error_for(zc, func, rhs_local, inst->source_line,
+                        "use of %s value (%s) in array write",
+                        ir_state_name(rh->state), ir_local_desc(zc, func, rhs_local, NULL, 0));
                 }
                 if (!rh) rh = ir_add_handle(ps, rhs_local);
                 if (rh) {
@@ -8980,12 +9164,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (reported_ids[ri] == h->alloc_id) { g_already = true; break; }
                 }
                 if (!g_already) {
-                    ir_zc_error(zc, last->source_line,
-                        "global '%.*s' left dangling at function exit — its "
-                        "target was freed at line %d; reset it ('%.*s = null;') "
-                        "after the free, or free through it before returning",
-                        (int)h->path_len, h->path, h->free_line,
-                        (int)h->path_len, h->path);
+                    ir_report_dangling_global(zc, last->source_line, h, false);
                     if (reported_n >= reported_cap) {
                         reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
                         int *nr = (int *)realloc(reported_ids,
@@ -9067,10 +9246,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 } else {
                     const char *alloc_verb = "pool.free";
                     if (h->source_color == ZC_COLOR_MALLOC) alloc_verb = "free";
-                    ir_zc_error(zc, last->source_line,
-                        "handle %%%d (local '%.*s') allocated at line %d but never freed — "
-                        "add defer %s() or return the handle",
-                        h->local_id,
+                    ir_zc_error_for(zc, func, h->local_id, last->source_line,
+                        "handle %s (local '%.*s') allocated at line %d but never freed — "
+                        "add defer %s() or return the handle", ir_local_desc(zc, func, h->local_id, NULL, 0),
                         (int)func->locals[h->local_id].name_len,
                         func->locals[h->local_id].name,
                         h->alloc_line, alloc_verb);

@@ -384,6 +384,8 @@ struct Symbol {
 
     /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
     uint64_t mmio_bound;        /* max valid index (0 = no bound) */
+    bool is_global_var_mmio;    /* BUG-1056: mmio_bound came from a GLOBAL declaration */
+    int8_t mmio_bound_checked;  /* BUG-1056 (globals): 0 = not yet, 1 = valid, -1 = reassigned somewhere */
 
     /* cross-function range summary: return value range for simple functions */
     int64_t return_range_min;
@@ -509,5 +511,7 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
                   Type *type, uint32_t line, const char *file);
 Symbol *scope_lookup(Scope *s, const char *name, uint32_t name_len);
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len);
+
+bool type_is_null_sentinel(Type *inner);   /* ?*T / ?funcptr use NULL as none */
 
 #endif /* ZER_TYPES_H */

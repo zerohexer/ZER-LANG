@@ -1,0 +1,38 @@
+// BUG-1051: `target = X orelse ...;` where the TARGET is an optional that is
+// NOT a local (a global, a field, an array element). The statement lowers to
+// `tmp = unwrap(X); target = tmp;` through a synthesized identifier that had
+// no type, so the emitter's T -> ?T wrap was skipped and GCC refused the C
+// ("incompatible types when assigning to type '_zer_opt_u32'").
+struct H { ?u32 v; ?[*]u32 s; }
+?u32 gv;
+?[*]u32 gs;
+H gh;
+?u32[2] garr;
+?bool gb;
+
+?u32 three() { return 3; }
+?bool yes() { return true; }
+
+u32 main() {
+    gv = three() orelse return;
+    gs = alloc(u32, 4) orelse return;
+    [*]u32 s = gs orelse return;
+    s[1] = 9;
+    H h;
+    h.v = three() orelse return;
+    gh.v = three() orelse 7;
+    garr[1] = three() orelse return;
+    bool t = true;
+    gb = t && (yes() orelse false);
+    u32 a = gv orelse 0;
+    u32 b = h.v orelse 0;
+    u32 c = gh.v orelse 0;
+    u32 d = garr[1] orelse 0;
+    bool e = gb orelse false;
+    [*]u32 s2 = gs orelse return;
+    u32 f = s2[1];
+    free(s2);
+    gs = null;
+    if (a != 3 || b != 3 || c != 3 || d != 3 || !e || f != 9) { return 1; }
+    return 0;
+}

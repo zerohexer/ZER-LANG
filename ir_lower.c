@@ -442,6 +442,23 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
     return -1;
 }
 
+/* BUG-1051: the ONE way to name an IR local from synthesized AST. Six sites
+ * built this identifier by hand and only some registered its TYPE, so a
+ * consumer asking checker_get_type got NULL and took an untyped fallback:
+ * `g = f() orelse return;` into an OPTIONAL global (or field) stored a bare
+ * `T` into `?T` with no `{ v, 1 }` wrap and GCC refused the C. The identifier
+ * stands for the local, so it carries the local's type — by construction. */
+static Node *make_local_ident(LowerCtx *ctx, IRLocal *l, SrcLoc loc) {
+    Node *id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+    memset(id, 0, sizeof(Node));
+    id->kind = NODE_IDENT;
+    id->loc = loc;
+    id->ident.name = l->name;
+    id->ident.name_len = (size_t)l->name_len;
+    if (l->type) checker_set_type(ctx->checker, id, l->type);
+    return id;
+}
+
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
@@ -757,12 +774,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                     int idx_id = lower_expr(ctx, expr->index_expr.index);
                     if (idx_id >= 0) {
                         IRLocal *il = &ctx->func->locals[idx_id];
-                        Node *new_idx = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                        memset(new_idx, 0, sizeof(Node));
-                        new_idx->kind = NODE_IDENT;
-                        new_idx->loc = expr->loc;
-                        new_idx->ident.name = il->name;
-                        new_idx->ident.name_len = (size_t)il->name_len;
+                        Node *new_idx = make_local_ident(ctx, il, expr->loc);
                         expr->index_expr.index = new_idx;
                     }
                 }
@@ -932,12 +944,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         int val_local = lower_expr(ctx, expr->assign.value);
         if (val_local < 0) goto passthrough; /* void/array RHS — can't decompose */
         IRLocal *vloc = &ctx->func->locals[val_local];
-        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-        memset(tmp_id, 0, sizeof(Node));
-        tmp_id->kind = NODE_IDENT;
-        tmp_id->loc = expr->loc;
-        tmp_id->ident.name = vloc->name;
-        tmp_id->ident.name_len = (size_t)vloc->name_len;
+        Node *tmp_id = make_local_ident(ctx, vloc, expr->loc);
         Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
         memset(new_assign, 0, sizeof(Node));
         new_assign->kind = NODE_ASSIGN;
@@ -2196,12 +2203,7 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
         int tmp = create_temp(ctx, rt, line);
         lower_orelse_to_dest(ctx, tmp, n, line);
         IRLocal *tloc = &ctx->func->locals[tmp];
-        Node *id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-        memset(id, 0, sizeof(Node));
-        id->kind = NODE_IDENT;
-        id->loc = n->loc;
-        id->ident.name = tloc->name;
-        id->ident.name_len = (size_t)tloc->name_len;
+        Node *id = make_local_ident(ctx, tloc, n->loc);
         /* BUG-942: register the replacement's type. The synthesized identifier had
          * NO typemap entry, so any consumer that asks `checker_get_type` for it got
          * NULL and took its untyped fallback. That never showed while every caller
@@ -2833,12 +2835,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         int tmp = create_temp(ctx, rt, node->loc.line);
                         lower_orelse_to_dest(ctx, tmp, orelse, node->loc.line);
                         IRLocal *tloc = &ctx->func->locals[tmp];
-                        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                        memset(tmp_id, 0, sizeof(Node));
-                        tmp_id->kind = NODE_IDENT;
-                        tmp_id->loc = node->loc;
-                        tmp_id->ident.name = tloc->name;
-                        tmp_id->ident.name_len = (size_t)tloc->name_len;
+                        Node *tmp_id = make_local_ident(ctx, tloc, node->loc);
                         Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                         memset(new_assign, 0, sizeof(Node));
                         new_assign->kind = NODE_ASSIGN;
@@ -2920,7 +2917,51 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         Node *if_cond_lock = emit_shared_lock_around_cond(ctx, node->if_stmt.cond,
                                                            node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        br.cond_local = lower_expr(ctx, node->if_stmt.cond);
+        /* BUG-1054: a MUTABLE capture `|*v|` must point INTO the optional the
+         * condition names. lower_expr copies any condition that is not a plain
+         * local (a global, a field, an array element, a deref) into a temp, and
+         * the capture then pointed into that COPY: `if (g) |*v| { *v = 3; }`
+         * left `g` unchanged — a silent lost write. Evaluate the ADDRESS of the
+         * lvalue once, branch on a read through it, and bind the capture to
+         * that address (IR_COPY adapts `*?T -> *T` as `&p->value`). */
+        int cap_addr_local = -1;
+        {
+            Node *cn = node->if_stmt.cond;
+            bool lvalue = cn && (cn->kind == NODE_FIELD || cn->kind == NODE_INDEX ||
+                (cn->kind == NODE_UNARY && cn->unary.op == TOK_STAR) ||
+                (cn->kind == NODE_IDENT &&
+                 ir_find_local(ctx->func, cn->ident.name,
+                               (uint32_t)cn->ident.name_len) < 0));
+            Type *ct = checker_get_type(ctx->checker, cn);
+            Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
+            if (has_capture && node->if_stmt.capture_is_ptr && lvalue &&
+                ce && type_dispatch_kind(ce) == TYPE_OPTIONAL &&
+                !type_is_null_sentinel(ce->optional.inner) &&
+                ce->optional.inner &&
+                type_dispatch_kind(ce->optional.inner) != TYPE_VOID) {
+                Node *amp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(amp, 0, sizeof(Node));
+                amp->kind = NODE_UNARY;
+                amp->loc = cn->loc;
+                amp->unary.op = TOK_AMP;
+                amp->unary.operand = cn;
+                checker_set_type(ctx->checker, amp, type_pointer(ctx->arena, ct));
+                cap_addr_local = lower_expr(ctx, amp);
+                if (cap_addr_local >= 0) {
+                    Node *dr = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(dr, 0, sizeof(Node));
+                    dr->kind = NODE_UNARY;
+                    dr->loc = cn->loc;
+                    dr->unary.op = TOK_STAR;
+                    dr->unary.operand = make_local_ident(ctx,
+                        &ctx->func->locals[cap_addr_local], cn->loc);
+                    checker_set_type(ctx->checker, dr, ct);
+                    br.cond_local = lower_expr(ctx, dr);
+                }
+            }
+        }
+        if (cap_addr_local < 0)
+            br.cond_local = lower_expr(ctx, node->if_stmt.cond);
         emit_shared_unlock_after_cond(ctx, if_cond_lock, node->loc.line);
         br.true_block = bb_then;
         br.false_block = bb_else >= 0 ? bb_else : bb_join;
@@ -2943,7 +2984,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     /* capture = condition (IR_COPY handles unwrap via type adaptation) */
                     IRInst cap = make_inst(IR_COPY, node->loc.line);
                     cap.dest_local = cap_id;
-                    cap.src1_local = br.cond_local;
+                    cap.src1_local = cap_addr_local >= 0 ? cap_addr_local   /* BUG-1054 */
+                                                         : br.cond_local;
                     emit_inst(ctx, cap);
                 }
             }
@@ -3395,12 +3437,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     break;
                 }
                 IRLocal *vl = &ctx->func->locals[val_local];
-                Node *ident = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                memset(ident, 0, sizeof(Node));
-                ident->kind = NODE_IDENT;
-                ident->loc = node->loc;
-                ident->ident.name = vl->name;
-                ident->ident.name_len = (size_t)vl->name_len;
+                Node *ident = make_local_ident(ctx, vl, node->loc);
                 /* Set type on synthesized ident so lower_expr and type inference
                  * see the correct union type (not ty_i32 fallback). */
                 checker_set_type(ctx->checker, ident, sw_type);
@@ -3421,12 +3458,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *pl = &ctx->func->locals[ptr_local];
-            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-            memset(sw_ref, 0, sizeof(Node));
-            sw_ref->kind = NODE_IDENT;
-            sw_ref->loc = node->loc;
-            sw_ref->ident.name = pl->name;
-            sw_ref->ident.name_len = (size_t)pl->name_len;
+            sw_ref = make_local_ident(ctx, pl, node->loc);
         } else {
             int val_local = lower_expr(ctx, node->switch_stmt.expr);
             if (val_local < 0) {
@@ -3435,12 +3467,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
-            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-            memset(sw_ref, 0, sizeof(Node));
-            sw_ref->kind = NODE_IDENT;
-            sw_ref->loc = node->loc;
-            sw_ref->ident.name = vl->name;
-            sw_ref->ident.name_len = (size_t)vl->name_len;
+            sw_ref = make_local_ident(ctx, vl, node->loc);
         }
 
         /* Gap 36: hoist complete — release the switch-expr lock before

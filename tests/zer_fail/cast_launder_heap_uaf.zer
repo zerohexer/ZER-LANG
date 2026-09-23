@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: use of freed handle
+// expect-error: use after free: 'g' is freed
 // BUG-931: a C-style cast is an IDENTITY cast the emitter deletes entirely, so
 // `g = (*N)n` is byte-identical to `g = n` in the emitted C — but only the latter
 // was tracked, so the free never linked to the later read through the global.

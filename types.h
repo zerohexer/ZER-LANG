@@ -425,7 +425,12 @@ struct Symbol {
 
 struct Scope {
     Scope *parent;          /* enclosing scope (NULL for module level) */
-    Symbol *symbols;        /* dynamic array */
+    /* BUG-1119: an array of POINTERS to individually-allocated Symbols. It was an
+     * array of Symbol VALUES that was copied on growth, so any Symbol* held across
+     * a later scope_add on the same scope (an auto-slab created by `alloc(T)`
+     * mid-body adds to the GLOBAL scope) pointed at a stale copy — reads saw old
+     * flags and writes were lost. Addresses are now stable for the arena's life. */
+    Symbol **symbols;
     uint32_t symbol_count;
     uint32_t symbol_capacity;
     const char *module_name; /* non-NULL for module-level scopes */

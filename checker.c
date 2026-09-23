@@ -704,7 +704,7 @@ Symbol *find_unique_allocator(Scope *s, Type *elem_type) {
     Symbol *found = NULL;
     for (Scope *sc = s; sc; sc = sc->parent) {
         for (uint32_t i = 0; i < sc->symbol_count; i++) {
-            Type *t = sc->symbols[i].type;
+            Type *t = sc->symbols[i]->type;
             if (!t) continue;
             if ((t->kind == TYPE_SLAB && type_equals(t->slab.elem, elem_type)) ||
                 (t->kind == TYPE_POOL && type_equals(t->pool.elem, elem_type))) {
@@ -714,7 +714,7 @@ Symbol *find_unique_allocator(Scope *s, Type *elem_type) {
                  * Don't treat these as ambiguous — same Type* = same allocator. */
                 if (found && found->type == t) continue; /* same allocator, skip */
                 if (found) return NULL; /* genuinely different allocator — ambiguous */
-                found = &sc->symbols[i];
+                found = sc->symbols[i];
             }
         }
     }
@@ -27620,7 +27620,7 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                     if (!dup) {
                         /* Find the Type* for this type_id — scan global scope */
                         for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
-                            Symbol *s = &c->global_scope->symbols[si];
+                            Symbol *s = c->global_scope->symbols[si];
                             if (s->type) {
                                 Type *eff = type_unwrap_distinct(s->type);
                                 if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&

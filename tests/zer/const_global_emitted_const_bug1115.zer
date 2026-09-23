@@ -1,0 +1,12 @@
+// BUG-1115: a `const` global is emitted as a C `const` object (read-only data /
+// flash on bare metal), not a plain RAM variable. Reads through every form work.
+const u32 A = 5;
+struct S { u32 x; u32 y; }
+const S gs;
+const u32[4] tab;
+u32 get(const *u32 p) { return *p; }
+u32 main() {
+    if (get(&A) != 5) { return 1; }
+    if (gs.x != 0 || tab[3] != 0) { return 2; }
+    return A - 5;
+}

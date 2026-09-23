@@ -1,0 +1,6 @@
+// zerc-flags: --stack-limit 64
+// EXPECTED: compile error
+// expect-error: stack_diag_has_line_bug1114.zer:5: error: function 'big' local stack
+// BUG-1114: every stack-analysis diagnostic was reported at `file:0`.
+u32 big() { u8[200] b; b[0] = 1; return b[0]; }
+u32 main() { return big() - 1; }

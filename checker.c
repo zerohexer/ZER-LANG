@@ -3731,6 +3731,91 @@ static bool packed_array_field_view(Checker *c, Node *v) {
     return packed_seen;
 }
 
+/* BUG-1057: which qualifiers does the MEMORY behind an array-valued
+ * expression carry? The array->slice coercion builds a `{ptr,len}` view, and a
+ * view has no way to remember that the array it points into was `volatile` or
+ * `const` — so the qualifier must be checked where the view is FORMED. The old
+ * rule (BUG-310 / BUG-182) looked only at a bare IDENT's Symbol, so a FIELD of a
+ * volatile register block was coerced silently:
+ *
+ *     volatile *Uart u = @inttoptr(*Uart, BASE);
+ *     kick(u.fifo);          // `s[0] = 1; s[0] = 2;` — GCC deleted the first store
+ *     [*]u32 t = cr.arr;     // cr a `const R` — writable view of const memory
+ *
+ * Walks the lvalue path: a pointer / slice step contributes ITS pointee's
+ * qualifiers and ends the walk (what the pointer points at is the memory); an
+ * array / struct step continues to its object; the root Symbol contributes its
+ * own. Conservative on nothing — an unknown step simply contributes nothing,
+ * which is the same answer the old rule gave. */
+static void array_view_qualifiers(Checker *c, Node *v, bool *is_vol, bool *is_const) {
+    *is_vol = false;
+    *is_const = false;
+    if (v && v->kind == NODE_SLICE) v = v->slice.object;
+    for (int depth = 0; v && depth <= ZER_EXPR_WALK_MAX; depth++) {
+        Node *obj = NULL;
+        if (v->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                     (uint32_t)v->ident.name_len);
+            if (s) { *is_vol |= s->is_volatile; *is_const |= s->is_const; }
+            return;
+        }
+        if (v->kind == NODE_FIELD) obj = v->field.object;
+        else if (v->kind == NODE_INDEX) obj = v->index_expr.object;
+        else if (v->kind == NODE_UNARY && v->unary.op == TOK_STAR) obj = v->unary.operand;
+        else return;
+        Type *ot = checker_get_type(c, obj);
+        switch (type_dispatch_kind(ot)) {
+        case TYPE_POINTER: {
+            Type *pe = type_unwrap_distinct(ot);
+            *is_vol |= pe->pointer.is_volatile;
+            *is_const |= pe->pointer.is_const;
+            return;
+        }
+        case TYPE_SLICE: {
+            Type *se = type_unwrap_distinct(ot);
+            *is_vol |= se->slice.is_volatile;
+            *is_const |= se->slice.is_const;
+            return;
+        }
+        default:
+            break;
+        }
+        if (v->kind == NODE_UNARY) return;   /* deref of a non-pointer: nothing to add */
+        v = obj;
+    }
+}
+
+/* BUG-1057: the ONE reporter for a qualifier dropped by forming a slice over an
+ * array — every value-flow sink (var-decl, assign, call arg, return, struct
+ * field, orelse fallback, spawn arg, global init) calls it through
+ * reject_array_view_hazards. */
+static bool reject_array_view_qualifier_drop(Checker *c, Node *v, Type *dest, int line) {
+    if (!v) return false;
+    Type *d = type_unwrap_distinct(dest);
+    while (d && type_dispatch_kind(d) == TYPE_OPTIONAL)
+        d = type_unwrap_distinct(d->optional.inner);
+    if (!d || type_dispatch_kind(d) != TYPE_SLICE) return false;
+    Node *src = v->kind == NODE_SLICE ? v->slice.object : v;
+    if (type_dispatch_kind(checker_get_type(c, src)) != TYPE_ARRAY) return false;
+    bool vol, cst;
+    array_view_qualifiers(c, v, &vol, &cst);
+    const char *what = (src->kind == NODE_IDENT) ? "array" : "array field";
+    if (vol && !d->slice.is_volatile) {
+        checker_error(c, line,
+            "cannot form a non-volatile slice over a volatile %s — the view would let "
+            "the compiler coalesce or delete the device accesses; use 'volatile [*]%s'",
+            what, type_name(d->slice.inner));
+        return true;
+    }
+    if (cst && !d->slice.is_const) {
+        checker_error(c, line,
+            "cannot form a mutable slice over a const %s — would allow writing to "
+            "read-only memory; use 'const [*]%s'", what, type_name(d->slice.inner));
+        return true;
+    }
+    return false;
+}
+
 /* The shared REPORTER, so every coercion sink words it identically. */
 static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) {
     if (!v || type_dispatch_kind(dest) != TYPE_SLICE) return false;
@@ -3742,6 +3827,12 @@ static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) 
         "the slice cannot see that. Copy the field to an aligned local, or view it as "
         "bytes ([*]u8)");
     return true;
+}
+
+/* BUG-1057: every hazard of forming a slice over an array, at one call. */
+static bool reject_array_view_hazards(Checker *c, Node *v, Type *dest, int line) {
+    if (reject_packed_array_view(c, v, dest, line)) return true;
+    return reject_array_view_qualifier_drop(c, v, dest, line);
 }
 
 static bool value_is_packed_derived(Checker *c, Node *v) {
@@ -4977,7 +5068,7 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                 if (vt && ft) {
                     reject_unique_resource_copy(c, df->value, ft,
                                                 line, "initialize");
-                    reject_packed_array_view(c, df->value, ft, line);
+                    reject_array_view_hazards(c, df->value, ft, line);
                 }
                 if (vt && ft && !value_flows_to(df->value, vt, ft)) {
                     char what[96];
@@ -9746,36 +9837,11 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-245: const array → mutable slice assignment blocked */
-        if (node->assign.op == TOK_EQ &&
-            target && type_unwrap_distinct(target)->kind == TYPE_SLICE &&
-            !type_unwrap_distinct(target)->slice.is_const &&
-            value && type_unwrap_distinct(value)->kind == TYPE_ARRAY) {
-            /* look up value symbol to check is_const */
-            Node *vroot = node->assign.value;
-            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
-                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
-                else vroot = vroot->index_expr.object;
-            }
-            if (vroot && vroot->kind == NODE_IDENT) {
-                Symbol *vsym = scope_lookup(c->current_scope,
-                    vroot->ident.name, (uint32_t)vroot->ident.name_len);
-                if (vsym && vsym->is_const) {
-                    checker_error(c, node->loc.line,
-                        "cannot assign const array to mutable slice — "
-                        "would allow writing to read-only memory");
-                }
-                /* BUG-310: volatile array → volatile slice propagation.
-                 * If source is volatile array and target is non-volatile slice, reject. */
-                if (vsym && vsym->is_volatile &&
-                    target->kind == TYPE_SLICE && !target->slice.is_volatile) {
-                    checker_error(c, node->loc.line,
-                        "cannot assign volatile array to non-volatile slice — "
-                        "use 'volatile []%s' to preserve volatile qualifier",
-                        type_name(target->slice.inner));
-                }
-            }
-        }
+        /* BUG-245/310 -> BUG-1057: every hazard of forming a slice over an array
+         * (packed misalignment, dropped volatile, dropped const) — the shared
+         * reporter every other value-flow sink already calls. */
+        if (node->assign.op == TOK_EQ && target)
+            reject_array_view_hazards(c, node->assign.value, target, node->loc.line);
 
         /* Designated initializer in assignment: validate fields */
         if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target) {
@@ -10991,37 +11057,8 @@ static Type *check_expr(Checker *c, Node *node) {
                             }
                         }
                     }
-                    /* const array → mutable slice coercion: check if arg var is const */
-                    if (arg && type_unwrap_distinct(arg)->kind == TYPE_ARRAY &&
-                        param && type_unwrap_distinct(param)->kind == TYPE_SLICE &&
-                        !type_unwrap_distinct(param)->slice.is_const &&
-                        node->call.args[i]->kind == NODE_IDENT) {
-                        Symbol *arg_sym = scope_lookup(c->current_scope,
-                            node->call.args[i]->ident.name,
-                            (uint32_t)node->call.args[i]->ident.name_len);
-                        if (arg_sym && arg_sym->is_const) {
-                            checker_error(c, node->loc.line,
-                                "argument %d: cannot pass const array '%.*s' to mutable slice parameter",
-                                i + 1, (int)arg_sym->name_len, arg_sym->name);
-                        }
-                    }
-                    /* BUG-310: volatile array → non-volatile slice param rejected.
-                     * Volatile must propagate — use volatile []T param. */
-                    if (arg && type_unwrap_distinct(arg)->kind == TYPE_ARRAY &&
-                        param && type_unwrap_distinct(param)->kind == TYPE_SLICE &&
-                        !param->slice.is_volatile &&
-                        node->call.args[i]->kind == NODE_IDENT) {
-                        Symbol *arg_sym = scope_lookup(c->current_scope,
-                            node->call.args[i]->ident.name,
-                            (uint32_t)node->call.args[i]->ident.name_len);
-                        if (arg_sym && arg_sym->is_volatile) {
-                            checker_error(c, node->loc.line,
-                                "argument %d: cannot pass volatile array '%.*s' to non-volatile slice parameter — "
-                                "use 'volatile []%s' parameter type",
-                                i + 1, (int)arg_sym->name_len, arg_sym->name,
-                                type_name(param->slice.inner));
-                        }
-                    }
+                    /* BUG-182/310 const / volatile array -> slice: now the shared
+                     * reject_array_view_hazards below (BUG-1057). */
 
                     /* []T → *T auto-coerce for extern (no body) C functions only.
                      * Emitter will auto-emit .ptr at call site.
@@ -11086,7 +11123,7 @@ static Type *check_expr(Checker *c, Node *node) {
 
                     reject_unique_resource_copy(c, node->call.args[i], param,
                                                 node->loc.line, "pass");
-                    reject_packed_array_view(c, node->call.args[i], param,
+                    reject_array_view_hazards(c, node->call.args[i], param,
                                              node->loc.line);
                     if (!value_flows_to(node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
@@ -12619,7 +12656,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* fallback must match unwrapped type */
                 reject_unique_resource_copy(c, node->orelse.fallback, unwrapped,
                                             node->loc.line, "use");
-                reject_packed_array_view(c, node->orelse.fallback, unwrapped,
+                reject_array_view_hazards(c, node->orelse.fallback, unwrapped,
                                          node->loc.line);
                 if (!value_flows_to(node->orelse.fallback, fallback, unwrapped)) {
                     if (!report_value_flow_refusal(c, node->orelse.fallback, unwrapped,
@@ -13655,6 +13692,13 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_error(c, node->loc.line,
                                 "@inttoptr address must be an integer, got '%s'",
                                 type_name(val_type));
+                        } else if (type_width(eff) > 64) {
+                            /* BUG-1058: the runtime range check holds the address in
+                             * 64 bits; a wider operand would be truncated first. */
+                            checker_error(c, node->loc.line,
+                                "@inttoptr address must be at most 64 bits wide, got '%s' — "
+                                "narrow it explicitly with @truncate",
+                                type_name(val_type));
                         }
                     }
                     /* BUG-797: an address that came from a VOLATILE pointer cannot
@@ -13693,6 +13737,18 @@ static Type *check_expr(Checker *c, Node *node) {
                         int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
+                        node->intrinsic.addr_is_const = true;   /* BUG-1058 */
+                        node->intrinsic.const_addr = addr;
+                        /* BUG-1058: a constant address the target pointer cannot
+                         * hold is a DIFFERENT address after the cast — `-m32`
+                         * turned 0x1_0000_0010 into 0x10 while this gate had
+                         * validated the full value. */
+                        if (c->target_ptr_bits > 0 && c->target_ptr_bits < 64 &&
+                            (addr >> c->target_ptr_bits) != 0) {
+                            checker_error(c, node->loc.line,
+                                "@inttoptr address 0x%llx does not fit in a %d-bit pointer",
+                                (unsigned long long)addr, c->target_ptr_bits);
+                        }
                         /* plt86m audit 2026-06-17: the range gate must account
                          * for the ACCESS SPAN (sizeof T), not just the start
                          * address — a *u32 at range_end-2 reads 2 bytes past the
@@ -17250,20 +17306,8 @@ static void check_stmt(Checker *c, Node *node) {
                         "cannot initialize mutable slice from const — "
                         "would allow writing to read-only memory");
                 }
-                /* BUG-310: volatile array → non-volatile slice rejected */
-                if (type->kind == TYPE_SLICE && !type->slice.is_volatile &&
-                    init_type->kind == TYPE_ARRAY &&
-                    node->var_decl.init->kind == NODE_IDENT) {
-                    Symbol *vs = scope_lookup(c->current_scope,
-                        node->var_decl.init->ident.name,
-                        (uint32_t)node->var_decl.init->ident.name_len);
-                    if (vs && vs->is_volatile) {
-                        checker_error(c, node->loc.line,
-                            "cannot initialize non-volatile slice from volatile array — "
-                            "use 'volatile []%s' to preserve volatile qualifier",
-                            type_name(type->slice.inner));
-                    }
-                }
+                /* BUG-310 volatile array -> slice: reject_array_view_hazards
+                 * below (BUG-1057), which also sees a FIELD / pointer step. */
             }
 
             /* Designated initializer: validate fields against target struct type */
@@ -17276,7 +17320,7 @@ static void check_stmt(Checker *c, Node *node) {
 
             reject_unique_resource_copy(c, node->var_decl.init, type,
                                         node->loc.line, "initialize");
-            reject_packed_array_view(c, node->var_decl.init, type, node->loc.line);
+            reject_array_view_hazards(c, node->var_decl.init, type, node->loc.line);
             if (!value_flows_to(node->var_decl.init, init_type, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "'%.*s'",
@@ -19836,7 +19880,7 @@ static void check_stmt(Checker *c, Node *node) {
                             "or build a fresh one in the function",
                             unique_resource_name(c->current_func_ret, 0));
                 }
-                reject_packed_array_view(c, node->ret.expr, c->current_func_ret,
+                reject_array_view_hazards(c, node->ret.expr, c->current_func_ret,
                                          node->loc.line);
                 if (!value_flows_to(node->ret.expr, ret_type, c->current_func_ret)) {
                     if (!report_value_flow_refusal(c, node->ret.expr,
@@ -21474,7 +21518,7 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 reject_unique_resource_copy(c, node->spawn_stmt.args[i], param_type,
                                             node->loc.line, "pass");
-                reject_packed_array_view(c, node->spawn_stmt.args[i], param_type,
+                reject_array_view_hazards(c, node->spawn_stmt.args[i], param_type,
                                          node->loc.line);
                 if (!value_flows_to(node->spawn_stmt.args[i], arg_type, param_type)) {
                     char what[48];
@@ -26291,7 +26335,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
             }
             reject_unique_resource_copy(c, decl->var_decl.init, type,
                                         decl->loc.line, "initialize");
-            reject_packed_array_view(c, decl->var_decl.init, type, decl->loc.line);
+            reject_array_view_hazards(c, decl->var_decl.init, type, decl->loc.line);
             if (!value_flows_to(decl->var_decl.init, init, type)) {
                 char what[96];
                 snprintf(what, sizeof(what), "global '%.*s'",

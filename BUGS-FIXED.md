@@ -113,6 +113,45 @@ correctly (it used `type_width`, 0 for a struct, so `volatile *Regs r = @inttopt
 was refused outright). Tests: `tests/zer_fail/mmio_bound_stale_*_bug1056.zer` (all three
 accepted pre-fix), `tests/zer/mmio_struct_block_bound_bug1056.zer` (refused pre-fix).
 
+### BUG-1057 — a slice over a volatile / const ARRAY FIELD dropped the qualifier (accept-unsafe)
+
+`volatile *Uart u = @inttoptr(*Uart, BASE); kick(u.fifo);` with `kick([*]u32 s) { s[0] = 1;
+s[0] = 2; }` — GCC deleted the first FIFO store (objdump: one `movl $0x2`). Same for
+`[*]u32 s = r.arr;`, `r.arr[0..2]`, a `volatile R` global's field, and the const sibling
+`const R cr; [*]u32 t = cr.arr; t[1] = 2;` (a write into a const object that RAN). The
+BUG-310 / BUG-182 rules looked only at a bare IDENT's Symbol, at three of the eight value-flow
+sinks. Now ONE qualifier walk `array_view_qualifiers` (a pointer/slice step contributes its
+pointee's qualifiers; an array/struct step continues; the root Symbol contributes its own) and
+ONE reporter `reject_array_view_qualifier_drop`, folded with the packed-view reporter into
+`reject_array_view_hazards`, called at every sink. That also closed the ASSIGN sink for
+BUG-972's packed view (`s = gp.w;` — the one sink it was never wired to). The three ident-only
+checks were deleted. Tests: `tests/zer_fail/{volatile,const}_field_slice_drop_bug1057.zer`,
+`tests/zer_fail/packed_array_view_assign_bug1057.zer`, `tests/zer/volatile_field_slice_view_ok_bug1057.zer`.
+
+### BUG-1058 — `@inttoptr` range-checked a TRUNCATED address; the span test wrapped (accept-unsafe on 32-bit / near 2^64)
+
+(1) The variable-address check cast to `uintptr_t` FIRST, so with `--target-bits 32` / `-m32`
+`rd(0x1_4000_0010)` was checked as `0x4000_0010` and read an in-range register it never named.
+(2) `ma + (sizeof(T) - 1) <= end` wraps: `0xFFFFFFFFFFFFFFFE` passed a range ending at
+`0x400000FF` and was dereferenced. (3) A constant address above the pointer width was
+validated at full width and then truncated by the cast. (4) Found beside them: a `const`-ident
+address in a GLOBAL initializer emitted a statement expression at file scope (GCC error).
+The AST and IR emitters carried identical copies; now ONE `emit_inttoptr`: the address is held
+in `uint64_t` (the checker refuses an operand wider than 64 bits), trapped if it exceeds
+`UINTPTR_MAX`, range-checked as `ma <= end && end - ma >= span - 1`, then narrowed. The checker
+records a folded constant address on the node (`intrinsic.addr_is_const`/`const_addr`) so the
+emitter emits a plain cast for it, and refuses a constant that does not fit `target_ptr_bits`.
+Tests: `tests/zer_trap/inttoptr_span_wraparound_bug1058.zer`,
+`tests/zer_fail/inttoptr_const_addr_too_wide_bug1058.zer`, `tests/zer/inttoptr_const_ident_global_init_bug1058.zer`.
+
+### Harness — `tests/test_zer.sh` shared one diagnostic file across concurrent runs
+
+`/tmp/_zer_neg_err.txt` and `/tmp/_zer_gap_err.txt` were fixed paths, so a `make check`
+running beside a hand run read the other run's diagnostics: 84 correct negatives reported
+"rejected, but for the WRONG REASON" in one measured collision. Now `mktemp` per run. The
+`tests/test_*_matrix.c` grids still use fixed `/tmp/_zer_*` paths — recorded in
+docs/limitations.md; do not run two grid-running `make check`s at once.
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

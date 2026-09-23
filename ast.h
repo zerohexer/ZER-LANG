@@ -637,6 +637,12 @@ struct Node {
             Node **args;
             int arg_count;
             TypeNode *type_arg;     /* for @ptrcast(*T, expr), @size(T), etc. */
+            /* BUG-1058: @inttoptr's address, when the CHECKER folded it to a
+             * constant (a literal or a `const` ident) — the emitter emits a
+             * plain cast for it (legal in a global initializer) and the
+             * runtime checks only for a genuinely variable address. */
+            bool addr_is_const;
+            uint64_t const_addr;
         } intrinsic;
 
         /* NODE_TYPECAST: (Type)expr — explicit C-style cast */

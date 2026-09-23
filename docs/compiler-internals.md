@@ -13936,3 +13936,42 @@ added only when the name does not already carry it. The arena `alloc` / `alloc_s
 element is spelled with `emit_type` (module-prefixed), not a hand-rolled `struct <name>`.
 Residuals: limitations.md "AST-path container-method receivers" and "same NON-static global
 name in two modules".
+
+## 2026-09-23 session — shared queries introduced (BUG-1049..1059, 1110..1115)
+
+Each is ONE answer to a question that used to be answered at several sites. Call it; do not
+re-derive the question at a new site.
+
+| query / helper | file | question it answers | replaced |
+|---|---|---|---|
+| bare-ident arm of `ir_extract_compound_key` | zercheck_ir.c | "which tracking entry names this bare GLOBAL?" — `(IR_GLOBAL_ROOT_ID, "g")`, the key BUG-739's store arm already used | a key only one arm could produce (BUG-1049) |
+| `ir_report_dangling_global` | zercheck_ir.c | the dangling-global sentence at the exit AND call boundaries, carrier-aware (a non-optional global cannot take `= null`) | two literal copies |
+| `ir_local_desc` + `ir_zc_error_for` | zercheck_ir.c | how to NAME an IR local in a diagnostic; drop a temp-only duplicate on a line already reported | 33 `local %%%d` prints (BUG-1050) |
+| `make_local_ident` | ir_lower.c | an AST identifier for an IR local, carrying the local's TYPE | 7 hand-built idents, some untyped (BUG-1051) |
+| `field.handle_alloc` (set by the checker) | ast.h / checker.c / emitter.c | which allocator a Handle auto-deref `h.f` uses | three emitter re-searches that gave up on 2 allocators (BUG-1053) |
+| `type_is_null_sentinel` | types.c | `?*T`/`?funcptr` are NULL-sentinel | emitter-private `is_null_sentinel` |
+| `ast_name_bind_count` | zercheck_ir.c | how many times is NAME bound (var-decl / if-capture / switch-capture) in a body | nothing — `ast_name_mutated_or_addrd` only asked "is the binding written" (BUG-1055) |
+| `mmio_inttoptr_bound` | checker.c | elements between a constant `@inttoptr` address and its range end, struct-aware | three copies using `type_width` (0 for a struct) (BUG-1056) |
+| `global_name_never_mutated` (cached on `Symbol.never_mutated_cache`) | checker.c | is a GLOBAL ever assigned / address-taken in ANY registered body (`Checker.reg_files`)? Ask it before trusting a global's DECLARATION initializer | stale MMIO bound; funcptr stack resolution (BUG-1056, 1059e) |
+| `reject_array_view_hazards` (= packed + `reject_array_view_qualifier_drop`) | checker.c | may this array-valued expression become this slice? (misaligned / dropped volatile / dropped const) — call it at EVERY value-flow sink | three ident-only checks; the assign sink never called the packed one (BUG-1057) |
+| `emit_inttoptr` | emitter.c | the one emission of `@inttoptr` for BOTH dispatch paths | two identical copies with the same truncation/wrap bugs (BUG-1058) |
+| `track_isr_pointee_of` | checker.c | naming a global pointer with an `&g` initializer reaches `g` (ISR sharing) | — (BUG-1059a) |
+| `comptime_cond_value` | checker.c | fold a compile-time CONDITION (bools included) for `comptime if` / `static_assert` | ad-hoc ident lookup + integer fold (BUG-1110) |
+| `emit_func_decl_head/params/tail` | emitter.c | the C declarator of a function, including one RETURNING a funcptr | two signature emitters, one wrong (BUG-1111) |
+
+Two traps met this session worth remembering:
+
+- **A walk that runs OUTSIDE the checker's own nesting must re-establish the context it
+  reads.** `record_isr_globals` is a post pass; `track_isr_global_ex` consulted
+  `critical_depth`, which was 0 there. The fix pushes/pops `critical_depth` at the walk's
+  `NODE_CRITICAL` arm. Any new context-sensitive predicate called from a post-pass walker has
+  the same hazard.
+- **A size/alignment walk that recomputes a child to learn its alignment is exponential in
+  depth.** `compute_type_size` did, and a 40-deep nest took 17 s (then 34 s once a second
+  caller appeared). Ask `type_alignment_bytes` — linear — for alignment, and remember a ZER
+  union carries an `int32_t _tag` (alignment >= 4).
+
+Parallel-work note: this session ran fix-agents in `.claude/worktrees/` under the repo. Add
+`.claude/` to `.git/info/exclude` before `git add -A`, and keep scratch tooling in a PRIVATE
+subdirectory — one agent overwrote a shared `corpus.sh`, and every concurrent
+`tests/test_*_matrix` run shares fixed `/tmp/_zer_*` paths (limitations.md).

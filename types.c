@@ -220,6 +220,27 @@ int type_width(Type *a) {
     }
 }
 
+/* BUG-1151: the C STORAGE size in bytes of a scalar type, or 0 when `a` is not
+ * a fixed-size scalar. `type_width` is the VALUE width — for a `uN` / `iN` it is N,
+ * not the carrier — so `width / 8` gave `u21` 2 bytes (carrier `uint32_t`, 4) and
+ * `u3` 0. Both callers that turned a width into bytes (compute_type_size and
+ * type_alignment_bytes below) now ask this, so an `@pun` into a struct holding a
+ * `u21` could no longer look non-widening (a measured 4-byte read of a 2-byte
+ * global) and a `*u21` MMIO pointer is aligned to its real carrier. The carrier
+ * rule is the emitter's (emit_intn_carrier): the smallest native int >= N. */
+int type_scalar_bytes(Type *a) {
+    if (!a) return 0;
+    a = type_unwrap_distinct(a);
+    if (!a) return 0;
+    TypeKind k = type_dispatch_kind(a);
+    if (k == TYPE_UINT || k == TYPE_SINT) {
+        uint32_t b = a->intn.bits;
+        return b <= 8 ? 1 : b <= 16 ? 2 : b <= 32 ? 4 : b <= 64 ? 8 : 16;
+    }
+    int w = type_width(a);
+    return w > 0 ? w / 8 : 0;
+}
+
 /* Required alignment in BYTES for type `a`. Returns 0 if alignment is
  * not computable (e.g., opaque). For aggregate types, alignment is the
  * max alignment of any field/element. Packed structs/unions = 1.
@@ -228,8 +249,8 @@ int type_width(Type *a) {
 int type_alignment_bytes(Type *a) {
     if (!a) return 0;
     a = type_unwrap_distinct(a);
-    int w = type_width(a);
-    if (w > 0) return w / 8;
+    int sb = type_scalar_bytes(a);   /* BUG-1151: the carrier, not the value width */
+    if (sb > 0) return sb;
     switch (a->kind) {
     case TYPE_POINTER: case TYPE_FUNC_PTR:
         return zer_target_ptr_bits / 8;

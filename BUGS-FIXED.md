@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-23e — BUG-1121..1129: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global designated initializers, missing prototypes
+## Session 2026-09-23e — BUG-1121..1129, 1150..1151: reference-audit defects (one silent), a retargeted pointer, a lent global reached through a callee, global and optional designated initializers, missing prototypes, @size vs sizeof
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
 **Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
@@ -32,6 +32,35 @@ and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[
 now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
 `type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
 refuses any non-identifier spelling, so no emitted name changes.
+
+### BUG-1151 — the checker's `@size` disagreed with C's `sizeof` (one of them an OOB read)
+Four guesses in `compute_type_size` / `type_alignment_bytes`, each measured:
+- `type_width / 8` is the VALUE width: a `u21` was 2 bytes (carrier `uint32_t`, 4) and a `u3` 0.
+  `@pun(*R, &u16_global)` with `struct R { u21 v; }` looked non-widening and read **4 bytes of
+  a 2-byte global** — ASan global-buffer-overflow, accepted clean. `struct Q { u3 a; u8 b; }`
+  folded to 5 (real 2).
+- an unknown member was a guessed 4 bytes (`struct S { Semaphore(1) s; u32 x; }` folded to 8).
+- an optional's alignment came from its SIZE (`?S3` for a 3-byte struct folded to 6, real 4).
+- BUG-275 deferred pointer-family sizes to a C `sizeof` while the CHECKER modelled the array as
+  length 0: `u8[@size(*u32)] b;` had `b.len == 0` at run time and every index was refused.
+Fixed with ONE scalar query, `type_scalar_bytes` (the emitter's carrier rule), used by both
+functions; pointer-family sizes computed from the target model (`zer_target_ptr_bits`, the value
+`type_alignment_bytes` already used); every unknown is `CONST_EVAL_FAIL`, never a number; and a
+`@size(T)` whose size is the platform's (a Semaphore / Barrier / allocator member) is refused as
+an array size rather than silently given length 0. `@size` now folds through ONE mechanism:
+`fold_size_intrinsics_in` records the value on the intrinsic node (`is_size_folded`, the
+`is_comptime_resolved` pattern) and the shared evaluator reads it — so `const usize K =
+@size(T); u8[K] b;` (refused before) and `u8[@size(T) * 2]` work, local and global, and the
+array path's inline copy of the computation is gone. Corpus: 0 verdict changes.
+Tests: `tests/zer/size_exact_bug1151.zer` (every compile-time size asserted against the runtime
+`@size`), `tests/zer_fail/{pun_widen_uN_carrier,size_platform_member}_bug1151.zer`.
+
+### BUG-1150 — a designated initializer into an OPTIONAL struct was refused at every sink
+`?P o = { .x = 1 };`, `opt = { .x = 1 };`, a `?P` parameter / return / field / global:
+"designated initializer requires struct type, got '?P'". `type_struct_literal` is now the one
+function that types a struct literal at a sink — the optional's INNER struct, which the ordinary
+`T -> ?T` coercion then wraps — replacing the validate-then-record pair written out at seven
+sites. Test: `tests/zer/opt_struct_designated_init_bug1150.zer`.
 
 ### BUG-1129 — a carrier holding TWO globals designated only one
 `H h = { .p = &g1, .q = &g2 }; bump(h);` with `bump` doing `*h.q += 1` beside an ISR writing

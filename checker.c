@@ -5568,6 +5568,7 @@ static Type *zero_value_nonnull_leaf(Type *t, const SField **leaf) {
     }
 }
 
+static Type *type_struct_literal(Checker *c, Node *sinit, Type *target, int line);
 static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
     Type *st = type_unwrap_distinct(target_type);
     if (st->kind != TYPE_STRUCT) {
@@ -5593,8 +5594,8 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                  * inner type. validate_struct_init emits the right error itself if
                  * `ft` is not a struct. (#13, 2026-06-24) */
                 if (df->value && df->value->kind == NODE_STRUCT_INIT) {
-                    validate_struct_init(c, df->value, ft, line);
-                    checker_set_type(c, df->value, ft);
+                    if (!type_struct_literal(c, df->value, ft, line))   /* BUG-1150 */
+                        checker_set_type(c, df->value, ft);
                     break;
                 }
                 /* BUG-831: the @inttoptr-into-non-volatile rule (BUG-799) had
@@ -5673,6 +5674,26 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
         return false;
     }
     return true;
+}
+
+/* BUG-1150: THE type a designated-initializer literal takes at a sink whose
+ * destination is `target`, or NULL (refused — already reported). A struct
+ * literal INTO an optional struct is the INNER struct (`?P o = { .x = 1 };`,
+ * `opt = { .x = 1 };`, a `?P` param / return / field); the ordinary `T -> ?T`
+ * coercion then wraps it. The literal was validated against `?P` itself and
+ * refused ("designated initializer requires struct type, got '?P'"). ONE
+ * function sets the literal's type for every sink, so no sink can record the
+ * optional by mistake. */
+static Type *type_struct_literal(Checker *c, Node *sinit, Type *target, int line) {
+    if (!sinit || !target) return NULL;
+    Type *lt = target;
+    Type *u = type_unwrap_distinct(target);
+    if (u && type_dispatch_kind(u) == TYPE_OPTIONAL && u->optional.inner &&
+        type_dispatch_kind(u->optional.inner) == TYPE_STRUCT)
+        lt = u->optional.inner;
+    if (!validate_struct_init(c, sinit, lt, line)) return NULL;
+    typemap_set(c, sinit, lt);
+    return lt;
 }
 
 /* ---- Auto-slab helper ---- */
@@ -6144,33 +6165,62 @@ static bool check_const_strip(Checker *c, Node *src_expr, Type *src_type,
  * Handles nested structs, arrays, pointers, slices with natural alignment. */
 static int64_t compute_type_size(Type *t) {
     t = type_unwrap_distinct(t);
-    /* BUG-275/280: target-dependent types — don't constant-fold.
-     * Let the emitter use sizeof() which GCC resolves per target. */
-    if (t->kind == TYPE_POINTER) return CONST_EVAL_FAIL;
-    if (t->kind == TYPE_SLICE) return CONST_EVAL_FAIL;
-    if (t->kind == TYPE_USIZE) return CONST_EVAL_FAIL;
-    int w = type_width(t);
-    if (w > 0) return w / 8;
+    /* BUG-1151: pointer-family sizes come from the TARGET model the checker
+     * already runs on (zer_target_ptr_bits: the target GCC's __SIZEOF_SIZE_T__, or
+     * --target-bits; type_alignment_bytes uses the same value). BUG-275/280 had
+     * them deferred to a `sizeof` in the emitted C instead — and the checker then
+     * modelled the array as SIZE 0: `u8[@size(*u32)] b;` had `b.len == 0` at run
+     * time (8 in C) and every `b[i]` refused as out of bounds. One model, one
+     * answer. The layouts are the emitter's: `*opaque` is `{ void *ptr; uint32_t
+     * type_id; }`, a slice `{ T *ptr; size_t len; }`, a `?*T` / `?funcptr` the bare
+     * pointer (null sentinel). */
+    {
+        int64_t P = zer_target_ptr_bits / 8;
+        if (P <= 0) return CONST_EVAL_FAIL;
+        if (type_dispatch_kind(t) == TYPE_POINTER) {
+            Type *pi = t->pointer.inner ? type_unwrap_distinct(t->pointer.inner) : NULL;
+            if (pi && type_dispatch_kind(pi) == TYPE_OPAQUE) return ((P + 4) + P - 1) / P * P;
+            return P;
+        }
+        if (type_dispatch_kind(t) == TYPE_FUNC_PTR) return P;
+        if (type_dispatch_kind(t) == TYPE_SLICE) return 2 * P;
+        if (type_dispatch_kind(t) == TYPE_USIZE) return P;
+    }
+    /* BUG-1151: the C storage size, never a guess. `width / 8` sized a `u21` at
+     * 2 bytes (its carrier is 4), and every "unknown" below used to fall back to
+     * a made-up number (-1, or a 4-byte field) — so `u8[@size(S)]` disagreed with
+     * the runtime `sizeof(S)` for a struct holding a `u3`, a `u21` or a
+     * `Semaphore`. Anything this function cannot size exactly is
+     * CONST_EVAL_FAIL: the array-size path then emits `sizeof`, and the `@pun`
+     * widening check keeps its runtime guard. */
+    int w = type_scalar_bytes(t);
+    if (w > 0) return w;
     if (t->kind == TYPE_ARRAY) {
         int64_t elem_size = compute_type_size(t->array.inner);
-        if (elem_size <= 0) return -1;
+        if (elem_size <= 0) return CONST_EVAL_FAIL;
         /* BUG-344: overflow-safe multiplication */
         int64_t count = (int64_t)t->array.size;
         if (count > 0 && elem_size > INT64_MAX / count) return CONST_EVAL_FAIL;
         return elem_size * count;
     }
     if (t->kind == TYPE_OPTIONAL) {
-        /* BUG-243/275: ?*T and ?FuncPtr are null-sentinel (same size as pointer).
-         * Target-dependent — don't constant-fold, let emitter use sizeof(). */
+        /* BUG-243/275/1151: ?*T and ?FuncPtr are null-sentinel — the pointer
+         * itself. (`?*opaque` is NOT: `_zer_opaque` is a struct, so it takes the
+         * value-optional layout below.) */
         { Type *oi = type_unwrap_distinct(t->optional.inner);
-          if (oi->kind == TYPE_POINTER || oi->kind == TYPE_FUNC_PTR)
-              return CONST_EVAL_FAIL; }
+          bool opq = type_dispatch_kind(oi) == TYPE_POINTER && oi->pointer.inner &&
+                     type_dispatch_kind(oi->pointer.inner) == TYPE_OPAQUE;
+          if ((type_dispatch_kind(oi) == TYPE_POINTER && !opq) || type_dispatch_kind(oi) == TYPE_FUNC_PTR)
+              return zer_target_ptr_bits / 8; }
         /* ?void = { has_value: u8 } = 1 byte */
         if (type_unwrap_distinct(t->optional.inner)->kind == TYPE_VOID) return 1;
         /* ?T = { T value; u8 has_value; } — aligned like a struct */
         int64_t inner_size = compute_type_size(t->optional.inner);
-        if (inner_size <= 0) return -1;
-        int align = (int)(inner_size > 8 ? 8 : inner_size);
+        if (inner_size <= 0) return CONST_EVAL_FAIL;
+        /* BUG-1151: the ALIGNMENT, not the size — a 3-byte struct is 1-aligned,
+         * and `inner_size` gave `?S3` 6 bytes instead of 4. */
+        int align = type_alignment_bytes(t->optional.inner);
+        if (align < 1) return CONST_EVAL_FAIL;
         int64_t total = inner_size; /* value field */
         /* add has_value (u8) with alignment padding */
         total += 1;
@@ -6205,7 +6255,7 @@ static int64_t compute_type_size(Type *t) {
         int struct_align = data_align > 4 ? data_align : 4; /* at least tag alignment */
         if (struct_align > 1 && (total % struct_align) != 0)
             total += struct_align - (total % struct_align);
-        return total > 0 ? total : -1;
+        return total > 0 ? total : CONST_EVAL_FAIL;
     }
     if (t->kind == TYPE_STRUCT) {
         int64_t total = 0;
@@ -6214,8 +6264,7 @@ static int64_t compute_type_size(Type *t) {
         for (uint32_t fi = 0; fi < t->struct_type.field_count; fi++) {
             int64_t fsize = compute_type_size(t->struct_type.fields[fi].type);
             /* BUG-275: if any field is target-dependent, whole struct is */
-            if (fsize == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-            if (fsize <= 0) fsize = 4; /* fallback for unknown types */
+            if (fsize == CONST_EVAL_FAIL || fsize <= 0) return CONST_EVAL_FAIL;   /* BUG-1151: never guess */
             /* BUG-350: alignment must be based on element type, not total size.
              * BUG-1059h: type_alignment_bytes — see the union arm above. */
             int falign = is_packed ? 1
@@ -6230,9 +6279,55 @@ static int64_t compute_type_size(Type *t) {
         }
         if (!is_packed && max_align > 1 && (total % max_align) != 0)
             total += max_align - (total % max_align);
-        return total > 0 ? total : -1;
+        return total > 0 ? total : CONST_EVAL_FAIL;
     }
-    return -1;
+    return CONST_EVAL_FAIL;   /* BUG-1151: an unsized kind is unknown, not -1 */
+}
+
+/* BUG-1151: the Type `@size(...)` names — a type argument, a `uN` / `iN` name
+ * (parsed as an identifier), or a variable's type. NULL when unresolved. */
+static Type *resolve_type(Checker *c, TypeNode *tn);
+static Type *size_intrinsic_type(Checker *c, Node *e) {
+    if (!e || e->kind != NODE_INTRINSIC || e->intrinsic.name_len != 4 ||
+        memcmp(e->intrinsic.name, "size", 4) != 0)
+        return NULL;
+    if (e->intrinsic.type_arg) return resolve_type(c, e->intrinsic.type_arg);
+    if (e->intrinsic.arg_count < 1 || !e->intrinsic.args[0]) return NULL;
+    Node *a = e->intrinsic.args[0];
+    Type *tt = typemap_get(c, a);
+    if (tt) return tt;
+    if (a->kind != NODE_IDENT) return NULL;
+    if (zer_is_intn_type_name(a->ident.name, (uint32_t)a->ident.name_len, NULL, NULL)) {
+        TypeNode *tn = (TypeNode *)arena_alloc(c->arena, sizeof(TypeNode));
+        memset(tn, 0, sizeof(TypeNode));
+        tn->kind = TYNODE_NAMED;
+        tn->named.name = a->ident.name;
+        tn->named.name_len = a->ident.name_len;
+        tn->loc = a->loc;
+        return resolve_type(c, tn);
+    }
+    Symbol *sym = scope_lookup(c->current_scope, a->ident.name, (uint32_t)a->ident.name_len);
+    return sym ? sym->type : NULL;
+}
+
+/* Record the value of every `@size(T)` in a constant expression on its node, so
+ * the shared evaluator (eval_const_expr_ex) reads it. Only the kinds the
+ * evaluator itself descends are walked; anything else stays unfolded, which is
+ * "not a constant" — the conservative answer. */
+static void fold_size_intrinsics_in(Checker *c, Node *n, int depth) {
+    if (!n || depth > ZER_EXPR_WALK_MAX) return;
+    if (n->kind == NODE_INTRINSIC) {
+        if (n->intrinsic.is_size_folded) return;
+        Type *t = size_intrinsic_type(c, n);
+        if (!t) return;
+        int64_t v = compute_type_size(t);
+        if (v > 0) { n->intrinsic.is_size_folded = true; n->intrinsic.size_value = v; }
+    } else if (n->kind == NODE_UNARY) {
+        fold_size_intrinsics_in(c, n->unary.operand, depth + 1);
+    } else if (n->kind == NODE_BINARY) {
+        fold_size_intrinsics_in(c, n->binary.left, depth + 1);
+        fold_size_intrinsics_in(c, n->binary.right, depth + 1);
+    }
 }
 
 static Type *resolve_type_inner(Checker *c, TypeNode *tn);
@@ -6608,33 +6703,13 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         uint32_t size = 0;
         Type *size_of = NULL; /* resolved @size type, if any */
         if (tn->array.size_expr) {
+            /* BUG-199 / BUG-1151: `@size(T)` anywhere in the size expression folds
+             * through the one shared mechanism (the checker's compute_type_size,
+             * recorded on the node) — the inline copy here computed `width / 8`,
+             * sizing `u8[@size(u21)]` at 2 bytes while C's sizeof is 4. */
+            fold_size_intrinsics_in(c, tn->array.size_expr, 0);
+            size_of = size_intrinsic_type(c, tn->array.size_expr);
             int64_t val = eval_const_expr(tn->array.size_expr);
-            /* BUG-199: handle @size(T) as compile-time constant */
-            if (val == CONST_EVAL_FAIL && tn->array.size_expr->kind == NODE_INTRINSIC &&
-                tn->array.size_expr->intrinsic.name_len == 4 &&
-                memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0) {
-                if (tn->array.size_expr->intrinsic.type_arg) {
-                    size_of = resolve_type(c, tn->array.size_expr->intrinsic.type_arg);
-                } else if (tn->array.size_expr->intrinsic.arg_count > 0 &&
-                           tn->array.size_expr->intrinsic.args[0]->kind == NODE_IDENT) {
-                    Symbol *sym = scope_lookup(c->current_scope,
-                        tn->array.size_expr->intrinsic.args[0]->ident.name,
-                        (uint32_t)tn->array.size_expr->intrinsic.args[0]->ident.name_len);
-                    if (sym) size_of = sym->type;
-                }
-                if (size_of) {
-                    Type *unwrapped = type_unwrap_distinct(size_of);
-                    int w = type_width(unwrapped);
-                    if (w > 0) {
-                        val = w / 8;
-                    } else if (unwrapped->kind == TYPE_STRUCT) {
-                        val = compute_type_size(unwrapped);
-                    } else {
-                        /* fallback: use recursive compute for any type */
-                        val = compute_type_size(unwrapped);
-                    }
-                }
-            }
             /* BUG-391: comptime function call as array size.
              * eval_const_expr can't resolve function calls (no Checker access).
              * Try resolving NODE_CALL on comptime functions here. */
@@ -6711,15 +6786,23 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
             if (val == CONST_EVAL_FAIL)
                 val = eval_decl_size_expr(c, tn->array.size_expr);
             if (val == CONST_EVAL_FAIL) {
-                /* BUG-275: if @size on target-dependent type (pointer/slice/struct-with-ptr),
-                 * don't error — store the resolved Type for emitter to emit sizeof(). */
+                /* BUG-1151: BUG-275 returned a SIZE-0 array here and let the emitter
+                 * write `sizeof(T)` — so the checker and the C disagreed: `.len` was 0
+                 * at run time and every index was refused as out of bounds. Pointer-
+                 * family sizes now fold from the target model (compute_type_size);
+                 * what still fails is a type whose size is the PLATFORM's (a
+                 * Semaphore / Barrier / allocator in the struct), and refusing it is
+                 * the honest answer — there is no value both sides agree on. */
                 if (tn->array.size_expr->kind == NODE_INTRINSIC &&
                     tn->array.size_expr->intrinsic.name_len == 4 &&
                     memcmp(tn->array.size_expr->intrinsic.name, "size", 4) == 0 &&
                     size_of) {
-                    Type *arr_type = type_array(c->arena, elem, 0);
-                    arr_type->array.sizeof_type = size_of;
-                    return arr_type;
+                    checker_error(c, tn->loc.line,
+                        "array size '@size(%s)' is not a compile-time constant — the "
+                        "type holds a member whose size is the platform's (a "
+                        "Semaphore, Barrier or allocator), so the compiler cannot "
+                        "agree with the C `sizeof` on it", type_name(size_of));
+                    return type_array(c->arena, elem, 1);
                 }
                 checker_error(c, tn->loc.line, "array size must be a compile-time constant");
             } else if (val <= 0) {
@@ -7995,6 +8078,7 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
             _cident_name[_cident_depth] = name;
             _cident_len[_cident_depth]  = name_len;
             _cident_depth++;
+            fold_size_intrinsics_in(c, init, 0);   /* BUG-1151 */
             /* `depth`, NOT 0 — that reset is what made the bound useless. */
             int64_t v = eval_const_expr_ex(init, depth, resolve_const_ident, ctx);
             _cident_depth--;
@@ -10836,10 +10920,8 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* Designated initializer in assignment: validate fields */
         if (node->assign.op == TOK_EQ && node->assign.value->kind == NODE_STRUCT_INIT && target) {
-            if (validate_struct_init(c, node->assign.value, target, node->loc.line)) {
-                value = target;
-                typemap_set(c, node->assign.value, target);
-            }
+            Type *lt = type_struct_literal(c, node->assign.value, target, node->loc.line);
+            if (lt) value = lt;   /* BUG-1150 */
         }
 
         /* BUG-847: `a = Arena.over(buf);` is how a GLOBAL arena is given its
@@ -12087,10 +12169,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                     /* Designated init as call arg: validate fields against param struct type */
                     if (node->call.args[i]->kind == NODE_STRUCT_INIT && param) {
-                        if (validate_struct_init(c, node->call.args[i], param, node->loc.line)) {
-                            arg = param;
-                            typemap_set(c, node->call.args[i], param);
-                        }
+                        Type *lt = type_struct_literal(c, node->call.args[i], param,
+                                                       node->loc.line);
+                        if (lt) arg = lt;   /* BUG-1150 */
                     }
 
                     /* SILENT-GAP FIX: passing a shared struct BY VALUE silently
@@ -14093,6 +14174,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
             }
+            fold_size_intrinsics_in(c, node, 0);   /* BUG-1151 */
             result = ty_usize;
         } else if (nlen == 6 && memcmp(name, "offset", 6) == 0) {
             /* @offset(T, field) — validate field exists on struct T */
@@ -18538,10 +18620,8 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* Designated initializer: validate fields against target struct type */
             if (node->var_decl.init->kind == NODE_STRUCT_INIT && type) {
-                if (validate_struct_init(c, node->var_decl.init, type, node->loc.line)) {
-                    init_type = type;
-                    typemap_set(c, node->var_decl.init, type);
-                }
+                Type *lt = type_struct_literal(c, node->var_decl.init, type, node->loc.line);
+                if (lt) init_type = lt;   /* BUG-1150 */
             }
 
             reject_unique_resource_copy(c, node->var_decl.init, type,
@@ -21072,10 +21152,9 @@ static void check_stmt(Checker *c, Node *node) {
 
             /* Designated init in return: validate against function return type */
             if (node->ret.expr->kind == NODE_STRUCT_INIT && c->current_func_ret) {
-                if (validate_struct_init(c, node->ret.expr, c->current_func_ret, node->loc.line)) {
-                    ret_type = c->current_func_ret;
-                    typemap_set(c, node->ret.expr, c->current_func_ret);
-                }
+                Type *lt = type_struct_literal(c, node->ret.expr, c->current_func_ret,
+                                               node->loc.line);
+                if (lt) ret_type = lt;   /* BUG-1150 */
                 /* Escape sink — this was the MISSING SIBLING of the var-decl and
                  * assign-to-global sinks, both of which already ran
                  * struct_init_has_local_derived. A struct/union LITERAL returned
@@ -22776,10 +22855,9 @@ static void check_stmt(Checker *c, Node *node) {
                 /* Type mismatch */
                 /* A15: add is_literal_compatible + validate_struct_init (match regular call) */
                 if (node->spawn_stmt.args[i]->kind == NODE_STRUCT_INIT && param_type) {
-                    if (validate_struct_init(c, node->spawn_stmt.args[i], param_type, node->loc.line)) {
-                        arg_type = param_type;
-                        typemap_set(c, node->spawn_stmt.args[i], param_type);
-                    }
+                    Type *lt = type_struct_literal(c, node->spawn_stmt.args[i], param_type,
+                                                   node->loc.line);
+                    if (lt) arg_type = lt;   /* BUG-1150 */
                 }
                 reject_unique_resource_copy(c, node->spawn_stmt.args[i], param_type,
                                             node->loc.line, "pass");
@@ -28110,10 +28188,9 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * it `void` — context supplies the type). This call was missing here,
              * so every `S s = { .f = 5 };` at file scope was refused as "cannot
              * initialize 's' of type 'S' with 'void'". */
-            if (decl->var_decl.init->kind == NODE_STRUCT_INIT && type &&
-                validate_struct_init(c, decl->var_decl.init, type, decl->loc.line)) {
-                init = type;
-                typemap_set(c, decl->var_decl.init, type);
+            if (decl->var_decl.init->kind == NODE_STRUCT_INIT && type) {
+                Type *lt = type_struct_literal(c, decl->var_decl.init, type, decl->loc.line);
+                if (lt) init = lt;   /* BUG-1150 */
             }
             reject_unique_resource_copy(c, decl->var_decl.init, type,
                                         decl->loc.line, "initialize");

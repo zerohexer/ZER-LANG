@@ -1,0 +1,10 @@
+// expect-error: @pun widens the pointee — the 4-byte target reads past the 2-byte source
+// BUG-1151: R's size was computed as 2 (u21 width / 8) — the widening looked absent and
+// the program read 4 bytes of a 2-byte global (ASan global-buffer-overflow).
+struct R { u21 v; }
+u16 x = 7;
+u32 main() {
+    *R p = @pun(*R, &x);
+    u32 got = (u32)p.v;
+    return got & 1;
+}

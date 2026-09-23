@@ -655,6 +655,12 @@ struct Node {
              * runtime checks only for a genuinely variable address. */
             bool addr_is_const;
             uint64_t const_addr;
+            /* BUG-1151: `@size(T)` folded by the CHECKER (compute_type_size, the
+             * same layout the emitter's `sizeof` produces), so the shared
+             * constant evaluator can use it: `const usize K = @size(T); u8[K] b;`,
+             * `@size(T) * 2`. Mirrors call.is_comptime_resolved. */
+            bool is_size_folded;
+            int64_t size_value;
         } intrinsic;
 
         /* NODE_TYPECAST: (Type)expr — explicit C-style cast */
@@ -702,6 +708,8 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
     if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
         return n->call.comptime_value;
+    if (n->kind == NODE_INTRINSIC && n->intrinsic.is_size_folded)   /* BUG-1151 */
+        return n->intrinsic.size_value;
     /* Ident resolution via callback */
     if (n->kind == NODE_IDENT && resolve)
         return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len,

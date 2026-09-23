@@ -501,6 +501,7 @@ bool type_is_unsigned(Type *a);
 bool type_is_float(Type *a);
 bool type_is_numeric(Type *a);
 int  type_width(Type *a);          /* bit width: 8, 16, 32, 64 */
+int  type_scalar_bytes(Type *a);   /* BUG-1151: C storage bytes of a scalar (uN/iN: its carrier), 0 if none */
 int  type_alignment_bytes(Type *a); /* required alignment in bytes; recurses
                                       * through aggregates for compound MMIO
                                       * targets; returns 0 if not computable */

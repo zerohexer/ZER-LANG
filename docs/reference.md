@@ -2622,6 +2622,29 @@ u32 main() {
 }
 ```
 
+- `@size` is a compile-time constant wherever the compiler knows the layout —
+  scalars (a `uN` at its carrier), structs, unions, arrays, optionals, and
+  pointer-family types at the TARGET's pointer width. It can size an array, feed a
+  `const`, and take part in arithmetic, locally and globally; the value always
+  equals the C `sizeof`:
+
+```zer
+struct Rec { u32 id; u21 tag; *u32 next; }
+const usize REC = @size(Rec);
+u32 main() {
+    u8[REC] one;
+    u8[@size(Rec) * 2] two;
+    const usize P = @size(*u32);
+    u8[P] ptr_bytes;
+    if (one.len != @size(Rec) || two.len != 2 * REC || ptr_bytes.len != P) { return 1; }
+    return 0;
+}
+```
+
+- A type holding a member whose size is the PLATFORM's (a `Semaphore`,
+  `Barrier` or allocator) has no compile-time size: `u8[@size(T)]` is a compile
+  error there (`@size(T)` as a runtime value still works).
+
 ---
 
 ### @offset(T, field)
@@ -4495,6 +4518,9 @@ Point make() { return { .x = 0, .y = 0 }; }
   non-null `*T` or function-pointer field (directly, or inside an omitted nested struct)
   would be NULL: compile error "designated initializer omits field '.p'". Initialize it,
   or declare the field `?*T`.
+- A literal into an OPTIONAL struct (`?P o = { .x = 1 };`, `opt = { .x = 1 };`, a
+  `?P` parameter, return or field) builds the struct and wraps it — the optional is
+  present.
 
 ```zer
 struct In { u32 a; u32 b; }

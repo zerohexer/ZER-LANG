@@ -119,3 +119,6 @@ checker.c:                Type *viacall[4];
 # BUG-1125: walk_callee_globals' visited set is STACK-FIRST, not fixed — 16 inline
 # slots, doubled into the arena past that (walk_callee_globals_body). Rule #7 pattern.
 checker.c:    Node *seen_stack[16];
+# BUG-1124: SymSet (for_each_write_target's pointer / emitted sets) is STACK-FIRST —
+# 16 inline slots, doubled into the arena past that (symset_add). Rule #7 pattern.
+checker.c:    Symbol *stack[16];

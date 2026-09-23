@@ -467,84 +467,89 @@ static int ir_resolve_cond_root(IRFunc *func, int cond_local, bool *polarity) {
  * -Werror=switch): a new NodeKind forces a decision here; opaque/rare kinds
  * (cast/asm/static_assert/declarations) return true (assume mutation) so a gap
  * can only OVER-reject, never accept a mutated condition. */
-bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
+static bool ast_name_writes_r(Node *n, const char *name, uint32_t len,
+                              AstNameWriteFn fn, void *ud) {
     if (!n) return false;
     switch (n->kind) {
     case NODE_ASSIGN: {
         Node *t = n->assign.target;
         if (t && t->kind == NODE_IDENT &&
             (uint32_t)t->ident.name_len == len &&
-            memcmp(t->ident.name, name, len) == 0)
-            return true;                            /* reassignment */
-        return ast_name_mutated_or_addrd(n->assign.target, name, len) ||
-               ast_name_mutated_or_addrd(n->assign.value, name, len);
+            memcmp(t->ident.name, name, len) == 0) {
+            /* reassignment: a plain `=` hands the visitor its VALUE; a
+             * compound operator has no value that could be followed */
+            if (fn(n->assign.op == TOK_EQ ? n->assign.value : NULL, ud)) return true;
+            return ast_name_writes_r(n->assign.value, name, len, fn, ud);
+        }
+        return ast_name_writes_r(n->assign.target, name, len, fn, ud) ||
+               ast_name_writes_r(n->assign.value, name, len, fn, ud);
     }
     case NODE_UNARY:
         if (n->unary.op == TOK_AMP && n->unary.operand &&
             n->unary.operand->kind == NODE_IDENT &&
             (uint32_t)n->unary.operand->ident.name_len == len &&
             memcmp(n->unary.operand->ident.name, name, len) == 0)
-            return true;                            /* address taken */
-        return ast_name_mutated_or_addrd(n->unary.operand, name, len);
+            return fn(NULL, ud);                    /* address taken */
+        return ast_name_writes_r(n->unary.operand, name, len, fn, ud);
     case NODE_BINARY:
-        return ast_name_mutated_or_addrd(n->binary.left, name, len) ||
-               ast_name_mutated_or_addrd(n->binary.right, name, len);
+        return ast_name_writes_r(n->binary.left, name, len, fn, ud) ||
+               ast_name_writes_r(n->binary.right, name, len, fn, ud);
     case NODE_CALL: {
-        if (ast_name_mutated_or_addrd(n->call.callee, name, len)) return true;
+        if (ast_name_writes_r(n->call.callee, name, len, fn, ud)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
-            if (ast_name_mutated_or_addrd(n->call.args[i], name, len)) return true;
+            if (ast_name_writes_r(n->call.args[i], name, len, fn, ud)) return true;
         return false;
     }
-    case NODE_FIELD:  return ast_name_mutated_or_addrd(n->field.object, name, len);
-    case NODE_INDEX:  return ast_name_mutated_or_addrd(n->index_expr.object, name, len) ||
-                             ast_name_mutated_or_addrd(n->index_expr.index, name, len);
-    case NODE_SLICE:  return ast_name_mutated_or_addrd(n->slice.object, name, len) ||
-                             ast_name_mutated_or_addrd(n->slice.start, name, len) ||
-                             ast_name_mutated_or_addrd(n->slice.end, name, len);
-    case NODE_ORELSE: return ast_name_mutated_or_addrd(n->orelse.expr, name, len) ||
-                             ast_name_mutated_or_addrd(n->orelse.fallback, name, len);
-    case NODE_TYPECAST: return ast_name_mutated_or_addrd(n->typecast.expr, name, len);
+    case NODE_FIELD:  return ast_name_writes_r(n->field.object, name, len, fn, ud);
+    case NODE_INDEX:  return ast_name_writes_r(n->index_expr.object, name, len, fn, ud) ||
+                             ast_name_writes_r(n->index_expr.index, name, len, fn, ud);
+    case NODE_SLICE:  return ast_name_writes_r(n->slice.object, name, len, fn, ud) ||
+                             ast_name_writes_r(n->slice.start, name, len, fn, ud) ||
+                             ast_name_writes_r(n->slice.end, name, len, fn, ud);
+    case NODE_ORELSE: return ast_name_writes_r(n->orelse.expr, name, len, fn, ud) ||
+                             ast_name_writes_r(n->orelse.fallback, name, len, fn, ud);
+    case NODE_TYPECAST: return ast_name_writes_r(n->typecast.expr, name, len, fn, ud);
     case NODE_INTRINSIC: {
         for (int i = 0; i < n->intrinsic.arg_count; i++)
-            if (ast_name_mutated_or_addrd(n->intrinsic.args[i], name, len)) return true;
+            if (ast_name_writes_r(n->intrinsic.args[i], name, len, fn, ud)) return true;
         return false;
     }
     case NODE_STRUCT_INIT: {
         for (int i = 0; i < n->struct_init.field_count; i++)
-            if (ast_name_mutated_or_addrd(n->struct_init.fields[i].value, name, len)) return true;
+            if (ast_name_writes_r(n->struct_init.fields[i].value, name, len, fn, ud)) return true;
         return false;
     }
     case NODE_BLOCK: {
         for (int i = 0; i < n->block.stmt_count; i++)
-            if (ast_name_mutated_or_addrd(n->block.stmts[i], name, len)) return true;
+            if (ast_name_writes_r(n->block.stmts[i], name, len, fn, ud)) return true;
         return false;
     }
-    case NODE_IF: return ast_name_mutated_or_addrd(n->if_stmt.cond, name, len) ||
-                         ast_name_mutated_or_addrd(n->if_stmt.then_body, name, len) ||
-                         ast_name_mutated_or_addrd(n->if_stmt.else_body, name, len);
-    case NODE_FOR: return ast_name_mutated_or_addrd(n->for_stmt.init, name, len) ||
-                          ast_name_mutated_or_addrd(n->for_stmt.cond, name, len) ||
-                          ast_name_mutated_or_addrd(n->for_stmt.step, name, len) ||
-                          ast_name_mutated_or_addrd(n->for_stmt.body, name, len);
+    case NODE_IF: return ast_name_writes_r(n->if_stmt.cond, name, len, fn, ud) ||
+                         ast_name_writes_r(n->if_stmt.then_body, name, len, fn, ud) ||
+                         ast_name_writes_r(n->if_stmt.else_body, name, len, fn, ud);
+    case NODE_FOR: return ast_name_writes_r(n->for_stmt.init, name, len, fn, ud) ||
+                          ast_name_writes_r(n->for_stmt.cond, name, len, fn, ud) ||
+                          ast_name_writes_r(n->for_stmt.step, name, len, fn, ud) ||
+                          ast_name_writes_r(n->for_stmt.body, name, len, fn, ud);
     case NODE_WHILE:
-    case NODE_DO_WHILE: return ast_name_mutated_or_addrd(n->while_stmt.cond, name, len) ||
-                               ast_name_mutated_or_addrd(n->while_stmt.body, name, len);
+    case NODE_DO_WHILE: return ast_name_writes_r(n->while_stmt.cond, name, len, fn, ud) ||
+                               ast_name_writes_r(n->while_stmt.body, name, len, fn, ud);
     case NODE_SWITCH: {
-        if (ast_name_mutated_or_addrd(n->switch_stmt.expr, name, len)) return true;
+        if (ast_name_writes_r(n->switch_stmt.expr, name, len, fn, ud)) return true;
         for (int i = 0; i < n->switch_stmt.arm_count; i++)
-            if (ast_name_mutated_or_addrd(n->switch_stmt.arms[i].body, name, len)) return true;
+            if (ast_name_writes_r(n->switch_stmt.arms[i].body, name, len, fn, ud)) return true;
         return false;
     }
-    case NODE_RETURN:    return ast_name_mutated_or_addrd(n->ret.expr, name, len);
-    case NODE_EXPR_STMT: return ast_name_mutated_or_addrd(n->expr_stmt.expr, name, len);
-    case NODE_VAR_DECL:  return ast_name_mutated_or_addrd(n->var_decl.init, name, len);
-    case NODE_DEFER:     return ast_name_mutated_or_addrd(n->defer.body, name, len);
-    case NODE_CRITICAL:  return ast_name_mutated_or_addrd(n->critical.body, name, len);
-    case NODE_ONCE:      return ast_name_mutated_or_addrd(n->once.body, name, len);
-    case NODE_AWAIT:     return ast_name_mutated_or_addrd(n->await_stmt.cond, name, len);
+    case NODE_RETURN:    return ast_name_writes_r(n->ret.expr, name, len, fn, ud);
+    case NODE_EXPR_STMT: return ast_name_writes_r(n->expr_stmt.expr, name, len, fn, ud);
+    case NODE_VAR_DECL:  return ast_name_writes_r(n->var_decl.init, name, len, fn, ud);
+    case NODE_DEFER:     return ast_name_writes_r(n->defer.body, name, len, fn, ud);
+    case NODE_CRITICAL:  return ast_name_writes_r(n->critical.body, name, len, fn, ud);
+    case NODE_ONCE:      return ast_name_writes_r(n->once.body, name, len, fn, ud);
+    case NODE_AWAIT:     return ast_name_writes_r(n->await_stmt.cond, name, len, fn, ud);
     case NODE_SPAWN: {
         for (int i = 0; i < n->spawn_stmt.arg_count; i++)
-            if (ast_name_mutated_or_addrd(n->spawn_stmt.args[i], name, len)) return true;
+            if (ast_name_writes_r(n->spawn_stmt.args[i], name, len, fn, ud)) return true;
         return false;
     }
     /* Leaves — cannot reassign or take the address of `name`. */
@@ -559,9 +564,27 @@ bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-        return true;
+        return fn(NULL, ud);
     }
-    return true;  /* unreachable (exhaustive) — conservative */
+    return fn(NULL, ud);  /* unreachable (exhaustive) — conservative */
+}
+
+
+/* The visitor form (BUG-1124): `fn(value, ud)` is called for every WRITE of
+ * `name` the subtree can perform — with the assigned VALUE for a plain
+ * `name = value`, and with NULL for a write whose value cannot be followed (a
+ * compound operator, `&name` handed anywhere, an opaque node). A true return
+ * from `fn` stops the walk, and the walk then returns true.
+ * ast_name_mutated_or_addrd is this walk with a visitor that stops at the first
+ * write, so the two can never disagree on coverage. */
+bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud) {
+    return ast_name_writes_r(n, name, len, fn, ud);
+}
+
+static bool anw_stop_at_first(Node *value, void *ud) { (void)value; (void)ud; return true; }
+
+bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
+    return ast_name_writes_r(n, name, len, anw_stop_at_first, NULL);
 }
 
 /* BUG-1055: how many times is `name` BOUND inside `n` — a var-decl, an

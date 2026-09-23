@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-23e — BUG-1121..1125: three defects the reference.md audit found (one silent), and a lent global reached through a callee
+## Session 2026-09-23e — BUG-1121..1125: three defects the reference.md audit found (one silent), a retargeted pointer, and a lent global reached through a callee
 
 ### BUG-1121 — a label inside `@critical` / `@once` (the `@once` case a SILENT miscompile)
 **Symptom.** `void f(u32 k){ if (k == 1) { goto again; } @once { again: n += 1; } }` called
@@ -32,6 +32,30 @@ and `t.name = "worker"` into a `[*]u8` field printed "cannot assign '[]u8' to '[
 now render `[*]T` with `const` / `volatile` (the BUG-830 lesson for pointers, one arm over).
 `type_name` feeds diagnostics and `--emit-ir` only — the container-stamp name path already
 refuses any non-identifier spelling, so no emitted name changes.
+
+### BUG-1124 — a pointer RETARGETED after its declaration hid its real target from the race rules
+**Symptom.** `volatile *u32 gp = &d; void aim() { gp = &g; }` then `*gp += 1` in main with an
+ISR writing `g` compiled clean — `g += 1` in the same place is refused. So did the ISR writing
+`*gp` with main reading a non-volatile `h` after `gp = &h`, a local `p = &d; p = &g; *p += 1;`,
+passing the retargeted `gp` to an RMW helper, and a local copy `volatile *u32 r = gp;`. The
+double-buffer idiom (`current = &buf_b;`) is this shape. 9 of 15 new RMW-grid cells were holes on
+the pre-fix build, at all three sites.
+**Root cause.** `resolve_write_target_global` follows a pointer's DECLARATION `&x` initializer
+and nothing else; the scans' alias table bound a name to exactly one global; the argument
+resolvers named nothing for a global pointer passed by name.
+**Fix.** `ast_name_writes` — the visitor core of `ast_name_mutated_or_addrd` (which is now a
+wrapper, so the two share one exhaustive switch) — hands every `name = value` to a visitor.
+`for_each_write_target` enumerates the resolver's answer plus the declaration initializer and
+every reassignment (all bodies for a global, the current body for a local), following `&x`,
+pointer copies and orelse arms, with a visited set; `rmw_arg_targets` / `rmw_arg_targets_main`
+are its argument forms, and the scans' alias table holds several entries per name. The five
+sinks (main compound, spawn scan, ISR scan, ISR pointee tracker, the three argument vehicles)
+loop over the set. A bare pointer name as a write TARGET (`gp = &h`) writes the pointer and is
+not expanded — the first draft rejected exactly that; the `retarget-plain-store` boundary cell
+pins it.
+**Tests.** `tests/zer_fail/{isr_retargeted_global_ptr,rmw_retargeted_global_ptr,rmw_retargeted_local_ptr}_bug1124.zer`;
+RMW FORM grid forms `global gp=&g elsewhere`, `local p=&d; p=&g`, `retargeted gp as arg`,
+`r=gp copy as arg`, `r=gp copy *r+=1` (x3 sites) + boundary `retarget-plain-store`.
 
 ### BUG-1125 — a global LENT to a scoped spawn was unprotected from the parent's CALLEES
 **Symptom.** `ThreadHandle th = spawn worker(&counter); bump(); th.join();` with

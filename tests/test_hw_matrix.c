@@ -320,7 +320,8 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_ALIAS_ARG, RFORM_CARRIER, RFORM_CARRIER_LIT,
                RFORM_FUNCPTR_LOCAL, RFORM_FUNCPTR_GLOBAL, RFORM_FUNCPTR_FIELD,
                RFORM_ALIAS_COPY, RFORM_CARRIER_COPY, RFORM_CARRIER_FIELD_ARG,
-               RFORM_CARRIER_READONLY,
+               RFORM_CARRIER_READONLY, RFORM_GLOBAL_RETARGET, RFORM_LOCAL_RETARGET,
+               RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -367,6 +368,11 @@ static const char *rform_name(RForm f) {
     case RFORM_CARRIER_COPY:    return "carrier copy k=h";
     case RFORM_CARRIER_FIELD_ARG: return "carrier field bump(h.p)";
     case RFORM_CARRIER_READONLY:return "carrier read-only";
+    case RFORM_GLOBAL_RETARGET: return "global gp=&g elsewhere";
+    case RFORM_LOCAL_RETARGET:  return "local p=&d; p=&g";
+    case RFORM_RETARGET_ARG:    return "retargeted gp as arg";
+    case RFORM_RETARGET_COPY_ARG:   return "r=gp copy as arg";
+    case RFORM_RETARGET_COPY_DEREF: return "r=gp copy *r+=1";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -433,6 +439,25 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
      * the carrier has no RMW bit, so the binding alone must not reject. */
     case RFORM_CARRIER_READONLY: *helper = "struct H { volatile *u32 p; }\nu32 rd(H h){ return *h.p; }";
                                                                                  *body = "H h; h.p = &g; u32 v = rd(h); if (v > 100) { g = 1; }"; break;
+    /* BUG-1124: a pointer RETARGETED after its declaration. The resolver followed
+     * the initializer (`&d`) alone, so the write landing on `g` was invisible at
+     * the ISR and MAIN sites (`d` is touched from one side only, so those cells
+     * can only fire through the reassignment). At the SPAWN site the cell also
+     * fires on `d` — any volatile RMW from a thread races — so it does not
+     * discriminate there. */
+    case RFORM_GLOBAL_RETARGET: *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }";
+                                                                                 *body = "aim(); *gp += 1;"; break;
+    case RFORM_LOCAL_RETARGET:  *helper = "volatile u32 d;";
+                                                                                 *body = "volatile *u32 p = &d; p = &g; *p += 1;"; break;
+    case RFORM_RETARGET_ARG:    *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }\n"
+                                          "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "aim(); bump(gp);"; break;
+    /* A local COPY of the retargeted pointer aims wherever the original does. */
+    case RFORM_RETARGET_COPY_ARG:   *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }\n"
+                                              "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "aim(); volatile *u32 r = gp; bump(r);"; break;
+    case RFORM_RETARGET_COPY_DEREF: *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }";
+                                                                                 *body = "aim(); volatile *u32 r = gp; *r += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
@@ -671,15 +696,22 @@ int main(void) {
      * writes g", which rejects a great deal of correct firmware. */
     fprintf(stderr, "\n--- RMW split-taint boundary (must COMPILE) ---\n");
     {
-        static const char *bnames[3] = { "taint-cleared", "other-global", "not-shared" };
-        static const char *bbodies[3] = {
+        static const char *bnames[4] = { "taint-cleared", "other-global", "not-shared",
+                                         "retarget-plain-store" };
+        static const char *bbodies[4] = {
             "volatile u32 g;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = g; t = 5; g = t; return g & 1; }\n",
             "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = h; g = t + 1; return g & 1; }\n",
-            "u32 plain;\nu32 main(){ u32 t = plain; plain = t + 1; return plain & 1; }\n"
+            "u32 plain;\nu32 main(){ u32 t = plain; plain = t + 1; return plain & 1; }\n",
+            /* BUG-1124 boundary: retargeting a pointer (`gp = &h`) writes the
+             * POINTER, not h — it must not read as an RMW of the new target. The
+             * first draft of the fix rejected exactly this. */
+            "volatile u32 g;\nvolatile u32 h;\nvolatile *u32 gp = &g;\n"
+            "interrupt TIMER { *gp = 5; }\nvoid aim(){ gp = &h; }\n"
+            "u32 main(){ aim(); u32 t = h; return t & 1; }\n"
         };
-        for (int bi = 0; bi < 3; bi++) {
+        for (int bi = 0; bi < 4; bi++) {
             valid_cells++;
             char bnm[192];
             snprintf(bnm, sizeof(bnm), "rmw-boundary/%s", bnames[bi]);

@@ -4771,8 +4771,12 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                     if (fh && fh->alloc_id != 0) {
                         IRAliasSnapshot fsnap;
                         ir_snapshot_alias(&fsnap, fh);
+                        /* BUG-1116: read fh BEFORE ir_add_handle — it may realloc
+                         * ps->handles and leave fh dangling (ASan heap-use-after-
+                         * free on tests/zer/arena_internal_link_ok.zer). */
+                        IRHandleState fstate = fh->state;
                         IRHandleInfo *fd = ir_add_handle(ps, inst->dest_local);
-                        if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fh->state; }
+                        if (fd) { ir_apply_alias(fd, &fsnap); fd->state = fstate; }
                     } else {
                         /* 2026-08-16: the BASE carries no allocation identity — the
                          * common case being a BY-VALUE STRUCT PARAM, where the
@@ -4823,8 +4827,9 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                             if (wh) {
                                 IRAliasSnapshot wsnap;
                                 ir_snapshot_alias(&wsnap, wh);
+                                IRHandleState wstate = wh->state;   /* BUG-1116: before the realloc */
                                 IRHandleInfo *wd = ir_add_handle(ps, inst->dest_local);
-                                if (wd) { ir_apply_alias(wd, &wsnap); wd->state = wh->state; }
+                                if (wd) { ir_apply_alias(wd, &wsnap); wd->state = wstate; }
                             }
                         }
                     }
@@ -6712,6 +6717,10 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                 IRHandleInfo *arg_h = ir_view_arg_handle(zc, func, ps,
                                           inst->expr->call.args[param_idx]);
                 if (arg_h) {
+                    /* BUG-1116: snapshot BEFORE ir_add_handle, which may realloc
+                     * ps->handles out from under arg_h. */
+                    IRAliasSnapshot snap;
+                    ir_snapshot_alias(&snap, arg_h);
                     IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
                     if (dh) {
                         /* Audit 2026-06-11: raw field copy missed
@@ -6720,10 +6729,8 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
                          * the handle round-tripped through a passthrough
                          * function. Use ir_apply_alias to copy ALL
                          * tracked state — same shape as IR_COPY at 2758. */
-                        IRAliasSnapshot snap;
-                        ir_snapshot_alias(&snap, arg_h);
                         ir_apply_alias(dh, &snap);
-                        dh->state = arg_h->state;
+                        dh->state = snap.state;
                     }
                 }
                 /* BUG-847 (RELAXATION, 2026-08-23): the result of a proven

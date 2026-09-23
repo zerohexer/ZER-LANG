@@ -220,6 +220,18 @@ session's own new tests.
   `[]u8`); the `@truncate`-on-float advice says a `(T)x` cast SATURATES (it said
   "range-checked at runtime").
 
+### BUG-1116 — the COMPILER read freed memory: IRHandleInfo* held across `ir_add_handle` (three sites)
+
+Found by a new sweep that builds zerc itself under ASan+UBSan and compiles the corpus
+(`tools/compiler_asan_sweep.sh`): heap-use-after-free on `tests/zer/arena_internal_link_ok.zer`
+and `tests/zer/tokenizer.zer`, both green in every gate. `ir_add_handle` may `realloc`
+`ps->handles`; three sites in zercheck_ir.c (the pointer-field read alias, its by-value-param
+sibling, and the param-view call-result alias) read `fh->state` / snapshotted `arg_h` AFTER the
+add. The release build silently read stale bytes — a verdict that could depend on the
+allocator. Fix: snapshot (the snapshot already carries `state`) before the add. After the fix the
+sweep is clean except the `@saturate` UB inside the emitter tracked with the value-semantics
+batch.
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

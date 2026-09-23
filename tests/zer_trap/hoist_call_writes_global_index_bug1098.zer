@@ -1,0 +1,14 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1098: the auto-guard for `arr[gi]` was HOISTED to the start of the
+// statement, where gi == 1 — and g() then set gi to 4 before the access read it.
+// Emitted `if (gi >= 4) return; _zer_t = g(); ... arr[gi]`: an unchecked write of
+// arr[4] (ASan global-buffer-overflow, exit 42 on the pre-fix build). The statement
+// can change the index, so it now carries the inline single-read bounds check.
+u32[4] arr;
+u32 gi = 1;
+u32 g() { gi = 4; return 0; }
+u32 main() {
+    u32 v = g() + arr[gi];
+    return 42 + v;
+}

@@ -831,7 +831,9 @@ static Symbol *add_symbol(Checker *c, const char *name, uint32_t name_len,
  * use add_symbol(). */
 static Symbol *add_symbol_synth(Checker *c, const char *name, uint32_t name_len,
                                 Type *type, int line) {
-    return add_symbol_impl(c, name, name_len, type, line, false);
+    Symbol *s = add_symbol_impl(c, name, name_len, type, line, false);
+    if (s) s->is_synthetic_var = true;   /* BUG-1099 */
+    return s;
 }
 
 static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int line) {
@@ -968,6 +970,20 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
 static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len); /* BUG-1011 */
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
+static void push_var_range_ex(Checker *c, const char *name, uint32_t name_len,
+                              int64_t min_val, int64_t max_val, bool known_nonzero,
+                              bool fresh);                                /* BUG-1092 */
+static Symbol *vrp_key_root(Checker *c, const char *name, uint32_t name_len,
+                            Scope **owner);                               /* BUG-1092 */
+static void vrp_widen_global_like(Checker *c);                           /* BUG-1093 */
+static bool vrp_store_through_pointer(Checker *c, Node *t);              /* BUG-1093 */
+static bool vrp_intrinsic_may_store(Checker *c, Node *n);                /* BUG-1093 */
+static bool vrp_intrinsic_is_value_only(Node *n);                      /* BUG-1094 */
+static Node *vrp_stmt_guard_root(Node *stmt);                          /* BUG-1098 */
+static bool vrp_guard_hoist_sound(Checker *c, Node *idx);               /* BUG-1098 */
+static int64_t vrp_const_value(Checker *c, Node *n, Type *dest);         /* BUG-1090 */
+static int64_t vrp_const_value_untyped_render(Checker *c, Node *n, Type *dest); /* BUG-1090 */
+static int64_t vrp_loop_bound_value(Checker *c, Node *n);              /* BUG-1099 */
 /* VRP branch-merge snapshot helpers (Finding A, 2026-07-03) — defined below. */
 static struct VarRange *vrp_snap_take(Checker *c, int n);
 static void vrp_snap_restore(Checker *c, struct VarRange *s, int n);
@@ -980,6 +996,7 @@ static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch);
+static void vrp_record_return_range(Checker *c, Node *node);   /* BUG-1097 */
 /* classify_return_root result codes: a single return is STATIC (global/static/
  * null), UNKNOWN (local/unprovable — forces summary incomplete), or a param index
  * in [0,63]. See the function for the param_lattice.v ARStatic/ARParam(n) mapping. */
@@ -1041,8 +1058,8 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
  * fact a float variable can then carry is `known_nonzero` over the full range,
  * which no bounds proof can use; an assignment to it re-derives or wipes the range
  * through vrp_invalidate_for_assign, as for any variable. */
-static int64_t vrp_guard_const(Node *k, TokenType op) {
-    int64_t v = eval_const_expr(k);
+static int64_t vrp_guard_const(Checker *c, Node *k, TokenType op) {
+    int64_t v = vrp_const_value(c, k, NULL);   /* BUG-1090 typed fold */
     if (v != CONST_EVAL_FAIL) return v;
     if (k && k->kind == NODE_FLOAT_LIT && k->float_lit.value == 0.0 &&
         (op == TOK_EQEQ || op == TOK_BANGEQ))
@@ -1050,23 +1067,18 @@ static int64_t vrp_guard_const(Node *k, TokenType op) {
     return CONST_EVAL_FAIL;
 }
 
-static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
+/* `raw_render`: the expression is emitted as ONE C expression (a plain
+ * assignment's value) rather than through typed temps — see
+ * vrp_const_value_untyped_render (BUG-1090). */
+static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max,
+                              bool raw_render) {
     if (!expr || expr->kind != NODE_BINARY) return false;
     Node *rhs = expr->binary.right;
-    int64_t rval = eval_const_expr(rhs);
-    /* try const symbol lookup for ident RHS (e.g., MAP_SIZE) */
-    if (rval == CONST_EVAL_FAIL && rhs->kind == NODE_IDENT) {
-        Symbol *rsym = scope_lookup(c->current_scope,
-            rhs->ident.name, (uint32_t)rhs->ident.name_len);
-        if (rsym && rsym->is_const && rsym->func_node) {
-            Node *init = NULL;
-            if (rsym->func_node->kind == NODE_GLOBAL_VAR)
-                init = rsym->func_node->var_decl.init;
-            else if (rsym->func_node->kind == NODE_VAR_DECL)
-                init = rsym->func_node->var_decl.init;
-            if (init) rval = eval_const_expr(init);
-        }
-    }
+    /* BUG-1090: the mask / modulus is the TYPED fold (a `const` ident resolved
+     * through its initializer at its own types). `x & ((0 - 1) / 1073741824 + 1)`
+     * folded to 1 untyped and RUNS as `x & 4`. */
+    int64_t rval = raw_render ? vrp_const_value_untyped_render(c, rhs, NULL)
+                              : vrp_const_value(c, rhs, NULL);
     if (rval == CONST_EVAL_FAIL || rval <= 0) return false;
     if (expr->binary.op == TOK_PERCENT) {
         /* x % N — C semantics: sign of result matches sign of dividend.
@@ -6748,6 +6760,18 @@ static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
     /* BUG-1016: 0 past the cap means "no width" = no wrap; an expression walk, so the
      * bound is check_expr's (closed by construction). */
     if (!n || depth > ZER_EXPR_WALK_MAX) return 0;
+    /* BUG-1091: a LITERAL has the width the checker typed it at — the width the
+     * same expression computes in at run time. Returning 0 ("no width") let a
+     * pure-literal subtree fold in untyped int64, so `comptime u32 F() { return
+     * (0 - 1) / 1073741824; }` folded 0 while the identical runtime function
+     * returns 3 (0xFFFFFFFF / 2^30). */
+    if (n->kind == NODE_INT_LIT) {
+        uint16_t lb = 0; bool ls = false;
+        if (_comptime_checker)
+            ct_type_width(typemap_get(_comptime_checker, n), &lb, &ls);
+        if (is_signed && lb) *is_signed = ls;
+        return lb;
+    }
     if (n->kind == NODE_IDENT) {
         for (int i = 0; i < param_count; i++)
             if (params[i].name_len == (uint32_t)n->ident.name_len &&
@@ -7623,6 +7647,363 @@ static int64_t comptime_cond_value(Checker *c, Node *e, int depth) {
 }
 
 /* ================================================================
+ * BUG-1090: THE TYPED CONSTANT FOLD.
+ *
+ * `eval_const_expr` folds in untyped signed int64. The emitted program does not:
+ * every expression node is computed in its CHECKER type (the IR gives each node a
+ * temp of `checker_get_type(node)`), and a u32 wraps at 2^32 before the next
+ * operation sees it. So the two disagreed on any tree whose value depends on a
+ * wrap — `(0 - 1) / 1073741824` folds to 0 untyped and RUNS as
+ * 0xFFFFFFFF / 2^30 = 3 — and VRP recorded the 0: `u32 i = (0 - 1) / 1073741824;
+ * arr2[i] = 7;` was proven in range and emitted with no check, writing arr2[3]
+ * (ASan stack-buffer-overflow). Same at every VRP sink that trusted a constant:
+ * the var-decl init, a mask or modulus, an if / while / for bound, a `const`
+ * ident, and the return-range summary.
+ *
+ * This folds each node AT ITS CHECKER TYPE (width and signedness), wrapping
+ * every intermediate exactly as the emitted C does, and FAILS on anything it
+ * does not model — a node with no integer type, a u64 value that does not fit
+ * int64, a zero divisor, a signed MIN / -1, mixed-signedness division. Failing
+ * is the safe answer: the sink then records no range and the access keeps its
+ * runtime check.
+ * ================================================================ */
+typedef struct { uint16_t bits; bool sg; uint16_t carrier; } TFoldTy;
+
+static bool tfold_type(Type *t, TFoldTy *out) {
+    if (!t) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    out->sg = false;
+    out->bits = 0;
+    out->carrier = 0;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_U8:  out->bits = 8;  break;
+    case TYPE_U16: out->bits = 16; break;
+    case TYPE_U32: out->bits = 32; break;
+    case TYPE_U64: out->bits = 64; break;
+    case TYPE_USIZE: out->bits = (uint16_t)zer_target_ptr_bits; break;
+    case TYPE_I8:  out->bits = 8;  out->sg = true; break;
+    case TYPE_I16: out->bits = 16; out->sg = true; break;
+    case TYPE_I32: out->bits = 32; out->sg = true; break;
+    case TYPE_I64: out->bits = 64; out->sg = true; break;
+    case TYPE_UINT: out->bits = (uint16_t)u->intn.bits; break;
+    case TYPE_SINT: out->bits = (uint16_t)u->intn.bits; out->sg = true; break;
+    /* An enum value is a declared variant — no arithmetic reaches one (BUG-928),
+     * so it is exact and never wrapped. bits == 0 marks "exact, no wrap". */
+    case TYPE_ENUM: out->sg = true; return true;
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_F32: case TYPE_F64:
+    case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE: case TYPE_ARRAY:
+    case TYPE_STRUCT: case TYPE_UNION: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+    case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+        return false;
+    }
+    if (out->bits == 0 || out->bits > 64) return false;
+    /* the C carrier a value of this type lives in — what `sizeof(a) * 8` sees */
+    out->carrier = out->bits <= 8 ? 8 : out->bits <= 16 ? 16 : out->bits <= 32 ? 32 : 64;
+    return true;
+}
+
+/* Wrap a bit pattern into `ty`. A value is carried as its type's BIT PATTERN in
+ * an int64: a signed type sign-extended, an unsigned type zero-extended — so a
+ * u64 at or above 2^63 reads negative here and is re-read unsigned by every
+ * operation that cares (/, %, >>). vrp_const_value refuses such a value at the
+ * end, since a VarRange cannot hold it. */
+static bool tfold_wrap(uint64_t v, const TFoldTy *ty, int64_t *out) {
+    if (ty->bits == 0) { *out = (int64_t)v; return true; }
+    uint64_t mask = ty->bits >= 64 ? ~0ULL : ((1ULL << ty->bits) - 1ULL);
+    uint64_t m = v & mask;
+    if (ty->sg && ty->bits < 64 && (m & (1ULL << (ty->bits - 1)))) m |= ~mask;
+    *out = (int64_t)m;
+    return true;
+}
+
+static bool tfold_node_ty(Checker *c, Node *n, TFoldTy *ty) {
+    return tfold_type(typemap_get(c, n), ty);
+}
+
+static bool tfold(Checker *c, Node *n, int depth, int64_t *out) {
+    if (!n || depth > ZER_EXPR_WALK_MAX) return false;
+    TFoldTy ty;
+    switch (n->kind) {
+    case NODE_INT_LIT:
+        if (!tfold_node_ty(c, n, &ty)) return false;
+        return tfold_wrap(n->int_lit.value, &ty, out);
+    case NODE_CHAR_LIT:
+        *out = (int64_t)(uint8_t)n->char_lit.value;
+        return true;
+    case NODE_CALL:
+        /* a resolved comptime call: the emitter renders exactly this value */
+        if (!n->call.is_comptime_resolved || n->call.is_comptime_float ||
+            n->call.comptime_struct_init) return false;
+        if (!tfold_node_ty(c, n, &ty)) return false;
+        return tfold_wrap((uint64_t)n->call.comptime_value, &ty, out);
+    case NODE_FIELD: {
+        /* `.len` of a FIXED array is its size — the for-in desugaring's bound */
+        if (n->field.field_name_len == 3 && memcmp(n->field.field_name, "len", 3) == 0) {
+            Type *ot = typemap_get(c, n->field.object);
+            Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+            if (oe && type_dispatch_kind(oe) == TYPE_ARRAY && !oe->array.sizeof_type &&
+                oe->array.size <= (uint64_t)INT64_MAX) {
+                if (!tfold_node_ty(c, n, &ty)) return false;
+                return tfold_wrap(oe->array.size, &ty, out);
+            }
+            return false;
+        }
+        /* an enum variant `State.idle` */
+        if (!tfold_node_ty(c, n, &ty) || ty.bits != 0) return false;
+        int64_t ev = resolve_enum_field(c, n);
+        if (ev == CONST_EVAL_FAIL) return false;
+        *out = ev;
+        return true;
+    }
+    case NODE_IDENT: {
+        /* a `const` with an initializer: its value is that initializer, folded
+         * at its own types, converted to the constant's declared type. */
+        Symbol *sym = scope_lookup(c->current_scope, n->ident.name,
+                                   (uint32_t)n->ident.name_len);
+        if (!sym) sym = global_decl_lookup(c, n->ident.name,
+                                     (uint32_t)n->ident.name_len);
+        if (!sym || !sym->is_const || !sym->func_node || sym->is_volatile) return false;
+        if (sym->func_node->kind != NODE_VAR_DECL &&
+            sym->func_node->kind != NODE_GLOBAL_VAR) return false;
+        Node *init = sym->func_node->var_decl.init;
+        if (!init || !tfold_type(sym->type, &ty)) return false;
+        int64_t v;
+        if (!tfold(c, init, depth + 1, &v)) return false;
+        return tfold_wrap((uint64_t)v, &ty, out);
+    }
+    case NODE_TYPECAST: {
+        if (!tfold_node_ty(c, n, &ty)) return false;
+        TFoldTy ity;
+        if (!tfold_node_ty(c, n->typecast.expr, &ity)) return false;   /* no float */
+        int64_t v;
+        if (!tfold(c, n->typecast.expr, depth + 1, &v)) return false;
+        return tfold_wrap((uint64_t)v, &ty, out);
+    }
+    case NODE_UNARY: {
+        if (!tfold_node_ty(c, n, &ty) || ty.bits == 0) return false;
+        int64_t v;
+        if (!tfold(c, n->unary.operand, depth + 1, &v)) return false;
+        if (n->unary.op == TOK_MINUS) return tfold_wrap(0ULL - (uint64_t)v, &ty, out);
+        if (n->unary.op == TOK_TILDE) return tfold_wrap(~(uint64_t)v, &ty, out);
+        return false;
+    }
+    case NODE_BINARY: {
+        if (!tfold_node_ty(c, n, &ty) || ty.bits == 0) return false;
+        TFoldTy lty, rty;
+        if (!tfold_node_ty(c, n->binary.left, &lty) ||
+            !tfold_node_ty(c, n->binary.right, &rty)) return false;
+        int64_t l, r;
+        if (!tfold(c, n->binary.left, depth + 1, &l) ||
+            !tfold(c, n->binary.right, depth + 1, &r)) return false;
+        uint64_t ul = (uint64_t)l, ur = (uint64_t)r;
+        switch (n->binary.op) {
+        case TOK_PLUS:  return tfold_wrap(ul + ur, &ty, out);
+        case TOK_MINUS: return tfold_wrap(ul - ur, &ty, out);
+        case TOK_STAR:  return tfold_wrap(ul * ur, &ty, out);
+        case TOK_AMP:   return tfold_wrap(ul & ur, &ty, out);
+        case TOK_PIPE:  return tfold_wrap(ul | ur, &ty, out);
+        case TOK_CARET: return tfold_wrap(ul ^ ur, &ty, out);
+        case TOK_SLASH: case TOK_PERCENT: {
+            /* Exact values of same-signedness operands divide exactly as C does
+             * after its conversions. Mixed signedness converts the signed side,
+             * which exact division does not model. */
+            if (lty.sg != rty.sg || r == 0) return false;
+            if (!lty.sg) {
+                uint64_t q = n->binary.op == TOK_SLASH ? ul / ur : ul % ur;
+                return tfold_wrap(q, &ty, out);
+            }
+            if (l == INT64_MIN && r == -1) return false;
+            if (ty.sg && ty.bits < 64 && r == -1 &&
+                l == -(int64_t)(1ULL << (ty.bits - 1))) return false;
+            int64_t q = n->binary.op == TOK_SLASH ? l / r : l % r;
+            return tfold_wrap((uint64_t)q, &ty, out);
+        }
+        case TOK_LSHIFT: case TOK_RSHIFT: {
+            /* `_zer_shl(a, b)` / `_zer_shr(a, b)`: 0 for a count < 0 or >= the
+             * LEFT operand's carrier width, else the C shift. */
+            if (lty.bits == 0) return false;
+            /* a count is read as ITS type's value: an unsigned count at or
+             * above 2^63 reads negative here and is over-width either way */
+            if (r < 0 || r >= (int64_t)lty.carrier) return tfold_wrap(0, &ty, out);
+            if (n->binary.op == TOK_LSHIFT) return tfold_wrap(ul << r, &ty, out);
+            if (!lty.sg) return tfold_wrap(ul >> r, &ty, out);
+            return tfold_wrap((uint64_t)(l >> r), &ty, out);
+        }
+        /* comparisons and logic produce a bool, not an integer */
+        default: return false;
+        }
+    }
+    /* Everything else is not a constant this fold models. Listed so a new
+     * NodeKind is classified here rather than silently folded. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_EXPR_STMT: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_BOOL_LIT:
+    case NODE_NULL_LIT: case NODE_ASSIGN: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT:
+        return false;
+    }
+    return false;
+}
+
+/* BUG-1090: public face of the typed fold (the emitter renders a global integer
+ * initializer with it, so a global constant and a local one agree on the value). */
+bool checker_fold_const_typed(Checker *c, Node *n, int64_t *out) {
+    if (!c || !n || !out) return false;
+    return tfold(c, n, 0, out);
+}
+
+/* BUG-1090: THE constant query for a VRP sink. The typed fold's value converted
+ * to `dest` (the variable it is stored into; NULL = the expression's own type),
+ * or CONST_EVAL_FAIL. It never falls back to the untyped evaluator: a constant
+ * the typed fold cannot model yields no range, which keeps the runtime check. */
+/* BUG-1090: the same constant, for a position whose C is NOT rendered through
+ * typed temps. A plain assignment `x = <tree>` is emitted as one C expression
+ * in which a literal is a bare `int` (see emit_int_literal), so `(0 - 1) % 7`
+ * RUNS as int arithmetic (-1, stored as 0xFFFFFFFF) while the typed fold says
+ * 3 — trusting the typed value there elided the check on `arr[i]` and wrote
+ * arr[0xFFFFFFFF]. A constant is trusted in such a position only when EVERY
+ * intermediate is the exact mathematical value, fits `int`, and is what the
+ * typed fold computes too: then int, unsigned, long and the typed temps all
+ * agree on it, whichever rendering runs. */
+static bool tfold_exact(Checker *c, Node *n, int depth, int64_t *out) {
+    if (!n || depth > ZER_EXPR_WALK_MAX) return false;
+    int64_t typed;
+    if (!tfold(c, n, depth, &typed)) return false;
+    int64_t v = 0;
+    switch (n->kind) {
+    case NODE_UNARY: {
+        int64_t a;
+        if (!tfold_exact(c, n->unary.operand, depth + 1, &a)) return false;
+        if (n->unary.op == TOK_MINUS) v = -a;
+        else if (n->unary.op == TOK_TILDE) v = ~a;
+        else return false;
+        break;
+    }
+    case NODE_BINARY: {
+        int64_t l, r;
+        if (!tfold_exact(c, n->binary.left, depth + 1, &l) ||
+            !tfold_exact(c, n->binary.right, depth + 1, &r)) return false;
+        switch (n->binary.op) {
+        case TOK_PLUS:  v = l + r; break;
+        case TOK_MINUS: v = l - r; break;
+        case TOK_STAR:  v = l * r; break;          /* int32 * int32 fits int64 */
+        case TOK_AMP:   v = l & r; break;
+        case TOK_PIPE:  v = l | r; break;
+        case TOK_CARET: v = l ^ r; break;
+        case TOK_SLASH: if (r == 0) return false; v = l / r; break;
+        case TOK_PERCENT: if (r == 0) return false; v = l % r; break;
+        case TOK_LSHIFT:
+            if (l < 0 || r < 0 || r >= 31) return false;
+            v = l << r;
+            break;
+        case TOK_RSHIFT:
+            if (l < 0 || r < 0 || r >= 31) return false;
+            v = l >> r;
+            break;
+        default: return false;
+        }
+        break;
+    }
+    case NODE_TYPECAST: {
+        if (!tfold_exact(c, n->typecast.expr, depth + 1, &v)) return false;
+        break;
+    }
+    /* leaves: the typed value is the value */
+    case NODE_INT_LIT: case NODE_CHAR_LIT: case NODE_CALL: case NODE_FIELD:
+    case NODE_IDENT:
+        v = typed;
+        break;
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_EXPR_STMT: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_STATIC_ASSERT:
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_BOOL_LIT:
+    case NODE_NULL_LIT: case NODE_ASSIGN: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT:
+        return false;
+    }
+    if (v != typed || v < INT32_MIN || v > INT32_MAX) return false;
+    *out = v;
+    return true;
+}
+
+/* BUG-1090: vrp_const_value for a value rendered as ONE C expression (a plain
+ * assignment's right-hand side) — trusted only when every rendering agrees. */
+static int64_t vrp_const_value_untyped_render(Checker *c, Node *n, Type *dest) {
+    int64_t v;
+    if (!tfold_exact(c, n, 0, &v)) return CONST_EVAL_FAIL;
+    if (dest) {
+        TFoldTy dty;
+        int64_t w;
+        if (!tfold_type(dest, &dty) || !tfold_wrap((uint64_t)v, &dty, &w) || w != v)
+            return CONST_EVAL_FAIL;
+    }
+    return v;
+}
+
+/* BUG-1099: a loop BOUND — a typed constant, or a variable whose live range is
+ * a single value (`usize _zer_rlen = arr.len;`, `u32 n = 4;`). The loop drivers
+ * widen every variable the body writes BEFORE reading the bound, so a bound the
+ * body changes is no longer a single value by the time it is read here. */
+static int64_t vrp_loop_bound_value(Checker *c, Node *n) {
+    int64_t v = vrp_const_value(c, n, NULL);
+    if (v != CONST_EVAL_FAIL) return v;
+    if (n && n->kind == NODE_IDENT) {
+        struct VarRange *r = find_var_range(c, n->ident.name, (uint32_t)n->ident.name_len);
+        if (r && r->min_val == r->max_val && r->min_val != INT64_MIN &&
+            r->min_val != INT64_MAX)
+            return r->min_val;
+    }
+    return CONST_EVAL_FAIL;
+}
+
+static int64_t vrp_const_value(Checker *c, Node *n, Type *dest) {
+    /* A defer body in a function with a label is emitted by the AST emitter,
+     * which renders a literal tree as ONE C expression (refactor L keeps that
+     * path) — so inside any defer body only a rendering-invariant constant is
+     * trusted. */
+    if (c->defer_depth > 0) return vrp_const_value_untyped_render(c, n, dest);
+    /* A LONE integer literal is exact at every width — there is no arithmetic
+     * to wrap — so it needs no typed model. Without this a 128-bit comparison
+     * (`if (b == 0)` on an i128, where tfold has no 128-bit type) narrowed
+     * nothing and `r /= b` was refused as "not proven nonzero" (the merge of
+     * BUG-1062's i128 trap test with BUG-1090). */
+    if (n && n->kind == NODE_INT_LIT && n->int_lit.value <= (uint64_t)INT64_MAX)
+        return (int64_t)n->int_lit.value;
+    int64_t v;
+    if (!tfold(c, n, 0, &v)) return CONST_EVAL_FAIL;
+    TFoldTy fty;
+    if (dest) {
+        if (!tfold_type(dest, &fty)) return CONST_EVAL_FAIL;
+        if (!tfold_wrap((uint64_t)v, &fty, &v)) return CONST_EVAL_FAIL;
+    } else if (!tfold_node_ty(c, n, &fty)) {
+        return CONST_EVAL_FAIL;
+    }
+    /* an unsigned value at or above 2^63 has no int64 reading */
+    if (!fty.sg && v < 0) return CONST_EVAL_FAIL;
+    if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+    return v;
+}
+
+/* ================================================================
  * V3 allocator sugar — target-type based routing (2026-04-19)
  *
  * ZER has two forms per allocator: one returning Handle(T), one
@@ -7806,6 +8187,15 @@ static Type *check_expr(Checker *c, Node *node) {
         Symbol *sym = find_symbol(c, node->ident.name, (uint32_t)node->ident.name_len,
                                   node->loc.line);
         result = sym ? sym->type : ty_void;
+        /* BUG-1099: the for-in desugaring's own variables are reserved — the
+         * `_zer_` prefix already stops a user DECLARING one, and nothing stopped a
+         * user READING or WRITING one (`arr[_zer_ri] = x;` compiled). */
+        if (sym && sym->is_synthetic_var && !node->ident.is_synthetic) {
+            checker_error(c, node->loc.line,
+                "'%.*s' is a compiler-generated variable of the for-in loop and "
+                "cannot be referenced — keep your own counter if you need the index",
+                (int)node->ident.name_len, node->ident.name);
+        }
         /* Scoped-borrow READ-side (BUG-751 write-side extension): a parent READ of
          * a local currently borrowed by a scoped spawn races the thread, which may
          * be writing it through the `&local` it holds. The write-side (NODE_ASSIGN)
@@ -8308,6 +8698,14 @@ static Type *check_expr(Checker *c, Node *node) {
                                 (uint32_t)root->ident.name_len);
                             if (r) r->address_taken = true;
                         }
+                        /* BUG-1095: and for a LOCAL, permanently on the Symbol. The
+                         * entry above is popped at its block's end, so `if (true)
+                         * { q = &i; }` left `i` narrowable again after the block,
+                         * with `q` still aliasing it. A global needs no flag: every
+                         * store through a pointer widens global ranges (BUG-1093). */
+                        if (sym && sym != global_decl_lookup(c,
+                                root->ident.name, (uint32_t)root->ident.name_len))
+                            sym->vrp_addr_taken = true;
                     }
                     /* BUG-208: block &union_var inside mutable capture arm. */
                     if (c->union_switch_var &&
@@ -8992,6 +9390,14 @@ static Type *check_expr(Checker *c, Node *node) {
         /* BUG-502: range invalidation for ALL assignment ops, not just TOK_EQ.
          * Compound assignments (+=, -=, *=, etc.) also change the value.
          * if (i < 5) { i += 20; arr[i]; } → stale range without this fix. */
+        /* BUG-1093: a store THROUGH A POINTER may write any global, any static
+         * local and anything read through a pointer — `void f(*u32 p) { if (g < 4)
+         * { *p = 4; arr[g] = 7; } }` called as `f(&g)` kept g in [0,3] across the
+         * store and elided the check on arr[g]. The target cannot be resolved to
+         * one variable, so every such range is widened (address-taken locals have
+         * none — BUG-1095). */
+        if (vrp_store_through_pointer(c, node->assign.target))
+            vrp_widen_global_like(c);
         {
             Node *troot = node->assign.target;
             while (troot && (troot->kind == NODE_FIELD || troot->kind == NODE_INDEX)) {
@@ -10505,6 +10911,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->call.callee->kind = NODE_IDENT;
                         node->call.callee->ident.name = func_name;
                         node->call.callee->ident.name_len = func_len;
+                        node->call.callee->ident.is_synthetic = false;
                         goto normal_call;
                     }
                 }
@@ -11735,18 +12142,11 @@ static Type *check_expr(Checker *c, Node *node) {
         /* BUG-478: Any function call might modify global variables.
          * Invalidate VRP ranges for all globals in the range stack.
          * Skip comptime calls (pure, no side effects). */
-        if (!node->call.is_comptime_resolved) {
-            for (int ri = 0; ri < c->var_range_count; ri++) {
-                struct VarRange *r = &c->var_ranges[ri];
-                /* Check if this range entry is for a global variable */
-                Symbol *rsym = global_decl_lookup(c, r->name, r->name_len);
-                if (rsym && !rsym->is_function && !rsym->is_const) {
-                    r->min_val = INT64_MIN;
-                    r->max_val = INT64_MAX;
-                    r->known_nonzero = false;
-                }
-            }
-        }
+        /* BUG-1093: through the ONE widening, keyed on the entry's recorded root
+         * (so a compound key `gs.i` of a global, a static local and a key read
+         * through a pointer are all widened — the old name lookup matched only a
+         * bare global name). */
+        if (!node->call.is_comptime_resolved) vrp_widen_global_like(c);
 
         break;
     }
@@ -11811,6 +12211,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->kind = NODE_IDENT;
                         node->ident.name = fname;
                         node->ident.name_len = flen;
+                        node->ident.is_synthetic = false;
                         typemap_set(c, node, gsym->type);
                         result = gsym->type;
                         break;
@@ -12282,6 +12683,22 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->index_expr.index->ident.name,
                         (unsigned long long)obj->array.size);
                 } else
+                /* BUG-1098: the auto-guard is HOISTED to the start of the
+                 * statement, so it tests the index's value THERE. When the
+                 * statement itself can change the index first (`g() + arr[gi]`
+                 * with g writing gi, `g(&i) + arr[i]`, `(i = get()) > 0 &&
+                 * arr[i]`), the guard tests a stale value. Leave the access
+                 * unguarded instead: the emitter then gives it the inline
+                 * single-read bounds check (a trap), evaluated where it reads. */
+                if (!checker_is_proven(c, node) &&
+                    !vrp_guard_hoist_sound(c, node->index_expr.index)) {
+                    checker_warning(c, node->loc.line,
+                        "index '%.*s' can change within this statement before it "
+                        "is read, so it cannot be guarded up front — a bounds check "
+                        "(trap on failure) is inserted at the access",
+                        (int)node->index_expr.index->ident.name_len,
+                        node->index_expr.index->ident.name);
+                } else
                 if (!checker_is_proven(c, node)) {
                     mark_auto_guard(c, node, obj->array.size);
                     if (iv == IDX_PARTIAL_OOB) {
@@ -12310,6 +12727,13 @@ static Type *check_expr(Checker *c, Node *node) {
                             (int)node->index_expr.index->ident.name_len,
                             node->index_expr.index->ident.name,
                             (unsigned long long)obj->array.size);
+                    } else if (node->index_expr.index->ident.is_synthetic) {
+                    /* BUG-1099: the for-in desugaring's index — the user never
+                     * wrote `_zer_ri`, and cannot add the suggested guard. */
+                    checker_warning(c, node->loc.line,
+                        "the for-in loop's element index could not be proven in range "
+                        "for this array of size %llu — auto-guard inserted",
+                        (unsigned long long)obj->array.size);
                     } else {
                     checker_warning(c, node->loc.line,
                         "index '%.*s' not proven in range for array of size %llu — "
@@ -12450,6 +12874,23 @@ static Type *check_expr(Checker *c, Node *node) {
                         ptr_proven = true;
                         mark_proven(c, node);
                         result = obj->pointer.inner;   /* diagnosed once, not twice */
+                        break;
+                    }
+                    /* BUG-1098: the MMIO guard is hoisted to the start of the
+                     * statement too, and a pointer index has no inline
+                     * single-read form to fall back to — so an index the same
+                     * statement can change before the access is refused. */
+                    if (node->index_expr.index->kind == NODE_IDENT &&
+                        !vrp_guard_hoist_sound(c, node->index_expr.index)) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index '%.*s' can change within this statement before "
+                            "it is read, so the range guard (evaluated first) would test "
+                            "a stale value. Compute the index in its own statement",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name);
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;
                         break;
                     }
                     /* variable index — auto-guard using mmio_bound as array size */
@@ -15551,6 +15992,12 @@ static Type *check_expr(Checker *c, Node *node) {
         break;
     }
 
+    /* BUG-1093: an intrinsic handed a pointer (atomics, @cstr, the context /
+     * FPU / cache ops) may write through it — the same widening as a store
+     * through a pointer. Its arguments are checked (typemapped) by now. */
+    if (node->kind == NODE_INTRINSIC && vrp_intrinsic_may_store(c, node))
+        vrp_widen_global_like(c);
+
     if (!result) result = ty_void;
     typemap_set(c, node,result);
     c->expr_depth--;
@@ -17212,12 +17659,172 @@ static int escaping_block_depth(Checker *c, int depth) {
     return depth;
 }
 
+
+/* BUG-1098: the expression an auto-guard for an access inside `stmt` is HOISTED
+ * in front of — the lowering (`lower_stmt_guards`) and the emitter
+ * (`emit_auto_guards`) both test the index once, before the statement's code
+ * runs. NULL = the statement has no such expression of its own (its children
+ * set their own root). */
+static Node *vrp_stmt_guard_root(Node *stmt) {
+    if (!stmt) return NULL;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: return stmt->expr_stmt.expr;
+    case NODE_VAR_DECL: case NODE_GLOBAL_VAR: return stmt->var_decl.init;
+    case NODE_RETURN: return stmt->ret.expr;
+    case NODE_IF: return stmt->if_stmt.cond;
+    case NODE_SWITCH: return stmt->switch_stmt.expr;
+    case NODE_WHILE: case NODE_DO_WHILE: return stmt->while_stmt.cond;
+    case NODE_AWAIT: return stmt->await_stmt.cond;
+    /* a spawn's arguments are evaluated together, in order, at the spawn */
+    case NODE_SPAWN: return stmt;
+    /* the for clauses are set one at a time by the for driver */
+    case NODE_FOR:
+    case NODE_BLOCK: case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_YIELD: case NODE_ASM: case NODE_GOTO: case NODE_LABEL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_FIELD: case NODE_INDEX: case NODE_SLICE:
+    case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return NULL;
+    }
+    return NULL;
+}
+
+static bool vrp_root_names(Node *e, const char *name, uint32_t len) {
+    Node *r = expr_root_ident(e);
+    return r && (uint32_t)r->ident.name_len == len &&
+           memcmp(r->ident.name, name, len) == 0;
+}
+
+/* BUG-1098: can evaluating `e` change the value of variable `name` before a
+ * later part of the same expression reads it? YES for an assignment to it, for
+ * `&name` (a callee may write through it), and — when the variable is storage
+ * other code can reach (`reachable`: a global, a static, an address-taken
+ * local) — for any call, store through a pointer, or writing intrinsic. An
+ * orelse BLOCK fallback holds statements and answers YES. Exhaustive, no
+ * `default:`; past the expression bound it answers YES. */
+static bool vrp_expr_may_write_var(Checker *c, Node *e, const char *name,
+                                   uint32_t len, bool reachable, int depth) {
+    if (!e) return false;
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    int d = depth + 1;
+    switch (e->kind) {
+    case NODE_ASSIGN:
+        if (vrp_root_names(e->assign.target, name, len)) return true;
+        if (reachable && vrp_store_through_pointer(c, e->assign.target)) return true;
+        return vrp_expr_may_write_var(c, e->assign.target, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->assign.value, name, len, reachable, d);
+    case NODE_UNARY:
+        if (e->unary.op == TOK_AMP && vrp_root_names(e->unary.operand, name, len))
+            return true;
+        return vrp_expr_may_write_var(c, e->unary.operand, name, len, reachable, d);
+    case NODE_CALL:
+        if (reachable && !e->call.is_comptime_resolved) return true;
+        if (vrp_expr_may_write_var(c, e->call.callee, name, len, reachable, d)) return true;
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (vrp_expr_may_write_var(c, e->call.args[i], name, len, reachable, d))
+                return true;
+        return false;
+    case NODE_INTRINSIC:
+        if (reachable && vrp_intrinsic_may_store(c, e)) return true;
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (vrp_expr_may_write_var(c, e->intrinsic.args[i], name, len, reachable, d))
+                return true;
+        return false;
+    case NODE_ORELSE:
+        if (e->orelse.fallback && e->orelse.fallback->kind == NODE_BLOCK) return true;
+        return vrp_expr_may_write_var(c, e->orelse.expr, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->orelse.fallback, name, len, reachable, d);
+    case NODE_BINARY:
+        return vrp_expr_may_write_var(c, e->binary.left, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->binary.right, name, len, reachable, d);
+    case NODE_FIELD:
+        return vrp_expr_may_write_var(c, e->field.object, name, len, reachable, d);
+    case NODE_INDEX:
+        return vrp_expr_may_write_var(c, e->index_expr.object, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->index_expr.index, name, len, reachable, d);
+    case NODE_SLICE:
+        return vrp_expr_may_write_var(c, e->slice.object, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->slice.start, name, len, reachable, d) ||
+               vrp_expr_may_write_var(c, e->slice.end, name, len, reachable, d);
+    case NODE_TYPECAST:
+        return vrp_expr_may_write_var(c, e->typecast.expr, name, len, reachable, d);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (vrp_expr_may_write_var(c, e->struct_init.fields[i].value, name, len,
+                                       reachable, d))
+                return true;
+        return false;
+    case NODE_SPAWN:
+        for (int i = 0; i < e->spawn_stmt.arg_count; i++)
+            if (vrp_expr_may_write_var(c, e->spawn_stmt.args[i], name, len, reachable, d))
+                return true;
+        return false;
+    case NODE_AWAIT:
+        return vrp_expr_may_write_var(c, e->await_stmt.cond, name, len, reachable, d);
+    /* Leaves read nothing they could write. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    /* A statement kind here is a statement nested in an expression position
+     * (an orelse block is caught above) — answer the conservative YES. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_EXPR_STMT: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
+/* BUG-1098: may an auto-guard for `arr[idx]` be HOISTED to the start of the
+ * current statement? Only when nothing in the statement can change `idx`
+ * before the access reads it. `u32 v = g() + arr[gi];` with `g` writing `gi`
+ * tested gi == 1 in the guard and then read arr[4]. NO means: leave the access
+ * unguarded, so it carries its own single-evaluation inline bounds check. */
+static bool vrp_guard_hoist_sound(Checker *c, Node *idx) {
+    if (!idx) return false;
+    if (idx->kind == NODE_INT_LIT) return true;
+    if (idx->kind != NODE_IDENT) return false;
+    Node *root = c->guard_stmt_root;
+    if (!root) return false;
+    const char *name = idx->ident.name;
+    uint32_t len = (uint32_t)idx->ident.name_len;
+    Symbol *sym = scope_lookup(c->current_scope, name, len);
+    bool reachable = !sym || sym->is_static || sym->vrp_addr_taken ||
+                     sym == global_decl_lookup(c, name, len);
+    /* The statement's OWN top-level assignment stores LAST — after every read
+     * of its target's subscripts and of its value (`k += a[k] + 1` reads a[k]
+     * under the pre-store k, which is exactly what the hoisted guard tests).
+     * Only writes NESTED inside it can move the index first. */
+    if (root->kind == NODE_ASSIGN)
+        return !vrp_expr_may_write_var(c, root->assign.target, name, len, reachable, 1) &&
+               !vrp_expr_may_write_var(c, root->assign.value, name, len, reachable, 1);
+    return !vrp_expr_may_write_var(c, root, name, len, reachable, 0);
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
     /* In async functions, set in_async_yield_stmt for statements containing yield/await.
      * Shared struct access is only banned in these statements (lock held across suspension). */
     bool saved_yield_stmt = c->in_async_yield_stmt;
+    /* BUG-1098: the expression this statement's auto-guards hoist in front of. */
+    Node *saved_guard_root = c->guard_stmt_root;
+    c->guard_stmt_root = vrp_stmt_guard_root(node);
     if (c->in_async && !c->in_async_yield_stmt) {
         if (node->kind == NODE_EXPR_STMT && expr_contains_yield(node->expr_stmt.expr))
             c->in_async_yield_stmt = true;
@@ -17990,17 +18597,20 @@ static void check_stmt(Checker *c, Node *node) {
          * struct field, return). No per-site duplicate code needed. */
 
         /* Value range propagation: track literal init values */
+        /* BUG-1090: the constant is the TYPED fold, converted to the declared
+         * type — the value the emitted code stores, not the untyped int64 fold.
+         * BUG-1092: `fresh` — a declaration never inherits a range. */
         if (node->var_decl.init && type && type_is_integer(type)) {
-            int64_t val = eval_const_expr(node->var_decl.init);
+            int64_t val = vrp_const_value(c, node->var_decl.init, type);
             if (val != CONST_EVAL_FAIL) {
-                push_var_range(c, node->var_decl.name,
-                    (uint32_t)node->var_decl.name_len, val, val, val != 0);
+                push_var_range_ex(c, node->var_decl.name,
+                    (uint32_t)node->var_decl.name_len, val, val, val != 0, true);
             } else {
                 /* derive range from expression: x % N → [0, N-1], x & MASK → [0, MASK] */
                 int64_t rmin, rmax;
-                if (derive_expr_range(c, node->var_decl.init, &rmin, &rmax)) {
-                    push_var_range(c, node->var_decl.name,
-                        (uint32_t)node->var_decl.name_len, rmin, rmax, rmin > 0);
+                if (derive_expr_range(c, node->var_decl.init, &rmin, &rmax, false)) {
+                    push_var_range_ex(c, node->var_decl.name,
+                        (uint32_t)node->var_decl.name_len, rmin, rmax, rmin > 0, true);
                 } else if (node->var_decl.init->kind == NODE_CALL &&
                            node->var_decl.init->call.callee->kind == NODE_IDENT) {
                     /* cross-function range: check if callee has return range summary */
@@ -18008,10 +18618,10 @@ static void check_stmt(Checker *c, Node *node) {
                         node->var_decl.init->call.callee->ident.name,
                         (uint32_t)node->var_decl.init->call.callee->ident.name_len);
                     if (csym && csym->has_return_range) {
-                        push_var_range(c, node->var_decl.name,
+                        push_var_range_ex(c, node->var_decl.name,
                             (uint32_t)node->var_decl.name_len,
                             csym->return_range_min, csym->return_range_max,
-                            csym->return_range_min > 0);
+                            csym->return_range_min > 0, true);
                     }
                 }
             }
@@ -18243,14 +18853,14 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *lsym = scope_lookup(c->current_scope,
                         lhs->ident.name, (uint32_t)lhs->ident.name_len);
                     bool is_vol = (lsym && lsym->is_volatile);
-                    cmp_val = vrp_guard_const(rhs, cmp_op);  /* BUG-1067 */
+                    cmp_val = vrp_guard_const(c, rhs, cmp_op);  /* BUG-1067 + BUG-1090 */
                     if (cmp_val != CONST_EVAL_FAIL && !is_vol) {
                         cmp_var = lhs->ident.name;
                         cmp_var_len = (uint32_t)lhs->ident.name_len;
                         var_on_left = true;
                     }
                 } else if (lhs->kind == NODE_FIELD) {
-                    cmp_val = vrp_guard_const(rhs, cmp_op);  /* BUG-1067 */
+                    cmp_val = vrp_guard_const(c, rhs, cmp_op);  /* BUG-1067 + BUG-1090 */
                     if (cmp_val != CONST_EVAL_FAIL) {
                         ExprKey ek = build_expr_key_a(c, lhs);
                         if (ek.len > 0) {
@@ -18265,14 +18875,14 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *rsym = scope_lookup(c->current_scope,
                         rhs->ident.name, (uint32_t)rhs->ident.name_len);
                     bool r_vol = (rsym && rsym->is_volatile);
-                    cmp_val = vrp_guard_const(lhs, cmp_op);  /* BUG-1067 */
+                    cmp_val = vrp_guard_const(c, lhs, cmp_op);  /* BUG-1067 + BUG-1090 */
                     if (cmp_val != CONST_EVAL_FAIL && !r_vol) {
                         cmp_var = rhs->ident.name;
                         cmp_var_len = (uint32_t)rhs->ident.name_len;
                         var_on_left = false;
                     }
                 } else if (!cmp_var && rhs->kind == NODE_FIELD) {
-                    cmp_val = vrp_guard_const(lhs, cmp_op);  /* BUG-1067 */
+                    cmp_val = vrp_guard_const(c, lhs, cmp_op);  /* BUG-1067 + BUG-1090 */
                     if (cmp_val != CONST_EVAL_FAIL) {
                         ExprKey ek = build_expr_key_a(c, rhs);
                         if (ek.len > 0) {
@@ -18565,6 +19175,7 @@ static void check_stmt(Checker *c, Node *node) {
          * loop-carried at the condition too. Idempotent with the B7 call below. */
         vrp_widen_loop_addr_taken(c, node->for_stmt.body);
         if (node->for_stmt.cond) {
+            c->guard_stmt_root = node->for_stmt.cond;          /* BUG-1098 */
             Type *fcond = check_expr(c, node->for_stmt.cond);
             if (!type_equals(fcond, ty_bool)) {
                 checker_error(c, node->loc.line,
@@ -18582,7 +19193,7 @@ static void check_stmt(Checker *c, Node *node) {
             if (fc->binary.left->kind == NODE_IDENT) {
                 loop_var = fc->binary.left->ident.name;
                 loop_var_len = (uint32_t)fc->binary.left->ident.name_len;
-                bound_val = eval_const_expr(fc->binary.right);
+                bound_val = vrp_loop_bound_value(c, fc->binary.right);   /* BUG-1090/1099 */
             }
 
             /* try to get init value for min */
@@ -18590,7 +19201,7 @@ static void check_stmt(Checker *c, Node *node) {
             bool init_known = false;
             if (node->for_stmt.init && node->for_stmt.init->kind == NODE_VAR_DECL &&
                 node->for_stmt.init->var_decl.init) {
-                int64_t iv = eval_const_expr(node->for_stmt.init->var_decl.init);
+                int64_t iv = vrp_const_value(c, node->for_stmt.init->var_decl.init, NULL);   /* BUG-1090 */
                 if (iv != CONST_EVAL_FAIL) { init_val = iv; init_known = true; }
             }
             /* B8 (2026-08-01): a NON-const-evaluable init previously fell back to
@@ -18651,7 +19262,15 @@ static void check_stmt(Checker *c, Node *node) {
                             else if (r_is && !l_is) inc = l;
                         }
                         if (inc) {
-                            int64_t cinc = eval_const_expr(inc);
+                            /* BUG-1090: the step is not type-checked yet here (it is
+                             * checked below, under the cond narrowing), so the typed
+                             * fold has no types to read. A bare literal is exact at
+                             * any width; anything else must fold typed, and does not
+                             * yet — which only costs a signed counter its lower bound. */
+                            int64_t cinc = inc->kind == NODE_INT_LIT &&
+                                               inc->int_lit.value <= (uint64_t)INT64_MAX
+                                           ? (int64_t)inc->int_lit.value
+                                           : vrp_const_value(c, inc, NULL);
                             nonneg_inc = cinc != CONST_EVAL_FAIL && cinc >= 0;
                         }
                     }
@@ -18686,7 +19305,9 @@ static void check_stmt(Checker *c, Node *node) {
         if (node->for_stmt.step) {
             int st_saved = c->var_range_count;
             struct VarRange *st_pre = vrp_snap_take(c, st_saved);
+            c->guard_stmt_root = node->for_stmt.step;          /* BUG-1098 */
             check_expr(c, node->for_stmt.step);
+            c->guard_stmt_root = NULL;
             c->var_range_count = st_saved;
             vrp_snap_restore(c, st_pre, st_saved);
             free(st_pre);
@@ -18714,9 +19335,9 @@ static void check_stmt(Checker *c, Node *node) {
             const char *cv = fc2->binary.left->ident.name;
             uint32_t cvl = (uint32_t)fc2->binary.left->ident.name_len;
             Node *stp = node->for_stmt.step;
-            int64_t lo2 = eval_const_expr(node->for_stmt.init->var_decl.init);
-            int64_t k2  = eval_const_expr(fc2->binary.right);
-            int64_t st2 = eval_const_expr(stp->assign.value);
+            int64_t lo2 = vrp_const_value(c, node->for_stmt.init->var_decl.init, NULL);   /* BUG-1090 */
+            int64_t k2  = vrp_const_value(c, fc2->binary.right, NULL);   /* BUG-1090 */
+            int64_t st2 = vrp_const_value(c, stp->assign.value, NULL);   /* BUG-1090 */
             bool same_var =
                 (uint32_t)stp->assign.target->ident.name_len == cvl &&
                 memcmp(stp->assign.target->ident.name, cv, cvl) == 0 &&
@@ -18833,7 +19454,7 @@ static void check_stmt(Checker *c, Node *node) {
             if (wc->binary.left->kind == NODE_IDENT) {
                 const char *lv = wc->binary.left->ident.name;
                 uint32_t lvl = (uint32_t)wc->binary.left->ident.name_len;
-                int64_t bv = eval_const_expr(wc->binary.right);
+                int64_t bv = vrp_loop_bound_value(c, wc->binary.right);   /* BUG-1090/1099 */
                 if (bv != CONST_EVAL_FAIL) {
                     if (wop == TOK_LT) {
                         push_var_range(c, lv, lvl, INT64_MIN, bv - 1, false);
@@ -18862,7 +19483,7 @@ static void check_stmt(Checker *c, Node *node) {
              node->while_stmt.cond->binary.op == TOK_LTEQ)) {
             const char *wv = node->while_stmt.cond->binary.left->ident.name;
             uint32_t wvl = (uint32_t)node->while_stmt.cond->binary.left->ident.name_len;
-            int64_t wk = eval_const_expr(node->while_stmt.cond->binary.right);
+            int64_t wk = vrp_const_value(c, node->while_stmt.cond->binary.right, NULL);   /* BUG-1090 */
             int64_t wstep = while_counter_step(node->while_stmt.body, wv, wvl);
             if (wk != CONST_EVAL_FAIL && wstep > 0) {
                 int64_t wbound = (node->while_stmt.cond->binary.op == TOK_LT)
@@ -19450,6 +20071,15 @@ static void check_stmt(Checker *c, Node *node) {
                 if (rc == RET_UNKNOWN) c->cur_ret_summary_complete = false;
                 else if (rc >= 0) c->cur_ret_param_mask |= (1ull << rc);
             }
+
+            /* BUG-1097: record the returned value's range HERE, at the return,
+             * under the narrowing live at this program point. The summary pass
+             * used to read the ranges live at the END of the body instead, so a
+             * later guard's inverse (`if (x >= 2) { return 1; }` after a
+             * `return x;` reached by a goto-free path) was credited to an earlier
+             * return, and an inner shadow's name resolved to the outer variable.
+             * A statement checked more than once JOINs its visits. */
+            vrp_record_return_range(c, node);
 
             /* string literal returned as mutable slice → .rodata write risk
              * Covers both []u8 and ?[]u8 return types.
@@ -21334,6 +21964,10 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "'yield' only allowed inside async function");
         }
+        /* BUG-1096: across a suspension the poller and every other task run —
+         * any of them may write a global. `if (g < 4) { yield; arr[g] = 7; }`
+         * kept g in [0,3] across the yield while main set g = 4 between polls. */
+        vrp_widen_global_like(c);
         break;
 
     case NODE_AWAIT: {
@@ -21343,6 +21977,9 @@ static void check_stmt(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "'await' only allowed inside async function");
         }
+        /* BUG-1096: the condition is re-evaluated after every suspension, and
+         * the code after it runs after one — widen BEFORE checking it. */
+        vrp_widen_global_like(c);
         if (node->await_stmt.cond) {
             /* BH-18 #9 (copied from cool-johnson-t8vr3h): a bare `await cond;`
              * is a NODE_AWAIT, not a NODE_EXPR_STMT/NODE_VAR_DECL, so the
@@ -22181,6 +22818,7 @@ static void check_stmt(Checker *c, Node *node) {
         break;
     }
     c->in_async_yield_stmt = saved_yield_stmt;
+    c->guard_stmt_root = saved_guard_root;
 }
 
 /* ================================================================
@@ -23336,15 +23974,12 @@ static void check_func_body(Checker *c, Node *node) {
          * after the body). */
         c->cur_ret_summary_complete = true;
         c->cur_ret_param_mask = 0;
-        /* §C #15: reset the value-range map at each function-body entry. VarRange
-         * is keyed by variable NAME with no scope discriminator, so ranges derived
-         * in an EARLIER function (e.g. `if (i >= 16) return;` narrowing param `i`
-         * to [0,15]) would otherwise persist into a LATER function that reuses the
-         * name, silently eliding its bounds guard (audit 2026-07-06). NOT restored
-         * after the body: the post-body find_return_range pass (cross-function
-         * range summary) READS these ranges, and the next function's own entry
-         * reset re-clears them. Functions never nest, so nothing between here and
-         * that next reset consults a stale range. */
+        /* §C #15: reset the value-range map at each function-body entry, so no
+         * range derived in an EARLIER function persists into a later one. (Entries
+         * are keyed by declaring scope since BUG-1092, so a stale entry could not
+         * match anyway; the reset keeps the table small.) The post-body
+         * find_return_range pass no longer reads these ranges — each return's
+         * range is recorded at the return (BUG-1097). */
         c->var_range_count = 0;
         c->rmw_taint_count = 0;   /* BUG-1010: per-function, same lifetime as VarRange */
         c->rmw_ptr_carrier_count = 0;   /* BUG-1046 */
@@ -23584,10 +24219,42 @@ void checker_set_type(Checker *c, Node *node, Type *type) {
 
 /* ---- Value Range Propagation helpers ---- */
 
-/* Find the most recent range entry for a variable (stack: scan from end) */
+/* BUG-1092: resolve the ROOT variable of a VRP key ("i", "s.x", "arr[3]", "*p")
+ * to the scope that DECLARES it — the variable's identity. Ranges used to be
+ * found by NAME alone, so a declaration that SHADOWED an outer variable read the
+ * outer variable's range (`u32 i = 1; { u32 i = get(5); arr[i] }` proved arr[i]
+ * against [1,1]), and an assignment to the inner variable mutated the outer
+ * entry in place. Scope pointers are arena-allocated and never reused within a
+ * compilation, so (owner scope, key) names exactly one variable. */
+static Symbol *vrp_key_root(Checker *c, const char *name, uint32_t name_len,
+                            Scope **owner) {
+    uint32_t st = 0;
+    while (st < name_len && name[st] == '*') st++;
+    uint32_t rl = st;
+    while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
+    *owner = NULL;
+    if (rl == st) return NULL;
+    for (Scope *s = c->current_scope; s; s = s->parent) {
+        Symbol *sym = scope_lookup_local(s, name + st, rl - st);
+        if (sym) { *owner = s; return sym; }
+    }
+    if (c->global_scope) {
+        Symbol *g = global_decl_lookup(c, name + st, rl - st);
+        if (g) { *owner = c->global_scope; return g; }
+    }
+    return NULL;
+}
+
+/* Find the most recent range entry for a variable (stack: scan from end).
+ * BUG-1092: matches the variable's IDENTITY (declaring scope + key), never the
+ * bare name. BUG-1095: an address-taken root has no range at all. */
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len) {
+    Scope *owner = NULL;
+    Symbol *root = vrp_key_root(c, name, name_len, &owner);
+    if (root && root->vrp_addr_taken) return NULL;
     for (int i = c->var_range_count - 1; i >= 0; i--) {
-        if (c->var_ranges[i].name_len == name_len &&
+        if (c->var_ranges[i].owner == owner &&
+            c->var_ranges[i].name_len == name_len &&
             memcmp(c->var_ranges[i].name, name, name_len) == 0)
             return &c->var_ranges[i];
     }
@@ -23601,31 +24268,55 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
  * key `volatile`? A volatile value is re-read at every use, so no fact about it
  * survives from one read to the next. */
 static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len) {
-    uint32_t rl = 0;
-    while (rl < name_len && name[rl] != '.' && name[rl] != '[') rl++;
-    if (rl == 0) return false;
-    Symbol *s = scope_lookup(c->current_scope, name, rl);
-    if (!s) s = global_decl_lookup(c, name, rl);
+    Scope *owner = NULL;
+    Symbol *s = vrp_key_root(c, name, name_len, &owner);
     return s && s->is_volatile;
 }
 
-static void push_var_range(Checker *c, const char *name, uint32_t name_len,
-                           int64_t min_val, int64_t max_val, bool known_nonzero) {
-    /* BUG-479: skip narrowing for address-taken variables — pointer alias
-     * may modify the value, so guard-narrowed range is unreliable. */
-    struct VarRange *existing = find_var_range(c, name, name_len);
+/* BUG-1093: does this key name storage that code OTHER than the statement being
+ * checked can change — a call, a store through a pointer, a suspension? A
+ * non-const global, a `static` local, and anything reached THROUGH a pointer
+ * (a key rooted in a pointer/slice/handle, or spelled with a deref). */
+static bool vrp_key_global_like(Checker *c, Scope *owner, Symbol *root,
+                                const char *name, uint32_t name_len) {
+    if (!root) return false;
+    if (root->is_function) return false;
+    bool compound = false;
+    for (uint32_t i = 0; i < name_len; i++)
+        if (name[i] == '.' || name[i] == '[' || name[i] == '*') { compound = true; break; }
+    if (owner == c->global_scope && !root->is_const) return true;
+    if (root->is_static && !root->is_const) return true;
+    if (compound && root->type) {
+        TypeKind k = type_dispatch_kind(root->type);
+        if (k == TYPE_POINTER || k == TYPE_SLICE || k == TYPE_HANDLE ||
+            k == TYPE_OPAQUE || name[0] == '*')
+            return true;
+    }
+    return false;
+}
+
+/* `fresh` = a DECLARATION's initial range: a new variable never inherits (or
+ * intersects with) whatever an earlier visit of the same declaration left. */
+static void push_var_range_ex(Checker *c, const char *name, uint32_t name_len,
+                              int64_t min_val, int64_t max_val, bool known_nonzero,
+                              bool fresh) {
+    Scope *owner = NULL;
+    Symbol *root = vrp_key_root(c, name, name_len, &owner);
+    /* BUG-479 / BUG-1095: an address-taken variable has no range — a pointer
+     * alias may change it, so a guard-narrowed range is unreliable. Read off the
+     * Symbol, which outlives any VarRange entry. */
+    if (root && root->vrp_addr_taken) return;
+    struct VarRange *existing = fresh ? NULL : find_var_range(c, name, name_len);
     if (existing && existing->address_taken) return;
     /* BUG-1011: a volatile value has no range — never record one. (Defensive:
      * measured not live for the `if (g_i < 4) { a[g_i] }` shape on main, but a
      * range on a value that changes between reads can only elide a guard.) */
-    if (vrp_key_root_is_volatile(c, name, name_len)) return;
+    if (root && root->is_volatile) return;
 
-    /* clamp min to 0 for unsigned variables */
-    if (min_val < 0) {
-        Symbol *sym = scope_lookup(c->current_scope, name, name_len);
-        if (sym && sym->type && type_is_unsigned(sym->type)) {
-            min_val = 0;
-        }
+    /* clamp min to 0 for unsigned variables (a plain key names the variable) */
+    if (min_val < 0 && root && root->type && type_is_unsigned(root->type) &&
+        root->name_len == name_len) {
+        min_val = 0;
     }
     /* intersect with existing range if present */
     if (existing) {
@@ -23642,10 +24333,99 @@ static void push_var_range(Checker *c, const char *name, uint32_t name_len,
     struct VarRange *r = &c->var_ranges[c->var_range_count++];
     r->name = name;
     r->name_len = name_len;
+    r->owner = owner;
+    r->root_global_like = vrp_key_global_like(c, owner, root, name, name_len);
     r->min_val = min_val;
     r->max_val = max_val;
     r->known_nonzero = known_nonzero;
     r->address_taken = false;
+}
+
+static void push_var_range(Checker *c, const char *name, uint32_t name_len,
+                           int64_t min_val, int64_t max_val, bool known_nonzero) {
+    push_var_range_ex(c, name, name_len, min_val, max_val, known_nonzero, false);
+}
+
+/* BUG-1093/1094/1096: forget every range on storage that code outside the
+ * current statement can change — non-const globals, static locals, and values
+ * reached through a pointer. Called at a CALL (the callee may write any of
+ * them), a STORE THROUGH A POINTER (it may alias any of them), a yield/await
+ * (another task runs), and — as a pre-pass — before a loop body that contains
+ * any of those (the back edge carries their effect to the top of the body). */
+static void vrp_widen_global_like(Checker *c) {
+    for (int ri = 0; ri < c->var_range_count; ri++) {
+        struct VarRange *r = &c->var_ranges[ri];
+        if (!r->root_global_like) continue;
+        r->min_val = INT64_MIN;
+        r->max_val = INT64_MAX;
+        r->known_nonzero = false;
+    }
+}
+
+/* BUG-1093: does storing to this assignment target write THROUGH a pointer?
+ * `*p = v`, `p.f = v` (auto-deref), `p[i] = v` / `s[i] = v` on a pointer or
+ * slice, a store into a handle's slot, or any target that is not a plain
+ * variable path. Such a store can alias a global or an address-taken local.
+ * Unknown shapes answer YES (the widening direction). Reads the typemap, so the
+ * target must already be checked. */
+static bool vrp_store_through_pointer(Checker *c, Node *t) {
+    int guard = 0;
+    while (t && guard++ < 4096) {
+        if (t->kind == NODE_IDENT) return false;
+        if (t->kind == NODE_UNARY && t->unary.op == TOK_STAR) return true;
+        if (t->kind == NODE_FIELD) {
+            Type *ot = typemap_get(c, t->field.object);
+            if (!ot) return true;
+            TypeKind k = type_dispatch_kind(ot);
+            if (k == TYPE_POINTER || k == TYPE_HANDLE || k == TYPE_OPAQUE) return true;
+            t = t->field.object;
+            continue;
+        }
+        if (t->kind == NODE_INDEX) {
+            Type *ot = typemap_get(c, t->index_expr.object);
+            if (!ot) return true;
+            TypeKind k = type_dispatch_kind(ot);
+            if (k != TYPE_ARRAY) return true;
+            t = t->index_expr.object;
+            continue;
+        }
+        return true;
+    }
+    return true;
+}
+
+/* BUG-1093/1094: the intrinsics that only compute a VALUE from their operands
+ * and never write memory. ONE list, read by the post-check store test below and
+ * by the loop pre-pass (which runs before the body is typed). */
+static bool vrp_intrinsic_is_value_only(Node *n) {
+    static const char *const pure[] = {
+        "ptrcast", "ptrtoint", "inttoptr", "pun", "container", "bitcast", "cast",
+        "truncate", "saturate", "size", "offset", "try_enum", "probe", "expect",
+        "atomic_load", "popcount", "ctz", "clz", "parity", "ffs",
+        "bswap16", "bswap32", "bswap64", "addc", "subb", "mulw", NULL };
+    for (int i = 0; pure[i]; i++) {
+        size_t l = strlen(pure[i]);
+        if (n->intrinsic.name_len == l && memcmp(n->intrinsic.name, pure[i], l) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* BUG-1093: an intrinsic that may WRITE memory through a pointer argument —
+ * anything not value-only that is handed a pointer, an array or an address. */
+static bool vrp_intrinsic_may_store(Checker *c, Node *n) {
+    if (vrp_intrinsic_is_value_only(n)) return false;
+    for (int i = 0; i < n->intrinsic.arg_count; i++) {
+        Node *a = n->intrinsic.args[i];
+        if (!a) continue;
+        if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP) return true;
+        Type *at = typemap_get(c, a);
+        if (!at) return true;
+        TypeKind k = type_dispatch_kind(at);
+        if (k == TYPE_POINTER || k == TYPE_SLICE || k == TYPE_ARRAY || k == TYPE_OPAQUE)
+            return true;
+    }
+    return false;
 }
 
 /* Refactor 1: unified VRP range update on assignment.
@@ -23667,7 +24447,14 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
             r->known_nonzero = (v != 0);
         } else {
             int64_t rmin, rmax;
-            if (derive_expr_range(c, value, &rmin, &rmax)) {
+            /* BUG-1090: a plain assignment's value is ONE C expression, not
+             * typed temps — only a rendering-invariant constant is trusted. */
+            int64_t tv = vrp_const_value_untyped_render(c, value, NULL);
+            if (tv != CONST_EVAL_FAIL) {
+                r->min_val = tv;
+                r->max_val = tv;
+                r->known_nonzero = (tv != 0);
+            } else if (derive_expr_range(c, value, &rmin, &rmax, true)) {
                 r->min_val = rmin;
                 r->max_val = rmax;
                 r->known_nonzero = (rmin > 0);
@@ -23751,7 +24538,7 @@ static void vrp_join_assign_range(Checker *c, const char *name, uint32_t name_le
     if (op == TOK_EQ && value && value->kind == NODE_INT_LIT) {
         vmin = vmax = (int64_t)value->int_lit.value;
         vnz = (vmin != 0);
-    } else if (op == TOK_EQ && value && derive_expr_range(c, value, &vmin, &vmax)) {
+    } else if (op == TOK_EQ && value && derive_expr_range(c, value, &vmin, &vmax, true)) {
         vnz = (vmin > 0);
     } else {
         /* compound op (+=, etc.) or underivable rhs → result unknown */
@@ -23820,6 +24607,11 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
                 (uint32_t)t->ident.name_len,
                 body->assign.op, body->assign.value);
         }
+        /* BUG-1094: a store that is not to a plain variable may go through a
+         * pointer (the body is not type-checked yet, so the path cannot be
+         * classified) — the back edge carries it to the top of the body. */
+        if (body->assign.target && body->assign.target->kind != NODE_IDENT)
+            vrp_widen_global_like(c);
         /* RHS may also contain assignments (e.g., compound expr) */
         vrp_invalidate_loop_body_writes(c, body->assign.value);
         break;
@@ -23885,13 +24677,23 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_UNARY:
         vrp_invalidate_loop_body_writes(c, body->unary.operand);
         break;
-    case NODE_CALL:
+    case NODE_CALL: {
+        /* BUG-1094: a call in the body may write any global, static local or
+         * pointee — and it runs BEFORE the next iteration's top of the body.
+         * `if (g < 4) { while (n < 2) { arr[g] = 7; bump(); n += 1; } }` proved
+         * arr[g] against [0,3] on every iteration. A comptime callee is pure. */
+        Symbol *cs = NULL;
+        if (body->call.callee && body->call.callee->kind == NODE_IDENT)
+            cs = scope_lookup(c->current_scope, body->call.callee->ident.name,
+                              (uint32_t)body->call.callee->ident.name_len);
+        if (!cs || !cs->is_comptime) vrp_widen_global_like(c);
         for (int i = 0; i < body->call.arg_count; i++)
             vrp_invalidate_loop_body_writes(c, body->call.args[i]);
         /* BUG-826: a write reachable only through a callee EXPRESSION. */
         if (body->call.callee && body->call.callee->kind != NODE_IDENT)
             vrp_invalidate_loop_body_writes(c, body->call.callee);
         break;
+    }
     case NODE_TYPECAST:
         /* BUG-826: `(u32)(i = f())` — a cast operand can write. Sat in the leaf
          * list; a missed invalidation leaves a STALE RANGE and elides a bounds
@@ -23899,6 +24701,10 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
         vrp_invalidate_loop_body_writes(c, body->typecast.expr);
         break;
     case NODE_INTRINSIC:
+        /* BUG-1094: an intrinsic may write through a pointer argument; the
+         * arguments are not typed yet, so any intrinsic widens unless it is
+         * one of the value-only ones. */
+        if (!vrp_intrinsic_is_value_only(body)) vrp_widen_global_like(c);
         for (int i = 0; i < body->intrinsic.arg_count; i++)
             vrp_invalidate_loop_body_writes(c, body->intrinsic.args[i]);
         break;
@@ -23928,7 +24734,12 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    /* BUG-1096: a suspension lets another task run before the body resumes,
+     * and a started thread may run at once. Both are a call for this purpose. */
+    case NODE_YIELD: case NODE_AWAIT: case NODE_SPAWN:
+        vrp_widen_global_like(c);
+        break;
+    case NODE_ASM:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
@@ -23974,6 +24785,15 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
                     r->max_val = INT64_MAX;
                     r->known_nonzero = false;
                     r->address_taken = true; /* blocks all later narrowing */
+                }
+                /* BUG-1095: a LOCAL whose address is taken anywhere in the body
+                 * has no range for the whole body (the Symbol flag outlives the
+                 * entry). A global is covered by the pointer-store widening. */
+                {
+                    Scope *own = NULL;
+                    Symbol *rs = vrp_key_root(c, root->ident.name,
+                        (uint32_t)root->ident.name_len, &own);
+                    if (rs && own != c->global_scope) rs->vrp_addr_taken = true;
                 }
             }
         }
@@ -24095,6 +24915,13 @@ void checker_mark_guard_lowered(Checker *c, Node *node) {
 static bool guard_is_lowered(Checker *c, Node *node) {
     for (int i = 0; i < c->guard_lowered_count; i++)
         if (c->guard_lowered[i] == node) return true;
+    return false;
+}
+
+bool checker_has_auto_guard(Checker *c, Node *node) {
+    if (!c || !node) return false;
+    for (int i = 0; i < c->auto_guard_count; i++)
+        if (c->auto_guards[i].node == node) return true;
     return false;
 }
 
@@ -25905,6 +26732,56 @@ static bool scan_expr_orelse_returns(Checker *c, Node *e, int64_t *out_min,
     return true; /* leaf / non-composition — no embedded orelse */
 }
 
+/* BUG-1097: the range of a valued return's expression AT the return statement,
+ * under the VRP state live there. Four sources, in order: a `% N` / `& MASK`
+ * derivation, a TYPED constant converted to the function's return type, a
+ * callee's own summary, and a variable's live range (non-negative only). The
+ * result is JOINed into the node, so a return checked twice keeps both visits. */
+static void vrp_record_return_range(Checker *c, Node *node) {
+    if (!node || node->kind != NODE_RETURN || !node->ret.expr) return;
+    Type *rt = c->current_func_ret;
+    if (!rt || !type_is_integer(rt)) { node->ret.vrp_state = 2; return; }
+    Node *e = node->ret.expr;
+    int64_t rmin = 0, rmax = 0;
+    bool ok = false;
+    if (derive_expr_range(c, e, &rmin, &rmax, false)) {
+        ok = true;
+    } else {
+        int64_t cval = vrp_const_value(c, e, rt);
+        if (cval != CONST_EVAL_FAIL) {
+            rmin = rmax = cval;
+            ok = true;
+        } else if (e->kind == NODE_CALL && e->call.callee &&
+                   e->call.callee->kind == NODE_IDENT) {
+            Symbol *csym = scope_lookup(c->current_scope, e->call.callee->ident.name,
+                                        (uint32_t)e->call.callee->ident.name_len);
+            if (!csym) csym = global_decl_lookup(c, e->call.callee->ident.name,
+                                           (uint32_t)e->call.callee->ident.name_len);
+            if (csym && csym->has_return_range) {
+                rmin = csym->return_range_min;
+                rmax = csym->return_range_max;
+                ok = true;
+            }
+        } else if (e->kind == NODE_IDENT) {
+            struct VarRange *r = find_var_range(c, e->ident.name,
+                                                (uint32_t)e->ident.name_len);
+            if (r && r->min_val >= 0 && r->max_val >= 0) {
+                rmin = r->min_val;
+                rmax = r->max_val;
+                ok = true;
+            }
+        }
+    }
+    if (!ok || node->ret.vrp_state == 2) { node->ret.vrp_state = 2; return; }
+    if (node->ret.vrp_state == 1) {
+        if (node->ret.vrp_min < rmin) rmin = node->ret.vrp_min;
+        if (node->ret.vrp_max > rmax) rmax = node->ret.vrp_max;
+    }
+    node->ret.vrp_state = 1;
+    node->ret.vrp_min = rmin;
+    node->ret.vrp_max = rmax;
+}
+
 static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t *out_max, bool *found, bool in_branch) {
     if (!node) return true;
     if (node->kind == NODE_RETURN && node->ret.expr) {
@@ -25913,86 +26790,20 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
          * separate path; union it before deriving the outer expr's range. */
         if (!scan_expr_orelse_returns(c, node->ret.expr, out_min, out_max, found))
             return false;
-        int64_t rmin, rmax;
-        if (derive_expr_range(c, node->ret.expr, &rmin, &rmax)) {
-            if (!*found) {
-                *out_min = rmin;
-                *out_max = rmax;
-                *found = true;
-            } else {
-                /* widen to union of ranges */
-                if (rmin < *out_min) *out_min = rmin;
-                if (rmax > *out_max) *out_max = rmax;
-            }
-            return true;
+        /* BUG-1097: the range was recorded AT this return by the NODE_RETURN
+         * handler (vrp_record_return_range). A return the checker never reached,
+         * or one with no derivable range, gives up the whole summary. */
+        if (node->ret.vrp_state != 1) return false;
+        if (!*found) {
+            *out_min = node->ret.vrp_min;
+            *out_max = node->ret.vrp_max;
+            *found = true;
+        } else {
+            if (node->ret.vrp_min < *out_min) *out_min = node->ret.vrp_min;
+            if (node->ret.vrp_max > *out_max) *out_max = node->ret.vrp_max;
         }
-        /* try constant expression: return 0, return 5, return N + 1 */
-        int64_t cval = eval_const_expr_scoped(c, node->ret.expr);
-        if (cval != CONST_EVAL_FAIL) {
-            if (!*found) {
-                *out_min = cval;
-                *out_max = cval;
-                *found = true;
-            } else {
-                if (cval < *out_min) *out_min = cval;
-                if (cval > *out_max) *out_max = cval;
-            }
-            return true;
-        }
-        /* try chained call range: return func() where func has return range */
-        if (node->ret.expr->kind == NODE_CALL &&
-            node->ret.expr->call.callee &&
-            node->ret.expr->call.callee->kind == NODE_IDENT) {
-            Symbol *csym = scope_lookup(c->current_scope,
-                node->ret.expr->call.callee->ident.name,
-                (uint32_t)node->ret.expr->call.callee->ident.name_len);
-            if (!csym) csym = global_decl_lookup(c,
-                node->ret.expr->call.callee->ident.name,
-                (uint32_t)node->ret.expr->call.callee->ident.name_len);
-            if (csym && csym->has_return_range) {
-                int64_t rmin = csym->return_range_min;
-                int64_t rmax = csym->return_range_max;
-                if (!*found) {
-                    *out_min = rmin;
-                    *out_max = rmax;
-                    *found = true;
-                } else {
-                    if (rmin < *out_min) *out_min = rmin;
-                    if (rmax > *out_max) *out_max = rmax;
-                }
-                return true;
-            }
-        }
-        /* try parameter ident: return param — check if preceding guard
-         * constrains it. Pattern: if (param >= N) { return C; } return param;
-         * The guard ensures param < N at this return point.
-         * §C #14 A2: ONLY narrow at the TOP LEVEL of the body (in_branch==false).
-         * find_var_range reflects the range live at body-END, not at THIS return.
-         * A guard-BODY return `if (n >= 100) { return n; }` actually yields
-         * n >= 100, but the guard's persisted INVERSE ([0,99]) is what remains
-         * after the if — so it was wrongly credited [0,99] and the caller elided
-         * its bounds check on `arr[pick(150)]` → silent stack OOB. A TOP-LEVEL
-         * `return raw;` after `if (raw >= 16) return 0;` is sound (the inverse
-         * genuinely holds there). The in_branch gate keeps the sound case, drops
-         * the unsound one. */
-        if (!in_branch && node->ret.expr->kind == NODE_IDENT) {
-            struct VarRange *r = find_var_range(c,
-                node->ret.expr->ident.name,
-                (uint32_t)node->ret.expr->ident.name_len);
-            if (r && r->min_val >= 0 && r->max_val >= 0) {
-                int64_t rmin = r->min_val, rmax = r->max_val;
-                if (!*found) {
-                    *out_min = rmin;
-                    *out_max = rmax;
-                    *found = true;
-                } else {
-                    if (rmin < *out_min) *out_min = rmin;
-                    if (rmax > *out_max) *out_max = rmax;
-                }
-                return true;
-            }
-        }
-        return false; /* return without derivable range — give up */
+        (void)in_branch;
+        return true;
     }
     if (node->kind == NODE_BLOCK) {
         for (int i = 0; i < node->block.stmt_count; i++) {
@@ -26676,7 +27487,14 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * sign-conversion error BUG-890 reports just above. */
             if (decl->var_decl.init->kind != NODE_INT_LIT &&
                 type && type_is_integer(type_unwrap_distinct(type))) {
-                int64_t gv = eval_const_expr_scoped(c, decl->var_decl.init);
+                /* BUG-1090: the TYPED fold, converted to the declared type — the
+                 * value the same initializer computes on a LOCAL. The untyped
+                 * fold folded `(0 - 1) / 1073741824` to 0 here while a local
+                 * spelled identically holds 3. Untyped only as the fallback for a
+                 * tree the typed fold does not model. */
+                int64_t gv = vrp_const_value(c, decl->var_decl.init, type);
+                if (gv == CONST_EVAL_FAIL)
+                    gv = eval_const_expr_scoped(c, decl->var_decl.init);
                 if (gv != CONST_EVAL_FAIL && gv >= 0) {
                     decl->var_decl.init->kind = NODE_INT_LIT;
                     decl->var_decl.init->int_lit.value = (uint64_t)gv;

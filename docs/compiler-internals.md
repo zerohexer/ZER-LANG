@@ -3343,9 +3343,40 @@ Tracks `{min_val, max_val, known_nonzero}` per variable. Stack-based: newer entr
 **find_return_range enhancements (2026-04-06):**
 1. Constant returns: `return 0`, `return N+1` via `eval_const_expr_scoped` — unions with `% N` ranges
 2. Chained call returns: `return other_func()` inherits callee's `has_return_range` — enables multi-layer `get_slot() → raw_hash() → % N` chains
-3. Guard-clamped ident returns: `if (idx >= N) { return 0; } return idx;` — `find_var_range()` on the ident uses the guard narrowing from check_stmt. Works because `find_return_range` runs immediately after `check_stmt(body)` while VarRanges are still on the stack.
+3. Guard-clamped ident returns: `if (idx >= N) { return 0; } return idx;` — the range is RECORDED AT THE RETURN by the NODE_RETURN handler (`vrp_record_return_range` -> `Node.ret.vrp_state/vrp_min/vrp_max`, BUG-1097). `find_return_range` only unions recorded ranges; a return never reached (state 0) or with no derivable range (state 2) gives the summary up. (It used to read the ranges live at the END of the body, which credited a later guard's inverse to an earlier return and resolved an inner shadow's name to the parameter.)
 4. NODE_SWITCH/FOR/WHILE/CRITICAL recursion — finds returns inside all control flow
 5. Order-dependent: callee must be checked BEFORE caller (declaration order in ZER). Cross-module: imported functions checked first (topological order) so return ranges are available.
+
+### VRP fact validity — the five reasons a range stops being true (2026-09-23, BUG-1090..1101)
+
+A range may remove a runtime check only if it is a TRUE fact about THIS variable at THIS
+point. Each rule below closed a class; `tests/test_vrp_fact_matrix.c` has a cell per form.
+
+- **Identity.** An entry is keyed by (DECLARING SCOPE of the key's root, key string):
+  `VarRange.owner`, resolved by `vrp_key_root` at push AND at every lookup. Never key by
+  name alone. Declarations push `fresh` (`push_var_range_ex(..., true)`) — no inheritance.
+- **Constants.** A constant reaches a range only through `vrp_const_value` (the TYPED
+  fold `tfold`: each node at its typemap type, every intermediate wrapped, FAIL on
+  anything unmodelled). A PLAIN assignment's value and anything in a defer body are
+  rendered as ONE C expression with bare-`int` literals, not typed temps — there only
+  `vrp_const_value_untyped_render` (`tfold_exact`, rendering-invariant) is trusted.
+  `derive_expr_range(..., raw_render)` carries that choice. Global integer initializers
+  are folded in place with the typed fold, and the emitter's global path uses
+  `checker_fold_const_typed`, so a global and a local of one spelling agree.
+- **Invalidation.** `VarRange.root_global_like` (non-const global, `static`, or a key
+  through a pointer) + ONE widening `vrp_widen_global_like`: at a call, a store through a
+  pointer (`vrp_store_through_pointer`), a writing intrinsic (`vrp_intrinsic_may_store`),
+  `yield`, `await`, and in the loop pre-pass when the body contains any of those (or a
+  spawn / non-plain store). An address-taken LOCAL has no range at all
+  (`Symbol.vrp_addr_taken`, permanent — an entry's `address_taken` dies with the block).
+- **Hoist.** An auto-guard is tested at the start of `Checker.guard_stmt_root` (set per
+  statement by `vrp_stmt_guard_root`, per for-clause by the for driver).
+  `vrp_guard_hoist_sound` refuses the hoist when the statement can change the index
+  first; the access is then left unguarded and the emitter's rule "unproven fixed-array
+  access with no auto-guard carries its own single-read inline check"
+  (`checker_has_auto_guard`) applies. The statement's own top-level assignment stores
+  last and is exempt.
+- **Summary.** See find_return_range item 3.
 
 ### C-Style Cast Syntax: (Type)expr (2026-04-07)
 

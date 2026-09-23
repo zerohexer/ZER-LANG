@@ -59,6 +59,7 @@ test_hw_matrix
 test_async_matrix
 test_asm_matrix
 test_vrp_position_matrix
+test_vrp_fact_matrix
 
 # Compiled rust_tests binaries (rebuilt by rust_tests/run_tests.sh)
 test_defer_goto_matrix

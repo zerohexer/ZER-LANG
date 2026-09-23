@@ -1,0 +1,11 @@
+// expect-error: compiler-generated variable of the for-in loop
+// BUG-1099: the `_zer_` prefix stopped a user DECLARING the for-in desugaring's
+// index, and nothing stopped READING it: `arr[_zer_ri] = x;` compiled.
+u32 main() {
+    u32[2] arr;
+    u32[5] src;
+    for (u32 x in src) {
+        arr[_zer_ri] = x;
+    }
+    return 0;
+}

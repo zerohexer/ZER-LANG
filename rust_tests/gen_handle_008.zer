@@ -6,6 +6,7 @@ Slab(Buffer) heap;
 u32 main() {
     ?*Buffer mb = heap.alloc_ptr();
     *Buffer b = mb orelse return;
+    defer heap.free_ptr(b);   // BUG-1071: also on the early returns below
 
     b.capacity = 256;
     b.used = 0;
@@ -14,6 +15,5 @@ u32 main() {
     if (b.capacity != 256) { return 1; }
     if (b.used != 64) { return 2; }
 
-    heap.free_ptr(b);
     return 0;
 }

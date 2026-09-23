@@ -13,7 +13,8 @@ u32 main() {
     ?Handle(Slot) mb = pool.alloc();
     Handle(Slot) b = mb orelse return;
     pool.get(b).data = 99;
-    if (pool.get(b).data != 99) { return 1; }
-    pool.free(b);
+    u32 got = pool.get(b).data;
+    pool.free(b);                        // BUG-1071: before the early return
+    if (got != 99) { return 1; }
     return 0;
 }

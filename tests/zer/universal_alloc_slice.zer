@@ -24,12 +24,12 @@ void kv_table_free(*KvTable ht) {
 
 u32 main() {
     *KvTable ht = kv_table_create(4) orelse return;
+    defer kv_table_free(ht);   // BUG-1071: also on the early returns below
     if (ht.size != 4) { return 1; }
     if (ht.buckets.len != 4) { return 2; }
     if (ht.buckets[0].head != 0) { return 3; }         // calloc zeroes
     ht.buckets[2].head = 99;
     if (ht.buckets[2].head != 99) { return 4; }
     printf("universal_alloc_slice: ok size=%d len=%d\n", ht.size, ht.buckets.len);
-    kv_table_free(ht);
     return 0;
 }

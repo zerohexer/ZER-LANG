@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1070 (H1): a `defer` in a function made its RETURN not the last instruction
+// of the block (the defer body was lowered after it), and the leak pass only looked at
+// a block whose LAST instruction is RETURN — so every function with a defer was exempt
+// from leak checking. Pre-fix: compiled, LeakSanitizer reported the 16-byte leak.
+u32 main() {
+    u32 cnt = 0;
+    defer cnt += 1;
+    [*]u32 a = alloc(u32, 4) orelse return;
+    a[0] = 1;
+    return 0;
+}

@@ -246,9 +246,11 @@ static void gen_pos_before_free(ViewForm f, char *out, size_t n) {
                       snprintf(mk, sizeof(mk), "K kk = mk(s); *B vw = kk.p;"); break;
     case VF_FIELD_OF_PARAM: decls = "struct K{ *B p; }\n*B get(K k){ return k.p; }\n";
                       snprintf(mk, sizeof(mk), "K kk; kk.p = &s[0]; *B vw = get(kk);"); break;
+    /* BUG-1071: the fallback must free `s` — a leak on the orelse-fallback
+     * path is reported now, and this POSITIVE cell used to leak there. */
     case VF_OPT_UNWRAP: decls = "struct K{ *B p; }\n";
                       snprintf(mk, sizeof(mk),
-                               "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { return 3; }; *B vw = u.p;"); break;
+                               "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { free(s); return 3; }; *B vw = u.p;"); break;
     case VF_COUNT: break;
     }
     snprintf(out, n,

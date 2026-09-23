@@ -16,16 +16,20 @@ u32 main() {
         it.flags = i * 2;
         it.count = i * 3;
 
-        if (it.id != i) { return 2; }
-        if (it.flags != i * 2) { return 3; }
-
+        u32 got_id = it.id;
+        u32 got_flags = it.flags;
         store.free_ptr(it);
+        if (got_id != i) { return 2; }
+        if (got_flags != i * 2) { return 3; }
     }
 
     // Allocate many at once
     *Item a = store.alloc_ptr() orelse { return 4; };
+    defer store.free_ptr(a);   // defers run LIFO: c, b, a — reverse order
     *Item b = store.alloc_ptr() orelse { return 5; };
+    defer store.free_ptr(b);
     *Item c = store.alloc_ptr() orelse { return 6; };
+    defer store.free_ptr(c);
 
     a.id = 111;
     b.id = 222;
@@ -34,11 +38,6 @@ u32 main() {
     if (a.id != 111) { return 7; }
     if (b.id != 222) { return 8; }
     if (c.id != 333) { return 9; }
-
-    // Free in reverse order
-    store.free_ptr(c);
-    store.free_ptr(b);
-    store.free_ptr(a);
 
     return 0;
 }

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: overwritten while alive
+// BUG-1072 (H10): slot spelling — `h.p = a` over a live `h.p`.
+struct T { u32 v; }
+struct H { *T p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    defer free(a);
+    H h;
+    h.p = alloc(T) orelse return;
+    h.p = a;
+    return h.p.v;
+}

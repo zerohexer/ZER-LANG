@@ -12,8 +12,8 @@ u32 main() {
     // Re-alloc same slot — new generation
     ?Handle(Slot) mh2 = pool.alloc();
     Handle(Slot) h2 = mh2 orelse return;
+    defer pool.free(h2);   // BUG-1071: also on the early return below
     pool.get(h2).data = 20;
     if (pool.get(h2).data != 20) { return 1; }
-    pool.free(h2);
     return 0;
 }

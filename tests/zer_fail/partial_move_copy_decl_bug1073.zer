@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: partially moved
+// BUG-1073 (H9): a move-struct FIELD moved out (`Tok a = w.t;`) and then the WHOLE
+// struct copied (`W w2 = w;`) gave two owners of one token — both consumed.
+move struct Tok { u32 k; }
+struct W { Tok t; u32 x; }
+void consume(Tok t) { }
+u32 main() {
+    W w;
+    w.t.k = 5;
+    Tok a = w.t;
+    W w2 = w;
+    consume(w2.t);
+    consume(a);
+    return 0;
+}

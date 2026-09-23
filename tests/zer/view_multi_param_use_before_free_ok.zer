@@ -5,7 +5,7 @@
 
 u32 main() {
     [*]u8 s = alloc(u8, 4) orelse { return 1; };
-    [*]u8 t = alloc(u8, 4) orelse { return 2; };
+    [*]u8 t = alloc(u8, 4) orelse { free(s); return 2; };   // BUG-1071
     s[0] = 7;
     t[0] = 9;
     [*]u8 h = pick(s, t, true);

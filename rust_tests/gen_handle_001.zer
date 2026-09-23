@@ -6,6 +6,7 @@ Pool(Task, 8) pool;
 u32 main() {
     ?Handle(Task) mh = pool.alloc();
     Handle(Task) h = mh orelse return;
+    defer pool.free(h);   // BUG-1071: also on the early returns below
 
     pool.get(h).id = 1;
     pool.get(h).priority = 5;
@@ -13,6 +14,5 @@ u32 main() {
     if (pool.get(h).id != 1) { return 1; }
     if (pool.get(h).priority != 5) { return 2; }
 
-    pool.free(h);
     return 0;
 }

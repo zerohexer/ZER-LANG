@@ -38,7 +38,11 @@ i32 main() {
     u32 got = 0;
     for (u32 i = 0; i < 8; i += 1) {
         ?Handle(Slot) h = gpool.alloc();
-        if (h) |k| { held[got] = k; got += 1; }
+        // BUG-1071: an unproven `held[got]` would get a bounds auto-guard whose
+        // early return leaks `k`; prove the index, and free what does not fit.
+        if (h) |k| {
+            if (got < 8) { held[got] = k; got += 1; } else { gpool.free(k); }
+        }
     }
     if (got != CAP) { return 6; }
     for (u32 i = 0; i < got; i += 1) { gpool.free(held[i]); }

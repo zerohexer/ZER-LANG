@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1080 (H6): recycled-slot form of the returned-field free.
+struct T { u32 v; }
+struct H { *T p; }
+H mk(*T a) { H h = { .p = a }; return h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = mk(a);
+    free(h.p);
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    free(a);
+    return r;
+}

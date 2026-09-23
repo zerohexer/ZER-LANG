@@ -30,6 +30,53 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — a variable-index SLOT loses identity: three residuals after BUG-1074 (2026-09-23c, HIGH — two accept-unsafe, one leak-silent)
+
+BUG-1074 made a variable-index store record WHERE the allocation went (the array's wildcard
+slot `(root, P"[*]")`) and a variable-index read a VIEW of that set, so `arr[k] = a; free(a);
+*T q = arr[k] orelse return; q.v` is refused. What it does NOT do, all measured:
+
+1. **A free THROUGH a slot read does not invalidate the slot.**
+   `arr[k] = alloc(T); *T a = arr[k] orelse return; free(a); ... *T q = arr[k] orelse return; q.v`
+   compiles (probe: scratch `h7b.zer`; same for `a = alloc; arr[k] = a;` when the free goes
+   through a slot read). Root cause: allocation ids are per LOCAL, so every allocation a loop
+   stores shares ONE id; if freeing through a slot view widened that id, the canonical
+   free-every-slot loop (`tests/zer/var_index_free_loop_ok.zer`) would be refused on its second
+   iteration. So `ir_view_free_barrier` only REPORTS for a slot view, and `ir_use_blocker` lets a
+   slot view pass a MAYBE_FREED member.
+2. **A conditional free before a slot read is invisible** — `arr[k] = a; if (c) { free(a); }
+   *T q = arr[k] orelse return; q.v` compiles, for the same MAYBE rule.
+3. **Storing into a LOCAL array at a variable index exempts the allocation from leak checking**
+   — `?*T[4] arr; arr[k] = alloc(T); return 0;` and `arr[k] = a;` compile (the store marks the
+   value escaped, the pre-BUG-1074 "untrackable array assignment" rule). The DIRECT spelling
+   `arr[k] = alloc(T)` is also never registered as an allocation at all.
+
+**Fix sketch.** The missing variable is the INDEX, not the allocation: record on a slot view the
+`(array, index local)` it was read through, plus the index's stability (the Level B
+`ast_name_mutated_or_addrd` gate). A free through that view marks the slot `(array, k)` FREED;
+a later read `arr[k]` with the same stable `k` is blocked by it. Residual 3 needs a per-array
+"holds live allocations" fact checked at the array's own scope exit (a local array going out of
+scope with a live slot is a leak; a global one is not). No tripwire test pinned — freezing an
+accept into `zer_gaps` for a HIGH hole is the next session's first step.
+
+---
+
+## OPEN — a struct-returning wrapper whose returned value came through an ARRAY ELEMENT keeps no field views (2026-09-23c, MEDIUM — accept-unsafe, narrow)
+
+BUG-1080 records, per live return, which FIELD of the returned local holds which param's
+allocation (UNION over returns; MUST pairs alias at the call site, MAY pairs are views). A return
+whose value carries no compound entry naming the param contributes no pairs. MEASURED:
+`H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }` then `H h = mk(a); free(a);
+return h.p.v;` compiles (the struct went through an array element, whose field entries are
+keyed `hs[0].p`, not on the returned temp). `return { .p = a };` and chained wrappers
+(`H mk2(*T a) { return mk(a); }`) DO work — the returned temp carries the views. Fix sketch:
+carry compound entries through an element READ of a struct array (the dual of
+`ir_carry_compounds`), and, as the backstop, when a live return's value has no entries and the
+return type carries a pointer field, make every pointer field of the call result a MAY view of
+every pointer-carrying argument (the argument-precise barrier). Measure the corpus cost first.
+
+---
+
 ## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 
 All eight caps the 2026-09-13 audit listed as answering in the ACCEPT direction are now
@@ -465,10 +512,11 @@ separate fact for this (`freed_then_reset`); the bare-ident form reuses the stat
 **Fix sketch.** Give the bare ident the same treatment as the slot: on `mp = null;` set
 `freed_then_reset` from the FREED state and move the state to a "known null" value the
 orelse read treats as the null path; the summary reads the flag. Corpus cost of the
-current over-rejection is zero (measured, 2379 files). The if-capture form
-(`if (h.p) |q| { free(q); }`) staying MAYBE at the caller is the other residual of the same
-commit and is a precision limit, not a bug: the callee's join really does merge a freed
-and a null path.
+current over-rejection is zero (measured, 2379 files). (The if-capture form
+`if (h.p) |q| { free(q); }` that used to stay MAYBE at the caller is CLOSED by BUG-1071:
+the null edge of an optional test drops the optional's entries, so the callee's join is
+FREED — `tests/zer/opt_param_capture_form_frees_ok.zer`. Re-unwrapping the field after the
+callee's `h.p = null;` is still refused, the same residual as the bare-ident form above.)
 
 **Tripwire:** none pinned — freezing a wrong "use after free" into `zer_fail` would freeze
 the wrong reason.

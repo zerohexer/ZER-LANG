@@ -381,8 +381,11 @@ static void gen_safe_task_new(char *buf, int id) {
     p += sprintf(p, "    *Tk%d t = mt orelse return;\n", id);
     p += sprintf(p, "    t.id = %d;\n", id);
     p += sprintf(p, "    t.priority = %d;\n", id % 5);
-    p += sprintf(p, "    if (t.id != %d) { return 1; }\n", id);
+    /* BUG-1071: read, free, THEN check — an early return between the
+     * allocation and the free is a real leak and is now reported. */
+    p += sprintf(p, "    u32 got = t.id;\n");
     p += sprintf(p, "    Tk%d.free_ptr(t);\n", id);
+    p += sprintf(p, "    if (got != %d) { return 1; }\n", id);
     p += sprintf(p, "    return 0;\n");
     p += sprintf(p, "}\n");
 }

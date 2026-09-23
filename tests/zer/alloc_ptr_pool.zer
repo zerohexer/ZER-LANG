@@ -11,8 +11,8 @@ Pool(Sensor, 8) sensors;
 u32 main() {
     // Allocate multiple via alloc_ptr
     *Sensor s1 = sensors.alloc_ptr() orelse { return 1; };
-    *Sensor s2 = sensors.alloc_ptr() orelse { return 2; };
-    *Sensor s3 = sensors.alloc_ptr() orelse { return 3; };
+    *Sensor s2 = sensors.alloc_ptr() orelse { sensors.free_ptr(s1); return 2; };
+    *Sensor s3 = sensors.alloc_ptr() orelse { sensors.free_ptr(s1); sensors.free_ptr(s2); return 3; };
 
     s1.id = 1;
     s1.value = 100;
@@ -27,24 +27,27 @@ u32 main() {
     s3.flags = 2;
 
     // Verify all values
-    if (s1.id != 1) { return 4; }
-    if (s2.value != 200) { return 5; }
-    if (s3.flags != 2) { return 6; }
+    u32 bad = 0;
+    if (s1.id != 1) { bad = 4; }
+    if (s2.value != 200) { bad = 5; }
+    if (s3.flags != 2) { bad = 6; }
 
     // Modify and verify
     s1.value = 999;
-    if (s1.value != 999) { return 7; }
+    if (s1.value != 999) { bad = 7; }
 
     // Free all
     sensors.free_ptr(s1);
     sensors.free_ptr(s2);
     sensors.free_ptr(s3);
+    if (bad != 0) { return bad; }
 
     // Reallocate — should reuse freed slots
     *Sensor s4 = sensors.alloc_ptr() orelse { return 8; };
     s4.id = 44;
-    if (s4.id != 44) { return 9; }
+    u32 id4 = s4.id;
     sensors.free_ptr(s4);
+    if (id4 != 44) { return 9; }
 
     return 0;
 }

@@ -77,7 +77,7 @@ u32 main() {
 
     // Sensor 2: pressure = 1500 → scaled = 750 → under threshold (1000)
     ?Handle(Sample) ms2 = sample_pool.alloc();
-    Handle(Sample) s2 = ms2 orelse return;
+    Handle(Sample) s2 = ms2 orelse { sample_pool.free(s1); return 2; };   // BUG-1071
     sample_pool.get(s2).timestamp = 1001;
     sample_pool.get(s2).value = 1500;
     sample_pool.get(s2).sensor_id = 2;
@@ -86,7 +86,7 @@ u32 main() {
 
     // Sensor 3: raw = 150 → identity = 150 → over threshold (100)
     ?Handle(Sample) ms3 = sample_pool.alloc();
-    Handle(Sample) s3 = ms3 orelse return;
+    Handle(Sample) s3 = ms3 orelse { sample_pool.free(s1); sample_pool.free(s2); return 2; };
     sample_pool.get(s3).timestamp = 1002;
     sample_pool.get(s3).value = 150;
     sample_pool.get(s3).sensor_id = 3;
@@ -95,7 +95,9 @@ u32 main() {
 
     // Sensor 1: temp = 800 → scaled = 200 → under threshold (500)
     ?Handle(Sample) ms4 = sample_pool.alloc();
-    Handle(Sample) s4 = ms4 orelse return;
+    Handle(Sample) s4 = ms4 orelse {
+        sample_pool.free(s1); sample_pool.free(s2); sample_pool.free(s3); return 2;
+    };
     sample_pool.get(s4).timestamp = 1003;
     sample_pool.get(s4).value = 800;
     sample_pool.get(s4).sensor_id = 1;

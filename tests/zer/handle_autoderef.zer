@@ -11,11 +11,13 @@ Slab(Task) heap;
 u32 main() {
     // Allocate with explicit .get() (old way)
     Handle(Task) t1 = heap.alloc() orelse { return 1; };
+    defer heap.free(t1);   // every early return below frees it too
     heap.get(t1).id = 10;
     heap.get(t1).priority = 3;
 
     // Allocate with auto-deref (new way — same safety)
     Handle(Task) t2 = heap.alloc() orelse { return 2; };
+    defer heap.free(t2);
     t2.id = 20;
     t2.priority = 5;
 
@@ -29,7 +31,5 @@ u32 main() {
     t1.id = 99;
     if (heap.get(t1).id != 99) { return 7; }
 
-    heap.free(t1);
-    heap.free(t2);
     return 0;
 }

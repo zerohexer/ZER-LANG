@@ -1,0 +1,22 @@
+// BUG-1074 boundary: the free-everything loop over a variable-index table must
+// still compile — a slot view only reports a member that is DEFINITELY freed.
+struct T { u32 v; }
+?*T[4] tbl;
+u32 main() {
+    for (u32 i = 0; i < 4; i += 1) {
+        *T a = alloc(T) orelse return;
+        a.v = i;
+        tbl[i] = a;
+    }
+    u32 s = 0;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = tbl[i] orelse return;
+        s += q.v;
+    }
+    for (u32 i = 0; i < 4; i += 1) {
+        *T q = tbl[i] orelse return;
+        free(q);
+        tbl[i] = null;
+    }
+    return s - 6;
+}

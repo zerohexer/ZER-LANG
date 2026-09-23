@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1080 (H6): a struct-returning wrapper `H mk(*T a){ H h = {.p = a}; return h; }`
+// was not recorded as returning a VIEW of its param in field `.p`, so `free(a)` left
+// `h.p` ALIVE. Pre-fix: compiled, read freed memory.
+struct T { u32 v; }
+struct H { *T p; }
+H mk(*T a) { H h = { .p = a }; return h; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = mk(a);
+    free(a);
+    return h.p.v;
+}

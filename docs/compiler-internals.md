@@ -2419,8 +2419,57 @@ At function exit, any handle that is `HS_ALIVE` or `HS_MAYBE_FREED` and was allo
 
 **If-exit MAYBE_FREED fix (2026-04-05):** In if-without-else merging, `block_always_exits()` checks if the then-branch always exits (NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_GOTO, or NODE_IF with both branches exiting). If the freeing branch always exits, handles stay ALIVE on the continuation path — the pattern `if (err) { free(h); return; } use(h);` is now correctly safe.
 
+**PER-RETURN, NOT UNION (BUG-1070/1071, 2026-09-23c) — supersedes the `is_early_exit` / union-coverage
+text elsewhere in this file.** Every REACHABLE return block (`ir_block_is_live_return`) is checked on
+its OWN state; an allocation freed at some other return covers nothing here. Three things made that
+possible, and all three are load-bearing:
+- **A terminator is always the LAST instruction of its block** (`ir_add_inst_checked`, ir_lower.c;
+  `ir_validate` errors otherwise). A `defer` used to lower its fired body AFTER the RETURN in the same
+  block, so "last instruction is IR_RETURN" was false for every function with a defer and the leak pass
+  and the FuncSummary builder silently skipped it. The lowerer now opens a fresh block after any
+  terminator; user code written after a `return` records `IRBlock.dead_code_seed` so the dead block
+  still starts from the returning block's state (a use-after-move written after `return t;` is still
+  reported) — ID adjacency is NOT used for this any more.
+- **Predecessors come only from REACHABLE blocks** (`ir_compute_preds` + `ir_block_succs`). A dead tail
+  `GOTO` contributed its empty state to a join and read as "nothing allocated on this path".
+- **The NULL edge of a has-value test drops the optional** (`ir_drop_null_optional` via `ir_edge_state`).
+  A BRANCH on an OPTIONAL-typed local is the lowering of both `if (m) |x|` and every `orelse`; on its
+  false edge the allocation does not exist, so that local, its compounds and every alias sharing its
+  alloc_id leave the state. This is the precision union coverage used to buy (and the early-exit /
+  orelse-fallback skips, which also hid real leaks). The FuncSummary's "own null path" check for an
+  optional PARAM reads `IRBlock.orelse_subject_local` (recorded syntactically by the lowerer), not
+  the state.
+A return synthesised by a bounds AUTO-GUARD carries `IRInst.ret_from_guard`, so its leak message says
+"leaks if the bounds auto-guard on this line returns early" instead of pointing at a return the user
+never wrote. Both passes (fixed point and reporting) take their entry state from ONE
+`ir_block_entry_state`.
+
 ### Overwrite Detection
 If a handle target is already `HS_ALIVE` when a new `pool.alloc()` is assigned to it, the first handle is leaked. Error: "handle overwritten while alive — previous handle leaked."
+**ONE query since BUG-1072: `ir_report_overwrite(zc, func, ps, prev, new_alloc_id, line)`**, called at
+every site that writes an entry — the six allocation arms, both alloc-result registrations, IR_COPY,
+and the plain-assignment ALIAS / view / slice arms (`b = a;`, `h.p = a;`, which were the sites that
+never asked). It exempts escaped / move-struct / arena entries, compiler temps, and any case where
+ANOTHER user-visible entry still holds the allocation (the `?*T mt` beside its unwrapped `*T t`) — in
+that case the leak is reported at exit instead, on the holder. Allocation ids are per LOCAL
+(`ir_alloc_id_of_local`), so the alloc arms pass `-1` as the new id.
+
+### Views and the one use query (BUG-1074/1075/1080, 2026-09-23c)
+A VIEW is an entry with `alloc_id == 0` and a `view_alloc_ids` set — it owns nothing and names the
+allocations it MAY be. Three producers: the multi-param return pick (BUG-849, `ir_fill_multiview_set`),
+a VARIABLE-INDEX array read (`ir_var_index_read_alias`, from the array's WILDCARD slot
+`(root, P"[*]")` that every variable-index store adds to — `view_is_slot`), and a MAY field of a
+struct-returning wrapper (`FuncSummary.ret_field`, a UNION over the returns: a pair on EVERY return is
+a MUST and becomes an ALIAS at the call site, `ir_apply_ret_field_views`; otherwise a VIEW). Two
+queries consume them, and every sink calls them rather than reading the state itself:
+- **`ir_use_blocker`** — "is using this entry unsafe?" (FIELD_READ walk, IR_COPY source, ident use).
+  A SLOT view is blocked only by a DEFINITELY freed member (per-local ids make a loop's stored
+  allocations share one id, so a MAYBE member would refuse the free-every-slot loop).
+- **`ir_view_free_barrier`** — freeing THROUGH a view: an already-FREED member is a double free; an
+  ALIVE member widens to MAYBE_FREED (the argument-precise barrier), except for slot views, which only
+  report. The limits of the slot rules are docs/limitations.md "variable-index slot".
+A move-carrying value consumed WHOLE while one of its move FIELDS was already moved out is refused by
+`ir_check_partial_move` at every whole-consume sink (copy, assign, by-value arg, return) — BUG-1073.
 
 ### Cross-Function Analysis (Change 4)
 Pre-scan builds `FuncSummary` for each function with Handle params:
@@ -8049,6 +8098,12 @@ Zercheck_ir.c:
 Fixes gen_uaf_003: `if (cond) { free(h); return 0; }` now doesn't
 count as coverage. Fall-through `return val` with h ALIVE triggers leak.
 
+**SUPERSEDED 2026-09-23c (BUG-1071).** `is_early_exit` is GONE. It made the leak check SKIP the
+early return itself, so `if (k == 1) { return 1; } free(a);` leaked on the k==1 path with no
+diagnostic. Every reachable return is now checked on its own state and the null path of an optional
+is represented by dropping the optional on the branch's false edge — see "ZER-CHECK Semantics" →
+"PER-RETURN, NOT UNION".
+
 **2. Exhaustive enum switch elision** (commit `800aaf6`, ir_lower.c)
 
 When a switch on an enum has no default arm, the checker requires
@@ -8375,7 +8430,7 @@ All 20 items from the audit, with rationale:
 | 5 | Locals-used-outside-scope | **Not a gap** | `hidden` is a lookup-time flag for `ir_find_local` during lowering, NOT a runtime-scope property. Post-lowering, instructions legitimately reference hidden locals (they were visible when the instruction was lowered). |
 | 6 | Per-op IR invariants | **Landed (phase 1)** | 11 op kinds covered. |
 | 7 | NULL type on local | **Landed (phase 2)** | Not on the critic's list; found during audit. |
-| 8 | Dead code after terminator | **Considered, rejected** | Lowerer emits legitimate `RETURN; DEFER_FIRE; GOTO bb_post` for scope cleanup. The post-terminator instructions emit dead C that GCC strips. Not a safety hole; just redundant IR. |
+| 8 | Dead code after terminator | **LANDED 2026-09-23c (BUG-1070) — the "not a safety hole" verdict was WRONG** | The `RETURN; DEFER_FIRE; GOTO bb_post` shape meant the last instruction of a returning block was not IR_RETURN whenever a defer was pending, and every exit consumer keyed on exactly that — so no function with a defer was ever leak-checked and its FuncSummary was empty (a callee's free was invisible: a silent double free). The lowerer now opens a fresh block after any terminator (`ir_add_inst_checked`) and `ir_validate` rejects an instruction after one. |
 | 9 | `BRANCH` with same true/false target | **Trivial, skipped** | Should be GOTO. Minor style, not safety. |
 | 10 | Duplicate block IDs | **Skipped** | The existing local-ID uniqueness check is symmetric and could extend to blocks; low value since block indexes are array-based. |
 | 11 | Orphan non-entry block (no preds) | **Overlaps with #2** | Any block with zero preds is unreachable. Already covered. |

@@ -1,0 +1,10 @@
+// BUG-1078 (O1): assignment spelling `b = pass(a);`.
+move struct Tok { u32 k; }
+Tok pass(Tok t) { return t; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    Tok b;
+    b = pass(a);
+    return b.k - 3;
+}

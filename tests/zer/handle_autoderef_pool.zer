@@ -9,10 +9,12 @@ Pool(Sensor, 4) sensors;
 
 u32 main() {
     Handle(Sensor) s1 = sensors.alloc() orelse { return 1; };
+    defer sensors.free(s1);   // every early return below frees it too
     s1.id = 1;
     s1.value = 100;
 
     Handle(Sensor) s2 = sensors.alloc() orelse { return 2; };
+    defer sensors.free(s2);
     s2.id = 2;
     s2.value = 200;
 
@@ -23,7 +25,5 @@ u32 main() {
     s1.value = 999;
     if (sensors.get(s1).value != 999) { return 5; }
 
-    sensors.free(s1);
-    sensors.free(s2);
     return 0;
 }

@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1076 (H4): the callee frees through its own local view (`free(x.p)`).
+// Pre-fix: exit 99.
+struct T { u32 v; }
+struct H { *T p; }
+void outer(*H h) { *H x = h; free(x.p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = { .p = a };
+    outer(&h);
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 99;
+    u32 r = h.p.v;
+    free(b);
+    free(a);
+    return r;
+}

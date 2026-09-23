@@ -1342,6 +1342,21 @@ Fires on ALL exit paths (return, break, continue, end of block).
 
 Handle leaks are **compile errors** — allocating without `defer free()` (or returning/storing the handle) is rejected. The compiler error tells you exactly what to add.
 
+The check is **per return path**: every reachable `return` — an early one, an `orelse { return; }` fallback, a `switch` arm, the silent return an array auto-guard inserts — must have released (or handed off) every allocation still live there. Freeing on SOME path does not count for the others. The usual fix is a `defer` right after the allocation succeeds:
+
+```zer
+struct Buf { u32 n; }
+u32 pair() {
+    *Buf a = alloc(Buf) orelse return;
+    defer free(a);                      // covers the early return below
+    *Buf b = alloc(Buf) orelse return;  // without the defer, `a` leaks HERE
+    defer free(b);
+    a.n = 1; b.n = 2;
+    return a.n + b.n;
+}
+u32 main() { if (pair() != 3) { return 1; } return 0; }
+```
+
 `yield` and `await` are **banned** inside defer bodies — both directly and transitively (calling a function that yields is also rejected). Defer cleanup must be atomic; suspending mid-cleanup corrupts the coroutine state machine.
 
 `defer` inside another `defer` body is also **banned** — the inner defer would run at the outer defer's execution time (scope exit), which is confusing and rarely what the programmer intends.
@@ -1870,14 +1885,13 @@ Slab(Task) heap;
 
 u32 main() {
     Handle(Task) t1 = heap.alloc() orelse { return 1; };
+    defer heap.free(t1);    // released on EVERY exit — including `return 2` below
     heap.get(t1).id = 1;
     heap.get(t1).name = "first";
 
     Handle(Task) t2 = heap.alloc() orelse { return 2; };
+    defer heap.free(t2);
     heap.get(t2).id = 2;
-
-    heap.free(t1);
-    heap.free(t2);
     return 0;
 }
 ```
@@ -1966,14 +1980,13 @@ Slab(Task) heap;
 
 u32 main() {
     *Task t = heap.alloc_ptr() orelse { return 1; };
+    defer heap.free_ptr(t);   // released on EVERY exit — including `return 2` below
     t.id = 42;
     t.priority = 3;
 
     *Task t2 = heap.alloc_ptr() orelse { return 2; };
+    defer heap.free_ptr(t2);
     t2.id = 99;
-
-    heap.free_ptr(t);
-    heap.free_ptr(t2);
     return 0;
 }
 ```
@@ -2072,13 +2085,12 @@ u32 main() {
     // No Slab declaration needed — auto-created per struct type.
     // One method name for both forms; target type picks the variant.
     Handle(Task) t = Task.alloc() orelse { return 1; };
+    defer Task.free(t);   // Handle arg — released on every exit, `return 2` included
     t.id = 42;
 
     *Node n = Node.alloc() orelse { return 2; };
+    defer Node.free(n);   // *T arg
     n.value = 99;
-
-    Task.free(t);   // Handle arg
-    Node.free(n);   // *T arg
     return 0;
 }
 ```

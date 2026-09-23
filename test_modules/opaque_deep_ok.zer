@@ -5,7 +5,7 @@ u32 main() {
     ?*opaque mh = opaque_layer2.mid_open(21);
     *opaque h = mh orelse { return 1; };
     u32 v = opaque_layer2.mid_read(h);
+    opaque_layer2.mid_close(h);          // BUG-1071: before the early return
     if (v != 42) { return 2; }
-    opaque_layer2.mid_close(h);
     return 0;
 }

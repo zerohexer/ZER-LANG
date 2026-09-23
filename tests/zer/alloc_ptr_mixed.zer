@@ -10,19 +10,17 @@ Slab(Task) heap;
 u32 main() {
     // Handle path
     Handle(Task) h = heap.alloc() orelse { return 1; };
+    defer heap.free(h);   // every early return below frees it too
     h.id = 10;       // auto-deref
 
     // Pointer path — same slab
     *Task t = heap.alloc_ptr() orelse { return 2; };
+    defer heap.free_ptr(t);
     t.id = 20;
 
     // Verify both
     if (h.id != 10) { return 3; }
     if (t.id != 20) { return 4; }
-
-    // Free both
-    heap.free(h);
-    heap.free_ptr(t);
 
     return 0;
 }

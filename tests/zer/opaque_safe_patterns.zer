@@ -30,35 +30,35 @@ u32 test_conditional(bool flag) {
 // Pattern 3: multiple allocs, free all
 u32 test_multiple() {
     *Task a = heap.alloc_ptr() orelse { return 1; };
+    defer heap.free_ptr(a);   // BUG-1071: also on the early returns below
     *Task b = heap.alloc_ptr() orelse { return 2; };
+    defer heap.free_ptr(b);
     a.id = 1;
     b.id = 2;
     if (a.id != 1) { return 3; }
     if (b.id != 2) { return 4; }
-    heap.free_ptr(a);
-    heap.free_ptr(b);
     return 0;
 }
 
 // Pattern 4: Pool alloc_ptr
 u32 test_pool() {
     *Ctx c = ctx_pool.alloc_ptr() orelse { return 1; };
+    defer ctx_pool.free_ptr(c);
     c.flags = 42;
     if (c.flags != 42) { return 2; }
-    ctx_pool.free_ptr(c);
     return 0;
 }
 
 // Pattern 5: Handle and alloc_ptr mixed
 u32 test_mixed() {
     Handle(Task) h = heap.alloc() orelse { return 1; };
+    defer heap.free(h);
     h.id = 10;
     *Task t = heap.alloc_ptr() orelse { return 2; };
+    defer heap.free_ptr(t);
     t.id = 20;
     if (h.id != 10) { return 3; }
     if (t.id != 20) { return 4; }
-    heap.free(h);
-    heap.free_ptr(t);
     return 0;
 }
 

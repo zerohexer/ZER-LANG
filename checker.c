@@ -5141,12 +5141,31 @@ static bool check_isr_ban(Checker *c, int line, const char *method) {
     if (zer_alloc_allowed_in_critical((int)c->critical_depth) == 0) {
         checker_error(c, line,
             "%s not allowed inside @critical block — "
-            "malloc/calloc may deadlock when interrupts are disabled. "
-            "Use Pool(T, N) instead, or move the allocation outside "
+            "malloc/calloc/free may deadlock when interrupts are disabled. "
+            "Use Pool(T, N) instead, or move the call outside "
             "@critical", method);
         return true;
     }
     return false;
+}
+
+/* BUG-1079 (M2): the label a ban names must be what the USER WROTE. The auto-slab
+ * methods printed a hard-coded "Task." for every struct, and `free(p)` — which
+ * the checker desugars to `T.free_ptr(p)` — was reported as "Task.free_ptr()",
+ * a call that appears nowhere in the program. */
+static const char *auto_slab_method_label(Checker *c, Type *obj, const char *method,
+                                          bool desugared_free) {
+    if (desugared_free) return "free()";
+    uint32_t nl = (obj && obj->struct_type.name) ? obj->struct_type.name_len : 0;
+    size_t ml = strlen(method);
+    char *buf = (char *)arena_alloc(c->arena, nl + 1 + ml + 3);
+    if (!buf) return method;
+    size_t o = 0;
+    if (nl) { memcpy(buf, obj->struct_type.name, nl); o = nl; }
+    buf[o++] = '.';
+    memcpy(buf + o, method, ml); o += ml;
+    buf[o++] = '('; buf[o++] = ')'; buf[o] = '\0';
+    return buf;
 }
 
 /* ---- Designated init field validation ---- */
@@ -10584,6 +10603,9 @@ static Type *check_expr(Checker *c, Node *node) {
     /* ---- Function call ---- */
     case NODE_CALL: {
         check_call_vs_lent_globals(c, node);   /* BUG-1125 */
+        /* BUG-1079: set when `free(p)` is rewritten to `T.free_ptr(p)` below, so
+         * a diagnostic about the rewritten call names the spelling the user wrote. */
+        bool free_desugared = false;
         /* G3 (2026-08-09): a call made while a fire-and-forget spawn is live —
          * descend the callee and record its plain global accesses, so moving a
          * statement into a helper cannot change whether it races. The post-check
@@ -10811,6 +10833,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->call.callee->field.object = recv;
                 node->call.callee->field.field_name = "free_ptr";
                 node->call.callee->field.field_name_len = 8;
+                free_desugared = true;   /* BUG-1079 */
                 /* args unchanged [p]; fall through to field dispatch */
             } else if (ae && aek == TYPE_SLICE) {
                 /* free(s:[*]T) -> direct heap-slice free (handled in emitter) */
@@ -11395,7 +11418,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 mname = node->call.callee->field.field_name;
                 mlen = (uint32_t)node->call.callee->field.field_name_len;
                 if (mlen == 5 && memcmp(mname, "alloc", 5) == 0) {
-                    check_isr_ban(c, node->loc.line, "Task.alloc()");
+                    check_isr_ban(c, node->loc.line, auto_slab_method_label(c, obj, "alloc", false));
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.alloc() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -11405,7 +11428,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     break;
                 }
                 if (mlen == 9 && memcmp(mname, "alloc_ptr", 9) == 0) {
-                    check_isr_ban(c, node->loc.line, "Task.alloc_ptr()");
+                    check_isr_ban(c, node->loc.line, auto_slab_method_label(c, obj, "alloc_ptr", false));
                     if (node->call.arg_count != 0)
                         checker_error(c, node->loc.line, "%.*s.alloc_ptr() takes no arguments",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -11416,7 +11439,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
                     /* Task.free(h) → void — same as slab.free(h) */
-                    check_isr_ban(c, node->loc.line, "Task.free()");
+                    check_isr_ban(c, node->loc.line, auto_slab_method_label(c, obj, "free", false));
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -11426,7 +11449,8 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
                     /* Task.free_ptr(p) → void — same as slab.free_ptr(p) */
-                    check_isr_ban(c, node->loc.line, "Task.free_ptr()");
+                    check_isr_ban(c, node->loc.line,
+                                  auto_slab_method_label(c, obj, "free_ptr", free_desugared));
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free_ptr() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);

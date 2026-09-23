@@ -1,0 +1,14 @@
+// BUG-1080 boundary: a MAY field view (the field holds the param on one return
+// only) is still usable BEFORE the param is freed.
+struct T { u32 v; }
+struct H { *T p; }
+T gt;
+H mk(*T a, bool c) { if (c) { H h = { .p = a }; return h; } H k = { .p = &gt }; return k; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = mk(a, true);
+    u32 r = h.p.v;
+    free(a);
+    return r - 7;
+}

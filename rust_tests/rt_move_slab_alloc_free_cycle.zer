@@ -15,18 +15,16 @@ u32 main() {
     ?*Node m2 = heap.alloc_ptr();
     *Node n2 = m2 orelse return;
     n2.value = 20;
-
-    if (n2.value != 20) { return 1; }
-
-    heap.free_ptr(n2);
+    u32 v2 = n2.value;
+    heap.free_ptr(n2);                   // BUG-1071: before the early return
+    if (v2 != 20) { return 1; }
 
     // Cycle 3: another reuse
     ?*Node m3 = heap.alloc_ptr();
     *Node n3 = m3 orelse return;
     n3.value = 30;
-
-    if (n3.value != 30) { return 2; }
-
+    u32 v3 = n3.value;
     heap.free_ptr(n3);
+    if (v3 != 30) { return 2; }
     return 0;
 }

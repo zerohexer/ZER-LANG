@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: move the call outside @critical
+// BUG-1079 (M2): `free(a)` in @critical named "Task.free_ptr()" — the desugared form
+// the user never wrote. The diagnostic now names free() and the remedy.
+struct T { u32 v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    @critical {
+        free(a);
+    }
+    return 0;
+}

@@ -119,6 +119,22 @@ typedef struct {
      * (AOBorrow); a param-VIEW stays fully tracked (AOParam — the interior-
      * pointer UAF class).  Default false = conservative (treat as a view). */
     bool ret_is_content;
+    /* BUG-1080 (H6): FIELD-level return views. `H mk(*T a) { H h = { .p = a };
+     * return h; }` returns a STRUCT one of whose fields is a view of a param —
+     * a fact the whole-value mask above cannot state. Entry k: on SOME live
+     * return the returned local's field `path` holds the allocation of param
+     * `param` — a UNION over the returns. `must` = on EVERY live return (the
+     * call site makes `(dest, path)` an ALIAS of the argument); otherwise the
+     * call site makes it a VIEW (BUG-849 view set), so a use after the argument
+     * is freed is refused either way. Arena array, no cap (a fixed table that
+     * silently drops is a missed view). ret_field_n == 0 when nothing was seen. */
+    int ret_field_n;
+    struct ZcRetFieldView {
+        const char *path;
+        uint32_t plen;
+        int param;
+        bool must;
+    } *ret_field;
 } FuncSummary;
 
 /* ZER-CHECK context */

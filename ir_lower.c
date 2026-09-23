@@ -164,8 +164,36 @@ typedef struct {
 
 /* ---- Helpers ---- */
 
-static void emit_inst(LowerCtx *ctx, IRInst inst) {
+/* BUG-1070: NO INSTRUCTION EVER FOLLOWS A TERMINATOR IN THE SAME BLOCK.
+ *
+ * `return` under an active defer lowered as `DEFER_FIRE; RETURN; DEFER_FIRE;
+ * GOTO bbN` in ONE block — the enclosing NODE_BLOCK's exit fire and its GOTO to
+ * bb_post were appended after the RETURN. Every exit consumer in zercheck_ir
+ * (the leak check, the FuncSummary builder, the return-provenance passes) keys on
+ * "the LAST instruction is IR_RETURN", so that block was not an exit at all: a
+ * `defer` plus an explicit `return` silently disabled leak detection AND the
+ * cross-function free summary (`zap(a); free(a);` was a clean double free).
+ * ir_compute_preds reads the LAST instruction too, so the GOTO also gave the
+ * dead tail a phantom edge out of a returning block.
+ *
+ * Fixing the consumers one by one would be the N-site shape this codebase keeps
+ * paying for. Instead the lowerer cannot produce the shape: an instruction
+ * emitted into a terminated block opens a fresh (unreachable) block first. The
+ * dead tail is still emitted — the emitter's C is unchanged in meaning — but it
+ * now sits in a block with no predecessors, where zercheck's Phase-E rule
+ * (inherit the state of a preceding RETURN block) already handles it.
+ * ir_validate enforces the invariant, so a new emission path cannot reintroduce
+ * it. BOTH raw emit helpers route through here. */
+static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    IRBlock *bb = &ctx->func->blocks[ctx->current_block];
+    if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
+        ctx->current_block = ir_add_block(ctx->func, ctx->arena);
+    }
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
+}
+
+static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    ir_add_inst_checked(ctx, inst);
 }
 
 static IRInst make_inst(IROpKind op, int line) {
@@ -461,7 +489,7 @@ static Node *make_local_ident(LowerCtx *ctx, IRLocal *l, SrcLoc loc) {
 
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
-    ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
+    ir_add_inst_checked(ctx, inst);   /* BUG-1070 */
 }
 
 /* Lower one expression to a local ID.
@@ -1336,6 +1364,7 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
         emit_inst(ctx, unlock);
     }
     IRInst ret = make_inst(IR_RETURN, g->line);
+    ret.ret_from_guard = true;   /* BUG-1071: named in the leak diagnostic */
     if (!void_ret) {
         int z = create_temp(ctx, rty, g->line);
         IRInst zl = make_inst(IR_LITERAL, g->line);
@@ -2281,6 +2310,24 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
     }
 }
 
+/* BUG-1071: the local an orelse subject is rooted at — `p` for `p orelse`,
+ * `h` for `h.p orelse` / `h.arr[i] orelse` — or -1 for anything else (a call,
+ * a deref). A syntactic fact, recorded where the fallback is lowered. */
+static int orelse_subject_root_local(LowerCtx *ctx, Node *e) {
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX)) {
+        e = (e->kind == NODE_FIELD) ? e->field.object : e->index_expr.object;
+    }
+    if (!e || e->kind != NODE_IDENT) return -1;
+    return ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len);
+}
+
+/* ONE place tags a block as the null path of an orelse (was six copies). */
+static void tag_orelse_fallback(LowerCtx *ctx, int bi, int tmp_id, int subj_root) {
+    ctx->func->blocks[bi].is_orelse_fallback = true;
+    ctx->func->blocks[bi].orelse_fallback_local = tmp_id;       /* BUG-985 */
+    ctx->func->blocks[bi].orelse_subject_local = subj_root;     /* BUG-1071 */
+}
+
 /* Lower: dest_local = orelse_expr
  * Creates temp, branches, assigns unwrapped value on ok path.
  * Three patterns:
@@ -2308,6 +2355,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     Node *inner = orelse_node->orelse.expr;
     rewrite_idents(ctx, inner);
     pre_lower_orelse(ctx, &inner, line);
+    /* BUG-1071: the local the orelse SUBJECT is rooted at (`p orelse`,
+     * `h.p orelse`), recorded on the fallback blocks for the FuncSummary
+     * builder — see IRBlock.orelse_subject_local. */
+    int subj_root = orelse_subject_root_local(ctx, inner);
     /* BUG-944: an ORDINARY call must go through lower_expr, not the raw-AST
      * passthrough. The passthrough exists for BUILTINS (their arguments may be a
      * bare type name), and the emitter's raw-AST argument loop applies NO
@@ -2367,8 +2418,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     if (orelse_node->orelse.fallback_is_return ||
         orelse_node->orelse.fallback_is_break ||
         orelse_node->orelse.fallback_is_continue) {
-        ctx->func->blocks[bb_fail].is_orelse_fallback = true;
-        ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-985 */
+        tag_orelse_fallback(ctx, bb_fail, tmp_id, subj_root);
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
@@ -2383,8 +2433,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
          * splice it never split. Same question, two sites, one of them updated — the
          * sibling-site shape this project keeps recording. */
         if (ctx->current_block != bb_fail) {
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
@@ -2402,8 +2451,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
@@ -2416,8 +2464,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
@@ -2465,13 +2512,11 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
              * from bb_fail if the block lowered into multiple blocks). */
             IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
             if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
-                ctx->func->blocks[bb_fail].is_orelse_fallback = true;
-                ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-985 */
+                tag_orelse_fallback(ctx, bb_fail, tmp_id, subj_root);
                 /* Also tag the ending block if it's different from bb_fail
                  * (block lowering may have split into sub-blocks) */
                 if (ctx->current_block != bb_fail) {
-                    ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-                    ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;
+                    tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
                 }
             }
         }
@@ -2572,10 +2617,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     ZTRACE("LOWER  %-12s @ line %d  (into block %d)",
            node_kind_name(node->kind), node->loc.line, ctx->current_block);
 
-    /* Check if current block is already terminated — start new block */
+    /* Check if current block is already terminated — start new block.
+     * BUG-1070: record which block this dead USER statement follows, so
+     * zercheck_ir can seed it (see IRBlock.dead_code_seed). */
     IRBlock *cur = &ctx->func->blocks[ctx->current_block];
     if (cur->inst_count > 0 && ir_block_is_terminated(cur)) {
-        start_block(ctx);
+        int after = ctx->current_block;
+        int nb = start_block(ctx);
+        ctx->func->blocks[nb].dead_code_seed = after;
     }
 
     switch (node->kind) {
@@ -2993,108 +3042,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Save defer count so if-scoped defers fire at block exit */
         int then_defer_base = ctx->defer_count;
         ctx->block_defers_managed++;  /* if-body block: we manage */
-        int then_start_bi = bb_then;
-        int then_start_block_count = ctx->func->block_count;
         lower_stmt(ctx, node->if_stmt.then_body);
         emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
         ctx->defer_count = then_defer_base;
 
-        /* Phase E: detect if the then-body "always exits" — its final
-         * block ends with RETURN/BREAK/CONTINUE (not a normal fall-
-         * through to bb_join). If so, tag all blocks in the then-body
-         * range [then_start_bi, ctx->current_block] as is_early_exit.
-         * This mirrors zercheck.c's block_always_exits semantic: these
-         * blocks shouldn't provide leak-coverage to non-early-exit
-         * returns — they're conditional bypass paths that don't
-         * contribute to the canonical function-exit state.
-         *
-         * Check BEFORE ensure_terminated (which would add GOTO to
-         * bb_join for non-terminated blocks).
-         *
-         * Side note: we don't rely on was_terminated because the
-         * then-body may have created intermediate blocks via nested
-         * control flow; only the current block's terminator matters. */
-        bool then_always_exits = false;
-        {
-            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
-            if (cb->inst_count > 0) {
-                IRInst *last = &cb->insts[cb->inst_count - 1];
-                /* RETURN always exits. GOTO to bb_join is NOT an exit
-                 * (that's normal fall-through). GOTO to loop_exit/
-                 * loop_continue/label is an exit. BREAK/CONTINUE via
-                 * GOTO have goto_block != bb_join. */
-                if (last->op == IR_RETURN) {
-                    then_always_exits = true;
-                } else if (last->op == IR_GOTO &&
-                           last->goto_block != bb_join) {
-                    then_always_exits = true;
-                }
-            }
-        }
-        /* Only tag if-without-capture (regular if). If-unwrap (with
-         * capture) has special alias semantics: when the capture is
-         * freed in the early-exit body, the original allocation's
-         * alloc_id should be considered "escaped" on the fall-through
-         * path too. Excluding the early-exit from coverage would
-         * incorrectly flag such patterns as leaks. Union coverage
-         * correctly handles if-unwrap early-exits via alias
-         * propagation to the canonical return's state. */
-        if (then_always_exits && !has_capture) {
-            /* BUG-846: bb_then / bb_else / bb_join are allocated CONSECUTIVELY, so a
-             * sweep of [then_start_bi, block_count) that skips only bb_join also
-             * tags bb_ELSE — a block whose body has not even been lowered yet. The
-             * else sweep below had the mirror defect and swallowed the then body's
-             * blocks. The correct boundary is the BLOCK COUNT captured before the
-             * then-body was lowered: the blocks that body created are exactly
-             * [then_start_block_count, block_count), plus bb_then itself. That is
-             * what `then_start_block_count` was written for — it had been dead,
-             * (void)-cast, since it was introduced. */
-            if (!ctx->func->blocks[then_start_bi].is_early_exit)
-                ctx->func->blocks[then_start_bi].is_early_exit = true;
-            for (int bi = then_start_block_count; bi < ctx->func->block_count; bi++) {
-                if (bi == bb_join) continue;
-                if (!ctx->func->blocks[bi].is_early_exit)
-                    ctx->func->blocks[bi].is_early_exit = true;
-            }
-        }
-
+        /* BUG-1071: the then/else bodies used to be tagged is_early_exit when
+         * they always exit, and zercheck_ir skipped those returns in its leak
+         * check. That skip hid real leaks (`if (k == 1) { return 1; }` with an
+         * allocation alive) and is gone: every reachable return is checked on
+         * its own state, and the optional's null path — the precision the
+         * skip bought — is represented by zercheck_ir's null-edge refinement. */
         ensure_terminated(ctx, bb_join);
 
         /* Else block */
-        int else_start_bi = -1;
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
-            else_start_bi = bb_else;
-            int else_start_block_count = ctx->func->block_count;   /* BUG-846 */
             int else_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
             emit_defer_fire_scoped(ctx, else_defer_base, true, node->loc.line);
             ctx->defer_count = else_defer_base;
-
-            /* Phase E: same tagging for else-body if it always exits. */
-            bool else_always_exits = false;
-            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
-            if (cb->inst_count > 0) {
-                IRInst *last = &cb->insts[cb->inst_count - 1];
-                if (last->op == IR_RETURN) {
-                    else_always_exits = true;
-                } else if (last->op == IR_GOTO &&
-                           last->goto_block != bb_join) {
-                    else_always_exits = true;
-                }
-            }
-            if (else_always_exits) {
-                /* BUG-846: same boundary fix, mirror side. */
-                if (!ctx->func->blocks[else_start_bi].is_early_exit)
-                    ctx->func->blocks[else_start_bi].is_early_exit = true;
-                for (int bi = else_start_block_count; bi < ctx->func->block_count; bi++) {
-                    /* Don't tag bb_join if we accidentally reach it */
-                    if (bi == bb_join) continue;
-                    if (!ctx->func->blocks[bi].is_early_exit)
-                        ctx->func->blocks[bi].is_early_exit = true;
-                }
-            }
 
             ensure_terminated(ctx, bb_join);
         }

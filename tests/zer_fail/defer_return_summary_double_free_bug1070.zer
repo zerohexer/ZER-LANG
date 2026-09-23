@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-1070 (H1), summary half: the same misplaced RETURN hid the free from the
+// FuncSummary builder, so `zap(a)` was recorded as NOT freeing its param and the
+// caller's `free(a)` was a silent double free (ASan: attempting double-free).
+u32 cnt = 0;
+void zap([*]u32 p) {
+    defer cnt += 1;
+    free(p);
+    return;
+}
+u32 main() {
+    [*]u32 a = alloc(u32, 4) orelse return;
+    a[0] = 1;
+    zap(a);
+    free(a);
+    return 0;
+}

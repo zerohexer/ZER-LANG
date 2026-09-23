@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1080 (H6): the dual — free through the returned field, then use the original.
+// Pre-fix: compiled, ASan heap-use-after-free.
+struct H { [*]u32 p; }
+H mk([*]u32 a) { H h = { .p = a }; return h; }
+u32 main() {
+    [*]u32 a = alloc(u32, 4) orelse return;
+    a[0] = 7;
+    H h = mk(a);
+    free(h.p);
+    u32 r = a[0];
+    free(a);
+    return r;
+}

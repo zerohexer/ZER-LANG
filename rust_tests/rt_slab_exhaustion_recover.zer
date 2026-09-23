@@ -11,19 +11,19 @@ u32 main() {
     t.id = 1;
     t.status = 0;
 
-    if (t.id != 1) { return 1; }
-
-    heap.free_ptr(t);
+    u32 id1 = t.id;
+    heap.free_ptr(t);                    // BUG-1071: before the early return
+    if (id1 != 1) { return 1; }
 
     // Re-allocate after free — reuses slot
     ?*Task mt2 = heap.alloc_ptr();
     *Task t2 = mt2 orelse return;
+    defer heap.free_ptr(t2);
     t2.id = 2;
     t2.status = 1;
 
     if (t2.id != 2) { return 2; }
     if (t2.status != 1) { return 3; }
 
-    heap.free_ptr(t2);
     return 0;
 }

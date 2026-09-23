@@ -6,8 +6,8 @@ Pool(Task, 8) tasks;
 
 u32 main() {
     const Handle(Task) h = tasks.alloc() orelse { return 1; };
+    defer tasks.free(h);
     h.id = 42;           // OK — modifying data, not reassigning handle
     if (h.id != 42) { return 2; }
-    tasks.free(h);
     return 0;
 }

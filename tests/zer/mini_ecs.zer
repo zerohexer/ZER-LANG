@@ -28,6 +28,9 @@ u32 entity_count;
 u32 spawn(i32 x, i32 y) {
     if (entity_count >= MAX_ENTITIES()) { return 0xFFFFFFFF; }
     u32 idx = entity_count;
+    // BUG-1071: prove the index BEFORE allocating — an unproven `entities[idx]`
+    // store below gets a bounds auto-guard whose early return would leak `ph`.
+    if (idx >= 32) { return 0xFFFFFFFF; }
     entity_count = entity_count + 1;
 
     entities[idx].id = idx;
@@ -46,6 +49,7 @@ u32 spawn(i32 x, i32 y) {
 // Add velocity component to entity
 bool add_velocity(u32 idx, i32 dx, i32 dy) {
     if (idx >= entity_count) { return false; }
+    if (idx >= 32) { return false; }   // BUG-1071: see spawn()
     Handle(Velocity) vh = vel_pool.alloc() orelse { return false; };
     vh.dx = dx;
     vh.dy = dy;
@@ -56,6 +60,7 @@ bool add_velocity(u32 idx, i32 dx, i32 dy) {
 // Add health component to entity
 bool add_health(u32 idx, u32 max_hp) {
     if (idx >= entity_count) { return false; }
+    if (idx >= 32) { return false; }   // BUG-1071: see spawn()
     Handle(Health) hh = hp_pool.alloc() orelse { return false; };
     hh.current = max_hp;
     hh.max = max_hp;

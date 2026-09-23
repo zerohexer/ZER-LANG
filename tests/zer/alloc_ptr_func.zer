@@ -20,11 +20,11 @@ void update(*Particle p) {
 u32 main() {
     ?*Particle mp = spawn(10, 20);
     *Particle p = mp orelse { return 1; };
+    defer particles.free_ptr(p);   // early returns below free it too
     update(p);
     if (p.x != 11) { return 2; }
     if (p.y != 22) { return 3; }
     update(p);
     if (p.x != 12) { return 4; }
-    particles.free_ptr(p);
     return 0;
 }

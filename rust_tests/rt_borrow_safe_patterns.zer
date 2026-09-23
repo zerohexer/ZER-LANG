@@ -43,8 +43,9 @@ u32 main() {
     }
     // h5 still ALIVE here — safe to use
     pool.get(h5).id = 5;
-    if (pool.get(h5).id != 5) { return 2; }
-    pool.free(h5);
+    u32 id5 = pool.get(h5).id;
+    pool.free(h5);                       // BUG-1071: before the early return
+    if (id5 != 5) { return 2; }
 
     return 0;
 }

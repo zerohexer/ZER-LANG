@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: may be a view of
+// BUG-1075 (H5): the recycled-slot form — returned 99 (the new object) pre-fix.
+struct T { u32 v; }
+*T pick(*T x, *T y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T d = alloc(T) orelse { free(a); return 1; };
+    a.v = 7;
+    *T c = pick(d, a, false);
+    free(a);
+    *T b = alloc(T) orelse { free(d); return 1; };
+    b.v = 99;
+    u32 r = c.v;
+    free(b); free(d);
+    return r;
+}

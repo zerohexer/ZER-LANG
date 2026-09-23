@@ -1,0 +1,6 @@
+// expect-error: cannot be initialized from 'm'
+// BUG-1127: the same, inside a designated initializer's field.
+struct S { u32 f; }
+u32 m = 3;
+S s = { .f = m };
+u32 main(){ return s.f - 3; }

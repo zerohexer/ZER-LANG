@@ -1,0 +1,6 @@
+// expect-error: cannot be initialized from 'i'
+// BUG-1127: &arr[i] is an address constant only when the INDEX is one.
+u32[4] arr;
+u32 i = 1;
+*u32 p = &arr[i];
+u32 main(){ return 0; }

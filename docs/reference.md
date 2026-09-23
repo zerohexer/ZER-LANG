@@ -1129,10 +1129,13 @@ u32 main() {
   `@mulw`, and `@truncate` to a non-native `uN`/`iN` width.
 - An assignment inside an initializer (`u32 G = (x = f());`) is reachable and is
   checked the same way.
-- Aggregates cannot be initialised at global scope: there is no array-literal
-  syntax, and a designated initializer (`S g = { .x = 1 };`) is a var-decl,
-  assignment, call-argument and return form only. Assign the fields from an init
-  function instead.
+- A struct global takes a designated initializer (`S g = { .x = 1 };`, nested
+  structs included); there is no array-literal syntax, so an ARRAY global cannot be
+  initialised from a literal. A global initializer may name a `const` global, a
+  function, an enum variant, the address of a global (`&g`, `&g.f`, `&g[2]`), a
+  global ARRAY (its address — `[*]u8 s = buf;`, `buf[0..2]`) and a fixed array's
+  `.len`; it may NOT name a mutable global's VALUE anywhere in the expression
+  (`u32 x = m + 1;` is an error — not a compile-time constant).
 
 **SEE ALSO**
 const, comptime, @size
@@ -2497,12 +2500,18 @@ pattern is a legal `u32` — so those puns still compile in both directions:
 
 ```zer
 struct A { u32 x; }
-A a;  *A pa = &a;
-*u8 bytes = @pun(*u8, pa);       // OK — byte view of a struct
-
-u32 raw = 9;  *u32 rp = &raw;
 struct Plain { u32 y; }
-*Plain pl = @pun(*Plain, rp);    // OK — target carries no invariant
+A a;
+u32 raw = 9;
+u32 main() {
+    *A pa = &a;
+    *u8 bytes = @pun(*u8, pa);       // OK — byte view of a struct
+    *u32 rp = &raw;
+    *Plain pl = @pun(*Plain, rp);    // OK — target carries no invariant
+    if (pl.y != 9) { return 1; }
+    *bytes = 0;
+    return 0;
+}
 ```
 
 **NOTES**
@@ -4469,7 +4478,9 @@ static_assert(Color.red == 0, "red is 0");
 ### Designated Initializers
 
 **DESCRIPTION**
-Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl, assignment, call args, and return.
+Initialize struct fields by name. Unmentioned fields auto-zero. Works in var-decl (local
+AND global), assignment, call args, and return; a field that is itself a struct takes a
+nested initializer.
 
 **SYNTAX**
 ```zer
@@ -4477,6 +4488,24 @@ Point p = { .x = 10, .y = 20 };
 p = { .x = 100, .y = 200 };
 func({ .x = 1, .y = 2 });
 Point make() { return { .x = 0, .y = 0 }; }
+```
+
+**NOTES**
+- An omitted field auto-zeroes — so a field whose zero is FORBIDDEN must be named. A
+  non-null `*T` or function-pointer field (directly, or inside an omitted nested struct)
+  would be NULL: compile error "designated initializer omits field '.p'". Initialize it,
+  or declare the field `?*T`.
+
+```zer
+struct In { u32 a; u32 b; }
+struct Cfg { In in; *u32 counter; ?u32 limit; }
+u32 hits;
+Cfg g = { .in = { .a = 1, .b = 2 }, .counter = &hits };   // global; .limit is null
+u32 main() {
+    *g.counter += 1;
+    u32 lim = g.limit orelse 10;
+    return g.in.a + g.in.b + hits + lim - 14;
+}
 ```
 
 ---

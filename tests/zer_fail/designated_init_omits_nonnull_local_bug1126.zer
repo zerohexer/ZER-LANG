@@ -1,0 +1,4 @@
+// expect-error: designated initializer omits field '.p'
+// BUG-1126: an omitted *T field is zero (NULL); *w.p dereferenced address 0.
+struct H { u32 a; *u32 p; }
+u32 main(){ H w = { .a = 1 }; return *w.p; }

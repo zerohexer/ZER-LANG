@@ -1,0 +1,18 @@
+// BUG-1128: calling a function defined LATER relied on C's implicit `int f()`
+// declaration — the emitter wrote no prototypes. Any non-int return failed to
+// build ("conflicting types for 'later'"), and a funcptr global initialised with a
+// later function was "undeclared".
+struct Pair { u32 a; u32 b; }
+*() -> u64 hook = later;
+u32 main() {
+    u64 v = later();
+    Pair p = mk(4);
+    ?u32 m = maybe(5);
+    u32 mv = m orelse 0;
+    if (v != 4294967296 || hook() != v) { return 1; }
+    if (p.a + p.b != 9 || mv != 5) { return 2; }
+    return 0;
+}
+u64 later() { return 4294967296; }
+Pair mk(u32 x) { Pair p = { .a = x, .b = x + 1 }; return p; }
+?u32 maybe(u32 x) { if (x > 0) { return x; } return null; }

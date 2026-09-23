@@ -5257,6 +5257,25 @@ borrowed by that thread until `.join()`:
 - `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
   so the child would write the parent's slot. Pass it by value instead.
 - All `&` arguments are tracked, not just the first; `.join()` releases every one.
+- A non-shared **global** lent by `&g` is borrowed the same way — and so is every
+  function the parent calls before the join: a call whose body (or any function it
+  calls) names `g` is a compile error, and so is a call through a function pointer,
+  whose target is unknown. Calling a helper that touches only other globals is fine:
+  ```zer
+  u32 counter;
+  u32 other;
+  void worker(*u32 p) { *p += 1; }
+  void bump() { counter += 1; }
+  void bump_other() { other += 1; }
+  u32 main() {
+      ThreadHandle th = spawn worker(&counter);
+      bump_other();        // OK — never names counter
+      // bump();           // compile error — bump() writes counter while the thread does
+      th.join();
+      bump();              // OK after the join
+      return counter - 2;
+  }
+  ```
 - A `.join()` **inside a branch** does not release the borrow for code after that
   branch — the other path never joined, so the thread may still be running:
   ```zer

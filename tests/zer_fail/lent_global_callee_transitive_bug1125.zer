@@ -1,0 +1,12 @@
+// expect-error: cannot call 'deeper' while 'counter' is lent to a scoped spawn
+// BUG-1125: transitive — deeper() -> peek() reads the lent global.
+u32 counter;
+void worker(*u32 p) { *p += 1; }
+u32 peek() { return counter; }
+u32 deeper() { return peek(); }
+u32 main() {
+    ThreadHandle th = spawn worker(&counter);
+    u32 v = deeper();
+    th.join();
+    return v;
+}

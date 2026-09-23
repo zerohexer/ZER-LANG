@@ -315,14 +315,14 @@ checker.c:expr_contains_yield:NODE_WHILE:while_stmt.cond
 #   if-condition: an `if` used as a STATEMENT is walked via its bodies; a cast of the
 #   param inside the condition is reached through the expression arms instead.
 
-# --- checker.c: record_atomic_plain_in_callee ---
-checker.c:record_atomic_plain_in_callee:NODE_ASM:asm_stmt.inputs
-checker.c:record_atomic_plain_in_callee:NODE_ASM:asm_stmt.outputs
-checker.c:record_atomic_plain_in_callee:NODE_FILE:file.decls
-checker.c:record_atomic_plain_in_callee:NODE_FUNC_DECL:func_decl.body
-checker.c:record_atomic_plain_in_callee:NODE_GLOBAL_VAR:var_decl.init
-checker.c:record_atomic_plain_in_callee:NODE_INTERRUPT:interrupt.body
-checker.c:record_atomic_plain_in_callee:NODE_STATIC_ASSERT:static_assert_stmt.cond
+# --- checker.c: walk_callee_globals (was record_atomic_plain_in_callee, BUG-1125) ---
+# Declarations are never inside a function body; a static_assert condition is a
+# compile-time constant and names no runtime global.
+checker.c:walk_callee_globals:NODE_FILE:file.decls
+checker.c:walk_callee_globals:NODE_FUNC_DECL:func_decl.body
+checker.c:walk_callee_globals:NODE_GLOBAL_VAR:var_decl.init
+checker.c:walk_callee_globals:NODE_INTERRUPT:interrupt.body
+checker.c:walk_callee_globals:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: record_isr_globals ---
 checker.c:record_isr_globals:NODE_ASM:asm_stmt.inputs

@@ -322,6 +322,12 @@ typedef struct {
      * fire-and-forget spawn also ran, in which case no join may ever clear it. */
     int live_scoped_threads;
     bool unbounded_spawn_in_func;
+    /* BUG-1125: GLOBALS lent by pointer to a scoped spawn in this function (BUG-1118).
+     * Candidates only — a join clears the Symbol's is_borrowed_by_thread, which is
+     * what the call-site check reads — so nothing is ever removed; reset per
+     * function. */
+    Symbol **lent_globals;
+    int lent_global_count, lent_global_cap;
     /* BUG-980: the mirror of lockchk_direct_only — collect ONLY what the
      * statement's CALLEES touch, skipping its own direct accesses. Intersecting
      * the two sets is what makes same-type re-entry visible: the full pass

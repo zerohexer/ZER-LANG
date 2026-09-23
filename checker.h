@@ -116,6 +116,13 @@ typedef struct {
     int cert_loop_depth;      /* branch_depth at which the body is unconditional */
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
+    /* BUG-1161: the TOP node of the assignment target being checked and the
+     * assignment operator. A union variant may be written only as the WHOLE
+     * target of a plain `=` — a compound op reads the variant, and a write
+     * into a SUB-field / element flips the tag while keeping the other
+     * variant's bytes. */
+    Node *assign_target_top;
+    int assign_target_op;
     const char *union_switch_var;  /* variable name being switched on (union only) */
     uint32_t union_switch_var_len;
     const char *union_switch_key;  /* BUG-392: full path key e.g. "msgs[0]" for array element locks */

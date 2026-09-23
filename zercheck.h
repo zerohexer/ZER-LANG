@@ -135,6 +135,13 @@ typedef struct {
         int param;
         bool must;
     } *ret_field;
+    /* BUG-1172: the function (or a callee, transitively) RESETS an arena that
+     * is not its own local — a global arena, or one reached through a field.
+     * A reset frees every arena allocation, so the CALLER's arena-coloured
+     * handles are freed across the call. Without it, `void rs() { g.reset(); }`
+     * called between `p = g.alloc(T)` and `p.v` was a silent use-after-free
+     * (the next alloc returned the same bytes). */
+    bool resets_arena;
 } FuncSummary;
 
 /* ZER-CHECK context */
@@ -159,6 +166,7 @@ typedef struct {
     int summary_count;
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
+    bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
 
     /* allocation ID counter — each unique allocation gets a unique ID */
     int next_alloc_id;

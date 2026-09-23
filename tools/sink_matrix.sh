@@ -356,6 +356,11 @@ cell p20_slice_view       reject 'void ws20([*]u8 s){s[0]=5;} u32 main(){ u8[4] 
 cell p20_param_ptr        reject 'void w20(*u32 p){*p=5;} void f20(*u32 p){ ThreadHandle t=spawn w20(p); *p=3; t.join(); } u32 main(){ u32 v=0; f20(&v); return 0; }'
 cell p20_threadlocal_alias reject 'threadlocal u32 tl20; void w20(*u32 p){*p=1;} u32 main(){ *u32 q=&tl20; ThreadHandle t=spawn w20(q); t.join(); return 0; }'
 cell p20_interior_ptr     reject 'struct B20{u32 v;} void w20(*u32 p){*p=5;} u32 main(){ B20 b; ThreadHandle t=spawn w20(&b.v); b.v=3; t.join(); return b.v; }'
+# BUG-1169: three more spellings — a PRE-EXISTING alias written through, a struct
+# LITERAL carrier, and a pointer TO a carrier.
+cell p20_prior_alias      reject 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=1; *u32 al=&v; ThreadHandle t=spawn w20(&v); *al=7; t.join(); return v; }'
+cell p20_literal_carrier  reject 'struct H20{*u32 p;} void wh20(H20 h){*h.p=5;} u32 main(){ u32 v=1; H20 h={.p=&v}; ThreadHandle t=spawn wh20(h); v=7; t.join(); return v; }'
+cell p20_amp_carrier      reject 'struct H20{*u32 p;} void wp20(*H20 h){*h.p=5;} u32 main(){ u32 v=1; H20 h; h.p=&v; ThreadHandle t=spawn wp20(&h); v=7; t.join(); return v; }'
 # BOUNDARY: lend only what actually reaches the parent's memory, and release at join.
 # A SCALAR is copied; a pointer to a GLOBAL lends no local; an unrelated local stays
 # writable; and every borrow ends at the join. Over-rejecting any of these would break
@@ -432,6 +437,10 @@ cell p22_nested_packed  reject 'packed struct I22{u8 a; u32[2] w;} struct O22{I2
 # UNPACKED struct is naturally aligned and must stay viewable in every spelling.
 cell p22_safe_u8_view   compile 'packed struct F22{u8 k; u8[6] pay; u16 crc;} u32 sm22([*]u8 s){u32 t=0; for (u8 b in s) { t+=b; } return t;} u32 main(){ F22 f; f.pay[0]=1; f.pay[1]=2; [*]u8 v=f.pay; [*]u8 t=f.pay[0..2]; if (sm22(v)!=3) { return 1; } if (sm22(t)!=3) { return 2; } if (sm22(f.pay)!=3) { return 3; } return 0; }'
 cell p22_safe_unpacked  compile 'struct U22{u8 a; u32[2] w;} u32 main(){ U22 u; u.w[0]=5; [*]u32 s=u.w; if (s[0]!=5) { return 1; } return 0; }'
+# BUG-1171: the CARRIER sinks — a struct literal field and a field assignment.
+cell p22_literal_field    reject 'packed struct P22c{u8 a; u32 w;} struct H22c{*u32 p;} P22c gp22c; u32 main(){ H22c h = { .p = &gp22c.w }; *h.p = 7; return 0; }'
+cell p22_field_assign     reject 'packed struct P22d{u8 a; u32 w;} struct H22d{*u32 p;} P22d gp22d; u32 g22d; u32 main(){ H22d h = { .p = &g22d }; h.p = &gp22d.w; *h.p = 7; return 0; }'
+
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +747,23 @@ cell p34_safe_elem_use_first    compile 'struct T34h{u32 v;} struct H34h{*T34h p
 cell p34_safe_elem_free_field   compile 'struct T34i{u32 v;} struct H34i{*T34i p;} H34i mk34i(*T34i a){ H34i[2] hs; hs[0] = { .p = a }; return hs[0]; } u32 main(){ *T34i a = alloc(T34i) orelse return; a.v = 5; H34i h = mk34i(a); u32 r = h.p.v; free(h.p); return r - 5; }'
 cell p34_safe_global_field      compile 'struct T34k{u32 v;} struct H34k{*T34k p;} T34k g34k; H34k mk34k(*T34k a){ H34k h; h.p = &g34k; u32 x = a.v; return h; } u32 main(){ *T34k a = alloc(T34k) orelse return; g34k.v = 4; H34k h = mk34k(a); free(a); return h.p.v - 4; }'
 cell p34_safe_other_param       compile 'struct T34j{u32 v;} struct H34j{*T34j p;} H34j mk34j(*T34j a, *T34j b){ H34j[2] hs; hs[0] = { .p = b }; u32 x = a.v; return hs[0]; } u32 main(){ *T34j b = alloc(T34j) orelse return; defer free(b); *T34j a = alloc(T34j) orelse return; b.v = 3; H34j h = mk34j(a, b); free(a); return h.p.v - 3; }'
+
+# SHAPE p35 (BUG-1158/1159/1160): a STRUCT LITERAL carrying a frame-bound pointer —
+# VALUE SHAPE x SINK. The literal walker knew four field-value shapes and every
+# other sink routed through arg_is_local_derived, which had no literal case; an
+# assigned literal never tainted its local; a spawn literal was never typed
+# before the gates. One cell per shape the audit found, plus the sinks.
+echo "===== SHAPE p35 = a struct literal carrying a frame-bound pointer (shape x sink) ====="
+cell p35_array_coerce_global  reject 'struct R35{[*]u32 s;} R35 g35; void f35(){ u32[4] a; g35 = { .s = a }; } u32 main(){ f35(); return 0; }'
+cell p35_field_value_return   reject 'struct H35{*u32 q;} struct R35{*u32 p;} R35 f35(){ u32 x = 5; H35 h = { .q = &x }; return { .p = h.q }; } u32 main(){ return *f35().p; }'
+cell p35_orelse_value_return  reject 'struct R35{*u32 p;} ?*u32 no35(){ return null; } R35 f35(){ u32 x = 5; return { .p = no35() orelse &x }; } u32 main(){ return *f35().p; }'
+cell p35_assign_local_return  reject 'struct R35{*u32 p;} R35 f35(){ u32 x = 5; R35 r; r = { .p = &x }; return r; } u32 main(){ return *f35().p; }'
+cell p35_keep_call_arg        reject 'struct M35{*u32 p;} M35 gm35; void st35(M35 m){ gm35 = m; } void f35(){ u32 x = 5; st35({ .p = &x }); } u32 main(){ f35(); return 0; }'
+cell p35_spawn_arg            reject 'struct M35{*u32 p;} void w35(M35 m){ u32 v = *m.p; } void f35(){ u32 x = 5; spawn w35({ .p = &x }); } u32 main(){ f35(); return 0; }'
+# BOUNDARY: a scalar read out of a local array is a VALUE, and a global array is
+# not frame-bound.
+cell p35_safe_scalar_elem     compile 'struct N35{u32 n;} N35 g35; void f35(){ u32[4] a; a[0] = 3; g35 = { .n = a[0] }; } u32 main(){ f35(); return g35.n - 3; }'
+cell p35_safe_global_array    compile 'struct R35{[*]u32 s;} u32[4] ga35; R35 g35; u32 main(){ g35 = { .s = ga35 }; return (u32)g35.s.len - 4; }'
 
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

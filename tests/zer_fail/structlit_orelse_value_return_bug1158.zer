@@ -1,0 +1,6 @@
+// expect-error: carrying a pointer to a local
+// BUG-1158: struct-literal escape class — see BUGS-FIXED.md.
+struct R { ?*u32 p; }
+?*u32 none() { return null; }
+R f() { u32 x = 5; return { .p = none() orelse &x }; }
+u32 main() { R r = f(); if (r.p) |q| { return *q; } return 0; }

@@ -488,6 +488,14 @@ void set_priority(*Task t, u32 p) {
   length, so the access cannot be bounds-checked (it would be a silent buffer overflow).
   Use `[*]T` (a slice — it carries a length and is bounds-checked) for a collection, or
   dereference to read the single pointee: `*ptr` (or `ptr.field` for a field).
+- A `*T` **field or array element** is zero (NULL) until assigned, because every aggregate
+  is auto-zeroed (`H w;`, `alloc(H)`, a Pool/Slab/Arena slot, an element of `*T[N]` via a
+  typedef). A local or parameter `*T` can never be NULL (it needs an initializer), so the
+  compiler checks the LOAD of a `*T` out of memory instead: reading such a field before it
+  is assigned traps with `read of a null non-null pointer` — on hosted AND bare-metal
+  targets. Assigning the field (`w.p = &x;`) and taking its address (`&w.p`) are not loads.
+  The `.ptr` of an empty (zero) slice is the same case. Use `?*T` for a field that is
+  legitimately absent.
 
 **SEE ALSO**
 ?*T, [*]T, *opaque
@@ -679,6 +687,14 @@ packed struct SensorPacket {
 }   // exactly 4 bytes, no padding
 ```
 
+**NOTES**
+- `&p.field` of a field whose alignment exceeds 1 is a possibly-misaligned pointer. A
+  local that holds it is tracked (dereferencing it is refused); storing it into a STRUCT
+  FIELD or ARRAY ELEMENT (`H h = { .p = &pkt.temperature };`, `h.p = &pkt.temperature;`)
+  is a compile error, because an aggregate cannot carry the misalignment fact and a later
+  access would fault on strict-alignment targets (Cortex-M0, strict RISC-V). Copy the value
+  out of the packed field instead.
+
 **SEE ALSO**
 struct, move struct
 
@@ -755,6 +771,11 @@ enum Direction { left = -1, center = 0, right = 1 }
 **NOTES**
 - Dot syntax required: `State.idle`, not bare `idle`.
 - Switch arms use `.variant => { }` syntax.
+- An enum with NO variant equal to 0 (`enum E { a = 5, b = 6 }`) cannot be zero-initialized:
+  a bare `E g;` is a compile error, and inside an aggregate (a struct field, an array
+  element, an `alloc(S)` slot, a field left out of a designated initializer) the zero is
+  caught when it is READ — `read of an enum holding 0, which is not one of its variants`
+  traps. Assign the field before reading it, or give the enum a zero variant.
 
 **SEE ALSO**
 switch, union
@@ -793,6 +814,13 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
 **NOTES**
 - Mutable capture `|*v|` takes a pointer to the original union variant.
 - Mutating the switched-on union's variant inside a capture arm is a compile error.
+- Writing the whole variant (`msg.ack = a;`) sets the tag. A **partial** write into a
+  variant (`msg.sensor.temperature = 5;`) or a **compound** assignment (`u.count += 1;`)
+  also makes that variant active — and if a DIFFERENT variant was active, the union is
+  first reset to zero, so the other variant's bytes can never be read as the new one (a
+  compound op on a newly activated variant starts from 0). Within the active variant both
+  behave normally. Such a write through a path with a side effect (`arr[next()].v.x = 1`)
+  is a compile error — take a pointer to the union in a local first.
 
 **SEE ALSO**
 enum, switch
@@ -1359,6 +1387,11 @@ u32 pair() {
 }
 u32 main() { if (pair() != 3) { return 1; } return 0; }
 ```
+
+The return VALUE is evaluated before the defers fire — `u32 v = 4; defer v = 8; return v;`
+returns 4 (a defer that writes the returned local does not change what the caller receives).
+A one-statement `defer stmt;` behaves exactly like `defer { stmt; }`, including the
+shared-struct auto-lock.
 
 `yield` and `await` are **banned** inside defer bodies — both directly and transitively (calling a function that yields is also rejected). Defer cleanup must be atomic; suspending mid-cleanup corrupts the coroutine state machine.
 
@@ -2494,6 +2527,25 @@ compile-time rules cover what the runtime check cannot:
   only way an integer becomes a pointer, and keeps a forged enum out of an
   exhaustive `switch`. Use `@inttoptr` for an address, a `[*]u8` slice to parse
   bytes, or pun between two struct types (which IS runtime-checked).
+
+The same holds in the other direction: a **writable** primitive view over a source that
+carries such a value is refused, because a store through the view forges it
+(`*u32 p = @pun(*u32, &state); *p = 200;` would put a non-variant in an enum). A **const**
+view is a read-only byte view and stays allowed:
+
+```zer
+enum State { idle, run }
+struct Node { *u32 p; State s; }
+u32 g = 7;
+u32 main() {
+    Node n;
+    n.p = &g;
+    n.s = State.run;
+    const *u64 raw = @pun(const *u64, &n);   // OK — read-only view
+    if (*raw == 0) { return 1; }
+    return 0;
+}
+```
 
 Reinterpreting bits as plain integers or floats forges nothing — every bit
 pattern is a legal `u32` — so those puns still compile in both directions:
@@ -4521,6 +4573,13 @@ Point make() { return { .x = 0, .y = 0 }; }
 - A literal into an OPTIONAL struct (`?P o = { .x = 1 };`, `opt = { .x = 1 };`, a
   `?P` parameter, return or field) builds the struct and wraps it — the optional is
   present.
+- An ARRAY value may initialize an array field (`{ .arr = local_arr }` copies it) or a
+  `[*]T` field (`{ .s = buf }` views it, `len` = the array's size), in every form.
+- A literal carrying a pointer into THIS frame (`{ .p = &x }`, a local array into a
+  `[*]T` field, `{ .p = h.q }` of a local-derived `h`, `{ .p = maybe() orelse &x }`) may not
+  outlive the frame — returning it, storing it to a global, passing it where the callee
+  keeps it, or to a fire-and-forget `spawn` is a compile error, and so is assigning it to
+  a local (`r = { .p = &x };`) that later escapes.
 
 ```zer
 struct In { u32 a; u32 b; }
@@ -5421,6 +5480,11 @@ borrowed by that thread until `.join()`:
 ```zer
 threadlocal u32 counter;    // each thread has its own copy
 ```
+- The ADDRESS of a threadlocal may not reach a non-threadlocal global, a pointer
+  parameter's field, or a shared struct — directly (`g = &counter;`), through a pointer
+  bound to it (`*u32 q = &counter; g = q;`), or inside a struct (`g = { .p = &counter };`).
+  Each thread has its own copy, so another thread would read a slot that dies with this
+  thread. Storing it in ANOTHER threadlocal is fine (same thread).
 - `threadlocal shared struct X g;` is rejected. The two
   annotations are mutually exclusive — `threadlocal` gives each thread
   its own copy + own mutex, so cross-thread synchronization is

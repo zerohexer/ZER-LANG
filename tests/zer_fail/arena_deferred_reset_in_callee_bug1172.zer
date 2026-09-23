@@ -1,0 +1,7 @@
+// expect-error: use after free: 'n'
+// BUG-1172: a DEFERRED reset in the callee.
+struct N { u32 v; }
+Arena ar;
+u8[256] buf;
+void wipe() { defer ar.reset(); }
+u32 main() { ar = Arena.over(buf); *N n = ar.alloc(N) orelse return; n.v = 7; wipe(); *N m = ar.alloc(N) orelse return; m.v = 9; return n.v; }

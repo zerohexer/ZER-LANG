@@ -3887,6 +3887,28 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Keep expr for cases lower_expr returns -1 (void/array passthrough).
              * Emitter's IR_RETURN checks expr for array→slice coercion. */
             if (ret.src1_local < 0) ret.expr = ret_expr;
+            /* BUG-1154: `return v;` of a bare NAMED local lowers to v's own id,
+             * not a temp — so the IR_RETURN read v AFTER the defers below had
+             * run, and `u32 v = 4; defer v = 8; return v;` returned 8. BUG-442's
+             * rule is that the return value is evaluated BEFORE the defers;
+             * every other expression shape already lands in a fresh temp. With
+             * a VRP-proven return range that became a silent OOB write at the
+             * caller (the range was proven for the pre-defer value). Snapshot
+             * the named local into a temp whenever a defer is pending. */
+            if (ret.src1_local >= 0 && ctx->defer_count > 0 &&
+                !ctx->func->locals[ret.src1_local].is_temp) {
+                Type *rt = ctx->func->locals[ret.src1_local].type;
+                Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
+                if (rte && type_dispatch_kind(rte) != TYPE_ARRAY) {
+                    int snap = create_temp(ctx, rt, node->loc.line);
+                    ctx->func->locals[snap].snapshot_of_plus1 = ret.src1_local + 1;
+                    IRInst cp = make_inst(IR_COPY, node->loc.line);
+                    cp.dest_local = snap;
+                    cp.src1_local = ret.src1_local;
+                    emit_inst(ctx, cp);
+                    ret.src1_local = snap;
+                }
+            }
         }
         emit_defer_fire(ctx, node->loc.line);
         /* Release the active shared-struct lock for THIS statement before

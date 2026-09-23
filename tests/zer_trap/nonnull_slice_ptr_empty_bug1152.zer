@@ -1,0 +1,10 @@
+// expect-trap
+// expect-trap-msg: read of a null non-null pointer
+// expect-trap-at: 8
+// BUG-1152: `.ptr` of a zero slice is typed `*T` (non-null) but is NULL; its
+// load is guarded like any other non-null pointer load out of memory.
+u32 main() {
+    [*]u8 s;
+    *u8 p = s.ptr;
+    return (u32)*p;
+}

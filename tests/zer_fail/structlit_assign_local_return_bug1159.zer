@@ -1,0 +1,6 @@
+// expect-error: pointer to local 'r'
+// BUG-1159: struct-literal escape class — see BUGS-FIXED.md.
+struct R { *u32 p; }
+R f() { u32 x = 5; R r; r = { .p = &x }; return r; }
+u32 clobber(u32 k) { u32[32] z; for (u32 i = 0; i < 32; i += 1) { z[i] = k; } return z[k % 32]; }
+u32 main() { R r = f(); clobber(77); return *r.p; }

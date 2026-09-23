@@ -46,6 +46,12 @@ typedef struct {
     Checker *checker;       /* for resolved type info */
     int indent;             /* current indentation level */
     int temp_count;         /* counter for temporary variable names */
+    /* BUG-1152: the non-null pointer LOAD guard. `nn_bypass` is the node whose
+     * guard is already open (so its own emission is not wrapped a second time);
+     * `nn_lvalue` is the assignment target / `&` operand currently being
+     * emitted — a STORE location, never a load, so never guarded. */
+    Node *nn_bypass;
+    Node *nn_lvalue;
     Type *current_func_ret; /* return type of current function */
     bool current_main_promoted; /* true if current func is `void main()` promoted to `int main()` — bare return becomes `return 0;` */
     DeferStack defer_stack; /* current block's deferred statements */

@@ -1,0 +1,23 @@
+// expect-trap
+// expect-trap-msg: read of a null non-null pointer
+// expect-trap-at: 19
+// BUG-1161: a partial write `w.pp.b = 1` flipped the tag to .pp while pp.a still
+// held the .n integer — read back as a pointer, no @inttoptr. The union is now
+// RESET when a partial/compound write changes the active variant, so pp.a is
+// zero, and BUG-1152's load guard traps the null read (on bare metal too).
+i32 printf(const *u8 fmt, ...);
+struct Pp { *u32 a; u32 b; }
+union U { u64 n; Pp pp; }
+u32 secret;
+u32 main() {
+    secret = 7;
+    U w;
+    w.n = (u64)@ptrtoint(&secret);  // an INTEGER, active = .n (no @inttoptr, no mmio)
+    w.pp.b = 1;                     // partial write: tag flips to .pp, pp.a keeps the integer bits
+    switch (w) {
+        .n => |n| { }
+        .pp => |v| { *v.a = 0xBEEF; }   // integer used as a pointer
+    }
+    printf("secret=%x (expected 7)\n", secret);
+    return 0;
+}

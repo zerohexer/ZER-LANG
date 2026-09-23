@@ -1996,6 +1996,119 @@ static bool call_needs_null_funcptr_guard(Emitter *e, Node *callee) {
     return t && type_dispatch_kind(t) == TYPE_FUNC_PTR;
 }
 
+/* ================================================================
+ * BUG-1152 — the non-null pointer LOAD guard
+ *
+ * ZER's `*T` is non-null, and for a SCALAR the promise is structural: `*u32 p;`
+ * is refused (nonnull_zero_hole, BUG-866/893). But auto-zero writes NULL into a
+ * `*T` STRUCT FIELD and a `*T` ARRAY ELEMENT wherever the aggregate is
+ * zero-initialised — `H w;`, `H[2] hs;`, every `alloc(T)` / Pool / Slab / Arena
+ * slot — and nothing refused a read of it. Hosted, the dereference faulted into
+ * the SIGSEGV trap; on BARE METAL address 0 is ordinary memory (the initial SP on
+ * Cortex-M) and the read returned a wrong value, the write corrupted it. Silent
+ * at compile time AND at run time on the target that matters.
+ *
+ * TRACK, do not ban (option (c) of the limitations entry; the BUG-1019 precedent
+ * for funcptrs). Refusing every struct with a non-null field wherever it is
+ * zero-initialised would refuse `alloc(T)` of it outright (the BUG-893 author
+ * measured 34 corpus files); a definite-initialisation analysis is a new
+ * subsystem. The guard is ONE predictable branch.
+ *
+ * WHERE: at the LOAD, not the dereference. Every `*T` that reaches a local, a
+ * param or an operand arrives by one of three loads out of memory — a FIELD, an
+ * array/slice ELEMENT, or a DEREF of `**T` — and a local / param `*T` is non-null
+ * by construction (it needs an initialiser). Guarding the three loads therefore
+ * makes every `*T` value non-null, so no dereference site needs a check and no
+ * laundering route (`*u32 q = h.p; *q`) exists — the reason BUG-1019 could not
+ * guard only INDEX/FIELD callees does not arise, because the guard is on the
+ * load that produces the value, not on its use.
+ *
+ * NOT a load: the assignment TARGET (`h.p = &x`) and the `&` operand (`&h.p`) —
+ * both name the location. A global initialiser (file scope) cannot contain a
+ * statement expression and cannot read a field value anyway.
+ *
+ * Emission: `({ __auto_type _zer_nnN = LOAD; if (!_zer_nnN) _zer_trap(...);
+ * _zer_nnN; })` — LOAD text once, so a nested chain stays linear, and
+ * `__auto_type` drops only the TOP-level qualifier of the pointer value (the
+ * pointee's const/volatile are part of the type and are kept). The IR's own
+ * decomposed loads (IR_FIELD_READ / IR_INDEX_READ / IR_UNOP deref) get the same
+ * check as a statement after the load: emit_nonnull_local_check.
+ * ================================================================ */
+#define ZER_NN_TRAP_MSG "read of a null non-null pointer (a *T field or element that was zero-initialized and never assigned)"
+
+/* BUG-1175: an enum with NO variant whose value is 0. Auto-zero forges a
+ * non-variant value of it wherever it is zero-initialised inside an aggregate
+ * (a bare `E g;` is refused, BUG-930; a struct field, an array element, an
+ * alloc(T) / Pool slot and an omitted designated-init field are not), and the
+ * exhaustive switch then takes an ARM for it. Such a value is guarded at the
+ * same LOAD sites as a non-null pointer: the zero is the only value auto-zero
+ * can produce, and every other forge is guarded at its door. */
+static bool enum_lacks_zero_variant(Type *t) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (!u || type_dispatch_kind(u) != TYPE_ENUM || u->enum_type.variant_count == 0) return false;
+    for (uint32_t i = 0; i < u->enum_type.variant_count; i++)
+        if (u->enum_type.variants[i].value == 0) return false;
+    return true;
+}
+
+/* What a guarded load must check: 0 = nothing, 1 = a non-null pointer,
+ * 2 = a no-zero-variant enum. */
+static int load_guard_kind(Type *t) {
+    if (!t) return 0;
+    if (type_dispatch_kind(t) == TYPE_POINTER) return 1;
+    if (enum_lacks_zero_variant(t)) return 2;
+    return 0;
+}
+
+static bool node_is_nonnull_ptr_load(Emitter *e, Node *n) {
+    if (!n || !e->checker) return false;
+    if (n->kind == NODE_UNARY) {
+        if (n->unary.op != TOK_STAR) return false;
+    } else if (n->kind != NODE_FIELD && n->kind != NODE_INDEX) {
+        return false;
+    }
+    Type *t = checker_get_type(e->checker, n);
+    if (!t) return false;
+    /* An enum's `.variant` spelling is a NODE_FIELD on the enum TYPE, not a
+     * load — only a field of a value/pointer object is. */
+    if (n->kind == NODE_FIELD) {
+        Type *ot = checker_get_type(e->checker, n->field.object);
+        if (ot && type_dispatch_kind(ot) == TYPE_ENUM) return false;
+    }
+    return load_guard_kind(t) != 0;
+}
+
+/* Should this node's emission be wrapped in the load guard? */
+static bool nn_guard_wanted(Emitter *e, Node *n) {
+    if (!n || n == e->nn_bypass || n == e->nn_lvalue) return false;
+    if (e->global_init_depth > 0) return false;
+    return node_is_nonnull_ptr_load(e, n);
+}
+
+/* The location a node WRITES (or names), if it has one: an assignment target,
+ * an `&` operand. Emitted as an lvalue, so never load-guarded. */
+static Node *nn_lvalue_of(Node *n) {
+    if (!n) return NULL;
+    if (n->kind == NODE_ASSIGN) return n->assign.target;
+    if (n->kind == NODE_UNARY && n->unary.op == TOK_AMP) return n->unary.operand;
+    return NULL;
+}
+
+/* `*opaque` is the VALUE struct `_zer_opaque {ptr, type_id}`, not a C
+ * pointer, so its null test reads `.ptr`. */
+static const char *nn_null_member(Type *t) {
+    Type *pt = t ? type_unwrap_distinct(t) : NULL;
+    if (pt && type_dispatch_kind(pt) == TYPE_POINTER && pt->pointer.inner &&
+        type_dispatch_kind(pt->pointer.inner) == TYPE_OPAQUE)
+        return ".ptr";
+    return "";
+}
+#define ZER_ENUM0_TRAP_MSG "read of an enum holding 0, which is not one of its variants (a zero-initialized field or element that was never assigned)"
+
+
+/* The statement form, after an IR load into a local. */
+static void emit_nonnull_local_check(Emitter *e, IRFunc *func, int local_id);
+
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     if (!t) return;
     TypeKind k = type_dispatch_kind(t);
@@ -2430,7 +2543,260 @@ static void emit_int_literal(Emitter *e, Node *node) {
     emit(e, "%llu", v);
 }
 
+/* BUG-1157: does this struct literal name an ARRAY-typed field? C cannot
+ * initialise an array member from an array expression inside a compound
+ * literal — the value decays to a pointer (`.arr = l` put an address in
+ * arr[0]). Such a literal is emitted as a statement expression: the literal
+ * without its array fields, then one memcpy per array field. */
+static bool struct_init_names_array_field(Type *si_type, Node *node) {
+    if (!si_type || !node || node->kind != NODE_STRUCT_INIT) return false;
+    for (int i = 0; i < node->struct_init.field_count; i++) {
+        Type *ft = struct_field_type_by_name(si_type, node->struct_init.fields[i].name,
+                                             (uint32_t)node->struct_init.fields[i].name_len);
+        if (ft && type_dispatch_kind(ft) == TYPE_ARRAY) return true;
+    }
+    return false;
+}
+
+/* BUG-1162/1163/1164: the ONE store path for a non-native-width uN/iN target,
+ * shared by the AST (emit_expr) and IR-rewritten (emit_rewritten_node) paths —
+ * they were two copies of the same intercept and had the same three defects:
+ *   - it ran BEFORE the union-variant case, so `w.t = 5` into a `u3` variant
+ *     never updated `_tag` (switch took the other arm; with a pointer variant
+ *     beside it, a forged pointer) — the tag is now set here;
+ *   - it ran before the bit-slice SET case, so `x[2..1] = 3` on a uN became
+ *     `&(bit-extract rvalue)` — invalid C; a bit-slice target is left to its case;
+ *   - it STORED the unmasked value and then re-masked through the same lvalue:
+ *     two stores and an extra load, so a `volatile u12` register saw an
+ *     out-of-field bit written transiently. The value is now computed and
+ *     masked in a carrier temp and stored ONCE.
+ * Returns false when the target is not this function's business. */
+typedef void (*EmitNodeFn)(Emitter *, Node *, IRFunc *);
+static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f);
+static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en) {
+    Node *tgt = node->assign.target;
+    Type *nn_t = tgt ? checker_get_type(e->checker, tgt) : NULL;
+    if (!type_is_nonnative_intn(nn_t)) return false;
+    if (tgt->kind == NODE_SLICE) return false;          /* bit-slice SET */
+    TokenType aop = node->assign.op;
+    if (!(aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+          aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+          aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ))
+        return false;
+    /* union variant target (value or `*Union` auto-deref)? */
+    Node *uobj = NULL; bool uptr = false; long utag = -1;
+    if (tgt->kind == NODE_FIELD) {
+        Type *ot = checker_get_type(e->checker, tgt->field.object);
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.inner &&
+            type_dispatch_kind(oe->pointer.inner) == TYPE_UNION) {
+            uptr = true; oe = type_unwrap_distinct(oe->pointer.inner);
+        }
+        if (oe && type_dispatch_kind(oe) == TYPE_UNION) {
+            for (uint32_t i = 0; i < oe->union_type.variant_count; i++) {
+                SUVariant *v = &oe->union_type.variants[i];
+                if (v->name_len == (uint32_t)tgt->field.field_name_len &&
+                    memcmp(v->name, tgt->field.field_name, v->name_len) == 0) {
+                    utag = (long)i; break;
+                }
+            }
+            if (utag >= 0) uobj = tgt->field.object;
+        }
+    }
+    int tmp = e->temp_count++;
+    char lv[96];
+    emit(e, "({ ");
+    if (uobj) {
+        emit(e, "__typeof__(");
+        en(e, uobj, func);
+        emit(e, ") %s_zer_up%d = %s(", uptr ? "" : "*", tmp, uptr ? "" : "&");
+        en(e, uobj, func);
+        emit(e, "); _zer_up%d->_tag = %ld; ", tmp, utag);
+        snprintf(lv, sizeof lv, "(_zer_up%d->%.*s)", tmp,
+                 (int)tgt->field.field_name_len, tgt->field.field_name);
+    } else {
+        emit(e, "__typeof__(");
+        en(e, tgt, func);
+        emit(e, ") *_zer_np%d = &(", tmp);
+        en(e, tgt, func);
+        emit(e, "); ");
+        snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+    }
+    char nv[40];
+    snprintf(nv, sizeof nv, "_zer_nv%d", tmp);
+    emit_type(e, nn_t);
+    emit(e, " %s = ", nv);
+    if (aop == TOK_EQ) {
+        emit(e, "(");
+        en(e, node->assign.value, func);
+        emit(e, "); ");
+    } else if (aop == TOK_LSHIFTEQ) {
+        emit(e, "_zer_shl(%s, (", lv);
+        en(e, node->assign.value, func);
+        emit(e, "), %d); ", shift_guard_width(nn_t));
+    } else {
+        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                          aop==TOK_PIPEEQ?"|":"^";
+        emit(e, "(%s %s (", lv, cop);
+        en(e, node->assign.value, func);
+        emit(e, ")); ");
+    }
+    emit_intn_mask_lv(e, nn_t, nv);
+    emit(e, "%s = %s; %s; })", lv, nv, nv);
+    return true;
+}
+
+/* BUG-1166: the ONE runtime type_id a `*opaque` carries for a pointee type —
+ * the tag packed when a `*T` is wrapped and the tag expected when it is
+ * unwrapped. It was seven copies of the same three lines, each answering 0
+ * ("unknown provenance, allow") for every pointee that is not a struct / enum /
+ * union, so a `*u32` wrapped in a function and returned as `*opaque` could be
+ * cast to `*Big` (80 bytes) and written — the runtime check never fires on 0,
+ * and the compile-time provenance is gone once the value crosses a return.
+ * Scalars now get a RESERVED id (high bit set, so it can never collide with
+ * the checker's sequential struct ids); pointer / slice / array / opaque
+ * pointees keep 0 — their representation is not a fixed scalar. 0 is still
+ * what C code (cinclude) produces: the FFI floor is unchanged. */
+static uint32_t opaque_type_id(Type *inner);
+/* @pun's advertised runtime check is NOMINAL — it compares struct / enum /
+ * union ids and treats every other pointee as "no id" (the byte-view idiom
+ * `@pun(const *u64, &s)` relies on that; the checker's
+ * pun_type_id_check_can_fire mirrors exactly this). */
+static uint32_t opaque_type_id_nominal(Type *inner) {
+    if (!inner) return 0;
+    inner = type_unwrap_distinct(inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_UNION) return opaque_type_id(inner);
+    return 0;
+}
+
+static uint32_t opaque_type_id(Type *inner) {
+    if (!inner) return 0;
+    inner = type_unwrap_distinct(inner);
+    if (!inner) return 0;
+    switch (inner->kind) {
+    case TYPE_STRUCT: return inner->struct_type.type_id;
+    case TYPE_ENUM:   return inner->enum_type.type_id;
+    case TYPE_UNION:  return inner->union_type.type_id;
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64: case TYPE_BOOL:
+        return 0x80000000u | ((uint32_t)inner->kind << 8);
+    case TYPE_UINT: case TYPE_SINT:
+        return 0x80000000u | ((uint32_t)inner->kind << 8) | (inner->intn.bits & 0xFFu);
+    case TYPE_VOID: case TYPE_POINTER: case TYPE_OPAQUE: case TYPE_SLICE:
+    case TYPE_ARRAY: case TYPE_OPTIONAL: case TYPE_FUNC_PTR: case TYPE_HANDLE:
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+    case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+        return 0;
+    }
+    return 0;
+}
+
+/* BUG-1161: is this assignment a write INTO a union variant that is not the
+ * whole variant by plain `=` (a compound op, or a sub-field / element write)?
+ * If so, return the union object, whether it is reached through a pointer,
+ * and the variant index. Such a write must first RESET the union when it
+ * changes the active variant, or the union's other bytes (the previous
+ * variant's) are read back as the new one — see the checker's comment at
+ * union_variant_write_is_partial. */
+static Node *union_partial_write_target(Emitter *e, Node *node, bool *is_ptr,
+                                        uint32_t *idx) {
+    if (!node || node->kind != NODE_ASSIGN || !node->assign.target) return NULL;
+    Node *walk = node->assign.target;
+    while (walk) {
+        if (walk->kind == NODE_FIELD) {
+            Type *ot = checker_get_type(e->checker, walk->field.object);
+            Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+            bool ptr = false;
+            if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.inner &&
+                type_dispatch_kind(oe->pointer.inner) == TYPE_UNION) {
+                ptr = true; oe = type_unwrap_distinct(oe->pointer.inner);
+            }
+            if (oe && type_dispatch_kind(oe) == TYPE_UNION) {
+                if (walk == node->assign.target && node->assign.op == TOK_EQ)
+                    return NULL;                      /* whole-variant `=` */
+                for (uint32_t i = 0; i < oe->union_type.variant_count; i++) {
+                    SUVariant *v = &oe->union_type.variants[i];
+                    if (v->name_len == (uint32_t)walk->field.field_name_len &&
+                        memcmp(v->name, walk->field.field_name, v->name_len) == 0) {
+                        *is_ptr = ptr; *idx = i;
+                        return walk->field.object;
+                    }
+                }
+                return NULL;
+            }
+            walk = walk->field.object;
+        } else if (walk->kind == NODE_INDEX) {
+            walk = walk->index_expr.object;
+        } else {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* Emit `(({ reset-if-variant-changes; 0; }), ` before such a write; the caller
+ * emits the assignment itself and then `)`. */
+static void emit_union_reset_prefix(Emitter *e, Node *uobj, bool is_ptr, uint32_t idx,
+                                    IRFunc *func, EmitNodeFn en) {
+    int t = e->temp_count++;
+    emit(e, "(({ __typeof__(");
+    en(e, uobj, func);
+    emit(e, ") %s_zer_ur%d = %s(", is_ptr ? "" : "*", t, is_ptr ? "" : "&");
+    en(e, uobj, func);
+    emit(e, "); if (_zer_ur%d->_tag != %u) { memset(_zer_ur%d, 0, sizeof(*_zer_ur%d)); "
+            "_zer_ur%d->_tag = %u; } 0; }), ", t, idx, t, t, t, idx);
+}
+
+static void emit_expr_impl(Emitter *e, Node *node);
+static void emit_expr_impl_fn(Emitter *e, Node *n, IRFunc *f) {
+    (void)f;
+    emit_expr_impl(e, n);
+}
+
+/* BUG-1152: emit `node` (a guarded load) through `impl` inside the load guard.
+ * ONE function holds both halves of the statement expression, so the emitted
+ * braces stay balanced within it. */
+static void emit_nn_guarded(Emitter *e, Node *node, IRFunc *func, EmitNodeFn impl) {
+    int t = e->temp_count++;
+    Type *ty = checker_get_type(e->checker, node);
+    Node *saved_bp = e->nn_bypass;
+    emit(e, "({ __auto_type _zer_nn%d = ", t);
+    e->nn_bypass = node;
+    impl(e, node, func);
+    e->nn_bypass = saved_bp;
+    emit(e, "; if (!_zer_nn%d%s) _zer_trap(\"%s\", __FILE__, __LINE__); _zer_nn%d; })",
+         t, nn_null_member(ty),
+         load_guard_kind(ty) == 2 ? ZER_ENUM0_TRAP_MSG : ZER_NN_TRAP_MSG, t);
+}
+
+/* BUG-1152: every emit_expr passes through the non-null load guard. */
 static void emit_expr(Emitter *e, Node *node) {
+    if (!node) return;
+    Node *saved_lv = e->nn_lvalue;
+    Node *lv = nn_lvalue_of(node);
+    if (nn_guard_wanted(e, node)) {
+        emit_nn_guarded(e, node, NULL, emit_expr_impl_fn);
+        return;
+    }
+    if (lv) e->nn_lvalue = lv;
+    bool ur_ptr = false; uint32_t ur_idx = 0;
+    Node *ur = e->global_init_depth == 0 ? union_partial_write_target(e, node, &ur_ptr, &ur_idx) : NULL;
+    if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, NULL, emit_node_via_ast);
+    emit_expr_impl(e, node);
+    if (ur) emit(e, ")");
+    e->nn_lvalue = saved_lv;
+}
+
+static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f) {
+    (void)f;
+    emit_expr(e, n);
+}
+
+static void emit_expr_impl(Emitter *e, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
@@ -2773,43 +3139,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * the dedicated cases below and don't carry a scalar uN/iN type here).
          * /= %= >>= can't exceed the width (result magnitude ≤ operand), so they
          * skip this and keep their existing div-guard / shift paths. */
-        {
-            Type *nn_t = checker_get_type(e->checker, node->assign.target);
-            if (type_is_nonnative_intn(nn_t)) {
-                TokenType aop = node->assign.op;
-                if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
-                    aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
-                    aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
-                    int tmp = e->temp_count++;
-                    char lv[40];
-                    snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
-                    emit(e, "({ __typeof__(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, ") *_zer_np%d = &(", tmp);
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); ");
-                    if (aop == TOK_EQ) {
-                        emit(e, "%s = (", lv);
-                        emit_expr(e, node->assign.value);
-                        emit(e, "); ");
-                    } else if (aop == TOK_LSHIFTEQ) {
-                        emit(e, "%s = _zer_shl(%s, (", lv, lv);
-                        emit_expr(e, node->assign.value);
-                        emit(e, "), %d); ", shift_guard_width(nn_t));
-                    } else {
-                        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
-                                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
-                                          aop==TOK_PIPEEQ?"|":"^";
-                        emit(e, "%s = (%s %s (", lv, lv, cop);
-                        emit_expr(e, node->assign.value);
-                        emit(e, ")); ");
-                    }
-                    emit_intn_mask_lv(e, nn_t, lv);
-                    emit(e, "})");
-                    goto assign_done;
-                }
-            }
-        }
+        if (emit_intn_store(e, node, NULL, emit_node_via_ast)) goto assign_done;   /* BUG-1162 */
         /* union variant assignment: msg.sensor = val → set tag first */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
@@ -4106,9 +4436,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t tid = 0;
             if (src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                tid = opaque_type_id(inner);   /* BUG-1166 */
             }
             emit(e, "(_zer_opaque){(void*)(");
             emit_expr(e, node->typecast.expr);
@@ -4122,9 +4450,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t expected_tid = 0;
             if (tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                expected_tid = opaque_type_id(inner);   /* BUG-1166 */
             }
             if (expected_tid > 0) {
                 int tmp = e->temp_count++;
@@ -4181,16 +4507,30 @@ static void emit_expr(Emitter *e, Node *node) {
         /* Designated initializer: emit as C99 compound literal (Type){ .x = 1 }
          * Works in both var-decl init and assignment contexts. */
         Type *si_type = checker_get_type(e->checker, node);
+        bool si_arr = e->global_init_depth == 0 &&
+                      struct_init_names_array_field(si_type, node);   /* BUG-1157 */
+        int si_tmp = si_arr ? e->temp_count++ : 0;
+        if (si_arr) {
+            emit(e, "({ ");
+            emit_type(e, si_type);
+            emit(e, " _zer_si%d = ", si_tmp);
+        }
         if (si_type) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
         }
         emit(e, "{ ");
+        bool si_first = true;
         for (int i = 0; i < node->struct_init.field_count; i++) {
-            if (i > 0) emit(e, ", ");
             const char *fname = node->struct_init.fields[i].name;
             uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            if (si_arr) {
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (aft && type_dispatch_kind(aft) == TYPE_ARRAY) continue;
+            }
+            if (!si_first) emit(e, ", ");
+            si_first = false;
             emit(e, ".%.*s = ", (int)fname_len, fname);
             Node *fval = node->struct_init.fields[i].value;
             Type *fv_type = checker_get_type(e->checker, fval);
@@ -4208,7 +4548,20 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, fval);
             }
         }
+        if (si_first && si_arr) emit(e, "0");
         emit(e, " }");
+        if (si_arr) {
+            for (int i = 0; i < node->struct_init.field_count; i++) {
+                const char *fname = node->struct_init.fields[i].name;
+                uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
+                emit(e, "; memcpy(&_zer_si%d.%.*s, &(", si_tmp, (int)fname_len, fname);
+                emit_expr(e, node->struct_init.fields[i].value);
+                emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
+            }
+            emit(e, "; _zer_si%d; })", si_tmp);
+        }
         break;
     }
 
@@ -4289,9 +4642,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 uint32_t tid = 0;
                 if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
@@ -4304,9 +4655,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
@@ -4363,9 +4712,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t src_tid = 0;
             if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+                src_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             } else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
                 /* source already *opaque — its type_id flows through directly */
                 src_tid = 0; /* will be read from the source's actual struct field */
@@ -4375,9 +4722,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t tgt_tid = 0;
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+                tgt_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             /* If source is already *opaque, reuse its existing type_id and just
@@ -7380,6 +7725,20 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
 
+/* BUG-1152: the statement form of the non-null load guard — after an IR load
+ * (field / element / deref) whose destination is a non-optional `*T`. */
+static void emit_nonnull_local_check(Emitter *e, IRFunc *func, int local_id) {
+    if (local_id < 0 || local_id >= func->local_count) return;
+    Type *t = func->locals[local_id].type;
+    int gk = load_guard_kind(t);
+    if (!gk) return;
+    /* Same C line as the load, so the trap's __LINE__ is the load's #line. */
+    emit(e, " if (!");
+    emit_local_name(e, func, local_id);
+    emit(e, "%s) _zer_trap(", nn_null_member(t));
+    emit(e, "\"%s\", __FILE__, __LINE__);", gk == 2 ? ZER_ENUM0_TRAP_MSG : ZER_NN_TRAP_MSG);
+}
+
 /* ================================================================
  * Builtin Call Emitter — emit pool/slab/ring/arena/Task inline C
  * Extracted from emit_expr NODE_CALL. Uses emit_rewritten_node for args.
@@ -7812,7 +8171,27 @@ static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func) {
     emit(e, ")(uintptr_t)_zer_ma%d; })", tmp);
 }
 
+static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func);
+
+/* BUG-1152: the IR-rewritten path passes through the same load guard. */
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
+    if (!node) return;
+    Node *saved_lv = e->nn_lvalue;
+    Node *lv = nn_lvalue_of(node);
+    if (nn_guard_wanted(e, node)) {
+        emit_nn_guarded(e, node, func, emit_rewritten_node_impl);
+        return;
+    }
+    if (lv) e->nn_lvalue = lv;
+    bool ur_ptr = false; uint32_t ur_idx = 0;
+    Node *ur = union_partial_write_target(e, node, &ur_ptr, &ur_idx);
+    if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, func, emit_rewritten_node);
+    emit_rewritten_node_impl(e, node, func);
+    if (ur) emit(e, ")");
+    e->nn_lvalue = saved_lv;
+}
+
+static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
     switch (node->kind) {
@@ -8510,40 +8889,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * are handled by the dedicated cases below and don't carry a scalar
          * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
          * operand) so they keep their existing div-guard / shift paths. */
-        if (type_is_nonnative_intn(tgt_type)) {
-            TokenType aop = node->assign.op;
-            if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
-                aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
-                aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
-                int tmp = e->temp_count++;
-                char lv[40];
-                snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
-                emit(e, "({ __typeof__(");
-                emit_rewritten_node(e, node->assign.target, func);
-                emit(e, ") *_zer_np%d = &(", tmp);
-                emit_rewritten_node(e, node->assign.target, func);
-                emit(e, "); ");
-                if (aop == TOK_EQ) {
-                    emit(e, "%s = (", lv);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, "); ");
-                } else if (aop == TOK_LSHIFTEQ) {
-                    emit(e, "%s = _zer_shl(%s, (", lv, lv);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, "), %d); ", shift_guard_width(checker_get_type(e->checker, node->assign.target)));
-                } else {
-                    const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
-                                      aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
-                                      aop==TOK_PIPEEQ?"|":"^";
-                    emit(e, "%s = (%s %s (", lv, lv, cop);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, ")); ");
-                }
-                emit_intn_mask_lv(e, tgt_type, lv);
-                emit(e, "})");
-                return;
-            }
-        }
+        if (emit_intn_store(e, node, func, emit_rewritten_node)) return;   /* BUG-1162 */
 
         /* BUG-582: Union variant assignment — port from emit_expr (line 1210+)
          * with extension: also handle `u.variant[i] = val` and deeper chains
@@ -9244,9 +9590,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 uint32_t tid = 0;
                 if (src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
@@ -9261,9 +9605,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
@@ -9306,17 +9648,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             uint32_t src_tid = 0;
             if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+                src_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             uint32_t tgt_tid = 0;
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+                tgt_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             bool src_is_opaque = (src_eff &&
@@ -11487,16 +11825,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     case NODE_STRUCT_INIT: {
         /* Should be handled by IR_STRUCT_INIT_DECOMP, but fallback */
         Type *si_type = checker_get_type(e->checker, node);
+        bool si_arr = e->global_init_depth == 0 &&
+                      struct_init_names_array_field(si_type, node);   /* BUG-1157 */
+        int si_tmp = si_arr ? e->temp_count++ : 0;
+        if (si_arr) {
+            emit(e, "({ ");
+            emit_type(e, si_type);
+            emit(e, " _zer_si%d = ", si_tmp);
+        }
         if (si_type) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
         }
         emit(e, "{ ");
+        bool si_first = true;
         for (int i = 0; i < node->struct_init.field_count; i++) {
-            if (i > 0) emit(e, ", ");
             const char *fname = node->struct_init.fields[i].name;
             uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            if (si_arr) {
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (aft && type_dispatch_kind(aft) == TYPE_ARRAY) continue;
+            }
+            if (!si_first) emit(e, ", ");
+            si_first = false;
             emit(e, ".%.*s = ", (int)fname_len, fname);
             Node *fval = node->struct_init.fields[i].value;
             /* F21: wrap a scalar into a value-optional field {val,1} (the
@@ -11528,7 +11880,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, fval, func);
             }
         }
+        if (si_first && si_arr) emit(e, "0");
         emit(e, " }");
+        if (si_arr) {
+            for (int i = 0; i < node->struct_init.field_count; i++) {
+                const char *fname = node->struct_init.fields[i].name;
+                uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
+                emit(e, "; memcpy(&_zer_si%d.%.*s, &(", si_tmp, (int)fname_len, fname);
+                emit_rewritten_node(e, node->struct_init.fields[i].value, func);
+                emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
+            }
+            emit(e, "; _zer_si%d; })", si_tmp);
+        }
         return;
     }
 
@@ -13640,7 +14005,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_local_name(e, func, inst->dest_local);
                 emit(e, " = *");
                 emit_local_name(e, func, inst->src1_local);
-                emit(e, ";\n");
+                emit(e, ";");
+                emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+                emit(e, "\n");
                 goto unop_done;
             case TOK_AMP: /* addr-of */
                 emit_indent(e);
@@ -13681,8 +14048,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
             emit_local_name(e, func, inst->src1_local);
-            emit(e, "%s%.*s;\n", accessor,
+            emit(e, "%s%.*s;", accessor,
                  (int)inst->field_name_len, inst->field_name);
+            emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+            emit(e, "\n");
         }
         break;
     }
@@ -13713,13 +14082,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, ".ptr)[");
                 emit_local_name(e, func, inst->src2_local);
-                emit(e, "];\n");
+                emit(e, "];");
             } else {
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "[");
                 emit_local_name(e, func, inst->src2_local);
-                emit(e, "];\n");
+                emit(e, "];");
             }
+            emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+            emit(e, "\n");
         }
         break;
     }
@@ -13759,9 +14130,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 uint32_t tid = 0;
                 if (src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 emit_local_name(e, func, inst->src1_local);
@@ -13776,9 +14145,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0 && inst->src1_local >= 0) {
                     int tmp = e->temp_count++;
@@ -13853,10 +14220,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, " = (");
             emit_type(e, inst->cast_type);
             emit(e, "){ ");
+            /* BUG-1157: an ARRAY-typed field cannot be initialised from an
+             * array expression inside a C compound literal (the array decays
+             * to a pointer: `.arr = l` initialised arr[0] with an address, and
+             * a global array `.arr = garr` fell to the `0` fallback). Such
+             * fields are left out of the literal (zeroed) and copied by
+             * memcpy right after it. */
+            bool any_arr_field = false;
+            bool first_field = true;
             for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
-                if (i > 0) emit(e, ", ");
                 const char *fname = inst->expr->struct_init.fields[i].name;
                 uint32_t fname_len = (uint32_t)inst->expr->struct_init.fields[i].name_len;
+                Type *fty_arr = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                if (fty_arr && type_dispatch_kind(fty_arr) == TYPE_ARRAY) {
+                    any_arr_field = true;
+                    continue;
+                }
+                if (!first_field) emit(e, ", ");
+                first_field = false;
                 emit(e, ".%.*s = ", (int)fname_len, fname);
                 if (inst->call_arg_locals && i < inst->call_arg_local_count &&
                     inst->call_arg_locals[i] >= 0) {
@@ -13904,10 +14285,61 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         }
                     }
                 } else {
-                    emit(e, "0"); /* fallback */
+                    /* BUG-1157: the value did not lower to a local (a GLOBAL
+                     * array, an array FIELD, …). This used to emit a literal
+                     * `0` — `R r = { .s = ga };` gave r.s.len == 0, silently.
+                     * Emit the rewritten expression itself, with the same
+                     * array->slice coercion the local path applies. */
+                    Node *fv = inst->expr->struct_init.fields[i].value;
+                    Type *fvt = fv ? checker_get_type(e->checker, fv) : NULL;
+                    Type *fvte = fvt ? type_unwrap_distinct(fvt) : NULL;
+                    Type *ftype = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                    Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
+                                                         fname_len, fvt);
+                    Type *wt_eff = wt ? type_unwrap_distinct(wt) : NULL;
+                    Type *wi = (wt_eff && type_dispatch_kind(wt_eff) == TYPE_OPTIONAL &&
+                                wt_eff->optional.inner)
+                               ? type_unwrap_distinct(wt_eff->optional.inner) : NULL;
+                    Type *slice_tgt = wt ? wi : aggregate_slice_coerce_target(ftype, fvt);
+                    bool arr_to_slice = slice_tgt && type_dispatch_kind(slice_tgt) == TYPE_SLICE &&
+                                        fvte && type_dispatch_kind(fvte) == TYPE_ARRAY;
+                    if (wt) { emit(e, "("); emit_type(e, wt); emit(e, "){ "); }
+                    if (arr_to_slice) {
+                        emit(e, "(");
+                        emit_type(e, slice_tgt);
+                        emit(e, "){ ");
+                        emit_rewritten_node(e, fv, func);
+                        emit(e, ", %u }", (unsigned)fvte->array.size);
+                    } else if (fv) {
+                        emit_rewritten_node(e, fv, func);
+                    } else {
+                        emit(e, "0");
+                    }
+                    if (wt) emit(e, ", 1 }");
                 }
             }
+            if (first_field) emit(e, "0");
             emit(e, " };\n");
+            if (any_arr_field) {
+                for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
+                    const char *fname = inst->expr->struct_init.fields[i].name;
+                    uint32_t fname_len = (uint32_t)inst->expr->struct_init.fields[i].name_len;
+                    Type *fty_arr = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                    if (!fty_arr || type_dispatch_kind(fty_arr) != TYPE_ARRAY) continue;
+                    emit_indent(e);
+                    emit(e, "memcpy(&");
+                    emit_local_name(e, func, inst->dest_local);
+                    emit(e, ".%.*s, &", (int)fname_len, fname);
+                    if (inst->call_arg_locals && i < inst->call_arg_local_count &&
+                        inst->call_arg_locals[i] >= 0)
+                        emit_local_name(e, func, inst->call_arg_locals[i]);
+                    else
+                        emit_rewritten_node(e, inst->expr->struct_init.fields[i].value, func);
+                    emit(e, ", sizeof(");
+                    emit_local_name(e, func, inst->dest_local);
+                    emit(e, ".%.*s));\n", (int)fname_len, fname);
+                }
+            }
         }
         break;
     }

@@ -1,0 +1,8 @@
+// expect-error: deadlock
+// BUG-1156: a braceless `defer stmt;` body skipped the per-statement lock
+// checks (it was a bare expression statement, not a block).
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void f() { defer a.x = b.y; }
+u32 main() { f(); return 0; }

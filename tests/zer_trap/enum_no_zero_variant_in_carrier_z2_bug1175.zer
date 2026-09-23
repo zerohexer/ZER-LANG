@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: read of an enum holding 0
+// expect-trap-at: 10
+// BUG-1175: an enum with no zero variant, zero-initialized inside an aggregate,
+// took a switch ARM (the last-arm elision) silently.
+enum E { a = 5, b = 6 }
+struct S { E e; }
+u32 main() {
+    S s;
+    switch (s.e) { .a => { return 10; } .b => { return 11; } }
+    return 0;
+}

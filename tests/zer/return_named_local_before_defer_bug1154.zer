@@ -1,0 +1,32 @@
+// BUG-1154: `return v;` of a bare named local read v AFTER the defers had
+// run (the IR returned v's own slot, not a snapshot), so a defer that writes
+// v changed the returned value. BUG-442: the return value is evaluated BEFORE
+// defers fire. With a VRP-proven return range this was a silent OOB write at
+// the caller: the range was proven for the pre-defer value.
+struct B { u32[4] tbl; u32 secret; }
+B b;
+
+u32 plain() { u32 v = 4; defer v = 8; return v; }
+u32 param(u32 p) { defer p = 9; return p; }
+struct P { u32 x; }
+P rstruct() { P s; s.x = 4; defer s.x = 8; return s; }
+?u32 ropt() { u32 v = 4; defer v = 8; return v; }
+
+u32 slot(u32 h) {
+    u32 i = h % 4;
+    defer i = 4;
+    return i;
+}
+
+u32 main() {
+    b.secret = 7;
+    b.tbl[slot(1)] = 0xBEEF;
+    if (b.secret != 7) { return 1; }
+    if (b.tbl[1] != 0xBEEF) { return 2; }
+    if (plain() != 4) { return 3; }
+    if (param(4) != 4) { return 4; }
+    if (rstruct().x != 4) { return 5; }
+    u32 o = ropt() orelse 0;
+    if (o != 4) { return 6; }
+    return 0;
+}

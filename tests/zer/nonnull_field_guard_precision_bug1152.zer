@@ -1,0 +1,36 @@
+// BUG-1152: the non-null pointer LOAD guard must not fire on assigned fields,
+// must not wrap an assignment TARGET or an `&` operand (both name a location),
+// and must keep `*opaque` (a {ptr,type_id} struct) compiling.
+struct V { u32 v; }
+struct H { u32 a; *V p; *u32 q; }
+struct O { *opaque ctx; }
+V gv;
+u32 gk = 7;
+H gh;
+
+u32 via(*H h) { return h.p.v + *h.q; }
+
+u32 main() {
+    V x;
+    u32 k = 7;
+    H w;
+    w.p = &x;
+    w.q = &k;
+    w.p.v = 5;
+    *V y = w.p;
+    y.v += 1;
+    **u32 pq = &w.q;
+    gh.p = &gv;
+    gh.q = &gk;
+    gh.p.v = 3;
+    *H hp = alloc(H) orelse return;
+    hp.p = &gv;
+    hp.q = &gk;
+    O o;
+    o.ctx = @ptrcast(*opaque, &gv);
+    *V back = @ptrcast(*V, o.ctx);
+    u32 r = via(&w) + via(hp) + gh.p.v + *w.q + back.v;
+    free(hp);
+    if (r != 13 + 10 + 3 + 7 + 3) { return 1; }
+    return 0;
+}

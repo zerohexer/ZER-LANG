@@ -63,6 +63,11 @@ typedef struct {
      * `static u32 retries = 3;` returned 0 on every call). NULL for
      * non-static locals and for static locals declared without init. */
     Node *static_init;
+
+    /* BUG-1154: the RETURN-VALUE snapshot of a named local (taken before the
+     * defers fire) is a temp; diagnostics about it name the local it copies.
+     * local id + 1, 0 = not a snapshot. */
+    int snapshot_of_plus1;
 } IRLocal;
 
 /* ================================================================

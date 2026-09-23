@@ -1457,6 +1457,30 @@ static bool ir_local_is_aggregate(IRFunc *func, int local) {
  * used to be marked, so `H make(){ H h; h.p = alloc(T) orelse return; return h; }`
  * was a false "never freed". Same rule at every caller (global store,
  * variable-index store, return, orelse fallback, struct-init field). */
+/* BUG-1173: a returned by-value aggregate carries its FIELD entries out with
+ * it. The return check looked at the returned local's BARE entry only, so
+ * `W w = { .p = a }; free(a); return w;` (and the `defer free(a)` spelling)
+ * handed the caller a struct holding a dangling pointer. Check every compound
+ * entry rooted at the returned local, with the same verdict as the bare one. */
+static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
+                                 const char *path, uint32_t plen);
+static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h);
+static void ir_check_returned_compounds(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                        int local_id, int line) {
+    if (local_id < 0) return;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *h = &ps->handles[i];
+        if (h->local_id != local_id || h->path_len == 0) continue;
+        if (!ir_is_invalid(h) || ir_use_guard_disjoint(zc, h)) continue;
+        ir_zc_error_for(zc, func, local_id, line,
+            "returning a value whose %s is a %s pointer (freed at line %d) — "
+            "the caller would receive a dangling pointer",
+            ir_local_desc(zc, func, local_id, h->path, h->path_len),
+            ir_state_name(h->state), h->free_line);
+        return;   /* one report per return */
+    }
+}
+
 static void ir_mark_local_escaped(IRPathState *ps, int local_id) {
     if (local_id < 0) return;
     for (int i = 0; i < ps->handle_count; i++)
@@ -4598,7 +4622,14 @@ static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
  * the defer-body scanner — `defer arena.reset()` must invalidate arena handles
  * the same way a direct `arena.reset()` does. Two-pass (snapshot alloc_ids,
  * then mark) so aliases with ZC_COLOR_UNKNOWN are also caught. */
+static void ir_mark_arena_handles_state(IRPathState *ps, int line, int new_state);
 static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
+    ir_mark_arena_handles_state(ps, line, IR_HS_FREED);
+}
+/* BUG-1172: the same two-pass alias-group walk, with the resulting state as a
+ * parameter — FREED for a reset that certainly ran, MAYBE_FREED for an
+ * indirect call that may reach one. */
+static void ir_mark_arena_handles_state(IRPathState *ps, int line, int new_state) {
     int aid_cap = ps->handle_count > 0 ? ps->handle_count : 1;
     int *aids = (int *)malloc((size_t)aid_cap * sizeof(int));
     if (!aids) return;
@@ -4613,7 +4644,7 @@ static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
         if (h->state != IR_HS_ALIVE) continue;
         for (int ai = 0; ai < aid_count; ai++) {
             if (h->alloc_id == aids[ai]) {
-                h->state = IR_HS_FREED;
+                h->state = new_state;
                 h->free_line = line;
                 break;
             }
@@ -4626,6 +4657,19 @@ static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
  * (NODE_FIELD callee, method "reset"/"unsafe_reset"). Mirrors ir_defer_free_arg
  * shape. Used by the defer scanner so a deferred reset invalidates arena
  * handles. */
+/* BUG-1172: does this reset call's RECEIVER name an arena the CURRENT
+ * function owns (a non-param local `Arena a;`)? Anything else — a global, a
+ * field of a param, a field of a global — is the caller's arena too. */
+static bool ir_reset_receiver_is_own_local(IRFunc *func, Node *call) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee ||
+        call->call.callee->kind != NODE_FIELD) return false;
+    Node *r = call->call.callee->field.object;
+    if (!r || r->kind != NODE_IDENT) return false;
+    int lid = ir_find_local(func, r->ident.name, (uint32_t)r->ident.name_len);
+    if (lid < 0) return false;
+    return !func->locals[lid].is_param;
+}
+
 static bool ir_defer_is_arena_reset(Node *node) {
     if (!node || node->kind != NODE_EXPR_STMT || !node->expr_stmt.expr) return false;
     Node *call = node->expr_stmt.expr;
@@ -4898,8 +4942,11 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
      * every arena-colored handle, exactly like a direct reset. Without this a
      * `defer arena.reset(); defer use(p);` (or just leak detection on an
      * arena handle freed only via deferred reset) was blind. */
-    if (ir_defer_is_arena_reset(body))
+    if (ir_defer_is_arena_reset(body)) {
         ir_mark_arena_handles_freed(ps, defer_line);
+        if (!ir_reset_receiver_is_own_local(func, body->expr_stmt.expr))
+            zc->cur_resets_arena = true;                      /* BUG-1172 */
+    }
 
     /* Recurse into block AND nested control-flow bodies (BUG-608).
      * Conservative: any reachable free inside defer marks handle FREED.
@@ -5229,6 +5276,20 @@ static bool ir_call_is_indirect(ZerCheck *zc, IRFunc *func, Node *call) {
  * conservative-proxy stance of call_has_nonkeep_derived_arg. */
 static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
                                      IRPathState *ps, Node *call, int line) {
+    /* BUG-1172: an unknown callee may be one that resets an arena. The arena is
+     * not HANDED to it (it is a global), so the argument-precise rule below
+     * cannot see it — but a reset reaches every arena allocation. Widen the
+     * arena-coloured handles to MAYBE_FREED whenever SOME function in this
+     * program resets a non-local arena (programs without one pay nothing). */
+    {
+        bool any_reset = false;
+        for (int si = 0; si < zc->summary_count && !any_reset; si++)
+            any_reset = zc->summaries[si].resets_arena;
+        if (any_reset) {
+            zc->cur_resets_arena = true;
+            ir_mark_arena_handles_state(ps, line, IR_HS_MAYBE_FREED);
+        }
+    }
     for (int ai = 0; ai < call->call.arg_count; ai++) {
         Node *arg = call->call.args[ai];
         if (!arg) continue;
@@ -5300,6 +5361,10 @@ static const char *ir_local_desc(ZerCheck *zc, IRFunc *func, int id,
     const char *nm = NULL;
     uint32_t nl = 0;
     bool temp = false;
+    if (id >= 0 && id < func->local_count && func->locals[id].is_temp &&
+        func->locals[id].snapshot_of_plus1 > 0 &&
+        func->locals[id].snapshot_of_plus1 <= func->local_count)
+        id = func->locals[id].snapshot_of_plus1 - 1;   /* BUG-1154 */
     if (id >= 0 && id < func->local_count) {
         nm = func->locals[id].name;
         nl = (uint32_t)func->locals[id].name_len;
@@ -6146,7 +6211,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     free(_idx);
                 }
             }
-            if (!h && root_local < func->local_count) {
+            if (!h && root_local >= 0 && root_local < func->local_count) {   /* a GLOBAL root is IR_GLOBAL_ROOT_ID (-2) */
                 /* Auto-register move-struct args (bare or compound) so
                  * TRANSFERRED can be observed. For compound paths, walk
                  * the root local type and verify the targeted field is
@@ -8151,6 +8216,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 }
                 /* BUG-981: the compounds a returned by-value aggregate
                  * carries leave with it (same as case (a) below). */
+                ir_check_returned_compounds(zc, func, ps, ret_local_direct,
+                                            inst->source_line);   /* BUG-1173 */
                 ir_mark_local_escaped(ps, ret_local_direct);
             }
         }
@@ -8189,6 +8256,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     }
                     /* BUG-981: the bare entry AND the compounds a returned
                      * by-value aggregate carries all leave with it. */
+                    ir_check_returned_compounds(zc, func, ps, ret_local,
+                                                inst->source_line);   /* BUG-1173 */
                     ir_mark_local_escaped(ps, ret_local);
                 }
             }
@@ -8445,6 +8514,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                  * now ir_mark_arena_handles_freed, shared with the defer-body
                  * scanner so a deferred arena.reset() behaves identically. */
                 ir_mark_arena_handles_freed(ps, inst->source_line);
+                if (!ir_reset_receiver_is_own_local(func, inst->expr))
+                    zc->cur_resets_arena = true;                  /* BUG-1172 */
                 break;
             }
             if ((mc == IRMC_FREE || mc == IRMC_FREE_PTR) &&
@@ -8964,6 +9035,14 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         }
 
         if (!summary) break;
+
+        /* BUG-1172: the callee resets a non-local arena — every arena-coloured
+         * handle of THIS function is freed across the call, exactly as if the
+         * reset were written here; and this function now resets one too. */
+        if (summary->resets_arena) {
+            ir_mark_arena_handles_freed(ps, inst->source_line);
+            zc->cur_resets_arena = true;
+        }
 
         /* Phase D7: if callee returns an ARENA-colored pointer, tag the
          * call's dest local so it's skipped in leak detection. Propagates
@@ -9774,6 +9853,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     /* BUG-1130: the trackable-index cache is per analysis of ONE function —
      * never trust it across calls (an IRFunc address can be reused). */
     _ir_kx_func = NULL;
+    zc->cur_resets_arena = false;   /* BUG-1172 */
     if (!zc->building_summary)
         ZTRACE("CHECK  zercheck_ir: '%.*s'  (%d blocks, %d locals) -- handle-lattice fixpoint",
                (int)func->name_len, func->name, func->block_count, func->local_count);
@@ -10186,7 +10266,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             IRBlock *bb = &func->blocks[bi];
             if (!ir_block_is_live_return(func, bi)) continue;   /* BUG-1070 */
             IRInst *last = &bb->insts[bb->inst_count - 1];
-            if (bb->is_orelse_fallback) continue;
+            /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
             /* BUG-848: `is_early_exit` is a LEAK-COVERAGE tag ("this path is not
              * the canonical exit"), NOT a statement about the returned VALUE. An
              * early `if (c) { return arena_thing; }` hands its value to the
@@ -10241,7 +10324,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 IRBlock *bb = &func->blocks[bi];
                 if (!ir_block_is_live_return(func, bi)) continue;   /* BUG-1070 */
                 IRInst *last = &bb->insts[bb->inst_count - 1];
-                if (bb->is_orelse_fallback) continue;
+                /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
                 /* BUG-848: do NOT skip is_early_exit here — see the ARENA loop
                  * above. Measured hole: `[*]u8 pick([*]u8 a,[*]u8 b,bool f){ if
                  * (f) { return b[0..1]; } return a[0..1]; }` had its `b` return
@@ -10550,7 +10636,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             for (int bi = 0; bi < func->block_count; bi++) {
                 IRBlock *bb = &func->blocks[bi];
                 if (!ir_block_is_live_return(func, bi)) continue;
-                if (bb->is_orelse_fallback) continue;
+                /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
                 IRInst *last = &bb->insts[bb->inst_count - 1];
                 int rlocal = -1;
                 if (last->src1_local >= 0) rlocal = last->src1_local;
@@ -10613,7 +10702,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 for (int bi = 0; rpl.n > 0 && bi < func->block_count; bi++) {
                     IRBlock *bb = &func->blocks[bi];
                     if (!ir_block_is_live_return(func, bi)) continue;
-                    if (bb->is_orelse_fallback) continue;
+                    /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
                     IRInst *last = &bb->insts[bb->inst_count - 1];
                     int rlocal = last->src1_local >= 0 ? last->src1_local :
                         (last->expr && last->expr->kind == NODE_IDENT)
@@ -10684,7 +10776,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 for (int bi = 0; bi < func->block_count; bi++) {
                     IRBlock *bb = &func->blocks[bi];
                     if (!ir_block_is_live_return(func, bi)) continue;
-                    if (bb->is_orelse_fallback) continue;
+                    /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
                     IRInst *last = &bb->insts[bb->inst_count - 1];
                     int rlocal = last->src1_local >= 0 ? last->src1_local :
                         (last->expr && last->expr->kind == NODE_IDENT)
@@ -10753,7 +10848,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
              * value (see the ARENA loop). Skipping it let an early-exit param
              * VIEW keep ret_is_content=true, which suppresses the caller's
              * tracking of exactly the class ret_is_content exists to preserve. */
-            if (bb->is_orelse_fallback) continue;
+            /* BUG-1155: an orelse FALLBACK block's return is a real return
+             * (`m orelse { return b; }`) — skipping it dropped a param view
+             * from the summary. A bare `orelse return` carries no value and is
+             * skipped by the no-value test below. */
             /* void return (no value) — irrelevant to a pointer-return borrow */
             if (last->src1_local < 0 && !last->expr) continue;
             real_return_count++;
@@ -10793,6 +10891,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->returns_all_views != returns_all_views_final) changed = true;
             if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
             if (existing->ret_is_content != ret_is_content_final) changed = true;
+            if (existing->resets_arena != zc->cur_resets_arena) changed = true;   /* BUG-1172 */
             if (existing->ret_field_n != rf_n) changed = true;
             for (int k = 0; !changed && k < rf_n; k++)
                 if (existing->ret_field[k].param != rf[k].param ||
@@ -10818,6 +10917,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->returns_all_views = returns_all_views_final;
                 existing->ret_is_borrow = ret_is_borrow_final;
                 existing->ret_is_content = ret_is_content_final;
+                existing->resets_arena = zc->cur_resets_arena;
             } else {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);
@@ -10848,6 +10948,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->returns_all_views = returns_all_views_final;
                 s->ret_is_borrow = ret_is_borrow_final;
                 s->ret_is_content = ret_is_content_final;
+                s->resets_arena = zc->cur_resets_arena;   /* BUG-1172 */
                 s->ret_field_n = rf_n;
                 s->ret_field = ir_ret_field_copy(zc, rf, rf_n);
             } else {
@@ -11158,6 +11259,50 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 continue;
             }
+            /* BUG-1173: the OUT-PARAM twin of the rule above. A field reached
+             * through a POINTER parameter (`out.p = a; free(a);`) is the
+             * CALLER's memory: returning with it definitely FREED hands the
+             * caller a dangling pointer it will read (measured: the next alloc
+             * returned the same bytes). A by-value param is the callee's own
+             * copy, so only a pointer param counts. Same hygiene fix: reset
+             * the field (`out.p = &something;`) or free after the return. */
+            bool own_alloc = false;
+            /* Only an allocation made HERE: freeing a field the CALLER put there
+             * (`void kv_free(*Kv t) { free(t.buckets); free(t); }`) is a hand-off
+             * the frees_param_field summary reports at the call site. */
+            if (h->local_id >= 0 && h->local_id < func->local_count &&
+                func->locals[h->local_id].is_param && h->path_len > 0 &&
+                h->state == IR_HS_FREED) {
+                for (int oi = 0; oi < ps->handle_count && !own_alloc; oi++) {
+                    IRHandleInfo *o = &ps->handles[oi];
+                    if (o == h || o->alloc_id != h->alloc_id || o->local_id < 0 ||
+                        o->local_id >= func->local_count) continue;
+                    if (!func->locals[o->local_id].is_param) own_alloc = true;
+                }
+            }
+            if (own_alloc &&
+                type_dispatch_kind(func->locals[h->local_id].type) == TYPE_POINTER) {
+                bool p_already = false;
+                for (int ri = 0; ri < reported_n; ri++)
+                    if (reported_ids[ri] == h->alloc_id) { p_already = true; break; }
+                if (!p_already) {
+                    ir_zc_error_for(zc, func, h->local_id, last->source_line,
+                        "returning while %s — reached through a pointer parameter, so "
+                        "it is the caller's — holds a pointer freed at line %d; the "
+                        "caller would read a dangling pointer. Store something live "
+                        "there before returning",
+                        ir_local_desc(zc, func, h->local_id, h->path, h->path_len),
+                        h->free_line);
+                    if (reported_n >= reported_cap) {
+                        reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                        int *nr = (int *)realloc(reported_ids, reported_cap * sizeof(int));
+                        if (nr) reported_ids = nr;
+                    }
+                    if (reported_n < reported_cap)
+                        reported_ids[reported_n++] = h->alloc_id;
+                }
+                continue;
+            }
             if (h->escaped) continue;
             if (h->source_color == ZC_COLOR_ARENA) continue;
             /* bh18_1b: move-local handle and its pointer aliases are not
@@ -11315,7 +11460,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         IRBlock *bb = &func->blocks[bi];
         if (!ir_block_is_live_return(func, bi)) continue;   /* BUG-1070 */
         IRInst *last = &bb->insts[bb->inst_count - 1];
-        if (bb->is_orelse_fallback) continue;
+        /* BUG-1155: an orelse fallback is NOT a path on which no thread was
+         * spawned — only when the orelse SUBJECT is the spawn, and a spawn is
+         * never optional. `ThreadHandle th = spawn w(&b); u32 v = maybe(k)
+         * orelse return; th.join();` returned with the thread still writing
+         * into the dead frame. (BUG-1071 removed the same skip from the leak
+         * check.) */
         IRPathState *ps = &block_states[bi];
         for (int ti = 0; ti < ps->thread_count; ti++) {
             IRThreadTrack *t = &ps->threads[ti];

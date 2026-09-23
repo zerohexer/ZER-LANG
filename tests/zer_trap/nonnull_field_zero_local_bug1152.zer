@@ -1,0 +1,14 @@
+// expect-trap
+// expect-trap-msg: read of a null non-null pointer
+// expect-trap-at: 13
+// BUG-1152: a `*T` FIELD of a zero-initialized struct is NULL. `*u32 p;` is
+// refused (nonnull_zero_hole), but `H w;` zero-fills w.p and nothing refused
+// the read. Hosted it faulted into the SIGSEGV handler; on bare metal address
+// 0 is ordinary memory and the read returned a wrong value silently. The load
+// of a non-null pointer out of memory is now guarded.
+struct H { u32 a; *u32 p; }
+
+u32 main() {
+    H w;
+    return *w.p;
+}

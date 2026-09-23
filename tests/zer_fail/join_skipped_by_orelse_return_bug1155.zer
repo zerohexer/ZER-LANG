@@ -1,0 +1,15 @@
+// expect-error: not joined
+// BUG-1155: a ThreadHandle join skipped by an orelse-return fallback was excused
+// (the join check skipped every orelse fallback block); the thread wrote into
+// the returned frame.
+struct B { u32[4] d; }
+void work(*B b) { b.d[0] = 1; }
+?u32 maybe(u32 x) { if (x > 0) { return x; } return null; }
+u32 f(u32 k) {
+    B b;
+    ThreadHandle th = spawn work(&b);
+    u32 v = maybe(k) orelse return;
+    th.join();
+    return v;
+}
+u32 main() { return f(0); }

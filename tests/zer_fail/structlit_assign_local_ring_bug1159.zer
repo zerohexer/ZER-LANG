@@ -1,0 +1,6 @@
+// expect-error: Ring channel
+// BUG-1159: struct-literal escape class — see BUGS-FIXED.md.
+struct M { *u32 p; }
+Ring(M, 4) rq;
+void f() { u32 x = 5; M m; m = { .p = &x }; rq.push(m); }
+u32 main() { f(); M m = rq.pop() orelse return; return *m.p; }

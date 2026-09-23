@@ -1,0 +1,7 @@
+// expect-error: cannot satisfy 'keep'
+// BUG-1160: struct-literal escape class — see BUGS-FIXED.md.
+struct M { *u32 p; }
+M gm;
+void stash(M m) { gm = m; }
+void f() { u32 x = 5; stash({ .p = &x }); }
+u32 main() { f(); return *gm.p; }

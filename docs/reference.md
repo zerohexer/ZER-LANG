@@ -2020,6 +2020,15 @@ i8 clamped = @saturate(i8, 200);   // 127 (i8 max)
 u8 clamped = @saturate(u8, -5);    // 0 (u8 min)
 ```
 
+**NOTES**
+- The clamp is exact for every source and target width, `u128` / `i128` and
+  `uN` / `iN` included. An unsigned source is never compared against a negative
+  bound (BUG-1060: `@saturate(i32, s.len)` used to give `-2147483648`, because C
+  made `u64 < -2147483648LL` an unsigned comparison).
+- A FLOAT source is the same operation as the `(T)x` cast: NaN becomes 0, and the
+  boundaries are exact (`@saturate(i64, 9223372036854775808.0)` is `i64` max, not
+  min). See *Converting a float to an integer*.
+
 **SAFETY**
 - Cannot be used in a GLOBAL variable initializer, even with a constant
   argument — it does not produce a compile-time-constant value at file scope.
@@ -3375,8 +3384,9 @@ u32 main() {
 
 **NaN is tested first, deliberately.** Every comparison against NaN is false, so a range
 check written the obvious way falls straight through to the raw cast — the exact UB being
-removed. `u128` / `i128` keep a trap for NaN instead: the bounds are not expressible as
-literals at that width.
+removed. This holds at EVERY width, `u128` / `i128` and `u65`..`u127` included — those
+used to keep only a NaN trap followed by a raw cast (undefined for an infinity or an
+out-of-range value); they saturate like every other width since BUG-1064.
 
 **It works in a global initializer too**, where the value is a compile-time constant:
 
@@ -4139,6 +4149,8 @@ cinclude
 
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
+"Width" is the ZER width of the left operand, not its C carrier: `i5 x = -16;
+x >> 5` is 0 even though an `i5` is stored in an 8-bit carrier (BUG-1065).
 This covers negative shift counts too: a signed count that is negative
 (e.g. `i32 n = -1; x << n`) returns 0 rather than falling into C
 undefined behavior.
@@ -4555,7 +4567,7 @@ the `Handle` by value rather than a pointer to it.
 | Dangling pointer | Scope escape analysis on return, assign, keep, orelse |
 | Union type confusion | Cannot mutate union variant during switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in globals |
-| Division by zero | Forced guard — compile error if divisor not proven nonzero |
+| Division by zero | Forced guard — compile error if divisor not proven nonzero. A float divisor is proven by `if (y == 0.0) { return; }` / `if (y != 0.0) { ... }` (BUG-1067) — float division follows the integer rule, not IEEE `inf` |
 | Invalid MMIO address | mmio range declarations + alignment check + boot probe |
 | ISR data race | Shared globals without volatile → compile error |
 | Thread data race | Spawn target body scanned for non-shared global access → error/warning |

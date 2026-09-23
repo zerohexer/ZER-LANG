@@ -637,6 +637,14 @@ zercheck_ir.c:ast_name_mutated_or_addrd:NODE_GLOBAL_VAR:var_decl.init
 zercheck_ir.c:ast_name_mutated_or_addrd:NODE_INTERRUPT:interrupt.body
 zercheck_ir.c:ast_name_mutated_or_addrd:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
+# --- zercheck_ir.c: ast_name_bind_count ---
+# Top-level declaration kinds never occur inside a function body; the arm returns
+# 2 ("more than one binding"), the conservative answer, without walking them.
+zercheck_ir.c:ast_name_bind_count:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_bind_count:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_bind_count:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_bind_count:NODE_INTERRUPT:interrupt.body
+
 # --- zercheck_ir.c: ir_check_expr_uaf ---
 #   orelse.fallback: MEASURED unreachable — ir_lower's pre_lower_orelse splits the
 #   orelse into separate basic blocks before zercheck_ir runs, so the fallback is

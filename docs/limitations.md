@@ -189,34 +189,76 @@ check must use the checker's scope instead.
 
 ---
 
-## OPEN — one integer literal has TWO renderings in the emitted C (2026-09-15, LOW — consistency residual of BUG-1018)
+## CLOSED — one integer literal had TWO renderings in the emitted C (2026-09-15 -> closed 2026-09-23b, BUG-1063)
 
-**Symptom.** The same source expression is emitted with different C types depending on
-the position it appears in:
+`u32 x = -4 / -2;` rendered `-(uint32_t)4 / -(uint32_t)2` on the 3AC path and a raw C
+`(-4 / -2)` at the index position. The literal rendering is now ONE function of the
+literal's checker type on both AST emitters (`emit_int_literal`: `U` for an unsigned
+17..32-bit literal), the same type the 3AC path gives the IR temp — so `a[-4 / -2]` renders
+`-4U / -2U`, the same u32 reading. The index position therefore stopped being
+"self-consistent in the signed reading" and would have picked the UNSIGNED reading
+silently, so it now refuses a divergent tree like every other sink
+(`tests/zer_fail/const_divergent_index_bug1063.zer`). What remains is the over-rejection
+half of the old fix sketch — narrowing the divergence rule to "reject only where the two
+readings genuinely differ" (`u32 x = (-4 * -2) / 2;` is 4 both ways) — which needs a
+width-exact fold, i.e. the entry directly below.
 
-    u32 x = -4 / -2;    // 3AC/value path: `-(uint32_t)4 / -(uint32_t)2`  -> 0
-    a[-4 / -2]          // index path:     raw C `(-4 / -2)`              -> 2
+---
 
-BUG-1018 closed the OBSERVABLE half: the value-flow sinks now refuse a literal tree
-whose signed and unsigned readings differ, so the silent wrong value is gone. The
-index position is left alone because it is SELF-CONSISTENT — it emits the signed
-reading and bounds-checks against that same signed value, so the checker's belief and
-the program's behaviour agree, and the access is guarded either way (verified:
-`a[-8 / -2]` on a `u32[4]` traps "array index out of bounds" at runtime).
+## OPEN — the constant evaluator is UNTYPED, and its "not a constant" sentinel is a real value (2026-09-23b, LOW — over-rejection in every shape probed)
 
-**Why it is still worth recording.** Two renderings of one literal is a latent source
-of exactly the class BUG-1018 was: any future rule that folds with `eval_const_expr`
-(signed int64) and then reasons about what the emitted code does can be wrong at one
-position and right at the other, with nothing to tell the author which it got.
+**Symptom.** Exactly one value of each 64-bit type is not a constant to the checker:
 
-**Fix sketch.** Make the literal rendering one function of (literal, expression type),
-used by both the 3AC path and `emit_rewritten_node`'s index arm, so the type a literal
-is rendered at comes from one place. Then the divergence rule can be narrowed to
-"reject only where the two readings genuinely differ" rather than "reject the whole
-non-homomorphic family", recovering `u32 x = (-4 * -2) / 2;` (4 under both readings).
+    i64 m = -9223372036854775807 - 1;   // error: cannot initialize 'm' of type 'i64' with 'u64'
+    const u64 D = 9223372036854775808;
+    u64 q = x / D;                      // error: divisor 'D' not proven nonzero
+    u64 d = 9223372036854775808;
+    u64 r = x / d;                      // error: divisor 'd' not proven nonzero
 
-**Corpus cost of the current over-rejection: zero** — measured over 2495 files, only
-BUG-1018's own new tests change verdict.
+while `i64 m = 0 - 5000000000;`, `const u64 E = 9223372036854775809;` and `u64 d = 7;` are all
+accepted.
+
+**Root cause.** `eval_const_expr` (ast.h) computes in signed int64 and returns
+`CONST_EVAL_FAIL`, defined as `INT64_MIN`, for "not a compile-time constant". Its comment
+says INT64_MIN "won't appear in real constant expressions" — but it is i64's MIN and the bit
+pattern of u64 2^63. The literal-tree retype (`int_literal_tree_fits`) sees the MIN fold as
+a failure and leaves the tree u64-typed; the divisor proof and the var-decl VRP range see
+2^63 as "unknown". Every such site falls back to its conservative answer, so every shape
+probed OVER-rejects; none accepted anything unsafe.
+
+**Why not patched at the three sites.** A `NODE_INT_LIT`-only special case would cover
+`x / 9223372036854775808` and leave `-9223372036854775807 - 1` (a tree) broken. The defect
+is the API: a value and a failure flag share one int64.
+
+**Fix sketch.** `bool eval_const_expr_ok(Node *, int64_t *out)` (or a small struct with a
+`uint64` payload and a signedness bit) beside the old entry point; migrate the ~150 call
+sites (140 in checker.c, 13 in emitter.c) mechanically, the divisor proof, the var-decl
+VRP init and `int_literal_tree_fits` first. While there, fold at the literal's WIDTH and
+SIGNEDNESS (`fold_wrap_to_type` already does the wrap for the file-scope case) — that is
+what BUG-1018's over-rejection narrowing above needs.
+
+---
+
+## OPEN — float division by zero follows the INTEGER rule (forced guard + runtime trap), not IEEE (2026-09-23b, LOW — a language decision, not a defect)
+
+**What is true today.** `f64 x = 1.0 / y;` needs a nonzero proof, and an unproven one still
+emits `if (_zer_dv == 0) _zer_trap("division by zero")`, so `1.0 / 0.0` halts rather than
+giving `+inf`. Since BUG-1067 the proof IS writable — `if (y == 0.0) { return; }` or
+`if (y != 0.0) { ... }`, and the diagnostic prescribes `== 0.0` for a float. Before it, no
+guard could prove a float divisor (the prescribed `y == 0` is a type error on an f64), so
+dividing by a float variable could not be written at all; that half was a bug and is
+closed.
+
+**Why the rest is recorded, not changed.** IEEE 754 defines float division by zero
+(+-inf, NaN), and ZER's own float rule is "arithmetic gets a defined value" (reference.md
+f32/f64 notes; float->int saturates). But the documented division rule — reference.md
+"Division by zero | Forced guard — compile error if divisor not proven nonzero" — does not
+exempt floats, and dropping it is a relaxation (reject -> accept, plus removing a runtime
+trap). Two consistent answers exist: keep the guard (a zero divisor is almost always a bug,
+and the trap names the line), or follow IEEE (no proof, no trap; `inf` flows on and
+saturates if later converted to an integer). The owner's call. If adopted: the checker gate
+is the `TOK_SLASH`/`TOK_PERCENT` arm of `check_expr` NODE_BINARY and the compound arm; the
+emitter zero tests sit beside each of the seven `signed_min_text` call sites.
 
 ---
 

@@ -1004,6 +1004,30 @@ static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
 
+/* BUG-1067: the constant side of an `if` GUARD comparison, for VRP.
+ *
+ * `eval_const_expr` folds INTEGER constants only, so `if (y == 0.0) { return; }` —
+ * the ONLY guard a float divisor can take (`y == 0` is "cannot compare 'f64' and
+ * 'u32'") — narrowed nothing, and a float division by a variable was rejected with
+ * "not proven nonzero — add 'if (y == 0) { return; }'", a prescription that does
+ * not compile. Division by a float variable was therefore impossible to write.
+ *
+ * A float literal ZERO is accepted for `==` / `!=` ONLY: those two ask "is this
+ * value zero?", which means the same for a float as for an integer range (and
+ * `-0.0 == 0.0`, so the guard excludes both zeros). An ordering comparison
+ * against a float (`y > 0.5`) has no integer range and stays unfolded. The only
+ * fact a float variable can then carry is `known_nonzero` over the full range,
+ * which no bounds proof can use; an assignment to it re-derives or wipes the range
+ * through vrp_invalidate_for_assign, as for any variable. */
+static int64_t vrp_guard_const(Node *k, TokenType op) {
+    int64_t v = eval_const_expr(k);
+    if (v != CONST_EVAL_FAIL) return v;
+    if (k && k->kind == NODE_FLOAT_LIT && k->float_lit.value == 0.0 &&
+        (op == TOK_EQEQ || op == TOK_BANGEQ))
+        return 0;
+    return CONST_EVAL_FAIL;
+}
+
 static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t *out_max) {
     if (!expr || expr->kind != NODE_BINARY) return false;
     Node *rhs = expr->binary.right;
@@ -7937,9 +7961,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             node->binary.right->kind == NODE_FIELD) {
                             ExprKey dname = build_expr_key_a(c, node->binary.right);
                             if (dname.len > 0) {
+                                /* BUG-1067: name a guard that COMPILES for this type —
+                                 * `y == 0` is a type error on a float. */
                                 checker_error(c, node->loc.line,
-                                    "divisor '%.*s' not proven nonzero — add 'if (%.*s == 0) { return; }' before division",
-                                    dname.len, dname.str, dname.len, dname.str);
+                                    "divisor '%.*s' not proven nonzero — add 'if (%.*s == %s) { return; }' before division",
+                                    dname.len, dname.str, dname.len, dname.str,
+                                    type_is_float(right) ? "0.0" : "0");
                             }
                         } else if (node->binary.right->kind == NODE_CALL) {
                             /* Function call as divisor: check if callee has proven return range */
@@ -10055,10 +10082,12 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (divisor->kind == NODE_IDENT || divisor->kind == NODE_FIELD) {
                         ExprKey dname = build_expr_key_a(c, divisor);
                         if (dname.len > 0) {
+                            Type *dvt = checker_get_type(c, divisor);
                             checker_error(c, node->loc.line,
                                 "divisor '%.*s' not proven nonzero — "
-                                "add 'if (%.*s == 0) { return; }' before division",
-                                dname.len, dname.str, dname.len, dname.str);
+                                "add 'if (%.*s == %s) { return; }' before division",
+                                dname.len, dname.str, dname.len, dname.str,
+                                (dvt && type_is_float(dvt)) ? "0.0" : "0");
                         }
                     } else if (divisor->kind == NODE_CALL) {
                         bool call_proven = false;
@@ -12122,6 +12151,21 @@ static Type *check_expr(Checker *c, Node *node) {
         if (!type_is_integer(idx)) {
             checker_error(c, node->loc.line,
                 "array index must be integer, got '%s'", type_name(idx));
+        }
+
+        /* BUG-1063: the INDEX sink of the BUG-1018 divergent-reading refusal.
+         * BUG-1018 left this position alone because it rendered the SIGNED reading
+         * of a literal tree (`a[-4 / -2]` was C `-4 / -2` = 2), which made it
+         * self-consistent. BUG-1063 made the literal rendering follow the checker
+         * type everywhere, so the index now renders the UNSIGNED reading (`-4U /
+         * -2U` = 0) — the same value the 3AC path computes — and it would pick that
+         * reading silently, which is exactly what the rule exists to refuse. An
+         * index is converted to an unsigned size, so the destination is u32. A
+         * NEGATIVE-folding tree is left to the existing negative-index rules. */
+        if (!const_negative_into_unsigned(node->index_expr.index, ty_u32) &&
+            const_signedness_divergent_into_unsigned(node->index_expr.index, ty_u32)) {
+            report_value_flow_refusal(c, node->index_expr.index, ty_u32,
+                                      node->loc.line, "array index");
         }
 
         if (obj->kind == TYPE_ARRAY) {
@@ -18177,14 +18221,14 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *lsym = scope_lookup(c->current_scope,
                         lhs->ident.name, (uint32_t)lhs->ident.name_len);
                     bool is_vol = (lsym && lsym->is_volatile);
-                    cmp_val = eval_const_expr(rhs);
+                    cmp_val = vrp_guard_const(rhs, cmp_op);  /* BUG-1067 */
                     if (cmp_val != CONST_EVAL_FAIL && !is_vol) {
                         cmp_var = lhs->ident.name;
                         cmp_var_len = (uint32_t)lhs->ident.name_len;
                         var_on_left = true;
                     }
                 } else if (lhs->kind == NODE_FIELD) {
-                    cmp_val = eval_const_expr(rhs);
+                    cmp_val = vrp_guard_const(rhs, cmp_op);  /* BUG-1067 */
                     if (cmp_val != CONST_EVAL_FAIL) {
                         ExprKey ek = build_expr_key_a(c, lhs);
                         if (ek.len > 0) {
@@ -18199,14 +18243,14 @@ static void check_stmt(Checker *c, Node *node) {
                     Symbol *rsym = scope_lookup(c->current_scope,
                         rhs->ident.name, (uint32_t)rhs->ident.name_len);
                     bool r_vol = (rsym && rsym->is_volatile);
-                    cmp_val = eval_const_expr(lhs);
+                    cmp_val = vrp_guard_const(lhs, cmp_op);  /* BUG-1067 */
                     if (cmp_val != CONST_EVAL_FAIL && !r_vol) {
                         cmp_var = rhs->ident.name;
                         cmp_var_len = (uint32_t)rhs->ident.name_len;
                         var_on_left = false;
                     }
                 } else if (!cmp_var && rhs->kind == NODE_FIELD) {
-                    cmp_val = eval_const_expr(lhs);
+                    cmp_val = vrp_guard_const(lhs, cmp_op);  /* BUG-1067 */
                     if (cmp_val != CONST_EVAL_FAIL) {
                         ExprKey ek = build_expr_key_a(c, rhs);
                         if (ek.len > 0) {

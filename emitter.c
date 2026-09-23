@@ -1665,23 +1665,81 @@ static bool f2i_needs_guard(Type *src, Type *tgt) {
     }
 }
 static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
-    Type *u = type_unwrap_distinct(tgt);
-    *bits = 32; *is_signed = false;
-    switch (type_dispatch_kind(u)) {
-    case TYPE_U8:  *bits = 8;  break;
-    case TYPE_U16: *bits = 16; break;
-    case TYPE_U32: *bits = 32; break;
-    case TYPE_U64: *bits = 64; break;
-    case TYPE_USIZE: *bits = zer_target_ptr_bits; break;
-    case TYPE_I8:  *bits = 8;  *is_signed = true; break;
-    case TYPE_I16: *bits = 16; *is_signed = true; break;
-    case TYPE_I32: *bits = 32; *is_signed = true; break;
-    case TYPE_I64: *bits = 64; *is_signed = true; break;
-    case TYPE_UINT: *bits = (int)u->intn.bits; break;
-    case TYPE_SINT: *bits = (int)u->intn.bits; *is_signed = true; break;
-    default: break;
-    }
+    /* BUG-1064: width and signedness come from the SAME two queries every other
+     * integer-width decision uses (type_width / type_is_signed), so u65..u128 /
+     * i65..i128 and the enum carrier get their real bounds instead of a default. */
+    Type *u = tgt ? type_unwrap_distinct(tgt) : NULL;
+    *bits = u ? type_width(u) : 0;
+    if (*bits <= 0) *bits = 32;
+    if (*bits > 128) *bits = 128;
+    *is_signed = u ? type_is_signed(u) : false;
 }
+
+/* BUG-1060..1064: the MIN or MAX of a ZER integer of `bits` width, as C
+ * CONSTANT-EXPRESSION text of the matching C width.
+ *
+ * This is the ONE place a width's limits are spelled. Before it, five division
+ * sites picked the MIN with an `8 / 16 / 32 / else-64` switch (so an i5, i12,
+ * i48 or i128 compared against INT64_MIN and never trapped), two @saturate paths
+ * computed `1LL << (w-1)` inside zerc (undefined for w > 64) and clamped every
+ * width > 64 to the u64 maximum, and the float->int saturation gave up past 64
+ * bits. Every one of them was the same question -- "what is the minimum / maximum
+ * of this ZER width?" -- answered at N sites with N different coverages.
+ *
+ * Widths above 64 are expressed through `unsigned __int128`, which is what the
+ * u65..u128 / i65..i128 carriers already are; `1 << 127` is formed UNSIGNED and
+ * converted, so no signed shift overflows. `n` is the size of `buf`. */
+static void int_limit_text(int bits, bool sg, bool want_max, char *buf, size_t n) {
+    if (bits <= 0) bits = 32;
+    if (bits > 128) bits = 128;
+    if (!sg) {
+        if (!want_max)        snprintf(buf, n, "0");
+        else if (bits < 64)   snprintf(buf, n, "%lluULL", (1ULL << bits) - 1ULL);
+        else if (bits == 64)  snprintf(buf, n, "18446744073709551615ULL");
+        else if (bits < 128)  snprintf(buf, n, "((((unsigned __int128)1) << %d) - 1)", bits);
+        else                  snprintf(buf, n, "(~(unsigned __int128)0)");
+        return;
+    }
+    if (bits < 64) {
+        long long m = (long long)(1ULL << (bits - 1));
+        if (want_max) snprintf(buf, n, "%lldLL", m - 1);
+        else          snprintf(buf, n, "(-%lldLL)", m);
+        return;
+    }
+    if (bits == 64) {
+        if (want_max) snprintf(buf, n, "9223372036854775807LL");
+        else          snprintf(buf, n, "(-9223372036854775807LL - 1)");
+        return;
+    }
+    if (want_max) snprintf(buf, n, "((__int128)((((unsigned __int128)1) << %d) - 1))", bits - 1);
+    else          snprintf(buf, n, "(-((__int128)((((unsigned __int128)1) << %d) - 1)) - 1)", bits - 1);
+}
+
+/* The MIN of a SIGNED integer type, for the `MIN / -1` division trap. Every
+ * division site asks this through here (BUG-1062). */
+static void signed_min_text(Type *t, char *buf, size_t n) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    int w = u ? type_width(u) : 0;
+    int_limit_text(w, true, false, buf, n);
+}
+
+/* BUG-1065: the width a shift COUNT is compared against -- the ZER width of the
+ * LEFT operand, passed to `_zer_shl` / `_zer_shr` as their third argument.
+ *
+ * The macros used to take the width from `sizeof(a) * 8`, the C CARRIER, which
+ * is right only when the carrier is exactly the ZER type. It is not for an iN
+ * (`i5` lives in an `int8_t`, so `x >> 5` .. `x >> 7` passed the guard and an
+ * arithmetic shift of a negative value gave -1, where ZER's rule is 0) and it is
+ * not for a narrow operand C has PROMOTED (`(x / y) >> 8` on an i8, whose left
+ * side is emitted as a statement expression of type `int`, so the guard saw 32
+ * and the shift gave -1). The macro still ALSO tests the carrier width, so an
+ * unknown width (0 -> 128 here) can never make a C shift undefined. */
+static int shift_guard_width(Type *lhs) {
+    Type *u = lhs ? type_unwrap_distinct(lhs) : NULL;
+    int w = (u && type_is_integer(u)) ? type_width(u) : 0;
+    return w > 0 ? w : 128;
+}
+
 /* The four saturation limits, as C constant-expression text. Extracted so the
  * statement-expression form (emit_f2i_close) and the CONSTANT form
  * (emit_f2i_const, BUG-990) cannot drift apart — the bounds ARE the safety
@@ -1689,23 +1747,20 @@ static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
  * getting bitten by. `n` is the size of EACH buffer. */
 static void f2i_limits(int bits, bool sg, char *lo, char *hi, char *mn, char *mx,
                        size_t n) {
+    /* lo / hi are EXACT hex-float powers of two, so they are exact as doubles for
+     * every width up to 128 (0x1p128 ~ 3.4e38 is far inside the double range).
+     * The signed `lo` is `-2^(b-1) - 1`; past 53 bits the `- 1` rounds away and
+     * `lo` equals MIN itself, which is still the right boundary (`<= MIN` clamps
+     * to MIN, anything above truncates in range). */
     if (sg) {
         snprintf(lo, n, "-0x1p%d - 1.0", bits - 1);
         snprintf(hi, n, "0x1p%d", bits - 1);
-        if (bits == 64) {
-            snprintf(mn, n, "(-9223372036854775807LL - 1)");
-            snprintf(mx, n, "9223372036854775807LL");
-        } else {
-            snprintf(mn, n, "(-(1LL << %d))", bits - 1);
-            snprintf(mx, n, "((1LL << %d) - 1)", bits - 1);
-        }
     } else {
         snprintf(lo, n, "-1.0");
         snprintf(hi, n, "0x1p%d", bits);
-        snprintf(mn, n, "0");
-        if (bits == 64) snprintf(mx, n, "18446744073709551615ULL");
-        else            snprintf(mx, n, "((1ULL << %d) - 1ULL)", bits);
     }
+    int_limit_text(bits, sg, false, mn, n);
+    int_limit_text(bits, sg, true, mx, n);
 }
 
 /* Emits `({ <srcT> _v = ` — caller emits the source, then calls _close. */
@@ -1736,22 +1791,80 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
      * without `_v != _v` it would fall through the range tests into the raw cast —
      * the exact UB being removed. Bounds are exact hex-float powers of two, so no
      * representable value is ever clamped. */
-    if (bits > 0 && bits <= 64) {
-        char lo[64], hi[64], mn[64], mx[64];
+    /* BUG-1064: every width 1..128 saturates. u65..u128 / i65..i128 used to keep
+     * only a NaN trap and then a RAW cast -- undefined for +-inf and any value
+     * outside the range, so `(u128)1e39` was whatever GCC chose. The bounds ARE
+     * expressible at that width: `int_limit_text` spells them through
+     * `unsigned __int128`, and the hex-float boundaries are exact doubles.
+     * The statement expression emit_f2i_open began ends with the `})` below
+     * (tools/audit_walker_fields.sh counts braces in comments and strings, and
+     * this function used to carry that text twice, once per width branch). */
+    {
+        char lo[96], hi[96], mn[96], mx[96];
         f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
         emit(e, "; (_zer_f2i%d != _zer_f2i%d) ? (", tmp, tmp);
         emit_type(e, tgt); emit(e, ")0 : (_zer_f2i%d <= (%s)) ? (", tmp, lo);
         emit_type(e, tgt); emit(e, ")%s : (_zer_f2i%d >= (%s)) ? (", mn, tmp, hi);
         emit_type(e, tgt); emit(e, ")%s : (", mx);
         emit_type(e, tgt); emit(e, ")_zer_f2i%d; })", tmp);
+    }
+}
+
+/* BUG-1060/1061: @saturate's clamp -- ONE implementation, used by BOTH
+ * dispatch paths (the AST `emit_expr` handler and the IR `emit_rewritten_node`
+ * handler). The two paths used to compute the clamp separately, and both were
+ * wrong in different ways:
+ *
+ *   - an UNSIGNED 64-bit source into a SIGNED target compared `u64 < -128LL`.
+ *     C's usual arithmetic conversions make that an UNSIGNED comparison (the
+ *     -128 becomes 2^64-128), so every value clamped to MIN:
+ *     `@saturate(i32, s.len)` for a length of 10 gave INT32_MIN.
+ *   - a FLOAT source had no NaN test (NaN fell through to the raw C cast, which
+ *     is undefined), and the integer MAX rounded UP as a double, so 2^63 into
+ *     i64 and 2^64 into u64 were not "> MAX" and hit the raw cast too.
+ *   - targets wider than 64 bits clamped to the u64 maximum, and the IR path
+ *     evaluated `1LL << (w - 1)` inside zerc -- undefined for w > 64.
+ *
+ * The integer clamp below never compares a value against a NEGATIVE constant
+ * unless the value is itself negative (so it is signed): the sign test comes
+ * first, and against a non-negative constant C's conversions are exact for every
+ * operand type. So the source type is not needed at all -- the form is correct
+ * for u8..u128 and i8..i128 alike. A float source goes through the float->int
+ * saturation the `(T)x` cast already uses (`emit_f2i_*`, BUG-883), which tests
+ * NaN first and uses exact hex-float boundaries. */
+static bool saturate_src_is_float(Emitter *e, Node *arg) {
+    Type *st = arg ? checker_get_type(e->checker, arg) : NULL;
+    return st && type_is_float(st);
+}
+static void emit_saturate_open(Emitter *e, Node *arg, int tmp) {
+    if (saturate_src_is_float(e, arg)) {
+        emit_f2i_open(e, type_unwrap_distinct(checker_get_type(e->checker, arg)), tmp);
         return;
     }
-    /* Width the literal bounds above cannot express (u128 / i128). Keep the TRAP
-     * rather than emit an unguarded cast — a halt is defined, the raw cast is not. */
-    emit(e, "; if (_zer_f2i%d != _zer_f2i%d) _zer_trap(\"NaN to integer\", __FILE__, __LINE__); (",
-         tmp, tmp);
-    emit_type(e, tgt);
-    emit(e, ")_zer_f2i%d; })", tmp);
+    emit(e, "({ __auto_type _zer_sat%d = ", tmp);
+}
+static void emit_saturate_close(Emitter *e, Node *arg, Type *t, int tmp) {
+    if (saturate_src_is_float(e, arg)) {
+        emit_f2i_close(e, t, tmp);
+        return;
+    }
+    int bits; bool sg;
+    f2i_bounds(t, &bits, &sg);
+    char mn[96], mx[96];
+    int_limit_text(bits, sg, false, mn, sizeof mn);
+    int_limit_text(bits, sg, true, mx, sizeof mx);
+    emit(e, "; (_zer_sat%d < 0) ? ", tmp);
+    if (sg) {
+        emit(e, "((_zer_sat%d < %s) ? (", tmp, mn);
+        emit_type(e, t); emit(e, ")%s : (", mn);
+        emit_type(e, t); emit(e, ")_zer_sat%d)", tmp);
+    } else {
+        emit(e, "(");
+        emit_type(e, t); emit(e, ")0");
+    }
+    emit(e, " : ((_zer_sat%d > %s) ? (", tmp, mx);
+    emit_type(e, t); emit(e, ")%s : (", mx);
+    emit_type(e, t); emit(e, ")_zer_sat%d); })", tmp);
 }
 
 /* BUG-990: the same saturation as a C CONSTANT EXPRESSION — no statement
@@ -1780,11 +1893,11 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
 static bool emit_f2i_const(Emitter *e, Type *tgt, Node *operand) {
     int bits; bool sg;
     f2i_bounds(tgt, &bits, &sg);
-    if (bits <= 0 || bits > 64) return false;      /* u128/i128 — trap form only */
+    if (bits <= 0 || bits > 128) return false;
     if (!operand) return false;
     if (expr_has_side_effects(operand) || expr_is_volatile(e, operand)) return false;
 
-    char lo[64], hi[64], mn[64], mx[64];
+    char lo[96], hi[96], mn[96], mx[96];
     f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
     #define F2I_OP() do { emit(e, "("); emit_expr(e, operand); emit(e, ")"); } while (0)
     emit(e, "(");
@@ -2278,17 +2391,42 @@ static int64_t fold_wrap_to_type(int64_t v, Type *t) {
  * LIT-1's retype is only half the fix; without a width suffix the retyped node still
  * prints as a 32-bit constant. Shared by BOTH emitters so the two spellings cannot
  * drift apart again — same reason emit_try_enum_open/close is shared. */
+/* BUG-1063: the SIGNEDNESS comes from the type too, not only the width. A
+ * literal the checker typed u32 (the default for every literal that fits 32 bits)
+ * was printed bare, so C typed it `int` -- and every operation around it on the
+ * AST-passthrough path (`x = ...`, `s.f = ...`, `g = ...`, an index) ran in
+ * SIGNED 32-bit arithmetic while the IR var-decl path, whose temps are
+ * `uint32_t`, ran it unsigned:
+ *
+ *     u32 v = (1 << 31) >> 28;   // 8           (IR temps, unsigned)
+ *     r.m   = (1 << 31) >> 28;   // 4294967288  (bare `1`: INT_MIN >> 28 sign-extends)
+ *     g     = ~0 >> 28;          // 4294967295  (~0 is -1, arithmetic shift)
+ *     z = (2000000000 + 2000000000) % 7;   // signed overflow, then a negative %
+ *     arr[~0 >> 28]              // checker folded 15, the program indexed -1 -> trap
+ *
+ * One literal, two C types, two answers. The rendering is now a function of the
+ * literal's CHECKER TYPE alone -- the same type ir_lower gives the IR literal's
+ * destination temp -- so both paths compute the expression at one width and one
+ * signedness. Signed literals of <= 32 bits stay bare: a bare decimal is a C
+ * `int` when it fits, and when it does not (the `2147483648` under a unary minus
+ * in `-2147483648`) C widens it to `long` instead of wrapping it, which is the
+ * value the source denotes. u8 / u16 stay bare as well: C promotes them to `int`
+ * whatever their spelling. */
 static void emit_int_literal(Emitter *e, Node *node) {
     unsigned long long v = (unsigned long long)node->int_lit.value;
-    if (v > 0xFFFFFFFFULL) { emit(e, "%lluULL", v); return; }
     Type *lt = checker_get_type(e->checker, node);
     Type *eff = lt ? type_unwrap_distinct(lt) : NULL;
-    if (eff && type_is_integer(eff) && type_width(eff) > 32) {
+    int w = (eff && type_is_integer(eff)) ? type_width(eff) : 0;
+    bool sg = w > 0 && type_is_signed(eff);
+    if (v > 0xFFFFFFFFULL || w > 32) {
         /* The width comes from the TYPE, not the value: a small literal inside a
-         * 64-bit expression must still be 64-bit or the operation wraps at 32. */
-        emit(e, "%llu%s", v, type_is_signed(eff) ? "LL" : "ULL");
+         * 64-bit expression must still be 64-bit or the operation wraps at 32. A
+         * SIGNED 64-bit literal is `LL` so a comparison against a negative signed
+         * value is not silently made unsigned. */
+        emit(e, "%llu%s", v, (sg && v <= 0x7FFFFFFFFFFFFFFFULL) ? "LL" : "ULL");
         return;
     }
+    if (w > 16 && !sg) { emit(e, "%lluU", v); return; }
     emit(e, "%llu", v);
 }
 
@@ -2441,11 +2579,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_expr(e, node->binary.left);
                 /* check if dividend is the minimum value for its type */
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit(e, "(");
@@ -2485,7 +2621,7 @@ static void emit_expr(Emitter *e, Node *node) {
             emit_expr(e, node->binary.left);
             emit(e, ", ");
             emit_expr(e, node->binary.right);
-            emit(e, ")");
+            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
         } else {
             /* check if result type is narrower than int — need cast to prevent
              * C integer promotion from changing wrapping behavior */
@@ -2659,7 +2795,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     } else if (aop == TOK_LSHIFTEQ) {
                         emit(e, "%s = _zer_shl(%s, (", lv, lv);
                         emit_expr(e, node->assign.value);
-                        emit(e, ")); ");
+                        emit(e, "), %d); ", shift_guard_width(nn_t));
                     } else {
                         const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
                                           aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
@@ -2855,11 +2991,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (is_signed_div) {
                     emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
                          tmp, tmp, tmp, tmp);
-                    int w = type_width(tgt_eff);
-                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
-                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
-                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                    char dmin[96]; signed_min_text(tgt_eff, dmin, sizeof dmin);
+                    emit(e, "if (_zer_dd%d == %s) ", tmp, dmin);
                     emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
                 }
                 emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
@@ -2876,11 +3010,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->assign.target);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_expr(e, node->assign.target);
-                int w = type_width(tgt_eff);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(tgt_eff, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit_expr(e, node->assign.target);
@@ -2894,6 +3026,7 @@ static void emit_expr(Emitter *e, Node *node) {
              * NODE_INDEX.index calls. See expr_has_side_effects above. */
             bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
                 /* hoist target into pointer: *({ auto *_p = &target; *_p = macro(*_p, n); _p; }) — but simpler: */
                 int tmp = e->temp_count++;
@@ -2901,14 +3034,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->assign.target);
                 emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
                 emit_expr(e, node->assign.value);
-                emit(e, "); })");
+                emit(e, ", %d); })", shw);
             } else {
                 emit_expr(e, node->assign.target);
                 emit(e, " = %s(", macro);
                 emit_expr(e, node->assign.target);
                 emit(e, ", ");
                 emit_expr(e, node->assign.value);
-                emit(e, ")");
+                emit(e, ", %d)", shw);
             }
         } else {
         emit_expr(e, node->assign.target);
@@ -4392,41 +4525,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 bool sat_enum = t && type_carries_enum_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
-                emit(e, "({__auto_type _zer_sat%d = ", tmp);
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; ");
-                /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
-                /* for unsigned targets, just clamp to max */
-                if (type_is_unsigned(t)) {
-                    /* unsigned: clamp to [0, 2^N-1] — check both bounds for signed
-                     * source. #13: compute the max from the target WIDTH so
-                     * non-native uN (u7/u12/u21 …) clamp correctly; the old hardcoded
-                     * {8,16,32,else→64} switch sent every odd width to the u64 branch
-                     * (max 2^64-1) so it never clamped (silent wrong result). */
-                    int w = type_width(t);
-                    if (w >= 64) {
-                        /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
-                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
-                    } else {
-                        unsigned long long mx = (1ULL << w) - 1ULL;
-                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > %lluULL ? %lluULL : (", tmp, tmp, mx, mx);
-                        emit_type(e, t);   /* carrier cast (uint8_t for u7 …); clamped value fits */
-                        emit(e, ")_zer_sat%d", tmp);
-                    }
-                } else {
-                    /* signed: clamp to [min, max] for target width */
-                    int w = type_width(t);
-                    if (w == 8)
-                        emit(e, "_zer_sat%d < -128 ? -128 : _zer_sat%d > 127 ? 127 : (int8_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 16)
-                        emit(e, "_zer_sat%d < -32768 ? -32768 : _zer_sat%d > 32767 ? 32767 : (int16_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 32)
-                        emit(e, "_zer_sat%d < -2147483648LL ? -2147483648LL : _zer_sat%d > 2147483647LL ? 2147483647LL : (int32_t)_zer_sat%d", tmp, tmp, tmp);
-                    else
-                        emit(e, "(int64_t)_zer_sat%d", tmp);
-                }
-                emit(e, "; })");
+                Node *sat_arg = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                emit_saturate_open(e, sat_arg, tmp);
+                if (sat_arg) emit_expr(e, sat_arg);
+                else emit(e, "0");
+                emit_saturate_close(e, sat_arg, t, tmp);
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
@@ -6769,12 +6872,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * shift count with negative value (e.g., i32 n = -1; x << n) bypassed
      * the >= width guard and fell through to (a) << -1 = C undefined
      * behavior. Cast to int64_t for the comparison so unsigned operands
-     * compare correctly without wrap-to-negative. */
-    emit(e, "#define _zer_shl(a, b) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+     * compare correctly without wrap-to-negative.
+     *
+     * BUG-1065: `w` is the ZER width of the left operand (shift_guard_width). The
+     * carrier test `sizeof(a) * 8` stays as well: the ZER width alone would let a
+     * count reach an operand C has narrower than the ZER type claims, and a C
+     * shift by >= its operand's width is undefined. */
+    emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(b) _b = (b); "
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) << _b; })\n");
-    emit(e, "#define _zer_shr(a, b) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+    emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(b) _b = (b); "
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
@@ -7854,7 +7964,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ", ");
                 emit_rewritten_node(e, node->binary.right, func);
-                emit(e, "); ");
+                emit(e, ", %d); ", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
                 emit_intn_mask_lv(e, rts, lvbuf);
                 emit(e, "%s; })", lvbuf);
                 return;
@@ -7863,7 +7973,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_rewritten_node(e, node->binary.left, func);
             emit(e, ", ");
             emit_rewritten_node(e, node->binary.right, func);
-            emit(e, ")");
+            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
             return;
         }
         /* BUG-604: signed division overflow (INT_MIN / -1 is C UB).
@@ -7890,11 +8000,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_rewritten_node(e, node->binary.left, func);
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit(e, "(");
@@ -8343,7 +8451,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 } else if (aop == TOK_LSHIFTEQ) {
                     emit(e, "%s = _zer_shl(%s, (", lv, lv);
                     emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, ")); ");
+                    emit(e, "), %d); ", shift_guard_width(checker_get_type(e->checker, node->assign.target)));
                 } else {
                     const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
                                       aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
@@ -8571,20 +8679,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * NODE_INDEX.index — silently double-evaluating fn(). */
             bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
                 int tmp = e->temp_count++;
                 emit(e, "({ __auto_type _zer_sp%d = &(", tmp);
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
                 emit_rewritten_node(e, node->assign.value, func);
-                emit(e, "); })");
+                emit(e, ", %d); })", shw);
             } else {
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, " = %s(", macro);
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, ", ");
                 emit_rewritten_node(e, node->assign.value, func);
-                emit(e, ")");
+                emit(e, ", %d)", shw);
             }
             return;
         }
@@ -8619,11 +8728,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (is_signed_div) {
                     emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
                          tmp, tmp, tmp, tmp);
-                    int w = type_width(div_type);
-                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
-                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
-                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                    char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                    emit(e, "if (_zer_dd%d == %s) ", tmp, dmin);
                     emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
                 }
                 emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
@@ -8640,11 +8747,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_rewritten_node(e, node->assign.target, func);
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit_rewritten_node(e, node->assign.target, func);
@@ -8958,56 +9063,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 bool sat_enum = t && type_carries_enum_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
-                emit(e, "({__auto_type _zer_sat%d = ", tmp);
-                if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "; ");
-                int w = type_width(t);
-                bool is_signed = type_is_signed(t);
-                if (is_signed) {
-                    /* For w == 64, the literal min INT64_MIN = -9223372036854775808
-                     * cannot be written as `-9223372036854775808LL` — C parses that as
-                     * unary-minus applied to a literal that overflows i64, triggering
-                     * "integer constant is so large that it is unsigned" warnings (and
-                     * `-Werror` failures). Emit `(LLONG_MIN_LITERAL)` for w==64 and
-                     * the direct form for smaller widths. */
-                    int64_t max_v = (1LL << (w - 1)) - 1;
-                    if (w == 64) {
-                        emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? (-9223372036854775807LL - 1) : "
-                                "_zer_sat%d > %lldLL ? (%lldLL) : (",
-                             tmp, tmp, (long long)max_v, (long long)max_v);
-                    } else {
-                        int64_t min_v = -(1LL << (w - 1));
-                        emit(e, "_zer_sat%d < %lldLL ? (%lldLL) : _zer_sat%d > %lldLL ? (%lldLL) : (",
-                             tmp, (long long)min_v, (long long)min_v,
-                             tmp, (long long)max_v, (long long)max_v);
-                    }
-                } else {
-                    /* Unsigned target: clamp below 0 AND above max. The lower/upper
-                     * comparisons MUST be done in the SOURCE's own type — the old
-                     * `(int64_t)_zer_sat` cast misread a large UNSIGNED source (value
-                     * >= 2^63, e.g. `@saturate(u32, 18e18)`) as negative, clamping it
-                     * to 0 instead of the target max. `_zer_sat` is `__auto_type` (the
-                     * source type), so a bare `_zer_sat < 0` is always-false for an
-                     * unsigned source (no lower clamp) and true for a signed source
-                     * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
-                    const char *max_cmp, *max_val;
-                    /* #13: compute the max from the target WIDTH so non-native uN
-                     * (u7/u12/u21 …) clamp to 2^N-1. The old {8,16,32,else→64} switch
-                     * sent every odd width to the u64 branch (never clamped). */
-                    char max_buf[32];
-                    if (w >= 64) { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
-                    else {
-                        unsigned long long mx = (1ULL << w) - 1ULL;
-                        snprintf(max_buf, sizeof max_buf, "%lluULL", mx);
-                        max_cmp = max_buf; max_val = max_buf;
-                    }
-                    emit(e, "_zer_sat%d < 0 ? 0 : "
-                             "_zer_sat%d > %s ? (%s) : (",
-                         tmp, tmp, max_cmp, max_val);
-                }
-                emit_type(e, t);
-                emit(e, ")_zer_sat%d; })", tmp);
+                Node *sat_arg = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                emit_saturate_open(e, sat_arg, tmp);
+                if (sat_arg) emit_rewritten_node(e, sat_arg, func);
+                else emit(e, "0");
+                emit_saturate_close(e, sat_arg, t, tmp);
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
@@ -13386,11 +13446,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * raw << / >>, which are C undefined behavior when n >= width. */
             if (inst->op_token == TOK_LSHIFT || inst->op_token == TOK_RSHIFT) {
                 emit_indent(e);
-                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s);\n",
+                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s, %d);\n",
                      sp, (int)dst->name_len, dst->name,
                      inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
                      sp, (int)s1->name_len, s1->name,
-                     sp, (int)s2->name_len, s2->name);
+                     sp, (int)s2->name_len, s2->name,
+                     shift_guard_width(s1->type));
                 emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN shift result to its width */
                 break;
             }
@@ -13409,27 +13470,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (inst->op_token == TOK_SLASH || inst->op_token == TOK_PERCENT) {
                 emit_indent(e);
                 emit(e, "if (%s%.*s == 0) "
-                        "_zer_trap(\"division by zero\", __FILE__, __LINE__);\n",
+                        "_zer_trap(\"division by zero\", __FILE__, __LINE__);",
                      sp, (int)s2->name_len, s2->name);
                 Type *lt = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+                /* BUG-1066: everything that can TRAP stays on the ONE C line the
+                 * `#line` directive above names. The zero test used to end with a
+                 * newline, so the overflow trap sat on the NEXT emitted line and
+                 * reported the source line PLUS ONE (the BUG-1003 class). */
                 if (lt && type_is_signed(lt)) {
-                    int w = type_width(lt);
-                    const char *minlit = "(-9223372036854775807LL-1)";
-                    if (w == 8) minlit = "(-128)";
-                    else if (w == 16) minlit = "(-32768)";
-                    else if (w == 32) minlit = "(-2147483647-1)";
-                    emit_indent(e);
-                    emit(e, "if (%s%.*s == %s && %s%.*s == -1) "
-                            "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);\n",
+                    /* BUG-1062: the MIN of THIS width -- an i5, i48 or i128
+                     * compared against INT64_MIN before and never trapped. */
+                    char minlit[96];
+                    signed_min_text(lt, minlit, sizeof minlit);
+                    emit(e, " if (%s%.*s == %s && %s%.*s == -1) "
+                            "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);",
                          sp, (int)s1->name_len, s1->name, minlit,
                          sp, (int)s2->name_len, s2->name);
                 }
-                emit_indent(e);
-                emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
+                emit(e, " %s%.*s = (%s%.*s %s %s%.*s);\n",
                      sp, (int)dst->name_len, dst->name,
                      sp, (int)s1->name_len, s1->name,
                      inst->op_token == TOK_SLASH ? "/" : "%",
                      sp, (int)s2->name_len, s2->name);
+                emit_intn_mask(e, dst, sp); /* BUG-1062: wrap an iN/uN quotient to its width */
                 break;
             }
 

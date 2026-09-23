@@ -5,6 +5,203 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-23b — BUG-1060..1068: seven silent value miscompiles and one unsatisfiable guard in the integer/float emission helpers, each one question answered at N sites
+
+Fix session over an auditor's probe set (value semantics of @saturate, literals, iN
+division, shifts, wide float casts, trap lines). Every fix was A/B'd against the unmodified
+`ede0646a` build (`/tmp/base_vs/zerc`): every new test but one boundary pin FAILS there and passes here. The
+shared shape: the emitter asked "what is the MIN / MAX / width / signedness of this ZER
+integer type?" at a dozen sites, each with its own hand-written `8 / 16 / 32 / else-64`
+switch or `sizeof(a) * 8`, and each covered a different subset of the widths ZER has
+(i5, i48, u100, i128, a C-promoted i8). The fix is the same for all of them: ONE helper
+per question, called at every site.
+
+### BUG-1060 — `@saturate` of an unsigned 64-bit source into a signed target clamped to MIN
+
+**Symptom.** `@saturate(i32, s.len)` for a length of 10 gave `-2147483648`;
+`@saturate(i8, (u64)300)` gave -128. Wider targets (u65..u128) clamped to the u64 max, and
+the IR path evaluated `1LL << (w - 1)` INSIDE zerc, undefined for w > 64.
+
+**Root cause.** Both dispatch paths (AST `emit_expr` and IR `emit_rewritten_node`) wrote
+their own clamp, and both compared the value against a NEGATIVE constant first:
+`_v < -2147483648LL ? ...`. For a `uint64_t` `_v`, C's usual arithmetic conversions turn
+that into an UNSIGNED comparison (the constant becomes 2^64 - 2^31), so it is true for
+every value. The AST path additionally emitted NO clamp for any signed width other than 8/16/32
+(`(int64_t)_v` for i64 and every iN).
+
+**Fix.** ONE `emit_saturate_open` / `emit_saturate_close` pair used by both paths. The
+integer clamp tests the SIGN first — `(_v < 0) ? (_v < MIN ? MIN : _v) : (_v > MAX ? MAX :
+_v)` — so a negative bound is only ever compared against a value that is itself negative,
+hence signed; against a non-negative bound C's conversions are exact for every operand
+type. The form needs no source type and is correct for u8..u128 / i8..i128. The limits come
+from the new `int_limit_text(bits, signed, want_max)`, the ONE place a width's MIN/MAX is
+spelled (through `unsigned __int128` above 64 bits). Test:
+`tests/zer/saturate_int_source_sign_bug1060.zer` (exit 1 pre-fix).
+
+### BUG-1061 — `@saturate` of a FLOAT source: NaN hit the raw cast, the boundaries clamped to the wrong extreme
+
+**Symptom.** `@saturate(i32, nan)` gave INT32_MIN (the raw x86 conversion result — the C
+cast is undefined), `@saturate(i64, 2^63)` gave i64 MIN, `@saturate(u64, 2^64)` gave 0,
+`@saturate(u32, (f32)2^32)` gave 0. docs/reference.md already promised "`@saturate(T, x)`
+is the same operation under its own name" as the `(T)x` cast; it was not.
+
+**Root cause.** The clamp compared a double against the integer MAX, which ROUNDS UP as a
+double (2^63 - 1 becomes 2^63), so exactly-2^63 was not `> MAX` and fell through to the
+raw cast; and nothing tested NaN.
+
+**Fix.** A float source routes through the existing float->int saturation
+(`emit_f2i_open` / `emit_f2i_close`, BUG-883) — NaN tested first, exact hex-float
+boundaries — from inside `emit_saturate_*`, so both dispatch paths get it. Test:
+`tests/zer/saturate_float_source_bug1061.zer` (exit 2 pre-fix).
+
+### BUG-1062 — MIN / -1 of an iN (i5, i12, i48) or i128 was never trapped
+
+**Symptom.** `i5 a = -16; a / -1` gave 16 on the var-decl path (a value no i5 holds —
+`if (r > 0)` then took the branch) and -16 on the field path; i48 and i128 likewise ran the
+division unchecked (for i128 that is the C UB the trap exists to prevent).
+
+**Root cause.** SEVEN division sites (IR_BINOP, emit_expr binary + both compound forms,
+emit_rewritten_node binary + both compound forms) chose the MIN with an
+`8 / 16 / 32 / else INT64_MIN` switch on `type_width`. Every width that is not one of the
+three went to the INT64_MIN comparison, which an iN / i128 value never equals.
+
+**Fix.** ONE `signed_min_text(type)` (over `int_limit_text`) at all seven. IR_BINOP also
+applies `emit_intn_mask` to the quotient, as it does for every other value-producing op.
+Tests: `tests/zer_trap/intn_div_overflow_{i5,i48_field,i128_compound}_bug1062.zer` (each
+exits 7 — no trap, wrong value — pre-fix).
+
+### BUG-1063 — a u32-typed literal was printed as a C `int` on the AST-passthrough path
+
+**Symptom.** One expression, two answers, decided by where it was written:
+
+    u32 v = (1 << 31) >> 28;   // 8          (IR var-decl: uint32_t temps)
+    r.m   = (1 << 31) >> 28;   // 4294967288 (bare `1`: INT_MIN >> 28 sign-extends)
+    g     = ~0 >> 28;          // 4294967295
+    z = (2000000000 + 2000000000) % 7;  // signed overflow, then a negative `%`
+    arr[~0 >> 28] = 9;         // indexed -1 and TRAPPED; the checker had folded 15
+
+**Root cause.** `emit_int_literal` (shared by both AST emitters since BUG-939) keyed the
+C suffix on the literal's WIDTH only: a literal the checker typed u32 — the default for
+every literal that fits 32 bits — printed as a bare decimal, which C types `int`.
+
+**Fix.** The suffix now follows the checker type's signedness too: an unsigned 17..32-bit
+literal is `NU`, a signed 64-bit one `NLL` (was `ULL`, which made a comparison against a
+negative signed value unsigned). Signed <= 32-bit literals stay bare (a bare decimal is
+`int` when it fits, and C WIDENS `2147483648` under a unary minus instead of wrapping it);
+u8 / u16 stay bare (C promotes them either way). This also CLOSES the limitations.md entry
+"one integer literal has TWO renderings": `a[-4 / -2]` now renders `-4U / -2U`, the same
+u32 reading as the 3AC path — and the index position, the one sink BUG-1018 had left
+alone as "self-consistent" because it rendered the signed reading, now refuses a divergent
+tree like every other sink (same sentence, `array index:`), since it would otherwise pick
+the unsigned reading silently. Tests: `tests/zer/int_literal_unsigned_rendering_bug1063.zer`
+(exit 2 pre-fix), `tests/zer_fail/const_divergent_index_bug1063.zer`.
+
+### BUG-1064 — a float -> u65..u128 / i65..i128 cast was a raw cast after a NaN trap
+
+**Symptom.** `(u128)inf`, `(i128)-1e39`, `(u100)1e39` were whatever GCC chose (C UB);
+NaN trapped instead of giving 0, unlike every narrower width.
+
+**Root cause.** `emit_f2i_close` / `emit_f2i_const` stopped at 64 bits because the limits
+were spelled as `LL` literals ("not expressible at that width").
+
+**Fix.** `f2i_limits` now takes its MIN/MAX from `int_limit_text`, which spells them
+through `unsigned __int128`; the hex-float boundaries (`0x1p128`) are exact doubles. Every
+width 1..128 saturates, NaN -> 0. `f2i_bounds` now reads `type_width` / `type_is_signed`
+like every other width decision. CLAUDE.md and docs/reference.md said u128 "keeps a NaN
+trap"; both corrected. Test: `tests/zer/f2i_wide_saturate_bug1064.zer` (exit 1 pre-fix).
+
+### BUG-1065 — a shift count >= the ZER width gave -1, not 0, for iN and for a promoted narrow operand
+
+**Symptom.** `i5 m = -16; m >> 5` (also `>> 6`, `>> 7`) gave -1 at every emission form,
+where the spec rule ("shift by >= width returns 0") gives 0. `i8 x = -100; s.f = (x / y) >> 8;` gave -1
+on the assign / field / global paths (0 on the var-decl path).
+
+**Root cause.** `_zer_shl` / `_zer_shr` guarded the count with `sizeof(a) * 8` — the C
+CARRIER. An i5 lives in an int8_t (guard 8), and a `/` or `%` left operand is emitted as a
+statement expression of type `int` (guard 32).
+
+**Fix.** The macros take the ZER width as a third argument, computed by ONE
+`shift_guard_width(type)` from the left operand's checker type at all eight emission sites
+(IR_BINOP, both NODE_BINARY paths, both compound `<<=`/`>>=` paths, both non-native-uN
+`<<=` paths, the narrow-result IR path). The carrier test stays too, so an unknown width can
+never make a C shift undefined. Making the macro 3-argument is itself the gate: a site that
+still passes two arguments is a GCC error in the emitted C, not a silent wrong value. Test:
+`tests/zer/shift_zer_width_bug1065.zer` (exit 1 pre-fix).
+
+### BUG-1066 — the IR_BINOP overflow trap reported the source line PLUS ONE
+
+**Symptom.** `i32 r = a / b;` on line 14 with MIN / -1 reported `... at f.zer:15`.
+
+**Root cause.** The division emitted the zero test and the overflow test as two C lines
+under one `#line` (the BUG-1003 class): the second reported line + 1.
+
+**Fix.** Everything that can trap is emitted on the one C line the `#line` names. Test:
+`tests/zer_trap/i32_div_overflow_line_bug1066.zer` (`expect-trap-at: 14`; reported 15
+pre-fix). The i5/i48/i128 trap tests above assert their lines too.
+
+### BUG-1067 — a FLOAT divisor could not be proven nonzero by any guard (over-rejection: float division by a variable was unwritable)
+
+**Symptom.** `f64 x = 1.0 / y;` was "divisor 'y' not proven nonzero — add 'if (y == 0) {
+return; }'", and that prescription is itself a type error on an f64 ("cannot compare 'f64'
+and 'u32'"). `if (y == 0.0) { return; }` and `if (y != 0.0) { ... }` narrowed nothing, so
+no program could divide by a float variable.
+
+**Root cause.** The `if`-guard VRP folder took its constant side from `eval_const_expr`,
+which folds integer constants only.
+
+**Fix.** ONE `vrp_guard_const(node, op)` at the four constant-side folds of the guard
+detector: a float literal ZERO is accepted for `==` / `!=` only (the two comparisons whose
+meaning, "is this zero?", is the same for a float as for an integer range; `-0.0 == 0.0`,
+so the guard excludes both). The only fact a float variable can then carry is
+`known_nonzero` over the full int64 range, which no bounds proof can use, and an assignment
+re-derives or wipes it through `vrp_invalidate_for_assign` as for any variable. Both
+divisor diagnostics now prescribe `== 0.0` for a float. Corpus: ZERO verdict changes
+outside the new tests. Tests: `tests/zer/float_div_guard_bug1067.zer` (rejected pre-fix),
+`tests/zer_fail/float_div_guard_stale_bug1067.zer` (a write after the guard kills the proof).
+
+### BUG-1068 — `make check` at `ede0646a` exited 2: `ast_name_bind_count` (BUG-1055) was not walker-complete
+
+**Symptom.** `tools/audit_walker_fields.sh` failed on the base commit itself (36 entries,
+all `zercheck_ir.c:ast_name_bind_count`), so `make check` stopped at that gate and every
+later one (fixed-buffer, type-dispatch, carrier, emit, sink matrix, reference examples,
+float-literal) never ran. Measured: the unmodified `/tmp/base_vs` tree prints the same FAIL.
+
+**Root cause.** BUG-1055's binding counter returned 0 for every expression kind on the
+reasoning that "no expression binds a name" — but an expression can CARRY a statement body
+(an orelse BLOCK fallback), which is exactly the BUG-1044 lesson. A `bool c` declared inside
+`x orelse { ... }` was not counted. No accept-unsafe program was constructed (the one probe
+tried was rejected on other grounds), but the count answers a soundness gate ("is this ONE
+stable guard?"), and under-counting is its unsafe direction.
+
+**Fix.** Every child is descended (the count can only grow, which withholds the Level-B
+relaxation — the conservative direction); the four top-level declaration kinds, which
+return 2 without walking, are baselined with that justification. Gate:
+`OK — no new walker field-coverage gaps`.
+
+### Left open (docs/limitations.md)
+
+- The constant evaluator is UNTYPED: signed int64 with `INT64_MIN` as the "not a constant"
+  sentinel. So `i64 m = -9223372036854775807 - 1;` is rejected ("with 'u64'") and a divisor
+  whose value is exactly 2^63 (`const u64 D = 9223372036854775808; x / D`) is "not proven
+  nonzero" — the only value of each type the sentinel collides with. Over-rejection only
+  in every shape probed. The fix is an API change across ~150 call sites.
+- Float division by zero still follows the INTEGER rule (forced guard, runtime trap)
+  rather than IEEE `inf`. The documented rule ("Division by zero — forced guard") does not
+  exempt floats, so dropping it is a language decision, recorded rather than changed; BUG-1067
+  only made the rule satisfiable.
+
+### Measurement
+
+- A/B: 12 new tests. 11 fail on `ede0646a` (wrong value, no trap, wrong trap line, or a verdict flip) and pass here; the twelfth, `float_div_guard_stale_bug1067`, is a BOUNDARY pin that both builds reject — it fails on `ede0646a` only through its `expect-error` (the old prescription said `== 0`).
+- Corpus classifier over 2508 files (`tests/zer`, `zer_fail`, `zer_trap`, `rust_tests`,
+  `zig_tests`), `-o x.c` with both compilers: ZERO checker-verdict changes outside the new
+  tests. Runtime A/B (compile both C outputs, run, compare exit code AND stdout) over every
+  file both accept: ZERO differences outside the new tests, plus
+  `tests/zer_trap/signed_div_overflow_trap.zer`, whose trap now names line 9 (the division)
+  instead of 10 — BUG-1066.
+
+---
+
 ## Session 2026-09-23 — BUG-1049..1056: a bare global held an allocation nothing tracked, three silent miscompiles, a stale MMIO bound, a Level-B guard that was two variables
 
 Audit session. First the four newest audit branches were surveyed: all forked at the then-HEAD

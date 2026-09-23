@@ -385,7 +385,7 @@ struct Symbol {
     /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
     uint64_t mmio_bound;        /* max valid index (0 = no bound) */
     bool is_global_var_mmio;    /* BUG-1056: mmio_bound came from a GLOBAL declaration */
-    int8_t mmio_bound_checked;  /* BUG-1056 (globals): 0 = not yet, 1 = valid, -1 = reassigned somewhere */
+    int8_t never_mutated_cache; /* BUG-1056/1059e (globals): 0 = not computed, 1 = never assigned/addressed anywhere, -1 = is */
 
     /* cross-function range summary: return value range for simple functions */
     int64_t return_range_min;

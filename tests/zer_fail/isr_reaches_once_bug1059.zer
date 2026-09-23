@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: @once is reachable from an interrupt handler
+// BUG-1059b: `@once` reached from both an ISR and main. The freestanding lowering
+// is a plain test-and-set on a compiler-generated flag, which no sharing rule saw.
+volatile u32 ready;
+void init() { @once { ready = 1; } }
+interrupt TIM2 { init(); }
+u32 main() { init(); return 0; }

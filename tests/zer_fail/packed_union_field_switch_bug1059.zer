@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: cannot switch on a union that is a field of a PACKED
+// BUG-1059f: a union switch works through the union's address; inside a packed
+// struct that address is misaligned.
+struct In { u32 x; }
+union U { u8 b; In s; }
+packed struct P { u8 a; U u; }
+P gp;
+u32 main() { switch (gp.u) { .b => |*v| { *v = 1; } .s => |*s| { s.x = 2; } } return 0; }

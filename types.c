@@ -252,7 +252,11 @@ int type_alignment_bytes(Type *a) {
         return max_a;
     }
     case TYPE_UNION: {
-        int max_a = 1;
+        /* BUG-1059h: a ZER union is emitted as `struct { int32_t _tag; union {...}; }`,
+         * so it is at least 4-aligned whatever its variants are. Answering 1 for a
+         * union of byte variants let a packed-struct field of that type pass as
+         * safely viewable while its `_tag` sat on an odd address. */
+        int max_a = 4;
         for (uint32_t i = 0; i < a->union_type.variant_count; i++) {
             int fa = type_alignment_bytes(a->union_type.variants[i].type);
             if (fa > max_a) max_a = fa;

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: shared between interrupt and another interrupt handler code
+// BUG-1059d: two interrupt handlers read-modify-write one volatile. The sharing rule
+// considered only ISR-vs-main, while under nested priorities one handler preempts
+// the other mid-update (the stack rule, BUG-836, already assumes exactly that).
+volatile u32 g;
+interrupt TIM2 { g += 1; }
+interrupt TIM3 { g += 1; }
+u32 main() { return 0; }

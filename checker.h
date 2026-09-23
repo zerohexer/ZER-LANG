@@ -320,6 +320,12 @@ typedef struct {
         bool from_isr;          /* accessed inside interrupt body */
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
+        /* BUG-1059d: which interrupt handler first touched it, and whether a
+         * SECOND one did. Two handlers can preempt each other under nested
+         * priorities (BUG-836's stack rule already assumes any ISR may preempt
+         * any other), so ISR-vs-ISR sharing is the same hazard as ISR-vs-main. */
+        const Node *first_isr_body;
+        bool multi_isr;
         bool compound_in_func;  /* compound assign in regular func */
         /* BUG-1046: passed BY POINTER to a call whose target the analysis cannot
          * see (a function-pointer callee). That call may read-modify-write it;

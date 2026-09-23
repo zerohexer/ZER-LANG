@@ -1,0 +1,17 @@
+// BUG-1059h: @size folded a struct whose field is a struct with a member wider than
+// 8 bytes as if that field were 1-aligned (alignment was guessed from member SIZES
+// capped at 8): `u8[@size(O)]` got 17 bytes where C's sizeof(O) is 24, so a buffer
+// "sized to hold an O" was 7 bytes short. The same guess was exponential in nesting
+// depth (a 40-deep struct took 17 s to check). Both now ask type_alignment_bytes.
+struct In { u64[2] a; }
+struct O { u8 b; In i; }
+union U { u8 x; In y; }
+struct Q { u8 b; U u; }
+u8[@size(O)] buf;
+u8[@size(Q)] qbuf;
+u32 main() {
+    if (buf.len != 24) { return 1; }
+    if (qbuf.len != 32) { return 2; }
+    if (@size(O) != 24) { return 3; }
+    return 0;
+}

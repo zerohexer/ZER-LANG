@@ -232,6 +232,25 @@ allocator. Fix: snapshot (the snapshot already carries `state`) before the add. 
 sweep is clean except the `@saturate` UB inside the emitter tracked with the value-semantics
 batch.
 
+### BUG-1117 — a slice VIEW into a `shared struct`'s array field took no lock (accept-unsafe data race)
+
+`shared struct C { u32[4] a; } C g; ... [*]u32 s = g.a; ThreadHandle th = spawn w(); s[0] += 1;`
+compiled: the `&g.a[i]` interior-address ban (A6/#5) has no `&` to see in an array->slice
+coercion, so the view outlived the per-statement auto-lock. `lvalue_path_through_shared` asks
+the question at EVERY step of the path (the `&` rule only looked at the ROOT symbol, so a shared
+struct nested in a plain one was exempt too), and `reject_array_view_hazards` — already at every
+value-flow sink — refuses the view. (`tests/zer_fail/shared_array_field_slice_view_bug1117.zer`)
+
+### BUG-1118 — a non-shared GLOBAL lent by pointer to a scoped spawn raced the parent (accept-unsafe)
+
+`ThreadHandle th = spawn w(&counter); counter += 1; th.join();` compiled: the borrow rule
+skipped every global ("a global root lends no local"), and the spawn body scan only sees globals
+spelled BY NAME. A lendable global (not const, not shared, not Semaphore/Barrier) is now borrowed
+exactly like a local, so the parent's own access before `join()` is refused and the sink-matrix
+idiom `p20_safe_global_root` still compiles. Residual in limitations.md: a callee of the parent
+naming the global during the window. (`tests/zer_fail/scoped_spawn_global_ptr_bug1118.zer`,
+`tests/zer/scoped_spawn_global_ptr_join_ok_bug1118.zer`)
+
 ---
 
 ## Session 2026-09-22 — BUG-1041..1048: a compiler ABORT on `(x += 1) > 3`, a summary walk that answered "no" for six positions, an orelse block six walkers never entered, a keep trace that peeled to a field name, five ways a pointer reached an RMW unseen, and a comptime folder that skipped what it could not model

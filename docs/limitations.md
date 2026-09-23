@@ -53,6 +53,55 @@ Zero corpus cost (2621 files, both binaries, zero diagnostic differences). The f
 measured-live holes are pinned by the `*_bug1016.zer` negatives, each verified to reject
 on the fix and (bar the global-init reason-only one) accept on the pre-fix build.
 
+## OPEN — the `tests/test_*_matrix.c` grids write fixed `/tmp/_zer_*` paths (2026-09-23, LOW — harness)
+
+Twelve grids (`test_hw_matrix`, `test_conc_matrix`, ... `test_semantic_fuzz`) write their probe
+program and read their diagnostics through fixed paths such as `/tmp/_zer_hw.zer` /
+`/tmp/_zer_hw.err`. Two `make check` runs at once (two worktrees, or a make check beside a
+hand-run grid) read each other's files and report phantom failures. `tests/test_zer.sh` had
+the same defect and was fixed with `mktemp` (BUG-1058 harness note; 84 phantom "WRONG REASON"
+failures measured). Fix sketch: one helper header (`tests/zer_tmp.h`) that builds a per-process
+prefix once (`mkdtemp`), and every grid formats its paths from it. Until then: never run two
+grid-running `make check`s concurrently.
+
+## OPEN — an interrupt handler's own read-modify-write is refused even when only main READS (2026-09-23, LOW/MEDIUM — over-rejection of the tick-counter idiom)
+
+`volatile u32 ticks; interrupt TIM2 { ticks += 1; } u32 main() { u32 t = ticks; ... }` is
+refused ("read-modify-written and is shared"). On a single core the ISR's RMW cannot be split
+by main — main never runs during the handler — so the only real hazards are main's own RMW
+(caught, and since BUG-1059c exempt inside `@critical`) and a SECOND handler that preempts the
+first (caught since BUG-1059d). The relaxation was deliberately NOT shipped: it is unsound on a
+multi-core part where an ISR runs on another core concurrently with main, and the compiler has
+no target fact saying "single core". The accepted spellings today are `@atomic_add(&ticks, 1)`
+or `@critical { ticks += 1; }` in the handler. Fix sketch if taken up: a `--single-core`
+(or target-derived) fact that licenses dropping `compound_in_isr` when `!multi_isr`.
+
+## OPEN — the ISR / stack rules follow a GLOBAL pointer's initializer without checking it is never reassigned (2026-09-23, LOW — accept-side)
+
+BUG-1059a records the pointee of `*u32 gp = &g;` as touched when `gp` is named; a later
+`gp = &h;` elsewhere is not followed, so an ISR writing `*gp` after the reassignment reaches
+`h` unseen. The funcptr stack resolver was hardened the same session with
+`global_name_never_mutated`; `resolve_write_target_global` (shared by the RMW rules) should ask
+the same question and answer "unknown" (every global) when the pointer is reassigned.
+
+## OPEN — `u8[K] buf;` with a local `const usize K = @size(T);` is refused as "not a compile-time constant" (2026-09-23, LOW — over-rejection)
+
+`u8[@size(T)] buf;` works (folded through `compute_type_size`); binding the same value to a
+`const` first does not. Found writing BUG-1059h's test.
+
+## OPEN — `opt_struct = { .x = 1 };` into a `?Struct` is refused (2026-09-23, LOW — over-rejection)
+
+"designated initializer requires struct type, got '?P'" — the var-decl / assignment sink does
+not unwrap the optional before validating the literal. Workaround: build the struct, then
+assign it.
+
+## OPEN — the preamble includes `<string.h>`, `<stdio.h>`, `<stdlib.h>` unconditionally (2026-09-23, LOW — loud)
+
+C99 4.6 guarantees only the freestanding headers; a `-nostdinc` bare-metal toolchain fails on
+`string.h`. Every mainstream bare-metal toolchain (newlib, picolibc) provides them, and the
+emitted code uses `memcpy`/`memset` in both modes, so the fix is to gate stdio/stdlib on
+`_ZER_HOSTED` and route mem* through `__builtin_memcpy`/`__builtin_memset`.
+
 ## OPEN — three RMW-reach residuals after BUG-1046 (2026-09-22, LOW/MEDIUM — two accept-side, one precision)
 
 **1. A carrier that points at TWO globals binds the first only (accept-side, LOW).**
@@ -62,14 +111,9 @@ global, so `H h = { .p = &g1, .q = &g2 }; bump(h)` resolves `h` to `g1`; an RMW 
 SET (or bind `h.p` / `h.q` as compound keys, the way the atomic-cell path keys do) and have
 `rmw_arg_target_global` return all of them for the callee's param binding.
 
-**2. A funcptr FIELD callee inside a spawn target declared AFTER its spawner is not treated
-as opaque (accept-side, MEDIUM).** `callee_is_opaque_funcptr` recognises `o.cb(&g)` by the
-callee's TYPEMAP type, which exists only once that body has been checked; the spawn scan
-runs from the spawner's body, so a target declared later has no entry yet. The IDENT forms
-(`fp(&g)`, `gfp(&g)`) do not depend on the typemap and are caught in either order; the ISR
-scan runs after every body and is unaffected. Fix sketch: resolve the field's type from the
-object's declared struct type (walk `struct_type.fields`) instead of the typemap, or run
-the spawn scans as a post pass like ISR-TRANS.
+**2. ~~A funcptr FIELD callee inside a spawn target declared AFTER its spawner is not treated
+as opaque~~ — CLOSED 2026-09-23 (BUG-1052):** an untyped FIELD/INDEX callee now rounds toward
+opaque in `callee_is_opaque_funcptr`.
 
 **3. A GLOBAL funcptr rebound in another function is resolved through its declaration
 initializer (pre-existing, accept-side, LOW).** ISR "facet 1" descends the function named
@@ -197,75 +241,17 @@ before the statement expression opens.
 
 ---
 
-## OPEN — an allocation stored in a BARE GLOBAL is tracked by nothing (2026-09-15, MEDIUM — measured UAF, carrier-independent)
+## CLOSED 2026-09-23 (BUG-1049) — an allocation stored in a BARE GLOBAL is tracked
 
-**Symptom (ASan-confirmed, compiles with zero diagnostics):**
-
-    [*]u32 g;
-    u32 run() { g = alloc(u32, 4) orelse return; free(g); return g[0]; }
-
-    AddressSanitizer: heap-use-after-free ... #0 in run ... gbl2.zer:2
-
-The POINTER spelling (`?*W g; g = alloc(W); ... free(q); ... g`) is accepted too;
-it does not show under ASan only because `alloc(T)` for a single object is an
-auto-Slab that recycles rather than returning to libc — the tracking gap is the
-same. Not specific to the factory forms fixed as BUG-1023/1024: the DIRECT
-`g = alloc(...)` is equally untracked.
-
-**Root cause.** `ir_global_projection_key` — the G5 mechanism that lets a global's
-storage be a tracked slot — opens with
-
-    if (expr->kind != NODE_FIELD && expr->kind != NODE_INDEX) return false;
-
-so it registers `g.p` and `g.arr[0]` and deliberately NOT bare `g`. Every sink
-resolves globals through `ir_extract_compound_key`, which is the only caller, so a
-bare global has no key anywhere and no sink can see it.
-
-**Why the obvious fix needs measuring first.** Admitting a bare global ident would
-make ~36 sinks start seeing bare globals at once. CLAUDE.md records that
-MAYBE_FREED globals at exit are deliberately NOT flagged, because that noises the
-legitimate register-context-then-callback pattern — so the widening has a real
-false-positive surface and must be measured, not argued. That is why it was not
-bolted onto BUG-1024.
-
-**Fix sketch — ATTEMPTED 2026-09-15 and deliberately REVERTED; read this before
-trying again, it is most of the work.** The one-line part is easy: give
-`ir_global_projection_key` a bare-ident arm producing the key
-`(IR_GLOBAL_ROOT_ID, "g")`, gated on `ir_ident_is_unshadowed_global`. Measured with
-that in place:
-
-- The three defects are caught — bare global slice with a direct alloc, the same
-  via a factory, and a bare global pointer double-free. So the key really is the
-  only thing missing on the detection side.
-- The `escaped = true` invariant is NOT a hazard: `ir_add_compound_handle` sets it
-  by construction for `IR_GLOBAL_ROOT_ID`, so no widening of the key set can reach
-  the `func->locals[-2]` access the invariant exists to prevent.
-
-**What stops it are two SIBLING RULES that have never seen a bare global**, and
-both produce a WRONG SENTENCE rather than an over-rejection — the failure mode
-CLAUDE.md records as worse than the permissive answer:
-
-1. **The dangling-at-exit rule prescribes a remedy that does not compile.** It says
-   *"reset it (`g = null;`) after the free"*. For a NON-OPTIONAL global — `[*]u32 g`
-   or `*T g`, which is what a bare global carrying an allocation usually is — `g =
-   null;` is `error: cannot assign 'void' to '[]u32'`. The advice is unfollowable,
-   so the rule becomes an inescapable over-rejection. It needs a carrier-aware
-   sentence: for a non-optional global the real remedy is to declare it `?[*]u32` /
-   `?*T` so it CAN hold the reset.
-2. **`g = null;` is not taught as a RESET for the bare form.** With the key added,
-   `?[*]u32 g; ... free(s); g = null;` reports *"use after free: 'g' is freed"* —
-   on the very line the first rule just told the author to write. BUG-985 added
-   exactly this reset arm (`freed_then_reset`) for the SLOT form `g.p = null;`; the
-   bare-ident form reuses the state itself and has no equivalent.
-
-So the order is: teach (2) the bare form, fix (1)'s wording per carrier, THEN add
-the key, THEN measure the corpus compiler-classified (compile every corpus file
-with both binaries and diff exit status + diagnostic count). Landing the key alone
-trades an ASan-confirmed UAF for a diagnostic that contradicts itself, which is not
-a trade worth making.
-
-**Gate when it lands:** cells in SHAPE p26 of `tools/sink_matrix.sh` crossing
-{bare global, global field} x {direct alloc, factory} x {UAF, double-free}.
+Closed in the order the 2026-09-15 attempt prescribed: `g = null;` became an overwrite for a
+bare global (`ir_assign_target_is_tracked_slot`), the dangling-global sentence became
+carrier-aware (`ir_report_dangling_global`: a non-optional global is told to be declared
+`?[*]T` / `?*T`), THEN the bare-ident key landed in `ir_extract_compound_key`. Corpus cost
+measured compiler-classified over 2585 files: zero verdict changes. Gate: SHAPE p27 in
+`tools/sink_matrix.sh`. Found beside it and closed by the same key: `g = s; free(g); s[0]`
+(the free THROUGH the global, the alias from a local). Residual (unchanged): a global freed in
+one function and read in another is caught only by the exit/call-window dangling rules, as
+for every global before.
 
 ---
 ## OPEN — the checker's fits-check on a `const` GLOBAL initializer uses the UNWRAPPED fold (2026-09-14, LOW — over-rejection, BUG-1032 residual)

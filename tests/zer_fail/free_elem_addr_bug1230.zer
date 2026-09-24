@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: points INSIDE its allocation
+// BUG-1230: free() of an element address `&s[1]` (reached GCC before).
+struct T { u32 v; }
+u32 main() {
+    [*]T s = alloc(T, 4) orelse return;
+    *T e = &s[1];
+    free(e);
+    return 0;
+}

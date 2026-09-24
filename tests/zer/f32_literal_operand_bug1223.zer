@@ -1,0 +1,25 @@
+// BUG-1223: a float literal meeting an f32 operand kept its f64 typing, so
+// `x + 0.1` ran in double and was rounded to f32 afterwards — two roundings where
+// the f32 operation has one, and a disagreement with the comptime fold (BUG-1205).
+// 0.1 is not exact in f32; x's bits are chosen so the two answers differ.
+u32 idu(u32 x) { return x; }
+comptime f32 ADD(f32 a) { return a + 0.1; }
+f32 add_rt(f32 a) { return a + 0.1; }
+u32 main() {
+    f32 x = @bitcast(f32, idu(0x3e0003d1));
+    f32 tenth = 0.1;
+    f32 r_lit = x + 0.1;
+    f32 r_var = x + tenth;
+    if (@bitcast(u32, r_lit) != @bitcast(u32, r_var)) { return 1; }
+    f32 y = x;
+    y += 0.1;
+    if (@bitcast(u32, y) != @bitcast(u32, r_var)) { return 2; }
+    ?f32 o = x + 0.1;
+    f32 ov = o orelse 0.0;
+    if (@bitcast(u32, ov) != @bitcast(u32, r_var)) { return 3; }
+    f32 c = ADD(0.125014558);
+    if (@bitcast(u32, c) != @bitcast(u32, add_rt(x))) { return 4; }
+    f32 one = 0.1;
+    if (!(one == 0.1)) { return 5; }
+    return 0;
+}

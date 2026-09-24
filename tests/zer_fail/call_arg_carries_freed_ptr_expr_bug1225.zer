@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: carries a freed pointer at 'h.p'
+// BUG-1225: the same through a call in EXPRESSION position (`get(&h).v`).
+struct T { u32 v; }
+struct H { *T p; }
+*T get(*H h) { return h.p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 77;
+    u32 r = get(&h).v;
+    free(b);
+    return r;
+}

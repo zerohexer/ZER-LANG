@@ -182,6 +182,12 @@ typedef struct IRInst {
      * function containing a LABEL — see materialise_defer_body. */
     bool defer_fire_emit_ast;
 
+    /* BUG-1221: on IR_ASSIGN, zero the destination local (`memset`, any type,
+     * arrays included) — a declaration WITHOUT an initializer that can execute
+     * more than once (in a loop body, or in a function with labels). `expr` is a
+     * literal 0 so analyses see an ordinary constant store. */
+    bool zero_dest;
+
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
     /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this

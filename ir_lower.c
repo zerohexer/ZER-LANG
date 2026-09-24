@@ -1556,8 +1556,15 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
      * re-fire the defer stack and skip the rest of the function's cleanup, which is
      * exactly why the emitter's guard_traps exists. IR_TRAP is a terminator, so the
      * CFG knows the path ends. */
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) {
-        emit_inst(ctx, make_inst(IR_TRAP, g->line));
+    /* BUG-1222: nor when the function's result has no zero value (an enum
+     * without a 0 variant — the literal return below would forge one). */
+    bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
+    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+        IRInst tr = make_inst(IR_TRAP, g->line);
+        /* literal_kind names the reason for the emitter's message:
+         * 0 = a scope that cannot be left, 1 = no zero value to return */
+        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
         return;
@@ -2967,6 +2974,25 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             node->var_decl.name, (uint32_t)node->var_decl.name_len,
             vt, false, false, false, node->loc.line);
         if (local_id >= 0) ctx->func->locals[local_id].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
+        /* BUG-1221: ZER auto-zeroes a declaration EVERY time it executes. Locals
+         * are hoisted to the function top and zeroed there ONCE, so `u32 acc;`
+         * in a loop body kept last iteration's value (`acc += 5` summed to 30,
+         * not 15), and a pointer / Handle declared that way carried a stale one.
+         * Re-zero at the declaration wherever it can run again: inside a loop, or
+         * in a function with labels (a backward goto). */
+        if (local_id >= 0 && !node->var_decl.init &&
+            (ctx->loop_exit_block >= 0 || ctx->label_count > 0)) {
+            Node *zlit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(zlit, 0, sizeof(Node));
+            zlit->kind = NODE_INT_LIT;
+            zlit->loc = node->loc;
+            zlit->int_lit.value = 0;
+            IRInst zi = make_inst(IR_ASSIGN, node->loc.line);
+            zi.dest_local = local_id;
+            zi.expr = zlit;
+            zi.zero_dest = true;
+            emit_inst(ctx, zi);
+        }
         if (local_id >= 0 && node->var_decl.init) {
             /* Rewrite idents in init expression to use correct local names */
             rewrite_idents(ctx, node->var_decl.init);

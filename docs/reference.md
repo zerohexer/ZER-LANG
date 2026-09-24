@@ -118,6 +118,11 @@ f64 precise = 3.14159265358979;
 ```
 
 **NOTES**
+- A float literal combined with an `f32` takes the f32's precision: `x + 0.1`
+  (with `f32 x`) is ONE f32 operation on `0.1` rounded to f32, not a double
+  operation rounded afterwards (BUG-1223). The same at every value-flow position
+  (`y += 0.1`, `?f32 o = x + 0.1`, a return, an argument), and the comptime fold
+  rounds the same way.
 - Digit-group underscores are allowed in numeric literals for readability and
   are ignored by the value: `1_000.5`, `3.141_592`, `1e1_0` (and `1_000_000`
   for integers).
@@ -265,7 +270,10 @@ That is a real behavioural difference from `[*]T`, which traps:
 | `[*]T` (slice) | `_zer_trap` — `SIGTRAP`, with the file and line |
 
 So a fixed-array access that goes out of range does not crash: it abandons the
-rest of the function and hands the caller a zero. Inside `@critical` or a held
+rest of the function and hands the caller a zero. When the function's return
+type HAS no zero value — a non-null `*T`, or an enum with no variant equal to 0 —
+there is nothing to hand back, and the guard TRAPS instead (BUG-1222; it used to
+return NULL / a non-variant). Inside `@critical` or a held
 lock the guard traps instead (an early return would leak the interrupt-disable or
 the mutex) — see "SAFETY RULES YOU WILL HIT". If you want the loud behaviour
 everywhere, index a slice, or write the explicit `if (i >= N) { ... }`, which
@@ -548,6 +556,9 @@ Must unwrap before use.
 ?bool flag;                // struct { u8 value; u8 has_value; }
 ?void status;              // struct { u8 has_value; } — NO .value field!
 ```
+
+A literal assigned to a `?T` is checked against `T`: `?u8 a = 200;` compiles and
+`?u8 a = 300;` does not (BUG-1224 — narrow payloads used to be refused outright).
 
 **EXAMPLE**
 ```zer
@@ -1744,6 +1755,16 @@ free(xs);                                    // release a [*]T
   primitive: `alloc(u8, n)`, `alloc(u32, n)`, `alloc(Node, n)`). Memory is
   auto-zeroed (calloc semantics).
 - `free(x)` → `void` — releases a `*T` or a `[*]T`. Dispatches on the shape.
+  `x` must be the pointer `alloc` handed out: freeing a VIEW inside the
+  allocation — a sub-slice that does not start at 0 (`s[1..4]`), or the address
+  of an element / field (`&s[2]`) — is a compile error, directly or through a
+  callee that frees its parameter (BUG-1230).
+- A freed pointer is dead wherever it is carried: handing a callee a struct
+  (by value or `&`) whose field still holds a freed pointer is refused like
+  passing the pointer itself (BUG-1225) — reset the field (`h.p = null;`) after
+  the free. The same holds for a field of an array element (`arr[i].p`), a
+  factory-returned struct, a value stored through an out-parameter, and a
+  `move struct` handed to a callee that frees its field (BUG-1226..1229).
 - Neither may run inside an `interrupt` handler or a `@critical` block — the
   libc heap lock may deadlock there — and the ban is TRANSITIVE: a helper that
   allocates or frees cannot be called from either context (BUG-1036: the
@@ -5079,6 +5100,13 @@ The rest of the contract (BUG-1196/1198):
 
 Rules that reject code most people expect to compile. Each is here because the
 alternative is a wrong answer at run time rather than a message at compile time.
+
+### Auto-zero happens every time a declaration RUNS
+
+`u32 acc;` is zero each time control reaches it — inside a loop body that is
+every iteration, and after a backward `goto` it is again (BUG-1221; before, a
+loop-body declaration without an initializer kept the previous iteration's
+value). A pointer or `?*T` declared that way starts every iteration as null.
 
 ### Bounds: four verdicts, not two
 

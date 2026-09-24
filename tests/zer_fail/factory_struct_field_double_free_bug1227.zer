@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: double free: 'a.p' already freed
+// BUG-1227: a factory-returned struct's field was untracked, so freeing it twice compiled.
+struct T { u32 v; }
+struct S { *T p; }
+S mk() { *T p = alloc(T) orelse { S e; return e; }; S r = { .p = p }; return r; }
+u32 main() {
+    S a = mk();
+    free(a.p);
+    free(a.p);
+    return 0;
+}

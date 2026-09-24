@@ -1,0 +1,9 @@
+// expect-trap
+// expect-trap-at: 8
+// BUG-1222: the auto-guard's early return handed back NULL from a `*Box`
+// function (non-null by type). It must trap at the guarded access instead.
+struct Box { u32 v; }
+Box gb;
+u32[4] arr;
+*Box f(u32 k) { arr[k] = 1; return &gb; }
+u32 main() { *Box p = f(9); p.v = 5; return 0; }

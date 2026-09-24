@@ -1,0 +1,22 @@
+// BUG-1224: a literal into ?T narrower than 32 bits was refused at every sink
+// (`?u8 a = 200;` — the literal's default u32 typing only coerces to ?u32).
+?u8 r8() { return 200; }
+struct S { ?u16 a; }
+u32 take(?i8 v) { i8 x = v orelse 0; return (u32)(x + 10); }
+u32 main() {
+    ?u8 a = 200;
+    ?u12 b = 5;
+    ?i16 c = 7;
+    ?i8 d = -1;
+    ?i4 e = -8;
+    S s = { .a = 5 };
+    a = 17;
+    u8 av = a orelse 0;
+    if (av != 17) { return 1; }
+    if ((r8() orelse 0) != 200) { return 2; }
+    if ((s.a orelse 0) != 5) { return 3; }
+    if (take(5) != 15) { return 4; }
+    i16 cv = c orelse 0;
+    if (cv != 7) { return 5; }
+    return 0;
+}

@@ -1,0 +1,11 @@
+// BUG-1229: a move struct handed to a callee that frees its field is fully consumed —
+// the caller does not free it again (was a false "never freed" leak).
+struct T { u32 v; }
+move struct M { *T p; }
+void eat(M m) { free(m.p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    M m = { .p = a };
+    eat(m);
+    return 0;
+}

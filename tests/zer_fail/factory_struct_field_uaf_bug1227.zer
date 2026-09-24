@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1227: ...and a read after the free returned a recycled object.
+struct T { u32 v; }
+struct S { *T p; }
+S mk() { *T p = alloc(T) orelse { S e; return e; }; S r = { .p = p }; return r; }
+u32 main() {
+    S a = mk();
+    free(a.p);
+    *T t = alloc(T) orelse return;
+    t.v = 77;
+    u32 r = a.p.v;
+    free(t);
+    return r;
+}

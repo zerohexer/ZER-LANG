@@ -5,6 +5,83 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24c — BUG-1221..1230: a fresh audit round (async, allocation tracker, arithmetic) — the non-async findings
+
+**Method.** Three read-only agents probed against a frozen compiler; every finding below was
+re-run here, every negative COMPILED on the from-HEAD baseline and every positive FAILED on it.
+The async-specific findings are the next batch (limitations.md, "async"). Sink matrix shape p39
+(12 cells) is new: all nine reject cells are HOLES on the baseline and the move-struct boundary
+cell was an over-rejection there.
+
+### BUG-1221 — a declaration without an initializer was zeroed once, not every time it ran
+Locals are hoisted to the function top and zeroed there, so `u32 acc;` in a loop body kept the
+previous iteration's value (`acc += 5` summed 30 over three iterations, not 15), and a `?*T`
+declared that way carried the last iteration's pointer. ir_lower now re-zeroes at the declaration
+wherever it can run again — in a loop, or in a function with labels (backward `goto`) — through
+`IR_ASSIGN` with the new `zero_dest` flag (the emitter writes a `memset`; analyses see a literal
+0). zercheck_ir treats it as a store: an allocation it orphans is reported through the existing
+overwrite check (same verdict as before), and the local's entries are dropped — which also fixes
+the false "use of freed value" on `?*T p;` in a loop that frees what it held. Test:
+`tests/zer/loop_decl_rezeroed_bug1221.zer`.
+
+### BUG-1222 — the auto-guard's early return forged a value of a type with no zero
+An out-of-range fixed-array index returns early with the function's zero value. For a `*T`
+function that is NULL (a non-null pointer handed to the caller — a silent access near address 0
+on bare metal), and for an enum with no 0 variant it is a non-variant (the exhaustive switch's
+last-arm elision then took a wrong arm). ONE predicate `checker_type_has_no_zero_value` (exported;
+BUG-1189's goto rule now calls it) decides; both the IR-lowered guard (`IR_TRAP`, message chosen by
+`literal_kind`) and the emitter's C-level guard trap instead, async bodies included. Tests:
+`tests/zer_trap/autoguard_{nonnull,enum}_return_bug1222.zer` (`expect-trap-at` the guard's line).
+
+### BUG-1223 — a float literal next to an f32 ran in double
+`is_literal_compatible` let `0.1` adopt f32 in the checker's local type only; its typemap stayed
+f64, so the IR temp was `double` and `x + 0.1` was a double operation rounded to f32 — two
+roundings — disagreeing with `x + tenth` and with the comptime fold (BUG-1205). A float-literal
+tree is now retyped (`retype_const_float_to_target`) at both binary operand sites and at every
+LIT-1 value-flow sink (var-decl, assign / compound, call arg, return, orelse fallback, struct
+field, global). Test: `tests/zer/f32_literal_operand_bug1223.zer` (0.1 is not exact in f32).
+
+### BUG-1224 — a literal into a `?T` narrower than 32 bits was refused
+`?u8 a = 200;` failed "cannot initialize '?u8' with 'u32'" at every sink while `?u32` worked, only
+because the literal's default u32 typing coerces to `?u32`. `is_literal_compatible` now asks the
+question of the payload type. Test: `tests/zer/optional_narrow_literal_bug1224.zer`.
+
+### BUG-1225..1230 — the allocation tracker lost a freed or interior pointer inside a carrier
+Each compiled clean and read a recycled object, double-freed, or freed a non-heap pointer.
+- **1225** a struct handed to a call (by value, by `&`, or in expression position) whose FIELD
+  holds a freed pointer: `ir_check_call_arg_carriers`, from the UAF walker's NODE_CALL arm, reports
+  any FREED / MAYBE_FREED entry rooted strictly inside an argument.
+- **1226** `arr[i].p` (a field of a variable-index element): a free through the view recorded no
+  slot fact because the slot key was kept only for a bare element read; it now keeps the full
+  path.
+- **1227** an untracked local (a factory-returned struct's field, a copied value) freed: the lazy
+  "register on free" of BUG rdh99l applied to params only; it now applies to every local (escaped:
+  a fact, not an ownership claim), so a second free or a later use is seen.
+- **1228** `fill(&m)` with `void fill(*?*T o){ *o = alloc(T); }`: an untracked pointer local
+  handed by address to a call gets an escaped entry, so frees through its captures are recorded.
+- **1229** a `move struct` copy `break`s before the compound replicate, so its pointer fields
+  were never carried — a callee freeing `m.p` freed nothing visible, and the caller's `free(a)` was
+  a clean double free (while the correct consume-and-done program was a false leak). The move
+  branch now calls `ir_carry_compounds`.
+- **1230** `free()` of an INTERIOR view: `IRHandleInfo.interior` (carried by aliasing) marks a
+  sub-slice not starting at 0 and an element / field address; the free sink refuses it (and the
+  inline spelling), and a call whose callee frees that parameter refuses an interior argument.
+  Measured: glibc aborted (`free(): invalid pointer`); a bare-metal allocator would have been
+  corrupted.
+Two companion adjustments, each found by `make check` rather than by reasoning. (a) An
+untracked value COPIED into a local that now carries a FREED fact (BUG-1227 made that possible)
+must retire the fact, or a loop's `if (arr[i].pos) |ph|` capture, re-filled every iteration,
+read as freed on the next one (`mini_ecs`); the IR_COPY no-source arm drops the destination's
+bare entry, reporting it as an overwrite leak if it was live. (b) The BUG-1225 carrier rule
+does not apply to a builtin (`free`, pool / slab / arena methods): those do not read the
+fields of what they are handed, and `free(ht.buckets); free(ht);` is the canonical two-level
+teardown (`universal_alloc_slice`).
+Tests: `tests/zer_fail/{call_arg_carries_freed_ptr*,varidx_field_free_reuse,factory_struct_field_*,
+outparam_optptr_double_free,move_struct_callee_frees_field,free_subslice*,free_elem_addr}_bug12xx.zer`,
+`tests/zer/move_struct_callee_frees_ok_bug1229.zer`; sink matrix p39.
+
+---
+
 ## Session 2026-09-24b — BUG-1194..1220: bare-metal and module holes (an audit agent's batch, each re-measured)
 
 **Method.** Every negative below COMPILED on the from-HEAD baseline (`5b63c9b8`) and is refused

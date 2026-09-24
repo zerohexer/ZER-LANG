@@ -1377,6 +1377,13 @@ static bool is_literal_compatible(Node *expr, Type *target) {
     if (int_literal_tree_fits(NULL, expr, target)) return true;
     /* unwrap distinct for literal compatibility */
     Type *effective = type_unwrap_distinct(target);
+    /* BUG-1224: a literal flowing into `?T` becomes the T inside it — `?u8 a =
+     * 200;` was refused ("cannot initialize '?u8' with 'u32'") at every sink
+     * while `?u32 a = 200;` compiled, only because the literal's default u32
+     * typing happens to coerce to ?u32. Ask the question of the payload type. */
+    if (effective && type_dispatch_kind(effective) == TYPE_OPTIONAL &&
+        expr->kind != NODE_NULL_LIT)
+        return is_literal_compatible(expr, effective->optional.inner);
     if (expr->kind == NODE_INT_LIT && type_is_integer(effective)) {
         /* range check: literal must fit in target type.
          * SAFETY: zer_literal_fits_u in src/safety/arith_rules.c (M08).
@@ -1662,6 +1669,43 @@ static void retype_const_int_to_target(Checker *c, Node *e, Type *target) {
         retype_const_int_to_target(c, e->binary.right, target);
         typemap_set(c, e, target);
     }
+}
+
+/* BUG-1223: the FLOAT twin of retype_const_int_to_target. A float literal meeting
+ * an f32 operand adopted f32 only in the checker's local Type — its typemap entry
+ * stayed f64, so ir_lower made a `double` temp and `x + 0.1` ran in double and was
+ * rounded to f32 afterwards: two roundings where the f32 operation has one (and a
+ * disagreement with the comptime fold, which rounds per operation, BUG-1205).
+ * Retypes a pure float-literal tree (literal, unary minus, arithmetic of those). */
+static bool is_pure_float_literal_expr(Node *e, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    if (e->kind == NODE_FLOAT_LIT) return true;
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_MINUS)
+        return is_pure_float_literal_expr(e->unary.operand, depth + 1);
+    if (e->kind == NODE_BINARY &&
+        (e->binary.op == TOK_PLUS || e->binary.op == TOK_MINUS ||
+         e->binary.op == TOK_STAR || e->binary.op == TOK_SLASH))
+        return is_pure_float_literal_expr(e->binary.left, depth + 1) &&
+               is_pure_float_literal_expr(e->binary.right, depth + 1);
+    return false;
+}
+static void retype_float_tree(Checker *c, Node *e, Type *target) {
+    if (!e) return;
+    if (e->kind == NODE_UNARY) retype_float_tree(c, e->unary.operand, target);
+    else if (e->kind == NODE_BINARY) {
+        retype_float_tree(c, e->binary.left, target);
+        retype_float_tree(c, e->binary.right, target);
+    }
+    typemap_set(c, e, target);
+}
+/* `target` may be an optional of a float (the value inside it is what the
+ * literal becomes). Only a PURE float-literal tree is retyped. */
+static void retype_const_float_to_target(Checker *c, Node *e, Type *target) {
+    Type *t = target ? type_unwrap_distinct(target) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL) t = type_unwrap_distinct(t->optional.inner);
+    if (!e || !t || !type_is_float(t)) return;
+    if (!is_pure_float_literal_expr(e, 0)) return;
+    retype_float_tree(c, e, t);
 }
 
 /* LIT-1: the integer type a pure-literal constant should be retyped to for a
@@ -6152,6 +6196,7 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     Type *rt = int_retype_target(ft);
                     if (rt) retype_const_int_to_target(c, df->value, rt);
                 }
+                retype_const_float_to_target(c, df->value, ft);   /* BUG-1223 */
                 break;
             }
         }
@@ -9664,6 +9709,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *rt = int_retype_target(right);
                 if (rt) retype_const_int_to_target(c, node->binary.left, rt);
             }
+            retype_const_float_to_target(c, node->binary.left, right);   /* BUG-1223 */
         }
         if (is_literal_compatible(node->binary.right, left)) {
             right = left;
@@ -9671,6 +9717,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *rt = int_retype_target(left);
                 if (rt) retype_const_int_to_target(c, node->binary.right, rt);
             }
+            retype_const_float_to_target(c, node->binary.right, left);   /* BUG-1223 */
         }
 
         switch (node->binary.op) {
@@ -11902,6 +11949,7 @@ static Type *check_expr(Checker *c, Node *node) {
             Type *rt = int_retype_target(target);
             if (rt) retype_const_int_to_target(c, node->assign.value, rt);
         }
+        retype_const_float_to_target(c, node->assign.value, target);   /* BUG-1223 */
         /* check type compatibility */
         if (node->assign.op == TOK_EQ) {
             if (!value_flows_to(node->assign.value, value, target)) {
@@ -13206,6 +13254,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         Type *rt = int_retype_target(param);
                         if (rt) retype_const_int_to_target(c, node->call.args[i], rt);
                     }
+                    retype_const_float_to_target(c, node->call.args[i], param);   /* BUG-1223 */
                 }
 
                 /* keep parameter validation: check call arguments.
@@ -14905,6 +14954,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     Type *rt = int_retype_target(unwrapped);
                     if (rt) retype_const_int_to_target(c, node->orelse.fallback, rt);
                 }
+                retype_const_float_to_target(c, node->orelse.fallback, unwrapped);   /* BUG-1223 */
                 /* fallback must match unwrapped type */
                 reject_unique_resource_copy(c, node->orelse.fallback, unwrapped,
                                             node->loc.line, "use");
@@ -19870,6 +19920,7 @@ static void check_stmt(Checker *c, Node *node) {
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, node->var_decl.init, rt);
             }
+            retype_const_float_to_target(c, node->var_decl.init, type);   /* BUG-1223 */
             /* cross-platform portability: @ptrtoint to fixed-width type is fragile.
              * u32 x = @ptrtoint(ptr) works on 32-bit but loses bits on 64-bit.
              * Warn even if types match on current target — use usize instead. */
@@ -22531,6 +22582,7 @@ static void check_stmt(Checker *c, Node *node) {
                     Type *rt = int_retype_target(c->current_func_ret);
                     if (rt) retype_const_int_to_target(c, node->ret.expr, rt);
                 }
+                retype_const_float_to_target(c, node->ret.expr, c->current_func_ret);   /* BUG-1223 */
             }
         } else {
             /* bare return — function must return void */
@@ -25437,9 +25489,11 @@ static bool switch_arm_has_capture_local(SwitchArm *arm) {
  * position in its block, so "the goto's path does not cover the label's" is
  * exactly "the jump bypasses the initialization" (C++'s rule, restricted to the
  * types for which auto-zero is not a value). */
-static bool decl_has_no_zero_value(Checker *c, Node *decl) {
-    if (!decl || decl->kind != NODE_VAR_DECL || decl->var_decl.is_static) return false;
-    Type *t = checker_get_type(c, decl);
+/* BUG-1222: ONE answer to "is the all-zero bit pattern NOT a value of this
+ * type?" — a non-null `*T` / funcptr, or an enum with no variant equal to 0.
+ * Asked by the goto-bypass rule (BUG-1189) and by the emitter's auto-guard early
+ * return, which used to hand back exactly that zero. */
+bool checker_type_has_no_zero_value(Type *t) {
     if (!t) return false;
     bool is_func = false;
     if (nonnull_zero_hole(t, &is_func)) return true;
@@ -25450,6 +25504,10 @@ static bool decl_has_no_zero_value(Checker *c, Node *decl) {
         return true;
     }
     return false;
+}
+static bool decl_has_no_zero_value(Checker *c, Node *decl) {
+    if (!decl || decl->kind != NODE_VAR_DECL || decl->var_decl.is_static) return false;
+    return checker_type_has_no_zero_value(checker_get_type(c, decl));
 }
 
 /* BUG-1189: is `name` mentioned by any statement at or after `line`? The bypassed
@@ -29877,6 +29935,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                 Type *rt = int_retype_target(type);
                 if (rt) retype_const_int_to_target(c, decl->var_decl.init, rt);
             }
+            retype_const_float_to_target(c, decl->var_decl.init, type);   /* BUG-1223 */
             /* Designated initializer: the struct literal is typed by its
              * DESTINATION, exactly as at a local declaration (check_expr leaves
              * it `void` — context supplies the type). This call was missing here,

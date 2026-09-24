@@ -704,6 +704,22 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
      * with no fault to notice it by. That asymmetry is why no existing test caught
      * either half. Trapping is the same trade-off already accepted for defer bodies,
      * and consistent with slices, which already TRAP on an out-of-range index. */
+    /* BUG-1222: an early return must RETURN SOMETHING, and for a `*T` function
+     * (non-null) or an enum without a 0 variant the zero it used to return is not
+     * a value of the type — a NULL non-null pointer handed to the caller (on bare
+     * metal a silent access near address 0), or a non-variant enum that the
+     * exhaustive switch's last-arm elision turns into a wrong arm. Trap, exactly
+     * like the lock / @critical / defer scopes below. */
+    bool ret_has_no_zero = e->current_func_ret &&
+        checker_type_has_no_zero_value(e->current_func_ret);
+    if (ret_has_no_zero) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds access in a function whose return type has "
+                "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
+                "return early\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (e->guard_traps || e->noreturn_scope_depth > 0) {
         if (with_braces) emit(e, "{ ");
         emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
@@ -12266,6 +12282,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     switch (inst->op) {
 
     case IR_ASSIGN: {
+        /* BUG-1221: re-zero a declaration that executes again (see ir_lower). */
+        if (inst->zero_dest && inst->dest_local >= 0) {
+            emit(e, "memset((void *)&");
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, ", 0, sizeof(");
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, "));\n");
+            break;
+        }
         if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dest = &func->locals[inst->dest_local];
 
@@ -12894,8 +12919,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * @critical, returning would skip the interrupt re-enable. Same emitted
          * text as the C-level guard used, now with the CFG knowing the path ends. */
         emit_indent(e);
-        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
-                "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
+        if (inst->literal_kind == 1)   /* BUG-1222 */
+            emit(e, "_zer_trap(\"out-of-bounds access in a function whose return type has "
+                    "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
+                    "return early\", __FILE__, __LINE__);\n");
+        else
+            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+                    "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
         break;
 
     case IR_UNLOCK: {

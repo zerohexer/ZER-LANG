@@ -826,6 +826,28 @@ cell p38_safe_bound        compile "$P38"' u32 main(){ B38 b = mk38(3); [*]u32 s
 cell p38_safe_value_read   compile "$P38"' u32 main(){ return mk38(4).arr[2] - 4; }'
 cell p38_safe_slice_field  compile "$P38"' u32[4] ga38; B38 mks38(){ B38 b; b.s = ga38; return b; } u32 main(){ [*]u32 s = mks38().s[0..2]; return (u32)s.len - 2; }'
 
+# SHAPE p39 (BUG-1225..1230): a freed / interior pointer reaching a FREE or USE sink
+# through a CARRIER the tracker did not follow — a struct argument, a field of a
+# variable-index element, a factory-returned struct, an out-param, a move struct,
+# a sub-slice. Every reject cell compiled pre-fix (a recycled object read, a
+# double free, or glibc's abort on a non-heap free).
+echo "===== SHAPE p39 = freed / interior pointer through a carrier (carrier x sink) ====="
+P39='struct T39{u32 v;} struct H39{*T39 p;} struct O39{?*T39 p;}'
+cell p39_struct_arg_ptr    reject "$P39"' u32 rd39(*H39 h){ return h.p.v; } u32 main(){ *T39 a = alloc(T39) orelse return; H39 h = { .p = a }; free(a); return rd39(&h); }'
+cell p39_struct_arg_value  reject "$P39"' u32 rd39(H39 h){ return h.p.v; } u32 main(){ *T39 a = alloc(T39) orelse return; H39 h = { .p = a }; free(a); return rd39(h); }'
+cell p39_varidx_field      reject "$P39"' u32 main(){ O39[4] l; l[0].p = alloc(T39); u32 i = 0; if (l[i].p) |p| { free(p); } u32 r = 0; if (l[i].p) |q| { r = q.v; } return r; }'
+cell p39_factory_field     reject "$P39"' H39 mk39(){ *T39 p = alloc(T39) orelse { H39 e; return e; }; H39 r = { .p = p }; return r; } u32 main(){ H39 a = mk39(); free(a.p); free(a.p); return 0; }'
+cell p39_outparam          reject "$P39"' void fill39(*?*T39 o){ *o = alloc(T39); } u32 main(){ ?*T39 m = null; fill39(&m); if (m) |p| { free(p); } if (m) |p| { free(p); } return 0; }'
+cell p39_move_callee       reject "$P39"' move struct M39{*T39 p;} void eat39(M39 m){ free(m.p); } u32 main(){ *T39 a = alloc(T39) orelse return; M39 m = { .p = a }; eat39(m); free(a); return 0; }'
+cell p39_free_subslice     reject "$P39"' u32 main(){ [*]T39 s = alloc(T39, 4) orelse return; [*]T39 t = s[1..4]; free(t); return 0; }'
+cell p39_free_subslice_fn  reject "$P39"' void k39([*]T39 x){ free(x); } u32 main(){ [*]T39 s = alloc(T39, 4) orelse return; k39(s[1..4]); return 0; }'
+cell p39_free_elem_addr    reject "$P39"' u32 main(){ [*]T39 s = alloc(T39, 4) orelse return; *T39 e = &s[1]; free(e); return 0; }'
+# BOUNDARY: the field reset after the free clears the carrier; a view that starts
+# at 0 IS the allocation; a move struct consumed by the freeing callee is done.
+cell p39_safe_reset        compile "$P39"' u32 rd39(*O39 h){ if (h.p) |q| { return q.v; } return 0; } u32 main(){ O39 h; h.p = alloc(T39); if (h.p) |p| { free(p); } h.p = null; return rd39(&h); }'
+cell p39_safe_base_view    compile "$P39"' u32 main(){ [*]T39 s = alloc(T39, 4) orelse return; [*]T39 t = s[0..4]; free(t); return 0; }'
+cell p39_safe_move_done    compile "$P39"' move struct M39{*T39 p;} void eat39(M39 m){ free(m.p); } u32 main(){ *T39 a = alloc(T39) orelse return; M39 m = { .p = a }; eat39(m); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: double free: 'a' already freed
+// BUG-1229: a move struct lost its pointer fields at every copy, so a callee freeing m.p freed nothing visible.
+struct T { u32 v; }
+move struct M { *T p; }
+void eat(M m) { free(m.p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    M m = { .p = a };
+    eat(m);
+    free(a);
+    return 0;
+}

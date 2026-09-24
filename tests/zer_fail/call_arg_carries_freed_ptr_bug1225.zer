@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: carries a freed pointer at 'h.p'
+// BUG-1225: a struct handed to a call carried a freed pointer in a field; the callee read the recycled object (returned 77).
+struct T { u32 v; }
+struct H { *T p; }
+u32 rd(*H h) { return h.p.v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 77;
+    u32 r = rd(&h);
+    free(b);
+    return r;
+}

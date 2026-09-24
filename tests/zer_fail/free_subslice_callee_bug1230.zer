@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: is a pointer INSIDE an allocation
+// BUG-1230: the same through a callee that frees its parameter.
+struct T { u32 v; }
+void k([*]T x) { free(x); }
+u32 main() {
+    [*]T s = alloc(T, 4) orelse return;
+    k(s[1..4]);
+    return 0;
+}

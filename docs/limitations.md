@@ -134,6 +134,25 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
+## OPEN — allocation-tracker residuals of the 2026-09-24c round (LOW — leak-silent / wrong reason)
+
+- **A factory-returned struct's allocations are not leak-checked.** `S mk(){ S r; r.p =
+  alloc(T); return r; } ... S a = mk();` discarding `a` compiles (reproducers `h1`..`h3`,
+  `g4c` in the ag6 set). BUG-1227 records a FREE of such a field (so a double free / UAF is
+  caught), but the entry is escaped: the summary has no per-FIELD "returns a fresh allocation"
+  fact. Fix sketch: `FuncSummary.returns_field_alloc` — the compound paths of the returned
+  struct local that are ALIVE owned allocations at every return — registered on the call's
+  dest temp and carried by `ir_carry_compounds`.
+- **An out-parameter's allocation is not leak-checked** (`fill(&m)` then drop `m`): BUG-1228's
+  entry is escaped for the same reason — no summary says the callee stored a FRESH allocation
+  through `*out`. Same fix shape (`stores_alloc_through_param`).
+- **Two slot frees reported for the wrong reason.** `free(larr[i].p); free(larr[0].p);`
+  (a possible double free, i == 0) and the UAF sibling are refused, but as "never freed" leaks:
+  the variable-index free widens the literal slot to MAYBE_FREED and the later literal free of a
+  MAYBE entry is not reported as a double free. Verdict right, sentence wrong.
+
+---
+
 ## OPEN — a qualified reference to the SECOND module's declaration of a shared name (2026-09-24, LOW — over-rejection; was a silent miscompile before BUG-1200)
 
 Two imported modules c and d both declare `get`. `c.get()` (c registered first) works;

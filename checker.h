@@ -633,4 +633,8 @@ void checker_mark_guard_lowered(Checker *c, Node *node);
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);
 
+/* BUG-1222: is the all-zero bit pattern NOT a value of this type (non-null
+ * pointer / funcptr, enum without a 0 variant)? */
+bool checker_type_has_no_zero_value(Type *t);
+
 #endif /* ZER_CHECKER_H */

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: reaches 'v', which is borrowed by a scoped spawn
+// BUG-1248: a by-value carrier passed to a callee that writes through it.
+void w(*u32 p) { for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+struct H { *u32 p; }
+void bumph(H h) { *h.p += 1; }
+u32 main() {
+    u32 v = 0;
+    H h = { .p = &v }; *u32 p = &v;
+    ThreadHandle th = spawn w(p);
+    for (u32 i = 0; i < 100000; i += 1) { bumph(h); }
+    th.join();
+    return 0;
+}

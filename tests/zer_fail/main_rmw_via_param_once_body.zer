@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written and is shared
+// BUG-1043: the RMW-through-parameter summary (func_rmw_param_mask, BUG-801) was
+// a PARTIAL if-chain walk. The `*p += 1` below sits in a position it never
+// descended, so main's call `bump(&g)` recorded no RMW and the ISR/main torn
+// read-modify-write compiled clean — a lost update, silent on bare metal.
+volatile u32 g;
+void bump(volatile *u32 p) { @once { *p += 1; } }
+interrupt TIM2 { g = 1; }
+u32 main() { bump(&g); return 0; }

@@ -1,0 +1,31 @@
+// BUG-1067: a FLOAT divisor could not be proven nonzero at all. The guard the
+// diagnostic prescribed, `if (y == 0) { return; }`, is a type error on an f64
+// ("cannot compare 'f64' and 'u32'"), and `if (y == 0.0)` narrowed nothing because
+// the VRP guard folder only understood integer constants — so every division by a
+// float VARIABLE was rejected, and the documented forced-guard rule could not be
+// satisfied. `== 0.0` / `!= 0.0` guards now prove the divisor nonzero, for the
+// guard form, the then-body form, and compound `/=`.
+i32 printf(const *u8 fmt, ...);
+f64 inv(f64 y) {
+    if (y == 0.0) { return 0.0; }
+    return 1.0 / y;
+}
+u32 main() {
+    volatile f64 v = 4.0;
+    f64 y = v;
+    f64 a = 0.0;
+    if (y != 0.0) { a = 1.0 / y; }
+    if (a != 0.25) { return 1; }
+    if (y == 0.0) { return 2; }
+    f64 b = 2.0 / y;
+    if (b != 0.5) { return 3; }
+    f64 c = 8.0;
+    c /= y;
+    if (c != 2.0) { return 4; }
+    if (inv(y) != 0.25) { return 5; }
+    f32 fy = (f32)y;
+    if (fy == 0.0) { return 6; }
+    f32 fq = 1.0 / fy;
+    if (fq != 0.25) { return 7; }
+    return 0;
+}

@@ -1,0 +1,29 @@
+// BUG-1127: a designated initializer at GLOBAL scope was refused for every field
+// type ("cannot initialize 's' of type 'S' with 'void'") — the global path never
+// typed the struct literal from its destination, as the local path does.
+enum Mode { off, on }
+struct In { u32 a; u32 b; }
+struct Out { In in; Mode m; *u32 p; ?u32 opt; [*]u8 view; }
+u32 cell;
+u8[4] buf;
+const u32 K = 9;
+Out o = { .in = { .a = 1, .b = 2 }, .m = Mode.on, .p = &cell, .opt = 7, .view = buf };
+Out z = { .m = Mode.off, .p = &cell, .view = buf[1..3] };
+In k = { .a = K, .b = K + 1 };
+[*]u8 whole = buf;          // array -> slice at a global (the emitter lacked it)
+?[*]u8 maybe = buf;
+*u32 third = &cell;
+usize n = buf.len;          // a fixed array's .len is a constant
+u32 main() {
+    *o.p = 3;
+    if (o.in.a + o.in.b != 3) { return 1; }
+    if (o.m != Mode.on || z.m != Mode.off) { return 2; }
+    if (z.in.a != 0 || cell != 3 || k.b != 10) { return 3; }
+    u32 ov = o.opt orelse 0;
+    if (ov != 7 || z.opt != null) { return 4; }
+    whole[2] = 5;
+    if (buf[2] != 5 || o.view.len != 4 || z.view.len != 2 || z.view[1] != 5) { return 5; }
+    [*]u8 mv = maybe orelse return;
+    if (mv.len != 4 || n != 4 || *third != 3) { return 6; }
+    return 0;
+}

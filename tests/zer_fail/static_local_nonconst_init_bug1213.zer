@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: static local 'b' initializer must be a compile-time constant
+// BUG-1213: a static local is initialised once, before the program runs; a
+// non-constant initializer reached GCC as "initializer element is not constant".
+u32 f() { u32 l = 9; static u32 b = l; return b; }
+u32 main() { return f(); }

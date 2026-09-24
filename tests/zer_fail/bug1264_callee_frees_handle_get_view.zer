@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: designates the same allocation as argument
+struct T { u32 v; }
+Pool(T, 4) pool;
+u32 rdl(*T x, Handle(T) hh) {
+    pool.free(hh);
+    Handle(T) g2 = pool.alloc() orelse return;
+    pool.get(g2).v = 77;
+    u32 r = x.v;
+    pool.free(g2);
+    return r;
+}
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    pool.get(h).v = 5;
+    return rdl(pool.get(h), h);
+}

@@ -1,0 +1,20 @@
+// expect-trap
+// expect-trap-msg: signed division overflow
+// expect-trap-at: 17
+// BUG-1062: the AST-passthrough (field store) spelling of an i48 MIN / -1. The
+// dividend's MIN is -2^47; the old switch sent every width that is not 8/16/32 to
+// the INT64_MIN comparison, which an i48 never equals, so the division ran
+// unchecked and stored 2^47 into a 48-bit signed field.
+struct S { i48 q; }
+
+u32 main() {
+    volatile i48 va = -140737488355328;
+    volatile i48 vb = -1;
+    i48 a = va;
+    i48 b = vb;
+    if (b == 0) { return 9; }
+    S s;
+    s.q = a / b;
+    if (s.q != 0) { return 7; }
+    return 0;
+}

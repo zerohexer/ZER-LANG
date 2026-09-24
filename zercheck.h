@@ -119,6 +119,53 @@ typedef struct {
      * (AOBorrow); a param-VIEW stays fully tracked (AOParam — the interior-
      * pointer UAF class).  Default false = conservative (treat as a view). */
     bool ret_is_content;
+    /* BUG-1080 (H6): FIELD-level return views. `H mk(*T a) { H h = { .p = a };
+     * return h; }` returns a STRUCT one of whose fields is a view of a param —
+     * a fact the whole-value mask above cannot state. Entry k: on SOME live
+     * return the returned local's field `path` holds the allocation of param
+     * `param` — a UNION over the returns. `must` = on EVERY live return (the
+     * call site makes `(dest, path)` an ALIAS of the argument); otherwise the
+     * call site makes it a VIEW (BUG-849 view set), so a use after the argument
+     * is freed is refused either way. Arena array, no cap (a fixed table that
+     * silently drops is a missed view). ret_field_n == 0 when nothing was seen. */
+    int ret_field_n;
+    struct ZcRetFieldView {
+        const char *path;
+        uint32_t plen;
+        int param;
+        bool must;
+    } *ret_field;
+    /* BUG-1241: the callee stores param `src` into the field `path` of the
+     * object param `dst` points at / is (`void init(*S s, *Box b) { s.b = b; }`).
+     * The call site records the argument's allocation as CARRIED by the
+     * destination argument, so a free of it followed by handing that object to
+     * a call is the BUG-1225 carrier error. Syntactic (direct stores only). */
+    /* BUG-1243: the function POLLS the async task its param `param` points at
+     * (directly, or through a callee that does), running body `fn` (Node*). */
+    int polls_n;
+    struct ZcPolls { int param; void *fn; } *polls;
+    int param_store_n;
+    struct ZcParamStore {
+        int dst;
+        const char *path;
+        uint32_t plen;
+        int src;
+    } *param_store;
+    /* BUG-1172: the function (or a callee, transitively) RESETS an arena that
+     * is not its own local — a global arena, or one reached through a field.
+     * A reset frees every arena allocation, so the CALLER's arena-coloured
+     * handles are freed across the call. Without it, `void rs() { g.reset(); }`
+     * called between `p = g.alloc(T)` and `p.v` was a silent use-after-free
+     * (the next alloc returned the same bytes). */
+    bool resets_arena;
+    /* BUG-1181: the function (or a callee, transitively) FREES the allocation a
+     * GLOBAL holds — `void drop_g() { if (g) |p| { free(p); } g = null; }`.
+     * Each entry is the global's key as zercheck_ir spells it for its
+     * (IR_GLOBAL_ROOT_ID, key) entry: the bare name `g`, or a projection `g.p`.
+     * The call site widens the CALLER's allocation that entry aliases to
+     * MAYBE_FREED, so `g = a; drop_g(); a.v` is refused. Arena array; 0 = none. */
+    int freed_global_n;
+    struct ZcFreedGlobal { const char *key; uint32_t len; } *freed_global;
 } FuncSummary;
 
 /* ZER-CHECK context */
@@ -143,6 +190,11 @@ typedef struct {
     int summary_count;
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
+    bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
+    /* BUG-1181: global keys the function being analysed frees through (dynamic,
+     * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
+    struct ZcFreedGlobal *cur_freed_global;
+    int cur_freed_global_n, cur_freed_global_cap;
 
     /* allocation ID counter — each unique allocation gets a unique ID */
     int next_alloc_id;

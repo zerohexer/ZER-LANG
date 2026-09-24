@@ -115,6 +115,10 @@ struct Type {
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
             bool is_move;           /* move struct — ownership transfer on pass/assign */
+            bool is_async_state;    /* BUG-1177: `_zer_async_NAME` coroutine state — a
+                                     * promoted local may be pointed at by another
+                                     * promoted local, so the value is SELF-REFERENTIAL
+                                     * and a copy dangles into the original */
             const char *module_prefix;  /* NULL for main module */
             uint32_t module_prefix_len;
             uint32_t type_id;           /* BUG-393: runtime provenance tag */
@@ -227,8 +231,24 @@ struct Symbol {
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
+    /* BUG-1095: `&x` was taken somewhere at or before this program point. A
+     * pointer alias may then change x at ANY later store through a pointer, so
+     * VRP never again records a range for it. Lives on the Symbol, not on a
+     * VarRange entry: an entry is popped at block exit, and the alias is not. */
+    bool vrp_addr_taken;
+    /* BUG-1099: declared by a parser desugaring (add_symbol_synth). */
+    bool is_synthetic_var;
+    /* BUG-1200: a top-level name that a SECOND imported module also declares.
+     * This Symbol is the first registration (the raw global-scope entry); the
+     * other module's own lives in Checker.module_own. A reference that reaches
+     * THIS entry from a context owning neither is ambiguous. */
+    bool cross_module_dup;
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    bool is_variant_capture; /* BUG-1186: a `|*w|` capture of a UNION switch arm, or a
+                              * pointer derived from one — it points INTO a variant and
+                              * is valid only while the arm runs and the union keeps
+                              * that variant. Never stored, returned, or kept. */
     /* BUG-969: WHICH local this pointer/slice/carrier points into, by name, when that
      * is knowable at the declaration. `is_local_derived` says THAT it points into a
      * local; the scoped-spawn borrow needs to know WHICH one, because the race it
@@ -357,6 +377,7 @@ struct Symbol {
         bool can_spawn;      /* body contains spawn (directly or transitively) */
         bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
         bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
+        bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */
         /* Direct-only effect flags — set when the effect appears literally
          * in this function's immediate body (NOT through a callee). Used by
          * check_body_effects to suppress duplicate body-level errors when
@@ -384,6 +405,8 @@ struct Symbol {
 
     /* MMIO pointer bound: derived from mmio range for @inttoptr pointers */
     uint64_t mmio_bound;        /* max valid index (0 = no bound) */
+    bool is_global_var_mmio;    /* BUG-1056: mmio_bound came from a GLOBAL declaration */
+    int8_t never_mutated_cache; /* BUG-1056/1059e (globals): 0 = not computed, 1 = never assigned/addressed anywhere, -1 = is */
 
     /* cross-function range summary: return value range for simple functions */
     int64_t return_range_min;
@@ -423,7 +446,12 @@ struct Symbol {
 
 struct Scope {
     Scope *parent;          /* enclosing scope (NULL for module level) */
-    Symbol *symbols;        /* dynamic array */
+    /* BUG-1119: an array of POINTERS to individually-allocated Symbols. It was an
+     * array of Symbol VALUES that was copied on growth, so any Symbol* held across
+     * a later scope_add on the same scope (an auto-slab created by `alloc(T)`
+     * mid-body adds to the GLOBAL scope) pointed at a stale copy — reads saw old
+     * flags and writes were lost. Addresses are now stable for the arena's life. */
+    Symbol **symbols;
     uint32_t symbol_count;
     uint32_t symbol_capacity;
     const char *module_name; /* non-NULL for module-level scopes */
@@ -487,6 +515,7 @@ bool type_is_unsigned(Type *a);
 bool type_is_float(Type *a);
 bool type_is_numeric(Type *a);
 int  type_width(Type *a);          /* bit width: 8, 16, 32, 64 */
+int  type_scalar_bytes(Type *a);   /* BUG-1151: C storage bytes of a scalar (uN/iN: its carrier), 0 if none */
 int  type_alignment_bytes(Type *a); /* required alignment in bytes; recurses
                                       * through aggregates for compound MMIO
                                       * targets; returns 0 if not computable */
@@ -505,9 +534,14 @@ void type_print(Type *t);
  * ================================================================ */
 
 Scope *scope_new(Arena *a, Scope *parent);
+/* BUG-1120: insert an EXISTING Symbol (stable since BUG-1119) under its own name;
+ * false if the name is already bound in this scope. */
+bool scope_insert(Arena *a, Scope *s, Symbol *sym);
 Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
                   Type *type, uint32_t line, const char *file);
 Symbol *scope_lookup(Scope *s, const char *name, uint32_t name_len);
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len);
+
+bool type_is_null_sentinel(Type *inner);   /* ?*T / ?funcptr use NULL as none */
 
 #endif /* ZER_TYPES_H */

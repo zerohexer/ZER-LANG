@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot take the address of a call result
+struct T { u32 v; }
+T mk() { T t = { .v = 1 }; return t; }
+u32 main() {
+    *T p = &mk();
+    return p.v;
+}

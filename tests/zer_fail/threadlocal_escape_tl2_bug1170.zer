@@ -1,0 +1,10 @@
+// expect-error: carries the address of threadlocal
+// BUG-1170: a threadlocal's address escaped to a global through an alias,
+// a carrier or a struct literal (A5 caught only the literal `g = &tl`).
+threadlocal u32 tl;
+u32 dummy;
+struct H { *u32 p; }
+shared struct S { H h; }
+S sh = { .h = { .p = &dummy } };
+void w() { H loc = { .p = &tl }; sh.h = loc; }
+u32 main() { ThreadHandle t = spawn w(); t.join(); u32 v = *sh.h.p; return v; }

@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot return a shared struct by value
+// BUG-1250: returning a global shared struct (as ?C) copied it.
+shared struct C { u32 v; }
+C g;
+?C maybe() { return g; }
+u32 main() { if (maybe()) |c| { return c.v; } return 0; }

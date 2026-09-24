@@ -1,0 +1,27 @@
+// BUG-1034: the for-loop LOWER bound assumed the counter only ever goes up.
+// A SIGNED counter lowered in the body (or by a decrementing step) kept its
+// proven [init, bound-1] range, so `arr[i]` was emitted with no check and wrote
+// BELOW the array (ASan stack-buffer-underflow, exit 0). Now the lower bound is
+// dropped to INT64_MIN and the auto-guard returns early — exit 0 here means the
+// guard fired (pre-fix: OOB writes, then exit 0 too — so a runtime check pins it).
+u32 main() {
+    u32[4] arr;
+    u32 sentinel = 7;
+    u32 k = 0;
+    for (i32 i = 2; i < 4; i += 1) {
+        arr[i] = 9;        // i = 2, then -2, -6 ... — guarded now
+        i -= 5;
+        k += 1;
+        if (k > 3) { break; }
+    }
+    if (sentinel != 7) { return 1; }
+    if (arr[2] != 9) { return 2; }
+    k = 0;
+    for (i32 j = 3; j < 4; j -= 1) {   // decrementing STEP: j = 3, 2, 1, 0, -1 ...
+        arr[j] = 5;
+        k += 1;
+        if (k > 6) { break; }
+    }
+    if (arr[3] != 5 || arr[0] != 5) { return 3; }
+    return 0;
+}

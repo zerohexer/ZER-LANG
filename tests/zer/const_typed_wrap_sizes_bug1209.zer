@@ -1,0 +1,18 @@
+// BUG-1209: a const's value is its initializer WRAPPED to its declared type, and a
+// size expression's value is wrapped to its checked type. `u8[S3]` had 400 elements
+// while `S3` read 144; `T[SMALL + SMALL]` in a container the same; a u64 const above
+// INT64_MAX compared as negative in `comptime if`.
+const u8 SMALL = 200;
+const u8 S3 = SMALL + SMALL;
+const u64 BIG = 10000000000000000000;
+u8[S3] arr;
+container B(T) { T[SMALL + SMALL] e; }
+u32 main() {
+    u32 a = S3;
+    if (a != 144) { return 1; }
+    if (arr.len != 144) { return 2; }
+    B(u8) b;
+    if (b.e.len != 144) { return 3; }
+    comptime if (BIG > 5) { return 0; }
+    return 4;
+}

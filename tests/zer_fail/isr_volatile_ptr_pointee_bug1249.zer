@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: volatile pointer 'gp' is shared between interrupt and main
+// BUG-1249: ISR sibling (heap pointee); GCC made main's loop infinite.
+struct T { u32 v; }
+volatile ?*T gp;
+interrupt TIM2 { if (gp) |p| { p.v += 1; } }
+u32 main() {
+    *T t = alloc(T) orelse return;
+    gp = t;
+    while (t.v < 10) { }
+    gp = null;
+    free(t);
+    return 0;
+}

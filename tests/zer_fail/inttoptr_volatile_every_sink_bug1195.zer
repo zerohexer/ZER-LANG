@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot assign volatile pointer to non-volatile
+// BUG-1195: a constant-address @inttoptr result is a volatile pointer, so binding it to
+// a plain *u32 through ANY sink is refused. Pre-fix only the var-decl and struct-literal
+// sinks checked the destination: GCC -O2 kept one of two writes and turned a poll loop
+// into 'jmp .'. (The direct use '@inttoptr(*R, A).dr = x' now emits a volatile access.)
+mmio 0x40000000..0x400000FF;
+u32 g;
+void w(*u32 p) { *p = 1; *p = 2; }
+*u32 get() { return @inttoptr(*u32, 0x40000000); }
+void viaret() { *get() = 1; *get() = 2; }
+void viaassign() { *u32 r = &g; r = @inttoptr(*u32, 0x40000004); *r = 1; *r = 2; }
+void viaarg() { w(@inttoptr(*u32, 0x4000000C)); }
+u32 main() { return 0; }

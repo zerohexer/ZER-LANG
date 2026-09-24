@@ -1,0 +1,27 @@
+// BUG-1172 boundary: a callee that resets its OWN local arena does not free
+// the caller's arena allocations; a callee that resets the shared arena is
+// fine when the caller re-allocates afterwards.
+struct T { u32 v; }
+Arena gar;
+u8[256] buf;
+u32 scratch_work() {
+    u8[64] lb;
+    Arena la = Arena.over(lb);
+    *T t = la.alloc(T) orelse return;
+    t.v = 3;
+    u32 r = t.v;
+    la.reset();
+    return r;
+}
+void rs() { gar.reset(); }
+u32 main() {
+    gar = Arena.over(buf);
+    *T p = gar.alloc(T) orelse return;
+    p.v = 5;
+    u32 s = scratch_work();
+    if (p.v != 5 || s != 3) { return 1; }
+    rs();
+    *T q = gar.alloc(T) orelse return;
+    q.v = 9;
+    return q.v - 9;
+}

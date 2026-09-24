@@ -1,0 +1,5 @@
+// expect-error: optional of 'Pool'
+// BUG-1033 sibling: `?Pool(T, N)` emitted `_zer_opt_u128 p` for a pool of four slots.
+struct T { u32 v; }
+?Pool(T, 4) p;
+u32 main() { return 0; }

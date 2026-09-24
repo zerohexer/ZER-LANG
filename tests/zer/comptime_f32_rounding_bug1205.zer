@@ -1,0 +1,13 @@
+// BUG-1205: an f32 comptime result is rounded at every operation, as the emitted
+// f32 code is. Folded in double, H(1.0) was 1.0 while the runtime h(1.0) is 0.0.
+comptime f32 G(f32 x) { return x * x * x + x / 3.0 - 1.1; }
+f32 g(f32 x) { return x * x * x + x / 3.0 - 1.1; }
+comptime f32 H(f32 x) { return x + 1.0e8 - 1.0e8; }
+f32 h(f32 x) { return x + 1.0e8 - 1.0e8; }
+u32 main() {
+    f32 p = 0.1;
+    if (G(0.1) != g(p)) { return 1; }
+    f32 one = 1.0;
+    if (H(1.0) != h(one)) { return 2; }
+    return 0;
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize a shared struct by value
+// BUG-1250: a wrapper struct carrying a shared struct was copied (hang).
+shared struct C { u32 v; }
+struct Wrap { C c; u32 k; }
+Wrap gw;
+void w(*C p) { for (u32 i = 0; i < 1000000; i += 1) { p.v += 1; } }
+u32 main() {
+    spawn w(&gw.c);
+    u32 s = 0;
+    for (u32 i = 0; i < 100000; i += 1) { Wrap x = gw; s += x.c.v; }
+    return 0;
+}

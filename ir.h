@@ -63,6 +63,11 @@ typedef struct {
      * `static u32 retries = 3;` returned 0 on every call). NULL for
      * non-static locals and for static locals declared without init. */
     Node *static_init;
+
+    /* BUG-1154: the RETURN-VALUE snapshot of a named local (taken before the
+     * defers fire) is a temp; diagnostics about it name the local it copies.
+     * local id + 1, 0 = not a snapshot. */
+    int snapshot_of_plus1;
 } IRLocal;
 
 /* ================================================================
@@ -177,6 +182,12 @@ typedef struct IRInst {
      * function containing a LABEL — see materialise_defer_body. */
     bool defer_fire_emit_ast;
 
+    /* BUG-1221: on IR_ASSIGN, zero the destination local (`memset`, any type,
+     * arrays included) — a declaration WITHOUT an initializer that can execute
+     * more than once (in a loop body, or in a function with labels). `expr` is a
+     * literal 0 so analyses see an ordinary constant store. */
+    bool zero_dest;
+
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
     /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this
@@ -237,6 +248,13 @@ typedef struct IRInst {
      * orelse-fallback bare return must propagate FAILURE = None {has_value=0}.
      * (?T bare returns are None either way; ?*T is a null sentinel.) */
     bool ret_from_orelse;
+
+    /* BUG-1071: IR_RETURN: this return is the early exit of a lowered bounds
+     * AUTO-GUARD (lower_one_guard_site) — the compiler's, not the user's. The
+     * leak check still reports an allocation alive here (it really leaks if the
+     * guard fires), but names the guard instead of pointing at a `return` the
+     * user never wrote. */
+    bool ret_from_guard;
 } IRInst;
 
 /* ================================================================
@@ -273,23 +291,27 @@ typedef struct {
      * path of param i's own unwrap" (nothing to free there) from "this return
      * is some other optional's null path" (param i simply was not freed). */
     int orelse_fallback_local;
+    /* BUG-1071: for an is_orelse_fallback block, the local the orelse SUBJECT
+     * is syntactically rooted at (`p orelse`, `h.p orelse` -> the local of p /
+     * h); -1 otherwise. On this path that local's allocation is NULL. The
+     * FuncSummary builder uses it to tell a param's own null path ("nothing to
+     * free here") from a path where the param simply was not freed. It cannot
+     * ask the handle STATE any more: zercheck_ir drops the optional's entries
+     * on the null edge (ir_drop_null_optional), so both look like "absent". */
+    int orelse_subject_local;
 
-    /* Phase E: set by ir_lower when this block is part of an if-then or
-     * switch-arm body whose always-exits terminator (return/break/
-     * continue/goto) represents an "early exit" — a conditional path
-     * that bypasses the fall-through canonical exit.
-     *
-     * Mirrors zercheck.c's `block_always_exits` semantic
-     * (zercheck.c:312): when an if-then always exits, the linear scan
-     * treats the post-if state as pre-if state — the early-exit
-     * branch's effects DON'T contribute to the final function-exit
-     * state. In CFG terms, early-exit blocks shouldn't count as
-     * leak-coverage providers — the fall-through return is the
-     * canonical exit and must independently show all allocs freed.
-     *
-     * Tagging is propagated transitively: if a block's terminator
-     * leads into an already-tagged block, it's also tagged. */
-    bool is_early_exit;
+
+    /* BUG-1070: a block the LOWERER opened because the user wrote a statement
+     * after a terminator (`return t; u32 k = t.kind;`) records the terminated
+     * block it textually follows; -1 otherwise. Such a block has no
+     * predecessors, and zercheck_ir seeds it with that block's state when the
+     * terminator is a RETURN, so dead USER code is still diagnosed
+     * (rt_move_struct_return_then_use). Compiler-generated dead tails — the
+     * scope-exit fire after a `return`, a join no arm reaches — are NOT marked
+     * and start from an empty state: seeding them by block-ID adjacency (the
+     * rule this replaces) handed a spliced defer body the state of an
+     * UNRELATED returning block and reported a false double free. */
+    int dead_code_seed;
 } IRBlock;
 
 /* ================================================================

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot write to 'counter' while it is borrowed by a scoped spawn
+// BUG-1118: a non-shared global lent BY POINTER to a scoped spawn raced main's
+// direct write — the borrow rule skipped globals, and the body scan only sees names.
+u32 counter;
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    ThreadHandle th = spawn w(&counter);
+    counter += 1;
+    th.join();
+    return 0;
+}

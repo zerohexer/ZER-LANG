@@ -1,0 +1,25 @@
+// expect-error: use after free
+// BUG-1101: the Level-B guard relaxation asks "is `c` bound EXACTLY ONCE in the
+// function?" (BUG-1055), and the counter never looked inside an EXPRESSION — so a
+// second `bool c` inside an orelse BLOCK was invisible, the two `c`s read as one
+// immutable guard, and `if (c) { free(a); }` ... `if (!c) { a.v = 5; }` was
+// accepted as disjoint. Pre-fix only the (unrelated) leak was reported here; the
+// use of the maybe-freed `a` in the orelse block was not.
+struct T { u32 v; }
+?u32 none() { return null; }
+u32 get(u32 a) { return a; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    u32 x = get(1);
+    u32 y = get(2);
+    {
+        bool c = x == 1;
+        if (c) { free(a); }
+    }
+    u32 z = none() orelse {
+        bool c = y == 1;
+        if (!c) { a.v = 5; }
+        return 0;
+    };
+    return z;
+}

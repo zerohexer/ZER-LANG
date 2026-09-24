@@ -1,0 +1,20 @@
+// BUG-1017: an array index in the for-loop STEP was checked under the INIT range.
+//
+// `for (u32 k = 0; k < 8; k += a[k] + 1)` on a `u32[4]` proved `a[k]` against
+// k in [0,0] — the value BEFORE the loop — marked the node proven for good, and
+// emitted a bare `k += a[k] + 1;` with no bounds check, no auto-guard and NO
+// warning. ASan: stack-buffer-overflow (reads a[4]..a[7]).
+//
+// This is BUG-1015 (the condition) at the one loop POSITION that fix missed.
+//
+// DISCRIMINATES: pre-fix the loop runs all 8 iterations (4 of them OOB reads)
+// and returns 8. Post-fix the auto-guard fires the first time k reaches 4 and
+// the function returns early — exit 0.
+u32 main() {
+    u32[4] a;
+    u32 n = 0;
+    for (u32 k = 0; k < 8; k += a[k] + 1) {
+        n += 1;
+    }
+    return n;
+}

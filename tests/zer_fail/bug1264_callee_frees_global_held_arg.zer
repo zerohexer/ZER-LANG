@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: is also held by global 'g'
+struct T { u32 v; }
+?*T g;
+u32 f(*T p) {
+    free(p);
+    *T t2 = alloc(T) orelse return;
+    t2.v = 99;
+    u32 r = 0;
+    if (g) |q| { r = q.v; }
+    free(t2);
+    return r;
+}
+u32 main() {
+    *T t = alloc(T) orelse return;
+    t.v = 5;
+    g = t;
+    u32 r = f(t);
+    g = null;
+    return r;
+}

@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: variable index
+// BUG-1074 (H7): storing into / reading from `arr[k]` with a VARIABLE index lost
+// tracking, so a freed allocation read back through the slot was accepted — and the
+// recycled slot returned the NEW object's value (exit 99). Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    arr[k] = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    defer free(b);
+    b.v = 99;
+    *T q = arr[k] orelse return;
+    u32 r = q.v;
+    return r;
+}
+u32 main() { return run(1); }

@@ -1,0 +1,14 @@
+// zerc-flags: --stack-limit 500
+// EXPECTED: compile error
+// expect-error: call chain contains function pointer call with unknown target
+// BUG-1059e: a GLOBAL funcptr resolved through its initializer although another function reassigns it (`gfp = big;`).
+u32 leaf(u32 n) { return n; }
+u32 big(u32 n) { u8[300] buf; buf[0] = 1; return n + buf[0]; }
+*(u32) -> u32 gfp = leaf;
+void setit() { gfp = big; }
+u32 main() {
+    u8[250] mb;
+    mb[0] = 1;
+    setit();
+    return gfp(1) - 2 + mb[0] - 1;
+}

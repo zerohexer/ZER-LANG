@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: element 'larr[i].p' (variable index) is freed
+// BUG-1226: a free through `larr[i].p` (a field of a variable-index element) left no slot fact; the re-read returned a recycled object.
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    H[4] larr;
+    larr[0].p = alloc(T);
+    u32 i = 0;
+    if (larr[i].p) |p| { free(p); }
+    *T b = alloc(T) orelse return;
+    b.v = 77;
+    u32 r = 0;
+    if (larr[i].p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

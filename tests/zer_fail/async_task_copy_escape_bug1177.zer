@@ -1,0 +1,27 @@
+// EXPECTED: compile error
+// expect-error: cannot assign an async task by value
+// BUG-1177: an async task is SELF-REFERENTIAL — `p` is promoted to `self->p` and
+// holds `&self->x`. Copying the task after its first poll copies a pointer into the
+// ORIGINAL, here a frame that has returned. Pre-fix: compiled clean; ASan reported
+// stack-use-after-return in `_zer_async_cnt_poll` (the `*p += 1`).
+async u32 cnt() {
+    u32 x = 5;
+    *u32 p = &x;
+    yield;
+    *p += 1;
+    yield;
+    return x;
+}
+_zer_async_cnt g;
+void start() {
+    _zer_async_cnt t;
+    _zer_async_cnt_init(&t);
+    _zer_async_cnt_poll(&t);
+    g = t;
+}
+u32 main() {
+    start();
+    _zer_async_cnt_poll(&g);
+    _zer_async_cnt_poll(&g);
+    return _zer_async_cnt_result(&g);
+}

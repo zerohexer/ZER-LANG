@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot store result of get() in field
+struct T { u32 v; }
+struct W { *T p; }
+Pool(T, 4) pool;
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    pool.get(h).v = 5;
+    W w = { .p = pool.get(h) };
+    pool.free(h);
+    Handle(T) g = pool.alloc() orelse return;
+    defer pool.free(g);
+    pool.get(g).v = 99;
+    return w.p.v;
+}

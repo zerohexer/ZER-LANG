@@ -1,0 +1,16 @@
+// BUG-1206: a comptime DECLARATION always makes a new binding. It used to update any
+// same-named variable in scope, so an inner `u32 x` rewrote the outer one, a
+// declaration inside a branch leaked out, and `u32 x;` (no initializer) was skipped.
+comptime u32 A(u32 n) { u32 x = 1; { u32 x = 2; x += n; } return x; }
+comptime u32 D(u32 n) { u32 x = 1; if (n > 0) { u32 x = 5; } return x; }
+comptime u32 Z(u32 n) { u32 x = 7; { u32 x; x += n; } return x; }
+comptime u32 L(u32 n) { u32 i = 100; for (u32 i = 0; i < n; i += 1) { } return i; }
+u32 a(u32 n) { u32 x = 1; { u32 x = 2; x += n; } return x; }
+u32 main() {
+    if (A(1) != a(1)) { return 1; }
+    if (A(1) != 1) { return 2; }
+    if (D(1) != 1) { return 3; }
+    if (Z(3) != 7) { return 4; }
+    if (L(4) != 100) { return 5; }
+    return 0;
+}

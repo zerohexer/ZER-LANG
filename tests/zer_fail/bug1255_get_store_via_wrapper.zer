@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot store result of get()
+struct T { u32 v; }
+struct W { *T p; }
+Pool(T, 4) pool;
+?*T gp;
+*T id(*T x) { return x; }
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    pool.get(h).v = 5;
+    *T p = id(pool.get(h));
+    pool.free(h);
+    Handle(T) g = pool.alloc() orelse return;
+    defer pool.free(g);
+    pool.get(g).v = 99;
+    return p.v;
+}

@@ -8,7 +8,7 @@ void wr(*u32 p) { *p = 7; }
 u32 main() {
     *T h = alloc(T) orelse { return 1; };
     wr(&h.v);
-    if (h.v != 7) { return 2; }
+    if (h.v != 7) { free(h); return 2; }
     S s;
     s.p = h;
     free(h);

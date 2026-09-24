@@ -1,0 +1,55 @@
+// BUG-1182: the canonical dequeue-and-free loop. Each iteration takes a FRESH
+// optional from a call and frees its capture. Pre-fix the call's result temp kept
+// the PREVIOUS iteration's FREED entry across the back edge, so this reported
+// use-after-free and double free (and examples/scheduler.zer did not compile).
+struct Task { u32 v; }
+Pool(Task, 4) tp;
+?Handle(Task)[4] q;
+u32 qn;
+?Handle(Task) deq() {
+    if (qn == 0) { return null; }
+    qn -= 1;
+    if (qn >= 4) { return null; }
+    ?Handle(Task) r = q[qn];
+    q[qn] = null;
+    return r;
+}
+struct Node { u32 v; }
+?*Node[4] pq;
+u32 pn;
+?*Node pdeq() {
+    if (pn == 0 || pn > 4) { return null; }
+    pn -= 1;
+    ?*Node r = pq[pn];
+    pq[pn] = null;
+    return r;
+}
+u32 main() {
+    for (u32 i = 0; i < 3; i += 1) {
+        Handle(Task) h = tp.alloc() orelse return;
+        tp.get(h).v = i;
+        q[i] = h;
+        *Node n = alloc(Node) orelse return;
+        n.v = 10 + i;
+        pq[i] = n;
+    }
+    qn = 3;
+    pn = 3;
+    u32 sum = 0;
+    while (qn > 0) {
+        ?Handle(Task) next = deq();
+        if (next) |h| {
+            sum += tp.get(h).v;
+            tp.free(h);
+        }
+    }
+    while (pn > 0) {
+        ?*Node next = pdeq();
+        if (next) |p| {
+            sum += p.v;
+            free(p);
+        }
+    }
+    if (sum != 0 + 1 + 2 + 10 + 11 + 12) { return 1; }
+    return 0;
+}

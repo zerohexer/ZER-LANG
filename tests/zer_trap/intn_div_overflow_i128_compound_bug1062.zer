@@ -1,0 +1,18 @@
+// expect-trap
+// expect-trap-msg: signed division overflow
+// expect-trap-at: 15
+// BUG-1062: i128 MIN / -1 through the compound `/=` spelling. i128's MIN is
+// -2^127; the old switch compared against INT64_MIN, so the division itself —
+// undefined behaviour in C, a SIGFPE on x86 — was reached.
+u32 main() {
+    i128 one = 1;
+    volatile i128 va = one << 127;
+    volatile i128 vb = -1;
+    i128 a = va;
+    i128 b = vb;
+    if (b == 0) { return 9; }
+    i128 r = a;
+    r /= b;
+    if (r != 0) { return 7; }
+    return 0;
+}

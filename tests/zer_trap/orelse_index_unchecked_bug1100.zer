@@ -1,0 +1,14 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1100: `arr[big() orelse 0]` was emitted as a bare `arr[_zer_t0]` — no check
+// at all. The orelse is lowered into a temp and the index REWRITTEN to an ident,
+// and the IR emitter skipped the inline check for any ident index, trusting an
+// auto-guard that the checker never registered (the index was not an ident when
+// it checked it). Pre-fix this wrote arr[9] and read it back (exit 9).
+?u32 big() { return 9; }
+u32 main() {
+    u32[4] arr;
+    arr[big() orelse 0] = 9;
+    u32 x = arr[big() orelse 0];
+    return x;
+}

@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot allocate inside interrupt handler
+// BUG-1036: the universal `alloc(T, n)` / `free(slice)` builtins have no Symbol,
+// so FuncProps never saw them and a helper calling them was ISR-safe by omission.
+void helper() { ?[*]u8 b = alloc(u8, 16); if (b) |bb| { free(bb); } }
+interrupt IRQ1 { helper(); }
+u32 main() { return 0; }

@@ -1,0 +1,24 @@
+// BUG-1184: the assignment TARGET's index is evaluated before the value (left to
+// right). Pre-fix `a[i] += seti(&i);` read i AFTER the call: the checker had
+// proven i == 0 and elided the bounds check, and the write landed at a[4] (ASan
+// stack-buffer-overflow, no diagnostic). Same for `a[i] = (i = 4);`, which was an
+// unsequenced C expression.
+u32 seti(*u32 p) { *p = 4; return 1; }
+struct B { u32[4] arr; }
+u32 main() {
+    u32[4] a;
+    u32 i = 0;
+    a[i] += seti(&i);
+    if (a[0] != 1 || i != 4) { return 1; }
+    u32 j = 0;
+    a[j] = (j = 4) - 1;
+    if (a[0] != 3 || j != 4) { return 2; }
+    B b;
+    u32 k = 0;
+    b.arr[k] = b.arr[k] + seti(&k);
+    if (b.arr[0] != 1) { return 3; }
+    u32 m = 0;
+    u32 v = a[m + seti(&m)];        // index operands left to right: a[0 + 1]
+    if (v != 0) { return 4; }
+    return 0;
+}

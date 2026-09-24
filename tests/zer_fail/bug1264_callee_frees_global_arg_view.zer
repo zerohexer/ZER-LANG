@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: same allocation as global 'gh'
+struct T { u32 v; }
+Pool(T, 4) pool;
+Handle(T) gh;
+u32 rdl(*T x) {
+    pool.free(gh);
+    Handle(T) g2 = pool.alloc() orelse return;
+    pool.get(g2).v = 77;
+    u32 r = x.v;
+    pool.free(g2);
+    return r;
+}
+u32 main() {
+    gh = pool.alloc() orelse return;
+    pool.get(gh).v = 5;
+    return rdl(pool.get(gh));
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot form a non-volatile slice over a volatile array field
+// BUG-1057: `u.fifo` of a volatile register block coerced to a plain `[*]u32`
+// — kick's two stores became one (GCC deleted the first write to the FIFO).
+// The rule used to look only at a bare identifier's Symbol.
+mmio 0x40000000..0x400000FF;
+struct Uart { u32[4] fifo; }
+void kick([*]u32 s) { s[0] = 1; s[0] = 2; }
+u32 main() {
+    volatile *Uart u = @inttoptr(*Uart, 0x40000000);
+    kick(u.fifo);
+    return 0;
+}

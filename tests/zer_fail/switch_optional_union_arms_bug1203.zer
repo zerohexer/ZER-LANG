@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot match union variants on optional
+// BUG-1203: dot arms on a `?Union` passed the checker and reached GCC as undeclared
+// identifiers ("'n' undeclared"); only `?Enum` has an optional-variant lowering.
+struct P { u32 x; }
+union U { u32 n; P p; }
+?U mu(u32 k) { U u; if (k == 0) { return null; } u.n = 4; return u; }
+u32 main() {
+    u32 r = 0;
+    switch (mu(1)) {
+        .n => { r += 1; }
+        .p => { r += 10; }
+    }
+    return r;
+}

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: has no run-time body, so it cannot be used as a value
+// BUG-1217: a comptime function is never emitted; naming it as a function pointer
+// reached GCC as "'BIT' undeclared".
+comptime u32 BIT(u32 n) { return 1 << n; }
+u32 main() {
+    *(u32) -> u32 fp = BIT;
+    return fp(3);
+}

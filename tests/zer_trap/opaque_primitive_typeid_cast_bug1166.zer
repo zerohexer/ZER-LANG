@@ -1,0 +1,7 @@
+// expect-trap
+// expect-trap-msg: type mismatch in cast
+// BUG-1166: a *u32 wrapped as *opaque packed type_id 0 ("unknown"), so casting
+// it back to an 80-byte struct after a function return was never checked.
+struct B { u64 y; u64 z; u64[8] w; }
+*opaque mk(*u32 p) { return (*opaque)p; }
+u32 main() { u32 x = 1; *B b = (*B)mk(&x); b.w[7] = 99; return 0; }

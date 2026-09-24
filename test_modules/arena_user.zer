@@ -1,0 +1,7 @@
+import arena_lib;
+u8[4096] mem;
+u32 main() {
+    scratch = Arena.over(mem);
+    u32 v = take();
+    return v - 3;
+}

@@ -7,11 +7,13 @@ Slab(Bullet) bullets;
 u32 main() {
     ?Handle(Enemy) me = enemies.alloc();
     Handle(Enemy) e = me orelse return;
+    defer enemies.free(e);   // BUG-1071: also on the early returns below
     e.hp = 100;
     e.dmg = 5;
 
     ?Handle(Bullet) mb = bullets.alloc();
     Handle(Bullet) b = mb orelse return;
+    defer bullets.free(b);
     b.x = 0;
     b.y = 0;
     b.power = 25;
@@ -20,7 +22,5 @@ u32 main() {
     e.hp = new_hp;
     if (e.hp != 75) { return 1; }
 
-    bullets.free(b);
-    enemies.free(e);
     return 0;
 }

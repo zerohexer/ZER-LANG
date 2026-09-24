@@ -8,24 +8,26 @@ u32 main() {
     h1.val = 10;
 
     ?Handle(Slot) m2 = pool.alloc();
-    Handle(Slot) h2 = m2 orelse return;
+    Handle(Slot) h2 = m2 orelse { pool.free(h1); return 3; };   // BUG-1071
     h2.val = 20;
 
     // Pool is full (capacity 2) — alloc should fail
     ?Handle(Slot) m3 = pool.alloc();
     if (m3) |h3| {
         pool.free(h3);
+        pool.free(h1);
+        pool.free(h2);
         return 1;
     }
 
     // Free one and re-alloc
     pool.free(h1);
     ?Handle(Slot) m4 = pool.alloc();
-    Handle(Slot) h4 = m4 orelse return;
+    Handle(Slot) h4 = m4 orelse { pool.free(h2); return 4; };
     h4.val = 30;
-    if (h4.val != 30) { return 2; }
-
+    u32 v4 = h4.val;
     pool.free(h2);
     pool.free(h4);
+    if (v4 != 30) { return 2; }
     return 0;
 }

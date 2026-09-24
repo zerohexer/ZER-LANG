@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: must be a single 'return <expr>;'
+// BUG-1204: a struct-returning comptime function was folded from the FIRST `return`
+// found, ignoring the condition — MK(1) gave .a = 1 where the body says 2.
+struct In { u32 a; u8 b; }
+comptime In MK(u32 x) { if (x > 2) { return { .a = 1 }; } return { .a = 2 }; }
+u32 main() { In d = MK(1); return d.a; }

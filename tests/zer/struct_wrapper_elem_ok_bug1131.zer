@@ -1,0 +1,94 @@
+// BUG-1131 boundaries: a struct value carried through an array element, an
+// assigned literal or a chained wrapper aliases the param's allocation — so a
+// use BEFORE the free, a free THROUGH the returned field, and a field holding a
+// DIFFERENT param than the one freed all compile and run.
+struct T { u32 v; }
+struct H { *T p; }
+struct G { *T p; *T q; }
+T gt;
+
+H mk(*T a) { H[2] hs; hs[0] = { .p = a }; return hs[0]; }
+H mk_chain(*T a) { return mk(a); }
+G mk2(*T a, *T b) { G[2] gs; gs[0] = { .p = a, .q = b }; return gs[0]; }
+H mk_other(*T a, *T b) { H[2] hs; hs[0] = { .p = b }; u32 x = a.v; return hs[0]; }
+
+// the backstop is GATED: a value built by field stores the analysis saw keeps
+// exactly its entries — a field set to a global is not a view of the param
+H mk_global(*T a) { H h; h.p = &gt; u32 x = a.v; return h; }
+
+u32 global_field() {
+    *T a = alloc(T) orelse return;
+    gt.v = 4;
+    H h = mk_global(a);
+    free(a);
+    return h.p.v - 4;
+}
+
+u32 use_first() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a);
+    u32 r = h.p.v;
+    free(a);
+    return r - 5;
+}
+
+u32 free_through_field() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk(a);
+    u32 r = h.p.v;
+    free(h.p);
+    return r - 5;
+}
+
+u32 other_field() {
+    *T a = alloc(T) orelse return;
+    defer free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 2;
+    G g = mk2(a, b);
+    u32 r = g.q.v;
+    free(b);
+    return r - 2;
+}
+
+u32 other_param() {
+    *T b = alloc(T) orelse return;
+    defer free(b);
+    *T a = alloc(T) orelse return;
+    b.v = 3;
+    H h = mk_other(a, b);
+    free(a);
+    return h.p.v - 3;
+}
+
+u32 assign_literal() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H[2] hs;
+    hs[0] = { .p = a };
+    u32 r = hs[0].p.v;
+    free(a);
+    return r - 5;
+}
+
+u32 chained() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h = mk_chain(a);
+    u32 r = h.p.v;
+    free(a);
+    return r - 5;
+}
+
+u32 main() {
+    if (use_first() != 0) { return 1; }
+    if (free_through_field() != 0) { return 2; }
+    if (other_field() != 0) { return 3; }
+    if (other_param() != 0) { return 4; }
+    if (assign_literal() != 0) { return 5; }
+    if (chained() != 0) { return 6; }
+    if (global_field() != 0) { return 7; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: never reassigned
+// BUG-1056: the MMIO index bound is derived from the pointer's DECLARATION
+// (`@inttoptr(*u32, 0x40000000)` -> 64 u32 registers). After the reassignment
+// the pointer is 0xF0 bytes further on, so `r[10]` reads 0x40000118 — outside
+// every declared range — and compiled with no check at all.
+mmio 0x40000000..0x400000FF;
+u32 main() {
+    volatile *u32 r = @inttoptr(*u32, 0x40000000);
+    r = @inttoptr(*u32, 0x400000F0);
+    return r[10];
+}

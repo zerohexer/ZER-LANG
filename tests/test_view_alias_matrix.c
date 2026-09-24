@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
@@ -67,12 +68,12 @@ static int has_uaf_reason(const char *eb) {
 
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_va.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_va.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_va.zer -o /tmp/_zer_va.c 2>/tmp/_zer_va.err", zerc_path);
+             ZT("%s /tmp/_zer_va.zer -o /tmp/_zer_va.c 2>/tmp/_zer_va.err"), zerc_path);
     if (system(cmd) == 0) {
         failed++; false_neg++;
         fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — a view of freed memory COMPILED CLEAN\n", name);
@@ -80,7 +81,7 @@ static int run_neg(const char *name, const char *code) {
         return 0;
     }
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_va.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_va.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
@@ -95,16 +96,16 @@ static int run_neg(const char *name, const char *code) {
 
 static int run_pos(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_va.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_va.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_va.zer -o /tmp/_zer_va.c 2>/tmp/_zer_va.err", zerc_path);
+             ZT("%s /tmp/_zer_va.zer -o /tmp/_zer_va.c 2>/tmp/_zer_va.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_va.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_va.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — a SAFE view pattern was REJECTED:\n    %.130s\n", name, eb);
     fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
@@ -245,9 +246,11 @@ static void gen_pos_before_free(ViewForm f, char *out, size_t n) {
                       snprintf(mk, sizeof(mk), "K kk = mk(s); *B vw = kk.p;"); break;
     case VF_FIELD_OF_PARAM: decls = "struct K{ *B p; }\n*B get(K k){ return k.p; }\n";
                       snprintf(mk, sizeof(mk), "K kk; kk.p = &s[0]; *B vw = get(kk);"); break;
+    /* BUG-1071: the fallback must free `s` — a leak on the orelse-fallback
+     * path is reported now, and this POSITIVE cell used to leak there. */
     case VF_OPT_UNWRAP: decls = "struct K{ *B p; }\n";
                       snprintf(mk, sizeof(mk),
-                               "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { return 3; }; *B vw = u.p;"); break;
+                               "K kk; kk.p = &s[0]; ?K oa = kk; K u = oa orelse { free(s); return 3; }; *B vw = u.p;"); break;
     case VF_COUNT: break;
     }
     snprintf(out, n,

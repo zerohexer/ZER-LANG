@@ -1,0 +1,10 @@
+// expect-error: always out of bounds
+// BUG-1091: F() is 3 (as the same expression is at run time); pre-fix the comptime
+// fold said 0 and the index was trusted.
+comptime u32 F() { return (0 - 1) / 1073741824; }
+u32 main() {
+    u32[2] two;
+    u32 i = F();
+    two[i] = 1;
+    return 0;
+}

@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
@@ -75,11 +76,11 @@ static int has_conc_reason(const char *eb) {
 /* NEGATIVE: must reject for a concurrency reason. */
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_co.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_co.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_co.zer -o /dev/null 2>/tmp/_zer_co.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_co.zer -o /dev/null 2>/tmp/_zer_co.err"), zerc_path);
     if (system(cmd) == 0) {
         failed++; false_neg++;
         fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — unsynchronized program COMPILED CLEAN\n", name);
@@ -87,7 +88,7 @@ static int run_neg(const char *name, const char *code) {
         return 0;
     }
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_co.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_co.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
@@ -112,16 +113,16 @@ static int run_neg(const char *name, const char *code) {
  * checker error. */
 static int run_pos_check_only(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_co.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_co.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
-             "%s /tmp/_zer_co.zer -o /tmp/_zer_co_out.c 2>/tmp/_zer_co.err", zerc_path);
+             ZT("%s /tmp/_zer_co.zer -o /tmp/_zer_co_out.c 2>/tmp/_zer_co.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_co.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_co.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — safe pattern REJECTED BY THE CHECKER:\n", name);
     fprintf(stderr, "    %.160s\n", eb);
@@ -132,15 +133,15 @@ static int run_pos_check_only(const char *name, const char *code) {
 /* POSITIVE: a correctly-synchronized pattern must compile. */
 static int run_pos(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_co.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_co.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_co.zer -o /dev/null 2>/tmp/_zer_co.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_co.zer -o /dev/null 2>/tmp/_zer_co.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_co.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_co.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — safe concurrency pattern REJECTED:\n", name);
     fprintf(stderr, "    %.110s\n", eb);
@@ -410,7 +411,8 @@ static const char *sink_name(CASink s) {
  * commit as the form. */
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
                RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM,
-               RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_COUNT } CAReach;
+               RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_FACTORY_ORELSE,
+               RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
 static const char *reach_name(CAReach r) {
@@ -425,6 +427,7 @@ static const char *reach_name(CAReach r) {
     case RCH_FWD_PARAM:   return "forwarded-param";
     case RCH_FACTORY_SWITCH:  return "factory-switch-arm";
     case RCH_FACTORY_DOWHILE: return "factory-dowhile-body";
+    case RCH_FACTORY_ORELSE:  return "factory-orelse-block";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -502,6 +505,16 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
     case RCH_FACTORY_DOWHILE:
         extra = "void nop() { }\n"
                 "*() -> void mk(u32 k) { do { if (k == 9) { return cb; } } while (k > 0); return nop; }\n";
+        wbody = "*() -> void fp = mk(0); fp();"; break;
+    /* 12th form (BUG-1044, 2026-09-22): the `return cb;` sits in an orelse-BLOCK
+     * fallback — a statement body reachable only THROUGH an expression, which the
+     * factory walk (now exhaustive over statement KINDS) still never entered,
+     * because it descended bodies, not expressions. Same fall-through-to-`nop`
+     * shape as the two forms above, for the same masking reason. */
+    case RCH_FACTORY_ORELSE:
+        extra = "void nop() { }\n"
+                "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
+                "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }\n";
         wbody = "*() -> void fp = mk(0); fp();"; break;
     default: break;
     }
@@ -627,7 +640,7 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
  * A new reach form must get a cell HERE as well as in the spawn grid. */
 typedef enum { IR_DIRECT, IR_GLOBAL_FP, IR_ARG, IR_STRUCT_INIT, IR_LOCAL_BIND,
                IR_FIELD_ASSIGN, IR_FIELD_ARRAY, IR_FACTORY1, IR_FACTORY2,
-               IR_FACTORY_SWITCH, IR_FACTORY_DOWHILE,
+               IR_FACTORY_SWITCH, IR_FACTORY_DOWHILE, IR_FACTORY_ORELSE,
                IR_COUNT } IsrReach;
 
 static const char *isr_name(IsrReach r) {
@@ -643,6 +656,7 @@ static const char *isr_name(IsrReach r) {
     case IR_FACTORY2:     return "factory-2hop";
     case IR_FACTORY_SWITCH:  return "factory-switch-arm";
     case IR_FACTORY_DOWHILE: return "factory-dowhile-body";
+    case IR_FACTORY_ORELSE:  return "factory-orelse-block";
     case IR_COUNT:        break;
     }
     return "?";
@@ -676,6 +690,12 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
     case IR_FACTORY_DOWHILE:
                           extra = "void nop() { }\n"
                                   "*() -> void mk(u32 k) { do { if (k == 9) { return bump; } } while (k > 0); return nop; }\n";
+                          body = "*() -> void fp = mk(0); fp();"; break;
+    /* BUG-1044 — the ISR sibling of RCH_FACTORY_ORELSE; both walks had the gap. */
+    case IR_FACTORY_ORELSE:
+                          extra = "void nop() { }\n"
+                                  "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
+                                  "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return bump; }; return nop; }\n";
                           body = "*() -> void fp = mk(0); fp();"; break;
     default: break;
     }

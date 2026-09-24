@@ -1,0 +1,7 @@
+// expect-error: global 'buf' is accessed from both interrupt and main code
+// BUG-1174: a global SLICE view of a global array did not reach the array in
+// the ISR sharing rule (only pointer views did).
+u32[4] buf;
+[*]u32 gs = buf[0..];
+interrupt TIMER { gs[0] = 5; }
+u32 main() { u32 x = buf[0]; return x; }

@@ -1,0 +1,3 @@
+// BUG-1199: a thread and main both use an imported module's static Pool.
+import m1199st;
+u32 main() { ThreadHandle t = spawn salloc(); u32 r = salloc(); t.join(); return r; }

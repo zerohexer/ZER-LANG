@@ -1,0 +1,4 @@
+// BUG-1211: under --stack-limit, a module static callee was "a function pointer
+// call with unknown target" and the whole chain was rejected.
+import m1211st;
+u32 main() { return m1211_use() - 11; }

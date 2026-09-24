@@ -1,0 +1,8 @@
+// expect-error: non-atomic read-modify-write
+// BUG-1168: a read-modify-write split across statements through a GLOBAL
+// pointer (`u32 t = *gp; *gp = t + 1;`) recorded its read as the pointer,
+// not the pointee, so the RMW rule never matched the write.
+volatile u32 g;
+volatile *u32 gp = &g;
+void w() { u32 t = *gp; *gp = t + 1; }
+u32 main() { spawn w(); u32 x = g; return x & 1; }

@@ -28,7 +28,7 @@ void ctrl_flow_fallback(){
 u32 main(){
     Handle(T) held = p.alloc() orelse { return 1; };   // take the only slot
     ctrl_flow_fallback();
-    if (marker != 0) { return 2; }                     // the orelse fell through
+    if (marker != 0) { p.free(held); return 2; }       // the orelse fell through
     p.free(held);
 
     // value fallback in a Slab method argument

@@ -12,12 +12,15 @@ struct Job {
 u32 main() {
     // Test 1: alloc_ptr with orelse block (was broken — emitted 0)
     *Node a = heap.alloc_ptr() orelse { return 1; };
+    defer heap.free_ptr(a);   // BUG-1071: also on every early return below
     a.value = 42;
     if (a.value != 42) { return 2; }
 
     // Test 2: multiple alloc_ptrs with orelse blocks
     *Node b = heap.alloc_ptr() orelse { return 3; };
+    defer heap.free_ptr(b);
     *Node c = heap.alloc_ptr() orelse { return 4; };
+    defer heap.free_ptr(c);
     b.value = 10;
     c.value = 20;
     if (b.value != 10) { return 5; }
@@ -29,8 +32,11 @@ u32 main() {
     j.priority = 99;
     j.node.value = 77;
     j.node.depth = 3;
-    if (j.node.value != 77) { return 8; }
-    if (j.node.depth != 3) { return 9; }
+    u32 jv = j.node.value;
+    u32 jd = j.node.depth;
+    heap.free(j.node);
+    if (jv != 77) { return 8; }
+    if (jd != 3) { return 9; }
     if (j.priority != 99) { return 10; }
 
     // Test 4: defer + alloc_ptr in loop
@@ -40,12 +46,6 @@ u32 main() {
         tmp.value = i * 100;
         if (tmp.value != i * 100) { return 12; }
     }
-
-    // Cleanup
-    heap.free_ptr(a);
-    heap.free_ptr(b);
-    heap.free_ptr(c);
-    heap.free(j.node);
 
     return 0;
 }

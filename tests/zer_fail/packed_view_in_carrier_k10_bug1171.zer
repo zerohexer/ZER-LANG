@@ -1,0 +1,8 @@
+// expect-error: a pointer into a packed struct's field may be misaligned
+// BUG-1171: a pointer into a packed field stored in a struct field lost its
+// misalignment fact; the later access was a misaligned store.
+struct In { u32 x; }
+packed struct P { u8 a; In i; }
+struct Q { *In p; }
+P gp;
+u32 main() { In dummy; Q q = { .p = &dummy }; q.p = &gp.i; q.p.x = 1; return 0; }

@@ -1,0 +1,32 @@
+// EXPECTED: compile error
+// expect-error: cannot 'yield' while '|*v|'
+// mutable union capture held across yield; main switches variant between polls
+struct A { u32 x; u32 y; }
+struct B { *u32 p; }
+union U { A a; B b; }
+U gu;
+u32 gv;
+u32 secret;
+async void f() {
+    switch (gu) {
+        .a => |*v| {
+            yield;
+            u64 addr = (u64)@ptrtoint(&secret);
+            v.x = @truncate(u32, addr);
+            v.y = @truncate(u32, addr >> 32);
+        }
+        .b => |*w| { }
+    }
+}
+u32 main() {
+    gu.a.x = 1;
+    _zer_async_f t; _zer_async_f_init(&t);
+    _zer_async_f_poll(&t);
+    gu.b.p = &gv;             // variant is now .b
+    _zer_async_f_poll(&t);    // async writes through its stale .a capture
+    switch (gu) {
+        .a => |*v| { return 1; }
+        .b => |*w| { *w.p = 42; }   // intended to write gv
+    }
+    return secret;            // 42: wrote a different global
+}

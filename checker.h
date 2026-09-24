@@ -53,6 +53,17 @@ typedef struct {
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
+    Node *current_body;      /* BUG-1056: body (function OR interrupt) being checked */
+    Node **reg_files;        /* BUG-1056: every NODE_FILE registered (whole-program scans) */
+    /* BUG-1120: an imported module's non-static global / function whose RAW
+     * name another module registered first gets its OWN Symbol (registered
+     * into a private scope), inserted into that module's scope when its bodies
+     * are checked. */
+    struct ModuleOwnSym { Node *decl; Symbol *sym; } *module_own;
+    int module_own_count;
+    int module_own_cap;
+    int reg_file_count;
+    int reg_file_cap;
     /* Stage 1->2 escape summary accumulators (set at func-body-check entry, updated
      * at each valued return in the NODE_RETURN handler, read into
      * Symbol.ret_summary_complete / ret_param_mask after the body). Sound by
@@ -105,11 +116,31 @@ typedef struct {
     int cert_loop_depth;      /* branch_depth at which the body is unconditional */
     int orelse_depth;       /* > 0 when inside orelse { block } — ban yield/await (BUG-481: stack ghost) */
     bool in_assign_target;  /* true when checking LHS of assignment */
+    /* BUG-1161: the TOP node of the assignment target being checked and the
+     * assignment operator. A union variant may be written only as the WHOLE
+     * target of a plain `=` — a compound op reads the variant, and a write
+     * into a SUB-field / element flips the tag while keeping the other
+     * variant's bytes. */
+    Node *assign_target_top;
+    int assign_target_op;
     const char *union_switch_var;  /* variable name being switched on (union only) */
     uint32_t union_switch_var_len;
     const char *union_switch_key;  /* BUG-392: full path key e.g. "msgs[0]" for array element locks */
     uint32_t union_switch_key_len;
     Type *union_switch_type;      /* the union type being switched — blocks alias mutation */
+    /* BUG-1186: the union type whose arm holds a live `|*w|` capture (NULL when
+     * none), and the calls made while one is live — judged after every body is
+     * typed (check_union_capture_calls): a callee that may assign a variant of
+     * that union type would leave `w` pointing at the wrong variant. */
+    Type *union_ptr_capture_type;
+    const char *union_ptr_capture_name;
+    uint32_t union_ptr_capture_name_len;
+    bool union_ptr_capture_task_private; /* BUG-1234: the switched union is a local no one else can reach */
+    struct UnionCaptureCall {
+        Node *call; Type *utype; const char *cap; uint32_t cap_len;
+        int line; const char *file_name; const char *source;
+    } *ucc;
+    int ucc_count, ucc_cap;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */
@@ -160,6 +191,15 @@ typedef struct {
     struct VarRange {
         const char *name;
         uint32_t name_len;
+        /* BUG-1092: the scope that DECLARES the key's root variable — the
+         * variable's identity. A range used to be found by NAME alone, so a
+         * shadowing declaration read (and assignments to it mutated) the OUTER
+         * variable's range. Resolved at push and at every lookup through the
+         * scope chain; NULL only when the root has no Symbol at all. */
+        Scope *owner;
+        /* BUG-1093: the root is a non-const GLOBAL or a `static` local — storage
+         * a call, a store through a pointer, or a suspension can change. */
+        bool root_global_like;
         int64_t min_val;
         int64_t max_val;
         bool known_nonzero;
@@ -188,13 +228,22 @@ typedef struct {
      * `u32 t = g; t = 5; g = t;` stays accepted.
      *
      * Only ever ADDS rejections, so the failure direction is over-rejection,
-     * never a shipped race. Name-keyed with no scope discriminator, exactly like
-     * VarRange above, with the same consequence: a shadowing local of the same
-     * name in a sibling scope can inherit a taint it did not earn. That
-     * over-rejects; it cannot under-reject. */
+     * never a shipped race. Name-keyed with no scope discriminator (VarRange
+     * above WAS too, until BUG-1092 — there a shadow could inherit a RANGE and
+     * elide a check; here the consequence is only that a shadowing local of the
+     * same name can inherit a taint it did not earn, which over-rejects and
+     * cannot under-reject). */
     RmwTaintEnt *rmw_taints;
     int rmw_taint_count;
     int rmw_taint_capacity;
+    /* BUG-1046: the main-side POINTER-CARRIER table — `h.p = &g` / `H h = { .p =
+     * &g }` / `q = &g` bind the local's ROOT name to the global it now points at,
+     * so a later `bump(h)` / `bump(q)` resolves to `g` at the RMW-through-param
+     * sink. Same entry shape and lifetime as rmw_taints (per function). The scans
+     * keep the same fact in their own alias table (_rmw_alias). */
+    RmwTaintEnt *rmw_ptr_carriers;
+    int rmw_ptr_carrier_count;
+    int rmw_ptr_carrier_capacity;
 
     /* Nodes proven safe by range propagation — emitter skips runtime checks */
     Node **proven_safe;
@@ -281,6 +330,10 @@ typedef struct {
     bool in_naked;      /* true when checking naked function body (MISRA Dir 4.3) */
     bool in_async;      /* true when checking async function body */
     bool in_async_yield_stmt; /* true when checking a statement containing yield/await in async */
+    /* BUG-1098: the expression an auto-guard for an access inside it would be
+     * HOISTED in front of (a statement's expression, a loop condition / step).
+     * NULL = unknown, which never hoists. */
+    Node *guard_stmt_root;
     bool after_spawn_in_func; /* A6-full: a spawn has executed earlier in this function body — a plain write to an atomic cell from here on could be concurrent */
     /* BUG-979: the SCOPED half of the same question. A scoped spawn opens a
      * concurrent window that a join CLOSES, so unlike a fire-and-forget spawn the
@@ -289,6 +342,12 @@ typedef struct {
      * fire-and-forget spawn also ran, in which case no join may ever clear it. */
     int live_scoped_threads;
     bool unbounded_spawn_in_func;
+    /* BUG-1125: GLOBALS lent by pointer to a scoped spawn in this function (BUG-1118).
+     * Candidates only — a join clears the Symbol's is_borrowed_by_thread, which is
+     * what the call-site check reads — so nothing is ever removed; reset per
+     * function. */
+    Symbol **lent_globals;
+    int lent_global_count, lent_global_cap;
     /* BUG-980: the mirror of lockchk_direct_only — collect ONLY what the
      * statement's CALLEES touch, skipping its own direct accesses. Intersecting
      * the two sets is what makes same-type re-entry visible: the full pass
@@ -302,13 +361,32 @@ typedef struct {
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
+    Node *call_callee_node; /* BUG-1217: the callee ident of the call being checked — a comptime function may appear ONLY there */
+    bool gi_static_local;  /* BUG-1213: global_init_scan is checking a STATIC LOCAL's initializer — a function-local name is not a constant */
     struct IsrGlobal {
         const char *name;
         uint32_t name_len;
+        /* BUG-1199: the global this entry names, resolved WHERE it was touched.
+         * Names alone collide across modules (two modules' `cnt`) and a module
+         * static is not findable by name from main's context at all. NULL for a
+         * static local. */
+        Symbol *sym;
         bool from_isr;          /* accessed inside interrupt body */
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */
+        /* BUG-1059d: which interrupt handler first touched it, and whether a
+         * SECOND one did. Two handlers can preempt each other under nested
+         * priorities (BUG-836's stack rule already assumes any ISR may preempt
+         * any other), so ISR-vs-ISR sharing is the same hazard as ISR-vs-main. */
+        const Node *first_isr_body;
+        bool multi_isr;
         bool compound_in_func;  /* compound assign in regular func */
+        /* BUG-1046: passed BY POINTER to a call whose target the analysis cannot
+         * see (a function-pointer callee). That call may read-modify-write it;
+         * "did not look" must not read as "no RMW", but the sentence must not
+         * claim an RMW either, so it is its own flag with its own wording. */
+        bool opaque_in_isr;
+        bool opaque_in_func;
         /* BUG-971: this entry names a STATIC LOCAL, not a global. It is the same
          * hazard — one object, reached from both the ISR and main — but it has no
          * global-scope Symbol, so check_interrupt_safety cannot look it up and needs
@@ -451,6 +529,9 @@ typedef struct {
         int callee_capacity;
         bool is_recursive;      /* part of a call cycle */
         bool has_indirect_call; /* calls through function pointer with unknown target */
+        int line;               /* BUG-1114: declaration line + file, so the stack */
+        const char *file_name;  /* diagnostics stop printing `file:0` */
+        const char *source;
     } *stack_frames;
     int stack_frame_count;
     int stack_frame_capacity;
@@ -462,10 +543,37 @@ void checker_register_file(Checker *c, Node *file_node); /* register declaration
 bool checker_check(Checker *c, Node *file_node);
 bool checker_check_bodies(Checker *c, Node *file_node); /* check bodies only, decls already registered */
 void check_keep_inference(Checker *c);
+/* zercheck_ir.c: does any statement in `n` ASSIGN to `name` (any assign op) or take
+ * `&name`? Exhaustive no-default AST walk, conservative (true) on opaque kinds. The
+ * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
+bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
+/* BUG-1184: is `&name` formed anywhere in `n` (a reassignment does not count)? */
+bool ast_name_addr_taken(Node *n, const char *name, uint32_t len);
+/* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
+/* `kind`: ANW_ASSIGN (`value` is the assigned value for `=`, NULL for a compound
+ * operator), ANW_ADDR (`&name`), ANW_OPAQUE (a node the walk cannot see into). */
+enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
+typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
+bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
+int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */
 void checker_post_passes(Checker *c, Node *file_node); /* stack depth + interrupt safety (after all bodies checked) */
+/* BUG-1037: the whole-program form. One entry per module, dependencies first, the
+ * main module LAST (its context is restored afterwards). The per-file passes
+ * (lock ordering, *opaque call provenance) run on each AST under that file's
+ * name/source so diagnostics point into the right file; the whole-program
+ * passes (stack depth, Arena/Barrier initialisation) see every module at once.
+ * checker_post_passes(c, f) is the one-file wrapper (checker_check / LSP). */
+typedef struct {
+    Node *ast;
+    const char *file_name;
+    const char *source;
+    const char *module;        /* NULL for the main module */
+    uint32_t module_len;
+} CheckerFile;
+void checker_post_passes_files(Checker *c, const CheckerFile *files, int count);
 void checker_push_module_scope(Checker *c, Node *file_node); /* push scope with module's own types */
 void checker_pop_module_scope(Checker *c); /* pop module scope */
 
@@ -483,6 +591,16 @@ bool checker_is_proven(Checker *c, Node *node);
 
 /* returns array_size if this node needs auto-guard, 0 if not */
 uint64_t checker_auto_guard_size(Checker *c, Node *node);
+
+/* BUG-1098: was this access given an auto-guard at all (hoisted into the C, or
+ * lowered into the IR)? An unproven fixed-array access WITHOUT one must carry
+ * its own inline single-evaluation bounds check. */
+bool checker_has_auto_guard(Checker *c, Node *node);
+
+/* BUG-1090: fold an integer expression at its CHECKER types, wrapping every
+ * intermediate exactly as the emitted code does. False when the tree is not a
+ * constant this fold models. */
+bool checker_fold_const_typed(Checker *c, Node *n, int64_t *out);
 
 /* BUG-955 (refactor M): ONE descent over an expression tree yielding every access
  * that needs a safety guard, so the emitter and the IR lowering ask the same
@@ -515,5 +633,9 @@ void checker_mark_guard_lowered(Checker *c, Node *node);
 
 /* Handle auto-deref: find unique Slab/Pool for a Handle's element type */
 Symbol *find_unique_allocator(Scope *s, Type *elem_type);
+
+/* BUG-1222: is the all-zero bit pattern NOT a value of this type (non-null
+ * pointer / funcptr, enum without a 0 variant)? */
+bool checker_type_has_no_zero_value(Type *t);
 
 #endif /* ZER_CHECKER_H */

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: must be declared volatile
+// ISR polls a task that touches a non-volatile global main reads
+u32 counter;
+async void f() { while (true) { counter += 1; yield; } }
+interrupt USART1 {
+    _zer_async_f t; _zer_async_f_init(&t);
+    _zer_async_f_poll(&t);
+}
+u32 main() { counter = 0; while (counter == 0) { } return 0; }

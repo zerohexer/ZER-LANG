@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'g' is freed
+// BUG-1049: an allocation held by a BARE global. The free THROUGH the global
+// resolved to no tracking key, so this compiled clean and ASan reported a
+// heap-use-after-free at the read.
+[*]u32 g;
+u32 run() { g = alloc(u32, 4) orelse return; free(g); return g[0]; }
+u32 main() { return run(); }

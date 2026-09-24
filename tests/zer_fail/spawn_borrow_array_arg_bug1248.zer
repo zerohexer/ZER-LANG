@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-1248: an array coerced to a slice spawn parameter lent nothing.
+void w([*]u32 s) { for (u32 i = 0; i < 100000; i += 1) { s[0] += 1; } }
+u32 main() {
+    u32[4] a;
+    ThreadHandle th = spawn w(a);
+    for (u32 i = 0; i < 100000; i += 1) { a[0] += 1; }
+    th.join();
+    return 0;
+}

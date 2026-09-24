@@ -1,0 +1,21 @@
+// BUG-1220: a DISTINCT array typedef was declared `uint8_t[4] q;` (not C) at every
+// declaration site — local, global, parameter, struct field.
+distinct typedef u8[4] Quad;
+Quad gq;
+u32 sum(Quad q) { return q[0] + q[3]; }
+struct H { Quad q; }
+u32 main() {
+    Quad a;
+    a[0] = 1; a[3] = 2;
+    Quad b = a;
+    b[0] = 9;
+    H h;
+    h.q = b;
+    gq = a;
+    if (a[0] != 1) { return 1; }
+    if (sum(b) != 11) { return 2; }
+    if (h.q[0] != 9) { return 3; }
+    if (gq[3] != 2) { return 4; }
+    if (a.len != 4) { return 5; }
+    return 0;
+}

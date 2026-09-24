@@ -37,6 +37,8 @@ run_test diamond2 30
 run_test collision_test 170
 run_test static_coll 30
 run_test gcoll 30
+run_test twin1120 0
+run_test xref1120 0
 run_test transitive 3
 run_test opaque_wrap 0
 run_test opaque_deep_ok 0
@@ -68,6 +70,26 @@ if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_deep_df (shoul
 $ZERC opaque_deep_uaf.zer -o /dev/null 2>/dev/null
 if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_deep_uaf (should reject 3-layer UAF)"; FAIL=$((FAIL+1)); fi
 
+# BUG-1199/1200: negatives that must fail for THEIR reason (the diagnostic is read).
+expect_err() {
+    local out
+    out=$($ZERC $1.zer -o /dev/null 2>&1)
+    if [ $? -ne 0 ] && echo "$out" | grep -qF "$2"; then PASS=$((PASS+1));
+    else echo "  FAIL: $1 (expected error containing: $2)"; echo "$out" | grep error | head -2; FAIL=$((FAIL+1)); fi
+}
+expect_err m1199_spawn_negative "accesses non-shared global 'scnt'"
+expect_err m1199_isr_negative "global 'scnt' is accessed from both interrupt and main code"
+expect_err m1199_pool_negative "accesses non-shared global 'spool'"
+expect_err m1199_atomic_negative "plain access to 'sac' in a concurrent context"
+expect_err m1200_qual_negative "a qualified reference to the SECOND declaration"
+expect_err m1200_ambig_negative "'M1200Pt' is declared by more than one imported module"
+expect_err m1200_ambig_negative "'m1200_get' is declared by more than one imported module"
+
+# BUG-1211: a module's static callee is resolved in its module by the stack analysis.
+out=$($ZERC m1211_stack.zer --stack-limit 4096 -o /dev/null 2>&1)
+if [ $? -eq 0 ] && ! echo "$out" | grep -q "unknown target"; then PASS=$((PASS+1));
+else echo "  FAIL: m1211_stack (static module callee treated as an unknown funcptr)"; echo "$out" | head -2; FAIL=$((FAIL+1)); fi
+
 # BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
 $ZERC use_hal.zer -o _use_hal.c 2>/dev/null
 if [ $? -eq 0 ] && grep -q "USART1_IRQHandler" _use_hal.c; then
@@ -93,6 +115,30 @@ run_test handle_user 0
 run_test comptime_user 0
 # Multi-module: enum + switch across modules
 run_test enum_user 0
+# BUG-1029: alloc(T,n) inside an imported module
+run_test alloc_user 0
+# BUG-1037: the post passes run over EVERY module. An arena declared + used in a
+# module and backed in main is whole-program-initialised (must compile) ...
+run_test arena_user 0
+# ... a two-shared-struct statement inside an IMPORTED function is the same
+# deadlock it is in main (must reject, and for THAT reason) ...
+output=$($ZERC deadlock_user_negative.zer -o /dev/null 2>&1)
+if [ $? -ne 0 ] && echo "$output" | grep -q "deadlock: single statement accesses both"; then
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: deadlock_user_negative (cross-module two-shared-struct statement not rejected as a deadlock)"
+    echo "$output" | head -3
+    FAIL=$((FAIL+1))
+fi
+# ... and --stack-limit counts an imported callee's frame in main's chain.
+output=$($ZERC stack_user_negative.zer -o /dev/null --stack-limit 500 2>&1)
+if [ $? -ne 0 ] && echo "$output" | grep -q "max call chain stack .* exceeds --stack-limit"; then
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: stack_user_negative (imported 1000-byte frame not counted under --stack-limit)"
+    echo "$output" | head -3
+    FAIL=$((FAIL+1))
+fi
 
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*

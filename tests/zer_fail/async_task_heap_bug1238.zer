@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot heap-allocate an async task
+// alloc a task on the heap
+async u32 f(u32 s) { yield; return s; }
+u32 main() {
+    [*]_zer_async_f ts = alloc(_zer_async_f, 2) orelse return;
+    _zer_async_f_init(&ts[0], 5);
+    while (_zer_async_f_poll(&ts[0]) == 0) { }
+    u32 r = _zer_async_f_result(&ts[0]);
+    free(ts);
+    return r - 5;
+}

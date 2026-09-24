@@ -1,0 +1,13 @@
+// expect-error: while it is borrowed by a scoped
+// BUG-1169: a scoped-spawn borrow missed this spelling (pre-existing alias /
+// struct-literal carrier / &carrier) and the parent raced the thread.
+struct H { *u32 p; }
+void w(H h) { *h.p = 5; }
+u32 main() {
+    u32 v = 1;
+    H h = { .p = &v };
+    ThreadHandle th = spawn w(h);
+    v = 7;
+    th.join();
+    return v;
+}

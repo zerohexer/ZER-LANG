@@ -1,0 +1,14 @@
+// BUG-1091: a comptime body folded a pure-literal subtree with NO width, so
+// `comptime u32 F() { return (0 - 1) / 1073741824; }` gave 0 while the same
+// expression in an ordinary function returns 3. A literal now carries the width
+// the checker typed it at, like every other operand.
+comptime u32 F() { return (0 - 1) / 1073741824; }
+comptime u32 G(u32 a) { return (a - 1) / 1073741824; }
+u32 rt() { return (0 - 1) / 1073741824; }
+const u32 K = (0 - 1) / 1073741824;
+u32 main() {
+    if (F() != rt()) { return 1; }
+    if (G(0) != 3) { return 2; }
+    if (K != 3) { return 3; }
+    return 0;
+}

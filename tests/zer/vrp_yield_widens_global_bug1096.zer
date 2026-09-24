@@ -1,0 +1,30 @@
+// BUG-1096: a yield / await is a suspension — the poller (here main) runs and
+// may write any global before the task resumes. `if (g < 4) { yield; arr[g] }`
+// kept g in [0,3] across the yield while main set g = 4 between the polls: the
+// resumed task wrote arr[4] unchecked (ASan). Now the range is widened at the
+// suspension, the access is guarded, and the task ends without writing.
+u32[4] arr;
+u32 g = 1;
+u32 hit = 0;
+bool go = false;
+async void on_yield() {
+    if (g < 4) { yield; arr[g] = 7; hit += 1; }
+}
+async void on_await() {
+    if (g < 4) { await go; arr[g] = 7; hit += 1; }
+}
+u32 main() {
+    _zer_async_on_yield a;
+    _zer_async_on_yield_init(&a);
+    i32 d = _zer_async_on_yield_poll(&a);
+    g = 4;
+    d = _zer_async_on_yield_poll(&a);
+    g = 1;
+    _zer_async_on_await b;
+    _zer_async_on_await_init(&b);
+    d = _zer_async_on_await_poll(&b);
+    g = 4;
+    go = true;
+    d = _zer_async_on_await_poll(&b);
+    return hit;
+}

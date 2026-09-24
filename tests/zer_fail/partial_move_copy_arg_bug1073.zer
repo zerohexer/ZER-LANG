@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: partially moved
+// BUG-1073 (H9): call-argument spelling — `take(w)` after `w.t` was moved out.
+move struct Tok { u32 k; }
+struct W { Tok t; u32 x; }
+void consume(Tok t) { }
+void take(W w) { consume(w.t); }
+u32 main() {
+    W w;
+    w.t.k = 5;
+    Tok a = w.t;
+    take(w);
+    consume(a);
+    return 0;
+}

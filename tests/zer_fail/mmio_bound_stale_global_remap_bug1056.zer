@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: never reassigned
+// BUG-1056, the GLOBAL form: a remap in ANOTHER function invalidates the
+// declaration's bound for every use in the program.
+mmio 0x40000000..0x400000FF;
+volatile *u32 greg = @inttoptr(*u32, 0x40000000);
+void remap() { greg = @inttoptr(*u32, 0x400000FC); }
+u32 main() { remap(); return greg[40]; }

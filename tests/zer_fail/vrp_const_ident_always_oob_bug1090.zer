@@ -1,0 +1,8 @@
+// expect-error: always out of bounds
+// BUG-1090: a local `const` initialized with a wrapping tree — the index `K` is 3.
+u32 main() {
+    u32[2] two;
+    const u32 K = (0 - 1) / 1073741824;
+    two[K] = 7;
+    return K;
+}

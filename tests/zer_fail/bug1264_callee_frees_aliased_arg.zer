@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: designates the same allocation as argument
+struct T { u32 v; }
+u32 use_it(*T t, *T u) {
+    free(u);
+    *T t2 = alloc(T) orelse return;
+    t2.v = 99;
+    u32 r = t.v;
+    free(t2);
+    return r;
+}
+u32 main() {
+    *T t = alloc(T) orelse return;
+    t.v = 5;
+    return use_it(t, t);
+}

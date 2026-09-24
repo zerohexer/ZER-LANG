@@ -1,0 +1,3 @@
+// BUG-1037: --stack-limit built frames from the main module only, so an imported
+// function had no frame and its 1000-byte buffer counted as 0 in main's chain.
+u32 deep(u32 n) { u8[1000] buf; buf[0] = 1; return n + buf[0]; }

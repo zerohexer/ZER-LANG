@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: transferred
+move struct Tok { u32 k; }
+void consume(Tok t) { }
+void eat(?Tok o) { if (o) |*p| { u32 z = p.k; } }
+u32 main() {
+    ?Tok o;
+    Tok a;
+    a.k = 1;
+    o = a;
+    eat(o);
+    eat(o);
+    return 0;
+}

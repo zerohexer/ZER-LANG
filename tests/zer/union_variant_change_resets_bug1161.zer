@@ -1,0 +1,42 @@
+// BUG-1161: a COMPOUND assignment to an inactive union variant read the other
+// variant's bytes (`w.p = &b.a; w.n += 4;` did pointer arithmetic, and the tag
+// stayed `.p`, so the arm wrote through the moved pointer), and a PARTIAL write
+// switched the tag while keeping the old bytes. Such a write now resets the
+// union to zero when it changes the active variant; within the same variant it
+// behaves normally.
+struct B { u32 a; u32 secret; }
+struct A { u32 x; u32 y; }
+union V { *u32 p; u64 n; A s; }
+B b;
+
+u32 main() {
+    b.secret = 7;
+    V w;
+    w.p = &b.a;
+    w.n += 4;                    // variant change: reset, then 0 + 4
+    switch (w) {
+        .p => |q| { *q = 0xBEEF; return 1; }
+        .n => |n| { if (n != 4) { return 2; } }
+        .s => |s| { return 3; }
+    }
+    if (b.secret != 7) { return 4; }
+    w.n += 5;                    // same variant: ordinary compound op
+    switch (w) {
+        .p => |q| { return 5; }
+        .n => |n| { if (n != 9) { return 6; } }
+        .s => |s| { return 7; }
+    }
+    w.s.y = 3;                   // partial write into .s: reset, x stays 0
+    switch (w) {
+        .p => |q| { return 8; }
+        .n => |n| { return 9; }
+        .s => |s| { if (s.x != 0 || s.y != 3) { return 10; } }
+    }
+    w.s.x = 2;                   // same variant: y kept
+    switch (w) {
+        .p => |q| { return 11; }
+        .n => |n| { return 12; }
+        .s => |s| { if (s.x != 2 || s.y != 3) { return 13; } }
+    }
+    return 0;
+}

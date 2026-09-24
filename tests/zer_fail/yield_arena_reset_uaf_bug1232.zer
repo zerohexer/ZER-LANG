@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: 'b' is maybe-freed
+struct Box { u32 v; }
+u8[256] mem;
+Arena ar;
+async u32 f() {
+    *Box b = ar.alloc(Box) orelse return;
+    b.v = 5;
+    yield;
+    return b.v;
+}
+u32 main() {
+    ar = Arena.over(mem);
+    _zer_async_f t; _zer_async_f_init(&t);
+    _zer_async_f_poll(&t);
+    ar.reset();
+    *Box q = ar.alloc(Box) orelse return;
+    q.v = 77;
+    while (_zer_async_f_poll(&t) == 0) { }
+    return _zer_async_f_result(&t);
+}

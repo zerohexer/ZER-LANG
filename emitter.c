@@ -83,13 +83,7 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
 /* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
  * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix). */
 static inline bool is_null_sentinel(Type *inner) {
-    if (!inner) return false;
-    /* BUG-279: unwrap ALL levels of distinct, not just one */
-    while (inner->kind == TYPE_DISTINCT) inner = inner->distinct.underlying;
-    /* BUG-393: *opaque is _zer_opaque struct, not a pointer — NOT null sentinel */
-    if (inner->kind == TYPE_POINTER && inner->pointer.inner &&
-        type_unwrap_distinct(inner->pointer.inner)->kind == TYPE_OPAQUE) return false;
-    return inner->kind == TYPE_POINTER || inner->kind == TYPE_FUNC_PTR;
+    return type_is_null_sentinel(inner);   /* BUG-1054: one definition, types.c */
 }
 #define IS_NULL_SENTINEL(inner_kind) \
     ((inner_kind) == TYPE_POINTER || (inner_kind) == TYPE_FUNC_PTR)
@@ -421,9 +415,6 @@ static bool field_obj_needs_parens(Node *obj) {
  * into NODE_INDEX.object but not NODE_INDEX.index, so `arr[fn()] <<= n`
  * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
  */
-/* fwd: bit-slice emission helpers (defined next to the IR-path SET handler,
- * but called from the AST path above it). */
-static void emit_bitslice_runtime_mask(Emitter *e, int btmp);
 
 static bool expr_has_side_effects(Node *n) {
     if (!n) return false;
@@ -571,6 +562,83 @@ static bool ir_op_takes_auto_guards(IROpKind op) {
     }
     return true;   /* unreachable; conservative if a cast smuggles a bad value in */
 }
+static void emit_local_name(Emitter *e, IRFunc *func, int local_id);
+static void emit_unreachable(Emitter *e, const char *what, Node *n);
+static void emit_module_global_name(Emitter *e, const char *name, uint32_t len);   /* BUG-1040 */
+static void emit_alloc_sym_cname(Emitter *e, Symbol *sym);                         /* BUG-1040 */
+static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func);
+static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func);   /* BUG-1058 */
+
+/* BUG-1019: the IR_CALL callee text, factored out of the four inline branches
+ * that used to emit it together with the opening `(`. Emits ONLY the callee —
+ * no paren — so the caller can either open the arg list directly or wrap the
+ * callee in the null-funcptr guard. Four shapes: a direct/mangled name, a
+ * struct-field funcptr, an array-element funcptr, and the unreachable
+ * fallback. */
+static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
+    /* Emit callee: simple ident or field access (funcptr through struct) */
+    if (inst->func_name) {
+        /* Check for cross-module function needing mangled name */
+        Symbol *fsym = scope_lookup(e->checker->global_scope,
+            inst->func_name, inst->func_name_len);
+        if (fsym && fsym->is_function && fsym->module_prefix) {
+            emit(e, "%.*s__%.*s",
+                 (int)fsym->module_prefix_len, fsym->module_prefix,
+                 (int)inst->func_name_len, inst->func_name);
+        } else {
+            emit(e, "%.*s", (int)inst->func_name_len, inst->func_name);
+        }
+    } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+               inst->expr->call.callee &&
+               inst->expr->call.callee->kind == NODE_FIELD) {
+        /* Struct field callee: obj.method or obj->method */
+        Node *callee = inst->expr->call.callee;
+        /* Emit object name from local or rewritten ident */
+        if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
+            int obj_id = -1;
+            for (int li = 0; li < func->local_count; li++) {
+                if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
+                    memcmp(func->locals[li].name, callee->field.object->ident.name,
+                           func->locals[li].name_len) == 0) {
+                    obj_id = li; break;
+                }
+            }
+            if (obj_id >= 0) {
+                Type *ot = func->locals[obj_id].type;
+                Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
+                emit_local_name(e, func, obj_id);
+                emit(e, "%s%.*s",
+                     (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
+                     (int)callee->field.field_name_len, callee->field.field_name);
+            } else {
+                /* Global/extern funcptr */
+                emit(e, "%.*s.%.*s",
+                     (int)callee->field.object->ident.name_len,
+                     callee->field.object->ident.name,
+                     (int)callee->field.field_name_len, callee->field.field_name);
+            }
+        } else {
+            emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
+        }
+    } else if (inst->expr && inst->expr->kind == NODE_CALL &&
+               inst->expr->call.callee &&
+               inst->expr->call.callee->kind == NODE_INDEX) {
+        /* Indexed funcptr callee: arr[i](args) / slice[i](args).
+         * BUG-1027b: this used to be a hand-rolled `name[index]` spelling
+         * that never went through the NODE_INDEX emitter, so a SLICE
+         * callee lost its `.ptr` and its `_zer_bounds_check` (GCC then
+         * refused `s[i](..)`; a fixed array is guarded by the IR branch
+         * the checker's auto-guard lowers to, so that form was safe).
+         * Route the callee through the one index emitter instead. The
+         * BUG-1019 null-funcptr guard wraps this callee text in
+         * `__typeof__(...)` + one initialiser, so the bounds check inside
+         * the index emitter still evaluates exactly once. */
+        emit_rewritten_node(e, inst->expr->call.callee, func);
+    } else {
+        emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
+    }
+}
+
 static void emit_defers(Emitter *e);
 
 /* Emit the zero value for a type (used by auto-guard return, auto-orelse).
@@ -636,6 +704,22 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
      * with no fault to notice it by. That asymmetry is why no existing test caught
      * either half. Trapping is the same trade-off already accepted for defer bodies,
      * and consistent with slices, which already TRAP on an out-of-range index. */
+    /* BUG-1222: an early return must RETURN SOMETHING, and for a `*T` function
+     * (non-null) or an enum without a 0 variant the zero it used to return is not
+     * a value of the type — a NULL non-null pointer handed to the caller (on bare
+     * metal a silent access near address 0), or a non-variant enum that the
+     * exhaustive switch's last-arm elision turns into a wrong arm. Trap, exactly
+     * like the lock / @critical / defer scopes below. */
+    bool ret_has_no_zero = e->current_func_ret &&
+        checker_type_has_no_zero_value(e->current_func_ret);
+    if (ret_has_no_zero) {
+        if (with_braces) emit(e, "{ ");
+        emit(e, "_zer_trap(\"out-of-bounds access in a function whose return type has "
+                "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
+                "return early\", __FILE__, __LINE__);");
+        if (with_braces) emit(e, " }\n"); else emit(e, " ");
+        return;
+    }
     if (e->guard_traps || e->noreturn_scope_depth > 0) {
         if (with_braces) emit(e, "{ ");
         emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
@@ -812,18 +896,76 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
     if (t) return t;
     return resolve_type_for_emit(e, tn);  /* fallback for uncached TypeNodes */
 }
+
+static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len);
+/* BUG-1111: ONE function-declarator emitter for the prototype path and the IR
+ * definition path. A function RETURNING a function pointer needs C's nested
+ * declarator `RET (*name(params))(fp_args)`; only the definition path knew, so a
+ * bodyless prototype `*(u32, u32) -> u32 select_op(u32 kind);` emitted
+ * `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);`, which GCC
+ * refuses. Split as head / params / tail so each caller keeps its own name
+ * spelling (the IR path mangles from IRFunc, the prototype from the AST). */
+static bool func_ret_is_funcptr(Type *ret, bool main_promote) {
+    return !main_promote && ret && type_dispatch_kind(ret) == TYPE_FUNC_PTR;
+}
+static void emit_func_decl_head(Emitter *e, Type *ret, bool main_promote) {
+    if (main_promote) {
+        emit(e, "int ");
+    } else if (func_ret_is_funcptr(ret, main_promote)) {
+        emit_type(e, type_unwrap_distinct(ret)->func_ptr.ret);
+        emit(e, " (*");
+    } else if (ret) {
+        emit_type(e, ret);
+        emit(e, " ");
+    } else {
+        emit(e, "void ");
+    }
+}
+static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
+    emit(e, "(");
+    if (fn->func_decl.param_count == 0) {
+        emit(e, "void");
+    } else {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            ParamDecl *p = &fn->func_decl.params[i];
+            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
+                          (uint32_t)i < func_type->func_ptr.param_count) ?
+                func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            emit_type_and_name(e, ptype, p->name, p->name_len);
+        }
+        if (fn->func_decl.is_variadic) emit(e, ", ...");
+    }
+    emit(e, ")");
+}
+static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
+    if (!func_ret_is_funcptr(ret, main_promote)) return;
+    Type *r = type_unwrap_distinct(ret);
+    emit(e, ")(");
+    if (r->func_ptr.param_count == 0) emit(e, "void");
+    for (uint32_t i = 0; i < r->func_ptr.param_count; i++) {
+        if (i > 0) emit(e, ", ");
+        emit_type(e, r->func_ptr.params[i]);
+    }
+    emit(e, ")");
+}
+
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
+
+static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile); /* BUG-1027, defined below */
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
     emit(e, "((");
     emit_type(e, slice_type);
     emit(e, "){ (");
-    if (slice_type && slice_type->slice.is_volatile) emit(e, "volatile ");
-    emit_type(e, array_type->array.inner);
-    emit(e, "*)");
+    /* BUG-1027: a funcptr/array element needs the `ret (**)(..)` / `T (*)[N]`
+     * declarator spelling — `emit_type(inner)*` is invalid C for those. */
+    emit_ptr_to_elem(e, array_type->array.inner,
+                     slice_type && slice_type->slice.is_volatile);
+    emit(e, ")");
     emit_expr(e, array_expr);
     emit(e, ", %llu })", (unsigned long long)array_type->array.size);
 }
@@ -864,6 +1006,470 @@ static const char *intn_carrier_suffix(uint32_t bits, bool is_signed) {
                (bits <= 32) ? "i32" : (bits <= 64) ? "i64" : "i128";
     return (bits <= 8) ? "u8" : (bits <= 16) ? "u16" :
            (bits <= 32) ? "u32" : (bits <= 64) ? "u64" : "u128";
+}
+
+/* ================================================================
+ * BUG-1027 (2026-09-14): ONE query for the name of a slice typedef, for EVERY
+ * element type — and the machinery that emits the typedef when no earlier
+ * site already did.
+ *
+ * Three hand-rolled suffix switches (emit_type TYPE_SLICE, emit_type ?[*]T,
+ * the NODE_SLICE literal) each listed the primitive/struct/union element kinds
+ * and let every OTHER kind fall through an exhaustive case list into the G1
+ * `TYPE_UINT` arm, which read `intn.bits` out of a non-intn Type (a pointer's
+ * low bits, an array's inner pointer) and named the slice `_zer_slice_u128`.
+ * Measured on a valid program: `[*]State s = arr; s[2]` read with a 16-byte
+ * stride over a 4-byte enum array (wrong value, then a stack OOB read);
+ * `[*]?*Task` read two pointers as one; `[*]Handle(T)` trapped; a funcptr
+ * element emitted `(uint32_t (*)(uint32_t)*)` and did not compile. The corpus
+ * only ever sliced `u*`/`i*`/struct, so no test exercised the fallthrough.
+ *
+ * Classification of an element type E:
+ *   - primitive / bool / uN,iN / enum (int32_t) / Handle (uint64_t):
+ *     reuse the PREAMBLE typedef `_zer_slice_<carrier>`
+ *   - struct / union: `_zer_slice_<user name>`, emitted at the declaration
+ *   - EXOTIC (pointer, optional value, funcptr, array, nested slice, *opaque,
+ *     builtin containers): `_zer_xslice_<mangled>`, emitted by
+ *     flush_exotic_slices once its named dependencies exist. Separate prefix
+ *     (`x`) + length-prefixed user names keep the mangling injective, so a
+ *     user struct named `p_Task` can never collide with `[*]*Task`.
+ * ================================================================ */
+
+/* growable byte buffer for building a mangled suffix (no fixed buffers) */
+typedef struct { char *p; size_t len; size_t cap; } XSBuf;
+
+static void xsb_put(XSBuf *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t nc = b->cap ? b->cap * 2 : 64;
+        while (nc < b->len + n + 1) nc *= 2;
+        char *np = (char *)realloc(b->p, nc);
+        if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        b->p = np; b->cap = nc;
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+static void xsb_puts(XSBuf *b, const char *s) { xsb_put(b, s, strlen(s)); }
+static void xsb_putu(XSBuf *b, unsigned long long v) {
+    char tmp[32]; /* a u64 has at most 20 decimal digits — bounded, not dynamic */
+    int n = snprintf(tmp, sizeof tmp, "%llu", v);
+    xsb_put(b, tmp, (size_t)n);
+}
+/* `<tag><len>_<prefix__name>` — length-prefixed so a user name containing '_'
+ * cannot be confused with the grammar tokens around it */
+static void xsb_user(XSBuf *b, const char *tag, const char *prefix, uint32_t plen,
+                     const char *name, uint32_t nlen) {
+    size_t total = (prefix && plen) ? (size_t)plen + 2 + nlen : nlen;
+    xsb_puts(b, tag); xsb_putu(b, total); xsb_puts(b, "_");
+    if (prefix && plen) { xsb_put(b, prefix, plen); xsb_puts(b, "__"); }
+    xsb_put(b, name, nlen);
+}
+
+/* The mangled suffix of ANY type (exhaustive — a new TypeKind fails the build). */
+static void xslice_suffix_append(XSBuf *b, Type *t) {
+    t = type_unwrap_distinct(t);
+    if (!t) { xsb_puts(b, "void"); return; }
+    switch (t->kind) {
+    case TYPE_VOID:   xsb_puts(b, "void"); break;
+    case TYPE_BOOL:   xsb_puts(b, "u8"); break;   /* bool = uint8_t */
+    case TYPE_U8:     xsb_puts(b, "u8"); break;
+    case TYPE_U16:    xsb_puts(b, "u16"); break;
+    case TYPE_U32:    xsb_puts(b, "u32"); break;
+    case TYPE_U64:    xsb_puts(b, "u64"); break;
+    case TYPE_USIZE:  xsb_puts(b, "usize"); break;
+    case TYPE_I8:     xsb_puts(b, "i8"); break;
+    case TYPE_I16:    xsb_puts(b, "i16"); break;
+    case TYPE_I32:    xsb_puts(b, "i32"); break;
+    case TYPE_I64:    xsb_puts(b, "i64"); break;
+    case TYPE_F32:    xsb_puts(b, "f32"); break;
+    case TYPE_F64:    xsb_puts(b, "f64"); break;
+    case TYPE_UINT:   xsb_puts(b, intn_carrier_suffix(t->intn.bits, false)); break;
+    case TYPE_SINT:   xsb_puts(b, intn_carrier_suffix(t->intn.bits, true)); break;
+    case TYPE_ENUM:   xsb_puts(b, "i32"); break;   /* enums are int32_t */
+    case TYPE_HANDLE: xsb_puts(b, "u64"); break;   /* Handle = uint64_t */
+    case TYPE_OPAQUE: xsb_puts(b, "opq"); break;
+    case TYPE_POINTER: {
+        Type *in = type_unwrap_distinct(t->pointer.inner);
+        if (type_dispatch_kind(in) == TYPE_OPAQUE) {
+            /* *opaque is the VALUE type _zer_opaque, not a C pointer */
+            xsb_puts(b, t->pointer.is_const ? (t->pointer.is_volatile ? "cvopq" : "copq")
+                                            : (t->pointer.is_volatile ? "vopq" : "opq"));
+        } else {
+            xsb_puts(b, "p");
+            if (t->pointer.is_const) xsb_puts(b, "c");
+            if (t->pointer.is_volatile) xsb_puts(b, "v");
+            xsb_puts(b, "_");
+            xslice_suffix_append(b, t->pointer.inner);
+        }
+        break;
+    }
+    case TYPE_OPTIONAL:
+        /* ?*T / ?funcptr have the SAME C type as the inner (null sentinel) */
+        if (!is_null_sentinel(t->optional.inner)) xsb_puts(b, "o_");
+        xslice_suffix_append(b, t->optional.inner);
+        break;
+    case TYPE_SLICE:
+        xsb_puts(b, t->slice.is_volatile ? "sv_" : "s_");
+        xslice_suffix_append(b, t->slice.inner);
+        break;
+    case TYPE_ARRAY:
+        if (t->array.sizeof_type) {
+            xsb_puts(b, "az_"); xslice_suffix_append(b, t->array.sizeof_type); xsb_puts(b, "_");
+        } else {
+            xsb_puts(b, "a"); xsb_putu(b, t->array.size); xsb_puts(b, "_");
+        }
+        xslice_suffix_append(b, t->array.inner);
+        break;
+    case TYPE_STRUCT:
+        xsb_user(b, "N", t->struct_type.module_prefix, t->struct_type.module_prefix_len,
+                 t->struct_type.name, t->struct_type.name_len);
+        break;
+    case TYPE_UNION:
+        xsb_user(b, "M", t->union_type.module_prefix, t->union_type.module_prefix_len,
+                 t->union_type.name, t->union_type.name_len);
+        break;
+    case TYPE_FUNC_PTR:
+        xsb_puts(b, t->func_ptr.is_variadic ? "fv" : "f");
+        xsb_putu(b, t->func_ptr.param_count);
+        xsb_puts(b, "_");
+        xslice_suffix_append(b, t->func_ptr.ret);
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
+            xsb_puts(b, "_");
+            xslice_suffix_append(b, t->func_ptr.params[i]);
+        }
+        break;
+    case TYPE_POOL:
+        xsb_puts(b, "pool"); xsb_putu(b, t->pool.count); xsb_puts(b, "_");
+        xslice_suffix_append(b, t->pool.elem);
+        break;
+    case TYPE_RING:
+        xsb_puts(b, "ring"); xsb_putu(b, t->ring.count); xsb_puts(b, "_");
+        xslice_suffix_append(b, t->ring.elem);
+        break;
+    case TYPE_ARENA:     xsb_puts(b, "arena"); break;
+    case TYPE_BARRIER:   xsb_puts(b, "barrier"); break;
+    case TYPE_SEMAPHORE: xsb_puts(b, "sem"); break;
+    case TYPE_SLAB:      xsb_puts(b, "slab"); break;
+    case TYPE_DISTINCT:  xslice_suffix_append(b, t->distinct.underlying); break; /* unwrapped above */
+    }
+}
+
+/* Does `[*]elem` need an emitted-on-demand typedef (no preamble/declaration one)? */
+static bool slice_elem_is_exotic(Type *elem) {
+    elem = type_unwrap_distinct(elem);
+    if (!elem) return true;
+    switch (elem->kind) {
+    case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64:
+    case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64: case TYPE_UINT: case TYPE_SINT:
+    case TYPE_ENUM: case TYPE_HANDLE:           /* preamble carrier typedef */
+    case TYPE_STRUCT: case TYPE_UNION:          /* emitted at the declaration */
+        return false;
+    case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL: case TYPE_SLICE:
+    case TYPE_ARRAY: case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
+    case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SLAB:
+    case TYPE_SEMAPHORE:
+        return true;
+    case TYPE_DISTINCT:
+        return slice_elem_is_exotic(elem->distinct.underlying); /* unwrapped above */
+    }
+    return true;
+}
+
+/* THE query: emit the typedef name of the slice over `elem`.
+ * is_opt selects the `?[*]T` wrapper typedef; is_volatile the `volatile [*]T` one. */
+static void emit_slice_name(Emitter *e, Type *elem, bool is_volatile, bool is_opt) {
+    elem = type_unwrap_distinct(elem);
+    XSBuf b = {0};
+    if (slice_elem_is_exotic(elem)) {
+        xslice_suffix_append(&b, elem);
+        emit(e, "%s%s", is_opt ? "_zer_xopt_slice_" : is_volatile ? "_zer_xvslice_" : "_zer_xslice_",
+             b.p ? b.p : "");
+        free(b.p);
+        return;
+    }
+    emit(e, "%s", is_opt ? "_zer_opt_slice_" : is_volatile ? "_zer_vslice_" : "_zer_slice_");
+    if (type_dispatch_kind(elem) == TYPE_STRUCT) { EMIT_STRUCT_NAME(e, elem); return; }
+    if (type_dispatch_kind(elem) == TYPE_UNION)  { EMIT_UNION_NAME(e, elem); return; }
+    xslice_suffix_append(&b, elem);   /* primitive / uN / enum / Handle carrier */
+    emit(e, "%s", b.p ? b.p : "");
+    free(b.p);
+}
+
+/* Emit the C type "pointer to elem" — the `ptr` field of a slice over `elem`
+ * (name = "ptr") or the cast an array→slice coercion applies (name = NULL, an
+ * abstract declarator). A funcptr element needs `ret (**name)(params)` and an
+ * array element `base (*name)[N]`; `emit_type(elem)* name` is only right for
+ * the other kinds. */
+static void emit_ptr_to_elem_named(Emitter *e, Type *elem, bool is_volatile, const char *name) {
+    elem = type_unwrap_distinct(elem);
+    const char *nm = name ? name : "";
+    if (type_dispatch_kind(elem) == TYPE_FUNC_PTR) {
+        emit_type(e, elem->func_ptr.ret);
+        emit(e, is_volatile ? " (* volatile *%s)(" : " (**%s)(", nm);
+        for (uint32_t i = 0; i < elem->func_ptr.param_count; i++) {
+            if (i > 0) emit(e, ", ");
+            emit_type(e, elem->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        return;
+    }
+    if (type_dispatch_kind(elem) == TYPE_ARRAY) {
+        Type *base = elem;
+        while (base->kind == TYPE_ARRAY) base = base->array.inner;
+        if (is_volatile) emit(e, "volatile ");
+        emit_type(e, base);
+        emit(e, " (*%s)", nm);
+        for (Type *dim = elem; type_dispatch_kind(dim) == TYPE_ARRAY; dim = dim->array.inner) {
+            if (dim->array.sizeof_type) {
+                emit(e, "[sizeof("); emit_type(e, dim->array.sizeof_type); emit(e, ")]");
+            } else {
+                emit(e, "[%llu]", (unsigned long long)dim->array.size);
+            }
+        }
+        return;
+    }
+    if (is_volatile) emit(e, "volatile ");
+    emit_type(e, elem);
+    emit(e, "*");
+    if (name) emit(e, " %s", name);
+}
+static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile) {
+    emit_ptr_to_elem_named(e, elem, is_volatile, NULL);
+}
+
+/* ---- the exotic-slice registry ---- */
+
+static bool user_type_same(Type *a, Type *b) {
+    a = type_unwrap_distinct(a); b = type_unwrap_distinct(b);
+    if (!a || !b || a->kind != b->kind) return false;
+    const char *an, *bn, *ap, *bp; uint32_t anl, bnl, apl, bpl;
+    if (type_dispatch_kind(a) == TYPE_STRUCT) {
+        an = a->struct_type.name; anl = a->struct_type.name_len;
+        ap = a->struct_type.module_prefix; apl = a->struct_type.module_prefix_len;
+        bn = b->struct_type.name; bnl = b->struct_type.name_len;
+        bp = b->struct_type.module_prefix; bpl = b->struct_type.module_prefix_len;
+    } else if (type_dispatch_kind(a) == TYPE_UNION) {
+        an = a->union_type.name; anl = a->union_type.name_len;
+        ap = a->union_type.module_prefix; apl = a->union_type.module_prefix_len;
+        bn = b->union_type.name; bnl = b->union_type.name_len;
+        bp = b->union_type.module_prefix; bpl = b->union_type.module_prefix_len;
+    } else {
+        return a == b;
+    }
+    if (anl != bnl || memcmp(an, bn, anl) != 0) return false;
+    if (!ap) apl = 0;
+    if (!bp) bpl = 0;
+    if (apl != bpl) return false;
+    return apl == 0 || memcmp(ap, bp, apl) == 0;
+}
+
+/* Called by every site that emits a struct/union DEFINITION (declaration,
+ * container stamp) so flush_exotic_slices knows which names are complete. */
+static void record_user_type_emitted(Emitter *e, Type *t) {
+    if (!t) return;
+    if (e->emitted_user_count == e->emitted_user_capacity) {
+        int nc = e->emitted_user_capacity ? e->emitted_user_capacity * 2 : 32;
+        Type **np = (Type **)realloc(e->emitted_user_types, (size_t)nc * sizeof(Type *));
+        if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        e->emitted_user_types = np; e->emitted_user_capacity = nc;
+    }
+    e->emitted_user_types[e->emitted_user_count++] = t;
+}
+
+static bool user_type_emitted(Emitter *e, Type *t) {
+    for (int i = 0; i < e->emitted_user_count; i++)
+        if (user_type_same(e->emitted_user_types[i], t)) return true;
+    return false;
+}
+
+static struct XSlice *xslice_find(Emitter *e, const char *suffix) {
+    for (int i = 0; i < e->xslice_count; i++)
+        if (strcmp(e->xslices[i].suffix, suffix) == 0) return &e->xslices[i];
+    return NULL;
+}
+
+static void xslice_register(Emitter *e, Type *elem) {
+    XSBuf b = {0};
+    xslice_suffix_append(&b, elem);
+    if (!b.p) return;
+    if (!xslice_find(e, b.p)) {
+        if (e->xslice_count == e->xslice_capacity) {
+            int nc = e->xslice_capacity ? e->xslice_capacity * 2 : 16;
+            struct XSlice *np = (struct XSlice *)realloc(e->xslices, (size_t)nc * sizeof(struct XSlice));
+            if (!np) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+            e->xslices = np; e->xslice_capacity = nc;
+        }
+        char *owned = (char *)arena_alloc(e->arena, b.len + 1);
+        memcpy(owned, b.p, b.len + 1);
+        struct XSlice *x = &e->xslices[e->xslice_count++];
+        x->suffix = owned;
+        x->elem = type_unwrap_distinct(elem);
+        x->emitted = false;
+    }
+    free(b.p);
+}
+
+/* pointer set (open addressing) — the visited set for the type walk; the type
+ * graph is cyclic through struct fields (`struct N { ?*N next; }`) */
+typedef struct { Type **keys; size_t cap; size_t count; } XPtrSet;
+
+static bool xptrset_add(XPtrSet *s, Type *k) {
+    if (s->count * 2 >= s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 1024;
+        Type **nk = (Type **)calloc(nc, sizeof(Type *));
+        if (!nk) { fprintf(stderr, "zerc: out of memory\n"); exit(1); }
+        for (size_t i = 0; i < s->cap; i++) {
+            Type *o = s->keys[i];
+            if (!o) continue;
+            size_t j = ((uintptr_t)o >> 4) % nc;
+            while (nk[j]) j = (j + 1) % nc;
+            nk[j] = o;
+        }
+        free(s->keys); s->keys = nk; s->cap = nc;
+    }
+    size_t j = ((uintptr_t)k >> 4) % s->cap;
+    while (s->keys[j]) {
+        if (s->keys[j] == k) return false;
+        j = (j + 1) % s->cap;
+    }
+    s->keys[j] = k; s->count++;
+    return true;
+}
+
+/* Walk every type reachable from `t`, registering each exotic slice element. */
+static void collect_walk(Emitter *e, XPtrSet *seen, Type *t) {
+    if (!t || !xptrset_add(seen, t)) return;
+    switch (t->kind) {
+    case TYPE_SLICE:
+        if (slice_elem_is_exotic(t->slice.inner)) xslice_register(e, t->slice.inner);
+        collect_walk(e, seen, t->slice.inner);
+        break;
+    case TYPE_POINTER:  collect_walk(e, seen, t->pointer.inner); break;
+    case TYPE_OPTIONAL: collect_walk(e, seen, t->optional.inner); break;
+    case TYPE_ARRAY:
+        collect_walk(e, seen, t->array.inner);
+        collect_walk(e, seen, t->array.sizeof_type);
+        break;
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < t->struct_type.field_count; i++)
+            collect_walk(e, seen, t->struct_type.fields[i].type);
+        break;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++)
+            collect_walk(e, seen, t->union_type.variants[i].type);
+        break;
+    case TYPE_FUNC_PTR:
+        collect_walk(e, seen, t->func_ptr.ret);
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++)
+            collect_walk(e, seen, t->func_ptr.params[i]);
+        break;
+    case TYPE_POOL:     collect_walk(e, seen, t->pool.elem); break;
+    case TYPE_RING:     collect_walk(e, seen, t->ring.elem); break;
+    case TYPE_HANDLE:   collect_walk(e, seen, t->handle.elem); break;
+    case TYPE_SLAB:     collect_walk(e, seen, t->slab.elem); break;
+    case TYPE_DISTINCT: collect_walk(e, seen, t->distinct.underlying); break;
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32:
+    case TYPE_I64: case TYPE_F32: case TYPE_F64: case TYPE_ENUM: case TYPE_OPAQUE:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE: case TYPE_UINT:
+    case TYPE_SINT:
+        break;  /* leaves: nothing nested */
+    }
+}
+
+/* Register every exotic slice type the program names anywhere: the checker's
+ * typemap holds the resolved type of every node AND every resolved type node
+ * (RF3), so all slice types the emitter can ever spell are reachable from it;
+ * container stamps are walked too. Idempotent — the registry dedupes. */
+static void collect_exotic_slices(Emitter *e) {
+    if (!e->checker) return;
+    XPtrSet seen = {0};
+    Checker *c = e->checker;
+    for (uint32_t i = 0; i < c->type_map_size; i++)
+        if (c->type_map[i].key) collect_walk(e, &seen, c->type_map[i].type);
+    for (int i = 0; i < c->container_inst_count; i++) {
+        collect_walk(e, &seen, c->container_instances[i].stamped_struct);
+        collect_walk(e, &seen, c->container_instances[i].concrete_type);
+    }
+    free(seen.keys);
+}
+
+/* Can `[*]elem`'s typedef be emitted NOW? Every struct/union it names by VALUE
+ * (or under an array, which C requires complete) must already be defined, and
+ * every nested exotic slice typedef must already be emitted. A struct reached
+ * only through a pointer needs no definition (`struct T*` may be incomplete),
+ * which is what lets `struct Task { [*]?*Task kids; }` compile. */
+static bool xslice_deps_ready(Emitter *e, Type *t) {
+    t = type_unwrap_distinct(t);
+    if (!t) return true;
+    switch (t->kind) {
+    case TYPE_STRUCT: case TYPE_UNION:
+        return user_type_emitted(e, t);
+    case TYPE_POINTER: {
+        Type *in = type_unwrap_distinct(t->pointer.inner);
+        if (type_dispatch_kind(in) == TYPE_STRUCT || type_dispatch_kind(in) == TYPE_UNION) return true;
+        return xslice_deps_ready(e, in);
+    }
+    case TYPE_OPTIONAL: {
+        Type *in = type_unwrap_distinct(t->optional.inner);
+        return xslice_deps_ready(e, in);   /* value optional: `_zer_opt_X` needs X; ?*X same as *X */
+    }
+    case TYPE_SLICE: {
+        if (slice_elem_is_exotic(t->slice.inner)) {
+            XSBuf b = {0};
+            xslice_suffix_append(&b, t->slice.inner);
+            struct XSlice *x = b.p ? xslice_find(e, b.p) : NULL;
+            free(b.p);
+            return x && x->emitted;
+        }
+        return xslice_deps_ready(e, t->slice.inner);
+    }
+    case TYPE_ARRAY:
+        return xslice_deps_ready(e, t->array.inner) &&
+               xslice_deps_ready(e, t->array.sizeof_type);
+    case TYPE_FUNC_PTR:
+        if (!xslice_deps_ready(e, t->func_ptr.ret)) return false;
+        for (uint32_t i = 0; i < t->func_ptr.param_count; i++)
+            if (!xslice_deps_ready(e, t->func_ptr.params[i])) return false;
+        return true;
+    case TYPE_POOL:   return xslice_deps_ready(e, t->pool.elem);
+    case TYPE_RING:   return xslice_deps_ready(e, t->ring.elem);
+    case TYPE_DISTINCT: return xslice_deps_ready(e, t->distinct.underlying);
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_U8: case TYPE_U16: case TYPE_U32:
+    case TYPE_U64: case TYPE_USIZE: case TYPE_I8: case TYPE_I16: case TYPE_I32:
+    case TYPE_I64: case TYPE_F32: case TYPE_F64: case TYPE_ENUM: case TYPE_OPAQUE:
+    case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE: case TYPE_SLAB:
+    case TYPE_SEMAPHORE: case TYPE_UINT: case TYPE_SINT:
+        return true;
+    }
+    return true;
+}
+
+/* Emit every registered exotic slice typedef whose dependencies are satisfied.
+ * Called before each pass-1 declaration and after pass 1 / the container
+ * stamps, so a typedef lands before its first use and after the definitions
+ * it needs. Iterates to a fixpoint so `[*][*]?u32` follows `[*]?u32`. */
+static void flush_exotic_slices(Emitter *e) {
+    bool progress = true;
+    while (progress) {
+        progress = false;
+        for (int i = 0; i < e->xslice_count; i++) {
+            struct XSlice *x = &e->xslices[i];
+            if (x->emitted || !xslice_deps_ready(e, x->elem)) continue;
+            emit(e, "typedef struct { ");
+            emit_ptr_to_elem_named(e, x->elem, false, "ptr");
+            emit(e, "; size_t len; } _zer_xslice_%s;\n", x->suffix);
+            emit(e, "typedef struct { ");
+            emit_ptr_to_elem_named(e, x->elem, true, "ptr");
+            emit(e, "; size_t len; } _zer_xvslice_%s;\n", x->suffix);
+            emit(e, "typedef struct { _zer_xslice_%s value; uint8_t has_value; } _zer_xopt_slice_%s;\n",
+                 x->suffix, x->suffix);
+            x->emitted = true;
+            progress = true;
+        }
+    }
 }
 
 /* Path C: after an arithmetic op, mask a uN/iN result to its bit width when the
@@ -968,19 +1574,40 @@ static bool type_carries_enum_e(Type *t, int depth) {
  * CLAUDE.md: an intrinsic handled in only one path falls through to a placeholder
  * emission and segfaults at runtime, so the value expression is passed in as an
  * already-emitted callback rather than duplicating the body. */
+/* BUG-1193: the membership test runs on the OPERAND's own value and type. It used
+ * to narrow to int32 first, so `@try_enum(Gap, (u64)4294967306)` matched the
+ * variant 10 and `@try_enum(Dir, (u32)0xFFFFFFFF)` matched -1 — the checked door
+ * returning a variant for a value that is not one. `src` is the operand's type: a
+ * variant is compared only when it is REPRESENTABLE in that type (a negative value
+ * never matches an unsigned operand; 300 never matches a u8), and then exactly, in
+ * the operand's type. Unknown type: fall back to the old int32 test. */
 static void emit_try_enum_open(Emitter *e) {
-    emit(e, "({ int32_t _zer_tev = (int32_t)(");
+    emit(e, "({ __auto_type _zer_tew = (");
 }
-static void emit_try_enum_close(Emitter *e, Type *t) {
+static void emit_try_enum_close(Emitter *e, Type *t, Type *src) {
     Type *u = t ? type_unwrap_distinct(t) : NULL;
-    emit(e, "); _zer_opt_i32 _zer_teo; _zer_teo.has_value = (");
-    if (u && type_dispatch_kind(u) == TYPE_ENUM && u->enum_type.variant_count > 0) {
+    Type *se = src ? type_unwrap_distinct(src) : NULL;
+    int bits = (se && type_is_integer(se)) ? type_width(se) : 0;
+    bool sgn = se && type_is_signed(se);
+    emit(e, "); int32_t _zer_tev = (int32_t)_zer_tew; _zer_opt_i32 _zer_teo; "
+            "_zer_teo.has_value = (0");
+    if (u && type_dispatch_kind(u) == TYPE_ENUM) {
         for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
-            if (vi) emit(e, " || ");
-            emit(e, "_zer_tev == %lld", (long long)u->enum_type.variants[vi].value);
+            long long v = (long long)u->enum_type.variants[vi].value;
+            if (bits <= 0) {                     /* operand type unknown */
+                emit(e, " || _zer_tev == %lld", v);
+                continue;
+            }
+            bool fits;
+            if (sgn) {
+                fits = bits >= 64 ||
+                       (v >= -(1LL << (bits - 1)) && v <= (1LL << (bits - 1)) - 1);
+            } else {
+                fits = v >= 0 && (bits >= 63 || v <= (long long)((1ULL << bits) - 1));
+            }
+            if (!fits) continue;                 /* no value of the operand is v */
+            emit(e, " || _zer_tew == (__typeof__(_zer_tew))%lldLL", v);
         }
-    } else {
-        emit(e, "0");
     }
     emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
 }
@@ -1072,23 +1699,81 @@ static bool f2i_needs_guard(Type *src, Type *tgt) {
     }
 }
 static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
-    Type *u = type_unwrap_distinct(tgt);
-    *bits = 32; *is_signed = false;
-    switch (type_dispatch_kind(u)) {
-    case TYPE_U8:  *bits = 8;  break;
-    case TYPE_U16: *bits = 16; break;
-    case TYPE_U32: *bits = 32; break;
-    case TYPE_U64: *bits = 64; break;
-    case TYPE_USIZE: *bits = zer_target_ptr_bits; break;
-    case TYPE_I8:  *bits = 8;  *is_signed = true; break;
-    case TYPE_I16: *bits = 16; *is_signed = true; break;
-    case TYPE_I32: *bits = 32; *is_signed = true; break;
-    case TYPE_I64: *bits = 64; *is_signed = true; break;
-    case TYPE_UINT: *bits = (int)u->intn.bits; break;
-    case TYPE_SINT: *bits = (int)u->intn.bits; *is_signed = true; break;
-    default: break;
-    }
+    /* BUG-1064: width and signedness come from the SAME two queries every other
+     * integer-width decision uses (type_width / type_is_signed), so u65..u128 /
+     * i65..i128 and the enum carrier get their real bounds instead of a default. */
+    Type *u = tgt ? type_unwrap_distinct(tgt) : NULL;
+    *bits = u ? type_width(u) : 0;
+    if (*bits <= 0) *bits = 32;
+    if (*bits > 128) *bits = 128;
+    *is_signed = u ? type_is_signed(u) : false;
 }
+
+/* BUG-1060..1064: the MIN or MAX of a ZER integer of `bits` width, as C
+ * CONSTANT-EXPRESSION text of the matching C width.
+ *
+ * This is the ONE place a width's limits are spelled. Before it, five division
+ * sites picked the MIN with an `8 / 16 / 32 / else-64` switch (so an i5, i12,
+ * i48 or i128 compared against INT64_MIN and never trapped), two @saturate paths
+ * computed `1LL << (w-1)` inside zerc (undefined for w > 64) and clamped every
+ * width > 64 to the u64 maximum, and the float->int saturation gave up past 64
+ * bits. Every one of them was the same question -- "what is the minimum / maximum
+ * of this ZER width?" -- answered at N sites with N different coverages.
+ *
+ * Widths above 64 are expressed through `unsigned __int128`, which is what the
+ * u65..u128 / i65..i128 carriers already are; `1 << 127` is formed UNSIGNED and
+ * converted, so no signed shift overflows. `n` is the size of `buf`. */
+static void int_limit_text(int bits, bool sg, bool want_max, char *buf, size_t n) {
+    if (bits <= 0) bits = 32;
+    if (bits > 128) bits = 128;
+    if (!sg) {
+        if (!want_max)        snprintf(buf, n, "0");
+        else if (bits < 64)   snprintf(buf, n, "%lluULL", (1ULL << bits) - 1ULL);
+        else if (bits == 64)  snprintf(buf, n, "18446744073709551615ULL");
+        else if (bits < 128)  snprintf(buf, n, "((((unsigned __int128)1) << %d) - 1)", bits);
+        else                  snprintf(buf, n, "(~(unsigned __int128)0)");
+        return;
+    }
+    if (bits < 64) {
+        long long m = (long long)(1ULL << (bits - 1));
+        if (want_max) snprintf(buf, n, "%lldLL", m - 1);
+        else          snprintf(buf, n, "(-%lldLL)", m);
+        return;
+    }
+    if (bits == 64) {
+        if (want_max) snprintf(buf, n, "9223372036854775807LL");
+        else          snprintf(buf, n, "(-9223372036854775807LL - 1)");
+        return;
+    }
+    if (want_max) snprintf(buf, n, "((__int128)((((unsigned __int128)1) << %d) - 1))", bits - 1);
+    else          snprintf(buf, n, "(-((__int128)((((unsigned __int128)1) << %d) - 1)) - 1)", bits - 1);
+}
+
+/* The MIN of a SIGNED integer type, for the `MIN / -1` division trap. Every
+ * division site asks this through here (BUG-1062). */
+static void signed_min_text(Type *t, char *buf, size_t n) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    int w = u ? type_width(u) : 0;
+    int_limit_text(w, true, false, buf, n);
+}
+
+/* BUG-1065: the width a shift COUNT is compared against -- the ZER width of the
+ * LEFT operand, passed to `_zer_shl` / `_zer_shr` as their third argument.
+ *
+ * The macros used to take the width from `sizeof(a) * 8`, the C CARRIER, which
+ * is right only when the carrier is exactly the ZER type. It is not for an iN
+ * (`i5` lives in an `int8_t`, so `x >> 5` .. `x >> 7` passed the guard and an
+ * arithmetic shift of a negative value gave -1, where ZER's rule is 0) and it is
+ * not for a narrow operand C has PROMOTED (`(x / y) >> 8` on an i8, whose left
+ * side is emitted as a statement expression of type `int`, so the guard saw 32
+ * and the shift gave -1). The macro still ALSO tests the carrier width, so an
+ * unknown width (0 -> 128 here) can never make a C shift undefined. */
+static int shift_guard_width(Type *lhs) {
+    Type *u = lhs ? type_unwrap_distinct(lhs) : NULL;
+    int w = (u && type_is_integer(u)) ? type_width(u) : 0;
+    return w > 0 ? w : 128;
+}
+
 /* The four saturation limits, as C constant-expression text. Extracted so the
  * statement-expression form (emit_f2i_close) and the CONSTANT form
  * (emit_f2i_const, BUG-990) cannot drift apart — the bounds ARE the safety
@@ -1096,23 +1781,20 @@ static void f2i_bounds(Type *tgt, int *bits, bool *is_signed) {
  * getting bitten by. `n` is the size of EACH buffer. */
 static void f2i_limits(int bits, bool sg, char *lo, char *hi, char *mn, char *mx,
                        size_t n) {
+    /* lo / hi are EXACT hex-float powers of two, so they are exact as doubles for
+     * every width up to 128 (0x1p128 ~ 3.4e38 is far inside the double range).
+     * The signed `lo` is `-2^(b-1) - 1`; past 53 bits the `- 1` rounds away and
+     * `lo` equals MIN itself, which is still the right boundary (`<= MIN` clamps
+     * to MIN, anything above truncates in range). */
     if (sg) {
         snprintf(lo, n, "-0x1p%d - 1.0", bits - 1);
         snprintf(hi, n, "0x1p%d", bits - 1);
-        if (bits == 64) {
-            snprintf(mn, n, "(-9223372036854775807LL - 1)");
-            snprintf(mx, n, "9223372036854775807LL");
-        } else {
-            snprintf(mn, n, "(-(1LL << %d))", bits - 1);
-            snprintf(mx, n, "((1LL << %d) - 1)", bits - 1);
-        }
     } else {
         snprintf(lo, n, "-1.0");
         snprintf(hi, n, "0x1p%d", bits);
-        snprintf(mn, n, "0");
-        if (bits == 64) snprintf(mx, n, "18446744073709551615ULL");
-        else            snprintf(mx, n, "((1ULL << %d) - 1ULL)", bits);
     }
+    int_limit_text(bits, sg, false, mn, n);
+    int_limit_text(bits, sg, true, mx, n);
 }
 
 /* Emits `({ <srcT> _v = ` — caller emits the source, then calls _close. */
@@ -1143,22 +1825,80 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
      * without `_v != _v` it would fall through the range tests into the raw cast —
      * the exact UB being removed. Bounds are exact hex-float powers of two, so no
      * representable value is ever clamped. */
-    if (bits > 0 && bits <= 64) {
-        char lo[64], hi[64], mn[64], mx[64];
+    /* BUG-1064: every width 1..128 saturates. u65..u128 / i65..i128 used to keep
+     * only a NaN trap and then a RAW cast -- undefined for +-inf and any value
+     * outside the range, so `(u128)1e39` was whatever GCC chose. The bounds ARE
+     * expressible at that width: `int_limit_text` spells them through
+     * `unsigned __int128`, and the hex-float boundaries are exact doubles.
+     * The statement expression emit_f2i_open began ends with the `})` below
+     * (tools/audit_walker_fields.sh counts braces in comments and strings, and
+     * this function used to carry that text twice, once per width branch). */
+    {
+        char lo[96], hi[96], mn[96], mx[96];
         f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
         emit(e, "; (_zer_f2i%d != _zer_f2i%d) ? (", tmp, tmp);
         emit_type(e, tgt); emit(e, ")0 : (_zer_f2i%d <= (%s)) ? (", tmp, lo);
         emit_type(e, tgt); emit(e, ")%s : (_zer_f2i%d >= (%s)) ? (", mn, tmp, hi);
         emit_type(e, tgt); emit(e, ")%s : (", mx);
         emit_type(e, tgt); emit(e, ")_zer_f2i%d; })", tmp);
+    }
+}
+
+/* BUG-1060/1061: @saturate's clamp -- ONE implementation, used by BOTH
+ * dispatch paths (the AST `emit_expr` handler and the IR `emit_rewritten_node`
+ * handler). The two paths used to compute the clamp separately, and both were
+ * wrong in different ways:
+ *
+ *   - an UNSIGNED 64-bit source into a SIGNED target compared `u64 < -128LL`.
+ *     C's usual arithmetic conversions make that an UNSIGNED comparison (the
+ *     -128 becomes 2^64-128), so every value clamped to MIN:
+ *     `@saturate(i32, s.len)` for a length of 10 gave INT32_MIN.
+ *   - a FLOAT source had no NaN test (NaN fell through to the raw C cast, which
+ *     is undefined), and the integer MAX rounded UP as a double, so 2^63 into
+ *     i64 and 2^64 into u64 were not "> MAX" and hit the raw cast too.
+ *   - targets wider than 64 bits clamped to the u64 maximum, and the IR path
+ *     evaluated `1LL << (w - 1)` inside zerc -- undefined for w > 64.
+ *
+ * The integer clamp below never compares a value against a NEGATIVE constant
+ * unless the value is itself negative (so it is signed): the sign test comes
+ * first, and against a non-negative constant C's conversions are exact for every
+ * operand type. So the source type is not needed at all -- the form is correct
+ * for u8..u128 and i8..i128 alike. A float source goes through the float->int
+ * saturation the `(T)x` cast already uses (`emit_f2i_*`, BUG-883), which tests
+ * NaN first and uses exact hex-float boundaries. */
+static bool saturate_src_is_float(Emitter *e, Node *arg) {
+    Type *st = arg ? checker_get_type(e->checker, arg) : NULL;
+    return st && type_is_float(st);
+}
+static void emit_saturate_open(Emitter *e, Node *arg, int tmp) {
+    if (saturate_src_is_float(e, arg)) {
+        emit_f2i_open(e, type_unwrap_distinct(checker_get_type(e->checker, arg)), tmp);
         return;
     }
-    /* Width the literal bounds above cannot express (u128 / i128). Keep the TRAP
-     * rather than emit an unguarded cast — a halt is defined, the raw cast is not. */
-    emit(e, "; if (_zer_f2i%d != _zer_f2i%d) _zer_trap(\"NaN to integer\", __FILE__, __LINE__); (",
-         tmp, tmp);
-    emit_type(e, tgt);
-    emit(e, ")_zer_f2i%d; })", tmp);
+    emit(e, "({ __auto_type _zer_sat%d = ", tmp);
+}
+static void emit_saturate_close(Emitter *e, Node *arg, Type *t, int tmp) {
+    if (saturate_src_is_float(e, arg)) {
+        emit_f2i_close(e, t, tmp);
+        return;
+    }
+    int bits; bool sg;
+    f2i_bounds(t, &bits, &sg);
+    char mn[96], mx[96];
+    int_limit_text(bits, sg, false, mn, sizeof mn);
+    int_limit_text(bits, sg, true, mx, sizeof mx);
+    emit(e, "; (_zer_sat%d < 0) ? ", tmp);
+    if (sg) {
+        emit(e, "((_zer_sat%d < %s) ? (", tmp, mn);
+        emit_type(e, t); emit(e, ")%s : (", mn);
+        emit_type(e, t); emit(e, ")_zer_sat%d)", tmp);
+    } else {
+        emit(e, "(");
+        emit_type(e, t); emit(e, ")0");
+    }
+    emit(e, " : ((_zer_sat%d > %s) ? (", tmp, mx);
+    emit_type(e, t); emit(e, ")%s : (", mx);
+    emit_type(e, t); emit(e, ")_zer_sat%d); })", tmp);
 }
 
 /* BUG-990: the same saturation as a C CONSTANT EXPRESSION — no statement
@@ -1187,11 +1927,11 @@ static void emit_f2i_close(Emitter *e, Type *tgt, int tmp) {
 static bool emit_f2i_const(Emitter *e, Type *tgt, Node *operand) {
     int bits; bool sg;
     f2i_bounds(tgt, &bits, &sg);
-    if (bits <= 0 || bits > 64) return false;      /* u128/i128 — trap form only */
+    if (bits <= 0 || bits > 128) return false;
     if (!operand) return false;
     if (expr_has_side_effects(operand) || expr_is_volatile(e, operand)) return false;
 
-    char lo[64], hi[64], mn[64], mx[64];
+    char lo[96], hi[96], mn[96], mx[96];
     f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
     #define F2I_OP() do { emit(e, "("); emit_expr(e, operand); emit(e, ")"); } while (0)
     emit(e, "(");
@@ -1233,6 +1973,215 @@ static void emit_unreachable(Emitter *e, const char *what, Node *n) {
     if (n) fprintf(stderr, "  (source line %d)\n", n->loc.line);
     abort();
 }
+
+/* ================================================================
+ * BUG-1019 — the null-function-pointer guard
+ *
+ * ZER promises a non-null `*T`, and for a SCALAR funcptr it keeps that promise
+ * structurally: `B f;` and `B g;` at global scope are both rejected ("function
+ * pointer requires an initializer", BUG-866). But auto-zero fills an ARRAY
+ * ELEMENT and a STRUCT FIELD of funcptr type with NULL, and neither carrier is
+ * covered by that rule — ZER has no array-initializer syntax, so extending the
+ * rule through the array was implemented and REVERTED (it would have removed the
+ * dispatch-table idiom rather than initialise it; see tests/zer_gaps/
+ * funcptr_array_null_element.zer for that history).
+ *
+ * So the value really can be NULL, and until now the emitted C was a raw
+ * indirect call: `_zer_t3 = g_ops[0](_zer_t1, _zer_t2);`. HOSTED, that faults
+ * and ZER's SIGSEGV handler prints a trap — which is why it looked handled. On
+ * BARE METAL with no MMU there is no handler and no fault: address 0 is the
+ * reset vector or ordinary memory, and the jump silently goes somewhere. That is
+ * the silent-on-target class: missed at compile time AND at run time.
+ *
+ * TRACK, do not ban — the Ban Decision Framework's answer, and the one the gap
+ * file names as fix #1. One predictable branch before an indirect call; GCC
+ * elides it wherever it can see the assignment.
+ *
+ * WHICH CALLS. Every call whose callee is not a DIRECT function name. Not an
+ * enumeration of the null-producing carriers — enumerating them is the
+ * multi-site shape that keeps leaking here (a bare `B f = g_ops[0];` launders an
+ * array element's NULL into a scalar name, so "only guard INDEX and FIELD"
+ * would already be wrong). Unless the callee resolves to a function symbol, it
+ * is guarded.
+ *
+ * SINGLE EVALUATION. `__typeof__` does not evaluate its operand, so emitting the
+ * callee text twice — once inside `__typeof__`, once as the initialiser — still
+ * evaluates it exactly once at run time. That matters: a callee like
+ * `ops[next()]` must not run `next()` twice (the RF13 / BUG-661 double-eval
+ * class).
+ * ================================================================ */
+
+/* BUG-1215: the TYPE operand of @offset when the parser left it as an identifier.
+ * Writing `struct <name>` literally was wrong for every name that is not the C
+ * struct tag: a typedef (`typedef A AA;` -> `struct AA`, undefined), a distinct
+ * typedef, a union, a module-mangled struct. Resolve the name to its type and emit
+ * that — ONE helper for both emitter paths. */
+static void emit_offset_type_operand(Emitter *e, Node *name_node) {
+    Type *t = e->checker ? checker_get_type(e->checker, name_node) : NULL;
+    if ((!t || type_dispatch_kind(t) == TYPE_VOID) && e->checker && name_node &&
+        name_node->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(e->checker->global_scope, name_node->ident.name,
+                                 (uint32_t)name_node->ident.name_len);
+        if (s) t = s->type;
+    }
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_STRUCT || k == TYPE_UNION) { emit_type(e, type_unwrap_distinct(t)); return; }
+    emit(e, "struct %.*s", name_node && name_node->kind == NODE_IDENT ?
+         (int)name_node->ident.name_len : 0,
+         name_node && name_node->kind == NODE_IDENT ? name_node->ident.name : "");
+}
+
+/* Does `callee` name a function DIRECTLY (so the call is not indirect)? */
+static bool callee_is_direct_function(Emitter *e, Node *callee) {
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    if (!e->checker) return false;
+    Symbol *s = scope_lookup(e->checker->global_scope, callee->ident.name,
+                             (uint32_t)callee->ident.name_len);
+    if (s && s->is_function) return true;
+    /* BUG-1211: a module's `static` function is registered only under its
+     * mangled key `<module>__<name>`, so the raw lookup missed it and a plain
+     * call to it was wrapped in the funcptr null guard —
+     * `__typeof__(m__helper) _zer_fp0 = m__helper;` declares a FUNCTION, and GCC
+     * refuses to initialise one ("initialized like a variable"). */
+    if (e->current_module) {
+        uint32_t nl = (uint32_t)callee->ident.name_len;
+        uint32_t mkl = e->current_module_len + 2 + nl;
+        char *mk = (char *)arena_alloc(e->arena, mkl + 1);
+        if (mk) {
+            memcpy(mk, e->current_module, e->current_module_len);
+            mk[e->current_module_len] = '_';
+            mk[e->current_module_len + 1] = '_';
+            memcpy(mk + e->current_module_len + 2, callee->ident.name, nl);
+            mk[mkl] = '\0';
+            Symbol *ms = scope_lookup_local(e->checker->global_scope, mk, mkl);
+            if (ms && ms->is_function) return true;
+        }
+    }
+    return false;
+}
+
+/* Is this call an INDIRECT call through a non-optional function pointer?
+ * An OPTIONAL funcptr (`?B`) is not guarded here: it cannot be called without
+ * being unwrapped first, and the unwrap is what proves it non-null. */
+static bool call_needs_null_funcptr_guard(Emitter *e, Node *callee) {
+    if (!callee) return false;
+    if (callee_is_direct_function(e, callee)) return false;
+    Type *t = e->checker ? checker_get_type(e->checker, callee) : NULL;
+    return t && type_dispatch_kind(t) == TYPE_FUNC_PTR;
+}
+
+/* ================================================================
+ * BUG-1152 — the non-null pointer LOAD guard
+ *
+ * ZER's `*T` is non-null, and for a SCALAR the promise is structural: `*u32 p;`
+ * is refused (nonnull_zero_hole, BUG-866/893). But auto-zero writes NULL into a
+ * `*T` STRUCT FIELD and a `*T` ARRAY ELEMENT wherever the aggregate is
+ * zero-initialised — `H w;`, `H[2] hs;`, every `alloc(T)` / Pool / Slab / Arena
+ * slot — and nothing refused a read of it. Hosted, the dereference faulted into
+ * the SIGSEGV trap; on BARE METAL address 0 is ordinary memory (the initial SP on
+ * Cortex-M) and the read returned a wrong value, the write corrupted it. Silent
+ * at compile time AND at run time on the target that matters.
+ *
+ * TRACK, do not ban (option (c) of the limitations entry; the BUG-1019 precedent
+ * for funcptrs). Refusing every struct with a non-null field wherever it is
+ * zero-initialised would refuse `alloc(T)` of it outright (the BUG-893 author
+ * measured 34 corpus files); a definite-initialisation analysis is a new
+ * subsystem. The guard is ONE predictable branch.
+ *
+ * WHERE: at the LOAD, not the dereference. Every `*T` that reaches a local, a
+ * param or an operand arrives by one of three loads out of memory — a FIELD, an
+ * array/slice ELEMENT, or a DEREF of `**T` — and a local / param `*T` is non-null
+ * by construction (it needs an initialiser). Guarding the three loads therefore
+ * makes every `*T` value non-null, so no dereference site needs a check and no
+ * laundering route (`*u32 q = h.p; *q`) exists — the reason BUG-1019 could not
+ * guard only INDEX/FIELD callees does not arise, because the guard is on the
+ * load that produces the value, not on its use.
+ *
+ * NOT a load: the assignment TARGET (`h.p = &x`) and the `&` operand (`&h.p`) —
+ * both name the location. A global initialiser (file scope) cannot contain a
+ * statement expression and cannot read a field value anyway.
+ *
+ * Emission: `({ __auto_type _zer_nnN = LOAD; if (!_zer_nnN) _zer_trap(...);
+ * _zer_nnN; })` — LOAD text once, so a nested chain stays linear, and
+ * `__auto_type` drops only the TOP-level qualifier of the pointer value (the
+ * pointee's const/volatile are part of the type and are kept). The IR's own
+ * decomposed loads (IR_FIELD_READ / IR_INDEX_READ / IR_UNOP deref) get the same
+ * check as a statement after the load: emit_nonnull_local_check.
+ * ================================================================ */
+#define ZER_NN_TRAP_MSG "read of a null non-null pointer (a *T field or element that was zero-initialized and never assigned)"
+
+/* BUG-1175: an enum with NO variant whose value is 0. Auto-zero forges a
+ * non-variant value of it wherever it is zero-initialised inside an aggregate
+ * (a bare `E g;` is refused, BUG-930; a struct field, an array element, an
+ * alloc(T) / Pool slot and an omitted designated-init field are not), and the
+ * exhaustive switch then takes an ARM for it. Such a value is guarded at the
+ * same LOAD sites as a non-null pointer: the zero is the only value auto-zero
+ * can produce, and every other forge is guarded at its door. */
+static bool enum_lacks_zero_variant(Type *t) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (!u || type_dispatch_kind(u) != TYPE_ENUM || u->enum_type.variant_count == 0) return false;
+    for (uint32_t i = 0; i < u->enum_type.variant_count; i++)
+        if (u->enum_type.variants[i].value == 0) return false;
+    return true;
+}
+
+/* What a guarded load must check: 0 = nothing, 1 = a non-null pointer,
+ * 2 = a no-zero-variant enum. */
+static int load_guard_kind(Type *t) {
+    if (!t) return 0;
+    if (type_dispatch_kind(t) == TYPE_POINTER) return 1;
+    if (enum_lacks_zero_variant(t)) return 2;
+    return 0;
+}
+
+static bool node_is_nonnull_ptr_load(Emitter *e, Node *n) {
+    if (!n || !e->checker) return false;
+    if (n->kind == NODE_UNARY) {
+        if (n->unary.op != TOK_STAR) return false;
+    } else if (n->kind != NODE_FIELD && n->kind != NODE_INDEX) {
+        return false;
+    }
+    Type *t = checker_get_type(e->checker, n);
+    if (!t) return false;
+    /* An enum's `.variant` spelling is a NODE_FIELD on the enum TYPE, not a
+     * load — only a field of a value/pointer object is. */
+    if (n->kind == NODE_FIELD) {
+        Type *ot = checker_get_type(e->checker, n->field.object);
+        if (ot && type_dispatch_kind(ot) == TYPE_ENUM) return false;
+    }
+    return load_guard_kind(t) != 0;
+}
+
+/* Should this node's emission be wrapped in the load guard? */
+static bool nn_guard_wanted(Emitter *e, Node *n) {
+    if (!n || n == e->nn_bypass || n == e->nn_lvalue) return false;
+    if (e->global_init_depth > 0) return false;
+    return node_is_nonnull_ptr_load(e, n);
+}
+
+/* The location a node WRITES (or names), if it has one: an assignment target,
+ * an `&` operand. Emitted as an lvalue, so never load-guarded. */
+static Node *nn_lvalue_of(Node *n) {
+    if (!n) return NULL;
+    if (n->kind == NODE_ASSIGN) return n->assign.target;
+    if (n->kind == NODE_UNARY && n->unary.op == TOK_AMP) return n->unary.operand;
+    return NULL;
+}
+
+/* `*opaque` is the VALUE struct `_zer_opaque {ptr, type_id}`, not a C
+ * pointer, so its null test reads `.ptr`. */
+static const char *nn_null_member(Type *t) {
+    Type *pt = t ? type_unwrap_distinct(t) : NULL;
+    if (pt && type_dispatch_kind(pt) == TYPE_POINTER && pt->pointer.inner &&
+        type_dispatch_kind(pt->pointer.inner) == TYPE_OPAQUE)
+        return ".ptr";
+    return "";
+}
+#define ZER_ENUM0_TRAP_MSG "read of an enum holding 0, which is not one of its variants (a zero-initialized field or element that was never assigned)"
+
+
+/* The statement form, after an IR load into a local. */
+static void emit_nonnull_local_check(Emitter *e, IRFunc *func, int local_id);
 
 static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     if (!t) return;
@@ -1346,52 +2295,10 @@ static void emit_type(Emitter *e, Type *t) {
             emit(e, "_zer_opt_");
             EMIT_UNION_NAME(e, opt_inner);
             break;
-        case TYPE_SLICE: {
-            /* ?[]T → _zer_opt_slice_T — unwrap distinct on element type */
-            Type *elem = type_unwrap_distinct(opt_inner->slice.inner);
-            switch (elem->kind) {
-            case TYPE_U8:
-            case TYPE_BOOL:  emit(e, "_zer_opt_slice_u8"); break; /* bool = uint8_t */
-            case TYPE_U16:   emit(e, "_zer_opt_slice_u16"); break;
-            case TYPE_U32:   emit(e, "_zer_opt_slice_u32"); break;
-            case TYPE_U64:   emit(e, "_zer_opt_slice_u64"); break;
-            case TYPE_I8:    emit(e, "_zer_opt_slice_i8"); break;
-            case TYPE_I16:   emit(e, "_zer_opt_slice_i16"); break;
-            case TYPE_I32:   emit(e, "_zer_opt_slice_i32"); break;
-            case TYPE_I64:   emit(e, "_zer_opt_slice_i64"); break;
-            case TYPE_USIZE: emit(e, "_zer_opt_slice_usize"); break;
-            case TYPE_F32:   emit(e, "_zer_opt_slice_f32"); break;
-            case TYPE_F64:   emit(e, "_zer_opt_slice_f64"); break;
-            case TYPE_STRUCT:
-                emit(e, "_zer_opt_slice_");
-                EMIT_STRUCT_NAME(e, elem);
-                break;
-            case TYPE_UNION:
-                emit(e, "_zer_opt_slice_");
-                EMIT_UNION_NAME(e, elem);
-                break;
-            /* Stage 2 Part B (2026-04-28): exhaustive — any other elem
-             * type uses anonymous struct fallback (rare). */
-            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
-            case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
-            case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
-            case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
-            case TYPE_DISTINCT:
-            /* G1: ?[*]uN → the carrier's named optional-slice typedef (same
-             * C layout). Split UINT/SINT so signedness comes from the case
-             * label, not a raw type-kind comparison. */
-            case TYPE_UINT:
-                emit(e, "_zer_opt_slice_%s",
-                     intn_carrier_suffix(elem->intn.bits, false));
-                break;
-            case TYPE_SINT:
-                emit(e, "_zer_opt_slice_%s",
-                     intn_carrier_suffix(elem->intn.bits, true));
-                break;
-            }
+        case TYPE_SLICE:
+            /* ?[*]T → _zer_opt_slice_T / _zer_xopt_slice_<mangled> (BUG-1027: one query) */
+            emit_slice_name(e, opt_inner->slice.inner, false, true);
             break;
-        }
         /* Stage 2 Part B (2026-04-28): exhaustive — fallback to
          * anonymous struct for any TYPE_KIND not handled above
          * (rare: ?FuncPtr, ?array, etc.). */
@@ -1410,50 +2317,10 @@ static void emit_type(Emitter *e, Type *t) {
         }
         break;
 
-    case TYPE_SLICE: {
-        /* Unwrap TYPE_DISTINCT for named typedef lookup */
-        Type *sl_inner = type_unwrap_distinct(t->slice.inner);
-        const char *prefix = t->slice.is_volatile ? "_zer_vslice_" : "_zer_slice_";
-        switch (sl_inner->kind) {
-        case TYPE_U8:
-        case TYPE_BOOL:  emit(e, "%su8", prefix); break; /* bool = uint8_t */
-        case TYPE_U16:   emit(e, "%su16", prefix); break;
-        case TYPE_U32:   emit(e, "%su32", prefix); break;
-        case TYPE_U64:   emit(e, "%su64", prefix); break;
-        case TYPE_I8:    emit(e, "%si8", prefix); break;
-        case TYPE_I16:   emit(e, "%si16", prefix); break;
-        case TYPE_I32:   emit(e, "%si32", prefix); break;
-        case TYPE_I64:   emit(e, "%si64", prefix); break;
-        case TYPE_USIZE: emit(e, "%susize", prefix); break;
-        case TYPE_F32:   emit(e, "%sf32", prefix); break;
-        case TYPE_F64:   emit(e, "%sf64", prefix); break;
-        case TYPE_STRUCT:
-            emit(e, "%s", prefix);
-            EMIT_STRUCT_NAME(e, sl_inner);
-            break;
-        case TYPE_UNION:
-            emit(e, "%s", prefix);
-            EMIT_UNION_NAME(e, sl_inner);
-            break;
-        /* Stage 2 Part B (2026-04-28): exhaustive — anonymous struct
-         * fallback for any other elem type. */
-        case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-        case TYPE_SLICE: case TYPE_ARRAY: case TYPE_ENUM:
-        case TYPE_FUNC_PTR: case TYPE_OPAQUE: case TYPE_POOL:
-        case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
-        case TYPE_HANDLE: case TYPE_SLAB: case TYPE_SEMAPHORE:
-        case TYPE_DISTINCT:
-        /* G1: [*]uN → the carrier's named slice typedef (prefix already
-         * selects _zer_slice_ vs _zer_vslice_ for volatile). */
-        case TYPE_UINT:
-            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, false));
-            break;
-        case TYPE_SINT:
-            emit(e, "%s%s", prefix, intn_carrier_suffix(sl_inner->intn.bits, true));
-            break;
-        }
+    case TYPE_SLICE:
+        /* [*]T / volatile [*]T → the named typedef, for EVERY element kind (BUG-1027) */
+        emit_slice_name(e, t->slice.inner, t->slice.is_volatile, false);
         break;
-    }
 
     case TYPE_ARRAY: {
         /* BUG-297: emit full array type with dimensions for sizeof() context.
@@ -1545,6 +2412,9 @@ static void emit_type(Emitter *e, Type *t) {
 /* emit type with variable name (handles arrays and func ptrs) */
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
+    /* BUG-1220: a DISTINCT array type needs the array declarator too — `distinct
+     * typedef u8[4] Quad; Quad q;` was emitted `uint8_t[4] q`, which is not C. */
+    if (type_dispatch_kind(t) == TYPE_ARRAY) t = type_unwrap_distinct(t);
 
     if (t->kind == TYPE_ARRAY) {
         /* collect all array dimensions, emit base type + name + all dims */
@@ -1681,6 +2551,24 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * EXPRESSION EMISSION
  * ================================================================ */
 
+/* BUG-1032: wrap a FOLDED integer value into the width/signedness the checker
+ * gave the folded EXPRESSION. The untyped evaluator computes in int64, so
+ * `const u8 B = 200; const u32 P = B + 100;` folded to 300 at file scope while
+ * the same expression in a function is a u8 add and gives 44 — one program, two
+ * values for one expression, decided by where it was written. The local path
+ * wraps by assigning into a u8 IR temp; this is the file-scope twin of that. */
+static int64_t fold_wrap_to_type(int64_t v, Type *t) {
+    Type *eff = t ? type_unwrap_distinct(t) : NULL;
+    if (!eff || !type_is_integer(eff)) return v;
+    int w = type_width(eff);
+    if (w <= 0 || w >= 64) return v;
+    uint64_t mask = (1ULL << w) - 1ULL;
+    uint64_t u = (uint64_t)v & mask;
+    if (type_is_signed(eff) && (u >> (w - 1)) & 1ULL)
+        return (int64_t)(u | ~mask);          /* sign-extend */
+    return (int64_t)u;
+}
+
 /* BUG-939: emit an integer literal AT ITS RESOLVED WIDTH.
  *
  * Both AST literal emitters printed a bare `%llu` for any value fitting in 32 bits,
@@ -1693,21 +2581,309 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
  * LIT-1's retype is only half the fix; without a width suffix the retyped node still
  * prints as a 32-bit constant. Shared by BOTH emitters so the two spellings cannot
  * drift apart again — same reason emit_try_enum_open/close is shared. */
+/* BUG-1063: the SIGNEDNESS comes from the type too, not only the width. A
+ * literal the checker typed u32 (the default for every literal that fits 32 bits)
+ * was printed bare, so C typed it `int` -- and every operation around it on the
+ * AST-passthrough path (`x = ...`, `s.f = ...`, `g = ...`, an index) ran in
+ * SIGNED 32-bit arithmetic while the IR var-decl path, whose temps are
+ * `uint32_t`, ran it unsigned:
+ *
+ *     u32 v = (1 << 31) >> 28;   // 8           (IR temps, unsigned)
+ *     r.m   = (1 << 31) >> 28;   // 4294967288  (bare `1`: INT_MIN >> 28 sign-extends)
+ *     g     = ~0 >> 28;          // 4294967295  (~0 is -1, arithmetic shift)
+ *     z = (2000000000 + 2000000000) % 7;   // signed overflow, then a negative %
+ *     arr[~0 >> 28]              // checker folded 15, the program indexed -1 -> trap
+ *
+ * One literal, two C types, two answers. The rendering is now a function of the
+ * literal's CHECKER TYPE alone -- the same type ir_lower gives the IR literal's
+ * destination temp -- so both paths compute the expression at one width and one
+ * signedness. Signed literals of <= 32 bits stay bare: a bare decimal is a C
+ * `int` when it fits, and when it does not (the `2147483648` under a unary minus
+ * in `-2147483648`) C widens it to `long` instead of wrapping it, which is the
+ * value the source denotes. u8 / u16 stay bare as well: C promotes them to `int`
+ * whatever their spelling. */
 static void emit_int_literal(Emitter *e, Node *node) {
     unsigned long long v = (unsigned long long)node->int_lit.value;
-    if (v > 0xFFFFFFFFULL) { emit(e, "%lluULL", v); return; }
     Type *lt = checker_get_type(e->checker, node);
     Type *eff = lt ? type_unwrap_distinct(lt) : NULL;
-    if (eff && type_is_integer(eff) && type_width(eff) > 32) {
+    int w = (eff && type_is_integer(eff)) ? type_width(eff) : 0;
+    bool sg = w > 0 && type_is_signed(eff);
+    if (v > 0xFFFFFFFFULL || w > 32) {
         /* The width comes from the TYPE, not the value: a small literal inside a
-         * 64-bit expression must still be 64-bit or the operation wraps at 32. */
-        emit(e, "%llu%s", v, type_is_signed(eff) ? "LL" : "ULL");
+         * 64-bit expression must still be 64-bit or the operation wraps at 32. A
+         * SIGNED 64-bit literal is `LL` so a comparison against a negative signed
+         * value is not silently made unsigned. */
+        emit(e, "%llu%s", v, (sg && v <= 0x7FFFFFFFFFFFFFFFULL) ? "LL" : "ULL");
         return;
     }
+    if (w > 16 && !sg) { emit(e, "%lluU", v); return; }
     emit(e, "%llu", v);
 }
 
+/* BUG-1157: does this struct literal name an ARRAY-typed field? C cannot
+ * initialise an array member from an array expression inside a compound
+ * literal — the value decays to a pointer (`.arr = l` put an address in
+ * arr[0]). Such a literal is emitted as a statement expression: the literal
+ * without its array fields, then one memcpy per array field. */
+static bool struct_init_names_array_field(Type *si_type, Node *node) {
+    if (!si_type || !node || node->kind != NODE_STRUCT_INIT) return false;
+    for (int i = 0; i < node->struct_init.field_count; i++) {
+        Type *ft = struct_field_type_by_name(si_type, node->struct_init.fields[i].name,
+                                             (uint32_t)node->struct_init.fields[i].name_len);
+        if (ft && type_dispatch_kind(ft) == TYPE_ARRAY) return true;
+    }
+    return false;
+}
+
+/* BUG-1162/1163/1164: the ONE store path for a non-native-width uN/iN target,
+ * shared by the AST (emit_expr) and IR-rewritten (emit_rewritten_node) paths —
+ * they were two copies of the same intercept and had the same three defects:
+ *   - it ran BEFORE the union-variant case, so `w.t = 5` into a `u3` variant
+ *     never updated `_tag` (switch took the other arm; with a pointer variant
+ *     beside it, a forged pointer) — the tag is now set here;
+ *   - it ran before the bit-slice SET case, so `x[2..1] = 3` on a uN became
+ *     `&(bit-extract rvalue)` — invalid C; a bit-slice target is left to its case;
+ *   - it STORED the unmasked value and then re-masked through the same lvalue:
+ *     two stores and an extra load, so a `volatile u12` register saw an
+ *     out-of-field bit written transiently. The value is now computed and
+ *     masked in a carrier temp and stored ONCE.
+ * Returns false when the target is not this function's business. */
+typedef void (*EmitNodeFn)(Emitter *, Node *, IRFunc *);
+static void emit_bitslice_set(Emitter *e, Node *node, IRFunc *func, EmitNodeFn sub);   /* BUG-1198 */
+static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f);
+static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en) {
+    Node *tgt = node->assign.target;
+    Type *nn_t = tgt ? checker_get_type(e->checker, tgt) : NULL;
+    if (!type_is_nonnative_intn(nn_t)) return false;
+    if (tgt->kind == NODE_SLICE) return false;          /* bit-slice SET */
+    TokenType aop = node->assign.op;
+    if (!(aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
+          aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
+          aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ))
+        return false;
+    /* union variant target (value or `*Union` auto-deref)? */
+    Node *uobj = NULL; bool uptr = false; long utag = -1;
+    if (tgt->kind == NODE_FIELD) {
+        Type *ot = checker_get_type(e->checker, tgt->field.object);
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.inner &&
+            type_dispatch_kind(oe->pointer.inner) == TYPE_UNION) {
+            uptr = true; oe = type_unwrap_distinct(oe->pointer.inner);
+        }
+        if (oe && type_dispatch_kind(oe) == TYPE_UNION) {
+            for (uint32_t i = 0; i < oe->union_type.variant_count; i++) {
+                SUVariant *v = &oe->union_type.variants[i];
+                if (v->name_len == (uint32_t)tgt->field.field_name_len &&
+                    memcmp(v->name, tgt->field.field_name, v->name_len) == 0) {
+                    utag = (long)i; break;
+                }
+            }
+            if (utag >= 0) uobj = tgt->field.object;
+        }
+    }
+    int tmp = e->temp_count++;
+    char lv[96];
+    emit(e, "({ ");
+    if (uobj) {
+        emit(e, "__typeof__(");
+        en(e, uobj, func);
+        emit(e, ") %s_zer_up%d = %s(", uptr ? "" : "*", tmp, uptr ? "" : "&");
+        en(e, uobj, func);
+        emit(e, "); _zer_up%d->_tag = %ld; ", tmp, utag);
+        snprintf(lv, sizeof lv, "(_zer_up%d->%.*s)", tmp,
+                 (int)tgt->field.field_name_len, tgt->field.field_name);
+    } else {
+        emit(e, "__typeof__(");
+        en(e, tgt, func);
+        emit(e, ") *_zer_np%d = &(", tmp);
+        en(e, tgt, func);
+        emit(e, "); ");
+        snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
+    }
+    char nv[40];
+    snprintf(nv, sizeof nv, "_zer_nv%d", tmp);
+    emit_type(e, nn_t);
+    emit(e, " %s = ", nv);
+    if (aop == TOK_EQ) {
+        emit(e, "(");
+        en(e, node->assign.value, func);
+        emit(e, "); ");
+    } else if (aop == TOK_LSHIFTEQ) {
+        emit(e, "_zer_shl(%s, (", lv);
+        en(e, node->assign.value, func);
+        emit(e, "), %d); ", shift_guard_width(nn_t));
+    } else {
+        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
+                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
+                          aop==TOK_PIPEEQ?"|":"^";
+        emit(e, "(%s %s (", lv, cop);
+        en(e, node->assign.value, func);
+        emit(e, ")); ");
+    }
+    emit_intn_mask_lv(e, nn_t, nv);
+    emit(e, "%s = %s; %s; })", lv, nv, nv);
+    return true;
+}
+
+/* BUG-1166: the ONE runtime type_id a `*opaque` carries for a pointee type —
+ * the tag packed when a `*T` is wrapped and the tag expected when it is
+ * unwrapped. It was seven copies of the same three lines, each answering 0
+ * ("unknown provenance, allow") for every pointee that is not a struct / enum /
+ * union, so a `*u32` wrapped in a function and returned as `*opaque` could be
+ * cast to `*Big` (80 bytes) and written — the runtime check never fires on 0,
+ * and the compile-time provenance is gone once the value crosses a return.
+ * Scalars now get a RESERVED id (high bit set, so it can never collide with
+ * the checker's sequential struct ids); pointer / slice / array / opaque
+ * pointees keep 0 — their representation is not a fixed scalar. 0 is still
+ * what C code (cinclude) produces: the FFI floor is unchanged. */
+static uint32_t opaque_type_id(Type *inner);
+/* @pun's advertised runtime check is NOMINAL — it compares struct / enum /
+ * union ids and treats every other pointee as "no id" (the byte-view idiom
+ * `@pun(const *u64, &s)` relies on that; the checker's
+ * pun_type_id_check_can_fire mirrors exactly this). */
+static uint32_t opaque_type_id_nominal(Type *inner) {
+    if (!inner) return 0;
+    inner = type_unwrap_distinct(inner);
+    if (!inner) return 0;
+    TypeKind k = type_dispatch_kind(inner);
+    if (k == TYPE_STRUCT || k == TYPE_ENUM || k == TYPE_UNION) return opaque_type_id(inner);
+    return 0;
+}
+
+static uint32_t opaque_type_id(Type *inner) {
+    if (!inner) return 0;
+    inner = type_unwrap_distinct(inner);
+    if (!inner) return 0;
+    switch (inner->kind) {
+    case TYPE_STRUCT: return inner->struct_type.type_id;
+    case TYPE_ENUM:   return inner->enum_type.type_id;
+    case TYPE_UNION:  return inner->union_type.type_id;
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64: case TYPE_BOOL:
+        return 0x80000000u | ((uint32_t)inner->kind << 8);
+    case TYPE_UINT: case TYPE_SINT:
+        return 0x80000000u | ((uint32_t)inner->kind << 8) | (inner->intn.bits & 0xFFu);
+    case TYPE_VOID: case TYPE_POINTER: case TYPE_OPAQUE: case TYPE_SLICE:
+    case TYPE_ARRAY: case TYPE_OPTIONAL: case TYPE_FUNC_PTR: case TYPE_HANDLE:
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+    case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
+        return 0;
+    }
+    return 0;
+}
+
+/* BUG-1161: is this assignment a write INTO a union variant that is not the
+ * whole variant by plain `=` (a compound op, or a sub-field / element write)?
+ * If so, return the union object, whether it is reached through a pointer,
+ * and the variant index. Such a write must first RESET the union when it
+ * changes the active variant, or the union's other bytes (the previous
+ * variant's) are read back as the new one — see the checker's comment at
+ * union_variant_write_is_partial. */
+static Node *union_partial_write_target(Emitter *e, Node *node, bool *is_ptr,
+                                        uint32_t *idx) {
+    if (!node || node->kind != NODE_ASSIGN || !node->assign.target) return NULL;
+    Node *walk = node->assign.target;
+    while (walk) {
+        if (walk->kind == NODE_FIELD) {
+            Type *ot = checker_get_type(e->checker, walk->field.object);
+            Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+            bool ptr = false;
+            if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.inner &&
+                type_dispatch_kind(oe->pointer.inner) == TYPE_UNION) {
+                ptr = true; oe = type_unwrap_distinct(oe->pointer.inner);
+            }
+            if (oe && type_dispatch_kind(oe) == TYPE_UNION) {
+                if (walk == node->assign.target && node->assign.op == TOK_EQ)
+                    return NULL;                      /* whole-variant `=` */
+                for (uint32_t i = 0; i < oe->union_type.variant_count; i++) {
+                    SUVariant *v = &oe->union_type.variants[i];
+                    if (v->name_len == (uint32_t)walk->field.field_name_len &&
+                        memcmp(v->name, walk->field.field_name, v->name_len) == 0) {
+                        *is_ptr = ptr; *idx = i;
+                        return walk->field.object;
+                    }
+                }
+                return NULL;
+            }
+            walk = walk->field.object;
+        } else if (walk->kind == NODE_INDEX) {
+            walk = walk->index_expr.object;
+        } else {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+/* Emit `(({ reset-if-variant-changes; 0; }), ` before such a write; the caller
+ * emits the assignment itself and then `)`. */
+static void emit_union_reset_prefix(Emitter *e, Node *uobj, bool is_ptr, uint32_t idx,
+                                    IRFunc *func, EmitNodeFn en) {
+    int t = e->temp_count++;
+    emit(e, "(({ __typeof__(");
+    en(e, uobj, func);
+    emit(e, ") %s_zer_ur%d = %s(", is_ptr ? "" : "*", t, is_ptr ? "" : "&");
+    en(e, uobj, func);
+    emit(e, "); if (_zer_ur%d->_tag != %u) { memset(_zer_ur%d, 0, sizeof(*_zer_ur%d)); "
+            "_zer_ur%d->_tag = %u; } 0; }), ", t, idx, t, t, t, idx);
+}
+
+static void emit_expr_impl(Emitter *e, Node *node);
+static void emit_expr_impl_fn(Emitter *e, Node *n, IRFunc *f) {
+    (void)f;
+    emit_expr_impl(e, n);
+}
+
+/* BUG-1152: emit `node` (a guarded load) through `impl` inside the load guard.
+ * ONE function holds both halves of the statement expression, so the emitted
+ * braces stay balanced within it. */
+static void emit_nn_guarded(Emitter *e, Node *node, IRFunc *func, EmitNodeFn impl) {
+    int t = e->temp_count++;
+    Type *ty = checker_get_type(e->checker, node);
+    Node *saved_bp = e->nn_bypass;
+    emit(e, "({ __auto_type _zer_nn%d = ", t);
+    e->nn_bypass = node;
+    impl(e, node, func);
+    e->nn_bypass = saved_bp;
+    emit(e, "; if (!_zer_nn%d%s) _zer_trap(\"%s\", __FILE__, __LINE__); _zer_nn%d; })",
+         t, nn_null_member(ty),
+         load_guard_kind(ty) == 2 ? ZER_ENUM0_TRAP_MSG : ZER_NN_TRAP_MSG, t);
+}
+
+/* BUG-1152: every emit_expr passes through the non-null load guard. */
 static void emit_expr(Emitter *e, Node *node) {
+    if (!node) return;
+    Node *saved_lv = e->nn_lvalue;
+    Node *lv = nn_lvalue_of(node);
+    if (nn_guard_wanted(e, node)) {
+        emit_nn_guarded(e, node, NULL, emit_expr_impl_fn);
+        return;
+    }
+    if (lv) e->nn_lvalue = lv;
+    /* BUG-1183: an assignment is an EXPRESSION in ZER and is emitted in value
+     * position (`a[0] = (y = 5) + 1;`, `x + (x = 10)`); C's `=` binds loosest of
+     * all, so without its own parentheses the enclosing operator's operand
+     * swallowed it — `(y = 5U + 1U)` stored 6 into y, `(y = 3U == 3U)` stored 1,
+     * `-(y=5)` became the invalid `-y = 5`. Parenthesised at the one dispatch
+     * point for each emitter, so every nested position is covered. */
+    bool asg_paren = node->kind == NODE_ASSIGN;
+    if (asg_paren) emit(e, "(");
+    bool ur_ptr = false; uint32_t ur_idx = 0;
+    Node *ur = e->global_init_depth == 0 ? union_partial_write_target(e, node, &ur_ptr, &ur_idx) : NULL;
+    if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, NULL, emit_node_via_ast);
+    emit_expr_impl(e, node);
+    if (ur) emit(e, ")");
+    if (asg_paren) emit(e, ")");
+    e->nn_lvalue = saved_lv;
+}
+
+static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f) {
+    (void)f;
+    emit_expr(e, n);
+}
+
+static void emit_expr_impl(Emitter *e, Node *node) {
     if (!node) return;
 
     switch (node->kind) {
@@ -1856,11 +3032,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_expr(e, node->binary.left);
                 /* check if dividend is the minimum value for its type */
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit(e, "(");
@@ -1871,11 +3045,36 @@ static void emit_expr(Emitter *e, Node *node) {
         }
         /* shift operators use safe macros (ZER spec: shift >= width = 0) */
         if (node->binary.op == TOK_LSHIFT || node->binary.op == TOK_RSHIFT) {
+            /* BUG-1031: inside a GLOBAL initializer the `_zer_shl` statement
+             * expression is illegal C ("braced-group within expression allowed
+             * only inside a function"), and the generic fold cannot decide a count
+             * in [63,127] without the operand's width. Here the left operand's
+             * TYPE is known: a constant count >= its width (or negative) is 0 by
+             * the ZER rule, and an in-range constant count needs no guard. */
+            if (e->global_init_depth > 0) {
+                int64_t sc = eval_const_expr(node->binary.right);
+                Type *lt = checker_get_type(e->checker, node->binary.left);
+                Type *lte = lt ? type_unwrap_distinct(lt) : NULL;
+                int lw = (lte && type_is_integer(lte)) ? type_width(lte) : 0;
+                if (sc != CONST_EVAL_FAIL && lw > 0) {
+                    if (sc < 0 || sc >= lw) {
+                        emit(e, "((");
+                        emit_type(e, lte);
+                        emit(e, ")0)");
+                    } else {
+                        emit(e, "(");
+                        emit_expr(e, node->binary.left);
+                        emit(e, " %s %lld)", node->binary.op == TOK_LSHIFT ? "<<" : ">>",
+                             (long long)sc);
+                    }
+                    break;
+                }
+            }
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
             emit_expr(e, node->binary.left);
             emit(e, ", ");
             emit_expr(e, node->binary.right);
-            emit(e, ")");
+            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
         } else {
             /* check if result type is narrower than int — need cast to prevent
              * C integer promotion from changing wrapping behavior */
@@ -2027,43 +3226,7 @@ static void emit_expr(Emitter *e, Node *node) {
          * the dedicated cases below and don't carry a scalar uN/iN type here).
          * /= %= >>= can't exceed the width (result magnitude ≤ operand), so they
          * skip this and keep their existing div-guard / shift paths. */
-        {
-            Type *nn_t = checker_get_type(e->checker, node->assign.target);
-            if (type_is_nonnative_intn(nn_t)) {
-                TokenType aop = node->assign.op;
-                if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
-                    aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
-                    aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
-                    int tmp = e->temp_count++;
-                    char lv[40];
-                    snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
-                    emit(e, "({ __typeof__(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, ") *_zer_np%d = &(", tmp);
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); ");
-                    if (aop == TOK_EQ) {
-                        emit(e, "%s = (", lv);
-                        emit_expr(e, node->assign.value);
-                        emit(e, "); ");
-                    } else if (aop == TOK_LSHIFTEQ) {
-                        emit(e, "%s = _zer_shl(%s, (", lv, lv);
-                        emit_expr(e, node->assign.value);
-                        emit(e, ")); ");
-                    } else {
-                        const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
-                                          aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
-                                          aop==TOK_PIPEEQ?"|":"^";
-                        emit(e, "%s = (%s %s (", lv, lv, cop);
-                        emit_expr(e, node->assign.value);
-                        emit(e, ")); ");
-                    }
-                    emit_intn_mask_lv(e, nn_t, lv);
-                    emit(e, "})");
-                    goto assign_done;
-                }
-            }
-        }
+        if (emit_intn_store(e, node, NULL, emit_node_via_ast)) goto assign_done;   /* BUG-1162 */
         /* union variant assignment: msg.sensor = val → set tag first */
         if (node->assign.op == TOK_EQ &&
             node->assign.target->kind == NODE_FIELD) {
@@ -2098,80 +3261,10 @@ static void emit_expr(Emitter *e, Node *node) {
         /* BUG-210/216: bit-set assignment: reg[7..0] = 0xFF
          * → ({ auto *_p = &obj; *_p = (*_p & ~mask) | ((val << lo) & mask); })
          * Uses pointer hoist for single-eval of target expression. */
-        if (node->assign.op == TOK_EQ &&
-            node->assign.target->kind == NODE_SLICE) {
+        if (node->assign.target->kind == NODE_SLICE) {                /* BUG-1198 */
             Type *obj_type = checker_get_type(e->checker,node->assign.target->slice.object);
             if (obj_type && type_is_integer(obj_type)) {
-                Node *obj = node->assign.target->slice.object;
-                Node *hi_node = node->assign.target->slice.start;  /* high bit */
-                Node *lo_node = node->assign.target->slice.end;    /* low bit */
-                int btmp = e->temp_count++;
-                /* BUG-216: hoist target address for single-eval.
-                 * Use *({ auto val = obj; auto *p = &val; ... }) pattern
-                 * for simple vars. For indexed/field access, this writes to
-                 * a copy which is OK — the outer assignment handles write-back. */
-                /* __typeof__ does NOT evaluate its argument.
-                 * &(obj) evaluates obj exactly once as an lvalue.
-                 * *_p reads/writes through cached pointer — no re-eval. */
-                emit(e, "({ __typeof__(");
-                emit_expr(e, obj);
-                emit(e, ") *_zer_bp%d = &(", btmp);
-                emit_expr(e, obj);
-                emit(e, "); ");
-                /* BUG-316: hoist hi/lo into temps for single evaluation */
-                int64_t const_hi = hi_node ? eval_const_expr(hi_node) : CONST_EVAL_FAIL;
-                int64_t const_lo = lo_node ? eval_const_expr(lo_node) : CONST_EVAL_FAIL;
-                bool bits_const = (const_hi != CONST_EVAL_FAIL && const_lo != CONST_EVAL_FAIL &&
-                                   const_hi >= 0 && const_lo >= 0);
-                if (!bits_const && hi_node && lo_node) {
-                    emit(e, "uint64_t _zer_bh%d = (uint64_t)(", btmp);
-                    emit_expr(e, hi_node);
-                    emit(e, "); uint64_t _zer_bl%d = (uint64_t)(", btmp);
-                    emit_expr(e, lo_node);
-                    emit(e, "); ");
-                }
-                emit(e, "*_zer_bp%d = (*_zer_bp%d", btmp, btmp);
-                emit(e, " & ~(");
-                /* emit mask: safe for width >= 64 */
-                if (hi_node && lo_node) {
-                    if (bits_const) {
-                        int64_t width = const_hi - const_lo + 1;
-                        if (width >= 64) {
-                            emit(e, "~(uint64_t)0");
-                        } else {
-                            emit(e, "((1ull << %lld) - 1)", (long long)width);
-                        }
-                        emit(e, " << %lld", (long long)const_lo);
-                    } else {
-                        /* runtime: use hoisted temps */
-                        emit_bitslice_runtime_mask(e, btmp);
-                    }
-                }
-                emit(e, ")) | (((uint64_t)(");
-                emit_expr(e, node->assign.value);
-                /* clamp the VALUE shift as well — same UB as the mask shift */
-                if (!bits_const && hi_node && lo_node)
-                    emit(e, ") << ((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
-                else if (bits_const && hi_node && lo_node)
-                    emit(e, ") << %lld", (long long)const_lo);
-                else
-                    emit(e, ") << 0");
-                emit(e, ") & (");
-                /* re-emit mask */
-                if (hi_node && lo_node) {
-                    if (bits_const) {
-                        int64_t width = const_hi - const_lo + 1;
-                        if (width >= 64) {
-                            emit(e, "~(uint64_t)0");
-                        } else {
-                            emit(e, "((1ull << %lld) - 1)", (long long)width);
-                        }
-                        emit(e, " << %lld", (long long)const_lo);
-                    } else {
-                        emit_bitslice_runtime_mask(e, btmp);
-                    }
-                }
-                emit(e, ")); })");
+                emit_bitslice_set(e, node, NULL, emit_node_via_ast);
                 goto assign_done;
             }
         }
@@ -2245,11 +3338,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (is_signed_div) {
                     emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
                          tmp, tmp, tmp, tmp);
-                    int w = type_width(tgt_eff);
-                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
-                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
-                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                    char dmin[96]; signed_min_text(tgt_eff, dmin, sizeof dmin);
+                    emit(e, "if (_zer_dd%d == %s) ", tmp, dmin);
                     emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
                 }
                 emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
@@ -2266,11 +3357,9 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->assign.target);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_expr(e, node->assign.target);
-                int w = type_width(tgt_eff);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(tgt_eff, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit_expr(e, node->assign.target);
@@ -2284,6 +3373,7 @@ static void emit_expr(Emitter *e, Node *node) {
              * NODE_INDEX.index calls. See expr_has_side_effects above. */
             bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
                 /* hoist target into pointer: *({ auto *_p = &target; *_p = macro(*_p, n); _p; }) — but simpler: */
                 int tmp = e->temp_count++;
@@ -2291,14 +3381,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 emit_expr(e, node->assign.target);
                 emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
                 emit_expr(e, node->assign.value);
-                emit(e, "); })");
+                emit(e, ", %d); })", shw);
             } else {
                 emit_expr(e, node->assign.target);
                 emit(e, " = %s(", macro);
                 emit_expr(e, node->assign.target);
                 emit(e, ", ");
                 emit_expr(e, node->assign.value);
-                emit(e, ")");
+                emit(e, ", %d)", shw);
             }
         } else {
         emit_expr(e, node->assign.target);
@@ -2732,7 +3822,21 @@ static void emit_expr(Emitter *e, Node *node) {
 
         if (!handled) {
             /* normal function call */
-            emit_expr(e, node->call.callee);
+            /* BUG-1019: guard an indirect call through a possibly-NULL funcptr.
+             * AST dispatch path (the defer-body / spawn-arg emitter); the IR
+             * paths carry the same guard — CLAUDE.md's "two emitter dispatch
+             * paths" rule. */
+            if (call_needs_null_funcptr_guard(e, node->call.callee)) {
+                int fpt = e->temp_count++;
+                emit(e, "({ __typeof__(");
+                emit_expr(e, node->call.callee);
+                emit(e, ") _zer_fp%d = ", fpt);
+                emit_expr(e, node->call.callee);
+                emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                        "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
+            } else {
+                emit_expr(e, node->call.callee);
+            }
             emit(e, "(");
             Type *callee_type = checker_get_type(e->checker,node->call.callee);
             for (int i = 0; i < node->call.arg_count; i++) {
@@ -2799,8 +3903,8 @@ static void emit_expr(Emitter *e, Node *node) {
         if (obj_type && type_unwrap_distinct(obj_type)->kind == TYPE_HANDLE) {
             Type *handle_type = type_unwrap_distinct(obj_type);
             /* find the allocator symbol — first try slab_source on the variable */
-            Symbol *alloc_sym = NULL;
-            if (node->field.object->kind == NODE_IDENT) {
+            Symbol *alloc_sym = node->field.handle_alloc;   /* BUG-1053 */
+            if (!alloc_sym && node->field.object->kind == NODE_IDENT) {
                 Symbol *hsym = scope_lookup(e->checker->current_scope,
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
@@ -2828,20 +3932,14 @@ static void emit_expr(Emitter *e, Node *node) {
                 if (at->kind == TYPE_SLAB) {
                     emit(e, "((");
                     emit_type(e, at->slab.elem);
-                    emit(e, "*)_zer_slab_get(&%.*s, ",
-                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit(e, "*)_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                     emit_expr(e, node->field.object);
                     emit(e, "))->%.*s",
                          (int)node->field.field_name_len, node->field.field_name);
                 } else if (at->kind == TYPE_POOL) {
                     emit(e, "((");
                     emit_type(e, at->pool.elem);
-                    emit(e, "*)_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                         "sizeof(%.*s.slots[0]), ",
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name,
-                         (int)alloc_sym->name_len, alloc_sym->name);
+                    emit(e, "*)_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                     emit_expr(e, node->field.object);
                     emit(e, ", %llu))->%.*s",
                          (unsigned long long)at->pool.count,
@@ -3046,13 +4144,16 @@ static void emit_expr(Emitter *e, Node *node) {
                     int objbits = type_width(obj_type);
                     if (objbits <= 0) objbits = 64;
                     int tmp = e->temp_count++;
-                    emit(e, "({ int _zer_hi%d = (int)(", tmp);
+                    /* BUG-1198: positions are uint64_t — an `int` wrapped a runtime
+                     * position >= 2^31 negative (UBSan "shift exponent -2"; 3 at -O0,
+                     * 0 at -O2). hi < lo is an empty field (0). */
+                    emit(e, "({ uint64_t _zer_hi%d = (uint64_t)(", tmp);
                     emit_expr(e, node->slice.start);
-                    emit(e, "); int _zer_lo%d = (int)(", tmp);
+                    emit(e, "); uint64_t _zer_lo%d = (uint64_t)(", tmp);
                     emit_expr(e, node->slice.end);
-                    emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", tmp, tmp, tmp, tmp, objbits, ucast);
+                    emit(e, "); uint64_t _zer_w%d = (_zer_hi%d < _zer_lo%d) ? 0 : _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", tmp, tmp, tmp, tmp, tmp, tmp, objbits, ucast);
                     emit_expr(e, node->slice.object);
-                    emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+                    emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d == 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                          tmp, tmp, tmp, tmp);
                 }
             }
@@ -3113,51 +4214,19 @@ static void emit_expr(Emitter *e, Node *node) {
             }
         }
 
-        /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix) */
+        /* Use named _zer_slice_T typedefs for ALL types (BUG-085 fix).
+         * BUG-1027: ONE query (emit_slice_name) names the typedef for EVERY
+         * element kind — the per-site switch here used to leave enum / Handle /
+         * pointer / optional / funcptr / array / nested-slice elements to the
+         * anonymous-struct fallback below, an incompatible C type at each site. */
         bool slice_type_emitted = false;
         if (slice_needs_runtime_check && !slice_obj_side_effect_early) {
             /* skip the normal struct literal — we'll wrap in stmt expr */
         } else if (eff_elem && !slice_obj_side_effect_early) {
-            const char *sname = NULL;
-            switch (eff_elem->kind) {
-            case TYPE_U8:    sname = "_zer_slice_u8"; break;
-            case TYPE_U16:   sname = "_zer_slice_u16"; break;
-            case TYPE_U32:   sname = "_zer_slice_u32"; break;
-            case TYPE_U64:   sname = "_zer_slice_u64"; break;
-            case TYPE_I8:    sname = "_zer_slice_i8"; break;
-            case TYPE_I16:   sname = "_zer_slice_i16"; break;
-            case TYPE_I32:   sname = "_zer_slice_i32"; break;
-            case TYPE_I64:   sname = "_zer_slice_i64"; break;
-            case TYPE_USIZE: sname = "_zer_slice_usize"; break;
-            case TYPE_F32:   sname = "_zer_slice_f32"; break;
-            case TYPE_F64:   sname = "_zer_slice_f64"; break;
-            case TYPE_BOOL:  sname = "_zer_slice_u8"; break; /* bool = uint8_t */
-            /* Stage 2 Part B (2026-04-28): exhaustive — non-primitive
-             * elem types fall through to STRUCT/UNION handlers below,
-             * or anonymous struct emission. */
-            case TYPE_VOID: case TYPE_POINTER: case TYPE_OPTIONAL:
-            case TYPE_SLICE: case TYPE_ARRAY: case TYPE_STRUCT:
-            case TYPE_ENUM: case TYPE_UNION: case TYPE_FUNC_PTR:
-            case TYPE_OPAQUE: case TYPE_POOL: case TYPE_RING:
-            case TYPE_ARENA: case TYPE_BARRIER: case TYPE_HANDLE:
-            case TYPE_SLAB: case TYPE_SEMAPHORE: case TYPE_DISTINCT:
-            case TYPE_UINT: case TYPE_SINT: /* Path C: [*]uN → anonymous slice literal */
-                break;
-            }
-            if (sname) {
-                emit(e, "((%s){ ", sname);
-                slice_type_emitted = true;
-            } else if (eff_elem->kind == TYPE_STRUCT) {
-                emit(e, "((_zer_slice_");
-                EMIT_STRUCT_NAME(e, eff_elem);
-                emit(e, "){ ");
-                slice_type_emitted = true;
-            } else if (eff_elem->kind == TYPE_UNION) {
-                emit(e, "((_zer_slice_");
-                EMIT_UNION_NAME(e, eff_elem);
-                emit(e, "){ ");
-                slice_type_emitted = true;
-            }
+            emit(e, "((");
+            emit_slice_name(e, eff_elem, false, false);
+            emit(e, "){ ");
+            slice_type_emitted = true;
         }
         if (!slice_type_emitted && !slice_obj_side_effect_early && !slice_needs_runtime_check) {
             emit(e, "((struct { ");
@@ -3387,9 +4456,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t tid = 0;
             if (src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                tid = opaque_type_id(inner);   /* BUG-1166 */
             }
             emit(e, "(_zer_opaque){(void*)(");
             emit_expr(e, node->typecast.expr);
@@ -3403,9 +4470,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t expected_tid = 0;
             if (tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                expected_tid = opaque_type_id(inner);   /* BUG-1166 */
             }
             if (expected_tid > 0) {
                 int tmp = e->temp_count++;
@@ -3462,16 +4527,30 @@ static void emit_expr(Emitter *e, Node *node) {
         /* Designated initializer: emit as C99 compound literal (Type){ .x = 1 }
          * Works in both var-decl init and assignment contexts. */
         Type *si_type = checker_get_type(e->checker, node);
+        bool si_arr = e->global_init_depth == 0 &&
+                      struct_init_names_array_field(si_type, node);   /* BUG-1157 */
+        int si_tmp = si_arr ? e->temp_count++ : 0;
+        if (si_arr) {
+            emit(e, "({ ");
+            emit_type(e, si_type);
+            emit(e, " _zer_si%d = ", si_tmp);
+        }
         if (si_type) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
         }
         emit(e, "{ ");
+        bool si_first = true;
         for (int i = 0; i < node->struct_init.field_count; i++) {
-            if (i > 0) emit(e, ", ");
             const char *fname = node->struct_init.fields[i].name;
             uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            if (si_arr) {
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (aft && type_dispatch_kind(aft) == TYPE_ARRAY) continue;
+            }
+            if (!si_first) emit(e, ", ");
+            si_first = false;
             emit(e, ".%.*s = ", (int)fname_len, fname);
             Node *fval = node->struct_init.fields[i].value;
             Type *fv_type = checker_get_type(e->checker, fval);
@@ -3489,7 +4568,20 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, fval);
             }
         }
+        if (si_first && si_arr) emit(e, "0");
         emit(e, " }");
+        if (si_arr) {
+            for (int i = 0; i < node->struct_init.field_count; i++) {
+                const char *fname = node->struct_init.fields[i].name;
+                uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
+                emit(e, "; memcpy(&_zer_si%d.%.*s, (", si_tmp, (int)fname_len, fname);   /* BUG-1192 */
+                emit_expr(e, node->struct_init.fields[i].value);
+                emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
+            }
+            emit(e, "; _zer_si%d; })", si_tmp);
+        }
         break;
     }
 
@@ -3503,6 +4595,14 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.type_arg) {
                 Type *t = resolve_tynode(e,node->intrinsic.type_arg);
                 emit_type(e, t);
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT &&
+                       checker_get_type(e->checker, node->intrinsic.args[0])) {
+                /* BUG-1038: the checker resolved the operand — a type name, a uN
+                 * spelling, OR a VARIABLE (`u32 x; @size(x)`), whose type is what
+                 * sizeof wants. The name-based fallback below spelled the variable
+                 * as `struct x` (GCC: incomplete type). IR-path twin below. */
+                emit_type(e, checker_get_type(e->checker, node->intrinsic.args[0]));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* named type passed as identifier (e.g. @size(MyStruct)) */
@@ -3525,8 +4625,7 @@ static void emit_expr(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
                 /* args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_expr(e, node->intrinsic.args[0]);
+                emit_offset_type_operand(e, node->intrinsic.args[0]);   /* BUG-1215 */
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
             }
@@ -3562,9 +4661,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 uint32_t tid = 0;
                 if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
@@ -3577,9 +4674,7 @@ static void emit_expr(Emitter *e, Node *node) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
@@ -3636,9 +4731,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t src_tid = 0;
             if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+                src_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             } else if (src_eff && src_eff->kind == TYPE_OPAQUE) {
                 /* source already *opaque — its type_id flows through directly */
                 src_tid = 0; /* will be read from the source's actual struct field */
@@ -3648,9 +4741,7 @@ static void emit_expr(Emitter *e, Node *node) {
             uint32_t tgt_tid = 0;
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+                tgt_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             /* If source is already *opaque, reuse its existing type_id and just
@@ -3798,41 +4889,11 @@ static void emit_expr(Emitter *e, Node *node) {
                 bool sat_enum = t && type_carries_enum_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
-                emit(e, "({__auto_type _zer_sat%d = ", tmp);
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "; ");
-                /* clamp: min(max(val, TYPE_MIN), TYPE_MAX) */
-                /* for unsigned targets, just clamp to max */
-                if (type_is_unsigned(t)) {
-                    /* unsigned: clamp to [0, 2^N-1] — check both bounds for signed
-                     * source. #13: compute the max from the target WIDTH so
-                     * non-native uN (u7/u12/u21 …) clamp correctly; the old hardcoded
-                     * {8,16,32,else→64} switch sent every odd width to the u64 branch
-                     * (max 2^64-1) so it never clamped (silent wrong result). */
-                    int w = type_width(t);
-                    if (w >= 64) {
-                        /* BUG-308: u64 needs upper bound check (f64 can exceed UINT64_MAX) */
-                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > 18446744073709551615.0 ? 18446744073709551615ULL : (uint64_t)_zer_sat%d", tmp, tmp, tmp);
-                    } else {
-                        unsigned long long mx = (1ULL << w) - 1ULL;
-                        emit(e, "_zer_sat%d < 0 ? 0 : _zer_sat%d > %lluULL ? %lluULL : (", tmp, tmp, mx, mx);
-                        emit_type(e, t);   /* carrier cast (uint8_t for u7 …); clamped value fits */
-                        emit(e, ")_zer_sat%d", tmp);
-                    }
-                } else {
-                    /* signed: clamp to [min, max] for target width */
-                    int w = type_width(t);
-                    if (w == 8)
-                        emit(e, "_zer_sat%d < -128 ? -128 : _zer_sat%d > 127 ? 127 : (int8_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 16)
-                        emit(e, "_zer_sat%d < -32768 ? -32768 : _zer_sat%d > 32767 ? 32767 : (int16_t)_zer_sat%d", tmp, tmp, tmp);
-                    else if (w == 32)
-                        emit(e, "_zer_sat%d < -2147483648LL ? -2147483648LL : _zer_sat%d > 2147483647LL ? 2147483647LL : (int32_t)_zer_sat%d", tmp, tmp, tmp);
-                    else
-                        emit(e, "(int64_t)_zer_sat%d", tmp);
-                }
-                emit(e, "; })");
+                Node *sat_arg = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                emit_saturate_open(e, sat_arg, tmp);
+                if (sat_arg) emit_expr(e, sat_arg);
+                else emit(e, "0");
+                emit_saturate_close(e, sat_arg, t, tmp);
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
@@ -3856,69 +4917,7 @@ static void emit_expr(Emitter *e, Node *node) {
              * property of the TARGET TYPE and must be emitted for variable
              * addresses even with zero mmio declarations — a misaligned
              * volatile *u32 load is a BusFault on Cortex-M0. */
-            bool g2_var_addr = node->intrinsic.arg_count > 0 &&
-                node->intrinsic.args[0]->kind != NODE_INT_LIT;
-            int g2_align = 0;
-            Type *g2_inner = NULL;
-            if (node->intrinsic.type_arg) {
-                Type *g2_t = resolve_tynode(e, node->intrinsic.type_arg);
-                g2_inner = g2_t ? type_unwrap_distinct(g2_t) : NULL;
-                if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
-                    g2_inner = g2_inner->pointer.inner;
-                /* F4: alignment must use type_alignment_bytes (recurses into
-                 * struct/array/union fields) — type_width returned 0 for any
-                 * aggregate, so a struct-typed MMIO pointer got NO runtime
-                 * alignment trap at a variable address. */
-                g2_align = g2_inner ? type_alignment_bytes(g2_inner) : 0;
-            }
-            bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
-            bool need_align_check = g2_align > 1 && g2_var_addr;
-            if (need_range_check || need_align_check) {
-                int tmp = e->temp_count++;
-                emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
-                emit_expr(e, node->intrinsic.args[0]);
-                emit(e, "); ");
-                if (need_range_check) {
-                    /* plt86m audit 2026-06-17: account for the access SPAN so a
-                     * variable address near the range end can't straddle past it.
-                     * F4: span = sizeof(target) via C sizeof (GCC-evaluated, correct
-                     * for struct/array/union too) — the previous `g2_align>1?..:1`
-                     * collapsed every aggregate span to 1 byte. */
-                    emit(e, "if (!(");
-                    for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
-                        if (ri > 0) emit(e, " || ");
-                        emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + (sizeof(",
-                             tmp, (unsigned long long)e->checker->mmio_ranges[ri][0], tmp);
-                        if (g2_inner) emit_type(e, g2_inner); else emit(e, "char");
-                        emit(e, ") - 1ULL) <= 0x%llxULL)",
-                             (unsigned long long)e->checker->mmio_ranges[ri][1]);
-                    }
-                    emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
-                }
-                /* BUG-489: runtime alignment check — variable addresses must be
-                 * aligned to target type. Constant addresses checked at compile time,
-                 * but runtime addresses (0x40000000 + offset) need runtime check. */
-                if (need_align_check) {
-                    emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
-                         tmp, g2_align);
-                }
-                emit(e, "(");
-                if (node->intrinsic.type_arg) {
-                    Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                    emit_type(e, t);
-                }
-                emit(e, ")_zer_ma%d; })", tmp);
-            } else {
-                emit(e, "(");
-                if (node->intrinsic.type_arg) {
-                    Type *t = resolve_tynode(e,node->intrinsic.type_arg);
-                    emit_type(e, t);
-                }
-                emit(e, ")(uintptr_t)(");
-                if (node->intrinsic.arg_count > 0)
-                    emit_expr(e, node->intrinsic.args[0]);
-                emit(e, ")");
-            }
+            emit_inttoptr(e, node, NULL);   /* BUG-1058: one emission, both paths */
         } else if (nlen == 8 && memcmp(name, "ptrtoint", 8) == 0) {
             /* @ptrtoint(ptr) → (uintptr_t)(ptr) */
             emit(e, "(uintptr_t)(");
@@ -3938,7 +4937,9 @@ static void emit_expr(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0) emit_expr(e, node->intrinsic.args[0]);
             else emit(e, "0");
             emit_try_enum_close(e, node->intrinsic.type_arg
-                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL,
+                                node->intrinsic.arg_count > 0
+                                   ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
@@ -4566,6 +5567,7 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
     }
     e->indent--;
     emit(e, "};\n\n");
+    record_user_type_emitted(e, st);   /* BUG-1027: exotic-slice dependency set */
 }
 
 /* Emit all stamped container struct declarations, topologically ordered so a
@@ -4669,6 +5671,7 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     if (st) EMIT_STRUCT_NAME(e, st);
     else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
     emit(e, ";\n\n");
+    record_user_type_emitted(e, st);   /* BUG-1027: exotic-slice dependency set */
 }
 
 /* ================================================================
@@ -4948,6 +5951,12 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * masked bugs. Post-2026-04-19 policy: IR correctness is
      * load-bearing. Lowering or validation failure = abort. */
     if (node->func_decl.body) {
+        /* BUG-1238: an async function lowered early (its state struct is already
+         * out) is not lowered again — pre_lower_orelse rewrites the AST. */
+        for (int ai = 0; ai < e->early_async_count; ai++) {
+            IRFunc *pre = (IRFunc *)e->early_async_ir[ai];
+            if (pre && pre->ast_node == node) { emit_func_from_ir(e, pre); return; }
+        }
         IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
         if (!ir) {
             fprintf(stderr,
@@ -4987,30 +5996,155 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * Single source of truth via helper — see emit_func_attributes(). */
     emit_func_attributes(e, node);
 
-    emit_type(e, ret);
-    emit(e, " ");
+    emit_func_decl_head(e, ret, false);                 /* BUG-1111 */
     EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
-    emit(e, "(");
-
-    if (node->func_decl.param_count == 0) {
-        emit(e, "void");
-    } else {
-        for (int i = 0; i < node->func_decl.param_count; i++) {
-            if (i > 0) emit(e, ", ");
-            ParamDecl *p = &node->func_decl.params[i];
-            Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                          (uint32_t)i < func_type->func_ptr.param_count) ?
-                func_type->func_ptr.params[i] : resolve_tynode(e,p->type);
-            emit_type_and_name(e, ptype, p->name, p->name_len);
-        }
-        if (node->func_decl.is_variadic) emit(e, ", ...");
-    }
-    emit(e, ") ");
+    emit_func_decl_params(e, node, func_type);
+    emit_func_decl_tail(e, ret, false);
+    emit(e, " ");
 
     /* Prototype-only path — functions with bodies took the IR return
      * at the top of this function. Only prototype / forward-decl shapes
      * reach here. */
     emit(e, ";\n\n");
+}
+
+/* BUG-1128: a PROTOTYPE for every function with a body, emitted before any
+ * function or global that could name it. The checker registers every
+ * declaration before checking any body, so ZER lets a function be used before
+ * its definition — and the emitter wrote no prototype, leaving C's implicit
+ * `int f()` declaration: `u64 later()` called from an earlier `main` was
+ * "conflicting types for 'later'", a struct / optional / pointer return the same,
+ * and a funcptr global initialised with a later function "undeclared". GCC 14
+ * makes the implicit declaration itself an error. Same helpers as the definition
+ * (attributes, head, mangled name, params, tail), so the two cannot disagree.
+ * `main` is skipped (its return type may be promoted to int); comptime and async
+ * functions do not exist as plain C functions. */
+static void emit_func_prototype(Emitter *e, Node *node) {
+    if (node->kind != NODE_FUNC_DECL || !node->func_decl.body) return;
+    if (node->func_decl.is_comptime || node->func_decl.is_async) return;
+    if (!e->current_module && node->func_decl.name_len == 4 &&
+        memcmp(node->func_decl.name, "main", 4) == 0) return;
+    Type *func_type = checker_get_type(e->checker, node);
+    Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
+        func_type->func_ptr.ret : NULL;
+    emit_func_attributes(e, node);
+    emit_func_decl_head(e, ret, false);
+    EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
+    emit_func_decl_params(e, node, func_type);
+    emit_func_decl_tail(e, ret, false);
+    emit(e, ";\n");
+}
+
+/* BUG-1177: `typedef struct _zer_async_NAME _zer_async_NAME;` for every async
+ * function, before any prototype. The state struct is defined where the async
+ * function itself is emitted (in declaration order), so without this a function
+ * declared EARLIER that takes `*_zer_async_NAME` named an unknown type — and the
+ * pointer is the only legal way to pass a task. Names are unmangled, matching
+ * emit_async_func_from_ir (BUG-866). */
+static void emit_async_forward_typedefs(Emitter *e, Node *file_node) {
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
+            continue;
+        emit(e, "typedef struct _zer_async_%.*s _zer_async_%.*s;\n",
+             (int)d->func_decl.name_len, d->func_decl.name,
+             (int)d->func_decl.name_len, d->func_decl.name);
+    }
+}
+
+/* BUG-1238: define every async state struct BEFORE any function or global.
+ * The struct is emitted from the lowered IR (it holds every promoted local),
+ * and was written where the async function itself is emitted — in source
+ * order. So every use of a task spelled before that point met an incomplete
+ * type: a GLOBAL task, a task in a struct FIELD, `alloc(task, n)`, or even a
+ * LOCAL task in a function declared above the async one ("has initializer but
+ * incomplete type"). The async functions are lowered here instead (once — the
+ * lowered IR is kept and reused when the function body is emitted), and their
+ * structs defined in dependency order: a task holding another task BY VALUE as
+ * a local needs that one first. */
+static void emit_async_state_struct(Emitter *e, IRFunc *func);
+static bool async_local_needs(Type *t, IRFunc **fs, bool *done, int n, int depth) {
+    if (!t || depth > 64) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_ARRAY: return async_local_needs(u->array.inner, fs, done, n, depth + 1);
+    case TYPE_OPTIONAL: return async_local_needs(u->optional.inner, fs, done, n, depth + 1);
+    case TYPE_STRUCT:
+        if (u->struct_type.is_async_state) {
+            for (int i = 0; i < n; i++) {
+                if (done[i]) continue;
+                uint32_t fl = fs[i]->name_len;
+                if (u->struct_type.name_len == 11 + fl &&
+                    memcmp(u->struct_type.name + 11, fs[i]->name, fl) == 0) return true;
+            }
+            return false;
+        }
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (async_local_needs(u->struct_type.fields[i].type, fs, done, n, depth + 1))
+                return true;
+        return false;
+    default: return false;
+    }
+}
+static void emit_early_async_structs(Emitter *e, Node *file_node) {
+    int start = e->early_async_count;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
+            continue;
+        IRFunc *ir = ir_lower_func(e->arena, e->checker, d);
+        if (!ir) {
+            fprintf(stderr, "INTERNAL ERROR: IR lowering returned NULL for async '%.*s'\n",
+                    (int)d->func_decl.name_len, d->func_decl.name);
+            abort();
+        }
+        ir->module_prefix = e->current_module;
+        ir->module_prefix_len = e->current_module_len;
+        if (!ir_validate(ir)) {
+            fprintf(stderr, "INTERNAL ERROR: IR validation failed for async '%.*s'\n",
+                    (int)d->func_decl.name_len, d->func_decl.name);
+            abort();
+        }
+        if (e->ir_hook) e->ir_hook(e->ir_hook_ctx, ir);
+        if (e->early_async_count >= e->early_async_cap) {
+            int nc = e->early_async_cap < 8 ? 8 : e->early_async_cap * 2;
+            void **nb = (void **)arena_alloc(e->arena, (size_t)nc * sizeof(void *));
+            if (!nb) abort();
+            if (e->early_async_count)
+                memcpy(nb, e->early_async_ir, (size_t)e->early_async_count * sizeof(void *));
+            e->early_async_ir = nb;
+            e->early_async_cap = nc;
+        }
+        e->early_async_ir[e->early_async_count++] = ir;
+    }
+    int n = e->early_async_count - start;
+    if (n <= 0) return;
+    IRFunc **fs = (IRFunc **)(e->early_async_ir + start);
+    bool *done = (bool *)arena_alloc(e->arena, (size_t)n * sizeof(bool));
+    if (!done) abort();
+    memset(done, 0, (size_t)n * sizeof(bool));
+    int left = n;
+    while (left > 0) {
+        bool progress = false;
+        for (int i = 0; i < n; i++) {
+            if (done[i]) continue;
+            bool blocked = false;
+            for (int li = 0; li < fs[i]->local_count && !blocked; li++) {
+                if (fs[i]->locals[li].is_static) continue;
+                done[i] = true;   /* a task never waits on itself */
+                blocked = async_local_needs(fs[i]->locals[li].type, fs, done, n, 0);
+                done[i] = false;
+            }
+            if (blocked) continue;
+            emit_async_state_struct(e, fs[i]);
+            done[i] = true; left--; progress = true;
+        }
+        if (!progress) {   /* a cycle by value is unrepresentable in C: emit anyway, GCC reports it */
+            for (int i = 0; i < n; i++)
+                if (!done[i]) { emit_async_state_struct(e, fs[i]); done[i] = true; left--; }
+        }
+    }
 }
 
 static void emit_global_var_inner(Emitter *e, Node *node);
@@ -5047,8 +6181,8 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         emit_type(e, type->pool.elem);
         emit(e, " slots[%llu]; uint32_t gen[%llu]; uint8_t used[%llu]; } ",
              (unsigned long long)type->pool.count, (unsigned long long)type->pool.count, (unsigned long long)type->pool.count);
-        emit(e, "%.*s = {0};\n\n",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = {0};\n\n");
         return;
     }
 
@@ -5058,15 +6192,15 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         emit_type(e, type->ring.elem);
         emit(e, " data[%llu]; uint32_t head; uint32_t tail; uint32_t count; } ",
              (unsigned long long)type->ring.count);
-        emit(e, "%.*s = {0};\n\n",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = {0};\n\n");
         return;
     }
 
     /* Arena → _zer_arena */
     if (type && type->kind == TYPE_ARENA) {
-        emit(e, "_zer_arena %.*s",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit(e, "_zer_arena ");
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
         if (node->var_decl.init) {
             emit(e, " = ");
             emit_expr(e, node->var_decl.init);
@@ -5079,8 +6213,9 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
 
     /* Slab(T) → _zer_slab with slot_size */
     if (type && type->kind == TYPE_SLAB) {
-        emit(e, "_zer_slab %.*s = { .slot_size = sizeof(",
-             (int)node->var_decl.name_len, node->var_decl.name);
+        emit(e, "_zer_slab ");
+        emit_module_global_name(e, node->var_decl.name, (uint32_t)node->var_decl.name_len);   /* BUG-1040 */
+        emit(e, " = { .slot_size = sizeof(");
         emit_type(e, type->slab.elem);
         emit(e, ") };\n\n");
         return;
@@ -5090,6 +6225,22 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     /* volatile on non-pointer scalars (pointers handled above) */
     if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
         emit(e, "volatile ");
+    /* BUG-1115: a ZER `const` global is read-only by the checker's rules and was
+     * emitted as a plain C object — so it occupied RAM (.data) rather than flash
+     * (.rodata), contrary to the reference. Emit C `const` for value-shaped
+     * types. Pointer / slice / funcptr kinds are left alone: there `const` in
+     * ZER qualifies the POINTEE, which the type already spells. */
+    if (node->var_decl.is_const && type) {
+        switch (type_dispatch_kind(type)) {
+        case TYPE_POINTER: case TYPE_SLICE: case TYPE_FUNC_PTR: case TYPE_OPAQUE:
+        case TYPE_OPTIONAL: case TYPE_POOL: case TYPE_RING: case TYPE_SLAB:
+        case TYPE_ARENA: case TYPE_BARRIER: case TYPE_SEMAPHORE: case TYPE_HANDLE:
+            break;
+        default:
+            emit(e, "const ");
+            break;
+        }
+    }
 
     /* BUG-218/222: mangle global var names for imported modules (including static) */
     if (e->current_module) {
@@ -5134,8 +6285,14 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * `_zer_shl` emits a GCC statement expression, which is illegal at
              * file scope. When it does not fold, emit_opt_wrap_value is the shared
              * T -> ?T query (the same one assignment and struct-field init use). */
-            int64_t oval = eval_const_expr(node->var_decl.init);
+            /* BUG-1090: the TYPED fold first — the value a local of the same
+             * spelling computes. The untyped fold is the fallback for a tree
+             * the typed one does not model. */
+            int64_t oval;
+            if (!checker_fold_const_typed(e->checker, node->var_decl.init, &oval))
+                oval = eval_const_expr(node->var_decl.init);
             if (oval != CONST_EVAL_FAIL) {
+                oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1032 */
                 emit(e, " = (");
                 emit_type(e, type);
                 if (oval < 0) emit(e, "){ (%lld), 1 }", (long long)oval);
@@ -5159,9 +6316,27 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * foldable tree is identical either way. eval_const_expr returns
              * CONST_EVAL_FAIL for anything with a variable in it, so widening the
              * gate cannot fold something it should not. */
-            {
-                int64_t cval = eval_const_expr(node->var_decl.init);
+            /* BUG-1216: a comptime call whose result is a STRUCT (or a float)
+             * is not an integer fold — its `comptime_value` slot is unused, 0 —
+             * and `In g = MK(3);` was emitted `struct In g = 0;`. Emit the folded
+             * literal instead. */
+            Node *gci = node->var_decl.init;
+            if (gci->kind == NODE_CALL && gci->call.is_comptime_resolved &&
+                (gci->call.comptime_struct_init || gci->call.is_comptime_float)) {
+                emit(e, " = ");
+                emit_expr(e, gci);
+                emitted_const = true;
+            }
+            if (!emitted_const) {
+                /* BUG-1090: typed fold first (see the optional arm above).
+                 * `const u32 K = (0 - 1) / 1073741824;` emitted `K = 0` — the
+                 * untyped int64 reading — while the same initializer on a
+                 * LOCAL computes 3 at run time. */
+                int64_t cval;
+                if (!checker_fold_const_typed(e->checker, node->var_decl.init, &cval))
+                    cval = eval_const_expr(node->var_decl.init);
                 if (cval != CONST_EVAL_FAIL) {
+                    cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1032 */
                     if (cval < 0) {
                         emit(e, " = (%lld)", (long long)cval);
                     } else {
@@ -5172,7 +6347,17 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
             }
             if (!emitted_const) {
                 emit(e, " = ");
-                emit_expr(e, node->var_decl.init);
+                /* BUG-1127: the array -> slice coercion, at the GLOBAL value-flow
+                 * site. `[*]u8 s = buf;` emitted `s = buf;` ("invalid initializer"
+                 * from GCC) — masked until now because BUG-997's checker rule
+                 * refused the bare global name before the emitter saw it. */
+                Type *gd = type_unwrap_distinct(type);
+                Type *gv = gi_type ? type_unwrap_distinct(gi_type) : NULL;
+                if (gd && gv && type_dispatch_kind(gd) == TYPE_SLICE &&
+                    type_dispatch_kind(gv) == TYPE_ARRAY)
+                    emit_array_as_slice(e, node->var_decl.init, gv, gd);
+                else
+                    emit_expr(e, node->var_decl.init);
             }
         }
     } else {
@@ -5589,6 +6774,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         emit(e, "typedef struct { _zer_slice_"); EMIT_UNAME();
         emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); EMIT_UNAME();
         emit(e, ";\n\n");
+        record_user_type_emitted(e, ut);   /* BUG-1027: exotic-slice dependency set */
         break;
         #undef EMIT_UNAME
     }
@@ -5597,21 +6783,14 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         Type *et = checker_get_type(e->checker, decl);
         emit(e, "/* enum %.*s */\n",
              (int)decl->enum_decl.name_len, decl->enum_decl.name);
-        int32_t next_val = 0;
+        /* BUG-1191: print the CHECKER's values — the one fold, so the emitted
+         * #define and every compile-time decision agree by construction. */
+        Type *ete = et ? type_unwrap_distinct(et) : NULL;
         for (int j = 0; j < decl->enum_decl.variant_count; j++) {
             EnumVariant *v = &decl->enum_decl.variants[j];
-            int32_t val;
-            if (v->value && v->value->kind == NODE_INT_LIT) {
-                val = (int32_t)v->value->int_lit.value;
-                next_val = val + 1;
-            } else if (v->value && v->value->kind == NODE_UNARY &&
-                       v->value->unary.op == TOK_MINUS &&
-                       v->value->unary.operand->kind == NODE_INT_LIT) {
-                val = -(int32_t)v->value->unary.operand->int_lit.value;
-                next_val = val + 1;
-            } else {
-                val = next_val++;
-            }
+            int32_t val = (ete && type_dispatch_kind(ete) == TYPE_ENUM &&
+                           (uint32_t)j < ete->enum_type.variant_count)
+                ? ete->enum_type.variants[j].value : j;
             emit(e, "#define _ZER_");
             if (et) EMIT_ENUM_NAME(e, et);
             else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
@@ -5734,17 +6913,25 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         for (int i = 0; i < file_node->file.decl_count; i++)
             prescan_spawn_in_node(e, file_node->file.decls[i]);
 
+        /* BUG-1027: register every exotic slice type, then flush the ones whose
+         * dependencies are ready before each declaration that may name one. */
+        collect_exotic_slices(e);
+
         /* Pass 1: struct/enum/union/typedef declarations */
         for (int i = 0; i < file_node->file.decl_count; i++) {
             Node *d = file_node->file.decls[i];
             if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
             if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
-                d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF)
+                d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
+                flush_exotic_slices(e);
                 emit_top_level_decl(e, d, file_node, i);
+            }
         }
+        flush_exotic_slices(e);
 
         /* Emit stamped container struct declarations */
         emit_container_structs(e);
+        flush_exotic_slices(e);
 
         /* Spawn wrappers (between struct decls and functions) */
         emit_spawn_wrappers(e);
@@ -6099,6 +7286,31 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    pthread_cond_signal(&s->_zer_cond);\n");
     emit(e, "    pthread_mutex_unlock(&s->_zer_mtx);\n");
     emit(e, "}\n");
+    /* BUG-1022: name the REASON in the non-hosted branch.
+     *
+     * Barrier / Semaphore / shared struct / spawn / condvar are all pthread-based,
+     * so they genuinely cannot work freestanding — that part is a floor, not a
+     * bug. What WAS a bug is what the author saw: the types simply vanished and
+     * GCC said `error: unknown type name '_zer_barrier'` pointing at a line of
+     * GENERATED C, with nothing naming the ZER feature or the reason. Same defect
+     * BUG-991 records for float literals, where GCC blamed the user's .zer line
+     * for an emitter problem; here it blames a file the user never wrote.
+     *
+     * zerc cannot know at compile time whether the emitted C will be built with
+     * -ffreestanding (that is a GCC flag applied later, or ZER_FREESTANDING), so
+     * it cannot diagnose this itself. But it can put the REASON inside the error
+     * GCC is going to print, which is what these macros do: the name that shows
+     * up in "unknown type name" now says what went wrong and why.
+     *
+     * A macro, not an `#error`, precisely so a bare-metal program that does NOT
+     * use threads is unaffected — which is the common firmware case and must keep
+     * building. Nothing fires unless the program actually names one of them. */
+    emit(e, "#else\n");
+    emit(e, "/* Freestanding: pthreads do not exist, so Barrier/Semaphore cannot. These\n");
+    emit(e, "   macros put the reason into GCC's \"unknown type name\" message rather than\n");
+    emit(e, "   leaving the author staring at a missing typedef in generated C. */\n");
+    emit(e, "#  define _zer_barrier   ZER_Barrier_requires_a_HOSTED_target__pthreads_are_unavailable_on_bare_metal\n");
+    emit(e, "#  define _zer_semaphore ZER_Semaphore_requires_a_HOSTED_target__pthreads_are_unavailable_on_bare_metal\n");
     emit(e, "#endif\n\n");
 
     /* Universal fault handler + @probe — uses C standard signal() everywhere.
@@ -6196,12 +7408,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * shift count with negative value (e.g., i32 n = -1; x << n) bypassed
      * the >= width guard and fell through to (a) << -1 = C undefined
      * behavior. Cast to int64_t for the comparison so unsigned operands
-     * compare correctly without wrap-to-negative. */
-    emit(e, "#define _zer_shl(a, b) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+     * compare correctly without wrap-to-negative.
+     *
+     * BUG-1065: `w` is the ZER width of the left operand (shift_guard_width). The
+     * carrier test `sizeof(a) * 8` stays as well: the ZER width alone would let a
+     * count reach an operand C has narrower than the ZER type claims, and a C
+     * shift by >= its operand's width is undefined. */
+    emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(b) _b = (b); "
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) << _b; })\n");
-    emit(e, "#define _zer_shr(a, b) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
+    emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(b) _b = (b); "
+            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
@@ -6532,16 +7751,24 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     for (int i = 0; i < file_node->file.decl_count; i++)
         prescan_spawn_in_node(e, file_node->file.decls[i]);
 
+    /* BUG-1027: register every exotic slice type, then flush the ones whose
+     * dependencies are ready before each declaration that may name one. */
+    collect_exotic_slices(e);
+
     /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
-            d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF)
+            d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
+            flush_exotic_slices(e);
             emit_top_level_decl(e, d, file_node, i);
+        }
     }
+    flush_exotic_slices(e);
 
     /* Emit stamped container struct declarations — after regular structs */
     emit_container_structs(e);
+    flush_exotic_slices(e);
 
     /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions */
     if (e->checker->auto_slab_count > 0) {
@@ -6556,15 +7783,35 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         emit(e, "\n");
     }
 
+    /* BUG-1128: prototypes for every function with a body — after every type
+     * they can name, before any function or global initializer that names them. */
+    emit(e, "\n/* ZER function prototypes */\n");
+    emit_async_forward_typedefs(e, file_node);
+    for (int i = 0; i < file_node->file.decl_count; i++)
+        emit_func_prototype(e, file_node->file.decls[i]);
+    emit(e, "\n");
+    emit_early_async_structs(e, file_node);   /* BUG-1238 */
+
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);
 
-    /* Pass 2: emit everything else (functions, globals, etc.) */
+    /* Pass 2a: every GLOBAL variable, before any function body. BUG-1214: ZER
+     * lets a function use a global declared further down the file (the checker
+     * registers every top-level name first), and the emitter wrote globals in
+     * source order — `u32 use() { return later; } u32 later = 5;` reached GCC as
+     * "'later' undeclared". A global's initializer can name only functions
+     * (prototyped above) and other globals (their relative order is kept). */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind == NODE_GLOBAL_VAR)
+            emit_top_level_decl(e, d, file_node, i);
+    }
+    /* Pass 2b: everything else (functions, interrupts, ...) */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
             d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
-            d->kind != NODE_CONTAINER_DECL)
+            d->kind != NODE_CONTAINER_DECL && d->kind != NODE_GLOBAL_VAR)
             emit_top_level_decl(e, d, file_node, i);
     }
 }
@@ -6596,6 +7843,35 @@ void emit_file_no_preamble(Emitter *e, Node *file_node) {
  * All IR instruction emission uses local IDs. This helper emits
  * the C name for a local, with async self-> prefix when needed.
  * ================================================================ */
+/* BUG-1040 (2026-09-21): the C name of a GLOBAL declared in the module being
+ * emitted — `mod__name` inside a module, the bare name in main. The general
+ * global-var path has mangled this way since BUG-218/222; the Pool / Ring /
+ * Arena / Slab declaration arms bypassed it, so a module's `Arena scratch` was
+ * emitted as bare `scratch` while every reference from main was
+ * `arena_lib__scratch` (GCC: undeclared), and two modules each declaring
+ * `Pool(T, 4) items` collided at link (redefinition). */
+static void emit_module_global_name(Emitter *e, const char *name, uint32_t len) {
+    if (e->current_module)
+        emit(e, "%.*s__%.*s", (int)e->current_module_len, e->current_module, (int)len, name);
+    else
+        emit(e, "%.*s", (int)len, name);
+}
+
+/* BUG-1040: the C name of an ALLOCATOR found by type (find_unique_allocator) —
+ * the Handle auto-deref `h.field` spells `pool.get(h)` with it. The lookup can
+ * return either of a module global's two Symbols (raw key or mangled key, BUG-233),
+ * so the prefix is added only when the name does not already carry it. */
+static void emit_alloc_sym_cname(Emitter *e, Symbol *sym) {
+    if (sym->module_prefix) {
+        uint32_t pl = sym->module_prefix_len;
+        bool already = sym->name_len > pl + 2 &&
+            memcmp(sym->name, sym->module_prefix, pl) == 0 &&
+            sym->name[pl] == '_' && sym->name[pl + 1] == '_';
+        if (!already) emit(e, "%.*s__", (int)pl, sym->module_prefix);
+    }
+    emit(e, "%.*s", (int)sym->name_len, sym->name);
+}
+
 static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
     IRLocal *l = &func->locals[local_id];
@@ -6603,6 +7879,20 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "self->%.*s", (int)l->name_len, l->name);
     else
         emit(e, "%.*s", (int)l->name_len, l->name);
+}
+
+/* BUG-1152: the statement form of the non-null load guard — after an IR load
+ * (field / element / deref) whose destination is a non-optional `*T`. */
+static void emit_nonnull_local_check(Emitter *e, IRFunc *func, int local_id) {
+    if (local_id < 0 || local_id >= func->local_count) return;
+    Type *t = func->locals[local_id].type;
+    int gk = load_guard_kind(t);
+    if (!gk) return;
+    /* Same C line as the load, so the trap's __LINE__ is the load's #line. */
+    emit(e, " if (!");
+    emit_local_name(e, func, local_id);
+    emit(e, "%s) _zer_trap(", nn_null_member(t));
+    emit(e, "\"%s\", __FILE__, __LINE__);", gk == 2 ? ZER_ENUM0_TRAP_MSG : ZER_NN_TRAP_MSG);
 }
 
 /* ================================================================
@@ -6622,6 +7912,41 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
     if (!ot) { Symbol *s = scope_lookup(e->checker->global_scope, on, ol); if (s) ot = s->type; }
     if (!ot) return false;
+    /* BUG-1040: every `%.*s` below spells the RECEIVER. A local (`Arena a` in
+     * this function) keeps its name; a global is spelled exactly as the ident
+     * emitter spells every other global — with the module prefix that the
+     * declaration (emit_module_global_name) now carries. Before this, a
+     * module's `scratch.alloc(Node)` emitted `&scratch` against a declaration
+     * main referenced as `arena_lib__scratch`. */
+    {
+        bool is_local = false;
+        if (func) {
+            for (int li = 0; li < func->local_count; li++) {
+                IRLocal *l = &func->locals[li];
+                if ((l->name_len == ol && memcmp(l->name, on, ol) == 0) ||
+                    (l->orig_name && l->orig_name_len == ol && memcmp(l->orig_name, on, ol) == 0)) {
+                    is_local = true; break;
+                }
+            }
+        }
+        if (!is_local) {
+            Symbol *gs = scope_lookup(e->checker->global_scope, on, ol);
+            const char *pfx = NULL; uint32_t pl = 0;
+            if (gs && gs->module_prefix) {
+                if (e->current_module) { pfx = e->current_module; pl = e->current_module_len; }
+                else { pfx = gs->module_prefix; pl = gs->module_prefix_len; }
+            } else if (!gs && e->current_module) {
+                pfx = e->current_module; pl = e->current_module_len;
+            }
+            if (pfx) {
+                uint32_t ml2 = pl + 2 + ol;
+                char *m = (char *)arena_alloc(e->arena, ml2 + 1);
+                memcpy(m, pfx, pl); m[pl] = '_'; m[pl + 1] = '_';
+                memcpy(m + pl + 2, on, ol); m[ml2] = '\0';
+                on = m; ol = ml2;
+            }
+        }
+    }
     Type *te = type_unwrap_distinct(ot);
     #define BA(i) emit_rewritten_node(e, node->call.args[i], func)
     /* Pool */
@@ -6772,14 +8097,18 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
         }
         if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
-            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
-                if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type);
-                emit(e,"),_Alignof("); if(st->kind==TYPE_STRUCT){if(st->struct_type.is_packed)emit(e,"struct __attribute__((packed)) ");else emit(e,"struct ");emit(e,"%.*s",(int)st->struct_type.name_len,st->struct_type.name);}else emit_type(e,ts->type); emit(e,")))"); return true; }
+            /* BUG-1040: emit_type spells a struct WITH its module prefix (`struct
+             * arena_lib__Node`); the hand-rolled `struct Node` here was an
+             * incomplete type inside an imported module (same defect BUG-1029
+             * fixed for alloc(T, n)). */
+            if (ts&&ts->type) { emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
+                emit_type(e,ts->type);
+                emit(e,"),_Alignof("); emit_type(e,ts->type); emit(e,")))"); return true; }
         }
         if (ml==11 && !memcmp(mn,"alloc_slice",11) && node->call.arg_count>1 && node->call.args[0]->kind==NODE_IDENT) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
             Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
-            if (ts&&ts->type) { Type *st=type_unwrap_distinct(ts->type); int t=e->temp_count++;
+            if (ts&&ts->type) { int t=e->temp_count++;
                 /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
                  * computed with an overflow check. The AST path has done this
                  * since BUG-266; this IR path — the only one that runs for a
@@ -6805,10 +8134,10 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
                  * a wrapper whose absence produces a WRONG LENGTH defeats every
                  * downstream guard rather than merely removing one. */
                 emit(e,"size_t _zer_asz%d; uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t,t);
-                if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);}
+                emit_type(e,ts->type);   /* BUG-1040: module-prefixed spelling */
                 emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
-                emit(e,"_Alignof("); if(st->kind==TYPE_STRUCT){emit(e,"struct %.*s",(int)st->struct_type.name_len,st->struct_type.name);}else{emit_type(e,ts->type);} emit(e,"));");
+                emit(e,"_Alignof("); emit_type(e,ts->type); emit(e,"));");
                 /* wrap in ?[]T */
                 emit(e,"_zer_ap%d?(",t);
                 Type *slice_t=type_slice(e->arena,ts->type); Type *opt_t=type_optional(e->arena,slice_t);
@@ -6841,92 +8170,223 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
  * DOES NOT CALL emit_expr. Each node type emitted directly.
  * For sub-expressions, calls itself recursively.
  * ================================================================ */
-/* Emit the VALUE that a bit-slice SET stores, honouring a COMPOUND operator.
- *
- * 2026-08-06: `reg[hi..lo] OP= rhs` was compiled as `reg[hi..lo] = rhs` — the
- * IR-path handler matched any assign with a NODE_SLICE target and emitted the
- * bare RHS, never consulting node->assign.op. Measured: `r[7..0] = 20;
- * r[7..0] += 3;` produced 3, not 23. All ten compound ops were affected, and
- * read-modify-write on a register field is the idiom bit-slices exist for.
- *
- * The AST path never had this bug because it is gated on `op == TOK_EQ`, which
- * is also why a compound bit-slice assign reaches the IR path at all.
- *
- * For a compound op the stored value is `current_field OP rhs`, where
- * current_field is the field read back out of the cached pointer:
- *     ((*_zer_bp >> lo) & unshifted_mask)
- * The position shift is clamped for the same UB reason as the mask
- * (see emit_bitslice_runtime_mask). */
-static void emit_bitslice_ir_value(Emitter *e, Node *node, IRFunc *func, int btmp,
-                                   bool bits_const, int64_t const_hi, int64_t const_lo,
-                                   Node *hi_node, Node *lo_node) {
+/* Does an lvalue path pass through a field of a PACKED struct? Taking its address
+ * gives a possibly misaligned pointer (BUG-833's `&p.w`). */
+static bool lvalue_through_packed(Emitter *e, Node *lv) {
+    for (Node *r = lv; r; ) {
+        if (r->kind == NODE_FIELD) {
+            Type *ot = checker_get_type(e->checker, r->field.object);
+            Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+            if (oe && type_dispatch_kind(oe) == TYPE_POINTER)
+                oe = type_unwrap_distinct(oe->pointer.inner);
+            if (oe && type_dispatch_kind(oe) == TYPE_STRUCT && oe->struct_type.is_packed)
+                return true;
+            r = r->field.object;
+        } else if (r->kind == NODE_INDEX) {
+            r = r->index_expr.object;
+        } else break;
+    }
+    return false;
+}
+
+/* BUG-1198: ONE bit-slice SET, for both emitter paths (`sub` is emit_expr's or
+ * emit_rewritten_node's node emitter), every assignment operator, and every
+ * position. It replaces two copies that between them:
+ *   - read a VOLATILE register twice for a compound op (2 loads + 1 store — a
+ *     clear-on-read status register saw its side effect twice);
+ *   - took `&(p.w)` of a PACKED field, a misaligned `uint32_t*` (a hard fault on
+ *     Cortex-M0 / RISC-V, measured with UBSan);
+ *   - emitted a raw C shift for `<<=` / `>>=` (UBSan "shift exponent 70"; 3 at
+ *     -O0, 0 at -O2) and a raw division for `/=` / `%=`;
+ *   - with runtime positions: `hi < lo` cleared every bit from lo up, `hi` past the
+ *     type's width overwrote the whole register, and on a `uN` wrote bits above N
+ *     (a u12 left at 0x3F00). The documented rule (reference.md "Bit Extraction")
+ *     is "a runtime position at or past the width is a defined no-op": the write
+ *     changes nothing when hi >= W (then lo >= W too, or the field is cut) or
+ *     hi < lo. W is the VALUE width (N for a uN / iN).
+ * The value is read once into `_zer_bv`, the new value computed in 64 bits, and a
+ * non-native signed `iN` sign-extended from bit N-1 so its carrier invariant holds.
+ * Types wider than 64 bits are refused by the checker (the math is 64-bit). */
+static void emit_bitslice_set(Emitter *e, Node *node, IRFunc *func, EmitNodeFn sub) {
+    Node *obj = node->assign.target->slice.object;
+    Node *hi_node = node->assign.target->slice.start;
+    Node *lo_node = node->assign.target->slice.end;
+    Type *ot = checker_get_type(e->checker, obj);
+    Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+    int W = oe ? type_width(oe) : 64;
+    if (W <= 0 || W > 64) W = 64;
+    TypeKind ok = oe ? type_dispatch_kind(oe) : TYPE_U64;
+    bool narrow_signed = (ok == TYPE_SINT) && W < 64;
+    bool packed = lvalue_through_packed(e, obj);
+    int t = e->temp_count++;
+    emit(e, "({ ");
+    if (!packed) {
+        emit(e, "__typeof__(");
+        sub(e, obj, func);
+        emit(e, ") *_zer_bp%d = &(", t);
+        sub(e, obj, func);
+        emit(e, "); ");
+    }
+    #define BS_LV() do { if (packed) { emit(e, "("); sub(e, obj, func); emit(e, ")"); } \
+                         else emit(e, "(*_zer_bp%d)", t); } while (0)
+    emit(e, "uint64_t _zer_bh%d = ", t);
+    if (hi_node) { emit(e, "(uint64_t)("); sub(e, hi_node, func); emit(e, ")"); }
+    else emit(e, "%d", W - 1);
+    emit(e, "; uint64_t _zer_bl%d = ", t);
+    if (lo_node) { emit(e, "(uint64_t)("); sub(e, lo_node, func); emit(e, ")"); }
+    else emit(e, "0");
+    emit(e, "; uint64_t _zer_bv%d = (uint64_t)", t);
+    BS_LV();
+    emit(e, "; uint64_t _zer_bt%d = (_zer_bh%d >= %d) ? %d : _zer_bh%d; ",
+         t, t, W, W - 1, t);
+    emit(e, "uint64_t _zer_bm%d = (_zer_bh%d >= %d || _zer_bh%d < _zer_bl%d) ? 0 : "
+            "((((_zer_bt%d - _zer_bl%d + 1) >= 64) ? ~(uint64_t)0 : "
+            "((1ull << (_zer_bt%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d); ",
+         t, t, W, t, t, t, t, t, t, t);
+    emit(e, "uint64_t _zer_bn%d = ", t);
     TokenType op = node->assign.op;
-    if (op == TOK_EQ) {                      /* plain store — unchanged */
-        emit_rewritten_node(e, node->assign.value, func);
+    if (op == TOK_EQ) {
+        emit(e, "(uint64_t)(");
+        sub(e, node->assign.value, func);
+        emit(e, ")");
+    } else {
+        const char *cop = " + ";
+        bool is_div = false, is_shift = false;
+        switch (op) {
+        case TOK_PLUSEQ:    cop = " + ";  break;
+        case TOK_MINUSEQ:   cop = " - ";  break;
+        case TOK_STAREQ:    cop = " * ";  break;
+        case TOK_SLASHEQ:   cop = " / ";  is_div = true; break;
+        case TOK_PERCENTEQ: cop = " % ";  is_div = true; break;   /* an ARGUMENT: literal % */
+        case TOK_AMPEQ:     cop = " & ";  break;
+        case TOK_PIPEEQ:    cop = " | ";  break;
+        case TOK_CARETEQ:   cop = " ^ ";  break;
+        case TOK_LSHIFTEQ:  cop = " << "; is_shift = true; break;
+        case TOK_RSHIFTEQ:  cop = " >> "; is_shift = true; break;
+        default:            cop = " + ";  break;
+        }
+        emit(e, "({ uint64_t _zer_bc%d = (_zer_bm%d == 0) ? 0 : "
+                "((_zer_bv%d >> _zer_bl%d) & (_zer_bm%d >> _zer_bl%d)); "
+                "uint64_t _zer_br%d = (uint64_t)(", t, t, t, t, t, t, t);
+        sub(e, node->assign.value, func);
+        emit(e, "); ");
+        if (is_div)
+            emit(e, "if (_zer_br%d == 0) _zer_trap(\"division by zero\", __FILE__, __LINE__); ", t);
+        if (is_shift)
+            emit(e, "(_zer_br%d >= 64) ? (uint64_t)0 : (_zer_bc%d%s_zer_br%d); })", t, t, cop, t);
+        else
+            emit(e, "_zer_bc%d%s_zer_br%d; })", t, cop, t);
+    }
+    emit(e, "; uint64_t _zer_bf%d = (_zer_bv%d & ~_zer_bm%d) | ((_zer_bm%d == 0) ? 0 : "
+            "((_zer_bn%d << _zer_bl%d) & _zer_bm%d)); ", t, t, t, t, t, t, t);
+    if (narrow_signed)
+        emit(e, "_zer_bf%d = (uint64_t)(((int64_t)(_zer_bf%d << %d)) >> %d); ",
+             t, t, 64 - W, 64 - W);
+    BS_LV();
+    emit(e, " = (__typeof__(");
+    BS_LV();
+    emit(e, "))_zer_bf%d; })", t);
+    #undef BS_LV
+}
+
+/* BUG-1058: ONE emission of `@inttoptr(*T, addr)` for both dispatch paths
+ * (`func == NULL` = AST path, emit_expr; else IR path, emit_rewritten_node).
+ * The two copies were identical and shared three defects:
+ *   - the address was cast to `uintptr_t` BEFORE the range check, so on a
+ *     32-bit target `0x1_4000_0010` was checked as `0x4000_0010` and read an
+ *     in-range register it never named (measured with -m32);
+ *   - the span test `ma + (sizeof(T) - 1) <= end` wraps for an address near the
+ *     top of the space, so `0xFFFF...FE` passed a range that ends far below it;
+ *   - with no range and no alignment need, nothing checked the address at all.
+ * Now the address is held in `uint64_t` (the checker refuses a wider operand),
+ * trapped if it does not fit in a pointer, range-checked without overflow, and
+ * only then narrowed. A constant address is validated by the checker. */
+static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func) {
+    if (!node->intrinsic.type_arg) return;
+    /* BUG-1195: the CHECKER's result type — volatile for a constant address. */
+    Type *t = checker_get_type(e->checker, node);
+    if (!t || type_dispatch_kind(t) != TYPE_POINTER) t = resolve_tynode(e, node->intrinsic.type_arg);
+    Node *arg = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+    bool var_addr = arg && arg->kind != NODE_INT_LIT && !node->intrinsic.addr_is_const;
+    Type *inner = t ? type_unwrap_distinct(t) : NULL;
+    if (inner && type_dispatch_kind(inner) == TYPE_POINTER)
+        inner = inner->pointer.inner;
+    /* F4: alignment via type_alignment_bytes (aggregate-aware). GAP-2 (BUG-736):
+     * alignment is a property of the TARGET TYPE and is checked even with zero
+     * declared mmio ranges (--no-strict-mmio); only the range check needs them. */
+    int align = inner ? type_alignment_bytes(inner) : 0;
+    if (!var_addr && node->intrinsic.addr_is_const) {
+        emit(e, "((");
+        emit_type(e, t);
+        emit(e, ")(uintptr_t)0x%llxULL)", (unsigned long long)node->intrinsic.const_addr);
         return;
     }
-    const char *cop = " + ";
-    switch (op) {
-    case TOK_PLUSEQ:    cop = " + ";  break;
-    case TOK_MINUSEQ:   cop = " - ";  break;
-    case TOK_STAREQ:    cop = " * ";  break;
-    case TOK_SLASHEQ:   cop = " / ";  break;
-    /* NOTE: cop is passed as a %s ARGUMENT to emit(), not as part of the format
-     * string, so it must contain a LITERAL "%". Writing " %% " here (correct for
-     * a format string, as the sibling switch at the plain-assign site does) emits
-     * a literal "%%" into the C and silently miscompiles: 23 %= 5 gave 1, not 3. */
-    case TOK_PERCENTEQ: cop = " % ";  break;
-    case TOK_AMPEQ:     cop = " & ";  break;
-    case TOK_PIPEEQ:    cop = " | ";  break;
-    case TOK_CARETEQ:   cop = " ^ ";  break;
-    case TOK_LSHIFTEQ:  cop = " << "; break;
-    case TOK_RSHIFTEQ:  cop = " >> "; break;
-    default:            cop = " + ";  break;
-    }
-    /* current field value, read back through the cached pointer */
-    emit(e, "((((uint64_t)(*_zer_bp%d) >> ", btmp);
-    if (bits_const) emit(e, "%lld", (long long)const_lo);
-    else if (lo_node) emit(e, "((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
-    else emit(e, "0");
-    emit(e, ") & (");
-    if (hi_node && lo_node) {
-        if (bits_const) {
-            int64_t width = const_hi - const_lo + 1;
-            if (width >= 64) emit(e, "~(uint64_t)0");
-            else emit(e, "((1ull << %lld) - 1)", (long long)width);
-        } else {
-            emit(e, "(((_zer_bh%d - _zer_bl%d + 1) >= 64) ? ~(uint64_t)0 : "
-                 "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1))",
-                 btmp, btmp, btmp, btmp);
+    if (!var_addr) {
+        emit(e, "((");
+        emit_type(e, t);
+        emit(e, ")(uintptr_t)(");
+        if (arg) {
+            if (func) emit_rewritten_node(e, arg, func); else emit_expr(e, arg);
         }
-    } else {
-        emit(e, "~(uint64_t)0");
+        emit(e, "))");
+        return;
     }
-    emit(e, "))%s(uint64_t)(", cop);
-    emit_rewritten_node(e, node->assign.value, func);
-    emit(e, "))");
+    int tmp = e->temp_count++;
+    emit(e, "({ uint64_t _zer_ma%d = (uint64_t)(", tmp);
+    if (func) emit_rewritten_node(e, arg, func); else emit_expr(e, arg);
+    emit(e, "); ");
+    emit(e, "if (_zer_ma%d > (uint64_t)UINTPTR_MAX) _zer_trap(\"@inttoptr: address does "
+            "not fit in a pointer\", __FILE__, __LINE__); ", tmp);
+    if (e->checker->mmio_range_count > 0) {
+        /* plt86m 2026-06-17: the ACCESS SPAN (sizeof T, GCC-evaluated so an
+         * aggregate is right) must fit, not just the start address. Written as
+         * `end - ma >= span - 1` after `ma <= end`, which cannot overflow. */
+        emit(e, "if (!(");
+        for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
+            unsigned long long lo = (unsigned long long)e->checker->mmio_ranges[ri][0];
+            unsigned long long hi = (unsigned long long)e->checker->mmio_ranges[ri][1];
+            if (ri > 0) emit(e, " || ");
+            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d <= 0x%llxULL && "
+                    "0x%llxULL - _zer_ma%d >= (uint64_t)sizeof(",
+                 tmp, lo, tmp, hi, hi, tmp);
+            if (inner) emit_type(e, inner); else emit(e, "char");
+            emit(e, ") - 1ULL)");
+        }
+        emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
+    }
+    /* BUG-489: runtime alignment for a variable address. */
+    if (align > 1)
+        emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", "
+                "__FILE__, __LINE__); ", tmp, align);
+    emit(e, "(");
+    emit_type(e, t);
+    emit(e, ")(uintptr_t)_zer_ma%d; })", tmp);
 }
 
-/* Emit the runtime bit-slice MASK, positioned, with the POSITION SHIFT CLAMPED.
- *
- * 2026-08-06: `reg[hi..lo] = v` with a runtime `lo >= 64` emitted a bare
- * `mask << _zer_bl` — C UB. UBSan: "shift exponent 70 is too large"; measured
- * `reg` corrupted from 5 to 69. The WIDTH was already guarded
- * (`(hi-lo+1) >= 64 ? ~0 : ...`); the POSITION never was. The READ path has the
- * equivalent guard (`(_zer_lo >= N) ? 0 : (obj >> _zer_lo)`), so this only
- * restores parity between read and write.
- *
- * An out-of-range position yields mask 0, which makes the whole write a defined
- * no-op — upholding ZER's "shift by >= width is 0 (defined)" guarantee rather
- * than inventing a trap. */
-static void emit_bitslice_runtime_mask(Emitter *e, int btmp) {
-    emit(e, "((_zer_bl%d >= 64) ? (uint64_t)0 : "
-         "((((_zer_bh%d - _zer_bl%d + 1) >= 64 ? ~(uint64_t)0 : "
-         "((1ull << (_zer_bh%d - _zer_bl%d + 1)) - 1)) << _zer_bl%d)))",
-         btmp, btmp, btmp, btmp, btmp, btmp);
-}
+static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func);
 
+/* BUG-1152: the IR-rewritten path passes through the same load guard. */
 static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
+    if (!node) return;
+    Node *saved_lv = e->nn_lvalue;
+    Node *lv = nn_lvalue_of(node);
+    if (nn_guard_wanted(e, node)) {
+        emit_nn_guarded(e, node, func, emit_rewritten_node_impl);
+        return;
+    }
+    if (lv) e->nn_lvalue = lv;
+    bool asg_paren = node->kind == NODE_ASSIGN;   /* BUG-1183 — see emit_expr */
+    if (asg_paren) emit(e, "(");
+    bool ur_ptr = false; uint32_t ur_idx = 0;
+    Node *ur = union_partial_write_target(e, node, &ur_ptr, &ur_idx);
+    if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, func, emit_rewritten_node);
+    emit_rewritten_node_impl(e, node, func);
+    if (ur) emit(e, ")");
+    if (asg_paren) emit(e, ")");
+    e->nn_lvalue = saved_lv;
+}
+
+static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
     if (!node) return;
 
     switch (node->kind) {
@@ -6965,26 +8425,36 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                  * This matches EMIT_MANGLED_NAME for the current module's own
                  * symbols, and symbol->module_prefix for cross-module calls. */
                 Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
-                if (sym && sym->module_prefix) {
-                    /* Symbol found in scope with module prefix.
-                     * If it's a function, always use its own module_prefix.
-                     * If it's a variable and we're in a module, use current_module
-                     * (prevents wrong module's same-named variable being used). */
-                    if (sym->is_function) {
-                        emit(e, "%.*s__%.*s",
-                             (int)sym->module_prefix_len, sym->module_prefix,
-                             (int)ilen, iname);
-                    } else if (e->current_module) {
-                        /* Variable in current module context */
-                        emit(e, "%.*s__%.*s",
-                             (int)e->current_module_len, e->current_module,
-                             (int)ilen, iname);
-                    } else {
-                        /* Main module referencing imported variable */
-                        emit(e, "%.*s__%.*s",
-                             (int)sym->module_prefix_len, sym->module_prefix,
-                             (int)ilen, iname);
+                /* BUG-1120: ONE rule for which module a non-local name belongs to.
+                 * If the current module registered it (its own global, function or
+                 * static all have the mangled key `<module>__<name>`), it is this
+                 * module's; otherwise it is whoever owns the raw entry. The old
+                 * split guessed: a FUNCTION always took the raw entry's module
+                 * (two modules each defining `bump()` made module b call module
+                 * a's), and a VARIABLE always took the current module (module b
+                 * reading module a's `shared_total` emitted an undeclared
+                 * `mb__shared_total`). */
+                if (e->current_module) {
+                    uint32_t mkl = e->current_module_len + 2 + ilen;
+                    char *mk = (char *)arena_alloc(e->arena, mkl + 1);
+                    if (mk) {
+                        memcpy(mk, e->current_module, e->current_module_len);
+                        mk[e->current_module_len] = '_';
+                        mk[e->current_module_len + 1] = '_';
+                        memcpy(mk + e->current_module_len + 2, iname, ilen);
+                        mk[mkl] = '\0';
+                        if (scope_lookup_local(e->checker->global_scope, mk, mkl)) {
+                            emit(e, "%.*s__%.*s",
+                                 (int)e->current_module_len, e->current_module,
+                                 (int)ilen, iname);
+                            return;
+                        }
                     }
+                }
+                if (sym && sym->module_prefix) {
+                    emit(e, "%.*s__%.*s",
+                         (int)sym->module_prefix_len, sym->module_prefix,
+                         (int)ilen, iname);
                     return;
                 }
                 /* No symbol found — if in a module context, assume
@@ -7133,7 +8603,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ", ");
                 emit_rewritten_node(e, node->binary.right, func);
-                emit(e, "); ");
+                emit(e, ", %d); ", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
                 emit_intn_mask_lv(e, rts, lvbuf);
                 emit(e, "%s; })", lvbuf);
                 return;
@@ -7142,7 +8612,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit_rewritten_node(e, node->binary.left, func);
             emit(e, ", ");
             emit_rewritten_node(e, node->binary.right, func);
-            emit(e, ")");
+            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
             return;
         }
         /* BUG-604: signed division overflow (INT_MIN / -1 is C UB).
@@ -7169,11 +8639,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->binary.left, func);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_rewritten_node(e, node->binary.left, func);
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit(e, "(");
@@ -7294,26 +8762,26 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (ot_eff->kind == TYPE_HANDLE) {
                     Type *elem = ot_eff->handle.elem;
                     /* Find allocator for this handle */
-                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    /* BUG-1053: the checker's resolution (slab_source first), not
+                     * a fresh unique-allocator search, which is NULL as soon as
+                     * two allocators of this element type exist and used to
+                     * emit a literal `0` for the read (and `0 = v` for a write). */
+                    Symbol *alloc_sym = node->field.handle_alloc
+                        ? node->field.handle_alloc
+                        : find_unique_allocator(e->checker->global_scope, elem);
                     if (alloc_sym) {
                         Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
                         if (alloc_type->kind == TYPE_SLAB) {
                             emit(e, "((");
                             emit_type(e, type_pointer(e->arena, elem));
-                            emit(e, ")_zer_slab_get(&%.*s, ",
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                             emit_rewritten_node(e, node->field.object, func);
                             emit(e, "))->%.*s",
                                  (int)node->field.field_name_len, node->field.field_name);
                         } else if (alloc_type->kind == TYPE_POOL) {
                             emit(e, "((");
                             emit_type(e, type_pointer(e->arena, elem));
-                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                                 "sizeof(%.*s.slots[0]), ",
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                             emit_rewritten_node(e, node->field.object, func);
                             emit(e, ", %llu))->%.*s",
                                  (unsigned long long)alloc_type->pool.count,
@@ -7442,21 +8910,17 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 /* Handle auto-deref: emit get() → -> */
                 if (oe->kind == TYPE_HANDLE) {
                     Type *elem = oe->handle.elem;
-                    Symbol *alloc_sym = find_unique_allocator(e->checker->global_scope, elem);
+                    Symbol *alloc_sym = node->field.handle_alloc   /* BUG-1053 */
+                        ? node->field.handle_alloc
+                        : find_unique_allocator(e->checker->global_scope, elem);
                     if (alloc_sym) {
                         Type *alloc_type = type_unwrap_distinct(alloc_sym->type);
                         emit(e, "((");
                         emit_type(e, type_pointer(e->arena, elem));
                         if (alloc_type->kind == TYPE_SLAB) {
-                            emit(e, ")_zer_slab_get(&%.*s, ",
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_slab_get(&"); emit_alloc_sym_cname(e, alloc_sym); emit(e, ", ");
                         } else if (alloc_type->kind == TYPE_POOL) {
-                            emit(e, ")_zer_pool_get(%.*s.slots, %.*s.gen, %.*s.used, "
-                                 "sizeof(%.*s.slots[0]), ",
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name,
-                                 (int)alloc_sym->name_len, alloc_sym->name);
+                            emit(e, ")_zer_pool_get("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".gen, "); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".used, sizeof("); emit_alloc_sym_cname(e, alloc_sym); emit(e, ".slots[0]), ");
                         }
                         emit_rewritten_node(e, node->field.object, func);
                         if (alloc_type->kind == TYPE_POOL)
@@ -7511,6 +8975,15 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * statement-expression branch. */
         if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
+        /* BUG-1098: an ident index the checker declined to auto-guard because the
+         * statement may change it — the check and the access must read it ONCE,
+         * whatever order C evaluates the rest of the statement in (the comma form
+         * reads it twice, and `(check(i), a)[i] = g()` leaves g() unsequenced
+         * against both reads). */
+        if (idx_array && node->index_expr.index->kind == NODE_IDENT &&
+            !checker_is_proven(e->checker, node) &&
+            !checker_has_auto_guard(e->checker, node))
+            idx_se = true;
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
@@ -7541,8 +9014,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     * on purpose (the guard would read it once and the access again),
                     * so it must take THIS single-evaluation form instead: one load
                     * into a temp, the check and the access both on the temp. */
+                   /* BUG-1098: and an IDENT the checker declined to auto-guard
+                    * (the statement can change it before this read, so a hoisted
+                    * guard would test a stale value) — the general rule is that
+                    * an unproven access with no guard carries its own check. */
                    (node->index_expr.index->kind != NODE_IDENT ||
-                    expr_is_volatile(e, node->index_expr.index)) &&
+                    expr_is_volatile(e, node->index_expr.index) ||
+                    !checker_has_auto_guard(e->checker, node)) &&
                    /* BH-18 #5 (copied from cool-johnson-t8vr3h): a bare-CALL index
                     * on a fixed array previously fell through to the raw emit,
                     * relying on the auto-guard pre-pass — which only fires for
@@ -7606,40 +9084,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
          * are handled by the dedicated cases below and don't carry a scalar
          * uN/iN type here). /= %= >>= can't exceed the width (result magnitude ≤
          * operand) so they keep their existing div-guard / shift paths. */
-        if (type_is_nonnative_intn(tgt_type)) {
-            TokenType aop = node->assign.op;
-            if (aop == TOK_EQ || aop == TOK_PLUSEQ || aop == TOK_MINUSEQ ||
-                aop == TOK_STAREQ || aop == TOK_AMPEQ || aop == TOK_PIPEEQ ||
-                aop == TOK_CARETEQ || aop == TOK_LSHIFTEQ) {
-                int tmp = e->temp_count++;
-                char lv[40];
-                snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
-                emit(e, "({ __typeof__(");
-                emit_rewritten_node(e, node->assign.target, func);
-                emit(e, ") *_zer_np%d = &(", tmp);
-                emit_rewritten_node(e, node->assign.target, func);
-                emit(e, "); ");
-                if (aop == TOK_EQ) {
-                    emit(e, "%s = (", lv);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, "); ");
-                } else if (aop == TOK_LSHIFTEQ) {
-                    emit(e, "%s = _zer_shl(%s, (", lv, lv);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, ")); ");
-                } else {
-                    const char *cop = aop==TOK_PLUSEQ?"+":aop==TOK_MINUSEQ?"-":
-                                      aop==TOK_STAREQ?"*":aop==TOK_AMPEQ?"&":
-                                      aop==TOK_PIPEEQ?"|":"^";
-                    emit(e, "%s = (%s %s (", lv, lv, cop);
-                    emit_rewritten_node(e, node->assign.value, func);
-                    emit(e, ")); ");
-                }
-                emit_intn_mask_lv(e, tgt_type, lv);
-                emit(e, "})");
-                return;
-            }
-        }
+        if (emit_intn_store(e, node, func, emit_rewritten_node)) return;   /* BUG-1162 */
 
         /* BUG-582: Union variant assignment — port from emit_expr (line 1210+)
          * with extension: also handle `u.variant[i] = val` and deeper chains
@@ -7736,61 +9181,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             }
         }
 
-        /* Bit extract SET: reg[hi..lo] = val → shift/mask.
-         * Replicates emit_expr's BUG-210/216 handler using emit_rewritten_node. */
+        /* Bit extract SET: reg[hi..lo] OP= val — one emitter (BUG-1198). */
         if (node->assign.target && node->assign.target->kind == NODE_SLICE) {
-            Node *obj = node->assign.target->slice.object;
-            Node *hi_node = node->assign.target->slice.start;
-            Node *lo_node = node->assign.target->slice.end;
-            int btmp = e->temp_count++;
-            emit(e, "({ __typeof__(");
-            emit_rewritten_node(e, obj, func);
-            emit(e, ") *_zer_bp%d = &(", btmp);
-            emit_rewritten_node(e, obj, func);
-            emit(e, "); ");
-            int64_t const_hi = hi_node ? eval_const_expr(hi_node) : CONST_EVAL_FAIL;
-            int64_t const_lo = lo_node ? eval_const_expr(lo_node) : CONST_EVAL_FAIL;
-            bool bits_const = (const_hi != CONST_EVAL_FAIL && const_lo != CONST_EVAL_FAIL &&
-                               const_hi >= 0 && const_lo >= 0);
-            if (!bits_const && hi_node && lo_node) {
-                emit(e, "uint64_t _zer_bh%d = (uint64_t)(", btmp);
-                emit_rewritten_node(e, hi_node, func);
-                emit(e, "); uint64_t _zer_bl%d = (uint64_t)(", btmp);
-                emit_rewritten_node(e, lo_node, func);
-                emit(e, "); ");
-            }
-            emit(e, "*_zer_bp%d = (*_zer_bp%d & ~(", btmp, btmp);
-            if (hi_node && lo_node) {
-                if (bits_const) {
-                    int64_t width = const_hi - const_lo + 1;
-                    if (width >= 64) emit(e, "~(uint64_t)0");
-                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
-                    emit(e, " << %lld", (long long)const_lo);
-                } else {
-                    emit_bitslice_runtime_mask(e, btmp);
-                }
-            }
-            emit(e, ")) | (((uint64_t)(");
-            emit_bitslice_ir_value(e, node, func, btmp, bits_const, const_hi, const_lo,
-                                   hi_node, lo_node);
-            if (!bits_const && lo_node)
-                emit(e, ") << ((_zer_bl%d >= 64) ? 0 : _zer_bl%d)", btmp, btmp);
-            else if (bits_const)
-                emit(e, ") << %lld", (long long)const_lo);
-            else
-                emit(e, ") << 0");
-            emit(e, ") & (");
-            if (hi_node && lo_node) {
-                if (bits_const) {
-                    int64_t width = const_hi - const_lo + 1;
-                    if (width >= 64) emit(e, "~(uint64_t)0");
-                    else emit(e, "((1ull << %lld) - 1)", (long long)width);
-                    emit(e, " << %lld", (long long)const_lo);
-                } else {
-                    emit_bitslice_runtime_mask(e, btmp);
-                }
-            }
-            emit(e, ")); })");
+            emit_bitslice_set(e, node, func, emit_rewritten_node);
             return;
         }
         /* Array assignment — memcpy/byte-loop */
@@ -7854,20 +9247,21 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * NODE_INDEX.index — silently double-evaluating fn(). */
             bool shift_side_effect = expr_has_side_effects(node->assign.target);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
+            int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
                 int tmp = e->temp_count++;
                 emit(e, "({ __auto_type _zer_sp%d = &(", tmp);
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, "); *_zer_sp%d = %s(*_zer_sp%d, ", tmp, macro, tmp);
                 emit_rewritten_node(e, node->assign.value, func);
-                emit(e, "); })");
+                emit(e, ", %d); })", shw);
             } else {
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, " = %s(", macro);
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, ", ");
                 emit_rewritten_node(e, node->assign.value, func);
-                emit(e, ")");
+                emit(e, ", %d)", shw);
             }
             return;
         }
@@ -7902,11 +9296,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 if (is_signed_div) {
                     emit(e, "if (_zer_dv%d == -1) { __typeof__(*_zer_dp%d) _zer_dd%d = *_zer_dp%d; ",
                          tmp, tmp, tmp, tmp);
-                    int w = type_width(div_type);
-                    if (w == 8) emit(e, "if (_zer_dd%d == -128) ", tmp);
-                    else if (w == 16) emit(e, "if (_zer_dd%d == -32768) ", tmp);
-                    else if (w == 32) emit(e, "if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                    else emit(e, "if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                    /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                    char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                    emit(e, "if (_zer_dd%d == %s) ", tmp, dmin);
                     emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
                 }
                 emit(e, "*_zer_dp%d %s= _zer_dv%d; })", tmp, cop, tmp);
@@ -7923,11 +9315,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->assign.target, func);
                 emit(e, ") _zer_dd%d = ", tmp);
                 emit_rewritten_node(e, node->assign.target, func);
-                int w = type_width(div_type);
-                if (w == 8) emit(e, "; if (_zer_dd%d == -128) ", tmp);
-                else if (w == 16) emit(e, "; if (_zer_dd%d == -32768) ", tmp);
-                else if (w == 32) emit(e, "; if (_zer_dd%d == (-2147483647-1)) ", tmp);
-                else emit(e, "; if (_zer_dd%d == (-9223372036854775807LL-1)) ", tmp);
+                /* BUG-1062: the MIN of THIS width, incl. iN and i128. */
+                char dmin[96]; signed_min_text(div_type, dmin, sizeof dmin);
+                emit(e, "; if (_zer_dd%d == %s) ", tmp, dmin);
                 emit(e, "_zer_trap(\"signed division overflow\", __FILE__, __LINE__); } ");
             }
             emit_rewritten_node(e, node->assign.target, func);
@@ -8028,17 +9418,19 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 Type *sl = type_unwrap_distinct(rt)->optional.inner;  /* [*]T  */
                 if (sl && type_dispatch_kind(sl) == TYPE_SLICE) {
                     Type *elem = type_unwrap_distinct(sl)->slice.inner; /* T */
-                    Type *ee = type_unwrap_distinct(elem);
                     int t = e->temp_count++;
                     emit(e, "({size_t _zer_hn%d=", t);
                     emit_rewritten_node(e, node->call.args[1], func);
                     emit(e, ";void *_zer_hp%d=calloc(_zer_hn%d,sizeof(", t, t);
-                    if (type_dispatch_kind(elem) == TYPE_STRUCT)
-                        emit(e, "struct %.*s", (int)ee->struct_type.name_len, ee->struct_type.name);
-                    else emit_type(e, elem);
+                    /* BUG-1029: emit_type spells a struct WITH its module prefix
+                     * (`struct lib__Task`); the bare `struct Task` used here made
+                     * every alloc(T,n) inside an imported module a GCC
+                     * "incomplete type" error. BUG-1027: the cast needs the
+                     * funcptr/array declarator spelling, not `emit_type(T)*`. */
+                    emit_type(e, elem);
                     emit(e, "));_zer_hp%d?(", t);
                     emit_type(e, rt); emit(e, "){("); emit_type(e, sl); emit(e, "){(");
-                    emit_type(e, type_pointer(e->arena, elem));
+                    emit_ptr_to_elem(e, elem, false);
                     emit(e, ")_zer_hp%d,_zer_hn%d},1}:(", t, t);
                     emit_type(e, rt); emit(e, "){0};})");
                     return;
@@ -8099,7 +9491,18 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 }
             }
         }
-        emit_rewritten_node(e, node->call.callee, func);
+        /* BUG-1019: same guard on the IR-rewritten dispatch path. */
+        if (call_needs_null_funcptr_guard(e, node->call.callee)) {
+            int fpt = e->temp_count++;
+            emit(e, "({ __typeof__(");
+            emit_rewritten_node(e, node->call.callee, func);
+            emit(e, ") _zer_fp%d = ", fpt);
+            emit_rewritten_node(e, node->call.callee, func);
+            emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                    "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
+        } else {
+            emit_rewritten_node(e, node->call.callee, func);
+        }
         emit(e, "(");
         for (int i = 0; i < node->call.arg_count; i++) {
             if (i > 0) emit(e, ", ");
@@ -8148,6 +9551,12 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     Type *t = resolve_type_for_emit(e, ta);
                     if (t) emit_type(e, t);
                 }
+            } else if (node->intrinsic.arg_count > 0 &&
+                       node->intrinsic.args[0]->kind == NODE_IDENT &&
+                       checker_get_type(e->checker, node->intrinsic.args[0])) {
+                /* BUG-1038 — IR-path twin of the AST-path arm: the checker's
+                 * resolved type of the operand (type name / uN / variable). */
+                emit_type(e, checker_get_type(e->checker, node->intrinsic.args[0]));
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* @size(TypeName) — type name passed as ident arg */
@@ -8222,56 +9631,11 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 bool sat_enum = t && type_carries_enum_e(t, 0);
                 int seg = sat_enum ? e->temp_count++ : 0;
                 if (sat_enum) { emit(e, "({ "); emit_type(e, t); emit(e, " _zer_seg%d = (", seg); }
-                emit(e, "({__auto_type _zer_sat%d = ", tmp);
-                if (node->intrinsic.arg_count > 0)
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                emit(e, "; ");
-                int w = type_width(t);
-                bool is_signed = type_is_signed(t);
-                if (is_signed) {
-                    /* For w == 64, the literal min INT64_MIN = -9223372036854775808
-                     * cannot be written as `-9223372036854775808LL` — C parses that as
-                     * unary-minus applied to a literal that overflows i64, triggering
-                     * "integer constant is so large that it is unsigned" warnings (and
-                     * `-Werror` failures). Emit `(LLONG_MIN_LITERAL)` for w==64 and
-                     * the direct form for smaller widths. */
-                    int64_t max_v = (1LL << (w - 1)) - 1;
-                    if (w == 64) {
-                        emit(e, "_zer_sat%d < (-9223372036854775807LL - 1) ? (-9223372036854775807LL - 1) : "
-                                "_zer_sat%d > %lldLL ? (%lldLL) : (",
-                             tmp, tmp, (long long)max_v, (long long)max_v);
-                    } else {
-                        int64_t min_v = -(1LL << (w - 1));
-                        emit(e, "_zer_sat%d < %lldLL ? (%lldLL) : _zer_sat%d > %lldLL ? (%lldLL) : (",
-                             tmp, (long long)min_v, (long long)min_v,
-                             tmp, (long long)max_v, (long long)max_v);
-                    }
-                } else {
-                    /* Unsigned target: clamp below 0 AND above max. The lower/upper
-                     * comparisons MUST be done in the SOURCE's own type — the old
-                     * `(int64_t)_zer_sat` cast misread a large UNSIGNED source (value
-                     * >= 2^63, e.g. `@saturate(u32, 18e18)`) as negative, clamping it
-                     * to 0 instead of the target max. `_zer_sat` is `__auto_type` (the
-                     * source type), so a bare `_zer_sat < 0` is always-false for an
-                     * unsigned source (no lower clamp) and true for a signed source
-                     * (BUG-546). Mirrors the AST path (emitter.c ~3040). */
-                    const char *max_cmp, *max_val;
-                    /* #13: compute the max from the target WIDTH so non-native uN
-                     * (u7/u12/u21 …) clamp to 2^N-1. The old {8,16,32,else→64} switch
-                     * sent every odd width to the u64 branch (never clamped). */
-                    char max_buf[32];
-                    if (w >= 64) { max_cmp = "18446744073709551615.0"; max_val = "18446744073709551615ULL"; }
-                    else {
-                        unsigned long long mx = (1ULL << w) - 1ULL;
-                        snprintf(max_buf, sizeof max_buf, "%lluULL", mx);
-                        max_cmp = max_buf; max_val = max_buf;
-                    }
-                    emit(e, "_zer_sat%d < 0 ? 0 : "
-                             "_zer_sat%d > %s ? (%s) : (",
-                         tmp, tmp, max_cmp, max_val);
-                }
-                emit_type(e, t);
-                emit(e, ")_zer_sat%d; })", tmp);
+                Node *sat_arg = node->intrinsic.arg_count > 0 ? node->intrinsic.args[0] : NULL;
+                emit_saturate_open(e, sat_arg, tmp);
+                if (sat_arg) emit_rewritten_node(e, sat_arg, func);
+                else emit(e, "0");
+                emit_saturate_close(e, sat_arg, t, tmp);
                 if (sat_enum) {
                     char segp[40]; snprintf(segp, sizeof segp, "_zer_seg%d", seg);
                     emit(e, "); ");
@@ -8339,8 +9703,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
             } else if (node->intrinsic.arg_count >= 2) {
                 /* Named type: args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit_offset_type_operand(e, node->intrinsic.args[0]);   /* BUG-1215 */
                 emit(e, ", ");
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
             }
@@ -8369,9 +9732,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 uint32_t tid = 0;
                 if (src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 if (node->intrinsic.arg_count > 0)
@@ -8386,9 +9747,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0) {
                     int tmp = e->temp_count++;
@@ -8431,17 +9790,13 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             uint32_t src_tid = 0;
             if (src_eff && src_eff->kind == TYPE_POINTER && src_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) src_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) src_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) src_tid = inner->union_type.type_id;
+                src_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             uint32_t tgt_tid = 0;
             if (tgt_eff && tgt_eff->kind == TYPE_POINTER && tgt_eff->pointer.inner) {
                 Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                if (inner->kind == TYPE_STRUCT) tgt_tid = inner->struct_type.type_id;
-                else if (inner->kind == TYPE_ENUM) tgt_tid = inner->enum_type.type_id;
-                else if (inner->kind == TYPE_UNION) tgt_tid = inner->union_type.type_id;
+                tgt_tid = opaque_type_id_nominal(inner);   /* @pun: nominal ids only (BUG-1166) */
             }
 
             bool src_is_opaque = (src_eff &&
@@ -8498,57 +9853,7 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
              * validated at compile time by the checker. Variable addresses
              * need runtime range check (must fall in declared mmio range)
              * and runtime alignment check (must match target type). */
-            if (node->intrinsic.type_arg) {
-                Type *t = resolve_tynode(e, node->intrinsic.type_arg);
-                /* GAP-2 fix (BUG-736): see AST sibling in emit_expr — the
-                 * alignment check is target-type-driven and emitted even
-                 * with zero declared mmio ranges (--no-strict-mmio path);
-                 * only the range check is gated on declarations. */
-                bool g2_var_addr = node->intrinsic.arg_count > 0 &&
-                    node->intrinsic.args[0]->kind != NODE_INT_LIT;
-                Type *g2_inner = t ? type_unwrap_distinct(t) : NULL;
-                if (g2_inner && type_dispatch_kind(g2_inner) == TYPE_POINTER)
-                    g2_inner = g2_inner->pointer.inner;
-                /* F4: alignment via type_alignment_bytes (aggregate-aware). */
-                int g2_align = g2_inner ? type_alignment_bytes(g2_inner) : 0;
-                bool need_range_check = e->checker->mmio_range_count > 0 && g2_var_addr;
-                bool need_align_check = g2_align > 1 && g2_var_addr;
-                if (need_range_check || need_align_check) {
-                    int tmp = e->temp_count++;
-                    emit(e, "({ uintptr_t _zer_ma%d = (uintptr_t)(", tmp);
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, "); ");
-                    if (need_range_check) {
-                        /* plt86m audit 2026-06-17: span-aware (see AST path).
-                         * F4: span = sizeof(target) via C sizeof (aggregate-correct). */
-                        emit(e, "if (!(");
-                        for (int ri = 0; ri < e->checker->mmio_range_count; ri++) {
-                            if (ri > 0) emit(e, " || ");
-                            emit(e, "(_zer_ma%d >= 0x%llxULL && _zer_ma%d + (sizeof(",
-                                 tmp, (unsigned long long)e->checker->mmio_ranges[ri][0], tmp);
-                            if (g2_inner) emit_type(e, g2_inner); else emit(e, "char");
-                            emit(e, ") - 1ULL) <= 0x%llxULL)",
-                                 (unsigned long long)e->checker->mmio_ranges[ri][1]);
-                        }
-                        emit(e, ")) _zer_trap(\"@inttoptr: address outside mmio range\", __FILE__, __LINE__); ");
-                    }
-                    /* Runtime alignment check for variable address */
-                    if (need_align_check) {
-                        emit(e, "if (_zer_ma%d %% %d != 0) _zer_trap(\"@inttoptr: unaligned address\", __FILE__, __LINE__); ",
-                             tmp, g2_align);
-                    }
-                    emit(e, "(");
-                    emit_type(e, t);
-                    emit(e, ")_zer_ma%d; })", tmp);
-                } else {
-                    emit(e, "((");
-                    emit_type(e, t);
-                    emit(e, ")(uintptr_t)(");
-                    if (node->intrinsic.arg_count > 0)
-                        emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, "))");
-                }
-            }
+            emit_inttoptr(e, node, func);   /* BUG-1058: one emission, both paths */
         } else if (nlen == 9 && memcmp(name, "container", 9) == 0) {
             /* @container(*T, ptr, field) → container_of */
             if (node->intrinsic.type_arg && node->intrinsic.arg_count >= 2) {
@@ -8878,8 +10183,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"int3\");\n"
-                "#elif defined(__aarch64__) || defined(__ARM_ARCH)\n"
+                "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"brk #0\");\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    __asm__ __volatile__ (\"bkpt #0\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"ebreak\");\n"
                 "#else\n"
@@ -9711,7 +11018,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"cli\" ::: \"memory\");\n"
-                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr daifset, #2\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
                 "    __asm__ __volatile__ (\"cpsid i\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrci mstatus, 8\" ::: \"memory\");\n"
@@ -9724,7 +11033,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             emit(e, "({\n"
                 "#if defined(__x86_64__) || defined(__i386__)\n"
                 "    __asm__ __volatile__ (\"sti\" ::: \"memory\");\n"
-                "#elif defined(__ARM_ARCH) || defined(__aarch64__)\n"
+                "#elif defined(__aarch64__)\n"
+                "    __asm__ __volatile__ (\"msr daifclr, #2\" ::: \"memory\");\n"
+                "#elif defined(__ARM_ARCH)\n"
                 "    __asm__ __volatile__ (\"cpsie i\" ::: \"memory\");\n"
                 "#elif defined(__riscv)\n"
                 "    __asm__ __volatile__ (\"csrsi mstatus, 8\" ::: \"memory\");\n"
@@ -9752,8 +11063,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    __asm__ __volatile__ (\"pushfl; popl %0\" : \"=r\"(_zer_istate) :: \"memory\");\n"
                 "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"mrs %0, daif\" : \"=r\"(_zer_istate) :: \"memory\");\n"
-                "#elif defined(__ARM_ARCH)\n"
+                "#elif defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n"
                 "    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, primask\" : \"=r\"(_zer_p) :: \"memory\"); _zer_istate = _zer_p; }\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_p; __asm__ __volatile__ (\"mrs %0, cpsr\" : \"=r\"(_zer_p) :: \"memory\"); _zer_istate = _zer_p; }\n"
                 "#elif defined(__riscv)\n"
                 "    { unsigned long _zer_m; __asm__ __volatile__ (\"csrr %0, mstatus\" : \"=r\"(_zer_m) :: \"memory\"); _zer_istate = _zer_m; }\n"
                 "#else\n"
@@ -10052,8 +11365,10 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"pushl %0; popfl\" :: \"r\"(_zer_r32) : \"memory\", \"cc\"); }\n"
                 "#elif defined(__aarch64__)\n"
                 "    __asm__ __volatile__ (\"msr daif, %0\" :: \"r\"(_zer_rstate) : \"memory\");\n"
-                "#elif defined(__ARM_ARCH)\n"
+                "#elif defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n"
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr primask, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
+                "#elif defined(__ARM_ARCH)\n"
+                "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr cpsr_c, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
                 "#elif defined(__riscv)\n"
                 "    { unsigned long _zer_m = (unsigned long)_zer_rstate; __asm__ __volatile__ (\"csrw mstatus, %0\" :: \"r\"(_zer_m) : \"memory\"); }\n"
                 "#else\n"
@@ -10352,7 +11667,9 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
             else emit(e, "0");
             emit_try_enum_close(e, node->intrinsic.type_arg
-                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL,
+                                node->intrinsic.arg_count > 0
+                                   ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0 && node->intrinsic.arg_count > 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -10433,13 +11750,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
             int objbits = type_width(obj_eff);
             if (objbits <= 0) objbits = 64;
             int t = e->temp_count++;
-            emit(e, "({ int _zer_hi%d = (int)(", t);
+            /* BUG-1198: uint64_t positions (see the AST twin). */
+            emit(e, "({ uint64_t _zer_hi%d = (uint64_t)(", t);
             emit_rewritten_node(e, node->slice.start, func);
-            emit(e, "); int _zer_lo%d = (int)(", t);
+            emit(e, "); uint64_t _zer_lo%d = (uint64_t)(", t);
             emit_rewritten_node(e, node->slice.end, func);
-            emit(e, "); int _zer_w%d = _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", t, t, t, t, objbits, ucast);
+            emit(e, "); uint64_t _zer_w%d = (_zer_hi%d < _zer_lo%d) ? 0 : _zer_hi%d - _zer_lo%d + 1; (((_zer_lo%d >= %d) ? (uint64_t)0 : (%s", t, t, t, t, t, t, objbits, ucast);
             emit_rewritten_node(e, node->slice.object, func);
-            emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d <= 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
+            emit(e, " >> _zer_lo%d)) & ((_zer_w%d >= 64) ? ~(uint64_t)0 : (_zer_w%d == 0) ? (uint64_t)0 : ((1ull << _zer_w%d) - 1))); })",
                  t, t, t, t);
             return;
         }
@@ -10652,16 +11970,30 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
     case NODE_STRUCT_INIT: {
         /* Should be handled by IR_STRUCT_INIT_DECOMP, but fallback */
         Type *si_type = checker_get_type(e->checker, node);
+        bool si_arr = e->global_init_depth == 0 &&
+                      struct_init_names_array_field(si_type, node);   /* BUG-1157 */
+        int si_tmp = si_arr ? e->temp_count++ : 0;
+        if (si_arr) {
+            emit(e, "({ ");
+            emit_type(e, si_type);
+            emit(e, " _zer_si%d = ", si_tmp);
+        }
         if (si_type) {
             emit(e, "(");
             emit_type(e, si_type);
             emit(e, ")");
         }
         emit(e, "{ ");
+        bool si_first = true;
         for (int i = 0; i < node->struct_init.field_count; i++) {
-            if (i > 0) emit(e, ", ");
             const char *fname = node->struct_init.fields[i].name;
             uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+            if (si_arr) {
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (aft && type_dispatch_kind(aft) == TYPE_ARRAY) continue;
+            }
+            if (!si_first) emit(e, ", ");
+            si_first = false;
             emit(e, ".%.*s = ", (int)fname_len, fname);
             Node *fval = node->struct_init.fields[i].value;
             /* F21: wrap a scalar into a value-optional field {val,1} (the
@@ -10693,7 +12025,20 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, fval, func);
             }
         }
+        if (si_first && si_arr) emit(e, "0");
         emit(e, " }");
+        if (si_arr) {
+            for (int i = 0; i < node->struct_init.field_count; i++) {
+                const char *fname = node->struct_init.fields[i].name;
+                uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
+                Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
+                if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
+                emit(e, "; memcpy(&_zer_si%d.%.*s, (", si_tmp, (int)fname_len, fname);
+                emit_rewritten_node(e, node->struct_init.fields[i].value, func);
+                emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
+            }
+            emit(e, "; _zer_si%d; })", si_tmp);
+        }
         return;
     }
 
@@ -11039,6 +12384,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     switch (inst->op) {
 
     case IR_ASSIGN: {
+        /* BUG-1221: re-zero a declaration that executes again (see ir_lower). */
+        if (inst->zero_dest && inst->dest_local >= 0) {
+            emit(e, "memset((void *)&");
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, ", 0, sizeof(");
+            emit_local_name(e, func, inst->dest_local);
+            emit(e, "));\n");
+            break;
+        }
         if (inst->dest_local >= 0 && inst->expr) {
             IRLocal *dest = &func->locals[inst->dest_local];
 
@@ -11184,105 +12538,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     if (ct_eff->kind == TYPE_FUNC_PTR) callee_ft = ct_eff;
                 }
             }
-            /* Emit callee: simple ident or field access (funcptr through struct) */
-            if (inst->func_name) {
-                /* Check for cross-module function needing mangled name */
-                Symbol *fsym = scope_lookup(e->checker->global_scope,
-                    inst->func_name, inst->func_name_len);
-                if (fsym && fsym->is_function && fsym->module_prefix) {
-                    emit(e, "%.*s__%.*s(",
-                         (int)fsym->module_prefix_len, fsym->module_prefix,
-                         (int)inst->func_name_len, inst->func_name);
+            /* Emit callee (BUG-1019: guarded when the call is indirect — this is
+             * the path that emitted the raw `g_ops[0](...)` through NULL). */
+            {
+                Node *icallee = (inst->expr && inst->expr->kind == NODE_CALL)
+                                  ? inst->expr->call.callee : NULL;
+                bool guard = icallee && call_needs_null_funcptr_guard(e, icallee);
+                if (guard) {
+                    int fpt = e->temp_count++;
+                    emit(e, "({ __typeof__(");
+                    emit_ir_call_callee(e, inst, func);
+                    emit(e, ") _zer_fp%d = ", fpt);
+                    emit_ir_call_callee(e, inst, func);
+                    emit(e, "; if (!_zer_fp%d) _zer_trap(\"call through a null function "
+                            "pointer\", __FILE__, __LINE__); _zer_fp%d; })", fpt, fpt);
                 } else {
-                    emit(e, "%.*s(", (int)inst->func_name_len, inst->func_name);
+                    emit_ir_call_callee(e, inst, func);
                 }
-            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
-                       inst->expr->call.callee &&
-                       inst->expr->call.callee->kind == NODE_FIELD) {
-                /* Struct field callee: obj.method or obj->method */
-                Node *callee = inst->expr->call.callee;
-                /* Emit object name from local or rewritten ident */
-                if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
-                    int obj_id = -1;
-                    for (int li = 0; li < func->local_count; li++) {
-                        if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
-                            memcmp(func->locals[li].name, callee->field.object->ident.name,
-                                   func->locals[li].name_len) == 0) {
-                            obj_id = li; break;
-                        }
-                    }
-                    if (obj_id >= 0) {
-                        Type *ot = func->locals[obj_id].type;
-                        Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
-                        emit_local_name(e, func, obj_id);
-                        emit(e, "%s%.*s(",
-                             (ot_eff && ot_eff->kind == TYPE_POINTER) ? "->" : ".",
-                             (int)callee->field.field_name_len, callee->field.field_name);
-                    } else {
-                        /* Global/extern funcptr */
-                        emit(e, "%.*s.%.*s(",
-                             (int)callee->field.object->ident.name_len,
-                             callee->field.object->ident.name,
-                             (int)callee->field.field_name_len, callee->field.field_name);
-                    }
-                } else {
-                    emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
-                }
-            } else if (inst->expr && inst->expr->kind == NODE_CALL &&
-                       inst->expr->call.callee &&
-                       inst->expr->call.callee->kind == NODE_INDEX) {
-                /* Array-indexed funcptr: arr[i](args) */
-                Node *idx_callee = inst->expr->call.callee;
-                if (idx_callee->index_expr.object->kind == NODE_IDENT) {
-                    int arr_id = -1;
-                    for (int li = 0; li < func->local_count; li++) {
-                        if (func->locals[li].name_len == (uint32_t)idx_callee->index_expr.object->ident.name_len &&
-                            memcmp(func->locals[li].name, idx_callee->index_expr.object->ident.name,
-                                   func->locals[li].name_len) == 0) {
-                            arr_id = li; break;
-                        }
-                    }
-                    if (arr_id >= 0) {
-                        emit_local_name(e, func, arr_id);
-                    } else {
-                        /* Global array */
-                        emit(e, "%.*s", (int)idx_callee->index_expr.object->ident.name_len,
-                             idx_callee->index_expr.object->ident.name);
-                    }
-                    emit(e, "[");
-                    /* Index expression — support NODE_IDENT (local or global)
-                     * and NODE_INT_LIT (constant). BUG-587: the old "non-ident
-                     * fallback" emitted literal `0` for every non-ident index,
-                     * so `ops[0](...)` and `ops[1](...)` both became `ops[0](...)`. */
-                    Node *idx_node = idx_callee->index_expr.index;
-                    if (idx_node->kind == NODE_IDENT) {
-                        int idx_id = -1;
-                        for (int li = 0; li < func->local_count; li++) {
-                            if (func->locals[li].name_len == (uint32_t)idx_node->ident.name_len &&
-                                memcmp(func->locals[li].name, idx_node->ident.name,
-                                       func->locals[li].name_len) == 0) {
-                                idx_id = li; break;
-                            }
-                        }
-                        if (idx_id >= 0)
-                            emit_local_name(e, func, idx_id);
-                        else
-                            emit(e, "%.*s", (int)idx_node->ident.name_len,
-                                 idx_node->ident.name);
-                    } else if (idx_node->kind == NODE_INT_LIT) {
-                        emit(e, "%llu", (unsigned long long)idx_node->int_lit.value);
-                    } else {
-                        /* Fallback: emit the index expression via the rewritten
-                         * AST emitter. Handles complex cases like arr[i+1] or
-                         * arr[func()]. */
-                        emit_rewritten_node(e, idx_node, func);
-                    }
-                    emit(e, "](");
-                } else {
-                    emit_unreachable(e, "this indexed call target", inst->expr);   /* BUG-851 */
-                }
-            } else {
-                emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
+                emit(e, "(");
             }
             for (int i = 0; i < inst->call_arg_local_count; i++) {
                 if (i > 0) emit(e, ", ");
@@ -11748,8 +13021,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * @critical, returning would skip the interrupt re-enable. Same emitted
          * text as the C-level guard used, now with the CFG knowing the path ends. */
         emit_indent(e);
-        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
-                "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
+        if (inst->literal_kind == 1)   /* BUG-1222 */
+            emit(e, "_zer_trap(\"out-of-bounds access in a function whose return type has "
+                    "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
+                    "return early\", __FILE__, __LINE__);\n");
+        else
+            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+                    "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
         break;
 
     case IR_UNLOCK: {
@@ -11784,20 +13062,59 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit(e, "{ /* @critical */\n");
         e->indent++;
         emit_indent(e);
-        emit(e, "#if defined(__ARM_ARCH)\n");
-        emit_indent(e);
-        /* A7-6 (2026-07-03): the "memory" clobber makes the interrupt-disable a
+        /* BUG-1020 (2026-09-15): the ARM and RISC-V arms used to key on the ARCH
+         * macro ALONE, while x86 was gated on `!_ZER_HOSTED`. That asymmetry was
+         * recorded as deliberate ("ARM, RISC-V and AVR have always emitted the
+         * correct interrupt-disable sequence regardless of __STDC_HOSTED__") —
+         * true for BARE METAL, and wrong for hosted, where the correct sequence
+         * is the fence because user mode cannot mask interrupts. Measured with
+         * real cross-toolchains rather than argued:
+         *
+         *   aarch64-linux-gnu-gcc : BUILD FAILS — `mrs x0, primask` / `cpsid i`
+         *                           are ARMv7-M encodings that do not exist on
+         *                           ARMv8-A. So `@critical` could not be compiled
+         *                           at all for 64-bit Raspberry Pi OS, Apple
+         *                           silicon Linux, Graviton, …
+         *   arm-linux-gnueabihf   : BUILD FAILS — "selected processor does not
+         *                           support requested special purpose register"
+         *                           (PRIMASK is M-profile only).
+         *   riscv64-linux-gnu-gcc : BUILDS CLEAN — and `csrrci mstatus` is a
+         *                           MACHINE-mode CSR, so it faults at run time in
+         *                           user mode. That is the silent one.
+         *
+         * PRIMASK exists only on ARM M-profile, so the M arm is selected by
+         * PROFILE rather than by hosted-ness — that is the precise fact, and it
+         * keeps Cortex-M bare metal working whether or not the build passes
+         * -ffreestanding. A/R-profile and aarch64 bare metal get their own
+         * correct sequences (CPSR + `cpsid i`, and DAIF + `msr daifset, #2`),
+         * which previously did not build either.
+         *
+         * AVR is deliberately NOT gated on _ZER_HOSTED: avr-gcc reports
+         * __STDC_HOSTED__ == 1 by default, so gating it would silently downgrade
+         * every AVR build that does not pass -ffreestanding to a fence — the exact
+         * regression this arm's x86 sibling was written to fix.
+         *
+         * A7-6 (2026-07-03): the "memory" clobber makes the interrupt-disable a
          * COMPILER barrier — without it GCC may hoist non-volatile loads/stores
          * across `cpsid i`/`cli`/`csrrci`, defeating the critical section for
-         * anything the volatile-global rule misses. The x86 arms already had it
-         * (Gap 10, 2026-05-16); ARM/AVR/RISC-V did not. */
+         * anything the volatile-global rule misses. */
+        emit(e, "#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n");
+        emit_indent(e);
         emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask) :: \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "uint64_t _zer_daif; __asm__ __volatile__(\"mrs %%0, daif\\n\\tmsr daifset, #2\" : \"=r\"(_zer_daif) :: \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "uint32_t _zer_cpsr; __asm__ __volatile__(\"mrs %%0, cpsr\\n\\tcpsid i\" : \"=r\"(_zer_cpsr) :: \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
         emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\" ::: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
         emit_indent(e);
         emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus) :: \"memory\");\n");
         emit_indent(e);
@@ -11824,9 +13141,23 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_CRITICAL_END: {
         if (e->noreturn_scope_depth > 0) e->noreturn_scope_depth--;   /* BUG-835 */
         emit_indent(e);
-        emit(e, "#if defined(__ARM_ARCH)\n");
+        /* BUG-1020: mirrors IR_CRITICAL_BEGIN's cascade exactly — the two must
+         * agree arm for arm, or a block saves state one way and restores it
+         * another. Restoring the WHOLE saved word (PRIMASK / DAIF / CPSR /
+         * mstatus / EFLAGS) rather than unconditionally re-enabling is what makes
+         * nesting safe: an inner @critical inside an outer one leaves interrupts
+         * disabled on exit, as it must. */
+        emit(e, "#if defined(__ARM_ARCH_PROFILE) && (__ARM_ARCH_PROFILE == 'M')\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr daif, %%0\" :: \"r\"(_zer_daif) : \"memory\");\n");
+        emit_indent(e);
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit_indent(e);
+        emit(e, "__asm__ __volatile__(\"msr cpsr_c, %%0\" :: \"r\"(_zer_cpsr) : \"memory\");\n");
         emit_indent(e);
         emit(e, "#elif defined(__AVR__)\n");
         emit_indent(e);
@@ -11834,7 +13165,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * complete before interrupts return (SREG= is not a compiler barrier). */
         emit(e, "__asm__ __volatile__(\"\" ::: \"memory\"); SREG = _zer_sreg;\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus) : \"memory\");\n");
         emit_indent(e);
@@ -12075,6 +13406,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                     emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
                                     emit(e, ", .has_value = 1 }");
                                 }
+                            } else if (pt && type_dispatch_kind(pt) == TYPE_SLICE &&
+                                       at_eff && type_dispatch_kind(at_eff) == TYPE_ARRAY) {
+                                /* BUG-1253: the array -> slice coercion, at the
+                                 * spawn-argument sink (was a GCC type error). */
+                                emit_array_as_slice(e, sp->spawn_stmt.args[ai], at_eff, pt);
                             } else {
                                 emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
                             }
@@ -12523,7 +13859,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             bool need_addr_capture = (dst && dst->is_capture &&
                                      dst_eff && dst_eff->kind == TYPE_POINTER &&
                                      src_eff && src_eff->kind == TYPE_OPTIONAL &&
-                                     !is_null_sentinel(src_eff->optional.inner));
+                                     !is_null_sentinel(src_eff->optional.inner) &&
+                                     /* BUG-1028: a VALUE capture `|v|` of `?*opaque` has
+                                      * capture type `*opaque`, which is TYPE_POINTER but
+                                      * the C VALUE type _zer_opaque — it is the unwrap
+                                      * `v = o.value`, not `&o.value` (which GCC refused,
+                                      * so every `if (?*opaque) |v|` failed to compile).
+                                      * A `|*v|` capture has pointee `*opaque`, not
+                                      * `opaque`, so it still takes the address. */
+                                     type_dispatch_kind(dst_eff->pointer.inner) != TYPE_OPAQUE);
+
+            /* BUG-1054: mutable capture bound to the ADDRESS of the optional
+             * (a non-local lvalue condition): dst is *T, src is *?T. */
+            bool need_addr_capture_via_ptr = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_eff && type_dispatch_kind(src_eff) == TYPE_POINTER &&
+                                     src_eff->pointer.inner &&
+                                     type_dispatch_kind(src_eff->pointer.inner) == TYPE_OPTIONAL &&
+                                     !is_null_sentinel(type_unwrap_distinct(src_eff->pointer.inner)->optional.inner));
 
             const char *sp = func->is_async ? "self->" : "";
 
@@ -12533,10 +13886,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                   src_eff && src_eff->kind == TYPE_ARRAY);
             if (need_arr_copy) {
                 emit_indent(e);
+                /* BUG-1192: sizeof the DESTINATION — an array PARAMETER source is
+                 * a decayed pointer, so sizeof(src) was 8 and `u8[64] c = a;`
+                 * copied 8 bytes. The types are equal, so the sizes are. */
                 emit(e, "memcpy(%s%.*s, %s%.*s, sizeof(%s%.*s));\n",
                      sp, (int)dst->name_len, dst->name,
                      sp, (int)src->name_len, src->name,
-                     sp, (int)src->name_len, src->name);
+                     sp, (int)dst->name_len, dst->name);
                 break;
             }
 
@@ -12550,7 +13906,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->pointer.inner &&
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
-            if (need_addr_capture) {
+            if (need_addr_capture_via_ptr) {
+                emit(e, "&%s%.*s->value;\n",
+                     sp, (int)src->name_len, src->name);
+            } else if (need_addr_capture) {
                 emit(e, "&%s%.*s.value;\n",
                      sp, (int)src->name_len, src->name);
             } else if (need_slice) {
@@ -12698,11 +14057,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * raw << / >>, which are C undefined behavior when n >= width. */
             if (inst->op_token == TOK_LSHIFT || inst->op_token == TOK_RSHIFT) {
                 emit_indent(e);
-                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s);\n",
+                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s, %d);\n",
                      sp, (int)dst->name_len, dst->name,
                      inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
                      sp, (int)s1->name_len, s1->name,
-                     sp, (int)s2->name_len, s2->name);
+                     sp, (int)s2->name_len, s2->name,
+                     shift_guard_width(s1->type));
                 emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN shift result to its width */
                 break;
             }
@@ -12721,27 +14081,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (inst->op_token == TOK_SLASH || inst->op_token == TOK_PERCENT) {
                 emit_indent(e);
                 emit(e, "if (%s%.*s == 0) "
-                        "_zer_trap(\"division by zero\", __FILE__, __LINE__);\n",
+                        "_zer_trap(\"division by zero\", __FILE__, __LINE__);",
                      sp, (int)s2->name_len, s2->name);
                 Type *lt = s1->type ? type_unwrap_distinct(s1->type) : NULL;
+                /* BUG-1066: everything that can TRAP stays on the ONE C line the
+                 * `#line` directive above names. The zero test used to end with a
+                 * newline, so the overflow trap sat on the NEXT emitted line and
+                 * reported the source line PLUS ONE (the BUG-1003 class). */
                 if (lt && type_is_signed(lt)) {
-                    int w = type_width(lt);
-                    const char *minlit = "(-9223372036854775807LL-1)";
-                    if (w == 8) minlit = "(-128)";
-                    else if (w == 16) minlit = "(-32768)";
-                    else if (w == 32) minlit = "(-2147483647-1)";
-                    emit_indent(e);
-                    emit(e, "if (%s%.*s == %s && %s%.*s == -1) "
-                            "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);\n",
+                    /* BUG-1062: the MIN of THIS width -- an i5, i48 or i128
+                     * compared against INT64_MIN before and never trapped. */
+                    char minlit[96];
+                    signed_min_text(lt, minlit, sizeof minlit);
+                    emit(e, " if (%s%.*s == %s && %s%.*s == -1) "
+                            "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);",
                          sp, (int)s1->name_len, s1->name, minlit,
                          sp, (int)s2->name_len, s2->name);
                 }
-                emit_indent(e);
-                emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
+                emit(e, " %s%.*s = (%s%.*s %s %s%.*s);\n",
                      sp, (int)dst->name_len, dst->name,
                      sp, (int)s1->name_len, s1->name,
                      inst->op_token == TOK_SLASH ? "/" : "%",
                      sp, (int)s2->name_len, s2->name);
+                emit_intn_mask(e, dst, sp); /* BUG-1062: wrap an iN/uN quotient to its width */
                 break;
             }
 
@@ -12810,7 +14172,9 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_local_name(e, func, inst->dest_local);
                 emit(e, " = *");
                 emit_local_name(e, func, inst->src1_local);
-                emit(e, ";\n");
+                emit(e, ";");
+                emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+                emit(e, "\n");
                 goto unop_done;
             case TOK_AMP: /* addr-of */
                 emit_indent(e);
@@ -12851,8 +14215,10 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit_local_name(e, func, inst->dest_local);
             emit(e, " = ");
             emit_local_name(e, func, inst->src1_local);
-            emit(e, "%s%.*s;\n", accessor,
+            emit(e, "%s%.*s;", accessor,
                  (int)inst->field_name_len, inst->field_name);
+            emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+            emit(e, "\n");
         }
         break;
     }
@@ -12883,13 +14249,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, ".ptr)[");
                 emit_local_name(e, func, inst->src2_local);
-                emit(e, "];\n");
+                emit(e, "];");
             } else {
                 emit_local_name(e, func, inst->src1_local);
                 emit(e, "[");
                 emit_local_name(e, func, inst->src2_local);
-                emit(e, "];\n");
+                emit(e, "];");
             }
+            emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
+            emit(e, "\n");
         }
         break;
     }
@@ -12929,9 +14297,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 uint32_t tid = 0;
                 if (src_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(src_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) tid = inner->union_type.type_id;
+                    tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 emit(e, "(_zer_opaque){(void*)(");
                 emit_local_name(e, func, inst->src1_local);
@@ -12946,9 +14312,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 uint32_t expected_tid = 0;
                 if (tgt_eff->pointer.inner) {
                     Type *inner = type_unwrap_distinct(tgt_eff->pointer.inner);
-                    if (inner->kind == TYPE_STRUCT) expected_tid = inner->struct_type.type_id;
-                    else if (inner->kind == TYPE_ENUM) expected_tid = inner->enum_type.type_id;
-                    else if (inner->kind == TYPE_UNION) expected_tid = inner->union_type.type_id;
+                    expected_tid = opaque_type_id(inner);   /* BUG-1166 */
                 }
                 if (expected_tid > 0 && inst->src1_local >= 0) {
                     int tmp = e->temp_count++;
@@ -13023,10 +14387,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             emit(e, " = (");
             emit_type(e, inst->cast_type);
             emit(e, "){ ");
+            /* BUG-1157: an ARRAY-typed field cannot be initialised from an
+             * array expression inside a C compound literal (the array decays
+             * to a pointer: `.arr = l` initialised arr[0] with an address, and
+             * a global array `.arr = garr` fell to the `0` fallback). Such
+             * fields are left out of the literal (zeroed) and copied by
+             * memcpy right after it. */
+            bool any_arr_field = false;
+            bool first_field = true;
             for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
-                if (i > 0) emit(e, ", ");
                 const char *fname = inst->expr->struct_init.fields[i].name;
                 uint32_t fname_len = (uint32_t)inst->expr->struct_init.fields[i].name_len;
+                Type *fty_arr = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                if (fty_arr && type_dispatch_kind(fty_arr) == TYPE_ARRAY) {
+                    any_arr_field = true;
+                    continue;
+                }
+                if (!first_field) emit(e, ", ");
+                first_field = false;
                 emit(e, ".%.*s = ", (int)fname_len, fname);
                 if (inst->call_arg_locals && i < inst->call_arg_local_count &&
                     inst->call_arg_locals[i] >= 0) {
@@ -13074,10 +14452,66 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                         }
                     }
                 } else {
-                    emit(e, "0"); /* fallback */
+                    /* BUG-1157: the value did not lower to a local (a GLOBAL
+                     * array, an array FIELD, …). This used to emit a literal
+                     * `0` — `R r = { .s = ga };` gave r.s.len == 0, silently.
+                     * Emit the rewritten expression itself, with the same
+                     * array->slice coercion the local path applies. */
+                    Node *fv = inst->expr->struct_init.fields[i].value;
+                    Type *fvt = fv ? checker_get_type(e->checker, fv) : NULL;
+                    Type *fvte = fvt ? type_unwrap_distinct(fvt) : NULL;
+                    Type *ftype = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                    Type *wt = struct_init_opt_wrap_type(inst->cast_type, fname,
+                                                         fname_len, fvt);
+                    Type *wt_eff = wt ? type_unwrap_distinct(wt) : NULL;
+                    Type *wi = (wt_eff && type_dispatch_kind(wt_eff) == TYPE_OPTIONAL &&
+                                wt_eff->optional.inner)
+                               ? type_unwrap_distinct(wt_eff->optional.inner) : NULL;
+                    Type *slice_tgt = wt ? wi : aggregate_slice_coerce_target(ftype, fvt);
+                    bool arr_to_slice = slice_tgt && type_dispatch_kind(slice_tgt) == TYPE_SLICE &&
+                                        fvte && type_dispatch_kind(fvte) == TYPE_ARRAY;
+                    if (wt) { emit(e, "("); emit_type(e, wt); emit(e, "){ "); }
+                    if (arr_to_slice) {
+                        emit(e, "(");
+                        emit_type(e, slice_tgt);
+                        emit(e, "){ ");
+                        emit_rewritten_node(e, fv, func);
+                        emit(e, ", %u }", (unsigned)fvte->array.size);
+                    } else if (fv) {
+                        emit_rewritten_node(e, fv, func);
+                    } else {
+                        emit(e, "0");
+                    }
+                    if (wt) emit(e, ", 1 }");
                 }
             }
+            if (first_field) emit(e, "0");
             emit(e, " };\n");
+            if (any_arr_field) {
+                for (int i = 0; i < inst->expr->struct_init.field_count; i++) {
+                    const char *fname = inst->expr->struct_init.fields[i].name;
+                    uint32_t fname_len = (uint32_t)inst->expr->struct_init.fields[i].name_len;
+                    Type *fty_arr = struct_field_type_by_name(inst->cast_type, fname, fname_len);
+                    if (!fty_arr || type_dispatch_kind(fty_arr) != TYPE_ARRAY) continue;
+                    emit_indent(e);
+                    /* BUG-1192: the SOURCE is the array's VALUE (it decays to the
+                     * first element's address), never `&src` — for an array
+                     * PARAMETER, which C has already decayed to a pointer, `&a` is
+                     * the address of that pointer variable, so the copy read
+                     * sizeof(field) bytes of the caller's stack frame. */
+                    emit(e, "memcpy(&");
+                    emit_local_name(e, func, inst->dest_local);
+                    emit(e, ".%.*s, (", (int)fname_len, fname);
+                    if (inst->call_arg_locals && i < inst->call_arg_local_count &&
+                        inst->call_arg_locals[i] >= 0)
+                        emit_local_name(e, func, inst->call_arg_locals[i]);
+                    else
+                        emit_rewritten_node(e, inst->expr->struct_init.fields[i].value, func);
+                    emit(e, "), sizeof(");
+                    emit_local_name(e, func, inst->dest_local);
+                    emit(e, ".%.*s));\n", (int)fname_len, fname);
+                }
+            }
         }
         break;
     }
@@ -13208,20 +14642,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * C requires nested-paren syntax: RET (*name(params))(fp_args).
          * Without this branch, emitter would produce invalid C like
          * `RET (*)(fp_args) name(params)` which gcc rejects. */
-        bool ret_is_funcptr = !main_promote && ret && ret->kind == TYPE_FUNC_PTR;
-
-        if (main_promote) {
-            emit(e, "int ");
-        } else if (ret_is_funcptr) {
-            /* Open: RET_OF_RET (* */
-            emit_type(e, ret->func_ptr.ret);
-            emit(e, " (*");
-        } else if (ret) {
-            emit_type(e, ret);
-            emit(e, " ");
-        } else {
-            emit(e, "void ");
-        }
+        emit_func_decl_head(e, ret, main_promote);          /* BUG-1111 */
         e->current_main_promoted = main_promote;
 
         /* Mangled name */
@@ -13234,31 +14655,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Parameters — use AST types (same resolution as AST emitter).
          * IR local types may be ty_void for complex params (struct, pointer). */
-        emit(e, "(");
-        Type *func_type = checker_get_type(e->checker, fn);
-        if (fn->func_decl.param_count == 0) {
-            emit(e, "void");
-        } else {
-            for (int i = 0; i < fn->func_decl.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                ParamDecl *p = &fn->func_decl.params[i];
-                Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
-                              (uint32_t)i < func_type->func_ptr.param_count) ?
-                    func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
-                emit_type_and_name(e, ptype, p->name, p->name_len);
-            }
-        }
-        emit(e, ")");
-
-        /* Close funcptr-return form: )(fp_args) */
-        if (ret_is_funcptr) {
-            emit(e, ")(");
-            for (uint32_t i = 0; i < ret->func_ptr.param_count; i++) {
-                if (i > 0) emit(e, ", ");
-                emit_type(e, ret->func_ptr.params[i]);
-            }
-            emit(e, ")");
-        }
+        emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
+        emit_func_decl_tail(e, ret, main_promote);
         emit(e, " {\n");
         e->indent++;
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
@@ -13468,6 +14866,86 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 }
 
 /* Emit an async function from IR — state struct + init + poll */
+/* BUG-1238: the state struct + result accessor, split out so an async
+ * function can have them emitted EARLY (emit_early_async_structs). */
+static void emit_async_state_struct(Emitter *e, IRFunc *func) {
+    Node *fn = func->ast_node;
+    if (!fn) return;
+    char mname[256];
+    int flen = snprintf(mname, sizeof(mname), "%.*s",
+        (int)func->name_len, func->name);
+    if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+    /* BUG-863: a value-returning async needs somewhere to PUT the value.
+     * `async u32 compute() { … return 42; }` compiled clean and the state
+     * machine finalized correctly, but the value landed in an internal temp
+     * (`self->_zer_t0`) with no caller-accessible accessor and an unstable name
+     * — so a user who wrote `async <non-void>` could never read the result.
+     * Neither rejected nor retrievable. A stable `_zer_result` field plus a
+     * `_zer_async_NAME_result()` accessor is the additive half of that; the
+     * `int` poll protocol (0 = pending, 1 = done) is untouched, because the
+     * done-flag and the value are different questions. */
+    Type *afn_type = checker_get_type(e->checker, fn);
+    Type *async_ret = (afn_type && type_dispatch_kind(afn_type) == TYPE_FUNC_PTR)
+        ? afn_type->func_ptr.ret : NULL;
+    if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
+
+    /* State struct = ALL locals. BUG-1177: TAGGED, and the typedef itself is
+     * emitted up front (emit_async_forward_typedefs), so a function declared
+     * before this one can take a `*_zer_async_NAME` — the pointer is the only way
+     * to hand a task around, since the value is not copyable. */
+    emit(e, "struct _zer_async_%.*s {\n", flen, mname);
+    emit(e, "    int _zer_state;\n");
+    if (async_ret) {
+        emit(e, "    ");
+        emit_type_and_name(e, async_ret, "_zer_result", 11);
+        emit(e, ";\n");
+    }
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (l->is_static) continue;
+        if (!l->type) continue;
+        emit(e, "    ");
+        emit_type_and_name(e, l->type, l->name, l->name_len);
+        emit(e, ";\n");
+    }
+    emit(e, "};\n\n");
+
+    /* Result accessor — only for a non-void async. Reading it before the poll
+     * protocol reports done yields the zeroed initial value, exactly like any
+     * other field of a freshly `_init`ed task. */
+    if (async_ret) {
+        emit(e, "static inline ");
+        emit_type(e, async_ret);
+        emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
+             flen, mname, flen, mname);
+        /* BUG-1237: before done the field holds the zeroed initial value, which
+         * for a non-null pointer is NULL and for an enum without a 0 variant is
+         * no variant at all — a forged value (measured: a `*Box` result read
+         * early was NULL, an `E{a=5,b=6}` result took an arm). Those two refuse
+         * an early read; every other type keeps the documented zero. */
+        if (checker_type_has_no_zero_value(async_ret))
+            emit(e, "    if (self->_zer_state != -1) _zer_trap(\"async result read before "
+                    "the task finished — its return type has no zero value\", "
+                    "__FILE__, __LINE__);\n");
+        emit(e, "    return self->_zer_result;\n");
+        emit(e, "}\n\n");
+    }
+
+    /* BUG-1238: prototypes, so a function emitted before the async one can
+     * call _init / _poll (the definitions stay where the function is). */
+    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
+         flen, mname, flen, mname);
+    for (int li = 0; li < func->local_count; li++) {
+        if (!func->locals[li].is_param) continue;
+        emit(e, ", ");
+        emit_type_and_name(e, func->locals[li].type,
+                           func->locals[li].name, func->locals[li].name_len);
+    }
+    emit(e, ");\n");
+    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self);\n\n",
+         flen, mname, flen, mname);
+}
+
 static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     Node *fn = func->ast_node;
     if (!fn) return;
@@ -13499,49 +14977,16 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         (int)func->name_len, func->name);
     if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
 
-    /* BUG-863: a value-returning async needs somewhere to PUT the value.
-     * `async u32 compute() { … return 42; }` compiled clean and the state
-     * machine finalized correctly, but the value landed in an internal temp
-     * (`self->_zer_t0`) with no caller-accessible accessor and an unstable name
-     * — so a user who wrote `async <non-void>` could never read the result.
-     * Neither rejected nor retrievable. A stable `_zer_result` field plus a
-     * `_zer_async_NAME_result()` accessor is the additive half of that; the
-     * `int` poll protocol (0 = pending, 1 = done) is untouched, because the
-     * done-flag and the value are different questions. */
+    {
+        bool early = false;
+        for (int ai = 0; ai < e->early_async_count && !early; ai++)
+            early = e->early_async_ir[ai] == (void *)func;
+        if (!early) emit_async_state_struct(e, func);
+    }
     Type *afn_type = checker_get_type(e->checker, fn);
     Type *async_ret = (afn_type && type_dispatch_kind(afn_type) == TYPE_FUNC_PTR)
         ? afn_type->func_ptr.ret : NULL;
     if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
-
-    /* State struct = ALL locals */
-    emit(e, "typedef struct {\n");
-    emit(e, "    int _zer_state;\n");
-    if (async_ret) {
-        emit(e, "    ");
-        emit_type_and_name(e, async_ret, "_zer_result", 11);
-        emit(e, ";\n");
-    }
-    for (int li = 0; li < func->local_count; li++) {
-        IRLocal *l = &func->locals[li];
-        if (l->is_static) continue;
-        if (!l->type) continue;
-        emit(e, "    ");
-        emit_type_and_name(e, l->type, l->name, l->name_len);
-        emit(e, ";\n");
-    }
-    emit(e, "} _zer_async_%.*s;\n\n", flen, mname);
-
-    /* Result accessor — only for a non-void async. Reading it before the poll
-     * protocol reports done yields the zeroed initial value, exactly like any
-     * other field of a freshly `_init`ed task. */
-    if (async_ret) {
-        emit(e, "static inline ");
-        emit_type(e, async_ret);
-        emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
-             flen, mname, flen, mname);
-        emit(e, "    return self->_zer_result;\n");
-        emit(e, "}\n\n");
-    }
 
     /* Init function */
     emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
@@ -13556,6 +15001,15 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     emit(e, "    memset(self, 0, sizeof(*self));\n");
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
+        /* BUG-1239: an ARRAY param is copied by value into the task (it is a
+         * pointer in the C init's parameter list); `self->a = a` is not C. */
+        if (type_dispatch_kind(func->locals[li].type) == TYPE_ARRAY) {
+            emit(e, "    memcpy(self->%.*s, %.*s, sizeof(self->%.*s));\n",
+                 (int)func->locals[li].name_len, func->locals[li].name,
+                 (int)func->locals[li].name_len, func->locals[li].name,
+                 (int)func->locals[li].name_len, func->locals[li].name);
+            continue;
+        }
         emit(e, "    self->%.*s = %.*s;\n",
              (int)func->locals[li].name_len, func->locals[li].name,
              (int)func->locals[li].name_len, func->locals[li].name);
@@ -13586,6 +15040,19 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    /* BUG-1240: the @once flags (the same pre-scan as the regular path). They
+     * are C statics — one per @once, shared by every task, which is exactly
+     * @once's "once per program". Missing here, a @once in an async body was an
+     * undeclared identifier at GCC. */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_BRANCH && in->cond_local < 0 &&
+                in->expr && in->expr->kind == NODE_ONCE)
+                emit(e, "    static uint32_t _zer_once_%d = 0;\n", in->false_block);
+        }
+    }
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;

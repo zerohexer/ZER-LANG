@@ -1,0 +1,24 @@
+// BUG-1150: a designated initializer into an OPTIONAL struct was refused at every sink
+// ("designated initializer requires struct type, got '?P'"). It takes the INNER struct
+// type and the ordinary T -> ?T coercion wraps it.
+struct P { u32 x; u32 y; }
+struct W { ?P inner; u32 k; }
+?P gp = { .x = 5 };
+?P id(?P v) { return v; }
+?P mk(u32 a) { return { .x = a, .y = a + 1 }; }
+u32 main() {
+    ?P o = { .x = 1, .y = 2 };
+    ?P q = null;
+    q = { .x = 3 };
+    W w = { .inner = { .x = 7 }, .k = 1 };
+    ?P r = id({ .x = 9 });
+    P a = o orelse return;
+    P b = q orelse return;
+    P c = gp orelse return;
+    P d = w.inner orelse return;
+    P e = r orelse return;
+    P f = mk(10) orelse return;
+    if (a.x + a.y != 3 || b.x != 3 || b.y != 0 || c.x != 5) { return 1; }
+    if (d.x != 7 || e.x != 9 || f.y != 11) { return 2; }
+    return 0;
+}

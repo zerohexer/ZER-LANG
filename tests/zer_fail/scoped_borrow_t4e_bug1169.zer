@@ -1,0 +1,13 @@
+// expect-error: cannot write through
+// BUG-1169: a scoped-spawn borrow missed this spelling (pre-existing alias /
+// struct-literal carrier / &carrier) and the parent raced the thread.
+struct S { u32 a; u32 b; }
+void w(*u32 p) { *p = 5; }
+u32 main() {
+    S s;
+    *S sp = &s;
+    ThreadHandle th = spawn w(&s.a);
+    sp.a = 7;
+    th.join();
+    return s.a;
+}

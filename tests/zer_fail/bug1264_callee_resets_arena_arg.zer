@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: resets an arena
+struct T { u32 v; }
+u8[256] buf;
+Arena ga;
+u32 use_it(*T t) {
+    ga.reset();
+    *T t2 = ga.alloc(T) orelse return;
+    t2.v = 99;
+    return t.v;
+}
+u32 main() {
+    ga = Arena.over(buf);
+    *T t = ga.alloc(T) orelse return;
+    t.v = 5;
+    return use_it(t);
+}

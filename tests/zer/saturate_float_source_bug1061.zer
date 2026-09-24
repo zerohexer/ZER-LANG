@@ -1,0 +1,70 @@
+// BUG-1061: @saturate with a FLOAT source. NaN fell through every range test
+// into the raw C cast (undefined behaviour — x86 gives INT_MIN / 2^63), and the
+// integer MAX rounds UP as a double, so exactly 2^63 into i64 and 2^64 into u64
+// were not "> MAX" and hit the raw cast too (i64 got MIN, u64 got 0). It now goes
+// through the same float->int saturation `(T)x` uses: NaN -> 0, exact hex-float
+// boundaries. Both emitter paths: var-decl init and struct-field store.
+struct S { u32 u; i8 s; i64 l; }
+
+u32 main() {
+    volatile f64 vinf = 1e400;
+    f64 inf = vinf;
+    f64 nan = inf - inf;
+    u32 a = @saturate(u32, nan);
+    if (a != 0) { return 1; }
+    i32 b = @saturate(i32, nan);
+    if (b != 0) { return 2; }
+    i8 c = @saturate(i8, nan);
+    if (c != 0) { return 3; }
+    u64 d = @saturate(u64, nan);
+    if (d != 0) { return 4; }
+    S s;
+    s.u = @saturate(u32, nan);
+    s.s = @saturate(i8, nan);
+    if (s.u != 0) { return 5; }
+    if (s.s != 0) { return 6; }
+    u32 i = @saturate(u32, inf);
+    if (i != 4294967295) { return 7; }
+    i32 j = @saturate(i32, -inf);
+    if (j != -2147483647 - 1) { return 8; }
+    // the boundaries
+    volatile f64 v63 = 9223372036854775808.0;
+    volatile f64 v64 = 18446744073709551616.0;
+    f64 p63 = v63;
+    f64 p64 = v64;
+    i64 x = @saturate(i64, p63);
+    if (x != 9223372036854775807) { return 9; }
+    s.l = @saturate(i64, p63);
+    if (s.l != 9223372036854775807) { return 10; }
+    u64 y = @saturate(u64, p64);
+    if (y != 18446744073709551615) { return 11; }
+    volatile f32 vf = 4294967296.0;
+    f32 cf = vf;
+    u32 z = @saturate(u32, cf);
+    if (z != 4294967295) { return 12; }
+    volatile f32 vf2 = 2147483648.0;
+    f32 cf2 = vf2;
+    i32 w = @saturate(i32, cf2);
+    if (w != 2147483647) { return 13; }
+    // in-range values truncate toward zero
+    volatile f64 vpi = -3.75;
+    f64 pi = vpi;
+    i8 tp = @saturate(i8, pi);
+    if (tp != -3) { return 14; }
+    u8 tu = @saturate(u8, pi);
+    if (tu != 0) { return 15; }
+    // wide targets
+    f64 e30 = 1e30;
+    u128 e = @saturate(u128, e30);
+    u128 ec = (u128)e30;
+    if (e != ec) { return 16; }
+    u128 emax = @saturate(u128, inf);
+    if (emax != ~(u128)0) { return 17; }
+    i128 f = @saturate(i128, -e30);
+    if (f != (i128)(-e30)) { return 18; }
+    u3 g = @saturate(u3, nan);
+    if (g != 0) { return 19; }
+    u3 g2 = @saturate(u3, e30);
+    if (g2 != 7) { return 20; }
+    return 0;
+}

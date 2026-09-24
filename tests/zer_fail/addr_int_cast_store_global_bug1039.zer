@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: integer derived from @ptrtoint of a local
+// BUG-1039: the cast spelling of the same launder.
+usize g;
+u32 main() {
+    u32 l = 5;
+    usize a = @ptrtoint(&l);
+    g = (usize)a;
+    return 0;
+}

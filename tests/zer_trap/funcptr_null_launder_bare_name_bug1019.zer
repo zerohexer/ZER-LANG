@@ -1,0 +1,17 @@
+// expect-trap
+// expect-trap-msg: call through a null function pointer
+// BUG-1019, the shape that makes "guard only INDEX and FIELD" wrong.
+//
+// A NULL array element is copied into a plain funcptr local — the assignment is
+// type-correct, both sides are the same non-null funcptr type — and the call is
+// then through a BARE NAME. An enumeration of the null-producing carriers would
+// not have guarded this one. The rule is therefore "guard unless the callee
+// resolves to a function symbol", which has no enumeration to get wrong.
+typedef u32 (*BinOp)(u32, u32);
+u32 add(u32 a, u32 b) { return a + b; }
+BinOp[3] g_ops;
+u32 main() {
+    g_ops[0] = add;
+    BinOp f = g_ops[1];      // never assigned -> NULL
+    return f(1, 2);
+}

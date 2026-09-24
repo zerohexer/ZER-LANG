@@ -1,0 +1,11 @@
+// BUG-1243 positive: a helper drives the task that owns (and frees) the param.
+struct Box { u32 v; }
+async void f(*Box b) { yield; free(b); }
+void drive(*_zer_async_f t) { while (_zer_async_f_poll(t) == 0) { } }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    p.v = 3;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    drive(&t);
+    return 0;
+}

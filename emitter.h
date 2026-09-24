@@ -46,6 +46,12 @@ typedef struct {
     Checker *checker;       /* for resolved type info */
     int indent;             /* current indentation level */
     int temp_count;         /* counter for temporary variable names */
+    /* BUG-1152: the non-null pointer LOAD guard. `nn_bypass` is the node whose
+     * guard is already open (so its own emission is not wrapped a second time);
+     * `nn_lvalue` is the assignment target / `&` operand currently being
+     * emitted — a STORE location, never a load, so never guarded. */
+    Node *nn_bypass;
+    Node *nn_lvalue;
     Type *current_func_ret; /* return type of current function */
     bool current_main_promoted; /* true if current func is `void main()` promoted to `int main()` — bare return becomes `return 0;` */
     DeferStack defer_stack; /* current block's deferred statements */
@@ -102,6 +108,12 @@ typedef struct {
     void (*ir_hook)(void *ctx, void *ir_func);
     void *ir_hook_ctx;
 
+    /* BUG-1238: async functions lowered EARLY so their state structs are
+     * defined before anything that names the task type (IRFunc*, as void*). */
+    void **early_async_ir;
+    int early_async_count;
+    int early_async_cap;
+
     /* The IRFunc whose body is currently being emitted (actually IRFunc*, typed
      * void* to keep ir.h out of emitter.h). Set at emit_regular/async_func_from_ir
      * entry, cleared at exit. Lets a mid-body conditional early-exit (auto-guard
@@ -130,6 +142,30 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+
+    /* BUG-1027: slice typedefs for element types that have NO pre-emitted named
+     * typedef — pointer, optional-value, funcptr, array, nested slice, *opaque.
+     * Primitives/uN/enum/Handle reuse the preamble typedefs; struct/union get
+     * theirs at the declaration. Everything else used to fall through emit_type's
+     * exhaustive case list into the TYPE_UINT arm, which read `intn.bits` from a
+     * non-intn Type and named the slice `_zer_slice_u128` — a 16-byte stride over
+     * a 4-byte element (silent wrong reads, stack OOB, or a GCC error).
+     * Each entry is one structural element type, keyed by its mangled suffix;
+     * the typedef triple (`_zer_xslice_S`, `_zer_xvslice_S`, `_zer_xopt_slice_S`)
+     * is emitted once its named dependencies (structs/unions, inner exotic
+     * slices) have been emitted — see collect_exotic_slices / flush_exotic_slices. */
+    struct XSlice {
+        const char *suffix;     /* arena-owned mangled suffix */
+        Type *elem;             /* the element type (distinct-unwrapped) */
+        bool emitted;
+    } *xslices;
+    int xslice_count;
+    int xslice_capacity;
+    /* user struct/union types whose C definition has been emitted (the
+     * dependency set for flush_exotic_slices; compared by module prefix + name) */
+    Type **emitted_user_types;
+    int emitted_user_count;
+    int emitted_user_capacity;
 } Emitter;
 
 /* ---- API ---- */

@@ -13,7 +13,7 @@ i32 main() {
     pool.get(a).height = 50;
 
     ?Handle(Widget) mb = pool.alloc();
-    Handle(Widget) b = mb orelse return;
+    Handle(Widget) b = mb orelse { pool.free(a); return 3; };   // BUG-1071
     pool.get(b).width = 200;
     pool.get(b).height = 75;
 

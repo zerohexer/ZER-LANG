@@ -1,0 +1,14 @@
+// BUG-1193: @try_enum tests membership on the operand's OWN value. Pre-fix it narrowed
+// to i32 first: a u64 2^32+10 returned the variant 10, and a u32 0xFFFFFFFF matched -1.
+enum Gap { g0 = 10, g1 = 5, g2 }
+enum Dir { l = -1, c = 0, r = 1 }
+u32 name(Gap g) { switch (g) { .g0 => { return 10; } .g1 => { return 11; } .g2 => { return 12; } } }
+u32 main() {
+    u64 wide = 4294967306;
+    ?Gap o = @try_enum(Gap, wide);
+    if (o) |g| { return name(g); }
+    u32 big = 4294967295;
+    ?Dir d = @try_enum(Dir, big);
+    if (d != null) { return 2; }
+    return 0;
+}

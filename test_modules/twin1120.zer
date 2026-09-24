@@ -1,0 +1,5 @@
+// BUG-1120: two modules with same-named Pool / global / function of DIFFERENT types.
+// Module b resolved every one to module a's (type errors, or b calling a's bump()).
+import twin1120_a;
+import twin1120_b;
+u32 main() { u32 a = a_use(); u32 b = b_use(); if (a != 2) { return 1; } if (b != 107) { return 2; } return 0; }

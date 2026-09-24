@@ -23,7 +23,7 @@ void phase_one() {
     pay.magic = 0xABCD;
 
     ?*Ctx ca = alloc(Ctx);
-    *Ctx c = ca orelse return;
+    *Ctx c = ca orelse { free(pay); return; };
     c.p = pay;
     c.tag = 1;
 

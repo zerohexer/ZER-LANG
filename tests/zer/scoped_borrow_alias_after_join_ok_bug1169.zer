@@ -1,0 +1,20 @@
+// BUG-1169 boundary: an alias of a lent local is usable again after the join,
+// and a carrier can be rebuilt after it.
+struct H { *u32 p; }
+void w(*u32 p) { *p = 5; }
+void wh(H h) { *h.p = 6; }
+u32 main() {
+    u32 v = 1;
+    *u32 alias = &v;
+    ThreadHandle th = spawn w(&v);
+    th.join();
+    *alias = 7;
+    if (v != 7) { return 1; }
+    u32 x = 1;
+    H h = { .p = &x };
+    ThreadHandle t2 = spawn wh(h);
+    t2.join();
+    x = 9;
+    if (x != 9) { return 2; }
+    return 0;
+}

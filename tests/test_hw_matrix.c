@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "zer_tmp.h"
 
 static int total = 0, passed = 0, failed = 0;
 static int false_neg = 0, invalid_probe = 0, over_reject = 0;
@@ -60,11 +61,11 @@ static int has_hw_reason(const char *eb) {
 /* NEG: must reject for a program-consequence reason. EMIT-ONLY harness. */
 static int run_neg(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"), zerc_path);
     if (system(cmd) == 0) {
         failed++; false_neg++;
         fprintf(stderr, "  FAIL [FALSE-NEGATIVE] %s — program-consequence violation ACCEPTED\n", name);
@@ -72,7 +73,7 @@ static int run_neg(const char *name, const char *code) {
         return 0;
     }
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (strstr(eb, "expected ") || strstr(eb, "unexpected") || strstr(eb, "parse error")) {
         failed++; invalid_probe++;
@@ -90,15 +91,15 @@ static int run_neg(const char *name, const char *code) {
 /* POS: a structurally-valid hardware access must be accepted (emit succeeds). */
 static int run_pos(const char *name, const char *code) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err", zerc_path);
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"), zerc_path);
     if (system(cmd) == 0) { passed++; return 1; }
     failed++; over_reject++;
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     fprintf(stderr, "  FAIL [OVER-REJECT] %s — valid hardware access REJECTED:\n", name);
     fprintf(stderr, "    %.110s\n", eb);
@@ -270,7 +271,7 @@ static void gen(HWScenario s, char *buf, size_t n) {
  * ================================================================ */
 
 typedef enum { VSITE_SPAWN, VSITE_ISR, VSITE_COUNT } VSite;
-typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_COUNT } VShape;
+typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN, VSHAPE_COUNT } VShape;
 
 static const char *vsite_name(VSite s) {
     switch (s) {
@@ -285,12 +286,18 @@ static const char *vshape_name(VShape s) {
     case VSHAPE_WORD:      return "single-word-scalar";
     case VSHAPE_OVERWIDTH: return "over-width(u64@32)";
     case VSHAPE_AGGREGATE: return "aggregate-struct";
+    case VSHAPE_OPTPTR:    return "optional-pointer ?*volatile T";
+    case VSHAPE_OPTPTR_PLAIN: return "optional-pointer ?*T (plain pointee)";
     case VSHAPE_COUNT: break;
     }
     return "?";
 }
 /* A single-word scalar is the sanctioned idiom -> ACCEPT. Everything else tears. */
-static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD; }
+/* BUG-1212: a `?*T` is a null-sentinel pointer — one word, like `*T`.
+ * BUG-1249: but the exemption covers the WORD, and the scans cannot tell a read
+ * of the word from a dereference of it — so the pointer is exempt only when its
+ * pointee is itself volatile (or a shared struct). A plain pointee is negative. */
+static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD && s != VSHAPE_OPTPTR; }
 static const char *vshape_flags(VShape s) {
     return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
 }
@@ -314,7 +321,35 @@ static const char *vshape_flags(VShape s) {
 typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
+               RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
+               RFORM_PARAM_CALL_ARG, RFORM_PARAM_RETURN, RFORM_PARAM_IF_COND,
+               RFORM_ALIAS_ARG, RFORM_CARRIER, RFORM_CARRIER_LIT,
+               RFORM_FUNCPTR_LOCAL, RFORM_FUNCPTR_GLOBAL, RFORM_FUNCPTR_FIELD,
+               RFORM_ALIAS_COPY, RFORM_CARRIER_COPY, RFORM_CARRIER_FIELD_ARG,
+               RFORM_CARRIER_READONLY, RFORM_GLOBAL_RETARGET, RFORM_LOCAL_RETARGET,
+               RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
+               RFORM_CARRIER_TWO_LIT, RFORM_CARRIER_TWO_ASSIGN,
+               RFORM_GLOBAL_CARRIER_LIT,
                RFORM_COUNT } RForm;
+/* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
+ * walker are exhaustive descents of the body that performs the RMW; the MAIN
+ * side is different code — plain main-line code calling a helper, answered by
+ * the per-function summary func_rmw_param_mask (BUG-801) — and that summary was
+ * a partial if-chain. Six POSITIONS of `*p += 1` inside the helper were invisible
+ * to it and only to it, so a grid with two sites could not have shown the hole:
+ * the ISR and spawn cells for those forms pass on the pre-fix compiler. RSite is
+ * separate from VSite so the volatile-width and static-local grids, whose
+ * `else` branch means "ISR", are untouched. */
+typedef enum { RSITE_SPAWN, RSITE_ISR, RSITE_MAIN, RSITE_COUNT } RSite;
+static const char *rsite_name(RSite s) {
+    switch (s) {
+    case RSITE_SPAWN: return "spawn";
+    case RSITE_ISR:   return "isr";
+    case RSITE_MAIN:  return "main";
+    case RSITE_COUNT: break;
+    }
+    return "?";
+}
 static const char *rform_name(RForm f) {
     switch (f) {
     case RFORM_NAMED_COMPOUND:  return "named g+=1";
@@ -325,6 +360,30 @@ static const char *rform_name(RForm f) {
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
     case RFORM_SPLIT_STMT:      return "split t=g;g=t+1";
     case RFORM_SPLIT_2HOP:      return "split 2-hop";
+    case RFORM_PARAM_SWITCH:    return "param in switch";
+    case RFORM_PARAM_ONCE:      return "param in @once";
+    case RFORM_PARAM_ORELSE:    return "param in orelse{}";
+    case RFORM_PARAM_CALL_ARG:  return "param as call arg";
+    case RFORM_PARAM_RETURN:    return "param in return";
+    case RFORM_PARAM_IF_COND:   return "param in if cond";
+    case RFORM_ALIAS_ARG:       return "alias q=&g;bump(q)";
+    case RFORM_CARRIER:         return "carrier h.p=&g";
+    case RFORM_CARRIER_LIT:     return "carrier {.p=&g}";
+    case RFORM_FUNCPTR_LOCAL:   return "funcptr fp(&g)";
+    case RFORM_FUNCPTR_GLOBAL:  return "funcptr gfp(&g)";
+    case RFORM_FUNCPTR_FIELD:   return "funcptr o.cb(&g)";
+    case RFORM_ALIAS_COPY:      return "alias copy r=q";
+    case RFORM_CARRIER_COPY:    return "carrier copy k=h";
+    case RFORM_CARRIER_FIELD_ARG: return "carrier field bump(h.p)";
+    case RFORM_CARRIER_READONLY:return "carrier read-only";
+    case RFORM_GLOBAL_RETARGET: return "global gp=&g elsewhere";
+    case RFORM_LOCAL_RETARGET:  return "local p=&d; p=&g";
+    case RFORM_RETARGET_ARG:    return "retargeted gp as arg";
+    case RFORM_RETARGET_COPY_ARG:   return "r=gp copy as arg";
+    case RFORM_RETARGET_COPY_DEREF: return "r=gp copy *r+=1";
+    case RFORM_CARRIER_TWO_LIT:     return "carrier {.p=&d,.q=&g}";
+    case RFORM_CARRIER_TWO_ASSIGN:  return "carrier h.p=&d;h.q=&g";
+    case RFORM_GLOBAL_CARRIER_LIT:  return "global carrier {.p=&g}";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -345,18 +404,110 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
      * pins the taint being TRANSITIVE — a local reading a local that read g. */
     case RFORM_SPLIT_STMT:     *helper = "";                                    *body = "u32 t = g; g = t + 1;"; break;
     case RFORM_SPLIT_2HOP:     *helper = "";                                    *body = "u32 t = g; u32 u = t; g = u + 1;"; break;
+    /* BUG-1043: the SAME `*p += 1` through a pointer param, in six POSITIONS the
+     * main-side summary walk never descended. Each was accepted at the main site
+     * (a torn ISR/main update, silent on bare metal) while the plain
+     * RFORM_PTR_PARAM body was rejected — the position axis, not the spelling one. */
+    case RFORM_PARAM_SWITCH:   *helper = "void bump(volatile *u32 p, u32 k){ switch (k) { 0 => { *p += 1; } default => { } } }";
+                                                                                 *body = "bump(&g, 0);";   break;
+    case RFORM_PARAM_ONCE:     *helper = "void bump(volatile *u32 p){ @once { *p += 1; } }"; *body = "bump(&g);"; break;
+    case RFORM_PARAM_ORELSE:   *helper = "?u32 mb(u32 x){ if (x > 0) { return x; } return null; }\n"
+                                         "void bump(volatile *u32 p, u32 k){ u32 v = mb(k) orelse { *p += 1; return; }; }";
+                                                                                 *body = "bump(&g, 0);";   break;
+    case RFORM_PARAM_CALL_ARG: *helper = "void take(u32 x){ }\nvoid bump(volatile *u32 p){ take((*p += 1)); }";
+                                                                                 *body = "bump(&g);";      break;
+    case RFORM_PARAM_RETURN:   *helper = "u32 bump(volatile *u32 p){ return (*p += 1); }";
+                                                                                 *body = "u32 r = bump(&g);"; break;
+    case RFORM_PARAM_IF_COND:  *helper = "void bump(volatile *u32 p){ if ((*p += 1) > 3) { } }";
+                                                                                 *body = "bump(&g);";      break;
+    /* BUG-1046: the RMW REACH axis — the pointer to g arrives at the RMW through a
+     * vehicle the resolvers did not follow. The alias-as-argument form was live at
+     * the MAIN site only (the scans had an alias table, the main sink matched a
+     * literal `&g`); the carrier and the three funcptr-callee forms were live at
+     * ALL THREE sites. The funcptr forms are refused as "handed to a call the
+     * analysis cannot see" — a may-RMW, worded as such, not a proven one. */
+    case RFORM_ALIAS_ARG:      *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "volatile *u32 q = &g; bump(q);"; break;
+    case RFORM_CARRIER:        *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h; h.p = &g; bump(h);"; break;
+    case RFORM_CARRIER_LIT:    *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h = { .p = &g }; bump(h);"; break;
+    case RFORM_FUNCPTR_LOCAL:  *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "*(volatile *u32) fp = bump; fp(&g);"; break;
+    case RFORM_FUNCPTR_GLOBAL: *helper = "void bump(volatile *u32 p){ *p += 1; }\n*(volatile *u32) gfp = bump;";
+                                                                                 *body = "gfp(&g);"; break;
+    case RFORM_FUNCPTR_FIELD:  *helper = "struct Ops { *(volatile *u32) cb; }\nvoid bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "Ops o; o.cb = bump; o.cb(&g);"; break;
+    /* The fourth vehicle: a COPY of a pointer / carrier that already designates g. */
+    case RFORM_ALIAS_COPY:     *helper = "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "volatile *u32 q = &g; volatile *u32 r = q; bump(r);"; break;
+    case RFORM_CARRIER_COPY:   *helper = "struct H { volatile *u32 p; }\nvoid bump(H h){ *h.p += 1; }";
+                                                                                 *body = "H h; h.p = &g; H k = h; bump(k);"; break;
+    /* The fifth vehicle: the carrier's FIELD handed directly. */
+    case RFORM_CARRIER_FIELD_ARG: *helper = "struct H { volatile *u32 p; }\nvoid bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "H h; h.p = &g; bump(h.p);"; break;
+    /* The boundary pin for the carrier binding: a helper that only READS through
+     * the carrier has no RMW bit, so the binding alone must not reject. */
+    case RFORM_CARRIER_READONLY: *helper = "struct H { volatile *u32 p; }\nu32 rd(H h){ return *h.p; }";
+                                                                                 *body = "H h; h.p = &g; u32 v = rd(h); if (v > 100) { g = 1; }"; break;
+    /* BUG-1124: a pointer RETARGETED after its declaration. The resolver followed
+     * the initializer (`&d`) alone, so the write landing on `g` was invisible at
+     * the ISR and MAIN sites (`d` is touched from one side only, so those cells
+     * can only fire through the reassignment). At the SPAWN site the cell also
+     * fires on `d` — any volatile RMW from a thread races — so it does not
+     * discriminate there. */
+    case RFORM_GLOBAL_RETARGET: *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }";
+                                                                                 *body = "aim(); *gp += 1;"; break;
+    case RFORM_LOCAL_RETARGET:  *helper = "volatile u32 d;";
+                                                                                 *body = "volatile *u32 p = &d; p = &g; *p += 1;"; break;
+    case RFORM_RETARGET_ARG:    *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }\n"
+                                          "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "aim(); bump(gp);"; break;
+    /* A local COPY of the retargeted pointer aims wherever the original does. */
+    case RFORM_RETARGET_COPY_ARG:   *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }\n"
+                                              "void bump(volatile *u32 p){ *p += 1; }";
+                                                                                 *body = "aim(); volatile *u32 r = gp; bump(r);"; break;
+    case RFORM_RETARGET_COPY_DEREF: *helper = "volatile u32 d;\nvolatile *u32 gp = &d;\nvoid aim(){ gp = &g; }";
+                                                                                 *body = "aim(); volatile *u32 r = gp; *r += 1;"; break;
+    /* BUG-1129: a carrier holding TWO globals bound only the first (the literal)
+     * or only the LAST (two field assignments replaced the row). The RMW is
+     * through the field aimed at `g`. */
+    case RFORM_CARRIER_TWO_LIT:     *helper = "volatile u32 d;\nstruct H2 { volatile *u32 p; volatile *u32 q; }\n"
+                                              "void bump2(H2 h){ *h.q += 1; }";
+                                                                                 *body = "H2 h = { .p = &d, .q = &g }; bump2(h);"; break;
+    case RFORM_CARRIER_TWO_ASSIGN:  *helper = "volatile u32 d;\nstruct H2 { volatile *u32 p; volatile *u32 q; }\n"
+                                              "void bump2(H2 h){ *h.p += 1; }";
+                                                                                 *body = "H2 h; h.p = &g; h.q = &d; bump2(h);"; break;
+    /* BUG-1201: a GLOBAL carrier whose pointer comes from its struct-literal
+     * initializer. The write-target walk followed `&x`, a pointer name, a slice and
+     * `orelse` as an assigned value, never a struct literal. */
+    case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
+                                                                                 *body = "*gh.p += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }
-static void gen_rmw(VSite site, RForm f, char *out, size_t n) {
+static void gen_rmw(RSite site, RForm f, char *out, size_t n) {
     const char *helper; const char *body;
     rform_parts(f, &helper, &body);
-    if (site == VSITE_SPAWN)
+    switch (site) {
+    case RSITE_SPAWN:
         snprintf(out, n, "volatile u32 g;\n%s\nvoid w(){ %s }\n"
                          "u32 main(){ spawn w(); u32 x = g; return x & 1; }\n", helper, body);
-    else
+        break;
+    case RSITE_ISR:
         snprintf(out, n, "volatile u32 g;\n%s\ninterrupt TIMER { %s }\n"
                          "u32 main(){ u32 x = g; return x & 1; }\n", helper, body);
+        break;
+    /* BUG-1043: the RMW is in MAIN-line code (a helper main calls) and the ISR
+     * does a plain write — the BUG-801 shape, answered by the per-function
+     * summary rather than by either body scan. */
+    case RSITE_MAIN:
+        snprintf(out, n, "volatile u32 g;\n%s\nvoid w(){ %s }\n"
+                         "interrupt TIMER { g = 1; }\n"
+                         "u32 main(){ w(); return 0; }\n", helper, body);
+        break;
+    case RSITE_COUNT: out[0] = 0; break;
+    }
 }
 
 static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
@@ -367,6 +518,8 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     case VSHAPE_WORD:      decl = "volatile u32 g;";                      wr = "g = 1;";   rd = "u32 x = g;";   break;
     case VSHAPE_OVERWIDTH: decl = "volatile u64 g;";                      wr = "g = 1;";   rd = "u64 x = g;";   break;
     case VSHAPE_AGGREGATE: decl = "struct P{u32 a; u32 b;}\nvolatile P g;"; wr = "g.a = 1;"; rd = "u32 x = g.a;"; break;
+    case VSHAPE_OPTPTR:    decl = "volatile ?volatile *u32 g = null;";    wr = "g = null;"; rd = "volatile ?volatile *u32 x = g;"; break;
+    case VSHAPE_OPTPTR_PLAIN: decl = "volatile ?*u32 g = null;";          wr = "g = null;"; rd = "volatile ?*u32 x = g;"; break;
     case VSHAPE_COUNT:     decl = ""; wr = ""; rd = ""; break;
     }
     if (site == VSITE_SPAWN) {
@@ -439,15 +592,15 @@ static void gen_sl(VSite site, SLShape shape, char *out, size_t n) {
  * target). Same EMIT-ONLY contract and integrity guard as the helpers above. */
 static int run_vol(const char *name, const char *code, const char *flags, int negative) {
     total++;
-    FILE *f = fopen("/tmp/_zer_hw.zer", "w");
+    FILE *f = fopen(ZT("/tmp/_zer_hw.zer"), "w");
     if (!f) { fprintf(stderr, "cannot create temp file\n"); return 0; }
     fputs(code, f); fclose(f);
     char cmd[640];
-    snprintf(cmd, sizeof(cmd), "%s /tmp/_zer_hw.zer %s -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err",
+    snprintf(cmd, sizeof(cmd), ZT("%s /tmp/_zer_hw.zer %s -o /tmp/_zer_hw.c 2>/tmp/_zer_hw.err"),
              zerc_path, flags);
     int rc = system(cmd);
     char eb[4096]; eb[0] = 0;
-    FILE *e = fopen("/tmp/_zer_hw.err", "r");
+    FILE *e = fopen(ZT("/tmp/_zer_hw.err"), "r");
     if (e) { size_t r = fread(eb, 1, sizeof(eb) - 1, e); eb[r] = 0; fclose(e); }
     if (!negative) {
         if (rc == 0) { passed++; return 1; }
@@ -532,17 +685,32 @@ int main(void) {
         }
     }
 
-    /* RMW FORM grid (BUG-792) — every cell negative; both sinks must agree. */
+    /* RMW FORM grid (BUG-792) — every cell negative; all THREE sinks must agree
+     * (BUG-1043 added the main-side summary as a site of its own). */
     fprintf(stderr, "\n--- RMW form grid (site x spelling) ---\n");
-    for (VSite vs = 0; vs < VSITE_COUNT; vs++) {
+    for (RSite vs = 0; vs < RSITE_COUNT; vs++) {
         for (RForm rf = 0; rf < RFORM_COUNT; rf++) {
             valid_cells++;
             char rbuf[1024], rnm[192];
-            snprintf(rnm, sizeof(rnm), "rmw/%s/%s", vsite_name(vs), rform_name(rf));
+            snprintf(rnm, sizeof(rnm), "rmw/%s/%s", rsite_name(vs), rform_name(rf));
             gen_rmw(vs, rf, rbuf, sizeof(rbuf));
-            int ok = run_vol(rnm, rbuf, "", 1);
-            fprintf(stderr, "  [%-5s][%-15s][neg] %s\n",
-                    vsite_name(vs), rform_name(rf), ok ? "ok" : "*** FAIL ***");
+            /* The ONE positive cell, and it is the grid's boundary pin: at the
+             * SPAWN sink a `@once` body is real synchronisation — it runs exactly
+             * once program-wide and every later arrival waits for its release
+             * publish (B4, once_loser_wait.zer) — so the RMW inside it has ONE
+             * writer and main's single-word volatile read is the sanctioned flag
+             * idiom. scan_unsafe_global_access keeps @once a leaf for that
+             * reason, and this cell fails if someone "fixes" that. At the ISR
+             * and MAIN sites the same body is a race: an interrupt can land
+             * inside the once-body's read-modify-write (ISR site), or the ISR's
+             * own store can (MAIN site), and @once orders nothing against an
+             * interrupt. */
+            int neg = !(vs == RSITE_SPAWN && rf == RFORM_PARAM_ONCE) &&
+                      rf != RFORM_CARRIER_READONLY;   /* BUG-1046 boundary, every site */
+            int ok = run_vol(rnm, rbuf, "", neg);
+            fprintf(stderr, "  [%-5s][%-24s][%s] %s\n",
+                    rsite_name(vs), rform_name(rf), neg ? "neg" : "pos",
+                    ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
     }
@@ -555,15 +723,22 @@ int main(void) {
      * writes g", which rejects a great deal of correct firmware. */
     fprintf(stderr, "\n--- RMW split-taint boundary (must COMPILE) ---\n");
     {
-        static const char *bnames[3] = { "taint-cleared", "other-global", "not-shared" };
-        static const char *bbodies[3] = {
+        static const char *bnames[4] = { "taint-cleared", "other-global", "not-shared",
+                                         "retarget-plain-store" };
+        static const char *bbodies[4] = {
             "volatile u32 g;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = g; t = 5; g = t; return g & 1; }\n",
             "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = h; g = t + 1; return g & 1; }\n",
-            "u32 plain;\nu32 main(){ u32 t = plain; plain = t + 1; return plain & 1; }\n"
+            "u32 plain;\nu32 main(){ u32 t = plain; plain = t + 1; return plain & 1; }\n",
+            /* BUG-1124 boundary: retargeting a pointer (`gp = &h`) writes the
+             * POINTER, not h — it must not read as an RMW of the new target. The
+             * first draft of the fix rejected exactly this. */
+            "volatile u32 g;\nvolatile u32 h;\nvolatile *u32 gp = &g;\n"
+            "interrupt TIMER { *gp = 5; }\nvoid aim(){ gp = &h; }\n"
+            "u32 main(){ aim(); u32 t = h; return t & 1; }\n"
         };
-        for (int bi = 0; bi < 3; bi++) {
+        for (int bi = 0; bi < 4; bi++) {
             valid_cells++;
             char bnm[192];
             snprintf(bnm, sizeof(bnm), "rmw-boundary/%s", bnames[bi]);

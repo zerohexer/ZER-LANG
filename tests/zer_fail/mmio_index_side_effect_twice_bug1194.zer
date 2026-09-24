@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: MMIO index expression would be evaluated twice
+// BUG-1194: the MMIO auto-guard is hoisted and re-evaluates the index, so f() ran
+// twice: the guard approved 3 and the store used 4 — a write past the declared mmio
+// range (measured against a mapped page), with only a warning.
+mmio 0x40000000..0x400000FF;
+u32 c = 2;
+u32 f() { c += 1; return c; }
+u32 main() {
+    volatile *u32 r = @inttoptr(*u32, 0x400000F0);
+    r[f()] = 0xDEAD;
+    return c;
+}

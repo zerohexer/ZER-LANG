@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: is not a value type
+// BUG-1218: A(void) stamped `void v;` into the emitted struct (a GCC error).
+container A(T) { T v; }
+u32 main() { A(void) a; return 0; }

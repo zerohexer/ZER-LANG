@@ -1,0 +1,26 @@
+// BUG-1179: operands evaluate LEFT TO RIGHT whether they are locals or globals.
+// Pre-fix a bare LOCAL operand was read at its CONSUMER, after every later sibling
+// had run, while a GLOBAL was read at its own position: `x + bump(&x)` gave 16 for
+// a local and 6 for a global.
+struct P { u32 a; u32 b; }
+u32 g;
+u32 bump(*u32 p) { *p += 10; return 1; }
+u32 bumpg() { g += 10; return 1; }
+u32 pair(u32 a, u32 b) { return a * 100 + b; }
+u32 main() {
+    u32 x = 5;
+    if (x + bump(&x) != 6) { return 1; }          // binary
+    g = 5;
+    if (g + bumpg() != 6) { return 2; }           // the global spelling agrees
+    u32 y = 5;
+    if (pair(y, bump(&y)) != 501) { return 3; }   // call arguments
+    u32 z = 5;
+    P p = { .a = z, .b = bump(&z) };              // struct literal fields
+    if (p.a != 5 || p.b != 1 || z != 15) { return 4; }
+    u32 w = 5;
+    if (w == bump(&w) + 14) { return 5; }         // comparison: 5 == 15 is false
+    u32 v = 5;
+    u32 r = v * (bump(&v) + 1);                   // nested: v read before the call
+    if (r != 10) { return 6; }
+    return 0;
+}

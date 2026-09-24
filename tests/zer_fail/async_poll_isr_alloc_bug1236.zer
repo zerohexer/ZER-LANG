@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: cannot allocate inside interrupt handler
+struct Box { u32 v; }
+Slab(Box) sl;
+async void f() { *Box p = sl.alloc_ptr() orelse return; p.v = 1; sl.free_ptr(p); yield; }
+interrupt USART1 {
+    _zer_async_f t; _zer_async_f_init(&t);
+    _zer_async_f_poll(&t);
+}
+u32 main() { return 0; }

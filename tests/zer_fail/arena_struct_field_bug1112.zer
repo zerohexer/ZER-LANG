@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot be struct fields
+// BUG-1112: an Arena as a struct field was accepted and every method call on it
+// was emitted as a raw C member call (`'_zer_arena' has no member named 'reset'`).
+struct Scratch { Arena a; }
+u8[256] backing;
+Scratch g_s;
+u32 main() { g_s.a = Arena.over(backing); g_s.a.reset(); return 0; }

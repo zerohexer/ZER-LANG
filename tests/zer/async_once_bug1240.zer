@@ -1,0 +1,4 @@
+// BUG-1240 positive: @once in an async body
+u32 g;
+async void f() { @once { g += 1; } yield; }
+u32 main() { _zer_async_f a; _zer_async_f_init(&a); _zer_async_f_poll(&a); return g - 1; }

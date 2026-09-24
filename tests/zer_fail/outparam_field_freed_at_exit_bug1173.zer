@@ -1,0 +1,20 @@
+// expect-error: reached through a pointer parameter
+// BUG-1173: an out-param field left pointing at freed memory at return.
+struct T { u32 v; }
+struct W { *T p; }
+void mk(*W out) {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    out.p = a;
+    free(a);
+}
+u32 main() {
+    T g;
+    W w = { .p = &g };
+    mk(&w);
+    *T d = alloc(T) orelse return;
+    d.v = 9;
+    u32 r = w.p.v;
+    free(d);
+    return r;
+}

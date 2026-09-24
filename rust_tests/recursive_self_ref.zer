@@ -16,12 +16,12 @@ u32 main() {
     n1.next = null;
 
     ?*ListNode m2 = heap.alloc_ptr();
-    *ListNode n2 = m2 orelse return;
+    *ListNode n2 = m2 orelse { heap.free_ptr(n1); return 2; };   // BUG-1071
     n2.value = 2;
     n2.next = n1;
 
     ?*ListNode m3 = heap.alloc_ptr();
-    *ListNode n3 = m3 orelse return;
+    *ListNode n3 = m3 orelse { heap.free_ptr(n2); heap.free_ptr(n1); return 3; };
     n3.value = 3;
     n3.next = n2;
 

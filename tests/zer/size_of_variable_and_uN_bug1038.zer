@@ -1,0 +1,18 @@
+// BUG-1038: `@size(x)` on a VARIABLE emitted `sizeof(struct x)` (GCC: incomplete
+// type) and `@size(u21)` was "undefined identifier 'u21'". Both resolve now: a
+// variable's size is its type's, a uN's is its carrier's.
+struct Task { u32 id; u64 pad; }
+packed struct Pk { u8 a; u32 b; }
+u32 main() {
+    u21 x = 5;
+    Task t;
+    u32 s1 = (u32)@size(x);      // 4 — the u21 carrier
+    u32 s2 = (u32)@size(u21);    // 4
+    u32 s3 = (u32)@size(u3);     // 1
+    u32 s4 = (u32)@size(t);      // 16
+    u32 s5 = (u32)@size(Task);   // 16
+    u32 s6 = (u32)@size(Pk);     // 5
+    u32 s7 = (u32)@size(u64);    // 8
+    if (s1 != 4 || s2 != 4 || s3 != 1 || s4 != 16 || s5 != 16 || s6 != 5 || s7 != 8) { return 1; }
+    return 0;
+}

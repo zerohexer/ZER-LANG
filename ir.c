@@ -71,7 +71,22 @@ int ir_add_local(IRFunc *func, Arena *arena,
                 bool same_type = (!type || !func->locals[i].type ||
                                   type == func->locals[i].type);
                 bool same_scope = (func->locals[i].scope_depth == cur_depth);
-                if (same_type && same_scope) return func->locals[i].id;
+                /* BUG-1185: a CAPTURE never shares storage with another name
+                 * (either direction). `u32 i = 3; if (mb()) |i| { … }` has
+                 * the same name, type and depth as the outer `i`, so the
+                 * capture WAS the outer local: the unwrap overwrote it and the
+                 * next `arr[i]` indexed with the payload, past a bound the
+                 * checker had proven for 3 (ASan global-buffer-overflow).
+                 * And a dedup onto a local whose block has CLOSED must re-open
+                 * it: returning it still hidden made ir_find_local fall back to
+                 * the LAST same-named local — a sibling block's `u8 v` answered
+                 * for this block's `u32 v`, and a nested range-for's step
+                 * advanced the inner loop's counter (an infinite loop). */
+                if (same_type && same_scope && !is_capture &&
+                    !func->locals[i].is_capture) {
+                    func->locals[i].hidden = false;
+                    return func->locals[i].id;
+                }
                 /* Different type OR different scope → fall through to create
                  * new suffixed local. Use `_%d` with the count to ensure
                  * uniqueness across suffixed + unsuffixed variants. */
@@ -187,6 +202,8 @@ int ir_add_block(IRFunc *func, Arena *arena) {
     memset(block, 0, sizeof(IRBlock));
     block->id = id;
     block->orelse_fallback_local = -1;   /* BUG-985: 0 is a valid local */
+    block->dead_code_seed = -1;          /* BUG-1070 */
+    block->orelse_subject_local = -1;    /* BUG-1071 */
 
     /* Pre-allocate instruction array */
     block->inst_capacity = 8;
@@ -236,7 +253,8 @@ int ir_append_block_copies(IRFunc *func, Arena *arena,
          * label would emit duplicate C goto targets) and `preds` (recomputed by
          * ir_compute_preds after lowering). */
         dst->is_orelse_fallback = sb->is_orelse_fallback;
-        dst->is_early_exit      = sb->is_early_exit;
+        dst->orelse_fallback_local = sb->orelse_fallback_local;   /* locals are shared */
+        dst->orelse_subject_local  = sb->orelse_subject_local;    /* BUG-1071 */
 
         if (sb->inst_count <= 0) continue;
         dst->insts = (IRInst *)arena_alloc(arena, (size_t)sb->inst_count * sizeof(IRInst));
@@ -288,82 +306,121 @@ static void add_pred(IRBlock *block, Arena *arena, int pred_id) {
     block->preds[block->pred_count++] = pred_id;
 }
 
+/* The successors of block `bi`, written into out[0..1]; returns how many.
+ *
+ * BUG-964: the successors are decided by the block's FIRST terminator, not
+ * its last instruction. (BUG-1070 made the lowerer stop appending past one —
+ * ir_validate now rejects it — so for lowered IR the first terminator IS the last
+ * instruction. The first-terminator rule stays as the defensive reading.)
+ *
+ * Yield/await → resume point. ir_lower sets last->goto_block = resume_bb.
+ * Pre-fix used `bi + 1`, which only matches when the resume_bb is the
+ * next-sequential block — but when an orelse decomp inserts intermediate blocks
+ * between yield/await and resume, bi+1 points at a fail-RETURN block instead
+ * (§E #30: a handle freed before an `await (opt orelse d) == x` was NOT seen
+ * FREED at a use after the await — a silent UAF).
+ *
+ * IR_RETURN / IR_TRAP: no successor. IR_TRAP (BUG-957) is a terminator by
+ * ir_block_is_terminated, but it used to fall into `default` here and gain a
+ * phantom fall-through edge into the next block.
+ *
+ * Non-terminator last instruction — implicit fallthrough to next block. */
+static int ir_block_succs(IRFunc *func, int bi, int out[2]) {
+    IRBlock *block = &func->blocks[bi];
+    if (block->inst_count == 0) return 0;
+    IRInst *last = &block->insts[block->inst_count - 1];
+    for (int ii = 0; ii < block->inst_count; ii++) {
+        IROpKind op = block->insts[ii].op;
+        if (op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN ||
+            op == IR_YIELD  || op == IR_AWAIT || op == IR_TRAP) {
+            last = &block->insts[ii];
+            break;
+        }
+    }
+    int n = 0;
+    switch (last->op) {
+    case IR_BRANCH:
+        if (last->true_block >= 0 && last->true_block < func->block_count)
+            out[n++] = last->true_block;
+        if (last->false_block >= 0 && last->false_block < func->block_count)
+            out[n++] = last->false_block;
+        break;
+    case IR_GOTO:
+        if (last->goto_block >= 0 && last->goto_block < func->block_count)
+            out[n++] = last->goto_block;
+        break;
+    case IR_YIELD:
+    case IR_AWAIT:
+        if (last->goto_block >= 0 && last->goto_block < func->block_count)
+            out[n++] = last->goto_block;
+        else if (bi + 1 < func->block_count)
+            out[n++] = bi + 1;
+        break;
+    case IR_RETURN:
+    case IR_TRAP:
+        break;
+    default:
+        if (bi + 1 < func->block_count)
+            out[n++] = bi + 1;
+        break;
+    }
+    return n;
+}
+
+/* BUG-1070: predecessor edges are recorded ONLY from blocks REACHABLE from the
+ * entry. A block nothing reaches never executes, so it must contribute no state to
+ * a block that does — and once the lowerer stopped appending the dead tail of a
+ * `return` (the enclosing block's exit fire + GOTO) into the returning block, that
+ * tail became its own unreachable block whose GOTO still named a live join. As an
+ * edge it merged a path that had ALREADY FREED a handle into the fall-through path
+ * that had not, turning a definite leak into MAYBE_FREED — silent
+ * (defer_in_branch_fallthrough_leak.zer). The same pollution reached the guard
+ * sets (ir_compute_block_guards intersects over preds).
+ *
+ * After this, `bi != 0 && pred_count == 0` is exactly "unreachable" — the reading
+ * the exit consumers in zercheck_ir already use. A dead block is still ANALYSED
+ * (zercheck's Phase-E rule seeds one that follows a RETURN with that block's
+ * state, which is what keeps `return t; u32 k = t.kind;` reported); it just
+ * cannot flow into live code. Sound: the edge set is unchanged for every
+ * reachable block, and an unreachable block runs on no execution. */
 void ir_compute_preds(IRFunc *func, Arena *arena) {
     /* Clear existing preds */
     for (int bi = 0; bi < func->block_count; bi++) {
         func->blocks[bi].pred_count = 0;
     }
+    if (func->block_count <= 0) return;
 
-    /* Walk all blocks, add edges from terminators */
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *block = &func->blocks[bi];
-        if (block->inst_count == 0) continue;
-
-        /* BUG-964: the successors are decided by the block's FIRST terminator, not
-         * its last instruction. Lowering can append past one — a `return` inside a
-         * switch arm terminates the block, and the arm's end still emits its
-         * IR_DEFER_FIRE and a GOTO to the switch join. Reading the last instruction
-         * gave that join a predecessor it does not really have, and once defer bodies
-         * became real IR, zercheck followed the phantom edge out of a path that had
-         * already freed a handle into one that frees it again — a false double free
-         * on `defer …; switch { arms that return }` (rt_drop_enum_variant_cleanup).
-         *
-         * Fixed HERE rather than by deleting the trailing instructions: they are
-         * unreachable, but they are still ANALYSED, and deleting them silently drops
-         * diagnostics about dead code — measured, it lost the use-after-move report on
-         * `return t; u32 k = t.kind;` (rt_move_struct_return_then_use). Correct edges,
-         * every instruction intact. */
-        IRInst *last = &block->insts[block->inst_count - 1];
-        for (int ii = 0; ii < block->inst_count; ii++) {
-            IROpKind op = block->insts[ii].op;
-            if (op == IR_BRANCH || op == IR_GOTO || op == IR_RETURN ||
-                op == IR_YIELD  || op == IR_AWAIT || op == IR_TRAP) {
-                last = &block->insts[ii];
-                break;
-            }
+    char *reach = (char *)calloc((size_t)func->block_count, 1);
+    int *stack = (int *)malloc((size_t)func->block_count * 2 * sizeof(int) + sizeof(int));
+    if (!reach || !stack) {
+        /* Out of memory: fall back to recording every block's edges (the
+         * pre-BUG-1070 behaviour — more edges, never fewer). */
+        free(reach); free(stack);
+        for (int bi = 0; bi < func->block_count; bi++) {
+            int succ[2];
+            int ns = ir_block_succs(func, bi, succ);
+            for (int k = 0; k < ns; k++) add_pred(&func->blocks[succ[k]], arena, bi);
         }
-        switch (last->op) {
-        case IR_BRANCH:
-            if (last->true_block >= 0 && last->true_block < func->block_count)
-                add_pred(&func->blocks[last->true_block], arena, bi);
-            if (last->false_block >= 0 && last->false_block < func->block_count)
-                add_pred(&func->blocks[last->false_block], arena, bi);
-            break;
-        case IR_GOTO:
-            if (last->goto_block >= 0 && last->goto_block < func->block_count)
-                add_pred(&func->blocks[last->goto_block], arena, bi);
-            break;
-        case IR_YIELD:
-        case IR_AWAIT:
-            /* Yield/await → resume point. ir_lower sets last->goto_block = resume_bb
-             * (ir_lower.c:2980). Pre-fix used `bi + 1`, which only matches when
-             * the resume_bb is the next-sequential block — but when an orelse
-             * decomp inserts intermediate blocks between yield/await and resume,
-             * bi+1 points at a fail-RETURN block instead. Result: missing CFG
-             * edge for the resume → false-positive "defer unreachable" trap AND
-             * lost zercheck_ir state across the suspend (§E #30: a handle freed
-             * before an `await (opt orelse d) == x` was NOT seen FREED at a use
-             * after the await — a silent UAF). IR_AWAIT was previously in the
-             * `default` fall-through (only the bi+1 edge); dfs_reachable and
-             * cfg_reaches_fire already group YIELD/AWAIT — this makes it consistent. */
-            if (last->goto_block >= 0 && last->goto_block < func->block_count)
-                add_pred(&func->blocks[last->goto_block], arena, bi);
-            else if (bi + 1 < func->block_count)
-                add_pred(&func->blocks[bi + 1], arena, bi);
-            break;
-        case IR_RETURN:
-        case IR_TRAP:
-            /* No successor. IR_TRAP (BUG-957) is a terminator by
-             * ir_block_is_terminated, but it used to fall into `default` here and
-             * gain a phantom fall-through edge into the next block. */
-            break;
-        default:
-            /* Non-terminator last instruction — implicit fallthrough to next block */
-            if (bi + 1 < func->block_count)
-                add_pred(&func->blocks[bi + 1], arena, bi);
-            break;
+        return;
+    }
+    int sp = 0;
+    reach[0] = 1;
+    stack[sp++] = 0;
+    while (sp > 0) {
+        int bi = stack[--sp];
+        int succ[2];
+        int ns = ir_block_succs(func, bi, succ);
+        for (int k = 0; k < ns; k++) {
+            if (!reach[succ[k]]) { reach[succ[k]] = 1; stack[sp++] = succ[k]; }
         }
     }
+    for (int bi = 0; bi < func->block_count; bi++) {
+        if (!reach[bi]) continue;
+        int succ[2];
+        int ns = ir_block_succs(func, bi, succ);
+        for (int k = 0; k < ns; k++) add_pred(&func->blocks[succ[k]], arena, bi);
+    }
+    free(reach); free(stack);
 }
 
 bool ir_block_is_terminated(IRBlock *block) {
@@ -490,6 +547,23 @@ bool ir_validate(IRFunc *func) {
         /* Validate branch targets */
         for (int ii = 0; ii < block->inst_count; ii++) {
             IRInst *inst = &block->insts[ii];
+
+            /* BUG-1070: a terminator is ALWAYS the block's last instruction. Every
+             * CFG consumer (ir_compute_preds, zercheck_ir's exit detection, the
+             * FuncSummary builder) reads only the LAST instruction, so an
+             * instruction after a RETURN makes the block not an exit — which is
+             * how `defer` + `return` switched leak detection off. The lowerer's
+             * ir_add_inst_checked opens a fresh block instead; this pins it. */
+            if (ii < block->inst_count - 1 &&
+                (inst->op == IR_BRANCH || inst->op == IR_GOTO ||
+                 inst->op == IR_RETURN || inst->op == IR_YIELD ||
+                 inst->op == IR_TRAP)) {
+                fprintf(stderr, "IR VALIDATION ERROR: bb%d has a terminator at inst %d "
+                        "followed by %d more instruction(s) in '%.*s'\n",
+                        bi, ii, block->inst_count - 1 - ii,
+                        (int)func->name_len, func->name);
+                valid = false;
+            }
 
             if (inst->op == IR_BRANCH) {
                 if (inst->true_block < 0 || inst->true_block >= func->block_count) {

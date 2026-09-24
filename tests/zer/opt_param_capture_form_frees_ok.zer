@@ -1,0 +1,12 @@
+// (from claude/loving-davinci-3sdup9 92cc9dfd, body verbatim; its BUG-979 -> main BUG-985)
+// Was a NEGATIVE (tests/zer_fail/opt_param_capture_form_stays_maybe.zer) pinning a
+// precision residual: the `if (h.p) |q| { free(q); }` capture form joined the freed
+// path with the NULL path inside the callee, so the summary was MAYBE and the caller
+// was told the field "may not be freed on all paths".
+// BUG-1071 (2026-09-23): the null edge of an optional test now DROPS the optional's
+// entries (on that path there is no allocation to track), so the join is FREED and
+// the summary says the callee frees `h.p` — this is correct code and compiles.
+struct T { u32 v; }
+struct H { ?*T p; }
+void drop(*H h) { if (h.p) |q| { free(q); } h.p = null; }
+u32 main() { H h; h.p = alloc(T); drop(&h); return 0; }

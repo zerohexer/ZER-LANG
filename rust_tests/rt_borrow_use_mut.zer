@@ -20,12 +20,12 @@ u32 main() {
     // Allocate fresh, use it, free it properly
     ?*Item mi2 = heap.alloc_ptr();
     *Item p2 = mi2 orelse return;
+    defer heap.free_ptr(p2);   // BUG-1071: also on the early returns below
     p2.a = 10;
     p2.b = 20;
 
     if (p2.a != 10) { return 1; }
     if (p2.b != 20) { return 2; }
 
-    heap.free_ptr(p2);
     return 0;
 }

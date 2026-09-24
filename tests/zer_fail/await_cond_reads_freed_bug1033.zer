@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1025: an await CONDITION is re-evaluated from the raw AST on every poll
+// (BUG-591), and IR_AWAIT was a zercheck no-op — so the poll read freed memory
+// on every resume. The existing negative only tested a use AFTER the await.
+struct Item { u32 id; }
+async void w() {
+    *Item p = alloc(Item) orelse return;
+    p.id = 1;
+    free(p);
+    await p.id == 7;
+}
+u32 main() { _zer_async_w t; _zer_async_w_init(&t); return 0; }

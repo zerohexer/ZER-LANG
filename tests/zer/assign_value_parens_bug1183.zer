@@ -1,0 +1,21 @@
+// BUG-1183: an assignment used as a VALUE keeps its own parentheses in the
+// emitted C. Pre-fix `a[0] = (y = 5) + 1;` emitted `a[0] = (y = 5U + 1U);` — y
+// became 6 — and `(y = 3) == 3` stored 1 into y.
+u32 main() {
+    u32[4] a;
+    u32 y = 0;
+    a[0] = (y = 5) + 1;
+    if (y != 5 || a[0] != 6) { return 1; }
+    bool[2] bs;
+    u32 z = 0;
+    bs[0] = (z = 3) == 3;
+    if (z != 3 || !bs[0]) { return 2; }
+    u32 w = 0;
+    a[1] = 1 + (w = 2) * 3;
+    if (w != 2 || a[1] != 7) { return 3; }
+    u32 i = 0;
+    a[2] = (i = 3) + 1;          // i is 3, not 4 — the next index is in range
+    a[i] = 99;
+    if (a[3] != 99) { return 4; }
+    return 0;
+}

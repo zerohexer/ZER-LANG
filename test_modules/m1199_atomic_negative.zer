@@ -1,0 +1,3 @@
+// BUG-1199: an imported static used atomically by a thread and plainly by main.
+import m1199st;
+u32 main() { spawn sabump(); return saread(); }

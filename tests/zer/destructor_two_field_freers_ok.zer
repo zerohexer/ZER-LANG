@@ -10,7 +10,7 @@ void cleanup(*H h) { free_a(h); free_b(h); }
 u32 main() {
     H h;
     h.a = alloc(B, 2) orelse { return 1; };
-    h.b = alloc(B, 2) orelse { return 1; };
+    h.b = alloc(B, 2) orelse { free(h.a); return 1; };   // BUG-1071: h.a is live here
     cleanup(&h);
     return 0;
 }

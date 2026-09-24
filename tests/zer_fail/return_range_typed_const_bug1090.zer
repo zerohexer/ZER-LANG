@@ -1,0 +1,11 @@
+// expect-error: always out of bounds
+// BUG-1090: the return-range summary folded `(0 - 1) / 1073741824` as 0; f returns
+// 3, and `two[f(2)]` was unchecked (ASan). The summary is now [3,3].
+u32 f(u32 x) {
+    return (0 - 1) / 1073741824;
+}
+u32 main() {
+    u32[2] two;
+    two[f(2)] = 7;
+    return 0;
+}

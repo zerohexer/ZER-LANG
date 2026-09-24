@@ -1,0 +1,10 @@
+// BUG-1261: a program that only FREES a T (a helper taking *T, e.g. a library
+// release function) used to emit `_zer_auto_slab_T` with no declaration — a GCC
+// error blaming the user's line. The free now names the auto-slab itself.
+struct T { u32 v; }
+void rel(*T p) { free(p); }
+u32 main() {
+    T x;
+    x.v = 1;
+    return x.v - 1;
+}

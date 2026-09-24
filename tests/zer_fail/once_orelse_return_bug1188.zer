@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: cannot use 'orelse return' inside @once block
+// BUG-1188: pre-fix this compiled; the skipped publish left the once-flag at 1 and
+// the SECOND call spun forever (single-threaded hang).
+u32 cnt = 0;
+?u32 mb(u32 i) { if (i > 0) { return i; } return null; }
+u32 f(u32 k) {
+    @once {
+        cnt += 1;
+        u32 v = mb(k) orelse return;
+        cnt += v;
+    }
+    return cnt;
+}
+u32 main() {
+    f(0);
+    f(0);
+    if (cnt != 1) { return 1; }
+    return 0;
+}

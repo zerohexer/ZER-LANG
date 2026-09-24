@@ -1,0 +1,17 @@
+// BUG-1233 positive: a task that frees its param takes ownership; polled to done
+struct Box { u32 v; }
+async u32 f(*Box b) { yield; return b.v; }
+async void g(*Box b) { yield; free(b); }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    p.v = 9;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    while (_zer_async_f_poll(&t) == 0) { }
+    u32 r = _zer_async_f_result(&t);
+    free(p);
+    *Box q = alloc(Box) orelse return;
+    _zer_async_g u; _zer_async_g_init(&u, q);
+    while (_zer_async_g_poll(&u) == 0) { }
+    if (r != 9) { return 1; }
+    return 0;
+}

@@ -1,0 +1,51 @@
+// BUG-1185: IR locals and scopes.
+//  (1) an if-unwrap capture with the same name, type and depth as an outer local
+//      WAS that local — the unwrap overwrote it (and a checker-proven index then
+//      wrote out of bounds);
+//  (2) a capture stayed visible after its if, so the outer name read the payload;
+//  (3) a sibling block's re-declaration was deduped onto a HIDDEN local and name
+//      lookup fell back to the last same-named local (a sibling's u8 `v`); a
+//      nested range-for stepped the inner loop's counter (infinite loop).
+u32[10] arr;
+u32[5] five;
+?u32 mb(u32 i) { if (i > 0) { return i; } return null; }
+?u8 mb8(u8 i) { if (i > 0) { return i; } return null; }
+?u32 g;
+u32 sib(u32 k) {
+    u32 r = 0;
+    if (k == 0) { u32 v = 1; r += v; }
+    if (k == 0) { u8 v = 2; r += (u32)v; }
+    if (k == 0) { u32 v = 1000; r += v; }
+    return r;
+}
+u32 main() {
+    u32 i = 3;
+    u32 r = 0;
+    if (mb(12)) |i| { r = i; }            // (1): the capture is its own local
+    if (r != 12) { return 1; }
+    arr[i] = 5;                           // i is still 3
+    if (arr[3] != 5) { return 2; }
+    u8 z = 0;
+    if (mb8(3)) |v| {
+        if (mb(300)) |v| { z = 1; }
+        z = v;                            // (2): the outer capture, a u8 3
+    }
+    if (z != 3) { return 3; }
+    g = 5;
+    *u32 p = &arr[1];
+    if (g) |*p| { *p = 6; }               // writes g
+    *p = 7;                               // writes arr[1]
+    if ((g orelse 0) != 6 || arr[1] != 7) { return 4; }
+    if (sib(0) != 1003) { return 5; }     // (3)
+    [*]u32 sl = five;
+    u32 s = 0;
+    for (u32 x in sl) {
+        for (u32 y in sl) { s += 1; }
+    }
+    if (s != 25) { return 6; }
+    ?u32 v = 7;                           // (4) the condition reads the OUTER v
+    u32 got = 0;
+    if (v) |v| { got = v; }
+    if (got != 7) { return 7; }
+    return 0;
+}

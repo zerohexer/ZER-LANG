@@ -1,0 +1,8 @@
+// expect-error: not re-entrant
+// BUG-1156: a braceless `defer stmt;` body skipped the per-statement lock
+// checks (it was a bare expression statement, not a block).
+shared(rw) struct A { u32 x; }
+A a;
+u32 rd() { u32 v = a.x; return v; }
+void f() { defer a.x = rd(); }
+u32 main() { f(); return 0; }

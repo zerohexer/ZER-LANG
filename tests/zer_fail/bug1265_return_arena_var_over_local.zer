@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot return an Arena over this function's local memory
+struct T { u32 v; }
+Arena mk() { u8[64] b; Arena a = Arena.over(b); return a; }
+u32 main() { Arena a = mk(); *T t = a.alloc(T) orelse return; t.v = 5; return t.v; }

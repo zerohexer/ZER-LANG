@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: a non-optional '[*]u32' global cannot be reset
+// BUG-1049: the dangling-global rule's remedy (`g = null;`) does not compile for
+// a non-optional global, so the diagnostic names the real remedy instead:
+// declare the global optional.
+[*]u32 g;
+u32 main() { g = alloc(u32, 4) orelse return; g[0] = 1; free(g); return 0; }

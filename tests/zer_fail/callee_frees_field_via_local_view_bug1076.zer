@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1076 (H4): the view is taken INSIDE an intermediate callee (`*H x = h; zap(x);`).
+// Pre-fix: exit 99.
+struct T { u32 v; }
+struct H { *T p; }
+void zap(*H h) { free(h.p); }
+void outer(*H h) { *H x = h; zap(x); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = { .p = a };
+    outer(&h);
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 99;
+    u32 r = h.p.v;
+    free(b);
+    free(a);
+    return r;
+}

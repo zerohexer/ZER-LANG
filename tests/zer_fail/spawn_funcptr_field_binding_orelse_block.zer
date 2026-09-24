@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: function-pointer field whose bound function accesses non-shared global
+// BUG-1044: the racy BINDING `o.cb = bump` happens inside an orelse-block fallback
+// of a helper the spawner calls. scan_funcptr_field_bindings (the collector half
+// of the funcptr-field gate) never looked inside an expression, so the binding
+// was invisible and only the safe `nop` binding was seen.
+u32 g;
+struct Ops { *() -> void cb; }
+?u32 mb(u32 x) { if (x > 0) { return x; } return null; }
+void bump() { g += 1; }
+void nop() { }
+void worker(Ops o) { o.cb(); }
+void setup(*Ops o) { u32 v = mb(0) orelse { o.cb = bump; return; }; }
+u32 main() { Ops ops; ops.cb = nop; setup(&ops); spawn worker(ops); return 0; }

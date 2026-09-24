@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: is not supported in a comptime body
+// BUG-1048: the comptime interpreter SKIPPED a call statement to a run-time function and folded a
+// WRONG constant into the emitted C (measured: the call and its side effect vanished). It now refuses the body
+// and names the construct.
+u32 side;
+void poke() { side = 1; }
+comptime u32 F(u32 a) { u32 x = a; poke(); return x; }
+u32 main() { return F(1); }

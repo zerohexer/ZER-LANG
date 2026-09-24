@@ -1,0 +1,22 @@
+// expect-error: may be a view of 'b'
+// BUG-1155: a param view returned from an orelse FALLBACK block
+// (`m orelse { return b; }`) never reached the return summary, so the
+// caller's free(b) left r dangling — reads returned a recycled object.
+struct T { u32 v; }
+*T pick(*T a, *T b, ?u32 m) {
+    u32 v = m orelse { return b; };
+    return a;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 5;
+    *T r = pick(a, b, null);
+    free(b);
+    *T d = alloc(T) orelse { free(a); return 1; };
+    d.v = 9;
+    u32 x = r.v;
+    free(d);
+    free(a);
+    return x;
+}

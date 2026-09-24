@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot pass a shared struct by value
+// BUG-1250: a shared struct copied into a spawn argument (race on a cloned mutex).
+shared struct C { u32 v; u32 w; }
+C g;
+void w2(C c) { }
+void w(*C c) { for (u32 i = 0; i < 1000000; i += 1) { c.v += 1; } }
+u32 main() {
+    spawn w(&g);
+    for (u32 i = 0; i < 1000; i += 1) { spawn w2(g); }
+    return 0;
+}

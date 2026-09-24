@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize an async task by value
+// copy via deref of pointer
+async u32 f(u32 s) { u32 x = s; *u32 p = &x; yield; *p += 1; return x; }
+u32 main() {
+    _zer_async_f a; _zer_async_f_init(&a, 5); _zer_async_f_poll(&a);
+    *_zer_async_f pa = &a;
+    _zer_async_f b = *pa;
+    while (_zer_async_f_poll(&b) == 0) { }
+    return _zer_async_f_result(&b);
+}

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot assign 'Barrier' by value
+// BUG-1177: a Barrier / Semaphore copied by plain assignment is a second owner of
+// one count; the var-decl form was refused, the assignment form was not.
+Barrier b1;
+Barrier b2;
+Semaphore(2) s1;
+Semaphore(2) s2;
+u32 main() {
+    @barrier_init(b1, 1);
+    b2 = b1;
+    s2 = s1;
+    return 0;
+}

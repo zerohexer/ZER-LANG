@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: fires once per pass
+// BUG-1077 (H8): a function with a LABEL keeps the AST defer path; there a `defer`
+// inside a loop body fired once per iteration, freeing `a` twice — accepted.
+struct T { u32 v; }
+u32 main() {
+    u32 i = 0;
+    *T a = alloc(T) orelse return;
+    while (i < 2) {
+        defer free(a);
+        i += 1;
+    }
+    goto done;
+done:
+    return 0;
+}

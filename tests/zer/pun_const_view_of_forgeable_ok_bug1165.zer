@@ -1,0 +1,14 @@
+// BUG-1165: a CONST @pun view over a source that carries a pointer/enum is a
+// read-only byte view and stays allowed — only a WRITABLE view is refused.
+enum State { idle, run }
+struct Node { *u32 p; State s; }
+u32 g = 7;
+u32 main() {
+    Node n;
+    n.p = &g;
+    n.s = State.run;
+    const *u64 raw = @pun(const *u64, &n);
+    u64 bits = *raw;
+    if (bits == 0) { return 1; }
+    return 0;
+}

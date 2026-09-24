@@ -1,0 +1,15 @@
+move struct Tok { u32 k; }
+distinct typedef Tok DT;
+u32 consume(Tok t) { return t.k; }
+u32 consume_d(DT t) { return 1; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    DT d = @cast(DT, a);
+    u32 r = consume(@cast(Tok, d));
+    Tok b;
+    b.k = 2;
+    r += consume_d(@cast(DT, b));
+    if (r != 4) { return 1; }
+    return 0;
+}

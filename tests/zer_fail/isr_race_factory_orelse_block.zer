@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: must be declared volatile
+// BUG-1044: the ISR sibling of spawn_race_factory_orelse_block —
+// record_isr_returned_funcname had the same blind spot, so the callback bound in
+// the interrupt handler was never scanned and `g` stayed non-volatile.
+u32 g;
+?u32 mb(u32 x) { if (x > 0) { return x; } return null; }
+void cb() { g += 1; }
+void nop() { }
+*() -> void mk(u32 k) {
+    u32 v = mb(k) orelse { return cb; };
+    return nop;
+}
+interrupt TIM1 { *() -> void fp = mk(0); fp(); }
+u32 main() { u32 x = g; return x & 1; }

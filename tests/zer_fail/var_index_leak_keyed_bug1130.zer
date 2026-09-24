@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1130 (3): storing into a LOCAL array at a variable index exempted the allocation
+// from leak checking (the store counted as an escape). Pre-fix: compiled.
+struct T { u32 v; }
+u32 run(u32 k) {
+    if (k >= 4) { return 0; }
+    ?*T[4] arr;
+    *T a = alloc(T) orelse return;
+    arr[k] = a;
+    return 0;
+}
+u32 main() { return run(1); }

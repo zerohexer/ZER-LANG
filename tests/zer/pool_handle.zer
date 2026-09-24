@@ -11,7 +11,8 @@ Pool(Task, 8) tasks;
 u32 main() {
     // Alloc
     Handle(Task) h1 = tasks.alloc() orelse return;
-    Handle(Task) h2 = tasks.alloc() orelse return;
+    Handle(Task) h2 = tasks.alloc() orelse { tasks.free(h1); return 7; };   // BUG-1071
+    defer tasks.free(h2);   // every early return below frees it too
 
     // Set fields via inline get
     tasks.get(h1).id = 1;
@@ -20,14 +21,15 @@ u32 main() {
     tasks.get(h2).priority = 20;
 
     // Read back
-    if (tasks.get(h1).id != 1) { return 1; }
-    if (tasks.get(h1).priority != 10) { return 2; }
-    if (tasks.get(h2).id != 2) { return 3; }
-    if (tasks.get(h2).priority != 20) { return 4; }
+    if (tasks.get(h1).id != 1) { tasks.free(h1); return 1; }
+    if (tasks.get(h1).priority != 10) { tasks.free(h1); return 2; }
+    if (tasks.get(h2).id != 2) { tasks.free(h1); return 3; }
+    if (tasks.get(h2).priority != 20) { tasks.free(h1); return 4; }
 
     // Free and realloc
     tasks.free(h1);
     Handle(Task) h3 = tasks.alloc() orelse return;
+    defer tasks.free(h3);
     tasks.get(h3).id = 3;
     tasks.get(h3).priority = 30;
 
@@ -36,9 +38,6 @@ u32 main() {
 
     // h3 works
     if (tasks.get(h3).id != 3) { return 6; }
-
-    tasks.free(h2);
-    tasks.free(h3);
 
     return 0;
 }

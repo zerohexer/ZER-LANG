@@ -1,0 +1,8 @@
+// BUG-1214: a function may use a global declared further down the file (the
+// checker registers every top-level name first); the emitter wrote globals in
+// source order, so this reached GCC as "'later' undeclared".
+u32 use() { return later + table[1] + 2; }
+u32 later = 5;
+u32[3] table;
+*u32 lp = &later;
+u32 main() { if (use() != 7) { return 1; } if (*lp != 5) { return 2; } return 0; }

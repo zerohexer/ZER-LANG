@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: may already be freed
+// BUG-1075 (H5): slice spelling of the free-through-view double free.
+// Pre-fix: compiled, ASan attempting double-free.
+[*]u32 pick([*]u32 x, [*]u32 y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    [*]u32 a = alloc(u32, 4) orelse return;
+    [*]u32 d = alloc(u32, 4) orelse { free(a); return 1; };
+    [*]u32 c = pick(d, a, false);
+    free(c);
+    free(a);
+    free(d);
+    return 0;
+}

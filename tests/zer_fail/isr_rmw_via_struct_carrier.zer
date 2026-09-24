@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written and is shared
+// BUG-1046 (RMW REACH): the pointer to `g` reaches the read-modify-write through
+// a vehicle the resolvers never followed — a by-value struct CARRIER, at the ISR sink. Accepted on main before the fix
+// (measured); a torn read-modify-write that loses an update, silent on bare metal.
+volatile u32 g;
+struct H { volatile *u32 p; }
+void bump(H h) { *h.p += 1; }
+interrupt TIM2 { H h; h.p = &g; bump(h); }
+u32 main() { u32 x = g; return x & 1; return 0; }

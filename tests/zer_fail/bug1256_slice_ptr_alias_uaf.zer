@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+u32 main() {
+    [*]u32 s = alloc(u32, 8) orelse return;
+    s[0] = 5;
+    *u32 p = s.ptr;
+    free(s);
+    [*]u32 s2 = alloc(u32, 8) orelse return;
+    s2[0] = 99;
+    u32 r = *p;
+    free(s2);
+    return r;
+}

@@ -1,0 +1,15 @@
+// expect-error: carries the address of threadlocal
+// BUG-1170: a threadlocal's address escaped to a global through an alias,
+// a carrier or a struct literal (A5 caught only the literal `g = &tl`).
+threadlocal u32 tl;
+u32 dummy;
+shared struct S { *u32 p; }
+S sh = { .p = &dummy };
+void w() { tl = 42; *u32 q = &tl; sh.p = q; }   // direct `sh.p = &tl` IS rejected
+void other() { tl = 7; }
+u32 main() {
+    ThreadHandle t = spawn w(); t.join();      // w's thread has exited: its TLS is gone
+    ThreadHandle t2 = spawn other(); t2.join(); // glibc reuses the cached stack/TLS block
+    u32 v = *sh.p;
+    return v;                                  // 7: read of ANOTHER (also dead) thread's TLS
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: not all control flow paths return a value in function 'f'
+// BUG-1190: `goto out` lands on a label AFTER the loop, and the function ends there.
+// Pre-fix the `while (true)` (and, in the sibling shape, a `return` before the label)
+// counted as covering every path; f(3) returned NULL and main dereferenced it.
+*u32 f(u32 k) {
+    while (true) {
+        if (k == 0) { goto out; }
+        k -= 1;
+    }
+out:
+}
+u32 main() { *u32 p = f(3); return *p; }

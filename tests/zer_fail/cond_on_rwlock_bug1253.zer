@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: needs a plain 'shared struct'
+// BUG-1253: condvar ops on a shared(rw) struct emitted a missing _zer_mtx.
+shared(rw) struct Q { u32 n; }
+Q q;
+void prod(*Q p) { for (u32 i = 0; i < 1000; i += 1) { p.n += 1; @cond_signal(q); } }
+u32 main() {
+    spawn prod(&q);
+    @cond_wait(q, q.n >= 1000);
+    return 0;
+}

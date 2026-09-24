@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: array index: this constant reads differently signed and unsigned
+// BUG-1063: the INDEX sink of BUG-1018's divergent-reading refusal. `-4 / -2` is 2
+// read signed and 0 read as the u32 its literals are. The index position used to
+// render the signed reading and was left alone as "self-consistent"; once literal
+// rendering followed the checker type everywhere (BUG-1063) it rendered the
+// unsigned one instead — silently picking a reading, which every other sink refuses.
+u32 main() {
+    u32[4] a;
+    a[2] = 7;
+    return a[-4 / -2];
+}

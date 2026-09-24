@@ -1,0 +1,5 @@
+// BUG-1029: alloc(T, n) INSIDE an imported module spelled `sizeof(struct Task)`
+// with the bare struct name while the struct is emitted as `struct alloc_lib__Task`
+// — GCC: "invalid application of 'sizeof' to incomplete type".
+struct Task { u32 id; u64 pad; }
+?[*]Task make(u32 n) { return alloc(Task, n); }

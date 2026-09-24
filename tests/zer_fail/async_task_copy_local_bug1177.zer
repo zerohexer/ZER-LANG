@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize an async task by value
+// BUG-1177: the in-frame copy. Pre-fix it compiled and returned 5, not 6: the
+// copy's `*p += 1` updated the ORIGINAL task's `x`.
+async u32 cnt() {
+    u32 x = 5;
+    *u32 p = &x;
+    yield;
+    *p += 1;
+    yield;
+    return x;
+}
+u32 main() {
+    _zer_async_cnt t;
+    _zer_async_cnt_init(&t);
+    _zer_async_cnt_poll(&t);
+    _zer_async_cnt t2 = t;
+    _zer_async_cnt_poll(&t2);
+    _zer_async_cnt_poll(&t2);
+    if (_zer_async_cnt_result(&t2) != 6) { return 1; }
+    return 0;
+}

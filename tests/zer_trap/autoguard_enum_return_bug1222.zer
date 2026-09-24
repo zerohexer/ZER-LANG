@@ -1,0 +1,15 @@
+// expect-trap
+// expect-trap-at: 8
+// BUG-1222: the early return handed back 0 from an enum with no 0 variant; the
+// exhaustive switch's last-arm elision then took `.b` (returned 2).
+enum E { a = 5, b = 6 }
+u32[4] arr;
+u32 g(u32 k) { return k; }
+E f(u32 k) { arr[k] = 1; return E.a; }
+u32 main() {
+    switch (f(g(9))) {
+        .a => { return 1; }
+        .b => { return 2; }
+    }
+    return 0;
+}

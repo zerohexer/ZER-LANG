@@ -109,6 +109,95 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1019 — the null-function-pointer guard, at all THREE call-emission paths.
+#
+# Same silent-drop shape as the lock cap above, and worse to lose: a dropped
+# guard leaves a raw indirect call through address 0, which HOSTED still faults
+# into ZER's SIGSEGV handler and looks handled, while on bare metal it jumps
+# into the reset vector with nothing to notice. The absence is invisible to
+# every other gate, and to a hosted test run.
+#
+# Three shapes because the callee reaches three different emitters: the
+# decomposed IR_CALL (array element / struct field), `emit_rewritten_node`
+# (inside a defer body), and `emit_expr` (spawn arguments and labelled-function
+# defer bodies). A direct call must NOT be guarded — that half keeps the gate
+# from passing on a compiler that simply guards everything.
+cat > "$req_dir/fpguard.zer" <<'ZEOF'
+typedef u32 (*B)(u32, u32);
+struct Ops { B f; }
+u32 add(u32 a, u32 b) { return a + b; }
+B[3] tbl;
+Ops ops;
+u32 viaindex(u32 i) { return tbl[i](1, 2); }
+u32 viafield()      { return ops.f(1, 2); }
+u32 vianame()       { B g = tbl[0]; return g(1, 2); }
+u32 direct()        { return add(1, 2); }
+u32 main() { tbl[0] = add; ops.f = add; return viaindex(0) + viafield() + vianame() + direct(); }
+ZEOF
+if "$ZERC" "$req_dir/fpguard.zer" -o "$req_dir/fpguard.c" >/dev/null 2>&1; then
+    for fn in viaindex viafield vianame; do
+        n=$(sed -n "/^uint32_t $fn/,/^}/p" "$req_dir/fpguard.c" \
+            | grep -c 'call through a null function pointer' || true)
+        if [ "$n" -lt 1 ]; then
+            echo "MISSING EMISSION: indirect call in '$fn' has NO null-funcptr guard"
+            REQ_FAIL=$((REQ_FAIL + 1))
+        fi
+    done
+    nd=$(sed -n '/^uint32_t direct/,/^}/p' "$req_dir/fpguard.c" \
+         | grep -c 'call through a null function pointer' || true)
+    if [ "$nd" -ne 0 ]; then
+        echo "OVER-EMISSION: a DIRECT call in 'direct' was given a null-funcptr guard"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the funcptr-guard sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1020 — the @critical interrupt-disable cascade, per TARGET.
+#
+# `@critical` must disable interrupts on bare metal and must NOT try to on a
+# hosted target, where the instruction is privileged. Getting that wrong is
+# invisible to a host test run in both directions: the hosted-ARM arms did not
+# BUILD at all (so no ZER test could reach them), and hosted RISC-V built clean
+# and would have faulted at run time in user mode.
+#
+# No cross-toolchain needed: the choice is made entirely by the preprocessor, so
+# defining the target's own macros and asking `gcc -E` which arm survives tests
+# the real cascade. Measured against actual aarch64 / armhf / riscv64 GCC when
+# this was written; the simulation agreed with all of them.
+cat > "$req_dir/crit.zer" <<'ZEOF'
+shared struct Counter { u32 val; }
+Counter c;
+i32 main() { @critical { c.val += 1; } return 0; }
+ZEOF
+if "$ZERC" "$req_dir/crit.zer" -o "$req_dir/crit.c" >/dev/null 2>&1; then
+    # target-name | preprocessor macros | instruction that MUST appear
+    while IFS='|' read -r tname tmacros twant; do
+        [ -z "$tname" ] && continue
+        got=$(gcc -E $tmacros -x c "$req_dir/crit.c" 2>/dev/null \
+              | sed -n '/int32_t main/,/^}/p' \
+              | grep -oE 'primask|daifset|cpsid|csrrci|cli|__atomic_thread_fence' \
+              | sort -u | tr '\n' ' ')
+        case " $got " in
+            *" $twant "*) ;;
+            *) echo "MISSING EMISSION: @critical on $tname picked '${got:-nothing}', want '$twant'"
+               REQ_FAIL=$((REQ_FAIL + 1)) ;;
+        esac
+    done <<'TARGETS'
+cortex-m (bare)|-D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=77 -ffreestanding|primask
+aarch64 (bare)|-D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65 -ffreestanding|daifset
+aarch64 (hosted)|-D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65|__atomic_thread_fence
+arm A-profile (bare)|-D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=65 -ffreestanding|cpsid
+riscv (bare)|-D__riscv=1 -ffreestanding|csrrci
+riscv (hosted)|-D__riscv=1|__atomic_thread_fence
+x86 (bare)|-ffreestanding|cli
+TARGETS
+else
+    echo "MISSING EMISSION: the @critical cascade sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

@@ -33,7 +33,8 @@ u32 main(){
 
     *T p = heap.alloc_ptr() orelse { return 4; };  // builtin subject, passthrough
     p.v = 9;
-    if (p.v != 9) { return 5; }
-    heap.free_ptr(p);
+    u32 pv = p.v;
+    heap.free_ptr(p);                              // BUG-1071: before the early return
+    if (pv != 9) { return 5; }
     return 0;
 }

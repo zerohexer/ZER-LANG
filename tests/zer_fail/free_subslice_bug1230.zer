@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: points INSIDE its allocation
+// BUG-1230: free() of a sub-slice not starting at 0 — glibc aborts, a bare-metal allocator is corrupted.
+struct T { u32 v; }
+u32 main() {
+    [*]T s = alloc(T, 4) orelse return;
+    [*]T tail = s[1..4];
+    free(tail);
+    return 0;
+}

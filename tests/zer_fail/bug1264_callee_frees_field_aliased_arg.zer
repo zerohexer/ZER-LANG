@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: same allocation as a field of argument
+struct T { u32 v; }
+struct H { *T p; }
+u32 use_it(*H h, *T t) {
+    free(h.p);
+    *T t2 = alloc(T) orelse return;
+    t2.v = 99;
+    u32 r = t.v;
+    free(t2);
+    return r;
+}
+u32 main() {
+    *T t = alloc(T) orelse return;
+    t.v = 5;
+    H h = { .p = t };
+    return use_it(&h, t);
+}

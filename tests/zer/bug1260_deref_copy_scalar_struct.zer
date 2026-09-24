@@ -1,0 +1,12 @@
+struct P { u32 x; u32 y; }
+P get(*P p) { return *p; }
+u32 main() {
+    P a = { .x = 3, .y = 4 };
+    *P pp = &a;
+    P b = *pp;
+    P c;
+    c = *pp;
+    P d = get(pp);
+    if (b.x + c.y + d.x != 10) { return 1; }
+    return 0;
+}

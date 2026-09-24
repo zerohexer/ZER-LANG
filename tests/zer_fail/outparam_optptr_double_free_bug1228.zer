@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-1228: `fill(&m)` stored an allocation through `*?*T`; m stayed untracked and a double free compiled.
+struct T { u32 v; }
+void fill(*?*T out) { *out = alloc(T); }
+u32 main() {
+    ?*T m = null;
+    fill(&m);
+    if (m) |p| { free(p); }
+    if (m) |p| { free(p); }
+    return 0;
+}

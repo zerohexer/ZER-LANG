@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: overwritten while alive
+// BUG-1072 (H10): `h.p = alloc(); h.p = alloc();` — the compound-slot alloc spelling.
+struct T { u32 v; }
+struct H { *T p; }
+u32 main() {
+    H h;
+    h.p = alloc(T) orelse return;
+    h.p = alloc(T) orelse return;
+    free(h.p);
+    return 0;
+}

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize a shared struct by value
+// BUG-1250: an array of shared structs was copied.
+shared struct C { u32 v; }
+C[2] ga;
+u32 main() { C[2] b = ga; return b[0].v; }

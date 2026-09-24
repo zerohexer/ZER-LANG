@@ -1,0 +1,57 @@
+// BUG-1090: constants were folded in UNTYPED int64, and every VRP sink trusted the
+// fold. The program computes each tree in its checker type: `(0 - 1) / 1073741824`
+// is 0xFFFFFFFF / 2^30 = 3, not 0. Pre-fix each access below was PROVEN in range
+// against the untyped value and written unchecked (ASan); now each is guarded
+// (or proven against the TRUE value) and every function returns 0.
+//   if_bound / while_bound — the comparison bound
+//   mask / modulus         — derive_expr_range's right operand
+//   plain_assign           — `i = (0 - 1) % 7;` is ONE C expression. Before
+//                            BUG-1063 its literals rendered as C `int` (-1 % 7),
+//                            disagreeing with the typed fold (3); since BUG-1063
+//                            they render at their u32 type, so both readings are
+//                            3 and the access is in range — asserted below
+u32 get(u32 a) { return a; }
+u32 if_bound() {
+    u32[1] one;
+    u32 i = get(3);
+    if (i < (0 - 1) / 1073741824 + 1) { one[i] = 7; }
+    return 42;
+}
+u32 while_bound() {
+    u32[1] one;
+    u32 i = get(3);
+    while (i < (0 - 1) / 1073741824 + 1) { one[i] = 1; i += 1; }
+    return 42;
+}
+u32 mask() {
+    u32[2] two;
+    u32 x = get(4);
+    u32 i = x & ((0 - 1) / 1073741824 + 1);
+    two[i] = 7;
+    return 42;
+}
+u32 modulus() {
+    u32[2] two;
+    u32 x = get(7);
+    u32 i = x % ((0 - 1) / 1073741824 + 2);
+    two[i] = 7;
+    return 42;
+}
+u32 plain_assign() {
+    u32[4] arr;
+    u32 i = 0;
+    i = (0 - 1) % 7;
+    if (i > 100) { i = 5; }
+    arr[i] = 1;
+    if (i != 3) { return 42; }   /* the typed and the emitted value agree: 3 */
+    return 0;
+}
+u32 in_range() {
+    u32[4] arr;
+    u32 i = (0 - 1) / 1073741824;
+    arr[i] = 1;
+    return arr[3] - 1;
+}
+u32 main() {
+    return if_bound() + while_bound() + mask() + modulus() + plain_assign() + in_range();
+}

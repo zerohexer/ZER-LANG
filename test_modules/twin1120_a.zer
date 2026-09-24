@@ -1,0 +1,5 @@
+struct IA { u32 v; }
+Pool(IA, 4) items;
+u32 counter;
+u32 bump() { counter += 1; return counter; }
+u32 a_use() { Handle(IA) h = items.alloc() orelse return; items.get(h).v = 1; u32 r = items.get(h).v; items.free(h); return r + bump(); }

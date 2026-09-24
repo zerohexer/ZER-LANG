@@ -7,11 +7,11 @@ struct Task { u32 id; u32 value; }
 
 u32 main() {
     *Task t = alloc(Task) orelse return;
+    defer free(t);   // BUG-1071: also on the early returns below
     t.id = 7;
     t.value = 42;
     if (t.id != 7) { return 1; }
     if (t.value != 42) { return 2; }
-    free(t);
     puts("universal_alloc_single: ok");
     return 0;
 }

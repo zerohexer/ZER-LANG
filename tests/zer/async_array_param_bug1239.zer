@@ -1,0 +1,11 @@
+// BUG-1239 positive: an array param is copied into the task
+async u32 f(u32[4] a) { yield; return a[1]; }
+void start(*_zer_async_f t) {
+    u32[4] arr; arr[1] = 7;
+    _zer_async_f_init(t, arr);
+}
+u32 main() {
+    _zer_async_f t; start(&t);
+    while (_zer_async_f_poll(&t) == 0) { }
+    return _zer_async_f_result(&t) - 7;
+}

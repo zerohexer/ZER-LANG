@@ -1,0 +1,7 @@
+// expect-error: carrying a pointer to a local
+// BUG-1158: struct-literal escape class — see BUGS-FIXED.md.
+struct R { [*]u32 s; }
+R g;
+void f() { u32[4] a; a[1] = 5; g = { .s = a }; }
+u32 clobber(u32 k) { u32[32] z; for (u32 i = 0; i < 32; i += 1) { z[i] = k; } return z[k % 32]; }
+u32 main() { f(); clobber(77); return g.s[1]; }

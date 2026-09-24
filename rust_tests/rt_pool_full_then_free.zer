@@ -7,7 +7,7 @@ u32 main() {
     ?Handle(Slot) m1 = pool.alloc();
     Handle(Slot) h1 = m1 orelse return;
     ?Handle(Slot) m2 = pool.alloc();
-    Handle(Slot) h2 = m2 orelse return;
+    Handle(Slot) h2 = m2 orelse { pool.free(h1); return 3; };   // BUG-1071
 
     pool.get(h1).data = 10;
     pool.get(h2).data = 20;
@@ -17,13 +17,14 @@ u32 main() {
 
     // Now alloc succeeds — reuses freed slot
     ?Handle(Slot) m3 = pool.alloc();
-    Handle(Slot) h3 = m3 orelse return;
+    Handle(Slot) h3 = m3 orelse { pool.free(h2); return 4; };
     pool.get(h3).data = 30;
 
-    if (pool.get(h3).data != 30) { return 1; }
-    if (pool.get(h2).data != 20) { return 2; }
-
+    u32 got3 = pool.get(h3).data;
+    u32 got2 = pool.get(h2).data;
     pool.free(h2);
     pool.free(h3);
+    if (got3 != 30) { return 1; }
+    if (got2 != 20) { return 2; }
     return 0;
 }

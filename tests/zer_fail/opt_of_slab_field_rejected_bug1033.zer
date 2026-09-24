@@ -1,0 +1,5 @@
+// expect-error: optional of 'Slab'
+// BUG-1033 sibling, STRUCT FIELD position.
+struct T { u32 v; }
+struct H { ?Slab(T) s; }
+u32 main() { return 0; }

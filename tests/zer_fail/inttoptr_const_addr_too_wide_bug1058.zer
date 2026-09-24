@@ -1,0 +1,7 @@
+// zerc-flags: --target-bits 32
+// EXPECTED: compile error
+// expect-error: does not fit in a 32-bit pointer
+// BUG-1058: the range gate validated the full 64-bit constant while the cast to a
+// 32-bit pointer kept only the low word — `-m32` compiled this to an access at 0x10.
+mmio 0x100000000..0x1000000FF;
+u32 main() { volatile *u32 r = @inttoptr(*u32, 0x100000010); return *r; }

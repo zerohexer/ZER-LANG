@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1055, capture spelling: two if-unwrap captures named `c`.
+struct T { u32 v; }
+u32 run(?bool m1, ?bool m2) {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    if (m1) |c| { if (c) { free(a); } }
+    u32 r = 0;
+    if (m2) |c| { if (!c) { r = a.v; free(a); } }
+    return r;
+}
+u32 main() { return run(true, false); }

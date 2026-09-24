@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'counter'
+// thread polls a task that touches a global main writes
+u32 counter;
+async void f() { while (true) { counter += 1; yield; } }
+void drive(*_zer_async_f t) { for (u32 i = 0; i < 100000; i += 1) { _zer_async_f_poll(t); } }
+u32 main() {
+    _zer_async_f t; _zer_async_f_init(&t);
+    ThreadHandle th = spawn drive(&t);
+    for (u32 i = 0; i < 100000; i += 1) { counter += 1; }
+    th.join();
+    return 0;
+}

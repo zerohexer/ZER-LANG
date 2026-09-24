@@ -8,6 +8,7 @@ Slab(Sensor) sensors;
 u32 main() {
     ?*Sensor ms = sensors.alloc_ptr();
     *Sensor s = ms orelse { return 1; };
+    defer sensors.free_ptr(s);   // BUG-1071: also on the early returns below
     s.reading = 42;
     s.id = 7;
 
@@ -16,6 +17,5 @@ u32 main() {
     if (back.reading != 42) { return 2; }
     if (back.id != 7) { return 3; }
 
-    sensors.free_ptr(s);
     return 0;
 }

@@ -152,12 +152,48 @@ typedef struct {
      * locks do not nest within one condition (conditions are expressions), so
      * one slot suffices. */
     Node *cond_shared_saved;
+    /* BUG-1041: set by the expression-STATEMENT arm for the one lower_expr call
+     * whose NODE_ASSIGN result is discarded. Everywhere else a NODE_ASSIGN sits in
+     * VALUE position — `if ((x += 1) > 3)`, `y = (x += 1) + 2` — and the compound
+     * arm used to answer -1 ("statement-like"), which the BINOP / BRANCH consumer
+     * then stored as an operand: an IR validation ABORT of the compiler. Read and
+     * cleared at the top of the NODE_ASSIGN arm, so a nested assignment inside the
+     * RHS is correctly in value position again. */
+    bool assign_stmt_pos;
 } LowerCtx;
 
 /* ---- Helpers ---- */
 
-static void emit_inst(LowerCtx *ctx, IRInst inst) {
+/* BUG-1070: NO INSTRUCTION EVER FOLLOWS A TERMINATOR IN THE SAME BLOCK.
+ *
+ * `return` under an active defer lowered as `DEFER_FIRE; RETURN; DEFER_FIRE;
+ * GOTO bbN` in ONE block — the enclosing NODE_BLOCK's exit fire and its GOTO to
+ * bb_post were appended after the RETURN. Every exit consumer in zercheck_ir
+ * (the leak check, the FuncSummary builder, the return-provenance passes) keys on
+ * "the LAST instruction is IR_RETURN", so that block was not an exit at all: a
+ * `defer` plus an explicit `return` silently disabled leak detection AND the
+ * cross-function free summary (`zap(a); free(a);` was a clean double free).
+ * ir_compute_preds reads the LAST instruction too, so the GOTO also gave the
+ * dead tail a phantom edge out of a returning block.
+ *
+ * Fixing the consumers one by one would be the N-site shape this codebase keeps
+ * paying for. Instead the lowerer cannot produce the shape: an instruction
+ * emitted into a terminated block opens a fresh (unreachable) block first. The
+ * dead tail is still emitted — the emitter's C is unchanged in meaning — but it
+ * now sits in a block with no predecessors, where zercheck's Phase-E rule
+ * (inherit the state of a preceding RETURN block) already handles it.
+ * ir_validate enforces the invariant, so a new emission path cannot reintroduce
+ * it. BOTH raw emit helpers route through here. */
+static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    IRBlock *bb = &ctx->func->blocks[ctx->current_block];
+    if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
+        ctx->current_block = ir_add_block(ctx->func, ctx->arena);
+    }
     ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
+}
+
+static void emit_inst(LowerCtx *ctx, IRInst inst) {
+    ir_add_inst_checked(ctx, inst);
 }
 
 static IRInst make_inst(IROpKind op, int line) {
@@ -434,9 +470,195 @@ static int get_label_guard_flag(LowerCtx *ctx, const char *name, uint32_t len, i
     return -1;
 }
 
+/* BUG-1051: the ONE way to name an IR local from synthesized AST. Six sites
+ * built this identifier by hand and only some registered its TYPE, so a
+ * consumer asking checker_get_type got NULL and took an untyped fallback:
+ * `g = f() orelse return;` into an OPTIONAL global (or field) stored a bare
+ * `T` into `?T` with no `{ v, 1 }` wrap and GCC refused the C. The identifier
+ * stands for the local, so it carries the local's type — by construction. */
+static Node *make_local_ident(LowerCtx *ctx, IRLocal *l, SrcLoc loc) {
+    Node *id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+    memset(id, 0, sizeof(Node));
+    id->kind = NODE_IDENT;
+    id->loc = loc;
+    id->ident.name = l->name;
+    id->ident.name_len = (size_t)l->name_len;
+    if (l->type) checker_set_type(ctx->checker, id, l->type);
+    return id;
+}
+
 /* Emit helper: creates instruction, adds to current block */
 static void emit_3ac(LowerCtx *ctx, IRInst inst) {
-    ir_block_add_inst(&ctx->func->blocks[ctx->current_block], ctx->arena, inst);
+    ir_add_inst_checked(ctx, inst);   /* BUG-1070 */
+}
+
+/* BUG-1179: LEFT-TO-RIGHT evaluation for every multi-operand expression.
+ *
+ * lower_expr returns a named local's OWN id for a bare identifier (no copy), so
+ * the READ of that operand happened wherever the consuming instruction sat —
+ * AFTER every later sibling had been lowered and run. A global operand is a
+ * passthrough and lands in a temp at its own position. Measured, one shape, two
+ * answers:
+ *     u32 x = 5;  u32 r  = x + bump(&x);    // 16 (x read after the call)
+ *     g = 5;      u32 r2 = g + bumpg();     //  6 (g read before it)
+ * and the same for call arguments (`f(x, bump(&x))`) and struct-literal fields.
+ * A dialect with no undefined behaviour cannot have its value depend on whether
+ * a name is a local; the order the rest of the lowering already implements
+ * (and every non-ident operand gets) is left-to-right, so a named operand whose
+ * LATER siblings may write memory is snapshotted into a temp at its own position.
+ * Reuses BUG-1154's snapshot (a temp that names its source in diagnostics).
+ *
+ * `lower_may_write` answers "can evaluating this change a local?" — exhaustive,
+ * no default, and conservative: any call, assignment, intrinsic or orelse (whose
+ * fallback may be a block) counts. Over-answering only adds a dead copy. */
+static bool lower_may_write(Node *n) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+        return true;
+    case NODE_UNARY:  return lower_may_write(n->unary.operand);
+    case NODE_FIELD:  return lower_may_write(n->field.object);
+    case NODE_INDEX:  return lower_may_write(n->index_expr.object) ||
+                             lower_may_write(n->index_expr.index);
+    case NODE_SLICE:  return lower_may_write(n->slice.object) ||
+                             lower_may_write(n->slice.start) ||
+                             lower_may_write(n->slice.end);
+    case NODE_BINARY: return lower_may_write(n->binary.left) ||
+                             lower_may_write(n->binary.right);
+    case NODE_TYPECAST: return lower_may_write(n->typecast.expr);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (lower_may_write(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* Leaves: reading them changes nothing. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return false;
+    /* Not expressions. Answer true: if one ever reaches here, a copy is harmless
+     * and silence would be the wrong default. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
+/* Snapshot a NAMED local operand into a temp here, at its own evaluation
+ * position. Arrays are not copied (an array operand is an address, and C cannot
+ * assign one); a temp is returned unchanged. */
+static int snapshot_operand(LowerCtx *ctx, int id, int line) {
+    if (id < 0 || id >= ctx->func->local_count) return id;
+    IRLocal *l = &ctx->func->locals[id];
+    if (l->is_temp || !l->type) return id;
+    if (type_dispatch_kind(l->type) == TYPE_ARRAY) return id;
+    Type *t = l->type;
+    int snap = create_temp(ctx, t, line);
+    ctx->func->locals[snap].snapshot_of_plus1 = id + 1;
+    IRInst cp = make_inst(IR_COPY, line);
+    cp.dest_local = snap;
+    cp.src1_local = id;
+    emit_3ac(ctx, cp);
+    return snap;
+}
+
+/* BUG-1184: the assignment sibling of BUG-1179. `a[i] += seti(&i);` and
+ * `a[i] = (i = 4);` read the TARGET'S index after the value ran — the compound
+ * form was lowered `t = seti(&i); a[i] += t;`, the plain form was one C
+ * expression with unsequenced operands. The checker proves the index at the
+ * statement's START (i == 0 there, so the check was elided) and the write landed
+ * at a[4]: ASan stack-buffer-overflow, no diagnostic. Left to right means the
+ * target's index is evaluated BEFORE the value; so when the value may write, an
+ * index the value can change is lowered to a temp first, and the target names
+ * the temp.
+ *
+ * "Can change" is asked narrowly on purpose: a local the value assigns or takes
+ * the address of, a local whose address is taken ANYWHERE in the function (a
+ * callee can write it through the alias), or any non-local name (a callee can
+ * write a global). Replacing EVERY index would re-root zercheck's slot keys —
+ * `arr[i] = alloc(T)` in a loop keys `arr[i]` by the trackable index `i`
+ * (BUG-1130) — for no benefit when nothing can move `i`. */
+static bool index_clobbered_by(LowerCtx *ctx, Node *e, Node *value, Node *body) {
+    if (!e) return false;
+    switch (e->kind) {
+    case NODE_IDENT: {
+        if (ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len) < 0)
+            return true;   /* a global / non-local name: a call may write it */
+        return ast_name_mutated_or_addrd(value, e->ident.name, (uint32_t)e->ident.name_len) ||
+               (body && ast_name_addr_taken(body, e->ident.name, (uint32_t)e->ident.name_len));
+    }
+    case NODE_INT_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_SIZEOF:
+    case NODE_FLOAT_LIT: case NODE_NULL_LIT: case NODE_STRING_LIT: case NODE_CAST:
+        return false;
+    case NODE_BINARY: return index_clobbered_by(ctx, e->binary.left, value, body) ||
+                             index_clobbered_by(ctx, e->binary.right, value, body);
+    case NODE_UNARY:  return index_clobbered_by(ctx, e->unary.operand, value, body);
+    case NODE_TYPECAST: return index_clobbered_by(ctx, e->typecast.expr, value, body);
+    case NODE_FIELD:  return index_clobbered_by(ctx, e->field.object, value, body);
+    case NODE_INDEX:  return index_clobbered_by(ctx, e->index_expr.object, value, body) ||
+                             index_clobbered_by(ctx, e->index_expr.index, value, body);
+    /* An index that itself calls, assigns, unwraps or runs an intrinsic has to run
+     * before the value anyway (left to right). Everything else: conservative. */
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_SLICE: case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
+/* Walk the assignment target root-first (object before its index, outer index
+ * after inner), snapshotting each clobberable index into a temp. */
+static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body) {
+    if (!t) return;
+    switch (t->kind) {
+    case NODE_INDEX: {
+        hoist_target_indices(ctx, t->index_expr.object, value, body);
+        Node *ix = t->index_expr.index;
+        if (ix && index_clobbered_by(ctx, ix, value, body)) {
+            int id = lower_expr(ctx, ix);
+            id = snapshot_operand(ctx, id, t->loc.line);
+            if (id >= 0)
+                t->index_expr.index = make_local_ident(ctx, &ctx->func->locals[id], ix->loc);
+        }
+        return;
+    }
+    case NODE_FIELD: hoist_target_indices(ctx, t->field.object, value, body); return;
+    case NODE_UNARY: hoist_target_indices(ctx, t->unary.operand, value, body); return;
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_TYPECAST: case NODE_CAST:
+    case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return;
+    }
 }
 
 /* Lower one expression to a local ID.
@@ -601,6 +823,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             }
         }
         int left = lower_expr(ctx, expr->binary.left);
+        if (lower_may_write(expr->binary.right))                /* BUG-1179 */
+            left = snapshot_operand(ctx, left, expr->loc.line);
         int right = lower_expr(ctx, expr->binary.right);
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_i32;
@@ -744,17 +968,16 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 /* Global array passthrough, but first decompose complex index
                  * (orelse, call chains) to a local — emit_rewritten_node can't
                  * handle orelse. Rewrite the index AST node to reference the local. */
+                /* BUG-1179: an index that may WRITE (`a[i + seti(&i)]`) is
+                 * lowered too, so its operands evaluate left to right in 3AC
+                 * instead of as one unsequenced C expression. */
                 if (expr->index_expr.index &&
-                    expr->index_expr.index->kind == NODE_ORELSE) {
+                    (expr->index_expr.index->kind == NODE_ORELSE ||
+                     lower_may_write(expr->index_expr.index))) {
                     int idx_id = lower_expr(ctx, expr->index_expr.index);
                     if (idx_id >= 0) {
                         IRLocal *il = &ctx->func->locals[idx_id];
-                        Node *new_idx = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                        memset(new_idx, 0, sizeof(Node));
-                        new_idx->kind = NODE_IDENT;
-                        new_idx->loc = expr->loc;
-                        new_idx->ident.name = il->name;
-                        new_idx->ident.name_len = (size_t)il->name_len;
+                        Node *new_idx = make_local_ident(ctx, il, expr->loc);
                         expr->index_expr.index = new_idx;
                     }
                 }
@@ -763,6 +986,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         }
         int obj = lower_expr(ctx, expr->index_expr.object);
         if (obj < 0) goto passthrough; /* object couldn't be decomposed → passthrough */
+        if (lower_may_write(expr->index_expr.index))            /* BUG-1179 */
+            obj = snapshot_operand(ctx, obj, expr->loc.line);
         int idx = lower_expr(ctx, expr->index_expr.index);
         int tmp = create_temp(ctx, rt, expr->loc.line);
         IRInst inst = make_inst(IR_INDEX_READ, expr->loc.line);
@@ -809,6 +1034,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             for (int i = 0; i < expr->struct_init.field_count; i++) {
                 rewrite_idents(ctx, expr->struct_init.fields[i].value);
                 field_locals[i] = lower_expr(ctx, expr->struct_init.fields[i].value);
+                /* BUG-1179: a later field's value may write this one's local. */
+                bool later_writes = false;
+                for (int j = i + 1; j < expr->struct_init.field_count && !later_writes; j++)
+                    later_writes = lower_may_write(expr->struct_init.fields[j].value);
+                if (later_writes)
+                    field_locals[i] = snapshot_operand(ctx, field_locals[i],
+                                                       expr->loc.line);
             }
         }
         int tmp = create_temp(ctx, rt, expr->loc.line);
@@ -836,6 +1068,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             arg_locals = (int *)arena_alloc(ctx->arena, arg_count * sizeof(int));
             for (int i = 0; i < arg_count; i++) {
                 arg_locals[i] = lower_expr(ctx, expr->call.args[i]);
+                /* BUG-1179: a later argument may write this one's local. */
+                bool later_writes = false;
+                for (int j = i + 1; j < arg_count && !later_writes; j++)
+                    later_writes = lower_may_write(expr->call.args[j]);
+                if (later_writes)
+                    arg_locals[i] = snapshot_operand(ctx, arg_locals[i],
+                                                     expr->loc.line);
             }
         }
         /* BUG-942: a BUILTIN's arguments are deliberately NOT decomposed (they may
@@ -903,6 +1142,14 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * compound ops which need the original target + op preserved. */
     case NODE_ASSIGN: {
         bool plain_sc = false;
+        bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
+        ctx->assign_stmt_pos = false;
+        if (lower_may_write(expr->assign.value)) {                 /* BUG-1184 */
+            Node *fb = (ctx->func->ast_node &&
+                        ctx->func->ast_node->kind == NODE_FUNC_DECL)
+                ? ctx->func->ast_node->func_decl.body : ctx->func->ast_node;
+            hoist_target_indices(ctx, expr->assign.target, expr->assign.value, fb);
+        }
         if (expr->assign.op == TOK_EQ) {
             /* G6 (2026-08-01): plain `x = Y` normally passes through. EXCEPTION:
              * a short-circuit `&&`/`||` RHS carrying a nested `orelse` must be
@@ -913,8 +1160,17 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             Node *rhs = expr->assign.value;
             bool rhs_sc = rhs && rhs->kind == NODE_BINARY &&
                 (rhs->binary.op == TOK_AMPAMP || rhs->binary.op == TOK_PIPEPIPE);
-            if (!(rhs_sc && sc_expr_has_orelse(rhs))) goto passthrough;
-            plain_sc = true;
+            /* BUG-1210: `s = { .b = nx(), .a = nx() };` passed through as a C
+             * compound literal, whose initializer order C leaves UNSPECIFIED —
+             * GCC evaluated `.a` first, so s.b == 2, s.a == 1, while the same
+             * literal as a var-decl init, a call argument or a return value was
+             * decomposed left to right (s.b == 1). Decompose it here too when the
+             * order can be observed: two or more fields and some field with an
+             * effect. */
+            bool rhs_si_order = rhs && rhs->kind == NODE_STRUCT_INIT &&
+                rhs->struct_init.field_count >= 2 && lower_may_write(rhs);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order) goto passthrough;
+            plain_sc = rhs_sc;
         }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
          * passthrough emitter emits a simple compound assign with no nested
@@ -922,12 +1178,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         int val_local = lower_expr(ctx, expr->assign.value);
         if (val_local < 0) goto passthrough; /* void/array RHS — can't decompose */
         IRLocal *vloc = &ctx->func->locals[val_local];
-        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-        memset(tmp_id, 0, sizeof(Node));
-        tmp_id->kind = NODE_IDENT;
-        tmp_id->loc = expr->loc;
-        tmp_id->ident.name = vloc->name;
-        tmp_id->ident.name_len = (size_t)vloc->name_len;
+        Node *tmp_id = make_local_ident(ctx, vloc, expr->loc);
         Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
         memset(new_assign, 0, sizeof(Node));
         new_assign->kind = NODE_ASSIGN;
@@ -935,6 +1186,26 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         new_assign->assign.op = expr->assign.op;
         new_assign->assign.target = expr->assign.target;
         new_assign->assign.value = tmp_id;
+        /* BUG-1041: a COMPOUND assignment in VALUE position yields the stored
+         * value, exactly as in C. Measured on the pre-fix compiler:
+         *     if ((x += 1) > 3) { }        -> IR VALIDATION ERROR ... Aborted (134)
+         *     u32 y = (x += 1) + 2;        -> same
+         *     if ((*p += 1) > 3) { }       -> same   (`u32 y = (x = 5) + 1;` worked)
+         * The synthesized `target op= tmp` goes through the passthrough below WITH
+         * a destination temp, so the emitter writes `_zer_tN = (target op= tmp)` —
+         * one evaluation of the target (a side-effecting index runs once), and the
+         * uN / union / shared forms keep their statement-expression emission, whose
+         * value is the store. The synthesized node has no typemap entry, so it is
+         * given the assignment's own type first (the target's, when the assignment
+         * itself was not typed). Statement position keeps the void form: no dead
+         * temp for every `x += 1;` in the tree. */
+        if (!plain_sc && !stmt_pos) {
+            Type *at = checker_get_type(ctx->checker, expr);
+            if (!at) at = checker_get_type(ctx->checker, expr->assign.target);
+            if (at) checker_set_type(ctx->checker, new_assign, at);
+            expr = new_assign;
+            goto passthrough;
+        }
         /* Emit as void IR_ASSIGN — compound assign result is statement-like. */
         IRInst inst = make_inst(IR_ASSIGN, expr->loc.line);
         inst.expr = new_assign;
@@ -1285,8 +1556,15 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
      * re-fire the defer stack and skip the rest of the function's cleanup, which is
      * exactly why the emitter's guard_traps exists. IR_TRAP is a terminator, so the
      * CFG knows the path ends. */
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) {
-        emit_inst(ctx, make_inst(IR_TRAP, g->line));
+    /* BUG-1222: nor when the function's result has no zero value (an enum
+     * without a 0 variant — the literal return below would forge one). */
+    bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
+    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+        IRInst tr = make_inst(IR_TRAP, g->line);
+        /* literal_kind names the reason for the emitter's message:
+         * 0 = a scope that cannot be left, 1 = no zero value to return */
+        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
         return;
@@ -1299,6 +1577,7 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
         emit_inst(ctx, unlock);
     }
     IRInst ret = make_inst(IR_RETURN, g->line);
+    ret.ret_from_guard = true;   /* BUG-1071: named in the leak diagnostic */
     if (!void_ret) {
         int z = create_temp(ctx, rty, g->line);
         IRInst zl = make_inst(IR_LITERAL, g->line);
@@ -2166,12 +2445,7 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
         int tmp = create_temp(ctx, rt, line);
         lower_orelse_to_dest(ctx, tmp, n, line);
         IRLocal *tloc = &ctx->func->locals[tmp];
-        Node *id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-        memset(id, 0, sizeof(Node));
-        id->kind = NODE_IDENT;
-        id->loc = n->loc;
-        id->ident.name = tloc->name;
-        id->ident.name_len = (size_t)tloc->name_len;
+        Node *id = make_local_ident(ctx, tloc, n->loc);
         /* BUG-942: register the replacement's type. The synthesized identifier had
          * NO typemap entry, so any consumer that asks `checker_get_type` for it got
          * NULL and took its untyped fallback. That never showed while every caller
@@ -2249,6 +2523,24 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
     }
 }
 
+/* BUG-1071: the local an orelse subject is rooted at — `p` for `p orelse`,
+ * `h` for `h.p orelse` / `h.arr[i] orelse` — or -1 for anything else (a call,
+ * a deref). A syntactic fact, recorded where the fallback is lowered. */
+static int orelse_subject_root_local(LowerCtx *ctx, Node *e) {
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX)) {
+        e = (e->kind == NODE_FIELD) ? e->field.object : e->index_expr.object;
+    }
+    if (!e || e->kind != NODE_IDENT) return -1;
+    return ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len);
+}
+
+/* ONE place tags a block as the null path of an orelse (was six copies). */
+static void tag_orelse_fallback(LowerCtx *ctx, int bi, int tmp_id, int subj_root) {
+    ctx->func->blocks[bi].is_orelse_fallback = true;
+    ctx->func->blocks[bi].orelse_fallback_local = tmp_id;       /* BUG-985 */
+    ctx->func->blocks[bi].orelse_subject_local = subj_root;     /* BUG-1071 */
+}
+
 /* Lower: dest_local = orelse_expr
  * Creates temp, branches, assigns unwrapped value on ok path.
  * Three patterns:
@@ -2276,6 +2568,10 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     Node *inner = orelse_node->orelse.expr;
     rewrite_idents(ctx, inner);
     pre_lower_orelse(ctx, &inner, line);
+    /* BUG-1071: the local the orelse SUBJECT is rooted at (`p orelse`,
+     * `h.p orelse`), recorded on the fallback blocks for the FuncSummary
+     * builder — see IRBlock.orelse_subject_local. */
+    int subj_root = orelse_subject_root_local(ctx, inner);
     /* BUG-944: an ORDINARY call must go through lower_expr, not the raw-AST
      * passthrough. The passthrough exists for BUILTINS (their arguments may be a
      * bare type name), and the emitter's raw-AST argument loop applies NO
@@ -2335,8 +2631,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     if (orelse_node->orelse.fallback_is_return ||
         orelse_node->orelse.fallback_is_break ||
         orelse_node->orelse.fallback_is_continue) {
-        ctx->func->blocks[bb_fail].is_orelse_fallback = true;
-        ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-985 */
+        tag_orelse_fallback(ctx, bb_fail, tmp_id, subj_root);
     }
     if (orelse_node->orelse.fallback_is_return) {
         emit_defer_fire(ctx, line);
@@ -2351,8 +2646,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
          * splice it never split. Same question, two sites, one of them updated — the
          * sibling-site shape this project keeps recording. */
         if (ctx->current_block != bb_fail) {
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
@@ -2370,8 +2664,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         /* Fire loop-scoped defers (emit, don't pop — other paths still need them) */
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
@@ -2384,8 +2677,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
     } else if (orelse_node->orelse.fallback_is_continue && ctx->loop_continue_block >= 0) {
         emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, line);
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
-            ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-            ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;   /* BUG-985 */
+            tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
         if (ctx->current_stmt_shared_root) {
             IRInst unlock = make_inst(IR_UNLOCK, line);
@@ -2433,13 +2725,11 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
              * from bb_fail if the block lowered into multiple blocks). */
             IRInst *fb_last = &fb_blk->insts[fb_blk->inst_count - 1];
             if (fb_last->op == IR_RETURN || fb_last->op == IR_GOTO) {
-                ctx->func->blocks[bb_fail].is_orelse_fallback = true;
-                ctx->func->blocks[bb_fail].orelse_fallback_local = tmp_id;   /* BUG-985 */
+                tag_orelse_fallback(ctx, bb_fail, tmp_id, subj_root);
                 /* Also tag the ending block if it's different from bb_fail
                  * (block lowering may have split into sub-blocks) */
                 if (ctx->current_block != bb_fail) {
-                    ctx->func->blocks[ctx->current_block].is_orelse_fallback = true;
-                    ctx->func->blocks[ctx->current_block].orelse_fallback_local = tmp_id;
+                    tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
                 }
             }
         }
@@ -2540,10 +2830,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     ZTRACE("LOWER  %-12s @ line %d  (into block %d)",
            node_kind_name(node->kind), node->loc.line, ctx->current_block);
 
-    /* Check if current block is already terminated — start new block */
+    /* Check if current block is already terminated — start new block.
+     * BUG-1070: record which block this dead USER statement follows, so
+     * zercheck_ir can seed it (see IRBlock.dead_code_seed). */
     IRBlock *cur = &ctx->func->blocks[ctx->current_block];
     if (cur->inst_count > 0 && ir_block_is_terminated(cur)) {
-        start_block(ctx);
+        int after = ctx->current_block;
+        int nb = start_block(ctx);
+        ctx->func->blocks[nb].dead_code_seed = after;
     }
 
     switch (node->kind) {
@@ -2680,6 +2974,25 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             node->var_decl.name, (uint32_t)node->var_decl.name_len,
             vt, false, false, false, node->loc.line);
         if (local_id >= 0) ctx->func->locals[local_id].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
+        /* BUG-1221: ZER auto-zeroes a declaration EVERY time it executes. Locals
+         * are hoisted to the function top and zeroed there ONCE, so `u32 acc;`
+         * in a loop body kept last iteration's value (`acc += 5` summed to 30,
+         * not 15), and a pointer / Handle declared that way carried a stale one.
+         * Re-zero at the declaration wherever it can run again: inside a loop, or
+         * in a function with labels (a backward goto). */
+        if (local_id >= 0 && !node->var_decl.init &&
+            (ctx->loop_exit_block >= 0 || ctx->label_count > 0)) {
+            Node *zlit = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+            memset(zlit, 0, sizeof(Node));
+            zlit->kind = NODE_INT_LIT;
+            zlit->loc = node->loc;
+            zlit->int_lit.value = 0;
+            IRInst zi = make_inst(IR_ASSIGN, node->loc.line);
+            zi.dest_local = local_id;
+            zi.expr = zlit;
+            zi.zero_dest = true;
+            emit_inst(ctx, zi);
+        }
         if (local_id >= 0 && node->var_decl.init) {
             /* Rewrite idents in init expression to use correct local names */
             rewrite_idents(ctx, node->var_decl.init);
@@ -2710,6 +3023,30 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     inst.dest_local = local_id;
                     inst.expr = init;
                     emit_inst(ctx, inst);
+                    break;
+                }
+                /* BUG-1246: an ARRAY-valued init that is not a local (a global,
+                 * a struct field, `s.a`, an element of an array of arrays):
+                 * lower_expr has no local to return for it (C cannot assign an
+                 * array), so it lowered the read as a destination-less
+                 * passthrough and the copy was DROPPED — `u32[2] b = ga;` left
+                 * b zero. Lower it as the assignment `b = <init>`, the spelling
+                 * that already copies (the emitter memcpys an array assign). */
+                if (init_eff && type_dispatch_kind(init_eff) == TYPE_ARRAY &&
+                    vt_unwrap && type_dispatch_kind(vt_unwrap) == TYPE_ARRAY &&
+                    !(init->kind == NODE_IDENT &&
+                      ir_find_local_exact_first(ctx->func, init->ident.name,
+                                                (uint32_t)init->ident.name_len) >= 0)) {
+                    Node *asg = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(asg, 0, sizeof(Node));
+                    asg->kind = NODE_ASSIGN;
+                    asg->loc = node->loc;
+                    asg->assign.op = TOK_EQ;
+                    asg->assign.target = make_local_ident(ctx, &ctx->func->locals[local_id],
+                                                          node->loc);
+                    asg->assign.value = init;
+                    checker_set_type(ctx->checker, asg, vt);
+                    (void)lower_expr(ctx, asg);
                     break;
                 }
                 /* Unified: lower_expr decomposes all inits.
@@ -2803,12 +3140,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                         int tmp = create_temp(ctx, rt, node->loc.line);
                         lower_orelse_to_dest(ctx, tmp, orelse, node->loc.line);
                         IRLocal *tloc = &ctx->func->locals[tmp];
-                        Node *tmp_id = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                        memset(tmp_id, 0, sizeof(Node));
-                        tmp_id->kind = NODE_IDENT;
-                        tmp_id->loc = node->loc;
-                        tmp_id->ident.name = tloc->name;
-                        tmp_id->ident.name_len = (size_t)tloc->name_len;
+                        Node *tmp_id = make_local_ident(ctx, tloc, node->loc);
                         Node *new_assign = (Node *)arena_alloc(ctx->arena, sizeof(Node));
                         memset(new_assign, 0, sizeof(Node));
                         new_assign->kind = NODE_ASSIGN;
@@ -2839,7 +3171,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Unified: route ALL expressions through lower_expr.
          * Calls → IR_CALL, assignments → IR_ASSIGN passthrough,
          * everything else → decomposed or passthrough. */
+        ctx->assign_stmt_pos = (expr->kind == NODE_ASSIGN);   /* BUG-1041 */
         lower_expr(ctx, expr);
+        ctx->assign_stmt_pos = false;
         break;
     }
 
@@ -2860,24 +3194,20 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                       ir_add_block(ctx->func, ctx->arena) : -1;
         int bb_join = ir_add_block(ctx->func, ctx->arena);
 
-        /* If-unwrap capture: create local on-demand */
+        /* If-unwrap capture: created AFTER the condition is lowered (BUG-1185 —
+         * a condition naming the same identifier, `if (v) |v|`, must read the
+         * OUTER v) and hidden again once the then-body is lowered. */
         bool has_capture = (node->if_stmt.capture_name != NULL);
+        Type *if_cap_type = NULL;
         if (has_capture) {
             Type *cond_type = checker_get_type(ctx->checker, node->if_stmt.cond);
-            Type *cap_type = NULL;
             if (cond_type) {
                 Type *eff = type_unwrap_distinct(cond_type);
                 if (eff && eff->kind == TYPE_OPTIONAL) {
-                    cap_type = eff->optional.inner;
-                    if (node->if_stmt.capture_is_ptr && cap_type)
-                        cap_type = type_pointer(ctx->arena, cap_type);
+                    if_cap_type = eff->optional.inner;
+                    if (node->if_stmt.capture_is_ptr && if_cap_type)
+                        if_cap_type = type_pointer(ctx->arena, if_cap_type);
                 }
-            }
-            if (cap_type && cap_type->kind != TYPE_VOID) {
-                ir_add_local(ctx->func, ctx->arena,
-                    node->if_stmt.capture_name,
-                    (uint32_t)node->if_stmt.capture_name_len,
-                    cap_type, false, true, false, node->loc.line);
             }
         }
 
@@ -2888,7 +3218,51 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         Node *if_cond_lock = emit_shared_lock_around_cond(ctx, node->if_stmt.cond,
                                                            node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
-        br.cond_local = lower_expr(ctx, node->if_stmt.cond);
+        /* BUG-1054: a MUTABLE capture `|*v|` must point INTO the optional the
+         * condition names. lower_expr copies any condition that is not a plain
+         * local (a global, a field, an array element, a deref) into a temp, and
+         * the capture then pointed into that COPY: `if (g) |*v| { *v = 3; }`
+         * left `g` unchanged — a silent lost write. Evaluate the ADDRESS of the
+         * lvalue once, branch on a read through it, and bind the capture to
+         * that address (IR_COPY adapts `*?T -> *T` as `&p->value`). */
+        int cap_addr_local = -1;
+        {
+            Node *cn = node->if_stmt.cond;
+            bool lvalue = cn && (cn->kind == NODE_FIELD || cn->kind == NODE_INDEX ||
+                (cn->kind == NODE_UNARY && cn->unary.op == TOK_STAR) ||
+                (cn->kind == NODE_IDENT &&
+                 ir_find_local(ctx->func, cn->ident.name,
+                               (uint32_t)cn->ident.name_len) < 0));
+            Type *ct = checker_get_type(ctx->checker, cn);
+            Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
+            if (has_capture && node->if_stmt.capture_is_ptr && lvalue &&
+                ce && type_dispatch_kind(ce) == TYPE_OPTIONAL &&
+                !type_is_null_sentinel(ce->optional.inner) &&
+                ce->optional.inner &&
+                type_dispatch_kind(ce->optional.inner) != TYPE_VOID) {
+                Node *amp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                memset(amp, 0, sizeof(Node));
+                amp->kind = NODE_UNARY;
+                amp->loc = cn->loc;
+                amp->unary.op = TOK_AMP;
+                amp->unary.operand = cn;
+                checker_set_type(ctx->checker, amp, type_pointer(ctx->arena, ct));
+                cap_addr_local = lower_expr(ctx, amp);
+                if (cap_addr_local >= 0) {
+                    Node *dr = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(dr, 0, sizeof(Node));
+                    dr->kind = NODE_UNARY;
+                    dr->loc = cn->loc;
+                    dr->unary.op = TOK_STAR;
+                    dr->unary.operand = make_local_ident(ctx,
+                        &ctx->func->locals[cap_addr_local], cn->loc);
+                    checker_set_type(ctx->checker, dr, ct);
+                    br.cond_local = lower_expr(ctx, dr);
+                }
+            }
+        }
+        if (cap_addr_local < 0)
+            br.cond_local = lower_expr(ctx, node->if_stmt.cond);
         emit_shared_unlock_after_cond(ctx, if_cond_lock, node->loc.line);
         br.true_block = bb_then;
         br.false_block = bb_else >= 0 ? bb_else : bb_join;
@@ -2896,10 +3270,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
         /* Then block */
         ctx->current_block = bb_then;
-        if (has_capture) {
-            int cap_id = ir_find_local(ctx->func,
+        int if_cap_id = -1;
+        if (has_capture && if_cap_type && type_dispatch_kind(if_cap_type) != TYPE_VOID)
+            if_cap_id = ir_add_local(ctx->func, ctx->arena,
                 node->if_stmt.capture_name,
-                (uint32_t)node->if_stmt.capture_name_len);
+                (uint32_t)node->if_stmt.capture_name_len,
+                if_cap_type, false, true, false, node->loc.line);
+        if (has_capture) {
+            int cap_id = if_cap_id;
             if (cap_id >= 0 && br.cond_local >= 0) {
                 /* Skip ?void captures — no value to unwrap */
                 Type *cond_t = ctx->func->locals[br.cond_local].type;
@@ -2911,7 +3289,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     /* capture = condition (IR_COPY handles unwrap via type adaptation) */
                     IRInst cap = make_inst(IR_COPY, node->loc.line);
                     cap.dest_local = cap_id;
-                    cap.src1_local = br.cond_local;
+                    cap.src1_local = cap_addr_local >= 0 ? cap_addr_local   /* BUG-1054 */
+                                                         : br.cond_local;
                     emit_inst(ctx, cap);
                 }
             }
@@ -2919,108 +3298,27 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Save defer count so if-scoped defers fire at block exit */
         int then_defer_base = ctx->defer_count;
         ctx->block_defers_managed++;  /* if-body block: we manage */
-        int then_start_bi = bb_then;
-        int then_start_block_count = ctx->func->block_count;
         lower_stmt(ctx, node->if_stmt.then_body);
+        if (if_cap_id >= 0) ctx->func->locals[if_cap_id].hidden = true;   /* BUG-1185 */
         emit_defer_fire_scoped(ctx, then_defer_base, true, node->loc.line);
         ctx->defer_count = then_defer_base;
 
-        /* Phase E: detect if the then-body "always exits" — its final
-         * block ends with RETURN/BREAK/CONTINUE (not a normal fall-
-         * through to bb_join). If so, tag all blocks in the then-body
-         * range [then_start_bi, ctx->current_block] as is_early_exit.
-         * This mirrors zercheck.c's block_always_exits semantic: these
-         * blocks shouldn't provide leak-coverage to non-early-exit
-         * returns — they're conditional bypass paths that don't
-         * contribute to the canonical function-exit state.
-         *
-         * Check BEFORE ensure_terminated (which would add GOTO to
-         * bb_join for non-terminated blocks).
-         *
-         * Side note: we don't rely on was_terminated because the
-         * then-body may have created intermediate blocks via nested
-         * control flow; only the current block's terminator matters. */
-        bool then_always_exits = false;
-        {
-            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
-            if (cb->inst_count > 0) {
-                IRInst *last = &cb->insts[cb->inst_count - 1];
-                /* RETURN always exits. GOTO to bb_join is NOT an exit
-                 * (that's normal fall-through). GOTO to loop_exit/
-                 * loop_continue/label is an exit. BREAK/CONTINUE via
-                 * GOTO have goto_block != bb_join. */
-                if (last->op == IR_RETURN) {
-                    then_always_exits = true;
-                } else if (last->op == IR_GOTO &&
-                           last->goto_block != bb_join) {
-                    then_always_exits = true;
-                }
-            }
-        }
-        /* Only tag if-without-capture (regular if). If-unwrap (with
-         * capture) has special alias semantics: when the capture is
-         * freed in the early-exit body, the original allocation's
-         * alloc_id should be considered "escaped" on the fall-through
-         * path too. Excluding the early-exit from coverage would
-         * incorrectly flag such patterns as leaks. Union coverage
-         * correctly handles if-unwrap early-exits via alias
-         * propagation to the canonical return's state. */
-        if (then_always_exits && !has_capture) {
-            /* BUG-846: bb_then / bb_else / bb_join are allocated CONSECUTIVELY, so a
-             * sweep of [then_start_bi, block_count) that skips only bb_join also
-             * tags bb_ELSE — a block whose body has not even been lowered yet. The
-             * else sweep below had the mirror defect and swallowed the then body's
-             * blocks. The correct boundary is the BLOCK COUNT captured before the
-             * then-body was lowered: the blocks that body created are exactly
-             * [then_start_block_count, block_count), plus bb_then itself. That is
-             * what `then_start_block_count` was written for — it had been dead,
-             * (void)-cast, since it was introduced. */
-            if (!ctx->func->blocks[then_start_bi].is_early_exit)
-                ctx->func->blocks[then_start_bi].is_early_exit = true;
-            for (int bi = then_start_block_count; bi < ctx->func->block_count; bi++) {
-                if (bi == bb_join) continue;
-                if (!ctx->func->blocks[bi].is_early_exit)
-                    ctx->func->blocks[bi].is_early_exit = true;
-            }
-        }
-
+        /* BUG-1071: the then/else bodies used to be tagged is_early_exit when
+         * they always exit, and zercheck_ir skipped those returns in its leak
+         * check. That skip hid real leaks (`if (k == 1) { return 1; }` with an
+         * allocation alive) and is gone: every reachable return is checked on
+         * its own state, and the optional's null path — the precision the
+         * skip bought — is represented by zercheck_ir's null-edge refinement. */
         ensure_terminated(ctx, bb_join);
 
         /* Else block */
-        int else_start_bi = -1;
         if (bb_else >= 0) {
             ctx->current_block = bb_else;
-            else_start_bi = bb_else;
-            int else_start_block_count = ctx->func->block_count;   /* BUG-846 */
             int else_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* else-body block: we manage */
             lower_stmt(ctx, node->if_stmt.else_body);
             emit_defer_fire_scoped(ctx, else_defer_base, true, node->loc.line);
             ctx->defer_count = else_defer_base;
-
-            /* Phase E: same tagging for else-body if it always exits. */
-            bool else_always_exits = false;
-            IRBlock *cb = &ctx->func->blocks[ctx->current_block];
-            if (cb->inst_count > 0) {
-                IRInst *last = &cb->insts[cb->inst_count - 1];
-                if (last->op == IR_RETURN) {
-                    else_always_exits = true;
-                } else if (last->op == IR_GOTO &&
-                           last->goto_block != bb_join) {
-                    else_always_exits = true;
-                }
-            }
-            if (else_always_exits) {
-                /* BUG-846: same boundary fix, mirror side. */
-                if (!ctx->func->blocks[else_start_bi].is_early_exit)
-                    ctx->func->blocks[else_start_bi].is_early_exit = true;
-                for (int bi = else_start_block_count; bi < ctx->func->block_count; bi++) {
-                    /* Don't tag bb_join if we accidentally reach it */
-                    if (bi == bb_join) continue;
-                    if (!ctx->func->blocks[bi].is_early_exit)
-                        ctx->func->blocks[bi].is_early_exit = true;
-                }
-            }
 
             ensure_terminated(ctx, bb_join);
         }
@@ -3363,12 +3661,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     break;
                 }
                 IRLocal *vl = &ctx->func->locals[val_local];
-                Node *ident = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-                memset(ident, 0, sizeof(Node));
-                ident->kind = NODE_IDENT;
-                ident->loc = node->loc;
-                ident->ident.name = vl->name;
-                ident->ident.name_len = (size_t)vl->name_len;
+                Node *ident = make_local_ident(ctx, vl, node->loc);
                 /* Set type on synthesized ident so lower_expr and type inference
                  * see the correct union type (not ty_i32 fallback). */
                 checker_set_type(ctx->checker, ident, sw_type);
@@ -3389,12 +3682,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *pl = &ctx->func->locals[ptr_local];
-            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-            memset(sw_ref, 0, sizeof(Node));
-            sw_ref->kind = NODE_IDENT;
-            sw_ref->loc = node->loc;
-            sw_ref->ident.name = pl->name;
-            sw_ref->ident.name_len = (size_t)pl->name_len;
+            sw_ref = make_local_ident(ctx, pl, node->loc);
         } else {
             int val_local = lower_expr(ctx, node->switch_stmt.expr);
             if (val_local < 0) {
@@ -3403,12 +3691,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
-            sw_ref = (Node *)arena_alloc(ctx->arena, sizeof(Node));
-            memset(sw_ref, 0, sizeof(Node));
-            sw_ref->kind = NODE_IDENT;
-            sw_ref->loc = node->loc;
-            sw_ref->ident.name = vl->name;
-            sw_ref->ident.name_len = (size_t)vl->name_len;
+            sw_ref = make_local_ident(ctx, vl, node->loc);
         }
 
         /* Gap 36: hoist complete — release the switch-expr lock before
@@ -3861,6 +4144,28 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Keep expr for cases lower_expr returns -1 (void/array passthrough).
              * Emitter's IR_RETURN checks expr for array→slice coercion. */
             if (ret.src1_local < 0) ret.expr = ret_expr;
+            /* BUG-1154: `return v;` of a bare NAMED local lowers to v's own id,
+             * not a temp — so the IR_RETURN read v AFTER the defers below had
+             * run, and `u32 v = 4; defer v = 8; return v;` returned 8. BUG-442's
+             * rule is that the return value is evaluated BEFORE the defers;
+             * every other expression shape already lands in a fresh temp. With
+             * a VRP-proven return range that became a silent OOB write at the
+             * caller (the range was proven for the pre-defer value). Snapshot
+             * the named local into a temp whenever a defer is pending. */
+            if (ret.src1_local >= 0 && ctx->defer_count > 0 &&
+                !ctx->func->locals[ret.src1_local].is_temp) {
+                Type *rt = ctx->func->locals[ret.src1_local].type;
+                Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
+                if (rte && type_dispatch_kind(rte) != TYPE_ARRAY) {
+                    int snap = create_temp(ctx, rt, node->loc.line);
+                    ctx->func->locals[snap].snapshot_of_plus1 = ret.src1_local + 1;
+                    IRInst cp = make_inst(IR_COPY, node->loc.line);
+                    cp.dest_local = snap;
+                    cp.src1_local = ret.src1_local;
+                    emit_inst(ctx, cp);
+                    ret.src1_local = snap;
+                }
+            }
         }
         emit_defer_fire(ctx, node->loc.line);
         /* Release the active shared-struct lock for THIS statement before

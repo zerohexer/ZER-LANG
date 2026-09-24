@@ -1,0 +1,2 @@
+import stack_lib;
+u32 main() { u32 r = deep(1); return r * 0; }

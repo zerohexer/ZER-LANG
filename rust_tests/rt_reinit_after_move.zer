@@ -18,8 +18,8 @@ u32 main() {
     y.value = 20;
 
     // Use after reinit — OK
-    if (y.value != 20) { return 1; }
-
-    heap.free_ptr(y);
+    u32 got = y.value;
+    heap.free_ptr(y);                    // BUG-1071: before the early return
+    if (got != 20) { return 1; }
     return 0;
 }

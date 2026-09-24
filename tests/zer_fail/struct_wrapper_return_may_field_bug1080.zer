@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: may be a view of
+// BUG-1080 (H6), the MAY half: `mk` returns `{ .p = a }` on ONE path and `{ .p = &gt }`
+// on the other. A field view recorded only when it held on EVERY return (an
+// intersection) dropped this one, so `free(a); h.p.v` was accepted. The summary is
+// now a UNION; a pair that is not on every return is a VIEW at the call site.
+struct T { u32 v; }
+struct H { *T p; }
+T gt;
+H mk(*T a, bool c) { if (c) { H h = { .p = a }; return h; } H k = { .p = &gt }; return k; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = mk(a, true);
+    free(a);
+    return h.p.v;
+}

@@ -13,7 +13,9 @@ struct Node {
 u32 main() {
     // Two different types — auto-creates two separate slabs
     Handle(Task) t = Task.alloc() orelse { return 1; };
+    defer Task.free(t);   // BUG-1071: also on the early returns below
     Handle(Node) n = Node.alloc() orelse { return 2; };
+    defer Node.free(n);
 
     t.id = 10;
     t.priority = 3;
@@ -26,12 +28,9 @@ u32 main() {
 
     // Mix Handle and ptr on same type
     *Task t2 = alloc(Task) orelse { return 6; };
+    defer free(t2);
     t2.id = 77;
     if (t2.id != 77) { return 7; }
-
-    Task.free(t);
-    Node.free(n);
-    free(t2);
 
     return 0;
 }

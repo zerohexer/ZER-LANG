@@ -242,16 +242,9 @@ checker.c:cond_pred_foreign_shared:NODE_WHILE:while_stmt.cond
 #   a condition, or a switch subject.
 checker.c:contains_break:NODE_ASM:asm_stmt.inputs
 checker.c:contains_break:NODE_ASM:asm_stmt.outputs
-checker.c:contains_break:NODE_ASSIGN:assign.target
-checker.c:contains_break:NODE_ASSIGN:assign.value
-checker.c:contains_break:NODE_BINARY:binary.left
-checker.c:contains_break:NODE_BINARY:binary.right
-checker.c:contains_break:NODE_CALL:call.args
-checker.c:contains_break:NODE_CALL:call.callee
 checker.c:contains_break:NODE_DEFER:defer.body
 checker.c:contains_break:NODE_DO_WHILE:while_stmt.body
 checker.c:contains_break:NODE_DO_WHILE:while_stmt.cond
-checker.c:contains_break:NODE_FIELD:field.object
 checker.c:contains_break:NODE_FILE:file.decls
 checker.c:contains_break:NODE_FOR:for_stmt.body
 checker.c:contains_break:NODE_FOR:for_stmt.cond
@@ -259,22 +252,8 @@ checker.c:contains_break:NODE_FOR:for_stmt.init
 checker.c:contains_break:NODE_FOR:for_stmt.step
 checker.c:contains_break:NODE_FUNC_DECL:func_decl.body
 checker.c:contains_break:NODE_GLOBAL_VAR:var_decl.init
-checker.c:contains_break:NODE_IF:if_stmt.cond
-checker.c:contains_break:NODE_INDEX:index_expr.index
-checker.c:contains_break:NODE_INDEX:index_expr.object
 checker.c:contains_break:NODE_INTERRUPT:interrupt.body
-checker.c:contains_break:NODE_INTRINSIC:intrinsic.args
-checker.c:contains_break:NODE_ORELSE:orelse.expr
-checker.c:contains_break:NODE_RETURN:ret.expr
-checker.c:contains_break:NODE_SLICE:slice.end
-checker.c:contains_break:NODE_SLICE:slice.object
-checker.c:contains_break:NODE_SLICE:slice.start
-checker.c:contains_break:NODE_SPAWN:spawn_stmt.args
 checker.c:contains_break:NODE_STATIC_ASSERT:static_assert_stmt.cond
-checker.c:contains_break:NODE_STRUCT_INIT:struct_init.fields
-checker.c:contains_break:NODE_SWITCH:switch_stmt.expr
-checker.c:contains_break:NODE_TYPECAST:typecast.expr
-checker.c:contains_break:NODE_UNARY:unary.operand
 checker.c:contains_break:NODE_WHILE:while_stmt.body
 checker.c:contains_break:NODE_WHILE:while_stmt.cond
 
@@ -315,14 +294,14 @@ checker.c:expr_contains_yield:NODE_WHILE:while_stmt.cond
 #   if-condition: an `if` used as a STATEMENT is walked via its bodies; a cast of the
 #   param inside the condition is reached through the expression arms instead.
 
-# --- checker.c: record_atomic_plain_in_callee ---
-checker.c:record_atomic_plain_in_callee:NODE_ASM:asm_stmt.inputs
-checker.c:record_atomic_plain_in_callee:NODE_ASM:asm_stmt.outputs
-checker.c:record_atomic_plain_in_callee:NODE_FILE:file.decls
-checker.c:record_atomic_plain_in_callee:NODE_FUNC_DECL:func_decl.body
-checker.c:record_atomic_plain_in_callee:NODE_GLOBAL_VAR:var_decl.init
-checker.c:record_atomic_plain_in_callee:NODE_INTERRUPT:interrupt.body
-checker.c:record_atomic_plain_in_callee:NODE_STATIC_ASSERT:static_assert_stmt.cond
+# --- checker.c: walk_callee_globals (was record_atomic_plain_in_callee, BUG-1125) ---
+# Declarations are never inside a function body; a static_assert condition is a
+# compile-time constant and names no runtime global.
+checker.c:walk_callee_globals:NODE_FILE:file.decls
+checker.c:walk_callee_globals:NODE_FUNC_DECL:func_decl.body
+checker.c:walk_callee_globals:NODE_GLOBAL_VAR:var_decl.init
+checker.c:walk_callee_globals:NODE_INTERRUPT:interrupt.body
+checker.c:walk_callee_globals:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: record_isr_globals ---
 checker.c:record_isr_globals:NODE_ASM:asm_stmt.inputs
@@ -628,14 +607,25 @@ ir_lower.c:rewrite_idents:NODE_VAR_DECL:var_decl.init
 ir_lower.c:rewrite_idents:NODE_WHILE:while_stmt.body
 ir_lower.c:rewrite_idents:NODE_WHILE:while_stmt.cond
 
-# --- zercheck_ir.c: ast_name_mutated_or_addrd ---
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_ASM:asm_stmt.inputs
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_ASM:asm_stmt.outputs
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_FILE:file.decls
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_FUNC_DECL:func_decl.body
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_GLOBAL_VAR:var_decl.init
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_INTERRUPT:interrupt.body
-zercheck_ir.c:ast_name_mutated_or_addrd:NODE_STATIC_ASSERT:static_assert_stmt.cond
+# --- zercheck_ir.c: ast_name_writes_r (the core of ast_name_mutated_or_addrd, BUG-1124) ---
+# An unwalked arm answers "a write whose value cannot be followed" (fn(NULL)): the
+# conservative answer for both clients (the predicate says "mutated"; the
+# write-target enumerator treats it as the documented unresolvable floor).
+zercheck_ir.c:ast_name_writes_r:NODE_ASM:asm_stmt.inputs
+zercheck_ir.c:ast_name_writes_r:NODE_ASM:asm_stmt.outputs
+zercheck_ir.c:ast_name_writes_r:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_writes_r:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_writes_r:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_writes_r:NODE_INTERRUPT:interrupt.body
+zercheck_ir.c:ast_name_writes_r:NODE_STATIC_ASSERT:static_assert_stmt.cond
+
+# --- zercheck_ir.c: ast_name_bind_count ---
+# Top-level declaration kinds never occur inside a function body; the arm returns
+# 2 ("more than one binding"), the conservative answer, without walking them.
+zercheck_ir.c:ast_name_bind_count:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_bind_count:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_bind_count:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_bind_count:NODE_INTERRUPT:interrupt.body
 
 # --- zercheck_ir.c: ir_check_expr_uaf ---
 #   orelse.fallback: MEASURED unreachable — ir_lower's pre_lower_orelse splits the
@@ -679,7 +669,6 @@ zercheck_ir.c:ir_check_expr_wrong_pool:NODE_ASM:asm_stmt.inputs
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_ASM:asm_stmt.outputs
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_AWAIT:await_stmt.cond
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_BLOCK:block.stmts
-zercheck_ir.c:ir_check_expr_wrong_pool:NODE_CALL:call.callee
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_CRITICAL:critical.body
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_DEFER:defer.body
 zercheck_ir.c:ir_check_expr_wrong_pool:NODE_DO_WHILE:while_stmt.body
@@ -808,7 +797,6 @@ ir_lower.c:lower_expr:NODE_CALL:call.callee
 # `pool` on every builtin method call. The arm descends `callee->field.object`
 # instead, which is what reaches a tracked receiver (`freed.some_method()`). The
 # accessor is therefore intentionally not passed whole.
-zercheck_ir.c:ir_check_expr_uaf:NODE_CALL:call.callee
 
 # --- checker.c: checker_walk_guard_sites ---
 # BUG-955: this is the emit_auto_guards descent, MOVED from emitter.c so the
@@ -1136,3 +1124,626 @@ checker.c:for_init_has_loop_jump:NODE_SWITCH:switch_stmt.arms
 checker.c:for_init_has_loop_jump:NODE_SWITCH:switch_stmt.expr
 checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.body
 checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.cond
+
+# 2026-09-22 (BUG-1045) — checker.c:keep_arg_caller_root became recursive (its orelse
+# JOIN, call-result and struct-literal arms re-enter it). It is a TRACE from a call
+# argument to the caller PARAMETER it views, not a walk: a kind that cannot carry the
+# argument's root has nothing to descend (every statement kind, literals, binary /
+# assign / cast / sizeof), a view's root is its OBJECT (index_expr.index is a scalar),
+# a switch arm value is a constant, and an intrinsic's pointer argument is reached
+# through unwrap_ptr_launder (the shared peeler), which this audit cannot see.
+checker.c:keep_arg_caller_root:NODE_ASM:asm_stmt.inputs
+checker.c:keep_arg_caller_root:NODE_ASM:asm_stmt.outputs
+checker.c:keep_arg_caller_root:NODE_ASSIGN:assign.target
+checker.c:keep_arg_caller_root:NODE_ASSIGN:assign.value
+checker.c:keep_arg_caller_root:NODE_AWAIT:await_stmt.cond
+checker.c:keep_arg_caller_root:NODE_BINARY:binary.left
+checker.c:keep_arg_caller_root:NODE_BINARY:binary.right
+checker.c:keep_arg_caller_root:NODE_BLOCK:block.stmts
+checker.c:keep_arg_caller_root:NODE_CRITICAL:critical.body
+checker.c:keep_arg_caller_root:NODE_DEFER:defer.body
+checker.c:keep_arg_caller_root:NODE_DO_WHILE:while_stmt.body
+checker.c:keep_arg_caller_root:NODE_DO_WHILE:while_stmt.cond
+checker.c:keep_arg_caller_root:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:keep_arg_caller_root:NODE_FILE:file.decls
+checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.body
+checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.cond
+checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.init
+checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.step
+checker.c:keep_arg_caller_root:NODE_FUNC_DECL:func_decl.body
+checker.c:keep_arg_caller_root:NODE_GLOBAL_VAR:var_decl.init
+checker.c:keep_arg_caller_root:NODE_IF:if_stmt.cond
+checker.c:keep_arg_caller_root:NODE_IF:if_stmt.else_body
+checker.c:keep_arg_caller_root:NODE_IF:if_stmt.then_body
+checker.c:keep_arg_caller_root:NODE_INDEX:index_expr.index
+checker.c:keep_arg_caller_root:NODE_INTERRUPT:interrupt.body
+checker.c:keep_arg_caller_root:NODE_INTRINSIC:intrinsic.args
+checker.c:keep_arg_caller_root:NODE_ONCE:once.body
+checker.c:keep_arg_caller_root:NODE_RETURN:ret.expr
+checker.c:keep_arg_caller_root:NODE_SLICE:slice.end
+checker.c:keep_arg_caller_root:NODE_SLICE:slice.start
+checker.c:keep_arg_caller_root:NODE_SPAWN:spawn_stmt.args
+checker.c:keep_arg_caller_root:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:keep_arg_caller_root:NODE_SWITCH:switch_stmt.arms
+checker.c:keep_arg_caller_root:NODE_SWITCH:switch_stmt.expr
+checker.c:keep_arg_caller_root:NODE_VAR_DECL:var_decl.init
+checker.c:keep_arg_caller_root:NODE_WHILE:while_stmt.body
+checker.c:keep_arg_caller_root:NODE_WHILE:while_stmt.cond
+
+# 2026-09-22 (BUG-1043) — checker.c:rmw_scan_body is the exhaustive main-side RMW
+# summary walk. NODE_ASM operands are the tree-wide latent gap (asm is naked-only, and
+# a naked body holds nothing but asm and return, so no parameter RMW can hide there);
+# the remaining entries are declarations that cannot appear inside a body, and a
+# static_assert condition, which is a constant expression and can read-modify-write
+# nothing.
+checker.c:rmw_scan_body:NODE_ASM:asm_stmt.inputs
+checker.c:rmw_scan_body:NODE_ASM:asm_stmt.outputs
+checker.c:rmw_scan_body:NODE_FILE:file.decls
+checker.c:rmw_scan_body:NODE_FUNC_DECL:func_decl.body
+checker.c:rmw_scan_body:NODE_GLOBAL_VAR:var_decl.init
+checker.c:rmw_scan_body:NODE_INTERRUPT:interrupt.body
+checker.c:rmw_scan_body:NODE_STATIC_ASSERT:static_assert_stmt.cond
+
+# 2026-09-23 (BUG-1090/1098): three new exhaustive walkers, none of which descends
+# the arms listed below - by design, and each arm's answer is the SAFE one:
+#   * tfold / tfold_exact - the TYPED constant fold. Every listed kind is "not a
+#     constant this fold models" and returns false (FAIL => no range => the access
+#     keeps its runtime check). A call is folded only when comptime-resolved (its
+#     VALUE, never its arguments); an index / assign / orelse / intrinsic is never
+#     a constant here.
+#   * vrp_expr_may_write_var - "can this expression change variable X before a
+#     later read?". Every STATEMENT kind reaching it answers the conservative YES
+#     (do not hoist the guard) without descending; ASM operands are naked-only.
+checker.c:tfold:NODE_ASM:asm_stmt.inputs
+checker.c:tfold:NODE_ASM:asm_stmt.outputs
+checker.c:tfold:NODE_ASSIGN:assign.target
+checker.c:tfold:NODE_ASSIGN:assign.value
+checker.c:tfold:NODE_AWAIT:await_stmt.cond
+checker.c:tfold:NODE_BLOCK:block.stmts
+checker.c:tfold:NODE_CALL:call.args
+checker.c:tfold:NODE_CALL:call.callee
+checker.c:tfold:NODE_CRITICAL:critical.body
+checker.c:tfold:NODE_DEFER:defer.body
+checker.c:tfold:NODE_DO_WHILE:while_stmt.body
+checker.c:tfold:NODE_DO_WHILE:while_stmt.cond
+checker.c:tfold:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:tfold:NODE_FILE:file.decls
+checker.c:tfold:NODE_FOR:for_stmt.body
+checker.c:tfold:NODE_FOR:for_stmt.cond
+checker.c:tfold:NODE_FOR:for_stmt.init
+checker.c:tfold:NODE_FOR:for_stmt.step
+checker.c:tfold:NODE_FUNC_DECL:func_decl.body
+checker.c:tfold:NODE_GLOBAL_VAR:var_decl.init
+checker.c:tfold:NODE_IF:if_stmt.cond
+checker.c:tfold:NODE_IF:if_stmt.else_body
+checker.c:tfold:NODE_IF:if_stmt.then_body
+checker.c:tfold:NODE_INDEX:index_expr.index
+checker.c:tfold:NODE_INDEX:index_expr.object
+checker.c:tfold:NODE_INTERRUPT:interrupt.body
+checker.c:tfold:NODE_INTRINSIC:intrinsic.args
+checker.c:tfold:NODE_ONCE:once.body
+checker.c:tfold:NODE_ORELSE:orelse.expr
+checker.c:tfold:NODE_ORELSE:orelse.fallback
+checker.c:tfold:NODE_RETURN:ret.expr
+checker.c:tfold:NODE_SLICE:slice.end
+checker.c:tfold:NODE_SLICE:slice.object
+checker.c:tfold:NODE_SLICE:slice.start
+checker.c:tfold:NODE_SPAWN:spawn_stmt.args
+checker.c:tfold:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:tfold:NODE_STRUCT_INIT:struct_init.fields
+checker.c:tfold:NODE_SWITCH:switch_stmt.arms
+checker.c:tfold:NODE_SWITCH:switch_stmt.expr
+checker.c:tfold:NODE_VAR_DECL:var_decl.init
+checker.c:tfold:NODE_WHILE:while_stmt.body
+checker.c:tfold:NODE_WHILE:while_stmt.cond
+checker.c:tfold_exact:NODE_ASM:asm_stmt.inputs
+checker.c:tfold_exact:NODE_ASM:asm_stmt.outputs
+checker.c:tfold_exact:NODE_ASSIGN:assign.target
+checker.c:tfold_exact:NODE_ASSIGN:assign.value
+checker.c:tfold_exact:NODE_AWAIT:await_stmt.cond
+checker.c:tfold_exact:NODE_BLOCK:block.stmts
+checker.c:tfold_exact:NODE_CALL:call.args
+checker.c:tfold_exact:NODE_CALL:call.callee
+checker.c:tfold_exact:NODE_CRITICAL:critical.body
+checker.c:tfold_exact:NODE_DEFER:defer.body
+checker.c:tfold_exact:NODE_DO_WHILE:while_stmt.body
+checker.c:tfold_exact:NODE_DO_WHILE:while_stmt.cond
+checker.c:tfold_exact:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:tfold_exact:NODE_FIELD:field.object
+checker.c:tfold_exact:NODE_FILE:file.decls
+checker.c:tfold_exact:NODE_FOR:for_stmt.body
+checker.c:tfold_exact:NODE_FOR:for_stmt.cond
+checker.c:tfold_exact:NODE_FOR:for_stmt.init
+checker.c:tfold_exact:NODE_FOR:for_stmt.step
+checker.c:tfold_exact:NODE_FUNC_DECL:func_decl.body
+checker.c:tfold_exact:NODE_GLOBAL_VAR:var_decl.init
+checker.c:tfold_exact:NODE_IF:if_stmt.cond
+checker.c:tfold_exact:NODE_IF:if_stmt.else_body
+checker.c:tfold_exact:NODE_IF:if_stmt.then_body
+checker.c:tfold_exact:NODE_INDEX:index_expr.index
+checker.c:tfold_exact:NODE_INDEX:index_expr.object
+checker.c:tfold_exact:NODE_INTERRUPT:interrupt.body
+checker.c:tfold_exact:NODE_INTRINSIC:intrinsic.args
+checker.c:tfold_exact:NODE_ONCE:once.body
+checker.c:tfold_exact:NODE_ORELSE:orelse.expr
+checker.c:tfold_exact:NODE_ORELSE:orelse.fallback
+checker.c:tfold_exact:NODE_RETURN:ret.expr
+checker.c:tfold_exact:NODE_SLICE:slice.end
+checker.c:tfold_exact:NODE_SLICE:slice.object
+checker.c:tfold_exact:NODE_SLICE:slice.start
+checker.c:tfold_exact:NODE_SPAWN:spawn_stmt.args
+checker.c:tfold_exact:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:tfold_exact:NODE_STRUCT_INIT:struct_init.fields
+checker.c:tfold_exact:NODE_SWITCH:switch_stmt.arms
+checker.c:tfold_exact:NODE_SWITCH:switch_stmt.expr
+checker.c:tfold_exact:NODE_VAR_DECL:var_decl.init
+checker.c:tfold_exact:NODE_WHILE:while_stmt.body
+checker.c:tfold_exact:NODE_WHILE:while_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_ASM:asm_stmt.inputs
+checker.c:vrp_expr_may_write_var:NODE_ASM:asm_stmt.outputs
+checker.c:vrp_expr_may_write_var:NODE_BLOCK:block.stmts
+checker.c:vrp_expr_may_write_var:NODE_CRITICAL:critical.body
+checker.c:vrp_expr_may_write_var:NODE_DEFER:defer.body
+checker.c:vrp_expr_may_write_var:NODE_DO_WHILE:while_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_DO_WHILE:while_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:vrp_expr_may_write_var:NODE_FILE:file.decls
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.init
+checker.c:vrp_expr_may_write_var:NODE_FOR:for_stmt.step
+checker.c:vrp_expr_may_write_var:NODE_FUNC_DECL:func_decl.body
+checker.c:vrp_expr_may_write_var:NODE_GLOBAL_VAR:var_decl.init
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.else_body
+checker.c:vrp_expr_may_write_var:NODE_IF:if_stmt.then_body
+checker.c:vrp_expr_may_write_var:NODE_INTERRUPT:interrupt.body
+checker.c:vrp_expr_may_write_var:NODE_ONCE:once.body
+checker.c:vrp_expr_may_write_var:NODE_RETURN:ret.expr
+checker.c:vrp_expr_may_write_var:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:vrp_expr_may_write_var:NODE_SWITCH:switch_stmt.arms
+checker.c:vrp_expr_may_write_var:NODE_SWITCH:switch_stmt.expr
+checker.c:vrp_expr_may_write_var:NODE_VAR_DECL:var_decl.init
+checker.c:vrp_expr_may_write_var:NODE_WHILE:while_stmt.body
+checker.c:vrp_expr_may_write_var:NODE_WHILE:while_stmt.cond
+
+# 2026-09-23 (BUG-1101): zercheck_ir.c:ast_name_bind_count (BUG-1055) shipped with
+# every EXPRESSION arm answering 0 without descending, so an orelse BLOCK binding
+# (`x = m() orelse { bool c = ...; }`) was never counted and make check's walker
+# audit was RED at 3c5e6eaa. It now descends every expression child; what remains
+# is declarations that never appear in a body (counted as a rebinding, 2), asm
+# operands (naked-only) and a static_assert condition (a constant expression).
+zercheck_ir.c:ast_name_bind_count:NODE_FILE:file.decls
+zercheck_ir.c:ast_name_bind_count:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ast_name_bind_count:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ast_name_bind_count:NODE_INTERRUPT:interrupt.body
+
+# 2026-09-23g (BUG-1161): union_path_has_side_effect answers TRUE ("may have a side
+# effect") for every kind it does not descend — the conservative answer, which can only
+# refuse. Descending those children could never change a TRUE, so none is skipped wrongly.
+checker.c:union_path_has_side_effect:NODE_ASM:asm_stmt.inputs
+checker.c:union_path_has_side_effect:NODE_ASM:asm_stmt.outputs
+checker.c:union_path_has_side_effect:NODE_ASSIGN:assign.target
+checker.c:union_path_has_side_effect:NODE_ASSIGN:assign.value
+checker.c:union_path_has_side_effect:NODE_AWAIT:await_stmt.cond
+checker.c:union_path_has_side_effect:NODE_BLOCK:block.stmts
+checker.c:union_path_has_side_effect:NODE_CALL:call.args
+checker.c:union_path_has_side_effect:NODE_CALL:call.callee
+checker.c:union_path_has_side_effect:NODE_CRITICAL:critical.body
+checker.c:union_path_has_side_effect:NODE_DEFER:defer.body
+checker.c:union_path_has_side_effect:NODE_DO_WHILE:while_stmt.body
+checker.c:union_path_has_side_effect:NODE_DO_WHILE:while_stmt.cond
+checker.c:union_path_has_side_effect:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:union_path_has_side_effect:NODE_FILE:file.decls
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.body
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.cond
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.init
+checker.c:union_path_has_side_effect:NODE_FOR:for_stmt.step
+checker.c:union_path_has_side_effect:NODE_FUNC_DECL:func_decl.body
+checker.c:union_path_has_side_effect:NODE_GLOBAL_VAR:var_decl.init
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.cond
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.else_body
+checker.c:union_path_has_side_effect:NODE_IF:if_stmt.then_body
+checker.c:union_path_has_side_effect:NODE_INTERRUPT:interrupt.body
+checker.c:union_path_has_side_effect:NODE_INTRINSIC:intrinsic.args
+checker.c:union_path_has_side_effect:NODE_ONCE:once.body
+checker.c:union_path_has_side_effect:NODE_ORELSE:orelse.expr
+checker.c:union_path_has_side_effect:NODE_ORELSE:orelse.fallback
+checker.c:union_path_has_side_effect:NODE_RETURN:ret.expr
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.end
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.object
+checker.c:union_path_has_side_effect:NODE_SLICE:slice.start
+checker.c:union_path_has_side_effect:NODE_SPAWN:spawn_stmt.args
+checker.c:union_path_has_side_effect:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:union_path_has_side_effect:NODE_STRUCT_INIT:struct_init.fields
+checker.c:union_path_has_side_effect:NODE_SWITCH:switch_stmt.arms
+checker.c:union_path_has_side_effect:NODE_SWITCH:switch_stmt.expr
+checker.c:union_path_has_side_effect:NODE_TYPECAST:typecast.expr
+checker.c:union_path_has_side_effect:NODE_VAR_DECL:var_decl.init
+checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.body
+checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.cond
+
+# 2026-09-23g: emit_defer_stmt's NODE_ASM arm hands the whole node to emit_structured_asm,
+# which walks inputs/outputs itself. (The audit started seeing this function once the
+# emitter's brace-in-string layout around the new load-guard helpers changed.)
+# --- ir_lower.c: lower_may_write / index_clobbered_by / hoist_target_indices (BUG-1179/1184) ---
+# Early-ANSWER walkers: a call/assign/orelse/intrinsic answers TRUE at the node
+# (its children cannot make the answer more true), statement kinds answer the
+# conservative value, and hoist_target_indices only descends the lvalue chain
+# (object of FIELD/INDEX/deref) because only an INDEX inside the target is hoisted.
+ir_lower.c:hoist_target_indices:NODE_ASM:asm_stmt.inputs
+ir_lower.c:hoist_target_indices:NODE_ASM:asm_stmt.outputs
+ir_lower.c:hoist_target_indices:NODE_ASSIGN:assign.target
+ir_lower.c:hoist_target_indices:NODE_ASSIGN:assign.value
+ir_lower.c:hoist_target_indices:NODE_AWAIT:await_stmt.cond
+ir_lower.c:hoist_target_indices:NODE_BINARY:binary.left
+ir_lower.c:hoist_target_indices:NODE_BINARY:binary.right
+ir_lower.c:hoist_target_indices:NODE_BLOCK:block.stmts
+ir_lower.c:hoist_target_indices:NODE_CALL:call.args
+ir_lower.c:hoist_target_indices:NODE_CALL:call.callee
+ir_lower.c:hoist_target_indices:NODE_CRITICAL:critical.body
+ir_lower.c:hoist_target_indices:NODE_DEFER:defer.body
+ir_lower.c:hoist_target_indices:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:hoist_target_indices:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:hoist_target_indices:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:hoist_target_indices:NODE_FILE:file.decls
+ir_lower.c:hoist_target_indices:NODE_FOR:for_stmt.body
+ir_lower.c:hoist_target_indices:NODE_FOR:for_stmt.cond
+ir_lower.c:hoist_target_indices:NODE_FOR:for_stmt.init
+ir_lower.c:hoist_target_indices:NODE_FOR:for_stmt.step
+ir_lower.c:hoist_target_indices:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:hoist_target_indices:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:hoist_target_indices:NODE_IF:if_stmt.cond
+ir_lower.c:hoist_target_indices:NODE_IF:if_stmt.else_body
+ir_lower.c:hoist_target_indices:NODE_IF:if_stmt.then_body
+ir_lower.c:hoist_target_indices:NODE_INTERRUPT:interrupt.body
+ir_lower.c:hoist_target_indices:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:hoist_target_indices:NODE_ONCE:once.body
+ir_lower.c:hoist_target_indices:NODE_ORELSE:orelse.expr
+ir_lower.c:hoist_target_indices:NODE_ORELSE:orelse.fallback
+ir_lower.c:hoist_target_indices:NODE_RETURN:ret.expr
+ir_lower.c:hoist_target_indices:NODE_SLICE:slice.end
+ir_lower.c:hoist_target_indices:NODE_SLICE:slice.object
+ir_lower.c:hoist_target_indices:NODE_SLICE:slice.start
+ir_lower.c:hoist_target_indices:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:hoist_target_indices:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:hoist_target_indices:NODE_STRUCT_INIT:struct_init.fields
+ir_lower.c:hoist_target_indices:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:hoist_target_indices:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:hoist_target_indices:NODE_TYPECAST:typecast.expr
+ir_lower.c:hoist_target_indices:NODE_VAR_DECL:var_decl.init
+ir_lower.c:hoist_target_indices:NODE_WHILE:while_stmt.body
+ir_lower.c:hoist_target_indices:NODE_WHILE:while_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_ASM:asm_stmt.inputs
+ir_lower.c:index_clobbered_by:NODE_ASM:asm_stmt.outputs
+ir_lower.c:index_clobbered_by:NODE_ASSIGN:assign.target
+ir_lower.c:index_clobbered_by:NODE_ASSIGN:assign.value
+ir_lower.c:index_clobbered_by:NODE_AWAIT:await_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_BLOCK:block.stmts
+ir_lower.c:index_clobbered_by:NODE_CALL:call.args
+ir_lower.c:index_clobbered_by:NODE_CALL:call.callee
+ir_lower.c:index_clobbered_by:NODE_CRITICAL:critical.body
+ir_lower.c:index_clobbered_by:NODE_DEFER:defer.body
+ir_lower.c:index_clobbered_by:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:index_clobbered_by:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:index_clobbered_by:NODE_FILE:file.decls
+ir_lower.c:index_clobbered_by:NODE_FOR:for_stmt.body
+ir_lower.c:index_clobbered_by:NODE_FOR:for_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_FOR:for_stmt.init
+ir_lower.c:index_clobbered_by:NODE_FOR:for_stmt.step
+ir_lower.c:index_clobbered_by:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:index_clobbered_by:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:index_clobbered_by:NODE_IF:if_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_IF:if_stmt.else_body
+ir_lower.c:index_clobbered_by:NODE_IF:if_stmt.then_body
+ir_lower.c:index_clobbered_by:NODE_INTERRUPT:interrupt.body
+ir_lower.c:index_clobbered_by:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:index_clobbered_by:NODE_ONCE:once.body
+ir_lower.c:index_clobbered_by:NODE_ORELSE:orelse.expr
+ir_lower.c:index_clobbered_by:NODE_ORELSE:orelse.fallback
+ir_lower.c:index_clobbered_by:NODE_RETURN:ret.expr
+ir_lower.c:index_clobbered_by:NODE_SLICE:slice.end
+ir_lower.c:index_clobbered_by:NODE_SLICE:slice.object
+ir_lower.c:index_clobbered_by:NODE_SLICE:slice.start
+ir_lower.c:index_clobbered_by:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:index_clobbered_by:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:index_clobbered_by:NODE_STRUCT_INIT:struct_init.fields
+ir_lower.c:index_clobbered_by:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:index_clobbered_by:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:index_clobbered_by:NODE_VAR_DECL:var_decl.init
+ir_lower.c:index_clobbered_by:NODE_WHILE:while_stmt.body
+ir_lower.c:index_clobbered_by:NODE_WHILE:while_stmt.cond
+ir_lower.c:lower_may_write:NODE_ASM:asm_stmt.inputs
+ir_lower.c:lower_may_write:NODE_ASM:asm_stmt.outputs
+ir_lower.c:lower_may_write:NODE_ASSIGN:assign.target
+ir_lower.c:lower_may_write:NODE_ASSIGN:assign.value
+ir_lower.c:lower_may_write:NODE_AWAIT:await_stmt.cond
+ir_lower.c:lower_may_write:NODE_BLOCK:block.stmts
+ir_lower.c:lower_may_write:NODE_CALL:call.args
+ir_lower.c:lower_may_write:NODE_CALL:call.callee
+ir_lower.c:lower_may_write:NODE_CRITICAL:critical.body
+ir_lower.c:lower_may_write:NODE_DEFER:defer.body
+ir_lower.c:lower_may_write:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:lower_may_write:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:lower_may_write:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:lower_may_write:NODE_FILE:file.decls
+ir_lower.c:lower_may_write:NODE_FOR:for_stmt.body
+ir_lower.c:lower_may_write:NODE_FOR:for_stmt.cond
+ir_lower.c:lower_may_write:NODE_FOR:for_stmt.init
+ir_lower.c:lower_may_write:NODE_FOR:for_stmt.step
+ir_lower.c:lower_may_write:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:lower_may_write:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:lower_may_write:NODE_IF:if_stmt.cond
+ir_lower.c:lower_may_write:NODE_IF:if_stmt.else_body
+ir_lower.c:lower_may_write:NODE_IF:if_stmt.then_body
+ir_lower.c:lower_may_write:NODE_INTERRUPT:interrupt.body
+ir_lower.c:lower_may_write:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:lower_may_write:NODE_ONCE:once.body
+ir_lower.c:lower_may_write:NODE_ORELSE:orelse.expr
+ir_lower.c:lower_may_write:NODE_ORELSE:orelse.fallback
+ir_lower.c:lower_may_write:NODE_RETURN:ret.expr
+ir_lower.c:lower_may_write:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:lower_may_write:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:lower_may_write:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:lower_may_write:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:lower_may_write:NODE_VAR_DECL:var_decl.init
+ir_lower.c:lower_may_write:NODE_WHILE:while_stmt.body
+ir_lower.c:lower_may_write:NODE_WHILE:while_stmt.cond
+# --- checker.c: value_forms_variant_ref / ucw_walk (BUG-1186) ---
+# value_forms_variant_ref asks "does this VALUE form a reference into a variant":
+# only the object side of a projection, the operand of &, both orelse arms,
+# call args and struct-literal values can; statement kinds answer false.
+# ucw_walk delegates NODE_CALL to ucw_call (args + callee body), answers TRUE
+# at ASM/SPAWN, and never sees declaration kinds (it walks bodies).
+checker.c:ucw_walk:NODE_ASM:asm_stmt.inputs
+checker.c:ucw_walk:NODE_ASM:asm_stmt.outputs
+checker.c:ucw_walk:NODE_CALL:call.args
+checker.c:ucw_walk:NODE_CALL:call.callee
+checker.c:ucw_walk:NODE_FILE:file.decls
+checker.c:ucw_walk:NODE_FUNC_DECL:func_decl.body
+checker.c:ucw_walk:NODE_GLOBAL_VAR:var_decl.init
+checker.c:ucw_walk:NODE_INTERRUPT:interrupt.body
+checker.c:ucw_walk:NODE_SPAWN:spawn_stmt.args
+checker.c:ucw_walk:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:value_forms_variant_ref:NODE_ASM:asm_stmt.inputs
+checker.c:value_forms_variant_ref:NODE_ASM:asm_stmt.outputs
+checker.c:value_forms_variant_ref:NODE_ASSIGN:assign.target
+checker.c:value_forms_variant_ref:NODE_ASSIGN:assign.value
+checker.c:value_forms_variant_ref:NODE_AWAIT:await_stmt.cond
+checker.c:value_forms_variant_ref:NODE_BINARY:binary.left
+checker.c:value_forms_variant_ref:NODE_BINARY:binary.right
+checker.c:value_forms_variant_ref:NODE_BLOCK:block.stmts
+checker.c:value_forms_variant_ref:NODE_CALL:call.callee
+checker.c:value_forms_variant_ref:NODE_CRITICAL:critical.body
+checker.c:value_forms_variant_ref:NODE_DEFER:defer.body
+checker.c:value_forms_variant_ref:NODE_DO_WHILE:while_stmt.body
+checker.c:value_forms_variant_ref:NODE_DO_WHILE:while_stmt.cond
+checker.c:value_forms_variant_ref:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:value_forms_variant_ref:NODE_FIELD:field.object
+checker.c:value_forms_variant_ref:NODE_FILE:file.decls
+checker.c:value_forms_variant_ref:NODE_FOR:for_stmt.body
+checker.c:value_forms_variant_ref:NODE_FOR:for_stmt.cond
+checker.c:value_forms_variant_ref:NODE_FOR:for_stmt.init
+checker.c:value_forms_variant_ref:NODE_FOR:for_stmt.step
+checker.c:value_forms_variant_ref:NODE_FUNC_DECL:func_decl.body
+checker.c:value_forms_variant_ref:NODE_GLOBAL_VAR:var_decl.init
+checker.c:value_forms_variant_ref:NODE_IF:if_stmt.cond
+checker.c:value_forms_variant_ref:NODE_IF:if_stmt.else_body
+checker.c:value_forms_variant_ref:NODE_IF:if_stmt.then_body
+checker.c:value_forms_variant_ref:NODE_INDEX:index_expr.index
+checker.c:value_forms_variant_ref:NODE_INTERRUPT:interrupt.body
+checker.c:value_forms_variant_ref:NODE_INTRINSIC:intrinsic.args
+checker.c:value_forms_variant_ref:NODE_ONCE:once.body
+checker.c:value_forms_variant_ref:NODE_RETURN:ret.expr
+checker.c:value_forms_variant_ref:NODE_SLICE:slice.end
+checker.c:value_forms_variant_ref:NODE_SLICE:slice.start
+checker.c:value_forms_variant_ref:NODE_SPAWN:spawn_stmt.args
+checker.c:value_forms_variant_ref:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:value_forms_variant_ref:NODE_SWITCH:switch_stmt.arms
+checker.c:value_forms_variant_ref:NODE_SWITCH:switch_stmt.expr
+checker.c:value_forms_variant_ref:NODE_TYPECAST:typecast.expr
+checker.c:value_forms_variant_ref:NODE_VAR_DECL:var_decl.init
+checker.c:value_forms_variant_ref:NODE_WHILE:while_stmt.body
+checker.c:value_forms_variant_ref:NODE_WHILE:while_stmt.cond
+# --- checker.c: stmt_mentions_name_from / stmt_holds_label (BUG-1189/1190) ---
+# stmt_mentions_name_from walks STATEMENTS and hands every expression child to
+# expr_mentions_name (EXM) — the audit cannot see through that delegation.
+# stmt_holds_label asks only whether a LABEL (a statement) sits inside: expression
+# children cannot hold one, so only statement bodies are descended.
+# Z is zbi_scan_children's local macro (the resource-init scan): asm operands are
+# not descended — asm is naked-only and cannot initialise a Barrier/Arena.
+checker.c:stmt_holds_label:NODE_ASM:asm_stmt.inputs
+checker.c:stmt_holds_label:NODE_ASM:asm_stmt.outputs
+checker.c:stmt_holds_label:NODE_ASSIGN:assign.target
+checker.c:stmt_holds_label:NODE_ASSIGN:assign.value
+checker.c:stmt_holds_label:NODE_AWAIT:await_stmt.cond
+checker.c:stmt_holds_label:NODE_BINARY:binary.left
+checker.c:stmt_holds_label:NODE_BINARY:binary.right
+checker.c:stmt_holds_label:NODE_CALL:call.args
+checker.c:stmt_holds_label:NODE_CALL:call.callee
+checker.c:stmt_holds_label:NODE_DO_WHILE:while_stmt.cond
+checker.c:stmt_holds_label:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:stmt_holds_label:NODE_FIELD:field.object
+checker.c:stmt_holds_label:NODE_FILE:file.decls
+checker.c:stmt_holds_label:NODE_FOR:for_stmt.cond
+checker.c:stmt_holds_label:NODE_FOR:for_stmt.init
+checker.c:stmt_holds_label:NODE_FOR:for_stmt.step
+checker.c:stmt_holds_label:NODE_FUNC_DECL:func_decl.body
+checker.c:stmt_holds_label:NODE_GLOBAL_VAR:var_decl.init
+checker.c:stmt_holds_label:NODE_IF:if_stmt.cond
+checker.c:stmt_holds_label:NODE_INDEX:index_expr.index
+checker.c:stmt_holds_label:NODE_INDEX:index_expr.object
+checker.c:stmt_holds_label:NODE_INTERRUPT:interrupt.body
+checker.c:stmt_holds_label:NODE_INTRINSIC:intrinsic.args
+checker.c:stmt_holds_label:NODE_ORELSE:orelse.expr
+checker.c:stmt_holds_label:NODE_ORELSE:orelse.fallback
+checker.c:stmt_holds_label:NODE_RETURN:ret.expr
+checker.c:stmt_holds_label:NODE_SLICE:slice.end
+checker.c:stmt_holds_label:NODE_SLICE:slice.object
+checker.c:stmt_holds_label:NODE_SLICE:slice.start
+checker.c:stmt_holds_label:NODE_SPAWN:spawn_stmt.args
+checker.c:stmt_holds_label:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:stmt_holds_label:NODE_STRUCT_INIT:struct_init.fields
+checker.c:stmt_holds_label:NODE_SWITCH:switch_stmt.expr
+checker.c:stmt_holds_label:NODE_TYPECAST:typecast.expr
+checker.c:stmt_holds_label:NODE_UNARY:unary.operand
+checker.c:stmt_holds_label:NODE_VAR_DECL:var_decl.init
+checker.c:stmt_holds_label:NODE_WHILE:while_stmt.cond
+checker.c:stmt_mentions_name_from:NODE_ASM:asm_stmt.inputs
+checker.c:stmt_mentions_name_from:NODE_ASM:asm_stmt.outputs
+checker.c:stmt_mentions_name_from:NODE_ASSIGN:assign.target
+checker.c:stmt_mentions_name_from:NODE_ASSIGN:assign.value
+checker.c:stmt_mentions_name_from:NODE_BINARY:binary.left
+checker.c:stmt_mentions_name_from:NODE_BINARY:binary.right
+checker.c:stmt_mentions_name_from:NODE_CALL:call.args
+checker.c:stmt_mentions_name_from:NODE_CALL:call.callee
+checker.c:stmt_mentions_name_from:NODE_FIELD:field.object
+checker.c:stmt_mentions_name_from:NODE_FILE:file.decls
+checker.c:stmt_mentions_name_from:NODE_FUNC_DECL:func_decl.body
+checker.c:stmt_mentions_name_from:NODE_GLOBAL_VAR:var_decl.init
+checker.c:stmt_mentions_name_from:NODE_INDEX:index_expr.index
+checker.c:stmt_mentions_name_from:NODE_INDEX:index_expr.object
+checker.c:stmt_mentions_name_from:NODE_INTERRUPT:interrupt.body
+checker.c:stmt_mentions_name_from:NODE_INTRINSIC:intrinsic.args
+checker.c:stmt_mentions_name_from:NODE_ORELSE:orelse.expr
+checker.c:stmt_mentions_name_from:NODE_ORELSE:orelse.fallback
+checker.c:stmt_mentions_name_from:NODE_SLICE:slice.end
+checker.c:stmt_mentions_name_from:NODE_SLICE:slice.object
+checker.c:stmt_mentions_name_from:NODE_SLICE:slice.start
+checker.c:stmt_mentions_name_from:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:stmt_mentions_name_from:NODE_STRUCT_INIT:struct_init.fields
+checker.c:stmt_mentions_name_from:NODE_TYPECAST:typecast.expr
+checker.c:stmt_mentions_name_from:NODE_UNARY:unary.operand
+# BUG-1194 mmio_index_reevaluable: a PROOF-OF-SAFETY walk (may the MMIO guard re-read this index?).
+# Every kind it does not descend answers false = refuse the index, so an undescended field can only over-reject.
+checker.c:mmio_index_reevaluable:NODE_ASM:asm_stmt.inputs
+checker.c:mmio_index_reevaluable:NODE_ASM:asm_stmt.outputs
+checker.c:mmio_index_reevaluable:NODE_ASSIGN:assign.target
+checker.c:mmio_index_reevaluable:NODE_ASSIGN:assign.value
+checker.c:mmio_index_reevaluable:NODE_AWAIT:await_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_BLOCK:block.stmts
+checker.c:mmio_index_reevaluable:NODE_CALL:call.args
+checker.c:mmio_index_reevaluable:NODE_CALL:call.callee
+checker.c:mmio_index_reevaluable:NODE_CRITICAL:critical.body
+checker.c:mmio_index_reevaluable:NODE_DEFER:defer.body
+checker.c:mmio_index_reevaluable:NODE_DO_WHILE:while_stmt.body
+checker.c:mmio_index_reevaluable:NODE_DO_WHILE:while_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:mmio_index_reevaluable:NODE_FIELD:field.object
+checker.c:mmio_index_reevaluable:NODE_FILE:file.decls
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.body
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.init
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.step
+checker.c:mmio_index_reevaluable:NODE_FUNC_DECL:func_decl.body
+checker.c:mmio_index_reevaluable:NODE_GLOBAL_VAR:var_decl.init
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.else_body
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.then_body
+checker.c:mmio_index_reevaluable:NODE_INDEX:index_expr.index
+checker.c:mmio_index_reevaluable:NODE_INDEX:index_expr.object
+checker.c:mmio_index_reevaluable:NODE_INTERRUPT:interrupt.body
+checker.c:mmio_index_reevaluable:NODE_INTRINSIC:intrinsic.args
+checker.c:mmio_index_reevaluable:NODE_ONCE:once.body
+checker.c:mmio_index_reevaluable:NODE_ORELSE:orelse.expr
+checker.c:mmio_index_reevaluable:NODE_ORELSE:orelse.fallback
+checker.c:mmio_index_reevaluable:NODE_RETURN:ret.expr
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.end
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.object
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.start
+checker.c:mmio_index_reevaluable:NODE_SPAWN:spawn_stmt.args
+checker.c:mmio_index_reevaluable:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_STRUCT_INIT:struct_init.fields
+checker.c:mmio_index_reevaluable:NODE_SWITCH:switch_stmt.arms
+checker.c:mmio_index_reevaluable:NODE_SWITCH:switch_stmt.expr
+checker.c:mmio_index_reevaluable:NODE_VAR_DECL:var_decl.init
+checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.body
+checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.cond
+# 2026-09-24e — BUG-1248 collect_borrow_roots: a VALUE walk for 'which locals can this
+# pointer reach'. Scalar-producing kinds (binary, assign, literals) lend nothing, statement
+# kinds never appear in a value position, and FIELD/INDEX/SLICE are walked as a chain to
+# their root (the index / bounds are scalars). Reviewed row by row.
+checker.c:collect_borrow_roots:NODE_ASM:asm_stmt.inputs
+checker.c:collect_borrow_roots:NODE_ASM:asm_stmt.outputs
+checker.c:collect_borrow_roots:NODE_ASSIGN:assign.target
+checker.c:collect_borrow_roots:NODE_ASSIGN:assign.value
+checker.c:collect_borrow_roots:NODE_AWAIT:await_stmt.cond
+checker.c:collect_borrow_roots:NODE_BINARY:binary.left
+checker.c:collect_borrow_roots:NODE_BINARY:binary.right
+checker.c:collect_borrow_roots:NODE_BLOCK:block.stmts
+checker.c:collect_borrow_roots:NODE_CALL:call.callee
+checker.c:collect_borrow_roots:NODE_CRITICAL:critical.body
+checker.c:collect_borrow_roots:NODE_DEFER:defer.body
+checker.c:collect_borrow_roots:NODE_DO_WHILE:while_stmt.body
+checker.c:collect_borrow_roots:NODE_DO_WHILE:while_stmt.cond
+checker.c:collect_borrow_roots:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:collect_borrow_roots:NODE_FIELD:field.object
+checker.c:collect_borrow_roots:NODE_FILE:file.decls
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.body
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.cond
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.init
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.step
+checker.c:collect_borrow_roots:NODE_FUNC_DECL:func_decl.body
+checker.c:collect_borrow_roots:NODE_GLOBAL_VAR:var_decl.init
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.cond
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.else_body
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.then_body
+checker.c:collect_borrow_roots:NODE_INDEX:index_expr.index
+checker.c:collect_borrow_roots:NODE_INDEX:index_expr.object
+checker.c:collect_borrow_roots:NODE_INTERRUPT:interrupt.body
+checker.c:collect_borrow_roots:NODE_ONCE:once.body
+checker.c:collect_borrow_roots:NODE_RETURN:ret.expr
+checker.c:collect_borrow_roots:NODE_SLICE:slice.end
+checker.c:collect_borrow_roots:NODE_SLICE:slice.start
+checker.c:collect_borrow_roots:NODE_SPAWN:spawn_stmt.args
+checker.c:collect_borrow_roots:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:collect_borrow_roots:NODE_SWITCH:switch_stmt.arms
+checker.c:collect_borrow_roots:NODE_SWITCH:switch_stmt.expr
+checker.c:collect_borrow_roots:NODE_VAR_DECL:var_decl.init
+checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.body
+checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.cond
+# BUG-1255: is_non_storable_depth follows ONE value's projection chain (field / index / launder /
+# get() call) to decide whether it still names a pool slot; it deliberately does not descend
+# sub-expressions that are not that value (an index, a call argument, statements).
+checker.c:is_non_storable_depth:NODE_ASM:asm_stmt.inputs
+checker.c:is_non_storable_depth:NODE_ASM:asm_stmt.outputs
+checker.c:is_non_storable_depth:NODE_ASSIGN:assign.target
+checker.c:is_non_storable_depth:NODE_ASSIGN:assign.value
+checker.c:is_non_storable_depth:NODE_AWAIT:await_stmt.cond
+checker.c:is_non_storable_depth:NODE_BINARY:binary.left
+checker.c:is_non_storable_depth:NODE_BINARY:binary.right
+checker.c:is_non_storable_depth:NODE_BLOCK:block.stmts
+checker.c:is_non_storable_depth:NODE_CALL:call.callee
+checker.c:is_non_storable_depth:NODE_CRITICAL:critical.body
+checker.c:is_non_storable_depth:NODE_DEFER:defer.body
+checker.c:is_non_storable_depth:NODE_DO_WHILE:while_stmt.body
+checker.c:is_non_storable_depth:NODE_DO_WHILE:while_stmt.cond
+checker.c:is_non_storable_depth:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:is_non_storable_depth:NODE_FIELD:field.object
+checker.c:is_non_storable_depth:NODE_FILE:file.decls
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.body
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.cond
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.init
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.step
+checker.c:is_non_storable_depth:NODE_FUNC_DECL:func_decl.body
+checker.c:is_non_storable_depth:NODE_GLOBAL_VAR:var_decl.init
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.cond
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.else_body
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.then_body
+checker.c:is_non_storable_depth:NODE_INDEX:index_expr.index
+checker.c:is_non_storable_depth:NODE_INDEX:index_expr.object
+checker.c:is_non_storable_depth:NODE_INTERRUPT:interrupt.body
+checker.c:is_non_storable_depth:NODE_ONCE:once.body
+checker.c:is_non_storable_depth:NODE_RETURN:ret.expr
+checker.c:is_non_storable_depth:NODE_SLICE:slice.end
+checker.c:is_non_storable_depth:NODE_SLICE:slice.object
+checker.c:is_non_storable_depth:NODE_SLICE:slice.start
+checker.c:is_non_storable_depth:NODE_SPAWN:spawn_stmt.args
+checker.c:is_non_storable_depth:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:is_non_storable_depth:NODE_SWITCH:switch_stmt.arms
+checker.c:is_non_storable_depth:NODE_SWITCH:switch_stmt.expr
+checker.c:is_non_storable_depth:NODE_UNARY:unary.operand
+checker.c:is_non_storable_depth:NODE_VAR_DECL:var_decl.init
+checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.body
+checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.cond

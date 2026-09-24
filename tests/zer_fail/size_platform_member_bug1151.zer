@@ -1,0 +1,10 @@
+// expect-error: is not a compile-time constant — the type holds a member whose size is the platform's
+// BUG-1151: was a SIZE-0 array (checker) sized by sizeof in C — .len read 0 at run time.
+struct S { Semaphore(1) s; u32 x; }
+S gs;
+u32 main() {
+    u8[@size(S)] buf;
+    usize real = @size(S);
+    if (buf.len != real) { return 1; }
+    return 0;
+}

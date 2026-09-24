@@ -320,13 +320,14 @@ static void test_pool_driver_pattern(void) {
         "}\n",
         0, "pool alloc/configure/read/free");
 
-    /* 3b: multiple handles, independent lifecycle */
+    /* 3b: multiple handles, independent lifecycle.
+     * BUG-1071: b's fallback must free a — `orelse return` there leaked it. */
     test_e2e(
         "struct Task { u32 id; u32 prio; }\n"
         "Pool(Task, 8) tasks;\n"
         "u32 main() {\n"
         "    Handle(Task) a = tasks.alloc() orelse return;\n"
-        "    Handle(Task) b = tasks.alloc() orelse return;\n"
+        "    Handle(Task) b = tasks.alloc() orelse { tasks.free(a); return 1; };\n"
         "    tasks.get(a).id = 10;\n"
         "    tasks.get(b).id = 20;\n"
         "    u32 sum = tasks.get(a).id + tasks.get(b).id;\n"

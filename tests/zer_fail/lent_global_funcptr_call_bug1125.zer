@@ -1,0 +1,12 @@
+// expect-error: cannot call through a function pointer while 'counter' is lent
+// BUG-1125: a funcptr call's target is unknown while a global is lent.
+u32 counter;
+void worker(*u32 p) { *p += 1; }
+void noop() { }
+u32 main() {
+    *() fp = noop;
+    ThreadHandle th = spawn worker(&counter);
+    fp();
+    th.join();
+    return 0;
+}

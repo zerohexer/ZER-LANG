@@ -457,7 +457,15 @@ struct Node {
         } switch_stmt;
 
         /* NODE_RETURN: return expr; */
-        struct { Node *expr; /* NULL for bare return */ } ret;
+        struct {
+            Node *expr; /* NULL for bare return */
+            /* BUG-1097: the value range of `expr` AT THIS RETURN, recorded by the
+             * checker when it reaches the statement (0 = never reached, 1 = range
+             * in vrp_min/vrp_max, 2 = no derivable range). The cross-function
+             * summary reads this, never the ranges live at the end of the body. */
+            uint8_t vrp_state;
+            int64_t vrp_min, vrp_max;
+        } ret;
 
         /* NODE_DEFER: defer stmt; or defer { block } */
         struct { Node *body; } defer;
@@ -563,6 +571,14 @@ struct Node {
         struct {
             const char *name;
             size_t name_len;
+            /* BUG-1099: a reference the PARSER made to one of its own desugaring
+             * variables (the for-in `_zer_ri` / `_zer_rlen`). Only such a
+             * reference may name a synthetic variable; user code may not. */
+            bool is_synthetic;
+            /* BUG-1200: written by the checker when it rewrites a qualified
+             * `mod.name` to this ident — the module has been checked to own the
+             * Symbol the bare name resolves to, so it is not ambiguous. */
+            bool module_qualified;
         } ident;
 
         /* NODE_BINARY: left op right */
@@ -602,6 +618,10 @@ struct Node {
             Node *object;
             const char *field_name;
             size_t field_name_len;
+            /* BUG-1053: the allocator a Handle auto-deref `h.f` resolves to,
+             * recorded by the CHECKER (which alone sees `h`'s slab_source) so
+             * the emitter's paths read ONE answer instead of re-deriving it. */
+            struct Symbol *handle_alloc;
         } field;
 
         /* NODE_INDEX: expr[index] */
@@ -633,6 +653,18 @@ struct Node {
             Node **args;
             int arg_count;
             TypeNode *type_arg;     /* for @ptrcast(*T, expr), @size(T), etc. */
+            /* BUG-1058: @inttoptr's address, when the CHECKER folded it to a
+             * constant (a literal or a `const` ident) — the emitter emits a
+             * plain cast for it (legal in a global initializer) and the
+             * runtime checks only for a genuinely variable address. */
+            bool addr_is_const;
+            uint64_t const_addr;
+            /* BUG-1151: `@size(T)` folded by the CHECKER (compute_type_size, the
+             * same layout the emitter's `sizeof` produces), so the shared
+             * constant evaluator can use it: `const usize K = @size(T); u8[K] b;`,
+             * `@size(T) * 2`. Mirrors call.is_comptime_resolved. */
+            bool is_size_folded;
+            int64_t size_value;
         } intrinsic;
 
         /* NODE_TYPECAST: (Type)expr — explicit C-style cast */
@@ -678,8 +710,13 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
                                           ConstIdentResolver resolve, void *resolve_ctx) {
     if (!n || depth > 256) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
+    /* BUG-1191: a character literal is a u8 constant ('G' is 71) — `enum Cmd {
+     * get = 'G' }` and `u8[' '] pad` fold like any literal. */
+    if (n->kind == NODE_CHAR_LIT) return (int64_t)(uint8_t)n->char_lit.value;
     if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
         return n->call.comptime_value;
+    if (n->kind == NODE_INTRINSIC && n->intrinsic.is_size_folded)   /* BUG-1151 */
+        return n->intrinsic.size_value;
     /* Ident resolution via callback */
     if (n->kind == NODE_IDENT && resolve)
         return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len,
@@ -722,11 +759,19 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
             if (r == 0) return CONST_EVAL_FAIL;
             if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
             return l % r;
+        /* BUG-1031: a shift by a negative count, or by >= the operand width, is 0
+         * in ZER (`_zer_shl`/`_zer_shr`). This evaluator is UNTYPED, so only a
+         * count that is over-width for EVERY ZER integer width (uN goes to 128)
+         * can be folded here; [63,127] stays CONST_EVAL_FAIL and is decided by a
+         * typed site (checker.c eval_const_expr_subst knows the operand width;
+         * the emitter's global-initializer path knows the left operand's type). */
         case TOK_LSHIFT:
-            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            if (r < 0 || r >= 128) return 0;
+            if (r >= 63) return CONST_EVAL_FAIL;
             return (int64_t)((uint64_t)l << r);
         case TOK_RSHIFT:
-            if (r < 0 || r >= 63) return CONST_EVAL_FAIL;
+            if (r < 0 || r >= 128) return 0;
+            if (r >= 63) return CONST_EVAL_FAIL;
             return l >> r;
         case TOK_AMP:     return l & r;
         case TOK_PIPE:    return l | r;

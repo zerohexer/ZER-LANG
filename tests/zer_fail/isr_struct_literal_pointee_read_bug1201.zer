@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: global 'g' is accessed from both interrupt and main code
+// BUG-1201 (read side): main polled g THROUGH a nested global carrier while the ISR
+// wrote it by name — the pointee tracker demanded a bare pointer/slice root.
+u32 g;
+struct H { *u32 p; }
+struct O { H in; }
+O o = { .in = { .p = &g } };
+interrupt TIM2 { g = 1; }
+u32 main() { while (*o.in.p == 0) { } return 0; }

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: reads a field of a global variable
+// BUG-1219: C evaluates no object at file scope; this emitted
+// `uint32_t x = (struct C){ .a = 5U }.a;` — "initializer element is not constant".
+struct C { u32 a; u32[2] arr; }
+const C cg = { .a = 5 };
+u32 x = cg.a;
+u32 main() { return x - 5; }

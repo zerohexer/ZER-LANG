@@ -1,0 +1,76 @@
+// BUG-1060: @saturate with an UNSIGNED 64-bit (or wider) source and a SIGNED
+// target compared `u64 < -128LL`, which C's usual arithmetic conversions make an
+// UNSIGNED comparison — every value clamped to MIN. `@saturate(i32, s.len)` for a
+// length of 10 gave INT32_MIN. Targets wider than 64 bits clamped to the u64
+// maximum. Both emitter dispatch paths (AST and IR) are exercised: var-decl init,
+// plain assign, struct-field store, return, call argument.
+struct S { i8 f; i32 g; u64 h; }
+
+i8 ret_sat(u64 v) { return @saturate(i8, v); }
+i32 take(i32 x) { return x; }
+
+u32 main() {
+    volatile u64 vb = 300;
+    u64 b = vb;
+    // var-decl init
+    i8 t = @saturate(i8, b);
+    if (t != 127) { return 1; }
+    i32 t32 = @saturate(i32, b);
+    if (t32 != 300) { return 2; }
+    i64 t64 = @saturate(i64, b);
+    if (t64 != 300) { return 3; }
+    i16 th = @saturate(i16, b);
+    if (th != 300) { return 4; }
+    // plain assign + field store
+    S s;
+    s.f = @saturate(i8, b);
+    if (s.f != 127) { return 5; }
+    i32 a = 0;
+    a = @saturate(i32, b);
+    if (a != 300) { return 6; }
+    // return + call arg
+    if (ret_sat(b) != 127) { return 7; }
+    if (take(@saturate(i32, b)) != 300) { return 8; }
+    // slice length (usize source)
+    u8[10] buf;
+    [*]u8 sl = buf[0..];
+    i32 n = @saturate(i32, sl.len);
+    if (n != 10) { return 9; }
+    // max u64 into i64 still clamps high
+    u64 big = 18446744073709551615;
+    i64 tb = @saturate(i64, big);
+    if (tb != 9223372036854775807) { return 10; }
+    // signed source, both directions
+    volatile i64 vneg = -1000;
+    i64 neg = vneg;
+    i8 sn = @saturate(i8, neg);
+    if (sn != -128) { return 11; }
+    u8 un = @saturate(u8, neg);
+    if (un != 0) { return 12; }
+    u64 un64 = @saturate(u64, neg);
+    if (un64 != 0) { return 13; }
+    s.h = @saturate(u64, neg);
+    if (s.h != 0) { return 14; }
+    // 128-bit source above 2^64 into a 64-bit target
+    u128 one = 1;
+    volatile u128 v128 = one << 64;
+    u128 w128 = v128;
+    u64 y = @saturate(u64, w128);
+    if (y != 18446744073709551615) { return 15; }
+    u64 y2 = @saturate(u64, w128 + 1000);
+    if (y2 != 18446744073709551615) { return 16; }
+    i8 q = @saturate(i8, w128);
+    if (q != 127) { return 17; }
+    i5 q5 = @saturate(i5, w128);
+    if (q5 != 15) { return 18; }
+    // targets wider than 64 bits keep the full value
+    u128 wide = @saturate(u128, w128);
+    if (wide != w128) { return 19; }
+    i128 swide = @saturate(i128, w128);
+    if (swide != (i128)w128) { return 20; }
+    u100 w100 = @saturate(u100, w128 << 30);
+    u100 w100max = @saturate(u100, w128 << 60);
+    if ((w100 >> 94) != 1) { return 21; }
+    if ((w100max >> 99) != 1) { return 22; }
+    return 0;
+}

@@ -1,0 +1,52 @@
+// BUG-1064: a float -> u65..u128 / i65..i128 cast kept only a NaN trap and then a
+// RAW C cast, which is undefined for +-inf and for any value outside the range —
+// so `(u128)inf` and `(i128)-1e39` were whatever GCC chose. They now saturate
+// exactly like the <= 64-bit widths: NaN -> 0, out of range -> MIN / MAX.
+struct W { u128 u; i128 s; u100 n; }
+
+u32 main() {
+    volatile f64 vinf = 1e400;
+    f64 inf = vinf;
+    f64 nan = inf - inf;
+    volatile f64 vbig = 1e39;
+    f64 big = vbig;
+    u128 umax = ~(u128)0;
+    i128 smax = (i128)(umax >> 1);
+    i128 smin = -smax - 1;
+
+    u128 a = (u128)inf;
+    if (a != umax) { return 1; }
+    u128 b = (u128)(-inf);
+    if (b != 0) { return 2; }
+    u128 c = (u128)big;
+    if (c != umax) { return 3; }
+    i128 d = (i128)big;
+    if (d != smax) { return 4; }
+    i128 e = (i128)(-big);
+    if (e != smin) { return 5; }
+    i128 f = (i128)(-inf);
+    if (f != smin) { return 6; }
+    // NaN saturates to 0 now (it used to trap)
+    u128 g = (u128)nan;
+    if (g != 0) { return 7; }
+    i128 h = (i128)nan;
+    if (h != 0) { return 8; }
+    // field / assign forms
+    W w;
+    w.u = (u128)inf;
+    if (w.u != umax) { return 9; }
+    w.s = (i128)(-big);
+    if (w.s != smin) { return 10; }
+    // a non-native wide width clamps at ITS max
+    w.n = (u100)big;
+    if ((w.n >> 99) != 1) { return 11; }
+    u100 nmax = w.n;
+    w.n = nmax + 1;
+    if (w.n != 0) { return 12; }
+    // in-range values are still exact
+    volatile f64 vq = 12345678901234567890123.0;
+    f64 q = vq;
+    u128 r = (u128)q;
+    if ((u64)(r >> 64) != 669) { return 13; }
+    return 0;
+}

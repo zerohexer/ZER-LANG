@@ -1,0 +1,48 @@
+// BUG-1093..1096: a narrowed range survived something that changed the value.
+// Each function's access is out of bounds at run time; pre-fix each was PROVEN in
+// range and written unchecked (ASan). Now the range is widened at the event and
+// the auto-guard returns 0.
+//   store_through_param   — `*p = 4` with p == &g (BUG-1093)
+//   store_via_global_ptr  — a pointer read out of a global (BUG-1093)
+//   call_in_loop_body     — bump() on the back edge (BUG-1094)
+//   addr_in_ended_block   — `q = &i` inside a block that has ended (BUG-1095)
+u32[4] arr;
+u32 get(u32 a) { return a; }
+u32 g = 1;
+u32 h = 1;
+?*u32 hp = null;
+void bump() { g = 4; }
+u32 store_through_param(*u32 p) {
+    if (g < 4) { *p = 4; arr[g] = 7; }
+    return 42;
+}
+u32 store_via_global_ptr() {
+    hp = &h;
+    if (hp) |p| {
+        if (h < 4) { *p = 4; arr[h] = 7; }
+    }
+    return 42;
+}
+u32 call_in_loop_body() {
+    g = 1;
+    u32 n = 0;
+    if (g < 4) { while (n < 2) { arr[g] = 7; bump(); n += 1; } }
+    return 42;
+}
+u32 addr_in_ended_block() {
+    u32 i = get(1);
+    ?*u32 q = null;
+    if (true) { q = &i; }
+    if (q) |p| {
+        if (i < 4) { *p = 4; arr[i] = 7; }
+    }
+    return 42;
+}
+u32 main() {
+    u32 r = store_through_param(&g);
+    g = 1;
+    r += store_via_global_ptr();
+    r += call_in_loop_body();
+    r += addr_in_ended_block();
+    return r;
+}

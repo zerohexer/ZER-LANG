@@ -220,6 +220,27 @@ int type_width(Type *a) {
     }
 }
 
+/* BUG-1151: the C STORAGE size in bytes of a scalar type, or 0 when `a` is not
+ * a fixed-size scalar. `type_width` is the VALUE width — for a `uN` / `iN` it is N,
+ * not the carrier — so `width / 8` gave `u21` 2 bytes (carrier `uint32_t`, 4) and
+ * `u3` 0. Both callers that turned a width into bytes (compute_type_size and
+ * type_alignment_bytes below) now ask this, so an `@pun` into a struct holding a
+ * `u21` could no longer look non-widening (a measured 4-byte read of a 2-byte
+ * global) and a `*u21` MMIO pointer is aligned to its real carrier. The carrier
+ * rule is the emitter's (emit_intn_carrier): the smallest native int >= N. */
+int type_scalar_bytes(Type *a) {
+    if (!a) return 0;
+    a = type_unwrap_distinct(a);
+    if (!a) return 0;
+    TypeKind k = type_dispatch_kind(a);
+    if (k == TYPE_UINT || k == TYPE_SINT) {
+        uint32_t b = a->intn.bits;
+        return b <= 8 ? 1 : b <= 16 ? 2 : b <= 32 ? 4 : b <= 64 ? 8 : 16;
+    }
+    int w = type_width(a);
+    return w > 0 ? w / 8 : 0;
+}
+
 /* Required alignment in BYTES for type `a`. Returns 0 if alignment is
  * not computable (e.g., opaque). For aggregate types, alignment is the
  * max alignment of any field/element. Packed structs/unions = 1.
@@ -228,8 +249,8 @@ int type_width(Type *a) {
 int type_alignment_bytes(Type *a) {
     if (!a) return 0;
     a = type_unwrap_distinct(a);
-    int w = type_width(a);
-    if (w > 0) return w / 8;
+    int sb = type_scalar_bytes(a);   /* BUG-1151: the carrier, not the value width */
+    if (sb > 0) return sb;
     switch (a->kind) {
     case TYPE_POINTER: case TYPE_FUNC_PTR:
         return zer_target_ptr_bits / 8;
@@ -252,7 +273,11 @@ int type_alignment_bytes(Type *a) {
         return max_a;
     }
     case TYPE_UNION: {
-        int max_a = 1;
+        /* BUG-1059h: a ZER union is emitted as `struct { int32_t _tag; union {...}; }`,
+         * so it is at least 4-aligned whatever its variants are. Answering 1 for a
+         * union of byte variants let a packed-struct field of that type pass as
+         * safely viewable while its `_tag` sat on an odd address. */
+        int max_a = 4;
         for (uint32_t i = 0; i < a->union_type.variant_count; i++) {
             int fa = type_alignment_bytes(a->union_type.variants[i].type);
             if (fa > max_a) max_a = fa;
@@ -550,8 +575,14 @@ static int type_name_write(Type *t, char *buf, int pos, int max) {
         pos = tn_append(buf, pos, max, "?");
         return type_name_write(t->optional.inner, buf, pos, max);
     case TYPE_SLICE:
+        /* BUG-1123: rendered the DEPRECATED `[]T` spelling (the diagnostics then
+         * told users to write a form that itself warns "use [*]T instead") and
+         * dropped `const`, so assigning a string literal to a `[*]u8` field read
+         * "cannot assign '[]u8' to '[]u8'" — a mismatch between two identical
+         * spellings. Same lesson as BUG-830 for pointers. */
         if (t->slice.is_volatile) pos = tn_append(buf, pos, max, "volatile ");
-        pos = tn_append(buf, pos, max, "[]");
+        if (t->slice.is_const)    pos = tn_append(buf, pos, max, "const ");
+        pos = tn_append(buf, pos, max, "[*]");
         return type_name_write(t->slice.inner, buf, pos, max);
     case TYPE_ARRAY:
         pos = type_name_write(t->array.inner, buf, pos, max);
@@ -624,7 +655,7 @@ Scope *scope_new(Arena *a, Scope *parent) {
     s->parent = parent;
     s->symbol_count = 0;
     s->symbol_capacity = 16;
-    s->symbols = (Symbol *)arena_alloc(a, s->symbol_capacity * sizeof(Symbol));
+    s->symbols = (Symbol **)arena_alloc(a, s->symbol_capacity * sizeof(Symbol *));
     return s;
 }
 
@@ -634,16 +665,18 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
     Symbol *existing = scope_lookup_local(s, name, name_len);
     if (existing) return NULL; /* caller handles error */
 
-    /* grow if needed */
+    /* grow if needed — only the POINTER array moves; Symbols never do (BUG-1119) */
     if (s->symbol_count >= s->symbol_capacity) {
         uint32_t new_cap = s->symbol_capacity * 2;
-        Symbol *new_syms = (Symbol *)arena_alloc(a, new_cap * sizeof(Symbol));
-        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol));
+        Symbol **new_syms = (Symbol **)arena_alloc(a, new_cap * sizeof(Symbol *));
+        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol *));
         s->symbols = new_syms;
         s->symbol_capacity = new_cap;
     }
 
-    Symbol *sym = &s->symbols[s->symbol_count++];
+    Symbol *sym = (Symbol *)arena_alloc(a, sizeof(Symbol));
+    if (!sym) return NULL;
+    s->symbols[s->symbol_count++] = sym;
     memset(sym, 0, sizeof(Symbol));
     sym->name = name;
     sym->name_len = name_len;
@@ -653,11 +686,25 @@ Symbol *scope_add(Arena *a, Scope *s, const char *name, uint32_t name_len,
     return sym;
 }
 
+bool scope_insert(Arena *a, Scope *s, Symbol *sym) {
+    if (!sym || scope_lookup_local(s, sym->name, sym->name_len)) return false;
+    if (s->symbol_count >= s->symbol_capacity) {
+        uint32_t new_cap = s->symbol_capacity * 2;
+        Symbol **new_syms = (Symbol **)arena_alloc(a, new_cap * sizeof(Symbol *));
+        if (!new_syms) return false;
+        memcpy(new_syms, s->symbols, s->symbol_count * sizeof(Symbol *));
+        s->symbols = new_syms;
+        s->symbol_capacity = new_cap;
+    }
+    s->symbols[s->symbol_count++] = sym;
+    return true;
+}
+
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len) {
     for (uint32_t i = 0; i < s->symbol_count; i++) {
-        if (s->symbols[i].name_len == name_len &&
-            memcmp(s->symbols[i].name, name, name_len) == 0) {
-            return &s->symbols[i];
+        if (s->symbols[i]->name_len == name_len &&
+            memcmp(s->symbols[i]->name, name, name_len) == 0) {
+            return s->symbols[i];
         }
     }
     return NULL;
@@ -671,4 +718,20 @@ Symbol *scope_lookup(Scope *s, const char *name, uint32_t name_len) {
         cur = cur->parent;
     }
     return NULL;
+}
+
+/* null-sentinel check: ?*T and ?FuncPtr both use NULL as none.
+ * Also handles TYPE_DISTINCT wrapping pointer/func_ptr (BUG-088 fix).
+ * Moved from emitter.c (BUG-1054) so IR lowering asks the same question. */
+bool type_is_null_sentinel(Type *inner) {
+    if (!inner) return false;
+    TypeKind k = type_dispatch_kind(inner);   /* BUG-279: unwraps ALL distinct levels */
+    /* BUG-393: *opaque is _zer_opaque struct, not a pointer — NOT null sentinel */
+    if (k == TYPE_POINTER) {
+        Type *e = type_unwrap_distinct(inner);
+        if (e->pointer.inner && type_dispatch_kind(e->pointer.inner) == TYPE_OPAQUE)
+            return false;
+        return true;
+    }
+    return k == TYPE_FUNC_PTR;
 }

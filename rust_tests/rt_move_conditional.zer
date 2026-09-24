@@ -13,8 +13,9 @@ u32 main() {
     pool.get(h1).y = 2;
     pool.get(h1).z = 3;
 
-    if (pool.get(h1).y != 2) { return 1; }
-    pool.free(h1);
+    u32 y1 = pool.get(h1).y;
+    pool.free(h1);                       // BUG-1071: before the early return
+    if (y1 != 2) { return 1; }
 
     // Test 2: replace with new allocation
     ?Handle(Triple) mx2 = pool.alloc();
@@ -32,8 +33,9 @@ u32 main() {
     pool.get(h3).y = 5;
     pool.get(h3).z = 6;
 
-    if (pool.get(h3).y != 5) { return 2; }
+    u32 y3 = pool.get(h3).y;
     pool.free(h3);
+    if (y3 != 5) { return 2; }
 
     return 0;
 }

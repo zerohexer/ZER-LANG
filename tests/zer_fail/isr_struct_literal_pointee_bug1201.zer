@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: global 'g' is accessed from both interrupt and main code
+// BUG-1201: an ISR wrote g through a global struct whose pointer field came from its
+// struct-literal initializer; main polled g, non-volatile — GCC -O2 hoists the load
+// and the loop never ends. The write-target walk did not follow a struct literal.
+u32 g;
+struct H { *u32 p; }
+H h = { .p = &g };
+interrupt TIM2 { *h.p = 1; }
+u32 main() { while (g == 0) { } return g; }

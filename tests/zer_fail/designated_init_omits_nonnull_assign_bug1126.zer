@@ -1,0 +1,10 @@
+// expect-error: designated initializer omits field '.cb'
+// BUG-1126: the assignment sink and a FUNCPTR field — the rule is in the one
+// struct-literal checker every sink calls, so no spelling routes around it.
+struct Ops { u32 n; *(u32) -> u32 cb; }
+u32 id(u32 x) { return x; }
+u32 main() {
+    Ops o = { .n = 1, .cb = id };
+    o = { .n = 2 };
+    return o.cb(3);
+}

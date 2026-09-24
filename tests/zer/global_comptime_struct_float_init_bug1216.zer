@@ -1,0 +1,12 @@
+// BUG-1216: a global initialized by a comptime call returning a STRUCT or a FLOAT was
+// emitted `= 0` — the struct one failed in GCC, the float one ran with 0.0.
+struct In { u32 a; u8 b; }
+comptime In MK(u32 x) { return { .a = x * 2, .b = 1 }; }
+comptime f64 H(f64 x) { return x * 2.0; }
+In g = MK(3);
+f64 gf = H(1.5);
+u32 main() {
+    if (g.a != 6 || g.b != 1) { return 1; }
+    if (gf != 3.0) { return 2; }
+    return 0;
+}

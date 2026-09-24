@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-1248: a pointer COPY of &v lent nothing; the parent raced the thread.
+void w(*u32 p) { for (u32 i = 0; i < 100000; i += 1) { *p += 1; } }
+struct H { *u32 p; }
+u32 main() {
+    u32 v = 0;
+    *u32 q = &v; *u32 p = q;
+    ThreadHandle th = spawn w(p);
+    for (u32 i = 0; i < 100000; i += 1) { v += 1; }
+    th.join();
+    return 0;
+}

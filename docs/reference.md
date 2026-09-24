@@ -3852,6 +3852,8 @@ Per-architecture interrupt disable/enable.
 
 `yield`, `await`, and `spawn` are also **banned** inside `@critical` — both directly and transitively (calling a function that yields/spawns is also rejected). Yield/await would suspend with interrupts disabled (system hang). Spawn would create a thread with interrupts disabled (hardware-unsafe).
 
+Turning interrupts back on inside the block — `@cpu_enable_int()`, `@cpu_restore_int_state(...)`, or waiting for one with `@cpu_wait_int()` / `@cpu_deep_sleep()`, directly or in a called function — is **banned** too: code after that point would run unprotected while the compiler still treats it as inside `@critical` (and a wait with interrupts off never wakes on x86).
+
 **EXAMPLE**
 ```zer
 @critical {
@@ -5595,6 +5597,14 @@ borrowed by that thread until `.join()`:
 - `&threadlocal` to a scoped spawn → compile error. Each thread has its own copy,
   so the child would write the parent's slot. Pass it by value instead.
 - All `&` arguments are tracked, not just the first; `.join()` releases every one.
+- The borrow follows the pointer, not the spelling: a pointer copied from `&x`, an
+  `orelse` unwrap of it, a pointer FIELD read (`h.p`), a cast through `*opaque`, the
+  result of a call it was passed to, an if-unwrap capture of it, a sub-slice written
+  directly as the argument (`spawn w(a[1..3])`) and an array passed to a `[*]T`
+  parameter all lend `x`. So does a by-value struct passed to a call whose field
+  points into `x` (the callee could write through it).
+- `defer th.join();` releases the borrow only when the defer RUNS, at scope exit —
+  so the lent local stays borrowed for the rest of the function.
 - A non-shared **global** lent by `&g` is borrowed the same way — and so is every
   function the parent calls before the join: a call whose body (or any function it
   calls) names `g` is a compile error, and so is a call through a function pointer,
@@ -5655,7 +5665,14 @@ borrowed by that thread until `.join()`:
   - Has atomic/barrier → compile **warning** (lock-free pattern possible)
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
-  **single-word** `volatile` global
+  **single-word** `volatile` global. Two of these cover the VALUE, never what it
+  points at: a `const` pointer, slice or pointer-carrying struct is not exempt
+  (the data behind it is mutable), and a `volatile` pointer is exempt only when
+  its pointee is itself `volatile` or a `shared struct`
+- A `shared struct` is never copied by value — as a declaration, an assignment, a
+  call or spawn argument, a return of a global, a field of another struct, an array
+  element or inside an optional (the copy would clone the mutex). Assigning a WHOLE
+  shared struct (`g = { .v = 5 };`) is refused too — assign its fields
 - The same single-word restriction applies to a global shared between an
   **interrupt handler** and main code: `volatile` is required there, but a
   `volatile u64` on a 32-bit target, a `volatile u128`, or a volatile struct is
@@ -5687,6 +5704,11 @@ borrowed by that thread until `.join()`:
   @cond_wait(gq, gq.count > 0 && gq.shutdown);   // OK: both fields are gq's own
   ```
   Fold the extra state into the same `shared struct`, or signal on its change.
+- The predicate may not CALL a function that touches any shared struct — it runs
+  with the condition's mutex held, so the callee would take a second lock (two such
+  predicates deadlock). Read into a local first.
+- The condition variable must be a plain `shared struct`: a `shared(rw)` struct's
+  reader-writer lock cannot back one.
 
 ### threadlocal — Per-Thread Storage
 ```zer

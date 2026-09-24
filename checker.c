@@ -680,7 +680,24 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
      * definition, which is all this predicate needs. */
     int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
     if (w <= 0) return false;
-    return w <= c->target_ptr_bits;
+    if (w > c->target_ptr_bits) return false;
+    /* BUG-1249: the exemption covers the POINTER WORD, and the scan cannot tell a
+     * read of the word from a dereference of it — so `volatile ?*T gp = &obj;`
+     * exempted every `p.v += 1` through it, a race on `obj` (TSan-confirmed; the
+     * heap-object sibling made GCC spin forever on the main side). A pointer is
+     * exempt only when what it points at is itself synchronised: volatile, or a
+     * shared struct. The rationale's qualifier ("single-word flag") is about the
+     * word; the pointee was never covered by it. */
+    if (k == TYPE_POINTER) {
+        Type *pt = vt;
+        if (type_dispatch_kind(pt) == TYPE_OPTIONAL) pt = type_unwrap_distinct(pt->optional.inner);
+        if (!pt || type_dispatch_kind(pt) != TYPE_POINTER) return true;   /* funcptr */
+        if (pt->pointer.is_volatile) return true;
+        Type *pe = type_unwrap_distinct(pt->pointer.inner);
+        return pe && type_dispatch_kind(pe) == TYPE_STRUCT &&
+               (pe->struct_type.is_shared || pe->struct_type.is_shared_rw);
+    }
+    return true;
 }
 
 static bool type_carries_nonshared_pointer(Type *t, int depth) {
@@ -1988,6 +2005,12 @@ static const char _res_walk_stopped[] = "<walk stopped>";
  * refused too: that "move" is a bitwise copy like any other. Compared by
  * POINTER, like `_res_walk_stopped`. */
 static const char _res_async_task[] = "async task";
+/* BUG-1250: a SHARED struct embeds its mutex, so a copy locks a DIFFERENT lock
+ * (breaking auto-lock) and the multi-field read is torn. Refused at two sinks
+ * only (var-decl, call arg), so `spawn w(g)`, `return g`, a wrapper struct, an
+ * array of them and `?C og = g` all copied it (TSan race; a copied held mutex
+ * hung). One more member of the unique-resource family, at all its sinks. */
+static const char _res_shared_struct[] = "shared struct";
 
 static const char *unique_resource_name(Type *t, int depth) {
     /* BUG-976: MY OWN fail-open cap, written in BUG-970 three days ago. NULL means
@@ -2014,9 +2037,12 @@ static const char *unique_resource_name(Type *t, int depth) {
     case TYPE_BARRIER:   return "Barrier";
     case TYPE_SEMAPHORE: return "Semaphore";
     case TYPE_ARRAY:     return unique_resource_name(e->array.inner, depth + 1);
+    case TYPE_OPTIONAL:  return unique_resource_name(e->optional.inner, depth + 1);
     case TYPE_STRUCT:
         /* BUG-1177: an async task is not copyable either — see _res_async_task. */
         if (e->struct_type.is_async_state) return _res_async_task;
+        if (e->struct_type.is_shared || e->struct_type.is_shared_rw)
+            return _res_shared_struct;                               /* BUG-1250 */
         for (uint32_t i = 0; i < e->struct_type.field_count; i++) {
             const char *r = unique_resource_name(e->struct_type.fields[i].type, depth + 1);
             if (r) return r;
@@ -2115,6 +2141,14 @@ static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
             "other (`*T p = &x;` across a yield stores the address of the task's own "
             "field), so a copy would keep writing into the ORIGINAL task, which may be "
             "a dead frame. Pass a pointer ('*_zer_async_...') instead",
+            what);
+        return true;
+    }
+    if (rn == _res_shared_struct) {
+        checker_error(c, line,
+            "cannot %s a shared struct by value — the embedded mutex would be "
+            "cloned, so the copy locks a different lock (breaking auto-lock) and the "
+            "multi-field read is torn. Use a pointer to it, or read individual fields",
             what);
         return true;
     }
@@ -5874,6 +5908,131 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
         sym->borrow_root_ambiguous = true;
     sym->borrow_root_name = rs->name;
     sym->borrow_root_len  = rs->name_len;
+}
+
+/* BUG-1248: ONE query — "which locals (or lendable globals) can this VALUE
+ * reach through a pointer?" — for the scoped-spawn borrow. The borrow used to be
+ * recorded only for a literal `&v`, a slice of a local and a struct-literal
+ * carrier, so every other spelling of the same pointer lent NOTHING and the
+ * parent raced the thread (TSan-confirmed): a pointer COPY (`*u32 p = q;`), an
+ * `orelse` (`op orelse return`), a FIELD read (`*u32 p = h.p;`), a cast through
+ * `*opaque`, a CALL result (`id(&v)`), a capture (`if (oz) |zz|`) and a SUB-SLICE
+ * written directly as the spawn argument (`spawn w(a[1..3])`). Conservative on
+ * a call: its result may be a view of ANY argument. */
+struct BorrowRoots { const char **n; uint32_t *l; int count, cap; };
+static void borrow_roots_add(Checker *c, struct BorrowRoots *br, const char *n, uint32_t l) {
+    if (!n) return;
+    for (int i = 0; i < br->count; i++)
+        if (br->l[i] == l && memcmp(br->n[i], n, l) == 0) return;
+    if (br->count >= br->cap) {
+        int nc = br->cap < 4 ? 4 : br->cap * 2;
+        const char **nn = (const char **)arena_alloc(c->arena, (size_t)nc * sizeof(char *));
+        uint32_t *nl = (uint32_t *)arena_alloc(c->arena, (size_t)nc * sizeof(uint32_t));
+        if (!nn || !nl) return;
+        if (br->count) {
+            memcpy(nn, br->n, (size_t)br->count * sizeof(char *));
+            memcpy(nl, br->l, (size_t)br->count * sizeof(uint32_t));
+        }
+        br->n = nn; br->l = nl; br->cap = nc;
+    }
+    br->n[br->count] = n; br->l[br->count] = l; br->count++;
+}
+/* The names a ROOT identifier contributes: itself when its storage is what the
+ * value points into (an array viewed, an object whose address is taken), and
+ * whatever it was recorded to point into (a pointer / carrier local). */
+static void borrow_roots_of_ident(Checker *c, struct BorrowRoots *br, Node *id,
+                                  bool storage_itself) {
+    Symbol *s = scope_lookup(c->current_scope, id->ident.name, (uint32_t)id->ident.name_len);
+    if (!s) return;
+    if (storage_itself) borrow_roots_add(c, br, s->name, s->name_len);
+    if (s->borrow_root_name) borrow_roots_add(c, br, s->borrow_root_name, s->borrow_root_len);
+}
+static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, int depth) {
+    if (!v || depth > ZER_EXPR_WALK_MAX) return;
+    v = unwrap_ptr_launder(v);
+    if (!v) return;
+    switch (v->kind) {
+    case NODE_UNARY:
+        if (v->unary.op == TOK_AMP) {
+            Node *r = v->unary.operand;
+            while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+                r = r->kind == NODE_FIELD ? r->field.object :
+                    r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
+            if (r && r->kind == NODE_IDENT) borrow_roots_of_ident(c, br, r, true);
+            return;
+        }
+        if (v->unary.op == TOK_STAR) collect_borrow_roots(c, v->unary.operand, br, depth + 1);
+        return;
+    case NODE_SLICE: case NODE_FIELD: case NODE_INDEX: {
+        /* a view or a READ of a pointer field / element: the root's storage when
+         * it is an array or a by-value object, and what the root points into */
+        Node *r = v;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE))
+            r = r->kind == NODE_FIELD ? r->field.object :
+                r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
+        if (!r) return;
+        if (r->kind != NODE_IDENT) { collect_borrow_roots(c, r, br, depth + 1); return; }
+        Type *rt = typemap_get(c, r);
+        TypeKind rk = rt ? type_dispatch_kind(rt) : TYPE_VOID;
+        borrow_roots_of_ident(c, br, r, v->kind == NODE_SLICE && rk == TYPE_ARRAY);
+        return;
+    }
+    case NODE_IDENT: borrow_roots_of_ident(c, br, v, false); return;
+    case NODE_ORELSE:
+        collect_borrow_roots(c, v->orelse.expr, br, depth + 1);
+        collect_borrow_roots(c, v->orelse.fallback, br, depth + 1);
+        return;
+    case NODE_CALL:
+        for (int i = 0; i < v->call.arg_count; i++)
+            collect_borrow_roots(c, v->call.args[i], br, depth + 1);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            collect_borrow_roots(c, v->struct_init.fields[i].value, br, depth + 1);
+        return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < v->intrinsic.arg_count; i++)
+            collect_borrow_roots(c, v->intrinsic.args[i], br, depth + 1);
+        return;
+    case NODE_TYPECAST: collect_borrow_roots(c, v->typecast.expr, br, depth + 1); return;
+    /* scalar-producing / non-value kinds lend nothing */
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_INT_LIT: case NODE_FLOAT_LIT:
+    case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return;
+    }
+}
+/* Record every root a value reaches on a pointer-carrying symbol (same
+ * one-name-or-ambiguous rule as record_borrow_root). */
+static void borrow_roots_add_to_sym(Symbol *sym, const char *n, uint32_t l) {
+    if (!sym || !n) return;
+    if (sym->borrow_root_name &&
+        (sym->borrow_root_len != l || memcmp(sym->borrow_root_name, n, l) != 0))
+        sym->borrow_root_ambiguous = true;
+    sym->borrow_root_name = n;
+    sym->borrow_root_len = l;
+}
+static void record_borrow_roots_from_value(Checker *c, Symbol *sym, Node *v) {
+    if (!sym || !v || !type_can_carry_pointer(sym->type)) return;
+    struct BorrowRoots br = {0};
+    collect_borrow_roots(c, v, &br, 0);
+    for (int i = 0; i < br.count; i++) {
+        if (sym->name_len == br.l[i] && memcmp(sym->name, br.n[i], br.l[i]) == 0) continue;
+        if (sym->borrow_root_name &&
+            (sym->borrow_root_len != br.l[i] ||
+             memcmp(sym->borrow_root_name, br.n[i], br.l[i]) != 0))
+            sym->borrow_root_ambiguous = true;
+        sym->borrow_root_name = br.n[i];
+        sym->borrow_root_len = br.l[i];
+    }
 }
 
 /* BUG-1169: a struct LITERAL carrier lends what its fields point into —
@@ -10771,8 +10930,20 @@ static Type *check_expr(Checker *c, Node *node) {
              * the SAME BYTES (`y.v = 9` overwrote `x.v`). The VALUE decides, as at
              * the other sinks: `a = Arena.over(buf);` builds a fresh state and is
              * allowed (zercheck_ir treats it as a reset, BUG-1178). */
-            reject_unique_resource_copy(c, node->assign.value, value,
+            bool reported_copy = reject_unique_resource_copy(c, node->assign.value, value,
                                         node->loc.line, "assign");
+            /* BUG-1253: a WHOLE shared struct as the TARGET — `g = { .v = 5 };`
+             * overwrites the embedded mutex (possibly while another thread holds
+             * it), and the emitter wrapped the store in a lock/unlock statement
+             * expression used as a value (GCC error). Assign the fields. */
+            Type *tgt_s = type_unwrap_distinct(target);
+            if (!reported_copy && tgt_s && type_dispatch_kind(tgt_s) == TYPE_STRUCT &&
+                (tgt_s->struct_type.is_shared || tgt_s->struct_type.is_shared_rw)) {
+                checker_error(c, node->loc.line,
+                    "cannot assign a whole shared struct — that overwrites its embedded "
+                    "mutex, possibly while another thread holds it. Assign its fields "
+                    "one by one (each is auto-locked)");
+            }
         } }
 
         /* string literal to mutable slice: runtime crash on write.
@@ -11099,6 +11270,8 @@ static Type *check_expr(Checker *c, Node *node) {
                              * which is what `spawn w(h)` then hands to the thread. */
                             record_borrow_root(c, tsym, vlaunder->unary.operand);
                         }
+                        /* BUG-1248: any other value spelling reaching a local. */
+                        record_borrow_roots_from_value(c, tsym, node->assign.value);
                         /* BUG-833, the ASSIGNMENT sink. NOT STICKY: SET on a
                          * packed-derived RHS and CLEAR otherwise, so `q = &aligned.z;`
                          * re-clears. A sticky flag would over-reject every later deref
@@ -12422,23 +12595,32 @@ static Type *check_expr(Checker *c, Node *node) {
                     "itself, or bind and pass a name the compiler can follow");
             }
         }
+        /* BUG-1248: every argument spelling that REACHES a borrowed local, not
+         * only a literal `&v` — a pointer local, or a by-value carrier whose
+         * field points into it (`bumph(h)` with `h.p = &v` wrote v while the
+         * thread held it, TSan-confirmed). */
         for (int i = 0; i < node->call.arg_count; i++) {
             Node *a = node->call.args[i];
-            if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP) continue;
-            Node *ar = a->unary.operand;
-            while (ar && (ar->kind == NODE_FIELD || ar->kind == NODE_INDEX)) {
-                ar = (ar->kind == NODE_FIELD) ? ar->field.object
-                                              : ar->index_expr.object;
-            }
-            if (!ar || ar->kind != NODE_IDENT) continue;
-            Symbol *bs = scope_lookup(c->current_scope, ar->ident.name,
-                                      (uint32_t)ar->ident.name_len);
-            if (bs && bs->is_borrowed_by_thread) {
-                checker_error(c, node->loc.line,
-                    "cannot pass '&%.*s' to a call while it is borrowed by a "
-                    "scoped spawn — the callee may write through it while the "
-                    "thread holds it (data race). join() first, or pass by value",
-                    (int)ar->ident.name_len, ar->ident.name);
+            if (!a) continue;
+            struct BorrowRoots br = {0};
+            collect_borrow_roots(c, a, &br, 0);
+            for (int k = 0; k < br.count; k++) {
+                Symbol *bs = scope_lookup(c->current_scope, br.n[k], br.l[k]);
+                if (!bs || !bs->is_borrowed_by_thread) continue;
+                Node *pa = unwrap_ptr_launder(a);
+                if (pa && pa->kind == NODE_UNARY && pa->unary.op == TOK_AMP)
+                    checker_error(c, node->loc.line,
+                        "cannot pass '&%.*s' to a call while it is borrowed by a "
+                        "scoped spawn — the callee may write through it while the "
+                        "thread holds it (data race). join() first, or pass by value",
+                        (int)br.l[k], br.n[k]);
+                else
+                    checker_error(c, node->loc.line,
+                        "argument %d reaches '%.*s', which is borrowed by a scoped "
+                        "spawn — the callee may write or read it through that pointer "
+                        "while the thread holds it (data race). join() first",
+                        i + 1, (int)br.l[k], br.n[k]);
+                break;
             }
         }
 
@@ -12662,6 +12844,17 @@ static Type *check_expr(Checker *c, Node *node) {
                          * ever accepted. The leak check still sees this as a
                          * join, so "ThreadHandle not joined" does not regress. */
                         if (c->branch_depth > osym2->th_spawn_branch_depth) {
+                            result = ty_void;
+                            typemap_set(c, field_node, result);
+                            break;
+                        }
+                        /* BUG-1247: `defer th.join();` is CHECKED here, at the
+                         * defer statement, but RUNS at scope exit — so releasing
+                         * the borrow now let every statement after the defer
+                         * (`v += 1;`, `return v;`) race the still-running thread
+                         * (TSan-confirmed). A deferred join keeps the borrow for
+                         * the rest of the function, and keeps the window open. */
+                        if (c->defer_depth > 0) {
                             result = ty_void;
                             typemap_set(c, field_node, result);
                             break;
@@ -13325,7 +13518,9 @@ static Type *check_expr(Checker *c, Node *node) {
                             arg_eff->kind == TYPE_STRUCT &&
                             param_eff->kind == TYPE_STRUCT &&
                             (arg_eff->struct_type.is_shared ||
-                             arg_eff->struct_type.is_shared_rw)) {
+                             arg_eff->struct_type.is_shared_rw) &&
+                            /* BUG-1250: an existing one is the unified rule's */
+                            !value_is_existing_resource(node->call.args[i], 0)) {
                             checker_error(c, node->loc.line,
                                 "argument %u: cannot pass shared struct '%s' by value — "
                                 "embedded mutex would be copied, breaking auto-lock "
@@ -17717,6 +17912,21 @@ static Type *check_expr(Checker *c, Node *node) {
                         Type *inner = type_unwrap_distinct(seff->pointer.inner);
                         if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared) ok = true;
                     }
+                    /* BUG-1253: a `shared(rw)` struct has a reader-writer lock,
+                     * not the mutex a condition variable waits on — the emitted
+                     * wait named a `_zer_mtx` the struct does not have (GCC
+                     * error), and pairing a condvar with a mutex its writers never
+                     * take would not synchronise anyway. */
+                    Type *sst = type_dispatch_kind(seff) == TYPE_POINTER
+                        ? type_unwrap_distinct(seff->pointer.inner) : seff;
+                    if (ok && sst && type_dispatch_kind(sst) == TYPE_STRUCT && sst->struct_type.is_shared_rw) {
+                        checker_error(c, node->loc.line,
+                            "@%.*s needs a plain 'shared struct' (a mutex) — a "
+                            "'shared(rw)' struct's reader-writer lock cannot back a "
+                            "condition variable",
+                            (int)nlen, name);
+                        ok = true;   /* reported; skip the generic message */
+                    } else
                     /* SAFETY: zer_condvar_arg_valid in src/safety/atomic_rules.c (E04) */
                     if (zer_condvar_arg_valid(ok ? 1 : 0) == 0) {
                         checker_error(c, node->loc.line,
@@ -17924,7 +18134,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     if (!node) return;
     /* Short-circuit: if all properties already found, stop scanning */
     if (parent_sym->props.can_yield && parent_sym->props.can_spawn &&
-        parent_sym->props.can_alloc && parent_sym->props.has_sync)
+        parent_sym->props.can_alloc && parent_sym->props.has_sync &&
+        parent_sym->props.can_enable_int)
         return;
 
     switch (node->kind) {
@@ -17958,6 +18169,11 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
             (nl == 13 && memcmp(n, "barrier_store", 13) == 0) ||
             (nl == 12 && memcmp(n, "barrier_load", 12) == 0))
             parent_sym->props.has_sync = true;
+        if ((nl == 14 && memcmp(n, "cpu_enable_int", 14) == 0) ||
+            (nl == 21 && memcmp(n, "cpu_restore_int_state", 21) == 0) ||
+            (nl == 12 && memcmp(n, "cpu_wait_int", 12) == 0) ||
+            (nl == 14 && memcmp(n, "cpu_deep_sleep", 14) == 0))
+            parent_sym->props.can_enable_int = true;                 /* BUG-1251 */
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_func_props(c, node->intrinsic.args[i], parent_sym);
         return;
@@ -18055,6 +18271,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (callee->props.can_spawn) parent_sym->props.can_spawn = true;
                 if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
                 if (callee->props.has_sync)  parent_sym->props.has_sync = true;
+                if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
             }
         }
 
@@ -18080,6 +18297,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (fs->props.can_spawn) parent_sym->props.can_spawn = true;
                 if (fs->props.can_alloc) parent_sym->props.can_alloc = true;
                 if (fs->props.has_sync)  parent_sym->props.has_sync = true;
+                if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
             }
         }
 
@@ -18105,6 +18323,7 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                     if (callee->props.can_spawn) parent_sym->props.can_spawn = true;
                     if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
                     if (callee->props.has_sync)  parent_sym->props.has_sync = true;
+                if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
                 }
             }
         }
@@ -18878,7 +19097,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         if (sym && !sym->is_function && sym->type) {
             /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
              * shared, Pool/Slab/Ring/Arena/Barrier */
-            if (sym->is_const) return false;
+            /* BUG-1249: const exempts a value that cannot change — not the
+             * mutable data a const POINTER / slice / carrier points at
+             * (`const [*]u32 gs = arr;` read while main writes arr). */
+            if (sym->is_const && !type_can_carry_pointer(sym->type)) return false;
             /* volatile: an "explicit low-level opt-in" for the SINGLE-WORD
              * volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer).
              * That rationale is width-bounded and the check never was:
@@ -19878,8 +20100,12 @@ static void check_stmt(Checker *c, Node *node) {
              * auto-locked path. */
             {
                 Type *ie = init_type ? type_unwrap_distinct(init_type) : NULL;
+                /* BUG-1250: a copy of an EXISTING shared struct is reported by
+                 * reject_unique_resource_copy (every sink); this keeps the fresh
+                 * one — a call result — which that rule treats as a new value. */
                 if (ie && type_dispatch_kind(init_type) == TYPE_STRUCT &&
-                    (ie->struct_type.is_shared || ie->struct_type.is_shared_rw)) {
+                    (ie->struct_type.is_shared || ie->struct_type.is_shared_rw) &&
+                    !value_is_existing_resource(node->var_decl.init, 0)) {
                     checker_error(c, node->loc.line,
                         "cannot copy shared struct '%s' by value — the embedded "
                         "mutex would be cloned, so the copy locks a different lock "
@@ -20315,6 +20541,9 @@ static void check_stmt(Checker *c, Node *node) {
                         if (value_is_packed_derived(c, addr_exprs[ai]))
                             sym->is_packed_derived = true;
                     }
+                    /* BUG-1248: every other spelling of a pointer into a local
+                     * (copy, orelse, field read, cast, call result) lends it too. */
+                    if (sym && init) record_borrow_roots_from_value(c, sym, init);
                     /* AUDIT-2026-06-08 (BUG-732): struct/union literal field
                      * carrying a local-derived pointer. Pre-fix:
                      *   `Box b = { .ptr = &local };`        (Case `&local`)
@@ -20688,6 +20917,14 @@ static void check_stmt(Checker *c, Node *node) {
                              * — which is how every optional-linked list is walked. */
                             if (csym && csym->arena_source && !cap->arena_source)
                                 cap->arena_source = csym->arena_source;
+                            /* BUG-1248: and what it points into, for the scoped-
+                             * spawn borrow (`if (oz) |zz| { *zz += 1; }` wrote a
+                             * lent local through the capture). A `|*v|` capture
+                             * points into the optional's own storage too. */
+                            if (!node->if_stmt.capture_is_ptr)
+                                record_borrow_roots_from_value(c, cap, node->if_stmt.cond);
+                            else if (csym)
+                                borrow_roots_add_to_sym(cap, csym->name, csym->name_len);
                             /* BH-18 #6 (copied from cool-johnson-t8vr3h):
                              * `if (m) |*v| { g = v; }` where `m` is a local
                              * optional — `v` points INTO `m`'s storage. The
@@ -22693,7 +22930,12 @@ static void check_stmt(Checker *c, Node *node) {
                     bool rglobal = rs && (rs->is_static ||
                         global_decl_lookup(c, rs->name,
                                            rs->name_len) != NULL);
-                    if (rglobal)
+                    if (rglobal && unique_resource_name(c->current_func_ret, 0) ==
+                                   _res_shared_struct)                /* BUG-1250 */
+                        reject_unique_resource_copy(c, node->ret.expr,
+                                                    c->current_func_ret,
+                                                    node->loc.line, "return");
+                    else if (rglobal)
                         checker_error(c, node->loc.line,
                             "cannot return '%s' by value — it names a global, so the "
                             "caller becomes a SECOND owner of one buffer / count and "
@@ -23976,6 +24218,25 @@ static void check_stmt(Checker *c, Node *node) {
             true, "cannot heap-allocate or free inside @critical block — "
                   "malloc/calloc/free may deadlock when interrupts are disabled. "
                   "Use Pool(T, N) instead, or move the call outside @critical");
+        /* BUG-1251: `@critical` is trusted to keep interrupts OFF for its body —
+         * the ISR rule drops a read-modify-write's "may be split" finding inside
+         * it. A body that turns them back on (`@cpu_enable_int()`, a restore of a
+         * saved enabled state, directly or in a callee) defeats that silently
+         * (an ISR update lost between the read and the write), and a wait for an
+         * interrupt with interrupts off never wakes on x86. */
+        {
+            Symbol tmp = {0};
+            tmp.is_function = true;
+            tmp.props.in_progress = true;
+            scan_func_props(c, node->critical.body, &tmp);
+            if (tmp.props.can_enable_int)
+                checker_error(c, node->loc.line,
+                    "@critical body re-enables or waits for interrupts (@cpu_enable_int / "
+                    "@cpu_restore_int_state / @cpu_wait_int / @cpu_deep_sleep, directly or "
+                    "in a callee) — the block promises interrupts stay off for its whole "
+                    "body, and code after that point would run unprotected. End the "
+                    "@critical block first");
+        }
         c->critical_depth++;
         /* BUG-947: remember the loop nesting at this body's entry, so a break or
          * continue can tell whether the loop it targets is INSIDE the body. */
@@ -24548,6 +24809,7 @@ static void check_stmt(Checker *c, Node *node) {
                      * The whole set goes into th_borrow_names, so the join releases
                      * every one (the positive boundary test depends on that). */
                     const char *cand_n[3]; uint32_t cand_l[3]; int cand_c = 0;
+                    const char **cand_np = cand_n; uint32_t *cand_lp = cand_l;
                     if (ba->kind == NODE_UNARY && ba->unary.op == TOK_AMP &&
                         ba->unary.operand) {
                         Node *r = ba->unary.operand;
@@ -24606,12 +24868,24 @@ static void check_stmt(Checker *c, Node *node) {
                          * can: a pointer or slice (or a struct carrying one). A plain
                          * scalar argument is COPIED and lends nothing. */
                         TypeKind ak = as ? type_dispatch_kind(as->type) : TYPE_VOID;
+                        /* BUG-1248: an ARRAY passed to a `[*]T` parameter is
+                         * coerced to a view of its own storage — it lends itself. */
                         bool reaches = as && (ak == TYPE_POINTER || ak == TYPE_SLICE ||
+                                              ak == TYPE_ARRAY ||
                                               as->borrow_root_name != NULL);
                         if (reaches) {
                             cand_n[cand_c] = ba->ident.name;
                             cand_l[cand_c] = (uint32_t)ba->ident.name_len; cand_c++;
                         }
+                    }
+                    else {
+                        /* BUG-1248: any other argument spelling — a sub-slice
+                         * (`spawn w(a[1..3])`), a call result (`id(&v)`), an
+                         * orelse, a field read, a cast — lends every root the
+                         * value reaches. */
+                        struct BorrowRoots br = {0};
+                        collect_borrow_roots(c, ba, &br, 0);
+                        cand_np = br.n; cand_lp = br.l; cand_c = br.count;
                     }
                     if (cand_c == 0) continue;
                     for (int ci = 0; ci < cand_c; ci++) {
@@ -24629,8 +24903,8 @@ static void check_stmt(Checker *c, Node *node) {
                      * concurrently written. Exactly the `&x` vs `&x.f` shape as
                      * §C6 (keep call-site) — this is that same blind spot one
                      * level down from §D5/§D7. */
-                    const char *vn = cand_n[ci];
-                    uint32_t vl = cand_l[ci];
+                    const char *vn = cand_np[ci];
+                    uint32_t vl = cand_lp[ci];
                     Symbol *vs = scope_lookup(c->current_scope, vn, vl);
                     bool vglobal = global_decl_lookup(c,
                                        vn, vl) != NULL;
@@ -28661,6 +28935,19 @@ static void check_interrupt_safety(Checker *c) {
              * The spawn site was fixed first and this one was missed — both now
              * call volatile_global_exempt_from_race_check, and
              * tests/test_hw_matrix.c pins them together. */
+            if (sym->type && (type_dispatch_kind(sym->type) == TYPE_POINTER ||
+                 (type_dispatch_kind(sym->type) == TYPE_OPTIONAL &&
+                  type_is_null_sentinel(type_unwrap_distinct(sym->type)->optional.inner)))) {
+                /* BUG-1249: one word, but the OBJECT it points at is shared by
+                 * both sides with nothing making its accesses safe. */
+                checker_error(c, sym->line,
+                    "volatile pointer '%.*s' is shared between interrupt and main "
+                    "code, and what it points at is neither volatile nor a shared "
+                    "struct — reads and writes THROUGH it race (the pointer word is "
+                    "safe, the object is not). Point it at a 'volatile' object, or "
+                    "hand the object over by value",
+                    (int)g->name_len, g->name);
+            } else
             checker_error(c, sym->line,
                 "volatile global '%.*s' is shared between interrupt and main "
                 "code but is not a single-word scalar — the access lowers to "
@@ -31178,6 +31465,20 @@ static Node *cond_pred_foreign_shared(Checker *c, Node *pred,
         if (pred->call.callee &&
             (r = cond_pred_foreign_shared(c, pred->call.callee, cond_root, cond_root_len)))
             return r;
+        /* BUG-1252: a CALLEE that touches any shared struct locks it while the
+         * predicate runs under the cond mutex — two predicates each calling a
+         * reader of the other's struct is an AB-BA deadlock (measured: hangs),
+         * and a callee re-locking the cond's own mutex deadlocks inside
+         * pthread_cond_wait. Evaluate it into a local before the wait instead. */
+        if (pred->call.callee && pred->call.callee->kind == NODE_IDENT) {
+            Symbol *fs = global_decl_lookup(c, pred->call.callee->ident.name,
+                                            (uint32_t)pred->call.callee->ident.name_len);
+            if (fs && fs->is_function) {
+                compute_func_shared_types(c, fs->name, fs->name_len);
+                struct FuncSharedTypes *fsc = find_func_shared_cache(c, fs->name, fs->name_len);
+                if (!fsc || fsc->type_count > 0 || fsc->in_progress) return pred;
+            }
+        }
         return NULL;
     /* B3 completeness — a foreign shared read can also hide inside an
      * @intrinsic (e.g. @truncate(u8, gb.count)), an orelse, a slice, or a

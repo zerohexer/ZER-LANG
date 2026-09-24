@@ -134,6 +134,42 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
+## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
+
+Each reproducer is in the ag9 report shape; none needs `cinclude`.
+- **MEDIUM: a pointer FIELD of a `shared struct` is an unlocked channel.** `shared struct S { *Cell p; }`:
+  the LOAD of `s.p` is locked, the object it points at is not, and the spawn scan never looks
+  at it (`*Cell q = s.p; q.n += 1` in two threads, TSan race; with a heap object, a
+  cross-thread use-after-free shape). Fix sketch: treat the pointee of a pointer read out of a
+  shared struct as shared state — refuse a write through it unless it is itself shared/volatile,
+  or refuse pointer fields in shared structs whose pointee is neither.
+- **MEDIUM: an `@once` body is invisible to the spawn race scan** — deliberately a leaf, because
+  descending it rejects the legal publish-once idiom (`once_loser_wait.zer`: main writes before
+  the spawn and reads after the join). The race is `main` reading during the window. Fix sketch:
+  record the `@once` body's globals as thread-touched in the concurrent-window machinery (the
+  atomic-cell rule's `after_spawn_in_func` window), not in the spawn scan.
+- **MEDIUM: an atomic target reached through a POINTER does not create an atomic cell.**
+  `*u32 p = &g; @atomic_add(p, 1)` in the thread, or a helper `add1(*u32 p){ @atomic_add(p,1); }`
+  called with `&g`: main's plain `g += 1` is accepted (only the "verify ordering" warning).
+  `@atomic_add(&p.n, 1)` with `*S p = &gs` is refused for the WRONG reason ("stack local").
+  Fix sketch: resolve the operand through `for_each_write_target` / `rmw_arg_targets` as the
+  RMW rule does.
+- **MEDIUM: a global lent through a callee's RETURNED pointer** (`*u32 p = getp(); spawn w(p);
+  gv += 1;` with `getp(){ return &gv; }`, threadlocal sibling included). `collect_borrow_roots`
+  sees call ARGUMENTS only; a return-root summary (the `classify_return_root` machinery, with the
+  root's NAME) would close it.
+- **LOW: parameter aliasing into a scoped spawn** (`f(&v, &v)` where f spawns with one param and
+  writes through the other) — the borrow is intra-function.
+- **Over-rejections:** a heap pointer lent to a scoped spawn stays TRANSFERRED after `th.join()`
+  (`t.v` / `free(t)` after the join refused, "freed at line <spawn>"); a local Barrier lent to a
+  scoped spawn cannot be `@barrier_wait`-ed by the parent; a join followed by a use in the same
+  nested block (`while (c) { th.join(); return v; }`); diagnostics that name a TYPE as a global
+  ("global 'Msg' is accessed from both interrupt and main").
+- **LOW / liveness:** `@sem_acquire` / `@barrier_wait` inside `@critical` are accepted while
+  `@cond_wait` there is banned; `@cond_signal` in an interrupt handler emits `pthread_mutex_lock`.
+
+---
+
 ## OPEN — async residuals of BUG-1231..1244 (2026-09-24d; LOW — over-rejection / leak-silent)
 
 - **A global task must be declared BELOW its async function** — the global's type is resolved at

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: while it is borrowed by a scoped spawn
+// BUG-1247: return value read before the deferred join fired.
+void w(*u32 p) { for (u32 i = 0; i < 1000000; i += 1) { *p += 1; } }
+u32 run() {
+    u32 v = 0;
+    ThreadHandle th = spawn w(&v);
+    defer th.join();
+    return v;
+}
+u32 main() { u32 r = run(); return 0; }

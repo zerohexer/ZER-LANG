@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'tab'
+// BUG-1249: a const struct carrying a pointer let the thread WRITE through it.
+struct T { u32 v; }
+T obj;
+struct Tab { *T p; }
+const Tab tab = { .p = &obj };
+void w() { for (u32 i = 0; i < 100000; i += 1) { tab.p.v += 1; } }
+u32 main() { spawn w(); for (u32 i = 0; i < 100000; i += 1) { obj.v += 1; } return 0; }

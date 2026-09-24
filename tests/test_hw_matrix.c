@@ -271,7 +271,7 @@ static void gen(HWScenario s, char *buf, size_t n) {
  * ================================================================ */
 
 typedef enum { VSITE_SPAWN, VSITE_ISR, VSITE_COUNT } VSite;
-typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_COUNT } VShape;
+typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN, VSHAPE_COUNT } VShape;
 
 static const char *vsite_name(VSite s) {
     switch (s) {
@@ -286,13 +286,17 @@ static const char *vshape_name(VShape s) {
     case VSHAPE_WORD:      return "single-word-scalar";
     case VSHAPE_OVERWIDTH: return "over-width(u64@32)";
     case VSHAPE_AGGREGATE: return "aggregate-struct";
-    case VSHAPE_OPTPTR:    return "optional-pointer ?*T";
+    case VSHAPE_OPTPTR:    return "optional-pointer ?*volatile T";
+    case VSHAPE_OPTPTR_PLAIN: return "optional-pointer ?*T (plain pointee)";
     case VSHAPE_COUNT: break;
     }
     return "?";
 }
 /* A single-word scalar is the sanctioned idiom -> ACCEPT. Everything else tears. */
-/* BUG-1212: a `?*T` is a null-sentinel pointer — one word, like `*T`. */
+/* BUG-1212: a `?*T` is a null-sentinel pointer — one word, like `*T`.
+ * BUG-1249: but the exemption covers the WORD, and the scans cannot tell a read
+ * of the word from a dereference of it — so the pointer is exempt only when its
+ * pointee is itself volatile (or a shared struct). A plain pointee is negative. */
 static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD && s != VSHAPE_OPTPTR; }
 static const char *vshape_flags(VShape s) {
     return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
@@ -514,7 +518,8 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     case VSHAPE_WORD:      decl = "volatile u32 g;";                      wr = "g = 1;";   rd = "u32 x = g;";   break;
     case VSHAPE_OVERWIDTH: decl = "volatile u64 g;";                      wr = "g = 1;";   rd = "u64 x = g;";   break;
     case VSHAPE_AGGREGATE: decl = "struct P{u32 a; u32 b;}\nvolatile P g;"; wr = "g.a = 1;"; rd = "u32 x = g.a;"; break;
-    case VSHAPE_OPTPTR:    decl = "volatile ?*u32 g = null;";             wr = "g = null;"; rd = "volatile ?*u32 x = g;"; break;
+    case VSHAPE_OPTPTR:    decl = "volatile ?volatile *u32 g = null;";    wr = "g = null;"; rd = "volatile ?volatile *u32 x = g;"; break;
+    case VSHAPE_OPTPTR_PLAIN: decl = "volatile ?*u32 g = null;";          wr = "g = null;"; rd = "volatile ?*u32 x = g;"; break;
     case VSHAPE_COUNT:     decl = ""; wr = ""; rd = ""; break;
     }
     if (site == VSITE_SPAWN) {

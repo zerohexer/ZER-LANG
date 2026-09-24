@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: @cond_wait predicate may only read
+// BUG-1252: a predicate CALLING a reader of another shared struct deadlocked (AB-BA).
+shared struct Q { u32 n; }
+shared struct R { u32 m; }
+Q q; R r;
+u32 peekr() { return r.m; }
+u32 peekq() { return q.n; }
+void a(*Q p) { for (u32 i = 0; i < 100000; i += 1) { @cond_wait(q, peekr() < 1000000); } }
+u32 main() {
+    spawn a(&q);
+    for (u32 i = 0; i < 100000; i += 1) { @cond_wait(r, peekq() < 1000000); }
+    return 0;
+}

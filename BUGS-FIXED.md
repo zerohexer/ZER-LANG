@@ -5,6 +5,74 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24e — BUG-1246..1253: the concurrency audit round (ag9) + an array-copy miscompile
+
+**Method.** A read-only agent probed ~150 concurrency shapes against a frozen compiler, each
+hole paired with a control the checker already refused. Every negative below COMPILED on the
+from-HEAD baseline (`fa54da50`) and is refused now for its `// expect-error:` reason; the
+positives failed there. Sink matrix shape p41 is new: its nine reject cells are HOLES on the
+baseline. Corpus cost of every new diagnostic: zero (compiler-classified over tests/,
+rust_tests/, zig_tests/, test_modules/, examples/, lib/).
+
+### BUG-1246 — an array declaration initialised from a non-local array dropped the copy
+`u32[2] b = ga;` (a global), `= gs.a`, `= ls.a` and `= grid[1]` left `b` ZERO: lower_expr has
+no local to return for an array value, so the read was lowered as a destination-less
+passthrough and the emitted C was the statement `ga;`. Local-to-local worked (IR_COPY) and so
+did the assignment spelling. The declaration now lowers `b = <init>` as that assignment.
+Test: `tests/zer/array_init_from_nonlocal_bug1246.zer`.
+
+### BUG-1247 — `defer th.join()` released the borrow at the defer statement
+The join is checked where the defer is written and runs at scope exit, so every statement
+after it (`v += 1;`, `return v;`) raced the still-running thread (TSan). A deferred join keeps
+the borrow and the concurrent window open.
+
+### BUG-1248 — the scoped-spawn borrow was lost through every launder
+`borrow_root_name` was recorded for a literal `&v`, a slice of a local and a struct-literal
+carrier only. ONE query now, `collect_borrow_roots`, answers "which locals can this value
+reach?" through launders, `orelse`, field reads, calls, struct literals and slices; it feeds
+the declaration site, the assignment site, an if-unwrap capture, the spawn argument (a
+sub-slice or an array passed to a `[*]T` parameter now lends) and the call-argument check (a
+by-value carrier whose field points into the lent local).
+
+### BUG-1249 — the `const` and `volatile` race-scan exemptions covered what a pointer points at
+`const [*]u32 gs = arr;`, `const *T gp = &obj;` and `const Tab tab = { .p = &obj }` let a thread
+read (and write) mutable data main was writing; `volatile ?*T gp = &obj;` exempted every `p.v`
+through it (TSan; the ISR heap sibling made GCC turn main's poll loop infinite). `const`
+exempts only a value that cannot carry a pointer; a volatile pointer is single-word-exempt only
+when its pointee is volatile or a shared struct — in the one shared predicate, so the spawn and
+ISR sites agree. The ISR site gets its own sentence for the pointer case. This narrows BUG-1212's
+sanctioned `volatile ?*u32` publish: the hw-matrix volatile grid now carries `?*volatile T`
+(positive) and `?*T` with a plain pointee (negative).
+
+### BUG-1250 — a shared struct copied at the sinks the D9 rule missed
+Spawn argument, `return g`, a wrapper struct, an array of them, `?C og = g` and a struct-literal
+field copied the embedded mutex (TSan race; copying a held mutex hung). Shared structs are now a
+member of `unique_resource_name`, reported at every value-flow sink; the old var-decl and
+call-arg rules keep only the fresh-value (call-result) case so nothing is reported twice.
+
+### BUG-1251 — re-enabling interrupts inside `@critical`
+The ISR rule drops a read-modify-write's "may be split" finding inside `@critical`, trusting it
+to keep interrupts off. `@cpu_enable_int()`, `@cpu_restore_int_state(1)` (directly or in a
+helper) and `@cpu_wait_int()` inside the block defeated that silently. A new FuncProps bit
+`can_enable_int` (transitive) refuses them.
+
+### BUG-1252 — an `@cond_wait` predicate calling a reader of another shared struct
+Two threads each waiting with a predicate that called a function reading the other's struct
+took two locks in opposite orders and hung. A predicate may not call a function that touches
+any shared struct.
+
+### BUG-1253 — three GCC failures on accepted concurrency code
+An array passed to a `[*]T` spawn parameter (the coercion was not emitted); `@cond_*` on a
+`shared(rw)` struct (no `_zer_mtx`; now refused); a whole-struct assignment to a shared global
+(it overwrites the mutex; now refused).
+
+**Recorded, not fixed** (limitations.md "concurrency residuals of the ag9 round"): pointer
+fields inside a shared struct, `@once` body vs main, an atomic target reached through a pointer,
+a global lent through a callee's returned pointer, parameter aliasing into a scoped spawn, and
+four over-rejections.
+
+---
+
 ## Session 2026-09-24d — BUG-1231..1245: the async batch and residuals (an audit agent's findings, each re-measured)
 
 **Method.** The ag5 async audit ran ~120 probes against a frozen compiler, each async hole

@@ -3025,6 +3025,30 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     emit_inst(ctx, inst);
                     break;
                 }
+                /* BUG-1246: an ARRAY-valued init that is not a local (a global,
+                 * a struct field, `s.a`, an element of an array of arrays):
+                 * lower_expr has no local to return for it (C cannot assign an
+                 * array), so it lowered the read as a destination-less
+                 * passthrough and the copy was DROPPED — `u32[2] b = ga;` left
+                 * b zero. Lower it as the assignment `b = <init>`, the spelling
+                 * that already copies (the emitter memcpys an array assign). */
+                if (init_eff && type_dispatch_kind(init_eff) == TYPE_ARRAY &&
+                    vt_unwrap && type_dispatch_kind(vt_unwrap) == TYPE_ARRAY &&
+                    !(init->kind == NODE_IDENT &&
+                      ir_find_local_exact_first(ctx->func, init->ident.name,
+                                                (uint32_t)init->ident.name_len) >= 0)) {
+                    Node *asg = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                    memset(asg, 0, sizeof(Node));
+                    asg->kind = NODE_ASSIGN;
+                    asg->loc = node->loc;
+                    asg->assign.op = TOK_EQ;
+                    asg->assign.target = make_local_ident(ctx, &ctx->func->locals[local_id],
+                                                          node->loc);
+                    asg->assign.value = init;
+                    checker_set_type(ctx->checker, asg, vt);
+                    (void)lower_expr(ctx, asg);
+                    break;
+                }
                 /* Unified: lower_expr decomposes all inits.
                  * Simple expressions → local ID + IR_COPY.
                  * Complex expressions (calls, builtins, intrinsics, casts,

@@ -1,0 +1,12 @@
+// BUG-1247 positive: a deferred join with no access to the lent local after it.
+void w(*u32 p) { *p += 1; }
+u32 run() {
+    u32 v = 0;
+    ThreadHandle th = spawn w(&v);
+    defer th.join();
+    return 5;
+}
+u32 main() {
+    if (run() != 5) { return 1; }
+    return 0;
+}

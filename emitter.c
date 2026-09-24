@@ -13406,6 +13406,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                     emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
                                     emit(e, ", .has_value = 1 }");
                                 }
+                            } else if (pt && type_dispatch_kind(pt) == TYPE_SLICE &&
+                                       at_eff && type_dispatch_kind(at_eff) == TYPE_ARRAY) {
+                                /* BUG-1253: the array -> slice coercion, at the
+                                 * spawn-argument sink (was a GCC type error). */
+                                emit_array_as_slice(e, sp->spawn_stmt.args[ai], at_eff, pt);
                             } else {
                                 emit_rewritten_node(e, sp->spawn_stmt.args[ai], func);
                             }

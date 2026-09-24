@@ -1,0 +1,31 @@
+// BUG-1246: an array declaration initialised from a GLOBAL array, a struct field
+// array, or an array element dropped the copy and left the new array zero.
+struct E { u32 v; }
+struct S { u32[2] a; }
+u32[2] ga;
+E[2] ge;
+S gs;
+u32[2][2] grid;
+u32 main() {
+    ga[1] = 3;
+    ge[0].v = 4;
+    gs.a[0] = 5;
+    grid[1][0] = 6;
+    S ls;
+    ls.a[1] = 7;
+    u32 s = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        u32[2] b = ga;
+        s += b[1];
+    }
+    E[2] e = ge;
+    u32[2] f = gs.a;
+    u32[2] g = grid[1];
+    u32[2] h = ls.a;
+    if (s != 6) { return 1; }
+    if (e[0].v != 4) { return 2; }
+    if (f[0] != 5) { return 3; }
+    if (g[0] != 6) { return 4; }
+    if (h[1] != 7) { return 5; }
+    return 0;
+}

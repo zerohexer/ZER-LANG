@@ -1,5 +1,5 @@
 // EXPECTED: compile error
-// expect-error: carries a freed pointer at 't.b'
+// expect-error: still holds a freed pointer at 't.b'
 struct Box { u32 v; }
 async u32 f(*Box b) { yield; return b.v; }
 u32 main() {

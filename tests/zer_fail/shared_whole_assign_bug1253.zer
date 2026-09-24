@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot assign a whole shared struct
+// BUG-1253: a struct literal assigned over a shared global's mutex.
+shared struct C { u32 v; }
+C g;
+void w(*C c) { for (u32 i = 0; i < 100000; i += 1) { c.v += 1; } }
+u32 main() {
+    spawn w(&g);
+    for (u32 i = 0; i < 100000; i += 1) { g = { .v = 5 }; }
+    return 0;
+}

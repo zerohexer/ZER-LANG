@@ -2468,6 +2468,8 @@ static bool elem_free_pre(Node *arg) {
 }
 
 static bool ir_call_is_classified_method(Checker *c, Node *call); /* after IRMethodKind */
+static bool ir_async_task_name(Checker *ck, const char *nm, uint32_t nl,
+                               const char *suffix, uint32_t sl, Node **fn);
 static void ir_check_call_arg_carriers(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                        Node *call, int line) {
     if (!call || call->kind != NODE_CALL) return;
@@ -2496,6 +2498,21 @@ static void ir_check_call_arg_carriers(ZerCheck *zc, IRFunc *func, IRPathState *
             if (plen > 0 && (!path || memcmp(h->path, path, plen) != 0)) continue;
             if (h->path[plen] != '.' && h->path[plen] != '[') continue;
             if (h->state != IR_HS_FREED && h->state != IR_HS_MAYBE_FREED) continue;
+            Node *cal = call->call.callee;
+            Node *afn = NULL;
+            if (cal && cal->kind == NODE_IDENT &&
+                ir_async_task_name(zc->checker, cal->ident.name,
+                                   (uint32_t)cal->ident.name_len, "_poll", 5, &afn)) {
+                /* BUG-1233: the carrier is a TASK — its body reads the argument. */
+                ir_zc_error_for(zc, func, root, line,
+                    "polling %s, which still holds a %s pointer at %s (freed at line %d) "
+                    "— the async body reads it on this poll. Free it only after the task "
+                    "is done, or let the task free it",
+                    ir_local_desc(zc, func, root, path, plen),
+                    h->state == IR_HS_FREED ? "freed" : "maybe-freed",
+                    ir_local_desc(zc, func, root, h->path, h->path_len), h->free_line);
+                break;
+            }
             ir_zc_error_for(zc, func, root, line,
                 "a call is handed %s, which carries a %s pointer at %s (freed at "
                 "line %d) — the callee receives the dangling pointer. Reset the "

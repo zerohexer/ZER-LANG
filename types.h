@@ -377,6 +377,7 @@ struct Symbol {
         bool can_spawn;      /* body contains spawn (directly or transitively) */
         bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
         bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
+        bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */
         /* Direct-only effect flags — set when the effect appears literally
          * in this function's immediate body (NOT through a callee). Used by
          * check_body_effects to suppress duplicate body-level errors when

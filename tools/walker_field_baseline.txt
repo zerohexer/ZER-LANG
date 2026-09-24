@@ -1660,3 +1660,46 @@ checker.c:mmio_index_reevaluable:NODE_SWITCH:switch_stmt.expr
 checker.c:mmio_index_reevaluable:NODE_VAR_DECL:var_decl.init
 checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.body
 checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.cond
+# 2026-09-24e — BUG-1248 collect_borrow_roots: a VALUE walk for 'which locals can this
+# pointer reach'. Scalar-producing kinds (binary, assign, literals) lend nothing, statement
+# kinds never appear in a value position, and FIELD/INDEX/SLICE are walked as a chain to
+# their root (the index / bounds are scalars). Reviewed row by row.
+checker.c:collect_borrow_roots:NODE_ASM:asm_stmt.inputs
+checker.c:collect_borrow_roots:NODE_ASM:asm_stmt.outputs
+checker.c:collect_borrow_roots:NODE_ASSIGN:assign.target
+checker.c:collect_borrow_roots:NODE_ASSIGN:assign.value
+checker.c:collect_borrow_roots:NODE_AWAIT:await_stmt.cond
+checker.c:collect_borrow_roots:NODE_BINARY:binary.left
+checker.c:collect_borrow_roots:NODE_BINARY:binary.right
+checker.c:collect_borrow_roots:NODE_BLOCK:block.stmts
+checker.c:collect_borrow_roots:NODE_CALL:call.callee
+checker.c:collect_borrow_roots:NODE_CRITICAL:critical.body
+checker.c:collect_borrow_roots:NODE_DEFER:defer.body
+checker.c:collect_borrow_roots:NODE_DO_WHILE:while_stmt.body
+checker.c:collect_borrow_roots:NODE_DO_WHILE:while_stmt.cond
+checker.c:collect_borrow_roots:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:collect_borrow_roots:NODE_FIELD:field.object
+checker.c:collect_borrow_roots:NODE_FILE:file.decls
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.body
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.cond
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.init
+checker.c:collect_borrow_roots:NODE_FOR:for_stmt.step
+checker.c:collect_borrow_roots:NODE_FUNC_DECL:func_decl.body
+checker.c:collect_borrow_roots:NODE_GLOBAL_VAR:var_decl.init
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.cond
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.else_body
+checker.c:collect_borrow_roots:NODE_IF:if_stmt.then_body
+checker.c:collect_borrow_roots:NODE_INDEX:index_expr.index
+checker.c:collect_borrow_roots:NODE_INDEX:index_expr.object
+checker.c:collect_borrow_roots:NODE_INTERRUPT:interrupt.body
+checker.c:collect_borrow_roots:NODE_ONCE:once.body
+checker.c:collect_borrow_roots:NODE_RETURN:ret.expr
+checker.c:collect_borrow_roots:NODE_SLICE:slice.end
+checker.c:collect_borrow_roots:NODE_SLICE:slice.start
+checker.c:collect_borrow_roots:NODE_SPAWN:spawn_stmt.args
+checker.c:collect_borrow_roots:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:collect_borrow_roots:NODE_SWITCH:switch_stmt.arms
+checker.c:collect_borrow_roots:NODE_SWITCH:switch_stmt.expr
+checker.c:collect_borrow_roots:NODE_VAR_DECL:var_decl.init
+checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.body
+checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.cond

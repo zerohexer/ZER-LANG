@@ -867,6 +867,23 @@ cell p40_safe_frame_task    compile "$P40"' async void f40(*u32 p){ yield; *p = 
 cell p40_safe_task_owns     compile "$P40"' async void f40(*T40 b){ yield; free(b); } u32 main(){ *T40 p = alloc(T40) orelse return; _zer_async_f40 t; _zer_async_f40_init(&t, p); while (_zer_async_f40_poll(&t) == 0) { } return 0; }'
 cell p40_safe_store_reset   compile "$P40"' void in40(*S40 s, *T40 b){ s.b = b; } void rd40(*S40 s){ if (s.b) |b| { b.v = 1; } } u32 main(){ *T40 p = alloc(T40) orelse return; S40 t; in40(&t, p); free(p); t.b = null; rd40(&t); return 0; }'
 
+# SHAPE p41 (BUG-1248, 1250): what a scoped-spawn argument LENDS through a launder,
+# and a shared struct copied at the sinks the old rule missed.
+echo "===== SHAPE p41 = scoped-spawn borrow launder / shared-struct copy (spawn sinks) ====="
+P41='void w41(*u32 p){ *p += 1; } void ws41([*]u32 s){ s[0] += 1; } *u32 id41(*u32 p){ return p; } struct H41{*u32 p;} shared struct C41{u32 v;} C41 g41; void wc41(C41 c){ }'
+cell p41_ptr_copy          reject "$P41"' u32 main(){ u32 v = 0; *u32 q = &v; *u32 p = q; ThreadHandle th = spawn w41(p); v += 1; th.join(); return 0; }'
+cell p41_orelse            reject "$P41"' u32 main(){ u32 v = 0; ?*u32 op = &v; *u32 p = op orelse return; ThreadHandle th = spawn w41(p); v += 1; th.join(); return 0; }'
+cell p41_field_read        reject "$P41"' u32 main(){ u32 v = 0; H41 h = { .p = &v }; *u32 p = h.p; ThreadHandle th = spawn w41(p); v += 1; th.join(); return 0; }'
+cell p41_call_result       reject "$P41"' u32 main(){ u32 v = 0; *u32 p = id41(&v); ThreadHandle th = spawn w41(p); v += 1; th.join(); return 0; }'
+cell p41_subslice_arg      reject "$P41"' u32 main(){ u32[4] a; ThreadHandle th = spawn ws41(a[1..3]); a[1] += 1; th.join(); return 0; }'
+cell p41_array_arg         reject "$P41"' u32 main(){ u32[4] a; ThreadHandle th = spawn ws41(a); a[0] += 1; th.join(); return 0; }'
+cell p41_carrier_to_callee reject "$P41"' void bh41(H41 h){ *h.p += 1; } u32 main(){ u32 v = 0; H41 h = { .p = &v }; *u32 p = &v; ThreadHandle th = spawn w41(p); bh41(h); th.join(); return 0; }'
+cell p41_shared_spawn_copy reject "$P41"' u32 main(){ spawn wc41(g41); return 0; }'
+cell p41_shared_return     reject "$P41"' C41 get41(){ return g41; } u32 main(){ return 0; }'
+# BOUNDARY: a launder whose root is touched only after the join; a fresh shared value.
+cell p41_safe_after_join   compile "$P41"' u32 main(){ u32 v = 0; *u32 p = id41(&v); ThreadHandle th = spawn w41(p); th.join(); v += 1; return 0; }'
+cell p41_safe_array_join   compile "$P41"' u32 main(){ u32[4] a; ThreadHandle th = spawn ws41(a); th.join(); a[0] += 1; return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

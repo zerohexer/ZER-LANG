@@ -4264,10 +4264,12 @@ Allowed only inside `naked` functions.
 ```zer
 asm("cpsid i");        // disable interrupts
 asm("wfi");             // wait for interrupt
-
-// With operands (GCC extended syntax):
-asm("mov %0, %1" : "=r"(out) : "r"(in));
 ```
+
+Operands are written in the STRUCTURED form below. The GCC-style inline
+`asm("mov %0, %1" : "=r"(out) : "r"(in))` is a compile error: its operands are raw
+text, so the race, lock, lifetime and move analyses could not see the ZER values
+they name.
 
 **STRUCTURED FORM**
 Besides the GCC-style string, a structured `asm { }` block names every operand
@@ -4909,6 +4911,8 @@ zerc main.zer --run --stack-limit 2048
   includes a call through a struct FIELD (`o.f(1)`) or array ELEMENT (`tbl[i](x)`),
   a local funcptr, and a GLOBAL funcptr that any function reassigns. An `interrupt`
   handler is an entry point like `main`, and gets the same error.
+- Every function that nothing in the program calls is an entry point too (a
+  vector-table `Reset_Handler`, a callback): its whole call chain must fit N.
 - Frames are sized for the TARGET: a pointer local is 8 bytes by default on a
   64-bit host and 4 with `--target-bits 32`.
 - Every stack diagnostic names the function's own source line

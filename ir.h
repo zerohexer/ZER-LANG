@@ -182,6 +182,13 @@ typedef struct IRInst {
      * function containing a LABEL — see materialise_defer_body. */
     bool defer_fire_emit_ast;
 
+    /* BUG-1291: lowered inside a DEFER BODY. The emitter's C-level auto-guard
+     * (for every site the IR lowering declined — a loop condition, a for-init)
+     * exits by RETURN, which fires the pending defers — the one being run
+     * included, as raw AST, unguarded (ASan global-buffer-overflow, and a double
+     * fire of the cleanup). Such a guard must TRAP, as the IR-lowered one does. */
+    bool in_defer_body;
+
     /* BUG-1221: on IR_ASSIGN, zero the destination local (`memset`, any type,
      * arrays included) — a declaration WITHOUT an initializer that can execute
      * more than once (in a loop body, or in a function with labels). `expr` is a

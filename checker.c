@@ -10895,6 +10895,17 @@ static Type *check_expr(Checker *c, Node *node) {
                     gs->type && type_is_integer(gs->type)) {
                     record_atomic_plain_write(c, gs, node->loc.line);
                 }
+                /* BUG-1295: the WHOLE of an aggregate — a copy (`S t = s;`), a
+                 * struct-literal assignment, a slice view, `&s` handed on — reads or
+                 * writes every field at once, the atomic one included. Only a
+                 * field / element access (this ident as the object of `.f` / `[i]`)
+                 * is keyed by path. */
+                if (c->after_spawn_in_func && node != c->field_obj_node && gs->type &&
+                    !c->in_atomic_intrinsic_arg) {
+                    TypeKind wk = type_dispatch_kind(gs->type);
+                    if (wk == TYPE_STRUCT || wk == TYPE_ARRAY || wk == TYPE_UNION)
+                        track_atomic_field(c, gs, "*", 1, false, node->loc.line);
+                }
             }
         }
         break;
@@ -11621,6 +11632,36 @@ static Type *check_expr(Checker *c, Node *node) {
                             (long long)_v, _w, (long long)_hi, (long long)_lo,
                             (unsigned long long)_max);
                     }
+                }
+                /* BUG-1293: a RUNTIME value wider than the field was masked just as
+                 * silently (`r[7..0] = x` with x = 300 stored 44) — the implicit
+                 * narrowing ZER refuses everywhere else. Accept it when the value's
+                 * TYPE fits, or its proven range does (an identifier's VRP range, a
+                 * `& mask` / `% n`); otherwise ask for the explicit narrowing. */
+                if (node->assign.op == TOK_EQ &&   /* a compound op's operand is not the stored value */
+                    _hi != CONST_EVAL_FAIL && _lo != CONST_EVAL_FAIL &&
+                    _v == CONST_EVAL_FAIL && _hi >= _lo && _lo >= 0 && _hi < 64) {
+                    uint32_t _w = (uint32_t)(_hi - _lo + 1);
+                    uint64_t _max = (_w >= 64) ? ~0ULL : ((1ULL << _w) - 1ULL);
+                    Type *_vt = typemap_get(c, node->assign.value);
+                    int _vw = _vt ? type_width(_vt) : 0;
+                    bool _fits = _vw > 0 && (uint32_t)_vw <= _w;
+                    int64_t _mn = 0, _mx = 0;
+                    if (!_fits && node->assign.value->kind == NODE_IDENT) {
+                        struct VarRange *_r = find_var_range(c, node->assign.value->ident.name,
+                            (uint32_t)node->assign.value->ident.name_len);
+                        if (_r && !_r->address_taken && _r->min_val >= 0 &&
+                            (uint64_t)_r->max_val <= _max) _fits = true;
+                    }
+                    if (!_fits && derive_expr_range(c, node->assign.value, &_mn, &_mx, false) &&
+                        _mn >= 0 && (uint64_t)_mx <= _max) _fits = true;
+                    if (!_fits && _vw > 0)
+                        checker_error(c, node->loc.line,
+                            "a %d-bit value written into the %u-bit field [%lld..%lld] may "
+                            "not fit — it would be silently truncated. Narrow it explicitly "
+                            "(@truncate(u%u, x)) or mask it (x & %llu)",
+                            _vw, _w, (long long)_hi, (long long)_lo, _w,
+                            (unsigned long long)_max);
                 }
             }
         }
@@ -15290,7 +15331,10 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
+        Node *sv_fobj = c->field_obj_node;          /* BUG-1295 */
+        c->field_obj_node = node->field.object;
         Type *obj_raw = check_expr(c, node->field.object);
+        c->field_obj_node = sv_fobj;
         /* BUG-410: unwrap distinct for field access dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
 
@@ -15644,7 +15688,10 @@ static Type *check_expr(Checker *c, Node *node) {
 
     /* ---- Index ---- */
     case NODE_INDEX: {
+        Node *sv_fobj = c->field_obj_node;          /* BUG-1295 */
+        c->field_obj_node = node->index_expr.object;
         Type *obj_raw = check_expr(c, node->index_expr.object);
+        c->field_obj_node = sv_fobj;
         /* BUG-410: unwrap distinct for array/slice/pointer index dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
         Type *idx = check_expr(c, node->index_expr.index);
@@ -24661,6 +24708,32 @@ static void check_stmt(Checker *c, Node *node) {
                 "asm statements only allowed in naked functions — "
                 "use @critical or @atomic_* for safe alternatives (MISRA Dir 4.3)");
         }
+        /* BUG-1297: the INLINE form is kept as raw text, so GCC-style operands
+         * (`asm("nop" : : "r"(g))`, `"r"(a.x)`) name ZER variables no analysis
+         * sees — the spawn race scan, the shared-struct lock, UAF / move / escape
+         * tracking (the Z-rules run on the STRUCTURED form's typed operands only).
+         * A `:` outside a string / char literal is the extended form. */
+        if (!node->asm_stmt.is_structured && node->asm_stmt.code) {
+            const char *q = node->asm_stmt.code;
+            const char *qe = q + node->asm_stmt.code_len;
+            bool ext = false;
+            while (q < qe && !ext) {
+                if (*q == '"' || *q == '\'') {
+                    char d = *q++;
+                    while (q < qe && *q != d) { if (*q == '\\') q++; q++; }
+                    if (q < qe) q++;
+                    continue;
+                }
+                if (*q == ':') ext = true;
+                q++;
+            }
+            if (ext)
+                checker_error(c, node->loc.line,
+                    "asm operands in the inline asm(\"...\") form are raw text the compiler "
+                    "cannot check (race, lock, lifetime and move tracking do not see them) — "
+                    "use the structured asm { instructions: ... inputs: { ... } outputs: "
+                    "{ ... } safety: ... } form, whose operands are typed ZER expressions");
+        }
         /* D-Alpha-7.5 H1+H3: structured asm form requires `instructions:` and
          * `safety:` keys; safety string must be >= 30 chars (S4 rule preview).
          * Forces auditable documentation at every escape-hatch site. */
@@ -29921,6 +29994,8 @@ typedef struct CalleeGlobalWalk {
     void *ud;
     bool skip_atomic_target;
     Node *cur_once;   /* BUG-1276: innermost @once on the walk (NULL outside) */
+    Node *field_obj;  /* BUG-1295: the object of the `.f` / `[i]` being descended */
+    bool ident_whole; /* BUG-1295: the ident just visited names the WHOLE object */
     Node **seen;
     int seen_count, seen_cap;
     Node *seen_stack[16];
@@ -29956,6 +30031,7 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
     case NODE_IDENT: {
         Symbol *gs = global_decl_lookup(c, node->ident.name,
                                   (uint32_t)node->ident.name_len);
+        w->ident_whole = (node != w->field_obj);   /* BUG-1295 */
         if (gs && !gs->is_function)
             w->visit(c, gs, node->loc.line, w->ud);
         return;
@@ -29994,11 +30070,19 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
         walk_callee_globals(c, node->assign.target, w);
         walk_callee_globals(c, node->assign.value, w);
         return;
-    case NODE_FIELD:  walk_callee_globals(c, node->field.object, w); return;
-    case NODE_INDEX:
+    case NODE_FIELD: {
+        Node *sv = w->field_obj; w->field_obj = node->field.object;   /* BUG-1295 */
+        walk_callee_globals(c, node->field.object, w);
+        w->field_obj = sv;
+        return;
+    }
+    case NODE_INDEX: {
+        Node *sv = w->field_obj; w->field_obj = node->index_expr.object;
         walk_callee_globals(c, node->index_expr.object, w);
+        w->field_obj = sv;
         walk_callee_globals(c, node->index_expr.index, w);
         return;
+    }
     case NODE_UNARY:  walk_callee_globals(c, node->unary.operand, w); return;
     case NODE_BINARY:
         walk_callee_globals(c, node->binary.left, w);
@@ -30094,8 +30178,14 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
 }
 
 static void atomic_plain_visit(Checker *c, Symbol *g, int line, void *ud) {
-    (void)ud;
+    CalleeGlobalWalk *w = (CalleeGlobalWalk *)ud;
     record_atomic_plain_write(c, g, line);
+    /* BUG-1295: a callee's whole-aggregate access (`S t = s;` in a helper) */
+    if (w && w->ident_whole && g->type) {
+        TypeKind k = type_dispatch_kind(g->type);
+        if (k == TYPE_STRUCT || k == TYPE_ARRAY || k == TYPE_UNION)
+            track_atomic_field(c, g, "*", 1, false, line);
+    }
 }
 static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
     (void)depth;
@@ -30103,6 +30193,7 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
     memset(&w, 0, sizeof(w));
     callee_global_walk_init(&w);
     w.visit = atomic_plain_visit;
+    w.ud = &w;   /* BUG-1295: the visitor reads ident_whole */
     w.skip_atomic_target = true;
     walk_callee_globals_body(c, node, &w);
 }
@@ -30458,6 +30549,23 @@ static void check_atomic_cell_safety(Checker *c) {
                 "same storage, so access it atomically here too",
                 (int)a->s->name_len, a->s->name, (int)b->field_len, b->field,
                 (int)a->s->name_len, a->s->name, (int)a->field_len, a->field);
+        }
+    }
+    /* BUG-1295: a whole-aggregate access conflicts with ANY atomic row on it */
+    for (int i = 0; i < c->atomic_field_count; i++) {
+        struct AtomicFieldEntry *w = &c->atomic_fields[i];
+        if (!w->plain_used || !w->s || w->field_len != 1 || w->field[0] != '*') continue;
+        for (int j = 0; j < c->atomic_field_count; j++) {
+            struct AtomicFieldEntry *a = &c->atomic_fields[j];
+            if (a->s != w->s || !a->atomic_used) continue;
+            const char *sep = (a->field_len && (a->field[0] == '.' || a->field[0] == '[')) ? "" : ".";
+            checker_error(c, w->plain_line,
+                "plain access to the whole of '%.*s' in a concurrent context — its part "
+                "'%.*s%s%.*s' is used with @atomic_* elsewhere (atomic cell), and a copy, "
+                "assignment or view of the whole reads or writes it non-atomically",
+                (int)w->s->name_len, w->s->name, (int)w->s->name_len, w->s->name, sep,
+                (int)a->field_len, a->field);
+            break;
         }
     }
     for (int i = 0; i < c->atomic_field_count; i++) {
@@ -31109,6 +31217,28 @@ static void check_stack_depth_files(Checker *c, const CheckerFile *files, int co
                             is_isr ? "interrupt" : "entry",
                             (int)f->name_len, f->name,
                             (unsigned)max_depth, (unsigned)c->stack_limit);
+                    } else {
+                        /* BUG-1296: a call-graph ROOT — nothing in the program calls
+                         * it — is reachable only from outside: a vector-table entry
+                         * (`Reset_Handler`, `_start`), a callback. Its whole chain was
+                         * never measured, so a 3200-byte firmware chain passed
+                         * `--stack-limit 1000` because each frame fit. */
+                        bool called = false;
+                        for (int ci = 0; ci < c->stack_frame_count && !called; ci++) {
+                            struct StackFrame *cf = &c->stack_frames[ci];
+                            for (int k = 0; k < cf->callee_count; k++)
+                                if (cf->callee_lens[k] == f->name_len &&
+                                    memcmp(cf->callees[k], f->name, f->name_len) == 0) {
+                                    called = true; break;
+                                }
+                        }
+                        if (!called)
+                            checker_error(c, f->line,
+                                "function '%.*s' is never called anywhere in the program, so "
+                                "it is an entry point (a vector-table handler or a callback) — "
+                                "its call chain needs %u bytes, over --stack-limit %u",
+                                (int)f->name_len, f->name,
+                                (unsigned)max_depth, (unsigned)c->stack_limit);
                     }
                 }
                 /* Indirect call check: if entry point's call chain contains

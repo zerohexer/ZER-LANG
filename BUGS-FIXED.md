@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-24g — BUG-1268..1290: closing the MEDIUM limitations (arena, wrong-pool, races, escapes)
+## Session 2026-09-24g — BUG-1268..1297: closing the MEDIUM limitations (arena, wrong-pool, races, escapes)
 
 **Method.** Every item below was an entry in `docs/limitations.md` or a finding of the read-only
 triage agents that re-measured it; each was RE-REPRODUCED on the from-HEAD (`ae001cfe`) build
@@ -194,6 +194,54 @@ GRID of `tests/test_conc_matrix.c` (spawned from `main` — a first draft spawne
 spawned `worker`, where the outer scan found `cb` by name and all five passed on the unfixed
 build). The ISR sibling holds by other rules: a funcptr an ISR can call must live in a global,
 and such a global is refused unless it is a single-word volatile scalar. Tests: `funcptr_reach_*_bug1290.zer`.
+
+### BUG-1291 — a guard's early exit inside a label-free DEFER BODY re-fired the defers
+A loop condition or for-init in a defer body is a guard site the IR lowering declines, so the
+emitter's C-level guard ran — and its exit RETURNS, firing the pending defers, the one being run
+included, from raw AST and unguarded: an ASan global-buffer-overflow and a cleanup that ran
+twice (`cnt` 12 instead of 11). Instructions lowered inside a defer body carry
+`IRInst.in_defer_body`, and the guard there TRAPS, as the IR-lowered one already did.
+Tests: `tests/zer_trap/defer_body_*_bug1291.zer`.
+
+### BUG-1292 — an `await` condition's guard sat BEFORE the resume label
+The generic per-instruction guard was emitted ahead of `case N:`, so a resumed poll jumped past
+it and indexed out of bounds. IR_AWAIT emits its condition's guard after its own case label.
+Test: `await_cond_guard_after_resume_bug1292.zer` (the second poll now ends the task).
+
+### BUG-1293 — a runtime value wider than a bit-slice field was truncated silently
+`r[7..0] = x` with `x = 300` stored 44 — the implicit narrowing refused everywhere else (a
+constant that does not fit was already an error). A plain `=` now needs the value's TYPE to fit,
+or its proven range (an identifier's VRP range, `& mask`, `% n`); otherwise `@truncate` or a
+mask. A compound operator's operand is not the stored value and is exempt (the corpus scan
+caught `r[7..0] <<= s` in a first draft). Tests: `bitslice_runtime_value_*_bug1293.zer`.
+
+### BUG-1294 — an indirect call that may free a global (BUG-1181 residual)
+`*() fp = drop_g; fp(); a.v` — no summary is applied at an indirect call. It now applies every
+function's freed-global set as MAYBE_FREED, the union BUG-1172 already uses for arena resets.
+Tests: `indirect_call_*_bug1294.zer`.
+
+### BUG-1295 — the atomic-cell rule was blind to WHOLE-AGGREGATE access
+With a thread doing `@atomic_add(&s.n, 1)`, main's `S t = s;`, `s = { ... }`, `u32[4] c =
+cnts;`, a slice view, `clear(cnts)`, `reset(&s)` — and a helper doing `S t = s;` — were
+accepted. An identifier that is not the object of a `.f` / `[i]` names the whole object and is
+recorded as the path `*`, which conflicts with every atomic row of the same symbol; the callee
+walk tells its visitor the same thing. A sibling field (`s.m`) is still independent.
+Tests: `atomic_cell_whole_aggregate_*_bug1295.zer` (7), two positives.
+
+### BUG-1296 — `--stack-limit` measured only `main` and interrupt handlers
+On bare metal the entry is whatever the vector table names (`Reset_Handler`, `_start`), so a
+real firmware's whole chain went unmeasured — a 3200-byte chain passed `--stack-limit 1000`
+because each 800-byte frame fit. A call-graph ROOT (nothing in the program calls it) is now an
+entry point whose chain must fit. Tests: `stack_limit_root_entry*_bug1296.zer` (from the BUG-923
+probe of an audit branch).
+
+### BUG-1297 — GCC-style operands in the INLINE `asm("...")` form were invisible
+The inline form is kept as raw text, so `asm("nop" : : "r"(g))` in a spawned naked function
+read a non-shared global with no race diagnostic, and `"r"(a.x)` read a shared struct with no
+lock (the BUG-1013 residual). The structured form's operands are typed ZER expressions that
+every analysis sees; the inline form now refuses operands (a `:` outside a string or char
+literal) and points there. Zero corpus cost — only reference.md's SYNTAX sketch used it.
+Tests: `asm_inline_operand_{global,shared}_bug1297.zer`.
 
 ## Session 2026-09-24f — BUG-1254..1267: the allocator audit round (ag10)
 

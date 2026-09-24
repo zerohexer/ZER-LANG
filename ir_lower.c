@@ -191,6 +191,7 @@ typedef struct {
  * ir_validate enforces the invariant, so a new emission path cannot reintroduce
  * it. BOTH raw emit helpers route through here. */
 static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;   /* BUG-1291 */
     IRBlock *bb = &ctx->func->blocks[ctx->current_block];
     if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
         ctx->current_block = ir_add_block(ctx->func, ctx->arena);

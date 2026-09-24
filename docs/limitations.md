@@ -101,8 +101,8 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 
 1. ~~**A callee frees an allocation through a GLOBAL, the caller reads its LOCAL alias**~~ —
    **CLOSED 2026-09-24 (BUG-1181)**: FuncSummary.freed_global + the call-site widening; SHAPE
-   p36. Residual: a free through a global reached via a FUNCPTR call is not summarised (the
-   target is unknown and no summary is applied at an indirect call). Original text:
+   p36. The FUNCPTR-call residual is closed by BUG-1294 (an indirect call applies every
+   summary's freed globals as MAYBE_FREED). Original text:
    (MEDIUM — accept-unsafe, silent). `g = a; drop_g(); a.v` where `void drop_g() { if (g) |p|
    { free(p); } g = null; }` compiles, and the read returns a recycled object's value. The
    store marks `a` escaped and no FuncSummary says "frees what global g points to" (the callee
@@ -112,12 +112,9 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    X), applied at the call by freeing every caller handle aliased by the `(IR_GLOBAL_ROOT_ID,
    "X")` entry. The Handle spellings trap at run time (generation check), so the raw-pointer
    forms are the live ones.
-2. **The atomic-cell rule is blind to WHOLE-AGGREGATE access** (MEDIUM — data race, silent).
-   With a thread doing `@atomic_add(&s.n, 1)` / `@atomic_add(&cnts[1], 1)`, main's `S t = s;`,
-   `s = { .n = 3 };`, `u32[4] c = cnts;`, `[*]u32 v = cnts[0..]; v[1] = 9;`, `clear(cnts)` and
-   `reset(&s)` (callee writes `p.n`) are accepted; only field- and element-precise keys are
-   checked. Fix sketch: record a whole-object plain access as the empty path, which
-   `atomic_paths_may_alias` must treat as aliasing every path of the symbol.
+2. ~~**The atomic-cell rule is blind to WHOLE-AGGREGATE access**~~ — CLOSED 2026-09-24g
+   (BUG-1295): a copy, assignment, view or `&` of the whole object (in the function or in a
+   callee reached during the window) conflicts with any atomic part of it.
 3. **An indirect call widens arena allocations to MAYBE_FREED** whenever any function in the
    program resets a non-local arena (BUG-1172). Sound, but a funcptr call in a function that
    keeps using an arena pointer is then refused even when the target never resets. Precision
@@ -2853,7 +2850,7 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 - **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,
   `_tilde`. NB: distinct from the ALLOWED unsigned ops `~0` / `0 - 1`; see the
   corpus-cost rule in CLAUDE.md before widening.
-- **misc** (`yzhu1s`): `bitcast_bare_array_source`, `stack_limit_root_entry`.
+- **misc** (`yzhu1s`): `bitcast_bare_array_source` (`stack_limit_root_entry` is CLOSED as BUG-1296).
 - **bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).
 
 ---

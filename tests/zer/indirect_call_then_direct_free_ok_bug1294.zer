@@ -1,0 +1,14 @@
+struct T { u32 v; }
+?*T g;
+void drop_g() { if (g) |p| { free(p); } g = null; }
+void nop() { }
+u32 main() {
+    *T a = alloc(T) orelse { return 1; };
+    a.v = 5;
+    u32 r = a.v;
+    g = a;
+    *() fp = nop;
+    fp();
+    drop_g();
+    return r - 5;
+}

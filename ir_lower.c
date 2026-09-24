@@ -1160,8 +1160,17 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
             Node *rhs = expr->assign.value;
             bool rhs_sc = rhs && rhs->kind == NODE_BINARY &&
                 (rhs->binary.op == TOK_AMPAMP || rhs->binary.op == TOK_PIPEPIPE);
-            if (!(rhs_sc && sc_expr_has_orelse(rhs))) goto passthrough;
-            plain_sc = true;
+            /* BUG-1210: `s = { .b = nx(), .a = nx() };` passed through as a C
+             * compound literal, whose initializer order C leaves UNSPECIFIED —
+             * GCC evaluated `.a` first, so s.b == 2, s.a == 1, while the same
+             * literal as a var-decl init, a call argument or a return value was
+             * decomposed left to right (s.b == 1). Decompose it here too when the
+             * order can be observed: two or more fields and some field with an
+             * effect. */
+            bool rhs_si_order = rhs && rhs->kind == NODE_STRUCT_INIT &&
+                rhs->struct_init.field_count >= 2 && lower_may_write(rhs);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order) goto passthrough;
+            plain_sc = rhs_sc;
         }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
          * passthrough emitter emits a simple compound assign with no nested

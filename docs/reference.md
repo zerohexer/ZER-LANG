@@ -1214,6 +1214,14 @@ void count() {
 static void helper() { }    // not exported
 ```
 
+**NOTES**
+- A static local is initialised ONCE, before the program runs, so its initializer
+  must be a compile-time constant — a literal, a `const`, an address of a global.
+  `static u32 b = l;` naming a local (or a call, or a mutable global) is refused
+  (BUG-1213); initialise it to a constant and assign on first use.
+- Globals may be used above their declaration (BUG-1214) — every top-level name is
+  visible to every function in the file.
+
 ---
 
 ## CONTROL FLOW
@@ -1350,12 +1358,14 @@ switch (ready) {
 - Union switch uses capture syntax: `.variant => |val| { ... }`
 - Mutable capture: `.variant => |*val| { val.field = 5; }`
 - Optional `?T` switch: `default => |*v| { ... }` capture
-  pattern works. `switch (v) { .red => ... }` works when inner is enum
-  or union. Dot-prefix arms on `?u32` / `?bool` (non-variant inner) are
-  rejected — use `if (x) |v| { ... } else { ... }` instead.
+  pattern works. `switch (v) { .red => ... }` works when inner is an
+  enum. Dot-prefix arms on `?u32` / `?bool` (non-variant inner) are
+  rejected — use `if (x) |v| { ... } else { ... }` instead. So are
+  variant arms on a `?Union` (BUG-1203 — they used to reach GCC as
+  undeclared names): unwrap first, `if (x) |u| { switch (u) { ... } }`.
 - An arm body may be a single expression terminated by a comma instead of a
   `{ }` block: `0 => note(),`.
-- Switching on a `?Enum` / `?Union` with enum-dot arms is allowed; when the
+- Switching on a `?Enum` with enum-dot arms is allowed; when the
   optional is **null, no arm runs** and control continues after the switch.
 
 ```zer
@@ -4642,6 +4652,21 @@ comptime f64 DEG_TO_RAD(f64 deg) { return deg * 3.14159 / 180.0; }
 static_assert(Color.red == 0, "red is 0");
 ```
 
+**What the fold guarantees (2026-09-24).** An INTEGER comptime function is
+interpreted: locals, loops, `if`, `switch`, `break`/`continue`. Its answer is the
+answer the same function gives at run time — every operation wraps at its type's
+width, a `u64` above `2^63` divides, shifts and compares as unsigned (BUG-1207), a
+`switch` compares in the subject's type (`-1 =>` on an `i32`, BUG-1208), a block
+declaration shadows (`u32 x` inside `{ }` is a new `x`, BUG-1206), and an operation
+the run time would TRAP on (division by zero, signed `MIN / -1`) is a compile error
+rather than a constant. A STRUCT or FLOAT comptime result is folded from a single
+`return <expr>;` — a body with any other shape is refused (BUG-1204; it used to take
+the first `return` it found), and an `f32` result is rounded at every operation, as
+the emitted `f32` code is (BUG-1205).
+
+A `const`'s value is its initializer wrapped to its declared type, everywhere it is
+used — `const u8 S3 = 200 + 200;` is 144, and `u8[S3]` has 144 elements (BUG-1209).
+
 ---
 
 ### Designated Initializers
@@ -4658,6 +4683,10 @@ p = { .x = 100, .y = 200 };
 func({ .x = 1, .y = 2 });
 Point make() { return { .x = 0, .y = 0 }; }
 ```
+
+Field values are evaluated LEFT TO RIGHT in source order, in every one of those
+positions (BUG-1210: an assignment `s = { .b = f(), .a = f() };` used to leave the
+order to C, which does not define it).
 
 **NOTES**
 - An omitted field auto-zeroes — so a field whose zero is FORBIDDEN must be named. A

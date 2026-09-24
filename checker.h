@@ -360,6 +360,7 @@ typedef struct {
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
+    bool gi_static_local;  /* BUG-1213: global_init_scan is checking a STATIC LOCAL's initializer — a function-local name is not a constant */
     struct IsrGlobal {
         const char *name;
         uint32_t name_len;

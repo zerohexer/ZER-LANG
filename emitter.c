@@ -2001,7 +2001,27 @@ static bool callee_is_direct_function(Emitter *e, Node *callee) {
     if (!e->checker) return false;
     Symbol *s = scope_lookup(e->checker->global_scope, callee->ident.name,
                              (uint32_t)callee->ident.name_len);
-    return s && s->is_function;
+    if (s && s->is_function) return true;
+    /* BUG-1211: a module's `static` function is registered only under its
+     * mangled key `<module>__<name>`, so the raw lookup missed it and a plain
+     * call to it was wrapped in the funcptr null guard —
+     * `__typeof__(m__helper) _zer_fp0 = m__helper;` declares a FUNCTION, and GCC
+     * refuses to initialise one ("initialized like a variable"). */
+    if (e->current_module) {
+        uint32_t nl = (uint32_t)callee->ident.name_len;
+        uint32_t mkl = e->current_module_len + 2 + nl;
+        char *mk = (char *)arena_alloc(e->arena, mkl + 1);
+        if (mk) {
+            memcpy(mk, e->current_module, e->current_module_len);
+            mk[e->current_module_len] = '_';
+            mk[e->current_module_len + 1] = '_';
+            memcpy(mk + e->current_module_len + 2, callee->ident.name, nl);
+            mk[mkl] = '\0';
+            Symbol *ms = scope_lookup_local(e->checker->global_scope, mk, mkl);
+            if (ms && ms->is_function) return true;
+        }
+    }
+    return false;
 }
 
 /* Is this call an INDIRECT call through a non-optional function pointer?
@@ -7624,12 +7644,23 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);
 
-    /* Pass 2: emit everything else (functions, globals, etc.) */
+    /* Pass 2a: every GLOBAL variable, before any function body. BUG-1214: ZER
+     * lets a function use a global declared further down the file (the checker
+     * registers every top-level name first), and the emitter wrote globals in
+     * source order — `u32 use() { return later; } u32 later = 5;` reached GCC as
+     * "'later' undeclared". A global's initializer can name only functions
+     * (prototyped above) and other globals (their relative order is kept). */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind == NODE_GLOBAL_VAR)
+            emit_top_level_decl(e, d, file_node, i);
+    }
+    /* Pass 2b: everything else (functions, interrupts, ...) */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
             d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
-            d->kind != NODE_CONTAINER_DECL)
+            d->kind != NODE_CONTAINER_DECL && d->kind != NODE_GLOBAL_VAR)
             emit_top_level_decl(e, d, file_node, i);
     }
 }

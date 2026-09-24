@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-24b — BUG-1194..1202: bare-metal and module holes (an audit agent's batch, each re-measured)
+## Session 2026-09-24b — BUG-1194..1214: bare-metal and module holes (an audit agent's batch, each re-measured)
 
 **Method.** Every negative below COMPILED on the from-HEAD baseline (`5b63c9b8`) and is refused
 now, for the reason its `// expect-error:` names; the positive FAILED on the baseline. Corpus
@@ -108,6 +108,96 @@ bound was not asked: `for (u32 i = 0; i < 8; i += 1) { r[i] = 0xAA; }` over a 4-
 window warned, and the guard returned from `main` before `done = 1` (exit 0, not 7). The
 certainty test is now ONE predicate (`cert_loop_index_reaches`) asked by both the array and
 the mmio bound. Test: `mmio_counted_loop_past_window_bug1202`.
+
+### BUG-1203 — `switch` on a `?Union` with variant arms reached GCC
+Gap 40 admitted dot arms when an optional's inner type is an enum OR a union, but only `?Enum`
+has a lowering (null matches no arm). A `?Union` subject emitted its arm names as bare C
+identifiers (`'n' undeclared`), and reference.md documented it as working. Refused now with the
+unwrap idiom. Test: `switch_optional_union_arms_bug1203`.
+
+### BUG-1204 — struct / float comptime results were folded from the FIRST `return`
+The integer path interprets the body; the struct and float paths only fold one return
+expression, and `find_comptime_return_expr` returned the first one it met (then-branch first),
+ignoring conditions, loops and preceding statements. `comptime In MK(u32 x){ if (x > 2) {
+return {.a=1}; } return {.a=2}; }` gave `.a = 1` for `MK(1)`; `comptime f64 D(f64 x){ if (x >
+1.0) { return 1.0; } return 2.0; }` gave 1.0 for `D(0.5)`. The finder now answers only for a body
+that IS one `return <expr>;`, and anything else is refused with a sentence that says so.
+Measured corpus cost: zero — every struct/float comptime function in the tree is that shape.
+Tests: `comptime_struct_first_return_bug1204`, `comptime_float_first_return_bug1204`.
+
+### BUG-1205 — an f32 comptime result was computed in double
+`comptime f32 H(f32 x){ return x + 1.0e8 - 1.0e8; }` folded 1.0 for `H(1.0)`; the emitted f32
+code gives 0.0. The float folder rounds every leaf and operation result to float when the result
+type is f32. Test: `tests/zer/comptime_f32_rounding_bug1205.zer`.
+
+### BUG-1206 — comptime declarations did not shadow
+A declaration went through update-or-add, so `u32 x = 1; { u32 x = 2; x += n; } return x;`
+rewrote the outer `x` (folded 3, runs 1) and a declaration inside a branch leaked out; `u32 x;`
+with no initializer was skipped outright (a later `x += n` wrote an outer `x`); a for-loop's
+init updated an outer same-named variable and outlived the loop; and assigning a name with no
+binding invented one. Declarations now always append (`ct_ctx_declare_w`), every lookup and
+update searches newest-first, the loop variable is popped after the loop, and an unbound
+assignment fails the fold. Test: `tests/zer/comptime_shadowing_bug1206.zer`.
+
+### BUG-1207 — comptime u64 above 2^63, and signed MIN / -1
+The fold runs in int64, so a `u64` above INT64_MAX was negative and `/`, `%`, `>>` and the
+comparisons (and `/=`, `%=`, `>>=`) answered as signed — `H(1e19) = 1e19 / 3` and `a > 5` were
+wrong. They use unsigned arithmetic when the operand width is an unsigned 64. Signed `MIN / -1`
+(the emitted code TRAPS on it) folded `-2147483648` for i32; at i64 width it was undefined
+behaviour in the compiler's own process. It now fails the fold, loudly. Tests:
+`tests/zer/comptime_u64_unsigned_bug1207.zer`, `comptime_int_min_div_bug1207`.
+
+### BUG-1208 — a comptime `switch` compared arms in the literal's own typing
+An arm `-1 =>` on an `i32` subject folded `-1` in the literal's (unsigned) width, 0xFFFFFFFF,
+and never matched, so the fold took `default` while the runtime took the arm. Both sides are
+wrapped to the subject's width. Test: `tests/zer/comptime_switch_negative_arm_bug1208.zer`.
+
+### BUG-1209 — a const's value and a size expression ignored their declared type
+`resolve_const_ident` folded a const's initializer untyped: `const u8 S3 = SMALL + SMALL;` is
+144 (the emitted global), but `u8[S3] arr;` got 400 elements — a runtime `arr.len` of 400
+against a storage the programmer sized at 144. The same for a size EXPRESSION
+(`T[SMALL + SMALL]` in a container), and a `const u64 BIG = 1e19; comptime if (BIG > 5)` took
+the else branch. The const's value is wrapped to its type; `eval_decl_size_expr` wraps to the
+size expression's checked type; the scoped fold uses unsigned operators for a u64 operand.
+Test: `tests/zer/const_typed_wrap_sizes_bug1209.zer`.
+
+### BUG-1210 — an ASSIGNED struct literal left its field order to C
+`s = { .b = nx(), .a = nx() };` passed through as a C compound literal, whose initializer order
+C leaves unspecified — GCC ran `.a` first. A var-decl init, a call argument and a return value
+were already decomposed left to right. An assignment whose literal has two or more fields and an
+effect now takes the same `IR_STRUCT_INIT_DECOMP` path. Test:
+`tests/zer/struct_literal_assign_order_bug1210.zer`.
+
+### BUG-1211 — a call to a module's `static` function did not compile
+Two defects, one shape. The EMITTER's direct-call test (`callee_is_direct_function`) looked the
+name up raw in the global scope, where a module static exists only under `<module>__<name>`, so a
+plain call was wrapped in the BUG-1019 funcptr null guard — `__typeof__(m__helper) _zer_fp0 =
+m__helper;` declares a FUNCTION and GCC refused to initialise it. And the STACK analysis built
+every frame from main's context, so the same callee resolved to nothing and was "a call through
+a function pointer with unknown target": a spurious warning, and under `--stack-limit` a hard
+rejection of main's whole call chain. The emitter also tries the current module's mangled key;
+`check_stack_depth_files` enters each file's module. Test: `test_modules/m1211_stack.zer`
+(builds an executable under `--stack-limit`).
+
+### BUG-1212 — `volatile ?*T` shared with an ISR or a thread was refused as not single-word
+A `?*T` is a null-sentinel pointer, emitted as a plain C pointer — one word, like `*T`. The
+single-word volatile exemption (`volatile_global_exempt_from_race_check`) admitted `TYPE_POINTER`
+only, so the published-pointer idiom was refused at both sinks. Volatile grid shape
+`optional-pointer ?*T` in `tests/test_hw_matrix.c` (both sites fail on the pre-change compiler).
+
+### BUG-1213 — a `static` local with a non-constant initializer reached GCC
+`static u32 b = l;` (a local) is set once, before the program runs; C requires a constant and
+GCC reported "initializer element is not constant" against the generated file. The local
+declaration now runs the global-initializer scan (`global_init_scan`), whose identifier arm also
+refuses a function-local name while `Checker.gi_static_local` is set. Test:
+`static_local_nonconst_init_bug1213`.
+
+### BUG-1214 — a global used before its declaration did not compile
+The checker registers every top-level name first, so `u32 use() { return later; } u32 later =
+5;` is valid ZER; the emitter wrote globals in source order after the prototypes, and GCC said
+`'later' undeclared`. Pass 2 of `emit_file_module` now emits every global before any function
+body (a global's initializer can name only prototyped functions and other globals, whose order
+is kept). Test: `tests/zer/global_used_before_decl_bug1214.zer`.
 
 ---
 

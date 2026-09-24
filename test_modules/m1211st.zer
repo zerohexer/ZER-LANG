@@ -1,0 +1,3 @@
+// BUG-1211: a module static helper, called by an exported function.
+static u32 m1211_helper() { return 11; }
+u32 m1211_use() { u32 x = m1211_helper(); return x; }

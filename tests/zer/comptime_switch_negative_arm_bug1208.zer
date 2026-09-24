@@ -1,0 +1,9 @@
+// BUG-1208: a comptime switch compares in the SUBJECT's width. The arm literal `-1`
+// folded as 0xFFFFFFFF and never matched an i32 -1, so the fold took `default`.
+comptime i32 NEGSW(i32 k) { switch (k) { -1 => { return 1; } default => { return 2; } } }
+i32 negsw(i32 k) { switch (k) { -1 => { return 1; } default => { return 2; } } }
+u32 main() {
+    if (negsw(-1) != 1) { return 2; }
+    if (NEGSW(-1) != 1) { return 1; }
+    return 0;
+}

@@ -85,6 +85,11 @@ expect_err m1200_qual_negative "a qualified reference to the SECOND declaration"
 expect_err m1200_ambig_negative "'M1200Pt' is declared by more than one imported module"
 expect_err m1200_ambig_negative "'m1200_get' is declared by more than one imported module"
 
+# BUG-1211: a module's static callee is resolved in its module by the stack analysis.
+out=$($ZERC m1211_stack.zer --stack-limit 4096 -o /dev/null 2>&1)
+if [ $? -eq 0 ] && ! echo "$out" | grep -q "unknown target"; then PASS=$((PASS+1));
+else echo "  FAIL: m1211_stack (static module callee treated as an unknown funcptr)"; echo "$out" | head -2; FAIL=$((FAIL+1)); fi
+
 # BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
 $ZERC use_hal.zer -o _use_hal.c 2>/dev/null
 if [ $? -eq 0 ] && grep -q "USART1_IRQHandler" _use_hal.c; then

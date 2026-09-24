@@ -1,0 +1,20 @@
+// BUG-1207: a u64 value above INT64_MAX folded as a NEGATIVE int64, so / % >> and
+// the comparisons disagreed with the runtime.
+comptime u64 H(u64 a) { return a / 3; }
+u64 h(u64 a) { return a / 3; }
+comptime u64 M(u64 a) { return a % 10; }
+u64 m(u64 a) { return a % 10; }
+comptime bool G(u64 a) { return a > 5; }
+comptime u64 SR(u64 a) { return a >> 1; }
+u64 sr(u64 a) { return a >> 1; }
+comptime u64 DV(u64 a) { u64 x = a; x /= 5; return x; }
+u64 dv(u64 a) { u64 x = a; x /= 5; return x; }
+u32 main() {
+    u64 v = 10000000000000000000;
+    if (H(10000000000000000000) != h(v)) { return 1; }
+    if (M(10000000000000000000) != m(v)) { return 2; }
+    if (!G(10000000000000000000)) { return 3; }
+    if (SR(10000000000000000000) != sr(v)) { return 4; }
+    if (DV(10000000000000000000) != dv(v)) { return 5; }
+    return 0;
+}

@@ -108,6 +108,12 @@ typedef struct {
     void (*ir_hook)(void *ctx, void *ir_func);
     void *ir_hook_ctx;
 
+    /* BUG-1238: async functions lowered EARLY so their state structs are
+     * defined before anything that names the task type (IRFunc*, as void*). */
+    void **early_async_ir;
+    int early_async_count;
+    int early_async_cap;
+
     /* The IRFunc whose body is currently being emitted (actually IRFunc*, typed
      * void* to keep ir.h out of emitter.h). Set at emit_regular/async_func_from_ir
      * entry, cleared at exit. Lets a mid-body conditional early-exit (auto-guard

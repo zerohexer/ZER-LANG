@@ -5,6 +5,99 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24d — BUG-1231..1244: the async batch (an audit agent's findings, each re-measured)
+
+**Method.** The ag5 async audit ran ~120 probes against a frozen compiler, each async hole
+paired with its NON-async control. Every negative below COMPILED on the from-HEAD baseline
+(`f744f3b3`) and is refused now for the reason its `// expect-error:` names; every positive
+failed (GCC error or false leak) on it. Sink matrix shape p40 is new: its seven reject cells are
+HOLES on the baseline, and `p40_safe_task_owns` was an over-rejection there.
+
+### BUG-1231 — `_init` did not keep its pointer arguments
+A task STORES every `_init` argument, but `_init` has no body, so keep inference saw nothing: a
+helper could init the CALLER's task with `&helper_local`, and the next poll wrote into a dead
+frame (ASan stack-use-after-return). The call site now records its keep edges against a
+signature chosen per call (`async_init_keep_sig`): a task in THIS frame uses the async
+function's own inferred keeps (so a body that stores its param to a global still rejects
+`&local`); any other task makes every pointer-CARRYING argument keep (an array param is copied
+by value).
+
+### BUG-1232 — a suspend was not a barrier
+`g = a; yield; a.v` and `ar.alloc(...); yield; b.v` were accepted while the poller freed / reset
+between polls (measured: returned the recycled object's 77). `yield` and every `await` now apply
+`ir_suspend_barrier`: global-rooted and escaped allocations (with their alias groups), and
+arena allocations when some function resets a non-local arena, become MAYBE_FREED.
+
+### BUG-1233 — the caller's tracker did not see what a task holds
+`_init(&t, p)` records `t.<param>` as a CARRIED entry of `p`'s allocation, so `free(p); poll(&t)`
+is the BUG-1225 carrier error. `_poll(&t)` applies the async body's free summary: a param the
+body may free leaves the task and every alias becomes MAYBE_FREED + escaped (the task owns the
+free) — `p.v` / `free(p)` after the task are refused, and simply dropping `p` is clean (it was a
+false leak before).
+
+### BUG-1234 — `|*v|` union capture held across `yield` / `await`
+The BUG-1186 callee rule's missing sibling: the poller may switch the variant between polls, and
+the stale writes forged the other variant's pointer (main's write landed in an unrelated global).
+Refused.
+
+### BUG-1235 — a task copied through a dereference
+`value_is_existing_resource` classified every NODE_UNARY as a fresh value, so `b = *pa` copied a
+live task (and would an Arena / Barrier). A `*` names the pointee now.
+
+### BUG-1236 — whole-program scans stopped at `_poll`
+The spawn race scan, the atomic-cell rule, the ISR volatile rule and the ISR allocation ban all
+descend a callee through `func_node`, which the synthetic `_poll` symbol did not have. It now
+points at the async declaration (a poll runs the body); `_init` does not (it runs none of it).
+
+### BUG-1237 — `_result` read before done forged a value
+For a non-null pointer or an enum without a 0 variant, the zeroed field is not a value of the
+type. The accessor traps before done for exactly those types.
+
+### BUG-1238 — the task type was incomplete wherever it was used before its async function
+The state struct was emitted with the async function (source order), so a GLOBAL task, a task in
+a function above the async one (local or static), and `_init` / `_poll` called from there were
+GCC errors. The async functions are now lowered early (once — the IR is reused), their structs
+defined in dependency order before any global or function, with `_init` / `_poll` prototypes. A
+task as a struct / union FIELD, a slice element or a heap allocation is refused with a
+diagnostic (those need the struct orders interleaved — limitations.md).
+
+### BUG-1239 — an array parameter of an async function
+`_init` emitted `self->a = a` (not C). It copies with `memcpy`.
+
+### BUG-1240 — `@once` in an async body
+The once flag was declared only on the regular-function path (GCC: undeclared). Declared on the
+async path too. A `yield` / `await` INSIDE `@once` is refused: a second task reaching it would
+wait forever for the suspended winner.
+
+### BUG-1241 — a callee storing one pointer parameter into another's field (not async)
+`void init(*S s, *Box b) { s.b = b; }` then `free(p); poll(&t)` read the recycled object.
+`FuncSummary.param_store` (direct `param.f = param` stores) makes the call site record the
+argument as CARRIED by the destination argument, so the BUG-1225 carrier rule sees it.
+
+### BUG-1242 — a capture of a global pointer, then a callee freeing the global (not async)
+`if (gb) |b| { release(); b.v = 99; }` — BUG-1181 widens only an entry the caller has, and the
+global was filled in another function. A read of a global pointer now mints the global's entry
+(escaped) and aliases the reading local to it.
+
+### BUG-1243 — a task polled inside a HELPER
+BUG-1233 applied the body's free summary at a DIRECT `_poll(&t)` only; `drive(&t)` polling it
+ran the body with nothing applied, so the caller's pointer stayed ALIVE after the body freed it.
+`FuncSummary.polls` records "polls the task param j points at" (directly, or through a callee's
+own poll facts — transitive by the summary fixpoint), and the call site replays the poll step
+on the argument's carried entries.
+
+### BUG-1244 — every shadow in an async body was refused as "shadows function parameter"
+The BUG-499 ban (a param and a same-named local share one state-struct field) looked the name
+up in ANY scope, so an inner block's `u32 x` over an outer local `x`, or a local named like a
+global, was refused with the param sentence. IR lowering gives same-named locals distinct
+fields (measured: nested and loop shadows keep their own values across yields); the ban now
+applies to a parameter's name only.
+
+Tests: `tests/zer_fail/*_bug123[1-9].zer`, `*_bug124[0-3].zer`; `tests/zer/*_bug123[1-9].zer`,
+`*_bug124[0134].zer`; `tests/zer_trap/async_result_before_done_bug1237.zer`; sink matrix p40.
+
+---
+
 ## Session 2026-09-24c — BUG-1221..1230: a fresh audit round (async, allocation tracker, arithmetic) — the non-async findings
 
 **Method.** Three read-only agents probed against a frozen compiler; every finding below was

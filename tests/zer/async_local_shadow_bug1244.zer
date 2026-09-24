@@ -1,0 +1,19 @@
+// BUG-1244 positive: block-local and global shadows in an async body keep their own values across yields.
+u32 x;
+async u32 f(u32 a) {
+    u32 s = 0;
+    for (u32 i = 0; i < 2; i += 1) {
+        u32 x = a + i;
+        yield;
+        { u32 x = 100; yield; s += x; }
+        s += x;
+    }
+    return s;
+}
+u32 main() {
+    x = 7;
+    _zer_async_f t; _zer_async_f_init(&t, 3);
+    while (_zer_async_f_poll(&t) == 0) { }
+    if (x != 7) { return 1; }
+    return _zer_async_f_result(&t) - 207;
+}

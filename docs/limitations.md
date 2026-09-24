@@ -134,6 +134,38 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
+## OPEN — async residuals of BUG-1231..1244 (2026-09-24d; LOW — over-rejection / leak-silent)
+
+- **A global task must be declared BELOW its async function** — the global's type is resolved at
+  registration, before a later async declaration has introduced `_zer_async_NAME`. Over-rejection
+  ("undefined type"); a local task is fine anywhere (BUG-1238 emits every state struct early).
+- **A task cannot be a struct / union field, a slice element or a heap allocation** (BUG-1238,
+  rejected). A struct is defined before any async state struct; interleaving the two orders
+  would lift it. Hold a `*_zer_async_NAME`.
+- **`_init` keep is per call, not per lifetime** (BUG-1231). A task reached through a pointer
+  makes every pointer argument `keep`, even when the task provably finishes before the frame
+  returns; a helper that forwards its own pointer parameter into such an `_init` makes that
+  parameter keep, so its caller cannot pass `&local`. Init the task where it is declared.
+- **A suspend widens every escaped / global-reachable allocation** (BUG-1232), whether or not
+  any code could actually free it between polls. Copy what you need into a local before the
+  `yield`, or re-read the global after it.
+- **A task that frees its parameter owns it** (BUG-1233): once polled, the caller's entry is
+  escaped, so a task abandoned before it reaches the free leaks silently.
+- **BUG-1241 is syntactic**: only a DIRECT `param.f.g = param` store in the callee is summarised.
+  A store through a local copy (`*T x = b; s.b = x;`) or through a further helper is not, and
+  the carried pointer is then invisible to the carrier rule.
+- **BUG-1242 sees a DIRECT read of the global** (`gb`, `gb.p`, `gb orelse …`); a read through a
+  local pointer to the global's slot is not minted.
+- **`await gs.flag == 1` on a `shared struct` is refused** ("lock would be held across
+  suspension"). The condition is evaluated inside ONE poll, so a lock around just the
+  condition would be sound; the emitter does not lock an await condition yet, so the ban
+  (BH-18 #9) stays. Spell it as a loop that re-reads the field in its own statement:
+  `while (true) { u32 f = gs.flag; if (f == 1) { break; } yield; }`.
+- **The `_result` early-read trap reports a line of the generated C**, not the `.zer` call site
+  (the accessor is a C inline function).
+
+---
+
 ## OPEN — allocation-tracker residuals of the 2026-09-24c round (LOW — leak-silent / wrong reason)
 
 - **A factory-returned struct's allocations are not leak-checked.** `S mk(){ S r; r.p =

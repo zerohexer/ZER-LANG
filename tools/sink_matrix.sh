@@ -848,6 +848,25 @@ cell p39_safe_reset        compile "$P39"' u32 rd39(*O39 h){ if (h.p) |q| { retu
 cell p39_safe_base_view    compile "$P39"' u32 main(){ [*]T39 s = alloc(T39, 4) orelse return; [*]T39 t = s[0..4]; free(t); return 0; }'
 cell p39_safe_move_done    compile "$P39"' move struct M39{*T39 p;} void eat39(M39 m){ free(m.p); } u32 main(){ *T39 a = alloc(T39) orelse return; M39 m = { .p = a }; eat39(m); return 0; }'
 
+# SHAPE p40 (BUG-1231..1233, 1241, 1242): an allocation or a frame pointer reaching
+# a sink THROUGH AN ASYNC TASK or a callee store — the task keeps every `_init`
+# argument, a poll runs the body, and a suspend lets the poller run anything.
+echo "===== SHAPE p40 = async task / callee-store carrier (carrier x sink) ====="
+P40='struct T40{u32 v;} struct S40{?*T40 b;} ?*T40 g40;'
+cell p40_init_callers_task  reject "$P40"' async void f40(*u32 p){ yield; *p = 1; } void st40(*_zer_async_f40 t){ u32 x = 5; _zer_async_f40_init(t, &x); } u32 main(){ _zer_async_f40 t; st40(&t); _zer_async_f40_poll(&t); return 0; }'
+cell p40_body_stores_param  reject "$P40"' ?*u32 gp40; async void f40(*u32 p){ gp40 = p; yield; } void st40(){ u32 x = 5; _zer_async_f40 t; _zer_async_f40_init(&t, &x); _zer_async_f40_poll(&t); } u32 main(){ st40(); return 0; }'
+cell p40_free_between_polls reject "$P40"' async u32 f40(*T40 b){ yield; return b.v; } u32 main(){ *T40 p = alloc(T40) orelse return; _zer_async_f40 t; _zer_async_f40_init(&t, p); _zer_async_f40_poll(&t); free(p); _zer_async_f40_poll(&t); return 0; }'
+cell p40_body_frees_param   reject "$P40"' async void f40(*T40 b){ yield; free(b); } u32 main(){ *T40 p = alloc(T40) orelse return; _zer_async_f40 t; _zer_async_f40_init(&t, p); while (_zer_async_f40_poll(&t) == 0) { } free(p); return 0; }'
+cell p40_yield_global_alias reject "$P40"' async u32 f40(){ *T40 a = alloc(T40) orelse return; g40 = a; yield; return a.v; } u32 main(){ return 0; }'
+cell p40_callee_stores      reject "$P40"' void in40(*S40 s, *T40 b){ s.b = b; } void rd40(*S40 s){ if (s.b) |b| { b.v = 1; } } u32 main(){ *T40 p = alloc(T40) orelse return; S40 t; in40(&t, p); free(p); rd40(&t); return 0; }'
+cell p40_helper_poll_frees  reject "$P40"' async void f40(*T40 b){ yield; free(b); } void dr40(*_zer_async_f40 t){ while (_zer_async_f40_poll(t) == 0) { } } u32 main(){ *T40 p = alloc(T40) orelse return; _zer_async_f40 t; _zer_async_f40_init(&t, p); dr40(&t); return p.v; }'
+cell p40_global_capture     reject "$P40"' void rel40(){ if (g40) |b| { free(b); } g40 = null; } void f40(){ if (g40) |b| { rel40(); b.v = 9; } } u32 main(){ g40 = alloc(T40); f40(); return 0; }'
+# BOUNDARY: a task in this frame may hold this frame's pointers; a task that frees
+# its param owns it; a carried field reset after the free is clean.
+cell p40_safe_frame_task    compile "$P40"' async void f40(*u32 p){ yield; *p = 1; } u32 main(){ u32 x = 5; _zer_async_f40 t; _zer_async_f40_init(&t, &x); while (_zer_async_f40_poll(&t) == 0) { } return 0; }'
+cell p40_safe_task_owns     compile "$P40"' async void f40(*T40 b){ yield; free(b); } u32 main(){ *T40 p = alloc(T40) orelse return; _zer_async_f40 t; _zer_async_f40_init(&t, p); while (_zer_async_f40_poll(&t) == 0) { } return 0; }'
+cell p40_safe_store_reset   compile "$P40"' void in40(*S40 s, *T40 b){ s.b = b; } void rd40(*S40 s){ if (s.b) |b| { b.v = 1; } } u32 main(){ *T40 p = alloc(T40) orelse return; S40 t; in40(&t, p); free(p); t.b = null; rd40(&t); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

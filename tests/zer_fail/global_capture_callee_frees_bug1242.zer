@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: 'b' is maybe-freed
+struct Box { u32 v; }
+?*Box gb;
+void release() { if (gb) |b| { free(b); } gb = null; }
+void f() {
+    if (gb) |b| { release(); b.v = 99; }
+}
+u32 main() {
+    gb = alloc(Box);
+    f();
+    return 0;
+}

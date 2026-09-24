@@ -409,6 +409,8 @@ static const char *global_init_node_reason(Node *n, Type *type) {
  * `u32 x = m + 1;` and `S s = { .f = m };` reached GCC as "initializer element is
  * not constant" against the generated file). */
 static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t name_len);
+static void check_suspend_in_union_capture(Checker *c, Node *node, const char *what);
+static void check_suspend_in_once(Checker *c, Node *node, const char *what);
 static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, Node **bad) {
     if (!n) return NULL;
     /* BUG-1016: NULL past the cap read as "nothing offending", so a call hidden 200
@@ -1958,6 +1960,18 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  * "declare it where both sides can see it, conventionally a global". The verdict
  * (reject) is right; the SENTENCE was wrong, and a wrong diagnostic is worse than the
  * permissive answer it replaced. The reporter now says what actually happened. */
+/* BUG-1238: is this an async task's state type (or an array of them)? */
+static bool type_is_async_task(Type *t) {
+    for (int d = 0; t && d < 64; d++) {
+        Type *u = type_unwrap_distinct(t);
+        if (!u) return false;
+        TypeKind k = type_dispatch_kind(u);
+        if (k == TYPE_ARRAY) { t = u->array.inner; continue; }
+        return k == TYPE_STRUCT && u->struct_type.is_async_state;
+    }
+    return true;
+}
+
 static const char _res_walk_stopped[] = "<walk stopped>";
 
 /* BUG-1177: an async function's STATE (`_zer_async_NAME`) is a unique resource
@@ -2032,6 +2046,13 @@ static bool value_is_existing_resource(Node *v, int depth) {
     case NODE_FIELD: return value_is_existing_resource(v->field.object, depth + 1);
     case NODE_INDEX: return value_is_existing_resource(v->index_expr.object, depth + 1);
     case NODE_SLICE: return value_is_existing_resource(v->slice.object, depth + 1);
+    /* BUG-1235: a DEREFERENCE names the object the pointer points at —
+     * `_zer_async_f b = *pa;` and `*out = *pa;` copied a live task (and
+     * `Arena b = *pa;` an arena) exactly like `b = a`. Only `*` names; the other
+     * unary operators compute a new value. */
+    case NODE_UNARY:
+        if (v->unary.op == TOK_STAR) return true;
+        return false;
     /* A JOIN: either arm can hand over an existing one. */
     case NODE_ORELSE:
         return value_is_existing_resource(v->orelse.expr, depth + 1) ||
@@ -2045,7 +2066,7 @@ static bool value_is_existing_resource(Node *v, int depth) {
      * omission. */
     case NODE_CALL: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
-    case NODE_UNARY: case NODE_ASSIGN: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_ASSIGN: case NODE_INTRINSIC: case NODE_CAST:
     case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return false;
 
@@ -3475,6 +3496,70 @@ static void record_keep_edge(Checker *c, Type *callee_sig, int param_index,
     e->caller_param_index = caller_param_index;
 }
 
+
+/* BUG-1231: an async function's state struct STORES every argument its
+ * `_zer_async_NAME_init` receives, so a pointer argument must live as long as the
+ * TASK, not as long as the call. `init` has no body for keep inference to read,
+ * so its keep facts are supplied here, per call:
+ *  - the task lives in THIS frame (`&t`, `&arr[i]`, `&s.t` with no pointer hop,
+ *    t a non-static local): the task dies with the frame, so a pointer into the
+ *    frame is fine — the only escape is what the async BODY does with its
+ *    param, i.e. the async function's OWN inferred keeps (param i-1);
+ *  - any other task (a `*_zer_async_NAME` param, a global, a static): it may
+ *    outlive this frame, so every pointer-carrying argument is keep.
+ * Measured: a helper that inits the caller's task with `&helper_local` read a
+ * dead frame on the next poll (ASan stack-use-after-return). */
+static bool async_init_task_in_frame(Checker *c, Node *arg0) {
+    if (!arg0 || arg0->kind != NODE_UNARY || arg0->unary.op != TOK_AMP) return false;
+    Node *n = arg0->unary.operand;
+    while (n && (n->kind == NODE_FIELD || n->kind == NODE_INDEX)) {
+        Node *obj = n->kind == NODE_FIELD ? n->field.object : n->index_expr.object;
+        Type *ot = checker_get_type(c, obj);
+        TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+        if (ok != TYPE_STRUCT && ok != TYPE_ARRAY) return false;   /* a pointer / slice hop */
+        n = obj;
+    }
+    if (!n || n->kind != NODE_IDENT) return false;
+    Symbol *s = scope_lookup(c->current_scope, n->ident.name, (uint32_t)n->ident.name_len);
+    if (!s || s->is_static || s->is_function) return false;
+    if (global_decl_lookup(c, s->name, s->name_len) == s) return false;
+    if (!c->current_func_sig) return false;                         /* a global init */
+    TypeKind sk = type_dispatch_kind(s->type);
+    return sk == TYPE_STRUCT || sk == TYPE_ARRAY;
+}
+
+/* Returns the signature the keep edges of an `_zer_async_NAME_init` call are
+ * recorded against, with *off set to the index shift; NULL when the callee is
+ * not an async init. */
+static Type *async_init_keep_sig(Checker *c, Node *call, Type *init_sig, int *off) {
+    *off = 0;
+    Node *cal = call->call.callee;
+    if (!cal || cal->kind != NODE_IDENT || call->call.arg_count < 1) return NULL;
+    const char *nm = cal->ident.name; size_t nl = cal->ident.name_len;
+    if (nl <= 16 || memcmp(nm, "_zer_async_", 11) != 0 ||
+        memcmp(nm + nl - 5, "_init", 5) != 0) return NULL;
+    Symbol *is = scope_lookup(c->current_scope, nm, (uint32_t)nl);
+    if (!is || !is->is_function || is->func_node) return NULL;      /* not the synthetic one */
+    Symbol *fs = global_decl_lookup(c, nm + 11, (uint32_t)(nl - 16));
+    Type *fsig = fs && fs->is_async ? type_unwrap_distinct(fs->type) : NULL;
+    if (fsig && type_dispatch_kind(fsig) == TYPE_FUNC_PTR &&
+        async_init_task_in_frame(c, call->call.args[0])) {
+        *off = 1;
+        return fsig;
+    }
+    Type *is_sig = type_unwrap_distinct(init_sig);
+    if (!is_sig || type_dispatch_kind(is_sig) != TYPE_FUNC_PTR) return NULL;
+    Type *k = (Type *)arena_alloc(c->arena, sizeof(Type));
+    *k = *is_sig;
+    k->func_ptr.param_keeps = (bool *)arena_alloc(c->arena,
+        (is_sig->func_ptr.param_count + 1) * sizeof(bool));
+    /* Only what CARRIES a pointer: an array param is copied into the task by
+     * value, a scalar is a scalar. */
+    for (uint32_t i = 0; i < is_sig->func_ptr.param_count; i++)
+        k->func_ptr.param_keeps[i] = i > 0 &&
+            type_carries_data_pointer(is_sig->func_ptr.params[i], 0);
+    return k;
+}
 
 /* keep inference (Site 1, transitivity): walk a call argument to its root ident
  * through address-of, deref, field, index, slice, orelse, intrinsic and cast.
@@ -7306,6 +7391,11 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (inner && type_unwrap_distinct(inner)->kind == TYPE_VOID) {
             checker_error(c, tn->loc.line,
                 "cannot create slice of void — void has no size");
+        }
+        if (inner && type_is_async_task(inner)) {                          /* BUG-1238 */
+            checker_error(c, tn->loc.line,
+                "cannot form a slice of async tasks — use an array of tasks, and pass "
+                "each one as '*_zer_async_...'");
         }
         return type_slice(c->arena, inner);
     }
@@ -12220,6 +12310,15 @@ static Type *check_expr(Checker *c, Node *node) {
             Node *type_arg = node->call.args[0];
             Type *elem = alloc_resolve_elem_type(c, type_arg->ident.name,
                 (uint32_t)type_arg->ident.name_len);
+            /* BUG-1238: a heap task — the allocator sizes the state struct
+             * before it is defined. A task lives in a local, a static or a global. */
+            if (elem && type_is_async_task(elem)) {
+                checker_error(c, node->loc.line,
+                    "cannot heap-allocate an async task — declare it as a local, a "
+                    "static local or a global and pass '*_zer_async_...'");
+                result = ty_void;
+                break;
+            }
             if (elem) {
                 if (node->call.arg_count == 1) {
                     if (type_dispatch_kind(elem) == TYPE_STRUCT) {
@@ -13271,8 +13370,11 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->call.callee->ident.name,
                         (uint32_t)node->call.callee->ident.name_len)->is_function);
                 {
+                    int ai_off = 0;
+                    Type *ai_sig = async_init_keep_sig(c, node, effective_callee, &ai_off);
                     for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
                          i < node->call.arg_count; i++) {
+                        if (ai_sig && i < ai_off) continue;   /* the task pointer itself */
                         /* keep inference (Site 1, deferred 2026-06-19): record a keep
                          * edge for every pointer-arg position. Enforcement + the
                          * transitive-escape fixpoint run in check_keep_inference after
@@ -13553,7 +13655,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         }
                         /* transitivity: does the arg trace to a non-keep caller param? */
                         int caller_root = keep_arg_caller_root(c, arg_node);
-                        record_keep_edge(c, effective_callee, i, is_fn_ptr_call,
+                        record_keep_edge(c, ai_sig ? ai_sig : effective_callee, i - ai_off,
+                                         is_fn_ptr_call,
                                          edge_vkind, edge_argname, edge_argname_len,
                                          i + 1, node->loc.line, c->current_func_sig, caller_root);
                     }
@@ -19954,8 +20057,18 @@ static void check_stmt(Checker *c, Node *node) {
          * (separate stack slots for param and local). */
         if (c->in_async && c->current_func_ret) {
             /* Walk parent scope chain to check if name matches a param */
-            Symbol *existing = scope_lookup(c->current_scope,
-                node->var_decl.name, (uint32_t)node->var_decl.name_len);
+            /* BUG-1244: only a PARAM shares its state-struct field with a
+             * same-named local. Every other shadow (an outer block local, a
+             * global) was refused with this param wording too, and IR lowering
+             * gives two same-named locals distinct fields. */
+            bool shadows_param = false;
+            Node *cf = c->current_func_node;
+            for (int pi = 0; cf && pi < cf->func_decl.param_count && !shadows_param; pi++)
+                shadows_param = cf->func_decl.params[pi].name_len == node->var_decl.name_len &&
+                    memcmp(cf->func_decl.params[pi].name, node->var_decl.name,
+                           node->var_decl.name_len) == 0;
+            Symbol *existing = shadows_param ? scope_lookup(c->current_scope,
+                node->var_decl.name, (uint32_t)node->var_decl.name_len) : NULL;
             if (existing && existing->line != (uint32_t)node->loc.line) {
                 checker_error(c, node->loc.line,
                     "variable '%.*s' shadows function parameter in async function — "
@@ -21713,10 +21826,30 @@ static void check_stmt(Checker *c, Node *node) {
                 Type *saved_ucap_type = c->union_ptr_capture_type;          /* BUG-1186 */
                 const char *saved_ucap_name = c->union_ptr_capture_name;
                 uint32_t saved_ucap_len = c->union_ptr_capture_name_len;
+                bool saved_ucap_priv = c->union_ptr_capture_task_private;
                 if (type_dispatch_kind(expr_eff) == TYPE_UNION && arm->capture_name && arm->capture_is_ptr) {
                     c->union_ptr_capture_type = expr_eff;
                     c->union_ptr_capture_name = arm->capture_name;
                     c->union_ptr_capture_name_len = (uint32_t)arm->capture_name_len;
+                    /* BUG-1234: a union that is a plain LOCAL of this function,
+                     * whose address is never formed anywhere in it, is reachable
+                     * by no one but this body — in an async function it lives in
+                     * the task, whose fields ZER cannot name. A suspend inside
+                     * the capture is then safe. */
+                    Node *sx = node->switch_stmt.expr;
+                    bool priv = false;
+                    if (sx && sx->kind == NODE_IDENT && c->current_func_node &&
+                        c->current_func_node->func_decl.body) {
+                        Symbol *ss = scope_lookup(c->current_scope, sx->ident.name,
+                                                  (uint32_t)sx->ident.name_len);
+                        priv = ss && !ss->is_static &&
+                               type_dispatch_kind(ss->type) == TYPE_UNION &&
+                               global_decl_lookup(c, ss->name, ss->name_len) != ss &&
+                               !ast_name_addr_taken(c->current_func_node->func_decl.body,
+                                                    sx->ident.name,
+                                                    (uint32_t)sx->ident.name_len);
+                    }
+                    c->union_ptr_capture_task_private = priv;
                 }
                 if (expr_eff->kind == TYPE_UNION) {
                     c->union_switch_type = expr;
@@ -21767,6 +21900,7 @@ static void check_stmt(Checker *c, Node *node) {
                 }
                 check_stmt_cond_body(c, arm->body);
                 c->union_ptr_capture_type = saved_ucap_type;                /* BUG-1186 */
+                c->union_ptr_capture_task_private = saved_ucap_priv;
                 c->union_ptr_capture_name = saved_ucap_name;
                 c->union_ptr_capture_name_len = saved_ucap_len;
                 c->union_switch_var = saved_union_var;
@@ -23911,6 +24045,8 @@ static void check_stmt(Checker *c, Node *node) {
          * any of them may write a global. `if (g < 4) { yield; arr[g] = 7; }`
          * kept g in [0,3] across the yield while main set g = 4 between polls. */
         vrp_widen_global_like(c);
+        check_suspend_in_union_capture(c, node, "yield");   /* BUG-1234 */
+        check_suspend_in_once(c, node, "yield");            /* BUG-1240 */
         break;
 
     case NODE_AWAIT: {
@@ -23923,6 +24059,8 @@ static void check_stmt(Checker *c, Node *node) {
         /* BUG-1096: the condition is re-evaluated after every suspension, and
          * the code after it runs after one — widen BEFORE checking it. */
         vrp_widen_global_like(c);
+        check_suspend_in_union_capture(c, node, "await");   /* BUG-1234 */
+        check_suspend_in_once(c, node, "await");            /* BUG-1240 */
         if (node->await_stmt.cond) {
             /* BH-18 #9 (copied from cool-johnson-t8vr3h): a bare `await cond;`
              * is a NODE_AWAIT, not a NODE_EXPR_STMT/NODE_VAR_DECL, so the
@@ -24925,6 +25063,14 @@ static void register_decl(Checker *c, Node *node) {
                     Type *inner = sf->type;
                     while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
                     inner = type_unwrap_distinct(inner);
+                    if (type_is_async_task(sf->type)) {                         /* BUG-1238 */
+                        checker_error(c, node->loc.line,
+                            "field '%.*s' of struct '%.*s' cannot hold an async task by value — "
+                            "a struct is defined before the task's state is known; hold a "
+                            "'*_zer_async_...' pointer to a task declared as a local or global",
+                            (int)sf->name_len, sf->name,
+                            (int)node->struct_decl.name_len, node->struct_decl.name);
+                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -25072,6 +25218,12 @@ static void register_decl(Checker *c, Node *node) {
                     Type *inner = sv->type;
                     while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
                     inner = type_unwrap_distinct(inner);
+                    if (type_is_async_task(sv->type)) {                         /* BUG-1238 */
+                        checker_error(c, node->loc.line,
+                            "union '%.*s' cannot hold an async task by value — hold a "
+                            "'*_zer_async_...' pointer instead",
+                            (int)node->union_decl.name_len, node->union_decl.name);
+                    }
                     if (inner == t) {
                         checker_error(c, node->loc.line,
                             "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
@@ -25216,6 +25368,14 @@ static void register_decl(Checker *c, Node *node) {
             memcpy(pname_copy, pname, plen + 1);
             Symbol *psym = add_symbol_internal(c, pname_copy, plen, poll_ft, node->loc.line);
             if (psym) psym->is_function = true;
+            /* BUG-1236: a POLL runs the async body — it is the one call through
+             * which the body executes. Every whole-program scan that descends a
+             * callee reads `func_node->func_decl.body` (spawn race scan, atomic
+             * cell, ISR volatile / alloc ban, union writers, stack depth, ...);
+             * with no func_node they all stopped at the poll, so moving a race or
+             * an ISR slab alloc into an async body hid it from every one of them.
+             * `_init` does NOT get one: it runs none of the body. */
+            if (psym) psym->func_node = node;
 
             /* BUG-863: register _zer_async_funcname_result for a NON-VOID async,
              * returning the function's own return type. Without it the value a
@@ -30493,6 +30653,41 @@ static void check_union_capture_calls(Checker *c) {
     c->file_name = sv_file;
     c->source = sv_src;
     c->ucc_count = 0;
+}
+
+/* BUG-1234: a `|*v|` union capture held across a SUSPEND. Between polls the
+ * poller runs, and it may assign a different variant of the union — BUG-1186's
+ * callee rule, whose "call" here is the whole rest of the program. Measured: an
+ * async body's stale `.a` writes after `main` switched the union to `.b` forged
+ * `.b.p`, and main's write through it landed in an unrelated global. A frame-
+ * local union whose address is never formed is exempt: only the task's own
+ * body can reach it (`async_switch_capture_yield`). */
+/* BUG-1240: a suspend inside `@once`. The winner holds the flag at
+ * "in progress" across the suspend, and a second task in the SAME thread that
+ * reaches the @once waits for "done" — which only the suspended winner can
+ * publish, and it cannot run until the waiter returns. A hang by construction
+ * (the ban-framework "needs runtime" case: only a scheduler could interleave). */
+static void check_suspend_in_once(Checker *c, Node *node, const char *what) {
+    if (!c->in_once) return;
+    checker_error(c, node->loc.line,
+        "cannot '%s' inside @once — another task reaching the same @once would wait "
+        "for this one to finish it, and this one cannot resume until that task "
+        "returns (a hang). Finish the @once body without suspending", what);
+}
+
+static void check_suspend_in_union_capture(Checker *c, Node *node, const char *what) {
+    if (!c->union_ptr_capture_type) return;
+    if (c->union_ptr_capture_task_private) return;   /* nobody else can reach it */
+    Type *u = c->union_ptr_capture_type;
+    checker_error(c, node->loc.line,
+        "cannot '%s' while '|*%.*s|' points into a variant of union '%.*s' — whoever "
+        "polls the task runs before it resumes and may assign a different variant, "
+        "leaving '%.*s' pointing at the bytes of that variant. Capture by value "
+        "('|%.*s|') and write the variant back after the switch, or suspend outside it",
+        what, (int)c->union_ptr_capture_name_len, c->union_ptr_capture_name,
+        (int)u->union_type.name_len, u->union_type.name,
+        (int)c->union_ptr_capture_name_len, c->union_ptr_capture_name,
+        (int)c->union_ptr_capture_name_len, c->union_ptr_capture_name);
 }
 
 void check_keep_inference(Checker *c) {

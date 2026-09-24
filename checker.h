@@ -135,6 +135,7 @@ typedef struct {
     Type *union_ptr_capture_type;
     const char *union_ptr_capture_name;
     uint32_t union_ptr_capture_name_len;
+    bool union_ptr_capture_task_private; /* BUG-1234: the switched union is a local no one else can reach */
     struct UnionCaptureCall {
         Node *call; Type *utype; const char *cap; uint32_t cap_len;
         int line; const char *file_name; const char *source;

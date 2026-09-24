@@ -1,0 +1,16 @@
+// expect-error: cannot satisfy 'keep' parameter
+?*u32 gp;
+async void f(*u32 p) { gp = p; yield; }
+void start() {
+    u32 x = 5;
+    _zer_async_f t;
+    _zer_async_f_init(&t, &x);
+    _zer_async_f_poll(&t);
+}
+u32 smash() { u32[16] buf; u32 s = 0; for (u32 i = 0; i < 16; i += 1) { buf[i] = i; } for (u32 i = 0; i < 16; i += 1) { s += buf[i]; } return s; }
+u32 main() {
+    start();
+    u32 s = smash();
+    if (gp) |p| { *p = 0x41414141; return *p; }
+    return 0;
+}

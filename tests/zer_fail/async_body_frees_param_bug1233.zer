@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: 'p' is maybe-freed
+// async body frees its pointer param; caller reads it afterwards (UAF), then frees (double free)
+struct Box { u32 v; }
+async void f(*Box b) { yield; free(b); }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    p.v = 3;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    while (_zer_async_f_poll(&t) == 0) { }
+    *Box q = alloc(Box) orelse { free(p); return 9; };
+    q.v = 77;
+    u32 r = p.v;       // 3 expected; 77 = reading q through the freed p
+    free(q);
+    free(p);
+    return r;
+}

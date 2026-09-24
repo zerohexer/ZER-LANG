@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: carries a freed pointer at 't.b'
+struct Box { u32 v; }
+struct S { ?*Box b; }
+void init(*S s, *Box b) { s.b = b; }
+void poll(*S s) { if (s.b) |b| { b.v = 99; } }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    S t;
+    init(&t, p);
+    free(p);
+    *Box q = alloc(Box) orelse return;
+    poll(&t);
+    u32 r = q.v;
+    free(q);
+    return r;
+}

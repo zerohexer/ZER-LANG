@@ -135,6 +135,22 @@ typedef struct {
         int param;
         bool must;
     } *ret_field;
+    /* BUG-1241: the callee stores param `src` into the field `path` of the
+     * object param `dst` points at / is (`void init(*S s, *Box b) { s.b = b; }`).
+     * The call site records the argument's allocation as CARRIED by the
+     * destination argument, so a free of it followed by handing that object to
+     * a call is the BUG-1225 carrier error. Syntactic (direct stores only). */
+    /* BUG-1243: the function POLLS the async task its param `param` points at
+     * (directly, or through a callee that does), running body `fn` (Node*). */
+    int polls_n;
+    struct ZcPolls { int param; void *fn; } *polls;
+    int param_store_n;
+    struct ZcParamStore {
+        int dst;
+        const char *path;
+        uint32_t plen;
+        int src;
+    } *param_store;
     /* BUG-1172: the function (or a callee, transitively) RESETS an arena that
      * is not its own local — a global arena, or one reached through a field.
      * A reset frees every arena allocation, so the CALLER's arena-coloured

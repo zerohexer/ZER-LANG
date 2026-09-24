@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: it is used with @atomic_* elsewhere
+u32 cnt;
+void worker() { for (u32 i = 0; i < 1000; i += 1) { @atomic_add(&cnt, 1); } }
+async void f() { while (true) { cnt += 1; yield; } }
+u32 main() {
+    _zer_async_f t; _zer_async_f_init(&t);
+    spawn worker();
+    for (u32 i = 0; i < 1000; i += 1) { _zer_async_f_poll(&t); }
+    return 0;
+}

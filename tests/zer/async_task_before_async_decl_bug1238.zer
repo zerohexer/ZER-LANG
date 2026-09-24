@@ -1,0 +1,7 @@
+// BUG-1238 positive: tasks (local and static) used above the async function
+u32 main();
+async void f();
+u32 run() { static _zer_async_f t; _zer_async_f_init(&t); _zer_async_f_poll(&t); return 0; }
+u32 run2() { _zer_async_f t; _zer_async_f_init(&t); _zer_async_f_poll(&t); return 0; }
+async void f() { yield; }
+u32 main() { return run() + run2(); }

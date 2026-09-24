@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot 'yield' inside @once
+u32 g;
+async void f() { @once { g += 1; yield; g += 10; } }
+u32 main() {
+    _zer_async_f a; _zer_async_f_init(&a);
+    _zer_async_f b; _zer_async_f_init(&b);
+    _zer_async_f_poll(&a);
+    _zer_async_f_poll(&b);
+    _zer_async_f_poll(&a);
+    _zer_async_f_poll(&b);
+    return g;
+}

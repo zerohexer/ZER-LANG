@@ -1,0 +1,4 @@
+// BUG-1238 positive: a GLOBAL task (state struct defined before globals)
+async void f() { yield; }
+_zer_async_f gt;
+u32 main() { _zer_async_f_init(&gt); _zer_async_f_poll(&gt); return 0; }

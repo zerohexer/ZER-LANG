@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot hold an async task by value
+async void f() { yield; }
+struct Sched { _zer_async_f a; u32 n; }
+u32 main() { Sched s; _zer_async_f_init(&s.a); _zer_async_f_poll(&s.a); return 0; }

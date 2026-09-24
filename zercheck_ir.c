@@ -5534,6 +5534,324 @@ static bool ir_call_is_indirect(ZerCheck *zc, IRFunc *func, Node *call) {
     return false;
 }
 
+/* BUG-1233: the arguments an async task's `_zer_async_NAME_init` receives live
+ * in the TASK, and the async body reads them at later polls. The caller's
+ * tracker saw `_init(&t, p)` and `_poll(&t)` as two opaque calls, so
+ *   - `free(p)` between polls, then `_poll(&t)` read the freed object
+ *     (measured: returned a recycled object's 77), and
+ *   - a body that frees its param (`async void f(*Box b){ yield; free(b); }`)
+ *     left the caller's `p` ALIVE — `p.v` after the task was a use-after-free
+ *     and the caller's `free(p)` a double free, both accepted.
+ * `_init` records each tracked argument as a CARRIED entry of the task
+ * (`t.<param>`, same allocation, escaped — the caller's own entry keeps the
+ * leak duty), so the BUG-1225 carrier rule refuses a `_poll(&t)` whose task
+ * carries a freed pointer. `_poll` applies the body's free summary: a param the
+ * body may free is no longer carried, and every other alias of it becomes
+ * MAYBE_FREED (maybe — the free may not have been reached yet). */
+static bool ir_async_task_name(Checker *ck, const char *nm, uint32_t nl,
+                               const char *suffix, uint32_t sl, Node **fn) {
+    if (nl <= 11 + sl || memcmp(nm, "_zer_async_", 11) != 0 ||
+        memcmp(nm + nl - sl, suffix, sl) != 0) return false;
+    Symbol *s = scope_lookup(ck->global_scope, nm + 11, nl - 11 - sl);
+    if (!s || !s->is_async || !s->func_node) return false;
+    *fn = s->func_node;
+    return true;
+}
+static bool ir_async_task_key(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *arg0,
+                              int *root, const char **path, uint32_t *plen) {
+    if (!arg0) return false;
+    if (arg0->kind == NODE_UNARY && arg0->unary.op == TOK_AMP) arg0 = arg0->unary.operand;
+    if (ir_extract_compound_key(zc, func, ps, arg0, root, path, plen) != 0) return false;
+    return *root >= 0 || *root == IR_GLOBAL_ROOT_ID;
+}
+static const char *ir_async_carried_path(ZerCheck *zc, const char *base, uint32_t blen,
+                                         Node *fn, int pi, uint32_t *out_len) {
+    const char *pn = fn->func_decl.params[pi].name;
+    uint32_t pl = (uint32_t)fn->func_decl.params[pi].name_len;
+    uint32_t tot = blen + 1 + pl;
+    char *p = (char *)arena_alloc(zc->arena, tot + 1);
+    if (!p) return NULL;
+    if (blen) memcpy(p, base, blen);
+    p[blen] = '.';
+    memcpy(p + blen + 1, pn, pl);
+    p[tot] = '\0';
+    *out_len = tot;
+    return p;
+}
+static void ir_async_poll_step(ZerCheck *zc, IRPathState *ps, Node *fn,
+                               int root, const char *base, uint32_t blen, int line);
+static void ir_async_task_call(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *call,
+                               const char *nm, uint32_t nl, int line) {
+    Node *fn = NULL;
+    bool is_init = ir_async_task_name(zc->checker, nm, nl, "_init", 5, &fn);
+    if (!is_init && !ir_async_task_name(zc->checker, nm, nl, "_poll", 5, &fn)) return;
+    if (call->call.arg_count < 1) return;
+    int root; const char *base; uint32_t blen;
+    if (!ir_async_task_key(zc, func, ps, call->call.args[0], &root, &base, &blen)) return;
+    if (is_init) {
+        for (int ai = 1; ai < call->call.arg_count && ai - 1 < fn->func_decl.param_count; ai++) {
+            IRHandleInfo *src = ir_view_arg_handle(zc, func, ps, call->call.args[ai]);
+            if (!src || src->alloc_id == 0) continue;
+            IRHandleInfo snap = *src;
+            uint32_t cl;
+            const char *cp = ir_async_carried_path(zc, base, blen, fn, ai - 1, &cl);
+            if (!cp) continue;
+            IRHandleInfo *ch = ir_add_compound_handle(ps, root, cp, cl);
+            if (!ch) continue;
+            ch->state = snap.state;
+            ch->alloc_id = snap.alloc_id;
+            ch->alloc_line = snap.alloc_line;
+            ch->free_line = snap.free_line;
+            ch->source_color = snap.source_color;
+            ch->escaped = true;
+        }
+        return;
+    }
+    ir_async_poll_step(zc, ps, fn, root, base, blen, line);
+}
+
+/* BUG-1233: the effect of one POLL of a task keyed (root, base) that runs `fn`. */
+static void ir_async_poll_step(ZerCheck *zc, IRPathState *ps, Node *fn,
+                               int root, const char *base, uint32_t blen, int line) {
+    FuncSummary *fs = NULL;
+    for (int si = 0; si < zc->summary_count && !fs; si++)
+        if (zc->summaries[si].func_name_len == fn->func_decl.name_len &&
+            memcmp(zc->summaries[si].func_name, fn->func_decl.name,
+                   fn->func_decl.name_len) == 0)
+            fs = &zc->summaries[si];
+    if (!fs) return;
+    for (int pi = 0; pi < fs->param_count && pi < fn->func_decl.param_count; pi++) {
+        bool frees = (fs->frees_param && fs->frees_param[pi]) ||
+                     (fs->maybe_frees_param && fs->maybe_frees_param[pi]);
+        if (!frees) continue;
+        uint32_t cl;
+        const char *cp = ir_async_carried_path(zc, base, blen, fn, pi, &cl);
+        IRHandleInfo *ch = cp ? ir_find_compound_handle(ps, root, cp, cl) : NULL;
+        if (!ch) continue;
+        int aid = ch->alloc_id;
+        int ci = (int)(ch - ps->handles);
+        ps->handles[ci] = ps->handles[ps->handle_count - 1];   /* no longer carried */
+        ps->handle_count--;
+        if (aid == 0) continue;
+        for (int hi = 0; hi < ps->handle_count; hi++) {
+            IRHandleInfo *h = &ps->handles[hi];
+            if (h->alloc_id != aid) continue;
+            h->escaped = true;   /* the task owns the free: not the caller's leak */
+            if (h->state != IR_HS_ALIVE) continue;
+            h->state = IR_HS_MAYBE_FREED;
+            h->free_line = line;
+        }
+    }
+}
+
+/* BUG-1243: which params' tasks does this function poll (directly or through a
+ * callee's summary)? A task polled in a HELPER (`drive(&t)`) ran the body with
+ * nothing applied at the caller, so a body that frees its param left the
+ * caller's pointer ALIVE. */
+static int ir_param_index_of(IRFunc *func, Node *arg) {
+    if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) return -1;
+    if (!arg || arg->kind != NODE_IDENT) return -1;
+    int l = ir_find_local_exact_first(func, arg->ident.name, (uint32_t)arg->ident.name_len);
+    if (l < 0 || !func->locals[l].is_param) return -1;
+    int k = 0;
+    for (int li = 0; li < l; li++) if (func->locals[li].is_param) k++;
+    return k;
+}
+static struct ZcPolls *ir_collect_polls(ZerCheck *zc, IRFunc *func, int *out_n) {
+    *out_n = 0;
+    int n = 0, cap = 0;
+    struct ZcPolls *v = NULL;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op != IR_CALL || !in->expr || in->expr->kind != NODE_CALL) continue;
+            Node *call = in->expr;
+            const char *nm = in->func_name; uint32_t nl = in->func_name_len;
+            if (!nm || nl == 0) continue;
+            for (int pass = 0; pass < 2; pass++) {
+                /* pass 0: a direct _poll; pass 1: a callee's own poll facts */
+                int cnt = 0;
+                const FuncSummary *cs = NULL;
+                Node *fn0 = NULL;
+                if (pass == 0) {
+                    if (!ir_async_task_name(zc->checker, nm, nl, "_poll", 5, &fn0)) continue;
+                    cnt = 1;
+                } else {
+                    for (int si = 0; si < zc->summary_count && !cs; si++)
+                        if (zc->summaries[si].func_name_len == nl &&
+                            memcmp(zc->summaries[si].func_name, nm, nl) == 0)
+                            cs = &zc->summaries[si];
+                    if (!cs) continue;
+                    cnt = cs->polls_n;
+                }
+                for (int k = 0; k < cnt; k++) {
+                    int ap = pass == 0 ? 0 : cs->polls[k].param;
+                    void *fnp = pass == 0 ? (void *)fn0 : cs->polls[k].fn;
+                    if (ap >= call->call.arg_count) continue;
+                    int pj = ir_param_index_of(func, call->call.args[ap]);
+                    if (pj < 0) continue;
+                    bool dup = false;
+                    for (int d = 0; d < n && !dup; d++)
+                        dup = v[d].param == pj && v[d].fn == fnp;
+                    if (dup) continue;
+                    if (n >= cap) {
+                        int nc = cap < 4 ? 4 : cap * 2;
+                        struct ZcPolls *nb = (struct ZcPolls *)arena_alloc(zc->arena,
+                            (size_t)nc * sizeof(*nb));
+                        if (!nb) continue;
+                        if (n) memcpy(nb, v, (size_t)n * sizeof(*nb));
+                        v = nb; cap = nc;
+                    }
+                    v[n].param = pj; v[n].fn = fnp; n++;
+                }
+            }
+        }
+    }
+    *out_n = n;
+    return v;
+}
+static void ir_apply_polls(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                           const FuncSummary *s, Node *call, int line) {
+    for (int k = 0; k < s->polls_n; k++) {
+        if (s->polls[k].param >= call->call.arg_count) continue;
+        int root; const char *base; uint32_t blen;
+        if (!ir_async_task_key(zc, func, ps, call->call.args[s->polls[k].param],
+                               &root, &base, &blen)) continue;
+        ir_async_poll_step(zc, ps, (Node *)s->polls[k].fn, root, base, blen, line);
+    }
+}
+
+/* BUG-1241: collect `dst_param.f(.g…) = src_param` in the callee (arena copy). */
+static struct ZcParamStore *ir_collect_param_stores(ZerCheck *zc, IRFunc *func, int *out_n) {
+    *out_n = 0;
+    int n = 0, cap = 0;
+    struct ZcParamStore *v = NULL;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            Node *a = in->expr;
+            if (!a || a->kind != NODE_ASSIGN || a->assign.op != TOK_EQ) continue;
+            Node *val = ir_peel_launder(a->assign.value);
+            if (val && val->kind == NODE_ORELSE) val = ir_peel_launder(val->orelse.expr);
+            if (!val || val->kind != NODE_IDENT) continue;
+            int src = ir_find_local_exact_first(func, val->ident.name, (uint32_t)val->ident.name_len);
+            if (src < 0 || !func->locals[src].is_param) continue;
+            Node *t = a->assign.target;
+            if (!t || t->kind != NODE_FIELD) continue;
+            uint32_t plen = 0;
+            Node *r = t;
+            bool ok = true;
+            while (r && r->kind == NODE_FIELD) { plen += 1 + (uint32_t)r->field.field_name_len; r = r->field.object; }
+            if (!r || r->kind != NODE_IDENT) ok = false;
+            int dst = ok ? ir_find_local_exact_first(func, r->ident.name, (uint32_t)r->ident.name_len) : -1;
+            if (dst < 0 || !func->locals[dst].is_param || dst == src) continue;
+            char *path = (char *)arena_alloc(zc->arena, plen + 1);
+            if (!path) continue;
+            uint32_t w = plen;
+            path[plen] = '\0';
+            for (Node *f = t; f && f->kind == NODE_FIELD; f = f->field.object) {
+                w -= (uint32_t)f->field.field_name_len;
+                memcpy(path + w, f->field.field_name, f->field.field_name_len);
+                path[--w] = '.';
+            }
+            /* param index = position among params */
+            int di = 0, si = 0, k = 0;
+            for (int li = 0; li < func->local_count; li++) {
+                if (!func->locals[li].is_param) continue;
+                if (li == dst) di = k;
+                if (li == src) si = k;
+                k++;
+            }
+            if (n >= cap) {
+                int nc = cap < 4 ? 4 : cap * 2;
+                struct ZcParamStore *nb = (struct ZcParamStore *)arena_alloc(zc->arena,
+                    (size_t)nc * sizeof(*nb));
+                if (!nb) continue;
+                if (n) memcpy(nb, v, (size_t)n * sizeof(*nb));
+                v = nb; cap = nc;
+            }
+            v[n].dst = di; v[n].path = path; v[n].plen = plen; v[n].src = si;
+            n++;
+        }
+    }
+    *out_n = n;
+    return v;
+}
+
+static void ir_apply_param_stores(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                  const FuncSummary *s, Node *call) {
+    for (int k = 0; k < s->param_store_n; k++) {
+        const struct ZcParamStore *e = &s->param_store[k];
+        if (e->dst >= call->call.arg_count || e->src >= call->call.arg_count) continue;
+        IRHandleInfo *src = ir_view_arg_handle(zc, func, ps, call->call.args[e->src]);
+        if (!src || src->alloc_id == 0) continue;
+        IRHandleInfo snap = *src;
+        int root; const char *base; uint32_t blen;
+        if (!ir_async_task_key(zc, func, ps, call->call.args[e->dst], &root, &base, &blen))
+            continue;
+        uint32_t tot = blen + e->plen;
+        char *p = (char *)arena_alloc(zc->arena, tot + 1);
+        if (!p) continue;
+        if (blen) memcpy(p, base, blen);
+        memcpy(p + blen, e->path, e->plen);
+        p[tot] = '\0';
+        IRHandleInfo *ch = ir_add_compound_handle(ps, root, p, tot);
+        if (!ch) continue;
+        ch->state = snap.state;
+        ch->alloc_id = snap.alloc_id;
+        ch->alloc_line = snap.alloc_line;
+        ch->free_line = snap.free_line;
+        ch->source_color = snap.source_color;
+        ch->escaped = true;   /* the argument's own entry keeps the leak duty */
+    }
+}
+
+/* BUG-1232: a SUSPEND (`yield`, and every re-poll of an `await`) hands control
+ * back to whoever polls the task, and that code may do anything before the next
+ * poll — the async body resumes after an arbitrary unknown call. So the
+ * unresolvable-call barrier applies, widened to everything reachable from
+ * OUTSIDE the frame (nothing is HANDED to a suspend, so the argument-precise
+ * rule has nothing to key on):
+ *   - a global-rooted entry, with its alias group — `g = a; yield; a.v` was
+ *     accepted and read a slot `drop_g()` freed between polls;
+ *   - an ESCAPED entry (stored through a param, handed to a keep function) —
+ *     its other owner may free it;
+ *   - arena allocations, when some function resets a non-local arena (the
+ *     BUG-1172 rule, which `ar.reset()` between polls also triggers).
+ * ALIVE becomes MAYBE_FREED — a use or a free after the suspend is refused, and
+ * simply not touching it again is clean. A frame-local allocation nobody else
+ * can reach is untouched. */
+static void ir_suspend_barrier(ZerCheck *zc, IRPathState *ps, int line) {
+    bool any_reset = false;
+    for (int si = 0; si < zc->summary_count && !any_reset; si++)
+        any_reset = zc->summaries[si].resets_arena;
+    if (any_reset || zc->cur_resets_arena)
+        ir_mark_arena_handles_state(ps, line, IR_HS_MAYBE_FREED);
+    int cap = ps->handle_count > 0 ? ps->handle_count : 1;
+    int *aids = (int *)malloc((size_t)cap * sizeof(int));
+    if (!aids) return;
+    int n = 0;
+    for (int hi = 0; hi < ps->handle_count; hi++) {
+        IRHandleInfo *h = &ps->handles[hi];
+        if (h->state != IR_HS_ALIVE || h->alloc_id == 0) continue;
+        if (h->local_id != IR_GLOBAL_ROOT_ID && !h->escaped) continue;
+        aids[n++] = h->alloc_id;
+    }
+    for (int hi = 0; hi < ps->handle_count; hi++) {
+        IRHandleInfo *h = &ps->handles[hi];
+        if (h->state != IR_HS_ALIVE) continue;
+        for (int k = 0; k < n; k++) {
+            if (h->alloc_id != aids[k]) continue;
+            h->state = IR_HS_MAYBE_FREED;
+            h->free_line = line;
+            break;
+        }
+    }
+    free(aids);
+}
+
 /* GAP-4 (BUG-740): argument-precise indirect-call barrier.
  *
  * Principle: anything HANDED to an unknown callee may have been freed
@@ -9122,6 +9440,10 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             }
         }
 
+        if (inst->expr && inst->expr->kind == NODE_CALL)              /* BUG-1233 */
+            ir_async_task_call(zc, func, ps, inst->expr, fn_name, fn_name_len,
+                               inst->source_line);
+
         /* BUG-742 call-window rule: a ZER-defined callee (summary exists)
          * can read globals — calling it while a global is definitely
          * dangling may observe freed memory. Bodyless externs never have
@@ -9498,6 +9820,12 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         }
         if (summary->freed_global_n > 0)                        /* BUG-1181 */
             ir_apply_freed_globals(zc, ps, summary, inst->source_line);
+        if (summary->param_store_n > 0 && inst->expr &&         /* BUG-1241 */
+            inst->expr->kind == NODE_CALL)
+            ir_apply_param_stores(zc, func, ps, summary, inst->expr);
+        if (summary->polls_n > 0 && inst->expr &&                /* BUG-1243 */
+            inst->expr->kind == NODE_CALL)
+            ir_apply_polls(zc, func, ps, summary, inst->expr, inst->source_line);
 
         /* Phase D7: if callee returns an ARENA-colored pointer, tag the
          * call's dest local so it's skipped in leak detection. Propagates
@@ -9950,6 +10278,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
      * Same for `await gp.get(h).id == 7` after `gp.free(h)`. The existing
      * negative (await_orelse_cond_uaf) only tested a use AFTER the await. */
     case IR_AWAIT: {
+        ir_suspend_barrier(zc, ps, inst->source_line);   /* BUG-1232: re-polled */
         if (inst->expr) {
             UafReportSet rs = {0};
             ir_check_expr_uaf(zc, func, ps, inst->expr, inst->source_line, &rs);
@@ -9961,7 +10290,10 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         }
         break;
     }
-    case IR_BRANCH: case IR_GOTO: case IR_YIELD:
+    case IR_YIELD:
+        ir_suspend_barrier(zc, ps, inst->source_line);   /* BUG-1232 */
+        break;
+    case IR_BRANCH: case IR_GOTO:
     case IR_LOCK: case IR_UNLOCK:
     case IR_ARENA_RESET: case IR_RING_PUSH: case IR_RING_POP:
     case IR_RING_PUSH_CHECKED:
@@ -10320,8 +10652,47 @@ static bool ir_return_is_null_literal(IRFunc *func, IRBlock *bb, IRInst *last,
 /* One forward-pass step: the transfer function, then (BUG-1130) the facts
  * keyed on an index local this instruction wrote are demoted — `arr[k]` names
  * a different slot once k changes. */
+/* BUG-1242: a local that READS a global pointer (`if (gb) |b|`, `*T b = gb;`)
+ * is a view of whatever the global holds — and a callee whose summary frees
+ * that global (BUG-1181) widens only an entry the caller HAS. When the global
+ * was filled in another function, the caller had none, so
+ * `if (gb) |b| { release(); b.v = 99; }` wrote into a freed object. The read
+ * now mints the global's entry (escaped: the caller owns nothing) and makes the
+ * reading local an alias of it, so the summary reaches the local. */
+static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                     IRInst *inst) {
+    if (inst->op != IR_ASSIGN || inst->dest_local < 0 || !inst->expr) return;
+    if (inst->dest_local >= func->local_count) return;
+    if (ir_find_handle(ps, inst->dest_local)) return;
+    Type *dt = type_unwrap_distinct(func->locals[inst->dest_local].type);
+    if (dt && type_dispatch_kind(dt) == TYPE_OPTIONAL) dt = type_unwrap_distinct(dt->optional.inner);
+    if (!dt || (type_dispatch_kind(dt) != TYPE_POINTER &&
+                type_dispatch_kind(dt) != TYPE_SLICE)) return;
+    const char *key; uint32_t klen;
+    if (!ir_value_global_key(zc, func, inst->expr, &key, &klen)) return;
+    IRHandleInfo *gh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID, key, klen);
+    if (!gh) {
+        gh = ir_add_compound_handle(ps, IR_GLOBAL_ROOT_ID, key, klen);
+        if (!gh) return;
+        gh->state = IR_HS_ALIVE;
+        gh->alloc_line = inst->source_line;
+        gh->alloc_id = _ir_next_alloc_id++;
+        gh->source_color = ZC_COLOR_UNKNOWN;
+    }
+    if (gh->alloc_id == 0 || gh->state != IR_HS_ALIVE) return;
+    IRHandleInfo snap = *gh;
+    IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+    if (!dh) return;
+    dh->state = snap.state;
+    dh->alloc_id = snap.alloc_id;
+    dh->alloc_line = snap.alloc_line;
+    dh->source_color = snap.source_color;
+    dh->escaped = true;
+}
+
 static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
     ir_check_inst_core(zc, ps, inst, func);
+    ir_mint_global_read_view(zc, func, ps, inst);   /* BUG-1242 */
     ir_kill_index_facts(zc, func, ps, inst);
 }
 
@@ -11338,6 +11709,12 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
         if (real_return_count == 0) ret_is_content_final = false;
 
+        /* BUG-1241: direct `param.f.g = param` stores. */
+        int pst_n = 0;
+        struct ZcParamStore *pst = ir_collect_param_stores(zc, func, &pst_n);
+        int pol_n = 0;                                               /* BUG-1243 */
+        struct ZcPolls *pol = ir_collect_polls(zc, func, &pol_n);
+
         /* Update or create summary — same logic as zercheck.c:2320+ */
         FuncSummary *existing = NULL;
         for (int si = 0; si < zc->summary_count; si++) {
@@ -11372,6 +11749,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->resets_arena != zc->cur_resets_arena) changed = true;   /* BUG-1172 */
             if (!ir_freed_global_same(existing, zc)) changed = true;              /* BUG-1181 */
             if (existing->ret_field_n != rf_n) changed = true;
+            if (existing->param_store_n != pst_n) changed = true;          /* BUG-1241 */
+            if (existing->polls_n != pol_n) changed = true;                /* BUG-1243 */
             for (int k = 0; !changed && k < rf_n; k++)
                 if (existing->ret_field[k].param != rf[k].param ||
                     existing->ret_field[k].must != rf[k].must ||
@@ -11379,6 +11758,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     memcmp(existing->ret_field[k].path, rf[k].path, rf[k].plen) != 0)
                     changed = true;
             if (changed) {
+                existing->param_store_n = pst_n;
+                existing->param_store = pst;
+                existing->polls_n = pol_n;
+                existing->polls = pol;
                 existing->ret_field_n = rf_n;
                 existing->ret_field = ir_ret_field_copy(zc, rf, rf_n);
                 free(existing->frees_param);
@@ -11432,6 +11815,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 ir_freed_global_store(zc, s);             /* BUG-1181 */
                 s->ret_field_n = rf_n;
                 s->ret_field = ir_ret_field_copy(zc, rf, rf_n);
+                s->param_store_n = pst_n;
+                s->param_store = pst;
+                s->polls_n = pol_n;
+                s->polls = pol;
             } else {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);

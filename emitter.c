@@ -5951,6 +5951,12 @@ static void emit_func_decl(Emitter *e, Node *node) {
      * masked bugs. Post-2026-04-19 policy: IR correctness is
      * load-bearing. Lowering or validation failure = abort. */
     if (node->func_decl.body) {
+        /* BUG-1238: an async function lowered early (its state struct is already
+         * out) is not lowered again — pre_lower_orelse rewrites the AST. */
+        for (int ai = 0; ai < e->early_async_count; ai++) {
+            IRFunc *pre = (IRFunc *)e->early_async_ir[ai];
+            if (pre && pre->ast_node == node) { emit_func_from_ir(e, pre); return; }
+        }
         IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
         if (!ir) {
             fprintf(stderr,
@@ -6043,6 +6049,101 @@ static void emit_async_forward_typedefs(Emitter *e, Node *file_node) {
         emit(e, "typedef struct _zer_async_%.*s _zer_async_%.*s;\n",
              (int)d->func_decl.name_len, d->func_decl.name,
              (int)d->func_decl.name_len, d->func_decl.name);
+    }
+}
+
+/* BUG-1238: define every async state struct BEFORE any function or global.
+ * The struct is emitted from the lowered IR (it holds every promoted local),
+ * and was written where the async function itself is emitted — in source
+ * order. So every use of a task spelled before that point met an incomplete
+ * type: a GLOBAL task, a task in a struct FIELD, `alloc(task, n)`, or even a
+ * LOCAL task in a function declared above the async one ("has initializer but
+ * incomplete type"). The async functions are lowered here instead (once — the
+ * lowered IR is kept and reused when the function body is emitted), and their
+ * structs defined in dependency order: a task holding another task BY VALUE as
+ * a local needs that one first. */
+static void emit_async_state_struct(Emitter *e, IRFunc *func);
+static bool async_local_needs(Type *t, IRFunc **fs, bool *done, int n, int depth) {
+    if (!t || depth > 64) return false;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_ARRAY: return async_local_needs(u->array.inner, fs, done, n, depth + 1);
+    case TYPE_OPTIONAL: return async_local_needs(u->optional.inner, fs, done, n, depth + 1);
+    case TYPE_STRUCT:
+        if (u->struct_type.is_async_state) {
+            for (int i = 0; i < n; i++) {
+                if (done[i]) continue;
+                uint32_t fl = fs[i]->name_len;
+                if (u->struct_type.name_len == 11 + fl &&
+                    memcmp(u->struct_type.name + 11, fs[i]->name, fl) == 0) return true;
+            }
+            return false;
+        }
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (async_local_needs(u->struct_type.fields[i].type, fs, done, n, depth + 1))
+                return true;
+        return false;
+    default: return false;
+    }
+}
+static void emit_early_async_structs(Emitter *e, Node *file_node) {
+    int start = e->early_async_count;
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
+            continue;
+        IRFunc *ir = ir_lower_func(e->arena, e->checker, d);
+        if (!ir) {
+            fprintf(stderr, "INTERNAL ERROR: IR lowering returned NULL for async '%.*s'\n",
+                    (int)d->func_decl.name_len, d->func_decl.name);
+            abort();
+        }
+        ir->module_prefix = e->current_module;
+        ir->module_prefix_len = e->current_module_len;
+        if (!ir_validate(ir)) {
+            fprintf(stderr, "INTERNAL ERROR: IR validation failed for async '%.*s'\n",
+                    (int)d->func_decl.name_len, d->func_decl.name);
+            abort();
+        }
+        if (e->ir_hook) e->ir_hook(e->ir_hook_ctx, ir);
+        if (e->early_async_count >= e->early_async_cap) {
+            int nc = e->early_async_cap < 8 ? 8 : e->early_async_cap * 2;
+            void **nb = (void **)arena_alloc(e->arena, (size_t)nc * sizeof(void *));
+            if (!nb) abort();
+            if (e->early_async_count)
+                memcpy(nb, e->early_async_ir, (size_t)e->early_async_count * sizeof(void *));
+            e->early_async_ir = nb;
+            e->early_async_cap = nc;
+        }
+        e->early_async_ir[e->early_async_count++] = ir;
+    }
+    int n = e->early_async_count - start;
+    if (n <= 0) return;
+    IRFunc **fs = (IRFunc **)(e->early_async_ir + start);
+    bool *done = (bool *)arena_alloc(e->arena, (size_t)n * sizeof(bool));
+    if (!done) abort();
+    memset(done, 0, (size_t)n * sizeof(bool));
+    int left = n;
+    while (left > 0) {
+        bool progress = false;
+        for (int i = 0; i < n; i++) {
+            if (done[i]) continue;
+            bool blocked = false;
+            for (int li = 0; li < fs[i]->local_count && !blocked; li++) {
+                if (fs[i]->locals[li].is_static) continue;
+                done[i] = true;   /* a task never waits on itself */
+                blocked = async_local_needs(fs[i]->locals[li].type, fs, done, n, 0);
+                done[i] = false;
+            }
+            if (blocked) continue;
+            emit_async_state_struct(e, fs[i]);
+            done[i] = true; left--; progress = true;
+        }
+        if (!progress) {   /* a cycle by value is unrepresentable in C: emit anyway, GCC reports it */
+            for (int i = 0; i < n; i++)
+                if (!done[i]) { emit_async_state_struct(e, fs[i]); done[i] = true; left--; }
+        }
     }
 }
 
@@ -7689,6 +7790,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     for (int i = 0; i < file_node->file.decl_count; i++)
         emit_func_prototype(e, file_node->file.decls[i]);
     emit(e, "\n");
+    emit_early_async_structs(e, file_node);   /* BUG-1238 */
 
     /* Emit spawn wrapper functions — after structs/slabs, before user functions */
     emit_spawn_wrappers(e);
@@ -14759,37 +14861,15 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 }
 
 /* Emit an async function from IR — state struct + init + poll */
-static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
+/* BUG-1238: the state struct + result accessor, split out so an async
+ * function can have them emitted EARLY (emit_early_async_structs). */
+static void emit_async_state_struct(Emitter *e, IRFunc *func) {
     Node *fn = func->ast_node;
     if (!fn) return;
-
-    /* Build mangled name */
-    /* BUG-866: the async internal names are NOT module-mangled.
-     *
-     * They used to be — `_zer_async_lib1__acompute` for a coroutine in module
-     * `lib1` — while the CHECKER registers the state-struct type and the
-     * init/poll/result accessors under the UNMANGLED `_zer_async_acompute`
-     * (checker.c, the NODE_FUNC_DECL async arm). So a user of an imported async
-     * wrote exactly what the checker accepts, the emitter emitted it verbatim at
-     * the use site, and GCC found no such type or function: async across module
-     * boundaries did not compile at all, in any form, with the failure landing
-     * as a GCC error in generated code rather than a ZER diagnostic.
-     *
-     * Dropping the prefix here makes all five names agree — the type, _init,
-     * _poll, _result and the state struct — and it is the side that had to move:
-     * the checker's registration is what the user's source spells, and the
-     * accessor names are part of the documented API (reference.md "async").
-     *
-     * The cost is that two modules each defining an async function of the SAME
-     * name now collide, as a C redefinition error. That is loud, and it was
-     * already true of the state-struct TYPE name before this change (the
-     * checker registered it unmangled either way). Recorded in
-     * docs/limitations.md. */
     char mname[256];
     int flen = snprintf(mname, sizeof(mname), "%.*s",
         (int)func->name_len, func->name);
     if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
-
     /* BUG-863: a value-returning async needs somewhere to PUT the value.
      * `async u32 compute() { … return 42; }` compiled clean and the state
      * machine finalized correctly, but the value landed in an internal temp
@@ -14833,9 +14913,75 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         emit_type(e, async_ret);
         emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
              flen, mname, flen, mname);
+        /* BUG-1237: before done the field holds the zeroed initial value, which
+         * for a non-null pointer is NULL and for an enum without a 0 variant is
+         * no variant at all — a forged value (measured: a `*Box` result read
+         * early was NULL, an `E{a=5,b=6}` result took an arm). Those two refuse
+         * an early read; every other type keeps the documented zero. */
+        if (checker_type_has_no_zero_value(async_ret))
+            emit(e, "    if (self->_zer_state != -1) _zer_trap(\"async result read before "
+                    "the task finished — its return type has no zero value\", "
+                    "__FILE__, __LINE__);\n");
         emit(e, "    return self->_zer_result;\n");
         emit(e, "}\n\n");
     }
+
+    /* BUG-1238: prototypes, so a function emitted before the async one can
+     * call _init / _poll (the definitions stay where the function is). */
+    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
+         flen, mname, flen, mname);
+    for (int li = 0; li < func->local_count; li++) {
+        if (!func->locals[li].is_param) continue;
+        emit(e, ", ");
+        emit_type_and_name(e, func->locals[li].type,
+                           func->locals[li].name, func->locals[li].name_len);
+    }
+    emit(e, ");\n");
+    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self);\n\n",
+         flen, mname, flen, mname);
+}
+
+static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
+    Node *fn = func->ast_node;
+    if (!fn) return;
+
+    /* Build mangled name */
+    /* BUG-866: the async internal names are NOT module-mangled.
+     *
+     * They used to be — `_zer_async_lib1__acompute` for a coroutine in module
+     * `lib1` — while the CHECKER registers the state-struct type and the
+     * init/poll/result accessors under the UNMANGLED `_zer_async_acompute`
+     * (checker.c, the NODE_FUNC_DECL async arm). So a user of an imported async
+     * wrote exactly what the checker accepts, the emitter emitted it verbatim at
+     * the use site, and GCC found no such type or function: async across module
+     * boundaries did not compile at all, in any form, with the failure landing
+     * as a GCC error in generated code rather than a ZER diagnostic.
+     *
+     * Dropping the prefix here makes all five names agree — the type, _init,
+     * _poll, _result and the state struct — and it is the side that had to move:
+     * the checker's registration is what the user's source spells, and the
+     * accessor names are part of the documented API (reference.md "async").
+     *
+     * The cost is that two modules each defining an async function of the SAME
+     * name now collide, as a C redefinition error. That is loud, and it was
+     * already true of the state-struct TYPE name before this change (the
+     * checker registered it unmangled either way). Recorded in
+     * docs/limitations.md. */
+    char mname[256];
+    int flen = snprintf(mname, sizeof(mname), "%.*s",
+        (int)func->name_len, func->name);
+    if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+
+    {
+        bool early = false;
+        for (int ai = 0; ai < e->early_async_count && !early; ai++)
+            early = e->early_async_ir[ai] == (void *)func;
+        if (!early) emit_async_state_struct(e, func);
+    }
+    Type *afn_type = checker_get_type(e->checker, fn);
+    Type *async_ret = (afn_type && type_dispatch_kind(afn_type) == TYPE_FUNC_PTR)
+        ? afn_type->func_ptr.ret : NULL;
+    if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
 
     /* Init function */
     emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
@@ -14850,6 +14996,15 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     emit(e, "    memset(self, 0, sizeof(*self));\n");
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
+        /* BUG-1239: an ARRAY param is copied by value into the task (it is a
+         * pointer in the C init's parameter list); `self->a = a` is not C. */
+        if (type_dispatch_kind(func->locals[li].type) == TYPE_ARRAY) {
+            emit(e, "    memcpy(self->%.*s, %.*s, sizeof(self->%.*s));\n",
+                 (int)func->locals[li].name_len, func->locals[li].name,
+                 (int)func->locals[li].name_len, func->locals[li].name,
+                 (int)func->locals[li].name_len, func->locals[li].name);
+            continue;
+        }
         emit(e, "    self->%.*s = %.*s;\n",
              (int)func->locals[li].name_len, func->locals[li].name,
              (int)func->locals[li].name_len, func->locals[li].name);
@@ -14880,6 +15035,19 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         }
     }
 
+    /* BUG-1240: the @once flags (the same pre-scan as the regular path). They
+     * are C statics — one per @once, shared by every task, which is exactly
+     * @once's "once per program". Missing here, a @once in an async body was an
+     * undeclared identifier at GCC. */
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_BRANCH && in->cond_local < 0 &&
+                in->expr && in->expr->kind == NODE_ONCE)
+                emit(e, "    static uint32_t _zer_once_%d = 0;\n", in->false_block);
+        }
+    }
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: carries a freed pointer at 't.b'
+struct Box { u32 v; }
+async u32 f(*Box b) { yield; return b.v; }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    p.v = 1;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    _zer_async_f_poll(&t);
+    free(p);
+    *Box q = alloc(Box) orelse return;
+    q.v = 77;
+    while (_zer_async_f_poll(&t) == 0) { }
+    u32 r = _zer_async_f_result(&t);
+    free(q);
+    return r;
+}

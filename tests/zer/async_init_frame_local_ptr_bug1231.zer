@@ -1,0 +1,17 @@
+// BUG-1231 positive: a task in THIS frame may hold a pointer into this frame.
+async void bump(*u32 p) {
+    *p += 1;
+    yield;
+    *p += 10;
+}
+u32 run() {
+    u32 x = 5;
+    _zer_async_bump t;
+    _zer_async_bump_init(&t, &x);
+    while (_zer_async_bump_poll(&t) == 0) { }
+    return x;
+}
+u32 main() {
+    if (run() != 16) { return 1; }
+    return 0;
+}

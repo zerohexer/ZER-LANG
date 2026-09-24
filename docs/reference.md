@@ -5888,12 +5888,79 @@ u32 main() {
 ```
 
 Any return type works — scalar, struct, `?T`, `?*T`, `?void`. Reading the result
-before the poll reports done gives the zeroed initial value, exactly like any
+before the poll reports done gives the zeroed initial value (for a type that has
+one — see below), exactly like any
 other field of a freshly `_init`ed task; the value is stable across further
 polls of a finished task. A value-returning async function compiles with no
 warning. A VOID async has no accessor at all, so
 `_zer_async_blink_result` on one is an undefined identifier rather than a call
 that yields nothing.
+
+A value whose type has NO zero value — a non-null `*T`, or an enum with no `0`
+variant — cannot be read early: the zeroed field would be a NULL non-null
+pointer or a value outside the enum. `_result` on such a task traps until the
+task is done:
+
+<!-- audit: expect-trap: async result read before the task finished -->
+```zer
+enum Mode { slow = 5, fast = 6 }
+async Mode pick() { yield; return Mode.fast; }
+u32 main() {
+    _zer_async_pick t;
+    _zer_async_pick_init(&t);
+    Mode m = _zer_async_pick_result(&t);   // TRAP: not done yet
+    if (m == Mode.fast) { return 0; }
+    return 1;
+}
+```
+
+**WHAT A TASK HOLDS — AND WHERE IT MAY LIVE**
+
+A task STORES every argument its `_init` receives and runs its body at later
+polls, so the compiler treats it like any other object that keeps a pointer:
+
+- **Pointer arguments must outlive the task.** A task declared in this frame
+  may hold pointers into this frame. A task reached through a pointer (a
+  `*_zer_async_NAME` parameter, a global) may outlive the frame, so every
+  pointer argument to its `_init` is a `keep` argument — `&local` is rejected.
+- **An allocation handed to `_init` is carried by the task.** Freeing it
+  while the task can still be polled, then polling, is rejected. A body that
+  frees its parameter takes ownership: after polling, the caller may neither
+  use nor free it.
+- **A suspend runs unknown code.** At `yield` / `await` the poller runs, so an
+  allocation reachable from outside the frame (stored to a global, escaped, or
+  from an arena some function resets) may be freed before the task resumes. Using
+  it after the suspend is rejected. `yield` / `await` are also rejected inside a
+  `|*v|` union capture (the poller may change the variant — unless the union
+  is a local of the async function whose address is never taken, which only
+  the task itself can reach) and inside `@once`
+  (a second task would wait on this one forever).
+- **Every whole-program check follows a poll into the body**: the spawn race
+  scan, the atomic-cell rule, the interrupt volatile rule and the interrupt
+  allocation ban see the body of any async function a thread or an interrupt
+  polls.
+- **Where a task lives:** a local, a static local, an array of tasks, or a
+  GLOBAL (declared below its async function, whose declaration introduces
+  the type). Not a struct or union field, a slice element, or a heap allocation
+  (`alloc(_zer_async_NAME, n)`) — hold a `*_zer_async_NAME` instead. A task is
+  never copied (`b = a`, `b = *pa`), because its promoted locals may point into
+  itself.
+
+```zer
+async void tick_task(*u32 n) { *n += 1; yield; *n += 1; }
+_zer_async_tick_task gtask;            // a GLOBAL task (declared after its async fn)
+u32 counter;
+u32 main() {
+    u32 local = 0;
+    _zer_async_tick_task t;
+    _zer_async_tick_task_init(&t, &local);      // this-frame task, this-frame pointer
+    while (_zer_async_tick_task_poll(&t) == 0) { }
+    _zer_async_tick_task_init(&gtask, &counter); // a global task holds a global
+    while (_zer_async_tick_task_poll(&gtask) == 0) { }
+    if (local != 2 || counter != 2) { return 1; }
+    return 0;
+}
+```
 
 ### Deadlock Detection (Compile-Time)
 

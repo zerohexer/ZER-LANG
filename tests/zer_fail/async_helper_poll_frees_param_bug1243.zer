@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: 'p' is maybe-freed
+// BUG-1243: a task polled inside a helper (two levels) ran a body that frees its param.
+struct Box { u32 v; }
+async void f(*Box b) { yield; free(b); }
+void drive(*_zer_async_f t) { while (_zer_async_f_poll(t) == 0) { } }
+void drive2(*_zer_async_f t) { drive(t); }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    p.v = 3;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    drive2(&t);
+    u32 r = p.v;
+    return r;
+}

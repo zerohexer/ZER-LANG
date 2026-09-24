@@ -750,7 +750,9 @@ Config c = { .baud = 9600 };         // partial — unmentioned fields auto-zero
 16. **Inline asm uses bare `asm(...)`** (renamed from `unsafe asm` 2026-04-25 —
     the keyword was cosmetic; safety keys on the structural `in_naked` flag).
     Allowed ONLY inside `naked` functions (S1 interim guard). Two forms:
-    - Inline: `asm("nop");` or extended `asm("..." : outputs : inputs : clobbers);`
+    - Inline: `asm("nop");` — operand-free only. The GCC extended form
+      `asm("..." : outputs : inputs : clobbers);` is a compile error since BUG-1297
+      (its operands were raw text no analysis saw); operands go in the structured form.
     - Structured: `asm { instructions: "..."  inputs: { "rax" = expr }
       outputs: { ... }  clobbers: { ... }  safety: "..." }` — the `safety:`
       string (>= 30 chars) is MANDATORY (S4 audit-trail rule).

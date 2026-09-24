@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: asm operands in the inline
+u32 g;
+naked void w() { asm("nop" : : "r"(g)); }
+u32 main() { g = 1; spawn w(); return 0; }

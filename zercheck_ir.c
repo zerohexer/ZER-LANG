@@ -10008,6 +10008,14 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             ir_check_dangling_globals_at_call(zc, ps, inst->source_line);
             ir_indirect_call_barrier(zc, func, ps, inst->expr,
                                      inst->source_line);
+            /* BUG-1294: the callee is unknown, so it may be ANY function that
+             * frees a global through its own body (BUG-1181's summary) —
+             * `*() fp = drop_g; fp(); a.v` read the freed object. Widen every
+             * such global the caller holds to MAYBE_FREED, as a direct call to
+             * one of them would. */
+            for (int si = 0; si < zc->summary_count; si++)
+                if (zc->summaries[si].freed_global_n > 0)
+                    ir_apply_freed_globals(zc, ps, &zc->summaries[si], inst->source_line);
             break;
         }
 

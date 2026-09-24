@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: may not fit — it would be silently truncated
+u32 main() {
+    u32 r = 0;
+    volatile u32 v = 300;
+    u32 x = v;
+    r[7..0] = x;
+    return r;
+}

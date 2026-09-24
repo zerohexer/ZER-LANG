@@ -12988,6 +12988,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * is set (legacy), fall back to the pre-computed local. */
             emit_indent(e);
             emit(e, "case %d:;\n", e->async_yield_id);
+            /* BUG-1292: the condition's auto-guard runs on EVERY evaluation, so it
+             * goes AFTER the resume label — emitted before it (the generic
+             * per-instruction guard), a resumed poll jumped past the check and
+             * indexed out of bounds (ASan global-buffer-overflow). */
+            if (inst->expr) emit_auto_guards(e, inst->expr);
             emit_indent(e);
             emit(e, "if (!(");
             if (inst->expr) {
@@ -14858,8 +14863,12 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
                  * nobody had added. The list is hand-maintained and has been widened
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k)) {
+                if (ir_op_takes_auto_guards(k) &&
+                    !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
+                    bool sv_gt = e->guard_traps;              /* BUG-1291 */
+                    if (ins->in_defer_body) e->guard_traps = true;
                     emit_auto_guards(e, ins->expr);
+                    e->guard_traps = sv_gt;
                 }
             }
             emit_ir_inst(e, ins, func);
@@ -15141,8 +15150,12 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                  * nobody had added. The list is hand-maintained and has been widened
                  * reactively three times now (2026-05-03/06 async, 2026-06-30
                  * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k)) {
+                if (ir_op_takes_auto_guards(k) &&
+                    !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
+                    bool sv_gt = e->guard_traps;              /* BUG-1291 */
+                    if (ins->in_defer_body) e->guard_traps = true;
                     emit_auto_guards(e, ins->expr);
+                    e->guard_traps = sv_gt;
                 }
             }
             emit_ir_inst(e, ins, func);

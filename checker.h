@@ -435,6 +435,7 @@ typedef struct {
         struct Symbol *via_callee;
         int via_argi;
     } *atomic_plain_writes;
+    Node *field_obj_node;            /* BUG-1295: the object of the NODE_FIELD / NODE_INDEX being checked */
     struct Symbol *amp_arg_callee;   /* the call whose argument is being checked */
     int amp_arg_index;
     int atomic_plain_write_count;

@@ -1,0 +1,10 @@
+struct S { u32 n; u32 m; }
+S s;
+void w() { @atomic_add(&s.n, 1); }
+u32 peek() { return s.m; }
+u32 main() {
+    ThreadHandle th = spawn w();
+    u32 r = peek();
+    th.join();
+    return r;
+}

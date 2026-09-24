@@ -2861,7 +2861,16 @@ u32 main() {
 
 **DESCRIPTION**
 Safe MMIO read. Returns `?u32` — null if the address faults (unmapped memory).
-Uses signal-based fault handler. Works on any platform.
+Uses a signal-based fault handler — which exists only on a HOSTED target.
+
+**Where "null on fault" holds (2026-09-24, corrected).** On a hosted build
+(`__STDC_HOSTED__`, any OS, or bare metal with a libc that delivers SIGSEGV/SIGBUS)
+a faulting read returns null. On a FREESTANDING build there is no portable fault
+recovery: `@probe` is a direct read, so a faulting address does NOT return null —
+it takes the CPU's fault (a HardFault on Cortex-M) exactly as a plain read would.
+`--probe-mode=raw` selects that direct read everywhere; `--probe-mode=disabled`
+refuses `@probe` at compile time. On bare metal, treat `@probe` as "read this
+register", not as "detect whether it exists" — see docs/limitations.md.
 
 **EXAMPLE**
 ```zer
@@ -4753,6 +4762,10 @@ void stack_push(*Stack(u32) s, u32 val) {
   — are a clean compile error with a wrapper-struct hint: wrap the
   composite in a named struct and instantiate with that. NESTED containers
   work — `Stack(Stack(u32))` resolves inner-first to `Stack_Stack_u32`.
+  `void` and `opaque` are not value types and are refused (BUG-1218).
+- Two imported modules may not each declare a container of the same NAME
+  (the stamp is program-wide, so the second module would get the first's
+  layout) — see docs/limitations.md.
 - SELF-REFERENCE through a pointer is supported — this is the canonical
   linked list / tree node:
 ```zer

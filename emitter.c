@@ -1995,6 +1995,26 @@ static void emit_unreachable(Emitter *e, const char *what, Node *n) {
  * class).
  * ================================================================ */
 
+/* BUG-1215: the TYPE operand of @offset when the parser left it as an identifier.
+ * Writing `struct <name>` literally was wrong for every name that is not the C
+ * struct tag: a typedef (`typedef A AA;` -> `struct AA`, undefined), a distinct
+ * typedef, a union, a module-mangled struct. Resolve the name to its type and emit
+ * that — ONE helper for both emitter paths. */
+static void emit_offset_type_operand(Emitter *e, Node *name_node) {
+    Type *t = e->checker ? checker_get_type(e->checker, name_node) : NULL;
+    if ((!t || type_dispatch_kind(t) == TYPE_VOID) && e->checker && name_node &&
+        name_node->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(e->checker->global_scope, name_node->ident.name,
+                                 (uint32_t)name_node->ident.name_len);
+        if (s) t = s->type;
+    }
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_STRUCT || k == TYPE_UNION) { emit_type(e, type_unwrap_distinct(t)); return; }
+    emit(e, "struct %.*s", name_node && name_node->kind == NODE_IDENT ?
+         (int)name_node->ident.name_len : 0,
+         name_node && name_node->kind == NODE_IDENT ? name_node->ident.name : "");
+}
+
 /* Does `callee` name a function DIRECTLY (so the call is not indirect)? */
 static bool callee_is_direct_function(Emitter *e, Node *callee) {
     if (!callee || callee->kind != NODE_IDENT) return false;
@@ -2376,6 +2396,9 @@ static void emit_type(Emitter *e, Type *t) {
 /* emit type with variable name (handles arrays and func ptrs) */
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t name_len) {
     if (!t) { emit(e, "void %.*s", (int)name_len, name); return; }
+    /* BUG-1220: a DISTINCT array type needs the array declarator too — `distinct
+     * typedef u8[4] Quad; Quad q;` was emitted `uint8_t[4] q`, which is not C. */
+    if (type_dispatch_kind(t) == TYPE_ARRAY) t = type_unwrap_distinct(t);
 
     if (t->kind == TYPE_ARRAY) {
         /* collect all array dimensions, emit base type + name + all dims */
@@ -4586,8 +4609,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                     emit_expr(e, node->intrinsic.args[0]);
             } else if (node->intrinsic.arg_count >= 2) {
                 /* args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_expr(e, node->intrinsic.args[0]);
+                emit_offset_type_operand(e, node->intrinsic.args[0]);   /* BUG-1215 */
                 emit(e, ", ");
                 emit_expr(e, node->intrinsic.args[1]);
             }
@@ -6177,7 +6199,18 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
              * foldable tree is identical either way. eval_const_expr returns
              * CONST_EVAL_FAIL for anything with a variable in it, so widening the
              * gate cannot fold something it should not. */
-            {
+            /* BUG-1216: a comptime call whose result is a STRUCT (or a float)
+             * is not an integer fold — its `comptime_value` slot is unused, 0 —
+             * and `In g = MK(3);` was emitted `struct In g = 0;`. Emit the folded
+             * literal instead. */
+            Node *gci = node->var_decl.init;
+            if (gci->kind == NODE_CALL && gci->call.is_comptime_resolved &&
+                (gci->call.comptime_struct_init || gci->call.is_comptime_float)) {
+                emit(e, " = ");
+                emit_expr(e, gci);
+                emitted_const = true;
+            }
+            if (!emitted_const) {
                 /* BUG-1090: typed fold first (see the optional arm above).
                  * `const u32 K = (0 - 1) / 1073741824;` emitted `K = 0` — the
                  * untyped int64 reading — while the same initializer on a
@@ -9552,8 +9585,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
             } else if (node->intrinsic.arg_count >= 2) {
                 /* Named type: args[0] = type name, args[1] = field name */
-                emit(e, "struct ");
-                emit_rewritten_node(e, node->intrinsic.args[0], func);
+                emit_offset_type_operand(e, node->intrinsic.args[0]);   /* BUG-1215 */
                 emit(e, ", ");
                 emit_rewritten_node(e, node->intrinsic.args[1], func);
             }

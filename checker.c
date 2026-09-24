@@ -470,6 +470,25 @@ static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, 
                                             (uint32_t)n->field.object->ident.name_len);
             if (os && os->type && type_dispatch_kind(os->type) == TYPE_ARRAY) break;
         }
+        /* BUG-1219: a FIELD read of a global VARIABLE is a read of that variable,
+         * const or not — C evaluates no object at file scope, and `u32 x = cg.a;`
+         * over `const C cg = { .a = 5 };` emitted `(struct C){ .a = 5U }.a`,
+         * "initializer element is not constant". (An enum's `Color.red` names a
+         * TYPE, and `&g.f` is an address — both are handled elsewhere.) */
+        if (c && n->field.object) {
+            Node *fr = n->field.object;
+            while (fr && (fr->kind == NODE_FIELD || fr->kind == NODE_INDEX))
+                fr = (fr->kind == NODE_FIELD) ? fr->field.object : fr->index_expr.object;
+            if (fr && fr->kind == NODE_IDENT) {
+                Symbol *fs = global_decl_lookup(c, fr->ident.name, (uint32_t)fr->ident.name_len);
+                if (fs && !fs->is_function && fs->func_node &&
+                    fs->func_node->kind == NODE_GLOBAL_VAR) {
+                    *bad = n;
+                    return "reads a field of a global variable, which C cannot evaluate "
+                           "at file scope (not even a const one)";
+                }
+            }
+        }
         GI(n->field.object);
         break;
     case NODE_CALL:
@@ -7513,6 +7532,20 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         char *mname = (char *)arena_alloc(c->arena, mlen + 1);
         memcpy(mname, mangled, mlen + 1);
 
+        /* BUG-1218: `void` and `opaque` are not VALUE types — a field of either
+         * cannot exist, and `A(void)` / `A(opaque)` stamped `void v;` into the
+         * emitted struct (GCC: "variable or field 'v' declared void"). */
+        {
+            TypeKind ck = type_dispatch_kind(concrete);
+            if (ck == TYPE_VOID || ck == TYPE_OPAQUE) {
+                checker_error(c, tn->loc.line,
+                    "container type argument '%s' is not a value type — '%.*s(%s)' "
+                    "would declare a field of it. Use '*opaque' or a named struct",
+                    ctype_name, (int)cnlen, cname, ctype_name);
+                _container_depth--;
+                return ty_void;
+            }
+        }
         /* GAP-7 (BUG-738, 2026-06-10, 6u360k audit): composite type args
          * (Box(?u32), Box(*u32), Pair(Handle(Item)), Box([*]u8)) produced
          * stamped struct names like "Box_?u32" — GCC syntax errors pointing
@@ -9509,6 +9542,15 @@ static Type *check_expr(Checker *c, Node *node) {
                                   node->loc.line);
         if (!node->ident.module_qualified && symbol_is_import_ambiguous(c, sym))
             report_import_ambiguous(c, sym, node->loc.line);   /* BUG-1200 */
+        /* BUG-1217: a comptime function has NO run-time body — it is never
+         * emitted — so it can only be CALLED (and folded). Naming it as a value
+         * (`*(u32) -> u32 fp = BIT;`) reached GCC as "'BIT' undeclared". */
+        if (sym && sym->is_function && sym->is_comptime && node != c->call_callee_node)
+            checker_error(c, node->loc.line,
+                "comptime function '%.*s' has no run-time body, so it cannot be used "
+                "as a value (a function pointer) — call it with constant arguments, "
+                "or write a regular function",
+                (int)node->ident.name_len, node->ident.name);
         result = sym ? sym->type : ty_void;
         /* BUG-1099: the for-in desugaring's own variables are reserved — the
          * `_zer_` prefix already stops a user DECLARING one, and nothing stopped a
@@ -12931,7 +12973,10 @@ static Type *check_expr(Checker *c, Node *node) {
 
         /* normal function call */
         normal_call:;
+        Node *sv_callee = c->call_callee_node;
+        c->call_callee_node = node->call.callee;   /* BUG-1217 */
         Type *callee_type = check_expr(c, node->call.callee);
+        c->call_callee_node = sv_callee;
         /* unwrap distinct typedef for call dispatch */
         Type *effective_callee = type_unwrap_distinct(callee_type);
         /* BUG-1046: a FIELD / INDEX callee (`o.cb(&g)`, `tbl[i](&g)`) is typed
@@ -29790,12 +29835,19 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
                             "global variable '%.*s' initializer must be a constant "
                             "expression — %s",
                             (int)decl->var_decl.name_len, decl->var_decl.name, reason);
-                    } else {
+                    } else if (bad->kind == NODE_INTRINSIC) {
                         checker_error(c, decl->loc.line,
                             "global variable '%.*s' initializer cannot use @%.*s — it %s. "
                             "Use a literal, or compute it in a function body",
                             (int)decl->var_decl.name_len, decl->var_decl.name,
                             (int)bad->intrinsic.name_len, bad->intrinsic.name, reason);
+                    } else {
+                        /* BUG-1219: any other offending node (a field read). */
+                        checker_error(c, decl->loc.line,
+                            "global variable '%.*s' initializer must be a compile-time "
+                            "constant — it %s. Use a literal or a scalar const, or "
+                            "assign in an init function",
+                            (int)decl->var_decl.name_len, decl->var_decl.name, reason);
                     }
                 }
             }

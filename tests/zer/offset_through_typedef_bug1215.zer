@@ -1,0 +1,13 @@
+// BUG-1215: @offset named its type operand `struct <name>` literally, so a typedef
+// or a distinct name was an undefined C struct ("invalid use of undefined type").
+struct A { u8 x; u32 y; u8 z; }
+typedef A AA;
+distinct typedef A DA;
+u32 main() {
+    usize a = @offset(AA, z);
+    usize d = @offset(DA, z);
+    usize r = @offset(A, z);
+    if (a != r || d != r) { return 1; }
+    if (@size(DA) != @size(A)) { return 2; }
+    return 0;
+}

@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-24b — BUG-1194..1214: bare-metal and module holes (an audit agent's batch, each re-measured)
+## Session 2026-09-24b — BUG-1194..1220: bare-metal and module holes (an audit agent's batch, each re-measured)
 
 **Method.** Every negative below COMPILED on the from-HEAD baseline (`5b63c9b8`) and is refused
 now, for the reason its `// expect-error:` names; the positive FAILED on the baseline. Corpus
@@ -198,6 +198,30 @@ The checker registers every top-level name first, so `u32 use() { return later; 
 `'later' undeclared`. Pass 2 of `emit_file_module` now emits every global before any function
 body (a global's initializer can name only prototyped functions and other globals, whose order
 is kept). Test: `tests/zer/global_used_before_decl_bug1214.zer`.
+
+### BUG-1215..1220 — six programs the checker accepted and GCC refused (or ran wrong)
+Each compiled clean through the checker and then failed in GCC against the generated file — the
+"loud" class, except BUG-1216's float half, which RAN with a wrong value.
+- **BUG-1215** `@offset(AA, z)` through a typedef or a distinct name emitted `offsetof(struct AA,
+  z)` — the name spelled as a C struct tag. `emit_offset_type_operand` (both emitter paths)
+  resolves the name to its type and emits that. Test: `tests/zer/offset_through_typedef_bug1215.zer`.
+- **BUG-1216** `In g = MK(3);` (a comptime call with a STRUCT result) emitted `struct In g = 0;`,
+  and `f64 gf = H(1.5);` emitted `= 0` and ran with 0.0: the global path tried the integer fold
+  first and a struct/float comptime call "folds" to its unused integer slot. It now emits the
+  folded literal. Test: `tests/zer/global_comptime_struct_float_init_bug1216.zer`.
+- **BUG-1217** a comptime function used as a VALUE (`fp = BIT;`) — it has no emitted body. Refused
+  unless it is the callee of the call being checked (`Checker.call_callee_node`). Test:
+  `comptime_fn_as_value_bug1217`.
+- **BUG-1218** `A(void)` / `A(opaque)` stamped a `void v;` field. Refused (not a value type).
+  Test: `container_void_arg_bug1218`.
+- **BUG-1219** `u32 x = cg.a;` over a `const C cg` emitted a compound-literal field read at file
+  scope. `global_init_scan` refuses a field read of a global variable (an enum's `Color.red` names
+  a type and `&g.f` is an address — both still allowed); its reporter gained a generic branch, the
+  old catch-all assumed every other offending node was an intrinsic (which also garbled the
+  depth-cap case). Test: `global_init_const_field_bug1219`.
+- **BUG-1220** a DISTINCT array typedef was declared `uint8_t[4] q;` — `emit_type_and_name` tested
+  the raw kind, so the array declarator never ran for a distinct wrapper. Test:
+  `tests/zer/distinct_array_typedef_bug1220.zer` (local, global, param, field, copy, `.len`).
 
 ---
 

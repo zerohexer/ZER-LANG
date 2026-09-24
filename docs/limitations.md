@@ -163,6 +163,32 @@ rule refuses to guess).
 
 ---
 
+## OPEN — two modules declaring a container template of the same NAME (2026-09-24, LOW — loud)
+
+`container Box(T)` in module cx1 and a different `container Box(T)` in module cx2: the template
+table and the stamped `Box_u32` are program-wide, so cx2's `Box(u32)` resolves to cx1's layout
+and cx2's own body then fails to check ("array index 7 is out of bounds for array of size 2",
+"no field 'n'"). Loud, never silent — the second module's code is checked against the first
+layout and refused. Fix: key container templates (and their stamps) by module like struct types
+(`module_prefix` on the stamped struct + a per-module template lookup). Reproducer:
+`/tmp`-style pair — cx1.zer `container Box(T) { T[2] d; } Box(u32) b1;`, cx2.zer `container
+Box(T) { T[8] d; u32 n; } Box(u32) b2; u32 f2() { b2.d[7] = 4; return b2.d[7]; }`.
+
+---
+
+## OPEN — `@probe` cannot return null on a freestanding target (2026-09-24, FLOOR — documented)
+
+`@probe(addr)` recovers from a fault with `signal()` + `setjmp()`. A freestanding build has
+neither, so the emitted probe is a direct read: a faulting address takes the CPU fault (HardFault,
+bus error) instead of yielding null. reference.md used to say "works on any platform". This is a
+platform floor, not a checker gap — recovering needs a target-specific fault handler that knows
+the faulting instruction's length (Cortex-M: stacked PC in the exception frame, advance past the
+LDR, set a flag). Fix sketch if wanted: a `--probe-handler=cortex-m` mode emitting a HardFault
+handler + a volatile `_zer_in_probe` / `_zer_probe_faulted` pair, the same shape as the hosted
+path, with the PC advance done in asm. Until then the docs say what happens.
+
+---
+
 ## OPEN — atomic-cell diagnostics for an imported module's global name the wrong file (2026-09-24, LOW — diagnostic only)
 
 `check_atomic_cell_safety` runs after every body is checked and reports at the recorded LINE

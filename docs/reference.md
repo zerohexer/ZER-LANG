@@ -1565,6 +1565,12 @@ duplicate labels           // COMPILE ERROR — label 'x' already defined
 **NOTES**
 - Labels are function-scoped — cannot goto between functions. There is no fixed
   limit on the number of labels in a function.
+- A `goto` may not jump PAST a declaration into its scope when the code after
+  the label reads that variable: it would hold whatever an earlier pass left
+  there, not its declared value (for a non-null pointer, a function pointer or
+  an enum without a 0 variant, not even a value of its type). Declare it before
+  the goto. Skipping a declaration nothing after the label reads — the cleanup
+  chain — is fine.
 - A **forward** `goto` fires EVERY defer pending at the goto, in LIFO order —
   including the defers of scopes the label is still inside — and those defers do not
   fire again later. So after `goto out;`, code at `out:` runs with the function's

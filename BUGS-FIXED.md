@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-24d — BUG-1231..1244: the async batch (an audit agent's findings, each re-measured)
+## Session 2026-09-24d — BUG-1231..1245: the async batch and residuals (an audit agent's findings, each re-measured)
 
 **Method.** The ag5 async audit ran ~120 probes against a frozen compiler, each async hole
 paired with its NON-async control. Every negative below COMPILED on the from-HEAD baseline
@@ -93,8 +93,21 @@ global, was refused with the param sentence. IR lowering gives same-named locals
 fields (measured: nested and loop shadows keep their own values across yields); the ban now
 applies to a parameter's name only.
 
-Tests: `tests/zer_fail/*_bug123[1-9].zer`, `*_bug124[0-3].zer`; `tests/zer/*_bug123[1-9].zer`,
-`*_bug124[0134].zer`; `tests/zer_trap/async_result_before_done_bug1237.zer`; sink matrix p40.
+### BUG-1245 — a goto past an initialised declaration read a stale value (ag2 residual)
+`goto inside;` into a block past `u32 v = 7;`, then `r += v`: locals are hoisted, so `v` held
+the previous iteration's 100 and main returned 107. BUG-1189 refused the bypass only for types
+with no zero value; it now applies to every non-static declaration that the code after the label
+reads (C++'s rule, with BUG-1189's observed-after-the-label scoping). Corpus cost: zero hits
+(compiler-classified over every `.zer` in tests/, rust_tests/, zig_tests/, test_modules/, lib/,
+examples/).
+
+**Re-measured and NOT bugs.** The ag6 "over-rejections" d5b, m1s, f6b, f8, m3w and k4e report a
+leak at an `orelse return` whose failed `alloc` really leaks an earlier allocation; j4b and j5d
+are real hazards when the callee's `alloc` fails (the old pointer / the stack view survives).
+The INT64_MIN spelling is the recorded `CONST_EVAL_FAIL` sentinel entry.
+
+Tests: `tests/zer_fail/*_bug123[1-9].zer`, `*_bug124[0-35].zer`; `tests/zer/*_bug123[1-9].zer`,
+`*_bug124[01345].zer`; `tests/zer_trap/async_result_before_done_bug1237.zer`; sink matrix p40.
 
 ---
 

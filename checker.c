@@ -25670,6 +25670,18 @@ static bool decl_has_no_zero_value(Checker *c, Node *decl) {
     return checker_type_has_no_zero_value(checker_get_type(c, decl));
 }
 
+/* BUG-1245: a goto may not jump past ANY declaration into its scope when the
+ * variable is read after the label. Locals are hoisted and zeroed at the
+ * function top (or re-zeroed where the declaration runs, BUG-1221), so a jump
+ * past `u32 v = 7;` read whatever the previous pass left — measured: 100 from
+ * the previous loop iteration, where the source says 7. C++'s rule (a jump may
+ * not bypass an initialization), limited as BUG-1189 is to a variable the code
+ * after the label can observe. The no-zero-value types keep their own sentence. */
+static bool decl_bypass_tracked(Checker *c, Node *decl) {
+    (void)c;
+    return decl && decl->kind == NODE_VAR_DECL && !decl->var_decl.is_static;
+}
+
 /* BUG-1189: is `name` mentioned by any statement at or after `line`? The bypassed
  * declaration is only a hazard when its (zero) value can be OBSERVED after the jump
  * lands — the ordinary cleanup chain `goto cleanup1;` past `*R2 r2 = …;` whose
@@ -25746,7 +25758,7 @@ static void collect_labels(Checker *c, Node *node, LabelInfo *labels,
         int pushed = 0;
         for (int i = 0; i < node->block.stmt_count; i++) {
             collect_labels(c, node->block.stmts[i], labels, count, max, arms);
-            if (decl_has_no_zero_value(c, node->block.stmts[i])) {   /* BUG-1189 */
+            if (decl_bypass_tracked(c, node->block.stmts[i])) {   /* BUG-1189, BUG-1245 */
                 arm_stack_push(c, arms, node->block.stmts[i]);
                 pushed++;
             }
@@ -25848,7 +25860,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
                                                 (uint32_t)byp->var_decl.name_len,
                                                 tgt->line))
                 break;   /* bypassed, but never observed after the label */
-            if (byp) {
+            if (byp && decl_has_no_zero_value(c, byp)) {
                 checker_error(c, node->loc.line,
                     "goto '%.*s' jumps past the declaration of '%.*s' (line %d) into its "
                     "scope — its type has no zero value (a non-null pointer, a function "
@@ -25856,6 +25868,17 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
                     "hold one. Move the declaration before the goto, or make it optional",
                     (int)node->goto_stmt.label_len, node->goto_stmt.label,
                     (int)byp->var_decl.name_len, byp->var_decl.name, byp->loc.line);
+                break;
+            }
+            if (byp) {                                                     /* BUG-1245 */
+                checker_error(c, node->loc.line,
+                    "goto '%.*s' jumps past the declaration of '%.*s' (line %d) into its "
+                    "scope, and '%.*s' is read after the label — it would hold whatever an "
+                    "earlier pass left there, not its declared value. Move the declaration "
+                    "before the goto",
+                    (int)node->goto_stmt.label_len, node->goto_stmt.label,
+                    (int)byp->var_decl.name_len, byp->var_decl.name, byp->loc.line,
+                    (int)byp->var_decl.name_len, byp->var_decl.name);
                 break;
             }
             checker_error(c, node->loc.line,
@@ -25869,7 +25892,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
         int pushed = 0;
         for (int i = 0; i < node->block.stmt_count; i++) {
             validate_gotos(c, node->block.stmts[i], labels, label_count, arms);
-            if (decl_has_no_zero_value(c, node->block.stmts[i])) {   /* BUG-1189 */
+            if (decl_bypass_tracked(c, node->block.stmts[i])) {   /* BUG-1189, BUG-1245 */
                 arm_stack_push(c, arms, node->block.stmts[i]);
                 pushed++;
             }

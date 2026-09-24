@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: is read after the label
+// BUG-1245: the goto skipped 'u32 v = 7' and read the previous pass's 100 (returned 107).
+u32 main() {
+    u32 n = 0;
+    u32 r = 0;
+    while (n < 2) {
+        n += 1;
+        if (n == 2) { goto inside; }
+        {
+            u32 v = 7;
+inside:
+            r += v;
+            v = 100;
+        }
+    }
+    return r;
+}

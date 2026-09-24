@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot form a reference into a function's returned value
+// BUG-1187: `mk(k)` returns a struct by value — a TEMPORARY. A slice of its array
+// field outlived it: pre-fix this compiled, `leak` returned a view of a dead frame
+// and main read garbage (ASan stack-use-after-return).
+struct B { u32[4] arr; }
+B mk(u32 k) { B b; b.arr[2] = k; return b; }
+[*]u32 leak(u32 k) { return mk(k).arr[0..]; }
+u32 main() {
+    [*]u32 s = leak(7);
+    if (s[2] != 7) { return 1; }
+    return 0;
+}

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: Ring element type cannot be Barrier
+// BUG-1180: a Ring copies elements BY VALUE, so a Ring of a unique resource is a
+// copy that no value-flow sink sees. Pre-fix `rq.push(b1)` compiled clean: a second
+// owner of one barrier count.
+Barrier b1;
+Ring(Barrier, 4) rq;
+u32 main() {
+    @barrier_init(b1, 1);
+    rq.push(b1);
+    return 0;
+}

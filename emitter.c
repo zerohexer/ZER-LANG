@@ -1561,19 +1561,40 @@ static bool type_carries_enum_e(Type *t, int depth) {
  * CLAUDE.md: an intrinsic handled in only one path falls through to a placeholder
  * emission and segfaults at runtime, so the value expression is passed in as an
  * already-emitted callback rather than duplicating the body. */
+/* BUG-1193: the membership test runs on the OPERAND's own value and type. It used
+ * to narrow to int32 first, so `@try_enum(Gap, (u64)4294967306)` matched the
+ * variant 10 and `@try_enum(Dir, (u32)0xFFFFFFFF)` matched -1 — the checked door
+ * returning a variant for a value that is not one. `src` is the operand's type: a
+ * variant is compared only when it is REPRESENTABLE in that type (a negative value
+ * never matches an unsigned operand; 300 never matches a u8), and then exactly, in
+ * the operand's type. Unknown type: fall back to the old int32 test. */
 static void emit_try_enum_open(Emitter *e) {
-    emit(e, "({ int32_t _zer_tev = (int32_t)(");
+    emit(e, "({ __auto_type _zer_tew = (");
 }
-static void emit_try_enum_close(Emitter *e, Type *t) {
+static void emit_try_enum_close(Emitter *e, Type *t, Type *src) {
     Type *u = t ? type_unwrap_distinct(t) : NULL;
-    emit(e, "); _zer_opt_i32 _zer_teo; _zer_teo.has_value = (");
-    if (u && type_dispatch_kind(u) == TYPE_ENUM && u->enum_type.variant_count > 0) {
+    Type *se = src ? type_unwrap_distinct(src) : NULL;
+    int bits = (se && type_is_integer(se)) ? type_width(se) : 0;
+    bool sgn = se && type_is_signed(se);
+    emit(e, "); int32_t _zer_tev = (int32_t)_zer_tew; _zer_opt_i32 _zer_teo; "
+            "_zer_teo.has_value = (0");
+    if (u && type_dispatch_kind(u) == TYPE_ENUM) {
         for (uint32_t vi = 0; vi < u->enum_type.variant_count; vi++) {
-            if (vi) emit(e, " || ");
-            emit(e, "_zer_tev == %lld", (long long)u->enum_type.variants[vi].value);
+            long long v = (long long)u->enum_type.variants[vi].value;
+            if (bits <= 0) {                     /* operand type unknown */
+                emit(e, " || _zer_tev == %lld", v);
+                continue;
+            }
+            bool fits;
+            if (sgn) {
+                fits = bits >= 64 ||
+                       (v >= -(1LL << (bits - 1)) && v <= (1LL << (bits - 1)) - 1);
+            } else {
+                fits = v >= 0 && (bits >= 63 || v <= (long long)((1ULL << bits) - 1));
+            }
+            if (!fits) continue;                 /* no value of the operand is v */
+            emit(e, " || _zer_tew == (__typeof__(_zer_tew))%lldLL", v);
         }
-    } else {
-        emit(e, "0");
     }
     emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
 }
@@ -2783,11 +2804,20 @@ static void emit_expr(Emitter *e, Node *node) {
         return;
     }
     if (lv) e->nn_lvalue = lv;
+    /* BUG-1183: an assignment is an EXPRESSION in ZER and is emitted in value
+     * position (`a[0] = (y = 5) + 1;`, `x + (x = 10)`); C's `=` binds loosest of
+     * all, so without its own parentheses the enclosing operator's operand
+     * swallowed it — `(y = 5U + 1U)` stored 6 into y, `(y = 3U == 3U)` stored 1,
+     * `-(y=5)` became the invalid `-y = 5`. Parenthesised at the one dispatch
+     * point for each emitter, so every nested position is covered. */
+    bool asg_paren = node->kind == NODE_ASSIGN;
+    if (asg_paren) emit(e, "(");
     bool ur_ptr = false; uint32_t ur_idx = 0;
     Node *ur = e->global_init_depth == 0 ? union_partial_write_target(e, node, &ur_ptr, &ur_idx) : NULL;
     if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, NULL, emit_node_via_ast);
     emit_expr_impl(e, node);
     if (ur) emit(e, ")");
+    if (asg_paren) emit(e, ")");
     e->nn_lvalue = saved_lv;
 }
 
@@ -4556,7 +4586,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
                 Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
                 if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
-                emit(e, "; memcpy(&_zer_si%d.%.*s, &(", si_tmp, (int)fname_len, fname);
+                emit(e, "; memcpy(&_zer_si%d.%.*s, (", si_tmp, (int)fname_len, fname);   /* BUG-1192 */
                 emit_expr(e, node->struct_init.fields[i].value);
                 emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
             }
@@ -4918,7 +4948,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             if (node->intrinsic.arg_count > 0) emit_expr(e, node->intrinsic.args[0]);
             else emit(e, "0");
             emit_try_enum_close(e, node->intrinsic.type_arg
-                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL,
+                                node->intrinsic.arg_count > 0
+                                   ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             if (node->intrinsic.arg_count > 0)
@@ -6008,6 +6040,23 @@ static void emit_func_prototype(Emitter *e, Node *node) {
     emit(e, ";\n");
 }
 
+/* BUG-1177: `typedef struct _zer_async_NAME _zer_async_NAME;` for every async
+ * function, before any prototype. The state struct is defined where the async
+ * function itself is emitted (in declaration order), so without this a function
+ * declared EARLIER that takes `*_zer_async_NAME` named an unknown type — and the
+ * pointer is the only legal way to pass a task. Names are unmangled, matching
+ * emit_async_func_from_ir (BUG-866). */
+static void emit_async_forward_typedefs(Emitter *e, Node *file_node) {
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
+            continue;
+        emit(e, "typedef struct _zer_async_%.*s _zer_async_%.*s;\n",
+             (int)d->func_decl.name_len, d->func_decl.name,
+             (int)d->func_decl.name_len, d->func_decl.name);
+    }
+}
+
 static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
     /* BUG-997: mark the global-initializer context for the whole emission, so a
@@ -6633,21 +6682,14 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         Type *et = checker_get_type(e->checker, decl);
         emit(e, "/* enum %.*s */\n",
              (int)decl->enum_decl.name_len, decl->enum_decl.name);
-        int32_t next_val = 0;
+        /* BUG-1191: print the CHECKER's values — the one fold, so the emitted
+         * #define and every compile-time decision agree by construction. */
+        Type *ete = et ? type_unwrap_distinct(et) : NULL;
         for (int j = 0; j < decl->enum_decl.variant_count; j++) {
             EnumVariant *v = &decl->enum_decl.variants[j];
-            int32_t val;
-            if (v->value && v->value->kind == NODE_INT_LIT) {
-                val = (int32_t)v->value->int_lit.value;
-                next_val = val + 1;
-            } else if (v->value && v->value->kind == NODE_UNARY &&
-                       v->value->unary.op == TOK_MINUS &&
-                       v->value->unary.operand->kind == NODE_INT_LIT) {
-                val = -(int32_t)v->value->unary.operand->int_lit.value;
-                next_val = val + 1;
-            } else {
-                val = next_val++;
-            }
+            int32_t val = (ete && type_dispatch_kind(ete) == TYPE_ENUM &&
+                           (uint32_t)j < ete->enum_type.variant_count)
+                ? ete->enum_type.variants[j].value : j;
             emit(e, "#define _ZER_");
             if (et) EMIT_ENUM_NAME(e, et);
             else emit(e, "%.*s", (int)decl->enum_decl.name_len, decl->enum_decl.name);
@@ -7643,6 +7685,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* BUG-1128: prototypes for every function with a body — after every type
      * they can name, before any function or global initializer that names them. */
     emit(e, "\n/* ZER function prototypes */\n");
+    emit_async_forward_typedefs(e, file_node);
     for (int i = 0; i < file_node->file.decl_count; i++)
         emit_func_prototype(e, file_node->file.decls[i]);
     emit(e, "\n");
@@ -8183,11 +8226,14 @@ static void emit_rewritten_node(Emitter *e, Node *node, IRFunc *func) {
         return;
     }
     if (lv) e->nn_lvalue = lv;
+    bool asg_paren = node->kind == NODE_ASSIGN;   /* BUG-1183 — see emit_expr */
+    if (asg_paren) emit(e, "(");
     bool ur_ptr = false; uint32_t ur_idx = 0;
     Node *ur = union_partial_write_target(e, node, &ur_ptr, &ur_idx);
     if (ur) emit_union_reset_prefix(e, ur, ur_ptr, ur_idx, func, emit_rewritten_node);
     emit_rewritten_node_impl(e, node, func);
     if (ur) emit(e, ")");
+    if (asg_paren) emit(e, ")");
     e->nn_lvalue = saved_lv;
 }
 
@@ -11525,7 +11571,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
             else emit(e, "0");
             emit_try_enum_close(e, node->intrinsic.type_arg
-                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL);
+                                   ? resolve_tynode(e, node->intrinsic.type_arg) : NULL,
+                                node->intrinsic.arg_count > 0
+                                   ? checker_get_type(e->checker, node->intrinsic.args[0]) : NULL);
         } else if (nlen == 5 && memcmp(name, "probe", 5) == 0 && node->intrinsic.arg_count > 0) {
             emit(e, "_zer_probe((uintptr_t)(");
             emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -11888,7 +11936,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 uint32_t fname_len = (uint32_t)node->struct_init.fields[i].name_len;
                 Type *aft = struct_field_type_by_name(si_type, fname, fname_len);
                 if (!aft || type_dispatch_kind(aft) != TYPE_ARRAY) continue;
-                emit(e, "; memcpy(&_zer_si%d.%.*s, &(", si_tmp, (int)fname_len, fname);
+                emit(e, "; memcpy(&_zer_si%d.%.*s, (", si_tmp, (int)fname_len, fname);
                 emit_rewritten_node(e, node->struct_init.fields[i].value, func);
                 emit(e, "), sizeof(_zer_si%d.%.*s))", si_tmp, (int)fname_len, fname);
             }
@@ -13722,10 +13770,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                   src_eff && src_eff->kind == TYPE_ARRAY);
             if (need_arr_copy) {
                 emit_indent(e);
+                /* BUG-1192: sizeof the DESTINATION — an array PARAMETER source is
+                 * a decayed pointer, so sizeof(src) was 8 and `u8[64] c = a;`
+                 * copied 8 bytes. The types are equal, so the sizes are. */
                 emit(e, "memcpy(%s%.*s, %s%.*s, sizeof(%s%.*s));\n",
                      sp, (int)dst->name_len, dst->name,
                      sp, (int)src->name_len, src->name,
-                     sp, (int)src->name_len, src->name);
+                     sp, (int)dst->name_len, dst->name);
                 break;
             }
 
@@ -14327,15 +14378,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     Type *fty_arr = struct_field_type_by_name(inst->cast_type, fname, fname_len);
                     if (!fty_arr || type_dispatch_kind(fty_arr) != TYPE_ARRAY) continue;
                     emit_indent(e);
+                    /* BUG-1192: the SOURCE is the array's VALUE (it decays to the
+                     * first element's address), never `&src` — for an array
+                     * PARAMETER, which C has already decayed to a pointer, `&a` is
+                     * the address of that pointer variable, so the copy read
+                     * sizeof(field) bytes of the caller's stack frame. */
                     emit(e, "memcpy(&");
                     emit_local_name(e, func, inst->dest_local);
-                    emit(e, ".%.*s, &", (int)fname_len, fname);
+                    emit(e, ".%.*s, (", (int)fname_len, fname);
                     if (inst->call_arg_locals && i < inst->call_arg_local_count &&
                         inst->call_arg_locals[i] >= 0)
                         emit_local_name(e, func, inst->call_arg_locals[i]);
                     else
                         emit_rewritten_node(e, inst->expr->struct_init.fields[i].value, func);
-                    emit(e, ", sizeof(");
+                    emit(e, "), sizeof(");
                     emit_local_name(e, func, inst->dest_local);
                     emit(e, ".%.*s));\n", (int)fname_len, fname);
                 }
@@ -14739,8 +14795,11 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         ? afn_type->func_ptr.ret : NULL;
     if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
 
-    /* State struct = ALL locals */
-    emit(e, "typedef struct {\n");
+    /* State struct = ALL locals. BUG-1177: TAGGED, and the typedef itself is
+     * emitted up front (emit_async_forward_typedefs), so a function declared
+     * before this one can take a `*_zer_async_NAME` — the pointer is the only way
+     * to hand a task around, since the value is not copyable. */
+    emit(e, "struct _zer_async_%.*s {\n", flen, mname);
     emit(e, "    int _zer_state;\n");
     if (async_ret) {
         emit(e, "    ");
@@ -14755,7 +14814,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
         emit_type_and_name(e, l->type, l->name, l->name_len);
         emit(e, ";\n");
     }
-    emit(e, "} _zer_async_%.*s;\n\n", flen, mname);
+    emit(e, "};\n\n");
 
     /* Result accessor — only for a non-void async. Reading it before the poll
      * protocol reports done yields the zeroed initial value, exactly like any

@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: the implicit next value exceeds i32 range
+// BUG-1191: pre-fix `b` silently wrapped to -2147483648 (and the compiler itself
+// performed signed-overflow UB computing it).
+enum Big { a = 2147483647, b }
+u32 main() { return (u32)(i32)Big.a - 2147483647; }

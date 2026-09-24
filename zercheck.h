@@ -142,6 +142,14 @@ typedef struct {
      * called between `p = g.alloc(T)` and `p.v` was a silent use-after-free
      * (the next alloc returned the same bytes). */
     bool resets_arena;
+    /* BUG-1181: the function (or a callee, transitively) FREES the allocation a
+     * GLOBAL holds — `void drop_g() { if (g) |p| { free(p); } g = null; }`.
+     * Each entry is the global's key as zercheck_ir spells it for its
+     * (IR_GLOBAL_ROOT_ID, key) entry: the bare name `g`, or a projection `g.p`.
+     * The call site widens the CALLER's allocation that entry aliases to
+     * MAYBE_FREED, so `g = a; drop_g(); a.v` is refused. Arena array; 0 = none. */
+    int freed_global_n;
+    struct ZcFreedGlobal { const char *key; uint32_t len; } *freed_global;
 } FuncSummary;
 
 /* ZER-CHECK context */
@@ -167,6 +175,10 @@ typedef struct {
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
     bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
+    /* BUG-1181: global keys the function being analysed frees through (dynamic,
+     * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
+    struct ZcFreedGlobal *cur_freed_global;
+    int cur_freed_global_n, cur_freed_global_cap;
 
     /* allocation ID counter — each unique allocation gets a unique ID */
     int next_alloc_id;

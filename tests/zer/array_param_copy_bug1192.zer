@@ -1,0 +1,18 @@
+// BUG-1192: copying an ARRAY PARAMETER. C decays `u8[64] a` to a pointer, so the
+// emitted `memcpy(&dst.arr, &a, sizeof(dst.arr))` read 64 bytes starting at the
+// POINTER variable (stack garbage), and `u8[64] c = a;` used `sizeof(a)` == 8.
+struct S { u8[64] arr; u32 k; }
+S mk(u8[64] a) { return { .arr = a, .k = 1 }; }
+u32 via_literal(u8[64] a) { S y = { .arr = a }; return y.arr[40]; }
+u32 via_assign(u8[64] a) { S z; z = { .arr = a, .k = 2 }; return z.arr[63]; }
+u32 via_decl(u8[64] a) { u8[64] c = a; return c[40] + c[63]; }
+u32 main() {
+    u8[64] b;
+    b[3] = 9; b[40] = 7; b[63] = 5;
+    S x = mk(b);
+    if (x.arr[3] != 9 || x.arr[40] != 7 || x.arr[63] != 5) { return 1; }
+    if (via_literal(b) != 7) { return 2; }
+    if (via_assign(b) != 5) { return 3; }
+    if (via_decl(b) != 12) { return 4; }
+    return 0;
+}

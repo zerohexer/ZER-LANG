@@ -1759,6 +1759,21 @@ static bool const_int_into_enum(Node *value, Type *vt, Type *target) {
  * permissive answer it replaced. The reporter now says what actually happened. */
 static const char _res_walk_stopped[] = "<walk stopped>";
 
+/* BUG-1177: an async function's STATE (`_zer_async_NAME`) is a unique resource
+ * too, for a reason the six builtins do not share: it is SELF-REFERENTIAL. Every
+ * local of the coroutine is promoted into the state struct, so `*u32 p = &x;`
+ * before a `yield` stores `&self->x` into `self->p`. A bitwise copy of the task
+ * after its first poll carries a `p` that still points into the ORIGINAL — and
+ * when the original is a dead frame, every later poll of the copy writes into it.
+ * Measured: `g = t;` in a function that then returned, `poll(&g)` = ASan
+ * stack-use-after-return; the in-frame copy silently updated the wrong task.
+ * Rust's answer is `Pin`, a type-system fact ZER cannot express, so the rule is
+ * the one ZER already has for unique state: address it by name or by pointer
+ * (`_zer_async_NAME_init/_poll/_result` all take `*`). Returning a LOCAL task is
+ * refused too: that "move" is a bitwise copy like any other. Compared by
+ * POINTER, like `_res_walk_stopped`. */
+static const char _res_async_task[] = "async task";
+
 static const char *unique_resource_name(Type *t, int depth) {
     /* BUG-976: MY OWN fail-open cap, written in BUG-970 three days ago. NULL means
      * "not a resource", i.e. ACCEPT the copy — so a struct nesting an Arena 9 deep
@@ -1785,6 +1800,8 @@ static const char *unique_resource_name(Type *t, int depth) {
     case TYPE_SEMAPHORE: return "Semaphore";
     case TYPE_ARRAY:     return unique_resource_name(e->array.inner, depth + 1);
     case TYPE_STRUCT:
+        /* BUG-1177: an async task is not copyable either — see _res_async_task. */
+        if (e->struct_type.is_async_state) return _res_async_task;
         for (uint32_t i = 0; i < e->struct_type.field_count; i++) {
             const char *r = unique_resource_name(e->struct_type.fields[i].type, depth + 1);
             if (r) return r;
@@ -1870,8 +1887,16 @@ static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
             what);
         return true;
     }
-    bool ptr_ok = (rn[0] == 'B' || rn[0] == 'S');   /* Barrier, Semaphore */
-    if (rn[0] == 'S' && rn[1] == 'l') ptr_ok = false;   /* Slab, not Semaphore */
+    if (rn == _res_async_task) {
+        checker_error(c, line,
+            "cannot %s an async task by value — its promoted locals may point at each "
+            "other (`*T p = &x;` across a yield stores the address of the task's own "
+            "field), so a copy would keep writing into the ORIGINAL task, which may be "
+            "a dead frame. Pass a pointer ('*_zer_async_...') instead",
+            what);
+        return true;
+    }
+    bool ptr_ok = (strcmp(rn, "Barrier") == 0 || strcmp(rn, "Semaphore") == 0);
     if (ptr_ok)
         checker_error(c, line,
             "cannot %s '%s' by value — resource types are not copyable, because the "
@@ -2484,6 +2509,92 @@ static Node *keep_view_root_ident(Checker *c, Node *e) {
 }
 
 static bool struct_init_has_local_derived(Checker *c, Node *init);
+/* BUG-1186: does `v` FORM A REFERENCE into the storage a union `|*w|` capture
+ * points at? A reference is formed by the capture itself, anything derived from
+ * it by a var-decl (`*P q = w;`), `&w.f` / `&w.a[i]`, a SLICE of an array inside
+ * it, an ARRAY field of it decaying to a slice, or a call handed any of those (a
+ * callee may return a view of its argument). A plain field READ (`w.ptr`, `w.n`)
+ * copies a value out and forms nothing — CLAUDE.md "FORMING a reference aliases;
+ * READING a value does not". Recurses the orelse JOIN and struct literals. */
+static bool type_can_carry_pointer(Type *t);
+static int escaping_block_depth(Checker *c, int depth);
+static bool value_forms_variant_ref(Checker *c, Node *v, int depth) {
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    v = unwrap_ptr_launder(v);
+    if (!v) return false;
+    switch (v->kind) {
+    case NODE_IDENT: {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name,
+                                 (uint32_t)v->ident.name_len);
+        return s && s->is_variant_capture;
+    }
+    case NODE_UNARY:
+        if (v->unary.op != TOK_AMP) return false;
+        { Node *r = v->unary.operand;
+          while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX ||
+                       (r->kind == NODE_UNARY && r->unary.op == TOK_STAR)))
+              r = r->kind == NODE_FIELD ? r->field.object
+                : r->kind == NODE_INDEX ? r->index_expr.object : r->unary.operand;
+          return r && value_forms_variant_ref(c, r, depth + 1); }
+    case NODE_SLICE: {
+        Node *r = v->slice.object;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+            r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+        return r && value_forms_variant_ref(c, r, depth + 1);
+    }
+    case NODE_FIELD: case NODE_INDEX: {
+        /* Only an ARRAY-typed projection forms a reference (it decays). */
+        Type *t = checker_get_type(c, v);
+        if (!t || type_dispatch_kind(t) != TYPE_ARRAY) return false;
+        Node *r = v;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+            r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+        return r && value_forms_variant_ref(c, r, depth + 1);
+    }
+    case NODE_ORELSE:
+        return value_forms_variant_ref(c, v->orelse.expr, depth + 1) ||
+               value_forms_variant_ref(c, v->orelse.fallback, depth + 1);
+    case NODE_CALL: {
+        /* Only a result that can carry a pointer can be a view of an argument. */
+        Type *rt = checker_get_type(c, v);
+        if (rt && !type_can_carry_pointer(rt)) return false;
+        for (int i = 0; i < v->call.arg_count; i++)
+            if (value_forms_variant_ref(c, v->call.args[i], depth + 1)) return true;
+        return false;
+    }
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            if (value_forms_variant_ref(c, v->struct_init.fields[i].value, depth + 1))
+                return true;
+        return false;
+    /* Values that cannot carry a reference into the variant. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_TYPECAST: case NODE_SIZEOF:
+        return false;
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
+static void report_variant_ref_store(Checker *c, int line, const char *what) {
+    checker_error(c, line,
+        "cannot %s a pointer into a union variant — a '|*v|' switch capture is "
+        "valid only while its arm runs and the union keeps that variant; once the "
+        "variant changes, the pointer reads the new variant's bytes as the old type. "
+        "Copy the value out (capture '|v|'), or finish using the pointer inside the arm",
+        what);
+}
+
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     /* BUG-976: ten nested identity calls laundered `&x` into a global because this
      * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED.
@@ -2540,7 +2651,8 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
              * direct-store + keep sinks already reject arena-derived; this launder
              * path was blind to it (only tested is_local_derived). Applied at all
              * 5 "is this src frame-bound?" sites in this predicate. */
-            if (src && (src->is_local_derived || src->is_arena_derived))
+            if (src && (src->is_local_derived || src->is_arena_derived ||
+                        src->is_variant_capture))                  /* BUG-1186 */
                 return true;
             /* local array passed as slice → points to stack */
             if (src && src->type && type_unwrap_distinct(src->type)->kind == TYPE_ARRAY) {
@@ -3126,7 +3238,8 @@ static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
 
 /* keep-arg short-lived-borrow classes (Site 1 deferred enforcement). KV_NONE =
  * the arg is acceptable for a keep param (static/global/param/other). */
-enum { KV_NONE = 0, KV_LOCAL_ADDR, KV_LOCAL_DERIVED, KV_ARENA, KV_LOCAL_ARRAY, KV_SLICE_LOCAL };
+enum { KV_NONE = 0, KV_LOCAL_ADDR, KV_LOCAL_DERIVED, KV_ARENA, KV_LOCAL_ARRAY, KV_SLICE_LOCAL,
+       KV_VARIANT_CAPTURE /* BUG-1186 */ };
 
 /* keep inference (Site 1): record one deferred keep edge for a call argument at a
  * pointer-param position. Resolved in check_keep_inference after ALL bodies are
@@ -4061,9 +4174,51 @@ static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) 
     return true;
 }
 
+/* BUG-1187: does a reference formed over `path` point INTO a function call's
+ * returned TEMPORARY? Walk the lvalue path to its root: a step whose object is a
+ * pointer or a slice goes through an indirection (the reference then points
+ * wherever that pointer does, not into the temporary) and answers NO; reaching a
+ * NODE_CALL through by-value steps answers YES. Measured: `return mk(k).arr[0..];`
+ * and `gs = mk(5).arr[0..];` compiled clean and read a dead frame (ASan
+ * stack-use-after-return); `&mk(9).arr[2]` reached GCC as "lvalue required". */
+static bool ref_path_hits_call_temp(Checker *c, Node *path) {
+    for (Node *r = path; r; ) {
+        if (r->kind == NODE_CALL) return true;
+        Node *obj = NULL;
+        if (r->kind == NODE_FIELD) obj = r->field.object;
+        else if (r->kind == NODE_INDEX) obj = r->index_expr.object;
+        else return false;
+        Type *ot = checker_get_type(c, obj);
+        TypeKind ok = type_dispatch_kind(ot);
+        if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE) return false;
+        r = obj;
+    }
+    return false;
+}
+
+static void report_call_temp_view(Checker *c, int line) {
+    checker_error(c, line,
+        "cannot form a reference into a function's returned value — it is a temporary "
+        "that dies with the statement, so the view would dangle. Bind the result to a "
+        "local first ('T v = f(); ... v.arr[..]')");
+}
+
 /* BUG-1057: every hazard of forming a slice over an array, at one call. */
 static bool reject_array_view_hazards(Checker *c, Node *v, Type *dest, int line) {
     if (reject_packed_array_view(c, v, dest, line)) return true;
+    {   /* BUG-1187: an ARRAY inside a call's returned temporary, decaying to a
+         * slice (`[*]u32 s = mk().arr;`). The NODE_SLICE spelling is refused in
+         * check_expr itself. */
+        Type *dd = dest ? type_unwrap_distinct(dest) : NULL;
+        while (dd && type_dispatch_kind(dd) == TYPE_OPTIONAL)
+            dd = type_unwrap_distinct(dd->optional.inner);
+        if (v && dd && type_dispatch_kind(dd) == TYPE_SLICE && v->kind != NODE_SLICE &&
+            type_dispatch_kind(checker_get_type(c, v)) == TYPE_ARRAY &&
+            ref_path_hits_call_temp(c, v)) {
+            report_call_temp_view(c, line);
+            return true;
+        }
+    }
     if (reject_array_view_qualifier_drop(c, v, dest, line)) return true;
     /* BUG-1117: a slice view into a shared struct's array field is the `&s.a[i]`
      * that BUG A6/#5 refuses, spelled as a coercion — `[*]u32 s = g.a;` then
@@ -5779,6 +5934,9 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
     }
     for (int fi = 0; fi < sinit->struct_init.field_count; fi++) {
         DesigField *df = &sinit->struct_init.fields[fi];
+        if (df->value && df->value->kind != NODE_STRUCT_INIT &&
+            value_forms_variant_ref(c, df->value, 0))                    /* BUG-1186 */
+            report_variant_ref_store(c, line, "store into a struct literal");
         bool found = false;
         for (uint32_t si = 0; si < st->struct_type.field_count; si++) {
             if (st->struct_type.fields[si].name_len == (uint32_t)df->name_len &&
@@ -7083,6 +7241,24 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
             int64_t val = eval_decl_size_expr(c, tn->ring.count_expr);
             if (zer_count_is_positive((int)val)) count = (uint32_t)val;
             else checker_error(c, tn->loc.line, "Ring count must be a positive compile-time constant");
+        }
+        /* BUG-1180: a Ring moves its elements BY VALUE — `push(v)` copies v into
+         * the buffer, `pop()` copies it out — so a Ring of a unique resource is
+         * the BUG-970 copy with no value-flow sink to catch it: `rq.push(b1)` of
+         * a Barrier compiled clean (a second owner of one count), as did a push
+         * of a polled async task (a copy of a self-referential state, BUG-1177).
+         * `Ring(Arena, N)` reached GCC as an incompatible-types error. Pool and
+         * Slab construct in place and hand out pointers, so they stay legal. */
+        if (elem) {
+            const char *rn = unique_resource_name(elem, 0);
+            if (rn)
+                checker_error(c, tn->loc.line,
+                    "Ring element type cannot be %s%s — a Ring copies elements in "
+                    "and out by value, and that value is unique state (a copy is a "
+                    "second owner). Queue a pointer or a Handle to it instead",
+                    rn == _res_async_task ? "an " : "",
+                    rn == _res_walk_stopped ? "a type nested too deep to inspect"
+                                            : rn);
         }
         return type_ring(c->arena, elem, count);
     }
@@ -9449,6 +9625,10 @@ static Type *check_expr(Checker *c, Node *node) {
         if (node->unary.op == TOK_AMP) c->in_amp = true;
         Type *operand = check_expr(c, node->unary.operand);
         c->in_amp = saved_in_amp;
+        if (node->unary.op == TOK_AMP && node->unary.operand &&
+            node->unary.operand->kind != NODE_CALL &&
+            ref_path_hits_call_temp(c, node->unary.operand))            /* BUG-1187 */
+            report_call_temp_view(c, node->loc.line);
 
         /* BUG-928: `-c` / `~c` on an enum operand yields a non-variant just as
          * surely as the binary forms. Placed before the switch so both unary
@@ -9739,6 +9919,9 @@ static Type *check_expr(Checker *c, Node *node) {
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
+        if (node->assign.op == TOK_EQ &&
+            value_forms_variant_ref(c, node->assign.value, 0))          /* BUG-1186 */
+            report_variant_ref_store(c, node->loc.line, "store");
 
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
@@ -10102,13 +10285,25 @@ static Type *check_expr(Checker *c, Node *node) {
         }
 
         /* BUG-225: reject Pool/Ring/Slab assignment — unique resource types.
-         * BUG-506: unwrap distinct. */
+         * BUG-506: unwrap distinct. These three have no constructor expression at
+         * all, so ANY store into one is refused by the target type alone. */
         { Type *teff = target ? type_unwrap_distinct(target) : NULL;
         if (node->assign.op == TOK_EQ && teff &&
             (teff->kind == TYPE_POOL || teff->kind == TYPE_RING || teff->kind == TYPE_SLAB)) {
             checker_error(c, node->loc.line,
                 "cannot assign %s — resource types are not copyable",
                 teff->kind == TYPE_POOL ? "Pool" : teff->kind == TYPE_RING ? "Ring" : "Slab");
+        } else if (node->assign.op == TOK_EQ) {
+            /* BUG-1177: the ASSIGNMENT sink of the BUG-970 rule. BUG-970 wired the
+             * shared reporter at seven value-flow sinks and this one kept only the
+             * BUG-225 target test above, so Arena / Barrier / Semaphore (and every
+             * aggregate carrying one, and the async task) were copied freely by a
+             * plain `=`. Measured: `lb = la;` then one alloc from each returned
+             * the SAME BYTES (`y.v = 9` overwrote `x.v`). The VALUE decides, as at
+             * the other sinks: `a = Arena.over(buf);` builds a fresh state and is
+             * allowed (zercheck_ir treats it as a reset, BUG-1178). */
+            reject_unique_resource_copy(c, node->assign.value, value,
+                                        node->loc.line, "assign");
         } }
 
         /* string literal to mutable slice: runtime crash on write.
@@ -11541,6 +11736,23 @@ static Type *check_expr(Checker *c, Node *node) {
     /* ---- Function call ---- */
     case NODE_CALL: {
         check_call_vs_lent_globals(c, node);   /* BUG-1125 */
+        if (c->union_ptr_capture_type) {                                  /* BUG-1186 */
+            if (c->ucc_count >= c->ucc_cap) {
+                int nc = c->ucc_cap < 16 ? 16 : c->ucc_cap * 2;
+                struct UnionCaptureCall *nb = (struct UnionCaptureCall *)arena_alloc(
+                    c->arena, (size_t)nc * sizeof(struct UnionCaptureCall));
+                if (nb) {
+                    if (c->ucc_count) memcpy(nb, c->ucc, (size_t)c->ucc_count * sizeof(*nb));
+                    c->ucc = nb; c->ucc_cap = nc;
+                }
+            }
+            if (c->ucc_count < c->ucc_cap) {
+                struct UnionCaptureCall *r = &c->ucc[c->ucc_count++];
+                r->call = node; r->utype = c->union_ptr_capture_type;
+                r->cap = c->union_ptr_capture_name; r->cap_len = c->union_ptr_capture_name_len;
+                r->line = node->loc.line; r->file_name = c->file_name; r->source = c->source;
+            }
+        }
         /* BUG-1079: set when `free(p)` is rewritten to `T.free_ptr(p)` below, so
          * a diagnostic about the rewritten call names the spelling the user wrote. */
         bool free_desugared = false;
@@ -12826,6 +13038,10 @@ static Type *check_expr(Checker *c, Node *node) {
                                     edge_vkind = KV_LOCAL_DERIVED;
                                     edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
                                 }
+                                if (arg_sym && arg_sym->is_variant_capture && edge_vkind == KV_NONE) {
+                                    edge_vkind = KV_VARIANT_CAPTURE;          /* BUG-1186 */
+                                    edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
+                                }
                                 if (arg_sym && arg_sym->is_arena_derived && edge_vkind == KV_NONE) {
                                     edge_vkind = KV_ARENA;
                                     edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
@@ -13964,6 +14180,9 @@ static Type *check_expr(Checker *c, Node *node) {
         Type *obj_raw = check_expr(c, node->slice.object);
         /* BUG-410: unwrap distinct for slice/array/integer dispatch */
         Type *obj = type_unwrap_distinct(obj_raw);
+        if (type_dispatch_kind(obj) == TYPE_ARRAY &&
+            ref_path_hits_call_temp(c, node->slice.object))              /* BUG-1187 */
+            report_call_temp_view(c, node->loc.line);
 
         /* BUG-881: BIT EXTRACTION THROUGH A POINTER.
          *
@@ -14149,8 +14368,25 @@ static Type *check_expr(Checker *c, Node *node) {
                     type_name(c->current_func_ret), type_name(c->current_func_ret));
             }
         }
+        /* BUG-1188: `@once` bans return/break/continue as STATEMENTS; the flag
+         * forms reached no statement handler, so `x orelse return;` inside
+         * `@once` compiled — and the next call spun forever on the once-flag
+         * the skipped publish never set (measured: a single-threaded hang). The
+         * break/continue checks also ask the ESCAPING depth now (BUG-947), as the
+         * statement forms do: a loop inside the block keeps the jump inside it. */
+        if (c->in_once &&
+            (node->orelse.fallback_is_return ||
+             ((node->orelse.fallback_is_break || node->orelse.fallback_is_continue) &&
+              escaping_block_depth(c, 1) > 0))) {
+            checker_error(c, node->loc.line,
+                "cannot use 'orelse %s' inside @once block — it would skip the one-time "
+                "completion publish and hang threads waiting on @once",
+                node->orelse.fallback_is_return ? "return" :
+                node->orelse.fallback_is_break ? "break" : "continue");
+        }
         if (node->orelse.fallback_is_break &&
-            zer_break_allowed_in_context(c->defer_depth, c->critical_depth,
+            zer_break_allowed_in_context(escaping_block_depth(c, c->defer_depth),
+                                          escaping_block_depth(c, c->critical_depth),
                                           c->in_loop ? 1 : 0) == 0) {
             if (c->defer_depth > 0) {
                 checker_error(c, node->loc.line,
@@ -14161,7 +14397,8 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
         if (node->orelse.fallback_is_continue &&
-            zer_continue_allowed_in_context(c->defer_depth, c->critical_depth,
+            zer_continue_allowed_in_context(escaping_block_depth(c, c->defer_depth),
+                                             escaping_block_depth(c, c->critical_depth),
                                              c->in_loop ? 1 : 0) == 0) {
             if (c->defer_depth > 0) {
                 checker_error(c, node->loc.line,
@@ -19326,6 +19563,12 @@ static void check_stmt(Checker *c, Node *node) {
                                 sym->arena_source = src->arena_source;
                         }
                     }
+                    /* BUG-1186: a local initialised with a reference into a
+                     * union variant capture is itself one (it is declared inside
+                     * the arm, so it cannot outlive it lexically — but it can be
+                     * STORED, which the sinks below refuse). */
+                    if (sym && value_forms_variant_ref(c, node->var_decl.init, 0))
+                        sym->is_variant_capture = true;
                     /* Audit 2026-05-26: stack-escape via arithmetic chain.
                      * `usize b = a + 0` where `a` was @ptrtoint(&local) —
                      * the chain walker above stops at NODE_BINARY (no
@@ -20833,6 +21076,10 @@ static void check_stmt(Checker *c, Node *node) {
                     (uint32_t)arm->capture_name_len,
                     cap_type, arm->loc.line);
                 if (cap) cap->is_const = cap_const;
+                /* BUG-1186: a POINTER capture of a UNION arm points into the
+                 * variant — see value_forms_variant_ref / check_union_capture_calls. */
+                if (cap && arm->capture_is_ptr && type_dispatch_kind(expr_eff) == TYPE_UNION)
+                    cap->is_variant_capture = true;
 
                 /* BUG-249: propagate safety flags from switch expression to capture.
                  * Same pattern as if-unwrap (BUG-212). */
@@ -20883,6 +21130,14 @@ static void check_stmt(Checker *c, Node *node) {
                 const char *saved_union_key = c->union_switch_key;
                 uint32_t saved_union_key_len = c->union_switch_key_len;
                 Type *saved_union_type = c->union_switch_type;
+                Type *saved_ucap_type = c->union_ptr_capture_type;          /* BUG-1186 */
+                const char *saved_ucap_name = c->union_ptr_capture_name;
+                uint32_t saved_ucap_len = c->union_ptr_capture_name_len;
+                if (type_dispatch_kind(expr_eff) == TYPE_UNION && arm->capture_name && arm->capture_is_ptr) {
+                    c->union_ptr_capture_type = expr_eff;
+                    c->union_ptr_capture_name = arm->capture_name;
+                    c->union_ptr_capture_name_len = (uint32_t)arm->capture_name_len;
+                }
                 if (expr_eff->kind == TYPE_UNION) {
                     c->union_switch_type = expr;
                     Node *sw_expr = node->switch_stmt.expr;
@@ -20931,6 +21186,9 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                 }
                 check_stmt_cond_body(c, arm->body);
+                c->union_ptr_capture_type = saved_ucap_type;                /* BUG-1186 */
+                c->union_ptr_capture_name = saved_ucap_name;
+                c->union_ptr_capture_name_len = saved_ucap_len;
                 c->union_switch_var = saved_union_var;
                 c->union_switch_var_len = saved_union_var_len;
                 c->union_switch_key = saved_union_key;
@@ -21101,6 +21359,8 @@ static void check_stmt(Checker *c, Node *node) {
     }
 
     case NODE_RETURN: {
+        if (node->ret.expr && value_forms_variant_ref(c, node->ret.expr, 0))   /* BUG-1186 */
+            report_variant_ref_store(c, node->loc.line, "return");
         /* Deref-launder sink: `return *pp;` hands the CALLER an alias the analyzer
          * cannot follow, so a free through either name is a UAF. Same predicate and
          * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
@@ -21703,6 +21963,14 @@ static void check_stmt(Checker *c, Node *node) {
                  * caller a SECOND owner of state that keeps existing, which is the
                  * copy this rule is about. Same question, different answer, because
                  * the source's lifetime is what decides it. */
+                /* BUG-1177: an async task has no MOVE — a bitwise copy of a
+                 * self-referential state is a copy whether or not the source then
+                 * dies (it is exactly the dying source that the copy points into). */
+                if (unique_resource_name(c->current_func_ret, 0) == _res_async_task &&
+                    node->ret.expr) {
+                    reject_unique_resource_copy(c, node->ret.expr, c->current_func_ret,
+                                                node->loc.line, "return");
+                } else
                 if (unique_resource_name(c->current_func_ret, 0) &&
                     node->ret.expr && node->ret.expr->kind == NODE_IDENT) {
                     Symbol *rs = scope_lookup(c->current_scope,
@@ -24096,7 +24364,7 @@ static void register_decl(Checker *c, Node *node) {
         if (node->enum_decl.variant_count > 0) {
             t->enum_type.variants = (SEVariant *)arena_alloc(c->arena,
                 node->enum_decl.variant_count * sizeof(SEVariant));
-            int32_t next_val = 0;
+            int64_t next_val = 0;   /* BUG-1191: wide, so +1 past INT32_MAX is seen */
             for (int i = 0; i < node->enum_decl.variant_count; i++) {
                 EnumVariant *ev = &node->enum_decl.variants[i];
                 /* BUG-198: check for duplicate variant names */
@@ -24112,33 +24380,44 @@ static void register_decl(Checker *c, Node *node) {
                 SEVariant *sv = &t->enum_type.variants[i];
                 sv->name = ev->name;
                 sv->name_len = (uint32_t)ev->name_len;
+                /* BUG-1191: the value is ANY compile-time integer expression — a
+                 * literal, `-N`, `1 << 4`, `A + 1`, a `const`, a char literal, a
+                 * comptime call. Only the first two were evaluated; anything else
+                 * left the value at 0 here, while the emitter counted on from the
+                 * previous variant — so the checker's switch dispatch, VRP and
+                 * static_assert saw a different number than the program ran with.
+                 * Measured: `enum E { a..i, j = 0 + 0 }` then `arr[(u32)E.j]` on a
+                 * u32[4] — proven index 0, emitted #define 9, an unchecked
+                 * out-of-bounds write. The value is folded ONCE, here; the emitter
+                 * prints these values (emit_top_level_decl NODE_ENUM_DECL). A value
+                 * that is not a constant, or does not fit i32 — including the
+                 * implicit `+1` past INT32_MAX, which used to wrap silently — is an
+                 * error. */
                 if (ev->value) {
-                    /* explicit value — evaluate */
-                    if (ev->value->kind == NODE_INT_LIT) {
-                        uint64_t v = ev->value->int_lit.value;
-                        if (v > (uint64_t)INT32_MAX) {
-                            checker_error(c, ev->value->loc.line,
-                                "enum variant '%.*s' value %llu exceeds i32 range — enum values are 32-bit signed",
-                                (int)ev->name_len, ev->name,
-                                (unsigned long long)v);
-                        }
-                        sv->value = (int32_t)v;
-                    } else if (ev->value->kind == NODE_UNARY &&
-                               ev->value->unary.op == TOK_MINUS &&
-                               ev->value->unary.operand->kind == NODE_INT_LIT) {
-                        /* negative value: -N */
-                        uint64_t v = ev->value->unary.operand->int_lit.value;
-                        if (v > (uint64_t)INT32_MAX + 1ULL) {
-                            checker_error(c, ev->value->loc.line,
-                                "enum variant '%.*s' value -%llu exceeds i32 range — enum values are 32-bit signed",
-                                (int)ev->name_len, ev->name,
-                                (unsigned long long)v);
-                        }
-                        sv->value = -(int32_t)v;
+                    check_expr(c, ev->value);   /* resolves comptime calls, consts */
+                    int64_t v = eval_decl_size_expr(c, ev->value);
+                    if (v == CONST_EVAL_FAIL) {
+                        checker_error(c, ev->value->loc.line,
+                            "enum variant '%.*s' value must be a compile-time integer constant",
+                            (int)ev->name_len, ev->name);
+                        v = next_val;
+                    } else if (v < (int64_t)INT32_MIN || v > (int64_t)INT32_MAX) {
+                        checker_error(c, ev->value->loc.line,
+                            "enum variant '%.*s' value %lld exceeds i32 range — enum values are 32-bit signed",
+                            (int)ev->name_len, ev->name, (long long)v);
+                        v = 0;
                     }
-                    next_val = sv->value + 1;
+                    sv->value = (int32_t)v;
+                    next_val = (int64_t)sv->value + 1;
                 } else {
-                    sv->value = next_val++;
+                    if (next_val > (int64_t)INT32_MAX) {
+                        checker_error(c, node->loc.line,
+                            "enum variant '%.*s' would be %lld — the implicit next value "
+                            "exceeds i32 range; give it an explicit value",
+                            (int)ev->name_len, ev->name, (long long)next_val);
+                        next_val = 0;
+                    }
+                    sv->value = (int32_t)next_val++;
                 }
             }
         }
@@ -24316,6 +24595,7 @@ static void register_decl(Checker *c, Node *node) {
             async_type->struct_type.field_count = 0;
             async_type->struct_type.fields = NULL;
             async_type->struct_type.type_id = c->next_type_id++;
+            async_type->struct_type.is_async_state = true;   /* BUG-1177 */
             char *aname_copy = arena_alloc(c->arena, alen + 1);
             memcpy(aname_copy, aname, alen + 1);
             add_symbol_internal(c, aname_copy, alen, async_type, node->loc.line);
@@ -24611,6 +24891,90 @@ static bool switch_arm_has_capture_local(SwitchArm *arm) {
     return arm && arm->capture_name != NULL;
 }
 
+/* BUG-1189: a declaration whose type has NO zero value — the types whose
+ * declaration already REQUIRES an initializer (a non-null `*T`, a non-optional
+ * funcptr, an enum with no zero variant). The IR declares every local at the
+ * function's top, auto-zeroed, so a `goto` that jumps PAST such a declaration into
+ * its scope lands where the variable holds the one value its type forbids:
+ * measured, `goto skip; *B b = &gb; skip: return b.v;` dereferenced NULL (SIGSEGV
+ * hosted, a silent read of address 0 on bare metal). The goto-label walkers push
+ * such a declaration onto the same path stack the capture arms use, at its
+ * position in its block, so "the goto's path does not cover the label's" is
+ * exactly "the jump bypasses the initialization" (C++'s rule, restricted to the
+ * types for which auto-zero is not a value). */
+static bool decl_has_no_zero_value(Checker *c, Node *decl) {
+    if (!decl || decl->kind != NODE_VAR_DECL || decl->var_decl.is_static) return false;
+    Type *t = checker_get_type(c, decl);
+    if (!t) return false;
+    bool is_func = false;
+    if (nonnull_zero_hole(t, &is_func)) return true;
+    Type *e = type_unwrap_distinct(t);
+    if (e && type_dispatch_kind(e) == TYPE_ENUM && e->enum_type.variant_count > 0) {
+        for (uint32_t i = 0; i < e->enum_type.variant_count; i++)
+            if (e->enum_type.variants[i].value == 0) return false;
+        return true;
+    }
+    return false;
+}
+
+/* BUG-1189: is `name` mentioned by any statement at or after `line`? The bypassed
+ * declaration is only a hazard when its (zero) value can be OBSERVED after the jump
+ * lands — the ordinary cleanup chain `goto cleanup1;` past `*R2 r2 = …;` whose
+ * `cleanup1:` code touches only `r1` stays legal. Source order is the
+ * approximation: a mention on a later line is assumed reachable from the label. */
+static bool stmt_mentions_name_from(Node *n, const char *nm, uint32_t nl, int line) {
+    if (!n) return false;
+    #define SMN(x) stmt_mentions_name_from((x), nm, nl, line)
+    #define EXM(x) (n->loc.line >= line && expr_mentions_name((x), nm, nl, 0))
+    switch (n->kind) {
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (SMN(n->block.stmts[i])) return true;
+        return false;
+    case NODE_IF: return EXM(n->if_stmt.cond) || SMN(n->if_stmt.then_body) ||
+                         SMN(n->if_stmt.else_body);
+    case NODE_FOR: return SMN(n->for_stmt.init) || EXM(n->for_stmt.cond) ||
+                          EXM(n->for_stmt.step) || SMN(n->for_stmt.body);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return EXM(n->while_stmt.cond) || SMN(n->while_stmt.body);
+    case NODE_SWITCH:
+        if (EXM(n->switch_stmt.expr)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (SMN(n->switch_stmt.arms[i].body)) return true;
+        return false;
+    case NODE_RETURN:    return EXM(n->ret.expr);
+    case NODE_EXPR_STMT: return EXM(n->expr_stmt.expr);
+    case NODE_VAR_DECL:  return EXM(n->var_decl.init);
+    case NODE_DEFER:     return SMN(n->defer.body);
+    case NODE_CRITICAL:  return SMN(n->critical.body);
+    case NODE_ONCE:      return SMN(n->once.body);
+    case NODE_AWAIT:     return EXM(n->await_stmt.cond);
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            if (EXM(n->spawn_stmt.args[i])) return true;
+        return false;
+    case NODE_ASM: return n->loc.line >= line;   /* operands not walked: assume */
+    case NODE_LABEL: case NODE_GOTO: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
+        return false;
+    /* Expression kinds reached directly (a braceless body): ask the expression. */
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return EXM(n);
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return false;
+    }
+    #undef SMN
+    #undef EXM
+    return true;
+}
+static Node *_goto_fn_body;   /* the body check_goto_labels is validating */
+
 static void collect_labels(Checker *c, Node *node, LabelInfo *labels,
                            int *count, int max, ArmStack *arms) {
     if (!node) return;
@@ -24625,10 +24989,18 @@ static void collect_labels(Checker *c, Node *node, LabelInfo *labels,
             (*count)++;
         }
         break;
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
+    case NODE_BLOCK: {
+        int pushed = 0;
+        for (int i = 0; i < node->block.stmt_count; i++) {
             collect_labels(c, node->block.stmts[i], labels, count, max, arms);
+            if (decl_has_no_zero_value(c, node->block.stmts[i])) {   /* BUG-1189 */
+                arm_stack_push(c, arms, node->block.stmts[i]);
+                pushed++;
+            }
+        }
+        while (pushed-- > 0) arm_stack_pop(arms);
         break;
+    }
     case NODE_IF: {
         bool has_cap = if_has_capture_local(node);
         if (has_cap) arm_stack_push(c, arms, node);
@@ -24712,6 +25084,27 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
                 (int)node->goto_stmt.label_len, node->goto_stmt.label);
         } else if (!goto_path_covers_label(arms->stack, arms->depth,
                                            tgt->arm_path, tgt->arm_depth)) {
+            /* BUG-1189: name the bypassed declaration when that is the cause. */
+            Node *byp = NULL;
+            for (int i = 0; i < tgt->arm_depth && !byp; i++) {
+                bool covered = i < arms->depth && arms->stack[i] == tgt->arm_path[i];
+                if (!covered && ((Node *)tgt->arm_path[i])->kind == NODE_VAR_DECL)
+                    byp = (Node *)tgt->arm_path[i];
+            }
+            if (byp && !stmt_mentions_name_from(_goto_fn_body, byp->var_decl.name,
+                                                (uint32_t)byp->var_decl.name_len,
+                                                tgt->line))
+                break;   /* bypassed, but never observed after the label */
+            if (byp) {
+                checker_error(c, node->loc.line,
+                    "goto '%.*s' jumps past the declaration of '%.*s' (line %d) into its "
+                    "scope — its type has no zero value (a non-null pointer, a function "
+                    "pointer, or an enum without a 0 variant), so at the label it would "
+                    "hold one. Move the declaration before the goto, or make it optional",
+                    (int)node->goto_stmt.label_len, node->goto_stmt.label,
+                    (int)byp->var_decl.name_len, byp->var_decl.name, byp->loc.line);
+                break;
+            }
             checker_error(c, node->loc.line,
                 "goto '%.*s' jumps into if-unwrap/switch-capture arm without "
                 "binding the capture — capture variable would be uninitialized",
@@ -24719,10 +25112,18 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
         }
         break;
     }
-    case NODE_BLOCK:
-        for (int i = 0; i < node->block.stmt_count; i++)
+    case NODE_BLOCK: {
+        int pushed = 0;
+        for (int i = 0; i < node->block.stmt_count; i++) {
             validate_gotos(c, node->block.stmts[i], labels, label_count, arms);
+            if (decl_has_no_zero_value(c, node->block.stmts[i])) {   /* BUG-1189 */
+                arm_stack_push(c, arms, node->block.stmts[i]);
+                pushed++;
+            }
+        }
+        while (pushed-- > 0) arm_stack_pop(arms);
         break;
+    }
     case NODE_IF: {
         bool has_cap = if_has_capture_local(node);
         if (has_cap) arm_stack_push(c, arms, node);
@@ -24772,6 +25173,7 @@ static void validate_gotos(Checker *c, Node *node, LabelInfo *labels,
 }
 
 static void check_goto_labels(Checker *c, Node *func_body) {
+    _goto_fn_body = func_body;   /* BUG-1189 */
     /* A16: stack-first dynamic pattern — no fixed limit on labels per function */
     LabelInfo stack_labels[128];
     LabelInfo *labels = stack_labels;
@@ -24823,9 +25225,11 @@ static bool contains_break(Node *node) {
         }
         return false;
     case NODE_IF:
-        return contains_break(node->if_stmt.then_body) ||
+        return contains_break(node->if_stmt.cond) ||             /* BUG-1190 */
+               contains_break(node->if_stmt.then_body) ||
                contains_break(node->if_stmt.else_body);
     case NODE_SWITCH:
+        if (contains_break(node->switch_stmt.expr)) return true;  /* BUG-1190 */
         for (int i = 0; i < node->switch_stmt.arm_count; i++) {
             if (contains_break(node->switch_stmt.arms[i].body)) return true;
         }
@@ -24836,6 +25240,7 @@ static bool contains_break(Node *node) {
          * form (and leaves fallback NULL); `orelse { break; }` puts the break in a
          * BLOCK, which was never descended. Mutually exclusive, so no double count. */
         return node->orelse.fallback_is_break ||
+               contains_break(node->orelse.expr) ||               /* BUG-1190 */
                contains_break(node->orelse.fallback);
     case NODE_VAR_DECL:
         return node->var_decl.init ? contains_break(node->var_decl.init) : false;
@@ -24857,20 +25262,89 @@ static bool contains_break(Node *node) {
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_RETURN: case NODE_CONTINUE: case NODE_GOTO:
-    case NODE_LABEL: case NODE_ASM: case NODE_SPAWN:
+    /* BUG-1190: an `orelse break` nested INSIDE an expression — `k + (mb(k)
+     * orelse break)`, a call argument, a return value — is a break too. These
+     * were leaves, so `while (true) { u32 t = k + (mb(k) orelse break); return
+     * t; }` counted as a loop that never exits: the function fell off its end and
+     * returned 0 (NULL for a `*T` return, dereferenced by the caller). */
+    case NODE_RETURN: return contains_break(node->ret.expr);
+    case NODE_BINARY: return contains_break(node->binary.left) ||
+                             contains_break(node->binary.right);
+    case NODE_UNARY:  return contains_break(node->unary.operand);
+    case NODE_ASSIGN: return contains_break(node->assign.target) ||
+                             contains_break(node->assign.value);
+    case NODE_CALL:
+        if (contains_break(node->call.callee)) return true;
+        for (int i = 0; i < node->call.arg_count; i++)
+            if (contains_break(node->call.args[i])) return true;
+        return false;
+    case NODE_FIELD:  return contains_break(node->field.object);
+    case NODE_INDEX:  return contains_break(node->index_expr.object) ||
+                             contains_break(node->index_expr.index);
+    case NODE_SLICE:  return contains_break(node->slice.object) ||
+                             contains_break(node->slice.start) ||
+                             contains_break(node->slice.end);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            if (contains_break(node->intrinsic.args[i])) return true;
+        return false;
+    case NODE_TYPECAST: return contains_break(node->typecast.expr);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < node->struct_init.field_count; i++)
+            if (contains_break(node->struct_init.fields[i].value)) return true;
+        return false;
+    case NODE_SPAWN:
+        for (int i = 0; i < node->spawn_stmt.arg_count; i++)
+            if (contains_break(node->spawn_stmt.args[i])) return true;
+        return false;
+    case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_ASM:
     case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
-    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
-    case NODE_INDEX: case NODE_SLICE: case NODE_INTRINSIC:
-    case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
-    case NODE_STRUCT_INIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
         return false;
     }
     return false; /* GCC -Wreturn-type: exhaustive switch above but
                    * lint can't prove it. Defensive fallback. */
+}
+
+/* BUG-1190: does a statement hold a LABEL (a goto target) anywhere inside it? */
+static bool stmt_holds_label(Node *n) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_LABEL: return true;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (stmt_holds_label(n->block.stmts[i])) return true;
+        return false;
+    case NODE_IF: return stmt_holds_label(n->if_stmt.then_body) ||
+                         stmt_holds_label(n->if_stmt.else_body);
+    case NODE_FOR: return stmt_holds_label(n->for_stmt.body);
+    case NODE_WHILE: case NODE_DO_WHILE: return stmt_holds_label(n->while_stmt.body);
+    case NODE_SWITCH:
+        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+            if (stmt_holds_label(n->switch_stmt.arms[i].body)) return true;
+        return false;
+    case NODE_CRITICAL: return stmt_holds_label(n->critical.body);
+    case NODE_ONCE:     return stmt_holds_label(n->once.body);
+    case NODE_DEFER:    return stmt_holds_label(n->defer.body);
+    /* An orelse block fallback can hold statements, but a label there is refused
+     * elsewhere; expressions and leaves hold no label. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_EXPR_STMT: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_BINARY:
+    case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return false;
+    }
+    return true;
 }
 
 static bool all_paths_return(Node *node) {
@@ -24878,14 +25352,23 @@ static bool all_paths_return(Node *node) {
     switch (node->kind) {
     case NODE_RETURN:
         return true;
-    case NODE_BLOCK:
-        /* check if any statement in the block guarantees a return */
-        for (int i = node->block.stmt_count - 1; i >= 0; i--) {
+    case NODE_BLOCK: {
+        /* check if any statement in the block guarantees a return.
+         * BUG-1190: only from the LAST statement that holds a label onward — a
+         * `goto` can land on that label, past any return before it. Measured: a
+         * u32 function ending `return 7; done:` with an earlier `goto done;` fell
+         * off the end (returned 0); a `*u32` function whose `while (true)` body
+         * did `goto out;` to an `out:` label ending the function returned NULL. */
+        int from = 0;
+        for (int i = node->block.stmt_count - 1; i >= 0; i--)
+            if (stmt_holds_label(node->block.stmts[i])) { from = i; break; }
+        for (int i = node->block.stmt_count - 1; i >= from; i--) {
             if (all_paths_return(node->block.stmts[i])) return true;
             /* if this statement is not a return but is a block/if/switch,
              * it might still cover all paths */
         }
         return false;
+    }
     case NODE_IF:
         /* BUG-354: comptime if — only the taken branch matters */
         if (node->if_stmt.is_comptime) {
@@ -29086,7 +29569,223 @@ static bool keep_edge_propagates(struct KeepEdge *e) {
  * module that declares it") is a teachable discipline, which is the bar CLAUDE.md
  * sets for an acceptable rejection. */
 
+/* ================================================================
+ * BUG-1186: may a CALL made inside a union `|*w|` arm change that union's
+ * variant? The in-arm rule (check_union_switch_mutation) sees only direct
+ * writes in the arm itself. A callee writing the union through a pointer
+ * alias (`mutu(up)`), writing a GLOBAL union by name, or reached through a
+ * funcptr left `w` pointing at the bytes of the NEW variant: measured, an
+ * integer variant written by the callee became a working pointer through
+ * `*w.ptr` (no @inttoptr, no mmio) and the write landed in another object.
+ *
+ * The question is TYPE-based: does the callee (transitively) assign through a
+ * path that passes a value of union type U, or store a whole aggregate
+ * carrying one by value? Every body is typed when this runs (it is called from
+ * check_keep_inference, i.e. after all bodies, on both entry points). A call
+ * the walk cannot see into — a funcptr, a field funcptr — answers YES; a
+ * bodyless extern answers YES only when an argument can carry a pointer (C
+ * cannot name a ZER global it is not handed). Visited set over bodies: no cap.
+ * ================================================================ */
+typedef struct { Node **seen; int n, cap; } UcwSeen;
+
+static bool type_holds_union_by_value(Type *t, Type *u, int depth) {
+    if (!t || depth > ZER_TYPE_NEST_MAX) return depth > ZER_TYPE_NEST_MAX;
+    Type *e = type_unwrap_distinct(t);
+    if (!e) return false;
+    if (e == u) return true;
+    switch (type_dispatch_kind(e)) {
+    case TYPE_ARRAY:    return type_holds_union_by_value(e->array.inner, u, depth + 1);
+    case TYPE_OPTIONAL: return type_holds_union_by_value(e->optional.inner, u, depth + 1);
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < e->struct_type.field_count; i++)
+            if (type_holds_union_by_value(e->struct_type.fields[i].type, u, depth + 1))
+                return true;
+        return false;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < e->union_type.variant_count; i++)
+            if (type_holds_union_by_value(e->union_type.variants[i].type, u, depth + 1))
+                return true;
+        return false;
+    default: return false;
+    }
+}
+
+/* Does writing through `target` change the variant of some U? True when any
+ * node on the lvalue chain has type U (or *U auto-deref'd), or the stored
+ * value itself holds a U by value. */
+static bool assign_target_writes_union(Checker *c, Node *target, Type *u) {
+    Type *tt = checker_get_type(c, target);
+    if (tt && type_holds_union_by_value(tt, u, 0)) return true;
+    for (Node *r = target; r; ) {
+        Type *rt = checker_get_type(c, r);
+        Type *re = rt ? type_unwrap_distinct(rt) : NULL;
+        if (re && type_dispatch_kind(re) == TYPE_POINTER)
+            re = type_unwrap_distinct(re->pointer.inner);
+        if (re == u) return true;
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_UNARY && r->unary.op == TOK_STAR) r = r->unary.operand;
+        else break;
+    }
+    return false;
+}
+
+static bool ucw_walk(Checker *c, Node *n, Type *u, UcwSeen *sn);
+
+static bool ucw_body(Checker *c, Node *body, Type *u, UcwSeen *sn) {
+    if (!body) return false;
+    for (int i = 0; i < sn->n; i++) if (sn->seen[i] == body) return false;
+    if (sn->n >= sn->cap) {
+        int nc = sn->cap < 16 ? 16 : sn->cap * 2;
+        Node **nb = (Node **)arena_alloc(c->arena, (size_t)nc * sizeof(Node *));
+        if (!nb) return true;   /* cannot record -> cannot prove -> may write */
+        if (sn->n) memcpy(nb, sn->seen, (size_t)sn->n * sizeof(Node *));
+        sn->seen = nb; sn->cap = nc;
+    }
+    sn->seen[sn->n++] = body;
+    return ucw_walk(c, body, u, sn);
+}
+
+static bool ucw_call(Checker *c, Node *call, Type *u, UcwSeen *sn) {
+    for (int i = 0; i < call->call.arg_count; i++)
+        if (ucw_walk(c, call->call.args[i], u, sn)) return true;
+    Node *cal = call->call.callee;
+    if (!cal) return true;
+    if (cal->kind == NODE_IDENT) {
+        Symbol *cs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
+        if (!cs) cs = scope_lookup(c->global_scope, cal->ident.name,
+                                   (uint32_t)cal->ident.name_len);
+        if (cs && cs->is_function && cs->func_node &&
+            cs->func_node->kind == NODE_FUNC_DECL) {
+            if (cs->func_node->func_decl.body)
+                return ucw_body(c, cs->func_node->func_decl.body, u, sn);
+            /* bodyless extern: only what it is handed */
+            for (int i = 0; i < call->call.arg_count; i++) {
+                Type *at = checker_get_type(c, call->call.args[i]);
+                if (!at || type_can_carry_pointer(at)) return true;
+            }
+            return false;
+        }
+        if (cs && cs->is_function) return false;   /* builtin / intrinsic-like name */
+        return true;                               /* a funcptr local / global */
+    }
+    if (cal->kind == NODE_FIELD) {
+        /* A builtin method (pool/slab/ring/arena, `Task.alloc()`): its object is
+         * an allocator or a TYPE name, never a union writer. A funcptr FIELD is
+         * an unknown target. */
+        Type *ot = checker_get_type(c, cal->field.object);
+        if (!ot) return false;
+        switch (type_dispatch_kind(ot)) {
+        case TYPE_POOL: case TYPE_SLAB: case TYPE_RING: case TYPE_ARENA:
+            return false;
+        default:
+            return true;
+        }
+    }
+    return true;
+}
+
+static bool ucw_walk(Checker *c, Node *n, Type *u, UcwSeen *sn) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_ASSIGN:
+        if (assign_target_writes_union(c, n->assign.target, u)) return true;
+        return ucw_walk(c, n->assign.target, u, sn) || ucw_walk(c, n->assign.value, u, sn);
+    case NODE_CALL:   return ucw_call(c, n, u, sn);
+    case NODE_SPAWN:  return true;   /* a thread may write it at any time */
+    case NODE_ASM:    return true;
+    case NODE_BINARY: return ucw_walk(c, n->binary.left, u, sn) || ucw_walk(c, n->binary.right, u, sn);
+    case NODE_UNARY:  return ucw_walk(c, n->unary.operand, u, sn);
+    case NODE_FIELD:  return ucw_walk(c, n->field.object, u, sn);
+    case NODE_INDEX:  return ucw_walk(c, n->index_expr.object, u, sn) || ucw_walk(c, n->index_expr.index, u, sn);
+    case NODE_SLICE:  return ucw_walk(c, n->slice.object, u, sn) || ucw_walk(c, n->slice.start, u, sn) ||
+                             ucw_walk(c, n->slice.end, u, sn);
+    case NODE_ORELSE: return ucw_walk(c, n->orelse.expr, u, sn) || ucw_walk(c, n->orelse.fallback, u, sn);
+    case NODE_TYPECAST: return ucw_walk(c, n->typecast.expr, u, sn);
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (ucw_walk(c, n->intrinsic.args[i], u, sn)) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (ucw_walk(c, n->struct_init.fields[i].value, u, sn)) return true;
+        return false;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++)
+            if (ucw_walk(c, n->block.stmts[i], u, sn)) return true;
+        return false;
+    case NODE_EXPR_STMT: return ucw_walk(c, n->expr_stmt.expr, u, sn);
+    case NODE_VAR_DECL:  return ucw_walk(c, n->var_decl.init, u, sn);
+    case NODE_RETURN:    return ucw_walk(c, n->ret.expr, u, sn);
+    case NODE_IF: return ucw_walk(c, n->if_stmt.cond, u, sn) || ucw_walk(c, n->if_stmt.then_body, u, sn) ||
+                         ucw_walk(c, n->if_stmt.else_body, u, sn);
+    case NODE_FOR: return ucw_walk(c, n->for_stmt.init, u, sn) || ucw_walk(c, n->for_stmt.cond, u, sn) ||
+                          ucw_walk(c, n->for_stmt.step, u, sn) || ucw_walk(c, n->for_stmt.body, u, sn);
+    case NODE_WHILE: case NODE_DO_WHILE:
+        return ucw_walk(c, n->while_stmt.cond, u, sn) || ucw_walk(c, n->while_stmt.body, u, sn);
+    case NODE_SWITCH:
+        if (ucw_walk(c, n->switch_stmt.expr, u, sn)) return true;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            for (int j = 0; j < n->switch_stmt.arms[i].value_count; j++)
+                if (ucw_walk(c, n->switch_stmt.arms[i].values[j], u, sn)) return true;
+            if (ucw_walk(c, n->switch_stmt.arms[i].body, u, sn)) return true;
+        }
+        return false;
+    case NODE_DEFER:    return ucw_walk(c, n->defer.body, u, sn);
+    case NODE_CRITICAL: return ucw_walk(c, n->critical.body, u, sn);
+    case NODE_ONCE:     return ucw_walk(c, n->once.body, u, sn);
+    case NODE_AWAIT:    return ucw_walk(c, n->await_stmt.cond, u, sn);
+    /* Leaves and non-statement kinds: nothing is assigned. */
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_CAST:
+    case NODE_SIZEOF: case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO:
+    case NODE_LABEL: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        return false;
+    }
+    return true;
+}
+
+static void check_union_capture_calls(Checker *c) {
+    const char *sv_file = c->file_name;
+    const char *sv_src = c->source;
+    for (int i = 0; i < c->ucc_count; i++) {
+        struct UnionCaptureCall *r = &c->ucc[i];
+        UcwSeen sn = { NULL, 0, 0 };
+        if (!ucw_call(c, r->call, r->utype, &sn)) continue;
+        Node *cal = r->call->call.callee;
+        c->file_name = r->file_name;
+        c->source = r->source;
+        if (cal && cal->kind == NODE_IDENT)
+            checker_error(c, r->line,
+                "cannot call '%.*s' while '|*%.*s|' points into a variant of union '%.*s' "
+                "— '%.*s' may assign a variant of a '%.*s' (directly or in a callee), "
+                "which would leave '%.*s' pointing at the bytes of a different variant. "
+                "Capture by value ('|%.*s|') and write the variant back after the switch, "
+                "or finish using '%.*s' before the call",
+                (int)cal->ident.name_len, cal->ident.name,
+                (int)r->cap_len, r->cap,
+                (int)r->utype->union_type.name_len, r->utype->union_type.name,
+                (int)cal->ident.name_len, cal->ident.name,
+                (int)r->utype->union_type.name_len, r->utype->union_type.name,
+                (int)r->cap_len, r->cap, (int)r->cap_len, r->cap, (int)r->cap_len, r->cap);
+        else
+            checker_error(c, r->line,
+                "cannot make this call while '|*%.*s|' points into a variant of union "
+                "'%.*s' — its target is not known, so it may assign a different variant. "
+                "Capture by value and write back after the switch",
+                (int)r->cap_len, r->cap,
+                (int)r->utype->union_type.name_len, r->utype->union_type.name);
+    }
+    c->file_name = sv_file;
+    c->source = sv_src;
+    c->ucc_count = 0;
+}
+
 void check_keep_inference(Checker *c) {
+    check_union_capture_calls(c);   /* BUG-1186: needs every body typed, as keep does */
     /* (1) transitive-escape fixpoint (monotone: flags only turn on → converges) */
     bool changed = true;
     int guard = 0;
@@ -29122,6 +29821,8 @@ void check_keep_inference(Checker *c) {
             msg = "argument %d: local array '%.*s' cannot satisfy 'keep' parameter — stack memory is freed when function returns"; break;
         case KV_SLICE_LOCAL:
             msg = "argument %d: slice borrowing local '%.*s' cannot satisfy 'keep' parameter — stack memory is freed when function returns"; break;
+        case KV_VARIANT_CAPTURE:
+            msg = "argument %d: '%.*s' points INTO a union variant (a '|*v|' switch capture) and cannot satisfy 'keep' parameter — it is valid only while the arm runs and the union keeps that variant"; break;
         default: continue;
         }
         checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);

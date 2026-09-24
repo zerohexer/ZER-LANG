@@ -128,6 +128,18 @@ typedef struct {
     const char *union_switch_key;  /* BUG-392: full path key e.g. "msgs[0]" for array element locks */
     uint32_t union_switch_key_len;
     Type *union_switch_type;      /* the union type being switched — blocks alias mutation */
+    /* BUG-1186: the union type whose arm holds a live `|*w|` capture (NULL when
+     * none), and the calls made while one is live — judged after every body is
+     * typed (check_union_capture_calls): a callee that may assign a variant of
+     * that union type would leave `w` pointing at the wrong variant. */
+    Type *union_ptr_capture_type;
+    const char *union_ptr_capture_name;
+    uint32_t union_ptr_capture_name_len;
+    struct UnionCaptureCall {
+        Node *call; Type *utype; const char *cap; uint32_t cap_len;
+        int line; const char *file_name; const char *source;
+    } *ucc;
+    int ucc_count, ucc_cap;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */
@@ -527,6 +539,8 @@ void check_keep_inference(Checker *c);
  * `&name`? Exhaustive no-default AST walk, conservative (true) on opaque kinds. The
  * Level-B guard-stability gate; also the BUG-1034 for-loop lower-bound gate. */
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len);
+/* BUG-1184: is `&name` formed anywhere in `n` (a reassignment does not count)? */
+bool ast_name_addr_taken(Node *n, const char *name, uint32_t len);
 /* BUG-1124: the visitor form — fn(value-or-NULL, ud) per write; true stops. */
 /* `kind`: ANW_ASSIGN (`value` is the assigned value for `=`, NULL for a compound
  * operator), ANW_ADDR (`&name`), ANW_OPAQUE (a node the walk cannot see into). */

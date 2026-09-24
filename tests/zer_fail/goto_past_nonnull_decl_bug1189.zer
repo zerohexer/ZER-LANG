@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: jumps past the declaration of 'b'
+// BUG-1189: the goto lands where 'b' (a non-null *B) holds the auto-zero NULL. Pre-fix
+// this compiled and dereferenced address 0 (SIGSEGV hosted, a silent read on bare metal).
+struct B { u32 v; }
+B gb;
+u32 f(u32 k) {
+    if (k == 1) { goto skip; }
+    *B b = &gb;
+    b.v = 1;
+skip:
+    return b.v;
+}
+u32 main() {
+    return f(1);
+}

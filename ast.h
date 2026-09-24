@@ -706,6 +706,9 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
                                           ConstIdentResolver resolve, void *resolve_ctx) {
     if (!n || depth > 256) return CONST_EVAL_FAIL;
     if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
+    /* BUG-1191: a character literal is a u8 constant ('G' is 71) — `enum Cmd {
+     * get = 'G' }` and `u8[' '] pad` fold like any literal. */
+    if (n->kind == NODE_CHAR_LIT) return (int64_t)(uint8_t)n->char_lit.value;
     if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
         return n->call.comptime_value;
     if (n->kind == NODE_INTRINSIC && n->intrinsic.is_size_folded)   /* BUG-1151 */

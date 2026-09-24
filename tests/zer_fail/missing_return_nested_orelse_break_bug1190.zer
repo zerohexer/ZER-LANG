@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: not all control flow paths return a value in function 'g'
+// BUG-1190: the `orelse break` nested inside an expression exits the loop, so the
+// function can fall off its end. Pre-fix the loop counted as infinite, and g(0)
+// silently returned 0.
+?u32 mb(u32 i) { if (i > 0) { return i; } return null; }
+u32 g(u32 k) {
+    while (true) {
+        u32 t = k + (mb(k) orelse break);
+        return t;
+    }
+}
+u32 main() { if (g(0) == 0) { return 42; } return 0; }

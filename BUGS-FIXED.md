@@ -5,6 +5,191 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24 — BUG-1177..1193: harvest of `loving-bohr-l07qno`, then an audit (own probes + four read-only agents)
+
+**Harvest.** `claude/loving-bohr-l07qno` (36 commits, forked AT main) was fast-forwarded in. It
+contains `loving-bohr-8rby10`, `stoic-mendel-p4i854` and `stoic-mendel-mzqgy6` as ancestors;
+`friendly-galileo-1hkj1n` is tree-identical to `stoic-mendel-mzqgy6~2` and
+`loving-davinci-bdorfl` is an earlier copy of its `ccd53970` (renumbered BUG-1025..1033), so
+nothing else was pending. `make check` on the harvested tree: MAKE_CHECK_EXIT=0, all ten gates.
+
+**Method.** Every negative below COMPILED on the from-HEAD baseline (`b1e41b05`) and is refused
+now; every positive FAILED on the baseline. Corpus cost measured compiler-classified over every
+`.zer` in the tree (both binaries, diagnostics diffed): zero verdict changes outside the new
+tests, except `examples/scheduler.zer`, which now COMPILES (BUG-1182).
+
+### BUG-1177 — the unique-resource rule missed plain ASSIGNMENT; an async task was copyable
+BUG-970 put `reject_unique_resource_copy` at seven value-flow sinks; the eighth, `x = y`, kept
+only BUG-225's Pool/Ring/Slab TARGET test. `lb = la;` on two Arenas made both hand out the SAME
+bytes (`y.v = 9` overwrote `x.v`, returned 9); `b2 = b1;` / `s2 = s1;` copied a Barrier /
+Semaphore count. The assignment sink now asks the VALUE, like the others (a fresh
+`a = Arena.over(buf)` is still allowed — see BUG-1178).
+The async state `_zer_async_NAME` is now a unique resource too, for a reason of its own: it is
+SELF-REFERENTIAL. Every local of a coroutine is promoted into the state struct, so `*u32 p = &x;`
+before a `yield` stores `&self->x` in `self->p`. A copy after the first poll kept writing into
+the ORIGINAL: in-frame it silently updated the wrong task (returned 5, not 6); with the original
+in a returned frame, ASan stack-use-after-return. Rust answers this with `Pin`, which ZER cannot
+express; the rule is the one ZER has for unique state — address it by name or pointer
+(init/poll/result already take `*`). Returning a LOCAL task is refused too (that "move" is a
+bitwise copy). `Type.struct_type.is_async_state` marks the type. Found beside it: the pointer
+remedy did not BUILD — a function declared before the async function named
+`*_zer_async_NAME` before its typedef existed; the state struct is now tagged and forward-
+declared with the prototypes (`emit_async_forward_typedefs`).
+Tests: `arena_assign_copy_bug1177`, `barrier_semaphore_assign_bug1177`,
+`async_task_copy_escape_bug1177`, `async_task_copy_local_bug1177`,
+`tests/zer/async_task_by_pointer_bug1177.zer`; sink matrix p21 (+9 cells).
+
+### BUG-1178 — `a = Arena.over(buf)` re-initialised an arena without invalidating what it handed out
+Exactly `a.reset()` (offset back to 0), which zercheck tracked; the assignment spelling was not
+tracked, so `*T x = a.alloc(T)…; a = Arena.over(buf); *T y = a.alloc(T)…; y.v = 9; return x.v;`
+returned 9. zercheck_ir's IR_ASSIGN treats a store into an Arena-typed target as that arena's
+reset (and sets BUG-1172's caller-visible flag for a non-own arena). Arena allocations now
+record WHICH arena (`IRHandleInfo.pool_name`, at all four arena-alloc sites) and both the reset
+and the re-init invalidate only that arena's allocations (unknown source still marked) — the
+first draft marked every arena's allocations and broke `arena_backing_shapes_ok`, where a
+second global arena is initialised by assignment in the middle of `main`.
+Test: `arena_reinit_assign_uaf_bug1178`; sink p21_arena_reinit_uaf.
+
+### BUG-1179 — operands evaluated LEFT TO RIGHT only when they were not bare local names
+`lower_expr` returns a named local's own id for an identifier, so its READ happened at the
+consuming instruction — after every later sibling had run — while a global (a passthrough)
+landed in a temp at its own position: `x + bump(&x)` gave 16 for a local x and 6 for a global.
+Same at call arguments (`f(x, bump(&x))`), struct-literal fields, comparisons, `x + (x = 10)`,
+and an index `a[i + seti(&i)]` on an array (one unsequenced C expression). A named operand
+whose later siblings may write (`lower_may_write`, exhaustive, conservative) is snapshotted
+into a temp at its own position (BUG-1154's snapshot, so diagnostics still name it).
+Test: `tests/zer/eval_order_left_to_right_bug1179.zer`.
+
+### BUG-1180 — a Ring of a unique resource
+A Ring moves elements by value, so `Ring(Barrier, 4)` + `rq.push(b1)` was the BUG-970 copy with
+no sink to see it; so was a Ring of an async task; `Ring(Arena, N)` reached GCC as an
+incompatible-types error. Refused at the TYPE. Pool/Slab construct in place and stay legal.
+Test: `ring_of_unique_resource_bug1180`; sink p21_ring_push_*.
+
+### BUG-1181 — a callee freeing the allocation a GLOBAL holds (the OPEN "callee frees through a global")
+`g = a; drop_g(); a.v` with `void drop_g() { if (g) |p| { free(p); } g = null; }` compiled and
+returned the value of a recycled auto-Slab slot. FuncSummary gains `freed_global[]` — every
+global KEY (`g`, `g.p`) a free's argument traces to, directly or through a local loaded from
+one (a capture, an orelse unwrap, `*T p = g;`, `p = g;`; flow-insensitive over the function's
+IR) — applied at the call by widening the caller's `(IR_GLOBAL_ROOT_ID, key)` entry and its
+alias group to MAYBE_FREED; transitive through summaries. Test:
+`callee_frees_through_global_bug1181`; sink matrix SHAPE p36 (7 cells, 4 holes pre-fix).
+
+### BUG-1182 — the dequeue-and-free loop was refused (use-after-free AND double free)
+`while (…) { ?Handle(T) next = deq(); if (next) |h| { tp.free(h); } }` — the call's destination
+TEMP kept the previous iteration's FREED entry across the back edge, so the next `next = …`
+read a "freed" value. `examples/scheduler.zer` did not compile for this reason. An IR_CALL now
+kills its destination temp's stale entry before the allocator arms re-register a result.
+Test: `tests/zer/loop_dequeue_free_capture_bug1182.zer`.
+
+### BUG-1183 — an assignment in VALUE position lost its parentheses in the emitted C
+`a[0] = (y = 5) + 1;` emitted `a[0] = (y = 5U + 1U);` (y became 6); `(z = 3) == 3` stored 1
+into z; `-(y = 5)` became the invalid `-y = 5`. Measured consequence: `a[0] = (i = 3) + 1;
+b[i] = 99;` — the checker's i was 3 and the program's was 4, an unchecked write to `b[4]`. Both
+emitter dispatch points (`emit_expr`, `emit_rewritten_node`) parenthesise every assignment.
+Test: `tests/zer/assign_value_parens_bug1183.zer`.
+
+### BUG-1184 — the assignment TARGET's index was read after the value ran
+`u32 i = 0; a[i] += seti(&i);` lowered to `t = seti(&i); a[i] += t;`: the checker proved i == 0
+(statement start) and elided the check, the write landed at a[4] — ASan stack-buffer-overflow,
+no diagnostic; `a[i] = (i = 4);` was an unsequenced C expression doing the same. Left to right
+means the target's index is evaluated first: when the value may write, an index it can change
+(a local it assigns or addresses, a local address-taken anywhere in the function, or a
+non-local name) is lowered into a temp before the value. Deliberately NOT every index —
+`arr[i] = alloc(T)` keeps `i`, which BUG-1130's slot identity keys on. Test:
+`tests/zer/assign_target_index_first_bug1184.zer`.
+
+### BUG-1185 — IR locals: a capture WAS the same-named outer local; a closed sibling scope answered for an open one
+(1) `u32 i = 3; if (mb()) |i| { … } arr[i] = 5;` — the capture had the outer local's name,
+type and depth, so `ir_add_local` DEDUPED onto it: the unwrap overwrote `i`, and the write to
+`arr[12]` skipped the check the checker had proven for 3 (ASan global-buffer-overflow). A
+`|*p|` capture merged with a `*u32 p` the same way. (2) A capture was never hidden after its
+if, so the outer name read the payload afterwards. (3) `if (v) |v|` created the capture BEFORE
+lowering the condition, which then read the uninitialised capture. (4) A redeclaration in a
+SIBLING block deduped onto the closed block's local but left it hidden, so `ir_find_local` fell
+back to the last same-named local — a sibling's `u8 v` answered for `u32 v`, an index was
+emitted with the wrong local, and a nested range-for stepped the inner counter (an infinite
+loop). Captures never share a local (either direction); the if-capture is created after the
+condition and hidden after the then-body; a dedup re-opens the local it returns.
+Test: `tests/zer/capture_and_sibling_scope_locals_bug1185.zer`.
+
+### BUG-1186 — a union `|*w|` capture outlived its variant (CRITICAL — integer to pointer, no @inttoptr)
+The in-arm mutation rule saw direct writes only. A CALLEE assigning the other variant (through
+a `*U` alias, or a global union by name), or the capture ESCAPING the arm (`k = w;`, a derived
+local, `return w;`, a keep param), left `w` pointing at the bytes of a different variant:
+`*w.ptr = 1234` wrote through a u64 the callee had set to `@ptrtoint(&victim[2])`. Two halves:
+- the ESCAPE half: `Symbol.is_variant_capture` on the capture and on locals initialised from a
+  reference into it (`value_forms_variant_ref` — a reference is FORMED by the capture, `&w.f`, a
+  slice of it, an array field decaying, or a pointer-carrying call handed one; a field READ is
+  not); the store, return and struct-literal sinks refuse it; `arg_is_local_derived` and the
+  keep edges (`KV_VARIANT_CAPTURE`) cover calls and spawns;
+- the CALLEE half: calls inside a `|*w|` arm are recorded and judged after every body is typed
+  (`check_union_capture_calls`, run from `check_keep_inference`, i.e. on both entry points): a
+  callee that may assign through a path of union type U, or store an aggregate holding one —
+  transitively, visited set, no cap — is refused, as is a call whose target is unknown.
+Test: `union_capture_callee_variant_change_bug1186`; sink matrix SHAPE p37 (10 cells, 6 holes
+pre-fix). Zero corpus cost.
+
+### BUG-1187 — a reference formed INTO a function's returned temporary
+`return mk(k).arr[0..];`, `gs = mk(5).arr[0..];`, `[*]u32 s = mk(k).arr;` (decay) compiled and
+read a dead frame (ASan stack-use-after-return); `&mk(9).arr[2]` reached GCC as "lvalue
+required"; the named-local spelling was already refused. `ref_path_hits_call_temp` walks the
+lvalue path — a step through a pointer / slice / Handle points elsewhere and is fine (`f().s[0..]`
+of a slice FIELD stays legal) — and `&`, a slice of an array, and an array decaying to a slice
+(`reject_array_view_hazards`, every value-flow sink) are refused at the node. Test:
+`view_into_call_temporary_bug1187`; sink matrix SHAPE p38 (8 cells, 5 holes pre-fix). Zero corpus
+cost.
+
+### BUG-1188 — `@once` accepted the bare `orelse return` / `break` / `continue`
+The statement forms were refused; the flag forms reach no statement handler (the "construct
+modelled as a flag" class), so `u32 v = mb(k) orelse return;` inside `@once` compiled and the
+second call spun forever on the once-flag the skipped publish never set — a single-threaded hang.
+Found beside it: the defer / `@critical` bans on the flag forms asked the RAW depth, not BUG-947's
+escaping depth, so `@critical { for (…) { x orelse break; } }` was over-rejected. Tests:
+`once_orelse_return_bug1188`, `tests/zer/orelse_jump_loop_inside_critical_once_bug1188.zer`.
+
+### BUG-1189 — a `goto` could jump past the declaration of a non-null `*T` into its scope
+The IR declares every local at function top, auto-zeroed, so `goto skip; *B b = &gb; skip:
+return b.v;` dereferenced NULL (SIGSEGV hosted, a silent read of address 0 on bare metal); the
+funcptr spelling trapped only because of BUG-1019's guard. The goto-label walkers push a
+declaration whose type has NO zero value (non-null pointer, funcptr, enum without a 0 variant —
+exactly the types that require an initializer) onto the path stack the capture arms already use,
+so "the goto's path does not cover the label's" is the bypass. Refused only when the variable is
+mentioned at or after the label (`gen_goto_003`'s cleanup chain past an unused `r2` stays legal).
+Test: `goto_past_nonnull_decl_bug1189`.
+
+### BUG-1190 — two ways to fall off the end of a non-void function
+(1) `contains_break` treated expressions as leaves, so `while (true) { u32 t = k + (mb(k) orelse
+break); return t; }` counted as a loop that never exits (also an `if` condition and the orelse
+subject); (2) `all_paths_return` accepted a block with ANY returning statement, so `goto done;
+… return 7; done:` fell off the end. Both returned 0 — NULL for a `*T` return. Only the statements
+from the block's last label onward count now (`stmt_holds_label`). Zero corpus cost. Tests:
+`missing_return_nested_orelse_break_bug1190`, `missing_return_goto_label_after_return_bug1190`.
+
+### BUG-1191 — an enum value that was not a bare literal was silently dropped
+`a = 1 + 2`, `c = 1 << 4`, `d = BASE`, `get = 'G'`: the checker set 0, the emitter counted on
+from the previous variant, so switch dispatch, VRP and static_assert disagreed with the program.
+Measured: `enum E { a..i, j = 0 + 0 }; arr[(u32)E.j]` on a u32[4] — proven index 0, emitted 9, an
+unchecked out-of-bounds write. The value is folded ONCE in the checker (any compile-time
+expression; a non-constant or out-of-i32 value is an error, including the implicit `+1` past
+INT32_MAX that used to wrap — and was signed-overflow UB inside the compiler); the emitter prints
+the checker's values. The constant evaluator now folds character literals. Tests:
+`tests/zer/enum_value_expressions_bug1191.zer`, `enum_auto_value_overflow_bug1191`.
+
+### BUG-1192 — copying an ARRAY PARAMETER copied the pointer's bytes
+C decays `u8[64] a` to a pointer, so `S y = { .arr = a }` (both emitters) emitted
+`memcpy(&y.arr, &a, sizeof(y.arr))` — 64 bytes read from the pointer VARIABLE — and `u8[64] c =
+a;` used `sizeof(a)` (8). The source is the array's value and the size the destination's. Test:
+`tests/zer/array_param_copy_bug1192.zer` (ASan-clean).
+
+### BUG-1193 — `@try_enum` narrowed its operand to i32 before the membership test
+`@try_enum(Gap, (u64)4294967306)` returned the variant 10 and `@try_enum(Dir, (u32)0xFFFFFFFF)`
+matched -1 — the CHECKED door returning a variant for a value that is not one. The test now runs
+on the operand's own value and type, comparing only the variants representable in that type.
+Test: `tests/zer/try_enum_wide_operand_bug1193.zer`.
+
+---
+
 ## Session 2026-09-23g — BUG-1152..1176: a harvested branch plus a five-area audit (silent holes at run time AND compile time, several silent on bare metal only)
 
 **Harvest.** `claude/loving-bohr-8rby10` (34 commits, forked AT main) was fast-forwarded in; it

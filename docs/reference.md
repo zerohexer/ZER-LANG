@@ -821,6 +821,34 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
   compound op on a newly activated variant starts from 0). Within the active variant both
   behave normally. Such a write through a path with a side effect (`arr[next()].v.x = 1`)
   is a compile error — take a pointer to the union in a local first.
+- A mutable capture `|*v|` points INTO the variant, so it is valid only while the arm runs
+  and the union keeps that variant. Two rules keep it that way:
+  - it cannot be stored anywhere (assigned, put in a struct literal, returned, handed to a
+    function that keeps it) — the variant could change after the arm;
+  - inside the arm, a call to a function that may assign a variant of the same union
+    TYPE (directly, through a pointer, through a global, or in a callee of its own) is a
+    compile error, and so is a call through a function pointer — its target is unknown.
+  Reading a value OUT of the variant (`u32 n = v.count;`, `*T p = v.ptr;`) is always fine;
+  so is a callee that only reads. When you need to call a function that changes the
+  union, capture by value (`|v|`, a copy) and write the result back after the switch.
+
+<!-- audit: expect-error: cannot call 'reset' while -->
+```zer
+struct Buf { *u32 ptr; }
+union Slot { u64 raw; Buf buf; }
+Slot g;
+u32[4] storage;
+void reset() { g.raw = 0; }          // assigns the OTHER variant
+u32 main() {
+    Buf b = { .ptr = &storage[0] };
+    g.buf = b;
+    switch (g) {
+        .buf => |*v| { reset(); *v.ptr = 1; }   // COMPILE ERROR — v would point at `raw`
+        .raw => |r| { }
+    }
+    return 0;
+}
+```
 
 **SEE ALSO**
 enum, switch
@@ -1516,9 +1544,16 @@ duplicate labels           // COMPILE ERROR — label 'x' already defined
 **NOTES**
 - Labels are function-scoped — cannot goto between functions. There is no fixed
   limit on the number of labels in a function.
-- A `goto` fires the defers of every scope it LEAVES, in LIFO order — the same as
-  `return` / `break` / `continue`. A backward goto that stays inside the scope of
-  an armed defer does not fire it; the defer still runs once, at scope exit.
+- A **forward** `goto` fires EVERY defer pending at the goto, in LIFO order —
+  including the defers of scopes the label is still inside — and those defers do not
+  fire again later. So after `goto out;`, code at `out:` runs with the function's
+  cleanup already done: a use of a resource a pending `defer` released is a compile
+  error (use after free), and a `defer x = 77;` has already written x. Put the label
+  code that needs the resource before the goto, or move the defer after the label.
+  (Measured 2026-09-24; the scope-based wording this note used to have described a
+  rule the compiler does not implement — see docs/limitations.md.)
+- A **backward** goto (a loop) fires only the defers registered after its label; a
+  defer registered before the label stays pending and runs once, at scope exit.
 - Labels work inside switch arms. A label inside a `defer` body is a compile
   error ("cannot place a label inside a defer body") — goto is banned there, so it
   could never be a jump target.
@@ -2191,6 +2226,10 @@ rx_buf.push_checked(byte) orelse {
 **NOTES**
 - N must be a compile-time constant.
 - ISR-safe: uses memory barriers between producer and consumer.
+- The element type cannot be a unique resource — `Arena`, `Pool`, `Slab`, `Ring`,
+  `Barrier`, `Semaphore`, an async task, or an aggregate carrying one. A Ring copies
+  elements in and out by value, and a copy of those is a second owner of one state.
+  Queue a pointer or a `Handle` instead.
 
 **SEE ALSO**
 Pool(T,N)
@@ -2283,6 +2322,29 @@ ar.alloc_slice(Byte, 64);
   overflows, so a slice can never report a length the arena does not hold.
 - No individual free — arena is all-or-nothing.
 - Use `defer ar.reset()` to ensure cleanup on all exit paths.
+- An Arena is not copyable: `b = a;` (and every other value-flow spelling) is a compile
+  error, because the two would hand out the same bytes. Build a fresh one with
+  `Arena.over(buf)` instead.
+- **Re-initialising an arena by assignment is a reset.** `a = Arena.over(buf);` puts the
+  bump offset back to 0, so everything `a` handed out before is invalid afterwards — a
+  later use of such a pointer is the same compile error as a use after `a.reset()`. Only
+  the allocations from THAT arena are affected. (This holds even when `buf` is a different
+  buffer: whether two backings overlap is not decidable in general.)
+
+<!-- audit: expect-error: use after free -->
+```zer
+struct Rec { u32 v; }
+u8[256] mem;
+u32 main() {
+    Arena a = Arena.over(mem);
+    *Rec x = a.alloc(Rec) orelse return;
+    x.v = 7;
+    a = Arena.over(mem);          // a reset: x's bytes are handed out again
+    *Rec y = a.alloc(Rec) orelse return;
+    y.v = 9;
+    return x.v;                   // COMPILE ERROR — x was invalidated by the re-init
+}
+```
 
 **SEE ALSO**
 Pool(T,N), Slab(T)
@@ -4869,6 +4931,32 @@ u32 main() {
 `x /= 0` and `x %= 0` with a divisor that folds to zero are compile errors, exactly
 like `x / 0`; a divisor the compiler cannot prove nonzero is one too (see "SAFETY GUARANTEES").
 
+### Evaluation Order
+
+Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once — for
+binary operators, comparisons, call arguments, struct-literal fields and array indices,
+whether an operand is a local, a global or a field. An assignment evaluates its TARGET
+(including every index in it) before its value, and yields the stored value.
+
+```zer
+u32 bump(*u32 p) { *p += 10; return 1; }
+u32 pair(u32 a, u32 b) { return a * 100 + b; }
+u32 main() {
+    u32 x = 5;
+    if (x + bump(&x) != 6) { return 1; }        // x is read (5) before the call
+    u32 y = 5;
+    if (pair(y, bump(&y)) != 501) { return 2; } // argument 1 before argument 2
+    u32[4] a;
+    u32 i = 0;
+    a[i] = bump(&i);                            // the target a[0] is fixed first
+    if (a[0] != 1 || i != 10) { return 3; }
+    u32 z = 0;
+    a[1] = (z = 2) * 3;                         // an assignment is a value
+    if (z != 2 || a[1] != 6) { return 4; }
+    return 0;
+}
+```
+
 ### Bit Extraction
 ```zer
 reg[9..8]                  // Extract bits 9:8
@@ -5601,6 +5689,51 @@ u32 main() {
     g_ready = 1;
     if (_zer_async_waiter_poll(&task) != 1) { return 2; }   // condition met -> done
     if (g_seen != 1) { return 3; }
+    return 0;
+}
+```
+
+**A TASK IS NOT COPYABLE — pass it by pointer**
+
+Every local of an async function lives in the task struct, so a pointer local may point at
+ANOTHER field of the same task (`*u32 p = &x;` across a `yield`). A copy of a polled task
+would keep that pointer aimed at the original. The task type is therefore a unique
+resource, like `Arena`: it cannot be copied by initialization, assignment, argument,
+return, struct literal or `Ring.push`. `_init`, `_poll` and `_result` all take a pointer, so
+hand the task around as `*_zer_async_NAME`:
+
+```zer
+async u32 count_up(u32 start) {
+    u32 x = start;
+    *u32 p = &x;              // points at the task's own field
+    yield;
+    *p += 1;
+    return x;
+}
+
+u32 drive(*_zer_async_count_up t) {   // a pointer to the task, never a copy
+    u32 polls = 0;
+    while (_zer_async_count_up_poll(t) == 0) { polls += 1; }
+    return polls;
+}
+
+u32 main() {
+    _zer_async_count_up t;
+    _zer_async_count_up_init(&t, 5);
+    if (drive(&t) != 1) { return 1; }
+    if (_zer_async_count_up_result(&t) != 6) { return 2; }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: cannot initialize an async task by value -->
+```zer
+async u32 count_up(u32 start) { u32 x = start; *u32 p = &x; yield; *p += 1; return x; }
+u32 main() {
+    _zer_async_count_up t;
+    _zer_async_count_up_init(&t, 5);
+    _zer_async_count_up_poll(&t);
+    _zer_async_count_up t2 = t;   // COMPILE ERROR — t2.p would still point into t
     return 0;
 }
 ```

@@ -1,0 +1,35 @@
+// BUG-1177: a task is not copyable, so it is handed around by POINTER. Pre-fix the
+// pointer form did not build either: a function declared before the async function
+// named `*_zer_async_...` before its typedef existed (now forward-declared).
+async u32 count_up(u32 start) {
+    u32 x = start;
+    *u32 p = &x;          // self-reference: `p` points at the task's own field
+    yield;
+    *p += 1;
+    yield;
+    *p += 1;
+    return x;
+}
+u32 drive(*_zer_async_count_up t) {
+    u32 polls = 0;
+    while (_zer_async_count_up_poll(t) == 0) { polls += 1; }
+    return polls;
+}
+u8[64] backing;
+struct T { u32 v; }
+u32 main() {
+    _zer_async_count_up t;
+    _zer_async_count_up_init(&t, 5);
+    if (drive(&t) != 2) { return 1; }
+    if (_zer_async_count_up_result(&t) != 7) { return 2; }
+    // BUG-1178: re-initialising an arena with a FRESH state is still allowed.
+    Arena a = Arena.over(backing);
+    *T one = a.alloc(T) orelse return;
+    one.v = 3;
+    u32 saved = one.v;
+    a = Arena.over(backing);
+    *T two = a.alloc(T) orelse return;
+    two.v = 4;
+    if (saved + two.v != 7) { return 3; }
+    return 0;
+}

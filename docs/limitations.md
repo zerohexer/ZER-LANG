@@ -102,7 +102,10 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 
 ## OPEN — residuals of the 2026-09-23g audit (measured; reproducers inline)
 
-1. **A callee frees an allocation through a GLOBAL, the caller reads its LOCAL alias**
+1. ~~**A callee frees an allocation through a GLOBAL, the caller reads its LOCAL alias**~~ —
+   **CLOSED 2026-09-24 (BUG-1181)**: FuncSummary.freed_global + the call-site widening; SHAPE
+   p36. Residual: a free through a global reached via a FUNCPTR call is not summarised (the
+   target is unknown and no summary is applied at an indirect call). Original text:
    (MEDIUM — accept-unsafe, silent). `g = a; drop_g(); a.v` where `void drop_g() { if (g) |p|
    { free(p); } g = null; }` compiles, and the read returns a recycled object's value. The
    store marks `a` escaped and no FuncSummary says "frees what global g points to" (the callee
@@ -130,6 +133,53 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    re-initialized); a one-iteration loop that frees reported as a double free; a false leak
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
+
+## OPEN — precision residuals of BUG-1177..1186 (2026-09-24, LOW — over-rejection; each is the conservative side of a new rule)
+
+1. **An async task cannot be copied even BEFORE its first poll** (BUG-1177). A never-polled task
+   holds no self-reference, so the copy is safe; the rule is type-level because ZER has no
+   "not yet started" fact on a value. Corpus cost zero. Fix sketch: a per-task flow fact
+   "polled" (reset by `_init`), with the copy refused only once it may be set.
+2. **Re-pointing an arena at a DIFFERENT buffer invalidates what it handed out** (BUG-1178).
+   `a = Arena.over(b2)` after allocations from `Arena.over(b1)` is safe — `b1` still holds
+   them — but whether the two backings overlap (sub-slices of one buffer, a loop re-overing
+   the same one) is not decidable in general, so any re-init is treated as `a.reset()`. Read
+   the old allocation's data into a local before the re-init (what p21_safe_fresh does).
+3. **The union-capture callee rule is TYPE-based** (BUG-1186). A callee that assigns a variant
+   of ANOTHER `U` instance (a queue of messages of the same union type) is refused inside a
+   `|*w|` arm, as is any call through a funcptr. Precise alternative: a per-callee summary of
+   WHICH roots it writes (the BUG-1181 key machinery), with a pointer argument's pointee
+   treated as a root. Remedy today: capture by value and write back after the switch.
+4. **A variant-capture pointer assigned to a local DECLARED IN THE ARM** (`*P q = w; … q = w;`)
+   is refused like an escape: the store sink does not ask where the target was declared.
+5. **BUG-1181 is flow-insensitive** on the callee side: a local that is EVER loaded from `g` is
+   treated as possibly holding `g`'s allocation at every free of it.
+
+## OPEN — a forward `goto` fires EVERY pending defer, not only those of the scopes it leaves (2026-09-24, LOW — semantics / over-rejection, memory-safe)
+
+`defer x = 77; if (k == 0) { goto out; } out: return x;` returns 77 on the goto path and the
+original value otherwise, and `*T p = alloc(T)…; defer free(p); if (e) { goto out; } out:
+return p.v;` is REFUSED (use after free) although the label is inside the defer's scope. The IR
+(`NODE_GOTO` in ir_lower.c) fires everything above `fire_base = 0` for a forward goto and
+guards the label's return-fire with a runtime flag (plt86m). CLAUDE.md and
+`tests/zer/goto_defer.zer` / `rust_tests/rt_goto_fires_defer.zer` rely on "fire all";
+reference.md used to state the scope-based rule (C++/Zig: a jump runs the defers of the scopes
+it LEAVES) and now documents the implemented one. Memory-safe either way: zercheck sees the
+DEFER_FIRE on the goto path. Fix sketch if the scope-based rule is adopted: `fire_base` = the
+defer count live at the label's lexical position (known at the LABEL for a backward goto; for
+a forward goto the label's enclosing-scope defer depth is known from collect_labels), plus
+the label's guard flag keyed per fired range.
+
+## OPEN — defer bodies in a function WITH A LABEL still use the AST emitter (2026-09-24, MEDIUM — a lost lock, a trap on valid code)
+
+Refactor L lowered defer bodies to IR only for functions without a label
+(`IRInst.defer_fire_emit_ast`). In a labelled function, measured by the 2026-09-24 audit
+(`/tmp` reproducers l1/l3/l4): a shared-struct read in an `if`/`while`/`for` CONDITION inside
+the defer body takes no mutex (the same body without a label does), and `switch` / `do-while`
+in the defer body emit "compiler bug: emit_defer_stmt has no handler" plus a runtime trap. Fix:
+finish refactor L for labelled functions (the goto guard-flag machinery is the reason it was
+not done), or, until then, refuse those statement kinds and shared reads in a labelled
+function's defer body at the checker so the failure is a diagnostic, not a trap/race.
 
 ## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 

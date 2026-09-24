@@ -115,6 +115,10 @@ struct Type {
             bool is_shared;
             bool is_shared_rw;      /* shared(rw) — reader-writer lock */
             bool is_move;           /* move struct — ownership transfer on pass/assign */
+            bool is_async_state;    /* BUG-1177: `_zer_async_NAME` coroutine state — a
+                                     * promoted local may be pointed at by another
+                                     * promoted local, so the value is SELF-REFERENTIAL
+                                     * and a copy dangles into the original */
             const char *module_prefix;  /* NULL for main module */
             uint32_t module_prefix_len;
             uint32_t type_id;           /* BUG-393: runtime provenance tag */
@@ -236,6 +240,10 @@ struct Symbol {
     bool is_synthetic_var;
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
+    bool is_variant_capture; /* BUG-1186: a `|*w|` capture of a UNION switch arm, or a
+                              * pointer derived from one — it points INTO a variant and
+                              * is valid only while the arm runs and the union keeps
+                              * that variant. Never stored, returned, or kept. */
     /* BUG-969: WHICH local this pointer/slice/carrier points into, by name, when that
      * is knowable at the declaration. `is_local_derived` says THAT it points into a
      * local; the scoped-spawn borrow needs to know WHICH one, because the race it

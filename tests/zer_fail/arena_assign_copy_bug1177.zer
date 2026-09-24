@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot assign 'Arena' by value
+// BUG-1177: the ASSIGNMENT sink of the unique-resource rule. Pre-fix this compiled
+// and both arenas handed out the SAME BYTES: main returned 9, not 7.
+struct T { u32 v; }
+u8[256] buf1;
+u8[256] buf2;
+u32 main() {
+    Arena la = Arena.over(buf1);
+    Arena lb = Arena.over(buf2);
+    lb = la;
+    *T x = la.alloc(T) orelse return;
+    *T y = lb.alloc(T) orelse return;
+    x.v = 7;
+    y.v = 9;
+    return x.v;
+}

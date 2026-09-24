@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1181: the callee frees the allocation the GLOBAL holds; the caller still
+// reads its LOCAL alias. Pre-fix this compiled and returned 5 — the value of a
+// recycled auto-Slab slot (ASan cannot see it: free() recycles, it does not unmap).
+struct T { u32 v; }
+?*T g;
+void drop_g() {
+    if (g) |p| { free(p); }
+    g = null;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    g = a;
+    drop_g();
+    return a.v;
+}

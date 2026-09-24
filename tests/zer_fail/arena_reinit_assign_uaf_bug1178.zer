@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1178: `a = Arena.over(buf)` re-initialises the arena (offset back to 0) —
+// exactly `a.reset()`, which was tracked; the assignment spelling was not. Pre-fix
+// this compiled and returned 9: `y` was handed the bytes `x` still points at.
+struct T { u32 v; }
+u8[256] buf1;
+u32 main() {
+    Arena la = Arena.over(buf1);
+    *T x = la.alloc(T) orelse return;
+    x.v = 7;
+    la = Arena.over(buf1);
+    *T y = la.alloc(T) orelse return;
+    y.v = 9;
+    return x.v;
+}

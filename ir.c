@@ -71,7 +71,22 @@ int ir_add_local(IRFunc *func, Arena *arena,
                 bool same_type = (!type || !func->locals[i].type ||
                                   type == func->locals[i].type);
                 bool same_scope = (func->locals[i].scope_depth == cur_depth);
-                if (same_type && same_scope) return func->locals[i].id;
+                /* BUG-1185: a CAPTURE never shares storage with another name
+                 * (either direction). `u32 i = 3; if (mb()) |i| { … }` has
+                 * the same name, type and depth as the outer `i`, so the
+                 * capture WAS the outer local: the unwrap overwrote it and the
+                 * next `arr[i]` indexed with the payload, past a bound the
+                 * checker had proven for 3 (ASan global-buffer-overflow).
+                 * And a dedup onto a local whose block has CLOSED must re-open
+                 * it: returning it still hidden made ir_find_local fall back to
+                 * the LAST same-named local — a sibling block's `u8 v` answered
+                 * for this block's `u32 v`, and a nested range-for's step
+                 * advanced the inner loop's counter (an infinite loop). */
+                if (same_type && same_scope && !is_capture &&
+                    !func->locals[i].is_capture) {
+                    func->locals[i].hidden = false;
+                    return func->locals[i].id;
+                }
                 /* Different type OR different scope → fall through to create
                  * new suffixed local. Use `_%d` with the count to ensure
                  * uniqueness across suffixed + unsuffixed variants. */

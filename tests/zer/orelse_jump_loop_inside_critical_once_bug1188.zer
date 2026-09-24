@@ -1,0 +1,20 @@
+// BUG-1188: an 'orelse break' / 'orelse continue' whose loop is INSIDE @critical /
+// @once keeps the jump inside the block (BUG-947's escaping depth), so it is legal.
+// Pre-fix the flag forms asked the raw depth and refused this.
+?u32 mb(u32 i) { if (i > 2) { return null; } return i; }
+u32 main() {
+    u32 s = 0;
+    @critical {
+        for (u32 i = 0; i < 5; i += 1) {
+            u32 v = mb(i) orelse break;
+            s += v;
+        }
+    }
+    @once {
+        for (u32 i = 0; i < 5; i += 1) {
+            u32 v = mb(i) orelse continue;
+            s += v;
+        }
+    }
+    return s - 6;
+}

@@ -677,7 +677,7 @@ static bool anw_stop_at_addr(Node *value, int kind, void *ud) {
 bool ast_name_mutated_or_addrd(Node *n, const char *name, uint32_t len) {
     return ast_name_writes_r(n, name, len, anw_stop_at_first, NULL);
 }
-static bool ast_name_addr_taken(Node *n, const char *name, uint32_t len) {
+bool ast_name_addr_taken(Node *n, const char *name, uint32_t len) {
     return ast_name_writes_r(n, name, len, anw_stop_at_addr, NULL);
 }
 
@@ -3133,6 +3133,7 @@ static bool ir_register_alloc_result(ZerCheck *zc, IRFunc *func, IRPathState *ps
             h->alloc_line = line;
             h->alloc_id = ir_alloc_id_of_local(dest);   /* BUG-1006: never 0 */
             h->source_color = ZC_COLOR_ARENA;
+            ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);   /* BUG-1178 */
         }
         return true;
     }
@@ -3312,6 +3313,7 @@ static bool ir_register_alloc_into_wild_slot(ZerCheck *zc, IRFunc *func,
     h->alloc_line = line;
     if (mc == IRMC_ARENA_ALLOC) {
         h->source_color = ZC_COLOR_ARENA;
+        ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);   /* BUG-1178 */
     } else {
         h->source_color = ZC_COLOR_POOL;
         ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);
@@ -3339,6 +3341,7 @@ static bool ir_register_alloc_result_compound(ZerCheck *zc, IRFunc *func,
     h->alloc_id = _ir_next_alloc_id++;
     if (mc == IRMC_ARENA_ALLOC) {
         h->source_color = ZC_COLOR_ARENA;
+        ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);   /* BUG-1178 */
     } else {
         h->source_color = ZC_COLOR_POOL;
         ir_extract_pool_name(call, &h->pool_name, &h->pool_name_len);
@@ -4617,12 +4620,170 @@ static void ir_check_expr_wrong_pool(ZerCheck *zc, IRFunc *func,
  * freed in any defer is considered potentially covered.
  * ================================================================ */
 
+/* ================================================================
+ * BUG-1181: a free THROUGH A GLOBAL, seen from the caller.
+ *
+ *     ?*T g;
+ *     void drop_g() { if (g) |p| { free(p); } g = null; }
+ *     *T a = alloc(T) orelse return;  g = a;  drop_g();  a.v   // was ACCEPTED
+ *
+ * The store `g = a` made (IR_GLOBAL_ROOT_ID, "g") an alias of `a` in the
+ * caller, but no summary said "this callee frees what g holds", so `a` stayed
+ * ALIVE across the call and the read hit a recycled slot (measured: returned
+ * the old value; ASan is blind because alloc(T) recycles through the auto-Slab).
+ * The callee records every global KEY a free's argument traces to — directly
+ * (`free(g)`, `free(g.p)`) or through a local copied out of one (a capture,
+ * an orelse unwrap, `*T p = g;`, `p = g;`) — and the call site widens the
+ * caller's entry for that key, with its alias group, to MAYBE_FREED. MAYBE,
+ * not FREED: the callee's free may be conditional, and MAYBE already refuses a
+ * use and a second free. Transitive: applying a summary re-notes its keys.
+ * ================================================================ */
+/* Summary fixpoint helpers: same set (order-insensitive), and an ARENA copy. */
+static bool ir_freed_global_same(const FuncSummary *s, const ZerCheck *zc) {
+    if (s->freed_global_n != zc->cur_freed_global_n) return false;
+    for (int i = 0; i < s->freed_global_n; i++) {
+        bool found = false;
+        for (int j = 0; j < zc->cur_freed_global_n && !found; j++)
+            found = s->freed_global[i].len == zc->cur_freed_global[j].len &&
+                    memcmp(s->freed_global[i].key, zc->cur_freed_global[j].key,
+                           s->freed_global[i].len) == 0;
+        if (!found) return false;
+    }
+    return true;
+}
+static void ir_freed_global_store(ZerCheck *zc, FuncSummary *s) {
+    s->freed_global_n = 0;
+    s->freed_global = NULL;
+    if (zc->cur_freed_global_n == 0) return;
+    s->freed_global = (struct ZcFreedGlobal *)arena_alloc(zc->arena,
+        (size_t)zc->cur_freed_global_n * sizeof(struct ZcFreedGlobal));
+    if (!s->freed_global) return;
+    memcpy(s->freed_global, zc->cur_freed_global,
+           (size_t)zc->cur_freed_global_n * sizeof(struct ZcFreedGlobal));
+    s->freed_global_n = zc->cur_freed_global_n;
+}
+
+static void ir_note_freed_global(ZerCheck *zc, const char *key, uint32_t len) {
+    if (!key || len == 0) return;
+    for (int i = 0; i < zc->cur_freed_global_n; i++)
+        if (zc->cur_freed_global[i].len == len &&
+            memcmp(zc->cur_freed_global[i].key, key, len) == 0) return;
+    if (zc->cur_freed_global_n >= zc->cur_freed_global_cap) {
+        int nc = zc->cur_freed_global_cap < 8 ? 8 : zc->cur_freed_global_cap * 2;
+        struct ZcFreedGlobal *nb = (struct ZcFreedGlobal *)realloc(
+            zc->cur_freed_global, (size_t)nc * sizeof(struct ZcFreedGlobal));
+        if (!nb) return;
+        zc->cur_freed_global = nb;
+        zc->cur_freed_global_cap = nc;
+    }
+    /* Keys point at AST names or zc->arena paths — both outlive the analysis. */
+    zc->cur_freed_global[zc->cur_freed_global_n].key = key;
+    zc->cur_freed_global[zc->cur_freed_global_n].len = len;
+    zc->cur_freed_global_n++;
+}
+
+/* The global key a VALUE expression reads (`g`, `g.p`, `g orelse …`), if any. */
+static bool ir_value_global_key(ZerCheck *zc, IRFunc *func, Node *e,
+                                const char **key, uint32_t *len) {
+    e = ir_peel_launder(e);
+    if (e && e->kind == NODE_ORELSE) e = ir_peel_launder(e->orelse.expr);
+    if (!e) return false;
+    if (e->kind == NODE_FIELD || e->kind == NODE_INDEX)
+        return ir_global_projection_key(zc, func, e, key, len);
+    if (e->kind == NODE_IDENT && ir_ident_is_unshadowed_global(zc, func, e)) {
+        *key = e->ident.name;
+        *len = (uint32_t)e->ident.name_len;
+        return true;
+    }
+    return false;
+}
+
+/* Follow a local back through every instruction that defines it (COPY, a
+ * passthrough ASSIGN into it, a plain `p = <value>` assignment to it) and note
+ * each global key it may have been loaded from. Flow-INSENSITIVE on purpose: a
+ * local that is EVER loaded from g may hold g's allocation at the free — the
+ * over-approximation can only widen a caller's handle, never narrow one.
+ * Terminates by a visited set over locals. */
+static void ir_trace_local_globals(ZerCheck *zc, IRFunc *func, int local,
+                                   bool *visited) {
+    if (local < 0 || local >= func->local_count || visited[local]) return;
+    visited[local] = true;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            Node *val = NULL;
+            if (in->dest_local == local && in->op == IR_COPY) {
+                ir_trace_local_globals(zc, func, in->src1_local, visited);
+                continue;
+            }
+            if (in->op != IR_ASSIGN || !in->expr) continue;
+            if (in->dest_local == local && in->expr->kind != NODE_ASSIGN) {
+                val = in->expr;
+            } else if (in->expr->kind == NODE_ASSIGN &&
+                       in->expr->assign.op == TOK_EQ &&
+                       in->expr->assign.target &&
+                       in->expr->assign.target->kind == NODE_IDENT &&
+                       ir_find_local(func, in->expr->assign.target->ident.name,
+                           (uint32_t)in->expr->assign.target->ident.name_len) == local) {
+                val = in->expr->assign.value;
+            }
+            if (!val) continue;
+            const char *k; uint32_t kl;
+            if (ir_value_global_key(zc, func, val, &k, &kl)) {
+                ir_note_freed_global(zc, k, kl);
+                continue;
+            }
+            Node *pv = ir_peel_launder(val);
+            if (pv && pv->kind == NODE_ORELSE) pv = ir_peel_launder(pv->orelse.expr);
+            if (pv && pv->kind == NODE_IDENT) {
+                int src = ir_find_local(func, pv->ident.name,
+                                        (uint32_t)pv->ident.name_len);
+                if (src >= 0) ir_trace_local_globals(zc, func, src, visited);
+            }
+        }
+    }
+}
+
+/* Called at every free whose argument resolved to (root_local, path). */
+static void ir_record_free_through_global(ZerCheck *zc, IRFunc *func,
+                                          int root_local, const char *path,
+                                          uint32_t path_len) {
+    if (root_local == IR_GLOBAL_ROOT_ID) {
+        ir_note_freed_global(zc, path, path_len);
+        return;
+    }
+    if (root_local < 0 || root_local >= func->local_count || path_len != 0) return;
+    bool *vis = (bool *)calloc((size_t)func->local_count, sizeof(bool));
+    if (!vis) return;
+    ir_trace_local_globals(zc, func, root_local, vis);
+    free(vis);
+}
+
+/* Call site: the callee may free what each listed global holds. */
+static void ir_apply_freed_globals(ZerCheck *zc, IRPathState *ps,
+                                   const FuncSummary *summary, int line) {
+    for (int k = 0; k < summary->freed_global_n; k++) {
+        const char *key = summary->freed_global[k].key;
+        uint32_t len = summary->freed_global[k].len;
+        ir_note_freed_global(zc, key, len);          /* transitive */
+        IRHandleInfo *gh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID, key, len);
+        if (!gh || gh->alloc_id == 0) continue;
+        if (gh->state != IR_HS_ALIVE) continue;
+        gh->state = IR_HS_MAYBE_FREED;
+        gh->free_line = line;
+        ir_propagate_alias_state(ps, gh, IR_HS_MAYBE_FREED, line);
+    }
+}
+
 /* AU-2 (2026-07-01): mark every ALIVE arena-colored handle (and any alias
  * sharing its alloc_id) FREED. Shared by the direct IRMC_ARENA_RESET path AND
  * the defer-body scanner — `defer arena.reset()` must invalidate arena handles
  * the same way a direct `arena.reset()` does. Two-pass (snapshot alloc_ids,
  * then mark) so aliases with ZC_COLOR_UNKNOWN are also caught. */
 static void ir_mark_arena_handles_state(IRPathState *ps, int line, int new_state);
+static void ir_mark_arena_handles_state_of(IRPathState *ps, int line, int new_state,
+                                           const char *arena, uint32_t arena_len);
 static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
     ir_mark_arena_handles_state(ps, line, IR_HS_FREED);
 }
@@ -4630,14 +4791,28 @@ static void ir_mark_arena_handles_freed(IRPathState *ps, int line) {
  * parameter — FREED for a reset that certainly ran, MAYBE_FREED for an
  * indirect call that may reach one. */
 static void ir_mark_arena_handles_state(IRPathState *ps, int line, int new_state) {
+    ir_mark_arena_handles_state_of(ps, line, new_state, NULL, 0);
+}
+/* BUG-1178: `arena` non-NULL restricts the walk to allocations handed out by
+ * THAT arena (IRHandleInfo.pool_name, recorded at every arena-alloc site). An
+ * allocation whose arena is unknown (no name — e.g. an arena-coloured call
+ * result — or the join marker of two arenas) is still marked: the filter can
+ * only ever SPARE an allocation provably from a different arena. */
+static void ir_mark_arena_handles_state_of(IRPathState *ps, int line, int new_state,
+                                           const char *arena, uint32_t arena_len) {
     int aid_cap = ps->handle_count > 0 ? ps->handle_count : 1;
     int *aids = (int *)malloc((size_t)aid_cap * sizeof(int));
     if (!aids) return;
     int aid_count = 0;
     for (int hi = 0; hi < ps->handle_count; hi++) {
         IRHandleInfo *h = &ps->handles[hi];
-        if (h->source_color == ZC_COLOR_ARENA && h->state == IR_HS_ALIVE)
-            aids[aid_count++] = h->alloc_id;
+        if (h->source_color != ZC_COLOR_ARENA || h->state != IR_HS_ALIVE) continue;
+        if (arena && h->pool_name && h->pool_name_len > 0 &&
+            h->pool_name != _ir_pool_mixed &&
+            (h->pool_name_len != arena_len ||
+             memcmp(h->pool_name, arena, arena_len) != 0))
+            continue;   /* provably another arena's allocation */
+        aids[aid_count++] = h->alloc_id;
     }
     for (int hi = 0; hi < ps->handle_count; hi++) {
         IRHandleInfo *h = &ps->handles[hi];
@@ -6877,6 +7052,39 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
      * inside the assign's expression — these are collapsed into IR_ASSIGN
      * per ir_lower.c Phase 8d and must be recognized here to track state. */
     case IR_ASSIGN: {
+        /* BUG-1178: `a = Arena.over(buf);` RE-INITIALISES an arena — its bump
+         * offset goes back to 0, so the next alloc hands out bytes an earlier
+         * allocation still points at. That is exactly `a.reset()`, which was
+         * tracked; the assignment spelling was not, and measured
+         *     *T x = a.alloc(T) orelse return; a = Arena.over(buf);
+         *     *T y = a.alloc(T) orelse return; y.v = 9; return x.v;   // 9
+         * compiled clean. One question, two spellings: treat the store exactly
+         * as the reset arm below does (ir_mark_arena_handles_freed, and the
+         * caller-visible BUG-1172 flag when the arena is not this function's own
+         * local). A copy `b = a;` is refused by the checker (BUG-1177), so the
+         * value stored here is always a fresh state. */
+        if (inst->expr && inst->expr->kind == NODE_ASSIGN &&
+            inst->expr->assign.op == TOK_EQ && inst->expr->assign.target) {
+            Node *at = inst->expr->assign.target;
+            int alid = (at->kind == NODE_IDENT)
+                ? ir_find_local(func, at->ident.name, (uint32_t)at->ident.name_len) : -1;
+            Type *att = checker_get_type(zc->checker, at);
+            if (!att && alid >= 0) att = func->locals[alid].type;
+            if (!att && at->kind == NODE_IDENT && zc->checker) {
+                Symbol *as = scope_lookup(zc->checker->global_scope,
+                    at->ident.name, (uint32_t)at->ident.name_len);
+                if (as) att = as->type;
+            }
+            if (att && type_dispatch_kind(att) == TYPE_ARENA) {
+                if (at->kind == NODE_IDENT)
+                    ir_mark_arena_handles_state_of(ps, inst->source_line, IR_HS_FREED,
+                        at->ident.name, (uint32_t)at->ident.name_len);
+                else
+                    ir_mark_arena_handles_freed(ps, inst->source_line);
+                if (alid < 0 || func->locals[alid].is_param)
+                    zc->cur_resets_arena = true;
+            }
+        }
         /* BUG-1131: a struct VALUE read out of a field / element — into the
          * instruction's dest (`H r = hs[0];`, the orelse temp) or, for the
          * passthrough assignment `r = hs[0];`, into the target — carries the
@@ -8347,6 +8555,25 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             free(pool_rs.ids);
             free(rs.ids);
         }
+        /* BUG-1182: the call DEFINES its destination temp — a fresh value. In a
+         * loop the same temp is redefined every iteration, and the back edge
+         * brought in the PREVIOUS iteration's entry: after `if (next) |h| {
+         * free(h); }` that entry is FREED (h aliases it), so the very next
+         * `?Handle(T) next = deq();` read a "freed" temp. Measured: the canonical
+         * dequeue-and-free loop — `examples/scheduler.zer`, and a four-line
+         * `for (…) { ?Handle(T) n = deq(i); if (n) |h| { tp.free(h); } }` —
+         * reported use-after-free AND double free on every run. A definition
+         * kills the old binding; the allocator arms below re-register the
+         * result when the call is one. Temps only: a named local is written by
+         * a COPY from the temp, which already overwrites its entry. */
+        if (inst->dest_local >= 0 && inst->dest_local < func->local_count &&
+            func->locals[inst->dest_local].is_temp) {
+            IRHandleInfo *dh_old = ir_find_handle(ps, inst->dest_local);
+            if (dh_old) {
+                dh_old->state = IR_HS_UNKNOWN;
+                dh_old->alloc_id = 0;
+            }
+        }
         /* BUG-1130: a local array HANDED to a call may be emptied by it. */
         ir_call_hands_local_array(zc, func, ps, inst->expr);
         /* Phase D3/E: ThreadHandle.join() — mark thread as joined.
@@ -8499,6 +8726,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     h->alloc_line = inst->source_line;
                     h->alloc_id = ir_alloc_id_of_local(inst->dest_local);
                     h->source_color = ZC_COLOR_ARENA;
+                    ir_extract_pool_name(inst->expr, &h->pool_name,
+                                         &h->pool_name_len);        /* BUG-1178 */
                 }
                 break;
             }
@@ -8513,7 +8742,12 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 /* AU-2 (2026-07-01): the two-pass arena-handle invalidation is
                  * now ir_mark_arena_handles_freed, shared with the defer-body
                  * scanner so a deferred arena.reset() behaves identically. */
-                ir_mark_arena_handles_freed(ps, inst->source_line);
+                {   /* BUG-1178: only THIS arena's allocations are invalidated. */
+                    const char *rn; uint32_t rl;
+                    ir_extract_pool_name(inst->expr, &rn, &rl);
+                    ir_mark_arena_handles_state_of(ps, inst->source_line,
+                                                   IR_HS_FREED, rn, rl);
+                }
                 if (!ir_reset_receiver_is_own_local(func, inst->expr))
                     zc->cur_resets_arena = true;                  /* BUG-1172 */
                 break;
@@ -8526,6 +8760,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 uint32_t path_len;
                 if (ir_extract_compound_key(zc, func, ps, arg,
                                              &root_local, &path, &path_len) == 0) {
+                    ir_record_free_through_global(zc, func, root_local,
+                                                  path, path_len);   /* BUG-1181 */
                     IRHandleInfo *h;
                     if (path_len == 0) h = ir_find_handle(ps, root_local);
                     else h = ir_find_compound_handle(ps, root_local, path, path_len);
@@ -9043,6 +9279,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             ir_mark_arena_handles_freed(ps, inst->source_line);
             zc->cur_resets_arena = true;
         }
+        if (summary->freed_global_n > 0)                        /* BUG-1181 */
+            ir_apply_freed_globals(zc, ps, summary, inst->source_line);
 
         /* Phase D7: if callee returns an ARENA-colored pointer, tag the
          * call's dest local so it's skipped in leak detection. Propagates
@@ -9854,6 +10092,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * never trust it across calls (an IRFunc address can be reused). */
     _ir_kx_func = NULL;
     zc->cur_resets_arena = false;   /* BUG-1172 */
+    zc->cur_freed_global_n = 0;     /* BUG-1181 */
     if (!zc->building_summary)
         ZTRACE("CHECK  zercheck_ir: '%.*s'  (%d blocks, %d locals) -- handle-lattice fixpoint",
                (int)func->name_len, func->name, func->block_count, func->local_count);
@@ -10892,6 +11131,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
             if (existing->ret_is_content != ret_is_content_final) changed = true;
             if (existing->resets_arena != zc->cur_resets_arena) changed = true;   /* BUG-1172 */
+            if (!ir_freed_global_same(existing, zc)) changed = true;              /* BUG-1181 */
             if (existing->ret_field_n != rf_n) changed = true;
             for (int k = 0; !changed && k < rf_n; k++)
                 if (existing->ret_field[k].param != rf[k].param ||
@@ -10918,6 +11158,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->ret_is_borrow = ret_is_borrow_final;
                 existing->ret_is_content = ret_is_content_final;
                 existing->resets_arena = zc->cur_resets_arena;
+                ir_freed_global_store(zc, existing);                           /* BUG-1181 */
             } else {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);
@@ -10949,6 +11190,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->ret_is_borrow = ret_is_borrow_final;
                 s->ret_is_content = ret_is_content_final;
                 s->resets_arena = zc->cur_resets_arena;   /* BUG-1172 */
+                ir_freed_global_store(zc, s);             /* BUG-1181 */
                 s->ret_field_n = rf_n;
                 s->ret_field = ir_ret_field_copy(zc, rf, rf_n);
             } else {

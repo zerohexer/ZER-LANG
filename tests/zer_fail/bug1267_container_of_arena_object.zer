@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+struct L { u32 x; }
+struct D { u32 id; L link; }
+u8[64] buf;
+u32 main() {
+    Arena a = Arena.over(buf);
+    *L h = a.alloc(L) orelse return;
+    *D d = @container(*D, h, link);
+    return d.id;
+}

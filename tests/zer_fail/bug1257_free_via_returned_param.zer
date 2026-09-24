@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: use after free: 's' is freed
+[*]u32 same([*]u32 x) { return x; }
+u32 main() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    s[0] = 5;
+    free(same(s));
+    u32 r = s[0];
+    free(s);
+    return r;
+}

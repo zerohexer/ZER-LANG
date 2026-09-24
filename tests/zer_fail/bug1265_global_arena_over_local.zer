@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot store local Arena value in global
+struct T { u32 v; }
+Arena ga;
+void init() {
+    u8[64] lb;
+    ga = Arena.over(lb);
+}
+u32 main() {
+    init();
+    *T t = ga.alloc(T) orelse return;
+    t.v = 5;
+    return t.v;
+}

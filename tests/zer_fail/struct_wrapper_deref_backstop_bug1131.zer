@@ -1,10 +1,13 @@
 // EXPECTED: compile error
 // expect-error: may be a view of
 // BUG-1131 backstop: a returned struct whose field the analysis cannot account for
-// (here `return *hp;`) is a MAY view of every reference param. Pre-fix: compiled.
+// (here a VARIABLE-index element, `return arr[i];`) is a MAY view of every reference
+// param. Pre-fix: compiled. (The original spelling `return *hp;` is refused earlier
+// by the checker since BUG-1260 — sink matrix p42_deref_return — so it no longer
+// reaches this backstop.)
 struct T { u32 v; }
 struct H { *T p; }
-H mk(*T a) { H h = { .p = a }; *H hp = &h; return *hp; }
+H mk(*T a) { H[2] arr; arr[0].p = a; arr[1].p = a; u32 i = a.v % 2; return arr[i]; }
 u32 main() {
     *T a = alloc(T) orelse return;
     a.v = 5;

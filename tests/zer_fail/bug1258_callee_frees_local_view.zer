@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: the callee frees that parameter
+void rel([*]u32 x) { free(x); }
+u32 main() {
+    u32[4] arr;
+    rel(arr[0..]);
+    return 0;
+}

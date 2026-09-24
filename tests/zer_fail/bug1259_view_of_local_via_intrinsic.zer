@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: view of local
+distinct typedef [*]u32 DS;
+DS mk() { u32[4] a; return @cast(DS, a[0..]); }
+u32 main() { DS d = mk(); return d[0]; }

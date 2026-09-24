@@ -742,7 +742,13 @@ a.kind;              // COMPILE ERROR — use after move
 **SAFETY**
 - Use after move → compile error
 - Double move (pass twice) → compile error
-- No interaction with other features — tracked independently
+- A move struct inside a wrapper is still ONE owner: `?Token` (moving out with
+  `orelse` twice, or passing the optional twice, is a double move), a struct or
+  array field, and a `@cast` to a distinct typedef of it (`@cast(DT, a)` moves `a`).
+  A pointer capture `if (o) |*t|` BORROWS — moving `o` invalidates `t`.
+- Copying a struct that CONTAINS a move struct, a pointer or a Handle out of a
+  dereference (`H copy = *hp;`) is refused — the copy would be a second owner the
+  compiler cannot tie back. Read the fields you need (`u32 v = hp.v;`) instead.
 
 **SEE ALSO**
 struct, shared struct
@@ -1771,6 +1777,28 @@ free(xs);                                    // release a [*]T
   the free. The same holds for a field of an array element (`arr[i].p`), a
   factory-returned struct, a value stored through an out-parameter, and a
   `move struct` handed to a callee that frees its field (BUG-1226..1229).
+- A callee that frees a parameter must not be able to reach that allocation
+  another way: passing it twice (`use_it(t, t)`), passing a `get()` view of the
+  handle it frees, passing a pointer that is also a field of another argument,
+  or while a global still holds it (`g = t; destroy(t);` — reset `g = null;`
+  first) is refused at the call (BUG-1264). It must also be handed memory
+  `alloc` gave out — not `&local`, a local array view, or an arena allocation
+  (BUG-1258).
+- `*u32 p = s.ptr;` is a view of the slice `s`: after `free(s)`, `p` is dead
+  (BUG-1256). `&call()` — the address of a call's result — is refused; bind the
+  result to a local first (BUG-1254).
+- A program may `free(p)` a `*T` without ever calling `alloc(T)` itself (a
+  release helper in a library) (BUG-1261).
+
+<!-- audit: expect-error: designates the same allocation as argument -->
+```zer
+struct T { u32 v; }
+u32 use_it(*T a, *T b) { free(b); return a.v; }   // b freed, then a read
+u32 main() {
+    *T t = alloc(T) orelse return;
+    return use_it(t, t);                           // ERROR — a IS b inside the callee
+}
+```
 - Neither may run inside an `interrupt` handler or a `@critical` block — the
   libc heap lock may deadlock there — and the ban is TRANSITIVE: a helper that
   allocates or frees cannot be called from either context (BUG-1036: the
@@ -1953,7 +1981,10 @@ u32 main() {
 **NOTES**
 - Pool does NOT use heap. Safe for ISR and bare metal.
 - `.get(h)` result is non-storable: `*Task t = tasks.get(h)` is a compile error.
-  Must use inline: `tasks.get(h).field`.
+  Must use inline: `tasks.get(h).field`. The rule sees through wrappers — a
+  launder, a field that still carries a pointer, a struct-literal field
+  (`W w = { .p = tasks.get(h) };`) and a `return` are all refused. A SCALAR read
+  out of the slot (`u32 v = tasks.get(h).v;`) is a value and stays legal.
 - N must be a compile-time constant.
 
 **SEE ALSO**
@@ -2302,6 +2333,24 @@ firmware example does).
 into a discarded temporary and leave `ar` at capacity 0, so every later
 allocation would return null forever. Allocating from an arena that never
 received a backing store anywhere in the program is a compile error too.
+
+The backing store must be WRITABLE (the arena writes every allocation into it):
+a string literal or a `const` buffer is refused. An arena over a function's
+LOCAL buffer must not outlive the function — storing it in a global
+(`g_ar = Arena.over(local_buf);`) or returning it (`return Arena.over(b);`, or a
+local `Arena a = Arena.over(b); return a;`) is a compile error.
+
+<!-- audit: expect-error: cannot return an Arena over this function's local memory -->
+```zer
+Arena make_scratch() {
+    u8[256] buf;
+    return Arena.over(buf);      // ERROR — buf dies when make_scratch returns
+}
+u32 main() { return 0; }
+```
+
+Passing an arena allocation to a function that RESETS an arena is refused at
+the call: inside the callee the pointer dangles from the reset on.
 
 **METHODS**
 - `Arena.over(buf)` → `Arena` — Create arena over an array or slice.
@@ -2732,6 +2781,7 @@ came from and knows three answers, not two:
 | `&outer.field` — a field of the named struct | OK |
 | `&outer.other` / a field of a *different* struct | compile error (wrong field / wrong struct) |
 | `&wholeObject`, `&arr[i]` — a complete object that is nobody's field | compile error |
+| `alloc(T)`, `arena.alloc(T)`, `pool.alloc_ptr()` — a fresh allocation (also through `orelse`) | compile error |
 | a parameter, a `cinclude` pointer — unknown | allowed (cannot be proven wrong) |
 
 ```zer

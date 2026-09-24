@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: out of a dereference
+struct T { u32 v; }
+struct H { *T p; }
+u32 main() {
+    *T t = alloc(T) orelse return;
+    t.v = 5;
+    H h = { .p = t };
+    *H hp = &h;
+    H copy = *hp;
+    free(copy.p);
+    u32 r = 0;
+    if (alloc(T)) |x| {
+        x.v = 99;
+        r = t.v;
+        free(x);
+    }
+    free(t);
+    return r;
+}

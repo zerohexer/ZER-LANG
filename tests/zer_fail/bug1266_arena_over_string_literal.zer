@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: needs a WRITABLE backing store
+struct T { u32 v; }
+u32 main() {
+    Arena a = Arena.over("hello world, this is a long read-only string!!");
+    *T t = a.alloc(T) orelse return;
+    t.v = 5;
+    return t.v;
+}

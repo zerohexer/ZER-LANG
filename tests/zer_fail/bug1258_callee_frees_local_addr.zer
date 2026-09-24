@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: the callee frees that parameter
+struct T { u32 v; }
+void rel(*T x) { free(x); }
+u32 main() {
+    T loc;
+    *T one = alloc(T) orelse return;
+    free(one);
+    rel(&loc);
+    return 0;
+}

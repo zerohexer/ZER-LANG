@@ -884,6 +884,32 @@ cell p41_shared_return     reject "$P41"' C41 get41(){ return g41; } u32 main(){
 cell p41_safe_after_join   compile "$P41"' u32 main(){ u32 v = 0; *u32 p = id41(&v); ThreadHandle th = spawn w41(p); th.join(); v += 1; return 0; }'
 cell p41_safe_array_join   compile "$P41"' u32 main(){ u32[4] a; ThreadHandle th = spawn ws41(a); th.join(); a[0] += 1; return 0; }'
 
+# SHAPE p42 (BUG-1260, 1262, 1263): a second owner minted by COPYING a carrier —
+# out of a deref (every sink), out of an optional twice, through a @cast.
+echo "===== SHAPE p42 = carrier copy via deref / optional / cast (move + free sinks) ====="
+P42='struct T42{u32 v;} struct H42{*T42 p;} move struct K42{u32 k;} distinct typedef K42 D42; void eat42(K42 k){ } void eatd42(D42 k){ } struct S42{u32 a; u32 b;}'
+cell p42_deref_decl        reject "$P42"' u32 main(){ *T42 t = alloc(T42) orelse return; H42 h = { .p = t }; *H42 hp = &h; H42 c = *hp; free(c.p); u32 r = t.v; free(t); return r; }'
+cell p42_deref_assign      reject "$P42"' u32 main(){ *T42 t = alloc(T42) orelse return; H42 h = { .p = t }; *H42 hp = &h; H42 c; c = *hp; free(c.p); u32 r = t.v; free(t); return r; }'
+cell p42_deref_return      reject "$P42"' H42 cp42(*H42 hp){ return *hp; } u32 main(){ return 0; }'
+cell p42_deref_move        reject "$P42"' struct M42{K42 k;} u32 main(){ M42 m; *M42 mp = &m; M42 c = *mp; eat42(c.k); eat42(m.k); return 0; }'
+cell p42_optional_twice    reject "$P42"' u32 main(){ ?K42 o; K42 a; o = a; K42 b = o orelse return; eat42(b); K42 c = o orelse return; eat42(c); return 0; }'
+cell p42_cast_then_use     reject "$P42"' u32 main(){ K42 a; eatd42(@cast(D42, a)); eat42(a); return 0; }'
+# BOUNDARY: a scalar struct copy is a value; a single move out of an optional / a cast.
+cell p42_safe_scalar_deref compile "$P42"' u32 main(){ S42 s = { .a = 1, .b = 2 }; *S42 sp = &s; S42 c = *sp; return c.a - 1; }'
+cell p42_safe_optional_once compile "$P42"' u32 main(){ ?K42 o; K42 a; o = a; K42 b = o orelse return; eat42(b); return 0; }'
+cell p42_safe_cast_once    compile "$P42"' u32 main(){ K42 a; eatd42(@cast(D42, a)); return 0; }'
+
+# SHAPE p43 (BUG-1264): the callee frees / resets something another name it can
+# reach still designates — a second argument, a get() view, a field, a global.
+echo "===== SHAPE p43 = callee-freed allocation aliased by another reachable name ====="
+P43='struct T43{u32 v;} struct H43{*T43 p;} ?*T43 g43; u32 two43(*T43 a, *T43 b){ free(b); return a.v; } u32 fld43(*H43 h, *T43 t){ free(h.p); return t.v; } u32 one43(*T43 a){ free(a); return 0; } void keep43(*T43 a, *T43 b){ free(a); free(b); }'
+cell p43_same_arg_twice    reject "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; return two43(t, t); }'
+cell p43_field_and_arg     reject "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; H43 h = { .p = t }; return fld43(&h, t); }'
+cell p43_global_holds_arg  reject "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; g43 = t; u32 r = one43(t); g43 = null; return r; }'
+# BOUNDARY: two distinct allocations; the global reset before the call.
+cell p43_safe_distinct     compile "$P43"' u32 main(){ *T43 a = alloc(T43) orelse return; defer free(a); *T43 b = alloc(T43) orelse return; return two43(a, b); }'
+cell p43_safe_global_reset compile "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; g43 = t; g43 = null; return one43(t); }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

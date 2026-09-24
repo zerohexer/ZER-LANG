@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: transferred
+move struct Tok { u32 k; }
+distinct typedef Tok DT;
+void consume(Tok t) { }
+void consume_d(DT t) { }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    consume_d(@cast(DT, a));
+    consume(a);
+    return 0;
+}

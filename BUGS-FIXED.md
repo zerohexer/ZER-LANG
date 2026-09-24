@@ -5,6 +5,108 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24f — BUG-1254..1267: the allocator audit round (ag10)
+
+**Method.** A read-only agent probed ~200 allocator / free / move / arena shapes against a
+frozen compiler. Every negative below COMPILED on the from-HEAD baseline and is refused now for
+its `// expect-error:` reason. Sink matrix shapes p42 (carrier copy via deref / optional / cast)
+and p43 (a callee-freed allocation still reachable by another name) are new, and all nine of
+their reject cells are HOLES on the baseline. Corpus cost, compiler-classified over tests/,
+rust_tests/, zig_tests/, test_modules/, examples/ and lib/: **zero** files newly rejected. The
+two ECS stress modules tripped the first draft of BUG-1255 and are why it asks
+`type_carries_data_pointer` rather than `type_can_carry_pointer` (true for every struct).
+
+### BUG-1254 — `&call()` / `&call().f` took the address of a temporary
+The call result has no storage, so GCC either refused it (a GCC error blaming the user's line)
+or the pointer outlived the full-expression. Refused, and the message names the fix (bind to a
+local first). Tests: `bug1254_addr_of_call_result*.zer`.
+
+### BUG-1255 — a `pool.get(h)` result stored through a wrapper, a struct field, or returned
+The non-storable rule matched a bare `pool.get(h)` init only. `is_non_storable` now walks
+field / index / launder wrappers (only while the walked type still carries a data pointer: a
+scalar field read out of the slot is a value), and it runs at the return sink and at every
+designated-initializer field. Tests: `bug1255_get_*.zer`.
+
+### BUG-1256 — `*u32 p = s.ptr` did not alias the slice
+The header's `.ptr` of a slice (or an optional slice) is the allocation itself; it is now a
+view of `s`, so `free(s)` invalidates `p`. Test: `bug1256_slice_ptr_alias_uaf.zer`.
+
+### BUG-1257 — `free(same(s))` freed nothing the tracker could see
+A free sink whose argument is a call now resolves through the callee's return summary
+(`returns_param_color` / the returned field), so the allocation it frees is `s`.
+Test: `bug1257_free_via_returned_param.zer`.
+
+### BUG-1258 — a callee that frees its parameter was handed stack or arena memory
+`rel(&x)`, `rel(arr[0..])`, an arena allocation: the direct `free()` of those is refused by the
+checker; through a callee it reached libc (ASan bad-free). The call site now asks what each
+freed argument IS. Residual: a pointer FIELD of a by-value struct argument (`rel(h)` where
+`h.d = arr[0..]` and `rel` frees `h.d`) — limitations.md. Tests: `bug1258_*.zer`.
+
+### BUG-1259 — a view of a local escaped through an intrinsic return
+`return @cast(DS, a[0..]);` — the return sink looked for a bare NODE_SLICE; the launder hid it.
+The slice-taint marker peels launders too. Test: `bug1259_view_of_local_via_intrinsic.zer`.
+
+### BUG-1260 — copying a pointer-carrying struct out of a dereference
+`H copy = *hp;` where `H` holds a `*T`, a Handle or a move struct made `copy.p` a second name
+for `h.p` the analyzer could not tie back (freed through the copy, read through the original —
+the read ran and returned a recycled slot). The deref-launder predicate now covers aggregates
+that carry a reference, at the declaration, assignment, return and call-argument sinks, with a
+message of its own. A scalar-only struct is a plain value and stays legal.
+Tests: `bug1260_deref_copy_carrier_{ptr,move}.zer`, positive `bug1260_deref_copy_scalar_struct.zer`.
+
+### BUG-1261 — a program that only FREES a `T` emitted an undeclared auto-slab
+`void rel(*T p) { free(p); }` with no `alloc(T)` anywhere: the free named `_zer_auto_slab_T`,
+which only an allocation created. A free now creates it too. Test: `bug1261_free_without_alloc.zer`.
+
+### BUG-1262 — a move struct inside an optional was not an owner
+`?Tok` was not a move carrier (the tri-state verdict walk recursed struct / union / array, not
+optional), so `ot = a; b = ot orelse return; c = ot orelse return;` minted two owners and
+`eat(o); eat(o);` passed one twice. Three companions were needed so the new tracking stays
+precise: a move needs a BY-VALUE destination (an `if (o) |*t|` pointer capture is a borrow, not a
+transfer); a borrow shares the owner's identity but owns nothing (it was reported as a leak);
+and the raw-AST UAF walk must not re-read an orelse subject the lowering already moved into its
+temp. `neg_borrow` (move `o` inside its own `|*t|` capture, then read `t`) is refused too — the
+assignment spelling `o = a` never gave `o` an entry, so a borrow now mints one.
+Tests: `bug1262_*.zer`, positive `bug1262_move_optional_ok.zer`.
+
+### BUG-1263 — `@cast` to a distinct type of a move value did not move it
+`consume_d(@cast(DT, a)); consume(a);`. The move source now sees through a launder when the
+peeled local is move-carrying (`ir_move_source`); pointer launders keep their existing
+treatment. Tests: `bug1263_move_via_cast*.zer`, positive `bug1263_move_via_cast_ok.zer`.
+
+### BUG-1264 — a callee frees an allocation the caller also handed it under another name
+`use_it(t, t)`, `rdl(pool.get(h), h)`, `fld(&h, h.p)` with the callee freeing `h.p`, `g = t;
+f(t);`, `rdl(pool.get(gh))` where the callee frees the global `gh`, and an arena allocation
+passed to a callee that resets an arena. The callee's own analysis assumes distinct params and
+cannot see the caller's globals, so the other name was a dangling pointer inside it (measured:
+the read returned a recycled slot's value). ONE caller-side check,
+`ir_check_freed_arg_aliasing`, runs BEFORE the summary's effects are applied (they widen the
+very aliases it compares). An argument resolves to an allocation only through spellings that
+FORM a reference (bare name, `&x.f`, a slice, a `get()` view, an exactly tracked compound) — a
+pointer READ out of a field is a different allocation. Tests: `bug1264_*.zer`, sink matrix p43.
+
+### BUG-1265 — an Arena over a local buffer escaped
+`ga = Arena.over(lb);` (BUG-496 recognised only an Arena VARIABLE as the value, never the
+constructor call), `return Arena.over(b);`, and `Arena a = Arena.over(b); return a;` (the Arena
+symbol now carries `is_local_derived`). Tests: `bug1265_*.zer`, positive `bug1265_arena_backing_ok.zer`.
+
+### BUG-1266 — `Arena.over()` accepted a read-only backing store
+A string literal (.rodata — the first allocation faults) or a `const` buffer. Tests:
+`bug1266_arena_over_{string_literal,const}.zer`.
+
+### BUG-1267 — `@container` of a pointer that came from an allocator
+`*L h = alloc(L) orelse return; @container(*D, h, link)` read before the allocation. An
+allocator's result (`alloc(T)`, `x.alloc(T)`, `x.alloc_ptr()`) is a WHOLE object; the provenance
+resolver now says so, sees through a value-less `orelse`, and the assignment sink uses the same
+resolver as the declaration. Residual: provenance carried through a struct FIELD (`h.q = &ls[0]`)
+— limitations.md. Tests: `bug1267_*.zer`, positive `bug1267_container_of_field_ok.zer`.
+
+### Diagnostics
+The Handle auto-deref error said "no Pool or Slab found" when TWO were declared; it now says no
+SINGLE allocator holds the type. Re-measured and NOT bugs: the move-optional m3 shape
+(`b = o orelse return; c = o orelse return;` is a real double move) and the ag6-style
+"over-rejections" on orelse-return paths (real leaks when the second allocation fails).
+
 ## Session 2026-09-24e — BUG-1246..1253: the concurrency audit round (ag9) + an array-copy miscompile
 
 **Method.** A read-only agent probed ~150 concurrency shapes against a frozen compiler, each

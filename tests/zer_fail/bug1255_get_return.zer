@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot return the result of get()
+struct T { u32 v; }
+Pool(T, 4) pool;
+?*T g;
+?*T mk() { Handle(T) h = pool.alloc() orelse return; defer pool.free(h); pool.get(h).v = 5; return pool.get(h); }
+u32 main() {
+    g = mk();
+    Handle(T) h2 = pool.alloc() orelse return;
+    defer pool.free(h2);
+    pool.get(h2).v = 99;
+    if (g) |p| { return p.v; }
+    return 0;
+}

@@ -134,6 +134,41 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
+## OPEN — allocator residuals of the ag10 round (2026-09-24f; MEDIUM — accept-unsafe; each measured on the fixed build)
+
+BUG-1254..1267 closed the rest of the round. These still COMPILE; each needs more than a sink
+patch.
+
+1. **An arena's backing store stays addressable after `Arena.over()`** (MEDIUM, type confusion).
+   Two arenas over the same buffer (`Arena a = Arena.over(g); Arena b = Arena.over(g);`) hand
+   out the same bytes to both, and a plain write to the buffer (`gbuf[8] = 64;`) overwrites a
+   `[*]T` header living in an arena object — a forged `.len`, then an out-of-bounds write the
+   bounds check trusts. Fix sketch: a buffer handed to `Arena.over` is CONSUMED — any later
+   mention other than through the arena is refused. The catch is heap backing, whose `free(hb)`
+   is itself a mention and must stay legal: it needs a zercheck link (every arena allocation from
+   `a` dies with `hb`), which is also what item 2 needs.
+2. **`free(hb)` of a heap backing store leaves the arena's objects live** (MEDIUM, UAF).
+   `[*]u8 hb = alloc(u8, 64); Arena a = Arena.over(hb); *T t = a.alloc(T)…; free(hb); t.v`.
+   Fix sketch: record the backing allocation on the Arena local; its free invalidates the arena's
+   colour group the way `a.reset()` does (`ir_mark_arena_handles_state_of`).
+3. **A wrong-pool Handle across a function boundary** (MEDIUM, wrong object). `rd(h)` where `rd`
+   does `pb.get(x)` and `h` came from `pa`; the same through a global (`stash(h)` then
+   `pb.get(gh[0])`) and through a Ring. The generation check does not help: both pools start at
+   generation 0, so the read returns the OTHER pool's live object. The in-function wrong-pool
+   check has no cross-function half. Fix sketch: a per-param "which pool does the callee `get`
+   / `free` through" summary, checked against the argument's `pool_name` at the call.
+4. **`@container` provenance through a struct field** (MEDIUM). `H h = { .q = &ls[0] };
+   @container(*D, h.q, link)` — `ls` is an `L[2]`, not the `link` field of any `D`. The fact is
+   recorded on symbols and on `&expr`, not on compound keys. Fix sketch: carry
+   `ContainerProv` in the compound provenance map beside `prov_map_set`.
+5. **A callee that frees a FIELD of a BY-VALUE struct argument, handed stack memory** (LOW,
+   bad-free). `void rel(H h) { free(h.d); }` with `h.d = arr[0..]`. BUG-1258 asks what each
+   freed ARGUMENT is; the freed field of a by-value carrier is one level further in.
+6. **The caller-side free-aliasing rule (BUG-1264) over-approximates an arena reset**: the
+   summary says only "resets SOME arena", so an allocation from a caller-LOCAL arena passed to a
+   callee that resets a global one is refused. Zero corpus cost today; a per-arena summary
+   (`resets_arena` keyed by name) would make it exact.
+
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.

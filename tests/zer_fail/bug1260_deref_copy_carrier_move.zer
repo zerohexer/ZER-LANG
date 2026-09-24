@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: out of a dereference
+move struct Tok { u32 k; }
+struct H { Tok t; }
+void consume(Tok t) { }
+u32 main() {
+    H h;
+    h.t.k = 1;
+    *H p = &h;
+    H copy = *p;
+    consume(copy.t);
+    consume(h.t);
+    return 0;
+}

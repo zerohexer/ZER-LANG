@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: cannot take the address of a call result
+struct T { u32 v; }
+Pool(T, 4) pool;
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    defer pool.free(h);
+    pool.get(h).v = 5;
+    **T pp = &pool.get(h);
+    return 0;
+}

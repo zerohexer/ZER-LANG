@@ -1310,6 +1310,15 @@ static IRMoveVerdict ir_move_verdict_depth(Type *t, int depth) {
         IRMoveVerdict v = ir_move_verdict_depth(et, depth + 1);
         return v == IR_MOVE_NO ? acc : v;
     }
+    /* BUG-1262: `?Tok` is a CARRIER of a move struct like an array is — the
+     * optional wrapper hid it, so `ot = a; b = ot orelse return; c = ot orelse
+     * return;` minted two owners, and `eat(o); eat(o);` passed one twice. */
+    if (type_dispatch_kind(eff) == TYPE_OPTIONAL) {
+        Type *ot = eff->optional.inner;
+        if (ir_is_move_struct_type(ot)) return IR_MOVE_YES;
+        IRMoveVerdict v = ir_move_verdict_depth(ot, depth + 1);
+        return v == IR_MOVE_NO ? acc : v;
+    }
     if (eff->kind == TYPE_UNION) {
         for (uint32_t i = 0; i < eff->union_type.variant_count; i++) {
             Type *vt = eff->union_type.variants[i].type;
@@ -2307,6 +2316,20 @@ static Node *ir_peel_launder(Node *v) {
         if (v == prev) break;   /* not a launder — stop */
     }
     return v;
+}
+
+/* BUG-1263: the node a MOVE takes its owner from. A launder (`@cast(DT, a)`,
+ * `@bitcast`) of a move-carrying local is that local — the same unique value
+ * under another type. Peeled only when the peeled root IS a move-carrying
+ * local, so every pointer launder keeps its existing treatment. */
+static Node *ir_move_source(ZerCheck *zc, IRFunc *func, Node *e) {
+    (void)zc;
+    if (!e || e->kind != NODE_INTRINSIC) return e;
+    Node *p = ir_peel_launder(e);
+    if (!p || p == e || p->kind != NODE_IDENT) return e;
+    int l = ir_find_local_exact_first(func, p->ident.name, (uint32_t)p->ident.name_len);
+    if (l < 0 || l >= func->local_count) return e;
+    return ir_should_track_move(func->locals[l].type) ? p : e;
 }
 
 /* BUG-982: the ONE key for a GLOBAL-rooted projection (`g.p`, `g_arr[0].q`).
@@ -3636,6 +3659,101 @@ static bool ir_value_clears_slot(Node *value) {
  * because the view carries a raw pointer that is never checked again.
  *
  * Returns the root ident node, or NULL. */
+/* BUG-1258: a short reason when this argument is PROVABLY not a heap allocation,
+ * else NULL. Only what the syntax / the tracker states; unknown stays NULL. */
+static const char *ir_arg_not_heap(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *arg) {
+    Node *a = ir_peel_launder(arg);
+    if (!a) return NULL;
+    Node *r = NULL;
+    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP) {
+        r = a->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+            Node *obj = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+            Type *ot = checker_get_type(zc->checker, obj);
+            TypeKind k = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+            if (k == TYPE_POINTER || k == TYPE_SLICE) return NULL;   /* through a pointer */
+            r = obj;
+        }
+        if (r && r->kind == NODE_IDENT) {
+            int l = ir_find_local_exact_first(func, r->ident.name, (uint32_t)r->ident.name_len);
+            if (l >= 0 && !func->locals[l].is_static) return "the address of a local";
+        }
+        return NULL;
+    }
+    if (a->kind == NODE_SLICE) r = a->slice.object;
+    else if (a->kind == NODE_IDENT) r = a;
+    if (r && r->kind == NODE_IDENT) {
+        int l = ir_find_local_exact_first(func, r->ident.name, (uint32_t)r->ident.name_len);
+        if (l >= 0 && !func->locals[l].is_static &&
+            type_dispatch_kind(func->locals[l].type) == TYPE_ARRAY)
+            return "a view of a local array";
+        if (l >= 0) {
+            IRHandleInfo *h = ir_find_handle(ps, l);
+            if (h && h->source_color == ZC_COLOR_ARENA) return "an arena allocation";
+        }
+    }
+    return NULL;
+}
+
+/* BUG-1257: `free(same(s))` — a call whose summary says it returns (a view of)
+ * one of its arguments frees THAT argument's allocation. The free was attributed
+ * to nothing: `s[0]` after it was a heap use-after-free and the later `free(s)` a
+ * double free (ASan). Follows `returns_param_color`, the same single-param fact the
+ * call-result alias (Phase F) uses; a multi-view result stays unresolved. */
+static Node *ir_resolve_returned_arg(ZerCheck *zc, Node *arg) {
+    for (int guard = 0; arg && guard < 16; guard++) {
+        Node *a = ir_peel_launder(arg);
+        if (!a) return arg;
+        if (a->kind == NODE_FIELD) {
+            /* `free(wrap(s).d)` — a FIELD of a returned struct whose field is a
+             * view of a param (BUG-1080 ret_field). */
+            Node *call = a->field.object;
+            if (!call || call->kind != NODE_CALL || !call->call.callee ||
+                call->call.callee->kind != NODE_IDENT) return arg;
+            FuncSummary *fs = NULL;
+            for (int si = 0; si < zc->summary_count && !fs; si++)
+                if (zc->summaries[si].func_name_len == call->call.callee->ident.name_len &&
+                    memcmp(zc->summaries[si].func_name, call->call.callee->ident.name,
+                           call->call.callee->ident.name_len) == 0)
+                    fs = &zc->summaries[si];
+            if (!fs) return arg;
+            for (int k = 0; k < fs->ret_field_n; k++) {
+                const struct ZcRetFieldView *rf = &fs->ret_field[k];
+                if (!rf->must || rf->plen != a->field.field_name_len + 1 ||
+                    rf->path[0] != '.' ||
+                    memcmp(rf->path + 1, a->field.field_name, a->field.field_name_len) != 0)
+                    continue;
+                if (rf->param < call->call.arg_count) { arg = call->call.args[rf->param]; break; }
+            }
+            if (arg == (Node *)a || arg == call) return arg;
+            continue;
+        }
+        if (a->kind != NODE_CALL || !a->call.callee || a->call.callee->kind != NODE_IDENT)
+            return a == arg ? arg : a;
+        FuncSummary *fs = NULL;
+        for (int si = 0; si < zc->summary_count && !fs; si++)
+            if (zc->summaries[si].func_name_len == a->call.callee->ident.name_len &&
+                memcmp(zc->summaries[si].func_name, a->call.callee->ident.name,
+                       a->call.callee->ident.name_len) == 0)
+                fs = &zc->summaries[si];
+        if (!fs || fs->returns_param_color <= 0) return arg;
+        int k = fs->returns_param_color - 1;
+        if (k >= a->call.arg_count) return arg;
+        arg = a->call.args[k];
+    }
+    return arg;
+}
+
+/* BUG-1256: is this `x.ptr` where x is a slice (or an optional slice)? */
+static bool ir_is_slice_ptr_field(ZerCheck *zc, Node *n) {
+    if (!n || n->kind != NODE_FIELD || n->field.field_name_len != 3 ||
+        memcmp(n->field.field_name, "ptr", 3) != 0) return false;
+    Type *ot = checker_get_type(zc->checker, n->field.object);
+    Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+    if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
+    return oe && type_dispatch_kind(oe) == TYPE_SLICE;
+}
+
 static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
     int guard = 0;
     while (e && guard++ < 64) {
@@ -3654,6 +3772,136 @@ static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
         break;
     }
     return (e && e->kind == NODE_IDENT) ? e : NULL;
+}
+
+/* BUG-1264: the allocation an ARGUMENT designates — for the caller-side
+ * aliasing rule at a call whose callee frees a parameter. Only spellings that
+ * FORM a reference into the allocation resolve: the bare name, `&x.f` / a slice
+ * (navigation inside it), a `pool.get(h)` view (the slot of h), or an exactly
+ * tracked compound. A pointer READ out of a field (`t.next`) is a DIFFERENT
+ * allocation and resolves to nothing (no alias claimed). 0 = unknown. */
+static IRHandleInfo *ir_arg_handle(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *a) {
+    a = a ? ir_peel_launder(a) : NULL;
+    if (!a) return NULL;
+    Node *root = NULL;
+    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP) root = ir_view_root_ident(zc, a->unary.operand);
+    else if (a->kind == NODE_SLICE || a->kind == NODE_CALL) root = ir_view_root_ident(zc, a);
+    else if (a->kind == NODE_IDENT) root = a;
+    else if (a->kind == NODE_FIELD || a->kind == NODE_INDEX) {
+        int rl; const char *pp; uint32_t pl;
+        if (ir_extract_compound_key(zc, func, ps, a, &rl, &pp, &pl) == 0 && pl > 0) {
+            IRHandleInfo *ch = ir_find_compound_handle(ps, rl, pp, pl);
+            if (ch && ch->state == IR_HS_ALIVE) return ch;
+        }
+        return NULL;
+    }
+    if (!root) return NULL;
+    int l = ir_find_local_exact_first(func, root->ident.name, (uint32_t)root->ident.name_len);
+    IRHandleInfo *h = l >= 0 ? ir_find_handle(ps, l) : NULL;
+    if (!h && l < 0 && ir_ident_is_unshadowed_global(zc, func, root))
+        h = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID, root->ident.name,
+                                    (uint32_t)root->ident.name_len);
+    return (h && h->state == IR_HS_ALIVE) ? h : NULL;
+}
+
+static int ir_arg_alloc_id(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *a) {
+    IRHandleInfo *h = ir_arg_handle(zc, func, ps, a);
+    return h ? h->alloc_id : 0;
+}
+
+/* BUG-1264: a callee that frees something — param pi, a FIELD of param pi,
+ * or a global — must not be able to reach that same allocation through another
+ * name: a second argument (`use_it(t, t)`, `rdl(pool.get(h), h)`,
+ * `use_it(&h, h.p)`), or a global still holding it (`g = t; f(t);`). Inside the
+ * callee that other name dangles, and the callee's own analysis cannot see it —
+ * it assumes distinct params, and a global's contents are the caller's.
+ * Measured: the read returned a recycled slot's value. Must run BEFORE the
+ * summary's effects are applied (they widen exactly the aliases compared). */
+static void ir_report_freed_alias(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                  Node *call, int line, int aid, int freed_arg,
+                                  const char *what, uint32_t what_len,
+                                  const char *fn, uint32_t fnl) {
+    for (int pj = 0; pj < call->call.arg_count; pj++) {
+        if (pj == freed_arg) continue;
+        if (ir_arg_alloc_id(zc, func, ps, call->call.args[pj]) != aid) continue;
+        ir_zc_error(zc, line,
+            "argument %d designates the same allocation as %.*s, which '%.*s' frees "
+            "— inside the callee it is a dangling pointer the callee cannot see. "
+            "Pass distinct allocations, or read what you need before the call",
+            pj + 1, (int)what_len, what, (int)fnl, fn);
+        return;
+    }
+    if (freed_arg < 0) return;   /* the freed thing IS a global; no global alias check */
+    for (int hi = 0; hi < ps->handle_count; hi++) {
+        IRHandleInfo *gh = &ps->handles[hi];
+        if (gh->local_id != IR_GLOBAL_ROOT_ID || gh->alloc_id != aid ||
+            gh->state != IR_HS_ALIVE || !gh->path) continue;
+        ir_zc_error(zc, line,
+            "%.*s is also held by global '%.*s', and '%.*s' frees it — the global "
+            "dangles while the callee runs. Reset it first ('%.*s = null;')",
+            (int)what_len, what, (int)gh->path_len, gh->path, (int)fnl, fn,
+            (int)gh->path_len, gh->path);
+        return;
+    }
+}
+
+static void ir_check_freed_arg_aliasing(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                        const FuncSummary *summary, Node *call, int line,
+                                        const char *fn, uint32_t fnl) {
+    char what[48];
+    for (int pi = 0; pi < summary->param_count && pi < call->call.arg_count; pi++) {
+        bool bare = summary->frees_param[pi] || summary->maybe_frees_param[pi];
+        bool field = (summary->frees_param_field && summary->frees_param_field[pi]) ||
+                     (summary->maybe_frees_param_field && summary->maybe_frees_param_field[pi]);
+        if (bare) {
+            int aid = ir_arg_alloc_id(zc, func, ps, call->call.args[pi]);
+            int wl = snprintf(what, sizeof(what), "argument %d", pi + 1);
+            if (aid) ir_report_freed_alias(zc, func, ps, call, line, aid, pi, what, (uint32_t)wl, fn, fnl);
+        }
+        if (field) {
+            /* Which field is not known here — every tracked pointer field of the
+             * argument's root may be the one freed. */
+            Node *a = ir_peel_launder(call->call.args[pi]);
+            Node *root = NULL;
+            if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP) root = ir_view_root_ident(zc, a->unary.operand);
+            else if (a && a->kind == NODE_IDENT) root = a;
+            int rl = root ? ir_find_local_exact_first(func, root->ident.name,
+                                                      (uint32_t)root->ident.name_len) : -1;
+            if (rl < 0) continue;
+            int wl = snprintf(what, sizeof(what), "a field of argument %d", pi + 1);
+            for (int hi = 0; hi < ps->handle_count; hi++) {
+                IRHandleInfo *fh = &ps->handles[hi];
+                if (fh->local_id != rl || fh->path_len == 0 || fh->state != IR_HS_ALIVE ||
+                    fh->alloc_id == 0) continue;
+                int aid = fh->alloc_id;
+                ir_report_freed_alias(zc, func, ps, call, line, aid, pi, what, (uint32_t)wl, fn, fnl);
+            }
+        }
+    }
+    /* BUG-1264 (arena): the callee resets an arena — an argument that is an
+     * arena allocation is a dangling pointer inside the callee from the reset on
+     * (the caller-side invalidation below happens only AFTER the call). */
+    if (summary->resets_arena) {
+        for (int pj = 0; pj < call->call.arg_count; pj++) {
+            IRHandleInfo *ah = ir_arg_handle(zc, func, ps, call->call.args[pj]);
+            if (!ah || ah->source_color != ZC_COLOR_ARENA) continue;
+            ir_zc_error(zc, line,
+                "argument %d is an arena allocation, and '%.*s' resets an arena — "
+                "inside the callee it dangles from the reset on. Pass the values "
+                "you need, or reset after the call", pj + 1, (int)fnl, fn);
+            break;
+        }
+    }
+    for (int k = 0; k < summary->freed_global_n; k++) {
+        IRHandleInfo *gh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID,
+            summary->freed_global[k].key, summary->freed_global[k].len);
+        if (!gh || gh->alloc_id == 0 || gh->state != IR_HS_ALIVE) continue;
+        int wl = snprintf(what, sizeof(what), "global '%.*s'",
+                          (int)(summary->freed_global[k].len > 30 ? 30 : summary->freed_global[k].len),
+                          summary->freed_global[k].key);
+        if (wl >= (int)sizeof(what)) wl = (int)sizeof(what) - 1;
+        ir_report_freed_alias(zc, func, ps, call, line, gh->alloc_id, -1, what, (uint32_t)wl, fn, fnl);
+    }
 }
 
 static Node *ir_addr_of_deref_target(ZerCheck *zc, Node *operand) {
@@ -4549,11 +4797,24 @@ static void ir_check_expr_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         ir_check_expr_uaf(zc, func, ps, expr->slice.start, line, rs);
         ir_check_expr_uaf(zc, func, ps, expr->slice.end, line, rs);
         break;
-    case NODE_ORELSE:
-        ir_check_expr_uaf(zc, func, ps, expr->orelse.expr, line, rs);
+    case NODE_ORELSE: {
+        /* BUG-1262: the lowering already MOVED a move-carrying subject into its
+         * `_zer_or` temp (that copy is where use-after-move is checked), so
+         * re-reading the raw subject here reported the value's own move as a
+         * use of it. A non-move subject is unchanged by that copy and is still
+         * checked. */
+        Type *ost = expr->orelse.expr ? checker_get_type(zc->checker, expr->orelse.expr) : NULL;
+        if (!(ost && ir_should_track_move(ost)))
+            ir_check_expr_uaf(zc, func, ps, expr->orelse.expr, line, rs);
         /* Fallback is a separate branch — not part of success flow */
         break;
+    }
     case NODE_INTRINSIC:
+        /* BUG-1263: a launder of a move-carrying local (`@cast(Tok, d)`) was
+         * hoisted into a temp by the lowering, and that copy MOVED `d` and is
+         * where use-after-move is checked — re-reading `d` here reported its
+         * own move. Same shape as the orelse subject (BUG-1262). */
+        if (ir_move_source(zc, func, expr) != expr) break;
         for (int i = 0; i < expr->intrinsic.arg_count; i++)
             ir_check_expr_uaf(zc, func, ps, expr->intrinsic.args[i], line, rs);
         break;
@@ -6907,7 +7168,10 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         if (inst->dest_local < func->local_count &&
             inst->src1_local < func->local_count) {
             Type *src_type = func->locals[inst->src1_local].type;
-            if (ir_should_track_move(src_type)) {
+            /* BUG-1262: and a by-value destination — a `|*p|` capture of a
+             * move-carrying optional copies INTO a pointer, which borrows. */
+            if (ir_should_track_move(src_type) &&
+                ir_should_track_move(func->locals[inst->dest_local].type)) {
                 IRHandleInfo *src_h = ir_find_handle(ps, inst->src1_local);
                 if (src_h && src_h->state == IR_HS_TRANSFERRED) {
                     ir_zc_error(zc, inst->source_line,
@@ -6993,6 +7257,21 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 }
             }
         }
+        /* BUG-1262: a BORROW (`if (o) |*t|`) of a move-carrying local that has
+         * no entry yet — the assign spelling `o = a;` never names `o` as a
+         * dest — gets its identity now, so a later move of `o` reaches `t`
+         * through the shared alloc_id. A move local with no entry is live. */
+        if (!src_h && inst->src1_local < func->local_count &&
+            inst->dest_local < func->local_count &&
+            ir_should_track_move(func->locals[inst->src1_local].type) &&
+            !ir_should_track_move(func->locals[inst->dest_local].type)) {
+            src_h = ir_add_handle(ps, inst->src1_local);
+            if (src_h) {
+                src_h->state = IR_HS_ALIVE;
+                src_h->alloc_line = inst->source_line;
+                src_h->alloc_id = _ir_next_alloc_id++;
+            }
+        }
         if (!src_h) {
             /* BUG-1227 companion: an UNTRACKED value overwrites the destination.
              * Before BUG-1227 an untracked local stayed untracked, so nothing was
@@ -7065,6 +7344,15 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             if (dst_h->view_root_local < 0 &&
                 ir_is_stable_aggregate_ptr_param(func, inst->src1_local))
                 dst_h->view_root_local = inst->src1_local;
+            /* BUG-1262: a BORROW of a move-carrying value (`if (o) |*t|`) shares
+             * its identity — so a move of `o` invalidates `t` — but owns nothing:
+             * the owner is `o`, whose own exit rule applies. Without this the
+             * pointer read as an un-freed owner ("handle 't' never freed"). */
+            if (inst->src1_local < func->local_count &&
+                ir_should_track_move(func->locals[inst->src1_local].type) &&
+                inst->dest_local < func->local_count &&
+                !ir_should_track_move(func->locals[inst->dest_local].type))
+                dst_h->escaped = true;
         }
         break;
     }
@@ -8434,13 +8722,19 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
              * this codebase already states is "FORMING a reference aliases; READING a
              * value does not". Admitting it here is what makes `[*]u8 s = h.arr[0..]`
              * alias the slot instead of nothing. */
+            /* BUG-1256: `s.ptr` of a SLICE is `&s[0]` spelled as a field — a
+             * reference to the slice's allocation, so it aliases exactly as that
+             * does. It aliased nothing: `*T p = s.ptr; free(s); *p` read a freed
+             * allocation (ASan heap-use-after-free). */
+            bool rhs_is_slice_ptr = rhs_pv && ir_is_slice_ptr_field(zc, rhs_pv);
             bool rhs_is_view = rhs_pv && ((rhs_pv->kind == NODE_UNARY &&
                                            rhs_pv->unary.op == TOK_AMP) ||
-                                          rhs_pv->kind == NODE_SLICE);
+                                          rhs_pv->kind == NODE_SLICE || rhs_is_slice_ptr);
             if (rhs_is_view) {
                 Node *rhs = rhs_pv;   /* shadow: the peeled view drives this branch */
                 Node *addr_target = (rhs->kind == NODE_SLICE) ? rhs->slice.object
-                                                              : rhs->unary.operand;
+                                  : rhs_is_slice_ptr ? rhs->field.object
+                                                     : rhs->unary.operand;
                 /* §A #7 (HOLE-A1/A2): if the address-taken expression is a
                  * COMPOUND (`&arr[0]` or `&b.field`) on a move-tracking base,
                  * alias the pointer against the COMPOUND handle so a later move
@@ -8755,16 +9049,28 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     }
                 }
             }
-            /* If source is an ident that's a tracked handle, create alias */
-            if (inst->expr->kind == NODE_IDENT) {
+            /* If source is an ident that's a tracked handle, create alias.
+             * BUG-1263: `DT d = @cast(DT, a);` moves `a` — see through a launder
+             * to a move-carrying source (only then; a pointer launder keeps its
+             * existing untracked treatment here). */
+            Node *mvsrc = ir_move_source(zc, func, inst->expr);
+            if (mvsrc->kind == NODE_IDENT) {
                 int src_local = ir_find_local_exact_first(func,
-                    inst->expr->ident.name,
-                    (uint32_t)inst->expr->ident.name_len);
+                    mvsrc->ident.name,
+                    (uint32_t)mvsrc->ident.name_len);
                 if (src_local >= 0) {
                     IRHandleInfo *src_h = ir_find_handle(ps, src_local);
                     Type *src_type = (src_local < func->local_count)
                         ? func->locals[src_local].type : NULL;
                     bool is_move = ir_should_track_move(src_type);
+                    /* BUG-1262: a move needs a BY-VALUE destination. A pointer
+                     * capture `if (o) |*p|` lowers to a COPY from the move-carrying
+                     * `o` into `*Tok p`; treating it as a transfer consumed `o`
+                     * and reported `p` as a leaked owner. */
+                    if (is_move && inst->dest_local >= 0 &&
+                        inst->dest_local < func->local_count &&
+                        !ir_should_track_move(func->locals[inst->dest_local].type))
+                        is_move = false;
 
                     if (is_move) {
                         /* Move transfer: source → TRANSFERRED, dest → new ALIVE */
@@ -8841,7 +9147,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                                 ir_state_name(src_h->state), ir_local_desc(zc, func, src_local, NULL, 0));
                         }
                     }
-                } else if (ir_ident_is_unshadowed_global(zc, func,
+                } else if (mvsrc == inst->expr &&
+                           ir_ident_is_unshadowed_global(zc, func,
                                                          inst->expr)) {
                     /* GAP-3 (BUG-739): bare global read-back —
                      * `?*Item m = g_ptr;`. Alias dest to the global's
@@ -9274,7 +9581,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             }
             if ((mc == IRMC_FREE || mc == IRMC_FREE_PTR) &&
                 inst->expr->call.arg_count >= 1) {
-                Node *arg = inst->expr->call.args[0];
+                Node *arg = ir_resolve_returned_arg(zc, inst->expr->call.args[0]);
                 int root_local;
                 const char *path;
                 uint32_t path_len;
@@ -9828,6 +10135,12 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
 
         if (!summary) break;
 
+        /* BUG-1264: BEFORE any summary effect (the freed-global apply below
+         * already widens the aliases this rule compares). */
+        if (inst->expr && inst->expr->kind == NODE_CALL)
+            ir_check_freed_arg_aliasing(zc, func, ps, summary, inst->expr,
+                                        inst->source_line, fn_name, fn_name_len);
+
         /* BUG-1172: the callee resets a non-local arena — every arena-coloured
          * handle of THIS function is freed across the call, exactly as if the
          * reset were written here; and this function now resets one too. */
@@ -9865,6 +10178,20 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
          * skipped. Cross-function double-free of a struct-field handle
          * compiled cleanly. Mirror the compound-key resolution that the
          * extern_free path already uses (see lines 2902-2942). */
+        /* BUG-1258: a callee that frees param pi, handed memory the allocator
+         * never gave out — a local array, a view of one, `&local`, or an arena
+         * allocation. The direct `free(stack_view)` is refused by the checker;
+         * through a callee it reached libc (ASan bad-free / arena corruption). */
+        for (int pi = 0; inst->expr && inst->expr->kind == NODE_CALL &&
+                         pi < summary->param_count && pi < inst->expr->call.arg_count; pi++) {
+            if (!summary->frees_param[pi] && !summary->maybe_frees_param[pi]) continue;
+            const char *why = ir_arg_not_heap(zc, func, ps, inst->expr->call.args[pi]);
+            if (why)
+                ir_zc_error(zc, inst->source_line,
+                    "argument %d is %s, but the callee frees that parameter — free() "
+                    "is only for memory from alloc(). Pass a heap allocation, or do not "
+                    "free it in the callee", pi + 1, why);
+        }
         for (int pi = 0; pi < summary->param_count; pi++) {
             bool bare = summary->frees_param[pi] || summary->maybe_frees_param[pi];
             /* rdh99l (2026-08-02): the callee frees a FIELD of param pi. */

@@ -1703,3 +1703,47 @@ checker.c:collect_borrow_roots:NODE_SWITCH:switch_stmt.expr
 checker.c:collect_borrow_roots:NODE_VAR_DECL:var_decl.init
 checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.body
 checker.c:collect_borrow_roots:NODE_WHILE:while_stmt.cond
+# BUG-1255: is_non_storable_depth follows ONE value's projection chain (field / index / launder /
+# get() call) to decide whether it still names a pool slot; it deliberately does not descend
+# sub-expressions that are not that value (an index, a call argument, statements).
+checker.c:is_non_storable_depth:NODE_ASM:asm_stmt.inputs
+checker.c:is_non_storable_depth:NODE_ASM:asm_stmt.outputs
+checker.c:is_non_storable_depth:NODE_ASSIGN:assign.target
+checker.c:is_non_storable_depth:NODE_ASSIGN:assign.value
+checker.c:is_non_storable_depth:NODE_AWAIT:await_stmt.cond
+checker.c:is_non_storable_depth:NODE_BINARY:binary.left
+checker.c:is_non_storable_depth:NODE_BINARY:binary.right
+checker.c:is_non_storable_depth:NODE_BLOCK:block.stmts
+checker.c:is_non_storable_depth:NODE_CALL:call.callee
+checker.c:is_non_storable_depth:NODE_CRITICAL:critical.body
+checker.c:is_non_storable_depth:NODE_DEFER:defer.body
+checker.c:is_non_storable_depth:NODE_DO_WHILE:while_stmt.body
+checker.c:is_non_storable_depth:NODE_DO_WHILE:while_stmt.cond
+checker.c:is_non_storable_depth:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:is_non_storable_depth:NODE_FIELD:field.object
+checker.c:is_non_storable_depth:NODE_FILE:file.decls
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.body
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.cond
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.init
+checker.c:is_non_storable_depth:NODE_FOR:for_stmt.step
+checker.c:is_non_storable_depth:NODE_FUNC_DECL:func_decl.body
+checker.c:is_non_storable_depth:NODE_GLOBAL_VAR:var_decl.init
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.cond
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.else_body
+checker.c:is_non_storable_depth:NODE_IF:if_stmt.then_body
+checker.c:is_non_storable_depth:NODE_INDEX:index_expr.index
+checker.c:is_non_storable_depth:NODE_INDEX:index_expr.object
+checker.c:is_non_storable_depth:NODE_INTERRUPT:interrupt.body
+checker.c:is_non_storable_depth:NODE_ONCE:once.body
+checker.c:is_non_storable_depth:NODE_RETURN:ret.expr
+checker.c:is_non_storable_depth:NODE_SLICE:slice.end
+checker.c:is_non_storable_depth:NODE_SLICE:slice.object
+checker.c:is_non_storable_depth:NODE_SLICE:slice.start
+checker.c:is_non_storable_depth:NODE_SPAWN:spawn_stmt.args
+checker.c:is_non_storable_depth:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:is_non_storable_depth:NODE_SWITCH:switch_stmt.arms
+checker.c:is_non_storable_depth:NODE_SWITCH:switch_stmt.expr
+checker.c:is_non_storable_depth:NODE_UNARY:unary.operand
+checker.c:is_non_storable_depth:NODE_VAR_DECL:var_decl.init
+checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.body
+checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.cond

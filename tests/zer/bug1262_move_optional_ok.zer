@@ -1,0 +1,18 @@
+move struct Tok { u32 k; }
+u32 consume(Tok t) { return t.k; }
+?Tok mk(u32 k) { if (k == 0) { return null; } Tok t; t.k = k; return t; }
+void peek(?Tok o) { if (o) |*p| { u32 z = p.k; } }
+u32 main() {
+    ?Tok ot;
+    Tok a;
+    a.k = 3;
+    ot = a;
+    Tok b = ot orelse return;
+    u32 r = consume(b);
+    ?Tok o2 = mk(4);
+    peek(o2);
+    Tok c = mk(5) orelse return;
+    r += consume(c);
+    if (r != 8) { return 1; }
+    return 0;
+}

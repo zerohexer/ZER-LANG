@@ -133,6 +133,30 @@ static bool type_carries_handle(Type *t, int depth) {
     return false;
 }
 
+/* BUG-1260: does this type hold a `move struct` anywhere (fields, elements,
+ * optional payload, union variants)? Past the cap: assume it does. */
+static bool type_carries_move_struct(Type *t, int depth) {
+    if (depth > 256) return true;
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_OPTIONAL) return type_carries_move_struct(u->optional.inner, depth + 1);
+    if (k == TYPE_ARRAY) return type_carries_move_struct(u->array.inner, depth + 1);
+    if (k == TYPE_STRUCT) {
+        if (u->struct_type.is_move) return true;
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_move_struct(u->struct_type.fields[i].type, depth + 1)) return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_move_struct(u->union_type.variants[i].type, depth + 1)) return true;
+        return false;
+    }
+    return false;
+}
+
 /* Forward: the SCOPED constant evaluator (defined below with the other const
  * machinery). Needed up here by the size fold, which must resolve a `const`
  * identifier — the non-scoped evaluator cannot. */
@@ -881,11 +905,71 @@ static void mark_non_storable(Checker *c, Node *n) {
     c->non_storable_nodes[c->non_storable_count++] = n;
 }
 
-static bool is_non_storable(Checker *c, Node *n) {
+static bool type_carries_data_pointer(Type *t, int depth);
+static bool is_non_storable_direct(Checker *c, Node *n) {
     for (int i = 0; i < c->non_storable_count; i++) {
         if (c->non_storable_nodes[i] == n) return true;
     }
     return false;
+}
+/* BUG-1255: "is a get() pointer stored by this value?" — the rule matched only a
+ * BARE `pool.get(h)`, so `id(pool.get(h))`, `(*T)pool.get(h)`, `@ptrcast` /
+ * `@pun`, an `orelse`, a `*opaque` round trip and a struct literal field all
+ * stored the pointer, and after `pool.free(h)` + a new alloc it read the reused
+ * slot (returned 99). A call is conservative: its result may be a view of the
+ * get() argument. A FIELD read of a get() (`pool.get(h).v`) reads a value and is
+ * not descended — the site's own type gate decides whether the value can hold a
+ * pointer. */
+static bool is_non_storable_depth(Checker *c, Node *n, int depth) {
+    if (!n || depth > ZER_EXPR_WALK_MAX) return false;
+    if (depth > 0) {
+        /* a nested value that cannot hold a pointer cannot carry the slot
+         * pointer onward (`v2_add(e.pos, …)` reads a Vec2 by value) */
+        Type *nt = checker_get_type(c, n);
+        if (!nt || !type_carries_data_pointer(nt, 0)) return false;   /* unknown: a value read */
+    }
+    if (is_non_storable_direct(c, n)) return true;
+    switch (n->kind) {
+    case NODE_TYPECAST: return is_non_storable_depth(c, n->typecast.expr, depth + 1);
+    case NODE_ORELSE:
+        return is_non_storable_depth(c, n->orelse.expr, depth + 1) ||
+               is_non_storable_depth(c, n->orelse.fallback, depth + 1);
+    case NODE_CALL:
+        for (int i = 0; i < n->call.arg_count; i++)
+            if (is_non_storable_depth(c, n->call.args[i], depth + 1)) return true;
+        return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++)
+            if (is_non_storable_depth(c, n->intrinsic.args[i], depth + 1)) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (is_non_storable_depth(c, n->struct_init.fields[i].value, depth + 1)) return true;
+        return false;
+    /* a value read out of it, an operator result, a leaf or a statement kind */
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_UNARY:
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_IDENT: case NODE_INT_LIT:
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
+    case NODE_NULL_LIT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+static bool is_non_storable(Checker *c, Node *n) {
+    if (!n) return false;
+    if (is_non_storable_direct(c, n)) return true;   /* the bare get(): old rule */
+    /* a WRAPPER stores the slot pointer only if its own value can hold one */
+    Type *nt = checker_get_type(c, n);
+    if (nt && !type_carries_data_pointer(nt, 0)) return false;
+    return is_non_storable_depth(c, n, 0);
 }
 
 /* ---- Scope helpers ---- */
@@ -4025,6 +4109,30 @@ static ContainerProv container_prov_of_value(Checker *c, Node *v, int depth,
         }
         return s->is_whole_object_addr ? CPROV_WHOLE : CPROV_UNKNOWN;
     }
+    /* BUG-1267: an allocator's result is a WHOLE object — it was never a field of
+     * anything, so `@container(*D, h, link)` on `*L h = alloc(L) orelse return;`
+     * reads before the allocation. The unwrap `orelse` keeps the subject's fact
+     * when the fallback does not produce a value (return/break/continue/block). */
+    if (v->kind == NODE_ORELSE) {
+        bool no_value = v->orelse.fallback_is_return || v->orelse.fallback_is_break ||
+                        v->orelse.fallback_is_continue ||
+                        (v->orelse.fallback && v->orelse.fallback->kind == NODE_BLOCK);
+        if (!no_value) return CPROV_UNKNOWN;
+        return container_prov_of_value(c, v->orelse.expr, depth + 1, st, fn, fl);
+    }
+    if (v->kind == NODE_CALL && v->call.callee) {
+        Node *ce = v->call.callee;
+        if (ce->kind == NODE_IDENT && ce->ident.name_len == 5 &&
+            memcmp(ce->ident.name, "alloc", 5) == 0 && v->call.arg_count == 1)
+            return CPROV_WHOLE;                          /* alloc(T) */
+        if (ce->kind == NODE_FIELD &&
+            ((ce->field.field_name_len == 5 && memcmp(ce->field.field_name, "alloc", 5) == 0) ||
+             (ce->field.field_name_len == 9 && memcmp(ce->field.field_name, "alloc_ptr", 9) == 0))) {
+            Type *rt = typemap_get(c, v);
+            Type *ri = rt ? type_unwrap_optional(rt) : NULL;
+            if (ri && type_dispatch_kind(ri) == TYPE_POINTER) return CPROV_WHOLE;
+        }
+    }
     if (v->kind == NODE_CALL && v->call.callee && v->call.callee->kind == NODE_IDENT) {
         Symbol *fs = scope_lookup(c->current_scope, v->call.callee->ident.name,
                                   (uint32_t)v->call.callee->ident.name_len);
@@ -4194,6 +4302,40 @@ static const char *view_header_field(Checker *c, Node *e, const char **container
     return NULL;
 }
 
+/* BUG-1265: the backing-store argument of an `Arena.over(x)` call, else NULL. */
+static Node *arena_over_backing(Node *e) {
+    if (!e || e->kind != NODE_CALL || e->call.arg_count != 1) return NULL;
+    Node *cal = e->call.callee;
+    if (!cal || cal->kind != NODE_FIELD || cal->field.field_name_len != 4 ||
+        memcmp(cal->field.field_name, "over", 4) != 0) return NULL;
+    Node *o = cal->field.object;
+    if (!o || o->kind != NODE_IDENT || o->ident.name_len != 5 ||
+        memcmp(o->ident.name, "Arena", 5) != 0) return NULL;
+    return e->call.args[0];
+}
+
+/* BUG-1266: is an Arena.over() backing store read-only? A string literal, a
+ * const slice, or a view whose root is a const-declared name. */
+static bool arena_backing_is_readonly(Checker *c, Node *a) {
+    if (!a) return false;
+    if (a->kind == NODE_STRING_LIT) return true;
+    Type *t = check_expr(c, a);
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (u && type_dispatch_kind(u) == TYPE_SLICE && u->slice.is_const) return true;
+    Node *r = a;
+    while (r && (r->kind == NODE_SLICE || r->kind == NODE_INDEX || r->kind == NODE_FIELD)) {
+        if (r->kind == NODE_SLICE) r = r->slice.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else r = r->field.object;
+    }
+    if (r && r->kind == NODE_STRING_LIT) return true;
+    if (r && r->kind == NODE_IDENT) {
+        Symbol *sy = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+        if (sy && sy->is_const) return true;
+    }
+    return false;
+}
+
 static bool deref_ptr_launder(Checker *c, Node *e) {
     if (!e || e->kind != NODE_UNARY || e->unary.op != TOK_STAR) return false;
     Node *inner = e->unary.operand;
@@ -4218,7 +4360,46 @@ static bool deref_ptr_launder(Checker *c, Node *e) {
      * first. Plain value structs are NOT included — that would re-break move_user. */
     if (ik == TYPE_HANDLE) return true;
     if (ik == TYPE_STRUCT && inner_t->struct_type.is_move) return true;
+    /* BUG-1260: an AGGREGATE copied out of a deref carries the same identity as
+     * its fields — `H copy = *hp;` where H holds a `*T` / Handle / move struct
+     * made `copy.p` a second name for `h.p` the analyzer could not tie back
+     * (freed through the copy, read through the original: a UAF that RAN). A
+     * scalar-only struct is a plain value and stays legal. */
+    if (ik == TYPE_STRUCT || ik == TYPE_UNION || ik == TYPE_ARRAY || ik == TYPE_OPTIONAL)
+        return type_carries_data_pointer(inner_t, 0) || type_carries_handle(inner_t, 0) ||
+               type_carries_move_struct(inner_t, 0);
     return false;
+}
+
+/* BUG-1260: the deref-launder sinks word the refusal by what was copied — a
+ * pointer out of a pointer-to-pointer, or an AGGREGATE whose fields carry a
+ * pointer / Handle / move struct (a struct copy is not "a pointer to a pointer"). */
+static bool deref_launder_is_aggregate(Checker *c, Node *e) {
+    /* From the POINTER operand, not the typemap of `e`: the return sink asks
+     * before its expression has been typed. */
+    if (!e || e->kind != NODE_UNARY || !e->unary.operand) return false;
+    Node *inner = e->unary.operand;
+    Type *ot = typemap_get(c, inner);
+    if (!ot && inner->kind == NODE_IDENT) {
+        Symbol *sy = scope_lookup(c->current_scope, inner->ident.name,
+                                  (uint32_t)inner->ident.name_len);
+        ot = sy ? sy->type : NULL;
+    }
+    Type *ou = ot ? type_unwrap_distinct(ot) : NULL;
+    if (!ou || type_dispatch_kind(ou) != TYPE_POINTER) return false;
+    Type *t = ou->pointer.inner;
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_STRUCT || k == TYPE_UNION || k == TYPE_ARRAY || k == TYPE_OPTIONAL;
+}
+
+static void report_deref_aggregate_copy(Checker *c, int line) {
+    checker_error(c, line,
+        "cannot copy a value holding a pointer, Handle or move struct out of a "
+        "dereference — the copy's fields alias the original's, and the compiler "
+        "cannot tie them back, so a free or consume through one name would be a "
+        "use-after-free through the other. Read the fields you need ('u32 v = p.v;'), "
+        "or pass the pointer itself");
 }
 
 static bool deref_launder_transfers_identity(Checker *c, Node *e) {
@@ -4234,7 +4415,16 @@ static bool deref_launder_transfers_identity(Checker *c, Node *e) {
     Type *it = ot->pointer.inner ? type_unwrap_distinct(ot->pointer.inner) : NULL;
     if (!it) return false;
     TypeKind ik = type_dispatch_kind(it);
-    return ik == TYPE_HANDLE || (ik == TYPE_STRUCT && it->struct_type.is_move);
+    if (ik == TYPE_HANDLE || (ik == TYPE_STRUCT && it->struct_type.is_move)) return true;
+    /* BUG-1260: an AGGREGATE read through a dereference carries whatever its
+     * fields carry — `H copy = *hp;` duplicated `h.p` (a heap pointer) with no
+     * link to h, so `free(copy.p)` then `t.v` read a recycled object and the
+     * later `free(t)` double-freed; a nested move struct was consumed twice. The
+     * `H copy = h;` spelling is tracked. A struct of scalars stays a plain copy. */
+    if (ik == TYPE_STRUCT || ik == TYPE_UNION || ik == TYPE_ARRAY || ik == TYPE_OPTIONAL)
+        return type_carries_data_pointer(it, 0) || type_carries_handle(it, 0) ||
+               type_carries_move_struct(it, 0);
+    return false;
 }
 
 /* Is this expression `&<packed struct>.field` (at any field/index depth)?
@@ -6143,13 +6333,22 @@ static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
      * left alone. Another instance of the `?T`-hides-the-inner-kind class (the
      * OPEN "optional-unwrap" class-kill). */
     Type *sym_eff = type_unwrap_optional(sym_type);
+    /* BUG-1265: an Arena CARRIES its backing store — `Arena a = Arena.over(lb);`
+     * with lb local makes `a` frame-bound, so `return a;` hands the caller an
+     * arena bump-allocating into a dead frame. */
+    if (type_dispatch_kind(sym_eff) == TYPE_ARENA) {
+        Node *bk = arena_over_backing(value);
+        if (bk && arg_is_local_derived(c, bk, 0)) sym->is_local_derived = true;
+        return;
+    }
     if (type_dispatch_kind(sym_eff) != TYPE_SLICE) return;
     Node *roots[2] = { value, NULL };
     int root_count = 1;
     if (value->kind == NODE_ORELSE && value->orelse.fallback)
         roots[root_count++] = value->orelse.fallback;
     for (int ri = 0; ri < root_count; ri++) {
-        Node *sr = roots[ri];
+        /* BUG-1259: `DS d = @cast(DS, a[0..]);` — the launder hid the slice. */
+        Node *sr = unwrap_ptr_launder(roots[ri]);
         if (!sr) continue;
         if (sr->kind == NODE_SLICE) sr = sr->slice.object;
         while (sr && (sr->kind == NODE_FIELD || sr->kind == NODE_INDEX)) {
@@ -6424,6 +6623,12 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
                     reject_unique_resource_copy(c, df->value, ft,
                                                 line, "initialize");
                     reject_array_view_hazards(c, df->value, ft, line);
+                    /* BUG-1255: a struct-literal FIELD is a store too — typed here,
+                     * after the var-decl / assignment gates have already run. */
+                    if (type_carries_data_pointer(ft, 0) && is_non_storable(c, df->value))
+                        checker_error(c, line,
+                            "cannot store result of get() in field '.%.*s' — use inline",
+                            (int)df->name_len, df->name);
                 }
                 if (vt && ft && !value_flows_to(df->value, vt, ft)) {
                     char what[96];
@@ -10337,6 +10542,32 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
             }
             result = type_pointer(c->arena, operand);
+            /* BUG-1254: the address of a CALL RESULT — `&mk()`, `&pool.get(h)`, or
+             * a field / element of a struct-VALUED result (`&mk().v`) — is not an
+             * lvalue: C has no object to point at, and GCC refused the emitted
+             * code ("lvalue required as unary '&'"). Through a call returning a
+             * POINTER (`&getp().v`) the object is the pointee and stays legal. */
+            {
+                Node *o = node->unary.operand;
+                bool rvalue = false;
+                while (o) {
+                    if (o->kind == NODE_CALL) { rvalue = true; break; }
+                    Node *obj = o->kind == NODE_FIELD ? o->field.object :
+                                o->kind == NODE_INDEX ? o->index_expr.object : NULL;
+                    if (!obj) break;
+                    if (obj->kind == NODE_CALL) {
+                        Type *ot = checker_get_type(c, obj);
+                        TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+                        if (ok != TYPE_POINTER && ok != TYPE_SLICE) rvalue = true;
+                        break;
+                    }
+                    o = obj;
+                }
+                if (rvalue)
+                    checker_error(c, node->loc.line,
+                        "cannot take the address of a call result — it is a temporary "
+                        "value with no storage to point at. Bind it to a local first");
+            }
             /* BUG-197/228/254: walk operand to root for volatile/const propagation.
              * Handles &ident, &arr[i], &s.field, &s.arr[i].field etc. */
             {
@@ -10451,7 +10682,10 @@ static Type *check_expr(Checker *c, Node *node) {
         /* Deref-launder sink: `h.p = *pp;` / `g = *pp;` stores an alias the
          * analyzer cannot follow into a field or a global. Same predicate and
          * Level-A stance as the var-decl and return sinks. */
-        if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
+        if (node->assign.value && deref_ptr_launder(c, node->assign.value) &&
+            deref_launder_is_aggregate(c, node->assign.value)) {
+            report_deref_aggregate_copy(c, node->loc.line);
+        } else if (node->assign.value && deref_ptr_launder(c, node->assign.value)) {
             checker_error(c, node->loc.line,
                 "cannot bind a pointer obtained by dereferencing a pointer to a pointer "
                 "— the compiler cannot prove which allocation it aliases, so a later "
@@ -10638,6 +10872,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     val_is_local = vsym && !vsym->is_static &&
                         !global_decl_lookup(c, vsym->name, vsym->name_len);
                 }
+                /* BUG-1265: the constructor itself — `ga = Arena.over(lb);` with lb
+                 * a LOCAL array. vroot is the call, not an ident, so the old test
+                 * never fired and the global arena bump-allocated into a dead frame. */
+                if (!val_is_local && arena_over_backing(vroot))
+                    val_is_local = arg_is_local_derived(c, arena_over_backing(vroot), 0);
                 if (val_is_local) {
                     /* Check if target is global/static */
                     Node *troot = node->assign.target;
@@ -11386,10 +11625,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* @container provenance: val = &struct.field, or
                          * (BUG-987) val = &wholeObject — same classifier as the
                          * var-decl sink so the two cannot diverge. */
-                        if (vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP) {
+                        if ((vcheck->kind == NODE_UNARY && vcheck->unary.op == TOK_AMP) ||
+                            vcheck->kind == NODE_CALL || vcheck->kind == NODE_ORELSE) {   /* BUG-1267 */
                             Type *st = NULL; const char *cfn = NULL; uint32_t cfl = 0;
-                            switch (classify_amp_operand(c, vcheck->unary.operand,
-                                                         &st, &cfn, &cfl)) {
+                            switch (container_prov_of_value(c, vcheck, 0, &st, &cfn, &cfl)) {
                             case CPROV_FIELD: set_container_prov_field(tsym, st, cfn, cfl); break;
                             case CPROV_WHOLE: set_container_prov_whole(tsym); break;
                             case CPROV_UNKNOWN: break;
@@ -13161,6 +13400,15 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (mlen == 4 && memcmp(mname, "over", 4) == 0) {
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "Arena.over() takes exactly 1 argument");
+                    /* BUG-1266: the arena WRITES its allocations into the backing
+                     * store — a string literal (.rodata, a fault) or a const buffer
+                     * handed over gives writable objects in read-only memory. */
+                    if (node->call.arg_count == 1 && node->call.args[0] &&
+                        arena_backing_is_readonly(c, node->call.args[0]))
+                        checker_error(c, node->loc.line,
+                            "Arena.over() needs a WRITABLE backing store — the arena "
+                            "writes every allocation into it, and this one is a string "
+                            "literal or const. Use a non-const u8[N] buffer");
                     result = ty_arena;
                     typemap_set(c, field_node,result);
                     break;
@@ -13277,6 +13525,10 @@ static Type *check_expr(Checker *c, Node *node) {
                 if (mlen == 4 && memcmp(mname, "free", 4) == 0) {
                     /* Task.free(h) → void — same as slab.free(h) */
                     check_isr_ban(c, node->loc.line, auto_slab_method_label(c, obj, "free", false));
+                    /* BUG-1261: a free names the auto-slab too — a program that only
+                     * FREES a T (a helper taking *T) emitted `_zer_auto_slab_T` with no
+                     * declaration, a GCC error blaming the user's line. */
+                    find_or_create_auto_slab(c, obj);
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -13288,6 +13540,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* Task.free_ptr(p) → void — same as slab.free_ptr(p) */
                     check_isr_ban(c, node->loc.line,
                                   auto_slab_method_label(c, obj, "free_ptr", free_desugared));
+                    find_or_create_auto_slab(c, obj);   /* BUG-1261 */
                     if (node->call.arg_count != 1)
                         checker_error(c, node->loc.line, "%.*s.free_ptr() takes exactly 1 argument",
                             (int)obj->struct_type.name_len, obj->struct_type.name);
@@ -14240,8 +14493,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 node->field.handle_alloc = alloc_sym;   /* BUG-1053 */
                 if (!alloc_sym) {
                     checker_error(c, node->loc.line,
-                        "no Pool or Slab found for Handle(%.*s) — cannot auto-deref. "
-                        "Use explicit pool.get(h).%.*s",
+                        "cannot auto-deref Handle(%.*s): no single Pool or Slab holds "
+                        "it (none is declared, or more than one is and the handle's "
+                        "origin is not known here). Use explicit pool.get(h).%.*s",
                         (int)elem->struct_type.name_len, elem->struct_type.name,
                         (int)flen, fname);
                     result = ty_void;
@@ -19100,7 +19354,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             /* BUG-1249: const exempts a value that cannot change — not the
              * mutable data a const POINTER / slice / carrier points at
              * (`const [*]u32 gs = arr;` read while main writes arr). */
-            if (sym->is_const && !type_can_carry_pointer(sym->type)) return false;
+            if (sym->is_const && !type_carries_data_pointer(sym->type, 0)) return false;
             /* volatile: an "explicit low-level opt-in" for the SINGLE-WORD
              * volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer).
              * That rationale is width-bounded and the check never was:
@@ -20083,7 +20337,10 @@ static void check_stmt(Checker *c, Node *node) {
              * model deliberately lacks. Level-A stance: cannot prove => REJECT.
              * Measured live: the reproducer RAN, read freed memory and double-freed.
              * A scalar `u32 v = *p` is NOT matched (the result must carry identity). */
-            if (deref_ptr_launder(c, node->var_decl.init)) {
+            if (deref_ptr_launder(c, node->var_decl.init) &&
+                deref_launder_is_aggregate(c, node->var_decl.init)) {
+                report_deref_aggregate_copy(c, node->loc.line);
+            } else if (deref_ptr_launder(c, node->var_decl.init)) {
                 checker_error(c, node->loc.line,
                     "cannot bind a value obtained by dereferencing a pointer to a pointer "
                     "— the compiler cannot prove which allocation it aliases, so a later "
@@ -20702,7 +20959,7 @@ static void check_stmt(Checker *c, Node *node) {
             if (sym && node->var_decl.init) {
                 Node *init = node->var_decl.init;
                 if ((init->kind == NODE_UNARY && init->unary.op == TOK_AMP) ||
-                    init->kind == NODE_CALL) {                    /* BUG-1167 */
+                    init->kind == NODE_CALL || init->kind == NODE_ORELSE) {   /* BUG-1167, 1267 */
                     Type *st = NULL; const char *fn = NULL; uint32_t fl = 0;
                     switch (container_prov_of_value(c, init, 0, &st, &fn, &fl)) {
                     case CPROV_FIELD:   set_container_prov_field(sym, st, fn, fl); break;
@@ -22312,10 +22569,31 @@ static void check_stmt(Checker *c, Node *node) {
     case NODE_RETURN: {
         if (node->ret.expr && value_forms_variant_ref(c, node->ret.expr, 0))   /* BUG-1186 */
             report_variant_ref_store(c, node->loc.line, "return");
+        /* BUG-1265: an arena over this frame's memory, returned. */
+        if (node->ret.expr) {
+            Node *re = node->ret.expr;
+            bool frame_arena = arena_over_backing(re) &&
+                               arg_is_local_derived(c, arena_over_backing(re), 0);
+            if (!frame_arena && re->kind == NODE_IDENT) {
+                Symbol *rs = scope_lookup(c->current_scope, re->ident.name,
+                                          (uint32_t)re->ident.name_len);
+                frame_arena = rs && rs->is_local_derived &&
+                              type_dispatch_kind(rs->type) == TYPE_ARENA;
+            }
+            if (frame_arena)
+                checker_error(c, node->loc.line,
+                    "cannot return an Arena over this function's local memory — its "
+                    "backing store dies when the function returns, and every later "
+                    "allocation would land in a dead frame. Back it with a global or "
+                    "heap buffer");
+        }
         /* Deref-launder sink: `return *pp;` hands the CALLER an alias the analyzer
          * cannot follow, so a free through either name is a UAF. Same predicate and
          * Level-A stance as the var-decl sink. Scalar / struct-VALUE not matched. */
-        if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
+        if (node->ret.expr && deref_ptr_launder(c, node->ret.expr) &&
+            deref_launder_is_aggregate(c, node->ret.expr)) {
+            report_deref_aggregate_copy(c, node->loc.line);
+        } else if (node->ret.expr && deref_ptr_launder(c, node->ret.expr)) {
             checker_error(c, node->loc.line, "cannot bind a pointer obtained by dereferencing a pointer to a pointer "
                 "— the compiler cannot prove which allocation it aliases, so a later "
                 "free through either name would be a use-after-free. Alias the pointer "
@@ -22723,6 +23001,30 @@ static void check_stmt(Checker *c, Node *node) {
                             }
                         }
                     }
+                    /* BUG-1259: a SUB-SLICE of a local array through the cast —
+                     * `return @cast(DS, a[0..]);` to a distinct slice type
+                     * returned a view of the dead frame (ASan
+                     * stack-use-after-return); the plain `return a[0..]` is caught. */
+                    if (arg->kind == NODE_SLICE) {
+                        Node *root = arg->slice.object;
+                        while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX))
+                            root = root->kind == NODE_FIELD ? root->field.object
+                                                            : root->index_expr.object;
+                        if (root && root->kind == NODE_IDENT) {
+                            Symbol *sym = scope_lookup(c->current_scope,
+                                root->ident.name, (uint32_t)root->ident.name_len);
+                            bool is_global = global_decl_lookup(c,
+                                root->ident.name, (uint32_t)root->ident.name_len) != NULL;
+                            if (sym && !sym->is_static && !is_global &&
+                                (type_dispatch_kind(sym->type) == TYPE_ARRAY ||
+                                 sym->is_local_derived))
+                                checker_error(c, node->loc.line,
+                                    "cannot return a view of local '%.*s' via @%.*s — "
+                                    "stack memory is freed when function returns",
+                                    (int)root->ident.name_len, root->ident.name,
+                                    (int)ilen, iname);
+                        }
+                    }
                     /* BUG-256: check local/arena-derived ident through pointer cast.
                      * Only applies when the result can carry a pointer (a value
                      * @bitcast to an integer is safe and must stay accepted).
@@ -22905,6 +23207,17 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* BUG-1255: the RETURN sink of the non-storable rule — `return
+             * pool.get(h);` (after `defer pool.free(h)`) handed the caller a slot
+             * pointer that was freed on the way out. */
+            if (c->current_func_ret && node->ret.expr &&
+                is_non_storable(c, node->ret.expr) &&
+                type_carries_data_pointer(c->current_func_ret, 0)) {
+                checker_error(c, node->loc.line,
+                    "cannot return the result of get() — the slot may be freed or "
+                    "reused once this function returns. Return the Handle, or the "
+                    "field values you need");
+            }
             if (c->current_func_ret) {
                 /* BUG-970: the RETURN sink is NARROWER than the other seven, and
                  * deliberately so. Returning a LOCAL resource by value is a MOVE —

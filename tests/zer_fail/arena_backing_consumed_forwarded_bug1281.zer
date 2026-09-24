@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: 'lb' is the backing store of an arena
+struct B { [*]u32 s; }
+Arena mk([*]u8 b) { return Arena.over(b); }
+Arena mk2([*]u8 b) { return mk(b); }
+u32 main() {
+    u8[64] lb;
+    Arena a = mk2(lb[0..]);
+    *B x = a.alloc(B) orelse return;
+    x.s.len;
+    lb[8] = 200;
+    return 0;
+}

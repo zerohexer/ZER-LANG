@@ -5,6 +5,196 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24g — BUG-1268..1290: closing the MEDIUM limitations (arena, wrong-pool, races, escapes)
+
+**Method.** Every item below was an entry in `docs/limitations.md` or a finding of the read-only
+triage agents that re-measured it; each was RE-REPRODUCED on the from-HEAD (`ae001cfe`) build
+before any change. Every negative COMPILES on that build and is refused now for its
+`// expect-error:` reason; the trap tests exit 9 (the other pool's object) on it. Gates: sink
+matrix shape **p44** (five hazard cells, all HOLES on HEAD, plus four boundary cells) and a new
+required-emission case in `tools/emit_audit.sh` (red on HEAD). Corpus cost, compiler-classified
+over tests/, rust_tests/, zig_tests/, test_modules/, examples/, lib/: **zero** files newly
+rejected. The corpus scan caught one draft: the first `@once` fix (1276) descended the block
+with no exemption and rejected six publish-once idioms, which is why it has one.
+
+### BUG-1268 — `free(hb)` of a heap backing store left the arena's objects live
+zercheck_ir records which allocation backs each Arena local (`Arena.over(x)` at a call, an
+Arena copy, an assignment) and links every allocation from that arena as a VIEW of it, so
+freeing the backing store invalidates them. Also: the caller-side arena-reset rule (BUG-1264)
+no longer counts an allocation from a caller-LOCAL arena, which no callee can reset.
+Tests: `arena_backing_view_uaf_bug1268.zer`, positive `arena_local_vs_callee_global_reset_ok_bug1268.zer`.
+
+### BUG-1269 — an arena's backing store stayed addressable after `Arena.over()`
+Two arenas over one buffer handed out the same bytes; a plain write to the buffer overwrote a
+`[*]T` header living in an arena object (forged `.len`, then an out-of-bounds write the bounds
+check trusts). A buffer handed to `Arena.over` now belongs to the arena: every other mention is
+refused ("is the backing store of arena"), a second arena over it too ("already backs arena").
+The only permitted mentions are `Arena.over(x)` and `free(x)`. The rule is flow-INSENSITIVE (a
+use before the `over` is refused as well) and whole-program for globals.
+Tests: `arena_backing_second_arena_bug1269.zer`, `arena_backing_read_bug1269.zer`, positive
+`arena_backing_over_ok_bug1269.zer`.
+
+### BUG-1270 — a Handle from one pool used with another returned the OTHER pool's object
+`rd(h)` doing `pb.get(x)` on an `h` from `pa` (also via a global and via a Ring): every pool
+started its generations at 0, so the check passed. Each pool / slab now seeds its slot
+generations from its own address (`_zer_gen_seed`), so a foreign handle mismatches, and
+`free` traps too ("free of a handle this pool/slab did not issue"). A RUN-time check: two
+pools' generations could only meet after ~2^31 recycles of one slot (limitations.md).
+Tests: `tests/zer_trap/wrong_pool_handle_via_{callee,global,ring}_bug1270.zer`.
+
+### BUG-1271 — `@container` provenance through a struct field
+`H h = { .q = &ls[0] }; @container(*D, h.q, link)` — the fact lived on symbols only. A
+per-function compound map (`cprov_*`) carries it for `h.q` / `arr[i]` roots whose address is
+never taken. Tests: `container_whole_object_field_bug1271.zer`, positive `container_field_heap_ok_bug1271.zer`.
+
+### BUG-1272 — a callee freeing a FIELD of a by-value struct argument, handed stack memory
+`void rel(H h) { free(h.d); }` now infers `keep` on `h`, so `rel(h)` with `h.d = arr[0..]` is
+refused at the call. Tests: `free_byvalue_param_field_stack_bug1272.zer`, positive `…_heap_ok_bug1272.zer`.
+
+### BUG-1273 — an index in the RHS of `&&` / `||` or an `orelse` value fallback got a HOISTED guard
+The early-return auto-guard ran before the whole statement, so `if (i < 4 && a[i] > 0)` with
+`i = 9` returned from the function although `a[i]` never executes (a miscompile, not a crash).
+Those positions now get the inline single-evaluation check at the access itself; an MMIO index
+or a dyn-freed UAF guard in such a position is a checker error.
+Tests: `shortcircuit_and_index_guard_bug1273.zer`, `orelse_fallback_index_guard_bug1273.zer`,
+`shortcircuit_guard_no_early_return_bug1273.zer`.
+
+### BUG-1274 — a conditional reassignment cleared a pointer's escape taint on every path
+`*u32 p = &loc; if (c) { p = &gx; } return p;` compiled (ASan stack-use-after-return). A
+reassignment now replaces the taint only when it is at the declaration's branch depth
+(`Symbol.decl_branch_depth`). Tests: `cond_reassign_{return_local,store_global}_bug1274.zer`, p44.
+
+### BUG-1275 — a bare switch arm (`0 => g.x = 5,`) ran its shared store unlocked
+The arm body was lowered without the statement wrapper that carries the per-statement lock. It
+is now wrapped in a block. Test: `switch_bare_arm_shared_lock_bug1275.zer` (a two-thread counter;
+probabilistic on HEAD) and the deterministic `emit_audit.sh` required-lock case.
+
+### BUG-1276 — an `@once` body was invisible to the spawn race scan
+It was a leaf. It is now scanned, with the publish-once exemption stated precisely: a global
+touched ONLY inside ONE `@once` block of a SCOPED spawn target is exempt, and the parent may
+not touch it outside that same block — directly, through a callee, or through a function
+pointer — until the LAST join (not the first: a conditional `@once` may be skipped by the
+thread that joined). Two different `@once` blocks on one global race and are refused; a
+fire-and-forget thread gets no exemption (its window is the rest of the program).
+Tests: `once_*_bug1276.zer` (7 negatives), positive `once_same_block_parent_call_ok_bug1276.zer`.
+
+### BUG-1277 — a written-out read-modify-write through a global pointer (`*gp = *gp + 1`)
+The RMW read side only matched the target by name; it now asks `for_each_write_target` whether a
+deref on the value side reaches the same global (`value_derefs_global`). Both sinks (ISR, spawn)
+and main. Tests: `{isr,spawn}_rmw_written_out_gptr_bug1277.zer`, two new cells in the RMW grid.
+
+### BUG-1278 — a cast in the MIDDLE of a reference path hid the root from the escape walks
+`g = &((*Inner)h.in).v` stored a pointer into a stack object. A reference formed through a
+path containing a cast is refused (`ref_path_crosses_launder`); a cast at the root stays legal.
+Tests: `interior_cast_ref_{global,local,nonkeep}_bug1278.zer`, p44.
+
+### BUG-1279 — a detached thread started by a CALLEE received the caller's stack
+`void mid(*S w) { spawn grand(w); }` then `mid(&local)`: ASan stack-use-after-return. A param
+handed to a fire-and-forget spawn now infers `keep`. Tests: `detached_grandchild_local{,2}_bug1279.zer`, p44.
+
+### BUG-1280 — freeing an allocation after a callee handed it to a detached thread
+`mid(p); free(p);` (the thread still writes it). FuncSummary gains `transfers_param` (a param
+handed to a fire-and-forget spawn on every path / some path) and the call site marks the
+argument TRANSFERRED / MAYBE_FREED, exactly as a direct `spawn w(p)` does. Note the live handler
+is `IR_NOP` wrapping NODE_SPAWN; `IR_SPAWN` in zercheck_ir.c is never emitted.
+Tests: `forwarded_spawn_*_bug1280.zer`, positives for a heap/global argument and a joining callee.
+
+### BUG-1281 — an arena backing store with a SECOND name
+Found while documenting 1269: its "every mention of the name" rule is sound only when the
+buffer has ONE name. `Arena.over(st.buf)`, `Arena.over(p.buf)`, `Arena.over(v)` with
+`v = lb[0..]`, and `Arena mk([*]u8 b) { return Arena.over(b); }` called as `mk(lb[0..])` each
+left a name the header could be forged through (`.len` read 200). `Arena.over` now takes an
+array identifier, a slice parameter, or a fresh never-reassigned `alloc` slice; a parameter a
+function turns into a backing store (directly or by forwarding, to a fixpoint) CONSUMES the
+caller's argument, which is then held to the same rule. Tests: `arena_backing_*_bug1281.zer`,
+positive `arena_over_param_returned_ok_bug1281.zer`.
+
+### BUG-1282 — a free through a FIELD over a variable index (`free(larr[i].p)`)
+The variable-index free barrier (BUG-741/1130) recognised only a bare `free(arr[i])`, so
+`free(larr[i].p); free(larr[0].p);` compiled (limitations.md recorded it as refused "for the
+wrong reason"; re-measured, it was ACCEPTED, and ran: an auto-slab free recycles silently), as
+did a read of `larr[0].p.v` after it. One helper, `ir_elem_free_index`, finds the index under a
+field chain at all three sites. Tests: `elem_field_*_bug1282.zer`.
+
+### BUG-1283 — a BY-VALUE struct param's field copied into the returned struct
+`H mk(G g) { H h; h.p = g.p; return h; }`, then `free(a)` (where `g.p == a`), then
+`mk(g).p.v`. `h.p = g.p` lowers to a passthrough that records nothing, and the return-field
+summary matched only a param's bare handle. The BUG-1131 backstop (an unaccounted reference
+field of a returned value is a MAY view of each reference param) now also runs, for every
+returned value, against by-value struct params that carry a reference; the call site views every
+allocation the struct argument carries. MAY only, so it can refuse a use after the argument's
+allocation is freed and never accept one. Tests: `byvalue_param_field_returned_{uaf,ok}_bug1283.zer`.
+
+### BUG-1284 — an atomic cell reached through a POINTER
+`*u32 p = &g; @atomic_add(p, 1)` in a thread, or a helper `add1(*u32 p) { @atomic_add(p, 1); }`
+called with `&g` (directly or through a forwarding `add2`), never made `g` an atomic cell, so
+main's plain `g += 1` raced the thread's atomic with no diagnostic. A pointer operand is now
+resolved through `for_each_write_target`; a param used as an atomic target is recorded on the
+function (`Symbol.atomic_param_mask`), every direct call records what its pointer arguments
+reach, and the post-check (`check_atomic_cell_safety`, after every body) propagates the masks
+to a fixpoint and marks the globals. The same facts fix two over-rejections: handing `&g`
+straight to such a helper is no longer a "launder" of the cell (unless the helper ALSO uses the
+param non-atomically — `atomic_param_plain_mask`), and `@atomic_add(&p.n, 1)` through a pointer
+local was refused as "a stack local". Tests: `atomic_*_bug1284.zer` (4 negatives, 2 positives).
+
+### O4 — `@barrier_acq_rel` did not count as synchronisation
+A spawn target that touched a non-shared global and used `@barrier_load` / `@barrier_store` /
+`@barrier()` got the "verify ordering" WARNING; the same target with `@barrier_acq_rel` was a
+hard ERROR. It is the fourth fence of the same list. Test: `spawn_barrier_acq_rel_warns_ok.zer`.
+
+### BUG-1285 — a global lent to a scoped spawn through a callee's RETURNED pointer
+`*u32 p = getp(); ThreadHandle th = spawn w(p); gv += 1;` with `getp() { return &gv; }` (and the
+threadlocal sibling) was accepted: `collect_borrow_roots` looked at a call's ARGUMENTS only. It
+now also collects the GLOBAL roots of the named callee's `return` expressions (orelse-block
+returns included; a recursive callee is walked once). Names the callee binds are dropped.
+Tests: `lend_*_via_returned_ptr*_bug1285.zer`.
+
+### BUG-1286 — a pointer FIELD of a `shared struct` was an unlocked channel
+`shared struct S { ?*Cell p; }`: `?*Cell q = s.p;` locks for that statement only, then
+`q.n += 1` in two threads raced on the Cell (lost updates, measured). A shared struct's field
+may no longer carry a pointer to non-shared data (`type_carries_nonshared_pointer`: a pointer,
+slice, also inside a nested struct / optional / array); a pointer to a shared struct is fine
+(that is locked itself), as is a function pointer and a top-level `*opaque` C handle — the
+reference-examples gate caught that the first draft refused the documented C-interop example.
+Its cast-back residual is in limitations.md. Chosen over tracking every
+pointer read OUT of a shared struct through locals and captures (a flow question of the kind
+that has leaked repeatedly); corpus cost zero. Tests: `shared_struct_pointer_*_bug1286.zer`.
+
+### BUG-1287 — an auto-guard's early return inside `@once`, or while holding a semaphore, HUNG
+`void init() { @once { arr[idx] = 1; } }` with `idx = 9`: the compiler-inserted `return`
+skipped the done-publish, and the next `init()` waited on it forever; the same between a
+straight-line `@sem_acquire` and `@sem_release` leaked the permit. A user-written `return` in
+`@once` is already a compile error — the compiler was emitting the construct it bans. The guard
+now TRAPS there, as it already did in `@critical`, a defer body and a held lock (LowerCtx
+`once_depth` / `sem_held`). Tests: `tests/zer_trap/{once,sem}_guard_no_hang_bug1287.zer`.
+
+### BUG-1288 — BUG-1241's "callee stores param into another param's field" was syntactic
+`void init(*S s, *Box b) { *Box x = b; s.b = x; }` (a local copy) and `init(s, b) { set2(s, b); }`
+(a helper) were not summarised, so `init(&t, p); free(p); poll(&t)` wrote into a recycled object.
+The collector follows a local back through its copies to every param it may hold, and re-maps
+a callee's own store entries through the call's arguments (the iterative summary build reaches
+the fixpoint). Tests: `param_store_via_{local_copy,helper}_bug1288.zer`.
+
+### BUG-1289 — BUG-1242's global-read view missed a read THROUGH a pointer to the global
+`*?*Box slot = &gb; if (*slot) |b| { release(); b.v = 99; }` — the deref is an `IR_UNOP`, and the
+key resolver knew bare names and projections only. A deref of a local defined once as `&g` now
+keys g. Tests: `global_read_via_pointer_*_bug1289.zer`.
+
+### BUG-1290 — the funcptr REACH class at the spawn ARGUMENT, closed by its conservative end
+`spawn worker(o.h)` (a field), `spawn worker(t[0])` (an element), a reassigned funcptr local, a
+global funcptr, a funcptr LOCAL handed to a helper that spawns it, and a struct carrier forwarded
+through a helper — each reached the thread unscanned (TSan races). The resolvers stay precise
+for a direct name and for a local bound once at its declaration and never rebound; anything
+else falls back to EVERY function of the pointer's signature (`funcptr_sig_racy_target` — a
+funcptr can hold nothing else, there is no cast between funcptr types). A helper that spawns
+a callback PARAM is therefore checked against every same-signature function in the program:
+refused if any of them races, accepted when all are race-free (the boundary positive and the
+three non-racy payload columns pin that). Corpus cost zero. Gate: five new cells in the REACH
+GRID of `tests/test_conc_matrix.c` (spawned from `main` — a first draft spawned them inside a
+spawned `worker`, where the outer scan found `cb` by name and all five passed on the unfixed
+build). The ISR sibling holds by other rules: a funcptr an ISR can call must live in a global,
+and such a global is refused unless it is a single-word volatile scalar. Tests: `funcptr_reach_*_bug1290.zer`.
+
 ## Session 2026-09-24f — BUG-1254..1267: the allocator audit round (ag10)
 
 **Method.** A read-only agent probed ~200 allocator / free / move / arena shapes against a

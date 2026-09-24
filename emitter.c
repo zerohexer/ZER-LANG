@@ -722,7 +722,7 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
     }
     if (e->guard_traps || e->noreturn_scope_depth > 0) {
         if (with_braces) emit(e, "{ ");
-        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block, @once body, semaphore hold "
                 "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);");
         if (with_braces) emit(e, " }\n"); else emit(e, " ");
         return;
@@ -7129,6 +7129,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        uint8_t used[CAPACITY]; \\\n");
     emit(e, "    } NAME = {0}\n");
     emit(e, "\n");
+    /* BUG-1270: each allocator starts its slots' generations at its OWN seed.
+     * With every Pool and Slab starting at 1, a Handle from pool A carried the
+     * generation pool B's slot also held, so `pb.get(h_from_pa)` passed the check
+     * and returned B's live object — through a parameter, a global or a Ring,
+     * where no static rule can follow the handle. The seed is derived from the
+     * allocator's own address (a Pool's gen array, a Slab's struct), so two live
+     * allocators differ and no call site changes. */
+    emit(e, "static inline uint32_t _zer_gen_seed(const void *owner) {\n");
+    emit(e, "    uint64_t a = (uint64_t)(uintptr_t)owner;\n");
+    emit(e, "    uint32_t x = (uint32_t)((a >> 3) ^ (a >> 35)) * 0x9E3779B9u;\n");
+    emit(e, "    x ^= x >> 16;\n");
+    emit(e, "    return x ? x : 1u;\n");
+    emit(e, "}\n\n");
     emit(e, "static inline uint64_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
             "uint32_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
@@ -7144,7 +7157,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * The asymmetry is why it survived: the FRESH-page path already callocs, so
      * only the REUSE path was affected. */
     emit(e, "            memset((char*)pool_ptr + (size_t)i * slot_size, 0, slot_size);\n");
-    emit(e, "            if (gen[i] == 0) gen[i] = 1; /* skip 0: reserved for null handle */\n");
+    emit(e, "            if (gen[i] == 0) gen[i] = _zer_gen_seed(gen); /* BUG-1270; never 0 */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -7434,7 +7447,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    uint32_t h_gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
-    emit(e, "        _zer_trap(\"use-after-free: handle generation mismatch\", __FILE__, __LINE__);\n");
+    emit(e, "        _zer_trap(\"use-after-free or wrong-pool handle: generation mismatch\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    return (char*)slots + idx * slot_size;\n");
     emit(e, "}\n\n");
@@ -7458,6 +7471,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * pool-clear). Documented in docs/limitations.md cross-function
      * wrong-pool gap as the natural follow-up. */
     emit(e, "    if (h_gen == 0) return;  /* null handle: no-op */\n");
+    /* BUG-1270: a handle this pool never issued (another pool's, or a stale one)
+     * used to free whatever live object sat in that slot. */
+    emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen)\n");
+    emit(e, "        _zer_trap(\"free of a handle this pool did not issue (wrong pool or already freed)\", __FILE__, __LINE__);\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");
     emit(e, "        gen[idx]++;\n");
@@ -7540,7 +7557,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * The asymmetry is why it survived: the FRESH-page path already callocs, so
      * only the REUSE path was affected. */
     emit(e, "            memset(s->pages[i / _ZER_SLAB_PAGE_SLOTS] + (i %% _ZER_SLAB_PAGE_SLOTS) * s->slot_size, 0, s->slot_size);\n");
-    emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
+    emit(e, "            if (s->gen[i] == 0) s->gen[i] = _zer_gen_seed(s); /* BUG-1270; never 0 */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -7564,7 +7581,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    s->page_count++;\n");
     emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    s->used[base] = 1;\n");
-    emit(e, "    if (s->gen[base] == 0) s->gen[base] = 1; /* zero handle must not match */\n");
+    emit(e, "    if (s->gen[base] == 0) s->gen[base] = _zer_gen_seed(s); /* BUG-1270; never 0 */\n");
     emit(e, "    *ok = 1;\n");
     emit(e, "    return ((uint64_t)s->gen[base] << 32) | base;\n");
     emit(e, "}\n\n");
@@ -7573,7 +7590,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    uint32_t gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != gen) {\n");
-    emit(e, "        _zer_trap(\"slab: use-after-free or invalid handle\", __FILE__, __LINE__);\n");
+    emit(e, "        _zer_trap(\"slab: use-after-free, wrong-slab or invalid handle\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    size_t page = idx / _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    size_t slot = idx %% _ZER_SLAB_PAGE_SLOTS;\n");
@@ -7586,6 +7603,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* SAFETY (silent-gap audit 2026-05-21): mirror _zer_pool_free's
      * null-handle no-op. See _zer_pool_free for rationale. */
     emit(e, "    if (h_gen == 0) return;  /* null handle: no-op */\n");
+    emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != h_gen)   /* BUG-1270 */\n");
+    emit(e, "        _zer_trap(\"free of a handle this slab did not issue (wrong slab or already freed)\", __FILE__, __LINE__);\n");
     emit(e, "    if (idx < s->total_slots) {\n");
     emit(e, "        s->used[idx] = 0;\n");
     emit(e, "        s->gen[idx]++;\n");
@@ -13026,7 +13045,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
                     "return early\", __FILE__, __LINE__);\n");
         else
-            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block, @once body, semaphore hold "
                     "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
         break;
 

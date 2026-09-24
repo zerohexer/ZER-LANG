@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: read-modify-written
+volatile u32 counter;
+volatile *u32 gp = &counter;
+interrupt TIM2 { *gp = *gp + 1; }
+u32 main() { return counter; }

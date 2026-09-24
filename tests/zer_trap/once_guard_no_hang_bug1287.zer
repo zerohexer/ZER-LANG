@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: cannot return without leaking it
+u32[4] arr;
+u32 idx = 0;
+void init() { @once { arr[idx] = 1; } }
+u32 main() {
+    idx = 9;
+    init();
+    idx = 0;
+    init();
+    return 0;
+}

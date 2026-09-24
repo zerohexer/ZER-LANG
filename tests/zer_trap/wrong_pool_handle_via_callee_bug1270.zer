@@ -1,0 +1,15 @@
+// expect-trap
+// expect-trap-msg: wrong-pool handle
+struct T { u32 v; }
+Pool(T, 4) pa;
+Pool(T, 4) pb;
+u32 rd(Handle(T) x) { return pb.get(x).v; }
+u32 main() {
+    Handle(T) h = pa.alloc() orelse return;
+    defer pa.free(h);
+    pa.get(h).v = 5;
+    Handle(T) g = pb.alloc() orelse return;
+    defer pb.free(g);
+    pb.get(g).v = 9;
+    return rd(h);
+}

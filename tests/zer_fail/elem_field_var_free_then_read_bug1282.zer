@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+struct T { u32 v; }
+struct S { *T p; }
+u32 f(u32 i) {
+    if (i >= 4) { return 0; }
+    S[4] larr;
+    *T a = alloc(T) orelse { return 1; };
+    a.v = 42;
+    larr[0].p = a;
+    free(larr[i].p);
+    u32 r = larr[0].p.v;
+    free(larr[0].p);
+    return r;
+}
+u32 main() { return f(0); }

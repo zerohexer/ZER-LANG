@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'g'
+u32 g;
+void w() { @once { g = 5; } }
+void start() { spawn w(); }
+u32 main() {
+    start();
+    return g;
+}

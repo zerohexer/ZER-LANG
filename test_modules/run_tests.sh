@@ -70,6 +70,21 @@ if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_deep_df (shoul
 $ZERC opaque_deep_uaf.zer -o /dev/null 2>/dev/null
 if [ $? -ne 0 ]; then PASS=$((PASS+1)); else echo "  FAIL: opaque_deep_uaf (should reject 3-layer UAF)"; FAIL=$((FAIL+1)); fi
 
+# BUG-1199/1200: negatives that must fail for THEIR reason (the diagnostic is read).
+expect_err() {
+    local out
+    out=$($ZERC $1.zer -o /dev/null 2>&1)
+    if [ $? -ne 0 ] && echo "$out" | grep -qF "$2"; then PASS=$((PASS+1));
+    else echo "  FAIL: $1 (expected error containing: $2)"; echo "$out" | grep error | head -2; FAIL=$((FAIL+1)); fi
+}
+expect_err m1199_spawn_negative "accesses non-shared global 'scnt'"
+expect_err m1199_isr_negative "global 'scnt' is accessed from both interrupt and main code"
+expect_err m1199_pool_negative "accesses non-shared global 'spool'"
+expect_err m1199_atomic_negative "plain access to 'sac' in a concurrent context"
+expect_err m1200_qual_negative "a qualified reference to the SECOND declaration"
+expect_err m1200_ambig_negative "'M1200Pt' is declared by more than one imported module"
+expect_err m1200_ambig_negative "'m1200_get' is declared by more than one imported module"
+
 # BUG-087: imported interrupt — compile-only (interrupt attr is ARM-specific)
 $ZERC use_hal.zer -o _use_hal.c 2>/dev/null
 if [ $? -eq 0 ] && grep -q "USART1_IRQHandler" _use_hal.c; then

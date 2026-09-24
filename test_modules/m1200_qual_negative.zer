@@ -1,0 +1,4 @@
+// BUG-1200: `m1200b.m1200_get()` was rewritten to the bare name and called m1200a's.
+import m1200a;
+import m1200b;
+u32 main() { if (m1200b.m1200_get() != 9) { return 1; } return 0; }

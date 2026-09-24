@@ -575,6 +575,10 @@ struct Node {
              * variables (the for-in `_zer_ri` / `_zer_rlen`). Only such a
              * reference may name a synthetic variable; user code may not. */
             bool is_synthetic;
+            /* BUG-1200: written by the checker when it rewrites a qualified
+             * `mod.name` to this ident — the module has been checked to own the
+             * Symbol the bare name resolves to, so it is not ambiguous. */
+            bool module_qualified;
         } ident;
 
         /* NODE_BINARY: left op right */

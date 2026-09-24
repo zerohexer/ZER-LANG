@@ -1,0 +1,3 @@
+u32 m1200_total = 9;
+u32 m1200_get() { return m1200_total; }
+struct M1200Pt { u8 x; }

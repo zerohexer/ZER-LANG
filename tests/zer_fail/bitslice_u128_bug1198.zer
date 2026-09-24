@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: bit-slices work on types up to 64 bits
+// BUG-1198: the bit-slice arithmetic is 64-bit; on a u128 a position >= 64 was C UB
+// (`((1ull<<4)-1) << 124`) and the read-back was wrong.
+u32 main() {
+    u128 w = 0;
+    w[127..124] = 0xF;
+    return 0;
+}

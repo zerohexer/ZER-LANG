@@ -363,6 +363,11 @@ typedef struct {
     struct IsrGlobal {
         const char *name;
         uint32_t name_len;
+        /* BUG-1199: the global this entry names, resolved WHERE it was touched.
+         * Names alone collide across modules (two modules' `cnt`) and a module
+         * static is not findable by name from main's context at all. NULL for a
+         * static local. */
+        Symbol *sym;
         bool from_isr;          /* accessed inside interrupt body */
         bool from_func;         /* accessed inside regular function */
         bool compound_in_isr;   /* compound assign (|=, +=) in ISR */

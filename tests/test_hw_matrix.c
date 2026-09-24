@@ -323,6 +323,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_CARRIER_READONLY, RFORM_GLOBAL_RETARGET, RFORM_LOCAL_RETARGET,
                RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
                RFORM_CARRIER_TWO_LIT, RFORM_CARRIER_TWO_ASSIGN,
+               RFORM_GLOBAL_CARRIER_LIT,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -376,6 +377,7 @@ static const char *rform_name(RForm f) {
     case RFORM_RETARGET_COPY_DEREF: return "r=gp copy *r+=1";
     case RFORM_CARRIER_TWO_LIT:     return "carrier {.p=&d,.q=&g}";
     case RFORM_CARRIER_TWO_ASSIGN:  return "carrier h.p=&d;h.q=&g";
+    case RFORM_GLOBAL_CARRIER_LIT:  return "global carrier {.p=&g}";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -470,6 +472,11 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_CARRIER_TWO_ASSIGN:  *helper = "volatile u32 d;\nstruct H2 { volatile *u32 p; volatile *u32 q; }\n"
                                               "void bump2(H2 h){ *h.p += 1; }";
                                                                                  *body = "H2 h; h.p = &g; h.q = &d; bump2(h);"; break;
+    /* BUG-1201: a GLOBAL carrier whose pointer comes from its struct-literal
+     * initializer. The write-target walk followed `&x`, a pointer name, a slice and
+     * `orelse` as an assigned value, never a struct literal. */
+    case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
+                                                                                 *body = "*gh.p += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
     }
 }

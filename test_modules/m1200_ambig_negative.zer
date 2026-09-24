@@ -1,0 +1,4 @@
+// BUG-1200: an unqualified name two imports declare silently took the first.
+import m1200a;
+import m1200b;
+u32 main() { M1200Pt p; p.x = 300; return m1200_get() + p.x; }

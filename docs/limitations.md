@@ -134,6 +134,46 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
+## OPEN — a qualified reference to the SECOND module's declaration of a shared name (2026-09-24, LOW — over-rejection; was a silent miscompile before BUG-1200)
+
+Two imported modules c and d both declare `get`. `c.get()` (c registered first) works;
+`d.get()` is REFUSED ("a qualified reference to the SECOND declaration of a shared name is not
+supported yet"), and so is the bare `get()` from code that owns neither. Before BUG-1200 both
+compiled and silently reached c's (`d.shared_name = 50` wrote c's global).
+
+Why it is refused rather than resolved: the qualified form is rewritten to the bare ident,
+and every later stage answers "which symbol is this?" BY NAME — the checker's ~130
+`global_decl_lookup` sites, the VRP range keys, zercheck_ir's global keys `(-2, "name")`,
+BUG-1181's `freed_global[]` summaries, and the emitter. Resolving `d.get` correctly in the
+checker alone would give d's global TWO keys (`get` inside d, something else in main), so one
+object's facts would split across them — a range proven on one read and an index through the
+other, a free recorded under one and a use under the other. That is unsound, so the honest
+answer until the naming is unified is the refusal.
+
+Fix sketch: give every top-level declaration ONE canonical key — the module-mangled name
+(`d__get`) — at the ident level (a `module` field on NODE_IDENT written by the qualified
+rewrite AND by lookup inside the owning module), and key every by-name table (VRP, zercheck_ir
+globals, freed_global, the ISR / atomic-cell / race tables) on it. Then the refusal is removed
+and `d.get()` resolves. Tests to flip: `test_modules/m1200_qual_negative.zer`.
+
+Also over-rejected by the same rule: main imports only `out1`, `out1` imports `in1`, both
+declare `nm`; main's bare `nm` is refused as ambiguous although main never imported `in1`
+(declarations are program-global today, so which one main "sees" is exactly the question the
+rule refuses to guess).
+
+---
+
+## OPEN — atomic-cell diagnostics for an imported module's global name the wrong file (2026-09-24, LOW — diagnostic only)
+
+`check_atomic_cell_safety` runs after every body is checked and reports at the recorded LINE
+of the plain access under the CURRENT file name (main's). A plain access inside module m is
+therefore printed as `main.zer:<m's line>` (measured: `test_modules/m1199_atomic_negative.zer`
+reports line 10, which is in `m1199st.zer`). The verdict is right. Fix: record the file with
+the line (`AtomicFieldEntry.plain_line` and the scalar twin) and switch `c->file_name` around
+the report, as `check_interrupt_safety` now does (BUG-1199).
+
+---
+
 ## OPEN — precision residuals of BUG-1177..1186 (2026-09-24, LOW — over-rejection; each is the conservative side of a new rule)
 
 1. **An async task cannot be copied even BEFORE its first poll** (BUG-1177). A never-polled task
@@ -313,7 +353,9 @@ ONE rule (the current module's mangled key exists -> this module's; else the raw
 also fixed module d reading module c's global (`d__x` undeclared). Tests:
 `test_modules/twin1120.zer`, `test_modules/xref1120.zer`. Residual: post passes run with
 `current_module == NULL`, so a whole-program pass that resolves a colliding name by string gets
-the first-registered module's.
+the first-registered module's. (BUG-1199, 2026-09-24: the scans now ENTER the callee's module
+when they descend into its body — `decl_module_enter` — and the ISR table keys on the resolved
+Symbol; the qualified-reference half is the OPEN entry above.)
 
 ---
 

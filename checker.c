@@ -851,6 +851,26 @@ static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t len) {
     return scope_lookup_local(c->global_scope, name, len);
 }
 
+/* BUG-1199: an analysis that DESCENDS into another function's body (the spawn
+ * race scan, the ISR walk, the callee-globals walk, the shared-type collector)
+ * must resolve that body's names in the body's OWN module. `global_decl_lookup`
+ * answers relative to `c->current_module`, and every scan runs from the caller's
+ * context — so walking module m's `bump()` from main looked `cnt` up as MAIN
+ * would: a module `static` (registered only in m's scope) resolved to nothing and
+ * a name m shares with another module resolved to the other module's. Measured:
+ * two threads doing `scnt += 1` on an imported static compiled clean and lost
+ * updates; a Pool touched from a spawn and an ISR the same. Enter the callee's
+ * module for the descent and restore after. */
+typedef struct { const char *mod; uint32_t len; } DeclModuleSave;
+static DeclModuleSave decl_module_enter(Checker *c, Symbol *fs) {
+    DeclModuleSave sv = { c->current_module, c->current_module_len };
+    if (fs) { c->current_module = fs->module_prefix; c->current_module_len = fs->module_prefix_len; }
+    return sv;
+}
+static void decl_module_leave(Checker *c, DeclModuleSave sv) {
+    c->current_module = sv.mod; c->current_module_len = sv.len;
+}
+
 static Symbol *add_symbol_impl(Checker *c, const char *name, uint32_t name_len,
                                Type *type, int line, bool enforce_reserved) {
     /* BUG-276: warn on _zer_ prefixed names — reserved for compiler internals */
@@ -875,6 +895,7 @@ static Symbol *add_symbol_impl(Checker *c, const char *name, uint32_t name_len,
             if (existing_mod != c->current_module) {
                 /* cross-module type collision — allowed, per-module scope resolves it.
                  * First registration wins in global scope; module scope overrides. */
+                existing->cross_module_dup = true;   /* BUG-1200 */
                 return existing;
             }
         }
@@ -897,6 +918,65 @@ static Symbol *add_symbol_synth(Checker *c, const char *name, uint32_t name_len,
     Symbol *s = add_symbol_impl(c, name, name_len, type, line, false);
     if (s) s->is_synthetic_var = true;   /* BUG-1099 */
     return s;
+}
+
+/* BUG-1200: does this lookup result stand for TWO imported modules' declarations?
+ * Two modules may each declare a top-level `get` / `total` / `Pt`; the raw
+ * global-scope entry is whichever registered first, and each module's own body
+ * sees its own through the module scope. Code that owns NEITHER (main, or a third
+ * module) reached the first registration by lookup order alone — measured: main
+ * calling `get()` with c and d both defining it silently called c's, and
+ * `Pt p; p.x = 300;` silently used c's layout. Reaching the flagged raw entry from
+ * a module that does not own it is an ambiguity, not a choice to make silently. */
+static const char *symbol_owner_module(Symbol *s, uint32_t *len) {
+    /* functions and globals carry their module; a TYPE name's Symbol does not,
+     * its Type does */
+    if (s->module_prefix) { *len = s->module_prefix_len; return s->module_prefix; }
+    Type *t = s->type ? type_unwrap_distinct(s->type) : NULL;
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_STRUCT) { *len = t->struct_type.module_prefix_len; return t->struct_type.module_prefix; }
+    if (k == TYPE_ENUM)   { *len = t->enum_type.module_prefix_len;   return t->enum_type.module_prefix; }
+    if (k == TYPE_UNION)  { *len = t->union_type.module_prefix_len;  return t->union_type.module_prefix; }
+    *len = 0;
+    return NULL;
+}
+/* BUG-1200: a qualified `mod.name` is rewritten to the bare `name`, and every
+ * later stage (the checker's own lookups, the emitter) resolves the bare name.
+ * That is only right when the bare name resolves, from here, to MOD's
+ * declaration. When another module's same-named declaration is what the bare
+ * name reaches, the rewrite silently retargets the reference — measured:
+ * `d.get()` called c's get(), `d.shared_name = 50` wrote c's. */
+static bool qualified_rewrite_retargets(Checker *c, const char *mod, uint32_t mod_len,
+                                        const char *name, uint32_t name_len) {
+    Symbol *bare = scope_lookup(c->current_scope, name, name_len);
+    if (!bare) return false;
+    uint32_t ol = 0;
+    const char *om = symbol_owner_module(bare, &ol);
+    return !(om && ol == mod_len && memcmp(om, mod, mod_len) == 0);
+}
+static void report_qualified_retarget(Checker *c, const char *mod, uint32_t mod_len,
+                                      const char *name, uint32_t name_len, int line) {
+    checker_error(c, line,
+        "'%.*s.%.*s': another imported module also declares '%.*s', and a qualified "
+        "reference to the SECOND declaration of a shared name is not supported yet "
+        "(it would silently reach the first). Rename one of them",
+        (int)mod_len, mod, (int)name_len, name, (int)name_len, name);
+}
+static bool symbol_is_import_ambiguous(Checker *c, Symbol *s) {
+    if (!s || !s->cross_module_dup) return false;
+    if (scope_lookup_local(c->global_scope, s->name, s->name_len) != s) return false;
+    uint32_t ol = 0;
+    const char *om = symbol_owner_module(s, &ol);
+    if (om && c->current_module && ol == c->current_module_len &&
+        memcmp(om, c->current_module, ol) == 0) return false;
+    return true;
+}
+static void report_import_ambiguous(Checker *c, Symbol *s, int line) {
+    checker_error(c, line,
+        "'%.*s' is declared by more than one imported module — this reference "
+        "does not say which, and silently taking the first-registered one is how "
+        "a call reached the wrong module. Rename one of the declarations",
+        (int)s->name_len, s->name);
 }
 
 static Symbol *find_symbol(Checker *c, const char *name, uint32_t name_len, int line) {
@@ -1044,6 +1124,7 @@ static bool vrp_intrinsic_may_store(Checker *c, Node *n);                /* BUG-
 static bool vrp_intrinsic_is_value_only(Node *n);                      /* BUG-1094 */
 static Node *vrp_stmt_guard_root(Node *stmt);                          /* BUG-1098 */
 static bool vrp_guard_hoist_sound(Checker *c, Node *idx);               /* BUG-1098 */
+static bool mmio_index_reevaluable(Checker *c, Node *e);             /* BUG-1194 */
 static int64_t vrp_const_value(Checker *c, Node *n, Type *dest);         /* BUG-1090 */
 static int64_t vrp_const_value_untyped_render(Checker *c, Node *n, Type *dest); /* BUG-1090 */
 static int64_t vrp_loop_bound_value(Checker *c, Node *n);              /* BUG-1099 */
@@ -1055,6 +1136,21 @@ static void mark_proven(Checker *c, Node *node);
 static void mark_auto_guard(Checker *c, Node *node, uint64_t array_size);
 static bool body_always_exits(Node *body);
 static bool loop_seq_reaches_limit(int64_t lo, int64_t step, int64_t last, uint64_t limit);
+/* BUG-992 / BUG-1202: ONE certainty test for "this index is the counter of the
+ * enclosing counted loop, the access runs on every iteration, and the counter
+ * provably takes a value >= limit". The fixed-array bound and the mmio-window
+ * bound both ask it; `idx_node` is the NODE_INDEX. */
+static bool cert_loop_index_reaches(Checker *c, Node *idx_node, uint64_t limit) {
+    Node *ix = idx_node ? idx_node->index_expr.index : NULL;
+    return ix && ix->kind == NODE_IDENT && c->cert_loop_step > 0 &&
+           c->shortcircuit_rhs_depth == 0 &&
+           c->branch_depth == c->cert_loop_depth &&
+           c->cert_loop_name &&
+           (uint32_t)ix->ident.name_len == c->cert_loop_name_len &&
+           memcmp(ix->ident.name, c->cert_loop_name, c->cert_loop_name_len) == 0 &&
+           loop_seq_reaches_limit(c->cert_loop_lo, c->cert_loop_step,
+                                  c->cert_loop_last, limit);
+}
 static bool orelse_block_diverges(Node *n); /* #21 */
 static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len);
 static Type *find_return_provenance(Checker *c, Node *node);
@@ -5338,6 +5434,14 @@ static bool write_target_reassign_visit(Node *value, int kind, void *ud) {
         write_target_reassign_visit(v->orelse.expr, ANW_ASSIGN, ud);
         write_target_reassign_visit(v->orelse.fallback, ANW_ASSIGN, ud);
     }
+    /* BUG-1201: a struct LITERAL carrying a pointer aims that carrier wherever
+     * its pointer fields point — `H h = { .p = &g };` then `*h.p = 1` in an ISR
+     * writes g. Every field value counts (over-approximate: which field the
+     * access went through is not asked), nested literals included. */
+    else if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            write_target_reassign_visit(v->struct_init.fields[i].value, ANW_ASSIGN, ud);
+    }
     return false;           /* keep walking: every write contributes */
 }
 
@@ -7206,6 +7310,8 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
     case TYNODE_NAMED: {
         /* look up type name in scope (struct, enum, union, typedef) */
         Symbol *sym = scope_lookup(c->current_scope, tn->named.name, (uint32_t)tn->named.name_len);
+        if (symbol_is_import_ambiguous(c, sym))
+            report_import_ambiguous(c, sym, tn->loc.line);   /* BUG-1200 */
         if (!sym) {
             /* Path C: arbitrary-width integer u<N>/i<N> (e.g. u21, i48). */
             uint32_t _nb; bool _sgn;
@@ -9233,6 +9339,8 @@ static Type *check_expr(Checker *c, Node *node) {
     case NODE_IDENT: {
         Symbol *sym = find_symbol(c, node->ident.name, (uint32_t)node->ident.name_len,
                                   node->loc.line);
+        if (!node->ident.module_qualified && symbol_is_import_ambiguous(c, sym))
+            report_import_ambiguous(c, sym, node->loc.line);   /* BUG-1200 */
         result = sym ? sym->type : ty_void;
         /* BUG-1099: the for-in desugaring's own variables are reserved — the
          * `_zer_` prefix already stops a user DECLARING one, and nothing stopped a
@@ -9923,6 +10031,20 @@ static Type *check_expr(Checker *c, Node *node) {
             value_forms_variant_ref(c, node->assign.value, 0))          /* BUG-1186 */
             report_variant_ref_store(c, node->loc.line, "store");
 
+        /* BUG-1198: a bit-slice write into a PACKED field is emitted without a
+         * pointer hoist (the field's address would be misaligned), so its lvalue
+         * path is evaluated twice — refuse a path with a side effect. */
+        if (node->assign.target->kind == NODE_SLICE && node->assign.target->slice.object) {
+            Node *bso = node->assign.target->slice.object;
+            bool bs_packed = false;
+            if (bso->kind == NODE_FIELD || bso->kind == NODE_INDEX)
+                packed_path_aggregate(c, bso, &bs_packed, 0);
+            if (bs_packed && union_path_has_side_effect(bso, 0))
+                checker_error(c, node->loc.line,
+                    "cannot write bits of a packed field through a path with a side "
+                    "effect — the field has no aligned address to hoist, so the path "
+                    "would be evaluated twice. Take the struct into a local first");
+        }
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
          * For a scalar-integer object (bit extraction, not array sub-slicing)
@@ -11765,8 +11887,11 @@ static Type *check_expr(Checker *c, Node *node) {
             Symbol *cs = global_decl_lookup(c, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
+                DeclModuleSave dm = decl_module_enter(c, cs);   /* BUG-1199 */
                 record_atomic_plain_in_callee(c, cs->func_node->func_decl.body, 0);
+                decl_module_leave(c, dm);
+            }
         }
 
         /* 8th funcptr REACH form (2026-08-10): a CALLER-supplied funcptr FORWARDED
@@ -11792,8 +11917,11 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (!func_forwards_param_to_spawn(c, tgt, ai, 0)) continue;
                     const char *fbad = NULL; uint32_t fblen = 0;
                     rmw_alias_reset();
-                    if (scan_unsafe_global_access(c, fsym->func_node->func_decl.body,
-                                                  &fbad, &fblen)) {
+                    DeclModuleSave dm = decl_module_enter(c, fsym);   /* BUG-1199 */
+                    bool fhit = scan_unsafe_global_access(c, fsym->func_node->func_decl.body,
+                                                          &fbad, &fblen);
+                    decl_module_leave(c, dm);
+                    if (fhit) {
                         ensure_func_props(c, fsym);
                         if (fsym->props.has_sync) {
                             checker_warning(c, node->loc.line,
@@ -12099,6 +12227,16 @@ static Type *check_expr(Checker *c, Node *node) {
                     memcpy(mangled + maybe_mod_len + 2, func_name, func_len);
                     mangled[mang_len] = '\0';
                     Symbol *mod_func = global_decl_lookup(c, mangled, mang_len);
+                    if (mod_func && mod_func->is_function &&
+                        qualified_rewrite_retargets(c, maybe_mod, maybe_mod_len,
+                                                    func_name, func_len)) {
+                        report_qualified_retarget(c, maybe_mod, maybe_mod_len,
+                            func_name, func_len, node->loc.line);   /* BUG-1200 */
+                        Type *mft = type_unwrap_distinct(mod_func->type);
+                        result = (type_dispatch_kind(mft) == TYPE_FUNC_PTR && mft->func_ptr.ret)
+                                 ? mft->func_ptr.ret : ty_void;
+                        break;
+                    }
                     if (mod_func && mod_func->is_function) {
                         /* rewrite callee to raw function name — the existing
                          * unqualified resolution finds it in global scope */
@@ -12106,6 +12244,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->call.callee->ident.name = func_name;
                         node->call.callee->ident.name_len = func_len;
                         node->call.callee->ident.is_synthetic = false;
+                        node->call.callee->ident.module_qualified = true;   /* BUG-1200 */
                         goto normal_call;
                     }
                 }
@@ -13413,6 +13552,13 @@ static Type *check_expr(Checker *c, Node *node) {
                     memcpy(mangled + maybe_mod_len + 2, fname, flen);
                     mangled[mang_len] = '\0';
                     Symbol *gsym = global_decl_lookup(c, mangled, mang_len);
+                    if (gsym && gsym->type &&
+                        qualified_rewrite_retargets(c, maybe_mod, maybe_mod_len, fname, flen)) {
+                        report_qualified_retarget(c, maybe_mod, maybe_mod_len,
+                                                  fname, flen, node->loc.line);   /* BUG-1200 */
+                        result = gsym->type;
+                        break;
+                    }
                     if (gsym && gsym->type) {
                         /* rewrite to NODE_IDENT with the raw field name.
                          * The emitter resolves via mangled lookup in global scope.
@@ -13421,6 +13567,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         node->ident.name = fname;
                         node->ident.name_len = flen;
                         node->ident.is_synthetic = false;
+                        node->ident.module_qualified = true;   /* BUG-1200 */
                         typemap_set(c, node, gsym->type);
                         result = gsym->type;
                         break;
@@ -13856,15 +14003,8 @@ static Type *check_expr(Checker *c, Node *node) {
                  * (an access nested in an `if` may be unreachable for the
                  * offending values) and, like IDX_ALWAYS_OOB, not to be in
                  * short-circuit RHS position. */
-                if (!checker_is_proven(c, node) && c->cert_loop_step > 0 &&
-                    c->shortcircuit_rhs_depth == 0 &&
-                    c->branch_depth == c->cert_loop_depth &&
-                    c->cert_loop_name &&
-                    (uint32_t)node->index_expr.index->ident.name_len == c->cert_loop_name_len &&
-                    memcmp(node->index_expr.index->ident.name, c->cert_loop_name,
-                           c->cert_loop_name_len) == 0 &&
-                    loop_seq_reaches_limit(c->cert_loop_lo, c->cert_loop_step,
-                                           c->cert_loop_last, obj->array.size)) {
+                if (!checker_is_proven(c, node) &&
+                    cert_loop_index_reaches(c, node, obj->array.size)) {
                     checker_error(c, node->loc.line,
                         "loop counter '%.*s' runs %lld..%lld, so this indexes past the "
                         "end of an array of size %llu — the loop provably performs an "
@@ -14110,6 +14250,41 @@ static Type *check_expr(Checker *c, Node *node) {
                         result = obj->pointer.inner;
                         break;
                     }
+                    /* BUG-1194: the non-identifier sibling of the two rules above. */
+                    if (node->index_expr.index->kind != NODE_IDENT &&
+                        !mmio_index_reevaluable(c, node->index_expr.index)) {
+                        checker_error(c, node->loc.line,
+                            "MMIO index expression would be evaluated twice — once by "
+                            "the range guard, once by the access — and it has a side "
+                            "effect or reads memory that can change in between, so the "
+                            "guard could approve a different value than the one used. "
+                            "Compute the index into a local in its own statement");
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;
+                        break;
+                    }
+                    /* BUG-1202: the BUG-992 verdict for an MMIO bound. `for (i <
+                     * 8) r[i] = x;` over a 4-register window got a warning and an
+                     * auto-guard — whose silent early return skipped the rest of
+                     * the function (measured: `done = 1` after the loop never ran,
+                     * and main returned 0). The loop provably writes past the
+                     * declared window; say so. */
+                    if (cert_loop_index_reaches(c, node, mmio_bound)) {
+                        checker_error(c, node->loc.line,
+                            "loop counter '%.*s' runs %lld..%lld, so this indexes past "
+                            "the declared mmio window (%llu elements) — the loop "
+                            "provably accesses outside it. Fix the loop bound (use %llu)",
+                            (int)node->index_expr.index->ident.name_len,
+                            node->index_expr.index->ident.name,
+                            (long long)c->cert_loop_lo, (long long)c->cert_loop_last,
+                            (unsigned long long)mmio_bound,
+                            (unsigned long long)mmio_bound);
+                        ptr_proven = true;
+                        mark_proven(c, node);
+                        result = obj->pointer.inner;
+                        break;
+                    }
                     /* variable index — auto-guard using mmio_bound as array size */
                     mark_auto_guard(c, node, mmio_bound);
                     checker_warning(c, node->loc.line,
@@ -14272,6 +14447,28 @@ static Type *check_expr(Checker *c, Node *node) {
             result = type_slice(c->arena, obj->array.inner);
         } else if (obj->kind == TYPE_SLICE) {
             result = obj; /* slice of slice = same slice type */
+        } else if (type_is_integer(obj) && type_dispatch_kind(obj) == TYPE_ENUM) {
+            /* BUG-1196: `type_is_integer` answers TRUE for an enum (it is
+             * integer-backed), so `e[2..1] = f;` WROTE bits into an enum (e became
+             * 5, not a variant) and `Mode x = e[1..0];` READ bits back out as an
+             * enum — a fifth forging door beside the guarded three, and the switch
+             * on the result took its last arm. Bits of an enum are not a value of
+             * any type the language checks; convert to the carrier first. */
+            checker_error(c, node->loc.line,
+                "cannot take bits of enum '%s' — the result is not a variant check "
+                "the language can make. Convert first: '(u32)e' / '@bitcast(u32, e)', "
+                "and back with '@try_enum'", type_name(obj));
+            result = ty_u32;
+        } else if (type_is_integer(obj) && type_width(obj) > 64) {
+            /* BUG-1198: the bit-slice arithmetic is 64-bit; on a u128 / i128 / uN
+             * wider than 64 a position >= 64 was C UB (`(1ull<<4)-1) << 124`) or a
+             * silent no-op, and a read was cut to 64 bits. Refused rather than
+             * miscompiled. */
+            checker_error(c, node->loc.line,
+                "bit-slices work on types up to 64 bits; '%s' is %d bits — shift and "
+                "mask it explicitly, or split it into two u64 halves",
+                type_name(obj), type_width(obj));
+            result = obj;
         } else if (type_is_integer(obj)) {
             /* bit extraction: reg[high..low] → integer result */
             /* validate constant indices are within type width.
@@ -15597,6 +15794,27 @@ static Type *check_expr(Checker *c, Node *node) {
                         uint64_t addr = (uint64_t)cval;
                         node->intrinsic.addr_is_const = true;   /* BUG-1058 */
                         node->intrinsic.const_addr = addr;
+                        /* BUG-1195: a CONSTANT address designates a peripheral, so the
+                         * RESULT is a volatile pointer — the qualifier lives on the
+                         * value, where every value-flow sink's "cannot strip volatile"
+                         * rule already looks. BUG-799 checked the destination at two
+                         * sinks only: `r = @inttoptr(...)`, a global initializer, a
+                         * return, a call argument, and the direct use
+                         * `@inttoptr(*R, A).dr = 0x41` all bound it non-volatile, and
+                         * GCC -O2 deleted the first of two writes and turned a poll
+                         * loop into `jmp .` (measured). A FRESH type: the resolved
+                         * type_arg may be cached and shared. */
+                        {
+                            Type *rp = result ? type_unwrap_distinct(result) : NULL;
+                            if (rp && rp == result &&
+                                type_dispatch_kind(rp) == TYPE_POINTER &&
+                                !rp->pointer.is_volatile) {
+                                Type *vp = type_pointer(c->arena, rp->pointer.inner);
+                                vp->pointer.is_const = rp->pointer.is_const;
+                                vp->pointer.is_volatile = true;
+                                result = vp;
+                            }
+                        }
                         /* BUG-1058: a constant address the target pointer cannot
                          * hold is a DIFFERENT address after the cast — `-m32`
                          * turned 0x1_0000_0010 into 0x10 while this gate had
@@ -16590,6 +16808,24 @@ static Type *check_expr(Checker *c, Node *node) {
                         track_atomic_field(c, ps, pp, pl, true, node->loc.line);
                 }
             }
+            /* BUG-1197: an atomic on an ENUM or BOOL cell is a forging door — an
+             * arithmetic atomic (`@atomic_add(&state, 5)`) or a raw store / xchg /
+             * cas writes a value the type does not have, and the exhaustive switch
+             * that reads it takes its last arm (measured). Only the atomic LOAD is
+             * a read. Use an integer cell and convert with @try_enum / @bitcast. */
+            if (!is_load && node->intrinsic.arg_count > 0) {
+                Type *at0 = typemap_get(c, node->intrinsic.args[0]);
+                Type *ae0 = at0 ? type_unwrap_distinct(at0) : NULL;
+                Type *pe0 = (ae0 && type_dispatch_kind(ae0) == TYPE_POINTER)
+                    ? type_unwrap_distinct(ae0->pointer.inner) : NULL;
+                TypeKind pk0 = pe0 ? type_dispatch_kind(pe0) : TYPE_VOID;
+                if (pk0 == TYPE_ENUM || pk0 == TYPE_BOOL)
+                    checker_error(c, node->loc.line,
+                        "@%.*s on a '%s' cell can store a value that is not one of its "
+                        "values — atomics other than @atomic_load need an integer cell; "
+                        "keep the state in a u32 and convert with @try_enum",
+                        (int)nlen, name, type_name(pe0));
+            }
             if (is_load) {
                 /* @atomic_load(&var) → T */
                 if (node->intrinsic.arg_count != 1)
@@ -16622,7 +16858,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
                         int aw = type_width(at->pointer.inner);
                         int aw_bytes = aw / 8;
-                        if (zer_atomic_width_valid(aw_bytes) == 0) {
+                        /* BUG-1197: EXACTLY 8/16/32/64 bits — `aw / 8` let u9, u12, u21
+                         * and u33 through (and an RMW left a u21 at 0x200000). */
+                        if (aw % 8 != 0 || zer_atomic_width_valid(aw_bytes) == 0) {
                             checker_error(c, node->loc.line,
                                 "@atomic_store target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
                         } else if (aw == 64 && c->target_ptr_bits < 64) {
@@ -16643,7 +16881,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     if (at && at->kind == TYPE_POINTER && type_is_integer(at->pointer.inner)) {
                         int aw = type_width(at->pointer.inner);
                         int aw_bytes = aw / 8;
-                        if (zer_atomic_width_valid(aw_bytes) == 0) {
+                        /* BUG-1197: EXACTLY 8/16/32/64 bits — `aw / 8` let u9, u12, u21
+                         * and u33 through (and an RMW left a u21 at 0x200000). */
+                        if (aw % 8 != 0 || zer_atomic_width_valid(aw_bytes) == 0) {
                             checker_error(c, node->loc.line,
                                 "@atomic_cas target must be 1, 2, 4, or 8 bytes (got %d-bit type)", aw);
                         } else if (aw == 64 && c->target_ptr_bits < 64) {
@@ -16668,7 +16908,9 @@ static Type *check_expr(Checker *c, Node *node) {
                          * Oracle: typing.v Section E (E01). */
                         int aw = type_width(at->pointer.inner);
                         int aw_bytes = aw / 8;
-                        if (zer_atomic_width_valid(aw_bytes) == 0) {
+                        /* BUG-1197: EXACTLY 8/16/32/64 bits — `aw / 8` let u9, u12, u21
+                         * and u33 through (and an RMW left a u21 at 0x200000). */
+                        if (aw % 8 != 0 || zer_atomic_width_valid(aw_bytes) == 0) {
                             checker_error(c, node->loc.line,
                                 "@%.*s target must be 1, 2, 4, or 8 bytes (got %d-bit type)",
                                 (int)nlen, name, aw);
@@ -17605,7 +17847,11 @@ static void ensure_func_props(Checker *c, Symbol *sym) {
         body = sym->func_node->interrupt.body;
 
     if (body) {
-        scan_func_props(c, body, sym);
+        {
+            DeclModuleSave dm = decl_module_enter(c, sym);   /* BUG-1199 */
+            scan_func_props(c, body, sym);
+            decl_module_leave(c, dm);
+        }
     }
 
     sym->props.in_progress = false;
@@ -17914,8 +18160,10 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         _scan_global_depth++;
         RmwScanCtx k; rmw_ctx_save(&k);   /* BUG-998: the caller's aliases survive */
         rmw_alias_reset();
+        DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
         bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                                out_name, out_len);
+        decl_module_leave(c, dm);
         if (!found) rmw_ctx_restore(&k);
         _scan_global_depth--;
         return found;
@@ -18004,8 +18252,10 @@ static bool scan_funcname_binding(Checker *c, Node *n,
             gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body &&
             _scan_global_depth < 32) {
             _scan_global_depth++;
+            DeclModuleSave dm = decl_module_enter(c, gs);   /* BUG-1199 */
             bool f = scan_returned_funcname(c, gs->func_node->func_decl.body, 0,
                                             out_name, out_len);
+            decl_module_leave(c, dm);
             _scan_global_depth--;
             if (f) return true;
         }
@@ -18024,8 +18274,10 @@ static bool scan_funcname_binding(Checker *c, Node *n,
     _scan_global_depth++;
     RmwScanCtx k; rmw_ctx_save(&k);   /* BUG-998: the caller's aliases survive */
     rmw_alias_reset();
+    DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
     bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
                                            out_name, out_len);
+    decl_module_leave(c, dm);
     if (!found) rmw_ctx_restore(&k);
     _scan_global_depth--;
     return found;
@@ -18086,8 +18338,12 @@ static bool body_calls_funcptr_field(Checker *c, Node *n, int depth) {
             Symbol *fs = global_decl_lookup(c, n->call.callee->ident.name,
                                       (uint32_t)n->call.callee->ident.name_len);
             if (fs && fs->is_function && fs->func_node &&
-                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
-                return body_calls_funcptr_field(c, fs->func_node->func_decl.body, depth + 1);
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
+                DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
+                bool r = body_calls_funcptr_field(c, fs->func_node->func_decl.body, depth + 1);
+                decl_module_leave(c, dm);
+                return r;
+            }
         }
         return false;
     }
@@ -18185,9 +18441,13 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
             Symbol *fs = global_decl_lookup(c, n->call.callee->ident.name,
                                       (uint32_t)n->call.callee->ident.name_len);
             if (fs && fs->is_function && fs->func_node &&
-                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
-                return scan_funcptr_field_bindings(c, fs->func_node->func_decl.body,
-                                                   depth + 1, out_name, out_len, out_fn);
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
+                DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
+                bool r = scan_funcptr_field_bindings(c, fs->func_node->func_decl.body,
+                                                     depth + 1, out_name, out_len, out_fn);
+                decl_module_leave(c, dm);
+                return r;
+            }
         }
         return false;
     }
@@ -18466,8 +18726,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                             rmw_arg_targets(c, node->call.args[_ai],
                                             rmw_bind_param_visit, &_bu);   /* BUG-1124 */
                         }
+                        DeclModuleSave dm = decl_module_enter(c, csym);   /* BUG-1199 */
                         bool found = scan_unsafe_global_access(c,
                             csym->func_node->func_decl.body, out_name, out_len);
+                        decl_module_leave(c, dm);
                         _rmw_alias_count = _saved_alias;
                         _scan_global_depth--;
                         if (found) return true;
@@ -18514,8 +18776,10 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                     !asym->func_node->func_decl.body) continue;
                 if (_scan_global_depth < 32) {
                     _scan_global_depth++;
+                    DeclModuleSave dm = decl_module_enter(c, asym);   /* BUG-1199 */
                     bool found = scan_unsafe_global_access(c,
                         asym->func_node->func_decl.body, out_name, out_len);
+                    decl_module_leave(c, dm);
                     _scan_global_depth--;
                     if (found) return true;
                 }
@@ -24016,8 +24280,11 @@ static void check_stmt(Checker *c, Node *node) {
             func_sym->func_node->func_decl.body) {
             const char *bad_name = NULL;
             uint32_t bad_len = 0;
-            if (scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
-                                           &bad_name, &bad_len)) {
+            DeclModuleSave dm = decl_module_enter(c, func_sym);   /* BUG-1199 */
+            bool spawn_hit = scan_unsafe_global_access(c, func_sym->func_node->func_decl.body,
+                                                       &bad_name, &bad_len);
+            decl_module_leave(c, dm);
+            if (spawn_hit) {
                 /* If function uses @atomic_* or @barrier — developer is doing manual
                  * synchronization (lock-free pattern). Warn, don't error.
                  * If NO synchronization at all — definitely unsafe, error. */
@@ -24122,8 +24389,11 @@ static void check_stmt(Checker *c, Node *node) {
                 !asym->func_node->func_decl.body) continue;
             const char *abad = NULL;
             uint32_t ablen = 0;
-            if (scan_unsafe_global_access(c, asym->func_node->func_decl.body,
-                                          &abad, &ablen)) {
+            DeclModuleSave adm = decl_module_enter(c, asym);   /* BUG-1199 */
+            bool arg_hit = scan_unsafe_global_access(c, asym->func_node->func_decl.body,
+                                                     &abad, &ablen);
+            decl_module_leave(c, adm);
+            if (arg_hit) {
                 ensure_func_props(c, asym);
                 if (asym->props.has_sync) {
                     checker_warning(c, node->loc.line,
@@ -25896,6 +26166,46 @@ static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t na
 /* Push a new range entry. If an existing range exists for this var,
  * intersect (narrow) rather than replace — ensures ranges only tighten.
  * For unsigned types, min is clamped to 0 (can't be negative). */
+/* BUG-1194: may the MMIO auto-guard RE-EVALUATE this index? The guard is hoisted
+ * to the start of the statement and a pointer index has no single-read inline
+ * form, so the index is evaluated TWICE — once in the guard, once in the access.
+ * Measured: `r[f()] = 0xDEAD;` with f() returning 3 then 4 checked 3 and wrote
+ * index 4, past the declared mmio range; `r[vs.k]` (a volatile field) the same
+ * way. BUG-1011/1098 covered a bare identifier only. Answer YES only for what is
+ * a pure, stable read: literals, non-volatile identifiers the statement cannot
+ * change (vrp_guard_hoist_sound), and arithmetic over those. */
+static bool vrp_guard_hoist_sound(Checker *c, Node *idx);
+static bool mmio_index_reevaluable(Checker *c, Node *e) {
+    if (!e) return true;
+    switch (e->kind) {
+    case NODE_INT_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_SIZEOF:
+        return true;
+    case NODE_IDENT:
+        return !vrp_key_root_is_volatile(c, e->ident.name, (uint32_t)e->ident.name_len) &&
+               vrp_guard_hoist_sound(c, e);
+    case NODE_BINARY: return mmio_index_reevaluable(c, e->binary.left) &&
+                             mmio_index_reevaluable(c, e->binary.right);
+    case NODE_UNARY:  return e->unary.op != TOK_STAR &&
+                             mmio_index_reevaluable(c, e->unary.operand);
+    case NODE_TYPECAST: return mmio_index_reevaluable(c, e->typecast.expr);
+    /* Everything else may have an effect, read volatile memory, or change
+     * between the two evaluations: refuse. */
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_NULL_LIT: case NODE_CAST:
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
 /* BUG-1011 (from ppnatu 99c922c7, its BUG-960): is the ROOT variable of this VRP
  * key `volatile`? A volatile value is re-read at every use, so no fact about it
  * survives from one read to the next. */
@@ -26692,10 +27002,15 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
      * there masks the nested interrupts that could split it. */
     if (is_compound && c->critical_depth > 0)
         is_compound = false;
+    /* BUG-1199: key the entry on the global's Symbol, resolved in the context
+     * of the body being walked (the descents enter the callee's module). */
+    Symbol *gsym = is_static_local ? NULL : global_decl_lookup(c, name, name_len);
     /* find existing entry */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
-        if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+        bool same = (gsym || g->sym) ? g->sym == gsym
+                  : (g->name_len == name_len && memcmp(g->name, name, name_len) == 0);
+        if (same) {
             if (is_static_local) { g->is_static_local = true;
                                    if (!g->decl_line) g->decl_line = line; }
             if (c->in_interrupt) {
@@ -26722,6 +27037,7 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
     memset(g, 0, sizeof(*g));
     g->name = name;
     g->name_len = name_len;
+    g->sym = gsym;
     g->is_static_local = is_static_local;
     g->decl_line = line;
     if (c->in_interrupt) {
@@ -26766,9 +27082,10 @@ static void track_isr_pointee_of(Checker *c, Node *ident) {
                               (uint32_t)ident->ident.name_len);
     /* BUG-1174: a global SLICE view reaches the array it views, same as a
      * pointer reaches its pointee (`[*]u32 gs = buf[0..];`). */
-    if (!ps || ps->is_function ||
-        (type_dispatch_kind(ps->type) != TYPE_POINTER &&
-         type_dispatch_kind(ps->type) != TYPE_SLICE)) return;
+    /* BUG-1201: a STRUCT that carries a pointer reaches its pointee the same
+     * way (`H h = { .p = &g }; ... *h.p`). */
+    if (!ps || ps->is_function || !ps->type ||
+        !type_carries_data_pointer(ps->type, 0)) return;
     /* BUG-1124: every target, not only the initializer's — a retargeted pointer
      * reaches each global it was ever pointed at. */
     for_each_write_target_ex(c, ident, true, isr_pointee_visit, ps);
@@ -26780,9 +27097,12 @@ static void track_isr_pointee_of(Checker *c, Node *ident) {
  * non-volatile one; the opaque flags add the may-RMW finding for a volatile one. */
 static void track_isr_global_opaque(Checker *c, const char *name, uint32_t name_len) {
     track_isr_global_ex(c, name, name_len, false, false, 0);
+    Symbol *gsym = global_decl_lookup(c, name, name_len);   /* BUG-1199: same key */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
-        if (g->name_len == name_len && memcmp(g->name, name, name_len) == 0) {
+        bool same = (gsym || g->sym) ? g->sym == gsym
+                  : (g->name_len == name_len && memcmp(g->name, name, name_len) == 0);
+        if (same) {
             if (c->in_interrupt) g->opaque_in_isr = true; else g->opaque_in_func = true;
             return;
         }
@@ -26923,16 +27243,22 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
         Symbol *gs = global_decl_lookup(c, value->call.callee->ident.name,
                                   (uint32_t)value->call.callee->ident.name_len);
         if (gs && gs->is_function && gs->func_node &&
-            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body)
+            gs->func_node->kind == NODE_FUNC_DECL && gs->func_node->func_decl.body) {
+            DeclModuleSave dm = decl_module_enter(c, gs);   /* BUG-1199 */
             record_isr_returned_funcname(c, gs->func_node->func_decl.body, depth + 1);
+            decl_module_leave(c, dm);
+        }
         return;
     }
     if (value->kind != NODE_IDENT) return;
     Symbol *fs = global_decl_lookup(c, value->ident.name,
                               (uint32_t)value->ident.name_len);
     if (fs && fs->is_function && fs->func_node &&
-        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body)
+        fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
+        DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
         record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+        decl_module_leave(c, dm);
+    }
 }
 
 /* E1 (2026-08-02): descend into a function BOUND to a function pointer.
@@ -27041,7 +27367,9 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                     rmw_arg_targets(c, node->call.args[_ai],
                                     rmw_bind_param_visit, &_bu);   /* BUG-1124 */
                 }
+                DeclModuleSave dm = decl_module_enter(c, cs);   /* BUG-1199 */
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                decl_module_leave(c, dm);
                 _rmw_alias_count = _sv;
             }
             /* ISR funcptr facet 1: an ISR dispatching through a GLOBAL funcptr
@@ -27410,8 +27738,11 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
             Symbol *cs = global_decl_lookup(c, node->call.callee->ident.name,
                                       (uint32_t)node->call.callee->ident.name_len);
             if (cs && cs->is_function && cs->func_node &&
-                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body)
+                cs->func_node->kind == NODE_FUNC_DECL && cs->func_node->func_decl.body) {
+                DeclModuleSave dm = decl_module_enter(c, cs);   /* BUG-1199 */
                 walk_callee_globals_body(c, cs->func_node->func_decl.body, w);
+                decl_module_leave(c, dm);
+            }
         }
         if (w->on_opaque_call && callee_is_opaque_funcptr(c, node->call.callee))
             w->on_opaque_call(c, node, w->ud);
@@ -27591,7 +27922,9 @@ static void check_call_vs_lent_globals(Checker *c, Node *call) {
     w.on_opaque_call = lent_opaque_visit;
     w.ud = &u;
     w.skip_atomic_target = false;   /* an atomic access still races the thread's plain one */
+    DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
     walk_callee_globals_body(c, fs->func_node->func_decl.body, &w);
+    decl_module_leave(c, dm);
     if (u.hit) {
         checker_error(c, call->loc.line,
             "cannot call '%.*s' while '%.*s' is lent to a scoped spawn — '%.*s' "
@@ -27754,8 +28087,13 @@ static void check_interrupt_safety(Checker *c) {
                 (int)g->name_len, g->name);
             continue;
         }
-        Symbol *sym = global_decl_lookup(c, g->name, g->name_len);
+        Symbol *sym = g->sym ? g->sym : global_decl_lookup(c, g->name, g->name_len);
         if (!sym) continue;
+        /* BUG-1199: the diagnostic points at the DECLARATION (sym->line), which
+         * for an imported module's global is in that module's file — name it,
+         * and do not echo a line of main's source under it. */
+        const char *sv_fn = c->file_name, *sv_src = c->source;
+        if (sym->file && sym->file != c->file_name) { c->file_name = sym->file; c->source = NULL; }
         TypeKind gk = type_dispatch_kind(sym->type);
         if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
             gk == TYPE_ARENA) {
@@ -27825,6 +28163,7 @@ static void check_interrupt_safety(Checker *c) {
                 "single-word scalar flag, or @atomic_* on a *shared T",
                 (int)g->name_len, g->name);
         }
+        c->file_name = sv_fn; c->source = sv_src;
     }
 }
 
@@ -28995,6 +29334,7 @@ void checker_register_file(Checker *c, Node *file_node) {
             own_n = decl->var_decl.name; own_l = (uint32_t)decl->var_decl.name_len;
         }
         if (own_n && scope_lookup_local(c->global_scope, own_n, own_l)) {
+            scope_lookup_local(c->global_scope, own_n, own_l)->cross_module_dup = true; /* BUG-1200 */
             Scope *priv = scope_new(c->arena, c->global_scope);
             Scope *saved = c->current_scope;
             c->current_scope = priv;
@@ -29097,6 +29437,34 @@ void checker_push_module_scope(Checker *c, Node *file_node) {
             (decl->kind == NODE_GLOBAL_VAR && decl->var_decl.is_static)) {
             /* register into module scope (for checker body-check) */
             register_decl(c, decl);
+            /* BUG-1199: and make it findable by `global_decl_lookup` while this
+             * module is the context — the lookup every whole-program analysis uses
+             * (race / ISR / atomic-cell / shared-type scans). Registered only in
+             * the module SCOPE, a static was a local to those scans: invisible. */
+            {
+                const char *on = (decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name : decl->var_decl.name;
+                uint32_t ol = (uint32_t)((decl->kind == NODE_FUNC_DECL) ?
+                    decl->func_decl.name_len : decl->var_decl.name_len);
+                Symbol *mine = c->current_module ?
+                    scope_lookup_local(c->current_scope, on, ol) : NULL;
+                if (mine) {
+                    if (c->module_own_count >= c->module_own_cap) {
+                        int nc = c->module_own_cap ? c->module_own_cap * 2 : 8;
+                        struct ModuleOwnSym *na = (struct ModuleOwnSym *)arena_alloc(
+                            c->arena, (size_t)nc * sizeof(struct ModuleOwnSym));
+                        if (na && c->module_own)
+                            memcpy(na, c->module_own,
+                                   (size_t)c->module_own_count * sizeof(struct ModuleOwnSym));
+                        if (na) { c->module_own = na; c->module_own_cap = nc; }
+                    }
+                    if (c->module_own_count < c->module_own_cap) {
+                        c->module_own[c->module_own_count].decl = NULL;
+                        c->module_own[c->module_own_count].sym = mine;
+                        c->module_own_count++;
+                    }
+                }
+            }
             /* BUG-229: register into global scope with MANGLED key for emitter.
              * Uses "module_name" as key to avoid collision between
              * mod_a's static x and mod_b's static x. */
@@ -29657,8 +30025,12 @@ static bool ucw_call(Checker *c, Node *call, Type *u, UcwSeen *sn) {
                                    (uint32_t)cal->ident.name_len);
         if (cs && cs->is_function && cs->func_node &&
             cs->func_node->kind == NODE_FUNC_DECL) {
-            if (cs->func_node->func_decl.body)
-                return ucw_body(c, cs->func_node->func_decl.body, u, sn);
+            if (cs->func_node->func_decl.body) {
+                DeclModuleSave dm = decl_module_enter(c, cs);   /* BUG-1199 */
+                bool r = ucw_body(c, cs->func_node->func_decl.body, u, sn);
+                decl_module_leave(c, dm);
+                return r;
+            }
             /* bodyless extern: only what it is handed */
             for (int i = 0; i < call->call.arg_count; i++) {
                 Type *at = checker_get_type(c, call->call.args[i]);
@@ -29962,6 +30334,7 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
         return;
     }
 
+    DeclModuleSave dm = decl_module_enter(c, sym);   /* BUG-1199 */
     /* 1. Scan body for direct shared accesses */
     scan_body_shared_types(c, sym->func_node->func_decl.body, fsc);
 
@@ -29971,6 +30344,7 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
         for (int i = 0; i < body->block.stmt_count; i++)
             scan_body_shared_types(c, body->block.stmts[i], fsc);
     }
+    decl_module_leave(c, dm);
 
     fsc->computed = true;
     fsc->in_progress = false;

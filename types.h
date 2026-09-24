@@ -238,6 +238,11 @@ struct Symbol {
     bool vrp_addr_taken;
     /* BUG-1099: declared by a parser desugaring (add_symbol_synth). */
     bool is_synthetic_var;
+    /* BUG-1200: a top-level name that a SECOND imported module also declares.
+     * This Symbol is the first registration (the raw global-scope entry); the
+     * other module's own lives in Checker.module_own. A reference that reaches
+     * THIS entry from a context owning neither is ambiguous. */
+    bool cross_module_dup;
     bool is_arena_derived;  /* pointer from LOCAL arena.alloc() — cannot escape to global/static or return */
     bool is_local_derived;  /* pointer to local variable — cannot be returned */
     bool is_variant_capture; /* BUG-1186: a `|*w|` capture of a UNION switch arm, or a

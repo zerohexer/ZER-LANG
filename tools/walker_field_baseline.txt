@@ -1366,8 +1366,6 @@ checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.cond
 # 2026-09-23g: emit_defer_stmt's NODE_ASM arm hands the whole node to emit_structured_asm,
 # which walks inputs/outputs itself. (The audit started seeing this function once the
 # emitter's brace-in-string layout around the new load-guard helpers changed.)
-emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.inputs
-emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.outputs
 # --- ir_lower.c: lower_may_write / index_clobbered_by / hoist_target_indices (BUG-1179/1184) ---
 # Early-ANSWER walkers: a call/assign/orelse/intrinsic answers TRUE at the node
 # (its children cannot make the answer more true), statement kinds answer the
@@ -1617,3 +1615,48 @@ checker.c:stmt_mentions_name_from:NODE_STATIC_ASSERT:static_assert_stmt.cond
 checker.c:stmt_mentions_name_from:NODE_STRUCT_INIT:struct_init.fields
 checker.c:stmt_mentions_name_from:NODE_TYPECAST:typecast.expr
 checker.c:stmt_mentions_name_from:NODE_UNARY:unary.operand
+# BUG-1194 mmio_index_reevaluable: a PROOF-OF-SAFETY walk (may the MMIO guard re-read this index?).
+# Every kind it does not descend answers false = refuse the index, so an undescended field can only over-reject.
+checker.c:mmio_index_reevaluable:NODE_ASM:asm_stmt.inputs
+checker.c:mmio_index_reevaluable:NODE_ASM:asm_stmt.outputs
+checker.c:mmio_index_reevaluable:NODE_ASSIGN:assign.target
+checker.c:mmio_index_reevaluable:NODE_ASSIGN:assign.value
+checker.c:mmio_index_reevaluable:NODE_AWAIT:await_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_BLOCK:block.stmts
+checker.c:mmio_index_reevaluable:NODE_CALL:call.args
+checker.c:mmio_index_reevaluable:NODE_CALL:call.callee
+checker.c:mmio_index_reevaluable:NODE_CRITICAL:critical.body
+checker.c:mmio_index_reevaluable:NODE_DEFER:defer.body
+checker.c:mmio_index_reevaluable:NODE_DO_WHILE:while_stmt.body
+checker.c:mmio_index_reevaluable:NODE_DO_WHILE:while_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:mmio_index_reevaluable:NODE_FIELD:field.object
+checker.c:mmio_index_reevaluable:NODE_FILE:file.decls
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.body
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.init
+checker.c:mmio_index_reevaluable:NODE_FOR:for_stmt.step
+checker.c:mmio_index_reevaluable:NODE_FUNC_DECL:func_decl.body
+checker.c:mmio_index_reevaluable:NODE_GLOBAL_VAR:var_decl.init
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.else_body
+checker.c:mmio_index_reevaluable:NODE_IF:if_stmt.then_body
+checker.c:mmio_index_reevaluable:NODE_INDEX:index_expr.index
+checker.c:mmio_index_reevaluable:NODE_INDEX:index_expr.object
+checker.c:mmio_index_reevaluable:NODE_INTERRUPT:interrupt.body
+checker.c:mmio_index_reevaluable:NODE_INTRINSIC:intrinsic.args
+checker.c:mmio_index_reevaluable:NODE_ONCE:once.body
+checker.c:mmio_index_reevaluable:NODE_ORELSE:orelse.expr
+checker.c:mmio_index_reevaluable:NODE_ORELSE:orelse.fallback
+checker.c:mmio_index_reevaluable:NODE_RETURN:ret.expr
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.end
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.object
+checker.c:mmio_index_reevaluable:NODE_SLICE:slice.start
+checker.c:mmio_index_reevaluable:NODE_SPAWN:spawn_stmt.args
+checker.c:mmio_index_reevaluable:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:mmio_index_reevaluable:NODE_STRUCT_INIT:struct_init.fields
+checker.c:mmio_index_reevaluable:NODE_SWITCH:switch_stmt.arms
+checker.c:mmio_index_reevaluable:NODE_SWITCH:switch_stmt.expr
+checker.c:mmio_index_reevaluable:NODE_VAR_DECL:var_decl.init
+checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.body
+checker.c:mmio_index_reevaluable:NODE_WHILE:while_stmt.cond

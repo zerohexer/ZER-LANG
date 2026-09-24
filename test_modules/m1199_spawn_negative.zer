@@ -1,0 +1,3 @@
+// BUG-1199: two threads race on an imported module's static.
+import m1199st;
+u32 main() { ThreadHandle a = spawn sbump(); ThreadHandle b = spawn sbump(); a.join(); b.join(); return sread(); }

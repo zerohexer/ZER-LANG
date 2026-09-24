@@ -1,0 +1,41 @@
+// BUG-1198: one bit-slice SET for both emitters, every operator and position.
+// Pre-fix: a runtime hi < lo cleared every bit from lo up; hi past the width
+// overwrote the whole value; a u12 field write left the value at 0x3F00 (outside
+// u12); `<<=` by 70 was a raw C shift (UB); a packed field was written through a
+// misaligned `uint32_t*`; a runtime position >= 2^31 on a READ was cast to `int`.
+packed struct P { u8 a; u32 w; }
+P gp;
+u32 g(u32 a) { return a; }
+u32 main() {
+    u32 w = 0xFFFFFFFF;
+    u32 hi = g(3); u32 lo = g(5);
+    w[hi..lo] = 0;                        // hi < lo: defined no-op
+    if (w != 0xFFFFFFFF) { return 1; }
+    u32 v = 0x12345678;
+    u32 h2 = g(40); u32 l2 = g(0);
+    v[h2..l2] = 0;                        // a position past the width: no-op
+    if (v != 0x12345678) { return 2; }
+    u12 x = 0;
+    x[11..8] = 15;
+    u32 h3 = g(13); u32 l3 = g(12);
+    x[h3..l3] = 3;                        // past a u12's width: no-op, value stays in range
+    if ((u32)x != 0xF00) { return 3; }
+    u32 r = 0xAB;
+    u32 s = g(70);
+    r[7..0] <<= s;                        // shift >= 64: the field becomes 0, no UB
+    if (r != 0) { return 4; }
+    u32 q = 0x1234;
+    q[15..8] += 1;                        // compound read-modify-write of the field
+    if (q != 0x1334) { return 5; }
+    gp.w = 0x11223344;
+    gp.w[7..0] = 0xFF;                    // packed field: no misaligned pointer
+    gp.w[15..8] += 1;
+    if (gp.w != 0x112234FF) { return 6; }
+    u32 big = 0xF0F0F0F0;
+    u32 bh = g(0xFFFFFFFF); u32 bl = g(0xFFFFFFFE);
+    if (big[bh..bl] != 0) { return 7; }   // a read far past the width is 0
+    i12 si = 0;
+    si[11..11] = 1;                       // the sign bit of an i12: the value is negative
+    if (si >= 0) { return 8; }
+    return 0;
+}

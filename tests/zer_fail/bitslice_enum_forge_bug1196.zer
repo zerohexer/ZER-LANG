@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot take bits of enum 'Mode'
+// BUG-1196: a bit-slice WROTE bits into an enum (e became 5, not a variant) — a forging
+// door beside the three guarded ones; a switch on it then took its last arm.
+enum Mode { off, on, auto }
+u32 main() {
+    Mode e = Mode.on;
+    Mode f = Mode.auto;
+    e[2..1] = f;
+    ?Mode chk = @try_enum(Mode, @bitcast(u32, e));
+    if (chk) |v| { return 0; }
+    return 42;
+}

@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: indexes past the declared mmio window
+// BUG-1202: the BUG-992 verdict for an MMIO window. The loop provably writes 8
+// registers into a 4-register window; it got a warning and an auto-guard whose
+// silent early return skipped `done = 1` — main returned 0 instead of 7.
+mmio 0x40000000..0x40000017;
+u32 done = 0;
+u32 main() {
+    volatile *u8 r = @inttoptr(*u8, 0x40000014);
+    for (u32 i = 0; i < 8; i += 1) { r[i] = 0xAA; }
+    done = 1;
+    return 7;
+}

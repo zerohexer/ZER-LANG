@@ -5,6 +5,112 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-24b — BUG-1194..1202: bare-metal and module holes (an audit agent's batch, each re-measured)
+
+**Method.** Every negative below COMPILED on the from-HEAD baseline (`5b63c9b8`) and is refused
+now, for the reason its `// expect-error:` names; the positive FAILED on the baseline. Corpus
+cost compiler-classified over every `.zer` in the tree: no verdict changes outside the new tests.
+
+### BUG-1194 — the MMIO auto-guard evaluated a side-effecting index twice
+The guard for an MMIO pointer index is hoisted to the start of the statement, and a pointer
+index has no single-read inline form, so the index was evaluated in the guard AND in the
+access. `r[f()] = 0xDEAD;` with `f()` returning 3 then 4: the guard approved 3, the store wrote
+index 4, past the declared range (measured against a mapped page) — with only a warning.
+BUG-1011/1098 covered a bare volatile identifier only; `r[vs.k]` (a volatile FIELD) was the
+same. `mmio_index_reevaluable` (a proof-of-safety walk — only literals, stable non-volatile
+identifiers and arithmetic over them answer yes) now gates it; anything else is refused with
+"read it into a local". Test: `mmio_index_side_effect_twice_bug1194`.
+
+### BUG-1195 — a constant-address `@inttoptr` lost `volatile` at every sink but two
+Only the var-decl and struct-literal sinks demanded a volatile destination. Returning it,
+assigning it, or passing it to a `*u32` param produced a plain pointer: GCC -O2 kept one of two
+register writes and compiled a poll loop into `jmp .`. The checker now types the result of a
+constant-address `@inttoptr` as a volatile pointer (a fresh type, set where `addr_is_const` is
+decided), so the ordinary qualifier rule refuses every non-volatile destination, and
+`emit_inttoptr` reads the checker's type, so the direct `@inttoptr(*R, A).f = x` emits a
+volatile access. Test: `inttoptr_volatile_every_sink_bug1195`.
+
+### BUG-1196 — a bit-slice was a fourth enum-forging door
+`e[2..1] = f` wrote raw bits into an enum (the value became 5 in a 3-variant enum; the
+exhaustive switch then took its last arm). The guarded doors are `@bitcast` / `@truncate` /
+`@saturate`; this one is refused rather than guarded (a guard would have to fire at every
+bit-slice store). Test: `bitslice_enum_forge_bug1196`.
+
+### BUG-1197 — atomics on an enum / bool cell, and on an odd-width `uN`
+`@atomic_add(&g, 5)` on an enum cell stored a non-variant (same last-arm amplifier). An enum or
+bool target now allows `@atomic_load` only. The width rule was `aw / 8 in {1,2,4,8}`, which let a
+`u21` through (21/8 = 2); the RMW then left it at 0x200000, outside `u21`. It is now exactly
+8/16/32/64 bits (`aw % 8 != 0` refuses). Tests: `atomic_enum_cell_bug1197`,
+`atomic_uN_width_bug1197`.
+
+### BUG-1198 — bit-slice SET: six defects, two emitters, one function now
+The AST and IR emitters each had their own bit-slice store (`emit_bitslice_ir_value` +
+`emit_bitslice_runtime_mask` and an AST twin), and each had different gaps. Measured pre-fix:
+a runtime `hi < lo` cleared every bit from `lo` up; a `hi` past the width overwrote the whole
+value; a `u12` field write left 0x3F00 (outside `u12`); `<<=` by 70 was a raw C shift (UB); a
+compound `/=` by 0 was a raw C division; a `packed` field was written through a misaligned
+`uint32_t*`; a volatile target was read twice; a runtime position `>= 2^31` on a READ was cast
+to `int`. ONE `emit_bitslice_set` now serves both paths: a single read into `_zer_bv`, a mask
+that is 0 when `hi >= W` or `hi < lo`, the value masked to the target's own width, clamped
+compound shifts, a trapping zero divisor, iN sign extension, and — for a packed path — no
+pointer at all (`lvalue_through_packed`). Reads use `uint64_t` positions. The checker refuses a
+bit-slice of a type wider than 64 bits (`u128`: the field arithmetic is 64-bit and a position
+>= 64 was C UB) and a packed bit-slice write through a side-effecting path. UBSan-clean.
+Tests: `tests/zer/bitslice_runtime_positions_packed_bug1198.zer`, `bitslice_u128_bug1198`.
+
+### BUG-1199 — an imported module's `static` was invisible to every whole-program scan
+A module static is registered in its module's SCOPE only (plus a mangled stub for the emitter).
+The race scan, the ISR walk, the atomic-cell recorder, the callee-globals walk and the
+shared-type collector all resolve names with `global_decl_lookup`, which answers relative to
+`c->current_module` — and every one of them descends into another module's function body from
+the CALLER's context. So `static u32 scnt; void sbump(){ scnt += 1; }` raced by two threads
+compiled clean and lost updates; a module `static Pool` used from a spawn, or from an ISR and
+main, the same; a static `@atomic_add`ed by a thread and read plainly by main the same. Three
+parts: (1) module statics join `Checker.module_own`, so `global_decl_lookup` finds them in their
+module; (2) every scan descent into a callee body enters the callee's module and restores it
+(`decl_module_enter` / `decl_module_leave`, 19 sites — this also fixes a colliding NON-static
+name being scanned as the other module's, BUG-1120's residual); (3) the ISR table keys entries
+on the Symbol resolved where the access happened (`IsrGlobal.sym`), since the post-pass runs in
+main's context and could not find a module static by name. The ISR diagnostic now names the
+declaring file. Tests: `test_modules/m1199_{spawn,isr,pool,atomic}_negative.zer` (the runner now
+asserts the diagnostic, `expect_err`).
+
+### BUG-1200 — two modules' same-named declarations: silently the first one
+Two imported modules each declaring `get` / `shared_name` / `struct Pt`: main's bare `get()`
+called the first-registered module's; `d.get()` and `d.shared_name = 50` were rewritten to the
+bare name and reached c's (main returned 2 from `if (d.get() != 9) return 2`); `Pt p; p.x =
+300;` used c's layout. Now: a reference that reaches the first registration from code owning
+neither is "declared by more than one imported module" (`Symbol.cross_module_dup`, set where
+the collision is registered — the BUG-1120 private-scope path for functions/globals, the type
+collision path for types — and checked in `find_symbol`'s NODE_IDENT arm and TYNODE_NAMED); a
+qualified `m.name` is refused when the bare name would resolve to another module's declaration
+(`qualified_rewrite_retargets`), and marks the ident `module_qualified` when it is right. The
+refusal is deliberate — resolving `d.get` properly needs one canonical key per declaration
+across VRP / zercheck_ir / the summaries; see limitations.md. Tests:
+`test_modules/m1200_{qual,ambig}_negative.zer`.
+
+### BUG-1201 — the ISR sharing rule did not follow a pointer out of a struct LITERAL
+`u32 g; struct H { *u32 p; } H h = { .p = &g }; interrupt TIM2 { *h.p = 1; }` with main
+polling `g` non-volatile compiled clean (GCC -O2 hoists the load: the loop never ends). The
+write-target walk (`write_target_reassign_visit`) followed `&x`, a pointer name, a slice and
+`orelse` as an assigned value — never a struct literal — and the read-side pointee tracker
+(`track_isr_pointee_of`) demanded a bare pointer/slice root, so `*o.in.p` in main reached
+nothing either. A struct literal's field values are now followed (nested literals included,
+over-approximating which field was used), and the tracker accepts any pointer-CARRYING root
+(`type_carries_data_pointer`). The spawn and main RMW sinks share the walk, so they gained it
+too. Tests: `isr_struct_literal_pointee_bug1201`, `isr_struct_literal_pointee_read_bug1201`;
+RMW FORM grid cell `global carrier {.p=&g}` in `tests/test_hw_matrix.c` (all three sites).
+
+### BUG-1202 — a counted loop provably past an MMIO window got a warning, not an error
+BUG-992 made "the loop counter provably indexes past a fixed array" a compile error because the
+auto-guard's silent early return hides the overflow at compile AND run time. The MMIO-window
+bound was not asked: `for (u32 i = 0; i < 8; i += 1) { r[i] = 0xAA; }` over a 4-register
+window warned, and the guard returned from `main` before `done = 1` (exit 0, not 7). The
+certainty test is now ONE predicate (`cert_loop_index_reaches`) asked by both the array and
+the mmio bound. Test: `mmio_counted_loop_past_window_bug1202`.
+
+---
+
 ## Session 2026-09-24 — BUG-1177..1193: harvest of `loving-bohr-l07qno`, then an audit (own probes + four read-only agents)
 
 **Harvest.** `claude/loving-bohr-l07qno` (36 commits, forked AT main) was fast-forwarded in. It

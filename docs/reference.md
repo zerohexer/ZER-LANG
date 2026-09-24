@@ -2463,6 +2463,16 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   the whole access (`sizeof(T)` bytes from the address) is not inside one declared
   range. The address operand must be at most 64 bits wide — a `u128` is rejected
   ("narrow it explicitly with @truncate").
+- The result of a CONSTANT-address `@inttoptr` is a **volatile** pointer (BUG-1195),
+  wherever it flows: binding it to a plain `*T` through a return, an assignment
+  or a call argument is refused ("cannot assign volatile pointer to non-volatile"),
+  and a direct `@inttoptr(*R, A).field = x` emits a volatile access. Before, only
+  the var-decl sink checked, and GCC could delete one of two register writes or
+  turn a poll loop into an infinite loop.
+- An index into an MMIO pointer is bounds-guarded, and the guard evaluates the
+  index a second time. An index with a side effect (`r[f()]`, `r[vs.k]` with `vs`
+  volatile) is therefore refused (BUG-1194: `f()` returned 3 to the guard and 4
+  to the store — a write past the declared range). Read it into a local first.
 - `--no-strict-mmio` flag allows @inttoptr without mmio declarations —
   it relaxes the RANGE strictness only. The runtime ALIGNMENT trap is
   still emitted for variable addresses (alignment is a property of the
@@ -3737,9 +3747,21 @@ Atomic read-modify-write. Returns value BEFORE the operation.
 
 **EXAMPLE**
 ```zer
-u32 old = @atomic_add(&counter, 1);
-u32 old_lock = @atomic_xchg(&lock, 1);
+u32 counter;
+u32 lock;
+u32 main() {
+    u32 old = @atomic_add(&counter, 1);
+    u32 old_lock = @atomic_xchg(&lock, 1);
+    return old + old_lock;
+}
 ```
+
+**TARGETS (BUG-1197)**: an integer cell of exactly 8, 16, 32 or 64 bits. A
+`uN` / `iN` of another width is refused (the hardware operation acts on the whole
+carrier and would leave a value outside `uN`). An `enum` or `bool` cell may be
+read with `@atomic_load` and nothing else — an arithmetic or bitwise atomic can
+produce a value that is not a variant (`@atomic_add` stored 5 into a 3-variant
+enum). Keep such state in an integer and convert with `@try_enum`.
 
 ---
 
@@ -4246,9 +4268,19 @@ provenance. A container global (`Pool`, `Ring`, `Slab`, `Arena`) declared in a
 module is addressable from its importers like any other global — `scratch =
 Arena.over(mem);` in main for a module's `Arena scratch;` compiles (BUG-1040).
 
-Known limit: two modules declaring the same NON-static global name resolve to
-whichever was registered first inside the checker — see `docs/limitations.md`.
-Make such globals `static`, or give them distinct names.
+A module's `static` globals are part of those whole-program checks too
+(BUG-1199): a thread, an interrupt handler and main reaching one through the
+module's functions is checked exactly like a shared global — a data race, a
+missing `volatile`, an allocator shared with an ISR, a plain access to an atomic
+cell.
+
+**Two modules, one name (BUG-1200).** When two imported modules each declare the
+same top-level name (function, global or type), code that owns neither may not
+use the bare name — it is reported as ambiguous instead of silently binding to
+the first-registered one. A qualified `mod.name` works when `mod` owns the
+first-registered declaration, and is refused (not silently retargeted) when it
+names the second. Each module's own body always sees its own. Give such names
+distinct spellings, or make them `static` — see `docs/limitations.md`.
 
 **QUALIFIED CALLS**
 Both unqualified and module-qualified calls work:
@@ -4973,6 +5005,22 @@ unchanged — matching ZER's rule that a shift of at least the type width is `0`
 rather than undefined. A position known at compile time to be out of range is a
 compile error instead.
 
+The rest of the contract (BUG-1196/1198):
+- A runtime `hi < lo` is also a **no-op** on a write, and reads `0`.
+- A READ whose field starts at or past the width reads `0`, for any runtime
+  position (a position is never narrowed to a signed `int`).
+- The target is read ONCE (a volatile register is not read twice), and the new
+  bits are masked to the target's own width — a write into a `u12` never leaves a
+  value outside `u12`. Writing the top bit of an `iN` makes the value negative.
+- In a compound operator, a shift of 64 or more gives `0`, and `/=` / `%=` by
+  zero TRAPS — the same rules as the plain operators.
+- A `packed` struct field works as a bit-slice target (no misaligned pointer is
+  formed); a packed target whose PATH has a side effect (`ps[f()].w[3..0] = 1`)
+  is refused — hoist the index into a local.
+- Refused: a bit-slice of an ENUM (`e[2..1] = x` could write a value that is no
+  variant — use `@bitcast` / `@try_enum`), and a bit-slice of a type wider than
+  64 bits (`u128`) — the field arithmetic is 64-bit.
+
 ### NOT in ZER
 - `++  --` — Use += 1, -= 1
 - `,` — Comma operator
@@ -4998,7 +5046,7 @@ An index gets one of four verdicts:
 |---|---|---|
 | PROVEN SAFE | the whole range is inside the bound | no check emitted — zero overhead |
 | PROVABLY OUT OF BOUNDS | no value in the range can be valid | **compile error** |
-| LOOP RUNS PAST THE END | the index is the counter of a counted loop that *will* take a value past the bound | **compile error** |
+| LOOP RUNS PAST THE END | the index is the counter of a counted loop that *will* take a value past the bound (a fixed array, or an MMIO pointer's declared window — BUG-1202) | **compile error** |
 | UNKNOWN | the range straddles the bound, or is unknown | auto-guard inserted (early return) |
 
 An index the compiler can prove is *always* wrong is an error, not a runtime

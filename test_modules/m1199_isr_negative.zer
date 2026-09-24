@@ -1,0 +1,4 @@
+// BUG-1199: an ISR and main share an imported module's non-volatile static.
+import m1199st;
+interrupt TIM2 { sbump(); }
+u32 main() { while (sread() == 0) { } return 0; }

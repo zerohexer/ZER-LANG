@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: target must be 1, 2, 4, or 8 bytes (got 21-bit type)
+// BUG-1197: 'aw / 8' let a u21 through; the RMW then left it at 0x200000, outside u21.
+u21 g = 2097151;
+u32 main() { u21 old = @atomic_add(&g, 1); return (u32)old; }

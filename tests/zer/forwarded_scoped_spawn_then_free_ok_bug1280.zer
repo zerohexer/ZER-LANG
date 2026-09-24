@@ -1,0 +1,11 @@
+shared struct S { u32 x; u32 y; }
+Slab(S) sl;
+void worker(*S w) { w.x = 7; }
+void mid(*S w) { ThreadHandle t = spawn worker(w); t.join(); }
+u32 main() {
+    *S p = sl.alloc_ptr() orelse return;
+    mid(p);
+    u32 r = p.x;
+    sl.free_ptr(p);
+    return r - 7;
+}

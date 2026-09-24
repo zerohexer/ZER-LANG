@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+struct Box { u32 v; }
+?*Box gb;
+void release() { if (gb) |b| { free(b); } gb = null; }
+u32 f() {
+    *?*Box slot = &gb;
+    if (*slot) |b| { release(); b.v = 99; return b.v; }
+    return 0;
+}
+u32 main() {
+    gb = alloc(Box);
+    return f();
+}

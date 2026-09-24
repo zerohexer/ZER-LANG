@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot return pointer to local
+u32 flag = 0;
+*u32 bad(*u32 r) {
+    u32 loc = 77;
+    *u32 p = &loc;
+    if (flag == 1) {
+        p = r;
+    }
+    return p;
+}
+u32 gx = 5;
+u32 clobber(u32 a) { u32[16] junk; for (u32 i = 0; i < 16; i += 1) { junk[i] = a + i; } return junk[3]; }
+u32 main() {
+    u32 v = *bad(&gx);
+    return v;
+}

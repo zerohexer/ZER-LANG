@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: (threadlocal) and cannot be passed to a scoped spawn
+threadlocal u32 tv;
+*u32 getp() { return &tv; }
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    *u32 p = getp();
+    ThreadHandle th = spawn w(p);
+    tv += 1;
+    th.join();
+    return 0;
+}

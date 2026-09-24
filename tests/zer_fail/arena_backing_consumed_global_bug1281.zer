@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: 'gb' is the backing store of an arena
+struct B { [*]u32 s; }
+u8[64] gb;
+Arena mk([*]u8 b) { return Arena.over(b); }
+u32 poke() { gb[8] = 200; return 0; }
+u32 main() {
+    Arena a = mk(gb[0..]);
+    *B x = a.alloc(B) orelse return;
+    return poke();
+}

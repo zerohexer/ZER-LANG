@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: through a cast in the middle
+struct Inner { u32 v; }
+?*u32 g;
+void f() { Inner i; i.v = 42; *Inner ip = &i; g = &((*Inner)ip).v; }
+u32 main() { f(); if (g) |p| { return *p; } return 0; }

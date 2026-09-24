@@ -910,6 +910,23 @@ cell p43_global_holds_arg  reject "$P43"' u32 main(){ *T43 t = alloc(T43) orelse
 cell p43_safe_distinct     compile "$P43"' u32 main(){ *T43 a = alloc(T43) orelse return; defer free(a); *T43 b = alloc(T43) orelse return; return two43(a, b); }'
 cell p43_safe_global_reset compile "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; g43 = t; g43 = null; return one43(t); }'
 
+# SHAPE p44 (BUG-1274, 1278, 1279, 1280): a frame-bound value that reaches a
+# sink through a CONDITIONAL reassignment, a cast in the MIDDLE of a reference
+# path, or a DETACHED thread started by a callee.
+echo "===== SHAPE p44 = conditional reassign / interior cast / callee-started detached thread ====="
+P44='u32 gx44; u32 gy44; struct In44{u32 v;} struct Hd44{*In44 in;} shared struct S44{u32 x;} S44 gs44; Slab(S44) sl44; void gr44(*S44 w){ w.x = 1; } void mid44(*S44 w){ spawn gr44(w); } void jmid44(*S44 w){ ThreadHandle t = spawn gr44(w); t.join(); }'
+cell p44_cond_reassign_return reject "$P44"' *u32 c(bool k){ u32 loc = 1; *u32 p = &loc; if (k) { p = &gx44; } return p; } u32 main(){ return 0; }'
+cell p44_cond_reassign_store  reject "$P44"' void c(bool k){ u32 loc = 1; *u32 p = &loc; if (k) { p = &gx44; } g_p = p; } u32 main(){ return 0; }'
+cell p44_interior_cast_store  reject "$P44"' void st(Hd44 h){ g_p = &((*In44)h.in).v; } u32 main(){ return 0; }'
+cell p44_detached_via_callee  reject "$P44"' u32 main(){ S44 l; mid44(&l); return 0; }'
+cell p44_detached_then_free   reject "$P44"' u32 main(){ *S44 p = sl44.alloc_ptr() orelse return; mid44(p); sl44.free_ptr(p); return 0; }'
+# BOUNDARY: an unconditional reassignment replaces the taint; two globals; a
+# global to the detached callee; a callee that JOINS before returning.
+cell p44_safe_uncond_reassign compile "$P44"' *u32 c(){ u32 loc = 1; *u32 p = &loc; p = &gx44; return p; } u32 main(){ return 0; }'
+cell p44_safe_cond_two_globals compile "$P44"' *u32 c(bool k){ *u32 p = &gx44; if (k) { p = &gy44; } return p; } u32 main(){ return 0; }'
+cell p44_safe_detached_global compile "$P44"' u32 main(){ mid44(&gs44); return 0; }'
+cell p44_safe_joined_then_free compile "$P44"' u32 main(){ *S44 p = sl44.alloc_ptr() orelse return; jmid44(p); sl44.free_ptr(p); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

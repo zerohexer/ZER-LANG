@@ -198,6 +198,33 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1275 — the per-statement shared lock inside a BARE switch arm.
+#
+# `0 => g.x = 5,` (an arm whose body is a statement, not a block) lowered the arm
+# without the statement wrapper that carries the lock, so the store to a shared
+# struct ran UNLOCKED — the same silent drop as the lock cap above, invisible to
+# a hosted test unless two threads happen to collide. The braced arm is the
+# control: both must lock.
+cat > "$req_dir/barearm.zer" <<'ZEOF'
+shared struct G { u32 x; }
+G g;
+void bare(u32 k)   { switch (k) { 0 => g.x = 5, default => { } } }
+void braced(u32 k) { switch (k) { 0 => { g.x = 5; } default => { } } }
+u32 main() { bare(0); braced(0); return 0; }
+ZEOF
+if "$ZERC" "$req_dir/barearm.zer" -o "$req_dir/barearm.c" >/dev/null 2>&1; then
+    for fn in bare braced; do
+        n=$(sed -n "/^void $fn(/,/^}/p" "$req_dir/barearm.c" | grep -c 'lock(&g\b' || true)
+        if [ "$n" -lt 1 ]; then
+            echo "MISSING EMISSION: shared store in a $fn switch arm is not locked"
+            REQ_FAIL=$((REQ_FAIL + 1))
+        fi
+    done
+else
+    echo "MISSING EMISSION: the bare-switch-arm lock sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 if [ $REQ_FAIL -ne 0 ]; then
     echo ""
     echo "$REQ_FAIL required-emission check(s) failed — the compiler DROPPED code it"

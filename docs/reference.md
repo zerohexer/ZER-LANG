@@ -1936,6 +1936,10 @@ ISR-safe — no heap, no malloc, no locking. Fixed at compile time.
 
 Every slot has a generation counter. When freed, the generation increments.
 Accessing a freed slot with an old handle traps (generation mismatch).
+Each pool (and slab) starts its generations at a value derived from its own
+address, so a handle used with a DIFFERENT pool than the one that issued it —
+`pb.get(h)` on an `h` from `pa`, even across a function call, a global or a Ring
+— also traps, at `get` and at `free`, instead of returning the other pool's object.
 
 **SYNOPSIS**
 ```zer
@@ -2333,6 +2337,19 @@ firmware example does).
 into a discarded temporary and leave `ar` at capacity 0, so every later
 allocation would return null forever. Allocating from an arena that never
 received a backing store anywhere in the program is a compile error too.
+
+**The backing store belongs to the arena.** Once a buffer is handed to
+`Arena.over(buf)`, every other mention of `buf` in that function (for a global,
+anywhere in the program) is a compile error — a write through it would overwrite
+what the arena handed out, e.g. forge a slice's `.len`. The only permitted
+mentions are `Arena.over(buf)` and `free(buf)` (for a heap backing store; the
+free invalidates every allocation made from the arena). A second arena over the
+same buffer is refused. So that this rule can see every name the buffer has, the
+backing store must be a named array (`buf`, `buf[0..32]`), a fresh
+`alloc(u8, n)` slice that is never reassigned, or a slice PARAMETER — not a
+field, an element, a path through a pointer, or a slice that views another
+buffer. A function that builds an arena over its parameter consumes the caller's
+argument: the caller may not mention that buffer again.
 
 The backing store must be WRITABLE (the arena writes every allocation into it):
 a string literal or a `const` buffer is refused. An arena over a function's
@@ -5338,7 +5355,10 @@ u32 c = -4 + -2;      // ERROR — folds to -6, a negative constant
 ### A plain access races a SCOPED thread too, not just a fire-and-forget one
 
 Once a global is touched with `@atomic_*` anywhere it is an ATOMIC CELL, and every other
-access to it in a concurrent context must be atomic as well. The concurrent context of a
+access to it in a concurrent context must be atomic as well. "Touched" includes through a
+pointer: `*u32 p = &g; @atomic_add(p, 1);`, and a helper `void add1(*u32 p) {
+@atomic_add(p, 1); }` called with `&g`, both make `g` a cell. Handing `&g` to such a helper is
+itself fine (it is an atomic use), unless the helper also uses that parameter non-atomically. The concurrent context of a
 scoped spawn is the window between the `spawn` and its `join` — not nothing:
 
 <!-- audit: expect-error: plain access to 'g_ctr' in a concurrent context -->
@@ -5363,10 +5383,13 @@ still running.
 
 The auto-guard normally returns early. Inside `@critical` an early `return` would
 leak the interrupt-disable, so there the guard **traps** instead (`SIGTRAP`, message
-`out-of-bounds access inside a held lock, @critical block or defer cleanup — cannot
-return without leaking it`), aborting before both the access and the leak.
+`out-of-bounds access inside a held lock, @critical block, @once body, semaphore hold
+or defer cleanup — cannot return without leaking it`), aborting before both the access
+and the leak. The same holds inside a `@once` body (returning would skip the
+completion signal the other threads wait on) and between a `@sem_acquire` and its
+`@sem_release` in the same function (the permit would never come back).
 
-<!-- audit: expect-trap: out-of-bounds access inside a held lock, @critical block or defer cleanup -->
+<!-- audit: expect-trap: cannot return without leaking it -->
 ```zer
 volatile u32 g_idx = 9;
 u32 out;
@@ -5617,6 +5640,12 @@ u32 main() {
   snapshot. A **mutable pointer capture `|*x|` of a shared union variant** is a
   compile error (it would alias the shared bytes past the auto-lock) — copy the
   field into a local, mutate it, then assign it back as its own statement.
+- A shared struct's fields may not hold a **pointer to non-shared data** (`*T`, `?*T`,
+  `[*]T`, `*opaque`, also nested inside a field struct): the lock protects the field,
+  not what it points at, so a copy of the pointer written through by two threads
+  races. A pointer to another `shared struct` is allowed (that one locks itself),
+  and so is a function pointer, and a top-level `*opaque` C-library handle (see
+  "Safe C Library Interop").
 
 ### shared(rw) struct — Reader-Writer Lock
 ```zer
@@ -5789,6 +5818,14 @@ threadlocal u32 counter;    // each thread has its own copy
 - Control flow that exits the body — `return`, `break`, `continue`, `goto` — is a
   **compile error** (it would skip the one-time completion signal and hang the
   waiting threads). Put such logic in a helper function called from `@once`.
+- **Globals written inside `@once` from a spawned thread.** A global touched ONLY
+  inside ONE `@once` block of a SCOPED spawn target (`ThreadHandle t = spawn w();`)
+  is the publish-once idiom and is allowed. Until the LAST `join()`, the spawning
+  function may touch that global only inside the same `@once` block (directly or
+  by calling the function that contains it) — any other access, a call to a helper
+  that reads it, or a call through a function pointer is a compile error. A second,
+  different `@once` block on the same global is a data race and is refused, and a
+  fire-and-forget `spawn` gets no exemption (nothing ends its window).
 
 ### Barrier — Thread Sync Point
 ```zer

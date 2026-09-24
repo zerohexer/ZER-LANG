@@ -1,0 +1,19 @@
+shared struct G { u32 x; }
+G g;
+void w() {
+    for (u32 i = 0; i < 2000000; i += 1) {
+        u32 k = i & 1;
+        switch (k) {
+            0 => g.x = g.x + 1,
+            default => g.x = g.x + 1,
+        }
+    }
+}
+u32 main() {
+    ThreadHandle t1 = spawn w();
+    ThreadHandle t2 = spawn w();
+    t1.join();
+    t2.join();
+    if (g.x != 4000000) { return 1; }
+    return 0;
+}

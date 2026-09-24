@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep'
+shared struct S { u32 x; u32 y; }
+void grand(*S w) {
+    for (u32 i = 0; i < 20000000; i += 1) { }
+    w.x = 7;
+}
+void mid(*S w) {
+    spawn grand(w);
+}
+void f() {
+    S local;
+    local.x = 1;
+    mid(&local);
+}
+u32 deep(u32 n) { u32[64] junk; for (u32 i = 0; i < 64; i += 1) { junk[i] = n + i; } return junk[5]; }
+u32 main() {
+    f();
+    u32 acc = 0;
+    for (u32 i = 0; i < 400000; i += 1) { acc += deep(i); }
+    return 0;
+}

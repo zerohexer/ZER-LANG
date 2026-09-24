@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: carries a function pointer whose target the compiler cannot resolve
+u32 g;
+void bump() { g += 1; }
+struct Ops { *() -> void cb; }
+void worker(Ops o) { o.cb(); }
+void run(Ops o) { spawn worker(o); }
+u32 main() { Ops ops; ops.cb = bump; run(ops); return 0; }

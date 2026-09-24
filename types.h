@@ -228,6 +228,15 @@ struct Symbol {
     Type *type;
 
     bool is_keep;           /* keep parameter — can be stored */
+    /* BUG-1269: this buffer is an arena's BACKING STORE — the arena owns its
+     * bytes, so any mention other than `Arena.over(x)` / `free(x)` is refused.
+     * The arena's name ("" when the over result has no named destination). */
+    /* BUG-1274: Checker.branch_depth when this symbol was declared — a whole-name
+     * reassignment deeper than this may not run, so it cannot clear the escape
+     * taint the declaration-depth value carries. */
+    int decl_branch_depth;
+    const char *arena_backing_of;
+    uint32_t arena_backing_of_len;
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
@@ -318,6 +327,10 @@ struct Symbol {
      * model that replaces the exclusion-list: instead of listing what's safe,
      * mark what's shared and require synchronized access. */
     bool is_atomic_cell;
+    /* BUG-1284: bit i = this function applies an @atomic_* to what its param i
+     * points at (directly, or by handing it to a function that does). */
+    uint64_t atomic_param_mask;
+    uint64_t atomic_param_plain_mask;   /* BUG-1284: param i also used NON-atomically */
 
     /* BUG-847/849: set on a RESOURCE symbol the first time it is given its
      * backing state — an `Arena` receiving a buffer (a var-decl initializer or

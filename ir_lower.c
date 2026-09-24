@@ -115,6 +115,12 @@ typedef struct {
      * user writes it. Inside one, the guard declines and the emitter's trapping
      * form is used instead. */
     int critical_depth;
+    /* BUG-1287: two more scopes a guard's early return must not leave — a @once
+     * body (the done-publish that loser threads wait on would never run: a hang)
+     * and code between @sem_acquire and @sem_release written straight-line in
+     * this function (the permit would never be returned: the next acquire hangs). */
+    int once_depth;
+    int sem_held;
     int active_guard_flag;
     int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
@@ -1559,11 +1565,13 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     /* BUG-1222: nor when the function's result has no zero value (an enum
      * without a 0 variant — the literal return below would forge one). */
     bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+    bool no_leave = ctx->critical_depth > 0 || ctx->defer_body_depth > 0 ||
+                    ctx->once_depth > 0 || ctx->sem_held > 0;   /* BUG-1287 */
+    if (no_leave || no_zero) {
         IRInst tr = make_inst(IR_TRAP, g->line);
         /* literal_kind names the reason for the emitter's message:
          * 0 = a scope that cannot be left, 1 = no zero value to return */
-        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        tr.literal_kind = no_leave ? 0 : 1;
         emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -3084,6 +3092,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+        /* BUG-1287: a straight-line semaphore hold (see LowerCtx.sem_held). The
+         * acquire counts BEFORE its own statement is lowered is irrelevant — it
+         * holds no guarded access. */
+        if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+            memcmp(expr->intrinsic.name, "sem_acquire", 11) == 0)
+            ctx->sem_held++;
+        else if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+                 memcmp(expr->intrinsic.name, "sem_release", 11) == 0 && ctx->sem_held > 0)
+            ctx->sem_held--;
 
         /* Rewrite idents in expression to use correct local names */
         rewrite_idents(ctx, expr);
@@ -4118,7 +4135,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
             int arm_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-1275: a bare arm `0 => g.x = 5,` is a lone EXPR_STMT, not a block,
+             * and the per-statement shared-struct lock is taken only by the BLOCK
+             * lowering — so the store ran with no mutex while the braced spelling
+             * locked. Lower a non-block body as a one-statement block (a node built
+             * here; the AST keeps its shape for every other consumer). */
+            Node *arm_body = arm->body;
+            if (arm_body && arm_body->kind != NODE_BLOCK) {
+                Node *blk = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                Node **one = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+                if (blk && one) {
+                    memset(blk, 0, sizeof(Node));
+                    blk->kind = NODE_BLOCK;
+                    blk->loc = arm_body->loc;
+                    one[0] = arm_body;
+                    blk->block.stmts = one;
+                    blk->block.stmt_count = 1;
+                    arm_body = blk;
+                }
+            }
+            lower_stmt(ctx, arm_body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4628,7 +4664,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         emit_inst(ctx, br);
 
         ctx->current_block = bb_body;
+        ctx->once_depth++;   /* BUG-1287 */
         lower_stmt(ctx, node->once.body);
+        ctx->once_depth--;
         ensure_terminated(ctx, bb_skip);
 
         ctx->current_block = bb_skip;

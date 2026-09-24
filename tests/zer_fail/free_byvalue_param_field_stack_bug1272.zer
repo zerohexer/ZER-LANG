@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep'
+struct H { [*]u32 d; }
+void rel(H h) { free(h.d); }
+u32 main() {
+    u32[4] arr;
+    H h = { .d = arr[0..] };
+    rel(h);
+    return 0;
+}

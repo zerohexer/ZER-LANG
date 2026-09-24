@@ -84,6 +84,14 @@ typedef struct {
      * NULL when param_count == 0 (memset-zeroed). */
     bool *frees_param_field;
     bool *maybe_frees_param_field;
+    /* BUG-1280: the callee hands param i to a fire-and-forget spawn (directly or
+     * through a callee that does) — 2 = on every return path, 1 = on some. The
+     * caller's argument becomes TRANSFERRED (2) or MAYBE_FREED (1): the thread
+     * holds it for ever, so a later free is a use-after-free in that thread.
+     * Separate from frees_param on purpose — handing a GLOBAL to such a callee
+     * is fine, and the free-only checks (heap-only argument, interior pointer)
+     * must not fire for it. NULL when nothing is transferred. */
+    unsigned char *transfers_param;
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
     /* BUG-849 (2026-08-23): the SET of params the return may be a view of.
@@ -195,6 +203,12 @@ typedef struct {
      * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
     struct ZcFreedGlobal *cur_freed_global;
     int cur_freed_global_n, cur_freed_global_cap;
+    /* BUG-1268: which heap allocation backs each arena of the function being
+     * analysed (`Arena a = Arena.over(hb);`) — name -> backing alloc_id, so an
+     * allocation from `a` can list `hb` in its view set and die with it.
+     * Dynamic, malloc'd, reset per function. */
+    struct ZcArenaBacking { const char *name; uint32_t len; int aid; } *cur_arena_backing;
+    int cur_arena_backing_n, cur_arena_backing_cap;
 
     /* allocation ID counter — each unique allocation gets a unique ID */
     int next_alloc_id;

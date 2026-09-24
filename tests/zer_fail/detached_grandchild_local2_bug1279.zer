@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy 'keep'
+shared struct S { u32 x; }
+void grand(*S w) { w.x = 7; }
+void mid(*S w) {
+    spawn grand(w);
+}
+u32 main() {
+    S local;
+    ThreadHandle th = spawn mid(&local);
+    th.join();
+    return 0;
+}

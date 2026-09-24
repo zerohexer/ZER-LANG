@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: slice that may view other storage
+struct B { [*]u32 s; }
+u32 main() {
+    u8[64] lb;
+    [*]u8 v = lb[0..];
+    Arena a = Arena.over(v);
+    *B x = a.alloc(B) orelse return;
+    [*]u32 hs = alloc(u32, 2) orelse return;
+    x.s = hs;
+    lb[8] = 200;
+    u32 r = (u32)x.s.len;
+    free(hs);
+    return r;
+}

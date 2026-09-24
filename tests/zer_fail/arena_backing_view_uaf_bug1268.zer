@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+struct T { u32 v; }
+u32 main() {
+    [*]u8 hb = alloc(u8, 64) orelse return;
+    Arena a = Arena.over(hb);
+    u32 r = 0;
+    if (a.alloc(T)) |t| {
+        t.v = 5;
+        free(hb);
+        r = t.v;
+    } else {
+        free(hb);
+    }
+    return r;
+}

@@ -485,7 +485,7 @@ script, not a net. GOTCHA: `zerc f.zer -o /tmp/x.exe` builds the exe NEXT TO THE
 like a compiler failure.
 
 **WHAT A GREEN `make check` ACTUALLY COVERS (verified from a run, 2026-08-27 — do not quote from
-memory, the census in this file was once wrong by 2x).** TEN gates, each printing its own verdict
+memory, the census in this file was once wrong by 2x).** ELEVEN gates, each printing its own verdict
 line, plus TEN axis-crossed matrices:
 
 | gate | verdict line it prints |
@@ -500,6 +500,7 @@ line, plus TEN axis-crossed matrices:
 | `sink_matrix.sh` | `SINK MATRIX CLEAN` (169 cells as of 2026-09-13 — this number drifts, RUN the gate) |
 | `audit_reference_examples.sh` | `OK — every non-baselined reference.md example builds.` |
 | `audit_float_literal.sh` | `OK — every emitted float literal goes through emit_double_lit.` (10th gate, 2026-09-13, BUG-991) |
+| `audit_matrix.sh` | `OK — every construct x context verdict holds.` (11th gate, 2026-09-25 — the flag-handler matrix, now behavioural) |
 
 Matrices: shape / escape / keep / cflow / conc / view-alias / hw / async / asm / defer-goto / **vrp-position** (11th, 2026-09-15, BUG-1017) / **vrp-fact** (12th, 2026-09-23, BUG-1090..1100). (The conc
 matrix prints its own `=== conc-matrix: N/N cells correct ===` line — 124 as of 2026-09-13, and like
@@ -3104,7 +3105,7 @@ This approach found 13 bugs in ~5K tokens. Brute-force reading of the same code 
 
 ### Flag-Handler Matrix Audit (automated cross-reference)
 
-Run `bash tools/audit_matrix.sh checker.c` to automatically find missing checker validations. The script cross-references control-flow NODE_ handlers (return, break, continue, goto, yield, await, spawn) against context flags (in_loop, defer_depth, critical_depth, in_async, in_interrupt, in_naked). Missing checks = potential bugs.
+`bash tools/audit_matrix.sh ./zerc` (in `make check` since 2026-09-25) compiles one program per control-flow construct (return, break, continue, goto, yield, await, spawn, alloc) × context (defer body, @critical, no loop, sync/async function, interrupt, naked) and asserts the VERDICT and the rule's own wording, plus boundary cells that must compile. It used to grep checker.c line windows; that drifted onto decoy `case` labels and printed 16 false positives, so it could not have shown a real gap. A new context flag or a new control-flow construct needs its cells in the same commit.
 
 First run found 5 bugs: yield/await missing defer_depth + critical_depth checks, spawn missing in_interrupt check.
 

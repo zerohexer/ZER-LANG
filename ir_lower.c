@@ -1927,6 +1927,24 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
             else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
             else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
             else break;
+            /* BUG-1307: `S.alloc_ptr()` / `S.free_ptr(p)` — the auto-slab builtins,
+             * which the universal alloc(S) / free(p) also lower to — name the struct
+             * TYPE as their receiver. It has the shared struct's type, so it was
+             * taken for a shared ROOT and the emitter locked `&S._zer_mtx`: GCC
+             * "'S' undeclared". A type receiver holds no data and needs no lock. */
+            if (cur->kind == NODE_FIELD && next->kind == NODE_IDENT) {
+                const char *fm = cur->field.field_name;
+                size_t fl = cur->field.field_name_len;
+                bool type_method = (fl == 5 && memcmp(fm, "alloc", 5) == 0) ||
+                                   (fl == 9 && memcmp(fm, "alloc_ptr", 9) == 0) ||
+                                   (fl == 4 && memcmp(fm, "free", 4) == 0) ||
+                                   (fl == 8 && memcmp(fm, "free_ptr", 8) == 0);
+                /* The checker routes ANY struct-typed receiver of these four to
+                 * the auto-slab (checker.c "Task.alloc() / Task.free()"), so the
+                 * same test answers it here. */
+                if (type_method &&
+                    type_dispatch_kind(checker_get_type(c, next)) == TYPE_STRUCT) break;
+            }
             Type *nt = checker_get_type(c, next);
             if (nt) {
                 Type *eff = type_unwrap_distinct(nt);

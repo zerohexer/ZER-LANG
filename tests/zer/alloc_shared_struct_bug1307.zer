@@ -1,0 +1,16 @@
+// BUG-1307: alloc(S) / free(p) on a SHARED struct. Both lower to the auto-slab
+// builtins `S.alloc_ptr()` / `S.free_ptr(p)`, whose receiver is the struct TYPE; the
+// shared-root finder took the type name for a shared object and the emitter locked
+// `&S._zer_mtx` — GCC: "'S' undeclared". A type receiver holds no data.
+shared struct S { u32 v; }
+u32 main() {
+    *S p = alloc(S) orelse { return 1; };
+    p.v = 3;
+    u32 r = p.v;
+    free(p);
+    *S q = S.alloc_ptr() orelse { return 2; };
+    q.v = 4;
+    r += q.v;
+    S.free_ptr(q);
+    return r - 7;
+}

@@ -167,6 +167,25 @@ static bool is_func_ptr_start(Parser *p) {
     Token saved_prev = p->previous;
     advance(p); /* consume '(' */
     bool result = check(p, TOK_STAR);
+    /* BUG-1306: the whole declarator shape — `( * [name] [dims] ) (` — not just
+     * `( *`. A call whose first argument is a dereference, `add(*p);`, starts the
+     * same two tokens and was parsed as a funcptr declaration ("expected variable
+     * name"). */
+    if (result) {
+        advance(p);                                   /* '*' */
+        if (check(p, TOK_IDENT)) advance(p);
+        while (result && check(p, TOK_LBRACKET)) {    /* `(*ops[4])(…)` */
+            int depth = 0;
+            do {
+                if (check(p, TOK_LBRACKET)) depth++;
+                else if (check(p, TOK_RBRACKET)) depth--;
+                else if (check(p, TOK_EOF)) { result = false; break; }
+                advance(p);
+            } while (depth > 0);
+        }
+        if (result) result = check(p, TOK_RPAREN);
+        if (result) { advance(p); result = check(p, TOK_LPAREN); }
+    }
     *p->scanner = saved;
     p->current = saved_cur;
     p->previous = saved_prev;
@@ -2367,11 +2386,16 @@ static Node *parse_statement(Parser *p) {
                 /* IDENT ( — could be func ptr type, container type, or function call.
                  * Peek: ( * means function pointer declaration.
                  * ( TypeToken ) IDENT means container instantiation: Stack(u32) s; */
+                /* BUG-1306: the full declarator shape (is_func_ptr_start) — a bare
+                 * `( *` peek took the call `add(*p);` for a declaration. */
+                bool fp_decl = is_func_ptr_start(p);
                 Scanner saved2 = *p->scanner;
                 Token saved2_cur = p->current;
                 advance(p); /* consume ( */
-                if (check(p, TOK_STAR)) {
+                if (fp_decl) {
                     is_var = true; /* function pointer decl */
+                } else if (check(p, TOK_STAR)) {
+                    is_var = false;   /* a call whose argument is a dereference */
                 } else if (is_type_token(p->current.type)) {
                     /* Could be container: Stack(u32) varname
                      * Skip past type + ) and check if IDENT follows */
@@ -2410,15 +2434,9 @@ static Node *parse_statement(Parser *p) {
             TypeNode *try_type = parse_type(p);
             (void)try_type;
 
-            bool is_func_ptr = false;
-            if (!p->had_error && check(p, TOK_LPAREN)) {
-                Scanner saved2 = *p->scanner;
-                Token saved2_cur = p->current;
-                advance(p);
-                is_func_ptr = check(p, TOK_STAR);
-                *p->scanner = saved2;
-                p->current = saved2_cur;
-            }
+            /* BUG-1306: the one declarator-shape query (RF10), not a second
+             * `( *` peek — that accepted `add(*p);` as a declaration. */
+            bool is_func_ptr = !p->had_error && is_func_ptr_start(p);
             is_var = !p->had_error && (check(p, TOK_IDENT) || is_func_ptr);
 
             *p->scanner = saved_scanner;

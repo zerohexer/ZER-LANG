@@ -412,6 +412,8 @@ static const char *sink_name(CASink s) {
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
                RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM,
                RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_FACTORY_ORELSE,
+               RCH_ARG_REASSIGN, RCH_ARG_FIELD, RCH_ARG_ARRAY, RCH_ARG_FWD_LOCAL,
+               RCH_ARG_CARRIER,
                RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
@@ -428,6 +430,11 @@ static const char *reach_name(CAReach r) {
     case RCH_FACTORY_SWITCH:  return "factory-switch-arm";
     case RCH_FACTORY_DOWHILE: return "factory-dowhile-body";
     case RCH_FACTORY_ORELSE:  return "factory-orelse-block";
+    case RCH_ARG_REASSIGN:    return "spawn-arg-reassigned";
+    case RCH_ARG_FIELD:       return "spawn-arg-field";
+    case RCH_ARG_ARRAY:       return "spawn-arg-element";
+    case RCH_ARG_FWD_LOCAL:   return "fwd-local-through-helper";
+    case RCH_ARG_CARRIER:     return "fwd-struct-carrier";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -516,7 +523,40 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
                 "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
                 "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }\n";
         wbody = "*() -> void fp = mk(0); fp();"; break;
+    /* 13th..17th forms (BUG-1290, 2026-09-24): the callback is the spawn
+     * ARGUMENT (or reaches a spawn through a helper) in a shape no resolver
+     * followed. The rule falls back to every function of the funcptr's
+     * signature; the non-racy payloads pin that it does not over-reject when
+     * all of them are race-free. */
+    case RCH_ARG_REASSIGN:
+        extra = "void other() { }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "*() -> void fp = other; fp = cb; spawn inner(fp);"; break;
+    case RCH_ARG_FIELD:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Ops o; o.h = cb; spawn inner(o.h);"; break;
+    case RCH_ARG_ARRAY:
+        extra = "typedef *() -> void Cb;\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Cb[2] t; t[0] = cb; t[1] = cb; spawn inner(t[0]);"; break;
+    case RCH_ARG_FWD_LOCAL:
+        extra = "void inner(*() -> void f) { f(); }\nvoid run(*() -> void f) { spawn inner(f); }\n";
+        wbody = "*() -> void fp = cb; run(fp);"; break;
+    case RCH_ARG_CARRIER:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(Ops o) { o.h(); }\n"
+                "void run(Ops o) { spawn inner(o); }\n";
+        wbody = "Ops o; o.h = cb; run(o);"; break;
     default: break;
+    }
+    /* The argument forms spawn from MAIN: inside a spawned `worker` the outer
+     * scan finds `cb` by name in the worker's body and masks the cell (the first
+     * draft of these cells passed on the pre-BUG-1290 build for that reason). */
+    if (r >= RCH_ARG_REASSIGN) {
+        snprintf(out, n,
+            "%s\n"
+            "void cb() { %s }\n"
+            "%s"
+            "u32 main() { %s return 0; }\n",
+            decls, body, extra, wbody);
+        return;
     }
     snprintf(out, n,
         "%s\n"

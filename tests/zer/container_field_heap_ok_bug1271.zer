@@ -1,0 +1,11 @@
+struct L { u32 x; }
+struct D { u32 id; L link; }
+u32 main() {
+    *D dd = alloc(D) orelse return;
+    dd.id = 7;
+    *L h = &dd.link;
+    *D d = @container(*D, h, link);
+    u32 r = d.id;
+    free(dd);
+    return r - 7;
+}

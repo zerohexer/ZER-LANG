@@ -2784,7 +2784,7 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 **For fresh sessions:** Run `make tags` first. Use `grep "function_name" tags` to find locations. Use `grep "pattern" file.c` to find specific code. Never read full files speculatively.
 
 ### Flag-Handler Matrix Audit (2026-04-14, automated)
-`bash tools/audit_matrix.sh checker.c` — cross-references control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
+(**Superseded 2026-09-25:** the tool is now BEHAVIOURAL — `bash tools/audit_matrix.sh ./zerc`, one compiled program per construct × context, in `make check`. The grep version below had drifted onto decoy `case` labels.) The original `bash tools/audit_matrix.sh checker.c` cross-referenced control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
 
 | Node | Missing Flag | Why it's a bug |
 |---|---|---|
@@ -6521,8 +6521,23 @@ on `LowerCtx`, and the single query `defers_stay_on_ast(ctx)` (= `label_count > 
 
 Consequences a session touching defer code must know:
 
-- **`emit_defer_stmt` and `zercheck_ir`'s AST defer analysis are now the LABEL path
-  only.** Both are gated on `IRInst.defer_fire_emit_ast`, which `make_defer_fire` — the
+- **UPDATE 2026-09-25 (BUG-1298): the template is lowered in EVERY function now.** A
+  labelled function still does not SPLICE it (the reasons below stand); instead the
+  push carries it (`IRInst.defer_tpl`, an `IRDeferTpl` of detached blocks) and the
+  emitter's `emit_defer_body` emits it INLINE at each AST-flagged fire and at every
+  C-level early exit (`emit_defers_from`), with fresh `_zer_bb<1<<24+n>` labels, through
+  `emit_ir_inst_guarded` — the one per-instruction emitter the regular and async block
+  loops also use. `emit_defer_stmt` is only the fallback for a body with no template.
+  The "never lower on the label path" rule below no longer applies: nothing REPLAYS the
+  AST for emission any more, and zercheck's AST scans look only for frees and uses,
+  which `pre_lower_orelse` leaves in place.
+- **`zercheck_ir`'s AST defer analysis is the LABEL path only.** At a return it applies
+  only the bodies of fires that REACH that return with no work after them
+  (`ir_fire_mark_returns`); a fire with work after (the eager fire at a `goto`) has its
+  uses AND frees applied in the forward pass. Every expression position gets both raw-AST
+  checks (`ir_defer_check_expr` = UAF + wrong-pool).
+- **`emit_defer_stmt` and `zercheck_ir`'s AST defer analysis were the LABEL path
+  only (superseded for emission by the update above).** Both are gated on `IRInst.defer_fire_emit_ast`, which `make_defer_fire` — the
   ONLY constructor of an `IR_DEFER_FIRE` — sets from that one query. Add a new fire site
   through that constructor or the two consumers will disagree with the lowerer, which is
   precisely how eleven goto/defer tests broke during this work.

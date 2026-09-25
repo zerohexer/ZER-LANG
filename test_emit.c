@@ -3029,13 +3029,15 @@ int main(void) {
         40,
         "@size(u32[10]) = 40 (not 4)");
 
-    /* BUG-286: Arena.over single-eval */
+    /* BUG-286: Arena.over single-eval. (BUG-1281: the backing store must be a
+     * NAMED buffer, so the side effect lives in the slice bound, not in a call
+     * returning the buffer — that call result is a second name for it.) */
     test_compile_and_run(
         "u8[64] g_buf;\n"
         "u32 counter = 0;\n"
-        "[]u8 next_buf() { counter += 1; return g_buf; }\n"
+        "u32 next_len() { counter += 1; return 32; }\n"
         "u32 main() {\n"
-        "    Arena a = Arena.over(next_buf());\n"
+        "    Arena a = Arena.over(g_buf[0..next_len()]);\n"
         "    return counter;\n"
         "}\n",
         1,

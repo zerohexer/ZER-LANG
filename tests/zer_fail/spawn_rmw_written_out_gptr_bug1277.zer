@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: non-atomic read-modify-write
+volatile u32 counter;
+volatile *u32 gp = &counter;
+void w() { *gp = *gp + 1; }
+u32 main() { ThreadHandle t = spawn w(); t.join(); return 0; }

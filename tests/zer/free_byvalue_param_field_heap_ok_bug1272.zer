@@ -1,0 +1,9 @@
+struct H { [*]u32 d; }
+void rel(H h) { free(h.d); }
+u32 main() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    s[0] = 3;
+    H h = { .d = s };
+    rel(h);
+    return 0;
+}

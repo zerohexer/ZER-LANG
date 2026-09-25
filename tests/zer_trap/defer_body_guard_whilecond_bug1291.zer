@@ -1,0 +1,16 @@
+// expect-trap
+// expect-trap-msg: defer cleanup
+u32 g = 0;
+u32[4] arr;
+void f(u32 k) {
+    u32 i = 0;
+    defer {
+        while (arr[i] > 7) { g += 1; }
+    }
+    i = k;
+
+    g += 100;
+
+    g += 1000;
+}
+u32 main() { f(100); return 0; }

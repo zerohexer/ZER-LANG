@@ -64,20 +64,20 @@ Mechanism: compiler-internals.md "Array slots — the three precisions".
 
 Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`).
 
-1. **A slot freed through an index and read back after the index was WRITTEN.**
-   `for (i..) { *T q = tbl[i] orelse return; free(q); } for (j..) { *T r = tbl[j] orelse return; r.v }`
-   compiles — dangling pointers are left in every slot. The `tbl[i]` FREED fact is dropped when
-   `i` is written (ir_kill_index_facts). Keeping it as a "some slot holds a freed pointer" fact
-   was drafted and dropped: it would refuse every loop that frees or consumes one slot per
-   iteration (`for (i..) { q = tbl[i]; use(q); free(q); }`, pinned as a positive by
-   `p33_safe_consume_no_reset`), because the analysis cannot tell that `i` never comes back. Fix sketch: a relational fact on the counter (monotone `i` with `i > i_free`) — the
-   `disjoint_lattice.v` direction. The reset idiom (`tbl[i] = null;` after the free) is what the
-   diagnostics teach where they fire.
-2. **An UNTRACKABLE index keeps the BUG-1074 posture.** An index that is an expression
-   (`g[k % 4]`), an address-taken local, or a name two locals share has no key: a free through a
-   read of such a slot is not recorded, and a MAYBE member of the wildcard is not blocking.
-   `g[k % 4] = x; a = g[k % 4]; free(a); q = g[k % 4]; q.v` compiles. Fix sketch: key an index
-   EXPRESSION by its syntactic form when every local in it is trackable (kill on any of them).
+1. ~~**A slot freed through an index and read back after the index was WRITTEN.**~~ — CLOSED
+   2026-09-25 (BUG-1302). The dropped FREED fact now survives on the array's wildcard
+   (`slot_freed_idx1` / `slot_freed_unknown`): relative to the counter when every write to it
+   since was a NON-WRAPPING increment (a for-step `k += 1` under `k < E` with no other write,
+   `ir_lower` `for_step_cannot_wrap`; or a 64-bit counter moving by 1), otherwise "some slot".
+   A read of the array through anything else, with no precise entry for that slot, is refused.
+   **Residual (over-rejection):** a WHILE-loop consume (`while (k < n) { … free(tbl[k]) …
+   k += 1; }` on a u32 counter) is not recognised as non-wrapping — use a `for`, or reset the
+   slot (`tbl[k] = null;`), which is what the diagnostic teaches.
+2. ~~**An UNTRACKABLE index keeps the BUG-1074 posture.**~~ — CLOSED for pure arithmetic
+   index expressions (2026-09-25, BUG-1301): `g[k % 4]` is keyed `[(k%4)]` while no local in it
+   is written (`ir_index_is_keyable` / `ir_index_key_text`; the kill checks every name inside
+   the brackets). Still unkeyed: an index with a CALL, a global, a field or another index in it,
+   an address-taken local, a name two locals share.
 3. **A drain exempts the whole array.** Which slots a free-through-a-variable-index loop
    reached is unknowable, so `for (i < 2) { free(arr[i]) }` over a 4-slot array leaks two
    allocations silently; so does handing the array to a callee (`drain(arr)` — needed, else a
@@ -86,14 +86,12 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 4. **A leak on an early return INSIDE the fill loop** (`for (i..) { *T a = alloc(T) orelse
    return; arr[i] = a; }`) is invisible: allocation ids are per LOCAL, so the null-edge drop of
    `a` (BUG-1071) also drops the earlier iterations' allocations that share its id.
-5. **A draining callee's UAF side.** After `drain(arr)` frees the elements, a read of a
-   precise slot (`arr[0]` stored by literal) is not refused — no FuncSummary says a callee frees
-   through a slice param at a variable index. Widening the elements at the call would refuse
-   every read-only callee (`sum(arr); a.v`).
-6. **A struct PARAM's field copied into the returned struct** (`H mk(G g) { H h; h.p = g.p;
-   return h; }`, then `free(a)` where `g.p == a`, then `mk(g).p.v`) compiles: the backstop covers
-   only direct reference params, and a by-value struct param has no bare handle to view.
-7. **The dynamic-freed auto-guard's return leaks.** `pool.free(handles[k]); handles[j].f` gets a
+5. ~~**A draining callee's UAF side.**~~ — CLOSED 2026-09-25 (BUG-1300):
+   `FuncSummary.frees_param_elems` (the callee frees a value read out of an element of param i,
+   directly or through a callee with the bit); the caller widens the array's slots to
+   MAYBE_FREED. A read-only callee has no bit and is unaffected. Params past 63 are not
+   represented.
+6. **The dynamic-freed auto-guard's return leaks.** `pool.free(handles[k]); handles[j].f` gets a
    runtime `if (j == k) return;` (checker.c, Handle arrays) that the leak pass does not report,
    although the remaining handles leak when it fires (`tests/zer/dyn_array_autoguard_crash.zer`
    compiles clean and its case 2 takes that return with three handles live).
@@ -104,8 +102,8 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 
 1. ~~**A callee frees an allocation through a GLOBAL, the caller reads its LOCAL alias**~~ —
    **CLOSED 2026-09-24 (BUG-1181)**: FuncSummary.freed_global + the call-site widening; SHAPE
-   p36. Residual: a free through a global reached via a FUNCPTR call is not summarised (the
-   target is unknown and no summary is applied at an indirect call). Original text:
+   p36. The FUNCPTR-call residual is closed by BUG-1294 (an indirect call applies every
+   summary's freed globals as MAYBE_FREED). Original text:
    (MEDIUM — accept-unsafe, silent). `g = a; drop_g(); a.v` where `void drop_g() { if (g) |p|
    { free(p); } g = null; }` compiles, and the read returns a recycled object's value. The
    store marks `a` escaped and no FuncSummary says "frees what global g points to" (the callee
@@ -115,18 +113,17 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    X), applied at the call by freeing every caller handle aliased by the `(IR_GLOBAL_ROOT_ID,
    "X")` entry. The Handle spellings trap at run time (generation check), so the raw-pointer
    forms are the live ones.
-2. **The atomic-cell rule is blind to WHOLE-AGGREGATE access** (MEDIUM — data race, silent).
-   With a thread doing `@atomic_add(&s.n, 1)` / `@atomic_add(&cnts[1], 1)`, main's `S t = s;`,
-   `s = { .n = 3 };`, `u32[4] c = cnts;`, `[*]u32 v = cnts[0..]; v[1] = 9;`, `clear(cnts)` and
-   `reset(&s)` (callee writes `p.n`) are accepted; only field- and element-precise keys are
-   checked. Fix sketch: record a whole-object plain access as the empty path, which
-   `atomic_paths_may_alias` must treat as aliasing every path of the symbol.
+2. ~~**The atomic-cell rule is blind to WHOLE-AGGREGATE access**~~ — CLOSED 2026-09-24g
+   (BUG-1295): a copy, assignment, view or `&` of the whole object (in the function or in a
+   callee reached during the window) conflicts with any atomic part of it.
 3. **An indirect call widens arena allocations to MAYBE_FREED** whenever any function in the
    program resets a non-local arena (BUG-1172). Sound, but a funcptr call in a function that
    keeps using an arena pointer is then refused even when the target never resets. Precision
    would need the funcptr-binding resolution the spawn scan already has.
-4. **`*u32[4]` (pointer to an array) emits invalid C** (`uint32_t[4]* p`) — LOW, loud (GCC
-   rejects). Accepted by the checker as a param, local or field.
+4. ~~**`*u32[4]` (pointer to an array) emits invalid C**~~ — CLOSED 2026-09-25 (BUG-1304):
+   refused at the type (`resolve_type` TYNODE_POINTER), with the slice / struct-wrapper remedy.
+   Supporting it would need a C declarator (`uint32_t (*p)[4]`) at every emission site that
+   names a type — none of the corpus spells it.
 5. **The out-param rule (BUG-1173) reports at the function's line** for an implicit return at
    the end of a void function — cosmetic.
 6. Over-rejections seen during the audit, not fixed: `u = t; t = u; consume(u); t.k` (t was
@@ -134,67 +131,48 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    after `set_g(a)`; a spawn target calling `free()` rejected as accessing the non-shared
    auto-slab global.
 
-## OPEN — allocator residuals of the ag10 round (2026-09-24f; MEDIUM — accept-unsafe; each measured on the fixed build)
+## OPEN — what remains of the ag10 allocator residuals after BUG-1268..1281 (2026-09-24g; LOW)
 
-BUG-1254..1267 closed the rest of the round. These still COMPILE; each needs more than a sink
-patch.
-
-1. **An arena's backing store stays addressable after `Arena.over()`** (MEDIUM, type confusion).
-   Two arenas over the same buffer (`Arena a = Arena.over(g); Arena b = Arena.over(g);`) hand
-   out the same bytes to both, and a plain write to the buffer (`gbuf[8] = 64;`) overwrites a
-   `[*]T` header living in an arena object — a forged `.len`, then an out-of-bounds write the
-   bounds check trusts. Fix sketch: a buffer handed to `Arena.over` is CONSUMED — any later
-   mention other than through the arena is refused. The catch is heap backing, whose `free(hb)`
-   is itself a mention and must stay legal: it needs a zercheck link (every arena allocation from
-   `a` dies with `hb`), which is also what item 2 needs.
-2. **`free(hb)` of a heap backing store leaves the arena's objects live** (MEDIUM, UAF).
-   `[*]u8 hb = alloc(u8, 64); Arena a = Arena.over(hb); *T t = a.alloc(T)…; free(hb); t.v`.
-   Fix sketch: record the backing allocation on the Arena local; its free invalidates the arena's
-   colour group the way `a.reset()` does (`ir_mark_arena_handles_state_of`).
-3. **A wrong-pool Handle across a function boundary** (MEDIUM, wrong object). `rd(h)` where `rd`
-   does `pb.get(x)` and `h` came from `pa`; the same through a global (`stash(h)` then
-   `pb.get(gh[0])`) and through a Ring. The generation check does not help: both pools start at
-   generation 0, so the read returns the OTHER pool's live object. The in-function wrong-pool
-   check has no cross-function half. Fix sketch: a per-param "which pool does the callee `get`
-   / `free` through" summary, checked against the argument's `pool_name` at the call.
-4. **`@container` provenance through a struct field** (MEDIUM). `H h = { .q = &ls[0] };
-   @container(*D, h.q, link)` — `ls` is an `L[2]`, not the `link` field of any `D`. The fact is
-   recorded on symbols and on `&expr`, not on compound keys. Fix sketch: carry
-   `ContainerProv` in the compound provenance map beside `prov_map_set`.
-5. **A callee that frees a FIELD of a BY-VALUE struct argument, handed stack memory** (LOW,
-   bad-free). `void rel(H h) { free(h.d); }` with `h.d = arr[0..]`. BUG-1258 asks what each
-   freed ARGUMENT is; the freed field of a by-value carrier is one level further in.
-6. **The caller-side free-aliasing rule (BUG-1264) over-approximates an arena reset**: the
-   summary says only "resets SOME arena", so an allocation from a caller-LOCAL arena passed to a
-   callee that resets a global one is refused. Zero corpus cost today; a per-arena summary
-   (`resets_arena` keyed by name) would make it exact.
+All six MEDIUM items of this entry are closed (arena backing ownership 1269/1281, heap backing
+free 1268, wrong-pool across a boundary 1270, `@container` through a field 1271, by-value field
+free 1272, per-arena reset precision 1268). What is left, each measured on the fixed build:
+- **The wrong-pool check is a RUN-time trap, and probabilistic.** Each pool/slab seeds its slot
+  generations from its own address (`_zer_gen_seed`), so a foreign handle traps at `get` /
+  `free`. Two pools' generations for one slot index can only meet after ~2^31 recycles of that
+  slot; a compile-time "which pool does the callee get through" summary would make it exact.
+- **The arena backing rule is flow-INSENSITIVE** (LOW, over-rejection): a buffer handed to
+  `Arena.over` anywhere in a function may not be mentioned anywhere else in it, even BEFORE the
+  `over` (`lb[0] = 1; Arena a = Arena.over(lb);`). Zero corpus cost. A backing store reached
+  through a dereference (`Arena.over(*b)`) is refused even when the arena does not escape.
+- **A function that turns a param into a backing store consumes the caller's argument even
+  when the arena dies in the callee** (`u32 use([*]u8 b) { Arena a = Arena.over(b); … }` —
+  the caller's buffer is then unusable after the call). Precision: an "arena escapes the
+  callee" test would allow the scratch idiom. Zero corpus cost today.
+- **Module scope of the whole-program scan**: consuming params and global backing stores are
+  resolved with `global_decl_lookup` outside any module context, so two modules declaring the
+  SAME function or global name can confuse the scan (same limitation as BUG-1269's global pass).
 
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.
-- **MEDIUM: a pointer FIELD of a `shared struct` is an unlocked channel.** `shared struct S { *Cell p; }`:
-  the LOAD of `s.p` is locked, the object it points at is not, and the spawn scan never looks
-  at it (`*Cell q = s.p; q.n += 1` in two threads, TSan race; with a heap object, a
-  cross-thread use-after-free shape). Fix sketch: treat the pointee of a pointer read out of a
-  shared struct as shared state — refuse a write through it unless it is itself shared/volatile,
-  or refuse pointer fields in shared structs whose pointee is neither.
-- **MEDIUM: an `@once` body is invisible to the spawn race scan** — deliberately a leaf, because
-  descending it rejects the legal publish-once idiom (`once_loser_wait.zer`: main writes before
-  the spawn and reads after the join). The race is `main` reading during the window. Fix sketch:
-  record the `@once` body's globals as thread-touched in the concurrent-window machinery (the
-  atomic-cell rule's `after_spawn_in_func` window), not in the spawn scan.
-- **MEDIUM: an atomic target reached through a POINTER does not create an atomic cell.**
-  `*u32 p = &g; @atomic_add(p, 1)` in the thread, or a helper `add1(*u32 p){ @atomic_add(p,1); }`
-  called with `&g`: main's plain `g += 1` is accepted (only the "verify ordering" warning).
-  `@atomic_add(&p.n, 1)` with `*S p = &gs` is refused for the WRONG reason ("stack local").
-  Fix sketch: resolve the operand through `for_each_write_target` / `rmw_arg_targets` as the
-  RMW rule does.
-- **MEDIUM: a global lent through a callee's RETURNED pointer** (`*u32 p = getp(); spawn w(p);
-  gv += 1;` with `getp(){ return &gv; }`, threadlocal sibling included). `collect_borrow_roots`
-  sees call ARGUMENTS only; a return-root summary (the `classify_return_root` machinery, with the
-  root's NAME) would close it.
-- **LOW: parameter aliasing into a scoped spawn** (`f(&v, &v)` where f spawns with one param and
-  writes through the other) — the borrow is intra-function.
+- ~~**MEDIUM: a `*opaque` field of a shared struct cast back to a ZER pointer**~~ — CLOSED
+  2026-09-25 (BUG-1299) for a cast (C-style, `@ptrcast`, `@pun`) of the field itself, of a local
+  initialised or assigned from it (sticky `Symbol.opaque_from_shared`), and of an if-unwrap
+  capture of it. **Residual (LOW):** the value handed to a ZER FUNCTION (`use(s.handle)` where
+  `use` casts its `*opaque` param) or returned from one (`*opaque get() { return s.handle; }`)
+  is not followed — a per-param "casts to a ZER pointer" summary would close it.
+- **LOW (over-rejection, from BUG-1276): a fire-and-forget thread may not write a global inside
+  `@once`** — the publish-once exemption needs the parent's window to END, which only a join
+  gives. Use a scoped spawn. Also the parent may not call ANY function that reaches the global
+  outside that same `@once` during the window.
+- ~~**LOW: parameter aliasing into a scoped spawn**~~ (`f(&v, &v)` where f spawns with one param
+  and writes through the other) — CLOSED 2026-09-25 (BUG-1303): per-function (lent i, used j)
+  param pairs (`Symbol.alias_pairs`), carried through callees that forward their params
+  (fixpoint in `check_alias_spawn_calls`) and through a local copy of a param
+  (`Symbol.param_alias_pos1`); a call passing one object as both is refused. Residual: the
+  pairs are keyed by POSITION up to 64 params, and "same object" is decided by NAME
+  (`alias_arg_root`) — two different pointers to one object that the checker cannot name
+  alike (`f(p, q)` with `q` computed through a call) are not matched.
 - **Over-rejections:** a heap pointer lent to a scoped spawn stays TRANSFERRED after `th.join()`
   (`t.v` / `free(t)` after the join refused, "freed at line <spawn>"); a local Barrier lent to a
   scoped spawn cannot be `@barrier_wait`-ed by the parent; a join followed by a use in the same
@@ -222,11 +200,9 @@ Each reproducer is in the ag9 report shape; none needs `cinclude`.
   `yield`, or re-read the global after it.
 - **A task that frees its parameter owns it** (BUG-1233): once polled, the caller's entry is
   escaped, so a task abandoned before it reaches the free leaks silently.
-- **BUG-1241 is syntactic**: only a DIRECT `param.f.g = param` store in the callee is summarised.
-  A store through a local copy (`*T x = b; s.b = x;`) or through a further helper is not, and
-  the carried pointer is then invisible to the carrier rule.
-- **BUG-1242 sees a DIRECT read of the global** (`gb`, `gb.p`, `gb orelse …`); a read through a
-  local pointer to the global's slot is not minted.
+- **BUG-1242/1289 resolve a pointer to the global's slot only when it is defined ONCE** (`*?*T slot
+  = &gb;`); a pointer retargeted between globals is not minted. (The local-copy and helper forms
+  of BUG-1241 are closed by BUG-1288.)
 - **`await gs.flag == 1` on a `shared struct` is refused** ("lock would be held across
   suspension"). The condition is evaluated inside ONE poll, so a lock around just the
   condition would be sound; the emitter does not lock an await condition yet, so the ban
@@ -249,11 +225,6 @@ Each reproducer is in the ag9 report shape; none needs `cinclude`.
 - **An out-parameter's allocation is not leak-checked** (`fill(&m)` then drop `m`): BUG-1228's
   entry is escaped for the same reason — no summary says the callee stored a FRESH allocation
   through `*out`. Same fix shape (`stores_alloc_through_param`).
-- **Two slot frees reported for the wrong reason.** `free(larr[i].p); free(larr[0].p);`
-  (a possible double free, i == 0) and the UAF sibling are refused, but as "never freed" leaks:
-  the variable-index free widens the literal slot to MAYBE_FREED and the later literal free of a
-  MAYBE entry is not reported as a double free. Verdict right, sentence wrong.
-
 ---
 
 ## OPEN — a qualified reference to the SECOND module's declaration of a shared name (2026-09-24, LOW — over-rejection; was a silent miscompile before BUG-1200)
@@ -358,16 +329,24 @@ defer count live at the label's lexical position (known at the LABEL for a backw
 a forward goto the label's enclosing-scope defer depth is known from collect_labels), plus
 the label's guard flag keyed per fired range.
 
-## OPEN — defer bodies in a function WITH A LABEL still use the AST emitter (2026-09-24, MEDIUM — a lost lock, a trap on valid code)
+## CLOSED 2026-09-25 — defer bodies in a function WITH A LABEL used the AST emitter (BUG-1298)
 
-Refactor L lowered defer bodies to IR only for functions without a label
-(`IRInst.defer_fire_emit_ast`). In a labelled function, measured by the 2026-09-24 audit
-(`/tmp` reproducers l1/l3/l4): a shared-struct read in an `if`/`while`/`for` CONDITION inside
-the defer body takes no mutex (the same body without a label does), and `switch` / `do-while`
-in the defer body emit "compiler bug: emit_defer_stmt has no handler" plus a runtime trap. Fix:
-finish refactor L for labelled functions (the goto guard-flag machinery is the reason it was
-not done), or, until then, refuse those statement kinds and shared reads in a labelled
-function's defer body at the checker so the failure is a diagnostic, not a trap/race.
+Every defer body is now lowered to an IR template at its registration, in every function.
+A labelled function still does not SPLICE it into the CFG (the goto guard / ARMED flags wrap
+the fire in C, and as IR branches their correlation would defeat leak analysis — see
+`defers_stay_on_ast`); the emitter emits the template INLINE at each such fire and at every
+C-level early exit (`emit_defers_from`), through the same instruction emitter as the rest of
+the function. Measured on the pre-fix build: the defer-body condition lock, the
+var-decl/for-init/while-cond guards, and `switch` / `do-while` / `@critical` in the body.
+zercheck_ir still checks such a body from its AST, and three holes in that path closed with
+it: the wrong-pool check was never run on it, every defer's frees were credited to every
+return (hiding a leak on a path that never passed the defer), and the eager fire at a `goto`
+checked no USES. `emit_defer_stmt` remains only as the fallback for a body with no template.
+
+**Still AST-checked (precision, not emission):** zercheck_ir treats a labelled function's
+defer body with the older AST scans rather than as CFG. Making it CFG needs the guard-flag
+correlation modelled (the Level-B guard machinery is for IMMUTABLE conditions; the guard
+flag is not).
 
 ## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 
@@ -507,13 +486,13 @@ Symbol; the qualified-reference half is the OPEN entry above.)
 
 ---
 
-## OPEN — AST-path container-method receivers are not module-prefixed (2026-09-21, LOW — reachable only from a global initializer or a labelled function's defer body)
+## OPEN — AST-path container-method receivers are not module-prefixed (2026-09-21, LOW — reachable only from a global initializer since BUG-1298)
 
 BUG-1040 prefixed the IR-path receiver (`emit_builtin_inline`) and the declaration arms. The
 AST emitter's arena / pool / slab method arms (`emit_expr` NODE_CALL, `aname` / `sname`)
-still spell the raw name. That path runs for global initializers (where only `Arena.over`
-— no receiver — is legal) and for defer bodies in functions WITH a label. A module function
-with a label whose defer body calls `pool.free(h)` would emit the bare name. Fix: the same
+still spell the raw name. That path now runs only for global initializers (where only
+`Arena.over` — no receiver — is legal); defer bodies in functions WITH a label go through the
+IR emitter since BUG-1298. Fix, if a receiver ever becomes legal there: the same
 local-vs-global mangling as the IR receiver; the AST path has no `IRFunc`, so the local
 check must use the checker's scope instead.
 
@@ -594,8 +573,9 @@ emitter zero tests sit beside each of the seven `signed_min_text` call sites.
 at it.** VRP trusts constants, so it must know which rendering RUNS. There are THREE, not
 two: the 3AC path (var-decl init, conditions, returns, compound-assign RHS) computes each
 node in its typed temp; a PLAIN assignment `x = <tree>` and the index arm are one C
-expression with bare-`int` literals; and a defer body in a function with a label goes
-through the AST emitter (the same bare-literal rendering). The typed fold (`tfold`)
+expression with bare-`int` literals; and a defer body in a function with a label went
+through the AST emitter (the same bare-literal rendering — until BUG-1298, which emits it
+from IR; the conservative defer-body rule below is kept, it only costs precision). The typed fold (`tfold`)
 models the first. The plain-assignment sink and any defer body trust only a constant for
 which all three agree (`tfold_exact`: every intermediate exact, fits `int`, equals the
 typed value) — measured necessary: trusting the typed value there let
@@ -1896,53 +1876,15 @@ of memory (BUG-1175). What remains is a design note, not a hole: `*T` in an aggr
 non-null "by trap", not by construction. A definite-initialization analysis (option (b)) would
 move the report to compile time; nothing depends on it for soundness.
 
-## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned (2026-09-09, LOW — over-rejection, valid program refused)
+## CLOSED 2026-09-25 — `&packed.byte_field` was rejected although a u8 cannot be misaligned (BUG-1305)
 
-**Symptom.** Taking the address of a BYTE-typed member of a packed struct is refused,
-in both spellings:
-
-    packed struct P { u8 a; u8[4] w; }
-    *u8 q = &p.w[0];          // rejected — `points into a PACKED struct field`
-    packed struct Q { u8 a; u32 w; u8 b; }
-    *u8 q = &p.b;             // rejected, and has been since BUG-786
-
-A `u8` has alignment 1, so no access through either pointer can ever be misaligned.
-Both are valid programs.
-
-**Root cause.** `addr_of_is_packed_field` (checker.c) asks only whether the access path
-crosses a packed aggregate. It never consults the alignment of the thing whose address
-is being taken, so it cannot tell `&p.u32_field` (a real hazard) from `&p.u8_field`
-(harmless).
-
-**Why the obvious fix was not bundled with BUG-972.** BUG-972 peeled INDEX in that gate
-to close the REAL hole (`&p.w[0]` on a `u32[2]` field — offsetof 1, a misaligned 32-bit
-store) and the byte case became rejected as a side effect. Making the gate
-alignment-aware would RELAX a shipped rule, which is the accept-unsafe change class:
-per "Sound relaxation (reject→accept)" in docs/compiler-internals.md, a bug there is a
-shipped fault rather than a harmless refusal, so it needs its own commit, its own
-negative matrix, and its own measurement. Bundling it into a hole-closing commit is
-exactly the mistake that discipline exists to prevent.
-
-Note the SLICE half of BUG-972 IS alignment-aware — `packed_array_field_view` keys on
-`type_alignment_bytes`, so `[*]u8 v = f.payload;` compiles (pinned by
-`tests/zer/packed_u8_array_view_ok.zer`). The asymmetry is deliberate: that rule is new,
-so its precision was designed in.
-
-**Measured cost: ZERO.** `make check` is green across the 18 corpus files that use packed
-structs, so nothing real is being refused today. That is what makes deferring it correct
-rather than lazy.
-
-**Fix sketch.** Gate `addr_of_is_packed_field` on `type_alignment_bytes(target) > 1`,
-where `target` is the type of the addressed member (the array ELEMENT type when an INDEX
-step was peeled). That also relaxes `&p.b`. Verify against
-`tests/zer_fail/packed_array_elem_addr.zer` and the p22 cells, which must all still
-reject, and add a positive for each newly-accepted byte spelling.
-
-**Tripwire.** `tests/zer_fail/packed_u8_array_elem_addr.zer` pins the CURRENT rejection
-and says in its header that the rejection is the over-rejection. **DELETE that file when
-this is fixed** — leaving it would turn a deliberate record into a rule nobody meant.
-
----
+`addr_of_is_packed_field` now answers "no hazard" when the addressed operand's own type has
+alignment 1 (`type_alignment_bytes`), the test the slice half (`packed_array_field_view`) has
+made since BUG-972. `&p.b` (u8), `&p.w8[1]` (u8 array element) and `&p.bs` (a struct of bytes)
+compile; every u32 / u32-array / aligned-struct form stays refused (the zer_fail packed set, all
+re-run). An unknown operand type keeps the refusal. The pinned over-rejection
+`tests/zer_fail/packed_u8_array_elem_addr.zer` was removed as its own header instructed;
+`tests/zer/packed_byte_addr_ok_bug1305.zer` replaces it.
 
 ## ~~OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK~~ — CLOSED 2026-09-13 as BUG-1013
 
@@ -2384,7 +2326,7 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 ### Their remaining three (no live negative here; verify before adopting)
 
 - **BUG-913** an if-unwrap capture overwrote a same-named outer local
-- **BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration
+- ~~**BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration~~ — CLOSED 2026-09-25 (BUG-1306)
 - **BUG-923** a bit-slice write on a `uN` value did not compile
 
 ### Suggested order for this branch
@@ -2887,7 +2829,7 @@ malformed arguments are silently ignored. **NOTE: also found independently on br
 - **negative const into unsigned** (`osp1a7`): `neg_const_into_unsigned_assign`,
   `_tilde`. NB: distinct from the ALLOWED unsigned ops `~0` / `0 - 1`; see the
   corpus-cost rule in CLAUDE.md before widening.
-- **misc** (`yzhu1s`): `bitcast_bare_array_source`, `stack_limit_root_entry`.
+- **misc** (`yzhu1s`): `bitcast_bare_array_source` (`stack_limit_root_entry` is CLOSED as BUG-1296).
 - **bool as a forged-tag carrier** (`fhf8rn/bool_mint_ptrcast`).
 
 ---
@@ -3617,7 +3559,7 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 |---|---|---|---|
 | ~~O1~~ **DONE (BUG-829)** | `defer sensor_close(dev)` reported as a leak; the DIRECT call is recognised | **39294y** BUG-812 (`ir_defer_free_arg`) | `cinterop_defer_close_ok` and `defer_extern_destructor_no_false_leak` both hard-error. This is the flagship "Safe C Library Interop" example in `reference.md` — the docs assert it compiles and it does not. pjtawx BUG-805 is the same fix; take either, keep both tests |
 | ~~O2~~ **DONE (BUG-833)** | Sticky packed-derived flag refuses a re-cleared pointer | **87xihb** BUG-804 (boundary positive) | `packed_aligned_forms_ok` hard-errors on main. The fix SETS on a packed-derived RHS and CLEARS otherwise |
-| **O3 — STILL OPEN** | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
+| **O3 — STILL OPEN** | `&&`/`||` do not narrow their RHS | **87xihb** BUG-800 | `if (i < 4 && arr[i] > 0)` — the canonical guarded idiom, and the exact shape the auto-guard warning tells users to write — still carries a runtime guard. (Since BUG-1273 that check is the INLINE single-read trap at the access, not the hoisted early-return guard, which returned from the function even when the RHS never ran.) **PRECISION ONLY on main** (warning, compiles). It becomes REQUIRED if the always-OOB verdict is ever promoted at short-circuit position |
 
 ### Quality / no-longer-silent (not soundness)
 
@@ -3674,8 +3616,8 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
   fixed 2026-06-26; 13 probes show every post-join index auto-guarded. The architectural
   reason to wire it survives; the urgency does not.
 - **`f64` -> `f32` narrowing overflow is C UB** (pmytnl, LOW latent).
-- **Two DISTINCT `@once` blocks touching the same global are not mutually exclusive**
-  (39294y, LOW).
+- ~~**Two DISTINCT `@once` blocks touching the same global are not mutually exclusive**
+  (39294y, LOW).~~ CLOSED 2026-09-24g (BUG-1276): refused at the spawn scan.
 - **Two arena allocations cannot be LINKED** (4z36e0, over-rejection). Both share the
   arena's lifetime. Found because the doc's Arena example showed exactly that line and had
   never been compiled.
@@ -6082,45 +6024,12 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 
 ---
 
-## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
+## CLOSED 2026-09-25 — `tools/audit_matrix.sh` was STALE (16 false positives)
 
-**Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …
-check" gaps (RETURN/BREAK/CONTINUE/GOTO/YIELD/AWAIT/SPAWN × defer_depth/
-critical_depth/in_loop/in_interrupt). **All 16 are FALSE POSITIVES** — the
-contracts they claim are missing are actually enforced.
-
-**Root cause:** the script hardcodes a line window (`$1 > 8500 && $1 < 11000`)
-and extracts the handler body as "first `case NODE_X:` in that window → next 200
-lines." checker.c has grown to 16k+ lines, and the SAME control-flow case labels
-now appear in FIVE different switches (scan_frame, collect_labels, validate_gotos,
-the real `check_stmt`, plus the emit-side). The script grabs a DECOY case (e.g.
-`case NODE_RETURN:` at ~9062 in a non-checking switch) instead of the real
-handler. The actual context-ban checks live at checker.c ~6730
-(`zer_return_allowed_in_context(defer_depth, critical_depth)` and the break/
-continue siblings) and ~11237 (the check_stmt switch) — both outside the tool's
-window. Verified by hand: every one of the 16 contracts holds.
-
-**Why it matters (and why LOW):** it is a MANUAL audit, NOT a `make check` gate,
-so it gates nothing and cannot fail CI. BUT in its current state it cannot
-surface a *real* flag-handler gap — the 16-line noise floor would bury it (same
-failure mode as "CRLF masks the audits"). So the flag-handler dimension currently
-has no working automated guard, unlike the switch-exhaustiveness dimension (now a
-hard `-Werror=switch` gate, 2026-06-27).
-
-**Fix sketch:** stop using a line range. Anchor on the real `check_stmt` function
-(find its `switch (node->kind)` by walking from the `check_stmt` definition), and
-within THAT switch only, extract each control-flow case to its `break`. Or
-better, drop the grep heuristic entirely and assert the contracts a different way
-(e.g. a small unit test that feeds each `return/break/.../spawn`-in-`defer`/
-`@critical` program through the checker and asserts rejection — those negative
-`.zer` tests already exist in `tests/zer_fail/`, so the tool is arguably
-redundant and could be retired in favor of them).
-
-**Tripwire:** none yet (the negative `.zer` tests in `tests/zer_fail/` —
-`*_in_critical.zer`, defer-ban tests — are the real guarantee; this tool was
-meant to be a static cross-check of them).
-
----
+Rewritten as a BEHAVIOURAL matrix, as the fix sketch proposed: 25 cells, one compiled program
+per construct × context, each reject cell asserting the rule's own wording (so another rule
+cannot mask it), plus boundary cells that must compile. In `make check` after the emit audit.
+Verified to fire against a stub compiler that accepts everything (21 mismatches).
 
 ## OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
 

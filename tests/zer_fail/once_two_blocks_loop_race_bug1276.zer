@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'g'
+u32 g = 0;
+void a() { @once { for (u32 i = 0; i < 5000000; i += 1) { g += 1; } } }
+void b() { @once { for (u32 i = 0; i < 5000000; i += 1) { g += 1; } } }
+u32 main() {
+    ThreadHandle t1 = spawn a();
+    ThreadHandle t2 = spawn b();
+    t1.join();
+    t2.join();
+    if (g != 10000000) { return 1; }
+    return 0;
+}

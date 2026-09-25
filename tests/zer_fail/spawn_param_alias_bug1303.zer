@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: both reach 'v'
+// BUG-1303: f lends param a to a scoped spawn and writes through param b before the
+// join. Its own borrow check sees two names; the caller passes ONE object as both,
+// so the thread and the parent write v at the same time. Accepted before the fix.
+void w(*u32 p) { *p = *p + 1; }
+void f(*u32 a, *u32 b) {
+    ThreadHandle t = spawn w(a);
+    *b = 5;
+    t.join();
+}
+u32 main() {
+    u32 v = 0;
+    f(&v, &v);
+    return 0;
+}

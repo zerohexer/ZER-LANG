@@ -318,7 +318,8 @@ static const char *vshape_flags(VShape s) {
  * No `default:` in the switches, so adding an RFORM value fails the build until
  * both sinks are taught it.
  * ------------------------------------------------------------------------- */
-typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
+typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
+               RFORM_GPTR_COPY_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
                RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
@@ -354,6 +355,8 @@ static const char *rform_name(RForm f) {
     switch (f) {
     case RFORM_NAMED_COMPOUND:  return "named g+=1";
     case RFORM_WRITTEN_OUT:     return "written g=g+1";
+    case RFORM_GPTR_WRITTEN_OUT: return "written *gp=*gp+1";
+    case RFORM_GPTR_COPY_WRITTEN_OUT: return "written p=gp;*p=*p+1";
     case RFORM_LOCAL_ALIAS:     return "local *p+=1";
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
@@ -393,6 +396,10 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     switch (f) {
     case RFORM_NAMED_COMPOUND: *helper = "";                                    *body = "g += 1;";        break;
     case RFORM_WRITTEN_OUT:    *helper = "";                                    *body = "g = g + 1;";     break;
+    /* BUG-1277: the written-out RMW THROUGH a global pointer — the write side
+     * resolved `*gp` to g, the read side matched g only by name. */
+    case RFORM_GPTR_WRITTEN_OUT: *helper = "volatile *u32 gp = &g;";           *body = "*gp = *gp + 1;"; break;
+    case RFORM_GPTR_COPY_WRITTEN_OUT: *helper = "volatile *u32 gp = &g;";      *body = "volatile *u32 p = gp; *p = *p + 1;"; break;
     case RFORM_LOCAL_ALIAS:    *helper = "";                                    *body = "volatile *u32 p = &g; *p += 1;"; break;
     case RFORM_PTR_PARAM:      *helper = "void bump(volatile *u32 p){ *p += 1; }"; *body = "bump(&g);";   break;
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";

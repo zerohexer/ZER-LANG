@@ -1,0 +1,18 @@
+// BUG-1298: a C-level auto-guard early return (a loop condition the IR lowering
+// leaves to the emitter) fires the pending defers through emit_defers_from, which
+// replayed the body through the AST-only defer emitter — a switch there became
+// 'compiler bug: no handler' plus a trap. Now emitted from the body's IR template.
+u32 g = 0;
+u32[4] arr;
+u32 f(u32 i) {
+    defer {
+        switch (i) {
+            1 => { g += 1; }
+            default => { g += 10; }
+        }
+    }
+    while (arr[i] > 7) { g += 1; }
+    for (u32 j = arr[i]; j < 1; j += 1) { g += 1; }
+    return 5;
+}
+u32 main() { u32 r = f(100); if (g != 10) { return 1; } if (r != 0) { return 2; } return 0; }

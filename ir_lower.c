@@ -115,6 +115,12 @@ typedef struct {
      * user writes it. Inside one, the guard declines and the emitter's trapping
      * form is used instead. */
     int critical_depth;
+    /* BUG-1287: two more scopes a guard's early return must not leave — a @once
+     * body (the done-publish that loser threads wait on would never run: a hang)
+     * and code between @sem_acquire and @sem_release written straight-line in
+     * this function (the permit would never be returned: the next acquire hangs). */
+    int once_depth;
+    int sem_held;
     int active_guard_flag;
     int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
@@ -185,6 +191,7 @@ typedef struct {
  * ir_validate enforces the invariant, so a new emission path cannot reintroduce
  * it. BOTH raw emit helpers route through here. */
 static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;   /* BUG-1291 */
     IRBlock *bb = &ctx->func->blocks[ctx->current_block];
     if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
         ctx->current_block = ir_add_block(ctx->func, ctx->arena);
@@ -1398,6 +1405,42 @@ static void materialise_defers_from(LowerCtx *ctx, int base) {
  * carries an armed gate. Functions WITHOUT a label (the overwhelming majority, and
  * where the safety wins are) get the IR treatment; functions with one keep exactly
  * the behaviour they had. */
+/* BUG-1302: `for (…; k < E; k += 1)` (or `k = k + 1`, `E > k`) with no write to k
+ * in the condition or the body: every step runs with k < E <= max, so k + 1 does
+ * not wrap. Syntactic, and conservative on anything else. */
+static bool for_step_cannot_wrap(Node *node) {
+    Node *c = node->for_stmt.cond, *st = node->for_stmt.step;
+    if (!c || !st || c->kind != NODE_BINARY || st->kind != NODE_ASSIGN) return false;
+    Node *k = NULL;
+    if (c->binary.op == TOK_LT) k = c->binary.left;
+    else if (c->binary.op == TOK_GT) k = c->binary.right;
+    if (!k || k->kind != NODE_IDENT) return false;
+    Node *t = st->assign.target;
+    if (!t || t->kind != NODE_IDENT || t->ident.name_len != k->ident.name_len ||
+        memcmp(t->ident.name, k->ident.name, k->ident.name_len) != 0) return false;
+    Node *v = st->assign.value;
+    bool one = false;
+    if (st->assign.op == TOK_PLUSEQ)
+        one = v && v->kind == NODE_INT_LIT && v->int_lit.value == 1;
+    else if (st->assign.op == TOK_EQ && v && v->kind == NODE_BINARY &&
+             v->binary.op == TOK_PLUS) {
+        Node *l = v->binary.left, *r = v->binary.right;
+        bool ls = l && l->kind == NODE_IDENT && l->ident.name_len == k->ident.name_len &&
+                  memcmp(l->ident.name, k->ident.name, k->ident.name_len) == 0;
+        bool rs = r && r->kind == NODE_IDENT && r->ident.name_len == k->ident.name_len &&
+                  memcmp(r->ident.name, k->ident.name, k->ident.name_len) == 0;
+        one = (ls && r && r->kind == NODE_INT_LIT && r->int_lit.value == 1) ||
+              (rs && l && l->kind == NODE_INT_LIT && l->int_lit.value == 1);
+    }
+    if (!one) return false;
+    const char *nm = k->ident.name;
+    uint32_t nl = (uint32_t)k->ident.name_len;
+    if (ast_name_mutated_or_addrd(c, nm, nl)) return false;
+    if (node->for_stmt.body && ast_name_mutated_or_addrd(node->for_stmt.body, nm, nl))
+        return false;
+    return true;
+}
+
 static bool defers_stay_on_ast(LowerCtx *ctx) {
     return ctx->label_count > 0;
 }
@@ -1559,11 +1602,13 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     /* BUG-1222: nor when the function's result has no zero value (an enum
      * without a 0 variant — the literal return below would forge one). */
     bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+    bool no_leave = ctx->critical_depth > 0 || ctx->defer_body_depth > 0 ||
+                    ctx->once_depth > 0 || ctx->sem_held > 0;   /* BUG-1287 */
+    if (no_leave || no_zero) {
         IRInst tr = make_inst(IR_TRAP, g->line);
         /* literal_kind names the reason for the emitter's message:
          * 0 = a scope that cannot be left, 1 = no zero value to return */
-        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        tr.literal_kind = no_leave ? 0 : 1;
         emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -1882,6 +1927,24 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
             else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
             else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
             else break;
+            /* BUG-1307: `S.alloc_ptr()` / `S.free_ptr(p)` — the auto-slab builtins,
+             * which the universal alloc(S) / free(p) also lower to — name the struct
+             * TYPE as their receiver. It has the shared struct's type, so it was
+             * taken for a shared ROOT and the emitter locked `&S._zer_mtx`: GCC
+             * "'S' undeclared". A type receiver holds no data and needs no lock. */
+            if (cur->kind == NODE_FIELD && next->kind == NODE_IDENT) {
+                const char *fm = cur->field.field_name;
+                size_t fl = cur->field.field_name_len;
+                bool type_method = (fl == 5 && memcmp(fm, "alloc", 5) == 0) ||
+                                   (fl == 9 && memcmp(fm, "alloc_ptr", 9) == 0) ||
+                                   (fl == 4 && memcmp(fm, "free", 4) == 0) ||
+                                   (fl == 8 && memcmp(fm, "free_ptr", 8) == 0);
+                /* The checker routes ANY struct-typed receiver of these four to
+                 * the auto-slab (checker.c "Task.alloc() / Task.free()"), so the
+                 * same test answers it here. */
+                if (type_method &&
+                    type_dispatch_kind(checker_get_type(c, next)) == TYPE_STRUCT) break;
+            }
             Type *nt = checker_get_type(c, next);
             if (nt) {
                 Type *eff = type_unwrap_distinct(nt);
@@ -3084,6 +3147,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+        /* BUG-1287: a straight-line semaphore hold (see LowerCtx.sem_held). The
+         * acquire counts BEFORE its own statement is lowered is irrelevant — it
+         * holds no guarded access. */
+        if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+            memcmp(expr->intrinsic.name, "sem_acquire", 11) == 0)
+            ctx->sem_held++;
+        else if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+                 memcmp(expr->intrinsic.name, "sem_release", 11) == 0 && ctx->sem_held > 0)
+            ctx->sem_held--;
 
         /* Rewrite idents in expression to use correct local names */
         rewrite_idents(ctx, expr);
@@ -3426,6 +3498,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
+            step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
             ctx->current_stmt_shared_root = prev_step_shared;
             if (step_root) {
@@ -4118,7 +4191,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
             int arm_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-1275: a bare arm `0 => g.x = 5,` is a lone EXPR_STMT, not a block,
+             * and the per-statement shared-struct lock is taken only by the BLOCK
+             * lowering — so the store ran with no mutex while the braced spelling
+             * locked. Lower a non-block body as a one-statement block (a node built
+             * here; the AST keeps its shape for every other consumer). */
+            Node *arm_body = arm->body;
+            if (arm_body && arm_body->kind != NODE_BLOCK) {
+                Node *blk = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                Node **one = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+                if (blk && one) {
+                    memset(blk, 0, sizeof(Node));
+                    blk->kind = NODE_BLOCK;
+                    blk->loc = arm_body->loc;
+                    one[0] = arm_body;
+                    blk->block.stmts = one;
+                    blk->block.stmt_count = 1;
+                    arm_body = blk;
+                }
+            }
+            lower_stmt(ctx, arm_body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4402,6 +4494,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
+        /* BUG-1298: filled below once the template is lowered. */
+        IRDeferTpl *dtpl = (IRDeferTpl *)arena_alloc(ctx->arena, sizeof(IRDeferTpl));
+        if (dtpl) memset(dtpl, 0, sizeof(*dtpl));
+        push.defer_tpl = dtpl;
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -4478,12 +4574,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->defer_tpl_count[ctx->defer_count]  = 0;
             ctx->defer_tpl_first[ctx->defer_count]  = -1;
             ctx->defer_tpl_exit[ctx->defer_count]   = 0;
-            /* BUG-965: on the raw-AST path, do not lower a template at all. Lowering
-             * would be wasted, and worse than wasted: pre_lower_orelse REWRITES the
-             * nodes it visits, so the emitter's emit_defer_stmt would then replay an
-             * AST this pass had already mutated — the "never lower the same AST
-             * twice" invariant, hit from inside one lowering. */
-            if (!defers_stay_on_ast(ctx)) {
+            /* BUG-1298: lowered in EVERY function now. BUG-965 declined to lower a
+             * template in a function with a label because the emitter then replayed
+             * the raw AST (emit_defer_stmt) that lowering had already rewritten. The
+             * emitter now emits the TEMPLATE there too, so nothing replays the AST
+             * for emission; zercheck_ir's AST scan of such a body only looks for
+             * frees and uses, which pre_lower_orelse leaves in place. */
+            {
                 int saved_block = ctx->current_block;
                 int saved_n     = ctx->defer_count;
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
@@ -4514,6 +4611,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ctx->defer_tpl_first[ctx->defer_count]  = tpl_first;
                     ctx->defer_tpl_exit[ctx->defer_count]   =
                         (tpl_exit >= 0 && tpl_exit < tpl_n) ? tpl_exit : tpl_n - 1;
+                    if (dtpl) {
+                        dtpl->blocks = tpl;
+                        dtpl->count  = tpl_n;
+                        dtpl->first  = tpl_first;
+                        dtpl->exit   = ctx->defer_tpl_exit[ctx->defer_count];
+                    }
                 }
                 ctx->func->block_count = tpl_first;   /* extract */
             }
@@ -4628,7 +4731,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         emit_inst(ctx, br);
 
         ctx->current_block = bb_body;
+        ctx->once_depth++;   /* BUG-1287 */
         lower_stmt(ctx, node->once.body);
+        ctx->once_depth--;
         ensure_terminated(ctx, bb_skip);
 
         ctx->current_block = bb_skip;

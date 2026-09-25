@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1301: an index EXPRESSION (`g[k % 4]`) had no key, so a free through a read of
+// the slot was not recorded and a second read of the same slot returned the freed
+// object. Expression keys are now tracked while none of their locals is written.
+struct T { u32 v; }
+?*T[4] g;
+u32 main() {
+    u32 k = 5;
+    *T x = alloc(T) orelse { return 1; };
+    g[k % 4] = x;
+    *T a = g[k % 4] orelse { return 2; };
+    free(a);
+    *T q = g[k % 4] orelse { return 3; };
+    return q.v;
+}

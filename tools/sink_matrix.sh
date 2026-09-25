@@ -910,6 +910,57 @@ cell p43_global_holds_arg  reject "$P43"' u32 main(){ *T43 t = alloc(T43) orelse
 cell p43_safe_distinct     compile "$P43"' u32 main(){ *T43 a = alloc(T43) orelse return; defer free(a); *T43 b = alloc(T43) orelse return; return two43(a, b); }'
 cell p43_safe_global_reset compile "$P43"' u32 main(){ *T43 t = alloc(T43) orelse return; g43 = t; g43 = null; return one43(t); }'
 
+# SHAPE p44 (BUG-1274, 1278, 1279, 1280): a frame-bound value that reaches a
+# sink through a CONDITIONAL reassignment, a cast in the MIDDLE of a reference
+# path, or a DETACHED thread started by a callee.
+echo "===== SHAPE p44 = conditional reassign / interior cast / callee-started detached thread ====="
+P44='u32 gx44; u32 gy44; struct In44{u32 v;} struct Hd44{*In44 in;} shared struct S44{u32 x;} S44 gs44; Slab(S44) sl44; void gr44(*S44 w){ w.x = 1; } void mid44(*S44 w){ spawn gr44(w); } void jmid44(*S44 w){ ThreadHandle t = spawn gr44(w); t.join(); }'
+cell p44_cond_reassign_return reject "$P44"' *u32 c(bool k){ u32 loc = 1; *u32 p = &loc; if (k) { p = &gx44; } return p; } u32 main(){ return 0; }'
+cell p44_cond_reassign_store  reject "$P44"' void c(bool k){ u32 loc = 1; *u32 p = &loc; if (k) { p = &gx44; } g_p = p; } u32 main(){ return 0; }'
+cell p44_interior_cast_store  reject "$P44"' void st(Hd44 h){ g_p = &((*In44)h.in).v; } u32 main(){ return 0; }'
+cell p44_detached_via_callee  reject "$P44"' u32 main(){ S44 l; mid44(&l); return 0; }'
+cell p44_detached_then_free   reject "$P44"' u32 main(){ *S44 p = sl44.alloc_ptr() orelse return; mid44(p); sl44.free_ptr(p); return 0; }'
+# BOUNDARY: an unconditional reassignment replaces the taint; two globals; a
+# global to the detached callee; a callee that JOINS before returning.
+cell p44_safe_uncond_reassign compile "$P44"' *u32 c(){ u32 loc = 1; *u32 p = &loc; p = &gx44; return p; } u32 main(){ return 0; }'
+cell p44_safe_cond_two_globals compile "$P44"' *u32 c(bool k){ *u32 p = &gx44; if (k) { p = &gy44; } return p; } u32 main(){ return 0; }'
+cell p44_safe_detached_global compile "$P44"' u32 main(){ mid44(&gs44); return 0; }'
+cell p44_safe_joined_then_free compile "$P44"' u32 main(){ *S44 p = sl44.alloc_ptr() orelse return; jmid44(p); sl44.free_ptr(p); return 0; }'
+
+# SHAPE p45 (BUG-1300..1302): an ARRAY SLOT that still holds a freed pointer —
+# freed by a CALLEE that drains the array, freed through an index EXPRESSION, or
+# freed through a counter that has since moved on. BOUNDARY: a read-only callee;
+# a slot refilled after the drain; the consume loop reading through the counter
+# it frees with; a slot reset to null after the free.
+echo "===== SHAPE p45 = slot freed by a draining callee / expression index / moved counter ====="
+P45='struct T45 { u32 v; }
+void drain45([*]?*T45 a) { for (u32 i = 0; i < a.len; i += 1) { if (a[i]) |p| { free(p); } } }
+u32 sum45([*]?*T45 a) { u32 t = 0; for (u32 i = 0; i < a.len; i += 1) { if (a[i]) |p| { t += p.v; } } return t; }
+'
+cell p45_drain_callee_read  reject "$P45"' u32 main(){ ?*T45[2] a; a[0] = alloc(T45); a[1] = alloc(T45); drain45(a); *T45 x = a[0] orelse { return 0; }; return x.v; }'
+cell p45_expr_index_reread  reject "$P45"'?*T45[4] g; u32 main(){ u32 k = 5; *T45 x = alloc(T45) orelse { return 1; }; g[k % 4] = x; *T45 a = g[k % 4] orelse { return 2; }; free(a); *T45 q = g[k % 4] orelse { return 3; }; return q.v; }'
+cell p45_moved_counter_read reject "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; free(q); } for (u32 j = 0; j < 4; j += 1) { *T45 r = t[j] orelse { return 2; }; if (r.v != 0) { return 3; } } return 0; }'
+cell p45_counter_reset_read reject "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } u32 k = 0; for (k = 0; k < 4; k += 1) { *T45 q = t[k] orelse { return 1; }; free(q); } k = 0; *T45 r = t[k] orelse { return 2; }; return r.v; }'
+cell p45_safe_readonly_callee compile "$P45"' u32 main(){ ?*T45[2] a; *T45 x = alloc(T45) orelse { return 1; }; a[0] = x; u32 s = sum45(a); *T45 y = a[0] orelse { return 2; }; u32 r = y.v + s; free(y); return r; }'
+cell p45_safe_consume_loop compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } u32 n = 0; for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; n += q.v; free(q); } return n; }'
+cell p45_safe_reset_after_free compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; free(q); t[i] = null; } u32 n = 0; for (u32 j = 0; j < 4; j += 1) { if (t[j]) |r| { n += r.v; } } return n; }'
+
+# SHAPE p46 (BUG-1303): a scoped-spawn BORROW that reaches the caller's object
+# through two PARAMS — the callee lends one and uses the other in the window, and
+# the caller passes one object as both. BOUNDARY: distinct objects; the second
+# param used only after the join.
+echo "===== SHAPE p46 = one object passed as two params of a scoped-spawn lender ====="
+P46='void w46(*u32 p) { *p = *p + 1; }
+void lend46(*u32 a, *u32 b) { ThreadHandle t = spawn w46(a); *b = 5; t.join(); }
+void late46(*u32 a, *u32 b) { ThreadHandle t = spawn w46(a); t.join(); *b = 5; }
+'
+cell p46_same_object_twice  reject "$P46"' u32 main(){ u32 v = 0; lend46(&v, &v); return 0; }'
+cell p46_same_via_pointer   reject "$P46"' u32 main(){ u32 v = 0; *u32 p = &v; lend46(p, &v); return 0; }'
+cell p46_local_copy_used    reject "$P46"' void cp46(*u32 a, *u32 b) { *u32 q = b; ThreadHandle t = spawn w46(a); *q = 5; t.join(); } u32 main(){ u32 v = 0; cp46(&v, &v); return 0; }'
+cell p46_forwarding_callee  reject "$P46"' void fw46(*u32 a, *u32 b) { lend46(a, b); } u32 main(){ u32 v = 0; fw46(&v, &v); return 0; }'
+cell p46_safe_distinct      compile "$P46"' u32 main(){ u32 v = 0; u32 x = 0; lend46(&v, &x); return 0; }'
+cell p46_safe_after_join    compile "$P46"' u32 main(){ u32 v = 0; late46(&v, &v); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

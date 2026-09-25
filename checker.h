@@ -445,6 +445,15 @@ typedef struct {
     struct AtomicArgRec { Symbol *callee; int argi; Symbol *g; Symbol *caller;
                           int caller_param; } *atomic_args;
     int atomic_arg_n, atomic_arg_cap;
+    /* BUG-1303: direct calls passing one object as two pointer arguments. */
+    struct AliasCallRec { Symbol *callee; int line; int argc;
+                          const char **roots; uint32_t *root_lens; } *alias_calls;
+    int alias_call_n, alias_call_cap;
+    /* BUG-1303: calls forwarding the caller's params (for the pair fixpoint). */
+    struct ParamFwdRec { Symbol *caller; Symbol *callee; int argc; signed char *pparam; }
+        *param_fwds;
+    int param_fwd_n, param_fwd_cap;
+    uint64_t lent_param_live_mask;   /* params lent to a still-live scoped thread */
     int atomic_plain_write_capacity;
 
     /* A6-full slice 3: struct-field atomic cells `@atomic_*(&s.f)` on a plain

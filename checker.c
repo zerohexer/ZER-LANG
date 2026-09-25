@@ -1346,6 +1346,10 @@ static void check_call_vs_lent_globals(Checker *c, Node *call);   /* BUG-1125 */
 static void check_call_vs_once_lent(Checker *c, Node *call);     /* BUG-1276 */
 static void atomic_record_call_args(Checker *c, Node *call);    /* BUG-1284 */
 static int atomic_param_of(Checker *c, Node *e);                /* BUG-1284 */
+static int param_pos_named(Checker *c, const char *n, uint32_t l);   /* BUG-1303 */
+static void alias_call_record(Checker *c, Node *call);              /* BUG-1303 */
+static bool alias_pair_add(Checker *c, Symbol *f, int i, int j);    /* BUG-1303 */
+static int param_alias_of_value(Checker *c, Node *e);               /* BUG-1303 */
 static Symbol *current_func_symbol(Checker *c);                 /* BUG-1284 */
 static void atomic_cell_mark_visit(Checker *c, Symbol *g, void *ud);
 static void atomic_resolve_param_cells(Checker *c);
@@ -10914,6 +10918,17 @@ static Type *check_expr(Checker *c, Node *node) {
                 "or copy the value before spawning",
                 (int)node->ident.name_len, node->ident.name);
         }
+        /* BUG-1303: a pointer / slice PARAM used while a scoped thread is live. */
+        if (sym && c->lent_param_live_mask && sym->type &&
+            (type_dispatch_kind(sym->type) == TYPE_POINTER ||
+             type_dispatch_kind(sym->type) == TYPE_SLICE)) {
+            int wp = atomic_param_of(c, node);
+            if (wp < 0 && sym->param_alias_pos1 > 0) wp = sym->param_alias_pos1 - 1;
+            Symbol *wfs = (wp >= 0 && wp < 64) ? current_func_symbol(c) : NULL;
+            for (int li = 0; wfs && li < 64; li++)
+                if (li != wp && (c->lent_param_live_mask & (1ULL << li)))
+                    alias_pair_add(c, wfs, li, wp);
+        }
         /* BUG-1284: a pointer param mentioned anywhere but as an @atomic target */
         if (sym && !c->in_atomic_intrinsic_arg && sym->type &&
             type_dispatch_kind(sym->type) == TYPE_POINTER) {
@@ -12376,6 +12391,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         /* BUG-1299: sticky — a copy of a shared *opaque stays one. */
                         if (opaque_read_from_shared(c, node->assign.value))
                             tsym->opaque_from_shared = true;
+                        /* BUG-1303: sticky too — once it held a param it may still. */
+                        if (!tsym->param_alias_pos1)
+                            tsym->param_alias_pos1 = param_alias_of_value(c, node->assign.value);
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
                         /* BUG-987: clears BOTH halves of the @container fact —
@@ -13739,6 +13757,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
         atomic_record_call_args(c, node);   /* BUG-1284: after the args are typed */
+        alias_call_record(c, node);         /* BUG-1303 */
 
         /* D5 (2026-08-01): scoped-borrow exclusivity laundered through a HELPER.
          * `ThreadHandle t = spawn worker(&x); poke(&x); t.join();` compiled —
@@ -14095,6 +14114,8 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (osym2->th_live) {
                             osym2->th_live = false;
                             if (c->live_scoped_threads > 0) c->live_scoped_threads--;
+                            if (c->live_scoped_threads == 0)
+                                c->lent_param_live_mask = 0;   /* BUG-1303 */
                             if (c->live_scoped_threads == 0 &&
                                 !c->unbounded_spawn_in_func) {
                                 c->after_spawn_in_func = false;
@@ -22089,6 +22110,9 @@ static void check_stmt(Checker *c, Node *node) {
             if (sym && node->var_decl.init &&
                 opaque_read_from_shared(c, node->var_decl.init))
                 sym->opaque_from_shared = true;
+            /* BUG-1303: a local that holds one of this function's params. */
+            if (sym && node->var_decl.init)
+                sym->param_alias_pos1 = param_alias_of_value(c, node->var_decl.init);
 
             /* Cross-function provenance: if init is a call to a function with
              * known return provenance, propagate to the variable. */
@@ -26505,6 +26529,11 @@ static void check_stmt(Checker *c, Node *node) {
                         continue;
                     }
                     vs->is_borrowed_by_thread = true;
+                    {   /* BUG-1303: a PARAM lent (or a local holding one) */
+                        int lp = param_pos_named(c, vn, vl);
+                        if (lp < 0 && vs->param_alias_pos1 > 0) lp = vs->param_alias_pos1 - 1;
+                        if (lp >= 0 && lp < 64) c->lent_param_live_mask |= (1ULL << lp);
+                    }
                     if (vglobal) {   /* BUG-1125: the parent's CALLEES are checked too */
                         if (c->lent_global_count >= c->lent_global_cap) {
                             int nc = c->lent_global_cap ? c->lent_global_cap * 2 : 8;
@@ -28259,6 +28288,8 @@ static void check_func_body(Checker *c, Node *node) {
          * not nest, but save/restore mirrors the flag above rather than assuming it. */
         int saved_live_threads = c->live_scoped_threads;
         bool saved_unbounded = c->unbounded_spawn_in_func;
+        uint64_t saved_lent_params = c->lent_param_live_mask;   /* BUG-1303 */
+        c->lent_param_live_mask = 0;
         c->live_scoped_threads = 0;
         c->unbounded_spawn_in_func = false;
         int saved_lent_globals = c->lent_global_count;
@@ -28294,6 +28325,7 @@ static void check_func_body(Checker *c, Node *node) {
          * re-walking callee bodies per caller. Tracked in docs/limitations.md. */
         c->after_spawn_in_func = saved_after_spawn;
         c->live_scoped_threads = saved_live_threads;
+        c->lent_param_live_mask = saved_lent_params;
         c->unbounded_spawn_in_func = saved_unbounded;
         c->lent_global_count = saved_lent_globals;   /* BUG-1125 */
         c->once_lent_count = saved_once_lent;   /* BUG-1276 */
@@ -30491,6 +30523,187 @@ static int atomic_param_of(Checker *c, Node *e) {
     }
     return -1;
 }
+/* BUG-1303: position of the current function's param named n, or -1. */
+static int param_pos_named(Checker *c, const char *n, uint32_t l) {
+    Node *fd = c->current_func_node;
+    if (!n || !fd || fd->kind != NODE_FUNC_DECL) return -1;
+    for (int i = 0; i < fd->func_decl.param_count && i < 64; i++) {
+        ParamDecl *pd = &fd->func_decl.params[i];
+        if (pd->name_len == l && memcmp(pd->name, n, l) == 0) return i;
+    }
+    return -1;
+}
+
+/* BUG-1303: param position + 1 of the param a pointer / slice VALUE is (or is a
+ * view of — `b[1..]`, a local copy), 0 when none. */
+static int param_alias_of_value(Checker *c, Node *e) {
+    e = unwrap_ptr_launder(e);
+    if (e && e->kind == NODE_ORELSE) e = unwrap_ptr_launder(e->orelse.expr);
+    if (e && e->kind == NODE_SLICE) e = unwrap_ptr_launder(e->slice.object);
+    if (!e || e->kind != NODE_IDENT) return 0;
+    Type *t = typemap_get(c, e);
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_OPTIONAL) k = type_dispatch_kind(type_unwrap_distinct(t)->optional.inner);
+    if (k != TYPE_POINTER && k != TYPE_SLICE) return 0;
+    int pp = atomic_param_of(c, e);
+    if (pp >= 0 && pp < 64) return pp + 1;
+    Symbol *s = scope_lookup(c->current_scope, e->ident.name, (uint32_t)e->ident.name_len);
+    return s ? s->param_alias_pos1 : 0;
+}
+
+/* BUG-1303: the object a pointer / slice ARGUMENT designates, by name — `&v`,
+ * `&v.f`, `v[..]` name v; a pointer local names what it was bound to
+ * (borrow_root_name), else itself. NULL when unknown. */
+static const char *alias_arg_root(Checker *c, Node *a, uint32_t *len) {
+    a = unwrap_ptr_launder(a);
+    if (!a) return NULL;
+    if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP) a = a->unary.operand;
+    else if (a->kind == NODE_SLICE) a = a->slice.object;
+    else if (a->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, a->ident.name,
+                                 (uint32_t)a->ident.name_len);
+        if (s && s->borrow_root_name) { *len = s->borrow_root_len; return s->borrow_root_name; }
+        *len = (uint32_t)a->ident.name_len;
+        return a->ident.name;
+    } else return NULL;
+    for (int d = 0; a && d <= ZER_EXPR_WALK_MAX; d++) {
+        if (a->kind == NODE_FIELD) a = a->field.object;
+        else if (a->kind == NODE_INDEX) a = a->index_expr.object;
+        else break;
+    }
+    if (!a || a->kind != NODE_IDENT) return NULL;
+    *len = (uint32_t)a->ident.name_len;
+    return a->ident.name;
+}
+
+/* BUG-1303: remember a direct call that passes one object as two pointer / slice
+ * arguments; checked after every body, when the callee's masks are known. */
+static void alias_call_record(Checker *c, Node *call) {
+    if (!call || !call->call.callee || call->call.callee->kind != NODE_IDENT) return;
+    int n = call->call.arg_count;
+    if (n < 2) return;
+    Symbol *rc = global_decl_lookup(c, call->call.callee->ident.name,
+                                    (uint32_t)call->call.callee->ident.name_len);
+    if (!rc || !rc->is_function || !rc->func_node) return;
+    const char **roots = (const char **)arena_alloc(c->arena, (size_t)n * sizeof(char *));
+    uint32_t *lens = (uint32_t *)arena_alloc(c->arena, (size_t)n * sizeof(uint32_t));
+    signed char *pparam = (signed char *)arena_alloc(c->arena, (size_t)n);
+    if (!roots || !lens || !pparam) return;
+    bool dup = false;
+    int nparam = 0;
+    for (int i = 0; i < n; i++) {
+        roots[i] = NULL; lens[i] = 0; pparam[i] = -1;
+        Type *at = typemap_get(c, call->call.args[i]);
+        TypeKind k = type_dispatch_kind(at);
+        if (k != TYPE_POINTER && k != TYPE_SLICE) continue;
+        roots[i] = alias_arg_root(c, call->call.args[i], &lens[i]);
+        for (int j = 0; roots[i] && j < i; j++)
+            if (roots[j] && lens[j] == lens[i] && memcmp(roots[j], roots[i], lens[i]) == 0)
+                dup = true;
+        /* which of THIS function's params the argument hands on */
+        Node *pa = unwrap_ptr_launder(call->call.args[i]);
+        int pp = pa ? atomic_param_of(c, pa) : -1;
+        if (pp < 0 && pa && pa->kind == NODE_IDENT) {
+            Symbol *ps = scope_lookup(c->current_scope, pa->ident.name,
+                                      (uint32_t)pa->ident.name_len);
+            if (ps && ps->param_alias_pos1 > 0) pp = ps->param_alias_pos1 - 1;
+        }
+        if (pp >= 0 && pp < 64) { pparam[i] = (signed char)pp; nparam++; }
+    }
+    Symbol *caller = current_func_symbol(c);
+    if (nparam >= 2 && caller) {
+        if (c->param_fwd_n >= c->param_fwd_cap) {
+            int nc = c->param_fwd_cap ? c->param_fwd_cap * 2 : 8;
+            struct ParamFwdRec *nb = (struct ParamFwdRec *)arena_alloc(c->arena,
+                (size_t)nc * sizeof(*nb));
+            if (nb) {
+                if (c->param_fwd_n) memcpy(nb, c->param_fwds, (size_t)c->param_fwd_n * sizeof(*nb));
+                c->param_fwds = nb;
+                c->param_fwd_cap = nc;
+            }
+        }
+        if (c->param_fwd_n < c->param_fwd_cap) {
+            struct ParamFwdRec *fr = &c->param_fwds[c->param_fwd_n++];
+            fr->caller = caller; fr->callee = rc; fr->argc = n; fr->pparam = pparam;
+        }
+    }
+    if (!dup) return;
+    if (c->alias_call_n >= c->alias_call_cap) {
+        int nc = c->alias_call_cap ? c->alias_call_cap * 2 : 8;
+        struct AliasCallRec *nb = (struct AliasCallRec *)arena_alloc(c->arena,
+            (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        if (c->alias_call_n) memcpy(nb, c->alias_calls, (size_t)c->alias_call_n * sizeof(*nb));
+        c->alias_calls = nb;
+        c->alias_call_cap = nc;
+    }
+    struct AliasCallRec *r = &c->alias_calls[c->alias_call_n++];
+    r->callee = rc; r->line = call->loc.line; r->argc = n;
+    r->roots = roots; r->root_lens = lens;
+}
+
+static bool alias_pair_has(Symbol *f, int i, int j) {
+    unsigned short v = (unsigned short)((i << 8) | j);
+    for (int k = 0; k < f->alias_pair_n; k++) if (f->alias_pairs[k] == v) return true;
+    return false;
+}
+static bool alias_pair_add(Checker *c, Symbol *f, int i, int j) {
+    if (!f || i < 0 || j < 0 || i >= 64 || j >= 64 || i == j) return false;
+    if (alias_pair_has(f, i, j)) return false;
+    if (f->alias_pair_n >= f->alias_pair_cap) {
+        int nc = f->alias_pair_cap ? f->alias_pair_cap * 2 : 4;
+        unsigned short *nb = (unsigned short *)arena_alloc(c->arena,
+            (size_t)nc * sizeof(unsigned short));
+        if (!nb) return false;
+        if (f->alias_pair_n) memcpy(nb, f->alias_pairs, (size_t)f->alias_pair_n * sizeof(*nb));
+        f->alias_pairs = nb;
+        f->alias_pair_cap = nc;
+    }
+    f->alias_pairs[f->alias_pair_n++] = (unsigned short)((i << 8) | j);
+    return true;
+}
+
+/* BUG-1303: the callee lends param i to a scoped spawn and uses param j before
+ * the join; a call that passes one object as both is a data race. First the
+ * pairs are carried through callees that FORWARD their params (a fixpoint). */
+static void check_alias_spawn_calls(Checker *c) {
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (int k = 0; k < c->param_fwd_n; k++) {
+            struct ParamFwdRec *r = &c->param_fwds[k];
+            Symbol *g = r->callee;
+            for (int q = 0; q < g->alias_pair_n; q++) {
+                int i = g->alias_pairs[q] >> 8, j = g->alias_pairs[q] & 0xff;
+                if (i >= r->argc || j >= r->argc) continue;
+                int pi = r->pparam[i], pj = r->pparam[j];
+                if (pi >= 0 && pj >= 0 && pi != pj &&
+                    alias_pair_add(c, r->caller, pi, pj)) changed = true;
+            }
+        }
+    }
+    for (int k = 0; k < c->alias_call_n; k++) {
+        struct AliasCallRec *r = &c->alias_calls[k];
+        if (!r->callee->alias_pair_n) continue;
+        bool done = false;
+        for (int i = 0; i < r->argc && i < 64 && !done; i++) {
+            if (!r->roots[i]) continue;
+            for (int j = 0; j < r->argc && j < 64 && !done; j++) {
+                if (j == i || !r->roots[j] || !alias_pair_has(r->callee, i, j)) continue;
+                if (r->root_lens[j] != r->root_lens[i] ||
+                    memcmp(r->roots[j], r->roots[i], r->root_lens[i]) != 0) continue;
+                checker_error(c, r->line,
+                    "arguments %d and %d both reach '%.*s', and '%.*s' lends the first "
+                    "to a scoped spawn while it uses the second before the join — two "
+                    "accesses to one object from two threads (data race). Pass distinct "
+                    "objects",
+                    i + 1, j + 1, (int)r->root_lens[i], r->roots[i],
+                    (int)r->callee->name_len, r->callee->name);
+                done = true;
+            }
+        }
+    }
+}
+
 static void atomic_cell_mark_visit(Checker *c, Symbol *g, void *ud) {
     (void)c; (void)ud;
     if (g && !g->is_function) g->is_atomic_cell = true;
@@ -34197,6 +34410,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     }
     /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
     check_atomic_cell_safety(c);
+    check_alias_spawn_calls(c);   /* BUG-1303 */
 
     /* Stack depth analysis — detect recursion; --stack-limit over the WHOLE
      * program (BUG-1037: imported functions had no frame before) */

@@ -5,6 +5,28 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-25d — BUG-1303: one object passed as two params of a scoped-spawn lender
+
+**Symptom (from-HEAD `c960b4ba` build).** `void f(*u32 a, *u32 b) { ThreadHandle t = spawn
+w(a); *b = 5; t.join(); }` called as `f(&v, &v)` compiled: the scoped-spawn borrow is checked
+inside `f`, where `a` and `b` are different names, so the thread's write through `a` and the
+parent's write through `b` raced on `v`. Same through a local copy of `b`, and through a
+callee `h(a, b) { f(a, b); }`.
+
+**Fix.** Each function records (lent i, used j) PARAM pairs: a param (or a local holding one,
+`Symbol.param_alias_pos1`) lent to a scoped spawn sets `Checker.lent_param_live_mask` until
+the last join; a pointer/slice param used while that mask is non-zero adds pairs. Calls that
+forward two of the caller's params are recorded (`ParamFwdRec`) and the pairs carried to a
+fixpoint; then every call that passes one object (by `alias_arg_root`) as both halves of a
+pair is refused. SHAPE p46 in `tools/sink_matrix.sh` (four HOLE cells on the old build, two
+boundary cells).
+
+**Tests.** `tests/zer_fail/spawn_param_alias_bug1303.zer`,
+`tests/zer_fail/spawn_param_alias_forward_bug1303.zer`,
+`tests/zer/spawn_param_alias_boundary_bug1303.zer`.
+
+---
+
 ## Session 2026-09-25c — BUG-1300..1302: three ways an array slot still held a freed pointer
 
 All three measured on the from-HEAD `c960b4ba` build, where each negative COMPILED and read a

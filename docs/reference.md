@@ -5722,6 +5722,11 @@ borrowed by that thread until `.join()`:
   ```
   This also means joining on *every* arm is not recognised as unconditional.
   Hoist the join out of the branch instead: `if (err) { ... } th.join();`
+- A function that lends one POINTER PARAM to a scoped spawn and uses another
+  before the join cannot be called with ONE object as both —
+  `void f(*u32 a, *u32 b) { ThreadHandle t = spawn w(a); *b = 5; t.join(); }`
+  then `f(&v, &v)` is a compile error (the thread and the caller write `v` at once).
+  The rule follows a local copy of either param and callees that forward them.
 
 **SAFETY CHECKS**
 - Non-shared `*T` to fire-and-forget spawn → compile error

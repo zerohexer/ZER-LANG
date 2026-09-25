@@ -1,0 +1,25 @@
+// BUG-1298: a @once in a DEFER body. The body is cloned at every fire site (spliced
+// in a label-free function, emitted inline in a function with a label), and the
+// flag was keyed on the clone's block id — so it ran once PER EXIT PATH, and the
+// labelled function's inline copy named an undeclared flag. Keyed on the NODE now.
+u32 g = 0;
+void labelled(u32 k) {
+    defer { @once { g += 5; } }
+    if (k > 5) { goto out; }
+    g += 100;
+out:
+    g += 1000;
+}
+void plain(u32 k) {
+    defer { @once { g += 7; } }
+    if (k > 5) { return; }
+    g += 1;
+}
+u32 main() {
+    labelled(1); labelled(9); labelled(1);
+    if (g != 3205) { return 1; }
+    g = 0;
+    plain(1); plain(9); plain(1);
+    if (g != 9) { return 2; }
+    return 0;
+}

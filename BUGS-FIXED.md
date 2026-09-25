@@ -5,6 +5,60 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-25 — BUG-1298: defer bodies in a function WITH a label
+
+**Symptom (measured on the from-HEAD `c960b4ba` build).** In a function containing a
+`goto` label, a defer body was emitted by `emit_defer_stmt`, the eleven-kind AST emitter
+refactor L had retired everywhere else:
+- a shared-struct read in a defer-body CONDITION (`defer { if (s.v > 3) {…} }`) took no mutex;
+- `switch`, `do-while` and `@critical` printed `compiler bug: emit_defer_stmt has no handler`
+  and emitted a `_zer_trap` in place of the code (the programs exited 133);
+- an unproven index in a var-decl initialiser, a for-initialiser or a while condition had
+  NO guard — `arr[100]` on a `u32[4]` was read silently (exit 0);
+- the same AST emitter served the C-level auto-guard early exit (`emit_defers_from`) in
+  EVERY function, so a label-free function with `defer { switch … }` and an unproven loop
+  condition index also turned the switch into a trap.
+And zercheck_ir, which checks a labelled function's defer bodies from the AST:
+- never ran the wrong-pool check on them (`defer heap.free_ptr(t)` on an auto-slab `t`
+  accepted; the label-free twin rejected);
+- credited every defer's frees to every return, so a defer registered inside `if (c)` hid
+  the leak on the goto path that never passed it;
+- checked no USES at the eager fire a `goto` performs.
+
+**Root cause.** BUG-965 declined to lower a template on the label path because the
+emitter replayed the raw AST and `pre_lower_orelse` rewrites it. The splice itself is
+still impossible there (the goto guard / ARMED flags would become IR branches whose
+correlation zercheck cannot see) — but the EMISSION did not need the splice.
+
+**Fix.** The template is lowered in every function and hung on the push
+(`IRInst.defer_tpl`). `emit_defer_body` emits it inline, with fresh block labels, at every
+AST-flagged fire and every `emit_defers_from` exit; both block loops and the inline body
+share one `emit_ir_inst_guarded`. zercheck: `ir_defer_check_expr` (UAF + wrong-pool at
+every position), per-return application of only the bodies whose no-work-after fire
+reaches that return (`ir_fire_mark_returns`), uses checked at a fire with work after.
+`ir_zc_error` drops an identical repeat on the same line (one body is checked once per
+fire that reaches it).
+
+**Two @once defects found by probing the new path.** The @once flag was keyed on the
+branch's `false_block` id. A defer body is CLONED per fire site, so a `@once` in a defer
+body got one flag per exit path and ran once PER PATH (measured: a two-exit function ran
+it twice — pre-existing on the spliced path since refactor L); the inline copy in a
+labelled function named an undeclared flag. The flag is now keyed on the @once NODE
+(`emit_once_id`), declared for the body and every template (`emit_once_decls`). And the
+ASYNC block loop never published "done" at the join (`emit_once_join_publish`, now shared),
+so the second task reaching an async @once spun forever on a flag stuck at 1 — measured:
+the program hung (timeout 124).
+
+**Tests.** `tests/zer/defer_once_per_fire_bug1298.zer`, `tests/zer/async_once_second_task_bug1298.zer`
+(hung pre-fix), `tests/zer/defer_label_stmt_kinds_bug1298.zer` (both paths, exits 133 pre-fix),
+`tests/zer/defer_guard_exit_switch_bug1298.zer` (label-free C-level exit, traps pre-fix),
+`tests/zer_trap/defer_label_guard_{vardecl,forinit,whilecond}_bug1298.zer` (exit 0 pre-fix),
+`tests/zer_fail/defer_label_{wrong_pool,leak_branch}_bug1298.zer` (accepted pre-fix), and a
+required-emission case in `tools/emit_audit.sh` (labelled vs plain defer-body condition
+lock; RED on the pre-fix build). Corpus scan: zero verdict differences.
+
+---
+
 ## Session 2026-09-24g — BUG-1268..1297: closing the MEDIUM limitations (arena, wrong-pool, races, escapes)
 
 **Method.** Every item below was an entry in `docs/limitations.md` or a finding of the read-only

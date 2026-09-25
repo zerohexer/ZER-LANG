@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: wrong pool
+// BUG-1298: in a function WITH a label, defer bodies are checked from the AST, and
+// that check ran the UAF walker only — a deferred free on the WRONG pool was accepted
+// (the same function without the label was rejected).
+struct Task { u32 id; }
+Slab(Task) heap;
+u32 main() {
+    *Task t = alloc(Task) orelse return;
+    defer heap.free_ptr(t);
+    u32 k = t.id;
+    if (k > 5) { goto out; }
+    k += 1;
+out:
+    return k;
+}

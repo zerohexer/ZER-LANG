@@ -952,6 +952,21 @@ static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
 
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
+static void emit_defer_body(Emitter *e, IRFunc *func, Node *db);   /* BUG-1298 */
+/* BUG-1298: the flag id of a @once — its index among the function's @once NODES. */
+static int emit_once_id(Emitter *e, Node *n) {
+    for (int i = 0; i < e->once_n; i++)
+        if (e->once_nodes[i] == (void *)n) return i;
+    if (e->once_n == e->once_cap) {
+        int nc = e->once_cap ? e->once_cap * 2 : 8;
+        void **nn = (void **)realloc(e->once_nodes, (size_t)nc * sizeof(void *));
+        if (!nn) return 0;
+        e->once_nodes = nn;
+        e->once_cap = nc;
+    }
+    e->once_nodes[e->once_n] = (void *)n;
+    return e->once_n++;
+}
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
 static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile); /* BUG-1027, defined below */
@@ -5334,25 +5349,7 @@ static void emit_defers_from(Emitter *e, int base) {
     for (int di = e->defer_stack.count - 1; di >= base; di--) {
         Node *db = e->defer_stack.stmts[di];
         if (!db) continue;
-        if (db->kind == NODE_BLOCK) {
-            /* F4 (2026-08-02): brace-scope the block-form defer body. A defer
-             * body is emitted at EVERY exit path, so a local declared inside
-             * (`defer { u32 z = x; ... }`) otherwise lands in the SHARED C
-             * function scope and the second exit path's copy is a gcc
-             * "redefinition" error — valid ZER failed to compile, and only at
-             * the gcc stage. The single-statement form below never declares, so
-             * it needs no brace. */
-            emit_indent(e);
-            emit(e, "{\n");
-            e->indent++;
-            for (int si = 0; si < db->block.stmt_count; si++)
-                emit_defer_stmt(e, db->block.stmts[si], func);
-            e->indent--;
-            emit_indent(e);
-            emit(e, "}\n");
-        } else {
-            emit_defer_stmt(e, db, func);
-        }
+        emit_defer_body(e, func, db);
     }
 }
 
@@ -12696,16 +12693,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              *   loser : CAS fails -> spin-load until ==2 (ACQUIRE) -> skip
              * The ACQUIRE load pairs with the winner's RELEASE store, so a loser
              * never observes the half-constructed state the winner published. */
-            int oid = inst->false_block;
+            /* BUG-1298: the flag is keyed on the @once NODE, so the clones of a
+             * defer body (one per fire site) share it; the CAS scratch keeps the
+             * block id, which is unique per clone. */
+            int oid = emit_once_id(e, inst->expr);
+            int xid = inst->false_block;
             emit_indent(e);
             emit(e, "{\n");
             emit_indent(e);
             emit(e, "#if _ZER_HOSTED\n");
             emit_indent(e);
-            emit(e, "uint32_t _zer_once_exp_%d = 0;\n", oid);
+            emit(e, "uint32_t _zer_once_exp_%d = 0;\n", xid);
             emit_indent(e);
             emit(e, "if (__atomic_compare_exchange_n(&_zer_once_%d, &_zer_once_exp_%d, 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) goto _zer_bb%d;\n",
-                 oid, oid, inst->true_block);
+                 oid, xid, inst->true_block);
             emit_indent(e);
             emit(e, "else { while (__atomic_load_n(&_zer_once_%d, __ATOMIC_ACQUIRE) != 2u) _zer_once_relax(); goto _zer_bb%d; }\n",
                  oid, inst->false_block);
@@ -13301,24 +13302,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ") {\n");
                 e->indent++;
             }
-            if (db->kind == NODE_BLOCK) {
-                /* F4 (2026-08-02): brace-scope — see the emit_defers_from
-                 * sibling. Flattening the block here rather than calling
-                 * emit_defer_stmt(block) is deliberate: the `guarded` if-wrap
-                 * above must be able to nest the whole body. These braces just
-                 * restore the scope the flattening removes. */
-                emit_indent(e);
-                emit(e, "{\n");
-                e->indent++;
-                for (int si = 0; si < db->block.stmt_count; si++) {
-                    emit_defer_stmt(e, db->block.stmts[si], func);
-                }
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            } else {
-                emit_defer_stmt(e, db, func);
-            }
+            emit_defer_body(e, func, db);
             if (armed_flag >= 0) {
                 e->indent--;
                 emit_indent(e);
@@ -14611,6 +14595,183 @@ static void emit_line_map(Emitter *e, const char *src_file, int line, int *last)
     *last = line;
 }
 
+/* BUG-1298: publish "done" at a @once's join block — the block some @once branch in
+ * `blocks` names as its false_block. `blocks` is the function's, or a defer
+ * template's (whose instructions still carry the template's ORIGINAL ids). */
+static void emit_once_join_publish(Emitter *e, IRBlock *blocks, int n, int block_id) {
+    for (int bj = 0; bj < n; bj++) {
+        for (int ij = 0; ij < blocks[bj].inst_count; ij++) {
+            IRInst *in = &blocks[bj].insts[ij];
+            if (in->op == IR_BRANCH && in->cond_local < 0 && in->expr &&
+                in->expr->kind == NODE_ONCE && in->false_block == block_id) {
+                emit(e, "#if _ZER_HOSTED\n");
+                emit_indent(e);
+                emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n",
+                     emit_once_id(e, in->expr));
+                emit(e, "#endif\n");
+                return;
+            }
+        }
+    }
+}
+
+static void emit_once_decls_in(Emitter *e, IRBlock *blocks, int n, const char *indent) {
+    for (int bi = 0; bi < n; bi++) {
+        for (int ii = 0; ii < blocks[bi].inst_count; ii++) {
+            IRInst *in = &blocks[bi].insts[ii];
+            if (in->op == IR_BRANCH && in->cond_local < 0 && in->expr &&
+                in->expr->kind == NODE_ONCE) {
+                int before = e->once_n;
+                int id = emit_once_id(e, in->expr);
+                if (e->once_n > before)
+                    emit(e, "%sstatic uint32_t _zer_once_%d = 0;\n", indent, id);
+            }
+        }
+    }
+}
+
+/* B4 (BUG-756) + BUG-1298: declare one function-scope flag per @once NODE — in the
+ * body and in every defer template (a labelled function emits those inline). */
+static void emit_once_decls(Emitter *e, IRFunc *func, const char *indent) {
+    e->once_n = 0;
+    emit_once_decls_in(e, func->blocks, func->block_count, indent);
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_DEFER_PUSH && in->defer_tpl && in->defer_tpl->count > 0)
+                emit_once_decls_in(e, in->defer_tpl->blocks, in->defer_tpl->count, indent);
+        }
+    }
+}
+
+/* One IR instruction with its C-level auto-guards. Shared by the regular and the
+ * async block loops, and by inline defer-template emission (BUG-1298). */
+static void emit_ir_inst_guarded(Emitter *e, IRInst *ins, IRFunc *func,
+                                 const char *src_file, int *last_line) {
+    /* BUG-1003: anchor the line counter BEFORE the guards, so an
+     * auto-guard trap reports the access's line, not the previous one. */
+    emit_line_map(e, src_file, ins->source_line, last_line);
+    if (ins->expr) {
+        IROpKind k = ins->op;
+        /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
+         * AST array indexing re-emitted per-poll) and IR_NOP (carries
+         * NODE_SPAWN args copied in parent thread). Both were
+         * silently miscompiling unproven arr[i] — emit_auto_guards
+         * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
+        /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
+         * gate too. It carries the SHARED ROOT expression, and that root can
+         * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
+         * the guard was emitted before the ASSIGN, which is INSIDE the lock,
+         * so the emitted C read:
+         *
+         *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
+         *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
+         *
+         * — the lock's own bounds check traps first, and even reaching the
+         * guard it could only trap, because a lock is held and returning
+         * would leak it. Measured: exit 133 on a program whose guard should
+         * have taken a clean early return. Guarding the LOCK emits the check
+         * BEFORE the lock, where the early return is still legal.
+         *
+         * This is the gate defect M exists to remove, and IR_LOCK is a
+         * measured instance of it: an op kind carrying a guardable expr that
+         * nobody had added. The list is hand-maintained and has been widened
+         * reactively three times now (2026-05-03/06 async, 2026-06-30
+         * AWAIT/NOP, and this). */
+        if (ir_op_takes_auto_guards(k) &&
+            !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
+            bool sv_gt = e->guard_traps;              /* BUG-1291 */
+            if (ins->in_defer_body) e->guard_traps = true;
+            emit_auto_guards(e, ins->expr);
+            e->guard_traps = sv_gt;
+        }
+    }
+    emit_ir_inst(e, ins, func);
+}
+
+/* BUG-1298: the template ir_lower built for this defer body at its registration. */
+static IRDeferTpl *ir_defer_tpl_for_body(IRFunc *func, Node *db) {
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_DEFER_PUSH && in->defer_body == db &&
+                in->defer_tpl && in->defer_tpl->count > 0)
+                return in->defer_tpl;
+        }
+    }
+    return NULL;
+}
+
+/* BUG-1298: emit ONE defer body at a fire point that ir_lower did not splice — a
+ * fire in a function with a LABEL (the goto guard / ARMED flags wrap it in C), or
+ * a C-level early exit (emit_defers_from).
+ *
+ * The body is emitted from its IR TEMPLATE, inline, with fresh block labels — the
+ * same instructions a spliced body would have produced. It used to go through
+ * emit_defer_stmt, a second statement emitter over the raw AST covering eleven
+ * node kinds, which is exactly what refactor L removed for label-free functions:
+ * measured on the pre-fix build, a shared read in a defer-body CONDITION took no
+ * lock, and `switch` / `do-while` / `@critical` became `compiler bug: ... no
+ * handler` plus a `_zer_trap` in place of valid code.
+ *
+ * A body with no template (none was lowered) keeps the AST path. */
+static void emit_defer_body(Emitter *e, IRFunc *func, Node *db) {
+    IRDeferTpl *t = func ? ir_defer_tpl_for_body(func, db) : NULL;
+    if (!t) {
+        if (db->kind == NODE_BLOCK) {
+            /* F4 (2026-08-02): brace-scope the block-form body — it is emitted at
+             * every exit path, so a declared local would otherwise be redefined. */
+            emit_indent(e);
+            emit(e, "{\n");
+            e->indent++;
+            for (int si = 0; si < db->block.stmt_count; si++)
+                emit_defer_stmt(e, db->block.stmts[si], func);
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
+        } else {
+            emit_defer_stmt(e, db, func);
+        }
+        return;
+    }
+    /* Labels beyond any function block id, unique per emitted copy: a body is
+     * emitted once per fire site, and C labels are function-scoped. */
+    int base = (1 << 24) + e->defer_label_seq;
+    e->defer_label_seq += t->count + 1;
+    int end = base + t->count;
+    int dummy_line = -1;
+    int *last = e->ir_last_line ? e->ir_last_line : &dummy_line;
+    emit_indent(e);
+    emit(e, "{\n");
+    e->indent++;
+    for (int k = 0; k < t->count; k++) {
+        IRBlock *tb = &t->blocks[k];
+        emit(e, "_zer_bb%d:;\n", base + k);
+        emit_once_join_publish(e, t->blocks, t->count, t->first + k);
+        for (int ii = 0; ii < tb->inst_count; ii++) {
+            IRInst c = tb->insts[ii];
+            if (c.true_block  >= t->first && c.true_block  < t->first + t->count)
+                c.true_block  = base + (c.true_block  - t->first);
+            if (c.false_block >= t->first && c.false_block < t->first + t->count)
+                c.false_block = base + (c.false_block - t->first);
+            if (c.goto_block  >= t->first && c.goto_block  < t->first + t->count)
+                c.goto_block  = base + (c.goto_block  - t->first);
+            emit_ir_inst_guarded(e, &c, func, e->ir_src_file, last);
+        }
+        /* The exit block (and any block lowering left open) leaves the body. */
+        if (!ir_block_is_terminated(tb)) {
+            emit_indent(e);
+            emit(e, "goto _zer_bb%d;\n", end);
+        }
+    }
+    emit(e, "_zer_bb%d:;\n", end);
+    e->indent--;
+    emit_indent(e);
+    emit(e, "}\n");
+}
+
 /* Emit a regular (non-async) function from IR */
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
@@ -14726,17 +14887,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
      * (emitted at the join block below) can both reference it. The flag id is the
      * @once's bb_skip (false_block) id — unique within the function, and reachable
      * from both the branch (inst->false_block) and the join (bb->id). */
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        for (int ii = 0; ii < bb->inst_count; ii++) {
-            IRInst *in = &bb->insts[ii];
-            if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                in->expr && in->expr->kind == NODE_ONCE) {
-                emit_indent(e);
-                emit(e, "static uint32_t _zer_once_%d = 0;\n", in->false_block);
-            }
-        }
-    }
+    emit_once_decls(e, func, "    ");
 
     /* Wholesale source mapping stays OFF during IR block emission — an
      * unconditional #line collides with goto labels and statement expressions
@@ -14745,6 +14896,10 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
     int last_mapped_line = -1;
+    const char *sv_ir_src = e->ir_src_file;     /* BUG-1298 */
+    int *sv_ir_last = e->ir_last_line;
+    e->ir_src_file = saved_source;
+    e->ir_last_line = &last_mapped_line;
 
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -14758,23 +14913,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * "done" (RELEASE) so a spinning loser (ACQUIRE) observes the fully
          * constructed state. The loser also re-enters here and re-stores 2
          * (idempotent). Hosted only; freestanding @once is single-core (no wait). */
-        {
-            bool is_once_join = false;
-            for (int bj = 0; bj < func->block_count && !is_once_join; bj++) {
-                for (int ij = 0; ij < func->blocks[bj].inst_count; ij++) {
-                    IRInst *in = &func->blocks[bj].insts[ij];
-                    if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                        in->expr && in->expr->kind == NODE_ONCE &&
-                        in->false_block == bb->id) { is_once_join = true; break; }
-                }
-            }
-            if (is_once_join) {
-                emit(e, "#if _ZER_HOSTED\n");
-                emit_indent(e);
-                emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n", bb->id);
-                emit(e, "#endif\n");
-            }
-        }
+        emit_once_join_publish(e, func->blocks, func->block_count, bb->id);
 
         /* Check if block has a capture that conflicts with another capture
          * of the same name but different type — wrap in C { } scope.
@@ -14832,46 +14971,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * unmapped; baremetal: silent corruption (entire address space
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
-            IRInst *ins = &bb->insts[ii];
-            /* BUG-1003: anchor the line counter BEFORE the guards, so an
-             * auto-guard trap reports the access's line, not the previous one. */
-            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
-                 * AST array indexing re-emitted per-poll) and IR_NOP (carries
-                 * NODE_SPAWN args copied in parent thread). Both were
-                 * silently miscompiling unproven arr[i] — emit_auto_guards
-                 * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
-                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
-                 * gate too. It carries the SHARED ROOT expression, and that root can
-                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
-                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
-                 * so the emitted C read:
-                 *
-                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
-                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
-                 *
-                 * — the lock's own bounds check traps first, and even reaching the
-                 * guard it could only trap, because a lock is held and returning
-                 * would leak it. Measured: exit 133 on a program whose guard should
-                 * have taken a clean early return. Guarding the LOCK emits the check
-                 * BEFORE the lock, where the early return is still legal.
-                 *
-                 * This is the gate defect M exists to remove, and IR_LOCK is a
-                 * measured instance of it: an op kind carrying a guardable expr that
-                 * nobody had added. The list is hand-maintained and has been widened
-                 * reactively three times now (2026-05-03/06 async, 2026-06-30
-                 * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k) &&
-                    !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
-                    bool sv_gt = e->guard_traps;              /* BUG-1291 */
-                    if (ins->in_defer_body) e->guard_traps = true;
-                    emit_auto_guards(e, ins->expr);
-                    e->guard_traps = sv_gt;
-                }
-            }
-            emit_ir_inst(e, ins, func);
+            emit_ir_inst_guarded(e, &bb->insts[ii], func, saved_source,
+                                 &last_mapped_line);
         }
 
         if (has_capture_scope) {
@@ -14887,6 +14988,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
      * fall-through from int main = return 0 implicitly. */
 
     e->source_file = saved_source;
+    e->ir_src_file = sv_ir_src;
+    e->ir_last_line = sv_ir_last;
     e->current_func_ret = NULL;
     e->current_main_promoted = false;
     e->indent--;
@@ -15072,15 +15175,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
      * are C statics — one per @once, shared by every task, which is exactly
      * @once's "once per program". Missing here, a @once in an async body was an
      * undeclared identifier at GCC. */
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        for (int ii = 0; ii < bb->inst_count; ii++) {
-            IRInst *in = &bb->insts[ii];
-            if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                in->expr && in->expr->kind == NODE_ONCE)
-                emit(e, "    static uint32_t _zer_once_%d = 0;\n", in->false_block);
-        }
-    }
+    emit_once_decls(e, func, "    ");
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;
@@ -15101,6 +15196,10 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
     int last_mapped_line = -1;
+    const char *sv_ir_src = e->ir_src_file;     /* BUG-1298 */
+    int *sv_ir_last = e->ir_last_line;
+    e->ir_src_file = saved_source;
+    e->ir_last_line = &last_mapped_line;
 
     /* BUG-863: IR_RETURN reads this to decide whether the async termination
      * also stores a result. The regular-function path sets it; this one never
@@ -15115,54 +15214,20 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
             emit_indent(e);
             emit(e, "_zer_bb%d:;\n", bb->id);
         }
+        /* BUG-1298: the winner's done-publish was missing on the async path, so a
+         * second arrival at an async @once spun forever on a flag stuck at 1. */
+        emit_once_join_publish(e, func->blocks, func->block_count, bb->id);
         for (int ii = 0; ii < bb->inst_count; ii++) {
-            /* Audit-fix (2026-05-03/06): mirror the regular-IR path's auto-guard
-             * emission. Without this, async functions silently miscompiled
-             * unproven `arr[i]` accesses — the warning claimed an auto-guard
-             * was inserted, but the async emission loop only called
-             * emit_ir_inst (no emit_auto_guards). The guard now fires the
-             * same way as the regular path; emit_auto_guard_return_body
-             * emits `self->_zer_state = -1; return 1;` for async returns. */
-            IRInst *ins = &bb->insts[ii];
-            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): paired with the regular-path gate
-                 * widening — IR_AWAIT carries the await condition's array
-                 * indexing re-emitted per-poll; IR_NOP carries spawn args. */
-                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
-                 * gate too. It carries the SHARED ROOT expression, and that root can
-                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
-                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
-                 * so the emitted C read:
-                 *
-                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
-                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
-                 *
-                 * — the lock's own bounds check traps first, and even reaching the
-                 * guard it could only trap, because a lock is held and returning
-                 * would leak it. Measured: exit 133 on a program whose guard should
-                 * have taken a clean early return. Guarding the LOCK emits the check
-                 * BEFORE the lock, where the early return is still legal.
-                 *
-                 * This is the gate defect M exists to remove, and IR_LOCK is a
-                 * measured instance of it: an op kind carrying a guardable expr that
-                 * nobody had added. The list is hand-maintained and has been widened
-                 * reactively three times now (2026-05-03/06 async, 2026-06-30
-                 * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k) &&
-                    !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
-                    bool sv_gt = e->guard_traps;              /* BUG-1291 */
-                    if (ins->in_defer_body) e->guard_traps = true;
-                    emit_auto_guards(e, ins->expr);
-                    e->guard_traps = sv_gt;
-                }
-            }
-            emit_ir_inst(e, ins, func);
+            /* Audit-fix (2026-05-03/06): the async loop mirrors the regular path's
+             * auto-guard emission — one helper now, so the two cannot drift. */
+            emit_ir_inst_guarded(e, &bb->insts[ii], func, saved_source,
+                                 &last_mapped_line);
         }
     }
 
     e->source_file = saved_source;
+    e->ir_src_file = sv_ir_src;
+    e->ir_last_line = sv_ir_last;
     e->current_func_ret = saved_ret;
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");

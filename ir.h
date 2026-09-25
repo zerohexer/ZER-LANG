@@ -197,6 +197,11 @@ typedef struct IRInst {
 
     /* Defer operand */
     Node *defer_body;        /* IR_DEFER_PUSH: AST of defer body (emitter walks it) */
+    /* BUG-1298: IR_DEFER_PUSH — the body lowered to IR at its registration (the
+     * refactor-L template). In a function WITH a label the template is not spliced
+     * into the CFG (see materialise_defer_body); the emitter emits it INLINE at each
+     * fire instead of replaying the AST through emit_defer_stmt. NULL = no template. */
+    struct IRDeferTpl *defer_tpl;
     /* IR_DEFER_FIRE: capture-on-FIRE snapshot of the live defer bodies at this
      * fire point, captured at lowering. The emitter emits THESE (LIFO: index 0 =
      * oldest/outermost, emit high->low) instead of replaying a shared mutable
@@ -320,6 +325,18 @@ typedef struct {
      * UNRELATED returning block and reported a false double free. */
     int dead_code_seed;
 } IRBlock;
+
+/* BUG-1298: a defer body lowered to IR at its registration. `blocks` is a private
+ * copy (NOT part of the function's block array); `first` is the block id the copy
+ * was lowered at, so a branch target t in [first, first+count) is template block
+ * t-first. `exit` is the index of the block control leaves the body from — the one
+ * unterminated block. */
+typedef struct IRDeferTpl {
+    IRBlock *blocks;
+    int count;
+    int first;
+    int exit;
+} IRDeferTpl;
 
 /* ================================================================
  * IR Function — the complete lowered representation

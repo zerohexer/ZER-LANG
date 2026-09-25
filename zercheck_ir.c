@@ -24,8 +24,31 @@ static int _ir_last_err_line = -1;
 static const char *_ir_last_err_file = NULL;
 
 /* Local error reporting — mirrors zercheck.c's zc_error but accessible here */
+static unsigned long _ir_last_err_hash = 0;
 static void ir_zc_error(ZerCheck *zc, int line, const char *fmt, ...) {
     if (zc->building_summary) return;
+    /* An IDENTICAL report (same file, line and text) is dropped: one defer body is
+     * checked at every fire that reaches it, so the same defect in it would
+     * otherwise print once per path (BUG-1298). */
+    unsigned long hsh = 5381;
+    {
+        va_list a2;
+        va_start(a2, fmt);
+        int n = vsnprintf(NULL, 0, fmt, a2);
+        va_end(a2);
+        char *txt = n >= 0 ? (char *)malloc((size_t)n + 1) : NULL;
+        if (txt) {
+            va_start(a2, fmt);
+            vsnprintf(txt, (size_t)n + 1, fmt, a2);
+            va_end(a2);
+            for (int i = 0; i < n; i++) hsh = hsh * 33 + (unsigned char)txt[i];
+            free(txt);
+        }
+    }
+    if (line == _ir_last_err_line && zc->file_name == _ir_last_err_file &&
+        hsh == _ir_last_err_hash)
+        return;
+    _ir_last_err_hash = hsh;
     zc->error_count++;
     _ir_last_err_line = line;
     _ir_last_err_file = zc->file_name;
@@ -52,6 +75,7 @@ static void ir_zc_error_for(ZerCheck *zc, IRFunc *func, int id, int line,
     zc->error_count++;
     _ir_last_err_line = line;
     _ir_last_err_file = zc->file_name;
+    _ir_last_err_hash = 0;
     fprintf(stderr, "%s:%d: zercheck: ", zc->file_name, line);
     va_list args;
     va_start(args, fmt);
@@ -5508,6 +5532,37 @@ static bool ir_fire_has_work_after(IRFunc *func, IRInst *fire) {
     return found;
 }
 
+/* BUG-1298: mark every live RETURN block reachable from `fire` — for a fire with no
+ * work after it (ir_fire_has_work_after false), the returns whose exit state the
+ * fire's bodies apply to. Same successor derivation as ir_fire_has_work_after. */
+static void ir_fire_mark_returns(IRFunc *func, IRInst *fire, char *ret_mark) {
+    int start_block = -1;
+    for (int bi0 = 0; bi0 < func->block_count && start_block < 0; bi0++) {
+        IRBlock *bb0 = &func->blocks[bi0];
+        for (int ii0 = 0; ii0 < bb0->inst_count; ii0++)
+            if (&bb0->insts[ii0] == fire) { start_block = bi0; break; }
+    }
+    if (start_block < 0) return;
+    int cap = func->block_count > 0 ? func->block_count : 1;
+    char *seen = (char *)calloc((size_t)cap, 1);
+    int *stack = (int *)malloc((size_t)cap * sizeof(int));
+    if (!seen || !stack) { free(seen); free(stack); return; }
+    int sp = 0;
+    stack[sp++] = start_block;
+    seen[start_block] = 1;
+    while (sp > 0) {
+        int bi = stack[--sp];
+        if (ir_block_is_live_return(func, bi)) ret_mark[bi] = 1;
+        for (int sb = 0; sb < func->block_count && sp < cap; sb++) {
+            if (seen[sb]) continue;
+            IRBlock *cand = &func->blocks[sb];
+            for (int pi = 0; pi < cand->pred_count; pi++)
+                if (cand->preds[pi] == bi) { seen[sb] = 1; stack[sp++] = sb; break; }
+        }
+    }
+    free(stack); free(seen);
+}
+
 /* PUSH-order index of a defer body, using the SAME ordering Phase C3 builds its
  * dfs[] with (every IR_DEFER_PUSH, block order then instruction order). Returns
  * index+1 as the per-defer instance id — 0 means "not found", matching C3's
@@ -5712,22 +5767,37 @@ static void ir_defer_scan_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
  * use (freeing in a defer is the normal cleanup pattern — handled by
  * ir_defer_scan_frees), so skip those. `rs` dedups reports per root-local
  * across every return block + defer in the function. */
+/* BUG-1298: every expression position of an AST defer body gets BOTH raw-AST
+ * checks, the rule for every other raw-AST position in this file (BUG-1025). The
+ * wrong-pool half was missing, so a function WITH a label — whose defer bodies are
+ * checked here rather than as spliced IR — accepted `defer heap.free_ptr(t)` on a
+ * handle from a different pool. */
+static void ir_defer_check_expr(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                Node *expr, int line, UafReportSet *rs) {
+    ir_check_expr_uaf(zc, func, ps, expr, line, rs);
+    ir_check_expr_wrong_pool(zc, func, ps, expr, line, rs);
+}
+
 static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                 Node *body, int defer_line, UafReportSet *rs) {
     if (!body) return;
 
     if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr &&
         ir_defer_free_arg(zc, body) == NULL) {
-        ir_check_expr_uaf(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
+    } else if (body->kind == NODE_EXPR_STMT && body->expr_stmt.expr) {
+        /* BUG-1298: the free statement itself is not a use, but its POOL is
+         * checked — `defer heap.free_ptr(t)` on an auto-slab `t`. */
+        ir_check_expr_wrong_pool(zc, func, ps, body->expr_stmt.expr, defer_line, rs);
     }
     /* BUG-819: the two non-control-flow expression positions. Both sat in the
      * no-op leaf list below, which reads as "nothing to scan" — but a VAR_DECL
      * carries an initialiser and a RETURN carries a value, and either can read a
      * handle this defer's exit state says is already freed. */
     if (body->kind == NODE_VAR_DECL && body->var_decl.init)
-        ir_check_expr_uaf(zc, func, ps, body->var_decl.init, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->var_decl.init, defer_line, rs);
     if (body->kind == NODE_RETURN && body->ret.expr)
-        ir_check_expr_uaf(zc, func, ps, body->ret.expr, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->ret.expr, defer_line, rs);
 
     /* BUG-819: this walker NAMED every control-flow kind but only ever handed an
      * expression to the UAF checker for NODE_EXPR_STMT — so a defer-body read of a
@@ -5743,22 +5813,22 @@ static void ir_defer_scan_uses(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             ir_defer_scan_uses(zc, func, ps, body->block.stmts[i], defer_line, rs);
         break;
     case NODE_IF:
-        ir_check_expr_uaf(zc, func, ps, body->if_stmt.cond, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->if_stmt.cond, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->if_stmt.then_body, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->if_stmt.else_body, defer_line, rs);
         break;
     case NODE_FOR:
         ir_defer_scan_uses(zc, func, ps, body->for_stmt.init, defer_line, rs);
-        ir_check_expr_uaf(zc, func, ps, body->for_stmt.cond, defer_line, rs);
-        ir_check_expr_uaf(zc, func, ps, body->for_stmt.step, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->for_stmt.cond, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->for_stmt.step, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->for_stmt.body, defer_line, rs);
         break;
     case NODE_WHILE: case NODE_DO_WHILE:
-        ir_check_expr_uaf(zc, func, ps, body->while_stmt.cond, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->while_stmt.cond, defer_line, rs);
         ir_defer_scan_uses(zc, func, ps, body->while_stmt.body, defer_line, rs);
         break;
     case NODE_SWITCH:
-        ir_check_expr_uaf(zc, func, ps, body->switch_stmt.expr, defer_line, rs);
+        ir_defer_check_expr(zc, func, ps, body->switch_stmt.expr, defer_line, rs);
         for (int i = 0; i < body->switch_stmt.arm_count; i++)
             ir_defer_scan_uses(zc, func, ps, body->switch_stmt.arms[i].body, defer_line, rs);
         break;
@@ -10975,6 +11045,18 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                                dbi + (inst->cond_local >= 0 ? inst->cond_local : 0) <
                                    inst->defer_fire_guard_below;
                 if (did > 0) {
+                    /* BUG-1298: a fire WITH work after it (the eager fire at a
+                     * `goto`) is applied only here, so its body's USES must be
+                     * checked here too — the exit pass handles the other fires. */
+                    UafReportSet fire_rs = {0};
+                    int reg_line = inst->source_line;
+                    for (int rb = 0; rb < func->block_count; rb++)
+                        for (int ri = 0; ri < func->blocks[rb].inst_count; ri++)
+                            if (func->blocks[rb].insts[ri].op == IR_DEFER_PUSH &&
+                                func->blocks[rb].insts[ri].defer_body == dbody)
+                                reg_line = func->blocks[rb].insts[ri].source_line;
+                    ir_defer_scan_uses(zc, func, ps, dbody, reg_line, &fire_rs);
+                    free(fire_rs.ids);
                     g_defer_fire_token = guarded ? 0 : ++fire_token_seq;
                     ir_defer_scan_frees(zc, func, ps, dbody,
                                         inst->source_line, did);
@@ -12575,16 +12657,53 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             dfs[dfn++] = inst;
         }
     }
+    /* BUG-1298: apply at each return only the bodies that actually FIRE toward it —
+     * those in the snapshot of a fire with no work after it that reaches the return.
+     * Applying every body registered anywhere in the function to every return hid a
+     * leak on a path that never passed the defer: `if (c) { defer free(t); return; }
+     * goto out; out: return 0;` was clean because the inner defer's free was
+     * credited to the outer return. Fires WITH work after are already applied by
+     * the forward pass. */
+    char *dapply = NULL;
+    int dbc = func->block_count;
+    if (dfn > 0 && dbc > 0)
+        dapply = (char *)calloc((size_t)dfn * (size_t)dbc, 1);
+    char *rmark = dbc > 0 ? (char *)calloc((size_t)dbc, 1) : NULL;
+    for (int fb = 0; dapply && rmark && fb < func->block_count; fb++) {
+        IRBlock *fbb = &func->blocks[fb];
+        for (int fi = 0; fi < fbb->inst_count; fi++) {
+            IRInst *fire = &fbb->insts[fi];
+            if (fire->op != IR_DEFER_FIRE || !fire->defer_fire_emit_ast ||
+                fire->src2_local == 2 || !fire->defer_fire_bodies)
+                continue;
+            if (ir_fire_has_work_after(func, fire)) continue;
+            memset(rmark, 0, (size_t)dbc);
+            ir_fire_mark_returns(func, fire, rmark);
+            for (int b = 0; b < fire->defer_fire_body_count; b++) {
+                Node *body = fire->defer_fire_bodies[b];
+                if (!body) continue;
+                for (int k = 0; k < dfn; k++) {
+                    if (dfs[k]->defer_body != body) continue;
+                    for (int r = 0; r < dbc; r++)
+                        if (rmark[r]) dapply[(size_t)k * (size_t)dbc + (size_t)r] = 1;
+                }
+            }
+        }
+    }
+    free(rmark);
     for (int bi = 0; bi < func->block_count; bi++) {
         if (!ir_block_is_live_return(func, bi)) continue;   /* BUG-1070 */
         IRPathState *ret_ps = &block_states[bi];
         for (int k = dfn - 1; k >= 0; k--) {   /* LIFO fire order */
+            /* Allocation failure falls back to the old apply-everything rule. */
+            if (dapply && !dapply[(size_t)k * (size_t)dbc + (size_t)bi]) continue;
             ir_defer_scan_uses(zc, func, ret_ps, dfs[k]->defer_body,
                                dfs[k]->source_line, &defer_use_rs);
             ir_defer_scan_frees(zc, func, ret_ps, dfs[k]->defer_body,
                                 dfs[k]->source_line, k + 1);
         }
     }
+    free(dapply);
     free(dfs);
     free(defer_use_rs.ids);
 

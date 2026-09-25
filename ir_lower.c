@@ -4439,6 +4439,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
+        /* BUG-1298: filled below once the template is lowered. */
+        IRDeferTpl *dtpl = (IRDeferTpl *)arena_alloc(ctx->arena, sizeof(IRDeferTpl));
+        if (dtpl) memset(dtpl, 0, sizeof(*dtpl));
+        push.defer_tpl = dtpl;
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -4515,12 +4519,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->defer_tpl_count[ctx->defer_count]  = 0;
             ctx->defer_tpl_first[ctx->defer_count]  = -1;
             ctx->defer_tpl_exit[ctx->defer_count]   = 0;
-            /* BUG-965: on the raw-AST path, do not lower a template at all. Lowering
-             * would be wasted, and worse than wasted: pre_lower_orelse REWRITES the
-             * nodes it visits, so the emitter's emit_defer_stmt would then replay an
-             * AST this pass had already mutated — the "never lower the same AST
-             * twice" invariant, hit from inside one lowering. */
-            if (!defers_stay_on_ast(ctx)) {
+            /* BUG-1298: lowered in EVERY function now. BUG-965 declined to lower a
+             * template in a function with a label because the emitter then replayed
+             * the raw AST (emit_defer_stmt) that lowering had already rewritten. The
+             * emitter now emits the TEMPLATE there too, so nothing replays the AST
+             * for emission; zercheck_ir's AST scan of such a body only looks for
+             * frees and uses, which pre_lower_orelse leaves in place. */
+            {
                 int saved_block = ctx->current_block;
                 int saved_n     = ctx->defer_count;
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
@@ -4551,6 +4556,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ctx->defer_tpl_first[ctx->defer_count]  = tpl_first;
                     ctx->defer_tpl_exit[ctx->defer_count]   =
                         (tpl_exit >= 0 && tpl_exit < tpl_n) ? tpl_exit : tpl_n - 1;
+                    if (dtpl) {
+                        dtpl->blocks = tpl;
+                        dtpl->count  = tpl_n;
+                        dtpl->first  = tpl_first;
+                        dtpl->exit   = ctx->defer_tpl_exit[ctx->defer_count];
+                    }
                 }
                 ctx->func->block_count = tpl_first;   /* extract */
             }

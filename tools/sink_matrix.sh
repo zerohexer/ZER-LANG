@@ -945,6 +945,22 @@ cell p45_safe_readonly_callee compile "$P45"' u32 main(){ ?*T45[2] a; *T45 x = a
 cell p45_safe_consume_loop compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } u32 n = 0; for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; n += q.v; free(q); } return n; }'
 cell p45_safe_reset_after_free compile "$P45"' u32 main(){ ?*T45[4] t; for (u32 i = 0; i < 4; i += 1) { t[i] = alloc(T45); } for (u32 i = 0; i < 4; i += 1) { *T45 q = t[i] orelse { return 1; }; free(q); t[i] = null; } u32 n = 0; for (u32 j = 0; j < 4; j += 1) { if (t[j]) |r| { n += r.v; } } return n; }'
 
+# SHAPE p46 (BUG-1303): a scoped-spawn BORROW that reaches the caller's object
+# through two PARAMS — the callee lends one and uses the other in the window, and
+# the caller passes one object as both. BOUNDARY: distinct objects; the second
+# param used only after the join.
+echo "===== SHAPE p46 = one object passed as two params of a scoped-spawn lender ====="
+P46='void w46(*u32 p) { *p = *p + 1; }
+void lend46(*u32 a, *u32 b) { ThreadHandle t = spawn w46(a); *b = 5; t.join(); }
+void late46(*u32 a, *u32 b) { ThreadHandle t = spawn w46(a); t.join(); *b = 5; }
+'
+cell p46_same_object_twice  reject "$P46"' u32 main(){ u32 v = 0; lend46(&v, &v); return 0; }'
+cell p46_same_via_pointer   reject "$P46"' u32 main(){ u32 v = 0; *u32 p = &v; lend46(p, &v); return 0; }'
+cell p46_local_copy_used    reject "$P46"' void cp46(*u32 a, *u32 b) { *u32 q = b; ThreadHandle t = spawn w46(a); *q = 5; t.join(); } u32 main(){ u32 v = 0; cp46(&v, &v); return 0; }'
+cell p46_forwarding_callee  reject "$P46"' void fw46(*u32 a, *u32 b) { lend46(a, b); } u32 main(){ u32 v = 0; fw46(&v, &v); return 0; }'
+cell p46_safe_distinct      compile "$P46"' u32 main(){ u32 v = 0; u32 x = 0; lend46(&v, &x); return 0; }'
+cell p46_safe_after_join    compile "$P46"' u32 main(){ u32 v = 0; late46(&v, &v); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

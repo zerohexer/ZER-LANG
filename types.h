@@ -331,6 +331,14 @@ struct Symbol {
      * points at (directly, or by handing it to a function that does). */
     uint64_t atomic_param_mask;
     uint64_t atomic_param_plain_mask;   /* BUG-1284: param i also used NON-atomically */
+    /* BUG-1303: pairs (i, j) — param i is lent to a scoped spawn (here or in a
+     * callee) while param j is used before the join. A caller that passes ONE
+     * object as both is a race the callee's own borrow check cannot see. */
+    unsigned short *alias_pairs;   /* (lent i << 8) | used j */
+    int alias_pair_n, alias_pair_cap;
+    /* BUG-1303: a pointer / slice LOCAL that holds this function's param n-1
+     * (`*u32 q = b;`); 0 = none. */
+    int param_alias_pos1;
 
     /* BUG-847/849: set on a RESOURCE symbol the first time it is given its
      * backing state — an `Arena` receiving a buffer (a var-decl initializer or

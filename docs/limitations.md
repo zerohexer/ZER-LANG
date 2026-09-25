@@ -163,8 +163,14 @@ Each reproducer is in the ag9 report shape; none needs `cinclude`.
   `@once`** — the publish-once exemption needs the parent's window to END, which only a join
   gives. Use a scoped spawn. Also the parent may not call ANY function that reaches the global
   outside that same `@once` during the window.
-- **LOW: parameter aliasing into a scoped spawn** (`f(&v, &v)` where f spawns with one param and
-  writes through the other) — the borrow is intra-function.
+- ~~**LOW: parameter aliasing into a scoped spawn**~~ (`f(&v, &v)` where f spawns with one param
+  and writes through the other) — CLOSED 2026-09-25 (BUG-1303): per-function (lent i, used j)
+  param pairs (`Symbol.alias_pairs`), carried through callees that forward their params
+  (fixpoint in `check_alias_spawn_calls`) and through a local copy of a param
+  (`Symbol.param_alias_pos1`); a call passing one object as both is refused. Residual: the
+  pairs are keyed by POSITION up to 64 params, and "same object" is decided by NAME
+  (`alias_arg_root`) — two different pointers to one object that the checker cannot name
+  alike (`f(p, q)` with `q` computed through a call) are not matched.
 - **Over-rejections:** a heap pointer lent to a scoped spawn stays TRANSFERRED after `th.join()`
   (`t.v` / `free(t)` after the join refused, "freed at line <spawn>"); a local Barrier lent to a
   scoped spawn cannot be `@barrier_wait`-ed by the parent; a join followed by a use in the same

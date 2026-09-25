@@ -1,0 +1,19 @@
+// BUG-1298: the async emission path declared the @once flag but never PUBLISHED
+// "done" at the join, so the flag stayed at 1 (in progress) and the second task to
+// reach the @once spun forever waiting for 2 (hosted: the loser-wait). Pre-fix this
+// program hung.
+u32 g = 0;
+async void t() {
+    @once { g += 1; }
+    yield;
+}
+u32 main() {
+    _zer_async_t a;
+    _zer_async_t b;
+    _zer_async_t_init(&a);
+    _zer_async_t_init(&b);
+    while (_zer_async_t_poll(&a) == 0) { }
+    while (_zer_async_t_poll(&b) == 0) { }
+    if (g != 1) { return 1; }
+    return 0;
+}

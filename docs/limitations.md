@@ -321,16 +321,24 @@ defer count live at the label's lexical position (known at the LABEL for a backw
 a forward goto the label's enclosing-scope defer depth is known from collect_labels), plus
 the label's guard flag keyed per fired range.
 
-## OPEN — defer bodies in a function WITH A LABEL still use the AST emitter (2026-09-24, MEDIUM — a lost lock, a trap on valid code)
+## CLOSED 2026-09-25 — defer bodies in a function WITH A LABEL used the AST emitter (BUG-1298)
 
-Refactor L lowered defer bodies to IR only for functions without a label
-(`IRInst.defer_fire_emit_ast`). In a labelled function, measured by the 2026-09-24 audit
-(`/tmp` reproducers l1/l3/l4): a shared-struct read in an `if`/`while`/`for` CONDITION inside
-the defer body takes no mutex (the same body without a label does), and `switch` / `do-while`
-in the defer body emit "compiler bug: emit_defer_stmt has no handler" plus a runtime trap. Fix:
-finish refactor L for labelled functions (the goto guard-flag machinery is the reason it was
-not done), or, until then, refuse those statement kinds and shared reads in a labelled
-function's defer body at the checker so the failure is a diagnostic, not a trap/race.
+Every defer body is now lowered to an IR template at its registration, in every function.
+A labelled function still does not SPLICE it into the CFG (the goto guard / ARMED flags wrap
+the fire in C, and as IR branches their correlation would defeat leak analysis — see
+`defers_stay_on_ast`); the emitter emits the template INLINE at each such fire and at every
+C-level early exit (`emit_defers_from`), through the same instruction emitter as the rest of
+the function. Measured on the pre-fix build: the defer-body condition lock, the
+var-decl/for-init/while-cond guards, and `switch` / `do-while` / `@critical` in the body.
+zercheck_ir still checks such a body from its AST, and three holes in that path closed with
+it: the wrong-pool check was never run on it, every defer's frees were credited to every
+return (hiding a leak on a path that never passed the defer), and the eager fire at a `goto`
+checked no USES. `emit_defer_stmt` remains only as the fallback for a body with no template.
+
+**Still AST-checked (precision, not emission):** zercheck_ir treats a labelled function's
+defer body with the older AST scans rather than as CFG. Making it CFG needs the guard-flag
+correlation modelled (the Level-B guard machinery is for IMMUTABLE conditions; the guard
+flag is not).
 
 ## CLOSED — the BUG-976 depth-cap enumeration is closed (2026-09-14, BUG-1016)
 
@@ -470,13 +478,13 @@ Symbol; the qualified-reference half is the OPEN entry above.)
 
 ---
 
-## OPEN — AST-path container-method receivers are not module-prefixed (2026-09-21, LOW — reachable only from a global initializer or a labelled function's defer body)
+## OPEN — AST-path container-method receivers are not module-prefixed (2026-09-21, LOW — reachable only from a global initializer since BUG-1298)
 
 BUG-1040 prefixed the IR-path receiver (`emit_builtin_inline`) and the declaration arms. The
 AST emitter's arena / pool / slab method arms (`emit_expr` NODE_CALL, `aname` / `sname`)
-still spell the raw name. That path runs for global initializers (where only `Arena.over`
-— no receiver — is legal) and for defer bodies in functions WITH a label. A module function
-with a label whose defer body calls `pool.free(h)` would emit the bare name. Fix: the same
+still spell the raw name. That path now runs only for global initializers (where only
+`Arena.over` — no receiver — is legal); defer bodies in functions WITH a label go through the
+IR emitter since BUG-1298. Fix, if a receiver ever becomes legal there: the same
 local-vs-global mangling as the IR receiver; the AST path has no `IRFunc`, so the local
 check must use the checker's scope instead.
 
@@ -557,8 +565,9 @@ emitter zero tests sit beside each of the seven `signed_min_text` call sites.
 at it.** VRP trusts constants, so it must know which rendering RUNS. There are THREE, not
 two: the 3AC path (var-decl init, conditions, returns, compound-assign RHS) computes each
 node in its typed temp; a PLAIN assignment `x = <tree>` and the index arm are one C
-expression with bare-`int` literals; and a defer body in a function with a label goes
-through the AST emitter (the same bare-literal rendering). The typed fold (`tfold`)
+expression with bare-`int` literals; and a defer body in a function with a label went
+through the AST emitter (the same bare-literal rendering — until BUG-1298, which emits it
+from IR; the conservative defer-body rule below is kept, it only costs precision). The typed fold (`tfold`)
 models the first. The plain-assignment sink and any defer body trust only a constant for
 which all three agree (`tfold_exact`: every intermediate exact, fits `int`, equals the
 typed value) — measured necessary: trusting the typed value there let

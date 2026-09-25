@@ -120,8 +120,10 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
    program resets a non-local arena (BUG-1172). Sound, but a funcptr call in a function that
    keeps using an arena pointer is then refused even when the target never resets. Precision
    would need the funcptr-binding resolution the spawn scan already has.
-4. **`*u32[4]` (pointer to an array) emits invalid C** (`uint32_t[4]* p`) — LOW, loud (GCC
-   rejects). Accepted by the checker as a param, local or field.
+4. ~~**`*u32[4]` (pointer to an array) emits invalid C**~~ — CLOSED 2026-09-25 (BUG-1304):
+   refused at the type (`resolve_type` TYNODE_POINTER), with the slice / struct-wrapper remedy.
+   Supporting it would need a C declarator (`uint32_t (*p)[4]`) at every emission site that
+   names a type — none of the corpus spells it.
 5. **The out-param rule (BUG-1173) reports at the function's line** for an implicit return at
    the end of a void function — cosmetic.
 6. Over-rejections seen during the audit, not fixed: `u = t; t = u; consume(u); t.k` (t was
@@ -1874,53 +1876,15 @@ of memory (BUG-1175). What remains is a design note, not a hole: `*T` in an aggr
 non-null "by trap", not by construction. A definite-initialization analysis (option (b)) would
 move the report to compile time; nothing depends on it for soundness.
 
-## OPEN — `&packed.byte_field` is rejected although a u8 cannot be misaligned (2026-09-09, LOW — over-rejection, valid program refused)
+## CLOSED 2026-09-25 — `&packed.byte_field` was rejected although a u8 cannot be misaligned (BUG-1305)
 
-**Symptom.** Taking the address of a BYTE-typed member of a packed struct is refused,
-in both spellings:
-
-    packed struct P { u8 a; u8[4] w; }
-    *u8 q = &p.w[0];          // rejected — `points into a PACKED struct field`
-    packed struct Q { u8 a; u32 w; u8 b; }
-    *u8 q = &p.b;             // rejected, and has been since BUG-786
-
-A `u8` has alignment 1, so no access through either pointer can ever be misaligned.
-Both are valid programs.
-
-**Root cause.** `addr_of_is_packed_field` (checker.c) asks only whether the access path
-crosses a packed aggregate. It never consults the alignment of the thing whose address
-is being taken, so it cannot tell `&p.u32_field` (a real hazard) from `&p.u8_field`
-(harmless).
-
-**Why the obvious fix was not bundled with BUG-972.** BUG-972 peeled INDEX in that gate
-to close the REAL hole (`&p.w[0]` on a `u32[2]` field — offsetof 1, a misaligned 32-bit
-store) and the byte case became rejected as a side effect. Making the gate
-alignment-aware would RELAX a shipped rule, which is the accept-unsafe change class:
-per "Sound relaxation (reject→accept)" in docs/compiler-internals.md, a bug there is a
-shipped fault rather than a harmless refusal, so it needs its own commit, its own
-negative matrix, and its own measurement. Bundling it into a hole-closing commit is
-exactly the mistake that discipline exists to prevent.
-
-Note the SLICE half of BUG-972 IS alignment-aware — `packed_array_field_view` keys on
-`type_alignment_bytes`, so `[*]u8 v = f.payload;` compiles (pinned by
-`tests/zer/packed_u8_array_view_ok.zer`). The asymmetry is deliberate: that rule is new,
-so its precision was designed in.
-
-**Measured cost: ZERO.** `make check` is green across the 18 corpus files that use packed
-structs, so nothing real is being refused today. That is what makes deferring it correct
-rather than lazy.
-
-**Fix sketch.** Gate `addr_of_is_packed_field` on `type_alignment_bytes(target) > 1`,
-where `target` is the type of the addressed member (the array ELEMENT type when an INDEX
-step was peeled). That also relaxes `&p.b`. Verify against
-`tests/zer_fail/packed_array_elem_addr.zer` and the p22 cells, which must all still
-reject, and add a positive for each newly-accepted byte spelling.
-
-**Tripwire.** `tests/zer_fail/packed_u8_array_elem_addr.zer` pins the CURRENT rejection
-and says in its header that the rejection is the over-rejection. **DELETE that file when
-this is fixed** — leaving it would turn a deliberate record into a rule nobody meant.
-
----
+`addr_of_is_packed_field` now answers "no hazard" when the addressed operand's own type has
+alignment 1 (`type_alignment_bytes`), the test the slice half (`packed_array_field_view`) has
+made since BUG-972. `&p.b` (u8), `&p.w8[1]` (u8 array element) and `&p.bs` (a struct of bytes)
+compile; every u32 / u32-array / aligned-struct form stays refused (the zer_fail packed set, all
+re-run). An unknown operand type keeps the refusal. The pinned over-rejection
+`tests/zer_fail/packed_u8_array_elem_addr.zer` was removed as its own header instructed;
+`tests/zer/packed_byte_addr_ok_bug1305.zer` replaces it.
 
 ## ~~OPEN — a `shared struct` read in an ASM OPERAND takes NO LOCK~~ — CLOSED 2026-09-13 as BUG-1013
 
@@ -2362,7 +2326,7 @@ returns. 2 tests: `orelse_return_nonnull_ptr_fn`, `orelse_return_funcptr_fn`.
 ### Their remaining three (no live negative here; verify before adopting)
 
 - **BUG-913** an if-unwrap capture overwrote a same-named outer local
-- **BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration
+- ~~**BUG-921** `f(*p);` as a statement mis-parsed as a funcptr declaration~~ — CLOSED 2026-09-25 (BUG-1306)
 - **BUG-923** a bit-slice write on a `uN` value did not compile
 
 ### Suggested order for this branch
@@ -6060,45 +6024,12 @@ none widen acceptance, so a mistake over-rejects (safe), EXCEPT none here touch 
 
 ---
 
-## OPEN — `tools/audit_matrix.sh` is STALE (false positives mask real flag-handler gaps) (LOW — tool only, contracts sound)
+## CLOSED 2026-09-25 — `tools/audit_matrix.sh` was STALE (16 false positives)
 
-**Symptom:** `bash tools/audit_matrix.sh checker.c` reports 16 "BUG: … missing …
-check" gaps (RETURN/BREAK/CONTINUE/GOTO/YIELD/AWAIT/SPAWN × defer_depth/
-critical_depth/in_loop/in_interrupt). **All 16 are FALSE POSITIVES** — the
-contracts they claim are missing are actually enforced.
-
-**Root cause:** the script hardcodes a line window (`$1 > 8500 && $1 < 11000`)
-and extracts the handler body as "first `case NODE_X:` in that window → next 200
-lines." checker.c has grown to 16k+ lines, and the SAME control-flow case labels
-now appear in FIVE different switches (scan_frame, collect_labels, validate_gotos,
-the real `check_stmt`, plus the emit-side). The script grabs a DECOY case (e.g.
-`case NODE_RETURN:` at ~9062 in a non-checking switch) instead of the real
-handler. The actual context-ban checks live at checker.c ~6730
-(`zer_return_allowed_in_context(defer_depth, critical_depth)` and the break/
-continue siblings) and ~11237 (the check_stmt switch) — both outside the tool's
-window. Verified by hand: every one of the 16 contracts holds.
-
-**Why it matters (and why LOW):** it is a MANUAL audit, NOT a `make check` gate,
-so it gates nothing and cannot fail CI. BUT in its current state it cannot
-surface a *real* flag-handler gap — the 16-line noise floor would bury it (same
-failure mode as "CRLF masks the audits"). So the flag-handler dimension currently
-has no working automated guard, unlike the switch-exhaustiveness dimension (now a
-hard `-Werror=switch` gate, 2026-06-27).
-
-**Fix sketch:** stop using a line range. Anchor on the real `check_stmt` function
-(find its `switch (node->kind)` by walking from the `check_stmt` definition), and
-within THAT switch only, extract each control-flow case to its `break`. Or
-better, drop the grep heuristic entirely and assert the contracts a different way
-(e.g. a small unit test that feeds each `return/break/.../spawn`-in-`defer`/
-`@critical` program through the checker and asserts rejection — those negative
-`.zer` tests already exist in `tests/zer_fail/`, so the tool is arguably
-redundant and could be retired in favor of them).
-
-**Tripwire:** none yet (the negative `.zer` tests in `tests/zer_fail/` —
-`*_in_critical.zer`, defer-ban tests — are the real guarantee; this tool was
-meant to be a static cross-check of them).
-
----
+Rewritten as a BEHAVIOURAL matrix, as the fix sketch proposed: 25 cells, one compiled program
+per construct × context, each reject cell asserting the rule's own wording (so another rule
+cannot mask it), plus boundary cells that must compile. In `make check` after the emit audit.
+Verified to fire against a stub compiler that accepts everything (21 mismatches).
 
 ## OPEN — MAX-ORACLE GAP AUDIT (2026-06-23) — the master map: which safety classes are not-sound / not-flexible / coarse-or-no-oracle
 

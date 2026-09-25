@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-25e — BUG-1304..1307: pointer-to-array type, byte address of a packed field, `f(*p);`, alloc of a shared struct
+
+- **BUG-1304 — `*u32[4]` reached GCC as `uint32_t[4]* p`.** Refused at `resolve_type`
+  (TYNODE_POINTER over an array) with the slice / struct-wrapper remedy. Test:
+  `tests/zer_fail/pointer_to_array_type_bug1304.zer`.
+- **BUG-1305 — `&p.b` / `&p.w8[1]` on a u8 member of a packed struct was refused** (a
+  relaxation, done on its own per the sound-relaxation discipline). The gate now asks the
+  alignment of the addressed type; alignment 1 cannot be misaligned. Every hazard form in
+  `tests/zer_fail/*packed*` still rejects; corpus scan: zero verdict differences. Test:
+  `tests/zer/packed_byte_addr_ok_bug1305.zer` (replaces the pinned over-rejection).
+- **BUG-1306 — `add(*p);` failed to parse.** Two statement-level lookaheads decided "funcptr
+  declaration" from the two tokens `( *`, which a call whose first argument is a dereference
+  also starts with. Both now ask `is_func_ptr_start`, which checks the whole declarator shape
+  `( * [name] [dims] ) (` (RF10's single query, which the two peeks had duplicated). Test:
+  `tests/zer/call_deref_arg_stmt_bug1306.zer` (parse error on the old build).
+- **BUG-1307 — `alloc(S)` / `free(p)` on a SHARED struct failed at GCC** ("'S' undeclared").
+  Both lower to the auto-slab builtins whose receiver is the struct TYPE (`S.alloc_ptr()`,
+  `S.free_ptr(p)`); `find_shared_root_expr` took that type-name receiver for a shared object
+  and the emitter locked `&S._zer_mtx`. A struct-typed receiver of alloc / alloc_ptr / free /
+  free_ptr is exactly what the checker routes to the auto-slab, so the finder now stops there.
+  Test: `tests/zer/alloc_shared_struct_bug1307.zer` (GCC error on the old build).
+
+---
+
 ## Session 2026-09-25d — BUG-1303: one object passed as two params of a scoped-spawn lender
 
 **Symptom (from-HEAD `c960b4ba` build).** `void f(*u32 a, *u32 b) { ThreadHandle t = spawn

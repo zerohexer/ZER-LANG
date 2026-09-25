@@ -2784,7 +2784,7 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 **For fresh sessions:** Run `make tags` first. Use `grep "function_name" tags` to find locations. Use `grep "pattern" file.c` to find specific code. Never read full files speculatively.
 
 ### Flag-Handler Matrix Audit (2026-04-14, automated)
-`bash tools/audit_matrix.sh checker.c` — cross-references control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
+(**Superseded 2026-09-25:** the tool is now BEHAVIOURAL — `bash tools/audit_matrix.sh ./zerc`, one compiled program per construct × context, in `make check`. The grep version below had drifted onto decoy `case` labels.) The original `bash tools/audit_matrix.sh checker.c` cross-referenced control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
 
 | Node | Missing Flag | Why it's a bug |
 |---|---|---|

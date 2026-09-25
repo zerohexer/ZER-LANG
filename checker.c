@@ -4990,7 +4990,14 @@ static bool addr_of_is_packed_field(Checker *c, Node *expr) {
     if (!op || op->kind != NODE_FIELD) return false;   /* must reach a FIELD access */
     bool packed_seen = false;
     packed_path_aggregate(c, op, &packed_seen, 0);
-    return packed_seen;
+    if (!packed_seen) return false;
+    /* BUG-1305: the address of something whose alignment is ONE cannot be
+     * misaligned — `&p.b` on a u8, `&p.w[0]` on a u8[4]. Asked of the operand's
+     * own type (unknown type: keep refusing). The same test the slice half
+     * (packed_array_field_view) has made since BUG-972. */
+    Type *ot = checker_get_type(c, expr->unary.operand);
+    if (ot && type_alignment_bytes(ot) == 1) return false;
+    return true;
 }
 /* BUG-833: `Symbol.is_packed_derived` was WRITTEN at exactly one site (the
  * var-decl `addr_exprs` loop) and READ at exactly one (the deref of a bare ident).
@@ -8522,6 +8529,14 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
         if (inner && type_unwrap_distinct(inner)->kind == TYPE_VOID) {
             checker_error(c, tn->loc.line,
                 "cannot create pointer to void — use '*opaque' for type-erased pointers");
+        }
+        /* BUG-1304: a pointer to an ARRAY type (`*u32[4]`) reached GCC as
+         * `uint32_t[4]* p`, which is not C — refused with the ZER line instead. */
+        if (inner && type_dispatch_kind(inner) == TYPE_ARRAY) {
+            checker_error(c, tn->loc.line,
+                "a pointer to an array type ('*%s') is not supported — pass a slice "
+                "('[*]T', which carries the length), or wrap the array in a struct and "
+                "point at that", type_name(inner));
         }
         return type_pointer(c->arena, inner);
     }

@@ -1,0 +1,11 @@
+u32 gv;
+*u32 getp() { return &gv; }
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    *u32 p = getp();
+    ThreadHandle th = spawn w(p);
+    th.join();
+    gv += 1;
+    if (gv != 2) { return 1; }
+    return 0;
+}

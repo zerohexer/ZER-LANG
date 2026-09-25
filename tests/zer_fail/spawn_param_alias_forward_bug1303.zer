@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: both reach 'v'
+// BUG-1303: the same race one call deeper — h hands its two params to the lender f —
+// and through a local copy of the used param.
+void w(*u32 p) { *p = *p + 1; }
+void f(*u32 a, *u32 b) {
+    *u32 q = b;
+    ThreadHandle t = spawn w(a);
+    *q = 5;
+    t.join();
+}
+void h(*u32 a, *u32 b) { f(a, b); }
+u32 main() {
+    u32 v = 0;
+    f(&v, &v);
+    h(&v, &v);
+    return 0;
+}

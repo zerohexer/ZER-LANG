@@ -350,7 +350,6 @@ checker.c:scan_unsafe_global_access:NODE_FILE:file.decls
 checker.c:scan_unsafe_global_access:NODE_FUNC_DECL:func_decl.body
 checker.c:scan_unsafe_global_access:NODE_GLOBAL_VAR:var_decl.init
 checker.c:scan_unsafe_global_access:NODE_INTERRUPT:interrupt.body
-checker.c:scan_unsafe_global_access:NODE_ONCE:once.body
 checker.c:scan_unsafe_global_access:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 # --- checker.c: validate_gotos ---
@@ -1747,3 +1746,110 @@ checker.c:is_non_storable_depth:NODE_UNARY:unary.operand
 checker.c:is_non_storable_depth:NODE_VAR_DECL:var_decl.init
 checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.body
 checker.c:is_non_storable_depth:NODE_WHILE:while_stmt.cond
+# BUG-1277 value_derefs_global: walks a VALUE expression; statement kinds cannot occur in one
+# (an orelse block fallback yields no value). BUG-1285 ret_roots_stmt: a STATEMENT walk for
+# return expressions; expression kinds never stand at statement level (EXPR_STMT wraps them,
+# and every expression position is opened by for_each_orelse_block), and a return cannot
+# leave defer / @critical / @once bodies (checker bans).
+checker.c:ret_roots_stmt:NODE_ASSIGN:assign.target
+checker.c:ret_roots_stmt:NODE_ASSIGN:assign.value
+checker.c:ret_roots_stmt:NODE_BINARY:binary.left
+checker.c:ret_roots_stmt:NODE_BINARY:binary.right
+checker.c:ret_roots_stmt:NODE_CALL:call.args
+checker.c:ret_roots_stmt:NODE_CALL:call.callee
+checker.c:ret_roots_stmt:NODE_CRITICAL:critical.body
+checker.c:ret_roots_stmt:NODE_DEFER:defer.body
+checker.c:ret_roots_stmt:NODE_FIELD:field.object
+checker.c:ret_roots_stmt:NODE_FILE:file.decls
+checker.c:ret_roots_stmt:NODE_FUNC_DECL:func_decl.body
+checker.c:ret_roots_stmt:NODE_GLOBAL_VAR:var_decl.init
+checker.c:ret_roots_stmt:NODE_INDEX:index_expr.index
+checker.c:ret_roots_stmt:NODE_INDEX:index_expr.object
+checker.c:ret_roots_stmt:NODE_INTERRUPT:interrupt.body
+checker.c:ret_roots_stmt:NODE_INTRINSIC:intrinsic.args
+checker.c:ret_roots_stmt:NODE_ONCE:once.body
+checker.c:ret_roots_stmt:NODE_ORELSE:orelse.expr
+checker.c:ret_roots_stmt:NODE_ORELSE:orelse.fallback
+checker.c:ret_roots_stmt:NODE_SLICE:slice.end
+checker.c:ret_roots_stmt:NODE_SLICE:slice.object
+checker.c:ret_roots_stmt:NODE_SLICE:slice.start
+checker.c:ret_roots_stmt:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:ret_roots_stmt:NODE_STRUCT_INIT:struct_init.fields
+checker.c:ret_roots_stmt:NODE_TYPECAST:typecast.expr
+checker.c:ret_roots_stmt:NODE_UNARY:unary.operand
+checker.c:value_derefs_global:NODE_ASM:asm_stmt.inputs
+checker.c:value_derefs_global:NODE_ASM:asm_stmt.outputs
+checker.c:value_derefs_global:NODE_AWAIT:await_stmt.cond
+checker.c:value_derefs_global:NODE_BLOCK:block.stmts
+checker.c:value_derefs_global:NODE_CRITICAL:critical.body
+checker.c:value_derefs_global:NODE_DEFER:defer.body
+checker.c:value_derefs_global:NODE_DO_WHILE:while_stmt.body
+checker.c:value_derefs_global:NODE_DO_WHILE:while_stmt.cond
+checker.c:value_derefs_global:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:value_derefs_global:NODE_FILE:file.decls
+checker.c:value_derefs_global:NODE_FOR:for_stmt.body
+checker.c:value_derefs_global:NODE_FOR:for_stmt.cond
+checker.c:value_derefs_global:NODE_FOR:for_stmt.init
+checker.c:value_derefs_global:NODE_FOR:for_stmt.step
+checker.c:value_derefs_global:NODE_FUNC_DECL:func_decl.body
+checker.c:value_derefs_global:NODE_GLOBAL_VAR:var_decl.init
+checker.c:value_derefs_global:NODE_IF:if_stmt.cond
+checker.c:value_derefs_global:NODE_IF:if_stmt.else_body
+checker.c:value_derefs_global:NODE_IF:if_stmt.then_body
+checker.c:value_derefs_global:NODE_INTERRUPT:interrupt.body
+checker.c:value_derefs_global:NODE_ONCE:once.body
+checker.c:value_derefs_global:NODE_RETURN:ret.expr
+checker.c:value_derefs_global:NODE_SPAWN:spawn_stmt.args
+checker.c:value_derefs_global:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:value_derefs_global:NODE_SWITCH:switch_stmt.arms
+checker.c:value_derefs_global:NODE_SWITCH:switch_stmt.expr
+checker.c:value_derefs_global:NODE_VAR_DECL:var_decl.init
+checker.c:value_derefs_global:NODE_WHILE:while_stmt.body
+checker.c:value_derefs_global:NODE_WHILE:while_stmt.cond
+# BUG-1299 opaque_read_from_shared: asks where a STORED *opaque VALUE came from. It follows
+# the value (a field/index PATH is answered by lvalue_path_through_shared, a cast / intrinsic
+# / orelse by peeling). Every other kind produces no stored *opaque (a call result is the
+# documented residual); statements never reach it.
+checker.c:opaque_read_from_shared:NODE_ASM:asm_stmt.inputs
+checker.c:opaque_read_from_shared:NODE_ASM:asm_stmt.outputs
+checker.c:opaque_read_from_shared:NODE_ASSIGN:assign.target
+checker.c:opaque_read_from_shared:NODE_ASSIGN:assign.value
+checker.c:opaque_read_from_shared:NODE_AWAIT:await_stmt.cond
+checker.c:opaque_read_from_shared:NODE_BINARY:binary.left
+checker.c:opaque_read_from_shared:NODE_BINARY:binary.right
+checker.c:opaque_read_from_shared:NODE_BLOCK:block.stmts
+checker.c:opaque_read_from_shared:NODE_CALL:call.args
+checker.c:opaque_read_from_shared:NODE_CALL:call.callee
+checker.c:opaque_read_from_shared:NODE_CRITICAL:critical.body
+checker.c:opaque_read_from_shared:NODE_DEFER:defer.body
+checker.c:opaque_read_from_shared:NODE_DO_WHILE:while_stmt.body
+checker.c:opaque_read_from_shared:NODE_DO_WHILE:while_stmt.cond
+checker.c:opaque_read_from_shared:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:opaque_read_from_shared:NODE_FIELD:field.object
+checker.c:opaque_read_from_shared:NODE_FILE:file.decls
+checker.c:opaque_read_from_shared:NODE_FOR:for_stmt.body
+checker.c:opaque_read_from_shared:NODE_FOR:for_stmt.cond
+checker.c:opaque_read_from_shared:NODE_FOR:for_stmt.init
+checker.c:opaque_read_from_shared:NODE_FOR:for_stmt.step
+checker.c:opaque_read_from_shared:NODE_FUNC_DECL:func_decl.body
+checker.c:opaque_read_from_shared:NODE_GLOBAL_VAR:var_decl.init
+checker.c:opaque_read_from_shared:NODE_IF:if_stmt.cond
+checker.c:opaque_read_from_shared:NODE_IF:if_stmt.else_body
+checker.c:opaque_read_from_shared:NODE_IF:if_stmt.then_body
+checker.c:opaque_read_from_shared:NODE_INDEX:index_expr.index
+checker.c:opaque_read_from_shared:NODE_INDEX:index_expr.object
+checker.c:opaque_read_from_shared:NODE_INTERRUPT:interrupt.body
+checker.c:opaque_read_from_shared:NODE_ONCE:once.body
+checker.c:opaque_read_from_shared:NODE_RETURN:ret.expr
+checker.c:opaque_read_from_shared:NODE_SLICE:slice.end
+checker.c:opaque_read_from_shared:NODE_SLICE:slice.object
+checker.c:opaque_read_from_shared:NODE_SLICE:slice.start
+checker.c:opaque_read_from_shared:NODE_SPAWN:spawn_stmt.args
+checker.c:opaque_read_from_shared:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:opaque_read_from_shared:NODE_STRUCT_INIT:struct_init.fields
+checker.c:opaque_read_from_shared:NODE_SWITCH:switch_stmt.arms
+checker.c:opaque_read_from_shared:NODE_SWITCH:switch_stmt.expr
+checker.c:opaque_read_from_shared:NODE_UNARY:unary.operand
+checker.c:opaque_read_from_shared:NODE_VAR_DECL:var_decl.init
+checker.c:opaque_read_from_shared:NODE_WHILE:while_stmt.body
+checker.c:opaque_read_from_shared:NODE_WHILE:while_stmt.cond

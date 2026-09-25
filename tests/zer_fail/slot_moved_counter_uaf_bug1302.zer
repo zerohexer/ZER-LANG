@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1302: a slot freed through `tbl[i]` and read back through another index after
+// i moved on. The FREED fact was dropped when i was written, so the second loop read
+// four freed objects. Now kept on the array, relative to the counter.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] tbl;
+    for (u32 i = 0; i < 4; i += 1) { tbl[i] = alloc(T); }
+    for (u32 i = 0; i < 4; i += 1) { *T q = tbl[i] orelse { return 1; }; free(q); }
+    for (u32 j = 0; j < 4; j += 1) { *T r = tbl[j] orelse { return 2; }; if (r.v != 0) { return 3; } }
+    return 0;
+}

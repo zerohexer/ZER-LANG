@@ -1,0 +1,9 @@
+struct B { u32 v; }
+Arena mk([*]u8 b) { return Arena.over(b); }
+u32 main() {
+    u8[64] lb;
+    Arena a = mk(lb[0..]);
+    *B x = a.alloc(B) orelse return;
+    x.v = 3;
+    return x.v - 3;
+}

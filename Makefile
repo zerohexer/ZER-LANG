@@ -245,6 +245,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_float_literal.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
+	@echo "=== Flag-handler matrix (construct x context verdicts) ==="
+	@bash tools/audit_matrix.sh ./zerc
 	@echo "=== Per-sink escape/UAF matrix (must stay CLEAN — 0 holes / 0 over-rejects) ==="
 	@bash tools/sink_matrix.sh ./zerc
 	@echo ""

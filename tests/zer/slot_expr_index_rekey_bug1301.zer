@@ -1,0 +1,20 @@
+// BUG-1301 boundary: an expression-keyed slot fact dies when a local in the
+// expression is written — after `k = 6` the same spelling names another slot.
+struct T { u32 v; }
+?*T[4] g;
+u32 main() {
+    u32 k = 5;
+    *T x = alloc(T) orelse { return 1; };
+    g[k % 4] = x;
+    *T a = g[k % 4] orelse { return 2; };
+    free(a);
+    g[k % 4] = null;
+    k = 6;
+    *T y = alloc(T) orelse { return 3; };
+    g[k % 4] = y;
+    *T q = g[k % 4] orelse { return 4; };
+    u32 r = q.v;
+    free(q);
+    g[k % 4] = null;
+    return r;
+}

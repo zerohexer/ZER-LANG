@@ -1,0 +1,13 @@
+// expect-trap
+// expect-trap-msg: cannot return without leaking it
+Semaphore(1) s;
+u32[4] arr;
+u32 idx = 0;
+void put() { @sem_acquire(s); arr[idx] = 1; @sem_release(s); }
+u32 main() {
+    idx = 9;
+    put();
+    idx = 0;
+    put();
+    return 0;
+}

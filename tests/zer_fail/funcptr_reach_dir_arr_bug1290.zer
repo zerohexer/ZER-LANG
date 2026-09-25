@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: carries a function pointer whose target the compiler cannot resolve
+u32 g;
+void bump() { g += 1; }
+typedef *() -> void Cb;
+void worker(*() -> void fp) { fp(); }
+u32 main() { Cb[2] t; t[0] = bump; t[1] = bump; spawn worker(t[0]); return 0; }

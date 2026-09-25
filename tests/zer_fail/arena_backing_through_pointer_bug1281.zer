@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: field, element or dereference
+struct B { [*]u32 s; }
+struct S { u8[64] buf; }
+u32 main() {
+    S st;
+    *S p = &st;
+    Arena a = Arena.over(p.buf);
+    *B x = a.alloc(B) orelse return;
+    [*]u32 hs = alloc(u32, 2) orelse return;
+    x.s = hs;
+    st.buf[8] = 200;
+    u32 r = (u32)x.s.len;
+    free(hs);
+    return r;
+}

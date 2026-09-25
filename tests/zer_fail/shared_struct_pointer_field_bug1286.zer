@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: holds a pointer to non-shared data
+struct Cell { u32 n; }
+shared struct S { ?*Cell p; }
+S s;
+Cell c;
+void w() {
+    for (u32 i = 0; i < 100000; i += 1) {
+        ?*Cell mq = s.p;
+        if (mq) |q| { q.n += 1; }
+    }
+}
+u32 main() {
+    s.p = &c;
+    ThreadHandle t1 = spawn w();
+    ThreadHandle t2 = spawn w();
+    t1.join();
+    t2.join();
+    if (c.n == 200000) { return 0; }
+    return 1;
+}

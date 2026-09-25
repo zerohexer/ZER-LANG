@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: borrowed by a scoped spawn
+u32 gv;
+*u32 getp() { return &gv; }
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    *u32 p = getp();
+    ThreadHandle th = spawn w(p);
+    gv += 1;
+    th.join();
+    return 0;
+}

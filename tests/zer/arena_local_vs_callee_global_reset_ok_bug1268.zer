@@ -1,0 +1,13 @@
+struct T { u32 v; }
+u8[64] gbuf;
+Arena ga;
+u32 use_and_reset(*T t) { u32 r = t.v; ga.reset(); return r; }
+u32 main() {
+    ga = Arena.over(gbuf);
+    u8[64] lb;
+    Arena la = Arena.over(lb);
+    *T t = la.alloc(T) orelse return;
+    t.v = 4;
+    u32 r = use_and_reset(t);
+    return r - 4;
+}

@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: accesses 'g' outside the @once block
+u32 g;
+void w() { @once { g = 5; } }
+u32 peek() { return g; }
+u32 main() {
+    ThreadHandle th = spawn w();
+    u32 x = peek();
+    th.join();
+    return x;
+}

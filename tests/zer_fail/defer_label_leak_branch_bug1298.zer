@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1298: in a function WITH a label, every defer's frees were credited to every
+// return, so the free of a defer registered inside `if (c)` hid the leak on the
+// goto path, which never passed it.
+struct Task { u32 id; }
+Slab(Task) heap;
+u32 main() {
+    *Task t = heap.alloc_ptr() orelse { return 1; };
+    bool c = true;
+    if (c) {
+        defer heap.free_ptr(t);
+        return t.id;
+    }
+    goto out;
+out:
+    return 0;
+}

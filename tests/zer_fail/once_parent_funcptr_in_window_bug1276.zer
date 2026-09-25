@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot call through a function pointer
+u32 g;
+void w() { @once { g = 5; } }
+void nop() { }
+u32 main() {
+    *() fp = nop;
+    ThreadHandle th = spawn w();
+    fp();
+    th.join();
+    return 0;
+}

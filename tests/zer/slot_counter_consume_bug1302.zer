@@ -1,0 +1,24 @@
+// BUG-1302 boundary: the consume loop reads each slot through the counter it frees
+// with (a for-step under `i < 4` cannot wrap back onto a freed slot), and a slot
+// reset to null after its free is plain null afterwards.
+struct T { u32 v; }
+u32 consume() {
+    ?*T[4] tbl;
+    for (u32 i = 0; i < 4; i += 1) { tbl[i] = alloc(T); }
+    u32 n = 0;
+    for (u32 i = 0; i < 4; i += 1) { *T q = tbl[i] orelse { return 1; }; n += q.v; free(q); }
+    return n;
+}
+u32 reset_then_scan() {
+    ?*T[4] tbl;
+    for (u32 i = 0; i < 4; i += 1) { tbl[i] = alloc(T); }
+    for (u32 i = 0; i < 4; i += 1) { *T q = tbl[i] orelse { return 1; }; free(q); tbl[i] = null; }
+    u32 n = 0;
+    for (u32 j = 0; j < 4; j += 1) { if (tbl[j]) |r| { n += r.v; } }
+    return n;
+}
+u32 main() {
+    if (consume() != 0) { return 1; }
+    if (reset_then_scan() != 0) { return 2; }
+    return 0;
+}

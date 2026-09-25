@@ -348,6 +348,12 @@ typedef struct {
      * function. */
     Symbol **lent_globals;
     int lent_global_count, lent_global_cap;
+    /* BUG-1276: globals a RUNNING scoped thread writes inside a @once block, and
+     * which @once node owns each. While the spawn window is open the parent may
+     * touch them only inside that same @once (directly or through a callee). */
+    struct OnceLent { Symbol *g; Node *once; int line; } *once_lent;
+    int once_lent_count, once_lent_cap;
+    Node *cur_once_node;   /* innermost @once being checked (NULL outside) */
     /* BUG-980: the mirror of lockchk_direct_only — collect ONLY what the
      * statement's CALLEES touch, skipping its own direct accesses. Intersecting
      * the two sets is what makes same-type re-entry visible: the full pass
@@ -358,6 +364,26 @@ typedef struct {
     bool lockchk_callee_only;
     bool lockchk_saw_opaque_call;
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
+    /* BUG-1269: the ONE identifier node that is the root of an `Arena.over(x)`
+     * / `free(x)` argument being checked — the only mention of an arena's
+     * backing store the ownership rule allows. */
+    Node *arena_backing_exempt;
+    bool arena_backing_scanned;   /* the whole-program global scan ran */
+    /* this function's locals handed to Arena.over, with the arena they back */
+    struct ArenaBackingName { const char *name; uint32_t len; const char *arena;
+                              uint32_t alen; int line; } *fn_arena_backing;
+    int fn_arena_backing_n, fn_arena_backing_cap;
+    /* BUG-1281: parameters a function turns into an arena backing store —
+     * `Arena.over(p)`, directly or by forwarding p to such a parameter. Keyed on
+     * the FUNC_DECL node (both symbols of a module function share it). A call
+     * hands its argument's buffer to the arena: the caller's buffer is consumed. */
+    struct ArenaConsume { Node *fn; bool *param; int n; } *arena_consume;
+    int arena_consume_n, arena_consume_cap;
+    /* BUG-1271: container provenance of a POINTER FIELD / ELEMENT of a local
+     * (`H h = { .q = &ls[0] };` -> "h.q" is a whole object). Per function. */
+    struct CProvEntry { const char *key; uint32_t len; int kind; Type *st;
+                        const char *fn; uint32_t fl; } *cprov_map;
+    int cprov_n, cprov_cap;
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
@@ -404,8 +430,30 @@ typedef struct {
     struct AtomicPlainWrite {
         struct Symbol *sym;
         int line;
+        /* BUG-1284: `&g` handed straight to param `via_argi` of `via_callee` —
+         * not a launder when that param is only used atomically. */
+        struct Symbol *via_callee;
+        int via_argi;
     } *atomic_plain_writes;
+    Node *field_obj_node;            /* BUG-1295: the object of the NODE_FIELD / NODE_INDEX being checked */
+    struct Symbol *amp_arg_callee;   /* the call whose argument is being checked */
+    int amp_arg_index;
     int atomic_plain_write_count;
+    /* BUG-1284: every pointer argument of a direct call — the global it may
+     * reach, or the caller's param it forwards — resolved against the callees'
+     * atomic_param_mask after all bodies are checked. */
+    struct AtomicArgRec { Symbol *callee; int argi; Symbol *g; Symbol *caller;
+                          int caller_param; } *atomic_args;
+    int atomic_arg_n, atomic_arg_cap;
+    /* BUG-1303: direct calls passing one object as two pointer arguments. */
+    struct AliasCallRec { Symbol *callee; int line; int argc;
+                          const char **roots; uint32_t *root_lens; } *alias_calls;
+    int alias_call_n, alias_call_cap;
+    /* BUG-1303: calls forwarding the caller's params (for the pair fixpoint). */
+    struct ParamFwdRec { Symbol *caller; Symbol *callee; int argc; signed char *pparam; }
+        *param_fwds;
+    int param_fwd_n, param_fwd_cap;
+    uint64_t lent_param_live_mask;   /* params lent to a still-live scoped thread */
     int atomic_plain_write_capacity;
 
     /* A6-full slice 3: struct-field atomic cells `@atomic_*(&s.f)` on a plain

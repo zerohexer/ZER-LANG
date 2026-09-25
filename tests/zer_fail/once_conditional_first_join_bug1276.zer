@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: writes it inside a @once block
+u32 g;
+void w(bool k) { if (k) { @once { g = 5; } } }
+u32 main() {
+    ThreadHandle t1 = spawn w(false);
+    ThreadHandle t2 = spawn w(true);
+    t1.join();
+    u32 x = g;
+    t2.join();
+    return x;
+}

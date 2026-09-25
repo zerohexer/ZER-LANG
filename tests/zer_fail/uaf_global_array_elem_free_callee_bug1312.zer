@@ -1,0 +1,19 @@
+// expect-error: use after free
+// BUG-1312: a GLOBAL array handed as a slice to a callee that frees an element.
+i32 printf(const *u8 fmt, ...);
+struct T { u32 v; }
+struct H { ?*T p; }
+H[2] gh;
+void dropit([*]H s) { *T q = s[0].p orelse return; free(q); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 11;
+    gh[0].p = a;
+    dropit(gh);
+    gh[0].p = null;
+    *T b = alloc(T) orelse return;
+    b.v = 22;
+    printf("%u\n", a.v);
+    free(b);
+    return 0;
+}

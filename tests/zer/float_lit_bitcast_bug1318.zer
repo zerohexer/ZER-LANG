@@ -1,0 +1,8 @@
+// BUG-1318: regression (see BUGS-FIXED.md).
+// expected exit 0; actual exit 1 + ASan stack-buffer-overflow:
+// emitted `__auto_type _zer_bci1 = 2; memcpy(&u64, &_zer_bci1, 8)` — 2.0 rendered as int 2
+u32 main() {
+    u64 b = @bitcast(u64, 2.0);
+    if (b != 4611686018427387904) { return 1; }
+    return 0;
+}

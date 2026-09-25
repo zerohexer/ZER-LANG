@@ -1,0 +1,9 @@
+// BUG-1321: regression (see BUGS-FIXED.md).
+// ZER escape `\0` is one NUL byte, so "\01" is two bytes (0, '1').
+// Emitted C "\01" is the OCTAL escape \01 = one byte 0x01. Expected exit 0; actual exit 1.
+u32 main() {
+    const [*]u8 s = "\01";
+    if (s.len != 2) { return 1; }
+    if (s[0] != 0 || s[1] != '1') { return 2; }
+    return 0;
+}

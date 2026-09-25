@@ -1,0 +1,3 @@
+// expect-error: requires integer operands
+// BUG-1318: `%` on floats was accepted by the checker and refused by GCC.
+u32 main() { f64 a = 5.0; f64 b = a % 2.0; if (b > 1.0) { return 1; } return 0; }

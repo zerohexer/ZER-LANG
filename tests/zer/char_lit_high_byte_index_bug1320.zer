@@ -1,0 +1,9 @@
+// BUG-1320: regression (see BUGS-FIXED.md).
+// valid index 255 on u8[256]; emitted index is 4294967295 (sign-extended char literal) -> false ZER TRAP. Expected exit 0.
+u32 main() {
+    u8[256] t;
+    t['\xff'] = 7;
+    u8 x = t['\xff'];
+    if (t[255] != 7) { return 1; }
+    return 0;
+}

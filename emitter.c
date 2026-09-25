@@ -44,14 +44,106 @@ static void emit(Emitter *e, const char *fmt, ...) {
  *
  * ONE helper, not five spellings. A new float-emitting site must call this, never
  * `%.17g`; `tools/audit_float_literal.sh` fails the build on a raw one. */
-static void emit_double_lit(Emitter *e, double v) {
+/* BUG-1318: `%.17g` prints an INTEGRAL double without a decimal point — `2.0` as
+ * `2`, `-0.0` as `-0` — and C reads that token as an INT. The var-decl form hid it
+ * (the value lands in a typed temp); every expression position computed in int:
+ * `a = 1.0 / 2.0;` was `a = 1 / 2` = 0.0, `100000.0 * 100000.0` an int multiply,
+ * `@bitcast(u64, 2.0)` copied 8 bytes out of a 4-byte int (ASan), and `-0.0` lost
+ * its sign. An integral value now carries `.0`. `f32` = the literal's checked type
+ * is f32: it is printed as the FLOAT value with an `f` suffix, so an expression
+ * such as `c = a * 0.1` computes in f32 like the var-decl form does (the typed
+ * temp converts the double literal to float — the same value printed here). */
+static void emit_double_lit(Emitter *e, double v, bool f32) {
     /* NaN first: every comparison against NaN is false, so an `isnan`-last
      * ordering would fall through to `%.17g` and print `nan`. Same reason the
      * float->int saturation guard tests NaN first (BUG-883). */
-    if (v != v) { emit(e, "__builtin_nan(\"\")"); return; }
+    if (v != v) { emit(e, f32 ? "__builtin_nanf(\"\")" : "__builtin_nan(\"\")"); return; }
+    if (f32) {
+        float fv = (float)v;
+        if (fv != fv || fv > 3.40282347e38f || fv < -3.40282347e38f) {
+            emit(e, fv < 0 ? "(-__builtin_inff())" : "__builtin_inff()");
+            return;
+        }
+        emit(e, "%.9g", (double)fv);
+        if (fv < 1e9f && fv > -1e9f && fv == (float)(long long)fv) emit(e, ".0");
+        emit(e, "f");
+        return;
+    }
     if (v > 1.7976931348623157e308) { emit(e, "__builtin_inf()"); return; }
     if (v < -1.7976931348623157e308) { emit(e, "(-__builtin_inf())"); return; }
     emit(e, "%.17g", v);
+    /* %.17g uses an exponent (a floating token) from 1e17 up */
+    if (v < 1e17 && v > -1e17 && v == (double)(long long)v) emit(e, ".0");
+}
+/* The literal's checked type decides its C spelling. */
+static bool emit_type_is_f32(Type *t) {
+    t = t ? type_unwrap_distinct(t) : NULL;
+    return t && type_dispatch_kind(t) == TYPE_F32;
+}
+
+/* BUG-1323: the operand of a bit-query intrinsic (@popcount/@ctz/@clz/@parity/
+ * @ffs), ZERO-extended to the width it is counted at — 32 for up to 32 bits, else
+ * 64 (reference.md: "only TWO widths"). The operand used to reach the builtin
+ * as-is: a signed narrow value SIGN-extended (`@popcount(i8 -1)` was 32, not 8;
+ * `i5 -1` also 32), and the zero result was the operand's OWN width (`@clz(u8 0)`
+ * was 8 while `@clz(u8 1)` was 31 — not even monotonic). */
+static int bitq_count_width(int w) { return w > 32 ? 64 : 32; }
+static void bitq_operand_open(Emitter *e, int w) {
+    emit(e, w > 32 ? "((uint64_t)(" : "((uint32_t)(");
+}
+static void bitq_operand_close(Emitter *e, int w) {
+    if (w <= 0 || w == 32 || w >= 64) { emit(e, "))"); return; }
+    emit(e, ") & 0x%llxULL)", (unsigned long long)((1ULL << w) - 1ULL));
+}
+
+/* BUG-1321: the body of a ZER string literal as C string-literal text. ZER's
+ * escapes are fixed-width — `\xHH` is exactly two hex digits and `\0` is one NUL
+ * byte — while C's are greedy: `\x` eats EVERY following hex digit and `\0`
+ * starts an OCTAL escape of up to three digits. Copied verbatim, `"\x41b"` (two
+ * bytes in ZER) was one out-of-range byte in C and `"\01"` (NUL, '1') was the
+ * single byte 0x01 — a wrong `.len` and wrong bytes, silently. A hex escape is
+ * closed with `""` (C literal concatenation) when a hex digit follows, and `\0`
+ * is spelled `\000` (three octal digits end the escape). Every other character
+ * and escape is copied as written. */
+static int zer_is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+static void emit_c_string_text(Emitter *e, const char *t, int n) {
+    for (int i = 0; i < n; i++) {
+        if (t[i] != '\\' || i + 1 >= n) { fputc(t[i], e->out); continue; }
+        char esc = t[i + 1];
+        if (esc == 'x') {
+            /* \xHH — the lexer guarantees two hex digits */
+            fputc('\\', e->out); fputc('x', e->out);
+            if (i + 2 < n) fputc(t[i + 2], e->out);
+            if (i + 3 < n) fputc(t[i + 3], e->out);
+            i += 3;
+            if (i + 1 < n && zer_is_hex(t[i + 1])) fputs("\"\"", e->out);
+            continue;
+        }
+        if (esc == '0') { fputs("\\000", e->out); i += 1; continue; }
+        fputc('\\', e->out); fputc(esc, e->out);
+        i += 1;
+    }
+}
+static void emit_zer_string_slice(Emitter *e, const char *t, int n, bool paren) {
+    emit(e, paren ? "((_zer_slice_u8){ (uint8_t*)\"" : "(_zer_slice_u8){ (uint8_t*)\"");
+    emit_c_string_text(e, t, n);
+    emit(e, "\", sizeof(\"");
+    emit_c_string_text(e, t, n);
+    emit(e, paren ? "\") - 1 })" : "\") - 1 }");
+}
+
+/* BUG-1320: a character literal is a u8 (BUG-1191). The AST field is a (signed)
+ * `char`, so '\xff' read as -1: one emitter printed `(unsigned)-1` = 4294967295
+ * (`t['\xff'] = 7` trapped as out of bounds, `c == '\xff'` was false for c = 255)
+ * and the other printed the raw byte inside quotes, a negative `int` in C. ONE
+ * spelling for both paths: printable ASCII as itself, everything else as its
+ * unsigned value. */
+static void emit_char_lit(Emitter *e, Node *node) {
+    unsigned v = (unsigned)(uint8_t)node->char_lit.value;
+    if (v >= 32 && v < 127 && v != '\'' && v != '\\') emit(e, "'%c'", (char)v);
+    else emit(e, "%uU", v);
 }
 
 /* emit a user-defined type name with optional module prefix for namespace mangling.
@@ -2665,6 +2757,7 @@ static bool struct_init_names_array_field(Type *si_type, Node *node) {
  * Returns false when the target is not this function's business. */
 typedef void (*EmitNodeFn)(Emitter *, Node *, IRFunc *);
 static void emit_bitslice_set(Emitter *e, Node *node, IRFunc *func, EmitNodeFn sub);   /* BUG-1198 */
+static bool lvalue_through_packed(Emitter *e, Node *lv);   /* BUG-1324 */
 static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f);
 static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en) {
     Node *tgt = node->assign.target;
@@ -2707,6 +2800,19 @@ static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en)
         emit(e, "); _zer_up%d->_tag = %ld; ", tmp, utag);
         snprintf(lv, sizeof lv, "(_zer_up%d->%.*s)", tmp,
                  (int)tgt->field.field_name_len, tgt->field.field_name);
+    } else if (lvalue_through_packed(e, tgt)) {
+        /* BUG-1324: a field of a PACKED struct may sit at any byte offset, so a
+         * plain `__typeof__(p.w) *` to it is misaligned (UBSan; a hard fault on
+         * Cortex-M0 / RISC-V) — the pointer ZER forbids users to form (BUG-972).
+         * An aligned(1) pointee keeps the single evaluation and makes GCC use
+         * accesses that are legal at any address. */
+        emit(e, "typedef __typeof__(");
+        en(e, tgt, func);
+        emit(e, ") __attribute__((aligned(1))) _zer_ua%d; _zer_ua%d *_zer_np%d = &(",
+             tmp, tmp, tmp);
+        en(e, tgt, func);
+        emit(e, "); ");
+        snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
     } else {
         emit(e, "__typeof__(");
         en(e, tgt, func);
@@ -2907,7 +3013,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         break;
 
     case NODE_FLOAT_LIT:
-        emit_double_lit(e, node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value,
+                           emit_type_is_f32(checker_get_type(e->checker, node)));
         break;
 
     case NODE_STRING_LIT:
@@ -2916,19 +3023,11 @@ static void emit_expr_impl(Emitter *e, Node *node) {
          * sequences at compile time. Source-char count overcounted ("\n"
          * is 2 source chars / 1 emitted byte), letting bounds checks
          * approve OOB reads on escape-bearing literals. */
-        emit(e, "((_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 })",
-             (int)node->string_lit.length, node->string_lit.value,
-             (int)node->string_lit.length, node->string_lit.value);
+        emit_zer_string_slice(e, node->string_lit.value, (int)node->string_lit.length, true);
         break;
 
     case NODE_CHAR_LIT:
-        if (node->char_lit.value == '\n') emit(e, "'\\n'");
-        else if (node->char_lit.value == '\t') emit(e, "'\\t'");
-        else if (node->char_lit.value == '\r') emit(e, "'\\r'");
-        else if (node->char_lit.value == '\0') emit(e, "'\\0'");
-        else if (node->char_lit.value == '\\') emit(e, "'\\\\'");
-        else if (node->char_lit.value == '\'') emit(e, "'\\''");
-        else emit(e, "'%c'", node->char_lit.value);
+        emit_char_lit(e, node);
         break;
 
     case NODE_BOOL_LIT:
@@ -3458,7 +3557,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             }
             /* Comptime float return — emit double literal */
             if (node->call.is_comptime_float) {
-                emit_double_lit(e, node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value,
+                                   emit_type_is_f32(checker_get_type(e->checker, node)));
                 break;
             }
             Type *ct = checker_get_type(e->checker, node);
@@ -5265,14 +5365,20 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                  * GCC statement expressions are not allowed. Use a conditional expression
                  * which double-evaluates the arg — safe for globals (constant expr) and
                  * matches the IR-path semantics: ctz(0)/clz(0) → bit-width. */
-                emit(e, "(uint32_t)(((");
+                emit(e, "(uint32_t)((");
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                bitq_operand_close(e, w);
+                emit(e, " == 0) ? %d : __builtin_%.*s%s(", bitq_count_width(w), (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
+                bitq_operand_close(e, w);
                 emit(e, "))");
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
+                bitq_operand_close(e, w);
                 emit(e, ")");
             }
         } else if (nlen == 4 && memcmp(name, "addc", 4) == 0 && node->intrinsic.arg_count == 3) {
@@ -8491,17 +8597,14 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
-        emit_double_lit(e, node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value,
+                           emit_type_is_f32(checker_get_type(e->checker, node)));
         return;
     case NODE_BOOL_LIT:
         emit(e, "%d", node->bool_lit.value ? 1 : 0);
         return;
     case NODE_CHAR_LIT:
-        if (node->char_lit.value >= 32 && node->char_lit.value < 127 &&
-            node->char_lit.value != '\'' && node->char_lit.value != '\\')
-            emit(e, "'%c'", (char)node->char_lit.value);
-        else
-            emit(e, "%u", (unsigned)node->char_lit.value);
+        emit_char_lit(e, node);
         return;
     case NODE_NULL_LIT:
         emit(e, "0");
@@ -8510,9 +8613,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         /* sizeof("...") - 1 so C resolves escapes; source-char count
          * was off-by-many for any escape sequence, silently inflating
          * .len past actual byte count. */
-        emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
-             (int)node->string_lit.length, node->string_lit.value,
-             (int)node->string_lit.length, node->string_lit.value);
+        emit_zer_string_slice(e, node->string_lit.value, (int)node->string_lit.length, false);
         return;
 
     case NODE_BINARY: {
@@ -9412,7 +9513,8 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 return;
             }
             if (node->call.is_comptime_float)
-                emit_double_lit(e, node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value,
+                                   emit_type_is_f32(checker_get_type(e->checker, node)));
             else
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
@@ -11443,23 +11545,29 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                  * form double-evaluates the arg, which is safe because the
                  * side-effect-free gate excludes calls / assigns / etc. */
                 if (!expr_has_side_effects(node->intrinsic.args[0])) {
-                    emit(e, "(uint32_t)(((");
+                    emit(e, "(uint32_t)((");
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                    bitq_operand_close(e, w);
+                    emit(e, " == 0) ? %d : __builtin_%.*s%s(", bitq_count_width(w), (int)nlen, name, suffix);
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    bitq_operand_close(e, w);
                     emit(e, "))");
                 } else {
                     int t = e->temp_count++;
-                    emit(e, "({ __typeof__(");
+                    emit(e, "({ %s _zer_bz%d = ", w > 32 ? "uint64_t" : "uint32_t", t);
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, ") _zer_bz%d = (", t);
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, "); (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
-                         t, w, (int)nlen, name, suffix, t);
+                    bitq_operand_close(e, w);
+                    emit(e, "; (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
+                         t, bitq_count_width(w), (int)nlen, name, suffix, t);
                 }
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
+                bitq_operand_close(e, w);
                 emit(e, ")");
             }
         } else if (nlen == 12 && memcmp(name, "barrier_init", 12) == 0 && node->intrinsic.arg_count >= 2) {
@@ -14011,15 +14119,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 break;
             }
             case 1: /* float */
-                emit_double_lit(e, inst->literal_float);
+                emit_double_lit(e, inst->literal_float,
+                    inst->dest_local >= 0 && inst->dest_local < func->local_count &&
+                    emit_type_is_f32(func->locals[inst->dest_local].type));
                 break;
             case 2: /* string */
                 /* sizeof("...") - 1 so C resolves escapes; source-char
                  * count overcounted (silent OOB on bounds-checked
                  * reads of escape-bearing literals). */
-                emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
-                     (int)inst->literal_str_len, inst->literal_str,
-                     (int)inst->literal_str_len, inst->literal_str);
+                emit_zer_string_slice(e, inst->literal_str, (int)inst->literal_str_len, false);
                 break;
             case 3: /* bool */
                 emit(e, "%s", inst->literal_int ? "1" : "0");
@@ -14840,10 +14948,41 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Parameters — use AST types (same resolution as AST emitter).
          * IR local types may be ty_void for complex params (struct, pointer). */
-        emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
+        /* BUG-1316: `main([*][*]u8 args)` — the C runtime calls main with
+         * (argc, argv), so the ZER parameter is BUILT here from them: a stack
+         * array of `[*]u8` (one per argument, length by scanning for the NUL) and
+         * a slice over it. The checker admits no other parameter list for main. */
+        bool main_args = !func->module_prefix && func->name_len == 4 &&
+            memcmp(func->name, "main", 4) == 0 && fn->func_decl.param_count == 1;
+        if (main_args) emit(e, "(int _zer_argc, char **_zer_argv)");
+        else emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
         emit_func_decl_tail(e, ret, main_promote);
         emit(e, " {\n");
         e->indent++;
+        if (main_args) {
+            ParamDecl *ap = &fn->func_decl.params[0];
+            Type *fty = checker_get_type(e->checker, fn);
+            Type *at = (fty && type_dispatch_kind(fty) == TYPE_FUNC_PTR && fty->func_ptr.param_count == 1)
+                ? fty->func_ptr.params[0] : resolve_tynode(e, ap->type);
+            Type *au = type_unwrap_distinct(at);
+            Type *elem = au->slice.inner;
+            emit_indent(e);
+            emit_type(e, elem);
+            emit(e, " _zer_argbuf[_zer_argc > 0 ? _zer_argc : 1];\n");
+            emit_indent(e);
+            emit(e, "for (int _zer_ai = 0; _zer_ai < _zer_argc; _zer_ai++) {\n");
+            emit_indent(e);
+            emit(e, "    size_t _zer_al = 0; while (_zer_argv[_zer_ai][_zer_al]) _zer_al++;\n");
+            emit_indent(e);
+            emit(e, "    _zer_argbuf[_zer_ai].ptr = (uint8_t *)_zer_argv[_zer_ai];\n");
+            emit_indent(e);
+            emit(e, "    _zer_argbuf[_zer_ai].len = _zer_al;\n");
+            emit_indent(e);
+            emit(e, "}\n");
+            emit_indent(e);
+            emit_type_and_name(e, at, ap->name, ap->name_len);
+            emit(e, " = { .ptr = _zer_argbuf, .len = (size_t)(_zer_argc > 0 ? _zer_argc : 0) };\n");
+        }
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
     }
     e->defer_stack.count = 0; /* clear defer stack from previous function */
@@ -14874,9 +15013,23 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         }
         emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
-            emit(e, " = ");
-            emit_rewritten_node(e, l->static_init, func);
-            emit(e, ";\n");
+            /* BUG-1315: a static's initializer is a C CONSTANT expression. An
+             * integer one is folded the way a global's is (BUG-1090 typed fold):
+             * rendered as an expression, `static u32 i = 7 % 4;` emitted the
+             * guarded-division statement expression and GCC refused it
+             * ("initializer element is not constant"). */
+            int64_t sv;
+            if (type_is_integer(l->type) &&
+                checker_fold_const_typed(e->checker, l->static_init, &sv) &&
+                sv != CONST_EVAL_FAIL) {
+                sv = fold_wrap_to_type(sv, l->type);
+                if (sv < 0) emit(e, " = (%lld);\n", (long long)sv);
+                else emit(e, " = %lluULL;\n", (unsigned long long)sv);
+            } else {
+                emit(e, " = ");
+                emit_rewritten_node(e, l->static_init, func);
+                emit(e, ";\n");
+            }
         } else {
             emit(e, " = {0};\n"); /* auto-zero */
         }

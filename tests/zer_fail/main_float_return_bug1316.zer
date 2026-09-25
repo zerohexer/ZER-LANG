@@ -1,0 +1,3 @@
+// expect-error: 'main' must return void or an integer
+// BUG-1316: a float result is read out of the wrong register (exited 208).
+f64 main() { return 1.0; }

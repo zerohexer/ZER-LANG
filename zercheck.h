@@ -179,6 +179,14 @@ typedef struct {
      * MAYBE_FREED, so `g = a; drop_g(); a.v` is refused. Arena array; 0 = none. */
     int freed_global_n;
     struct ZcFreedGlobal { const char *key; uint32_t len; } *freed_global;
+    /* BUG-1311: every live return READS the global key `ret_global_key` (a bare
+     * global `g`, or a projection `gh.p`), or is null — `?*T getg() { return g; }`.
+     * The caller treats the call result exactly as a read of that global: an
+     * ALIAS of whatever allocation the global holds. Without it the result was
+     * a borrow of nothing, so `g = a; *T c = getg() orelse return; g = null;
+     * free(c); a.v` read a recycled object. NULL = not proven. */
+    const char *ret_global_key;
+    uint32_t ret_global_key_len;
 } FuncSummary;
 
 /* ZER-CHECK context */

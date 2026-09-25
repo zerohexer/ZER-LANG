@@ -1,0 +1,11 @@
+// BUG-1322: regression (see BUGS-FIXED.md).
+// A negative arm on a switch whose subject is a signed type WIDER than 32 bits never matches:
+// the arm is emitted as `_t = (uint32_t)1; _t = -_t; n == (int64_t)_t` -> compares with 4294967295.
+// Affects i33..i64, i65..i128. (i8..i32 work; `if (n == -1)` works.) Pre-fix: r was 3 (the default arm).
+i64 id(i64 x) { return x; }
+u32 main() {
+    i64 m = id(-1);
+    u32 r = 0;
+    switch (m) { 0 => { r = 1; } -1 => { r = 2; } default => { r = 3; } }
+    return r - 2;   // the -1 arm sets r = 2
+}

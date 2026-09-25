@@ -1,0 +1,8 @@
+// BUG-1318: regression (see BUGS-FIXED.md).
+// expected exit 0; actual exit 1. Emitted `a = (100000 * 100000)` — int multiply, wraps under -fwrapv.
+u32 main() {
+    f64 a = 0.0;
+    a = 100000.0 * 100000.0;
+    if (a != 10000000000.0) { return 1; }
+    return 0;
+}

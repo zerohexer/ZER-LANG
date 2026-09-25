@@ -1,0 +1,8 @@
+// expect-error: cannot store pointer to local 'loc' through pointer or slice 'w'
+// BUG-1309: the destination is reached through a POINTER FIELD of a local struct —
+// the root `w` is a local, but `w.hp` points at a global, so `&loc` escaped.
+struct H { ?*u32 p; }
+struct W { *H hp; }
+H gh;
+void mk() { u32 loc = 5; W w = { .hp = &gh }; w.hp.p = &loc; }
+u32 main() { mk(); *u32 q = gh.p orelse return; return *q; }

@@ -1,0 +1,20 @@
+// BUG-1308: the comptime evaluator (1) folded `x >>= n` / `x <<= n` with n in
+// [width, 63] as a real shift (i32 -1 >>= 40 gave -1; the runtime gives 0), and
+// (2) computed +, -, * and unary - in SIGNED int64 — undefined behaviour inside
+// the compiler for `a * a` at 2^32 (UBSan: signed integer overflow).
+comptime i32 SR(i32 a) { i32 x = a; x >>= 40; return x; }
+comptime u32 SL(u32 a) { u32 x = a; x <<= 33; return x; }
+comptime u64 SQ(u64 a) { return a * a; }
+comptime u64 ACC(u64 a) { u64 x = a; x *= a; x += 18446744073709551615; return x; }
+comptime i8 NEG(i8 a) { return -a; }
+i32 rt_sr(i32 a) { i32 x = a; x >>= 40; return x; }
+u64 rt_sq(u64 a) { return a * a; }
+u32 main() {
+    if (SR(-1) != rt_sr(-1)) { return 1; }
+    if (SR(-1) != 0) { return 2; }
+    if (SL(3) != 0) { return 3; }
+    if (SQ(4294967296) != rt_sq(4294967296)) { return 4; }
+    if (ACC(4294967297) != 8589934592) { return 5; }
+    if (NEG(-128) != -128) { return 6; }
+    return 0;
+}

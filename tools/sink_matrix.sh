@@ -961,6 +961,40 @@ cell p46_forwarding_callee  reject "$P46"' void fw46(*u32 a, *u32 b) { lend46(a,
 cell p46_safe_distinct      compile "$P46"' u32 main(){ u32 v = 0; u32 x = 0; lend46(&v, &x); return 0; }'
 cell p46_safe_after_join    compile "$P46"' u32 main(){ u32 v = 0; late46(&v, &v); return 0; }'
 
+# SHAPE p47 (BUG-1309): a frame address stored THROUGH AN INDIRECTION that is not
+# the root — an element of a slice (param or local view of a global), a field
+# reached through a pointer or slice FIELD of a local struct. The escape sink
+# asked only the ROOT's type. BOUNDARY: a local array's element, a global's
+# address through a slice.
+echo "===== SHAPE p47 = frame address stored through a slice element / pointer field ====="
+P47='struct H47 { ?*u32 p; } struct W47 { *H47 hp; } struct V47 { [*]H47 s; } H47[2] ga47; H47 gh47; u32 gv47;'
+cell p47_slice_param_elem   reject "$P47"' void mk([*]?*u32 s) { u32 loc = 5; s[1] = &loc; } u32 main(){ return 0; }'
+cell p47_slice_param_field  reject "$P47"' void mk([*]H47 s) { u32 loc = 5; s[1].p = &loc; } u32 main(){ return 0; }'
+cell p47_slice_local_view   reject "$P47"' void mk() { u32 loc = 5; [*]H47 s = ga47; s[1].p = &loc; } u32 main(){ return 0; }'
+cell p47_ptr_field_of_local reject "$P47"' void mk() { u32 loc = 5; W47 w = { .hp = &gh47 }; w.hp.p = &loc; } u32 main(){ return 0; }'
+cell p47_slice_field_local  reject "$P47"' void mk() { u32 loc = 5; V47 v = { .s = ga47 }; v.s[0].p = &loc; } u32 main(){ return 0; }'
+cell p47_safe_local_array   compile "$P47"' u32 main(){ u32 loc = 5; ?*u32[2] la; la[1] = &loc; *u32 q = la[1] orelse return; return *q - 5; }'
+cell p47_safe_global_addr   compile "$P47"' void mk([*]?*u32 s) { s[1] = &gv47; } u32 main(){ ?*u32[2] la; mk(la); return 0; }'
+
+# SHAPE p48 (BUG-1311, BUG-1312): a freed allocation reached through a GLOBAL
+# by a route the caller could not see — a GETTER whose every return reads the
+# global (`?*T getg() { return g; }`), and a global ARRAY handed as a slice to a
+# callee that frees an element. BOUNDARY: a getter of a global that is never
+# freed; a read-only callee over the global array.
+echo "===== SHAPE p48 = global read through a getter / global array to an element-freeing callee ====="
+P48='struct T48 { u32 v; } struct H48 { ?*T48 p; } ?*T48 g48; H48 gh48; H48[2] ga48;
+?*T48 getg48() { return g48; }
+?*T48 getp48() { return gh48.p; }
+void drop48([*]H48 s) { *T48 q = s[0].p orelse return; free(q); }
+u32 sum48([*]H48 s) { if (s[0].p) |q| { return q.v; } return 0; }
+'
+cell p48_getter_free_use     reject "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; g48 = a; *T48 c = getg48() orelse return; g48 = null; free(c); return a.v; }'
+cell p48_getter_field        reject "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; gh48.p = a; *T48 c = getp48() orelse return; gh48.p = null; free(c); return a.v; }'
+cell p48_getter_double_free  reject "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; g48 = a; *T48 c = getg48() orelse return; g48 = null; free(c); free(a); return 0; }'
+cell p48_global_array_drop   reject "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; ga48[0].p = a; drop48(ga48); ga48[0].p = null; return a.v; }'
+cell p48_safe_getter_read    compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; g48 = a; *T48 c = getg48() orelse return; u32 r = c.v + a.v; g48 = null; free(a); return r; }'
+cell p48_safe_readonly_global compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; ga48[0].p = a; u32 r = sum48(ga48); ga48[0].p = null; r += a.v; free(a); return r; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

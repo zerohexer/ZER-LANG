@@ -1,0 +1,5 @@
+// expect-error: cannot store pointer to local 'loc' through pointer or slice
+i32 printf(const *u8 fmt, ...);
+u32 clobber() { u32[32] z; for (u32 i = 0; i < 32; i += 1) { z[i] = 99; } return z[3]; }
+void mk([*]?*u32 s) { u32 loc = 5; s[1] = &loc; }
+u32 main() { ?*u32[2] la; mk(la); clobber(); *u32 q = la[1] orelse return; printf("%u\n", *q); return 0; }

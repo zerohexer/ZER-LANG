@@ -5,6 +5,36 @@
 
 ---
 
+## LEXICAL STRUCTURE
+
+### Comments
+
+**DESCRIPTION**
+Two comment forms, exactly as in C: `//` runs to the end of the line, and
+`/* ... */` spans any number of lines. Block comments do **not** nest — the first
+`*/` ends the comment, so commenting out a region that already contains a
+`/* */` comment leaves its tail as code. Use `//` on each line, or
+`comptime if (0) { ... }` (which still has to parse), to disable a region.
+
+```zer
+// a line comment
+/* a block comment
+   spanning lines */
+u32 main() {
+    u32 x = 1; // trailing comment
+    /* inline */ x += 1;
+    return x - 2;
+}
+```
+
+<!-- audit: expect-error: expected -->
+```zer
+/* outer /* inner */ this tail is CODE, not comment */
+u32 main() { return 0; }
+```
+
+---
+
 ## PRIMITIVE TYPES
 
 ### u8, u16, u32, u64
@@ -320,6 +350,53 @@ T[N] auto-coerces to [*]T at function calls, var-decl init, and return:
 u8[256] buf;
 void process([*]u8 data) { }
 process(buf);              // auto-coerces: { .ptr=buf, .len=256 }
+```
+
+**INITIALISING AN ARRAY — there is no array literal**
+ZER has no `{1, 2, 3}` array initializer (in a declaration, an assignment, or a
+struct field). An array starts auto-zeroed; set the elements you need. For a
+read-only BYTE table, a string literal with `\xHH` escapes is the idiom — it is a
+`const [*]u8` and indexes like an array. For a table of wider values, write a
+function with a `switch` (a `comptime` function if every argument is constant).
+
+**ARRAYS ARE VALUES IN A DECLARATION, BUT A PARAMETER ALIASES THE CALLER**
+`u32[3] b = a;` COPIES the array — writing `b` leaves `a` unchanged. An array
+PARAMETER does not copy: `void f(u32[3] a)` receives the caller's array (as in
+C), so a write through `a` is visible to the caller. Pass `[*]T` when you mean
+"a view of the caller's buffer" and copy into a local when you mean "my own
+copy".
+
+```zer
+const [*]u8 BITS = "\x01\x02\x04\x08";        // read-only byte table
+
+u32 prime(u32 i) {                          // a table of wider values
+    switch (i) {
+        0 => { return 2; }
+        1 => { return 3; }
+        2 => { return 5; }
+        default => { return 7; }
+    }
+}
+
+void poke(u32[3] a) { a[0] = 7; }           // writes the CALLER's array
+
+u32 main() {
+    u32[3] a;                               // { 0, 0, 0 }
+    a[1] = 10;
+    u32[3] b = a;                           // a copy
+    b[1] = 99;
+    if (a[1] != 10) { return 1; }           // a unchanged
+    poke(a);
+    if (a[0] != 7) { return 2; }            // the parameter aliased a
+    if (BITS[2] != 4) { return 3; }
+    if (prime(2) != 5) { return 4; }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: expected expression -->
+```zer
+u32 main() { u32[3] a = { 1, 2, 3 }; return a[0]; }
 ```
 
 **NOTES**
@@ -786,6 +863,11 @@ enum Direction { left = -1, center = 0, right = 1 }
 ```
 
 **NOTES**
+- An enum converts to an integer only EXPLICITLY, with a cast: `(u32)e`,
+  `(i32)State.done`. There is no implicit enum→int (`u32 v = e;` is an error)
+  and no int→enum cast at all — use `@try_enum` (checked, returns `?E`) or
+  `@bitcast` (traps on a non-variant).
+- Enums compare with `==` / `!=` against a variant.
 - Dot syntax required: `State.idle`, not bare `idle`.
 - Switch arms use `.variant => { }` syntax.
 - An enum with NO variant equal to 0 (`enum E { a = 5, b = 6 }`) cannot be zero-initialized:
@@ -793,6 +875,27 @@ enum Direction { left = -1, center = 0, right = 1 }
   element, an `alloc(S)` slot, a field left out of a designated initializer) the zero is
   caught when it is READ — `read of an enum holding 0, which is not one of its variants`
   traps. Assign the field before reading it, or give the enum a zero variant.
+
+```zer
+enum Code { ok, warn = 5, err }
+
+u32 main() {
+    Code c = Code.err;
+    u32 v = (u32)c;                 // 6 — explicit
+    i32 w = (i32)Code.warn;         // 5
+    if (v != 6 || w != 5) { return 1; }
+    if (c != Code.err) { return 2; }
+    Code back = @try_enum(Code, v) orelse Code.ok;
+    if (back != Code.err) { return 3; }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: cannot initialize 'v' of type 'u32' with 'Code' -->
+```zer
+enum Code { ok, err }
+u32 main() { Code c = Code.err; u32 v = c; return v; }
+```
 
 **SEE ALSO**
 switch, union
@@ -876,7 +979,8 @@ enum, switch
 
 **DESCRIPTION**
 Function declaration. Return type before name (like C).
-All parameters are by value unless pointer.
+All parameters are by value unless pointer — except a fixed array `T[N]`, which
+refers to the caller's array (see T[N]).
 
 **SYNTAX**
 ```zer
@@ -901,6 +1005,65 @@ void greet([*]u8 name) {
 - `void` return = no return value.
 - `?T` return = can return `null` for failure.
 - `static` functions are module-internal (not visible to importers).
+
+
+**DECLARATION ORDER, PROTOTYPES, RECURSION**
+- A function may be called before its definition — there are no forward
+  declarations to maintain. A bodyless prototype (`u32 f(u32 x);`) is also
+  accepted and is harmless; a bodyless declaration with NO definition anywhere
+  is an extern (a C function — see cinclude / Variadic).
+- Functions cannot be nested inside other functions, and there are no closures:
+  pass a function pointer plus a context pointer (`*opaque`) the C way.
+- Recursion works; it draws a warning ("function 'f' is recursive — unbounded
+  stack growth on embedded"), and `--stack-limit` cannot bound it.
+- Structs are passed and returned by value.
+
+```zer
+u32 main() {
+    if (fact(5) != 120) { return 1; }      // defined below: fine
+    Pair p = make(3);
+    if (p.b != 4) { return 2; }
+    return twice(0);
+}
+
+struct Pair { u32 a; u32 b; }
+Pair make(u32 x) { Pair p = { .a = x, .b = x + 1 }; return p; }  // struct by value
+
+u32 twice(u32 x);                          // optional prototype
+u32 twice(u32 x) { return x * 2; }
+
+u32 fact(u32 n) {                          // warning: recursive
+    if (n <= 1) { return 1; }
+    return n * fact(n - 1);
+}
+```
+
+**THE ENTRY POINT — `main`**
+The program starts at `main`. Its return value is the process exit status, so
+`main` returns `void` (exit status 0) or an integer of at most 64 bits — a float,
+optional, struct or pointer result is a compile error. `main` takes no
+parameters, or exactly one `[*][*]u8` — the command line, one slice per argument,
+`args[0]` being the program name. Every access is bounds-checked like any slice;
+the compiler builds it from the C runtime's `argc`/`argv`. Any other parameter
+list (`i32 argc`, `**u8 argv`, ...) is a compile error.
+
+```zer
+i32 printf(const *u8 fmt, ...);
+
+u32 main([*][*]u8 args) {
+    if (args.len < 1) { return 1; }           // args[0] is the program name
+    for (usize i = 1; i < args.len; i += 1) {
+        [*]u8 a = args[i];
+        printf("arg %u: %.*s\n", (u32)i, (i32)a.len, a.ptr);
+    }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: 'main' takes no parameters, or exactly one -->
+```zer
+i32 main(i32 argc, [*][*]u8 argv) { return argc; }
+```
 
 ---
 
@@ -1312,14 +1475,26 @@ Execute body at least once, then check condition. C-style `do { } while (cond);`
 
 **SYNTAX**
 ```zer
-do {
-    val = read_register();
-} while (val & BUSY_FLAG);
+const u32 BUSY_FLAG = 1;
+u32 polls;
+u32 read_register() { polls += 1; if (polls < 3) { return BUSY_FLAG; } return 0; }
+
+u32 main() {
+    u32 val = 0;
+    do {
+        val = read_register();
+    } while ((val & BUSY_FLAG) != 0);     // a condition must be bool
+    return polls - 3;
+}
 ```
 
 **NOTES**
 - Braces required around body.
 - `break` and `continue` work as expected.
+- The condition of `if`, `while`, `do-while` and `for` must be `bool` (an `if`
+  may also take an optional for unwrapping). An integer is not a condition:
+  write `x != 0`. Every part of a `for` header may be omitted — `for (;;) { }`
+  is an infinite loop, as is `while (true) { }`.
 
 ---
 
@@ -4337,12 +4512,26 @@ naked void reset_handler() {
 ### section attribute
 
 **DESCRIPTION**
-Place function or variable in a specific linker section.
+Place a global variable or a function in a named linker section. Emits
+`__attribute__((section("...")))`. `section(...)` comes first, before the type.
 
-**SYNTAX**
 ```zer
-section(".isr_vector") u32[64] vector_table;
+section(".data.fast") u32 counter;          // a variable
+section(".text.hot") u32 hot(u32 x) {       // a function
+    return x + 1;
+}
+
+u32 main() {
+    counter = hot(1);
+    if (counter != 2) { return 1; }
+    return 0;
+}
 ```
+
+**NOTES**
+- Whether the named section exists, is placed at the right address, and is
+  loaded/zeroed at boot is the linker script's job (a hardware-consequence
+  fact, outside the checker).
 
 ---
 
@@ -5111,6 +5300,69 @@ u32 main() {
 `x /= 0` and `x %= 0` with a divisor that folds to zero are compile errors, exactly
 like `x / 0`; a divisor the compiler cannot prove nonzero is one too (see "SAFETY GUARANTEES").
 
+### Precedence
+
+Binary operators bind in the SAME order as C, loosest first. `orelse` sits
+just above assignment — below `||` — so its right-hand side takes a whole
+arithmetic expression.
+
+| level (loosest → tightest) | operators | associativity |
+|---|---|---|
+| 1 | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` | right |
+| 2 | `orelse` | left |
+| 3 | `\|\|` | left |
+| 4 | `&&` | left |
+| 5 | `\|` | left |
+| 6 | `^` | left |
+| 7 | `&` | left |
+| 8 | `==  !=` | left |
+| 9 | `<  >  <=  >=` | left |
+| 10 | `<<  >>` | left |
+| 11 | `+  -` | left |
+| 12 | `*  /  %` | left |
+| 13 | unary `-  !  ~  *  &`, casts `(T)x` | prefix |
+| 14 | `.field  f()  a[i]  a[i..j]` | postfix |
+
+C's classic trap is still there syntactically — `&`, `|`, `^` bind LOOSER than
+`==` — but it cannot silently miscompile: `x & 1 == 0` parses as
+`x & (1 == 0)`, and a `u32 & bool` is a compile error ("bitwise operators
+require integers"). Parenthesise: `(x & 1) == 0`.
+
+There is **no conditional operator** `c ? a : b`. Use `if`/`else`, a `switch`,
+or `opt orelse fallback` for the optional case.
+
+```zer
+?u32 none() { return null; }
+
+u32 main() {
+    u32 a = none() orelse 2 + 3;          // orelse is looser than +: 5
+    if (a != 5) { return 1; }
+    u32 x = 6;
+    if ((x & 1) == 0) { } else { return 2; }   // parenthesise the mask
+    u32 s = 1 << 2 + 1;                   // + binds tighter than <<: 1 << 3
+    if (s != 8) { return 3; }
+    u32 m = 0xF0 | 0x0F ^ 0xFF & 0x3C;    // & then ^ then |
+    if (m != (0xF0 | (0x0F ^ (0xFF & 0x3C)))) { return 4; }
+    bool t = 1 + 2 * 3 == 7 && 4 > 3 || false;
+    if (!t) { return 5; }
+    u32 v = 0;
+    if (a > 4) { v = 1; } else { v = 2; }     // no `a > 4 ? 1 : 2`
+    return v - 1;
+}
+```
+
+<!-- audit: expect-error: bitwise operators require integers -->
+```zer
+u32 main() { u32 x = 6; if (x & 1 == 0) { return 1; } return 0; }
+```
+
+<!-- audit: expect-error: expected ';' -->
+```zer
+u32 main() { u32 a = 3; u32 b = a > 2 ? 1 : 0; return b; }
+```
+
+---
+
 ### Evaluation Order
 
 Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once — for
@@ -5176,6 +5428,13 @@ The rest of the contract (BUG-1196/1198):
 - Implicit narrowing or sign conversion — `(T)x` / `@truncate` / `@saturate` are
   the explicit routes (C-style casts ARE supported — see "Casts")
 - `(*U)p` between two different pointer types — `@pun(*U, p)` is the audit-visible form
+
+- No conditional operator `c ? a : b` (use `if`/`else`, `switch`, or `orelse`)
+- No array literals `{1, 2, 3}` (see T[N] — "Initialising an array")
+- No nested functions or closures (function pointer + `*opaque` context)
+- No adjacent string-literal concatenation (`"ab" "cd"` is a syntax error)
+- No nested block comments
+- No leading-dot float literals (`.5` — write `0.5`)
 
 (`goto` IS in ZER — see "goto + labels" above.)
 

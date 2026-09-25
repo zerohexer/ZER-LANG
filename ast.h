@@ -724,7 +724,10 @@ static inline int64_t eval_const_expr_ex(Node *n, int depth,
     if (n->kind == NODE_UNARY) {
         int64_t v = eval_const_expr_ex(n->unary.operand, depth + 1, resolve, resolve_ctx);
         if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
-        if (n->unary.op == TOK_MINUS) return -v;
+        if (n->unary.op == TOK_MINUS) {
+            if (v == INT64_MIN) return CONST_EVAL_FAIL;   /* -INT64_MIN: host UB */
+            return -v;
+        }
         if (n->unary.op == TOK_TILDE) return ~v;
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
         return CONST_EVAL_FAIL;

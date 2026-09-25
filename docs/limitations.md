@@ -30,6 +30,45 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-25f audit (BUG-1308..1325; measured)
+
+1. **`lib/` does not compile as shipped** (LOW — loud). `fmt.zer` calls `fmt_u64`/`fmt_i64`
+   that it never declares (it assumes concatenation with `str.zer`), `io.zer` calls `fputc`
+   it does not declare, and `io_open` is refused — `return fopen(&path_buf[0], …)`: a bodyless
+   extern handed a LOCAL buffer may return a pointer into it, so the result is frame-bound.
+   That rejection is the C-FFI floor working as designed (a C function CAN return its
+   argument); the library, not the checker, needs restructuring (a static path buffer, or
+   an `io_open` that takes a caller buffer). `compat.zer` is C-conversion scaffolding and is
+   not meant to compile without `--no-strict-mmio`. Only `str.zer` compiles (fixed by
+   BUG-1317). Imports resolve from the entry file's directory only, so `lib/` must be copied
+   beside the program. reference.md deliberately does not document the library until it builds.
+2. **Two literal-typing over-rejections.** `i8 x = 0 - 5 / 1;` ("cannot initialize 'i8' with
+   'u32'" while `i64 x = 0 - 5 / 1;` compiles), and `i64 x = -9223372036854775807 - 1;`
+   ("with 'u64'": the magnitude literal is typed u64 before the negation). Loud; spell
+   INT64_MIN through a const or `(i64)` arithmetic.
+3. **BUG-1310 precision.** An indirect call through a funcptr LOCAL / param / mutable global
+   reaches every function of its SIGNATURE (the BUG-1290 end), so a helper calling a callback
+   from a statement holding shared A is refused whenever ANY function of that signature
+   writes a second shared type. Per-binding resolution (the spawn scan's local-binding
+   walk) would narrow it. The stack-depth analysis still says "calls through function
+   pointer with unknown target" for a callee bound in a const global initializer — the same
+   `global_bound_functions` query would resolve it.
+4. **BUG-1311 is single-key.** A getter returning DIFFERENT globals on different paths
+   (`if (c) { return g1; } return g2;`) is still a borrow of nothing at the call site. A
+   key SET (the view machinery) would cover it.
+5. **`main([*][*]u8 args)` on a freestanding target** has no argc/argv to build from; the
+   emitted `main(int, char **)` is only meaningful where a C runtime calls it. Use `u32
+   main()` on bare metal.
+6. **Seen, not fixed (over-rejections / loud):** a comptime function using a cast or naming a
+   const global is refused; `alloc(u3, n)` says "undefined identifier"; a `?*T` parameter
+   returned unchanged is reported as a leak; a comptime function with a division needs a
+   zero guard although every argument is a constant.
+7. **The expression-position deadlock forms** (nested calls, struct-init, orelse, switch
+   subject, defer, range-for collection) were only partly probed by the concurrency agent
+   before its run ended — no hole found in what ran.
+
+---
+
 ## CLOSED 2026-09-23f — the variable-index SLOT residuals of BUG-1074 (BUG-1130) and the struct wrapper through an ARRAY ELEMENT (BUG-1131/1132/1133)
 
 Both former OPEN entries are closed; the residuals that remain are the narrowed OPEN entry

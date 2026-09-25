@@ -1,0 +1,3 @@
+// expect-error: 'main' takes no parameters, or exactly one
+// BUG-1316: C calls main(argc, argv); this list reinterpreted envp as argv.len.
+i32 main(i32 argc, [*][*]u8 argv) { if (argv.len > 5) { return 1; } return argc; }

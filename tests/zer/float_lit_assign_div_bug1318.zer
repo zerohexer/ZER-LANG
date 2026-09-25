@@ -1,0 +1,9 @@
+// BUG-1318: regression (see BUGS-FIXED.md).
+// expected exit 0; actual exit 1. Plain assignment emits `a = (1 / 2)` (C integer
+// division) because emit_double_lit prints 1.0 as "1" with %.17g.
+u32 main() {
+    f64 a = 0.0;
+    a = 1.0 / 2.0;
+    if (a != 0.5) { return 1; }
+    return 0;
+}

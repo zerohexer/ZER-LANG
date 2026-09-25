@@ -1,0 +1,10 @@
+// BUG-1317: a 2-hop param view (`return tr(tl(s));`) was summarised as nothing,
+// so `t = tb(s)` was a fresh allocation and reported "never freed".
+const [*]u8 tl(const [*]u8 s) { return s[1..s.len]; }
+const [*]u8 tr(const [*]u8 s) { return s[0..s.len - 1]; }
+const [*]u8 tb(const [*]u8 s) { return tr(tl(s)); }
+u32 main() {
+    const [*]u8 s = " hi ";
+    const [*]u8 t = tb(s);
+    return (u32)t.len - 2;
+}

@@ -1,0 +1,9 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1313: same hole, the fallback is a CALL whose argument holds the orelse block.
+u32[4] ga;
+u32 g = 3;
+?u32 m() { return null; }
+u32 id(u32 v) { return v; }
+u32 f(u32 x) { u32 y = m() orelse id(m() orelse { return 900; }); return x % 4; }
+u32 main() { ga[f(g)] = 1; return 42; }

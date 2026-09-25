@@ -1483,6 +1483,7 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
 /* BUG-940: defined below, beside the soundness rule it implements. */
 static bool int_literal_tree_fits(Checker *c, Node *e, Type *target);
 
+static bool is_pure_float_literal_expr(Node *e, int depth);   /* BUG-1319 */
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* BUG-940: a pure integer-literal TREE is as constant as a lone literal, and
@@ -1570,7 +1571,11 @@ static bool is_literal_compatible(Node *expr, Type *target) {
         }
     }
     /* bool is NOT an integer — no int→bool coercion (spec rule) */
-    if (expr->kind == NODE_FLOAT_LIT && type_is_float(effective)) return true;
+    /* BUG-1319: a pure float-literal TREE (`3.0 / 4.0`) is as constant as a lone
+     * literal — the float twin of BUG-940. `f32 a = 0.75;` was accepted and
+     * `f32 a = 3.0 / 4.0;` refused ("cannot initialize 'f32' with 'f64'"). The
+     * tree is retyped to the destination afterwards (BUG-1223). */
+    if (type_is_float(effective) && is_pure_float_literal_expr(expr, 0)) return true;
     if (expr->kind == NODE_NULL_LIT && type_is_optional(target)) return true;
     if (expr->kind == NODE_BOOL_LIT && effective->kind == TYPE_BOOL) return true;
     if (expr->kind == NODE_CHAR_LIT && effective->kind == TYPE_U8) return true;
@@ -1785,6 +1790,33 @@ static void retype_const_int_to_target(Checker *c, Node *e, Type *target) {
         retype_const_int_to_target(c, e->binary.right, target);
         typemap_set(c, e, target);
     }
+}
+
+/* BUG-1322: a pure integer-literal tree reaching a position with NO destination
+ * type — a cast operand, an intrinsic's value argument — keeps its default u32
+ * typing, and a negative value wraps there: `(i64)(-1)` was 4294967295,
+ * `@saturate(i8, -1)` 127, `@try_enum(E, -1)` null for a declared `a = -1`. Retype
+ * the tree to `want` when it fits (the value then computes in that width), else,
+ * when any node of it is negative, to i64 — the mathematical value, which the
+ * operation then converts. A non-negative tree that does not fit keeps its typing. */
+static bool literal_tree_has_negative(Node *e, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    int64_t v = eval_const_expr(e);
+    if (v != CONST_EVAL_FAIL && v < 0) return true;
+    if (e->kind == NODE_UNARY) return literal_tree_has_negative(e->unary.operand, depth + 1);
+    if (e->kind == NODE_BINARY)
+        return literal_tree_has_negative(e->binary.left, depth + 1) ||
+               literal_tree_has_negative(e->binary.right, depth + 1);
+    return false;
+}
+static void retype_free_int_literal(Checker *c, Node *e, Type *want) {
+    if (!e || !is_pure_int_literal_expr(e)) return;
+    Type *w = want ? type_unwrap_distinct(want) : NULL;
+    if (w && type_is_integer(w) && int_literal_tree_fits(c, e, want)) {
+        retype_const_int_to_target(c, e, want);
+        return;
+    }
+    if (literal_tree_has_negative(e, 0)) retype_const_int_to_target(c, e, ty_i64);
 }
 
 /* BUG-1223: the FLOAT twin of retype_const_int_to_target. A float literal meeting
@@ -2629,12 +2661,33 @@ static void classify_escape_sink(Checker *c, Node *target,
     *out_sym = NULL; *is_global = false; *is_param_ptr = false;
     Node *root = target;
     bool through_deref = false;
+    /* A step THROUGH an indirection anywhere in the chain — a field of a
+     * pointer / Handle (auto-deref), an element of a slice, or `*p` — lands in
+     * memory this frame does not own, whatever the ROOT is. Only the root's
+     * type used to be asked, so `s[1] = &loc` through a `[*]?*u32` param, and
+     * `w.hp.p = &loc` / `w.s[0].p = &loc` through a pointer or slice FIELD of a
+     * local struct, all stored a stack address into the caller's (or a
+     * global's) memory with no diagnostic (ASan: stack-use-after-return). */
+    bool through_indirection = false;
     while (root) {
-        if (root->kind == NODE_FIELD) { root = root->field.object; through_deref = true; }
-        else if (root->kind == NODE_INDEX) { root = root->index_expr.object; through_deref = true; }
+        Node *obj = NULL;
+        if (root->kind == NODE_FIELD) { obj = root->field.object; through_deref = true; }
+        else if (root->kind == NODE_INDEX) { obj = root->index_expr.object; through_deref = true; }
         else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
-            root = root->unary.operand; through_deref = true;
+            obj = root->unary.operand; through_deref = true;
+            through_indirection = true;
         } else break;
+        if (obj && !through_indirection) {
+            Type *ot = typemap_get(c, obj);
+            TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+            if (ok == TYPE_OPTIONAL) {
+                Type *oi = type_unwrap_optional(ot);
+                ok = oi ? type_dispatch_kind(oi) : TYPE_VOID;
+            }
+            if (ok == TYPE_POINTER || ok == TYPE_HANDLE || ok == TYPE_SLICE)
+                through_indirection = true;
+        }
+        root = obj;
     }
     if (!root || root->kind != NODE_IDENT) return;
     Symbol *ts = scope_lookup(c->current_scope,
@@ -2654,7 +2707,8 @@ static void classify_escape_sink(Checker *c, Node *target,
          * closest existing diagnostic — the underlying invariant
          * ("destination outlives current scope") is the same. */
         TypeKind rk = type_dispatch_kind(ts->type);
-        if (rk == TYPE_POINTER || rk == TYPE_HANDLE) {
+        if (through_indirection || rk == TYPE_POINTER || rk == TYPE_HANDLE ||
+            rk == TYPE_SLICE) {
             *is_param_ptr = true;
         } else if (rk == TYPE_OPTIONAL) {
             Type *inner = type_unwrap_distinct(ts->type)->optional.inner;
@@ -9363,7 +9417,8 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
              * in the operand's width. */
             bool _usg = false;
             uint16_t _ub = ct_expr_bits(n->unary.operand, params, param_count, &_usg, 0);
-            if (n->unary.op == TOK_MINUS) return ct_wrap(-v, _ub, _usg);
+            /* unsigned negate: -INT64_MIN is UB in the compiler's own process */
+            if (n->unary.op == TOK_MINUS) return ct_wrap((int64_t)(0ULL - (uint64_t)v), _ub, _usg);
             if (n->unary.op == TOK_TILDE) return ct_wrap(~v, _ub, _usg);
         }
         if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
@@ -9395,9 +9450,13 @@ static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_c
          * and % read the bits an earlier overflow already discarded, which is
          * exactly how `(a*4)>>3` folded 2000000000 while the runtime gives
          * 389387264: 16000000000 reached the shift un-wrapped. */
-        case TOK_PLUS:   return CTW(l + r);
-        case TOK_MINUS:  return CTW(l - r);
-        case TOK_STAR:   return CTW(l * r);
+        /* Computed in uint64_t: the wrapped result is the same bits, and a
+         * signed int64 overflow (`comptime u64 SQ(u64 a){ return a * a; }` at
+         * 2^32) is undefined behaviour in the compiler's own process — at -O2
+         * GCC may fold it to anything. */
+        case TOK_PLUS:   return CTW((int64_t)(_ul + _ur));
+        case TOK_MINUS:  return CTW((int64_t)(_ul - _ur));
+        case TOK_STAR:   return CTW((int64_t)(_ul * _ur));
         case TOK_SLASH:  if (r == 0 || _divovf) return CONST_EVAL_FAIL;
                          return _u64 ? (int64_t)(_ul / _ur) : CTW(l / r);
         case TOK_PERCENT: if (r == 0 || _divovf) return CONST_EVAL_FAIL;
@@ -9454,9 +9513,10 @@ static bool ct_apply_assign_op(int op, int64_t cur, int64_t rhs, int64_t *out,
     bool divovf = rhs == -1 && (is_signed || bits == 0) && cur == smin;
     switch (op) {
     case TOK_EQ:        *out = rhs; return true;
-    case TOK_PLUSEQ:    *out = cur + rhs; return true;
-    case TOK_MINUSEQ:   *out = cur - rhs; return true;
-    case TOK_STAREQ:    *out = cur * rhs; return true;
+    /* uint64_t arithmetic: same bits, no signed-overflow UB in the compiler. */
+    case TOK_PLUSEQ:    *out = (int64_t)((uint64_t)cur + (uint64_t)rhs); return true;
+    case TOK_MINUSEQ:   *out = (int64_t)((uint64_t)cur - (uint64_t)rhs); return true;
+    case TOK_STAREQ:    *out = (int64_t)((uint64_t)cur * (uint64_t)rhs); return true;
     /* BUG-1042: a zero divisor is NOT modelled — it used to fold to 0, a wrong
      * constant baked into the emitted C, while the binary `a / 0` of the same
      * interpreter answers CONST_EVAL_FAIL. Returning false makes the call
@@ -9469,8 +9529,13 @@ static bool ct_apply_assign_op(int op, int64_t cur, int64_t rhs, int64_t *out,
     case TOK_PERCENTEQ: if (rhs == 0 || divovf) return false;
                         *out = u64 ? (int64_t)((uint64_t)cur % (uint64_t)rhs) : cur % rhs;
                         return true;
-    case TOK_LSHIFTEQ:  *out = (rhs >= 0 && rhs < 64) ? (int64_t)((uint64_t)cur << rhs) : 0; return true;
-    case TOK_RSHIFTEQ:  *out = (rhs >= 0 && rhs < 64)
+    /* A count < 0 or >= the TARGET's width is 0 (`_zer_shl`/`_zer_shr`, Gap 26),
+     * exactly as the binary operator folds it. Testing only `< 64` folded
+     * `i32 x = -1; x >>= 40;` to -1 while the emitted runtime code gives 0. */
+    case TOK_LSHIFTEQ:  *out = (rhs >= 0 && rhs < (bits ? (int64_t)bits : 64) && rhs < 64)
+                            ? (int64_t)((uint64_t)cur << rhs) : 0;
+                        return true;
+    case TOK_RSHIFTEQ:  *out = (rhs >= 0 && rhs < (bits ? (int64_t)bits : 64) && rhs < 64)
                             ? (u64 ? (int64_t)((uint64_t)cur >> rhs) : cur >> rhs) : 0;
                         return true;
     case TOK_AMPEQ:     *out = cur & rhs; return true;
@@ -11075,6 +11140,14 @@ static Type *check_expr(Checker *c, Node *node) {
                     type_name(left), type_name(right));
                 result = left;
             } else {
+                /* BUG-1318: `%` is an INTEGER operation. On a float operand the
+                 * checker said yes and GCC then refused the emitted C. */
+                if (node->binary.op == TOK_PERCENT &&
+                    (type_is_float(left) || type_is_float(right)))
+                    checker_error(c, node->loc.line,
+                        "'%%' requires integer operands, got '%s' — there is no float "
+                        "remainder operator (compute it: a - b * (f64)(i64)(a / b))",
+                        type_name(type_is_float(left) ? left : right));
                 /* compile-time division by zero check.
                  * BUG-269: use eval_const_expr to catch expressions like (2-2) */
                 if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
@@ -11102,7 +11175,17 @@ static Type *check_expr(Checker *c, Node *node) {
                             if (init) div_val = eval_const_expr(init);
                         }
                     }
-                    if (div_val != CONST_EVAL_FAIL && div_val != 0) {
+                    /* BUG-1318: a nonzero FLOAT literal divisor (`1.0 / 2.0`) is
+                     * as proven as an integer one — without this a global
+                     * `f64 h = 1.0 / 2.0;` got the guarded statement expression
+                     * at file scope and GCC refused the program. */
+                    Node *fdv = node->binary.right;
+                    while (fdv && fdv->kind == NODE_UNARY && fdv->unary.op == TOK_MINUS)
+                        fdv = fdv->unary.operand;
+                    bool float_lit_nz = fdv && fdv->kind == NODE_FLOAT_LIT &&
+                        fdv->float_lit.value == fdv->float_lit.value &&   /* not NaN */
+                        fdv->float_lit.value != 0.0;
+                    if ((div_val != CONST_EVAL_FAIL && div_val != 0) || float_lit_nz) {
                         mark_proven(c, node); /* constant nonzero divisor */
                     } else if (node->binary.right->kind == NODE_INTRINSIC &&
                                node->binary.right->intrinsic.name_len == 4 &&
@@ -12274,8 +12357,9 @@ static Type *check_expr(Checker *c, Node *node) {
                     !val_sym->is_static && !val_is_global) {
                     checker_error(c, node->loc.line,
                         tgt_param ?
-                        "cannot store pointer to local '%.*s' through pointer parameter '%.*s' — "
-                        "may escape to caller's scope" :
+                        "cannot store pointer to local '%.*s' through pointer or slice '%.*s' — "
+                        "the destination is not this frame's memory, so the pointer may "
+                        "escape to the caller's scope" :
                         "cannot store pointer to local '%.*s' in static/global variable '%.*s'",
                         (int)val_sym->name_len, val_sym->name,
                         (int)target_sym->name_len, target_sym->name);
@@ -13493,6 +13577,21 @@ static Type *check_expr(Checker *c, Node *node) {
                     }
                 }
                 if (dv != CONST_EVAL_FAIL && dv != 0) div_ok = true;
+                {   /* BUG-1318: a nonzero FLOAT literal divisor */
+                    Node *fdv = divisor;
+                    while (fdv && fdv->kind == NODE_UNARY && fdv->unary.op == TOK_MINUS)
+                        fdv = fdv->unary.operand;
+                    if (fdv && fdv->kind == NODE_FLOAT_LIT &&
+                        fdv->float_lit.value == fdv->float_lit.value &&
+                        fdv->float_lit.value != 0.0)
+                        div_ok = true;
+                }
+                if (node->assign.op == TOK_PERCENTEQ &&
+                    (type_is_float(target) || type_is_float(value)))
+                    checker_error(c, node->loc.line,
+                        "'%%=' requires integer operands, got '%s' — there is no float "
+                        "remainder operator",
+                        type_name(type_is_float(target) ? target : value));
                 /* BUG-1042: a divisor that folds to ZERO. The binary form
                  * `a / 0` has reported "division by zero" since BUG-269; this
                  * compound sibling fell through to the range proof, found none,
@@ -16594,6 +16693,12 @@ static Type *check_expr(Checker *c, Node *node) {
     case NODE_TYPECAST: {
         Type *target = resolve_type(c, node->typecast.target_type);
         Type *source = check_expr(c, node->typecast.expr);
+        /* BUG-1322: `(i64)(-1)` — the operand has no destination of its own. */
+        if (is_pure_int_literal_expr(node->typecast.expr)) {
+            retype_free_int_literal(c, node->typecast.expr,
+                                    type_is_integer(target) ? target : NULL);
+            source = typemap_get(c, node->typecast.expr);
+        }
         Type *tgt_eff = type_unwrap_distinct(target);
         Type *src_eff = type_unwrap_distinct(source);
 
@@ -17567,6 +17672,12 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* validate source is numeric and target is integer */
                 if (node->intrinsic.arg_count > 0) {
                     Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    /* BUG-1322: the value to clamp is the MATHEMATICAL one. */
+                    if (is_pure_int_literal_expr(node->intrinsic.args[0]) &&
+                        literal_tree_has_negative(node->intrinsic.args[0], 0)) {
+                        retype_const_int_to_target(c, node->intrinsic.args[0], ty_i64);
+                        val_type = ty_i64;
+                    }
                     Type *effective = type_unwrap_distinct(val_type);
                     /* SAFETY: zer_saturate_operand_valid in src/safety/cast_rules.c (J08) */
                     if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
@@ -18587,6 +18698,10 @@ static Type *check_expr(Checker *c, Node *node) {
                     "@try_enum requires exactly 1 value argument after the type");
                 result = type_optional(c->arena, te_t);
             } else {
+                /* BUG-1322: `@try_enum(E, -1)` asks about the value -1. */
+                if (is_pure_int_literal_expr(node->intrinsic.args[0]) &&
+                    literal_tree_has_negative(node->intrinsic.args[0], 0))
+                    retype_const_int_to_target(c, node->intrinsic.args[0], ty_i64);
                 Type *te_v = typemap_get(c, node->intrinsic.args[0]);
                 if (te_v && !type_is_integer(te_v)) {
                     char tn2[96];
@@ -20083,6 +20198,143 @@ static Type *funcptr_first_carried(Type *t, int depth, int *nth) {
     default: return NULL;
     }
 }
+/* BUG-1310: WHICH FUNCTIONS CAN AN INDIRECT CALL REACH? The one query for every
+ * scan that must follow a call it cannot name a body for (the spawn race scan,
+ * the ISR scan, the deadlock shared-type summaries).
+ *
+ * The missing binding site was a GLOBAL's declaration initializer:
+ * `const Ops ops = { .f = set }; ... ops.f()` — and every copy of it (`Ops o =
+ * ops; o.f()`, `call(ops)`, `return ops.f`). The spawn scan exempted the READ of
+ * `ops` (const, and a funcptr is not a data pointer), the ISR scan recorded the
+ * read and followed nothing, and the deadlock summary treated `ops.f()` as a call
+ * to nothing — measured: a TSan data race, a Pool used from two threads, a
+ * non-volatile ISR global, and a runtime DEADLOCK, all compiled clean.
+ *
+ * The answer:
+ *  - a READ of a global that carries a funcptr: every function its initializer
+ *    names, when the global cannot change (`const`, or never assigned /
+ *    address-taken anywhere — `global_name_never_mutated`); otherwise every
+ *    registered function whose signature matches a funcptr the global carries;
+ *  - an indirect CALL through anything else (a local, a param, a field of a
+ *    local): every function of the callee's signature (the BUG-1290 end).
+ * A function named as a VALUE is covered by the callers' own binding rules.
+ *
+ * Re-entry: a callback that reads its own table would expand the same global
+ * again; a global already being expanded is skipped (its functions are being
+ * visited higher up the stack). The visitor returns true to stop. */
+typedef bool (*BoundFnVisit)(Checker *c, Symbol *fn, void *ud);
+#define BOUND_GLOBAL_STACK_MAX 64
+static Symbol *_bound_global_stack[BOUND_GLOBAL_STACK_MAX];
+static int _bound_global_depth = 0;
+
+static bool for_each_function_of_sig(Checker *c, Type *fpt, BoundFnVisit v, void *ud) {
+    if (!fpt) return false;
+    for (int fi = 0; fi < c->reg_file_count; fi++) {
+        Node *f = c->reg_files[fi];
+        for (int di = 0; di < f->file.decl_count; di++) {
+            Node *d = f->file.decls[di];
+            if (d->kind != NODE_FUNC_DECL || !d->func_decl.body) continue;
+            Symbol *fs = global_decl_lookup(c, d->func_decl.name,
+                                            (uint32_t)d->func_decl.name_len);
+            if (!fs || !fs->is_function || fs->func_node != d) continue;
+            if (!funcptr_sig_matches(fs->type, fpt)) continue;
+            if (v(c, fs, ud)) return true;
+        }
+    }
+    return false;
+}
+
+/* Every function a constant initializer expression names. */
+static bool global_bound_functions(Checker *c, Symbol *gs, BoundFnVisit v, void *ud);
+static bool init_bound_functions(Checker *c, Node *e, int depth, BoundFnVisit v, void *ud) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    switch (e->kind) {
+    case NODE_IDENT: {
+        Symbol *s = global_decl_lookup(c, e->ident.name, (uint32_t)e->ident.name_len);
+        if (!s) return false;
+        if (s->is_function)
+            return s->func_node && s->func_node->kind == NODE_FUNC_DECL &&
+                   s->func_node->func_decl.body && v(c, s, ud);
+        return global_bound_functions(c, s, v, ud);   /* `const Ops b = a;` */
+    }
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (init_bound_functions(c, e->struct_init.fields[i].value, depth + 1, v, ud))
+                return true;
+        return false;
+    case NODE_TYPECAST: return init_bound_functions(c, e->typecast.expr, depth + 1, v, ud);
+    case NODE_ORELSE:
+        return init_bound_functions(c, e->orelse.expr, depth + 1, v, ud) ||
+               init_bound_functions(c, e->orelse.fallback, depth + 1, v, ud);
+    case NODE_FIELD:   return init_bound_functions(c, e->field.object, depth + 1, v, ud);
+    case NODE_INDEX:   return init_bound_functions(c, e->index_expr.object, depth + 1, v, ud);
+    /* No other kind can designate a function in a global initializer (a call is
+     * not a constant; literals, sizes and operators yield no function). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_EXPR_STMT: case NODE_DEFER: case NODE_GOTO:
+    case NODE_LABEL: case NODE_CRITICAL: case NODE_ONCE: case NODE_ASM: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT: case NODE_INT_LIT:
+    case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
+    case NODE_NULL_LIT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+    case NODE_CALL: case NODE_SLICE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_SIZEOF:
+        return false;
+    }
+    return false;
+}
+
+static bool global_bound_functions(Checker *c, Symbol *gs, BoundFnVisit v, void *ud) {
+    if (!gs || gs->is_function || !gs->type) return false;
+    { int nth = 0; if (!funcptr_first_carried(gs->type, 0, &nth)) return false; }
+    for (int i = 0; i < _bound_global_depth; i++)
+        if (_bound_global_stack[i] == gs) return false;   /* already being expanded */
+    if (_bound_global_depth >= BOUND_GLOBAL_STACK_MAX) return false;
+    _bound_global_stack[_bound_global_depth++] = gs;
+    bool r = false;
+    Node *init = (gs->func_node && (gs->func_node->kind == NODE_GLOBAL_VAR ||
+                                    gs->func_node->kind == NODE_VAR_DECL))
+                 ? gs->func_node->var_decl.init : NULL;
+    if (init) r = init_bound_functions(c, init, 0, v, ud);
+    if (!r && !gs->is_const && !global_name_never_mutated(c, gs)) {
+        /* assigned somewhere: any function of a carried signature may be in it */
+        for (int k = 0; !r && k < 64; k++) {
+            int nth = k;
+            Type *fpt = funcptr_first_carried(gs->type, 0, &nth);
+            if (!fpt) break;
+            r = for_each_function_of_sig(c, fpt, v, ud);
+        }
+    }
+    _bound_global_depth--;
+    return r;
+}
+
+/* The functions an indirect CALLEE expression may designate. `callee` is not a
+ * plain function name (the caller handles that). */
+static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, void *ud) {
+    if (!callee) return false;
+    Node *root = callee;
+    while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX))
+        root = root->kind == NODE_FIELD ? root->field.object : root->index_expr.object;
+    if (root && root->kind == NODE_IDENT) {
+        Symbol *ls = scope_lookup(c->current_scope, root->ident.name,
+                                  (uint32_t)root->ident.name_len);
+        Symbol *gs = global_decl_lookup(c, root->ident.name, (uint32_t)root->ident.name_len);
+        /* a global, not shadowed by a local of the same name */
+        if (gs && !gs->is_function && (!ls || ls == gs) &&
+            (gs->is_const || global_name_never_mutated(c, gs)))
+            return global_bound_functions(c, gs, v, ud);
+    }
+    Type *ct = typemap_get(c, callee);
+    Type *cu = ct ? type_unwrap_distinct(ct) : NULL;
+    if (cu && type_dispatch_kind(cu) == TYPE_OPTIONAL) cu = type_unwrap_optional(cu);
+    if (!cu || type_dispatch_kind(cu) != TYPE_FUNC_PTR) return false;
+    return for_each_function_of_sig(c, cu, v, ud);
+}
+
 /* Report an unresolved funcptr carried by spawn argument `an` (or by an
  * argument a callee forwards to a spawn). `ctx` names the sink. */
 static void funcptr_arg_sig_check(Checker *c, Node *an, int line, const char *ctx) {
@@ -20283,6 +20535,30 @@ static bool scan_returned_funcname(Checker *c, Node *n, int depth,
         return false;
     }
     return false;
+}
+
+/* BUG-1310: the spawn scan's visitor for global_bound_functions — scan the
+ * bound function's body exactly as a funcname binding is scanned. */
+typedef struct { const char **out_name; uint32_t *out_len; } SpawnBoundUd;
+static bool spawn_scan_bound_fn(Checker *c, Symbol *fs, void *ud) {
+    SpawnBoundUd *u = (SpawnBoundUd *)ud;
+    if (!fs || !fs->func_node || fs->func_node->kind != NODE_FUNC_DECL ||
+        !fs->func_node->func_decl.body) return false;
+    if (_scan_global_depth >= 32) {   /* BUG-998: report, do not answer "nothing" */
+        _scan_depth_exceeded = true;
+        *u->out_name = fs->name; *u->out_len = fs->name_len;
+        return true;
+    }
+    _scan_global_depth++;
+    RmwScanCtx k; rmw_ctx_save(&k);
+    rmw_alias_reset();
+    DeclModuleSave dm = decl_module_enter(c, fs);
+    bool found = scan_unsafe_global_access(c, fs->func_node->func_decl.body,
+                                           u->out_name, u->out_len);
+    decl_module_leave(c, dm);
+    if (!found) rmw_ctx_restore(&k);
+    _scan_global_depth--;
+    return found;
 }
 
 static bool scan_funcname_binding(Checker *c, Node *n,
@@ -20540,6 +20816,13 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
     if (node->kind == NODE_IDENT) {
         Symbol *sym = global_decl_lookup(c,
             node->ident.name, (uint32_t)node->ident.name_len);
+        /* BUG-1310: a read of a global that carries a function pointer reaches
+         * every function it can hold — scan them BEFORE the exemptions below
+         * (a `const Ops ops = { .f = set }` is exempt as data, not as code). */
+        if (sym && !sym->is_function && sym->type) {
+            SpawnBoundUd bu = { out_name, out_len };
+            if (global_bound_functions(c, sym, spawn_scan_bound_fn, &bu)) return true;
+        }
         if (sym && !sym->is_function && sym->type) {
             /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
              * shared, Pool/Slab/Ring/Arena/Barrier */
@@ -22252,8 +22535,14 @@ static void check_stmt(Checker *c, Node *node) {
         /* Value range propagation: track literal init values */
         /* BUG-1090: the constant is the TYPED fold, converted to the declared
          * type — the value the emitted code stores, not the untyped int64 fold.
-         * BUG-1092: `fresh` — a declaration never inherits a range. */
-        if (node->var_decl.init && type && type_is_integer(type)) {
+         * BUG-1092: `fresh` — a declaration never inherits a range.
+         * BUG-1314: NOT for a `static` local — its initializer runs ONCE, so on
+         * every later call (and every later iteration of a loop the declaration
+         * sits in) the variable holds whatever was last stored. The init's range
+         * elided `ga[i]` in `static u32 i = 0; ga[i] = 1; i += 5;` and the second
+         * call wrote ga[5]. A static starts with no range, like a global. */
+        if (node->var_decl.init && type && type_is_integer(type) &&
+            !node->var_decl.is_static) {
             int64_t val = vrp_const_value(c, node->var_decl.init, type);
             if (val != CONST_EVAL_FAIL) {
                 push_var_range_ex(c, node->var_decl.name,
@@ -23331,6 +23620,13 @@ static void check_stmt(Checker *c, Node *node) {
                      * were accepted while the var-decl spelling of the identical
                      * value is correctly rejected — the two-spellings shape again,
                      * one sink short. */
+                    /* BUG-1322: an accepted literal arm computes in the SUBJECT's
+                     * width — `-1 =>` on an i64 subject compared 4294967295. */
+                    if (av && expr && is_pure_int_literal_expr(arm->values[j]) &&
+                        value_flows_to(arm->values[j], av, expr)) {
+                        Type *rt = int_retype_target(expr);
+                        if (rt) retype_const_int_to_target(c, arm->values[j], rt);
+                    }
                     if (av && expr && !value_flows_to(arm->values[j], av, expr)) {
                         if (!report_value_flow_refusal(c, arm->values[j], expr,
                                                        arm->values[j]->loc.line,
@@ -28163,6 +28459,35 @@ static void check_func_body(Checker *c, Node *node) {
                 "cannot return array type — use a struct wrapper or slice instead");
         }
         }
+        /* BUG-1316: the program's `main` is called by the C runtime with the C
+         * signature `int main(int argc, char **argv)`. Any other parameter list
+         * reinterpreted argc/argv as ZER values — `main(i32 argc, [*][*]u8 argv)`
+         * read argv's `.len` out of envp (measured 140721442775592) and every
+         * bounds check then trusted it. A float / optional / struct result was
+         * read out of the wrong register (`f64 main()` exited 208). */
+        if (!c->current_module && node->func_decl.name_len == 4 &&
+            memcmp(node->func_decl.name, "main", 4) == 0) {
+            Type *rb = type_unwrap_distinct(ret);
+            if (rb && type_dispatch_kind(rb) != TYPE_VOID &&
+                !(type_is_integer(rb) && type_width(rb) <= 64))
+                checker_error(c, node->loc.line,
+                    "'main' must return void or an integer of at most 64 bits — "
+                    "its result is the process exit status");
+            bool args_ok = node->func_decl.param_count == 0;
+            if (node->func_decl.param_count == 1) {
+                Type *pt = type_unwrap_distinct(resolve_type(c, node->func_decl.params[0].type));
+                Type *pi = (pt && type_dispatch_kind(pt) == TYPE_SLICE)
+                    ? type_unwrap_distinct(pt->slice.inner) : NULL;
+                Type *pe = (pi && type_dispatch_kind(pi) == TYPE_SLICE)
+                    ? type_unwrap_distinct(pi->slice.inner) : NULL;
+                args_ok = pe && type_dispatch_kind(pe) == TYPE_U8 && !pt->slice.is_volatile &&
+                          !pi->slice.is_volatile;
+            }
+            if (!args_ok)
+                checker_error(c, node->loc.line,
+                    "'main' takes no parameters, or exactly one `[*][*]u8 args` — the "
+                    "command line, one slice per argument (args[0] is the program name)");
+        }
         c->current_func_ret = ret;
         /* keep inference (Site 1): track the function + its signature so the
          * escape-detection sites can mark an escaping param keep, and call-site
@@ -29728,6 +30053,17 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
 static void record_isr_funcname_binding(Checker *c, Node *value, int depth);
 static void record_isr_returned_funcname(Checker *c, Node *n, int depth);
 
+/* BUG-1310: the ISR scan's visitor for global_bound_functions. */
+static bool isr_record_bound_fn(Checker *c, Symbol *fs, void *ud) {
+    int depth = *(int *)ud;
+    if (!fs || !fs->func_node || fs->func_node->kind != NODE_FUNC_DECL ||
+        !fs->func_node->func_decl.body) return false;
+    DeclModuleSave dm = decl_module_enter(c, fs);
+    record_isr_globals(c, fs->func_node->func_decl.body, depth);
+    decl_module_leave(c, dm);
+    return false;   /* record every bound function */
+}
+
 static void record_isr_globals(Checker *c, Node *node, int depth) {
     if (!node) return;
     /* BUG-976: this scan RECORDS what an ISR touches, so returning early past the cap
@@ -29755,6 +30091,11 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         if (gs && !gs->is_function) {
             track_isr_global(c, node->ident.name, (uint32_t)node->ident.name_len, false);
             track_isr_pointee_of(c, node);   /* BUG-1059 */
+            /* BUG-1310: the functions a funcptr-carrying global can hold run in
+             * the handler when it calls through it (`ops.f()`, a copy, a
+             * factory returning `ops.f`). */
+            int d1 = depth + 1;
+            global_bound_functions(c, gs, isr_record_bound_fn, &d1);
         }
         /* BUG-971: a STATIC LOCAL in a body this ISR reaches. It has no global-scope
          * Symbol, which is exactly why it was invisible here; static_local_record has
@@ -31698,54 +32039,80 @@ static bool find_return_range(Checker *c, Node *node, int64_t *out_min, int64_t 
 static bool scan_expr_orelse_returns(Checker *c, Node *e, int64_t *out_min,
                                      int64_t *out_max, bool *found) {
     if (!e) return true;
-    if (e->kind == NODE_ORELSE) {
-        if (e->orelse.fallback &&
-            !find_return_range(c, e->orelse.fallback, out_min, out_max, found, true))
-            return false;
-        return scan_expr_orelse_returns(c, e->orelse.expr, out_min, out_max, found);
-    }
-    if (e->kind == NODE_BINARY) {
-        if (!scan_expr_orelse_returns(c, e->binary.left, out_min, out_max, found)) return false;
-        return scan_expr_orelse_returns(c, e->binary.right, out_min, out_max, found);
-    }
-    if (e->kind == NODE_UNARY)
-        return scan_expr_orelse_returns(c, e->unary.operand, out_min, out_max, found);
-    if (e->kind == NODE_CALL) {
-        if (!scan_expr_orelse_returns(c, e->call.callee, out_min, out_max, found)) return false;
+    /* BUG-1313: was an if-chain whose ORELSE arm handed the fallback to the
+     * STATEMENT walker find_return_range — which ignores an expression. A
+     * fallback that is itself an expression (`m() orelse m2() orelse { return 5; }`,
+     * `m() orelse id(m() orelse { return 5; })`) hid its `return 5` from the
+     * summary, `ga[f(g)]` on a u32[4] elided its check and wrote ga[5] (ASan
+     * global-buffer-overflow). A block fallback goes to the statement walker; any
+     * other fallback is an expression and is scanned as one. No `default:` — a new
+     * kind must be classified here. */
+    #define SEOR(x) scan_expr_orelse_returns(c, (x), out_min, out_max, found)
+    switch (e->kind) {
+    case NODE_ORELSE:
+        if (e->orelse.fallback) {
+            if (e->orelse.fallback->kind == NODE_BLOCK) {
+                if (!find_return_range(c, e->orelse.fallback, out_min, out_max, found, true))
+                    return false;
+            } else if (!SEOR(e->orelse.fallback)) {
+                return false;
+            }
+        }
+        return SEOR(e->orelse.expr);
+    case NODE_BINARY:
+        if (!SEOR(e->binary.left)) return false;
+        return SEOR(e->binary.right);
+    case NODE_UNARY:
+        return SEOR(e->unary.operand);
+    case NODE_CALL:
+        if (!SEOR(e->call.callee)) return false;
         for (int i = 0; i < e->call.arg_count; i++)
-            if (!scan_expr_orelse_returns(c, e->call.args[i], out_min, out_max, found)) return false;
+            if (!SEOR(e->call.args[i])) return false;
         return true;
-    }
-    if (e->kind == NODE_INDEX) {
-        if (!scan_expr_orelse_returns(c, e->index_expr.object, out_min, out_max, found)) return false;
-        return scan_expr_orelse_returns(c, e->index_expr.index, out_min, out_max, found);
-    }
-    if (e->kind == NODE_FIELD)
-        return scan_expr_orelse_returns(c, e->field.object, out_min, out_max, found);
-    if (e->kind == NODE_SLICE) {
-        if (!scan_expr_orelse_returns(c, e->slice.object, out_min, out_max, found)) return false;
-        if (!scan_expr_orelse_returns(c, e->slice.start, out_min, out_max, found)) return false;
-        return scan_expr_orelse_returns(c, e->slice.end, out_min, out_max, found);
-    }
-    if (e->kind == NODE_TYPECAST)
-        return scan_expr_orelse_returns(c, e->typecast.expr, out_min, out_max, found);
+    case NODE_INDEX:
+        if (!SEOR(e->index_expr.object)) return false;
+        return SEOR(e->index_expr.index);
+    case NODE_FIELD:
+        return SEOR(e->field.object);
+    case NODE_SLICE:
+        if (!SEOR(e->slice.object)) return false;
+        if (!SEOR(e->slice.start)) return false;
+        return SEOR(e->slice.end);
+    case NODE_TYPECAST:
+        return SEOR(e->typecast.expr);
     /* BUG-1035: an assignment EXPRESSION inside a condition —
      * `if ((x = mb() orelse { return 9; }) > 0)` */
-    if (e->kind == NODE_ASSIGN) {
-        if (!scan_expr_orelse_returns(c, e->assign.target, out_min, out_max, found)) return false;
-        return scan_expr_orelse_returns(c, e->assign.value, out_min, out_max, found);
-    }
-    if (e->kind == NODE_INTRINSIC) {
+    case NODE_ASSIGN:
+        if (!SEOR(e->assign.target)) return false;
+        return SEOR(e->assign.value);
+    case NODE_INTRINSIC:
         for (int i = 0; i < e->intrinsic.arg_count; i++)
-            if (!scan_expr_orelse_returns(c, e->intrinsic.args[i], out_min, out_max, found)) return false;
+            if (!SEOR(e->intrinsic.args[i])) return false;
         return true;
-    }
-    if (e->kind == NODE_STRUCT_INIT) {
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < e->struct_init.field_count; i++)
-            if (!scan_expr_orelse_returns(c, e->struct_init.fields[i].value, out_min, out_max, found)) return false;
+            if (!SEOR(e->struct_init.fields[i].value)) return false;
+        return true;
+    /* A statement reached as an expression position (an orelse fallback block is
+     * handled above): hand it to the statement walker, which knows returns. */
+    case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_EXPR_STMT:
+    case NODE_VAR_DECL: case NODE_DEFER: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_LABEL: case NODE_GOTO: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_ASM:
+    case NODE_STATIC_ASSERT:
+        return find_return_range(c, e, out_min, out_max, found, true);
+    /* leaves / declarations — no embedded orelse */
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_CAST:
+    case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
         return true;
     }
-    return true; /* leaf / non-composition — no embedded orelse */
+    #undef SEOR
+    return true;
 }
 
 /* BUG-1097: the range of a valued return's expression AT the return statement,
@@ -33253,6 +33620,35 @@ static void fsc_add_type_id(struct FuncSharedTypes *fsc, uint32_t type_id) {
 /* Scan a function body for direct shared struct field accesses (non-transitive).
  * Collects type_ids into the FuncSharedTypes entry. */
 static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedTypes *fsc);
+static void fsc_free_types(struct FuncSharedTypes *fsc) {
+    free(fsc->type_ids);
+    fsc->type_ids = NULL;
+    fsc->type_count = fsc->type_capacity = 0;
+}
+
+static void compute_func_shared_types(Checker *c, const char *fname, uint32_t flen);
+/* BUG-1310: a callee that is a plain name of a FUNCTION (the named-callee path
+ * handles it); anything else is an indirect call. */
+static bool callee_names_function(Checker *c, Node *callee) {
+    if (!callee || callee->kind != NODE_IDENT) return false;
+    Symbol *ls = scope_lookup(c->current_scope, callee->ident.name,
+                              (uint32_t)callee->ident.name_len);
+    if (ls && !ls->is_function) return false;          /* a funcptr local */
+    Symbol *cs = global_decl_lookup(c, callee->ident.name,
+                                    (uint32_t)callee->ident.name_len);
+    return cs && cs->is_function;
+}
+/* BUG-1310: merge a reachable function's transitive shared types. */
+static bool fsc_merge_bound_fn(Checker *c, Symbol *fs, void *ud) {
+    struct FuncSharedTypes *dst = (struct FuncSharedTypes *)ud;
+    if (!fs || !fs->name) return false;
+    compute_func_shared_types(c, fs->name, fs->name_len);
+    struct FuncSharedTypes *src = find_func_shared_cache(c, fs->name, fs->name_len);
+    if (src)
+        for (int i = 0; i < src->type_count; i++) fsc_add_type_id(dst, src->type_ids[i]);
+    return false;
+}
+
 
 /* Compute shared types for a function transitively via DFS.
  * Uses in_progress flag for cycle detection, computed flag for memoization. */
@@ -33345,6 +33741,12 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
                     fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
             }
         }
+        /* BUG-1310: an INDIRECT call (`ops.f()`, a funcptr local / param) merges
+         * the shared types of every function it can reach — a helper calling a
+         * callback that writes shared B, called from a statement holding A's
+         * lock, deadlocked at run time with no diagnostic. */
+        if (node->call.callee && !callee_names_function(c, node->call.callee))
+            indirect_callee_functions(c, node->call.callee, fsc_merge_bound_fn, fsc);
         for (int i = 0; i < node->call.arg_count; i++)
             scan_body_shared_types(c, node->call.args[i], fsc);
         /* BUG-820: the callee is handled above ONLY when it is a bare IDENT (to
@@ -33817,6 +34219,31 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                 if (!cs || !cs->is_function)
                     c->lockchk_saw_opaque_call = true;
             }
+        }
+        /* BUG-1310: the functions an INDIRECT callee can reach contribute their
+         * shared types exactly as a named callee's summary does. */
+        if (!c->lockchk_direct_only && count < max_types && expr->call.callee &&
+            !callee_names_function(c, expr->call.callee)) {
+            struct FuncSharedTypes tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            indirect_callee_functions(c, expr->call.callee, fsc_merge_bound_fn, &tmp);
+            for (int fi = 0; fi < tmp.type_count && count < max_types; fi++) {
+                bool dup = false;
+                for (int di = 0; di < count; di++)
+                    if (types[di]->struct_type.type_id == tmp.type_ids[fi]) { dup = true; break; }
+                if (dup) continue;
+                for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
+                    Symbol *gsy = c->global_scope->symbols[si];
+                    if (!gsy->type) continue;
+                    Type *eff = type_unwrap_distinct(gsy->type);
+                    if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared &&
+                        eff->struct_type.type_id == tmp.type_ids[fi]) {
+                        types[count++] = eff;
+                        break;
+                    }
+                }
+            }
+            fsc_free_types(&tmp);
         }
         if (!c->lockchk_direct_only &&
             count < max_types && expr->call.callee && expr->call.callee->kind == NODE_IDENT) {

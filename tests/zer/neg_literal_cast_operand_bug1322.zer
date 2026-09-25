@@ -1,0 +1,12 @@
+// BUG-1322: regression (see BUGS-FIXED.md).
+// `(i64)(-1)` is 4294967295: the literal -1 is typed u32 (emitted `-1U`), then widened.
+// `i64 x = -1;` is -1. Expected exit 0; actual exit 1.
+u32 main() {
+    i64 a = (i64)(-1);
+    if (a != -1) { return 1; }
+    i64 b = (i64)-7 * 2;
+    if (b != -14) { return 2; }
+    f64 c = (f64)(-1);
+    if (c != -1.0) { return 3; }
+    return 0;
+}

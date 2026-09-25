@@ -238,6 +238,15 @@ typedef struct {
      * program empties the array through a loop, so the allocations stored
      * into it at a variable index are not reported as leaks. */
     bool slot_drained;
+    /* BUG-1302: on an array WILDCARD — a slot of this array was freed through
+     * `A[k]` and k then moved on. `slot_freed_idx1` = k's local + 1 when every
+     * write to k since was a monotone INCREMENT (so the freed slots all sit
+     * below k and a read of `A[k]` with that same k is a fresh slot);
+     * `slot_freed_unknown` = which slot is unknown (k written any other way, or
+     * two counters). A read of any other slot of the array is refused. */
+    int slot_freed_idx1;
+    bool slot_freed_unknown;
+    int slot_freed_line;
     /* BUG-1077 (H8): the FIRING (one IR_DEFER_FIRE application in the forward
      * pass) that last freed this handle through a defer body; 0 = none. Tells
      * "the other branch of the SAME firing" (legit) from "the same defer body
@@ -484,6 +493,15 @@ static void ir_merge_slot_facts(IRHandleInfo *rh, const IRHandleInfo *ph) {
         rh->slot_key_plen = ph->slot_key_plen;
     }
     if (ph->slot_drained) rh->slot_drained = true;
+    /* BUG-1302: the freed-slot fact JOINS — any path's fact holds after the
+     * join, and two different counters leave the slot unknown. */
+    if (ph->slot_freed_unknown ||
+        (rh->slot_freed_idx1 && ph->slot_freed_idx1 &&
+         rh->slot_freed_idx1 != ph->slot_freed_idx1))
+        rh->slot_freed_unknown = true;
+    else if (!rh->slot_freed_idx1)
+        rh->slot_freed_idx1 = ph->slot_freed_idx1;
+    if (!rh->slot_freed_line) rh->slot_freed_line = ph->slot_freed_line;
     if (ir_entry_is_precise_slot(rh) && rh->alloc_id != 0 && ph->alloc_id != 0 &&
         rh->alloc_id != ph->alloc_id) {
         const int cap = (int)(sizeof(rh->view_alloc_ids) / sizeof(rh->view_alloc_ids[0]));
@@ -2182,14 +2200,70 @@ static int ir_index_local_keyable(IRFunc *func, const char *name, uint32_t len) 
     return ok ? found : -1;
 }
 
-/* The index of `idx` as a key component: a literal, or a trackable local. */
-static bool ir_index_is_keyable(IRFunc *func, Node *idx) {
-    if (!idx) return false;
+/* BUG-1301: the C spelling of an arithmetic operator an index EXPRESSION may
+ * use, or NULL (then the expression has no key). */
+static const char *ir_index_op_text(int op) {
+    switch (op) {
+    case TOK_PLUS: return "+";   case TOK_MINUS: return "-";
+    case TOK_STAR: return "*";   case TOK_SLASH: return "/";
+    case TOK_PERCENT: return "%"; case TOK_AMP: return "&";
+    case TOK_PIPE: return "|";   case TOK_CARET: return "^";
+    case TOK_LSHIFT: return "<<"; case TOK_RSHIFT: return ">>";
+    default: return NULL;
+    }
+}
+
+/* The index of `idx` as a key component: a literal, a trackable local, or
+ * (BUG-1301) a pure arithmetic EXPRESSION over those — `g[k % 4]`. A fact keyed
+ * on an expression stays valid while none of its locals is written; the kill
+ * (ir_kill_index_facts) checks every name inside the brackets. */
+static bool ir_index_is_keyable_d(IRFunc *func, Node *idx, int depth) {
+    if (!idx || depth > 8) return false;
     if (idx->kind == NODE_INT_LIT) return true;
     if (idx->kind == NODE_IDENT)
         return ir_index_local_keyable(func, idx->ident.name,
                                       (uint32_t)idx->ident.name_len) >= 0;
+    if (idx->kind == NODE_BINARY)
+        return ir_index_op_text(idx->binary.op) &&
+               ir_index_is_keyable_d(func, idx->binary.left, depth + 1) &&
+               ir_index_is_keyable_d(func, idx->binary.right, depth + 1);
     return false;
+}
+static bool ir_index_is_keyable(IRFunc *func, Node *idx) {
+    return ir_index_is_keyable_d(func, idx, 0);
+}
+
+/* BUG-1301: the text INSIDE the brackets of a keyable index — `3`, `k`,
+ * `(k%4)`. With buf == NULL only measures. Returns the length, -1 if not keyable. */
+static int ir_index_key_text(IRFunc *func, Node *ix, char *buf) {
+    if (!ix) return -1;
+    if (ix->kind == NODE_INT_LIT) {
+        int n = snprintf(NULL, 0, "%llu", (unsigned long long)ix->int_lit.value);
+        if (buf && n > 0) snprintf(buf, (size_t)n + 1, "%llu",
+                                   (unsigned long long)ix->int_lit.value);
+        return n;
+    }
+    if (ix->kind == NODE_IDENT) {
+        if (buf) memcpy(buf, ix->ident.name, ix->ident.name_len);
+        return (int)ix->ident.name_len;
+    }
+    if (ix->kind == NODE_BINARY) {
+        const char *op = ir_index_op_text(ix->binary.op);
+        if (!op) return -1;
+        int ol = (int)strlen(op);
+        int l = ir_index_key_text(func, ix->binary.left, NULL);
+        int r = ir_index_key_text(func, ix->binary.right, NULL);
+        if (l < 0 || r < 0) return -1;
+        if (buf) {
+            buf[0] = '(';
+            ir_index_key_text(func, ix->binary.left, buf + 1);
+            memcpy(buf + 1 + l, op, (size_t)ol);
+            ir_index_key_text(func, ix->binary.right, buf + 1 + l + ol);
+            buf[1 + l + ol + r] = ')';
+        }
+        return l + ol + r + 2;
+    }
+    return -1;
 }
 
 /* Stage 3 (2026-04-28): measure pass for ir_extract_compound_key.
@@ -2209,13 +2283,9 @@ static int ir_measure_key_path(IRFunc *func, Node *expr) {
         if (!ir_index_is_keyable(func, ix)) return -1;
         int base = ir_measure_key_path(func, expr->index_expr.object);
         if (base < 0) return -1;
-        if (ix->kind == NODE_IDENT)       /* BUG-1130: `[k]` */
-            return base + 2 + (int)ix->ident.name_len;
-        char tmp[32];
-        int idx_chars = snprintf(tmp, sizeof(tmp), "[%llu]",
-            (unsigned long long)ix->int_lit.value);
-        if (idx_chars <= 0) return -1;
-        return base + idx_chars;
+        int tl = ir_index_key_text(func, ix, NULL);   /* BUG-1130/1301 */
+        if (tl <= 0) return -1;
+        return base + tl + 2;
     }
     return -1;
 }
@@ -2248,15 +2318,13 @@ static int ir_build_key_path(IRFunc *func, Node *expr, char *buf, int bufsize,
         int parent_len = ir_build_key_path(func, expr->index_expr.object, buf, bufsize,
                                            out_base_len);
         if (parent_len < 0) return -1;
-        int written;
-        if (ix->kind == NODE_IDENT)       /* BUG-1130: `[k]` */
-            written = snprintf(buf + parent_len, bufsize - parent_len, "[%.*s]",
-                               (int)ix->ident.name_len, ix->ident.name);
-        else
-            written = snprintf(buf + parent_len, bufsize - parent_len,
-                               "[%llu]", (unsigned long long)ix->int_lit.value);
-        if (written <= 0 || parent_len + written >= bufsize) return -1;
-        return parent_len + written;
+        int tl = ir_index_key_text(func, ix, NULL);   /* BUG-1130/1301 */
+        if (tl <= 0 || parent_len + tl + 2 >= bufsize) return -1;
+        buf[parent_len] = '[';
+        ir_index_key_text(func, ix, buf + parent_len + 1);
+        buf[parent_len + 1 + tl] = ']';
+        buf[parent_len + tl + 2] = '\0';
+        return parent_len + tl + 2;
     }
     return -1;
 }
@@ -3479,8 +3547,16 @@ static bool ir_slot_decompose(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     }
     char *comp;
     if (r->kind == IR_SLOT_SYM) {
-        comp = ir_cat3(zc, "[", 1, ix->ident.name, (uint32_t)ix->ident.name_len, "]", 1);
-        cl = (int)ix->ident.name_len + 2;
+        int tl = ir_index_key_text(func, ix, NULL);   /* BUG-1301: `[k]`, `[(k%4)]` */
+        if (tl <= 0) return false;
+        comp = (char *)arena_alloc(zc->arena, (size_t)tl + 3);
+        if (comp) {
+            comp[0] = '[';
+            ir_index_key_text(func, ix, comp + 1);
+            comp[tl + 1] = ']';
+            comp[tl + 2] = '\0';
+        }
+        cl = tl + 2;
     } else {
         if (cl <= 0) return false;
         comp = (char *)arena_alloc(zc->arena, (size_t)cl + 1);
@@ -4317,6 +4393,29 @@ static void ir_slot_read(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     IRSlotRef r;
     if (!ir_slot_decompose(zc, func, ps, e, &r)) return;
     IRHandleInfo *E = r.full ? ir_find_compound_handle(ps, r.root, r.full, r.fulllen) : NULL;
+    /* BUG-1302: with no precise entry for this slot, a slot of the array freed
+     * through a counter that has since moved may be the one read here — unless
+     * the read goes through that same counter, which only ever grew. A precise
+     * entry (stored, or reset to null, since) says exactly what the slot holds. */
+    if (!E) {
+        IRHandleInfo *fw = ir_slot_wild_at(zc, ps, r.root, r.apath, r.aplen,
+                                           r.rest, r.restlen, false);
+        if (fw && (fw->slot_freed_unknown || fw->slot_freed_idx1)) {
+            bool same_counter = false;
+            if (!fw->slot_freed_unknown && r.kind == IR_SLOT_SYM && r.comp &&
+                r.complen > 2 && r.comp[1] != '(') {
+                int rl = ir_index_local_keyable(func, r.comp + 1, r.complen - 2);
+                same_counter = rl >= 0 && rl + 1 == fw->slot_freed_idx1;
+            }
+            if (!same_counter) {
+                ir_zc_error(zc, line,
+                    "use after free: this slot may still hold a pointer freed at line "
+                    "%d — a slot of the array was freed through an index that has "
+                    "since changed; reset the slot after the free (`A[i] = null;`)",
+                    fw->slot_freed_line);
+            }
+        }
+    }
     if (E && E->alloc_id == 0) E = NULL;    /* a reset slot holds nothing tracked */
     IRHandleInfo tmp;
     memset(&tmp, 0, sizeof(tmp));
@@ -4452,6 +4551,19 @@ static void ir_slot_view_freed(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     }
 }
 
+/* The summary of a direct call's callee, or NULL (BUG-1300). */
+static const FuncSummary *ir_call_summary(ZerCheck *zc, Node *call) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee ||
+        call->call.callee->kind != NODE_IDENT) return NULL;
+    const char *cn = call->call.callee->ident.name;
+    uint32_t cl = (uint32_t)call->call.callee->ident.name_len;
+    for (int si = 0; si < zc->summary_count; si++)
+        if (zc->summaries[si].func_name_len == cl &&
+            memcmp(zc->summaries[si].func_name, cn, cl) == 0)
+            return &zc->summaries[si];
+    return NULL;
+}
+
 /* BUG-1130: a LOCAL array handed to a user call (`drain(arr)`, `f(arr[0..])`,
  * `f(&arr)`) may be emptied by it — the callee frees through a slice at a
  * variable index, which no FuncSummary expresses. Before BUG-1130 nothing
@@ -4477,6 +4589,27 @@ static void ir_call_hands_local_array(ZerCheck *zc, IRFunc *func, IRPathState *p
         if (!ir_slot_root_is_local_storage(func, root)) continue;
         IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, path ? path : "", plen, "", 0, true);
         if (w) w->slot_drained = true;
+        /* BUG-1300: a callee whose summary says it frees ELEMENTS of this param
+         * leaves every element the array held possibly freed. Widening only on
+         * that bit keeps read-only callees (`sum(arr); a.v`) accepted. */
+        const FuncSummary *cs = ir_call_summary(zc, call);
+        if (!cs || i >= 64 || !(cs->frees_param_elems & (1ULL << i))) continue;
+        uint32_t al = plen;
+        for (int hh = 0; hh < ps->handle_count; hh++) {
+            IRHandleInfo *e = &ps->handles[hh];
+            if (e->local_id != root || !e->path || e->path_len <= al) continue;
+            if (al > 0 && memcmp(e->path, path, al) != 0) continue;
+            if (e->path[al] != '[') continue;
+            if (e->state != IR_HS_ALIVE) continue;
+            e->state = IR_HS_MAYBE_FREED;
+            e->free_line = call->loc.line;
+            e->escaped = true;               /* the callee may own the free */
+            ir_propagate_alias_state(ps, e, IR_HS_MAYBE_FREED, call->loc.line);
+            if (e->alloc_id != 0)            /* ...for every alias of it */
+                for (int ai = 0; ai < ps->handle_count; ai++)
+                    if (ps->handles[ai].alloc_id == e->alloc_id)
+                        ps->handles[ai].escaped = true;
+        }
     }
 }
 
@@ -4551,7 +4684,7 @@ static void ir_slot_demote_into(ZerCheck *zc, IRPathState *ps, const IRHandleInf
 }
 
 static void ir_kill_index_name(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                               const char *nm, uint32_t nl) {
+                               const char *nm, uint32_t nl, int mono_loc) {
     for (int i = 0; i < ps->handle_count; i++) {
         IRHandleInfo *h = &ps->handles[i];
         if (h->slot_key_path &&
@@ -4583,6 +4716,23 @@ static void ir_kill_index_name(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         if (copy.alloc_id == 0) continue;            /* a reset slot: nothing held */
         const char *rest = copy.path + at + nl + 2;
         uint32_t restlen = copy.path_len - (uint32_t)at - nl - 2;
+        /* BUG-1302: a slot that still holds a FREED pointer. Dropping the fact
+         * let `for (i..) { free(tbl[i]) } … tbl[j].v` read freed memory; keep it
+         * on the wildcard, relative to the counter when the counter only grew. */
+        if ((copy.state == IR_HS_FREED || copy.state == IR_HS_MAYBE_FREED) &&
+            !copy.freed_then_reset && !copy.maybe_freed_then_reset &&
+            ir_entry_is_precise_slot(&copy)) {
+            IRHandleInfo *fw = ir_slot_wild_at(zc, ps, copy.local_id, copy.path,
+                                               (uint32_t)at, rest, restlen, true);
+            if (fw) {
+                if (mono_loc >= 0 &&
+                    (!fw->slot_freed_idx1 || fw->slot_freed_idx1 == mono_loc + 1))
+                    fw->slot_freed_idx1 = mono_loc + 1;
+                else
+                    fw->slot_freed_unknown = true;
+                if (!fw->slot_freed_line) fw->slot_freed_line = copy.free_line;
+            }
+        }
         IRHandleInfo *w = ir_slot_wild_at(zc, ps, copy.local_id, copy.path, (uint32_t)at,
                                           rest, restlen, true);
         if (w) ir_view_add(w, copy.alloc_id);
@@ -4600,9 +4750,110 @@ static void ir_kill_index_name(ZerCheck *zc, IRFunc *func, IRPathState *ps,
  * the instruction WROTE (dest_local, an assignment anywhere in its expression,
  * or — conservatively — an AST-path defer body). Only locals that actually key
  * something are asked about. */
+/* Does `inst` write the index local named `nm` (or can it no longer be keyed)? */
+static bool ir_index_name_written(IRFunc *func, IRInst *inst, bool all,
+                                  const char *nm, uint32_t nl) {
+    int loc = ir_index_local_keyable(func, nm, nl);
+    bool written = all || loc < 0 || inst->dest_local == loc ||
+        (inst->expr && ast_name_mutated_or_addrd(inst->expr, nm, nl));
+    if (!written && loc >= 0) {
+        IRLocal *l = &func->locals[loc];
+        if (l->orig_name && (l->orig_name_len != nl ||
+                             memcmp(l->orig_name, nm, nl) != 0) &&
+            inst->expr && ast_name_mutated_or_addrd(inst->expr,
+                                  l->orig_name, l->orig_name_len))
+            written = true;
+    }
+    return written;
+}
+
+/* BUG-1302: is `inst` a monotone INCREMENT of local `loc` — `k += c` or
+ * `k = k + c` / `k = c + k` with a positive literal c? */
+/* A positive integer constant — a literal, or a temp the 3AC lowering loaded
+ * one literal into (a compound assignment's right side is lowered that way). */
+static bool ir_positive_const(IRFunc *func, Node *v) {
+    if (!v) return false;
+    if (v->kind == NODE_INT_LIT) return v->int_lit.value > 0;
+    if (v->kind != NODE_IDENT) return false;
+    int t = ir_find_local_exact_first(func, v->ident.name, (uint32_t)v->ident.name_len);
+    if (t < 0 || !func->locals[t].is_temp) return false;
+    int defs = 0;
+    bool pos = false;
+    for (int bi = 0; bi < func->block_count; bi++)
+        for (int ii = 0; ii < func->blocks[bi].inst_count; ii++) {
+            IRInst *in = &func->blocks[bi].insts[ii];
+            if (in->dest_local != t) continue;
+            defs++;
+            pos = in->op == IR_LITERAL && in->literal_int > 0;
+        }
+    return defs == 1 && pos;
+}
+
+static bool ir_inst_increments_local(IRFunc *func, IRInst *inst, int loc) {
+    /* A WRAP moves k back down, onto the freed slots. Only a step proven not
+     * to wrap (a for-step under `k < E`, ir_lower) or a 64-bit counter moving
+     * by 1 counts as monotone. */
+    if (!inst->step_nowrap) {
+        Type *kt = (loc >= 0 && loc < func->local_count) ? func->locals[loc].type : NULL;
+        if (!kt || type_width(kt) < 64) return false;
+        Node *av = inst->expr && inst->expr->kind == NODE_ASSIGN ? inst->expr->assign.value : NULL;
+        Node *one = av;
+        if (av && av->kind == NODE_BINARY) {
+            one = av->binary.left && av->binary.left->kind == NODE_INT_LIT
+                ? av->binary.left : av->binary.right;
+        }
+        if (!one || one->kind != NODE_INT_LIT || one->int_lit.value != 1) {
+            /* the 3AC temp form of `k += 1` */
+            if (!(one && one->kind == NODE_IDENT && ir_positive_const(func, one)))
+                return false;
+            int t = ir_find_local_exact_first(func, one->ident.name,
+                                              (uint32_t)one->ident.name_len);
+            bool is1 = false;
+            for (int bi = 0; bi < func->block_count; bi++)
+                for (int ii = 0; ii < func->blocks[bi].inst_count; ii++) {
+                    IRInst *in = &func->blocks[bi].insts[ii];
+                    if (in->dest_local == t && in->op == IR_LITERAL && in->literal_int == 1)
+                        is1 = true;
+                }
+            if (!is1) return false;
+        }
+    }
+    Node *a = inst->expr;
+    if (!a || a->kind != NODE_ASSIGN || !a->assign.target ||
+        a->assign.target->kind != NODE_IDENT) return false;
+    Node *t = a->assign.target;
+    if (ir_index_local_keyable(func, t->ident.name, (uint32_t)t->ident.name_len) != loc)
+        return false;
+    Node *v = a->assign.value;
+    if (a->assign.op == TOK_PLUSEQ)
+        return ir_positive_const(func, v);
+    if (a->assign.op != TOK_EQ || !v || v->kind != NODE_BINARY ||
+        v->binary.op != TOK_PLUS) return false;
+    Node *l = v->binary.left, *r = v->binary.right;
+    bool l_self = l && l->kind == NODE_IDENT &&
+        ir_index_local_keyable(func, l->ident.name, (uint32_t)l->ident.name_len) == loc;
+    bool r_self = r && r->kind == NODE_IDENT &&
+        ir_index_local_keyable(func, r->ident.name, (uint32_t)r->ident.name_len) == loc;
+    return (l_self && ir_positive_const(func, r)) || (r_self && ir_positive_const(func, l));
+}
+
 static void ir_kill_index_facts(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                 IRInst *inst) {
     bool all = inst->op == IR_DEFER_FIRE && inst->defer_fire_emit_ast;
+    /* BUG-1302: a freed-slot fact relative to counter k survives only a monotone
+     * increment of k; any other write to k leaves the freed slot unknown. */
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *w = &ps->handles[i];
+        if (!w->slot_freed_idx1 || w->slot_freed_unknown) continue;
+        int L = w->slot_freed_idx1 - 1;
+        if (L < 0 || L >= func->local_count) { w->slot_freed_unknown = true; continue; }
+        IRLocal *lo = &func->locals[L];
+        const char *ln = lo->orig_name ? lo->orig_name : lo->name;
+        uint32_t ll = lo->orig_name ? lo->orig_name_len : lo->name_len;
+        if (ir_index_name_written(func, inst, all, ln, ll) &&
+            !ir_inst_increments_local(func, inst, L))
+            w->slot_freed_unknown = true;
+    }
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < ps->handle_count; i++) {
             const char *p = pass == 0 ? ps->handles[i].path : ps->handles[i].slot_key_path;
@@ -4611,23 +4862,29 @@ static void ir_kill_index_facts(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             for (uint32_t k = 0; k + 2 < pl; k++) {
                 if (p[k] != '[') continue;
                 char c0 = p[k + 1];
-                if (!((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
+                bool is_expr = c0 == '(';          /* BUG-1301: `[(k%4)]` */
+                if (!is_expr &&
+                    !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || c0 == '_'))
                     continue;
                 uint32_t e = k + 1;
                 while (e < pl && p[e] != ']') e++;
                 if (e >= pl) break;
                 const char *nm = p + k + 1;
                 uint32_t nl = e - k - 1;
-                int loc = ir_index_local_keyable(func, nm, nl);
-                bool written = all || loc < 0 || inst->dest_local == loc ||
-                    (inst->expr && ast_name_mutated_or_addrd(inst->expr, nm, nl));
-                if (!written && loc >= 0) {
-                    IRLocal *l = &func->locals[loc];
-                    if (l->orig_name && (l->orig_name_len != nl ||
-                                         memcmp(l->orig_name, nm, nl) != 0) &&
-                        inst->expr && ast_name_mutated_or_addrd(inst->expr,
-                                              l->orig_name, l->orig_name_len))
-                        written = true;
+                bool written = false;
+                /* Every NAME inside the brackets — the whole content for `[k]`,
+                 * each identifier token for an expression key. */
+                for (uint32_t t = 0; t < nl && !written; ) {
+                    char tc = nm[t];
+                    bool idst = (tc >= 'a' && tc <= 'z') || (tc >= 'A' && tc <= 'Z') || tc == '_';
+                    if (!idst) { t++; continue; }
+                    uint32_t te = t;
+                    while (te < nl && ((nm[te] >= 'a' && nm[te] <= 'z') ||
+                                       (nm[te] >= 'A' && nm[te] <= 'Z') ||
+                                       (nm[te] >= '0' && nm[te] <= '9') || nm[te] == '_'))
+                        te++;
+                    written = ir_index_name_written(func, inst, all, nm + t, te - t);
+                    t = te;
                 }
                 if (!written) continue;
                 /* Copy the name: the kill may delete the entry holding p. */
@@ -4635,7 +4892,12 @@ static void ir_kill_index_facts(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                 if (!nn) return;
                 memcpy(nn, nm, nl);
                 nn[nl] = 0;
-                ir_kill_index_name(zc, func, ps, nn, nl);
+                int mono = -1;                               /* BUG-1302 */
+                if (!is_expr && !all) {
+                    int kl = ir_index_local_keyable(func, nn, nl);
+                    if (kl >= 0 && ir_inst_increments_local(func, inst, kl)) mono = kl;
+                }
+                ir_kill_index_name(zc, func, ps, nn, nl, mono);
                 i = -1;          /* the table changed — rescan from the start */
                 break;
             }
@@ -6249,6 +6511,88 @@ static uint64_t ir_local_param_sources(IRFunc *func, int local, int depth) {
     }
     return m;
 }
+/* BUG-1300: the params whose ELEMENTS a value may have been read out of —
+ * `a[i]`, `a[i].p`, a local copy / capture of such a read, an orelse unwrap of it.
+ * Past the depth bound the answer is "any param" (round toward the widening). */
+static uint64_t ir_elem_sources_local(IRFunc *func, int local, int depth);
+static uint64_t ir_elem_sources_expr(IRFunc *func, Node *e, int depth) {
+    if (depth > 16) return ~0ULL;
+    e = ir_peel_launder(e);
+    if (e && e->kind == NODE_ORELSE) e = ir_peel_launder(e->orelse.expr);
+    bool indexed = false;
+    while (e && (e->kind == NODE_FIELD || e->kind == NODE_INDEX ||
+                 (e->kind == NODE_UNARY && e->unary.op == TOK_STAR))) {
+        if (e->kind == NODE_INDEX) { indexed = true; e = e->index_expr.object; }
+        else if (e->kind == NODE_FIELD) e = e->field.object;
+        else e = e->unary.operand;
+        e = ir_peel_launder(e);
+    }
+    if (!e || e->kind != NODE_IDENT) return 0;
+    int l = ir_find_local_exact_first(func, e->ident.name, (uint32_t)e->ident.name_len);
+    if (l < 0) return 0;
+    /* An element of a param (or of a local copy of one — `[*]?*T b = a;`). */
+    if (indexed) return ir_local_param_sources(func, l, 0);
+    return ir_elem_sources_local(func, l, depth + 1);
+}
+static uint64_t ir_elem_sources_local(IRFunc *func, int local, int depth) {
+    if (depth > 16) return ~0ULL;
+    if (local < 0 || local >= func->local_count || func->locals[local].is_param) return 0;
+    uint64_t m = 0;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->dest_local != local) continue;
+            if (in->op == IR_COPY && in->src1_local >= 0 && in->src1_local != local)
+                m |= ir_elem_sources_local(func, in->src1_local, depth + 1);
+            else if (in->expr)
+                m |= ir_elem_sources_expr(func, in->expr, depth + 1);
+        }
+    }
+    return m;
+}
+
+/* BUG-1300: FuncSummary.frees_param_elems for this function. */
+static Node *ir_defer_free_arg(ZerCheck *zc, Node *node);
+static uint64_t ir_collect_elem_frees(ZerCheck *zc, IRFunc *func) {
+    uint64_t m = 0;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            Node *call = bb->insts[ii].expr;
+            if (!call || call->kind != NODE_CALL) continue;
+            Node st;
+            memset(&st, 0, sizeof(st));
+            st.kind = NODE_EXPR_STMT;
+            st.expr_stmt.expr = call;
+            Node *fa = ir_defer_free_arg(zc, &st);
+            if (fa) m |= ir_elem_sources_expr(func, fa, 0);
+            /* A callee that frees the elements of what it is handed. */
+            if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
+                const char *cn = call->call.callee->ident.name;
+                uint32_t cl = (uint32_t)call->call.callee->ident.name_len;
+                for (int si = 0; si < zc->summary_count; si++) {
+                    FuncSummary *cs = &zc->summaries[si];
+                    if (cs->func_name_len != cl || memcmp(cs->func_name, cn, cl) != 0) continue;
+                    for (int ai = 0; ai < call->call.arg_count && ai < 64; ai++) {
+                        if (!(cs->frees_param_elems & (1ULL << ai))) continue;
+                        Node *a = ir_peel_launder(call->call.args[ai]);
+                        if (a && a->kind == NODE_UNARY && a->unary.op == TOK_AMP)
+                            a = a->unary.operand;
+                        if (a && a->kind == NODE_SLICE) a = a->slice.object;
+                        if (!a || a->kind != NODE_IDENT) continue;
+                        int l = ir_find_local_exact_first(func, a->ident.name,
+                                                          (uint32_t)a->ident.name_len);
+                        m |= ir_local_param_sources(func, l, 0);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return m;
+}
+
 static bool ir_param_store_push(ZerCheck *zc, struct ZcParamStore **v, int *n, int *cap,
                                 int dst, const char *path, uint32_t plen, int src) {
     for (int k = 0; k < *n; k++)
@@ -12474,6 +12818,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         struct ZcParamStore *pst = ir_collect_param_stores(zc, func, &pst_n);
         int pol_n = 0;                                               /* BUG-1243 */
         struct ZcPolls *pol = ir_collect_polls(zc, func, &pol_n);
+        uint64_t elem_frees = ir_collect_elem_frees(zc, func);         /* BUG-1300 */
 
         /* Update or create summary — same logic as zercheck.c:2320+ */
         FuncSummary *existing = NULL;
@@ -12513,6 +12858,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->ret_field_n != rf_n) changed = true;
             if (existing->param_store_n != pst_n) changed = true;          /* BUG-1241 */
             if (existing->polls_n != pol_n) changed = true;                /* BUG-1243 */
+            if (existing->frees_param_elems != elem_frees) changed = true;  /* BUG-1300 */
             for (int k = 0; !changed && k < rf_n; k++)
                 if (existing->ret_field[k].param != rf[k].param ||
                     existing->ret_field[k].must != rf[k].must ||
@@ -12520,6 +12866,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     memcmp(existing->ret_field[k].path, rf[k].path, rf[k].plen) != 0)
                     changed = true;
             if (changed) {
+                existing->frees_param_elems = elem_frees;   /* BUG-1300 */
                 existing->param_store_n = pst_n;
                 existing->param_store = pst;
                 existing->polls_n = pol_n;
@@ -12585,6 +12932,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->param_store = pst;
                 s->polls_n = pol_n;
                 s->polls = pol;
+                s->frees_param_elems = elem_frees;   /* BUG-1300 */
             } else {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);

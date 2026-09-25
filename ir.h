@@ -189,6 +189,11 @@ typedef struct IRInst {
      * fire of the cleanup). Such a guard must TRAP, as the IR-lowered one does. */
     bool in_defer_body;
 
+    /* BUG-1302: on a for-loop STEP `k += 1` whose condition is `k < E` and whose
+     * body never writes k: k is below E at every step, so the increment cannot
+     * wrap — the step is a genuinely monotone move of k. */
+    bool step_nowrap;
+
     /* BUG-1221: on IR_ASSIGN, zero the destination local (`memset`, any type,
      * arrays included) — a declaration WITHOUT an initializer that can execute
      * more than once (in a loop body, or in a function with labels). `expr` is a

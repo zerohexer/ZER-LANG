@@ -4560,6 +4560,12 @@ u32 main() {
 
 The auto-lock fires regardless of which THREAD calls the function — ZER `spawn`, C `pthread_create`, an OS callback thread. The lock is on the DATA (the `shared struct`'s mutex), not on the thread creation mechanism.
 
+A `*opaque` field of a `shared struct` is for a C handle: pass it to C functions. Casting
+it back to a ZER pointer — `@ptrcast(*T, g.handle)`, `(*T)h` or `@pun(*T, h)`, directly
+or through a local copy or an `if (g.mh) |h|` capture — is a compile error, because the
+resulting `*T` outlives the per-statement lock and two threads would write the object
+unlocked. Keep ZER data in the shared struct itself.
+
 An `interrupt` handler is not a thread, and a mutex is the wrong tool there (the
 interrupted code may hold it). A `shared struct` global touched from an ISR and
 from main is rejected with the ISR rules instead: it must be `volatile`, and a

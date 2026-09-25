@@ -92,6 +92,11 @@ typedef struct {
      * is fine, and the free-only checks (heap-only argument, interior pointer)
      * must not fire for it. NULL when nothing is transferred. */
     unsigned char *transfers_param;
+    /* BUG-1300: bit i = the callee may free a value read out of an ELEMENT of
+     * param i (`drain([*]?*T a) { if (a[i]) |p| { free(p); } }`), directly or
+     * through a callee with the bit. The caller widens the elements of the array
+     * it passed to MAYBE_FREED. Params past 63 are not represented. */
+    uint64_t frees_param_elems;
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
     /* BUG-849 (2026-08-23): the SET of params the return may be a view of.

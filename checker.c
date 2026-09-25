@@ -5085,6 +5085,69 @@ static bool lvalue_path_through_shared(Checker *c, Node *v) {
     return false;
 }
 
+/* BUG-1299: does this `*opaque`-typed value come out of a shared struct — a field
+ * of one (at any step), or a local that was assigned such a value? Launders that
+ * keep the value are peeled: casts, pointer intrinsics, and both arms of orelse. */
+static bool opaque_read_from_shared(Checker *c, Node *e) {
+    for (int depth = 0; e && depth <= ZER_EXPR_WALK_MAX; depth++) {
+        switch (e->kind) {
+        case NODE_FIELD:
+        case NODE_INDEX:
+            return lvalue_path_through_shared(c, e);
+        case NODE_IDENT: {
+            Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                     (uint32_t)e->ident.name_len);
+            return s && s->opaque_from_shared;
+        }
+        case NODE_TYPECAST:
+            e = e->typecast.expr;
+            continue;
+        case NODE_INTRINSIC:
+            if (e->intrinsic.arg_count < 1) return false;
+            e = e->intrinsic.args[e->intrinsic.arg_count - 1];
+            continue;
+        case NODE_ORELSE:
+            if (opaque_read_from_shared(c, e->orelse.fallback)) return true;
+            e = e->orelse.expr;
+            continue;
+        /* Not a read of a stored *opaque: a call RESULT, a literal, arithmetic,
+         * a statement. (A call returning a shared field is the documented
+         * residual — limitations.md.) */
+        case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+        case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+        case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR:
+        case NODE_CONTAINER_DECL: case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+        case NODE_FOR: case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN:
+        case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO:
+        case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+        case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+        case NODE_DO_WHILE: case NODE_STATIC_ASSERT: case NODE_INT_LIT:
+        case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT:
+        case NODE_NULL_LIT: case NODE_BINARY: case NODE_UNARY: case NODE_ASSIGN:
+        case NODE_CALL: case NODE_SLICE: case NODE_CAST: case NODE_SIZEOF:
+        case NODE_STRUCT_INIT:
+            return false;
+        }
+    }
+    return e != NULL;   /* past the walk bound: round toward reject */
+}
+
+/* BUG-1299: a `*opaque` field of a shared struct is the C-handle idiom — the lock
+ * serialises every C call made on it within one statement. Turned back into a ZER
+ * pointer it is a reference into the pointee that outlives the lock, so two
+ * threads write the object unlocked. */
+static void reject_shared_opaque_unwrap(Checker *c, Node *src, Type *target, int line,
+                                        const char *what) {
+    if (type_dispatch_kind(target) != TYPE_POINTER) return;
+    Type *ti = type_unwrap_distinct(type_unwrap_distinct(target)->pointer.inner);
+    if (!ti || type_dispatch_kind(ti) == TYPE_OPAQUE) return;
+    if (!opaque_read_from_shared(c, src)) return;
+    checker_error(c, line,
+        "%s turns a *opaque read out of a shared struct into a ZER pointer — the "
+        "object it points to would be accessed outside the struct's lock; keep ZER "
+        "data in the shared struct itself, and pass a *opaque field only to C", what);
+}
+
 static void array_view_qualifiers(Checker *c, Node *v, bool *is_vol, bool *is_const) {
     *is_vol = false;
     *is_const = false;
@@ -12310,6 +12373,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
                     }
                     if (node->assign.target->kind == NODE_IDENT) {
+                        /* BUG-1299: sticky — a copy of a shared *opaque stays one. */
+                        if (opaque_read_from_shared(c, node->assign.value))
+                            tsym->opaque_from_shared = true;
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
                         /* BUG-987: clears BOTH halves of the @container fact —
@@ -16573,6 +16639,11 @@ static Type *check_expr(Checker *c, Node *node) {
             /* BUG-447: volatile stripping — same check as @ptrcast BUG-258 */
             check_volatile_strip(c, node->typecast.expr, source, target, node->loc.line, "cast");
 
+            if (type_dispatch_kind(src_eff) == TYPE_POINTER &&
+                type_dispatch_kind(src_eff->pointer.inner) == TYPE_OPAQUE)
+                reject_shared_opaque_unwrap(c, node->typecast.expr, target,
+                                            node->loc.line, "cast");   /* BUG-1299 */
+
             /* BUG-446: provenance check — same as @ptrcast provenance tracking.
              * When source is *opaque with known provenance, target must match. */
             if (src_eff->kind == TYPE_POINTER &&
@@ -16966,6 +17037,10 @@ static Type *check_expr(Checker *c, Node *node) {
                          * check prov_map. BUG-393 runtime type_id is the suspenders.
                          * SAFETY: zer_provenance_check_required in src/safety/provenance_rules.c
                          * Oracle: lambda_zer_opaque/iris_opaque_specs.v typed_ptr_agree. */
+                        if (type_dispatch_kind(eff) == TYPE_POINTER &&
+                            type_dispatch_kind(eff->pointer.inner) == TYPE_OPAQUE)
+                            reject_shared_opaque_unwrap(c, node->intrinsic.args[0], result,
+                                                        node->loc.line, "@ptrcast");   /* BUG-1299 */
                         if (eff->kind == TYPE_POINTER &&
                             eff->pointer.inner->kind == TYPE_OPAQUE) {
                             Type *prov_type = NULL;
@@ -17153,6 +17228,10 @@ static Type *check_expr(Checker *c, Node *node) {
                         Type *tgt_eff_pun_strip = result ? type_unwrap_distinct(result) : NULL;
                         check_const_strip(c, node->intrinsic.args[0], val_type, result,
                                           node->loc.line, "@pun");
+                        if (eff->kind == TYPE_POINTER &&
+                            type_dispatch_kind(eff->pointer.inner) == TYPE_OPAQUE && result)
+                            reject_shared_opaque_unwrap(c, node->intrinsic.args[0], result,
+                                                        node->loc.line, "@pun");   /* BUG-1299 */
                         /* volatile stripping — same as @ptrcast BUG-258.
                          * check_volatile_strip handles distinct unwrap internally. */
                         check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
@@ -22006,6 +22085,11 @@ static void check_stmt(Checker *c, Node *node) {
                 }
             }
 
+            /* BUG-1299: a local copy of a *opaque read out of a shared struct. */
+            if (sym && node->var_decl.init &&
+                opaque_read_from_shared(c, node->var_decl.init))
+                sym->opaque_from_shared = true;
+
             /* Cross-function provenance: if init is a call to a function with
              * known return provenance, propagate to the variable. */
             if (sym && !sym->provenance_type && node->var_decl.init) {
@@ -22247,6 +22331,9 @@ static void check_stmt(Checker *c, Node *node) {
                     cap_type, node->loc.line);
                 if (cap) {
                     cap->is_const = cap_const;
+                    /* BUG-1299: `if (s.mh) |h|` — the capture is a copy of it. */
+                    if (opaque_read_from_shared(c, node->if_stmt.cond))
+                        cap->opaque_from_shared = true;
 
                     /* BUG-212: propagate local/arena-derived from condition ident */
                     {

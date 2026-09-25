@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1300: a callee that frees the ELEMENTS of an array it is handed. No summary
+// said so, so the caller's precise slot arr[0] stayed ALIVE and the read of a freed
+// object compiled (a recycled slot's value came back).
+struct T { u32 v; }
+void drain([*]?*T arr) {
+    for (u32 i = 0; i < arr.len; i += 1) { if (arr[i]) |p| { free(p); } }
+}
+u32 main() {
+    ?*T[2] arr;
+    arr[0] = alloc(T);
+    arr[1] = alloc(T);
+    drain(arr);
+    *T a = arr[0] orelse { return 0; };
+    return a.v;
+}

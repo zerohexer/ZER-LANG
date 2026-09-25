@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: out of a shared struct
+// BUG-1299: the same cast-back through an if-unwrap capture of a ?*opaque field.
+struct T { u32 x; }
+shared struct S { ?*opaque mh; }
+S s;
+T obj;
+void w() {
+    if (s.mh) |h| {
+        *T t = (*T)h;
+        t.x += 1;
+    }
+}
+u32 main() {
+    s.mh = @ptrcast(*opaque, &obj);
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

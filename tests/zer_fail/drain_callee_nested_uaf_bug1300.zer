@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1300: the same drain, one call deeper — the summary bit propagates through a
+// callee that hands its own param to a draining callee.
+struct T { u32 v; }
+void drain([*]?*T arr) {
+    for (u32 i = 0; i < arr.len; i += 1) { *T p = arr[i] orelse { return; }; free(p); }
+}
+void cleanup([*]?*T xs) { drain(xs); }
+u32 main() {
+    ?*T[2] arr;
+    arr[0] = alloc(T);
+    arr[1] = alloc(T);
+    cleanup(arr);
+    *T a = arr[0] orelse { return 0; };
+    return a.v;
+}

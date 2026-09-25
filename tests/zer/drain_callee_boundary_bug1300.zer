@@ -1,0 +1,30 @@
+// BUG-1300 boundary: only a callee that FREES elements widens them. A read-only
+// callee leaves the slots usable, and a drained slot that is REFILLED is live.
+struct T { u32 v; }
+u32 sum([*]?*T arr) {
+    u32 t = 0;
+    for (u32 i = 0; i < arr.len; i += 1) { if (arr[i]) |p| { t += p.v; } }
+    return t;
+}
+void drain([*]?*T arr) {
+    for (u32 i = 0; i < arr.len; i += 1) { if (arr[i]) |p| { free(p); } arr[i] = null; }
+}
+u32 main() {
+    ?*T[2] arr;
+    *T x = alloc(T) orelse { return 1; };
+    x.v = 4;
+    arr[0] = x;
+    arr[1] = alloc(T);
+    if (sum(arr) != 4) { return 2; }
+    *T a = arr[0] orelse { return 3; };
+    if (a.v != 4) { return 4; }
+    drain(arr);
+    *T y = alloc(T) orelse { return 5; };
+    y.v = 9;
+    arr[0] = y;
+    *T b = arr[0] orelse { return 6; };
+    u32 r = b.v;
+    free(b);
+    if (r != 9) { return 7; }
+    return 0;
+}

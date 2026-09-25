@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: out of a shared struct
+// BUG-1299: the same cast-back, laundered through a local ASSIGNED the field.
+struct T { u32 x; }
+shared struct S { *opaque handle; *opaque other; }
+S s;
+T obj;
+void w() {
+    *opaque h = s.other;
+    h = s.handle;
+    *T t = @pun(*T, h);
+    t.x += 1;
+}
+u32 main() {
+    s.handle = @ptrcast(*opaque, &obj);
+    s.other = @ptrcast(*opaque, &obj);
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

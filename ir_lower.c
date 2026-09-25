@@ -1405,6 +1405,42 @@ static void materialise_defers_from(LowerCtx *ctx, int base) {
  * carries an armed gate. Functions WITHOUT a label (the overwhelming majority, and
  * where the safety wins are) get the IR treatment; functions with one keep exactly
  * the behaviour they had. */
+/* BUG-1302: `for (…; k < E; k += 1)` (or `k = k + 1`, `E > k`) with no write to k
+ * in the condition or the body: every step runs with k < E <= max, so k + 1 does
+ * not wrap. Syntactic, and conservative on anything else. */
+static bool for_step_cannot_wrap(Node *node) {
+    Node *c = node->for_stmt.cond, *st = node->for_stmt.step;
+    if (!c || !st || c->kind != NODE_BINARY || st->kind != NODE_ASSIGN) return false;
+    Node *k = NULL;
+    if (c->binary.op == TOK_LT) k = c->binary.left;
+    else if (c->binary.op == TOK_GT) k = c->binary.right;
+    if (!k || k->kind != NODE_IDENT) return false;
+    Node *t = st->assign.target;
+    if (!t || t->kind != NODE_IDENT || t->ident.name_len != k->ident.name_len ||
+        memcmp(t->ident.name, k->ident.name, k->ident.name_len) != 0) return false;
+    Node *v = st->assign.value;
+    bool one = false;
+    if (st->assign.op == TOK_PLUSEQ)
+        one = v && v->kind == NODE_INT_LIT && v->int_lit.value == 1;
+    else if (st->assign.op == TOK_EQ && v && v->kind == NODE_BINARY &&
+             v->binary.op == TOK_PLUS) {
+        Node *l = v->binary.left, *r = v->binary.right;
+        bool ls = l && l->kind == NODE_IDENT && l->ident.name_len == k->ident.name_len &&
+                  memcmp(l->ident.name, k->ident.name, k->ident.name_len) == 0;
+        bool rs = r && r->kind == NODE_IDENT && r->ident.name_len == k->ident.name_len &&
+                  memcmp(r->ident.name, k->ident.name, k->ident.name_len) == 0;
+        one = (ls && r && r->kind == NODE_INT_LIT && r->int_lit.value == 1) ||
+              (rs && l && l->kind == NODE_INT_LIT && l->int_lit.value == 1);
+    }
+    if (!one) return false;
+    const char *nm = k->ident.name;
+    uint32_t nl = (uint32_t)k->ident.name_len;
+    if (ast_name_mutated_or_addrd(c, nm, nl)) return false;
+    if (node->for_stmt.body && ast_name_mutated_or_addrd(node->for_stmt.body, nm, nl))
+        return false;
+    return true;
+}
+
 static bool defers_stay_on_ast(LowerCtx *ctx) {
     return ctx->label_count > 0;
 }
@@ -3444,6 +3480,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
+            step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
             ctx->current_stmt_shared_root = prev_step_shared;
             if (step_root) {

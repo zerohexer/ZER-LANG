@@ -5,6 +5,58 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-25c — BUG-1300..1302: three ways an array slot still held a freed pointer
+
+All three measured on the from-HEAD `c960b4ba` build, where each negative COMPILED and read a
+freed object; pinned by SHAPE p45 in `tools/sink_matrix.sh` (all four reject cells HOLE on
+that build, CLEAN now; three boundary cells).
+
+- **BUG-1300 — a callee that frees the ELEMENTS of an array it is handed.** `drain(arr)` then
+  `arr[0].v`: no summary said "frees through a slice param at a variable index", so the
+  caller's precise slot stayed ALIVE. `FuncSummary.frees_param_elems` (`ir_collect_elem_frees`:
+  a free whose argument traces to an element read of param i — through copies, captures and
+  orelse — or a call handing param i to a callee with the bit), applied in
+  `ir_call_hands_local_array`: the array's slots and their aliases become MAYBE_FREED +
+  escaped. Side effect: a false LEAK of such an alias after a drain (`x` stored in `arr[0]`,
+  `drain(arr)`) is gone. Tests: `drain_callee_uaf_bug1300`, `drain_callee_nested_uaf_bug1300`,
+  `tests/zer/drain_callee_boundary_bug1300`.
+- **BUG-1301 — an index EXPRESSION had no key.** `g[k % 4] = x; a = g[k % 4]; free(a); q =
+  g[k % 4]; q.v` compiled. A pure arithmetic index over literals and trackable locals is now
+  keyed by its text (`[(k%4)]`), killed when any name inside it is written. Tests:
+  `slot_expr_index_uaf_bug1301`, `tests/zer/slot_expr_index_rekey_bug1301`.
+- **BUG-1302 — a slot freed through `tbl[i]`, read after `i` moved on.** The kill dropped the
+  FREED fact. It now lands on the array wildcard, relative to the counter when the counter
+  only moved by a NON-WRAPPING increment — a wrap would bring it back onto the freed slots, so
+  "monotone" needs the for-step `k += 1` under `k < E` (`IRInst.step_nowrap`) or a 64-bit
+  counter. Tests: `slot_moved_counter_uaf_bug1302`, `slot_counter_reset_uaf_bug1302`,
+  `tests/zer/slot_counter_consume_bug1302`.
+
+Corpus scan: the only verdict difference is the BUG-1300 positive (a false leak on HEAD).
+
+---
+
+## Session 2026-09-25b — BUG-1299: a shared struct's `*opaque` field cast back to a ZER pointer
+
+**Symptom (from-HEAD `c960b4ba` build).** BUG-1286 allows a top-level `*opaque` field in a
+`shared struct` (the C-handle idiom). `*T t = @ptrcast(*T, s.handle); t.x += 1;` in two
+spawned threads compiled: each thread got a ZER pointer into the pointee that outlived the
+per-statement lock, and both wrote `obj.x` unlocked. Same through a local copy (`h = s.handle;
+@pun(*T, h)`), and through `if (s.mh) |h| { (*T)h }`.
+
+**Fix.** `opaque_read_from_shared` (a field read at any step through a shared struct —
+`lvalue_path_through_shared` — or a local carrying the sticky `Symbol.opaque_from_shared`,
+peeling casts, pointer intrinsics and both orelse arms) and one reporter
+`reject_shared_opaque_unwrap`, called by the C-style cast, `@ptrcast` and `@pun` when the
+source is `*opaque` and the target is a non-opaque pointer. The flag is set at a var-decl
+init, an assignment and an if-unwrap capture. Residual (function param / return launder) in
+limitations.md. Corpus scan: zero verdict differences (the first draft rounded a NULL walk to
+"reject" and hit three positives — found by the scan).
+
+**Tests.** `tests/zer_fail/shared_opaque_cast_{direct,local_copy,capture}_bug1299.zer` (all
+accepted pre-fix).
+
+---
+
 ## Session 2026-09-25 — BUG-1298: defer bodies in a function WITH a label
 
 **Symptom (measured on the from-HEAD `c960b4ba` build).** In a function containing a

@@ -64,20 +64,20 @@ Mechanism: compiler-internals.md "Array slots — the three precisions".
 
 Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`).
 
-1. **A slot freed through an index and read back after the index was WRITTEN.**
-   `for (i..) { *T q = tbl[i] orelse return; free(q); } for (j..) { *T r = tbl[j] orelse return; r.v }`
-   compiles — dangling pointers are left in every slot. The `tbl[i]` FREED fact is dropped when
-   `i` is written (ir_kill_index_facts). Keeping it as a "some slot holds a freed pointer" fact
-   was drafted and dropped: it would refuse every loop that frees or consumes one slot per
-   iteration (`for (i..) { q = tbl[i]; use(q); free(q); }`, pinned as a positive by
-   `p33_safe_consume_no_reset`), because the analysis cannot tell that `i` never comes back. Fix sketch: a relational fact on the counter (monotone `i` with `i > i_free`) — the
-   `disjoint_lattice.v` direction. The reset idiom (`tbl[i] = null;` after the free) is what the
-   diagnostics teach where they fire.
-2. **An UNTRACKABLE index keeps the BUG-1074 posture.** An index that is an expression
-   (`g[k % 4]`), an address-taken local, or a name two locals share has no key: a free through a
-   read of such a slot is not recorded, and a MAYBE member of the wildcard is not blocking.
-   `g[k % 4] = x; a = g[k % 4]; free(a); q = g[k % 4]; q.v` compiles. Fix sketch: key an index
-   EXPRESSION by its syntactic form when every local in it is trackable (kill on any of them).
+1. ~~**A slot freed through an index and read back after the index was WRITTEN.**~~ — CLOSED
+   2026-09-25 (BUG-1302). The dropped FREED fact now survives on the array's wildcard
+   (`slot_freed_idx1` / `slot_freed_unknown`): relative to the counter when every write to it
+   since was a NON-WRAPPING increment (a for-step `k += 1` under `k < E` with no other write,
+   `ir_lower` `for_step_cannot_wrap`; or a 64-bit counter moving by 1), otherwise "some slot".
+   A read of the array through anything else, with no precise entry for that slot, is refused.
+   **Residual (over-rejection):** a WHILE-loop consume (`while (k < n) { … free(tbl[k]) …
+   k += 1; }` on a u32 counter) is not recognised as non-wrapping — use a `for`, or reset the
+   slot (`tbl[k] = null;`), which is what the diagnostic teaches.
+2. ~~**An UNTRACKABLE index keeps the BUG-1074 posture.**~~ — CLOSED for pure arithmetic
+   index expressions (2026-09-25, BUG-1301): `g[k % 4]` is keyed `[(k%4)]` while no local in it
+   is written (`ir_index_is_keyable` / `ir_index_key_text`; the kill checks every name inside
+   the brackets). Still unkeyed: an index with a CALL, a global, a field or another index in it,
+   an address-taken local, a name two locals share.
 3. **A drain exempts the whole array.** Which slots a free-through-a-variable-index loop
    reached is unknowable, so `for (i < 2) { free(arr[i]) }` over a 4-slot array leaks two
    allocations silently; so does handing the array to a callee (`drain(arr)` — needed, else a
@@ -86,10 +86,11 @@ Each item below was MEASURED on the BUG-1130..1133 build (probes: scratch `pr4/`
 4. **A leak on an early return INSIDE the fill loop** (`for (i..) { *T a = alloc(T) orelse
    return; arr[i] = a; }`) is invisible: allocation ids are per LOCAL, so the null-edge drop of
    `a` (BUG-1071) also drops the earlier iterations' allocations that share its id.
-5. **A draining callee's UAF side.** After `drain(arr)` frees the elements, a read of a
-   precise slot (`arr[0]` stored by literal) is not refused — no FuncSummary says a callee frees
-   through a slice param at a variable index. Widening the elements at the call would refuse
-   every read-only callee (`sum(arr); a.v`).
+5. ~~**A draining callee's UAF side.**~~ — CLOSED 2026-09-25 (BUG-1300):
+   `FuncSummary.frees_param_elems` (the callee frees a value read out of an element of param i,
+   directly or through a callee with the bit); the caller widens the array's slots to
+   MAYBE_FREED. A read-only callee has no bit and is unaffected. Params past 63 are not
+   represented.
 6. **The dynamic-freed auto-guard's return leaks.** `pool.free(handles[k]); handles[j].f` gets a
    runtime `if (j == k) return;` (checker.c, Handle arrays) that the leak pass does not report,
    although the remaining handles leak when it fires (`tests/zer/dyn_array_autoguard_crash.zer`
@@ -152,13 +153,12 @@ free 1272, per-arena reset precision 1268). What is left, each measured on the f
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.
-- **MEDIUM (residual of BUG-1286): a `*opaque` field of a shared struct cast back to a ZER
-  pointer.** BUG-1286 refuses pointer fields to non-shared data, but a top-level `*opaque` field
-  is allowed — it is the documented C-library-handle idiom (the lock serialises every C call made
-  on it within a statement). If the handle actually holds a ZER object, `*T t = @ptrcast(*T,
-  s.handle); t.x += 1;` in two threads writes it unlocked. Fix sketch: refuse a cast whose operand
-  was read out of a shared struct (directly, or through a local copy — a provenance flag on the
-  local).
+- ~~**MEDIUM: a `*opaque` field of a shared struct cast back to a ZER pointer**~~ — CLOSED
+  2026-09-25 (BUG-1299) for a cast (C-style, `@ptrcast`, `@pun`) of the field itself, of a local
+  initialised or assigned from it (sticky `Symbol.opaque_from_shared`), and of an if-unwrap
+  capture of it. **Residual (LOW):** the value handed to a ZER FUNCTION (`use(s.handle)` where
+  `use` casts its `*opaque` param) or returned from one (`*opaque get() { return s.handle; }`)
+  is not followed — a per-param "casts to a ZER pointer" summary would close it.
 - **LOW (over-rejection, from BUG-1276): a fire-and-forget thread may not write a global inside
   `@once`** — the publish-once exemption needs the parent's window to END, which only a join
   gives. Use a scoped spawn. Also the parent may not call ANY function that reaches the global

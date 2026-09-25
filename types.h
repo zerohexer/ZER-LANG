@@ -347,6 +347,10 @@ struct Symbol {
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */
     Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
+    /* BUG-1299: this `*opaque` local holds a value READ out of a shared struct —
+     * casting it to a ZER pointer would reach the object outside the lock. Sticky
+     * (never cleared): clearing is a relaxation and needs a flow argument. */
+    bool opaque_from_shared;
 
     /* @container provenance: tracks which struct+field this pointer points inside */
     Type *container_struct;          /* NULL = unknown */

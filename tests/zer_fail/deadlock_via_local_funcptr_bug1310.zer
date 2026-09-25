@@ -1,0 +1,8 @@
+// expect-error: deadlock: single statement accesses both 'A'
+// BUG-1310: the callee is a funcptr LOCAL — every function of its signature
+// may be reached, and `inner` writes shared B while the statement holds A.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 inner() { b.y = 1; return 1; }
+u32 main() { *() -> u32 f = inner; a.x = f(); return 0; }

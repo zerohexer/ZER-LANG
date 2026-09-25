@@ -1853,3 +1853,51 @@ checker.c:opaque_read_from_shared:NODE_UNARY:unary.operand
 checker.c:opaque_read_from_shared:NODE_VAR_DECL:var_decl.init
 checker.c:opaque_read_from_shared:NODE_WHILE:while_stmt.body
 checker.c:opaque_read_from_shared:NODE_WHILE:while_stmt.cond
+
+# 2026-09-25 (BUG-1310): init_bound_functions walks a GLOBAL's declaration INITIALIZER for
+# the function names it binds. A constant initializer designates a function only through
+# an ident, a struct literal field, a typecast, an orelse arm or a field/index projection
+# of another global — those arms descend. Operators, calls (a comptime call folds to a
+# value, never a function) and every statement kind cannot designate one; they are listed
+# only so -Werror=switch keeps the switch exhaustive.
+checker.c:init_bound_functions:NODE_ASM:asm_stmt.inputs
+checker.c:init_bound_functions:NODE_ASM:asm_stmt.outputs
+checker.c:init_bound_functions:NODE_ASSIGN:assign.target
+checker.c:init_bound_functions:NODE_ASSIGN:assign.value
+checker.c:init_bound_functions:NODE_AWAIT:await_stmt.cond
+checker.c:init_bound_functions:NODE_BINARY:binary.left
+checker.c:init_bound_functions:NODE_BINARY:binary.right
+checker.c:init_bound_functions:NODE_BLOCK:block.stmts
+checker.c:init_bound_functions:NODE_CALL:call.args
+checker.c:init_bound_functions:NODE_CALL:call.callee
+checker.c:init_bound_functions:NODE_CRITICAL:critical.body
+checker.c:init_bound_functions:NODE_DEFER:defer.body
+checker.c:init_bound_functions:NODE_DO_WHILE:while_stmt.body
+checker.c:init_bound_functions:NODE_DO_WHILE:while_stmt.cond
+checker.c:init_bound_functions:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:init_bound_functions:NODE_FILE:file.decls
+checker.c:init_bound_functions:NODE_FOR:for_stmt.body
+checker.c:init_bound_functions:NODE_FOR:for_stmt.cond
+checker.c:init_bound_functions:NODE_FOR:for_stmt.init
+checker.c:init_bound_functions:NODE_FOR:for_stmt.step
+checker.c:init_bound_functions:NODE_FUNC_DECL:func_decl.body
+checker.c:init_bound_functions:NODE_GLOBAL_VAR:var_decl.init
+checker.c:init_bound_functions:NODE_IF:if_stmt.cond
+checker.c:init_bound_functions:NODE_IF:if_stmt.else_body
+checker.c:init_bound_functions:NODE_IF:if_stmt.then_body
+checker.c:init_bound_functions:NODE_INDEX:index_expr.index
+checker.c:init_bound_functions:NODE_INTERRUPT:interrupt.body
+checker.c:init_bound_functions:NODE_INTRINSIC:intrinsic.args
+checker.c:init_bound_functions:NODE_ONCE:once.body
+checker.c:init_bound_functions:NODE_RETURN:ret.expr
+checker.c:init_bound_functions:NODE_SLICE:slice.end
+checker.c:init_bound_functions:NODE_SLICE:slice.object
+checker.c:init_bound_functions:NODE_SLICE:slice.start
+checker.c:init_bound_functions:NODE_SPAWN:spawn_stmt.args
+checker.c:init_bound_functions:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:init_bound_functions:NODE_SWITCH:switch_stmt.arms
+checker.c:init_bound_functions:NODE_SWITCH:switch_stmt.expr
+checker.c:init_bound_functions:NODE_UNARY:unary.operand
+checker.c:init_bound_functions:NODE_VAR_DECL:var_decl.init
+checker.c:init_bound_functions:NODE_WHILE:while_stmt.body
+checker.c:init_bound_functions:NODE_WHILE:while_stmt.cond

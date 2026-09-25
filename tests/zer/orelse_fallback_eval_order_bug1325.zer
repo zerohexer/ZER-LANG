@@ -1,0 +1,18 @@
+// BUG-1325: an orelse FALLBACK value and a self-referencing assignment evaluate left to right.
+u32 g;
+?u32 none() { return null; }
+u32 step() { g = g * 10 + 1; return g; }
+u32 main() {
+    g = 5;
+    u32 v = none() orelse g + step();
+    if (v != 56) { return 1; }
+    g = 5;
+    u32 w = 0;
+    w = none() orelse g + step();
+    if (w != 56) { return 2; }
+    g = 5;
+    u32 y = 1;
+    y = y + (y = 5);
+    if (y != 6) { return 3; }
+    return 0;
+}

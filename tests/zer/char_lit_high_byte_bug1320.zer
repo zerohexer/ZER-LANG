@@ -1,0 +1,21 @@
+// BUG-1320: regression (see BUGS-FIXED.md).
+// A char literal >= 0x80 outside the 3AC path is emitted as its SIGN-EXTENDED value
+// (emitter.c NODE_CHAR_LIT: `(unsigned)node->char_lit.value` on a signed char):
+//   w = '\xff';           -> `w = 4294967295`
+//   b = c == '\xff';      -> false for c = 255
+//   u32 x = none() orelse '\xff';  -> 4294967295
+// while `u32 v = '\xff';` gives 255. Expected exit 0.
+u8 id(u8 x) { return x; }
+?u32 none() { return null; }
+u32 main() {
+    u32 w = 0;
+    w = '\xff';
+    if (w != 255) { return 1; }
+    u8 c = id(255);
+    bool b = false;
+    b = c == '\xff';
+    if (!b) { return 2; }
+    u32 x = none() orelse '\xff';
+    if (x != 255) { return 3; }
+    return 0;
+}

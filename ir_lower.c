@@ -559,6 +559,21 @@ static bool lower_may_write(Node *n) {
     return true;
 }
 
+/* BUG-1325: can the ORDER in which this value's parts are evaluated be observed?
+ * It writes something, and it is more than one call whose arguments (and callee)
+ * are effect-free. Such a value handed to the passthrough emitter becomes ONE C
+ * expression, whose operand and argument order C leaves unsequenced. */
+static bool value_order_observable(Node *v) {
+    if (!v || !lower_may_write(v)) return false;
+    if (v->kind == NODE_CALL) {
+        if (lower_may_write(v->call.callee)) return true;
+        for (int ai = 0; ai < v->call.arg_count; ai++)
+            if (lower_may_write(v->call.args[ai])) return true;
+        return false;
+    }
+    return true;
+}
+
 /* Snapshot a NAMED local operand into a temp here, at its own evaluation
  * position. Arrays are not copied (an array operand is an address, and C cannot
  * assign one); a temp is returned unchanged. */
@@ -767,7 +782,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         int tmp = create_temp(ctx, ty_u8, expr->loc.line);
         IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
         inst.dest_local = tmp;
-        inst.literal_int = (int64_t)expr->char_lit.value;
+        inst.literal_int = (int64_t)(uint8_t)expr->char_lit.value;   /* BUG-1320: a u8 */
         inst.literal_kind = 5; /* char */
         emit_3ac(ctx, inst);
         return tmp;
@@ -1176,7 +1191,17 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
              * effect. */
             bool rhs_si_order = rhs && rhs->kind == NODE_STRUCT_INIT &&
                 rhs->struct_init.field_count >= 2 && lower_may_write(rhs);
-            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order) goto passthrough;
+            /* BUG-1325: the same for ANY value whose evaluation order can be
+             * observed — it writes something, and it is more than one call with
+             * effect-free arguments. Passed through, `x = g + step();` and
+             * `x = pair(step(), step2());` were one C expression, which C leaves
+             * unsequenced: GCC read `g` after the call (102, the var-decl form
+             * gives 56) and ran the arguments right to left, against the
+             * documented left-to-right rule (reference.md "Evaluation Order"). */
+            bool rhs_order = rhs && !rhs_sc && rhs->kind != NODE_STRUCT_INIT &&
+                             value_order_observable(rhs);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order && !rhs_order)
+                goto passthrough;
             plain_sc = rhs_sc;
         }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
@@ -2762,7 +2787,24 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
              * The fallback expression may contain nested orelse (e.g.,
              * `A orelse bar(B orelse 7)`). Pre-lower any orelse inside
              * before handing the AST to the passthrough emitter. */
-            if (dest_local >= 0) {
+            if (dest_local >= 0 && fb->kind != NODE_STRUCT_INIT &&
+                value_order_observable(fb)) {
+                /* BUG-1325: `none() orelse g + step()` — lowered left to right
+                 * (the var-decl / call-argument order), then copied in. */
+                int fv = lower_expr(ctx, fb);
+                if (fv >= 0) {
+                    IRInst cp = make_inst(IR_COPY, line);
+                    cp.dest_local = dest_local;
+                    cp.src1_local = fv;
+                    emit_inst(ctx, cp);
+                } else {
+                    pre_lower_orelse(ctx, &fb, line);
+                    IRInst assign = make_inst(IR_ASSIGN, line);
+                    assign.dest_local = dest_local;
+                    assign.expr = fb;
+                    emit_inst(ctx, assign);
+                }
+            } else if (dest_local >= 0) {
                 pre_lower_orelse(ctx, &fb, line);
                 IRInst assign = make_inst(IR_ASSIGN, line);
                 assign.dest_local = dest_local;

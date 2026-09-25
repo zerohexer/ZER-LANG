@@ -52,7 +52,6 @@ cef8a0991afd00d4  reference.md:691
 6478d5bd3562fdc5  reference.md:805
 dfaf2a0615cbe6bc  reference.md:833
 677840937f6c448f  reference.md:852
-157f503d18ac369a  reference.md:866
 8d21605548eaef59  reference.md:884
 5a4d68b5356493c6  reference.md:904
 2c6ba96c2b1361c6  reference.md:994
@@ -88,7 +87,6 @@ d38a3e67e4ff9cd0  reference.md:2660
 aa8de80acb528ee5  reference.md:2688
 f9764f4cb5d9f483  reference.md:2724
 4c9df36249a61c03  reference.md:4265
-cf1f45799e6f465a  reference.md:2857
 9077b704b75e0c84  reference.md:2872
 dcd613ebaca835de  reference.md:2894
 6c6f217dfa4c2874  reference.md:3147

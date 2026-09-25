@@ -4585,10 +4585,23 @@ static void ir_call_hands_local_array(ZerCheck *zc, IRFunc *func, IRPathState *p
         Type *t = checker_get_type(zc->checker, a);
         if (!t || type_dispatch_kind(t) != TYPE_ARRAY) continue;
         int root; const char *path; uint32_t plen;
-        if (ir_extract_compound_key(zc, func, ps, a, &root, &path, &plen) != 0) continue;
-        if (!ir_slot_root_is_local_storage(func, root)) continue;
-        IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, path ? path : "", plen, "", 0, true);
-        if (w) w->slot_drained = true;
+        if (ir_extract_compound_key(zc, func, ps, a, &root, &path, &plen) != 0) {
+            /* BUG-1312: a bare GLOBAL array (`dropit(gh)`) — its element entries
+             * are keyed `(IR_GLOBAL_ROOT_ID, "gh[0].p")`. */
+            if (a->kind == NODE_IDENT && ir_ident_is_unshadowed_global(zc, func, a)) {
+                root = IR_GLOBAL_ROOT_ID;
+                path = a->ident.name;
+                plen = (uint32_t)a->ident.name_len;
+            } else {
+                continue;
+            }
+        }
+        if (ir_slot_root_is_local_storage(func, root)) {
+            IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, path ? path : "", plen, "", 0, true);
+            if (w) w->slot_drained = true;
+        } else if (root != IR_GLOBAL_ROOT_ID) {
+            continue;
+        }
         /* BUG-1300: a callee whose summary says it frees ELEMENTS of this param
          * leaves every element the array held possibly freed. Widening only on
          * that bit keeps read-only callees (`sum(arr); a.v`) accepted. */
@@ -5480,6 +5493,16 @@ static bool ir_value_global_key(ZerCheck *zc, IRFunc *func, Node *e,
     e = ir_peel_launder(e);
     if (e && e->kind == NODE_ORELSE) e = ir_peel_launder(e->orelse.expr);
     if (!e) return false;
+    /* BUG-1311: a call whose every return reads one global key reads it too. */
+    if (e->kind == NODE_CALL) {
+        const FuncSummary *cs = ir_call_summary(zc, e);
+        if (cs && cs->ret_global_key && cs->ret_global_key_len > 0) {
+            *key = cs->ret_global_key;
+            *len = cs->ret_global_key_len;
+            return true;
+        }
+        return false;
+    }
     if (e->kind == NODE_FIELD || e->kind == NODE_INDEX)
         return ir_global_projection_key(zc, func, e, key, len);
     if (e->kind == NODE_IDENT && ir_ident_is_unshadowed_global(zc, func, e)) {
@@ -11712,9 +11735,16 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
                                      IRInst *inst) {
     bool deref_read = inst->op == IR_UNOP && inst->expr &&
         inst->expr->kind == NODE_UNARY && inst->expr->unary.op == TOK_STAR;   /* BUG-1289 */
-    if ((inst->op != IR_ASSIGN && !deref_read) || inst->dest_local < 0 || !inst->expr) return;
+    /* BUG-1311: a CALL whose summary says it returns a read of a global. */
+    bool call_read = inst->op == IR_CALL && inst->expr && inst->expr->kind == NODE_CALL;
+    if ((inst->op != IR_ASSIGN && !deref_read && !call_read) ||
+        inst->dest_local < 0 || !inst->expr) return;
     if (inst->dest_local >= func->local_count) return;
-    if (ir_find_handle(ps, inst->dest_local)) return;
+    /* A call result was already registered by the call transfer (as a fresh
+     * allocation or a borrow); when the summary PROVES it is the global's value,
+     * that registration is replaced by the alias below. */
+    IRHandleInfo *prev = ir_find_handle(ps, inst->dest_local);
+    if (prev && !call_read) return;
     Type *dt = type_unwrap_distinct(func->locals[inst->dest_local].type);
     if (dt && type_dispatch_kind(dt) == TYPE_OPTIONAL) dt = type_unwrap_distinct(dt->optional.inner);
     if (!dt || (type_dispatch_kind(dt) != TYPE_POINTER &&
@@ -11732,8 +11762,16 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
     }
     if (gh->alloc_id == 0 || gh->state != IR_HS_ALIVE) return;
     IRHandleInfo snap = *gh;
-    IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+    IRHandleInfo *dh = prev ? prev : ir_add_handle(ps, inst->dest_local);
     if (!dh) return;
+    if (prev) {                       /* BUG-1311: the result IS the global's value */
+        int keep_local = prev->local_id;
+        memset(prev, 0, sizeof(*prev));
+        prev->local_id = keep_local;
+        prev->state = IR_HS_UNKNOWN;
+        prev->free_block = -1;       /* as ir_alloc_handle_slot initialises */
+        prev->view_root_local = -1;
+    }
     dh->state = snap.state;
     dh->alloc_id = snap.alloc_id;
     dh->alloc_line = snap.alloc_line;
@@ -12338,8 +12376,25 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                      * OUR param by matching the argument it was given. The
                      * FuncSummary build is iterative, so a chain of any depth
                      * resolves one hop per pass. */
-                    if (vexpr && vexpr->kind == NODE_CALL && vexpr->call.callee &&
-                        vexpr->call.callee->kind == NODE_IDENT) {
+                    /* BUG-1317: iterate — the substituted argument may itself be
+                     * a call with a param-view summary (`return tr(tl(s));`), or a
+                     * temp defined by one. One hop left `tb(s)` unresolved, the
+                     * caller registered `t = tb(s)` as a fresh allocation, and
+                     * lib/str.zer's `bytes_trim` was a false "never freed". */
+                    for (int hop = 0; hop < 16 && vexpr && match_param < 0; hop++) {
+                    if (vexpr->kind == NODE_IDENT) {
+                        int tl = ir_find_local_exact_first(func, vexpr->ident.name,
+                                                           (uint32_t)vexpr->ident.name_len);
+                        if (tl < 0 || tl >= func->local_count || !func->locals[tl].is_temp) break;
+                        Node *d = ir_local_def_expr(func, NULL, tl);
+                        if (d && d->kind == NODE_ASSIGN && d->assign.value) d = d->assign.value;
+                        d = d ? ir_peel_launder(d) : NULL;
+                        if (!d || d == vexpr || d->kind != NODE_CALL) break;
+                        vexpr = d;
+                    }
+                    if (!(vexpr->kind == NODE_CALL && vexpr->call.callee &&
+                          vexpr->call.callee->kind == NODE_IDENT)) break;
+                    {
                         const char *hn = vexpr->call.callee->ident.name;
                         uint32_t hnl = (uint32_t)vexpr->call.callee->ident.name_len;
                         FuncSummary *hs = NULL;
@@ -12371,8 +12426,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                                         if (pl >= 0 && pl == hroot) { match_param = pi; break; }
                                     }
                                 }
+                                continue;   /* next hop on the substituted argument */
                             }
                         }
+                        break;
+                    }
                     }
 
                     /* (c3) 2026-08-06 — FIELD OF A BY-VALUE PARAM. `*B get(K k)
@@ -12813,6 +12871,26 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         }
         if (real_return_count == 0) ret_is_content_final = false;
 
+        /* BUG-1311: does every live return read ONE global key (or null)? */
+        const char *rgk = NULL; uint32_t rgk_len = 0;
+        {
+            bool ok = true; int nret = 0;
+            for (int bi = 0; bi < func->block_count && ok; bi++) {
+                IRBlock *bb = &func->blocks[bi];
+                if (!ir_block_is_live_return(func, bi)) continue;
+                IRInst *last = &bb->insts[bb->inst_count - 1];
+                if (last->src1_local < 0 && !last->expr) continue;
+                Node *ve = ir_return_value_expr(func, last);
+                Node *pv = ve ? ir_peel_launder(ve) : NULL;
+                if (pv && pv->kind == NODE_NULL_LIT) continue;
+                const char *k; uint32_t kl;
+                if (!ve || !ir_value_global_key(zc, func, ve, &k, &kl)) { ok = false; break; }
+                if (rgk && (kl != rgk_len || memcmp(k, rgk, kl) != 0)) { ok = false; break; }
+                rgk = k; rgk_len = kl; nret++;
+            }
+            if (!ok || nret == 0) { rgk = NULL; rgk_len = 0; }
+        }
+
         /* BUG-1241: direct `param.f.g = param` stores. */
         int pst_n = 0;
         struct ZcParamStore *pst = ir_collect_param_stores(zc, func, &pst_n);
@@ -12859,6 +12937,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->param_store_n != pst_n) changed = true;          /* BUG-1241 */
             if (existing->polls_n != pol_n) changed = true;                /* BUG-1243 */
             if (existing->frees_param_elems != elem_frees) changed = true;  /* BUG-1300 */
+            if (existing->ret_global_key_len != rgk_len ||
+                (rgk_len && memcmp(existing->ret_global_key, rgk, rgk_len) != 0))
+                changed = true;                                              /* BUG-1311 */
             for (int k = 0; !changed && k < rf_n; k++)
                 if (existing->ret_field[k].param != rf[k].param ||
                     existing->ret_field[k].must != rf[k].must ||
@@ -12867,6 +12948,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     changed = true;
             if (changed) {
                 existing->frees_param_elems = elem_frees;   /* BUG-1300 */
+                existing->ret_global_key = rgk;             /* BUG-1311 */
+                existing->ret_global_key_len = rgk_len;
                 existing->param_store_n = pst_n;
                 existing->param_store = pst;
                 existing->polls_n = pol_n;
@@ -12933,6 +13016,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->polls_n = pol_n;
                 s->polls = pol;
                 s->frees_param_elems = elem_frees;   /* BUG-1300 */
+                s->ret_global_key = rgk;             /* BUG-1311 */
+                s->ret_global_key_len = rgk_len;
             } else {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);

@@ -30,6 +30,42 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-26 memory round (BUG-1350..1355; measured)
+
+1. **A store THROUGH A GLOBAL POINTER into the global it points at is untracked** (MEDIUM —
+   accept-unsafe, found while closing BUG-1352, pre-existing in BOTH spellings).
+   `?*T slot; *?*T gpp = &slot;` then `*gpp = a; free(a); rd()` (rd reads `slot`) returns
+   the recycled object's value (exit 99), and so does the callee spelling `void reg(*T p) {
+   *gpp = p; }`. The direct store has no key (`ir_extract_compound_key` does not follow a
+   deref), and the store summary deliberately refuses `*global` (it names memory that is not
+   the global's own storage). Fix sketch: resolve `*gpp` to the slot BUG-1242/1289 mint for a
+   pointer defined ONCE (`global_name_never_mutated`), at the IR_ASSIGN store and in
+   `ir_ps_target_rec`; otherwise treat the store as a global store of unknown key.
+2. **A callee store with TWO unnameable indices on one path is refused** (LOW — loud
+   over-rejection). `void put(*S s, *T p, u32 i, u32 j) { s.m[i].row[j].p = p; }` — the
+   caller's wildcard slot is keyed at the LAST index only, so no read could meet the entry;
+   the call site reports it (BUG-1351). Store through one index, or index the outer level
+   with a literal.
+3. **A struct-valued call whose field views name DIFFERENT params does not resolve as a view
+   source** (LOW — same class as the BUG-849 multi-view rule, not yet taught here).
+   `unwrap(two(a, b))` where `two` returns `{ .p = a, .q = b }` and unwrap returns one
+   field: the result aliases nothing, so it is registered as a fresh allocation (a false
+   leak, and a free through it is not attributed). Fix sketch: a multi-view set from the
+   union of the ret_field params, as `ir_fill_multiview_set` does for a bare mask.
+4. **A callee that frees a field and stores a new value in it marks the caller's field
+   freed** (LOW — over-rejection, the pre-existing field-widening coarseness, now also on
+   the "maybe" path, BUG-1354). `re(&h); free(h.p);` is refused although `h.p` holds the new
+   allocation. The summary does not say what the callee stored after the free; the store
+   summary (BUG-1351) only records PARAM values. Fix sketch: record "field f of param i is
+   REPLACED by a fresh allocation" and register it at the call site.
+5. **A node freed while a field still holds a live allocation is reported at EXIT, not at
+   the free** (LOW — wrong position, BUG-1355): `n.p = a; free(n);` says "'a' never freed"
+   at the return. And an orelse fallback that returns while such a node is alive now reports
+   the field's allocation as leaked there, where it used to be (wrongly) escaped — free the
+   node in the fallback, or build the node after the last early exit.
+
+---
+
 ## OPEN — residuals of the 2026-09-25f audit (BUG-1308..1325; measured)
 
 1. **`lib/` does not compile as shipped** (LOW — loud). `fmt.zer` calls `fmt_u64`/`fmt_i64`

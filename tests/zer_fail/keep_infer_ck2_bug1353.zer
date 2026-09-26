@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy
+// BUG-1353: PT[1] t; t[0].p = p; s.data[1] = t[0]; (s points at a global)
+struct PT { ?*u32 p; }
+struct S { ?*u32 p; PT[2] data; }
+S g;
+void put(*S s, *u32 p) { PT[1] t; t[0].p = p; s.data[1] = t[0]; }
+void f() { u32 x = 42; put(&g, &x); }
+u32 clobber() { u32[8] y; for (u32 i = 0; i < 8; i += 1) { y[i] = 7; } return y[3]; }
+u32 main() {
+    f();
+    clobber();
+    u32 r = 0;
+    if (g.p) |q| { r += *q; }
+    if (g.data[1].p) |q| { r += *q; }
+    return r;
+}

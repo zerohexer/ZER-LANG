@@ -1,0 +1,16 @@
+// BUG-1330 boundary: a VALUE capture of a shared struct's optional is a copy taken
+// under the condition's lock — allowed; write back as its own statement.
+struct P { u32 x; }
+shared struct S { ?P o; u32 n; }
+S g;
+u32 main() {
+    g.o = { .x = 4 };
+    if (g.o) |v| {
+        P w = v;
+        w.x += 1;
+        g.o = w;
+    }
+    u32 out = 0;
+    if (g.o) |r| { out = r.x; }
+    return out - 5;
+}

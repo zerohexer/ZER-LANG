@@ -1,0 +1,42 @@
+// BUG-1340: `|*pp|` of a `?*T` (a null-sentinel optional: its storage IS the
+// pointer) must bind the address OF the optional. It emitted `pp = o;`, so
+// `*pp = &gu` wrote a pointer into gt's own bytes (memory corruption).
+struct T { u32 v; }
+struct H { ?*T p; u32 pad; }
+T gt;
+T gu;
+?*T gopt;
+H gh;
+u32 one(u32 x) { return 1; }
+u32 two(u32 x) { return 2; }
+u32 main() {
+    gt.v = 5;
+    gu.v = 8;
+    ?*T o = &gt;
+    if (o) |*pp| { *pp = &gu; }
+    *T r = o orelse return;
+    if (r.v != 8 || gt.v != 5) { return 1; }
+    gopt = &gt;
+    if (gopt) |*pg| { *pg = &gu; }
+    *T r1 = gopt orelse return;
+    if (r1.v != 8) { return 2; }
+    gh.p = &gt;
+    gh.pad = 77;
+    if (gh.p) |*q| { *q = &gu; }
+    *T r2 = gh.p orelse return;
+    if (r2.v != 8 || gh.pad != 77) { return 3; }
+    H[2] hs;
+    hs[1].p = &gt;
+    if (hs[1].p) |*q2| { *q2 = &gu; }
+    *T r3 = hs[1].p orelse return;
+    if (r3.v != 8) { return 4; }
+    ?*(u32) -> u32 f = one;
+    if (f) |*pf| { *pf = two; }
+    *(u32) -> u32 g = f orelse return;
+    if (g(0) != 2) { return 5; }
+    ?*T o2 = &gt;
+    u32 b = 0;
+    if (o2) |*qq| { b = (*qq).v; }
+    if (b != 5) { return 6; }
+    return 0;
+}

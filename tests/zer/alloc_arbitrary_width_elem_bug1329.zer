@@ -1,0 +1,14 @@
+// BUG-1329: alloc(uN, n) / alloc(iN, n) — "undefined identifier 'u3'" before.
+u32 main() {
+    [*]u3 s = alloc(u3, 4) orelse return;
+    s[0] = 7;
+    u3 v = s[0] + 1;
+    free(s);
+    if (v != 0) { return 2; }
+    [*]i48 t = alloc(i48, 2) orelse return;
+    t[1] = -5;
+    i48 w = t[1];
+    free(t);
+    if (w != -5) { return 4; }
+    return 0;
+}

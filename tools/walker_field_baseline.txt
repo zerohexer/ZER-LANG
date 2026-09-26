@@ -1365,6 +1365,9 @@ checker.c:union_path_has_side_effect:NODE_WHILE:while_stmt.cond
 # 2026-09-23g: emit_defer_stmt's NODE_ASM arm hands the whole node to emit_structured_asm,
 # which walks inputs/outputs itself. (The audit started seeing this function once the
 # emitter's brace-in-string layout around the new load-guard helpers changed.)
+# 2026-09-26: re-exposed by the brace-bearing strings of emit_array_assign (BUG-1344).
+emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.inputs
+emitter.c:emit_defer_stmt:NODE_ASM:asm_stmt.outputs
 # --- ir_lower.c: lower_may_write / index_clobbered_by / hoist_target_indices (BUG-1179/1184) ---
 # Early-ANSWER walkers: a call/assign/orelse/intrinsic answers TRUE at the node
 # (its children cannot make the answer more true), statement kinds answer the

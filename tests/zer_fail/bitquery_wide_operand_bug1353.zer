@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: takes an operand of at most 64 bits
+// BUG-1353: @ctz / @popcount / @clz / @ffs / @parity silently used the low 64 bits
+// of a u65..u128 operand (@ctz(1 << 70) was 64).
+u32 main() { u128 one = 1; u128 w = one << 70; return @ctz(w); }

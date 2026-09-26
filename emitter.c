@@ -110,6 +110,11 @@ static int zer_is_hex(char c) {
 }
 static void emit_c_string_text(Emitter *e, const char *t, int n) {
     for (int i = 0; i < n; i++) {
+        /* BUG-1350: `??` starts a C TRIGRAPH and the driver compiles with
+         * -std=c99, which translates them: "??=" became "#" (.len 3 -> a
+         * 1-byte string plus sizeof 2) and "??/" a backslash that escaped the
+         * next character. `\?` is the same byte and never starts one. */
+        if (t[i] == '?') { fputs("\\?", e->out); continue; }
         if (t[i] != '\\' || i + 1 >= n) { fputc(t[i], e->out); continue; }
         char esc = t[i + 1];
         if (esc == 'x') {
@@ -407,6 +412,23 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
      * SField.is_volatile for each field access. Handles: dev.regs where
      * dev is non-volatile but regs field is volatile u8[4]. */
     Node *n = expr;
+    /* BUG-1344: an access THROUGH a volatile pointer / volatile slice is volatile
+     * at every step — `r.fifo` / `r[i].fifo` for `volatile *Regs r`, `vs[i]` for a
+     * `volatile [*]T`. The field walk below only knew volatile FIELDS and the root
+     * symbol, so a whole-array copy out of a peripheral became a plain memmove. */
+    for (Node *w = expr; w; ) {
+        Node *obj = NULL;
+        if (w->kind == NODE_FIELD) obj = w->field.object;
+        else if (w->kind == NODE_INDEX) obj = w->index_expr.object;
+        else if (w->kind == NODE_UNARY && w->unary.op == TOK_STAR) obj = w->unary.operand;
+        else break;
+        Type *ot = obj ? checker_get_type(e->checker, obj) : NULL;
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (oe && oe->kind == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
+        if (oe && oe->kind == TYPE_POINTER && oe->pointer.is_volatile) return true;
+        if (oe && oe->kind == TYPE_SLICE && oe->slice.is_volatile) return true;
+        w = obj;
+    }
     while (n && n->kind == NODE_FIELD) {
         Type *obj_type = checker_get_type(e->checker, n->field.object);
         if (obj_type) {
@@ -726,6 +748,18 @@ static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
          * `__typeof__(...)` + one initialiser, so the bounds check inside
          * the index emitter still evaluates exactly once. */
         emit_rewritten_node(e, inst->expr->call.callee, func);
+    } else if (inst->expr && inst->expr->kind == NODE_CALL && inst->expr->call.callee &&
+               (inst->expr->call.callee->kind == NODE_CALL ||
+                inst->expr->call.callee->kind == NODE_ORELSE ||
+                (inst->expr->call.callee->kind == NODE_UNARY &&
+                 inst->expr->call.callee->unary.op == TOK_STAR))) {
+        /* BUG-1356: a function pointer produced by an EXPRESSION — `sel(1)(5)`,
+         * `(fa orelse fb)(x)`, `(*pf)(x)` — aborted the compiler ("INTERNAL ERROR:
+         * emitter cannot lower this callee expression"). The callee is one value;
+         * the BUG-1019 null guard evaluates this text exactly once. */
+        emit(e, "(");
+        emit_rewritten_node(e, inst->expr->call.callee, func);
+        emit(e, ")");
     } else {
         emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
     }
@@ -997,14 +1031,24 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len
  * `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);`, which GCC
  * refuses. Split as head / params / tail so each caller keeps its own name
  * spelling (the IR path mangles from IRFunc, the prototype from the AST). */
+/* BUG-1357: a NULLABLE function pointer return (`?*(u32) -> u32 f()`) is the same
+ * C pointer (null sentinel) and needs the same declarator; it was emitted as
+ * `uint32_t (*)(uint32_t) f(...)`, which GCC refused. Returns the funcptr Type. */
+static Type *func_ret_funcptr_type(Type *ret) {
+    Type *r = ret ? type_unwrap_distinct(ret) : NULL;
+    if (r && r->kind == TYPE_OPTIONAL && r->optional.inner &&
+        is_null_sentinel(r->optional.inner))
+        r = type_unwrap_distinct(r->optional.inner);
+    return (r && r->kind == TYPE_FUNC_PTR) ? r : NULL;
+}
 static bool func_ret_is_funcptr(Type *ret, bool main_promote) {
-    return !main_promote && ret && type_dispatch_kind(ret) == TYPE_FUNC_PTR;
+    return !main_promote && func_ret_funcptr_type(ret) != NULL;
 }
 static void emit_func_decl_head(Emitter *e, Type *ret, bool main_promote) {
     if (main_promote) {
         emit(e, "int ");
     } else if (func_ret_is_funcptr(ret, main_promote)) {
-        emit_type(e, type_unwrap_distinct(ret)->func_ptr.ret);
+        emit_type(e, func_ret_funcptr_type(ret)->func_ptr.ret);
         emit(e, " (*");
     } else if (ret) {
         emit_type(e, ret);
@@ -1024,6 +1068,21 @@ static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
             Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
                           (uint32_t)i < func_type->func_ptr.param_count) ?
                 func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            /* BUG-1345: an ARRAY parameter's qualifier lives only on its type node
+             * (an array Type carries none), and C needs it on the element:
+             * `volatile u32[4] a` must be `volatile uint32_t a[4]`, or every
+             * access in the callee goes through a plain pointer. */
+            if (type_dispatch_kind(ptype) == TYPE_ARRAY) {
+                bool pv = false, pc = false;
+                TypeNode *qt = p->type;
+                for (int d = 0; qt && d < 16 &&
+                     (qt->kind == TYNODE_CONST || qt->kind == TYNODE_VOLATILE); d++) {
+                    if (qt->kind == TYNODE_CONST) pc = true; else pv = true;
+                    qt = qt->qualified.inner;
+                }
+                if (pc) emit(e, "const ");
+                if (pv) emit(e, "volatile ");
+            }
             emit_type_and_name(e, ptype, p->name, p->name_len);
         }
         if (fn->func_decl.is_variadic) emit(e, ", ...");
@@ -1032,7 +1091,7 @@ static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
 }
 static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
     if (!func_ret_is_funcptr(ret, main_promote)) return;
-    Type *r = type_unwrap_distinct(ret);
+    Type *r = func_ret_funcptr_type(ret);
     emit(e, ")(");
     if (r->func_ptr.param_count == 0) emit(e, "void");
     for (uint32_t i = 0; i < r->func_ptr.param_count; i++) {
@@ -2583,6 +2642,39 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* BUG-1341: a POINTER to a function pointer (`**(u32) -> u32 pp`, the
+     * `|*pf|` capture of a `?funcptr`) needs the stars INSIDE the declarator:
+     * `ret (**name)(params)`. The generic pointer path emitted the abstract
+     * funcptr type followed by `*` and the name — `uint32_t (*)(uint32_t)* pp`,
+     * not C — so every such declaration failed in GCC. */
+    {
+        int fp_stars = 0;
+        Type *cur = type_unwrap_distinct(t);
+        while (cur) {
+            if (cur->kind == TYPE_OPTIONAL && cur->optional.inner &&
+                is_null_sentinel(cur->optional.inner)) {
+                cur = type_unwrap_distinct(cur->optional.inner);
+            } else if (cur->kind == TYPE_POINTER && cur->pointer.inner) {
+                fp_stars++;
+                cur = type_unwrap_distinct(cur->pointer.inner);
+            } else {
+                break;
+            }
+        }
+        if (fp_stars > 0 && cur && cur->kind == TYPE_FUNC_PTR) {
+            emit_type(e, cur->func_ptr.ret);
+            emit(e, " (*");
+            for (int si = 0; si < fp_stars; si++) emit(e, "*");
+            emit(e, "%.*s)(", (int)name_len, name);
+            for (uint32_t i = 0; i < cur->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, cur->func_ptr.params[i]);
+            }
+            emit(e, ")");
+            return;
+        }
+    }
+
     /* function pointer: ret (*name)(param1, param2, ...) */
     if (t->kind == TYPE_FUNC_PTR) {
         emit_type(e, t->func_ptr.ret);
@@ -2759,6 +2851,15 @@ typedef void (*EmitNodeFn)(Emitter *, Node *, IRFunc *);
 static void emit_bitslice_set(Emitter *e, Node *node, IRFunc *func, EmitNodeFn sub);   /* BUG-1198 */
 static bool lvalue_through_packed(Emitter *e, Node *lv);   /* BUG-1324 */
 static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f);
+/* BUG-1344: ONE emitter for a whole-array assignment `dst = src`, both paths.
+ * Plain arrays: memmove (overlap-safe, BUG-306). When either side is volatile the
+ * copy is ELEMENT-wise at the array's innermost element type, through volatile
+ * pointers — never memmove (which drops the qualifier: -O2 merged 32-bit
+ * registers into 64-bit accesses, deleted the first of two writes, and hoisted a
+ * poll loop into `jmp .`) and never a byte loop (a 32-bit FIFO register read as
+ * four byte accesses is four different reads on most peripherals). */
+static void emit_array_assign(Emitter *e, Type *arr_t, Node *dst, Node *src,
+                              bool is_volatile, IRFunc *func, EmitNodeFn en);
 static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en) {
     Node *tgt = node->assign.target;
     Type *nn_t = tgt ? checker_get_type(e->checker, tgt) : NULL;
@@ -2997,6 +3098,41 @@ static void emit_expr(Emitter *e, Node *node) {
     if (ur) emit(e, ")");
     if (asg_paren) emit(e, ")");
     e->nn_lvalue = saved_lv;
+}
+
+static void emit_array_assign(Emitter *e, Type *arr_t, Node *dst, Node *src,
+                              bool is_volatile, IRFunc *func, EmitNodeFn en) {
+    int tmp = e->temp_count++;
+    if (!is_volatile) {
+        emit(e, "({ __typeof__(");
+        en(e, dst, func);
+        emit(e, ") *_zer_ma%d = &(", tmp);
+        en(e, dst, func);
+        emit(e, "); memmove(_zer_ma%d, ", tmp);
+        en(e, src, func);
+        emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+        return;
+    }
+    Type *elem = type_unwrap_distinct(arr_t);
+    while (elem && elem->kind == TYPE_ARRAY) elem = type_unwrap_distinct(elem->array.inner);
+    emit(e, "({ volatile ");
+    emit_type(e, elem);
+    emit(e, " *_zer_vd%d = (volatile ", tmp);
+    emit_type(e, elem);
+    emit(e, " *)&(");
+    en(e, dst, func);
+    emit(e, "); const volatile ");
+    emit_type(e, elem);
+    emit(e, " *_zer_vs%d = (const volatile ", tmp);
+    emit_type(e, elem);
+    emit(e, " *)&(");
+    en(e, src, func);
+    emit(e, "); for (size_t _zer_vi%d = 0; _zer_vi%d < sizeof(", tmp, tmp);
+    en(e, dst, func);
+    emit(e, ") / sizeof(");
+    emit_type(e, elem);
+    emit(e, "); _zer_vi%d++) _zer_vd%d[_zer_vi%d] = _zer_vs%d[_zer_vi%d]; })",
+         tmp, tmp, tmp, tmp, tmp);
 }
 
 static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f) {
@@ -3391,25 +3527,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* BUG-273/320: check if target OR source is volatile — use byte loop */
                 bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
                                     expr_is_volatile(e, node->assign.value);
-                int tmp = e->temp_count++;
-                if (arr_volatile) {
-                    emit(e, "({ volatile uint8_t *_zer_vd%d = (volatile uint8_t*)&(", tmp);
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); const volatile uint8_t *_zer_vs%d = (const volatile uint8_t*)&(", tmp);
-                    emit_expr(e, node->assign.value);
-                    emit(e, "); for (size_t _i = 0; _i < sizeof(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); _i++) _zer_vd%d[_i] = _zer_vs%d[_i]; })", tmp, tmp);
-                } else {
-                    emit(e, "({ __typeof__(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, ") *_zer_ma%d = &(", tmp);
-                    emit_expr(e, node->assign.target);
-                    /* BUG-306: use memmove for overlap-safe self-assignment */
-                    emit(e, "); memmove(_zer_ma%d, ", tmp);
-                    emit_expr(e, node->assign.value);
-                    emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
-                }
+                emit_array_assign(e, tgt_type, node->assign.target, node->assign.value,
+                                  arr_volatile, NULL, emit_node_via_ast);   /* BUG-1344 */
                 goto assign_done;
             }
         }
@@ -4143,13 +4262,16 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* Single-eval lvalue path: pointer dereference preserves lvalue.
                  * *({ size_t _i = idx; check(_i); &arr[_i]; }) */
                 int tmp = e->temp_count++;
-                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                /* BUG-1349: parenthesised — a postfix `[j]` / `.f` binds tighter
+                 * than unary `*`, so a bare `*({...})[j]` indexed the POINTER:
+                 * `m[id(1)][2] = 7` wrote m[3][0]. */
+                emit(e, "(*({ size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
                 emit_array_size(e, idx_obj_type);
                 emit(e, ", __FILE__, __LINE__); &");
                 emit_expr(e, node->index_expr.object);
-                emit(e, "[_zer_idx%d]; })", tmp);
+                emit(e, "[_zer_idx%d]; }))", tmp);
             } else {
                 /* Simple index — comma operator, preserves lvalue */
                 emit(e, "(_zer_bounds_check((size_t)(");
@@ -4167,7 +4289,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* hoist both object and index for single-eval.
                  * A18: use __typeof__ to preserve volatile (BUG-319 pattern). */
                 int tmp = e->temp_count++;
-                emit(e, "*({ __typeof__(");
+                emit(e, "(*({ __typeof__(");   /* BUG-1349 */
                 emit_expr(e, node->index_expr.object);
                 emit(e, ") _zer_obj%d = ", tmp);
                 emit_expr(e, node->index_expr.object);
@@ -4175,7 +4297,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit_expr(e, node->index_expr.index);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, __FILE__, __LINE__); &",
                      tmp, tmp);
-                emit(e, "_zer_obj%d.ptr[_zer_idx%d]; })", tmp, tmp);
+                emit(e, "_zer_obj%d.ptr[_zer_idx%d]; }))", tmp, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_expr(e, node->index_expr.index);
@@ -6034,6 +6156,23 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
  * NODE_INTERRUPT). For interrupts, the GCC `interrupt` attribute is
  * emitted by the IR path's existing inline code — this helper covers
  * regular function attributes. */
+/* The ONE interrupt-handler signature (prototype and definition). BUG-1347:
+ * the `as "SYMBOL"` clause was parsed and never read — `interrupt UART_1 as
+ * "USART1_IRQHandler"` emitted `UART_1_IRQHandler`, so the vector table's weak
+ * default stayed linked and the handler never ran, with no diagnostic anywhere.
+ * BUG-1346: `section(...)` on an interrupt is honoured here too. */
+static void emit_isr_signature(Emitter *e, Node *isr) {
+    emit(e, "void __attribute__((interrupt, used");
+    if (isr->interrupt.section)
+        emit(e, ", section(\"%.*s\")", (int)isr->interrupt.section_len,
+             isr->interrupt.section);
+    emit(e, ")) ");
+    if (isr->interrupt.as_name)
+        emit(e, "%.*s(void)", (int)isr->interrupt.as_name_len, isr->interrupt.as_name);
+    else
+        emit(e, "%.*s_IRQHandler(void)", (int)isr->interrupt.name_len, isr->interrupt.name);
+}
+
 static void emit_func_attributes(Emitter *e, Node *fn) {
     if (!fn || fn->kind != NODE_FUNC_DECL) return;
     if (fn->func_decl.section) {
@@ -6959,8 +7098,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
              * .S/linker script the C TU never sees; without `used`,
              * `gcc -ffunction-sections -Wl,--gc-sections` silently tree-shakes
              * the handler and the vector slot keeps its default trap. */
-            emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void);\n",
-                 (int)decl->interrupt.name_len, decl->interrupt.name);
+            emit_isr_signature(e, decl);
+            emit(e, ";\n");
         }
         break;
 
@@ -7101,6 +7240,22 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#  define _ZER_HOSTED __STDC_HOSTED__\n");
     emit(e, "#else\n");
     emit(e, "#  define _ZER_HOSTED 1\n");
+    emit(e, "#endif\n");
+    /* BUG-1342: "hosted" in the C sense is NOT "runs in user mode". A bare-metal
+     * newlib toolchain (riscv*-unknown-elf, aarch64-none-elf, arm-none-eabi on an
+     * A/R core) reports __STDC_HOSTED__ == 1 unless -ffreestanding is passed, and
+     * most SDKs do not pass it — so `@critical` there took the FENCE arm and never
+     * masked an interrupt: the ISR read-modify-write the checker had told the user
+     * to wrap in `@critical` lost updates in silence. User mode is the conjunction
+     * the privileged arms actually need to rule out: a hosted implementation AND an
+     * operating system to be hosted by. */
+    emit(e, "#if _ZER_HOSTED && (defined(__linux__) || defined(__unix__) || "
+            "defined(__APPLE__) || defined(_WIN32) || defined(__CYGWIN__) || "
+            "defined(__wasi__) || defined(__FreeBSD__) || defined(__NetBSD__) || "
+            "defined(__OpenBSD__) || defined(__HAIKU__))\n");
+    emit(e, "#  define _ZER_USER_MODE 1\n");
+    emit(e, "#else\n");
+    emit(e, "#  define _ZER_USER_MODE 0\n");
     emit(e, "#endif\n");
     /* C99 4.6 guarantees stdint.h and stddef.h on a FREESTANDING implementation
      * too, so they stay outside the gate. */
@@ -7530,12 +7685,18 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * carrier test `sizeof(a) * 8` stays as well: the ZER width alone would let a
      * count reach an operand C has narrower than the ZER type claims, and a C
      * shift by >= its operand's width is undefined. */
+    /* BUG-1352: a count WIDER than 64 bits (a u128 shift count) was narrowed by
+     * the (int64_t) casts — `x << ((1 << 64) + 1)` shifted by 1 (UBSan: shift
+     * exponent too large). A count that does not survive the round trip through
+     * int64_t is out of range by definition, so it is the "0" case. */
     emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "((__typeof__(_b))(int64_t)_b != _b || "
+            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
             "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) << _b; })\n");
     emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "((__typeof__(_b))(int64_t)_b != _b || "
+            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
             "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
@@ -9104,14 +9265,14 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
-                emit(e, "*({ __typeof__(");
+                emit(e, "(*({ __typeof__(");   /* BUG-1349 */
                 emit_rewritten_node(e, node->index_expr.object, func);
                 emit(e, ") _zer_obj%d = ", tmp);
                 emit_rewritten_node(e, node->index_expr.object, func);
                 emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
                 emit_rewritten_node(e, node->index_expr.index, func);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, "
-                       "__FILE__, __LINE__); &_zer_obj%d.ptr[_zer_idx%d]; })",
+                       "__FILE__, __LINE__); &_zer_obj%d.ptr[_zer_idx%d]; }))",
                      tmp, tmp, tmp, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
@@ -9151,13 +9312,37 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
              * expressions use single-eval `*({...})` to avoid double-eval. */
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
-                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                /* BUG-1349: the OBJECT is evaluated first (left to right) when it
+                 * has a side effect of its own — `s.m[t(1)][t(2)]` ran t(2) first. */
+                /* only for an lvalue object — `&(f().arr)` is not C */
+                bool obj_hoist = obj_se;
+                {
+                    Node *b = node->index_expr.object;
+                    while (b && (b->kind == NODE_FIELD || b->kind == NODE_INDEX))
+                        b = b->kind == NODE_FIELD ? b->field.object : b->index_expr.object;
+                    if (!b || !(b->kind == NODE_IDENT ||
+                                (b->kind == NODE_UNARY && b->unary.op == TOK_STAR)))
+                        obj_hoist = false;
+                }
+                if (obj_hoist) {
+                    emit(e, "(*({ __typeof__(");
+                    emit_rewritten_node(e, node->index_expr.object, func);
+                    emit(e, ") *_zer_iob%d = &(", tmp);
+                    emit_rewritten_node(e, node->index_expr.object, func);
+                    emit(e, "); size_t _zer_idx%d = (size_t)(", tmp);
+                } else {
+                    emit(e, "(*({ size_t _zer_idx%d = (size_t)(", tmp);
+                }
                 emit_rewritten_node(e, node->index_expr.index, func);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
                 emit_array_size(e, idx_obj_eff);
                 emit(e, ", __FILE__, __LINE__); &");
-                emit_rewritten_node(e, node->index_expr.object, func);
-                emit(e, "[_zer_idx%d]; })", tmp);
+                if (obj_hoist) {
+                    emit(e, "(*_zer_iob%d)", tmp);
+                } else {
+                    emit_rewritten_node(e, node->index_expr.object, func);
+                }
+                emit(e, "[_zer_idx%d]; }))"  /* BUG-1349 */, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_rewritten_node(e, node->index_expr.index, func);
@@ -9305,14 +9490,10 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         }
         /* Array assignment — memcpy/byte-loop */
         if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {
-            int tmp = e->temp_count++;
-            emit(e, "({ __typeof__(");
-            emit_rewritten_node(e, node->assign.target, func);
-            emit(e, ") *_zer_ma%d = &(", tmp);
-            emit_rewritten_node(e, node->assign.target, func);
-            emit(e, "); memmove(_zer_ma%d, ", tmp);
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+            bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
+                                expr_is_volatile(e, node->assign.value);
+            emit_array_assign(e, tgt_eff, node->assign.target, node->assign.value,
+                              arr_volatile, func, emit_rewritten_node);   /* BUG-1344 */
             return;
         }
         /* Shared struct locking — emit lock + assign + unlock */
@@ -11488,7 +11669,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 "#elif defined(__ARM_ARCH)\n"
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr cpsr_c, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
                 "#elif defined(__riscv)\n"
-                "    { unsigned long _zer_m = (unsigned long)_zer_rstate; __asm__ __volatile__ (\"csrw mstatus, %0\" :: \"r\"(_zer_m) : \"memory\"); }\n"
+                "    { unsigned long _zer_m = (unsigned long)_zer_rstate & 8UL; __asm__ __volatile__ (\"csrc mstatus, %0\\n\\tcsrs mstatus, %1\" :: \"r\"(8UL), \"r\"(_zer_m) : \"memory\"); } /* BUG-1348: MIE only */\n"
                 "#else\n"
                 "    (void)_zer_rstate;\n"
                 "#endif\n"
@@ -13235,11 +13416,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask) :: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uint64_t _zer_daif; __asm__ __volatile__(\"mrs %%0, daif\\n\\tmsr daifset, #2\" : \"=r\"(_zer_daif) :: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uint32_t _zer_cpsr; __asm__ __volatile__(\"mrs %%0, cpsr\\n\\tcpsid i\" : \"=r\"(_zer_cpsr) :: \"memory\");\n");
         emit_indent(e);
@@ -13247,7 +13428,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\" ::: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus) :: \"memory\");\n");
         emit_indent(e);
@@ -13257,7 +13438,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * __STDC_HOSTED__ == 0 (freestanding) + x86 arch macro. On
          * hosted user-mode x86, cli/sti would SIGSEGV (CPL != 0), so
          * the fence-only fallback is correct there. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uintptr_t _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
         emit_indent(e);
@@ -13284,11 +13465,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr daif, %%0\" :: \"r\"(_zer_daif) : \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr cpsr_c, %%0\" :: \"r\"(_zer_cpsr) : \"memory\");\n");
         emit_indent(e);
@@ -13298,13 +13479,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * complete before interrupts return (SREG= is not a compiler barrier). */
         emit(e, "__asm__ __volatile__(\"\" ::: \"memory\"); SREG = _zer_sreg;\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
-        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus) : \"memory\");\n");
+        /* BUG-1348: restore ONLY MIE (bit 3), the one bit csrrci cleared. A full
+         * `csrw mstatus, saved` reverted everything the block changed — FS=Dirty
+         * set by FP use went back to Clean, so a lazy-FPU context switch skipped
+         * saving the FP registers. `csrs` of the saved MIE bit is exact: set when
+         * it was set, untouched (still clear) when it was not — nesting-safe. */
+        emit(e, "__asm__ __volatile__(\"csrs mstatus, %%0\" :: \"r\"(_zer_mstatus & 8UL) : \"memory\");\n");
         emit_indent(e);
         /* Gap 10 fix: restore EFLAGS on bare-metal x86. The push/pop
          * order matches IR_CRITICAL_BEGIN's save/disable sequence. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"push %%0\\n\\tpopf\" :: \"r\"(_zer_x86_flags) : \"memory\", \"cc\");\n");
         emit_indent(e);
@@ -13994,6 +14180,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                      type_dispatch_kind(src_eff->pointer.inner) == TYPE_OPTIONAL &&
                                      !is_null_sentinel(type_unwrap_distinct(src_eff->pointer.inner)->optional.inner));
 
+            /* BUG-1340: the same two captures when the optional is a NULL SENTINEL
+             * (`?*T`, `?funcptr`) — its storage IS the pointer, so `|*pp|` is the
+             * optional's own address. Fell through to the plain copy `pp = o;`,
+             * binding a `T **` to the POINTEE's address: `*pp = &other` wrote a
+             * pointer into the object's bytes (measured: a 4-byte struct global
+             * overwritten, the neighbour clobbered). A VALUE capture `|p|` has
+             * dst type `*T` = the inner itself, never `**T`, so the type test is
+             * what tells the two apart. */
+            bool need_ns_addr_capture = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                                     is_null_sentinel(src_eff->optional.inner) &&
+                                     dst_eff->pointer.inner &&
+                                     type_equals(dst_eff->pointer.inner, src_eff->optional.inner));
+            Type *src_pointee = (src_eff && type_dispatch_kind(src_eff) == TYPE_POINTER)
+                                ? type_unwrap_distinct(src_eff->pointer.inner) : NULL;
+            bool need_ns_addr_capture_via_ptr = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_pointee && type_dispatch_kind(src_pointee) == TYPE_OPTIONAL &&
+                                     is_null_sentinel(src_pointee->optional.inner) &&
+                                     dst_eff->pointer.inner &&
+                                     type_equals(dst_eff->pointer.inner, src_pointee->optional.inner));
+
             const char *sp = func->is_async ? "self->" : "";
 
             /* Array→array copy: use memcpy (C can't assign arrays).
@@ -14022,7 +14231,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->pointer.inner &&
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
-            if (need_addr_capture_via_ptr) {
+            if (need_ns_addr_capture) {                 /* BUG-1340 */
+                emit(e, "&%s%.*s;\n", sp, (int)src->name_len, src->name);
+            } else if (need_ns_addr_capture_via_ptr) {  /* BUG-1340 */
+                emit(e, "%s%.*s;\n", sp, (int)src->name_len, src->name);
+            } else if (need_addr_capture_via_ptr) {
                 emit(e, "&%s%.*s->value;\n",
                      sp, (int)src->name_len, src->name);
             } else if (need_addr_capture) {
@@ -14898,8 +15111,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* 8ezecl (copied): emit `used` so -ffunction-sections + --gc-sections
          * (mainstream embedded flags) cannot silently tree-shake the ISR — the
          * only reference is the vector table in a separate TU. */
-        emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void) {\n",
-             (int)fn->interrupt.name_len, fn->interrupt.name);
+        emit_isr_signature(e, fn);
+        emit(e, " {\n");
         e->indent++;
         e->current_func_ret = NULL;
     } else {

@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize 'x' of type 'u8'
+// BUG-1326 boundary: the exact-width rule never licenses a NEGATIVE value into an
+// unsigned destination — that is a sign conversion, not a fitting constant.
+u32 main() { u8 x = 0 - 5 / 1; return x; }

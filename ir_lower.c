@@ -3351,7 +3351,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
             if (has_capture && node->if_stmt.capture_is_ptr && lvalue &&
                 ce && type_dispatch_kind(ce) == TYPE_OPTIONAL &&
-                !type_is_null_sentinel(ce->optional.inner) &&
+                /* BUG-1340: a null-sentinel optional too — `|*pp|` of a `?*T`
+                 * field/global must point at THAT storage, not a temp copy. */
                 ce->optional.inner &&
                 type_dispatch_kind(ce->optional.inner) != TYPE_VOID) {
                 Node *amp = (Node *)arena_alloc(ctx->arena, sizeof(Node));

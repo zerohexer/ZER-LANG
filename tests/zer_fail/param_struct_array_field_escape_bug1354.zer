@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: cannot return an array of by-value parameter
+// BUG-1354: a by-value struct parameter is this frame's copy; its array field is not the caller's.
+// a by-value struct PARAMETER is a local copy; its array field coerced to a
+// slice and returned dangles (the same code on a local struct is refused)
+struct W { u32[4] a; }
+[*]u32 view(W w) { return w.a; }
+u32 clobber(u32 k) { u32[64] junk; for (u32 i = 0; i < 64; i += 1) { junk[i] = k; } return junk[5]; }
+u32 main() {
+    W w;
+    w.a[0] = 7;
+    [*]u32 s = view(w);
+    clobber(99);
+    return s[0];              // expected: rejected; actual: ASan stack-use-after-return
+}

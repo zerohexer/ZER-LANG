@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot capture an optional inside a shared struct by pointer
+// BUG-1330: the same capture through a *S parameter.
+struct P { u32 x; }
+shared struct S { ?P o; u32 n; }
+S g;
+void f(*S s) { if (s.o) |*v| { v.x += 1; } }
+u32 main() { f(&g); return 0; }

@@ -1,0 +1,21 @@
+// BUG-1352: a shift count wider than 64 bits (>= the width by any measure) gives 0;
+// the (int64_t) narrowing in _zer_shl/_zer_shr used to shift by the low bits.
+u128 mk() { u128 one = 1; return (one << 64) + 1; }
+u32 main() {
+    u128 n = mk();
+    u128 x = 3;
+    u128 r = x << n;
+    u128 q = x >> n;
+    u128 y = 3;
+    y <<= n;
+    u128 z = 3;
+    z >>= n;
+    u128 w = 5;
+    u128 v = w << n;
+    if (r != 0 || q != 0 || y != 0 || z != 0 || v != 0) { return 1; }
+    u128 k = 70;
+    u128 big = 1;
+    big <<= k;
+    if ((big >> 70) != 1) { return 2; }
+    return 0;
+}

@@ -1,0 +1,16 @@
+// BUG-1327: INT64_MIN / u64 2^63 is a real constant. The evaluator's "not a
+// constant" sentinel shared that bit pattern, so the tree below was refused and a
+// 2^63 divisor was "not proven nonzero".
+const u64 D = 9223372036854775808;
+u32 main() {
+    i64 m = -9223372036854775807 - 1;
+    if (m + 1 != -9223372036854775807) { return 1; }
+    u64 x = 18446744073709551615;
+    u64 q = x / D;
+    u64 d = 9223372036854775808;
+    u64 r = x / d;
+    u64 s = x / 9223372036854775808;
+    x /= 9223372036854775808;
+    if (q != 1 || r != 1 || s != 1 || x != 1) { return 2; }
+    return 0;
+}

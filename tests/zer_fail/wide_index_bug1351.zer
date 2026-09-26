@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: an index must be at most 64 bits wide
+// BUG-1351: a u128 index was narrowed to 64 bits by the bounds check AND the
+// access — `s[(1 << 64) + 1]` read s[1].
+u128 mk() { u128 one = 1; return (one << 64) + 1; }
+u32 rd([*]u32 s, u128 i) { return s[i]; }
+u32 main() { u32[4] arr; arr[1] = 77; return rd(arr, mk()); }

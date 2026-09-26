@@ -1,0 +1,12 @@
+// BUG-1341: a pointer to a function pointer needs its stars inside the C
+// declarator — `uint32_t (**pp)(uint32_t)`. It was emitted as
+// `uint32_t (*)(uint32_t)* pp`, which GCC refused.
+u32 one(u32 x) { return 1; }
+u32 two(u32 x) { return 2; }
+*(u32) -> u32 gf = one;
+void setf(**(u32) -> u32 pp) { *pp = two; }
+u32 main() {
+    **(u32) -> u32 pp = &gf;
+    setf(pp);
+    return gf(0) - 2;
+}

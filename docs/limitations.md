@@ -30,6 +30,48 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-26 audit (BUG-1326..1357; measured)
+
+1. **BUG-1327 migrated four callers only.** `eval_const_expr_ok` is the out-of-band entry
+   point; the ~95 remaining `eval_const_expr` sentinel callers still read INT64_MIN as "not a
+   constant" (conservative in every shape probed — they over-reject). The comptime
+   interpreter (`eval_const_expr_subst`) and the ident resolver still speak the sentinel.
+2. **ISR/main read-modify-write of the SAME register through two separately formed
+   pointers is accepted** (MEDIUM, silent on bare metal). `interrupt U { volatile *Regs u =
+   @inttoptr(*Regs, A); u.ctrl |= 1; }` and the same in main with `|= 2` (or two globals bound
+   to one constant address, or a helper forming the pointer locally): the RMW rule keys on a
+   global NAME, and a register reached through a fresh `@inttoptr` has none. Fix sketch: key
+   the ISR/main RMW sets on the constant MMIO address (`mmio_const_addr` + field offset) as
+   well as on names. Reproducers: agent probe set `x2`, `x4`, `x8` (2026-09-26 report in
+   BUGS-FIXED).
+3. **Bare-metal emission residuals (LOW):** the union-variant reset on a VOLATILE union uses
+   `memset` (qualifier cast away; GCC warns); `_zer_shl`/`_zer_shr` skip READING a volatile
+   left operand when the count is out of range; IR blocks of a `@critical` body are emitted
+   outside its braces and `goto` back in, so the save variable is formally indeterminate
+   (C11 6.2.4) though GCC keeps it in a register; AVR `@critical` names `SREG` without
+   `<avr/io.h>` (loud).
+4. **Over-rejections seen (loud):** a `const` global read from an ISR and from main is refused
+   "must be declared volatile" (`check_interrupt_safety` has no const exemption); a function
+   returning an `@inttoptr` pointer is reported as a leak; `volatile f32` is "not single-word"
+   on a 32-bit target.
+5. **reference.md "use a packed struct for named bit-fields" is misleading**: `packed struct
+   CR { u3 mode; u5 prio; }` lays the fields out in byte CARRIERS (u3 -> u8), not as bits —
+   a register overlay built that way puts fields at the wrong bits. Use bit-slices
+   `reg[hi..lo]` (documented as such since 2026-09-26).
+7. **Emitter residuals from the value audit (measured):** a literal tree needing more
+   than 64 bits folds at 64 outside a local var-decl (`x != 18446744073709551615 + 1` on a
+   u128 compares against 0; `const u128 C = 18446744073709551615 + 1;` emits 0 — the
+   untyped-evaluator entry above); a `uN`/`iN` read through an `@inttoptr` MMIO pointer is
+   not masked to N bits (`u3 f = rr.a;` gave 127); a compound assignment reads its target
+   AFTER evaluating the right side (`g += setg()` = 11 where `g = g + setg()` = 2 — the
+   evaluation-order section does not promise the compound case); `const [*]u8 T =
+   "hello"[2..];` at file scope emits a statement expression GCC refuses (loud); the AST
+   emitter path (defer bodies of labelled functions, global initializers) got BUG-1349's
+   parentheses but not its object-first evaluation order.
+6. **`|*pp|` of a `?*T` then `free(*pp)`** is not linked to the allocation `o` holds by
+   zercheck_ir (the emission is correct since BUG-1340); a later `free(a)` is accepted.
+   Likewise `*?*T po = &o; if (*po) |q| { free(q); }`.
+
 ## OPEN — residuals of the 2026-09-25f audit (BUG-1308..1325; measured)
 
 1. **`lib/` does not compile as shipped** (LOW — loud). `fmt.zer` calls `fmt_u64`/`fmt_i64`
@@ -42,10 +84,7 @@ repeated.
    not meant to compile without `--no-strict-mmio`. Only `str.zer` compiles (fixed by
    BUG-1317). Imports resolve from the entry file's directory only, so `lib/` must be copied
    beside the program. reference.md deliberately does not document the library until it builds.
-2. **Two literal-typing over-rejections.** `i8 x = 0 - 5 / 1;` ("cannot initialize 'i8' with
-   'u32'" while `i64 x = 0 - 5 / 1;` compiles), and `i64 x = -9223372036854775807 - 1;`
-   ("with 'u64'": the magnitude literal is typed u64 before the negation). Loud; spell
-   INT64_MIN through a const or `(i64)` arithmetic.
+2. ~~**Two literal-typing over-rejections.**~~ — CLOSED 2026-09-26 (BUG-1326, BUG-1327).
 3. **BUG-1310 precision.** An indirect call through a funcptr LOCAL / param / mutable global
    reaches every function of its SIGNATURE (the BUG-1290 end), so a helper calling a callback
    from a statement holding shared A is refused whenever ANY function of that signature
@@ -59,10 +98,9 @@ repeated.
 5. **`main([*][*]u8 args)` on a freestanding target** has no argc/argv to build from; the
    emitted `main(int, char **)` is only meaningful where a C runtime calls it. Use `u32
    main()` on bare metal.
-6. **Seen, not fixed (over-rejections / loud):** a comptime function using a cast or naming a
-   const global is refused; `alloc(u3, n)` says "undefined identifier"; a `?*T` parameter
-   returned unchanged is reported as a leak; a comptime function with a division needs a
-   zero guard although every argument is a constant.
+6. **Seen, not fixed (over-rejections / loud):** a `?*T` parameter returned unchanged is
+   reported as a leak (did not reproduce in the simple shape 2026-09-26). The comptime cast /
+   const-global / division items and `alloc(u3, n)` are CLOSED (BUG-1328, BUG-1329).
 7. **The expression-position deadlock forms** (nested calls, struct-init, orelse, switch
    subject, defer, range-for collection) were only partly probed by the concurrency agent
    before its run ended — no hole found in what ran.

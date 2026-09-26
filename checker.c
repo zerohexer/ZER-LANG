@@ -1484,6 +1484,19 @@ static bool derive_expr_range(Checker *c, Node *expr, int64_t *out_min, int64_t 
 static bool int_literal_tree_fits(Checker *c, Node *e, Type *target);
 
 static bool is_pure_float_literal_expr(Node *e, int depth);   /* BUG-1319 */
+/* BUG-1351: an index, a slice / bit-slice position and an alloc count wider than
+ * 64 bits were narrowed to size_t / uint64_t by the check AND the access, so
+ * `s[(1 << 64) + 1]` passed the bounds check as 1 and read s[1], a `u65` index
+ * wrote `arr[2]`, `alloc(u32, 2^64 + 2)` returned 2 elements. No such value is
+ * a meaningful position on any target (the address space is at most 64 bits):
+ * refuse it, as @inttoptr does for its address (BUG-1058). */
+static void reject_wide_position(Checker *c, Type *t, const char *what, int line) {
+    if (!t || !type_is_integer(t) || type_width(t) <= 64) return;
+    checker_error(c, line,
+        "%s must be at most 64 bits wide, got '%s' — narrow it explicitly "
+        "(@truncate / @saturate) after checking its range", what, type_name(t));
+}
+
 static bool is_literal_compatible(Node *expr, Type *target) {
     if (!expr || !target) return false;
     /* BUG-940: a pure integer-literal TREE is as constant as a lone literal, and
@@ -1720,6 +1733,36 @@ static bool lit_tree_ops_commute_with_wrap(Node *e) {
     return false;
 }
 
+/* The second licence for retyping a literal tree (BUG-1326): EVERY node's exact
+ * value fits the target, and every shift count is in [0, width-1]. Then no
+ * operation ever wraps, so computing in the target width IS the exact computation
+ * for every operator — `/`, `%`, `>>` and `~` included, which the ring-homomorphism
+ * rule above has to refuse because it lets an intermediate wrap. The shift bound
+ * is what keeps ZER's "count >= width gives 0" out of it: `i8 x = -5 >> 10` is 0
+ * in ZER and -1 exactly. `i8 x = -5 / 1;` and `i8 x = 0 - 5 / 1;` were refused
+ * ("cannot initialize 'i8' with 'u32'") while `i8 x = 0 - 5;` compiled. */
+static bool lit_tree_exact_in_width(Node *e, Type *eff, int w, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    /* a leaf above INT64_MAX has no exact int64 reading (the fold would see
+     * 18446744073709551615 as -1) — `i64 a = -18446744073709551615;` */
+    if (e->kind == NODE_INT_LIT && e->int_lit.value > (uint64_t)INT64_MAX) return false;
+    int64_t v;
+    if (!eval_const_expr_ok(e, &v) || !const_int_fits_type(v, eff)) return false;
+    if (e->kind == NODE_INT_LIT) return true;
+    if (e->kind == NODE_UNARY)
+        return lit_tree_exact_in_width(e->unary.operand, eff, w, depth + 1);
+    if (e->kind == NODE_BINARY) {
+        if (e->binary.op == TOK_LSHIFT || e->binary.op == TOK_RSHIFT) {
+            int64_t cnt;
+            if (!eval_const_expr_ok(e->binary.right, &cnt) || cnt < 0 || cnt >= w)
+                return false;
+        }
+        return lit_tree_exact_in_width(e->binary.left, eff, w, depth + 1) &&
+               lit_tree_exact_in_width(e->binary.right, eff, w, depth + 1);
+    }
+    return false;
+}
+
 static bool int_literal_tree_fits(Checker *c, Node *e, Type *target) {
     (void)c;
     if (!e || !target) return false;
@@ -1741,10 +1784,11 @@ static bool int_literal_tree_fits(Checker *c, Node *e, Type *target) {
         int w = type_width(eff);
         if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     }
+    if (lit_tree_exact_in_width(e, eff, type_width(eff), 0)) return true;
     if (!lit_tree_ops_commute_with_wrap(e)) return false;
     if (!lit_leaves_fit(e, rt)) return false;
-    int64_t folded = eval_const_expr(e);
-    if (folded == CONST_EVAL_FAIL) return false;
+    int64_t folded;
+    if (!eval_const_expr_ok(e, &folded)) return false;   /* BUG-1327: INT64_MIN is a value */
     return const_int_fits_type(folded, eff);
 }
 
@@ -3002,6 +3046,64 @@ static void report_variant_ref_store(Checker *c, int line, const char *what) {
         what);
 }
 
+/* BUG-1354: ONE answer to "which of THIS frame's variables holds the storage of
+ * this ARRAY-typed expression?" — asked wherever an array becomes a view (an
+ * array -> [*]T coercion, a sub-slice) and the view may outlive the frame. The
+ * old sites each walked FIELD/INDEX to the root ident and then tested the ROOT's
+ * type for ARRAY, so an array FIELD of a local struct (`[*]u32 s = w.a; return
+ * s;`, `return ident(w.a);`) was "not local", and a BY-VALUE struct PARAMETER
+ * (`[*]u32 view(W w) { return w.a; }`) was exempted as "caller memory" along with
+ * the array parameters it is not (ASan stack-use-after-return, all of them).
+ * The storage is the frame's unless a step goes THROUGH a pointer or slice (the
+ * pointee is someone else's), or the root is global / static / an array, pointer
+ * or slice PARAMETER (all name the caller's memory). A call result or anything
+ * else unrecognised answers NULL — the BUG-1187 temporary rule owns those. */
+static bool sym_is_current_param(Checker *c, const char *n, uint32_t l) {
+    Node *fn = c->current_func_node;
+    if (!fn || fn->kind != NODE_FUNC_DECL) return false;
+    for (int pi = 0; pi < fn->func_decl.param_count; pi++)
+        if (fn->func_decl.params[pi].name_len == l &&
+            memcmp(fn->func_decl.params[pi].name, n, l) == 0) return true;
+    return false;
+}
+static Symbol *array_storage_frame_root(Checker *c, Node *e) {
+    for (int d = 0; e && d <= ZER_EXPR_WALK_MAX; d++) {
+        Node *obj = NULL;
+        if (e->kind == NODE_SLICE) obj = e->slice.object;
+        else if (e->kind == NODE_INDEX) obj = e->index_expr.object;
+        else if (e->kind == NODE_FIELD) obj = e->field.object;
+        else if (e->kind == NODE_IDENT) {
+            Symbol *s = scope_lookup(c->current_scope, e->ident.name,
+                                     (uint32_t)e->ident.name_len);
+            if (!s || s->is_static || s->is_function) return NULL;
+            if (global_decl_lookup(c, e->ident.name, (uint32_t)e->ident.name_len) == s)
+                return NULL;
+            if (sym_is_current_param(c, s->name, s->name_len)) {
+                TypeKind pk = type_dispatch_kind(s->type);
+                if (pk == TYPE_ARRAY || pk == TYPE_POINTER || pk == TYPE_SLICE)
+                    return NULL;   /* names the caller's memory */
+            }
+            return s;
+        } else {
+            return NULL;
+        }
+        TypeKind ok = type_dispatch_kind(checker_get_type(c, obj));
+        if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE ||
+            ok == TYPE_OPTIONAL)
+            return NULL;   /* the step dereferences: not this frame's storage */
+        e = obj;
+    }
+    return NULL;
+}
+/* An array-typed expression, possibly under a sub-slice: is its storage this
+ * frame's? (the view it becomes would dangle once the frame returns) */
+static Symbol *array_view_frame_root(Checker *c, Node *v) {
+    if (!v) return NULL;
+    Node *base = v->kind == NODE_SLICE ? v->slice.object : v;
+    if (type_dispatch_kind(checker_get_type(c, base)) != TYPE_ARRAY) return NULL;
+    return array_storage_frame_root(c, base);
+}
+
 static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
     /* BUG-976: ten nested identity calls laundered `&x` into a global because this
      * answered "not local" past depth 8. Unknown must read as LOCAL-DERIVED.
@@ -3032,6 +3134,9 @@ static bool arg_is_local_derived(Checker *c, Node *arg, int depth) {
      * clobbered stack slot. One case here serves every sink routed through it. */
     if (arg->kind == NODE_STRUCT_INIT)
         return struct_init_has_local_derived(c, arg);
+    if ((arg->kind == NODE_FIELD || arg->kind == NODE_INDEX || arg->kind == NODE_SLICE) &&
+        array_view_frame_root(c, arg))                       /* BUG-1354 */
+        return true;
     {
         /* direct &local */
         if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
@@ -5282,6 +5387,56 @@ static bool reject_array_view_qualifier_drop(Checker *c, Node *v, Type *dest, in
     return false;
 }
 
+/* BUG-1345: a `T[N]` PARAMETER refers to the caller's array (C decays it to a
+ * pointer), so passing an array is forming a VIEW, exactly like the `[*]T`
+ * coercion above — and it dropped the qualifiers with no diagnostic. A volatile
+ * FIFO handed to `void push2(u32[4] a) { a[1] = 1; a[1] = 2; }` lost its first
+ * store at -O2 and `while (a[0] == 0) {}` became `jmp .`; a `const` array handed
+ * to a writing callee was written. The callee's declared qualifier lives on the
+ * PARAMETER's type node (an array Type carries none), so resolve the callee; an
+ * indirect callee has no declaration to consult and is treated as unqualified. */
+static bool typenode_has_qual(TypeNode *tn, TypeNodeKind q) {
+    for (int d = 0; tn && d < 16; d++) {
+        if (tn->kind == q) return true;
+        if (tn->kind == TYNODE_CONST || tn->kind == TYNODE_VOLATILE) tn = tn->qualified.inner;
+        else return false;
+    }
+    return false;
+}
+static void reject_array_param_qualifier_drop(Checker *c, Node *call, int ai,
+                                              Type *param, int line) {
+    if (!call || ai < 0 || ai >= call->call.arg_count) return;
+    if (type_dispatch_kind(param) != TYPE_ARRAY) return;
+    Node *v = call->call.args[ai];
+    if (!v || type_dispatch_kind(checker_get_type(c, v)) != TYPE_ARRAY) return;
+    bool vol = false, cst = false;
+    array_view_qualifiers(c, v, &vol, &cst);
+    if (!vol && !cst) return;
+    bool p_vol = false, p_cst = false;
+    Node *cal = call->call.callee;
+    if (cal && cal->kind == NODE_IDENT) {
+        Symbol *fs = scope_lookup(c->current_scope, cal->ident.name,
+                                  (uint32_t)cal->ident.name_len);
+        Node *fd = (fs && fs->is_function) ? fs->func_node : NULL;
+        if (fd && fd->kind == NODE_FUNC_DECL && ai < fd->func_decl.param_count) {
+            TypeNode *ptn = fd->func_decl.params[ai].type;
+            p_vol = typenode_has_qual(ptn, TYNODE_VOLATILE);
+            p_cst = typenode_has_qual(ptn, TYNODE_CONST);
+        }
+    }
+    if (vol && !p_vol)
+        checker_error(c, line,
+            "argument %d: cannot pass a volatile array to a non-volatile array "
+            "parameter — the callee would access the device through a plain pointer, "
+            "so the compiler may coalesce or delete the accesses; declare the "
+            "parameter 'volatile' or take 'volatile [*]T'", ai + 1);
+    else if (cst && !p_cst)
+        checker_error(c, line,
+            "argument %d: cannot pass a const array to a mutable array parameter — "
+            "the callee could write read-only memory; declare the parameter 'const'",
+            ai + 1);
+}
+
 /* The shared REPORTER, so every coercion sink words it identically. */
 static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) {
     if (!v || type_dispatch_kind(dest) != TYPE_SLICE) return false;
@@ -5305,6 +5460,9 @@ static bool reject_packed_array_view(Checker *c, Node *v, Type *dest, int line) 
 static bool ref_path_hits_call_temp(Checker *c, Node *path) {
     for (Node *r = path; r; ) {
         if (r->kind == NODE_CALL) return true;
+        /* BUG-1355: an `orelse` reached through by-value steps yields a
+         * temporary too — `(mkp(v) orelse dflt()).a` viewed a dead frame. */
+        if (r->kind == NODE_ORELSE) return true;
         Node *obj = NULL;
         if (r->kind == NODE_FIELD) obj = r->field.object;
         else if (r->kind == NODE_INDEX) obj = r->index_expr.object;
@@ -7219,6 +7377,15 @@ static void mark_slice_local_derived_from_value(Checker *c, Symbol *sym,
         /* BUG-1259: `DS d = @cast(DS, a[0..]);` — the launder hid the slice. */
         Node *sr = unwrap_ptr_launder(roots[ri]);
         if (!sr) continue;
+        {   /* BUG-1354: an array FIELD / element of a frame-held aggregate */
+            Symbol *fr = array_view_frame_root(c, sr);
+            if (fr && sr->kind != NODE_IDENT) {
+                sym->is_local_derived = true;
+                sym->borrow_root_name = fr->name;
+                sym->borrow_root_len  = fr->name_len;
+                continue;
+            }
+        }
         if (sr->kind == NODE_SLICE) sr = sr->slice.object;
         while (sr && (sr->kind == NODE_FIELD || sr->kind == NODE_INDEX)) {
             if (sr->kind == NODE_FIELD) sr = sr->field.object;
@@ -7673,6 +7840,13 @@ static Type *alloc_resolve_elem_type(Checker *c, const char *name, uint32_t len)
         case 5:
             if (memcmp(name, "usize", 5) == 0) return ty_usize;
             break;
+    }
+    {   /* BUG-1329: an arbitrary-width element (`alloc(u3, n)`, `alloc(i48, n)`)
+         * — the same spelling resolve_type accepts in a declaration. It was
+         * "undefined identifier 'u3'" while `[*]u3 s` itself was a valid type. */
+        uint32_t ibits = 0; bool isg = false;
+        if (zer_is_intn_type_name(name, len, &ibits, &isg))
+            return isg ? type_sint(c->arena, ibits) : type_uint(c->arena, ibits);
     }
     Symbol *s = scope_lookup(c->current_scope, name, len);
     if (s && s->type) return s->type;
@@ -9292,6 +9466,50 @@ static int64_t eval_comptime_call_subst(Node *call, ComptimeParam *outer_params,
 /* BUG-844: the WIDTH an expression computes in — the declared width of whichever
  * operand has one. A literal contributes no width, so `x + 1` uses x's; a mixed
  * `u8 + u32` uses the wider, matching ZER's usual-arithmetic behaviour. */
+/* BUG-1328: a comptime body may name a `const` GLOBAL (`return x + K;`) and cast
+ * (`return (u32)(x * 2);`). The interpreter knew neither and every such call was
+ * "could not be evaluated at compile time" — for the macro replacement the language
+ * documents comptime as. The global is resolved in the GLOBAL scope (the body's
+ * lexical scope — never a same-named local of the calling function) through the one
+ * const resolver, which already detects cycles and wraps into the const's type. */
+static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len,
+                                   int depth);
+static Symbol *ct_global_const(const char *name, uint32_t len) {
+    if (!_comptime_checker || !_comptime_global_scope) return NULL;
+    Symbol *g = scope_lookup(_comptime_global_scope, name, len);
+    if (!g || !g->is_const || g->is_function || !g->func_node ||
+        g->func_node->kind != NODE_GLOBAL_VAR || !g->func_node->var_decl.init)
+        return NULL;
+    uint16_t b = 0; bool sg = false;
+    ct_type_width(g->type, &b, &sg);
+    if (b == 0 || b > 64) return NULL;       /* integer consts only */
+    return g;
+}
+static int64_t ct_global_const_value(Symbol *g, const char *name, uint32_t len) {
+    Checker *c = _comptime_checker;
+    Scope *saved = c->current_scope;
+    c->current_scope = _comptime_global_scope;
+    int64_t v = resolve_const_ident(c, name, len, 0);
+    c->current_scope = saved;
+    (void)g;
+    return v;
+}
+/* A cast's value: integer (or bool) source to an integer target of at most 64 bits,
+ * wrapped as the emitted conversion does. Anything else (a float source, a u65+
+ * target that an int64 cannot hold) is left unfolded. */
+static int64_t ct_cast_value(Node *n, int64_t v) {
+    if (!_comptime_checker || v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+    Type *tt = typemap_get(_comptime_checker, n);
+    Type *st = typemap_get(_comptime_checker, n->typecast.expr);
+    uint16_t tb = 0, sb = 0; bool ts = false, ss = false;
+    ct_type_width(tt, &tb, &ts);
+    ct_type_width(st, &sb, &ss);
+    bool src_bool = st && type_dispatch_kind(st) == TYPE_BOOL;
+    if (tb == 0 || tb > 64) return CONST_EVAL_FAIL;
+    if (!src_bool && (sb == 0 || sb > 64)) return CONST_EVAL_FAIL;
+    return ct_wrap(v, tb, ts);
+}
+
 static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
                              bool *is_signed, int depth) {
     /* BUG-1016: 0 past the cap means "no width" = no wrap; an expression walk, so the
@@ -9316,7 +9534,23 @@ static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
                 if (is_signed) *is_signed = params[i].is_signed;
                 return params[i].bits;
             }
+        {   /* BUG-1328: a const global computes in its declared type */
+            Symbol *g = ct_global_const(n->ident.name, (uint32_t)n->ident.name_len);
+            if (g) {
+                uint16_t gb = 0; bool gs = false;
+                ct_type_width(g->type, &gb, &gs);
+                if (is_signed) *is_signed = gs;
+                return gb;
+            }
+        }
         return 0;
+    }
+    /* BUG-1328: a cast's result has the TARGET's width */
+    if (n->kind == NODE_TYPECAST) {
+        uint16_t tb = 0; bool ts = false;
+        if (_comptime_checker) ct_type_width(typemap_get(_comptime_checker, n), &tb, &ts);
+        if (is_signed) *is_signed = ts;
+        return tb;
     }
     /* BUG-868: an ARRAY ELEMENT read carries the element's width, exactly as a
      * scalar ident carries the binding's. Without this arm `v[0] + v[1]` on a
@@ -9350,12 +9584,19 @@ static uint16_t ct_expr_bits(Node *n, ComptimeParam *params, int param_count,
 
 static int64_t eval_const_expr_subst(Node *n, ComptimeParam *params, int param_count) {
     if (!n) return CONST_EVAL_FAIL;
+    if (n->kind == NODE_TYPECAST)   /* BUG-1328 */
+        return ct_cast_value(n, eval_const_expr_subst(n->typecast.expr, params, param_count));
     /* substitute parameter references */
     if (n->kind == NODE_IDENT) {
         for (int i = param_count - 1; i >= 0; i--) {   /* BUG-1206: innermost first */
             if (n->ident.name_len == params[i].name_len &&
                 memcmp(n->ident.name, params[i].name, params[i].name_len) == 0)
                 return params[i].value;
+        }
+        {   /* BUG-1328: a const global */
+            Symbol *g = ct_global_const(n->ident.name, (uint32_t)n->ident.name_len);
+            if (g) return ct_global_const_value(g, n->ident.name,
+                                                (uint32_t)n->ident.name_len);
         }
         return CONST_EVAL_FAIL;
     }
@@ -11151,7 +11392,11 @@ static Type *check_expr(Checker *c, Node *node) {
                 /* compile-time division by zero check.
                  * BUG-269: use eval_const_expr to catch expressions like (2-2) */
                 if (node->binary.op == TOK_SLASH || node->binary.op == TOK_PERCENT) {
-                    int64_t div_val = eval_const_expr(node->binary.right);
+                    /* BUG-1327: out-of-band — a divisor of u64 2^63 (INT64_MIN's bit
+                     * pattern) is a nonzero constant, not "unknown". */
+                    int64_t div_val = 0;
+                    bool div_known = eval_const_expr_ok(node->binary.right, &div_val);
+                    if (!div_known) div_val = CONST_EVAL_FAIL;
                     /* SAFETY: zer_div_valid in src/safety/arith_rules.c (M01).
                      * Oracle: typing.v M01_const_div_by_zero_rejected. Convert
                      * int64 to "is-zero flag" to preserve zeroness across cast. */
@@ -11162,7 +11407,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     /* range propagation: mark proven if divisor is nonzero.
                      * Handles both simple idents (d) and struct fields (cfg.d). */
                     /* if eval_const_expr didn't resolve, try const symbol lookup */
-                    if (div_val == CONST_EVAL_FAIL && node->binary.right->kind == NODE_IDENT) {
+                    if (!div_known && node->binary.right->kind == NODE_IDENT) {
                         Symbol *dsym = scope_lookup(c->current_scope,
                             node->binary.right->ident.name,
                             (uint32_t)node->binary.right->ident.name_len);
@@ -11172,7 +11417,8 @@ static Type *check_expr(Checker *c, Node *node) {
                                 init = dsym->func_node->var_decl.init;
                             else if (dsym->func_node->kind == NODE_VAR_DECL)
                                 init = dsym->func_node->var_decl.init;
-                            if (init) div_val = eval_const_expr(init);
+                            if (init) div_known = eval_const_expr_ok(init, &div_val);
+                            if (!div_known) div_val = CONST_EVAL_FAIL;
                         }
                     }
                     /* BUG-1318: a nonzero FLOAT literal divisor (`1.0 / 2.0`) is
@@ -11185,7 +11431,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     bool float_lit_nz = fdv && fdv->kind == NODE_FLOAT_LIT &&
                         fdv->float_lit.value == fdv->float_lit.value &&   /* not NaN */
                         fdv->float_lit.value != 0.0;
-                    if ((div_val != CONST_EVAL_FAIL && div_val != 0) || float_lit_nz) {
+                    if ((div_known && div_val != 0) || float_lit_nz) {
                         mark_proven(c, node); /* constant nonzero divisor */
                     } else if (node->binary.right->kind == NODE_INTRINSIC &&
                                node->binary.right->intrinsic.name_len == 4 &&
@@ -11213,6 +11459,9 @@ static Type *check_expr(Checker *c, Node *node) {
                      * deref, binary, intrinsic, etc.). Provable cases (constant nonzero,
                      * VRP range with known_nonzero) bypass via mark_proven above.
                      * SAFETY: zer_divisor_proven_nonzero in src/safety/arith_rules.c (M02) */
+                    /* BUG-1328: a comptime body is only folded, never emitted, and a
+                     * zero divisor fails the fold — nothing to guard at run time. */
+                    if (c->in_comptime_body) mark_proven(c, node);
                     int div_has_proof = checker_is_proven(c, node) ? 1 : 0;
                     if (div_val != 0 && zer_divisor_proven_nonzero(div_has_proof) == 0) {
                         if (node->binary.right->kind == NODE_IDENT ||
@@ -13563,8 +13812,9 @@ static Type *check_expr(Checker *c, Node *node) {
                 Node *divisor = node->assign.value;
                 /* literal nonzero → ok */
                 bool div_ok = false;
-                int64_t dv = eval_const_expr(divisor);
-                if (dv == CONST_EVAL_FAIL && divisor->kind == NODE_IDENT) {
+                int64_t dv = 0;   /* BUG-1327: out of band — 2^63 is a nonzero constant */
+                bool dv_known = eval_const_expr_ok(divisor, &dv);
+                if (!dv_known && divisor->kind == NODE_IDENT) {
                     Symbol *dsym = scope_lookup(c->current_scope,
                         divisor->ident.name, (uint32_t)divisor->ident.name_len);
                     if (dsym && dsym->is_const && dsym->func_node) {
@@ -13573,10 +13823,16 @@ static Type *check_expr(Checker *c, Node *node) {
                             dinit = dsym->func_node->var_decl.init;
                         else if (dsym->func_node->kind == NODE_VAR_DECL)
                             dinit = dsym->func_node->var_decl.init;
-                        if (dinit) dv = eval_const_expr(dinit);
+                        if (dinit) dv_known = eval_const_expr_ok(dinit, &dv);
                     }
                 }
-                if (dv != CONST_EVAL_FAIL && dv != 0) div_ok = true;
+                if (dv_known && dv != 0) div_ok = true;
+                /* BUG-1328: a comptime body is never emitted — it is only ever
+                 * folded, and a zero divisor makes the fold FAIL ("could not be
+                 * evaluated at compile time"), so there is no run-time division
+                 * to guard and no guard the author could write that the folder
+                 * would need. */
+                if (c->in_comptime_body) div_ok = true;
                 {   /* BUG-1318: a nonzero FLOAT literal divisor */
                     Node *fdv = divisor;
                     while (fdv && fdv->kind == NODE_UNARY && fdv->unary.op == TOK_MINUS)
@@ -13599,7 +13855,7 @@ static Type *check_expr(Checker *c, Node *node) {
                  * all: `x /= 0;` compiled and trapped at run time, and inside a
                  * comptime function it folded to 0 (see ct_apply_assign_op). The
                  * two spellings of one operation now give the same answer. */
-                if (dv != CONST_EVAL_FAIL && dv == 0) {
+                if (dv_known && dv == 0) {
                     checker_error(c, node->loc.line, "division by zero");
                     div_ok = true;   /* reported; no second diagnostic below */
                 }
@@ -13816,6 +14072,7 @@ static Type *check_expr(Checker *c, Node *node) {
                      * arg (arg 0) is resolved by name, never as a value. */
                     Type *nt = check_expr(c, node->call.args[1]);
                     if (nt && type_is_integer(nt)) {
+                        reject_wide_position(c, nt, "an allocation count", node->loc.line);
                         result = type_optional(c->arena, type_slice(c->arena, elem));
                     } else {
                         checker_error(c, node->loc.line,
@@ -14912,6 +15169,8 @@ static Type *check_expr(Checker *c, Node *node) {
                                                 node->loc.line, "pass");
                     reject_array_view_hazards(c, node->call.args[i], param,
                                              node->loc.line);
+                    reject_array_param_qualifier_drop(c, node, (int)i, param,
+                                                      node->loc.line);   /* BUG-1345 */
                     if (!value_flows_to(node->call.args[i], arg, param) &&
                         !slice_to_ptr_ok) {
                         char what[48];
@@ -15901,6 +16160,7 @@ static Type *check_expr(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "array index must be integer, got '%s'", type_name(idx));
         }
+        reject_wide_position(c, idx, "an index", node->loc.line);   /* BUG-1351 */
 
         /* BUG-1063: the INDEX sink of the BUG-1018 divergent-reading refusal.
          * BUG-1018 left this position alone because it rendered the SIGNED reading
@@ -16388,12 +16648,14 @@ static Type *check_expr(Checker *c, Node *node) {
             if (!type_is_integer(start)) {
                 checker_error(c, node->loc.line, "slice start must be integer");
             }
+            reject_wide_position(c, start, "a slice / bit-slice position", node->loc.line);
         }
         if (node->slice.end) {
             Type *end = check_expr(c, node->slice.end);
             if (!type_is_integer(end)) {
                 checker_error(c, node->loc.line, "slice end must be integer");
             }
+            reject_wide_position(c, end, "a slice / bit-slice position", node->loc.line);
         }
 
         /* compile-time check: start must be <= end (for array/slice sub-slicing only,
@@ -17807,33 +18069,43 @@ static Type *check_expr(Checker *c, Node *node) {
                      * UNCONDITIONALLY when address is constant — even under
                      * --no-strict-mmio, a misaligned MMIO address is SIGBUS
                      * on ARM/RISC-V or silent corruption on Cortex-M0+. */
+                    /* BUG-1195: a CONSTANT address designates a peripheral, so the
+                     * RESULT is a volatile pointer — the qualifier lives on the
+                     * value, where every value-flow sink's "cannot strip volatile"
+                     * rule already looks. BUG-799 checked the destination at two
+                     * sinks only: `r = @inttoptr(...)`, a global initializer, a
+                     * return, a call argument, and the direct use
+                     * `@inttoptr(*R, A).dr = 0x41` all bound it non-volatile, and
+                     * GCC -O2 deleted the first of two writes and turned a poll
+                     * loop into `jmp .` (measured). A FRESH type: the resolved
+                     * type_arg may be cached and shared.
+                     * BUG-1343: a COMPUTED address too. It passes the same runtime
+                     * mmio-range check, so it is just as much a peripheral —
+                     * `*Regs u = @inttoptr(*Regs, base + n*0x100); u.ctrl = 1;
+                     * u.ctrl = 2; while (u.status == 0) {}` bound a plain pointer
+                     * and -O2 deleted the first store and hoisted the poll.
+                     * Under --no-strict-mmio a computed address is NOT range-checked
+                     * (the zer-convert pointer-arithmetic emulation in lib/compat.zer
+                     * relies on that), so there only the constant form is promoted. */
+                    if (node->intrinsic.arg_count > 0 &&
+                        (!c->no_strict_mmio ||
+                         mmio_const_addr(c, node->intrinsic.args[0]) != CONST_EVAL_FAIL)) {
+                        Type *rp = result ? type_unwrap_distinct(result) : NULL;
+                        if (rp && rp == result &&
+                            type_dispatch_kind(rp) == TYPE_POINTER &&
+                            !rp->pointer.is_volatile) {
+                            Type *vp = type_pointer(c->arena, rp->pointer.inner);
+                            vp->pointer.is_const = rp->pointer.is_const;
+                            vp->pointer.is_volatile = true;
+                            result = vp;
+                        }
+                    }
                     if (node->intrinsic.arg_count > 0) {
                         int64_t cval = mmio_const_addr(c, node->intrinsic.args[0]);
                         if (cval != CONST_EVAL_FAIL) {
                         uint64_t addr = (uint64_t)cval;
                         node->intrinsic.addr_is_const = true;   /* BUG-1058 */
                         node->intrinsic.const_addr = addr;
-                        /* BUG-1195: a CONSTANT address designates a peripheral, so the
-                         * RESULT is a volatile pointer — the qualifier lives on the
-                         * value, where every value-flow sink's "cannot strip volatile"
-                         * rule already looks. BUG-799 checked the destination at two
-                         * sinks only: `r = @inttoptr(...)`, a global initializer, a
-                         * return, a call argument, and the direct use
-                         * `@inttoptr(*R, A).dr = 0x41` all bound it non-volatile, and
-                         * GCC -O2 deleted the first of two writes and turned a poll
-                         * loop into `jmp .` (measured). A FRESH type: the resolved
-                         * type_arg may be cached and shared. */
-                        {
-                            Type *rp = result ? type_unwrap_distinct(result) : NULL;
-                            if (rp && rp == result &&
-                                type_dispatch_kind(rp) == TYPE_POINTER &&
-                                !rp->pointer.is_volatile) {
-                                Type *vp = type_pointer(c->arena, rp->pointer.inner);
-                                vp->pointer.is_const = rp->pointer.is_const;
-                                vp->pointer.is_volatile = true;
-                                result = vp;
-                            }
-                        }
                         /* BUG-1058: a constant address the target pointer cannot
                          * hold is a DIFFERENT address after the cast — `-m32`
                          * turned 0x1_0000_0010 into 0x10 while this gate had
@@ -18628,6 +18900,13 @@ static Type *check_expr(Checker *c, Node *node) {
                 Type *vt = typemap_get(c, node->intrinsic.args[0]);
                 if (vt && !type_is_integer(vt)) {
                     checker_error(c, node->loc.line, "@%.*s argument must be integer", (int)nlen, name);
+                } else if (vt && type_width(vt) > 64) {
+                    /* BUG-1353: the GCC builtins are 64-bit at most; a u65..u128
+                     * operand was silently narrowed (@ctz(1 << 70) gave 64,
+                     * @popcount 0) — like @bswap64, refuse it. */
+                    checker_error(c, node->loc.line,
+                        "@%.*s takes an operand of at most 64 bits, got '%s' — "
+                        "split it into two u64 halves", (int)nlen, name, type_name(vt));
                 }
                 result = ty_u32;
             }
@@ -22547,6 +22826,13 @@ static void check_stmt(Checker *c, Node *node) {
             if (val != CONST_EVAL_FAIL) {
                 push_var_range_ex(c, node->var_decl.name,
                     (uint32_t)node->var_decl.name_len, val, val, val != 0, true);
+            } else if (node->var_decl.init->kind == NODE_INT_LIT &&
+                       node->var_decl.init->int_lit.value > (uint64_t)INT64_MAX) {
+                /* BUG-1327: a u64 literal at or above 2^63 has no int64 RANGE, but it
+                 * is a NONZERO constant — record that alone, full range. `u64 d =
+                 * 9223372036854775808; x / d` was "divisor 'd' not proven nonzero". */
+                push_var_range_ex(c, node->var_decl.name,
+                    (uint32_t)node->var_decl.name_len, INT64_MIN, INT64_MAX, true, true);
             } else {
                 /* derive range from expression: x % N → [0, N-1], x & MASK → [0, MASK] */
                 int64_t rmin, rmax;
@@ -22627,6 +22913,20 @@ static void check_stmt(Checker *c, Node *node) {
                                 (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name,
                                 (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name);
                     }
+                    /* BUG-1330: `|*v|` binds a pointer INTO the optional the condition
+                     * names. The auto-lock covers only the condition's evaluation, so
+                     * when that optional lives in a shared struct the body wrote the
+                     * shared bytes through `v` with the lock released — a data race
+                     * (TSan-confirmed). The union-switch sibling has refused the same
+                     * capture since B2; this is the optional spelling of it. */
+                    if (lvalue_path_through_shared(c, node->if_stmt.cond))
+                        checker_error(c, node->loc.line,
+                            "cannot capture an optional inside a shared struct by pointer "
+                            "(|*%.*s|) — the auto-lock covers only the condition, so writes "
+                            "through the capture would race. Capture by value '|%.*s|', then "
+                            "assign the field back as its own (auto-locked) statement",
+                            (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name,
+                            (int)node->if_stmt.capture_name_len, node->if_stmt.capture_name);
                     /* BUG-305: if source is const, capture pointer must be const */
                     cap_const = false;
                     {
@@ -22662,6 +22962,44 @@ static void check_stmt(Checker *c, Node *node) {
                     /* BUG-1299: `if (s.mh) |h|` — the capture is a copy of it. */
                     if (opaque_read_from_shared(c, node->if_stmt.cond))
                         cap->opaque_from_shared = true;
+                    /* BUG-1355: `|*v|` points at the optional's STORAGE. When that is
+                     * this frame's — a local, a by-value parameter, or the hidden
+                     * temporary a call / orelse condition is evaluated into — every
+                     * view formed through `v` dies with the frame:
+                     * `if (mk(7)) |*v| { return v.a[0..]; }` returned a dangling
+                     * slice (ASan stack-use-after-return). */
+                    if (node->if_stmt.capture_is_ptr) {
+                        Node *r = node->if_stmt.cond;
+                        bool through_ref = false;
+                        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
+                            Node *o = r->kind == NODE_FIELD ? r->field.object
+                                                            : r->index_expr.object;
+                            TypeKind ok = type_dispatch_kind(checker_get_type(c, o));
+                            if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE) {
+                                through_ref = true; break;
+                            }
+                            r = o;
+                        }
+                        if (!through_ref && r) {
+                            if (r->kind == NODE_IDENT) {
+                                Symbol *rs = scope_lookup(c->current_scope, r->ident.name,
+                                                          (uint32_t)r->ident.name_len);
+                                bool rglob = rs && global_decl_lookup(c, r->ident.name,
+                                                   (uint32_t)r->ident.name_len) == rs;
+                                bool rparam_ref = rs && sym_is_current_param(c, rs->name,
+                                                   rs->name_len) &&
+                                    (type_dispatch_kind(rs->type) == TYPE_POINTER ||
+                                     type_dispatch_kind(rs->type) == TYPE_SLICE);
+                                if (rs && !rs->is_static && !rglob && !rparam_ref) {
+                                    cap->is_local_derived = true;
+                                    cap->borrow_root_name = rs->name;
+                                    cap->borrow_root_len = rs->name_len;
+                                }
+                            } else if (!(r->kind == NODE_UNARY && r->unary.op == TOK_STAR)) {
+                                cap->is_local_derived = true;   /* a condition temporary */
+                            }
+                        }
+                    }
 
                     /* BUG-212: propagate local/arena-derived from condition ident */
                     {
@@ -23705,7 +24043,17 @@ static void check_stmt(Checker *c, Node *node) {
                                 else if (sr->kind == NODE_INDEX) sr = sr->index_expr.object;
                                 else break;
                             }
-                            if (sr && sr->kind == NODE_IDENT) {
+                            /* BUG-1330: any STEP of the path, not only its root —
+                             * one query with the if-unwrap sibling. */
+                            bool path_sh = lvalue_path_through_shared(c, node->switch_stmt.expr);
+                            if (path_sh) {
+                                checker_error(c, arm->loc.line,
+                                    "cannot capture a shared union variant by pointer (|*%.*s|) in a switch — "
+                                    "the shared union is snapshotted under the auto-lock, so the pointer would "
+                                    "alias a throwaway copy (the mutation is lost). Copy the field into a local, "
+                                    "mutate it, then assign it back as a separate statement.",
+                                    (int)arm->capture_name_len, arm->capture_name);
+                            } else if (sr && sr->kind == NODE_IDENT) {
                                 Symbol *ss = scope_lookup(c->current_scope,
                                     sr->ident.name, (uint32_t)sr->ident.name_len);
                                 if (ss && ss->type) {
@@ -24293,6 +24641,14 @@ static void check_stmt(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "cannot return local array as slice — "
                             "pointer will dangle after function returns");
+                    } else if (root_is_param && array_view_frame_root(c, node->ret.expr)) {
+                        /* BUG-1354: an array FIELD of a BY-VALUE struct parameter
+                         * is this frame's copy, not the caller's array. */
+                        checker_error(c, node->loc.line,
+                            "cannot return an array of by-value parameter '%.*s' as a "
+                            "slice — the parameter is this function's own copy, so the "
+                            "view dangles after it returns; take '*' the struct instead",
+                            (int)vlen, vname);
                     }
                 }
             }

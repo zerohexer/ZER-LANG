@@ -1,0 +1,19 @@
+// BUG-1326: a pure integer-literal tree whose EVERY intermediate value fits the
+// destination is exact in that width for every operator, `/ % >> ~` included.
+// `i8 a = -5 / 1;` was refused ("cannot initialize 'i8' with 'u32'") while
+// `i8 a = 0 - 5;` compiled.
+u32 main() {
+    i8 a = 0 - 5 / 1;
+    i8 b = -5 / 1;
+    i8 c = -100 / 3;
+    i8 d = -7 % 3;
+    i8 e = -64 >> 2;
+    i8 f = ~5;
+    i16 g = (300 - 400) / 7;
+    i32 h = -2147483647 / 2;
+    if (a != -5 || b != -5 || c != -33 || d != -1 || e != -16 || f != -6) { return 1; }
+    if (g != -14 || h != -1073741823) { return 2; }
+    u8 k = 250 / 5 * 3;
+    if (k != 150) { return 3; }
+    return 0;
+}

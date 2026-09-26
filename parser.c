@@ -2763,28 +2763,7 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
     return n;
 }
 
-static Node *parse_declaration(Parser *p) {
-    /* section("name") — attribute for next declaration */
-    const char *section_str = NULL;
-    size_t section_len = 0;
-    if (check(p, TOK_IDENT) && p->current.length == 7 &&
-        memcmp(p->current.start, "section", 7) == 0) {
-        advance(p); /* consume "section" */
-        consume(p, TOK_LPAREN, "expected '(' after 'section'");
-        consume(p, TOK_STRING, "expected string in section()");
-        section_str = p->previous.start + 1;
-        section_len = p->previous.length - 2;
-        consume(p, TOK_RPAREN, "expected ')' after section string");
-    }
-
-    /* naked — attribute for next function */
-    bool is_naked = false;
-    if (check(p, TOK_IDENT) && p->current.length == 5 &&
-        memcmp(p->current.start, "naked", 5) == 0) {
-        advance(p); /* consume "naked" */
-        is_naked = true;
-    }
-
+static Node *parse_declaration_rest(Parser *p) {
     /* static_assert at top level */
     if (match(p, TOK_STATIC_ASSERT)) {
         Node *n = new_node(p, NODE_STATIC_ASSERT);
@@ -3040,6 +3019,15 @@ static Node *parse_declaration(Parser *p) {
             consume(p, TOK_STRING, "expected string after 'as'");
             n->interrupt.as_name = p->previous.start + 1;
             n->interrupt.as_name_len = p->previous.length - 2;
+            /* BUG-1347: the name is emitted verbatim as the handler's C symbol */
+            bool ok = n->interrupt.as_name_len > 0;
+            for (size_t k = 0; ok && k < n->interrupt.as_name_len; k++) {
+                char ch = n->interrupt.as_name[k];
+                bool alpha = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+                bool digit = ch >= '0' && ch <= '9';
+                if (!(alpha || (digit && k > 0))) ok = false;
+            }
+            if (!ok) error(p, "interrupt 'as' name must be a C identifier (the handler's symbol)");
         }
 
         n->interrupt.body = parse_block(p);
@@ -3164,23 +3152,62 @@ static Node *parse_declaration(Parser *p) {
     }
 
     /* function or global variable */
-    {
-        Node *n = parse_func_or_var(p, false);
-        /* apply section/naked attributes if present */
-        if (n && section_str) {
-            if (n->kind == NODE_FUNC_DECL) {
-                n->func_decl.section = section_str;
-                n->func_decl.section_len = section_len;
-            } else if (n->kind == NODE_GLOBAL_VAR) {
-                n->var_decl.section = section_str;
-                n->var_decl.section_len = section_len;
-            }
-        }
-        if (n && is_naked && n->kind == NODE_FUNC_DECL) {
-            n->func_decl.is_naked = true;
-        }
-        return n;
+    return parse_func_or_var(p, false);
+}
+
+/* BUG-1346: `section(...)` / `naked` are parsed HERE and applied to whatever
+ * declaration follows. They used to be applied only on the generic
+ * function-or-variable path at the end of the declaration parser, and every
+ * earlier `return` — `volatile`, `const`, `static`, `threadlocal`, `interrupt`,
+ * `async` — dropped them in silence: a DMA buffer `section(".dma") volatile
+ * u8[64] buf;` landed in default RAM, a `.noinit` flag was zeroed at every reset,
+ * a `.ramfunc` ISR ran from flash. A declaration that cannot carry the attribute
+ * is now an error instead of a no-op. */
+static Node *parse_declaration(Parser *p) {
+    /* section("name") — attribute for next declaration */
+    const char *section_str = NULL;
+    size_t section_len = 0;
+    if (check(p, TOK_IDENT) && p->current.length == 7 &&
+        memcmp(p->current.start, "section", 7) == 0) {
+        advance(p); /* consume "section" */
+        consume(p, TOK_LPAREN, "expected '(' after 'section'");
+        consume(p, TOK_STRING, "expected string in section()");
+        section_str = p->previous.start + 1;
+        section_len = p->previous.length - 2;
+        consume(p, TOK_RPAREN, "expected ')' after section string");
     }
+
+    /* naked — attribute for next function */
+    bool is_naked = false;
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "naked", 5) == 0) {
+        advance(p); /* consume "naked" */
+        is_naked = true;
+    }
+
+    Node *n = parse_declaration_rest(p);
+    if (!n) return n;
+    if (section_str) {
+        if (n->kind == NODE_FUNC_DECL) {
+            n->func_decl.section = section_str;
+            n->func_decl.section_len = section_len;
+        } else if (n->kind == NODE_GLOBAL_VAR) {
+            n->var_decl.section = section_str;
+            n->var_decl.section_len = section_len;
+        } else if (n->kind == NODE_INTERRUPT) {
+            n->interrupt.section = section_str;
+            n->interrupt.section_len = section_len;
+        } else {
+            error(p,
+                "section(...) applies to a function, a global variable or an "
+                "interrupt handler, not to this declaration");
+        }
+    }
+    if (is_naked) {
+        if (n->kind == NODE_FUNC_DECL) n->func_decl.is_naked = true;
+        else error(p, "'naked' applies only to a function");
+    }
+    return n;
 }
 
 /* ================================================================

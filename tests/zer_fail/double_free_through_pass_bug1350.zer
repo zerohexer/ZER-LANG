@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: double free
+// BUG-1350: consume(pass(o)) frees o.p (the fields of the argument pass hands back).
+struct T { u32 v; }
+struct W { *T p; }
+void consume(W o) { free(o.p); }
+W pass(W o) { return o; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    W o = { .p = a };
+    consume(pass(o));
+    *T b = alloc(T) orelse { free(a); return 0; };
+    b.v = 7;
+    a.v = 99;
+    u32 r = b.v;
+    free(b);
+    free(a);
+    return r;
+}

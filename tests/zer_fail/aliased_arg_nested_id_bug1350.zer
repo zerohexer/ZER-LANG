@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: designates the same allocation
+// BUG-1350: f(x, id(x)) where f frees param 2 and reads param 1.
+struct T { u32 v; }
+*T id(*T p) { return p; }
+u32 f(*T a, *T c) {
+    free(c);
+    *T b = alloc(T) orelse { return 0; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T x = alloc(T) orelse return;
+    return f(x, id(x));
+}

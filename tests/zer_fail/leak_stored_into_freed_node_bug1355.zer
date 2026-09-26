@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1355: n.p = a; free(n); — a leaked with its only holder.
+struct T { u32 v; }
+struct N { ?*T p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *N n = alloc(N) orelse { free(a); return 0; };
+    n.p = a;
+    free(n);
+    return 0;
+}

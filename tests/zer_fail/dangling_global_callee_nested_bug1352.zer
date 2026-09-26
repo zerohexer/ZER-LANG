@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: dangling global
+// BUG-1352: reg(p) { gs2[1].p = p; }
+struct T { u32 v; }
+struct S { ?*T p; }
+?*T g;
+?*T[2] garr;
+S gs;
+S[2] gs2;
+void reg(*T p) { gs2[1].p = p; }
+u32 rd() { u32 r = 0; if (g) |q| { r += q.v; } if (garr[1]) |q| { r += q.v; } if (gs.p) |q| { r += q.v; } if (gs2[1].p) |q| { r += q.v; } return r; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    reg(a);
+    free(a);
+    *T b = alloc(T) orelse { return 0; };
+    b.v = 99;
+    u32 r = rd();
+    free(b);
+    return r;
+}

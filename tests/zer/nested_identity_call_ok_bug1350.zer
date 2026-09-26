@@ -1,0 +1,21 @@
+// BUG-1350 boundary.
+// BUG-1350 boundary: a nested identity call IS its argument — using it while
+// the allocation lives, and freeing through either name exactly once, is fine.
+struct T { u32 v; }
+struct W { *T p; }
+*T id(*T p) { return p; }
+W wrap(*T p) { W w = { .p = p }; return w; }
+*T unwrap(W w) { return w.p; }
+u32 rd(*T x, *T y) { return x.v + y.v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 3;
+    *T c = id(id(a));
+    u32 r = c.v;
+    *T d = unwrap(wrap(a));
+    r += d.v;
+    r += wrap(a).p.v;
+    r += rd(a, id(a));           // two views of one live allocation: no free
+    free(c);                     // frees a — once
+    return r - 15;
+}

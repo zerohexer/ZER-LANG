@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot satisfy
+// BUG-1353: keep must be inferred for `gnn = { .n = { .p = p } };`, so put(&x) is refused.
+struct N { ?*u32 p; }
+struct NN { N n; }
+?*u32 g;
+N gn;
+N[2] garr;
+NN gnn;
+[*]u32 gsl;
+*u32 id(*u32 p) { return p; }
+?*u32 pp(*u32 p) { return p; }
+[*]u32 sv([*]u32 s) { return s[0..1]; }
+void put(*u32 p) { gnn = { .n = { .p = p } }; }
+void f() { u32 x = 42; put(&x); }
+u32 main() { f(); return 0; }

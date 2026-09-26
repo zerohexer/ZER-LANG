@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1351: PT x = { .p = p }; s.data[1] = x; stores p into s.data[1].p.
+struct T { u32 v; }
+struct PT { ?*T p; }
+struct S { PT in; ?*T[2] arr; ?*T p; PT[2] data; }
+void put(*S s, *T p) { PT x = { .p = p }; s.data[1] = x; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    S s;
+    put(&s, a);
+    free(a);
+    *T b = alloc(T) orelse { return 0; };
+    b.v = 99;
+    u32 r = 0;
+    if (s.in.p) |q| { r += q.v; }
+    if (s.arr[1]) |q| { r += q.v; }
+    if (s.p) |q| { r += q.v; }
+    if (s.data[1].p) |q| { r += q.v; }
+    free(b);
+    return r;
+}

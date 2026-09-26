@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: may be a view
+// BUG-1351: put(&s, a, k) stores a into s.data[k].p; free(a); read s.data[0].p.
+struct T { u32 v; }
+struct PT { ?*T p; }
+struct S { PT[4] data; u32 top; }
+void put(*S s, *T p, u32 k) { s.data[k].p = p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    S s;
+    put(&s, a, 0);
+    free(a);
+    *T b = alloc(T) orelse { return 0; };
+    b.v = 99;
+    u32 r = 0;
+    if (s.data[0].p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: left dangling
+// BUG-1350: g = id(id(a)) then free(a) leaves g dangling.
+struct T { u32 v; }
+*T id(*T p) { return p; }
+?*T g;
+void mk() {
+    *T a = alloc(T) orelse return;
+    g = id(id(a));
+    free(a);
+}
+u32 main() {
+    mk();
+    *T c = g orelse return;
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = c.v;
+    free(b);
+    return r;
+}

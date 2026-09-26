@@ -5398,7 +5398,7 @@ static bool reject_array_view_qualifier_drop(Checker *c, Node *v, Type *dest, in
 static bool typenode_has_qual(TypeNode *tn, TypeNodeKind q) {
     for (int d = 0; tn && d < 16; d++) {
         if (tn->kind == q) return true;
-        if (tn->kind == TYNODE_CONST || tn->kind == TYNODE_VOLATILE) tn = tn->qualified.inner;
+        if (TYNODE_CONST == tn->kind || TYNODE_VOLATILE == tn->kind) tn = tn->qualified.inner;
         else return false;
     }
     return false;

@@ -6899,12 +6899,54 @@ static void borrow_roots_add(Checker *c, struct BorrowRoots *br, const char *n, 
 /* The names a ROOT identifier contributes: itself when its storage is what the
  * value points into (an array viewed, an object whose address is taken), and
  * whatever it was recorded to point into (a pointer / carrier local). */
+/* BUG-1333: the globals a GLOBAL pointer may be aimed at — its declaration
+ * initializer and every `gp = &x` anywhere in the program (the AIM query the
+ * RMW scans use, for_each_write_target). */
+typedef struct { struct BorrowRoots *br; int n; } GlobalAimUd;
+static void global_aim_visit(Checker *c, Symbol *g, void *ud) {
+    GlobalAimUd *u = (GlobalAimUd *)ud;
+    if (!g || g->is_function) return;
+    borrow_roots_add(c, u->br, g->name, g->name_len);
+    u->n++;
+}
+static int borrow_roots_of_global_pointer(Checker *c, struct BorrowRoots *br, Node *id,
+                                          Symbol *s) {
+    if (!s || s->is_function || !s->type || global_decl_lookup(c, s->name, s->name_len) != s)
+        return -1;
+    if (!type_carries_data_pointer(s->type, 0)) return -1;
+    GlobalAimUd u = { br, 0 };
+    for_each_write_target_ex(c, id, true, global_aim_visit, &u);
+    return u.n;
+}
 static void borrow_roots_of_ident(Checker *c, struct BorrowRoots *br, Node *id,
                                   bool storage_itself) {
     Symbol *s = scope_lookup(c->current_scope, id->ident.name, (uint32_t)id->ident.name_len);
     if (!s) return;
     if (storage_itself) borrow_roots_add(c, br, s->name, s->name_len);
     if (s->borrow_root_name) borrow_roots_add(c, br, s->borrow_root_name, s->borrow_root_len);
+    /* BUG-1333: a GLOBAL pointer lends what it is aimed at. `*u32 gp = &g;`
+     * then `spawn w(gp)` (or a local copy of gp) handed g to the thread with no
+     * borrow — the declaration initializer of a global was never recorded. An
+     * aim the walk cannot follow (a reassignment it cannot resolve) leaves the
+     * pointer's own name as the stand-in, below. */
+    if (!storage_itself) {
+        int aimed = borrow_roots_of_global_pointer(c, br, id, s);
+        if (aimed > 0 && (s->is_const || global_name_never_mutated(c, s))) return;
+    }
+    /* BUG-1332: a POINTER / SLICE name with no recorded root points at memory
+     * the compiler cannot name (a heap allocation, a param's pointee). The
+     * pointer's own name then STANDS FOR that pointee: a carrier holding it
+     * (`H h = { .p = p }`, `_zer_async_f_init(&t, p)`) lends `p`, so a
+     * `free(p)` / `p.v += 1` between `spawn w(&h)` and the join is refused —
+     * exactly as for `spawn w(p)`. Pre-fix the carrier lent nothing and the
+     * parent freed the payload under the running thread. */
+    if (!storage_itself && !s->borrow_root_name && !s->is_function) {
+        Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
+        if (st && type_is_optional(st)) st = type_unwrap_distinct(type_unwrap_optional(st));
+        TypeKind sk = st ? type_dispatch_kind(st) : TYPE_VOID;
+        if (sk == TYPE_POINTER || sk == TYPE_SLICE)
+            borrow_roots_add(c, br, s->name, s->name_len);
+    }
 }
 static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, int depth);
 /* BUG-1285: the GLOBALS a named callee's `return`s may point into. `*u32 p =
@@ -6914,7 +6956,64 @@ static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, in
  * the CALLER's scope, and a param's pointee arrives through the argument walk. */
 typedef bool (*OrelseBlockFn)(Checker *c, Node *block, void *ud);
 static bool for_each_orelse_block(Checker *c, Node *e, OrelseBlockFn fn, void *ud, int depth);
-typedef struct { struct BorrowRoots *br; Node *fn; int depth; } RetRootsUd;
+typedef struct { struct BorrowRoots *br; Node *fn; int depth; bool local_scanned; } RetRootsUd;
+static void ret_local_scan(Checker *c, Node *fn, struct BorrowRoots *br);   /* BUG-1335 */
+static bool fn_has_param_named(Node *fn, const char *name, uint32_t len) {
+    if (!fn || fn->kind != NODE_FUNC_DECL) return false;
+    for (int i = 0; i < fn->func_decl.param_count; i++)
+        if (fn->func_decl.params[i].name_len == len &&
+            memcmp(fn->func_decl.params[i].name, name, len) == 0) return true;
+    return false;
+}
+/* BUG-1335: does a pointer-carrying RETURN value name a local the callee binds
+ * (not a param)? Walks the value spellings collect_borrow_roots follows. */
+static bool ret_expr_names_callee_local(Checker *c, Node *fn, Node *e, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    switch (e->kind) {
+    case NODE_IDENT: {
+        Type *t = typemap_get(c, e);
+        if (t && !type_can_carry_pointer(t) && type_dispatch_kind(t) != TYPE_ARRAY)
+            return false;
+        return fn_binds_name(fn, e->ident.name, (uint32_t)e->ident.name_len) &&
+               !fn_has_param_named(fn, e->ident.name, (uint32_t)e->ident.name_len);
+    }
+    case NODE_UNARY:   return ret_expr_names_callee_local(c, fn, e->unary.operand, depth + 1);
+    case NODE_FIELD:   return ret_expr_names_callee_local(c, fn, e->field.object, depth + 1);
+    case NODE_INDEX:   return ret_expr_names_callee_local(c, fn, e->index_expr.object, depth + 1);
+    case NODE_SLICE:   return ret_expr_names_callee_local(c, fn, e->slice.object, depth + 1);
+    case NODE_TYPECAST: return ret_expr_names_callee_local(c, fn, e->typecast.expr, depth + 1);
+    case NODE_ORELSE:
+        return ret_expr_names_callee_local(c, fn, e->orelse.expr, depth + 1) ||
+               ret_expr_names_callee_local(c, fn, e->orelse.fallback, depth + 1);
+    case NODE_CALL:
+        for (int i = 0; i < e->call.arg_count; i++)
+            if (ret_expr_names_callee_local(c, fn, e->call.args[i], depth + 1)) return true;
+        return false;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++)
+            if (ret_expr_names_callee_local(c, fn, e->intrinsic.args[i], depth + 1)) return true;
+        return false;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++)
+            if (ret_expr_names_callee_local(c, fn, e->struct_init.fields[i].value, depth + 1))
+                return true;
+        return false;
+    /* scalar-producing / non-value kinds carry no callee local's pointer */
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_INT_LIT: case NODE_FLOAT_LIT:
+    case NODE_STRING_LIT: case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
 static void ret_roots_stmt(Checker *c, Node *n, RetRootsUd *u);
 static bool ret_roots_orelse_cb(Checker *c, Node *block, void *ud) {
     ret_roots_stmt(c, block, (RetRootsUd *)ud);
@@ -6930,6 +7029,13 @@ static void ret_roots_stmt(Checker *c, Node *n, RetRootsUd *u) {
         if (n->ret.expr) {
             struct BorrowRoots tmp = {0};
             collect_borrow_roots(c, n->ret.expr, &tmp, u->depth + 1);
+            /* BUG-1335: the returned value may be (or carry) a callee LOCAL's
+             * pointer; its names resolve in the CALLER's scope here, so they are
+             * not even seen. What may such a local hold? */
+            if (!u->local_scanned && ret_expr_names_callee_local(c, u->fn, n->ret.expr, 0)) {
+                u->local_scanned = true;
+                ret_local_scan(c, u->fn, u->br);
+            }
             for (int i = 0; i < tmp.count; i++) {
                 if (fn_binds_name(u->fn, tmp.n[i], tmp.l[i])) continue;
                 Symbol *g = global_decl_lookup(c, tmp.n[i], tmp.l[i]);
@@ -7000,7 +7106,7 @@ static void call_return_roots(Checker *c, Node *call, struct BorrowRoots *br, in
         if (_ret_roots_active[i] == fs->func_node) return;   /* recursion: already walking it */
     if (_ret_roots_active_n > ZER_EXPR_WALK_MAX) return;
     _ret_roots_active[_ret_roots_active_n++] = fs->func_node;
-    RetRootsUd u = { br, fs->func_node, depth };
+    RetRootsUd u = { br, fs->func_node, depth, false };
     ret_roots_stmt(c, fs->func_node->func_decl.body, &u);
     _ret_roots_active_n--;
 }
@@ -7091,6 +7197,37 @@ static void record_borrow_roots_from_value(Checker *c, Symbol *sym, Node *v) {
             sym->borrow_root_ambiguous = true;
         sym->borrow_root_name = br.n[i];
         sym->borrow_root_len = br.l[i];
+    }
+}
+
+/* BUG-1331: an async TASK stores every `_init` argument, so `&task` handed to
+ * a scoped spawn lends what those arguments point into — `_zer_async_f_init(&t,
+ * &x); ThreadHandle th = spawn w(&t); x += 1;` raced the child's poll (TSan)
+ * because the task symbol carried no borrow root. Record the roots of args
+ * 1.. on the task's ROOT symbol (the `&t` / `&t.f` / `&arr[i]` operand root), and
+ * on a pointer local naming the task (`init(tp, …)`), exactly as a struct
+ * carrier records its fields. The task type need not "carry a pointer" by the
+ * type predicate — the synthetic struct is opaque to it — so the gate of
+ * record_borrow_roots_from_value is bypassed deliberately. */
+static void async_init_record_task_roots(Checker *c, Node *call) {
+    if (!call || call->call.arg_count < 2) return;
+    Node *a0 = call->call.args[0];
+    Node *r = a0;
+    if (r && r->kind == NODE_UNARY && r->unary.op == TOK_AMP) {
+        r = r->unary.operand;
+        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX))
+            r = r->kind == NODE_FIELD ? r->field.object : r->index_expr.object;
+    }
+    if (!r || r->kind != NODE_IDENT) return;
+    Symbol *ts = scope_lookup(c->current_scope, r->ident.name, (uint32_t)r->ident.name_len);
+    if (!ts || ts->is_function) return;
+    for (int i = 1; i < call->call.arg_count; i++) {
+        struct BorrowRoots br = {0};
+        collect_borrow_roots(c, call->call.args[i], &br, 0);
+        for (int k = 0; k < br.count; k++) {
+            if (ts->name_len == br.l[k] && memcmp(ts->name, br.n[k], br.l[k]) == 0) continue;
+            borrow_roots_add_to_sym(ts, br.n[k], br.l[k]);
+        }
     }
 }
 
@@ -10848,6 +10985,25 @@ static bool borrow_alias_reaches_lent_root(Checker *c, Symbol *alias) {
     return rs && rs != alias && rs->is_borrowed_by_thread;
 }
 
+/* BUG-1334: the parent's own use of a GLOBAL pointer aimed at a lent global —
+ * `*u32 gp = &g; spawn w(&g); *gp += 1;`. A global's aim is not a recorded
+ * borrow root (it is program-wide), so ask the AIM query. NULL when none. */
+typedef struct { Symbol *hit; } LentAimUd;
+static void lent_aim_visit(Checker *c, Symbol *g, void *ud) {
+    (void)c;
+    LentAimUd *u = (LentAimUd *)ud;
+    if (!u->hit && g && !g->is_function && g->is_borrowed_by_thread) u->hit = g;
+}
+static Symbol *global_pointer_lent_aim(Checker *c, Symbol *sym, Node *id) {
+    if (!sym || !id || c->lent_global_count == 0 || sym->is_borrowed_by_thread ||
+        sym->is_function || !sym->type || !type_carries_data_pointer(sym->type, 0) ||
+        global_decl_lookup(c, sym->name, sym->name_len) != sym)
+        return NULL;
+    LentAimUd u = { NULL };
+    for_each_write_target_ex(c, id, true, lent_aim_visit, &u);
+    return u.hit;
+}
+
 /* Does this lvalue / value path DEREFERENCE something on its way to the root —
  * an explicit `*`, or a field / element reached through a pointer or slice?
  * (`h.x = 3` on a by-value struct writes h itself; `h.p.x` / `*q` / `s[i]` on a
@@ -10985,11 +11141,20 @@ static Type *check_expr(Checker *c, Node *node) {
             TypeKind ak = type_dispatch_kind(sym->type);
             if (ak == TYPE_POINTER || ak == TYPE_SLICE)
                 checker_error(c, node->loc.line,
-                    "cannot use '%.*s' while '%.*s', which it points into, is borrowed "
+                    "cannot use '%.*s' while '%.*s', which it points into (or copies), is borrowed "
                     "by a scoped spawn — the thread may be writing it until its "
                     ".join() (data race). Join first",
                     (int)node->ident.name_len, node->ident.name,
                     (int)sym->borrow_root_len, sym->borrow_root_name);
+        } else if (sym && !c->in_assign_target && !c->in_amp) {
+            Symbol *lg = global_pointer_lent_aim(c, sym, node);   /* BUG-1334 */
+            if (lg)
+                checker_error(c, node->loc.line,
+                    "cannot use '%.*s' while '%.*s', which it points into, is borrowed "
+                    "by a scoped spawn — the thread may be writing it until its "
+                    ".join() (data race). Join first",
+                    (int)node->ident.name_len, node->ident.name,
+                    (int)lg->name_len, lg->name);
         }
         if (sym && sym->is_borrowed_by_thread && !c->in_assign_target && !c->in_amp) {
             checker_error(c, node->loc.line,
@@ -11716,6 +11881,15 @@ static Type *check_expr(Checker *c, Node *node) {
                         "Join first",
                         (int)troot->ident.name_len, troot->ident.name,
                         (int)bts->borrow_root_len, bts->borrow_root_name);
+                } else if (bts && target_path_derefs(c, node->assign.target)) {
+                    Symbol *lg = global_pointer_lent_aim(c, bts, troot);   /* BUG-1334 */
+                    if (lg)
+                        checker_error(c, node->loc.line,
+                            "cannot write through '%.*s' — it points into '%.*s', which "
+                            "is borrowed by a scoped spawn until its .join() (data "
+                            "race). Join first",
+                            (int)troot->ident.name_len, troot->ident.name,
+                            (int)lg->name_len, lg->name);
                 }
             }
         }
@@ -14946,6 +15120,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 {
                     int ai_off = 0;
                     Type *ai_sig = async_init_keep_sig(c, node, effective_callee, &ai_off);
+                    if (ai_sig) async_init_record_task_roots(c, node);   /* BUG-1331 */
                     for (int i = 0; i < (int)effective_callee->func_ptr.param_count &&
                          i < node->call.arg_count; i++) {
                         if (ai_sig && i < ai_off) continue;   /* the task pointer itself */
@@ -18805,7 +18980,26 @@ static Type *check_expr(Checker *c, Node *node) {
                                         node->loc.line);
                             }
                         }
-                        if (!is_glob && rs && !rs->is_static && !through_ptr)
+                        /* BUG-1336: an atomic on an object LENT to a scoped spawn.
+                         * The borrow checks skip an `&` operand (in_amp), so the
+                         * parent's `@atomic_add(&g, 1)` raced the thread's PLAIN
+                         * `*p += 1` — an atomic is only atomic against other
+                         * atomics. The stack-local form was refused for the wrong
+                         * reason ("no other thread can reference it" — one does). */
+                        Symbol *lent = NULL;
+                        if (rs && !through_ptr && rs->is_borrowed_by_thread) lent = rs;
+                        else if (rs && borrow_alias_reaches_lent_root(c, rs))
+                            lent = scope_lookup(c->current_scope, rs->borrow_root_name,
+                                                rs->borrow_root_len);
+                        else if (rs && through_ptr)
+                            lent = global_pointer_lent_aim(c, rs, root);
+                        if (lent)
+                            checker_error(c, node->loc.line,
+                                "@%.*s on '%.*s' while it is borrowed by a scoped spawn — "
+                                "the thread holds it until .join() and need not access it atomically, so this "
+                                "still races them (data race). join() first",
+                                (int)nlen, name, (int)lent->name_len, lent->name);
+                        else if (!is_glob && rs && !rs->is_static && !through_ptr)
                             checker_error(c, node->loc.line,
                                 "@%.*s target '%.*s' is a stack local — an atomic on "
                                 "private frame memory is meaningless (no other thread "
@@ -26731,23 +26925,22 @@ static void check_stmt(Checker *c, Node *node) {
                                 "directly, or copy the data by value", bi + 1);
                             continue;
                         }
-                        if (as && as->borrow_root_name) {
-                            cand_n[cand_c] = as->borrow_root_name;
-                            cand_l[cand_c] = as->borrow_root_len; cand_c++;
-                        }
-                        /* The value itself, when it can reach memory the parent also
-                         * can: a pointer or slice (or a struct carrying one). A plain
-                         * scalar argument is COPIED and lends nothing. */
+                        /* The roots the value reaches (recorded root, and — BUG-1333 —
+                         * every global a GLOBAL pointer is aimed at), then the value
+                         * itself when it can reach memory the parent also can: a
+                         * pointer or slice (or a struct carrying one). A plain scalar
+                         * argument is COPIED and lends nothing. */
+                        struct BorrowRoots ibr = {0};
+                        collect_borrow_roots(c, ba, &ibr, 0);
                         TypeKind ak = as ? type_dispatch_kind(as->type) : TYPE_VOID;
                         /* BUG-1248: an ARRAY passed to a `[*]T` parameter is
                          * coerced to a view of its own storage — it lends itself. */
                         bool reaches = as && (ak == TYPE_POINTER || ak == TYPE_SLICE ||
-                                              ak == TYPE_ARRAY ||
-                                              as->borrow_root_name != NULL);
-                        if (reaches) {
-                            cand_n[cand_c] = ba->ident.name;
-                            cand_l[cand_c] = (uint32_t)ba->ident.name_len; cand_c++;
-                        }
+                                              ak == TYPE_ARRAY || ibr.count > 0);
+                        if (reaches)
+                            borrow_roots_add(c, &ibr, ba->ident.name,
+                                             (uint32_t)ba->ident.name_len);
+                        cand_np = ibr.n; cand_lp = ibr.l; cand_c = ibr.count;
                     }
                     else {
                         /* BUG-1248: any other argument spelling — a sub-slice
@@ -26863,6 +27056,22 @@ static void check_stmt(Checker *c, Node *node) {
                     }
                     /* D7: record EVERY borrow (was: first only, then `break`), so
                      * join() releases each. First entry mirrors the legacy field. */
+                    if (sym->th_borrow_count >= bcap) {   /* grow: every lent name must be released */
+                        int nc = bcap * 2;
+                        const char **nn = (const char **)arena_alloc(c->arena,
+                            sizeof(const char *) * (size_t)nc);
+                        uint32_t *nl = (uint32_t *)arena_alloc(c->arena,
+                            sizeof(uint32_t) * (size_t)nc);
+                        if (nn && nl) {
+                            if (sym->th_borrow_count) {
+                                memcpy(nn, sym->th_borrow_names,
+                                       sizeof(const char *) * (size_t)sym->th_borrow_count);
+                                memcpy(nl, sym->th_borrow_lens,
+                                       sizeof(uint32_t) * (size_t)sym->th_borrow_count);
+                            }
+                            sym->th_borrow_names = nn; sym->th_borrow_lens = nl; bcap = nc;
+                        }
+                    }
                     if (sym->th_borrow_names && sym->th_borrow_lens &&
                         sym->th_borrow_count < bcap) {
                         sym->th_borrow_names[sym->th_borrow_count] = vn;
@@ -30471,12 +30680,20 @@ typedef struct CalleeGlobalWalk {
     Node *cur_once;   /* BUG-1276: innermost @once on the walk (NULL outside) */
     Node *field_obj;  /* BUG-1295: the object of the `.f` / `[i]` being descended */
     bool ident_whole; /* BUG-1295: the ident just visited names the WHOLE object */
+    bool follow_pointee; /* BUG-1334: a global POINTER named also reaches its aims */
+    bool in_addr;        /* BUG-1335: below an `&` / a slice's object */
+    Node *cur_ident;     /* BUG-1335: the ident being visited */
     Node **seen;
     int seen_count, seen_cap;
     Node *seen_stack[16];
 } CalleeGlobalWalk;
 
 static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w);
+typedef struct { CalleeGlobalWalk *w; int line; } CalleePointeeUd;
+static void callee_pointee_visit(Checker *c, Symbol *g, void *ud) {
+    CalleePointeeUd *u = (CalleePointeeUd *)ud;
+    if (g && !g->is_function) u->w->visit(c, g, u->line, u->w->ud);
+}
 
 static void callee_global_walk_init(CalleeGlobalWalk *w) {
     w->seen = w->seen_stack;
@@ -30507,8 +30724,17 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
         Symbol *gs = global_decl_lookup(c, node->ident.name,
                                   (uint32_t)node->ident.name_len);
         w->ident_whole = (node != w->field_obj);   /* BUG-1295 */
-        if (gs && !gs->is_function)
+        w->cur_ident = node;                       /* BUG-1335 */
+        if (gs && !gs->is_function) {
             w->visit(c, gs, node->loc.line, w->ud);
+            /* BUG-1334: `void bump() { *gp += 1; }` with `*u32 gp = &g;` reaches
+             * g — naming the pointer was only ever naming gp, so a callee writing
+             * through it while g was lent to a scoped spawn raced unchecked. */
+            if (w->follow_pointee && gs->type && type_carries_data_pointer(gs->type, 0)) {
+                CalleePointeeUd pu = { w, node->loc.line };
+                for_each_write_target_ex(c, node, true, callee_pointee_visit, &pu);
+            }
+        }
         return;
     }
     case NODE_INTRINSIC: {
@@ -30558,7 +30784,13 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
         walk_callee_globals(c, node->index_expr.index, w);
         return;
     }
-    case NODE_UNARY:  walk_callee_globals(c, node->unary.operand, w); return;
+    case NODE_UNARY: {
+        bool sv = w->in_addr;
+        if (node->unary.op == TOK_AMP) w->in_addr = true;   /* BUG-1335 */
+        walk_callee_globals(c, node->unary.operand, w);
+        w->in_addr = sv;
+        return;
+    }
     case NODE_BINARY:
         walk_callee_globals(c, node->binary.left, w);
         walk_callee_globals(c, node->binary.right, w);
@@ -30599,11 +30831,15 @@ static void walk_callee_globals(Checker *c, Node *node, CalleeGlobalWalk *w) {
         walk_callee_globals(c, node->orelse.expr, w);
         walk_callee_globals(c, node->orelse.fallback, w);
         return;
-    case NODE_SLICE:
+    case NODE_SLICE: {
+        bool sv = w->in_addr;
+        w->in_addr = true;   /* BUG-1335: a view of the object's storage */
         walk_callee_globals(c, node->slice.object, w);
+        w->in_addr = sv;
         walk_callee_globals(c, node->slice.start, w);
         walk_callee_globals(c, node->slice.end, w);
         return;
+    }
     case NODE_STRUCT_INIT:
         for (int i = 0; i < node->struct_init.field_count; i++)
             walk_callee_globals(c, node->struct_init.fields[i].value, w);
@@ -30673,6 +30909,40 @@ static void record_atomic_plain_in_callee(Checker *c, Node *node, int depth) {
     walk_callee_globals_body(c, node, &w);
 }
 
+/* BUG-1335: the globals a callee's LOCAL may point into when the callee returns
+ * it. ret_roots_stmt resolves a returned name in the CALLER's scope, so `H mk()
+ * { H h = { .p = &g }; return h; }` lent nothing (the name `h` is the callee's
+ * and was dropped). Following that local's writes precisely would have to see
+ * field stores, `&h` handed to helpers and nested calls, so over-approximate
+ * instead — soundly: a callee local can only hold a pointer to a global whose
+ * address the callee (or a function it calls) forms, a global array it views,
+ * or what a global pointer it names is aimed at. Params are excluded by the
+ * caller — their pointee arrives through the argument walk. */
+typedef struct { struct BorrowRoots *br; CalleeGlobalWalk *w; } RetLocalUd;
+static void ret_local_global_visit(Checker *c, Symbol *g, int line, void *ud) {
+    (void)line;
+    RetLocalUd *u = (RetLocalUd *)ud;
+    if (!g || g->is_function || !g->type) return;
+    if (u->w->in_addr ||
+        (u->w->ident_whole && type_dispatch_kind(g->type) == TYPE_ARRAY)) {
+        borrow_roots_add(c, u->br, g->name, g->name_len);
+        return;
+    }
+    if (type_carries_data_pointer(g->type, 0) && u->w->cur_ident)
+        borrow_roots_of_global_pointer(c, u->br, u->w->cur_ident, g);
+}
+static void ret_local_scan(Checker *c, Node *fn, struct BorrowRoots *br) {
+    if (!fn || fn->kind != NODE_FUNC_DECL || !fn->func_decl.body) return;
+    CalleeGlobalWalk w;
+    memset(&w, 0, sizeof(w));
+    callee_global_walk_init(&w);
+    RetLocalUd u = { br, &w };
+    w.visit = ret_local_global_visit;
+    w.ud = &u;
+    w.skip_atomic_target = false;
+    walk_callee_globals_body(c, fn->func_decl.body, &w);
+}
+
 /* BUG-1125: a global LENT to a scoped spawn (BUG-1118) is refused to the parent's
  * own statements until join(), and was NOT refused to the functions the parent
  * CALLS in that window:
@@ -30736,6 +31006,7 @@ static void check_call_vs_lent_globals(Checker *c, Node *call) {
     w.on_opaque_call = lent_opaque_visit;
     w.ud = &u;
     w.skip_atomic_target = false;   /* an atomic access still races the thread's plain one */
+    w.follow_pointee = true;        /* BUG-1334 */
     DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
     walk_callee_globals_body(c, fs->func_node->func_decl.body, &w);
     decl_module_leave(c, dm);
@@ -30811,6 +31082,7 @@ static void check_call_vs_once_lent(Checker *c, Node *call) {
     w.ud = &u;
     w.skip_atomic_target = false;
     w.cur_once = c->cur_once_node;   /* a call made inside the @once is inside it */
+    w.follow_pointee = true;         /* BUG-1334 */
     DeclModuleSave dm = decl_module_enter(c, fs);
     walk_callee_globals_body(c, fs->func_node->func_decl.body, &w);
     decl_module_leave(c, dm);

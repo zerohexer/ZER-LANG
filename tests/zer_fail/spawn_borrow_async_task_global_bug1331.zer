@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot write to 'g' while it is borrowed
+// BUG-1331: _init(&t, &g) then spawn w(&t) lends g
+async void f(*u32 p) { while (true) { *p += 1; yield; } }
+void w(*_zer_async_f t) { for (u32 i = 0; i < 2000000; i += 1) { _zer_async_f_poll(t); } }
+u32 g;
+u32 main() { _zer_async_f t; _zer_async_f_init(&t, &g); ThreadHandle th = spawn w(&t); for (u32 i = 0; i < 2000000; i += 1) { g += 1; } th.join(); return 0; }

@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot write through 'p'
+// BUG-1332: h.p = p field-store carrier
+struct T { u32 v; }
+struct H { *T p; }
+void w(*H h) { for (u32 i = 0; i < 2000000; i += 1) { h.p.v += 1; } }
+u32 main() {
+    ?*T mp = alloc(T);
+    *T p = mp orelse return;
+    H h;
+    h.p = p;
+    ThreadHandle th = spawn w(&h);
+    for (u32 i = 0; i < 2000000; i += 1) { p.v += 1; }
+    th.join();
+    free(p);
+    return 0;
+}

@@ -57,10 +57,11 @@ repeated.
 7. **Emitter residuals from the value audit (measured):** a literal tree needing more
    than 64 bits folds at 64 outside a local var-decl (`x != 18446744073709551615 + 1` on a
    u128 compares against 0; `const u128 C = 18446744073709551615 + 1;` emits 0 — the
-   untyped-evaluator entry above); a `uN`/`iN` read through an `@inttoptr` MMIO pointer is
-   not masked to N bits (`u3 f = rr.a;` gave 127); a compound assignment reads its target
-   AFTER evaluating the right side (`g += setg()` = 11 where `g = g + setg()` = 2 — the
-   evaluation-order section does not promise the compound case); `const [*]u8 T =
+   untyped-evaluator entry above); a `uN`/`iN` LOAD on the AST emitter path is not re-wrapped to N bits (the IR path is,
+   BUG-1359); a compound assignment reads its target
+   AFTER evaluating the right side (`g += setg()` = 11 where `g = g + setg()` = 2) —
+   deterministic and now documented in reference.md "Evaluation Order", but the two
+   spellings differ; `const [*]u8 T =
    "hello"[2..];` at file scope emits a statement expression GCC refuses (loud); the AST
    emitter path (defer bodies of labelled functions, global initializers) got BUG-1349's
    parentheses but not its object-first evaluation order.

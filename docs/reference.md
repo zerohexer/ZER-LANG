@@ -5420,6 +5420,10 @@ Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once
 binary operators, comparisons, call arguments, struct-literal fields and array indices,
 whether an operand is a local, a global or a field. An assignment evaluates its TARGET
 (including every index in it) before its value, and yields the stored value.
+A COMPOUND assignment `t op= v` evaluates `v` first and then reads `t`: with a
+`setg()` that sets `g = 10` and returns 1, `g += setg()` is 11 while the written-out
+`g = g + setg()` reads `g` first and is 2. Write the long form when the right side
+changes the target.
 
 ```zer
 u32 bump(*u32 p) { *p += 10; return 1; }

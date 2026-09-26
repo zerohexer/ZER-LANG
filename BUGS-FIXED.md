@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-26 — BUG-1326..1358: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
+## Session 2026-09-26 — BUG-1326..1359: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
 
 Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict
 superset of `review/25092026`) forked exactly at main — fast-forwarded, `make check` green.
@@ -161,6 +161,13 @@ probes. Every entry below was A/B-measured against the post-harvest build.
   callee locals as it passes them), so both sides meet in one entry. Boundary: `@critical`
   on both sides, different registers/fields, ISR reads only. Tests:
   `tests/zer_fail/isr_mmio_register_rmw_{x2,x4,x8}_bug1358.zer`.
+- **BUG-1359 — a uN / iN read out of foreign memory was not narrowed to its width.**
+  ZER stores only in-range values, but a device register (or C, or a `@pun` view) can
+  leave bits above N set: `u3 f = rr.a;` through an MMIO pointer held 127, `i5 v = *reg;`
+  held 127 instead of -1, and every comparison read the raw carrier. The IR emits the
+  width wrap after each field / element / deref LOAD (`emit_intn_load_normalize`). The
+  AST emitter path (labelled-function defer bodies, global initializers) does not.
+  Test: `tests/zer/uN_load_from_mmio_masked_bug1359.zer`.
 - Tooling: `test_fuzz.c` declares `_POSIX_C_SOURCE` (implicit `fileno` warning — the build is
   otherwise warning-free).
 

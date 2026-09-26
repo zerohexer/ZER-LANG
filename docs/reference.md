@@ -4418,6 +4418,11 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
   neither.
 - TWO interrupt handlers sharing a global are treated exactly like an ISR and
   main: with nested priorities one handler preempts the other mid-update.
+- The same rule covers a peripheral REGISTER reached through a pointer bound to a
+  constant `@inttoptr` — even when each side forms its own pointer (`volatile *Regs
+  u = @inttoptr(*Regs, 0x40000000); u.ctrl |= 1;` in the handler and in main): the
+  register is identified by its address and field, so both read-modify-writes must
+  sit inside `@critical`.
 - `Pool`, `Ring`, `Slab` and `Arena` cannot be shared between an interrupt
   handler and other code — their bookkeeping is updated in several non-atomic
   steps, and `volatile` cannot fix that. Give each context its own, or hand

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: is read-modify-written and is written from both interrupt
+// BUG-1358: an MMIO register RMW'd from an ISR and main through pointers each side forms itself.
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32 status; }
+volatile *Regs ua = @inttoptr(*Regs, 0x40000000);
+volatile *Regs ub = @inttoptr(*Regs, 0x40000000);
+interrupt USART1 { ua.ctrl |= 1; }
+u32 main() { ub.ctrl |= 2; return 0; }

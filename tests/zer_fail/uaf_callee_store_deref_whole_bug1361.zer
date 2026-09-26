@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1361: *s = { .p = p } stores p into the caller object.
+struct T { u32 v; }
+struct PT { ?*T p; }
+void put(*PT s, *T p) { *s = { .p = p }; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    PT s;
+    put(&s, a);
+    free(a);
+    *T b = alloc(T) orelse { return 0; };
+    b.v = 99;
+    u32 r = 0;
+    if (s.p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

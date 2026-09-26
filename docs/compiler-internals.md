@@ -13820,7 +13820,7 @@ verdict; `compile` cells still build a real binary.
    "conservative", ask which way the failure actually rounds.
 
 
-## zercheck_ir: call-result identity and the callee STORE summary (BUG-1350..1352)
+## zercheck_ir: call-result identity and the callee STORE summary (BUG-1360..1352)
 
 - **A call argument can itself be a call result** (`id(id(a))`, `unwrap(wrap(a))`,
   `wrap(a).p`). The inner call is lowered into a temp, but every sink reads the ORIGINAL
@@ -13839,11 +13839,11 @@ verdict; `compile` cells still build a real binary.
   carried allocation at path + sub-path; `[*]` lands in the array wildcard as an aliasing
   `[*@L]` entry (`ir_slot_demote_into`); a GLOBAL placement marks the argument escaped, as
   the direct `g = p` does. Add a store spelling to the scan, never a second collector.
-- **An overwrite keeps the freed fact** (BUG-1354): `ir_report_overwrite` (the one "an
+- **An overwrite keeps the freed fact** (BUG-1364): `ir_report_overwrite` (the one "an
   entry is about to be overwritten" query) calls `ir_slot_note_overwrite`, which sets
   `freed_then_reset` / `maybe_freed_then_reset` — the flags the frees_param_field summary
   reads. A new arm that overwrites a slot must go through one of the two.
-- **A store into an OWNED object is not an escape** (BUG-1355): `ir_target_root_escapes`
+- **A store into an OWNED object is not an escape** (BUG-1365): `ir_target_root_escapes`
   exempts a non-param pointer local holding a live, owned, non-arena allocation.
 
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
@@ -13860,7 +13860,7 @@ UAF bugs (BUG-760..763) lives here; read this before editing.**
 - `is_nonkeep_derived` + `nonkeep_root_param` + **`nonkeep_root_mask`** — a non-keep
   pointer/slice/opaque/struct-carrying-pointer PARAM is a borrow rooted at param N;
   persisting it infers `keep`. Set at param registration (**must include TYPE_SLICE**,
-  BUG-761). Since BUG-1353 the SET of params is the fact (the mask): a join (`pick(p, q)`,
+  BUG-761). Since BUG-1363 the SET of params is the fact (the mask): a join (`pick(p, q)`,
   both orelse arms) carries every one. **Ask `keep_value_roots(c, value, 0)`** — the one
   query for "which non-keep params may this VALUE carry?" (field/index/slice/deref,
   launders, BOTH orelse arms, calls through the return summary — every argument for an

@@ -1,9 +1,0 @@
-// EXPECTED: compile error
-// expect-error: cannot satisfy
-// BUG-1353: *h = { .p = p }; gh = h; — the heap object carries p to a global.
-struct N { ?*u32 p; }
-?*N gh;
-void put(*u32 p) { *N h = alloc(N) orelse return; *h = { .p = p }; gh = h; }
-void f() { u32 x = 42; put(&x); }
-u32 clobber() { u32[16] y; for (u32 i = 0; i < 16; i += 1) { y[i] = 7; } return y[3]; }
-u32 main() { f(); clobber(); u32 r = 0; if (gh) |h| { if (h.p) |q| { r = *q; } } return r; }

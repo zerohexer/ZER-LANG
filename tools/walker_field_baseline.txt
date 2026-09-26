@@ -1857,7 +1857,7 @@ checker.c:init_bound_functions:NODE_UNARY:unary.operand
 checker.c:init_bound_functions:NODE_VAR_DECL:var_decl.init
 checker.c:init_bound_functions:NODE_WHILE:while_stmt.body
 checker.c:init_bound_functions:NODE_WHILE:while_stmt.cond
-# 2026-09-26 (BUG-1353): keep_value_roots asks which non-keep PARAMS a VALUE may carry. It
+# 2026-09-26 (BUG-1363): keep_value_roots asks which non-keep PARAMS a VALUE may carry. It
 # descends everything that can hand a reference on: projections (object side), deref, both
 # orelse arms, casts, launder intrinsics (via unwrap_ptr_launder), call arguments the return
 # summary allows, struct-literal fields. An index / slice bound is an integer; a BINARY or
@@ -1900,7 +1900,7 @@ checker.c:keep_value_roots:NODE_SWITCH:switch_stmt.expr
 checker.c:keep_value_roots:NODE_VAR_DECL:var_decl.init
 checker.c:keep_value_roots:NODE_WHILE:while_stmt.body
 checker.c:keep_value_roots:NODE_WHILE:while_stmt.cond
-# 2026-09-26 (BUG-1351): ir_ps_value classifies the VALUE of a store for the callee store
+# 2026-09-26 (BUG-1361): ir_ps_value classifies the VALUE of a store for the callee store
 # summary. A FIELD / INDEX value is a pointer READ out of memory — a different allocation than
 # any param's own ("FORMING a reference aliases; READING a value does not"); a reference INTO
 # a param (`&x.f`, `x[a..b]`) is followed by the UNARY / SLICE arm's own navigation loop. A

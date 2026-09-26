@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1360: wrap(a).p is a (ret_field view read out of a call result).
+struct T { u32 v; }
+struct W { *T p; }
+W wrap(*T p) { W w = { .p = p }; return w; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T c = wrap(a).p;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = c.v;
+    free(b);
+    return r;
+}

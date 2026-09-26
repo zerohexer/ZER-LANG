@@ -30,10 +30,10 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-09-26 memory round (BUG-1350..1355; measured)
+## OPEN — residuals of the 2026-09-26 memory round (BUG-1360..1355; measured)
 
 1. **A store THROUGH A GLOBAL POINTER into the global it points at is untracked** (MEDIUM —
-   accept-unsafe, found while closing BUG-1352, pre-existing in BOTH spellings).
+   accept-unsafe, found while closing BUG-1362, pre-existing in BOTH spellings).
    `?*T slot; *?*T gpp = &slot;` then `*gpp = a; free(a); rd()` (rd reads `slot`) returns
    the recycled object's value (exit 99), and so does the callee spelling `void reg(*T p) {
    *gpp = p; }`. The direct store has no key (`ir_extract_compound_key` does not follow a
@@ -44,7 +44,7 @@ repeated.
 2. **A callee store with TWO unnameable indices on one path is refused** (LOW — loud
    over-rejection). `void put(*S s, *T p, u32 i, u32 j) { s.m[i].row[j].p = p; }` — the
    caller's wildcard slot is keyed at the LAST index only, so no read could meet the entry;
-   the call site reports it (BUG-1351). Store through one index, or index the outer level
+   the call site reports it (BUG-1361). Store through one index, or index the outer level
    with a literal.
 3. **A struct-valued call whose field views name DIFFERENT params does not resolve as a view
    source** (LOW — same class as the BUG-849 multi-view rule, not yet taught here).
@@ -54,12 +54,12 @@ repeated.
    union of the ret_field params, as `ir_fill_multiview_set` does for a bare mask.
 4. **A callee that frees a field and stores a new value in it marks the caller's field
    freed** (LOW — over-rejection, the pre-existing field-widening coarseness, now also on
-   the "maybe" path, BUG-1354). `re(&h); free(h.p);` is refused although `h.p` holds the new
+   the "maybe" path, BUG-1364). `re(&h); free(h.p);` is refused although `h.p` holds the new
    allocation. The summary does not say what the callee stored after the free; the store
-   summary (BUG-1351) only records PARAM values. Fix sketch: record "field f of param i is
+   summary (BUG-1361) only records PARAM values. Fix sketch: record "field f of param i is
    REPLACED by a fresh allocation" and register it at the call site.
 5. **A node freed while a field still holds a live allocation is reported at EXIT, not at
-   the free** (LOW — wrong position, BUG-1355): `n.p = a; free(n);` says "'a' never freed"
+   the free** (LOW — wrong position, BUG-1365): `n.p = a; free(n);` says "'a' never freed"
    at the return. And an orelse fallback that returns while such a node is alive now reports
    the field's allocation as leaked there, where it used to be (wrongly) escaped — free the
    node in the fallback, or build the node after the last early exit.

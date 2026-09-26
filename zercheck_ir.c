@@ -448,7 +448,7 @@ static IRHandleInfo *ir_add_compound_handle(IRPathState *ps, int local_id,
     return h;
 }
 
-/* BUG-1354: a STORE is about to replace what the slot (local_id, path) holds.
+/* BUG-1364: a STORE is about to replace what the slot (local_id, path) holds.
  * If the slot's previous allocation was freed on this path, keep that FACT —
  * the FuncSummary reads it (frees_param_field). `void re(*H h) { *T n = alloc(T)
  * orelse return; free(h.p); h.p = n; }` freed the caller's allocation, but the
@@ -1492,7 +1492,7 @@ static bool ir_target_root_escapes(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                    Node *target) {
     Node *root = ir_target_root(target);
     if (!root || root->kind != NODE_IDENT) return false;
-    /* BUG-1355: a same-named LOCAL shadows the global — resolve locals first. */
+    /* BUG-1365: a same-named LOCAL shadows the global — resolve locals first. */
     int rl = func ? ir_find_local_exact_first(func, root->ident.name,
                                              (uint32_t)root->ident.name_len) : -1;
     /* Global check */
@@ -1505,7 +1505,7 @@ static bool ir_target_root_escapes(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         if (root_type) {
             Type *rt = type_unwrap_distinct(root_type);
             if (rt && type_dispatch_kind(rt) == TYPE_POINTER) {
-                /* BUG-1355: a pointer LOCAL holding an allocation THIS function
+                /* BUG-1365: a pointer LOCAL holding an allocation THIS function
                  * owns (`*N n = alloc(N) orelse ...; n.p = a;`) is not "somewhere
                  * outside" — the value now lives in an object the function still
                  * has to free or hand on. Marking it escaped made `free(n);`
@@ -2774,7 +2774,7 @@ static bool ir_fill_multiview_set(ZerCheck *zc, IRFunc *func, IRPathState *ps,
  * `h.p` unusable once `a` is freed. */
 static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
                                         IRPathState *ps, Node *arg);
-static Node *ir_resolve_returned_arg(ZerCheck *zc, Node *arg);   /* BUG-1350 */
+static Node *ir_resolve_returned_arg(ZerCheck *zc, Node *arg);   /* BUG-1360 */
 static Node *ir_resolve_returned_arg_ex(ZerCheck *zc, Node *arg, bool collapse_struct);
 static void ir_view_add(IRHandleInfo *h, int aid);
 static void ir_arena_link_backing(ZerCheck *zc, IRHandleInfo *h);   /* BUG-1268 */
@@ -2907,7 +2907,7 @@ static IRHandleInfo *ir_view_arg_handle(ZerCheck *zc, IRFunc *func,
             arg = arg->unary.operand;
         else if (arg && arg->kind == NODE_SLICE)
             arg = arg->slice.object;
-        /* BUG-1350: the argument is ITSELF a call result — `id(id(a))`,
+        /* BUG-1360: the argument is ITSELF a call result — `id(id(a))`,
          * `pick(id(a), a)`, `wrap(a).p`. The inner call is lowered into a temp,
          * but this query reads the ORIGINAL AST, where the argument is a
          * NODE_CALL with no key — so the outer result aliased nothing and was
@@ -3413,7 +3413,7 @@ static bool ir_entry_is_temp(IRFunc *func, int local_id) {
 static void ir_report_overwrite(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                 IRHandleInfo *prev, int new_alloc_id,
                                 int line) {
-    /* BUG-1354: the overwrite also ends a FREED slot's entry — keep the fact. */
+    /* BUG-1364: the overwrite also ends a FREED slot's entry — keep the fact. */
     if (prev && prev->path_len > 0)
         ir_slot_note_overwrite(ps, prev->local_id, prev->path, prev->path_len);
     if (!prev || prev->state != IR_HS_ALIVE) return;
@@ -3684,7 +3684,7 @@ static bool ir_register_alloc_result_compound(ZerCheck *zc, IRFunc *func,
     if (ir_extract_compound_key(zc, func, ps, target, &root, &path, &plen) != 0 ||
         plen == 0)
         return ir_register_alloc_into_wild_slot(zc, func, ps, call, mc, target, line);
-    ir_slot_note_overwrite(ps, root, path, plen);                /* BUG-1354 */
+    ir_slot_note_overwrite(ps, root, path, plen);                /* BUG-1364 */
     IRHandleInfo *h = ir_add_compound_handle(ps, root, path, plen);
     if (!h) return false;
     ir_report_overwrite(zc, func, ps, h, -1, line);   /* -1: a fresh id is minted below */
@@ -3921,7 +3921,7 @@ static Node *ir_resolve_returned_arg_ex(ZerCheck *zc, Node *arg, bool collapse_s
 static Node *ir_resolve_returned_arg(ZerCheck *zc, Node *arg) {
     return ir_resolve_returned_arg_ex(zc, arg, false);
 }
-/* BUG-1350: `collapse_struct` — a STRUCT-valued call (`wrap(a)`, no single
+/* BUG-1360: `collapse_struct` — a STRUCT-valued call (`wrap(a)`, no single
  * returned param) whose every field view (ret_field) names the SAME param k
  * designates, as a VIEW source, the allocation(s) of args[k]. Only the view
  * query (ir_view_arg_handle) asks for this: it returns "any handle the value
@@ -4014,7 +4014,7 @@ static Node *ir_view_root_ident(ZerCheck *zc, Node *e) {
  * tracked compound. A pointer READ out of a field (`t.next`) is a DIFFERENT
  * allocation and resolves to nothing (no alias claimed). 0 = unknown. */
 static IRHandleInfo *ir_arg_handle(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node *a) {
-    /* BUG-1350: `f(x, id(x))` — an argument that is a call returning (a view
+    /* BUG-1360: `f(x, id(x))` — an argument that is a call returning (a view
      * of) one of ITS arguments designates that argument's allocation. */
     a = a ? ir_resolve_returned_arg(zc, a) : NULL;
     a = a ? ir_peel_launder(a) : NULL;
@@ -6712,7 +6712,7 @@ static bool ir_param_store_push(ZerCheck *zc, struct ZcParamStore **v, int *n, i
     return true;
 }
 
-/* BUG-1351 / BUG-1352: "what does this function STORE, of its params, where the
+/* BUG-1361 / BUG-1362: "what does this function STORE, of its params, where the
  * caller can see it?" — ONE collector for every spelling of the store.
  *
  * BUG-1241 recorded `dst_param.f.g = src_param` only: a FIELD chain on the
@@ -6724,7 +6724,7 @@ static bool ir_param_store_push(ZerCheck *zc, struct ZcParamStore **v, int *n, i
  *     container push `s.data[s.top].p = p`;
  *   - the WHOLE object                `*s = { .p = p }`, `*s = t`;
  *   - an aggregate VALUE carrying p   `PT x = { .p = p }; s.data[1] = x;`;
- *   - a GLOBAL target (BUG-1352)      `g = p`, `garr[1] = p`, `gs = { .p = p }`,
+ *   - a GLOBAL target (BUG-1362)      `g = p`, `garr[1] = p`, `gs = { .p = p }`,
  *     `gs2[1].p = p` — the direct spelling in the caller is caught by the
  *     dangling-global rules; through a callee the global was never tied to the
  *     argument, so `reg(a); free(a); rd()` read the freed object.
@@ -7270,7 +7270,7 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
     for (int ai = 0; ai < call->call.arg_count; ai++) {
         Node *arg = call->call.args[ai];
         if (!arg) continue;
-        /* BUG-1350: `fp(id(a))` hands over `a` — resolve a call result that
+        /* BUG-1360: `fp(id(a))` hands over `a` — resolve a call result that
          * is a view of one of its own arguments before keying it. */
         arg = ir_resolve_returned_arg(zc, arg);
         if (arg && arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP)
@@ -7398,7 +7398,7 @@ static void ir_report_dangling_global(ZerCheck *zc, int line,
     for (uint32_t k = 0; k < h->path_len; k++) {
         if (h->path[k] == '.' || h->path[k] == '[') { bare = false; break; }
     }
-    /* BUG-1352: an element a CALLEE stored at an index this analysis cannot
+    /* BUG-1362: an element a CALLEE stored at an index this analysis cannot
      * name (`reg(p) { garr[k] = p; }` leaves `garr[*@L]`). No `x = null;` can
      * name that slot, so the remedy is ownership, not a reset. */
     for (uint32_t k = 0; k + 1 < h->path_len; k++) {
@@ -7596,7 +7596,7 @@ static void ir_carry_compounds(ZerCheck *zc, IRPathState *ps, int src_root,
             np = buf;
             nl = prefix_len + nl;
         }
-        ir_slot_note_overwrite(ps, dest_root, np, nl);              /* BUG-1354 */
+        ir_slot_note_overwrite(ps, dest_root, np, nl);              /* BUG-1364 */
         IRHandleInfo *dch = ir_add_compound_handle(ps, dest_root, np, nl);
         if (dch) {
             ir_apply_alias(dch, &rows[k].snap);
@@ -7740,7 +7740,7 @@ static void ir_store_struct_literal(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         IRAliasSnapshot snap;
         ir_snapshot_alias(&snap, vh);
         IRHandleState st = vh->state;
-        ir_slot_note_overwrite(ps, root, np, npl);                  /* BUG-1354 */
+        ir_slot_note_overwrite(ps, root, np, npl);                  /* BUG-1364 */
         IRHandleInfo *ch = ir_add_compound_handle(ps, root, np, npl);
         if (ch) {
             ir_apply_alias(ch, &snap);
@@ -9481,7 +9481,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                         path_len > 0) {
                         IRAliasSnapshot snap;
                         ir_snapshot_alias(&snap, rh);
-                        ir_slot_note_overwrite(ps, root_local, path, path_len);   /* BUG-1354 */
+                        ir_slot_note_overwrite(ps, root_local, path, path_len);   /* BUG-1364 */
                         IRHandleInfo *ch = ir_add_compound_handle(ps,
                             root_local, path, path_len);
                         if (ch) {
@@ -10068,7 +10068,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     }
                 } else if (rhs->kind == NODE_FIELD && inst->dest_local >= 0 &&
                            ir_type_reads_as_ref(checker_get_type(zc->checker, rhs))) {
-                    /* BUG-1350: `*T c = wrap(a).p;` — a pointer field READ out
+                    /* BUG-1360: `*T c = wrap(a).p;` — a pointer field READ out
                      * of a call result. The object is a NODE_CALL with no key,
                      * so nothing aliased and `free(a); c.v` read a recycled
                      * slot. A field the callee's summary proves is a view of
@@ -11530,7 +11530,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
              * stored, so ALL of the arg's tracked fields are marked: sound for
              * double-free/UAF, over-rejects a sibling field the callee did not
              * free (rare; the common destructor frees every member). */
-            /* BUG-1350: `consume(pass(o))` — the argument is a call handing
+            /* BUG-1360: `consume(pass(o))` — the argument is a call handing
              * back one of its own arguments; the fields freed are that one's. */
             Node *ae = ir_resolve_returned_arg(zc, inst->args[pi]);
             if (ae->kind == NODE_UNARY && ae->unary.op == TOK_AMP && ae->unary.operand)
@@ -11548,7 +11548,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 IRHandleState nf = (summary->frees_param_field &&
                                     summary->frees_param_field[pi])
                     ? IR_HS_FREED : IR_HS_MAYBE_FREED;
-                /* BUG-1355: a bare POINTER argument names an OBJECT, and its
+                /* BUG-1365: a bare POINTER argument names an OBJECT, and its
                  * slots may be recorded under any alias of it — `j.p = d;
                  * push(&l, j); *N hn = l.head orelse ...; drop(hn);` frees the
                  * field recorded as (j, ".p"). Every local whose bare entry is

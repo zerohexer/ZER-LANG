@@ -3652,7 +3652,7 @@ static Type *async_init_keep_sig(Checker *c, Node *call, Type *init_sig, int *of
  * If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
-/* BUG-1353: the SET of non-keep caller params a VALUE may carry — the one
+/* BUG-1363: the SET of non-keep caller params a VALUE may carry — the one
  * query every keep sink and every alias site asks. Bit i = param i.
  *
  * keep_arg_caller_root answered with ONE index and was used only at keep-call
@@ -3762,7 +3762,7 @@ static void infer_mark_param_keep_mask(Checker *c, uint64_t m) {
         if (m & (1ULL << i)) infer_mark_param_keep(c, i);
 }
 
-/* BUG-1353: `dst` now holds `value` — it carries every non-keep param the
+/* BUG-1363: `dst` now holds `value` — it carries every non-keep param the
  * value does. The one taint for every alias site (var-decl init, assignment,
  * capture). Gated on the destination carrying a reference (BUG-421). */
 static bool type_can_carry_pointer(Type *t);
@@ -12799,7 +12799,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-1353: the TARGET's root now holds the value — `z = id(p);`,
+        /* BUG-1363: the TARGET's root now holds the value — `z = id(p);`,
          * `t[0].p = p;`, `*h = { .p = p };` (a deref of a local pointer names the
          * object it points at, which the local then carries). */
         if (node->assign.op == TOK_EQ && node->assign.value) {
@@ -12816,7 +12816,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-440 / BUG-1353: a value carrying a non-keep parameter, persisted
+        /* BUG-440 / BUG-1363: a value carrying a non-keep parameter, persisted
          * into a global / static or a pointer-param sink, makes that parameter
          * ESCAPE — it must be keep, and the call sites are then restricted.
          *
@@ -22067,7 +22067,7 @@ static void check_stmt(Checker *c, Node *node) {
                                 sym->arena_source = src->arena_source;
                         }
                     }
-                    /* BUG-1353: the keep axis asks the one value query, which also
+                    /* BUG-1363: the keep axis asks the one value query, which also
                      * sees through a CALL result, an orelse, a struct literal. */
                     taint_nonkeep_from_value(c, sym, type, node->var_decl.init);
                     /* BUG-1186: a local initialised with a reference into a
@@ -22523,7 +22523,7 @@ static void check_stmt(Checker *c, Node *node) {
                     if (opaque_read_from_shared(c, node->if_stmt.cond))
                         cap->opaque_from_shared = true;
 
-                    /* BUG-1353: `if (pp(p)) |z|` — the capture holds whatever the
+                    /* BUG-1363: `if (pp(p)) |z|` — the capture holds whatever the
                      * condition's value carries, through a call too. */
                     taint_nonkeep_from_value(c, cap, cap->type, node->if_stmt.cond);
                     /* BUG-212: propagate local/arena-derived from condition ident */
@@ -23649,7 +23649,7 @@ static void check_stmt(Checker *c, Node *node) {
                 /* BUG-249: propagate safety flags from switch expression to capture.
                  * Same pattern as if-unwrap (BUG-212). */
                 if (cap) {
-                    taint_nonkeep_from_value(c, cap, cap->type, node->switch_stmt.expr);   /* BUG-1353 */
+                    taint_nonkeep_from_value(c, cap, cap->type, node->switch_stmt.expr);   /* BUG-1363 */
                     Node *sw_root = node->switch_stmt.expr;
                     while (sw_root) {
                         if (sw_root->kind == NODE_UNARY && sw_root->unary.op == TOK_STAR)
@@ -26196,7 +26196,7 @@ static void check_stmt(Checker *c, Node *node) {
                  * stack-use-after-return); keep makes the call site refuse it. */
                 if (!is_scoped && !stack_derived &&
                     type_carries_data_pointer(checker_get_type(c, node->spawn_stmt.args[i]), 0))
-                    /* BUG-1353: every spelling of the argument — `spawn grand(id(w))`,
+                    /* BUG-1363: every spelling of the argument — `spawn grand(id(w))`,
                      * `spawn grand(h.p)` — through the one value query. */
                     infer_mark_param_keep_mask(c,
                         keep_value_roots(c, node->spawn_stmt.args[i], 0));

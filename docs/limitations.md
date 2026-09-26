@@ -36,14 +36,10 @@ repeated.
    point; the ~95 remaining `eval_const_expr` sentinel callers still read INT64_MIN as "not a
    constant" (conservative in every shape probed — they over-reject). The comptime
    interpreter (`eval_const_expr_subst`) and the ident resolver still speak the sentinel.
-2. **ISR/main read-modify-write of the SAME register through two separately formed
-   pointers is accepted** (MEDIUM, silent on bare metal). `interrupt U { volatile *Regs u =
-   @inttoptr(*Regs, A); u.ctrl |= 1; }` and the same in main with `|= 2` (or two globals bound
-   to one constant address, or a helper forming the pointer locally): the RMW rule keys on a
-   global NAME, and a register reached through a fresh `@inttoptr` has none. Fix sketch: key
-   the ISR/main RMW sets on the constant MMIO address (`mmio_const_addr` + field offset) as
-   well as on names. Reproducers: agent probe set `x2`, `x4`, `x8` (2026-09-26 report in
-   BUGS-FIXED).
+2. ~~**ISR/main RMW of the SAME register through separately formed pointers**~~ — CLOSED
+   (BUG-1358) for pointers bound once to a CONSTANT `@inttoptr`. Still unkeyed: a
+   register reached through a computed address, or two struct types overlaying one
+   address with different field names (the key is address + field-name path).
 3. **Bare-metal emission residuals (LOW):** the union-variant reset on a VOLATILE union uses
    `memset` (qualifier cast away; GCC warns); `_zer_shl`/`_zer_shr` skip READING a volatile
    left operand when the count is out of range; IR blocks of a `@critical` body are emitted

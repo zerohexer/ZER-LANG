@@ -6807,6 +6807,138 @@ static void for_each_write_target(Checker *c, Node *target, WriteTargetFn fn, vo
     for_each_write_target_ex(c, target, false, fn, ud);
 }
 
+/* BUG-1358: a memory-mapped REGISTER has no global name, so the ISR/main RMW
+ * rule — keyed on global Symbols — never saw one reached through a pointer each
+ * side forms itself: `interrupt U { volatile *Regs u = @inttoptr(*Regs, A);
+ * u.ctrl |= 1; }` beside `main`'s own `u.ctrl |= 2` compiled with no critical
+ * section on either side (a lost update to the register). Key such a WRITE on
+ * the constant address plus its field / constant-index path, "MMIO 0x…​.ctrl":
+ * both sides then meet in the same entry and the existing rule applies. The
+ * pointer must be bound once to a constant `@inttoptr` and never rebound (the
+ * trust rule for a declaration initializer, BUG-1056). Unresolvable shapes are
+ * not keyed (they are the global rule's, or none). */
+static bool mmio_bound_name_stable_in(Node *body, const char *name, uint32_t len,
+                                      int expected_binds);
+/* BUG-1358: the ISR walk descends into CALLEE bodies from the handler's scope,
+ * where a callee's local pointer is not in scope — so the walk records each
+ * local bound to a constant @inttoptr as it passes the declaration (the
+ * static_local_record pattern), and marks it unstable if the walk sees it
+ * rebound. Reset per interrupt handler. Dynamic, not a fixed table. */
+typedef struct { const char *name; uint32_t len; uint64_t addr; bool unstable; } IsrMmioPtr;
+static IsrMmioPtr *_isr_mmio_ptrs = NULL;
+static int _isr_mmio_ptr_count = 0, _isr_mmio_ptr_cap = 0;
+static void isr_mmio_ptrs_reset(void) { _isr_mmio_ptr_count = 0; }
+static void isr_mmio_ptr_record(Node *vd) {
+    if (!vd || !vd->var_decl.name) return;
+    Node *init = vd->var_decl.init;
+    for (int i = 0; i < _isr_mmio_ptr_count; i++)   /* a second binding of the name */
+        if (_isr_mmio_ptrs[i].len == (uint32_t)vd->var_decl.name_len &&
+            memcmp(_isr_mmio_ptrs[i].name, vd->var_decl.name, vd->var_decl.name_len) == 0)
+            _isr_mmio_ptrs[i].unstable = true;
+    if (!init || init->kind != NODE_INTRINSIC || !init->intrinsic.addr_is_const ||
+        init->intrinsic.name_len != 8 || memcmp(init->intrinsic.name, "inttoptr", 8) != 0)
+        return;
+    if (_isr_mmio_ptr_count >= _isr_mmio_ptr_cap) {
+        int nc = _isr_mmio_ptr_cap ? _isr_mmio_ptr_cap * 2 : 16;
+        IsrMmioPtr *nt = (IsrMmioPtr *)realloc(_isr_mmio_ptrs, (size_t)nc * sizeof(IsrMmioPtr));
+        if (!nt) return;
+        _isr_mmio_ptrs = nt; _isr_mmio_ptr_cap = nc;
+    }
+    IsrMmioPtr *e = &_isr_mmio_ptrs[_isr_mmio_ptr_count++];
+    e->name = vd->var_decl.name; e->len = (uint32_t)vd->var_decl.name_len;
+    e->addr = init->intrinsic.const_addr; e->unstable = false;
+}
+static void isr_mmio_ptr_rebound(Node *target) {
+    if (!target || target->kind != NODE_IDENT) return;
+    for (int i = 0; i < _isr_mmio_ptr_count; i++)
+        if (_isr_mmio_ptrs[i].len == (uint32_t)target->ident.name_len &&
+            memcmp(_isr_mmio_ptrs[i].name, target->ident.name, target->ident.name_len) == 0)
+            _isr_mmio_ptrs[i].unstable = true;
+}
+static bool mmio_ptr_const_addr(Checker *c, Node *p, uint64_t *addr) {
+    if (!p) return false;
+    if (p->kind == NODE_INTRINSIC && p->intrinsic.addr_is_const &&
+        p->intrinsic.name_len == 8 && memcmp(p->intrinsic.name, "inttoptr", 8) == 0) {
+        *addr = p->intrinsic.const_addr;
+        return true;
+    }
+    if (p->kind != NODE_IDENT) return false;
+    Symbol *s = scope_lookup(c->current_scope, p->ident.name, (uint32_t)p->ident.name_len);
+    if (!s && c->in_interrupt) {   /* a callee's local, met by the ISR walk */
+        for (int i = _isr_mmio_ptr_count - 1; i >= 0; i--)
+            if (_isr_mmio_ptrs[i].len == (uint32_t)p->ident.name_len &&
+                memcmp(_isr_mmio_ptrs[i].name, p->ident.name, p->ident.name_len) == 0) {
+                if (_isr_mmio_ptrs[i].unstable) return false;
+                *addr = _isr_mmio_ptrs[i].addr;
+                return true;
+            }
+        return false;
+    }
+    if (!s || !s->func_node) return false;
+    Node *d = s->func_node;
+    if (d->kind != NODE_VAR_DECL && d->kind != NODE_GLOBAL_VAR) return false;
+    Node *init = d->var_decl.init;
+    if (!init || init->kind != NODE_INTRINSIC || !init->intrinsic.addr_is_const ||
+        init->intrinsic.name_len != 8 || memcmp(init->intrinsic.name, "inttoptr", 8) != 0)
+        return false;
+    bool stable = d->kind == NODE_GLOBAL_VAR
+        ? global_name_never_mutated(c, s)
+        : mmio_bound_name_stable_in(c->current_body, s->name, s->name_len, 1);
+    if (!stable) return false;
+    *addr = init->intrinsic.const_addr;
+    return true;
+}
+/* Render the register key into `out` (NULL = measure). Returns the length, or
+ * -1 when the path is not a constant-address register. Recursive over the
+ * FIELD / constant-INDEX steps; the base must be a pointer bound to a constant
+ * `@inttoptr` (or the intrinsic itself). Two passes (measure, then fill), so no
+ * fixed buffer (audit_fixed_buffers). */
+static int mmio_register_key(Checker *c, Node *e, char *out, size_t cap, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return -1;
+    if (e->kind == NODE_FIELD || e->kind == NODE_INDEX) {
+        Node *obj = e->kind == NODE_FIELD ? e->field.object : e->index_expr.object;
+        int n;
+        TypeKind ok = type_dispatch_kind(checker_get_type(c, obj));
+        if (ok == TYPE_POINTER && e->kind == NODE_FIELD) {
+            uint64_t addr;
+            if (!mmio_ptr_const_addr(c, obj, &addr)) return -1;
+            n = snprintf(out, out ? cap : 0, "MMIO register 0x%llx", (unsigned long long)addr);
+        } else {
+            n = mmio_register_key(c, obj, out, cap, depth + 1);
+        }
+        if (n < 0) return -1;
+        char *o = out ? out + n : NULL;
+        size_t rem = out && (size_t)n < cap ? cap - (size_t)n : 0;
+        int m;
+        if (e->kind == NODE_FIELD) {
+            m = snprintf(o, rem, ".%.*s", (int)e->field.field_name_len, e->field.field_name);
+        } else {
+            int64_t k;
+            if (!eval_const_expr_ok(e->index_expr.index, &k)) return -1;
+            m = snprintf(o, rem, "[%lld]", (long long)k);
+        }
+        return m < 0 ? -1 : n + m;
+    }
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR) {
+        uint64_t addr;
+        if (!mmio_ptr_const_addr(c, e->unary.operand, &addr)) return -1;
+        return snprintf(out, out ? cap : 0, "MMIO register 0x%llx", (unsigned long long)addr);
+    }
+    return -1;   /* a bare name is the global rule's */
+}
+static void track_mmio_register_write(Checker *c, Node *assign) {
+    if (!assign || assign->kind != NODE_ASSIGN) return;
+    Node *t = assign->assign.target;
+    bool is_rmw = assign->assign.op != TOK_EQ;
+    if (t && t->kind == NODE_SLICE) { is_rmw = true; t = t->slice.object; }  /* bit range */
+    int n = mmio_register_key(c, t, NULL, 0, 0);
+    if (n <= 0) return;
+    char *key = (char *)arena_alloc(c->arena, (size_t)n + 1);
+    if (!key) return;
+    mmio_register_key(c, t, key, (size_t)n + 1, 0);
+    track_isr_global_ex(c, key, (uint32_t)n, is_rmw, false, assign->loc.line);
+}
+
 /* The main-checker RMW sink, per target (BUG-1124). `ud` is the NODE_ASSIGN. */
 static bool target_is_bit_range(Checker *c, Node *target);
 static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
@@ -12376,6 +12508,7 @@ static Type *check_expr(Checker *c, Node *node) {
             /* BUG-1124: the same question for EVERY global the target may land on
              * (a retargeted pointer), each classified against its own name. */
             for_each_write_target(c, node->assign.target, main_rmw_visit, node);
+            track_mmio_register_write(c, node);   /* BUG-1358 */
 
             /* BUG-1010: maintain the taint. A plain `local = <expr>` SETS the
              * local's taint to whichever global the expression's value came
@@ -29411,6 +29544,7 @@ static void check_func_body(Checker *c, Node *node) {
          * the globals lexically inside the ISR body). Runs with in_interrupt
          * still set so track_isr_global tags them from_isr. */
         _isr_depth_reported = false;   /* BUG-976: per interrupt */
+        isr_mmio_ptrs_reset();          /* BUG-1358 */
         record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
@@ -30688,6 +30822,8 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                                   node->assign.value);   /* BUG-1124 */
         }
         rmw_bind_carrier_scan(c, node->assign.target, node->assign.value);   /* BUG-1046 */
+        track_mmio_register_write(c, node);   /* BUG-1358 */
+        if (node->assign.op == TOK_EQ) isr_mmio_ptr_rebound(node->assign.target);
         record_isr_globals(c, node->assign.target, depth);
         record_isr_globals(c, node->assign.value, depth);
         record_isr_funcname_binding(c, node->assign.value, depth);  /* E1 */
@@ -30771,6 +30907,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
         static_local_record(node);   /* BUG-971 */
+        isr_mmio_ptr_record(node);   /* BUG-1358 */
         /* BUG-976: record the overflow at BOTH scans — the two NODE_VAR_DECL arms are
          * the mirrored sink pair, so a flag set at one and not the other is exactly
          * the drift this class is made of. */
@@ -31905,6 +32042,19 @@ static void check_interrupt_safety(Checker *c) {
                 "can. Pass the value in and out, or make it a shared struct / "
                 "@atomic_* cell",
                 (int)g->name_len, g->name);
+            continue;
+        }
+        if (g->name_len > 14 && memcmp(g->name, "MMIO register ", 14) == 0) {
+            /* BUG-1358: a register reached through a constant @inttoptr pointer.
+             * It is volatile by construction (BUG-1195) and one word; only the
+             * read-modify-write half of the rule applies. */
+            if (g->compound_in_isr || g->compound_in_func)
+                checker_error(c, g->decl_line,
+                    "%.*s is read-modify-written and is written from both interrupt "
+                    "and %s code — the read and the write can be split by an "
+                    "interrupt, losing an update; do the read/modify/write inside "
+                    "@critical on every side",
+                    (int)g->name_len, g->name, other);
             continue;
         }
         Symbol *sym = g->sym ? g->sym : global_decl_lookup(c, g->name, g->name_len);

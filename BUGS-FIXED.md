@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-26 — BUG-1326..1357: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
+## Session 2026-09-26 — BUG-1326..1358: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
 
 Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict
 superset of `review/25092026`) forked exactly at main — fast-forwarded, `make check` green.
@@ -151,6 +151,16 @@ probes. Every entry below was A/B-measured against the post-harvest build.
 - **BUG-1357 — a function returning a NULLABLE function pointer emitted
   `uint32_t (*)(uint32_t) f(...)`** (GCC refused). `func_ret_funcptr_type` peels the
   null-sentinel optional. Same test.
+- **BUG-1358 — an MMIO register read-modify-written from an interrupt and from main
+  through pointers each side forms itself was accepted** (`interrupt U { volatile *Regs u
+  = @inttoptr(*Regs, A); u.ctrl |= 1; }` beside main's `u.ctrl |= 2`; two globals bound
+  to one address; a helper forming the pointer, called from both) — a lost update to the
+  register. The ISR/main RMW rule was keyed on global NAMES. A write through a pointer
+  bound once to a constant `@inttoptr` is now also keyed on "MMIO register ADDR.path"
+  (`track_mmio_register_write`, both the check_expr sink and the ISR walk, which records
+  callee locals as it passes them), so both sides meet in one entry. Boundary: `@critical`
+  on both sides, different registers/fields, ISR reads only. Tests:
+  `tests/zer_fail/isr_mmio_register_rmw_{x2,x4,x8}_bug1358.zer`.
 - Tooling: `test_fuzz.c` declares `_POSIX_C_SOURCE` (implicit `fileno` warning — the build is
   otherwise warning-free).
 

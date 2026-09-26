@@ -1025,6 +1025,94 @@ cell p60_safe_array_param    compile "$P60"' [*]u32 v(u32[4] a) { return a; } u3
 cell p60_safe_ptr_param      compile "$P60"' [*]u32 v(*W60 p) { [*]u32 s = p.a; return s; } u32 main(){ W60 w; return v(&w)[0]; }'
 cell p60_safe_global         compile "$P60"' [*]u32 v() { return gw60.a; } u32 main(){ return v()[0]; }'
 cell p60_safe_in_frame       compile "$P60"' u32 v(W60 w) { [*]u32 s = w.a; return sum60(s) + sum60(w.a); } u32 main(){ W60 w; return v(w); }'
+# SHAPE p49 (BUG-1360): an allocation reached through a CALL whose result is a
+# view of one of its own arguments, when that argument is ITSELF such a call
+# (`id(id(a))`, `unwrap(wrap(a))`, `wrap(a).p`). The inner call lowers into a
+# temp but the sinks read the ORIGINAL AST, where the argument had no key — so
+# the result aliased nothing. Crossed with the sinks: use, global store, arena
+# reset, funcptr barrier, aliased-arg free, callee free. BOUNDARY: the same
+# spellings used while the allocation lives, freed once.
+echo "===== SHAPE p49 = nested identity call result (use / store / reset / barrier / free sinks) ====="
+P49='struct T49 { u32 v; } struct W49 { *T49 p; } ?*T49 g49; u8[256] buf49;
+*T49 id49(*T49 p) { return p; }
+W49 wrap49(*T49 p) { W49 w = { .p = p }; return w; }
+*T49 unwrap49(W49 w) { return w.p; }
+void kill49(*T49 p) { free(p); }
+u32 two49(*T49 a, *T49 c) { free(c); return a.v; }
+'
+cell p49_use_id_id          reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *T49 c = id49(id49(a)); free(a); return c.v; }'
+cell p49_use_unwrap_wrap    reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *T49 c = unwrap49(wrap49(a)); free(a); return c.v; }'
+cell p49_use_field_of_call  reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *T49 c = wrap49(a).p; free(a); return c.v; }'
+cell p49_global_store       reject "$P49"' void mk(){ *T49 a = alloc(T49) orelse return; g49 = id49(id49(a)); free(a); } u32 main(){ mk(); return 0; }'
+cell p49_arena_reset        reject "$P49"' u32 main(){ Arena ar = Arena.over(buf49); *T49 a = ar.alloc(T49) orelse return; *T49 c = id49(id49(a)); ar.reset(); return c.v; }'
+cell p49_funcptr_barrier    reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *(*T49) fp = kill49; fp(id49(a)); free(a); return 0; }'
+cell p49_aliased_arg        reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; return two49(a, id49(a)); }'
+cell p49_callee_free        reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; kill49(id49(id49(a))); free(a); return 0; }'
+cell p49_safe_live_use      compile "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *T49 c = id49(id49(a)); u32 r = c.v + wrap49(a).p.v; free(c); return r; }'
+
+# SHAPE p50 (BUG-1361, BUG-1362): a callee that STORES one of its params
+# somewhere the caller can see, in a spelling BUG-1241's FIELD-chain summary did
+# not record: an ELEMENT (literal / variable index), the WHOLE object (`*s =`),
+# an aggregate VALUE carrying the param, a GLOBAL (bare / element / literal /
+# variable index). The caller then freed the argument and read it back.
+# BOUNDARY: freeing through the container and resetting it.
+echo "===== SHAPE p50 = callee stores a param into an element / object / global ====="
+P50='struct T50 { u32 v; } struct PT50 { ?*T50 p; } struct S50 { PT50[4] data; u32 top; }
+?*T50 g50; ?*T50[2] garr50; PT50 gs50;
+void put_lit(*S50 s, *T50 p) { s.data[1].p = p; }
+void put_var(*S50 s, *T50 p, u32 k) { s.data[k].p = p; }
+void put_whole(*PT50 s, *T50 p) { *s = { .p = p }; }
+void put_val(*S50 s, *T50 p) { PT50 x = { .p = p }; s.data[2] = x; }
+void reg_g(*T50 p) { g50 = p; }
+void reg_e(*T50 p) { garr50[1] = p; }
+void reg_l(*T50 p) { gs50 = { .p = p }; }
+void reg_v(*T50 p, u32 k) { garr50[k] = p; }
+u32 rd50() { if (g50) |q| { return q.v; } return 0; }
+'
+cell p50_elem_literal       reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_lit(&s, a); free(a); if (s.data[1].p) |q| { return q.v; } return 0; }'
+cell p50_elem_var_index     reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_var(&s, a, 0); free(a); if (s.data[0].p) |q| { return q.v; } return 0; }'
+cell p50_whole_object       reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; PT50 s; put_whole(&s, a); free(a); if (s.p) |q| { return q.v; } return 0; }'
+cell p50_aggregate_value    reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_val(&s, a); free(a); if (s.data[2].p) |q| { return q.v; } return 0; }'
+cell p50_global_bare        reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_g(a); free(a); return rd50(); }'
+cell p50_global_elem        reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_e(a); free(a); return rd50(); }'
+cell p50_global_literal     reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_l(a); free(a); return rd50(); }'
+cell p50_global_var_index   reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_v(a, 1); free(a); return rd50(); }'
+cell p50_safe_reset         compile "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_lit(&s, a); free(a); s.data[1].p = null; *T50 b = alloc(T50) orelse return; reg_g(b); g50 = null; free(b); return 0; }'
+
+# SHAPE p51 (BUG-1363): keep inference — a non-keep param reaching a GLOBAL in a
+# spelling the alias sites could not follow: a CALL result (var-decl, assignment,
+# nested), an orelse unwrap / capture of one, a STRUCT LITERAL, an element of a
+# local aggregate, a heap object filled through `*h =`. The caller's `put(&x)`
+# must be refused. BOUNDARY: a global argument; a param used locally only.
+echo "===== SHAPE p51 = keep inference through call results / literals / aggregates ====="
+P51='struct N51 { ?*u32 p; } ?*u32 g51; N51 gn51; N51[2] ga51; ?*N51 gh51;
+*u32 id51(*u32 p) { return p; }
+?*u32 pp51(*u32 p) { return p; }
+'
+cell p51_call_vardecl       reject "$P51"' void put(*u32 p) { *u32 z = id51(p); g51 = z; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_call_assign        reject "$P51"' void put(*u32 p) { ?*u32 z = null; z = id51(p); g51 = z; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_orelse_unwrap      reject "$P51"' void put(*u32 p) { *u32 z = pp51(p) orelse return; g51 = z; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_if_capture         reject "$P51"' void put(*u32 p) { if (pp51(p)) |z| { gn51.p = z; } } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_struct_literal     reject "$P51"' void put(*u32 p) { ga51[0] = { .p = p }; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_local_aggregate    reject "$P51"' void put(*u32 p) { N51[1] t; t[0].p = p; ga51[1] = t[0]; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_heap_object        reject "$P51"' void put(*u32 p) { *N51 h = alloc(N51) orelse return; *h = { .p = p }; gh51 = h; } void f() { u32 x = 1; put(&x); } u32 main(){ f(); return 0; }'
+cell p51_safe_global_arg    compile "$P51"' u32 gx51; void put(*u32 p) { *u32 z = id51(p); g51 = z; } u32 main(){ put(&gx51); return 0; }'
+cell p51_safe_local_use     compile "$P51"' void put(*u32 p) { u32 v = *id51(p); N51 n = { .p = p }; if (n.p) |q| { v += *q; } if (v == 9) { g51 = null; } } u32 main(){ u32 x = 1; put(&x); return 0; }'
+
+# SHAPE p52 (BUG-1364, BUG-1365): the fact that an allocation was freed / is
+# held must survive an OVERWRITE of the slot and a store into an OWNED object.
+# A callee that frees a field then stores a new value into it (on one path)
+# freed the caller's allocation; `n.p = a; free(n);` dropped a's only holder.
+# BOUNDARY: a node that is returned / freed after its field.
+echo "===== SHAPE p52 = freed-then-replaced field / allocation held by an owned object ====="
+P52='struct T52 { u32 v; } struct H52 { ?*T52 p; } struct R52 { *T52 p; }
+void re52(*R52 h) { *T52 n = alloc(T52) orelse return; free(h.p); h.p = n; }
+?*H52 mk52() { *T52 a = alloc(T52) orelse return; *H52 n = alloc(H52) orelse { free(a); return null; }; n.p = a; return n; }
+void drop52(*H52 n) { if (n.p) |q| { free(q); } n.p = null; free(n); }
+'
+cell p52_replace_after_free reject "$P52"' u32 main(){ *T52 a = alloc(T52) orelse return; R52 h = { .p = a }; re52(&h); u32 r = a.v; free(h.p); return r; }'
+cell p52_leak_through_node  reject "$P52"' u32 main(){ *T52 a = alloc(T52) orelse return; *H52 n = alloc(H52) orelse { free(a); return 0; }; n.p = a; free(n); return 0; }'
+cell p52_safe_node_returned compile "$P52"' u32 main(){ *H52 n = mk52() orelse return; drop52(n); return 0; }'
 
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

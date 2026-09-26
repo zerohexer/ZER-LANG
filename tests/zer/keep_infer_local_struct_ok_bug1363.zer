@@ -1,0 +1,13 @@
+// BUG-1363 boundary: a local struct literal holding p, never persisted.
+struct N { ?*u32 p; }
+struct NN { N n; }
+?*u32 g;
+N gn;
+N[2] garr;
+NN gnn;
+[*]u32 gsl;
+*u32 id(*u32 p) { return p; }
+?*u32 pp(*u32 p) { return p; }
+[*]u32 sv([*]u32 s) { return s[0..1]; }
+void put(*u32 p) { N n = { .p = p }; u32 v = 0; if (n.p) |q| { v = *q; } if (v == 9) { g = null; } }
+u32 main() { u32 x = 9; put(&x); return 0; }

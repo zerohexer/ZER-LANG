@@ -284,6 +284,9 @@ struct Symbol {
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
     bool is_nonkeep_derived; /* pointer traces to a non-keep param — cannot be persisted (keep axis) */
     int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */
+    uint64_t nonkeep_root_mask; /* BUG-1363: EVERY param it may trace to (bit i = param i; a value that
+                                 * came through `pick(p, q)` or a branch holds either). A single root
+                                 * dropped the others, so only one of them was inferred keep. */
     bool is_keep_derived;   /* pointer traces to a KEEP param — a borrow; storing into a struct field requires a 'keep' field (field-level keep, Rust &'a analog) */
     bool is_thread_handle;  /* ThreadHandle from scoped spawn — must call .join() */
     /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a non-shared local

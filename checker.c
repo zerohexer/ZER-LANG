@@ -3626,14 +3626,6 @@ static bool struct_init_has_local_derived(Checker *c, Node *init) {
     return false;
 }
 
-/* keep axis (2026-06-07): does this call have a non-keep-derived pointer arg?
- * `idfn(p)` where p is a non-keep param (or a local aliasing one) yields a
- * result that may trace back to the non-keep param — persisting it violates the
- * non-keep contract. Conservative proxy (same philosophy as
- * call_has_local_derived_arg): rejects even if the callee doesn't actually
- * return the arg. Over-rejection acceptable (restructure / add `keep`),
- * under-rejection is a safety hole. The keep VALVE is unaffected: a `keep` arg
- * is NOT is_nonkeep_derived, so `idfn(keep_p)` does not fire. */
 /* BUG-816: reset-then-ask, so the ARENA/local distinction the walker recorded is
  * read from a defined state. A wrapper rather than an out-param threaded through the
  * recursion: the walker calls itself for nested literals, and the innermost hit is
@@ -3643,37 +3635,6 @@ static bool struct_init_frame_bound(Checker *c, Node *init, bool *is_arena) {
     bool hit = struct_init_has_local_derived(c, init);
     if (is_arena) *is_arena = hit && _si_hit_arena;
     return hit;
-}
-
-static bool call_has_nonkeep_derived_arg(Checker *c, Node *call, int depth) {
-    if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-976 polarity; BUG-1016 bound */
-    if (!call || call->kind != NODE_CALL) return false;
-    for (int i = 0; i < call->call.arg_count; i++) {
-        Node *arg = call->call.args[i];
-        /* unwrap value-side intrinsic launders. MUST use the shared helper:
-         * @container's pointer is args[0] (its LAST arg is the field NAME), so a
-         * hand-rolled last-arg loop peeled to the field ident and missed the local. */
-        arg = unwrap_ptr_launder(arg);
-        /* BUG-766 (copied from cool-johnson-dfcqr9): descend SLICE/INDEX/FIELD to
-         * the root ident — `g = idfn(np[0..16])` (direct slice of a non-keep
-         * param) previously laundered the flag here and silently escaped. */
-        while (arg && (arg->kind == NODE_SLICE ||
-                       arg->kind == NODE_INDEX ||
-                       arg->kind == NODE_FIELD)) {
-            if (arg->kind == NODE_SLICE)      arg = arg->slice.object;
-            else if (arg->kind == NODE_INDEX) arg = arg->index_expr.object;
-            else                              arg = arg->field.object;
-        }
-        if (arg && arg->kind == NODE_IDENT) {
-            Symbol *src = scope_lookup(c->current_scope,
-                arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (src && src->is_nonkeep_derived) return true;
-        }
-        if (arg && arg->kind == NODE_CALL) {
-            if (call_has_nonkeep_derived_arg(c, arg, depth + 1)) return true;
-        }
-    }
-    return false;
 }
 
 /* keep inference (Site 1, 2026-06-19): mark param `idx` of the function currently
@@ -3686,66 +3647,6 @@ static void infer_mark_param_keep(Checker *c, int idx) {
     if (!sig || sig->kind != TYPE_FUNC_PTR) return;
     if (idx >= (int)sig->func_ptr.param_count || !sig->func_ptr.param_keeps) return;
     sig->func_ptr.param_keeps[idx] = true;
-}
-
-/* keep inference: mirror of call_has_nonkeep_derived_arg, but instead of
- * reporting, marks keep on the root param of every non-keep-derived argument —
- * the launder case `g = idfn(p)` makes p escape THROUGH IDFN'S RESULT, so p must
- * become keep.
- *
- * Refinement (2026-06-22, uses ret_param_mask): this inference is about the RESULT
- * aliasing the arg, so it fires only for arg positions the callee MAY actually
- * return. `g = idfn(scratch, keep_me)` where idfn returns keep_me (not scratch)
- * launders only keep_me via the result; scratch is skipped. A callee that provably
- * never returns position i (complete summary, bit i clear) does not escape arg i
- * THROUGH ITS RESULT — and the OTHER escape path (idfn internally retaining arg i)
- * is covered independently by the keep-call-site transitivity at this same call
- * (idfn's param i would be keep, propagating to the caller's param). Conservative:
- * an incomplete summary treats every position as maybe-returned (no under-inference). */
-static void infer_keep_from_call_args(Checker *c, Node *call, int depth) {
-    /* BUG-1016: nested call arguments are expression nesting, bounded by check_expr
-     * before this runs; the old cap of 8 stopped inferring keep on the 9th nested
-     * identity call (masked in practice by the store sink's own flip, but a walk must
-     * not depend on a neighbour for its polarity). */
-    if (!call || call->kind != NODE_CALL || depth > ZER_EXPR_WALK_MAX) return;
-    Symbol *csym = NULL;
-    if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
-        csym = scope_lookup(c->current_scope, call->call.callee->ident.name,
-                            (uint32_t)call->call.callee->ident.name_len);
-        if (!csym) csym = global_decl_lookup(c, call->call.callee->ident.name,
-                                       (uint32_t)call->call.callee->ident.name_len);
-    }
-    bool complete = csym && csym->ret_summary_complete;
-    uint64_t mask = csym ? csym->ret_param_mask : 0;
-    for (int i = 0; i < call->call.arg_count; i++) {
-        /* skip positions the callee provably never returns (no result-launder there) */
-        bool may_return_i = !complete || (i < 64 && (mask & (1ull << i)));
-        if (!may_return_i) continue;
-        /* BUG-931: was a hand-rolled last-arg loop — no C-style cast, and it
-         * peeled @container/@cstr to the WRONG argument. `g_p = idfn((*u32)p)`
-         * therefore recorded the launder but never inferred keep on p, so the
-         * call site `stash(&loc)` was accepted: a stack pointer reached a global
-         * one indirection away. Shared peeler. */
-        Node *arg = unwrap_ptr_launder(call->call.args[i]);
-        /* BUG-766 (copied from cool-johnson-dfcqr9): mirror the SLICE/INDEX/FIELD
-         * descent — without it, `g = idfn(np[0..16])` records the launder but
-         * skips keep inference (no propagation to np's root param). */
-        while (arg && (arg->kind == NODE_SLICE ||
-                       arg->kind == NODE_INDEX ||
-                       arg->kind == NODE_FIELD)) {
-            if (arg->kind == NODE_SLICE)      arg = arg->slice.object;
-            else if (arg->kind == NODE_INDEX) arg = arg->index_expr.object;
-            else                              arg = arg->field.object;
-        }
-        if (arg && arg->kind == NODE_IDENT) {
-            Symbol *src = scope_lookup(c->current_scope,
-                arg->ident.name, (uint32_t)arg->ident.name_len);
-            if (src && src->is_nonkeep_derived)
-                infer_mark_param_keep(c, src->nonkeep_root_param);
-        }
-        if (arg && arg->kind == NODE_CALL)
-            infer_keep_from_call_args(c, arg, depth + 1);
-    }
 }
 
 /* keep-arg short-lived-borrow classes (Site 1 deferred enforcement). KV_NONE =
@@ -3856,113 +3757,130 @@ static Type *async_init_keep_sig(Checker *c, Node *call, Type *init_sig, int *of
  * If the root traces to a
  * non-keep caller param, return that param's index (so passing it to a keep
  * callee position makes the caller param escape too). Else -1. */
-static int keep_arg_caller_root(Checker *c, Node *arg) {
-    Node *n = arg;
-    for (int guard = 0; n && guard < 64; guard++) {
-        switch (n->kind) {
-        case NODE_UNARY:     n = n->unary.operand; break;
-        case NODE_FIELD:     n = n->field.object; break;
-        case NODE_INDEX:     n = n->index_expr.object; break;
-        case NODE_SLICE:     n = n->slice.object; break;
-        /* BUG-1045 (second form): an orelse is a JOIN — EITHER arm can hand the
-         * caller's parameter to the keep position. Following only the tried
-         * expression let `inner(mb(0) orelse p)` drop the edge from p, and
-         * `outer(&d)` then stored a pointer to main's frame in a global. A
-         * return / break / continue fallback supplies no value; a block
-         * fallback's value is the block's last expression, which this trace
-         * does not model — that side stays -1, the direction of BUG-1045's own
-         * over-approximation rule (a missed edge is the accept side, so the
-         * expression-fallback case is the one that must be followed). */
-        case NODE_ORELSE: {
-            int r = keep_arg_caller_root(c, n->orelse.expr);
-            if (r >= 0) return r;
-            Node *fb = n->orelse.fallback;
-            if (!fb || fb->kind == NODE_BLOCK || n->orelse.fallback_is_return ||
-                n->orelse.fallback_is_break || n->orelse.fallback_is_continue)
-                return -1;
-            return keep_arg_caller_root(c, fb);
-        }
-        case NODE_TYPECAST:  n = n->typecast.expr; break;
-        /* BUG-1045: THE SHARED PEELER, not a private rule. This arm took every
-         * intrinsic's LAST argument as "the pointer" — right for @ptrcast / @pun /
-         * @bitcast / @cast, wrong for @container(*T, ptr, field), whose last
-         * argument is the FIELD NAME. The trace landed on an ident that names
-         * no symbol and answered -1 ("not a caller param"), so
-         *     void inner(*D d) { g = d; }                       // keep inferred
-         *     void outer(*L p) { inner(@container(*D, p, list)); }
-         *     u32 main() { D d; outer(&d.list); }               // ACCEPTED
-         * stored a pointer to main's frame in a global, while the direct
-         * spelling `inner(p)` was refused. unwrap_ptr_launder already knows
-         * which argument each launder carries (BUG-931 made it the one query);
-         * a peeler that cannot peel returns its input, which ends the trace. */
-        case NODE_INTRINSIC: {
-            Node *pn = unwrap_ptr_launder(n);
-            if (pn == n) return -1;
-            n = pn;
-            break;
-        }
-        case NODE_IDENT: {
-            Symbol *s = scope_lookup(c->current_scope,
-                n->ident.name, (uint32_t)n->ident.name_len);
-            return (s && s->is_nonkeep_derived) ? s->nonkeep_root_param : -1;
-        }
-        /* Exhaustive (no default:) per the walker-default audit / -Wswitch
-         * discipline (the keep commit 856fbb0 shipped a `default: return -1`
-         * here; it was masked because CRLF .sh shebangs made make stop before
-         * the audit). Any other node kind can't be traced to a caller-param
-         * root, so the keep-escape trace gives up (return -1) — but listing
-         * every kind makes GCC -Wswitch flag a NEW NODE_ kind that might need
-         * a trace rule, instead of silently returning -1 (a latent keep gap).
-         * Behaviorally identical to the old default. */
-        case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
-        case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
-        case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
-        case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-        case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
-        case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
-        case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
-        case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
-        case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
-        case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
-        case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
-        /* BUG-1045 (third form): `inner(idf(p))` — the argument is a CALL whose
-         * result is a VIEW of one of its own arguments (`*D idf(*D p) { return
-         * p; }`). The Stage-2 return summary already says which positions the
-         * result may alias (`ret_param_mask`); trace those arguments. A callee
-         * with an INCOMPLETE summary may return anything it was handed, so every
-         * argument is traced — the over-approximating side, never the accept
-         * side a bare -1 was. */
-        case NODE_CALL: {
-            Node *cal = n->call.callee;
-            Symbol *cs = (cal && cal->kind == NODE_IDENT)
-                ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len)
-                : NULL;
-            if (!cs || !cs->is_function) return -1;
-            for (int i = 0; i < n->call.arg_count && i < 64; i++) {
-                if (cs->ret_summary_complete && !(cs->ret_param_mask & (1ULL << i))) continue;
-                int r = keep_arg_caller_root(c, n->call.args[i]);
-                if (r >= 0) return r;
-            }
-            return -1;
-        }
-        /* BUG-1045 (fourth form): `inner({ .p = p })` — a struct LITERAL carrying
-         * the parameter in a field. Same fact as the by-value carrier `W w; w.p =
-         * p; inner(w);` (already traced through w's nonkeep root), spelled
-         * without the local. Trace every field value. */
-        case NODE_STRUCT_INIT:
-            for (int i = 0; i < n->struct_init.field_count; i++) {
-                int r = keep_arg_caller_root(c, n->struct_init.fields[i].value);
-                if (r >= 0) return r;
-            }
-            return -1;
-        case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
-        case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-        case NODE_BINARY: case NODE_ASSIGN:
-        case NODE_CAST: case NODE_SIZEOF:
-            return -1;
-        }
+/* BUG-1363: the SET of non-keep caller params a VALUE may carry — the one
+ * query every keep sink and every alias site asks. Bit i = param i.
+ *
+ * keep_arg_caller_root answered with ONE index and was used only at keep-call
+ * arguments; the alias sites (var-decl init, assignment, if/switch capture)
+ * walked FIELD/INDEX/SLICE to a root IDENT and stopped at anything else, so a
+ * CALL result (`*u32 z = id(p); g = z;`, `z = id(p)`, `id(id(p))`), an orelse
+ * unwrap of one (`*u32 z = pp(p) orelse return;`), a capture of one
+ * (`if (pp(p)) |z| { gn.p = z; }`) and a STRUCT LITERAL (`g = { .p = p };`,
+ * `garr[0] = { .p = p }`) carried no param — keep was never inferred and the
+ * caller's `put(&local)` stored a stack address in a global (ASan:
+ * stack-use-after-return). Every arm joins (a union over what the value may
+ * be); an unresolvable callee may return anything it was handed. */
+static uint64_t keep_value_roots(Checker *c, Node *n, int depth) {
+    if (!n) return 0;
+    if (depth > ZER_EXPR_WALK_MAX) return ~0ULL;   /* round toward "any param" */
+    switch (n->kind) {
+    case NODE_UNARY:     return keep_value_roots(c, n->unary.operand, depth + 1);
+    case NODE_FIELD:     return keep_value_roots(c, n->field.object, depth + 1);
+    case NODE_INDEX:     return keep_value_roots(c, n->index_expr.object, depth + 1);
+    case NODE_SLICE:     return keep_value_roots(c, n->slice.object, depth + 1);
+    /* BUG-1045 (second form): an orelse is a JOIN — EITHER arm can hand the
+     * caller's parameter on. A return / break / continue fallback supplies no
+     * value; a block fallback's value is not modelled (its own statements are
+     * checked as statements). */
+    case NODE_ORELSE: {
+        uint64_t m = keep_value_roots(c, n->orelse.expr, depth + 1);
+        Node *fb = n->orelse.fallback;
+        if (!fb || fb->kind == NODE_BLOCK || n->orelse.fallback_is_return ||
+            n->orelse.fallback_is_break || n->orelse.fallback_is_continue)
+            return m;
+        return m | keep_value_roots(c, fb, depth + 1);
     }
+    case NODE_TYPECAST:  return keep_value_roots(c, n->typecast.expr, depth + 1);
+    /* BUG-1045: THE SHARED PEELER — @container's pointer is args[0], its last
+     * argument is the FIELD NAME. A peeler that cannot peel returns its input. */
+    case NODE_INTRINSIC: {
+        Node *pn = unwrap_ptr_launder(n);
+        return pn == n ? 0 : keep_value_roots(c, pn, depth + 1);
+    }
+    case NODE_IDENT: {
+        Symbol *s = scope_lookup(c->current_scope,
+            n->ident.name, (uint32_t)n->ident.name_len);
+        if (!s || !s->is_nonkeep_derived) return 0;
+        uint64_t m = s->nonkeep_root_mask;
+        if (s->nonkeep_root_param >= 0 && s->nonkeep_root_param < 64)
+            m |= 1ULL << s->nonkeep_root_param;
+        return m;
+    }
+    /* BUG-1045 (third form): a CALL whose result is a VIEW of one of its own
+     * arguments. The Stage-2 return summary says which positions it may be; a
+     * callee with an INCOMPLETE summary — or one that is not a named function at
+     * all (a funcptr) — may return anything it was handed. */
+    case NODE_CALL: {
+        Node *cal = n->call.callee;
+        Symbol *cs = (cal && cal->kind == NODE_IDENT)
+            ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len)
+            : NULL;
+        bool known = cs && cs->is_function && cs->ret_summary_complete;
+        uint64_t m = 0;
+        for (int i = 0; i < n->call.arg_count; i++) {
+            if (known && (i >= 64 || !(cs->ret_param_mask & (1ULL << i)))) continue;
+            m |= keep_value_roots(c, n->call.args[i], depth + 1);
+        }
+        return m;
+    }
+    /* BUG-1045 (fourth form): a struct LITERAL carries every field value. */
+    case NODE_STRUCT_INIT: {
+        uint64_t m = 0;
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            m |= keep_value_roots(c, n->struct_init.fields[i].value, depth + 1);
+        return m;
+    }
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        /* statements / declarations — never a value */
+        return 0;
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BINARY: case NODE_ASSIGN:
+    case NODE_CAST: case NODE_SIZEOF:
+        /* a scalar result — carries no reference */
+        return 0;
+    }
+    return 0;
+}
+
+/* The lowest param a value traces to, or -1 (the single-root form some sinks
+ * still record; prefer keep_value_roots). */
+static int keep_arg_caller_root(Checker *c, Node *arg) {
+    uint64_t m = keep_value_roots(c, arg, 0);
+    for (int i = 0; i < 64; i++) if (m & (1ULL << i)) return i;
     return -1;
+}
+
+/* Mark every param in `m` keep. */
+static void infer_mark_param_keep_mask(Checker *c, uint64_t m) {
+    for (int i = 0; i < 64 && m; i++)
+        if (m & (1ULL << i)) infer_mark_param_keep(c, i);
+}
+
+/* BUG-1363: `dst` now holds `value` — it carries every non-keep param the
+ * value does. The one taint for every alias site (var-decl init, assignment,
+ * capture). Gated on the destination carrying a reference (BUG-421). */
+static bool type_can_carry_pointer(Type *t);
+static void taint_nonkeep_from_value(Checker *c, Symbol *dst, Type *dst_type, Node *value) {
+    if (!dst || !value || !type_can_carry_pointer(dst_type)) return;
+    uint64_t m = keep_value_roots(c, value, 0);
+    if (!m) return;
+    if (!dst->is_nonkeep_derived) {
+        dst->nonkeep_root_param = -1;
+        for (int i = 0; i < 64; i++) if (m & (1ULL << i)) { dst->nonkeep_root_param = i; break; }
+    }
+    dst->is_nonkeep_derived = true;
+    dst->nonkeep_root_mask |= m;
 }
 
 /* ---- Unified escape flag helpers (prevents BUG-421 class) ---- */
@@ -4018,6 +3936,7 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_nonkeep_derived) {
         dst->is_nonkeep_derived = true;
         dst->nonkeep_root_param = src->nonkeep_root_param; /* keep inference: carry root param to aliases */
+        dst->nonkeep_root_mask |= src->nonkeep_root_mask;
     }
     if (src->is_keep_derived) dst->is_keep_derived = true;
     /* BUG-833: the packed-misalignment fact rides the VALUE the same way, so a
@@ -13041,6 +12960,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         tsym->is_from_arena = false;  /* BUG-597: must clear on reassign */
                         tsym->arena_source = NULL;    /* BUG-848: identity clears with it */
                         tsym->is_nonkeep_derived = false; /* keep axis: re-derived below */
+                        tsym->nonkeep_root_mask = 0;
                     }
                     if (node->assign.target->kind == NODE_IDENT) {
                         /* BUG-1299: sticky — a copy of a shared *opaque stays one. */
@@ -13435,76 +13355,49 @@ static Type *check_expr(Checker *c, Node *node) {
             }
         }
 
-        /* BUG-440: non-keep pointer parameter stored in global/static.
-         * Spec: non-keep *T is "non-storable — use it, read it, write through it."
-         * Storing to global violates this contract — caller may pass &local. */
-        if (node->assign.op == TOK_EQ) {
-            Node *vnode = node->assign.value;
-            /* @container-safe peel: its pointer is args[0] (last arg = field name). */
-            vnode = unwrap_ptr_launder(vnode);
-            /* P9 (BUG-737 field-launder, 2026-06-24): `g = param.field` (or
-             * `param[i]`) where the stored value is a pointer/slice FIELD of a
-             * non-keep-derived by-value struct param launders the caller's
-             * pointer exactly like `g = param` (the whole-struct case BUG-737
-             * already covers). The non-keep sink below matched only a bare
-             * NODE_IDENT, so the FIELD form slipped through (a verified escape
-             * under-rejection: `stash(Holder h){ g = h.p; }` + `stash({.p=&local})`
-             * compiled). Descend the field/index projection to the root ident,
-             * GATED on the stored value being a pointer/slice — a scalar field
-             * store (`g_int = h.count`) copies a value, not a reference, and
-             * must NOT infer keep. Certified by param_lattice.v
-             * projection_preserves_escape / buggy_projection_unsound. */
-            if (vnode && (vnode->kind == NODE_FIELD || vnode->kind == NODE_INDEX)) {
-                Type *vt2 = typemap_get(c, node->assign.value);
-                /* escape_type_carries_ref: pointer|slice|optional-of-those — a ?*T
-                 * field of a by-value param launders the caller pointer identically
-                 * to a bare *T field (F3 sibling on the keep-inference sink). */
-                if (escape_type_carries_ref(vt2)) {
-                    while (vnode && (vnode->kind == NODE_FIELD ||
-                                     vnode->kind == NODE_INDEX)) {
-                        if (vnode->kind == NODE_FIELD) vnode = vnode->field.object;
-                        else vnode = vnode->index_expr.object;
-                    }
-                }
+        /* BUG-1363: the TARGET's root now holds the value — `z = id(p);`,
+         * `t[0].p = p;`, `*h = { .p = p };` (a deref of a local pointer names the
+         * object it points at, which the local then carries). */
+        if (node->assign.op == TOK_EQ && node->assign.value) {
+            Node *kr = node->assign.target;
+            while (kr && (kr->kind == NODE_FIELD || kr->kind == NODE_INDEX ||
+                          (kr->kind == NODE_UNARY && kr->unary.op == TOK_STAR)))
+                kr = kr->kind == NODE_FIELD ? kr->field.object
+                   : kr->kind == NODE_INDEX ? kr->index_expr.object : kr->unary.operand;
+            if (kr && kr->kind == NODE_IDENT) {
+                Symbol *ks = scope_lookup(c->current_scope, kr->ident.name,
+                                          (uint32_t)kr->ident.name_len);
+                if (ks && !ks->is_function && global_decl_lookup(c, ks->name, ks->name_len) != ks)
+                    taint_nonkeep_from_value(c, ks, ks->type, node->assign.value);
             }
-            if (vnode && vnode->kind == NODE_IDENT) {
-                Symbol *val_sym = scope_lookup(c->current_scope,
-                    vnode->ident.name, (uint32_t)vnode->ident.name_len);
-                /* A non-keep pointer parameter stored in a persistent sink violates
-                 * the non-keep contract. Both the param itself AND any local that
-                 * aliases it carry is_nonkeep_derived (set at registration,
-                 * propagated by propagate_escape_flags) — keep-axis matrix holes
-                 * (alias / call-result launder). func_node==NULL identifies the
-                 * direct param for the precise "add 'keep' to parameter X" message.
-                 * STRUCT/UNION values are included (hole A, 2026-06-07): a struct
-                 * that received a non-keep param in one of its fields carries
-                 * is_nonkeep_derived (via propagate_escape_flags), and persisting
-                 * it via a whole-struct copy to a global is the same violation —
-                 * mirrors the escape axis, which already marks/checks structs. */
-                TypeKind vk = type_dispatch_kind(val_sym ? val_sym->type : NULL);
-                bool is_nonkeep_value = val_sym && val_sym->is_nonkeep_derived &&
-                    (vk == TYPE_POINTER || vk == TYPE_OPAQUE || vk == TYPE_SLICE ||
-                     vk == TYPE_STRUCT || vk == TYPE_UNION ||
-                     /* #7 (2026-07-14): ?*T / ?[*]T nullable-borrow value — gated by
-                      * is_nonkeep_derived, only set for carrier types, so a scalar
-                      * ?u32 never reaches here. */
-                     vk == TYPE_OPTIONAL);
-                if (is_nonkeep_value) {
-                    /* keep-universalization 2a: a non-keep pointer param (or alias)
-                     * persisted into a global OR a pointer-param field/nested sink
-                     * violates the non-keep contract. Extends BUG-440 (global-only)
-                     * to param-field sinks via classify_escape_sink. Fix is `keep`. */
+        }
+
+        /* BUG-440 / BUG-1363: a value carrying a non-keep parameter, persisted
+         * into a global / static or a pointer-param sink, makes that parameter
+         * ESCAPE — it must be keep, and the call sites are then restricted.
+         *
+         * ONE query for every spelling of the value (keep_value_roots). There
+         * used to be two arms: a bare IDENT (or a FIELD projection of one) and a
+         * CALL with a non-keep argument. A struct LITERAL (`g = { .p = p };`,
+         * `garr[0] = { .p = p }`, nested), an element or field of an aggregate
+         * local that holds the param (`s.data[1] = t[0]` after `t[0].p = p`), and
+         * an orelse fallback reached neither, so keep was never inferred and
+         * `put(&local)` compiled — a stack address in a global.
+         *
+         * Gated on the DESTINATION carrying a reference: a scalar read of a
+         * field (`g_int = h.count`) copies a value and must not infer keep.
+         * The value has no type of its own when it is a literal, so the target's
+         * type is the one that can answer. */
+        if (node->assign.op == TOK_EQ && node->assign.value) {
+            Type *tt = typemap_get(c, node->assign.target);
+            if (!tt) tt = checker_get_type(c, node->assign.target);
+            if (tt && type_carries_data_pointer(tt, 0)) {
+                uint64_t km = keep_value_roots(c, node->assign.value, 0);
+                if (km) {
                     Symbol *target_sym = NULL; bool tgt_global = false, tgt_param = false;
-                    classify_escape_sink(c, node->assign.target, &target_sym, &tgt_global, &tgt_param);
-                    if (tgt_global || tgt_param) {
-                        /* keep inference (Site 1): a non-keep pointer/struct param
-                         * (or an alias of one) is persisted into a global/static or
-                         * a pointer-param sink — it ESCAPES, so it must be keep.
-                         * val_sym->nonkeep_root_param names the originating param
-                         * (its own index for a direct param; the propagated root for
-                         * an alias). Callers are then restricted at the call site. */
-                        infer_mark_param_keep(c, val_sym->nonkeep_root_param);
-                    }
+                    classify_escape_sink(c, node->assign.target, &target_sym,
+                                         &tgt_global, &tgt_param);
+                    if (tgt_global || tgt_param) infer_mark_param_keep_mask(c, km);
                 }
             }
         }
@@ -13519,42 +13412,6 @@ static Type *check_expr(Checker *c, Node *node) {
          * inference makes `keep` annotation-free, so this nudge is dropped. The
          * `keep` field keyword is still accepted (parsed) as an optional marker.
          * (Verified: the keep-param chain rejects `fill(&local)`, proving static.) */
-
-        /* keep axis (call-result launder): value is a (field/index of a) call with
-         * a non-keep-derived pointer argument, stored at a persistent sink.
-         * `gk = idfn(p)` / `h.hp = idfn(p)` where p is a non-keep param. Gated on
-         * the stored value being a pointer/slice (same as BUG-360/383) so
-         * int-returning calls aren't over-rejected. Conservative proxy — see
-         * call_has_nonkeep_derived_arg. */
-        if (node->assign.op == TOK_EQ && value &&
-            /* BUG-766 (copied from cool-johnson-dfcqr9): gate via
-             * type_carries_data_pointer so STRUCT/UNION/OPTIONAL returns wrapping
-             * a pointer/slice are covered (`g = mk_outer(p)`, `g = idfn(np)`
-             * returning ?[*]u8) — the old pointer/slice-only gate left silent
-             * stack-UAFs. Scalars stay false → unaffected. */
-            type_carries_data_pointer(value, 0)) {
-            /* BUG-931: peel launders BEFORE the field/index descent. With an
-             * OUTER cast (`g = (*u32)idfn(p)`) vroot was the NODE_TYPECAST and
-             * not the NODE_CALL, so this keep-inference gate was skipped whole
-             * and the call site accepted `stash(&loc)` — a stack pointer into a
-             * global, one indirection away. */
-            Node *vroot = unwrap_ptr_launder(node->assign.value);
-            while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
-                if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
-                else vroot = vroot->index_expr.object;
-                vroot = unwrap_ptr_launder(vroot);
-            }
-            if (vroot && vroot->kind == NODE_CALL &&
-                call_has_nonkeep_derived_arg(c, vroot, 0)) {
-                Symbol *tsym = NULL; bool tgt_global = false, tgt_param = false;
-                classify_escape_sink(c, node->assign.target, &tsym, &tgt_global, &tgt_param);
-                if (tgt_global || tgt_param) {
-                    /* keep inference (Site 1): `sink = idfn(p)` persists a value that
-                     * launders a non-keep param p — p escapes, so mark p keep. */
-                    infer_keep_from_call_args(c, vroot, 0);
-                }
-            }
-        }
 
         /* BUG-314: orelse &local escape to global via assignment.
          * g_ptr = opt orelse &local — if target is global, reject directly. */
@@ -22816,6 +22673,9 @@ static void check_stmt(Checker *c, Node *node) {
                                 sym->arena_source = src->arena_source;
                         }
                     }
+                    /* BUG-1363: the keep axis asks the one value query, which also
+                     * sees through a CALL result, an orelse, a struct literal. */
+                    taint_nonkeep_from_value(c, sym, type, node->var_decl.init);
                     /* BUG-1186: a local initialised with a reference into a
                      * union variant capture is itself one (it is declared inside
                      * the arm, so it cannot outlive it lexically — but it can be
@@ -23328,6 +23188,9 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
 
+                    /* BUG-1363: `if (pp(p)) |z|` — the capture holds whatever the
+                     * condition's value carries, through a call too. */
+                    taint_nonkeep_from_value(c, cap, cap->type, node->if_stmt.cond);
                     /* BUG-212: propagate local/arena-derived from condition ident */
                     {
                         Node *croot = node->if_stmt.cond;
@@ -24461,6 +24324,7 @@ static void check_stmt(Checker *c, Node *node) {
                 /* BUG-249: propagate safety flags from switch expression to capture.
                  * Same pattern as if-unwrap (BUG-212). */
                 if (cap) {
+                    taint_nonkeep_from_value(c, cap, cap->type, node->switch_stmt.expr);   /* BUG-1363 */
                     Node *sw_root = node->switch_stmt.expr;
                     while (sw_root) {
                         if (sw_root->kind == NODE_UNARY && sw_root->unary.op == TOK_STAR)
@@ -27013,15 +26877,12 @@ static void check_stmt(Checker *c, Node *node) {
                  * means. `void mid(*S w) { spawn grand(w); }` then `mid(&local)`
                  * handed a stack frame to a detached thread (ASan
                  * stack-use-after-return); keep makes the call site refuse it. */
-                if (!is_scoped && !stack_derived) {
-                    Node *pa = unwrap_ptr_launder(node->spawn_stmt.args[i]);
-                    if (pa && pa->kind == NODE_IDENT) {
-                        Symbol *ps = scope_lookup(c->current_scope, pa->ident.name,
-                                                  (uint32_t)pa->ident.name_len);
-                        if (ps && ps->is_nonkeep_derived && ps->nonkeep_root_param >= 0)
-                            infer_mark_param_keep(c, ps->nonkeep_root_param);
-                    }
-                }
+                if (!is_scoped && !stack_derived &&
+                    type_carries_data_pointer(checker_get_type(c, node->spawn_stmt.args[i]), 0))
+                    /* BUG-1363: every spelling of the argument — `spawn grand(id(w))`,
+                     * `spawn grand(h.p)` — through the one value query. */
+                    infer_mark_param_keep_mask(c,
+                        keep_value_roots(c, node->spawn_stmt.args[i], 0));
                 if (is_scoped) {
                     /* OK — scoped spawn, thread joined before scope exit */
                 } else if (stack_derived) {
@@ -29227,6 +29088,7 @@ static void check_func_body(Checker *c, Node *node) {
                          * at the persist sink (~4115). */
                         sym->is_nonkeep_derived = true;
                         sym->nonkeep_root_param = i; /* keep inference: this param is its own root */
+                        if (i < 64) sym->nonkeep_root_mask |= 1ULL << i;
                     }
                     /* GAP-8 (BUG-737, 2026-06-10, 6u360k audit): a by-value
                      * STRUCT/UNION param whose type carries raw data-pointer
@@ -29242,6 +29104,7 @@ static void check_func_body(Checker *c, Node *node) {
                         if (type_carries_data_pointer(ptype, 0)) {
                             sym->is_nonkeep_derived = true;
                             sym->nonkeep_root_param = i; /* keep inference: struct param is its own root */
+                        if (i < 64) sym->nonkeep_root_mask |= 1ULL << i;
                         }
                     }
                     /* #7 (2026-07-14): a `?*T`/`?[*]T` param is a NULLABLE borrow —
@@ -29254,6 +29117,7 @@ static void check_func_body(Checker *c, Node *node) {
                     else if (pk == TYPE_OPTIONAL && type_carries_data_pointer(ptype, 0)) {
                         sym->is_nonkeep_derived = true;
                         sym->nonkeep_root_param = i; /* keep inference: optional-carrier param is its own root */
+                        if (i < 64) sym->nonkeep_root_mask |= 1ULL << i;
                     }
                 }
                 /* field-level keep: a KEEP pointer param is a BORROW. Storing it

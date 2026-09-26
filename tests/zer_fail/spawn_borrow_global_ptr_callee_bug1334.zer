@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot call 'bump' while 'g' is lent
+// BUG-1334: a callee writes *gp while g is lent
+u32 g;
+*u32 gp = &g;
+void w(*u32 p) { for (u32 i = 0; i < 2000000; i += 1) { *p += 1; } }
+void bump() { *gp += 1; }
+u32 main() { ThreadHandle t = spawn w(&g); for (u32 i = 0; i < 2000000; i += 1) { bump(); } t.join(); return 0; }

@@ -6032,6 +6032,15 @@ borrowed by that thread until `.join()`:
   `void f(*u32 a, *u32 b) { ThreadHandle t = spawn w(a); *b = 5; t.join(); }`
   then `f(&v, &v)` is a compile error (the thread and the caller write `v` at once).
   The rule follows a local copy of either param and callees that forward them.
+- What a scoped spawn argument lends is followed through every CARRIER
+  (BUG-1331..1336): an async task handed as `&t` lends what its `_init` arguments
+  point into; a struct handed as `&h` lends the heap object its pointer field
+  holds (`free(p)` / `p.v = 1` before the join is refused); a global pointer
+  lends what it is aimed at (`*u32 gp = &g; spawn w(gp)` lends `g`, and a
+  callee writing `*gp` in the window is refused); a struct built by a factory
+  lends the globals the factory takes the address of; and `@atomic_*` on a lent
+  object is refused like a plain access — the thread's own access need not be
+  atomic.
 
 **SAFETY CHECKS**
 - Non-shared `*T` to fire-and-forget spawn → compile error

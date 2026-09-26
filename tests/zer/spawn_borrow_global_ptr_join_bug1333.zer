@@ -1,0 +1,14 @@
+// BUG-1333 boundary: a global pointer aimed at g lends g; the parent touches a
+// different global in the window and reads g after the join.
+u32 g;
+u32 other;
+*u32 gp = &g;
+void w(*u32 p) { *p += 42; }
+u32 main() {
+    ThreadHandle th = spawn w(gp);
+    other = 7;
+    th.join();
+    if (g != 42) { return 1; }
+    if (*gp != 42) { return 2; }
+    return 0;
+}

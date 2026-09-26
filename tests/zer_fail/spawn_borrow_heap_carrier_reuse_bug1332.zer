@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: which is borrowed by a scoped spawn
+// BUG-1332: free + realloc while &h is lent (slot reuse)
+struct T { u32 v; }
+struct H { *T p; }
+u32 go;
+void w(*H h) { while (@atomic_load(&go) == 0) { } h.p.v += 1; }
+u32 main() {
+    ?*T mp = alloc(T);
+    *T p = mp orelse return;
+    H h = { .p = p };
+    ThreadHandle th = spawn w(&h);
+    free(p);
+    ?*T mq = alloc(T);
+    *T q = mq orelse { th.join(); return 9; };
+    q.v = 100;
+    @atomic_store(&go, 1);
+    th.join();
+    u32 r = q.v;
+    free(q);
+    return r;
+}

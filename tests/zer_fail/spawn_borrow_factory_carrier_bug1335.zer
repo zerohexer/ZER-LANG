@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot write to 'g' while it is borrowed
+// BUG-1335: H h = mk() (mk returns a local carrier aimed at g)
+u32 g;
+struct H { *u32 p; }
+H mk() { H h = { .p = &g }; return h; }
+void w(H h) { for (u32 i = 0; i < 2000000; i += 1) { *h.p += 1; } }
+u32 main() { H h = mk(); ThreadHandle t = spawn w(h); for (u32 i = 0; i < 2000000; i += 1) { g += 1; } t.join(); return 0; }

@@ -1,0 +1,13 @@
+// BUG-1331 boundary: a task whose _init was handed &x lends x through &task to a
+// scoped spawn — the parent may touch x again only after the join.
+async void f(*u32 p) { *p += 1; yield; *p += 1; }
+void w(*_zer_async_f t) { _zer_async_f_poll(t); _zer_async_f_poll(t); }
+u32 main() {
+    u32 x = 40;
+    _zer_async_f t;
+    _zer_async_f_init(&t, &x);
+    ThreadHandle th = spawn w(&t);
+    th.join();
+    if (x != 42) { return 1; }
+    return 0;
+}

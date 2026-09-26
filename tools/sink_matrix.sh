@@ -361,6 +361,15 @@ cell p20_interior_ptr     reject 'struct B20{u32 v;} void w20(*u32 p){*p=5;} u32
 cell p20_prior_alias      reject 'void w20(*u32 p){*p=5;} u32 main(){ u32 v=1; *u32 al=&v; ThreadHandle t=spawn w20(&v); *al=7; t.join(); return v; }'
 cell p20_literal_carrier  reject 'struct H20{*u32 p;} void wh20(H20 h){*h.p=5;} u32 main(){ u32 v=1; H20 h={.p=&v}; ThreadHandle t=spawn wh20(h); v=7; t.join(); return v; }'
 cell p20_amp_carrier      reject 'struct H20{*u32 p;} void wp20(*H20 h){*h.p=5;} u32 main(){ u32 v=1; H20 h; h.p=&v; ThreadHandle t=spawn wp20(&h); v=7; t.join(); return v; }'
+# BUG-1331..1336: an async TASK carrier, a HEAP payload behind &carrier, a GLOBAL
+# pointer's declaration aim, a FACTORY-built carrier, and a parent @atomic_*.
+cell p20_async_task_amp   reject 'async void af20(*u32 p){ *p+=1; yield; } void wt20(*_zer_async_af20 t){ _zer_async_af20_poll(t); } u32 main(){ u32 v=0; _zer_async_af20 t; _zer_async_af20_init(&t, &v); ThreadHandle th=spawn wt20(&t); v=3; th.join(); return v; }'
+cell p20_heap_amp_carrier reject 'struct T20{u32 v;} struct HP20{*T20 p;} void wq20(*HP20 h){ h.p.v+=1; } u32 main(){ ?*T20 mp=alloc(T20); *T20 p=mp orelse return; HP20 h={.p=p}; ThreadHandle t=spawn wq20(&h); free(p); t.join(); return 0; }'
+cell p20_global_ptr_init  reject 'u32 g20b; *u32 gp20=&g20b; void w20(*u32 p){*p+=1;} u32 main(){ ThreadHandle t=spawn w20(gp20); g20b=3; t.join(); return 0; }'
+cell p20_factory_carrier  reject 'u32 g20c; struct H20{*u32 p;} H20 mk20(){ H20 h={.p=&g20c}; return h; } void wh20(H20 h){*h.p+=1;} u32 main(){ H20 h=mk20(); ThreadHandle t=spawn wh20(h); g20c=3; t.join(); return 0; }'
+cell p20_atomic_parent    reject 'u32 g20d; void w20(*u32 p){*p+=1;} u32 main(){ ThreadHandle t=spawn w20(&g20d); @atomic_add(&g20d, 1); t.join(); return 0; }'
+cell p20_safe_task_after_join compile 'async void af20(*u32 p){ *p+=1; yield; } void wt20(*_zer_async_af20 t){ _zer_async_af20_poll(t); } u32 main(){ u32 v=0; _zer_async_af20 t; _zer_async_af20_init(&t, &v); ThreadHandle th=spawn wt20(&t); th.join(); if(v!=1){return 1;} return 0; }'
+cell p20_safe_heap_after_join compile 'struct T20{u32 v;} struct HP20{*T20 p;} void wq20(*HP20 h){ h.p.v+=1; } u32 main(){ ?*T20 mp=alloc(T20); *T20 p=mp orelse return; HP20 h={.p=p}; ThreadHandle t=spawn wq20(&h); t.join(); u32 r=p.v; free(p); if(r!=1){return 1;} return 0; }'
 # BOUNDARY: lend only what actually reaches the parent's memory, and release at join.
 # A SCALAR is copied; a pointer to a GLOBAL lends no local; an unrelated local stays
 # writable; and every borrow ends at the join. Over-rejecting any of these would break
@@ -707,6 +716,7 @@ cell p32_transitive       reject  'u32 g32; void w32(*u32 p){*p+=1;} u32 peek32(
 cell p32_recursive        reject  'u32 g32; void w32(*u32 p){*p+=1;} u32 walk32(u32 n){ if(n==0){return g32;} return walk32(n-1); } u32 main(){ ThreadHandle t=spawn w32(&g32); u32 v=walk32(3); t.join(); return v; }'
 cell p32_atomic_in_callee reject  'u32 g32; void w32(*u32 p){*p+=1;} void bump32(){ @atomic_add(&g32, 1); } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); return 0; }'
 cell p32_funcptr_call     reject  'u32 g32; void w32(*u32 p){*p+=1;} void noop32(){ } u32 main(){ *() fp=noop32; ThreadHandle t=spawn w32(&g32); fp(); t.join(); return 0; }'
+cell p32_global_ptr_deref reject  'u32 g32; *u32 gp32=&g32; void w32(*u32 p){*p+=1;} void bump32(){ *gp32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); return 0; }'
 # BOUNDARY: a callee touching ANOTHER global, a call after the join, and a call
 # before the spawn are all fine — and a ThreadHandle's own join() is not a funcptr.
 cell p32_safe_other_global compile 'u32 g32; u32 o32; void w32(*u32 p){*p+=1;} void bump32(){ o32 += 1; } u32 main(){ ThreadHandle t=spawn w32(&g32); bump32(); t.join(); if(g32!=1||o32!=1){return 1;} return 0; }'

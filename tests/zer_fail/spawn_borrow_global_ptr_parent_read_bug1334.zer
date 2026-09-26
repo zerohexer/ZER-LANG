@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot use 'gp' while 'g'
+// BUG-1334: the parent reads through gp while g is lent
+u32 g;
+*u32 gp = &g;
+void w(*u32 p) { *p += 1; }
+u32 main() { ThreadHandle t = spawn w(&g); u32 v = *gp; t.join(); return v; }

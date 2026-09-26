@@ -5,6 +5,155 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-26 — BUG-1326..1357: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
+
+Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict
+superset of `review/25092026`) forked exactly at main — fast-forwarded, `make check` green.
+Older branches (`l07qno`, `8rby10`, `stoic-mendel-p4i854`) were already consumed. Then four
+read-only probe agents (emitter values, memory safety, bare-metal, concurrency) plus own
+probes. Every entry below was A/B-measured against the post-harvest build.
+
+- **BUG-1326 — a pure literal tree with `/`, `%`, `>>` or `~` could not initialise a narrow
+  signed type.** `i8 x = -5 / 1;` / `i8 x = 0 - 5 / 1;` were "cannot initialize 'i8' with
+  'u32'" while `i8 x = 0 - 5;` compiled. The only licence was the ring-homomorphism rule,
+  which must refuse those operators because it lets an intermediate wrap. Second licence
+  (`lit_tree_exact_in_width`): EVERY node's exact value fits the target and every shift count
+  is in [0, width-1] — then nothing ever wraps and the target-width computation IS the exact
+  one. The shift bound keeps ZER's over-width-is-0 rule out (`-5 >> 10` is 0 in ZER, -1
+  exactly). Tests: `tests/zer/literal_tree_exact_division_bug1326.zer`, two boundary
+  negatives `literal_tree_{negative_to_unsigned,shift_past_width}_bug1326.zer`.
+- **BUG-1327 — INT64_MIN / u64 2^63 was "not a constant".** `CONST_EVAL_FAIL` is INT64_MIN,
+  so `i64 m = -9223372036854775807 - 1;` was refused and `x / 9223372036854775808` (binary,
+  compound, const global, var-decl) was "not proven nonzero". The evaluator core
+  (`eval_const_expr_core`, ast.h) now reports failure out of band; `eval_const_expr_ok` is
+  the new entry point and the sentinel API is a thin wrapper, so every unmigrated caller
+  behaves exactly as before. Migrated: the literal-tree retype, both divisor proofs, and a
+  var-decl of a >= 2^63 u64 literal records "nonzero" with a full range. Test:
+  `tests/zer/int64_min_constant_bug1327.zer`.
+- **BUG-1328 — comptime functions could not cast, name a const global, or divide.**
+  `comptime u32 W(u32 x) { return (u32)(x * 2); }`, `return x + K;` and `return x / y;`
+  were all refused — the last by the RUN-TIME division guard, in a body that is never
+  emitted. The interpreter now folds `(T)x` (integer/bool source to an integer of at most 64
+  bits, wrapped as the emitted conversion is) and resolves an integer `const` global through
+  the one const resolver, in the GLOBAL scope (a same-named local of the caller cannot
+  capture it); the division guard is skipped in a comptime body (a zero divisor fails the
+  fold and the call is refused). Tests: `tests/zer/comptime_cast_and_const_global_bug1328.zer`,
+  `tests/zer_fail/comptime_division_by_zero_fold_bug1328.zer`.
+- **BUG-1329 — `alloc(u3, n)` / `alloc(i48, n)` said "undefined identifier 'u3'".**
+  `alloc_resolve_elem_type` knew only the keyword widths. Test:
+  `tests/zer/alloc_arbitrary_width_elem_bug1329.zer`.
+- **BUG-1330 — `if (g.o) |*v| { v.x += 1; }` on an optional inside a SHARED struct wrote the
+  shared bytes with no lock** (the auto-lock covers the condition only; TSan race; also
+  through a `*S` param and a nested field). Refused through `lvalue_path_through_shared` —
+  the union-switch sibling (B2) now uses the same path query (it tested only the ROOT). Tests:
+  `tests/zer_fail/shared_optional_ptr_capture{,_param,_nested}_bug1330.zer`; boundary
+  `tests/zer/shared_optional_value_capture_ok_bug1330.zer`.
+- **BUG-1340 — `|*pp|` of a `?*T` / `?funcptr` bound the POINTEE's address, not the
+  optional's.** Emitted `pp = o;` into a `T **`, so `*pp = &other` wrote a pointer into the
+  object's own bytes (a 4-byte struct global overwritten, its neighbour clobbered — silent).
+  IR_COPY now takes the optional's address for a null-sentinel optional (the type test `dst
+  == *inner` separates it from the value capture), and ir_lower's BUG-1054 lvalue-address
+  path no longer excludes null-sentinel optionals (a field/global/element capture pointed
+  into a temp copy). Test: `tests/zer/optional_ptr_mutable_capture_bug1340.zer`.
+- **BUG-1341 — a pointer to a function pointer was not a C declarator**
+  (`uint32_t (*)(uint32_t)* pp`) — every `**(u32) -> u32` local/param and every `|*pf|`
+  capture of a `?funcptr` failed in GCC. `emit_type_and_name` puts the stars inside:
+  `uint32_t (**pp)(uint32_t)`. Test: `tests/zer/pointer_to_funcptr_bug1341.zer`.
+- **BUG-1342 — `@critical` masked nothing on bare-metal RISC-V / AArch64 / ARM A-R unless the
+  build passed `-ffreestanding`.** The privileged arms were gated on `!_ZER_HOSTED`
+  (= `__STDC_HOSTED__`), which a newlib toolchain (`riscv*-unknown-elf`, `aarch64-none-elf`,
+  `arm-none-eabi` on an A/R core) sets to 1; the fence arm ran and the ISR read-modify-write
+  the checker had told the user to wrap lost updates. New preamble macro `_ZER_USER_MODE` =
+  hosted C AND an operating system (`__linux__`, `__APPLE__`, `_WIN32`, …); the privileged
+  arms key on `!_ZER_USER_MODE`. Gate: three new newlib rows in `tools/emit_audit.sh`'s
+  per-target `@critical` table (RED on the old build).
+- **BUG-1343 — a COMPUTED `@inttoptr` address bound a plain pointer.** BUG-1195 made only a
+  constant address volatile; `*Regs u = @inttoptr(*Regs, base + n*0x100); u.ctrl = 1;
+  u.ctrl = 2; while (u.status == 0) {}` passed the same runtime mmio-range check and -O2
+  deleted the first store and hoisted the poll (also `@ptrtoint(r) + 4`). The result is now
+  volatile for every address in strict mode; under `--no-strict-mmio` (no range check —
+  lib/compat.zer's pointer-arithmetic emulation) only the constant form is promoted. Tests:
+  `tests/zer_fail/inttoptr_computed_addr_volatile_{l13,l14}_bug1343.zer`.
+- **BUG-1344 — a whole-array copy to/from a volatile array was a plain `memmove`** (qualifier
+  cast away: -O2 merged 32-bit FIFO registers into 64-bit accesses, deleted the first of two
+  writes, turned a poll into `jmp .`). The IR path had no volatile case at all; the AST path
+  used a BYTE loop (four accesses to a 32-bit register). One emitter `emit_array_assign`,
+  element-wise at the innermost element type through volatile pointers; `expr_is_volatile`
+  now sees an access THROUGH a volatile pointer or slice at any step. Gate: `emit_audit.sh`
+  "bmq" sample; test `tests/zer/volatile_array_copy_bug1344.zer`.
+- **BUG-1345 — array PARAMETERS dropped qualifiers in both directions.** Passing a volatile
+  array to `void f(u32[4] a)` (C: a plain pointer) was accepted, as was a `const` array to a
+  writing callee; and a DECLARED `volatile u32[4] a` parameter was emitted as `uint32_t
+  a[4]`. `reject_array_param_qualifier_drop` at the call-arg sink (reads the callee's
+  parameter type node; an indirect callee counts as unqualified), and
+  `emit_func_decl_params` emits the element qualifier. Tests:
+  `tests/zer_fail/{volatile_array_to_plain_param,const_array_to_mutable_param}_bug1345.zer`,
+  `tests/zer/qualified_array_param_bug1345.zer`.
+- **BUG-1346 — `section(...)` was silently dropped on every declaration form except the
+  generic one** (`volatile`, `const`, `static`, `threadlocal`, `interrupt`, `async` returned
+  earlier) — a DMA buffer outside DMA-reachable RAM, a `.noinit` flag zeroed at reset, a
+  `.ramfunc` ISR running from flash. `parse_declaration` now parses the attribute, calls the
+  body parser, and applies it to whatever came back; `NODE_INTERRUPT` carries a section; a
+  declaration that cannot carry it (and `naked` on a non-function) is an error. Test:
+  `tests/zer_fail/section_on_struct_decl_bug1346.zer` + `emit_audit.sh` "bmq".
+- **BUG-1347 — `interrupt X as "SYMBOL"` was parsed and never emitted**: the handler was
+  `X_IRQHandler`, so the vector table kept its weak default and the handler never ran. One
+  `emit_isr_signature` for prototype and definition; the name must be a C identifier. Test:
+  `tests/zer_fail/interrupt_as_name_not_identifier_bug1347.zer` + `emit_audit.sh` "bmq".
+- **BUG-1348 — RISC-V `@critical` / `@cpu_restore_int_state` restored ALL of `mstatus`**, so
+  anything the block changed (FS=Dirty from FP use) was reverted and a lazy-FPU context
+  switch skipped saving the FP registers. Restores MIE (bit 3) only.
+- **BUG-1349 — a nested index with a side-effecting inner index addressed the wrong
+  element.** The single-evaluation lvalue form `*({ ...; &a[i]; })` was followed by the
+  outer `[j]` / `.f`, and postfix binds tighter than unary `*`: `m[id(1)][2] = 7` wrote
+  `m[3][0]` (`m[id(2)][2]` overflowed the stack — ASan), for a call, a volatile, an
+  orelse, `k += 1` as the inner index; `rs[id(1)].x = 5` did not compile. The four forms
+  (both emitter paths, array and slice) are parenthesised, and the IR form now evaluates
+  an lvalue OBJECT with a side effect before the index (`s.m[t(1)][t(2)]` ran t(2) first).
+  Test: `tests/zer/nested_index_side_effect_bug1349.zer`.
+- **BUG-1350 — C trigraphs rewrote string literals.** The driver compiles with
+  `-std=c99`, so `"??="` became `"#"` and `"??/"` a backslash escaping the next byte.
+  `emit_c_string_text` emits `?` as `\?`. Test: `tests/zer/string_trigraph_literal_bug1350.zer`.
+- **BUG-1351 — an index, a slice / bit-slice position and an alloc count wider than 64
+  bits were silently narrowed** (`s[(1 << 64) + 1]` read `s[1]` after passing the check as
+  1; a `u65` index wrote `arr[2]`; `alloc(u32, 2^64 + 2)` returned 2 elements). Refused
+  (`reject_wide_position`), as `@inttoptr` refuses a wide address. Tests:
+  `tests/zer_fail/wide_{index,alloc_count}_bug1351.zer`.
+- **BUG-1352 — a shift count wider than 64 bits was narrowed by `(int64_t)` in
+  `_zer_shl`/`_zer_shr`** (`x << ((1 << 64) + 1)` shifted by 1; UBSan). A count that does
+  not round-trip through int64_t is out of range → 0. Test:
+  `tests/zer/wide_shift_count_bug1352.zer`.
+- **BUG-1353 — `@ctz`/`@clz`/`@popcount`/`@ffs`/`@parity` on u65..u128 used the low 64
+  bits** (`@ctz(1 << 70)` was 64). Refused like `@bswap64`. Test:
+  `tests/zer_fail/bitquery_wide_operand_bug1353.zer`.
+- **BUG-1354 — an ARRAY FIELD of a frame-held struct escaped as a view.**
+  `[*]u32 view(W w) { return w.a; }` (a by-value struct PARAMETER was exempted as "caller
+  memory" along with array parameters), `[*]u32 s = w.a; return s;` and `return
+  ident(w.a);` on a LOCAL struct, sub-slice and carrier variants — all accepted, ASan
+  stack-use-after-return. Every site walked to the root ident and tested whether the ROOT
+  was an array. ONE predicate, `array_storage_frame_root` / `array_view_frame_root`, now
+  answers "which of this frame's variables holds this array?" (the storage is someone
+  else's only through a pointer/slice step, or at a global / static / array-pointer-slice
+  parameter root) and feeds `arg_is_local_derived`, the slice-binding taint and the
+  return sink. Gate: SHAPE p60 in `tools/sink_matrix.sh` (6 HOLE on the old build, 4
+  boundary cells). Tests: `tests/zer_fail/{param_struct_array_field_escape,
+  local_struct_array_field_view_escape,local_struct_array_field_call_launder}_bug1354.zer`.
+- **BUG-1355 — views into two more frame temporaries.** `(mkp(v) orelse dflt()).a` (an
+  orelse reached through by-value steps is a temporary, like a call —
+  `ref_path_hits_call_temp`), and `if (mk(7)) |*v| { return v.a[0..]; }` (a `|*v|`
+  capture of frame storage — a local, a by-value parameter or a condition temporary — is
+  now local-derived). Tests: `tests/zer_fail/{orelse_temp_array_view,
+  mutable_capture_call_temp_view}_bug1355.zer`.
+- **BUG-1356 — calling a function pointer produced by an expression aborted the
+  compiler** (`sel(1)(5)`, `(maybe(k) orelse f)(x)`: "INTERNAL ERROR: emitter cannot lower
+  this callee expression"). Emitted as a parenthesised callee through the BUG-1019 null
+  guard. Test: `tests/zer/call_result_callee_bug1356.zer`.
+- **BUG-1357 — a function returning a NULLABLE function pointer emitted
+  `uint32_t (*)(uint32_t) f(...)`** (GCC refused). `func_ret_funcptr_type` peels the
+  null-sentinel optional. Same test.
+- Tooling: `test_fuzz.c` declares `_POSIX_C_SOURCE` (implicit `fileno` warning — the build is
+  otherwise warning-free).
+
 ## Session 2026-09-25f — BUG-1308..1325: five-area audit (escape through indirection, funcptr reach via global initializers, global-read aliases, VRP, emitter literals, `main` ABI)
 
 Harvest first: `origin/review/25092026` (6 commits, BUG-1268..1307, forked on main) merged

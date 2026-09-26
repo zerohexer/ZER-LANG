@@ -1,0 +1,9 @@
+// BUG-1350: `??=` in a string literal is three bytes — the emitted C escapes `?`
+// so the C99 trigraph translation cannot turn it into `#` (or `??/` into `\`).
+u32 main() {
+    const [*]u8 q = "??=";
+    const [*]u8 r = "a??/b?";
+    if (q.len != 3 || q[0] != '?' || q[2] != '=') { return 1; }
+    if (r.len != 6 || r[3] != '/' || r[4] != 'b') { return 2; }
+    return 0;
+}

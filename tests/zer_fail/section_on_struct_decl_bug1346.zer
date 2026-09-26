@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: section(...) applies to a function, a global variable or an interrupt handler
+// BUG-1346: section() was silently dropped on every declaration form but the
+// generic one; one that cannot carry it is now refused instead of ignored.
+section(".t") struct S { u32 a; }
+u32 main() { return 0; }

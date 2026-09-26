@@ -995,6 +995,27 @@ cell p48_global_array_drop   reject "$P48"' u32 main(){ *T48 a = alloc(T48) orel
 cell p48_safe_getter_read    compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; g48 = a; *T48 c = getg48() orelse return; u32 r = c.v + a.v; g48 = null; free(a); return r; }'
 cell p48_safe_readonly_global compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; ga48[0].p = a; u32 r = sum48(ga48); ga48[0].p = null; r += a.v; free(a); return r; }'
 
+# SHAPE p60 (BUG-1354): an ARRAY FIELD of a frame-held aggregate becoming a view —
+# a local struct, or a BY-VALUE struct parameter (this frame's copy, unlike an array
+# or pointer parameter). Every site walked to the root ident and asked whether the
+# ROOT was an array. BOUNDARY: array param, pointer param, slice param, global,
+# static, a view used only inside the frame.
+echo "===== SHAPE p60 = array field of a frame struct (local / by-value param) as a view ====="
+P60='struct W60 { u32[4] a; } struct H60 { [*]u32 s; } W60 gw60;
+[*]u32 id60([*]u32 x) { return x; }
+u32 sum60([*]u32 x) { return x[0]; }
+'
+cell p60_param_ret_field     reject "$P60"' [*]u32 v(W60 w) { return w.a; } u32 main(){ return 0; }'
+cell p60_param_local_view    reject "$P60"' [*]u32 v(W60 w) { [*]u32 s = w.a; return s; } u32 main(){ return 0; }'
+cell p60_local_local_view    reject "$P60"' [*]u32 v() { W60 w; [*]u32 s = w.a; return s; } u32 main(){ return 0; }'
+cell p60_local_call_launder  reject "$P60"' [*]u32 v() { W60 w; return id60(w.a); } u32 main(){ return 0; }'
+cell p60_local_subslice_view reject "$P60"' [*]u32 v() { W60 w; [*]u32 s = w.a[1..]; return s; } u32 main(){ return 0; }'
+cell p60_local_carrier       reject "$P60"' H60 v() { W60 w; H60 h = { .s = w.a }; return h; } u32 main(){ return 0; }'
+cell p60_safe_array_param    compile "$P60"' [*]u32 v(u32[4] a) { return a; } u32 main(){ u32[4] x; return v(x)[0]; }'
+cell p60_safe_ptr_param      compile "$P60"' [*]u32 v(*W60 p) { [*]u32 s = p.a; return s; } u32 main(){ W60 w; return v(&w)[0]; }'
+cell p60_safe_global         compile "$P60"' [*]u32 v() { return gw60.a; } u32 main(){ return v()[0]; }'
+cell p60_safe_in_frame       compile "$P60"' u32 v(W60 w) { [*]u32 s = w.a; return sum60(s) + sum60(w.a); } u32 main(){ W60 w; return v(w); }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

@@ -384,6 +384,8 @@ struct Node {
             const char *as_name;        /* NULL if no 'as' clause */
             size_t as_name_len;
             Node *body;
+            const char *section;        /* BUG-1346: section("...") */
+            size_t section_len;
         } interrupt;
 
         /* NODE_MMIO: mmio 0x40020000..0x40020FFF; */
@@ -704,93 +706,120 @@ void ast_print(Node *node, int indent);
 typedef int64_t (*ConstIdentResolver)(void *ctx, const char *name, uint32_t name_len,
                                       int depth);
 
-/* Extended constant expression evaluator with optional ident resolution.
- * Pass resolve=NULL and resolve_ctx=NULL for basic evaluation (same as eval_const_expr). */
-static inline int64_t eval_const_expr_ex(Node *n, int depth,
-                                          ConstIdentResolver resolve, void *resolve_ctx) {
-    if (!n || depth > 256) return CONST_EVAL_FAIL;
-    if (n->kind == NODE_INT_LIT) return (int64_t)n->int_lit.value;
+/* BUG-1327: the evaluator's CORE reports failure out of band. `CONST_EVAL_FAIL` is
+ * INT64_MIN — i64's minimum and the bit pattern of u64 2^63 — so through the
+ * sentinel API exactly one value of each 64-bit type "is not a constant"
+ * (`i64 m = -9223372036854775807 - 1;` was refused, a divisor of 2^63 was "not
+ * proven nonzero"). `eval_const_expr_ok` returns false for "not a constant" and
+ * stores the value otherwise, INT64_MIN included. The sentinel entry points below
+ * are thin wrappers that still map INT64_MIN to CONST_EVAL_FAIL, so every caller
+ * that has not been migrated behaves exactly as before (conservatively). An
+ * identifier resolver still speaks the sentinel, so a NAMED constant equal to
+ * INT64_MIN stays unresolved — the reject direction. */
+static inline bool eval_const_expr_core(Node *n, int depth,
+                                        ConstIdentResolver resolve, void *resolve_ctx,
+                                        int64_t *out) {
+    if (!n || depth > 256) return false;
+    if (n->kind == NODE_INT_LIT) { *out = (int64_t)n->int_lit.value; return true; }
     /* BUG-1191: a character literal is a u8 constant ('G' is 71) — `enum Cmd {
      * get = 'G' }` and `u8[' '] pad` fold like any literal. */
-    if (n->kind == NODE_CHAR_LIT) return (int64_t)(uint8_t)n->char_lit.value;
-    if (n->kind == NODE_CALL && n->call.is_comptime_resolved)
-        return n->call.comptime_value;
-    if (n->kind == NODE_INTRINSIC && n->intrinsic.is_size_folded)   /* BUG-1151 */
-        return n->intrinsic.size_value;
+    if (n->kind == NODE_CHAR_LIT) { *out = (int64_t)(uint8_t)n->char_lit.value; return true; }
+    if (n->kind == NODE_CALL && n->call.is_comptime_resolved) {
+        *out = n->call.comptime_value;
+        return *out != CONST_EVAL_FAIL;
+    }
+    if (n->kind == NODE_INTRINSIC && n->intrinsic.is_size_folded) {   /* BUG-1151 */
+        *out = n->intrinsic.size_value;
+        return true;
+    }
     /* Ident resolution via callback */
-    if (n->kind == NODE_IDENT && resolve)
-        return resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len,
+    if (n->kind == NODE_IDENT && resolve) {
+        *out = resolve(resolve_ctx, n->ident.name, (uint32_t)n->ident.name_len,
                        depth + 1);   /* BUG-975: an identifier hop IS a level */
+        return *out != CONST_EVAL_FAIL;
+    }
     if (n->kind == NODE_UNARY) {
-        int64_t v = eval_const_expr_ex(n->unary.operand, depth + 1, resolve, resolve_ctx);
-        if (v == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        int64_t v;
+        if (!eval_const_expr_core(n->unary.operand, depth + 1, resolve, resolve_ctx, &v))
+            return false;
         if (n->unary.op == TOK_MINUS) {
-            if (v == INT64_MIN) return CONST_EVAL_FAIL;   /* -INT64_MIN: host UB */
-            return -v;
+            if (v == INT64_MIN) return false;   /* -INT64_MIN: host UB */
+            *out = -v; return true;
         }
-        if (n->unary.op == TOK_TILDE) return ~v;
-        if (n->unary.op == TOK_BANG)  return v ? 0 : 1;
-        return CONST_EVAL_FAIL;
+        if (n->unary.op == TOK_TILDE) { *out = ~v; return true; }
+        if (n->unary.op == TOK_BANG)  { *out = v ? 0 : 1; return true; }
+        return false;
     }
     if (n->kind == NODE_BINARY) {
-        int64_t l = eval_const_expr_ex(n->binary.left, depth + 1, resolve, resolve_ctx);
-        int64_t r = eval_const_expr_ex(n->binary.right, depth + 1, resolve, resolve_ctx);
-        if (l == CONST_EVAL_FAIL || r == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
+        int64_t l, r;
+        if (!eval_const_expr_core(n->binary.left, depth + 1, resolve, resolve_ctx, &l) ||
+            !eval_const_expr_core(n->binary.right, depth + 1, resolve, resolve_ctx, &r))
+            return false;
         switch (n->binary.op) {
         case TOK_PLUS:
             if ((r > 0 && l > INT64_MAX - r) || (r < 0 && l < INT64_MIN - r))
-                return CONST_EVAL_FAIL;
-            return l + r;
+                return false;
+            *out = l + r; return true;
         case TOK_MINUS:
             if ((r < 0 && l > INT64_MAX + r) || (r > 0 && l < INT64_MIN + r))
-                return CONST_EVAL_FAIL;
-            return l - r;
+                return false;
+            *out = l - r; return true;
         case TOK_STAR:
             if (l != 0 && r != 0) {
                 if ((l > 0 && r > 0 && l > INT64_MAX / r) ||
                     (l < 0 && r < 0 && l < INT64_MAX / r) ||
                     (l > 0 && r < 0 && r < INT64_MIN / l) ||
                     (l < 0 && r > 0 && l < INT64_MIN / r))
-                    return CONST_EVAL_FAIL;
+                    return false;
             }
-            return l * r;
+            *out = l * r; return true;
         case TOK_SLASH:
-            if (r == 0) return CONST_EVAL_FAIL;
-            if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
-            return l / r;
+            if (r == 0) return false;
+            if (l == INT64_MIN && r == -1) return false;
+            *out = l / r; return true;
         case TOK_PERCENT:
-            if (r == 0) return CONST_EVAL_FAIL;
-            if (l == INT64_MIN && r == -1) return CONST_EVAL_FAIL;
-            return l % r;
+            if (r == 0) return false;
+            if (l == INT64_MIN && r == -1) return false;
+            *out = l % r; return true;
         /* BUG-1031: a shift by a negative count, or by >= the operand width, is 0
          * in ZER (`_zer_shl`/`_zer_shr`). This evaluator is UNTYPED, so only a
          * count that is over-width for EVERY ZER integer width (uN goes to 128)
-         * can be folded here; [63,127] stays CONST_EVAL_FAIL and is decided by a
+         * can be folded here; [63,127] stays unfolded and is decided by a
          * typed site (checker.c eval_const_expr_subst knows the operand width;
          * the emitter's global-initializer path knows the left operand's type). */
         case TOK_LSHIFT:
-            if (r < 0 || r >= 128) return 0;
-            if (r >= 63) return CONST_EVAL_FAIL;
-            return (int64_t)((uint64_t)l << r);
+            if (r < 0 || r >= 128) { *out = 0; return true; }
+            if (r >= 63) return false;
+            *out = (int64_t)((uint64_t)l << r); return true;
         case TOK_RSHIFT:
-            if (r < 0 || r >= 128) return 0;
-            if (r >= 63) return CONST_EVAL_FAIL;
-            return l >> r;
-        case TOK_AMP:     return l & r;
-        case TOK_PIPE:    return l | r;
-        case TOK_CARET:   return l ^ r;
-        case TOK_GT:      return l > r ? 1 : 0;
-        case TOK_LT:      return l < r ? 1 : 0;
-        case TOK_GTEQ:    return l >= r ? 1 : 0;
-        case TOK_LTEQ:    return l <= r ? 1 : 0;
-        case TOK_EQEQ:    return l == r ? 1 : 0;
-        case TOK_BANGEQ:  return l != r ? 1 : 0;
-        case TOK_AMPAMP:  return (l && r) ? 1 : 0;
-        case TOK_PIPEPIPE: return (l || r) ? 1 : 0;
-        default: return CONST_EVAL_FAIL;
+            if (r < 0 || r >= 128) { *out = 0; return true; }
+            if (r >= 63) return false;
+            *out = l >> r; return true;
+        case TOK_AMP:     *out = l & r; return true;
+        case TOK_PIPE:    *out = l | r; return true;
+        case TOK_CARET:   *out = l ^ r; return true;
+        case TOK_GT:      *out = l > r ? 1 : 0; return true;
+        case TOK_LT:      *out = l < r ? 1 : 0; return true;
+        case TOK_GTEQ:    *out = l >= r ? 1 : 0; return true;
+        case TOK_LTEQ:    *out = l <= r ? 1 : 0; return true;
+        case TOK_EQEQ:    *out = l == r ? 1 : 0; return true;
+        case TOK_BANGEQ:  *out = l != r ? 1 : 0; return true;
+        case TOK_AMPAMP:  *out = (l && r) ? 1 : 0; return true;
+        case TOK_PIPEPIPE: *out = (l || r) ? 1 : 0; return true;
+        default: return false;
         }
     }
-    return CONST_EVAL_FAIL;
+    return false;
+}
+
+/* Extended constant expression evaluator with optional ident resolution.
+ * Pass resolve=NULL and resolve_ctx=NULL for basic evaluation (same as eval_const_expr).
+ * Sentinel API: INT64_MIN (a real value) reads as CONST_EVAL_FAIL — see BUG-1327. */
+static inline int64_t eval_const_expr_ex(Node *n, int depth,
+                                          ConstIdentResolver resolve, void *resolve_ctx) {
+    int64_t v;
+    if (!eval_const_expr_core(n, depth, resolve, resolve_ctx, &v)) return CONST_EVAL_FAIL;
+    return v;
 }
 
 /* BUG-817: THE root-ident walk. The same three lines had been hand-written at
@@ -824,6 +853,10 @@ static inline int64_t eval_const_expr_d(Node *n, int depth) {
 }
 static inline int64_t eval_const_expr(Node *n) {
     return eval_const_expr_d(n, 0);
+}
+/* BUG-1327: the out-of-band form — false = not a constant; INT64_MIN is a value. */
+static inline bool eval_const_expr_ok(Node *n, int64_t *out) {
+    return eval_const_expr_core(n, 0, NULL, NULL, out);
 }
 
 /* Path C front door: is `name` an arbitrary-width int type spelling like "u21"/"i48"?

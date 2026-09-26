@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot return result of call with local-derived pointer argument
+// BUG-1354: the same view laundered through an identity call.
+struct W { u32[4] a; }
+[*]u32 ident([*]u32 x) { return x; }
+[*]u32 view(u32 k) { W w; w.a[0] = k; return ident(w.a); }
+u32 main() { [*]u32 s = view(3); return s[0]; }

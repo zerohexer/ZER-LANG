@@ -1270,7 +1270,8 @@ int main(void) {
         "u32 main() {\n"
         "    u32 x = 42;\n"
         "    usize addr = @ptrtoint(&x);\n"
-        "    *u32 p = @inttoptr(*u32, addr);\n"
+        /* BUG-1343: every strict-mode @inttoptr result is volatile */
+        "    volatile *u32 p = @inttoptr(*u32, addr);\n"
         "    return *p;\n"
         "}\n",
         42,

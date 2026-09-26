@@ -1,0 +1,30 @@
+// BUG-1328: a comptime body may cast and name a const GLOBAL (resolved in the
+// global scope, not the caller's), and a division in a comptime body needs no
+// run-time guard (the body is only folded; a zero divisor fails the fold).
+const u8 SM = 200;
+const u32 K = 4;
+const i8 NEG = -3;
+comptime u32 A(u32 x) { return (u32)((u8)x + SM); }
+comptime u32 B(u32 x) { return x + K; }
+comptime i32 C(i32 x) { return (i32)NEG * x; }
+comptime u32 D(i32 x) { return (u32)x; }
+comptime u8 E(u32 x) { return (u8)x; }
+comptime u32 F(u32 x) { u32 r = x; r /= K; return r % 3; }
+comptime u64 G(u32 x) { return (u64)x << 40; }
+comptime i8 H(u32 x) { return (i8)x; }
+u32 main() {
+    const u32 K = 1000;
+    if (A(100) != 44) { return 1; }
+    if (B(1) != 5) { return 2; }
+    if (C(5) != -15) { return 3; }
+    if (D(-1) != 4294967295) { return 4; }
+    if (E(300) != 44) { return 5; }
+    if (F(20) != 2) { return 6; }
+    if (G(1) != 1099511627776) { return 7; }
+    if (H(200) != -56) { return 8; }
+    u32[B(4)] arr;
+    if (arr.len != 8) { return 9; }
+    comptime if (B(0) == 4) { } else { return 10; }
+    if (K != 1000) { return 11; }
+    return 0;
+}

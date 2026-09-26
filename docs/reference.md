@@ -107,7 +107,8 @@ u3  narrow = (u3)wide;   // C-style cast — truncates to 3 bits, so 4
 - Widths 1..128. Same no-implicit-narrowing rule as u8..u64 — narrow explicitly with either `@truncate(u21, big)` or a C-style cast `(u21)big`. Both wrap to N bits, not to the carrier width (BUG-946: `(u3)300` is 4, not 44).
 - Arithmetic on bare integer literals is `u32`, so `u21 x = 1000 + 500;` is rejected (u32→u21 narrowing). Write a fitting literal (`u21 x = 1500;`) or use `uN`-typed operands (`u21 a = 1000; u21 x = a + 500;` — this wraps at 2^N).
 - Carrier = smallest native int ≥ N bits (`u21` → `uint32_t`); the compiler masks arithmetic results to N bits so the wrap is at 2^N, not the carrier width.
-- A single sub-byte scalar is just a `uN`; for named bit-fields, use a `packed struct` or bit-slices `reg[hi..lo]`.
+- A single sub-byte scalar is just a `uN`. For named bit-FIELDS of a register use bit-slices `reg[hi..lo]`: a `packed struct` lays each `uN` field out in its byte-sized CARRIER (`u3` occupies a whole `u8`), so it is not a bit-level overlay.
+- `alloc(u12, n)` / `alloc(i48, n)` allocate arrays of an arbitrary width like any primitive.
 - `>64`-bit arithmetic (`u128` …) works but is emulated (multi-word). For hand-tuned big-int, use the `@addc`/`@subb`/`@mulw` carry primitives.
 
 **SEE ALSO**
@@ -364,7 +365,11 @@ function with a `switch` (a `comptime` function if every argument is constant).
 PARAMETER does not copy: `void f(u32[3] a)` receives the caller's array (as in
 C), so a write through `a` is visible to the caller. Pass `[*]T` when you mean
 "a view of the caller's buffer" and copy into a local when you mean "my own
-copy".
+copy". Because it is a view, a `volatile` or `const` array may be passed only to
+a parameter declared the same way (`u32 rd(volatile u32[4] a)`); passing it to a
+plain `u32[4]` parameter is a compile error. Copying a whole array to or from a
+`volatile` one (`c = regs.fifo;`) is done element by element through volatile
+accesses.
 
 ```zer
 const [*]u8 BITS = "\x01\x02\x04\x08";        // read-only byte table
@@ -1879,6 +1884,12 @@ if (result) |val| {
 - `|*val|` on an optional that is a field of a `packed struct` is a compile
   error ("mutable capture '|*v|' of a packed struct field would be a misaligned
   pointer"): capture by value and assign the field back.
+- `|*val|` on an optional inside a `shared struct` is a compile error ("cannot
+  capture an optional inside a shared struct by pointer"): the auto-lock covers
+  only the condition, so writes through the capture would race. Capture by
+  value and assign the field back as its own statement.
+- On a `?*T` (or a nullable function pointer) `|*pp|` is a `**T` pointing at the
+  optional itself: `*pp = &other` re-points the optional.
 
 ```zer
 struct S { ?u32 w; }
@@ -2741,8 +2752,13 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   the whole access (`sizeof(T)` bytes from the address) is not inside one declared
   range. The address operand must be at most 64 bits wide — a `u128` is rejected
   ("narrow it explicitly with @truncate").
-- The result of a CONSTANT-address `@inttoptr` is a **volatile** pointer (BUG-1195),
-  wherever it flows: binding it to a plain `*T` through a return, an assignment
+- The result of `@inttoptr` is a **volatile** pointer — for a constant address
+  (BUG-1195) and, in strict mode, for a computed one too (BUG-1343: it passes the
+  same run-time range check, so it is just as much a peripheral). Under
+  `--no-strict-mmio` a computed address is not range-checked and only the
+  constant form is promoted. So `volatile *Regs u = @inttoptr(*Regs, base + n *
+  0x100);` — a plain `*Regs u` is refused. Previously (constant address,
+  BUG-1195) wherever it flows: binding it to a plain `*T` through a return, an assignment
   or a call argument is refused ("cannot assign volatile pointer to non-volatile"),
   and a direct `@inttoptr(*R, A).field = x` emits a volatile access. Before, only
   the var-decl sink checked, and GCC could delete one of two register writes or
@@ -4381,6 +4397,15 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
 ```
 
 **NOTES**
+- The handler's C symbol is `NAME_IRQHandler`, or exactly the `as "SYMBOL"`
+  string (which must be a C identifier) — match it to your vector table.
+  `section("...")` before `interrupt` places the handler (e.g. `.ramfunc`).
+- `@critical` masks interrupts on bare metal: ARM M-profile (PRIMASK), A/R
+  (CPSR), AArch64 (DAIF), RISC-V (mstatus.MIE — only that bit is restored), AVR,
+  and x86 when the build is freestanding. It falls back to a memory fence only in
+  USER MODE — a hosted C library AND an operating system (`__linux__`, `_WIN32`,
+  `__APPLE__`, …); a newlib bare-metal toolchain that reports `__STDC_HOSTED__ ==
+  1` still gets the real instruction. `-DZER_FREESTANDING` forces bare metal.
 - Slab.alloc() inside interrupt → compile error (calloc may deadlock).
 - A global touched from an interrupt handler AND from other code must be
   `volatile` ("global 'g' is accessed from both interrupt and main code — must
@@ -4529,9 +4554,19 @@ u32 main() {
 ```
 
 **NOTES**
+- Any global declaration form takes it — `volatile`, `const`, `static`,
+  `threadlocal`, an array, a `Pool`/`Ring` — and so does an `interrupt` handler
+  (`section(".ramfunc") interrupt TIM2 { ... }`). On a declaration that cannot
+  carry it (a `struct`, an `enum`, a `typedef`) it is an error, not a no-op.
 - Whether the named section exists, is placed at the right address, and is
   loaded/zeroed at boot is the linker script's job (a hardware-consequence
   fact, outside the checker).
+
+```zer
+section(".dma") volatile u8[64] dmabuf;     // a DMA buffer in DMA-reachable RAM
+section(".noinit") static u32 boot_count;   // survives a reset (linker script permitting)
+u32 main() { dmabuf[0] = 1; boot_count += 1; return 0; }
+```
 
 ---
 
@@ -4817,11 +4852,22 @@ u32 y = BIT(x);            // COMPILE ERROR — x is not compile-time constant
   interpreter never skips a statement it cannot model.
 - A divisor that folds to zero (`x / 0`, `x /= 0`, `x %= 0`) is a compile
   error, not a folded 0.
-- A comptime body sees only its PARAMETERS and its own locals: reading a
-  global `const` inside the body (`comptime u32 L() { return LEVEL; }`) is
-  "body could not be evaluated at compile time". Pass the constant as an
-  argument instead — `comptime u32 L(u32 lvl) { return lvl; }` called as
-  `L(LEVEL)` folds.
+- A comptime body sees its PARAMETERS, its own locals, and integer `const`
+  GLOBALS (resolved at global scope — a same-named local of the caller does not
+  capture them). Casts `(T)x` between integer types fold with the wrap the
+  run-time conversion performs. A division needs no zero guard in a comptime
+  body — a zero divisor makes the call a compile error instead.
+
+```zer
+const u32 SCALE = 4;
+comptime u32 MUL(u32 x) { return x * SCALE; }
+comptime u8 LOW(u32 x) { return (u8)x; }           // 300 -> 44
+comptime u32 PER(u32 total, u32 n) { return total / n; }
+u32 main() {
+    if (MUL(3) != 12 || LOW(300) != 44 || PER(12, 4) != 3) { return 1; }
+    return 0;
+}
+```
 
 ```zer
 comptime u32 FIRST_OVER(u32 limit) {

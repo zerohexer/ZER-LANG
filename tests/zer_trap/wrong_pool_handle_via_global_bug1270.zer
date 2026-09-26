@@ -10,7 +10,7 @@ u32 main() {
     defer pb.free(g);
     pb.get(g).v = 9;
     // No `defer pa.free(h)`: stash() hands h to a global, and freeing it at
-    // exit would leave gh[0] dangling (BUG-1352 — the direct spelling
+    // exit would leave gh[0] dangling (BUG-1362 — the direct spelling
     // `gh[0] = h;` is refused for the same reason). The global owns it.
     Handle(T) h = pa.alloc() orelse return;
     pa.get(h).v = 5;

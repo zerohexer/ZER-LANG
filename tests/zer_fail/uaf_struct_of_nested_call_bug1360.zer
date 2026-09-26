@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1360: W w = wrap(id(a)) carries a in w.p.
+struct T { u32 v; }
+struct W { *T p; }
+W wrap(*T p) { W w = { .p = p }; return w; }
+*T id(*T p) { return p; }
+?*T maybe(*T p) { return p; }
+T gt;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T b = &gt;
+    u32 r = 0;
+    W w = wrap(id(a)); free(a); b.v = 99; r = w.p.v;
+    return r;
+}

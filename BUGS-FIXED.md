@@ -5,14 +5,14 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-09-26 — BUG-1350..1355: memory-safety audit round (call-result identity, callee store summaries, keep value query, overwritten free facts, owned-object stores)
+## Session 2026-09-26 — BUG-1360..1355: memory-safety audit round (call-result identity, callee store summaries, keep value query, overwritten free facts, owned-object stores)
 
 Six accept-unsafe holes from a probe round (reproducers read a recycled `alloc(T)` slot —
 exit 99 — which ASan cannot see, or a dead frame through a global — ASan
 stack-use-after-return). Every negative below was A/B-measured: ACCEPTED by the
 pre-change build (eed55b58), rejected with the stated reason after.
 
-- **BUG-1350 — a call argument that is ITSELF a call result lost its allocation identity.**
+- **BUG-1360 — a call argument that is ITSELF a call result lost its allocation identity.**
   `*T c = id(id(a)); free(a); c.v`, `unwrap(wrap(a))`, `wrap(a).p`, `pick(id(a), a)`,
   `W w = wrap(id(a))`, `g = id(id(a))` (global left dangling), `c = id(id(arena_alloc));
   ar.reset(); c.v`, `fp(id(a))` (not widened by the funcptr barrier), `f(x, id(x))` (aliased
@@ -28,9 +28,9 @@ pre-change build (eed55b58), rejected with the stated reason after.
   view query only, when every field view names the same param (`ir_resolve_returned_arg_ex`
   `collapse_struct`). `*T c = wrap(a).p;` (a field READ out of a call) aliases through the
   same resolution. Gate: SHAPE p49 in `tools/sink_matrix.sh` (8 HOLE + 1 OVER-REJECT on the
-  old build). Tests: `tests/zer_fail/*_bug1350.zer` (11), boundary
-  `tests/zer/nested_identity_call_ok_bug1350.zer` (rejected by the old build).
-- **BUG-1351 — a callee storing a param into an ELEMENT or the WHOLE object was not
+  old build). Tests: `tests/zer_fail/*_bug1360.zer` (11), boundary
+  `tests/zer/nested_identity_call_ok_bug1360.zer` (rejected by the old build).
+- **BUG-1361 — a callee storing a param into an ELEMENT or the WHOLE object was not
   summarised.** BUG-1241's `param_store` recorded `dst.f.g = src` only: `s.data[k].p = p`,
   `s.arr[1] = p`, a container push `s.data[s.top].p = p`, `*s = { .p = p }`, `*s = t`, and
   `PT x = { .p = p }; s.data[1] = x;` left the caller's object holding nothing, so
@@ -44,8 +44,8 @@ pre-change build (eed55b58), rejected with the stated reason after.
   array's wildcard slot as an aliasing `[*@L]` entry, exactly what a direct store at an
   untrackable index leaves. Two unnameable indices on one path are refused (no read could
   meet the key). Gate: SHAPE p50 cells `elem_*`, `whole_object`, `aggregate_value`. Tests:
-  `tests/zer_fail/uaf_callee_*_bug1351.zer` (4).
-- **BUG-1352 — a callee storing a param into a GLOBAL was not summarised.** `reg(p) { g =
+  `tests/zer_fail/uaf_callee_*_bug1361.zer` (4).
+- **BUG-1362 — a callee storing a param into a GLOBAL was not summarised.** `reg(p) { g =
   p; }` (and `garr[1] = p`, `gs.p = p`, `gs = { .p = p }`, `gs2[1].p = p`, `garr[k] = p`,
   `S t = { .p = p }; gs = t;`) then `reg(a); free(a); rd()` read the freed object; the
   direct `g = a` in the caller is refused by the dangling-global rules. Same collector: an
@@ -56,9 +56,9 @@ pre-change build (eed55b58), rejected with the stated reason after.
   can name that slot). `tests/zer_trap/wrong_pool_handle_via_global_bug1270.zer` freed a
   handle a callee had stashed in a global — the direct spelling is refused; the test now
   leaves the global as owner. Gate: SHAPE p50 `global_*`. Tests:
-  `tests/zer_fail/dangling_global_callee_*_bug1352.zer` (6), boundary
-  `tests/zer/callee_store_then_reset_ok_bug1351.zer`.
-- **BUG-1353 — keep inference missed every spelling of a param reaching a global that was
+  `tests/zer_fail/dangling_global_callee_*_bug1362.zer` (6), boundary
+  `tests/zer/callee_store_then_reset_ok_bug1361.zer`.
+- **BUG-1363 — keep inference missed every spelling of a param reaching a global that was
   not a bare ident or a direct call.** `*u32 z = id(p); g = z;`, `?*u32 z = id(p)`,
   `z = id(p)`, `gs.p = z`, `if (pp(p)) |z| { gn.p = z; }`, `*u32 z = pp(p) orelse return;`,
   `[*]u32 v = sv(s); gsl = v;`, `g = { .p = p }`, `garr[0] = { .p = p }`, a nested literal,
@@ -76,9 +76,9 @@ pre-change build (eed55b58), rejected with the stated reason after.
   of its own); it replaces the ident arm and the call arm (`call_has_nonkeep_derived_arg` /
   `infer_keep_from_call_args` are gone). The spawn sink and the keep-call edges ask the same
   query. Gate: SHAPE p51 (7 HOLE on the old build). Tests:
-  `tests/zer_fail/keep_infer_*_bug1353.zer` (18), boundaries
-  `tests/zer/keep_infer_{global_arg,local_use,local_struct}_ok_bug1353.zer`.
-- **BUG-1354 — a slot freed and then OVERWRITTEN lost the fact that it was freed.** `void
+  `tests/zer_fail/keep_infer_*_bug1363.zer` (18), boundaries
+  `tests/zer/keep_infer_{global_arg,local_use,local_struct}_ok_bug1363.zer`.
+- **BUG-1364 — a slot freed and then OVERWRITTEN lost the fact that it was freed.** `void
   re(*H h) { *T n = alloc(T) orelse return; free(h.p); h.p = n; }` freed the caller's
   allocation on its live path, but the store turned the FREED entry into an ALIVE alias of n;
   the summary saw nothing on that path and "not freed" on the orelse path, so the caller's
@@ -86,8 +86,8 @@ pre-change build (eed55b58), rejected with the stated reason after.
   (BUG-985); every other overwrite dropped it. `ir_slot_note_overwrite`, called from
   `ir_report_overwrite` (the one "an entry is about to be overwritten" query) and the three
   store arms that did not call it. Gate: p52 `replace_after_free`. Test:
-  `tests/zer_fail/uaf_callee_frees_field_then_replaces_bug1354.zer`.
-- **BUG-1355 — an allocation stored into a field of an object the function OWNS was marked
+  `tests/zer_fail/uaf_callee_frees_field_then_replaces_bug1364.zer`.
+- **BUG-1365 — an allocation stored into a field of an object the function OWNS was marked
   escaped.** `*N n = alloc(N) orelse ...; n.p = a; free(n);` leaked `a` in silence:
   `ir_target_root_escapes` called any pointer root "outside the function". A non-param
   pointer local holding a live, owned, non-arena allocation is not; the slot aliases `a`, and
@@ -95,8 +95,8 @@ pre-change build (eed55b58), rejected with the stated reason after.
   it. The field-free widening now also reaches the slots recorded under any ALIAS of the
   argument (`j.p = d; ... drop(hn)` where hn aliases j). Also: a same-named local shadows a
   global in that predicate. Gate: p52 `leak_through_node` + `safe_node_returned`. Tests:
-  `tests/zer_fail/leak_stored_into_freed_node_bug1355.zer`, boundary
-  `tests/zer/owned_node_field_store_ok_bug1355.zer`.
+  `tests/zer_fail/leak_stored_into_freed_node_bug1365.zer`, boundary
+  `tests/zer/owned_node_field_store_ok_bug1365.zer`.
 
 ---
 

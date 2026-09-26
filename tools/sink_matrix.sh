@@ -995,7 +995,7 @@ cell p48_global_array_drop   reject "$P48"' u32 main(){ *T48 a = alloc(T48) orel
 cell p48_safe_getter_read    compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; g48 = a; *T48 c = getg48() orelse return; u32 r = c.v + a.v; g48 = null; free(a); return r; }'
 cell p48_safe_readonly_global compile "$P48"' u32 main(){ *T48 a = alloc(T48) orelse return; ga48[0].p = a; u32 r = sum48(ga48); ga48[0].p = null; r += a.v; free(a); return r; }'
 
-# SHAPE p49 (BUG-1350): an allocation reached through a CALL whose result is a
+# SHAPE p49 (BUG-1360): an allocation reached through a CALL whose result is a
 # view of one of its own arguments, when that argument is ITSELF such a call
 # (`id(id(a))`, `unwrap(wrap(a))`, `wrap(a).p`). The inner call lowers into a
 # temp but the sinks read the ORIGINAL AST, where the argument had no key — so
@@ -1020,7 +1020,7 @@ cell p49_aliased_arg        reject "$P49"' u32 main(){ *T49 a = alloc(T49) orels
 cell p49_callee_free        reject "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; kill49(id49(id49(a))); free(a); return 0; }'
 cell p49_safe_live_use      compile "$P49"' u32 main(){ *T49 a = alloc(T49) orelse return; *T49 c = id49(id49(a)); u32 r = c.v + wrap49(a).p.v; free(c); return r; }'
 
-# SHAPE p50 (BUG-1351, BUG-1352): a callee that STORES one of its params
+# SHAPE p50 (BUG-1361, BUG-1362): a callee that STORES one of its params
 # somewhere the caller can see, in a spelling BUG-1241's FIELD-chain summary did
 # not record: an ELEMENT (literal / variable index), the WHOLE object (`*s =`),
 # an aggregate VALUE carrying the param, a GLOBAL (bare / element / literal /
@@ -1049,7 +1049,7 @@ cell p50_global_literal     reject "$P50"' u32 main(){ *T50 a = alloc(T50) orels
 cell p50_global_var_index   reject "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; reg_v(a, 1); free(a); return rd50(); }'
 cell p50_safe_reset         compile "$P50"' u32 main(){ *T50 a = alloc(T50) orelse return; S50 s; put_lit(&s, a); free(a); s.data[1].p = null; *T50 b = alloc(T50) orelse return; reg_g(b); g50 = null; free(b); return 0; }'
 
-# SHAPE p51 (BUG-1353): keep inference — a non-keep param reaching a GLOBAL in a
+# SHAPE p51 (BUG-1363): keep inference — a non-keep param reaching a GLOBAL in a
 # spelling the alias sites could not follow: a CALL result (var-decl, assignment,
 # nested), an orelse unwrap / capture of one, a STRUCT LITERAL, an element of a
 # local aggregate, a heap object filled through `*h =`. The caller's `put(&x)`
@@ -1069,7 +1069,7 @@ cell p51_heap_object        reject "$P51"' void put(*u32 p) { *N51 h = alloc(N51
 cell p51_safe_global_arg    compile "$P51"' u32 gx51; void put(*u32 p) { *u32 z = id51(p); g51 = z; } u32 main(){ put(&gx51); return 0; }'
 cell p51_safe_local_use     compile "$P51"' void put(*u32 p) { u32 v = *id51(p); N51 n = { .p = p }; if (n.p) |q| { v += *q; } if (v == 9) { g51 = null; } } u32 main(){ u32 x = 1; put(&x); return 0; }'
 
-# SHAPE p52 (BUG-1354, BUG-1355): the fact that an allocation was freed / is
+# SHAPE p52 (BUG-1364, BUG-1365): the fact that an allocation was freed / is
 # held must survive an OVERWRITE of the slot and a store into an OWNED object.
 # A callee that frees a field then stores a new value into it (on one path)
 # freed the caller's allocation; `n.p = a; free(n);` dropped a's only holder.

@@ -424,9 +424,9 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
         else break;
         Type *ot = obj ? checker_get_type(e->checker, obj) : NULL;
         Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
-        if (oe && oe->kind == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
-        if (oe && oe->kind == TYPE_POINTER && oe->pointer.is_volatile) return true;
-        if (oe && oe->kind == TYPE_SLICE && oe->slice.is_volatile) return true;
+        if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
+        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.is_volatile) return true;
+        if (oe && type_dispatch_kind(oe) == TYPE_SLICE && oe->slice.is_volatile) return true;
         w = obj;
     }
     while (n && n->kind == NODE_FIELD) {
@@ -1036,10 +1036,10 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len
  * `uint32_t (*)(uint32_t) f(...)`, which GCC refused. Returns the funcptr Type. */
 static Type *func_ret_funcptr_type(Type *ret) {
     Type *r = ret ? type_unwrap_distinct(ret) : NULL;
-    if (r && r->kind == TYPE_OPTIONAL && r->optional.inner &&
+    if (r && type_dispatch_kind(r) == TYPE_OPTIONAL && r->optional.inner &&
         is_null_sentinel(r->optional.inner))
         r = type_unwrap_distinct(r->optional.inner);
-    return (r && r->kind == TYPE_FUNC_PTR) ? r : NULL;
+    return (r && type_dispatch_kind(r) == TYPE_FUNC_PTR) ? r : NULL;
 }
 static bool func_ret_is_funcptr(Type *ret, bool main_promote) {
     return !main_promote && func_ret_funcptr_type(ret) != NULL;
@@ -1076,8 +1076,8 @@ static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
                 bool pv = false, pc = false;
                 TypeNode *qt = p->type;
                 for (int d = 0; qt && d < 16 &&
-                     (qt->kind == TYNODE_CONST || qt->kind == TYNODE_VOLATILE); d++) {
-                    if (qt->kind == TYNODE_CONST) pc = true; else pv = true;
+                     (TYNODE_CONST == qt->kind || TYNODE_VOLATILE == qt->kind); d++) {
+                    if (TYNODE_CONST == qt->kind) pc = true; else pv = true;
                     qt = qt->qualified.inner;
                 }
                 if (pc) emit(e, "const ");
@@ -2651,17 +2651,17 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         int fp_stars = 0;
         Type *cur = type_unwrap_distinct(t);
         while (cur) {
-            if (cur->kind == TYPE_OPTIONAL && cur->optional.inner &&
+            if (type_dispatch_kind(cur) == TYPE_OPTIONAL && cur->optional.inner &&
                 is_null_sentinel(cur->optional.inner)) {
                 cur = type_unwrap_distinct(cur->optional.inner);
-            } else if (cur->kind == TYPE_POINTER && cur->pointer.inner) {
+            } else if (type_dispatch_kind(cur) == TYPE_POINTER && cur->pointer.inner) {
                 fp_stars++;
                 cur = type_unwrap_distinct(cur->pointer.inner);
             } else {
                 break;
             }
         }
-        if (fp_stars > 0 && cur && cur->kind == TYPE_FUNC_PTR) {
+        if (fp_stars > 0 && cur && type_dispatch_kind(cur) == TYPE_FUNC_PTR) {
             emit_type(e, cur->func_ptr.ret);
             emit(e, " (*");
             for (int si = 0; si < fp_stars; si++) emit(e, "*");
@@ -3114,7 +3114,7 @@ static void emit_array_assign(Emitter *e, Type *arr_t, Node *dst, Node *src,
         return;
     }
     Type *elem = type_unwrap_distinct(arr_t);
-    while (elem && elem->kind == TYPE_ARRAY) elem = type_unwrap_distinct(elem->array.inner);
+    while (elem && type_dispatch_kind(elem) == TYPE_ARRAY) elem = type_unwrap_distinct(elem->array.inner);
     emit(e, "({ volatile ");
     emit_type(e, elem);
     emit(e, " *_zer_vd%d = (volatile ", tmp);

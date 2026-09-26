@@ -1124,50 +1124,6 @@ checker.c:for_init_has_loop_jump:NODE_SWITCH:switch_stmt.expr
 checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.body
 checker.c:for_init_has_loop_jump:NODE_WHILE:while_stmt.cond
 
-# 2026-09-22 (BUG-1045) — checker.c:keep_arg_caller_root became recursive (its orelse
-# JOIN, call-result and struct-literal arms re-enter it). It is a TRACE from a call
-# argument to the caller PARAMETER it views, not a walk: a kind that cannot carry the
-# argument's root has nothing to descend (every statement kind, literals, binary /
-# assign / cast / sizeof), a view's root is its OBJECT (index_expr.index is a scalar),
-# a switch arm value is a constant, and an intrinsic's pointer argument is reached
-# through unwrap_ptr_launder (the shared peeler), which this audit cannot see.
-checker.c:keep_arg_caller_root:NODE_ASM:asm_stmt.inputs
-checker.c:keep_arg_caller_root:NODE_ASM:asm_stmt.outputs
-checker.c:keep_arg_caller_root:NODE_ASSIGN:assign.target
-checker.c:keep_arg_caller_root:NODE_ASSIGN:assign.value
-checker.c:keep_arg_caller_root:NODE_AWAIT:await_stmt.cond
-checker.c:keep_arg_caller_root:NODE_BINARY:binary.left
-checker.c:keep_arg_caller_root:NODE_BINARY:binary.right
-checker.c:keep_arg_caller_root:NODE_BLOCK:block.stmts
-checker.c:keep_arg_caller_root:NODE_CRITICAL:critical.body
-checker.c:keep_arg_caller_root:NODE_DEFER:defer.body
-checker.c:keep_arg_caller_root:NODE_DO_WHILE:while_stmt.body
-checker.c:keep_arg_caller_root:NODE_DO_WHILE:while_stmt.cond
-checker.c:keep_arg_caller_root:NODE_EXPR_STMT:expr_stmt.expr
-checker.c:keep_arg_caller_root:NODE_FILE:file.decls
-checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.body
-checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.cond
-checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.init
-checker.c:keep_arg_caller_root:NODE_FOR:for_stmt.step
-checker.c:keep_arg_caller_root:NODE_FUNC_DECL:func_decl.body
-checker.c:keep_arg_caller_root:NODE_GLOBAL_VAR:var_decl.init
-checker.c:keep_arg_caller_root:NODE_IF:if_stmt.cond
-checker.c:keep_arg_caller_root:NODE_IF:if_stmt.else_body
-checker.c:keep_arg_caller_root:NODE_IF:if_stmt.then_body
-checker.c:keep_arg_caller_root:NODE_INDEX:index_expr.index
-checker.c:keep_arg_caller_root:NODE_INTERRUPT:interrupt.body
-checker.c:keep_arg_caller_root:NODE_INTRINSIC:intrinsic.args
-checker.c:keep_arg_caller_root:NODE_ONCE:once.body
-checker.c:keep_arg_caller_root:NODE_RETURN:ret.expr
-checker.c:keep_arg_caller_root:NODE_SLICE:slice.end
-checker.c:keep_arg_caller_root:NODE_SLICE:slice.start
-checker.c:keep_arg_caller_root:NODE_SPAWN:spawn_stmt.args
-checker.c:keep_arg_caller_root:NODE_STATIC_ASSERT:static_assert_stmt.cond
-checker.c:keep_arg_caller_root:NODE_SWITCH:switch_stmt.arms
-checker.c:keep_arg_caller_root:NODE_SWITCH:switch_stmt.expr
-checker.c:keep_arg_caller_root:NODE_VAR_DECL:var_decl.init
-checker.c:keep_arg_caller_root:NODE_WHILE:while_stmt.body
-checker.c:keep_arg_caller_root:NODE_WHILE:while_stmt.cond
 
 # 2026-09-22 (BUG-1043) — checker.c:rmw_scan_body is the exhaustive main-side RMW
 # summary walk. NODE_ASM operands are the tree-wide latent gap (asm is naked-only, and
@@ -1944,3 +1900,95 @@ checker.c:ret_expr_names_callee_local:NODE_SWITCH:switch_stmt.expr
 checker.c:ret_expr_names_callee_local:NODE_VAR_DECL:var_decl.init
 checker.c:ret_expr_names_callee_local:NODE_WHILE:while_stmt.body
 checker.c:ret_expr_names_callee_local:NODE_WHILE:while_stmt.cond
+# 2026-09-26 (BUG-1363): keep_value_roots asks which non-keep PARAMS a VALUE may carry. It
+# descends everything that can hand a reference on: projections (object side), deref, both
+# orelse arms, casts, launder intrinsics (via unwrap_ptr_launder), call arguments the return
+# summary allows, struct-literal fields. An index / slice bound is an integer; a BINARY or
+# ASSIGN value is a scalar (no pointer arithmetic in ZER); a non-launder intrinsic yields a
+# scalar or a value not derived from a param; statement kinds never stand in value position.
+checker.c:keep_value_roots:NODE_ASM:asm_stmt.inputs
+checker.c:keep_value_roots:NODE_ASM:asm_stmt.outputs
+checker.c:keep_value_roots:NODE_ASSIGN:assign.target
+checker.c:keep_value_roots:NODE_ASSIGN:assign.value
+checker.c:keep_value_roots:NODE_AWAIT:await_stmt.cond
+checker.c:keep_value_roots:NODE_BINARY:binary.left
+checker.c:keep_value_roots:NODE_BINARY:binary.right
+checker.c:keep_value_roots:NODE_BLOCK:block.stmts
+checker.c:keep_value_roots:NODE_CRITICAL:critical.body
+checker.c:keep_value_roots:NODE_DEFER:defer.body
+checker.c:keep_value_roots:NODE_DO_WHILE:while_stmt.body
+checker.c:keep_value_roots:NODE_DO_WHILE:while_stmt.cond
+checker.c:keep_value_roots:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:keep_value_roots:NODE_FILE:file.decls
+checker.c:keep_value_roots:NODE_FOR:for_stmt.body
+checker.c:keep_value_roots:NODE_FOR:for_stmt.cond
+checker.c:keep_value_roots:NODE_FOR:for_stmt.init
+checker.c:keep_value_roots:NODE_FOR:for_stmt.step
+checker.c:keep_value_roots:NODE_FUNC_DECL:func_decl.body
+checker.c:keep_value_roots:NODE_GLOBAL_VAR:var_decl.init
+checker.c:keep_value_roots:NODE_IF:if_stmt.cond
+checker.c:keep_value_roots:NODE_IF:if_stmt.else_body
+checker.c:keep_value_roots:NODE_IF:if_stmt.then_body
+checker.c:keep_value_roots:NODE_INDEX:index_expr.index
+checker.c:keep_value_roots:NODE_INTERRUPT:interrupt.body
+checker.c:keep_value_roots:NODE_INTRINSIC:intrinsic.args
+checker.c:keep_value_roots:NODE_ONCE:once.body
+checker.c:keep_value_roots:NODE_RETURN:ret.expr
+checker.c:keep_value_roots:NODE_SLICE:slice.end
+checker.c:keep_value_roots:NODE_SLICE:slice.start
+checker.c:keep_value_roots:NODE_SPAWN:spawn_stmt.args
+checker.c:keep_value_roots:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:keep_value_roots:NODE_SWITCH:switch_stmt.arms
+checker.c:keep_value_roots:NODE_SWITCH:switch_stmt.expr
+checker.c:keep_value_roots:NODE_VAR_DECL:var_decl.init
+checker.c:keep_value_roots:NODE_WHILE:while_stmt.body
+checker.c:keep_value_roots:NODE_WHILE:while_stmt.cond
+# 2026-09-26 (BUG-1361): ir_ps_value classifies the VALUE of a store for the callee store
+# summary. A FIELD / INDEX value is a pointer READ out of memory — a different allocation than
+# any param's own ("FORMING a reference aliases; READING a value does not"); a reference INTO
+# a param (`&x.f`, `x[a..b]`) is followed by the UNARY / SLICE arm's own navigation loop. A
+# slice bound is an integer, BINARY / TYPECAST (value casts; a reference cast was peeled by
+# ir_peel_launder) / non-launder INTRINSIC yield no param's allocation; statement kinds never
+# stand in value position.
+zercheck_ir.c:ir_ps_value:NODE_ASM:asm_stmt.inputs
+zercheck_ir.c:ir_ps_value:NODE_ASM:asm_stmt.outputs
+zercheck_ir.c:ir_ps_value:NODE_ASSIGN:assign.target
+zercheck_ir.c:ir_ps_value:NODE_ASSIGN:assign.value
+zercheck_ir.c:ir_ps_value:NODE_AWAIT:await_stmt.cond
+zercheck_ir.c:ir_ps_value:NODE_BINARY:binary.left
+zercheck_ir.c:ir_ps_value:NODE_BINARY:binary.right
+zercheck_ir.c:ir_ps_value:NODE_BLOCK:block.stmts
+zercheck_ir.c:ir_ps_value:NODE_CALL:call.args
+zercheck_ir.c:ir_ps_value:NODE_CALL:call.callee
+zercheck_ir.c:ir_ps_value:NODE_CRITICAL:critical.body
+zercheck_ir.c:ir_ps_value:NODE_DEFER:defer.body
+zercheck_ir.c:ir_ps_value:NODE_DO_WHILE:while_stmt.body
+zercheck_ir.c:ir_ps_value:NODE_DO_WHILE:while_stmt.cond
+zercheck_ir.c:ir_ps_value:NODE_EXPR_STMT:expr_stmt.expr
+zercheck_ir.c:ir_ps_value:NODE_FIELD:field.object
+zercheck_ir.c:ir_ps_value:NODE_FILE:file.decls
+zercheck_ir.c:ir_ps_value:NODE_FOR:for_stmt.body
+zercheck_ir.c:ir_ps_value:NODE_FOR:for_stmt.cond
+zercheck_ir.c:ir_ps_value:NODE_FOR:for_stmt.init
+zercheck_ir.c:ir_ps_value:NODE_FOR:for_stmt.step
+zercheck_ir.c:ir_ps_value:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ir_ps_value:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ir_ps_value:NODE_IF:if_stmt.cond
+zercheck_ir.c:ir_ps_value:NODE_IF:if_stmt.else_body
+zercheck_ir.c:ir_ps_value:NODE_IF:if_stmt.then_body
+zercheck_ir.c:ir_ps_value:NODE_INDEX:index_expr.index
+zercheck_ir.c:ir_ps_value:NODE_INDEX:index_expr.object
+zercheck_ir.c:ir_ps_value:NODE_INTERRUPT:interrupt.body
+zercheck_ir.c:ir_ps_value:NODE_INTRINSIC:intrinsic.args
+zercheck_ir.c:ir_ps_value:NODE_ONCE:once.body
+zercheck_ir.c:ir_ps_value:NODE_RETURN:ret.expr
+zercheck_ir.c:ir_ps_value:NODE_SLICE:slice.end
+zercheck_ir.c:ir_ps_value:NODE_SLICE:slice.start
+zercheck_ir.c:ir_ps_value:NODE_SPAWN:spawn_stmt.args
+zercheck_ir.c:ir_ps_value:NODE_STATIC_ASSERT:static_assert_stmt.cond
+zercheck_ir.c:ir_ps_value:NODE_SWITCH:switch_stmt.arms
+zercheck_ir.c:ir_ps_value:NODE_SWITCH:switch_stmt.expr
+zercheck_ir.c:ir_ps_value:NODE_TYPECAST:typecast.expr
+zercheck_ir.c:ir_ps_value:NODE_VAR_DECL:var_decl.init
+zercheck_ir.c:ir_ps_value:NODE_WHILE:while_stmt.body
+zercheck_ir.c:ir_ps_value:NODE_WHILE:while_stmt.cond

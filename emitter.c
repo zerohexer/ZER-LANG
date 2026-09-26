@@ -8164,6 +8164,16 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
 
+/* BUG-1359: a uN / iN value LOADED out of memory is re-wrapped to its width. ZER
+ * itself only ever stores in-range values, but a device register, C code or a
+ * `@pun` view can leave bits above N set, and every later comparison read the
+ * raw carrier (`u3 f = rr.a;` held 127 on a byte 0x7F; `i5` held 127, not -1).
+ * One AND (or sign-extend) after the load restores the type's range. */
+static void emit_intn_load_normalize(Emitter *e, IRFunc *func, int local_id) {
+    if (local_id < 0 || local_id >= func->local_count) return;
+    emit_intn_mask(e, &func->locals[local_id], func->is_async ? "self->" : "");
+}
+
 /* BUG-1152: the statement form of the non-null load guard — after an IR load
  * (field / element / deref) whose destination is a non-optional `*T`. */
 static void emit_nonnull_local_check(Emitter *e, IRFunc *func, int local_id) {
@@ -14504,6 +14514,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";");
                 emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
                 emit(e, "\n");
+                emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
                 goto unop_done;
             case TOK_AMP: /* addr-of */
                 emit_indent(e);
@@ -14548,6 +14559,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                  (int)inst->field_name_len, inst->field_name);
             emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
             emit(e, "\n");
+            emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
         }
         break;
     }
@@ -14587,6 +14599,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
             emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
             emit(e, "\n");
+            emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
         }
         break;
     }

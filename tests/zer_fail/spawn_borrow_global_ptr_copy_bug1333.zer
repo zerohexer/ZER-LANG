@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot write to 'g' while it is borrowed
+// BUG-1333: a local copy of gp lends g
+u32 g;
+*u32 gp = &g;
+void w(*u32 p) { for (u32 i = 0; i < 2000000; i += 1) { *p += 1; } }
+u32 main() { *u32 q = gp; ThreadHandle t = spawn w(q); for (u32 i = 0; i < 2000000; i += 1) { g += 1; } t.join(); return 0; }

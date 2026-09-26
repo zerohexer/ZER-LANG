@@ -1901,3 +1901,43 @@ checker.c:init_bound_functions:NODE_UNARY:unary.operand
 checker.c:init_bound_functions:NODE_VAR_DECL:var_decl.init
 checker.c:init_bound_functions:NODE_WHILE:while_stmt.body
 checker.c:init_bound_functions:NODE_WHILE:while_stmt.cond
+# 2026-09-26 — BUG-1335 ret_expr_names_callee_local: the same VALUE walk as
+# collect_borrow_roots (does a pointer-carrying return value name a callee local?), mirrored
+# row for row: scalar-producing and statement kinds carry no pointer, index/bounds are scalars.
+checker.c:ret_expr_names_callee_local:NODE_ASM:asm_stmt.inputs
+checker.c:ret_expr_names_callee_local:NODE_ASM:asm_stmt.outputs
+checker.c:ret_expr_names_callee_local:NODE_ASSIGN:assign.target
+checker.c:ret_expr_names_callee_local:NODE_ASSIGN:assign.value
+checker.c:ret_expr_names_callee_local:NODE_AWAIT:await_stmt.cond
+checker.c:ret_expr_names_callee_local:NODE_BINARY:binary.left
+checker.c:ret_expr_names_callee_local:NODE_BINARY:binary.right
+checker.c:ret_expr_names_callee_local:NODE_BLOCK:block.stmts
+checker.c:ret_expr_names_callee_local:NODE_CALL:call.callee
+checker.c:ret_expr_names_callee_local:NODE_CRITICAL:critical.body
+checker.c:ret_expr_names_callee_local:NODE_DEFER:defer.body
+checker.c:ret_expr_names_callee_local:NODE_DO_WHILE:while_stmt.body
+checker.c:ret_expr_names_callee_local:NODE_DO_WHILE:while_stmt.cond
+checker.c:ret_expr_names_callee_local:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:ret_expr_names_callee_local:NODE_FILE:file.decls
+checker.c:ret_expr_names_callee_local:NODE_FOR:for_stmt.body
+checker.c:ret_expr_names_callee_local:NODE_FOR:for_stmt.cond
+checker.c:ret_expr_names_callee_local:NODE_FOR:for_stmt.init
+checker.c:ret_expr_names_callee_local:NODE_FOR:for_stmt.step
+checker.c:ret_expr_names_callee_local:NODE_FUNC_DECL:func_decl.body
+checker.c:ret_expr_names_callee_local:NODE_GLOBAL_VAR:var_decl.init
+checker.c:ret_expr_names_callee_local:NODE_IF:if_stmt.cond
+checker.c:ret_expr_names_callee_local:NODE_IF:if_stmt.else_body
+checker.c:ret_expr_names_callee_local:NODE_IF:if_stmt.then_body
+checker.c:ret_expr_names_callee_local:NODE_INDEX:index_expr.index
+checker.c:ret_expr_names_callee_local:NODE_INTERRUPT:interrupt.body
+checker.c:ret_expr_names_callee_local:NODE_ONCE:once.body
+checker.c:ret_expr_names_callee_local:NODE_RETURN:ret.expr
+checker.c:ret_expr_names_callee_local:NODE_SLICE:slice.end
+checker.c:ret_expr_names_callee_local:NODE_SLICE:slice.start
+checker.c:ret_expr_names_callee_local:NODE_SPAWN:spawn_stmt.args
+checker.c:ret_expr_names_callee_local:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:ret_expr_names_callee_local:NODE_SWITCH:switch_stmt.arms
+checker.c:ret_expr_names_callee_local:NODE_SWITCH:switch_stmt.expr
+checker.c:ret_expr_names_callee_local:NODE_VAR_DECL:var_decl.init
+checker.c:ret_expr_names_callee_local:NODE_WHILE:while_stmt.body
+checker.c:ret_expr_names_callee_local:NODE_WHILE:while_stmt.cond

@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: which is borrowed by a scoped spawn
+// BUG-1332: free(p) while &h (h.p = p) is lent
+struct T { u32 v; }
+struct H { *T p; }
+void w(*H h) { h.p.v += 1; }
+u32 main() {
+    ?*T mp = alloc(T);
+    *T p = mp orelse return;
+    H h = { .p = p };
+    ThreadHandle th = spawn w(&h);
+    free(p);
+    th.join();
+    return 0;
+}

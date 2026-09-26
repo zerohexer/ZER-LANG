@@ -191,6 +191,26 @@ free 1272, per-arena reset precision 1268). What is left, each measured on the f
   resolved with `global_decl_lookup` outside any module context, so two modules declaring the
   SAME function or global name can confuse the scan (same limitation as BUG-1269's global pass).
 
+## OPEN — residuals of BUG-1331..1336 (scoped-spawn carriers, 2026-09-26; LOW — precision)
+
+The five holes (task `_init` args, a heap payload behind `&carrier`, a global pointer's aim,
+a factory-built carrier, a parent `@atomic_*` on a lent object) are CLOSED; see BUGS-FIXED.md.
+What they leave:
+- **A heap payload is lent by NAME.** An unrooted pointer's own name stands for its pointee
+  (`borrow_roots_of_ident`). A second pointer to the same heap object that the checker cannot
+  name alike — obtained from a call (`*T q = same(p)` records p's roots only when the call's
+  argument walk sees it) or through a field of another object — is not refused in the window.
+  zercheck_ir's alloc identity would answer this exactly; the borrow lives in the checker.
+- **Factory over-approximation (over-rejection).** `H h = mk();` lends EVERY global whose
+  address `mk` (or a function it calls) forms, every global array it names whole and every
+  global pointer's aim — not only the one its returned local holds (`ret_local_scan`).
+- **A mutable global pointer** whose writes the aim query cannot follow (a call result) also
+  lends its own name, so the parent may not name the pointer itself in the window.
+- **A pointer local reassigned between two heap objects** now has two roots, so passing it to
+  a scoped spawn is refused as "cannot resolve" (was accepted, lending only itself).
+- The by-value `spawn w(h)` heap form keeps zercheck's permanent TRANSFER (see the ag9
+  over-rejection below); the `&h` form uses the borrow, released at the join.
+
 ## OPEN — concurrency residuals of the ag9 round (2026-09-24e; MEDIUM — accept-unsafe races; LOW — over-rejections)
 
 Each reproducer is in the ag9 report shape; none needs `cinclude`.

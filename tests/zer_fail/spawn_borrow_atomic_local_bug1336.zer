@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: @atomic_add on 'x' while it is borrowed
+// BUG-1336: stack local lent — was refused for the wrong reason
+void w(*u32 p) { for (u32 i = 0; i < 2000000; i += 1) { *p += 1; } }
+u32 main() { u32 x = 0; ThreadHandle t = spawn w(&x); for (u32 i = 0; i < 2000000; i += 1) { @atomic_add(&x, 1); } t.join(); return x; }

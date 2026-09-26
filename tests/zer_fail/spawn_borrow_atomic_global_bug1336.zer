@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: @atomic_add on 'g' while it is borrowed
+// BUG-1336: parent atomic vs the thread's plain RMW
+u32 g;
+void w(*u32 p) { for (u32 i = 0; i < 2000000; i += 1) { *p += 1; } }
+u32 main() { ThreadHandle t = spawn w(&g); for (u32 i = 0; i < 2000000; i += 1) { @atomic_add(&g, 1); } t.join(); return g - 4000000; }

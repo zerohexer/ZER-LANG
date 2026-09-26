@@ -5,6 +5,69 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-26 — BUG-1331..1336: what a scoped-spawn CARRIER lends
+
+All six were accepted by the pre-change build (eed55b58) and TSan/ASan-confirmed in the probe
+round; every new negative below compiles clean there. One query throughout — the borrow roots
+(`collect_borrow_roots` / `borrow_roots_of_ident`) — read by the spawn sink, not a use-site patch.
+
+- **BUG-1331 — an async task's `_init` arguments were not lent through `&task`.**
+  `_zer_async_f_init(&t, &x); ThreadHandle th = spawn w(&t); x += 1;` raced the child's poll
+  (also a global `&g`, and a threadlocal `&tl` reached the child's own TLS slot). The task
+  stores every argument, so it is a carrier: `async_init_record_task_roots` records the roots
+  of args 1.. on the task's root symbol at the `_init` call, and the existing `&carrier` arm of
+  the spawn sink lends them. Tests: `tests/zer_fail/spawn_borrow_async_task_{local,global,threadlocal}_bug1331.zer`,
+  boundary `tests/zer/spawn_borrow_async_task_join_bug1331.zer`.
+- **BUG-1332 — a heap payload reached through `&carrier` / `&task` could be freed or written
+  in the window.** `H h = { .p = p }; spawn w(&h); free(p);` (and the slot reused by the next
+  `alloc`, the thread writing a DIFFERENT live object), `p.v += 1` racing `h.p.v += 1`, the
+  `h.p = p` field-store spelling, and the task form `init(&t, p)`. A pointer with no recorded
+  root pointed at memory the checker could not name, so the carrier lent nothing. Now an
+  unrooted POINTER / SLICE name stands for its own pointee (`borrow_roots_of_ident`), exactly
+  as `spawn w(p)` already lent `p`. Zero corpus verdict changes. Tests:
+  `tests/zer_fail/spawn_borrow_heap_{carrier_free,carrier_reuse,carrier_write,carrier_fieldassign,task_free,task_reuse}_bug1332.zer`,
+  boundary `tests/zer/spawn_borrow_heap_carrier_join_bug1332.zer`.
+- **BUG-1333 — a GLOBAL pointer initialised to `&g` did not lend `g`.** `*u32 gp = &g;
+  spawn w(gp); g += 1;` (also through a local copy `q = gp`, and `&g` + `gp` to two live
+  threads). A global's declaration initializer is never a recorded borrow root; the spawn
+  sink's ident arm now asks `collect_borrow_roots`, which for a global pointer runs the AIM
+  query (`for_each_write_target`: the initializer and every `gp = …` in the program). The
+  pointer's own name is added too when a write cannot be followed. Recorded names on a
+  ThreadHandle now grow instead of being dropped past 3 per argument (an un-recorded name was
+  never released by the join). Tests: `tests/zer_fail/spawn_borrow_global_ptr{,_copy,_twice}_bug1333.zer`,
+  boundary `tests/zer/spawn_borrow_global_ptr_join_bug1333.zer`.
+- **BUG-1334 — reaching a lent global THROUGH a global pointer.** A callee `void bump() {
+  *gp += 1; }` called in the window (the BUG-1125 callee walk visited `gp`, never `g`), and
+  the parent's own `*gp += 1` / `u32 v = *gp`. `walk_callee_globals` follows a pointer global
+  to its aims for the two borrow clients (`follow_pointee`), and `global_pointer_lent_aim`
+  answers the parent's read and write-through sinks. Tests:
+  `tests/zer_fail/spawn_borrow_global_ptr_{callee,parent_write,parent_read}_bug1334.zer`.
+- **BUG-1335 — a struct carrier built by a FACTORY lent nothing.** `H mk() { H h = { .p = &g
+  }; return h; }` then `H h = mk(); spawn w(h);` or `spawn w(mk())`. The BUG-1285 return walk
+  resolved the returned name in the CALLER's scope and dropped the callee's locals. When a
+  pointer-carrying return names a callee local, `ret_local_scan` over-approximates soundly:
+  every global whose address the callee (or its callees) forms, every global array it names
+  whole, and every global pointer's aim. Tests: `tests/zer_fail/spawn_borrow_factory_carrier{,_arg}_bug1335.zer`,
+  boundary `tests/zer/spawn_borrow_factory_carrier_join_bug1335.zer`.
+- **BUG-1336 — a parent `@atomic_*` on a lent object was exempt from the borrow.** The borrow
+  checks skip an `&` operand, so `spawn w(&g); @atomic_add(&g, 1);` raced the thread's plain
+  `*p += 1` (an atomic is atomic only against other atomics). The atomic-target check now
+  refuses a lent root (directly, through a pointer alias, or through a global pointer's aim).
+  The stack-local form had been refused for the WRONG reason ("no other thread can reference
+  it" — one does). Tests: `tests/zer_fail/spawn_borrow_atomic_{global,load,local}_bug1336.zer`,
+  boundary `tests/zer/spawn_borrow_atomic_after_join_bug1336.zer`.
+
+`tests/zer_fail/spawn_scoped_carrier_free_before_join.zer` (by-value `spawn w(b)`, `b.t = t`,
+`free(t)` before the join) is now refused by the checker's borrow before zercheck's TRANSFER;
+its `// expect-error:` moved from "is transferred" to "borrowed by a scoped spawn" — both are
+the right reason, the borrow simply fires first.
+
+Gate: SHAPE p20 +7 cells (5 reject, 2 boundary) and p32 +1 in `tools/sink_matrix.sh` — all six
+reject cells HOLE on the pre-change build. Residuals: `docs/limitations.md` "residuals of
+BUG-1331..1336".
+
+---
+
 ## Session 2026-09-25f — BUG-1308..1325: five-area audit (escape through indirection, funcptr reach via global initializers, global-read aliases, VRP, emitter literals, `main` ABI)
 
 Harvest first: `origin/review/25092026` (6 commits, BUG-1268..1307, forked on main) merged

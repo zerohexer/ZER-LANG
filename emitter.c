@@ -585,6 +585,28 @@ static bool field_obj_needs_parens(Node *obj) {
  * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
  */
 
+/* BUG-1391: may this expression be written out TWICE in the emitted C? The
+ * comma bounds form `(check(i, N), a)[i]` repeats the index text, and a nested
+ * index doubled the output per level (`a[a[a[…]]]` at depth 24 = 528 MB of C).
+ * Small = a few nodes of names, literals, fields, unary / binary / casts; any
+ * other kind, or more than a handful of nodes, takes the single-evaluation
+ * form, whose output is linear. An if-chain on purpose: an unlisted kind
+ * answers NOT small, which is always correct (just a statement expression). */
+static bool expr_emit_small_b(Node *n, int *budget) {
+    if (!n || --(*budget) < 0) return false;
+    if (n->kind == NODE_IDENT || n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT ||
+        n->kind == NODE_BOOL_LIT)
+        return true;
+    if (n->kind == NODE_FIELD) return expr_emit_small_b(n->field.object, budget);
+    if (n->kind == NODE_UNARY) return expr_emit_small_b(n->unary.operand, budget);
+    if (n->kind == NODE_TYPECAST) return expr_emit_small_b(n->typecast.expr, budget);
+    if (n->kind == NODE_BINARY)
+        return expr_emit_small_b(n->binary.left, budget) &&
+               expr_emit_small_b(n->binary.right, budget);
+    return false;
+}
+static bool expr_emit_small(Node *n) { int b = 8; return expr_emit_small_b(n, &b); }
+
 static bool expr_has_side_effects(Node *n) {
     if (!n) return false;
     switch (n->kind) {
@@ -4607,10 +4629,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         if (slice_obj_side_effect && obj_is_slice) {
             /* hoist entire object into temp, build slice from temp */
             int sl_tmp = e->temp_count++;
-            /* A18: __typeof__ preserves volatile */
-            emit(e, "({ __typeof__(");
-            emit_expr(e, node->slice.object);
-            emit(e, ") _zer_so%d = ", sl_tmp);
+            /* A18/BUG-1391: the temp is a private copy of the slice HEADER — its
+             * element qualifiers live in the slice type, which __auto_type keeps. */
+            emit(e, "({ __auto_type _zer_so%d = ", sl_tmp);   /* BUG-1391: the object once */
             emit_expr(e, node->slice.object);
             emit(e, "; ");
             if (slice_type_emitted) { /* re-emit type name for inner struct */ }
@@ -4644,9 +4665,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             emit(e, "({ ");
             if (obj_is_slice) {
                 /* Hoist slice object so .len is single-evaluation. */
-                emit(e, "__typeof__(");
-                emit_expr(e, node->slice.object);
-                emit(e, ") _zer_so%d = ", sl_tmp);
+                emit(e, "__auto_type _zer_so%d = ", sl_tmp);   /* BUG-1391: the object once */
                 emit_expr(e, node->slice.object);
                 emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", sl_tmp, sl_tmp);
             } else if (is_array) {
@@ -9480,6 +9499,8 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
          * the field chain; OR it in to route through the single-eval
          * statement-expression branch. */
         if (expr_reads_volatile(e, node->index_expr.index, func)) idx_se = true;   /* BUG-1378 */
+        if (!expr_emit_small(node->index_expr.index)) idx_se = true;          /* BUG-1391 */
+        if (idx_slice && !expr_emit_small(node->index_expr.object)) obj_se = true;   /* BUG-1391: .len and .ptr */
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
         /* BUG-1098: an ident index the checker declined to auto-guard because the
          * statement may change it — the check and the access must read it ONCE,
@@ -9493,9 +9514,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
-                emit(e, "(*({ __typeof__(");   /* BUG-1349 */
-                emit_rewritten_node(e, node->index_expr.object, func);
-                emit(e, ") _zer_obj%d = ", tmp);
+                /* BUG-1349; BUG-1391: `__auto_type`, so the object's text is
+                 * written once (a `__typeof__(obj)` copy doubled it per level). */
+                emit(e, "(*({ __auto_type _zer_obj%d = ", tmp);
                 emit_rewritten_node(e, node->index_expr.object, func);
                 emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
                 emit_rewritten_node(e, node->index_expr.index, func);
@@ -9553,9 +9574,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                         obj_hoist = false;
                 }
                 if (obj_hoist) {
-                    emit(e, "(*({ __typeof__(");
-                    emit_rewritten_node(e, node->index_expr.object, func);
-                    emit(e, ") *_zer_iob%d = &(", tmp);
+                    emit(e, "(*({ __auto_type _zer_iob%d = &(", tmp);   /* BUG-1391 */
                     emit_rewritten_node(e, node->index_expr.object, func);
                     emit(e, "); size_t _zer_idx%d = (size_t)(", tmp);
                 } else {
@@ -12315,9 +12334,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             /* Hoist obj so .len is single-evaluation (its type matches the
              * slice we're producing — same .ptr / .len shape). */
             if (bounds_present) {
-                emit(e, "__typeof__(");
-                emit_rewritten_node(e, node->slice.object, func);
-                emit(e, ") _zer_so%d = ", t);
+                emit(e, "__auto_type _zer_so%d = ", t);   /* BUG-1391: the object once */
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", t, t);
             }

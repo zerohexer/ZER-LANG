@@ -479,6 +479,51 @@ static bool cfg_reaches_fire(IRFunc *func, int from, const bool *has_fire_in_blo
     }
 }
 
+/* BUG-1390: can control reach a function EXIT (a RETURN, or falling off the
+ * last block) from block `from`? A defer registered on a path that never
+ * returns — `defer {…} for (;;) {…}` — has nothing to fire at, so a missing
+ * FIRE there is correct, not a lowering bug. Iterative (a worklist), so a long
+ * block chain cannot overflow the stack. */
+static bool cfg_reaches_exit(IRFunc *func, int from) {
+    if (from < 0 || from >= func->block_count) return false;
+    bool *seen = (bool *)calloc(func->block_count, sizeof(bool));
+    int *work = (int *)malloc(func->block_count * sizeof(int));
+    if (!seen || !work) { free(seen); free(work); return true; }  /* conservative */
+    int n = 0; bool exit_found = false;
+    work[n++] = from; seen[from] = true;
+    while (n > 0 && !exit_found) {
+        int b = work[--n];
+        IRBlock *block = &func->blocks[b];
+        int succ[2]; int ns = 0;
+        if (block->inst_count == 0) {
+            if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+        } else {
+            IRInst *last = &block->insts[block->inst_count - 1];
+            switch (last->op) {
+            case IR_RETURN: exit_found = true; break;
+            case IR_BRANCH: succ[ns++] = last->true_block; succ[ns++] = last->false_block; break;
+            case IR_GOTO: succ[ns++] = last->goto_block; break;
+            case IR_YIELD: case IR_AWAIT:
+                if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                    succ[ns++] = last->goto_block;
+                else if (b + 1 < func->block_count) succ[ns++] = b + 1;
+                else exit_found = true;
+                break;
+            default:
+                if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+                break;
+            }
+        }
+        for (int k = 0; k < ns; k++) {
+            int t = succ[k];
+            if (t < 0 || t >= func->block_count || seen[t]) continue;
+            seen[t] = true; work[n++] = t;
+        }
+    }
+    free(seen); free(work);
+    return exit_found;
+}
+
 /* Depth-first reachability walk from bb0. Fills reachable[] with true for
  * every block reachable via BRANCH/GOTO/implicit-fallthrough edges. */
 static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
@@ -929,7 +974,7 @@ bool ir_validate(IRFunc *func) {
                                 break;
                             }
                         }
-                        if (!reached) {
+                        if (!reached && cfg_reaches_exit(func, bi)) {
                             fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d IR_DEFER_PUSH "
                                     "has no CFG-reachable IR_DEFER_FIRE in '%.*s' "
                                     "(defer body would never execute)\n",

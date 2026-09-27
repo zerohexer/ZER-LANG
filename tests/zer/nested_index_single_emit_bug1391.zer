@@ -1,0 +1,19 @@
+// BUG-1391: nested index / sub-slice chains doubled the emitted C per level
+// (depth 24 = 528 MB). Semantics check for the single-evaluation forms they take now.
+u32[4] g;
+u32 main() {
+    u32[4] a;
+    a[0] = 1; a[1] = 2; a[2] = 3; a[3] = 0;
+    volatile u32 vi = 0;
+    u32 i = vi;
+    u32 y = a[a[a[a[i]]]];            // a[0]=1 a[1]=2 a[2]=3 a[3]=0
+    if (y != 0) { return 1; }
+    a[a[a[i]]] += 5;                   // a[2] += 5 -> 8
+    if (a[2] != 8) { return 2; }
+    [*]u32 s = a;
+    [*]u32 t = s[1..][1..];
+    if (t.len != 2 || t[0] != 8) { return 3; }
+    g[a[a[i] % 4] % 4] = 7;            // a[1]=2 -> g[2]
+    if (g[2] != 7) { return 4; }
+    return 0;
+}

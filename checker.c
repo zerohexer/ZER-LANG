@@ -1286,6 +1286,30 @@ static IndexVerdict index_range_verdict(struct VarRange *r, uint64_t limit) {
 
 static struct VarRange *find_var_range(Checker *c, const char *name, uint32_t name_len);
 static bool vrp_key_root_is_volatile(Checker *c, const char *name, uint32_t name_len); /* BUG-1011 */
+/* BUG-1389: the type a field stores BY VALUE once array, `?T` (a value
+ * optional holds its payload inline) and distinct wrappers are peeled — the type
+ * the self-containment rules compare against the declaration. `?A` was not
+ * peeled, so `struct A { ?A y; }` was accepted and every size walk recursed. A
+ * `?*A` is a pointer and stops the walk. */
+static Type *byvalue_core_type(Type *t) {
+    while (t) {
+        TypeKind k = type_dispatch_kind(t);
+        t = type_unwrap_distinct(t);
+        if (k == TYPE_ARRAY) { t = t->array.inner; continue; }
+        if (k == TYPE_OPTIONAL) { t = t->optional.inner; continue; }
+        return t;
+    }
+    return t;
+}
+
+/* BUG-1388: the successor / predecessor of a guard constant, SATURATED to the
+ * full range. `n > 9223372036854775807` on a u64 computed INT64_MAX + 1 (signed
+ * overflow, UB in the compiler itself). A u64 above INT64_MAX is outside the
+ * int64 range domain, so the fact becomes "any value" — the conservative
+ * reading — while the nonzero bit each caller passes stays true of it. */
+static int64_t vrp_succ(int64_t v) { return v == INT64_MAX ? INT64_MIN : v + 1; }
+static int64_t vrp_pred(int64_t v) { return v == INT64_MIN ? INT64_MAX : v - 1; }
+
 static void push_var_range(Checker *c, const char *name, uint32_t name_len,
                            int64_t min_val, int64_t max_val, bool known_nonzero);
 static void push_var_range_ex(Checker *c, const char *name, uint32_t name_len,
@@ -9518,9 +9542,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                  * slice wrappers around `st` are finite and must still pass, so
                  * only ARRAY and DISTINCT are peeled here. */
                 {
-                    Type *inner = sf->type;
-                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
-                    inner = type_unwrap_distinct(inner);
+                    Type *inner = byvalue_core_type(sf->type);   /* BUG-1389: peels ?T too */
                     if (inner == st) {
                         checker_error(c, tn->loc.line,
                             "container '%.*s(%s)' cannot contain itself by value "
@@ -9528,6 +9550,7 @@ static Type *resolve_type_inner(Checker *c, TypeNode *tn) {
                             (int)cnlen, cname, ctype_name,
                             (int)sf->name_len, sf->name,
                             (int)cnlen, cname, ctype_name);
+                        sf->type = ty_u8;   /* BUG-1389: recovery */
                     } else if (inner) {
                         /* BUG-868: the MUTUAL case. `inner` is not this frame's
                          * stamp but an ENCLOSING one, so the by-value chain
@@ -11405,6 +11428,16 @@ static bool target_path_derefs(Checker *c, Node *n) {
         break;
     }
     return false;
+}
+
+/* BUG-1392: an intrinsic's argument is type-checked ONCE, in the generic
+ * argument loop; the per-intrinsic validation reads the recorded type. The
+ * arms called check_expr again, so nested `@saturate(u8, @saturate(u8, …))`
+ * doubled the checking work per level (1.9 s at depth 24) and a diagnostic in
+ * an argument could be reported twice. */
+static Type *intrinsic_arg_type(Checker *c, Node *arg) {
+    Type *t = typemap_get(c, arg);
+    return t ? t : check_expr(c, arg);
 }
 
 static Type *check_expr(Checker *c, Node *node) {
@@ -18098,7 +18131,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 }
                 /* validate same width */
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    Type *val_type = intrinsic_arg_type(c, node->intrinsic.args[0]);
                     int tw = type_width(result);
                     int vw = type_width(val_type);
                     /* BUG-325: type_width returns 0 for structs/unions — use compute_type_size */
@@ -18208,7 +18241,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = resolve_type(c, node->intrinsic.type_arg);
                 /* validate source is numeric (unwrap distinct) */
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    Type *val_type = intrinsic_arg_type(c, node->intrinsic.args[0]);
                     Type *effective = type_unwrap_distinct(val_type);
                     /* SAFETY: zer_saturate_operand_valid in src/safety/cast_rules.c (J08) */
                     if (effective && zer_saturate_operand_valid(type_is_numeric(effective) ? 1 : 0) == 0) {
@@ -18244,7 +18277,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = resolve_type(c, node->intrinsic.type_arg);
                 /* validate source is numeric and target is integer */
                 if (node->intrinsic.arg_count > 0) {
-                    Type *val_type = check_expr(c, node->intrinsic.args[0]);
+                    Type *val_type = intrinsic_arg_type(c, node->intrinsic.args[0]);
                     /* BUG-1322: the value to clamp is the MATHEMATICAL one. */
                     if (is_pure_int_literal_expr(node->intrinsic.args[0]) &&
                         literal_tree_has_negative(node->intrinsic.args[0], 0)) {
@@ -19880,7 +19913,7 @@ static Type *check_expr(Checker *c, Node *node) {
         } else if (nlen == 6 && memcmp(name, "config", 6) == 0) {
             /* @config returns the type of the default value */
             if (node->intrinsic.arg_count > 0) {
-                result = check_expr(c, node->intrinsic.args[node->intrinsic.arg_count - 1]);
+                result = intrinsic_arg_type(c, node->intrinsic.args[node->intrinsic.arg_count - 1]);
             } else {
                 result = ty_void;
             }
@@ -19974,7 +20007,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         "@cond_timedwait requires 3 arguments: @cond_timedwait(shared_var, condition, timeout_ms)");
                 /* Type-check the timeout arg (must be integer) */
                 if (node->intrinsic.arg_count >= 3) {
-                    Type *tt = check_expr(c, node->intrinsic.args[2]);
+                    Type *tt = intrinsic_arg_type(c, node->intrinsic.args[2]);
                     if (tt && !type_is_integer(type_unwrap_distinct(tt)))
                         checker_error(c, node->loc.line,
                             "@cond_timedwait timeout must be an integer (milliseconds)");
@@ -19987,7 +20020,7 @@ static Type *check_expr(Checker *c, Node *node) {
             }
             /* Validate first arg is a shared struct variable */
             if (node->intrinsic.arg_count >= 1) {
-                Type *sarg = check_expr(c, node->intrinsic.args[0]);
+                Type *sarg = intrinsic_arg_type(c, node->intrinsic.args[0]);
                 if (sarg) {
                     Type *seff = type_unwrap_distinct(sarg);
                     bool ok = false;
@@ -20026,7 +20059,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 result = type_optional(c->arena, ty_void);
             }
             if ((is_wait || is_timedwait) && node->intrinsic.arg_count >= 2) {
-                Type *ct = check_expr(c, node->intrinsic.args[1]);
+                Type *ct = intrinsic_arg_type(c, node->intrinsic.args[1]);
                 if (ct) {
                     Type *ceff = type_unwrap_distinct(ct);
                     if (ceff->kind != TYPE_BOOL && !type_is_integer(ceff)) {
@@ -20072,7 +20105,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@barrier_init requires 2 arguments: @barrier_init(barrier_var, thread_count)");
                 if (node->intrinsic.arg_count >= 2) {
-                    Type *bt = check_expr(c, node->intrinsic.args[0]);
+                    Type *bt = intrinsic_arg_type(c, node->intrinsic.args[0]);
                     /* Validate first arg is Barrier or *Barrier */
                     Type *bt_eff = bt ? type_unwrap_distinct(bt) : NULL;
                     if (bt_eff && bt_eff->kind == TYPE_POINTER)
@@ -20081,7 +20114,7 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@barrier_init first argument must be Barrier type, got '%s'",
                             type_name(bt));
-                    Type *ct = check_expr(c, node->intrinsic.args[1]);
+                    Type *ct = intrinsic_arg_type(c, node->intrinsic.args[1]);
                     if (ct && !type_is_integer(type_unwrap_distinct(ct)))
                         checker_error(c, node->loc.line,
                             "@barrier_init count must be an integer");
@@ -20107,7 +20140,7 @@ static Type *check_expr(Checker *c, Node *node) {
                     checker_error(c, node->loc.line,
                         "@barrier_wait requires 1 argument: @barrier_wait(barrier_var)");
                 if (node->intrinsic.arg_count >= 1) {
-                    Type *bt = check_expr(c, node->intrinsic.args[0]);
+                    Type *bt = intrinsic_arg_type(c, node->intrinsic.args[0]);
                     Type *bt_eff = bt ? type_unwrap_distinct(bt) : NULL;
                     if (bt_eff && bt_eff->kind == TYPE_POINTER)
                         bt_eff = type_unwrap_distinct(bt_eff->pointer.inner);
@@ -20134,7 +20167,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "@sem_acquire requires 1 argument");
             if (node->intrinsic.arg_count >= 1) {
-                Type *st = check_expr(c, node->intrinsic.args[0]);
+                Type *st = intrinsic_arg_type(c, node->intrinsic.args[0]);
                 Type *st_eff = st ? type_unwrap_distinct(st) : NULL;
                 if (st_eff && st_eff->kind == TYPE_POINTER)
                     st_eff = type_unwrap_distinct(st_eff->pointer.inner);
@@ -20150,7 +20183,7 @@ static Type *check_expr(Checker *c, Node *node) {
                 checker_error(c, node->loc.line,
                     "@sem_release requires 1 argument");
             if (node->intrinsic.arg_count >= 1) {
-                Type *st = check_expr(c, node->intrinsic.args[0]);
+                Type *st = intrinsic_arg_type(c, node->intrinsic.args[0]);
                 Type *st_eff = st ? type_unwrap_distinct(st) : NULL;
                 if (st_eff && st_eff->kind == TYPE_POINTER)
                     st_eff = type_unwrap_distinct(st_eff->pointer.inner);
@@ -23583,7 +23616,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (var_on_left) {
                     switch (cmp_op) {
                     case TOK_LT:      /* var < val → range [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, vrp_pred(cmp_val),
                                        cmp_val <= 0);
                         break;
                     case TOK_LTEQ:    /* var <= val → range [INT64_MIN, val]; nonzero iff val < 0 */
@@ -23591,7 +23624,7 @@ static void check_stmt(Checker *c, Node *node) {
                                        cmp_val < 0);
                         break;
                     case TOK_GT:      /* var > val → range [val+1, INT64_MAX]; nonzero iff val+1 > 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                        push_var_range(c, cmp_var, cmp_var_len, vrp_succ(cmp_val), INT64_MAX,
                                        cmp_val >= 0);
                         break;
                     case TOK_GTEQ:    /* var >= val → range [val, INT64_MAX]; nonzero iff val > 0 */
@@ -23612,7 +23645,7 @@ static void check_stmt(Checker *c, Node *node) {
                     /* val OP var → flip: val < var means var > val */
                     switch (cmp_op) {
                     case TOK_LT:      /* val < var → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                        push_var_range(c, cmp_var, cmp_var_len, vrp_succ(cmp_val), INT64_MAX,
                                        cmp_val >= 0);
                         break;
                     case TOK_LTEQ:    /* val <= var → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
@@ -23620,7 +23653,7 @@ static void check_stmt(Checker *c, Node *node) {
                                        cmp_val > 0);
                         break;
                     case TOK_GT:      /* val > var → var < val → [INT64_MIN, val-1]; nonzero iff val <= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, vrp_pred(cmp_val),
                                        cmp_val <= 0);
                         break;
                     case TOK_GTEQ:    /* val >= var → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
@@ -23652,7 +23685,7 @@ static void check_stmt(Checker *c, Node *node) {
                 if (is_guard && var_on_left) {
                     switch (cmp_op) {
                     case TOK_GTEQ:    /* if (var >= val) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, vrp_pred(cmp_val),
                                        cmp_val <= 0);
                         break;
                     case TOK_GT:      /* if (var > val) return → var <= val → [INT64_MIN, val]; nonzero iff val < 0 */
@@ -23664,7 +23697,7 @@ static void check_stmt(Checker *c, Node *node) {
                                        cmp_val > 0);
                         break;
                     case TOK_LTEQ:    /* if (var <= val) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                        push_var_range(c, cmp_var, cmp_var_len, vrp_succ(cmp_val), INT64_MAX,
                                        cmp_val >= 0);
                         break;
                     case TOK_EQEQ:    /* if (var == 0) return → var != 0 → known_nonzero */
@@ -23677,7 +23710,7 @@ static void check_stmt(Checker *c, Node *node) {
                     /* val OP var guard → apply inverse (flip) */
                     switch (cmp_op) {
                     case TOK_GTEQ:    /* if (val >= var) return → var > val → [val+1, INT64_MAX]; nonzero iff val >= 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, cmp_val + 1, INT64_MAX,
+                        push_var_range(c, cmp_var, cmp_var_len, vrp_succ(cmp_val), INT64_MAX,
                                        cmp_val >= 0);
                         break;
                     case TOK_GT:      /* if (val > var) return → var >= val → [val, INT64_MAX]; nonzero iff val > 0 */
@@ -23689,7 +23722,7 @@ static void check_stmt(Checker *c, Node *node) {
                                        cmp_val < 0);
                         break;
                     case TOK_LTEQ:    /* if (val <= var) return → var < val → [INT64_MIN, val-1]; nonzero iff val-1 < 0 */
-                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, cmp_val - 1,
+                        push_var_range(c, cmp_var, cmp_var_len, INT64_MIN, vrp_pred(cmp_val),
                                        cmp_val <= 0);
                         break;
                     case TOK_EQEQ:
@@ -28066,9 +28099,7 @@ static void register_decl(Checker *c, Node *node) {
                 /* BUG-227/232/314: reject recursive struct by value (incomplete type in C).
                  * Unwrap arrays AND distinct — S[1] or distinct S contains S by value too. */
                 {
-                    Type *inner = sf->type;
-                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
-                    inner = type_unwrap_distinct(inner);
+                    Type *inner = byvalue_core_type(sf->type);   /* BUG-1389: peels ?T too */
                     if (type_is_async_task(sf->type)) {                         /* BUG-1238 */
                         checker_error(c, node->loc.line,
                             "field '%.*s' of struct '%.*s' cannot hold an async task by value — "
@@ -28082,6 +28113,10 @@ static void register_decl(Checker *c, Node *node) {
                             "struct '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
                             (int)node->struct_decl.name_len, node->struct_decl.name,
                             (int)node->struct_decl.name_len, node->struct_decl.name);
+                        /* BUG-1389: error RECOVERY — the checker keeps going after this
+                         * report, and every by-value type walk (size, alignment,
+                         * zero-value) recursed through the cycle for ever. */
+                        sf->type = ty_u8;
                     }
                 }
                 sf->is_keep = fd->is_keep;
@@ -28221,9 +28256,7 @@ static void register_decl(Checker *c, Node *node) {
                 }
                 /* BUG-265/314: reject recursive union by value (incomplete type in C) */
                 {
-                    Type *inner = sv->type;
-                    while (inner && inner->kind == TYPE_ARRAY) inner = inner->array.inner;
-                    inner = type_unwrap_distinct(inner);
+                    Type *inner = byvalue_core_type(sv->type);   /* BUG-1389: peels ?T too */
                     if (type_is_async_task(sv->type)) {                         /* BUG-1238 */
                         checker_error(c, node->loc.line,
                             "union '%.*s' cannot hold an async task by value — hold a "
@@ -28235,6 +28268,7 @@ static void register_decl(Checker *c, Node *node) {
                             "union '%.*s' cannot contain itself by value — use '*%.*s' (pointer) instead",
                             (int)node->union_decl.name_len, node->union_decl.name,
                             (int)node->union_decl.name_len, node->union_decl.name);
+                        sv->type = ty_u8;   /* BUG-1389: recovery, see the struct case */
                     }
                 }
             }

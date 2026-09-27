@@ -1,0 +1,12 @@
+// BUG-1380 boundary: handing an allocation to a callee that passes it to a
+// function pointer transfers it, exactly as the direct funcptr call does — it
+// is not reported as this frame's leak.
+struct T { u32 v; }
+void apply(*(*T) f, *T p) { f(p); }
+void freer(*T p) { free(p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 3;
+    apply(freer, a);
+    return 0;
+}

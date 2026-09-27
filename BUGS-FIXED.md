@@ -105,6 +105,100 @@ negative was confirmed to FIRE there.
   `tests/zer/shared_same_type_lock_order_bug1376.zer` (the runner's timeout makes a hang a
   FAIL).
 
+## Session 2026-09-27 (b) — BUG-1377..1386: union lock through an ancestor, volatile index reads, escape through computed destinations, funcptr hand-off summaries, literal sub-slice keys, >64-bit constants, uN cast wrap
+
+A second round of read-only probe agents (escape / modules / async, and VRP / bounds / enum /
+union) on the BUG-1366..1376 build. Each fix A/B-measured; each new negative fires on the
+post-harvest build.
+
+- **BUG-1377 — the union-switch mutation lock missed writes through an ENCLOSING object.**
+  Inside `switch (w.u) { .q => |*bq| { … } }`, `w = w2;`, `w = { .u = w2.u };`, a write
+  through `*W pw = &w` (`pw.u.p = …`), and — for `switch (pw.u)` — a write to `w.u` by name all
+  replaced the union under the live capture; `(*bq).a[2]` then read a `*T` as a `*Big` (ASan
+  global-buffer-overflow). The key comparison took the ANCESTOR key `w` for "a different
+  element" of `w.u` (disjoint now requires that neither key be a prefix of the other); a
+  pointer alias counted only a pointer to the union itself (now: to anything holding it,
+  `type_holds_byvalue`); and a switch reached THROUGH a pointer blocks a write to any object
+  holding the union type whose path reaches the union (`Checker.union_switch_via_ptr`), so a
+  sibling field (`w.k = 3`) stays legal. Tests: three `tests/zer_fail/union_switch_*_bug1377.zer`,
+  boundary `tests/zer/union_switch_sibling_field_write_bug1377.zer`.
+- **BUG-1378 — a volatile read INSIDE an index expression was loaded twice.** BUG-1011 made a
+  bare volatile index single-read; `g[hv + 0]`, `g[gs.v % 16]`, `s[hv * 1]` and a bit-slice
+  index took the comma form `(check((size_t)(hv + 0), 8), g)[hv + 0]` — the access used a
+  value that was never checked (an ISR or a device can change it between the two loads).
+  `expr_reads_volatile` (exhaustive, answers YES for anything it does not model; IR locals
+  carry their own qualifier) routes every such index through the single-evaluation form.
+  Gate: required fingerprint in `tools/emit_audit.sh` (RED pre-fix).
+- **BUG-1379 — the escape sink's destination walk stopped at a slice, a launder and a
+  computed destination.** `garr[0..2][0] = &x`, `gh[1..3][0].p = &x`, `@ptrcast(*H, gp).p =
+  &x`, `@container(*O, &go.h, h).h.p = &x`, `(gm orelse &gh).p = &x`, and the keep spellings
+  `void put(*u32 p) { *slot() = p; }` / `hp().p = p` all stored a stack address into lasting
+  storage (ASan stack-use-after-return). `classify_escape_sink` now walks a SLICE, a launder
+  and an `&` step, and treats a destination rooted at a value it cannot place (a call, an
+  orelse) as a sink — so every rule that asks it, keep inference included, agrees. Tests:
+  `tests/zer_fail/escape_store_through_slice_of_global_bug1379.zer`,
+  `tests/zer_fail/keep_through_call_rooted_target_bug1379.zer`.
+- **BUG-1380 — a callee handing its param to a FUNCTION POINTER said nothing in its summary.**
+  `void apply(*(*T) f, *T p) { f(p); }` — the argument-precise barrier widens what was handed
+  to the unknown callee, but a PARAM has no entry until one is minted, so nothing reached the
+  summary and `apply(freer, a); a.v` read a freed object (exit 99; also through a struct-field
+  funcptr, a global funcptr, and across a module). The barrier now records WHICH params were
+  handed to an unknown callee (`ZerCheck.cur_handoff_params`), without minting an entry for
+  them, and the summary publishes that as `transfers_param` bit 4 — so the caller's argument
+  is MAYBE_FREED and, as at a direct funcptr call, no longer this frame's leak unless the
+  callee also frees it. A first draft MINTED the param's identity at the barrier instead;
+  `make check` refused it — the callback idiom (`m.hash_fn(key)`, then `key` read by the
+  caller) became a false use-after-free, because a minted param entry turns "handed to an
+  unknown callee" into a free-path fact. The hand-off is an OWNERSHIP fact about the caller's
+  argument, not a state of the callee's param. Tests:
+  `tests/zer_fail/uaf_after_funcptr_free_in_callee_bug1380.zer`, boundary
+  `tests/zer/funcptr_handoff_in_callee_no_leak_bug1380.zer` (a false leak pre-fix).
+- **BUG-1381 — `Ring.push` of a param-derived pointer did not infer keep.** `void send(*u32
+  p) { M m = { .p = p }; r.push(m); }` then `send(&x)` left a stack address in the channel.
+  A Ring is global storage; the push is now a keep-inference sink (the direct push of `&x`
+  was already refused). Test: `tests/zer_fail/ring_push_param_keep_bug1381.zer`.
+- **BUG-1382 — an Arena did not count as carrying a pointer.** `void setup([*]u8 b) { ga =
+  Arena.over(b); }` then `setup(localbuf)`, and `return mk_arena(buf)` through a factory,
+  retained a stack buffer (ASan in the arena's memset). `type_carries_data_pointer` now
+  answers YES for an Arena — it holds a pointer to its backing store — so every value sink
+  (keep inference, call-result escape) sees it. A global buffer behind it still compiles.
+  Tests: `tests/zer_fail/arena_over_{param_to_global,local_via_factory_return}_bug1382.zer`.
+
+Gate for 1379..1382: SHAPE p56 in `tools/sink_matrix.sh` (6 HOLE + 1 OVER-REJECT pre-fix).
+
+- **BUG-1383 — a store through a LITERAL sub-slice of an array was not keyed.** `la[1..3][0]
+  = a` IS `la[1] = a`, but the compound-key extractor stopped at the SLICE, so the slot never
+  aliased `a`: `free(a); … la[1]` read a recycled object (exit 99), for a local array and a
+  global one alike. `ir_rebase_slice_index` folds a constant `[lo..hi][k]` to `[lo+k]` (in
+  both `ir_extract_compound_key` and `ir_global_projection_key`); a variable bound stays
+  unkeyed and keeps the untrackable-store rule. The use-after-free message now names the
+  SLOT when the entry is a projection. Test: `tests/zer_fail/uaf_store_through_literal_subslice_bug1383.zer`.
+- **BUG-1384 — integers wider than 64 bits were folded by 64-bit evaluators.** `u128 g =
+  0xFFFF_FFFF_FFFF_FFFF;` emitted `= (-1)` (all 128 ones), `… + 1` emitted 0, `i100 n = -1`
+  was wrong the same way, a `static u128` inside a function likewise, and a `comptime u128
+  F() { return 0xFFFF_FFFF_FFFF_FFFF + 1; }` returned 0 where its run-time twin returns 2^64.
+  Now: a 65..128-bit literal is emitted as a 128-bit operand (`emit_int_literal`); a global /
+  static initializer of such a type is emitted as the TREE (GCC folds it at 128 bits, then it
+  is wrapped to N) and the checker admits only what that expresses exactly — literals under
+  `+ - * & | ^ ~` and casts (`global_wide_init_ok`); a comptime function or comptime-body
+  local wider than 64 bits is REFUSED (the interpreter is 64-bit — refusing beats folding
+  wrongly). The in-place global constant fold is skipped above 64 bits. Tests:
+  `tests/zer/u128_global_static_init_bug1384.zer`, `tests/zer_fail/comptime_u128_refused_bug1384.zer`,
+  `tests/zer_fail/u128_global_init_shift_refused_bug1384.zer` (the shift form is an
+  over-rejection accepted on purpose; it computes correctly but is outside the admitted set).
+- **BUG-1385 — a cast to a non-native uN / iN wrapped to N bits only in some positions.**
+  `u32 d = (u32)(u2)x` gave 2, but `s = (u32)(u2)x` stored 6, `a[(u2)big]` indexed with the
+  unwrapped value (trapped), `(u2)x == 2` compared the carrier, and a global `const u32 C =
+  (u32)(u2)6` was 6 — the passthrough and AST emission paths cast to the CARRIER only. Both
+  NODE_TYPECAST paths now open `emit_intn_value_wrap_open/close` (once per cast,
+  `Emitter.intn_cast_wrapping`). Test: `tests/zer/intn_cast_wrap_all_forms_bug1385.zer`
+  (six of its seven checks fail pre-fix).
+- **BUG-1386 (OPEN, recorded) — a global array sized by a const whose value depends on typed
+  wrapping.** `const u32 X = (0 - 1) / 536870912 + 1;` is 8; `u32[X] loc` has 8 elements, but
+  a GLOBAL `u32[X] gb` has 1, because global types are resolved at registration, before X's
+  initializer is typed, and the untyped fold reads `(0 - 1)` as -1. Not memory-unsafe (every
+  access checks against the declared 1), but a wrong value; see `docs/limitations.md`.
+
 ## Session 2026-09-26 — BUG-1326..1359: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
 
 Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict

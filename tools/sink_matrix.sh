@@ -1170,6 +1170,27 @@ cell p55_heap_carrier        reject "$P55"' u32 main(){ *S55 hs = alloc(S55) ore
 cell p55_double_free         reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; SS55 ss = { .s = &s }; ss.s.p = a; free(a); free(s.p); return 0; }'
 cell p55_safe_free_through   compile "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; s.p = a; SS55 ss = { .s = &s }; u32 r = ss.s.p.v; free(ss.s.p); return r; }'
 
+# SHAPE p56 (BUG-1379..1382): a frame address reaching lasting storage through a
+# destination the escape root walk stopped at (slice, launder, computed call /
+# orelse destination), a Ring push in a helper, an Arena over a param, and a
+# funcptr hand-off inside a callee (the caller's summary). BOUNDARY: a global
+# buffer behind the arena; the funcptr hand-off is not a leak.
+echo "===== SHAPE p56 = escape through slice / launder / computed dest / Ring / Arena, funcptr hand-off ====="
+P56='struct T56 { u32 v; } struct H56 { ?*u32 p; } struct M56 { *u32 p; }
+?*u32[4] garr56; H56 gh56; ?*u32 g56; Ring(M56, 4) r56; Arena ga56; u8[64] gbuf56;
+*?*u32 slot56() { return &g56; }
+void apply56(*(*T56) f, *T56 p) { f(p); }
+void freer56(*T56 p) { free(p); }
+'
+cell p56_slice_of_global     reject "$P56"' void f(){ u32 x = 5; garr56[0..2][0] = &x; } u32 main(){ f(); return 0; }'
+cell p56_ptrcast_dest        reject "$P56"' void f(){ u32 x = 5; *H56 hp = &gh56; @ptrcast(*H56, hp).p = &x; } u32 main(){ f(); return 0; }'
+cell p56_call_dest_keep      reject "$P56"' void put(*u32 p){ *slot56() = p; } void f(){ u32 x = 5; put(&x); } u32 main(){ f(); return 0; }'
+cell p56_ring_push_keep      reject "$P56"' void send(*u32 p){ M56 m = { .p = p }; r56.push(m); } void f(){ u32 x = 5; send(&x); } u32 main(){ f(); return 0; }'
+cell p56_arena_param_global  reject "$P56"' void setup([*]u8 b){ ga56 = Arena.over(b); } void f(){ u8[64] buf; setup(buf); } u32 main(){ f(); return 0; }'
+cell p56_funcptr_in_callee   reject "$P56"' u32 main(){ *T56 a = alloc(T56) orelse return; apply56(freer56, a); u32 r = a.v; free(a); return r; }'
+cell p56_safe_arena_global   compile "$P56"' void setup([*]u8 b){ ga56 = Arena.over(b); } u32 main(){ setup(gbuf56); return 0; }'
+cell p56_safe_funcptr_handoff compile "$P56"' u32 main(){ *T56 a = alloc(T56) orelse return; apply56(freer56, a); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

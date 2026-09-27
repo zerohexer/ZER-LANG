@@ -110,6 +110,8 @@ u3  narrow = (u3)wide;   // C-style cast — truncates to 3 bits, so 4
 - A single sub-byte scalar is just a `uN`. For named bit-FIELDS of a register use bit-slices `reg[hi..lo]`: a `packed struct` lays each `uN` field out in its byte-sized CARRIER (`u3` occupies a whole `u8`), so it is not a bit-level overlay.
 - `alloc(u12, n)` / `alloc(i48, n)` allocate arrays of an arbitrary width like any primitive.
 - `>64`-bit arithmetic (`u128` …) works but is emulated (multi-word). For hand-tuned big-int, use the `@addc`/`@subb`/`@mulw` carry primitives.
+- A cast to a `uN`/`iN` wraps to N bits wherever it appears — an initializer, a plain assignment, an index, a comparison operand, a global constant: `(u32)(u2)6` is 2 in every position.
+- A global or `static` of a type wider than 64 bits takes an initializer built from integer literals with `+ - * & | ^ ~` and casts (`u128 G = 0xFFFF_FFFF_FFFF_FFFF + 1;` is 2^64). A shift, a division or a name there is refused — assign the value at run time. A `comptime` function or comptime local wider than 64 bits is refused: compile-time evaluation is 64-bit.
 
 **SEE ALSO**
 u8..u64, i8..i64, @addc, @subb, @mulw, @truncate
@@ -938,7 +940,12 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
 
 **NOTES**
 - Mutable capture `|*v|` takes a pointer to the original union variant.
-- Mutating the switched-on union's variant inside a capture arm is a compile error.
+- Mutating the switched-on union's variant inside a capture arm is a compile error —
+  and so is writing anything that CONTAINS it: `switch (w.u)` refuses `w = w2;`,
+  `w = { .u = … };` and a write through a pointer to `w` (`pw.u.p = …`). When the
+  switched union is reached through a pointer (`switch (pw.u)`), a write that reaches
+  a union of that type in any object is refused (it may be the same bytes); writing a
+  sibling field (`w.k = 3;`) stays legal.
 - Writing the whole variant (`msg.ack = a;`) sets the tag. A **partial** write into a
   variant (`msg.sensor.temperature = 5;`) or a **compound** assignment (`u.count += 1;`)
   also makes that variant active — and if a DIFFERENT variant was active, the union is
@@ -5245,7 +5252,11 @@ register_callback(&global_handler);  // OK — global persists
 **NOTES**
 - Inference covers: direct store to global/static, store through a pointer-param
   field, store of an alias, a call-result launder (`g = idfn(p)`), and a
-  by-value STRUCT/UNION param whose pointer fields are persisted.
+  by-value STRUCT/UNION param whose pointer fields are persisted. Also a store
+  through a destination computed by a call (`*slot() = p`, `hp().p = p`) or
+  reached through a slice / cast of a global, a `Ring.push` of a value carrying the
+  param (a Ring is global storage), and an `Arena.over(p)` stored in a global — an
+  Arena carries a pointer to its backing store.
 - **Transitive (closes BH-15):** `void outer(*T p) { inner(p); }` where
   `inner`'s param is (inferred or explicit) keep → `outer`'s `p` is inferred
   keep, so `outer(&local)` is rejected. This is sound across forward references

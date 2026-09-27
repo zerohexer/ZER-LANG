@@ -177,6 +177,9 @@ typedef struct {
      * lowered again (the zercheck shim, then the emitter) is restored first, so
      * every lowering hoists from the program as written. */
     struct ZerHoistUndo { Node *node; Node *func; Node saved; } *hoist_undo;
+    /* BUG-1377: the switched union is reached THROUGH a pointer (`switch (pw.u)`),
+     * so a write to any object of a type holding the union may be the same bytes. */
+    bool union_switch_via_ptr;
     int hoist_undo_n, hoist_undo_cap;
     /* Fix #4 (2026-05-02): @probe behavior selector via --probe-mode flag.
      *   0 = HOSTED (default) — install signal handler, return null on fault

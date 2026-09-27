@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-09-27 round (BUG-1366..1376; measured)
+## OPEN — residuals of the 2026-09-27 rounds (BUG-1366..1386; measured)
 
 1. **A pointer's aim is resolved for a NAME only** (BUG-1366, MEDIUM — accept-unsafe,
    narrowed). `*p = a` is the store `x = a` when p is a local bound once to `&x`, a global
@@ -53,14 +53,36 @@ repeated.
    dependent). `packed struct R { u8 a; u32 b; }` over `@inttoptr(*R, 0x40000000)` emits an
    unaligned 32-bit access to device memory at 0x40000001 (a fault on Cortex-M Device
    memory; byte-split accesses elsewhere). `@inttoptr` checks the struct's alignment (1).
-5. **Wording:** a use through a field of a freed allocation names the ROOT (`use after free:
+5. **A store through a sub-slice with a VARIABLE bound is not keyed** (BUG-1383 closed the
+   constant-bound case: `la[1..3][0]` is `la[1]`, for a local and a global array). `la[i..n][0]
+   = a; free(a); … la[k]` still reaches the slot through no key; the slot's value is not
+   tracked. Fix sketch: land a non-constant re-base in the array's wildcard slot so every
+   element read afterwards sees MAYBE_FREED.
+6. **Wording:** a use through a field of a freed allocation names the ROOT (`use after free:
    's' is freed`) instead of the field path; `use of freed value an unnamed temporary` for a
    read through a pointer deref.
-6. **Over-rejections seen:** a swap / copy helper `void swap(*H x, *H y) { *T t = x.p; x.p =
+7. **Over-rejections seen:** a swap / copy helper `void swap(*H x, *H y) { *T t = x.p; x.p =
    y.p; y.p = t; }` infers `keep` on its params, so `swap(&h1, &h2)` on locals is refused
    (the value stored is the POINTEE's field, not the param); a Ring push/pop of a struct
    carrying a pointer reports the pushed allocation as never freed after `free(x.p)` of the
    popped copy.
+
+8. **BUG-1386 — a GLOBAL array sized by a const whose value needs TYPED wrapping gets the
+   untyped size.** `const u32 X = (0 - 1) / 536870912 + 1;` is 8 (u32 arithmetic); a local
+   `u32[X]` has 8 elements, a global `u32[X]` has 1, so `gb = loc` is refused ("cannot assign
+   'u32[8]' to 'u32[1]'") and a loop to `X` over `gb` traps. Global types are resolved at
+   REGISTRATION, before any initializer is typed, and `resolve_const_ident` wraps only the
+   final value of the untyped fold, not each intermediate. Not memory-unsafe (the declared
+   size is used consistently); a wrong value. Trying the typed fold first in
+   `eval_decl_size_expr` does not help — nothing is typed yet at registration. Fix sketch:
+   type a const's initializer on demand in `resolve_const_ident` (check_expr under the
+   declaring scope, suppressing the duplicate diagnostics pass 2 would repeat), then fold it
+   with `checker_fold_const_typed`.
+9. **>64-bit constants: an admitted set, not a 128-bit evaluator** (BUG-1384). A u65..u128
+   global / static initializer must be literals under `+ - * & | ^ ~` and casts — a shift, a
+   division or a name is refused though GCC would fold it correctly; a comptime function or
+   comptime local wider than 64 bits is refused outright. The durable fix is a 128-bit
+   constant evaluator (the typed fold and the comptime interpreter both carry int64_t).
 
 ## OPEN — residuals of the 2026-09-26 audit (BUG-1326..1357; measured)
 

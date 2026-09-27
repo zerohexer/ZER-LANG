@@ -85,7 +85,8 @@ typedef struct {
     bool *frees_param_field;
     bool *maybe_frees_param_field;
     /* BUG-1280: the callee hands param i to a fire-and-forget spawn (directly or
-     * through a callee that does) — 2 = on every return path, 1 = on some. The
+     * through a callee that does) — 2 = on every return path, 1 = on some; bit 4
+     * (BUG-1380) = handed to an unknown (funcptr) callee on some path. The
      * caller's argument becomes TRANSFERRED (2) or MAYBE_FREED (1): the thread
      * holds it for ever, so a later free is a use-after-free in that thread.
      * Separate from frees_param on purpose — handing a GLOBAL to such a callee
@@ -212,6 +213,9 @@ typedef struct {
     int summary_capacity;
     bool building_summary;  /* suppress error reporting during summary phase */
     bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
+    /* BUG-1380: params (by position, < 64) the function being analysed hands to
+     * a callee it cannot see — FuncSummary.transfers_param bit 4. */
+    uint64_t cur_handoff_params;
     /* BUG-1181: global keys the function being analysed frees through (dynamic,
      * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
     struct ZcFreedGlobal *cur_freed_global;

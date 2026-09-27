@@ -9,6 +9,10 @@
  * Target configuration
  * ================================================================ */
 int zer_target_ptr_bits = 32; /* default 32-bit for embedded targets */
+/* BUG-1375: the widest SINGLE memory access the target performs (0 = the
+ * pointer width). AVR has 16-bit pointers and an 8-bit data path: a u16 load
+ * is two `lds`, so an ISR can land between them. */
+int zer_target_access_bits = 0;
 
 /* ================================================================
  * Global type singletons

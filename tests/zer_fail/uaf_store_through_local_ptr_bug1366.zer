@@ -1,0 +1,19 @@
+// expect-error: use of freed value 'loc'
+// BUG-1366: `*lp = a` through a pointer bound once to `&loc` IS the store
+// `loc = a`. It had no key, so `loc` never aliased `a` and the read after the
+// free returned a recycled object (exit 99) with no diagnostic.
+struct T { u32 v; }
+u32 main() {
+    ?*T loc = null;
+    *?*T lp = &loc;
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    *lp = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (loc) |q| { r = q.v; }
+    free(b);
+    return r;
+}

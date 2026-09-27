@@ -704,7 +704,11 @@ static bool volatile_global_exempt_from_race_check(Checker *c, Symbol *sym) {
      * definition, which is all this predicate needs. */
     int w = (k == TYPE_POINTER) ? c->target_ptr_bits : type_width(vt);
     if (w <= 0) return false;
-    if (w > c->target_ptr_bits) return false;
+    /* BUG-1375: "one word" is the widest access the target performs in ONE
+     * instruction, not the pointer width — AVR's 16-bit pointer and u16 are
+     * each two 8-bit accesses, so an ISR store tears a main-side read. */
+    int acc = c->target_access_bits > 0 ? c->target_access_bits : c->target_ptr_bits;
+    if (w > acc) return false;
     /* BUG-1249: the exemption covers the POINTER WORD, and the scan cannot tell a
      * read of the word from a dereference of it — so `volatile ?*T gp = &obj;`
      * exempted every `p.v += 1` through it, a race on `obj` (TSan-confirmed; the
@@ -7153,7 +7157,10 @@ static void borrow_roots_of_ident(Checker *c, struct BorrowRoots *br, Node *id,
         Type *st = s->type ? type_unwrap_distinct(s->type) : NULL;
         if (st && type_is_optional(st)) st = type_unwrap_distinct(type_unwrap_optional(st));
         TypeKind sk = st ? type_dispatch_kind(st) : TYPE_VOID;
-        if (sk == TYPE_POINTER || sk == TYPE_SLICE)
+        /* BUG-1374: a HANDLE names a pool slot the same way — `&pool.get(h).v`
+         * reaches h's slot, so h stands for it (a later `pool.free(h)` is then
+         * the parent touching the lent object). */
+        if (sk == TYPE_POINTER || sk == TYPE_SLICE || sk == TYPE_HANDLE)
             borrow_roots_add(c, br, s->name, s->name_len);
     }
 }
@@ -7332,6 +7339,14 @@ static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, in
                 r = r->kind == NODE_FIELD ? r->field.object :
                     r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
             if (r && r->kind == NODE_IDENT) borrow_roots_of_ident(c, br, r, true);
+            /* BUG-1374: `&pool.get(h).v` — the object is a CALL (a Pool/Slab
+             * `.get(h)`, a getter): the address is INTO what the call reaches,
+             * so it lends what the call's arguments lend (the handle h — the
+             * same root `&h.v` lends) and what it returns. Before, nothing was
+             * lent: `spawn w(&pool.get(h).v); pool.free(h);` let the thread
+             * write a recycled slot (exit 99). The FIELD case below already
+             * recursed this way for a READ. */
+            else if (r) collect_borrow_roots(c, r, br, depth + 1);
             return;
         }
         if (v->unary.op == TOK_STAR) collect_borrow_roots(c, v->unary.operand, br, depth + 1);
@@ -8227,12 +8242,21 @@ static bool global_name_never_mutated(Checker *c, Symbol *sym) {
             Node *body = NULL;
             if (d->kind == NODE_FUNC_DECL) body = d->func_decl.body;
             else if (d->kind == NODE_INTERRUPT) body = d->interrupt.body;
+            /* BUG-1367: a global INITIALIZER can take the address too —
+             * `volatile *volatile *u32 rr = &r;` lets any body rewrite r
+             * through `*rr` without ever naming r, and r's declaration bound
+             * was trusted for `r[10]` after `*rr` re-aimed it. */
+            else if (d->kind == NODE_GLOBAL_VAR) body = d->var_decl.init;
             if (body && ast_name_mutated_or_addrd(body, sym->name, sym->name_len))
                 ok = false;
         }
     }
     sym->never_mutated_cache = ok ? 1 : -1;
     return ok;
+}
+
+bool checker_global_never_mutated(Checker *c, Symbol *sym) {
+    return global_name_never_mutated(c, sym);
 }
 
 static bool mmio_global_bound_stable(Checker *c, Symbol *sym) {
@@ -27254,6 +27278,15 @@ static void check_stmt(Checker *c, Node *node) {
                                 cand_n[cand_c] = crs->borrow_root_name;
                                 cand_l[cand_c] = crs->borrow_root_len; cand_c++;
                             }
+                        } else if (r) {
+                            /* BUG-1374: `&pool.get(h).v`, `&getp(&s).x` — an
+                             * address into what a CALL reaches lends what the
+                             * call reaches (the handle h, as `&h.v` does). This
+                             * branch recorded nothing, so the parent freed h
+                             * while the thread wrote the recycled slot. */
+                            struct BorrowRoots abr = {0};
+                            collect_borrow_roots(c, ba, &abr, 0);
+                            cand_np = abr.n; cand_lp = abr.l; cand_c = abr.count;
                         }
                     } else if (ba->kind == NODE_IDENT) {
                         Symbol *as = scope_lookup(c->current_scope, ba->ident.name,
@@ -29436,6 +29469,9 @@ void checker_init(Checker *c, Arena *arena, const char *file_name) {
      * always evaluates true regardless of CLI flags. Fix #1
      * (2026-05-02) — gate u64 atomic warning by target arch. */
     c->target_ptr_bits = zer_target_ptr_bits;
+    c->target_access_bits = (zer_target_access_bits > 0 &&
+                             zer_target_access_bits < zer_target_ptr_bits)
+        ? zer_target_access_bits : zer_target_ptr_bits;   /* BUG-1375 */
 
     /* init dynamic type map */
     typemap_init(c);
@@ -31928,6 +31964,17 @@ static void check_interrupt_safety(Checker *c) {
          * and do not echo a line of main's source under it. */
         const char *sv_fn = c->file_name, *sv_src = c->source;
         if (sym->file && sym->file != c->file_name) { c->file_name = sym->file; c->source = NULL; }
+        /* BUG-1369: a `const` global cannot change, so reading it from an
+         * interrupt and from main cannot race — the spawn scan has always
+         * exempted it (BUG-1249's form: not a const POINTER / slice / carrier,
+         * whose POINTEE can still be written). This sink refused the
+         * `const u32 LIMIT = 10;` configuration idiom with "must be declared
+         * volatile" — advice that is unfollowable for a constant. The two sinks
+         * now agree (test_hw_matrix SITE x SHAPE const cells). */
+        if (sym->is_const && !type_carries_data_pointer(sym->type, 0)) {
+            c->file_name = sv_fn; c->source = sv_src;
+            continue;
+        }
         TypeKind gk = type_dispatch_kind(sym->type);
         if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
             gk == TYPE_ARENA) {

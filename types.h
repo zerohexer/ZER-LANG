@@ -489,6 +489,7 @@ struct Scope {
  * Target configuration — set by checker, read by type_width
  * ================================================================ */
 extern int zer_target_ptr_bits; /* default 32, set via --target-bits */
+extern int zer_target_access_bits; /* BUG-1375: widest untearable access, 0 = ptr width */
 
 /* ================================================================
  * Global type singletons — primitives allocated once

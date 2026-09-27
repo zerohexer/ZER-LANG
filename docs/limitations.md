@@ -30,6 +30,38 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-27 round (BUG-1366..1376; measured)
+
+1. **A pointer's aim is resolved for a NAME only** (BUG-1366, MEDIUM — accept-unsafe,
+   narrowed). `*p = a` is the store `x = a` when p is a local bound once to `&x`, a global
+   initialised `&x` and never re-aimed, or (weakly) a local re-aimed only between `&x_i`.
+   Not resolved: a pointer PARAM (the store summary covers the caller side), a pointer held
+   in a FIELD / element (`*h.pp = a`), a pointer returned by a call, a pointer re-aimed from
+   anything but `&name`. A weak store into a GLOBAL candidate that already holds a different
+   allocation only adds a view, and the dangling-global rules do not read views.
+2. **A pointer field re-roots only when it views a LOCAL** (BUG-1373). Still keyed under the
+   carrier: a GLOBAL carrier (`gss.s = &gs; gs.p = a; free(a); gss.s.p`), a place rooted at a
+   call (`getp(&s).p = a` where getp returns its param), and a capture of an element
+   (`if (ps[0]) |q| { q.p = a; }`). Measured accept-unsafe (exit 99) on the reproducers of
+   the 2026-09-27 probe (`agents/uaf/{k4,f4,f1}`).
+3. **Lock order across a CALL** (BUG-1376, LOW — liveness). A statement's own locks are
+   acquired in address order; a statement holding instance A that CALLS a function locking
+   instance B of the same shared type still takes A then B, and another thread doing the
+   reverse deadlocks. The per-statement collector sees the callee's type (BUG-980 re-entry)
+   but not its instance.
+4. **A `packed` MMIO overlay with a misaligned multi-byte field is accepted** (hardware-
+   dependent). `packed struct R { u8 a; u32 b; }` over `@inttoptr(*R, 0x40000000)` emits an
+   unaligned 32-bit access to device memory at 0x40000001 (a fault on Cortex-M Device
+   memory; byte-split accesses elsewhere). `@inttoptr` checks the struct's alignment (1).
+5. **Wording:** a use through a field of a freed allocation names the ROOT (`use after free:
+   's' is freed`) instead of the field path; `use of freed value an unnamed temporary` for a
+   read through a pointer deref.
+6. **Over-rejections seen:** a swap / copy helper `void swap(*H x, *H y) { *T t = x.p; x.p =
+   y.p; y.p = t; }` infers `keep` on its params, so `swap(&h1, &h2)` on locals is refused
+   (the value stored is the POINTEE's field, not the param); a Ring push/pop of a struct
+   carrying a pointer reports the pushed allocation as never freed after `free(x.p)` of the
+   popped copy.
+
 ## OPEN — residuals of the 2026-09-26 audit (BUG-1326..1357; measured)
 
 1. **BUG-1327 migrated four callers only.** `eval_const_expr_ok` is the out-of-band entry
@@ -46,8 +78,8 @@ repeated.
    outside its braces and `goto` back in, so the save variable is formally indeterminate
    (C11 6.2.4) though GCC keeps it in a register; AVR `@critical` names `SREG` without
    `<avr/io.h>` (loud).
-4. **Over-rejections seen (loud):** a `const` global read from an ISR and from main is refused
-   "must be declared volatile" (`check_interrupt_safety` has no const exemption); a function
+4. **Over-rejections seen (loud):** ~~a `const` global read from an ISR and from main is refused
+   "must be declared volatile"~~ (CLOSED 2026-09-27, BUG-1369); a function
    returning an `@inttoptr` pointer is reported as a leak; `volatile f32` is "not single-word"
    on a 32-bit target.
 5. **reference.md "use a packed struct for named bit-fields" is misleading**: `packed struct
@@ -70,7 +102,8 @@ repeated.
    Likewise `*?*T po = &o; if (*po) |q| { free(q); }`.
 ## OPEN — residuals of the 2026-09-26 memory round (BUG-1360..1355; measured)
 
-1. **A store THROUGH A GLOBAL POINTER into the global it points at is untracked** (MEDIUM —
+1. ~~**A store THROUGH A GLOBAL POINTER into the global it points at is untracked**~~ —
+   CLOSED 2026-09-27 (BUG-1366), with the LOCAL sibling it had hidden. Original text: (MEDIUM —
    accept-unsafe, found while closing BUG-1362, pre-existing in BOTH spellings).
    `?*T slot; *?*T gpp = &slot;` then `*gpp = a; free(a); rd()` (rd reads `slot`) returns
    the recycled object's value (exit 99), and so does the callee spelling `void reg(*T p) {

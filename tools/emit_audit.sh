@@ -109,6 +109,34 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1370 — a `volatile` POINTER global that some code writes is a volatile
+# WORD in C. The checker exempts it from the ISR / thread race rules as a
+# volatile single-word cell; the emitter spelled `volatile ?volatile *u32 g` as
+# `volatile volatile uint32_t* g` (the word plain), so `while (g == null) {}`
+# became `jmp .` at -O2. A never-written pointer (the MMIO base idiom) stays
+# plain — that half keeps the gate from passing on "volatile everything".
+cat > "$req_dir/volword.zer" <<'ZEOF'
+mmio 0x40000000..0x400000FF;
+volatile u32 cell;
+volatile ?volatile *u32 flagp = null;
+volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+void pub() { flagp = &cell; }
+u32 main() { pub(); if (flagp == null) { return 1; } return 0; }
+ZEOF
+if "$ZERC" "$req_dir/volword.zer" -o "$req_dir/volword.c" >/dev/null 2>&1; then
+    if ! grep -qE '\* volatile flagp' "$req_dir/volword.c"; then
+        echo "MISSING EMISSION: the written volatile pointer global 'flagp' is not a volatile word"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+    if grep -qE '\* volatile reg' "$req_dir/volword.c"; then
+        echo "UNEXPECTED EMISSION: the never-written MMIO base 'reg' was made a volatile word"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the volatile-pointer-word sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 # BUG-1019 — the null-function-pointer guard, at all THREE call-emission paths.
 #
 # Same silent-drop shape as the lock cap above, and worse to lose: a dropped

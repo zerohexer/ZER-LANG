@@ -1,0 +1,13 @@
+// BUG-1376: two instances of ONE shared type locked in one statement are
+// acquired in ADDRESS order, so opposite source orders in two threads cannot
+// deadlock (the pre-fix build hung here: w() locked g1 then g2, main g2 then g1).
+shared struct C { u32 v; }
+C g1;
+C g2;
+void w() { for (u32 i = 0; i < 1000000; i += 1) { g1.v = g2.v + 1; } }
+u32 main() {
+    ThreadHandle t = spawn w();
+    for (u32 i = 0; i < 1000000; i += 1) { g2.v = g1.v + 1; }
+    t.join();
+    return 0;
+}

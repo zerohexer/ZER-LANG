@@ -1,0 +1,15 @@
+// expect-error: borrowed by a scoped spawn
+// BUG-1374: `&pool.get(h).v` handed to a scoped spawn lent NOTHING (the
+// address's object is a call), so freeing h in the window let the thread
+// write the recycled slot — a live object the parent had since allocated
+// (exit 99). `&h.v` (auto-deref) was refused.
+struct H { u32 v; }
+Pool(H, 1) pool;
+void w(*u32 p) { *p = 99; }
+u32 main() {
+    Handle(H) h = pool.alloc() orelse return;
+    ThreadHandle t = spawn w(&pool.get(h).v);
+    pool.free(h);
+    t.join();
+    return 0;
+}

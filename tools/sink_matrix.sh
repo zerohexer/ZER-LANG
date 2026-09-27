@@ -1114,6 +1114,62 @@ cell p52_replace_after_free reject "$P52"' u32 main(){ *T52 a = alloc(T52) orels
 cell p52_leak_through_node  reject "$P52"' u32 main(){ *T52 a = alloc(T52) orelse return; *H52 n = alloc(H52) orelse { free(a); return 0; }; n.p = a; free(n); return 0; }'
 cell p52_safe_node_returned compile "$P52"' u32 main(){ *H52 n = mk52() orelse return; drop52(n); return 0; }'
 
+# SHAPE p53 (BUG-1366): a STORE or READ through a pointer that can only designate
+# one object (`*lp` with `lp = &loc` bound once, `*gpp` with a global `gpp = &g`
+# never re-aimed). `*lp = a` had no key, so the object it names never aliased
+# `a`, and the read `*lp` of an object whose allocation was freed handed back
+# nothing. A local target was a single-function use-after-free (exit 99).
+# BOUNDARY: the reset through the pointer, and a free through the named object.
+echo "===== SHAPE p53 = store / read through a stable-aim pointer ====="
+P53='struct T53 { u32 v; } ?*T53 g53; *?*T53 gpp53 = &g53;
+u32 rd53() { if (g53) |q| { return q.v; } return 0; }
+void reg53(*T53 p) { *gpp53 = p; }
+'
+cell p53_local_ptr_to_local  reject "$P53"' u32 main(){ ?*T53 loc = null; *?*T53 lp = &loc; *T53 a = alloc(T53) orelse return; *lp = a; free(a); if (loc) |q| { return q.v; } return 0; }'
+cell p53_local_ptr_to_global reject "$P53"' u32 main(){ *?*T53 lp = &g53; *T53 a = alloc(T53) orelse return; *lp = a; free(a); return rd53(); }'
+cell p53_global_ptr_store    reject "$P53"' u32 main(){ *T53 a = alloc(T53) orelse return; *gpp53 = a; free(a); return rd53(); }'
+cell p53_global_ptr_callee   reject "$P53"' u32 main(){ *T53 a = alloc(T53) orelse return; reg53(a); free(a); return rd53(); }'
+cell p53_read_local_deref    reject "$P53"' u32 main(){ ?*T53 loc = null; *?*T53 lp = &loc; *T53 a = alloc(T53) orelse return; loc = a; free(a); if (*lp) |q| { return q.v; } return 0; }'
+cell p53_read_global_deref   reject "$P53"' u32 main(){ *T53 a = alloc(T53) orelse return; g53 = a; free(a); u32 r = 0; if (*gpp53) |q| { r = q.v; } g53 = null; return r; }'
+cell p53_read_local_to_global reject "$P53"' u32 main(){ *?*T53 lp = &g53; *T53 a = alloc(T53) orelse return; g53 = a; free(a); u32 r = 0; if (*lp) |q| { r = q.v; } g53 = null; return r; }'
+cell p53_multi_aim_weak      reject "$P53"' u32 main(){ ?*T53 l1 = null; ?*T53 l2 = null; *?*T53 lp = &l1; if (rd53() == 7) { lp = &l2; } *T53 a = alloc(T53) orelse return; *lp = a; free(a); if (l1) |q| { return q.v; } return 0; }'
+cell p53_safe_multi_aim_reset compile "$P53"' u32 main(){ ?*T53 l1 = null; ?*T53 l2 = null; *?*T53 lp = &l1; if (rd53() == 7) { lp = &l2; } *T53 a = alloc(T53) orelse return; *lp = a; u32 r = 0; if (l2) |q| { r = q.v; } free(a); l1 = null; l2 = null; if (l1) |q| { r = q.v; } return r; }'
+cell p53_safe_reset_through  compile "$P53"' u32 main(){ ?*T53 loc = null; *?*T53 lp = &loc; *T53 a = alloc(T53) orelse return; *lp = a; if (loc) |q| { free(q); } *lp = null; *T53 b = alloc(T53) orelse return; *gpp53 = b; u32 r = rd53(); free(b); *gpp53 = null; return r; }'
+
+# SHAPE p54 (BUG-1371): the ASSIGN spelling of a call (`z = f(a);`, `s.z = f(a);`,
+# `arr[0] = f(a);`) — one passthrough instruction, which the IR_CALL transfer
+# never saw, so the callee's summary effects were all skipped.
+echo "===== SHAPE p54 = call effects through the assignment spelling ====="
+P54='struct T54 { u32 v; } struct S54 { u32 z; ?*T54 p; } ?*T54 g54;
+u32 eat54(*T54 p) { free(p); return 1; }
+u32 dropg54() { if (g54) |q| { free(q); } g54 = null; return 1; }
+u32 eatf54(*S54 s) { if (s.p) |q| { free(q); } s.p = null; return 1; }
+move struct Tok54 { u32 k; } u32 mv54(Tok54 t) { return t.k; }
+'
+cell p54_local_target        reject "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; u32 z = 0; z = eat54(a); u32 r = a.v; free(a); return r + z; }'
+cell p54_field_target        reject "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; S54 s; s.z = eat54(a); u32 r = a.v; free(a); return r; }'
+cell p54_elem_target         reject "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; u32[2] z; z[0] = eat54(a); u32 r = a.v; free(a); return r; }'
+cell p54_frees_global        reject "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; g54 = a; u32 z = 0; z = dropg54(); u32 r = a.v; free(a); return r; }'
+cell p54_frees_field         reject "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; S54 s; s.p = a; u32 z = 0; z = eatf54(&s); u32 r = a.v; free(a); return r; }'
+cell p54_move                reject "$P54"' u32 main(){ Tok54 a; a.k = 1; u32 z = 0; z = mv54(a); return a.k; }'
+cell p54_safe_after_call     compile "$P54"' u32 main(){ *T54 a = alloc(T54) orelse return; u32 z = 0; z = eat54(a); return z - 1; }'
+
+# SHAPE p55 (BUG-1373): a projection THROUGH a pointer field (`ss.s.p` with
+# `ss.s = &s` / `{ .s = &s }` / `{ .s = hs }`) names the viewed object's slot.
+echo "===== SHAPE p55 = allocation reached through a pointer field of a struct ====="
+P55='struct T55 { u32 v; } struct S55 { *T55 p; } struct SS55 { *S55 s; }
+void put55(*SS55 ss, *T55 p) { ss.s.p = p; }
+u32 rd55(*SS55 x) { return x.s.p.v; }
+'
+cell p55_store_through_field reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; SS55 ss = { .s = &s }; ss.s.p = a; free(a); return s.p.v; }'
+cell p55_assign_view         reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; SS55 ss; ss.s = &s; ss.s.p = a; free(a); return s.p.v; }'
+cell p55_read_through_field  reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; s.p = a; SS55 ss = { .s = &s }; free(a); return ss.s.p.v; }'
+cell p55_callee_store        reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; SS55 ss = { .s = &s }; put55(&ss, a); free(a); return s.p.v; }'
+cell p55_callee_read         reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; s.p = a; SS55 ss = { .s = &s }; free(a); return rd55(&ss); }'
+cell p55_heap_carrier        reject "$P55"' u32 main(){ *S55 hs = alloc(S55) orelse return; *T55 a = alloc(T55) orelse { free(hs); return 0; }; hs.p = a; SS55 ss = { .s = hs }; free(a); u32 r = ss.s.p.v; free(hs); return r; }'
+cell p55_double_free         reject "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; SS55 ss = { .s = &s }; ss.s.p = a; free(a); free(s.p); return 0; }'
+cell p55_safe_free_through   compile "$P55"' u32 main(){ *T55 a = alloc(T55) orelse return; S55 s; s.p = a; SS55 ss = { .s = &s }; u32 r = ss.s.p.v; free(ss.s.p); return r; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

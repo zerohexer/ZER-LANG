@@ -271,7 +271,8 @@ static void gen(HWScenario s, char *buf, size_t n) {
  * ================================================================ */
 
 typedef enum { VSITE_SPAWN, VSITE_ISR, VSITE_COUNT } VSite;
-typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN, VSHAPE_COUNT } VShape;
+typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN,
+               VSHAPE_CONST, VSHAPE_CONST_AGG, VSHAPE_COUNT } VShape;
 
 static const char *vsite_name(VSite s) {
     switch (s) {
@@ -288,6 +289,8 @@ static const char *vshape_name(VShape s) {
     case VSHAPE_AGGREGATE: return "aggregate-struct";
     case VSHAPE_OPTPTR:    return "optional-pointer ?*volatile T";
     case VSHAPE_OPTPTR_PLAIN: return "optional-pointer ?*T (plain pointee)";
+    case VSHAPE_CONST:     return "const-scalar (read on both sides)";
+    case VSHAPE_CONST_AGG: return "const-aggregate (read on both sides)";
     case VSHAPE_COUNT: break;
     }
     return "?";
@@ -297,7 +300,11 @@ static const char *vshape_name(VShape s) {
  * BUG-1249: but the exemption covers the WORD, and the scans cannot tell a read
  * of the word from a dereference of it — so the pointer is exempt only when its
  * pointee is itself volatile (or a shared struct). A plain pointee is negative. */
-static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD && s != VSHAPE_OPTPTR; }
+/* BUG-1369: a `const` global cannot change, so both sinks must accept it — the
+ * spawn scan always did, the ISR check refused it ("must be declared volatile"). */
+static int vshape_is_negative(VShape s) {
+    return s != VSHAPE_WORD && s != VSHAPE_OPTPTR && s != VSHAPE_CONST && s != VSHAPE_CONST_AGG;
+}
 static const char *vshape_flags(VShape s) {
     return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
 }
@@ -527,6 +534,8 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     case VSHAPE_AGGREGATE: decl = "struct P{u32 a; u32 b;}\nvolatile P g;"; wr = "g.a = 1;"; rd = "u32 x = g.a;"; break;
     case VSHAPE_OPTPTR:    decl = "volatile ?volatile *u32 g = null;";    wr = "g = null;"; rd = "volatile ?volatile *u32 x = g;"; break;
     case VSHAPE_OPTPTR_PLAIN: decl = "volatile ?*u32 g = null;";          wr = "g = null;"; rd = "volatile ?*u32 x = g;"; break;
+    case VSHAPE_CONST:     decl = "const u32 g = 7;";                     wr = "u32 y = g;"; rd = "u32 x = g;"; break;
+    case VSHAPE_CONST_AGG: decl = "struct Q{u32 a; u32 b;}\nconst Q g = { .a = 1, .b = 2 };"; wr = "u32 y = g.b;"; rd = "u32 x = g.a;"; break;
     case VSHAPE_COUNT:     decl = ""; wr = ""; rd = ""; break;
     }
     if (site == VSITE_SPAWN) {

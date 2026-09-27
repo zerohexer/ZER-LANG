@@ -2073,6 +2073,28 @@ static bool ir_is_stable_aggregate_ptr_param(IRFunc *func, int local) {
     return !ast_name_mutated_or_addrd(fn->func_decl.body, nm, nl);
 }
 
+/* BUG-1373: a pointer-to-aggregate LOCAL or PARAM that holds ONE value for the
+ * whole function (never reassigned or address-taken, bound once) — so a
+ * pointer field set from it keeps naming the same object, and projections
+ * through that field can be re-rooted onto it. */
+static bool ir_is_stable_aggregate_ptr_local(IRFunc *func, int local) {
+    if (ir_is_stable_aggregate_ptr_param(func, local)) return true;
+    if (local < 0 || local >= func->local_count) return false;
+    IRLocal *l = &func->locals[local];
+    if (l->is_param || l->is_temp || !l->type) return false;
+    Type *t = type_unwrap_distinct(l->type);
+    if (!t || type_dispatch_kind(t) != TYPE_POINTER) return false;
+    Type *in = t->pointer.inner ? type_unwrap_distinct(t->pointer.inner) : NULL;
+    TypeKind k = in ? type_dispatch_kind(in) : TYPE_VOID;
+    if (k != TYPE_STRUCT && k != TYPE_UNION) return false;
+    Node *fn = func->ast_node;
+    if (!fn || fn->kind != NODE_FUNC_DECL || !fn->func_decl.body) return false;
+    const char *nm = l->orig_name ? l->orig_name : l->name;
+    uint32_t nl = l->orig_name ? l->orig_name_len : l->name_len;
+    if (ast_name_mutated_or_addrd(fn->func_decl.body, nm, nl)) return false;
+    return ast_name_bind_count(fn->func_decl.body, nm, nl) == 1;
+}
+
 /* BUG-1070: is block `bi` a REACHABLE function exit?  The one query every
  * exit consumer asks (leak check, FuncSummary, the return-value summaries, the
  * scope-exit defer scan, the ThreadHandle join check). "The last instruction is
@@ -2507,6 +2529,32 @@ static bool ir_global_projection_key(ZerCheck *zc, IRFunc *func, Node *expr,
     return true;
 }
 
+/* BUG-1373: re-root a key (local, path) through a POINTER FIELD that views
+ * another local — the field-level sibling of the BUG-984 root re-root. At the
+ * longest proper prefix of `path` whose compound entry records a view
+ * (`ss.s = &s`, `SS ss = { .s = hs }`), the rest of the path names the viewed
+ * local's slot: (ss, ".s.p") -> (s, ".p"). Repeated (each step shortens the
+ * path). Only a prefix followed by a further projection re-roots: the pointer
+ * field itself is its own slot. */
+static void ir_reroot_views(IRPathState *ps, int *local, const char **path, uint32_t *len) {
+    if (!ps || !path || !*path) return;
+    for (int guard = 0; guard < 64 && *len > 0; guard++) {
+        int cut = -1, vr = -1;
+        for (int i = (int)*len - 1; i > 0; i--) {
+            char c = (*path)[i];
+            if (c != '.' && c != '[') continue;
+            IRHandleInfo *pv = ir_find_compound_handle(ps, *local, *path, (uint32_t)i);
+            if (pv && pv->view_root_local >= 0 && pv->view_root_local != *local) {
+                cut = i; vr = pv->view_root_local; break;
+            }
+        }
+        if (cut < 0) return;
+        *local = vr;
+        *path += cut;
+        *len -= (uint32_t)cut;
+    }
+}
+
 static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                     Node *expr,
                                     int *out_local,
@@ -2581,6 +2629,16 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!path) return -1;
     int wrote = ir_build_key_path(func, expr, path, need + 1, NULL);
     if (wrote != need) return -1;  /* invariant violation */
+    /* BUG-1373: a projection THROUGH a pointer field that views a local
+     * (`ss.s.p` after `ss.s = &s`) names that local's own slot. */
+    {
+        uint32_t nl = (uint32_t)need;
+        const char *pp = path;
+        ir_reroot_views(ps, &local, &pp, &nl);
+        path = (char *)pp;
+        need = (int)nl;
+    }
+    *out_local = local;
     *out_path = path;
     *out_path_len = (uint32_t)need;
     return 0;
@@ -2689,6 +2747,33 @@ static void ir_check_call_arg_carriers(ZerCheck *zc, IRFunc *func, IRPathState *
                 h->state == IR_HS_FREED ? "freed" : "maybe-freed",
                 ir_local_desc(zc, func, root, h->path, h->path_len), h->free_line);
             break;
+        }
+        /* BUG-1373: an object the argument reaches through a pointer FIELD it
+         * views (`rd(&ss)` with `ss.s = &s`) is handed over too — the callee
+         * reads `x.s.p` as surely as a field of the argument itself. One level
+         * of view (the recursion is over entries, not views). */
+        for (int r = 0; r < ps->handle_count; r++) {
+            IRHandleInfo *pv = &ps->handles[r];
+            if (pv->local_id != root || pv->view_root_local < 0 ||
+                pv->view_root_local == root || pv->path_len <= plen || !pv->path) continue;
+            if (plen > 0 && (!path || memcmp(pv->path, path, plen) != 0)) continue;
+            int vr = pv->view_root_local;
+            bool hit = false;
+            for (int q = 0; q < ps->handle_count && !hit; q++) {
+                IRHandleInfo *h = &ps->handles[q];
+                if (h->local_id != vr || h->path_len == 0 || !h->path) continue;
+                if (h->state != IR_HS_FREED && h->state != IR_HS_MAYBE_FREED) continue;
+                ir_zc_error_for(zc, func, root, line,
+                    "a call is handed %s, which reaches %s through a pointer field — "
+                    "it holds a %s pointer (freed at line %d), and the callee receives "
+                    "the dangling pointer. Reset the field after the free (= null), or "
+                    "pass only what the callee needs",
+                    ir_local_desc(zc, func, root, path, plen),
+                    ir_local_desc(zc, func, vr, h->path, h->path_len),
+                    h->state == IR_HS_FREED ? "freed" : "maybe-freed", h->free_line);
+                hit = true;
+            }
+            if (hit) break;
         }
     }
 }
@@ -5566,6 +5651,207 @@ static void ir_arena_link_backing(ZerCheck *zc, IRHandleInfo *h) {
 
 /* The global key a VALUE expression reads (`g`, `g.p`, `g orelse …`), if any. */
 static Node *ir_local_def_expr(IRFunc *func, IRBlock *pref, int local);   /* BUG-1289 */
+
+/* BUG-1366: the storage a POINTER NAME provably designates — the ONE answer to
+ * "which object does `*p` name?" for the store sinks. `p` qualifies only when
+ * it can hold exactly one value for its whole lifetime:
+ *   - a LOCAL (not a param) bound once, never reassigned or address-taken in
+ *     the function (the ir_local_is_immutable_bool gate), whose unique
+ *     definition is `&x`;
+ *   - a GLOBAL whose declaration initializer is `&x` and which no body and no
+ *     global initializer assigns or addresses (checker_global_never_mutated).
+ * `x` must be a plain name that resolves, in THIS function, to the object the
+ * initializer named (a local bound once, or an unshadowed global). Returns that
+ * IDENT node (already typed by the checker), or NULL.
+ *
+ * Why it is needed: a store `*p = a` had no key (ir_extract_compound_key does
+ * not follow a deref) and the store summary refused `*global`, so
+ *     ?*T loc; *?*T lp = &loc; *lp = a; free(a); if (loc) |q| { q.v }
+ * read a recycled object (exit 99) in ONE function, and the global spelling
+ * `*gpp = a` (gpp = &slot) left `slot` dangling across a call unobserved. */
+static Node *ir_ptr_stable_aim(ZerCheck *zc, IRFunc *func, Node *p) {
+    if (!p || p->kind != NODE_IDENT) return NULL;
+    Node *init = NULL;
+    int pl = ir_find_local_exact_first(func, p->ident.name, (uint32_t)p->ident.name_len);
+    if (pl >= 0) {
+        if (pl >= func->local_count || func->locals[pl].is_param) return NULL;
+        if (!func->ast_node || func->ast_node->kind != NODE_FUNC_DECL) return NULL;
+        Node *body = func->ast_node->func_decl.body;
+        if (!body) return NULL;
+        if (ast_name_mutated_or_addrd(body, p->ident.name, (uint32_t)p->ident.name_len))
+            return NULL;
+        if (ast_name_bind_count(body, p->ident.name, (uint32_t)p->ident.name_len) != 1)
+            return NULL;
+        for (int bi = 0; bi < func->block_count; bi++) {
+            IRBlock *bb = &func->blocks[bi];
+            for (int ii = 0; ii < bb->inst_count; ii++)
+                if (bb->insts[ii].op == IR_ADDR_OF && bb->insts[ii].src1_local == pl)
+                    return NULL;
+        }
+        init = ir_local_def_expr(func, NULL, pl);
+        if (init && init->kind == NODE_VAR_DECL) init = init->var_decl.init;
+    } else if (ir_ident_is_unshadowed_global(zc, func, p)) {
+        Symbol *gs = scope_lookup(zc->checker->global_scope, p->ident.name,
+                                  (uint32_t)p->ident.name_len);
+        if (!gs || !gs->func_node || gs->func_node->kind != NODE_GLOBAL_VAR) return NULL;
+        if (!checker_global_never_mutated(zc->checker, gs)) return NULL;
+        init = gs->func_node->var_decl.init;
+    } else {
+        return NULL;
+    }
+    init = init ? ir_peel_launder(init) : NULL;
+    if (!init || init->kind != NODE_UNARY || init->unary.op != TOK_AMP) return NULL;
+    Node *x = init->unary.operand;
+    if (!x || x->kind != NODE_IDENT) return NULL;
+    int xl = ir_find_local_exact_first(func, x->ident.name, (uint32_t)x->ident.name_len);
+    if (xl >= 0) {
+        /* A global pointer's initializer names a GLOBAL: a local of the same
+         * name in this function is a different object. */
+        if (pl < 0) return NULL;
+        if (func->locals[xl].is_param) return NULL;   /* `&param` is this frame's copy */
+        Node *body = func->ast_node->func_decl.body;
+        if (ast_name_bind_count(body, x->ident.name, (uint32_t)x->ident.name_len) != 1)
+            return NULL;
+        return x;
+    }
+    return ir_ident_is_unshadowed_global(zc, func, x) ? x : NULL;
+}
+
+/* BUG-1366: the SET of objects a pointer LOCAL may designate, when it is
+ * re-aimed between several (`*?*T lp = &l1; if (c) { lp = &l2; }`). Every
+ * write of lp must be a plain `= &x` of a plain name, lp is never
+ * address-taken or compound-assigned, and it is bound once. Each x must be a
+ * local bound once (not a param) or an unshadowed global. Returns the count
+ * (>= 1) with the names in out[], or 0 when the set is not closed. */
+#define IR_AIM_SET_MAX 8
+typedef struct { Node **out; int n; bool bad; } IRAimAcc;
+static void ir_aim_acc_add(IRAimAcc *a, Node *v) {
+    v = v ? ir_peel_launder(v) : NULL;
+    if (!v || v->kind != NODE_UNARY || v->unary.op != TOK_AMP || !v->unary.operand ||
+        v->unary.operand->kind != NODE_IDENT) { a->bad = true; return; }
+    Node *x = v->unary.operand;
+    for (int i = 0; i < a->n; i++)
+        if (a->out[i]->ident.name_len == x->ident.name_len &&
+            memcmp(a->out[i]->ident.name, x->ident.name, x->ident.name_len) == 0) return;
+    if (a->n >= IR_AIM_SET_MAX) { a->bad = true; return; }
+    a->out[a->n++] = x;
+}
+static bool ir_aim_write_visit(Node *value, int kind, void *ud) {
+    IRAimAcc *a = (IRAimAcc *)ud;
+    if (kind != ANW_ASSIGN || !value) { a->bad = true; return true; }
+    ir_aim_acc_add(a, value);
+    return a->bad;
+}
+static int ir_ptr_aim_set(ZerCheck *zc, IRFunc *func, Node *p, Node **out) {
+    if (!p || p->kind != NODE_IDENT) return 0;
+    int pl = ir_find_local_exact_first(func, p->ident.name, (uint32_t)p->ident.name_len);
+    if (pl < 0 || pl >= func->local_count || func->locals[pl].is_param) return 0;
+    if (!func->ast_node || func->ast_node->kind != NODE_FUNC_DECL) return 0;
+    Node *body = func->ast_node->func_decl.body;
+    if (!body) return 0;
+    if (ast_name_bind_count(body, p->ident.name, (uint32_t)p->ident.name_len) != 1)
+        return 0;
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++)
+            if (bb->insts[ii].op == IR_ADDR_OF && bb->insts[ii].src1_local == pl)
+                return 0;
+    }
+    /* The declaration's initializer — the unique IR definition of lp (a later
+     * `lp = &y` is an expression-form store, not a definition). */
+    Node *init = ir_local_def_expr(func, NULL, pl);
+    if (init && init->kind == NODE_VAR_DECL) init = init->var_decl.init;
+    IRAimAcc a = { out, 0, false };
+    if (!init) return 0;
+    ir_aim_acc_add(&a, init);
+    if (a.bad) return 0;
+    ast_name_writes(body, p->ident.name, (uint32_t)p->ident.name_len,
+                    ir_aim_write_visit, &a);
+    if (a.bad || a.n == 0) return 0;
+    for (int i = 0; i < a.n; i++) {
+        Node *x = out[i];
+        int xl = ir_find_local_exact_first(func, x->ident.name, (uint32_t)x->ident.name_len);
+        if (xl >= 0) {
+            if (func->locals[xl].is_param) return 0;
+            if (ast_name_bind_count(body, x->ident.name, (uint32_t)x->ident.name_len) != 1)
+                return 0;
+        } else if (!ir_ident_is_unshadowed_global(zc, func, x)) {
+            return 0;
+        }
+    }
+    return a.n;
+}
+
+/* BUG-1366: a WEAK store `*p = v` where p may designate several objects: each
+ * of them may now hold v's allocation (and keeps what it held). A local target
+ * gets v's allocation in its VIEW set — the representation a variable-index
+ * store into an array's wildcard slot uses — so a read of it after v is freed
+ * is refused. A global target that holds nothing becomes an alias of v (the
+ * dangling-global rules then see it); one already holding another allocation
+ * keeps it and gets the view. Returns true when the store was handled. */
+static bool ir_weak_deref_store(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                IRInst *inst) {
+    if (inst->op != IR_ASSIGN || !inst->expr || inst->expr->kind != NODE_ASSIGN ||
+        inst->expr->assign.op != TOK_EQ) return false;
+    Node *t = inst->expr->assign.target;
+    if (!t || t->kind != NODE_UNARY || t->unary.op != TOK_STAR) return false;
+    Node *set[IR_AIM_SET_MAX];
+    int n = ir_ptr_aim_set(zc, func, t->unary.operand, set);
+    if (n < 2) return false;
+    int vl = ir_find_value_local(func, inst->expr->assign.value);
+    if (vl < 0) vl = ir_find_store_source_local(func, inst->expr->assign.value);
+    IRHandleInfo *vh = vl >= 0 ? ir_find_handle(ps, vl) : NULL;
+    if (!vh || (vh->alloc_id == 0 && vh->view_count == 0 && !vh->view_overflow))
+        return true;
+    IRHandleInfo src = *vh;            /* the adds below may realloc */
+    for (int i = 0; i < n; i++) {
+        Node *x = set[i];
+        int xl = ir_find_local_exact_first(func, x->ident.name, (uint32_t)x->ident.name_len);
+        IRHandleInfo *xh;
+        if (xl >= 0) {
+            xh = ir_add_handle(ps, xl);
+        } else {
+            xh = ir_find_compound_handle(ps, IR_GLOBAL_ROOT_ID, x->ident.name,
+                                         (uint32_t)x->ident.name_len);
+            if (!xh || xh->alloc_id == 0) {
+                IRAliasSnapshot snap;
+                ir_snapshot_alias(&snap, &src);
+                xh = ir_add_compound_handle(ps, IR_GLOBAL_ROOT_ID, x->ident.name,
+                                            (uint32_t)x->ident.name_len);
+                if (!xh) continue;
+                ir_apply_alias(xh, &snap);
+                xh->state = src.state;
+                xh->escaped = true;   /* INVARIANT — see IR_GLOBAL_ROOT_ID */
+                continue;
+            }
+        }
+        if (!xh) continue;
+        if (src.alloc_id != 0) ir_view_add(xh, src.alloc_id);
+        for (int k = 0; k < src.view_count; k++) ir_view_add(xh, src.view_alloc_ids[k]);
+        if (src.view_overflow) xh->view_overflow = true;
+    }
+    return true;
+}
+
+/* BUG-1366: the store TARGET with a deref of a stable-aim pointer replaced by
+ * the object it names (`*p = v` -> `x = v`). NULL when there is nothing to
+ * canonicalize. The synthesized NODE_ASSIGN is arena-allocated and carries the
+ * original value and operator; its target is the checker-typed IDENT from the
+ * pointer's initializer. */
+static Node *ir_canon_deref_store(ZerCheck *zc, IRFunc *func, Node *assign) {
+    if (!assign || assign->kind != NODE_ASSIGN || !assign->assign.target) return NULL;
+    Node *t = assign->assign.target;
+    if (t->kind != NODE_UNARY || t->unary.op != TOK_STAR) return NULL;
+    Node *x = ir_ptr_stable_aim(zc, func, t->unary.operand);
+    if (!x) return NULL;
+    Node *n = (Node *)arena_alloc(zc->arena, sizeof(Node));
+    if (!n) return NULL;
+    *n = *assign;
+    n->assign.target = x;
+    Type *at = checker_get_type(zc->checker, assign);
+    if (at) checker_set_type(zc->checker, n, at);
+    return n;
+}
 static bool ir_value_global_key(ZerCheck *zc, IRFunc *func, Node *e,
                                 const char **key, uint32_t *len) {
     e = ir_peel_launder(e);
@@ -5602,6 +5888,13 @@ static bool ir_value_global_key(ZerCheck *zc, IRFunc *func, Node *e,
             ir_ident_is_unshadowed_global(zc, func, d->unary.operand)) {
             *key = d->unary.operand->ident.name;
             *len = (uint32_t)d->unary.operand->ident.name_len;
+            return true;
+        }
+        /* BUG-1366: a GLOBAL pointer that can only designate global g. */
+        Node *aim = ir_ptr_stable_aim(zc, func, e->unary.operand);
+        if (aim && ir_ident_is_unshadowed_global(zc, func, aim)) {
+            *key = aim->ident.name;
+            *len = (uint32_t)aim->ident.name_len;
             return true;
         }
     }
@@ -6762,6 +7055,9 @@ static int ir_ps_target_rec(ZerCheck *zc, IRFunc *func, Node *e, char *buf,
         return (int)e->ident.name_len;
     }
     if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR) {
+        /* BUG-1366: a pointer that can only designate `x` names x's storage. */
+        Node *aim = ir_ptr_stable_aim(zc, func, e->unary.operand);
+        if (aim) return ir_ps_target_rec(zc, func, aim, buf, kind, local, depth + 1);
         int r = ir_ps_target_rec(zc, func, e->unary.operand, buf, kind, local, depth + 1);
         return (r >= 0 && *kind == IR_PS_GLOBAL) ? -1 : r;
     }
@@ -6970,9 +7266,12 @@ static void ir_ps_scan(IRPsAcc *a, int want_local, int dst, const char *prefix,
             if (!x) continue;
             /* (A) a direct store `target = value`. */
             if (x->kind == NODE_ASSIGN && x->assign.op == TOK_EQ) {
+                /* BUG-1371: `z = put(&s, p);` — the call's own stores are (B)'s. */
+                Node *acall = (x->assign.value && x->assign.value->kind == NODE_CALL)
+                    ? x->assign.value : NULL;
                 int k, l; uint32_t tl = 0;
                 const char *tp = ir_ps_target(zc, func, x->assign.target, &k, &l, &tl);
-                if (!tp) continue;
+                if (!tp) { if (!acall) continue; x = acall; goto ps_callee; }
                 if (want_local < 0) {
                     /* `p = q;` rebinds this function's own copy of a param —
                      * invisible to the caller (`*p = …` is a store, path ""). */
@@ -6986,8 +7285,10 @@ static void ir_ps_scan(IRPsAcc *a, int want_local, int dst, const char *prefix,
                     char *np = ir_cat3(zc, prefix, prefix_len, tp, tl, "", 0);
                     if (np) ir_ps_value(a, dst, np, prefix_len + tl, x->assign.value, depth + 1);
                 }
-                continue;
+                if (!acall) continue;
+                x = acall;
             }
+        ps_callee:
             /* (B) a callee that stores one of its params (BUG-1288), handed
              * this function's values. */
             if (x->kind != NODE_CALL || !x->call.callee || x->call.callee->kind != NODE_IDENT)
@@ -7186,6 +7487,12 @@ static void ir_apply_param_stores(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         uint32_t tot = blen + e->plen;
         char *p = ir_cat3(zc, base, blen, e->path, e->plen, "", 0);
         if (!p || tot == 0) continue;
+        if (root >= 0) {                                   /* BUG-1373 */
+            const char *rp = p;
+            ir_reroot_views(ps, &root, &rp, &tot);
+            p = (char *)rp;
+            if (tot == 0) continue;
+        }
         ir_ps_apply_value(zc, func, ps, root, p, tot, call->call.args[e->src], line, 0);
     }
 }
@@ -9520,6 +9827,31 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                         ch->alloc_id = 0;
                     }
                 }
+                /* BUG-1368: the same reset of a bare pointer LOCAL — `loc = null;`
+                 * after `loc = a; free(a);` left loc an alias of the freed
+                 * allocation (and a view set from a weak store, BUG-1366), so a
+                 * later `if (loc) |q| { q.v }` was refused as a use after free
+                 * although loc is null. An allocation loc alone held is reported
+                 * as overwritten first. Pointer-carrying locals only: a move
+                 * struct / thread handle keep their own lifecycle rules. */
+                if (target_expr->kind == NODE_IDENT) {
+                    int bl = ir_find_local_exact_first(func, target_expr->ident.name,
+                                                       (uint32_t)target_expr->ident.name_len);
+                    IRHandleInfo *bh = (bl >= 0 && bl < func->local_count &&
+                                        ir_type_is_ptrish(func->locals[bl].type))
+                        ? ir_find_handle(ps, bl) : NULL;
+                    if (bh && !bh->is_thread_handle && !bh->is_move_local) {
+                        ir_report_overwrite(zc, func, ps, bh, -1, inst->source_line);
+                        if (bh->state == IR_HS_FREED) bh->freed_then_reset = true;
+                        else if (bh->state == IR_HS_MAYBE_FREED) bh->maybe_freed_then_reset = true;
+                        bh->state = IR_HS_UNKNOWN;
+                        bh->alloc_id = 0;
+                        bh->view_count = 0;
+                        bh->view_overflow = false;
+                        bh->view_is_slot = false;
+                        bh->view_root_local = -1;
+                    }
+                }
             }
 
             /* G5: struct/array-global FIELD/INDEX store — `g.p = n`, `g[0] = n`.
@@ -9536,6 +9868,32 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 ir_alias_slot_to_slot(zc, func, ps, target_expr, value_expr);
             /* BUG-984: the ASSIGN spelling of a view — `hp = &h;` (re)binds the
              * pointer local's view root; `hp = <anything else>` ends it. */
+            if (inst->expr->assign.op == TOK_EQ && target_expr &&
+                (target_expr->kind == NODE_FIELD || target_expr->kind == NODE_INDEX)) {
+                /* BUG-1373: the same fact for a pointer FIELD / element —
+                 * `ss.s = &s;` makes `ss.s.p` name s's slot; any other value
+                 * ends the view. */
+                Node *v = ir_peel_launder(value_expr);
+                int nroot = -1;
+                if (v && v->kind == NODE_UNARY && v->unary.op == TOK_AMP &&
+                    v->unary.operand && v->unary.operand->kind == NODE_IDENT) {
+                    int bl = ir_find_local_exact_first(func, v->unary.operand->ident.name,
+                                                       (uint32_t)v->unary.operand->ident.name_len);
+                    if (bl >= 0 && bl < func->local_count && ir_local_is_aggregate(func, bl))
+                        nroot = bl;
+                } else if (v && v->kind == NODE_IDENT) {
+                    int bl = ir_find_local_exact_first(func, v->ident.name,
+                                                       (uint32_t)v->ident.name_len);
+                    if (ir_is_stable_aggregate_ptr_local(func, bl)) nroot = bl;
+                }
+                int vr; const char *vp; uint32_t vpl;
+                if (ir_extract_compound_key(zc, func, ps, target_expr, &vr, &vp, &vpl) == 0 &&
+                    vr >= 0 && vpl > 0) {
+                    IRHandleInfo *th = ir_find_compound_handle(ps, vr, vp, vpl);
+                    if (nroot >= 0 && !th) th = ir_add_compound_handle(ps, vr, vp, vpl);
+                    if (th) th->view_root_local = nroot;
+                }
+            }
             if (inst->expr->assign.op == TOK_EQ && target_expr &&
                 target_expr->kind == NODE_IDENT) {
                 int tl = ir_find_local_exact_first(func, target_expr->ident.name,
@@ -12026,6 +12384,15 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 path[fnlen + 1] = '\0';
                 IRHandleInfo *vh = ir_find_handle(ps, vloc);
                 if (!vh) vh = ir_param_identity(func, ps, vloc, inst->source_line);   /* BUG-1080 */
+                if (vh && vh->alloc_id == 0 && vh->view_root_local >= 0) {
+                    /* BUG-1373: `SS ss = { .s = &s };` — the field is a POINTER
+                     * VIEW of the local aggregate s, so `ss.s.p` names s's slot. */
+                    int vr = vh->view_root_local;
+                    IRHandleInfo *ch = ir_add_compound_handle(ps, inst->dest_local,
+                                                              path, fnlen + 1);
+                    if (ch) ch->view_root_local = vr;
+                    continue;
+                }
                 if (!vh || vh->state != IR_HS_ALIVE || vh->alloc_id == 0) {
                     /* BUG-983: no bare handle — the field value is a STRUCT
                      * (a nested literal's temp, or a struct local) whose OWN
@@ -12045,6 +12412,10 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 if (ch) {
                     ir_apply_alias(ch, &snap);
                     ch->state = IR_HS_ALIVE;
+                    /* BUG-1373: `SS ss = { .s = hs };` — hs's slots are ss.s's. */
+                    if (ch->view_root_local < 0 &&
+                        ir_is_stable_aggregate_ptr_local(func, vloc))
+                        ch->view_root_local = vloc;
                 }
             }
         }
@@ -12273,7 +12644,15 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
         gh->alloc_id = _ir_next_alloc_id++;
         gh->source_color = ZC_COLOR_UNKNOWN;
     }
-    if (gh->alloc_id == 0 || gh->state != IR_HS_ALIVE) return;
+    /* BUG-1366: a FREED / MAYBE_FREED entry is read too — the global still
+     * holds the dangling pointer (a reset makes the entry UNKNOWN with no
+     * alloc_id), so `slot = a; free(a); if (*lp) |q| { q.v }` must hand the
+     * freed state to q. ALIVE-only let every read through a pointer of a
+     * global freed in the SAME function through without a diagnostic, while
+     * the bare-name spelling `if (slot) |q|` was refused. */
+    if (gh->alloc_id == 0 ||
+        (gh->state != IR_HS_ALIVE && gh->state != IR_HS_FREED &&
+         gh->state != IR_HS_MAYBE_FREED)) return;
     IRHandleInfo snap = *gh;
     IRHandleInfo *dh = prev ? prev : ir_add_handle(ps, inst->dest_local);
     if (!dh) return;
@@ -12288,12 +12667,99 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
     dh->state = snap.state;
     dh->alloc_id = snap.alloc_id;
     dh->alloc_line = snap.alloc_line;
+    dh->free_line = snap.free_line;
     dh->source_color = snap.source_color;
     dh->escaped = true;
 }
 
+/* BUG-1366: the READ side — `%t = *p` where p can only designate the LOCAL x
+ * reads x's value, so %t is an alias of whatever x holds (`loc = a; free(a);
+ * if (*lp) |q| { q.v }` read a recycled object). The global spelling is the
+ * BUG-1242/1289 mint (ir_value_global_key). */
+static void ir_alias_deref_read_local(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                      IRInst *inst) {
+    if (inst->op != IR_UNOP || !inst->expr || inst->expr->kind != NODE_UNARY ||
+        inst->expr->unary.op != TOK_STAR) return;
+    if (inst->dest_local < 0 || inst->dest_local >= func->local_count) return;
+    if (ir_find_handle(ps, inst->dest_local)) return;
+    Node *x = ir_ptr_stable_aim(zc, func, inst->expr->unary.operand);
+    if (!x) return;
+    int xl = ir_find_local_exact_first(func, x->ident.name, (uint32_t)x->ident.name_len);
+    if (xl < 0) return;
+    IRHandleInfo *xh = ir_find_handle(ps, xl);
+    if (!xh || xh->alloc_id == 0) return;
+    IRAliasSnapshot snap;
+    ir_snapshot_alias(&snap, xh);
+    IRHandleState st = xh->state;
+    IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
+    if (!dh) return;
+    ir_apply_alias(dh, &snap);
+    dh->state = st;
+}
+
+/* BUG-1371: the ASSIGN spelling of a call — `z = eat(a);`, `s.f = eat(a);`,
+ * `arr[0] = eat(a);` — lowers to ONE passthrough `%t = ASSIGN <NODE_ASSIGN>`
+ * with the call inside it, and no IR_CALL. Every call effect the IR_CALL
+ * transfer applies (the callee's FuncSummary: frees / moves / freed globals /
+ * store summary; the funcptr barrier; the dangling-global call window) was
+ * skipped, so `z = eat(a); a.v` read a recycled slot (exit 99) while
+ * `u32 z = eat(a);` and a bare `eat(a);` were refused — the BUG-933
+ * two-spellings shape, for calls. Returns the call to run through the IR_CALL
+ * transfer first (it executes before the store), or NULL. Only a user
+ * function or an indirect call: a builtin method / allocation keeps its
+ * dedicated ASSIGN arm (BUG-933 / BUG-981 / BUG-1024). */
+static Node *ir_assign_call_value(ZerCheck *zc, IRInst *inst) {
+    if (inst->op != IR_ASSIGN || !inst->expr || inst->expr->kind != NODE_ASSIGN) return NULL;
+    Node *v = inst->expr->assign.value;
+    if (!v || v->kind != NODE_CALL) return NULL;
+    if (ir_classify_method_call_ex(zc->checker, v) != IRMC_NONE) return NULL;
+    return v;
+}
+
 static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *func) {
+    /* BUG-1371: `x = f(args);` — see ir_assign_call_value. The store transfer
+     * runs on the instruction as written (its own arms register a factory
+     * result, a view set, a move-struct result, and check the arguments while
+     * they are still live), then the CALL's effects are applied through the
+     * IR_CALL transfer with no destination — every summary effect it has
+     * (frees, moves, freed globals, stores, barriers, the call window). A
+     * callee's effect on what the store just made is the effect it has on its
+     * own return value, which the store took from the arguments anyway. */
+    IRInst cs;
+    Node *acall = ir_assign_call_value(zc, inst);
+    if (acall) {
+        cs = *inst;
+        cs.op = IR_CALL;
+        cs.expr = acall;
+        cs.dest_local = -1;
+        cs.args = acall->call.args;            /* as lower_expr's NODE_CALL */
+        cs.arg_count = acall->call.arg_count;
+        cs.call_arg_locals = NULL;
+        cs.call_arg_local_count = 0;
+        cs.func_name = NULL;
+        cs.func_name_len = 0;
+        if (acall->call.callee && acall->call.callee->kind == NODE_IDENT) {
+            cs.func_name = acall->call.callee->ident.name;
+            cs.func_name_len = (uint32_t)acall->call.callee->ident.name_len;
+        }
+    }
+    /* BUG-1366: `*p = v` through a pointer that can only designate `x` IS the
+     * store `x = v` — run the one transfer on that spelling, so every store arm
+     * (bare local alias, global dangle registration, leak overwrite) sees it. */
+    Node *canon = inst->op == IR_ASSIGN ? ir_canon_deref_store(zc, func, inst->expr) : NULL;
+    if (canon) {
+        IRInst shadow = *inst;
+        shadow.expr = canon;
+        ir_check_inst_core(zc, ps, &shadow, func);
+        if (acall) ir_check_inst_core(zc, ps, &cs, func);   /* BUG-1371 */
+        ir_mint_global_read_view(zc, func, ps, &shadow);
+        ir_kill_index_facts(zc, func, ps, &shadow);
+        return;
+    }
     ir_check_inst_core(zc, ps, inst, func);
+    if (acall) ir_check_inst_core(zc, ps, &cs, func);   /* BUG-1371 */
+    ir_weak_deref_store(zc, func, ps, inst);         /* BUG-1366 */
+    ir_alias_deref_read_local(zc, func, ps, inst);   /* BUG-1366 */
     ir_mint_global_read_view(zc, func, ps, inst);   /* BUG-1242 */
     ir_kill_index_facts(zc, func, ps, inst);
 }
@@ -12683,9 +13149,14 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         any_xfer[i] = true;   /* BUG-1280 */
                     else
                         all_xfer[i] = false;
-                    if (h->state == IR_HS_FREED) {
+                    /* BUG-1368: a param freed and then RESET (`free(p); p = null;`)
+                     * still freed the caller's allocation — the bare-local
+                     * sibling of BUG-985's slot rule. */
+                    if (h->state == IR_HS_FREED ||
+                        (h->state == IR_HS_UNKNOWN && h->freed_then_reset)) {
                         maybe_frees[i] = true;  /* definitely seen on this path */
-                    } else if (h->state == IR_HS_MAYBE_FREED) {
+                    } else if (h->state == IR_HS_MAYBE_FREED ||
+                               (h->state == IR_HS_UNKNOWN && h->maybe_freed_then_reset)) {
                         maybe_frees[i] = true;
                         all_return_blocks_freed[i] = false;
                     } else {

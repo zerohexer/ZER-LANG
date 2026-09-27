@@ -171,6 +171,13 @@ typedef struct {
     int auto_slab_count;
     int auto_slab_capacity;
     int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
+    int target_access_bits; /* BUG-1375: widest single (untearable) access; <= target_ptr_bits */
+    /* BUG-1372: AST nodes ir_lower rewrote IN PLACE to name a hoisted temp,
+     * with their original contents, keyed on the function lowered. A function
+     * lowered again (the zercheck shim, then the emitter) is restored first, so
+     * every lowering hoists from the program as written. */
+    struct ZerHoistUndo { Node *node; Node *func; Node saved; } *hoist_undo;
+    int hoist_undo_n, hoist_undo_cap;
     /* Fix #4 (2026-05-02): @probe behavior selector via --probe-mode flag.
      *   0 = HOSTED (default) — install signal handler, return null on fault
      *   1 = RAW              — direct read, no fault recovery (freestanding ok)
@@ -604,6 +611,10 @@ enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
 typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
+/* BUG-1366: is this GLOBAL never assigned or address-taken anywhere in the
+ * program (every registered body AND every global initializer)? The one query
+ * anything trusting a global's declaration initializer asks. */
+bool checker_global_never_mutated(Checker *c, Symbol *sym);
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */

@@ -1992,3 +1992,51 @@ zercheck_ir.c:ir_ps_value:NODE_TYPECAST:typecast.expr
 zercheck_ir.c:ir_ps_value:NODE_VAR_DECL:var_decl.init
 zercheck_ir.c:ir_ps_value:NODE_WHILE:while_stmt.body
 zercheck_ir.c:ir_ps_value:NODE_WHILE:while_stmt.cond
+
+# --- ir_lower.c: hoist_place_effects (BUG-1372) ---
+# A PLACE walker: it descends only the lvalue chain (FIELD object, INDEX object +
+# index, deref operand) and lowers any other kind WHOLE into a temp when it may
+# write, so no child of those kinds needs visiting (the hoist_target_indices shape).
+ir_lower.c:hoist_place_effects:NODE_ASM:asm_stmt.inputs
+ir_lower.c:hoist_place_effects:NODE_ASM:asm_stmt.outputs
+ir_lower.c:hoist_place_effects:NODE_ASSIGN:assign.target
+ir_lower.c:hoist_place_effects:NODE_ASSIGN:assign.value
+ir_lower.c:hoist_place_effects:NODE_AWAIT:await_stmt.cond
+ir_lower.c:hoist_place_effects:NODE_BINARY:binary.left
+ir_lower.c:hoist_place_effects:NODE_BINARY:binary.right
+ir_lower.c:hoist_place_effects:NODE_BLOCK:block.stmts
+ir_lower.c:hoist_place_effects:NODE_CALL:call.args
+ir_lower.c:hoist_place_effects:NODE_CALL:call.callee
+ir_lower.c:hoist_place_effects:NODE_CRITICAL:critical.body
+ir_lower.c:hoist_place_effects:NODE_DEFER:defer.body
+ir_lower.c:hoist_place_effects:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:hoist_place_effects:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:hoist_place_effects:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:hoist_place_effects:NODE_FILE:file.decls
+ir_lower.c:hoist_place_effects:NODE_FOR:for_stmt.body
+ir_lower.c:hoist_place_effects:NODE_FOR:for_stmt.cond
+ir_lower.c:hoist_place_effects:NODE_FOR:for_stmt.init
+ir_lower.c:hoist_place_effects:NODE_FOR:for_stmt.step
+ir_lower.c:hoist_place_effects:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:hoist_place_effects:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:hoist_place_effects:NODE_IF:if_stmt.cond
+ir_lower.c:hoist_place_effects:NODE_IF:if_stmt.else_body
+ir_lower.c:hoist_place_effects:NODE_IF:if_stmt.then_body
+ir_lower.c:hoist_place_effects:NODE_INTERRUPT:interrupt.body
+ir_lower.c:hoist_place_effects:NODE_INTRINSIC:intrinsic.args
+ir_lower.c:hoist_place_effects:NODE_ONCE:once.body
+ir_lower.c:hoist_place_effects:NODE_ORELSE:orelse.expr
+ir_lower.c:hoist_place_effects:NODE_ORELSE:orelse.fallback
+ir_lower.c:hoist_place_effects:NODE_RETURN:ret.expr
+ir_lower.c:hoist_place_effects:NODE_SLICE:slice.end
+ir_lower.c:hoist_place_effects:NODE_SLICE:slice.object
+ir_lower.c:hoist_place_effects:NODE_SLICE:slice.start
+ir_lower.c:hoist_place_effects:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:hoist_place_effects:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:hoist_place_effects:NODE_STRUCT_INIT:struct_init.fields
+ir_lower.c:hoist_place_effects:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:hoist_place_effects:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:hoist_place_effects:NODE_TYPECAST:typecast.expr
+ir_lower.c:hoist_place_effects:NODE_VAR_DECL:var_decl.init
+ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.body
+ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.cond

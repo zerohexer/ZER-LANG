@@ -1,0 +1,19 @@
+// expect-error: use after free
+// BUG-1373: a projection through a POINTER FIELD (`ss.s.p` with `ss.s = &s`)
+// was keyed under ss, so the store never aliased `s.p` and the read of `s.p`
+// after `free(a)` returned a recycled object (exit 99).
+struct T { u32 v; }
+struct S { *T p; }
+struct SS { *S s; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    S s;
+    SS ss = { .s = &s };
+    ss.s.p = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = s.p.v;
+    free(b);
+    return r;
+}

@@ -5,6 +5,106 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-27 — BUG-1366..1376: harvest of `loving-bohr-jyw9if`, then stores through pointers, call effects of the assign spelling, root-first places, lock order
+
+Harvest: `origin/claude/loving-bohr-jyw9if` (17 commits, a strict superset of
+`loving-bohr-qzn39v` and `review/25092026`, forked exactly at main) — fast-forwarded;
+`make check` green on it before anything else changed (MAKE_CHECK_EXIT=0). Then own probes
+plus three read-only probe agents (emitter values, allocation tracker, bare-metal /
+concurrency). Every fix below was A/B-measured against the post-harvest build; every new
+negative was confirmed to FIRE there.
+
+- **BUG-1366 — a store or read THROUGH a pointer that can only name one object was not
+  that object's store / read.** `?*T loc; *?*T lp = &loc; *lp = a; free(a); if (loc) |q| {
+  q.v }` returned a recycled object (exit 99) — a single-function use-after-free — and the
+  global spellings (`*gpp = a` with `*?*T gpp = &slot`, a callee `void reg(*T p) { *gpp =
+  p; }`, and the read `if (*lp) |q|`) were all silent (the documented MEDIUM residual of the
+  memory round was the global half). ONE query `ir_ptr_stable_aim` (a local bound once,
+  never reassigned or address-taken, defined `&x`; or a global initialised `&x` that
+  `checker_global_never_mutated` proves is never re-aimed) canonicalises `*p = v` into `x =
+  v` (`ir_canon_deref_store`, run on the ONE transfer) and resolves `*p` in the store
+  summary (`ir_ps_target_rec`) and on reads (`ir_alias_deref_read_local`, and the global
+  mint `ir_value_global_key`). A pointer re-aimed between several objects makes a WEAK store
+  (`ir_ptr_aim_set` / `ir_weak_deref_store`): each candidate gets the allocation in its view
+  set, the representation a wildcard array slot already uses. Found beside it: the global
+  read-view mint handed on only an ALIVE entry, so `slot = a; free(a); if (*lp) |q|` passed
+  while `if (slot) |q|` was refused — FREED/MAYBE_FREED now flow (with the free line).
+  Gate: SHAPE p53 in `tools/sink_matrix.sh` (10 cells, 8 HOLE + 1 OVER-REJECT pre-fix).
+- **BUG-1367 — `global_name_never_mutated` did not look at GLOBAL INITIALIZERS.** `volatile
+  *u32 r = @inttoptr(*u32, 0x40000000); volatile *volatile *u32 rr = &r;` then `*rr =
+  @inttoptr(*u32, 0x400000F0); r[10]` trusted r's declaration bound and read 0x40000118 —
+  outside every mmio range, no check emitted. The same query licenses funcptr resolution
+  and now the BUG-1366 aim. Test: `tests/zer_fail/mmio_bound_global_addr_in_global_init_bug1367.zer`.
+- **BUG-1368 — `loc = null;` did not end a pointer LOCAL's alias of a freed allocation**
+  (the field form `h.p = null;` and globals did): a later `if (loc) |q|` was a false
+  use-after-free. The bare-local sibling of BUG-982's reset, with the overwrite (leak) check
+  first; a param freed then reset still summarises as freeing it (`freed_then_reset`).
+  Test: `tests/zer/local_ptr_reset_after_free_bug1368.zer`.
+- **BUG-1369 — a `const` global read from an interrupt handler and from main was refused
+  "must be declared volatile"** — unfollowable advice for a constant; the spawn scan always
+  exempted const (not a const POINTER / slice, whose pointee is still shared, BUG-1249's
+  form). The two sinks now agree; `tests/test_hw_matrix.c` SITE x SHAPE gained two const cells.
+- **BUG-1370 — a `volatile` POINTER global's WORD was emitted plain.** The checker treats
+  `volatile ?volatile *u32 g` as a volatile single-word cell (the ISR / thread published-
+  pointer exemption rests on it) but the prefix `volatile` landed on the pointee in C
+  (`volatile volatile uint32_t* g`), so `while (g == null) { }` compiled to `jmp .` at -O2.
+  A pointer global that is written anywhere is now `T* volatile g` (also a static pointer
+  local); a never-written one (the `@inttoptr` MMIO base) stays plain. A pointer to a
+  qualified pointer is spelled postfix (`volatile uint32_t* volatile*`), which the old
+  prefix form could not express. Gate: required fingerprint in `tools/emit_audit.sh`
+  (RED on the pre-fix build).
+- **BUG-1371 — the ASSIGN spelling of a call skipped every call effect.** `z = eat(a);` (or
+  `s.f = …`, `arr[0] = …`) lowers to ONE passthrough `IR_ASSIGN <NODE_ASSIGN>` with no
+  IR_CALL, so the callee summary (frees, moves, freed globals, store summary), the funcptr
+  barrier and the dangling-global call window were all skipped: a single-function UAF,
+  double free and use-after-move compiled while `u32 z = eat(a);` was refused. The store
+  transfer runs as written, then the IR_CALL transfer runs on the call with no destination
+  (`ir_assign_call_value`); the store-summary scan follows the call inside an assignment too.
+  The two spellings now agree, which also surfaced a genuine leak the assign spelling of
+  `tests/zer_fail/multiview_*` had hidden. Gate: SHAPE p54 (5 of 6 reject cells HOLE pre-fix).
+- **BUG-1372 — a fixed-array PLACE was evaluated index-first, and a shared-lock root once per
+  lock / operation / unlock.** The emitter's single-evaluation bounds form reads the index
+  before the object (`size_t i = (IDX); check; &OBJ[i]`), so `m[next()][next()]` read m[2][1]
+  and `pick().a[k].b = 5` used k before `pick()` set it (reference.md: left to right). And
+  the lock root of `pick().v += 1` on a shared struct was emitted at the lock, the operation
+  and the unlock — pick() ran five times, the mutex of g1 guarded a write to g2 (race). ONE
+  lowering step `hoist_place_effects` evaluates a place's parts root-first into temps and
+  rewrites the node IN PLACE, so the lock instruction and the passthrough see one value;
+  called for a fixed-array read / field read, an assignment target, and every lock root
+  (statement, condition, for-step). The rewrites are recorded on the Checker and undone
+  when the same function is lowered again (the zercheck shim, then the emitter —
+  `test_firmware` caught the double lowering). Tests:
+  `tests/zer/eval_order_fixed_array_place_bug1372.zer`,
+  `tests/zer/shared_lock_root_single_eval_bug1372.zer` (both exit 1 pre-fix).
+- **BUG-1373 — an allocation reached through a POINTER FIELD of a struct was untracked.**
+  `SS ss = { .s = &s }; ss.s.p = a; free(a); s.p.v` (and the callee store `put(&ss, a)`, a
+  copy `*S q = ss.s`, the read `ss.s.p.v`, a callee read `rd(&ss)`, a heap carrier
+  `{ .s = hs }`, and the double free `free(s.p)`) all ran exit 99 / silently. A pointer
+  field that views a local aggregate (or a stable pointer local) records the view
+  (`view_root_local` on the compound entry — the field-level sibling of BUG-984's local),
+  and ONE re-rooting `ir_reroot_views` makes `(ss, ".s.p")` name `(s, ".p")` at every sink;
+  a call handed `&ss` is checked for freed pointers in what it reaches through the field.
+  Gate: SHAPE p55 (7 HOLE + 1 OVER-REJECT pre-fix).
+- **BUG-1374 — `&pool.get(h).v` handed to a scoped spawn lent nothing.** The borrow walk
+  needed a named root under the `&`; the object was a call. Freeing h in the window let the
+  thread write the recycled slot, a live object the parent had since allocated (exit 99),
+  while `&h.v` was refused. The `&` of a call-rooted place lends what the call reaches, and
+  a HANDLE stands for its slot like a pointer does. Test:
+  `tests/zer_fail/spawn_borrow_pool_get_bug1374.zer`.
+- **BUG-1375 — on AVR a `volatile u16` shared between an ISR and main was accepted as one
+  word.** The exemption compared against the POINTER width (16); AVR's data path is 8 bits,
+  so a u16 (and a 16-bit pointer) is two accesses and tears. `zer_target_access_bits` (8
+  when the target probe reports `__AVR__`) bounds the exemption. Test:
+  `tests/zer_fail/avr_u16_isr_tear_bug1375.zer` via `tests/support/fake_avr_gcc.sh` (a probe
+  stand-in, so the rule is testable on any host).
+- **BUG-1376 — the compiler's own locks deadlocked.** A statement touching two instances of
+  ONE shared type (the B1 multi-root lock) acquired them in SOURCE order, so `g1.v = g2.v +
+  1;` in one thread and `g2.v = g1.v + 1;` in another hung (measured 3/3, `timeout` 124) —
+  with no lock written by the user. The statement's locks are now one group (the first
+  IR_LOCK carries its size) acquired in ADDRESS order at run time. Test:
+  `tests/zer/shared_same_type_lock_order_bug1376.zer` (the runner's timeout makes a hang a
+  FAIL).
+
 ## Session 2026-09-26 — BUG-1326..1359: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
 
 Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict

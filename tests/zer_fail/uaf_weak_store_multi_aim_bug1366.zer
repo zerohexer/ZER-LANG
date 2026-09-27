@@ -1,0 +1,22 @@
+// expect-error: may be a view of 'a'
+// BUG-1366: `*lp = a` where lp may designate l1 OR l2 is a WEAK store into
+// both. It had no key at all, so neither aliased `a` and reading l1 after
+// `free(a)` returned a recycled object.
+struct T { u32 v; }
+u32 pick(u32 x) { return x; }
+u32 main() {
+    ?*T l1 = null;
+    ?*T l2 = null;
+    *?*T lp = &l1;
+    if (pick(1) == 2) { lp = &l2; }
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    *lp = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (l1) |q| { r = q.v; }
+    free(b);
+    return r;
+}

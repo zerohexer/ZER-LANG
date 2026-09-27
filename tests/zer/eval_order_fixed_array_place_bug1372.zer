@@ -1,0 +1,30 @@
+// BUG-1372: a FIXED-array place is evaluated root-first — the object before
+// its index, the outer index before the inner. The emitter's single-evaluation
+// bounds form read the index first, so `m[next()][next()]` read m[2][1] and
+// `pick().a[k].b = 5` used k before pick() changed it.
+struct In { u32 b; }
+struct Out { In[3] a; }
+Out go;
+u32 k = 0;
+u32 n = 0;
+u32 next() { n += 1; return n; }
+*Out pick() { k = 1; return &go; }
+struct S { u32[3] v; }
+S mk() { k = 2; S s; s.v[2] = 42; return s; }
+u32 main() {
+    u32[3][3] m;
+    m[1][2] = 12;
+    m[2][1] = 21;
+    u32 v = m[next()][next()];
+    if (v != 12) { return 1; }
+    k = 0;
+    pick().a[k].b = 5;
+    if (go.a[1].b != 5) { return 2; }
+    go.a[1].b = 7;
+    k = 0;
+    u32 w = pick().a[k].b;
+    if (w != 7) { return 3; }
+    k = 0;
+    if (mk().v[k] != 42) { return 4; }
+    return 0;
+}

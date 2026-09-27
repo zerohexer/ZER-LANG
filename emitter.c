@@ -1024,6 +1024,9 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
 }
 
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len);
+static bool global_is_ptr_shaped(Type *type);   /* BUG-1370 */
+static void emit_global_decl_name(Emitter *e, Type *type, const char *name,
+                                  uint32_t len, bool word_vol);
 /* BUG-1111: ONE function-declarator emitter for the prototype path and the IR
  * definition path. A function RETURNING a function pointer needs C's nested
  * declarator `RET (*name(params))(fp_args)`; only the definition path knew, so a
@@ -2407,6 +2410,22 @@ static void emit_type(Emitter *e, Type *t) {
             if (t->pointer.is_const) emit(e, "const ");
             if (t->pointer.is_volatile) emit(e, "volatile ");
             emit(e, "_zer_opaque");
+        } else if ((t->pointer.is_const || t->pointer.is_volatile) &&
+                   global_is_ptr_shaped(t->pointer.inner) &&
+                   type_dispatch_kind(type_unwrap_distinct(t->pointer.inner)) != TYPE_FUNC_PTR &&
+                   !(type_dispatch_kind(type_unwrap_distinct(t->pointer.inner)) == TYPE_OPTIONAL &&
+                     type_dispatch_kind(type_unwrap_distinct(
+                         type_unwrap_distinct(t->pointer.inner)->optional.inner)) == TYPE_FUNC_PTR)) {
+            /* BUG-1370: a pointer to a QUALIFIED POINTER (`volatile *volatile *u32`,
+             * the type of `&r` for a volatile pointer global r). A C prefix
+             * qualifier binds to the innermost base type, so the old spelling
+             * `volatile volatile uint32_t**` described a pointer to a pointer to
+             * volatile u32 — the middle qualifier was lost. The postfix form
+             * qualifies exactly the pointed-at pointer object. */
+            emit_type(e, t->pointer.inner);
+            if (t->pointer.is_const) emit(e, " const");
+            if (t->pointer.is_volatile) emit(e, " volatile");
+            emit(e, "*");
         } else {
             if (t->pointer.is_const) emit(e, "const ");
             if (t->pointer.is_volatile) emit(e, "volatile ");
@@ -6389,6 +6408,64 @@ static void emit_early_async_structs(Emitter *e, Node *file_node) {
     }
 }
 
+/* BUG-1370: is this global POINTER-shaped — `*T`, a null-sentinel `?*T`, a
+ * funcptr or `?funcptr` — so that a declaration-level `volatile` must not be
+ * emitted as a C prefix (which binds to the pointee)? */
+static bool global_is_ptr_shaped(Type *type) {
+    Type *t = type ? type_unwrap_distinct(type) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL && is_null_sentinel(t->optional.inner))
+        t = type_unwrap_distinct(t->optional.inner);
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_POINTER || k == TYPE_FUNC_PTR;
+}
+
+/* BUG-1370: must the pointer WORD of this `volatile` global be a C volatile
+ * object? The checker treats a `volatile` pointer global as a volatile
+ * single-word cell — the race exemption for the published-pointer idiom
+ * (`volatile ?volatile *u32 g = null;` set by an ISR, polled by main) rests on
+ * it — but the word was emitted plain, so `while (g == null) { }` compiled to
+ * `jmp .` at -O2 (the load hoisted out of the loop). The word is made volatile
+ * whenever the global can change: a pointer global that is const or never
+ * assigned / address-taken anywhere holds one value, and keeping it plain lets
+ * GCC fold the MMIO base address of the `volatile *u32 reg = @inttoptr(...)`
+ * idiom exactly as before. */
+static bool global_ptr_word_volatile(Emitter *e, Node *node, Type *type) {
+    if (!node->var_decl.is_volatile || !global_is_ptr_shaped(type)) return false;
+    Symbol *s = NULL;
+    if (e->current_module) {
+        uint32_t mlen = e->current_module_len + 2 + (uint32_t)node->var_decl.name_len;
+        char *mangled = (char *)arena_alloc(e->arena, mlen + 1);
+        if (mangled) {
+            memcpy(mangled, e->current_module, e->current_module_len);
+            mangled[e->current_module_len] = '_';
+            mangled[e->current_module_len + 1] = '_';
+            memcpy(mangled + e->current_module_len + 2, node->var_decl.name,
+                   node->var_decl.name_len);
+            mangled[mlen] = '\0';
+            s = scope_lookup(e->checker->global_scope, mangled, mlen);
+        }
+    }
+    if (!s) s = scope_lookup(e->checker->global_scope, node->var_decl.name,
+                             (uint32_t)node->var_decl.name_len);
+    if (s && (s->is_const || checker_global_never_mutated(e->checker, s))) return false;
+    return true;
+}
+
+/* The declarator of a global: `volatile` inside it (after the stars) when the
+ * pointer word is volatile — valid for every pointer-shaped declarator
+ * emit_type_and_name produces (`T* volatile g`, `R (*volatile g)(…)`). */
+static void emit_global_decl_name(Emitter *e, Type *type, const char *name,
+                                  uint32_t len, bool word_vol) {
+    if (!word_vol) { emit_type_and_name(e, type, name, len); return; }
+    char *nm = (char *)arena_alloc(e->arena, (size_t)len + 10);
+    if (!nm) { emit_type_and_name(e, type, name, len); return; }
+    memcpy(nm, "volatile ", 9);
+    memcpy(nm + 9, name, len);
+    nm[len + 9] = '\0';
+    emit_type_and_name(e, type, nm, len + 9);
+}
+
 static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
     /* BUG-997: mark the global-initializer context for the whole emission, so a
@@ -6464,8 +6541,13 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     }
 
     if (node->var_decl.is_static) emit(e, "static ");
-    /* volatile on non-pointer scalars (pointers handled above) */
-    if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
+    /* volatile on non-pointer scalars. A POINTER-shaped global (`*T`, `?*T`,
+     * a funcptr) spells its pointee's volatile in the TYPE; a prefix here would
+     * land on the pointee in C too (`volatile ?*u32 g` became `volatile
+     * uint32_t* g` — pointer to volatile, the word itself plain). BUG-1370: the
+     * WORD is volatile via global_ptr_word_volatile below. */
+    bool word_vol = global_ptr_word_volatile(e, node, type);
+    if (node->var_decl.is_volatile && !global_is_ptr_shaped(type))
         emit(e, "volatile ");
     /* BUG-1115: a ZER `const` global is read-only by the checker's rules and was
      * emitted as a plain C object — so it occupied RAM (.data) rather than flash
@@ -6495,9 +6577,10 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         mangled[e->current_module_len + 1] = '_';
         memcpy(mangled + e->current_module_len + 2, node->var_decl.name, node->var_decl.name_len);
         mangled[mlen] = '\0';
-        emit_type_and_name(e, type, mangled, (int)mlen);
+        emit_global_decl_name(e, type, mangled, mlen, word_vol);
     } else {
-        emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
+        emit_global_decl_name(e, type, node->var_decl.name,
+                              (uint32_t)node->var_decl.name_len, word_vol);
     }
 
     if (node->var_decl.init) {
@@ -13334,6 +13417,50 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * the root ident; src2_local encodes write-lock (1) vs
          * read-lock (0) for shared(rw) structs. Reuses the same
          * emit_shared_lock_mode helper the AST path uses. */
+        /* BUG-1376: a statement's lock GROUP (the first lock carries its size,
+         * the members follow it in this block) is acquired in ADDRESS order —
+         * the same order in every thread — so two statements locking the same
+         * instances in opposite source order cannot deadlock. Members were
+         * emitted by the group and are skipped here. */
+        if (inst->literal_int == -1) break;
+        if (inst->literal_int >= 2 && inst->expr) {
+            int n = (int)inst->literal_int;
+            bool ok = true;
+            for (int k = 1; k < n; k++)
+                if (inst[k].op != IR_LOCK || inst[k].literal_int != -1 || !inst[k].expr) ok = false;
+            if (ok) {
+                emit_indent(e);
+                emit(e, "{ uintptr_t _zer_la[%d] = { ", n);
+                for (int k = 0; k < n; k++) {
+                    Type *rt = checker_get_type(e->checker, inst[k].expr);
+                    bool is_ptr = type_dispatch_kind(rt) == TYPE_POINTER;
+                    emit(e, "%s(uintptr_t)%s(", k ? ", " : "", is_ptr ? "" : "&");
+                    emit_expr(e, inst[k].expr);
+                    emit(e, ")");
+                }
+                emit(e, " };\n");
+                emit_indent(e);
+                emit(e, "  int _zer_lo[%d]; for (int _zer_i = 0; _zer_i < %d; _zer_i++) _zer_lo[_zer_i] = _zer_i;\n", n, n);
+                emit_indent(e);
+                emit(e, "  for (int _zer_i = 1; _zer_i < %d; _zer_i++) { int _zer_k = _zer_lo[_zer_i]; int _zer_j = _zer_i;"
+                        " while (_zer_j > 0 && _zer_la[_zer_lo[_zer_j - 1]] > _zer_la[_zer_k]) { _zer_lo[_zer_j] = _zer_lo[_zer_j - 1]; _zer_j--; }"
+                        " _zer_lo[_zer_j] = _zer_k; }\n", n);
+                emit_indent(e);
+                emit(e, "  for (int _zer_i = 0; _zer_i < %d; _zer_i++) switch (_zer_lo[_zer_i]) {\n", n);
+                for (int k = 0; k < n; k++) {
+                    emit_indent(e);
+                    emit(e, "  case %d: {\n", k);
+                    emit_shared_lock_mode(e, inst[k].expr, inst[k].src2_local != 0);
+                    emit_indent(e);
+                    emit(e, "  } break;\n");
+                }
+                emit_indent(e);
+                emit(e, "  default: break; }\n");
+                emit_indent(e);
+                emit(e, "}\n");
+                break;
+            }
+        }
         if (inst->expr) {
             emit_shared_lock_mode(e, inst->expr, inst->src2_local != 0);
         }
@@ -15232,12 +15359,20 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * qualifier here. Skip pointer/slice — their volatile is already in the
          * emitted type (`volatile uint32_t *`); an outer prefix would change meaning
          * (volatile-pointer vs pointer-to-volatile). */
-        if (l->is_volatile && l->type) {
+        /* BUG-1370: a STATIC pointer local is one object shared by every
+         * execution of its function — an interrupt handler and main, two
+         * threads — exactly like a global, so its `volatile` is the WORD's
+         * (the pointee's volatile is already in the type). */
+        bool static_word_vol = l->is_static && l->is_volatile && global_is_ptr_shaped(l->type);
+        if (l->is_volatile && l->type && !static_word_vol) {
             TypeKind vtk = type_dispatch_kind(l->type);
             if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
                 emit(e, "volatile ");
         }
-        emit_type_and_name(e, l->type, l->name, l->name_len);
+        if (static_word_vol)
+            emit_global_decl_name(e, l->type, l->name, (uint32_t)l->name_len, true);
+        else
+            emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
             /* BUG-1315: a static's initializer is a C CONSTANT expression. An
              * integer one is folded the way a global's is (BUG-1090 typed fold):

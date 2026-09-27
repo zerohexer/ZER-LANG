@@ -683,6 +683,133 @@ static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body
     }
 }
 
+/* BUG-1372: make a PLACE expression (`m[i][j]`, `pick().a[k].b`, the lock root
+ * of a shared access) free of effects, evaluating its parts ROOT-FIRST into
+ * temps here. Two defects shared this cause:
+ *   - a fixed array keeps its place in the passthrough C, and the emitter's
+ *     single-evaluation bounds form reads the INDEX before the OBJECT
+ *     (`size_t i = (IDX); check; &OBJ[i]`), so `m[next()][next()]` read m[2][1]
+ *     and `pick().a[k].b = 5` used k before pick() set it — against the
+ *     documented left-to-right order;
+ *   - a shared-struct lock root is emitted once per lock, operation and
+ *     unlock: `pick().v += 1` called pick() five times, locking one object and
+ *     writing another (a data race).
+ * Every part that may write, and — once the place may write at all — every
+ * non-constant index and dereferenced operand before it, is lowered into a temp,
+ * and the node is overwritten IN PLACE with the temp's name, so every holder of
+ * the node (a lock instruction, the passthrough) sees the one value. Only
+ * called when lower_may_write(place). */
+static bool hoist_place_part_const(Node *n) {
+    return n && (n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT ||
+                 n->kind == NODE_BOOL_LIT || n->kind == NODE_SIZEOF);
+}
+static void hoist_place_to_temp(LowerCtx *ctx, Node *n, bool snapshot) {
+    int line = n->loc.line;
+    SrcLoc loc = n->loc;
+    /* Lower a COPY: the instructions lower_expr emits keep a pointer to the
+     * node they lower (inst.expr), and the node itself is overwritten below. */
+    Node *cp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+    if (!cp) return;
+    *cp = *n;
+    Type *nt = checker_get_type(ctx->checker, n);
+    if (nt) checker_set_type(ctx->checker, cp, nt);
+    int id = lower_expr(ctx, cp);
+    if (id < 0) return;
+    if (snapshot) id = snapshot_operand(ctx, id, line);
+    Node *ident = make_local_ident(ctx, &ctx->func->locals[id], loc);
+    Checker *ck = ctx->checker;
+    if (ck->hoist_undo_n >= ck->hoist_undo_cap) {
+        int nc = ck->hoist_undo_cap ? ck->hoist_undo_cap * 2 : 16;
+        struct ZerHoistUndo *nu = (struct ZerHoistUndo *)arena_alloc(ck->arena,
+            (size_t)nc * sizeof(struct ZerHoistUndo));
+        if (!nu) return;   /* no undo record: leave the node as written */
+        if (ck->hoist_undo_n)
+            memcpy(nu, ck->hoist_undo, (size_t)ck->hoist_undo_n * sizeof(struct ZerHoistUndo));
+        ck->hoist_undo = nu;
+        ck->hoist_undo_cap = nc;
+    }
+    ck->hoist_undo[ck->hoist_undo_n].node = n;
+    ck->hoist_undo[ck->hoist_undo_n].func = ctx->func->ast_node;
+    ck->hoist_undo[ck->hoist_undo_n].saved = *n;
+    ck->hoist_undo_n++;
+    *n = *ident;
+}
+
+/* BUG-1372: undo the previous lowering's in-place hoists of `fn`, newest first. */
+static void hoist_restore(Checker *ck, Node *fn) {
+    int w = 0;
+    for (int i = ck->hoist_undo_n - 1; i >= 0; i--)
+        if (ck->hoist_undo[i].func == fn) *ck->hoist_undo[i].node = ck->hoist_undo[i].saved;
+    for (int i = 0; i < ck->hoist_undo_n; i++) {
+        if (ck->hoist_undo[i].func == fn) continue;
+        ck->hoist_undo[w++] = ck->hoist_undo[i];
+    }
+    ck->hoist_undo_n = w;
+}
+/* Does this place's projection chain index a FIXED array (the shape kept whole
+ * in the passthrough)? */
+static bool place_has_array_index(LowerCtx *ctx, Node *n) {
+    while (n) {
+        if (n->kind == NODE_INDEX) {
+            Type *ot = checker_get_type(ctx->checker, n->index_expr.object);
+            if (ot && type_dispatch_kind(ot) == TYPE_ARRAY) return true;
+            n = n->index_expr.object;
+        } else if (n->kind == NODE_FIELD) {
+            n = n->field.object;
+        } else if (n->kind == NODE_UNARY && n->unary.op == TOK_STAR) {
+            n = n->unary.operand;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+static void hoist_place_effects(LowerCtx *ctx, Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case NODE_FIELD:
+        hoist_place_effects(ctx, n->field.object);
+        return;
+    case NODE_INDEX:
+        hoist_place_effects(ctx, n->index_expr.object);
+        if (n->index_expr.index && !hoist_place_part_const(n->index_expr.index))
+            hoist_place_to_temp(ctx, n->index_expr.index, true);
+        return;
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && n->unary.operand) {
+            Node *o = n->unary.operand;
+            if (o->kind == NODE_IDENT) hoist_place_to_temp(ctx, o, true);
+            else if (o->kind == NODE_FIELD || o->kind == NODE_INDEX ||
+                     (o->kind == NODE_UNARY && o->unary.op == TOK_STAR)) {
+                hoist_place_effects(ctx, o);
+                if (lower_may_write(o)) hoist_place_to_temp(ctx, o, false);
+            } else if (lower_may_write(o)) {
+                hoist_place_to_temp(ctx, o, false);
+            }
+        }
+        return;
+    case NODE_CALL: case NODE_ORELSE: case NODE_ASSIGN: case NODE_INTRINSIC:
+    case NODE_TYPECAST:
+        /* a value computed at the root (`pick()`, `mk()`): once, here */
+        if (lower_may_write(n)) hoist_place_to_temp(ctx, n, false);
+        return;
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return;
+    }
+}
+
 /* Lower one expression to a local ID.
  * Creates temp locals and emits instructions for each sub-expression.
  * Returns the local ID holding the result, or -1 for void/error. */
@@ -884,6 +1011,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * Complex types (Handle auto-deref, opaque, builtins, slices, arrays,
      * enums) go to passthrough → emit_expr handles the full logic. ---- */
     case NODE_FIELD: {
+        /* BUG-1372: a field read through a FIXED-array element whose place has
+         * effects (`pick().a[k].b`) keeps that place in the passthrough C,
+         * where the bounds form reads the index before the object. */
+        if (lower_may_write(expr) && place_has_array_index(ctx, expr)) {
+            hoist_place_effects(ctx, expr);
+            goto passthrough;
+        }
         /* Non-local objects (enum type, module prefix) → passthrough */
         if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
             int obj_id = ir_find_local(ctx->func,
@@ -993,6 +1127,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 /* BUG-1179: an index that may WRITE (`a[i + seti(&i)]`) is
                  * lowered too, so its operands evaluate left to right in 3AC
                  * instead of as one unsequenced C expression. */
+                if (lower_may_write(expr->index_expr.object)) {   /* BUG-1372 */
+                    hoist_place_effects(ctx, expr);
+                    goto passthrough;
+                }
                 if (expr->index_expr.index &&
                     (expr->index_expr.index->kind == NODE_ORELSE ||
                      lower_may_write(expr->index_expr.index))) {
@@ -1166,6 +1304,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         bool plain_sc = false;
         bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
         ctx->assign_stmt_pos = false;
+        if (lower_may_write(expr->assign.target))                  /* BUG-1372 */
+            hoist_place_effects(ctx, expr->assign.target);
         if (lower_may_write(expr->assign.value)) {                 /* BUG-1184 */
             Node *fb = (ctx->func->ast_node &&
                         ctx->func->ast_node->kind == NODE_FUNC_DECL)
@@ -2249,6 +2389,7 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     if (!cond) return NULL;
     Node *root = find_shared_root_expr(ctx->checker, cond);
     if (!root) return NULL;
+    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
     /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
@@ -2303,27 +2444,41 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
+    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
+    Node *se = stmt_shared_expr_ir(stmt);
+    SharedRootVec rv; srv_init(&rv);
+    if (se) find_all_shared_roots_expr(ctx->checker, se, &rv);
+    /* BUG-1376: the statement's locks are ONE group. Held together, two
+     * instances of one shared type locked in SOURCE order deadlock against
+     * another statement naming them the other way round (`g1.v = g2.v + 1;` in
+     * one thread, `g2.v = g1.v + 1;` in another — measured hang). The first
+     * lock carries the group size (literal_int); the emitter acquires the whole
+     * group in ADDRESS order, the same order in every thread. */
+    int group_n = 1;
+    for (int i = 0; i < rv.count; i++) if (rv.items[i] != root) group_n++;
+    for (int i = 0; i < rv.count; i++)       /* BUG-1372: before any lock */
+        if (rv.items[i] != root && lower_may_write(rv.items[i]))
+            hoist_place_effects(ctx, rv.items[i]);
     IRInst lock = make_inst(IR_LOCK, stmt->loc.line);
     lock.expr = root;
     lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
+    lock.literal_int = group_n;
     emit_inst(ctx, lock);
-    Node *se = stmt_shared_expr_ir(stmt);
     if (se) {
-        SharedRootVec rv; srv_init(&rv);
-        find_all_shared_roots_expr(ctx->checker, se, &rv);
         for (int i = 0; i < rv.count; i++) {
             if (rv.items[i] == root) continue; /* primary already locked */
             IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
             l2.expr = rv.items[i];
             l2.src2_local = 0; /* read lock for extras */
+            l2.literal_int = -1;               /* BUG-1376: a group member */
             emit_inst(ctx, l2);
             /* BUG-935: the UNLOCK replays this set, so a root locked here and
              * dropped from extra_out would be locked and never released. The
              * caller's vector grows with this one. */
             if (extra_out) srv_push(extra_out, rv.items[i]);
         }
-        srv_free(&rv);
     }
+    srv_free(&rv);
 }
 
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
@@ -3529,6 +3684,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
+            if (step_root && lower_may_write(step_root))
+                hoist_place_effects(ctx, step_root);                 /* BUG-1372 */
             if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
                 lock.expr = step_root;
@@ -4839,6 +4996,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     Checker *checker = (Checker *)checker_ptr;
     if (!func_decl || func_decl->kind != NODE_FUNC_DECL || !func_decl->func_decl.body)
         return NULL;
+    hoist_restore(checker, func_decl);   /* BUG-1372 */
 
     /* Resolve return type */
     Type *ret_type = checker_get_type(checker, func_decl);
@@ -4963,6 +5121,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     Checker *checker = (Checker *)checker_ptr;
     if (!interrupt || interrupt->kind != NODE_INTERRUPT || !interrupt->interrupt.body)
         return NULL;
+    hoist_restore(checker, interrupt);   /* BUG-1372 */
 
     IRFunc *func = ir_func_new(arena,
         interrupt->interrupt.name, (uint32_t)interrupt->interrupt.name_len,

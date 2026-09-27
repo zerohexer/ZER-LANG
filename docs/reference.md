@@ -1975,6 +1975,13 @@ free(xs);                                    // release a [*]T
   result to a local first (BUG-1254).
 - A program may `free(p)` a `*T` without ever calling `alloc(T)` itself (a
   release helper in a library) (BUG-1261).
+- A store or read THROUGH a pointer that can only name one object is that
+  object's store or read: `*?*T lp = &loc; *lp = a;` makes `loc` hold `a`, and
+  `if (*lp) |q|` reads what `loc` holds — so a freed allocation is seen through
+  either spelling (BUG-1366). The same holds for a global pointer initialised
+  `&g` and never re-aimed. A pointer re-aimed between several objects (`lp =
+  &l2;` on some path) stores into each of them MAYBE: a read of any of them after
+  the free is refused until it is reset (`l1 = null;`).
 
 <!-- audit: expect-error: designates the same allocation as argument -->
 ```zer
@@ -1983,6 +1990,20 @@ u32 use_it(*T a, *T b) { free(b); return a.v; }   // b freed, then a read
 u32 main() {
     *T t = alloc(T) orelse return;
     return use_it(t, t);                           // ERROR — a IS b inside the callee
+}
+```
+
+<!-- audit: expect-error: use of freed value 'loc' -->
+```zer
+struct T { u32 v; }
+u32 main() {
+    ?*T loc = null;
+    *?*T lp = &loc;                 // lp can only name loc
+    *T a = alloc(T) orelse return;
+    *lp = a;                        // the store `loc = a`
+    free(a);
+    if (loc) |q| { return q.v; }    // ERROR — loc holds the freed a
+    return 0;
 }
 ```
 - Neither may run inside an `interrupt` handler or a `@critical` block — the
@@ -4412,6 +4433,10 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
   be declared volatile"). Reaching it INDIRECTLY counts: through a helper, a
   function pointer, or a global pointer whose initializer is `&g` (the ISR
   writing `*gp` and main reading `g` touch the same global).
+- A `const` global needs none of this — it cannot change, so reading it from a
+  handler and from main cannot race (`const u32 LIMIT = 10;` read on both sides
+  compiles). A `const` POINTER / slice is different: the constant is the pointer,
+  and what it points at is still shared data under the rules above.
 - A read-modify-write (`g += 1`, `g = g | 4`) of such a global must run inside
   `@critical` (or use `@atomic_*`) on EVERY side that does one — an interrupt can
   land between the read and the write. A plain single-word read or store needs
@@ -5282,7 +5307,11 @@ cinclude
 ## OPERATORS
 
 ### Arithmetic
-`+  -  *  /  %` — All integer overflow wraps (never UB).
+`+  -  *  /  %` — All integer overflow wraps (never UB). Two exceptions TRAP at run
+time rather than wrap: a zero divisor the compiler could not rule out (a divisor it
+cannot prove nonzero is a compile error first), and a signed `MIN / -1` or `MIN % -1`
+(the quotient does not fit; C leaves both undefined, so the remainder traps too even
+though its value would be 0).
 
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
@@ -5420,6 +5449,11 @@ Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once
 binary operators, comparisons, call arguments, struct-literal fields and array indices,
 whether an operand is a local, a global or a field. An assignment evaluates its TARGET
 (including every index in it) before its value, and yields the stored value.
+A PLACE is evaluated from its root outward: in `m[f()][g()]`, `pick().a[k].b` or
+`mk().v[k]`, the object (`m`, `pick()`, `mk()`) comes first, then each index in the
+order written — for a read and for a write alike. The object a `shared struct` access
+locks is evaluated exactly once: `pick().v += 1` calls `pick()` once, and the lock it
+takes is the lock of the object it writes.
 A COMPOUND assignment `t op= v` evaluates `v` first and then reads `t`: with a
 `setg()` that sets `g = 10` and returns 1, `g += setg()` is 11 while the written-out
 `g = g + setg()` reads `g` first and is 2. Write the long form when the right side
@@ -6094,7 +6128,14 @@ borrowed by that thread until `.join()`:
   **interrupt handler** and main code: `volatile` is required there, but a
   `volatile u64` on a 32-bit target, a `volatile u128`, or a volatile struct is
   rejected — the access lowers to several loads/stores, so main can read half of
-  one ISR update and half of another
+  one ISR update and half of another. "One word" is the widest access the target
+  does in ONE instruction: on AVR (16-bit pointers, 8-bit data path) that is 8 bits,
+  so a `volatile u16` or a 16-bit pointer shared with an ISR is rejected there
+- A `volatile` POINTER global that some code writes (`volatile ?volatile *u32 g =
+  null;` set by a handler, polled by main) is a volatile WORD in the emitted C
+  (`uint32_t volatile* volatile g`), so a `while (g == null) { }` loop re-reads it.
+  A `volatile *T` that is never written or address-taken (the `@inttoptr` MMIO base)
+  keeps a plain word: it holds one value
 - `volatile` is the narrowest of these and is **not synchronization** — it gives no
   atomicity and no ordering. It is accepted only for the single-word flag idiom
   (a plain store/load of a scalar no wider than the target word). Rejected:
@@ -6105,6 +6146,11 @@ borrowed by that thread until `.join()`:
 - spawn inside `@critical` → compile error (direct + transitive via function summaries)
 - spawn inside `async` function → compile error (thread may outlive coroutine)
 - spawn inside interrupt handler → compile error (direct + transitive)
+- A statement that touches two instances of ONE shared type (`g1.v = g2.v + 1;`)
+  holds both locks at once; they are taken in ADDRESS order, so another thread
+  writing `g2.v = g1.v + 1;` cannot deadlock with it
+- A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
+  lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
 
 ### Condvar — Thread Synchronization
 ```zer

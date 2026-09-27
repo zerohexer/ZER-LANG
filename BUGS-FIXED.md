@@ -105,6 +105,56 @@ negative was confirmed to FIRE there.
   `tests/zer/shared_same_type_lock_order_bug1376.zer` (the runner's timeout makes a hang a
   FAIL).
 
+## Session 2026-09-27 (c) — BUG-1387..1393: crash / hang fuzzing
+
+A crash-fuzzing pass over an ASan+UBSan build: ~92,000 mutated corpus cases, ~180
+hand-built deep-nesting inputs (100..10,000), a 320-cell self-containing-type matrix and
+~250 integer edge values. Nine signatures; seven fixed here, the polynomial slowdowns
+recorded in `docs/limitations.md`. Every reproducer below runs clean under ASan+UBSan now.
+
+- **BUG-1387 — heap over-read in the inline `asm(` raw-source scanner.** `void f(){asm(x'`
+  at end of file (no newline): the quote-skipping loops stopped at the NUL and the outer
+  `src++` stepped past it; a trailing backslash inside a quote did the same. Every step now
+  checks for the terminator before moving, and an unterminated `asm(` is a parse error.
+  Test: `tests/zer_fail/asm_unterminated_quote_eof_bug1387.zer`.
+- **BUG-1388 — signed overflow inside the compiler's range tracker.** `if (n >
+  9223372036854775807)` on a u64 pushed the range `[INT64_MAX + 1, …]`. `vrp_succ` /
+  `vrp_pred` saturate to the full range — the conservative reading, and a u64 above
+  INT64_MAX is outside the int64 domain anyway. Test (UBSan-clean now):
+  `tests/zer/vrp_guard_int64_max_bug1388.zer`.
+- **BUG-1389 — self-containment through `?T`, and no recovery after the error.** `struct A
+  { u32 a; ?A y; }` was ACCEPTED (a value optional holds its payload inline — the size is
+  infinite): without a local of type A the compile "succeeded" and GCC failed on
+  `_zer_opt_A`; with one, the stack-size pass recursed until SIGSEGV. The same for a union
+  variant and a `container Node(T) { ?Node(T) next; }`. `byvalue_core_type` peels array,
+  `?T` and distinct for all three rules (a `?*A` is a pointer and stops the walk). And after
+  ANY self-containment report the checker kept going with the cyclic type, so `@pun`,
+  `@size`, a union switch or a struct init recursed for ever in `compute_type_size` /
+  `type_alignment_bytes` / `zero_value_nonnull_leaf`: the offending field is now re-typed to
+  `u8` after the report (error recovery). Tests: five `tests/zer_fail/self_contain_*_bug1389.zer`.
+- **BUG-1390 — `defer` followed by a loop that never exits aborted the compiler.** `void run()
+  { defer { } for (;;) { } }` — valid code — failed IR validation ("IR_DEFER_PUSH has no
+  CFG-reachable IR_DEFER_FIRE") and hit `abort()`. The rule now requires a fire only when a
+  function EXIT is reachable from the push (`cfg_reaches_exit`, iterative); a defer on a path
+  that never returns has nothing to fire at. Test: `tests/zer/defer_then_infinite_loop_bug1390.zer`.
+- **BUG-1391 — emitted C doubled per nesting level.** The comma bounds form `(check(i, N),
+  a)[i]` repeats the index text and the slice hoist `__typeof__(obj) t = obj` repeats the
+  object, so `a[a[…a[i]…]]` at depth 24 wrote 528 MB of C (5.7 GB with `% 4`), and a
+  sub-slice chain 8.4 GB. An index that is not a few nodes of names / literals / fields /
+  arithmetic (`expr_emit_small`) takes the single-evaluation form, and the hoists use
+  `__auto_type`, which names the object once. Output is linear now (~25 KB at depth 24).
+  Test (semantics of the forms taken): `tests/zer/nested_index_single_emit_bug1391.zer`.
+- **BUG-1392 — nested `@saturate` / `@truncate` / `@bitcast` doubled the checking work.** The
+  generic argument loop checked each argument, then the intrinsic's own arm called
+  `check_expr` on it again — 1.9 s at depth 24, and a diagnostic in an argument could be
+  printed twice. The arms read the recorded type (`intrinsic_arg_type`); 0.015 s now.
+- **BUG-1393 — no bound on `else if` chains or array dimensions.** An else-if chain is a
+  right-nested tree and every walker recurses per link: 700 links overflowed the ASan build,
+  10,000 the release build (and Windows gives the main thread 1 MB, not 8). A chain is now
+  capped at 256 links and an array type at 64 dimensions, each with its own error. Tests:
+  `tests/zer_fail/{else_if_chain_too_long,array_too_many_dimensions}_bug1393.zer`, boundary
+  `tests/zer/else_if_chain_256_links_bug1393.zer`.
+
 ## Session 2026-09-27 (b) — BUG-1377..1386: union lock through an ancestor, volatile index reads, escape through computed destinations, funcptr hand-off summaries, literal sub-slice keys, >64-bit constants, uN cast wrap
 
 A second round of read-only probe agents (escape / modules / async, and VRP / bounds / enum /

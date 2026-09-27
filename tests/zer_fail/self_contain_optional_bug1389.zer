@@ -1,0 +1,4 @@
+// expect-error: cannot contain itself by value
+// BUG-1389: ?A self-containment — was accepted, then the stack-size pass recursed for ever (SIGSEGV).
+struct A { u32 a; ?A y; }
+u32 main(){ A x; return 0; }

@@ -286,6 +286,8 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
  * Produces same TYNODE_FUNC_PTR shape as 2A — downstream code
  * (checker, IR lowering, emitter, zercheck_ir) is operator-agnostic.
  * ---------------------------------------------------------------- */
+#define ZER_ELSE_IF_CHAIN_MAX 256
+
 /* Array suffix after a type: T[N] or T[N][M] (multi-dim: array of M elements of
  * T[N]). ONE helper for the three places a declaration's `[N]` can follow a type
  * (base type, `?T`, and the 2C funcptr `*(..) -> R`) — BUG-1030: the third of
@@ -295,11 +297,20 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
  * the declaration, not to the return type. Returns `base` unchanged otherwise. */
 static TypeNode *parse_array_suffix(Parser *p, TypeNode *base) {
     if (p->no_array_suffix != 0 || !match(p, TOK_LBRACKET)) return base;
+    int dims = 1;   /* BUG-1393: type resolution recurses once per dimension */
     TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
     arr->array.elem = base;
     arr->array.size_expr = parse_expression(p);
     consume(p, TOK_RBRACKET, "expected ']' after array size");
     while (match(p, TOK_LBRACKET)) {
+        if (++dims > 64) {
+            /* report, then consume the remaining suffixes so the declaration
+             * still parses as one (a speculative parse must reach the name) */
+            if (dims == 65) error(p, "array type has more than 64 dimensions");
+            (void)parse_expression(p);
+            consume(p, TOK_RBRACKET, "expected ']' after array size");
+            continue;
+        }
         TypeNode *outer = new_type_node(p, TYNODE_ARRAY);
         outer->array.elem = arr;
         outer->array.size_expr = parse_expression(p);
@@ -1516,7 +1527,14 @@ static Node *parse_if_stmt(Parser *p) {
         if (check(p, TOK_IF)) {
             /* else if — parse as nested if */
             advance(p);
+            if (++p->else_if_links > ZER_ELSE_IF_CHAIN_MAX) {
+                error(p, "'else if' chain longer than 256 links — split it (a "
+                         "switch, a table, or a helper function per range)");
+                p->else_if_links--;
+                return n;
+            }
             n->if_stmt.else_body = parse_if_stmt(p);
+            p->else_if_links--;
         } else {
             n->if_stmt.else_body = parse_block(p);
         }
@@ -2296,12 +2314,30 @@ static Node *parse_statement(Parser *p) {
         const char *start = p->current.start;
         const char *src = start;
         int depth = 1;
+        /* BUG-1387: every step checks for the terminator BEFORE moving past it
+         * — a quote or a trailing backslash at end of file used to step over the
+         * NUL and read past the source buffer (ASan heap-buffer-overflow). */
         while (*src && depth > 0) {
             if (*src == '(') depth++;
             else if (*src == ')') { depth--; if (depth == 0) break; }
-            else if (*src == '"') { src++; while (*src && *src != '"') { if (*src == '\\') src++; src++; } }
-            else if (*src == '\'') { src++; while (*src && *src != '\'') { if (*src == '\\') src++; src++; } }
+            else if (*src == '"' || *src == '\'') {
+                char q = *src++;
+                while (*src && *src != q) {
+                    if (*src == '\\' && src[1]) src++;
+                    src++;
+                }
+                if (!*src) break;
+            }
             src++;
+        }
+        if (!*src) {
+            error_at(p, &p->current, "unterminated 'asm(' — no closing ')'");
+            p->scanner->pos = (size_t)(src - p->scanner->source);   /* at the NUL */
+            p->current = next_token(p->scanner);                     /* EOF */
+            Node *bad = new_node(p, NODE_ASM);
+            bad->asm_stmt.code = start;
+            bad->asm_stmt.code_len = 0;
+            return bad;
         }
         Node *n = new_node(p, NODE_ASM);
         n->asm_stmt.is_structured = 0;
@@ -3228,6 +3264,7 @@ void parser_init(Parser *p, Scanner *scanner, Arena *arena, const char *file_nam
      * suppresses EVERY array suffix — `u8[256] buf;` stops parsing as an array.
      * Same shape as the Checker.target_ptr_bits trap CLAUDE.md records. */
     p->no_array_suffix = 0;
+    p->else_if_links = 0;
     advance(p); /* prime the first token */
 }
 

@@ -84,6 +84,17 @@ repeated.
    comptime local wider than 64 bits is refused outright. The durable fix is a 128-bit
    constant evaluator (the typed fold and the comptime interpreter both carry int64_t).
 
+10. **Polynomial compile time on long straight-line functions** (measured by the 2026-09-27
+   fuzz pass, BUG-1387..1393 round). 16,000 lines of `x += 1;` take 24 s — the hot spot is
+   `ir_find_local_exact_first`, a linear local lookup called per identifier from
+   `ir_check_ident_uaf` / `ir_check_inst_core`; 800 `Handle(T) h_i = pl.alloc() orelse
+   return;` grow ~n^2.6 and 800 chained pointer aliases ~n^2. Not a hang; a hash on the IR
+   local table (name -> first id) is the fix.
+11. **Structural limits are parser caps, not iterative walkers** (BUG-1393). An `else if`
+   chain is capped at 256 links and an array type at 64 dimensions, because every walker
+   recurses per level. Lowering an else-if chain iteratively in each walker would lift the
+   cap; nothing in the corpus comes close (the longest chain is 9 links).
+
 ## OPEN — residuals of the 2026-09-26 audit (BUG-1326..1357; measured)
 
 1. **BUG-1327 migrated four callers only.** `eval_const_expr_ok` is the out-of-band entry

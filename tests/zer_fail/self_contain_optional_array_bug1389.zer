@@ -1,0 +1,5 @@
+// expect-error: cannot contain itself by value
+// BUG-1389: a value optional holds its payload inline — ?A inside A is infinite (was accepted; GCC then failed).
+struct A { u32 a; ?A[2] y; }
+u32 f(*A p){ return p.a; }
+u32 main(){ return 0; }

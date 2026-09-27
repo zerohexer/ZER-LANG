@@ -320,6 +320,8 @@ u32[4] values;            // 4 u32s
 i32[3][3] matrix;         // 3x3 multi-dimensional
 ```
 
+An array type may have at most 64 dimensions.
+
 **EXAMPLE**
 ```zer
 u32[4] scores;
@@ -1422,7 +1424,8 @@ static void helper() { }    // not exported
 
 **DESCRIPTION**
 Conditional execution. Braces ALWAYS required (no braceless one-liners).
-`else if` is supported.
+`else if` is supported; one chain may have at most 256 `else if` links — use a
+`switch`, a table, or a helper per range beyond that.
 
 **SYNTAX**
 ```zer

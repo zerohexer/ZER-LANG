@@ -168,7 +168,90 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
  * orig_name). Exact-first returns %2 (only match by exact name "h").
  *
  * Used only by zercheck_ir walkers after lowering. */
+/* BUG-1394: the linear scan was called once per identifier by every
+ * zercheck_ir walker, so a function with N locals and N statements cost N^2
+ * (16,000 straight-line statements took 24 s). The index answers the same
+ * question: the LAST local whose exact name matches, else the LAST local whose
+ * orig_name matches. */
+struct IRNameIndex {
+    int cap;          /* power of two; slots per table */
+    int indexed;      /* locals[0 .. indexed) are in the tables */
+    int *exact;       /* local index + 1, 0 = empty */
+    int *orig;
+};
+
+static uint32_t ir_name_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Insert local `li` keyed by (s, n) into `tab`; a later local overwrites an
+ * earlier one with the same spelling (the "last match" rule). */
+static void ir_name_tab_put(IRFunc *func, int *tab, int cap, int li,
+                            const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) { tab[k] = li + 1; return; }
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) { tab[k] = li + 1; return; }
+    }
+}
+
+static int ir_name_tab_get(IRFunc *func, int *tab, int cap,
+                           const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) return -1;
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) return o->id;
+    }
+}
+
+static void ir_name_index_add(IRFunc *func, struct IRNameIndex *ix, int li) {
+    IRLocal *l = &func->locals[li];
+    if (l->name) ir_name_tab_put(func, ix->exact, ix->cap, li, l->name, l->name_len, false);
+    if (l->orig_name) ir_name_tab_put(func, ix->orig, ix->cap, li, l->orig_name, l->orig_name_len, true);
+}
+
+static bool ir_name_index_sync(IRFunc *func) {
+    struct IRNameIndex *ix = func->name_index;
+    if (!ix) {
+        ix = (struct IRNameIndex *)calloc(1, sizeof(*ix));
+        if (!ix) return false;
+        func->name_index = ix;
+    }
+    if (ix->indexed == func->local_count && ix->cap) return true;
+    if (!ix->cap || func->local_count * 2 > ix->cap) {
+        int cap = ix->cap ? ix->cap : 64;
+        while (func->local_count * 2 > cap) cap *= 2;
+        int *ne = (int *)calloc((size_t)cap, sizeof(int));
+        int *no = (int *)calloc((size_t)cap, sizeof(int));
+        if (!ne || !no) { free(ne); free(no); return false; }
+        free(ix->exact); free(ix->orig);
+        ix->exact = ne; ix->orig = no; ix->cap = cap; ix->indexed = 0;
+    }
+    for (int i = ix->indexed; i < func->local_count; i++) ir_name_index_add(func, ix, i);
+    ix->indexed = func->local_count;
+    return true;
+}
+
 int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len) {
+    if (!name) return -1;
+    if (ir_name_index_sync(func)) {
+        int e = ir_name_tab_get(func, func->name_index->exact, func->name_index->cap,
+                                name, name_len, false);
+        if (e >= 0) return e;
+        return ir_name_tab_get(func, func->name_index->orig, func->name_index->cap,
+                               name, name_len, true);
+    }
+    /* allocation failed: the plain scan */
     int exact_match = -1;
     int orig_match = -1;
     for (int i = 0; i < func->local_count; i++) {

@@ -105,6 +105,80 @@ negative was confirmed to FIRE there.
   `tests/zer/shared_same_type_lock_order_bug1376.zer` (the runner's timeout makes a hang a
   FAIL).
 
+## Session 2026-09-27 (d) — BUG-1386, BUG-1394..1399: the recorded residuals
+
+The open residuals of the (a)..(c) rounds, worked through. Every hazard below was
+measured accept-unsafe (or wrong) on the pre-change build and is refused (or right) now;
+the sink-matrix cells were confirmed to report HOLES against that build.
+
+- **BUG-1386 — a global array sized by a const whose value needs typed arithmetic.**
+  `const u32 X = (0 - 1) / 536870912 + 1;` is 8; a local `u32[X]` had 8 elements and a global
+  one 1, because global types are resolved at registration, before any initializer is typed,
+  and the untyped fold reads `0 - 1` as -1. `resolve_const_ident` (and `tfold`'s identifier
+  arm) now type a const's initializer ON DEMAND when it has not been — quietly
+  (`Checker.diag_quiet`: the owning pass re-checks and reports for real), only for a
+  constant-shaped tree (no calls: a comptime call may name a later function) — and fold it
+  typed. The chain guard (cycle + 64 links) applies to the typed fold too; a first draft
+  bypassed it and `global_init_chain_too_deep` compiled, which `make check` caught. Also
+  fixes an over-rejection: `const u32 B = (u32)(A + A);` over `const u8 A` could not size an
+  array at all. Test: `tests/zer/global_array_size_typed_const_bug1386.zer`.
+- **BUG-1394 — quadratic compile time.** `ir_find_local_exact_first`, called per identifier
+  by every zercheck_ir walker, scanned the local table (76% of the time). A lazily built,
+  incrementally extended hash index on the IRFunc answers the same "last exact name, else
+  last orig_name" question (16,000 straight-line statements: 24 s -> 0.9 s; identical C).
+  The fixpoint's convergence test and the leak pass's per-return scans were O(handles^2)
+  too; both now use per-state hash sets (800 allocations with an `orelse return` each:
+  8.8 s -> 3.5 s, identical diagnostics).
+- **BUG-1395 — three places whose slot had no key.** (a) An element / field read out of a
+  slot that VIEWS a local aggregate (`ps[0] = &s; if (ps[0]) |q| { q.p = a; }`) did not make
+  the reader a view — only a slot holding an allocation aliased (`ir_inherit_slot_view`).
+  (b) A call at the base of a projection (`getp(&s).p = a`) — `ir_rebase_slice_index`, the
+  key normaliser, now rewrites it to the argument the callee provably returns, and a call
+  RESULT that is `&X` is a view of X (the lowering hoists such a place root into a temp).
+  (c) A GLOBAL carrier (`gss.s = &gs; gs.p = a; … gss.s.p`) — a global projection entry
+  records the global aggregate it views (`view_root_gkey`) and global keys re-root through
+  it (`ir_reroot_global_views`). All three read a recycled object (exit 99).
+- **BUG-1396 — a view names a SLOT, not only a whole local, and is bound from any view
+  expression.** `*S p = &w.inner;` (and `&w.arr[1]`) views `(w, ".inner")`, so `p.p` is
+  `w.inner.p`; a re-aim `p = getp(&s)` / `p = p2` moves the view. ONE resolver,
+  `ir_view_set_of_value` (`&place`, a viewing pointer, a call returning an argument), at
+  every binding site: var-decl, assignment to a local, to a field / element, a call result.
+  Only `&name` used to create a view, and only of a whole local.
+- **BUG-1397 — a view that is one of SEVERAL slots.** A join of two different views used to
+  become "ambiguous" and stop re-rooting, so `*S p = &t; if (c) { p = &s; } p.p = a;` stored
+  nowhere the analysis could name. A view is now a candidate SET (up to 8, joined as the
+  union); a call that may return any of several arguments (`pick(&s, &t, c)`) views all of
+  them; a store through such a pointer is a WEAK store into every candidate slot (the BUG-1366
+  view-set representation), so the read of `s.p` after the free is refused. The `h.p = null`
+  reset now also clears a slot's view set, or the documented reset would be a false error.
+  Gate for 1395..1397: SHAPE p57 in `tools/sink_matrix.sh` (9 HOLES pre-fix). Tests:
+  `tests/zer_fail/uaf_{global_carrier_view_bug1395,store_through_joined_view_bug1397}.zer`,
+  boundaries `tests/zer/view_{slot_store_reset,join_store_reset}_ok_bug139{6,7}.zer`.
+- **BUG-1398 — lock order across a CALL.** A statement holding the (recursive) mutex of
+  shared instance A that calls a function locking instance B of the SAME type nests two
+  locks of one type; a thread doing it the other way round deadlocks (`a.v = xfer(&b)` /
+  `b.v = xfer(&a)`). BUG-1376 ordered only the statement's own locks. The per-function
+  shared-types summary now records WHICH instance (a named global, a pointer parameter —
+  mapped through each call's argument — or any), and the statement check compares a
+  callee's instance with the ones it holds: the same instance is the recursive re-entry and
+  stays legal. An indirect call is checked through EACH function the pointer may call,
+  with that function's instances mapped through the call's arguments; the first draft
+  counted it as "any instance" and the concurrency matrix's callback-table cell (a plain
+  `shared` statement calling `fp()` bound to a function re-taking the same global) went
+  red — so did the summary merge of an indirect call, which now keeps a named-global
+  instance. Corpus cost: zero. Gate: SHAPE p58 (6 HOLES pre-fix, 4 boundary cells).
+  Test: `tests/zer/shared_same_instance_across_call_ok_bug1398.zer`.
+- **BUG-1399 — a packed MMIO overlay with a misaligned field.** `packed struct R { u8 a; u32
+  b; }` over `@inttoptr(*R, 0x40000000)` put a u32 register at 0x40000001 — a fault on
+  Cortex-M device memory, split byte accesses elsewhere. `@inttoptr` now refuses a pointee
+  whose layout places a multi-byte field at an offset its alignment does not divide
+  (`mmio_misaligned_field`, recursing nested structs / arrays / unions), and the address
+  alignment gate — the constant check AND the runtime trap for a variable address — uses the
+  alignment the ACCESSES need (`type_access_alignment`), not the packed struct's own 1.
+  Tests: `tests/zer_fail/mmio_packed_{misaligned_field,misaligned_nested,odd_address}_bug1399.zer`,
+  `tests/zer_trap/mmio_packed_variable_odd_address_bug1399.zer`, boundary
+  `tests/zer/mmio_packed_aligned_overlay_ok_bug1399.zer`.
+
 ## Session 2026-09-27 (c) — BUG-1387..1393: crash / hang fuzzing
 
 A crash-fuzzing pass over an ASan+UBSan build: ~92,000 mutated corpus cases, ~180
@@ -243,11 +317,7 @@ Gate for 1379..1382: SHAPE p56 in `tools/sink_matrix.sh` (6 HOLE + 1 OVER-REJECT
   NODE_TYPECAST paths now open `emit_intn_value_wrap_open/close` (once per cast,
   `Emitter.intn_cast_wrapping`). Test: `tests/zer/intn_cast_wrap_all_forms_bug1385.zer`
   (six of its seven checks fail pre-fix).
-- **BUG-1386 (OPEN, recorded) — a global array sized by a const whose value depends on typed
-  wrapping.** `const u32 X = (0 - 1) / 536870912 + 1;` is 8; `u32[X] loc` has 8 elements, but
-  a GLOBAL `u32[X] gb` has 1, because global types are resolved at registration, before X's
-  initializer is typed, and the untyped fold reads `(0 - 1)` as -1. Not memory-unsafe (every
-  access checks against the declared 1), but a wrong value; see `docs/limitations.md`.
+- **BUG-1386 — see session (d): fixed there (a const's initializer typed on demand).**
 
 ## Session 2026-09-26 — BUG-1326..1359: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
 

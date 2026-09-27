@@ -8844,7 +8844,8 @@ static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func) {
     /* F4: alignment via type_alignment_bytes (aggregate-aware). GAP-2 (BUG-736):
      * alignment is a property of the TARGET TYPE and is checked even with zero
      * declared mmio ranges (--no-strict-mmio); only the range check needs them. */
-    int align = inner ? type_alignment_bytes(inner) : 0;
+    /* BUG-1399: what the ACCESSES need — a packed struct's own alignment is 1 */
+    int align = inner ? type_access_alignment(inner) : 0;
     if (!var_addr && node->intrinsic.addr_is_const) {
         emit(e, "((");
         emit_type(e, t);

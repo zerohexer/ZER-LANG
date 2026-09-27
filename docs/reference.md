@@ -2794,6 +2794,13 @@ volatile *u32 reg = @inttoptr(*u32, 0x40020014);
   and a direct `@inttoptr(*R, A).field = x` emits a volatile access. Before, only
   the var-decl sink checked, and GCC could delete one of two register writes or
   turn a poll loop into an infinite loop.
+- A PACKED register block is checked field by field: a multi-byte field at an
+  offset its alignment does not divide (`packed struct R { u8 a; u32 b; }` puts `b`
+  at offset 1) is a compile error — an unaligned access to device memory faults on
+  Cortex-M and is split into byte accesses elsewhere. Lay the block out with
+  naturally aligned fields and explicit padding. The address itself must be aligned
+  for the widest field inside the packed struct (at compile time for a constant, by
+  a run-time trap for a variable) — the packed struct's own alignment is 1.
 - An index into an MMIO pointer is bounds-guarded, and the guard evaluates the
   index a second time. An index with a side effect (`r[f()]`, `r[vs.k]` with `vs`
   volatile) is therefore refused (BUG-1194: `f()` returned 3 to the guard and 4
@@ -6489,6 +6496,27 @@ a.x = b.y;                 // COMPILE ERROR — one statement accesses both A an
 ```
 
 Cross-statement ordering is safe because the emitter does lock→op→unlock per statement group — no two different shared types are ever locked simultaneously.
+
+A statement that holds a shared lock may CALL a function that takes the same instance
+again — the mutex is recursive. A call that may lock ANOTHER instance of the same type
+while the statement holds one is a compile error: two threads doing it in opposite order
+deadlock. The compiler follows the instance through a named global and through pointer
+parameters (`&a`, or the statement's own pointer); anything it cannot name counts as
+"another". Make such a call in its own statement.
+
+<!-- audit: expect-error: may lock ANOTHER -->
+```zer
+shared struct Acc { u32 v; }
+Acc a; Acc b;
+u32 bump(*Acc p) { p.v += 1; return p.v; }
+u32 main() {
+    a.v = bump(&a);            // OK — the same instance, re-taken
+    u32 t = bump(&b);          // OK — its own statement
+    a.v = t;
+    a.v = bump(&b);            // COMPILE ERROR — holds a, locks b
+    return 0;
+}
+```
 
 ---
 

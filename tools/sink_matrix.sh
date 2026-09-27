@@ -1191,6 +1191,54 @@ cell p56_funcptr_in_callee   reject "$P56"' u32 main(){ *T56 a = alloc(T56) orel
 cell p56_safe_arena_global   compile "$P56"' void setup([*]u8 b){ ga56 = Arena.over(b); } u32 main(){ setup(gbuf56); return 0; }'
 cell p56_safe_funcptr_handoff compile "$P56"' u32 main(){ *T56 a = alloc(T56) orelse return; apply56(freer56, a); return 0; }'
 
+# SHAPE p57 (BUG-1395..1397): WHICH SLOT a store through a pointer names — the
+# pointer bound from a sub-object address, re-aimed through a call or a copy,
+# joined from two branches, returned by a call that may return either argument,
+# a capture of an element that views a local, a call-rooted place, and a
+# GLOBAL carrier. Every hazard cell reads the slot through its real name after
+# the allocation was freed. BOUNDARY: the slot reset by its real name first.
+echo "===== SHAPE p57 = store through a view: sub-object / re-aim / join / multi-view / capture / call root / global carrier ====="
+P57='struct T57 { u32 v; } struct S57 { ?*T57 p; } struct W57 { S57 inner; S57[2] arr; } struct SS57 { *S57 s; }
+SS57 gss57; S57 gs57;
+*S57 getp57(*S57 s) { return s; }
+*S57 pick57(*S57 x, *S57 y, bool c) { if (c) { return x; } return y; }
+u32 rd57(?*T57 p) { if (p) |q| { return q.v; } return 0; }
+'
+cell p57_subobject           reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; W57 w; *S57 p = &w.inner; p.p = a; free(a); u32 r = rd57(w.inner.p); w.inner.p = null; return r; }'
+cell p57_element_slot        reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; W57 w; *S57 p = &w.arr[1]; p.p = a; free(a); u32 r = rd57(w.arr[1].p); w.arr[1].p = null; return r; }'
+cell p57_reaim_call          reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; S57 t; *S57 p = &t; p = getp57(&s); p.p = a; free(a); u32 r = rd57(s.p); s.p = null; return r; }'
+cell p57_reaim_copy          reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; S57 t; *S57 p = &t; *S57 p2 = &s; p = p2; p.p = a; free(a); u32 r = rd57(s.p); s.p = null; return r; }'
+cell p57_join                reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; S57 t; volatile bool c = true; *S57 p = &t; if (c) { p = &s; } p.p = a; free(a); u32 r = rd57(s.p); s.p = null; t.p = null; return r; }'
+cell p57_multiview_call      reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; S57 t; volatile bool c = true; bool cc = c; pick57(&s, &t, cc).p = a; free(a); u32 r = rd57(s.p); s.p = null; t.p = null; return r; }'
+cell p57_element_capture     reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; ?*S57[2] ps; ps[0] = &s; if (ps[0]) |q| { q.p = a; } free(a); u32 r = rd57(s.p); s.p = null; return r; }'
+cell p57_call_root           reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; getp57(&s).p = a; free(a); u32 r = rd57(s.p); s.p = null; return r; }'
+cell p57_global_carrier      reject "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; gss57.s = &gs57; gs57.p = a; free(a); u32 r = 0; if (gss57.s.p) |q| { r = q.v; } gs57.p = null; return r; }'
+cell p57_safe_reset_join     compile "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; S57 s; S57 t; volatile bool c = true; *S57 p = &t; if (c) { p = &s; } p.p = a; s.p = null; t.p = null; free(a); return rd57(s.p); }'
+cell p57_safe_reset_subobj   compile "$P57"' u32 main(){ *T57 a = alloc(T57) orelse return; W57 w; *S57 p = &w.inner; p.p = a; w.inner.p = null; free(a); return rd57(w.inner.p); }'
+
+# SHAPE p58 (BUG-1398): lock order ACROSS A CALL — a statement holding a plain
+# `shared` lock calls a function that locks ANOTHER instance of the same type
+# (directly, through a forwarded param, through a global, through a local
+# pointer). BOUNDARY: the callee re-takes the SAME instance (recursive mutex),
+# through the statement's own parameter, or the call is its own statement.
+echo "===== SHAPE p58 = same-type lock nested across a call ====="
+P58='shared struct A58 { u32 v; }
+A58 a58; A58 b58;
+u32 bump58(*A58 p) { p.v += 1; return p.v; }
+u32 fwd58(*A58 q) { return bump58(q); }
+u32 getb58() { return b58.v; }
+'
+cell p58_param_other         reject "$P58"' u32 main(){ a58.v = bump58(&b58); return 0; }'
+cell p58_forwarded_other     reject "$P58"' u32 main(){ a58.v = fwd58(&b58); return 0; }'
+cell p58_global_other        reject "$P58"' u32 main(){ a58.v = getb58(); return 0; }'
+cell p58_local_ptr_other     reject "$P58"' u32 main(){ *A58 pp = &b58; a58.v = bump58(pp); return 0; }'
+cell p58_param_pair          reject "$P58"' u32 f(*A58 x, *A58 y){ x.v = bump58(y); return 0; } u32 main(){ return f(&a58, &b58); }'
+cell p58_safe_same_global    compile "$P58"' u32 main(){ a58.v = fwd58(&a58); return 0; }'
+cell p58_safe_same_param     compile "$P58"' u32 f(*A58 x){ x.v = bump58(x); return 0; } u32 main(){ return f(&a58); }'
+cell p58_safe_split          compile "$P58"' u32 main(){ u32 t = bump58(&b58); a58.v = t; return 0; }'
+cell p58_funcptr_other       reject "$P58"' u32 main(){ *(*A58) -> u32 fp = bump58; a58.v = fp(&b58); return 0; }'
+cell p58_safe_funcptr_same   compile "$P58"' u32 main(){ *(*A58) -> u32 fp = bump58; a58.v = fp(&a58); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

@@ -50,6 +50,23 @@ typedef struct {
     const char *source;     /* source text for error display (NULL = skip source line) */
     int error_count;
     int warning_count;
+    /* BUG-1386: >0 while the checker types something SPECULATIVELY (a const
+     * initializer typed on demand at registration). Diagnostics are counted in
+     * diag_quiet_hits instead of being reported; the pass that owns the node
+     * checks it again later and reports for real. */
+    int diag_quiet;
+    int diag_quiet_hits;
+    /* BUG-1398: the function whose body the shared-types summary is scanning
+     * (so a param-rooted access can name its parameter), and — while one
+     * statement is checked for lock order across its calls — the instances it
+     * locks directly (malloc'd, per statement). */
+    Node *fsc_scan_func;
+    Node *lockchk_func;   /* BUG-1398: the function whose statements are lock-checked */
+    struct LockInst { uint32_t type_id; uint8_t kind; const char *name; uint32_t len; } *lockchk_roots;
+    int lockchk_root_n, lockchk_root_cap;
+    bool lockchk_collect_roots;
+    Node *lockchk_hazard_call;
+    uint32_t lockchk_hazard_type;
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
@@ -563,6 +580,13 @@ typedef struct {
         uint32_t *type_ids;     /* array of shared struct type_ids */
         int type_count;
         int type_capacity;
+        /* BUG-1398: per type_ids[i], WHICH instance of that type the function
+         * locks: a named global, the pointee of pointer parameter inst_param[i],
+         * or any (unknown / several / a local). Grown with type_ids. */
+        uint8_t *inst_kind;
+        const char **inst_name;
+        uint32_t *inst_name_len;
+        int *inst_param;
         bool computed;          /* true if DFS completed (memoized) */
         bool in_progress;       /* true during DFS (cycle detection) */
     } **func_shared_cache;  /* BUG-949: array of POINTERS to individually

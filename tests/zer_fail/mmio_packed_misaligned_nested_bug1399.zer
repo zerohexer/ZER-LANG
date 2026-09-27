@@ -1,0 +1,9 @@
+// expect-error: lies at offset 3
+// BUG-1399: the misaligned field sits inside a nested array of a packed overlay.
+mmio 0x40000000..0x400000FF;
+struct Inner { u8 x; u8 y; }
+packed struct R3 { u8 a; Inner i; u16[2] w; }
+u32 main() {
+    volatile *R3 r = @inttoptr(*R3, 0x40000000);
+    return 0;
+}

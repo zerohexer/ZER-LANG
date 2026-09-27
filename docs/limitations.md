@@ -30,29 +30,30 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-09-27 rounds (BUG-1366..1386; measured)
+## OPEN — residuals of the 2026-09-27 rounds (BUG-1366..1399; measured)
 
-1. **A pointer's aim is resolved for a NAME only** (BUG-1366, MEDIUM — accept-unsafe,
-   narrowed). `*p = a` is the store `x = a` when p is a local bound once to `&x`, a global
-   initialised `&x` and never re-aimed, or (weakly) a local re-aimed only between `&x_i`.
-   Not resolved: a pointer PARAM (the store summary covers the caller side), a pointer held
-   in a FIELD / element (`*h.pp = a`), a pointer returned by a call, a pointer re-aimed from
-   anything but `&name`. A weak store into a GLOBAL candidate that already holds a different
-   allocation only adds a view, and the dangling-global rules do not read views.
-2. **A pointer field re-roots only when it views a LOCAL** (BUG-1373). Still keyed under the
-   carrier: a GLOBAL carrier (`gss.s = &gs; gs.p = a; free(a); gss.s.p`), a place rooted at a
-   call (`getp(&s).p = a` where getp returns its param), and a capture of an element
-   (`if (ps[0]) |q| { q.p = a; }`). Measured accept-unsafe (exit 99) on the reproducers of
-   the 2026-09-27 probe (`agents/uaf/{k4,f4,f1}`).
-3. **Lock order across a CALL** (BUG-1376, LOW — liveness). A statement's own locks are
-   acquired in address order; a statement holding instance A that CALLS a function locking
-   instance B of the same shared type still takes A then B, and another thread doing the
-   reverse deadlocks. The per-statement collector sees the callee's type (BUG-980 re-entry)
-   but not its instance.
-4. **A `packed` MMIO overlay with a misaligned multi-byte field is accepted** (hardware-
-   dependent). `packed struct R { u8 a; u32 b; }` over `@inttoptr(*R, 0x40000000)` emits an
-   unaligned 32-bit access to device memory at 0x40000001 (a fault on Cortex-M Device
-   memory; byte-split accesses elsewhere). `@inttoptr` checks the struct's alignment (1).
+1. **`*p = a` through a pointer-to-POINTER re-aimed by anything but `&name`** (BUG-1366,
+   narrowed). A store through a deref is resolved when p is bound once to `&x`, is a global
+   initialised `&x` and never re-aimed, or is a local re-aimed only between `&x_i` (weak
+   store). A pointer to a pointer SLOT that is a parameter, a field / element (`*h.pp = a`),
+   or a call result is not resolved. (Projections through a pointer to an AGGREGATE — `p.f
+   = a` — are resolved through views, BUG-1395..1397, including re-aims through copies,
+   calls and joins.)
+2. **A view whose candidates are UNKNOWN** (BUG-1397). A pointer that may view more than
+   eight slots, or that joined with an unknown view, stores under its own key only; a read
+   of the real slot after the free is then not refused. A GLOBAL carrier whose view is
+   established in ANOTHER function (`void init() { gss.s = &gs; }`) is likewise not
+   followed — the view is a per-function fact. Fix sketch: a whole-program "this global
+   pointer field is only ever `&G`" query, the projection sibling of
+   `checker_global_never_mutated`.
+3. **Lock order across a call — precision residue** (BUG-1398). A callee's instance is
+   known when it is a named global, or a pointer parameter mapped through the call's
+   argument (`&G`, or a local / parameter of the calling statement's function); an
+   indirect call is checked through each function it may call. A callee touching its OWN
+   local shared struct, a global POINTER, or a parameter reached through an indirect call
+   inside another function's summary counts as "any instance", which refuses the
+   statement (over-rejection, never an accepted deadlock). Corpus cost measured: zero.
+4. ~~A `packed` MMIO overlay with a misaligned multi-byte field~~ — CLOSED (BUG-1399).
 5. **A store through a sub-slice with a VARIABLE bound is not keyed** (BUG-1383 closed the
    constant-bound case: `la[1..3][0]` is `la[1]`, for a local and a global array). `la[i..n][0]
    = a; free(a); … la[k]` still reaches the slot through no key; the slot's value is not
@@ -67,29 +68,17 @@ repeated.
    carrying a pointer reports the pushed allocation as never freed after `free(x.p)` of the
    popped copy.
 
-8. **BUG-1386 — a GLOBAL array sized by a const whose value needs TYPED wrapping gets the
-   untyped size.** `const u32 X = (0 - 1) / 536870912 + 1;` is 8 (u32 arithmetic); a local
-   `u32[X]` has 8 elements, a global `u32[X]` has 1, so `gb = loc` is refused ("cannot assign
-   'u32[8]' to 'u32[1]'") and a loop to `X` over `gb` traps. Global types are resolved at
-   REGISTRATION, before any initializer is typed, and `resolve_const_ident` wraps only the
-   final value of the untyped fold, not each intermediate. Not memory-unsafe (the declared
-   size is used consistently); a wrong value. Trying the typed fold first in
-   `eval_decl_size_expr` does not help — nothing is typed yet at registration. Fix sketch:
-   type a const's initializer on demand in `resolve_const_ident` (check_expr under the
-   declaring scope, suppressing the duplicate diagnostics pass 2 would repeat), then fold it
-   with `checker_fold_const_typed`.
 9. **>64-bit constants: an admitted set, not a 128-bit evaluator** (BUG-1384). A u65..u128
    global / static initializer must be literals under `+ - * & | ^ ~` and casts — a shift, a
    division or a name is refused though GCC would fold it correctly; a comptime function or
    comptime local wider than 64 bits is refused outright. The durable fix is a 128-bit
    constant evaluator (the typed fold and the comptime interpreter both carry int64_t).
 
-10. **Polynomial compile time on long straight-line functions** (measured by the 2026-09-27
-   fuzz pass, BUG-1387..1393 round). 16,000 lines of `x += 1;` take 24 s — the hot spot is
-   `ir_find_local_exact_first`, a linear local lookup called per identifier from
-   `ir_check_ident_uaf` / `ir_check_inst_core`; 800 `Handle(T) h_i = pl.alloc() orelse
-   return;` grow ~n^2.6 and 800 chained pointer aliases ~n^2. Not a hang; a hash on the IR
-   local table (name -> first id) is the fix.
+10. **Compile time grows super-linearly on some long functions** (measured 2026-09-27;
+   the linear local lookup, 76% of the 16,000-line case, is fixed — BUG-1394, 24 s -> 0.9 s).
+   Remaining: a function holding N live allocations each followed by its own `orelse
+   return` keeps a state per block and copies it (800: 3.5 s, mostly memory churn); a chain
+   of N pointer copies is O(N^2) in `for_each_write_target` (800: 1 s). Neither hangs.
 11. **Structural limits are parser caps, not iterative walkers** (BUG-1393). An `else if`
    chain is capped at 256 links and an array type at 64 dimensions, because every walker
    recurses per level. Lowering an else-if chain iteratively in each walker would lift the

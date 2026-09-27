@@ -292,6 +292,37 @@ int type_alignment_bytes(Type *a) {
     }
 }
 
+/* BUG-1399: the alignment the ACCESSES through a pointer to `a` need — the
+ * largest natural alignment of any field reached, looking INSIDE packed
+ * structs. type_alignment_bytes answers 1 for a packed struct (its layout
+ * allows any address), which is right for the struct and wrong for an MMIO
+ * overlay: `packed struct R { u8 a; u32 b; }` at 0x40000001 puts the u32
+ * register at an odd address, and the @inttoptr alignment gate (constant AND
+ * the runtime trap for a variable address) read 1 and passed it. */
+int type_access_alignment(Type *a) {
+    if (!a) return 0;
+    a = type_unwrap_distinct(a);
+    TypeKind k = type_dispatch_kind(a);
+    if (k == TYPE_ARRAY) return type_access_alignment(a->array.inner);
+    if (k == TYPE_STRUCT) {
+        int m = a->struct_type.is_packed ? 1 : type_alignment_bytes(a);
+        for (uint32_t i = 0; i < a->struct_type.field_count; i++) {
+            int fa = type_access_alignment(a->struct_type.fields[i].type);
+            if (fa > m) m = fa;
+        }
+        return m;
+    }
+    if (k == TYPE_UNION) {
+        int m = type_alignment_bytes(a);
+        for (uint32_t i = 0; i < a->union_type.variant_count; i++) {
+            int fa = type_access_alignment(a->union_type.variants[i].type);
+            if (fa > m) m = fa;
+        }
+        return m;
+    }
+    return type_alignment_bytes(a);
+}
+
 bool type_is_optional(Type *a) {
     /* BUG-409: unwrap distinct — distinct typedef ?*T is still optional */
     a = type_unwrap_distinct(a);

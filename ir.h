@@ -382,6 +382,13 @@ typedef struct {
      * (returns highest scope_depth ≤ current, so inner block locals don't
      * shadow outer locals in subsequent outer-block lookups). */
     int current_scope;
+
+    /* BUG-1394: name index over `locals` for ir_find_local_exact_first — two
+     * open-addressing tables (exact name, orig_name) holding the LAST id with
+     * that spelling. Built lazily and extended incrementally as locals are
+     * appended (locals are never renamed or removed). Heap-allocated so the
+     * arena-owned IRFunc stays a plain value. NULL until first lookup. */
+    struct IRNameIndex *name_index;
 } IRFunc;
 
 /* ================================================================

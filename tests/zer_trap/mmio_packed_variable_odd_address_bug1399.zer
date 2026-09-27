@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: unaligned address
+// BUG-1399: the runtime alignment gate for a VARIABLE address uses the access
+// alignment (4 for the u32 inside the packed overlay), not the struct's own 1.
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+packed struct R2 { u32 a; u16 b; u8 c; u8 d; }
+u32 main() {
+    volatile u64 base = 0x40000001;
+    u64 addr = base;
+    volatile *R2 r = @inttoptr(*R2, addr);
+    return 0;
+}

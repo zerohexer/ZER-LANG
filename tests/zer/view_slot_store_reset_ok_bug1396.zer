@@ -1,0 +1,31 @@
+// BUG-1396: views of a SLOT (&w.inner, &w.arr[1]) and re-aims through a call — the
+// store lands in the real slot; resetting it by its real name before the free is clean.
+struct T { u32 v; }
+struct S { ?*T p; }
+struct W { S inner; S[2] arr; }
+*S getp(*S s) { return s; }
+u32 main() {
+    u32 r = 0;
+    W w;
+    S s; S t;
+    *T a = alloc(T) orelse return;
+    *S p = &w.inner;
+    p.p = a;
+    if (w.inner.p) |q| { q.v = 5; }
+    w.inner.p = null;
+    *S p2 = &w.arr[1];
+    p2.p = a;
+    if (w.arr[1].p) |q| { r += q.v; }
+    w.arr[1].p = null;
+    *S p3 = &t;
+    p3 = getp(&s);
+    p3.p = a;
+    if (s.p) |q| { r += q.v; }
+    s.p = null;
+    if (t.p) |q| { return 90; }
+    free(a);
+    if (w.inner.p) |q| { return 91; }
+    if (s.p) |q| { return 92; }
+    if (r != 10) { return 93; }
+    return 0;
+}

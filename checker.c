@@ -845,6 +845,7 @@ static void checker_add_diag(Checker *c, int line, int severity, const char *fmt
 }
 
 static void checker_error(Checker *c, int line, const char *fmt, ...) {
+    if (c->diag_quiet) { c->diag_quiet_hits++; return; }   /* BUG-1386 */
     c->error_count++;
     va_list args;
     va_start(args, fmt);
@@ -859,6 +860,7 @@ static void checker_error(Checker *c, int line, const char *fmt, ...) {
 }
 
 static void checker_warning(Checker *c, int line, const char *fmt, ...) {
+    if (c->diag_quiet) { c->diag_quiet_hits++; return; }   /* BUG-1386 */
     c->warning_count++;
     va_list args;
     va_start(args, fmt);
@@ -8670,6 +8672,94 @@ static int64_t compute_type_size(Type *t) {
     return CONST_EVAL_FAIL;   /* BUG-1151: an unsized kind is unknown, not -1 */
 }
 
+/* BUG-1399: the first multi-byte field of `t` (placed at offset `off`) whose
+ * offset its natural alignment does not divide. Only a PACKED struct can place
+ * one there; a naturally laid-out aggregate pads every field. Arrays are
+ * checked over one alignment period (16 elements), a union at its data
+ * offset. Past the depth bound the answer is "misaligned" — the refusing one. */
+static bool mmio_misaligned_field(Type *t, int64_t off, int depth, const char **name,
+                                  uint32_t *nlen, int64_t *moff, int *malign) {
+    if (!t) return false;
+    if (depth > 64) { *name = "(nested too deeply to check)"; *nlen = 27; *moff = off; *malign = 0; return true; }
+    t = type_unwrap_distinct(t);
+    TypeKind k = type_dispatch_kind(t);
+    if (k == TYPE_STRUCT) {
+        int64_t total = 0;
+        bool packed = t->struct_type.is_packed;
+        for (uint32_t fi = 0; fi < t->struct_type.field_count; fi++) {
+            Type *ft = t->struct_type.fields[fi].type;
+            int64_t fsize = compute_type_size(ft);
+            if (fsize == CONST_EVAL_FAIL || fsize <= 0) return false;
+            int falign = packed ? 1 : type_alignment_bytes(ft);
+            if (falign < 1) falign = 1;
+            if (!packed && falign > 1 && (total % falign) != 0)
+                total += falign - (total % falign);
+            int64_t abs = off + total;
+            TypeKind fk = type_dispatch_kind(ft);
+            if (fk == TYPE_STRUCT || fk == TYPE_UNION || fk == TYPE_ARRAY) {
+                if (mmio_misaligned_field(ft, abs, depth + 1, name, nlen, moff, malign)) {
+                    if (fk != TYPE_STRUCT && fk != TYPE_UNION) {
+                        *name = t->struct_type.fields[fi].name;
+                        *nlen = t->struct_type.fields[fi].name_len;
+                    }
+                    return true;
+                }
+            } else {
+                int a = type_alignment_bytes(ft);
+                if (a > 1 && (abs % a) != 0) {
+                    *name = t->struct_type.fields[fi].name; *nlen = t->struct_type.fields[fi].name_len; *moff = abs; *malign = a;
+                    return true;
+                }
+            }
+            total += fsize;
+        }
+        return false;
+    }
+    if (k == TYPE_ARRAY) {
+        int64_t es = compute_type_size(t->array.inner);
+        if (es == CONST_EVAL_FAIL || es <= 0) return false;
+        uint64_t n = t->array.size < 16 ? t->array.size : 16;
+        for (uint64_t i = 0; i < n; i++)
+            if (mmio_misaligned_field(t->array.inner, off + (int64_t)i * es, depth + 1,
+                                      name, nlen, moff, malign)) return true;
+        TypeKind ek = type_dispatch_kind(t->array.inner);
+        if (ek != TYPE_STRUCT && ek != TYPE_UNION && ek != TYPE_ARRAY) {
+            int a = type_alignment_bytes(t->array.inner);
+            for (uint64_t i = 0; i < n && a > 1; i++)
+                if (((off + (int64_t)i * es) % a) != 0) {
+                    *name = "(element)"; *nlen = 9; *moff = off + (int64_t)i * es; *malign = a;
+                    return true;
+                }
+        }
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        int da = 1;
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
+            int a = type_alignment_bytes(t->union_type.variants[i].type);
+            if (a > da) da = a;
+        }
+        int64_t doff = 4;
+        if (da > 1 && (doff % da) != 0) doff += da - (doff % da);
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++) {
+            Type *vt = t->union_type.variants[i].type;
+            TypeKind vk = type_dispatch_kind(vt);
+            if (vk == TYPE_STRUCT || vk == TYPE_UNION || vk == TYPE_ARRAY) {
+                if (mmio_misaligned_field(vt, off + doff, depth + 1, name, nlen, moff, malign))
+                    return true;
+            } else {
+                int a = type_alignment_bytes(vt);
+                if (a > 1 && ((off + doff) % a) != 0) {
+                    *name = t->union_type.variants[i].name; *nlen = t->union_type.variants[i].name_len; *moff = off + doff; *malign = a;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 /* BUG-1151: the Type `@size(...)` names — a type argument, a `uN` / `iN` name
  * (parsed as an identifier), or a variable's type. NULL when unresolved. */
 static Type *resolve_type(Checker *c, TypeNode *tn);
@@ -10655,6 +10745,46 @@ static int         _cident_depth = 0;
  * bound real (it stops a long NON-cyclic chain, which is not an error of the same
  * kind). The name stack detects an actual CYCLE, which no depth bound can name
  * correctly. */
+/* BUG-1386: may a const's initializer be typed speculatively, before the pass
+ * that owns it? Only a constant-shaped tree — literals, names, unary / binary
+ * operators and casts. A call is excluded: a comptime call may name a function
+ * declared later, and typing a call has effects beyond the typemap. An
+ * if-chain on purpose: anything unlisted answers NO (fall back to the untyped
+ * fold, the old behaviour). */
+static bool tfold(Checker *c, Node *n, int depth, int64_t *out);   /* fwd, below */
+static bool const_init_shape_ok(Node *e, int depth) {
+    if (!e || depth > 256) return false;
+    if (e->kind == NODE_INT_LIT || e->kind == NODE_CHAR_LIT || e->kind == NODE_IDENT)
+        return true;
+    if (e->kind == NODE_UNARY)
+        return (e->unary.op == TOK_MINUS || e->unary.op == TOK_TILDE ||
+                e->unary.op == TOK_PLUS) && const_init_shape_ok(e->unary.operand, depth + 1);
+    if (e->kind == NODE_TYPECAST) return const_init_shape_ok(e->typecast.expr, depth + 1);
+    if (e->kind == NODE_BINARY)
+        return const_init_shape_ok(e->binary.left, depth + 1) &&
+               const_init_shape_ok(e->binary.right, depth + 1);
+    return false;
+}
+
+static bool const_init_typed_on_demand(Checker *c, Symbol *sym, Node *init) {
+    if (typemap_get(c, init)) return true;           /* already typed */
+    if (!const_init_shape_ok(init, 0)) return false;
+    Scope *saved_scope = c->current_scope;
+    if (sym->func_node && sym->func_node->kind == NODE_GLOBAL_VAR)
+        c->current_scope = c->global_scope;
+    int saved_hits = c->diag_quiet_hits;
+    c->diag_quiet++;
+    (void)check_expr(c, init);
+    c->diag_quiet--;
+    c->current_scope = saved_scope;
+    bool clean = c->diag_quiet_hits == saved_hits;
+    if (!clean) return false;
+    /* the literal retyping the declaration's own check performs (LIT-1) */
+    if (is_pure_int_literal_expr(init))
+        retype_const_int_to_target(c, init, sym->type);
+    return true;
+}
+
 static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_len,
                                    int depth) {
     Checker *c = (Checker *)ctx;
@@ -10686,6 +10816,23 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
             _cident_len[_cident_depth]  = name_len;
             _cident_depth++;
             fold_size_intrinsics_in(c, init, 0);   /* BUG-1151 */
+            /* BUG-1386: the const's value is its initializer computed at its
+             * TYPES (`const u32 X = (0 - 1) / 536870912 + 1;` is 8: `0 - 1`
+             * wraps in u32). The untyped fold below reads `0 - 1` as -1 and
+             * gives 1, so a GLOBAL `u32[X]` — resolved at registration, before
+             * any initializer was typed — had 1 element while a local had 8.
+             * Type the initializer now if it has not been, and fold it typed. */
+            {
+                int64_t tv;
+                if (sym->type && type_is_integer(sym->type) &&
+                    const_init_typed_on_demand(c, sym, init) &&
+                    tfold(c, init, depth, &tv)) {
+                    _cident_depth--;
+                    uint16_t wb = 0; bool ws = false;
+                    ct_type_width(sym->type, &wb, &ws);
+                    return ct_wrap(tv, wb, ws);
+                }
+            }
             /* `depth`, NOT 0 — that reset is what made the bound useless. */
             int64_t v = eval_const_expr_ex(init, depth, resolve_const_ident, ctx);
             _cident_depth--;
@@ -10960,8 +11107,24 @@ static bool tfold(Checker *c, Node *n, int depth, int64_t *out) {
             sym->func_node->kind != NODE_GLOBAL_VAR) return false;
         Node *init = sym->func_node->var_decl.init;
         if (!init || !tfold_type(sym->type, &ty)) return false;
+        /* BUG-1386: the same chain guard resolve_const_ident applies (cycle
+         * and CONST_CHAIN_MAX): past it this fold gives up, and the untyped
+         * resolver reports the chain with its own diagnostic. */
+        for (int ci = 0; ci < _cident_depth; ci++)
+            if (_cident_len[ci] == (uint32_t)n->ident.name_len &&
+                memcmp(_cident_name[ci], n->ident.name, n->ident.name_len) == 0)
+                return false;
+        if (_cident_depth >= CONST_CHAIN_MAX) return false;
+        /* a const read before its own declaration was checked (a global array
+         * size at registration) has an untyped initializer */
+        if (!const_init_typed_on_demand(c, sym, init)) return false;
+        _cident_name[_cident_depth] = n->ident.name;
+        _cident_len[_cident_depth] = (uint32_t)n->ident.name_len;
+        _cident_depth++;
         int64_t v;
-        if (!tfold(c, init, depth + 1, &v)) return false;
+        bool okf = tfold(c, init, depth + 1, &v);
+        _cident_depth--;
+        if (!okf) return false;
         return tfold_wrap((uint64_t)v, &ty, out);
     }
     case NODE_TYPECAST: {
@@ -18309,6 +18472,26 @@ static Type *check_expr(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@inttoptr target must be a pointer type, got '%s'",
                             type_name(result));
+                    } else if (res_eff->pointer.inner) {
+                        /* BUG-1399: a PACKED layout over a device. A multi-byte
+                         * field at an offset its alignment does not divide is an
+                         * unaligned access to device memory — a hard fault on
+                         * Cortex-M Device memory, and on a target without
+                         * unaligned access GCC splits it into byte accesses, which
+                         * a register does not survive either. */
+                        const char *mf = NULL; uint32_t mfl = 0; int64_t moff = 0; int malign = 0;
+                        if (mmio_misaligned_field(res_eff->pointer.inner, 0, 0,
+                                                  &mf, &mfl, &moff, &malign))
+                            checker_error(c, node->loc.line,
+                                "@inttoptr over '%s': field '%.*s' lies at offset %lld, "
+                                "which its %d-byte alignment does not divide — an "
+                                "unaligned access to device memory (a fault on "
+                                "Cortex-M, split byte accesses elsewhere). Lay the "
+                                "register block out with naturally aligned fields "
+                                "(explicit padding) instead of a packed struct",
+                                type_name(res_eff->pointer.inner),
+                                (int)(mf ? mfl : 1), mf ? mf : "?",
+                                (long long)moff, malign);
                     }
                     /* BUG-989: the FOURTH enum-forging door.
                      *
@@ -18503,7 +18686,9 @@ static Type *check_expr(Checker *c, Node *node) {
                         if (result) {
                             Type *inner = type_unwrap_distinct(result);
                             if (inner->kind == TYPE_POINTER && inner->pointer.inner) {
-                                align = type_alignment_bytes(inner->pointer.inner);
+                                /* BUG-1399: the alignment the ACCESSES need —
+                                 * a packed struct's own alignment is 1 */
+                                align = type_access_alignment(inner->pointer.inner);
                                 if (align > 1 && (addr % (uint64_t)align) != 0) {
                                     aligned = 0;
                                 }
@@ -34547,17 +34732,125 @@ static struct FuncSharedTypes *add_func_shared_cache(Checker *c,
     return entry;
 }
 
-static void fsc_add_type_id(struct FuncSharedTypes *fsc, uint32_t type_id) {
-    for (int i = 0; i < fsc->type_count; i++)
-        if (fsc->type_ids[i] == type_id) return; /* dedup */
+/* BUG-1398: which INSTANCE of a shared type a function locks. */
+enum { FSI_ANY = 0, FSI_GLOBAL = 1, FSI_PARAM = 2, FSI_LOCAL = 3 };
+
+/* Record that the function locks `type_id` on the given instance. Two
+ * different instances of one type join to ANY. */
+static void fsc_add_type_inst(struct FuncSharedTypes *fsc, uint32_t type_id, uint8_t kind,
+                              const char *name, uint32_t len, int param) {
+    for (int i = 0; i < fsc->type_count; i++) {
+        if (fsc->type_ids[i] != type_id) continue;
+        if (!fsc->inst_kind) return;
+        bool same = fsc->inst_kind[i] == kind && kind != FSI_ANY &&
+            (kind == FSI_PARAM ? fsc->inst_param[i] == param
+                               : (fsc->inst_name_len[i] == len && fsc->inst_name[i] &&
+                                  name && memcmp(fsc->inst_name[i], name, len) == 0));
+        if (!same) fsc->inst_kind[i] = FSI_ANY;
+        return;
+    }
     if (fsc->type_count >= fsc->type_capacity) {
         int nc = fsc->type_capacity < 8 ? 8 : fsc->type_capacity * 2;
         uint32_t *nids = realloc(fsc->type_ids, nc * sizeof(uint32_t));
         if (!nids) return;
         fsc->type_ids = nids;
+        uint8_t *nk = realloc(fsc->inst_kind, nc * sizeof(uint8_t));
+        if (nk) fsc->inst_kind = nk;
+        const char **nn = realloc(fsc->inst_name, nc * sizeof(char *));
+        if (nn) fsc->inst_name = nn;
+        uint32_t *nl = realloc(fsc->inst_name_len, nc * sizeof(uint32_t));
+        if (nl) fsc->inst_name_len = nl;
+        int *np = realloc(fsc->inst_param, nc * sizeof(int));
+        if (np) fsc->inst_param = np;
+        if (!nk || !nn || !nl || !np) {   /* the instance arrays are an option: drop them */
+            free(fsc->inst_kind); free(fsc->inst_name); free(fsc->inst_name_len);
+            free(fsc->inst_param);
+            fsc->inst_kind = NULL; fsc->inst_name = NULL; fsc->inst_name_len = NULL;
+            fsc->inst_param = NULL;
+        }
         fsc->type_capacity = nc;
     }
-    fsc->type_ids[fsc->type_count++] = type_id;
+    int k = fsc->type_count++;
+    fsc->type_ids[k] = type_id;
+    if (fsc->inst_kind) {
+        fsc->inst_kind[k] = kind;
+        fsc->inst_name[k] = name;
+        fsc->inst_name_len[k] = len;
+        fsc->inst_param[k] = param;
+    }
+}
+static void fsc_add_type_id(struct FuncSharedTypes *fsc, uint32_t type_id) {
+    fsc_add_type_inst(fsc, type_id, FSI_ANY, NULL, 0, -1);
+}
+/* the instance recorded for entry i (ANY when the arrays are absent) */
+static uint8_t fsc_inst_kind(const struct FuncSharedTypes *fsc, int i) {
+    return fsc->inst_kind ? fsc->inst_kind[i] : (uint8_t)FSI_ANY;
+}
+
+/* BUG-1398: the instance a shared access through `obj` locks, seen from the
+ * body of `fn` (NULL = a statement being checked, where a non-global name is a
+ * LOCAL instance). A global of the shared type itself is GLOBAL(name); a
+ * pointer PARAMETER of fn is PARAM(k); in a statement, a local struct or a
+ * local / param pointer is LOCAL(name); anything else is ANY. */
+static void lock_inst_of_obj(Checker *c, Node *obj, Node *fn, uint8_t *kind,
+                             const char **name, uint32_t *len, int *param) {
+    *kind = FSI_ANY; *name = NULL; *len = 0; *param = -1;
+    if (!obj || obj->kind != NODE_IDENT) return;
+    const char *nm = obj->ident.name;
+    uint32_t nl = (uint32_t)obj->ident.name_len;
+    if (fn && fn->kind == NODE_FUNC_DECL) {
+        for (int i = 0; i < fn->func_decl.param_count; i++) {
+            ParamDecl *pd = &fn->func_decl.params[i];
+            if (pd->name_len == nl && memcmp(pd->name, nm, nl) == 0) {
+                Type *pt = typemap_get(c, obj);
+                if (pt && type_dispatch_kind(pt) == TYPE_POINTER) { *kind = FSI_PARAM; *param = i; }
+                return;
+            }
+        }
+    }
+    /* a name the body declares itself is a local, even when a global shares it */
+    if (fn && fn->kind == NODE_FUNC_DECL && fn->func_decl.body &&
+        ast_name_bind_count(fn->func_decl.body, nm, nl) > 0) return;
+    if (!fn) {
+        /* a checked STATEMENT: a parameter or local of its function is one
+         * instance per name there (LOCAL), whatever global shares the name */
+        Node *sf = c->lockchk_func;
+        bool is_local = false;
+        if (sf && sf->kind == NODE_FUNC_DECL) {
+            for (int i = 0; i < sf->func_decl.param_count && !is_local; i++)
+                is_local = sf->func_decl.params[i].name_len == nl &&
+                           memcmp(sf->func_decl.params[i].name, nm, nl) == 0;
+            if (!is_local && sf->func_decl.body)
+                is_local = ast_name_bind_count(sf->func_decl.body, nm, nl) > 0;
+        }
+        if (is_local) { *kind = FSI_LOCAL; *name = nm; *len = nl; return; }
+    }
+    Symbol *gs = global_decl_lookup(c, nm, nl);
+    if (gs && gs->type && type_dispatch_kind(gs->type) == TYPE_STRUCT) {
+        *kind = FSI_GLOBAL; *name = nm; *len = nl;
+    }
+}
+
+/* BUG-1398: map a callee's PARAM(k) instance through this call's argument —
+ * `&G` is GLOBAL(G); a pointer that is the caller's own parameter is PARAM(j)
+ * (inside a summary) or LOCAL (inside a checked statement); `&L` / a pointer
+ * local of the statement is LOCAL(L). Anything else is ANY. */
+static void lock_inst_map_arg(Checker *c, Node *arg, Node *fn, uint8_t *kind,
+                              const char **name, uint32_t *len, int *param) {
+    *kind = FSI_ANY; *name = NULL; *len = 0; *param = -1;
+    if (!arg) return;
+    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+        lock_inst_of_obj(c, arg->unary.operand, fn, kind, name, len, param);
+        if (*kind == FSI_PARAM) *kind = FSI_ANY;   /* & of a by-value param */
+        return;
+    }
+    if (arg->kind == NODE_IDENT) {
+        Type *at = typemap_get(c, arg);
+        if (at && type_dispatch_kind(at) == TYPE_POINTER) {
+            lock_inst_of_obj(c, arg, fn, kind, name, len, param);
+            if (*kind == FSI_GLOBAL) *kind = FSI_ANY;   /* a global POINTER: aim unknown */
+        }
+    }
 }
 
 /* Scan a function body for direct shared struct field accesses (non-transitive).
@@ -34588,7 +34881,15 @@ static bool fsc_merge_bound_fn(Checker *c, Symbol *fs, void *ud) {
     compute_func_shared_types(c, fs->name, fs->name_len);
     struct FuncSharedTypes *src = find_func_shared_cache(c, fs->name, fs->name_len);
     if (src)
-        for (int i = 0; i < src->type_count; i++) fsc_add_type_id(dst, src->type_ids[i]);
+        for (int i = 0; i < src->type_count; i++) {
+            /* BUG-1398: a named-global instance survives the merge; a param
+             * instance cannot be mapped without the call, so it is ANY */
+            if (fsc_inst_kind(src, i) == FSI_GLOBAL)
+                fsc_add_type_inst(dst, src->type_ids[i], FSI_GLOBAL, src->inst_name[i],
+                                  src->inst_name_len[i], -1);
+            else
+                fsc_add_type_id(dst, src->type_ids[i]);
+        }
     return false;
 }
 
@@ -34611,6 +34912,8 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
     }
 
     DeclModuleSave dm = decl_module_enter(c, sym);   /* BUG-1199 */
+    Node *saved_scan_func = c->fsc_scan_func;       /* BUG-1398 */
+    c->fsc_scan_func = sym->func_node;
     /* 1. Scan body for direct shared accesses */
     scan_body_shared_types(c, sym->func_node->func_decl.body, fsc);
 
@@ -34620,6 +34923,7 @@ static void compute_func_shared_types(Checker *c, const char *fname, uint32_t fl
         for (int i = 0; i < body->block.stmt_count; i++)
             scan_body_shared_types(c, body->block.stmts[i], fsc);
     }
+    c->fsc_scan_func = saved_scan_func;
     decl_module_leave(c, dm);
 
     fsc->computed = true;
@@ -34660,12 +34964,15 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
             }
             if (ot) {
                 Type *eff = type_unwrap_distinct(ot);
+                uint8_t ik; const char *inm; uint32_t inl; int ip;   /* BUG-1398 */
+                lock_inst_of_obj(c, obj, c->fsc_scan_func, &ik, &inm, &inl, &ip);
+                if (ik == FSI_LOCAL) ik = FSI_ANY;   /* no caller can name it */
                 if (eff->kind == TYPE_STRUCT && eff->struct_type.is_shared)
-                    fsc_add_type_id(fsc, eff->struct_type.type_id);
+                    fsc_add_type_inst(fsc, eff->struct_type.type_id, ik, inm, inl, ip);
                 if (eff->kind == TYPE_POINTER) {
                     Type *inner = type_unwrap_distinct(eff->pointer.inner);
                     if (inner && inner->kind == TYPE_STRUCT && inner->struct_type.is_shared)
-                        fsc_add_type_id(fsc, inner->struct_type.type_id);
+                        fsc_add_type_inst(fsc, inner->struct_type.type_id, ik, inm, inl, ip);
                 }
             }
             cur = obj;
@@ -34680,8 +34987,22 @@ static void scan_body_shared_types(Checker *c, Node *node, struct FuncSharedType
             compute_func_shared_types(c, cn, cl);
             struct FuncSharedTypes *callee_fsc = find_func_shared_cache(c, cn, cl);
             if (callee_fsc) {
-                for (int i = 0; i < callee_fsc->type_count; i++)
-                    fsc_add_type_id(fsc, callee_fsc->type_ids[i]);
+                for (int i = 0; i < callee_fsc->type_count; i++) {
+                    /* BUG-1398: the callee's instance, seen from here */
+                    uint8_t ik = fsc_inst_kind(callee_fsc, i);
+                    const char *inm = NULL; uint32_t inl = 0; int ip = -1;
+                    if (ik == FSI_GLOBAL) {
+                        inm = callee_fsc->inst_name[i]; inl = callee_fsc->inst_name_len[i];
+                    } else if (ik == FSI_PARAM) {
+                        int k = callee_fsc->inst_param[i];
+                        Node *a = (k >= 0 && k < node->call.arg_count) ? node->call.args[k] : NULL;
+                        lock_inst_map_arg(c, a, c->fsc_scan_func, &ik, &inm, &inl, &ip);
+                        if (ik == FSI_LOCAL) ik = FSI_ANY;
+                    } else {
+                        ik = FSI_ANY;
+                    }
+                    fsc_add_type_inst(fsc, callee_fsc->type_ids[i], ik, inm, inl, ip);
+                }
             }
         }
         /* BUG-1310: an INDIRECT call (`ops.f()`, a funcptr local / param) merges
@@ -35003,6 +35324,78 @@ static int collect_shared_in_spawn_args(Checker *c, Node *sp,
     return count;
 }
 
+static void lockchk_check_call(Checker *c, Node *call, struct FuncSharedTypes *fsc);
+/* BUG-1398: one candidate target of an indirect call. */
+static bool lockchk_indirect_fn(Checker *c, Symbol *fs, void *ud) {
+    Node *call = (Node *)ud;
+    if (!fs || !fs->name) return false;
+    compute_func_shared_types(c, fs->name, fs->name_len);
+    struct FuncSharedTypes *f = find_func_shared_cache(c, fs->name, fs->name_len);
+    if (f) lockchk_check_call(c, call, f);
+    return false;
+}
+
+/* BUG-1398: record a lock this statement takes directly — its type and the
+ * instance (GLOBAL / LOCAL name, or ANY). rw types are BUG-980's rule. */
+static void lockchk_add_root(Checker *c, Type *shared, Node *obj) {
+    if (!shared || shared->struct_type.is_shared_rw) return;
+    uint8_t k; const char *nm; uint32_t nl; int prm;
+    lock_inst_of_obj(c, obj, NULL, &k, &nm, &nl, &prm);
+    if (c->lockchk_root_n >= c->lockchk_root_cap) {
+        int nc = c->lockchk_root_cap < 8 ? 8 : c->lockchk_root_cap * 2;
+        struct LockInst *na = (struct LockInst *)realloc(c->lockchk_roots,
+                                                         (size_t)nc * sizeof(*na));
+        if (!na) return;
+        c->lockchk_roots = na;
+        c->lockchk_root_cap = nc;
+    }
+    struct LockInst *r = &c->lockchk_roots[c->lockchk_root_n++];
+    r->type_id = shared->struct_type.type_id;
+    r->kind = k;
+    r->name = nm;
+    r->len = nl;
+}
+
+/* BUG-1398: a call inside a statement that holds plain `shared` locks. The
+ * mutex is recursive, so the callee re-taking an instance this statement
+ * already holds is fine — but taking ANOTHER instance of the same type nests
+ * two locks, and a thread doing the same in the opposite order deadlocks
+ * (`a.v = xfer(&b)` here, `b.v = xfer(&a)` there). A callee instance the
+ * statement provably holds is safe; anything else is the hazard. */
+static void lockchk_check_call(Checker *c, Node *call, struct FuncSharedTypes *fsc) {
+    if (c->lockchk_hazard_call) return;
+    for (int i = 0; i < fsc->type_count; i++) {
+        uint32_t tid = fsc->type_ids[i];
+        bool held = false;
+        for (int r = 0; r < c->lockchk_root_n && !held; r++)
+            held = c->lockchk_roots[r].type_id == tid;
+        if (!held) continue;
+        uint8_t ik = fsc_inst_kind(fsc, i);
+        const char *inm = NULL; uint32_t inl = 0; int ip = -1;
+        if (ik == FSI_GLOBAL) {
+            inm = fsc->inst_name[i]; inl = fsc->inst_name_len[i];
+        } else if (ik == FSI_PARAM) {
+            int k = fsc->inst_param[i];
+            Node *a = (k >= 0 && k < call->call.arg_count) ? call->call.args[k] : NULL;
+            lock_inst_map_arg(c, a, NULL, &ik, &inm, &inl, &ip);
+        } else {
+            ik = FSI_ANY;
+        }
+        bool same = false;
+        if (ik == FSI_GLOBAL || ik == FSI_LOCAL)
+            for (int r = 0; r < c->lockchk_root_n && !same; r++) {
+                struct LockInst *L = &c->lockchk_roots[r];
+                same = L->type_id == tid && L->kind == ik && L->len == inl &&
+                       L->name && inm && memcmp(L->name, inm, inl) == 0;
+            }
+        if (!same) {
+            c->lockchk_hazard_call = call;
+            c->lockchk_hazard_type = tid;
+            return;
+        }
+    }
+}
+
 static int collect_shared_types_in_expr(Checker *c, Node *expr,
                                          Type **types, int max_types, int count) {
     if (!expr || count >= max_types) return count;
@@ -35044,6 +35437,8 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                 /* BUG-980: in CALLEE-ONLY mode the statement's own accesses are
                  * not the subject — only what its callees reach is. */
                 if (shared && c->lockchk_callee_only) shared = NULL;
+                /* BUG-1398: remember WHICH instance this statement locks */
+                if (shared && c->lockchk_collect_roots) lockchk_add_root(c, shared, obj);
                 if (shared) {
                     bool dup = false;
                     for (int i = 0; i < count; i++) {
@@ -35161,6 +35556,23 @@ static int collect_shared_types_in_expr(Checker *c, Node *expr,
                  * which is a large over-rejection bought for nothing. */
                 if (!cs || !cs->is_function)
                     c->lockchk_saw_opaque_call = true;
+            }
+        }
+        /* BUG-1398: lock order across THIS call, against the instances the
+         * statement holds. Outside the `count < max_types` gates below: the
+         * type list filling up must not switch the check off. */
+        if (c->lockchk_root_n > 0 && !c->lockchk_collect_roots && expr->call.callee) {
+            if (callee_names_function(c, expr->call.callee)) {
+                const char *cn0 = expr->call.callee->ident.name;
+                uint32_t cl0 = (uint32_t)expr->call.callee->ident.name_len;
+                compute_func_shared_types(c, cn0, cl0);
+                struct FuncSharedTypes *f0 = find_func_shared_cache(c, cn0, cl0);
+                if (f0) lockchk_check_call(c, expr, f0);
+            } else {
+                /* each function the pointer may call, with ITS instances mapped
+                 * through this call's arguments — `fp = f; g.v = fp();` where f
+                 * re-takes g is the recursive re-entry, legal like a direct call */
+                indirect_callee_functions(c, expr->call.callee, lockchk_indirect_fn, expr);
             }
         }
         /* BUG-1310: the functions an INDIRECT callee can reach contribute their
@@ -35431,6 +35843,47 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
                 }
             }
         }
+        /* BUG-1398: lock order ACROSS A CALL. The statement holds plain
+         * `shared` locks on the instances it touches directly; a callee taking
+         * a DIFFERENT instance of one of those types nests a second lock of the
+         * same type, and two threads doing it in opposite order deadlock
+         * (BUG-1376 ordered the statement's OWN locks; this is the callee's). */
+        if (ndirect > 0) {
+            c->lockchk_root_n = 0;
+            c->lockchk_hazard_call = NULL;
+            c->lockchk_collect_roots = true;
+            c->lockchk_direct_only = true;
+            (void)collect_shared_types_in_stmt(c, stmt, found, 4);
+            c->lockchk_direct_only = false;
+            c->lockchk_collect_roots = false;
+            if (c->lockchk_root_n > 0) {
+                c->lockchk_callee_only = true;
+                (void)collect_shared_types_in_stmt(c, stmt, found, 4);
+                c->lockchk_callee_only = false;
+                Node *hz = c->lockchk_hazard_call;
+                if (hz) {
+                    const char *tn = "?"; uint32_t tl = 1;
+                    for (uint32_t si = 0; si < c->global_scope->symbol_count; si++) {
+                        Symbol *gsy = c->global_scope->symbols[si];
+                        Type *e2 = gsy->type ? type_unwrap_distinct(gsy->type) : NULL;
+                        if (e2 && type_dispatch_kind(e2) == TYPE_STRUCT &&
+                            e2->struct_type.type_id == c->lockchk_hazard_type) {
+                            tn = e2->struct_type.name; tl = e2->struct_type.name_len;
+                            break;
+                        }
+                    }
+                    checker_error(c, stmt->loc.line,
+                        "this statement holds the lock on a '%.*s' and calls a function "
+                        "that may lock ANOTHER '%.*s' — two locks of one type nested, "
+                        "and a thread doing the same in the opposite order deadlocks. "
+                        "Make the call in its own statement (read its result into a "
+                        "local first)",
+                        (int)tl, tn, (int)tl, tn);
+                }
+            }
+            c->lockchk_root_n = 0;
+            c->lockchk_hazard_call = NULL;
+        }
         /* NOTE: this must gate the CHECK ONLY, never the recursion below. A first
          * draft used `continue` here and silently stopped descending into nested
          * bodies whose OWN statements had a direct access — `do { a.x = b.y; }
@@ -35531,7 +35984,10 @@ static void check_lock_ordering(Checker *c, Node *file_node) {
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *decl = file_node->file.decls[i];
         if (decl->kind == NODE_FUNC_DECL && decl->func_decl.body) {
+            Node *saved = c->lockchk_func;          /* BUG-1398 */
+            c->lockchk_func = decl;
             check_block_lock_ordering(c, decl->func_decl.body);
+            c->lockchk_func = saved;
         }
     }
 }

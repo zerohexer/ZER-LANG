@@ -1,0 +1,14 @@
+// BUG-1398 BOUNDARY: a statement holding a plain `shared` lock may call a
+// function that re-takes the SAME instance (the mutex is recursive) — through
+// the same global, or through the statement's own pointer parameter.
+shared struct Acc { u32 v; }
+Acc a1;
+u32 bump(*Acc p) { p.v += 1; return p.v; }
+u32 fwd(*Acc q) { return bump(q); }
+u32 twice(*Acc x) { x.v = bump(x) + 1; return x.v; }
+u32 main() {
+    a1.v = fwd(&a1);
+    if (a1.v != 1) { return 1; }
+    if (twice(&a1) != 3) { return 2; }
+    return 0;
+}

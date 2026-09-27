@@ -1,0 +1,23 @@
+// BUG-1386: a GLOBAL array sized by a const whose value needs TYPED arithmetic
+// ((0 - 1) wraps in u32; A + A wraps in u8) had the untyped size (1 / refused).
+const u32 X = (0 - 1) / 536870912 + 1;
+struct S { u32[X] f; }
+u32[X] gb;
+u32 main1() { S s; u32[X] loc; [*]u32 a = gb; [*]u32 b = loc; [*]u32 c = s.f;
+  if (X != 8) { return 1; } if (a.len != 8 || b.len != 8 || c.len != 8) { return 2; }
+  if (@size(u32[X]) != 32) { return 3; } gb = loc; return 0; }
+const u8 A = 200;
+const u32 B = (u32)(A + A);
+u32[B] g;
+const i8 N = -3;
+const u32 M = (u32)(N * N);
+u32[M] g2;
+u32 main() {
+    if (main1() != 0) { return 10; }
+    if (B != 144) { return 11; }
+    [*]u32 s = g;
+    if (s.len != 144) { return 12; }
+    [*]u32 s2 = g2;
+    if (s2.len != 9) { return 13; }
+    return 0;
+}

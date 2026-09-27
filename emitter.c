@@ -465,6 +465,61 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
     return false;
 }
 
+/* BUG-1378: does evaluating `n` READ volatile memory anywhere inside it? The
+ * single-evaluation decision for an index asked expr_is_volatile, which answers
+ * for a PLACE (`hv`, `reg.status`) — so `g[hv + 0]`, `g[gs.v % 16]`, `s[hv * 1]`
+ * took the comma form `(check((size_t)(hv + 0), 8), g)[hv + 0]`: two loads of
+ * the volatile, the access using a value that was never checked (an ISR or a
+ * device can change it in between). Exhaustive; any node the walk does not
+ * model answers YES (single evaluation is always correct, only dearer). */
+static bool expr_is_volatile(Emitter *e, Node *expr);
+static bool expr_reads_volatile(Emitter *e, Node *n, IRFunc *func) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_IDENT:
+        if (func) {   /* an IR local carries its own qualifier */
+            for (int li = 0; li < func->local_count; li++)
+                if (func->locals[li].name_len == (uint32_t)n->ident.name_len &&
+                    memcmp(func->locals[li].name, n->ident.name, n->ident.name_len) == 0)
+                    return func->locals[li].is_volatile;
+        }
+        return expr_is_volatile(e, n);
+    case NODE_FIELD:
+        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->field.object, func);
+    case NODE_INDEX:
+        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->index_expr.object, func) ||
+               expr_reads_volatile(e, n->index_expr.index, func);
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && expr_is_volatile(e, n)) return true;
+        return expr_reads_volatile(e, n->unary.operand, func);
+    case NODE_BINARY:
+        return expr_reads_volatile(e, n->binary.left, func) || expr_reads_volatile(e, n->binary.right, func);
+    case NODE_TYPECAST:
+        return expr_reads_volatile(e, n->typecast.expr, func);
+    case NODE_SLICE:
+        return expr_reads_volatile(e, n->slice.object, func) ||
+               expr_reads_volatile(e, n->slice.start, func) || expr_reads_volatile(e, n->slice.end, func);
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+        return false;
+    /* A call / assignment / intrinsic / orelse is a side effect already
+     * (expr_has_side_effects); everything else is not an expression. */
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
+
 /* A field-access OBJECT needs C parentheses when its emitted form binds LOOSER
  * than the postfix `.`/`->` accessor. Without them valid ZER `(*p).field`
  * mis-emits as `*p.field` = C `*(p.field)` — uncompilable, or (with a pointer
@@ -2373,6 +2428,38 @@ static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     }
 }
 
+/* BUG-1385: the EXPRESSION form of the N-bit wrap, around a value of a
+ * non-native uN / iN type — `(u2)x` is x mod 4, `(i3)x` sign-extends bit 2. The
+ * IR_CAST emission masked; the passthrough (a plain assignment, an index, a
+ * defer body) and AST (global initializer) casts emitted a bare C carrier cast,
+ * so `s = (u32)(u2)x;` stored 6 for x == 6 (the var-decl form stored 2) and
+ * `a[(u2)x]` trapped on a valid index. Returns true when it opened a wrap; the
+ * caller emits the value and then emit_intn_value_wrap_close. */
+static bool emit_intn_value_wrap_open(Emitter *e, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return false;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return false;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+    const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+    if (k == TYPE_UINT) emit(e, "((%s)((", su);
+    else emit(e, "((%s)((%s)(", ss, su);
+    return true;
+}
+static void emit_intn_value_wrap_close(Emitter *e, Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64) emit(e, ") & 0x%llxULL))", (unsigned long long)((1ULL << nb) - 1ULL));
+        else emit(e, ") & ((((unsigned __int128)1u) << %u) - 1u)))", nb);
+    } else {
+        emit(e, ") << %u) >> %u)", cw - nb, cw - nb);
+    }
+}
+
 /* True if t is a non-native-width uN/iN scalar (needs post-store masking). */
 static bool type_is_nonnative_intn(Type *t) {
     if (!t) return false;
@@ -2826,6 +2913,14 @@ static void emit_int_literal(Emitter *e, Node *node) {
     Type *eff = lt ? type_unwrap_distinct(lt) : NULL;
     int w = (eff && type_is_integer(eff)) ? type_width(eff) : 0;
     bool sg = w > 0 && type_is_signed(eff);
+    if (w > 64) {
+        /* BUG-1384: a literal of a 65..128-bit type is an operand of 128-bit
+         * arithmetic; as a bare `…ULL` it is 64-bit in C, so `a = 0xFFFF_FFFF_
+         * FFFF_FFFF + 1` wrapped to 0 at 64 bits (the var-decl form, lowered to
+         * a typed temp, gave 2^64). */
+        emit(e, "((%s)%lluULL)", sg ? "__int128" : "unsigned __int128", v);
+        return;
+    }
     if (v > 0xFFFFFFFFULL || w > 32) {
         /* The width comes from the TYPE, not the value: a small literal inside a
          * 64-bit expression must still be 64-bit or the operation wraps at 32. A
@@ -4698,6 +4793,17 @@ static void emit_expr_impl(Emitter *e, Node *node) {
     case NODE_TYPECAST: {
         /* (Type)expr — emit as C cast for primitives.
          * For *opaque round-trips, emit the _zer_opaque unwrap/wrap. */
+        if (!e->intn_cast_wrapping) {   /* BUG-1385: the N-bit wrap, once */
+            Type *wt = checker_get_type(e->checker, node);
+            if (emit_intn_value_wrap_open(e, wt)) {
+                e->intn_cast_wrapping = true;
+                emit_expr(e, node);
+                e->intn_cast_wrapping = false;
+                emit_intn_value_wrap_close(e, wt);
+                break;
+            }
+        }
+        e->intn_cast_wrapping = false;
         Type *tgt = checker_get_type(e->checker, node);
         Type *src = checker_get_type(e->checker, node->typecast.expr);
         Type *tgt_eff = tgt ? type_unwrap_distinct(tgt) : NULL;
@@ -6651,6 +6757,35 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
                 emit(e, " = ");
                 emit_expr(e, gci);
                 emitted_const = true;
+            }
+            {
+                /* BUG-1384: a u65..u128 / i65..i128 initializer cannot be folded
+                 * (the constant evaluators are 64-bit: `u128 g = 0xFFFF_FFFF_
+                 * FFFF_FFFF;` emitted `= (-1)`, all ones; `… + 1` emitted 0).
+                 * The checker admits only literals under + - * & | ^ ~ and casts
+                 * there (global_wide_init_ok), which is a C constant expression
+                 * once each literal carries the 128-bit type — GCC folds it
+                 * exactly as the same code computes at run time. Wrapped to N. */
+                Type *gt = type ? type_unwrap_distinct(type) : NULL;
+                if (!emitted_const && gt && type_is_integer(gt) && type_width(gt) > 64) {
+                    int nb = type_width(gt);
+                    bool sgn = type_is_signed(gt);
+                    emit(e, " = ");
+                    if (nb >= 128) {
+                        emit(e, "(%s)(", sgn ? "__int128" : "unsigned __int128");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ")");
+                    } else if (!sgn) {
+                        emit(e, "((unsigned __int128)(");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ") & (((unsigned __int128)1 << %d) - 1))", nb);
+                    } else {
+                        emit(e, "((__int128)((unsigned __int128)(");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ") << %d) >> %d)", 128 - nb, 128 - nb);
+                    }
+                    emitted_const = true;
+                }
             }
             if (!emitted_const) {
                 /* BUG-1090: typed fold first (see the optional arm above).
@@ -9344,7 +9479,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
          * different value or pops a second entry. expr_is_volatile spans
          * the field chain; OR it in to route through the single-eval
          * statement-expression branch. */
-        if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
+        if (expr_reads_volatile(e, node->index_expr.index, func)) idx_se = true;   /* BUG-1378 */
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
         /* BUG-1098: an ident index the checker declined to auto-guard because the
          * statement may change it — the check and the access must read it ONCE,
@@ -12304,11 +12439,13 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             emit_f2i_close(e, t3, tmp);
             return;
         }
+        bool w3 = emit_intn_value_wrap_open(e, t3);   /* BUG-1385 */
         emit(e, "((");
         if (t3) emit_type(e, t3);
         emit(e, ")");
         emit_rewritten_node(e, node->typecast.expr, func);
         emit(e, ")");
+        if (w3) emit_intn_value_wrap_close(e, t3);
         return;
     }
 

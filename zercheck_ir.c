@@ -154,6 +154,9 @@ typedef struct {
      * thread keeps the value for ever, which a caller must learn through the
      * summary (FuncSummary.transfers_param). */
     bool spawn_transferred;
+    /* BUG-1380: handed to a callee the analysis cannot see (a funcptr call) —
+     * it may have freed or kept it; the summary tells the caller so. */
+    bool handed_off;
     /* BUG-1230: this entry is an INTERIOR view of its allocation — a sub-slice
      * that does not start at 0, or the address of an element / field. It shares
      * the allocation's lifetime (alloc_id) but is not the pointer the allocator
@@ -2505,12 +2508,58 @@ static Node *ir_move_source(ZerCheck *zc, IRFunc *func, Node *e) {
  * Shared by ir_extract_compound_key (so every sink resolves the projection)
  * and ir_register_global_field_store (which needs the key for its
  * clear-on-null-reset branch). Returns true iff `expr` is such a projection. */
+/* BUG-1383: `X[a..b][i]` with LITERAL a and i names the element `X[a+i]` —
+ * rewrite the projection chain so the key builders (which key a literal index
+ * and stop at a slice) see it. Without this, `garr[0..2][0] = a; free(a);` left
+ * the global slot untracked and a later `if (garr[0]) |q| { q.v }` read a
+ * recycled object. Arena-allocated copies; the program's AST is untouched. */
+static Node *ir_rebase_slice_index(ZerCheck *zc, Node *e, int depth) {
+    if (!e || depth > 64) return e;
+    if (e->kind == NODE_FIELD) {
+        Node *o = ir_rebase_slice_index(zc, e->field.object, depth + 1);
+        if (o == e->field.object) return e;
+        Node *n = (Node *)arena_alloc(zc->arena, sizeof(Node));
+        if (!n) return e;
+        *n = *e; n->field.object = o;
+        return n;
+    }
+    if (e->kind != NODE_INDEX) return e;
+    Node *o = ir_rebase_slice_index(zc, e->index_expr.object, depth + 1);
+    Node *ix = e->index_expr.index;
+    if (o && o->kind == NODE_SLICE && ix && ix->kind == NODE_INT_LIT) {
+        Node *st = o->slice.start;
+        uint64_t base = 0;
+        if (st) {
+            if (st->kind != NODE_INT_LIT) goto plain;
+            base = st->int_lit.value;
+        }
+        Node *lit = (Node *)arena_alloc(zc->arena, sizeof(Node));
+        Node *n = (Node *)arena_alloc(zc->arena, sizeof(Node));
+        if (!lit || !n) return e;
+        *lit = *ix;
+        lit->int_lit.value = base + ix->int_lit.value;
+        *n = *e;
+        n->index_expr.object = ir_rebase_slice_index(zc, o->slice.object, depth + 1);
+        n->index_expr.index = lit;
+        return n;
+    }
+plain:
+    if (o == e->index_expr.object) return e;
+    {
+        Node *n = (Node *)arena_alloc(zc->arena, sizeof(Node));
+        if (!n) return e;
+        *n = *e; n->index_expr.object = o;
+        return n;
+    }
+}
+
 static bool ir_global_projection_key(ZerCheck *zc, IRFunc *func, Node *expr,
                                      const char **out_path, uint32_t *out_len) {
     *out_path = NULL;
     *out_len = 0;
     if (!expr) return false;
     if (expr->kind != NODE_FIELD && expr->kind != NODE_INDEX) return false;
+    expr = ir_rebase_slice_index(zc, expr, 0);   /* BUG-1383 */
     Node *root = ir_key_root_ident(expr);
     if (!root) return false;
     if (!ir_ident_is_unshadowed_global(zc, func, root)) return false;
@@ -2566,6 +2615,7 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (!expr) return -1;
     expr = ir_peel_launder(expr);  /* BUG-791/931: launders are identity for allocations */
     if (!expr) return -1;
+    expr = ir_rebase_slice_index(zc, expr, 0);   /* BUG-1383 */
 
     Node *root = ir_key_root_ident(expr);
     if (!root) return -1;
@@ -5224,6 +5274,15 @@ static void ir_check_ident_uaf(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                 "use after free: element %s (variable index) is %s (freed at line %d)",
                 ir_local_desc(zc, func, h->local_id, h->path, h->path_len),
                 ir_state_name(h->state), h->free_line);
+        } else if (h->path_len > 0 && h->path &&
+                   (h->local_id >= 0 || h->local_id == IR_GLOBAL_ROOT_ID)) {
+            /* BUG-1383: name the SLOT that holds the freed pointer (`'s.p'`),
+             * not its root — `'s' is freed` sent the reader to an object that
+             * was never freed. */
+            ir_zc_error(zc, line,
+                "use after free: %s is %s (freed at line %d)",
+                ir_local_desc(zc, func, h->local_id, h->path, h->path_len),
+                ir_state_name(h->state), h->free_line);
         } else
         ir_zc_error(zc, line,
             "use after free: '%.*s' is %s (freed at line %d)",
@@ -7589,6 +7648,17 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
         if (ir_extract_compound_key(zc, func, ps, arg,
                                     &root_local, &path, &path_len) != 0)
             continue;
+        /* BUG-1380: a PARAM handed to the unknown callee has no entry (it is
+         * not an allocation of this frame), so nothing reached the summary and
+         * `apply(freer, a); a.v` read a freed object in the CALLER (exit 99).
+         * Record the hand-off for the summary; the param's own later uses in
+         * this body stay unchanged (the callback idiom — `m.hash_fn(key)` then
+         * `key` — would otherwise be refused wholesale). */
+        if (path_len == 0 && root_local >= 0 && root_local < func->local_count &&
+            func->locals[root_local].is_param && !ir_find_handle(ps, root_local)) {
+            int pp = ir_param_position(func, root_local);
+            if (pp >= 0 && pp < 64) zc->cur_handoff_params |= (1ULL << pp);
+        }
         /* Widen matching entries: exact compound for `b.h` args; for a
          * bare root, every entry on that root (the bare handle AND any
          * compound fields — a by-value struct copy carries them all). */
@@ -7603,6 +7673,7 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
             h->state = IR_HS_MAYBE_FREED;
             h->free_line = line;
             h->escaped = true;
+            h->handed_off = true;   /* BUG-1380 */
             /* Group propagation — aliases share the allocation. Also
              * escape them: ownership of the ALLOCATION was handed off,
              * so an untouched alias must not flag as a leak. */
@@ -7615,6 +7686,7 @@ static void ir_indirect_call_barrier(ZerCheck *zc, IRFunc *func,
                     g->state = IR_HS_MAYBE_FREED;
                     g->free_line = line;
                     g->escaped = true;
+                    g->handed_off = true;   /* BUG-1380 */
                 }
             }
         }
@@ -11861,7 +11933,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                     ir_state_name(h->state), ir_local_desc(zc, func, arg_local, NULL, 0));
             }
 
-            if (!bare && xf == 2) {
+            if (!bare && (xf & 3) == 2) {
                 /* BUG-1280: every path hands it to a fire-and-forget thread —
                  * exactly what a direct `spawn f(p)` does to p. */
                 ir_mark_transferred(ps, h, inst->source_line);
@@ -11875,6 +11947,15 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
 
             /* Propagate to aliases */
             ir_propagate_alias_state(ps, h, new_state, inst->source_line);
+            /* BUG-1380: the callee handed it to code it cannot see — ownership
+             * may have gone with it, exactly as at a direct funcptr call: not
+             * this frame's leak any more. */
+            if ((xf & 4) && !summary->frees_param[pi]) {
+                int aid = h->alloc_id;
+                h->escaped = true;
+                for (int gi = 0; aid != 0 && gi < ps->handle_count; gi++)
+                    if (ps->handles[gi].alloc_id == aid) ps->handles[gi].escaped = true;
+            }
             }
             }
             }
@@ -12770,6 +12851,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * never trust it across calls (an IRFunc address can be reused). */
     _ir_kx_func = NULL;
     zc->cur_resets_arena = false;   /* BUG-1172 */
+    zc->cur_handoff_params = 0;     /* BUG-1380 */
     zc->cur_freed_global_n = 0;     /* BUG-1181 */
     zc->cur_arena_backing_n = 0;    /* BUG-1268 */
     if (!zc->building_summary)
@@ -13051,6 +13133,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             for (int i = 0; i < pc; i++) all_ret_field_freed[i] = true;
             /* BUG-1280: transfer accumulators (see FuncSummary.transfers_param) */
             bool *any_xfer = (bool *)calloc(pc, sizeof(bool));
+            bool *any_handoff = (bool *)calloc(pc, sizeof(bool));   /* BUG-1380 */
             bool *all_xfer = (bool *)malloc(pc * sizeof(bool));
             for (int i = 0; i < pc; i++) all_xfer[i] = true;
             int return_blocks = 0;
@@ -13145,6 +13228,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         all_xfer[i] = false;
                         continue;
                     }
+                    if (h->state == IR_HS_MAYBE_FREED && h->handed_off)
+                        any_handoff[i] = true;   /* BUG-1380 */
                     if (h->state == IR_HS_TRANSFERRED && h->spawn_transferred)
                         any_xfer[i] = true;   /* BUG-1280 */
                     else
@@ -13181,12 +13266,19 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
             }
             for (int i = 0; i < pc; i++) {   /* BUG-1280 */
+                if (i < 64 && (zc->cur_handoff_params & (1ULL << i)))
+                    any_handoff[i] = true;
+                if (any_handoff && any_handoff[i]) {   /* BUG-1380: bit 4 */
+                    if (!xfer) xfer = (unsigned char *)calloc(pc, 1);
+                    if (xfer) xfer[i] |= 4;
+                }
                 if (!any_xfer[i]) continue;
                 if (!xfer) xfer = (unsigned char *)calloc(pc, 1);
-                if (xfer) xfer[i] = (return_blocks > 0 && all_xfer[i]) ? 2 : 1;
+                if (xfer) xfer[i] |= (return_blocks > 0 && all_xfer[i]) ? 2 : 1;
             }
             free(any_xfer);
             free(all_xfer);
+            free(any_handoff);
             free(all_return_blocks_freed);
             free(any_return_saw_alive);
             free(all_ret_field_freed);

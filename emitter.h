@@ -154,6 +154,7 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+    bool intn_cast_wrapping;   /* BUG-1385: inside the N-bit wrap of a (uN)x cast */
 
     /* BUG-1027: slice typedefs for element types that have NO pre-emitted named
      * typedef — pointer, optional-value, funcptr, array, nested slice, *opaque.

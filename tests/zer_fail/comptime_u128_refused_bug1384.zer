@@ -1,0 +1,7 @@
+// expect-error: comptime function 'F' uses an integer wider than 64 bits
+comptime u128 F() { return 0xFFFF_FFFF_FFFF_FFFF + 1; }
+u32 main() {
+    u128 x = F();
+    if ((x >> 64) != 1) { return 1; }
+    return 0;
+}

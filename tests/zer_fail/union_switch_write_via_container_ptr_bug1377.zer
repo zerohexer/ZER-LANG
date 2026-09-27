@@ -1,0 +1,21 @@
+// expect-error: cannot mutate union
+// BUG-1377: a write through a pointer to the struct that HOLDS the switched
+// union (`*W pw = &w; pw.u.p = …`) — only a pointer to the union itself was
+// recognised as an alias.
+struct T { u32 v; }
+struct Big { u32[64] a; }
+T t0;
+Big b0;
+union U { *T p; *Big q; }
+struct W { U u; }
+u32 main() {
+    W w;
+    w.u.q = &b0;
+    *W pw = &w;
+    u32 r = 0;
+    switch (w.u) {
+        .q => |*bq| { pw.u.p = &t0; r = (*bq).a[2]; }
+        .p => |m| { r = 1; }
+    }
+    return r;
+}

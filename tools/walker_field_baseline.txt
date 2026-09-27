@@ -2040,3 +2040,45 @@ ir_lower.c:hoist_place_effects:NODE_TYPECAST:typecast.expr
 ir_lower.c:hoist_place_effects:NODE_VAR_DECL:var_decl.init
 ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.body
 ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.cond
+
+# --- emitter.c: expr_reads_volatile (BUG-1378) ---
+# Every kind listed without descent answers YES (a call / assignment / intrinsic /
+# orelse is already a side effect; a statement kind is not an index expression),
+# which forces the single-evaluation form — the conservative verdict.
+emitter.c:expr_reads_volatile:NODE_ASM:asm_stmt.inputs
+emitter.c:expr_reads_volatile:NODE_ASM:asm_stmt.outputs
+emitter.c:expr_reads_volatile:NODE_ASSIGN:assign.target
+emitter.c:expr_reads_volatile:NODE_ASSIGN:assign.value
+emitter.c:expr_reads_volatile:NODE_AWAIT:await_stmt.cond
+emitter.c:expr_reads_volatile:NODE_BLOCK:block.stmts
+emitter.c:expr_reads_volatile:NODE_CALL:call.args
+emitter.c:expr_reads_volatile:NODE_CALL:call.callee
+emitter.c:expr_reads_volatile:NODE_CRITICAL:critical.body
+emitter.c:expr_reads_volatile:NODE_DEFER:defer.body
+emitter.c:expr_reads_volatile:NODE_DO_WHILE:while_stmt.body
+emitter.c:expr_reads_volatile:NODE_DO_WHILE:while_stmt.cond
+emitter.c:expr_reads_volatile:NODE_EXPR_STMT:expr_stmt.expr
+emitter.c:expr_reads_volatile:NODE_FILE:file.decls
+emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.body
+emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.cond
+emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.init
+emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.step
+emitter.c:expr_reads_volatile:NODE_FUNC_DECL:func_decl.body
+emitter.c:expr_reads_volatile:NODE_GLOBAL_VAR:var_decl.init
+emitter.c:expr_reads_volatile:NODE_IF:if_stmt.cond
+emitter.c:expr_reads_volatile:NODE_IF:if_stmt.else_body
+emitter.c:expr_reads_volatile:NODE_IF:if_stmt.then_body
+emitter.c:expr_reads_volatile:NODE_INTERRUPT:interrupt.body
+emitter.c:expr_reads_volatile:NODE_INTRINSIC:intrinsic.args
+emitter.c:expr_reads_volatile:NODE_ONCE:once.body
+emitter.c:expr_reads_volatile:NODE_ORELSE:orelse.expr
+emitter.c:expr_reads_volatile:NODE_ORELSE:orelse.fallback
+emitter.c:expr_reads_volatile:NODE_RETURN:ret.expr
+emitter.c:expr_reads_volatile:NODE_SPAWN:spawn_stmt.args
+emitter.c:expr_reads_volatile:NODE_STATIC_ASSERT:static_assert_stmt.cond
+emitter.c:expr_reads_volatile:NODE_STRUCT_INIT:struct_init.fields
+emitter.c:expr_reads_volatile:NODE_SWITCH:switch_stmt.arms
+emitter.c:expr_reads_volatile:NODE_SWITCH:switch_stmt.expr
+emitter.c:expr_reads_volatile:NODE_VAR_DECL:var_decl.init
+emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.body
+emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.cond

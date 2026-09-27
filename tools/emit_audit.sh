@@ -137,6 +137,25 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1378 — an index that READS a volatile inside an expression (`g[hv + 1]`,
+# `g[vs.v % 16]`) must be evaluated ONCE: the check and the access on one load.
+# The comma form `(check((size_t)(hv + 1U), 8), g)[(hv + 1U)]` read it twice.
+cat > "$req_dir/volidx.zer" <<'ZEOF'
+u32[8] g;
+volatile u32 hv = 2;
+u32 main() { g[hv + 1] = 1; return 0; }
+ZEOF
+if "$ZERC" "$req_dir/volidx.zer" -o "$req_dir/volidx.c" >/dev/null 2>&1; then
+    n=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/volidx.c" | grep -o 'hv + 1U' | wc -l)
+    if [ "$n" -ne 1 ]; then
+        echo "MISSING EMISSION: a volatile read inside an index is evaluated $n times (want 1)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the volatile-index sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 # BUG-1019 — the null-function-pointer guard, at all THREE call-emission paths.
 #
 # Same silent-drop shape as the lock cap above, and worse to lose: a dropped

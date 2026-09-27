@@ -1,0 +1,6 @@
+// expect-error: wider than 64 bits must be built from integer literals
+u128 G = (0xFFFF_FFFF_FFFF_FFFF + 1) >> 1;
+u32 main() {
+    if ((G >> 63) != 1) { return 1; }
+    return 0;
+}

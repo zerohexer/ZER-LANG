@@ -73,6 +73,12 @@ static bool type_carries_data_pointer(Type *t, int depth) {
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     if (k == TYPE_POINTER || k == TYPE_OPAQUE || k == TYPE_SLICE) return true;
+    /* BUG-1382: an Arena CARRIES a pointer to its backing store — `ga =
+     * Arena.over(b)` in a helper retained the caller's stack buffer in a global
+     * arena, and `return mk_arena(buf)` handed a local buffer out of its frame
+     * (ASan stack-use-after-return in the arena's memset), because every value
+     * sink asked this predicate and an Arena answered "no pointer". */
+    if (k == TYPE_ARENA) return true;
     if (k == TYPE_OPTIONAL)
         return type_carries_data_pointer(u->optional.inner, depth + 1);
     if (k == TYPE_ARRAY)
@@ -2568,6 +2574,33 @@ static void track_dyn_freed_index(Checker *c, Node *call_node) {
     }
 }
 
+/* BUG-1377: does a value of type `t` hold a `u` BY VALUE (itself, a field at
+ * any depth, an array element, a union variant)? The type graph is finite and
+ * acyclic for by-value containment, so a depth bound only guards pathology —
+ * and past it the answer is "yes" (conservative for the mutation lock). */
+static bool type_holds_byvalue(Type *t, Type *u, int depth) {
+    t = t ? type_unwrap_distinct(t) : NULL;
+    if (!t || !u) return false;
+    if (t == u) return true;
+    if (depth > 256) return true;
+    switch (type_dispatch_kind(t)) {
+    case TYPE_STRUCT:
+        for (uint32_t i = 0; i < t->struct_type.field_count; i++)
+            if (type_holds_byvalue(t->struct_type.fields[i].type, u, depth + 1)) return true;
+        return false;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < t->union_type.variant_count; i++)
+            if (type_holds_byvalue(t->union_type.variants[i].type, u, depth + 1)) return true;
+        return false;
+    case TYPE_ARRAY:
+        return type_holds_byvalue(t->array.inner, u, depth + 1);
+    case TYPE_OPTIONAL:
+        return type_holds_byvalue(t->optional.inner, u, depth + 1);
+    default:
+        return false;
+    }
+}
+
 /* B2 refactor: Check if union mutation is blocked by switch arm lock.
  * Walks field_object to root ident, checks name match + pointer alias + precise key.
  * Returns true if mutation should be blocked (caller emits error + breaks).
@@ -2704,6 +2737,7 @@ static Type *prov_map_get(Checker *c, const char *key, uint32_t key_len) {
  * escape-matrix holes H1-H4 (test_escape_matrix.c, 2026-06-07). Conservative:
  * any deref-of-pointer target counts as a potential escape (over-rejection of
  * local-pointer-to-local is acceptable; under-rejection is a safety hole). */
+static Node *unwrap_ptr_launder(Node *v);   /* BUG-1379: fwd */
 static void classify_escape_sink(Checker *c, Node *target,
                                  Symbol **out_sym, bool *is_global, bool *is_param_ptr) {
     *out_sym = NULL; *is_global = false; *is_param_ptr = false;
@@ -2724,6 +2758,21 @@ static void classify_escape_sink(Checker *c, Node *target,
         else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR) {
             obj = root->unary.operand; through_deref = true;
             through_indirection = true;
+        }
+        /* BUG-1379: a SLICE of the destination (`garr[0..2][0] = &x`) names the
+         * same storage as the object sliced; a LAUNDER (`@ptrcast(*H, gp).p`,
+         * `@container(*O, &go.h, h).h.p`, `(*H)gp`) is the pointer it launders;
+         * `&x` as a chain step (the @container argument) is x's storage. The walk
+         * stopped at all three, so the root was "not an ident" and the store of a
+         * stack address into a global was accepted (ASan stack-use-after-return). */
+        else if (root->kind == NODE_SLICE) { obj = root->slice.object; through_deref = true; }
+        else if (root->kind == NODE_UNARY && root->unary.op == TOK_AMP) {
+            obj = root->unary.operand;
+        }
+        else if ((root->kind == NODE_INTRINSIC || root->kind == NODE_TYPECAST) &&
+                 unwrap_ptr_launder(root) != root) {
+            obj = unwrap_ptr_launder(root); through_deref = true;
+            through_indirection = true;
         } else break;
         if (obj && !through_indirection) {
             Type *ot = typemap_get(c, obj);
@@ -2736,6 +2785,22 @@ static void classify_escape_sink(Checker *c, Node *target,
                 through_indirection = true;
         }
         root = obj;
+    }
+    if (root && root->kind != NODE_IDENT && through_deref) {
+        /* BUG-1379: the destination is reached from a value this analysis
+         * cannot place — a CALL result (`*slot() = p`, `hp().p = p`), an
+         * `orelse` (`(gm orelse &gh).p`), any other computed pointer. It is not
+         * provably this frame's memory, so it is a sink (the conservative
+         * answer; BUG-260 already refused the `&local` spelling through a call,
+         * and now every sink rule — including keep inference — agrees). */
+        static Symbol unknown_dest;
+        if (!unknown_dest.name) {
+            unknown_dest.name = "(computed destination)";
+            unknown_dest.name_len = (uint32_t)strlen(unknown_dest.name);
+        }
+        *out_sym = &unknown_dest;
+        *is_param_ptr = true;
+        return;
     }
     if (!root || root->kind != NODE_IDENT) return;
     Symbol *ts = scope_lookup(c->current_scope,
@@ -12529,10 +12594,13 @@ static Type *check_expr(Checker *c, Node *node) {
                     Type *obj_type = checker_get_type(c, troot->field.object);
                     if (!obj_type) obj_type = check_expr(c, troot->field.object);
                     Type *unwrapped = type_unwrap_distinct(obj_type);
-                    /* check if the object is a pointer to the locked union */
+                    /* check if the object is a pointer to the locked union — or,
+                     * BUG-1377, to anything that HOLDS it (`*W pw = &w;
+                     * pw.u.p = …` inside `switch (w.u)`) */
                     if (unwrapped && unwrapped->kind == TYPE_POINTER) {
                         Type *inner = type_unwrap_distinct(unwrapped->pointer.inner);
-                        if (inner == c->union_switch_type)
+                        if (inner == c->union_switch_type ||
+                            type_holds_byvalue(inner, c->union_switch_type, 0))
                             locked_via_alias = true;
                     }
                 }
@@ -12543,6 +12611,32 @@ static Type *check_expr(Checker *c, Node *node) {
                 else if (troot->kind == NODE_INDEX)
                     troot = troot->index_expr.object;
                 else break;
+            }
+            /* BUG-1377: the switched union is reached through a pointer, so
+             * a write to ANY object holding a union of this type may be it
+             * (`switch (pw.u)` with pw = &w, then `w.u.p = …` or `w = w2`). */
+            if (troot && troot->kind == NODE_IDENT && c->union_switch_via_ptr &&
+                c->union_switch_type && !locked_via_alias) {
+                Type *rt0 = typemap_get(c, troot);
+                if (!rt0) {
+                    Symbol *rs = scope_lookup(c->current_scope, troot->ident.name,
+                                              (uint32_t)troot->ident.name_len);
+                    rt0 = rs ? rs->type : NULL;
+                }
+                /* ...and the write reaches the union: the target holds one, or
+                 * its path passes through one. `w9.x = 1` (another field) does not. */
+                bool reaches = false;
+                for (Node *pn = node->assign.target; pn && !reaches; ) {
+                    Type *pt = typemap_get(c, pn);
+                    if (pt && type_holds_byvalue(pt, c->union_switch_type, 0)) reaches = true;
+                    if (pn->kind == NODE_FIELD) pn = pn->field.object;
+                    else if (pn->kind == NODE_INDEX) pn = pn->index_expr.object;
+                    else if (pn->kind == NODE_UNARY && pn->unary.op == TOK_STAR) pn = pn->unary.operand;
+                    else break;
+                    if (pn && pn->kind == NODE_IDENT) break;   /* the root itself is not the write */
+                }
+                if (rt0 && reaches && type_holds_byvalue(rt0, c->union_switch_type, 0))
+                    locked_via_alias = true;
             }
             if (troot && troot->kind == NODE_IDENT &&
                 (locked_via_alias ||
@@ -12563,8 +12657,18 @@ static Type *check_expr(Checker *c, Node *node) {
                             if (tgt_key.str[di] == '.') { last_dot = &tgt_key.str[di]; break; }
                         }
                         int cmp_len = last_dot ? (int)(last_dot - tgt_key.str) : tgt_key.len;
-                        if (cmp_len != (int)c->union_switch_key_len ||
-                            memcmp(tgt_key.str, c->union_switch_key, cmp_len) != 0) {
+                        /* BUG-1377: disjoint only when NEITHER key is a prefix
+                         * of the other at a path boundary. The target `w` (or
+                         * `w = { .u = … }`) is the switched `w.u`'s ANCESTOR —
+                         * a whole-struct write replaces the union under the
+                         * capture — and was let through as "a different element". */
+                        int kl = (int)c->union_switch_key_len;
+                        int tl = tgt_key.len;
+                        const char *ks = c->union_switch_key;
+                        bool t_is_prefix = tl <= kl && memcmp(ks, tgt_key.str, tl) == 0 &&
+                                           (tl == kl || ks[tl] == '.' || ks[tl] == '[');
+                        if (!t_is_prefix &&
+                            (cmp_len != kl || memcmp(tgt_key.str, ks, cmp_len) != 0)) {
                             blocked = false; /* different element, safe */
                         }
                     }
@@ -14808,6 +14912,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        /* BUG-1381: a Ring is global storage, so a pointer
+                         * PARAM pushed into it (or carried by the pushed
+                         * value) is retained past the call — keep, exactly as
+                         * a store to a global infers it. `void send(M m) {
+                         * r.push(m); }` then `send({ .p = &x })` put a stack
+                         * address in the channel (ASan stack-use-after-return). */
+                        if (elt && type_carries_data_pointer(elt, 0))
+                            infer_mark_param_keep_mask(c,
+                                keep_value_roots(c, node->call.args[0], 0));
                         if (container_push_arg_escapes(c, elt, node->call.args[0]))
                             checker_error(c, node->loc.line,
                                 "cannot push a local-derived pointer through Ring channel — "
@@ -14833,6 +14946,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
                                 "pointer may not be valid in receiver context");
+                        /* BUG-1381: a Ring is global storage, so a pointer
+                         * PARAM pushed into it (or carried by the pushed
+                         * value) is retained past the call — keep, exactly as
+                         * a store to a global infers it. `void send(M m) {
+                         * r.push(m); }` then `send({ .p = &x })` put a stack
+                         * address in the channel (ASan stack-use-after-return). */
+                        if (elt && type_carries_data_pointer(elt, 0))
+                            infer_mark_param_keep_mask(c,
+                                keep_value_roots(c, node->call.args[0], 0));
                         if (container_push_arg_escapes(c, elt, node->call.args[0]))
                             checker_error(c, node->loc.line,
                                 "cannot push a local-derived pointer through Ring channel — "
@@ -22184,6 +22306,31 @@ static bool vrp_guard_hoist_sound(Checker *c, Node *idx) {
     return !vrp_expr_may_write_var(c, root, name, len, reachable, 0);
 }
 
+/* BUG-1384: can this initializer of a >64-bit global be emitted as a C
+ * constant expression that GCC folds at 128 bits? Literals, and + - * & | ^ ~
+ * unary minus and casts over them. (A shift / division lowers to a statement
+ * expression; a name is not a C constant.) */
+static bool global_wide_init_ok(Node *n, int depth) {
+    /* An if-chain on purpose: every kind not named here answers NO (refuse), so
+     * an unlisted kind can only over-reject. */
+    if (!n || depth > 256) return false;
+    if (n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT) return true;
+    if (n->kind == NODE_UNARY)
+        return (n->unary.op == TOK_MINUS || n->unary.op == TOK_TILDE) &&
+               global_wide_init_ok(n->unary.operand, depth + 1);
+    if (n->kind == NODE_TYPECAST)
+        return global_wide_init_ok(n->typecast.expr, depth + 1);
+    if (n->kind != NODE_BINARY) return false;
+    switch (n->binary.op) {
+    case TOK_PLUS: case TOK_MINUS: case TOK_STAR: case TOK_AMP:
+    case TOK_PIPE: case TOK_CARET:
+        return global_wide_init_ok(n->binary.left, depth + 1) &&
+               global_wide_init_ok(n->binary.right, depth + 1);
+    default:
+        return false;
+    }
+}
+
 static void check_stmt(Checker *c, Node *node) {
     if (!node) return;
 
@@ -22211,6 +22358,29 @@ static void check_stmt(Checker *c, Node *node) {
 
     case NODE_VAR_DECL:
     case NODE_GLOBAL_VAR: {
+            /* BUG-1384: a u65..u128 GLOBAL / static initializer is emitted as a
+             * C constant expression over 128-bit literals (the 64-bit folders
+             * gave wrong values) — so only what that can express is admitted. */
+            if (node->kind == NODE_VAR_DECL && node->var_decl.is_static &&
+                node->var_decl.init) {
+                Type *vt1 = resolve_type(c, node->var_decl.type);
+                if (vt1 && type_is_integer(vt1) && type_width(vt1) > 64 &&
+                    !global_wide_init_ok(node->var_decl.init, 0))
+                    checker_error(c, node->loc.line,
+                        "the initializer of a global / static wider than 64 bits must be "
+                        "built from integer literals with + - * & | ^ ~ and casts — the "
+                        "compile-time evaluators are 64-bit. Assign the value at run time");
+            }
+            /* BUG-1384: a u65..u128 local inside a comptime body is folded in
+             * 64 bits by the interpreter — refuse it (see the function rule). */
+            if (c->in_comptime_body && node->kind == NODE_VAR_DECL) {
+                Type *vt0 = resolve_type(c, node->var_decl.type);
+                if (vt0 && type_is_integer(vt0) && type_width(vt0) > 64)
+                    checker_error(c, node->loc.line,
+                        "a comptime body cannot hold an integer wider than 64 bits — "
+                        "compile-time evaluation is 64-bit, so the value would differ "
+                        "from the same code at run time");
+            }
             /* Deref-launder: `*T k = *pp;` binds an alias the analyzer cannot
              * follow — resolving it needs points-to over `pp`, which the per-file +
              * summaries model deliberately lacks. Level-A stance: cannot prove =>
@@ -24395,6 +24565,7 @@ static void check_stmt(Checker *c, Node *node) {
                 const char *saved_union_key = c->union_switch_key;
                 uint32_t saved_union_key_len = c->union_switch_key_len;
                 Type *saved_union_type = c->union_switch_type;
+                bool saved_union_via_ptr = c->union_switch_via_ptr;   /* BUG-1377 */
                 Type *saved_ucap_type = c->union_ptr_capture_type;          /* BUG-1186 */
                 const char *saved_ucap_name = c->union_ptr_capture_name;
                 uint32_t saved_ucap_len = c->union_ptr_capture_name_len;
@@ -24460,6 +24631,22 @@ static void check_stmt(Checker *c, Node *node) {
                         c->union_switch_var = lock_root->ident.name;
                         c->union_switch_var_len = (uint32_t)lock_root->ident.name_len;
                     }
+                    /* BUG-1377: is the switched union reached through a pointer? */
+                    c->union_switch_via_ptr = false;
+                    for (Node *pp = sw_expr; pp; ) {
+                        Node *obj = NULL;
+                        if (pp->kind == NODE_UNARY && pp->unary.op == TOK_STAR) { c->union_switch_via_ptr = true; break; }
+                        else if (pp->kind == NODE_FIELD) obj = pp->field.object;
+                        else if (pp->kind == NODE_INDEX) obj = pp->index_expr.object;
+                        else {
+                            Type *lt = typemap_get(c, pp);
+                            if (type_dispatch_kind(lt) == TYPE_POINTER) c->union_switch_via_ptr = true;
+                            break;
+                        }
+                        Type *ot = typemap_get(c, obj);
+                        if (type_dispatch_kind(ot) == TYPE_POINTER) { c->union_switch_via_ptr = true; break; }
+                        pp = obj;
+                    }
                     /* build full key for precise comparison */
                     ExprKey sw_key = build_expr_key_a(c, sw_expr);
                     if (sw_key.len > 0) {
@@ -24480,6 +24667,7 @@ static void check_stmt(Checker *c, Node *node) {
                 c->union_switch_key = saved_union_key;
                 c->union_switch_key_len = saved_union_key_len;
                 c->union_switch_type = saved_union_type;
+                c->union_switch_via_ptr = saved_union_via_ptr;
                 pop_scope(c);
             } else {
                 check_stmt_cond_body(c, arm->body);
@@ -28088,6 +28276,23 @@ static void register_decl(Checker *c, Node *node) {
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
         func_type->func_ptr.is_variadic = node->func_decl.is_variadic;
+        /* BUG-1384: the comptime interpreter computes in 64 bits. A comptime
+         * function taking or returning a u65..u128 / i65..i128 folded to a
+         * different value than the same function run at run time
+         * (`comptime u128 F() { return 0xFFFF_FFFF_FFFF_FFFF + 1; }` gave 0,
+         * a run-time twin 2^64) — refuse it rather than fold it wrongly. */
+        if (node->func_decl.is_comptime) {
+            bool wide = ret && type_is_integer(ret) && type_width(ret) > 64;
+            for (uint32_t i = 0; i < pc && !wide; i++)
+                if (params[i] && type_is_integer(params[i]) && type_width(params[i]) > 64)
+                    wide = true;
+            if (wide)
+                checker_error(c, node->loc.line,
+                    "comptime function '%.*s' uses an integer wider than 64 bits — "
+                    "compile-time evaluation is 64-bit, so its result would differ "
+                    "from the same code at run time. Use a run-time function",
+                    (int)node->func_decl.name_len, node->func_decl.name);
+        }
         /* carry keep flags from ParamDecl to Type. Keep inference (Site 1):
          * ALWAYS allocate param_keeps when the function has params, zero-init and
          * seeded from explicit `keep` annotations. The escape-inference pass
@@ -33542,6 +33747,18 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * (NODE_FIELD) are unaffected. */
             /* BUG-997's top-level `ginit->kind == NODE_IDENT` check lives inside
              * global_init_scan_c now (BUG-1127), at EVERY node of the tree. */
+            /* BUG-1384: the global sibling of the static-local rule in check_stmt
+             * — a u65..u128 initializer is emitted as a 128-bit C constant
+             * expression, so only what that expresses exactly is admitted. */
+            {
+                Type *wt = type ? type_unwrap_distinct(type) : NULL;
+                if (wt && type_is_integer(wt) && type_width(wt) > 64 &&
+                    !global_wide_init_ok(ginit, 0))
+                    checker_error(c, decl->loc.line,
+                        "the initializer of a global / static wider than 64 bits must be "
+                        "built from integer literals with + - * & | ^ ~ and casts — the "
+                        "compile-time evaluators are 64-bit. Assign the value at run time");
+            }
             /* global array init from variable — invalid C (arrays can't be init'd from variables) */
             if (type && type->kind == TYPE_ARRAY && ginit->kind == NODE_IDENT) {
                 checker_error(c, decl->loc.line,
@@ -33601,7 +33818,10 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * targets, and to non-negative results — a negative one is the
              * sign-conversion error BUG-890 reports just above. */
             if (decl->var_decl.init->kind != NODE_INT_LIT &&
-                type && type_is_integer(type_unwrap_distinct(type))) {
+                type && type_is_integer(type_unwrap_distinct(type)) &&
+                /* BUG-1384: never for a type wider than the 64-bit folders — the
+                 * emitter renders that tree as a 128-bit C constant instead. */
+                type_width(type_unwrap_distinct(type)) <= 64) {
                 /* BUG-1090: the TYPED fold, converted to the declared type — the
                  * value the same initializer computes on a LOCAL. The untyped
                  * fold folded `(0 - 1) / 1073741824` to 0 here while a local

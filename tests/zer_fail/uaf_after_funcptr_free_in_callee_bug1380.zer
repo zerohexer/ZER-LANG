@@ -1,0 +1,15 @@
+// expect-error: is maybe-freed
+// BUG-1380: a callee that hands its param to a FUNCTION POINTER (which may free
+// it) said nothing about the param in its summary — the argument-precise
+// barrier had no entry to widen for a param — so `apply(freer, a); a.v` read a
+// freed object in the caller (exit 99 with slot reuse).
+struct T { u32 v; }
+void apply(*(*T) f, *T p) { f(p); }
+void freer(*T p) { free(p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    apply(freer, a);
+    u32 r = a.v;
+    free(a);
+    return r;
+}

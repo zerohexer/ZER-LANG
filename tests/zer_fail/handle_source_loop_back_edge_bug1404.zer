@@ -1,0 +1,16 @@
+// BUG-1404: the use sits BEFORE the re-allocation in the text, but on the second
+// iteration it sees the pool handle — the source must be unknown from the start.
+// expect-error: cannot auto-deref Handle(Task)
+struct Task { u32 id; }
+Slab(Task) heap;
+Pool(Task, 4) pool;
+u32 main() {
+    Handle(Task) h = heap.alloc() orelse { return 1; };
+    for (u32 i = 0; i < 2; i += 1) {
+        h.id = i;
+        if (i == 0) { heap.free(h); } else { pool.free(h); }
+        h = pool.alloc() orelse { return 2; };
+    }
+    pool.free(h);
+    return 0;
+}

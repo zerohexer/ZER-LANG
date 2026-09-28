@@ -454,88 +454,11 @@ static void emit_decl_cname_in(Emitter *e, const char *mod, uint32_t mod_len,
 
 /* ---- Qualifier helpers (RF11) ---- */
 
-/* Walk an expression to its root ident and look up the symbol.
- * Returns the symbol or NULL if not found. Used to detect volatile/const. */
-static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
-    Node *root = expr;
-    while (root) {
-        if (root->kind == NODE_FIELD) root = root->field.object;
-        else if (root->kind == NODE_INDEX) root = root->index_expr.object;
-        else if (root->kind == NODE_SLICE) root = root->slice.object;
-        else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
-            root = root->unary.operand;
-        else break;
-    }
-    if (root && root->kind == NODE_IDENT) {
-        /* try local scope first, then global */
-        Symbol *s = scope_lookup(e->checker->current_scope,
-            root->ident.name, (uint32_t)root->ident.name_len);
-        if (!s) s = emit_decl_lookup(e, /* BUG-1450 */
-            root->ident.name, (uint32_t)root->ident.name_len);
-        return s;
-    }
-    return NULL;
-}
-
 /* Check if an expression's root symbol has volatile qualifier. */
 static bool expr_is_volatile(Emitter *e, Node *expr) {
-    Symbol *s = expr_root_symbol(e, expr);
-    if (s && s->is_volatile) return true;
-    /* BUG-414: check volatile struct fields. Walk field chain, look up
-     * SField.is_volatile for each field access. Handles: dev.regs where
-     * dev is non-volatile but regs field is volatile u8[4]. */
-    Node *n = expr;
-    /* BUG-1344: an access THROUGH a volatile pointer / volatile slice is volatile
-     * at every step — `r.fifo` / `r[i].fifo` for `volatile *Regs r`, `vs[i]` for a
-     * `volatile [*]T`. The field walk below only knew volatile FIELDS and the root
-     * symbol, so a whole-array copy out of a peripheral became a plain memmove. */
-    for (Node *w = expr; w; ) {
-        Node *obj = NULL;
-        if (w->kind == NODE_FIELD) obj = w->field.object;
-        else if (w->kind == NODE_INDEX) obj = w->index_expr.object;
-        else if (w->kind == NODE_UNARY && w->unary.op == TOK_STAR) obj = w->unary.operand;
-        else break;
-        Type *ot = obj ? checker_get_type(e->checker, obj) : NULL;
-        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
-        if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
-        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.is_volatile) return true;
-        if (oe && type_dispatch_kind(oe) == TYPE_SLICE && oe->slice.is_volatile) return true;
-        w = obj;
-    }
-    while (n && n->kind == NODE_FIELD) {
-        Type *obj_type = checker_get_type(e->checker, n->field.object);
-        if (obj_type) {
-            Type *eff = type_unwrap_distinct(obj_type);
-            /* BUG-749 (2026-06-18): pointer-to-struct auto-deref (`ptr.field`
-             * for `*S ptr`) must also be scanned. Pre-fix expr_is_volatile
-             * matched only direct struct values, so a volatile field reached
-             * via `reg.status` for `*MMIO reg` returned false, and any
-             * duplicating emitter (bounds-check + index) re-read the
-             * volatile location twice — silent volatile-semantics violation
-             * (program-consequence: a volatile-qualified read must be a
-             * single C-level load; hardware: read-clear/sequence-counter/
-             * FIFO registers misbehave). Unwrap pointer/optional here. */
-            if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
-            if (eff && eff->kind == TYPE_OPTIONAL) eff = type_unwrap_distinct(eff->optional.inner);
-            if (eff && eff->kind == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
-            if (eff && eff->kind == TYPE_STRUCT) {
-                for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
-                    if (eff->struct_type.fields[i].name_len == (uint32_t)n->field.field_name_len &&
-                        memcmp(eff->struct_type.fields[i].name, n->field.field_name,
-                               n->field.field_name_len) == 0) {
-                        if (eff->struct_type.fields[i].is_volatile) return true;
-                        /* also check type-level volatile (slice/pointer) */
-                        Type *ft = eff->struct_type.fields[i].type;
-                        if (ft && ft->kind == TYPE_SLICE && ft->slice.is_volatile) return true;
-                        if (ft && ft->kind == TYPE_POINTER && ft->pointer.is_volatile) return true;
-                        break;
-                    }
-                }
-            }
-        }
-        n = n->field.object;
-    }
-    return false;
+    /* BUG-1470: the one shared place-volatility query (moved to checker.c so
+     * ir_lower asks the identical question). */
+    return checker_place_is_volatile(e->checker, expr);
 }
 
 /* BUG-1378: does evaluating `n` READ volatile memory anywhere inside it? The
@@ -547,49 +470,9 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
  * model answers YES (single evaluation is always correct, only dearer). */
 static bool expr_is_volatile(Emitter *e, Node *expr);
 static bool expr_reads_volatile(Emitter *e, Node *n, IRFunc *func) {
-    if (!n) return false;
-    switch (n->kind) {
-    case NODE_IDENT:
-        if (func) {   /* an IR local carries its own qualifier */
-            for (int li = 0; li < func->local_count; li++)
-                if (func->locals[li].name_len == (uint32_t)n->ident.name_len &&
-                    memcmp(func->locals[li].name, n->ident.name, n->ident.name_len) == 0)
-                    return func->locals[li].is_volatile;
-        }
-        return expr_is_volatile(e, n);
-    case NODE_FIELD:
-        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->field.object, func);
-    case NODE_INDEX:
-        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->index_expr.object, func) ||
-               expr_reads_volatile(e, n->index_expr.index, func);
-    case NODE_UNARY:
-        if (n->unary.op == TOK_STAR && expr_is_volatile(e, n)) return true;
-        return expr_reads_volatile(e, n->unary.operand, func);
-    case NODE_BINARY:
-        return expr_reads_volatile(e, n->binary.left, func) || expr_reads_volatile(e, n->binary.right, func);
-    case NODE_TYPECAST:
-        return expr_reads_volatile(e, n->typecast.expr, func);
-    case NODE_SLICE:
-        return expr_reads_volatile(e, n->slice.object, func) ||
-               expr_reads_volatile(e, n->slice.start, func) || expr_reads_volatile(e, n->slice.end, func);
-    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
-    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
-        return false;
-    /* A call / assignment / intrinsic / orelse is a side effect already
-     * (expr_has_side_effects); everything else is not an expression. */
-    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
-    case NODE_STRUCT_INIT:
-    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
-    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
-    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
-    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
-    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
-    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
-    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
-    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
-        return true;
-    }
-    return true;
+    /* BUG-1470: shared with ir_lower (checker_expr_reads_volatile). */
+    return checker_expr_reads_volatile(e->checker, n,
+                                       func ? ir_local_volatile_by_name : NULL, func);
 }
 
 
@@ -733,6 +616,21 @@ static bool expr_has_side_effects(Node *n) {
         return false;
     }
     return false;
+}
+
+/* BUG-1470..1473: THE single-evaluation query. Every emission site that writes
+ * an expression's text more than once (a place re-read as `P = f(P, n)`, an
+ * index checked then used, a conditional `(x == 0) ? w : ctz(x)`, the
+ * float->int constant form) asks THIS, never expr_has_side_effects alone: a
+ * VOLATILE read is an effect for single evaluation — two loads may see two
+ * values (a thread / ISR / device changes it in between), so `g[hv % 8] <<= 1`
+ * shifted g[i2] into g[i1]. The AST path passes func == NULL and inherits the
+ * IR function it is emitted inside (a defer body), so a volatile LOCAL is seen. */
+static bool expr_needs_single_eval(Emitter *e, Node *n, IRFunc *func) {
+    if (!n) return false;
+    if (expr_has_side_effects(n)) return true;
+    if (!func) func = (IRFunc *)e->cur_ir_func;
+    return expr_reads_volatile(e, n, func);
 }
 
 /* ---- Type emission ---- */
@@ -1115,6 +1013,16 @@ static bool shared_is_rw(Type *t) {
 
 /* Emit lock acquire for shared struct variable.
  * For shared(rw) structs, is_write determines rdlock vs wrlock. */
+/* BUG-1475: `(uintptr_t)&root` (or the pointer itself for a `*S` root) — the
+ * identity the lock and unlock groups compare. */
+static void emit_lock_root_addr(Emitter *e, Node *root) {
+    Type *rt = checker_get_type(e->checker, root);
+    bool is_ptr = type_dispatch_kind(rt) == TYPE_POINTER;
+    emit(e, "(uintptr_t)%s(", is_ptr ? "" : "&");
+    emit_expr(e, root);
+    emit(e, ")");
+}
+
 static void emit_shared_lock_mode(Emitter *e, Node *root, bool is_write) {
     e->noreturn_scope_depth++;   /* BUG-835: counted HERE so all five call sites are
                                   * covered by construction, not by remembering. */
@@ -2320,7 +2228,7 @@ static bool emit_f2i_const(Emitter *e, Type *tgt, Node *operand) {
     f2i_bounds(tgt, &bits, &sg);
     if (bits <= 0 || bits > 128) return false;
     if (!operand) return false;
-    if (expr_has_side_effects(operand) || expr_is_volatile(e, operand)) return false;
+    if (expr_needs_single_eval(e, operand, NULL)) return false;   /* BUG-1473 */
 
     char lo[96], hi[96], mn[96], mx[96];
     f2i_limits(bits, sg, lo, hi, mn, mx, sizeof lo);
@@ -3790,7 +3698,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             /* Side-effect hoist — mirror IR path. Without this,
              * `arr[fn()] /= y` evaluates fn() twice when the INT_MIN
              * check fires (and once when it doesn't). */
-            bool tgt_se = expr_has_side_effects(node->assign.target);
+            bool tgt_se = expr_needs_single_eval(e, node->assign.target, NULL);   /* BUG-1471 */
             if (tgt_se) {
                 emit(e, "({ __typeof__(");
                 emit_expr(e, node->assign.value);
@@ -3838,7 +3746,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         if (node->assign.op == TOK_LSHIFTEQ || node->assign.op == TOK_RSHIFTEQ) {
             /* Unified side-effect check — partial walker pre-fix missed
              * NODE_INDEX.index calls. See expr_has_side_effects above. */
-            bool shift_side_effect = expr_has_side_effects(node->assign.target);
+            /* BUG-1471: a VOLATILE read in the target is an effect too —
+             * `g[hv % 8] <<= 1` emitted `g[i1] = _zer_shl(g[i2], 1)`. */
+            bool shift_side_effect = expr_needs_single_eval(e, node->assign.target, NULL);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
             int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
@@ -4478,12 +4388,17 @@ static void emit_expr_impl(Emitter *e, Node *node) {
          * NODE_CALL, NODE_ASSIGN: obvious side effects.
          * NODE_UNARY(deref): volatile pointer deref must not be double-read.
          * BUG-255: NODE_ORELSE may wrap a NODE_CALL (e.g. get() orelse 0). */
+        /* BUG-1472: the AST path (defer bodies of a labelled function, spawn
+         * arguments) asked a top-level kind test — `a[f() + 1]` / `a[hv % 8]`
+         * took the comma form and evaluated the index TWICE. Same query as the
+         * IR path now; the old walk is kept only as a floor. */
         bool idx_has_side_effects = (node->index_expr.index->kind == NODE_CALL ||
                                       node->index_expr.index->kind == NODE_ASSIGN ||
                                       node->index_expr.index->kind == NODE_UNARY ||
-                                      node->index_expr.index->kind == NODE_ORELSE);
+                                      node->index_expr.index->kind == NODE_ORELSE) ||
+                                    expr_needs_single_eval(e, node->index_expr.index, NULL);
         /* check if base object has side effects (e.g. get_slice()[0]) */
-        bool obj_has_side_effects = false;
+        bool obj_has_side_effects = expr_needs_single_eval(e, node->index_expr.object, NULL);
         {
             Node *n = node->index_expr.object;
             while (n) {
@@ -4497,19 +4412,39 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         }
         if (idx_obj_type && idx_obj_type->kind == TYPE_ARRAY &&
             (idx_obj_type->array.size > 0 || idx_obj_type->array.sizeof_type)) {
-            if (idx_has_side_effects) {
+            if (idx_has_side_effects || obj_has_side_effects) {
                 /* Single-eval lvalue path: pointer dereference preserves lvalue.
                  * *({ size_t _i = idx; check(_i); &arr[_i]; }) */
                 int tmp = e->temp_count++;
+                /* BUG-1472: an object with an effect of its own (a call, a
+                 * volatile index: `m[hv % 8][(hv + 1) % 8]`) is evaluated FIRST
+                 * and once, as the IR path does (BUG-1349) — only for an lvalue
+                 * object, `&(f().arr)` is not C. */
+                bool obj_hoist = obj_has_side_effects;
+                {
+                    Node *b = node->index_expr.object;
+                    while (b && (b->kind == NODE_FIELD || b->kind == NODE_INDEX))
+                        b = b->kind == NODE_FIELD ? b->field.object : b->index_expr.object;
+                    if (!b || !(b->kind == NODE_IDENT ||
+                                (b->kind == NODE_UNARY && b->unary.op == TOK_STAR)))
+                        obj_hoist = false;
+                }
                 /* BUG-1349: parenthesised — a postfix `[j]` / `.f` binds tighter
                  * than unary `*`, so a bare `*({...})[j]` indexed the POINTER:
                  * `m[id(1)][2] = 7` wrote m[3][0]. */
-                emit(e, "(*({ size_t _zer_idx%d = (size_t)(", tmp);
+                emit(e, "(*({ ");
+                if (obj_hoist) {
+                    emit(e, "__auto_type _zer_iob%d = &(", tmp);
+                    emit_expr(e, node->index_expr.object);
+                    emit(e, "); ");
+                }
+                emit(e, "size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
                 emit_array_size(e, idx_obj_type);
                 emit(e, ", __FILE__, __LINE__); &");
-                emit_expr(e, node->index_expr.object);
+                if (obj_hoist) emit(e, "(*_zer_iob%d)", tmp);
+                else emit_expr(e, node->index_expr.object);
                 emit(e, "[_zer_idx%d]; }))", tmp);
             } else {
                 /* Simple index — comma operator, preserves lvalue */
@@ -5746,7 +5681,21 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* AST emission is reachable from global initializers (file scope) where
                  * GCC statement expressions are not allowed. Use a conditional expression
                  * which double-evaluates the arg — safe for globals (constant expr) and
-                 * matches the IR-path semantics: ctz(0)/clz(0) → bit-width. */
+                 * matches the IR-path semantics: ctz(0)/clz(0) → bit-width.
+                 * BUG-1473: but inside a function (a defer body, a spawn
+                 * argument) an operand that must be evaluated once — a call, a
+                 * VOLATILE read (`@ctz(hv)`: the test and the ctz could see two
+                 * values, and ctz(0) is undefined) — takes the single-temp form. */
+                if (e->global_init_depth == 0 &&
+                    expr_needs_single_eval(e, node->intrinsic.args[0], NULL)) {
+                    int t = e->temp_count++;
+                    emit(e, "({ %s _zer_bz%d = ", w > 32 ? "uint64_t" : "uint32_t", t);
+                    bitq_operand_open(e, w);
+                    emit_expr(e, node->intrinsic.args[0]);
+                    bitq_operand_close(e, w);
+                    emit(e, "; (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
+                         t, bitq_count_width(w), (int)nlen, name, suffix, t);
+                } else {
                 emit(e, "(uint32_t)((");
                 bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
@@ -5756,6 +5705,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit_expr(e, node->intrinsic.args[0]);
                 bitq_operand_close(e, w);
                 emit(e, "))");
+                }
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
                 bitq_operand_open(e, w);
@@ -9656,8 +9606,11 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         Type *idx_obj_eff = idx_obj_type ? type_unwrap_distinct(idx_obj_type) : NULL;
         bool idx_slice = idx_obj_eff && idx_obj_eff->kind == TYPE_SLICE;
         bool idx_array = idx_obj_eff && idx_obj_eff->kind == TYPE_ARRAY;
-        bool idx_se = expr_has_side_effects(node->index_expr.index);
-        bool obj_se = expr_has_side_effects(node->index_expr.object);
+        /* BUG-1472: the one single-evaluation query for both halves — a
+         * volatile read in the OBJECT (`m[hv % 8][j]`) is an effect, so the
+         * object is evaluated first (left to right) and once. */
+        bool idx_se = expr_needs_single_eval(e, node->index_expr.index, func);
+        bool obj_se = expr_needs_single_eval(e, node->index_expr.object, func);
         /* BUG-749 (2026-06-18): a volatile read in the index expression
          * must single-eval, exactly like a CALL/INTRINSIC. Without this
          * check, a fixed-array index of the form `arr[reg.status]` (with
@@ -9960,7 +9913,8 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
              * partial walker descended only through NODE_FIELD.object /
              * NODE_INDEX.object and missed side effects in
              * NODE_INDEX.index — silently double-evaluating fn(). */
-            bool shift_side_effect = expr_has_side_effects(node->assign.target);
+            /* BUG-1471: a VOLATILE read in the target is an effect too. */
+            bool shift_side_effect = expr_needs_single_eval(e, node->assign.target, func);
             const char *macro = node->assign.op == TOK_LSHIFTEQ ? "_zer_shl" : "_zer_shr";
             int shw = shift_guard_width(checker_get_type(e->checker, node->assign.target));
             if (shift_side_effect) {
@@ -9996,7 +9950,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
              * `arr[fn()] /= y`), the INT_MIN check and the actual
              * division both re-emit the target — silently
              * double-evaluating fn(). Hoist via pointer to single-eval. */
-            bool tgt_se = expr_has_side_effects(node->assign.target);
+            bool tgt_se = expr_needs_single_eval(e, node->assign.target, func);   /* BUG-1471 */
             if (tgt_se) {
                 emit(e, "({ __typeof__(");
                 emit_rewritten_node(e, node->assign.value, func);
@@ -12147,7 +12101,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                  * GCC with "initializer element is not constant". The conditional
                  * form double-evaluates the arg, which is safe because the
                  * side-effect-free gate excludes calls / assigns / etc. */
-                if (!expr_has_side_effects(node->intrinsic.args[0])) {
+                if (!expr_needs_single_eval(e, node->intrinsic.args[0], func)) {   /* BUG-1473 */
                     emit(e, "(uint32_t)((");
                     bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
@@ -13761,21 +13715,33 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_indent(e);
                 emit(e, "{ uintptr_t _zer_la[%d] = { ", n);
                 for (int k = 0; k < n; k++) {
-                    Type *rt = checker_get_type(e->checker, inst[k].expr);
-                    bool is_ptr = type_dispatch_kind(rt) == TYPE_POINTER;
-                    emit(e, "%s(uintptr_t)%s(", k ? ", " : "", is_ptr ? "" : "&");
-                    emit_expr(e, inst[k].expr);
-                    emit(e, ")");
+                    emit(e, "%s", k ? ", " : "");
+                    emit_lock_root_addr(e, inst[k].expr);
                 }
+                emit(e, " };\n");
+                /* BUG-1475: two members may name ONE instance at run time
+                 * (`ga.v = p.v + 1` with p == &ga). Sorted by address with the
+                 * WRITE lock first among equals, a member whose address equals
+                 * the previous one is not taken again — the stronger mode is
+                 * held once. A non-recursive rwlock would otherwise take
+                 * wrlock then rdlock on itself (EDEADLK, ignored), and the
+                 * group unlock would release it twice. */
+                emit_indent(e);
+                emit(e, "  const unsigned char _zer_lw[%d] = { ", n);
+                for (int k = 0; k < n; k++) emit(e, "%s%d", k ? ", " : "", inst[k].src2_local != 0 ? 1 : 0);
                 emit(e, " };\n");
                 emit_indent(e);
                 emit(e, "  int _zer_lo[%d]; for (int _zer_i = 0; _zer_i < %d; _zer_i++) _zer_lo[_zer_i] = _zer_i;\n", n, n);
                 emit_indent(e);
                 emit(e, "  for (int _zer_i = 1; _zer_i < %d; _zer_i++) { int _zer_k = _zer_lo[_zer_i]; int _zer_j = _zer_i;"
-                        " while (_zer_j > 0 && _zer_la[_zer_lo[_zer_j - 1]] > _zer_la[_zer_k]) { _zer_lo[_zer_j] = _zer_lo[_zer_j - 1]; _zer_j--; }"
+                        " while (_zer_j > 0 && (_zer_la[_zer_lo[_zer_j - 1]] > _zer_la[_zer_k] ||"
+                        " (_zer_la[_zer_lo[_zer_j - 1]] == _zer_la[_zer_k] && _zer_lw[_zer_lo[_zer_j - 1]] < _zer_lw[_zer_k])))"
+                        " { _zer_lo[_zer_j] = _zer_lo[_zer_j - 1]; _zer_j--; }"
                         " _zer_lo[_zer_j] = _zer_k; }\n", n);
                 emit_indent(e);
-                emit(e, "  for (int _zer_i = 0; _zer_i < %d; _zer_i++) switch (_zer_lo[_zer_i]) {\n", n);
+                emit(e, "  for (int _zer_i = 0; _zer_i < %d; _zer_i++) {"
+                        " if (_zer_i > 0 && _zer_la[_zer_lo[_zer_i]] == _zer_la[_zer_lo[_zer_i - 1]]) continue;"
+                        " switch (_zer_lo[_zer_i]) {\n", n);
                 for (int k = 0; k < n; k++) {
                     emit_indent(e);
                     emit(e, "  case %d: {\n", k);
@@ -13784,7 +13750,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "  } break;\n");
                 }
                 emit_indent(e);
-                emit(e, "  default: break; }\n");
+                emit(e, "  default: break; } }\n");
                 emit_indent(e);
                 emit(e, "}\n");
                 break;
@@ -13811,6 +13777,46 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         break;
 
     case IR_UNLOCK: {
+        /* BUG-1475: the unlock GROUP (the first unlock carries its size, the
+         * members follow) releases each distinct ADDRESS once — its LAST
+         * occurrence — mirroring the lock group, which took it once. */
+        if (inst->literal_int == -1) break;
+        if (inst->literal_int >= 2) {
+            int n = (int)inst->literal_int;
+            bool ok = true;
+            for (int k = 1; k < n; k++)
+                if (inst[k].op != IR_UNLOCK || inst[k].literal_int != -1 || !inst[k].expr) ok = false;
+            if (!inst->expr) ok = false;
+            if (ok) {
+                emit_indent(e);
+                emit(e, "{ uintptr_t _zer_ua[%d] = { ", n);
+                for (int k = 0; k < n; k++) {
+                    emit(e, "%s", k ? ", " : "");
+                    emit_lock_root_addr(e, inst[k].expr);
+                }
+                emit(e, " };\n");
+                for (int k = 0; k < n; k++) {
+                    if (k < n - 1) {
+                        emit_indent(e);
+                        emit(e, "if (");
+                        for (int j = k + 1; j < n; j++)
+                            emit(e, "%s_zer_ua[%d] != _zer_ua[%d]", j > k + 1 ? " && " : "", k, j);
+                        emit(e, ") {\n");
+                    }
+                    emit_shared_unlock(e, inst[k].expr);
+                    if (k < n - 1) { emit_indent(e); emit(e, "}\n"); }
+                }
+                emit_indent(e);
+                emit(e, "}\n");
+                break;
+            }
+            /* not a well-formed group: release each member on its own */
+            for (int k = 0; k < n; k++) {
+                if (k > 0 && (inst[k].op != IR_UNLOCK || inst[k].literal_int != -1)) break;
+                if (inst[k].expr) emit_shared_unlock(e, inst[k].expr);
+            }
+            break;
+        }
         if (inst->expr) {
             emit_shared_unlock(e, inst->expr);
         }

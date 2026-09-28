@@ -748,4 +748,24 @@ Symbol *find_unique_allocator(Scope *s, Type *elem_type);
  * pointer / funcptr, enum without a 0 variant)? */
 bool checker_type_has_no_zero_value(Type *t);
 
+/* BUG-1470: the ONE "must this expression be evaluated exactly once?" volatile
+ * half, shared by the emitter (every single-evaluation site) and ir_lower (the
+ * place hoist in front of a lock root / a duplicated target). A volatile read is
+ * an EFFECT for single evaluation: reading it twice may observe two values
+ * (an ISR, a thread or the device changes it between the loads).
+ *   checker_place_is_volatile — the PLACE `expr` is volatile storage (a
+ *     volatile root symbol, a volatile field, or an access through a volatile
+ *     pointer / slice). Moved from the emitter's expr_is_volatile.
+ *   checker_expr_reads_volatile — evaluating `n` as a VALUE reads volatile
+ *     memory anywhere inside it (index, operand, object). `local_vol` resolves a
+ *     name as an IR local (-1 = not a local, else 0/1); NULL = globals only.
+ *     Exhaustive; an unmodelled node answers YES (single evaluation is always
+ *     correct, only dearer). */
+typedef int (*ZerLocalVolFn)(void *ud, const char *name, uint32_t len);
+bool checker_place_is_volatile(Checker *c, Node *expr);
+bool checker_expr_reads_volatile(Checker *c, Node *n, ZerLocalVolFn local_vol, void *ud);
+/* Does computing the ADDRESS of place `p` read volatile memory (an index, a
+ * dereferenced pointer value, a slice header — not the place's own storage)? */
+bool checker_place_addr_reads_volatile(Checker *c, Node *p, ZerLocalVolFn local_vol, void *ud);
+
 #endif /* ZER_CHECKER_H */

@@ -1,0 +1,18 @@
+// BUG-1476 boundary: the same wait called in its OWN statement (no lock
+// held across it) compiles and runs.
+shared struct S { u32 v; u32 w; }
+S ga;
+u32 waiter() {
+    @cond_wait(ga, ga.v > 5);
+    return 1;
+}
+void sig() {
+    for (u32 i = 0; i < 1000000; i += 1) { ga.v = 10; @cond_signal(ga); }
+}
+u32 main() {
+    ThreadHandle th = spawn sig();
+    u32 r = waiter();
+    ga.w = r;
+    th.join();
+    return 0;
+}

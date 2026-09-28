@@ -1,0 +1,12 @@
+// expect-error: through a path with a volatile read
+// BUG-1470: the union-variant reset (BUG-1161) evaluates the union's path, then
+// the store evaluates it again — a VOLATILE index read twice reset the tag of
+// us[i1] and wrote us[i2] (a pointer variant forged by `+= 4096` when another
+// thread changed hv between the two loads).
+union U { *u32 p; u64 n; }
+volatile u32 hv;
+U[4] us;
+u32 main() {
+    us[hv % 4].n += 4096;
+    return 0;
+}

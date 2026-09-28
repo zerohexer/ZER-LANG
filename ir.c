@@ -1274,3 +1274,21 @@ void ir_print(FILE *out, IRFunc *func) {
         fprintf(out, "\n");
     }
 }
+
+/* BUG-1470: resolve a name as a local of `ud` (an IRFunc *) for the shared
+ * volatile predicate checker_expr_reads_volatile: -1 = not a local, else
+ * whether reading it is a volatile load. `volatile *T p` qualifies the
+ * POINTEE, so the pointer local itself is a plain load. */
+int ir_local_volatile_by_name(void *ud, const char *name, uint32_t len) {
+    IRFunc *func = (IRFunc *)ud;
+    if (!func) return -1;
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (l->name_len == len && memcmp(l->name, name, len) == 0) {
+            if (!l->is_volatile) return 0;
+            if (l->type && type_dispatch_kind(l->type) == TYPE_POINTER) return 0;
+            return 1;
+        }
+    }
+    return -1;
+}

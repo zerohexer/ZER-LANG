@@ -1,0 +1,13 @@
+// expect-error: may @cond_wait
+// BUG-1476: the wait (a timed one) is two calls deep, reached from a condition.
+shared struct S { u32 v; }
+S ga;
+u32 inner() {
+    @cond_timedwait(ga, ga.v > 0, 10);
+    return 1;
+}
+u32 outer() { return inner(); }
+u32 main() {
+    if (ga.v + outer() > 100) { return 1; }
+    return 0;
+}

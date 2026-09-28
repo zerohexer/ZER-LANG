@@ -30,6 +30,17 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 single-evaluation / lock round (BUG-1470..1476)
+
+1. A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an
+   interrupt handler (only a direct `@cond_wait` there is); the new `can_cond_wait` summary
+   flag can close it.
+2. A lock root whose place is a SLICE is not hoisted by `hoist_place_effects` (non-packed
+   bit-slice writes are evaluated once through the emitter's pointer hoist).
+3. The moved volatile predicates resolve a root name in the checker's CURRENT module; the
+   emitter calls them after checking, so a module global shadowed by a same-named main
+   global could be judged by the wrong declaration's qualifier (unprobed).
+
 ## OPEN — residuals of the 2026-09-28 passthrough / view round (BUG-1460..1465; measured)
 
 1. ~~Copying a whole GLOBAL aggregate into a local did not carry its slot entries~~ —

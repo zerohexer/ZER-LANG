@@ -807,6 +807,26 @@ static void hoist_restore(Checker *ck, Node *fn) {
     }
     ck->hoist_undo_n = w;
 }
+/* BUG-1474: THE gate for hoist_place_effects — "must this place's parts be
+ * evaluated exactly once, here, root first?" A part that may WRITE (BUG-1372)
+ * or that READS VOLATILE memory: a place is re-emitted at the lock, the
+ * operation and the unlock of a shared-struct access, and in a compound
+ * target, so `sl[hv % 2].v += 1` locked sl[i1], wrote sl[i2] and unlocked
+ * sl[i3] (a hang once another thread changed hv). Only the ADDRESS part counts
+ * (checker_place_addr_reads_volatile): a volatile place's own storage is read
+ * once whichever form is emitted. */
+static bool lower_value_needs_single_eval(LowerCtx *ctx, Node *v) {
+    if (!v) return false;
+    if (lower_may_write(v)) return true;
+    return checker_expr_reads_volatile(ctx->checker, v, ir_local_volatile_by_name, ctx->func);
+}
+static bool lower_place_needs_single_eval(LowerCtx *ctx, Node *place) {
+    if (!place) return false;
+    if (lower_may_write(place)) return true;
+    return checker_place_addr_reads_volatile(ctx->checker, place,
+                                             ir_local_volatile_by_name, ctx->func);
+}
+
 /* Does this place's projection chain index a FIXED array (the shape kept whole
  * in the passthrough)? */
 static bool place_has_array_index(LowerCtx *ctx, Node *n) {
@@ -825,6 +845,7 @@ static bool place_has_array_index(LowerCtx *ctx, Node *n) {
     }
     return false;
 }
+static bool lower_value_needs_single_eval(LowerCtx *ctx, Node *v);   /* BUG-1474 */
 static void hoist_place_effects(LowerCtx *ctx, Node *n) {
     if (!n) return;
     switch (n->kind) {
@@ -843,8 +864,8 @@ static void hoist_place_effects(LowerCtx *ctx, Node *n) {
             else if (o->kind == NODE_FIELD || o->kind == NODE_INDEX ||
                      (o->kind == NODE_UNARY && o->unary.op == TOK_STAR)) {
                 hoist_place_effects(ctx, o);
-                if (lower_may_write(o)) hoist_place_to_temp(ctx, o, false);
-            } else if (lower_may_write(o)) {
+                if (lower_value_needs_single_eval(ctx, o)) hoist_place_to_temp(ctx, o, false);
+            } else if (lower_value_needs_single_eval(ctx, o)) {
                 hoist_place_to_temp(ctx, o, false);
             }
         }
@@ -852,7 +873,7 @@ static void hoist_place_effects(LowerCtx *ctx, Node *n) {
     case NODE_CALL: case NODE_ORELSE: case NODE_ASSIGN: case NODE_INTRINSIC:
     case NODE_TYPECAST:
         /* a value computed at the root (`pick()`, `mk()`): once, here */
-        if (lower_may_write(n)) hoist_place_to_temp(ctx, n, false);
+        if (lower_value_needs_single_eval(ctx, n)) hoist_place_to_temp(ctx, n, false);
         return;
     case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
@@ -1106,7 +1127,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         /* BUG-1372: a field read through a FIXED-array element whose place has
          * effects (`pick().a[k].b`) keeps that place in the passthrough C,
          * where the bounds form reads the index before the object. */
-        if (lower_may_write(expr) && place_has_array_index(ctx, expr)) {
+        if (lower_place_needs_single_eval(ctx, expr) && place_has_array_index(ctx, expr)) {   /* BUG-1474 */
             hoist_place_effects(ctx, expr);
             goto passthrough;
         }
@@ -1219,7 +1240,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 /* BUG-1179: an index that may WRITE (`a[i + seti(&i)]`) is
                  * lowered too, so its operands evaluate left to right in 3AC
                  * instead of as one unsequenced C expression. */
-                if (lower_may_write(expr->index_expr.object)) {   /* BUG-1372 */
+                if (lower_place_needs_single_eval(ctx, expr->index_expr.object)) {   /* BUG-1372, BUG-1474 */
                     hoist_place_effects(ctx, expr);
                     goto passthrough;
                 }
@@ -1396,7 +1417,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         bool plain_sc = false;
         bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
         ctx->assign_stmt_pos = false;
-        if (lower_may_write(expr->assign.target))                  /* BUG-1372 */
+        if (lower_place_needs_single_eval(ctx, expr->assign.target))   /* BUG-1372, BUG-1474 */
             hoist_place_effects(ctx, expr->assign.target);
         if (lower_may_write(expr->assign.value)) {                 /* BUG-1184 */
             Node *fb = (ctx->func->ast_node &&
@@ -2487,18 +2508,10 @@ static StmtLock held_enter(LowerCtx *ctx, Node *root, SharedRootVec *extra, bool
  * path. Used by every early exit out of a locked statement. Pre-BUG-1420 each
  * exit site released only the PRIMARY, so `x = f(q.a, r.b) orelse { return 3; };`
  * returned holding r's lock (measured: the next access to r hung). */
+static void emit_unlock_group(LowerCtx *ctx, Node *root, SharedRootVec *ex, int line);
 static void emit_release_held(LowerCtx *ctx, int line) {
     if (!ctx->held.root) return;
-    SharedRootVec *ex = ctx->held.extra;
-    for (int i = ex ? ex->count - 1 : -1; i >= 0; i--) {
-        if (!ex->items[i]) continue;
-        IRInst u2 = make_inst(IR_UNLOCK, line);
-        u2.expr = ex->items[i];
-        emit_inst(ctx, u2);
-    }
-    IRInst unlock = make_inst(IR_UNLOCK, line);
-    unlock.expr = ctx->held.root;
-    emit_inst(ctx, unlock);
+    emit_unlock_group(ctx, ctx->held.root, ctx->held.extra, line);
 }
 
 /* Re-acquire the held group after a fallback block that fell through — the
@@ -2556,7 +2569,7 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     if (!cond) return NULL;
     Node *root = find_shared_root_expr(ctx->checker, cond);
     if (!root) return NULL;
-    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
+    if (lower_place_needs_single_eval(ctx, root)) hoist_place_effects(ctx, root);   /* BUG-1372, BUG-1474 */
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
     /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
@@ -2613,7 +2626,7 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
-    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
+    if (lower_place_needs_single_eval(ctx, root)) hoist_place_effects(ctx, root);   /* BUG-1372, BUG-1474 */
     Node *se = stmt_shared_expr_ir(stmt);
     SharedRootVec rv; srv_init(&rv);
     if (se) find_all_shared_roots_expr(ctx->checker, se, &rv);
@@ -2626,7 +2639,7 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     int group_n = 1;
     for (int i = 0; i < rv.count; i++) if (rv.items[i] != root) group_n++;
     for (int i = 0; i < rv.count; i++)       /* BUG-1372: before any lock */
-        if (rv.items[i] != root && lower_may_write(rv.items[i]))
+        if (rv.items[i] != root && lower_place_needs_single_eval(ctx, rv.items[i]))   /* BUG-1474 */
             hoist_place_effects(ctx, rv.items[i]);
     IRInst lock = make_inst(IR_LOCK, stmt->loc.line);
     lock.expr = root;
@@ -2650,21 +2663,39 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     srv_free(&rv);
 }
 
+/* Release a statement's lock group: the extras in reverse, then the primary.
+ * BUG-1475: the first UNLOCK carries the group size (literal_int, members -1),
+ * the mirror of the lock group (BUG-1376), so the emitter releases the group
+ * as ONE unit — once per distinct ADDRESS. Two roots of one group can name one
+ * instance at run time (`void f(*S p) { ga.v = p.v + 1; }` called as f(&ga));
+ * the lock side takes that instance once (a second `rdlock` after `wrlock` on a
+ * non-recursive rwlock is EDEADLK, ignored — and a second unlock is undefined
+ * behaviour that releases another thread's lock). */
+static void emit_unlock_group(LowerCtx *ctx, Node *root, SharedRootVec *ex, int line) {
+    int group_n = 1;
+    for (int i = 0; ex && i < ex->count; i++) if (ex->items[i]) group_n++;
+    bool first = true;
+    for (int i = ex ? ex->count - 1 : -1; i >= 0; i--) {
+        if (!ex->items[i]) continue;
+        IRInst u2 = make_inst(IR_UNLOCK, line);
+        u2.expr = ex->items[i];
+        u2.literal_int = first && group_n >= 2 ? group_n : -1;
+        first = false;
+        emit_inst(ctx, u2);
+    }
+    IRInst unlock = make_inst(IR_UNLOCK, line);
+    unlock.expr = root;
+    unlock.literal_int = group_n >= 2 ? -1 : 0;
+    emit_inst(ctx, unlock);
+}
+
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
                                          SharedRootVec *extra) {
     if (!root) return;
     /* Unlock the CAPTURED extras (reverse order), then the primary. Replaying
      * the captured set (not re-deriving) keeps lock/unlock balanced across the
      * orelse rewrite. */
-    for (int i = extra ? extra->count - 1 : -1; i >= 0; i--) {
-        if (!extra->items[i]) continue;
-        IRInst u2 = make_inst(IR_UNLOCK, root->loc.line);
-        u2.expr = extra->items[i];
-        emit_inst(ctx, u2);
-    }
-    IRInst unlock = make_inst(IR_UNLOCK, root->loc.line);
-    unlock.expr = root;
-    emit_inst(ctx, unlock);
+    emit_unlock_group(ctx, root, extra, root->loc.line);
 }
 
 /* Check if an expression contains NODE_ORELSE at the top level */
@@ -3896,8 +3927,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
-            if (step_root && lower_may_write(step_root))
-                hoist_place_effects(ctx, step_root);                 /* BUG-1372 */
+            if (step_root && lower_place_needs_single_eval(ctx, step_root))
+                hoist_place_effects(ctx, step_root);                 /* BUG-1372, BUG-1474 */
             if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
                 lock.expr = step_root;

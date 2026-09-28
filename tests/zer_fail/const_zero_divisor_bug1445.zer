@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: division by zero
+// BUG-1445: a `const` zero divisor compiled (and trapped at run time); the
+// compound `a /= Z` was already refused.
+const u32 Z = 0;
+u32 main() {
+    u32 a = 5;
+    return a / Z;
+}

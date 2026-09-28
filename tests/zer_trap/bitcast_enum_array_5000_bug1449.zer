@@ -1,0 +1,18 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a value that is not a declared variant of this enum
+// BUG-1449: the guard skipped arrays over 4096 elements.
+// FINDING 2 sibling: the same guard skips arrays with > 4096 elements
+// (emitter.c: `if (u->array.size == 0 || u->array.size > 4096) return;`).
+enum E { a, b, c }
+struct EA { E[5000] v; }
+struct UA { u32[5000] v; }
+UA src; EA dst;
+u32 main() {
+    src.v[4999] = 200;
+    dst = @bitcast(EA, src);
+    switch (dst.v[4999]) {               // 200 is no variant; silently takes .c
+        .a => { return 1; }
+        .b => { return 2; }
+        .c => { return 3; }
+    }
+}

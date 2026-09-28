@@ -1,0 +1,5 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a bool that is neither true nor false
+// BUG-1448: a bool inside a container(T) instance.
+container Box(T) { T v; }
+u32 main() { u8 x=2; Box(bool) b; b.v = @bitcast(bool, x); if (b.v != true) { if (b.v != false) { return 5; } } return 0; }

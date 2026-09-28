@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: slice start (5) is greater than end (4)
+// BUG-1442: a global initializer cannot trap at run time, so a const-named bound
+// must be checked at compile time — GA[5..4] would be a slice of length 2^64-1.
+const u32 K = 5;
+u32[4] GA;
+[*]u32 X = GA[K..4];
+u32 main() { return (u32)X.len; }

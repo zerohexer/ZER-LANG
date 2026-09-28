@@ -1,0 +1,5 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a bool that is neither true nor false
+// BUG-1448: a bool FIELD of a @bitcast struct target.
+struct S { bool a; u8 b; u16 c; }
+u32 main() { u32 w = 2; S s = @bitcast(S, w); u32 r=0; if (s.a != true) { if (s.a != false) { r += 1; } } r += (u32)s.a*10; return r; }

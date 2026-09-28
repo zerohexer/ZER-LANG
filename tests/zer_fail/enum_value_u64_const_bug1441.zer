@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: exceeds i32 range
+// BUG-1441: the same wrap through a u64 const.
+const u64 BIG = 18446744073709551615;
+enum E { a = BIG, b }
+u32 main() {
+    E e = E.a;
+    if (e == E.b) { return 1; }
+    return 0;
+}

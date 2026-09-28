@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: variable name 'int' is a C keyword
+// BUG-1446: the name was emitted verbatim — `uint32_t int = 3U;`, a GCC error
+// against the generated file.
+u32 main() {
+    u32 int = 3;
+    return int - 3;
+}

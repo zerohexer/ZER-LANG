@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: slice end 9 exceeds array size 4
+// BUG-1442: a bound naming a `const` escaped the compile-time slice bounds check.
+const u32 E = 9;
+u32 main() {
+    u32[4] a;
+    [*]u32 s = a[1..E];
+    return (u32)s.len;
+}

@@ -1,0 +1,22 @@
+// BUG-1444: copying a local ARRAY into an ARRAY field copies the elements — the
+// struct does not point into the stack. The taint keyed on the root struct's type
+// ("can it carry a pointer?") and refused `return s;` / `gs = s;`.
+struct S { u32[3] a; }
+struct M { u32[3] a; [*]u32 view; }
+S gs;
+u32[3] backing;
+S mk() { u32[3] a; a[0] = 4; S s; s.a = a; return s; }
+M mk_mixed() { u32[3] a; a[1] = 6; M m; m.a = a; m.view = backing; return m; }
+u32 main() {
+    S t = mk();
+    if (t.a[0] != 4) { return 1; }
+    u32[3] b;
+    b[2] = 9;
+    S s;
+    s.a = b;
+    gs = s;
+    if (gs.a[2] != 9) { return 2; }
+    M m = mk_mixed();
+    if (m.a[1] != 6 || m.view.len != 3) { return 3; }
+    return 0;
+}

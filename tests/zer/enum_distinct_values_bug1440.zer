@@ -1,0 +1,20 @@
+// BUG-1440 boundary: distinct values, gaps, negatives and an explicit value that
+// happens to follow the implicit run are all fine.
+enum Cmd { start = 1, stop, reset = 3, halt = -1, zero = 0 }
+u32 run(Cmd c) {
+    switch (c) {
+        .start => { return 10; }
+        .stop  => { return 20; }
+        .reset => { return 30; }
+        .halt  => { return 40; }
+        .zero  => { return 50; }
+    }
+}
+u32 main() {
+    if (run(Cmd.reset) != 30) { return 1; }
+    if (run(Cmd.stop) != 20) { return 2; }
+    if (run(Cmd.halt) != 40) { return 3; }
+    Cmd back = @try_enum(Cmd, 3) orelse Cmd.zero;
+    if (back != Cmd.reset) { return 4; }
+    return 0;
+}

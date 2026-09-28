@@ -1,18 +1,20 @@
 // Gap 30 regression test (2026-04-27): range-for desugaring uses _zer_ri,
 // not __ri. User code using __ri as variable name is now safe.
+// BUG-1446: `__ri` itself is now refused (C's reserved `__` namespace), so the
+// nearest legal spelling `_ri` carries the no-shadow check.
 
 i32 main() {
     u32[3] data;
     data[0] = 100;
     data[1] = 200;
     data[2] = 300;
-    u32 __ri = 999;  // user variable, no longer shadowed
+    u32 _ri = 999;  // user variable, no longer shadowed
     u32 sum = 0;
     for (u32 v in data) {
         sum += v;
     }
-    // sum should be 600, __ri should still be 999
+    // sum should be 600, _ri should still be 999
     if (sum != 600) { return 1; }
-    if (__ri != 999) { return 2; }
+    if (_ri != 999) { return 2; }
     return 0;
 }

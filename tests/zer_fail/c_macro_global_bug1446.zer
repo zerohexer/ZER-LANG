@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: variable name 'stdin' is a macro of the C headers
+// BUG-1446: `stdin` is a macro of <stdio.h>, which the generated C includes.
+u32 stdin = 0;
+u32 main() { return stdin; }

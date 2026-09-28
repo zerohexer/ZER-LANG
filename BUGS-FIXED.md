@@ -155,6 +155,51 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   ASan report; the whole corpus (3,430 files) is clean under it.
   Tests (1410..1419): 19 `tests/zer_fail/*_bug141*.zer`, 8 `tests/zer/*_bug141*.zer`;
   SHAPE p63 in `tools/sink_matrix.sh` (16 cells: 11 HOLE + 1 OVER-REJECT pre-fix).
+- **BUG-1440 — duplicate enum values made an exhaustive switch take the WRONG arm.**
+  `enum Cmd { start = 1, stop, reset = 2 }` (stop is implicitly 2): `run(Cmd.reset)` took
+  the `.stop` arm, no diagnostic (exit 20 for 30); `enum E { a, b = 0 }` too. A switch,
+  `@try_enum` and the forging guards identify a variant by its VALUE, so an alias is
+  ambiguous dispatch — duplicate values are refused at the declaration.
+- **BUG-1441 — an enum literal above 2^63 wrapped through int64 and passed the range
+  check** (`a = 18446744073709551615` became -1). Range-checked by unsigned magnitude
+  before the fold.
+- **BUG-1442 — `static` LOCAL initialisers got none of the global path's constant-init
+  handling** (checker accepts, GCC refuses: `static ?u32 o = 5;`, optional / struct-literal /
+  slice / wide-int / float->int initialisers), and `static *u32 p = &l;` (the address of a
+  LOCAL in a static that outlives the frame) was accepted. One emitter helper
+  `emit_static_storage_init` serves globals and static locals (with `static_brace_init`
+  for nested literals at block scope); `&local` in a static initialiser is a checker error;
+  a const-named slice bound in a constant initialiser folds on both sides
+  (`slice_bound_fold`), which also closed `GA[1..E]` with `const E = 9` on a `u32[4]`
+  being a run-time-only trap.
+- **BUG-1443 — a global `?u65` / `?u128` initialised past 2^64 got a truncated value**
+  (`?u128 C = 18446744073709551615 + 2;` emitted `{ 1ULL, 1 }`). One `emit_wide_int_const`
+  for plain and optional-payload wide globals; the admitted-expression rule
+  (`static_init_is_wide_int`) covers the payload.
+- **BUG-1444 (over-rejection) — copying an ARRAY into a struct field marked the struct
+  frame-bound** (`s.a = a; return s;` refused). Keyed on the destination FIELD's type: only
+  a slice / pointer field views the local.
+- **BUG-1445** — duplicate designators `{ .x = 5, .x = 6 }` refused; `a / Z` with `const
+  u32 Z = 0` is a compile-time division by zero (the compound form already was).
+- **BUG-1446 — identifiers that are C keywords, header macros / types or libc functions
+  the emitted runtime calls were emitted verbatim.** `u32 int = 3;` was a GCC error; worse,
+  `void abort() { }`, `void exit(i32 c) { }`, `i32 sched_yield() { return 0; }` compiled
+  and silently REPLACED the libc functions the runtime relies on (@once's spin-wait calls
+  sched_yield). One classifier `c_reserved_ident`, applied per declaration class; a
+  bodyless extern declaration of a real C function stays legal (that is C interop).
+- **BUG-1447 — an async function's ARRAY parameter silently meant a private copy** where a
+  plain function's aliases the caller. Refused; a slice / pointer parameter shares, a
+  struct wrapper copies. Documented in reference.md.
+- **BUG-1448 — `@bitcast` into a bool (or a carrier of one, or a value optional's presence
+  byte) forged a value that is neither true nor false**: `b != true && b != false`,
+  `(u32)b == 2`, an exhaustive `switch (b)` matched neither arm. The forging guard is one
+  walk over "forgeable scalars" — enum, bool, optional presence byte — at both emitter
+  paths and all three doors (a non-0/1 byte traps).
+- **BUG-1449 — the enum forging guard stopped at struct depth 8 and skipped arrays over 4096
+  elements** while the checker accepted any depth: a forged enum 10 structs deep or in an
+  `E[5000]` took the last switch arm with no trap. The walk has no cap now (the type graph
+  is finite and acyclic); any array size gets the run-time loop.
+  Tests (1440..1449): the `*_bug144*.zer` files in tests/zer, tests/zer_fail, tests/zer_trap.
 - **BUG-1420 — the statement's shared lock was HELD across an orelse-BLOCK fallback.**
   The checker treats the block's statements as separate lock scopes (BUG-1047); the
   lowering kept `current_stmt_shared_root` locked while lowering the block, so `u32 x =

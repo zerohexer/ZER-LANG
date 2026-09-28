@@ -468,6 +468,22 @@ static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, 
                 r = (r->kind == NODE_FIELD) ? r->field.object : r->index_expr.object;
             }
             if (r && r->kind != NODE_IDENT) GI(r);
+            /* BUG-1442: a STATIC local initialised with the address of a
+             * NON-static local (or a parameter): `u32 l = 3; static *u32 p = &l;`
+             * was accepted — the static outlives every frame, so from the second
+             * call on it points into a dead one (and C refuses the initializer:
+             * a frame address is not a constant). A static local's own address
+             * IS a constant and stays allowed. */
+            if (c && c->gi_static_local && r && r->kind == NODE_IDENT) {
+                Symbol *gs = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
+                Symbol *ls = scope_lookup(c->current_scope, r->ident.name,
+                                          (uint32_t)r->ident.name_len);
+                if (ls && ls != gs && !ls->is_function && !ls->is_static) {
+                    *bad = n;
+                    return "takes the address of a function-local variable — a static "
+                           "outlives the frame, so the pointer would dangle";
+                }
+            }
             break;
         }
         GI(n->unary.operand);
@@ -1079,6 +1095,195 @@ static Symbol *add_symbol_impl(Checker *c, const char *name, uint32_t name_len,
         checker_error(c, line, "redefinition of '%.*s'", (int)name_len, name);
     }
     return sym;
+}
+
+/* BUG-1446: identifiers that cannot be spelled in the emitted C.
+ *
+ * ZER emits user names VERBATIM, into a translation unit that #includes
+ * <stdint.h> <stddef.h> <string.h> <stdio.h> <stdlib.h> <pthread.h> <time.h>
+ * <sched.h> <setjmp.h> <signal.h> and whose runtime calls memcpy / calloc /
+ * pthread_mutex_lock / sched_yield / abort ... So `u32 int = 3;` reached GCC as a
+ * syntax error against a generated file, `u32 NULL;` / `struct S { u32 EOF; }`
+ * were macro-expanded, and — the silent case — `void abort() { }`,
+ * `void exit(i32 c) { }`, `i32 sched_yield() { return 0; }` compiled and
+ * REPLACED the libc function the runtime relies on (@once's loser spin calls
+ * sched_yield). Mangling every user name in the emitter would fix it too, but
+ * ZER is C-interop first — `cinclude` users name C functions by their C names —
+ * so the rule is a checker diagnostic by CLASS:
+ *
+ *   KEYWORD   a C keyword                                  refused everywhere
+ *   MACRO     an object/function-like macro of those headers refused everywhere
+ *   TYPE      a typedef of those headers / POSIX `*_t`     refused except a field
+ *   NS        C's reserved namespace `__x` / `_X` (C11 7.1.3) refused except a
+ *             field and a bodyless extern (glibc interop spells `__errno_location`)
+ *   LIBC      a function those headers declare, or a      refused except a field
+ *             `pthread_` / `sched_` name                   and a bodyless extern
+ *
+ * The bodyless-extern exemption is what keeps interop working:
+ * `i32 printf(const *u8 fmt, ...);` DECLARES the C function; a definition with a
+ * body, a global, a local or a parameter of that name is refused. The lists are
+ * ISO C for those headers plus what POSIX adds that the runtime or the preamble
+ * spells; a libc's non-standard extras are not listed, and a collision with one
+ * is loud (GCC redeclaration error), never silent — the silent class is a
+ * DEFINITION replacing a runtime callee, and every runtime callee is listed. */
+typedef enum { CRID_NONE, CRID_KEYWORD, CRID_MACRO, CRID_TYPE, CRID_NS, CRID_LIBC } CReservedId;
+
+static bool crid_in(const char *name, uint32_t len, const char *const *tab) {
+    for (int i = 0; tab[i]; i++)
+        if (strlen(tab[i]) == len && memcmp(tab[i], name, len) == 0) return true;
+    return false;
+}
+static bool crid_prefix(const char *name, uint32_t len, const char *pfx) {
+    size_t pl = strlen(pfx);
+    return len > pl && memcmp(name, pfx, pl) == 0;
+}
+
+static CReservedId c_reserved_ident(const char *name, uint32_t len) {
+    static const char *const kw[] = {
+        "auto", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "float", "for", "goto", "if",
+        "inline", "int", "long", "register", "restrict", "return", "short",
+        "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "void", "volatile", "while", "asm", "typeof", "bool",
+        "true", "false", NULL };
+    static const char *const macro[] = {
+        "NULL", "EOF", "BUFSIZ", "FILENAME_MAX", "FOPEN_MAX", "L_tmpnam",
+        "TMP_MAX", "SEEK_SET", "SEEK_CUR", "SEEK_END", "stdin", "stdout",
+        "stderr", "EXIT_SUCCESS", "EXIT_FAILURE", "RAND_MAX", "MB_CUR_MAX",
+        "CLOCKS_PER_SEC", "TIME_UTC", "offsetof",
+        "SIZE_MAX", "PTRDIFF_MIN", "PTRDIFF_MAX", "SIG_ATOMIC_MIN",
+        "SIG_ATOMIC_MAX", "WCHAR_MIN", "WCHAR_MAX", "WINT_MIN", "WINT_MAX",
+        "INTPTR_MIN", "INTPTR_MAX", "UINTPTR_MAX", "INTMAX_MIN", "INTMAX_MAX",
+        "UINTMAX_MAX", "INTMAX_C", "UINTMAX_C", NULL };
+    static const char *const types[] = {
+        "size_t", "ptrdiff_t", "wchar_t", "max_align_t", "FILE", "fpos_t",
+        "div_t", "ldiv_t", "lldiv_t", "clock_t", "time_t", "jmp_buf",
+        "sigjmp_buf", "sig_atomic_t", "sigset_t", "va_list", NULL };
+    static const char *const libc[] = {
+        /* <string.h> */
+        "memcpy", "memmove", "memset", "memcmp", "memchr", "strcpy", "strncpy",
+        "strcat", "strncat", "strcmp", "strncmp", "strcoll", "strxfrm",
+        "strchr", "strrchr", "strspn", "strcspn", "strpbrk", "strstr",
+        "strtok", "strerror", "strlen", "strdup",
+        /* <stdio.h> */
+        "remove", "rename", "tmpfile", "tmpnam", "fclose", "fflush", "fopen",
+        "freopen", "setbuf", "setvbuf", "fprintf", "fscanf", "printf", "scanf",
+        "snprintf", "sprintf", "sscanf", "vfprintf", "vfscanf", "vprintf",
+        "vscanf", "vsnprintf", "vsprintf", "vsscanf", "fgetc", "fgets",
+        "fputc", "fputs", "getc", "getchar", "gets", "putc", "putchar", "puts",
+        "ungetc", "fread", "fwrite", "fgetpos", "fseek", "fsetpos", "ftell",
+        "rewind", "clearerr", "feof", "ferror", "perror",
+        /* <stdlib.h> */
+        "atof", "atoi", "atol", "atoll", "strtod", "strtof", "strtold",
+        "strtol", "strtoll", "strtoul", "strtoull", "rand", "srand",
+        "aligned_alloc", "calloc", "free", "malloc", "realloc", "abort",
+        "atexit", "at_quick_exit", "exit", "getenv", "quick_exit", "system",
+        "bsearch", "qsort", "abs", "labs", "llabs", "div", "ldiv", "lldiv",
+        "mblen", "mbtowc", "wctomb", "mbstowcs", "wcstombs",
+        /* <time.h> (+ the POSIX clock the runtime calls) */
+        "clock", "difftime", "mktime", "time", "timespec_get", "asctime",
+        "ctime", "gmtime", "localtime", "strftime", "clock_gettime",
+        "nanosleep",
+        /* <setjmp.h> <signal.h> (+ POSIX) */
+        "setjmp", "longjmp", "sigsetjmp", "siglongjmp", "signal", "raise",
+        "sigaction", "sigemptyset", "sigaddset", "kill", NULL };
+    if (!name || len == 0) return CRID_NONE;
+    if (crid_in(name, len, kw)) return CRID_KEYWORD;
+    if (crid_in(name, len, macro)) return CRID_MACRO;
+    /* <stdint.h> limit / constant macros: [U]INT{N,_LEASTN,_FASTN}_{MIN,MAX,C} */
+    {
+        uint32_t i = 0;
+        if (i < len && name[i] == 'U') i++;
+        if (len - i > 3 && memcmp(name + i, "INT", 3) == 0) {
+            const char *tail = name + len;
+            if ((len >= 4 && memcmp(tail - 4, "_MIN", 4) == 0) ||
+                (len >= 4 && memcmp(tail - 4, "_MAX", 4) == 0) ||
+                (len >= 2 && memcmp(tail - 2, "_C", 2) == 0))
+                return CRID_MACRO;
+        }
+    }
+    /* <signal.h> SIGxxx / SIG_xxx, <pthread.h> PTHREAD_xxx, <time.h> CLOCK_xxx,
+     * <sched.h> SCHED_xxx — all macros. */
+    {
+        static const char *const sigs[] = {
+            "SIGABRT", "SIGALRM", "SIGBUS", "SIGCHLD", "SIGCLD", "SIGCONT",
+            "SIGFPE", "SIGHUP", "SIGILL", "SIGINT", "SIGIO", "SIGIOT", "SIGKILL",
+            "SIGPIPE", "SIGPOLL", "SIGPROF", "SIGPWR", "SIGQUIT", "SIGSEGV",
+            "SIGSTKFLT", "SIGSTOP", "SIGSYS", "SIGTERM", "SIGTRAP", "SIGTSTP",
+            "SIGTTIN", "SIGTTOU", "SIGURG", "SIGUSR1", "SIGUSR2", "SIGVTALRM",
+            "SIGWINCH", "SIGXCPU", "SIGXFSZ", "SIGRTMIN", "SIGRTMAX", "SIGSTKSZ",
+            "MINSIGSTKSZ", "NSIG", NULL };
+        if (crid_in(name, len, sigs) || crid_prefix(name, len, "SIG_") ||
+            crid_prefix(name, len, "SIGEV_"))
+            return CRID_MACRO;
+    }
+    if (crid_prefix(name, len, "PTHREAD_") || crid_prefix(name, len, "CLOCK_") ||
+        crid_prefix(name, len, "SCHED_"))
+        return CRID_MACRO;
+    if (len >= 2 && name[0] == '_' && (name[1] == '_' || (name[1] >= 'A' && name[1] <= 'Z')))
+        return CRID_NS;
+    if (crid_in(name, len, types)) return CRID_TYPE;
+    /* <stdint.h> int8_t.. / uint_least16_t / intptr_t ... — and POSIX reserves
+     * every `*_t` spelling the included headers may add (pthread_t, pid_t). */
+    if (len > 2 && name[len - 2] == '_' && name[len - 1] == 't') return CRID_TYPE;
+    if (crid_in(name, len, libc) || crid_prefix(name, len, "pthread_") ||
+        crid_prefix(name, len, "sched_"))
+        return CRID_LIBC;
+    return CRID_NONE;
+}
+
+/* DEFINITION: a function body, a global, a type. LOCAL: a local, parameter or
+ * capture — it only SHADOWS a C function inside its own function, which matters
+ * only for the functions the emitted body itself calls (crid_runtime_callee). */
+typedef enum { CRUSE_DEFINITION, CRUSE_LOCAL, CRUSE_EXTERN_FUNC, CRUSE_FIELD } CReservedUse;
+
+/* The C functions ZER's emitted function BODIES call (not its preamble's own
+ * helpers, which have their own scope): a local of one of these names shadows
+ * it for the whole function, and an emitted array copy / lock / @once spin then
+ * calls a u32. */
+static bool crid_runtime_callee(const char *name, uint32_t len) {
+    static const char *const rt[] = {
+        "memcpy", "memmove", "memset", "memcmp", "strlen", "calloc", "malloc",
+        "realloc", "free", "abort", "signal", "setjmp", "longjmp",
+        "clock_gettime", "fprintf", NULL };
+    return crid_in(name, len, rt) || crid_prefix(name, len, "pthread_") ||
+           crid_prefix(name, len, "sched_");
+}
+
+/* BUG-1446: refuse a user identifier the emitted C cannot carry. `what` names
+ * the declaration kind for the diagnostic ("variable", "function", ...). */
+static void check_c_reserved_ident(Checker *c, const char *name, uint32_t len,
+                                   int line, CReservedUse use, const char *what) {
+    CReservedId k = c_reserved_ident(name, len);
+    const char *why = NULL;
+    switch (k) {
+    case CRID_NONE: return;
+    case CRID_KEYWORD:
+        why = "is a C keyword";
+        break;
+    case CRID_MACRO:
+        why = "is a macro of the C headers the generated code includes";
+        break;
+    case CRID_TYPE:
+        if (use == CRUSE_FIELD) return;
+        why = "is a type name of the C headers the generated code includes "
+              "(POSIX reserves every name ending in '_t')";
+        break;
+    case CRID_NS:
+        if (use != CRUSE_DEFINITION && use != CRUSE_LOCAL) return;
+        why = "is in C's reserved namespace (a leading '__' or '_' + capital letter)";
+        break;
+    case CRID_LIBC:
+        if (use == CRUSE_FIELD || use == CRUSE_EXTERN_FUNC) return;
+        if (use == CRUSE_LOCAL && !crid_runtime_callee(name, len)) return;
+        why = "is a C library function the generated code includes (and may call) — "
+              "a definition would replace it; a bodyless declaration of the C "
+              "function itself is allowed";
+        break;
+    }
+    checker_error(c, line,
+        "%s name '%.*s' %s; ZER emits names verbatim into C — choose another name",
+        what, (int)len, name, why);
 }
 
 /* Public: enforces reserved prefix (rejects user-declared _zer_*). */
@@ -8068,6 +8273,19 @@ static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int
     }
     for (int fi = 0; fi < sinit->struct_init.field_count; fi++) {
         DesigField *df = &sinit->struct_init.fields[fi];
+        /* BUG-1445: `{ .x = 5, .x = 6 }` — C keeps the LAST, silently, and every
+         * analysis here (escape, provenance, VRP, the optional wrap) walks EVERY
+         * designator as if each were the field's value. Refuse it. */
+        for (int fj = 0; fj < fi; fj++) {
+            DesigField *dp = &sinit->struct_init.fields[fj];
+            if (dp->name_len == df->name_len &&
+                memcmp(dp->name, df->name, df->name_len) == 0) {
+                checker_error(c, line,
+                    "field '.%.*s' is initialized twice in one designated initializer",
+                    (int)df->name_len, df->name);
+                break;
+            }
+        }
         if (df->value && df->value->kind != NODE_STRUCT_INIT &&
             value_forms_variant_ref(c, df->value, 0))                    /* BUG-1186 */
             report_variant_ref_store(c, line, "store into a struct literal");
@@ -11446,6 +11664,20 @@ static bool tfold(Checker *c, Node *n, int depth, int64_t *out) {
     return false;
 }
 
+/* BUG-1442: a constant slice bound — a literal tree, or one naming a `const`
+ * (`GA[K..4]`). The untyped evaluator does not resolve a name, so `a[K..9]` on a
+ * u32[4] escaped the compile-time bounds check (it trapped at run time), and the
+ * emitter could not fold it inside a GLOBAL initializer either (a statement
+ * expression at file scope). The emitter asks the same typed fold there, so the
+ * two agree on which bounds are constant — and every constant one is checked
+ * here. */
+static int64_t slice_bound_fold(Checker *c, Node *n) {
+    int64_t v = eval_const_expr(n);
+    if (v != CONST_EVAL_FAIL) return v;
+    if (!tfold(c, n, 0, &v)) return CONST_EVAL_FAIL;
+    return v;
+}
+
 /* BUG-1090: public face of the typed fold (the emitter renders a global integer
  * initializer with it, so a global constant and a local one agree on the value). */
 bool checker_fold_const_typed(Checker *c, Node *n, int64_t *out) {
@@ -12156,6 +12388,13 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 init = dsym->func_node->var_decl.init;
                             if (init) div_known = eval_const_expr_ok(init, &div_val);
                             if (!div_known) div_val = CONST_EVAL_FAIL;
+                            /* BUG-1445: a `const` divisor that is ZERO. The literal
+                             * check above ran before this lookup, so `a / Z` over
+                             * `const u32 Z = 0;` reported nothing and trapped at run
+                             * time — while the compound sibling `a /= Z` (BUG-1042)
+                             * was already an error. Same operation, same answer. */
+                            if (div_known && div_val == 0)
+                                checker_error(c, node->loc.line, "division by zero");
                         }
                     }
                     /* BUG-1318: a nonzero FLOAT literal divisor (`1.0 / 2.0`) is
@@ -13646,9 +13885,21 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 Type *src_eff = type_unwrap_distinct(src->type);
                                 bool src_is_global = global_decl_lookup(c,
                                     src->name, src->name_len) != NULL;
+                                /* BUG-1444: key on the DESTINATION's type, not the
+                                 * root struct's. Only a destination that is a view
+                                 * (`[*]T`, `?[*]T`, a pointer) makes the array→slice
+                                 * coercion that points into the stack; an ARRAY-typed
+                                 * field copies the elements by value. Keyed on the
+                                 * root, `S s; s.a = local_arr; return s;` (S holding
+                                 * a `u32[3] a`) was refused as "pointer to local"
+                                 * whenever S carried a pointer anywhere — and always
+                                 * when the root itself was checked, since an array
+                                 * of pointers "can carry" one. */
+                                Type *dst_t = typemap_get(c, node->assign.target);
                                 if (src_eff && src_eff->kind == TYPE_ARRAY &&
                                     !src->is_static && !src_is_global &&
-                                    type_can_carry_pointer(tsym->type)) {
+                                    dst_t && type_dispatch_kind(dst_t) != TYPE_ARRAY &&
+                                    type_can_carry_pointer(dst_t)) {
                                     tsym->is_local_derived = true;
                                 }
                             }
@@ -17449,8 +17700,8 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * 0 iff start > end. Start/end must fit in int32 for safe cast. */
         if (node->slice.start && node->slice.end &&
             !type_is_integer(obj)) {
-            int64_t start_val = eval_const_expr(node->slice.start);
-            int64_t end_val = eval_const_expr(node->slice.end);
+            int64_t start_val = slice_bound_fold(c, node->slice.start);
+            int64_t end_val = slice_bound_fold(c, node->slice.end);
             if (start_val != CONST_EVAL_FAIL && end_val != CONST_EVAL_FAIL &&
                 start_val >= 0 && start_val <= 0x7FFFFFFF &&
                 end_val >= 0 && end_val <= 0x7FFFFFFF &&
@@ -17464,7 +17715,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
         /* BUG-217: compile-time slice bounds check for arrays */
         if (obj->kind == TYPE_ARRAY) {
             if (node->slice.end) {
-                int64_t end_val = eval_const_expr(node->slice.end);
+                int64_t end_val = slice_bound_fold(c, node->slice.end);
                 if (end_val != CONST_EVAL_FAIL && end_val >= 0 && (uint64_t)end_val > obj->array.size) {
                     checker_error(c, node->loc.line,
                         "slice end %lld exceeds array size %llu",
@@ -17472,7 +17723,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 }
             }
             if (node->slice.start) {
-                int64_t start_val = eval_const_expr(node->slice.start);
+                int64_t start_val = slice_bound_fold(c, node->slice.start);
                 if (start_val != CONST_EVAL_FAIL && start_val >= 0 && (uint64_t)start_val > obj->array.size) {
                     checker_error(c, node->loc.line,
                         "slice start %lld exceeds array size %llu",
@@ -23039,6 +23290,16 @@ static bool global_wide_init_ok(Node *n, int depth) {
     }
 }
 
+/* BUG-1443: is this static-storage object's initializer emitted as a 128-bit C
+ * constant expression? A u65..u128 / i65..i128 — and the PAYLOAD of an optional
+ * one (`?u128 C = …`), which the emitter renders the same way. */
+static bool static_init_is_wide_int(Type *t) {
+    t = t ? type_unwrap_distinct(t) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL)
+        t = type_unwrap_distinct(t->optional.inner);
+    return t && type_is_integer(t) && type_width(t) > 64;
+}
+
 static void check_stmt_impl(Checker *c, Node *node) {
     if (!node) return;
 
@@ -23094,7 +23355,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
             if (node->kind == NODE_VAR_DECL && node->var_decl.is_static &&
                 node->var_decl.init) {
                 Type *vt1 = resolve_type(c, node->var_decl.type);
-                if (vt1 && type_is_integer(vt1) && type_width(vt1) > 64 &&
+                if (static_init_is_wide_int(vt1) &&
+                    node->var_decl.init->kind != NODE_NULL_LIT &&
                     !global_wide_init_ok(node->var_decl.init, 0))
                     checker_error(c, node->loc.line,
                         "the initializer of a global / static wider than 64 bits must be "
@@ -23454,6 +23716,10 @@ static void check_stmt_impl(Checker *c, Node *node) {
                     "to a constant and assign the value on first use",
                     (int)node->var_decl.name_len, node->var_decl.name, reason);
         }
+        if (!node->var_decl.is_synthetic)   /* BUG-1446 */
+            check_c_reserved_ident(c, node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                                   node->loc.line,
+                                   CRUSE_LOCAL, "variable");   /* a static local is block-scoped too */
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,
                                (uint32_t)node->var_decl.name_len,
@@ -23988,6 +24254,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
                     cap_type = unwrapped;
                     cap_const = true;
                 }
+                check_c_reserved_ident(c, node->if_stmt.capture_name, (uint32_t)node->if_stmt.capture_name_len, node->loc.line,
+                                       CRUSE_LOCAL, "capture");   /* BUG-1446 */
                 Symbol *cap = add_symbol(c, node->if_stmt.capture_name,
                     (uint32_t)node->if_stmt.capture_name_len,
                     cap_type, node->loc.line);
@@ -25159,6 +25427,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
                     cap_const = true;
                 }
 
+                check_c_reserved_ident(c, arm->capture_name, (uint32_t)arm->capture_name_len, arm->loc.line,
+                                       CRUSE_LOCAL, "capture");   /* BUG-1446 */
                 Symbol *cap = add_symbol(c, arm->capture_name,
                     (uint32_t)arm->capture_name_len,
                     cap_type, arm->loc.line);
@@ -28038,6 +28308,9 @@ static void check_stmt_impl(Checker *c, Node *node) {
         /* Register ThreadHandle variable in scope */
         if (is_scoped) {
             /* ThreadHandle is u64 wrapping pthread_t */
+            check_c_reserved_ident(c, node->spawn_stmt.handle_name,
+                                   (uint32_t)node->spawn_stmt.handle_name_len, node->loc.line,
+                                   CRUSE_LOCAL, "variable");   /* BUG-1446 */
             Symbol *sym = add_symbol(c, node->spawn_stmt.handle_name,
                 (uint32_t)node->spawn_stmt.handle_name_len,
                 ty_u64, node->loc.line);
@@ -28616,6 +28889,8 @@ static void register_decl(Checker *c, Node *node) {
         t->struct_type.module_prefix = c->current_module;
         t->struct_type.module_prefix_len = c->current_module_len;
 
+        check_c_reserved_ident(c, node->struct_decl.name, (uint32_t)node->struct_decl.name_len,
+                               node->loc.line, CRUSE_DEFINITION, "type");   /* BUG-1446 */
         add_symbol(c, node->struct_decl.name,
                    (uint32_t)node->struct_decl.name_len,
                    t, node->loc.line);
@@ -28640,6 +28915,8 @@ static void register_decl(Checker *c, Node *node) {
                 SField *sf = &t->struct_type.fields[i];
                 sf->name = fd->name;
                 sf->name_len = (uint32_t)fd->name_len;
+                check_c_reserved_ident(c, fd->name, (uint32_t)fd->name_len,
+                                       node->loc.line, CRUSE_FIELD, "field");   /* BUG-1446 */
                 sf->type = resolve_type(c, fd->type);
                 /* BUG-414: detect volatile qualifier on field TypeNode */
                 sf->is_volatile = (fd->type && fd->type->kind == TYNODE_VOLATILE);
@@ -28797,6 +29074,21 @@ static void register_decl(Checker *c, Node *node) {
                             "enum variant '%.*s' value must be a compile-time integer constant",
                             (int)ev->name_len, ev->name);
                         v = next_val;
+                    } else if (literal_tree_has_huge_operand(ev->value) ||
+                               (v < 0 && const_expr_reads_typed_value(ev->value, 0) &&
+                                typemap_get(c, ev->value) &&
+                                type_is_unsigned(typemap_get(c, ev->value)))) {
+                        /* BUG-1441: the fold is int64, so an operand above INT64_MAX
+                         * (a literal, or a u64 const holding one) wraps NEGATIVE —
+                         * `a = 18446744073709551615` read back as -1, passed the i32
+                         * range test and became a variant while 4294967296 was
+                         * rejected. Range-check the unsigned MAGNITUDE first. (The typed
+                         * arm is limited to expressions reading a TYPED value: a bare
+                         * literal is typed u32 whatever its sign, so `-1` would trip it.) */
+                        checker_error(c, ev->value->loc.line,
+                            "enum variant '%.*s' value exceeds i32 range — enum values are 32-bit signed",
+                            (int)ev->name_len, ev->name);
+                        v = 0;
                     } else if (v < (int64_t)INT32_MIN || v > (int64_t)INT32_MAX) {
                         checker_error(c, ev->value->loc.line,
                             "enum variant '%.*s' value %lld exceeds i32 range — enum values are 32-bit signed",
@@ -28815,9 +29107,31 @@ static void register_decl(Checker *c, Node *node) {
                     }
                     sv->value = (int32_t)next_val++;
                 }
+                /* BUG-1440: two variants with the SAME value are refused. C allows
+                 * the alias; ZER cannot: an exhaustive switch lowers its LAST arm
+                 * to an unconditional `else` and the arms are compared by VALUE,
+                 * so `enum Cmd { start = 1, stop, reset = 2 }` dispatched
+                 * Cmd.reset to the `.stop` arm (the first arm whose value
+                 * matched) — a silent wrong result. @try_enum and the forging
+                 * guards test membership by value too, so an alias would also
+                 * make "which variant is this" unanswerable for them. */
+                for (int j = 0; j < i; j++) {
+                    if (t->enum_type.variants[j].value == sv->value) {
+                        checker_error(c, ev->value ? ev->value->loc.line : node->loc.line,
+                            "enum variant '%.*s' has value %d, the same as '%.*s' — "
+                            "duplicate enum values are not allowed (a switch could not "
+                            "tell them apart); give each variant a distinct value",
+                            (int)ev->name_len, ev->name, (int)sv->value,
+                            (int)t->enum_type.variants[j].name_len,
+                            t->enum_type.variants[j].name);
+                        break;
+                    }
+                }
             }
         }
 
+        check_c_reserved_ident(c, node->enum_decl.name, (uint32_t)node->enum_decl.name_len,
+                               node->loc.line, CRUSE_DEFINITION, "type");   /* BUG-1446 */
         add_symbol(c, node->enum_decl.name,
                    (uint32_t)node->enum_decl.name_len,
                    t, node->loc.line);
@@ -28836,6 +29150,8 @@ static void register_decl(Checker *c, Node *node) {
         t->union_type.module_prefix_len = c->current_module_len;
 
         /* register before resolving variants (same as struct) */
+        check_c_reserved_ident(c, node->union_decl.name, (uint32_t)node->union_decl.name_len,
+                               node->loc.line, CRUSE_DEFINITION, "type");   /* BUG-1446 */
         add_symbol(c, node->union_decl.name,
                    (uint32_t)node->union_decl.name_len,
                    t, node->loc.line);
@@ -28859,6 +29175,8 @@ static void register_decl(Checker *c, Node *node) {
                 SUVariant *sv = &t->union_type.variants[i];
                 sv->name = uv->name;
                 sv->name_len = (uint32_t)uv->name_len;
+                check_c_reserved_ident(c, uv->name, (uint32_t)uv->name_len,
+                                       node->loc.line, CRUSE_FIELD, "union variant");   /* BUG-1446 */
                 sv->type = resolve_type(c, uv->type);
                 /* BUG-224: reject void union variants */
                 if (sv->type && sv->type->kind == TYPE_VOID) {
@@ -28912,6 +29230,8 @@ static void register_decl(Checker *c, Node *node) {
             /* regular typedef: alias, fully interchangeable */
             type = underlying;
         }
+        check_c_reserved_ident(c, node->typedef_decl.name, (uint32_t)node->typedef_decl.name_len,
+                               node->loc.line, CRUSE_DEFINITION, "type");   /* BUG-1446 */
         add_symbol(c, node->typedef_decl.name,
                    (uint32_t)node->typedef_decl.name_len,
                    type, node->loc.line);
@@ -28963,6 +29283,13 @@ static void register_decl(Checker *c, Node *node) {
             }
         }
 
+        /* BUG-1446: a DEFINITION may not take a C library / keyword name; a
+         * bodyless declaration may name the C function it declares. */
+        if (!node->func_decl.is_comptime)   /* a comptime function is never emitted */
+            check_c_reserved_ident(c, node->func_decl.name, (uint32_t)node->func_decl.name_len,
+                                   node->loc.line,
+                                   node->func_decl.body ? CRUSE_DEFINITION : CRUSE_EXTERN_FUNC,
+                                   "function");
         /* check for forward declaration → definition pattern */
         Symbol *existing = scope_lookup_local(c->current_scope,
             node->func_decl.name, (uint32_t)node->func_decl.name_len);
@@ -29028,6 +29355,26 @@ static void register_decl(Checker *c, Node *node) {
             ip[0] = type_pointer(c->arena, async_type);
             for (int pi = 0; pi < node->func_decl.param_count; pi++) {
                 ip[1 + pi] = resolve_type(c, node->func_decl.params[pi].type);
+                /* BUG-1447: an ARRAY parameter means "the caller's array" in a
+                 * plain function (it decays; writes reach the caller), but the
+                 * async `_init` COPIED it into the task frame, so the same
+                 * spelling silently meant "a private copy" here — `fill(y)`
+                 * wrote to the task's copy and `y` stayed zero. Aliasing the
+                 * caller's array instead would need its lifetime tied to the
+                 * task, which is exactly what a `[*]T` / `*T` parameter already
+                 * gets (the task's `_init` keeps every argument, so a local that
+                 * does not outlive the task is refused). Refuse the ambiguous
+                 * spelling and point at the tracked ones. */
+                if (ip[1 + pi] && type_dispatch_kind(ip[1 + pi]) == TYPE_ARRAY)
+                    checker_error(c, node->func_decl.params[pi].loc.line,
+                        "async function '%.*s' cannot take an array parameter '%.*s' — "
+                        "the task outlives the call, so the array would be COPIED into "
+                        "the task (unlike a plain function, where it is the caller's "
+                        "array). Take a slice '[*]T' (or a pointer) to share the "
+                        "caller's array, or wrap the array in a struct to copy it",
+                        (int)node->func_decl.name_len, node->func_decl.name,
+                        (int)node->func_decl.params[pi].name_len,
+                        node->func_decl.params[pi].name);
             }
             Type *init_ft = type_func_ptr(c->arena, ip, init_pc, ty_void);
             char *iname_copy = arena_alloc(c->arena, ilen + 1);
@@ -29136,6 +29483,9 @@ static void register_decl(Checker *c, Node *node) {
                                             node->var_decl.name,
                                             (uint32_t)node->var_decl.name_len);
         }
+        if (!node->var_decl.is_synthetic)   /* BUG-1446 */
+            check_c_reserved_ident(c, node->var_decl.name, (uint32_t)node->var_decl.name_len,
+                                   node->loc.line, CRUSE_DEFINITION, "variable");
         Symbol *sym = node->var_decl.is_synthetic
             ? add_symbol_synth(c, node->var_decl.name,
                                (uint32_t)node->var_decl.name_len,
@@ -30355,6 +30705,8 @@ static void check_func_body_once(Checker *c, Node *node) {
         for (int i = 0; i < node->func_decl.param_count; i++) {
             ParamDecl *p = &node->func_decl.params[i];
             Type *ptype = resolve_type(c, p->type);
+            check_c_reserved_ident(c, p->name, (uint32_t)p->name_len, p->loc.line,
+                                   CRUSE_LOCAL, "parameter");   /* BUG-1446 */
             Symbol *sym = add_symbol(c, p->name, (uint32_t)p->name_len,
                                      ptype, p->loc.line);
             arena_backing_mark(c, sym);   /* BUG-1269 */
@@ -34955,8 +35307,7 @@ bool checker_check_bodies(Checker *c, Node *file_node) {
              * — a u65..u128 initializer is emitted as a 128-bit C constant
              * expression, so only what that expresses exactly is admitted. */
             {
-                Type *wt = type ? type_unwrap_distinct(type) : NULL;
-                if (wt && type_is_integer(wt) && type_width(wt) > 64 &&
+                if (static_init_is_wide_int(type) && ginit->kind != NODE_NULL_LIT &&
                     !global_wide_init_ok(ginit, 0))
                     checker_error(c, decl->loc.line,
                         "the initializer of a global / static wider than 64 bits must be "

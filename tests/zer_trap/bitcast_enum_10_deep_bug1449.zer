@@ -1,0 +1,18 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a value that is not a declared variant of this enum
+// BUG-1449: the guard walk stopped at struct depth 8; this enum is 11 deep.
+// FINDING 2: the @bitcast enum-variant guard (emit_enum_variant_guard_path) stops
+// descending at struct depth 8, though type_carries_enum_e (the acceptor) goes to 32.
+// A forged enum nested 10 deep is emitted with NO guard; value 200 takes the last arm.
+enum E { a, b, c }
+struct L0{E e;} struct L1{L0 x;} struct L2{L1 x;} struct L3{L2 x;} struct L4{L3 x;}
+struct L5{L4 x;} struct L6{L5 x;} struct L7{L6 x;} struct L8{L7 x;} struct L9{L8 x;} struct L10{L9 x;}
+u32 main() {
+    u32 raw = 200;
+    L10 v = @bitcast(L10, raw);
+    switch (v.x.x.x.x.x.x.x.x.x.x.e) {   // 200 is no variant; silently takes .c
+        .a => { return 1; }
+        .b => { return 2; }
+        .c => { return 3; }
+    }
+}

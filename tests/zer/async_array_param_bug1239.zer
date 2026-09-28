@@ -1,7 +1,12 @@
-// BUG-1239 positive: an array param is copied into the task
-async u32 f(u32[4] a) { yield; return a[1]; }
+// BUG-1239 positive: an array handed to a task is copied into the task.
+// BUG-1447: a bare array PARAMETER is refused on an async function now (it read
+// as "the caller's array" and silently meant "a copy"), so the copy is spelled
+// by wrapping the array in a struct — a by-value struct parameter copies, in a
+// plain function and in a task alike.
+struct Arr4 { u32[4] a; }
+async u32 f(Arr4 w) { yield; return w.a[1]; }
 void start(*_zer_async_f t) {
-    u32[4] arr; arr[1] = 7;
+    Arr4 arr; arr.a[1] = 7;
     _zer_async_f_init(t, arr);
 }
 u32 main() {

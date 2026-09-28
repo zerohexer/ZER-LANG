@@ -1,0 +1,48 @@
+// BUG-1442: a `static` local's initializer went through the in-function
+// expression emitter and got none of the global path's constant-initializer
+// handling — each of these was accepted by the checker and refused by GCC
+// (invalid initializer / not constant / braced-group). One helper now emits
+// both. Each static is also MUTATED so the second call proves it persists.
+enum E { a, b }
+struct S { u32 x; ?u32 o; }
+const u32 K = 1;
+u32[4] GA;
+
+u32 opt_scalar() { static ?u32 o = 5; u32 v = o orelse 0; o = v + 1; return v; }
+u32 opt_null() { static ?u32 o = null; if (o) |v| { return v; } o = 9; return 0; }
+u32 opt_bool() { static ?bool o = true; if (o) |v| { if (v) { return 1; } } return 0; }
+u32 opt_narrow() { static ?u3 o = 7; return (u32)(o orelse 0); }
+u32 opt_enum() { static ?E o = E.b; if (o) |x| { if (x == E.b) { return 1; } } return 0; }
+u32 opt_void() { static ?void v = null; if (v) { return 1; } return 0; }
+u32 st_struct() { static S s = { .x = 4, .o = 6 }; s.x += 1; return s.x + (s.o orelse 0); }
+u32 st_opt_struct() { static ?S s = { .x = 4 }; if (s) |v| { return v.x; } return 0; }
+usize sl_whole() { static [*]u32 sl = GA; return sl.len; }
+usize sl_sub() { static [*]u32 sl = GA[1..3]; return sl.len; }
+usize sl_const_bound() { static [*]u32 sl = GA[K..4]; return sl.len; }
+usize sl_opt() { static ?[*]u32 sl = GA; if (sl) |q| { return q.len; } return 0; }
+u32 wide() { static u65 w = 18446744073709551615 + 2; u65 one = 1; if (w != (one << 64) + 1) { return 0; } return 1; }
+u32 f2i() { static u32 w = (u32)1e20; return w; }
+u32 addr_static() { static u32 a = 3; static *u32 p = &a; *p += 1; return a; }
+
+u32 main() {
+    if (opt_scalar() != 5) { return 1; }
+    if (opt_scalar() != 6) { return 2; }
+    if (opt_null() != 0) { return 3; }
+    if (opt_null() != 9) { return 4; }
+    if (opt_bool() != 1) { return 5; }
+    if (opt_narrow() != 7) { return 6; }
+    if (opt_enum() != 1) { return 7; }
+    if (opt_void() != 0) { return 8; }
+    if (st_struct() != 11) { return 9; }
+    if (st_struct() != 12) { return 10; }
+    if (st_opt_struct() != 4) { return 11; }
+    if (sl_whole() != 4) { return 12; }
+    if (sl_sub() != 2) { return 13; }
+    if (sl_const_bound() != 3) { return 14; }
+    if (sl_opt() != 4) { return 15; }
+    if (wide() != 1) { return 16; }
+    if (f2i() != 4294967295) { return 17; }
+    if (addr_static() != 4) { return 18; }
+    if (addr_static() != 5) { return 19; }
+    return 0;
+}

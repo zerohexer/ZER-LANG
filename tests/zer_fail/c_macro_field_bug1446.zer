@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: field name 'EOF' is a macro of the C headers
+// BUG-1446: `s.EOF` was macro-expanded to `s.(-1)`.
+struct S { u32 EOF; }
+u32 main() { S s; s.EOF = 1; return s.EOF - 1; }

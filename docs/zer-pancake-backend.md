@@ -95,12 +95,42 @@ mismatch).
 
 ## §6 Trust ledger for this route
 
+**Using this route needs no HOL4 from us.** We only run the CakeML/Pancake compiler (`cake
+--pancake`), exactly as in the spike. Its proofs were written and checked by the CakeML team; we
+inherit them by using their released compiler. HOL4 would only be needed for optional future work
+(proving our translator in the same logic, or proving properties of Pancake programs).
+
+**The compiler binary itself is proved, not just the compiler algorithm.** CakeML is bootstrapped
+"in the logic": HOL4 evaluates the compiler on its own source and produces the machine code of the
+compiler together with a theorem that this machine code is correct. So the `cake` binary from a
+release is not "a verified compiler built by an unverified toolchain". Compare CompCert, whose `ccomp`
+binary exists only through Coq's extraction to OCaml and the OCaml compiler, two extra trusted steps.
+(Source: the CakeML JFP paper, section 11 "Compiler Bootstrapping".) Pancake is integrated into the
+CakeML compiler, so the same released binary compiles Pancake (`--pancake`).
+
+**The assembler barely translates.** CakeML's `.S` output is mostly raw hex bytes of machine code plus
+a small wrapper (per the release's `how-to.md`), so the assembler and linker mainly place bytes and
+resolve the wrapper's symbols.
+
+Trust, piece by piece:
+
 - **Proved:** the Pancake backend (Pancake AST → machine code), by the CakeML team in HOL4.
+- **Proved:** the `cake` compiler binary itself (in-logic bootstrap).
 - **Faithful:** the `zerc` binary (built by CompCert).
 - **Trusted:** the ZER → Pancake translation (until proved: the canonical-form invariant of §8 is
   the first thing to prove); the ISA models; assembler/linker; silicon. For ZER-safe, also the
   safety checker (until ZER's verification endgame lands).
-- **Trusted, small:** C code reached through Pancake FFI (traps, any remaining helpers).
+- **Trusted, small:** C code reached through Pancake FFI (traps, any remaining helpers), and the
+  C glue linked with the output (`basis_ffi.c`, our FFI file), compiled by an ordinary C compiler.
+- **Trusted, the logic itself:** HOL4's kernel (and the platform it runs on). In-logic bootstrapping
+  does not defend against a compromised proof checker ("trusting trust"); it shrinks the trust to one
+  small kernel. Verified checkers exist in this ecosystem: the CakeML release ships `candle_boot.ml`,
+  Candle, a HOL Light theorem prover verified and compiled with CakeML.
+- **Trusted:** the ISA models the backend is proved against; assembler and linker (see above).
+
+In one line: **the remaining trusted pieces are our ZER → Pancake translator, HOL4's kernel, the ISA
+models, and the assembler and linker.** Everything between Pancake source and machine code, including
+the compiler binary that does the work, is proved.
 
 ## §7 The spike (2026-09-28)
 

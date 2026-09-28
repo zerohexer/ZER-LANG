@@ -402,6 +402,20 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   stack-use-after-return). Past the cap the facts SATURATE: every pointer-carrying variable
   gets the union of every fact in the function — a superset of any fixpoint. Tests:
   `tests/zer_fail/escape_fixpoint_cap_{chain17,gchain17,chain30}_bug1489.zer`.
+- **BUG-1498 — a store that MAY NOT RUN was applied as a strong update (VRP and escape).**
+  The right operand of `&&` / `||` and the value fallback of `orelse` run conditionally,
+  and the checker already knew it (`shortcircuit_rhs_depth`, which it used to keep an
+  index there from being PROVEN) — but the NODE_ASSIGN handler stored with `join=false`,
+  so `u32 i = 9; bool b = t() || ((i = 1) > 0); arr[i] = 7;` recorded i = [1,1] and
+  emitted a bare `arr[i] = 7U` that wrote `arr[9]` of a `u32[4]` whenever `t()` was true.
+  The same position replaced the ESCAPE taint: `*u32 p = &x; b = t() || ((p = &g) == &g);
+  gp = p;` stored a pointer to the frame in a global. A store under
+  `shortcircuit_rhs_depth > 0` now JOINS the range and never replaces the taint (the same
+  rule a store in a branch already had). Measured: seven reproducers from the round-4 VRP
+  hunt now emit the guard or trap. Tests: vrp-fact matrix `cond/store-in-{or,and}-rhs`,
+  `cond/store-in-orelse-value`, `cond/store-then-return-summary` (all four SILENT HOLES
+  against the pre-fix build); sink matrix `p61_cond_{or_rhs_global,and_rhs_return}` +
+  boundary `p61_safe_cond_or_rhs`; `tests/zer_fail/escape_store_in_or_rhs_bug1498.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

@@ -1263,6 +1263,9 @@ cell p61_assign_field_read   reject "$P61"' void f(){ u32 x = 5; H61 h; h.p = &x
 cell p61_safe_loop_global    compile "$P61"' void f(){ *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { gp61 = p; p = &g61; } } u32 main(){ f(); return 0; }'
 cell p61_safe_goto_local     compile "$P61"' u32 f(u32 k){ u32 x = k; *u32 p = &x; if (k > 9) { goto out; } x += 1; out: return *p; } u32 main(){ return f(1) - 2; }'
 cell p61_safe_defer_read     compile "$P61"' u32 f(){ u32 x = 4; *u32 p = &x; u32 r = 0; defer x = 0; r = *p; return r; } u32 main(){ return f() - 4; }'
+cell p61_cond_or_rhs_global  reject "$P61"' bool t61(){ return true; } void f(){ u32 x = 5; *u32 p = &x; bool b = t61() || ((p = &g61) == &g61); gp61 = p; } u32 main(){ f(); return 0; }'
+cell p61_cond_and_rhs_return reject "$P61"' bool t61(){ return false; } *u32 f(){ u32 x = 5; *u32 p = &x; if (t61() && ((p = &g61) == &g61)) { } return p; } u32 main(){ return *f(); }'
+cell p61_safe_cond_or_rhs    compile "$P61"' bool t61(){ return true; } void f(){ u32 x = 5; *u32 p = &g61; bool b = t61() || ((p = &g61) == &g61); gp61 = p; } u32 main(){ f(); return 0; }'
 # SHAPE p59 (BUG-1423/1424): the address of a THREADLOCAL reaching a sink
 # another thread can read — crossed SPELLING (bare array name, slice, call
 # result through an argument, a no-argument getter, a struct literal, a local

@@ -208,6 +208,12 @@ typedef enum {
     VF_DEFER_CALL_GLOBAL,  /* a defer that CALLS a function writing a global */
     VF_DEFER_LOOP_BOUND,   /* the defer rewrites a loop bound */
     VF_DEFER_SUMMARY,      /* a return range recorded before a block's defer fired */
+    /* ---- CONDITIONAL STORE (BUG-1498): a store in the right of && / || or an
+     *      orelse value fallback may not run — it JOINS, never replaces ---- */
+    VF_COND_OR,            /* `i = 9; b = t() || ((i = 1) > 0); arr[i]` */
+    VF_COND_AND,           /* `if (f() && (i = 1) == 1) {} arr[i]` with f() false */
+    VF_COND_ORELSE,        /* `u32 v = mb() orelse (i = 1); arr[i]` */
+    VF_COND_SUMMARY,       /* the joined value as a return range */
 
     /* ---- PROVEN: precision the same fixes bought ---- */
     VF_OK_RANGE_FOR,       /* for-in over a fixed array: bound is the array size */
@@ -234,6 +240,7 @@ static int scenario_is_catch(VFScenario s) {
     case VF_DEFER_BLOCK: case VF_DEFER_IF_ARM: case VF_DEFER_SWITCH_ARM:
     case VF_DEFER_CAPTURE: case VF_DEFER_CRITICAL: case VF_DEFER_GLOBAL:
     case VF_DEFER_CALL_GLOBAL: case VF_DEFER_LOOP_BOUND: case VF_DEFER_SUMMARY:
+    case VF_COND_OR: case VF_COND_AND: case VF_COND_ORELSE: case VF_COND_SUMMARY:
         return 1;
     case VF_OK_RANGE_FOR: case VF_OK_CONST_BOUND: case VF_OK_TYPED_CONST:
         return 0;
@@ -273,6 +280,10 @@ static const char *scen_name(VFScenario s) {
     case VF_HOIST_ORELSE_INDEX:  return "hoist/orelse-index-temp";
     case VF_SUMMARY_GOTO:        return "summary/goto-then-guard";
     case VF_SUMMARY_SHADOW:      return "summary/return-of-inner-shadow";
+    case VF_COND_OR:             return "cond/store-in-or-rhs";
+    case VF_COND_AND:            return "cond/store-in-and-rhs";
+    case VF_COND_ORELSE:         return "cond/store-in-orelse-value";
+    case VF_COND_SUMMARY:        return "cond/store-then-return-summary";
     case VF_STALE_ASSIGN:        return "stale/assign-under-narrowing";
     case VF_STALE_COMPOUND:      return "stale/compound-under-narrowing";
     case VF_STALE_ELSE:          return "stale/assign-in-then-with-else";
@@ -574,6 +585,24 @@ static void gen(VFScenario s, char *buf, size_t n) {
             "    { u32 x = get(3); return x; }\n"
             "}\n"
             "u32 main() { two[f(1)] = 7; return 42; }\n");
+        break;
+    case VF_COND_OR:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = 9;\n    bool b = get(1) > 0 || ((i = 1) > 0);\n    arr[i] = 7;\n    return 42;\n}\n");
+        break;
+    case VF_COND_AND:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = 9;\n    if (get(0) > 0 && (i = 1) == 1) { }\n    arr[i] = 7;\n    return 42;\n}\n");
+        break;
+    case VF_COND_ORELSE:
+        snprintf(buf, n, "%s", PRE
+            "?u32 mb() { return 5; }\n"
+            "u32 main() {\n    u32 i = 9;\n    u32 v = mb() orelse (i = 1);\n    arr[i] = 7;\n    return 42 + v - 5;\n}\n");
+        break;
+    case VF_COND_SUMMARY:
+        snprintf(buf, n, "%s", PRE
+            "u32 pick() {\n    u32 i = 9;\n    bool b = get(1) > 0 || ((i = 1) > 0);\n    return i;\n}\n"
+            "u32 main() { arr[pick()] = 7; return 42; }\n");
         break;
     case VF_STALE_ASSIGN:
         snprintf(buf, n, "%s", PRE

@@ -14205,8 +14205,13 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * every compound key the path overlaps (`s = t` / `s.in = t` /
                      * `s[k].d = 0` used to leave "s.d" / "s.in.d" / "s[0].d" with
                      * their old range). */
+                    /* BUG-1490: a store in the RIGHT operand of `&&` / `||` or in an
+                     * orelse VALUE fallback may not run — it JOINS with the old range
+                     * (`u32 i = 9; bool b = t() || ((i = 1) > 0); arr[i] = 1;` kept
+                     * [1,1] and emitted a bare arr[9] store). */
                     vrp_store_target(c, node->assign.target,
-                                     node->assign.op, node->assign.value, false);
+                                     node->assign.op, node->assign.value,
+                                     c->shortcircuit_rhs_depth > 0);
                     /* clear — will be re-set below if new value is unsafe.
                      * ONLY clear if assigning the whole variable (NODE_IDENT target).
                      * Field/index assignments (h.val = 42) must NOT clear flags on
@@ -14218,7 +14223,12 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * the danger flags stay (sticky) and are only ADDED to below.
                      * The keep-derived flag is a RELAXATION, so clearing it is
                      * always the safe direction. */
-                    bool bk_replaces = tsym->decl_branch_depth >= c->branch_depth;
+                    /* BUG-1490: nor does a reassignment inside a short-circuit
+                     * operand / orelse value fallback replace on every path —
+                     * `p = &x; b = t() || ((p = &g) == &g); gp = p;` cleared p's
+                     * taint and published a stack address. */
+                    bool bk_replaces = tsym->decl_branch_depth >= c->branch_depth &&
+                                       c->shortcircuit_rhs_depth == 0;
                     if (node->assign.target->kind == NODE_IDENT && bk_replaces) {
                         tsym->is_local_derived = false;
                         tsym->is_arena_derived = false;

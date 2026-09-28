@@ -1,0 +1,13 @@
+// expect-error: may @cond_wait
+// BUG-1476: the callee is reached through a function pointer.
+shared struct S { u32 v; u32 w; }
+S ga;
+u32 waiter() {
+    @cond_wait(ga, ga.v > 5);
+    return 1;
+}
+u32 main() {
+    *() -> u32 fp = waiter;
+    ga.w = fp();
+    return 0;
+}

@@ -146,13 +146,88 @@ volatile u32 hv = 2;
 u32 main() { g[hv + 1] = 1; return 0; }
 ZEOF
 if "$ZERC" "$req_dir/volidx.zer" -o "$req_dir/volidx.c" >/dev/null 2>&1; then
-    n=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/volidx.c" | grep -o 'hv + 1U' | wc -l)
+    # BUG-1474: count READS of hv (the lowerer may now hoist the index into a
+    # temp, so the text `hv + 1U` need not survive — one load of hv must).
+    n=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/volidx.c" | { grep -oE '\bhv\b' || true; } | wc -l)
     if [ "$n" -ne 1 ]; then
         echo "MISSING EMISSION: a volatile read inside an index is evaluated $n times (want 1)"
         REQ_FAIL=$((REQ_FAIL + 1))
     fi
 else
     echo "MISSING EMISSION: the volatile-index sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1470..1474 — "evaluated exactly once" is ONE question: a VOLATILE read is
+# an effect for it, at EVERY site that writes a place or operand more than once.
+# Each sample reads `hv` once in the source; the emitted C must read it once
+# (a `__typeof__(...)` mention is not a read). Sites: compound shift / div / mod
+# targets (IR + AST paths), @ctz / @clz operands, a shared-struct LOCK ROOT
+# (lock, operation and unlock), a for-step lock root, a cond lock root.
+vol_once() {   # name, program
+    printf '%s\n' "$2" > "$req_dir/vo_$1.zer"
+    if "$ZERC" "$req_dir/vo_$1.zer" -o "$req_dir/vo_$1.c" >/dev/null 2>&1; then
+        n=$(grep -v '^volatile uint32_t hv' "$req_dir/vo_$1.c" | sed 's/__typeof__([^()]*)//g' |
+            { grep -oE '\bhv\b' || true; } | wc -l)
+        if [ "$n" -ne 1 ]; then
+            echo "MISSING EMISSION: volatile read in '$1' evaluated $n times (want 1) (BUG-1470..1474)"
+            REQ_FAIL=$((REQ_FAIL + 1))
+        fi
+    else
+        echo "MISSING EMISSION: the volatile single-eval sample '$1' failed to compile"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+}
+VH='volatile u32 hv;
+u32[8] g;
+i32[8] gi;'
+vol_once shl  "$VH
+u32 main() { g[hv % 8] <<= 1; return 0; }"
+vol_once shr  "$VH
+u32 main() { g[hv % 8] >>= 1; return 0; }"
+vol_once sdiv "$VH
+u32 main() { gi[hv % 8] /= 2; return 0; }"
+vol_once smod "$VH
+u32 main() { gi[hv % 8] %= 3; return 0; }"
+vol_once ctz  "$VH
+u32 main() { u32 r = @ctz(hv); return r; }"
+vol_once clz  "$VH
+u32 main() { u32 r = @clz(hv + 1); return r; }"
+vol_once dshl "$VH
+u32 main() { defer { g[hv % 8] <<= 1; } goto L; L: return 0; }"
+vol_once dsdiv "$VH
+u32 main() { defer { gi[hv % 8] /= 2; } goto L; L: return 0; }"
+vol_once lockroot "shared struct S { u32 v; }
+$VH
+void bump([*]S sl) { sl[hv % 2].v += 1; }
+u32 main() { S[2] pair; bump(pair[0..2]); return 0; }"
+vol_once lockcond "shared struct S { u32 v; }
+$VH
+S[4] gs;
+u32 main() { if (gs[hv % 4].v == 9) { return 1; } return 0; }"
+vol_once lockstep "shared struct S { u32 v; }
+$VH
+S[4] gs;
+u32 main() { for (u32 i = 0; i < 3; gs[hv % 4].v += 1) { i += 1; } return 0; }"
+# The ORDER half (BUG-1472): the object of an index is evaluated before its
+# index, so `m[hv % 8][(hv + 1) % 8]` reads `hv %` first.
+printf '%s\n' 'volatile u32 hv;
+u32[8][8] m;
+u32 main() { u32 y = m[hv % 8][(hv + 1) % 8]; return y; }' > "$req_dir/vo_order.zer"
+if "$ZERC" "$req_dir/vo_order.zer" -o "$req_dir/vo_order.c" >/dev/null 2>&1; then
+    body=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/vo_order.c" | tr -d '\n')
+    # between the FIRST read of hv and the second, the `+ 1` of the second
+    # index must not appear yet (the lowerer may hoist each into a temp; the
+    # emitter's single-evaluation form writes them inline — both must keep
+    # the object's read first).
+    rest=${body#*hv}
+    seg=${rest%%hv*}
+    if [ "$rest" = "$body" ] || [[ "$seg" == *"+ "* ]]; then
+        echo "MISSING EMISSION: the index OBJECT (a volatile read) is not evaluated before its index (BUG-1472)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the index-order sample failed to compile"
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 

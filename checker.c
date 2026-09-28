@@ -12049,13 +12049,20 @@ static bool union_variant_write_is_partial(Checker *c, Node *node,
     if (!c->in_assign_target) return false;
     bool whole = node == c->assign_target_top;
     if (whole && c->assign_target_op == (int)TOK_EQ) return false;
-    if (!union_path_has_side_effect(node->field.object, 0)) return false;
+    /* BUG-1470: a VOLATILE read in the path (`us[hv % 4].b += 1`) is an effect
+     * for single evaluation too — the reset and the store read it separately,
+     * so the tag of us[i1] was reset and us[i2] written (a pointer variant
+     * forged by integer arithmetic when another thread changes hv). The ADDRESS
+     * part only: a volatile union itself (`vu.b += 1`) is read once either way. */
+    bool se = union_path_has_side_effect(node->field.object, 0);
+    bool vol = !se && checker_place_addr_reads_volatile(c, node->field.object, NULL, NULL);
+    if (!se && !vol) return false;
     checker_error(c, node->loc.line,
-        "%s union variant '%.*s' through a path with a side effect — the variant "
+        "%s union variant '%.*s' through a path with %s — the variant "
         "change is checked on the union first, which would evaluate the path twice. "
         "Take a pointer to the union in a local first",
         whole ? "compound assignment to" : "a write into part of",
-        (int)flen, fname);
+        (int)flen, fname, vol ? "a volatile read" : "a side effect");
     return true;
 }
 
@@ -13074,11 +13081,16 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             bool bs_packed = false;
             if (bso->kind == NODE_FIELD || bso->kind == NODE_INDEX)
                 packed_path_aggregate(c, bso, &bs_packed, 0);
-            if (bs_packed && union_path_has_side_effect(bso, 0))
+            /* BUG-1470: a VOLATILE read in the path is the same double
+             * evaluation (`ps[hv % 4].w[3..0] = 5` read hv twice). */
+            bool bs_vol = bs_packed && !union_path_has_side_effect(bso, 0) &&
+                          checker_place_addr_reads_volatile(c, bso, NULL, NULL);
+            if (bs_packed && (union_path_has_side_effect(bso, 0) || bs_vol))
                 checker_error(c, node->loc.line,
-                    "cannot write bits of a packed field through a path with a side "
-                    "effect — the field has no aligned address to hoist, so the path "
-                    "would be evaluated twice. Take the struct into a local first");
+                    "cannot write bits of a packed field through a path with %s "
+                    "— the field has no aligned address to hoist, so the path "
+                    "would be evaluated twice. Take the struct into a local first",
+                    bs_vol ? "a volatile read" : "a side effect");
         }
         /* Bit-slice write over-width guard: `reg[hi..lo] = LIT` where LIT does
          * not fit the (hi-lo+1)-bit field used to silently truncate (9 -> 9&7=1).
@@ -21057,6 +21069,8 @@ static bool func_props_merge_reached(Checker *c, Symbol *fs, void *ud) {
     if (fs->props.can_spawn)      parent_sym->props.can_spawn = true;
     if (fs->props.can_alloc)      parent_sym->props.can_alloc = true;
     if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
+    if (fs->props.can_cond_wait)                                   /* BUG-1476 */
+        parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
     return false;   /* visit every target */
 }
 
@@ -21101,7 +21115,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     /* Short-circuit: if all properties already found, stop scanning */
     if (parent_sym->props.can_yield && parent_sym->props.can_spawn &&
         parent_sym->props.can_alloc && parent_sym->props.has_sync &&
-        parent_sym->props.can_enable_int)
+        parent_sym->props.can_enable_int && parent_sym->props.can_cond_wait &&
+        parent_sym->props.cond_wait_via_call)
         return;
 
     switch (node->kind) {
@@ -21141,6 +21156,9 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
             (nl == 12 && memcmp(n, "cpu_wait_int", 12) == 0) ||
             (nl == 14 && memcmp(n, "cpu_deep_sleep", 14) == 0))
             parent_sym->props.can_enable_int = true;                 /* BUG-1251 */
+        if ((nl == 9 && memcmp(n, "cond_wait", 9) == 0) ||
+            (nl == 14 && memcmp(n, "cond_timedwait", 14) == 0))
+            parent_sym->props.can_cond_wait = true;                  /* BUG-1476 */
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_func_props(c, node->intrinsic.args[i], parent_sym);
         return;
@@ -21239,6 +21257,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
                 if (callee->props.has_sync)  parent_sym->props.has_sync = true;
                 if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
+                if (callee->props.can_cond_wait)                       /* BUG-1476 */
+                    parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
             }
         }
 
@@ -21279,6 +21299,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (fs->props.can_alloc) parent_sym->props.can_alloc = true;
                 if (fs->props.has_sync)  parent_sym->props.has_sync = true;
                 if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
+                if (fs->props.can_cond_wait)                           /* BUG-1476 */
+                    parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
             }
         }
 
@@ -21305,6 +21327,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                     if (callee->props.can_alloc) parent_sym->props.can_alloc = true;
                     if (callee->props.has_sync)  parent_sym->props.has_sync = true;
                 if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
+                if (callee->props.can_cond_wait)                       /* BUG-1476 */
+                    parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
                 }
             }
         }
@@ -37153,6 +37177,78 @@ static bool cblo_orelse_cb(Checker *c, Node *blk, void *ud) {
     return false;   /* void walk: see every block */
 }
 
+/* BUG-1476: a statement that HOLDS a shared-struct lock (it touches one
+ * directly) and calls a function that may @cond_wait / @cond_timedwait
+ * (directly or through its callees). pthread_cond_wait releases ONE level of
+ * the (recursive) mutex, so with the caller's level still held the signaller
+ * can never take the lock: `ga.w = waiter();` with waiter doing
+ * `@cond_wait(ga, ga.v > 5)` hung (measured). On a different struct the waiter
+ * sleeps holding the caller's lock — the same hang for anyone needing it. The
+ * direct form is BUG-755's rule (a foreign shared read in the predicate); this
+ * is its sibling through a CALL, answered by the function summary
+ * (props.cond_wait_via_call — direct names, funcptr arguments, module calls
+ * and indirect calls, like every other FuncProps effect). */
+/* `found` is the caller's scratch (check_block_lock_ordering's), 4 entries. */
+static void check_lock_held_cond_wait(Checker *c, Node *expr, int line, Type **found) {
+    if (!expr) return;
+    c->lockchk_direct_only = true;
+    int nd = collect_shared_types_in_expr(c, expr, found, 4, 0);
+    c->lockchk_direct_only = false;
+    if (nd <= 0) return;
+    Symbol tmp = {0};
+    tmp.is_function = true;
+    tmp.props.in_progress = true;
+    tmp.func_node = c->lockchk_func;
+    scan_func_props(c, expr, &tmp);
+    if (!tmp.props.cond_wait_via_call) return;
+    checker_error(c, line,
+        "this statement holds the lock on '%.*s' and calls a function that may "
+        "@cond_wait — the wait releases only its own level of the lock, so the "
+        "signalling thread can never take it (the program hangs). Make the call "
+        "in its own statement (read its result into a local first)",
+        (int)found[0]->struct_type.name_len, found[0]->struct_type.name);
+}
+static void check_stmt_lock_held_cond_wait(Checker *c, Node *stmt, Type **found) {
+    if (!stmt) return;
+    switch (stmt->kind) {
+    case NODE_EXPR_STMT: check_lock_held_cond_wait(c, stmt->expr_stmt.expr, stmt->loc.line, found); return;
+    case NODE_VAR_DECL:  check_lock_held_cond_wait(c, stmt->var_decl.init, stmt->loc.line, found); return;
+    case NODE_RETURN:    check_lock_held_cond_wait(c, stmt->ret.expr, stmt->loc.line, found); return;
+    case NODE_IF:        check_lock_held_cond_wait(c, stmt->if_stmt.cond, stmt->loc.line, found); return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        check_lock_held_cond_wait(c, stmt->while_stmt.cond, stmt->loc.line, found); return;
+    case NODE_FOR:       /* init, cond and step each take their own lock */
+        check_lock_held_cond_wait(c, stmt->for_stmt.init, stmt->loc.line, found);
+        check_lock_held_cond_wait(c, stmt->for_stmt.cond, stmt->loc.line, found);
+        check_lock_held_cond_wait(c, stmt->for_stmt.step, stmt->loc.line, found);
+        return;
+    case NODE_SWITCH:    check_lock_held_cond_wait(c, stmt->switch_stmt.expr, stmt->loc.line, found); return;
+    case NODE_SPAWN:
+        /* each argument is evaluated under its own root's lock */
+        for (int i = 0; i < stmt->spawn_stmt.arg_count; i++)
+            check_lock_held_cond_wait(c, stmt->spawn_stmt.args[i], stmt->loc.line, found);
+        return;
+    /* No expression evaluated under a statement lock (bodies are walked by the
+     * caller statement by statement). */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BLOCK: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
+        return;
+    }
+}
+
 static void check_block_lock_ordering(Checker *c, Node *block) {
     if (!block || block->kind != NODE_BLOCK) return;
 
@@ -37276,6 +37372,8 @@ static void check_block_lock_ordering(Checker *c, Node *block) {
                 }
             }
         }
+        /* BUG-1476 (after the rw block: it reuses `found` as scratch) */
+        check_stmt_lock_held_cond_wait(c, stmt, found);
         /* BUG-1398: lock order ACROSS A CALL. The statement holds plain
          * `shared` locks on the instances it touches directly; a callee taking
          * a DIFFERENT instance of one of those types nests a second lock of the
@@ -37717,4 +37815,187 @@ void checker_post_passes(Checker *c, Node *file_node) {
     CheckerFile one = { file_node, c->file_name, c->source, c->current_module,
                         c->current_module_len };
     checker_post_passes_files(c, &one, 1);
+}
+
+/* BUG-1470: the shared volatile predicates (see checker.h). The body of
+ * checker_place_is_volatile is the emitter's former expr_is_volatile, moved
+ * unchanged so the emitter and ir_lower answer the one question identically. */
+static Symbol *vol_root_symbol(Checker *c, Node *expr) {
+    Node *root = expr;
+    while (root) {
+        if (root->kind == NODE_FIELD) root = root->field.object;
+        else if (root->kind == NODE_INDEX) root = root->index_expr.object;
+        else if (root->kind == NODE_SLICE) root = root->slice.object;
+        else if (root->kind == NODE_UNARY && root->unary.op == TOK_STAR)
+            root = root->unary.operand;
+        else break;
+    }
+    if (root && root->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope,
+            root->ident.name, (uint32_t)root->ident.name_len);
+        if (!s) s = scope_lookup(c->global_scope,
+            root->ident.name, (uint32_t)root->ident.name_len);
+        return s;
+    }
+    return NULL;
+}
+
+bool checker_place_is_volatile(Checker *c, Node *expr) {
+    Symbol *s = vol_root_symbol(c, expr);
+    if (s && s->is_volatile) return true;
+    /* BUG-414: volatile struct fields. BUG-1344: an access THROUGH a volatile
+     * pointer / volatile slice is volatile at every step. */
+    for (Node *w = expr; w; ) {
+        Node *obj = NULL;
+        if (w->kind == NODE_FIELD) obj = w->field.object;
+        else if (w->kind == NODE_INDEX) obj = w->index_expr.object;
+        else if (w->kind == NODE_UNARY && w->unary.op == TOK_STAR) obj = w->unary.operand;
+        else break;
+        Type *ot = obj ? checker_get_type(c, obj) : NULL;
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
+        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.is_volatile) return true;
+        if (oe && type_dispatch_kind(oe) == TYPE_SLICE && oe->slice.is_volatile) return true;
+        w = obj;
+    }
+    Node *n = expr;
+    while (n && n->kind == NODE_FIELD) {
+        Type *obj_type = checker_get_type(c, n->field.object);
+        if (obj_type) {
+            Type *eff = type_unwrap_distinct(obj_type);
+            /* BUG-749: pointer-to-struct auto-deref (`ptr.field`). */
+            if (eff && type_dispatch_kind(eff) == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+            if (eff && type_dispatch_kind(eff) == TYPE_OPTIONAL) eff = type_unwrap_distinct(eff->optional.inner);
+            if (eff && type_dispatch_kind(eff) == TYPE_POINTER) eff = type_unwrap_distinct(eff->pointer.inner);
+            if (eff && type_dispatch_kind(eff) == TYPE_STRUCT) {
+                for (uint32_t i = 0; i < eff->struct_type.field_count; i++) {
+                    if (eff->struct_type.fields[i].name_len == (uint32_t)n->field.field_name_len &&
+                        memcmp(eff->struct_type.fields[i].name, n->field.field_name,
+                               n->field.field_name_len) == 0) {
+                        if (eff->struct_type.fields[i].is_volatile) return true;
+                        Type *ft = eff->struct_type.fields[i].type;
+                        if (ft && type_dispatch_kind(ft) == TYPE_SLICE && ft->slice.is_volatile) return true;
+                        if (ft && type_dispatch_kind(ft) == TYPE_POINTER && ft->pointer.is_volatile) return true;
+                        break;
+                    }
+                }
+            }
+        }
+        n = n->field.object;
+    }
+    return false;
+}
+
+/* A NAME read as a value: its own storage is volatile. `volatile *T p` puts the
+ * qualifier on the POINTEE (the C is `volatile T *p`), so reading `p` itself is
+ * a plain load; a `volatile [*]T` header and a `volatile T x` are volatile
+ * storage. */
+static bool vol_ident_storage(Checker *c, Node *n, ZerLocalVolFn local_vol, void *ud) {
+    if (local_vol) {
+        int lv = local_vol(ud, n->ident.name, (uint32_t)n->ident.name_len);
+        if (lv >= 0) return lv != 0;
+    }
+    Symbol *s = vol_root_symbol(c, n);
+    if (!s || !s->is_volatile) return false;
+    if (s->type && type_dispatch_kind(s->type) == TYPE_POINTER) return false;
+    return true;
+}
+
+bool checker_expr_reads_volatile(Checker *c, Node *n, ZerLocalVolFn local_vol, void *ud) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_IDENT:
+        return vol_ident_storage(c, n, local_vol, ud);
+    case NODE_FIELD:
+        return checker_place_is_volatile(c, n) ||
+               checker_expr_reads_volatile(c, n->field.object, local_vol, ud);
+    case NODE_INDEX:
+        return checker_place_is_volatile(c, n) ||
+               checker_expr_reads_volatile(c, n->index_expr.object, local_vol, ud) ||
+               checker_expr_reads_volatile(c, n->index_expr.index, local_vol, ud);
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && checker_place_is_volatile(c, n)) return true;
+        return checker_expr_reads_volatile(c, n->unary.operand, local_vol, ud);
+    case NODE_BINARY:
+        return checker_expr_reads_volatile(c, n->binary.left, local_vol, ud) ||
+               checker_expr_reads_volatile(c, n->binary.right, local_vol, ud);
+    case NODE_TYPECAST:
+        return checker_expr_reads_volatile(c, n->typecast.expr, local_vol, ud);
+    case NODE_SLICE:
+        return checker_expr_reads_volatile(c, n->slice.object, local_vol, ud) ||
+               checker_expr_reads_volatile(c, n->slice.start, local_vol, ud) ||
+               checker_expr_reads_volatile(c, n->slice.end, local_vol, ud);
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+        return false;
+    /* A call / assignment / intrinsic / orelse / struct literal: every
+     * single-evaluation caller already treats these as effects; answering YES
+     * here keeps the predicate safe on its own. Non-expressions: YES. */
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
+/* BUG-1470: does computing the ADDRESS of the place `p` read volatile memory?
+ * That is the part a duplicated place re-evaluates (an index, a dereferenced
+ * pointer value, a slice header) — NOT the place's own storage: `vu.b += 1` on a
+ * `volatile U vu` reads vu.b once whichever form is emitted, while
+ * `us[hv % 4].b += 1` computes `hv % 4` again at every repetition. Exhaustive;
+ * a node that is not a place answers as a value read. */
+static bool place_obj_is_value(Checker *c, Node *obj) {
+    Type *ot = obj ? checker_get_type(c, obj) : NULL;
+    Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+    if (!oe) return true;   /* unknown: read it as a value (the conservative side) */
+    TypeKind k = type_dispatch_kind(oe);
+    return !(k == TYPE_STRUCT || k == TYPE_UNION || k == TYPE_ARRAY);
+}
+bool checker_place_addr_reads_volatile(Checker *c, Node *p, ZerLocalVolFn local_vol, void *ud) {
+    if (!p) return false;
+    switch (p->kind) {
+    case NODE_IDENT:
+        return false;
+    case NODE_FIELD: {
+        Node *o = p->field.object;
+        return place_obj_is_value(c, o)
+            ? checker_expr_reads_volatile(c, o, local_vol, ud)
+            : checker_place_addr_reads_volatile(c, o, local_vol, ud);
+    }
+    case NODE_INDEX: {
+        Node *o = p->index_expr.object;
+        bool ov = place_obj_is_value(c, o)
+            ? checker_expr_reads_volatile(c, o, local_vol, ud)
+            : checker_place_addr_reads_volatile(c, o, local_vol, ud);
+        return ov || checker_expr_reads_volatile(c, p->index_expr.index, local_vol, ud);
+    }
+    case NODE_UNARY:
+        if (p->unary.op == TOK_STAR)
+            return checker_expr_reads_volatile(c, p->unary.operand, local_vol, ud);
+        return checker_expr_reads_volatile(c, p, local_vol, ud);
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_BINARY: case NODE_TYPECAST: case NODE_SLICE:
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        /* not a place: whatever it reads, it reads at every repetition */
+        return checker_expr_reads_volatile(c, p, local_vol, ud);
+    }
+    return true;
 }

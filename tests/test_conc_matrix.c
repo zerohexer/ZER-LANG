@@ -936,6 +936,8 @@ typedef enum {
     RC_FUNCPTR_FIELD, /* callee is a field of the shared struct itself         */
     RC_NO_SHARED,     /* callee touches nothing shared — must compile          */
     RC_EXTERN,        /* bodyless extern: C cannot name a ZER rwlock           */
+    RC_COND_WAIT,     /* BUG-1476: callee @cond_waits on the held struct       */
+    RC_COND_WAIT_OWN, /* ... the same wait called in its OWN statement         */
     RC_COUNT
 } ReCallee;
 typedef enum { RL_RW, RL_PLAIN, RL_COUNT } ReLock;
@@ -949,6 +951,8 @@ static const char *rc_name(ReCallee c) {
     case RC_FUNCPTR_FIELD: return "funcptr-field";
     case RC_NO_SHARED:     return "callee-touches-none";
     case RC_EXTERN:        return "bodyless-extern";
+    case RC_COND_WAIT:     return "cond-wait";
+    case RC_COND_WAIT_OWN: return "cond-wait-own-stmt";
     case RC_COUNT:         break;
     }
     return "?";
@@ -966,6 +970,11 @@ static const char *rl_name(ReLock l) {
  * to carry it in both lock kinds — always valid. Everything else is valid too; the
  * grid is deliberately full so the PLAIN column proves the rule is scoped. */
 static int re_is_negative(ReCallee c, ReLock l) {
+    /* BUG-1476: a callee that @cond_waits while the statement holds the lock
+     * hangs for BOTH kinds — the wait releases one level of a recursive mutex
+     * (and a shared(rw) struct cannot back a condvar at all). */
+    if (c == RC_COND_WAIT) return 1;
+    if (c == RC_COND_WAIT_OWN) return l == RL_RW;
     if (l == RL_PLAIN) return 0;           /* recursive mutex: every form is legal */
     switch (c) {
     case RC_DIRECT:        return 1;
@@ -975,6 +984,8 @@ static int re_is_negative(ReCallee c, ReLock l) {
     case RC_FUNCPTR_FIELD: return 1;
     case RC_NO_SHARED:     return 0;
     case RC_EXTERN:        return 0;
+    case RC_COND_WAIT:     return 1;
+    case RC_COND_WAIT_OWN: return 1;
     case RC_COUNT:         break;
     }
     return 0;
@@ -1013,6 +1024,14 @@ static void gen_reentry(ReCallee c, ReLock l, char *out, size_t n) {
     case RC_EXTERN:
         extra = "u32 ext(u32 a);\n";
         stmt  = "g.v = ext(1);";
+        break;
+    case RC_COND_WAIT:
+        extra = "u32 f() { @cond_wait(g, g.v > 5); return 1; }\n";
+        stmt  = "g.v = f();";
+        break;
+    case RC_COND_WAIT_OWN:
+        extra = "u32 f() { @cond_wait(g, g.v > 5); return 1; }\n";
+        stmt  = "u32 r = f(); g.v = r;";
         break;
     case RC_COUNT: break;
     }
@@ -1128,10 +1147,12 @@ int main(void) {
             char nm[192];
             snprintf(nm, sizeof(nm), "reentry/%s/%s", rc_name(rc), rl_name(rl));
             gen_reentry(rc, rl, ebuf, sizeof(ebuf));
-            /* The bodyless-extern cell cannot LINK by construction. */
+            /* The bodyless-extern cell cannot LINK by construction; the
+             * own-statement wait has no signaller, so it would never return. */
             int ok = neg ? run_neg(nm, ebuf)
-                         : (rc == RC_EXTERN ? run_pos_check_only(nm, ebuf)
-                                            : run_pos(nm, ebuf));
+                         : ((rc == RC_EXTERN || rc == RC_COND_WAIT_OWN)
+                                ? run_pos_check_only(nm, ebuf)
+                                : run_pos(nm, ebuf));
             fprintf(stderr, "  [%-20s][%-10s][%-3s] %s\n",
                     rc_name(rc), rl_name(rl), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");

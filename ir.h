@@ -409,6 +409,8 @@ int ir_add_local(IRFunc *func, Arena *arena,
 
 /* Look up a local by name. Returns local ID or -1 if not found. */
 int ir_find_local(IRFunc *func, const char *name, uint32_t name_len);
+/* BUG-1470: ZerLocalVolFn for checker_expr_reads_volatile (ud = IRFunc *). */
+int ir_local_volatile_by_name(void *ud, const char *name, uint32_t len);
 int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len);
 
 /* Create a new basic block. Returns the block ID. */

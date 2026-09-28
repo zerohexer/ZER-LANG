@@ -327,6 +327,36 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   source already took `ir_carry_compounds`). Tests:
   `tests/zer_fail/global_aggregate_copy{,_assign}_uaf_bug1466.zer`,
   `tests/zer/global_aggregate_copy_live_bug1466.zer`.
+- **BUG-1470..1474 — a VOLATILE read was not an "effect" for single evaluation, so a
+  place read twice could read two different values.** `us[hv % 4].b += 1` reset the union
+  tag of one element and wrote another (a forged pointer variant, dereferenced — BUG-1161's
+  reset prefix + the store); `g[hv % 8] <<= 1` read `hv` twice (`g[i1] = _zer_shl(g[i2],…)`);
+  `m[hv%8][(hv+1)%8]` evaluated the inner index first; a shared-struct lock root with a
+  volatile index was evaluated separately at lock, operation and unlock (hang); the packed
+  bit-slice sibling `ps[hv % 4].w[3..0] = 5`. ONE predicate family in checker.c
+  (`checker_place_is_volatile`, `checker_expr_reads_volatile`,
+  `checker_place_addr_reads_volatile`) serves the checker, ir_lower
+  (`lower_place_needs_single_eval` gates every `hoist_place_effects`) and the emitter
+  (`expr_needs_single_eval` = side effects OR volatile reads, at every site that names a
+  place twice: `/=` `%=` `<<=` `>>=` targets on both paths, both NODE_INDEX emissions,
+  `@ctz`/`@clz`, `emit_f2i_const`). A union / packed path with a volatile read is refused
+  like one with a side effect. Gate: a required-count case in `tools/emit_audit.sh`
+  (loads of `hv` over 11 samples; 12 failures pre-fix).
+- **BUG-1475 — two lock roots aliasing ONE `shared(rw)` instance took it twice**
+  (`void f(*S p) { ga.v = p.v + 1; }` called as `f(&ga)`: wrlock then rdlock — EDEADLK,
+  ignored — then two unlocks, undefined; a later thread hung). The lock group is sorted by
+  address with the write mode first among equals and an equal address skipped; the unlock is
+  a group too (`emit_unlock_group`) releasing each distinct address once.
+- **BUG-1476 — `@cond_wait` in a CALLEE called while the statement holds a shared lock
+  hung** (`ga.w = waiter();` — the recursive mutex is held twice, the wait releases one
+  level). The function summary carries `can_cond_wait` / `cond_wait_via_call` (through
+  direct, funcptr-argument, module and indirect calls); a call reaching a wait under a
+  statement lock is refused. Conc-matrix re-entry cells `cond-wait` / `cond-wait-own-stmt`.
+  Tests (1470..1476): `tests/zer_fail/{union_volatile_path_{compound,subfield},packed_bitslice_volatile_path}_bug1470.zer`,
+  `cond_wait_in_callee_{under_lock,transitive,funcptr}_bug1476.zer`; positives
+  `union_volatile_path_remedy_bug1470`, `volatile_single_eval_forms_bug1471`,
+  `shared_lock_root_volatile_bug1474`, `shared_rw_alias_group_bug1475`,
+  `cond_wait_outside_lock_bug1476`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

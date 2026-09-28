@@ -1,0 +1,20 @@
+// BUG-1470 boundary: the remedies the diagnostic names still compile and run —
+// read the volatile into a local, or take a pointer to the union first — and a
+// VOLATILE union itself (its own storage, not its path) is not refused.
+struct P { u32 x; u32 y; }
+union U { P a; u32 b; }
+volatile u32 hv = 6;
+U[4] us;
+u32 main() {
+    u32 i = hv % 4;
+    us[i].a.x = 5;
+    us[i].b += 1;
+    *U up = &us[hv % 4];
+    up.b += 1;
+    if (i != 2) { return 1; }
+    switch (us[2]) {
+        .a => |v| { return 2; }
+        .b => |v| { if (v != 2) { return 3; } }
+    }
+    return 0;
+}

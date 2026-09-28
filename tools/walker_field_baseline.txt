@@ -2039,47 +2039,6 @@ ir_lower.c:hoist_place_effects:NODE_VAR_DECL:var_decl.init
 ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.body
 ir_lower.c:hoist_place_effects:NODE_WHILE:while_stmt.cond
 
-# --- emitter.c: expr_reads_volatile (BUG-1378) ---
-# Every kind listed without descent answers YES (a call / assignment / intrinsic /
-# orelse is already a side effect; a statement kind is not an index expression),
-# which forces the single-evaluation form — the conservative verdict.
-emitter.c:expr_reads_volatile:NODE_ASM:asm_stmt.inputs
-emitter.c:expr_reads_volatile:NODE_ASM:asm_stmt.outputs
-emitter.c:expr_reads_volatile:NODE_ASSIGN:assign.target
-emitter.c:expr_reads_volatile:NODE_ASSIGN:assign.value
-emitter.c:expr_reads_volatile:NODE_AWAIT:await_stmt.cond
-emitter.c:expr_reads_volatile:NODE_BLOCK:block.stmts
-emitter.c:expr_reads_volatile:NODE_CALL:call.args
-emitter.c:expr_reads_volatile:NODE_CALL:call.callee
-emitter.c:expr_reads_volatile:NODE_CRITICAL:critical.body
-emitter.c:expr_reads_volatile:NODE_DEFER:defer.body
-emitter.c:expr_reads_volatile:NODE_DO_WHILE:while_stmt.body
-emitter.c:expr_reads_volatile:NODE_DO_WHILE:while_stmt.cond
-emitter.c:expr_reads_volatile:NODE_EXPR_STMT:expr_stmt.expr
-emitter.c:expr_reads_volatile:NODE_FILE:file.decls
-emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.body
-emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.cond
-emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.init
-emitter.c:expr_reads_volatile:NODE_FOR:for_stmt.step
-emitter.c:expr_reads_volatile:NODE_FUNC_DECL:func_decl.body
-emitter.c:expr_reads_volatile:NODE_GLOBAL_VAR:var_decl.init
-emitter.c:expr_reads_volatile:NODE_IF:if_stmt.cond
-emitter.c:expr_reads_volatile:NODE_IF:if_stmt.else_body
-emitter.c:expr_reads_volatile:NODE_IF:if_stmt.then_body
-emitter.c:expr_reads_volatile:NODE_INTERRUPT:interrupt.body
-emitter.c:expr_reads_volatile:NODE_INTRINSIC:intrinsic.args
-emitter.c:expr_reads_volatile:NODE_ONCE:once.body
-emitter.c:expr_reads_volatile:NODE_ORELSE:orelse.expr
-emitter.c:expr_reads_volatile:NODE_ORELSE:orelse.fallback
-emitter.c:expr_reads_volatile:NODE_RETURN:ret.expr
-emitter.c:expr_reads_volatile:NODE_SPAWN:spawn_stmt.args
-emitter.c:expr_reads_volatile:NODE_STATIC_ASSERT:static_assert_stmt.cond
-emitter.c:expr_reads_volatile:NODE_STRUCT_INIT:struct_init.fields
-emitter.c:expr_reads_volatile:NODE_SWITCH:switch_stmt.arms
-emitter.c:expr_reads_volatile:NODE_SWITCH:switch_stmt.expr
-emitter.c:expr_reads_volatile:NODE_VAR_DECL:var_decl.init
-emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.body
-emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.cond
 # --- ir_lower.c: sc_expr_has_orelse (BUG-1400) ---
 # Mirrors pre_lower_orelse's descent EXACTLY: it answers "will pre_lower_orelse
 # find an orelse here?", so it skips exactly the children pre_lower_orelse skips.
@@ -2186,3 +2145,88 @@ zercheck_ir.c:ir_pass_calls_walk:NODE_SWITCH:switch_stmt.expr
 zercheck_ir.c:ir_pass_calls_walk:NODE_VAR_DECL:var_decl.init
 zercheck_ir.c:ir_pass_calls_walk:NODE_WHILE:while_stmt.body
 zercheck_ir.c:ir_pass_calls_walk:NODE_WHILE:while_stmt.cond
+# --- checker.c: checker_expr_reads_volatile / checker_place_addr_reads_volatile (BUG-1470) ---
+# Moved from emitter.c expr_reads_volatile (BUG-1378). Every kind listed without
+# descent answers YES (a call / assignment / intrinsic / orelse is already an
+# effect; a statement kind is not an expression) — single evaluation is always
+# correct, so the conservative answer needs no children.
+checker.c:checker_expr_reads_volatile:NODE_ASM:asm_stmt.inputs
+checker.c:checker_expr_reads_volatile:NODE_ASM:asm_stmt.outputs
+checker.c:checker_expr_reads_volatile:NODE_ASSIGN:assign.target
+checker.c:checker_expr_reads_volatile:NODE_ASSIGN:assign.value
+checker.c:checker_expr_reads_volatile:NODE_AWAIT:await_stmt.cond
+checker.c:checker_expr_reads_volatile:NODE_BLOCK:block.stmts
+checker.c:checker_expr_reads_volatile:NODE_CALL:call.args
+checker.c:checker_expr_reads_volatile:NODE_CALL:call.callee
+checker.c:checker_expr_reads_volatile:NODE_CRITICAL:critical.body
+checker.c:checker_expr_reads_volatile:NODE_DEFER:defer.body
+checker.c:checker_expr_reads_volatile:NODE_DO_WHILE:while_stmt.body
+checker.c:checker_expr_reads_volatile:NODE_DO_WHILE:while_stmt.cond
+checker.c:checker_expr_reads_volatile:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:checker_expr_reads_volatile:NODE_FILE:file.decls
+checker.c:checker_expr_reads_volatile:NODE_FOR:for_stmt.body
+checker.c:checker_expr_reads_volatile:NODE_FOR:for_stmt.cond
+checker.c:checker_expr_reads_volatile:NODE_FOR:for_stmt.init
+checker.c:checker_expr_reads_volatile:NODE_FOR:for_stmt.step
+checker.c:checker_expr_reads_volatile:NODE_FUNC_DECL:func_decl.body
+checker.c:checker_expr_reads_volatile:NODE_GLOBAL_VAR:var_decl.init
+checker.c:checker_expr_reads_volatile:NODE_IF:if_stmt.cond
+checker.c:checker_expr_reads_volatile:NODE_IF:if_stmt.else_body
+checker.c:checker_expr_reads_volatile:NODE_IF:if_stmt.then_body
+checker.c:checker_expr_reads_volatile:NODE_INTERRUPT:interrupt.body
+checker.c:checker_expr_reads_volatile:NODE_INTRINSIC:intrinsic.args
+checker.c:checker_expr_reads_volatile:NODE_ONCE:once.body
+checker.c:checker_expr_reads_volatile:NODE_ORELSE:orelse.expr
+checker.c:checker_expr_reads_volatile:NODE_ORELSE:orelse.fallback
+checker.c:checker_expr_reads_volatile:NODE_RETURN:ret.expr
+checker.c:checker_expr_reads_volatile:NODE_SPAWN:spawn_stmt.args
+checker.c:checker_expr_reads_volatile:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:checker_expr_reads_volatile:NODE_STRUCT_INIT:struct_init.fields
+checker.c:checker_expr_reads_volatile:NODE_SWITCH:switch_stmt.arms
+checker.c:checker_expr_reads_volatile:NODE_SWITCH:switch_stmt.expr
+checker.c:checker_expr_reads_volatile:NODE_VAR_DECL:var_decl.init
+checker.c:checker_expr_reads_volatile:NODE_WHILE:while_stmt.body
+checker.c:checker_expr_reads_volatile:NODE_WHILE:while_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_ASM:asm_stmt.inputs
+checker.c:checker_place_addr_reads_volatile:NODE_ASM:asm_stmt.outputs
+checker.c:checker_place_addr_reads_volatile:NODE_ASSIGN:assign.target
+checker.c:checker_place_addr_reads_volatile:NODE_ASSIGN:assign.value
+checker.c:checker_place_addr_reads_volatile:NODE_AWAIT:await_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_BINARY:binary.left
+checker.c:checker_place_addr_reads_volatile:NODE_BINARY:binary.right
+checker.c:checker_place_addr_reads_volatile:NODE_BLOCK:block.stmts
+checker.c:checker_place_addr_reads_volatile:NODE_CALL:call.args
+checker.c:checker_place_addr_reads_volatile:NODE_CALL:call.callee
+checker.c:checker_place_addr_reads_volatile:NODE_CRITICAL:critical.body
+checker.c:checker_place_addr_reads_volatile:NODE_DEFER:defer.body
+checker.c:checker_place_addr_reads_volatile:NODE_DO_WHILE:while_stmt.body
+checker.c:checker_place_addr_reads_volatile:NODE_DO_WHILE:while_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:checker_place_addr_reads_volatile:NODE_FILE:file.decls
+checker.c:checker_place_addr_reads_volatile:NODE_FOR:for_stmt.body
+checker.c:checker_place_addr_reads_volatile:NODE_FOR:for_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_FOR:for_stmt.init
+checker.c:checker_place_addr_reads_volatile:NODE_FOR:for_stmt.step
+checker.c:checker_place_addr_reads_volatile:NODE_FUNC_DECL:func_decl.body
+checker.c:checker_place_addr_reads_volatile:NODE_GLOBAL_VAR:var_decl.init
+checker.c:checker_place_addr_reads_volatile:NODE_IF:if_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_IF:if_stmt.else_body
+checker.c:checker_place_addr_reads_volatile:NODE_IF:if_stmt.then_body
+checker.c:checker_place_addr_reads_volatile:NODE_INTERRUPT:interrupt.body
+checker.c:checker_place_addr_reads_volatile:NODE_INTRINSIC:intrinsic.args
+checker.c:checker_place_addr_reads_volatile:NODE_ONCE:once.body
+checker.c:checker_place_addr_reads_volatile:NODE_ORELSE:orelse.expr
+checker.c:checker_place_addr_reads_volatile:NODE_ORELSE:orelse.fallback
+checker.c:checker_place_addr_reads_volatile:NODE_RETURN:ret.expr
+checker.c:checker_place_addr_reads_volatile:NODE_SLICE:slice.end
+checker.c:checker_place_addr_reads_volatile:NODE_SLICE:slice.object
+checker.c:checker_place_addr_reads_volatile:NODE_SLICE:slice.start
+checker.c:checker_place_addr_reads_volatile:NODE_SPAWN:spawn_stmt.args
+checker.c:checker_place_addr_reads_volatile:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:checker_place_addr_reads_volatile:NODE_STRUCT_INIT:struct_init.fields
+checker.c:checker_place_addr_reads_volatile:NODE_SWITCH:switch_stmt.arms
+checker.c:checker_place_addr_reads_volatile:NODE_SWITCH:switch_stmt.expr
+checker.c:checker_place_addr_reads_volatile:NODE_TYPECAST:typecast.expr
+checker.c:checker_place_addr_reads_volatile:NODE_VAR_DECL:var_decl.init
+checker.c:checker_place_addr_reads_volatile:NODE_WHILE:while_stmt.body
+checker.c:checker_place_addr_reads_volatile:NODE_WHILE:while_stmt.cond

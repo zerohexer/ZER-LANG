@@ -1,0 +1,11 @@
+// expect-error: through a path with a volatile read
+// BUG-1470: the sub-field form of the same double evaluation — a write into
+// PART of a variant through a path that reads a volatile.
+struct P { u32 x; u32 y; }
+union U { P a; u32 b; }
+volatile u32 hv;
+U[4] us;
+u32 main() {
+    us[hv % 4].a.x = 1;
+    return 0;
+}

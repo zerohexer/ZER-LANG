@@ -1017,7 +1017,8 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
   first reset to zero, so the other variant's bytes can never be read as the new one (a
   compound op on a newly activated variant starts from 0). Within the active variant both
   behave normally. Such a write through a path with a side effect (`arr[next()].v.x = 1`)
-  is a compile error — take a pointer to the union in a local first.
+  or a VOLATILE read (`arr[hv % 4].n += 1` with `volatile u32 hv`) is a compile error —
+  take a pointer to the union in a local first (or read the index into a local).
 - A mutable capture `|*v|` points INTO the variant, so it is valid only while the arm runs
   and the union keeps that variant. Two rules keep it that way:
   - it cannot be stored anywhere (assigned, put in a struct literal, returned, handed to a
@@ -5850,7 +5851,9 @@ A PLACE is evaluated from its root outward: in `m[f()][g()]`, `pick().a[k].b` or
 `mk().v[k]`, the object (`m`, `pick()`, `mk()`) comes first, then each index in the
 order written — for a read and for a write alike. The object a `shared struct` access
 locks is evaluated exactly once: `pick().v += 1` calls `pick()` once, and the lock it
-takes is the lock of the object it writes.
+takes is the lock of the object it writes. A VOLATILE read counts as a side effect for
+all of this: in `g[hv % 8] <<= 1`, `sl[hv % 2].v += 1` or `@ctz(hv)` the volatile is read
+once, however many times the emitted code names the place.
 A COMPOUND assignment `t op= v` evaluates `v` first and then reads `t`: with a
 `setg()` that sets `g = 10` and returns 1, `g += setg()` is 11 while the written-out
 `g = g + setg()` reads `g` first and is 2. Write the long form when the right side
@@ -6598,6 +6601,10 @@ void demo() {
   predicates deadlock). Read into a local first.
 - The condition variable must be a plain `shared struct`: a `shared(rw)` struct's
   reader-writer lock cannot back one.
+- A statement that holds a shared-struct lock may not CALL a function that
+  (directly or through its callees) does `@cond_wait` / `@cond_timedwait`: the wait
+  releases only its own level of the lock, so the signalling thread could never take
+  it. `ga.w = waiter();` is a compile error; `u32 r = waiter(); ga.w = r;` is fine.
 
 ### threadlocal — Per-Thread Storage
 ```zer

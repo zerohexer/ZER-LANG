@@ -1,0 +1,26 @@
+// BUG-1475: two lock roots of ONE statement that name one shared(rw) instance at
+// run time (`ga.v = p.v + 1` with p == &ga) were both taken — wrlock then rdlock
+// on a non-recursive rwlock (EDEADLK, ignored) — and both released, the second
+// unlock releasing a lock nobody held; the threads below then hung. The group
+// now takes and releases each distinct address once, in the stronger mode.
+shared(rw) struct S { u32 v; }
+S ga;
+S gb;
+void f(*S p) { ga.v = p.v + 1; }
+void w() { for (u32 i = 0; i < 100000; i += 1) { ga.v = ga.v + 1; } }
+u32 main() {
+    ga.v = 1;
+    f(&ga);
+    if (ga.v != 2) { return 2; }
+    gb.v = 10;
+    f(&gb);
+    if (ga.v != 11) { return 3; }
+    ga.v = 2;
+    f(&ga);
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join();
+    b.join();
+    if (ga.v != 200003) { return 1; }
+    return 0;
+}

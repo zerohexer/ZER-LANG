@@ -8108,6 +8108,90 @@ static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
     return auto_sym;
 }
 
+/* BUG-1404: WHICH allocator a Handle value came from, when the value says so —
+ * `pool.alloc()` / `slab.alloc()` (a named Pool / Slab) or `Task.alloc()` (the
+ * type's auto-slab), through an orelse; an identifier alias carries its own
+ * source. NULL = not known from the value.
+ *
+ * `h.field` on a Handle dereferences through ONE allocator. It used to be set
+ * only at a var-decl from a NAMED pool / slab and never cleared, so:
+ *   - `Handle(Task) h = Task.alloc() ...; h.id` with any named Slab(Task) in the
+ *     program was refused "no single Pool or Slab holds it" (over-rejection);
+ *   - `h = pool.alloc() ...;` after `h = heap.alloc() ...` kept the HEAP as the
+ *     source, and `h.id = 9` emitted `_zer_slab_get(&heap, h)` — a pool handle
+ *     looked up in the slab (silent wrong-object write when the index and
+ *     generation coincide with a live slab object). */
+static Symbol *handle_alloc_source_of(Checker *c, Node *v) {
+    if (!v) return NULL;
+    if (v->kind == NODE_ORELSE) v = v->orelse.expr;
+    if (!v) return NULL;
+    if (v->kind == NODE_IDENT) {
+        Symbol *s = scope_lookup(c->current_scope, v->ident.name, (uint32_t)v->ident.name_len);
+        return s ? s->slab_source : NULL;
+    }
+    if (v->kind != NODE_CALL || !v->call.callee || v->call.callee->kind != NODE_FIELD)
+        return NULL;
+    Node *obj = v->call.callee->field.object;
+    const char *mn = v->call.callee->field.field_name;
+    size_t ml = v->call.callee->field.field_name_len;
+    if (!obj || obj->kind != NODE_IDENT || !(ml == 5 && memcmp(mn, "alloc", 5) == 0))
+        return NULL;
+    Type *ot = typemap_get(c, obj);
+    if (!ot) return NULL;
+    if (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB) {
+        Symbol *a = scope_lookup(c->current_scope, obj->ident.name, (uint32_t)obj->ident.name_len);
+        if (!a) a = global_decl_lookup(c, obj->ident.name, (uint32_t)obj->ident.name_len);
+        return a;
+    }
+    /* `Task.alloc()` — the receiver names the TYPE (a variable of struct type has
+     * no alloc method), so the source is that type's auto-slab. */
+    if (type_dispatch_kind(ot) == TYPE_STRUCT) {
+        Symbol *os = scope_lookup(c->current_scope, obj->ident.name, (uint32_t)obj->ident.name_len);
+        if (os && !os->is_function && os->type && type_dispatch_kind(os->type) == TYPE_STRUCT &&
+            os->func_node && os->func_node->kind == NODE_VAR_DECL)
+            return NULL;   /* a struct VARIABLE — not a type name */
+        return find_or_create_auto_slab(c, type_unwrap_distinct(ot));
+    }
+    return NULL;
+}
+
+/* BUG-1404: is every later write of this Handle local from the SAME allocator?
+ * Asked once, at the declaration, over the whole body — so a use BEFORE a
+ * reassignment in the text (the loop back edge) cannot keep a source a later
+ * `h = other.alloc()` invalidates. Resolved without the typemap (the writes are
+ * not checked yet): a receiver naming a global Pool / Slab, or a struct type
+ * (its auto-slab). An address-take, a compound write or any other value is
+ * "not the same". */
+typedef struct { Checker *c; Symbol *src; bool same; } HandleSrcUd;
+static bool handle_src_write_visit(Node *v, int kind, void *ud) {
+    HandleSrcUd *u = (HandleSrcUd *)ud;
+    if (kind != ANW_ASSIGN || !v) { u->same = false; return true; }
+    if (v->kind == NODE_ORELSE) v = v->orelse.expr;
+    Symbol *got = NULL;
+    if (v && v->kind == NODE_CALL && v->call.callee &&
+        v->call.callee->kind == NODE_FIELD && v->call.callee->field.object &&
+        v->call.callee->field.object->kind == NODE_IDENT &&
+        v->call.callee->field.field_name_len == 5 &&
+        memcmp(v->call.callee->field.field_name, "alloc", 5) == 0) {
+        Node *o = v->call.callee->field.object;
+        Symbol *os = global_decl_lookup(u->c, o->ident.name, (uint32_t)o->ident.name_len);
+        if (os && os->type && (os->type->kind == TYPE_POOL || os->type->kind == TYPE_SLAB))
+            got = os;
+        else if (os && os->type && type_dispatch_kind(os->type) == TYPE_STRUCT &&
+                 !(os->func_node && (os->func_node->kind == NODE_GLOBAL_VAR ||
+                                     os->func_node->kind == NODE_VAR_DECL)))
+            got = find_or_create_auto_slab(u->c, type_unwrap_distinct(os->type));
+    }
+    if (got != u->src) { u->same = false; return true; }
+    return false;
+}
+static bool handle_source_stable(Checker *c, Symbol *sym) {
+    if (!c->current_body) return false;
+    HandleSrcUd u = { c, sym->slab_source, true };
+    ast_name_writes(c->current_body, sym->name, sym->name_len, handle_src_write_visit, &u);
+    return u.same;
+}
+
 /* Resolve the element type of a universal alloc(T, ...) from its name: a
  * primitive keyword (u8/u16/.../bool) OR a named struct/enum/union. Returns NULL
  * if unknown. This is what lets alloc() work over ALL element types, not just
@@ -13295,6 +13379,12 @@ static Type *check_expr(Checker *c, Node *node) {
                             tsym->param_alias_pos1 = param_alias_of_value(c, node->assign.value);
                         tsym->is_keep_derived = false;    /* field-level keep: re-derived below */
                         tsym->provenance_type = NULL;
+                        /* BUG-1404: the new value's allocator, or unknown — never the
+                         * OLD value's (a stale source derefs through the wrong one). */
+                        if (tsym->slab_source &&
+                            (node->assign.op != TOK_EQ ||
+                             handle_alloc_source_of(c, node->assign.value) != tsym->slab_source))
+                            tsym->slab_source = NULL;
                         /* BUG-987: clears BOTH halves of the @container fact —
                          * a reassigned pointer must not keep a stale
                          * whole-object claim any more than a stale field one. */
@@ -22956,6 +23046,11 @@ static void check_stmt(Checker *c, Node *node) {
             /* BUG-430: store AST node for const init lookup (enables
              * const u32 perms = ...; comptime if (FUNC(perms)) pattern) */
             sym->func_node = node;
+            if (node->var_decl.init) {   /* BUG-1404: the Handle's allocator */
+                sym->slab_source = handle_alloc_source_of(c, node->var_decl.init);
+                if (sym->slab_source && !handle_source_stable(c, sym))
+                    sym->slab_source = NULL;
+            }
             /* BUG-847: `Arena a = Arena.over(buf);` — the local form. */
             if (node->var_decl.init && type &&
                 type_dispatch_kind(type) == TYPE_ARENA)
@@ -22995,17 +23090,6 @@ static void check_stmt(Checker *c, Node *node) {
                                 if (!asrc) asrc = global_decl_lookup(c,
                                     obj->ident.name, (uint32_t)obj->ident.name_len);
                                 sym->arena_source = asrc;
-                            }
-                        }
-                        /* Handle auto-deref: track slab_source from pool/slab.alloc() */
-                        if (obj_type && (obj_type->kind == TYPE_POOL || obj_type->kind == TYPE_SLAB)) {
-                            if (obj->kind == NODE_IDENT) {
-                                Symbol *alloc_src = scope_lookup(c->current_scope,
-                                    obj->ident.name, (uint32_t)obj->ident.name_len);
-                                if (!alloc_src)
-                                    alloc_src = global_decl_lookup(c,
-                                        obj->ident.name, (uint32_t)obj->ident.name_len);
-                                if (alloc_src) sym->slab_source = alloc_src;
                             }
                         }
                     }

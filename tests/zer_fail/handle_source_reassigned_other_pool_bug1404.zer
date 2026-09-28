@@ -1,0 +1,14 @@
+// BUG-1404: a Handle re-allocated from a DIFFERENT allocator kept the first one as
+// its auto-deref source, so `h.id = 9` looked a pool handle up in the slab.
+// expect-error: cannot auto-deref Handle(Task)
+struct Task { u32 id; }
+Slab(Task) heap;
+Pool(Task, 4) pool;
+u32 main() {
+    Handle(Task) h = heap.alloc() orelse { return 1; };
+    heap.free(h);
+    h = pool.alloc() orelse { return 2; };
+    h.id = 9;
+    pool.free(h);
+    return 0;
+}

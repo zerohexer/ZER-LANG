@@ -1,0 +1,20 @@
+// BUG-1404 boundary: a Task.alloc() handle beside a NAMED Slab(Task) auto-derefs
+// through the auto-slab (was refused: no single Pool or Slab), and a handle
+// re-allocated from its own allocator in a loop keeps its source.
+struct Task { u32 id; }
+Slab(Task) heap;
+u32 main() {
+    Handle(Task) h = Task.alloc() orelse { return 1; };
+    h.id = 42;
+    Handle(Task) k = heap.alloc() orelse { Task.free(h); return 1; };
+    k.id = 1;
+    for (u32 i = 0; i < 3; i += 1) {
+        k.id += h.id;
+        heap.free(k);
+        k = heap.alloc() orelse { Task.free(h); return 2; };
+    }
+    u32 r = h.id - 42;
+    Task.free(h);
+    heap.free(k);
+    return r;
+}

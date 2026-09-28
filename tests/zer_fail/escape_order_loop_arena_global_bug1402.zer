@@ -1,0 +1,17 @@
+// BUG-1402: the frame-bound taint is set textually AFTER the sink, but runs before it
+// (loop back edge / goto / defer). Reproducer from the 2026-09-28 escape probe (L8).
+// expect-error: cannot store arena-derived pointer 'p' in global/s
+struct N { u32 v; }
+N gn0;
+?*N gn;
+void f() {
+    u8[256] bk;
+    Arena ar = Arena.over(bk);
+    *N p = &gn0;
+    for (u32 i = 0; i < 2; i += 1) {
+        gn = p;
+        p = ar.alloc(N) orelse return;
+        p.v = 7;
+    }
+}
+u32 main() { f(); if (gn) |q| { return q.v; } return 0; }

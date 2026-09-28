@@ -1,0 +1,12 @@
+// BUG-1402: the frame-bound taint is set textually AFTER the sink, but runs before it
+// (loop back edge / goto / defer). Reproducer from the 2026-09-28 escape probe (K2).
+// expect-error: argument 1: local variable 'x' cannot satisfy 'kee
+u32 g0 = 1;
+?*u32 gp;
+void st(*u32 a) {
+    *u32 p = &g0;
+    defer gp = p;
+    p = a;
+}
+void f() { u32 x = 5; st(&x); }
+u32 main() { f(); if (gp) |q| { return *q; } return 0; }

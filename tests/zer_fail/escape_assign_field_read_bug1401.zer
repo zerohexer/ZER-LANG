@@ -1,0 +1,14 @@
+// BUG-1401: the ASSIGNMENT spelling of a field read carried no taint — the var-decl
+// spelling `?*u32 q = h.p;` was refused, `q = h.p;` let the stack address escape.
+// expect-error: cannot store local-derived pointer 'q' in global/static variable 'gp'
+struct H { ?*u32 p; }
+?*u32 gp;
+void f() {
+    u32 x = 5;
+    H h;
+    h.p = &x;
+    ?*u32 q = null;
+    q = h.p;
+    gp = q;
+}
+u32 main() { f(); if (gp) |z| { return *z; } return 0; }

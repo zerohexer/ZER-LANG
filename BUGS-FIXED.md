@@ -29,6 +29,62 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   where `pre_lower_orelse` descends. Test: `tests/zer/shortcircuit_orelse_passthrough_bug1400.zer`
   (exit 2 pre-fix: the right side ran).
 
+- **BUG-1401 — the ASSIGNMENT spelling of a field / element / cast read carried no
+  escape taint.** `q = h.p; gp = q;` with `h.p = &x` stored a stack address in a global;
+  `?*u32 q = h.p; gp = q;` was refused. The var-decl sink walked the value to its root
+  (field, index, slice, intrinsic, reference cast, `&`, `*`, both orelse arms) and
+  propagated the root's flags; the assignment sink matched a bare identifier only. The walk
+  is now ONE helper, `propagate_escape_from_value`, called by both. Test:
+  `tests/zer_fail/escape_assign_field_read_bug1401.zer`.
+- **BUG-1402 — a frame-bound taint set TEXTUALLY AFTER a sink never reached it, though
+  it runs before it.** The escape flags are set in one statement-order walk and every sink
+  reads them at its own textual position, so three constructs that run code out of text
+  order let a stack / arena address escape with no diagnostic (all ASan
+  stack-use-after-return): a loop back edge (`for (...) { gp = p; p = &x; }`), any goto
+  (a forward `goto set; use: gp = p; ... set: p = &x; goto use;` too), and a defer body,
+  checked at registration but run at exit (`defer gp = p; p = &x;`) — at every sink: global
+  store, out-param store, return, keep call, and keep INFERENCE in a callee (so `st(&x)` was
+  accepted). BUG-1274 had fixed the other direction (a conditional reassignment clearing the
+  taint); nothing joined it around a back edge. Fix — the escape fixpoint (checker.c
+  "ESCAPE FIXPOINT", `check_func_body` wrapper): the missing state is a JOIN of may-facts.
+  Per (loop, outer variable) the flags the body adds are OR-ed in at the loop's entry; in a
+  function with a label the flags are flow-insensitive (every declaration starts with the
+  union of what it ever holds, and never clears); a defer body is checked under the union of
+  what each visible variable ever holds. The facts are discovered by the real walk; only if
+  it saw such a taint appear is the body re-walked quietly until the facts stop growing and
+  then once for real (checker state restored to the function entry before each re-walk;
+  definitions, typemap and diagnostics kept; the final walk does not repeat a diagnostic).
+  Every EXISTING sink reads the joined state, so no sink was taught anything. Corpus cost:
+  zero (2495/0 integration, every gate). Tests: 16 `tests/zer_fail/escape_order_*_bug1402.zer`,
+  `tests/zer/escape_order_boundaries_bug1402.zer`; SHAPE p61 in `tools/sink_matrix.sh`
+  (13 cells, 10 HOLE pre-fix).
+- **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
+  is accepted when every main-side operation is inside `@critical`.** The rule refused the
+  canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose
+  whole point is that the multi-step update cannot then be split; and reference.md's own
+  Ring example did not compile. `IsrGlobal.uncritical_in_func` records a regular-code
+  access outside `@critical`; the exemption needs none, and one handler (a second could
+  preempt the first). Same shape as BUG-1059c's exemption for a volatile RMW. Tests:
+  `tests/zer_fail/ring_isr_main_uncritical_bug1403.zer`, `ring_two_isrs_bug1403.zer`; the
+  positive is the (now compiled) reference.md Ring example.
+- **BUG-1404 — a Handle's auto-deref allocator followed the DECLARATION, not the value.**
+  `h.field` dereferences through one allocator (`Symbol.slab_source`), which was set only
+  at a var-decl from a NAMED Pool / Slab and never cleared. After `h = pool.alloc() ...`
+  a heap handle's source stayed the slab and `h.id = 9` emitted `_zer_slab_get(&heap, h)` —
+  a pool handle looked up in the slab (a wrong object whenever index and generation
+  coincide). And a `Task.alloc()` handle beside any named `Slab(Task)` could not
+  auto-deref at all ("no single Pool or Slab holds it"). `handle_alloc_source_of` names
+  the source for both receivers; the declaration asks over the whole body whether EVERY
+  later write comes from the same allocator (`handle_source_stable`, via `ast_name_writes`)
+  — per-assignment clearing alone would leave a use BEFORE a re-allocation on a loop back
+  edge with the stale source. Tests: `tests/zer_fail/handle_source_reassigned_other_pool_bug1404.zer`,
+  `handle_source_loop_back_edge_bug1404.zer`, `tests/zer/handle_alloc_source_bug1404.zer`.
+- **BUG-1405 — an if-unwrap capture of `?*T` could not be passed to a `*T` parameter.**
+  "cannot pass const variable 't' to mutable parameter", while `t.id = 2` in the same arm
+  compiled. The rule exists for a const DISTINCT pointer typedef (whose const lives on the
+  symbol); a capture's `is_const` is an immutable binding over a writable pointee. Keyed on
+  the distinct form now. Test: `tests/zer/capture_ptr_to_mut_param_bug1405.zer`.
+
 ## Session 2026-09-27 — BUG-1366..1376: harvest of `loving-bohr-jyw9if`, then stores through pointers, call effects of the assign spelling, root-first places, lock order
 
 Harvest: `origin/claude/loving-bohr-jyw9if` (17 commits, a strict superset of

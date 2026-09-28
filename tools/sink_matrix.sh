@@ -1239,6 +1239,31 @@ cell p58_safe_split          compile "$P58"' u32 main(){ u32 t = bump58(&b58); a
 cell p58_funcptr_other       reject "$P58"' u32 main(){ *(*A58) -> u32 fp = bump58; a58.v = fp(&b58); return 0; }'
 cell p58_safe_funcptr_same   compile "$P58"' u32 main(){ *(*A58) -> u32 fp = bump58; a58.v = fp(&a58); return 0; }'
 
+# SHAPE p61 (BUG-1401, BUG-1402): the POSITION axis of the escape taint — a sink the
+# walk reaches BEFORE the value becomes frame-bound in the text, but AFTER it at run
+# time: a loop back edge, a backward and a forward goto, a defer body (each at the
+# global store, the return, the keep call and keep inference), plus the assignment
+# spelling of a field read. BOUNDARY: a loop that only ever points at a global, a
+# goto function whose pointer never escapes, a defer that only reads.
+echo "===== SHAPE p61 = escape taint set textually after the sink (loop / goto / defer) ====="
+P61='u32 g61 = 1; ?*u32 gp61;
+struct H61 { ?*u32 p; }
+void stash61(*u32 p) { gp61 = p; }
+'
+cell p61_loop_global         reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { gp61 = p; p = &x; } } u32 main(){ f(); return 0; }'
+cell p61_loop_return         reject "$P61"' *u32 f(){ u32 x = 5; *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { if (i == 1) { return p; } p = &x; } return &g61; } u32 main(){ return *f(); }'
+cell p61_loop_keep_call      reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { stash61(p); p = &x; } } u32 main(){ f(); return 0; }'
+cell p61_loop_keep_infer     reject "$P61"' void st(*u32 a){ *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { gp61 = p; p = a; } } void f(){ u32 x = 5; st(&x); } u32 main(){ f(); return 0; }'
+cell p61_loop_chain          reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; *u32 q = &g61; for (u32 i = 0; i < 3; i += 1) { gp61 = q; q = p; p = &x; } } u32 main(){ f(); return 0; }'
+cell p61_backward_goto       reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; u32 n = 0; again: gp61 = p; p = &x; n += 1; if (n < 2) { goto again; } } u32 main(){ f(); return 0; }'
+cell p61_forward_goto        reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; goto set; use: gp61 = p; return; set: p = &x; goto use; } u32 main(){ f(); return 0; }'
+cell p61_defer_global        reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; defer gp61 = p; p = &x; } u32 main(){ f(); return 0; }'
+cell p61_defer_keep_call     reject "$P61"' void f(){ u32 x = 5; *u32 p = &g61; defer stash61(p); p = &x; } u32 main(){ f(); return 0; }'
+cell p61_assign_field_read   reject "$P61"' void f(){ u32 x = 5; H61 h; h.p = &x; ?*u32 q = null; q = h.p; gp61 = q; } u32 main(){ f(); return 0; }'
+cell p61_safe_loop_global    compile "$P61"' void f(){ *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { gp61 = p; p = &g61; } } u32 main(){ f(); return 0; }'
+cell p61_safe_goto_local     compile "$P61"' u32 f(u32 k){ u32 x = k; *u32 p = &x; if (k > 9) { goto out; } x += 1; out: return *p; } u32 main(){ return f(1) - 2; }'
+cell p61_safe_defer_read     compile "$P61"' u32 f(){ u32 x = 4; *u32 p = &x; u32 r = 0; defer x = 0; r = *p; return r; } u32 main(){ return f() - 4; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

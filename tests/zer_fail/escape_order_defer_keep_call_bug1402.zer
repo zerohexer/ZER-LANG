@@ -1,0 +1,13 @@
+// BUG-1402: the frame-bound taint is set textually AFTER the sink, but runs before it
+// (loop back edge / goto / defer). Reproducer from the 2026-09-28 escape probe (D2).
+// expect-error: argument 1: local-derived pointer 'p' cannot satis
+u32 g0 = 1;
+?*u32 gp;
+void stash(*u32 p) { gp = p; }
+void f() {
+    u32 x = 5;
+    *u32 p = &g0;
+    defer stash(p);
+    p = &x;
+}
+u32 main() { f(); if (gp) |q| { return *q; } return 0; }

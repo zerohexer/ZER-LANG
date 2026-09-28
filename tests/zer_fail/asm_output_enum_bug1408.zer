@@ -1,0 +1,13 @@
+// BUG-1408: an asm output into an enum forges a value outside the variant set.
+// expect-error: whose values are a closed set
+enum E { a, b }
+E ge;
+naked void forge() {
+    asm {
+        instructions: "mov $7, %0"
+        outputs: { "rax" = ge }
+        clobbers: [ "memory" ]
+        safety: "writes an integer into an enum register output slot......"
+    }
+}
+u32 main() { forge(); switch (ge) { .a => { return 1; } .b => { return 2; } } }

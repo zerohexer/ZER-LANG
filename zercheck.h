@@ -71,6 +71,11 @@ typedef struct {
 typedef struct {
     const char *func_name;
     uint32_t func_name_len;
+    /* BUG-1457: the IDENTITY of the summarised function (its NODE_FUNC_DECL).
+     * The name alone is not one: two modules' `release` are two functions, and
+     * keyed by name the second module's summary was the first module's. Every
+     * lookup goes through ir_summary_for_call / ir_summary_of_decl. */
+    Node *func_decl;
     int param_count;
     bool *frees_param;        /* definite free (all paths) */
     bool *maybe_frees_param;  /* conditional free (some paths) */
@@ -84,6 +89,20 @@ typedef struct {
      * NULL when param_count == 0 (memset-zeroed). */
     bool *frees_param_field;
     bool *maybe_frees_param_field;
+    /* BUG-1280: the callee hands param i to a fire-and-forget spawn (directly or
+     * through a callee that does) — 2 = on every return path, 1 = on some; bit 4
+     * (BUG-1380) = handed to an unknown (funcptr) callee on some path. The
+     * caller's argument becomes TRANSFERRED (2) or MAYBE_FREED (1): the thread
+     * holds it for ever, so a later free is a use-after-free in that thread.
+     * Separate from frees_param on purpose — handing a GLOBAL to such a callee
+     * is fine, and the free-only checks (heap-only argument, interior pointer)
+     * must not fire for it. NULL when nothing is transferred. */
+    unsigned char *transfers_param;
+    /* BUG-1300: bit i = the callee may free a value read out of an ELEMENT of
+     * param i (`drain([*]?*T a) { if (a[i]) |p| { free(p); } }`), directly or
+     * through a callee with the bit. The caller widens the elements of the array
+     * it passed to MAYBE_FREED. Params past 63 are not represented. */
+    uint64_t frees_param_elems;
     int returns_color;        /* allocation color of return value (ZC_COLOR_*) */
     int returns_param_color;  /* -1 = N/A, 0+ = return inherits param[N]'s color */
     /* BUG-849 (2026-08-23): the SET of params the return may be a view of.
@@ -97,6 +116,11 @@ typedef struct {
      * 0 when nothing was proven. Only meaningful together with
      * `returns_all_views`. */
     uint32_t returns_param_mask;
+    /* BUG-1491: bit n = some return path hands back an INTERIOR view of param
+     * n (`return s[2..s.len];`, `return &s[1];`) — a pointer that shares the
+     * argument's allocation but is not the pointer the allocator handed out,
+     * so a caller's `free(tail(b))` is heap corruption (BUG-1230). */
+    uint32_t returns_interior_mask;
     /* Every non-early-exit, non-fallback return was CLASSIFIED as a view of a
      * param, a view of static storage (`&global`), or a null literal — i.e. no
      * return path can be a fresh allocation. False = at least one return could
@@ -166,6 +190,14 @@ typedef struct {
      * MAYBE_FREED, so `g = a; drop_g(); a.v` is refused. Arena array; 0 = none. */
     int freed_global_n;
     struct ZcFreedGlobal { const char *key; uint32_t len; } *freed_global;
+    /* BUG-1311: every live return READS the global key `ret_global_key` (a bare
+     * global `g`, or a projection `gh.p`), or is null — `?*T getg() { return g; }`.
+     * The caller treats the call result exactly as a read of that global: an
+     * ALIAS of whatever allocation the global holds. Without it the result was
+     * a borrow of nothing, so `g = a; *T c = getg() orelse return; g = null;
+     * free(c); a.v` read a recycled object. NULL = not proven. */
+    const char *ret_global_key;
+    uint32_t ret_global_key_len;
 } FuncSummary;
 
 /* ZER-CHECK context */
@@ -189,12 +221,25 @@ typedef struct {
     FuncSummary *summaries;
     int summary_count;
     int summary_capacity;
+    /* BUG-1457: the module of the function being analysed (IRFunc.module_prefix,
+     * NULL = main) — a callee NAME is resolved in it. */
+    const char *cur_module;
+    uint32_t cur_module_len;
     bool building_summary;  /* suppress error reporting during summary phase */
     bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
+    /* BUG-1380: params (by position, < 64) the function being analysed hands to
+     * a callee it cannot see — FuncSummary.transfers_param bit 4. */
+    uint64_t cur_handoff_params;
     /* BUG-1181: global keys the function being analysed frees through (dynamic,
      * malloc'd, reset per function) — becomes FuncSummary.freed_global. */
     struct ZcFreedGlobal *cur_freed_global;
     int cur_freed_global_n, cur_freed_global_cap;
+    /* BUG-1268: which heap allocation backs each arena of the function being
+     * analysed (`Arena a = Arena.over(hb);`) — name -> backing alloc_id, so an
+     * allocation from `a` can list `hb` in its view set and die with it.
+     * Dynamic, malloc'd, reset per function. */
+    struct ZcArenaBacking { const char *name; uint32_t len; int aid; } *cur_arena_backing;
+    int cur_arena_backing_n, cur_arena_backing_cap;
 
     /* allocation ID counter — each unique allocation gets a unique ID */
     int next_alloc_id;
@@ -210,6 +255,11 @@ typedef struct {
      * "Level B guarded-refinement support" and
      * proofs/operational/lambda_zer_handle/handle_flow_lattice.v Level B. */
     void *gr_block_guards;
+    /* BUG-1486: the function the guard sets belong to — they are computed on the
+     * FIRST query (most functions never reach a MAYBE_FREED decision, and the
+     * computation is quadratic in branches: 20,000 switch arms took 113 s). */
+    void *gr_func;
+    bool gr_block_guards_done;
     int gr_block_count;
     int gr_cur_block;
 } ZerCheck;

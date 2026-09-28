@@ -1,0 +1,8 @@
+shared struct S { u32 v; }
+S gs;
+void grand(*S w) { w.v = 7; }
+void mid(*S w) { spawn grand(w); }
+u32 main() {
+    mid(&gs);
+    return 0;
+}

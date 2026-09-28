@@ -1,0 +1,12 @@
+// BUG-1323: regression (see BUGS-FIXED.md).
+// reference.md: "@clz(x) ... x = 0 gives the operand's WIDTH (32 or 64)"; a u8 "is widened and
+// counted at 32 bits" (@clz((u8)0x80) is 24). Emitted: `(z == 0) ? 8 : __builtin_clz(z)` — so
+// @clz(u8 0) = 8 but @clz(u8 1) = 31 (non-monotonic). Same for @ctz(u8 0) = 8.
+// Via a call result (@clz(f(0))) it gives 32. Expected exit 0; actual exit 1.
+u8 id8(u8 x) { return x; }
+u32 main() {
+    u8 z = id8(0);
+    if (@clz(z) != 32) { return 1; }
+    if (@clz(id8(0)) != 32) { return 2; }
+    return 0;
+}

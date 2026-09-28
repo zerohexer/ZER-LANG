@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: cannot capture an optional inside a shared struct by pointer
+// BUG-1330: |*v| wrote the shared optional after the condition's lock was released (TSan race).
+struct P { u32 x; }
+shared struct S { ?P o; u32 n; }
+S g;
+void w() { for (u32 i = 0; i < 2000000; i += 1) { g.o = { .x = 7 }; } }
+u32 main() {
+    g.o = { .x = 1 };
+    ThreadHandle t = spawn w();
+    for (u32 i = 0; i < 2000000; i += 1) {
+        if (g.o) |*v| { v.x += 1; }
+    }
+    t.join();
+    return 0;
+}

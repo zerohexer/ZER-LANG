@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: is the backing store of arena
+struct B { [*]u32 s; }
+u8[64] gbuf;
+u32[4] small;
+u32[4] victim;
+u32 main() {
+    Arena a = Arena.over(gbuf);
+    *B pb = a.alloc(B) orelse return;
+    pb.s = small[0..];
+    gbuf[8] = 64;
+    for (u32 i = 4; i < 12; i += 1) { pb.s[i] = 0xDEAD; }
+    return victim[0] + victim[1] + victim[2] + victim[3];
+}

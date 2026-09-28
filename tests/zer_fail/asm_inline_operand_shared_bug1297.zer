@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: asm operands in the inline
+shared struct A { u32 x; }
+A a;
+naked void k() {
+    asm("nop" : : "r"(a.x) : );
+}
+void worker() { k(); a.x = 1; }
+u32 main() { ThreadHandle t = spawn worker(); t.join(); return 0; }

@@ -1,0 +1,22 @@
+// BUG-1503: a callee re-polls the SAME async task, whose other arm writes the
+// frame local i while this activation is suspended inside reenter().
+u32[4] arr;
+u32[64] pad;
+u32 depth;
+u32 hit;
+void reenter();
+async void t() {
+    u32 i = 1;
+    yield;
+    if (depth == 0) { depth = 1; reenter(); arr[i] = 7; hit = 1; }
+    else { i = 4; }
+}
+_zer_async_t T;
+void reenter() { _zer_async_t_poll(&T); }
+u32 main() {
+    _zer_async_t_init(&T);
+    _zer_async_t_poll(&T);
+    _zer_async_t_poll(&T);
+    if (hit == 1) { return 42; }
+    return 0;
+}

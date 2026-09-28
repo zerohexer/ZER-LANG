@@ -1,0 +1,17 @@
+// BUG-1454/1455: an async function in each of two modules with the SAME name,
+// and one in the main module. Pre-fix: `redefinition of struct _zer_async_tick`,
+// and — with an import — the main module's async state type was never declared
+// (the imported-module emission path had no async forward typedefs).
+import m1455_a;
+import m1455_b;
+u32 cm;
+async void tm() { cm += 100; yield; cm += 100; }
+u32 main() {
+    if (m1455_fa() != 2) { return 1; }
+    if (m1455_fb() != 20) { return 2; }
+    _zer_async_tm t;
+    _zer_async_tm_init(&t);
+    while (_zer_async_tm_poll(&t) == 0) { }
+    if (cm != 200) { return 3; }
+    return 0;
+}

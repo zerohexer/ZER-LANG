@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: 'a' is transferred
+// BUG-1460: a move struct consumed in an orelse fallback, then again.
+move struct Tok { u32 k; }
+?u32 none() { return null; }
+u32 consume(Tok t) { return t.k; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    u32 y = none() orelse consume(a);
+    u32 z = consume(a);
+    return y + z;
+}

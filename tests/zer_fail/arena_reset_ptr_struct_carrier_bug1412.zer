@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: carries an arena allocation
+// BUG-1412: &h carrying an arena allocation dangles inside a callee that resets the arena
+struct T { u32 v; }
+struct H { *T p; }
+u8[256] buf;
+Arena ga;
+void rst() { ga.reset(); }
+u32 use(*H h) {
+    rst();
+    *T b = ga.alloc(T) orelse return;
+    b.v = 99;
+    return h.p.v;
+}
+u32 main() {
+    ga = Arena.over(buf);
+    *T a = ga.alloc(T) orelse return;
+    H h;
+    h.p = a;
+    return use(&h);
+}

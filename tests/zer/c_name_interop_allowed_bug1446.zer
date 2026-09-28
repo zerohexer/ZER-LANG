@@ -1,0 +1,16 @@
+// BUG-1446 boundary: the reserved-identifier rule must not break C interop or
+// ordinary names that only SHADOW a libc function the body does not call.
+i32 printf(const *u8 fmt, ...);   // a bodyless declaration of the C function
+i32 abs(i32 x);                   // likewise
+struct Clock { u32 time; u32 signal; }   // fields live in their own namespace
+u32 scale(u32 time) { return time * 2; }  // a parameter named like time()
+u32 main() {
+    u32 div = 3;                   // shadows div(), which the body never calls
+    Clock c;
+    c.time = 4;
+    c.signal = 1;
+    if (abs(-5) != 5) { return 1; }
+    if (scale(c.time) + div != 11) { return 2; }
+    if (c.signal != 1) { return 3; }
+    return 0;
+}

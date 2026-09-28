@@ -1,0 +1,10 @@
+// BUG-1459b: two modules each declare `const u32 SZ` and size an array with it.
+// Pre-fix the second module's own `u32[SZ]` was refused as ambiguous; the raw
+// lookup reached the first module's SZ (16).
+import m1459_a;
+import m1459_b;
+u32 main() {
+    if (m1459_fa() != 16) { return 1; }
+    if (m1459_fb() != 4) { return 2; }
+    return 0;
+}

@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'h.p' is freed
+// BUG-1461: a pointer bound once to &h.p is a stable aim — *lp = a stores into h.p.
+struct T { u32 v; }
+struct H { ?*T p; u32 k; }
+u32 main() {
+    H h;
+    *?*T lp = &h.p;
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    *lp = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (h.p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

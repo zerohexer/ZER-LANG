@@ -1,0 +1,16 @@
+// BUG-1407: a task polled without _init ran its body on ZERO parameters (an enum
+// holding no variant took the .fast arm; a *T param was NULL). The poll traps.
+// expect-trap: polled before its _init
+enum Mode { slow = 5, fast = 6 }
+u32 out;
+async void run(Mode m) {
+    switch (m) {
+        .slow => { out = 1; }
+        .fast => { out = 2; }
+    }
+}
+u32 main() {
+    _zer_async_run t;
+    _zer_async_run_poll(&t);
+    return out;
+}

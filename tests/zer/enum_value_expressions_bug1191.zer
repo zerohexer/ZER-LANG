@@ -6,7 +6,9 @@
 const u32 BASE = 8;
 enum E { a = 1 + 2, b, c = 1 << 4, d = BASE, e = (5) }
 enum Cmd { get = 'G', put = 'P', del }
-enum Late { l0, l1, l2, l3, l4, l5, l6, l7, l8, l9 = 0 + 0 }
+// (BUG-1440: l0 starts at 1 so l9 = 0 is not a duplicate value — duplicates are
+// refused now. The discrimination is kept: counting on would give 10, not 0.)
+enum Late { l0 = 1, l1, l2, l3, l4, l5, l6, l7, l8, l9 = 0 + 0 }
 static_assert(E.a == 3, "a");
 static_assert(E.c == 16, "c");
 u32 name(E x) {

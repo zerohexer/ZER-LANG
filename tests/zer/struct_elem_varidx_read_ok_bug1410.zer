@@ -1,0 +1,21 @@
+// BUG-1410 boundary: READING through a variable-index copy of a struct element
+// (and through a pointer to one) stays accepted; the allocation is then freed
+// once, by its own name, after the element slot is reset.
+struct T { u32 v; }
+struct H { ?*T p; u32 k; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H[2] hs;
+    hs[0] = { .p = a, .k = 1 };
+    u32 i = 0;
+    H h = hs[i];
+    u32 r = 0;
+    if (h.p) |q| { r = q.v; }
+    *H hp = &hs[i];
+    if (hp.p) |q| { r += q.v; }
+    hs[0].p = null;
+    free(a);
+    if (r != 14) { return 1; }
+    return 0;
+}

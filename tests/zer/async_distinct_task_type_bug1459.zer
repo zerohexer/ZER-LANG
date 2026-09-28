@@ -1,0 +1,13 @@
+// BUG-1459: a distinct typedef of an async task type is declarable — the task
+// tag is forward-declared before every user type (it was written after the
+// typedefs, so `typedef _zer_async_cu DT;` named an undeclared type at GCC).
+async u32 cu(u32 s) { u32 x = s; yield; x += 1; return x; }
+distinct typedef _zer_async_cu DT;
+DT gt;
+u32 main() {
+    _zer_async_cu t;
+    _zer_async_cu_init(&t, 5);
+    while (_zer_async_cu_poll(&t) == 0) { }
+    if (_zer_async_cu_result(&t) != 6) { return 1; }
+    return 0;
+}

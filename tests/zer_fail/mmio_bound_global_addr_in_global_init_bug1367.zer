@@ -1,0 +1,10 @@
+// expect-error: no compile-time MMIO bound is known for this pointer
+// BUG-1367: `r`'s declaration bound (64 words from 0x40000000) was trusted for
+// `r[10]` because no BODY assigned or addressed `r` — but a GLOBAL initializer
+// took `&r`, and f() re-aimed r through it to 0x400000F0, so r[10] read 0x40000118,
+// outside every declared range, with no check emitted.
+mmio 0x40000000..0x400000FF;
+volatile *u32 r = @inttoptr(*u32, 0x40000000);
+volatile *volatile *u32 rr = &r;
+void f() { *rr = @inttoptr(*u32, 0x400000F0); }
+u32 main() { f(); return r[10]; }

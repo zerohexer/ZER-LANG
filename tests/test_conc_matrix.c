@@ -159,6 +159,7 @@ typedef enum {
     CO_SPAWN_TRANSITIVE_GLOBAL,/* spawn -> helper() -> non-shared global (transitive) */
     CO_SPAWN_SLAB,             /* spawned body uses a global Slab (non-atomic metadata) */
     CO_THREADHANDLE_JOIN_ONE_BRANCH, /* join only in one branch — unjoined on the other */
+    CO_THREADHANDLE_RESPAWN_BACKEDGE, /* BUG-1422: one spawn re-run by a backward goto, un-joined */
     /* POSITIVE (synchronized — must compile) */
     CO_SPAWN_SHARED_OK,        /* spawn f(&g), g is a shared struct (auto-locked) */
     CO_SCOPED_SPAWN_JOIN,      /* ThreadHandle th = spawn f(&w); th.join(); */
@@ -167,6 +168,7 @@ typedef enum {
     CO_SHARED_FIELD_OK,        /* shared struct field access (auto-lock) */
     CO_THREADHANDLE_JOIN_BOTH, /* join in both branches — joined on all paths */
     CO_SPAWN_THREADLOCAL,      /* spawned body touches a threadlocal global (per-thread) */
+    CO_THREADHANDLE_RESPAWN_JOINED, /* BUG-1422 boundary: joined before the back edge */
     COSCEN_COUNT
 } COScenario;
 
@@ -176,11 +178,12 @@ static int scenario_is_negative(COScenario s) {
         case CO_DEADLOCK_SAME_STMT: case CO_SPAWN_IN_CRITICAL:
         case CO_THREADHANDLE_NOT_JOINED: case CO_SPAWN_TRANSITIVE_GLOBAL:
         case CO_SPAWN_SLAB: case CO_THREADHANDLE_JOIN_ONE_BRANCH:
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE:
             return 1;
         case CO_SPAWN_SHARED_OK: case CO_SCOPED_SPAWN_JOIN:
         case CO_SPAWN_VALUE_ARGS: case CO_DEADLOCK_SEPARATE_OK:
         case CO_SHARED_FIELD_OK: case CO_THREADHANDLE_JOIN_BOTH:
-        case CO_SPAWN_THREADLOCAL:
+        case CO_SPAWN_THREADLOCAL: case CO_THREADHANDLE_RESPAWN_JOINED:
             return 0;
         case COSCEN_COUNT: break;
     }
@@ -197,6 +200,8 @@ static const char *scen_name(COScenario s) {
         case CO_SPAWN_TRANSITIVE_GLOBAL: return "spawn-transitive-global";
         case CO_SPAWN_SLAB:              return "spawn-slab-access";
         case CO_THREADHANDLE_JOIN_ONE_BRANCH: return "join-one-branch";
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE: return "respawn-backedge";
+        case CO_THREADHANDLE_RESPAWN_JOINED: return "respawn-joined";
         case CO_SPAWN_SHARED_OK:         return "spawn-shared-ok";
         case CO_SCOPED_SPAWN_JOIN:       return "scoped-spawn-join";
         case CO_SPAWN_VALUE_ARGS:        return "spawn-value-args";
@@ -308,6 +313,22 @@ static void gen(COScenario s, char *buf, size_t n) {
                 "void worker() { g_tl = g_tl + 1; }\n"
                 "u32 main() { spawn worker(); return 0; }\n");
             break;
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE:
+            snprintf(buf, n,
+                "void compute(*u32 p) { *p += 1; }\n"
+                "u32 main() { u32 v = 0; u32 i = 0;\n"
+                "again:\n    ThreadHandle th = spawn compute(&v);\n"
+                "    i += 1;\n    if (i < 3) { goto again; }\n"
+                "    th.join();\n    return 0; }\n");
+            break;
+        case CO_THREADHANDLE_RESPAWN_JOINED:
+            snprintf(buf, n,
+                "void compute(*u32 p) { *p += 1; }\n"
+                "u32 main() { u32 v = 0; u32 i = 0;\n"
+                "again:\n    ThreadHandle th = spawn compute(&v);\n"
+                "    th.join();\n    i += 1;\n    if (i < 3) { goto again; }\n"
+                "    return 0; }\n");
+            break;
         case COSCEN_COUNT: buf[0] = 0; break;
     }
 }
@@ -412,6 +433,9 @@ static const char *sink_name(CASink s) {
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
                RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM,
                RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_FACTORY_ORELSE,
+               RCH_GLOBAL_FP, RCH_GLOBAL_INIT, RCH_GLOBAL_INIT_COPY,
+               RCH_ARG_REASSIGN, RCH_ARG_FIELD, RCH_ARG_ARRAY, RCH_ARG_FWD_LOCAL,
+               RCH_ARG_CARRIER,
                RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
@@ -428,6 +452,14 @@ static const char *reach_name(CAReach r) {
     case RCH_FACTORY_SWITCH:  return "factory-switch-arm";
     case RCH_FACTORY_DOWHILE: return "factory-dowhile-body";
     case RCH_FACTORY_ORELSE:  return "factory-orelse-block";
+    case RCH_GLOBAL_FP:       return "const-global-funcptr";
+    case RCH_GLOBAL_INIT:     return "global-struct-init";
+    case RCH_GLOBAL_INIT_COPY: return "global-init-copy";
+    case RCH_ARG_REASSIGN:    return "spawn-arg-reassigned";
+    case RCH_ARG_FIELD:       return "spawn-arg-field";
+    case RCH_ARG_ARRAY:       return "spawn-arg-element";
+    case RCH_ARG_FWD_LOCAL:   return "fwd-local-through-helper";
+    case RCH_ARG_CARRIER:     return "fwd-struct-carrier";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -516,7 +548,52 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
                 "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
                 "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }\n";
         wbody = "*() -> void fp = mk(0); fp();"; break;
+    /* BUG-1310: the binding lives in a GLOBAL's declaration initializer. The
+     * spawn scan exempted the read of a const global (a funcptr is not a data
+     * pointer) and followed nothing — measured: a TSan data race compiled. */
+    case RCH_GLOBAL_FP:
+        extra = "const *() -> void gfp = cb;\n";
+        wbody = "gfp();"; break;
+    case RCH_GLOBAL_INIT:
+        extra = "struct Ops { *() -> void h; }\nconst Ops gops = { .h = cb };\n";
+        wbody = "gops.h();"; break;
+    case RCH_GLOBAL_INIT_COPY:
+        extra = "struct Ops { *() -> void h; }\nconst Ops gops = { .h = cb };\n";
+        wbody = "Ops o = gops; o.h();"; break;
+    /* 13th..17th forms (BUG-1290, 2026-09-24): the callback is the spawn
+     * ARGUMENT (or reaches a spawn through a helper) in a shape no resolver
+     * followed. The rule falls back to every function of the funcptr's
+     * signature; the non-racy payloads pin that it does not over-reject when
+     * all of them are race-free. */
+    case RCH_ARG_REASSIGN:
+        extra = "void other() { }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "*() -> void fp = other; fp = cb; spawn inner(fp);"; break;
+    case RCH_ARG_FIELD:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Ops o; o.h = cb; spawn inner(o.h);"; break;
+    case RCH_ARG_ARRAY:
+        extra = "typedef *() -> void Cb;\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Cb[2] t; t[0] = cb; t[1] = cb; spawn inner(t[0]);"; break;
+    case RCH_ARG_FWD_LOCAL:
+        extra = "void inner(*() -> void f) { f(); }\nvoid run(*() -> void f) { spawn inner(f); }\n";
+        wbody = "*() -> void fp = cb; run(fp);"; break;
+    case RCH_ARG_CARRIER:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(Ops o) { o.h(); }\n"
+                "void run(Ops o) { spawn inner(o); }\n";
+        wbody = "Ops o; o.h = cb; run(o);"; break;
     default: break;
+    }
+    /* The argument forms spawn from MAIN: inside a spawned `worker` the outer
+     * scan finds `cb` by name in the worker's body and masks the cell (the first
+     * draft of these cells passed on the pre-BUG-1290 build for that reason). */
+    if (r >= RCH_ARG_REASSIGN) {
+        snprintf(out, n,
+            "%s\n"
+            "void cb() { %s }\n"
+            "%s"
+            "u32 main() { %s return 0; }\n",
+            decls, body, extra, wbody);
+        return;
     }
     snprintf(out, n,
         "%s\n"
@@ -641,6 +718,7 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
 typedef enum { IR_DIRECT, IR_GLOBAL_FP, IR_ARG, IR_STRUCT_INIT, IR_LOCAL_BIND,
                IR_FIELD_ASSIGN, IR_FIELD_ARRAY, IR_FACTORY1, IR_FACTORY2,
                IR_FACTORY_SWITCH, IR_FACTORY_DOWHILE, IR_FACTORY_ORELSE,
+               IR_GLOBAL_INIT, IR_GLOBAL_INIT_COPY,
                IR_COUNT } IsrReach;
 
 static const char *isr_name(IsrReach r) {
@@ -657,6 +735,8 @@ static const char *isr_name(IsrReach r) {
     case IR_FACTORY_SWITCH:  return "factory-switch-arm";
     case IR_FACTORY_DOWHILE: return "factory-dowhile-body";
     case IR_FACTORY_ORELSE:  return "factory-orelse-block";
+    case IR_GLOBAL_INIT:     return "global-struct-init";
+    case IR_GLOBAL_INIT_COPY: return "global-init-copy";
     case IR_COUNT:        break;
     }
     return "?";
@@ -697,6 +777,12 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
                                   "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
                                   "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return bump; }; return nop; }\n";
                           body = "*() -> void fp = mk(0); fp();"; break;
+    /* BUG-1310 — the ISR siblings of RCH_GLOBAL_INIT / _COPY. */
+    case IR_GLOBAL_INIT:  extra = "struct Ops { *() -> void cb; }\nconst Ops gops = { .cb = bump };\n";
+                          body = "gops.cb();"; break;
+    case IR_GLOBAL_INIT_COPY:
+                          extra = "struct Ops { *() -> void cb; }\nconst Ops gops = { .cb = bump };\n";
+                          body = "Ops o = gops; o.cb();"; break;
     default: break;
     }
     snprintf(out, n,
@@ -850,6 +936,8 @@ typedef enum {
     RC_FUNCPTR_FIELD, /* callee is a field of the shared struct itself         */
     RC_NO_SHARED,     /* callee touches nothing shared — must compile          */
     RC_EXTERN,        /* bodyless extern: C cannot name a ZER rwlock           */
+    RC_COND_WAIT,     /* BUG-1476: callee @cond_waits on the held struct       */
+    RC_COND_WAIT_OWN, /* ... the same wait called in its OWN statement         */
     RC_COUNT
 } ReCallee;
 typedef enum { RL_RW, RL_PLAIN, RL_COUNT } ReLock;
@@ -863,6 +951,8 @@ static const char *rc_name(ReCallee c) {
     case RC_FUNCPTR_FIELD: return "funcptr-field";
     case RC_NO_SHARED:     return "callee-touches-none";
     case RC_EXTERN:        return "bodyless-extern";
+    case RC_COND_WAIT:     return "cond-wait";
+    case RC_COND_WAIT_OWN: return "cond-wait-own-stmt";
     case RC_COUNT:         break;
     }
     return "?";
@@ -880,6 +970,11 @@ static const char *rl_name(ReLock l) {
  * to carry it in both lock kinds — always valid. Everything else is valid too; the
  * grid is deliberately full so the PLAIN column proves the rule is scoped. */
 static int re_is_negative(ReCallee c, ReLock l) {
+    /* BUG-1476: a callee that @cond_waits while the statement holds the lock
+     * hangs for BOTH kinds — the wait releases one level of a recursive mutex
+     * (and a shared(rw) struct cannot back a condvar at all). */
+    if (c == RC_COND_WAIT) return 1;
+    if (c == RC_COND_WAIT_OWN) return l == RL_RW;
     if (l == RL_PLAIN) return 0;           /* recursive mutex: every form is legal */
     switch (c) {
     case RC_DIRECT:        return 1;
@@ -889,6 +984,8 @@ static int re_is_negative(ReCallee c, ReLock l) {
     case RC_FUNCPTR_FIELD: return 1;
     case RC_NO_SHARED:     return 0;
     case RC_EXTERN:        return 0;
+    case RC_COND_WAIT:     return 1;
+    case RC_COND_WAIT_OWN: return 1;
     case RC_COUNT:         break;
     }
     return 0;
@@ -927,6 +1024,14 @@ static void gen_reentry(ReCallee c, ReLock l, char *out, size_t n) {
     case RC_EXTERN:
         extra = "u32 ext(u32 a);\n";
         stmt  = "g.v = ext(1);";
+        break;
+    case RC_COND_WAIT:
+        extra = "u32 f() { @cond_wait(g, g.v > 5); return 1; }\n";
+        stmt  = "g.v = f();";
+        break;
+    case RC_COND_WAIT_OWN:
+        extra = "u32 f() { @cond_wait(g, g.v > 5); return 1; }\n";
+        stmt  = "u32 r = f(); g.v = r;";
         break;
     case RC_COUNT: break;
     }
@@ -1042,10 +1147,12 @@ int main(void) {
             char nm[192];
             snprintf(nm, sizeof(nm), "reentry/%s/%s", rc_name(rc), rl_name(rl));
             gen_reentry(rc, rl, ebuf, sizeof(ebuf));
-            /* The bodyless-extern cell cannot LINK by construction. */
+            /* The bodyless-extern cell cannot LINK by construction; the
+             * own-statement wait has no signaller, so it would never return. */
             int ok = neg ? run_neg(nm, ebuf)
-                         : (rc == RC_EXTERN ? run_pos_check_only(nm, ebuf)
-                                            : run_pos(nm, ebuf));
+                         : ((rc == RC_EXTERN || rc == RC_COND_WAIT_OWN)
+                                ? run_pos_check_only(nm, ebuf)
+                                : run_pos(nm, ebuf));
             fprintf(stderr, "  [%-20s][%-10s][%-3s] %s\n",
                     rc_name(rc), rl_name(rl), neg ? "neg" : "pos",
                     ok ? "ok" : "*** FAIL ***");

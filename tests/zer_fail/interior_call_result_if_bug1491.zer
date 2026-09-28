@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: INSIDE
+// BUG-1491: the callee returns an interior view on ONE of its paths.
+[*]u8 maybe_tail([*]u8 s, bool t) { if (t) { return s[2..s.len]; } return s; }
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 t = maybe_tail(b, true);
+    free(t);
+    return 0;
+}

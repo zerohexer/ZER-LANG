@@ -104,3 +104,4 @@ zig_tests/*
 /zer-lsp
 /test
 /test1
+.claude/worktrees/

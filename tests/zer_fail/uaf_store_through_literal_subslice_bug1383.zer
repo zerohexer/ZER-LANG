@@ -1,0 +1,17 @@
+// expect-error: use after free
+// BUG-1383: `la[1..3][0]` IS `la[1]` — a store through a literal sub-slice was
+// not keyed, so the slot never aliased `a` and the read after `free(a)` returned
+// a recycled object (exit 99). Same for a global array.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] la;
+    *T a = alloc(T) orelse return;
+    la[1..3][0] = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (la[1]) |q| { r = q.v; }
+    free(b);
+    return r;
+}

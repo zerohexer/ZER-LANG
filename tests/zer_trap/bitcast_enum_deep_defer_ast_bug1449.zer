@@ -1,0 +1,13 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a value that is not a declared variant of this enum
+// BUG-1449: the same depth hole on the AST emitter path.
+enum E { a, b, c }
+struct L0{E e;} struct L1{L0 x;} struct L2{L1 x;} struct L3{L2 x;} struct L4{L3 x;}
+struct L5{L4 x;} struct L6{L5 x;} struct L7{L6 x;} struct L8{L7 x;} struct L9{L8 x;} struct L10{L9 x;}
+u32 gr=0;
+u32 main() {
+    defer { u32 raw=200; L10 v=@bitcast(L10,raw); switch(v.x.x.x.x.x.x.x.x.x.x.e){.a=>{gr=1;}.b=>{gr=2;}.c=>{gr=3;}} }
+    goto done;
+done:
+    return gr;
+}

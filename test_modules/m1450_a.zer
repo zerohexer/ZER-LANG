@@ -1,0 +1,12 @@
+// BUG-1450: module a's `helper`, `shelp` (static) and spawn target `work`.
+shared struct M1450CA { u32 v; }
+M1450CA m1450_ca;
+u32 helper(u32 x) { return x + 1; }
+static u32 shelp(u32 x) { return x + 2; }
+void work(u32 x) { m1450_ca.v = x + 1000; }
+u32 m1450_fa() {
+    ThreadHandle th = spawn work(1);
+    th.join();
+    if (m1450_ca.v != 1001) { return 100; }
+    return helper(10) + shelp(10);
+}

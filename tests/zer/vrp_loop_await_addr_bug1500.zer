@@ -1,0 +1,20 @@
+// BUG-1500: `await bump(&i)` in an async loop body writes i through the pointer.
+u32[4] arr;
+u32[64] pad;
+u32 hit = 0;
+bool bump(*u32 q) { *q = 4; return true; }
+async void t() {
+    u32 i = 1;
+    for (u32 k = 0; k < 2; k += 1) {
+        arr[i] = 7;
+        if (k == 1) { hit = 1; }
+        await bump(&i);
+    }
+}
+u32 main() {
+    _zer_async_t task;
+    _zer_async_t_init(&task);
+    for (u32 r = 0; r < 4; r += 1) { _zer_async_t_poll(&task); }
+    if (hit == 1) { return 42; }
+    return 0;
+}

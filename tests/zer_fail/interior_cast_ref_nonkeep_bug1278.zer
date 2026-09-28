@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: through a cast in the middle
+struct Inner { u32 v; }
+struct H { *Inner in; }
+?*u32 g;
+*u32 idf(*u32 x) { return x; }
+void stash(H h) { g = idf(&((*Inner)h.in).v); }
+void setup() { Inner i; i.v = 42; H h = { .in = &i }; stash(h); }
+u32 main() {
+    setup();
+    if (g) |p| { return *p; }
+    return 0;
+}

@@ -1,0 +1,8 @@
+// expect-error: cannot allocate inside interrupt handler
+// BUG-1425: calloc reachable from an interrupt handler through a funcptr LOCAL
+void helper() {
+    ?[*]u8 b = alloc(u8, 16);
+    if (b) |bb| { free(bb); }
+}
+interrupt TIM2 { *() f = helper; f(); }
+u32 main() { return 0; }

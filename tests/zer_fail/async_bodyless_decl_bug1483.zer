@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: is declared but never defined
+// BUG-1483: a bodyless async declaration with no definition — the checker accepted it and GCC
+// refused the emitted C ("unknown type name '_zer_async_f'").
+async void f();
+u32 main() { _zer_async_f t; _zer_async_f_init(&t); _zer_async_f_poll(&t); return 0; }

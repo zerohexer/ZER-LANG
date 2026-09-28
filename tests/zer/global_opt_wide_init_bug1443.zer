@@ -1,0 +1,18 @@
+// BUG-1443: a ?u65..?u128 GLOBAL payload past 2^64 was folded in 64 bits —
+// `?u128 C = 18446744073709551615 + 2;` emitted `{ 1ULL, 1 }`.
+?u128 C = 18446744073709551615 + 2;
+?u65 D = 18446744073709551615 * 2 + 1;
+?i128 E = -5;
+?u128 N = null;
+u32 main() {
+    u128 one = 1;
+    u128 v = C orelse 0;
+    if (v != (one << 64) + 1) { return 1; }
+    u65 d = D orelse 0;
+    if (d != (u65)((one << 65) - 1)) { return 2; }
+    i128 x = E orelse 0;
+    if (x != -5) { return 3; }
+    u128 n = N orelse 7;
+    if (n != 7) { return 4; }
+    return 0;
+}

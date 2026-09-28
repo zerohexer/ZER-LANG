@@ -1,0 +1,12 @@
+// expect-error: cannot return an async task by value
+// BUG-1459: returning `@cast(DT, a)` is the same copy of a live task as
+// returning `a`.
+async u32 cu(u32 s) { u32 x = s; *u32 p = &x; yield; *p += 1; return x; }
+distinct typedef _zer_async_cu DT;
+DT mk() {
+    _zer_async_cu a;
+    _zer_async_cu_init(&a, 5);
+    _zer_async_cu_poll(&a);
+    return @cast(DT, a);
+}
+u32 main() { return 0; }

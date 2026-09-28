@@ -1,0 +1,18 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a bool that is neither true nor false
+// BUG-1448: @bitcast into a bool was not guarded — it held 2 (IR emitter path).
+// FINDING 1: @bitcast into a bool is NOT normalized to 0/1 (unlike the enum guard).
+// A bool holds 2: != true AND != false, (u32)b == 2, and an exhaustive switch(bool)
+// takes NEITHER arm and returns a fallback value. Accepted by the checker.
+u32 main() {
+    u8 x = 2;
+    bool b = @bitcast(bool, x);
+    u32 r = 0;
+    if (b != true) { if (b != false) { r += 1; } }   // +1: neither true nor false
+    r += (u32)b * 10;                                 // +20: bool is 2, not 0/1
+    switch (b) {                                      // exhaustive; both arms missed
+        true  => { r += 1000; }
+        false => { r += 2000; }
+    }
+    return r;                                         // observed 21 (switch fell through to 0)
+}

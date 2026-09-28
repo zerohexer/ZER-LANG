@@ -1,0 +1,5 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced an optional whose presence byte is neither 0 nor 1
+// BUG-1448: an optional's has_value byte is a bool; a forged 2 read as present.
+struct W { u32 a; u32 b; }
+u32 main() { u64 x = 0x0000000200000005; ?u32 o = @bitcast(?u32, x); if (o) |v| { return v; } return 0; }

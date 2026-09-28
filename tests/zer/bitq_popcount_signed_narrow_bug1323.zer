@@ -1,0 +1,11 @@
+// BUG-1323: regression (see BUGS-FIXED.md).
+// reference.md: "@ctz / @popcount / @parity / @ffs are unaffected by the widening" of a u8/u16 operand.
+// For a SIGNED narrow operand the widening sign-extends: @popcount(i8 -1) is 32, not 8;
+// @popcount(i5 -1) is 32, not 5. Expected exit 0; actual exit 1.
+i8 f(i8 x) { return x; }
+i5 h(i5 x) { return x; }
+u32 main() {
+    if (@popcount(f(-1)) != 8) { return 1; }
+    if (@popcount(h(-1)) != 5) { return 2; }
+    return 0;
+}

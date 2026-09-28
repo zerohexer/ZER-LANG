@@ -38,6 +38,10 @@ typedef struct {
 typedef struct {
     int id;                 /* spawn_id for unique naming */
     Node *spawn_node;       /* the NODE_SPAWN for type info */
+    const char *module;     /* BUG-1450: module the spawn is written in (NULL = main) —
+                             * its target name resolves THERE, not in whatever module
+                             * is being emitted when the wrappers are written */
+    uint32_t module_len;
 } SpawnWrapper;
 
 typedef struct {
@@ -68,11 +72,20 @@ typedef struct {
     int spawn_wrapper_count;
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
+    int spawn_wrappers_emitted; /* BUG-1451: the list is ONE list for the whole
+                             * build (the ids are build-unique), and it was re-emitted
+                             * in full by every module — `redefinition of struct
+                             * _zer_spawn_args_0`. Each module writes only the ones
+                             * registered since the last write. */
 
     /* BUG-867: container_instances[] is ONE list on the Checker, shared by every
      * module in the build, so emitting it per-module produced a duplicate
      * `struct Box_u32 { … }` and GCC refused the file. Emit it once. */
     bool container_structs_emitted;
+    /* BUG-1453: which of the checker's auto-slabs are already declared — each
+     * is declared by the module that declares its struct. */
+    bool *auto_slab_done;
+    int auto_slab_done_cap;
 
     /* async function emission state */
     bool in_async;              /* true when emitting inside an async function body */
@@ -129,6 +142,18 @@ typedef struct {
      * function's cleanup — wrong. A trap aborts safely before the OOB access,
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
+    /* BUG-1298: inline defer-template emission. `ir_src_file` / `ir_last_line`
+     * point at the enclosing function's #line state so an inlined body re-anchors
+     * the same way; `defer_label_seq` hands out block labels no function block uses. */
+    const char *ir_src_file;
+    int *ir_last_line;
+    int defer_label_seq;
+    /* BUG-1298: the @once nodes of the function being emitted; a flag is keyed on
+     * the NODE (its index here), not on a block id, so every clone of a defer body
+     * — one per fire site — shares the one flag. */
+    void **once_nodes;
+    int once_n;
+    int once_cap;
     /* BUG-835: how many scopes are open that a `return` must NEVER leave — a held
      * shared lock, or an interrupt-disabled @critical block. Counted rather than
      * a bool because they nest. While non-zero, the bounds/UAF auto-guard degrades
@@ -142,6 +167,15 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+    bool global_tentative;   /* BUG-1482: emitting a forward (tentative) declaration of a global */
+    /* BUG-1442: > 0 while emitting a STATIC LOCAL's initializer. GCC accepts a
+     * compound literal `(T){ … }` as a file-scope initializer, but at BLOCK
+     * scope a NESTED one is "initializer element is not constant"
+     * (`static S s = { .o = 6 }` with a ?u32 field). In this context every
+     * aggregate is emitted as a plain braced initializer, which C accepts at
+     * any nesting (emit_clit_open). */
+    int static_brace_init;
+    bool intn_cast_wrapping;   /* BUG-1385: inside the N-bit wrap of a (uN)x cast */
 
     /* BUG-1027: slice typedefs for element types that have NO pre-emitted named
      * typedef — pointer, optional-value, funcptr, array, nested slice, *opaque.

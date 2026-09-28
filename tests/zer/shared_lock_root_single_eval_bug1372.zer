@@ -1,0 +1,24 @@
+// BUG-1372: the object a shared-struct access LOCKS is evaluated once. The lock
+// root was emitted at the lock, the operation and the unlock, so `pick().v += 1`
+// called pick() five times and locked one object while writing another.
+shared struct C { u32 v; }
+C g1;
+C g2;
+u32 calls;
+*C pick() { calls += 1; if (calls % 2 == 1) { return &g1; } return &g2; }
+C[2] la;
+u32 ni;
+u32 nx() { ni += 1; return ni - 1; }
+u32 main() {
+    pick().v += 1;
+    if (calls != 1 || g1.v != 1) { return 1; }
+    u32 x = pick().v;
+    if (calls != 2) { return 2; }
+    if (pick().v == 9) { return 3; }
+    if (calls != 3) { return 4; }
+    la[nx()].v = 7;
+    if (ni != 1 || la[0].v != 7) { return 5; }
+    u32 y = la[nx()].v;
+    if (ni != 2) { return 6; }
+    return x + y - x - y;
+}

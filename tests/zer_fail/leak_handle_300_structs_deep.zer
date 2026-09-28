@@ -6,6 +6,9 @@
 // no syntactic limit: you can always declare one more level, so a cap raise alone
 // could never have closed this. That is exactly why the verdict had to become
 // "unknown" rather than a wider "yes".
+// BUG-1484: the handle used to be reached as `w.in.in...(300).h`; the parser now bounds
+// an expression's AST depth at 256, so the 300-deep TYPE sits beside a shallow handle —
+// the type walk over `W` still hits the cap on `deep` and must answer UNKNOWN.
 struct T { u32 v; }
 Pool(T, 4) pool;
 struct H0 { Handle(T) h; }
@@ -309,8 +312,9 @@ struct H297 { H296 in; }
 struct H298 { H297 in; }
 struct H299 { H298 in; }
 struct H300 { H299 in; }
+struct W { H300 deep; Handle(T) h; }
 u32 main() {
-    H300 w;
-    w.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.in.h = pool.alloc() orelse return;
+    W w;
+    w.h = pool.alloc() orelse return;
     return 0;
 }

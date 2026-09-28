@@ -1,0 +1,11 @@
+// expect-error: packed field through a path with a volatile read
+// BUG-1470: a bit-slice write into a PACKED field reads the field and writes it
+// back through its path (no aligned address to hoist) — a VOLATILE read in that
+// path was evaluated twice (read ps[i1].w, write ps[i2].w). BUG-1198's sibling.
+packed struct P { u8 a; u32 w; }
+volatile u32 hv;
+P[4] ps;
+u32 main() {
+    ps[hv % 4].w[3..0] = 5;
+    return 0;
+}

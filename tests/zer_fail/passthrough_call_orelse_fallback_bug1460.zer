@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1460: a call in an orelse VALUE fallback runs in a passthrough — its free was skipped.
+struct T { u32 v; }
+?u32 none() { return null; }
+u32 eat(*T p) { u32 v = p.v; free(p); return v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    u32 y = none() orelse eat(a);
+    *T c = alloc(T) orelse { free(a); return 0; };
+    c.v = 99;
+    u32 r = a.v;
+    free(a);
+    free(c);
+    return r;
+}

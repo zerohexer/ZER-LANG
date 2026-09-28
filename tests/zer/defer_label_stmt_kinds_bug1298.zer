@@ -1,0 +1,42 @@
+// BUG-1298: a defer body in a function WITH a label used to be emitted by a second,
+// AST-only statement emitter that had no handler for switch / do-while / @critical:
+// each became `compiler bug: ... no handler` plus a runtime trap in place of the code.
+// The body is now emitted from its IR template. Both the goto path and the
+// fall-through path must run every body exactly once.
+enum Mode { a, b }
+u32 g = 0;
+
+void f(u32 k, Mode m) {
+    defer {
+        switch (k) {
+            1 => { g += 1; }
+            default => { g += 10; }
+        }
+    }
+    defer {
+        u32 j = 0;
+        do { g += 100; j += 1; } while (j < 2);
+    }
+    defer {
+        @critical { g += 1000; }
+    }
+    defer {
+        switch (m) {
+            .a => { g += 10000; }
+            .b => { g += 20000; }
+        }
+    }
+    if (k > 5) { goto out; }
+    g += 100000;
+out:
+    g += 1000000;
+}
+
+u32 main() {
+    f(1, Mode.a);
+    if (g != 1111201) { return 1; }
+    g = 0;
+    f(9, Mode.b);
+    if (g != 1021210) { return 2; }
+    return 0;
+}

@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: is read-modify-written and is written from both interrupt
+// BUG-1480: one register, two spellings — `*v` at base+4 in the ISR, `r.status`
+// through a register struct at the base in main. Keyed by BYTE SPAN, they meet.
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32 status; }
+interrupt USART1 { volatile *u32 v = @inttoptr(*u32, 0x40000004); *v |= 1; }
+u32 main() { volatile *Regs r = @inttoptr(*Regs, 0x40000000); r.status |= 2; return 0; }

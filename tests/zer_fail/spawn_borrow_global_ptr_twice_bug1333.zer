@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: 'g' is already borrowed by a live scoped spawn
+// BUG-1333: &g and gp to two live threads
+u32 g;
+*u32 gp = &g;
+void w(*u32 p) { for (u32 i = 0; i < 2000000; i += 1) { *p += 1; } }
+u32 main() { ThreadHandle t1 = spawn w(&g); ThreadHandle t2 = spawn w(gp); t1.join(); t2.join(); return g - 4000000; }

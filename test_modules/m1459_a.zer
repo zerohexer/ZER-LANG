@@ -1,0 +1,3 @@
+const u32 SZ = 16;
+u32[SZ] m1459_abuf;
+u32 m1459_fa() { return (u32)m1459_abuf.len; }

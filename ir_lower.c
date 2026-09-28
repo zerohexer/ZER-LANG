@@ -22,6 +22,16 @@
  * Lowering Context — state maintained during AST → IR translation
  * ================================================================ */
 
+struct SharedRootVec;
+/* A statement's held shared-lock group — see LowerCtx.held. */
+typedef struct {
+    Node *root;                    /* primary lock (NULL = nothing held) */
+    struct SharedRootVec *extra;   /* further group members (read locks), or NULL */
+    bool write;                    /* primary taken as a write lock */
+    int loop_exit_block;           /* BUG-1421: loop blocks at install time */
+    int loop_continue_block;
+} StmtLock;
+
 /* Label → block mapping entry (BUG-575: stack-first dynamic buffer). */
 typedef struct {
     const char *name;
@@ -115,6 +125,12 @@ typedef struct {
      * user writes it. Inside one, the guard declines and the emitter's trapping
      * form is used instead. */
     int critical_depth;
+    /* BUG-1287: two more scopes a guard's early return must not leave — a @once
+     * body (the done-publish that loser threads wait on would never run: a hang)
+     * and code between @sem_acquire and @sem_release written straight-line in
+     * this function (the permit would never be returned: the next acquire hangs). */
+    int once_depth;
+    int sem_held;
     int active_guard_flag;
     int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
@@ -137,21 +153,27 @@ typedef struct {
     /* Temp counter for generated names */
     int temp_count;
 
-    /* Active shared-lock root for the currently-being-lowered statement.
-     * NODE_BLOCK sets this before lower_stmt and clears afterward, so
-     * exit statements (NODE_RETURN) can emit IR_UNLOCK BEFORE the exit
-     * — without this, the unlock emitted by the block iterator after
-     * lower_stmt is dead code, and the shared mutex stays held forever.
-     * Single-level tracking — nested shared blocks accumulate locks
-     * (recursive mutex), and only the outermost unlock fires here. */
-    Node *current_stmt_shared_root;
-    /* §E #29 C-F3 (2026-07-03): prev value of current_stmt_shared_root saved
-     * while a condition's shared-read lock is active, so an `orelse return/break`
-     * INSIDE an if/while/for/switch/do-while CONDITION releases the cond mutex
-     * before the early exit (else the lock leaks → permanent deadlock). Cond
-     * locks do not nest within one condition (conditions are expressions), so
-     * one slot suffices. */
-    Node *cond_shared_saved;
+    /* The shared-struct lock GROUP held by the statement currently being
+     * lowered (NULL root = none). Exit statements lowered INSIDE the statement
+     * (an orelse `return` / `break` / `continue`, a bounds-guard return) release
+     * the WHOLE group through emit_release_held before the jump — the IR_UNLOCK
+     * the block iterator emits after lower_stmt is dead code on those paths.
+     *
+     * BUG-1420: the group is held only while the statement's OWN expressions
+     * run. An orelse BLOCK fallback is a nested statement list; it runs with the
+     * group RELEASED (lower_orelse_to_dest), so no statement ever lowers a
+     * nested statement while holding a lock — the per-statement model's
+     * "never two different shared-struct locks at once" holds by construction.
+     * BUG-1421: the loop blocks current when the group was installed, so a
+     * break / continue only releases it when it leaves THAT loop. */
+    StmtLock held;
+    /* §E #29 C-F3 (2026-07-03): the held group saved while a condition's
+     * shared-read lock is active, so an `orelse return/break` INSIDE an
+     * if/while/for/switch/do-while CONDITION releases the cond mutex before the
+     * early exit (else the lock leaks → permanent deadlock). Cond locks do not
+     * nest within one condition (conditions are expressions), so one slot
+     * suffices. */
+    StmtLock cond_held_saved;
     /* BUG-1041: set by the expression-STATEMENT arm for the one lower_expr call
      * whose NODE_ASSIGN result is discarded. Everywhere else a NODE_ASSIGN sits in
      * VALUE position — `if ((x += 1) > 3)`, `y = (x += 1) + 2` — and the compound
@@ -161,6 +183,9 @@ typedef struct {
      * RHS is correctly in value position again. */
     bool assign_stmt_pos;
 } LowerCtx;
+
+static void emit_release_held(LowerCtx *ctx, int line);
+static bool held_released_by_jump(LowerCtx *ctx, bool is_continue);
 
 /* ---- Helpers ---- */
 
@@ -185,6 +210,7 @@ typedef struct {
  * ir_validate enforces the invariant, so a new emission path cannot reintroduce
  * it. BOTH raw emit helpers route through here. */
 static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;   /* BUG-1291 */
     IRBlock *bb = &ctx->func->blocks[ctx->current_block];
     if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
         ctx->current_block = ir_add_block(ctx->func, ctx->arena);
@@ -396,7 +422,8 @@ static bool call_bypasses_arg_lowering(LowerCtx *ctx, Node *expr) {
         expr->call.callee->field.object) {
         Type *ot = checker_get_type(ctx->checker, expr->call.callee->field.object);
         if (!ot && expr->call.callee->field.object->kind == NODE_IDENT) {
-            Symbol *s = scope_lookup(ctx->checker->global_scope,
+            Symbol *s = checker_module_decl_lookup(ctx->checker,   /* BUG-1450 */
+                ctx->func->module_prefix, ctx->func->module_prefix_len,
                 expr->call.callee->field.object->ident.name,
                 (uint32_t)expr->call.callee->field.object->ident.name_len);
             if (s) ot = s->type;
@@ -445,6 +472,46 @@ static bool call_bypasses_arg_lowering(LowerCtx *ctx, Node *expr) {
  * ================================================================ */
 
 /* Create a temp local for intermediate results */
+/* BUG-1409: THE lowering-time answer to "does this name denote a local here?".
+ * ir_find_local falls back to a HIDDEN (closed-scope) local when no visible one
+ * matches — right for a name the lowering has no other meaning for, wrong when the
+ * name is a GLOBAL: after `if (m) |g| { ... }` closes, `g` is the global again, and
+ * the fallback handed back the capture (`return r + g` added the payload). */
+static int lower_find_local(LowerCtx *ctx, const char *name, uint32_t len) {
+    int id = ir_find_local(ctx->func, name, len);
+    if (id >= 0 && ctx->func->locals[id].hidden && ctx->checker &&
+        ctx->checker->global_scope &&
+        scope_lookup(ctx->checker->global_scope, name, len))
+        return -1;
+    return id;
+}
+
+/* BUG-1409: a local is declared at the FUNCTION top in the emitted C (IR locals are
+ * flat), under its source name — so a local that shadows a GLOBAL (or a function)
+ * shadows it for the WHOLE C function, including every statement BEFORE the
+ * local's own declaration and after its block closed. `u32 a = g; if (a > 0) {
+ * u32 g = 7; ... }` read the local's zero instead of the global's 42; a for-counter
+ * named like a global swallowed every write to the global; a shadowing `*T` read a
+ * NULL of a non-null type. Give such a local its own C name — rewrite_idents
+ * renames its references (as it does for a sibling-scope suffix), and a reference
+ * the lowering does not resolve to the local keeps naming the global. */
+static void local_avoid_global_name(LowerCtx *ctx, int id) {
+    if (id < 0 || id >= ctx->func->local_count) return;
+    IRLocal *l = &ctx->func->locals[id];
+    if (l->is_temp || l->is_param) return;
+    if (l->name != l->orig_name) return;   /* already suffixed: unique */
+    Checker *ck = ctx->checker;
+    if (!ck || !ck->global_scope) return;
+    if (!scope_lookup(ck->global_scope, l->name, l->name_len)) return;
+    char buf[32];
+    int sl = snprintf(buf, sizeof(buf), "_%d", id);
+    char *nn = (char *)arena_alloc(ctx->arena, l->name_len + (size_t)sl + 1);
+    if (!nn) return;
+    memcpy(nn, l->name, l->name_len);
+    memcpy(nn + l->name_len, buf, (size_t)sl + 1);
+    ir_local_rename(ctx->func, id, nn, l->name_len + (uint32_t)sl);   /* BUG-1486 */
+}
+
 static int create_temp(LowerCtx *ctx, Type *type, int line) {
     char buf[32];
     int tl = snprintf(buf, sizeof(buf), "_zer_t%d", ctx->temp_count++);
@@ -552,6 +619,21 @@ static bool lower_may_write(Node *n) {
     return true;
 }
 
+/* BUG-1325: can the ORDER in which this value's parts are evaluated be observed?
+ * It writes something, and it is more than one call whose arguments (and callee)
+ * are effect-free. Such a value handed to the passthrough emitter becomes ONE C
+ * expression, whose operand and argument order C leaves unsequenced. */
+static bool value_order_observable(Node *v) {
+    if (!v || !lower_may_write(v)) return false;
+    if (v->kind == NODE_CALL) {
+        if (lower_may_write(v->call.callee)) return true;
+        for (int ai = 0; ai < v->call.arg_count; ai++)
+            if (lower_may_write(v->call.args[ai])) return true;
+        return false;
+    }
+    return true;
+}
+
 /* Snapshot a NAMED local operand into a temp here, at its own evaluation
  * position. Arrays are not copied (an array operand is an address, and C cannot
  * assign one); a temp is returned unchanged. */
@@ -590,7 +672,7 @@ static bool index_clobbered_by(LowerCtx *ctx, Node *e, Node *value, Node *body) 
     if (!e) return false;
     switch (e->kind) {
     case NODE_IDENT: {
-        if (ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len) < 0)
+        if (lower_find_local(ctx, e->ident.name, (uint32_t)e->ident.name_len) < 0)
             return true;   /* a global / non-local name: a call may write it */
         return ast_name_mutated_or_addrd(value, e->ident.name, (uint32_t)e->ident.name_len) ||
                (body && ast_name_addr_taken(body, e->ident.name, (uint32_t)e->ident.name_len));
@@ -661,6 +743,154 @@ static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body
     }
 }
 
+/* BUG-1372: make a PLACE expression (`m[i][j]`, `pick().a[k].b`, the lock root
+ * of a shared access) free of effects, evaluating its parts ROOT-FIRST into
+ * temps here. Two defects shared this cause:
+ *   - a fixed array keeps its place in the passthrough C, and the emitter's
+ *     single-evaluation bounds form reads the INDEX before the OBJECT
+ *     (`size_t i = (IDX); check; &OBJ[i]`), so `m[next()][next()]` read m[2][1]
+ *     and `pick().a[k].b = 5` used k before pick() set it — against the
+ *     documented left-to-right order;
+ *   - a shared-struct lock root is emitted once per lock, operation and
+ *     unlock: `pick().v += 1` called pick() five times, locking one object and
+ *     writing another (a data race).
+ * Every part that may write, and — once the place may write at all — every
+ * non-constant index and dereferenced operand before it, is lowered into a temp,
+ * and the node is overwritten IN PLACE with the temp's name, so every holder of
+ * the node (a lock instruction, the passthrough) sees the one value. Only
+ * called when lower_may_write(place). */
+static bool hoist_place_part_const(Node *n) {
+    return n && (n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT ||
+                 n->kind == NODE_BOOL_LIT || n->kind == NODE_SIZEOF);
+}
+static void hoist_place_to_temp(LowerCtx *ctx, Node *n, bool snapshot) {
+    int line = n->loc.line;
+    SrcLoc loc = n->loc;
+    /* Lower a COPY: the instructions lower_expr emits keep a pointer to the
+     * node they lower (inst.expr), and the node itself is overwritten below. */
+    Node *cp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+    if (!cp) return;
+    *cp = *n;
+    Type *nt = checker_get_type(ctx->checker, n);
+    if (nt) checker_set_type(ctx->checker, cp, nt);
+    int id = lower_expr(ctx, cp);
+    if (id < 0) return;
+    if (snapshot) id = snapshot_operand(ctx, id, line);
+    Node *ident = make_local_ident(ctx, &ctx->func->locals[id], loc);
+    Checker *ck = ctx->checker;
+    if (ck->hoist_undo_n >= ck->hoist_undo_cap) {
+        int nc = ck->hoist_undo_cap ? ck->hoist_undo_cap * 2 : 16;
+        struct ZerHoistUndo *nu = (struct ZerHoistUndo *)arena_alloc(ck->arena,
+            (size_t)nc * sizeof(struct ZerHoistUndo));
+        if (!nu) return;   /* no undo record: leave the node as written */
+        if (ck->hoist_undo_n)
+            memcpy(nu, ck->hoist_undo, (size_t)ck->hoist_undo_n * sizeof(struct ZerHoistUndo));
+        ck->hoist_undo = nu;
+        ck->hoist_undo_cap = nc;
+    }
+    ck->hoist_undo[ck->hoist_undo_n].node = n;
+    ck->hoist_undo[ck->hoist_undo_n].func = ctx->func->ast_node;
+    ck->hoist_undo[ck->hoist_undo_n].saved = *n;
+    ck->hoist_undo_n++;
+    *n = *ident;
+}
+
+/* BUG-1372: undo the previous lowering's in-place hoists of `fn`, newest first. */
+static void hoist_restore(Checker *ck, Node *fn) {
+    int w = 0;
+    for (int i = ck->hoist_undo_n - 1; i >= 0; i--)
+        if (ck->hoist_undo[i].func == fn) *ck->hoist_undo[i].node = ck->hoist_undo[i].saved;
+    for (int i = 0; i < ck->hoist_undo_n; i++) {
+        if (ck->hoist_undo[i].func == fn) continue;
+        ck->hoist_undo[w++] = ck->hoist_undo[i];
+    }
+    ck->hoist_undo_n = w;
+}
+/* BUG-1474: THE gate for hoist_place_effects — "must this place's parts be
+ * evaluated exactly once, here, root first?" A part that may WRITE (BUG-1372)
+ * or that READS VOLATILE memory: a place is re-emitted at the lock, the
+ * operation and the unlock of a shared-struct access, and in a compound
+ * target, so `sl[hv % 2].v += 1` locked sl[i1], wrote sl[i2] and unlocked
+ * sl[i3] (a hang once another thread changed hv). Only the ADDRESS part counts
+ * (checker_place_addr_reads_volatile): a volatile place's own storage is read
+ * once whichever form is emitted. */
+static bool lower_value_needs_single_eval(LowerCtx *ctx, Node *v) {
+    if (!v) return false;
+    if (lower_may_write(v)) return true;
+    return checker_expr_reads_volatile(ctx->checker, v, ir_local_volatile_by_name, ctx->func);
+}
+static bool lower_place_needs_single_eval(LowerCtx *ctx, Node *place) {
+    if (!place) return false;
+    if (lower_may_write(place)) return true;
+    return checker_place_addr_reads_volatile(ctx->checker, place,
+                                             ir_local_volatile_by_name, ctx->func);
+}
+
+/* Does this place's projection chain index a FIXED array (the shape kept whole
+ * in the passthrough)? */
+static bool place_has_array_index(LowerCtx *ctx, Node *n) {
+    while (n) {
+        if (n->kind == NODE_INDEX) {
+            Type *ot = checker_get_type(ctx->checker, n->index_expr.object);
+            if (ot && type_dispatch_kind(ot) == TYPE_ARRAY) return true;
+            n = n->index_expr.object;
+        } else if (n->kind == NODE_FIELD) {
+            n = n->field.object;
+        } else if (n->kind == NODE_UNARY && n->unary.op == TOK_STAR) {
+            n = n->unary.operand;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+static bool lower_value_needs_single_eval(LowerCtx *ctx, Node *v);   /* BUG-1474 */
+static void hoist_place_effects(LowerCtx *ctx, Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case NODE_FIELD:
+        hoist_place_effects(ctx, n->field.object);
+        return;
+    case NODE_INDEX:
+        hoist_place_effects(ctx, n->index_expr.object);
+        if (n->index_expr.index && !hoist_place_part_const(n->index_expr.index))
+            hoist_place_to_temp(ctx, n->index_expr.index, true);
+        return;
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && n->unary.operand) {
+            Node *o = n->unary.operand;
+            if (o->kind == NODE_IDENT) hoist_place_to_temp(ctx, o, true);
+            else if (o->kind == NODE_FIELD || o->kind == NODE_INDEX ||
+                     (o->kind == NODE_UNARY && o->unary.op == TOK_STAR)) {
+                hoist_place_effects(ctx, o);
+                if (lower_value_needs_single_eval(ctx, o)) hoist_place_to_temp(ctx, o, false);
+            } else if (lower_value_needs_single_eval(ctx, o)) {
+                hoist_place_to_temp(ctx, o, false);
+            }
+        }
+        return;
+    case NODE_CALL: case NODE_ORELSE: case NODE_ASSIGN: case NODE_INTRINSIC:
+    case NODE_TYPECAST:
+        /* a value computed at the root (`pick()`, `mk()`): once, here */
+        if (lower_value_needs_single_eval(ctx, n)) hoist_place_to_temp(ctx, n, false);
+        return;
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return;
+    }
+}
+
 /* Lower one expression to a local ID.
  * Creates temp locals and emits instructions for each sub-expression.
  * Returns the local ID holding the result, or -1 for void/error. */
@@ -677,33 +907,64 @@ static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body
  * Gate it on an orelse ACTUALLY nested in the RHS so the common `x = a && b`
  * keeps its native (already-correct) passthrough emission.
  *
- * If-chain, not a switch, deliberately: this is a partial carrier walk, and a
- * no-default switch here would be a false promise of exhaustiveness. An
- * unlisted kind returns false and falls back to the PRIOR passthrough
- * behaviour — the pre-existing shape, never a crash — so a missed carrier
- * degrades to today's bug rather than to a miscompile of working code. */
+ * BUG-1400: this was an if-chain "deliberately", on the argument that a missed
+ * carrier degrades to the prior bug. It did — silently: `x = a && g({ .v = f()
+ * orelse 0 })`, `x = a && s[0..(f() orelse 1)].len > 0` and `x = a && (t = f()
+ * orelse 1) > 0` all ran f() with `a` false (a struct literal, a slice bound and
+ * an assignment value were not walked). The question it answers is exactly "will
+ * pre_lower_orelse find an orelse here?", so it now descends EXACTLY where
+ * pre_lower_orelse descends — an exhaustive switch, no default, so a new node kind
+ * fails the build instead of reopening the hoist. */
 static bool sc_expr_has_orelse(Node *n) {
     if (!n) return false;
-    if (n->kind == NODE_ORELSE) return true;
-    if (n->kind == NODE_BINARY)
+    switch (n->kind) {
+    case NODE_ORELSE: return true;
+    case NODE_BINARY:
         return sc_expr_has_orelse(n->binary.left) ||
                sc_expr_has_orelse(n->binary.right);
-    if (n->kind == NODE_UNARY) return sc_expr_has_orelse(n->unary.operand);
-    if (n->kind == NODE_TYPECAST) return sc_expr_has_orelse(n->typecast.expr);
-    if (n->kind == NODE_CALL) {
+    case NODE_UNARY: return sc_expr_has_orelse(n->unary.operand);
+    case NODE_TYPECAST: return sc_expr_has_orelse(n->typecast.expr);
+    case NODE_CALL:
+        if (sc_expr_has_orelse(n->call.callee)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
             if (sc_expr_has_orelse(n->call.args[i])) return true;
         return false;
-    }
-    if (n->kind == NODE_INTRINSIC) {
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             if (sc_expr_has_orelse(n->intrinsic.args[i])) return true;
         return false;
-    }
-    if (n->kind == NODE_FIELD) return sc_expr_has_orelse(n->field.object);
-    if (n->kind == NODE_INDEX)
+    case NODE_FIELD: return sc_expr_has_orelse(n->field.object);
+    case NODE_INDEX:
         return sc_expr_has_orelse(n->index_expr.object) ||
                sc_expr_has_orelse(n->index_expr.index);
+    case NODE_SLICE:
+        return sc_expr_has_orelse(n->slice.object) ||
+               sc_expr_has_orelse(n->slice.start) ||
+               sc_expr_has_orelse(n->slice.end);
+    case NODE_ASSIGN:
+        return sc_expr_has_orelse(n->assign.target) ||
+               sc_expr_has_orelse(n->assign.value);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (sc_expr_has_orelse(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* pre_lower_orelse does not descend into these, so neither does this. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return false;
+    }
     return false;
 }
 
@@ -715,7 +976,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Variable reference: just return the local ID ---- */
     case NODE_IDENT: {
-        int id = ir_find_local(ctx->func,
+        int id = lower_find_local(ctx,
                                expr->ident.name,
                                (uint32_t)expr->ident.name_len);
         if (id >= 0) return id;
@@ -760,7 +1021,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         int tmp = create_temp(ctx, ty_u8, expr->loc.line);
         IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
         inst.dest_local = tmp;
-        inst.literal_int = (int64_t)expr->char_lit.value;
+        inst.literal_int = (int64_t)(uint8_t)expr->char_lit.value;   /* BUG-1320: a u8 */
         inst.literal_kind = 5; /* char */
         emit_3ac(ctx, inst);
         return tmp;
@@ -862,9 +1123,16 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * Complex types (Handle auto-deref, opaque, builtins, slices, arrays,
      * enums) go to passthrough → emit_expr handles the full logic. ---- */
     case NODE_FIELD: {
+        /* BUG-1372: a field read through a FIXED-array element whose place has
+         * effects (`pick().a[k].b`) keeps that place in the passthrough C,
+         * where the bounds form reads the index before the object. */
+        if (lower_place_needs_single_eval(ctx, expr) && place_has_array_index(ctx, expr)) {   /* BUG-1474 */
+            hoist_place_effects(ctx, expr);
+            goto passthrough;
+        }
         /* Non-local objects (enum type, module prefix) → passthrough */
         if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
-            int obj_id = ir_find_local(ctx->func,
+            int obj_id = lower_find_local(ctx,
                 expr->field.object->ident.name,
                 (uint32_t)expr->field.object->ident.name_len);
             if (obj_id < 0) goto passthrough;
@@ -895,7 +1163,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         if (!frt) {
             Type *ot = NULL;
             if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
-                int obj_id_pre = ir_find_local(ctx->func,
+                int obj_id_pre = lower_find_local(ctx,
                     expr->field.object->ident.name,
                     (uint32_t)expr->field.object->ident.name_len);
                 if (obj_id_pre >= 0) ot = ctx->func->locals[obj_id_pre].type;
@@ -971,6 +1239,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 /* BUG-1179: an index that may WRITE (`a[i + seti(&i)]`) is
                  * lowered too, so its operands evaluate left to right in 3AC
                  * instead of as one unsequenced C expression. */
+                if (lower_place_needs_single_eval(ctx, expr->index_expr.object)) {   /* BUG-1372, BUG-1474 */
+                    hoist_place_effects(ctx, expr);
+                    goto passthrough;
+                }
                 if (expr->index_expr.index &&
                     (expr->index_expr.index->kind == NODE_ORELSE ||
                      lower_may_write(expr->index_expr.index))) {
@@ -1144,6 +1416,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         bool plain_sc = false;
         bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
         ctx->assign_stmt_pos = false;
+        if (lower_place_needs_single_eval(ctx, expr->assign.target))   /* BUG-1372, BUG-1474 */
+            hoist_place_effects(ctx, expr->assign.target);
         if (lower_may_write(expr->assign.value)) {                 /* BUG-1184 */
             Node *fb = (ctx->func->ast_node &&
                         ctx->func->ast_node->kind == NODE_FUNC_DECL)
@@ -1169,7 +1443,17 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
              * effect. */
             bool rhs_si_order = rhs && rhs->kind == NODE_STRUCT_INIT &&
                 rhs->struct_init.field_count >= 2 && lower_may_write(rhs);
-            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order) goto passthrough;
+            /* BUG-1325: the same for ANY value whose evaluation order can be
+             * observed — it writes something, and it is more than one call with
+             * effect-free arguments. Passed through, `x = g + step();` and
+             * `x = pair(step(), step2());` were one C expression, which C leaves
+             * unsequenced: GCC read `g` after the call (102, the var-decl form
+             * gives 56) and ran the arguments right to left, against the
+             * documented left-to-right rule (reference.md "Evaluation Order"). */
+            bool rhs_order = rhs && !rhs_sc && rhs->kind != NODE_STRUCT_INIT &&
+                             value_order_observable(rhs);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order && !rhs_order)
+                goto passthrough;
             plain_sc = rhs_sc;
         }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
@@ -1398,6 +1682,42 @@ static void materialise_defers_from(LowerCtx *ctx, int base) {
  * carries an armed gate. Functions WITHOUT a label (the overwhelming majority, and
  * where the safety wins are) get the IR treatment; functions with one keep exactly
  * the behaviour they had. */
+/* BUG-1302: `for (…; k < E; k += 1)` (or `k = k + 1`, `E > k`) with no write to k
+ * in the condition or the body: every step runs with k < E <= max, so k + 1 does
+ * not wrap. Syntactic, and conservative on anything else. */
+static bool for_step_cannot_wrap(Node *node) {
+    Node *c = node->for_stmt.cond, *st = node->for_stmt.step;
+    if (!c || !st || c->kind != NODE_BINARY || st->kind != NODE_ASSIGN) return false;
+    Node *k = NULL;
+    if (c->binary.op == TOK_LT) k = c->binary.left;
+    else if (c->binary.op == TOK_GT) k = c->binary.right;
+    if (!k || k->kind != NODE_IDENT) return false;
+    Node *t = st->assign.target;
+    if (!t || t->kind != NODE_IDENT || t->ident.name_len != k->ident.name_len ||
+        memcmp(t->ident.name, k->ident.name, k->ident.name_len) != 0) return false;
+    Node *v = st->assign.value;
+    bool one = false;
+    if (st->assign.op == TOK_PLUSEQ)
+        one = v && v->kind == NODE_INT_LIT && v->int_lit.value == 1;
+    else if (st->assign.op == TOK_EQ && v && v->kind == NODE_BINARY &&
+             v->binary.op == TOK_PLUS) {
+        Node *l = v->binary.left, *r = v->binary.right;
+        bool ls = l && l->kind == NODE_IDENT && l->ident.name_len == k->ident.name_len &&
+                  memcmp(l->ident.name, k->ident.name, k->ident.name_len) == 0;
+        bool rs = r && r->kind == NODE_IDENT && r->ident.name_len == k->ident.name_len &&
+                  memcmp(r->ident.name, k->ident.name, k->ident.name_len) == 0;
+        one = (ls && r && r->kind == NODE_INT_LIT && r->int_lit.value == 1) ||
+              (rs && l && l->kind == NODE_INT_LIT && l->int_lit.value == 1);
+    }
+    if (!one) return false;
+    const char *nm = k->ident.name;
+    uint32_t nl = (uint32_t)k->ident.name_len;
+    if (ast_name_mutated_or_addrd(c, nm, nl)) return false;
+    if (node->for_stmt.body && ast_name_mutated_or_addrd(node->for_stmt.body, nm, nl))
+        return false;
+    return true;
+}
+
 static bool defers_stay_on_ast(LowerCtx *ctx) {
     return ctx->label_count > 0;
 }
@@ -1559,11 +1879,13 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     /* BUG-1222: nor when the function's result has no zero value (an enum
      * without a 0 variant — the literal return below would forge one). */
     bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+    bool no_leave = ctx->critical_depth > 0 || ctx->defer_body_depth > 0 ||
+                    ctx->once_depth > 0 || ctx->sem_held > 0;   /* BUG-1287 */
+    if (no_leave || no_zero) {
         IRInst tr = make_inst(IR_TRAP, g->line);
         /* literal_kind names the reason for the emitter's message:
          * 0 = a scope that cannot be left, 1 = no zero value to return */
-        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        tr.literal_kind = no_leave ? 0 : 1;
         emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -1571,11 +1893,7 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     }
 
     emit_defer_fire(ctx, g->line);
-    if (ctx->current_stmt_shared_root) {
-        IRInst unlock = make_inst(IR_UNLOCK, g->line);
-        unlock.expr = ctx->current_stmt_shared_root;
-        emit_inst(ctx, unlock);
-    }
+    emit_release_held(ctx, g->line);   /* BUG-1420: the whole group */
     IRInst ret = make_inst(IR_RETURN, g->line);
     ret.ret_from_guard = true;   /* BUG-1071: named in the leak diagnostic */
     if (!void_ret) {
@@ -1672,7 +1990,7 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
 
     switch (expr->kind) {
     case NODE_IDENT: {
-        int id = ir_find_local(ctx->func, expr->ident.name,
+        int id = lower_find_local(ctx, expr->ident.name,
                                (uint32_t)expr->ident.name_len);
         if (id >= 0) {
             IRLocal *l = &ctx->func->locals[id];
@@ -1882,6 +2200,24 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
             else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
             else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
             else break;
+            /* BUG-1307: `S.alloc_ptr()` / `S.free_ptr(p)` — the auto-slab builtins,
+             * which the universal alloc(S) / free(p) also lower to — name the struct
+             * TYPE as their receiver. It has the shared struct's type, so it was
+             * taken for a shared ROOT and the emitter locked `&S._zer_mtx`: GCC
+             * "'S' undeclared". A type receiver holds no data and needs no lock. */
+            if (cur->kind == NODE_FIELD && next->kind == NODE_IDENT) {
+                const char *fm = cur->field.field_name;
+                size_t fl = cur->field.field_name_len;
+                bool type_method = (fl == 5 && memcmp(fm, "alloc", 5) == 0) ||
+                                   (fl == 9 && memcmp(fm, "alloc_ptr", 9) == 0) ||
+                                   (fl == 4 && memcmp(fm, "free", 4) == 0) ||
+                                   (fl == 8 && memcmp(fm, "free_ptr", 8) == 0);
+                /* The checker routes ANY struct-typed receiver of these four to
+                 * the auto-slab (checker.c "Task.alloc() / Task.free()"), so the
+                 * same test answers it here. */
+                if (type_method &&
+                    type_dispatch_kind(checker_get_type(c, next)) == TYPE_STRUCT) break;
+            }
             Type *nt = checker_get_type(c, next);
             if (nt) {
                 Type *eff = type_unwrap_distinct(nt);
@@ -1964,7 +2300,7 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
  * ZERO diagnostics — a silent data race in the emitted C. A cap on a SAFETY
  * collector cannot fail silently; either it grows or it must refuse the program.
  * It grows: stack-first 16, heap doubling, per CLAUDE.md rule #7. */
-typedef struct {
+typedef struct SharedRootVec {
     Node **items;
     int    count;
     int    cap;
@@ -2146,6 +2482,77 @@ static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
     return NULL;
 }
 
+/* BUG-1420/1421: the held statement lock group (LowerCtx.held). */
+static StmtLock held_make(LowerCtx *ctx, Node *root, SharedRootVec *extra, bool write) {
+    StmtLock h;
+    h.root = root;
+    h.extra = root ? extra : NULL;
+    h.write = write;
+    h.loop_exit_block = ctx->loop_exit_block;
+    h.loop_continue_block = ctx->loop_continue_block;
+    return h;
+}
+
+/* Install `root` (+extras) as the held group, or keep the enclosing one when
+ * this statement takes no lock of its own (an enclosing cond / for-init lock
+ * that is still held must still be released by a nested early exit). */
+static StmtLock held_enter(LowerCtx *ctx, Node *root, SharedRootVec *extra, bool write) {
+    StmtLock prev = ctx->held;
+    if (root) ctx->held = held_make(ctx, root, extra, write);
+    return prev;
+}
+
+/* Release every lock of the held group — the extras in reverse, then the
+ * primary; the same set emit_shared_unlock_if_needed releases on the normal
+ * path. Used by every early exit out of a locked statement. Pre-BUG-1420 each
+ * exit site released only the PRIMARY, so `x = f(q.a, r.b) orelse { return 3; };`
+ * returned holding r's lock (measured: the next access to r hung). */
+static void emit_unlock_group(LowerCtx *ctx, Node *root, SharedRootVec *ex, int line);
+static void emit_release_held(LowerCtx *ctx, int line) {
+    if (!ctx->held.root) return;
+    emit_unlock_group(ctx, ctx->held.root, ctx->held.extra, line);
+}
+
+/* Re-acquire the held group after a fallback block that fell through — the
+ * statement's normal-path unlock still follows. Same shape as
+ * emit_shared_lock_if_needed: the first lock carries the group size and the
+ * members follow it, so the emitter takes the group in ADDRESS order
+ * (BUG-1376). Nothing else is held at this point (BUG-1420), so this is the
+ * statement's own group re-taken, never a second lock nested inside one. */
+static void emit_reacquire_held(LowerCtx *ctx, int line) {
+    if (!ctx->held.root) return;
+    SharedRootVec *ex = ctx->held.extra;
+    int group_n = 1;
+    for (int i = 0; ex && i < ex->count; i++) if (ex->items[i]) group_n++;
+    IRInst lock = make_inst(IR_LOCK, line);
+    lock.expr = ctx->held.root;
+    lock.src2_local = ctx->held.write ? 1 : 0;
+    lock.literal_int = group_n;
+    emit_inst(ctx, lock);
+    for (int i = 0; ex && i < ex->count; i++) {
+        if (!ex->items[i]) continue;
+        IRInst l2 = make_inst(IR_LOCK, line);
+        l2.expr = ex->items[i];
+        l2.src2_local = 0;
+        l2.literal_int = -1;
+        emit_inst(ctx, l2);
+    }
+}
+
+/* BUG-1421: does a break (continue) lowered NOW leave the statement that holds
+ * the group? Only when it targets the loop that was current when the group was
+ * installed — a loop lowered INSIDE the statement has other blocks, and a jump
+ * to it stays inside the statement. Pre-fix every break/continue released the
+ * group, so a loop inside an orelse block (`x = f(q.a) orelse { for (...) {
+ * continue; ... break; } return s; };`) unlocked one lock up to four times —
+ * measured: TSan "unlock of an unlocked mutex", and on shared(rw) the extra
+ * unlocks released OTHER threads' locks (lost updates, hang). */
+static bool held_released_by_jump(LowerCtx *ctx, bool is_continue) {
+    if (!ctx->held.root) return false;
+    if (is_continue) return ctx->held.loop_continue_block == ctx->loop_continue_block;
+    return ctx->held.loop_exit_block == ctx->loop_exit_block;
+}
+
 /* Gap 36 fix (2026-04-27, Stage 2): emit IR_LOCK around evaluation of a
  * shared-struct-reading cond/expr in NODE_IF / NODE_WHILE / NODE_FOR /
  * NODE_SWITCH. Returns the shared root if a lock was emitted (caller
@@ -2161,6 +2568,7 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     if (!cond) return NULL;
     Node *root = find_shared_root_expr(ctx->checker, cond);
     if (!root) return NULL;
+    if (lower_place_needs_single_eval(ctx, root)) hoist_place_effects(ctx, root);   /* BUG-1372, BUG-1474 */
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
     /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
@@ -2171,16 +2579,16 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     emit_inst(ctx, lock);
     /* §E #29 C-F3: expose the cond's lock root so an `orelse return/break/continue`
      * lowered from INSIDE the condition (lower_orelse_to_dest consults
-     * ctx->current_stmt_shared_root) releases the mutex on the early-exit path.
+     * ctx->held) releases the mutex on the early-exit path.
      * Restored by emit_shared_unlock_after_cond on the normal path. */
-    ctx->cond_shared_saved = ctx->current_stmt_shared_root;
-    ctx->current_stmt_shared_root = root;
+    ctx->cond_held_saved = ctx->held;
+    ctx->held = held_make(ctx, root, NULL, false);
     return root;
 }
 
 static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
     if (!root) return;
-    ctx->current_stmt_shared_root = ctx->cond_shared_saved;  /* §E #29 C-F3 restore */
+    ctx->held = ctx->cond_held_saved;  /* §E #29 C-F3 restore */
     IRInst unlock = make_inst(IR_UNLOCK, line);
     unlock.expr = root;
     emit_inst(ctx, unlock);
@@ -2205,9 +2613,11 @@ static bool stmt_writes_shared_ir(Node *stmt) {
  * UN-LOCKED → data race / cross-thread stale-pointer UAF). Capture/replay lets
  * orelse statements lock every root too. Extras are always READ locks derived
  * from EXPRESSION contexts (find_all_shared_roots_expr does not descend
- * block-fallbacks), so they never coexist with a nested early-exit that would
- * need to release them independently — the primary root alone flows through
- * ctx->current_stmt_shared_root for nested exits, as before. Same-type multi
+ * block-fallbacks). A nested early exit (an orelse `return` / `break`) DOES
+ * coexist with them, so the whole group flows through ctx->held and
+ * emit_release_held releases every member (BUG-1420 — this comment used to
+ * say the primary alone sufficed, and `x = f(q.a, r.b) orelse { return 3; };`
+ * returned holding r's lock). Same-type multi
  * read locks compose (B1); only the pre-existing AB-BA liveness floor is
  * unchanged. */
 static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root,
@@ -2215,27 +2625,67 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
+    if (lower_place_needs_single_eval(ctx, root)) hoist_place_effects(ctx, root);   /* BUG-1372, BUG-1474 */
+    Node *se = stmt_shared_expr_ir(stmt);
+    SharedRootVec rv; srv_init(&rv);
+    if (se) find_all_shared_roots_expr(ctx->checker, se, &rv);
+    /* BUG-1376: the statement's locks are ONE group. Held together, two
+     * instances of one shared type locked in SOURCE order deadlock against
+     * another statement naming them the other way round (`g1.v = g2.v + 1;` in
+     * one thread, `g2.v = g1.v + 1;` in another — measured hang). The first
+     * lock carries the group size (literal_int); the emitter acquires the whole
+     * group in ADDRESS order, the same order in every thread. */
+    int group_n = 1;
+    for (int i = 0; i < rv.count; i++) if (rv.items[i] != root) group_n++;
+    for (int i = 0; i < rv.count; i++)       /* BUG-1372: before any lock */
+        if (rv.items[i] != root && lower_place_needs_single_eval(ctx, rv.items[i]))   /* BUG-1474 */
+            hoist_place_effects(ctx, rv.items[i]);
     IRInst lock = make_inst(IR_LOCK, stmt->loc.line);
     lock.expr = root;
     lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
+    lock.literal_int = group_n;
     emit_inst(ctx, lock);
-    Node *se = stmt_shared_expr_ir(stmt);
     if (se) {
-        SharedRootVec rv; srv_init(&rv);
-        find_all_shared_roots_expr(ctx->checker, se, &rv);
         for (int i = 0; i < rv.count; i++) {
             if (rv.items[i] == root) continue; /* primary already locked */
             IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
             l2.expr = rv.items[i];
             l2.src2_local = 0; /* read lock for extras */
+            l2.literal_int = -1;               /* BUG-1376: a group member */
             emit_inst(ctx, l2);
             /* BUG-935: the UNLOCK replays this set, so a root locked here and
              * dropped from extra_out would be locked and never released. The
              * caller's vector grows with this one. */
             if (extra_out) srv_push(extra_out, rv.items[i]);
         }
-        srv_free(&rv);
     }
+    srv_free(&rv);
+}
+
+/* Release a statement's lock group: the extras in reverse, then the primary.
+ * BUG-1475: the first UNLOCK carries the group size (literal_int, members -1),
+ * the mirror of the lock group (BUG-1376), so the emitter releases the group
+ * as ONE unit — once per distinct ADDRESS. Two roots of one group can name one
+ * instance at run time (`void f(*S p) { ga.v = p.v + 1; }` called as f(&ga));
+ * the lock side takes that instance once (a second `rdlock` after `wrlock` on a
+ * non-recursive rwlock is EDEADLK, ignored — and a second unlock is undefined
+ * behaviour that releases another thread's lock). */
+static void emit_unlock_group(LowerCtx *ctx, Node *root, SharedRootVec *ex, int line) {
+    int group_n = 1;
+    for (int i = 0; ex && i < ex->count; i++) if (ex->items[i]) group_n++;
+    bool first = true;
+    for (int i = ex ? ex->count - 1 : -1; i >= 0; i--) {
+        if (!ex->items[i]) continue;
+        IRInst u2 = make_inst(IR_UNLOCK, line);
+        u2.expr = ex->items[i];
+        u2.literal_int = first && group_n >= 2 ? group_n : -1;
+        first = false;
+        emit_inst(ctx, u2);
+    }
+    IRInst unlock = make_inst(IR_UNLOCK, line);
+    unlock.expr = root;
+    unlock.literal_int = group_n >= 2 ? -1 : 0;
+    emit_inst(ctx, unlock);
 }
 
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
@@ -2244,15 +2694,7 @@ static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
     /* Unlock the CAPTURED extras (reverse order), then the primary. Replaying
      * the captured set (not re-deriving) keeps lock/unlock balanced across the
      * orelse rewrite. */
-    for (int i = extra ? extra->count - 1 : -1; i >= 0; i--) {
-        if (!extra->items[i]) continue;
-        IRInst u2 = make_inst(IR_UNLOCK, root->loc.line);
-        u2.expr = extra->items[i];
-        emit_inst(ctx, u2);
-    }
-    IRInst unlock = make_inst(IR_UNLOCK, root->loc.line);
-    unlock.expr = root;
-    emit_inst(ctx, unlock);
+    emit_unlock_group(ctx, root, extra, root->loc.line);
 }
 
 /* Check if an expression contains NODE_ORELSE at the top level */
@@ -2463,6 +2905,24 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
     /* Recurse into children containing expressions */
     switch (n->kind) {
     case NODE_BINARY:
+        /* BUG-1400: an orelse in the RIGHT operand of `&&` / `||` runs only when
+         * the left operand lets it. Hoisting it (the recursion below) moves it in
+         * front of the operator and runs it unconditionally — every passthrough
+         * context that did not reroute the short-circuit itself (a one-field struct
+         * literal assigned whole, `t = { .b = a && g(f() orelse 0) }`, was the last
+         * one measured) called f() with `a` false. Lower the whole operator to
+         * branches here instead, and name its result. */
+        if ((n->binary.op == TOK_AMPAMP || n->binary.op == TOK_PIPEPIPE) &&
+            sc_expr_has_orelse(n->binary.right)) {
+            Type *bt = checker_get_type(ctx->checker, n);
+            if (!bt) bt = ty_bool;
+            int tmp = create_temp(ctx, bt, line);
+            lower_shortcircuit_to_dest(ctx, tmp, n, line);
+            Node *id = make_local_ident(ctx, &ctx->func->locals[tmp], n->loc);
+            checker_set_type(ctx->checker, id, bt);
+            *pp = id;
+            return;
+        }
         pre_lower_orelse(ctx, &n->binary.left, line);
         pre_lower_orelse(ctx, &n->binary.right, line);
         break;
@@ -2531,7 +2991,7 @@ static int orelse_subject_root_local(LowerCtx *ctx, Node *e) {
         e = (e->kind == NODE_FIELD) ? e->field.object : e->index_expr.object;
     }
     if (!e || e->kind != NODE_IDENT) return -1;
-    return ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len);
+    return lower_find_local(ctx, e->ident.name, (uint32_t)e->ident.name_len);
 }
 
 /* ONE place tags a block as the null path of an orelse (was six copies). */
@@ -2651,12 +3111,8 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
-         * the next thread to acquire it deadlocks. */
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+         * the next thread to acquire it deadlocks. BUG-1420: the WHOLE group. */
+        emit_release_held(ctx, line);
         IRInst ret = make_inst(IR_RETURN, line);
         ret.ret_from_orelse = true;  /* ?void: propagate FAILURE (None), not success */
         emit_inst(ctx, ret);
@@ -2666,11 +3122,9 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        /* BUG-1420: the whole group. A bare `orelse break` always leaves the
+         * statement (it names the loop the statement sits in). */
+        emit_release_held(ctx, line);
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_exit_block;
         emit_inst(ctx, go);
@@ -2679,11 +3133,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        emit_release_held(ctx, line);   /* BUG-1420: the whole group */
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_continue_block;
         emit_inst(ctx, go);
@@ -2699,7 +3149,24 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
              * The fallback expression may contain nested orelse (e.g.,
              * `A orelse bar(B orelse 7)`). Pre-lower any orelse inside
              * before handing the AST to the passthrough emitter. */
-            if (dest_local >= 0) {
+            if (dest_local >= 0 && fb->kind != NODE_STRUCT_INIT &&
+                value_order_observable(fb)) {
+                /* BUG-1325: `none() orelse g + step()` — lowered left to right
+                 * (the var-decl / call-argument order), then copied in. */
+                int fv = lower_expr(ctx, fb);
+                if (fv >= 0) {
+                    IRInst cp = make_inst(IR_COPY, line);
+                    cp.dest_local = dest_local;
+                    cp.src1_local = fv;
+                    emit_inst(ctx, cp);
+                } else {
+                    pre_lower_orelse(ctx, &fb, line);
+                    IRInst assign = make_inst(IR_ASSIGN, line);
+                    assign.dest_local = dest_local;
+                    assign.expr = fb;
+                    emit_inst(ctx, assign);
+                }
+            } else if (dest_local >= 0) {
                 pre_lower_orelse(ctx, &fb, line);
                 IRInst assign = make_inst(IR_ASSIGN, line);
                 assign.dest_local = dest_local;
@@ -2707,7 +3174,35 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
                 emit_inst(ctx, assign);
             }
         } else {
+            /* BUG-1420: a BLOCK fallback is a nested statement list, and the
+             * checker treats each of its statements as its OWN lock scope
+             * (check_block_lock_ordering via for_each_orelse_block, BUG-1047;
+             * the rw re-entry rule, BUG-980). The lowering used to run it
+             * INSIDE the enclosing statement's lock group, so
+             *   u32 x = none(a.v) orelse { b.y = 5; continue; };
+             * held A while locking B — against a thread doing the mirror
+             * statement, an ABBA deadlock the checker had accepted (measured
+             * hang) — and on a shared(rw) struct `maybe(q.a) orelse { q.n = 5;
+             * ... }` took a WRITE lock while holding a READ lock of the same
+             * non-recursive rwlock (self-deadlock).
+             *
+             * The subject has been evaluated into the temp by now, so nothing
+             * of the statement still needs the group: RELEASE it, lower the
+             * block with nothing held (its statements lock themselves), and
+             * re-acquire only if the block falls through into the rest of the
+             * statement (a `?void` / discarded-value orelse), whose normal-path
+             * unlock follows. This keeps "never two different shared-struct
+             * locks held at once" true by construction, the model the checker
+             * already assumes. */
+            StmtLock outer = ctx->held;
+            emit_release_held(ctx, line);
+            ctx->held.root = NULL;
+            ctx->held.extra = NULL;
             lower_stmt(ctx, fb);
+            ctx->held = outer;
+            IRBlock *after = &ctx->func->blocks[ctx->current_block];
+            if (after->inst_count == 0 || !ir_block_is_terminated(after))
+                emit_reacquire_held(ctx, line);
         }
         /* Check if fallback terminated; if not, goto join */
         IRBlock *fb_blk = &ctx->func->blocks[ctx->current_block];
@@ -2882,31 +3377,35 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
                 if (ret_expr) {
                     rewrite_idents(ctx, ret_expr);
+                    /* BUG-1420: the group is HELD while the return value is
+                     * lowered, so an orelse exit inside it (`return f(q.a)
+                     * orelse { return 3; };`) must see it. This path used to
+                     * lower with ctx->held unset, so that inner return left
+                     * q's lock held forever (measured hang). */
+                    StmtLock prev_held = held_enter(ctx, shared_root, &shared_extra, false);
                     ret.src1_local = lower_expr(ctx, ret_expr);
+                    ctx->held = prev_held;
                     if (ret.src1_local < 0) ret.expr = ret_expr;
                 }
                 emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
                 shared_root = NULL;
                 emit_defer_fire(ctx, stmt->loc.line);
                 emit_inst(ctx, ret);
+                srv_free(&shared_extra);
                 continue;
             }
-            /* Expose the active root to lower_stmt so exit statements
+            /* Expose the active group to lower_stmt so exit statements
              * (other than NODE_RETURN above) can also release the lock.
              *
-             * When the current inner stmt has no lock of its own
-             * (shared_root NULL) but an outer stmt's lock is still active
-             * (prev_shared non-NULL), INHERIT prev_shared so a nested
-             * early-exit (e.g., `x = outer.field orelse { return; }`
-             * block-fallback path containing a plain `return;`) still
-             * releases the outer lock before the IR_RETURN. Without
-             * inheritance, the inner return sees current_stmt_shared_root=
-             * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
-             * deadlock. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
+             * When the current inner stmt has no lock of its own, the
+             * enclosing held group (if any) is KEPT (held_enter) so a nested
+             * early exit still releases it. Since BUG-1420 an orelse BLOCK
+             * fallback runs with the enclosing group already RELEASED
+             * (lower_orelse_to_dest), so its statements normally see none. */
+            StmtLock prev_held = held_enter(ctx, shared_root, &shared_extra,
+                                            stmt_writes_shared_ir(stmt));
             lower_stmt(ctx, stmt);
-            ctx->current_stmt_shared_root = prev_shared;
+            ctx->held = prev_held;
             emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
             /* BUG-935: the vector is per-STATEMENT and may have grown onto the
              * heap, so it is released at the end of every iteration. */
@@ -2957,6 +3456,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int sid = ir_add_local(ctx->func, ctx->arena,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len,
                 vt, false, false, false, node->loc.line);
+            local_avoid_global_name(ctx, sid);   /* BUG-1409 */
             if (sid >= 0) {
                 ctx->func->locals[sid].is_static = true;
                 ctx->func->locals[sid].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
@@ -2973,6 +3473,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int local_id = ir_add_local(ctx->func, ctx->arena,
             node->var_decl.name, (uint32_t)node->var_decl.name_len,
             vt, false, false, false, node->loc.line);
+        local_avoid_global_name(ctx, local_id);   /* BUG-1409 */
         if (local_id >= 0) ctx->func->locals[local_id].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
         /* BUG-1221: ZER auto-zeroes a declaration EVERY time it executes. Locals
          * are hoisted to the function top and zeroed there ONCE, so `u32 acc;`
@@ -3084,6 +3585,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+        /* BUG-1287: a straight-line semaphore hold (see LowerCtx.sem_held). The
+         * acquire counts BEFORE its own statement is lowered is irrelevant — it
+         * holds no guarded access. */
+        if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+            memcmp(expr->intrinsic.name, "sem_acquire", 11) == 0)
+            ctx->sem_held++;
+        else if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+                 memcmp(expr->intrinsic.name, "sem_release", 11) == 0 && ctx->sem_held > 0)
+            ctx->sem_held--;
 
         /* Rewrite idents in expression to use correct local names */
         rewrite_idents(ctx, expr);
@@ -3113,7 +3623,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     Node *tgt = expr->assign.target;
                     int dest_local_for_ident = -1;
                     if (tgt->kind == NODE_IDENT) {
-                        dest_local_for_ident = ir_find_local(ctx->func,
+                        dest_local_for_ident = lower_find_local(ctx,
                             tgt->ident.name,
                             (uint32_t)tgt->ident.name_len);
                     }
@@ -3231,13 +3741,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             bool lvalue = cn && (cn->kind == NODE_FIELD || cn->kind == NODE_INDEX ||
                 (cn->kind == NODE_UNARY && cn->unary.op == TOK_STAR) ||
                 (cn->kind == NODE_IDENT &&
-                 ir_find_local(ctx->func, cn->ident.name,
+                 lower_find_local(ctx, cn->ident.name,
                                (uint32_t)cn->ident.name_len) < 0));
             Type *ct = checker_get_type(ctx->checker, cn);
             Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
             if (has_capture && node->if_stmt.capture_is_ptr && lvalue &&
                 ce && type_dispatch_kind(ce) == TYPE_OPTIONAL &&
-                !type_is_null_sentinel(ce->optional.inner) &&
+                /* BUG-1340: a null-sentinel optional too — `|*pp|` of a `?*T`
+                 * field/global must point at THAT storage, not a temp copy. */
                 ce->optional.inner &&
                 type_dispatch_kind(ce->optional.inner) != TYPE_VOID) {
                 Node *amp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
@@ -3276,6 +3787,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 node->if_stmt.capture_name,
                 (uint32_t)node->if_stmt.capture_name_len,
                 if_cap_type, false, true, false, node->loc.line);
+        local_avoid_global_name(ctx, if_cap_id);   /* BUG-1409 */
         if (has_capture) {
             int cap_id = if_cap_id;
             if (cap_id >= 0 && br.cond_local >= 0) {
@@ -3343,10 +3855,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * the init (e.g., `for (u32 v = g.field orelse return; ...)`
              * — orelse fallback inside for-init) release the lock before
              * the IR_RETURN, mirroring NODE_BLOCK iterator behavior. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = init_root ? init_root : prev_shared;
+            StmtLock prev_held = held_enter(ctx, init_root, &init_extra,
+                                            stmt_writes_shared_ir(node->for_stmt.init));
             lower_stmt(ctx, node->for_stmt.init);
-            ctx->current_stmt_shared_root = prev_shared;
+            ctx->held = prev_held;
             if (init_root) {
                 emit_shared_unlock_if_needed(ctx, init_root, &init_extra);
             }
@@ -3410,24 +3922,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * (which may be a shared field, e.g. `i = g.next orelse 0`); if the
              * lock were emitted AFTER pre_lower_orelse the shared read in the
              * branches would happen unlocked. Mirror the for-init pattern: find
-             * the shared root on the RAW step, lock, set current_stmt_shared_root
+             * the shared root on the RAW step, lock, install ctx->held
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
+            if (step_root && lower_place_needs_single_eval(ctx, step_root))
+                hoist_place_effects(ctx, step_root);                 /* BUG-1372, BUG-1474 */
             if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
                 lock.expr = step_root;
                 lock.src2_local = 1; /* write lock — step typically writes */
                 emit_inst(ctx, lock);
             }
-            Node *prev_step_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = step_root ? step_root : prev_step_shared;
+            StmtLock prev_step_held = held_enter(ctx, step_root, NULL, true);
             /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
+            step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
-            ctx->current_stmt_shared_root = prev_step_shared;
+            ctx->held = prev_step_held;
             if (step_root) {
                 IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
                 unlock.expr = step_root;
@@ -4091,7 +4605,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                          * For union/enum: emit normal IR_ASSIGN or IR_COPY. */
                         if (is_optional) {
                             /* IR_COPY src=sw_ref_local, dest=cap — type adaptation */
-                            int src_local = ir_find_local(ctx->func,
+                            int src_local = lower_find_local(ctx,
                                 sw_ref->ident.name, (uint32_t)sw_ref->ident.name_len);
                             if (src_local >= 0) {
                                 IRInst cop = make_inst(IR_COPY, node->loc.line);
@@ -4118,7 +4632,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
             int arm_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-1275: a bare arm `0 => g.x = 5,` is a lone EXPR_STMT, not a block,
+             * and the per-statement shared-struct lock is taken only by the BLOCK
+             * lowering — so the store ran with no mutex while the braced spelling
+             * locked. Lower a non-block body as a one-statement block (a node built
+             * here; the AST keeps its shape for every other consumer). */
+            Node *arm_body = arm->body;
+            if (arm_body && arm_body->kind != NODE_BLOCK) {
+                Node *blk = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                Node **one = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+                if (blk && one) {
+                    memset(blk, 0, sizeof(Node));
+                    blk->kind = NODE_BLOCK;
+                    blk->loc = arm_body->loc;
+                    one[0] = arm_body;
+                    blk->block.stmts = one;
+                    blk->block.stmt_count = 1;
+                    arm_body = blk;
+                }
+            }
+            lower_stmt(ctx, arm_body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4173,12 +4706,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * emits AFTER lower_stmt is unreachable and the mutex leaks.
          * Multi-threaded programs that have any function which returns a
          * value derived from a shared struct would deadlock the next
-         * time the same lock is acquired by another thread. */
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+         * time the same lock is acquired by another thread.
+         * BUG-1420: the WHOLE group, not only its primary. */
+        emit_release_held(ctx, node->loc.line);
         emit_inst(ctx, ret);
         break;
     }
@@ -4189,12 +4719,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Fire loop-scoped defers (emit bodies, DO NOT pop — other paths may need them) */
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
             /* Release any active shared lock before exiting (same as
-             * NODE_RETURN — see current_stmt_shared_root comment). */
-            if (ctx->current_stmt_shared_root) {
-                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = ctx->current_stmt_shared_root;
-                emit_inst(ctx, unlock);
-            }
+             * NODE_RETURN — see LowerCtx.held) — but only when this break
+             * leaves the locked statement (BUG-1421). */
+            if (held_released_by_jump(ctx, false)) emit_release_held(ctx, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_exit_block;
             emit_inst(ctx, go);
@@ -4206,11 +4733,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_CONTINUE: {
         if (ctx->loop_continue_block >= 0) {
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
-            if (ctx->current_stmt_shared_root) {
-                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = ctx->current_stmt_shared_root;
-                emit_inst(ctx, unlock);
-            }
+            /* BUG-1421: only when the continue leaves the locked statement. */
+            if (held_released_by_jump(ctx, true)) emit_release_held(ctx, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_continue_block;
             emit_inst(ctx, go);
@@ -4261,11 +4785,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int goto_fired_count = ctx->defer_count - fire_base; /* count actually fired */
         emit_defer_fire_scoped(ctx, fire_base, true, node->loc.line);
         ctx->defer_count = fire_base;
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        /* A goto always leaves the statement: labels are statements, and no
+         * statement is lowered while a group is held (BUG-1420). */
+        emit_release_held(ctx, node->loc.line);
         int target = find_label_block(ctx,
             node->goto_stmt.label, (uint32_t)node->goto_stmt.label_len);
         /* plt86m defer-goto fix: the goto fired the defers EAGERLY. Record that
@@ -4402,6 +4924,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
+        /* BUG-1298: filled below once the template is lowered. */
+        IRDeferTpl *dtpl = (IRDeferTpl *)arena_alloc(ctx->arena, sizeof(IRDeferTpl));
+        if (dtpl) memset(dtpl, 0, sizeof(*dtpl));
+        push.defer_tpl = dtpl;
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -4478,12 +5004,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->defer_tpl_count[ctx->defer_count]  = 0;
             ctx->defer_tpl_first[ctx->defer_count]  = -1;
             ctx->defer_tpl_exit[ctx->defer_count]   = 0;
-            /* BUG-965: on the raw-AST path, do not lower a template at all. Lowering
-             * would be wasted, and worse than wasted: pre_lower_orelse REWRITES the
-             * nodes it visits, so the emitter's emit_defer_stmt would then replay an
-             * AST this pass had already mutated — the "never lower the same AST
-             * twice" invariant, hit from inside one lowering. */
-            if (!defers_stay_on_ast(ctx)) {
+            /* BUG-1298: lowered in EVERY function now. BUG-965 declined to lower a
+             * template in a function with a label because the emitter then replayed
+             * the raw AST (emit_defer_stmt) that lowering had already rewritten. The
+             * emitter now emits the TEMPLATE there too, so nothing replays the AST
+             * for emission; zercheck_ir's AST scan of such a body only looks for
+             * frees and uses, which pre_lower_orelse leaves in place. */
+            {
                 int saved_block = ctx->current_block;
                 int saved_n     = ctx->defer_count;
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
@@ -4514,6 +5041,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ctx->defer_tpl_first[ctx->defer_count]  = tpl_first;
                     ctx->defer_tpl_exit[ctx->defer_count]   =
                         (tpl_exit >= 0 && tpl_exit < tpl_n) ? tpl_exit : tpl_n - 1;
+                    if (dtpl) {
+                        dtpl->blocks = tpl;
+                        dtpl->count  = tpl_n;
+                        dtpl->first  = tpl_first;
+                        dtpl->exit   = ctx->defer_tpl_exit[ctx->defer_count];
+                    }
                 }
                 ctx->func->block_count = tpl_first;   /* extract */
             }
@@ -4628,7 +5161,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         emit_inst(ctx, br);
 
         ctx->current_block = bb_body;
+        ctx->once_depth++;   /* BUG-1287 */
         lower_stmt(ctx, node->once.body);
+        ctx->once_depth--;
         ensure_terminated(ctx, bb_skip);
 
         ctx->current_block = bb_skip;
@@ -4688,9 +5223,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
  * ================================================================ */
 
 IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
+    return ir_lower_func_in(arena, checker_ptr, func_decl, NULL, 0);
+}
+
+IRFunc *ir_lower_func_in(Arena *arena, void *checker_ptr, Node *func_decl,
+                         const char *mod, uint32_t mod_len) {
     Checker *checker = (Checker *)checker_ptr;
     if (!func_decl || func_decl->kind != NODE_FUNC_DECL || !func_decl->func_decl.body)
         return NULL;
+    hoist_restore(checker, func_decl);   /* BUG-1372 */
 
     /* Resolve return type */
     Type *ret_type = checker_get_type(checker, func_decl);
@@ -4704,6 +5245,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     func->is_async = func_decl->func_decl.is_async;
     func->is_naked = func_decl->func_decl.is_naked;
     func->ast_node = func_decl;
+    func->module_prefix = mod;          /* BUG-1450 */
+    func->module_prefix_len = mod_len;
 
     /* Initialize lowering context */
     LowerCtx ctx;
@@ -4762,8 +5305,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
                     pt = func_type->func_ptr.params[i];
                 } else {
                     /* Fallback: look up in scope */
-                    Symbol *psym = scope_lookup(checker->global_scope,
-                        p->name, (uint32_t)p->name_len);
+                    Symbol *psym = checker_module_decl_lookup(checker,   /* BUG-1450 */
+                        mod, mod_len, p->name, (uint32_t)p->name_len);
                     if (psym && psym->type) pt = psym->type;
                 }
                 break;
@@ -4815,6 +5358,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     Checker *checker = (Checker *)checker_ptr;
     if (!interrupt || interrupt->kind != NODE_INTERRUPT || !interrupt->interrupt.body)
         return NULL;
+    hoist_restore(checker, interrupt);   /* BUG-1372 */
 
     IRFunc *func = ir_func_new(arena,
         interrupt->interrupt.name, (uint32_t)interrupt->interrupt.name_len,

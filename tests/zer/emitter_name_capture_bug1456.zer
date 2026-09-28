@@ -1,0 +1,43 @@
+// BUG-1456: names the EMITTER declares must never capture a user name. Every one
+// below is a legal ZER identifier that used to collide with emitted C:
+//   `self`  — the async _init/_poll task parameter (a GLOBAL `self` read in an
+//             async body read the task pointer instead)
+//   `_b`    — the local of the _zer_shl/_zer_shr macros (`a << _b` shifted by an
+//             uninitialised copy of itself)
+//   `_sa`   — the spawn-argument block (`spawn work(_sa)` read the block pointer)
+//   `_a`, `_raw` — the spawn wrapper's locals (a spawned function named `_a`)
+shared struct C { u64 v; }
+C gc;
+u32 self = 5;
+u32 out;
+async void w() { out = self; yield; out += self; }
+
+u32 shl(u32 a, u32 _b) { return a << _b; }
+u32 shl2(u32 _b, u32 n) { return _b << n; }
+u32 shr(u32 a, u32 _b) { return a >> _b; }
+
+void work(u64 x) { gc.v = x; }
+void _a(u64 x) { gc.v = x + 1; }
+void _raw(u64 x) { gc.v = x + 2; }
+
+u32 main() {
+    _zer_async_w t;
+    _zer_async_w_init(&t);
+    while (_zer_async_w_poll(&t) == 0) { }
+    if (out != 10) { return 1; }
+    if (shl(1, 3) != 8) { return 2; }
+    if (shl(1, 40) != 0) { return 3; }
+    if (shl2(1, 3) != 8) { return 4; }
+    if (shr(64, 3) != 8) { return 5; }
+    u64 _sa = 77;
+    ThreadHandle th = spawn work(_sa);
+    th.join();
+    if (gc.v != 77) { return 6; }
+    ThreadHandle th2 = spawn _a(10);
+    th2.join();
+    if (gc.v != 11) { return 7; }
+    ThreadHandle th3 = spawn _raw(10);
+    th3.join();
+    if (gc.v != 12) { return 8; }
+    return 0;
+}

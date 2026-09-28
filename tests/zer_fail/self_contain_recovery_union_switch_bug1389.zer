@@ -1,0 +1,4 @@
+// expect-error: cannot contain itself by value
+// BUG-1389: recovery — the union alignment walk recursed through the cycle.
+union A { u32 a; A y; }
+u32 main(){ A x; switch (x) { .a => |v| { } .y => |w| { } } return 0; }

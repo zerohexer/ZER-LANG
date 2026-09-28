@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: plain access to 'g' in a concurrent context
+u32 g;
+void add1(*u32 p) { @atomic_add(p, 1); }
+void add2(*u32 q) { add1(q); }
+void w() { add2(&g); }
+u32 main() {
+    ThreadHandle th = spawn w();
+    g += 1;
+    th.join();
+    return 0;
+}

@@ -1,0 +1,13 @@
+// BUG-1388: `n > 9223372036854775807` on a u64 computed INT64_MAX + 1 in the
+// range tracker (signed overflow in the compiler; UBSan). The fact is now "any
+// value, nonzero" — which is also what the program sees.
+u32 f(u64 n) {
+    if (n > 9223372036854775807) { return 1; }
+    if (9223372036854775807 < n) { return 2; }
+    return 0;
+}
+u32 main() {
+    if (f(1) != 0) { return 1; }
+    if (f(18446744073709551615) != 1) { return 2; }
+    return 0;
+}

@@ -1,0 +1,56 @@
+// BUG-1402 boundaries: the loop / goto / defer join must not refuse the idioms
+// that never let a frame-bound pointer reach a sink.
+struct Node { u32 v; ?*Node next; }
+Node gn;
+?*u32 gp;
+u32 g0 = 7;
+
+// a list walk returning a PARAM-derived pointer from inside the loop
+*Node find(*Node head, u32 k) {
+    *Node p = head;
+    while (true) {
+        if (p.v == k) { return p; }
+        if (p.next) |n| { p = n; } else { return head; }
+    }
+    return head;
+}
+
+// a loop that only ever points at globals, then publishes
+void publish() {
+    *u32 p = &g0;
+    for (u32 i = 0; i < 3; i += 1) {
+        gp = p;
+        p = &g0;
+    }
+}
+
+// the goto-cleanup idiom with a local that never escapes
+u32 cleanup(u32 k) {
+    u32 x = k;
+    *u32 p = &x;
+    if (k > 100) { goto out; }
+    x += 1;
+out:
+    return *p;
+}
+
+// a defer reading a local pointer (not storing it)
+u32 deferred() {
+    u32 x = 4;
+    *u32 p = &x;
+    u32 r = 0;
+    defer x = 0;
+    r = *p;
+    return r;
+}
+
+u32 main() {
+    Node a = { .v = 1, .next = null };
+    Node b = { .v = 2, .next = &a };
+    if (find(&b, 1).v != 1) { return 1; }
+    publish();
+    if (gp) |q| { if (*q != 7) { return 2; } } else { return 3; }
+    if (cleanup(5) != 6) { return 4; }
+    if (deferred() != 4) { return 5; }
+    return 0;
+}

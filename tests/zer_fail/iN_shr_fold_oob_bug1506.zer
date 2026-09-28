@@ -1,0 +1,11 @@
+// BUG-1506: `~((i3)(-1) >> (i3)3)` is (u3) 7 at run time; the typed fold
+// said 0 (it cut the shift at the i3 CARRIER, 8, not at 3), VRP "proved"
+// arr[k] with k = 0 and emitted a bare store to arr[7]. The fold now agrees
+// with the runtime, so the index is proven 7 — out of bounds.
+// expect-error: always out of bounds
+u32 main() {
+    u8[4] arr;
+    u32 k = (u32)(u3)(~((i3)(-1) >> (i3)3));
+    arr[k] = 7;
+    return k;
+}

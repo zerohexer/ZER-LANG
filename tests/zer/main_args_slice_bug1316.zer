@@ -1,0 +1,12 @@
+// BUG-1316: `main([*][*]u8 args)` is the one parameter list main may take — the
+// command line, built from argc/argv. Run with no arguments: args.len == 1.
+i32 printf(const *u8 fmt, ...);
+u32 main([*][*]u8 args) {
+    u32 total = 0;
+    for (usize i = 0; i < args.len; i += 1) { total += (u32)args[i].len; }
+    if (args.len > 1) { printf("arg1=%.*s\n", (i32)args[1].len, args[1].ptr); }
+    printf("n=%u total=%u\n", (u32)args.len, total);
+    if (args.len < 1 || args[0].len == 0) { return 9; }
+    if (args.len > 3) { return (u32)args[3][0]; }
+    return 0;
+}

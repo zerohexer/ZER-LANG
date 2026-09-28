@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1302: the counter is RESET (k = 0) after the free loop, so reading through
+// the same name reaches a freed slot again.
+struct T { u32 v; }
+u32 main() {
+    ?*T[4] tbl;
+    for (u32 i = 0; i < 4; i += 1) { tbl[i] = alloc(T); }
+    u32 k = 0;
+    for (k = 0; k < 4; k += 1) { *T q = tbl[k] orelse { return 1; }; free(q); }
+    k = 0;
+    *T r = tbl[k] orelse { return 2; };
+    return r.v;
+}

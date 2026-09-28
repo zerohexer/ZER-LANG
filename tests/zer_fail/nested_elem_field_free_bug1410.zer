@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1410: hs[0].in.p is a precise slot fact; In x = hs[i].in; free through x.p reaches it
+struct T { u32 v; }
+struct In { ?*T p; }
+struct H { In in; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0].in.p = a;
+    u32 i = 0;
+    In x = hs[i].in;
+    if (x.p) |q| { free(q); }
+    free(a);
+    return 0;
+}

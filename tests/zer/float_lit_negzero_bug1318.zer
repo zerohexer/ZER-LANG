@@ -1,0 +1,9 @@
+// BUG-1318: regression (see BUGS-FIXED.md).
+// expected exit 0; actual exit 1: `a = -0.0;` is emitted as `a = -0;` (integer zero), losing the sign bit
+u32 main() {
+    f64 a = 1.0;
+    a = -0.0;
+    u64 bits = @bitcast(u64, a);
+    if (bits != 9223372036854775808) { return 1; }
+    return 0;
+}

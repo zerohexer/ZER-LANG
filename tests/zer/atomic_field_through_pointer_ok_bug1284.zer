@@ -1,0 +1,11 @@
+struct S { u32 n; }
+S gs;
+void w() {
+    *S p = &gs;
+    @atomic_add(&p.n, 1);
+}
+u32 main() {
+    ThreadHandle th = spawn w();
+    th.join();
+    return 0;
+}

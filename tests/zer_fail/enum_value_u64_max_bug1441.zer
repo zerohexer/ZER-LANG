@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: exceeds i32 range
+// BUG-1441: the int64 fold wrapped 2^64-1 to -1, which passed the i32 range test.
+enum E { a = 18446744073709551615, b }
+u32 main() {
+    E e = E.a;
+    if (e == E.b) { return 1; }
+    return 0;
+}

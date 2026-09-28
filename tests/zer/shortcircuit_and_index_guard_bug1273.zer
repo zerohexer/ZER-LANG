@@ -1,0 +1,11 @@
+u32[4] arr;
+u32 count(u32 i) {
+    u32 n = 1;
+    if (i < 4 && arr[i] == 0) { n = 2; }
+    return n + 100;
+}
+u32 main() {
+    if (count(10) != 101) { return 1; }
+    if (count(1) != 102) { return 2; }
+    return 0;
+}

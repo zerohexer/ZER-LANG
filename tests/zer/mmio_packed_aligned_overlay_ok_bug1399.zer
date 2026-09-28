@@ -1,0 +1,9 @@
+// BUG-1399 BOUNDARY: a packed overlay whose fields are all naturally aligned is fine.
+mmio 0x40000000..0x400000FF;
+packed struct R2 { u32 a; u16 b; u8 c; u8 d; }
+u32 main() {
+    volatile *R2 r = @inttoptr(*R2, 0x40000000);
+    volatile u32 never = 0;
+    if (never == 42) { return r.a; }
+    return 0;
+}

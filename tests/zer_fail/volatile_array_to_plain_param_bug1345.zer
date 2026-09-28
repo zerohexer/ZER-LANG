@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: cannot pass a volatile array to a non-volatile array parameter
+// BUG-1345: a T[N] parameter is a view of the caller's array; volatile was dropped.
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32[4] fifo; }
+volatile u32[4] gv;
+void waitready(u32[4] a) { while (a[0] == 0) { } }
+void push2(u32[4] a) { a[1] = 1; a[1] = 2; }
+u32 main() {
+    volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+    push2(r.fifo);
+    waitready(gv);
+    return 0;
+}

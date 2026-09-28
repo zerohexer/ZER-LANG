@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: function name 'sched_yield' is a C library function
+// BUG-1446: @once's loser spin calls sched_yield(); this definition replaced it.
+i32 sched_yield() { return 0; }
+u32 main() { return 0; }

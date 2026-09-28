@@ -1,0 +1,31 @@
+// BUG-1448 boundary: a @bitcast producing a REAL bool (0 / 1), a present or absent
+// optional, and deep / large enum carriers holding declared variants do not trap.
+enum E { a, b, c }
+struct Flags { bool on; u8 pad; u16 rest; }
+struct L0 { E e; } struct L1 { L0 x; } struct L2 { L1 x; } struct L3 { L2 x; }
+struct L4 { L3 x; } struct L5 { L4 x; } struct L6 { L5 x; } struct L7 { L6 x; }
+struct L8 { L7 x; } struct L9 { L8 x; } struct L10 { L9 x; }
+struct EA { E[5000] v; }
+struct UA { u32[5000] v; }
+UA src;
+EA dst;
+u32 main() {
+    u8 one = 1;
+    u8 zero = 0;
+    if (!@bitcast(bool, one)) { return 1; }
+    if (@bitcast(bool, zero)) { return 2; }
+    u32 w = 0x00050001;
+    Flags f = @bitcast(Flags, w);
+    if (!f.on || f.rest != 5) { return 3; }
+    u64 present = 0x0000000100000007;
+    ?u32 o = @bitcast(?u32, present);
+    u32 v = o orelse 0;
+    if (v != 7) { return 4; }
+    u32 raw = 2;
+    L10 deep = @bitcast(L10, raw);
+    if (deep.x.x.x.x.x.x.x.x.x.x.e != E.c) { return 5; }
+    src.v[4999] = 1;
+    dst = @bitcast(EA, src);
+    if (dst.v[4999] != E.b) { return 6; }
+    return 0;
+}

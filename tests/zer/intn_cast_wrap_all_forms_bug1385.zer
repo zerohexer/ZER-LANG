@@ -1,0 +1,25 @@
+// BUG-1385: a cast to a non-native uN / iN wraps to N bits in EVERY position —
+// the passthrough (plain assignment, index) and AST (global) paths emitted a
+// bare carrier cast (`s = (u32)(u2)x` stored 6, `a[(u2)big]` trapped).
+volatile u32 v = 6;
+const u32 C = (u32)(u2)6;
+u32[4] a;
+u32 main() {
+    u32 x = v;
+    u32 d = (u32)(u2)x;
+    u32 s = 0; s = (u32)(u2)x;
+    bool b = false; b = (u2)x == 2;
+    u32 e = 0; e = (u32)(i3)x;
+    u32 f = 0; f = (u32)(u17)(x + 131072);
+    u32 big = x + 994;
+    a[(u2)big] = 1;
+    u32 r = 0;
+    if (C != 2) { r |= 1; }
+    if (d != 2) { r |= 2; }
+    if (s != 2) { r |= 4; }
+    if (!b) { r |= 8; }
+    if (e != 4294967294) { r |= 16; }
+    if (f != 6) { r |= 32; }
+    if (a[0] != 1) { r |= 64; }
+    return r;
+}

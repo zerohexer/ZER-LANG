@@ -1,0 +1,34 @@
+// BUG-1425 boundary: calls through function pointers inside @critical that
+// reach nothing banned — a funcptr whose signature no allocating/spawning
+// function shares, const tables resolved to their bound function even when
+// a dangerous function of the same signature exists, a Pool and an Arena
+// (ISR-safe allocators) — all compile and run.
+struct T { u32 v; }
+Pool(T, 4) pool;
+volatile u32 ticks;
+u8[64] backing;
+u32 tick(u32 k) { ticks += k; return 1; }
+void noop() { }
+// heavy2 shares tick's signature and allocates: the const tables must still
+// resolve to tick alone.
+u32 heavy2(u32 k) { ?*T p = alloc(T); if (p) |q| { free(q); } return 0; }
+void heavy(u32 k) { ?*T p = alloc(T); if (p) |q| { free(q); } }
+const *(u32) -> u32 ctab = tick;
+struct Ops { *(u32) -> u32 f; }
+const Ops ops = { .f = tick };
+u32 main() {
+    *() nf = noop;
+    Arena ar = Arena.over(backing);
+    u32 s = 0;
+    @critical {
+        s += ctab(1);
+        s += ops.f(1);
+        nf();
+        ?Handle(T) h = pool.alloc();
+        if (h) |hh| { pool.free(hh); }
+        ?*T t = ar.alloc(T);
+    }
+    heavy(1);
+    if (s != 2) { return 1; }
+    return 0;
+}

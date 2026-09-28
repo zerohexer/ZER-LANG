@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: a heap [*]u8 re-aimed on one branch (ASan heap-use-after-free pre-fix).
+u32 pick(bool c) {
+    [*]u8 a = alloc(u8, 8) orelse { return 1; };
+    [*]u8 b = alloc(u8, 8) orelse { free(a); return 1; };
+    b[0] = 2;
+    [*]u8 p = a;
+    if (c) { p = b; }
+    free(p);
+    u32 out = (u32)b[0];
+    free(b);
+    return out;
+}
+u32 main() { return pick(true); }

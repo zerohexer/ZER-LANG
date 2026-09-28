@@ -34,6 +34,91 @@ IRFunc *ir_func_new(Arena *arena, const char *name, uint32_t name_len, Type *ret
     return func;
 }
 
+/* BUG-1486: the lookup index — see IRFunc.lookup_index. One open-addressing
+ * table keyed by spelling; each slot holds the ids of every local that answers
+ * to that spelling (orig_name or name), appended in id order. */
+struct IRLookupSlot { const char *key; uint32_t len; int *ids; int n, cap; };
+struct IRLookupIndex {
+    int cap;          /* slots, power of two */
+    int used;         /* occupied slots */
+    int indexed;      /* locals[0 .. indexed) are in the table */
+    bool broken;      /* an allocation failed: callers use the linear scans */
+    struct IRLookupSlot *slots;
+};
+static uint32_t ir_lk_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+static struct IRLookupSlot *ir_lk_find(struct IRLookupIndex *ix, const char *s, uint32_t n) {
+    uint32_t m = (uint32_t)ix->cap - 1;
+    for (uint32_t k = ir_lk_hash(s, n) & m;; k = (k + 1) & m) {
+        struct IRLookupSlot *sl = &ix->slots[k];
+        if (!sl->key) return sl;   /* empty: where it would go */
+        if (sl->len == n && memcmp(sl->key, s, n) == 0) return sl;
+    }
+}
+static void ir_lk_free_slots(struct IRLookupIndex *ix) {
+    if (!ix->slots) return;
+    for (int i = 0; i < ix->cap; i++) free(ix->slots[i].ids);
+    free(ix->slots);
+    ix->slots = NULL; ix->cap = 0; ix->used = 0; ix->indexed = 0;
+}
+static bool ir_lk_put(struct IRLookupIndex *ix, const char *s, uint32_t n, int id) {
+    if ((ix->used + 1) * 2 > ix->cap) {   /* grow and re-hash */
+        int ncap = ix->cap ? ix->cap * 2 : 64;
+        struct IRLookupSlot *ns = (struct IRLookupSlot *)calloc((size_t)ncap, sizeof(*ns));
+        if (!ns) return false;
+        struct IRLookupSlot *old = ix->slots;
+        int ocap = ix->cap;
+        ix->slots = ns; ix->cap = ncap;
+        for (int i = 0; i < ocap; i++) {
+            if (!old[i].key) continue;
+            struct IRLookupSlot *d = ir_lk_find(ix, old[i].key, old[i].len);
+            *d = old[i];
+        }
+        free(old);
+    }
+    struct IRLookupSlot *sl = ir_lk_find(ix, s, n);
+    if (!sl->key) { sl->key = s; sl->len = n; ix->used++; }
+    if (sl->n > 0 && sl->ids[sl->n - 1] == id) return true;   /* name == orig_name */
+    if (sl->n >= sl->cap) {
+        int nc = sl->cap ? sl->cap * 2 : 4;
+        int *ni = (int *)realloc(sl->ids, (size_t)nc * sizeof(int));
+        if (!ni) return false;
+        sl->ids = ni; sl->cap = nc;
+    }
+    sl->ids[sl->n++] = id;
+    return true;
+}
+static struct IRLookupIndex *ir_lk_sync(IRFunc *func) {
+    struct IRLookupIndex *ix = func->lookup_index;
+    if (!ix) {
+        ix = (struct IRLookupIndex *)calloc(1, sizeof(*ix));
+        if (!ix) return NULL;
+        func->lookup_index = ix;
+    }
+    if (ix->broken) return NULL;
+    for (int i = ix->indexed; i < func->local_count; i++) {
+        IRLocal *l = &func->locals[i];
+        bool ok = true;
+        if (l->orig_name) ok = ir_lk_put(ix, l->orig_name, l->orig_name_len, i);
+        if (ok && l->name) ok = ir_lk_put(ix, l->name, l->name_len, i);
+        if (!ok) { ix->broken = true; ir_lk_free_slots(ix); return NULL; }
+        ix->indexed = i + 1;
+    }
+    return ix;
+}
+/* The ids answering to a spelling, in id order, or NULL (none / no index). */
+static const struct IRLookupSlot *ir_lk_get(IRFunc *func, const char *s, uint32_t n,
+                                            bool *have_index) {
+    struct IRLookupIndex *ix = ir_lk_sync(func);
+    *have_index = ix != NULL;
+    if (!ix || !ix->cap) return NULL;
+    struct IRLookupSlot *sl = ir_lk_find(ix, s, n);
+    return sl->key ? sl : NULL;
+}
+
 int ir_add_local(IRFunc *func, Arena *arena,
                  const char *name, uint32_t name_len, Type *type,
                  bool is_param, bool is_capture, bool is_temp, int line) {
@@ -65,7 +150,22 @@ int ir_add_local(IRFunc *func, Arena *arena,
      * (shadowing in nested block) no longer collapses. Inner local is
      * suffixed; ir_find_local's scope-aware lookup picks the right one. */
     if (!is_temp && !is_param) {
-        for (int i = 0; i < func->local_count; i++) {
+        /* BUG-1486: only the FIRST local with this orig_name is ever examined
+         * (the loop returns or breaks there) — start the scan at it. */
+        int first = 0;
+        {
+            bool hx;
+            const struct IRLookupSlot *sl = ir_lk_get(func, name, name_len, &hx);
+            if (hx) {
+                first = func->local_count;
+                for (int k = 0; sl && k < sl->n; k++) {
+                    IRLocal *c = &func->locals[sl->ids[k]];
+                    if (c->orig_name_len == name_len && c->orig_name &&
+                        memcmp(c->orig_name, name, name_len) == 0) { first = sl->ids[k]; break; }
+                }
+            }
+        }
+        for (int i = first; i < func->local_count; i++) {
             if (func->locals[i].orig_name_len == name_len &&
                 memcmp(func->locals[i].orig_name, name, name_len) == 0) {
                 bool same_type = (!type || !func->locals[i].type ||
@@ -90,12 +190,15 @@ int ir_add_local(IRFunc *func, Arena *arena,
                 /* Different type OR different scope → fall through to create
                  * new suffixed local. Use `_%d` with the count to ensure
                  * uniqueness across suffixed + unsuffixed variants. */
-                char buf[64];
-                int slen = snprintf(buf, sizeof(buf), "%.*s_%d",
-                                    (int)name_len, name, func->local_count);
-                if (slen >= (int)sizeof(buf)) slen = (int)sizeof(buf) - 1;
-                char *sname = (char *)arena_alloc(arena, slen + 1);
-                memcpy(sname, buf, slen + 1);
+                /* BUG-1409: sized to the name — a 64-byte buffer truncated a
+                 * long name's `_N` suffix away, so the "unique" name equalled
+                 * the local it was meant to be distinct from. */
+                char nbuf[16];
+                int nl = snprintf(nbuf, sizeof(nbuf), "_%d", func->local_count);
+                int slen = (int)name_len + nl;
+                char *sname = (char *)arena_alloc(arena, (size_t)slen + 1);
+                memcpy(sname, name, name_len);
+                memcpy(sname + name_len, nbuf, (size_t)nl + 1);
                 name = sname;
                 name_len = (uint32_t)slen;
                 break;
@@ -142,6 +245,16 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
      * Fallback: if no visible match, try LAST match regardless of hidden —
      * preserves pre-BUG-590 behavior for callers that query names outside
      * normal scope traversal (e.g., emitter passes after lowering). */
+    {   /* BUG-1486: the same answer from the index */
+        bool hx;
+        const struct IRLookupSlot *sl = ir_lk_get(func, name, name_len, &hx);
+        if (hx) {
+            if (!sl || sl->n == 0) return -1;
+            for (int k = sl->n - 1; k >= 0; k--)
+                if (!func->locals[sl->ids[k]].hidden) return func->locals[sl->ids[k]].id;
+            return func->locals[sl->ids[sl->n - 1]].id;
+        }
+    }
     int best = -1;
     int fallback = -1;
     for (int i = 0; i < func->local_count; i++) {
@@ -168,7 +281,139 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
  * orig_name). Exact-first returns %2 (only match by exact name "h").
  *
  * Used only by zercheck_ir walkers after lowering. */
+/* BUG-1394: the linear scan was called once per identifier by every
+ * zercheck_ir walker, so a function with N locals and N statements cost N^2
+ * (16,000 straight-line statements took 24 s). The index answers the same
+ * question: the LAST local whose exact name matches, else the LAST local whose
+ * orig_name matches. */
+struct IRNameIndex {
+    int cap;          /* power of two; slots per table */
+    int indexed;      /* locals[0 .. indexed) are in the tables */
+    int *exact;       /* local index + 1, 0 = empty */
+    int *orig;
+};
+
+static uint32_t ir_name_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Insert local `li` keyed by (s, n) into `tab`; a later local overwrites an
+ * earlier one with the same spelling (the "last match" rule). */
+static void ir_name_tab_put(IRFunc *func, int *tab, int cap, int li,
+                            const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) { tab[k] = li + 1; return; }
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) { tab[k] = li + 1; return; }
+    }
+}
+
+static int ir_name_tab_get(IRFunc *func, int *tab, int cap,
+                           const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) return -1;
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) return o->id;
+    }
+}
+
+static void ir_name_index_add(IRFunc *func, struct IRNameIndex *ix, int li) {
+    IRLocal *l = &func->locals[li];
+    if (l->name) ir_name_tab_put(func, ix->exact, ix->cap, li, l->name, l->name_len, false);
+    if (l->orig_name) ir_name_tab_put(func, ix->orig, ix->cap, li, l->orig_name, l->orig_name_len, true);
+}
+
+static bool ir_name_index_sync(IRFunc *func) {
+    struct IRNameIndex *ix = func->name_index;
+    if (!ix) {
+        ix = (struct IRNameIndex *)calloc(1, sizeof(*ix));
+        if (!ix) return false;
+        func->name_index = ix;
+    }
+    if (ix->indexed == func->local_count && ix->cap) return true;
+    if (!ix->cap || func->local_count * 2 > ix->cap) {
+        int cap = ix->cap ? ix->cap : 64;
+        while (func->local_count * 2 > cap) cap *= 2;
+        int *ne = (int *)calloc((size_t)cap, sizeof(int));
+        int *no = (int *)calloc((size_t)cap, sizeof(int));
+        if (!ne || !no) { free(ne); free(no); return false; }
+        free(ix->exact); free(ix->orig);
+        ix->exact = ne; ix->orig = no; ix->cap = cap; ix->indexed = 0;
+    }
+    for (int i = ix->indexed; i < func->local_count; i++) ir_name_index_add(func, ix, i);
+    ix->indexed = func->local_count;
+    return true;
+}
+
+void ir_local_rename(IRFunc *func, int id, const char *name, uint32_t name_len) {
+    if (!func || id < 0 || id >= func->local_count) return;
+    func->locals[id].name = name;
+    func->locals[id].name_len = name_len;
+    /* both indexes key on the name: rebuild them on next use */
+    if (func->lookup_index) {
+        ir_lk_free_slots(func->lookup_index);
+        func->lookup_index->broken = false;
+    }
+    if (func->name_index) {
+        free(func->name_index->exact); free(func->name_index->orig);
+        memset(func->name_index, 0, sizeof(*func->name_index));
+    }
+}
+
+int ir_find_local_first(IRFunc *func, const char *name, uint32_t name_len) {
+    if (!func || !name) return -1;
+    bool hx;
+    const struct IRLookupSlot *sl = ir_lk_get(func, name, name_len, &hx);
+    if (hx) return (sl && sl->n > 0) ? func->locals[sl->ids[0]].id : -1;
+    for (int i = 0; i < func->local_count; i++) {
+        IRLocal *l = &func->locals[i];
+        if ((l->name && l->name_len == name_len && memcmp(l->name, name, name_len) == 0) ||
+            (l->orig_name && l->orig_name_len == name_len &&
+             memcmp(l->orig_name, name, name_len) == 0))
+            return l->id;
+    }
+    return -1;
+}
+int ir_find_local_first_named(IRFunc *func, const char *name, uint32_t name_len) {
+    if (!func || !name) return -1;
+    bool hx;
+    const struct IRLookupSlot *sl = ir_lk_get(func, name, name_len, &hx);
+    if (hx) {
+        for (int k = 0; sl && k < sl->n; k++) {
+            IRLocal *l = &func->locals[sl->ids[k]];
+            if (l->name && l->name_len == name_len && memcmp(l->name, name, name_len) == 0)
+                return l->id;
+        }
+        return -1;
+    }
+    for (int i = 0; i < func->local_count; i++) {
+        IRLocal *l = &func->locals[i];
+        if (l->name && l->name_len == name_len && memcmp(l->name, name, name_len) == 0)
+            return l->id;
+    }
+    return -1;
+}
+
 int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len) {
+    if (!name) return -1;
+    if (ir_name_index_sync(func)) {
+        int e = ir_name_tab_get(func, func->name_index->exact, func->name_index->cap,
+                                name, name_len, false);
+        if (e >= 0) return e;
+        return ir_name_tab_get(func, func->name_index->orig, func->name_index->cap,
+                               name, name_len, true);
+    }
+    /* allocation failed: the plain scan */
     int exact_match = -1;
     int orig_match = -1;
     for (int i = 0; i < func->local_count; i++) {
@@ -479,6 +724,51 @@ static bool cfg_reaches_fire(IRFunc *func, int from, const bool *has_fire_in_blo
     }
 }
 
+/* BUG-1390: can control reach a function EXIT (a RETURN, or falling off the
+ * last block) from block `from`? A defer registered on a path that never
+ * returns — `defer {…} for (;;) {…}` — has nothing to fire at, so a missing
+ * FIRE there is correct, not a lowering bug. Iterative (a worklist), so a long
+ * block chain cannot overflow the stack. */
+static bool cfg_reaches_exit(IRFunc *func, int from) {
+    if (from < 0 || from >= func->block_count) return false;
+    bool *seen = (bool *)calloc(func->block_count, sizeof(bool));
+    int *work = (int *)malloc(func->block_count * sizeof(int));
+    if (!seen || !work) { free(seen); free(work); return true; }  /* conservative */
+    int n = 0; bool exit_found = false;
+    work[n++] = from; seen[from] = true;
+    while (n > 0 && !exit_found) {
+        int b = work[--n];
+        IRBlock *block = &func->blocks[b];
+        int succ[2]; int ns = 0;
+        if (block->inst_count == 0) {
+            if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+        } else {
+            IRInst *last = &block->insts[block->inst_count - 1];
+            switch (last->op) {
+            case IR_RETURN: exit_found = true; break;
+            case IR_BRANCH: succ[ns++] = last->true_block; succ[ns++] = last->false_block; break;
+            case IR_GOTO: succ[ns++] = last->goto_block; break;
+            case IR_YIELD: case IR_AWAIT:
+                if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                    succ[ns++] = last->goto_block;
+                else if (b + 1 < func->block_count) succ[ns++] = b + 1;
+                else exit_found = true;
+                break;
+            default:
+                if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+                break;
+            }
+        }
+        for (int k = 0; k < ns; k++) {
+            int t = succ[k];
+            if (t < 0 || t >= func->block_count || seen[t]) continue;
+            seen[t] = true; work[n++] = t;
+        }
+    }
+    free(seen); free(work);
+    return exit_found;
+}
+
 /* Depth-first reachability walk from bb0. Fills reachable[] with true for
  * every block reachable via BRANCH/GOTO/implicit-fallthrough edges. */
 static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
@@ -520,6 +810,10 @@ static void dfs_reachable(IRFunc *func, int bi, bool *reachable) {
     }
 }
 
+static int ir_int_cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
 bool ir_validate(IRFunc *func) {
     bool valid = true;
 
@@ -635,14 +929,30 @@ bool ir_validate(IRFunc *func) {
         }
     }
 
-    /* Check for duplicate local IDs */
-    for (int i = 0; i < func->local_count; i++) {
-        for (int j = i + 1; j < func->local_count; j++) {
-            if (func->locals[i].id == func->locals[j].id) {
-                fprintf(stderr, "IR VALIDATION ERROR: duplicate local id %d in '%.*s'\n",
-                        func->locals[i].id, (int)func->name_len, func->name);
-                valid = false;
+    /* Check for duplicate local IDs. BUG-1486: sorted, not all-pairs — the
+     * pairwise loop was the quadratic term that remained in a long function
+     * (2.0 s of 2.3 s at 40,000 statements). */
+    if (func->local_count > 1) {
+        int *ids = (int *)malloc((size_t)func->local_count * sizeof(int));
+        if (ids) {
+            for (int i = 0; i < func->local_count; i++) ids[i] = func->locals[i].id;
+            qsort(ids, (size_t)func->local_count, sizeof(int), ir_int_cmp);
+            for (int i = 1; i < func->local_count; i++) {
+                if (ids[i] == ids[i - 1] && (i < 2 || ids[i - 2] != ids[i])) {
+                    fprintf(stderr, "IR VALIDATION ERROR: duplicate local id %d in '%.*s'\n",
+                            ids[i], (int)func->name_len, func->name);
+                    valid = false;
+                }
             }
+            free(ids);
+        } else {
+            for (int i = 0; i < func->local_count; i++)
+                for (int j = i + 1; j < func->local_count; j++)
+                    if (func->locals[i].id == func->locals[j].id) {
+                        fprintf(stderr, "IR VALIDATION ERROR: duplicate local id %d in '%.*s'\n",
+                                func->locals[i].id, (int)func->name_len, func->name);
+                        valid = false;
+                    }
         }
     }
 
@@ -929,7 +1239,7 @@ bool ir_validate(IRFunc *func) {
                                 break;
                             }
                         }
-                        if (!reached) {
+                        if (!reached && cfg_reaches_exit(func, bi)) {
                             fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d IR_DEFER_PUSH "
                                     "has no CFG-reachable IR_DEFER_FIRE in '%.*s' "
                                     "(defer body would never execute)\n",
@@ -1142,4 +1452,22 @@ void ir_print(FILE *out, IRFunc *func) {
         }
         fprintf(out, "\n");
     }
+}
+
+/* BUG-1470: resolve a name as a local of `ud` (an IRFunc *) for the shared
+ * volatile predicate checker_expr_reads_volatile: -1 = not a local, else
+ * whether reading it is a volatile load. `volatile *T p` qualifies the
+ * POINTEE, so the pointer local itself is a plain load. */
+int ir_local_volatile_by_name(void *ud, const char *name, uint32_t len) {
+    IRFunc *func = (IRFunc *)ud;
+    if (!func) return -1;
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (l->name_len == len && memcmp(l->name, name, len) == 0) {
+            if (!l->is_volatile) return 0;
+            if (l->type && type_dispatch_kind(l->type) == TYPE_POINTER) return 0;
+            return 1;
+        }
+    }
+    return -1;
 }

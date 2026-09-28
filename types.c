@@ -3,12 +3,17 @@
 #include "src/safety/coerce_rules.h"  /* zer_coerce_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 /* ================================================================
  * Target configuration
  * ================================================================ */
 int zer_target_ptr_bits = 32; /* default 32-bit for embedded targets */
+/* BUG-1375: the widest SINGLE memory access the target performs (0 = the
+ * pointer width). AVR has 16-bit pointers and an 8-bit data path: a u16 load
+ * is two `lds`, so an ISR can land between them. */
+int zer_target_access_bits = 0;
 
 /* ================================================================
  * Global type singletons
@@ -286,6 +291,37 @@ int type_alignment_bytes(Type *a) {
     }
     default: return 0;
     }
+}
+
+/* BUG-1399: the alignment the ACCESSES through a pointer to `a` need — the
+ * largest natural alignment of any field reached, looking INSIDE packed
+ * structs. type_alignment_bytes answers 1 for a packed struct (its layout
+ * allows any address), which is right for the struct and wrong for an MMIO
+ * overlay: `packed struct R { u8 a; u32 b; }` at 0x40000001 puts the u32
+ * register at an odd address, and the @inttoptr alignment gate (constant AND
+ * the runtime trap for a variable address) read 1 and passed it. */
+int type_access_alignment(Type *a) {
+    if (!a) return 0;
+    a = type_unwrap_distinct(a);
+    TypeKind k = type_dispatch_kind(a);
+    if (k == TYPE_ARRAY) return type_access_alignment(a->array.inner);
+    if (k == TYPE_STRUCT) {
+        int m = a->struct_type.is_packed ? 1 : type_alignment_bytes(a);
+        for (uint32_t i = 0; i < a->struct_type.field_count; i++) {
+            int fa = type_access_alignment(a->struct_type.fields[i].type);
+            if (fa > m) m = fa;
+        }
+        return m;
+    }
+    if (k == TYPE_UNION) {
+        int m = type_alignment_bytes(a);
+        for (uint32_t i = 0; i < a->union_type.variant_count; i++) {
+            int fa = type_access_alignment(a->union_type.variants[i].type);
+            if (fa > m) m = fa;
+        }
+        return m;
+    }
+    return type_alignment_bytes(a);
 }
 
 bool type_is_optional(Type *a) {
@@ -700,7 +736,46 @@ bool scope_insert(Arena *a, Scope *s, Symbol *sym) {
     return true;
 }
 
+/* BUG-1487: see Scope.hidx. */
+#define SCOPE_HIDX_MIN 32
+static uint32_t scope_name_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+static void scope_hidx_put(Scope *s, Symbol *sym) {
+    uint32_t m = s->hidx_cap - 1;
+    for (uint32_t k = scope_name_hash(sym->name, sym->name_len) & m;; k = (k + 1) & m) {
+        Symbol *e = s->hidx[k];
+        if (!e) { s->hidx[k] = sym; return; }
+        if (e->name_len == sym->name_len && memcmp(e->name, sym->name, sym->name_len) == 0)
+            return;   /* first one wins */
+    }
+}
+/* Bring the index up to date; false = not indexed (small, or out of memory). */
+static bool scope_hidx_sync(Scope *s) {
+    if (s->symbol_count < SCOPE_HIDX_MIN) return false;
+    if (!s->hidx || (s->symbol_count + 1) * 2 > s->hidx_cap) {
+        uint32_t cap = s->hidx_cap ? s->hidx_cap : 64;
+        while ((s->symbol_count + 1) * 2 > cap) cap *= 2;
+        Symbol **nt = (Symbol **)calloc(cap, sizeof(Symbol *));
+        if (!nt) return false;
+        free(s->hidx);
+        s->hidx = nt; s->hidx_cap = cap; s->hidx_n = 0;
+    }
+    for (; s->hidx_n < s->symbol_count; s->hidx_n++) scope_hidx_put(s, s->symbols[s->hidx_n]);
+    return true;
+}
+
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len) {
+    if (scope_hidx_sync(s)) {
+        uint32_t m = s->hidx_cap - 1;
+        for (uint32_t k = scope_name_hash(name, name_len) & m;; k = (k + 1) & m) {
+            Symbol *e = s->hidx[k];
+            if (!e) return NULL;
+            if (e->name_len == name_len && memcmp(e->name, name, name_len) == 0) return e;
+        }
+    }
     for (uint32_t i = 0; i < s->symbol_count; i++) {
         if (s->symbols[i]->name_len == name_len &&
             memcmp(s->symbols[i]->name, name, name_len) == 0) {

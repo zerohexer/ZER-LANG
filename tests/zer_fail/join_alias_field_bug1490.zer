@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: the join of a struct FIELD carrier re-aimed on one branch.
+struct N { u32 v; }
+struct H { ?*N p; }
+u32 pick(bool c) {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    a.v = 1; b.v = 2;
+    H h;
+    h.p = a;
+    if (c) { h.p = b; }
+    if (h.p) |q| { free(q); }
+    *N r = alloc(N) orelse { free(b); return 1; };
+    r.v = 99;
+    u32 out = b.v;
+    free(b);
+    free(r);
+    return out;
+}
+u32 main() { return pick(true); }

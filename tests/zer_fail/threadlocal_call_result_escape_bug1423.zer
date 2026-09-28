@@ -1,0 +1,9 @@
+// expect-error: carries the address of threadlocal 'tl1'
+// BUG-1423: a call result that is a view of its argument (`pass(&tl1)`) carries
+// the threadlocal's address; the escape query now follows call results the way
+// the scoped-spawn borrow does.
+struct O { ?*u32 p; }
+threadlocal u32 tl1;
+*u32 pass(*u32 p) { return p; }
+void f(*O out) { out.p = pass(&tl1); }
+u32 main() { O o; ThreadHandle th = spawn f(&o); th.join(); return 0; }

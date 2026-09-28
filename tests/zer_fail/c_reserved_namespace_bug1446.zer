@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: is in C's reserved namespace
+// BUG-1446: `__LINE__` is a predefined macro; every `__x` / `_X` name is the
+// implementation's (C11 7.1.3).
+u32 main() {
+    u32 __LINE__ = 3;
+    return __LINE__ - 3;
+}

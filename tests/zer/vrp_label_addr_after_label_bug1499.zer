@@ -1,0 +1,17 @@
+// BUG-1499: a backward goto whose pointer is aimed at `i` only AFTER the label.
+// `*p = 4` on the second pass writes i, so arr[i] must be guarded. The guard
+// returns 0 early; a compiler that proves arr[i] runs the OOB store and exits 42.
+u32[4] arr;
+u32[64] pad;
+u32 g;
+u32 main() {
+    u32 i = 1;
+    u32 k = 0;
+    *u32 p = &g;
+top:
+    k += 1;
+    if (i < 4) { *p = 4; arr[i] = 7; if (k == 2) { return 42; } }
+    p = &i;
+    if (k < 2) { goto top; }
+    return 0;
+}

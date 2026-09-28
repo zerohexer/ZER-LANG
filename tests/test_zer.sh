@@ -30,6 +30,18 @@ FAIL=0
 SKIP=0
 TOTAL=0
 
+# A test file carrying a merge-conflict marker parses as garbage, so a NEGATIVE
+# one "passes" on the parse error whatever the rule under test does (measured
+# 2026-09-25: tests/zer_fail/compound_field_maybe_freed.zer had carried one
+# since BUG-941 — a vacuous test). Refuse the whole run instead.
+CONFLICTED=$(grep -lE '^(<<<<<<< |>>>>>>> )' tests/zer/*.zer tests/zer_fail/*.zer \
+             tests/zer_trap/*.zer tests/zer_gaps/*.zer tests/zer_proof/*.zer 2>/dev/null)
+if [ -n "$CONFLICTED" ]; then
+    echo "FAIL: merge-conflict markers in test files:"
+    echo "$CONFLICTED"
+    exit 1
+fi
+
 # Tests with known pre-existing failures, documented in docs/limitations.md.
 # Empty — BUG-590 closed the shadowing case, everything in tests/zer/
 # compiles + runs + exits 0.

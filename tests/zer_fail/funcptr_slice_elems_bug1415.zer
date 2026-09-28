@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1415: slice elements handed to an INDIRECT call may be freed by it
+struct T { u32 v; }
+void drop([*]?*T s) { if (s[0]) |p| { free(p); } }
+void nop([*]?*T s) { }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[1] arr;
+    arr[0] = a;
+    *([*]?*T) fp = nop;
+    u32 c = 1;
+    if (c == 1) { fp = drop; }
+    fp(arr[0..]);
+    *T b = alloc(T) orelse { return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    return r;
+}

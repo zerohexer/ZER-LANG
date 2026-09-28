@@ -1,0 +1,10 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-1425: spawn reached from @critical through a funcptr FIELD of a global.
+void w() { }
+void st() { spawn w(); }
+struct O { *() f; }
+O o = { .f = st };
+u32 main() {
+    @critical { o.f(); }
+    return 0;
+}

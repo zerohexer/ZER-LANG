@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot return pointer to local 'v'
+// BUG-1355: |*v| of a call result points at a frame temporary.
+struct W { u32[4] a; }
+u32[4] g1;
+?W mkp(u32 v) { W w; w.a[0] = v; return w; }
+[*]u32 f() { if (mkp(7)) |*v| { return v.a[0..]; } return g1; }
+u32 clobber(u32 k) { u32[64] junk; for (u32 i = 0; i < 64; i += 1) { junk[i] = k; } return junk[5]; }
+u32 main() {
+    [*]u32 p = f();
+    clobber(99);
+    return p[0];
+}

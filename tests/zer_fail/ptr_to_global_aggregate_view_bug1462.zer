@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'gs.p' is freed
+// BUG-1462: a local pointer to a GLOBAL aggregate views the global's slots.
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+S gs;
+u32 main() {
+    *S c = &gs;
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    c.p = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (gs.p) |q| { r = q.v; }
+    gs.p = null;
+    free(b);
+    return r;
+}

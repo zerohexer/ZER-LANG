@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: cannot take an array parameter
+// BUG-1447: in a plain function `u32[4] a` is the caller's array; in an async
+// function the task COPIED it, so `y` below stayed zero — a silent wrong result.
+async void fill(u32[4] a) {
+    a[0] = 5;
+    yield;
+    a[1] = 6;
+}
+u32 main() {
+    u32[4] y;
+    _zer_async_fill t;
+    _zer_async_fill_init(&t, y);
+    while (_zer_async_fill_poll(&t) == 0) { }
+    if (y[0] != 5) { return 2; }
+    return 0;
+}

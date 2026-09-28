@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: carries a freed pointer
+struct Box { u32 v; }
+struct S { ?*Box b; }
+void set2(*S s, *Box b) { s.b = b; }
+void init(*S s, *Box b) { set2(s, b); }
+void poll(*S s) { if (s.b) |b| { b.v = 99; } }
+u32 main() {
+    *Box p = alloc(Box) orelse return;
+    S t;
+    init(&t, p);
+    free(p);
+    *Box q = alloc(Box) orelse return;
+    poll(&t);
+    u32 r = q.v;
+    free(q);
+    return r;
+}

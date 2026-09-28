@@ -1,0 +1,11 @@
+// expect-trap
+// expect-trap-msg: array index out of bounds
+// BUG-1313: the `return 5` sits in an orelse fallback that is itself an EXPRESSION
+// (a second orelse). The summary walker handed that fallback to the statement walk,
+// which ignored it, so f was summarised [0,3] and ga[f(g)] had no check (ga[5]).
+u32[4] ga;
+u32 g = 3;
+?u32 m() { return null; }
+?u32 m2() { return null; }
+u32 f(u32 x) { u32 y = m() orelse m2() orelse { return 5; }; return x % 4; }
+u32 main() { ga[f(g)] = 1; return 42; }

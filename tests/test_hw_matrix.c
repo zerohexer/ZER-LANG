@@ -271,7 +271,8 @@ static void gen(HWScenario s, char *buf, size_t n) {
  * ================================================================ */
 
 typedef enum { VSITE_SPAWN, VSITE_ISR, VSITE_COUNT } VSite;
-typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN, VSHAPE_COUNT } VShape;
+typedef enum { VSHAPE_WORD, VSHAPE_OVERWIDTH, VSHAPE_AGGREGATE, VSHAPE_OPTPTR, VSHAPE_OPTPTR_PLAIN,
+               VSHAPE_CONST, VSHAPE_CONST_AGG, VSHAPE_COUNT } VShape;
 
 static const char *vsite_name(VSite s) {
     switch (s) {
@@ -288,6 +289,8 @@ static const char *vshape_name(VShape s) {
     case VSHAPE_AGGREGATE: return "aggregate-struct";
     case VSHAPE_OPTPTR:    return "optional-pointer ?*volatile T";
     case VSHAPE_OPTPTR_PLAIN: return "optional-pointer ?*T (plain pointee)";
+    case VSHAPE_CONST:     return "const-scalar (read on both sides)";
+    case VSHAPE_CONST_AGG: return "const-aggregate (read on both sides)";
     case VSHAPE_COUNT: break;
     }
     return "?";
@@ -297,7 +300,11 @@ static const char *vshape_name(VShape s) {
  * BUG-1249: but the exemption covers the WORD, and the scans cannot tell a read
  * of the word from a dereference of it — so the pointer is exempt only when its
  * pointee is itself volatile (or a shared struct). A plain pointee is negative. */
-static int vshape_is_negative(VShape s) { return s != VSHAPE_WORD && s != VSHAPE_OPTPTR; }
+/* BUG-1369: a `const` global cannot change, so both sinks must accept it — the
+ * spawn scan always did, the ISR check refused it ("must be declared volatile"). */
+static int vshape_is_negative(VShape s) {
+    return s != VSHAPE_WORD && s != VSHAPE_OPTPTR && s != VSHAPE_CONST && s != VSHAPE_CONST_AGG;
+}
 static const char *vshape_flags(VShape s) {
     return s == VSHAPE_OVERWIDTH ? "--target-bits 32" : "";
 }
@@ -318,7 +325,8 @@ static const char *vshape_flags(VShape s) {
  * No `default:` in the switches, so adding an RFORM value fails the build until
  * both sinks are taught it.
  * ------------------------------------------------------------------------- */
-typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
+typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
+               RFORM_GPTR_COPY_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
                RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
@@ -354,6 +362,8 @@ static const char *rform_name(RForm f) {
     switch (f) {
     case RFORM_NAMED_COMPOUND:  return "named g+=1";
     case RFORM_WRITTEN_OUT:     return "written g=g+1";
+    case RFORM_GPTR_WRITTEN_OUT: return "written *gp=*gp+1";
+    case RFORM_GPTR_COPY_WRITTEN_OUT: return "written p=gp;*p=*p+1";
     case RFORM_LOCAL_ALIAS:     return "local *p+=1";
     case RFORM_PTR_PARAM:       return "param *p+=1";
     case RFORM_PTR_PARAM_2HOP:  return "param 2-hop";
@@ -393,6 +403,10 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     switch (f) {
     case RFORM_NAMED_COMPOUND: *helper = "";                                    *body = "g += 1;";        break;
     case RFORM_WRITTEN_OUT:    *helper = "";                                    *body = "g = g + 1;";     break;
+    /* BUG-1277: the written-out RMW THROUGH a global pointer — the write side
+     * resolved `*gp` to g, the read side matched g only by name. */
+    case RFORM_GPTR_WRITTEN_OUT: *helper = "volatile *u32 gp = &g;";           *body = "*gp = *gp + 1;"; break;
+    case RFORM_GPTR_COPY_WRITTEN_OUT: *helper = "volatile *u32 gp = &g;";      *body = "volatile *u32 p = gp; *p = *p + 1;"; break;
     case RFORM_LOCAL_ALIAS:    *helper = "";                                    *body = "volatile *u32 p = &g; *p += 1;"; break;
     case RFORM_PTR_PARAM:      *helper = "void bump(volatile *u32 p){ *p += 1; }"; *body = "bump(&g);";   break;
     case RFORM_PTR_PARAM_2HOP: *helper = "void inner(volatile *u32 p){ *p += 1; }\nvoid mid(volatile *u32 p){ inner(p); }";
@@ -510,6 +524,128 @@ static void gen_rmw(RSite site, RForm f, char *out, size_t n) {
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * MMIO REGISTER grid (BUG-1358 / BUG-1480 / BUG-1481) — the RMW rule for a
+ * memory-mapped register, which has no global name: every cell has an interrupt
+ * handler and main code each forming their OWN pointer to the peripheral. The
+ * question is the RMW grid's ("is this a non-atomic read-modify-write of state
+ * the other side also writes?"), asked of a BYTE SPAN of the constant address
+ * space rather than a Symbol, so the axis is HOW THE REGISTER IS DESIGNATED:
+ * a field of a register struct, an INDEX on a `*u32` (BUG-1480), a non-constant
+ * index, two different spellings of one address, a write through a helper's
+ * pointer PARAMETER (BUG-1481), one or two hops deep, a `&register` argument, a
+ * helper declared AFTER the handler that calls it. The boundary cells are
+ * distinct registers, both sides under @critical, plain stores, and a
+ * parameter whose name coincides with a handler local pointing elsewhere (it
+ * used to resolve to that local).
+ * ------------------------------------------------------------------------- */
+typedef enum { MREG_FIELD, MREG_CONST_INDEX, MREG_VAR_INDEX, MREG_ALIAS_SPELLING,
+               MREG_STRUCT_INDEX, MREG_WRITTEN_OUT, MREG_LOCAL_COPY,
+               MREG_PARAM, MREG_PARAM_2HOP, MREG_PARAM_NESTED, MREG_PARAM_AMP,
+               MREG_HELPER_AFTER,
+               MREG_OK_DIFF_FIELD, MREG_OK_DIFF_INDEX, MREG_OK_CRITICAL,
+               MREG_OK_PLAIN, MREG_OK_PARAM_OTHER_FIELD, MREG_OK_PARAM_NAME_SHADOW,
+               MREG_COUNT } MReg;
+static const char *mreg_name(MReg m) {
+    switch (m) {
+    case MREG_FIELD:               return "u.ctrl |= both";
+    case MREG_CONST_INDEX:         return "u[1] |= both";
+    case MREG_VAR_INDEX:           return "u[i] vs u[1]";
+    case MREG_ALIAS_SPELLING:      return "*v@+4 vs r.status";
+    case MREG_STRUCT_INDEX:        return "a[1].ctrl vs *b@+8";
+    case MREG_WRITTEN_OUT:         return "u.ctrl = u.ctrl | x";
+    case MREG_LOCAL_COPY:          return "c = a; c.ctrl |=";
+    case MREG_PARAM:               return "setb(p) p.ctrl |=";
+    case MREG_PARAM_2HOP:          return "mid(p) -> setb(p)";
+    case MREG_PARAM_NESTED:        return "isr -> h1 -> setb(q)";
+    case MREG_PARAM_AMP:           return "setw(&u.status)";
+    case MREG_HELPER_AFTER:        return "helper declared after";
+    case MREG_OK_DIFF_FIELD:       return "ok: ctrl vs status";
+    case MREG_OK_DIFF_INDEX:       return "ok: u[1] vs u[2]";
+    case MREG_OK_CRITICAL:         return "ok: @critical both";
+    case MREG_OK_PLAIN:            return "ok: plain stores";
+    case MREG_OK_PARAM_OTHER_FIELD:return "ok: helper ctrl, isr status";
+    case MREG_OK_PARAM_NAME_SHADOW:return "ok: param named like isr local";
+    case MREG_COUNT: break;
+    }
+    return "?";
+}
+static int mreg_negative(MReg m) {
+    switch (m) {
+    case MREG_FIELD: case MREG_CONST_INDEX: case MREG_VAR_INDEX: case MREG_ALIAS_SPELLING:
+    case MREG_STRUCT_INDEX: case MREG_WRITTEN_OUT: case MREG_LOCAL_COPY:
+    case MREG_PARAM: case MREG_PARAM_2HOP: case MREG_PARAM_NESTED: case MREG_PARAM_AMP:
+    case MREG_HELPER_AFTER:
+        return 1;
+    case MREG_OK_DIFF_FIELD: case MREG_OK_DIFF_INDEX: case MREG_OK_CRITICAL:
+    case MREG_OK_PLAIN: case MREG_OK_PARAM_OTHER_FIELD: case MREG_OK_PARAM_NAME_SHADOW:
+    case MREG_COUNT:
+        return 0;
+    }
+    return 0;
+}
+static const char *mreg_body(MReg m) {
+#define MR_ISR(b) "interrupt USART1 { " b " }\n"
+#define MR_MAIN(b) "u32 main() { " b " return 0; }\n"
+#define MR_R(n, a) "volatile *Regs " n " = @inttoptr(*Regs, " a ");"
+#define MR_W(n, a) "volatile *u32 " n " = @inttoptr(*u32, " a ");"
+    switch (m) {
+    case MREG_FIELD:
+        return MR_ISR(MR_R("u", "0x40000000") " u.ctrl |= 1;") MR_MAIN(MR_R("u", "0x40000000") " u.ctrl |= 2;");
+    case MREG_CONST_INDEX:
+        return MR_ISR(MR_W("u", "0x40000000") " u[1] |= 1;") MR_MAIN(MR_W("u", "0x40000000") " u[1] |= 2;");
+    case MREG_VAR_INDEX:
+        return "volatile u32 k;\n"
+               MR_ISR(MR_W("u", "0x40000000") " u32 i = k & 3; u[i] |= 1;") MR_MAIN(MR_W("u", "0x40000000") " u[1] |= 2;");
+    case MREG_ALIAS_SPELLING:
+        return MR_ISR(MR_W("v", "0x40000004") " *v |= 1;") MR_MAIN(MR_R("r", "0x40000000") " r.status |= 2;");
+    case MREG_STRUCT_INDEX:
+        return MR_ISR(MR_R("a", "0x40000000") " a[1].ctrl |= 1;") MR_MAIN(MR_W("b", "0x40000008") " *b |= 2;");
+    case MREG_WRITTEN_OUT:
+        return MR_ISR(MR_R("u", "0x40000000") " u.ctrl = u.ctrl | 1;") MR_MAIN(MR_R("u", "0x40000000") " u.ctrl = u.ctrl | 2;");
+    case MREG_LOCAL_COPY:
+        return MR_ISR(MR_R("a", "0x40000000") " volatile *Regs c = a; c.ctrl |= 1;")
+               MR_MAIN(MR_R("b", "0x40000000") " volatile *Regs d = b; d.ctrl |= 2;");
+    case MREG_PARAM:
+        return "void setb(volatile *Regs p) { p.ctrl |= 2; }\n"
+               MR_ISR(MR_R("a", "0x40000000") " setb(a);") MR_MAIN(MR_R("b", "0x40000000") " setb(b);");
+    case MREG_PARAM_2HOP:
+        return "void setb(volatile *Regs p) { p.ctrl |= 2; }\nvoid mid(volatile *Regs m) { setb(m); }\n"
+               MR_ISR(MR_R("a", "0x40000000") " mid(a);") MR_MAIN(MR_R("b", "0x40000000") " mid(b);");
+    case MREG_PARAM_NESTED:
+        return "void setb(volatile *Regs p) { p.ctrl |= 2; }\n"
+               "void h1() { " MR_R("q", "0x40000000") " setb(q); }\n"
+               MR_ISR("h1();") MR_MAIN(MR_R("b", "0x40000000") " setb(b);");
+    case MREG_PARAM_AMP:
+        return "void setw(volatile *u32 p) { *p |= 1; }\n"
+               MR_ISR(MR_R("u", "0x40000000") " setw(&u.status);") MR_MAIN(MR_R("u", "0x40000000") " u.status |= 2;");
+    case MREG_HELPER_AFTER:
+        return MR_ISR("set(1);") MR_MAIN("set(2);")
+               "void set(u32 bit) { " MR_R("u", "0x40000000") " u.ctrl |= bit; }\n";
+    case MREG_OK_DIFF_FIELD:
+        return MR_ISR(MR_R("u", "0x40000000") " u.ctrl |= 1;") MR_MAIN(MR_R("u", "0x40000000") " u.status |= 2;");
+    case MREG_OK_DIFF_INDEX:
+        return MR_ISR(MR_W("u", "0x40000000") " u[1] |= 1;") MR_MAIN(MR_W("u", "0x40000000") " u[2] |= 2;");
+    case MREG_OK_CRITICAL:
+        return MR_ISR(MR_W("u", "0x40000000") " @critical { u[1] |= 1; }") MR_MAIN(MR_W("u", "0x40000000") " @critical { u[1] |= 2; }");
+    case MREG_OK_PLAIN:
+        return MR_ISR(MR_R("u", "0x40000000") " u.ctrl = 1;") MR_MAIN(MR_R("u", "0x40000000") " u.ctrl = 2;");
+    case MREG_OK_PARAM_OTHER_FIELD:
+        return "void setb(volatile *Regs p) { p.ctrl |= 2; }\n"
+               MR_ISR(MR_R("a", "0x40000000") " a.status |= 1;") MR_MAIN(MR_R("b", "0x40000000") " setb(b);");
+    case MREG_OK_PARAM_NAME_SHADOW:
+        return "void setb(volatile *Regs u) { u.ctrl |= 2; }\n"
+               MR_ISR(MR_R("u", "0x40000000") " " MR_R("w", "0x40000100") " setb(w);")
+               MR_MAIN(MR_R("b", "0x40000000") " b.ctrl |= 1;");
+    case MREG_COUNT: break;
+    }
+#undef MR_ISR
+#undef MR_MAIN
+#undef MR_R
+#undef MR_W
+    return "";
+}
+
 static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     const char *decl;
     const char *wr;
@@ -520,6 +656,8 @@ static void gen_vol(VSite site, VShape shape, char *out, size_t n) {
     case VSHAPE_AGGREGATE: decl = "struct P{u32 a; u32 b;}\nvolatile P g;"; wr = "g.a = 1;"; rd = "u32 x = g.a;"; break;
     case VSHAPE_OPTPTR:    decl = "volatile ?volatile *u32 g = null;";    wr = "g = null;"; rd = "volatile ?volatile *u32 x = g;"; break;
     case VSHAPE_OPTPTR_PLAIN: decl = "volatile ?*u32 g = null;";          wr = "g = null;"; rd = "volatile ?*u32 x = g;"; break;
+    case VSHAPE_CONST:     decl = "const u32 g = 7;";                     wr = "u32 y = g;"; rd = "u32 x = g;"; break;
+    case VSHAPE_CONST_AGG: decl = "struct Q{u32 a; u32 b;}\nconst Q g = { .a = 1, .b = 2 };"; wr = "u32 y = g.b;"; rd = "u32 x = g.a;"; break;
     case VSHAPE_COUNT:     decl = ""; wr = ""; rd = ""; break;
     }
     if (site == VSITE_SPAWN) {
@@ -713,6 +851,24 @@ int main(void) {
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
+    }
+
+    /* MMIO REGISTER grid (BUG-1358 / BUG-1480 / BUG-1481) — compile-only
+     * (`-o .c`), so GCC's hosted refusal of an interrupt attribute cannot mask
+     * the checker's verdict. */
+    fprintf(stderr, "\n--- MMIO register RMW grid (how the register is designated) ---\n");
+    for (MReg mr = 0; mr < MREG_COUNT; mr++) {
+        valid_cells++;
+        char mbuf[1536], mnm[128];
+        snprintf(mnm, sizeof(mnm), "mmio-reg/%s", mreg_name(mr));
+        snprintf(mbuf, sizeof(mbuf),
+                 "mmio 0x40000000..0x4000FFFF;\nstruct Regs { u32 ctrl; u32 status; }\n%s",
+                 mreg_body(mr));
+        int neg = mreg_negative(mr);
+        int ok = run_vol(mnm, mbuf, "", neg);
+        fprintf(stderr, "  [%-32s][%s] %s\n", mreg_name(mr), neg ? "neg" : "pos",
+                ok ? "ok" : "*** FAIL ***");
+        if (!ok) grid_ok = 0;
     }
 
     /* BUG-1010 BOUNDARY — the cross-statement taint must fire ONLY when the value

@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: duplicate enum values are not allowed
+// BUG-1440: `stop` is implicitly 2, the same as `reset`; the exhaustive switch
+// dispatched Cmd.reset to the .stop arm (returned 20, not 30).
+enum Cmd { start = 1, stop, reset = 2 }
+u32 run(Cmd c) {
+    switch (c) {
+        .start => { return 10; }
+        .stop  => { return 20; }
+        .reset => { return 30; }
+    }
+}
+u32 main() {
+    if (run(Cmd.reset) != 30) { return 1; }
+    return 0;
+}

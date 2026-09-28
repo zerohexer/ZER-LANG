@@ -1,0 +1,21 @@
+// BUG-1325: regression (see BUGS-FIXED.md).
+// reference.md "Evaluation Order": operands and call arguments are evaluated LEFT TO RIGHT.
+// The var-decl form obeys it; the PLAIN-ASSIGNMENT form is emitted as one C expression
+// `x = (g + step())` / `x = pair(step(), step2())`, which C leaves unsequenced (GCC reads g after the call).
+// Expected exit 0; actual exit 1 (and 2 for the argument case).
+u32 g;
+u32 step() { g = g * 10 + 1; return g; }
+u32 step2() { g = g * 10 + 2; return g; }
+u32 pair(u32 a, u32 b) { return a * 1000 + b; }
+u32 main() {
+    g = 5;
+    u32 y = g + step();          // var-decl: 5 + 51 = 56  (correct)
+    g = 5;
+    u32 x = 0;
+    x = g + step();              // plain assign: GCC gives 51 + 51 = 102
+    if (x != y) { return 1; }
+    g = 0;
+    x = pair(step(), step2());   // must be 1*1000 + 12
+    if (x != 1012) { return 2; }
+    return 0;
+}

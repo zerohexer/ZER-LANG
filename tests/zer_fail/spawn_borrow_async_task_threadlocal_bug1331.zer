@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: reaches 'tl' (threadlocal)
+// BUG-1331: a task holding &tl cannot go to a scoped spawn
+threadlocal u32 tl;
+async void f(*u32 p) { yield; *p += 1; }
+void w(*_zer_async_f t) { _zer_async_f_poll(t); _zer_async_f_poll(t); }
+u32 main() { _zer_async_f t; _zer_async_f_init(&t, &tl); ThreadHandle th = spawn w(&t); th.join(); return 0; }

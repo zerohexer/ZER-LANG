@@ -1,0 +1,13 @@
+struct Box { u32 v; }
+?*Box gb;
+void release() { if (gb) |b| { free(b); } gb = null; }
+u32 f() {
+    *?*Box slot = &gb;
+    if (*slot) |b| { b.v = 99; u32 r = b.v; release(); return r; }
+    return 0;
+}
+u32 main() {
+    gb = alloc(Box);
+    if (f() != 99) { return 1; }
+    return 0;
+}

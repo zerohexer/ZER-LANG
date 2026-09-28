@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1416: a getter returning gar[i] (param index) returns a view of what gar holds
+struct T { u32 v; }
+?*T[2] gar;
+?*T get(u32 i) { return gar[i]; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    gar[0] = a;
+    if (get(0)) |q| { free(q); }
+    *T b = alloc(T) orelse { return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    gar[0] = null;
+    return r;
+}

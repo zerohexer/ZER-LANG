@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: accesses non-shared global 'g'
+u32 g = 0;
+void a() { @once { g += 1; } }
+void b() { @once { g += 1; } }
+u32 main() {
+    ThreadHandle t1 = spawn a();
+    ThreadHandle t2 = spawn b();
+    t1.join();
+    t2.join();
+    return g - 2;
+}

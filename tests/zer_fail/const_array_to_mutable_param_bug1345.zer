@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: cannot pass a const array to a mutable array parameter
+// BUG-1345: a const array handed to a writing T[N] parameter.
+const u32[4] K;
+void w(u32[4] a) { a[0] = 1; }
+u32 main() { w(K); return 0; }

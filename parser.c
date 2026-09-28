@@ -167,6 +167,25 @@ static bool is_func_ptr_start(Parser *p) {
     Token saved_prev = p->previous;
     advance(p); /* consume '(' */
     bool result = check(p, TOK_STAR);
+    /* BUG-1306: the whole declarator shape — `( * [name] [dims] ) (` — not just
+     * `( *`. A call whose first argument is a dereference, `add(*p);`, starts the
+     * same two tokens and was parsed as a funcptr declaration ("expected variable
+     * name"). */
+    if (result) {
+        advance(p);                                   /* '*' */
+        if (check(p, TOK_IDENT)) advance(p);
+        while (result && check(p, TOK_LBRACKET)) {    /* `(*ops[4])(…)` */
+            int depth = 0;
+            do {
+                if (check(p, TOK_LBRACKET)) depth++;
+                else if (check(p, TOK_RBRACKET)) depth--;
+                else if (check(p, TOK_EOF)) { result = false; break; }
+                advance(p);
+            } while (depth > 0);
+        }
+        if (result) result = check(p, TOK_RPAREN);
+        if (result) { advance(p); result = check(p, TOK_LPAREN); }
+    }
     *p->scanner = saved;
     p->current = saved_cur;
     p->previous = saved_prev;
@@ -267,6 +286,8 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
  * Produces same TYNODE_FUNC_PTR shape as 2A — downstream code
  * (checker, IR lowering, emitter, zercheck_ir) is operator-agnostic.
  * ---------------------------------------------------------------- */
+#define ZER_ELSE_IF_CHAIN_MAX 256
+
 /* Array suffix after a type: T[N] or T[N][M] (multi-dim: array of M elements of
  * T[N]). ONE helper for the three places a declaration's `[N]` can follow a type
  * (base type, `?T`, and the 2C funcptr `*(..) -> R`) — BUG-1030: the third of
@@ -276,11 +297,20 @@ static TypeNode *parse_func_ptr_after_ret(Parser *p, TypeNode *ret_type,
  * the declaration, not to the return type. Returns `base` unchanged otherwise. */
 static TypeNode *parse_array_suffix(Parser *p, TypeNode *base) {
     if (p->no_array_suffix != 0 || !match(p, TOK_LBRACKET)) return base;
+    int dims = 1;   /* BUG-1393: type resolution recurses once per dimension */
     TypeNode *arr = new_type_node(p, TYNODE_ARRAY);
     arr->array.elem = base;
     arr->array.size_expr = parse_expression(p);
     consume(p, TOK_RBRACKET, "expected ']' after array size");
     while (match(p, TOK_LBRACKET)) {
+        if (++dims > 64) {
+            /* report, then consume the remaining suffixes so the declaration
+             * still parses as one (a speculative parse must reach the name) */
+            if (dims == 65) error(p, "array type has more than 64 dimensions");
+            (void)parse_expression(p);
+            consume(p, TOK_RBRACKET, "expected ']' after array size");
+            continue;
+        }
         TypeNode *outer = new_type_node(p, TYNODE_ARRAY);
         outer->array.elem = arr;
         outer->array.size_expr = parse_expression(p);
@@ -1127,6 +1157,99 @@ static Node *parse_primary(Parser *p) {
     return new_node(p, NODE_NULL_LIT);
 }
 
+/* ---- BUG-1484: AST height bound ----
+ *
+ * The recursion guard (p->depth, limit 256) counts the PARSER's recursion, and a
+ * left-associative chain is parsed by a LOOP: `a + a + ... + a` (400,000 terms)
+ * nests the AST 400,000 deep while p->depth never passes 2, and so do the
+ * postfix chains `x.f.f.f`, `t[t[...]]`, `f()()()`. Every later walker —
+ * checker, zercheck_ir, ir_lower, emitter — recurses over that tree, so the
+ * checker's own "expression nesting too deep (limit 1000)" fired and the next
+ * walk segfaulted; on a 1 MB stack (a Windows main thread) 900 terms crashed in
+ * check_expr, below that limit. The PARSER is the one place that sees every
+ * expression before anything walks it, so the bound lives here and is the SAME
+ * bound the recursion guard enforces: p->depth (what encloses the node — block
+ * and expression nesting) plus the node's own subtree height may not exceed
+ * PARSE_NEST_LIMIT. Measured: a 256-deep expression checks and emits on a
+ * `ulimit -s 1024` stack with the -O2 compiler (the chain crashed at ~900). */
+#define PARSE_NEST_LIMIT 256
+static uint32_t pnode_height(Node *n);
+static uint32_t pnode_max(uint32_t a, uint32_t b) { return a > b ? a : b; }
+/* Height of a subtree, computed once and cached. Only descends nodes that were
+ * not stamped as they were built (literals, primaries, statement bodies of an
+ * orelse block), whose children were stamped by their own parse_precedence. */
+static uint32_t pnode_height(Node *n) {
+    if (!n) return 0;
+    if (n->parse_height) return n->parse_height;
+    uint32_t h = 0;
+    #define PH(x) do { h = pnode_max(h, pnode_height(x)); } while (0)
+    switch (n->kind) {
+    case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) PH(n->block.stmts[i]); break;
+    case NODE_IF: PH(n->if_stmt.cond); PH(n->if_stmt.then_body); PH(n->if_stmt.else_body); break;
+    case NODE_FOR: PH(n->for_stmt.init); PH(n->for_stmt.cond); PH(n->for_stmt.step); PH(n->for_stmt.body); break;
+    case NODE_WHILE: case NODE_DO_WHILE: PH(n->while_stmt.cond); PH(n->while_stmt.body); break;
+    case NODE_SWITCH:
+        PH(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) PH(n->switch_stmt.arms[i].body);
+        break;
+    case NODE_RETURN: PH(n->ret.expr); break;
+    case NODE_DEFER: PH(n->defer.body); break;
+    case NODE_EXPR_STMT: PH(n->expr_stmt.expr); break;
+    case NODE_VAR_DECL: case NODE_GLOBAL_VAR: PH(n->var_decl.init); break;
+    case NODE_CRITICAL: PH(n->critical.body); break;
+    case NODE_ONCE: PH(n->once.body); break;
+    case NODE_SPAWN: for (int i = 0; i < n->spawn_stmt.arg_count; i++) PH(n->spawn_stmt.args[i]); break;
+    case NODE_AWAIT: PH(n->await_stmt.cond); break;
+    case NODE_STATIC_ASSERT: PH(n->static_assert_stmt.cond); break;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) PH(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) PH(n->asm_stmt.outputs[i].expr);
+        break;
+    case NODE_BINARY: PH(n->binary.left); PH(n->binary.right); break;
+    case NODE_UNARY: PH(n->unary.operand); break;
+    case NODE_ASSIGN: PH(n->assign.target); PH(n->assign.value); break;
+    case NODE_CALL:
+        PH(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) PH(n->call.args[i]);
+        break;
+    case NODE_FIELD: PH(n->field.object); break;
+    case NODE_INDEX: PH(n->index_expr.object); PH(n->index_expr.index); break;
+    case NODE_SLICE: PH(n->slice.object); PH(n->slice.start); PH(n->slice.end); break;
+    case NODE_ORELSE: PH(n->orelse.expr); PH(n->orelse.fallback); break;
+    case NODE_INTRINSIC: for (int i = 0; i < n->intrinsic.arg_count; i++) PH(n->intrinsic.args[i]); break;
+    case NODE_TYPECAST: PH(n->typecast.expr); break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) PH(n->struct_init.fields[i].value);
+        break;
+    /* declarations never sit inside an expression; leaves have no children */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+    #undef PH
+    n->parse_height = h < UINT32_MAX ? h + 1 : h;
+    return n->parse_height;
+}
+/* Stamp a node the parser just built from `a` and `b` (either may be NULL).
+ * Returns false — after reporting once — when it would nest past the limit; the
+ * caller then keeps its previous subtree instead, so the tree never grows past
+ * the bound while the rest of the chain is still consumed. */
+static bool pnode_stamp(Parser *p, Node *n, uint32_t child_h) {
+    uint32_t h = child_h + 1;
+    if ((uint32_t)(p->depth > 0 ? p->depth : 0) + h > PARSE_NEST_LIMIT) {
+        error(p, "expression nesting too deep (limit 256) — a chain of operators, "
+                 "field accesses, indexes or calls nests as deeply as parentheses; "
+                 "split it with intermediate variables");
+        return false;
+    }
+    n->parse_height = h;
+    return true;
+}
+
 /* ---- Unary expressions ---- */
 
 static Node *parse_postfix(Parser *p, Node *left); /* forward decl */
@@ -1156,6 +1279,8 @@ static Node *parse_unary_inner(Parser *p) {
         Node *n = new_node(p, NODE_UNARY);
         n->unary.op = op;
         n->unary.operand = parse_unary(p);
+        if (!pnode_stamp(p, n, pnode_height(n->unary.operand)))   /* BUG-1484 */
+            return n->unary.operand;
         return n;
     }
     /* parse_primary then postfix (. [] () ) so that &x.field = &(x.field) */
@@ -1208,6 +1333,11 @@ static Node *parse_postfix(Parser *p, Node *left) {
                 n->call.args = (Node **)arena_alloc(p->arena, arg_count * sizeof(Node *));
                 memcpy(n->call.args, args, arg_count * sizeof(Node *));
             }
+            {   /* BUG-1484 */
+                uint32_t ch = pnode_height(left);
+                for (int ai = 0; ai < arg_count; ai++) ch = pnode_max(ch, pnode_height(args[ai]));
+                if (!pnode_stamp(p, n, ch)) continue;
+            }
             left = n;
             continue;
         }
@@ -1219,6 +1349,7 @@ static Node *parse_postfix(Parser *p, Node *left) {
             n->field.object = left;
             n->field.field_name = tok_text(&p->previous);
             n->field.field_name_len = tok_len(&p->previous);
+            if (!pnode_stamp(p, n, pnode_height(left))) continue;   /* BUG-1484 */
             left = n;
             continue;
         }
@@ -1234,6 +1365,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
                 n->slice.start = NULL;
                 n->slice.end = parse_expression(p);
                 consume(p, TOK_RBRACKET, "expected ']' after slice");
+                if (!pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                                 pnode_height(n->slice.end)))) continue;   /* BUG-1484 */
                 left = n;
                 continue;
             }
@@ -1249,6 +1382,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
                     n->slice.end = parse_expression(p);
                 }
                 consume(p, TOK_RBRACKET, "expected ']' after slice");
+                if (!pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_max(
+                        pnode_height(first), pnode_height(n->slice.end))))) continue;   /* BUG-1484 */
                 left = n;
                 continue;
             }
@@ -1258,6 +1393,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
             n->index_expr.object = left;
             n->index_expr.index = first;
             consume(p, TOK_RBRACKET, "expected ']' after index");
+            if (!pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_height(first))))
+                continue;   /* BUG-1484 */
             left = n;
             continue;
         }
@@ -1305,7 +1442,9 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
                 /* orelse value */
                 n->orelse.fallback = parse_precedence(p, PREC_ORELSE);
             }
-            left = n;
+            if (pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                            pnode_height(n->orelse.fallback))))   /* BUG-1484 */
+                left = n;
             left = parse_postfix(p, left);
             continue;
         }
@@ -1317,7 +1456,9 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
             n->assign.op = op;
             n->assign.target = left;
             n->assign.value = parse_precedence(p, PREC_ASSIGN);
-            left = n;
+            if (pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                            pnode_height(n->assign.value))))   /* BUG-1484 */
+                left = n;
             continue;
         }
 
@@ -1333,9 +1474,12 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
         n->binary.op = op;
         n->binary.left = left;
         n->binary.right = right;
-        left = n;
+        /* BUG-1484: the loop is how a left-associative chain nests — bound it */
+        if (pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_height(right))))
+            left = n;
     }
 
+    (void)pnode_height(left);   /* BUG-1484: stamp what this level returns */
     p->depth--;
     return left;
 }
@@ -1497,7 +1641,14 @@ static Node *parse_if_stmt(Parser *p) {
         if (check(p, TOK_IF)) {
             /* else if — parse as nested if */
             advance(p);
+            if (++p->else_if_links > ZER_ELSE_IF_CHAIN_MAX) {
+                error(p, "'else if' chain longer than 256 links — split it (a "
+                         "switch, a table, or a helper function per range)");
+                p->else_if_links--;
+                return n;
+            }
             n->if_stmt.else_body = parse_if_stmt(p);
+            p->else_if_links--;
         } else {
             n->if_stmt.else_body = parse_block(p);
         }
@@ -2277,12 +2428,30 @@ static Node *parse_statement(Parser *p) {
         const char *start = p->current.start;
         const char *src = start;
         int depth = 1;
+        /* BUG-1387: every step checks for the terminator BEFORE moving past it
+         * — a quote or a trailing backslash at end of file used to step over the
+         * NUL and read past the source buffer (ASan heap-buffer-overflow). */
         while (*src && depth > 0) {
             if (*src == '(') depth++;
             else if (*src == ')') { depth--; if (depth == 0) break; }
-            else if (*src == '"') { src++; while (*src && *src != '"') { if (*src == '\\') src++; src++; } }
-            else if (*src == '\'') { src++; while (*src && *src != '\'') { if (*src == '\\') src++; src++; } }
+            else if (*src == '"' || *src == '\'') {
+                char q = *src++;
+                while (*src && *src != q) {
+                    if (*src == '\\' && src[1]) src++;
+                    src++;
+                }
+                if (!*src) break;
+            }
             src++;
+        }
+        if (!*src) {
+            error_at(p, &p->current, "unterminated 'asm(' — no closing ')'");
+            p->scanner->pos = (size_t)(src - p->scanner->source);   /* at the NUL */
+            p->current = next_token(p->scanner);                     /* EOF */
+            Node *bad = new_node(p, NODE_ASM);
+            bad->asm_stmt.code = start;
+            bad->asm_stmt.code_len = 0;
+            return bad;
         }
         Node *n = new_node(p, NODE_ASM);
         n->asm_stmt.is_structured = 0;
@@ -2367,11 +2536,16 @@ static Node *parse_statement(Parser *p) {
                 /* IDENT ( — could be func ptr type, container type, or function call.
                  * Peek: ( * means function pointer declaration.
                  * ( TypeToken ) IDENT means container instantiation: Stack(u32) s; */
+                /* BUG-1306: the full declarator shape (is_func_ptr_start) — a bare
+                 * `( *` peek took the call `add(*p);` for a declaration. */
+                bool fp_decl = is_func_ptr_start(p);
                 Scanner saved2 = *p->scanner;
                 Token saved2_cur = p->current;
                 advance(p); /* consume ( */
-                if (check(p, TOK_STAR)) {
+                if (fp_decl) {
                     is_var = true; /* function pointer decl */
+                } else if (check(p, TOK_STAR)) {
+                    is_var = false;   /* a call whose argument is a dereference */
                 } else if (is_type_token(p->current.type)) {
                     /* Could be container: Stack(u32) varname
                      * Skip past type + ) and check if IDENT follows */
@@ -2410,15 +2584,9 @@ static Node *parse_statement(Parser *p) {
             TypeNode *try_type = parse_type(p);
             (void)try_type;
 
-            bool is_func_ptr = false;
-            if (!p->had_error && check(p, TOK_LPAREN)) {
-                Scanner saved2 = *p->scanner;
-                Token saved2_cur = p->current;
-                advance(p);
-                is_func_ptr = check(p, TOK_STAR);
-                *p->scanner = saved2;
-                p->current = saved2_cur;
-            }
+            /* BUG-1306: the one declarator-shape query (RF10), not a second
+             * `( *` peek — that accepted `add(*p);` as a declaration. */
+            bool is_func_ptr = !p->had_error && is_func_ptr_start(p);
             is_var = !p->had_error && (check(p, TOK_IDENT) || is_func_ptr);
 
             *p->scanner = saved_scanner;
@@ -2745,28 +2913,7 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
     return n;
 }
 
-static Node *parse_declaration(Parser *p) {
-    /* section("name") — attribute for next declaration */
-    const char *section_str = NULL;
-    size_t section_len = 0;
-    if (check(p, TOK_IDENT) && p->current.length == 7 &&
-        memcmp(p->current.start, "section", 7) == 0) {
-        advance(p); /* consume "section" */
-        consume(p, TOK_LPAREN, "expected '(' after 'section'");
-        consume(p, TOK_STRING, "expected string in section()");
-        section_str = p->previous.start + 1;
-        section_len = p->previous.length - 2;
-        consume(p, TOK_RPAREN, "expected ')' after section string");
-    }
-
-    /* naked — attribute for next function */
-    bool is_naked = false;
-    if (check(p, TOK_IDENT) && p->current.length == 5 &&
-        memcmp(p->current.start, "naked", 5) == 0) {
-        advance(p); /* consume "naked" */
-        is_naked = true;
-    }
-
+static Node *parse_declaration_rest(Parser *p) {
     /* static_assert at top level */
     if (match(p, TOK_STATIC_ASSERT)) {
         Node *n = new_node(p, NODE_STATIC_ASSERT);
@@ -3022,6 +3169,15 @@ static Node *parse_declaration(Parser *p) {
             consume(p, TOK_STRING, "expected string after 'as'");
             n->interrupt.as_name = p->previous.start + 1;
             n->interrupt.as_name_len = p->previous.length - 2;
+            /* BUG-1347: the name is emitted verbatim as the handler's C symbol */
+            bool ok = n->interrupt.as_name_len > 0;
+            for (size_t k = 0; ok && k < n->interrupt.as_name_len; k++) {
+                char ch = n->interrupt.as_name[k];
+                bool alpha = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_';
+                bool digit = ch >= '0' && ch <= '9';
+                if (!(alpha || (digit && k > 0))) ok = false;
+            }
+            if (!ok) error(p, "interrupt 'as' name must be a C identifier (the handler's symbol)");
         }
 
         n->interrupt.body = parse_block(p);
@@ -3146,23 +3302,62 @@ static Node *parse_declaration(Parser *p) {
     }
 
     /* function or global variable */
-    {
-        Node *n = parse_func_or_var(p, false);
-        /* apply section/naked attributes if present */
-        if (n && section_str) {
-            if (n->kind == NODE_FUNC_DECL) {
-                n->func_decl.section = section_str;
-                n->func_decl.section_len = section_len;
-            } else if (n->kind == NODE_GLOBAL_VAR) {
-                n->var_decl.section = section_str;
-                n->var_decl.section_len = section_len;
-            }
-        }
-        if (n && is_naked && n->kind == NODE_FUNC_DECL) {
-            n->func_decl.is_naked = true;
-        }
-        return n;
+    return parse_func_or_var(p, false);
+}
+
+/* BUG-1346: `section(...)` / `naked` are parsed HERE and applied to whatever
+ * declaration follows. They used to be applied only on the generic
+ * function-or-variable path at the end of the declaration parser, and every
+ * earlier `return` — `volatile`, `const`, `static`, `threadlocal`, `interrupt`,
+ * `async` — dropped them in silence: a DMA buffer `section(".dma") volatile
+ * u8[64] buf;` landed in default RAM, a `.noinit` flag was zeroed at every reset,
+ * a `.ramfunc` ISR ran from flash. A declaration that cannot carry the attribute
+ * is now an error instead of a no-op. */
+static Node *parse_declaration(Parser *p) {
+    /* section("name") — attribute for next declaration */
+    const char *section_str = NULL;
+    size_t section_len = 0;
+    if (check(p, TOK_IDENT) && p->current.length == 7 &&
+        memcmp(p->current.start, "section", 7) == 0) {
+        advance(p); /* consume "section" */
+        consume(p, TOK_LPAREN, "expected '(' after 'section'");
+        consume(p, TOK_STRING, "expected string in section()");
+        section_str = p->previous.start + 1;
+        section_len = p->previous.length - 2;
+        consume(p, TOK_RPAREN, "expected ')' after section string");
     }
+
+    /* naked — attribute for next function */
+    bool is_naked = false;
+    if (check(p, TOK_IDENT) && p->current.length == 5 &&
+        memcmp(p->current.start, "naked", 5) == 0) {
+        advance(p); /* consume "naked" */
+        is_naked = true;
+    }
+
+    Node *n = parse_declaration_rest(p);
+    if (!n) return n;
+    if (section_str) {
+        if (n->kind == NODE_FUNC_DECL) {
+            n->func_decl.section = section_str;
+            n->func_decl.section_len = section_len;
+        } else if (n->kind == NODE_GLOBAL_VAR) {
+            n->var_decl.section = section_str;
+            n->var_decl.section_len = section_len;
+        } else if (n->kind == NODE_INTERRUPT) {
+            n->interrupt.section = section_str;
+            n->interrupt.section_len = section_len;
+        } else {
+            error(p,
+                "section(...) applies to a function, a global variable or an "
+                "interrupt handler, not to this declaration");
+        }
+    }
+    if (is_naked) {
+        if (n->kind == NODE_FUNC_DECL) n->func_decl.is_naked = true;
+        else error(p, "'naked' applies only to a function");
+    }
+    return n;
 }
 
 /* ================================================================
@@ -3183,6 +3378,7 @@ void parser_init(Parser *p, Scanner *scanner, Arena *arena, const char *file_nam
      * suppresses EVERY array suffix — `u8[256] buf;` stops parsing as an array.
      * Same shape as the Checker.target_ptr_bits trap CLAUDE.md records. */
     p->no_array_suffix = 0;
+    p->else_if_links = 0;
     advance(p); /* prime the first token */
 }
 

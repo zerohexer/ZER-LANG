@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: type name 'FILE' is a type name of the C headers
+// BUG-1446: `struct FILE` collides with <stdio.h>'s FILE typedef.
+struct FILE { u32 fd; }
+u32 main() { FILE f; f.fd = 0; return f.fd; }

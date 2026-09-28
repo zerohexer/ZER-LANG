@@ -1,0 +1,15 @@
+// expect-error: call may observe dangling global 'g'
+// BUG-1371: the dangling-global call window is a CALL effect too — `r = rd();`
+// after `g = a; free(a);` compiled while `u32 r = rd();` was refused.
+struct T { u32 v; }
+?*T g;
+u32 rd() { if (g) |p| { return p.v; } return 0; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g = a;
+    free(a);
+    u32 r = 0;
+    r = rd();
+    g = null;
+    return r;
+}

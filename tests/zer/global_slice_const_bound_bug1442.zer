@@ -1,0 +1,13 @@
+// BUG-1442: a GLOBAL slice whose bound names a `const` (`GA[K..4]`) was emitted
+// with the runtime-checked statement expression, illegal at file scope.
+const u32 K = 2;
+u32[4] GA;
+[*]u32 X = GA[K..4];
+[*]u32 Y = GA[K..];
+u32 main() {
+    GA[3] = 7;
+    if (X.len != 2) { return 1; }
+    if (Y.len != 2) { return 2; }
+    if (X[1] != 7) { return 3; }
+    return 0;
+}

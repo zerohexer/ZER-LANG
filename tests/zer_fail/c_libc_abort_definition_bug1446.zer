@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: function name 'abort' is a C library function
+// BUG-1446: a DEFINITION named like a libc function the runtime calls silently
+// REPLACED it — every _zer_trap would have "aborted" into this empty body.
+void abort() { }
+u32 main() { return 0; }

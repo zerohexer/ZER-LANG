@@ -1,0 +1,71 @@
+// BUG-1490 boundary: a pointer whose allocation identity differs between the
+// predecessors of a join is now a MAY-alias of each (the multi-view set). The
+// free-then-realloc idioms must keep compiling: the allocation freed on one
+// branch is a STALE member of the join (its invalidity comes from a path on
+// which the pointer named something else), so it does not block a use.
+struct N { u32 v; }
+u32 one_branch(bool c) {
+    *N p = alloc(N) orelse { return 1; };
+    if (c) { free(p); p = alloc(N) orelse { return 1; }; }
+    p.v = 3;
+    u32 r = p.v;
+    free(p);
+    return r;
+}
+u32 both_branches(bool c) {
+    *N p = alloc(N) orelse { return 1; };
+    if (c) { free(p); p = alloc(N) orelse { return 1; }; } else { p.v = 1; }
+    p.v = 3;
+    u32 r = p.v;
+    free(p);
+    return r;
+}
+u32 twice(bool c, bool d) {
+    *N p = alloc(N) orelse { return 1; };
+    if (c) { free(p); p = alloc(N) orelse { return 1; }; }
+    if (d) { free(p); p = alloc(N) orelse { return 1; }; }
+    p.v = 3;
+    u32 r = p.v;
+    free(p);
+    return r;
+}
+u32 in_loop(u32 n) {
+    *N p = alloc(N) orelse { return 1; };
+    for (u32 i = 0; i < n; i += 1) {
+        if (i == 2) { free(p); p = alloc(N) orelse { return 1; }; }
+        p.v = i;
+    }
+    u32 r = p.v;
+    free(p);
+    return r;
+}
+u32 in_switch(u32 k) {
+    *N p = alloc(N) orelse { return 1; };
+    switch (k) {
+        0 => { free(p); p = alloc(N) orelse { return 1; }; }
+        1 => { free(p); p = alloc(N) orelse { return 1; }; }
+        default => { }
+    }
+    p.v = 3;
+    u32 r = p.v;
+    free(p);
+    return r;
+}
+u32 both_named(bool c) {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    *N p = a;
+    if (c) { p = b; }
+    p.v = 3;
+    u32 r = p.v;
+    free(a);
+    free(b);
+    return r;
+}
+u32 main() {
+    u32 t = one_branch(true) + one_branch(false) + both_branches(true) + both_branches(false);
+    t += twice(true, false) + twice(true, true) + in_switch(1) + in_switch(7);
+    t += both_named(true) + both_named(false);
+    t += in_loop(4);
+    return t - 33;
+}

@@ -1,0 +1,13 @@
+// BUG-1450: module b's same-named functions — every call and spawn below must
+// reach THESE, not module a's (which registered the raw names first).
+shared struct M1450CB { u32 v; }
+M1450CB m1450_cb;
+u32 helper(u32 x) { return x * 100; }
+static u32 shelp(u32 x) { return x * 3; }
+void work(u32 x) { m1450_cb.v = x; }
+u32 m1450_fb() {
+    ThreadHandle th = spawn work(7);
+    th.join();
+    if (m1450_cb.v != 7) { return 100; }
+    return helper(2) + shelp(2);
+}

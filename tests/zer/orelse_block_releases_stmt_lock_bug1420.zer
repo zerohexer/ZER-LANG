@@ -1,0 +1,67 @@
+// BUG-1420: an orelse BLOCK fallback runs with the enclosing statement's
+// shared-lock group RELEASED. Pre-fix the lowering held the group across the
+// block while the checker treated the block's statements as their own lock
+// scopes, so every function below hung (ABBA deadlock, rwlock read->write
+// self-deadlock, a leaked group member, a leaked lock on the return path).
+shared struct A { u32 v; }
+shared struct B { u32 y; }
+shared(rw) struct Q { u32 a; u32 n; }
+shared(rw) struct R { u32 b; }
+A a; B b; Q q; R r;
+?u32 none(u32 x) { return null; }
+?u32 none2(u32 x, u32 y) { return null; }
+?void fails(u32 x) { return null; }
+
+// ABBA: this thread holds A then locks B inside the block; main does B then A.
+void t1() {
+    for (u32 i = 0; i < 100000; i += 1) {
+        u32 x = none(a.v) orelse { b.y = 5; continue; };
+    }
+}
+// rwlock read held by the statement, write taken by the block: var-decl form.
+u32 rw_decl() {
+    u32 x = none(q.a + 1) orelse { q.n = 5; return 7; };
+    return x;
+}
+// the same through an ASSIGN statement.
+u32 rw_assign() {
+    u32 x = 0;
+    x = none(q.a + 1) orelse { q.n += 1; return 7; };
+    return x;
+}
+// the same inside an IF CONDITION (the cond lock).
+u32 rw_cond() {
+    if ((none(q.a + 1) orelse { q.n += 1; return 7; }) > 3) { return 1; }
+    return 0;
+}
+// a two-member group: the early exit must release r too, not only q.
+u32 group_exit() {
+    u32 x = none2(q.a, r.b) orelse { return 3; };
+    return x;
+}
+// the group is held while a RETURN statement's value is lowered.
+u32 return_path() {
+    return none(q.a) orelse { return 3; };
+}
+// a fallback that FALLS THROUGH: the group is re-taken for the statement's end.
+void fall_through() {
+    fails(q.a) orelse { q.n += 1; };
+}
+u32 main() {
+    ThreadHandle th = spawn t1();
+    for (u32 i = 0; i < 100000; i += 1) {
+        u32 y = none(b.y) orelse { a.v = 5; continue; };
+    }
+    th.join();
+    if (rw_decl() != 7) { return 1; }
+    if (rw_assign() != 7) { return 2; }
+    if (rw_cond() != 7) { return 3; }
+    if (group_exit() != 3) { return 4; }
+    r.b = 9;
+    if (return_path() != 3) { return 5; }
+    q.n = 0;
+    fall_through();
+    fall_through();
+    if (q.n != 2) { return 6; }
+    return 0;
+}

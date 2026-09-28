@@ -1,0 +1,17 @@
+// expect-error: may @cond_wait
+// BUG-1476: the statement holds ga's (recursive) mutex and calls a function
+// that @cond_waits on ga — the wait releases one level, the signaller can
+// never take the lock, the program hangs.
+shared struct S { u32 v; u32 w; }
+S ga;
+u32 waiter() {
+    @cond_wait(ga, ga.v > 5);
+    return 1;
+}
+void sig() { ga.v = 10; @cond_signal(ga); }
+u32 main() {
+    ThreadHandle th = spawn sig();
+    ga.w = waiter();
+    th.join();
+    return 0;
+}

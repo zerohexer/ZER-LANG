@@ -1,0 +1,20 @@
+// BUG-1411 boundary: allocations made in a LOOP and stored at an untrackable
+// index, then drained through the array, stay accepted (the wildcard slot
+// exemption still applies to an allocation id minted on a CFG cycle).
+struct T { u32 v; }
+u32 idx(u32 x) { return x % 4; }
+u32 main() {
+    ?*T[4] arr;
+    for (u32 i = 0; i < 4; i += 1) {
+        *T t = alloc(T) orelse return;
+        t.v = i;
+        arr[idx(i)] = t;
+    }
+    u32 sum = 0;
+    for (u32 j = 0; j < 4; j += 1) {
+        if (arr[idx(j)]) |x| { sum += x.v; free(x); }
+        arr[idx(j)] = null;
+    }
+    if (sum != 6) { return 1; }
+    return 0;
+}

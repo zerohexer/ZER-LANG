@@ -1,0 +1,5 @@
+// BUG-1457: module d's `release` only reads — summarised FIRST, it used to be
+// the summary for c's `release` too, so c's use after free was accepted.
+u32 m1457_dcnt;
+void release([*]u32 s) { m1457_dcnt += s[0]; }
+u32 m1457_fd() { return m1457_dcnt; }

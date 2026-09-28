@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: is read-modify-written and is written from both interrupt
+// BUG-1481: the helper that RMWs the register is declared AFTER the interrupt
+// handler that calls it, so its body had not been type-checked when the handler's
+// walk descended into it — the typemap-based key saw no pointer type and no key.
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32 status; }
+interrupt USART1 { set(1); }
+u32 main() { set(2); return 0; }
+void set(u32 bit) { volatile *Regs u = @inttoptr(*Regs, 0x40000000); u.ctrl |= bit; }

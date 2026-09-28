@@ -1,0 +1,24 @@
+// BUG-1416 boundary: a getter that returns a GLOBAL element by a param index is a
+// view of what the global holds — reading through it, then freeing through the
+// global, is fine.
+struct T { u32 v; }
+struct H { ?*T p; }
+?*T[2] gar;
+H[2] ghs;
+?*T get(u32 i) { return gar[i]; }
+H geth(u32 i) { return ghs[i]; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 11;
+    gar[0] = a;
+    u32 r = 0;
+    if (get(0)) |q| { r = q.v; }
+    gar[0] = null;
+    ghs[0].p = a;
+    H h = geth(0);
+    if (h.p) |q| { r += q.v; }
+    ghs[0].p = null;
+    free(a);
+    if (r != 22) { return 1; }
+    return 0;
+}

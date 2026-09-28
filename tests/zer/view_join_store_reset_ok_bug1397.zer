@@ -1,0 +1,25 @@
+// BUG-1397: a pointer joined from two views (and a call that may return either
+// argument) stores into ONE OF the slots; resetting both before the free is clean.
+struct T { u32 v; }
+struct S { ?*T p; }
+*S pick(*S x, *S y, bool c) { if (c) { return x; } return y; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    S s; S t;
+    volatile bool c = true;
+    bool cc = c;
+    *S p = &t;
+    if (cc) { p = &s; }
+    p.p = a;
+    u32 r = 0;
+    if (s.p) |q| { r += q.v; }
+    if (t.p) |q| { r += 100; }
+    pick(&s, &t, cc).p = a;
+    s.p = null;
+    t.p = null;
+    free(a);
+    if (s.p) |q| { return 90; }
+    if (r != 7) { return 91; }
+    return 0;
+}

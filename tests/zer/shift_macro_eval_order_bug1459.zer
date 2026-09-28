@@ -1,0 +1,30 @@
+// BUG-1459c: the _zer_shl/_zer_shr macros evaluate the LEFT operand first and
+// exactly once, even when the count is out of range. Measured reachable through
+// a SPAWN ARGUMENT, which is emitted from the raw AST (emit_expr) and so hands
+// the macro the user's expressions: `spawn work(bump() << n)` with n >= 32 never
+// called bump() (the left operand was read only on the in-range arm), and
+// `bump() << order()` ran order() first. (A defer body in a function with a
+// label was measured too: its calls are already decomposed into temps.)
+shared struct C { u32 v; }
+C gc;
+u32 calls;
+u32 seq;
+u32 first;
+u32 bump() { calls += 1; seq += 1; if (first == 0) { first = seq; } return 1; }
+u32 order() { seq += 1; if (first == 0) { first = 100; } return 3; }
+void work(u32 x) { gc.v = x; }
+u32 main() {
+    u32 n = 99;
+    ThreadHandle th = spawn work(bump() << n);
+    th.join();
+    if (calls != 1) { return 1; }
+    if (gc.v != 0) { return 2; }
+    ThreadHandle th2 = spawn work(bump() << order());
+    th2.join();
+    if (first != 1) { return 3; }
+    if (gc.v != 8) { return 4; }
+    ThreadHandle th3 = spawn work(bump() >> n);
+    th3.join();
+    if (calls != 3) { return 5; }
+    return 0;
+}

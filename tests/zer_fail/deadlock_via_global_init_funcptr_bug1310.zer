@@ -1,0 +1,12 @@
+// expect-error: deadlock: single statement accesses both 'A'
+// BUG-1310: `a.x = get();` holds A's lock across the call, and get() calls a
+// callback bound in a GLOBAL initializer that writes shared B. The summary
+// treated `ops.f()` as a call to nothing; the binary hung at run time.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+void inner() { b.y = 1; }
+struct Ops { *() f; }
+const Ops ops = { .f = inner };
+u32 get() { ops.f(); return 1; }
+u32 main() { a.x = get(); return 0; }

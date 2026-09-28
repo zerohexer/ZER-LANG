@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: variable name 'memcpy' is a C library function
+// BUG-1446: a local named like a function the emitted BODY calls shadows it —
+// the array copy below is emitted as memcpy(...), calling a u32.
+u32 main() {
+    u32 memcpy = 1;
+    u32[4] a;
+    u32[4] b = a;
+    return b[0] + memcpy - 1;
+}

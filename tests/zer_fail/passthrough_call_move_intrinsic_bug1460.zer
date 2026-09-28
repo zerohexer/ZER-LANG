@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: use after move
+// BUG-1460: a move struct consumed inside an intrinsic argument, then again.
+move struct Tok { u32 k; }
+u32 consume(Tok t) { return t.k; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    u32 y = @popcount(consume(a));
+    u32 z = consume(a);
+    return y + z;
+}

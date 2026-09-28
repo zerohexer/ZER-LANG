@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: plain access to the whole of
+struct S { u32 n; u32 m; }
+S s;
+void w() { @atomic_add(&s.n, 1); }
+u32 peek() { S t = s; return t.m; }
+u32 main() {
+    ThreadHandle th = spawn w();
+    u32 r = peek();
+    th.join();
+    return r;
+}

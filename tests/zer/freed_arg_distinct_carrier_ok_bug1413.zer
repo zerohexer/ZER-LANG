@@ -1,0 +1,19 @@
+// BUG-1413 boundary: a callee that frees one argument while ANOTHER argument
+// carries a DIFFERENT allocation is fine.
+struct T { u32 v; }
+struct H { *T p; }
+u32 use(H h, *T q) {
+    free(q);
+    return h.p.v;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T b = alloc(T) orelse { free(a); return 1; };
+    a.v = 4;
+    H h;
+    h.p = a;
+    u32 r = use(h, b);
+    free(a);
+    if (r != 4) { return 1; }
+    return 0;
+}

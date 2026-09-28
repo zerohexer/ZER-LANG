@@ -1,0 +1,4 @@
+// expect-error: cannot contain itself by value
+// BUG-1389: after the report the checker kept walking the cycle (compute_type_size, SIGSEGV).
+struct A { A y; }
+u32 main(){ u32 p; *A q = @pun(*A, &p); return 0; }

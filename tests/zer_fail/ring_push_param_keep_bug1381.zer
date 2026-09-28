@@ -1,0 +1,10 @@
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1381: a Ring is global storage — a pointer param pushed into it is
+// retained, so the param is keep. `send(&x)` put a stack address in the channel
+// that `recv` dereferenced after f returned (ASan stack-use-after-return).
+struct M { *u32 p; }
+Ring(M, 4) r;
+void send(*u32 p) { M m = { .p = p }; r.push(m); }
+u32 recv() { if (r.pop()) |m| { return *m.p; } return 0; }
+void f() { u32 x = 5; send(&x); }
+u32 main() { f(); return recv(); }

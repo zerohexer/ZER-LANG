@@ -1,0 +1,9 @@
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1382: an Arena carries a pointer to its backing store. `ga =
+// Arena.over(b)` in a helper retained the caller's stack buffer in a global
+// arena (ASan stack-use-after-return in the arena's memset on the next alloc).
+struct M { u32 v; }
+Arena ga;
+void setup([*]u8 b) { ga = Arena.over(b); }
+void f() { u8[64] buf; setup(buf); }
+u32 main() { f(); *M m = ga.alloc(M) orelse return; m.v = 7; return m.v; }

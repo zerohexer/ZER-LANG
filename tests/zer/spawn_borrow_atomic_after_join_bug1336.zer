@@ -1,0 +1,10 @@
+// BUG-1336 boundary: an atomic on a lent global is fine once the thread is joined.
+u32 g;
+void w(*u32 p) { *p += 41; }
+u32 main() {
+    ThreadHandle th = spawn w(&g);
+    th.join();
+    @atomic_add(&g, 1);
+    if (@atomic_load(&g) != 42) { return 1; }
+    return 0;
+}

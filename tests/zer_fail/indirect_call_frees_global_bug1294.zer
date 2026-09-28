@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: use after free
+struct T { u32 v; }
+?*T g;
+void drop_g() { if (g) |p| { free(p); } g = null; }
+u32 main() {
+    *T a = alloc(T) orelse { return 1; };
+    a.v = 5;
+    g = a;
+    *() fp = drop_g;
+    fp();
+    return a.v;
+}

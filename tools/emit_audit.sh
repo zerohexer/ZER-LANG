@@ -109,6 +109,53 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1370 — a `volatile` POINTER global that some code writes is a volatile
+# WORD in C. The checker exempts it from the ISR / thread race rules as a
+# volatile single-word cell; the emitter spelled `volatile ?volatile *u32 g` as
+# `volatile volatile uint32_t* g` (the word plain), so `while (g == null) {}`
+# became `jmp .` at -O2. A never-written pointer (the MMIO base idiom) stays
+# plain — that half keeps the gate from passing on "volatile everything".
+cat > "$req_dir/volword.zer" <<'ZEOF'
+mmio 0x40000000..0x400000FF;
+volatile u32 cell;
+volatile ?volatile *u32 flagp = null;
+volatile *u32 reg = @inttoptr(*u32, 0x40000000);
+void pub() { flagp = &cell; }
+u32 main() { pub(); if (flagp == null) { return 1; } return 0; }
+ZEOF
+if "$ZERC" "$req_dir/volword.zer" -o "$req_dir/volword.c" >/dev/null 2>&1; then
+    if ! grep -qE '\* volatile flagp' "$req_dir/volword.c"; then
+        echo "MISSING EMISSION: the written volatile pointer global 'flagp' is not a volatile word"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+    if grep -qE '\* volatile reg' "$req_dir/volword.c"; then
+        echo "UNEXPECTED EMISSION: the never-written MMIO base 'reg' was made a volatile word"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the volatile-pointer-word sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1378 — an index that READS a volatile inside an expression (`g[hv + 1]`,
+# `g[vs.v % 16]`) must be evaluated ONCE: the check and the access on one load.
+# The comma form `(check((size_t)(hv + 1U), 8), g)[(hv + 1U)]` read it twice.
+cat > "$req_dir/volidx.zer" <<'ZEOF'
+u32[8] g;
+volatile u32 hv = 2;
+u32 main() { g[hv + 1] = 1; return 0; }
+ZEOF
+if "$ZERC" "$req_dir/volidx.zer" -o "$req_dir/volidx.c" >/dev/null 2>&1; then
+    n=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/volidx.c" | grep -o 'hv + 1U' | wc -l)
+    if [ "$n" -ne 1 ]; then
+        echo "MISSING EMISSION: a volatile read inside an index is evaluated $n times (want 1)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+else
+    echo "MISSING EMISSION: the volatile-index sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 # BUG-1019 — the null-function-pointer guard, at all THREE call-emission paths.
 #
 # Same silent-drop shape as the lock cap above, and worse to lose: a dropped
@@ -192,9 +239,119 @@ arm A-profile (bare)|-D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=65 -ffreestanding|cpsid
 riscv (bare)|-D__riscv=1 -ffreestanding|csrrci
 riscv (hosted)|-D__riscv=1|__atomic_thread_fence
 x86 (bare)|-ffreestanding|cli
+riscv (bare, newlib: hosted C, no OS)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__riscv=1|csrrci
+aarch64 (bare, newlib: hosted C, no OS)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65|daifset
+arm R-profile (bare, newlib)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=82|cpsid
 TARGETS
 else
     echo "MISSING EMISSION: the @critical cascade sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1275 — the per-statement shared lock inside a BARE switch arm.
+#
+# `0 => g.x = 5,` (an arm whose body is a statement, not a block) lowered the arm
+# without the statement wrapper that carries the lock, so the store to a shared
+# struct ran UNLOCKED — the same silent drop as the lock cap above, invisible to
+# a hosted test unless two threads happen to collide. The braced arm is the
+# control: both must lock.
+cat > "$req_dir/barearm.zer" <<'ZEOF'
+shared struct G { u32 x; }
+G g;
+void bare(u32 k)   { switch (k) { 0 => g.x = 5, default => { } } }
+void braced(u32 k) { switch (k) { 0 => { g.x = 5; } default => { } } }
+u32 main() { bare(0); braced(0); return 0; }
+ZEOF
+if "$ZERC" "$req_dir/barearm.zer" -o "$req_dir/barearm.c" >/dev/null 2>&1; then
+    for fn in bare braced; do
+        n=$(sed -n "/^void $fn(/,/^}/p" "$req_dir/barearm.c" | grep -c 'lock(&g\b' || true)
+        if [ "$n" -lt 1 ]; then
+            echo "MISSING EMISSION: shared store in a $fn switch arm is not locked"
+            REQ_FAIL=$((REQ_FAIL + 1))
+        fi
+    done
+else
+    echo "MISSING EMISSION: the bare-switch-arm lock sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1298 — a shared read in a DEFER-BODY condition, in a function WITH a label.
+#
+# Such a function kept its defer bodies on the raw-AST emitter (emit_defer_stmt),
+# which locked a shared access only in an expression STATEMENT, so the condition
+# `if (s.v > 3)` read the shared struct with no mutex held. The label-free function
+# is the control: both must lock.
+cat > "$req_dir/deferlabel.zer" <<'ZEOF'
+shared struct S { u32 v; }
+S s;
+u32 g = 0;
+void labelled(u32 k) {
+    defer { if (s.v > 3) { g += 1; } }
+    if (k > 5) { goto out; }
+    g += 100;
+out:
+    g += 1000;
+}
+void plain(u32 k) {
+    defer { if (s.v > 3) { g += 1; } }
+    if (k > 5) { return; }
+    g += 100;
+}
+u32 main() { labelled(1); plain(1); return 0; }
+ZEOF
+if "$ZERC" "$req_dir/deferlabel.zer" -o "$req_dir/deferlabel.c" >/dev/null 2>&1; then
+    for fn in labelled plain; do
+        n=$(sed -n "/^void $fn(/,/^}/p" "$req_dir/deferlabel.c" | grep -c 'lock(&s\b' || true)
+        if [ "$n" -lt 1 ]; then
+            echo "MISSING EMISSION: shared read in a defer-body condition of $fn is not locked"
+            REQ_FAIL=$((REQ_FAIL + 1))
+        fi
+    done
+else
+    echo "MISSING EMISSION: the labelled-defer lock sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1344 / BUG-1345 / BUG-1346 / BUG-1347 — bare-metal qualifiers and symbols
+# that were DROPPED from the emitted C with no diagnostic:
+#   - a whole-array copy to/from a volatile array was a plain memmove (the
+#     qualifier cast away; -O2 merged, deleted and hoisted the device accesses);
+#   - a `volatile u32[4]` PARAMETER lost its qualifier in the signature;
+#   - section(...) was dropped on a volatile global and on an interrupt;
+#   - `interrupt X as "SYM"` emitted X_IRQHandler, never SYM.
+cat > "$req_dir/bmq.zer" <<'ZEOF'
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32[4] fifo; }
+volatile u32[4] gv;
+section(".dma") volatile u8[64] dmabuf;
+u32 rd(volatile u32[4] a) { return a[0]; }
+volatile u32 tick;
+section(".ramfunc") interrupt TIM2 as "TIM2_Handler" { tick = 1; }
+u32 main() {
+    volatile *Regs r = @inttoptr(*Regs, 0x40000000);
+    u32[4] c;
+    c = r.fifo;
+    gv = c;
+    return rd(gv) + dmabuf[1];
+}
+ZEOF
+if "$ZERC" "$req_dir/bmq.zer" -o "$req_dir/bmq.c" >/dev/null 2>&1; then
+    body=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/bmq.c")
+    if printf '%s' "$body" | grep -q 'memmove'; then
+        echo "MISSING EMISSION: a volatile array copy became a plain memmove (BUG-1344)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+    grep -q 'uint32_t rd(volatile uint32_t a\[4\])' "$req_dir/bmq.c" || {
+        echo "MISSING EMISSION: a volatile array parameter lost its qualifier (BUG-1345)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+    grep -q 'section(".dma"))) volatile uint8_t dmabuf' "$req_dir/bmq.c" || {
+        echo "MISSING EMISSION: section() dropped on a volatile global (BUG-1346)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+    grep -q 'section(".ramfunc"))) TIM2_Handler(void)' "$req_dir/bmq.c" || {
+        echo "MISSING EMISSION: interrupt section()/as-name not emitted (BUG-1346/1347)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+else
+    echo "MISSING EMISSION: the bare-metal qualifier sample failed to compile"
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 

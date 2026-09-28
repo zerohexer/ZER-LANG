@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: interrupt 'as' name must be a C identifier
+// BUG-1347: the 'as' name is now emitted verbatim as the handler symbol.
+interrupt TIM2 as "TIM2 Handler" { }
+u32 main() { return 0; }

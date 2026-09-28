@@ -1,0 +1,14 @@
+// BUG-1356: calling a function pointer that an expression produces — `sel(1)(5)`,
+// `(maybe(0) orelse tri)(4)` — aborted the compiler with an INTERNAL ERROR.
+u32 dbl(u32 x) { return x * 2; }
+u32 tri(u32 x) { return x * 3; }
+u32 ncalls = 0;
+*(u32) -> u32 sel(u32 k) { ncalls += 1; if (k == 1) { return dbl; } return tri; }
+?*(u32) -> u32 maybe(u32 k) { if (k == 0) { return null; } return dbl; }
+u32 main() {
+    if (sel(1)(5) != 10) { return 1; }
+    if (sel(2)(5) != 15 || ncalls != 2) { return 2; }
+    if ((maybe(0) orelse tri)(4) != 12) { return 3; }
+    *(u32) -> u32 f = tri;
+    return 0;
+}

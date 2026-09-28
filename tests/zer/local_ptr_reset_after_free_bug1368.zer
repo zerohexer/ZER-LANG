@@ -1,0 +1,17 @@
+// BUG-1368: `loc = null;` ends a pointer local's alias of a freed allocation.
+// The reset was honoured for a field (`h.p = null;`, BUG-982) and a global,
+// but not for a bare local, so the read of the (null) local was refused.
+struct T { u32 v; }
+u32 main() {
+    ?*T loc = null;
+    *T a = alloc(T) orelse return;
+    a.v = 3;
+    loc = a;
+    u32 r = 0;
+    if (loc) |q| { r = q.v; }
+    free(a);
+    loc = null;
+    if (loc) |q| { r = q.v + 100; }
+    if (r != 3) { return 1; }
+    return 0;
+}

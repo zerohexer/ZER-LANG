@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: out of a shared struct
+// BUG-1299: a *opaque field of a shared struct is allowed (the C-handle idiom), but
+// casting it back to a ZER pointer gives each thread a reference that outlives the
+// lock: both threads below write obj.x unlocked. Accepted before the fix.
+struct T { u32 x; }
+shared struct S { *opaque handle; }
+S s;
+T obj;
+void w() {
+    *T t = @ptrcast(*T, s.handle);
+    t.x += 1;
+}
+u32 main() {
+    s.handle = @ptrcast(*opaque, &obj);
+    ThreadHandle a = spawn w();
+    ThreadHandle b = spawn w();
+    a.join(); b.join();
+    return 0;
+}

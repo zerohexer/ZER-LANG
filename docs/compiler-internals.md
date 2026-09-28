@@ -2784,7 +2784,7 @@ Used `make tags` (Universal Ctags) to query codebase structure instead of readin
 **For fresh sessions:** Run `make tags` first. Use `grep "function_name" tags` to find locations. Use `grep "pattern" file.c` to find specific code. Never read full files speculatively.
 
 ### Flag-Handler Matrix Audit (2026-04-14, automated)
-`bash tools/audit_matrix.sh checker.c` — cross-references control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
+(**Superseded 2026-09-25:** the tool is now BEHAVIOURAL — `bash tools/audit_matrix.sh ./zerc`, one compiled program per construct × context, in `make check`. The grep version below had drifted onto decoy `case` labels.) The original `bash tools/audit_matrix.sh checker.c` cross-referenced control-flow NODE_ handlers against context flags. Found 5 missing checks on first run:
 
 | Node | Missing Flag | Why it's a bug |
 |---|---|---|
@@ -6521,8 +6521,23 @@ on `LowerCtx`, and the single query `defers_stay_on_ast(ctx)` (= `label_count > 
 
 Consequences a session touching defer code must know:
 
-- **`emit_defer_stmt` and `zercheck_ir`'s AST defer analysis are now the LABEL path
-  only.** Both are gated on `IRInst.defer_fire_emit_ast`, which `make_defer_fire` — the
+- **UPDATE 2026-09-25 (BUG-1298): the template is lowered in EVERY function now.** A
+  labelled function still does not SPLICE it (the reasons below stand); instead the
+  push carries it (`IRInst.defer_tpl`, an `IRDeferTpl` of detached blocks) and the
+  emitter's `emit_defer_body` emits it INLINE at each AST-flagged fire and at every
+  C-level early exit (`emit_defers_from`), with fresh `_zer_bb<1<<24+n>` labels, through
+  `emit_ir_inst_guarded` — the one per-instruction emitter the regular and async block
+  loops also use. `emit_defer_stmt` is only the fallback for a body with no template.
+  The "never lower on the label path" rule below no longer applies: nothing REPLAYS the
+  AST for emission any more, and zercheck's AST scans look only for frees and uses,
+  which `pre_lower_orelse` leaves in place.
+- **`zercheck_ir`'s AST defer analysis is the LABEL path only.** At a return it applies
+  only the bodies of fires that REACH that return with no work after them
+  (`ir_fire_mark_returns`); a fire with work after (the eager fire at a `goto`) has its
+  uses AND frees applied in the forward pass. Every expression position gets both raw-AST
+  checks (`ir_defer_check_expr` = UAF + wrong-pool).
+- **`emit_defer_stmt` and `zercheck_ir`'s AST defer analysis were the LABEL path
+  only (superseded for emission by the update above).** Both are gated on `IRInst.defer_fire_emit_ast`, which `make_defer_fire` — the
   ONLY constructor of an `IR_DEFER_FIRE` — sets from that one query. Add a new fire site
   through that constructor or the two consumers will disagree with the lowerer, which is
   precisely how eleven goto/defer tests broke during this work.
@@ -13805,6 +13820,32 @@ verdict; `compile` cells still build a real binary.
    "conservative", ask which way the failure actually rounds.
 
 
+## zercheck_ir: call-result identity and the callee STORE summary (BUG-1360..1352)
+
+- **A call argument can itself be a call result** (`id(id(a))`, `unwrap(wrap(a))`,
+  `wrap(a).p`). The inner call is lowered into a temp, but every sink reads the ORIGINAL
+  AST. `ir_resolve_returned_arg` maps a call whose summary returns (a view of) one of its
+  arguments to that argument; `ir_view_arg_handle` (the view query), `ir_arg_handle` (the
+  aliased-argument query), the indirect-call barrier, the field-free widening and the
+  `x = wrap(a).p` field-read arm all resolve through it. The `_ex(…, collapse_struct)`
+  form lets the VIEW query see through a struct-valued call whose field views all name one
+  param. A new sink that keys an argument expression should resolve it the same way.
+- **`FuncSummary.param_store`** is "what this function STORES, of its params, where the
+  caller can see it" — ONE collector, `ir_ps_scan`: target = a param (path of `.f`,
+  `[n]`, `[*]`, `*x` = x) or a GLOBAL (dst -1, path = the full IR_GLOBAL_ROOT_ID key);
+  value = param / copy / `&`-reference into one / struct literal / aggregate local (what was
+  stored into it) / identity call / a callee's own entries composed through its args.
+  `ir_apply_param_stores` places a reference at the path and an aggregate argument's every
+  carried allocation at path + sub-path; `[*]` lands in the array wildcard as an aliasing
+  `[*@L]` entry (`ir_slot_demote_into`); a GLOBAL placement marks the argument escaped, as
+  the direct `g = p` does. Add a store spelling to the scan, never a second collector.
+- **An overwrite keeps the freed fact** (BUG-1364): `ir_report_overwrite` (the one "an
+  entry is about to be overwritten" query) calls `ir_slot_note_overwrite`, which sets
+  `freed_then_reset` / `maybe_freed_then_reset` — the flags the frees_param_field summary
+  reads. A new arm that overwrites a slot must go through one of the two.
+- **A store into an OWNED object is not an escape** (BUG-1365): `ir_target_root_escapes`
+  exempts a non-param pointer local holding a live, owned, non-arena allocation.
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow
@@ -13816,9 +13857,18 @@ UAF bugs (BUG-760..763) lives here; read this before editing.**
 **The finite state (the provenance "lattice", on `Symbol`):**
 - `is_local_derived` — points into THIS frame's stack (escapable = NO).
 - `is_arena_derived` / `is_from_arena` — points into a local arena (escapable = NO).
-- `is_nonkeep_derived` + `nonkeep_root_param` — a non-keep pointer/slice/opaque/
-  struct-carrying-pointer PARAM is a borrow rooted at param N; persisting it infers
-  `keep`. Set at param registration (~13632; **must include TYPE_SLICE**, BUG-761).
+- `is_nonkeep_derived` + `nonkeep_root_param` + **`nonkeep_root_mask`** — a non-keep
+  pointer/slice/opaque/struct-carrying-pointer PARAM is a borrow rooted at param N;
+  persisting it infers `keep`. Set at param registration (**must include TYPE_SLICE**,
+  BUG-761). Since BUG-1363 the SET of params is the fact (the mask): a join (`pick(p, q)`,
+  both orelse arms) carries every one. **Ask `keep_value_roots(c, value, 0)`** — the one
+  query for "which non-keep params may this VALUE carry?" (field/index/slice/deref,
+  launders, BOTH orelse arms, calls through the return summary — every argument for an
+  unresolvable callee — and struct literals). Every alias site writes it through
+  `taint_nonkeep_from_value` (var-decl init, assignment incl. a `*h =` target, if/switch
+  capture); the persist sink is ONE arm gated on the TARGET's type carrying a reference
+  (a struct literal has no type of its own); the spawn sink and the keep-call edges ask
+  the same query. Do not add an ident-only arm at a new sink — call the query.
 - (implicit) STATIC — global/static or a slice/pointer param/external pointee
   (escapable = YES, i.e. safe to return — it's the CALLER's memory).
 - `zer_sym_region_tag(is_local_derived, is_arena_derived)` → ZER_REGION_{STATIC,LOCAL,

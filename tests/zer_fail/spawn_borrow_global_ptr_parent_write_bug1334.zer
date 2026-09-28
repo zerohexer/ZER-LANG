@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot write through 'gp'
+// BUG-1334: the parent writes through gp while g is lent
+u32 g;
+*u32 gp = &g;
+void w(*u32 p) { *p += 1; }
+u32 main() { ThreadHandle t = spawn w(&g); *gp += 1; t.join(); return 0; }

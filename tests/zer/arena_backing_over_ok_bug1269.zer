@@ -1,0 +1,14 @@
+struct T { u32 v; }
+u8[64] gb;
+Arena ga;
+Arena mk() { return Arena.over(gb); }
+u32 main() {
+    u8[64] lb;
+    Arena la = Arena.over(lb);
+    *T t = la.alloc(T) orelse return;
+    t.v = 2;
+    ga = mk();
+    *T u = ga.alloc(T) orelse return;
+    u.v = 3;
+    return t.v + u.v - 5;
+}

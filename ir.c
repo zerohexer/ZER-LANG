@@ -168,7 +168,90 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len) {
  * orig_name). Exact-first returns %2 (only match by exact name "h").
  *
  * Used only by zercheck_ir walkers after lowering. */
+/* BUG-1394: the linear scan was called once per identifier by every
+ * zercheck_ir walker, so a function with N locals and N statements cost N^2
+ * (16,000 straight-line statements took 24 s). The index answers the same
+ * question: the LAST local whose exact name matches, else the LAST local whose
+ * orig_name matches. */
+struct IRNameIndex {
+    int cap;          /* power of two; slots per table */
+    int indexed;      /* locals[0 .. indexed) are in the tables */
+    int *exact;       /* local index + 1, 0 = empty */
+    int *orig;
+};
+
+static uint32_t ir_name_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+
+/* Insert local `li` keyed by (s, n) into `tab`; a later local overwrites an
+ * earlier one with the same spelling (the "last match" rule). */
+static void ir_name_tab_put(IRFunc *func, int *tab, int cap, int li,
+                            const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) { tab[k] = li + 1; return; }
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) { tab[k] = li + 1; return; }
+    }
+}
+
+static int ir_name_tab_get(IRFunc *func, int *tab, int cap,
+                           const char *s, uint32_t n, bool orig) {
+    uint32_t m = (uint32_t)cap - 1;
+    for (uint32_t k = ir_name_hash(s, n) & m;; k = (k + 1) & m) {
+        int e = tab[k];
+        if (e == 0) return -1;
+        IRLocal *o = &func->locals[e - 1];
+        const char *os = orig ? o->orig_name : o->name;
+        uint32_t on = orig ? o->orig_name_len : o->name_len;
+        if (on == n && os && memcmp(os, s, n) == 0) return o->id;
+    }
+}
+
+static void ir_name_index_add(IRFunc *func, struct IRNameIndex *ix, int li) {
+    IRLocal *l = &func->locals[li];
+    if (l->name) ir_name_tab_put(func, ix->exact, ix->cap, li, l->name, l->name_len, false);
+    if (l->orig_name) ir_name_tab_put(func, ix->orig, ix->cap, li, l->orig_name, l->orig_name_len, true);
+}
+
+static bool ir_name_index_sync(IRFunc *func) {
+    struct IRNameIndex *ix = func->name_index;
+    if (!ix) {
+        ix = (struct IRNameIndex *)calloc(1, sizeof(*ix));
+        if (!ix) return false;
+        func->name_index = ix;
+    }
+    if (ix->indexed == func->local_count && ix->cap) return true;
+    if (!ix->cap || func->local_count * 2 > ix->cap) {
+        int cap = ix->cap ? ix->cap : 64;
+        while (func->local_count * 2 > cap) cap *= 2;
+        int *ne = (int *)calloc((size_t)cap, sizeof(int));
+        int *no = (int *)calloc((size_t)cap, sizeof(int));
+        if (!ne || !no) { free(ne); free(no); return false; }
+        free(ix->exact); free(ix->orig);
+        ix->exact = ne; ix->orig = no; ix->cap = cap; ix->indexed = 0;
+    }
+    for (int i = ix->indexed; i < func->local_count; i++) ir_name_index_add(func, ix, i);
+    ix->indexed = func->local_count;
+    return true;
+}
+
 int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len) {
+    if (!name) return -1;
+    if (ir_name_index_sync(func)) {
+        int e = ir_name_tab_get(func, func->name_index->exact, func->name_index->cap,
+                                name, name_len, false);
+        if (e >= 0) return e;
+        return ir_name_tab_get(func, func->name_index->orig, func->name_index->cap,
+                               name, name_len, true);
+    }
+    /* allocation failed: the plain scan */
     int exact_match = -1;
     int orig_match = -1;
     for (int i = 0; i < func->local_count; i++) {
@@ -477,6 +560,51 @@ static bool cfg_reaches_fire(IRFunc *func, int from, const bool *has_fire_in_blo
             return cfg_reaches_fire(func, from + 1, has_fire_in_block, visited);
         return false;
     }
+}
+
+/* BUG-1390: can control reach a function EXIT (a RETURN, or falling off the
+ * last block) from block `from`? A defer registered on a path that never
+ * returns — `defer {…} for (;;) {…}` — has nothing to fire at, so a missing
+ * FIRE there is correct, not a lowering bug. Iterative (a worklist), so a long
+ * block chain cannot overflow the stack. */
+static bool cfg_reaches_exit(IRFunc *func, int from) {
+    if (from < 0 || from >= func->block_count) return false;
+    bool *seen = (bool *)calloc(func->block_count, sizeof(bool));
+    int *work = (int *)malloc(func->block_count * sizeof(int));
+    if (!seen || !work) { free(seen); free(work); return true; }  /* conservative */
+    int n = 0; bool exit_found = false;
+    work[n++] = from; seen[from] = true;
+    while (n > 0 && !exit_found) {
+        int b = work[--n];
+        IRBlock *block = &func->blocks[b];
+        int succ[2]; int ns = 0;
+        if (block->inst_count == 0) {
+            if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+        } else {
+            IRInst *last = &block->insts[block->inst_count - 1];
+            switch (last->op) {
+            case IR_RETURN: exit_found = true; break;
+            case IR_BRANCH: succ[ns++] = last->true_block; succ[ns++] = last->false_block; break;
+            case IR_GOTO: succ[ns++] = last->goto_block; break;
+            case IR_YIELD: case IR_AWAIT:
+                if (last->goto_block >= 0 && last->goto_block < func->block_count)
+                    succ[ns++] = last->goto_block;
+                else if (b + 1 < func->block_count) succ[ns++] = b + 1;
+                else exit_found = true;
+                break;
+            default:
+                if (b + 1 < func->block_count) succ[ns++] = b + 1; else exit_found = true;
+                break;
+            }
+        }
+        for (int k = 0; k < ns; k++) {
+            int t = succ[k];
+            if (t < 0 || t >= func->block_count || seen[t]) continue;
+            seen[t] = true; work[n++] = t;
+        }
+    }
+    free(seen); free(work);
+    return exit_found;
 }
 
 /* Depth-first reachability walk from bb0. Fills reachable[] with true for
@@ -929,7 +1057,7 @@ bool ir_validate(IRFunc *func) {
                                 break;
                             }
                         }
-                        if (!reached) {
+                        if (!reached && cfg_reaches_exit(func, bi)) {
                             fprintf(stderr, "IR VALIDATION ERROR: bb%d inst %d IR_DEFER_PUSH "
                                     "has no CFG-reachable IR_DEFER_FIRE in '%.*s' "
                                     "(defer body would never execute)\n",

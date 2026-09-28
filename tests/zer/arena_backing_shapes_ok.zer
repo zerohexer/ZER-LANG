@@ -10,6 +10,7 @@
 struct Block { u32 data; }
 
 u8[1024] global_mem;
+u8[512] more_mem;
 Arena g_late;           // declared here, backed inside main (the RTOS idiom)
 Arena g_method;         // same, but via the method form
 
@@ -31,7 +32,9 @@ u32 main() {
     //      returns an Arena by value, so `g_method.over(mem);` on its own is a
     //      no-op and is now a compile error (tests/zer_fail/arena_over_discarded.zer).
     //      The assigned form is the one that actually backs it. ----
-    u8[512] more_mem;
+    //      BUG-1382: the backing must outlive the GLOBAL arena — a local buffer
+    //      here was accepted only because an Arena did not count as carrying a
+    //      pointer (`g_method = Arena.over(local)` was always refused).
     g_method = g_method.over(more_mem);
     *Block b3 = g_method.alloc(Block) orelse { return 3; };
     b3.data = 33;

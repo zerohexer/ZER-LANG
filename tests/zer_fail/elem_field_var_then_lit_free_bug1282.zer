@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: variable-index free may double-free
+struct T { u32 v; }
+struct S { *T p; }
+void f(u32 i) {
+    if (i >= 4) { return; }
+    S[4] larr;
+    larr[0].p = alloc(T) orelse return;
+    free(larr[i].p);
+    free(larr[0].p);
+}
+u32 main() { f(0); return 0; }

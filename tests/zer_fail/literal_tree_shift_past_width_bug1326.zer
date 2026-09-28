@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot initialize 'x' of type 'i8'
+// BUG-1326 boundary: a shift count at or past the width is 0 in ZER but not in the
+// exact fold (-5 >> 10 is -1 exactly), so such a tree is not retyped.
+u32 main() { i8 x = -5 >> 10; if (x == 0) { return 0; } return 1; }

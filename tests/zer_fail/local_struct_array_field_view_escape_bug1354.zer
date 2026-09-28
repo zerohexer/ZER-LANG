@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: cannot return pointer to local 's'
+// BUG-1354: an array FIELD of a local struct bound to a slice local — the view
+// sites asked only whether the ROOT was an array.
+struct W { u32[4] a; }
+[*]u32 view(u32 k) { W w; w.a[0] = k; [*]u32 s = w.a; return s; }
+u32 main() { [*]u32 s = view(3); return s[0]; }

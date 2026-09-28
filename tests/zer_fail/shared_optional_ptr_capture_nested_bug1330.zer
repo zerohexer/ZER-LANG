@@ -1,0 +1,8 @@
+// EXPECTED: compile error
+// expect-error: cannot capture an optional inside a shared struct by pointer
+// BUG-1330: a nested field of the shared struct.
+struct P { u32 x; }
+struct Q { ?P o; }
+shared struct S { Q q; u32 n; }
+S g;
+u32 main() { if (g.q.o) |*v| { v.x += 1; } return 0; }

@@ -1,0 +1,19 @@
+// expect-error: call may observe dangling global 'slot'
+// BUG-1366: a global pointer that can only designate `slot` (initialised `&slot`,
+// never re-aimed) stores INTO slot. `*gpp = a; free(a); rd()` left slot dangling
+// across the call unobserved; rd() read the recycled object.
+struct T { u32 v; }
+?*T slot;
+*?*T gpp = &slot;
+u32 rd() { if (slot) |p| { return p.v; } return 0; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    *gpp = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = rd();
+    free(b);
+    return r;
+}

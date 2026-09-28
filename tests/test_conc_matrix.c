@@ -412,6 +412,9 @@ static const char *sink_name(CASink s) {
 typedef enum { RCH_DIRECT, RCH_REASSIGN, RCH_FIELD, RCH_ARRAY,
                RCH_FACTORY1, RCH_FACTORY2, RCH_FIELD_ARRAY, RCH_FWD_PARAM,
                RCH_FACTORY_SWITCH, RCH_FACTORY_DOWHILE, RCH_FACTORY_ORELSE,
+               RCH_GLOBAL_FP, RCH_GLOBAL_INIT, RCH_GLOBAL_INIT_COPY,
+               RCH_ARG_REASSIGN, RCH_ARG_FIELD, RCH_ARG_ARRAY, RCH_ARG_FWD_LOCAL,
+               RCH_ARG_CARRIER,
                RCH_COUNT } CAReach;
 typedef enum { RPAY_RACY, RPAY_TLS, RPAY_ATOMIC, RPAY_NONE, RPAY_COUNT } CARPay;
 
@@ -428,6 +431,14 @@ static const char *reach_name(CAReach r) {
     case RCH_FACTORY_SWITCH:  return "factory-switch-arm";
     case RCH_FACTORY_DOWHILE: return "factory-dowhile-body";
     case RCH_FACTORY_ORELSE:  return "factory-orelse-block";
+    case RCH_GLOBAL_FP:       return "const-global-funcptr";
+    case RCH_GLOBAL_INIT:     return "global-struct-init";
+    case RCH_GLOBAL_INIT_COPY: return "global-init-copy";
+    case RCH_ARG_REASSIGN:    return "spawn-arg-reassigned";
+    case RCH_ARG_FIELD:       return "spawn-arg-field";
+    case RCH_ARG_ARRAY:       return "spawn-arg-element";
+    case RCH_ARG_FWD_LOCAL:   return "fwd-local-through-helper";
+    case RCH_ARG_CARRIER:     return "fwd-struct-carrier";
     case RCH_COUNT:    break;
     }
     return "?";
@@ -516,7 +527,52 @@ static void gen_reach(CAReach r, CARPay p, char *out, size_t n) {
                 "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
                 "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return cb; }; return nop; }\n";
         wbody = "*() -> void fp = mk(0); fp();"; break;
+    /* BUG-1310: the binding lives in a GLOBAL's declaration initializer. The
+     * spawn scan exempted the read of a const global (a funcptr is not a data
+     * pointer) and followed nothing — measured: a TSan data race compiled. */
+    case RCH_GLOBAL_FP:
+        extra = "const *() -> void gfp = cb;\n";
+        wbody = "gfp();"; break;
+    case RCH_GLOBAL_INIT:
+        extra = "struct Ops { *() -> void h; }\nconst Ops gops = { .h = cb };\n";
+        wbody = "gops.h();"; break;
+    case RCH_GLOBAL_INIT_COPY:
+        extra = "struct Ops { *() -> void h; }\nconst Ops gops = { .h = cb };\n";
+        wbody = "Ops o = gops; o.h();"; break;
+    /* 13th..17th forms (BUG-1290, 2026-09-24): the callback is the spawn
+     * ARGUMENT (or reaches a spawn through a helper) in a shape no resolver
+     * followed. The rule falls back to every function of the funcptr's
+     * signature; the non-racy payloads pin that it does not over-reject when
+     * all of them are race-free. */
+    case RCH_ARG_REASSIGN:
+        extra = "void other() { }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "*() -> void fp = other; fp = cb; spawn inner(fp);"; break;
+    case RCH_ARG_FIELD:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Ops o; o.h = cb; spawn inner(o.h);"; break;
+    case RCH_ARG_ARRAY:
+        extra = "typedef *() -> void Cb;\nvoid inner(*() -> void f) { f(); }\n";
+        wbody = "Cb[2] t; t[0] = cb; t[1] = cb; spawn inner(t[0]);"; break;
+    case RCH_ARG_FWD_LOCAL:
+        extra = "void inner(*() -> void f) { f(); }\nvoid run(*() -> void f) { spawn inner(f); }\n";
+        wbody = "*() -> void fp = cb; run(fp);"; break;
+    case RCH_ARG_CARRIER:
+        extra = "struct Ops { *() -> void h; }\nvoid inner(Ops o) { o.h(); }\n"
+                "void run(Ops o) { spawn inner(o); }\n";
+        wbody = "Ops o; o.h = cb; run(o);"; break;
     default: break;
+    }
+    /* The argument forms spawn from MAIN: inside a spawned `worker` the outer
+     * scan finds `cb` by name in the worker's body and masks the cell (the first
+     * draft of these cells passed on the pre-BUG-1290 build for that reason). */
+    if (r >= RCH_ARG_REASSIGN) {
+        snprintf(out, n,
+            "%s\n"
+            "void cb() { %s }\n"
+            "%s"
+            "u32 main() { %s return 0; }\n",
+            decls, body, extra, wbody);
+        return;
     }
     snprintf(out, n,
         "%s\n"
@@ -641,6 +697,7 @@ static void gen_carrier(CACarrier c, CAPayload p, CASink k,
 typedef enum { IR_DIRECT, IR_GLOBAL_FP, IR_ARG, IR_STRUCT_INIT, IR_LOCAL_BIND,
                IR_FIELD_ASSIGN, IR_FIELD_ARRAY, IR_FACTORY1, IR_FACTORY2,
                IR_FACTORY_SWITCH, IR_FACTORY_DOWHILE, IR_FACTORY_ORELSE,
+               IR_GLOBAL_INIT, IR_GLOBAL_INIT_COPY,
                IR_COUNT } IsrReach;
 
 static const char *isr_name(IsrReach r) {
@@ -657,6 +714,8 @@ static const char *isr_name(IsrReach r) {
     case IR_FACTORY_SWITCH:  return "factory-switch-arm";
     case IR_FACTORY_DOWHILE: return "factory-dowhile-body";
     case IR_FACTORY_ORELSE:  return "factory-orelse-block";
+    case IR_GLOBAL_INIT:     return "global-struct-init";
+    case IR_GLOBAL_INIT_COPY: return "global-init-copy";
     case IR_COUNT:        break;
     }
     return "?";
@@ -697,6 +756,12 @@ static void gen_isr_reach(IsrReach r, char *out, size_t n) {
                                   "?u32 mb(u32 x) { if (x > 0) { return x; } return null; }\n"
                                   "*() -> void mk(u32 k) { u32 v = mb(k) orelse { return bump; }; return nop; }\n";
                           body = "*() -> void fp = mk(0); fp();"; break;
+    /* BUG-1310 — the ISR siblings of RCH_GLOBAL_INIT / _COPY. */
+    case IR_GLOBAL_INIT:  extra = "struct Ops { *() -> void cb; }\nconst Ops gops = { .cb = bump };\n";
+                          body = "gops.cb();"; break;
+    case IR_GLOBAL_INIT_COPY:
+                          extra = "struct Ops { *() -> void cb; }\nconst Ops gops = { .cb = bump };\n";
+                          body = "Ops o = gops; o.cb();"; break;
     default: break;
     }
     snprintf(out, n,

@@ -1,0 +1,14 @@
+struct T { u32 v; }
+struct G { *T p; }
+struct H { *T p; }
+H mk(G g) { H h; h.p = g.p; return h; }
+u32 main() {
+    *T a = alloc(T) orelse { return 1; };
+    a.v = 11;
+    G g;
+    g.p = a;
+    H h = mk(g);
+    u32 r = h.p.v;
+    free(a);
+    return r - 11;
+}

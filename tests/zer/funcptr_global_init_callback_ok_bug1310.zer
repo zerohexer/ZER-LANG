@@ -1,0 +1,19 @@
+// BUG-1310 boundary: callbacks bound in a global initializer that touch no
+// second shared type (and no racy global) still compile, from a locked
+// statement and from a spawned thread.
+shared struct A { u32 x; }
+A a;
+u32 seven() { return 7; }
+struct Ops { *() -> u32 f; }
+const Ops ops = { .f = seven };
+u32 get() { return ops.f(); }
+void w() { u32 v = ops.f(); if (v != 7) { return; } }
+u32 main() {
+    a.x = get();
+    ThreadHandle th = spawn w();
+    th.join();
+    Ops o = ops;
+    if (o.f() != 7) { return 1; }
+    if (a.x != 7) { return 2; }
+    return 0;
+}

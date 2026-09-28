@@ -1,0 +1,10 @@
+// expect-error: is not aligned to 4 bytes
+// BUG-1399: a packed struct's alignment is 1, but the u32 register it holds needs 4.
+mmio 0x40000000..0x400000FF;
+packed struct R2 { u32 a; u16 b; u8 c; u8 d; }
+u32 main() {
+    volatile *R2 r = @inttoptr(*R2, 0x40000001);
+    volatile u32 never = 0;
+    if (never == 42) { return r.a; }
+    return 0;
+}

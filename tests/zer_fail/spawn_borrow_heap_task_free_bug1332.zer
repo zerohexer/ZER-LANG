@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: which is borrowed by a scoped spawn
+// BUG-1332: free(p) while &task (init(&t, p)) is lent
+struct T { u32 v; }
+async void f(*T p) { yield; p.v += 1; }
+void w(*_zer_async_f t) { _zer_async_f_poll(t); _zer_async_f_poll(t); }
+u32 main() {
+    ?*T mp = alloc(T);
+    *T p = mp orelse return;
+    _zer_async_f t; _zer_async_f_init(&t, p);
+    ThreadHandle th = spawn w(&t);
+    free(p);
+    th.join();
+    return 0;
+}

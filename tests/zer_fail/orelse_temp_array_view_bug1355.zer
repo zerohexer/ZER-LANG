@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: cannot form a reference into a function's returned value
+// BUG-1355: an orelse reached through by-value steps is a temporary too.
+struct W { u32[4] a; }
+?W mkp(u32 v) { W w; w.a[3] = v; return w; }
+W dflt() { W w; return w; }
+[*]u32 view(u32 v) { return (mkp(v) orelse dflt()).a; }
+u32 deep(u32 k) { u32[64] junk; for (u32 i = 0; i < 64; i += 1) { junk[i] = k; } return junk[5]; }
+u32 main() {
+    [*]u32 s = view(7);
+    deep(99);
+    return s[3];
+}

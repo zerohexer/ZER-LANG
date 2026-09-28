@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: address of a whole object
+struct L { u32 x; }
+struct D { u32 id; L link; }
+struct H { *L q; }
+u32 main() {
+    L[2] ls;
+    H h = { .q = &ls[0] };
+    *D d = @container(*D, h.q, link);
+    return d.id;
+}

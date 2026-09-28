@@ -1,0 +1,18 @@
+// BUG-1359: a uN / iN value loaded out of foreign memory (an MMIO view of a byte
+// holding 0x7F) is re-wrapped to its width at the load.
+// a uN / iN value read out of MMIO memory is not narrowed to its width
+mmio 0x0..0xFFFFFFFFFFFFFFFF;
+u8[8] backing;
+struct R { u3 a; u8 pad; }
+u32 main() {
+    u32 r = 0;
+    backing[0] = 0x7F;
+    usize addr = @ptrtoint(&backing[0]);
+    volatile *R rr = @inttoptr(*R, addr);
+    u3 f = rr.a;                         // must be 7 (low 3 bits)
+    if (f != 7) { r |= 1; }
+    volatile *i5 reg = @inttoptr(*i5, addr);
+    i5 v = *reg;                         // 0x7F -> low 5 bits 11111 -> -1
+    if (v != -1) { r |= 2; }
+    return r;
+}

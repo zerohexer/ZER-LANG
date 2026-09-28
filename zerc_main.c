@@ -448,8 +448,11 @@ int main(int argc, char **argv) {
                         sz = atoi(val);
                     }
                     if (sz > 0) zer_target_ptr_bits = sz * 8;
-                    break;
+                    continue;
                 }
+                /* BUG-1375: an 8-bit data path (AVR) under a 16-bit pointer */
+                if (strstr(line, "#define __AVR__ ") || strstr(line, "#define __AVR_ARCH__ "))
+                    zer_target_access_bits = 8;
             }
             pclose(probe);
         }

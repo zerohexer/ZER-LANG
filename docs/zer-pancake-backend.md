@@ -260,6 +260,63 @@ Use (1) for ordinary data and (2) where layout is observable. MMIO always uses t
 5. `make CC=ccomp` for `zerc` itself (untested; ZER's own source must fit CompCert's C subset).
 6. Watch the upstream `ld32`/`st32` issue.
 
+## References (for a future paper's related work)
+
+From the CakeML publications page (numbering is that page's), grouped by what each supports here.
+
+**Primary: Pancake itself** (not on that page's list)
+
+- Johannes Åman Pohjola et al. *Pancake: Verified Systems Programming Made Sweeter.* PLOS 2023.
+  https://cakeml.org/plos23.pdf — the language, its verified compiler, the seL4 driver case study and
+  the performance numbers quoted in §7-§9.
+- *Verifying Device Drivers with Pancake.* arXiv 2025. https://arxiv.org/pdf/2501.08249
+
+**Precedent: other languages compiled through CakeML's verified backend** (the ZER → Pancake pattern;
+each proved its own front-end translation, so these are the models if the translator is ever proved)
+
+- [3] Nezamabadi, Myreen, Tan. *Verified VCG and verified compiler for Dafny.* CPP 2026.
+- [4] Lasnier, Yallop, Myreen. *Brack: A verified compiler for Scheme via CakeML.* CPP 2026.
+- [40] Hupel, Nipkow. *A verified compiler from Isabelle/HOL to CakeML.* ESOP 2018.
+- [20] Åman Pohjola, Gómez-Londoño, Shaker, Norrish. *Kalas: A verified, end-to-end compiler for a
+  choreographic language.* ITP 2022.
+
+**Claims made in this document**
+
+- [30] Tan, Myreen, Kumar, Fox, Owens, Norrish. *The verified CakeML compiler backend.* JFP 29, 2019.
+  Canonical backend reference; section 11, "Compiler Bootstrapping", is the in-logic bootstrap (§6).
+- [47] Same authors. *A new verified compiler backend for CakeML.* ICFP 2016 (conference version of [30]).
+- [45] Fox, Myreen, Tan, Kumar. *Verified compilation of CakeML to multiple machine-code targets.*
+  CPP 2017. The multi-ISA claim (§4).
+- [38] Kumar, Mullen, Tatlock, Myreen. *Software verification with ITPs should use binary code
+  extraction to reduce the TCB.* ITP 2018. Why in-logic compilation beats extraction + an OCaml
+  compiler (the `ccomp` comparison, §6).
+- [18] Kanabar, Fox, Myreen. *Taming an authoritative Armv8 ISA specification: L3 validation and
+  CakeML compiler verification.* ITP 2022. Reducing trust in the ISA model (§6).
+- [31] Lööw, Kumar, Tan, Myreen, Norrish, Abrahamsson, Fox. *Verified compilation on a verified
+  processor.* PLDI 2019. The chain extended to a verified CPU (Silver).
+- [25] Gómez-Londoño, Åman Pohjola, Syeda, Myreen, Tan. *Do you have space for dessert? A verified
+  space cost semantics for CakeML programs.* OOPSLA 2020. The out-of-memory caveat in correctness
+  theorems.
+- [21] Myreen. *A minimalistic verified bootstrapped compiler (proof pearl).* CPP 2021. Inspiration
+  for `zerc` compiling itself through the proved backend.
+- [19] Becker, Rabe, Darulova, Myreen, Tatlock, Kumar, Tan, Fox. *Verified compilation and
+  optimization of floating-point programs in CakeML.* ECOOP 2022. CakeML handles floats; Pancake does
+  not yet (the float gap in §7 / Next steps).
+- [17] Abrahamsson, Myreen, Kumar, Sewell. *Candle: A verified implementation of HOL Light.* ITP 2022;
+  [5] extended version, JAR 2025. The verified prover shipped in the release (trusting trust, §6).
+- [24] Myreen. *The CakeML project's quest for ever stronger correctness theorems.* ITP 2021. Overview.
+- [55] Kumar, Myreen, Norrish, Owens. *CakeML: A verified implementation of ML.* POPL 2014. The
+  project's canonical reference.
+
+**Related approaches (compared against in this document)**
+
+- Sewell, Myreen, Klein. *Translation validation for a verified OS kernel.* PLDI 2013 (seL4's GCC
+  output validation).
+- O'Connor et al. *COGENT: Certified Compilation for a Functional Systems Language.*
+  https://arxiv.org/pdf/1601.05520 (certifying compilation: a proof per program).
+- Leroy et al. CompCert (C → assembly, Coq); Monniaux, Boldo. *The Trusted Computing Base of the
+  CompCert Verified Compiler.* https://arxiv.org/pdf/2201.10280
+
 ## Sources
 
 - Pancake: Verified Systems Programming Made Sweeter (PLOS 2023): https://cakeml.org/plos23.pdf

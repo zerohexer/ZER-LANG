@@ -9386,7 +9386,13 @@ static void ir_carry_projection(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     Node *e = src_expr;
     if (e->kind == NODE_ORELSE) e = e->orelse.expr;
     e = ir_peel_launder(e);
-    if (!e || (e->kind != NODE_FIELD && e->kind != NODE_INDEX)) return;
+    /* BUG-1466: a WHOLE global aggregate (`S v = gs;`) carries its slot entries
+     * too — they live under (IR_GLOBAL_ROOT_ID, "gs.p"). Only field / element
+     * sources were carried, so `gs.p = a; free(a); S v = gs; v.p.v` read a
+     * recycled object (a local source takes ir_carry_compounds). */
+    bool whole_global = e && e->kind == NODE_IDENT &&
+                        ir_ident_is_unshadowed_global(zc, func, e);
+    if (!e || (e->kind != NODE_FIELD && e->kind != NODE_INDEX && !whole_global)) return;
     Type *vt = checker_get_type(zc->checker, e);
     Type *ve = vt ? type_unwrap_optional(vt) : NULL;
     TypeKind vk = ve ? type_dispatch_kind(ve) : TYPE_VOID;
@@ -9396,8 +9402,16 @@ static void ir_carry_projection(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     if (ir_should_track_move(vt)) return;
     if (dest_root < 0 && dest_root != IR_GLOBAL_ROOT_ID) return;
     int sroot = -1; const char *spath = NULL; uint32_t splen = 0;
-    bool keyed = ir_extract_compound_key(zc, func, ps, e, &sroot, &spath, &splen) == 0 &&
-                 splen > 0;
+    bool keyed;
+    if (whole_global) {
+        sroot = IR_GLOBAL_ROOT_ID;
+        spath = e->ident.name;
+        splen = (uint32_t)e->ident.name_len;
+        keyed = true;
+    } else {
+        keyed = ir_extract_compound_key(zc, func, ps, e, &sroot, &spath, &splen) == 0 &&
+                splen > 0;
+    }
     IRSlotRef r;
     bool elem = false;
     Node *ie = e;

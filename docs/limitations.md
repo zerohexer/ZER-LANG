@@ -32,10 +32,8 @@ repeated.
 
 ## OPEN — residuals of the 2026-09-28 passthrough / view round (BUG-1460..1465; measured)
 
-1. **Copying a whole GLOBAL aggregate into a local does not carry its slot entries**
-   (MEDIUM — accept-unsafe, pre-existing): `gs.p = a; free(a); S v = gs; v.p.v` is
-   accepted. The local sibling (BUG-1131 `ir_carry_projection`) exists; the global
-   source does not route through it.
+1. ~~Copying a whole GLOBAL aggregate into a local did not carry its slot entries~~ —
+   CLOSED (BUG-1466).
 2. A slice local with a VARIABLE index, or defined with a non-literal start, is keyed on
    the slice local rather than the array (a global slice variable too).
 3. A stable aim through a POINTER-typed root (`&hp.p`, `hp` a pointer) is not resolved.

@@ -1,0 +1,16 @@
+// BUG-1466 boundary: copying a global aggregate whose allocation is ALIVE, reading
+// through the copy, then freeing through the global, compiles and runs.
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+S gs;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    gs.p = a;
+    S v = gs;
+    u32 r = 0;
+    if (v.p) |q| { r = q.v; }
+    free(a);
+    gs.p = null;
+    return r - 5;
+}

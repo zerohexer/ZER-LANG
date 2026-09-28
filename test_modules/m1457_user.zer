@@ -1,0 +1,10 @@
+// BUG-1457: two modules' `release` are two functions. Keyed by NAME, one
+// module's summary answered for the other: with b imported first, a's
+// `release(s); s[0]` was reported as a use after free.
+import m1457_b;
+import m1457_a;
+u32 main() {
+    if (m1457_fa() != 10) { return 1; }
+    if (m1457_fb() != 2) { return 2; }
+    return 0;
+}

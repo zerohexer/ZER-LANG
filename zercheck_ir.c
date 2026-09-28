@@ -20,6 +20,43 @@
 #include <stdlib.h>
 #include <stdarg.h>
 
+/* ================================================================
+ * BUG-1457: THE summary lookup. A FuncSummary is keyed by its function's
+ * declaration node; a callee NAME is resolved to a declaration in the module
+ * of the function being analysed (checker_module_decl_lookup — the checker's
+ * BUG-1120 rule), never matched against summaries by name. Name-keyed, module
+ * b's `release` (which frees) and module a's `release` (which reads) shared one
+ * summary: b's `release(s); s[0] = 7;` was accepted and ran as a heap
+ * use-after-free, and with the imports reversed a's `release` was reported as
+ * freeing. A name that resolves to no user declaration (a bodyless extern, a
+ * builtin, anything the lookup cannot resolve) keeps the old name match.
+ * ================================================================ */
+static FuncSummary *ir_summary_of_decl(ZerCheck *zc, Node *decl) {
+    if (!decl) return NULL;
+    for (int si = 0; si < zc->summary_count; si++)
+        if (zc->summaries[si].func_decl == decl) return &zc->summaries[si];
+    return NULL;
+}
+
+static FuncSummary *ir_summary_for_name(ZerCheck *zc, const char *name, uint32_t len) {
+    if (!name || len == 0) return NULL;
+    Symbol *s = checker_module_decl_lookup(zc->checker, zc->cur_module,
+                                           zc->cur_module_len, name, len);
+    Node *d = s ? s->func_node : NULL;
+    /* only a declaration OF THIS NAME is an identity: an async `_poll`
+     * accessor carries its async function as func_node (BUG-1236), and is not
+     * that function */
+    if (d && d->kind == NODE_FUNC_DECL && (uint32_t)d->func_decl.name_len == len &&
+        memcmp(d->func_decl.name, name, len) == 0)
+        return ir_summary_of_decl(zc, d);
+    /* unresolved (no declaration of this name in scope): the old name match */
+    for (int si = 0; si < zc->summary_count; si++)
+        if (zc->summaries[si].func_name_len == len &&
+            memcmp(zc->summaries[si].func_name, name, len) == 0)
+            return &zc->summaries[si];
+    return NULL;
+}
+
 static int _ir_last_err_line = -1;
 static const char *_ir_last_err_file = NULL;
 
@@ -3110,10 +3147,7 @@ static int ir_view_set_of_value(ZerCheck *zc, IRFunc *func, IRPathState *ps, Nod
         Node *ce = v->call.callee;
         if (ce && ce->kind == NODE_IDENT) {
             FuncSummary *fs = NULL;
-            for (int si = 0; si < zc->summary_count && !fs; si++)
-                if (zc->summaries[si].func_name_len == ce->ident.name_len &&
-                    memcmp(zc->summaries[si].func_name, ce->ident.name, ce->ident.name_len) == 0)
-                    fs = &zc->summaries[si];
+            fs = ir_summary_for_name(zc, ce->ident.name, (uint32_t)ce->ident.name_len);   /* BUG-1457 */
             if (fs && fs->returns_all_views && fs->returns_param_mask) {
                 int n = 0;
                 for (int k = 0; k < v->call.arg_count && k < 32; k++) {
@@ -4422,13 +4456,7 @@ static bool ir_call_result_is_owned_alloc(ZerCheck *zc, Node *call) {
     Node *callee = call->call.callee;
     if (!callee || callee->kind != NODE_IDENT) return false;
     FuncSummary *summary = NULL;
-    for (int si = 0; si < zc->summary_count; si++) {
-        if (zc->summaries[si].func_name_len == (uint32_t)callee->ident.name_len &&
-            memcmp(zc->summaries[si].func_name, callee->ident.name,
-                   (size_t)callee->ident.name_len) == 0) {
-            summary = &zc->summaries[si]; break;
-        }
-    }
+    summary = ir_summary_for_name(zc, callee->ident.name, (uint32_t)callee->ident.name_len);   /* BUG-1457 */
     if (!summary) return false;
     if (summary->returns_color == ZC_COLOR_ARENA) return false;
     if (summary->ret_is_borrow) return false;      /* allocates nothing */
@@ -4621,11 +4649,7 @@ static Node *ir_resolve_returned_arg_ex(ZerCheck *zc, Node *arg, bool collapse_s
             if (!call || call->kind != NODE_CALL || !call->call.callee ||
                 call->call.callee->kind != NODE_IDENT) return arg;
             FuncSummary *fs = NULL;
-            for (int si = 0; si < zc->summary_count && !fs; si++)
-                if (zc->summaries[si].func_name_len == call->call.callee->ident.name_len &&
-                    memcmp(zc->summaries[si].func_name, call->call.callee->ident.name,
-                           call->call.callee->ident.name_len) == 0)
-                    fs = &zc->summaries[si];
+            fs = ir_summary_for_name(zc, call->call.callee->ident.name, (uint32_t)call->call.callee->ident.name_len);   /* BUG-1457 */
             if (!fs) return arg;
             for (int k = 0; k < fs->ret_field_n; k++) {
                 const struct ZcRetFieldView *rf = &fs->ret_field[k];
@@ -4641,11 +4665,7 @@ static Node *ir_resolve_returned_arg_ex(ZerCheck *zc, Node *arg, bool collapse_s
         if (a->kind != NODE_CALL || !a->call.callee || a->call.callee->kind != NODE_IDENT)
             return a == arg ? arg : a;
         FuncSummary *fs = NULL;
-        for (int si = 0; si < zc->summary_count && !fs; si++)
-            if (zc->summaries[si].func_name_len == a->call.callee->ident.name_len &&
-                memcmp(zc->summaries[si].func_name, a->call.callee->ident.name,
-                       a->call.callee->ident.name_len) == 0)
-                fs = &zc->summaries[si];
+        fs = ir_summary_for_name(zc, a->call.callee->ident.name, (uint32_t)a->call.callee->ident.name_len);   /* BUG-1457 */
         if (!fs) return arg;
         int k = fs->returns_param_color - 1;
         if (fs->returns_param_color <= 0) {
@@ -5589,13 +5609,8 @@ static void ir_slot_view_freed(ZerCheck *zc, IRFunc *func, IRPathState *ps,
 static const FuncSummary *ir_call_summary(ZerCheck *zc, Node *call) {
     if (!call || call->kind != NODE_CALL || !call->call.callee ||
         call->call.callee->kind != NODE_IDENT) return NULL;
-    const char *cn = call->call.callee->ident.name;
-    uint32_t cl = (uint32_t)call->call.callee->ident.name_len;
-    for (int si = 0; si < zc->summary_count; si++)
-        if (zc->summaries[si].func_name_len == cl &&
-            memcmp(zc->summaries[si].func_name, cn, cl) == 0)
-            return &zc->summaries[si];
-    return NULL;
+    return ir_summary_for_name(zc, call->call.callee->ident.name,   /* BUG-1457 */
+                               (uint32_t)call->call.callee->ident.name_len);
 }
 
 /* BUG-1130: a LOCAL array handed to a user call (`drain(arr)`, `f(arr[0..])`,
@@ -7160,15 +7175,12 @@ static Node *ir_defer_free_arg(ZerCheck *zc, Node *node) {
      * "this call frees its argument" get the same answer inside a defer as
      * outside it. Returns the first param the callee is known to free. */
     if (zc && callee && callee->kind == NODE_IDENT) {
-        for (int si = 0; si < zc->summary_count; si++) {
-            FuncSummary *sm = &zc->summaries[si];
-            if (sm->func_name_len != (uint32_t)callee->ident.name_len ||
-                memcmp(sm->func_name, callee->ident.name, sm->func_name_len) != 0)
-                continue;
+        /* BUG-1457: resolved in the caller's module, not by bare name. */
+        FuncSummary *sm = ir_summary_for_name(zc, callee->ident.name,
+                                              (uint32_t)callee->ident.name_len);
+        if (sm)
             for (int pi = 0; pi < sm->param_count && pi < call->call.arg_count; pi++)
                 if (sm->frees_param[pi]) return call->call.args[pi];
-            break;
-        }
     }
     return NULL;
 }
@@ -7812,11 +7824,7 @@ static void ir_async_task_call(ZerCheck *zc, IRFunc *func, IRPathState *ps, Node
 static void ir_async_poll_step(ZerCheck *zc, IRPathState *ps, Node *fn,
                                int root, const char *base, uint32_t blen, int line) {
     FuncSummary *fs = NULL;
-    for (int si = 0; si < zc->summary_count && !fs; si++)
-        if (zc->summaries[si].func_name_len == fn->func_decl.name_len &&
-            memcmp(zc->summaries[si].func_name, fn->func_decl.name,
-                   fn->func_decl.name_len) == 0)
-            fs = &zc->summaries[si];
+    fs = ir_summary_of_decl(zc, fn);   /* BUG-1457: the task's own function */
     if (!fs) return;
     for (int pi = 0; pi < fs->param_count && pi < fn->func_decl.param_count; pi++) {
         bool frees = (fs->frees_param && fs->frees_param[pi]) ||
@@ -7876,10 +7884,7 @@ static struct ZcPolls *ir_collect_polls(ZerCheck *zc, IRFunc *func, int *out_n) 
                     if (!ir_async_task_name(zc->checker, nm, nl, "_poll", 5, &fn0)) continue;
                     cnt = 1;
                 } else {
-                    for (int si = 0; si < zc->summary_count && !cs; si++)
-                        if (zc->summaries[si].func_name_len == nl &&
-                            memcmp(zc->summaries[si].func_name, nm, nl) == 0)
-                            cs = &zc->summaries[si];
+                    cs = ir_summary_for_name(zc, nm, (uint32_t)nl);   /* BUG-1457 */
                     if (!cs) continue;
                     cnt = cs->polls_n;
                 }
@@ -8016,9 +8021,8 @@ static uint64_t ir_collect_elem_frees(ZerCheck *zc, IRFunc *func) {
             if (call->call.callee && call->call.callee->kind == NODE_IDENT) {
                 const char *cn = call->call.callee->ident.name;
                 uint32_t cl = (uint32_t)call->call.callee->ident.name_len;
-                for (int si = 0; si < zc->summary_count; si++) {
-                    FuncSummary *cs = &zc->summaries[si];
-                    if (cs->func_name_len != cl || memcmp(cs->func_name, cn, cl) != 0) continue;
+                FuncSummary *cs = ir_summary_for_name(zc, cn, cl);   /* BUG-1457 */
+                for (int once = 0; cs && once < 1; once++) {
                     for (int ai = 0; ai < call->call.arg_count && ai < 64; ai++) {
                         if (!(cs->frees_param_elems & (1ULL << ai))) continue;
                         Node *a = ir_peel_launder(call->call.args[ai]);
@@ -8347,10 +8351,7 @@ static void ir_ps_scan(IRPsAcc *a, int want_local, int dst, const char *prefix,
             const char *cn = x->call.callee->ident.name;
             uint32_t cl = (uint32_t)x->call.callee->ident.name_len;
             FuncSummary *cs = NULL;
-            for (int si = 0; si < zc->summary_count && !cs; si++)
-                if (zc->summaries[si].func_name_len == cl &&
-                    memcmp(zc->summaries[si].func_name, cn, cl) == 0)
-                    cs = &zc->summaries[si];
+            cs = ir_summary_for_name(zc, cn, (uint32_t)cl);   /* BUG-1457 */
             if (!cs) continue;
             for (int q = 0; q < cs->param_store_n; q++) {
                 const struct ZcParamStore *e = &cs->param_store[q];
@@ -8477,11 +8478,7 @@ static void ir_ps_apply_value(ZerCheck *zc, IRFunc *func, IRPathState *ps, int r
         }
         FuncSummary *fs = NULL;
         if (pv->call.callee && pv->call.callee->kind == NODE_IDENT)
-            for (int si = 0; si < zc->summary_count && !fs; si++)
-                if (zc->summaries[si].func_name_len == pv->call.callee->ident.name_len &&
-                    memcmp(zc->summaries[si].func_name, pv->call.callee->ident.name,
-                           pv->call.callee->ident.name_len) == 0)
-                    fs = &zc->summaries[si];
+            fs = ir_summary_for_name(zc, pv->call.callee->ident.name, (uint32_t)pv->call.callee->ident.name_len);   /* BUG-1457 */
         for (int k = 0; fs && k < fs->ret_field_n; k++) {
             const struct ZcRetFieldView *rf = &fs->ret_field[k];
             if (rf->param < 0 || rf->param >= pv->call.arg_count) continue;
@@ -8854,12 +8851,7 @@ static void ir_check_dangling_globals_at_call(ZerCheck *zc, IRPathState *ps,
 static bool ir_callee_has_summary(ZerCheck *zc, const char *name,
                                   uint32_t name_len) {
     if (!name || name_len == 0) return false;
-    for (int si = 0; si < zc->summary_count; si++) {
-        if (zc->summaries[si].func_name_len == name_len &&
-            memcmp(zc->summaries[si].func_name, name, name_len) == 0)
-            return true;
-    }
-    return false;
+    return ir_summary_for_name(zc, name, name_len) != NULL;   /* BUG-1457 */
 }
 
 /* ================================================================
@@ -10770,12 +10762,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 const char *cn = rv->call.callee->ident.name;
                 uint32_t cnl = (uint32_t)rv->call.callee->ident.name_len;
                 FuncSummary *cs = NULL;
-                for (int si = 0; si < zc->summary_count; si++) {
-                    if (zc->summaries[si].func_name_len == cnl &&
-                        memcmp(zc->summaries[si].func_name, cn, cnl) == 0) {
-                        cs = &zc->summaries[si]; break;
-                    }
-                }
+                cs = ir_summary_for_name(zc, cn, (uint32_t)cnl);   /* BUG-1457 */
                 /* BUG-1080 (H6): the assignment spelling of the field views. */
                 if (cs && cs->ret_field_n > 0) {
                     int fr; const char *fp; uint32_t fpl;
@@ -12585,12 +12572,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         if (!fn_name || fn_name_len == 0) break;
 
         FuncSummary *summary = NULL;
-        for (int si = 0; si < zc->summary_count; si++) {
-            if (zc->summaries[si].func_name_len == fn_name_len &&
-                memcmp(zc->summaries[si].func_name, fn_name, fn_name_len) == 0) {
-                summary = &zc->summaries[si]; break;
-            }
-        }
+        summary = ir_summary_for_name(zc, fn_name, (uint32_t)fn_name_len);   /* BUG-1457 */
 
         if (inst->expr && inst->expr->kind == NODE_CALL)              /* BUG-1233 */
             ir_async_task_call(zc, func, ps, inst->expr, fn_name, fn_name_len,
@@ -14195,6 +14177,9 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * never trust it across calls (an IRFunc address can be reused). */
     _ir_kx_func = NULL;
     _ir_mi_func = NULL;             /* BUG-1411 */
+    if (func->source_file) zc->file_name = func->source_file;   /* BUG-1458 */
+    zc->cur_module = func->module_prefix;          /* BUG-1457 */
+    zc->cur_module_len = func->module_prefix_len;
     zc->cur_resets_arena = false;   /* BUG-1172 */
     zc->cur_handoff_params = 0;     /* BUG-1380 */
     zc->cur_freed_global_n = 0;     /* BUG-1181 */
@@ -14811,12 +14796,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         const char *hn = vexpr->call.callee->ident.name;
                         uint32_t hnl = (uint32_t)vexpr->call.callee->ident.name_len;
                         FuncSummary *hs = NULL;
-                        for (int si = 0; si < zc->summary_count; si++) {
-                            if (zc->summaries[si].func_name_len == hnl &&
-                                memcmp(zc->summaries[si].func_name, hn, hnl) == 0) {
-                                hs = &zc->summaries[si]; break;
-                            }
-                        }
+                        hs = ir_summary_for_name(zc, hn, (uint32_t)hnl);   /* BUG-1457 */
                         if (hs && hs->returns_param_color > 0) {
                             int hp = hs->returns_param_color - 1;
                             if (hp >= 0 && hp < vexpr->call.arg_count) {
@@ -15313,13 +15293,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
 
         /* Update or create summary — same logic as zercheck.c:2320+ */
         FuncSummary *existing = NULL;
-        for (int si = 0; si < zc->summary_count; si++) {
-            if (zc->summaries[si].func_name_len == (uint32_t)fn->func_decl.name_len &&
-                memcmp(zc->summaries[si].func_name, fn->func_decl.name,
-                       fn->func_decl.name_len) == 0) {
-                existing = &zc->summaries[si]; break;
-            }
-        }
+        existing = ir_summary_of_decl(zc, fn);   /* BUG-1457: keyed by identity */
         if (existing) {
             bool changed = false;
             if (existing->param_count == pc) {
@@ -15408,6 +15382,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 memset(s, 0, sizeof(FuncSummary));
                 s->func_name = fn->func_decl.name;
                 s->func_name_len = (uint32_t)fn->func_decl.name_len;
+                s->func_decl = fn;   /* BUG-1457 */
                 s->param_count = pc;
                 s->frees_param = frees;
                 s->maybe_frees_param = maybe_frees;

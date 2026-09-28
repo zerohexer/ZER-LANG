@@ -253,6 +253,51 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   `props_epoch` invalidating summaries cached earlier. `has_sync` is deliberately not
   merged (it softens a race error). Tests: seven `tests/zer_fail/*_bug1425.zer`,
   `tests/zer/critical_funcptr_boundary_bug1425.zer`; SHAPE p62 (16 cells, 13 HOLE pre-fix).
+- **BUG-1450 — a call WITH ARGUMENTS to a same-named function in a second module went to
+  the first-registered module's function** (silent: both `fa()` and `fb()` called
+  `xa__helper`). Every emitter / ir_lower lookup of a top-level name read the global scope
+  by the raw name, which belongs to the first-registered module; BUG-1120 had fixed only the
+  identifier path. ONE resolver — `checker_module_decl_lookup` (exported;
+  `global_decl_lookup` wraps it), `emit_decl_lookup` / `emit_decl_cname_in` in the emitter,
+  `ir_lower_func_in(..., module)` — at the IR call callee, both identifier emitters, the
+  global-init substitution, the container-receiver prefix and every object/type fallback;
+  spawn wrappers record the module the spawn is written in. Siblings: a module `static`
+  function called with arguments was emitted unmangled (link error).
+- **BUG-1451 / BUG-1452** — spawn wrappers were re-emitted by every module (`redefinition
+  of struct _zer_spawn_args_0`); a scoped-spawn join in a module named the undeclared
+  `xb__th`.
+- **BUG-1453** — two modules each using `alloc(T)` on their own struct failed at GCC (every
+  auto-slab was emitted after the FIRST module's structs, with the unmangled struct name);
+  each auto-slab is now declared by the module that declares its struct
+  (`emit_auto_slab_name`, `_zer_auto_slab_ma__Ta`).
+- **BUG-1454 / BUG-1455** — an import plus an async function in a later module failed
+  (`unknown type name '_zer_async_tm'`), and two modules' `async void tick()` redefined one
+  struct: the imported-module emission path was a drifted COPY of the preamble path (now one
+  `emit_module_body`), and the async state type and its accessors carry the module prefix.
+- **BUG-1456 — names the emitter generates in user scope captured user identifiers.** A
+  global `self` inside an async body was shadowed by the poll's `self` parameter (a write
+  re-aimed the task pointer, so later task-field stores landed in a user-chosen object —
+  exit 42); `_b` as a parameter collided with the shift macro's local (wrong shift result,
+  no warning); `_sa` as a spawn argument delivered the wrong value. Every such name is now
+  `_zer_`-prefixed (`_zer_self`, `_zer_sb`, `_zer_sa`, …).
+- **BUG-1457 — zercheck function summaries were keyed by BARE name**, so module mb's
+  `release` (frees) and ma's `release` (reads) shared one summary and a use-after-free in mb
+  was accepted (ASan heap-use-after-free). `FuncSummary.func_decl` is the identity;
+  `ir_summary_for_name` resolves a callee in the caller's module (two sites the round missed
+  were routed through it at merge). **BUG-1458** — zercheck diagnostics name the module's
+  file, not main's.
+- **BUG-1459** — the task-copy ban did not see through `@cast` / `@bitcast` / `(T)x` to a
+  distinct task type (and the distinct typedef itself failed at GCC: the async forward
+  typedefs now precede user typedefs). **1459b**: a module's own `const SZ` was reported
+  ambiguous when another module also declared one, and was sized from the OTHER module's
+  value (`own_decl_over_ambiguous`). **1459c**: `_zer_shl` / `_zer_shr` evaluated `b` before
+  `a` and skipped `a` entirely for an out-of-range count (`spawn work(bump() << 99)` never
+  called bump; a volatile left operand was never read) — both are now evaluated once, in
+  order, into `_zer_` temps.
+  Tests: `test_modules/m1450_user`, `m1453_user`, `m1455_user`, `m1457_user`,
+  `m1457_negative`, `m1459_user`; `tests/zer/emitter_name_capture_bug1456.zer`,
+  `async_self_global_store_bug1456.zer`, `shift_macro_eval_order_bug1459.zer`,
+  `async_distinct_task_type_bug1459.zer`; `tests/zer_fail/async_task_cast_{copy,return}_bug1459.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

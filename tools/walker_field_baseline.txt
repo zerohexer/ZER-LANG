@@ -873,7 +873,6 @@ checker.c:value_is_existing_resource:NODE_IF:if_stmt.else_body
 checker.c:value_is_existing_resource:NODE_IF:if_stmt.then_body
 checker.c:value_is_existing_resource:NODE_INDEX:index_expr.index
 checker.c:value_is_existing_resource:NODE_INTERRUPT:interrupt.body
-checker.c:value_is_existing_resource:NODE_INTRINSIC:intrinsic.args
 checker.c:value_is_existing_resource:NODE_ONCE:once.body
 checker.c:value_is_existing_resource:NODE_RETURN:ret.expr
 checker.c:value_is_existing_resource:NODE_SLICE:slice.end
@@ -883,7 +882,6 @@ checker.c:value_is_existing_resource:NODE_STATIC_ASSERT:static_assert_stmt.cond
 checker.c:value_is_existing_resource:NODE_STRUCT_INIT:struct_init.fields
 checker.c:value_is_existing_resource:NODE_SWITCH:switch_stmt.arms
 checker.c:value_is_existing_resource:NODE_SWITCH:switch_stmt.expr
-checker.c:value_is_existing_resource:NODE_TYPECAST:typecast.expr
 checker.c:value_is_existing_resource:NODE_UNARY:unary.operand
 checker.c:value_is_existing_resource:NODE_VAR_DECL:var_decl.init
 checker.c:value_is_existing_resource:NODE_WHILE:while_stmt.body

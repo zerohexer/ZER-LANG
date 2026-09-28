@@ -1,0 +1,4 @@
+// BUG-1459b: THIS module's `SZ` sizes the array, not the other module's.
+const u32 SZ = 4;
+u32[SZ] m1459_bbuf;
+u32 m1459_fb() { return (u32)m1459_bbuf.len; }

@@ -1,0 +1,12 @@
+// BUG-1450/1451/1452: same-named functions in two modules, called WITH ARGUMENTS,
+// a module `static` called with arguments, and a scoped spawn of a same-named
+// target in each module. Pre-fix: b's calls went to a's functions (exit 2), the
+// static was emitted unmangled (link error), the spawn wrappers were emitted
+// twice (`redefinition of struct _zer_spawn_args_0`) and the join named `m__th`.
+import m1450_a;
+import m1450_b;
+u32 main() {
+    if (m1450_fa() != 23) { return 1; }
+    if (m1450_fb() != 206) { return 2; }
+    return 0;
+}

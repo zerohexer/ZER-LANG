@@ -1,0 +1,13 @@
+struct M1453U { u32 v; }
+struct Node { u64 w; u64 z; }
+u32 m1453_fb() {
+    *M1453U p = alloc(M1453U) orelse return;
+    p.v = 4;
+    *Node n = alloc(Node) orelse { free(p); return 0; };
+    n.w = 20;
+    n.z = 5;
+    u32 r = p.v + (u32)n.w + (u32)n.z;
+    free(p);
+    free(n);
+    return r;
+}

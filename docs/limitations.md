@@ -30,6 +30,14 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — module name mangling is not one-to-one (2026-09-28, LOW — loud)
+
+`mod__name` joins the module and the identifier with `__`, so module `a` declaring
+`b__c` and module `a__b` declaring `c` both emit `a__b__c` (a GCC redefinition), and
+`a_` + `b` vs `a` + `_b` collide the same way. A proper fix is an unambiguous scheme
+(length-prefixed, or refusing `__` in module and identifier names), which touches every
+emitted name.
+
 ## OPEN — residuals of the 2026-09-28 allocation-tracker round (BUG-1410..1417; measured)
 
 1. **BUG-1411 is narrowed, not closed**: an allocation made INSIDE a loop, stored at an
@@ -150,8 +158,7 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
    register reached through a computed address, or two struct types overlaying one
    address with different field names (the key is address + field-name path).
 3. **Bare-metal emission residuals (LOW):** the union-variant reset on a VOLATILE union uses
-   `memset` (qualifier cast away; GCC warns); `_zer_shl`/`_zer_shr` skip READING a volatile
-   left operand when the count is out of range; IR blocks of a `@critical` body are emitted
+   `memset` (qualifier cast away; GCC warns); IR blocks of a `@critical` body are emitted
    outside its braces and `goto` back in, so the save variable is formally indeterminate
    (C11 6.2.4) though GCC keeps it in a register; AVR `@critical` names `SREG` without
    `<avr/io.h>` (loud).

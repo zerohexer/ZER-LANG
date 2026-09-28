@@ -1,0 +1,12 @@
+struct M1453T { u32 v; }
+struct Node { u32 w; }
+u32 m1453_fa() {
+    *M1453T p = alloc(M1453T) orelse return;
+    p.v = 3;
+    *Node n = alloc(Node) orelse { free(p); return 0; };
+    n.w = 10;
+    u32 r = p.v + n.w;
+    free(p);
+    free(n);
+    return r;
+}

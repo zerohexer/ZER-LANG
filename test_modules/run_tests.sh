@@ -140,6 +140,16 @@ else
     FAIL=$((FAIL+1))
 fi
 
+# BUG-1450..1459: same-named declarations in two modules — each module's call,
+# spawn, auto-slab, async task and summary resolves in ITS module.
+run_test m1450_user 0
+run_test m1453_user 0
+run_test m1455_user 0
+run_test m1457_user 0
+run_test m1459_user 0
+# BUG-1457/1458: the freeing `release` is c's; the report names c's FILE.
+expect_err m1457_negative "m1457_c.zer:6: zercheck: use after free: 's'"
+
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*
 

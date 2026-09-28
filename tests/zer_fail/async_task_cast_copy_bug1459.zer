@@ -1,0 +1,13 @@
+// expect-error: cannot initialize an async task by value
+// BUG-1459: `@cast` to a distinct typedef of a task rebrands the SAME object —
+// binding the result copies a polled task (whose promoted `p = &x` then aims into
+// the original). The copy ban classified @cast as building a fresh value.
+async u32 cu(u32 s) { u32 x = s; *u32 p = &x; yield; *p += 1; return x; }
+distinct typedef _zer_async_cu DT;
+u32 main() {
+    _zer_async_cu a;
+    _zer_async_cu_init(&a, 5);
+    _zer_async_cu_poll(&a);
+    DT b = @cast(DT, a);
+    return 0;
+}

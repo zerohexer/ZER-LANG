@@ -1,0 +1,17 @@
+// BUG-1417: a move struct moved INTO a slot is owned by that slot — consuming
+// the slot afterwards is the one legitimate use, with or without an initializer.
+move struct Tok { u32 k; }
+struct W { Tok t; }
+u32 eat(Tok t) { return t.k; }
+u32 main() {
+    Tok d = { .k = 2 };
+    Tok[1] ts;
+    ts[0] = d;
+    u32 r = eat(ts[0]);
+    Tok e = { .k = 3 };
+    W w;
+    w.t = e;
+    r += eat(w.t);
+    if (r != 5) { return 1; }
+    return 0;
+}

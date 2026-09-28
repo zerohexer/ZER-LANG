@@ -1343,6 +1343,44 @@ cell p62_isr_spawn_factory    reject "$P62"' interrupt TIM2 { *() f = mk61(); f(
 cell p62_safe_other_sig       compile "$P62"' u32 main(){ *(u32) -> u32 fp = ok61; u32 r = 0; @critical { r = fp(1); } if (r != 2) { return 1; } return 0; }'
 cell p62_safe_const_table     compile "$P62"' void nop62() { } const O61 o61 = { .f = nop62 }; u32 main(){ @critical { o61.f(); } return 0; }'
 
+# SHAPE p63 (BUG-1410..1417): an allocation that sits in a SLOT or a CARRIER and
+# is reached by a free / reset / hand-off through ANOTHER spelling — a struct
+# element read at a variable index, a pointer to an element, a callee freeing an
+# element argument's field, a wildcard slot, a Ring, a funcptr handed a slice,
+# a getter returning a global element, and an argument CARRYING what a callee
+# frees or resets. Every hazard cell then uses / frees the allocation by its OWN
+# name. BOUNDARY: reads through the same spellings, distinct allocations, a heap
+# (not arena) carrier, and a move struct moved INTO a slot then consumed.
+echo "===== SHAPE p63 = slot / carrier reached through another spelling ====="
+P63='struct T59 { u32 v; } struct H59 { ?*T59 p; u32 k; } move struct Tok59 { u32 k; }
+?*T59[2] gar59; H59[2] ghs59; Ring(H59, 4) rq59; u8[256] buf59; Arena ga59;
+u32 g59(u32 x) { return x; }
+void drop63(H59 h) { if (h.p) |q| { free(q); } }
+void dropp63(?*T59 p) { if (p) |q| { free(q); } }
+void drops59([*]?*T59 s) { if (s[0]) |q| { free(q); } }
+void nops59([*]?*T59 s) { }
+u32 kill2_59(H59 h, *T59 q) { free(q); return 0; }
+u32 rst59(H59 h) { ga59.reset(); return 0; }
+?*T59 get59(u32 i) { return gar59[i]; }
+H59 geth59(u32 i) { return ghs59[i]; }
+u32 eat59(Tok59 t) { return t.k; }
+'
+cell p63_elem_varidx_free    reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; H59[2] hs; hs[0].p = a; u32 i = 0; H59 h = hs[i]; if (h.p) |q| { free(q); } hs[0].p = null; u32 r = a.v; free(a); return r; }'
+cell p63_ptr_to_elem_free    reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; H59[2] hs; hs[0].p = a; u32 i = 0; *H59 hp = &hs[i]; if (hp.p) |q| { free(q); } hs[0].p = null; u32 r = a.v; free(a); return r; }'
+cell p63_callee_elem_field   reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; H59[2] hs; hs[0].p = a; u32 i = 0; drop63(hs[i]); hs[0].p = null; u32 r = a.v; free(a); return r; }'
+cell p63_callee_elem_bare    reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; ?*T59[2] arr; arr[0] = a; u32 i = 0; dropp63(arr[i]); arr[0] = null; free(a); return 0; }'
+cell p63_wild_slot_once      reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; ?*T59[2] arr; arr[g59(0)] = a; if (arr[0]) |x| { free(x); } arr[0] = null; u32 r = a.v; free(a); return r; }'
+cell p63_ring_pop_free       reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; H59 m = { .p = a, .k = 0 }; rq59.push(m); H59 got = rq59.pop() orelse { free(a); return 0; }; if (got.p) |q| { free(q); } u32 r = a.v; free(a); return r; }'
+cell p63_funcptr_slice       reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; ?*T59[1] arr; arr[0] = a; *([*]?*T59) fp = nops59; volatile u32 c = 1; if (c == 1) { fp = drops59; } fp(arr[0..]); arr[0] = null; u32 r = a.v; free(a); return r; }'
+cell p63_getter_param_index  reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; gar59[0] = a; if (get59(0)) |q| { free(q); } gar59[0] = null; u32 r = a.v; free(a); return r; }'
+cell p63_getter_struct_elem  reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; ghs59[0].p = a; H59 h = geth59(0); if (h.p) |q| { free(q); } ghs59[0].p = null; u32 r = a.v; free(a); return r; }'
+cell p63_carrier_freed_arg   reject "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; H59 h; h.p = a; return kill2_59(h, a); }'
+cell p63_carrier_arena_reset reject "$P63"' u32 main(){ ga59 = Arena.over(buf59); *T59 a = ga59.alloc(T59) orelse return; H59 h; h.p = a; return rst59(h); }'
+cell p63_safe_elem_read      compile "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; a.v = 1; H59[2] hs; hs[0].p = a; u32 i = 0; H59 h = hs[i]; u32 r = 0; if (h.p) |q| { r = q.v; } hs[0].p = null; free(a); return r - 1; }'
+cell p63_safe_distinct_arg   compile "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; *T59 b = alloc(T59) orelse { free(a); return 1; }; H59 h; h.p = a; u32 r = kill2_59(h, b); free(a); return r; }'
+cell p63_safe_heap_reset     compile "$P63"' u32 main(){ ga59 = Arena.over(buf59); *T59 a = alloc(T59) orelse return; H59 h; h.p = a; u32 r = rst59(h); free(a); return r; }'
+cell p63_safe_getter_read    compile "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; a.v = 0; gar59[0] = a; u32 r = 0; if (get59(0)) |q| { r = q.v; } gar59[0] = null; free(a); return r; }'
+cell p63_safe_move_into_slot compile "$P63"' u32 main(){ Tok59 d = { .k = 0 }; Tok59[1] ts; ts[0] = d; return eat59(ts[0]); }'
 
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1414: a Ring holds what was pushed: free(got.p) after pop may free a
+struct T { u32 v; }
+struct M { *T p; }
+Ring(M, 4) rq;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    M m = { .p = a };
+    rq.push(m);
+    M got = rq.pop() orelse { free(a); return 0; };
+    free(got.p);
+    *T b = alloc(T) orelse { free(a); return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    free(a);
+    return r;
+}

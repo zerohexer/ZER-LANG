@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1410: a free through a struct element read at a VARIABLE index (H h = hs[i]; free(h.p)) must reach the allocation hs[0].p holds
+struct T { u32 v; }
+struct H { *T p; u32 k; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0] = { .p = a, .k = 1 };
+    u32 i = 0;
+    H h = hs[i];          // literal index hs[0] is tracked; hs[i] is not
+    free(h.p);            // frees a
+    *T b = alloc(T) orelse { free(a); return 1; };   // reuses a's slot
+    free(a);              // accepted: really frees b
+    *T c = alloc(T) orelse { free(b); return 1; };   // reuses the same slot again
+    b.v = 1;
+    c.v = 99;
+    u32 r = b.v;          // 99: b and c are one object
+    free(c);
+    free(b);
+    return r;
+}

@@ -1,0 +1,16 @@
+// BUG-1414 boundary: a value popped from a Ring may be READ; the allocation it
+// carries is freed once, by its own name.
+struct T { u32 v; }
+struct M { *T p; }
+Ring(M, 4) rq;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 3;
+    M m = { .p = a };
+    rq.push(m);
+    M got = rq.pop() orelse { free(a); return 1; };
+    u32 r = got.p.v;
+    free(a);
+    if (r != 3) { return 1; }
+    return 0;
+}

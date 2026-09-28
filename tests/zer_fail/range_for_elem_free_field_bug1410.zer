@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1410: a range-for over a struct array reads each element at a variable
+// index; free(h.p) inside it may free what hs[0].p holds, so free(a) after the
+// loop is a possible double free.
+struct T { u32 v; }
+struct H { *T p; u32 k; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H[2] hs;
+    hs[0] = { .p = a, .k = 1 };
+    for (H h in hs) { if (h.k == 1) { free(h.p); } }
+    free(a);
+    return 0;
+}

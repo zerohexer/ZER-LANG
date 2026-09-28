@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: carries (in a field or element) the same allocation
+// BUG-1413: use(h, a): the callee frees q while h.p still names the same allocation
+struct T { u32 v; }
+struct H { *T p; }
+u32 use(H h, *T q) {
+    free(q);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = h.p.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h;
+    h.p = a;
+    return use(h, a);
+}

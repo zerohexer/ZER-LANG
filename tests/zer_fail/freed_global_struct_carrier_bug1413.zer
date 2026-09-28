@@ -1,0 +1,22 @@
+// EXPECTED: compile error
+// expect-error: carries (in a field or element) the same allocation
+// BUG-1413: the callee frees global g while the argument h carries the same allocation
+struct T { u32 v; }
+struct H { *T p; }
+?*T g;
+void drop_g() { if (g) |p| { free(p); } g = null; }
+u32 use(H h) {
+    drop_g();
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = h.p.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    g = a;
+    H h;
+    h.p = a;
+    return use(h);
+}

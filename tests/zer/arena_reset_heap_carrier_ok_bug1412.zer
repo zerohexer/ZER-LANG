@@ -1,0 +1,22 @@
+// BUG-1412 boundary: a callee that resets an arena may be handed a struct
+// carrying a HEAP allocation — only arena allocations die with the reset.
+struct T { u32 v; }
+struct H { *T p; }
+u8[256] buf;
+Arena ga;
+void rst() { ga.reset(); }
+u32 use(H h) {
+    rst();
+    return h.p.v;
+}
+u32 main() {
+    ga = Arena.over(buf);
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    H h;
+    h.p = a;
+    u32 r = use(h);
+    free(a);
+    if (r != 5) { return 1; }
+    return 0;
+}

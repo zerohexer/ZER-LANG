@@ -1,0 +1,49 @@
+// BUG-1489: a backward copy chain longer than the escape fixpoint's round cap was
+// left half-joined and the escape ACCEPTED; past the cap the facts saturate.
+// expect-error: local-derived pointer
+u32 g0 = 1;
+?*u32 gp;
+void f() {
+    u32 x = 5;
+    *u32 p0 = &g0;
+    *u32 p1 = &g0;
+    *u32 p2 = &g0;
+    *u32 p3 = &g0;
+    *u32 p4 = &g0;
+    *u32 p5 = &g0;
+    *u32 p6 = &g0;
+    *u32 p7 = &g0;
+    *u32 p8 = &g0;
+    *u32 p9 = &g0;
+    *u32 p10 = &g0;
+    *u32 p11 = &g0;
+    *u32 p12 = &g0;
+    *u32 p13 = &g0;
+    *u32 p14 = &g0;
+    *u32 p15 = &g0;
+    *u32 p16 = &g0;
+    *u32 p17 = &g0;
+    for (u32 i = 0; i < 19; i += 1) {
+        gp = p0;
+        p0 = p1;
+        p1 = p2;
+        p2 = p3;
+        p3 = p4;
+        p4 = p5;
+        p5 = p6;
+        p6 = p7;
+        p7 = p8;
+        p8 = p9;
+        p9 = p10;
+        p10 = p11;
+        p11 = p12;
+        p12 = p13;
+        p13 = p14;
+        p14 = p15;
+        p15 = p16;
+        p16 = p17;
+        p17 = &x;
+    }
+}
+u32 clobber() { u32[64] z; for (u32 i = 0; i < 64; i += 1) { z[i] = 7; } return z[3]; }
+u32 main() { f(); clobber(); if (gp) |q| { return *q; } return 0; }

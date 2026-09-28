@@ -124,7 +124,8 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
    including values it held only BEFORE the defer was registered.
 4. The re-walk runs only when the first walk saw a taint appear that an earlier sink could
    have missed, but then the function is checked two or more extra times (bounded by 16
-   fixpoint rounds; each round must add a fact bit).
+   fixpoint rounds; past them the facts SATURATE to their union — BUG-1489 — which is sound
+   and coarse: a function with a 17+-link backward copy chain gets every pointer tainted).
 
 ## OPEN — residuals of the 2026-09-27 rounds (BUG-1366..1399; measured)
 

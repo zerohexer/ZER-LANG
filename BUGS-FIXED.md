@@ -392,6 +392,16 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   Tests (1482..1484): `tests/zer/global_init_forward_ref_bug1482.zer`,
   `async_forward_decl_bug1483.zer`, `long_chains_under_limit_bug1484.zer`;
   `tests/zer_fail/async_bodyless_decl_bug1483.zer`, `parser_long_{add,field}_chain_bug1484.zer`.
+- **BUG-1488 — the escape fixpoint's final walk repeated every diagnostic of the first**
+  (and counted each error twice): the dedupe window `dedupe_from/to` was set and never
+  read. `checker_error` / `checker_warning` now skip a diagnostic identical (line,
+  severity, text) to one the first walk printed (`esc_diag_is_dup`).
+- **BUG-1489 — the escape fixpoint's 16-round cap FAILED OPEN.** Each round moves a taint
+  one link along a textually backward copy chain, so `gp = p0; p0 = p1; ... p16 = &x;` in a
+  loop (17+ links, and the goto form) was accepted with the chain half-joined (ASan
+  stack-use-after-return). Past the cap the facts SATURATE: every pointer-carrying variable
+  gets the union of every fact in the function — a superset of any fixpoint. Tests:
+  `tests/zer_fail/escape_fixpoint_cap_{chain17,gchain17,chain30}_bug1489.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

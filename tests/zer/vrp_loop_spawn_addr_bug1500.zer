@@ -1,0 +1,15 @@
+// BUG-1500: `spawn w(&i)` inside a loop body writes i before the next
+// iteration's arr[i]; the loop's address-taken pre-pass must see a spawn argument.
+u32[4] arr;
+u32[64] pad;
+void w(*u32 q) { *q = 4; }
+u32 main() {
+    u32 i = 1;
+    for (u32 k = 0; k < 2; k += 1) {
+        arr[i] = 7;
+        if (k == 1) { return 42; }
+        ThreadHandle th = spawn w(&i);
+        th.join();
+    }
+    return 0;
+}

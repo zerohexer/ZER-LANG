@@ -1568,6 +1568,7 @@ static void push_var_range_ex(Checker *c, const char *name, uint32_t name_len,
 static Symbol *vrp_key_root(Checker *c, const char *name, uint32_t name_len,
                             Scope **owner);                               /* BUG-1092 */
 static void vrp_widen_global_like(Checker *c);                           /* BUG-1093 */
+static void vrp_widen_call_effects(Checker *c);                          /* BUG-1503 */
 static bool vrp_store_through_pointer(Checker *c, Node *t);              /* BUG-1093 */
 static bool vrp_intrinsic_may_store(Checker *c, Node *n);                /* BUG-1093 */
 static bool vrp_intrinsic_is_value_only(Node *n);                      /* BUG-1094 */
@@ -17216,7 +17217,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * (so a compound key `gs.i` of a global, a static local and a key read
          * through a pointer are all widened — the old name lookup matched only a
          * bare global name). */
-        if (!node->call.is_comptime_resolved) vrp_widen_global_like(c);
+        if (!node->call.is_comptime_resolved) vrp_widen_call_effects(c);   /* BUG-1503 */
 
         break;
     }
@@ -23739,6 +23740,10 @@ static bool vrp_guard_hoist_sound(Checker *c, Node *idx) {
     Symbol *sym = scope_lookup(c->current_scope, name, len);
     bool reachable = !sym || sym->is_static || sym->vrp_addr_taken ||
                      sym == global_decl_lookup(c, name, len);
+    /* BUG-1503: in an async body a CALL may re-enter this task's _poll and
+     * write any frame local (see vrp_widen_call_effects) — `u32 v = f() +
+     * arr[i];` tested i before f() re-polled and set it. */
+    if (c->in_async) reachable = true;
     /* The statement's OWN top-level assignment stores LAST — after every read
      * of its target's subscripts and of its value (`k += a[k] + 1` reads a[k]
      * under the pre-store k, which is exactly what the hoisted guard tests).
@@ -27062,6 +27067,18 @@ static void check_stmt_impl(Checker *c, Node *node) {
             c->var_ranges[vi].max_val = INT64_MAX;
             c->var_ranges[vi].known_nonzero = false;
         }
+        /* BUG-1499: a backward goto carries every write of the code between
+         * the label and the goto — including a write THROUGH A POINTER whose
+         * `&i` is formed only AFTER the label (`top: if (i < 4) { *p = 9;
+         * arr[i] = 1; } p = &i; goto top;`). The widening above resets the
+         * ranges, but `if (i < 4)` re-narrows i in program order and `*p = 9`
+         * did not know p may aim at i, so arr[i] was proven against [0,3]
+         * (ASan global OOB). A loop body gets the same answer from the B7
+         * pre-pass; the label uses THE SAME query over the function body (the
+         * region any goto to this label can come from is not delimited, so
+         * the whole body is the sound over-approximation — precision cost is
+         * confined to functions that contain a label). */
+        vrp_widen_loop_addr_taken(c, c->current_body);
         break;
 
     case NODE_CONTINUE: {
@@ -31849,6 +31866,32 @@ static void vrp_widen_global_like(Checker *c) {
     }
 }
 
+/* BUG-1503: what a CALL may change. Everything a call may write
+ * (vrp_widen_global_like) — and, inside an ASYNC function, every frame local.
+ * The frame lives in the task object, and a callee can re-enter the SAME task's
+ * _poll (a callee that polls a global task), which runs the body — declarations
+ * and assignments included — while this activation is suspended mid-call.
+ * `if (depth == 0) { depth = 1; reenter(); arr[i] = 1; } else { i = 9; }` kept
+ * i's range across reenter() and emitted a bare arr[i] (ASan global OOB). This
+ * is the VRP analogue of the zercheck suspend barrier; refusing re-entrant
+ * polling instead would need a whole-program call-graph question. Only a CALL
+ * can re-enter: a yield/await returns to the poller, which cannot name a frame
+ * field, and a pointer into the frame needs `&local` (vrp_addr_taken: no range
+ * at all). Every non-global range entry while checking an async body is a
+ * frame local (a static local is already global-like). Even a `const` local is
+ * re-initialised by a re-entrant run of its declaration. */
+static void vrp_widen_call_effects(Checker *c) {
+    vrp_widen_global_like(c);
+    if (!c->in_async) return;
+    for (int ri = 0; ri < c->var_range_count; ri++) {
+        struct VarRange *r = &c->var_ranges[ri];
+        if (r->owner == c->global_scope) continue;
+        r->min_val = INT64_MIN;
+        r->max_val = INT64_MAX;
+        r->known_nonzero = false;
+    }
+}
+
 /* BUG-1093: does storing to this assignment target write THROUGH a pointer?
  * `*p = v`, `p.f = v` (auto-deref), `p[i] = v` / `s[i] = v` on a pointer or
  * slice, a store into a handle's slot, or any target that is not a plain
@@ -32318,7 +32361,7 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
         if (body->call.callee && body->call.callee->kind == NODE_IDENT)
             cs = scope_lookup(c->current_scope, body->call.callee->ident.name,
                               (uint32_t)body->call.callee->ident.name_len);
-        if (!cs || !cs->is_comptime) vrp_widen_global_like(c);
+        if (!cs || !cs->is_comptime) vrp_widen_call_effects(c);           /* BUG-1503 */
         for (int i = 0; i < body->call.arg_count; i++)
             vrp_invalidate_loop_body_writes(c, body->call.args[i]);
         /* BUG-826: a write reachable only through a callee EXPRESSION. */
@@ -32368,8 +32411,20 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
     /* BUG-1096: a suspension lets another task run before the body resumes,
      * and a started thread may run at once. Both are a call for this purpose. */
-    case NODE_YIELD: case NODE_AWAIT: case NODE_SPAWN:
+    case NODE_YIELD:
         vrp_widen_global_like(c);
+        break;
+    /* BUG-1501: `spawn w(i = 9)` / `await ((i = 9) > 0)` — the argument and the
+     * condition are expressions of this body and can WRITE a local. They were
+     * leaves here, so the write never joined into the loop-carried range. */
+    case NODE_AWAIT:
+        vrp_widen_global_like(c);
+        vrp_invalidate_loop_body_writes(c, body->await_stmt.cond);
+        break;
+    case NODE_SPAWN:
+        vrp_widen_global_like(c);
+        for (int i = 0; i < body->spawn_stmt.arg_count; i++)
+            vrp_invalidate_loop_body_writes(c, body->spawn_stmt.args[i]);
         break;
     case NODE_ASM:
     case NODE_STATIC_ASSERT:
@@ -32401,8 +32456,15 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
  * walker-default audit stays untouched. */
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
     if (!n) return;
-    NodeKind k = n->kind;
-    if (k == NODE_UNARY) {
+    /* BUG-1500: an exhaustive no-default switch (was an if/else chain whose
+     * catch-all comment listed spawn/await as "leaves"). `spawn w(&i)` and
+     * `await bump(&i)` in a loop body formed `&i` inside a SPAWN argument / an
+     * AWAIT condition, the chain never descended either, and `arr[i]` earlier in
+     * the body was proven against the stale pre-loop range (ASan global OOB).
+     * As a switch, -Werror=switch forces every future NodeKind to be decided
+     * here, and tools/audit_walker_fields.sh now audits its child coverage. */
+    switch (n->kind) {
+    case NODE_UNARY:
         if (n->unary.op == TOK_AMP) {
             Node *root = n->unary.operand;
             while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX)) {
@@ -32426,71 +32488,117 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
             }
         }
         vrp_widen_loop_addr_taken(c, n->unary.operand);
-    } else if (k == NODE_BLOCK) {
+        break;
+    case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++)
             vrp_widen_loop_addr_taken(c, n->block.stmts[i]);
-    } else if (k == NODE_IF) {
+        break;
+    case NODE_IF:
         vrp_widen_loop_addr_taken(c, n->if_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->if_stmt.then_body);
         vrp_widen_loop_addr_taken(c, n->if_stmt.else_body);
-    } else if (k == NODE_FOR) {
+        break;
+    case NODE_FOR:
         vrp_widen_loop_addr_taken(c, n->for_stmt.init);
         vrp_widen_loop_addr_taken(c, n->for_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->for_stmt.step);
         vrp_widen_loop_addr_taken(c, n->for_stmt.body);
-    } else if (k == NODE_WHILE || k == NODE_DO_WHILE) {
+        break;
+    case NODE_WHILE: case NODE_DO_WHILE:
         vrp_widen_loop_addr_taken(c, n->while_stmt.cond);
         vrp_widen_loop_addr_taken(c, n->while_stmt.body);
-    } else if (k == NODE_SWITCH) {
+        break;
+    case NODE_SWITCH:
         vrp_widen_loop_addr_taken(c, n->switch_stmt.expr);
-        for (int i = 0; i < n->switch_stmt.arm_count; i++)
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            for (int v = 0; v < n->switch_stmt.arms[i].value_count; v++)
+                vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].values[v]);
             vrp_widen_loop_addr_taken(c, n->switch_stmt.arms[i].body);
-    } else if (k == NODE_EXPR_STMT) {
+        }
+        break;
+    case NODE_EXPR_STMT:
         vrp_widen_loop_addr_taken(c, n->expr_stmt.expr);
-    } else if (k == NODE_DEFER) {
+        break;
+    case NODE_DEFER:
         vrp_widen_loop_addr_taken(c, n->defer.body);
-    } else if (k == NODE_CRITICAL) {
+        break;
+    case NODE_CRITICAL:
         vrp_widen_loop_addr_taken(c, n->critical.body);
-    } else if (k == NODE_ONCE) {
+        break;
+    case NODE_ONCE:
         vrp_widen_loop_addr_taken(c, n->once.body);
-    } else if (k == NODE_VAR_DECL) {
+        break;
+    case NODE_VAR_DECL:
         vrp_widen_loop_addr_taken(c, n->var_decl.init);
-    } else if (k == NODE_RETURN) {
+        break;
+    case NODE_RETURN:
         vrp_widen_loop_addr_taken(c, n->ret.expr);
-    } else if (k == NODE_ASSIGN) {
+        break;
+    case NODE_ASSIGN:
         vrp_widen_loop_addr_taken(c, n->assign.target);
         vrp_widen_loop_addr_taken(c, n->assign.value);
-    } else if (k == NODE_CALL) {
+        break;
+    case NODE_CALL:
         /* THE case this pass exists for: `bump(&i)`. */
         vrp_widen_loop_addr_taken(c, n->call.callee);
         for (int i = 0; i < n->call.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->call.args[i]);
-    } else if (k == NODE_INTRINSIC) {
+        break;
+    case NODE_SPAWN:
+        /* BUG-1500: `spawn w(&i)` — the thread writes i before the join. */
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++)
+            vrp_widen_loop_addr_taken(c, n->spawn_stmt.args[i]);
+        break;
+    case NODE_AWAIT:
+        /* BUG-1500: `await bump(&i)` — the condition is a call like any other. */
+        vrp_widen_loop_addr_taken(c, n->await_stmt.cond);
+        break;
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             vrp_widen_loop_addr_taken(c, n->intrinsic.args[i]);
-    } else if (k == NODE_BINARY) {
+        break;
+    case NODE_BINARY:
         vrp_widen_loop_addr_taken(c, n->binary.left);
         vrp_widen_loop_addr_taken(c, n->binary.right);
-    } else if (k == NODE_FIELD) {
+        break;
+    case NODE_FIELD:
         vrp_widen_loop_addr_taken(c, n->field.object);
-    } else if (k == NODE_INDEX) {
+        break;
+    case NODE_INDEX:
         vrp_widen_loop_addr_taken(c, n->index_expr.object);
         vrp_widen_loop_addr_taken(c, n->index_expr.index);
-    } else if (k == NODE_ORELSE) {
+        break;
+    case NODE_ORELSE:
         vrp_widen_loop_addr_taken(c, n->orelse.expr);
         vrp_widen_loop_addr_taken(c, n->orelse.fallback);
-    } else if (k == NODE_SLICE) {
+        break;
+    case NODE_SLICE:
         vrp_widen_loop_addr_taken(c, n->slice.object);
         vrp_widen_loop_addr_taken(c, n->slice.start);
         vrp_widen_loop_addr_taken(c, n->slice.end);
-    } else if (k == NODE_TYPECAST) {
+        break;
+    case NODE_TYPECAST:
         vrp_widen_loop_addr_taken(c, n->typecast.expr);
-    } else if (k == NODE_STRUCT_INIT) {
+        break;
+    case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++)
             vrp_widen_loop_addr_taken(c, n->struct_init.fields[i].value);
+        break;
+    /* No `&` subtree: literals, names, jumps and type-level kinds. NODE_ASM is
+     * legal only in a `naked` function, whose body holds nothing but asm and
+     * return — no loop or label can surround it. Declarations never appear in
+     * a body. Listed so a new NodeKind fails -Werror=switch. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_YIELD: case NODE_ASM: case NODE_STATIC_ASSERT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+        break;
     }
-    /* All other NodeKind values are leaves (literals, idents, break/continue/
-     * goto/label/yield/await/spawn/asm/static_assert) — no `&` subtree. */
 }
 
 /* Mark a node as proven safe — emitter will skip runtime check */

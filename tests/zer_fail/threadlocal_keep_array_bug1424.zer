@@ -1,0 +1,7 @@
+// expect-error: the address of threadlocal 'tla' cannot satisfy 'keep' parameter
+// BUG-1424: a threadlocal ARRAY decayed into a keep slice parameter.
+struct O { ?[*]u32 v; }
+threadlocal u32[4] tla;
+void sts(*O o, [*]u32 s) { o.v = s; }
+void f(*O out) { sts(out, tla); }
+u32 main() { O o; ThreadHandle th = spawn f(&o); th.join(); return 0; }

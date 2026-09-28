@@ -1,0 +1,14 @@
+// expect-error: @critical body re-enables or waits for interrupts
+// BUG-1425: @critical's interrupts-off promise broken through a funcptr LOCAL;
+// the direct call en() is rejected, this spelling was not.
+volatile u32 ticks;
+void en() { @cpu_enable_int(); }
+interrupt TIM2 { @critical { ticks += 1; } }
+u32 main() {
+    *() fp = en;
+    @critical {
+        fp();          // interrupts back ON
+        ticks += 1;    // main-side RMW exempted because it is "inside @critical"
+    }
+    return 0;
+}

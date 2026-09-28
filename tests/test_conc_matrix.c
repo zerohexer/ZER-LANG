@@ -159,6 +159,7 @@ typedef enum {
     CO_SPAWN_TRANSITIVE_GLOBAL,/* spawn -> helper() -> non-shared global (transitive) */
     CO_SPAWN_SLAB,             /* spawned body uses a global Slab (non-atomic metadata) */
     CO_THREADHANDLE_JOIN_ONE_BRANCH, /* join only in one branch — unjoined on the other */
+    CO_THREADHANDLE_RESPAWN_BACKEDGE, /* BUG-1422: one spawn re-run by a backward goto, un-joined */
     /* POSITIVE (synchronized — must compile) */
     CO_SPAWN_SHARED_OK,        /* spawn f(&g), g is a shared struct (auto-locked) */
     CO_SCOPED_SPAWN_JOIN,      /* ThreadHandle th = spawn f(&w); th.join(); */
@@ -167,6 +168,7 @@ typedef enum {
     CO_SHARED_FIELD_OK,        /* shared struct field access (auto-lock) */
     CO_THREADHANDLE_JOIN_BOTH, /* join in both branches — joined on all paths */
     CO_SPAWN_THREADLOCAL,      /* spawned body touches a threadlocal global (per-thread) */
+    CO_THREADHANDLE_RESPAWN_JOINED, /* BUG-1422 boundary: joined before the back edge */
     COSCEN_COUNT
 } COScenario;
 
@@ -176,11 +178,12 @@ static int scenario_is_negative(COScenario s) {
         case CO_DEADLOCK_SAME_STMT: case CO_SPAWN_IN_CRITICAL:
         case CO_THREADHANDLE_NOT_JOINED: case CO_SPAWN_TRANSITIVE_GLOBAL:
         case CO_SPAWN_SLAB: case CO_THREADHANDLE_JOIN_ONE_BRANCH:
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE:
             return 1;
         case CO_SPAWN_SHARED_OK: case CO_SCOPED_SPAWN_JOIN:
         case CO_SPAWN_VALUE_ARGS: case CO_DEADLOCK_SEPARATE_OK:
         case CO_SHARED_FIELD_OK: case CO_THREADHANDLE_JOIN_BOTH:
-        case CO_SPAWN_THREADLOCAL:
+        case CO_SPAWN_THREADLOCAL: case CO_THREADHANDLE_RESPAWN_JOINED:
             return 0;
         case COSCEN_COUNT: break;
     }
@@ -197,6 +200,8 @@ static const char *scen_name(COScenario s) {
         case CO_SPAWN_TRANSITIVE_GLOBAL: return "spawn-transitive-global";
         case CO_SPAWN_SLAB:              return "spawn-slab-access";
         case CO_THREADHANDLE_JOIN_ONE_BRANCH: return "join-one-branch";
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE: return "respawn-backedge";
+        case CO_THREADHANDLE_RESPAWN_JOINED: return "respawn-joined";
         case CO_SPAWN_SHARED_OK:         return "spawn-shared-ok";
         case CO_SCOPED_SPAWN_JOIN:       return "scoped-spawn-join";
         case CO_SPAWN_VALUE_ARGS:        return "spawn-value-args";
@@ -307,6 +312,22 @@ static void gen(COScenario s, char *buf, size_t n) {
                 "threadlocal u32 g_tl;\n"
                 "void worker() { g_tl = g_tl + 1; }\n"
                 "u32 main() { spawn worker(); return 0; }\n");
+            break;
+        case CO_THREADHANDLE_RESPAWN_BACKEDGE:
+            snprintf(buf, n,
+                "void compute(*u32 p) { *p += 1; }\n"
+                "u32 main() { u32 v = 0; u32 i = 0;\n"
+                "again:\n    ThreadHandle th = spawn compute(&v);\n"
+                "    i += 1;\n    if (i < 3) { goto again; }\n"
+                "    th.join();\n    return 0; }\n");
+            break;
+        case CO_THREADHANDLE_RESPAWN_JOINED:
+            snprintf(buf, n,
+                "void compute(*u32 p) { *p += 1; }\n"
+                "u32 main() { u32 v = 0; u32 i = 0;\n"
+                "again:\n    ThreadHandle th = spawn compute(&v);\n"
+                "    th.join();\n    i += 1;\n    if (i < 3) { goto again; }\n"
+                "    return 0; }\n");
             break;
         case COSCEN_COUNT: buf[0] = 0; break;
     }

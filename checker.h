@@ -158,6 +158,19 @@ typedef struct {
         int line; const char *file_name; const char *source;
     } *ucc;
     int ucc_count, ucc_cap;
+    /* BUG-1425: the context-ban scans of a @critical / interrupt / defer body,
+     * judged after every body is typed (check_deferred_body_effects): an
+     * indirect call in the body — or in any function it reaches — resolves its
+     * targets through the callee's TYPE, which an unchecked body lacks. */
+    struct DeferredBodyEffects {
+        Node *body; Node *fn; int line; int kind;   /* kind: BODY_EFFECTS_* */
+        const char *file_name; const char *source;
+        const char *mod; uint32_t mod_len;
+    } *dbe;
+    int dbe_count, dbe_cap;
+    /* BUG-1425: bumped when every body is typed, so a function summary cached
+     * earlier (when its indirect calls could not be resolved yet) is recomputed. */
+    int props_epoch;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */

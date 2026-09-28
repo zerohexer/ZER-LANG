@@ -1,0 +1,16 @@
+// expect-error: ThreadHandle 'th' re-spawned while the thread spawned at line
+// BUG-1422: the atomic-cell sibling — the concurrent window closes at the one
+// join, but two earlier threads are still running @atomic_add when main's
+// plain g = 0 runs. Same root: the handle was overwritten.
+u32 g;
+void w() { for (u32 k = 0; k < 1000000; k += 1) { @atomic_add(&g, 1); } }
+u32 main() {
+    u32 i = 0;
+again:
+    ThreadHandle th = spawn w();
+    i += 1;
+    if (i < 3) { goto again; }
+    th.join();
+    g = 0;
+    return g;
+}

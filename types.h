@@ -416,6 +416,7 @@ struct Symbol {
         bool has_direct_yield;
         bool has_direct_spawn;
         bool has_direct_alloc;
+        int epoch;           /* BUG-1425: Checker.props_epoch when computed */
     } props;
     bool returns_color_cached;  /* zercheck: return color already computed */
     int returns_color_value;    /* zercheck: cached ZC_COLOR_* for return value */

@@ -115,6 +115,47 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   also admitted bool. An output's type must now be one every bit pattern is valid for:
   an integer, or a nullable `?*T` (newly accepted — the unknown-provenance pointer floor,
   as for a cinclude return). Tests: `tests/zer_fail/asm_output_{nonnull_ptr,enum}_bug1408.zer`.
+- **BUG-1420 — the statement's shared lock was HELD across an orelse-BLOCK fallback.**
+  The checker treats the block's statements as separate lock scopes (BUG-1047); the
+  lowering kept `current_stmt_shared_root` locked while lowering the block, so `u32 x =
+  none(a.v) orelse { b.y = 5; continue; };` took B under A (an ABBA deadlock against a
+  thread doing the reverse — measured hang), and on a `shared(rw)` struct rdlock-then-wrlock
+  hung single-threaded (the assign spelling double-wrlocked: BUG-980's silent corruption).
+  The lowering now releases the statement's whole lock GROUP before the block runs and
+  re-takes it only if the block falls through (`StmtLock held`, `emit_release_held` /
+  `emit_reacquire_held`); every early exit releases the whole group. Found beside it:
+  `x = f(q.a, r.b) orelse { return 3; };` returned still holding r, `return f(q.a) orelse
+  { return 3; };` leaked q. Test: `tests/zer/orelse_block_releases_stmt_lock_bug1420.zer`
+  (timeout pre-fix).
+- **BUG-1421 — `break` / `continue` of a loop INSIDE an orelse block unlocked the
+  enclosing statement's lock** (one lock, four unlocks — the rwlock state corrupted, the
+  program hung; TSan "unlock of an unlocked mutex"). `held_released_by_jump`: only a jump
+  that leaves the loop current when the lock was taken releases it. Test:
+  `tests/zer/orelse_block_inner_loop_unlock_bug1421.zer`.
+- **BUG-1422 — re-spawning a scoped ThreadHandle on a backward goto dropped the unjoined
+  thread.** `ir_add_thread` reset the existing unjoined entry: two threads ran unjoined
+  (lost updates; in a helper, stack-use-after-return). zercheck_ir's `IR_SPAWN` reports a
+  re-spawn while the merged state holds the handle unjoined. Tests:
+  `tests/zer_fail/scoped_spawn_goto_respawn{,_atomic}_bug1422.zer`,
+  `scoped_spawn_continue_respawn_bug1422.zer`, `tests/zer/scoped_spawn_rejoin_loop_bug1422.zer`;
+  conc-matrix cells `respawn-backedge` / `respawn-joined`.
+- **BUG-1423 / BUG-1424 — a threadlocal's address escaped through a slice, a call result,
+  a getter and a keep parameter.** `out.v = tla;` (a threadlocal ARRAY decaying to a slice)
+  let thread 2 read thread 1's dead TLS (returned 22 for 11). `value_reaches_threadlocal`
+  now rides the shared `collect_borrow_roots` query (a stand-in flag keeps a threadlocal
+  POINTER's value from counting as a TLS address; `value_views_root_storage` covers an
+  array name, an array field / element and a slice of one); the keep call site has a
+  `KV_THREADLOCAL` arm. Tests: six `tests/zer_fail/threadlocal_*_bug142{3,4}.zer`,
+  `tests/zer/threadlocal_view_boundary_bug1423.zer`; SHAPE p59 (18 cells, 14 HOLE pre-fix).
+- **BUG-1425 — the @critical / interrupt context bans were bypassed through a funcptr.**
+  `scan_func_props` followed direct callees and funcptr ARGUMENTS only, so `*() fp = en;
+  @critical { fp(); }` re-enabled interrupts inside @critical (and spawn / alloc there, and
+  alloc in an ISR through a funcptr local / global / field). An indirect-call arm now asks
+  the BUG-1310/1290 reach query (every function the call may reach); the bans that depend
+  on callee types run after every body is typed (from `check_keep_inference`), with a
+  `props_epoch` invalidating summaries cached earlier. `has_sync` is deliberately not
+  merged (it softens a race error). Tests: seven `tests/zer_fail/*_bug1425.zer`,
+  `tests/zer/critical_funcptr_boundary_bug1425.zer`; SHAPE p62 (16 cells, 13 HOLE pre-fix).
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

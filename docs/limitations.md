@@ -30,6 +30,19 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 concurrency round (BUG-1420..1425; measured)
+
+1. **A funcptr LOCAL reaches every function of its signature** for the context bans
+   (BUG-1425), so `*() -> u32 fp = tick;` inside @critical is refused when ANY `() -> u32`
+   function (even `main`) allocates. A local bound once at its declaration could resolve to
+   that one function (the spawn scan's binding walk) — over-rejection only.
+2. **The for-loop STEP takes only the statement's primary lock** — the B1 multi-root lock
+   group was never applied to the step expression. Noticed, not probed for a hole.
+3. **`ensure_func_props` treats a call cycle as "no additional effects"** — a recursive
+   chain under-approximates can_spawn / can_alloc / can_enable_int (pre-existing).
+4. A static-local or global initializer `= &tl` (a threadlocal's address) is accepted by
+   the checker and refused by GCC ("initializer element is not constant") — loud.
+
 ## OPEN — residuals of the 2026-09-28 escape fixpoint (BUG-1402; LOW — over-rejection)
 
 The loop / goto / defer join is sound by construction (it only ever ADDS may-taint) and

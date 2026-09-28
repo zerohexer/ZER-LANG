@@ -1,0 +1,8 @@
+// expect-error: carries the address of threadlocal 'tl1'
+// BUG-1423: a no-argument getter returning `&tl1` — the call result reaches
+// the threadlocal through the callee's own returns.
+struct O { ?*u32 p; }
+threadlocal u32 tl1;
+*u32 get() { return &tl1; }
+void f(*O out) { out.p = get(); }
+u32 main() { O o; ThreadHandle th = spawn f(&o); th.join(); return 0; }

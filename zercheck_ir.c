@@ -9127,6 +9127,29 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
          * No IR local exists (emitter handles pthread_t emission directly),
          * so track via name-based IRThreadTrack set on IRPathState. */
         if (sp->spawn_stmt.handle_name && sp->spawn_stmt.handle_name_len > 0) {
+            /* BUG-1422: a spawn into a ThreadHandle whose PREVIOUS thread is
+             * still un-joined on some path overwrites the only handle to it.
+             * One spawn statement reached again by a backward goto / continue
+             * starts a second thread while the first runs; the one join after
+             * the loop awaits only the LAST, and the scoped-spawn premise that
+             * lets `&local` be lent ("it is joined before the frame dies")
+             * breaks for every earlier thread — measured: lost updates, and a
+             * stack-use-after-return once the function returned.
+             * ir_add_thread used to reset `joined` silently. The merged path
+             * state is the join-AND over predecessors (BUG-743), so an entry
+             * that is un-joined here is un-joined on at least one path into
+             * this spawn — the same "maybe" conservatism as overwriting an
+             * ALIVE handle. */
+            IRThreadTrack *prev_t = ir_find_thread(ps, sp->spawn_stmt.handle_name,
+                (uint32_t)sp->spawn_stmt.handle_name_len);
+            if (prev_t && !prev_t->joined) {
+                ir_zc_error(zc, inst->source_line,
+                    "ThreadHandle '%.*s' re-spawned while the thread spawned at line %d "
+                    "may not be joined — the earlier thread would be lost and never "
+                    "joined; join it before spawning again",
+                    (int)sp->spawn_stmt.handle_name_len, sp->spawn_stmt.handle_name,
+                    prev_t->spawn_line);
+            }
             ir_add_thread(ps, sp->spawn_stmt.handle_name,
                 (uint32_t)sp->spawn_stmt.handle_name_len, inst->source_line);
         }

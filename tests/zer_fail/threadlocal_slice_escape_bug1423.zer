@@ -1,0 +1,20 @@
+// expect-error: carries the address of threadlocal 'tla'
+// BUG-1423: a bare threadlocal ARRAY name decays to a view of THIS thread's
+// TLS; stored through an out-param it is read after the thread exited (the
+// reproducer returned 22 — the next thread's slot — instead of 11).
+// A thread publishes a SLICE of its threadlocal array through an out-param.
+// `out.p = &tla[2]` is rejected ("address of threadlocal escapes"); the slice
+// spellings `out.v = tla` / `out.v = tla[0..2]` / call-laundered forms are not.
+struct O { ?[*]u32 v; }
+threadlocal u32[4] tla;
+void pub(*O out) { tla[0] = 11; out.v = tla; }
+void other() { tla[0] = 22; }
+u32 main() {
+    O o;
+    ThreadHandle th = spawn pub(&o);
+    th.join();                     // thread 1 is gone: its TLS block is dead
+    ThreadHandle t2 = spawn other();
+    t2.join();                     // thread 2 reused the same TLS block
+    if (o.v) |s| { return s[0]; }  // reads thread 2's (or freed) storage
+    return 0;
+}

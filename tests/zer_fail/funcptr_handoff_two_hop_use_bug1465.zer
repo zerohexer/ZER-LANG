@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1465 boundary: two funcptr hops still hand 'a' off — a use after it is refused.
+struct T { u32 v; }
+void freer(*T p) { free(p); }
+void apply(*(*T) f, *T p) { f(p); }
+void apply2(*(*T) f, *T p) { apply(f, p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    apply2(freer, a);
+    u32 r = a.v;
+    return r;
+    return 0;
+}

@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'v.p' is freed
+// BUG-1462: an optional's |*c| capture points INTO the optional.
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+u32 main() {
+    ?S os = null;
+    S s0;
+    os = s0;
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    if (os) |*c| { c.p = a; }
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (os) |v| { if (v.p) |q| { r = q.v; } }
+    free(b);
+    return r;
+}

@@ -1,0 +1,44 @@
+// BUG-1461..1465 boundary: storing an allocation through a view spelling and
+// reading it back BEFORE the free is fine — a stable pointer to a field/element,
+// an optional's |*c| capture, a local pointer to a global aggregate, a slice
+// local over an array, a nested sub-slice — and a funcptr hand-off two calls
+// deep hands ownership away (no false "may not be freed on all paths").
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+S gs;
+void freer(*T p) { free(p); }
+void apply(*(*T) f, *T p) { f(p); }
+void apply2(*(*T) f, *T p) { apply(f, p); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 1;
+    u32 r = 0;
+    S h;
+    *?*T lp = &h.p;
+    *lp = a;
+    if (h.p) |q| { r += q.v; }
+    ?*T[4] arr;
+    *?*T ep = &arr[2];
+    *ep = a;
+    if (arr[2]) |q| { r += q.v; }
+    ?S os = null;
+    S s0;
+    os = s0;
+    if (os) |*c| { c.p = a; }
+    if (os) |v| { if (v.p) |q| { r += q.v; } }
+    *S gp = &gs;
+    gp.p = a;
+    if (gs.p) |q| { r += q.v; }
+    gs.p = null;
+    [*]?*T sl = arr[1..4];
+    sl[0] = a;
+    if (arr[1]) |q| { r += q.v; }
+    ?*T[4] la;
+    la[1..3][1..2][0] = a;
+    if (la[2]) |q| { r += q.v; }
+    free(a);
+    *T b = alloc(T) orelse return;
+    apply2(freer, b);
+    if (r != 6) { return 1; }
+    return 0;
+}

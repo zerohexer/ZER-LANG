@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'arr[1].p' is freed
+// BUG-1463: the field-of-element spelling through a slice local.
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+u32 main() {
+    S[3] arr;
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    [*]S sl = arr[0..3];
+    sl[1].p = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (arr[1].p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

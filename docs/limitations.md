@@ -30,6 +30,18 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 passthrough / view round (BUG-1460..1465; measured)
+
+1. **Copying a whole GLOBAL aggregate into a local does not carry its slot entries**
+   (MEDIUM — accept-unsafe, pre-existing): `gs.p = a; free(a); S v = gs; v.p.v` is
+   accepted. The local sibling (BUG-1131 `ir_carry_projection`) exists; the global
+   source does not route through it.
+2. A slice local with a VARIABLE index, or defined with a non-literal start, is keyed on
+   the slice local rather than the array (a global slice variable too).
+3. A stable aim through a POINTER-typed root (`&hp.p`, `hp` a pointer) is not resolved.
+4. Over-rejection: `if (gos) |*c| { c.p = a; } free(a); if (gos) |*c| { c.p = null; }` is
+   "global left dangling at exit" — the two `if (gos)` tests are not known to agree.
+
 ## OPEN — module name mangling is not one-to-one (2026-09-28, LOW — loud)
 
 `mod__name` joins the module and the identifier with `__`, so module `a` declaring

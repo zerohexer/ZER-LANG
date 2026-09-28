@@ -2153,3 +2153,36 @@ checker.c:esc_has_jump:NODE_TYPECAST:typecast.expr
 checker.c:esc_has_jump:NODE_UNARY:unary.operand
 checker.c:esc_has_jump:NODE_VAR_DECL:var_decl.init
 checker.c:esc_has_jump:NODE_WHILE:while_stmt.cond
+
+# --- zercheck_ir.c: ir_pass_calls_walk (BUG-1460) ---
+# An EXPRESSION walker over a passthrough instruction's expression (the calls it
+# runs). Statement / declaration kinds cannot occur inside one — an orelse BLOCK
+# fallback is lowered to its own blocks (pre_lower_orelse) before the expression
+# reaches the IR, so its calls are IR_CALLs. Listed only for -Werror=switch.
+zercheck_ir.c:ir_pass_calls_walk:NODE_ASM:asm_stmt.inputs
+zercheck_ir.c:ir_pass_calls_walk:NODE_ASM:asm_stmt.outputs
+zercheck_ir.c:ir_pass_calls_walk:NODE_BLOCK:block.stmts
+zercheck_ir.c:ir_pass_calls_walk:NODE_CRITICAL:critical.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_DEFER:defer.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_DO_WHILE:while_stmt.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_DO_WHILE:while_stmt.cond
+zercheck_ir.c:ir_pass_calls_walk:NODE_EXPR_STMT:expr_stmt.expr
+zercheck_ir.c:ir_pass_calls_walk:NODE_FILE:file.decls
+zercheck_ir.c:ir_pass_calls_walk:NODE_FOR:for_stmt.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_FOR:for_stmt.cond
+zercheck_ir.c:ir_pass_calls_walk:NODE_FOR:for_stmt.init
+zercheck_ir.c:ir_pass_calls_walk:NODE_FOR:for_stmt.step
+zercheck_ir.c:ir_pass_calls_walk:NODE_FUNC_DECL:func_decl.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_GLOBAL_VAR:var_decl.init
+zercheck_ir.c:ir_pass_calls_walk:NODE_IF:if_stmt.cond
+zercheck_ir.c:ir_pass_calls_walk:NODE_IF:if_stmt.else_body
+zercheck_ir.c:ir_pass_calls_walk:NODE_IF:if_stmt.then_body
+zercheck_ir.c:ir_pass_calls_walk:NODE_INTERRUPT:interrupt.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_ONCE:once.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_RETURN:ret.expr
+zercheck_ir.c:ir_pass_calls_walk:NODE_STATIC_ASSERT:static_assert_stmt.cond
+zercheck_ir.c:ir_pass_calls_walk:NODE_SWITCH:switch_stmt.arms
+zercheck_ir.c:ir_pass_calls_walk:NODE_SWITCH:switch_stmt.expr
+zercheck_ir.c:ir_pass_calls_walk:NODE_VAR_DECL:var_decl.init
+zercheck_ir.c:ir_pass_calls_walk:NODE_WHILE:while_stmt.body
+zercheck_ir.c:ir_pass_calls_walk:NODE_WHILE:while_stmt.cond

@@ -4819,6 +4819,11 @@ register name to a ZER lvalue / value, `clobbers:` is a list, and **`safety:`
 is MANDATORY and must be at least 30 characters** — the audit trail; shorter is a
 compile error. Like the string form it is allowed only in a `naked` function.
 
+An OUTPUT is a raw register value, so its destination must be a type every bit
+pattern is a valid value of: an integer, or a nullable `?*T` (unwrap it before use).
+A non-null `*T` (the register may hold 0), an enum and a bool are refused — output
+into an integer and convert it (`@try_enum`, or a comparison).
+
 ```zer
 u64 out_val;
 const u64 in_val = 42;

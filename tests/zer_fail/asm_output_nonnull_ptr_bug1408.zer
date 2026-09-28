@@ -1,0 +1,14 @@
+// BUG-1408: an asm output is a raw register; `xor %0, %0` into a non-null `*u32`
+// forged a NULL the type promises cannot exist, and `*gp` then loaded through it.
+// expect-error: writes a raw register into a non-null '*u32'
+u32 target = 5;
+*u32 gp = &target;
+naked void forge() {
+    asm {
+        instructions: "xor %0, %0"
+        outputs: { "rax" = gp }
+        clobbers: [ "memory" ]
+        safety: "writes zero into a non-null pointer register output slot"
+    }
+}
+u32 main() { forge(); return *gp; }

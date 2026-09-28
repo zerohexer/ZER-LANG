@@ -1,0 +1,5 @@
+// expect-error: @bitcast cannot build a 'W'
+// BUG-1432: BH-18 #3 refused `@bitcast(*u32, int)`, but a STRUCT carrying the
+// pointer was a pointer made from an integer with no @inttoptr and no mmio.
+struct W { *u32 p; }
+u32 main() { u32 x = 5; u64 v = @ptrtoint(&x); W w = @bitcast(W, v); return *w.p; }

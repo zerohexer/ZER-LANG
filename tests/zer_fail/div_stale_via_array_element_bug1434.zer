@@ -1,0 +1,7 @@
+// expect-error: divisor 's.d' not proven nonzero
+// BUG-1434: a store that OVERLAPS the compound key the guard narrowed (a whole-struct
+// store, a store to a containing field, a store through a variable index) left
+// the key known-nonzero, and the division was 'proven'.
+u32 get(u32 a) { return a; }
+struct S { u32 d; }
+u32 main() { S s; S[1] arr; s.d = get(1); if (s.d == 0) { return 1; } arr[0] = s; arr[0].d = 0; s = arr[0]; return 100 / s.d; }

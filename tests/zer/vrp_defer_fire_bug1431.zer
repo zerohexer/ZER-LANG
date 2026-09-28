@@ -1,0 +1,35 @@
+// BUG-1431: a defer fires at its BLOCK's exit, so the code after the block sees
+// what the defer body wrote. Each helper returns 1 only if its fixed-array access
+// RAN out of bounds (the auto-guard returns 0 early); a broken compiler returns 8.
+u32[4] arr;
+u32[64] pad;
+u32 gi;
+u32 get(u32 a) { return a; }
+?u32 mg(u32 a) { return a; }
+void bump() { gi = 5; }
+u32 block() { u32 i = get(1); if (i < 4) { { defer i = 5; } arr[i] = 7; return 1; } return 0; }
+u32 if_arm() { u32 i = get(1); u32 c = get(1); if (i < 4) { if (c == 1) { defer i = 5; } arr[i] = 7; return 1; } return 0; }
+u32 sw_arm() {
+    u32 i = get(1);
+    u32 k = get(0);
+    if (i < 4) {
+        switch (k) { 0 => { defer i += 4; } default => { } }
+        arr[i] = 7;
+        return 1;
+    }
+    return 0;
+}
+u32 capture() { u32 i = get(1); if (i < 4) { if (mg(1)) |v| { defer i = 5; } arr[i] = 7; return 1; } return 0; }
+u32 critical() { u32 i = get(1); if (i < 4) { @critical { defer i = 5; } arr[i] = 7; return 1; } return 0; }
+u32 global() { gi = get(1); if (gi < 4) { { defer gi = 5; } arr[gi] = 7; return 1; } return 0; }
+u32 call_global() { gi = get(1); if (gi < 4) { { defer bump(); } arr[gi] = 7; return 1; } return 0; }
+u32 bound() {
+    u32 n = 4;
+    { defer n = 8; }
+    for (u32 i = 0; i < n; i += 1) { arr[i] = 7; }
+    return 1;
+}
+u32 main() {
+    return block() + if_arm() + sw_arm() + capture() + critical() + global() +
+           call_global() + bound();
+}

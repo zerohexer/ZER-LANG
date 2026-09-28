@@ -58,6 +58,40 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   zero (2495/0 integration, every gate). Tests: 16 `tests/zer_fail/escape_order_*_bug1402.zer`,
   `tests/zer/escape_order_boundaries_bug1402.zer`; SHAPE p61 in `tools/sink_matrix.sh`
   (13 cells, 10 HOLE pre-fix).
+- **BUG-1430 — a store updated only the NEWEST range entry of a variable, so an older one
+  resurfaced when the inner scope closed.** `u32 i = 1; if (i < 2) { i = get(5); }
+  arr[i] = 7;` emitted a bare `arr[i]` (ASan stack-buffer-overflow, no diagnostic): the
+  `if` pushed a narrowing entry, the assignment rewrote only that one, the branch exit
+  popped it and the pre-branch `[1,1]` came back. Same at the return summary and the loop
+  bound, and in the loop pre-pass (`vrp_join_assign_range`, deleted). ONE store
+  application — `vrp_store_target` → `vrp_apply_store` — updates every entry with the
+  variable's identity; `&` widening goes through `vrp_widen_key_all`; asm outputs take any
+  path. Tests: `tests/zer/vrp_stale_entry_bug1430.zer`, `tests/zer_trap/vrp_stale_entry_summary_bug1430.zer`,
+  8 stale-entry cells in `tests/test_vrp_fact_matrix.c`.
+- **BUG-1431 — a defer's writes were discarded, but a defer fires when ANY enclosing
+  block exits.** `if (i < 4) { { defer i = 5; } arr[i] = 7; }` kept `i` in `[0,3]` (the
+  B4 comment claimed no path observes a defer body — false for any block that ends before
+  the function). At the end of a block each defer registered in it is applied as a
+  may-store (the loop pre-pass walker: joined ranges, and a call / pointer store / yield
+  widens every global-like range). Tests: `tests/zer/vrp_defer_fire_bug1431.zer`,
+  `tests/zer_trap/vrp_defer_summary_bug1431.zer`, 9 defer cells in the fact matrix.
+- **BUG-1432 — an async task frame could be forged through `@pun` / `@bitcast`.** A
+  writable `*u64` view of `_zer_async_worker` rewrote a local the body's VRP trusted and
+  the resume state (`_zer_state`), resuming past a guard (ASan global-buffer-overflow).
+  `type_carries_forgeable` now counts a struct with `is_async_state`, and a new
+  `bitcast_target_mints` (exhaustive) refuses `@bitcast` INTO a value that carries a
+  pointer or a task frame — which also closed `W w = @bitcast(W, u64)` with `struct W {
+  *u32 p; }`, an integer-to-pointer forge with no `@inttoptr` (the BH-18 #3 rule checked a
+  bare pointer target only). Tests: three `tests/zer_fail/*_bug1432.zer`.
+- **BUG-1434 — a compound-key nonzero fact survived a store that overwrote it.** `s.d`
+  proven nonzero, then `s = t` (or `s.in = t`, `s[k].d = 0`, `k = 1` under `s[k].d`) still
+  proved `100 / s.d`. `vrp_key_relation` compares the stored path against each key: an
+  exact match gets the new range; a prefix, a sub-path or a wildcard-index overlap widens
+  it. (The emitter still trapped at run time, so this was a wrong verdict, not yet a
+  silent divide.) Tests: six `tests/zer_fail/*_bug1434.zer`.
+- **BUG-1435 — a FIELD divisor with no range key (`s[k].d`) was accepted with no proof at
+  all**, in `/` and in `/=`. Now "complex divisor expression not proven nonzero". Tests:
+  two `tests/zer_fail/*_bug1435.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

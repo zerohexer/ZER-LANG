@@ -186,6 +186,28 @@ typedef enum {
     /* ---- SUMMARY: a return range read at the end of the body ---- */
     VF_SUMMARY_GOTO,       /* a later guard's inverse credited to an earlier return */
     VF_SUMMARY_SHADOW,     /* `return x` naming an inner shadow */
+    /* ---- STALE ENTRY (BUG-1430): a store reached only the NEWEST range entry, a
+     *      guard-pushed narrowing that is popped at its block's end — the older,
+     *      untouched entry resurfaced ---- */
+    VF_STALE_ASSIGN,       /* `if (i < 2) { i = get(5); } arr[i]` */
+    VF_STALE_COMPOUND,     /* `if (i < 2) { i += 4; }` */
+    VF_STALE_ELSE,         /* narrowing store in a then with an (empty) else */
+    VF_STALE_EQ_GUARD,     /* `if (i == 1) { i = 5; }` */
+    VF_STALE_SWITCH_ARM,   /* the store in a switch arm */
+    VF_STALE_LOOP_BOUND,   /* the loop bound `n` restored to its old single value */
+    VF_STALE_SUMMARY,      /* a return range read after the stale entry resurfaced */
+    VF_STALE_ADDR,         /* `&i` taken under a narrowing — the flag set on the newest entry only */
+    /* ---- DEFER FIRE (BUG-1431): a defer body runs at its BLOCK's exit, and the
+     *      code after that block observes its writes ---- */
+    VF_DEFER_BLOCK,        /* `{ defer i = 5; } arr[i]` */
+    VF_DEFER_IF_ARM,       /* the defer in an if arm */
+    VF_DEFER_SWITCH_ARM,   /* in a switch arm */
+    VF_DEFER_CAPTURE,      /* in an `if (m) |v|` body */
+    VF_DEFER_CRITICAL,     /* in an @critical body */
+    VF_DEFER_GLOBAL,       /* a defer that writes a global index */
+    VF_DEFER_CALL_GLOBAL,  /* a defer that CALLS a function writing a global */
+    VF_DEFER_LOOP_BOUND,   /* the defer rewrites a loop bound */
+    VF_DEFER_SUMMARY,      /* a return range recorded before a block's defer fired */
 
     /* ---- PROVEN: precision the same fixes bought ---- */
     VF_OK_RANGE_FOR,       /* for-in over a fixed array: bound is the array size */
@@ -206,6 +228,12 @@ static int scenario_is_catch(VFScenario s) {
     case VF_HOIST_CALL_GLOBAL: case VF_HOIST_ADDR_ARG: case VF_HOIST_SHORTCIRCUIT:
     case VF_HOIST_ASSIGN_COND: case VF_HOIST_STRUCT_RET: case VF_HOIST_ORELSE_INDEX:
     case VF_SUMMARY_GOTO: case VF_SUMMARY_SHADOW:
+    case VF_STALE_ASSIGN: case VF_STALE_COMPOUND: case VF_STALE_ELSE:
+    case VF_STALE_EQ_GUARD: case VF_STALE_SWITCH_ARM: case VF_STALE_LOOP_BOUND:
+    case VF_STALE_SUMMARY: case VF_STALE_ADDR:
+    case VF_DEFER_BLOCK: case VF_DEFER_IF_ARM: case VF_DEFER_SWITCH_ARM:
+    case VF_DEFER_CAPTURE: case VF_DEFER_CRITICAL: case VF_DEFER_GLOBAL:
+    case VF_DEFER_CALL_GLOBAL: case VF_DEFER_LOOP_BOUND: case VF_DEFER_SUMMARY:
         return 1;
     case VF_OK_RANGE_FOR: case VF_OK_CONST_BOUND: case VF_OK_TYPED_CONST:
         return 0;
@@ -245,6 +273,23 @@ static const char *scen_name(VFScenario s) {
     case VF_HOIST_ORELSE_INDEX:  return "hoist/orelse-index-temp";
     case VF_SUMMARY_GOTO:        return "summary/goto-then-guard";
     case VF_SUMMARY_SHADOW:      return "summary/return-of-inner-shadow";
+    case VF_STALE_ASSIGN:        return "stale/assign-under-narrowing";
+    case VF_STALE_COMPOUND:      return "stale/compound-under-narrowing";
+    case VF_STALE_ELSE:          return "stale/assign-in-then-with-else";
+    case VF_STALE_EQ_GUARD:      return "stale/assign-under-==-guard";
+    case VF_STALE_SWITCH_ARM:    return "stale/assign-in-switch-arm";
+    case VF_STALE_LOOP_BOUND:    return "stale/loop-bound";
+    case VF_STALE_SUMMARY:       return "stale/return-summary";
+    case VF_STALE_ADDR:          return "stale/&i-under-narrowing";
+    case VF_DEFER_BLOCK:         return "defer/fires-at-block-exit";
+    case VF_DEFER_IF_ARM:        return "defer/in-if-arm";
+    case VF_DEFER_SWITCH_ARM:    return "defer/in-switch-arm";
+    case VF_DEFER_CAPTURE:       return "defer/in-if-capture-body";
+    case VF_DEFER_CRITICAL:      return "defer/in-@critical-body";
+    case VF_DEFER_GLOBAL:        return "defer/writes-global-index";
+    case VF_DEFER_CALL_GLOBAL:   return "defer/calls-global-writer";
+    case VF_DEFER_LOOP_BOUND:    return "defer/rewrites-loop-bound";
+    case VF_DEFER_SUMMARY:       return "defer/return-summary";
     case VF_OK_RANGE_FOR:        return "proven/for-in-over-array";
     case VF_OK_CONST_BOUND:      return "proven/const-loop-bound";
     case VF_OK_TYPED_CONST:      return "proven/typed-constant";
@@ -529,6 +574,74 @@ static void gen(VFScenario s, char *buf, size_t n) {
             "    { u32 x = get(3); return x; }\n"
             "}\n"
             "u32 main() { two[f(1)] = 7; return 42; }\n");
+        break;
+    case VF_STALE_ASSIGN:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = 1;\n    if (i < 2) { i = get(5); }\n    arr[i] = 7;\n    return 42;\n}\n");
+        break;
+    case VF_STALE_COMPOUND:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    if (i < 4) { if (i < 2) { i += 4; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_STALE_ELSE:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    if (i < 4) { if (i < 2) { i = get(5); } else { } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_STALE_EQ_GUARD:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    if (i < 4) { if (i == 1) { i = 5; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_STALE_SWITCH_ARM:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    u32 c = get(0);\n    if (i < 4) {\n        switch (c) { 0 => { if (i < 2) { i = 5; } } default => { } }\n        arr[i] = 7;\n    }\n    return 42;\n}\n");
+        break;
+    case VF_STALE_LOOP_BOUND:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 n = 4;\n    if (n == 4) { n = get(8); }\n    for (u32 k = 0; k < n; k += 1) { arr[k] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_STALE_SUMMARY:
+        snprintf(buf, n, "%s", PRE
+            "u32 f(u32 i) { if (i < 4) { if (i < 2) { i = get(5); } return i; } return 0; }\nu32 main() { arr[f(1)] = 7; return 42; }\n");
+        break;
+    case VF_STALE_ADDR:
+        snprintf(buf, n, "%s", PRE
+            "void bump(*u32 p) { *p = 5; }\nu32 main() {\n    u32 i = get(1);\n    ?*u32 q = null;\n    if (i < 4) { if (i < 2) { q = &i; } }\n    *u32 p = q orelse return;\n    if (i < 4) { bump(p); arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_BLOCK:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    if (i < 4) { { defer i = 5; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_IF_ARM:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    u32 c = get(1);\n    if (i < 4) { if (c == 1) { defer i = 5; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_SWITCH_ARM:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    u32 k = get(0);\n    if (i < 4) {\n        switch (k) { 0 => { defer i += 4; } default => { } }\n        arr[i] = 7;\n    }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_CAPTURE:
+        snprintf(buf, n, "%s", PRE
+            "?u32 mg(u32 a) { return a; }\nu32 main() {\n    u32 i = get(1);\n    if (i < 4) { if (mg(1)) |v| { defer i = 5; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_CRITICAL:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 i = get(1);\n    if (i < 4) { @critical { defer i = 5; } arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_GLOBAL:
+        snprintf(buf, n, "%s", PRE
+            "u32 gi;\nu32 main() {\n    gi = get(1);\n    if (gi < 4) { { defer gi = 5; } arr[gi] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_CALL_GLOBAL:
+        snprintf(buf, n, "%s", PRE
+            "u32 gi;\nvoid bump() { gi = 5; }\nu32 main() {\n    gi = get(1);\n    if (gi < 4) { { defer bump(); } arr[gi] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_LOOP_BOUND:
+        snprintf(buf, n, "%s", PRE
+            "u32 main() {\n    u32 n = 4;\n    { defer n = 8; }\n    for (u32 i = 0; i < n; i += 1) { arr[i] = 7; }\n    return 42;\n}\n");
+        break;
+    case VF_DEFER_SUMMARY:
+        snprintf(buf, n, "%s", PRE
+            "u32 pick() {\n    u32 i = get(1);\n    if (i < 4) { { defer i = 4; } return i; }\n    return 0;\n}\nu32 main() { arr[pick()] = 7; return 42; }\n");
         break;
     case VF_OK_RANGE_FOR:
         snprintf(buf, n, "%s",

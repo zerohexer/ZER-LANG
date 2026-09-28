@@ -1413,6 +1413,10 @@ static Type *lookup_prov_summary(Checker *c, const char *name, uint32_t name_len
  * Prevents BUG-502 class: compound key path was missing compound op check. */
 static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
                                        TokenType op, Node *value);
+static bool vrp_store_target(Checker *c, Node *target, TokenType op, Node *value,
+                             bool join);                                  /* BUG-1430 */
+static void vrp_widen_key_all(Checker *c, const char *name, uint32_t name_len,
+                              bool mark_addr_taken);                      /* BUG-1430 */
 static void vrp_invalidate_loop_body_writes(Checker *c, Node *body);
 static void vrp_widen_loop_addr_taken(Checker *c, Node *n);
 
@@ -4179,6 +4183,15 @@ static bool type_carries_forgeable(Type *t, int depth) {
     case TYPE_ARRAY:
         return type_carries_forgeable(u->array.inner, depth + 1);
     case TYPE_STRUCT:
+        /* BUG-1432: an async task FRAME (`_zer_async_NAME`) is compiler-owned
+         * state: its `_zer_state` selects the RESUME POINT and its other fields
+         * are the saved locals — whose VRP ranges were proven before the
+         * suspension and are trusted after it. Every field is a plain integer,
+         * so the member walk below answered "no invariant" and
+         * `*q = @pun(*u64, &task); *q = (5 << 32) | 1;` rewrote a saved index
+         * the resumed body had already proven in range (global-buffer-overflow).
+         * The frame as a whole is the invariant. */
+        if (u->struct_type.is_async_state) return true;
         for (uint32_t i = 0; i < u->struct_type.field_count; i++)
             if (type_carries_forgeable(u->struct_type.fields[i].type, depth + 1))
                 return true;
@@ -4196,6 +4209,55 @@ static bool type_carries_forgeable(Type *t, int depth) {
     /* Unwrapped by type_dispatch_kind, so unreachable; listed so the switch
      * stays total. */
     case TYPE_DISTINCT:
+        return false;
+    }
+    return false;
+}
+
+/* BUG-1432: may a VALUE of this type, reinterpreted from foreign bits by
+ * @bitcast, MINT a capability no later check re-validates — an address (a
+ * pointer / slice / *opaque / funcptr / Arena's backing store) or an async task
+ * frame (its resume state and its saved, already-range-proven locals)? The
+ * scalar pointer case was BH-18 #3; the AGGREGATE carrying one was not asked:
+ * `task = @bitcast(_zer_async_worker, v)` rewrote a suspended task's saved index
+ * (ASan stack-buffer-overflow at resume) and `W w = @bitcast(W, v)` for
+ * `struct W { *u32 p; }` built a pointer from an integer with no @inttoptr.
+ * Enums are NOT here (the variant guard re-validates them at the door, BUG-843),
+ * nor Handles (index + generation are re-checked at every use), nor bool /
+ * optional (a value invariant, not an address — tracked separately). Exhaustive
+ * switch, no default; past the cap the answer is YES (reject). */
+static bool bitcast_target_mints(Type *t, int depth) {
+    if (!t) return false;
+    if (depth > 32) return true;
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(t)) {
+    case TYPE_POINTER: case TYPE_OPAQUE: case TYPE_SLICE: case TYPE_FUNC_PTR:
+    case TYPE_ARENA:
+        return true;
+    case TYPE_OPTIONAL:
+        return bitcast_target_mints(u->optional.inner, depth + 1);
+    case TYPE_ARRAY:
+        return bitcast_target_mints(u->array.inner, depth + 1);
+    case TYPE_STRUCT:
+        if (u->struct_type.is_async_state) return true;
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (bitcast_target_mints(u->struct_type.fields[i].type, depth + 1))
+                return true;
+        return false;
+    case TYPE_UNION:
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (bitcast_target_mints(u->union_type.variants[i].type, depth + 1))
+                return true;
+        return false;
+    /* No address and no compiler-owned resume state in these. Pool / Ring / Slab /
+     * Barrier / Semaphore are unique resources, refused as values elsewhere. */
+    case TYPE_VOID: case TYPE_BOOL: case TYPE_ENUM: case TYPE_HANDLE:
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64: case TYPE_UINT: case TYPE_SINT:
+    case TYPE_POOL: case TYPE_RING: case TYPE_BARRIER: case TYPE_SLAB:
+    case TYPE_SEMAPHORE: case TYPE_DISTINCT:
         return false;
     }
     return false;
@@ -12104,10 +12166,19 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     if (c->in_comptime_body) mark_proven(c, node);
                     int div_has_proof = checker_is_proven(c, node) ? 1 : 0;
                     if (div_val != 0 && zer_divisor_proven_nonzero(div_has_proof) == 0) {
+                        /* BUG-1435: a FIELD divisor whose path has no key (a
+                         * variable index on the way — `s[k].d`) can never be
+                         * proven by VRP, and fell through BOTH arms here: no key,
+                         * so no "not proven" error, and not a "complex divisor"
+                         * either. It was accepted with no proof, the one divisor
+                         * shape the forced-guard rule skipped. It is a complex
+                         * divisor now. */
+                        ExprKey dname = {NULL, 0};
                         if (node->binary.right->kind == NODE_IDENT ||
-                            node->binary.right->kind == NODE_FIELD) {
-                            ExprKey dname = build_expr_key_a(c, node->binary.right);
-                            if (dname.len > 0) {
+                            node->binary.right->kind == NODE_FIELD)
+                            dname = build_expr_key_a(c, node->binary.right);
+                        if (dname.len > 0) {
+                            {
                                 /* BUG-1067: name a guard that COMPILES for this type —
                                  * `y == 0` is a type error on a float. */
                                 checker_error(c, node->loc.line,
@@ -12450,13 +12521,14 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * Covers ALL paths: var-decl init, assignment, call args,
                      * struct field store, return. Single check point = 100%. */
                     {
+                        /* BUG-1430: EVERY entry of the variable, not the newest
+                         * (a guard's narrowing would be popped, resurrecting the
+                         * declaration's range without the flag). */
                         struct VarRange *r = find_var_range(c,
                             root->ident.name, (uint32_t)root->ident.name_len);
                         if (r) {
-                            r->min_val = INT64_MIN;
-                            r->max_val = INT64_MAX;
-                            r->known_nonzero = false;
-                            r->address_taken = true;
+                            vrp_widen_key_all(c, root->ident.name,
+                                (uint32_t)root->ident.name_len, true);
                         } else {
                             push_var_range(c, root->ident.name,
                                 (uint32_t)root->ident.name_len,
@@ -13391,20 +13463,15 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 Symbol *tsym = scope_lookup(c->current_scope,
                     troot->ident.name, (uint32_t)troot->ident.name_len);
                 if (tsym) {
-                    /* Refactor 1: unified VRP invalidation via helper.
-                     * One call for simple ident, one for compound key.
-                     * Both use same logic — no more inconsistency between paths. */
-                    vrp_invalidate_for_assign(c, troot->ident.name,
-                        (uint32_t)troot->ident.name_len,
-                        node->assign.op, node->assign.value);
-                    /* compound key range (e.g., "s.x" for struct field) */
-                    if (node->assign.target->kind == NODE_FIELD) {
-                        ExprKey ckey = build_expr_key_a(c, node->assign.target);
-                        if (ckey.len > 0) {
-                            vrp_invalidate_for_assign(c, ckey.str, (uint32_t)ckey.len,
-                                node->assign.op, node->assign.value);
-                        }
-                    }
+                    /* Refactor 1 + BUG-1430/1434: ONE store application for the
+                     * whole target path. It reaches every range entry of the
+                     * variable (a guard-pushed narrowing used to absorb the store
+                     * and be popped, resurrecting the stale declaration range) and
+                     * every compound key the path overlaps (`s = t` / `s.in = t` /
+                     * `s[k].d = 0` used to leave "s.d" / "s.in.d" / "s[0].d" with
+                     * their old range). */
+                    vrp_store_target(c, node->assign.target,
+                                     node->assign.op, node->assign.value, false);
                     /* clear — will be re-set below if new value is unsafe.
                      * ONLY clear if assigning the whole variable (NODE_IDENT target).
                      * Field/index assignments (h.val = 42) must NOT clear flags on
@@ -14518,9 +14585,13 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     }
                 }
                 if (!div_ok) {
-                    if (divisor->kind == NODE_IDENT || divisor->kind == NODE_FIELD) {
-                        ExprKey dname = build_expr_key_a(c, divisor);
-                        if (dname.len > 0) {
+                    /* BUG-1435: the compound-assign twin — an unkeyable FIELD
+                     * divisor (`x /= s[k].d`) is a complex divisor, not silence. */
+                    ExprKey dname = {NULL, 0};
+                    if (divisor->kind == NODE_IDENT || divisor->kind == NODE_FIELD)
+                        dname = build_expr_key_a(c, divisor);
+                    if (dname.len > 0) {
+                        {
                             Type *dvt = checker_get_type(c, divisor);
                             checker_error(c, node->loc.line,
                                 "divisor '%.*s' not proven nonzero — "
@@ -16357,13 +16428,9 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     else operand = operand->index_expr.object;
                 }
                 if (operand && operand->kind == NODE_IDENT) {
-                    struct VarRange *r = find_var_range(c, operand->ident.name,
-                        (uint32_t)operand->ident.name_len);
-                    if (r) {
-                        r->min_val = INT64_MIN;
-                        r->max_val = INT64_MAX;
-                        r->known_nonzero = false;
-                    }
+                    /* BUG-1430: every entry of the variable, not the newest. */
+                    vrp_widen_key_all(c, operand->ident.name,
+                        (uint32_t)operand->ident.name_len, false);
                 }
             }
         }
@@ -18551,6 +18618,22 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 "non-pointer (forges a pointer) — use @%s for the "
                                 "address conversion",
                                 dst_prim ? "ptrtoint" : "inttoptr");
+                        }
+                        /* BUG-1432: the AGGREGATE sibling — a struct / union / array
+                         * / optional target that carries an address or is an async
+                         * task frame (see bitcast_target_mints). Only a pure
+                         * reinterpretation between DIFFERENT types mints; the same
+                         * type is a copy. Scalar pointer targets are the rule above. */
+                        else if (dst_prim &&
+                                 !type_equals(type_unwrap_distinct(val_type),
+                                              type_unwrap_distinct(result)) &&
+                                 bitcast_target_mints(result, 0)) {
+                            checker_error(c, node->loc.line,
+                                "@bitcast cannot build a '%s' from foreign bits — it "
+                                "carries a pointer, slice, function pointer or async task "
+                                "state that nothing re-validates. Assign the fields "
+                                "(use @inttoptr for an address)",
+                                type_name(result));
                         }
                     }
                 }
@@ -22729,6 +22812,28 @@ static void check_stmt_impl(Checker *c, Node *node) {
         for (int i = 0; i < node->block.stmt_count; i++) {
             check_stmt(c, node->block.stmts[i]);
         }
+        /* BUG-1431: the defers this block registered FIRE HERE, at its exit —
+         * after the last statement, before the code that follows the block. The
+         * NODE_DEFER handler checks the body at the registration point and
+         * discards its effect (B4: nothing between the `defer` and the exit may
+         * see it), but the code AFTER the block does see it:
+         *
+         *     if (i < 4) { { defer i = 5; } arr[i] = 7; }
+         *
+         * proved arr[i] against [0,3] and stored at arr[5]. Apply every defer's
+         * writes as a MAY-store here (joined into the variable's ranges; a call /
+         * pointer store / suspension widens every global-like range), while the
+         * block's scope is still open so the body's names resolve as they did at
+         * registration. The walker is the loop pre-pass's (one definition of
+         * "what may this code write"). The OTHER exits are covered elsewhere:
+         * `return` evaluates its value before the defers fire (BUG-442) and ends
+         * the path; break / continue leave a loop whose pre-pass already applied
+         * every write in the body, defer bodies included; a label widens all. */
+        for (int i = 0; i < node->block.stmt_count; i++) {
+            Node *ds = node->block.stmts[i];
+            if (ds && ds->kind == NODE_DEFER)
+                vrp_invalidate_loop_body_writes(c, ds->defer.body);
+        }
         pop_scope(c);
         break;
 
@@ -26007,9 +26112,11 @@ static void check_stmt_impl(Checker *c, Node *node) {
              * `defer { idx = 2; }` was eliding a later `garr[idx]` fixed-array
              * bounds guard (verified on main: exit 2 instead of 0 = silent OOB).
              * RESTORE (fully discard the body's in-place narrowing) is the
-             * correct operation here — unlike a may-run body there is no path on
-             * which the body's effect is observable by the following code, so
-             * there is nothing to JOIN. The §C #13 JOIN fix wired
+             * correct operation for the statements between the `defer` and the
+             * exit of its block. BUG-1431: it is NOT true that nothing observes
+             * the body — the code after the ENCLOSING BLOCK does, since the
+             * defer fires at that block's exit. NODE_BLOCK applies the body's
+             * writes there. The §C #13 JOIN fix wired
              * NODE_IF/FOR/WHILE/SWITCH/LABEL but the defer body was checked
              * inline with no snapshot at all. */
             int vrp_saved = c->var_range_count;
@@ -26638,11 +26745,9 @@ static void check_stmt_impl(Checker *c, Node *node) {
              * for every regular = / += / etc. assignment). */
             for (int i = 0; i < node->asm_stmt.output_count; i++) {
                 AsmOperand *op = &node->asm_stmt.outputs[i];
-                if (!op->expr || op->expr->kind != NODE_IDENT) continue;
-                vrp_invalidate_for_assign(c,
-                    op->expr->ident.name,
-                    (uint32_t)op->expr->ident.name_len,
-                    TOK_EQ, NULL);
+                if (!op->expr) continue;
+                /* BUG-1430: any output PATH (`s.x`), not just a bare ident. */
+                vrp_store_target(c, op->expr, TOK_EQ, NULL, false);
             }
 
             /* Z7 (MMIO range): if any operand expression is `@inttoptr`,
@@ -30641,62 +30746,243 @@ static bool vrp_intrinsic_may_store(Checker *c, Node *n) {
     return false;
 }
 
-/* Refactor 1: unified VRP range update on assignment.
- * One function handles both simple ident keys ("i") and compound keys ("s.x").
- * For TOK_EQ: try literal → derive_expr_range → call return range → wipe.
- * For compound ops (+=, -=, etc.): always wipe.
- * Eliminates BUG-502 class: compound key path previously had different logic
- * from simple ident path (missing compound op check, missing call return range). */
-static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
-                                       TokenType op, Node *value) {
-    struct VarRange *r = find_var_range(c, key, key_len);
-    if (!r) return;
-    if (op == TOK_EQ && value) {
-        /* Direct assignment: try to derive new range from value */
-        if (value->kind == NODE_INT_LIT) {
-            int64_t v = (int64_t)value->int_lit.value;
-            r->min_val = v;
-            r->max_val = v;
-            r->known_nonzero = (v != 0);
-        } else {
-            int64_t rmin, rmax;
-            /* BUG-1090: a plain assignment's value is ONE C expression, not
-             * typed temps — only a rendering-invariant constant is trusted. */
-            int64_t tv = vrp_const_value_untyped_render(c, value, NULL);
-            if (tv != CONST_EVAL_FAIL) {
-                r->min_val = tv;
-                r->max_val = tv;
-                r->known_nonzero = (tv != 0);
-            } else if (derive_expr_range(c, value, &rmin, &rmax, true)) {
-                r->min_val = rmin;
-                r->max_val = rmax;
-                r->known_nonzero = (rmin > 0);
-            } else if (value->kind == NODE_CALL &&
-                       value->call.callee && value->call.callee->kind == NODE_IDENT) {
-                Symbol *csym = scope_lookup(c->current_scope,
-                    value->call.callee->ident.name,
-                    (uint32_t)value->call.callee->ident.name_len);
-                if (csym && csym->has_return_range) {
-                    r->min_val = csym->return_range_min;
-                    r->max_val = csym->return_range_max;
-                    r->known_nonzero = (csym->return_range_min > 0);
-                } else {
-                    r->min_val = INT64_MIN;
-                    r->max_val = INT64_MAX;
-                    r->known_nonzero = false;
-                }
-            } else {
-                r->min_val = INT64_MIN;
-                r->max_val = INT64_MAX;
-                r->known_nonzero = false;
-            }
+/* ================================================================
+ * BUG-1430 / BUG-1434: ONE application of a STORE to the range stack.
+ *
+ * The range stack holds SEVERAL entries per variable: the declaration's entry
+ * and one more for every guard that narrowed it (`if (i < 2)` pushes a second
+ * `i`). Only the NEWEST is read, but the older ones become current again the
+ * moment the block that pushed the newer one ends (the count is rewound) — and
+ * the branch JOIN (vrp_snap_join) merges ONLY those older entries. A store used
+ * to update the newest entry alone:
+ *
+ *     u32 i = 1; if (i < 2) { i = get(5); } arr[i] = 7;
+ *
+ * wrote TOP into the narrowing the `if` pushed, the `if` popped it, the join saw
+ * the untouched declaration entry [1,1] on both paths, and `arr[i]` was proven
+ * against a value the variable no longer held — a bare store at arr[5]. So a
+ * store now reaches EVERY entry of the variable's identity (the owner scope +
+ * key, as BUG-1092 defines it).
+ *
+ * The same function also answers the COMPOUND-KEY half (BUG-1434). A key is a
+ * path — "s.d", "s[0].d", "s.in.d", "*p" — and a store to one path changes every
+ * key that OVERLAPS it:
+ *   - a store to a PREFIX (`s = t`, `s.in = t`, `s = mk()`, `s = arr[0]`)
+ *     rewrites every key below it;
+ *   - a store through a VARIABLE index (`s[k].d = 0`) may be `s[0].d`;
+ *   - a key below the stored one has a container that was rewritten.
+ * Only the store to exactly the same path (no wildcard) sets the derived range;
+ * every other overlap is widened to TOP. Each of those used to leave `s.d`
+ * known-nonzero across a store that zeroed it, so a division was "proven".
+ * (Union variants cannot overlap here: a variant is never read by field — the
+ * checker requires a switch — so two different field names never alias.)
+ * ================================================================ */
+typedef enum { VRP_REL_NONE = 0, VRP_REL_EXACT, VRP_REL_ALIAS } VrpKeyRel;
+
+/* End of the key component starting at s[i] ('.' or '['). */
+static uint32_t vrp_key_comp_end(const char *s, uint32_t i, uint32_t n) {
+    if (s[i] == '[') {
+        while (i < n && s[i] != ']') i++;
+        return i < n ? i + 1 : n;
+    }
+    i++;
+    while (i < n && s[i] != '.' && s[i] != '[') i++;
+    return i;
+}
+
+static bool vrp_key_comp_is_wild(const char *s, uint32_t i, uint32_t end) {
+    return s[i] == '[' && end - i == 3 && s[i + 1] == '?';
+}
+
+/* How does the stored path `t` (may hold "[?]" for a non-literal index) relate
+ * to the range key `e`? Roots are compared by NAME here; the caller compares the
+ * owner scope, which is the identity. */
+static VrpKeyRel vrp_key_relation(const char *e, uint32_t el,
+                                  const char *t, uint32_t tl) {
+    uint32_t ei = 0, ti = 0;
+    while (ei < el && e[ei] == '*') ei++;
+    while (ti < tl && t[ti] == '*') ti++;
+    bool inexact = (ei != ti);   /* `p = q` vs key "*p": the pointee changed too */
+    uint32_t er = ei, tr = ti;
+    while (er < el && e[er] != '.' && e[er] != '[') er++;
+    while (tr < tl && t[tr] != '.' && t[tr] != '[') tr++;
+    if (er - ei != tr - ti || memcmp(e + ei, t + ti, er - ei) != 0) return VRP_REL_NONE;
+    ei = er; ti = tr;
+    for (;;) {
+        bool e_done = ei >= el, t_done = ti >= tl;
+        if (e_done && t_done) return inexact ? VRP_REL_ALIAS : VRP_REL_EXACT;
+        if (e_done || t_done) return VRP_REL_ALIAS;   /* one path contains the other */
+        uint32_t en = vrp_key_comp_end(e, ei, el), tn = vrp_key_comp_end(t, ti, tl);
+        bool ew = vrp_key_comp_is_wild(e, ei, en), tw = vrp_key_comp_is_wild(t, ti, tn);
+        if (e[ei] == '[' && t[ti] == '[' && (ew || tw)) {
+            inexact = true;           /* a variable index may be any element */
+        } else if (en - ei != tn - ti || memcmp(e + ei, t + ti, en - ei) != 0) {
+            return VRP_REL_NONE;      /* a different field / a different literal index */
         }
-    } else {
-        /* Compound assignment (+=, -=, etc.) — always wipe */
+        ei = en; ti = tn;
+    }
+}
+
+/* The PATH a store writes, spelled like a range key but with "[?]" for an index
+ * that is not an integer literal. `buf` NULL = measure. -1 = not a path (a call
+ * result, a cast, ...): such a target is reached only through a pointer, and
+ * vrp_store_through_pointer widens for it. */
+static int vrp_store_path(Node *e, char *buf) {
+    if (!e) return -1;
+    if (e->kind == NODE_IDENT) {
+        if (buf) memcpy(buf, e->ident.name, e->ident.name_len);
+        return (int)e->ident.name_len;
+    }
+    if (e->kind == NODE_FIELD) {
+        int b = vrp_store_path(e->field.object, buf);
+        if (b < 0) return -1;
+        if (buf) {
+            buf[b] = '.';
+            memcpy(buf + b + 1, e->field.field_name, e->field.field_name_len);
+        }
+        return b + 1 + (int)e->field.field_name_len;
+    }
+    if (e->kind == NODE_INDEX) {
+        int b = vrp_store_path(e->index_expr.object, buf);
+        if (b < 0) return -1;
+        char tmp[32];
+        int n;
+        if (e->index_expr.index && e->index_expr.index->kind == NODE_INT_LIT)
+            n = snprintf(tmp, sizeof tmp, "[%llu]",
+                         (unsigned long long)e->index_expr.index->int_lit.value);
+        else
+            n = snprintf(tmp, sizeof tmp, "[?]");
+        if (n <= 0) return -1;
+        if (buf) memcpy(buf + b, tmp, (size_t)n);
+        return b + n;
+    }
+    if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR) {
+        int b = vrp_store_path(e->unary.operand, buf ? buf + 1 : NULL);
+        if (b < 0) return -1;
+        if (buf) buf[0] = '*';
+        return b + 1;
+    }
+    return -1;
+}
+
+/* Apply a store of [mn, mx] (nz = known nonzero) to path `t`. `join` = the store
+ * MAY have happened (a loop body's pre-pass, a defer that fires at a block exit):
+ * union into the exact entries instead of replacing them. */
+static void vrp_apply_store(Checker *c, const char *t, uint32_t tl,
+                            int64_t mn, int64_t mx, bool nz, bool join) {
+    Scope *owner = NULL;
+    (void)vrp_key_root(c, t, tl, &owner);
+    for (int i = 0; i < c->var_range_count; i++) {
+        struct VarRange *r = &c->var_ranges[i];
+        if (r->owner != owner) continue;
+        VrpKeyRel rel = vrp_key_relation(r->name, r->name_len, t, tl);
+        if (rel == VRP_REL_NONE) continue;
+        if (rel == VRP_REL_EXACT && join) {
+            if (mn < r->min_val) r->min_val = mn;
+            if (mx > r->max_val) r->max_val = mx;
+            r->known_nonzero = r->known_nonzero && nz;
+        } else if (rel == VRP_REL_EXACT) {
+            r->min_val = mn;
+            r->max_val = mx;
+            r->known_nonzero = nz;
+        } else {
+            r->min_val = INT64_MIN;
+            r->max_val = INT64_MAX;
+            r->known_nonzero = false;
+        }
+    }
+}
+
+/* BUG-1430: widen EVERY entry of this key's identity (optionally marking it
+ * address-taken) — the newest-entry-only form lost the effect when the newer
+ * entry was popped. */
+static void vrp_widen_key_all(Checker *c, const char *name, uint32_t name_len,
+                              bool mark_addr_taken) {
+    Scope *owner = NULL;
+    (void)vrp_key_root(c, name, name_len, &owner);
+    for (int i = 0; i < c->var_range_count; i++) {
+        struct VarRange *r = &c->var_ranges[i];
+        if (r->owner != owner) continue;
+        if (vrp_key_relation(r->name, r->name_len, name, name_len) == VRP_REL_NONE)
+            continue;
         r->min_val = INT64_MIN;
         r->max_val = INT64_MAX;
         r->known_nonzero = false;
+        if (mark_addr_taken) r->address_taken = true;
     }
+}
+
+/* Refactor 1: unified VRP range update on assignment.
+ * For TOK_EQ: try literal -> typed const -> derive_expr_range -> call return
+ * range -> wipe. For compound ops (+=, -=, etc.): always wipe.
+ * BUG-1430: the derived range is APPLIED through vrp_apply_store, which reaches
+ * every entry of the variable (and every overlapping compound key), not just the
+ * newest one. `key` is a store path (vrp_store_path spelling). */
+static void vrp_assigned_range(Checker *c, TokenType op, Node *value,
+                               int64_t *mn, int64_t *mx, bool *nz) {
+    *mn = INT64_MIN; *mx = INT64_MAX; *nz = false;
+    if (op != TOK_EQ || !value) return;           /* compound op: result unknown */
+    if (value->kind == NODE_INT_LIT) {
+        int64_t v = (int64_t)value->int_lit.value;
+        *mn = *mx = v; *nz = (v != 0);
+        return;
+    }
+    int64_t rmin, rmax;
+    /* BUG-1090: a plain assignment's value is ONE C expression, not
+     * typed temps — only a rendering-invariant constant is trusted. */
+    int64_t tv = vrp_const_value_untyped_render(c, value, NULL);
+    if (tv != CONST_EVAL_FAIL) {
+        *mn = *mx = tv; *nz = (tv != 0);
+    } else if (derive_expr_range(c, value, &rmin, &rmax, true)) {
+        *mn = rmin; *mx = rmax; *nz = (rmin > 0);
+    } else if (value->kind == NODE_CALL &&
+               value->call.callee && value->call.callee->kind == NODE_IDENT) {
+        Symbol *csym = scope_lookup(c->current_scope,
+            value->call.callee->ident.name,
+            (uint32_t)value->call.callee->ident.name_len);
+        if (csym && csym->has_return_range) {
+            *mn = csym->return_range_min;
+            *mx = csym->return_range_max;
+            *nz = (csym->return_range_min > 0);
+        }
+    }
+}
+static void vrp_invalidate_for_assign(Checker *c, const char *key, uint32_t key_len,
+                                       TokenType op, Node *value) {
+    int64_t mn, mx; bool nz;
+    vrp_assigned_range(c, op, value, &mn, &mx, &nz);
+    vrp_apply_store(c, key, key_len, mn, mx, nz, false);
+}
+
+/* BUG-1430/1434: the ONE entry point for "this lvalue was just stored to".
+ * Returns false when the target is not a path (see vrp_store_path). */
+static bool vrp_store_target(Checker *c, Node *target, TokenType op, Node *value,
+                             bool join) {
+    int n = vrp_store_path(target, NULL);
+    if (n <= 0) return false;
+    char *key = (char *)arena_alloc(c->arena, (size_t)n + 1);
+    if (!key) return false;
+    vrp_store_path(target, key);
+    key[n] = '\0';
+    if (join) {
+        /* loop pre-pass / defer effect: the value is NOT type-checked yet
+         * (or is checked in another context) — only the shapes that need no
+         * typemap are derived. */
+        int64_t vmin = INT64_MIN, vmax = INT64_MAX; bool vnz = false;
+        if (op == TOK_EQ && value && value->kind == NODE_INT_LIT) {
+            vmin = vmax = (int64_t)value->int_lit.value;
+            vnz = (vmin != 0);
+        } else if (op == TOK_EQ && value &&
+                   derive_expr_range(c, value, &vmin, &vmax, true)) {
+            vnz = (vmin > 0);
+        } else {
+            vmin = INT64_MIN; vmax = INT64_MAX; vnz = false;
+        }
+        vrp_apply_store(c, key, (uint32_t)n, vmin, vmax, vnz, true);
+    } else {
+        vrp_invalidate_for_assign(c, key, (uint32_t)n, op, value);
+    }
+    return true;
 }
 
 /* VRP branch-merge (Finding A, 2026-07-03): an assignment inside an if-branch
@@ -30732,36 +31018,6 @@ static void vrp_snap_join(Checker *c, struct VarRange *s, int n) {
         if (s[i].max_val > r->max_val) r->max_val = s[i].max_val;
         r->known_nonzero = r->known_nonzero && s[i].known_nonzero;
     }
-}
-
-/* JOIN (union) an assignment's value range into a variable's live VRP range,
- * instead of REPLACING it. Used for a loop-body write, where the body index
- * use may observe either the loop-carried (pre) value OR this write's value:
- * the sound range is the union of both. Preserves known_nonzero only when
- * both the prior range and the assigned value are nonzero (so `d = 3` inside
- * a loop keeps a `100/d` division provable, while `i = 0` correctly drops
- * known_nonzero and widens the bound). Mirrors vrp_invalidate_for_assign's
- * value-range derivation but unions rather than overwrites. */
-static void vrp_join_assign_range(Checker *c, const char *name, uint32_t name_len,
-                                   TokenType op, Node *value) {
-    struct VarRange *r = find_var_range(c, name, name_len);
-    if (!r) return;
-    int64_t vmin, vmax;
-    bool vnz;
-    if (op == TOK_EQ && value && value->kind == NODE_INT_LIT) {
-        vmin = vmax = (int64_t)value->int_lit.value;
-        vnz = (vmin != 0);
-    } else if (op == TOK_EQ && value && derive_expr_range(c, value, &vmin, &vmax, true)) {
-        vnz = (vmin > 0);
-    } else {
-        /* compound op (+=, etc.) or underivable rhs → result unknown */
-        vmin = INT64_MIN;
-        vmax = INT64_MAX;
-        vnz = false;
-    }
-    if (vmin < r->min_val) r->min_val = vmin;
-    if (vmax > r->max_val) r->max_val = vmax;
-    r->known_nonzero = r->known_nonzero && vnz;
 }
 
 /* BUG-748 (2026-06-18): pre-pass for while/do-while bodies that widens
@@ -30806,20 +31062,14 @@ static void vrp_invalidate_loop_body_writes(Checker *c, Node *body) {
      * a silent OOB). So every expression kind that can NEST an orelse is walked. */
     switch (body->kind) {
     case NODE_ASSIGN: {
-        Node *t = body->assign.target;
-        /* walk through field/index chains to root ident */
-        while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX)) {
-            if (t->kind == NODE_FIELD) t = t->field.object;
-            else t = t->index_expr.object;
-        }
-        if (t && t->kind == NODE_IDENT) {
-            /* JOIN this write's value range with the loop-carried (pre) range —
-             * never narrow to just the assigned value. The body use may see
-             * either the carried value or this write's value. */
-            vrp_join_assign_range(c, t->ident.name,
-                (uint32_t)t->ident.name_len,
-                body->assign.op, body->assign.value);
-        }
+        /* JOIN this write's value range with the loop-carried (pre) range —
+         * never narrow to just the assigned value. The body use may see
+         * either the carried value or this write's value.
+         * BUG-1430/1434: through the ONE store application — every entry of the
+         * variable, and every compound key the path overlaps (`s.d = 0` in a
+         * loop body used to join into the ROOT `s` only, leaving "s.d" alone). */
+        vrp_store_target(c, body->assign.target, body->assign.op,
+                         body->assign.value, true);
         /* BUG-1094: a store that is not to a plain variable may go through a
          * pointer (the body is not type-checked yet, so the path cannot be
          * classified) — the back edge carries it to the top of the body. */
@@ -30991,14 +31241,10 @@ static void vrp_widen_loop_addr_taken(Checker *c, Node *n) {
                                                   : root->index_expr.object;
             }
             if (root && root->kind == NODE_IDENT) {
-                struct VarRange *r = find_var_range(c, root->ident.name,
-                    (uint32_t)root->ident.name_len);
-                if (r) {
-                    r->min_val = INT64_MIN;
-                    r->max_val = INT64_MAX;
-                    r->known_nonzero = false;
-                    r->address_taken = true; /* blocks all later narrowing */
-                }
+                /* BUG-1430: every entry of the variable; address_taken blocks
+                 * all later narrowing. */
+                vrp_widen_key_all(c, root->ident.name,
+                    (uint32_t)root->ident.name_len, true);
                 /* BUG-1095: a LOCAL whose address is taken anywhere in the body
                  * has no range for the whole body (the Symbol flag outlives the
                  * entry). A global is covered by the pointer-store widening. */

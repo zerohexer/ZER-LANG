@@ -1,0 +1,16 @@
+// expect-error: @pun cannot give a WRITABLE
+// BUG-1432: a writable view of an async task frame rewrote its saved index (and
+// could rewrite its resume state) between polls; the resumed body had proven
+// arr[i] in range before the yield. Global-buffer-overflow at the second poll.
+u32 get(u32 a) { return a; }
+u32[4] arr;
+async void worker() { u32 i = get(1); if (i < 4) { yield; arr[i] = 7; } }
+u32 main() {
+    _zer_async_worker task;
+    _zer_async_worker_init(&task);
+    i32 d = _zer_async_worker_poll(&task);
+    *u64 q = @pun(*u64, &task);
+    *q = 21474836481;
+    d = _zer_async_worker_poll(&task);
+    return 42;
+}

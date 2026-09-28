@@ -1,0 +1,13 @@
+// BUG-1402: the frame-bound taint is set textually AFTER the sink, but runs before it
+// (loop back edge / goto / defer). Reproducer from the 2026-09-28 escape probe (L5).
+// expect-error: cannot store local-derived pointer 'p' through poi
+u32 g0 = 1;
+void f(*?*u32 out) {
+    u32 x = 5;
+    *u32 p = &g0;
+    for (u32 i = 0; i < 2; i += 1) {
+        *out = p;
+        p = &x;
+    }
+}
+u32 main() { ?*u32 r = null; f(&r); if (r) |q| { return *q; } return 0; }

@@ -618,6 +618,10 @@ typedef struct {
     } *stack_frames;
     int stack_frame_count;
     int stack_frame_capacity;
+
+    /* BUG-1402: the escape-taint fixpoint (checker.c "escape fixpoint"). Owned by
+     * check_func_body; a POINTER so the per-walk state restore leaves it alone. */
+    struct EscState *esc;
 } Checker;
 
 /* ---- API ---- */

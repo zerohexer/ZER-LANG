@@ -4041,6 +4041,61 @@ static void propagate_escape_flags(Symbol *dst, Symbol *src, Type *dst_type) {
     if (src->is_packed_derived) dst->is_packed_derived = true;
 }
 
+/* BUG-1401: THE root walk for "which variable's escape flags does this VALUE carry?"
+ * — `w.ptr`, `arr[i]`, `np[0..16]`, an intrinsic / reference-producing cast, `&x`,
+ * `*pp`, and BOTH arms of an orelse (BUG-318). It was written out inline at the
+ * var-decl sink only; the ASSIGNMENT sink matched a bare identifier, so
+ * `q = h.p; gp = q;` (h holding `&x`) left q untainted and stored a stack address
+ * into a global, while the spelling `?*u32 q = h.p; gp = q;` was refused. One walk,
+ * both sinks. `whole_alias` (the destination IS the variable, not a field of it)
+ * also carries the arena identity (BUG-848). */
+static bool tynode_is_reference_producing(TypeNode *tn);
+static void propagate_escape_from_value(Checker *c, Symbol *dst, Type *dst_type,
+                                        Node *value, bool whole_alias) {
+    if (!dst || !value) return;
+    Node *checks[2] = { value, NULL };
+    int check_count = 1;
+    if (value->kind == NODE_ORELSE) {
+        checks[0] = value->orelse.expr;
+        if (value->orelse.fallback) checks[check_count++] = value->orelse.fallback;
+    }
+    for (int ci = 0; ci < check_count; ci++) {
+        Node *init_root = checks[ci];
+        while (init_root) {
+            if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
+            else if (init_root->kind == NODE_INDEX) init_root = init_root->index_expr.object;
+            /* BUG-766: `s = np[0..16]` root is np. */
+            else if (init_root->kind == NODE_SLICE) init_root = init_root->slice.object;
+            /* BUG-338 / S1: an intrinsic's pointer operand — `@container`'s is
+             * args[0] (its last arg is the field NAME). */
+            else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
+                init_root = (init_root->intrinsic.name_len == 9 &&
+                             memcmp(init_root->intrinsic.name, "container", 9) == 0)
+                    ? init_root->intrinsic.args[0]
+                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
+            /* BUG-931: a reference-producing C-style cast; a VALUE cast makes a new
+             * value and must not inherit the source's provenance. */
+            else if (init_root->kind == NODE_TYPECAST &&
+                     tynode_is_reference_producing(init_root->typecast.target_type))
+                init_root = init_root->typecast.expr;
+            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
+                init_root = init_root->unary.operand;
+            /* BUG-356: `*pp` root is pp */
+            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_STAR)
+                init_root = init_root->unary.operand;
+            else break;
+        }
+        if (init_root && init_root->kind == NODE_IDENT) {
+            Symbol *src = scope_lookup(c->current_scope, init_root->ident.name,
+                                       (uint32_t)init_root->ident.name_len);
+            /* BUG-421: type-gated inside — a scalar cannot carry the address. */
+            if (src && src != dst) propagate_escape_flags(dst, src, dst_type);
+            if (whole_alias && src && src->arena_source && !dst->arena_source)
+                dst->arena_source = src->arena_source;
+        }
+    }
+}
+
 /* ================================================================
  * BUG-987: @container pointer provenance — ONE writer for the pair
  *
@@ -11687,7 +11742,7 @@ static Type *intrinsic_arg_type(Checker *c, Node *arg) {
     return t ? t : check_expr(c, arg);
 }
 
-static Type *check_expr(Checker *c, Node *node) {
+static Type *check_expr_impl(Checker *c, Node *node) {
     if (!node) return ty_void;
 
     /* recursion depth guard — prevents stack overflow on pathological input.
@@ -13459,10 +13514,15 @@ static Type *check_expr(Checker *c, Node *node) {
                     {
                         Node *vcheck = node->assign.value;
                         if (vcheck->kind == NODE_ORELSE) vcheck = vcheck->orelse.expr;
+                        /* BUG-1401: the same root walk as the var-decl sink, so a
+                         * field / element / slice / cast / deref READ carries its
+                         * root's flags here too (`q = h.p;`). The orelse is walked
+                         * whole (both arms) by the helper. */
+                        propagate_escape_from_value(c, tsym, tsym->type,
+                                                    node->assign.value, false);
                         if (vcheck->kind == NODE_IDENT) {
                             Symbol *src = scope_lookup(c->current_scope,
                                 vcheck->ident.name, (uint32_t)vcheck->ident.name_len);
-                            if (src) propagate_escape_flags(tsym, src, tsym->type);
                             /* BUG-848: the arena IDENTITY rides an ALIAS only —
                              * `free_head = block_ptr;` (whole ident), never a
                              * field store. See propagate_escape_flags. */
@@ -22647,7 +22707,7 @@ static bool global_wide_init_ok(Node *n, int depth) {
     }
 }
 
-static void check_stmt(Checker *c, Node *node) {
+static void check_stmt_impl(Checker *c, Node *node) {
     if (!node) return;
 
     /* In async functions, set in_async_yield_stmt for statements containing yield/await.
@@ -23102,81 +23162,10 @@ static void check_stmt(Checker *c, Node *node) {
                         }
                     }
                 }
-                /* propagate arena/local-derived from init expression
-                 * Walk field/index chains to find root (handles w.ptr, arr[i])
-                 * BUG-318: check BOTH orelse.expr AND orelse.fallback */
+                /* propagate arena/local-derived from init expression —
+                 * the shared root walk (BUG-1401: the assignment sink uses it too). */
                 {
-                    Node *checks[2] = { node->var_decl.init, NULL };
-                    int check_count = 1;
-                    if (checks[0] && checks[0]->kind == NODE_ORELSE) {
-                        checks[0] = node->var_decl.init->orelse.expr;
-                        if (node->var_decl.init->orelse.fallback)
-                            checks[check_count++] = node->var_decl.init->orelse.fallback;
-                    }
-                    for (int ci = 0; ci < check_count; ci++) {
-                        Node *init_root = checks[ci];
-                        while (init_root) {
-                            if (init_root->kind == NODE_FIELD) init_root = init_root->field.object;
-                            else if (init_root->kind == NODE_INDEX) init_root = init_root->index_expr.object;
-                            /* BUG-766 (copied from dfcqr9): walk NODE_SLICE — `s = np[0..16]`
-                             * root is np. Without this, is_nonkeep_derived doesn't propagate
-                             * from the slice subject through a slice-via-intermediate-var, so
-                             * a later keepfn(s) never infers keep on np's root param. */
-                            else if (init_root->kind == NODE_SLICE) init_root = init_root->slice.object;
-                            /* BUG-338: walk into intrinsic args (ptrcast, bitcast).
-                             * S1 (2026-08-02): `@container`'s POINTER operand is
-                             * args[0] — its LAST arg is the field NAME. Taking
-                             * args[last] here walked to the field name, found no
-                             * root ident, and stopped, so
-                             * `*Node d = @container(*Node, lp, list);` never
-                             * inherited is_local_derived and the local escaped
-                             * un-tainted to a global / return / keep sink
-                             * (ASan stack-use-after-return). Mirrors the
-                             * special-case unwrap_ptr_launder already has.
-                             *
-                             * This was a KNOWN miss: the §C5 chain-unwrap
-                             * (2026-08-01) commented that "@container is not a
-                             * launder form and is handled elsewhere" — it is a
-                             * launder form, and it was not handled here. */
-                            else if (init_root->kind == NODE_INTRINSIC && init_root->intrinsic.arg_count > 0)
-                                init_root = (init_root->intrinsic.name_len == 9 &&
-                                             memcmp(init_root->intrinsic.name, "container", 9) == 0)
-                                    ? init_root->intrinsic.args[0]
-                                    : init_root->intrinsic.args[init_root->intrinsic.arg_count - 1];
-                            /* BUG-931: the C-style cast was the ONE carrier this
-                             * chain-unwrap never knew, so `*N b = (*N)a; g = b;`
-                             * dropped a's arena/local taint at the var-decl and the
-                             * two-hop launder reached the global unflagged. Gated on
-                             * the target being reference-producing, exactly as the
-                             * shared peeler gates it — a VALUE cast makes a new
-                             * value and must NOT inherit the source's provenance. */
-                            else if (init_root->kind == NODE_TYPECAST &&
-                                     tynode_is_reference_producing(init_root->typecast.target_type))
-                                init_root = init_root->typecast.expr;
-                            /* walk into & — &x root is x */
-                            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_AMP)
-                                init_root = init_root->unary.operand;
-                            /* BUG-356: walk through deref — *pp root is pp */
-                            else if (init_root->kind == NODE_UNARY && init_root->unary.op == TOK_STAR)
-                                init_root = init_root->unary.operand;
-                            else break;
-                        }
-                        if (init_root && init_root->kind == NODE_IDENT) {
-                            Symbol *src = scope_lookup(c->current_scope,
-                                init_root->ident.name,
-                                (uint32_t)init_root->ident.name_len);
-                            /* BUG-421: only propagate local/arena-derived flags when the
-                             * target variable can actually carry a pointer. Scalar types
-                             * (u32, bool, etc.) can't escape local memory even if the
-                             * source struct was marked local-derived. Without this check,
-                             * u32 val = struct_result.field falsely inherits the flag. */
-                            if (src) propagate_escape_flags(sym, src, type);
-                            /* BUG-848: a var-decl target IS the whole variable, so
-                             * an initializer alias carries the arena identity. */
-                            if (src && src->arena_source && !sym->arena_source)
-                                sym->arena_source = src->arena_source;
-                        }
-                    }
+                    propagate_escape_from_value(c, sym, type, node->var_decl.init, true);
                     /* BUG-1363: the keep axis asks the one value query, which also
                      * sees through a CALL result, an orelse, a struct literal. */
                     taint_nonkeep_from_value(c, sym, type, node->var_decl.init);
@@ -29555,7 +29544,401 @@ static bool all_paths_return(Node *node) {
     return false;
 }
 
+/* ================================================================
+ * BUG-1402: the ESCAPE FIXPOINT — frame-bound taint that reaches a sink the
+ * linear walk had already passed.
+ *
+ * The escape flags (is_local_derived, is_arena_derived, is_from_arena,
+ * is_nonkeep_derived, is_keep_derived) are set in ONE statement-order walk, and
+ * every sink reads them at its own TEXTUAL position. Three constructs run code
+ * in a different order than it is written, and in each a pointer was stored /
+ * returned / handed to a keep parameter before the walk had seen it become
+ * frame-bound — all ASan stack-use-after-return, all compiled clean:
+ *     for (...) { gp = p;  p = &x; }            a loop's back edge
+ *     goto set; use: gp = p; return; set: p = &x; goto use;    any jump
+ *     defer gp = p;  p = &x;                    a body that runs at scope exit
+ * (BUG-1274 fixed the opposite direction, a conditional reassignment CLEARING
+ * the taint; nothing joined it around a back edge.)
+ *
+ * The facts are MAY facts and they only grow, so the missing state is a JOIN:
+ *   - LOOP: the flags an outer variable GAINS inside a loop reach the top of the
+ *     loop on the back edge. Recorded per (loop, variable) and OR-ed in at the
+ *     loop's entry. (A variable declared inside the body is re-initialised on
+ *     every iteration, so only outer variables carry.)
+ *   - LABEL / GOTO: control may reach any point from any other, so the flags are
+ *     flow-INSENSITIVE for the function: every variable starts with the union of
+ *     everything it ever holds, and a reassignment never clears ("sticky").
+ *   - DEFER: the body is checked at registration but runs at every exit, so it
+ *     sees the union of what each visible variable ever holds.
+ * The joined state is what every EXISTING sink reads, so all sinks (global store,
+ * out-param store, return, keep call, keep inference, spawn, Ring push) are
+ * covered by construction — no sink is taught anything.
+ *
+ * Mechanism: the function body is checked once for real. If that walk saw a
+ * taint appear that an earlier sink may have missed (an outer variable gained
+ * flags inside a loop; flags were added by an assignment in a function with a
+ * label, or after a `defer`), the body is re-walked QUIETLY with the recorded
+ * facts applied until they stop growing, then once more for real. Before each
+ * re-walk the checker state is restored to the function's entry (tables the walk
+ * APPENDS to have their counts rolled back); definitions the walk may create —
+ * container stamps, auto-slabs, type ids — and the typemap / diagnostics are kept.
+ * The final walk does not repeat a diagnostic the first one already printed.
+ * A function in which no such taint appears — nearly all of them — is walked once.
+ * ================================================================ */
+enum { ESC_LOCAL = 1, ESC_ARENA = 2, ESC_FROM_ARENA = 4, ESC_NONKEEP = 8, ESC_KEEPD = 16 };
+typedef struct EscFact {
+    const void *loop;        /* the loop node, or NULL = "ever, anywhere in the function" */
+    const char *key;         /* the declaration's name pointer: one per declaration */
+    uint32_t bits;
+    uint64_t nk_mask;
+    int nk_root;
+} EscFact;
+struct EscState {
+    EscFact *facts; int n, cap;
+    bool active;        /* inside check_func_body's walk */
+    bool event;         /* a taint appeared that a textually earlier sink may have missed */
+    bool sticky;        /* the function has a label / goto: flow-insensitive */
+    int defers_seen;    /* `defer`s registered so far in this walk */
+    int dedupe_from, dedupe_to;   /* the final walk does not repeat these diagnostics */
+    uint64_t growth;    /* monotone count of fact bits, to detect the fixpoint */
+};
+
+static uint32_t esc_bits(const Symbol *s) {
+    return (s->is_local_derived ? ESC_LOCAL : 0) | (s->is_arena_derived ? ESC_ARENA : 0) |
+           (s->is_from_arena ? ESC_FROM_ARENA : 0) | (s->is_nonkeep_derived ? ESC_NONKEEP : 0) |
+           (s->is_keep_derived ? ESC_KEEPD : 0);
+}
+static void esc_apply(Symbol *s, uint32_t b, uint64_t mask, int root) {
+    if (b & ESC_LOCAL) s->is_local_derived = true;
+    if (b & ESC_ARENA) s->is_arena_derived = true;
+    if (b & ESC_FROM_ARENA) s->is_from_arena = true;
+    if (b & ESC_KEEPD) s->is_keep_derived = true;
+    if (b & ESC_NONKEEP) {
+        if (!s->is_nonkeep_derived) s->nonkeep_root_param = root;
+        s->is_nonkeep_derived = true;
+        s->nonkeep_root_mask |= mask;
+    }
+}
+static EscFact *esc_fact_find(struct EscState *e, const void *loop, const char *key) {
+    for (int i = 0; i < e->n; i++)
+        if (e->facts[i].loop == loop && e->facts[i].key == key) return &e->facts[i];
+    return NULL;
+}
+/* OR bits into the fact; true when it grew. */
+static bool esc_fact_or(struct EscState *e, const void *loop, const char *key,
+                        uint32_t bits, uint64_t mask, int root) {
+    if (!key || (!bits && !mask)) return false;
+    EscFact *f = esc_fact_find(e, loop, key);
+    if (!f) {
+        if (e->n >= e->cap) {
+            int nc = e->cap ? e->cap * 2 : 32;
+            EscFact *nf = (EscFact *)realloc(e->facts, (size_t)nc * sizeof(EscFact));
+            if (!nf) return false;
+            e->facts = nf; e->cap = nc;
+        }
+        f = &e->facts[e->n++];
+        f->loop = loop; f->key = key; f->bits = 0; f->nk_mask = 0; f->nk_root = root;
+    }
+    uint32_t nb = f->bits | bits;
+    uint64_t nm = f->nk_mask | mask;
+    if (nb == f->bits && nm == f->nk_mask) return false;
+    e->growth += (uint64_t)(__builtin_popcount(nb & ~f->bits) +
+                            __builtin_popcountll(nm & ~f->nk_mask));
+    f->bits = nb; f->nk_mask = nm;
+    return true;
+}
+static bool esc_on(Checker *c) { return c->esc && c->esc->active; }
+static void esc_note_ever(Checker *c, Symbol *s) {
+    if (!esc_on(c) || !s) return;
+    esc_fact_or(c->esc, NULL, s->name, esc_bits(s),
+                s->is_nonkeep_derived ? s->nonkeep_root_mask : 0, s->nonkeep_root_param);
+}
+static void esc_apply_fact(Checker *c, const void *loop, Symbol *s) {
+    if (!esc_on(c) || !s) return;
+    EscFact *f = esc_fact_find(c->esc, loop, s->name);
+    if (f) esc_apply(s, f->bits, f->nk_mask, f->nk_root);
+}
+/* The function's own scopes, innermost first — NOT a module / global scope. */
+#define ESC_FOR_LOCAL_SYMS(c, SYM, BODY) do { \
+    for (Scope *_es = (c)->current_scope; _es && _es != (c)->global_scope && \
+         _es->parent && !_es->module_name; _es = _es->parent) \
+        for (uint32_t _ei = 0; _ei < _es->symbol_count; _ei++) { \
+            Symbol *SYM = _es->symbols[_ei]; \
+            if (!SYM || SYM->is_function) continue; \
+            BODY \
+        } \
+} while (0)
+
+/* Does this function body contain a label or a goto — in a statement, or in an
+ * orelse block reached through an expression? Exhaustive; the conservative
+ * direction (sticky) is "yes". */
+static bool esc_has_jump(Checker *c, Node *n, int depth);
+static bool esc_has_jump_ob(Checker *c, Node *blk, void *ud) {
+    return esc_has_jump(c, blk, *(int *)ud + 1);
+}
+static bool esc_has_jump(Checker *c, Node *n, int depth) {
+    if (!n) return false;
+    if (depth > ZER_EXPR_WALK_MAX) return true;
+    int d = depth;
+    if (for_each_orelse_block(c, n, esc_has_jump_ob, &d, 0)) return true;
+    #define EHJ(x) do { if (esc_has_jump(c, (x), depth + 1)) return true; } while (0)
+    switch (n->kind) {
+    case NODE_GOTO: case NODE_LABEL: return true;
+    case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) EHJ(n->block.stmts[i]); return false;
+    case NODE_IF: EHJ(n->if_stmt.then_body); EHJ(n->if_stmt.else_body); return false;
+    case NODE_FOR: EHJ(n->for_stmt.init); EHJ(n->for_stmt.body); return false;
+    case NODE_WHILE: case NODE_DO_WHILE: EHJ(n->while_stmt.body); return false;
+    case NODE_SWITCH:
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) EHJ(n->switch_stmt.arms[i].body);
+        return false;
+    case NODE_DEFER: EHJ(n->defer.body); return false;
+    case NODE_CRITICAL: EHJ(n->critical.body); return false;
+    case NODE_ONCE: EHJ(n->once.body); return false;
+    /* expression positions were covered by for_each_orelse_block above */
+    case NODE_VAR_DECL: case NODE_RETURN: case NODE_EXPR_STMT: case NODE_AWAIT:
+    case NODE_SPAWN: case NODE_ASM: case NODE_STATIC_ASSERT: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_YIELD:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_BINARY:
+    case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD: case NODE_INDEX:
+    case NODE_SLICE: case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_TYPECAST:
+        return false;
+    }
+    #undef EHJ
+    return true;
+}
+
+/* The root local an assignment target writes (`p`, `h.p`, `a[i].q`, `*pp` — a
+ * deref of a local pointer names the object the local then carries, as the keep
+ * axis already treats it). NULL for a global. */
+static Symbol *esc_target_root(Checker *c, Node *t) {
+    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX ||
+                 (t->kind == NODE_UNARY && t->unary.op == TOK_STAR)))
+        t = t->kind == NODE_FIELD ? t->field.object
+          : t->kind == NODE_INDEX ? t->index_expr.object : t->unary.operand;
+    if (!t || t->kind != NODE_IDENT) return NULL;
+    Symbol *s = scope_lookup(c->current_scope, t->ident.name, (uint32_t)t->ident.name_len);
+    if (!s || s->is_function) return NULL;
+    if (global_decl_lookup(c, s->name, s->name_len) == s) return NULL;
+    return s;
+}
+
+static Type *check_expr(Checker *c, Node *node) {
+    if (!node || node->kind != NODE_ASSIGN || !esc_on(c))
+        return check_expr_impl(c, node);
+    Symbol *ts = esc_target_root(c, node->assign.target);
+    uint32_t before = ts ? esc_bits(ts) : 0;
+    uint64_t mbefore = ts ? ts->nonkeep_root_mask : 0;
+    Type *r = check_expr_impl(c, node);
+    if (ts) {
+        esc_note_ever(c, ts);
+        uint32_t added = esc_bits(ts) & ~before;
+        uint64_t madded = ts->nonkeep_root_mask & ~mbefore;
+        if ((added || madded) && (c->esc->sticky || c->esc->defers_seen > 0))
+            c->esc->event = true;
+    }
+    return r;
+}
+
+/* A loop: OR in what its body gave outer variables on earlier walks, check it,
+ * then record what they gained this time. */
+static void esc_check_loop(Checker *c, Node *node) {
+    struct EscState *e = c->esc;
+    int cnt = 0, cap = 16;
+    struct { Symbol *s; uint32_t b; uint64_t m; } stk[16], *ent = stk;
+    ESC_FOR_LOCAL_SYMS(c, s, {
+        esc_apply_fact(c, node, s);
+        if (cnt >= cap) {
+            int nc = cap * 2;
+            void *nb = malloc((size_t)nc * sizeof(*ent));
+            if (!nb) break;
+            memcpy(nb, ent, (size_t)cnt * sizeof(*ent));
+            if (ent != stk) free(ent);
+            ent = nb; cap = nc;
+        }
+        ent[cnt].s = s; ent[cnt].b = esc_bits(s);
+        ent[cnt].m = s->is_nonkeep_derived ? s->nonkeep_root_mask : 0;
+        cnt++;
+    });
+    check_stmt_impl(c, node);
+    for (int i = 0; i < cnt; i++) {
+        Symbol *s = ent[i].s;
+        uint32_t gain = esc_bits(s) & ~ent[i].b;
+        uint64_t mgain = (s->is_nonkeep_derived ? s->nonkeep_root_mask : 0) & ~ent[i].m;
+        if ((gain || mgain) &&
+            esc_fact_or(e, node, s->name, gain | (mgain ? ESC_NONKEEP : 0), mgain,
+                        s->nonkeep_root_param))
+            e->event = true;
+    }
+    if (ent != stk) free(ent);
+}
+
+static void check_stmt(Checker *c, Node *node) {
+    if (!node || !esc_on(c)) { check_stmt_impl(c, node); return; }
+    switch (node->kind) {
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE:
+        esc_check_loop(c, node);
+        return;
+    case NODE_VAR_DECL: {
+        check_stmt_impl(c, node);
+        Symbol *s = scope_lookup_local(c->current_scope, node->var_decl.name,
+                                       (uint32_t)node->var_decl.name_len);
+        if (s) {
+            esc_note_ever(c, s);
+            if (c->esc->sticky) esc_apply_fact(c, NULL, s);
+        }
+        return;
+    }
+    case NODE_DEFER: {
+        /* The body runs at every exit: check it under the union of everything the
+         * visible variables ever hold, then put their flags back. */
+        int cnt = 0, cap = 16;
+        struct { Symbol *s; bool l, a, f, k, n; int r; uint64_t m; } stk[16], *ent = stk;
+        ESC_FOR_LOCAL_SYMS(c, s, {
+            if (cnt >= cap) {
+                int nc = cap * 2;
+                void *nb = malloc((size_t)nc * sizeof(*ent));
+                if (!nb) break;
+                memcpy(nb, ent, (size_t)cnt * sizeof(*ent));
+                if (ent != stk) free(ent);
+                ent = nb; cap = nc;
+            }
+            ent[cnt].s = s; ent[cnt].l = s->is_local_derived; ent[cnt].a = s->is_arena_derived;
+            ent[cnt].f = s->is_from_arena; ent[cnt].k = s->is_keep_derived;
+            ent[cnt].n = s->is_nonkeep_derived; ent[cnt].r = s->nonkeep_root_param;
+            ent[cnt].m = s->nonkeep_root_mask;
+            cnt++;
+            esc_apply_fact(c, NULL, s);
+        });
+        check_stmt_impl(c, node);
+        for (int i = 0; i < cnt; i++) {
+            Symbol *s = ent[i].s;
+            s->is_local_derived = ent[i].l; s->is_arena_derived = ent[i].a;
+            s->is_from_arena = ent[i].f; s->is_keep_derived = ent[i].k;
+            s->is_nonkeep_derived = ent[i].n; s->nonkeep_root_param = ent[i].r;
+            s->nonkeep_root_mask = ent[i].m;
+        }
+        if (ent != stk) free(ent);
+        c->esc->defers_seen++;
+        return;
+    }
+    case NODE_BLOCK: {
+        /* record what the block's own variables held before their scope closes */
+        check_stmt_impl(c, node);
+        return;
+    }
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_IF: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_BINARY:
+    case NODE_UNARY: case NODE_ASSIGN: case NODE_CALL: case NODE_FIELD: case NODE_INDEX:
+    case NODE_SLICE: case NODE_ORELSE: case NODE_INTRINSIC: case NODE_CAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT: case NODE_TYPECAST:
+        check_stmt_impl(c, node);
+        return;
+    }
+    check_stmt_impl(c, node);
+}
+
+/* Restore the checker to the function's entry for a re-walk. Everything the walk
+ * observed is rolled back (scalars, counts). Kept as they are NOW: heap buffers
+ * the walk may have REALLOCATED (the snapshot's pointer may be freed — only the
+ * pointer and capacity are kept, the count still rolls back), the typemap, the
+ * diagnostics and error counts, and definitions the walk may have created that
+ * the rest of the program refers to (container stamps, auto-slabs, type ids,
+ * the IR hoist journal). */
+static void esc_restore(Checker *c, const Checker *snap) {
+    Checker cur = *c;
+    *c = *snap;
+    c->type_map = cur.type_map; c->type_map_size = cur.type_map_size;
+    c->type_map_count = cur.type_map_count;
+    c->diagnostics = cur.diagnostics; c->diag_count = cur.diag_count;
+    c->diag_capacity = cur.diag_capacity;
+    c->error_count = cur.error_count; c->warning_count = cur.warning_count;
+    c->diag_quiet_hits = cur.diag_quiet_hits;
+    c->next_type_id = cur.next_type_id;
+    c->container_instances = cur.container_instances;
+    c->container_inst_count = cur.container_inst_count;
+    c->container_inst_capacity = cur.container_inst_capacity;
+    c->container_templates = cur.container_templates;
+    c->container_tmpl_count = cur.container_tmpl_count;
+    c->container_tmpl_capacity = cur.container_tmpl_capacity;
+    c->auto_slabs = cur.auto_slabs; c->auto_slab_count = cur.auto_slab_count;
+    c->auto_slab_capacity = cur.auto_slab_capacity;
+    c->hoist_undo = cur.hoist_undo; c->hoist_undo_n = cur.hoist_undo_n;
+    c->hoist_undo_cap = cur.hoist_undo_cap;
+    c->func_shared_cache = cur.func_shared_cache;
+    c->func_shared_cache_count = cur.func_shared_cache_count;
+    c->func_shared_cache_capacity = cur.func_shared_cache_capacity;
+    /* realloc'd buffers: keep pointer + capacity, roll the count back */
+    #define ESC_KEEP_BUF(p, cap) do { c->p = cur.p; c->cap = cur.cap; } while (0)
+    ESC_KEEP_BUF(prov_map, prov_map_capacity);
+    ESC_KEEP_BUF(var_ranges, var_range_capacity);
+    ESC_KEEP_BUF(rmw_taints, rmw_taint_capacity);
+    ESC_KEEP_BUF(rmw_ptr_carriers, rmw_ptr_carrier_capacity);
+    ESC_KEEP_BUF(proven_safe, proven_safe_capacity);
+    ESC_KEEP_BUF(auto_guards, auto_guard_capacity);
+    ESC_KEEP_BUF(guard_lowered, guard_lowered_capacity);
+    ESC_KEEP_BUF(prov_summaries, prov_summary_capacity);
+    ESC_KEEP_BUF(param_expects, param_expect_capacity);
+    ESC_KEEP_BUF(isr_globals, isr_global_capacity);
+    ESC_KEEP_BUF(atomic_plain_writes, atomic_plain_write_capacity);
+    ESC_KEEP_BUF(atomic_args, atomic_arg_cap);
+    ESC_KEEP_BUF(atomic_fields, atomic_field_capacity);
+    ESC_KEEP_BUF(stack_frames, stack_frame_capacity);
+    ESC_KEEP_BUF(lockchk_roots, lockchk_root_cap);
+    #undef ESC_KEEP_BUF
+}
+
+static void check_func_body_once(Checker *c, Node *node);
+#define ESC_FIXPOINT_MAX 16
 static void check_func_body(Checker *c, Node *node) {
+    Node *body = node ? (node->kind == NODE_FUNC_DECL ? node->func_decl.body
+                       : node->kind == NODE_INTERRUPT ? node->interrupt.body : NULL) : NULL;
+    if (!body || (c->esc && c->esc->active)) { check_func_body_once(c, node); return; }
+    if (!c->esc) {
+        c->esc = (struct EscState *)calloc(1, sizeof(struct EscState));
+        if (!c->esc) { check_func_body_once(c, node); return; }
+    }
+    struct EscState *e = c->esc;
+    e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0;
+    e->dedupe_from = e->dedupe_to = 0;
+    e->sticky = esc_has_jump(c, body, 0);
+    Checker *snap = (Checker *)malloc(sizeof(Checker));
+    if (!snap) { check_func_body_once(c, node); return; }
+    *snap = *c;
+    int diag_start = c->diag_count;
+    e->active = true;
+    check_func_body_once(c, node);                 /* the real walk */
+    if (e->event) {
+        for (int it = 0; it < ESC_FIXPOINT_MAX; it++) {
+            uint64_t g0 = e->growth;
+            esc_restore(c, snap);
+            e->event = false; e->defers_seen = 0;
+            c->diag_quiet++;
+            check_func_body_once(c, node);         /* quiet: only grows the facts */
+            c->diag_quiet--;
+            if (e->growth == g0) break;
+        }
+        esc_restore(c, snap);
+        e->defers_seen = 0;
+        e->dedupe_from = diag_start; e->dedupe_to = c->diag_count;
+        check_func_body_once(c, node);             /* the real walk, joined */
+        e->dedupe_from = e->dedupe_to = 0;
+    }
+    e->active = false;
+    free(snap);
+}
+
+static void check_func_body_once(Checker *c, Node *node) {
     if (node->kind == NODE_FUNC_DECL && node->func_decl.body) {
         /* resolve return type */
         Type *ret = resolve_type(c, node->func_decl.return_type);

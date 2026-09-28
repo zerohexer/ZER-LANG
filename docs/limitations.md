@@ -30,6 +30,25 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 escape fixpoint (BUG-1402; LOW — over-rejection)
+
+The loop / goto / defer join is sound by construction (it only ever ADDS may-taint) and
+measured at zero corpus cost; its precision residue, each an over-rejection:
+
+1. **A reassignment inside a branch or loop body never clears** (BUG-1274's sticky rule),
+   so with the loop join `for (...) { p = &g; gp = p; p = &x; }` is refused although `gp`
+   only ever receives `&g`. The precise form is a strong update inside the body plus a JOIN
+   of the saved flags at the body's exit — a relaxation, so it needs the accept-unsafe
+   discipline (CLAUDE.md) and the p61 cells as its net.
+2. **A function with any label / goto is flow-insensitive** for escape flags: a pointer that
+   holds `&local` at one point and `&global` at another may not be published anywhere in it.
+   A per-label join (the flags at each `goto` joined into its label) would be precise.
+3. **A defer body sees the union of everything a variable EVER holds in the function**,
+   including values it held only BEFORE the defer was registered.
+4. The re-walk runs only when the first walk saw a taint appear that an earlier sink could
+   have missed, but then the function is checked two or more extra times (bounded by 16
+   fixpoint rounds; each round must add a fact bit).
+
 ## OPEN — residuals of the 2026-09-27 rounds (BUG-1366..1399; measured)
 
 1. **`*p = a` through a pointer-to-POINTER re-aimed by anything but `&name`** (BUG-1366,

@@ -1,0 +1,15 @@
+// BUG-1402: the frame-bound taint is set textually AFTER the sink, but runs before it
+// (loop back edge / goto / defer). Reproducer from the 2026-09-28 escape probe (L4).
+// expect-error: cannot store local-derived pointer 'h' in global/s
+struct H { *u32 p; }
+u32 g0 = 1;
+H gh;
+void f() {
+    u32 x = 5;
+    H h; h.p = &g0;
+    for (u32 i = 0; i < 2; i += 1) {
+        gh = h;
+        h.p = &x;
+    }
+}
+u32 main() { gh.p = &g0; f(); return *gh.p; }

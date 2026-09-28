@@ -2082,3 +2082,37 @@ emitter.c:expr_reads_volatile:NODE_SWITCH:switch_stmt.expr
 emitter.c:expr_reads_volatile:NODE_VAR_DECL:var_decl.init
 emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.body
 emitter.c:expr_reads_volatile:NODE_WHILE:while_stmt.cond
+# --- ir_lower.c: sc_expr_has_orelse (BUG-1400) ---
+# Mirrors pre_lower_orelse's descent EXACTLY: it answers "will pre_lower_orelse
+# find an orelse here?", so it skips exactly the children pre_lower_orelse skips.
+ir_lower.c:sc_expr_has_orelse:NODE_ASM:asm_stmt.inputs
+ir_lower.c:sc_expr_has_orelse:NODE_ASM:asm_stmt.outputs
+ir_lower.c:sc_expr_has_orelse:NODE_AWAIT:await_stmt.cond
+ir_lower.c:sc_expr_has_orelse:NODE_BLOCK:block.stmts
+ir_lower.c:sc_expr_has_orelse:NODE_CRITICAL:critical.body
+ir_lower.c:sc_expr_has_orelse:NODE_DEFER:defer.body
+ir_lower.c:sc_expr_has_orelse:NODE_DO_WHILE:while_stmt.body
+ir_lower.c:sc_expr_has_orelse:NODE_DO_WHILE:while_stmt.cond
+ir_lower.c:sc_expr_has_orelse:NODE_EXPR_STMT:expr_stmt.expr
+ir_lower.c:sc_expr_has_orelse:NODE_FILE:file.decls
+ir_lower.c:sc_expr_has_orelse:NODE_FOR:for_stmt.body
+ir_lower.c:sc_expr_has_orelse:NODE_FOR:for_stmt.cond
+ir_lower.c:sc_expr_has_orelse:NODE_FOR:for_stmt.init
+ir_lower.c:sc_expr_has_orelse:NODE_FOR:for_stmt.step
+ir_lower.c:sc_expr_has_orelse:NODE_FUNC_DECL:func_decl.body
+ir_lower.c:sc_expr_has_orelse:NODE_GLOBAL_VAR:var_decl.init
+ir_lower.c:sc_expr_has_orelse:NODE_IF:if_stmt.cond
+ir_lower.c:sc_expr_has_orelse:NODE_IF:if_stmt.else_body
+ir_lower.c:sc_expr_has_orelse:NODE_IF:if_stmt.then_body
+ir_lower.c:sc_expr_has_orelse:NODE_INTERRUPT:interrupt.body
+ir_lower.c:sc_expr_has_orelse:NODE_ONCE:once.body
+ir_lower.c:sc_expr_has_orelse:NODE_ORELSE:orelse.expr
+ir_lower.c:sc_expr_has_orelse:NODE_ORELSE:orelse.fallback
+ir_lower.c:sc_expr_has_orelse:NODE_RETURN:ret.expr
+ir_lower.c:sc_expr_has_orelse:NODE_SPAWN:spawn_stmt.args
+ir_lower.c:sc_expr_has_orelse:NODE_STATIC_ASSERT:static_assert_stmt.cond
+ir_lower.c:sc_expr_has_orelse:NODE_SWITCH:switch_stmt.arms
+ir_lower.c:sc_expr_has_orelse:NODE_SWITCH:switch_stmt.expr
+ir_lower.c:sc_expr_has_orelse:NODE_VAR_DECL:var_decl.init
+ir_lower.c:sc_expr_has_orelse:NODE_WHILE:while_stmt.body
+ir_lower.c:sc_expr_has_orelse:NODE_WHILE:while_stmt.cond

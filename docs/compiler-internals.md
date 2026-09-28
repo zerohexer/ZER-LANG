@@ -13846,6 +13846,46 @@ verdict; `compile` cells still build a real binary.
 - **A store into an OWNED object is not an escape** (BUG-1365): `ir_target_root_escapes`
   exempts a non-param pointer local holding a live, owned, non-arena allocation.
 
+## Mechanisms added 2026-09-28 (BUG-1400..1449) — where each question is answered now
+
+One line per question, so a future change finds the ONE place instead of re-deriving it:
+
+- **"Does this orelse run only when its `&&` / `||` operand lets it?"** — `pre_lower_orelse`
+  lowers a short-circuit operator whose right side holds an orelse to branches wherever
+  it sits (BUG-1400); `sc_expr_has_orelse` mirrors `pre_lower_orelse`'s descent exactly.
+- **"Which lock group does this statement hold, and what releases it?"** — ir_lower's
+  `StmtLock held` (primary + group + write mode + the loop blocks current when taken).
+  An orelse BLOCK fallback runs with the group RELEASED (`emit_release_held`, re-taken by
+  `emit_reacquire_held` only on fall-through) — the checker already modelled the block as
+  separate lock scopes (BUG-1420). A break/continue releases only when it leaves the loop
+  current at acquisition (`held_released_by_jump`, BUG-1421).
+- **"What does this ARGUMENT reach?"** (zercheck_ir) — `ir_arg_reach`: what it designates,
+  what it carries by value / through `&` / a slice / a pointer view, and other spellings of
+  the same slot; asked by the arena-reset arm and the freed-alias report (BUG-1412/1413).
+  A path with an index and no `[*` is a PRECISE slot (`ir_entry_is_precise_slot`); a Ring
+  is an array written at an unknown slot (`ir_ring_transfer`).
+- **"Which allocator does `h.field` use?"** — `handle_alloc_source_of` +
+  `handle_source_stable` (the declaration asks, over the whole body, whether every write
+  comes from the same allocator) (BUG-1404).
+- **"Can this conversion forge a value outside its type's closed set?"** — the emitter's
+  forgeable-scalar guard walk (enum, bool, value-optional presence byte), uncapped, at both
+  dispatch paths and all three doors (BUG-1448/1449); the checker's
+  `bitcast_target_mints` refuses a `@bitcast` INTO a pointer carrier or a task frame
+  (BUG-1432), and an unknown width is refused (BUG-1406). An asm OUTPUT must be an integer
+  or `?*T` (BUG-1408).
+- **"How is a static-storage initializer emitted?"** — `emit_static_storage_init`, one
+  helper for globals AND static locals (`static_brace_init` for nested literals at block
+  scope), wide integers through `emit_wide_int_const` (BUG-1442/1443).
+- **"May this identifier be declared?"** — `c_reserved_ident` classifies (C keyword,
+  header macro, header type / `*_t`, reserved namespace, libc function the runtime calls);
+  each declaration class applies its rule; a bodyless extern stays legal (BUG-1446).
+- **"What C name does this local get?"** — ir_add_local (sibling-scope suffix, sized to the
+  name) + `local_avoid_global_name` (a local named like a global gets its own name); every
+  lowering lookup is `lower_find_local`, which never falls back to a closed-scope local for
+  a name that is a global (BUG-1409).
+- **"Was this task initialised?"** — `_zer_inited` in the task struct, set by `_init`, checked
+  by the poll (BUG-1407).
+
 ## The escape fixpoint — POSITION of a taint vs position of a sink (BUG-1402, 2026-09-28)
 
 The escape flags (`is_local_derived`, `is_arena_derived`, `is_from_arena`,

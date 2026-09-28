@@ -26422,11 +26422,40 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 }
                 Type *t = check_expr(c, op->expr);
                 Type *tu = t ? type_unwrap_distinct(t) : NULL;
-                bool ok_out = t && (type_is_integer(t) ||
-                    (tu && tu->kind == TYPE_POINTER));
-                if (t && !ok_out) {
+                /* BUG-1408: an asm output is a raw register value arriving in ZER,
+                 * so its destination must be a type every bit pattern is a VALID
+                 * value of. Three were accepted that are not:
+                 *   - a non-null `*T` — `xor %0,%0` into `*u32 gp` made a NULL
+                 *     pointer the type promises cannot exist, and a later `*gp`
+                 *     loads with no null check (a global pointer is non-null by
+                 *     construction) — silent on bare metal;
+                 *   - an enum — a value outside the variant set, which a switch's
+                 *     last-arm `else` then takes;
+                 *   - a bool other than 0 / 1.
+                 * A nullable `?*T` IS every-bit-pattern-valid (the register value
+                 * is an unknown-provenance pointer, the same floor as a cinclude
+                 * return) and is now accepted; an enum or bool comes in as an
+                 * integer and goes through @try_enum / a comparison. */
+                TypeKind ok_k = type_dispatch_kind(t);
+                bool out_is_nullable_ptr = tu && ok_k == TYPE_OPTIONAL &&
+                    tu->optional.inner &&
+                    type_dispatch_kind(tu->optional.inner) == TYPE_POINTER;
+                bool ok_out = t && ((type_is_integer(t) && ok_k != TYPE_ENUM &&
+                                     ok_k != TYPE_BOOL) || out_is_nullable_ptr);
+                if (t && ok_k == TYPE_POINTER) {
                     checker_error(c, op->loc.line,
-                        "asm output '%.*s' must be integer or pointer typed "
+                        "asm output '%.*s' writes a raw register into a non-null '%s' — "
+                        "the register may hold 0. Output into a '?%s' and unwrap it",
+                        (int)op->reg_name_len, op->reg_name, type_name(t), type_name(t));
+                } else if (t && (ok_k == TYPE_ENUM || ok_k == TYPE_BOOL)) {
+                    checker_error(c, op->loc.line,
+                        "asm output '%.*s' writes a raw register into '%s', whose values "
+                        "are a closed set — output into an integer and convert it "
+                        "(@try_enum for an enum, a comparison for a bool)",
+                        (int)op->reg_name_len, op->reg_name, type_name(t));
+                } else if (t && !ok_out) {
+                    checker_error(c, op->loc.line,
+                        "asm output '%.*s' must be integer or optional-pointer typed "
                         "(Session B scope: scalars only)",
                         (int)op->reg_name_len, op->reg_name);
                 }

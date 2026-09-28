@@ -107,6 +107,14 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   declaration line). A runtime check rather than a use-before-init rule because tasks live
   in arrays, struct fields and behind pointers, which a flow rule would have to follow.
   Test: `tests/zer_trap/async_poll_before_init_bug1407.zer`.
+- **BUG-1408 — an asm OUTPUT could forge a non-null pointer, an enum or a bool.** The
+  output check accepted "integer or pointer": `xor %0, %0` into a `*u32` global made the
+  NULL the type rules out, and `*gp` then loaded through it with no null check (a global
+  pointer is non-null by construction) — silent on bare metal; an enum output took a
+  value outside its variants (the switch's last-arm `else` took it); `type_is_integer`
+  also admitted bool. An output's type must now be one every bit pattern is valid for:
+  an integer, or a nullable `?*T` (newly accepted — the unknown-provenance pointer floor,
+  as for a cinclude return). Tests: `tests/zer_fail/asm_output_{nonnull_ptr,enum}_bug1408.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

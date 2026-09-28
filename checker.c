@@ -3751,7 +3751,7 @@ static void infer_mark_param_keep(Checker *c, int idx) {
 /* keep-arg short-lived-borrow classes (Site 1 deferred enforcement). KV_NONE =
  * the arg is acceptable for a keep param (static/global/param/other). */
 enum { KV_NONE = 0, KV_LOCAL_ADDR, KV_LOCAL_DERIVED, KV_ARENA, KV_LOCAL_ARRAY, KV_SLICE_LOCAL,
-       KV_VARIANT_CAPTURE /* BUG-1186 */ };
+       KV_VARIANT_CAPTURE /* BUG-1186 */, KV_THREADLOCAL /* BUG-1424 */ };
 
 /* keep inference (Site 1): record one deferred keep edge for a call argument at a
  * pointer-param position. Resolved in check_keep_inference after ALL bodies are
@@ -7299,23 +7299,37 @@ static void record_borrow_root(Checker *c, Symbol *sym, Node *root_expr) {
  * `*opaque`, a CALL result (`id(&v)`), a capture (`if (oz) |zz|`) and a SUB-SLICE
  * written directly as the spawn argument (`spawn w(a[1..3])`). Conservative on
  * a call: its result may be a view of ANY argument. */
-struct BorrowRoots { const char **n; uint32_t *l; int count, cap; };
-static void borrow_roots_add(Checker *c, struct BorrowRoots *br, const char *n, uint32_t l) {
+/* BUG-1423: `sd[i]` marks a STAND-IN entry — a pointer / slice / handle NAME
+ * standing for a pointee the compiler cannot name (BUG-1332), as opposed to a
+ * name whose STORAGE the value points into. The borrow sinks treat both alike;
+ * the threadlocal-escape query must not: reading a threadlocal POINTER's value
+ * (`out.p = tl_ptr`) is not this thread's TLS address, `&tl_ptr` is. */
+struct BorrowRoots { const char **n; uint32_t *l; bool *sd; int count, cap; };
+static void borrow_roots_add_ex(Checker *c, struct BorrowRoots *br, const char *n, uint32_t l,
+                                bool standin) {
     if (!n) return;
     for (int i = 0; i < br->count; i++)
-        if (br->l[i] == l && memcmp(br->n[i], n, l) == 0) return;
+        if (br->l[i] == l && memcmp(br->n[i], n, l) == 0) {
+            if (!standin) br->sd[i] = false;   /* storage wins over stand-in */
+            return;
+        }
     if (br->count >= br->cap) {
         int nc = br->cap < 4 ? 4 : br->cap * 2;
         const char **nn = (const char **)arena_alloc(c->arena, (size_t)nc * sizeof(char *));
         uint32_t *nl = (uint32_t *)arena_alloc(c->arena, (size_t)nc * sizeof(uint32_t));
-        if (!nn || !nl) return;
+        bool *ns = (bool *)arena_alloc(c->arena, (size_t)nc * sizeof(bool));
+        if (!nn || !nl || !ns) return;
         if (br->count) {
             memcpy(nn, br->n, (size_t)br->count * sizeof(char *));
             memcpy(nl, br->l, (size_t)br->count * sizeof(uint32_t));
+            memcpy(ns, br->sd, (size_t)br->count * sizeof(bool));
         }
-        br->n = nn; br->l = nl; br->cap = nc;
+        br->n = nn; br->l = nl; br->sd = ns; br->cap = nc;
     }
-    br->n[br->count] = n; br->l[br->count] = l; br->count++;
+    br->n[br->count] = n; br->l[br->count] = l; br->sd[br->count] = standin; br->count++;
+}
+static void borrow_roots_add(Checker *c, struct BorrowRoots *br, const char *n, uint32_t l) {
+    borrow_roots_add_ex(c, br, n, l, false);
 }
 /* The names a ROOT identifier contributes: itself when its storage is what the
  * value points into (an array viewed, an object whose address is taken), and
@@ -7323,11 +7337,13 @@ static void borrow_roots_add(Checker *c, struct BorrowRoots *br, const char *n, 
 /* BUG-1333: the globals a GLOBAL pointer may be aimed at — its declaration
  * initializer and every `gp = &x` anywhere in the program (the AIM query the
  * RMW scans use, for_each_write_target). */
-typedef struct { struct BorrowRoots *br; int n; } GlobalAimUd;
+typedef struct { struct BorrowRoots *br; int n; Symbol *self; } GlobalAimUd;
 static void global_aim_visit(Checker *c, Symbol *g, void *ud) {
     GlobalAimUd *u = (GlobalAimUd *)ud;
     if (!g || g->is_function) return;
-    borrow_roots_add(c, u->br, g->name, g->name_len);
+    /* BUG-1423: the walk names the pointer ITSELF where it cannot follow an aim
+     * — a stand-in for an unknown pointee, not the pointer's storage. */
+    borrow_roots_add_ex(c, u->br, g->name, g->name_len, g == u->self);
     u->n++;
 }
 static int borrow_roots_of_global_pointer(Checker *c, struct BorrowRoots *br, Node *id,
@@ -7335,7 +7351,7 @@ static int borrow_roots_of_global_pointer(Checker *c, struct BorrowRoots *br, No
     if (!s || s->is_function || !s->type || global_decl_lookup(c, s->name, s->name_len) != s)
         return -1;
     if (!type_carries_data_pointer(s->type, 0)) return -1;
-    GlobalAimUd u = { br, 0 };
+    GlobalAimUd u = { br, 0, s };
     for_each_write_target_ex(c, id, true, global_aim_visit, &u);
     return u.n;
 }
@@ -7369,7 +7385,7 @@ static void borrow_roots_of_ident(Checker *c, struct BorrowRoots *br, Node *id,
          * reaches h's slot, so h stands for it (a later `pool.free(h)` is then
          * the parent touching the lent object). */
         if (sk == TYPE_POINTER || sk == TYPE_SLICE || sk == TYPE_HANDLE)
-            borrow_roots_add(c, br, s->name, s->name_len);
+            borrow_roots_add_ex(c, br, s->name, s->name_len, true);   /* BUG-1423 */
     }
 }
 static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, int depth);
@@ -7463,7 +7479,8 @@ static void ret_roots_stmt(Checker *c, Node *n, RetRootsUd *u) {
             for (int i = 0; i < tmp.count; i++) {
                 if (fn_binds_name(u->fn, tmp.n[i], tmp.l[i])) continue;
                 Symbol *g = global_decl_lookup(c, tmp.n[i], tmp.l[i]);
-                if (g && !g->is_function) borrow_roots_add(c, u->br, tmp.n[i], tmp.l[i]);
+                if (g && !g->is_function)
+                    borrow_roots_add_ex(c, u->br, tmp.n[i], tmp.l[i], tmp.sd[i]);
             }
             ret_roots_expr(c, n->ret.expr, u);
         }
@@ -7535,6 +7552,36 @@ static void call_return_roots(Checker *c, Node *call, struct BorrowRoots *br, in
     _ret_roots_active_n--;
 }
 
+/* BUG-1423: does this VALUE view its root identifier's OWN storage — an
+ * array-typed name / field / element (which decays to a view of itself where a
+ * pointer is wanted) or a slice of an array — with no pointer, slice or handle
+ * step between it and the root? `tla`, `s.arr`, `tla[1..3]`, `s.arr[0..2]`: yes.
+ * `p.arr` (p a pointer), `sl[0..2]` (sl a slice): no — those reach what the
+ * pointer reaches, which borrow_roots_of_ident answers separately. Only the
+ * `sl[0..2]` / bare-`tla[0..2]` shapes were recognised before, so a bare array
+ * name handed where a view is wanted (`out.v = tla;`) reached NOTHING. An
+ * unknown step type is treated as storage (the conservative direction for every
+ * caller: lend / refuse more). A caller that may see an array VALUE COPY must
+ * check its destination carries a reference (value_reaches_threadlocal does). */
+static bool value_views_root_storage(Checker *c, Node *v) {
+    if (!v) return false;
+    Type *vt = typemap_get(c, v);
+    if (v->kind != NODE_SLICE && !(vt && type_dispatch_kind(vt) == TYPE_ARRAY)) return false;
+    Node *cur = v;
+    for (int guard = 0; cur && guard <= ZER_EXPR_WALK_MAX; guard++) {
+        Node *obj;
+        if (cur->kind == NODE_FIELD) obj = cur->field.object;
+        else if (cur->kind == NODE_INDEX) obj = cur->index_expr.object;
+        else if (cur->kind == NODE_SLICE) obj = cur->slice.object;
+        else return cur->kind == NODE_IDENT;
+        Type *ot = obj ? typemap_get(c, obj) : NULL;
+        TypeKind ok = ot ? type_dispatch_kind(ot) : TYPE_VOID;
+        if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE) return false;
+        cur = obj;
+    }
+    return true;   /* past the walk bound: conservative */
+}
+
 static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, int depth) {
     if (!v || depth > ZER_EXPR_WALK_MAX) return;
     v = unwrap_ptr_launder(v);
@@ -7568,12 +7615,14 @@ static void collect_borrow_roots(Checker *c, Node *v, struct BorrowRoots *br, in
                 r->kind == NODE_INDEX ? r->index_expr.object : r->slice.object;
         if (!r) return;
         if (r->kind != NODE_IDENT) { collect_borrow_roots(c, r, br, depth + 1); return; }
-        Type *rt = typemap_get(c, r);
-        TypeKind rk = rt ? type_dispatch_kind(rt) : TYPE_VOID;
-        borrow_roots_of_ident(c, br, r, v->kind == NODE_SLICE && rk == TYPE_ARRAY);
+        /* BUG-1423: the root's own storage whenever the value views it (was:
+         * only a SLICE directly of a root array). */
+        borrow_roots_of_ident(c, br, r, value_views_root_storage(c, v));
         return;
     }
-    case NODE_IDENT: borrow_roots_of_ident(c, br, v, false); return;
+    /* BUG-1423: an ARRAY name is a view of its own storage where a reference is
+     * wanted (the array -> slice coercion). */
+    case NODE_IDENT: borrow_roots_of_ident(c, br, v, value_views_root_storage(c, v)); return;
     case NODE_ORELSE:
         collect_borrow_roots(c, v->orelse.expr, br, depth + 1);
         collect_borrow_roots(c, v->orelse.fallback, br, depth + 1);
@@ -7712,48 +7761,34 @@ static bool sym_is_threadlocal(Symbol *s) {
            (s->func_node->kind == NODE_VAR_DECL || s->func_node->kind == NODE_GLOBAL_VAR) &&
            s->func_node->var_decl.is_threadlocal;
 }
-static Symbol *value_reaches_threadlocal(Checker *c, Node *v, int depth) {
-    if (!v || depth > ZER_EXPR_WALK_MAX) return NULL;
-    v = unwrap_ptr_launder(v);
+/* BUG-1423: the query is now "does ANY root collect_borrow_roots finds for this
+ * value name a threadlocal's STORAGE?" — the ONE "what does this value point
+ * into?" walk the scoped-spawn borrow uses, so every spelling it follows (a
+ * call result — through its arguments AND the callee's own returns — a slice,
+ * a bare array name, a field view, an orelse, a cast, a struct literal, a
+ * carrier or alias recorded earlier) reaches this rule too. The old private
+ * walk followed `&x`, orelse, struct literals and a recorded alias only, so
+ * `out.v = tla`, `out.v = tla[1..3]`, `out.p = pass(&tl1)`, `gp = get()` and
+ * `*out = { .v = tla }` all published this thread's TLS (measured: a later
+ * thread's value read through the dangling view, 22 instead of 11).
+ *
+ * `dst` is the type the value lands in: a destination that cannot carry a
+ * reference (an array VALUE copy, a scalar) receives no address. Stand-in
+ * entries (a pointer name standing for an unknown pointee) are skipped — the
+ * VALUE of a threadlocal pointer is not a TLS address. A name is resolved both
+ * in the current scope and as a global, and either being threadlocal counts
+ * (a callee's return roots are global names that a caller local may shadow). */
+static Symbol *value_reaches_threadlocal(Checker *c, Node *v, Type *dst) {
     if (!v) return NULL;
-    if (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) {
-        Node *r = v->unary.operand;
-        while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
-            if (r->kind == NODE_FIELD) r = r->field.object;
-            else r = r->index_expr.object;
-        }
-        if (r && r->kind == NODE_IDENT) {
-            Symbol *s = scope_lookup(c->current_scope, r->ident.name,
-                                     (uint32_t)r->ident.name_len);
-            if (sym_is_threadlocal(s)) return s;
-        }
-        return NULL;
-    }
-    if (v->kind == NODE_ORELSE) {
-        Symbol *s = value_reaches_threadlocal(c, v->orelse.expr, depth + 1);
-        return s ? s : value_reaches_threadlocal(c, v->orelse.fallback, depth + 1);
-    }
-    if (v->kind == NODE_STRUCT_INIT) {
-        for (int i = 0; i < v->struct_init.field_count; i++) {
-            Symbol *s = value_reaches_threadlocal(c, v->struct_init.fields[i].value, depth + 1);
-            if (s) return s;
-        }
-        return NULL;
-    }
-    /* a name (or a field / element of it) bound to a threadlocal earlier */
-    Node *r = v;
-    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX)) {
-        if (r->kind == NODE_FIELD) r = r->field.object;
-        else r = r->index_expr.object;
-    }
-    if (r && r->kind == NODE_IDENT) {
-        Symbol *s = scope_lookup(c->current_scope, r->ident.name,
-                                 (uint32_t)r->ident.name_len);
-        if (s && !sym_is_threadlocal(s) && s->borrow_root_name) {
-            Symbol *rs = scope_lookup(c->current_scope, s->borrow_root_name,
-                                      s->borrow_root_len);
-            if (sym_is_threadlocal(rs)) return rs;
-        }
+    if (dst && !type_can_carry_pointer(dst)) return NULL;
+    struct BorrowRoots br = {0};
+    collect_borrow_roots(c, v, &br, 0);
+    for (int i = 0; i < br.count; i++) {
+        if (br.sd[i]) continue;
+        Symbol *s = scope_lookup(c->current_scope, br.n[i], br.l[i]);
+        if (sym_is_threadlocal(s)) return s;
+        Symbol *g = global_decl_lookup(c, br.n[i], br.l[i]);
+        if (sym_is_threadlocal(g)) return g;
     }
     return NULL;
 }
@@ -13422,7 +13457,8 @@ static Type *check_expr_impl(Checker *c, Node *node) {
         if (node->assign.op == TOK_EQ && node->assign.value) {
             Node *av = unwrap_ptr_launder(node->assign.value);
             bool direct_amp = av && av->kind == NODE_UNARY && av->unary.op == TOK_AMP;
-            Symbol *tls = direct_amp ? NULL : value_reaches_threadlocal(c, node->assign.value, 0);
+            Symbol *tls = direct_amp ? NULL : value_reaches_threadlocal(c, node->assign.value,
+                                   typemap_get(c, node->assign.target));
             if (tls) {
                 Symbol *tsym = NULL; bool tg = false, tp = false;
                 classify_escape_sink(c, node->assign.target, &tsym, &tg, &tp);
@@ -16220,6 +16256,22 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                             if (struct_init_frame_bound(c, arg_node, &sl_arena)) {
                                 edge_vkind = sl_arena ? KV_ARENA : KV_LOCAL_DERIVED;
                                 edge_argname = "struct literal"; edge_argname_len = 14;
+                            }
+                        }
+                        /* BUG-1424: an argument that reaches a THREADLOCAL's storage
+                         * (`stp(out, &tl1)`, `sts(out, tla)`, `keepg(pass(&tl1))`) into a
+                         * keep param. The callee retains it past the call — into a
+                         * global or through a pointer parameter — which is exactly
+                         * the store the assignment sink refuses (BUG-1170/1423); the
+                         * keep call site was the one sink with no threadlocal arm, so
+                         * moving the store into a helper published this thread's TLS.
+                         * Same query as the assignment sink, so the two agree. */
+                        if (edge_vkind == KV_NONE && arg_node) {
+                            Symbol *tls = value_reaches_threadlocal(c, arg_node,
+                                effective_callee->func_ptr.params[i]);
+                            if (tls) {
+                                edge_vkind = KV_THREADLOCAL;
+                                edge_argname = tls->name; edge_argname_len = tls->name_len;
                             }
                         }
                         /* transitivity: does the arg trace to a non-keep caller param? */
@@ -20684,6 +20736,59 @@ static Type *check_expr_impl(Checker *c, Node *node) {
 
 /* Forward declaration — mutual recursion with scan_func_props */
 static void ensure_func_props(Checker *c, Symbol *sym);
+/* BUG-1310 / BUG-1425: which functions can an indirect call reach? (below) */
+typedef bool (*BoundFnVisit)(Checker *c, Symbol *fn, void *ud);
+static bool indirect_callee_functions_in(Checker *c, Node *callee, Node *scope_fn,
+                                         BoundFnVisit v, void *ud);
+
+/* BUG-1425: fold a function an INDIRECT call may reach into the scanning
+ * summary. Only the DANGER properties — the ones a context ban reads (yield,
+ * spawn, heap, interrupt re-enable). NOT has_sync: that one SUPPRESSES a race
+ * error into a warning, and "some function of this signature uses an atomic"
+ * says nothing about the one actually called. */
+static bool func_props_merge_reached(Checker *c, Symbol *fs, void *ud) {
+    Symbol *parent_sym = (Symbol *)ud;
+    if (!fs || !fs->is_function) return false;
+    ensure_func_props(c, fs);
+    if (fs->props.can_yield)      parent_sym->props.can_yield = true;
+    if (fs->props.can_spawn)      parent_sym->props.can_spawn = true;
+    if (fs->props.can_alloc)      parent_sym->props.can_alloc = true;
+    if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
+    return false;   /* visit every target */
+}
+
+/* BUG-1425: is this call's callee something other than a function NAME — a
+ * funcptr local / param / global, a field, an element, a call result? A builtin
+ * method (`pool.alloc()`) and a module-qualified call (`m.f()`) are not: their
+ * callee is not typed as a function pointer, or names a module function. */
+static bool call_is_indirect(Checker *c, Node *call, Node *scope_fn) {
+    Node *cal = call->call.callee;
+    if (!cal) return false;
+    if (cal->kind == NODE_IDENT) {
+        Symbol *fs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
+        bool local = scope_fn &&
+            fn_binds_name(scope_fn, cal->ident.name, (uint32_t)cal->ident.name_len);
+        if (fs && fs->is_function && !local) return false;   /* a direct call */
+    }
+    if (cal->kind == NODE_FIELD && cal->field.object &&
+        cal->field.object->kind == NODE_IDENT) {
+        const char *mod = cal->field.object->ident.name;
+        uint32_t modl = (uint32_t)cal->field.object->ident.name_len;
+        uint32_t fnl = (uint32_t)cal->field.field_name_len;
+        char mangled[256];
+        if (modl + 2 + fnl < sizeof(mangled)) {
+            memcpy(mangled, mod, modl);
+            mangled[modl] = '_'; mangled[modl + 1] = '_';
+            memcpy(mangled + modl + 2, cal->field.field_name, fnl);
+            Symbol *ms = global_decl_lookup(c, mangled, modl + 2 + fnl);
+            if (ms && ms->is_function) return false;          /* m.f() */
+        }
+    }
+    Type *ct = typemap_get(c, cal);
+    Type *cu = ct ? type_unwrap_distinct(ct) : NULL;
+    if (cu && type_dispatch_kind(cu) == TYPE_OPTIONAL) cu = type_unwrap_optional(cu);
+    return cu && type_dispatch_kind(cu) == TYPE_FUNC_PTR;
+}
 
 /* Recursive AST walker: collect all function properties in one pass.
  * Sets bools on props for: yield, spawn, alloc, sync.
@@ -20833,6 +20938,20 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
             }
         }
+
+        /* BUG-1425: an INDIRECT call — through a funcptr local, param, global,
+         * struct field, array element or factory result — reaches the functions
+         * the one REACH query names (indirect_callee_functions: a global's bound
+         * initializer when it cannot change, else every function of the callee's
+         * signature, the BUG-1290 conservative end). This summary followed direct
+         * names and funcptr ARGUMENTS only, so `*() fp = en; @critical { fp(); }`
+         * re-enabled interrupts inside @critical, and `interrupt T { *() f =
+         * helper; f(); }` reached calloc from an ISR — each rejected when spelled
+         * as a direct call. The callee's TYPE is read from the typemap, so this is
+         * evaluated after every body is typed (check_deferred_body_effects). */
+        if (call_is_indirect(c, node, parent_sym->func_node))
+            indirect_callee_functions_in(c, node->call.callee, parent_sym->func_node,
+                                         func_props_merge_reached, parent_sym);
 
         /* AU-5 (2026-07-01): a function passed as a funcptr ARGUMENT may be
          * invoked indirectly by the callee (`run(fn); ... fn();`). The ISR /
@@ -20995,7 +21114,11 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
  * Call this before reading sym->props. Idempotent — second call is O(1). */
 static void ensure_func_props(Checker *c, Symbol *sym) {
     if (!sym || !sym->is_function) return;
-    if (sym->props.computed) return;
+    /* BUG-1425: a summary computed before every body was typed could not resolve
+     * its indirect calls (the callee's type was not known yet); the epoch bump in
+     * check_deferred_body_effects makes it recompute. The flags only ever turn
+     * ON, so the facts found the first time stay valid. */
+    if (sym->props.computed && sym->props.epoch == c->props_epoch) return;
     if (sym->props.in_progress) return; /* cycle — conservative (no additional effects) */
     if (!sym->func_node) return;        /* no body (cinclude, forward decl without body) */
 
@@ -21017,11 +21140,12 @@ static void ensure_func_props(Checker *c, Symbol *sym) {
 
     sym->props.in_progress = false;
     sym->props.computed = true;
+    sym->props.epoch = c->props_epoch;
 }
 
 /* Check a body subtree for banned effects. Used at context entry points
  * (@critical, defer, interrupt). Creates a temporary scan, follows callees. */
-static void check_body_effects(Checker *c, Node *body, int line,
+static void check_body_effects(Checker *c, Node *body, Node *scope_fn, int line,
                                 bool ban_yield, const char *yield_msg,
                                 bool ban_spawn, const char *spawn_msg,
                                 bool ban_alloc, const char *alloc_msg) {
@@ -21033,6 +21157,7 @@ static void check_body_effects(Checker *c, Node *body, int line,
     tmp.is_function = true;  /* enable transitive following */
     tmp.props.computed = false;
     tmp.props.in_progress = true; /* prevent re-entry into this temp */
+    tmp.func_node = scope_fn;     /* BUG-1425: the scope an indirect callee is named in */
     scan_func_props(c, body, &tmp);
 
     /* yield / await: per-site NODE_YIELD only checks `in_async`, not
@@ -21052,6 +21177,102 @@ static void check_body_effects(Checker *c, Node *body, int line,
         checker_error(c, line, "%s", alloc_msg);
 }
 
+
+/* BUG-1425: the context bans of a @critical / interrupt / defer body, run after
+ * EVERY body of every module is typed. The scan follows indirect calls through
+ * the callee's type (call_is_indirect / indirect_callee_functions_in), and at
+ * the point the body is reached neither that body nor a function declared
+ * later is typed yet — evaluating inline would quietly skip exactly the calls
+ * this bug is about. Run from check_keep_inference, which every entry point
+ * (zerc_main, checker_check) calls once the bodies are done. */
+enum { BODY_EFFECTS_DEFER, BODY_EFFECTS_CRITICAL, BODY_EFFECTS_INTERRUPT };
+static Node *_isr_effects_scope = NULL;   /* the interrupt whose body is being checked */
+
+static void run_body_effects(Checker *c, int kind, Node *body, Node *scope_fn, int line) {
+    switch (kind) {
+    case BODY_EFFECTS_DEFER:
+        check_body_effects(c, body, scope_fn, line,
+            true, "cannot yield inside defer block — corrupts coroutine state machine",
+            false, NULL,
+            false, NULL);
+        return;
+    case BODY_EFFECTS_INTERRUPT:
+        check_body_effects(c, body, scope_fn, line,
+            false, NULL,
+            true, "cannot spawn inside interrupt handler — pthread_create in ISR is unsafe",
+            true, "cannot allocate inside interrupt handler — heap allocation may deadlock");
+        return;
+    case BODY_EFFECTS_CRITICAL: {
+        check_body_effects(c, body, scope_fn, line,
+            true, "cannot yield inside @critical block — interrupts stay disabled across suspend",
+            true, "cannot spawn inside @critical block — thread creation with interrupts disabled",
+            true, "cannot heap-allocate or free inside @critical block — "
+                  "malloc/calloc/free may deadlock when interrupts are disabled. "
+                  "Use Pool(T, N) instead, or move the call outside @critical");
+        /* BUG-1251: `@critical` is trusted to keep interrupts OFF for its body —
+         * the ISR rule drops a read-modify-write's "may be split" finding inside
+         * it. A body that turns them back on (`@cpu_enable_int()`, a restore of a
+         * saved enabled state, directly or in a callee) defeats that silently
+         * (an ISR update lost between the read and the write), and a wait for an
+         * interrupt with interrupts off never wakes on x86. */
+        {
+            Symbol tmp = {0};
+            tmp.is_function = true;
+            tmp.props.in_progress = true;
+            tmp.func_node = scope_fn;   /* BUG-1425 */
+            scan_func_props(c, body, &tmp);
+            if (tmp.props.can_enable_int)
+                checker_error(c, line,
+                    "@critical body re-enables or waits for interrupts (@cpu_enable_int / "
+                    "@cpu_restore_int_state / @cpu_wait_int / @cpu_deep_sleep, directly or "
+                    "in a callee) — the block promises interrupts stay off for its whole "
+                    "body, and code after that point would run unprotected. End the "
+                    "@critical block first");
+        }
+        return;
+    }
+    }
+}
+
+static void defer_body_effects(Checker *c, int kind, Node *body, int line) {
+    if (!body) return;
+    Node *scope_fn = c->current_func_node ? c->current_func_node : _isr_effects_scope;
+    if (c->dbe_count >= c->dbe_cap) {
+        int nc = c->dbe_cap < 16 ? 16 : c->dbe_cap * 2;
+        struct DeferredBodyEffects *nb = (struct DeferredBodyEffects *)arena_alloc(
+            c->arena, (size_t)nc * sizeof(struct DeferredBodyEffects));
+        if (nb) {
+            if (c->dbe_count) memcpy(nb, c->dbe, (size_t)c->dbe_count * sizeof(*nb));
+            c->dbe = nb; c->dbe_cap = nc;
+        }
+    }
+    if (c->dbe_count >= c->dbe_cap) {
+        /* cannot record: judge it now rather than not at all (the direct and
+         * the already-typed parts are still seen) */
+        run_body_effects(c, kind, body, scope_fn, line);
+        return;
+    }
+    struct DeferredBodyEffects *r = &c->dbe[c->dbe_count++];
+    r->body = body; r->fn = scope_fn; r->line = line; r->kind = kind;
+    r->file_name = c->file_name; r->source = c->source;
+    r->mod = c->current_module; r->mod_len = c->current_module_len;
+}
+
+static void check_deferred_body_effects(Checker *c) {
+    if (c->dbe_count == 0) return;
+    c->props_epoch++;   /* every summary is recomputed over typed bodies */
+    const char *sv_file = c->file_name, *sv_src = c->source;
+    const char *sv_mod = c->current_module; uint32_t sv_ml = c->current_module_len;
+    for (int i = 0; i < c->dbe_count; i++) {
+        struct DeferredBodyEffects *r = &c->dbe[i];
+        c->file_name = r->file_name; c->source = r->source;
+        c->current_module = r->mod; c->current_module_len = r->mod_len;
+        run_body_effects(c, r->kind, r->body, r->fn, r->line);
+    }
+    c->file_name = sv_file; c->source = sv_src;
+    c->current_module = sv_mod; c->current_module_len = sv_ml;
+    c->dbe_count = 0;
+}
 
 /* Does this function forward its parameter `pidx` into a `spawn` argument —
  * directly, or transitively through another function that does?
@@ -21305,7 +21526,6 @@ static Type *funcptr_first_carried(Type *t, int depth, int *nth) {
  * Re-entry: a callback that reads its own table would expand the same global
  * again; a global already being expanded is skipped (its functions are being
  * visited higher up the stack). The visitor returns true to stop. */
-typedef bool (*BoundFnVisit)(Checker *c, Symbol *fn, void *ud);
 #define BOUND_GLOBAL_STACK_MAX 64
 static Symbol *_bound_global_stack[BOUND_GLOBAL_STACK_MAX];
 static int _bound_global_depth = 0;
@@ -21396,18 +21616,29 @@ static bool global_bound_functions(Checker *c, Symbol *gs, BoundFnVisit v, void 
 }
 
 /* The functions an indirect CALLEE expression may designate. `callee` is not a
- * plain function name (the caller handles that). */
-static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, void *ud) {
+ * plain function name (the caller handles that). `scope_fn` (NULL = the
+ * checker's current scope) is the function whose body holds the call: a scan
+ * that walks a body OUTSIDE its own scope (a function summary, a deferred
+ * context-ban check — BUG-1425) asks that function whether it binds the root
+ * name, since the current scope is somebody else's. */
+static bool indirect_callee_functions_in(Checker *c, Node *callee, Node *scope_fn,
+                                         BoundFnVisit v, void *ud) {
     if (!callee) return false;
     Node *root = callee;
     while (root && (root->kind == NODE_FIELD || root->kind == NODE_INDEX))
         root = root->kind == NODE_FIELD ? root->field.object : root->index_expr.object;
     if (root && root->kind == NODE_IDENT) {
-        Symbol *ls = scope_lookup(c->current_scope, root->ident.name,
-                                  (uint32_t)root->ident.name_len);
         Symbol *gs = global_decl_lookup(c, root->ident.name, (uint32_t)root->ident.name_len);
+        bool shadowed;
+        if (scope_fn) {
+            shadowed = fn_binds_name(scope_fn, root->ident.name, (uint32_t)root->ident.name_len);
+        } else {
+            Symbol *ls = scope_lookup(c->current_scope, root->ident.name,
+                                      (uint32_t)root->ident.name_len);
+            shadowed = ls && ls != gs;
+        }
         /* a global, not shadowed by a local of the same name */
-        if (gs && !gs->is_function && (!ls || ls == gs) &&
+        if (gs && !gs->is_function && !shadowed &&
             (gs->is_const || global_name_never_mutated(c, gs)))
             return global_bound_functions(c, gs, v, ud);
     }
@@ -21416,6 +21647,9 @@ static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, 
     if (cu && type_dispatch_kind(cu) == TYPE_OPTIONAL) cu = type_unwrap_optional(cu);
     if (!cu || type_dispatch_kind(cu) != TYPE_FUNC_PTR) return false;
     return for_each_function_of_sig(c, cu, v, ud);
+}
+static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, void *ud) {
+    return indirect_callee_functions_in(c, callee, NULL, v, ud);
 }
 
 /* Report an unresolved funcptr carried by spawn argument `an` (or by an
@@ -26111,10 +26345,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "'defer' cannot be nested inside another 'defer' body");
         }
-        check_body_effects(c, node->defer.body, node->loc.line,
-            true, "cannot yield inside defer block — corrupts coroutine state machine",
-            false, NULL,
-            false, NULL);
+        defer_body_effects(c, BODY_EFFECTS_DEFER, node->defer.body, node->loc.line);
         c->defer_depth++;
         /* BUG-947: remember the loop nesting at this body's entry, so a break or
          * continue can tell whether the loop it targets is INSIDE the body. */
@@ -27273,31 +27504,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
          * libc heap lock and may deadlock when interrupts are disabled.
          * Pool/Ring/Arena methods are bitset/circular/bump and excluded
          * by the receiver-type gate in scan_func_props. */
-        check_body_effects(c, node->critical.body, node->loc.line,
-            true, "cannot yield inside @critical block — interrupts stay disabled across suspend",
-            true, "cannot spawn inside @critical block — thread creation with interrupts disabled",
-            true, "cannot heap-allocate or free inside @critical block — "
-                  "malloc/calloc/free may deadlock when interrupts are disabled. "
-                  "Use Pool(T, N) instead, or move the call outside @critical");
-        /* BUG-1251: `@critical` is trusted to keep interrupts OFF for its body —
-         * the ISR rule drops a read-modify-write's "may be split" finding inside
-         * it. A body that turns them back on (`@cpu_enable_int()`, a restore of a
-         * saved enabled state, directly or in a callee) defeats that silently
-         * (an ISR update lost between the read and the write), and a wait for an
-         * interrupt with interrupts off never wakes on x86. */
-        {
-            Symbol tmp = {0};
-            tmp.is_function = true;
-            tmp.props.in_progress = true;
-            scan_func_props(c, node->critical.body, &tmp);
-            if (tmp.props.can_enable_int)
-                checker_error(c, node->loc.line,
-                    "@critical body re-enables or waits for interrupts (@cpu_enable_int / "
-                    "@cpu_restore_int_state / @cpu_wait_int / @cpu_deep_sleep, directly or "
-                    "in a callee) — the block promises interrupts stay off for its whole "
-                    "body, and code after that point would run unprotected. End the "
-                    "@critical block first");
-        }
+        defer_body_effects(c, BODY_EFFECTS_CRITICAL, node->critical.body, node->loc.line);
         c->critical_depth++;
         /* BUG-947: remember the loop nesting at this body's entry, so a break or
          * continue can tell whether the loop it targets is INSIDE the body. */
@@ -30464,10 +30671,8 @@ static void check_func_body_once(Checker *c, Node *node) {
     if (node->kind == NODE_INTERRUPT && node->interrupt.body) {
         /* Ban spawn and heap alloc in interrupt handlers via function summaries.
          * Catches transitive cases: interrupt calls helper() which calls slab.alloc(). */
-        check_body_effects(c, node->interrupt.body, node->loc.line,
-            false, NULL,
-            true, "cannot spawn inside interrupt handler — pthread_create in ISR is unsafe",
-            true, "cannot allocate inside interrupt handler — heap allocation may deadlock");
+        _isr_effects_scope = node;   /* BUG-1425: the scope of a defer / @critical inside */
+        defer_body_effects(c, BODY_EFFECTS_INTERRUPT, node->interrupt.body, node->loc.line);
         c->current_func_ret = ty_void;
         c->in_interrupt = true;
         c->current_body = node->interrupt.body;   /* BUG-1056 */
@@ -30493,6 +30698,7 @@ static void check_func_body_once(Checker *c, Node *node) {
         record_isr_globals(c, node->interrupt.body, 0);
         pop_scope(c);
         c->in_interrupt = false;
+        _isr_effects_scope = NULL;   /* BUG-1425 */
         c->current_body = NULL;
         c->current_func_ret = NULL;
     }
@@ -35369,6 +35575,7 @@ static void check_suspend_in_union_capture(Checker *c, Node *node, const char *w
 
 void check_keep_inference(Checker *c) {
     check_union_capture_calls(c);   /* BUG-1186: needs every body typed, as keep does */
+    check_deferred_body_effects(c); /* BUG-1425: same reason */
     /* (1) transitive-escape fixpoint (monotone: flags only turn on → converges) */
     bool changed = true;
     int guard = 0;
@@ -35406,6 +35613,8 @@ void check_keep_inference(Checker *c) {
             msg = "argument %d: slice borrowing local '%.*s' cannot satisfy 'keep' parameter — stack memory is freed when function returns"; break;
         case KV_VARIANT_CAPTURE:
             msg = "argument %d: '%.*s' points INTO a union variant (a '|*v|' switch capture) and cannot satisfy 'keep' parameter — it is valid only while the arm runs and the union keeps that variant"; break;
+        case KV_THREADLOCAL:   /* BUG-1424 */
+            msg = "argument %d: the address of threadlocal '%.*s' cannot satisfy 'keep' parameter — the callee retains it past the call, where other threads can reach it and it dangles when this thread exits. Pass the value, or use a shared struct"; break;
         default: continue;
         }
         checker_error(c, e->line, msg, e->arg_pos, (int)e->arg_name_len, e->arg_name);

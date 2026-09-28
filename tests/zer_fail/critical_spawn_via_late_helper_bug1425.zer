@@ -1,0 +1,11 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-1425: the funcptr call sits in a helper declared AFTER the @critical
+// block, whose body was not typed yet when the block was reached — the
+// context bans are judged after every body is typed.
+void w() { }
+void st() { spawn w(); }
+u32 main() {
+    @critical { dispatch(); }
+    return 0;
+}
+void dispatch() { *() fp = st; fp(); }

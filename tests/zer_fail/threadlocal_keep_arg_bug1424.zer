@@ -1,0 +1,9 @@
+// expect-error: the address of threadlocal 'tl1' cannot satisfy 'keep' parameter
+// BUG-1424: the keep call site was the one escape sink with no threadlocal arm —
+// moving `o.p = &tl1` (refused) into a helper the compiler infers `keep` for
+// published this thread's TLS address.
+struct O { ?*u32 p; }
+threadlocal u32 tl1;
+void stp(*O o, *u32 s) { o.p = s; }
+void f(*O out) { stp(out, &tl1); }
+u32 main() { O o; ThreadHandle th = spawn f(&o); th.join(); return 0; }

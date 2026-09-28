@@ -1263,6 +1263,86 @@ cell p61_assign_field_read   reject "$P61"' void f(){ u32 x = 5; H61 h; h.p = &x
 cell p61_safe_loop_global    compile "$P61"' void f(){ *u32 p = &g61; for (u32 i = 0; i < 2; i += 1) { gp61 = p; p = &g61; } } u32 main(){ f(); return 0; }'
 cell p61_safe_goto_local     compile "$P61"' u32 f(u32 k){ u32 x = k; *u32 p = &x; if (k > 9) { goto out; } x += 1; out: return *p; } u32 main(){ return f(1) - 2; }'
 cell p61_safe_defer_read     compile "$P61"' u32 f(){ u32 x = 4; *u32 p = &x; u32 r = 0; defer x = 0; r = *p; return r; } u32 main(){ return f() - 4; }'
+# SHAPE p59 (BUG-1423/1424): the address of a THREADLOCAL reaching a sink
+# another thread can read — crossed SPELLING (bare array name, slice, call
+# result through an argument, a no-argument getter, a struct literal, a local
+# view) x SINK (global store, store through a pointer param, keep argument).
+# All spellings are ONE query (value_reaches_threadlocal over
+# collect_borrow_roots). BOUNDARY: a VALUE read / array VALUE copy, a local
+# view, another threadlocal as the destination, the value of a threadlocal
+# POINTER, a non-keep borrowing callee.
+echo "===== SHAPE p59 = threadlocal address x escape sink ====="
+P59='struct O59 { ?[*]u32 v; ?*u32 p; u32 x; u32[4] arr; }
+threadlocal u32[4] tla59;
+threadlocal u32 tl59;
+threadlocal ?[*]u32 tlv59;
+threadlocal ?*u32 tlp59;
+u32 gv59 = 5;
+*u32 pass59(*u32 p) { return p; }
+[*]u32 spass59([*]u32 s) { return s; }
+*u32 get59() { return &tl59; }
+void stp59(*O59 o, *u32 s) { o.p = s; }
+void sts59(*O59 o, [*]u32 s) { o.v = s; }
+u32 sum59([*]u32 s) { return s[0]; }
+'
+cell p59_array_glob          reject "$P59"' void f(){ g_s = tla59; } u32 main(){ f(); return 0; }'
+cell p59_array_param         reject "$P59"' void f(*O59 o){ o.v = tla59; } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_slice_glob          reject "$P59"' void f(){ g_s = tla59[1..3]; } u32 main(){ f(); return 0; }'
+cell p59_slice_param         reject "$P59"' void f(*O59 o){ o.v = tla59[0..2]; } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_call_arg_glob       reject "$P59"' void f(){ g_p = pass59(&tl59); } u32 main(){ f(); return 0; }'
+cell p59_call_arg_param      reject "$P59"' void f(*O59 o){ o.p = pass59(&tl59); } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_call_slice_param    reject "$P59"' void f(*O59 o){ o.v = spass59(tla59); } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_getter_glob         reject "$P59"' void f(){ g_p = get59(); } u32 main(){ f(); return 0; }'
+cell p59_getter_param        reject "$P59"' void f(*O59 o){ o.p = get59(); } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_literal_param       reject "$P59"' void f(*O59 o){ *o = { .v = tla59[1..3] }; } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_local_view_param    reject "$P59"' void f(*O59 o){ [*]u32 s = tla59; o.v = s; } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_keep_addr           reject "$P59"' void f(*O59 o){ stp59(o, &tl59); } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_keep_array          reject "$P59"' void f(*O59 o){ sts59(o, tla59); } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_keep_call           reject "$P59"' void f(){ keepfn(pass59(&tl59)); } u32 main(){ f(); return 0; }'
+cell p59_safe_value_read     compile "$P59"' void f(*O59 o){ o.x = tla59[1]; o.arr = tla59; } u32 main(){ O59 o; f(&o); return 0; }'
+cell p59_safe_local_view     compile "$P59"' u32 main(){ [*]u32 s = tla59[1..3]; *u32 q = pass59(&tl59); *q = 1; return sum59(s) + sum59(tla59); }'
+cell p59_safe_to_threadlocal compile "$P59"' u32 main(){ tlv59 = tla59; tlv59 = tla59[0..2]; return 0; }'
+cell p59_safe_tl_ptr_value   compile "$P59"' void f(*O59 o){ tlp59 = &gv59; o.p = tlp59; } u32 main(){ O59 o; f(&o); return 0; }'
+
+# SHAPE p62 (BUG-1425): a CONTEXT BAN reached through an INDIRECT call —
+# REACH form (funcptr local, mutable global, field of a const table, factory
+# result, forwarded param, a helper declared AFTER the banned block) x BAN
+# (@critical spawn / heap / interrupt re-enable, ISR heap / spawn). The summary
+# followed direct names only; every form is now the one REACH query
+# (indirect_callee_functions). ISR cells are checker-verdict only (hosted GCC
+# refuses an interrupt body). BOUNDARY: a funcptr whose SIGNATURE no dangerous
+# function has, and a const table naming a harmless function beside a
+# dangerous function of the same signature.
+echo "===== SHAPE p62 = context ban x indirect-call reach ====="
+P62='void w61() { }
+void sp62() { spawn w61(); }
+void al61(u32 k) { ?[*]u8 b = alloc(u8, 16); if (b) |bb| { free(bb); } }
+void en61(u8 k) { @cpu_enable_int(); }
+u32 ok61(u32 k) { return k + 1; }
+struct O61 { *() f; }
+struct A61 { *(u32) f; }
+*() mk61() { return sp62; }
+void run61(*() f) { f(); }
+'
+# (each dangerous function has its OWN signature, so a cell is rejected for its
+# own ban and not for another function the signature fallback also reaches)
+cell p62_crit_spawn_local     reject "$P62"' u32 main(){ *() fp = sp62; @critical { fp(); } return 0; }'
+cell p62_crit_spawn_global    reject "$P62"' *() g61 = sp62; u32 main(){ @critical { g61(); } return 0; }'
+cell p62_crit_spawn_table     reject "$P62"' const O61 o61 = { .f = sp62 }; u32 main(){ @critical { o61.f(); } return 0; }'
+cell p62_crit_spawn_factory   reject "$P62"' u32 main(){ *() fp = mk61(); @critical { fp(); } return 0; }'
+cell p62_crit_spawn_param     reject "$P62"' u32 main(){ @critical { run61(sp62); } return 0; }'
+cell p62_crit_spawn_late      reject "$P62"' u32 main(){ @critical { late61(); } return 0; } void late61() { *() fp = sp62; fp(); }'
+cell p62_crit_alloc_local     reject "$P62"' u32 main(){ *(u32) fp = al61; @critical { fp(1); } return 0; }'
+cell p62_crit_alloc_table     reject "$P62"' const A61 o61 = { .f = al61 }; u32 main(){ @critical { o61.f(1); } return 0; }'
+cell p62_crit_enable_local    reject "$P62"' u32 main(){ *(u8) fp = en61; @critical { fp(1); } return 0; }'
+cell p62_crit_enable_global   reject "$P62"' *(u8) g61 = en61; u32 main(){ @critical { g61(1); } return 0; }'
+cell p62_isr_alloc_local      reject "$P62"' interrupt TIM2 { *(u32) f = al61; f(1); } u32 main(){ return 0; }'
+cell p62_isr_alloc_global     reject "$P62"' *(u32) g61 = al61; interrupt TIM2 { g61(1); } u32 main(){ return 0; }'
+cell p62_isr_alloc_table      reject "$P62"' const A61 o61 = { .f = al61 }; interrupt TIM2 { o61.f(1); } u32 main(){ return 0; }'
+cell p62_isr_spawn_factory    reject "$P62"' interrupt TIM2 { *() f = mk61(); f(); } u32 main(){ return 0; }'
+cell p62_safe_other_sig       compile "$P62"' u32 main(){ *(u32) -> u32 fp = ok61; u32 r = 0; @critical { r = fp(1); } if (r != 2) { return 1; } return 0; }'
+cell p62_safe_const_table     compile "$P62"' void nop62() { } const O61 o61 = { .f = nop62 }; u32 main(){ @critical { o61.f(); } return 0; }'
+
 
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"

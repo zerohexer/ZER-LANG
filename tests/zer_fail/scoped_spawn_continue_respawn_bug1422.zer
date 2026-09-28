@@ -1,0 +1,13 @@
+// expect-error: ThreadHandle 'th' re-spawned while the thread spawned at line
+// BUG-1422: the loop spelling — a `continue` skips the join, and the next
+// iteration spawns into the same handle.
+void w(*u32 p) { *p += 1; }
+u32 main() {
+    u32 v = 0;
+    for (u32 i = 0; i < 3; i += 1) {
+        ThreadHandle th = spawn w(&v);
+        if (i < 2) { continue; }
+        th.join();
+    }
+    return 0;
+}

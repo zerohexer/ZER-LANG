@@ -22,6 +22,16 @@
  * Lowering Context — state maintained during AST → IR translation
  * ================================================================ */
 
+struct SharedRootVec;
+/* A statement's held shared-lock group — see LowerCtx.held. */
+typedef struct {
+    Node *root;                    /* primary lock (NULL = nothing held) */
+    struct SharedRootVec *extra;   /* further group members (read locks), or NULL */
+    bool write;                    /* primary taken as a write lock */
+    int loop_exit_block;           /* BUG-1421: loop blocks at install time */
+    int loop_continue_block;
+} StmtLock;
+
 /* Label → block mapping entry (BUG-575: stack-first dynamic buffer). */
 typedef struct {
     const char *name;
@@ -143,21 +153,27 @@ typedef struct {
     /* Temp counter for generated names */
     int temp_count;
 
-    /* Active shared-lock root for the currently-being-lowered statement.
-     * NODE_BLOCK sets this before lower_stmt and clears afterward, so
-     * exit statements (NODE_RETURN) can emit IR_UNLOCK BEFORE the exit
-     * — without this, the unlock emitted by the block iterator after
-     * lower_stmt is dead code, and the shared mutex stays held forever.
-     * Single-level tracking — nested shared blocks accumulate locks
-     * (recursive mutex), and only the outermost unlock fires here. */
-    Node *current_stmt_shared_root;
-    /* §E #29 C-F3 (2026-07-03): prev value of current_stmt_shared_root saved
-     * while a condition's shared-read lock is active, so an `orelse return/break`
-     * INSIDE an if/while/for/switch/do-while CONDITION releases the cond mutex
-     * before the early exit (else the lock leaks → permanent deadlock). Cond
-     * locks do not nest within one condition (conditions are expressions), so
-     * one slot suffices. */
-    Node *cond_shared_saved;
+    /* The shared-struct lock GROUP held by the statement currently being
+     * lowered (NULL root = none). Exit statements lowered INSIDE the statement
+     * (an orelse `return` / `break` / `continue`, a bounds-guard return) release
+     * the WHOLE group through emit_release_held before the jump — the IR_UNLOCK
+     * the block iterator emits after lower_stmt is dead code on those paths.
+     *
+     * BUG-1420: the group is held only while the statement's OWN expressions
+     * run. An orelse BLOCK fallback is a nested statement list; it runs with the
+     * group RELEASED (lower_orelse_to_dest), so no statement ever lowers a
+     * nested statement while holding a lock — the per-statement model's
+     * "never two different shared-struct locks at once" holds by construction.
+     * BUG-1421: the loop blocks current when the group was installed, so a
+     * break / continue only releases it when it leaves THAT loop. */
+    StmtLock held;
+    /* §E #29 C-F3 (2026-07-03): the held group saved while a condition's
+     * shared-read lock is active, so an `orelse return/break` INSIDE an
+     * if/while/for/switch/do-while CONDITION releases the cond mutex before the
+     * early exit (else the lock leaks → permanent deadlock). Cond locks do not
+     * nest within one condition (conditions are expressions), so one slot
+     * suffices. */
+    StmtLock cond_held_saved;
     /* BUG-1041: set by the expression-STATEMENT arm for the one lower_expr call
      * whose NODE_ASSIGN result is discarded. Everywhere else a NODE_ASSIGN sits in
      * VALUE position — `if ((x += 1) > 3)`, `y = (x += 1) + 2` — and the compound
@@ -167,6 +183,9 @@ typedef struct {
      * RHS is correctly in value position again. */
     bool assign_stmt_pos;
 } LowerCtx;
+
+static void emit_release_held(LowerCtx *ctx, int line);
+static bool held_released_by_jump(LowerCtx *ctx, bool is_continue);
 
 /* ---- Helpers ---- */
 
@@ -1812,11 +1831,7 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     }
 
     emit_defer_fire(ctx, g->line);
-    if (ctx->current_stmt_shared_root) {
-        IRInst unlock = make_inst(IR_UNLOCK, g->line);
-        unlock.expr = ctx->current_stmt_shared_root;
-        emit_inst(ctx, unlock);
-    }
+    emit_release_held(ctx, g->line);   /* BUG-1420: the whole group */
     IRInst ret = make_inst(IR_RETURN, g->line);
     ret.ret_from_guard = true;   /* BUG-1071: named in the leak diagnostic */
     if (!void_ret) {
@@ -2223,7 +2238,7 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
  * ZERO diagnostics — a silent data race in the emitted C. A cap on a SAFETY
  * collector cannot fail silently; either it grows or it must refuse the program.
  * It grows: stack-first 16, heap doubling, per CLAUDE.md rule #7. */
-typedef struct {
+typedef struct SharedRootVec {
     Node **items;
     int    count;
     int    cap;
@@ -2405,6 +2420,85 @@ static Node *find_shared_root_in_stmt_ir(Checker *c, Node *stmt) {
     return NULL;
 }
 
+/* BUG-1420/1421: the held statement lock group (LowerCtx.held). */
+static StmtLock held_make(LowerCtx *ctx, Node *root, SharedRootVec *extra, bool write) {
+    StmtLock h;
+    h.root = root;
+    h.extra = root ? extra : NULL;
+    h.write = write;
+    h.loop_exit_block = ctx->loop_exit_block;
+    h.loop_continue_block = ctx->loop_continue_block;
+    return h;
+}
+
+/* Install `root` (+extras) as the held group, or keep the enclosing one when
+ * this statement takes no lock of its own (an enclosing cond / for-init lock
+ * that is still held must still be released by a nested early exit). */
+static StmtLock held_enter(LowerCtx *ctx, Node *root, SharedRootVec *extra, bool write) {
+    StmtLock prev = ctx->held;
+    if (root) ctx->held = held_make(ctx, root, extra, write);
+    return prev;
+}
+
+/* Release every lock of the held group — the extras in reverse, then the
+ * primary; the same set emit_shared_unlock_if_needed releases on the normal
+ * path. Used by every early exit out of a locked statement. Pre-BUG-1420 each
+ * exit site released only the PRIMARY, so `x = f(q.a, r.b) orelse { return 3; };`
+ * returned holding r's lock (measured: the next access to r hung). */
+static void emit_release_held(LowerCtx *ctx, int line) {
+    if (!ctx->held.root) return;
+    SharedRootVec *ex = ctx->held.extra;
+    for (int i = ex ? ex->count - 1 : -1; i >= 0; i--) {
+        if (!ex->items[i]) continue;
+        IRInst u2 = make_inst(IR_UNLOCK, line);
+        u2.expr = ex->items[i];
+        emit_inst(ctx, u2);
+    }
+    IRInst unlock = make_inst(IR_UNLOCK, line);
+    unlock.expr = ctx->held.root;
+    emit_inst(ctx, unlock);
+}
+
+/* Re-acquire the held group after a fallback block that fell through — the
+ * statement's normal-path unlock still follows. Same shape as
+ * emit_shared_lock_if_needed: the first lock carries the group size and the
+ * members follow it, so the emitter takes the group in ADDRESS order
+ * (BUG-1376). Nothing else is held at this point (BUG-1420), so this is the
+ * statement's own group re-taken, never a second lock nested inside one. */
+static void emit_reacquire_held(LowerCtx *ctx, int line) {
+    if (!ctx->held.root) return;
+    SharedRootVec *ex = ctx->held.extra;
+    int group_n = 1;
+    for (int i = 0; ex && i < ex->count; i++) if (ex->items[i]) group_n++;
+    IRInst lock = make_inst(IR_LOCK, line);
+    lock.expr = ctx->held.root;
+    lock.src2_local = ctx->held.write ? 1 : 0;
+    lock.literal_int = group_n;
+    emit_inst(ctx, lock);
+    for (int i = 0; ex && i < ex->count; i++) {
+        if (!ex->items[i]) continue;
+        IRInst l2 = make_inst(IR_LOCK, line);
+        l2.expr = ex->items[i];
+        l2.src2_local = 0;
+        l2.literal_int = -1;
+        emit_inst(ctx, l2);
+    }
+}
+
+/* BUG-1421: does a break (continue) lowered NOW leave the statement that holds
+ * the group? Only when it targets the loop that was current when the group was
+ * installed — a loop lowered INSIDE the statement has other blocks, and a jump
+ * to it stays inside the statement. Pre-fix every break/continue released the
+ * group, so a loop inside an orelse block (`x = f(q.a) orelse { for (...) {
+ * continue; ... break; } return s; };`) unlocked one lock up to four times —
+ * measured: TSan "unlock of an unlocked mutex", and on shared(rw) the extra
+ * unlocks released OTHER threads' locks (lost updates, hang). */
+static bool held_released_by_jump(LowerCtx *ctx, bool is_continue) {
+    if (!ctx->held.root) return false;
+    if (is_continue) return ctx->held.loop_continue_block == ctx->loop_continue_block;
+    return ctx->held.loop_exit_block == ctx->loop_exit_block;
+}
+
 /* Gap 36 fix (2026-04-27, Stage 2): emit IR_LOCK around evaluation of a
  * shared-struct-reading cond/expr in NODE_IF / NODE_WHILE / NODE_FOR /
  * NODE_SWITCH. Returns the shared root if a lock was emitted (caller
@@ -2431,16 +2525,16 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     emit_inst(ctx, lock);
     /* §E #29 C-F3: expose the cond's lock root so an `orelse return/break/continue`
      * lowered from INSIDE the condition (lower_orelse_to_dest consults
-     * ctx->current_stmt_shared_root) releases the mutex on the early-exit path.
+     * ctx->held) releases the mutex on the early-exit path.
      * Restored by emit_shared_unlock_after_cond on the normal path. */
-    ctx->cond_shared_saved = ctx->current_stmt_shared_root;
-    ctx->current_stmt_shared_root = root;
+    ctx->cond_held_saved = ctx->held;
+    ctx->held = held_make(ctx, root, NULL, false);
     return root;
 }
 
 static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
     if (!root) return;
-    ctx->current_stmt_shared_root = ctx->cond_shared_saved;  /* §E #29 C-F3 restore */
+    ctx->held = ctx->cond_held_saved;  /* §E #29 C-F3 restore */
     IRInst unlock = make_inst(IR_UNLOCK, line);
     unlock.expr = root;
     emit_inst(ctx, unlock);
@@ -2465,9 +2559,11 @@ static bool stmt_writes_shared_ir(Node *stmt) {
  * UN-LOCKED → data race / cross-thread stale-pointer UAF). Capture/replay lets
  * orelse statements lock every root too. Extras are always READ locks derived
  * from EXPRESSION contexts (find_all_shared_roots_expr does not descend
- * block-fallbacks), so they never coexist with a nested early-exit that would
- * need to release them independently — the primary root alone flows through
- * ctx->current_stmt_shared_root for nested exits, as before. Same-type multi
+ * block-fallbacks). A nested early exit (an orelse `return` / `break`) DOES
+ * coexist with them, so the whole group flows through ctx->held and
+ * emit_release_held releases every member (BUG-1420 — this comment used to
+ * say the primary alone sufficed, and `x = f(q.a, r.b) orelse { return 3; };`
+ * returned holding r's lock). Same-type multi
  * read locks compose (B1); only the pre-existing AB-BA liveness floor is
  * unchanged. */
 static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_root,
@@ -2943,12 +3039,8 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         /* Release the active shared-struct lock for THIS statement before
          * the return — same pattern as NODE_RETURN handler. Without this,
          * `value = shared.field orelse return;` leaks the auto-mutex and
-         * the next thread to acquire it deadlocks. */
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+         * the next thread to acquire it deadlocks. BUG-1420: the WHOLE group. */
+        emit_release_held(ctx, line);
         IRInst ret = make_inst(IR_RETURN, line);
         ret.ret_from_orelse = true;  /* ?void: propagate FAILURE (None), not success */
         emit_inst(ctx, ret);
@@ -2958,11 +3050,9 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        /* BUG-1420: the whole group. A bare `orelse break` always leaves the
+         * statement (it names the loop the statement sits in). */
+        emit_release_held(ctx, line);
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_exit_block;
         emit_inst(ctx, go);
@@ -2971,11 +3061,7 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
         if (ctx->current_block != bb_fail) {   /* BUG-966, see above */
             tag_orelse_fallback(ctx, ctx->current_block, tmp_id, subj_root);
         }
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        emit_release_held(ctx, line);   /* BUG-1420: the whole group */
         IRInst go = make_inst(IR_GOTO, line);
         go.goto_block = ctx->loop_continue_block;
         emit_inst(ctx, go);
@@ -3016,7 +3102,35 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
                 emit_inst(ctx, assign);
             }
         } else {
+            /* BUG-1420: a BLOCK fallback is a nested statement list, and the
+             * checker treats each of its statements as its OWN lock scope
+             * (check_block_lock_ordering via for_each_orelse_block, BUG-1047;
+             * the rw re-entry rule, BUG-980). The lowering used to run it
+             * INSIDE the enclosing statement's lock group, so
+             *   u32 x = none(a.v) orelse { b.y = 5; continue; };
+             * held A while locking B — against a thread doing the mirror
+             * statement, an ABBA deadlock the checker had accepted (measured
+             * hang) — and on a shared(rw) struct `maybe(q.a) orelse { q.n = 5;
+             * ... }` took a WRITE lock while holding a READ lock of the same
+             * non-recursive rwlock (self-deadlock).
+             *
+             * The subject has been evaluated into the temp by now, so nothing
+             * of the statement still needs the group: RELEASE it, lower the
+             * block with nothing held (its statements lock themselves), and
+             * re-acquire only if the block falls through into the rest of the
+             * statement (a `?void` / discarded-value orelse), whose normal-path
+             * unlock follows. This keeps "never two different shared-struct
+             * locks held at once" true by construction, the model the checker
+             * already assumes. */
+            StmtLock outer = ctx->held;
+            emit_release_held(ctx, line);
+            ctx->held.root = NULL;
+            ctx->held.extra = NULL;
             lower_stmt(ctx, fb);
+            ctx->held = outer;
+            IRBlock *after = &ctx->func->blocks[ctx->current_block];
+            if (after->inst_count == 0 || !ir_block_is_terminated(after))
+                emit_reacquire_held(ctx, line);
         }
         /* Check if fallback terminated; if not, goto join */
         IRBlock *fb_blk = &ctx->func->blocks[ctx->current_block];
@@ -3191,31 +3305,35 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 IRInst ret = make_inst(IR_RETURN, stmt->loc.line);
                 if (ret_expr) {
                     rewrite_idents(ctx, ret_expr);
+                    /* BUG-1420: the group is HELD while the return value is
+                     * lowered, so an orelse exit inside it (`return f(q.a)
+                     * orelse { return 3; };`) must see it. This path used to
+                     * lower with ctx->held unset, so that inner return left
+                     * q's lock held forever (measured hang). */
+                    StmtLock prev_held = held_enter(ctx, shared_root, &shared_extra, false);
                     ret.src1_local = lower_expr(ctx, ret_expr);
+                    ctx->held = prev_held;
                     if (ret.src1_local < 0) ret.expr = ret_expr;
                 }
                 emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
                 shared_root = NULL;
                 emit_defer_fire(ctx, stmt->loc.line);
                 emit_inst(ctx, ret);
+                srv_free(&shared_extra);
                 continue;
             }
-            /* Expose the active root to lower_stmt so exit statements
+            /* Expose the active group to lower_stmt so exit statements
              * (other than NODE_RETURN above) can also release the lock.
              *
-             * When the current inner stmt has no lock of its own
-             * (shared_root NULL) but an outer stmt's lock is still active
-             * (prev_shared non-NULL), INHERIT prev_shared so a nested
-             * early-exit (e.g., `x = outer.field orelse { return; }`
-             * block-fallback path containing a plain `return;`) still
-             * releases the outer lock before the IR_RETURN. Without
-             * inheritance, the inner return sees current_stmt_shared_root=
-             * NULL → no IR_UNLOCK → outer mutex leaks → cross-thread
-             * deadlock. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = shared_root ? shared_root : prev_shared;
+             * When the current inner stmt has no lock of its own, the
+             * enclosing held group (if any) is KEPT (held_enter) so a nested
+             * early exit still releases it. Since BUG-1420 an orelse BLOCK
+             * fallback runs with the enclosing group already RELEASED
+             * (lower_orelse_to_dest), so its statements normally see none. */
+            StmtLock prev_held = held_enter(ctx, shared_root, &shared_extra,
+                                            stmt_writes_shared_ir(stmt));
             lower_stmt(ctx, stmt);
-            ctx->current_stmt_shared_root = prev_shared;
+            ctx->held = prev_held;
             emit_shared_unlock_if_needed(ctx, shared_root, &shared_extra);
             /* BUG-935: the vector is per-STATEMENT and may have grown onto the
              * heap, so it is released at the end of every iteration. */
@@ -3662,10 +3780,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * the init (e.g., `for (u32 v = g.field orelse return; ...)`
              * — orelse fallback inside for-init) release the lock before
              * the IR_RETURN, mirroring NODE_BLOCK iterator behavior. */
-            Node *prev_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = init_root ? init_root : prev_shared;
+            StmtLock prev_held = held_enter(ctx, init_root, &init_extra,
+                                            stmt_writes_shared_ir(node->for_stmt.init));
             lower_stmt(ctx, node->for_stmt.init);
-            ctx->current_stmt_shared_root = prev_shared;
+            ctx->held = prev_held;
             if (init_root) {
                 emit_shared_unlock_if_needed(ctx, init_root, &init_extra);
             }
@@ -3729,7 +3847,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * (which may be a shared field, e.g. `i = g.next orelse 0`); if the
              * lock were emitted AFTER pre_lower_orelse the shared read in the
              * branches would happen unlocked. Mirror the for-init pattern: find
-             * the shared root on the RAW step, lock, set current_stmt_shared_root
+             * the shared root on the RAW step, lock, install ctx->held
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
@@ -3741,15 +3859,14 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 lock.src2_local = 1; /* write lock — step typically writes */
                 emit_inst(ctx, lock);
             }
-            Node *prev_step_shared = ctx->current_stmt_shared_root;
-            ctx->current_stmt_shared_root = step_root ? step_root : prev_step_shared;
+            StmtLock prev_step_held = held_enter(ctx, step_root, NULL, true);
             /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
-            ctx->current_stmt_shared_root = prev_step_shared;
+            ctx->held = prev_step_held;
             if (step_root) {
                 IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
                 unlock.expr = step_root;
@@ -4514,12 +4631,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * emits AFTER lower_stmt is unreachable and the mutex leaks.
          * Multi-threaded programs that have any function which returns a
          * value derived from a shared struct would deadlock the next
-         * time the same lock is acquired by another thread. */
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+         * time the same lock is acquired by another thread.
+         * BUG-1420: the WHOLE group, not only its primary. */
+        emit_release_held(ctx, node->loc.line);
         emit_inst(ctx, ret);
         break;
     }
@@ -4530,12 +4644,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             /* Fire loop-scoped defers (emit bodies, DO NOT pop — other paths may need them) */
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
             /* Release any active shared lock before exiting (same as
-             * NODE_RETURN — see current_stmt_shared_root comment). */
-            if (ctx->current_stmt_shared_root) {
-                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = ctx->current_stmt_shared_root;
-                emit_inst(ctx, unlock);
-            }
+             * NODE_RETURN — see LowerCtx.held) — but only when this break
+             * leaves the locked statement (BUG-1421). */
+            if (held_released_by_jump(ctx, false)) emit_release_held(ctx, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_exit_block;
             emit_inst(ctx, go);
@@ -4547,11 +4658,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_CONTINUE: {
         if (ctx->loop_continue_block >= 0) {
             emit_defer_fire_scoped(ctx, ctx->loop_defer_base, false, node->loc.line);
-            if (ctx->current_stmt_shared_root) {
-                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = ctx->current_stmt_shared_root;
-                emit_inst(ctx, unlock);
-            }
+            /* BUG-1421: only when the continue leaves the locked statement. */
+            if (held_released_by_jump(ctx, true)) emit_release_held(ctx, node->loc.line);
             IRInst go = make_inst(IR_GOTO, node->loc.line);
             go.goto_block = ctx->loop_continue_block;
             emit_inst(ctx, go);
@@ -4602,11 +4710,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int goto_fired_count = ctx->defer_count - fire_base; /* count actually fired */
         emit_defer_fire_scoped(ctx, fire_base, true, node->loc.line);
         ctx->defer_count = fire_base;
-        if (ctx->current_stmt_shared_root) {
-            IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-            unlock.expr = ctx->current_stmt_shared_root;
-            emit_inst(ctx, unlock);
-        }
+        /* A goto always leaves the statement: labels are statements, and no
+         * statement is lowered while a group is held (BUG-1420). */
+        emit_release_held(ctx, node->loc.line);
         int target = find_label_block(ctx,
             node->goto_stmt.label, (uint32_t)node->goto_stmt.label_len);
         /* plt86m defer-goto fix: the goto fired the defers EAGERLY. Record that

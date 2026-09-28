@@ -1,0 +1,9 @@
+// expect-error: cannot spawn inside @critical block
+// BUG-1425: spawn reached from @critical through a mutable GLOBAL funcptr.
+void w() { }
+void st() { spawn w(); }
+*() fp = st;
+u32 main() {
+    @critical { fp(); }
+    return 0;
+}

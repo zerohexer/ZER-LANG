@@ -1,0 +1,7 @@
+// expect-error: carries the address of threadlocal 'tla'
+// BUG-1423: a struct literal carrying a SLICE of a threadlocal array, stored
+// through the out-param.
+struct O { ?[*]u32 v; }
+threadlocal u32[4] tla;
+void f(*O out) { *out = { .v = tla[1..3] }; }
+u32 main() { O o; ThreadHandle th = spawn f(&o); th.join(); return 0; }

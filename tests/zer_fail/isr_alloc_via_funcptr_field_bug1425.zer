@@ -1,0 +1,8 @@
+// expect-error: cannot allocate inside interrupt handler
+// BUG-1425: calloc reachable from an interrupt handler through a funcptr FIELD
+// of a (mutable) global struct.
+void helper() { ?[*]u8 b = alloc(u8, 16); if (b) |bb| { free(bb); } }
+struct O { *() f; }
+O go = { .f = helper };
+interrupt TIM2 { go.f(); }
+u32 main() { return 0; }

@@ -1,0 +1,9 @@
+// expect-error: cannot heap-allocate or free inside @critical block
+// BUG-1425: calloc/free reached from @critical through a funcptr local.
+struct T { u32 v; }
+void st() { ?*T p = alloc(T); if (p) |q| { free(q); } }
+u32 main() {
+    *() fp = st;
+    @critical { fp(); }
+    return 0;
+}

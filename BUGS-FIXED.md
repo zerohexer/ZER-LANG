@@ -298,6 +298,28 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   `m1457_negative`, `m1459_user`; `tests/zer/emitter_name_capture_bug1456.zer`,
   `async_self_global_store_bug1456.zer`, `shift_macro_eval_order_bug1459.zer`,
   `async_distinct_task_type_bug1459.zer`; `tests/zer_fail/async_task_cast_{copy,return}_bug1459.zer`.
+- **BUG-1460 — a CALL nested inside a passthrough expression skipped every callee
+  effect.** `u32 y = none() orelse eat(a);` (eat frees), `@popcount(eat(a))`, an intrinsic
+  argument, a slice bound, a bit-slice index, a struct-literal field, an intrinsic-wrapped
+  condition and a spawn argument: the free / move / funcptr barrier never applied, so a
+  later `a.v` read a recycled object (exit 99) and a second free / consume was accepted.
+  `ir_assign_call_value` recognised only a call at the TOP of an assignment's value; one
+  exhaustive walk (`ir_pass_calls_walk` / `ir_passthrough_calls`) now lists every call in
+  evaluation order in a passthrough, an await condition and spawn arguments, each run
+  through the ordinary IR_CALL transfer (a call that may not run — the right of `&&`/`||`,
+  an orelse fallback — is applied to a COPY of the state and merged, so MAYBE_FREED).
+- **BUG-1461** — a pointer bound once to `&h.p` / `&arr[2]` was never resolved as a
+  stable aim (`ir_stable_projection_root`); **BUG-1462** — an optional's `|*c|` capture was
+  not a view of the optional, nor `*S c = &gs` of a global aggregate (`ir_optional_capture_view`,
+  `view_root_gkey`); **BUG-1463** — a slice local over a local array was not keyed on the
+  array (`ir_stable_slice_local_def`); **BUG-1464** — a nested sub-slice store
+  `la[1..3][1..2][0] = a` folded one level only. Each let a store through the second
+  spelling escape the use-after-free check.
+- **BUG-1465 (over-rejection)** — a funcptr hand-off two calls deep was reported "may not
+  be freed on all paths"; the hand-off bit now propagates through a direct call.
+  Tests: 13 `tests/zer_fail/*_bug146[0-5].zer`, `tests/zer/passthrough_call_effects_bug1460.zer`,
+  `slot_view_spellings_bug1461.zer`; SHAPES p64 (31 cells) and p65 (16 cells) — 33 HOLE + 1
+  OVER-REJECT pre-fix.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

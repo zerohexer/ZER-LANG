@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'arr[2]' is freed
+// BUG-1461: a pointer bound once to &arr[2] — *lp = a stores into arr[2].
+struct T { u32 v; }
+struct H { ?*T p; }
+u32 main() {
+    ?*T[4] arr;
+    *?*T lp = &arr[2];
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    *lp = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (arr[2]) |q| { r = q.v; }
+    free(b);
+    return r;
+}

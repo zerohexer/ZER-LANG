@@ -1382,6 +1382,88 @@ cell p63_safe_heap_reset     compile "$P63"' u32 main(){ ga59 = Arena.over(buf59
 cell p63_safe_getter_read    compile "$P63"' u32 main(){ *T59 a = alloc(T59) orelse return; a.v = 0; gar59[0] = a; u32 r = 0; if (get59(0)) |q| { r = q.v; } gar59[0] = null; free(a); return r; }'
 cell p63_safe_move_into_slot compile "$P63"' u32 main(){ Tok59 d = { .k = 0 }; Tok59[1] ts; ts[0] = d; return eat59(ts[0]); }'
 
+# SHAPE p64 (BUG-1460): a CALL nested inside a passthrough expression — an orelse
+# VALUE fallback, an intrinsic argument, a slice bound, a bit-slice index, a
+# struct-literal field, an intrinsic-wrapped condition. These positions lower to
+# ONE `%t = ASSIGN <expr>` with the call inside and no IR_CALL, so every callee
+# effect (the frees / moves / funcptr barrier of its summary) was skipped and the
+# read of `a` afterwards returned a recycled object. ONE exhaustive walk
+# (ir_passthrough_calls) now lists every call such an instruction runs. A call
+# under `&&`/`||` or in an orelse fallback MAY not run: it is joined (MAYBE_FREED).
+# BOUNDARY: a NON-freeing callee at the same positions; a freeing call on a path
+# that returns (no false leak — the base compiler reported one).
+echo "===== SHAPE p64 = call nested in a passthrough expression x position ====="
+P64='struct T64 { u32 v; } struct W64 { u32 x; } enum E64 { a, b }
+move struct Tok64 { u32 k; }
+u32 g64; u32[4] garr64;
+?u32 none64() { return null; }
+u32 eat64(*T64 p) { u32 v = p.v; free(p); return v; }
+u32 peek64(*T64 p) { return p.v; }
+u32 take64(Tok64 t) { return t.k; }
+'
+
+cell p64_orelse_fallback        reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = none64() orelse eat64(a); u32 r = a.v; free(a); return r; }'
+cell p64_orelse_fallback_assign reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = 0; y = none64() orelse eat64(a); u32 r = a.v; free(a); return r; }'
+cell p64_popcount               reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = @popcount(eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_expect                 reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = @expect(eat64(a), 5); u32 r = a.v; free(a); return r; }'
+cell p64_atomic_add             reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; @atomic_add(&g64, eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_saturate               reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u8 y = @saturate(u8, eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_clz                    reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = @clz(eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_bswap32                reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = @bswap32(eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_try_enum               reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; if (@try_enum(E64, eat64(a))) |e| { g64 = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_ptrtoint_index         reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; usize q = @ptrtoint(&arr[eat64(a) % 4]); u32 r = a.v; free(a); return r; }'
+cell p64_slice_bound            reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; [*]u32 s = arr[0..(eat64(a) % 4)]; u32 r = a.v; free(a); return r; }'
+cell p64_bitslice_index         reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = g64[(eat64(a) % 8)..0]; u32 r = a.v; free(a); return r; }'
+cell p64_if_cond                reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; if (@popcount(eat64(a)) > 0) { g64 = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_while_cond             reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; while (@popcount(eat64(a)) > 100) { g64 = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_switch_subject         reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; switch (@popcount(eat64(a))) { default => { g64 = 1; } } u32 r = a.v; free(a); return r; }'
+cell p64_for_init               reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; for (u32 i = @popcount(eat64(a)); i < 1; i += 1) { g64 = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_struct_field           reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; W64 w = { .x = @popcount(eat64(a)) }; u32 r = a.v; free(a); return r; }'
+cell p64_compound_assign        reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = 1; y += @popcount(eat64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_andand_rhs             reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; u32[4] arr; u32 y = 0; if (g64 == 0 && eat64(a) > 0) { y = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_spawn_arg              reject "$P64"' void w64(u32 x) { } u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 5; ThreadHandle th = spawn w64(eat64(a)); th.join(); u32 r = a.v; free(a); return r; }'
+cell p64_safe_spawn_arg         compile "$P64"' void w64(u32 x) { } u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; ThreadHandle th = spawn w64(peek64(a)); th.join(); u32 r = a.v; free(a); return r; }'
+cell p64_move_orelse_fallback   reject "$P64"' u32 main(){ Tok64 t = { .k = 3 }; u32 y = none64() orelse take64(t); return take64(t) + y; }'
+cell p64_move_intrinsic_arg     reject "$P64"' u32 main(){ Tok64 t = { .k = 3 }; u32 y = @popcount(take64(t)); return take64(t) + y; }'
+cell p64_double_free_intrinsic  reject "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; u32 y = @popcount(eat64(a)); free(a); return y; }'
+cell p64_safe_popcount          compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; u32[4] arr; u32 y = @popcount(peek64(a)); u32 r = a.v; free(a); return r; }'
+cell p64_safe_orelse_fallback   compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; u32[4] arr; u32 y = none64() orelse peek64(a); u32 r = a.v; free(a); return r; }'
+cell p64_safe_slice_bound       compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; u32[4] arr; [*]u32 s = arr[0..(peek64(a) % 4)]; u32 r = a.v; free(a); return r; }'
+cell p64_safe_struct_field      compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; u32[4] arr; W64 w = { .x = @popcount(peek64(a)) }; u32 r = a.v; free(a); return r; }'
+cell p64_safe_if_cond           compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; u32[4] arr; if (@popcount(peek64(a)) > 0) { g64 = 1; } u32 r = a.v; free(a); return r; }'
+cell p64_safe_return_path      compile "$P64"' u32 main(){ *T64 a = alloc(T64) orelse return; a.v = 0; if (g64 == 7) { return @popcount(eat64(a)); } free(a); return 0; }'
+
+# SHAPE p65 (BUG-1461..1464): a STORE into a slot through a spelling that names
+# the slot without spelling it — so the use-after-free check at the slot's own
+# name never saw the allocation: a pointer bound once to `&h.p` / `&arr[2]`
+# (ir_ptr_stable_aim took only `&IDENT`), an optional's `|*c|` capture and a
+# local pointer to a GLOBAL aggregate (no view recorded), a slice LOCAL over a
+# local array (keyed on the slice), and a sub-slice of a sub-slice (BUG-1383
+# folded one level). Every hazard cell stores `a` through the spelling, frees
+# `a`, then reads the slot by its OWN name.
+# BOUNDARY: the same spellings with the read BEFORE the free, and a reset.
+echo "===== SHAPE p65 = slot store through a view spelling ====="
+P65='struct T65 { u32 v; } struct S65 { ?*T65 p; u32 k; }
+S65 gs65; ?S65 gos65; ?*T65[4] gla65;
+'
+
+cell p65_aim_field                reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; S65 h; *?*T65 lp = &h.p; *lp = a; free(a); u32 r = 0; if (h.p) |q| { r = q.v; } return r; }'
+cell p65_aim_elem                 reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[4] arr; *?*T65 lp = &arr[2]; *lp = a; free(a); u32 r = 0; if (arr[2]) |q| { r = q.v; } return r; }'
+cell p65_aim_field_read_deref     reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; S65 h; *?*T65 lp = &h.p; h.p = a; free(a); u32 r = 0; if (*lp) |q| { r = q.v; } return r; }'
+cell p65_opt_capture_local        reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?S65 os = null; S65 s0; os = s0; if (os) |*c| { c.p = a; } free(a); u32 r = 0; if (os) |v| { if (v.p) |q| { r = q.v; } } return r; }'
+cell p65_opt_capture_global       reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; S65 s0; gos65 = s0; if (gos65) |*c| { c.p = a; } free(a); *T65 b = alloc(T65) orelse return; u32 r = b.v; free(b); return r; }'
+cell p65_ptr_to_global_agg        reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; *S65 c = &gs65; c.p = a; free(a); u32 r = 0; if (gs65.p) |q| { r = q.v; } gs65.p = null; return r; }'
+cell p65_slice_local_elem         reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[3] arr; [*]?*T65 sl = arr[0..3]; sl[1] = a; free(a); u32 r = 0; if (arr[1]) |q| { r = q.v; } return r; }'
+cell p65_slice_local_offset       reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[4] arr; [*]?*T65 sl = arr[1..4]; sl[1] = a; free(a); u32 r = 0; if (arr[2]) |q| { r = q.v; } return r; }'
+cell p65_slice_local_coerce       reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[3] arr; [*]?*T65 sl = arr; sl[1] = a; free(a); u32 r = 0; if (arr[1]) |q| { r = q.v; } return r; }'
+cell p65_slice_local_field        reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; S65[3] arr; [*]S65 sl = arr[0..3]; sl[1].p = a; free(a); u32 r = 0; if (arr[1].p) |q| { r = q.v; } return r; }'
+cell p65_nested_subslice          reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[4] la; la[1..3][1..2][0] = a; free(a); u32 r = 0; if (la[2]) |q| { r = q.v; } return r; }'
+cell p65_nested_subslice_glob     reject "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; gla65[1..3][1..2][0] = a; free(a); u32 r = 0; if (gla65[2]) |q| { r = q.v; } gla65[2] = null; return r; }'
+cell p65_safe_aim_field           compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; S65 h; *?*T65 lp = &h.p; *lp = a; u32 r = 0; if (h.p) |q| { r = q.v; } free(a); return r - 5; }'
+cell p65_safe_opt_capture         compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?S65 os = null; S65 s0; os = s0; if (os) |*c| { c.p = a; } u32 r = 0; if (os) |v| { if (v.p) |q| { r = q.v; } } free(a); return r - 5; }'
+cell p65_safe_slice_local         compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[3] arr; [*]?*T65 sl = arr[0..3]; sl[1] = a; u32 r = 0; if (arr[1]) |q| { r = q.v; } free(a); return r - 5; }'
+cell p65_safe_ptr_global_reset    compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; *S65 c = &gs65; c.p = a; u32 r = 0; if (gs65.p) |q| { r = q.v; } gs65.p = null; free(a); return r - 5; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

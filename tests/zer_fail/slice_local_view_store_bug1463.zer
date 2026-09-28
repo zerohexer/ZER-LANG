@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'arr[1]' is freed
+// BUG-1463: a slice LOCAL over a local array names the array's elements.
+struct T { u32 v; }
+u32 main() {
+    ?*T[3] arr;
+    [*]?*T sl = arr[0..3];
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    sl[1] = a;
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (arr[1]) |q| { r = q.v; }
+    free(b);
+    return r;
+}

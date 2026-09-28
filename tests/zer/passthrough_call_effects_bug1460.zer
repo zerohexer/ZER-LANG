@@ -1,0 +1,26 @@
+// BUG-1460 boundary: calls nested in passthrough positions (orelse fallback,
+// intrinsic argument, slice bound, struct-literal field, intrinsic-wrapped
+// condition) whose callee does NOT free keep the allocation usable, and a
+// freeing call on a path that returns is not a leak (the base compiler reported
+// "never freed" for the `return @popcount(eat(a))` path).
+struct T { u32 v; }
+struct W { u32 x; }
+?u32 none() { return null; }
+u32 peek(*T p) { return p.v; }
+u32 eat(*T p) { u32 v = p.v; free(p); return v; }
+u32 g;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 3;
+    u32[4] arr;
+    u32 y = @popcount(peek(a));          // 3 -> 2 bits
+    u32 z = none() orelse peek(a);       // 3
+    [*]u32 s = arr[0..(peek(a) % 4)];    // len 3
+    W w = { .x = @clz(peek(a)) };        // 30
+    if (@popcount(peek(a)) > 1) { y += 1; }
+    if (g == 7) { return @popcount(eat(a)); }
+    u32 r = y + z + (u32)s.len + w.x + a.v;   // 3 + 3 + 3 + 30 + 3
+    free(a);
+    if (r != 42) { return 1; }
+    return 0;
+}

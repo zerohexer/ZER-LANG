@@ -439,6 +439,44 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
 - Tests (BUG-1499..1503): vrp-fact matrix — 7 catch cells (all SILENT HOLES on the pre-fix
   build) + 3 cells that must stay proven; `tests/zer/vrp_*_bug{1499,1500,1501,1503}.zer`;
   `tests/zer_trap/vrp_async_reentrant_hoist_bug1503.zer`.
+- **BUG-1490 (CRITICAL) — a join of two predecessors naming DIFFERENT allocations kept
+  only the first.** `ir_merge_states` took the first predecessor's `alloc_id`, so
+  `*T p = a; if (c) { p = b; } free(b); p.v` read a freed object. The join now adds the other
+  allocation to the entry's multi-view set (`ir_merge_identity`); a per-member "stale" count
+  (`view_base`, `ir_merge_view_bases`) keeps the free-then-replace idiom accepted in its
+  if/else / twice / loop / switch forms. Every other `IRHandleInfo` field now has a written
+  join rule (`ir_merge_entry_flags`: interior / handed_off / spawn_transferred /
+  is_thread_handle OR; defer_double_reported / is_move_local AND; arena colour wins;
+  `escaped_any` is the OR the suspend barrier reads). Residual (leak only): an allocation
+  freed through the joined entry is marked FREED on both paths.
+- **BUG-1491 — an INTERIOR view lost its mark at a join, through an assignment, and through
+  a call result**, so `free(s)` of `b[2..6]` was accepted. `interior` joins as OR; the
+  assignment arms re-mark it; `FuncSummary.returns_interior_mask` carries it out of a callee.
+- **BUG-1492 — `pool.get(h).f` and `h.f` were two keys for one slot.** `ir_extract_compound_key`
+  keys both the same (`ir_rel_key_path`); the hoisted `pool.get(h)` temp is a view of h's slot.
+  The wrong-pool check no longer falls back from `h.f` to the handle's own pool.
+- **BUG-1494 — the BUG-750 field-store taint was a hand-written root walk** that tainted a
+  sub-slice of a slice PARAMETER; it asks `arg_is_local_derived` now (an over-rejection fix).
+- Tests (BUG-1490..1494): 19 `tests/zer_fail/*_bug149{0,1,2}.zer`, 4 positives, sink-matrix
+  SHAPE p66 (26 cells, 14 holes against the pre-fix build).
+- **BUG-1504 — `-(-x)` was emitted as `--x`** (a pre-decrement: wrong value AND `x` modified;
+  with a literal operand GCC refused it). Both unary emitters now parenthesise
+  `(op(operand))`. Test: `tests/zer/unary_pair_positions_bug1504.zer` (operator pairs x
+  i32/i64/f32/f64 x assign / call arg / orelse / defer / global).
+- **BUG-1505 — a literal in [2^63, 2^64) under a cast was sign-extended** (`(u128)0xFFFF_FFFF_FFFF_FFFF`
+  set all 128 bits; `(f64)L` was negative). `literal_tree_has_negative` read the int64 fold;
+  it asks `lit_tree_exact_int64` (the mathematical value, or give up). Regression of BUG-1322.
+- **BUG-1506 — the typed constant fold zeroed an over-wide shift at the CARRIER width**, the
+  runtime `_zer_shr(a,b,w)` at the DECLARED width, so `(i3)(-1) >> (i3)3` folded to -1 and
+  VRP "proved" an index that ran out of bounds (ASan write), and a global `i48` constant was
+  wrong. `tfold` cuts at `lty.bits`.
+- **BUG-1508 — a global folding to INT64_MIN hit the `CONST_EVAL_FAIL` sentinel** and fell
+  back to a file-scope statement expression GCC refused. `global_init_fold` reports failure
+  separately; `emit_folded_int` spells INT64_MIN. The BUG-1031 count arm accepts a cast count.
+- **BUG-1510 (over-rejection)** — a cast-literal divisor counts as proven nonzero
+  (`tfold_exact`), and a cast literal is a valid comptime argument.
+- Found by differential testing (~8,900 random programs x -O0 / -O2 / UBSan against a
+  reference interpreter; zero UBSan reports in the emitted C).
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

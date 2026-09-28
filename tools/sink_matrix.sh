@@ -1467,6 +1467,54 @@ cell p65_safe_opt_capture         compile "$P65"' u32 main(){ *T65 a = alloc(T65
 cell p65_safe_slice_local         compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; ?*T65[3] arr; [*]?*T65 sl = arr[0..3]; sl[1] = a; u32 r = 0; if (arr[1]) |q| { r = q.v; } free(a); return r - 5; }'
 cell p65_safe_ptr_global_reset    compile "$P65"' u32 main(){ *T65 a = alloc(T65) orelse return; a.v = 5; *S65 c = &gs65; c.p = a; u32 r = 0; if (gs65.p) |q| { r = q.v; } gs65.p = null; free(a); return r - 5; }'
 
+# SHAPE p66 (BUG-1490..1494): an entry whose ALLOCATION IDENTITY (or one of its
+# flags) DIFFERS between the predecessors of a CFG join. The merge started from
+# the first live predecessor and kept ITS alloc_id / interior / escaped, so after
+# `*N p = a; if (c) { p = b; }` a free through p was attributed to a alone and b
+# stayed ALIVE (use after free + double free), and an interior sub-slice assigned
+# on one branch lost its "points inside" mark (bad free). A disagreeing identity
+# now joins into the multi-view set (ir_merge_identity), flags join by
+# ir_merge_entry_flags. Also here: the two spellings of a Pool slot field
+# (`pool.get(h).f` vs `h.f`) — one key now (BUG-1492); a call result that is an
+# interior view of its argument (FuncSummary.returns_interior_mask, BUG-1491);
+# a sub-slice of a slice PARAM stored into a field is not frame-bound (BUG-1494).
+# BOUNDARY: the free-then-realloc idioms (one branch, both branches, twice in a
+# row, in a loop, in a switch), every candidate freed by name, a view read
+# before its base is freed, and the `.get(h).f` spelling used correctly.
+echo "===== SHAPE p66 = identity / flag disagreeing at a CFG join ====="
+P66='struct V66 { [*]u8 s; } struct W66 { u8[8] a; }
+struct T66 { u32 v; } struct H66 { ?*T66 p; } struct P66n { *T66 p; u32 k; }
+Pool(P66n, 4) nodes66; ?*T66 gp66;
+void rel66(*T66 p) { free(p); }
+[*]u8 tail66([*]u8 s) { return s[2..s.len]; }
+'
+cell p66_join_alias_bare          reject "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; if (c == 1) { p = b; } free(p); u32 r = b.v; free(b); return r; }'
+cell p66_join_alias_field         reject "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; H66 h; h.p = a; if (c == 1) { h.p = b; } if (h.p) |q| { free(q); } u32 r = b.v; free(b); return r; }'
+cell p66_join_alias_switch        reject "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; switch (c) { 0 => { } default => { p = b; } } free(p); u32 r = b.v; free(b); return r; }'
+cell p66_join_alias_callee        reject "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; if (c == 1) { p = b; } rel66(p); u32 r = b.v; free(b); return r; }'
+cell p66_join_alias_global      reject "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; if (c == 1) { p = b; } free(p); gp66 = b; return 0; }'
+cell p66_join_alias_loop          reject "$P66"' u32 main(){ *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; for (u32 i = 0; i < 2; i += 1) { if (i == 1) { free(p); } p = b; } u32 r = b.v; free(a); free(b); return r; }'
+cell p66_join_alias_slice         reject "$P66"' u32 main(){ volatile u32 c = 1; [*]u8 a = alloc(u8, 8) orelse return; [*]u8 b = alloc(u8, 8) orelse { free(a); return 1; }; [*]u8 p = a; if (c == 1) { p = b; } free(p); u32 r = (u32)b[0]; free(b); return r; }'
+cell p66_join_alias_handle        reject "$P66"' u32 main(){ volatile u32 c = 1; Handle(P66n) a = nodes66.alloc() orelse return; Handle(P66n) b = nodes66.alloc() orelse { nodes66.free(a); return 1; }; Handle(P66n) p = a; if (c == 1) { p = b; } nodes66.free(p); u32 r = nodes66.get(b).k; nodes66.free(b); return r; }'
+cell p66_interior_join_if       reject "$P66"' u32 main(){ volatile u32 c = 1; [*]u8 b = alloc(u8, 8) orelse return; [*]u8 s = b; if (c == 1) { s = b[2..6]; } free(s); return 0; }'
+cell p66_interior_assign        reject "$P66"' u32 main(){ [*]u8 b = alloc(u8, 8) orelse return; [*]u8 s = b; s = b[2..6]; free(s); return 0; }'
+cell p66_interior_call_result   reject "$P66"' u32 main(){ [*]u8 b = alloc(u8, 8) orelse return; [*]u8 t = tail66(b); free(t); return 0; }'
+cell p66_interior_call_inline   reject "$P66"' u32 main(){ [*]u8 b = alloc(u8, 8) orelse return; free(tail66(b)); return 0; }'
+cell p66_pool_get_field_uaf     reject "$P66"' u32 main(){ Handle(P66n) nh = nodes66.alloc() orelse return; *T66 it = alloc(T66) orelse { nodes66.free(nh); return 1; }; nodes66.get(nh).p = it; free(it); u32 r = nodes66.get(nh).p.v; nodes66.free(nh); return r; }'
+cell p66_pool_get_field_free    reject "$P66"' u32 main(){ *T66 it = alloc(T66) orelse return; Handle(P66n) nh = nodes66.alloc() orelse { free(it); return 1; }; nodes66.get(nh).p = it; free(nodes66.get(nh).p); u32 r = it.v; nodes66.free(nh); return r; }'
+cell p66_fieldstore_subslice_local reject "$P66"' V66 bad(){ u8[8] buf; V66 v; v.s = buf[2..6]; return v; } u32 main(){ V66 v = bad(); return (u32)v.s.len; }'
+cell p66_fieldstore_subslice_inline reject "$P66"' V66 bad(){ W66 w; V66 v; v.s = w.a[2..6]; return v; } u32 main(){ V66 v = bad(); return (u32)v.s.len; }'
+cell p66_safe_realloc_if        compile "$P66"' u32 main(){ volatile u32 c = 1; *T66 p = alloc(T66) orelse return; if (c == 1) { free(p); p = alloc(T66) orelse return; } p.v = 3; u32 r = p.v; free(p); return r - 3; }'
+cell p66_safe_realloc_ifelse    compile "$P66"' u32 main(){ volatile u32 c = 1; *T66 p = alloc(T66) orelse return; if (c == 1) { free(p); p = alloc(T66) orelse return; } else { p.v = 1; } p.v = 3; u32 r = p.v; free(p); return r - 3; }'
+cell p66_safe_realloc_twice     compile "$P66"' u32 main(){ volatile u32 c = 1; *T66 p = alloc(T66) orelse return; if (c == 1) { free(p); p = alloc(T66) orelse return; } if (c == 1) { free(p); p = alloc(T66) orelse return; } p.v = 3; u32 r = p.v; free(p); return r - 3; }'
+cell p66_safe_realloc_switch    compile "$P66"' u32 main(){ volatile u32 c = 1; *T66 p = alloc(T66) orelse return; switch (c) { 0 => { free(p); p = alloc(T66) orelse return; } 1 => { free(p); p = alloc(T66) orelse return; } default => { } } p.v = 3; u32 r = p.v; free(p); return r - 3; }'
+cell p66_safe_realloc_loop      compile "$P66"' u32 main(){ *T66 p = alloc(T66) orelse return; for (u32 i = 0; i < 4; i += 1) { if (i == 2) { free(p); p = alloc(T66) orelse return; } p.v = i; } u32 r = p.v; free(p); return r - 3; }'
+cell p66_safe_join_both_freed   compile "$P66"' u32 main(){ volatile u32 c = 1; *T66 a = alloc(T66) orelse return; *T66 b = alloc(T66) orelse { free(a); return 1; }; *T66 p = a; if (c == 1) { p = b; } p.v = 3; u32 r = p.v; free(a); free(b); return r - 3; }'
+cell p66_safe_tail_view         compile "$P66"' u32 main(){ [*]u8 b = alloc(u8, 8) orelse return; [*]u8 t = tail66(b); t[0] = 1; u32 r = (u32)b[2]; free(b); return r - 1; }'
+cell p66_safe_pool_get_field    compile "$P66"' u32 main(){ Handle(P66n) nh = nodes66.alloc() orelse return; *T66 it = alloc(T66) orelse { nodes66.free(nh); return 1; }; it.v = 5; nodes66.get(nh).p = it; u32 r = nodes66.get(nh).p.v + nh.p.v; free(nodes66.get(nh).p); nodes66.free(nh); return r - 10; }'
+cell p66_safe_fieldstore_param  compile "$P66"' V66 mk2([*]u8 b){ V66 v; v.s = b[2..6]; return v; } u32 main(){ u8[8] buf; V66 w = mk2(buf); return (u32)w.s.len - 4; }'
+cell p66_safe_fieldstore_heap   compile "$P66"' u32 main(){ [*]u8 h = alloc(u8, 8) orelse return; V66 x; x.s = h[0..8]; x.s[1] = 3; free(x.s); return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

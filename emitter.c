@@ -2926,6 +2926,26 @@ static int64_t fold_wrap_to_type(int64_t v, Type *t) {
     return (int64_t)u;
 }
 
+/* BUG-1508: fold a global integer initializer with the out-of-band API. The
+ * sentinel form (`!typed -> eval_const_expr`, then `!= CONST_EVAL_FAIL`) read a
+ * folded value of INT64_MIN — the bit pattern of u64 2^63 — as "not a constant":
+ * `const u64 TOP = (u64)1 << (u64)63;` then fell back to the `_zer_shl`
+ * statement expression at FILE scope and GCC refused the program. */
+static bool global_init_fold(Emitter *e, Node *init, int64_t *out) {
+    if (checker_fold_const_typed(e->checker, init, out)) return true;
+    return eval_const_expr_ok(init, out);
+}
+/* BUG-1508: render a folded value. INT64_MIN has no literal spelling in C
+ * (`-9223372036854775808` is the negation of an out-of-range constant). */
+static void emit_folded_int(Emitter *e, int64_t v, const char *fmt_neg,
+                            const char *fmt_pos) {
+    if (v == INT64_MIN) { emit(e, fmt_neg, "(-9223372036854775807LL - 1)"); return; }
+    char buf[32];
+    if (v < 0) snprintf(buf, sizeof buf, "(%lld)", (long long)v);
+    else       snprintf(buf, sizeof buf, "%llu", (unsigned long long)v);
+    emit(e, v < 0 ? fmt_neg : fmt_pos, buf);
+}
+
 /* BUG-939: emit an integer literal AT ITS RESOLVED WIDTH.
  *
  * Both AST literal emitters printed a bare `%llu` for any value fitting in 32 bits,
@@ -3438,11 +3458,17 @@ static void emit_expr_impl(Emitter *e, Node *node) {
              * TYPE is known: a constant count >= its width (or negative) is 0 by
              * the ZER rule, and an in-range constant count needs no guard. */
             if (e->global_init_depth > 0) {
-                int64_t sc = eval_const_expr(node->binary.right);
+                /* BUG-1508: the count through the TYPED fold first, so a CAST
+                 * count (`(u64)1 << (u64)63`) is a constant here too — the
+                 * untyped evaluator does not look through a cast. Out of band:
+                 * no value is mistaken for "not a constant". */
+                int64_t sc = 0;
+                bool sc_ok = checker_fold_const_typed(e->checker, node->binary.right, &sc) ||
+                             eval_const_expr_ok(node->binary.right, &sc);
                 Type *lt = checker_get_type(e->checker, node->binary.left);
                 Type *lte = lt ? type_unwrap_distinct(lt) : NULL;
                 int lw = (lte && type_is_integer(lte)) ? type_width(lte) : 0;
-                if (sc != CONST_EVAL_FAIL && lw > 0) {
+                if (sc_ok && lw > 0) {
                     if (sc < 0 || sc >= lw) {
                         emit(e, "((");
                         emit_type(e, lte);
@@ -3580,23 +3606,25 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit(e, "(");
                 emit_type(e, res);
                 emit(e, ")(");
-                if (node->unary.op == TOK_TILDE) emit(e, "~");
-                else emit(e, "-");
+                if (node->unary.op == TOK_TILDE) emit(e, "~(");   /* BUG-1504 */
+                else emit(e, "-(");
                 emit_expr(e, node->unary.operand);
-                emit(e, ")");
+                emit(e, "))");
                 break;
             }
         }
         switch (node->unary.op) {
-        case TOK_MINUS: emit(e, "(-"); break;
-        case TOK_BANG:  emit(e, "(!"); break;
-        case TOK_TILDE: emit(e, "(~"); break;
-        case TOK_STAR:  emit(e, "(*"); break;
-        case TOK_AMP:   emit(e, "(&"); break;
-        default:        emit(e, "("); break;
+        /* BUG-1504: operand parenthesised so the operator cannot paste
+         * onto an operand emission that begins with the same token. */
+        case TOK_MINUS: emit(e, "(-("); break;
+        case TOK_BANG:  emit(e, "(!("); break;
+        case TOK_TILDE: emit(e, "(~("); break;
+        case TOK_STAR:  emit(e, "(*("); break;
+        case TOK_AMP:   emit(e, "(&("); break;
+        default:        emit(e, "(("); break;
         }
         emit_expr(e, node->unary.operand);
-        emit(e, ")");
+        emit(e, "))");
         break;
 
     case NODE_ASSIGN:
@@ -6736,14 +6764,11 @@ static void emit_static_storage_init(Emitter *e, Type *type, Node *init) {
             emit(e, ", 1 }");
             return;
         }
-        if (!checker_fold_const_typed(e->checker, init, &oval))
-            oval = eval_const_expr(init);
-        if (oval != CONST_EVAL_FAIL) {
+        if (global_init_fold(e, init, &oval)) {   /* BUG-1508 */
             oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1032 */
             emit(e, " = ");
             emit_clit_type(e, type);   /* BUG-1442 */
-            if (oval < 0) emit(e, "{ (%lld), 1 }", (long long)oval);
-            else          emit(e, "{ %lluULL, 1 }", (unsigned long long)oval);
+            emit_folded_int(e, oval, "{ %s, 1 }", "{ %sULL, 1 }");
         } else {
             emit(e, " = ");
             emit_opt_wrap_value(e, type, init);
@@ -6795,15 +6820,9 @@ static void emit_static_storage_init(Emitter *e, Type *type, Node *init) {
              * untyped int64 reading — while the same initializer on a
              * LOCAL computes 3 at run time. */
             int64_t cval;
-            if (!checker_fold_const_typed(e->checker, init, &cval))
-                cval = eval_const_expr(init);
-            if (cval != CONST_EVAL_FAIL) {
+            if (global_init_fold(e, init, &cval)) {   /* BUG-1508 */
                 cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1032 */
-                if (cval < 0) {
-                    emit(e, " = (%lld)", (long long)cval);
-                } else {
-                    emit(e, " = %llu", (unsigned long long)cval);
-                }
+                emit_folded_int(e, cval, " = %s", " = %s");
                 emitted_const = true;
             }
         }
@@ -9451,24 +9470,32 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 snprintf(lvbuf, sizeof(lvbuf), "_zer_uw%d", tmp);
                 emit(e, "({ ");
                 emit_type(e, rtu);
-                emit(e, " %s = (%s", lvbuf,
+                emit(e, " %s = (%s(", lvbuf,   /* BUG-1504: operand parenthesised */
                      node->unary.op == TOK_MINUS ? "-" : "~");
                 emit_rewritten_node(e, node->unary.operand, func);
-                emit(e, "); ");
+                emit(e, ")); ");
                 emit_intn_mask_lv(e, rtu, lvbuf);
                 emit(e, "%s; })", lvbuf);
                 return;
             }
         }
+        /* BUG-1504: the operator and its operand are each parenthesised.
+         * They were pasted as raw tokens, so `-(-x)` became `--x` — a C
+         * PRE-DECREMENT that compiled clean and modified x — and `-(-2.5)`
+         * became `--2.5` ("lvalue required"). The same token paste turns
+         * `&(&x)` into the GCC label-address `&&x` and would join `-` with
+         * any operand whose emission starts with `-` (a negative float
+         * literal). `(op(operand))` cannot merge with either neighbour. */
         switch (node->unary.op) {
-        case TOK_MINUS: emit(e, "-"); break;
-        case TOK_BANG: emit(e, "!"); break;
-        case TOK_TILDE: emit(e, "~"); break;
-        case TOK_STAR: emit(e, "*"); break;
-        case TOK_AMP: emit(e, "&"); break;
-        default: break;
+        case TOK_MINUS: emit(e, "(-("); break;
+        case TOK_BANG: emit(e, "(!("); break;
+        case TOK_TILDE: emit(e, "(~("); break;
+        case TOK_STAR: emit(e, "(*("); break;
+        case TOK_AMP: emit(e, "(&("); break;
+        default: emit(e, "(("); break;
         }
         emit_rewritten_node(e, node->unary.operand, func);
+        emit(e, "))");
         return;
 
     case NODE_FIELD: {

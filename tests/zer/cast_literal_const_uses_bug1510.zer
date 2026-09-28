@@ -1,0 +1,17 @@
+// BUG-1510: a CAST constant was not a constant to two consumers — a comptime
+// call argument (`F((u32)3, 2)` was "requires all arguments to be
+// compile-time constants") and a divisor (`(u21)246 / (u21)58` was "complex
+// divisor expression not proven nonzero"). Both now use the typed fold.
+comptime u32 F(u32 a, u32 b) { return a + b; }
+u32 main() {
+    u32 x = F((u32)3, 2);
+    if (x != 5) { return 1; }
+    u21 d = (u21)246 / (u21)58;
+    if (d != 4) { return 2; }
+    u32 y = 100;
+    y /= (u32)7;
+    if (y != 14) { return 3; }
+    u32 m = 100 % (u32)9;
+    if (m != 1) { return 4; }
+    return 0;
+}

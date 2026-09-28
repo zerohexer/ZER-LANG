@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: INSIDE
+// BUG-1491: the joined interior view handed to a callee that frees it.
+void dropbuf([*]u8 s) { free(s); }
+u32 one() { return 1; }
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 s = b;
+    if (one() == 1) { s = b[2..6]; }
+    dropbuf(s);
+    return 0;
+}

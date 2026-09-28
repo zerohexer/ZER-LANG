@@ -1,0 +1,21 @@
+// BUG-1492 boundary: `pool.get(h).f` and `h.f` name the SAME slot field, and
+// both spellings may be mixed freely in correct code.
+struct Item { u32 v; }
+struct Node { *Item p; u32 k; }
+Pool(Node, 4) nodes;
+void drop(Handle(Node) nh) { free(nodes.get(nh).p); }
+u32 main() {
+    Handle(Node) nh = nodes.alloc() orelse { return 1; };
+    *Item it = alloc(Item) orelse { nodes.free(nh); return 1; };
+    it.v = 5;
+    nodes.get(nh).p = it;
+    u32 r = nodes.get(nh).p.v + nh.p.v;
+    free(nodes.get(nh).p);
+    *Item i2 = alloc(Item) orelse { nodes.free(nh); return 1; };
+    i2.v = 1;
+    nh.p = i2;
+    r += nodes.get(nh).p.v;
+    drop(nh);
+    nodes.free(nh);
+    return r - 11;
+}

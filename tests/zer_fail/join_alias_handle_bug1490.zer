@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: the Handle form (pre-fix: only the runtime generation check trapped).
+struct N { u32 v; }
+Pool(N, 4) pool;
+u32 pick(bool c) {
+    Handle(N) a = pool.alloc() orelse { return 1; };
+    Handle(N) b = pool.alloc() orelse { pool.free(a); return 1; };
+    Handle(N) p = a;
+    if (c) { p = b; }
+    pool.free(p);
+    u32 out = pool.get(b).v;
+    pool.free(b);
+    return out;
+}
+u32 main() { return pick(true); }

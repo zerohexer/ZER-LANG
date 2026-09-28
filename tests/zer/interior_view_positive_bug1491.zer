@@ -1,0 +1,18 @@
+// BUG-1491 boundary: an interior view (a sub-slice not starting at 0, or a
+// call result that is one) is fine to READ and WRITE; only freeing it is
+// refused. A view that starts at 0, and re-aiming the variable back at the
+// whole allocation before the free, still compile.
+[*]u8 tail([*]u8 s) { return s[2..s.len]; }
+[*]u8 head([*]u8 s) { return s[0..2]; }
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 t = tail(b);
+    t[0] = 7;
+    [*]u8 s = b;
+    s = b[2..6];
+    s[1] = 1;
+    s = b;
+    u32 r = (u32)b[2] + (u32)b[3] + (u32)head(b).len;
+    free(s);
+    return r - 10;
+}

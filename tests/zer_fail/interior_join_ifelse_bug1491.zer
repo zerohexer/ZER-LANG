@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: INSIDE
+// BUG-1491: interior on the then-branch, the whole allocation on the else-branch.
+u32 one() { return 1; }
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 s = b;
+    if (one() == 1) { s = b[2..6]; } else { s = b; }
+    free(s);
+    return 0;
+}

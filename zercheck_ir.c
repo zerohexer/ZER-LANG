@@ -109,10 +109,31 @@ static void ir_zc_error_for(ZerCheck *zc, IRFunc *func, int id, int line,
     if (func && id >= 0 && id < func->local_count && func->locals[id].is_temp &&
         _ir_last_err_line == line && _ir_last_err_file == zc->file_name)
         return;
+    /* BUG-1492: and an IDENTICAL report, as ir_zc_error drops — a slot read
+     * through `pool.get(h).f` reaches h through the call, the hoisted get
+     * temp and the projection, each asking the one UAF question. */
+    unsigned long hsh = 5381;
+    {
+        va_list a2;
+        va_start(a2, fmt);
+        int n = vsnprintf(NULL, 0, fmt, a2);
+        va_end(a2);
+        char *txt = n >= 0 ? (char *)malloc((size_t)n + 1) : NULL;
+        if (txt) {
+            va_start(a2, fmt);
+            vsnprintf(txt, (size_t)n + 1, fmt, a2);
+            va_end(a2);
+            for (int i = 0; i < n; i++) hsh = hsh * 33 + (unsigned char)txt[i];
+            free(txt);
+        }
+    }
+    if (line == _ir_last_err_line && zc->file_name == _ir_last_err_file &&
+        hsh == _ir_last_err_hash)
+        return;
     zc->error_count++;
     _ir_last_err_line = line;
     _ir_last_err_file = zc->file_name;
-    _ir_last_err_hash = 0;
+    _ir_last_err_hash = hsh;
     fprintf(stderr, "%s:%d: zercheck: ", zc->file_name, line);
     va_list args;
     va_start(args, fmt);
@@ -208,6 +229,15 @@ typedef struct {
     uint32_t view_root_gkey_len;
     int alloc_id;          /* groups aliases — same alloc = same id */
     bool escaped;          /* returned, stored to global, etc. */
+    /* BUG-1490: `escaped` answers two questions of OPPOSITE polarity — the
+     * leak EXEMPTION (sound as AND over paths: exempt only if it escaped on
+     * every path) and "may someone else reach it?" for the suspend barrier
+     * (sound as OR). Some entries also set it to mean "owns nothing". A join
+     * keeps `escaped` as the first live predecessor had it (the leak reading
+     * the corpus was written against) and records the OR here, which only
+     * ir_suspend_barrier reads. Stale after a reassignment = an extra
+     * widening, never a missed one. */
+    bool escaped_any;
     /* BUG-1280: the TRANSFERRED state came from a fire-and-forget spawn — the
      * thread keeps the value for ever, which a caller must learn through the
      * summary (FuncSummary.transfers_param). */
@@ -268,6 +298,19 @@ typedef struct {
      * a push-based design would have to reach every one of them). */
     int view_alloc_ids[8];
     int view_count;
+    /* BUG-1490: per member, parallel to view_alloc_ids (valid below
+     * view_count). 0 = FRESH: any invalid entry of that allocation blocks a
+     * use of this one. n > 0 = STALE: at the CFG join that made it a member,
+     * the allocation already had n invalid (MAYBE_FREED) entries, and every
+     * one of them came from a path on which THIS entry did not name it (on a
+     * path where it does, the entry is in the allocation's alias group and
+     * would itself be invalid). Such a member blocks a use only once the
+     * allocation gets WORSE — a definite FREED/TRANSFERRED entry, or more
+     * invalid entries than n. Without it `if (c) { free(p); p = alloc(N); }`
+     * twice in a row made the second join's `p` look like a view of the
+     * first-freed allocation. Recomputed at every join (ir_merge_view_bases);
+     * a member appended anywhere else starts FRESH (the conservative value). */
+    uint8_t view_base[8];
     /* The candidate set did not fit. Sound degradation: an overflowed view is
      * treated as "may view ANY tracked allocation", so a use after any free is
      * rejected. Unreachable in practice — it needs a single return to be a view
@@ -688,6 +731,83 @@ static bool ir_entry_is_precise_slot(const IRHandleInfo *h) {
  * the one this entry did not keep becomes a VIEW member, so a free of it is
  * still seen by a read of the slot (`arr[0] = b; if (c) { arr[0] = a; }
  * free(b); arr[0]...` read b's freed memory on the else path). */
+/* BUG-1490: the join of an entry's ALLOCATION IDENTITY. `alloc_id` is the
+ * one-slot answer to "which allocation does this entry name", and the merge
+ * started from ir_ps_copy(first_live) and never looked at the other
+ * predecessors' answer — so after
+ *
+ *     *N p = a;
+ *     if (c) { p = b; }
+ *     free(p);                       // attributed to 'a' alone
+ *
+ * `b` stayed ALIVE and `b.v` read a recycled slot (use after free, then a
+ * double free). A predecessor that names a DIFFERENT allocation contributes
+ * it to the entry's multi-view set (BUG-849): the entry keeps the identity it
+ * had, and the other one becomes a MAY-alias member. That is the existing
+ * machinery for "this value is one of these allocations": a use PULLS every
+ * member's state (ir_use_blocker), a free through the entry widens every
+ * ALIVE member to MAYBE_FREED and reports a definitely-freed one as a double
+ * free (ir_view_free_barrier). Monotone: members only accumulate (dedup),
+ * overflow saturates to "any allocation" — the CFG fixpoint still converges.
+ * An entry whose own identity is 0 (a pure view) keeps 0 and gains the
+ * member; the other direction adds nothing (ph's own members are unioned by
+ * the caller). ir_merge_slot_facts did exactly this for a precise array slot
+ * (BUG-1130); this is the same join for every entry. */
+static void ir_merge_identity(IRHandleInfo *rh, const IRHandleInfo *ph) {
+    if (ph->alloc_id == 0 || ph->alloc_id == rh->alloc_id) return;
+    const int cap = (int)(sizeof(rh->view_alloc_ids) / sizeof(rh->view_alloc_ids[0]));
+    for (int k = 0; k < rh->view_count; k++)
+        if (rh->view_alloc_ids[k] == ph->alloc_id) return;
+    if (rh->view_count < cap) {
+        rh->view_base[rh->view_count] = 0;
+        rh->view_alloc_ids[rh->view_count++] = ph->alloc_id;
+    } else rh->view_overflow = true;
+}
+
+/* BUG-1490/1491: the join of the per-entry FLAGS ir_merge_states used to
+ * inherit from its first live predecessor alone (so the answer depended on
+ * which edge the lowering happened to list first). Each rule rounds toward
+ * the reading that can only over-report:
+ *   interior          OR  — may be an interior view: freeing it is refused
+ *                           (BUG-1230; `if (c) { v = s[2..]; }` then free(v)
+ *                           was clean when the plain edge came first).
+ *   escaped           unchanged (first live pred) + escaped_any = OR — the
+ *                           field feeds a leak EXEMPTION (wants AND) and the
+ *                           suspend barrier (wants OR); see escaped_any.
+ *   handed_off        OR  — BUG-1380 summary fact "may have been handed off".
+ *   spawn_transferred OR  — BUG-1280 "may be a thread's for ever".
+ *   is_thread_handle  OR  — the join obligation is kept.
+ *   defer_double_reported AND — it SUPPRESSES a report, so it holds only when
+ *                           every path already reported (it is also set during
+ *                           the silent fixpoint passes: an OR carried a
+ *                           suppressed pass's flag into the reporting pass and
+ *                           hid the BUG-1077 double free).
+ *   is_move_local     AND — a leak EXEMPTION: exempt only when every path is.
+ *   source_color      ARENA wins (an arena reset frees the group by colour);
+ *                     otherwise a known colour replaces UNKNOWN.
+ *   alloc_line        filled when missing (the compound leak check needs it).
+ *   freed_fire_token  two FREED paths freed by DIFFERENT firings: -1, which
+ *                     matches no firing, so a later deferred free of it is a
+ *                     double free on at least one path (BUG-1077).
+ * freed_defer_id is written only after the fixpoint (no join needed); state,
+ * free_block, freed_all_paths, freed_then_reset, the view-root and slot facts,
+ * pool_name and the view set have their own joins in ir_merge_states. */
+static void ir_merge_entry_flags(IRHandleInfo *rh, const IRHandleInfo *ph) {
+    if (ph->interior) rh->interior = true;
+    if (rh->escaped || ph->escaped || ph->escaped_any) rh->escaped_any = true;
+    if (ph->handed_off) rh->handed_off = true;
+    if (ph->spawn_transferred) rh->spawn_transferred = true;
+    if (ph->is_thread_handle) rh->is_thread_handle = true;
+    if (!ph->defer_double_reported) rh->defer_double_reported = false;
+    if (!ph->is_move_local) rh->is_move_local = false;
+    if (ph->source_color == ZC_COLOR_ARENA) rh->source_color = ZC_COLOR_ARENA;
+    else if (rh->source_color == ZC_COLOR_UNKNOWN) rh->source_color = ph->source_color;
+    if (rh->alloc_line <= 0) rh->alloc_line = ph->alloc_line;
+    if (rh->state == IR_HS_FREED && ph->state == IR_HS_FREED &&
+        rh->freed_fire_token != ph->freed_fire_token)
+        rh->freed_fire_token = -1;
+}
+
 static void ir_merge_slot_facts(IRHandleInfo *rh, const IRHandleInfo *ph) {
     if (rh->has_slot && ph->has_slot) {
         bool same_arr = rh->slot_root == ph->slot_root &&
@@ -725,7 +845,10 @@ static void ir_merge_slot_facts(IRHandleInfo *rh, const IRHandleInfo *ph) {
         for (int k = 0; k < rh->view_count; k++)
             if (rh->view_alloc_ids[k] == ph->alloc_id) { dup = true; break; }
         if (!dup) {
-            if (rh->view_count < cap) rh->view_alloc_ids[rh->view_count++] = ph->alloc_id;
+            if (rh->view_count < cap) {
+                rh->view_base[rh->view_count] = 0;   /* BUG-1490 */
+                rh->view_alloc_ids[rh->view_count++] = ph->alloc_id;
+            }
             else rh->view_overflow = true;
         }
     }
@@ -1392,6 +1515,7 @@ typedef struct {
      * var-decl produces, and the pull check at the use site found an empty set. */
     int view_alloc_ids[8];
     int view_count;
+    uint8_t view_base[8]; /* BUG-1490: travels with view_alloc_ids */
     bool view_overflow;
     int view_root_local;  /* BUG-984: a pointer copy views what its source views */
     const char *view_root_path;   /* BUG-1396 */
@@ -1426,7 +1550,7 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
     snap->view_overflow = src->view_overflow;
     for (int i = 0; i < src->view_count &&
              i < (int)(sizeof(snap->view_alloc_ids) / sizeof(snap->view_alloc_ids[0])); i++)
-        snap->view_alloc_ids[i] = src->view_alloc_ids[i];
+        { snap->view_alloc_ids[i] = src->view_alloc_ids[i]; snap->view_base[i] = src->view_base[i]; }
     snap->view_root_local = src->view_root_local;
     snap->view_root_path = src->view_root_path;   /* BUG-1396 */
     snap->view_root_plen = src->view_root_plen;
@@ -1463,7 +1587,7 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
     dst->view_overflow = snap->view_overflow;
     for (int i = 0; i < snap->view_count &&
              i < (int)(sizeof(dst->view_alloc_ids) / sizeof(dst->view_alloc_ids[0])); i++)
-        dst->view_alloc_ids[i] = snap->view_alloc_ids[i];
+        { dst->view_alloc_ids[i] = snap->view_alloc_ids[i]; dst->view_base[i] = snap->view_base[i]; }
     dst->view_root_local = snap->view_root_local;   /* BUG-984 */
     dst->view_root_path = snap->view_root_path;     /* BUG-1396 */
     dst->view_root_plen = snap->view_root_plen;
@@ -2028,6 +2152,85 @@ static int ir_find_store_source_local(IRFunc *func, Node *val) {
  * No hack, no block_always_exits check, no 2-pass workaround.
  * ================================================================ */
 
+/* BUG-1490: how many entries of allocation `aid` are invalid in `ps`, and
+ * whether one of them is DEFINITELY gone (FREED / TRANSFERRED). */
+static int ir_aid_invalid_count(const IRPathState *ps, int aid, bool *definite) {
+    int n = 0;
+    *definite = false;
+    for (int i = 0; i < ps->handle_count; i++) {
+        const IRHandleInfo *e = &ps->handles[i];
+        if (e->alloc_id != aid) continue;
+        if (e->state == IR_HS_FREED || e->state == IR_HS_TRANSFERRED) {
+            n++;
+            *definite = true;
+        } else if (e->state == IR_HS_MAYBE_FREED) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* BUG-1490: index of `aid` in h's view set, or -1. */
+static int ir_view_index(const IRHandleInfo *h, int aid) {
+    for (int k = 0; k < h->view_count; k++)
+        if (h->view_alloc_ids[k] == aid) return k;
+    return -1;
+}
+
+/* BUG-1490: is the invalidity allocation `aid` has in predecessor state `s`
+ * unrelated to entry `e` (e's value on that path)? True when e does not name
+ * aid there at all, when aid is e's OWN identity there (then e is in its alias
+ * group and carries any free itself), when aid has no invalid entry there, or
+ * when aid was already a STALE member of e and has not got worse since. */
+static bool ir_view_member_uncorrelated(const IRPathState *s, const IRHandleInfo *e,
+                                        int aid) {
+    if (e->alloc_id == aid) return true;
+    int k = ir_view_index(e, aid);
+    bool def;
+    int n = ir_aid_invalid_count(s, aid, &def);
+    if (n == 0) return true;
+    if (k < 0) return !e->view_overflow;   /* overflow: it may name anything */
+    if (e->view_is_slot) return false;
+    return e->view_base[k] > 0 && !def && n <= e->view_base[k];
+}
+
+/* BUG-1490: at a use, may member `aid` of h be ignored? Only a STALE member
+ * (see view_base) that has not got worse: no definite free, no more invalid
+ * entries than at the join. */
+static bool ir_view_member_stale(const IRPathState *ps, const IRHandleInfo *h, int aid) {
+    int k = ir_view_index(h, aid);
+    if (k < 0 || h->view_base[k] == 0) return false;
+    bool def;
+    int n = ir_aid_invalid_count(ps, aid, &def);
+    return !def && n <= h->view_base[k];
+}
+
+/* BUG-1490: after a merge, recompute every member's staleness. A member is
+ * STALE when, on every live predecessor, its invalidity was unrelated to this
+ * entry (ir_view_member_uncorrelated) — so the invalid entries it has in the
+ * joined state all come from paths on which this entry named something else.
+ * The base is the joined count; a definite free, or no invalid entry at all,
+ * leaves it FRESH (0) — the conservative value, so a later free of the member
+ * is always seen. Slot views (BUG-1074) keep their own rules: never stale. */
+static void ir_merge_view_bases(IRPathState *result, IRPathState *states, int state_count) {
+    for (int hi = 0; hi < result->handle_count; hi++) {
+        IRHandleInfo *rh = &result->handles[hi];
+        for (int k = 0; k < rh->view_count; k++) {
+            int aid = rh->view_alloc_ids[k];
+            bool stale = !rh->view_is_slot;
+            for (int si = 0; stale && si < state_count; si++) {
+                if (states[si].terminated) continue;
+                IRHandleInfo *e = ir_find_compound_handle(&states[si], rh->local_id,
+                                                          rh->path, rh->path_len);
+                if (e && !ir_view_member_uncorrelated(&states[si], e, aid)) stale = false;
+            }
+            bool def = false;
+            int n = stale ? ir_aid_invalid_count(result, aid, &def) : 0;
+            rh->view_base[k] = (stale && !def && n > 0 && n <= 255) ? (uint8_t)n : 0;
+        }
+    }
+}
+
 static IRPathState ir_merge_states(IRPathState *states, int state_count) {
     if (state_count == 0) {
         IRPathState empty;
@@ -2223,6 +2426,8 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
              * "more suspected views", the direction that can only over-report. */
             if (ph->view_overflow) rh->view_overflow = 1;
             if (ph->view_is_slot) rh->view_is_slot = 1;   /* BUG-1074 */
+            ir_merge_identity(rh, ph);                    /* BUG-1490 */
+            ir_merge_entry_flags(rh, ph);                 /* BUG-1490/1491 */
             ir_merge_slot_facts(rh, ph);                  /* BUG-1130 */
             for (int vi = 0; vi < ph->view_count; vi++) {
                 int cap = (int)(sizeof(rh->view_alloc_ids) /
@@ -2234,6 +2439,7 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
                     }
                 if (dup) continue;
                 if (rh->view_count >= cap) { rh->view_overflow = 1; break; }
+                rh->view_base[rh->view_count] = 0;   /* BUG-1490: ir_merge_view_bases */
                 rh->view_alloc_ids[rh->view_count++] = ph->view_alloc_ids[vi];
             }
             /* MAYBE_FREED ↔ {ALIVE, FREED, TRANSFERRED}: rh already
@@ -2293,6 +2499,7 @@ static IRPathState ir_merge_states(IRPathState *states, int state_count) {
         }
     }
 
+    ir_merge_view_bases(&result, states, state_count);   /* BUG-1490 */
     return result;
 }
 
@@ -3072,6 +3279,41 @@ static void ir_inherit_slot_view(IRFunc *func, IRPathState *ps, IRHandleInfo *sl
     if (d && d->alloc_id == 0) ir_set_view(d, vr, vp, vpl);
 }
 
+static bool ir_is_pool_get_call(ZerCheck *zc, Node *e);
+
+/* BUG-1492: the path of `expr` RELATIVE to the node `base` it is projected
+ * from (field / keyable-index steps only). buf == NULL measures. -1 when a
+ * step is not keyable or `base` is not on the chain. */
+static int ir_rel_key_path(IRFunc *func, Node *expr, Node *base, char *buf) {
+    if (!expr) return -1;
+    if (expr == base) return 0;
+    if (expr->kind == NODE_FIELD) {
+        int pl = ir_rel_key_path(func, expr->field.object, base, buf);
+        if (pl < 0) return -1;
+        int fl = (int)expr->field.field_name_len;
+        if (buf) {
+            buf[pl] = '.';
+            memcpy(buf + pl + 1, expr->field.field_name, (size_t)fl);
+        }
+        return pl + 1 + fl;
+    }
+    if (expr->kind == NODE_INDEX) {
+        Node *ix = expr->index_expr.index;
+        if (!ir_index_is_keyable(func, ix)) return -1;
+        int pl = ir_rel_key_path(func, expr->index_expr.object, base, buf);
+        if (pl < 0) return -1;
+        int tl = ir_index_key_text(func, ix, NULL);
+        if (tl <= 0) return -1;
+        if (buf) {
+            buf[pl] = '[';
+            ir_index_key_text(func, ix, buf + pl + 1);
+            buf[pl + 1 + tl] = ']';
+        }
+        return pl + tl + 2;
+    }
+    return -1;
+}
+
 static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
                                     Node *expr,
                                     int *out_local,
@@ -3084,6 +3326,39 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     expr = ir_peel_launder(expr);  /* BUG-791/931: launders are identity for allocations */
     if (!expr) return -1;
     expr = ir_rebase_slice_index(zc, func, expr, 0);   /* BUG-1383 */
+
+    /* BUG-1492: `pool.get(h).f` and the auto-deref `h.f` are TWO SPELLINGS of
+     * one slot field — the checker lowers `h.f` to exactly `pool.get(h).f`.
+     * The auto-deref spelling keyed (h, ".f"); the explicit one bottomed out
+     * on the NODE_CALL and was unkeyable, so an allocation stored through
+     * `nodes.get(nh).p = it` was tracked by NOTHING (a later
+     * `nodes.get(nh).p.v` after `free(it)` read a recycled slot, and
+     * `free(nodes.get(nh).p)` freed `it` behind its back). Canonicalise the
+     * explicit spelling onto the handle's own key: key(h) + the projection
+     * path above the call. Only a PROJECTION re-keys — the bare `pool.get(h)`
+     * is a pointer VALUE, as before. */
+    {
+        Node *b = expr;
+        while (b && (b->kind == NODE_FIELD || b->kind == NODE_INDEX))
+            b = (b->kind == NODE_FIELD) ? b->field.object : b->index_expr.object;
+        if (b && b != expr && b->kind == NODE_CALL && ir_is_pool_get_call(zc, b) &&
+            b->call.arg_count >= 1 && b->call.args[0]) {
+            int hl; const char *hp; uint32_t hpl;
+            if (ir_extract_compound_key(zc, func, ps, b->call.args[0], &hl, &hp, &hpl) != 0)
+                return -1;
+            int rl = ir_rel_key_path(func, expr, b, NULL);
+            if (rl <= 0) return -1;
+            char *np = (char *)arena_alloc(zc->arena, hpl + (uint32_t)rl + 1);
+            if (!np) return -1;
+            if (hpl) memcpy(np, hp, hpl);
+            ir_rel_key_path(func, expr, b, np + hpl);
+            np[hpl + (uint32_t)rl] = '\0';
+            *out_local = hl;
+            *out_path = np;
+            *out_path_len = hpl + (uint32_t)rl;
+            return 0;
+        }
+    }
 
     Node *root = ir_key_root_ident(expr);
     if (!root) return -1;
@@ -3335,9 +3610,25 @@ static void ir_weak_store_through_view(ZerCheck *zc, IRFunc *func, IRPathState *
  * element address `&s[i]` with an index other than literal 0, a field address
  * `&b.f`, or any of these over a projection. `s[0..n]` / `&s[0]` / `&x` are the
  * base. Conservative only in the refusing direction for free(). */
-static bool ir_view_expr_is_interior(Node *e) {
+static bool ir_view_expr_is_interior(ZerCheck *zc, Node *e) {
     e = e ? ir_peel_launder(e) : NULL;
     if (!e) return false;
+    /* BUG-1491: a CALL whose callee may return an interior view of one of
+     * its params (FuncSummary.returns_interior_mask), or hands back a view of
+     * an argument that is itself interior (`id(s[2..])`). */
+    if (e->kind == NODE_CALL) {
+        if (!zc || !e->call.callee || e->call.callee->kind != NODE_IDENT) return false;
+        FuncSummary *fs = ir_summary_for_name(zc, e->call.callee->ident.name,
+                                              (uint32_t)e->call.callee->ident.name_len);
+        if (!fs) return false;
+        if (fs->returns_interior_mask) return true;
+        uint32_t vm = fs->returns_all_views ? fs->returns_param_mask : 0;
+        if (fs->returns_param_color > 0) vm |= 1u << (fs->returns_param_color - 1);
+        for (int k = 0; k < e->call.arg_count && k < 32; k++)
+            if ((vm & (1u << k)) && ir_view_expr_is_interior(zc, e->call.args[k]))
+                return true;
+        return false;
+    }
     if (e->kind == NODE_SLICE) {
         Node *st = e->slice.start;
         if (st && !(st->kind == NODE_INT_LIT && st->int_lit.value == 0)) return true;
@@ -3527,6 +3818,7 @@ static bool ir_fill_multiview_set(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             if (dh->view_alloc_ids[k] == ah->alloc_id) dup = true;
         if (dup) continue;
         if (dh->view_count >= vcap) { dh->view_overflow = true; continue; }
+        dh->view_base[dh->view_count] = 0;   /* BUG-1490 */
         dh->view_alloc_ids[dh->view_count++] = ah->alloc_id;
     }
     return true;
@@ -4123,6 +4415,13 @@ static IRMethodKind ir_classify_method_call_ex(Checker *c, Node *call) {
     if (ml == 5 && memcmp(m, "reset", 5) == 0) return IRMC_ARENA_RESET;
     if (ml == 12 && memcmp(m, "unsafe_reset", 12) == 0) return IRMC_ARENA_RESET;
     return IRMC_NONE;
+}
+
+/* BUG-1492: is `e` a Pool/Slab `.get(h)` call (the explicit spelling of the
+ * Handle auto-deref)? */
+static bool ir_is_pool_get_call(ZerCheck *zc, Node *e) {
+    return zc && e && e->kind == NODE_CALL &&
+           ir_classify_method_call_ex(zc->checker, e) == IRMC_GET;
 }
 
 static bool ir_call_is_classified_method(Checker *c, Node *call) {
@@ -5376,6 +5675,9 @@ static IRHandleInfo *ir_use_blocker(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         for (int vi = 0; !member && vi < h->view_count; vi++)
             if (vh->alloc_id == h->view_alloc_ids[vi]) member = true;
         if (!member || !ir_is_invalid(vh)) continue;
+        /* BUG-1490: a member that was already invalid at the join, on paths
+         * where h named something else, and has not got worse since. */
+        if (ir_view_member_stale(ps, h, vh->alloc_id)) continue;
         /* A SLOT view (variable-index array read) is blocked only by a member
          * that is DEFINITELY gone. Allocation ids are per LOCAL, so a loop that
          * stores one iteration's allocation and frees another's — `if (got < 8)
@@ -5411,6 +5713,7 @@ static void ir_view_add(IRHandleInfo *h, int aid) {
     for (int k = 0; k < h->view_count; k++)
         if (h->view_alloc_ids[k] == aid) return;
     if (h->view_count >= vcap) { h->view_overflow = true; return; }
+    h->view_base[h->view_count] = 0;   /* BUG-1490: a new member is FRESH */
     h->view_alloc_ids[h->view_count++] = aid;
 }
 
@@ -5460,6 +5763,13 @@ static void ir_view_free_barrier(ZerCheck *zc, IRFunc *func, IRPathState *ps,
         if (vh->state == IR_HS_ALIVE) {
             vh->state = IR_HS_MAYBE_FREED;
             vh->free_line = line;
+        }
+        /* BUG-1490: this free may have released vh's allocation even when vh
+         * was ALREADY maybe-freed (the state does not change), so no entry
+         * may keep treating that allocation as a STALE member. */
+        for (int j = 0; j < ps->handle_count; j++) {
+            int k = ir_view_index(&ps->handles[j], vh->alloc_id);
+            if (k >= 0) ps->handles[j].view_base[k] = 0;
         }
     }
 }
@@ -6407,7 +6717,13 @@ static void ir_check_call_wrong_pool(ZerCheck *zc, IRFunc *func,
     IRHandleInfo *h;
     if (path_len == 0) h = ir_find_handle(ps, root_local);
     else h = ir_find_compound_handle(ps, root_local, path, path_len);
-    if (!h && path_len > 0) h = ir_find_handle(ps, root_local);
+    /* BUG-1492: a projection THROUGH a Handle (`h.p`, and `pool.get(h).p`
+     * now keys the same) names a field of h's SLOT — the handle's own pool
+     * says nothing about where the value in that field came from, so falling
+     * back to the root entry reported `free(h.p)` as a wrong-pool free of h. */
+    bool root_is_handle = root_local >= 0 && root_local < func->local_count &&
+        type_dispatch_kind(func->locals[root_local].type) == TYPE_HANDLE;
+    if (!h && path_len > 0 && !root_is_handle) h = ir_find_handle(ps, root_local);
     if (!h || !h->pool_name || h->pool_name_len == 0) return;
     const char *cur_n; uint32_t cur_l;
     ir_extract_pool_name(call, &cur_n, &cur_l);
@@ -8715,7 +9031,7 @@ static void ir_suspend_barrier(ZerCheck *zc, IRPathState *ps, int line) {
     for (int hi = 0; hi < ps->handle_count; hi++) {
         IRHandleInfo *h = &ps->handles[hi];
         if (h->state != IR_HS_ALIVE || h->alloc_id == 0) continue;
-        if (h->local_id != IR_GLOBAL_ROOT_ID && !h->escaped) continue;
+        if (h->local_id != IR_GLOBAL_ROOT_ID && !h->escaped && !h->escaped_any) continue;
         aids[n++] = h->alloc_id;
     }
     for (int hi = 0; hi < ps->handle_count; hi++) {
@@ -10773,7 +11089,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                             if (bdst_h) {
                                 ir_apply_alias(bdst_h, &bsnap);
                                 bdst_h->state = bsnap.state;
-                                if (ir_view_expr_is_interior(slice_val)) bdst_h->interior = true;   /* BUG-1230 */
+                                if (ir_view_expr_is_interior(zc, slice_val)) bdst_h->interior = true;   /* BUG-1230 */
                             }
                         }
                     }
@@ -10957,6 +11273,9 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                             if (vdst) {
                                 ir_apply_alias(vdst, &vsnap);
                                 vdst->state = vsnap.state;
+                                /* BUG-1491 */
+                                if (ir_view_expr_is_interior(zc, inst->expr->assign.value))
+                                    vdst->interior = true;
                             }
                         }
                     }
@@ -11003,6 +11322,13 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                         if (adst_h) {
                             ir_apply_alias(adst_h, &asnap);
                             adst_h->state = asnap.state;
+                            /* BUG-1491: `s = b[2..6];` / `s = tail(b);` — the
+                             * assignment spelling of the var-decl arm that
+                             * marks an interior view (BUG-1230). The alias
+                             * copied the BASE's flags, so the interior mark the
+                             * slice arm above had just set was overwritten. */
+                            if (ir_view_expr_is_interior(zc, inst->expr->assign.value))
+                                adst_h->interior = true;
                         }
                     }
                     /* 2026-08-06: a whole-STRUCT copy must also replicate the
@@ -11736,7 +12062,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                             if (dst_h) {
                                 ir_apply_alias(dst_h, &snap);
                                 dst_h->state = snap.state;
-                                if (ir_view_expr_is_interior(rhs)) dst_h->interior = true;   /* BUG-1230 */
+                                if (ir_view_expr_is_interior(zc, rhs)) dst_h->interior = true;   /* BUG-1230 */
                             }
                         } else if (rhs->kind == NODE_UNARY && addr_target->kind != NODE_IDENT) {
                             /* BUG-1396: `%t = &w.inner` — a view of a SLOT. */
@@ -12557,7 +12883,12 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                 uint32_t path_len;
                 /* BUG-1230: an interior view written INLINE (`free(s[1..4])`,
                  * `free(&s[2])`) — no key to look up, the shape says it all. */
-                bool inline_interior = ir_view_expr_is_interior(arg);
+                /* BUG-1491: asked of the argument AS WRITTEN — the resolve
+                 * above follows a view-returning call back to its argument
+                 * (`free(tail(b))` -> b), which is exactly the step that hides
+                 * the interior offset the callee added. */
+                bool inline_interior = ir_view_expr_is_interior(zc, arg) ||
+                    ir_view_expr_is_interior(zc, inst->expr->call.args[0]);
                 if (inline_interior)
                     ir_zc_error(zc, inst->source_line,
                         "free() of a pointer INSIDE an allocation (a sub-slice that "
@@ -12711,6 +13042,25 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                             "use after free: %s is %s (freed at line %d)", ir_local_desc(zc, func, root_local, path, path_len), ir_state_name(h->state), h->free_line);
                     }
                     /* F3.2 wrong-pool check centralized in walker. */
+                    /* BUG-1492: the lowering hoists `pool.get(h)` used as a
+                     * place root into a temp (`%t = pool.get(h); %t.p = it`).
+                     * The temp is a VIEW of h's slot, exactly as `h.p` names
+                     * it, so projections through it re-root onto (h, path)
+                     * (ir_extract_compound_key, BUG-984/1462) and both
+                     * spellings of the store / read / free share one key. */
+                    if (inst->dest_local >= 0 && inst->dest_local < func->local_count) {
+                        IRHandleInfo *dh = ir_find_handle(ps, inst->dest_local);
+                        if (!dh) dh = ir_add_handle(ps, inst->dest_local);
+                        if (dh && dh->alloc_id == 0) {
+                            if (root_local >= 0) {
+                                ir_set_view(dh, root_local, path, path_len);
+                            } else if (root_local == IR_GLOBAL_ROOT_ID && path_len > 0) {
+                                ir_set_view(dh, -1, NULL, 0);
+                                dh->view_root_gkey = path;
+                                dh->view_root_gkey_len = path_len;
+                            }
+                        }
+                    }
                 }
                 break;
             }
@@ -12808,6 +13158,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
                          * tracked state — same shape as IR_COPY at 2758. */
                         ir_apply_alias(dh, &snap);
                         dh->state = snap.state;
+                        /* BUG-1491: the callee may hand back an interior view */
+                        if (ir_view_expr_is_interior(zc, inst->expr)) dh->interior = true;
                     }
                 }
                 /* BUG-847 (RELAXATION, 2026-08-23): the result of a proven
@@ -12868,6 +13220,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             IRHandleInfo *dh = ir_add_handle(ps, inst->dest_local);
             ir_fill_multiview_set(zc, func, ps, inst->expr, summary, dh,
                                   inst->source_line);
+            if (dh && ir_view_expr_is_interior(zc, inst->expr)) dh->interior = true;   /* BUG-1491 */
             dest_aliased_from_param = true;
             /* BUG-1397: and the SLOTS it may view (`pick(&s, &t, c)`) */
             {
@@ -13213,7 +13566,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
              * and corrupts a bare-metal heap). */
             if (bare && inst->args && pi < inst->arg_count && inst->args[pi]) {
                 Node *ae = inst->args[pi];
-                bool inter = ir_view_expr_is_interior(ae);
+                bool inter = ir_view_expr_is_interior(zc, ae);
                 Node *aep = ir_peel_launder(ae);
                 if (!inter && aep && aep->kind == NODE_IDENT) {
                     int al = ir_find_local_exact_first(func, aep->ident.name,
@@ -15015,6 +15368,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
          * a fresh allocation — without it a mask bit means nothing, because an
          * unclassified return could be an allocation the caller must own. */
         uint32_t returns_param_mask_final = 0;
+        uint32_t returns_interior_mask_final = 0;   /* BUG-1491 */
         bool returns_all_views_final = false;
         if (returns_color_final == ZC_COLOR_UNKNOWN && pc > 0) {
             int inferred_param = -2;  /* -2 unset, -1 mixed, >=0 param idx */
@@ -15326,6 +15680,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
                 classified_returns++;
                 view_mask |= (uint32_t)1u << match_param;
+                /* BUG-1491: is THIS return an interior view of the param — the
+                 * returned local carries the BUG-1230 mark, or its defining
+                 * expression is an offset sub-slice / element address (directly,
+                 * or through a callee that returns one)? */
+                {
+                    bool rint = false;
+                    IRHandleInfo *rih = ir_find_handle(&block_states[bi], rlocal);
+                    if (rih && rih->interior) rint = true;
+                    Node *rd = ir_local_def_expr(func, bb, rlocal);
+                    if (rd && rd->kind == NODE_ASSIGN && rd->assign.value) rd = rd->assign.value;
+                    if (!rint && rd && ir_view_expr_is_interior(zc, rd)) rint = true;
+                    if (rint && match_param < 32)
+                        returns_interior_mask_final |= (uint32_t)1u << match_param;
+                }
                 if (inferred_param == -2) inferred_param = match_param;
                 else if (inferred_param != match_param) inferred_param = -1;
             }
@@ -15662,6 +16030,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             if (existing->returns_color != returns_color_final) changed = true;
             if (existing->returns_param_color != returns_param_color_final) changed = true;
             if (existing->returns_param_mask != returns_param_mask_final) changed = true;
+            if (existing->returns_interior_mask != returns_interior_mask_final) changed = true;
             if (existing->returns_all_views != returns_all_views_final) changed = true;
             if (existing->ret_is_borrow != ret_is_borrow_final) changed = true;
             if (existing->ret_is_content != ret_is_content_final) changed = true;
@@ -15704,6 +16073,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
                 existing->returns_param_mask = returns_param_mask_final;
+                existing->returns_interior_mask = returns_interior_mask_final;   /* BUG-1491 */
                 existing->returns_all_views = returns_all_views_final;
                 existing->ret_is_borrow = ret_is_borrow_final;
                 existing->ret_is_content = ret_is_content_final;
@@ -15739,6 +16109,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
                 s->returns_param_mask = returns_param_mask_final;
+                s->returns_interior_mask = returns_interior_mask_final;   /* BUG-1491 */
                 s->returns_all_views = returns_all_views_final;
                 s->ret_is_borrow = ret_is_borrow_final;
                 s->ret_is_content = ret_is_content_final;

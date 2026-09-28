@@ -116,6 +116,11 @@ typedef struct {
      * 0 when nothing was proven. Only meaningful together with
      * `returns_all_views`. */
     uint32_t returns_param_mask;
+    /* BUG-1491: bit n = some return path hands back an INTERIOR view of param
+     * n (`return s[2..s.len];`, `return &s[1];`) — a pointer that shares the
+     * argument's allocation but is not the pointer the allocator handed out,
+     * so a caller's `free(tail(b))` is heap corruption (BUG-1230). */
+    uint32_t returns_interior_mask;
     /* Every non-early-exit, non-fallback return was CLASSIFIED as a view of a
      * param, a view of static storage (`&global`), or a null literal — i.e. no
      * return path can be a fresh allocation. False = at least one return could

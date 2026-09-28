@@ -1,0 +1,13 @@
+// expect-error: local-derived pointer
+// BUG-1498: a store in the RIGHT operand of || may not run, so it must not REPLACE the
+// escape taint recorded before it — p still may point at the local x.
+u32 g0 = 1;
+?*u32 gp;
+bool t() { return true; }
+void f() {
+    u32 x = 5;
+    *u32 p = &x;
+    bool b = t() || ((p = &g0) == &g0);
+    gp = p;
+}
+u32 main() { f(); if (gp) |q| { return *q; } return 0; }

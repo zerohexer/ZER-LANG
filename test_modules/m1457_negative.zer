@@ -1,0 +1,6 @@
+// BUG-1457: must be rejected — module c's `release` frees `s`, then c writes it.
+// Pre-fix it compiled clean (d's non-freeing `release` summary was used) and
+// ran as an ASan heap-use-after-free.
+import m1457_c;
+import m1457_d;
+u32 main() { return m1457_fd() + m1457_fc(); }

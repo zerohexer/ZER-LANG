@@ -1030,17 +1030,29 @@ static Symbol *add_symbol_internal(Checker *c, const char *name, uint32_t name_l
  * declaration, so module b's `bump()` was scanned, summarised and typed as
  * module a's. Outside that case this is exactly scope_lookup_local on the
  * global scope. */
-static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t len) {
-    if (c->current_module) {
+/* BUG-1450: the same lookup with the module context passed EXPLICITLY — for the
+ * emitter (its own `current_module`) and zercheck_ir (the module of the function
+ * being analysed), which used to read `global_scope` by the raw name and so got
+ * the FIRST-registered module's declaration: a call with arguments to module b's
+ * `helper` was emitted as `a__helper`, and b's `release` was summarised as a's. */
+Symbol *checker_module_decl_lookup(Checker *c, const char *mod, uint32_t mod_len,
+                                   const char *name, uint32_t len) {
+    if (!c || !name) return NULL;
+    if (mod) {
         for (int mi = 0; mi < c->module_own_count; mi++) {
             Symbol *ms = c->module_own[mi].sym;
             if (ms && ms->name_len == len && memcmp(ms->name, name, len) == 0 &&
-                ms->module_prefix_len == c->current_module_len && ms->module_prefix &&
-                memcmp(ms->module_prefix, c->current_module, c->current_module_len) == 0)
+                ms->module_prefix_len == mod_len && ms->module_prefix &&
+                memcmp(ms->module_prefix, mod, mod_len) == 0)
                 return ms;
         }
     }
     return scope_lookup_local(c->global_scope, name, len);
+}
+
+static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t len) {
+    return checker_module_decl_lookup(c, c->current_module, c->current_module_len,
+                                      name, len);
 }
 
 /* BUG-1199: an analysis that DESCENDS into another function's body (the spawn
@@ -1352,6 +1364,18 @@ static bool symbol_is_import_ambiguous(Checker *c, Symbol *s) {
     if (om && c->current_module && ol == c->current_module_len &&
         memcmp(om, c->current_module, ol) == 0) return false;
     return true;
+}
+/* BUG-1459b: while a module's DECLARATIONS are registered (a global's `u32[SZ]`
+ * size, a const initializer), its own earlier declarations of a shared name live
+ * in module_own, not yet in any scope — so the raw lookup reached the OTHER
+ * module's `SZ`: the module's own reference was refused as ambiguous by the
+ * ident check, and the size evaluator silently took the other module's value.
+ * The module's own declaration is not ambiguous from inside it. ONE rescue,
+ * used by the ident check and the constant evaluator. */
+static Symbol *own_decl_over_ambiguous(Checker *c, Symbol *sym) {
+    if (!symbol_is_import_ambiguous(c, sym)) return sym;
+    Symbol *own = global_decl_lookup(c, sym->name, sym->name_len);
+    return (own && own != sym) ? own : sym;
 }
 static void report_import_ambiguous(Checker *c, Symbol *s, int line) {
     checker_error(c, line,
@@ -2508,10 +2532,24 @@ static bool value_is_existing_resource(Node *v, int depth) {
      * walker-default audit exist to force. Getting a new kind wrong in the "fresh"
      * direction is an ACCEPT of a copy, so the decision should not be made by
      * omission. */
+    /* BUG-1459: a VALUE-PRESERVING conversion names its operand — `@cast(DT, a)`
+     * to a distinct typedef of a task, `@bitcast(T, a)` and `(T)a` rebrand the
+     * SAME object, and the result is a bitwise copy of it. They were classified
+     * as building a fresh value, so `DT b = @cast(DT, a);` copied a polled task
+     * (its promoted `*u32 p = &x` then aimed into the dead original). */
+    case NODE_INTRINSIC:
+        if (v->intrinsic.arg_count > 0 &&
+            ((v->intrinsic.name_len == 4 && memcmp(v->intrinsic.name, "cast", 4) == 0) ||
+             (v->intrinsic.name_len == 7 && memcmp(v->intrinsic.name, "bitcast", 7) == 0)))
+            return value_is_existing_resource(
+                v->intrinsic.args[v->intrinsic.arg_count - 1], depth + 1);
+        return false;
+    case NODE_TYPECAST:
+        return value_is_existing_resource(v->typecast.expr, depth + 1);
     case NODE_CALL: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
-    case NODE_ASSIGN: case NODE_INTRINSIC: case NODE_CAST:
-    case NODE_TYPECAST: case NODE_SIZEOF: case NODE_STRUCT_INIT:
+    case NODE_ASSIGN: case NODE_CAST:
+    case NODE_SIZEOF: case NODE_STRUCT_INIT:
         return false;
 
     /* Not expressions — cannot appear in a value position at all. */
@@ -8449,8 +8487,17 @@ static Symbol *find_or_create_auto_slab(Checker *c, Type *struct_type) {
             return c->auto_slabs[i].slab_sym;
     }
     /* Create new */
-    char slab_name[128];
-    int sn_len = snprintf(slab_name, sizeof(slab_name),
+    /* BUG-1453: the C name carries the struct's MODULE, exactly as the struct
+     * tag does (`struct ma__Ta` -> `_zer_auto_slab_ma__Ta`). Two modules each
+     * with a `struct T` used through `alloc(T)` otherwise named one slab twice;
+     * the emitter spells the name with the same rule (emit_auto_slab_name). */
+    char slab_name[256];
+    int sn_len = struct_type->struct_type.module_prefix_len > 0 ?
+        snprintf(slab_name, sizeof(slab_name), "_zer_auto_slab_%.*s__%.*s",
+            (int)struct_type->struct_type.module_prefix_len,
+            struct_type->struct_type.module_prefix,
+            (int)struct_type->struct_type.name_len, struct_type->struct_type.name) :
+        snprintf(slab_name, sizeof(slab_name),
         "_zer_auto_slab_%.*s",
         (int)struct_type->struct_type.name_len, struct_type->struct_type.name);
     if (sn_len >= (int)sizeof(slab_name)) sn_len = (int)sizeof(slab_name) - 1;
@@ -11243,6 +11290,7 @@ static int64_t resolve_const_ident(void *ctx, const char *name, uint32_t name_le
                                    int depth) {
     Checker *c = (Checker *)ctx;
     Symbol *sym = scope_lookup(c->current_scope, name, name_len);
+    if (sym) sym = own_decl_over_ambiguous(c, sym);   /* BUG-1459b */
     if (!sym) sym = global_decl_lookup(c, name, name_len);
     if (sym && sym->is_const && sym->func_node) {
         Node *init = (sym->func_node->kind == NODE_VAR_DECL ||
@@ -12128,8 +12176,12 @@ static Type *check_expr_impl(Checker *c, Node *node) {
     case NODE_IDENT: {
         Symbol *sym = find_symbol(c, node->ident.name, (uint32_t)node->ident.name_len,
                                   node->loc.line);
-        if (!node->ident.module_qualified && symbol_is_import_ambiguous(c, sym))
-            report_import_ambiguous(c, sym, node->loc.line);   /* BUG-1200 */
+        /* BUG-1459b: own_decl_over_ambiguous */
+        if (!node->ident.module_qualified) {
+            sym = own_decl_over_ambiguous(c, sym);
+            if (symbol_is_import_ambiguous(c, sym))
+                report_import_ambiguous(c, sym, node->loc.line);   /* BUG-1200 */
+        }
         /* BUG-1217: a comptime function has NO run-time body — it is never
          * emitted — so it can only be CALLED (and folded). Naming it as a value
          * (`*(u32) -> u32 fp = BIT;`) reached GCC as "'BIT' undeclared". */
@@ -29341,9 +29393,21 @@ static void register_decl(Checker *c, Node *node) {
             async_type->struct_type.fields = NULL;
             async_type->struct_type.type_id = c->next_type_id++;
             async_type->struct_type.is_async_state = true;   /* BUG-1177 */
+            /* BUG-1455: the state type and its three accessors belong to the
+             * async function's MODULE, like the function itself — the C names
+             * carry the prefix (emitter async_cbase), and a name two modules
+             * share resolves per module (checker_module_decl_lookup; the
+             * private-scope collision path of checker_register_file hands
+             * these four to module_own with the function). */
+            async_type->struct_type.module_prefix = c->current_module;
+            async_type->struct_type.module_prefix_len = c->current_module_len;
             char *aname_copy = arena_alloc(c->arena, alen + 1);
             memcpy(aname_copy, aname, alen + 1);
-            add_symbol_internal(c, aname_copy, alen, async_type, node->loc.line);
+            Symbol *tsym_async = add_symbol_internal(c, aname_copy, alen, async_type, node->loc.line);
+            if (tsym_async) {
+                tsym_async->module_prefix = c->current_module;
+                tsym_async->module_prefix_len = c->current_module_len;
+            }
 
             /* Register _zer_async_funcname_init as function taking *async_type + original params (BUG-477) */
             char iname[256];
@@ -29380,7 +29444,11 @@ static void register_decl(Checker *c, Node *node) {
             char *iname_copy = arena_alloc(c->arena, ilen + 1);
             memcpy(iname_copy, iname, ilen + 1);
             Symbol *isym = add_symbol_internal(c, iname_copy, ilen, init_ft, node->loc.line);
-            if (isym) isym->is_function = true;
+            if (isym) {
+                isym->is_function = true;
+                isym->module_prefix = c->current_module;          /* BUG-1455 */
+                isym->module_prefix_len = c->current_module_len;
+            }
 
             /* Register _zer_async_funcname_poll as function taking *async_type, returning i32 */
             char pname[256];
@@ -29393,7 +29461,11 @@ static void register_decl(Checker *c, Node *node) {
             char *pname_copy = arena_alloc(c->arena, plen + 1);
             memcpy(pname_copy, pname, plen + 1);
             Symbol *psym = add_symbol_internal(c, pname_copy, plen, poll_ft, node->loc.line);
-            if (psym) psym->is_function = true;
+            if (psym) {
+                psym->is_function = true;
+                psym->module_prefix = c->current_module;          /* BUG-1455 */
+                psym->module_prefix_len = c->current_module_len;
+            }
             /* BUG-1236: a POLL runs the async body — it is the one call through
              * which the body executes. Every whole-program scan that descends a
              * callee reads `func_node->func_decl.body` (spawn race scan, atomic
@@ -29424,7 +29496,11 @@ static void register_decl(Checker *c, Node *node) {
                     memcpy(rname_copy, rname, rlen + 1);
                     Symbol *rsym = add_symbol_internal(c, rname_copy, rlen,
                                                        res_ft, node->loc.line);
-                    if (rsym) rsym->is_function = true;
+                    if (rsym) {
+                        rsym->is_function = true;
+                        rsym->module_prefix = c->current_module;  /* BUG-1455 */
+                        rsym->module_prefix_len = c->current_module_len;
+                    }
                 }
             }
         }
@@ -35016,6 +35092,25 @@ static bool body_always_exits(Node *body) {
     return false;
 }
 
+/* BUG-1455: append to the module-own table (the grow logic was written out
+ * twice; the async names are a third caller). */
+static void module_own_push(Checker *c, Node *decl, Symbol *sym) {
+    if (c->module_own_count >= c->module_own_cap) {
+        int nc = c->module_own_cap ? c->module_own_cap * 2 : 8;
+        struct ModuleOwnSym *na = (struct ModuleOwnSym *)arena_alloc(
+            c->arena, (size_t)nc * sizeof(struct ModuleOwnSym));
+        if (na && c->module_own)
+            memcpy(na, c->module_own,
+                   (size_t)c->module_own_count * sizeof(struct ModuleOwnSym));
+        if (na) { c->module_own = na; c->module_own_cap = nc; }
+    }
+    if (c->module_own_count < c->module_own_cap) {
+        c->module_own[c->module_own_count].decl = decl;
+        c->module_own[c->module_own_count].sym = sym;
+        c->module_own_count++;
+    }
+}
+
 void checker_register_file(Checker *c, Node *file_node) {
     if (!file_node || file_node->kind != NODE_FILE) return;
     record_registered_file(c, file_node);   /* BUG-1056 */
@@ -35052,20 +35147,19 @@ void checker_register_file(Checker *c, Node *file_node) {
             register_decl(c, decl);
             c->current_scope = saved;
             Symbol *mine = scope_lookup_local(priv, own_n, own_l);
-            if (mine) {
-                if (c->module_own_count >= c->module_own_cap) {
-                    int nc = c->module_own_cap ? c->module_own_cap * 2 : 8;
-                    struct ModuleOwnSym *na = (struct ModuleOwnSym *)arena_alloc(
-                        c->arena, (size_t)nc * sizeof(struct ModuleOwnSym));
-                    if (na && c->module_own)
-                        memcpy(na, c->module_own,
-                               (size_t)c->module_own_count * sizeof(struct ModuleOwnSym));
-                    if (na) { c->module_own = na; c->module_own_cap = nc; }
-                }
-                if (c->module_own_count < c->module_own_cap) {
-                    c->module_own[c->module_own_count].decl = decl;
-                    c->module_own[c->module_own_count].sym = mine;
-                    c->module_own_count++;
+            if (mine) module_own_push(c, decl, mine);
+            /* BUG-1455: an async function's state type and accessors were
+             * registered into the same private scope — they are this module's
+             * too, or module b's `_zer_async_tick_init` resolves to module a's. */
+            if (decl->kind == NODE_FUNC_DECL && decl->func_decl.is_async) {
+                static const char *const sfx[] = { "", "_init", "_poll", "_result" };
+                for (int k = 0; k < 4; k++) {
+                    char an[300];
+                    int al = snprintf(an, sizeof(an), "_zer_async_%.*s%s",
+                                      (int)own_l, own_n, sfx[k]);
+                    if (al >= (int)sizeof(an)) continue;
+                    Symbol *as = scope_lookup_local(priv, an, (uint32_t)al);
+                    if (as) module_own_push(c, decl, as);
                 }
             }
         } else {

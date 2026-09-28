@@ -376,6 +376,10 @@ typedef struct {
     /* Module context */
     const char *module_prefix;
     uint32_t module_prefix_len;
+    /* BUG-1458: the source file the function was written in (the emitter's
+     * source_file when it lowered it) — zercheck_ir names it in a diagnostic;
+     * it used to name the MAIN file for a defect in an imported module. */
+    const char *source_file;
 
     /* BUG-590: current scope depth — set by ir_lower during NODE_BLOCK
      * traversal. ir_find_local reads this to perform scope-aware lookup
@@ -478,6 +482,11 @@ void ir_print(FILE *out, IRFunc *func);
  * Returns NULL if node is not a function or has no body.
  * Note: Checker is an opaque type here — include checker.h in the calling code. */
 IRFunc *ir_lower_func(Arena *arena, void *checker, Node *func_decl);
+/* BUG-1450: the same, for a function written in module `mod` (NULL = main).
+ * The module is set on the IRFunc BEFORE lowering, so the lowerer's own name
+ * fallbacks resolve in that module (checker_module_decl_lookup). */
+IRFunc *ir_lower_func_in(Arena *arena, void *checker, Node *func_decl,
+                         const char *mod, uint32_t mod_len);
 
 /* Lower an interrupt handler body to IR. */
 IRFunc *ir_lower_interrupt(Arena *arena, void *checker, Node *interrupt);

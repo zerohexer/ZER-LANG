@@ -71,6 +71,11 @@ typedef struct {
 typedef struct {
     const char *func_name;
     uint32_t func_name_len;
+    /* BUG-1457: the IDENTITY of the summarised function (its NODE_FUNC_DECL).
+     * The name alone is not one: two modules' `release` are two functions, and
+     * keyed by name the second module's summary was the first module's. Every
+     * lookup goes through ir_summary_for_call / ir_summary_of_decl. */
+    Node *func_decl;
     int param_count;
     bool *frees_param;        /* definite free (all paths) */
     bool *maybe_frees_param;  /* conditional free (some paths) */
@@ -211,6 +216,10 @@ typedef struct {
     FuncSummary *summaries;
     int summary_count;
     int summary_capacity;
+    /* BUG-1457: the module of the function being analysed (IRFunc.module_prefix,
+     * NULL = main) — a callee NAME is resolved in it. */
+    const char *cur_module;
+    uint32_t cur_module_len;
     bool building_summary;  /* suppress error reporting during summary phase */
     bool cur_resets_arena;  /* BUG-1172: set while analysing a function that resets a non-local arena */
     /* BUG-1380: params (by position, < 64) the function being analysed hands to

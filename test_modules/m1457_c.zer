@@ -1,0 +1,8 @@
+// BUG-1457: module c's `release` frees; c then writes through the freed slice.
+void release([*]u32 s) { free(s); }
+u32 m1457_fc() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    release(s);
+    s[0] = 7;
+    return 0;
+}

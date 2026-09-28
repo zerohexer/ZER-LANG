@@ -660,6 +660,12 @@ int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 
  * program (every registered body AND every global initializer)? The one query
  * anything trusting a global's declaration initializer asks. */
 bool checker_global_never_mutated(Checker *c, Symbol *sym);
+/* BUG-1450: THE lookup of a top-level function / global name as seen from module
+ * `mod` (NULL = the main module): that module's own declaration when it has one
+ * (a name another module registered first, or a module `static`), else the raw
+ * global-scope entry. Symbol.module_prefix then gives the C name. */
+Symbol *checker_module_decl_lookup(Checker *c, const char *mod, uint32_t mod_len,
+                                   const char *name, uint32_t len);
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */

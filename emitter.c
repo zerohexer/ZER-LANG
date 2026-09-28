@@ -168,6 +168,14 @@ static void emit_user_name(Emitter *e, const char *prefix, uint32_t prefix_len,
 #define EMIT_UNION_NAME(e, t)  emit_user_name(e, (t)->union_type.module_prefix, (t)->union_type.module_prefix_len, (t)->union_type.name, (t)->union_type.name_len)
 #define EMIT_ENUM_NAME(e, t)   emit_user_name(e, (t)->enum_type.module_prefix, (t)->enum_type.module_prefix_len, (t)->enum_type.name, (t)->enum_type.name_len)
 
+/* BUG-1453: the C name of a struct's auto-slab — `_zer_auto_slab_` + the struct's
+ * own C name (module-prefixed), the rule find_or_create_auto_slab names the
+ * declaration with. Every use site calls this. */
+static void emit_auto_slab_name(Emitter *e, Type *st) {
+    fprintf(e->out, "_zer_auto_slab_");
+    EMIT_STRUCT_NAME(e, st);
+}
+
 /* BUG-218: emit function/global var name with module prefix */
 #define EMIT_MANGLED_NAME(e, name, name_len) do { \
     if ((e)->current_module) { \
@@ -387,6 +395,63 @@ static void emit_array_size(Emitter *e, Type *arr_type) {
     }
 }
 
+/* ---- BUG-1450: THE module-aware resolution of a top-level name ----
+ *
+ * Which declaration does a function / global NAME written in the module being
+ * emitted denote, and what is its C name? Answered ONCE here. The rule is
+ * checker_module_decl_lookup's (the checker's BUG-1120 lookup): this module's
+ * own declaration when it has one, else the raw global-scope entry; a module
+ * `static` is also found by its mangled key `<module>__<name>`. Before this, the
+ * IR call emitter, the funcptr guard, the spawn wrappers and several fallback
+ * type lookups read `global_scope` by the RAW name, which belongs to the
+ * FIRST-registered module: module b's `helper(2)` was emitted as `a__helper(2)`
+ * (a silent wrong call), and a module `static` called with arguments was
+ * emitted unmangled (a link error). */
+static Symbol *emit_decl_lookup_in(Emitter *e, const char *mod, uint32_t mod_len,
+                                   const char *name, uint32_t len) {
+    if (!e->checker || !name) return NULL;
+    Symbol *s = checker_module_decl_lookup(e->checker, mod, mod_len, name, len);
+    if (s && (!mod || s->module_prefix)) return s;
+    if (mod) {
+        /* a module static / own name whose Symbol is only reachable by its
+         * mangled key (registered for the emitter by BUG-222/229/233) */
+        uint32_t mkl = mod_len + 2 + len;
+        char *mk = (char *)arena_alloc(e->arena, mkl + 1);
+        if (mk) {
+            memcpy(mk, mod, mod_len);
+            mk[mod_len] = '_'; mk[mod_len + 1] = '_';
+            memcpy(mk + mod_len + 2, name, len);
+            mk[mkl] = '\0';
+            Symbol *ms = scope_lookup_local(e->checker->global_scope, mk, mkl);
+            if (ms) return ms;
+        }
+    }
+    return s;
+}
+
+static Symbol *emit_decl_lookup(Emitter *e, const char *name, uint32_t len) {
+    return emit_decl_lookup_in(e, e->current_module, e->current_module_len, name, len);
+}
+
+/* The C spelling of a top-level name resolved in module `mod`. `static_guess`:
+ * when the name resolves to NOTHING inside a module, it is a module-private
+ * name the checker registered only in the module scope — spell it with the
+ * module prefix (the ident emitters' long-standing fallback). */
+static void emit_decl_cname_in(Emitter *e, const char *mod, uint32_t mod_len,
+                               const char *name, uint32_t len, bool static_guess) {
+    Symbol *s = emit_decl_lookup_in(e, mod, mod_len, name, len);
+    if (s && s->module_prefix) {
+        emit(e, "%.*s__%.*s", (int)s->module_prefix_len, s->module_prefix,
+             (int)len, name);
+        return;
+    }
+    if (!s && static_guess && mod) {
+        emit(e, "%.*s__%.*s", (int)mod_len, mod, (int)len, name);
+        return;
+    }
+    emit(e, "%.*s", (int)len, name);
+}
+
 /* ---- Qualifier helpers (RF11) ---- */
 
 /* Walk an expression to its root ident and look up the symbol.
@@ -405,7 +470,7 @@ static Symbol *expr_root_symbol(Emitter *e, Node *expr) {
         /* try local scope first, then global */
         Symbol *s = scope_lookup(e->checker->current_scope,
             root->ident.name, (uint32_t)root->ident.name_len);
-        if (!s) s = scope_lookup(e->checker->global_scope,
+        if (!s) s = emit_decl_lookup(e, /* BUG-1450 */
             root->ident.name, (uint32_t)root->ident.name_len);
         return s;
     }
@@ -777,9 +842,9 @@ static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func);   /* BUG-1058 *
 static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
     /* Emit callee: simple ident or field access (funcptr through struct) */
     if (inst->func_name) {
-        /* Check for cross-module function needing mangled name */
-        Symbol *fsym = scope_lookup(e->checker->global_scope,
-            inst->func_name, inst->func_name_len);
+        /* BUG-1450: the callee resolved in THIS module's context — the raw
+         * global-scope entry is the first-registered module's function. */
+        Symbol *fsym = emit_decl_lookup(e, inst->func_name, inst->func_name_len);
         if (fsym && fsym->is_function && fsym->module_prefix) {
             emit(e, "%.*s__%.*s",
                  (int)fsym->module_prefix_len, fsym->module_prefix,
@@ -942,7 +1007,7 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
     emit_defers(e);
     if (e->in_async) {
         if (with_braces) emit_indent(e);
-        emit(e, "self->_zer_state = -1; return 1;");
+        emit(e, "_zer_self->_zer_state = -1; return 1;");
     } else if (e->current_func_ret && e->current_func_ret->kind != TYPE_VOID) {
         emit(e, "return ");
         emit_zero_value(e, e->current_func_ret);
@@ -2346,7 +2411,7 @@ static void emit_offset_type_operand(Emitter *e, Node *name_node) {
     Type *t = e->checker ? checker_get_type(e->checker, name_node) : NULL;
     if ((!t || type_dispatch_kind(t) == TYPE_VOID) && e->checker && name_node &&
         name_node->kind == NODE_IDENT) {
-        Symbol *s = scope_lookup(e->checker->global_scope, name_node->ident.name,
+        Symbol *s = emit_decl_lookup(e, /* BUG-1450 */ name_node->ident.name,
                                  (uint32_t)name_node->ident.name_len);
         if (s) t = s->type;
     }
@@ -2361,29 +2426,12 @@ static void emit_offset_type_operand(Emitter *e, Node *name_node) {
 static bool callee_is_direct_function(Emitter *e, Node *callee) {
     if (!callee || callee->kind != NODE_IDENT) return false;
     if (!e->checker) return false;
-    Symbol *s = scope_lookup(e->checker->global_scope, callee->ident.name,
-                             (uint32_t)callee->ident.name_len);
-    if (s && s->is_function) return true;
-    /* BUG-1211: a module's `static` function is registered only under its
-     * mangled key `<module>__<name>`, so the raw lookup missed it and a plain
-     * call to it was wrapped in the funcptr null guard —
-     * `__typeof__(m__helper) _zer_fp0 = m__helper;` declares a FUNCTION, and GCC
-     * refuses to initialise one ("initialized like a variable"). */
-    if (e->current_module) {
-        uint32_t nl = (uint32_t)callee->ident.name_len;
-        uint32_t mkl = e->current_module_len + 2 + nl;
-        char *mk = (char *)arena_alloc(e->arena, mkl + 1);
-        if (mk) {
-            memcpy(mk, e->current_module, e->current_module_len);
-            mk[e->current_module_len] = '_';
-            mk[e->current_module_len + 1] = '_';
-            memcpy(mk + e->current_module_len + 2, callee->ident.name, nl);
-            mk[mkl] = '\0';
-            Symbol *ms = scope_lookup_local(e->checker->global_scope, mk, mkl);
-            if (ms && ms->is_function) return true;
-        }
-    }
-    return false;
+    /* BUG-1211 / BUG-1450: resolved in this module's context — a module's
+     * `static` function is registered only under its mangled key, and the raw
+     * entry of a shared name is another module's. */
+    Symbol *s = emit_decl_lookup(e, callee->ident.name,
+                                 (uint32_t)callee->ident.name_len);
+    return s && s->is_function;
 }
 
 /* Is this call an INDIRECT call through a non-optional function pointer?
@@ -2720,7 +2768,7 @@ static void emit_type(Emitter *e, Type *t) {
         /* Async state structs are emitted as typedef, not struct tag */
         if (t->struct_type.name_len >= 11 &&
             memcmp(t->struct_type.name, "_zer_async_", 11) == 0) {
-            emit(e, "%.*s", (int)t->struct_type.name_len, t->struct_type.name);
+            EMIT_STRUCT_NAME(e, t);   /* BUG-1455: module-qualified (async_cbase) */
         } else {
             emit(e, "struct ");
             EMIT_STRUCT_NAME(e, t);
@@ -3393,7 +3441,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
     case NODE_IDENT: {
         /* Async local promotion: emit self->name for promoted locals */
         if (is_async_local(e, node->ident.name, node->ident.name_len)) {
-            emit(e, "self->%.*s", (int)node->ident.name_len, node->ident.name);
+            emit(e, "_zer_self->%.*s", (int)node->ident.name_len, node->ident.name);
             break;
         }
         /* BUG-997 (from qo0mm9 / vigilant-tesla-o51x9p): inside a GLOBAL
@@ -3418,7 +3466,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
          * compile-time constant and is rejected in the checker instead. The
          * depth bound is a backstop: a cycle never reaches here (BUG-975). */
         if (e->global_init_depth > 0 && e->global_init_depth < 64) {
-            Symbol *gs = scope_lookup(e->checker->global_scope,
+            Symbol *gs = emit_decl_lookup(e,   /* BUG-1450 */
                 node->ident.name, (uint32_t)node->ident.name_len);
             if (gs && gs->is_const && !gs->is_function && gs->func_node &&
                 gs->func_node->kind == NODE_GLOBAL_VAR &&
@@ -3430,42 +3478,12 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 break;
             }
         }
-        /* BUG-218/222/229/233: module-aware identifier emission.
-         * When inside a module body (current_module set), PREFER the mangled key
-         * for the current module. This prevents cross-module collision where raw
-         * key resolves to wrong module's symbol. */
-        bool emitted = false;
-        if (e->current_module) {
-            /* BUG-233/332: try current module's mangled key FIRST (double underscore) */
-            uint32_t mkl = e->current_module_len + 2 + (uint32_t)node->ident.name_len;
-            char mk_buf[512];
-            char *mk = mk_buf;
-            if (mkl >= sizeof(mk_buf)) mk = (char *)arena_alloc(e->arena, mkl + 1);
-            memcpy(mk, e->current_module, e->current_module_len);
-            mk[e->current_module_len] = '_';
-            mk[e->current_module_len + 1] = '_';
-            memcpy(mk + e->current_module_len + 2, node->ident.name, node->ident.name_len);
-            mk[mkl] = '\0';
-            Symbol *ms = scope_lookup(e->checker->global_scope, mk, mkl);
-            if (ms && ms->module_prefix) {
-                emit(e, "%.*s__%.*s",
-                     (int)ms->module_prefix_len, ms->module_prefix,
-                     (int)node->ident.name_len, node->ident.name);
-                emitted = true;
-            }
-        }
-        if (!emitted) {
-            /* Fall back to raw key lookup */
-            Symbol *id_sym = scope_lookup(e->checker->global_scope,
-                node->ident.name, (uint32_t)node->ident.name_len);
-            if (id_sym && id_sym->module_prefix) {
-                emit(e, "%.*s__%.*s",
-                     (int)id_sym->module_prefix_len, id_sym->module_prefix,
-                     (int)node->ident.name_len, node->ident.name);
-            } else {
-                emit(e, "%.*s", (int)node->ident.name_len, node->ident.name);
-            }
-        }
+        /* BUG-218/222/229/233 -> BUG-1450: module-aware identifier emission,
+         * through the ONE resolver every emitter site now shares (this module's
+         * own declaration first, then the raw entry's module). No static guess
+         * here: this path also spells locals, which resolve to nothing. */
+        emit_decl_cname_in(e, e->current_module, e->current_module_len,
+                           node->ident.name, (uint32_t)node->ident.name_len, false);
         break;
     }
 
@@ -3920,7 +3938,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 Type *obj_type = checker_get_type(e->checker,obj_node);
                 Symbol *sym = NULL;
                 if (!obj_type)  {
-                    sym = scope_lookup(e->checker->global_scope,
+                    sym = emit_decl_lookup(e, /* BUG-1450 */
                         obj_node->ident.name, (uint32_t)obj_node->ident.name_len);
                     if (sym) obj_type = sym->type;
                 }
@@ -4139,7 +4157,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                             const char *tname = node->call.args[0]->ident.name;
                             int tlen = (int)node->call.args[0]->ident.name_len;
                             /* Look up type to emit correct C name */
-                            Symbol *tsym = scope_lookup(e->checker->global_scope,
+                            Symbol *tsym = emit_decl_lookup(e, /* BUG-1450 */
                                 tname, (uint32_t)tlen);
                             if (tsym && tsym->type) {
                                 emit(e, "((");
@@ -4160,7 +4178,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                             node->call.args[0]->kind == NODE_IDENT) {
                             const char *tname = node->call.args[0]->ident.name;
                             int tlen = (int)node->call.args[0]->ident.name_len;
-                            Symbol *tsym = scope_lookup(e->checker->global_scope,
+                            Symbol *tsym = emit_decl_lookup(e, /* BUG-1450 */
                                 tname, (uint32_t)tlen);
                             if (tsym && tsym->type) {
                                 int tmp = e->temp_count++;
@@ -4206,39 +4224,44 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             if (ot && ot->kind == TYPE_STRUCT) {
                 const char *mn = node->call.callee->field.field_name;
                 uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
-                /* find auto-slab name */
-                char asname[128];
-                int aslen = snprintf(asname, sizeof(asname), "_zer_auto_slab_%.*s",
-                    (int)ot->struct_type.name_len, ot->struct_type.name);
+                /* BUG-1453: auto-slab name through emit_auto_slab_name */
                 if (ml == 5 && memcmp(mn, "alloc", 5) == 0) {
                     /* Task.alloc() → slab.alloc() */
                     int tmp = e->temp_count++;
                     emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
-                         "_zer_slab_alloc(&%.*s, &_zer_aok%d); "
+                         "_zer_slab_alloc(&", tmp, tmp);
+                    emit_auto_slab_name(e, ot);
+                    emit(e, ", &_zer_aok%d); "
                          "(_zer_opt_u64){_zer_ah%d, _zer_aok%d}; })",
-                         tmp, tmp, aslen, asname, tmp, tmp, tmp);
+                         tmp, tmp, tmp);
                     handled = true;
                 } else if (ml == 9 && memcmp(mn, "alloc_ptr", 9) == 0) {
                     /* Task.alloc_ptr() → slab.alloc_ptr() */
                     int tmp = e->temp_count++;
                     emit(e, "({uint8_t _zer_aok%d = 0; uint64_t _zer_ah%d = "
-                         "_zer_slab_alloc(&%.*s, &_zer_aok%d); ",
-                         tmp, tmp, aslen, asname, tmp);
+                         "_zer_slab_alloc(&", tmp, tmp);
+                    emit_auto_slab_name(e, ot);
+                    emit(e, ", &_zer_aok%d); ", tmp);
                     emit(e, "_zer_aok%d ? (", tmp);
                     emit_type(e, ot);
-                    emit(e, "*)_zer_slab_get(&%.*s, _zer_ah%d) : (void*)0; })",
-                         aslen, asname, tmp);
+                    emit(e, "*)_zer_slab_get(&");
+                    emit_auto_slab_name(e, ot);
+                    emit(e, ", _zer_ah%d) : (void*)0; })", tmp);
                     handled = true;
                 } else if (ml == 4 && memcmp(mn, "free", 4) == 0) {
                     /* Task.free(h) → slab.free(h) */
-                    emit(e, "_zer_slab_free(&%.*s, ", aslen, asname);
+                    emit(e, "_zer_slab_free(&");
+                    emit_auto_slab_name(e, ot);
+                    emit(e, ", ");
                     if (node->call.arg_count > 0)
                         emit_expr(e, node->call.args[0]);
                     emit(e, ")");
                     handled = true;
                 } else if (ml == 8 && memcmp(mn, "free_ptr", 8) == 0) {
                     /* Task.free_ptr(p) → slab.free_ptr(p) */
-                    emit(e, "_zer_slab_free_ptr(&%.*s, ", aslen, asname);
+                    emit(e, "_zer_slab_free_ptr(&");
+                    emit_auto_slab_name(e, ot);
+                    emit(e, ", ");
                     if (node->call.arg_count > 0)
                         emit_expr(e, node->call.args[0]);
                     emit(e, ")");
@@ -4323,7 +4346,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         Type *obj_type = checker_get_type(e->checker,node->field.object);
         /* fallback for imported modules: typemap may not have the node */
         if (!obj_type && node->field.object->kind == NODE_IDENT) {
-            Symbol *sym = scope_lookup(e->checker->global_scope,
+            Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                 node->field.object->ident.name,
                 (uint32_t)node->field.object->ident.name_len);
             if (sym) obj_type = sym->type;
@@ -4358,7 +4381,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 Symbol *hsym = scope_lookup(e->checker->current_scope,
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
-                if (!hsym) hsym = scope_lookup(e->checker->global_scope,
+                if (!hsym) hsym = emit_decl_lookup(e, /* BUG-1450 */
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
                 if (hsym) alloc_sym = hsym->slab_source;
@@ -5080,7 +5103,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             } else if (node->intrinsic.arg_count > 0 &&
                        node->intrinsic.args[0]->kind == NODE_IDENT) {
                 /* named type passed as identifier (e.g. @size(MyStruct)) */
-                Symbol *sym = scope_lookup(e->checker->global_scope,
+                Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                     node->intrinsic.args[0]->ident.name,
                     (uint32_t)node->intrinsic.args[0]->ident.name_len);
                 if (sym && sym->type) emit_type(e, sym->type);
@@ -5554,9 +5577,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                  * on both reads (source) and writes (destination).
                  * Cast source to volatile if source is volatile. */
                 const char *src_vol = src_volatile ? "volatile " : "";
-                emit(e, "{ %sconst uint8_t *_sv = (%sconst uint8_t*)_zer_cs%d.ptr; ",
+                emit(e, "{ %sconst uint8_t *_zer_sv = (%sconst uint8_t*)_zer_cs%d.ptr; ",
                      src_vol, src_vol, tmp);
-                emit(e, "for (size_t _i = 0; _i < _zer_cs%d.len; _i++) _zer_cb%d[_i] = _sv[_i]; } ",
+                emit(e, "for (size_t _zer_i = 0; _zer_i < _zer_cs%d.len; _zer_i++) _zer_cb%d[_zer_i] = _zer_sv[_zer_i]; } ",
                      tmp, tmp);
             } else {
                 emit(e, "memcpy(_zer_cb%d, _zer_cs%d.ptr, _zer_cs%d.len); ", tmp, tmp, tmp);
@@ -5873,7 +5896,7 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
         return type_handle(e->arena, resolve_tynode(e,tn->handle.elem));
     case TYNODE_NAMED: {
         /* look up in checker's global scope */
-        Symbol *sym = scope_lookup(e->checker->global_scope,
+        Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
             tn->named.name, (uint32_t)tn->named.name_len);
         if (sym) return sym->type;
         return ty_void;
@@ -5948,7 +5971,7 @@ static Type *resolve_type_for_emit(Emitter *e, TypeNode *tn) {
     }
     case TYNODE_CONTAINER: {
         /* container instantiation — look up stamped struct from checker */
-        Symbol *sym = scope_lookup(e->checker->global_scope,
+        Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
             tn->container.name, (uint32_t)tn->container.name_len);
         if (sym) return sym->type;
         return ty_void;
@@ -6436,7 +6459,8 @@ static void emit_func_decl(Emitter *e, Node *node) {
             IRFunc *pre = (IRFunc *)e->early_async_ir[ai];
             if (pre && pre->ast_node == node) { emit_func_from_ir(e, pre); return; }
         }
-        IRFunc *ir = ir_lower_func(e->arena, e->checker, node);
+        IRFunc *ir = ir_lower_func_in(e->arena, e->checker, node,   /* BUG-1450 */
+                                      e->current_module, e->current_module_len);
         if (!ir) {
             fprintf(stderr,
                     "INTERNAL ERROR: IR lowering returned NULL for '%.*s' "
@@ -6448,6 +6472,7 @@ static void emit_func_decl(Emitter *e, Node *node) {
         }
         ir->module_prefix = e->current_module;
         ir->module_prefix_len = e->current_module_len;
+        ir->source_file = e->source_file;   /* BUG-1458 */
         if (!ir_validate(ir)) {
             fprintf(stderr,
                     "INTERNAL ERROR: IR validation failed for '%.*s' "
@@ -6514,20 +6539,38 @@ static void emit_func_prototype(Emitter *e, Node *node) {
     emit(e, ";\n");
 }
 
+/* BUG-1455: the C base name of an async function's state type and accessors —
+ * `_zer_async_NAME` for the main module, `<module>___zer_async_NAME` for an
+ * imported one. The checker registers the four names (type, _init, _poll,
+ * _result) with the function's module_prefix, so a CALL resolves through the
+ * module-aware resolver and spells the same prefix; the definitions spell it
+ * here. BUG-866 had dropped the prefix everywhere to make the two sides agree,
+ * which made two modules' `async void tick()` one C name (a redefinition) and
+ * let module b's `_zer_async_tick_init` resolve to module a's task. */
+static int async_cbase(char *buf, size_t cap, const char *mod, uint32_t mod_len,
+                       const char *name, uint32_t len) {
+    int n = mod && mod_len ?
+        snprintf(buf, cap, "%.*s___zer_async_%.*s", (int)mod_len, mod, (int)len, name) :
+        snprintf(buf, cap, "_zer_async_%.*s", (int)len, name);
+    if (n >= (int)cap) n = (int)cap - 1;
+    return n;
+}
+
 /* BUG-1177: `typedef struct _zer_async_NAME _zer_async_NAME;` for every async
  * function, before any prototype. The state struct is defined where the async
  * function itself is emitted (in declaration order), so without this a function
  * declared EARLIER that takes `*_zer_async_NAME` named an unknown type — and the
- * pointer is the only legal way to pass a task. Names are unmangled, matching
- * emit_async_func_from_ir (BUG-866). */
+ * pointer is the only legal way to pass a task. Names are module-qualified
+ * through async_cbase, matching emit_async_func_from_ir (BUG-1455). */
 static void emit_async_forward_typedefs(Emitter *e, Node *file_node) {
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
             continue;
-        emit(e, "typedef struct _zer_async_%.*s _zer_async_%.*s;\n",
-             (int)d->func_decl.name_len, d->func_decl.name,
-             (int)d->func_decl.name_len, d->func_decl.name);
+        char cb[320];
+        int cl = async_cbase(cb, sizeof(cb), e->current_module, e->current_module_len,
+                             d->func_decl.name, (uint32_t)d->func_decl.name_len);
+        emit(e, "typedef struct %.*s %.*s;\n", cl, cb, cl, cb);   /* BUG-1455 */
     }
 }
 
@@ -6572,7 +6615,8 @@ static void emit_early_async_structs(Emitter *e, Node *file_node) {
         Node *d = file_node->file.decls[i];
         if (d->kind != NODE_FUNC_DECL || !d->func_decl.is_async || !d->func_decl.body)
             continue;
-        IRFunc *ir = ir_lower_func(e->arena, e->checker, d);
+        IRFunc *ir = ir_lower_func_in(e->arena, e->checker, d,   /* BUG-1450 */
+                                      e->current_module, e->current_module_len);
         if (!ir) {
             fprintf(stderr, "INTERNAL ERROR: IR lowering returned NULL for async '%.*s'\n",
                     (int)d->func_decl.name_len, d->func_decl.name);
@@ -6580,6 +6624,7 @@ static void emit_early_async_structs(Emitter *e, Node *file_node) {
         }
         ir->module_prefix = e->current_module;
         ir->module_prefix_len = e->current_module_len;
+        ir->source_file = e->source_file;   /* BUG-1458 */
         if (!ir_validate(ir)) {
             fprintf(stderr, "INTERNAL ERROR: IR validation failed for async '%.*s'\n",
                     (int)d->func_decl.name_len, d->func_decl.name);
@@ -6650,22 +6695,8 @@ static bool global_is_ptr_shaped(Type *type) {
  * idiom exactly as before. */
 static bool global_ptr_word_volatile(Emitter *e, Node *node, Type *type) {
     if (!node->var_decl.is_volatile || !global_is_ptr_shaped(type)) return false;
-    Symbol *s = NULL;
-    if (e->current_module) {
-        uint32_t mlen = e->current_module_len + 2 + (uint32_t)node->var_decl.name_len;
-        char *mangled = (char *)arena_alloc(e->arena, mlen + 1);
-        if (mangled) {
-            memcpy(mangled, e->current_module, e->current_module_len);
-            mangled[e->current_module_len] = '_';
-            mangled[e->current_module_len + 1] = '_';
-            memcpy(mangled + e->current_module_len + 2, node->var_decl.name,
-                   node->var_decl.name_len);
-            mangled[mlen] = '\0';
-            s = scope_lookup(e->checker->global_scope, mangled, mlen);
-        }
-    }
-    if (!s) s = scope_lookup(e->checker->global_scope, node->var_decl.name,
-                             (uint32_t)node->var_decl.name_len);
+    Symbol *s = emit_decl_lookup(e, node->var_decl.name,   /* BUG-1450 */
+                                 (uint32_t)node->var_decl.name_len);
     if (s && (s->is_const || checker_global_never_mutated(e->checker, s))) return false;
     return true;
 }
@@ -7056,6 +7087,8 @@ static void prescan_spawn_in_node(Emitter *e, Node *node) {
         SpawnWrapper *sw = &e->spawn_wrappers[e->spawn_wrapper_count++];
         sw->id = e->next_spawn_id++;
         sw->spawn_node = node;
+        sw->module = e->current_module;          /* BUG-1450 */
+        sw->module_len = e->current_module_len;
         break;
     }
     case NODE_EXPR_STMT:
@@ -7144,33 +7177,38 @@ static void emit_type(Emitter *e, Type *t); /* forward decl */
  * call — if the symbol carries a `module_prefix`, emit `prefix__name`. It was
  * spelled raw at FOUR spawn sites (two forward-declaration arms, two wrapper
  * bodies), which is why no single fix existed. One helper, four call sites. */
-static void emit_spawn_target_name(Emitter *e, const char *name, size_t len) {
-    Symbol *s = scope_lookup(e->checker->global_scope, name, (uint32_t)len);
-    if (s && s->module_prefix) {
-        emit(e, "%.*s__%.*s", (int)s->module_prefix_len, s->module_prefix,
-             (int)len, name);
-        return;
-    }
-    emit(e, "%.*s", (int)len, name);
+/* BUG-1450: resolved in the SPAWN's module (SpawnWrapper.module), through the
+ * shared resolver — the raw entry of a name two modules define is the first
+ * module's, so module b's `spawn work(7)` ran module a's `work`. */
+static Symbol *spawn_target_sym(Emitter *e, SpawnWrapper *sw) {
+    Node *sn = sw->spawn_node;
+    return emit_decl_lookup_in(e, sw->module, sw->module_len,
+                               sn->spawn_stmt.func_name,
+                               (uint32_t)sn->spawn_stmt.func_name_len);
+}
+
+static void emit_spawn_target_name(Emitter *e, SpawnWrapper *sw) {
+    Node *sn = sw->spawn_node;
+    emit_decl_cname_in(e, sw->module, sw->module_len, sn->spawn_stmt.func_name,
+                       (uint32_t)sn->spawn_stmt.func_name_len, false);
 }
 
 static void emit_spawn_wrappers(Emitter *e) {
-    if (e->spawn_wrapper_count == 0) return;
+    int first = e->spawn_wrappers_emitted;   /* BUG-1451 */
+    if (first >= e->spawn_wrapper_count) return;
+    e->spawn_wrappers_emitted = e->spawn_wrapper_count;
 
     /* Forward-declare target functions so wrappers can call them */
     emit(e, "\n/* ZER spawn target forward declarations */\n");
-    for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+    for (int wi = first; wi < e->spawn_wrapper_count; wi++) {
         SpawnWrapper *sw = &e->spawn_wrappers[wi];
-        Node *sn = sw->spawn_node;
-        Symbol *fsym = scope_lookup(e->checker->global_scope,
-            sn->spawn_stmt.func_name, (uint32_t)sn->spawn_stmt.func_name_len);
+        Symbol *fsym = spawn_target_sym(e, sw);
         if (fsym && fsym->type && fsym->type->kind == TYPE_FUNC_PTR) {
             /* Emit return type + name + params */
             Type *ft = fsym->type;
             emit_type(e, ft->func_ptr.ret);
             emit(e, " ");
-            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
-                                   sn->spawn_stmt.func_name_len);
+            emit_spawn_target_name(e, sw);
             emit(e, "(");
             for (uint32_t pi = 0; pi < ft->func_ptr.param_count; pi++) {
                 if (pi > 0) emit(e, ", ");
@@ -7185,8 +7223,7 @@ static void emit_spawn_wrappers(Emitter *e) {
                 if (ret && ret->kind == TYPE_FUNC_PTR) {
                     emit_type(e, ret->func_ptr.ret);
                     emit(e, " ");
-                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
-                                           sn->spawn_stmt.func_name_len);
+                    emit_spawn_target_name(e, sw);
                     emit(e, "(");
                     for (uint32_t pi = 0; pi < ret->func_ptr.param_count; pi++) {
                         if (pi > 0) emit(e, ", ");
@@ -7196,8 +7233,7 @@ static void emit_spawn_wrappers(Emitter *e) {
                 } else {
                     /* Fallback: just emit void func_name(); */
                     emit(e, "void ");
-                    emit_spawn_target_name(e, sn->spawn_stmt.func_name,
-                                           sn->spawn_stmt.func_name_len);
+                    emit_spawn_target_name(e, sw);
                     emit(e, "();\n");
                 }
             }
@@ -7205,7 +7241,7 @@ static void emit_spawn_wrappers(Emitter *e) {
     }
 
     emit(e, "\n/* ZER spawn thread wrappers */\n");
-    for (int wi = 0; wi < e->spawn_wrapper_count; wi++) {
+    for (int wi = first; wi < e->spawn_wrapper_count; wi++) {
         SpawnWrapper *sw = &e->spawn_wrappers[wi];
         Node *sn = sw->spawn_node;
         int sid = sw->id;
@@ -7222,9 +7258,7 @@ static void emit_spawn_wrappers(Emitter *e) {
              * spawn worker(42) where worker takes ?u32 silently
              * miscompiled because struct field was emitted as uint32_t
              * but worker takes _zer_opt_u32. */
-            Symbol *worker_sym = scope_lookup(e->checker->global_scope,
-                sn->spawn_stmt.func_name,
-                (uint32_t)sn->spawn_stmt.func_name_len);
+            Symbol *worker_sym = spawn_target_sym(e, sw);   /* BUG-1450 */
             Type *worker_ft = NULL;
             if (worker_sym && worker_sym->type) {
                 Type *wt = type_unwrap_distinct(worker_sym->type);
@@ -7253,23 +7287,25 @@ static void emit_spawn_wrappers(Emitter *e) {
         }
 
         /* Emit wrapper function */
-        emit(e, "static void *_zer_spawn_wrap_%d(void *_raw) {\n", sid);
+        emit(e, "static void *_zer_spawn_wrap_%d(void *_zer_raw) {\n", sid);
         if (ac > 0) {
-            emit(e, "    struct _zer_spawn_args_%d *_a = (struct _zer_spawn_args_%d *)_raw;\n", sid, sid);
+            /* BUG-1456: every name the emitter declares in a scope that also
+             * holds a user name lives in the reserved `_zer_` namespace — a user
+             * function named `_a` / `_raw`, spawned, was shadowed by the
+             * wrapper's own local. */
+            emit(e, "    struct _zer_spawn_args_%d *_zer_a = (struct _zer_spawn_args_%d *)_zer_raw;\n", sid, sid);
             emit(e, "    ");
-            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
-                                   sn->spawn_stmt.func_name_len);
+            emit_spawn_target_name(e, sw);
             emit(e, "(");
             for (int i = 0; i < ac; i++) {
                 if (i > 0) emit(e, ", ");
-                emit(e, "_a->a%d", i);
+                emit(e, "_zer_a->a%d", i);
             }
             emit(e, ");\n");
-            emit(e, "    free(_a);\n");
+            emit(e, "    free(_zer_a);\n");
         } else {
             emit(e, "    ");
-            emit_spawn_target_name(e, sn->spawn_stmt.func_name,
-                                   sn->spawn_stmt.func_name_len);
+            emit_spawn_target_name(e, sw);
             emit(e, "();\n");
         }
         emit(e, "    return NULL;\n");
@@ -7447,6 +7483,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
             }
             ir->module_prefix = e->current_module;
             ir->module_prefix_len = e->current_module_len;
+            ir->source_file = e->source_file;   /* BUG-1458 */
             if (!ir_validate(ir)) {
                 fprintf(stderr,
                         "INTERNAL ERROR: IR validation failed for interrupt "
@@ -7510,55 +7547,21 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
 
 /* Unified file emitter — one flow for both preamble and non-preamble modules.
  * Prevents BUG-472 class: prescan/setup steps can't be forgotten for one path. */
+/* BUG-1454: everything after the C preamble, for EVERY module. The imported-
+ * module path used to be a hand-copied subset of the preamble path, and it had
+ * drifted: no function prototypes, no async forward typedefs, no early async
+ * state structs — so an async function in any module other than the FIRST one
+ * emitted named an undeclared `_zer_async_NAME` — and every module re-emitted
+ * the whole spawn-wrapper list and the first module emitted every module's
+ * auto-slab before those modules' structs existed. One body, both paths. */
+static void emit_module_body(Emitter *e, Node *file_node);
+
 void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     if (!file_node || file_node->kind != NODE_FILE) return;
 
     if (!with_preamble) {
-        /* Non-preamble module: prescan + two-pass emit (same as preamble path) */
         emit(e, "\n/* --- imported module --- */\n\n");
-
-        /* Pre-scan for spawn (same as preamble path) */
-        for (int i = 0; i < file_node->file.decl_count; i++)
-            prescan_spawn_in_node(e, file_node->file.decls[i]);
-
-        /* BUG-1027: register every exotic slice type, then flush the ones whose
-         * dependencies are ready before each declaration that may name one. */
-        collect_exotic_slices(e);
-
-        /* Pass 1: struct/enum/union/typedef declarations */
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            Node *d = file_node->file.decls[i];
-            if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
-            if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
-                d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
-                flush_exotic_slices(e);
-                emit_top_level_decl(e, d, file_node, i);
-            }
-        }
-        flush_exotic_slices(e);
-
-        /* Emit stamped container struct declarations */
-        emit_container_structs(e);
-        flush_exotic_slices(e);
-
-        /* Spawn wrappers (between struct decls and functions) */
-        emit_spawn_wrappers(e);
-
-        /* Pass 2a: globals first (ensures cross-module references work) */
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            Node *d = file_node->file.decls[i];
-            if (d->kind == NODE_GLOBAL_VAR)
-                emit_top_level_decl(e, d, file_node, i);
-        }
-        /* Pass 2b: functions */
-        for (int i = 0; i < file_node->file.decl_count; i++) {
-            Node *d = file_node->file.decls[i];
-            if (d->kind == NODE_IMPORT || d->kind == NODE_CINCLUDE) continue;
-            if (d->kind != NODE_STRUCT_DECL && d->kind != NODE_ENUM_DECL &&
-                d->kind != NODE_UNION_DECL && d->kind != NODE_TYPEDEF &&
-                d->kind != NODE_CONTAINER_DECL && d->kind != NODE_GLOBAL_VAR)
-                emit_top_level_decl(e, d, file_node, i);
-        }
+        emit_module_body(e, file_node);
         return;
     }
 
@@ -8055,16 +8058,31 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * the (int64_t) casts — `x << ((1 << 64) + 1)` shifted by 1 (UBSan: shift
      * exponent too large). A count that does not survive the round trip through
      * int64_t is out of range by definition, so it is the "0" case. */
-    emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((__typeof__(_b))(int64_t)_b != _b || "
-            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
-            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
-            "? (__typeof__(a))0 : (a) << _b; })\n");
-    emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((__typeof__(_b))(int64_t)_b != _b || "
-            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
-            "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
-            "? (__typeof__(a))0 : (a) >> _b; })\n\n");
+    /* BUG-1456: the macro's own locals are `_zer_sva` / `_zer_sb`, in the
+     * reserved namespace. The count's was `_b`, a legal ZER identifier:
+     * `u32 sh(u32 a, u32 _b) { return a << _b; }` expanded to
+     * `__typeof__(_b) _b = (_b)` — the new `_b` initialised from itself — and
+     * shifted by garbage, with no diagnostic.
+     *
+     * BUG-1459c: and BOTH operands are evaluated exactly once, LEFT FIRST, into
+     * temps the select then reads. The macro used to evaluate the count first
+     * and the left operand only on the in-range arm — so on the AST emission
+     * path (a defer body in a function with a label, a global initializer)
+     * `f() << 99` never called f(), `f() << g()` ran g() before f(), and a
+     * volatile left operand past the range was never READ (a clear-on-read
+     * register kept its value). */
+    emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(a) _zer_sva = (a); "
+            "__typeof__(b) _zer_sb = (b); "
+            "((__typeof__(_zer_sb))(int64_t)_zer_sb != _zer_sb || "
+            "(int64_t)_zer_sb < 0 || (int64_t)_zer_sb >= (int64_t)(w) || "
+            "(int64_t)_zer_sb >= (int64_t)(sizeof(_zer_sva) * 8)) "
+            "? (__typeof__(_zer_sva))0 : _zer_sva << _zer_sb; })\n");
+    emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(a) _zer_sva = (a); "
+            "__typeof__(b) _zer_sb = (b); "
+            "((__typeof__(_zer_sb))(int64_t)_zer_sb != _zer_sb || "
+            "(int64_t)_zer_sb < 0 || (int64_t)_zer_sb >= (int64_t)(w) || "
+            "(int64_t)_zer_sb >= (int64_t)(sizeof(_zer_sva) * 8)) "
+            "? (__typeof__(_zer_sva))0 : _zer_sva >> _zer_sb; })\n\n");
 
     /* bounds check helper — works in comma expressions (LHS and RHS safe) */
     emit(e, "static inline void _zer_bounds_check(size_t idx, size_t len, "
@@ -8396,6 +8414,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
         }
     }
 
+    emit_module_body(e, file_node);
+}
+
+static void emit_module_body(Emitter *e, Node *file_node) {
     /* Pre-scan: find all spawn statements and assign IDs for wrapper emission */
     for (int i = 0; i < file_node->file.decl_count; i++)
         prescan_spawn_in_node(e, file_node->file.decls[i]);
@@ -8403,6 +8425,12 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* BUG-1027: register every exotic slice type, then flush the ones whose
      * dependencies are ready before each declaration that may name one. */
     collect_exotic_slices(e);
+
+    /* BUG-1177 / BUG-1459: the async state TAGS (`typedef struct X X;`) name no
+     * other type, so they go before every user type — a `distinct typedef
+     * _zer_async_f DT;` in pass 1 named an undeclared type when they were
+     * written with the prototypes after it. */
+    emit_async_forward_typedefs(e, file_node);
 
     /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
@@ -8419,23 +8447,66 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit_container_structs(e);
     flush_exotic_slices(e);
 
-    /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions */
-    if (e->checker->auto_slab_count > 0) {
-        emit(e, "\n/* ZER auto-Slab globals (Task.new/delete) */\n");
+    /* emit auto-Slab globals for Task.new() / Task.delete() — after structs, before functions.
+     * BUG-1453: each slab in the module that DECLARES its struct (its struct is
+     * complete there, and every user of the struct is emitted after it); the
+     * list is one list for the whole build, so it used to be written in full by
+     * the FIRST module, before a later module's struct existed (`sizeof` of an
+     * incomplete type). A struct without a module (the main module's, a
+     * container stamp) is emitted by the main module or wherever the first
+     * opportunity after its declaration comes — main is emitted last. */
+    if (e->checker->auto_slab_count > e->auto_slab_done_cap) {
+        int nc = e->checker->auto_slab_count;
+        bool *nd = (bool *)arena_alloc(e->arena, (size_t)nc * sizeof(bool));
+        if (!nd) abort();
+        memset(nd, 0, (size_t)nc * sizeof(bool));
+        if (e->auto_slab_done)
+            memcpy(nd, e->auto_slab_done, (size_t)e->auto_slab_done_cap * sizeof(bool));
+        e->auto_slab_done = nd;
+        e->auto_slab_done_cap = nc;
+    }
+    {
+        bool hdr = false;
         for (int i = 0; i < e->checker->auto_slab_count; i++) {
+            if (e->auto_slab_done[i]) continue;
             Type *elem = e->checker->auto_slabs[i].elem_type;
             Symbol *sym = e->checker->auto_slabs[i].slab_sym;
+            Type *eu = elem ? type_unwrap_distinct(elem) : NULL;
+            const char *em = (eu && type_dispatch_kind(eu) == TYPE_STRUCT) ?
+                eu->struct_type.module_prefix : NULL;
+            uint32_t eml = em ? eu->struct_type.module_prefix_len : 0;
+            bool mine;
+            if (em) {
+                mine = e->current_module && eml == e->current_module_len &&
+                       memcmp(em, e->current_module, eml) == 0;
+            } else {
+                /* no module: declared by THIS file (the main module's struct),
+                 * or by no file at all (a container stamp — its struct is
+                 * written with the first module's container structs) */
+                Node *df = NULL;
+                for (int fi = 0; fi < e->checker->reg_file_count && !df; fi++) {
+                    Node *f = e->checker->reg_files[fi];
+                    for (int di = 0; f && di < f->file.decl_count; di++) {
+                        Node *d = f->file.decls[di];
+                        if (d->kind == NODE_STRUCT_DECL &&
+                            checker_get_type(e->checker, d) == eu) { df = f; break; }
+                    }
+                }
+                mine = !df || df == file_node;
+            }
+            if (!mine || !sym) continue;
+            e->auto_slab_done[i] = true;
+            if (!hdr) { emit(e, "\n/* ZER auto-Slab globals (Task.new/delete) */\n"); hdr = true; }
             emit(e, "static _zer_slab %.*s = { .slot_size = sizeof(", (int)sym->name_len, sym->name);
             emit_type(e, elem);
             emit(e, ") };\n");
         }
-        emit(e, "\n");
+        if (hdr) emit(e, "\n");
     }
 
     /* BUG-1128: prototypes for every function with a body — after every type
      * they can name, before any function or global initializer that names them. */
     emit(e, "\n/* ZER function prototypes */\n");
-    emit_async_forward_typedefs(e, file_node);
     for (int i = 0; i < file_node->file.decl_count; i++)
         emit_func_prototype(e, file_node->file.decls[i]);
     emit(e, "\n");
@@ -8525,7 +8596,7 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
     IRLocal *l = &func->locals[local_id];
     if (func->is_async)
-        emit(e, "self->%.*s", (int)l->name_len, l->name);
+        emit(e, "_zer_self->%.*s", (int)l->name_len, l->name);
     else
         emit(e, "%.*s", (int)l->name_len, l->name);
 }
@@ -8537,7 +8608,7 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
  * One AND (or sign-extend) after the load restores the type's range. */
 static void emit_intn_load_normalize(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
-    emit_intn_mask(e, &func->locals[local_id], func->is_async ? "self->" : "");
+    emit_intn_mask(e, &func->locals[local_id], func->is_async ? "_zer_self->" : "");
 }
 
 /* BUG-1152: the statement form of the non-null load guard — after an IR load
@@ -8569,7 +8640,7 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     const char *on = node->call.callee->field.object->ident.name;
     uint32_t ol = (uint32_t)node->call.callee->field.object->ident.name_len;
     Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
-    if (!ot) { Symbol *s = scope_lookup(e->checker->global_scope, on, ol); if (s) ot = s->type; }
+    if (!ot) { Symbol *s = emit_decl_lookup(e, /* BUG-1450 */ on, ol); if (s) ot = s->type; }
     if (!ot) return false;
     /* BUG-1040: every `%.*s` below spells the RECEIVER. A local (`Arena a` in
      * this function) keeps its name; a global is spelled exactly as the ident
@@ -8589,11 +8660,13 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             }
         }
         if (!is_local) {
-            Symbol *gs = scope_lookup(e->checker->global_scope, on, ol);
+            Symbol *gs = emit_decl_lookup(e, /* BUG-1450 */ on, ol);
             const char *pfx = NULL; uint32_t pl = 0;
+            /* BUG-1450: the resolver names the OWNING module — the old guess
+             * ("inside a module, it must be ours") spelled module b's use of
+             * module a's container global with b's prefix. */
             if (gs && gs->module_prefix) {
-                if (e->current_module) { pfx = e->current_module; pl = e->current_module_len; }
-                else { pfx = gs->module_prefix; pl = gs->module_prefix_len; }
+                pfx = gs->module_prefix; pl = gs->module_prefix_len;
             } else if (!gs && e->current_module) {
                 pfx = e->current_module; pl = e->current_module_len;
             }
@@ -8755,7 +8828,7 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             return true;
         }
         if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
-            Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
+            Symbol *ts=emit_decl_lookup(e,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             /* BUG-1040: emit_type spells a struct WITH its module prefix (`struct
              * arena_lib__Node`); the hand-rolled `struct Node` here was an
              * incomplete type inside an imported module (same defect BUG-1029
@@ -8766,7 +8839,7 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
         }
         if (ml==11 && !memcmp(mn,"alloc_slice",11) && node->call.arg_count>1 && node->call.args[0]->kind==NODE_IDENT) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
-            Symbol *ts=scope_lookup(e->checker->global_scope,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
+            Symbol *ts=emit_decl_lookup(e,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
             if (ts&&ts->type) { int t=e->temp_count++;
                 /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
                  * computed with an overflow check. The AST path has done this
@@ -8809,11 +8882,13 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     }
     /* Task.alloc/free (auto-slab) */
     if (te->kind == TYPE_STRUCT) {
-        const char *sn=te->struct_type.name; uint32_t sl=te->struct_type.name_len;
-        if (ml==5 && !memcmp(mn,"alloc",5)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,(int)sl,sn,t,t,t); return true; }
-        if (ml==9 && !memcmp(mn,"alloc_ptr",9)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&_zer_auto_slab_%.*s,&_zer_aok%d);_zer_aok%d?(struct %.*s*)_zer_slab_get(&_zer_auto_slab_%.*s,_zer_ah%d):(void*)0;})",t,t,(int)sl,sn,t,t,(int)sl,sn,(int)sl,sn,t); return true; }
-        if (ml==4 && !memcmp(mn,"free",4) && node->call.arg_count>0) { emit(e,"_zer_slab_free(&_zer_auto_slab_%.*s,",(int)sl,sn); BA(0); emit(e,")"); return true; }
-        if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) { emit(e,"_zer_slab_free_ptr(&_zer_auto_slab_%.*s,(void*)",(int)sl,sn); BA(0); emit(e,")"); return true; }
+        /* BUG-1453: the slab AND the struct tag spelled with the module prefix
+         * (emit_auto_slab_name / emit_type) — `(struct Ta*)` and
+         * `_zer_auto_slab_Ta` named nothing inside a module. */
+        if (ml==5 && !memcmp(mn,"alloc",5)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&",t,t); emit_auto_slab_name(e,te); emit(e,",&_zer_aok%d);_zer_aok%d?(_zer_opt_u64){_zer_ah%d,1}:(_zer_opt_u64){0,0};})",t,t,t); return true; }
+        if (ml==9 && !memcmp(mn,"alloc_ptr",9)) { int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_slab_alloc(&",t,t); emit_auto_slab_name(e,te); emit(e,",&_zer_aok%d);_zer_aok%d?(",t,t); emit_type(e,te); emit(e,"*)_zer_slab_get(&"); emit_auto_slab_name(e,te); emit(e,",_zer_ah%d):(void*)0;})",t); return true; }
+        if (ml==4 && !memcmp(mn,"free",4) && node->call.arg_count>0) { emit(e,"_zer_slab_free(&"); emit_auto_slab_name(e,te); emit(e,","); BA(0); emit(e,")"); return true; }
+        if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) { emit(e,"_zer_slab_free_ptr(&"); emit_auto_slab_name(e,te); emit(e,",(void*)"); BA(0); emit(e,")"); return true; }
     }
     #undef BA
     return false;
@@ -9058,7 +9133,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             for (int i = 0; i < e->async_local_count; i++) {
                 if (e->async_local_lens[i] == (size_t)ilen &&
                     memcmp(e->async_locals[i], iname, ilen) == 0) {
-                    emit(e, "self->%.*s", (int)ilen, iname);
+                    emit(e, "_zer_self->%.*s", (int)ilen, iname);
                     return;
                 }
             }
@@ -9084,47 +9159,12 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                  * (same-named variables in different modules need correct prefix).
                  * This matches EMIT_MANGLED_NAME for the current module's own
                  * symbols, and symbol->module_prefix for cross-module calls. */
-                Symbol *sym = scope_lookup(e->checker->global_scope, iname, ilen);
-                /* BUG-1120: ONE rule for which module a non-local name belongs to.
-                 * If the current module registered it (its own global, function or
-                 * static all have the mangled key `<module>__<name>`), it is this
-                 * module's; otherwise it is whoever owns the raw entry. The old
-                 * split guessed: a FUNCTION always took the raw entry's module
-                 * (two modules each defining `bump()` made module b call module
-                 * a's), and a VARIABLE always took the current module (module b
-                 * reading module a's `shared_total` emitted an undeclared
-                 * `mb__shared_total`). */
-                if (e->current_module) {
-                    uint32_t mkl = e->current_module_len + 2 + ilen;
-                    char *mk = (char *)arena_alloc(e->arena, mkl + 1);
-                    if (mk) {
-                        memcpy(mk, e->current_module, e->current_module_len);
-                        mk[e->current_module_len] = '_';
-                        mk[e->current_module_len + 1] = '_';
-                        memcpy(mk + e->current_module_len + 2, iname, ilen);
-                        mk[mkl] = '\0';
-                        if (scope_lookup_local(e->checker->global_scope, mk, mkl)) {
-                            emit(e, "%.*s__%.*s",
-                                 (int)e->current_module_len, e->current_module,
-                                 (int)ilen, iname);
-                            return;
-                        }
-                    }
-                }
-                if (sym && sym->module_prefix) {
-                    emit(e, "%.*s__%.*s",
-                         (int)sym->module_prefix_len, sym->module_prefix,
-                         (int)ilen, iname);
-                    return;
-                }
-                /* No symbol found — if in a module context, assume
-                 * module-private (static) variable → use current_module prefix */
-                if (!sym && e->current_module) {
-                    emit(e, "%.*s__%.*s",
-                         (int)e->current_module_len, e->current_module,
-                         (int)ilen, iname);
-                    return;
-                }
+                /* BUG-1120 -> BUG-1450: ONE rule for which module a non-local
+                 * name belongs to — the shared resolver. Not an IR local, so a
+                 * name that resolves to nothing inside a module is its static. */
+                emit_decl_cname_in(e, e->current_module, e->current_module_len,
+                                   iname, ilen, true);
+                return;
             }
         }
         emit(e, "%.*s", (int)ilen, iname);
@@ -9395,7 +9435,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         if (node->field.object && node->field.object->kind == NODE_IDENT) {
             Type *ot = checker_get_type(e->checker, node->field.object);
             if (!ot) {
-                Symbol *sym = scope_lookup(e->checker->global_scope,
+                Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                     node->field.object->ident.name,
                     (uint32_t)node->field.object->ident.name_len);
                 if (sym) ot = sym->type;
@@ -9508,7 +9548,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 Type *inner_obj = checker_get_type(e->checker, inner->field.object);
                 if (!inner_obj && inner->field.object &&
                     inner->field.object->kind == NODE_IDENT) {
-                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                    Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                         inner->field.object->ident.name,
                         (uint32_t)inner->field.object->ident.name_len);
                     if (sym) inner_obj = sym->type;
@@ -10132,15 +10172,20 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
              * Thread handles are emitted as pthread_t — check checker_get_type. */
             if (node->call.callee->field.field_name_len == 4 &&
                 memcmp(node->call.callee->field.field_name, "join", 4) == 0) {
-                /* ThreadHandle — emit pthread_join directly */
-                emit(e, "pthread_join(");
-                emit_rewritten_node(e, node->call.callee->field.object, func);
-                emit(e, ", NULL)");
+                /* ThreadHandle — emit pthread_join directly. BUG-1452: the
+                 * handle is the `pthread_t <name>` the spawn emission declares
+                 * under its SOURCE name (it is not an IR local), so spell it
+                 * that way — through emit_rewritten_node a non-local ident in a
+                 * module is taken for a module static and prefixed (`xb__th`,
+                 * undeclared). */
+                emit(e, "pthread_join(%.*s, NULL)",
+                     (int)node->call.callee->field.object->ident.name_len,
+                     node->call.callee->field.object->ident.name);
                 return;
             }
             Type *ot = checker_get_type(e->checker, node->call.callee->field.object);
             if (!ot) {
-                Symbol *sym = scope_lookup(e->checker->global_scope,
+                Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                     node->call.callee->field.object->ident.name,
                     (uint32_t)node->call.callee->field.object->ident.name_len);
                 if (sym) ot = sym->type;
@@ -10199,7 +10244,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 TypeNode *ta = node->intrinsic.type_arg;
                 if (ta->kind == TYNODE_NAMED) {
                     /* Named type: look up in scope for C name */
-                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                    Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                         ta->named.name, (uint32_t)ta->named.name_len);
                     if (sym && sym->type) {
                         Type *te = type_unwrap_distinct(sym->type);
@@ -10238,7 +10283,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 /* @size(TypeName) — type name passed as ident arg */
                 const char *tn = node->intrinsic.args[0]->ident.name;
                 uint32_t tl = (uint32_t)node->intrinsic.args[0]->ident.name_len;
-                Symbol *sym = scope_lookup(e->checker->global_scope, tn, tl);
+                Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */ tn, tl);
                 if (sym && sym->type) {
                     Type *te = type_unwrap_distinct(sym->type);
                     if (te->kind == TYPE_STRUCT) {
@@ -13094,7 +13139,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * capture needs this). Must emit BEFORE "dst = " prefix. */
             if (dst_eff && dst_eff->kind == TYPE_ARRAY &&
                 src_eff && src_eff->kind == TYPE_ARRAY) {
-                const char *sp = func->is_async ? "self->" : "";
+                const char *sp = func->is_async ? "_zer_self->" : "";
                 emit_indent(e);
                 emit(e, "memcpy(%s%.*s, ", sp, (int)dest->name_len, dest->name);
                 emit_rewritten_node(e, inst->expr, func);
@@ -13104,7 +13149,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
 
             emit_indent(e);
             if (func->is_async) {
-                emit(e, "self->%.*s = ", (int)dest->name_len, dest->name);
+                emit(e, "_zer_self->%.*s = ", (int)dest->name_len, dest->name);
             } else {
                 emit(e, "%.*s = ", (int)dest->name_len, dest->name);
             }
@@ -13177,7 +13222,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 Type *ot = checker_get_type(e->checker, callee->field.object);
                 /* Fallback: look up in global scope (globals may not be in typemap) */
                 if (!ot) {
-                    Symbol *sym = scope_lookup(e->checker->global_scope,
+                    Symbol *sym = emit_decl_lookup(e, /* BUG-1450 */
                         callee->field.object->ident.name,
                         (uint32_t)callee->field.object->ident.name_len);
                     if (sym) ot = sym->type;
@@ -13451,7 +13496,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     type_dispatch_kind(asrc_eff) == TYPE_POINTER &&
                     asrc_eff->pointer.inner &&
                     type_dispatch_kind(asrc_eff->pointer.inner) == TYPE_VOID;
-                emit(e, "self->_zer_result = ");
+                emit(e, "_zer_self->_zer_result = ");
                 if (a_wrap && is_void_opt(aret_eff)) {
                     emit(e, "(_zer_opt_void){ %d }", a_null_src ? 0 : 1);
                 } else if (a_wrap && a_null_src) {
@@ -13469,7 +13514,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 }
                 emit(e, "; ");
             }
-            emit(e, "self->_zer_state = -1; return 1;\n");
+            emit(e, "_zer_self->_zer_state = -1; return 1;\n");
             break;
         }
 
@@ -13560,8 +13605,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 Type *bret = e->current_func_ret;
                 Type *bret_eff = bret ? type_unwrap_distinct(bret) : NULL;
                 if (bret_eff && is_void_opt(bret_eff))
-                    emit(e, "self->_zer_result = (_zer_opt_void){ 1 }; ");
-                emit(e, "self->_zer_state = -1; return 1;\n");
+                    emit(e, "_zer_self->_zer_result = (_zer_opt_void){ 1 }; ");
+                emit(e, "_zer_self->_zer_state = -1; return 1;\n");
             } else if (inst->expr) {
                 /* lower_expr returned -1 but expr was kept (array/void passthrough).
                  * Array→slice coercion at return site: emit slice wrapper. */
@@ -13632,7 +13677,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
     case IR_YIELD: {
         if (func->is_async) {
             emit_indent(e);
-            emit(e, "self->_zer_state = %d; return 0;\n", e->async_yield_id);
+            emit(e, "_zer_self->_zer_state = %d; return 0;\n", e->async_yield_id);
             emit_indent(e);
             emit(e, "case %d:;\n", e->async_yield_id);
             e->async_yield_id++;
@@ -13669,7 +13714,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             } else {
                 emit(e, "1"); /* shouldn't happen */
             }
-            emit(e, ")) { self->_zer_state = %d; return 0; }\n", e->async_yield_id);
+            emit(e, ")) { _zer_self->_zer_state = %d; return 0; }\n", e->async_yield_id);
             e->async_yield_id++;
             /* Same as yield — goto resume block */
             if (inst->goto_block >= 0) {
@@ -14084,13 +14129,13 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     e->indent++;
                     if (ac > 0) {
                         emit_indent(e);
-                        emit(e, "struct _zer_spawn_args_%d *_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
+                        emit(e, "struct _zer_spawn_args_%d *_zer_sa = malloc(sizeof(struct _zer_spawn_args_%d));\n", sid, sid);
                         /* Audit 2026-05-26: lock around shared-field reads in
                          * spawn arg expressions. Audit 2026-05-29: also coerce
                          * T → ?T per worker param signature (so `_sa->aN`
                          * matches the wrapper struct's field types which now
                          * follow the param types). */
-                        Symbol *worker_sym = scope_lookup(e->checker->global_scope,
+                        Symbol *worker_sym = emit_decl_lookup(e,   /* BUG-1450 */
                             sp->spawn_stmt.func_name,
                             (uint32_t)sp->spawn_stmt.func_name_len);
                         Type *worker_ft = NULL;
@@ -14106,7 +14151,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                 emit_shared_lock(e, sroot);
                             }
                             emit_indent(e);
-                            emit(e, "_sa->a%d = ", ai);
+                            emit(e, "_zer_sa->a%d = ", ai);
                             Type *pt = NULL;
                             if (worker_ft && (uint32_t)ai < worker_ft->func_ptr.param_count) {
                                 pt = type_unwrap_distinct(worker_ft->func_ptr.params[ai]);
@@ -14149,12 +14194,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                              (int)sp->spawn_stmt.handle_name_len, sp->spawn_stmt.handle_name, sid);
                     } else {
                         emit_indent(e);
-                        emit(e, "{ pthread_t _t; pthread_create(&_t, NULL, _zer_spawn_wrap_%d, ", sid);
+                        emit(e, "{ pthread_t _zer_t; pthread_create(&_zer_t, NULL, _zer_spawn_wrap_%d, ", sid);
                     }
-                    emit(e, "%s);\n", ac > 0 ? "(void*)_sa" : "NULL");
+                    emit(e, "%s);\n", ac > 0 ? "(void*)_zer_sa" : "NULL");
                     if (!is_scoped) {
                         emit_indent(e);
-                        emit(e, "pthread_detach(_t); }\n");
+                        emit(e, "pthread_detach(_zer_t); }\n");
                     }
                     e->indent--;
                     emit_indent(e);
@@ -14624,7 +14669,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                      dst_eff->pointer.inner &&
                                      type_equals(dst_eff->pointer.inner, src_pointee->optional.inner));
 
-            const char *sp = func->is_async ? "self->" : "";
+            const char *sp = func->is_async ? "_zer_self->" : "";
 
             /* Array→array copy: use memcpy (C can't assign arrays).
              * Handle BEFORE emitting "dst = " prefix. */
@@ -14714,7 +14759,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
             if (func->is_async)
-                emit(e, "self->%.*s = ", (int)dst->name_len, dst->name);
+                emit(e, "_zer_self->%.*s = ", (int)dst->name_len, dst->name);
             else
                 emit(e, "%.*s = ", (int)dst->name_len, dst->name);
             switch (inst->literal_kind) {
@@ -14800,7 +14845,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *s1 = &func->locals[inst->src1_local];
             IRLocal *s2 = &func->locals[inst->src2_local];
-            const char *sp = func->is_async ? "self->" : "";
+            const char *sp = func->is_async ? "_zer_self->" : "";
 
             /* Phase 3 fix #5: shift safety. ZER spec: shift by >= width = 0.
              * Use _zer_shl/_zer_shr macros (defined in preamble) instead of
@@ -14945,7 +14990,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * (~x) can leave bits above N set in the carrier. (! yields a bool;
              * deref/addr-of already jumped to unop_done.) */
             if (inst->op_token == TOK_MINUS || inst->op_token == TOK_TILDE) {
-                const char *usp = func->is_async ? "self->" : "";
+                const char *usp = func->is_async ? "_zer_self->" : "";
                 emit_intn_mask(e, &func->locals[inst->dest_local], usp);
             }
         }
@@ -15123,7 +15168,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * covers them, and it is the SAME emit_intn_mask that IR_BINOP and
              * IR_UNOP use rather than a new expression-position wrapper. */
             if (inst->dest_local >= 0) {
-                const char *csp = func->is_async ? "self->" : "";
+                const char *csp = func->is_async ? "_zer_self->" : "";
                 emit_intn_mask(e, &func->locals[inst->dest_local], csp);
             }
         }
@@ -15796,10 +15841,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 static void emit_async_state_struct(Emitter *e, IRFunc *func) {
     Node *fn = func->ast_node;
     if (!fn) return;
-    char mname[256];
-    int flen = snprintf(mname, sizeof(mname), "%.*s",
-        (int)func->name_len, func->name);
-    if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+    char mname[320];   /* BUG-1455: the module-qualified C base (async_cbase) */
+    int flen = async_cbase(mname, sizeof(mname), func->module_prefix,
+                           func->module_prefix_len, func->name, func->name_len);
     /* BUG-863: a value-returning async needs somewhere to PUT the value.
      * `async u32 compute() { … return 42; }` compiled clean and the state
      * machine finalized correctly, but the value landed in an internal temp
@@ -15818,7 +15862,7 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
      * emitted up front (emit_async_forward_typedefs), so a function declared
      * before this one can take a `*_zer_async_NAME` — the pointer is the only way
      * to hand a task around, since the value is not copyable. */
-    emit(e, "struct _zer_async_%.*s {\n", flen, mname);
+    emit(e, "struct %.*s {\n", flen, mname);
     emit(e, "    int _zer_state;\n");
     /* BUG-1407: set by _init only. A task is auto-zeroed, so a poll of a task
      * that was never _init'ed ran the body on ZERO parameters — a `*T` param
@@ -15846,7 +15890,7 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
     if (async_ret) {
         emit(e, "static inline ");
         emit_type(e, async_ret);
-        emit(e, " _zer_async_%.*s_result(_zer_async_%.*s *self) {\n",
+        emit(e, " %.*s_result(%.*s *_zer_self) {\n",
              flen, mname, flen, mname);
         /* BUG-1237: before done the field holds the zeroed initial value, which
          * for a non-null pointer is NULL and for an enum without a 0 variant is
@@ -15854,16 +15898,21 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
          * early was NULL, an `E{a=5,b=6}` result took an arm). Those two refuse
          * an early read; every other type keeps the documented zero. */
         if (checker_type_has_no_zero_value(async_ret))
-            emit(e, "    if (self->_zer_state != -1) _zer_trap(\"async result read before "
+            emit(e, "    if (_zer_self->_zer_state != -1) _zer_trap(\"async result read before "
                     "the task finished — its return type has no zero value\", "
                     "__FILE__, __LINE__);\n");
-        emit(e, "    return self->_zer_result;\n");
+        emit(e, "    return _zer_self->_zer_result;\n");
         emit(e, "}\n\n");
     }
 
     /* BUG-1238: prototypes, so a function emitted before the async one can
      * call _init / _poll (the definitions stay where the function is). */
-    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
+    /* BUG-1456: the task parameter is `_zer_self` (reserved), not `self`. As
+     * `self` it shadowed a user GLOBAL named `self` in every async body (the
+     * body is emitted inside _poll), so `out = self;` read the task pointer and
+     * `self = @ptrtoint(&victim)` retargeted every later spill into a
+     * user-chosen object. */
+    emit(e, "static inline void %.*s_init(%.*s *_zer_self",
          flen, mname, flen, mname);
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
@@ -15872,7 +15921,7 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
                            func->locals[li].name, func->locals[li].name_len);
     }
     emit(e, ");\n");
-    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self);\n\n",
+    emit(e, "static inline int %.*s_poll(%.*s *_zer_self);\n\n",
          flen, mname, flen, mname);
 }
 
@@ -15881,31 +15930,19 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     if (!fn) return;
 
     /* Build mangled name */
-    /* BUG-866: the async internal names are NOT module-mangled.
-     *
-     * They used to be — `_zer_async_lib1__acompute` for a coroutine in module
-     * `lib1` — while the CHECKER registers the state-struct type and the
-     * init/poll/result accessors under the UNMANGLED `_zer_async_acompute`
-     * (checker.c, the NODE_FUNC_DECL async arm). So a user of an imported async
-     * wrote exactly what the checker accepts, the emitter emitted it verbatim at
-     * the use site, and GCC found no such type or function: async across module
-     * boundaries did not compile at all, in any form, with the failure landing
-     * as a GCC error in generated code rather than a ZER diagnostic.
-     *
-     * Dropping the prefix here makes all five names agree — the type, _init,
-     * _poll, _result and the state struct — and it is the side that had to move:
-     * the checker's registration is what the user's source spells, and the
-     * accessor names are part of the documented API (reference.md "async").
-     *
-     * The cost is that two modules each defining an async function of the SAME
-     * name now collide, as a C redefinition error. That is loud, and it was
-     * already true of the state-struct TYPE name before this change (the
-     * checker registered it unmangled either way). Recorded in
-     * docs/limitations.md. */
-    char mname[256];
-    int flen = snprintf(mname, sizeof(mname), "%.*s",
-        (int)func->name_len, func->name);
-    if (flen >= (int)sizeof(mname)) flen = (int)sizeof(mname) - 1;
+    /* BUG-866 -> BUG-1455: the async internal names ARE module-qualified again,
+     * but now on BOTH sides. BUG-866 had dropped the prefix here because the
+     * checker registered the type and the _init/_poll/_result accessors
+     * unmangled, so an imported async did not compile at all; the cost it
+     * recorded — two modules' `async void tick()` colliding as one C name —
+     * came due (a redefinition, and module b's calls resolving to module a's
+     * task). The checker now gives the four names the function's module_prefix
+     * (and module_own for a shared name), calls spell it through the shared
+     * resolver, and the definitions spell it through async_cbase. The source
+     * spelling (`_zer_async_tick`) is unchanged. */
+    char mname[320];   /* BUG-1455: the module-qualified C base (async_cbase) */
+    int flen = async_cbase(mname, sizeof(mname), func->module_prefix,
+                           func->module_prefix_len, func->name, func->name_len);
 
     {
         bool early = false;
@@ -15919,7 +15956,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     if (async_ret && type_dispatch_kind(async_ret) == TYPE_VOID) async_ret = NULL;
 
     /* Init function */
-    emit(e, "static inline void _zer_async_%.*s_init(_zer_async_%.*s *self",
+    emit(e, "static inline void %.*s_init(%.*s *_zer_self",
          flen, mname, flen, mname);
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
@@ -15928,27 +15965,27 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
                            func->locals[li].name, func->locals[li].name_len);
     }
     emit(e, ") {\n");
-    emit(e, "    memset(self, 0, sizeof(*self));\n");
-    emit(e, "    self->_zer_inited = 1;\n");   /* BUG-1407 */
+    emit(e, "    memset(_zer_self, 0, sizeof(*_zer_self));\n");
+    emit(e, "    _zer_self->_zer_inited = 1;\n");   /* BUG-1407 */
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
         /* BUG-1239: an ARRAY param is copied by value into the task (it is a
          * pointer in the C init's parameter list); `self->a = a` is not C. */
         if (type_dispatch_kind(func->locals[li].type) == TYPE_ARRAY) {
-            emit(e, "    memcpy(self->%.*s, %.*s, sizeof(self->%.*s));\n",
+            emit(e, "    memcpy(_zer_self->%.*s, %.*s, sizeof(_zer_self->%.*s));\n",
                  (int)func->locals[li].name_len, func->locals[li].name,
                  (int)func->locals[li].name_len, func->locals[li].name,
                  (int)func->locals[li].name_len, func->locals[li].name);
             continue;
         }
-        emit(e, "    self->%.*s = %.*s;\n",
+        emit(e, "    _zer_self->%.*s = %.*s;\n",
              (int)func->locals[li].name_len, func->locals[li].name,
              (int)func->locals[li].name_len, func->locals[li].name);
     }
     emit(e, "}\n\n");
 
     /* Poll function = Duff's device */
-    emit(e, "static inline int _zer_async_%.*s_poll(_zer_async_%.*s *self) {\n",
+    emit(e, "static inline int %.*s_poll(%.*s *_zer_self) {\n",
          flen, mname, flen, mname);
 
     /* Emit static locals BEFORE the switch (C static, not in state struct) */
@@ -15978,9 +16015,9 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     emit_once_decls(e, func, "    ");
     if (e->source_file && func->ast_node)   /* BUG-1407: name the ZER declaration */
         emit(e, "#line %d \"%s\"\n", func->ast_node->loc.line, e->source_file);
-    emit(e, "    if (!self->_zer_inited) _zer_trap(\"async task '%.*s' polled before its _init\", __FILE__, __LINE__);\n",
-         flen, mname);   /* BUG-1407 */
-    emit(e, "    switch (self->_zer_state) { case 0:;\n");
+    emit(e, "    if (!_zer_self->_zer_inited) _zer_trap(\"async task '%.*s' polled before its _init\", __FILE__, __LINE__);\n",
+         (int)func->name_len, func->name);   /* BUG-1407 */
+    emit(e, "    switch (_zer_self->_zer_state) { case 0:;\n");
 
     e->indent = 1;
     e->async_yield_id = 1;
@@ -16033,7 +16070,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     e->ir_src_file = sv_ir_src;
     e->ir_last_line = sv_ir_last;
     e->current_func_ret = saved_ret;
-    emit(e, "    } self->_zer_state = -1; return 1;\n");
+    emit(e, "    } _zer_self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");
 
     /* Restore async context */

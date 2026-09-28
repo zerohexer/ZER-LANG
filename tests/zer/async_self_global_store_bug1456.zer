@@ -1,0 +1,21 @@
+// BUG-1456: a global named `self` written inside an async body. It was the
+// _poll parameter, so `self = @ptrtoint(&victim)` retargeted the task pointer
+// and the next promoted-local spill (`x = 0x41414141`) wrote into `victim`.
+struct V { u32[16] w; }
+V victim;
+u64 self;
+async void w() {
+    u32 x = 1;
+    self = @ptrtoint(&victim);
+    x = 0x41414141;
+    yield;
+    x += 1;
+}
+u32 main() {
+    _zer_async_w t;
+    _zer_async_w_init(&t);
+    _zer_async_w_poll(&t);
+    for (u32 i = 0; i < 16; i += 1) { if (victim.w[i] == 0x41414141) { return 42; } }
+    if (self != @ptrtoint(&victim)) { return 1; }
+    return 0;
+}

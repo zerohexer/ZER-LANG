@@ -1,0 +1,8 @@
+// BUG-1457: a `release` that FREES its argument.
+void release([*]u32 s) { free(s); }
+u32 m1457_fb() {
+    [*]u32 s = alloc(u32, 4) orelse return;
+    s[0] = 1;
+    release(s);
+    return 2;
+}

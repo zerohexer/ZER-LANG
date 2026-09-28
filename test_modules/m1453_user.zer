@@ -1,0 +1,17 @@
+// BUG-1453: alloc(T) in two imported modules. Pre-fix every auto-slab was
+// declared by the FIRST module emitted — before the second module's struct
+// existed (`sizeof` of an incomplete type) — alloc_ptr cast to the unmangled
+// `(struct M1453T*)`, and two modules' `struct Node` shared one slab name.
+import m1453_a;
+import m1453_b;
+struct Local { u32 k; }
+u32 main() {
+    if (m1453_fa() != 13) { return 1; }
+    if (m1453_fb() != 29) { return 2; }
+    *Local l = alloc(Local) orelse return;
+    l.k = 5;
+    u32 k = l.k;
+    free(l);
+    if (k != 5) { return 3; }
+    return 0;
+}

@@ -422,7 +422,8 @@ static bool call_bypasses_arg_lowering(LowerCtx *ctx, Node *expr) {
         expr->call.callee->field.object) {
         Type *ot = checker_get_type(ctx->checker, expr->call.callee->field.object);
         if (!ot && expr->call.callee->field.object->kind == NODE_IDENT) {
-            Symbol *s = scope_lookup(ctx->checker->global_scope,
+            Symbol *s = checker_module_decl_lookup(ctx->checker,   /* BUG-1450 */
+                ctx->func->module_prefix, ctx->func->module_prefix_len,
                 expr->call.callee->field.object->ident.name,
                 (uint32_t)expr->call.callee->field.object->ident.name_len);
             if (s) ot = s->type;
@@ -5192,6 +5193,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
  * ================================================================ */
 
 IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
+    return ir_lower_func_in(arena, checker_ptr, func_decl, NULL, 0);
+}
+
+IRFunc *ir_lower_func_in(Arena *arena, void *checker_ptr, Node *func_decl,
+                         const char *mod, uint32_t mod_len) {
     Checker *checker = (Checker *)checker_ptr;
     if (!func_decl || func_decl->kind != NODE_FUNC_DECL || !func_decl->func_decl.body)
         return NULL;
@@ -5209,6 +5215,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     func->is_async = func_decl->func_decl.is_async;
     func->is_naked = func_decl->func_decl.is_naked;
     func->ast_node = func_decl;
+    func->module_prefix = mod;          /* BUG-1450 */
+    func->module_prefix_len = mod_len;
 
     /* Initialize lowering context */
     LowerCtx ctx;
@@ -5267,8 +5275,8 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
                     pt = func_type->func_ptr.params[i];
                 } else {
                     /* Fallback: look up in scope */
-                    Symbol *psym = scope_lookup(checker->global_scope,
-                        p->name, (uint32_t)p->name_len);
+                    Symbol *psym = checker_module_decl_lookup(checker,   /* BUG-1450 */
+                        mod, mod_len, p->name, (uint32_t)p->name_len);
                     if (psym && psym->type) pt = psym->type;
                 }
                 break;

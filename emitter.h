@@ -38,6 +38,10 @@ typedef struct {
 typedef struct {
     int id;                 /* spawn_id for unique naming */
     Node *spawn_node;       /* the NODE_SPAWN for type info */
+    const char *module;     /* BUG-1450: module the spawn is written in (NULL = main) —
+                             * its target name resolves THERE, not in whatever module
+                             * is being emitted when the wrappers are written */
+    uint32_t module_len;
 } SpawnWrapper;
 
 typedef struct {
@@ -68,11 +72,20 @@ typedef struct {
     int spawn_wrapper_count;
     int spawn_wrapper_capacity;
     int next_spawn_id;      /* counter for unique spawn wrapper IDs */
+    int spawn_wrappers_emitted; /* BUG-1451: the list is ONE list for the whole
+                             * build (the ids are build-unique), and it was re-emitted
+                             * in full by every module — `redefinition of struct
+                             * _zer_spawn_args_0`. Each module writes only the ones
+                             * registered since the last write. */
 
     /* BUG-867: container_instances[] is ONE list on the Checker, shared by every
      * module in the build, so emitting it per-module produced a duplicate
      * `struct Box_u32 { … }` and GCC refused the file. Emit it once. */
     bool container_structs_emitted;
+    /* BUG-1453: which of the checker's auto-slabs are already declared — each
+     * is declared by the module that declares its struct. */
+    bool *auto_slab_done;
+    int auto_slab_done_cap;
 
     /* async function emission state */
     bool in_async;              /* true when emitting inside an async function body */

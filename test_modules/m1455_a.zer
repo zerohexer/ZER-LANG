@@ -1,0 +1,8 @@
+u32 m1455_ca;
+async void tick() { m1455_ca += 1; yield; m1455_ca += 1; }
+u32 m1455_fa() {
+    _zer_async_tick t;
+    _zer_async_tick_init(&t);
+    while (_zer_async_tick_poll(&t) == 0) { }
+    return m1455_ca;
+}

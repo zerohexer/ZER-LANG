@@ -92,6 +92,12 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
 - **BUG-1435 — a FIELD divisor with no range key (`s[k].d`) was accepted with no proof at
   all**, in `/` and in `/=`. Now "complex divisor expression not proven nonzero". Tests:
   two `tests/zer_fail/*_bug1435.zer`.
+- **BUG-1406 — `@bitcast` skipped its width check when either size was unknown.**
+  `compute_type_size` fails for an Arena / Barrier / Semaphore / async task, the check
+  was written `if (tw > 0 && vw > 0 && ...)`, so it passed: `Big b = @bitcast(Big, ar);`
+  memcpy'd 512 bytes out of the arena object (ASan stack-buffer-overflow), and a 48-byte
+  struct out of a 40-byte task. An unknown width now rounds toward reject. Corpus cost:
+  zero. Tests: `tests/zer_fail/bitcast_unknown_width_{arena,task}_bug1406.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

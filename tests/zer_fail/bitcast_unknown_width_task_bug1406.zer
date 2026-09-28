@@ -1,0 +1,10 @@
+// BUG-1406: the async-task source of the same fail-open width check.
+// expect-error: @bitcast needs both sizes known at compile time
+async u32 cu(u32 s) { u32 x = s; *u32 p = &x; yield; *p += 1; return x; }
+struct Blob { u64[6] w; }
+u32 main() {
+    _zer_async_cu a;
+    _zer_async_cu_init(&a, 5);
+    Blob b = @bitcast(Blob, a);
+    return 0;
+}

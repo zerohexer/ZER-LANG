@@ -15695,6 +15695,11 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
      * to hand a task around, since the value is not copyable. */
     emit(e, "struct _zer_async_%.*s {\n", flen, mname);
     emit(e, "    int _zer_state;\n");
+    /* BUG-1407: set by _init only. A task is auto-zeroed, so a poll of a task
+     * that was never _init'ed ran the body on ZERO parameters — a `*T` param
+     * NULL (a silent store to address 0 on bare metal), an enum param holding
+     * no variant (0 took the last switch arm). The poll traps instead. */
+    emit(e, "    uint8_t _zer_inited;\n");
     if (async_ret) {
         emit(e, "    ");
         emit_type_and_name(e, async_ret, "_zer_result", 11);
@@ -15799,6 +15804,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     }
     emit(e, ") {\n");
     emit(e, "    memset(self, 0, sizeof(*self));\n");
+    emit(e, "    self->_zer_inited = 1;\n");   /* BUG-1407 */
     for (int li = 0; li < func->local_count; li++) {
         if (!func->locals[li].is_param) continue;
         /* BUG-1239: an ARRAY param is copied by value into the task (it is a
@@ -15845,6 +15851,10 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
      * @once's "once per program". Missing here, a @once in an async body was an
      * undeclared identifier at GCC. */
     emit_once_decls(e, func, "    ");
+    if (e->source_file && func->ast_node)   /* BUG-1407: name the ZER declaration */
+        emit(e, "#line %d \"%s\"\n", func->ast_node->loc.line, e->source_file);
+    emit(e, "    if (!self->_zer_inited) _zer_trap(\"async task '%.*s' polled before its _init\", __FILE__, __LINE__);\n",
+         flen, mname);   /* BUG-1407 */
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;

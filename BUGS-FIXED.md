@@ -98,6 +98,15 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   memcpy'd 512 bytes out of the arena object (ASan stack-buffer-overflow), and a 48-byte
   struct out of a 40-byte task. An unknown width now rounds toward reject. Corpus cost:
   zero. Tests: `tests/zer_fail/bitcast_unknown_width_{arena,task}_bug1406.zer`.
+- **BUG-1407 — polling an async task that was never `_init`ed ran its body on ZERO
+  parameters.** A task is auto-zeroed, so `_zer_async_run t; _zer_async_run_poll(&t);`
+  ran `run(Mode m)` with `m == 0` — no variant, and the exhaustive switch's last-arm
+  `else` took `.fast`; a `*T` parameter was NULL (hosted: caught by the SIGSEGV handler;
+  bare metal: a silent store to address 0). The task struct now carries `_zer_inited`,
+  set by `_init` only, and the poll traps without it (naming the task and its ZER
+  declaration line). A runtime check rather than a use-before-init rule because tasks live
+  in arrays, struct fields and behind pointers, which a flow rule would have to follow.
+  Test: `tests/zer_trap/async_poll_before_init_bug1407.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

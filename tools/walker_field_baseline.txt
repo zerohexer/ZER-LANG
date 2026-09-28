@@ -392,15 +392,25 @@ checker.c:validate_gotos:NODE_UNARY:unary.operand
 checker.c:validate_gotos:NODE_VAR_DECL:var_decl.init
 checker.c:validate_gotos:NODE_WHILE:while_stmt.cond
 
+# --- checker.c: vrp_widen_loop_addr_taken ---
+# BUG-1500 converted it to a switch. asm is legal only in a naked function (asm +
+# return only: no loop or label surrounds it); declarations never occur in a body;
+# a static_assert condition is a compile-time constant with no `&` effect.
+checker.c:vrp_widen_loop_addr_taken:NODE_ASM:asm_stmt.inputs
+checker.c:vrp_widen_loop_addr_taken:NODE_ASM:asm_stmt.outputs
+checker.c:vrp_widen_loop_addr_taken:NODE_FILE:file.decls
+checker.c:vrp_widen_loop_addr_taken:NODE_FUNC_DECL:func_decl.body
+checker.c:vrp_widen_loop_addr_taken:NODE_GLOBAL_VAR:var_decl.init
+checker.c:vrp_widen_loop_addr_taken:NODE_INTERRUPT:interrupt.body
+checker.c:vrp_widen_loop_addr_taken:NODE_STATIC_ASSERT:static_assert_stmt.cond
+
 # --- checker.c: vrp_invalidate_loop_body_writes ---
 checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.inputs
 checker.c:vrp_invalidate_loop_body_writes:NODE_ASM:asm_stmt.outputs
-checker.c:vrp_invalidate_loop_body_writes:NODE_AWAIT:await_stmt.cond
 checker.c:vrp_invalidate_loop_body_writes:NODE_FILE:file.decls
 checker.c:vrp_invalidate_loop_body_writes:NODE_FUNC_DECL:func_decl.body
 checker.c:vrp_invalidate_loop_body_writes:NODE_GLOBAL_VAR:var_decl.init
 checker.c:vrp_invalidate_loop_body_writes:NODE_INTERRUPT:interrupt.body
-checker.c:vrp_invalidate_loop_body_writes:NODE_SPAWN:spawn_stmt.args
 checker.c:vrp_invalidate_loop_body_writes:NODE_STATIC_ASSERT:static_assert_stmt.cond
 
 

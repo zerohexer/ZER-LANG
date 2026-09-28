@@ -214,11 +214,23 @@ typedef enum {
     VF_COND_AND,           /* `if (f() && (i = 1) == 1) {} arr[i]` with f() false */
     VF_COND_ORELSE,        /* `u32 v = mb() orelse (i = 1); arr[i]` */
     VF_COND_SUMMARY,       /* the joined value as a return range */
+    /* ---- UNSEEN WRITE (BUG-1499..1503): a write the loop / label / async
+     *      pre-pass did not reach ---- */
+    VF_LABEL_ADDR_LATE,    /* backward goto; `p = &i` formed AFTER the label */
+    VF_LOOP_SPAWN_ADDR,    /* `spawn w(&i)` in a loop body */
+    VF_LOOP_SPAWN_ASSIGN,  /* `spawn w(i = 4)` in a loop body */
+    VF_LOOP_AWAIT_ADDR,    /* `await bump(&i)` in an async loop body */
+    VF_LOOP_AWAIT_ASSIGN,  /* `await ((i = 4) > 0)` in an async loop body */
+    VF_ASYNC_REENTER,      /* a callee re-polls the SAME task, which writes the frame local */
+    VF_ASYNC_REENTER_HOIST,/* same, the call in the SAME statement as the access (hoisted guard) */
 
     /* ---- PROVEN: precision the same fixes bought ---- */
     VF_OK_RANGE_FOR,       /* for-in over a fixed array: bound is the array size */
     VF_OK_CONST_BOUND,     /* `for (i < N)` with `const u32 N` */
     VF_OK_TYPED_CONST,     /* `u32 i = (0 - 1) / 1073741824;` is 3 — in range of u32[4] */
+    VF_OK_LOOP_ADDR_OTHER, /* a loop takes `&j` (spawn arg): `arr[i]` stays proven */
+    VF_OK_LABEL_ADDR_OTHER,/* a label function aims p at j, not i: `arr[i]` stays proven */
+    VF_OK_ASYNC_NO_CALL,   /* async frame local with no call before the access */
     VFSCEN_COUNT
 } VFScenario;
 
@@ -241,8 +253,12 @@ static int scenario_is_catch(VFScenario s) {
     case VF_DEFER_CAPTURE: case VF_DEFER_CRITICAL: case VF_DEFER_GLOBAL:
     case VF_DEFER_CALL_GLOBAL: case VF_DEFER_LOOP_BOUND: case VF_DEFER_SUMMARY:
     case VF_COND_OR: case VF_COND_AND: case VF_COND_ORELSE: case VF_COND_SUMMARY:
+    case VF_LABEL_ADDR_LATE: case VF_LOOP_SPAWN_ADDR: case VF_LOOP_SPAWN_ASSIGN:
+    case VF_LOOP_AWAIT_ADDR: case VF_LOOP_AWAIT_ASSIGN: case VF_ASYNC_REENTER:
+    case VF_ASYNC_REENTER_HOIST:
         return 1;
     case VF_OK_RANGE_FOR: case VF_OK_CONST_BOUND: case VF_OK_TYPED_CONST:
+    case VF_OK_LOOP_ADDR_OTHER: case VF_OK_LABEL_ADDR_OTHER: case VF_OK_ASYNC_NO_CALL:
         return 0;
     case VFSCEN_COUNT: break;
     }
@@ -301,6 +317,16 @@ static const char *scen_name(VFScenario s) {
     case VF_DEFER_CALL_GLOBAL:   return "defer/calls-global-writer";
     case VF_DEFER_LOOP_BOUND:    return "defer/rewrites-loop-bound";
     case VF_DEFER_SUMMARY:       return "defer/return-summary";
+    case VF_LABEL_ADDR_LATE:     return "unseen/label-&i-after-label";
+    case VF_LOOP_SPAWN_ADDR:     return "unseen/loop-spawn-&i";
+    case VF_LOOP_SPAWN_ASSIGN:   return "unseen/loop-spawn-arg-assign";
+    case VF_LOOP_AWAIT_ADDR:     return "unseen/loop-await-&i";
+    case VF_LOOP_AWAIT_ASSIGN:   return "unseen/loop-await-cond-assign";
+    case VF_ASYNC_REENTER:       return "unseen/async-reentrant-poll";
+    case VF_ASYNC_REENTER_HOIST: return "unseen/async-reentrant-poll-hoist";
+    case VF_OK_LOOP_ADDR_OTHER:  return "proven/loop-&other";
+    case VF_OK_LABEL_ADDR_OTHER: return "proven/label-&other";
+    case VF_OK_ASYNC_NO_CALL:    return "proven/async-no-call";
     case VF_OK_RANGE_FOR:        return "proven/for-in-over-array";
     case VF_OK_CONST_BOUND:      return "proven/const-loop-bound";
     case VF_OK_TYPED_CONST:      return "proven/typed-constant";
@@ -671,6 +697,169 @@ static void gen(VFScenario s, char *buf, size_t n) {
     case VF_DEFER_SUMMARY:
         snprintf(buf, n, "%s", PRE
             "u32 pick() {\n    u32 i = get(1);\n    if (i < 4) { { defer i = 4; } return i; }\n    return 0;\n}\nu32 main() { arr[pick()] = 7; return 42; }\n");
+        break;
+    case VF_LABEL_ADDR_LATE:
+        snprintf(buf, n, "%s", PRE
+            "u32 g;\n"
+            "u32 main() {\n"
+            "    u32 i = 1;\n"
+            "    u32 k = 0;\n"
+            "    *u32 p = &g;\n"
+            "top:\n"
+            "    k += 1;\n"
+            "    if (i < 4) { *p = 4; arr[i] = 7; if (k == 2) { return 42; } }\n"
+            "    p = &i;\n"
+            "    if (k < 2) { goto top; }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_LOOP_SPAWN_ADDR:
+        snprintf(buf, n, "%s", PRE
+            "void w(*u32 q) { *q = 4; }\n"
+            "u32 main() {\n"
+            "    u32 i = 1;\n"
+            "    for (u32 k = 0; k < 2; k += 1) {\n"
+            "        arr[i] = 7;\n"
+            "        if (k == 1) { return 42; }\n"
+            "        ThreadHandle th = spawn w(&i);\n"
+            "        th.join();\n"
+            "    }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_LOOP_SPAWN_ASSIGN:
+        snprintf(buf, n, "%s", PRE
+            "void w(u32 q) { }\n"
+            "u32 main() {\n"
+            "    u32 i = 1;\n"
+            "    for (u32 k = 0; k < 2; k += 1) {\n"
+            "        arr[i] = 7;\n"
+            "        if (k == 1) { return 42; }\n"
+            "        ThreadHandle th = spawn w(i = 4);\n"
+            "        th.join();\n"
+            "    }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_LOOP_AWAIT_ADDR:
+        snprintf(buf, n, "%s", PRE
+            "u32 hit = 0;\n"
+            "bool bump(*u32 q) { *q = 4; return true; }\n"
+            "async void t() {\n"
+            "    u32 i = 1;\n"
+            "    for (u32 k = 0; k < 2; k += 1) {\n"
+            "        arr[i] = 7;\n"
+            "        if (k == 1) { hit = 1; }\n"
+            "        await bump(&i);\n"
+            "    }\n"
+            "}\n"
+            "u32 main() {\n"
+            "    _zer_async_t task;\n"
+            "    _zer_async_t_init(&task);\n"
+            "    for (u32 r = 0; r < 4; r += 1) { _zer_async_t_poll(&task); }\n"
+            "    if (hit == 1) { return 42; }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_LOOP_AWAIT_ASSIGN:
+        snprintf(buf, n, "%s", PRE
+            "u32 hit = 0;\n"
+            "async void t() {\n"
+            "    u32 i = 1;\n"
+            "    for (u32 k = 0; k < 2; k += 1) {\n"
+            "        arr[i] = 7;\n"
+            "        if (k == 1) { hit = 1; }\n"
+            "        await ((i = 4) > 0);\n"
+            "    }\n"
+            "}\n"
+            "u32 main() {\n"
+            "    _zer_async_t task;\n"
+            "    _zer_async_t_init(&task);\n"
+            "    for (u32 r = 0; r < 4; r += 1) { _zer_async_t_poll(&task); }\n"
+            "    if (hit == 1) { return 42; }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_ASYNC_REENTER:
+        snprintf(buf, n, "%s", PRE
+            "u32 depth;\n"
+            "u32 hit;\n"
+            "void reenter();\n"
+            "async void t() {\n"
+            "    u32 i = 1;\n"
+            "    yield;\n"
+            "    if (depth == 0) { depth = 1; reenter(); arr[i] = 7; hit = 1; }\n"
+            "    else { i = 4; }\n"
+            "}\n"
+            "_zer_async_t T;\n"
+            "void reenter() { _zer_async_t_poll(&T); }\n"
+            "u32 main() {\n"
+            "    _zer_async_t_init(&T);\n"
+            "    _zer_async_t_poll(&T);\n"
+            "    _zer_async_t_poll(&T);\n"
+            "    if (hit == 1) { return 42; }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_ASYNC_REENTER_HOIST:
+        snprintf(buf, n, "%s", PRE
+            "u32 depth;\n"
+            "u32 hit;\n"
+            "u32 f();\n"
+            "async void t() {\n"
+            "    u32 i = get(1);\n"
+            "    yield;\n"
+            "    if (depth == 0) { depth = 1; u32 v = f() + arr[i]; hit = 1; }\n"
+            "    else { i = 4; }\n"
+            "}\n"
+            "_zer_async_t T;\n"
+            "u32 f() { _zer_async_t_poll(&T); return 0; }\n"
+            "u32 main() {\n"
+            "    _zer_async_t_init(&T);\n"
+            "    _zer_async_t_poll(&T);\n"
+            "    _zer_async_t_poll(&T);\n"
+            "    if (hit == 1) { return 42; }\n"
+            "    return 0;\n}\n");
+        break;
+    case VF_OK_LOOP_ADDR_OTHER:
+        snprintf(buf, n, "%s",
+            "u32[4] a;\n"
+            "void w(*u32 q) { *q = 4; }\n"
+            "u32 main() {\n"
+            "    u32 i = 1;\n"
+            "    u32 j = 0;\n"
+            "    for (u32 k = 0; k < 2; k += 1) {\n"
+            "        a[i] = 7;\n"
+            "        ThreadHandle th = spawn w(&j);\n"
+            "        th.join();\n"
+            "    }\n"
+            "    return a[1];\n}\n");
+        break;
+    case VF_OK_LABEL_ADDR_OTHER:
+        snprintf(buf, n, "%s",
+            "u32[4] a;\n"
+            "u32 g;\n"
+            "u32 main() {\n"
+            "    u32 i = 1;\n"
+            "    u32 j = 0;\n"
+            "    u32 k = 0;\n"
+            "    *u32 p = &g;\n"
+            "top:\n"
+            "    k += 1;\n"
+            "    if (i < 4) { *p = 4; a[i] = 7; }\n"
+            "    p = &j;\n"
+            "    if (k < 2) { goto top; }\n"
+            "    return a[1];\n}\n");
+        break;
+    case VF_OK_ASYNC_NO_CALL:
+        snprintf(buf, n, "%s",
+            "u32[4] a;\n"
+            "async void t() {\n"
+            "    u32 i = 1;\n"
+            "    yield;\n"
+            "    i = 2;\n"
+            "    a[i] = 7;\n"
+            "}\n"
+            "u32 main() {\n"
+            "    _zer_async_t task;\n"
+            "    _zer_async_t_init(&task);\n"
+            "    _zer_async_t_poll(&task);\n"
+            "    _zer_async_t_poll(&task);\n"
+            "    return a[2];\n}\n");
         break;
     case VF_OK_RANGE_FOR:
         snprintf(buf, n, "%s",

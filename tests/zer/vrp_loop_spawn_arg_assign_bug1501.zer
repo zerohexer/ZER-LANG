@@ -1,0 +1,15 @@
+// BUG-1501: `spawn w(i = 4)` — an assignment inside a spawn ARGUMENT of a loop
+// body is a loop-carried write of i.
+u32[4] arr;
+u32[64] pad;
+void w(u32 q) { }
+u32 main() {
+    u32 i = 1;
+    for (u32 k = 0; k < 2; k += 1) {
+        arr[i] = 7;
+        if (k == 1) { return 42; }
+        ThreadHandle th = spawn w(i = 4);
+        th.join();
+    }
+    return 0;
+}

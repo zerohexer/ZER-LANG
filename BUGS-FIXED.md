@@ -416,6 +416,29 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   `cond/store-in-orelse-value`, `cond/store-then-return-summary` (all four SILENT HOLES
   against the pre-fix build); sink matrix `p61_cond_{or_rhs_global,and_rhs_return}` +
   boundary `p61_safe_cond_or_rhs`; `tests/zer_fail/escape_store_in_or_rhs_bug1498.zer`.
+- **BUG-1499 — a backward goto whose target block takes `&i` AFTER the label kept the
+  range of `i` proven.** The NODE_LABEL widening had no address-taken pre-pass (loops have
+  `vrp_widen_loop_addr_taken`), so `top: ... arr[i] = 1; ... p = &i; goto top;` proved
+  `arr[i]` against the pre-label range while `*p = 9` changed `i` on the second pass. The
+  label now runs the SAME pre-pass over the whole function body (any goto can reach it).
+- **BUG-1500/1501 — the loop invalidation pre-passes did not look inside a SPAWN argument
+  or an AWAIT condition.** `vrp_widen_loop_addr_taken` was an if-chain that listed spawn
+  and await as leaves, so `spawn w(&i)` / `await bump(&i)` in a loop body left `i` proven;
+  `vrp_invalidate_loop_body_writes` likewise missed `spawn w(i = 9)` / `await ((i = 9) > 0)`.
+  The first is now an exhaustive switch (no `default:`, under `-Werror=switch` and the
+  walker-fields audit); the second descends both positions (two baseline rows that hid the
+  gap removed).
+- **BUG-1503 — a re-entrant `_poll` rewrote frame locals across a call.** Inside an async
+  body a callee can poll the SAME task, which re-runs the body from its saved state and
+  writes its frame locals, so a range held across ANY call was stale (`reenter(); arr[i] = 1;`
+  with the other arm writing `i = 9`). `vrp_widen_call_effects` widens every frame-local
+  range at a call inside an async body (not at yield/await — a poller cannot name a frame
+  field, and `&local` already drops the range). Sibling: `vrp_guard_hoist_sound` treated
+  frame locals as unreachable by calls, so `u32 v = f() + arr[i];` hoisted the guard before
+  the call; it now treats every local as call-reachable in an async body. Corpus cost zero.
+- Tests (BUG-1499..1503): vrp-fact matrix — 7 catch cells (all SILENT HOLES on the pre-fix
+  build) + 3 cells that must stay proven; `tests/zer/vrp_*_bug{1499,1500,1501,1503}.zer`;
+  `tests/zer_trap/vrp_async_reentrant_hoist_bug1503.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

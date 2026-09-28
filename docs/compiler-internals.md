@@ -13846,6 +13846,42 @@ verdict; `compile` cells still build a real binary.
 - **A store into an OWNED object is not an escape** (BUG-1365): `ir_target_root_escapes`
   exempts a non-param pointer local holding a live, owned, non-arena allocation.
 
+## The escape fixpoint — POSITION of a taint vs position of a sink (BUG-1402, 2026-09-28)
+
+The escape flags (`is_local_derived`, `is_arena_derived`, `is_from_arena`,
+`is_nonkeep_derived` + `nonkeep_root_mask`, `is_keep_derived`) are MAY facts written by
+ONE statement-order walk; every sink reads them where it stands in the TEXT. That is
+exact for straight-line code and wrong wherever control reaches a sink from a point
+later in the text: a loop's back edge, any `goto`, and a `defer` body (checked at
+registration, run at every exit). The join lives in `check_func_body` (checker.c,
+"ESCAPE FIXPOINT"):
+
+- `check_stmt` / `check_expr` are thin wrappers over `check_stmt_impl` /
+  `check_expr_impl`. While `c->esc->active`, the statement wrapper handles a LOOP
+  (`esc_check_loop`: OR in the facts recorded for this loop node, check, record what each
+  OUTER variable gained), a VAR_DECL (note the "ever" fact; in a label function also OR it
+  in), and a DEFER (check the body under every visible variable's "ever" fact, then put
+  the flags back). The expression wrapper notes the target root of every assignment and
+  raises `event` when flags were ADDED in a label function or after a `defer`.
+- Facts are keyed by `(loop node or NULL, Symbol.name)` — the name pointer points into
+  the declaration's source text, so it identifies the declaration across walks.
+- `check_func_body` does the real walk; only if `event` is set does it restore the
+  checker to the function entry (`esc_restore`), re-walk QUIETLY until the facts stop
+  growing (≤ 16 rounds), restore, and walk once more for real with the first walk's
+  diagnostics deduplicated (`dedupe_from/to`, checked in `checker_error/warning`).
+- `esc_restore` rolls back everything the walk observed (all scalars and table COUNTS)
+  and keeps what it may have CREATED or reallocated: the typemap, diagnostics and error
+  counts, container stamps / templates, auto-slabs, `next_type_id`, the hoist journal, the
+  shared-type cache, and the pointer + capacity of every realloc'd table (a stale pointer
+  would be freed memory). **A new realloc'd table in `Checker`, or a new kind of
+  DEFINITION a body walk can create, must be added to `esc_restore`** — otherwise a
+  re-walk either reads freed memory or creates the definition twice.
+- A label function is flow-INSENSITIVE for these flags: sticky (no BUG-1274 clear) and
+  every declaration starts with its "ever" fact.
+
+Gate: SHAPE p61 in `tools/sink_matrix.sh`. Precision residue: docs/limitations.md
+"residuals of the 2026-09-28 escape fixpoint".
+
 ## Escape & keep analysis — architecture + the call-launder bug class (READ before touching it)
 
 ZER has **no lifetime annotations**; pointer/slice dangling-prevention is dataflow

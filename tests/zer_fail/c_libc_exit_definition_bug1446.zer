@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: function name 'exit' is a C library function
+// BUG-1446: compiled and silently replaced libc exit().
+void exit(i32 c) { }
+u32 main() { return 0; }

@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: cannot return pointer to local 'm'
+// BUG-1444 boundary: a local array into a SLICE field IS a view of the stack —
+// still refused, in a struct that also has an array field.
+struct M { u32[3] a; [*]u32 view; }
+M mk() {
+    u32[3] a;
+    M m;
+    m.view = a;
+    return m;
+}
+u32 main() { M m = mk(); return (u32)m.view.len - 3; }

@@ -1,0 +1,10 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a bool that is neither true nor false
+// BUG-1448: the AST emitter path (defer body of a function with a label).
+u32 gr = 0;
+u32 main() {
+    defer { u8 x = 2; bool b = @bitcast(bool, x); if (b != true) { if (b != false) { gr = 5; } } }
+    goto done;
+done:
+    return gr;
+}

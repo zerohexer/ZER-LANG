@@ -221,8 +221,12 @@ u32 main() {
 ```
 
   `(bool)n` is emitted as `!!n`, so a cast can never produce a bool holding a
-  value outside {0, 1} — the exhaustive `switch` on a bool stays sound, and
-  there is no bool analogue of the enum-forging doors.
+  value outside {0, 1} — the exhaustive `switch` on a bool stays sound.
+  `@bitcast` is the one bit-level door into a bool (`@truncate` / `@saturate`
+  refuse a bool target), and it is GUARDED like the enum doors (BUG-1448):
+  `@bitcast(bool, (u8)2)` — or a bool field of a struct / container / packed
+  overlay, or an optional's presence byte, reached by a `@bitcast` — traps at the
+  point of forgery with `@bitcast produced a bool that is neither true nor false`.
 
 ---
 
@@ -929,6 +933,10 @@ enum Direction { left = -1, center = 0, right = 1 }
   `(i32)State.done`. There is no implicit enum→int (`u32 v = e;` is an error)
   and no int→enum cast at all — use `@try_enum` (checked, returns `?E`) or
   `@bitcast` (traps on a non-variant).
+- Every variant must have a DISTINCT value (BUG-1440): `enum Cmd { start = 1, stop, reset = 2 }`
+  is a compile error because `stop` is implicitly 2. C allows such aliases; ZER cannot,
+  because a switch and `@try_enum` identify a variant by its value. A value must also fit
+  `i32` — a literal above `i32` range is rejected, including one above 2^63 (BUG-1441).
 - Enums compare with `==` / `!=` against a variant.
 - Dot syntax required: `State.idle`, not bare `idle`.
 - Switch arms use `.variant => { }` syntax.
@@ -4543,7 +4551,26 @@ There are exactly **three** doors, and each carries the guard:
 
 `@cast` is **not** a fourth door: it requires a distinct typedef and cannot name a bare
 enum. The guard also recurses through struct fields, optional payloads and array elements,
-so `@bitcast(Box, 7)` where `struct Box { State s; }` is checked too.
+so `@bitcast(Box, 7)` where `struct Box { State s; }` is checked too — at ANY nesting depth
+and for an array of ANY length (checked by a run-time loop; BUG-1449 — the walk used to stop
+at 8 structs deep and skip arrays over 4096 elements).
+
+The same `@bitcast` guard covers a **bool** (a byte other than 0 / 1) and the presence byte
+of a value optional (`?T`), wherever they sit in the target (BUG-1448):
+
+```zer
+struct Flags { bool on; u8 pad; u16 rest; }
+
+u32 main() {
+    u32 w = 1;
+    Flags f = @bitcast(Flags, w);   // byte 0 is 1 — a real `true`, no trap
+    if (!f.on) { return 1; }
+    return 0;
+}
+```
+
+`@bitcast(Flags, (u32)2)` compiles and traps with
+`@bitcast produced a bool that is neither true nor false`.
 
 ```zer
 enum State { idle, running, done }
@@ -5021,6 +5048,17 @@ u32 main() {
   declare the wrapper — or use ZER's own `alloc` / `free` instead of `malloc`.
 - C macros (stderr, stdout, etc.) are NOT accessible. Wrap in a C helper function.
 - `_zer_` prefix is reserved — name helpers `zer_get_stderr`, not `_zer_stderr`.
+- Names are emitted into C verbatim, so a name C cannot carry is refused (BUG-1446):
+  a C keyword (`int`, `char`, `long`, `register`, `sizeof`, …) anywhere; a macro of
+  the headers the generated code includes (`NULL`, `EOF`, `stdin`, `UINT32_MAX`,
+  `SIGSEGV`, `PTHREAD_*`, …) anywhere, fields included; a C type name (`FILE`,
+  `size_t`, any `*_t`) and C's reserved namespace (`__x`, `_X`) for anything but a
+  field; and a C library function name (`memcpy`, `abort`, `exit`, `sched_yield`,
+  `pthread_*`, …) for a DEFINITION — a function with a body or a global, which
+  would replace the C function the runtime calls. A bodyless declaration of the C
+  function itself (`i32 printf(const *u8 fmt, ...);`, `i32 abs(i32 x);`) is
+  exactly how interop works and stays allowed, as does a local or parameter named
+  like a libc function the function body does not call (`u32 time`, `u32 div`).
 
 ### Variadic `...` — and how to print
 
@@ -6758,6 +6796,53 @@ u32 main() {
     _zer_async_count_up t2 = t;   // COMPILE ERROR — t2.p would still point into t
     return 0;
 }
+```
+
+**PARAMETERS ARE STORED IN THE TASK — AND AN ARRAY PARAMETER IS REFUSED**
+
+`_init` stores every argument in the task, because the body runs later, from `_poll`. A
+pointer or slice argument therefore has to outlive the task (the checker treats it like a
+`keep` parameter). A bare ARRAY parameter is a compile error (BUG-1447): in a plain function
+`u32[4] a` is the caller's array, while a task could only hold a COPY, so the same spelling
+would silently mean two different things. Say which one you mean — a slice to share the
+caller's array, a struct wrapping the array to copy it:
+
+```zer
+struct Four { u32[4] v; }
+
+async void fill([*]u32 a) {       // shares the caller's array
+    a[0] = 5;
+    yield;
+    a[1] = 6;
+}
+
+async u32 second(Four f) {        // a private copy, taken at _init
+    yield;
+    return f.v[1];
+}
+
+u32 main() {
+    u32[4] y;
+    _zer_async_fill t;
+    _zer_async_fill_init(&t, y);
+    while (_zer_async_fill_poll(&t) == 0) { }
+    if (y[0] != 5 || y[1] != 6) { return 1; }
+
+    Four w;
+    w.v[1] = 7;
+    _zer_async_second s;
+    _zer_async_second_init(&s, w);
+    w.v[1] = 9;                   // the task already holds its own copy
+    while (_zer_async_second_poll(&s) == 0) { }
+    if (_zer_async_second_result(&s) != 7) { return 2; }
+    return 0;
+}
+```
+
+<!-- audit: expect-error: cannot take an array parameter -->
+```zer
+async void fill(u32[4] a) { a[0] = 5; yield; }
+u32 main() { return 0; }
 ```
 
 **RETURNING A VALUE FROM AN ASYNC FUNCTION**

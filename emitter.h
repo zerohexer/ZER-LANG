@@ -154,6 +154,13 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+    /* BUG-1442: > 0 while emitting a STATIC LOCAL's initializer. GCC accepts a
+     * compound literal `(T){ … }` as a file-scope initializer, but at BLOCK
+     * scope a NESTED one is "initializer element is not constant"
+     * (`static S s = { .o = 6 }` with a ?u32 field). In this context every
+     * aggregate is emitted as a plain braced initializer, which C accepts at
+     * any nesting (emit_clit_open). */
+    int static_brace_init;
     bool intn_cast_wrapping;   /* BUG-1385: inside the N-bit wrap of a (uN)x cast */
 
     /* BUG-1027: slice typedefs for element types that have NO pre-emitted named

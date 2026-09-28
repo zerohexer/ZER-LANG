@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: takes the address of a function-local variable
+// BUG-1442: a static outlives the frame; from the second call on `p` would point
+// into a dead one.
+u32 f(u32 k) {
+    u32 l = k;
+    static *u32 p = &l;
+    return *p;
+}
+u32 main() { return f(1) - 1; }

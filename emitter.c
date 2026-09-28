@@ -222,6 +222,17 @@ static void emit_opt_unwrap(Emitter *e, int tmp_id, Type *opt_type) {
         emit(e, "_zer_tmp%d.value", tmp_id);
 }
 
+/* BUG-1442: the `(T)` of a compound literal `(T){ … }` — omitted inside a
+ * static local's initializer, where a NESTED compound literal is not a
+ * constant at block scope and a plain braced list is. Callers write the braces
+ * themselves (keeps every function's braces balanced for the walker audits). */
+static void emit_clit_type(Emitter *e, Type *t) {
+    if (e->static_brace_init > 0) return;
+    emit(e, "(");
+    emit_type(e, t);
+    emit(e, ")");
+}
+
 /* Emit null literal for optional type: "(T*)0" / "{ 0 }" / "{ 0, 0 }" */
 static void emit_opt_null_literal(Emitter *e, Type *opt_type) {
     Type *eff = type_unwrap_distinct(opt_type);
@@ -230,13 +241,11 @@ static void emit_opt_null_literal(Emitter *e, Type *opt_type) {
         emit_type(e, eff->optional.inner);
         emit(e, ")0");
     } else if (is_void_opt(opt_type)) {
-        emit(e, "(");
-        emit_type(e, opt_type);
-        emit(e, "){ 0 }");
+        emit_clit_type(e, opt_type);   /* BUG-1442 */
+        emit(e, "{ 0 }");
     } else {
-        emit(e, "(");
-        emit_type(e, opt_type);
-        emit(e, "){ 0, 0 }");
+        emit_clit_type(e, opt_type);   /* BUG-1442 */
+        emit(e, "{ 0, 0 }");
     }
 }
 
@@ -249,9 +258,8 @@ static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, 
  * Used for T → ?T wrapping at assignment, var-decl init.
  * opt_type is the target optional type (may be distinct). */
 static void emit_opt_wrap_value(Emitter *e, Type *opt_type, Node *value_expr) {
-    emit(e, "(");
-    emit_type(e, opt_type);
-    emit(e, "){ ");
+    emit_clit_type(e, opt_type);   /* BUG-1442 */
+    emit(e, "{ ");
     /* #14 (B): an array value into an optional-SLICE (?[*]T) must be coerced to a
      * {ptr,len} slice literal first — a bare array flattens into .value.ptr /
      * .value.len and defaults .has_value to 0 (a present optional built empty). */
@@ -1204,16 +1212,19 @@ static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile); /* BUG-1
 
 /* emit array→slice coercion: wraps array expr in slice compound literal */
 static void emit_array_as_slice(Emitter *e, Node *array_expr, Type *array_type, Type *slice_type) {
-    emit(e, "((");
-    emit_type(e, slice_type);
-    emit(e, "){ (");
+    /* BUG-1442: no outer parentheses in the brace form — `({ … })` would be a
+     * statement expression. */
+    bool brace = e->static_brace_init > 0;
+    if (!brace) emit(e, "(");
+    emit_clit_type(e, slice_type);
+    emit(e, "{ (");
     /* BUG-1027: a funcptr/array element needs the `ret (**)(..)` / `T (*)[N]`
      * declarator spelling — `emit_type(inner)*` is invalid C for those. */
     emit_ptr_to_elem(e, array_type->array.inner,
                      slice_type && slice_type->slice.is_volatile);
     emit(e, ")");
     emit_expr(e, array_expr);
-    emit(e, ", %llu })", (unsigned long long)array_type->array.size);
+    emit(e, ", %llu }%s", (unsigned long long)array_type->array.size, brace ? "" : ")");
 }
 
 /* Path C: emit the C carrier type for an arbitrary-width integer.
@@ -1764,22 +1775,59 @@ static void emit_intn_mask(Emitter *e, IRLocal *dst, const char *sp) {
  * no header for these predicates). Same shape, same depth limit; keep them in
  * step — they answer the same question for the same rule, the checker deciding
  * whether to care and the emitter deciding where to look. */
+/* BUG-1449: no depth cap. A walk over a TYPE needs none — the by-value type
+ * graph is finite and acyclic (self-containment by value is refused, and pointers
+ * are not followed) — and the old cap of 32 answered "carries no enum" past it,
+ * i.e. it failed OPEN (the emitter then emitted no guard). The `depth` parameter
+ * is kept for the callers' signature only. */
 static bool type_carries_enum_e(Type *t, int depth) {
-    if (!t || depth > 32) return false;
+    (void)depth;
+    if (!t) return false;
     TypeKind k = type_dispatch_kind(t);
     Type *u = type_unwrap_distinct(t);
     if (!u) return false;
     if (k == TYPE_ENUM) return true;
-    if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, depth + 1);
-    if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, depth + 1);
+    if (k == TYPE_OPTIONAL) return type_carries_enum_e(u->optional.inner, 0);
+    if (k == TYPE_ARRAY) return type_carries_enum_e(u->array.inner, 0);
     if (k == TYPE_STRUCT) {
         for (uint32_t i = 0; i < u->struct_type.field_count; i++)
-            if (type_carries_enum_e(u->struct_type.fields[i].type, depth + 1)) return true;
+            if (type_carries_enum_e(u->struct_type.fields[i].type, 0)) return true;
         return false;
     }
     if (k == TYPE_UNION) {
         for (uint32_t i = 0; i < u->union_type.variant_count; i++)
-            if (type_carries_enum_e(u->union_type.variants[i].type, depth + 1)) return true;
+            if (type_carries_enum_e(u->union_type.variants[i].type, 0)) return true;
+        return false;
+    }
+    return false;
+}
+
+/* BUG-1448: a FORGEABLE SCALAR — a type whose C representation holds bit
+ * patterns that are not values of the ZER type: an enum (a non-variant) or a
+ * bool (a uint8_t other than 0/1 — `@bitcast(bool, (u8)2)` held 2, was `!= true`
+ * AND `!= false`, and an exhaustive `switch` on it took neither arm). Does `t`
+ * carry one anywhere by value? Same wrappers as type_carries_enum_e, no cap. */
+static bool type_carries_forge_scalar_e(Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    if (k == TYPE_ENUM || k == TYPE_BOOL) return true;
+    /* A value optional's `has_value` byte is a bool too (a forged 2 is present
+     * to `if (o)` and absent to a `== 1` test). A ?*T is a null-sentinel pointer
+     * with no such byte. */
+    if (k == TYPE_OPTIONAL)
+        return !is_null_sentinel(u->optional.inner) ||
+               type_carries_forge_scalar_e(u->optional.inner);
+    if (k == TYPE_ARRAY) return type_carries_forge_scalar_e(u->array.inner);
+    if (k == TYPE_STRUCT) {
+        for (uint32_t i = 0; i < u->struct_type.field_count; i++)
+            if (type_carries_forge_scalar_e(u->struct_type.fields[i].type)) return true;
+        return false;
+    }
+    if (k == TYPE_UNION) {
+        for (uint32_t i = 0; i < u->union_type.variant_count; i++)
+            if (type_carries_forge_scalar_e(u->union_type.variants[i].type)) return true;
         return false;
     }
     return false;
@@ -1858,9 +1906,28 @@ static void emit_try_enum_close(Emitter *e, Type *t, Type *src) {
     emit(e, ") ? 1 : 0; _zer_teo.value = _zer_tev; _zer_teo; })");
 }
 
+/* BUG-1449: the lvalue path of a sub-object, arena-allocated — the old
+ * `char sub[256]` truncated a deep path (`.x.x.x…`), a fixed buffer over data
+ * with no syntactic bound. */
+static const char *guard_subpath(Emitter *e, const char *path, const char *fmt,
+                                 int n, const char *name) {
+    int len = snprintf(NULL, 0, fmt, path, n, name);
+    char *sub = (char *)arena_alloc(e->arena, (size_t)len + 1);
+    snprintf(sub, (size_t)len + 1, fmt, path, n, name);
+    return sub;
+}
+
+/* The guard walk: every forgeable scalar (BUG-1448: enum AND bool) reachable in
+ * `t` by value is checked at `path`, trapping at the point of forgery. It reaches
+ * EXACTLY what type_carries_forge_scalar_e accepts (BUG-1449): no depth cap, and
+ * an array of any size is checked by a runtime loop (constant code size) — the
+ * old walk stopped at struct depth 8 and skipped arrays over 4096 elements while
+ * the acceptors went on, so a forged enum 10 structs deep or in an E[5000] was
+ * emitted with no guard at all. */
 static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                                          const char *what, int depth) {
-    if (!t || depth > 8) return;
+    (void)depth;
+    if (!t) return;
     Type *u = type_unwrap_distinct(t);
     if (!u) return;
     TypeKind k = type_dispatch_kind(u);
@@ -1875,40 +1942,53 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
                 "of this enum\", __FILE__, __LINE__); ", what);
         return;
     }
+    if (k == TYPE_BOOL) {
+        /* BUG-1448: a bool is a uint8_t whose only values are 0 and 1. */
+        emit(e, "if ((uint8_t)(%s) > 1) _zer_trap(\"%s produced a bool that is "
+                "neither true nor false\", __FILE__, __LINE__); ", path, what);
+        return;
+    }
     if (k == TYPE_STRUCT) {
         for (uint32_t i = 0; i < u->struct_type.field_count; i++) {
             Type *ft = u->struct_type.fields[i].type;
-            if (!type_carries_enum_e(ft, 0)) continue;
-            char sub[256];
-            snprintf(sub, sizeof(sub), "%s.%.*s", path,
-                     (int)u->struct_type.fields[i].name_len,
-                     u->struct_type.fields[i].name);
-            emit_enum_variant_guard_path(e, ft, sub, what, depth + 1);
+            if (!type_carries_forge_scalar_e(ft)) continue;
+            const char *sub = guard_subpath(e, path, "%s.%.*s",
+                                            (int)u->struct_type.fields[i].name_len,
+                                            u->struct_type.fields[i].name);
+            emit_enum_variant_guard_path(e, ft, sub, what, 0);
         }
         return;
     }
     if (k == TYPE_OPTIONAL) {
         Type *in = u->optional.inner;
-        if (!type_carries_enum_e(in, 0)) return;
+        if (is_null_sentinel(in)) return;   /* a pointer: no presence byte */
         /* Only the payload of a PRESENT optional is meaningful; a null one
-         * carries whatever the zeroing left, which is not a forged variant. */
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s.value", path);
-        emit(e, "if (%s.has_value) { ", path);
-        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
-        emit(e, "} ");
+         * carries whatever the zeroing left, which is not a forged variant.
+         * The has_value byte itself is a bool: a forged 2 would read as
+         * present to `if (o)` and as absent to `== 1` tests, so it is checked
+         * first. */
+        emit(e, "if ((uint8_t)(%s.has_value) > 1) _zer_trap(\"%s produced an "
+                "optional whose presence byte is neither 0 nor 1\", __FILE__, "
+                "__LINE__); ", path, what);
+        if (!is_void_opt(u) && type_carries_forge_scalar_e(in)) {
+            emit(e, "if (%s.has_value) { ", path);
+            emit_enum_variant_guard_path(e, in, guard_subpath(e, path, "%s.value%.*s", 0, ""),
+                                         what, 0);
+            emit(e, "} ");
+        }
         return;
     }
     if (k == TYPE_ARRAY) {
         Type *in = u->array.inner;
-        if (!type_carries_enum_e(in, 0)) return;
-        if (u->array.size == 0 || u->array.size > 4096) return;
+        if (!type_carries_forge_scalar_e(in)) return;
+        if (u->array.size == 0) return;
         int li = e->temp_count++;
-        char sub[256];
-        snprintf(sub, sizeof(sub), "%s[_zer_egi%d]", path, li);
-        emit(e, "for (size_t _zer_egi%d = 0; _zer_egi%d < %llu; _zer_egi%d++) { ",
-             li, li, (unsigned long long)u->array.size, li);
-        emit_enum_variant_guard_path(e, in, sub, what, depth + 1);
+        char idx[32];
+        snprintf(idx, sizeof idx, "_zer_egi%d", li);
+        emit(e, "for (size_t %s = 0; %s < %llu; %s++) { ",
+             idx, idx, (unsigned long long)u->array.size, idx);
+        emit_enum_variant_guard_path(e, in, guard_subpath(e, path, "%s[%.*s]",
+                                     (int)strlen(idx), idx), what, 0);
         emit(e, "} ");
         return;
     }
@@ -1917,7 +1997,7 @@ static void emit_enum_variant_guard_path(Emitter *e, Type *t, const char *path,
 }
 
 static void emit_bitcast_enum_guard(Emitter *e, Type *t, const char *lv) {
-    if (!type_carries_enum_e(t, 0)) return;
+    if (!type_carries_forge_scalar_e(t)) return;   /* BUG-1448: enum or bool */
     emit_enum_variant_guard_path(e, t, lv, "@bitcast", 0);
 }
 
@@ -4572,12 +4652,27 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         bool obj_is_slice_early = obj_type && obj_type->kind == TYPE_SLICE;
         bool slice_needs_runtime_check = false;
         if (!type_is_integer(obj_type)) {
+            /* BUG-1442: inside a constant initializer (global / static local) a
+             * bound naming a `const` (`GA[K..4]`) does not fold in the untyped
+             * evaluator, and the runtime-check form is a statement expression —
+             * illegal at file scope ("braced-group within expression"). The
+             * checker folds such a bound (scoped) and checks it against the
+             * array's size at compile time, so ask the typed fold here too; the
+             * bound itself is emitted with the const substituted (BUG-997). */
             if (node->slice.start) {
                 int64_t v = eval_const_expr(node->slice.start);
+                if (v == CONST_EVAL_FAIL && e->global_init_depth > 0 &&
+                    !obj_is_slice_early &&
+                    (!checker_fold_const_typed(e->checker, node->slice.start, &v) || v < 0))
+                    v = CONST_EVAL_FAIL;   /* the checker bounds-checks only v >= 0 */
                 if (v == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
             }
             if (node->slice.end) {
                 int64_t v = eval_const_expr(node->slice.end);
+                if (v == CONST_EVAL_FAIL && e->global_init_depth > 0 &&
+                    !obj_is_slice_early &&
+                    (!checker_fold_const_typed(e->checker, node->slice.end, &v) || v < 0))
+                    v = CONST_EVAL_FAIL;   /* the checker bounds-checks only v >= 0 */
                 if (v == CONST_EVAL_FAIL) slice_needs_runtime_check = true;
             }
             /* Slices (dynamic cap): any specified bound needs runtime cap
@@ -4917,9 +5012,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             emit(e, " _zer_si%d = ", si_tmp);
         }
         if (si_type) {
-            emit(e, "(");
-            emit_type(e, si_type);
-            emit(e, ")");
+            emit_clit_type(e, si_type);   /* BUG-1442 */
         }
         emit(e, "{ ");
         bool si_first = true;
@@ -6591,6 +6684,171 @@ static void emit_global_decl_name(Emitter *e, Type *type, const char *name,
     emit_type_and_name(e, type, nm, len + 9);
 }
 
+/* BUG-1384 / BUG-1443: a u65..u128 / i65..i128 constant initializer. The
+ * constant evaluators are 64-bit, so the value is not folded: the checker admits
+ * only literals under + - * & | ^ ~ and casts (global_wide_init_ok), which is a
+ * C constant expression once each literal carries the 128-bit type — GCC folds it
+ * exactly as the same code computes at run time. Wrapped to N bits. Shared by the
+ * plain wide global and the optional-payload arm. */
+static void emit_wide_int_const(Emitter *e, Type *gt, Node *init) {
+    int nb = type_width(gt);
+    bool sgn = type_is_signed(gt);
+    if (nb >= 128) {
+        emit(e, "(%s)(", sgn ? "__int128" : "unsigned __int128");
+        emit_expr(e, init);
+        emit(e, ")");
+    } else if (!sgn) {
+        emit(e, "((unsigned __int128)(");
+        emit_expr(e, init);
+        emit(e, ") & (((unsigned __int128)1 << %d) - 1))", nb);
+    } else {
+        emit(e, "((__int128)((unsigned __int128)(");
+        emit_expr(e, init);
+        emit(e, ") << %d) >> %d)", 128 - nb, 128 - nb);
+    }
+}
+
+/* BUG-1442: the initializer of an object of STATIC storage duration — a
+ * global, or a `static` local. C requires a constant expression for both, so
+ * both must be emitted by ONE path. The static local used to render its
+ * initializer through emit_rewritten_node (the in-function expression path),
+ * which knows none of the constant forms below: `static ?u32 o = 5;` emitted
+ * `= 5U` into a `_zer_opt_u32` (invalid initializer), a designated struct a
+ * compound literal, `[*]u32 s = GA` a bare array, a float->int cast a statement
+ * expression. The caller holds `global_init_depth` raised (the constant-init
+ * context emit_expr keys on). Emits ` = <constant>`. */
+static void emit_static_storage_init(Emitter *e, Type *type, Node *init) {
+    /* optional null init needs struct literal, not scalar 0.
+     * BUG-506: unwrap distinct — distinct typedef ?T is still optional. */
+    Type *gtype_eff = type ? type_unwrap_distinct(type) : NULL;
+    Type *gi_type = checker_get_type(e->checker, init);
+    if (gtype_eff && gtype_eff->kind == TYPE_OPTIONAL &&
+        !is_null_sentinel(gtype_eff->optional.inner) &&
+        init->kind == NODE_NULL_LIT) {
+        emit(e, " = ");
+        emit_opt_null_literal(e, type);
+    } else if (gtype_eff && type_dispatch_kind(gtype_eff) == TYPE_OPTIONAL &&
+               !is_null_sentinel(gtype_eff->optional.inner) &&
+               !is_void_opt(type) &&
+               !(gi_type && type_dispatch_kind(gi_type) == TYPE_OPTIONAL)) {
+        /* BUG-943: a value-optional global initialised with its bare PAYLOAD.
+         * This branch handled exactly ONE optional shape — the null literal —
+         * and everything else fell through to the scalar path below, so
+         *     ?u32 g = 5;   ->   _zer_opt_u32 g = 5;
+         * i.e. `gcc: error: invalid initializer`: a valid ZER program that
+         * could not be BUILT. Measured on four shapes (?u32, ?bool, ?enum,
+         * ?i64); only `= null` worked, because only `= null` had an arm.
+         *
+         * The payload must be const-FOLDED rather than emitted as an
+         * expression, for the same reason BUG-939 folds below: a tree needing
+         * `_zer_shl` emits a GCC statement expression, which is illegal at
+         * file scope. When it does not fold, emit_opt_wrap_value is the shared
+         * T -> ?T query (the same one assignment and struct-field init use). */
+        /* BUG-1090: the TYPED fold first — the value a local of the same
+         * spelling computes. The untyped fold is the fallback for a tree
+         * the typed one does not model. */
+        int64_t oval;
+        Type *oinner = type_unwrap_distinct(gtype_eff->optional.inner);
+        if (oinner && type_is_integer(oinner) && type_width(oinner) > 64) {
+            /* BUG-1443: a ?u65..?u128 payload cannot go through the 64-bit
+             * folds below — `?u128 C = 18446744073709551615 + 2;` emitted
+             * `{ 1ULL, 1 }`. Use the plain wide global's mechanism (BUG-1384):
+             * the checker admits only a 128-bit C constant expression here. */
+            emit(e, " = ");
+            emit_clit_type(e, type);   /* BUG-1442 */
+            emit(e, "{ ");
+            emit_wide_int_const(e, oinner, init);
+            emit(e, ", 1 }");
+            return;
+        }
+        if (!checker_fold_const_typed(e->checker, init, &oval))
+            oval = eval_const_expr(init);
+        if (oval != CONST_EVAL_FAIL) {
+            oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1032 */
+            emit(e, " = ");
+            emit_clit_type(e, type);   /* BUG-1442 */
+            if (oval < 0) emit(e, "{ (%lld), 1 }", (long long)oval);
+            else          emit(e, "{ %lluULL, 1 }", (unsigned long long)oval);
+        } else {
+            emit(e, " = ");
+            emit_opt_wrap_value(e, type, init);
+        }
+    } else {
+        /* For const globals: try compile-time evaluation first.
+         * This avoids GCC statement expression errors from _zer_shl/shr
+         * macros which can't be used in global initializers. */
+        bool emitted_const = false;
+        /* BUG-939: the gate was `is_const`, so a NON-const global whose
+         * initializer needs a macro emitted the macro — and `_zer_shl` is a GCC
+         * STATEMENT EXPRESSION, which is illegal at file scope:
+         *     i64 g = -(1 << 4);   ->  int64_t g = (-_zer_shl(1LL, 4LL));
+         *                              error: braced-group ... only inside a function
+         * i.e. a valid ZER program that could not be BUILT. Constness has nothing
+         * to do with it: what matters is whether the initializer FOLDS, and a
+         * foldable tree is identical either way. eval_const_expr returns
+         * CONST_EVAL_FAIL for anything with a variable in it, so widening the
+         * gate cannot fold something it should not. */
+        /* BUG-1216: a comptime call whose result is a STRUCT (or a float)
+         * is not an integer fold — its `comptime_value` slot is unused, 0 —
+         * and `In g = MK(3);` was emitted `struct In g = 0;`. Emit the folded
+         * literal instead. */
+        Node *gci = init;
+        if (gci->kind == NODE_CALL && gci->call.is_comptime_resolved &&
+            (gci->call.comptime_struct_init || gci->call.is_comptime_float)) {
+            emit(e, " = ");
+            emit_expr(e, gci);
+            emitted_const = true;
+        }
+        {
+            /* BUG-1384: a u65..u128 / i65..i128 initializer cannot be folded
+             * (the constant evaluators are 64-bit: `u128 g = 0xFFFF_FFFF_
+             * FFFF_FFFF;` emitted `= (-1)`, all ones; `… + 1` emitted 0).
+             * The checker admits only literals under + - * & | ^ ~ and casts
+             * there (global_wide_init_ok), which is a C constant expression
+             * once each literal carries the 128-bit type — GCC folds it
+             * exactly as the same code computes at run time. Wrapped to N. */
+            Type *gt = type ? type_unwrap_distinct(type) : NULL;
+            if (!emitted_const && gt && type_is_integer(gt) && type_width(gt) > 64) {
+                emit(e, " = ");
+                emit_wide_int_const(e, gt, init);
+                emitted_const = true;
+            }
+        }
+        if (!emitted_const) {
+            /* BUG-1090: typed fold first (see the optional arm above).
+             * `const u32 K = (0 - 1) / 1073741824;` emitted `K = 0` — the
+             * untyped int64 reading — while the same initializer on a
+             * LOCAL computes 3 at run time. */
+            int64_t cval;
+            if (!checker_fold_const_typed(e->checker, init, &cval))
+                cval = eval_const_expr(init);
+            if (cval != CONST_EVAL_FAIL) {
+                cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1032 */
+                if (cval < 0) {
+                    emit(e, " = (%lld)", (long long)cval);
+                } else {
+                    emit(e, " = %llu", (unsigned long long)cval);
+                }
+                emitted_const = true;
+            }
+        }
+        if (!emitted_const) {
+            emit(e, " = ");
+            /* BUG-1127: the array -> slice coercion, at the GLOBAL value-flow
+             * site. `[*]u8 s = buf;` emitted `s = buf;` ("invalid initializer"
+             * from GCC) — masked until now because BUG-997's checker rule
+             * refused the bare global name before the emitter saw it. */
+            Type *gd = type_unwrap_distinct(type);
+            Type *gv = gi_type ? type_unwrap_distinct(gi_type) : NULL;
+            if (gd && gv && type_dispatch_kind(gd) == TYPE_SLICE &&
+                type_dispatch_kind(gv) == TYPE_ARRAY)
+                emit_array_as_slice(e, init, gv, gd);
+            else
+                emit_expr(e, init);
+        }
+    }
+}
+
 static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
     /* BUG-997: mark the global-initializer context for the whole emission, so a
@@ -6709,136 +6967,7 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     }
 
     if (node->var_decl.init) {
-        /* optional null init needs struct literal, not scalar 0.
-         * BUG-506: unwrap distinct — distinct typedef ?T is still optional. */
-        Type *gtype_eff = type ? type_unwrap_distinct(type) : NULL;
-        Type *gi_type = checker_get_type(e->checker, node->var_decl.init);
-        if (gtype_eff && gtype_eff->kind == TYPE_OPTIONAL &&
-            !is_null_sentinel(gtype_eff->optional.inner) &&
-            node->var_decl.init->kind == NODE_NULL_LIT) {
-            emit(e, " = ");
-            emit_opt_null_literal(e, type);
-        } else if (gtype_eff && type_dispatch_kind(gtype_eff) == TYPE_OPTIONAL &&
-                   !is_null_sentinel(gtype_eff->optional.inner) &&
-                   !is_void_opt(type) &&
-                   !(gi_type && type_dispatch_kind(gi_type) == TYPE_OPTIONAL)) {
-            /* BUG-943: a value-optional global initialised with its bare PAYLOAD.
-             * This branch handled exactly ONE optional shape — the null literal —
-             * and everything else fell through to the scalar path below, so
-             *     ?u32 g = 5;   ->   _zer_opt_u32 g = 5;
-             * i.e. `gcc: error: invalid initializer`: a valid ZER program that
-             * could not be BUILT. Measured on four shapes (?u32, ?bool, ?enum,
-             * ?i64); only `= null` worked, because only `= null` had an arm.
-             *
-             * The payload must be const-FOLDED rather than emitted as an
-             * expression, for the same reason BUG-939 folds below: a tree needing
-             * `_zer_shl` emits a GCC statement expression, which is illegal at
-             * file scope. When it does not fold, emit_opt_wrap_value is the shared
-             * T -> ?T query (the same one assignment and struct-field init use). */
-            /* BUG-1090: the TYPED fold first — the value a local of the same
-             * spelling computes. The untyped fold is the fallback for a tree
-             * the typed one does not model. */
-            int64_t oval;
-            if (!checker_fold_const_typed(e->checker, node->var_decl.init, &oval))
-                oval = eval_const_expr(node->var_decl.init);
-            if (oval != CONST_EVAL_FAIL) {
-                oval = fold_wrap_to_type(oval, gi_type);   /* BUG-1032 */
-                emit(e, " = (");
-                emit_type(e, type);
-                if (oval < 0) emit(e, "){ (%lld), 1 }", (long long)oval);
-                else          emit(e, "){ %lluULL, 1 }", (unsigned long long)oval);
-            } else {
-                emit(e, " = ");
-                emit_opt_wrap_value(e, type, node->var_decl.init);
-            }
-        } else {
-            /* For const globals: try compile-time evaluation first.
-             * This avoids GCC statement expression errors from _zer_shl/shr
-             * macros which can't be used in global initializers. */
-            bool emitted_const = false;
-            /* BUG-939: the gate was `is_const`, so a NON-const global whose
-             * initializer needs a macro emitted the macro — and `_zer_shl` is a GCC
-             * STATEMENT EXPRESSION, which is illegal at file scope:
-             *     i64 g = -(1 << 4);   ->  int64_t g = (-_zer_shl(1LL, 4LL));
-             *                              error: braced-group ... only inside a function
-             * i.e. a valid ZER program that could not be BUILT. Constness has nothing
-             * to do with it: what matters is whether the initializer FOLDS, and a
-             * foldable tree is identical either way. eval_const_expr returns
-             * CONST_EVAL_FAIL for anything with a variable in it, so widening the
-             * gate cannot fold something it should not. */
-            /* BUG-1216: a comptime call whose result is a STRUCT (or a float)
-             * is not an integer fold — its `comptime_value` slot is unused, 0 —
-             * and `In g = MK(3);` was emitted `struct In g = 0;`. Emit the folded
-             * literal instead. */
-            Node *gci = node->var_decl.init;
-            if (gci->kind == NODE_CALL && gci->call.is_comptime_resolved &&
-                (gci->call.comptime_struct_init || gci->call.is_comptime_float)) {
-                emit(e, " = ");
-                emit_expr(e, gci);
-                emitted_const = true;
-            }
-            {
-                /* BUG-1384: a u65..u128 / i65..i128 initializer cannot be folded
-                 * (the constant evaluators are 64-bit: `u128 g = 0xFFFF_FFFF_
-                 * FFFF_FFFF;` emitted `= (-1)`, all ones; `… + 1` emitted 0).
-                 * The checker admits only literals under + - * & | ^ ~ and casts
-                 * there (global_wide_init_ok), which is a C constant expression
-                 * once each literal carries the 128-bit type — GCC folds it
-                 * exactly as the same code computes at run time. Wrapped to N. */
-                Type *gt = type ? type_unwrap_distinct(type) : NULL;
-                if (!emitted_const && gt && type_is_integer(gt) && type_width(gt) > 64) {
-                    int nb = type_width(gt);
-                    bool sgn = type_is_signed(gt);
-                    emit(e, " = ");
-                    if (nb >= 128) {
-                        emit(e, "(%s)(", sgn ? "__int128" : "unsigned __int128");
-                        emit_expr(e, node->var_decl.init);
-                        emit(e, ")");
-                    } else if (!sgn) {
-                        emit(e, "((unsigned __int128)(");
-                        emit_expr(e, node->var_decl.init);
-                        emit(e, ") & (((unsigned __int128)1 << %d) - 1))", nb);
-                    } else {
-                        emit(e, "((__int128)((unsigned __int128)(");
-                        emit_expr(e, node->var_decl.init);
-                        emit(e, ") << %d) >> %d)", 128 - nb, 128 - nb);
-                    }
-                    emitted_const = true;
-                }
-            }
-            if (!emitted_const) {
-                /* BUG-1090: typed fold first (see the optional arm above).
-                 * `const u32 K = (0 - 1) / 1073741824;` emitted `K = 0` — the
-                 * untyped int64 reading — while the same initializer on a
-                 * LOCAL computes 3 at run time. */
-                int64_t cval;
-                if (!checker_fold_const_typed(e->checker, node->var_decl.init, &cval))
-                    cval = eval_const_expr(node->var_decl.init);
-                if (cval != CONST_EVAL_FAIL) {
-                    cval = fold_wrap_to_type(cval, gi_type);   /* BUG-1032 */
-                    if (cval < 0) {
-                        emit(e, " = (%lld)", (long long)cval);
-                    } else {
-                        emit(e, " = %llu", (unsigned long long)cval);
-                    }
-                    emitted_const = true;
-                }
-            }
-            if (!emitted_const) {
-                emit(e, " = ");
-                /* BUG-1127: the array -> slice coercion, at the GLOBAL value-flow
-                 * site. `[*]u8 s = buf;` emitted `s = buf;` ("invalid initializer"
-                 * from GCC) — masked until now because BUG-997's checker rule
-                 * refused the bare global name before the emitter saw it. */
-                Type *gd = type_unwrap_distinct(type);
-                Type *gv = gi_type ? type_unwrap_distinct(gi_type) : NULL;
-                if (gd && gv && type_dispatch_kind(gd) == TYPE_SLICE &&
-                    type_dispatch_kind(gv) == TYPE_ARRAY)
-                    emit_array_as_slice(e, node->var_decl.init, gv, gd);
-                else
-                    emit_expr(e, node->var_decl.init);
-            }
-        }
+        emit_static_storage_init(e, type, node->var_decl.init);
     } else {
         /* auto-zero — unwrap distinct to check if compound init needed */
         Type *eff_type = type_unwrap_distinct(type);
@@ -15529,23 +15658,19 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         else
             emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
-            /* BUG-1315: a static's initializer is a C CONSTANT expression. An
-             * integer one is folded the way a global's is (BUG-1090 typed fold):
-             * rendered as an expression, `static u32 i = 7 % 4;` emitted the
-             * guarded-division statement expression and GCC refused it
-             * ("initializer element is not constant"). */
-            int64_t sv;
-            if (type_is_integer(l->type) &&
-                checker_fold_const_typed(e->checker, l->static_init, &sv) &&
-                sv != CONST_EVAL_FAIL) {
-                sv = fold_wrap_to_type(sv, l->type);
-                if (sv < 0) emit(e, " = (%lld);\n", (long long)sv);
-                else emit(e, " = %lluULL;\n", (unsigned long long)sv);
-            } else {
-                emit(e, " = ");
-                emit_rewritten_node(e, l->static_init, func);
-                emit(e, ";\n");
-            }
+            /* BUG-1315 / BUG-1442: a static's initializer is a C CONSTANT
+             * expression — the same contract as a global's, so it is emitted by
+             * the SAME helper, in the same constant-init context (emit_expr's
+             * global_init_depth: const-global substitution, the constant
+             * float->int form). It used to go through emit_rewritten_node, the
+             * in-function expression path, which produced `= 5U` for a
+             * `static ?u32`, statement expressions, and bare arrays for slices. */
+            e->global_init_depth++;
+            e->static_brace_init++;
+            emit_static_storage_init(e, l->type, l->static_init);
+            e->static_brace_init--;
+            e->global_init_depth--;
+            emit(e, ";\n");
         } else {
             emit(e, " = {0};\n"); /* auto-zero */
         }

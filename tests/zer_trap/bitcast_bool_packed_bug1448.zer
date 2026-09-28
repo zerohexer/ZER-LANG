@@ -1,0 +1,6 @@
+// expect-trap
+// expect-trap-msg: @bitcast produced a bool that is neither true nor false
+// BUG-1448: a bool in a packed overlay.
+packed struct P { u8 a; bool b; u16 c; }
+struct R { u32 w; }
+u32 main() { R r = { .w = 0x00020200 }; P p = @bitcast(P, r); return (u32)p.b; }

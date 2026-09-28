@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: duplicate enum values are not allowed
+// BUG-1440: `b = 0` aliases the implicit `a = 0`.
+enum E { a, b = 0 }
+u32 main() {
+    E e = E.b;
+    switch (e) {
+        .a => { return 1; }
+        .b => { return 0; }
+    }
+}

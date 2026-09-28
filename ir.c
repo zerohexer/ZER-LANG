@@ -90,12 +90,15 @@ int ir_add_local(IRFunc *func, Arena *arena,
                 /* Different type OR different scope → fall through to create
                  * new suffixed local. Use `_%d` with the count to ensure
                  * uniqueness across suffixed + unsuffixed variants. */
-                char buf[64];
-                int slen = snprintf(buf, sizeof(buf), "%.*s_%d",
-                                    (int)name_len, name, func->local_count);
-                if (slen >= (int)sizeof(buf)) slen = (int)sizeof(buf) - 1;
-                char *sname = (char *)arena_alloc(arena, slen + 1);
-                memcpy(sname, buf, slen + 1);
+                /* BUG-1409: sized to the name — a 64-byte buffer truncated a
+                 * long name's `_N` suffix away, so the "unique" name equalled
+                 * the local it was meant to be distinct from. */
+                char nbuf[16];
+                int nl = snprintf(nbuf, sizeof(nbuf), "_%d", func->local_count);
+                int slen = (int)name_len + nl;
+                char *sname = (char *)arena_alloc(arena, (size_t)slen + 1);
+                memcpy(sname, name, name_len);
+                memcpy(sname + name_len, nbuf, (size_t)nl + 1);
                 name = sname;
                 name_len = (uint32_t)slen;
                 break;

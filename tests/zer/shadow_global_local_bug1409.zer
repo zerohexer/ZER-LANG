@@ -1,0 +1,40 @@
+// BUG-1409: IR locals are declared at the C function top, so a local shadowing a
+// GLOBAL shadowed it for the whole function — reads before its declaration saw the
+// local's zero, a for-counter named like a global swallowed the global's writes, and
+// a shadowing *T read a NULL of a non-null type.
+struct T { u32 v; }
+T obj = { .v = 42 };
+T other = { .v = 1 };
+*T gt = &obj;
+u32 g = 42;
+u32 count = 0;
+
+u32 read_before_shadow() {
+    u32 a = g;
+    if (a > 0) { u32 g = 7; a = a + g - 7; }
+    return a;
+}
+void tick() {
+    count += 1;
+    for (u32 count = 0; count < 3; count += 1) { }
+}
+u32 ptr_shadow() {
+    u32 a = gt.v;
+    if (a > 100) { *T gt = &other; a = gt.v; }
+    return a;
+}
+u32 capture_shadow() {
+    ?u32 m = 5;
+    u32 r = g;
+    if (m) |g| { r = r + g; }
+    return r + g;
+}
+
+u32 main() {
+    if (read_before_shadow() != 42) { return 1; }
+    tick(); tick();
+    if (count != 2) { return 2; }
+    if (ptr_shadow() != 42) { return 3; }
+    if (capture_shadow() != 89) { return 4; }
+    return 0;
+}

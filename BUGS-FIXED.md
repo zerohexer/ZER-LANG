@@ -115,6 +115,18 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   also admitted bool. An output's type must now be one every bit pattern is valid for:
   an integer, or a nullable `?*T` (newly accepted — the unknown-provenance pointer floor,
   as for a cinclude return). Tests: `tests/zer_fail/asm_output_{nonnull_ptr,enum}_bug1408.zer`.
+- **BUG-1409 — a local that shadows a GLOBAL shadowed it for the whole emitted function.**
+  IR locals are declared at the C function top under their source names, so `u32 a = g;
+  if (a > 0) { u32 g = 7; ... }` read the LOCAL's zero instead of the global's 42 (silent),
+  a for-counter named like a global swallowed every write to the global, and a shadowing
+  `*T` local read a NULL of a non-null type. Found beside it: after `if (m) |g| { ... }`
+  closed, `g` still resolved to the capture (ir_find_local falls back to a HIDDEN local),
+  so `return r + g` added the payload. Fix: a local whose name is a global gets its own C
+  name (`local_avoid_global_name`, references follow through rewrite_idents); every
+  lowering lookup goes through `lower_find_local`, which does not fall back to a hidden
+  local when the name is a global. Also: the sibling-scope suffix used a 64-byte buffer
+  that truncated a long name's `_N` away (the "unique" name equalled the original). Test:
+  `tests/zer/shadow_global_local_bug1409.zer` (exit 1 pre-fix).
 - **BUG-1410 — freeing through a struct FIELD read at a variable index never reached the
   allocation.** `H h = hs[i]; free(h.p); ... free(a)` (and `*H hp = &hs[i]; free(hp.p)`,
   a by-value callee `drop(hs[i])`, a nested field, the range-for form, and `drop(arr[i])`

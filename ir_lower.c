@@ -471,6 +471,47 @@ static bool call_bypasses_arg_lowering(LowerCtx *ctx, Node *expr) {
  * ================================================================ */
 
 /* Create a temp local for intermediate results */
+/* BUG-1409: THE lowering-time answer to "does this name denote a local here?".
+ * ir_find_local falls back to a HIDDEN (closed-scope) local when no visible one
+ * matches — right for a name the lowering has no other meaning for, wrong when the
+ * name is a GLOBAL: after `if (m) |g| { ... }` closes, `g` is the global again, and
+ * the fallback handed back the capture (`return r + g` added the payload). */
+static int lower_find_local(LowerCtx *ctx, const char *name, uint32_t len) {
+    int id = ir_find_local(ctx->func, name, len);
+    if (id >= 0 && ctx->func->locals[id].hidden && ctx->checker &&
+        ctx->checker->global_scope &&
+        scope_lookup(ctx->checker->global_scope, name, len))
+        return -1;
+    return id;
+}
+
+/* BUG-1409: a local is declared at the FUNCTION top in the emitted C (IR locals are
+ * flat), under its source name — so a local that shadows a GLOBAL (or a function)
+ * shadows it for the WHOLE C function, including every statement BEFORE the
+ * local's own declaration and after its block closed. `u32 a = g; if (a > 0) {
+ * u32 g = 7; ... }` read the local's zero instead of the global's 42; a for-counter
+ * named like a global swallowed every write to the global; a shadowing `*T` read a
+ * NULL of a non-null type. Give such a local its own C name — rewrite_idents
+ * renames its references (as it does for a sibling-scope suffix), and a reference
+ * the lowering does not resolve to the local keeps naming the global. */
+static void local_avoid_global_name(LowerCtx *ctx, int id) {
+    if (id < 0 || id >= ctx->func->local_count) return;
+    IRLocal *l = &ctx->func->locals[id];
+    if (l->is_temp || l->is_param) return;
+    if (l->name != l->orig_name) return;   /* already suffixed: unique */
+    Checker *ck = ctx->checker;
+    if (!ck || !ck->global_scope) return;
+    if (!scope_lookup(ck->global_scope, l->name, l->name_len)) return;
+    char buf[32];
+    int sl = snprintf(buf, sizeof(buf), "_%d", id);
+    char *nn = (char *)arena_alloc(ctx->arena, l->name_len + (size_t)sl + 1);
+    if (!nn) return;
+    memcpy(nn, l->name, l->name_len);
+    memcpy(nn + l->name_len, buf, (size_t)sl + 1);
+    l->name = nn;
+    l->name_len += (uint32_t)sl;
+}
+
 static int create_temp(LowerCtx *ctx, Type *type, int line) {
     char buf[32];
     int tl = snprintf(buf, sizeof(buf), "_zer_t%d", ctx->temp_count++);
@@ -631,7 +672,7 @@ static bool index_clobbered_by(LowerCtx *ctx, Node *e, Node *value, Node *body) 
     if (!e) return false;
     switch (e->kind) {
     case NODE_IDENT: {
-        if (ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len) < 0)
+        if (lower_find_local(ctx, e->ident.name, (uint32_t)e->ident.name_len) < 0)
             return true;   /* a global / non-local name: a call may write it */
         return ast_name_mutated_or_addrd(value, e->ident.name, (uint32_t)e->ident.name_len) ||
                (body && ast_name_addr_taken(body, e->ident.name, (uint32_t)e->ident.name_len));
@@ -914,7 +955,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
     /* ---- Variable reference: just return the local ID ---- */
     case NODE_IDENT: {
-        int id = ir_find_local(ctx->func,
+        int id = lower_find_local(ctx,
                                expr->ident.name,
                                (uint32_t)expr->ident.name_len);
         if (id >= 0) return id;
@@ -1070,7 +1111,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         }
         /* Non-local objects (enum type, module prefix) → passthrough */
         if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
-            int obj_id = ir_find_local(ctx->func,
+            int obj_id = lower_find_local(ctx,
                 expr->field.object->ident.name,
                 (uint32_t)expr->field.object->ident.name_len);
             if (obj_id < 0) goto passthrough;
@@ -1101,7 +1142,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         if (!frt) {
             Type *ot = NULL;
             if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
-                int obj_id_pre = ir_find_local(ctx->func,
+                int obj_id_pre = lower_find_local(ctx,
                     expr->field.object->ident.name,
                     (uint32_t)expr->field.object->ident.name_len);
                 if (obj_id_pre >= 0) ot = ctx->func->locals[obj_id_pre].type;
@@ -1928,7 +1969,7 @@ static void rewrite_idents(LowerCtx *ctx, Node *expr) {
 
     switch (expr->kind) {
     case NODE_IDENT: {
-        int id = ir_find_local(ctx->func, expr->ident.name,
+        int id = lower_find_local(ctx, expr->ident.name,
                                (uint32_t)expr->ident.name_len);
         if (id >= 0) {
             IRLocal *l = &ctx->func->locals[id];
@@ -2919,7 +2960,7 @@ static int orelse_subject_root_local(LowerCtx *ctx, Node *e) {
         e = (e->kind == NODE_FIELD) ? e->field.object : e->index_expr.object;
     }
     if (!e || e->kind != NODE_IDENT) return -1;
-    return ir_find_local(ctx->func, e->ident.name, (uint32_t)e->ident.name_len);
+    return lower_find_local(ctx, e->ident.name, (uint32_t)e->ident.name_len);
 }
 
 /* ONE place tags a block as the null path of an orelse (was six copies). */
@@ -3384,6 +3425,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int sid = ir_add_local(ctx->func, ctx->arena,
                 node->var_decl.name, (uint32_t)node->var_decl.name_len,
                 vt, false, false, false, node->loc.line);
+            local_avoid_global_name(ctx, sid);   /* BUG-1409 */
             if (sid >= 0) {
                 ctx->func->locals[sid].is_static = true;
                 ctx->func->locals[sid].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
@@ -3400,6 +3442,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         int local_id = ir_add_local(ctx->func, ctx->arena,
             node->var_decl.name, (uint32_t)node->var_decl.name_len,
             vt, false, false, false, node->loc.line);
+        local_avoid_global_name(ctx, local_id);   /* BUG-1409 */
         if (local_id >= 0) ctx->func->locals[local_id].is_volatile = node->var_decl.is_volatile; /* #19 VOL-1 */
         /* BUG-1221: ZER auto-zeroes a declaration EVERY time it executes. Locals
          * are hoisted to the function top and zeroed there ONCE, so `u32 acc;`
@@ -3549,7 +3592,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     Node *tgt = expr->assign.target;
                     int dest_local_for_ident = -1;
                     if (tgt->kind == NODE_IDENT) {
-                        dest_local_for_ident = ir_find_local(ctx->func,
+                        dest_local_for_ident = lower_find_local(ctx,
                             tgt->ident.name,
                             (uint32_t)tgt->ident.name_len);
                     }
@@ -3667,7 +3710,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             bool lvalue = cn && (cn->kind == NODE_FIELD || cn->kind == NODE_INDEX ||
                 (cn->kind == NODE_UNARY && cn->unary.op == TOK_STAR) ||
                 (cn->kind == NODE_IDENT &&
-                 ir_find_local(ctx->func, cn->ident.name,
+                 lower_find_local(ctx, cn->ident.name,
                                (uint32_t)cn->ident.name_len) < 0));
             Type *ct = checker_get_type(ctx->checker, cn);
             Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
@@ -3713,6 +3756,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                 node->if_stmt.capture_name,
                 (uint32_t)node->if_stmt.capture_name_len,
                 if_cap_type, false, true, false, node->loc.line);
+        local_avoid_global_name(ctx, if_cap_id);   /* BUG-1409 */
         if (has_capture) {
             int cap_id = if_cap_id;
             if (cap_id >= 0 && br.cond_local >= 0) {
@@ -4530,7 +4574,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                          * For union/enum: emit normal IR_ASSIGN or IR_COPY. */
                         if (is_optional) {
                             /* IR_COPY src=sw_ref_local, dest=cap — type adaptation */
-                            int src_local = ir_find_local(ctx->func,
+                            int src_local = lower_find_local(ctx,
                                 sw_ref->ident.name, (uint32_t)sw_ref->ident.name_len);
                             if (src_local >= 0) {
                                 IRInst cop = make_inst(IR_COPY, node->loc.line);

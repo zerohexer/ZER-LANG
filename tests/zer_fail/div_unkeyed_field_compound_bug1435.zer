@@ -1,0 +1,5 @@
+// expect-error: complex divisor expression not proven nonzero
+// BUG-1435: the `/=` twin of the unkeyed field divisor.
+u32 get(u32 a) { return a; }
+struct S { u32 d; }
+u32 main() { S[2] s; u32 k = get(0); u32 x = 100; x /= s[k].d; return x; }

@@ -1,0 +1,6 @@
+// expect-error: divisor 's.d' not proven nonzero
+// BUG-1434: the loop pre-pass joined a field store `s.d = 0` into the ROOT `s`
+// only, so "s.d" kept the guard's known-nonzero across a zeroing loop body.
+u32 get(u32 a) { return a; }
+struct S { u32 d; }
+u32 main() { S s; s.d = get(1); u32 n = get(1); if (s.d == 0) { return 1; } while (n > 0) { s.d = 0; n -= 1; } return 100 / s.d; }

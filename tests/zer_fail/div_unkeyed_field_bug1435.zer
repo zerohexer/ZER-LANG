@@ -1,0 +1,6 @@
+// expect-error: complex divisor expression not proven nonzero
+// BUG-1435: a field divisor through a variable index has no VRP key; it was
+// neither "not proven" nor "complex" and was accepted with no proof at all.
+u32 get(u32 a) { return a; }
+struct S { u32 d; }
+u32 main() { S[2] s; u32 k = get(0); s[k].d = get(1); if (s[k].d == 0) { return 1; } k = 1; return 100 / s[k].d; }

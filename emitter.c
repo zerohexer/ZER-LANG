@@ -757,14 +757,8 @@ static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
         Node *callee = inst->expr->call.callee;
         /* Emit object name from local or rewritten ident */
         if (callee->field.object && callee->field.object->kind == NODE_IDENT) {
-            int obj_id = -1;
-            for (int li = 0; li < func->local_count; li++) {
-                if (func->locals[li].name_len == (uint32_t)callee->field.object->ident.name_len &&
-                    memcmp(func->locals[li].name, callee->field.object->ident.name,
-                           func->locals[li].name_len) == 0) {
-                    obj_id = li; break;
-                }
-            }
+            int obj_id = ir_find_local_first_named(func, callee->field.object->ident.name,
+                (uint32_t)callee->field.object->ident.name_len);   /* BUG-1486 */
             if (obj_id >= 0) {
                 Type *ot = func->locals[obj_id].type;
                 Type *ot_eff = ot ? type_unwrap_distinct(ot) : NULL;
@@ -6841,6 +6835,12 @@ static void emit_global_var(Emitter *e, Node *node) {
 }
 static void emit_global_var_inner(Emitter *e, Node *node) {
     Type *type = checker_get_type(e->checker,node);
+    /* BUG-1482: a builtin container is an anonymous C struct — a second
+     * declaration would be a different type, so it gets no forward declaration */
+    if (e->global_tentative && type &&
+        (type_dispatch_kind(type) == TYPE_POOL || type_dispatch_kind(type) == TYPE_RING ||
+         type_dispatch_kind(type) == TYPE_ARENA || type_dispatch_kind(type) == TYPE_SLAB))
+        return;
     /* threadlocal */
     if (node->var_decl.is_threadlocal) {
         emit(e, "__thread ");
@@ -6947,6 +6947,10 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
                               (uint32_t)node->var_decl.name_len, word_vol);
     }
 
+    if (e->global_tentative) {   /* BUG-1482: the declaration only */
+        emit(e, ";\n");
+        return;
+    }
     if (node->var_decl.init) {
         emit_static_storage_init(e, type, node->var_decl.init);
     } else {
@@ -7266,6 +7270,105 @@ static void emit_spawn_wrappers(Emitter *e) {
 
 /* RF2: unified top-level declaration emitter — used by both emit_file and emit_file_no_preamble.
  * Previously these were two parallel switch statements that had to stay in sync (BUG-086/087 class). */
+/* BUG-1482: a global initializer may name a global declared LATER in the same
+ * file — `*u32 p = &g; u32 g = 42;`. The checker accepts it (file scope has no
+ * declaration order in ZER), but the definitions are emitted in source order,
+ * so GCC met `&g` before `g` existed: "'g' undeclared". Before a global's
+ * definition, emit a C TENTATIVE DECLARATION (the same declaration, no
+ * initializer) of every later global its initializer names — legal C for any
+ * number of repetitions, and it survives cycles (`a = {.n = &b}; b = {.n = &a}`),
+ * which reordering would not. The walk follows a `const` global's own
+ * initializer, because emit_expr substitutes it there (BUG-997). Exhaustive: an
+ * initializer is an expression, but every child is descended anyway. */
+static void emit_forward_global_refs(Emitter *e, Node *n, Node *file_node,
+                                     int decl_index, int depth);
+static void emit_forward_global_one(Emitter *e, Node *id, Node *file_node,
+                                    int decl_index, int depth) {
+    for (int j = decl_index + 1; j < file_node->file.decl_count; j++) {
+        Node *d = file_node->file.decls[j];
+        if (!d || d->kind != NODE_GLOBAL_VAR ||
+            d->var_decl.name_len != id->ident.name_len ||
+            memcmp(d->var_decl.name, id->ident.name, id->ident.name_len) != 0)
+            continue;
+        if (d->var_decl.is_const && d->var_decl.init) {
+            /* emit_expr substitutes this initializer at the reference site */
+            emit_forward_global_refs(e, d->var_decl.init, file_node, decl_index, depth + 1);
+            return;
+        }
+        bool sv = e->global_tentative;
+        e->global_tentative = true;
+        emit_global_var(e, d);
+        e->global_tentative = sv;
+        return;
+    }
+}
+static void emit_forward_global_refs(Emitter *e, Node *n, Node *file_node,
+                                     int decl_index, int depth) {
+    if (!n || depth > 64) return;   /* a cycle of const substitutions is a checker error (BUG-975) */
+    #define EFG(x) emit_forward_global_refs(e, (x), file_node, decl_index, depth + 1)
+    switch (n->kind) {
+    case NODE_IDENT: emit_forward_global_one(e, n, file_node, decl_index, depth); return;
+    case NODE_FILE:
+        for (int i = 0; i < n->file.decl_count; i++) EFG(n->file.decls[i]);
+        return;
+    case NODE_FUNC_DECL: EFG(n->func_decl.body); return;
+    case NODE_INTERRUPT: EFG(n->interrupt.body); return;
+    case NODE_GLOBAL_VAR: case NODE_VAR_DECL: EFG(n->var_decl.init); return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) EFG(n->block.stmts[i]);
+        return;
+    case NODE_IF: EFG(n->if_stmt.cond); EFG(n->if_stmt.then_body); EFG(n->if_stmt.else_body); return;
+    case NODE_FOR:
+        EFG(n->for_stmt.init); EFG(n->for_stmt.cond); EFG(n->for_stmt.step); EFG(n->for_stmt.body);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE: EFG(n->while_stmt.cond); EFG(n->while_stmt.body); return;
+    case NODE_SWITCH:
+        EFG(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) EFG(n->switch_stmt.arms[i].body);
+        return;
+    case NODE_RETURN: EFG(n->ret.expr); return;
+    case NODE_DEFER: EFG(n->defer.body); return;
+    case NODE_EXPR_STMT: EFG(n->expr_stmt.expr); return;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) EFG(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) EFG(n->asm_stmt.outputs[i].expr);
+        return;
+    case NODE_CRITICAL: EFG(n->critical.body); return;
+    case NODE_ONCE: EFG(n->once.body); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) EFG(n->spawn_stmt.args[i]);
+        return;
+    case NODE_AWAIT: EFG(n->await_stmt.cond); return;
+    case NODE_STATIC_ASSERT: EFG(n->static_assert_stmt.cond); return;
+    case NODE_BINARY: EFG(n->binary.left); EFG(n->binary.right); return;
+    case NODE_UNARY: EFG(n->unary.operand); return;
+    case NODE_ASSIGN: EFG(n->assign.target); EFG(n->assign.value); return;
+    case NODE_CALL:
+        EFG(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) EFG(n->call.args[i]);
+        return;
+    case NODE_FIELD: EFG(n->field.object); return;
+    case NODE_INDEX: EFG(n->index_expr.object); EFG(n->index_expr.index); return;
+    case NODE_SLICE: EFG(n->slice.object); EFG(n->slice.start); EFG(n->slice.end); return;
+    case NODE_ORELSE: EFG(n->orelse.expr); EFG(n->orelse.fallback); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) EFG(n->intrinsic.args[i]);
+        return;
+    case NODE_TYPECAST: EFG(n->typecast.expr); return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) EFG(n->struct_init.fields[i].value);
+        return;
+    /* no child expression */
+    case NODE_STRUCT_DECL: case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_CAST: case NODE_SIZEOF:
+        return;
+    }
+    #undef EFG
+}
+
 static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int decl_index) {
     switch (decl->kind) {
     case NODE_STRUCT_DECL:
@@ -7327,6 +7430,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         break;
 
     case NODE_GLOBAL_VAR:
+        if (file_node && decl->var_decl.init)   /* BUG-1482 */
+            emit_forward_global_refs(e, decl->var_decl.init, file_node, decl_index, 0);
         emit_global_var(e, decl);
         break;
 
@@ -8601,13 +8706,7 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
     {
         bool is_local = false;
         if (func) {
-            for (int li = 0; li < func->local_count; li++) {
-                IRLocal *l = &func->locals[li];
-                if ((l->name_len == ol && memcmp(l->name, on, ol) == 0) ||
-                    (l->orig_name && l->orig_name_len == ol && memcmp(l->orig_name, on, ol) == 0)) {
-                    is_local = true; break;
-                }
-            }
+            is_local = ir_find_local_first(func, on, ol) >= 0;   /* BUG-1486 */
         }
         if (!is_local) {
             Symbol *gs = emit_decl_lookup(e, /* BUG-1450 */ on, ol);
@@ -9092,15 +9191,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
          * If the ident is NOT an IR local, look up in scope. If the symbol
          * has a module_prefix, emit module__name instead of bare name. */
         if (func) {
-            int lid = -1;
-            for (int li = 0; li < func->local_count; li++) {
-                if ((func->locals[li].name_len == ilen &&
-                     memcmp(func->locals[li].name, iname, ilen) == 0) ||
-                    (func->locals[li].orig_name_len == ilen &&
-                     memcmp(func->locals[li].orig_name, iname, ilen) == 0)) {
-                    lid = li; break;
-                }
-            }
+            int lid = ir_find_local_first(func, iname, ilen);   /* BUG-1486: was a scan per ident */
             if (lid < 0) {
                 /* Not a local — apply module name mangling.
                  * For functions: use symbol's module_prefix (functions are
@@ -9392,14 +9483,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             }
             /* Fallback: look up in IR locals (rewritten idents use IR local C names) */
             if (!ot && func) {
-                for (int li = 0; li < func->local_count; li++) {
-                    if (func->locals[li].name_len == (uint32_t)node->field.object->ident.name_len &&
-                        memcmp(func->locals[li].name, node->field.object->ident.name,
-                               func->locals[li].name_len) == 0) {
-                        ot = func->locals[li].type;
-                        break;
-                    }
-                }
+                int li = ir_find_local_first_named(func, node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);   /* BUG-1486 */
+                if (li >= 0) ot = func->locals[li].type;
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
@@ -9539,14 +9625,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             }
             /* IR local fallback for object type */
             if (!obj_type && node->field.object && node->field.object->kind == NODE_IDENT && func) {
-                for (int li = 0; li < func->local_count; li++) {
-                    if (func->locals[li].name_len == (uint32_t)node->field.object->ident.name_len &&
-                        memcmp(func->locals[li].name, node->field.object->ident.name,
-                               func->locals[li].name_len) == 0) {
-                        obj_type = func->locals[li].type;
-                        break;
-                    }
-                }
+                int li = ir_find_local_first_named(func, node->field.object->ident.name,
+                    (uint32_t)node->field.object->ident.name_len);   /* BUG-1486 */
+                if (li >= 0) obj_type = func->locals[li].type;
             }
             const char *acc = ".";
             if (obj_type) {
@@ -10146,14 +10227,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             }
             /* IR locals fallback */
             if (!ot && func) {
-                for (int li = 0; li < func->local_count; li++) {
-                    if (func->locals[li].name_len == (uint32_t)node->call.callee->field.object->ident.name_len &&
-                        memcmp(func->locals[li].name, node->call.callee->field.object->ident.name,
-                               func->locals[li].name_len) == 0) {
-                        ot = func->locals[li].type;
-                        break;
-                    }
-                }
+                int li = ir_find_local_first_named(func, node->call.callee->field.object->ident.name,
+                    (uint32_t)node->call.callee->field.object->ident.name_len);   /* BUG-1486 */
+                if (li >= 0) ot = func->locals[li].type;
             }
             if (ot) {
                 Type *ot_eff = type_unwrap_distinct(ot);
@@ -15395,6 +15471,10 @@ static void emit_line_map(Emitter *e, const char *src_file, int line, int *last)
  * `blocks` names as its false_block. `blocks` is the function's, or a defer
  * template's (whose instructions still carry the template's ORIGINAL ids). */
 static void emit_once_join_publish(Emitter *e, IRBlock *blocks, int n, int block_id) {
+    /* BUG-1486: called once per block, and it scans every block — quadratic in a
+     * long function. emit_once_decls has already numbered every @once of this
+     * function (body and defer templates); none means nothing to publish. */
+    if (e->once_n == 0) return;
     for (int bj = 0; bj < n; bj++) {
         for (int ij = 0; ij < blocks[bj].inst_count; ij++) {
             IRInst *in = &blocks[bj].insts[ij];

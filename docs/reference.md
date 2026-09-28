@@ -4783,8 +4783,13 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
 - The same rule covers a peripheral REGISTER reached through a pointer bound to a
   constant `@inttoptr` — even when each side forms its own pointer (`volatile *Regs
   u = @inttoptr(*Regs, 0x40000000); u.ctrl |= 1;` in the handler and in main): the
-  register is identified by its address and field, so both read-modify-writes must
-  sit inside `@critical`.
+  register is identified by the BYTES it occupies (BUG-1480), so `u[1]` through a
+  `*u32` at the base and `r.status` through a `*Regs` are the same register, and a
+  non-constant index `u[i]` counts as every register from the base to the end of
+  its `mmio` range. A write made by a helper THROUGH a pointer parameter
+  (`void setb(volatile *Regs p) { p.ctrl |= 2; }`, called with a register pointer)
+  lands on the register its argument points at (BUG-1481). Both sides'
+  read-modify-writes must sit inside `@critical`.
 - `Pool`, `Ring`, `Slab` and `Arena` cannot be shared between an interrupt
   handler and other code — their bookkeeping is updated in several non-atomic
   steps, and `volatile` cannot fix that. Give each context its own, or hand
@@ -6735,6 +6740,11 @@ void regular() {
     yield;   // COMPILE ERROR — 'yield' only allowed inside async function
 }
 ```
+
+**An async function must have a body** (BUG-1483). Its state struct, `_init` and
+`_poll` are generated from the body, so a bodyless `async void f();` is only legal as a
+forward declaration completed by a definition later in the program; with no definition it
+is a compile error ("async function 'f' is declared but never defined").
 
 **`await <condition>;`** suspends the coroutine until the boolean condition is
 true; the condition is re-evaluated on every poll. `poll` returns 0 while the

@@ -6785,6 +6785,27 @@ static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
     return true;
 }
 
+/* BUG-1480/1481: the MMIO register span types (see the BUG-1358 block below). */
+#define MMIO_SPAN_OPEN UINT64_MAX
+typedef struct { int param; uint64_t addr; bool exact; Type *pointee; } MmioBase;
+typedef struct { int param; uint64_t lo, hi; Type *type; } MmioSpan;
+/* The function being summarised (rmw_scan_body): parameters resolve to
+ * param-relative bases, with each parameter's stability computed once. */
+typedef struct {
+    Node *fd;
+    Type **ptypes;          /* the function's RESOLVED parameter types (its Symbol's
+                             * func_ptr type) — never resolve_type here: the summary
+                             * may be computed from another module's context */
+    uint32_t nptypes;
+    signed char *pstable;   /* per param: 0 unknown, 1 stable, -1 not */
+    struct MmioParamWrite *v;
+    int n, cap;
+    bool open;              /* allocation failed: summary unusable */
+} MmioPwAcc;
+
+static void mmio_pw_assign(Checker *c, MmioPwAcc *acc, Node *assign);
+static void mmio_pw_call(Checker *c, MmioPwAcc *acc, Symbol *cs, Node *call);
+
 /* BUG-801: does this function read-modify-write through pointer parameter n?
  *
  * The ISR/spawn sinks resolve an RMW to the global it lands on, but an RMW reached
@@ -6804,13 +6825,18 @@ static Node *rmw_target_root_ident(Node *t) {
     return (t && t->kind == NODE_IDENT) ? t : NULL;
 }
 
-static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int depth) {
+static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, MmioPwAcc *acc, int depth) {
     if (!n) return;
     /* BUG-1016: a void scan that stops recording past its cap under-reports the mask
      * (accept direction). The walk counts the block AND the statement inside it, so a
      * source nesting of ZER_STMT_NEST_MAX is ~2x that here; past the cap every param
      * is assumed read-modify-written — the same answer func_rmw_param_mask gives. */
-    if (depth > 4 * ZER_STMT_NEST_MAX) { *mask = ~(uint64_t)0; return; }
+    if (depth > 4 * ZER_STMT_NEST_MAX) {
+        *mask = ~(uint64_t)0;
+        if (acc) acc->open = true;   /* BUG-1481: summary unknown */
+        return;
+    }
+    if (n->kind == NODE_ASSIGN && acc) mmio_pw_assign(c, acc, n);   /* BUG-1481 */
     if (n->kind == NODE_ASSIGN) {
         Node *root = rmw_target_root_ident(n->assign.target);
         if (root) {
@@ -6840,6 +6866,7 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
                                   (uint32_t)n->call.callee->ident.name_len);
         if (cs && cs->is_function) {
             uint64_t cm = func_rmw_param_mask(c, cs, depth + 1);
+            if (acc) mmio_pw_call(c, acc, cs, n);   /* BUG-1481 */
             for (int ai = 0; ai < n->call.arg_count && ai < 64; ai++) {
                 if (!(cm & (1ULL << ai))) continue;
                 Node *ar = n->call.args[ai];
@@ -6873,7 +6900,7 @@ static void rmw_scan_body(Checker *c, Node *n, Node *fd, uint64_t *mask, int dep
      * expressions. The same shape as BUG-994 and BUG-999: an if-chain in a safety
      * walker is invisible to both walker audits, so it is converted, not extended.
      * A no-`default:` exhaustive switch — a new NodeKind is a build error here. */
-    #define RMWD(x) rmw_scan_body(c, (x), fd, mask, depth + 1)
+    #define RMWD(x) rmw_scan_body(c, (x), fd, mask, acc, depth + 1)
     switch (n->kind) {
     case NODE_BLOCK:
         for (int i = 0; i < n->block.stmt_count; i++) RMWD(n->block.stmts[i]);
@@ -6949,8 +6976,28 @@ static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth) {
     if (fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return 0;
     fn->rmw_summary_done = true;     /* set FIRST: recursion guard */
     uint64_t m = 0;
-    rmw_scan_body(c, fd->func_decl.body, fd, &m, 0);
+    /* BUG-1481: the register-write half is collected in the same pass */
+    MmioPwAcc acc;
+    memset(&acc, 0, sizeof(acc));
+    acc.fd = fd;
+    {
+        Type *ft = fn->type ? type_unwrap_distinct(fn->type) : NULL;
+        if (ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR) {
+            acc.ptypes = ft->func_ptr.params;
+            acc.nptypes = ft->func_ptr.param_count;
+        }
+    }
+    if (fd->func_decl.param_count > 0)
+        acc.pstable = (signed char *)calloc((size_t)fd->func_decl.param_count, 1);
+    if (fd->func_decl.param_count > 0 && !acc.pstable) acc.open = true;
+    rmw_scan_body(c, fd->func_decl.body, fd, &m, acc.open ? NULL : &acc, 0);
+    free(acc.pstable);
     fn->rmw_param_mask = m;
+    if (!acc.open) {   /* an unusable summary stays "not done" = conservative */
+        fn->mmio_pw = acc.v; fn->mmio_pw_count = acc.n; fn->mmio_pw_done = true;
+    } else {
+        free(acc.v);
+    }
     return m;
 }
 
@@ -7185,33 +7232,93 @@ static void for_each_write_target(Checker *c, Node *target, WriteTargetFn fn, vo
  * rule — keyed on global Symbols — never saw one reached through a pointer each
  * side forms itself: `interrupt U { volatile *Regs u = @inttoptr(*Regs, A);
  * u.ctrl |= 1; }` beside `main`'s own `u.ctrl |= 2` compiled with no critical
- * section on either side (a lost update to the register). Key such a WRITE on
- * the constant address plus its field / constant-index path, "MMIO 0x…​.ctrl":
- * both sides then meet in the same entry and the existing rule applies. The
- * pointer must be bound once to a constant `@inttoptr` and never rebound (the
- * trust rule for a declaration initializer, BUG-1056). Unresolvable shapes are
- * not keyed (they are the global rule's, or none). */
+ * section on either side (a lost update to the register).
+ *
+ * BUG-1480: the first fix keyed such a write on a STRING ("0x40000000.ctrl"),
+ * built from the field path. Two spellings of one register were then two keys,
+ * and every form the key builder did not list was no key at all: `u[1] |= 1`
+ * through a `*u32` (an INDEX on a pointer base), a non-constant index, the same
+ * register reached as `v[1]` and as `r.status`. A register is a BYTE SPAN of
+ * the constant address space, so that is what is recorded now — `MmioSpan`,
+ * with `hi == MMIO_SPAN_OPEN` meaning "somewhere from `lo` upward" (a
+ * non-constant index: the conservative answer) — and two writes are one
+ * register when their spans OVERLAP (check_mmio_register_sharing).
+ *
+ * BUG-1481: a write THROUGH A POINTER PARAMETER (`void setb(volatile *Regs u)
+ * { u.ctrl |= 2; }`, called from the ISR and from main with a pointer each side
+ * forms) was keyed at neither side: the helper's body is checked once, where
+ * `u` is a parameter with no address. The same span, relative to the parameter,
+ * is summarised per function (`Symbol.mmio_pw`, computed in rmw_scan_body's pass
+ * beside rmw_param_mask) and a call site adds the argument's address. The ISR
+ * walk, which DESCENDS into callees, binds each parameter to its argument's
+ * address instead (isr_mmio_frame_enter).
+ *
+ * The pointer must be bound to a constant `@inttoptr` (or `&` of a register, or
+ * a copy of such a pointer) and never rebound (the trust rule for a declaration
+ * initializer, BUG-1056). Unresolvable shapes are not keyed (they are the
+ * global rule's, or none). Types are derived STRUCTURALLY (declared types, never
+ * the typemap), so a helper whose body is checked AFTER the interrupt handler
+ * that calls it is seen the same way — the typemap route missed exactly that. */
+static int64_t compute_type_size(Type *t);
+static int64_t mmio_const_addr(Checker *c, Node *addr_arg);
 static bool mmio_bound_name_stable_in(Node *body, const char *name, uint32_t len,
                                       int expected_binds);
+
+static uint64_t mmio_add_sat(uint64_t a, uint64_t b) {
+    return (a > MMIO_SPAN_OPEN - b) ? MMIO_SPAN_OPEN : a + b;
+}
+/* Last byte of an object of type `t` at `lo`, or OPEN when unknown. */
+static uint64_t mmio_span_end(uint64_t lo, Type *t, bool exact) {
+    if (!exact || !t) return MMIO_SPAN_OPEN;
+    int64_t sz = compute_type_size(t);
+    if (sz == CONST_EVAL_FAIL || sz <= 0) return MMIO_SPAN_OPEN;
+    uint64_t end = mmio_add_sat(lo, (uint64_t)sz - 1);
+    return end;
+}
+static Type *mmio_pointee_of(Type *pt) {
+    if (!pt) return NULL;
+    pt = type_unwrap_distinct(pt);
+    if (type_dispatch_kind(pt) != TYPE_POINTER) return NULL;
+    return pt->pointer.inner;
+}
+/* Byte offset of field `idx` of struct `st`, the layout compute_type_size uses. */
+static int64_t mmio_struct_field_offset(Type *st, uint32_t idx) {
+    int64_t total = 0;
+    bool packed = st->struct_type.is_packed;
+    for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+        Type *ft = st->struct_type.fields[fi].type;
+        int falign = packed ? 1 : type_alignment_bytes(ft);
+        if (falign < 1) falign = 1;
+        if (!packed && falign > 1 && (total % falign) != 0)
+            total += falign - (total % falign);
+        if (fi == idx) return total;
+        int64_t fsize = compute_type_size(ft);
+        if (fsize == CONST_EVAL_FAIL || fsize <= 0) return CONST_EVAL_FAIL;
+        total += fsize;
+    }
+    return CONST_EVAL_FAIL;
+}
+
 /* BUG-1358: the ISR walk descends into CALLEE bodies from the handler's scope,
  * where a callee's local pointer is not in scope — so the walk records each
- * local bound to a constant @inttoptr as it passes the declaration (the
- * static_local_record pattern), and marks it unstable if the walk sees it
- * rebound. Reset per interrupt handler. Dynamic, not a fixed table. */
-typedef struct { const char *name; uint32_t len; uint64_t addr; bool unstable; } IsrMmioPtr;
+ * local as it passes the declaration (the static_local_record pattern) and marks
+ * it unstable if the walk sees it rebound. Reset per interrupt handler. Dynamic,
+ * not a fixed table.
+ * BUG-1481: the table is FRAMED. A descent opens a frame holding the callee's
+ * PARAMETERS, each bound to its argument's address (or to "not a register"), and
+ * lookups in the callee see only that frame — a callee's `u` must never resolve
+ * to the CALLER's `u` (which it did: the param case "worked" only when the two
+ * names happened to coincide). Every declaration is entered, register or not, so
+ * a non-register local shadows a same-named register pointer. */
+typedef struct { const char *name; uint32_t len; MmioBase base; bool is_mmio; bool unstable; } IsrMmioPtr;
 static IsrMmioPtr *_isr_mmio_ptrs = NULL;
 static int _isr_mmio_ptr_count = 0, _isr_mmio_ptr_cap = 0;
-static void isr_mmio_ptrs_reset(void) { _isr_mmio_ptr_count = 0; }
-static void isr_mmio_ptr_record(Node *vd) {
-    if (!vd || !vd->var_decl.name) return;
-    Node *init = vd->var_decl.init;
-    for (int i = 0; i < _isr_mmio_ptr_count; i++)   /* a second binding of the name */
-        if (_isr_mmio_ptrs[i].len == (uint32_t)vd->var_decl.name_len &&
-            memcmp(_isr_mmio_ptrs[i].name, vd->var_decl.name, vd->var_decl.name_len) == 0)
-            _isr_mmio_ptrs[i].unstable = true;
-    if (!init || init->kind != NODE_INTRINSIC || !init->intrinsic.addr_is_const ||
-        init->intrinsic.name_len != 8 || memcmp(init->intrinsic.name, "inttoptr", 8) != 0)
-        return;
+static int _isr_mmio_frame = 0;            /* first entry of the current frame */
+static bool _isr_mmio_walk_active = false; /* only record_isr_globals reads the table */
+static void isr_mmio_ptrs_reset(void) { _isr_mmio_ptr_count = 0; _isr_mmio_frame = 0; }
+static bool mmio_ptr_base(Checker *c, Node *p, MmioPwAcc *acc, MmioBase *b, int depth);
+static bool mmio_lvalue_span(Checker *c, Node *e, MmioPwAcc *acc, MmioSpan *sp, int depth);
+static void isr_mmio_ptr_push(const char *name, uint32_t len, const MmioBase *b, bool is_mmio) {
     if (_isr_mmio_ptr_count >= _isr_mmio_ptr_cap) {
         int nc = _isr_mmio_ptr_cap ? _isr_mmio_ptr_cap * 2 : 16;
         IsrMmioPtr *nt = (IsrMmioPtr *)realloc(_isr_mmio_ptrs, (size_t)nc * sizeof(IsrMmioPtr));
@@ -7219,98 +7326,368 @@ static void isr_mmio_ptr_record(Node *vd) {
         _isr_mmio_ptrs = nt; _isr_mmio_ptr_cap = nc;
     }
     IsrMmioPtr *e = &_isr_mmio_ptrs[_isr_mmio_ptr_count++];
-    e->name = vd->var_decl.name; e->len = (uint32_t)vd->var_decl.name_len;
-    e->addr = init->intrinsic.const_addr; e->unstable = false;
+    memset(e, 0, sizeof(*e));
+    e->name = name; e->len = len; e->is_mmio = is_mmio;
+    if (b) e->base = *b;
+}
+static void isr_mmio_ptr_record(Checker *c, Node *vd) {
+    if (!vd || !vd->var_decl.name) return;
+    uint32_t nl = (uint32_t)vd->var_decl.name_len;
+    for (int i = _isr_mmio_frame; i < _isr_mmio_ptr_count; i++)   /* a second binding */
+        if (_isr_mmio_ptrs[i].len == nl &&
+            memcmp(_isr_mmio_ptrs[i].name, vd->var_decl.name, nl) == 0)
+            _isr_mmio_ptrs[i].unstable = true;
+    MmioBase b;
+    bool ok = vd->var_decl.init && mmio_ptr_base(c, vd->var_decl.init, NULL, &b, 0) &&
+              b.param < 0;
+    if (ok && vd->var_decl.type) {
+        Type *dt = resolve_type(c, vd->var_decl.type);
+        Type *pe = mmio_pointee_of(dt);
+        if (pe) b.pointee = pe;
+    }
+    isr_mmio_ptr_push(vd->var_decl.name, nl, ok ? &b : NULL, ok);
 }
 static void isr_mmio_ptr_rebound(Node *target) {
     if (!target || target->kind != NODE_IDENT) return;
-    for (int i = 0; i < _isr_mmio_ptr_count; i++)
+    for (int i = _isr_mmio_frame; i < _isr_mmio_ptr_count; i++)
         if (_isr_mmio_ptrs[i].len == (uint32_t)target->ident.name_len &&
             memcmp(_isr_mmio_ptrs[i].name, target->ident.name, target->ident.name_len) == 0)
             _isr_mmio_ptrs[i].unstable = true;
 }
-static bool mmio_ptr_const_addr(Checker *c, Node *p, uint64_t *addr) {
-    if (!p) return false;
-    if (p->kind == NODE_INTRINSIC && p->intrinsic.addr_is_const &&
+/* BUG-1481: open a frame for a descent into `fd`, binding each parameter to the
+ * address of `call`'s matching argument (NULL call: a function reached through a
+ * binding, whose arguments are unknown — every parameter is "not a register").
+ * The arguments are resolved in the CALLER's frame, all of them before the frame
+ * opens, so a parameter named like a later argument cannot capture it. */
+typedef struct { int frame, count; } IsrMmioFrame;
+static IsrMmioFrame isr_mmio_frame_enter(Checker *c, Symbol *fs, Node *call) {
+    IsrMmioFrame sv = { _isr_mmio_frame, _isr_mmio_ptr_count };
+    Node *fd = fs ? fs->func_node : NULL;
+    Type *ft = fs && fs->type ? type_unwrap_distinct(fs->type) : NULL;
+    bool have_pt = ft && type_dispatch_kind(ft) == TYPE_FUNC_PTR;
+    int np = (fd && fd->kind == NODE_FUNC_DECL) ? fd->func_decl.param_count : 0;
+    /* resolve the arguments first, into entries past the current frame end */
+    for (int i = 0; i < np; i++) {
+        MmioBase b;
+        bool ok = call && i < call->call.arg_count &&
+                  mmio_ptr_base(c, call->call.args[i], NULL, &b, 0) && b.param < 0;
+        isr_mmio_ptr_push(NULL, 0, ok ? &b : NULL, ok);
+    }
+    _isr_mmio_frame = sv.count;   /* the new frame is exactly those entries */
+    for (int i = 0; i < np && sv.count + i < _isr_mmio_ptr_count; i++) {
+        ParamDecl *pd = &fd->func_decl.params[i];
+        IsrMmioPtr *e = &_isr_mmio_ptrs[sv.count + i];
+        e->name = pd->name; e->len = (uint32_t)pd->name_len;
+        if (e->is_mmio && have_pt && (uint32_t)i < ft->func_ptr.param_count) {
+            Type *pe = mmio_pointee_of(ft->func_ptr.params[i]);
+            if (pe) e->base.pointee = pe;
+        }
+        /* a parameter reassigned in the body is not the argument any more */
+        if (e->is_mmio && pd->name &&
+            !mmio_bound_name_stable_in(fd->func_decl.body, pd->name, (uint32_t)pd->name_len, 0))
+            e->unstable = true;
+    }
+    return sv;
+}
+static void isr_mmio_frame_leave(IsrMmioFrame sv) {
+    _isr_mmio_frame = sv.frame;
+    _isr_mmio_ptr_count = sv.count;
+}
+
+/* Is `id` a parameter of the function being summarised? Its index, or -1. */
+static int mmio_acc_param(MmioPwAcc *acc, Node *id) {
+    Node *fd = acc->fd;
+    for (int pi = 0; pi < fd->func_decl.param_count; pi++) {
+        ParamDecl *pd = &fd->func_decl.params[pi];
+        if (!pd->name || pd->name_len != id->ident.name_len ||
+            memcmp(pd->name, id->ident.name, pd->name_len) != 0) continue;
+        if (acc->pstable && acc->pstable[pi] == 0)
+            acc->pstable[pi] = mmio_bound_name_stable_in(fd->func_decl.body, pd->name,
+                                                         (uint32_t)pd->name_len, 0) ? 1 : -1;
+        return (acc->pstable && acc->pstable[pi] > 0) ? pi : -2;
+    }
+    return -1;
+}
+
+/* What does pointer expression `p` point at? An absolute constant address
+ * (`param == -1`) or an offset from parameter `param` (summary mode, `acc`).
+ * `exact` is false when only a lower bound is known (a non-constant index). */
+static bool mmio_ptr_base(Checker *c, Node *p, MmioPwAcc *acc, MmioBase *b, int depth) {
+    if (!p || depth > ZER_EXPR_WALK_MAX) return false;
+    memset(b, 0, sizeof(*b));
+    b->param = -1;
+    if (p->kind == NODE_INTRINSIC && acc) return false;   /* keyed where the body is checked */
+    if (p->kind == NODE_INTRINSIC &&
         p->intrinsic.name_len == 8 && memcmp(p->intrinsic.name, "inttoptr", 8) == 0) {
-        *addr = p->intrinsic.const_addr;
+        /* A body the checker has not reached yet (a helper declared after the
+         * handler that calls it) has no addr_is_const — fold the address here. */
+        if (p->intrinsic.addr_is_const) {
+            b->addr = p->intrinsic.const_addr;
+        } else {
+            int64_t a = p->intrinsic.arg_count > 0
+                ? mmio_const_addr(c, p->intrinsic.args[0]) : CONST_EVAL_FAIL;
+            if (a == CONST_EVAL_FAIL) return false;
+            b->addr = (uint64_t)a;
+        }
+        b->exact = true;
+        Type *pt = checker_get_type(c, p);
+        if (!pt && p->intrinsic.type_arg) pt = resolve_type(c, p->intrinsic.type_arg);
+        b->pointee = mmio_pointee_of(pt);
+        return true;
+    }
+    if (p->kind == NODE_UNARY && p->unary.op == TOK_AMP) {   /* &register */
+        MmioSpan sp;
+        if (!mmio_lvalue_span(c, p->unary.operand, acc, &sp, depth + 1)) return false;
+        b->param = sp.param; b->addr = sp.lo;
+        b->exact = sp.hi != MMIO_SPAN_OPEN;
+        b->pointee = sp.type;
         return true;
     }
     if (p->kind != NODE_IDENT) return false;
-    Symbol *s = scope_lookup(c->current_scope, p->ident.name, (uint32_t)p->ident.name_len);
-    if (!s && c->in_interrupt) {   /* a callee's local, met by the ISR walk */
-        for (int i = _isr_mmio_ptr_count - 1; i >= 0; i--)
-            if (_isr_mmio_ptrs[i].len == (uint32_t)p->ident.name_len &&
+    if (acc) {
+        /* summary mode: only the function's own parameters mean anything here —
+         * a write through a global pointer is keyed where the body is checked */
+        int pi = mmio_acc_param(acc, p);
+        if (pi < 0) return false;
+        b->param = pi; b->addr = 0; b->exact = true;
+        b->pointee = (acc->ptypes && (uint32_t)pi < acc->nptypes)
+            ? mmio_pointee_of(acc->ptypes[pi]) : NULL;
+        return true;
+    }
+    if (_isr_mmio_walk_active) {
+        for (int i = _isr_mmio_ptr_count - 1; i >= _isr_mmio_frame; i--)
+            if (_isr_mmio_ptrs[i].name && _isr_mmio_ptrs[i].len == (uint32_t)p->ident.name_len &&
                 memcmp(_isr_mmio_ptrs[i].name, p->ident.name, p->ident.name_len) == 0) {
-                if (_isr_mmio_ptrs[i].unstable) return false;
-                *addr = _isr_mmio_ptrs[i].addr;
+                if (!_isr_mmio_ptrs[i].is_mmio || _isr_mmio_ptrs[i].unstable) return false;
+                *b = _isr_mmio_ptrs[i].base;
                 return true;
             }
-        return false;
     }
+    Symbol *s = scope_lookup(c->current_scope, p->ident.name, (uint32_t)p->ident.name_len);
     if (!s || !s->func_node) return false;
     Node *d = s->func_node;
     if (d->kind != NODE_VAR_DECL && d->kind != NODE_GLOBAL_VAR) return false;
+    /* the walk resolves locals from its own table only (see above) */
+    if (_isr_mmio_walk_active && d->kind != NODE_GLOBAL_VAR) return false;
     Node *init = d->var_decl.init;
-    if (!init || init->kind != NODE_INTRINSIC || !init->intrinsic.addr_is_const ||
-        init->intrinsic.name_len != 8 || memcmp(init->intrinsic.name, "inttoptr", 8) != 0)
-        return false;
+    if (!init) return false;
     bool stable = d->kind == NODE_GLOBAL_VAR
         ? global_name_never_mutated(c, s)
         : mmio_bound_name_stable_in(c->current_body, s->name, s->name_len, 1);
     if (!stable) return false;
-    *addr = init->intrinsic.const_addr;
+    if (d->kind == NODE_GLOBAL_VAR) {
+        /* a global's initializer names other globals — resolving it from a
+         * function's scope could meet a local that shadows one; only the
+         * self-contained constant form is trusted */
+        if (init->kind != NODE_INTRINSIC) return false;
+    }
+    if (!mmio_ptr_base(c, init, NULL, b, depth + 1) || b->param >= 0) return false;
+    Type *pe = mmio_pointee_of(s->type);
+    if (pe) b->pointee = pe;
     return true;
 }
-/* Render the register key into `out` (NULL = measure). Returns the length, or
- * -1 when the path is not a constant-address register. Recursive over the
- * FIELD / constant-INDEX steps; the base must be a pointer bound to a constant
- * `@inttoptr` (or the intrinsic itself). Two passes (measure, then fill), so no
- * fixed buffer (audit_fixed_buffers). */
-static int mmio_register_key(Checker *c, Node *e, char *out, size_t cap, int depth) {
-    if (!e || depth > ZER_EXPR_WALK_MAX) return -1;
-    if (e->kind == NODE_FIELD || e->kind == NODE_INDEX) {
-        Node *obj = e->kind == NODE_FIELD ? e->field.object : e->index_expr.object;
-        int n;
-        TypeKind ok = type_dispatch_kind(checker_get_type(c, obj));
-        if (ok == TYPE_POINTER && e->kind == NODE_FIELD) {
-            uint64_t addr;
-            if (!mmio_ptr_const_addr(c, obj, &addr)) return -1;
-            n = snprintf(out, out ? cap : 0, "MMIO register 0x%llx", (unsigned long long)addr);
-        } else {
-            n = mmio_register_key(c, obj, out, cap, depth + 1);
-        }
-        if (n < 0) return -1;
-        char *o = out ? out + n : NULL;
-        size_t rem = out && (size_t)n < cap ? cap - (size_t)n : 0;
-        int m;
-        if (e->kind == NODE_FIELD) {
-            m = snprintf(o, rem, ".%.*s", (int)e->field.field_name_len, e->field.field_name);
-        } else {
-            int64_t k;
-            if (!eval_const_expr_ok(e->index_expr.index, &k)) return -1;
-            m = snprintf(o, rem, "[%lld]", (long long)k);
-        }
-        return m < 0 ? -1 : n + m;
-    }
+
+/* The byte span an lvalue designates, when it lies in constant MMIO space (or,
+ * in summary mode, relative to a parameter). */
+static bool mmio_lvalue_span(Checker *c, Node *e, MmioPwAcc *acc, MmioSpan *sp, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    MmioBase b;
     if (e->kind == NODE_UNARY && e->unary.op == TOK_STAR) {
-        uint64_t addr;
-        if (!mmio_ptr_const_addr(c, e->unary.operand, &addr)) return -1;
-        return snprintf(out, out ? cap : 0, "MMIO register 0x%llx", (unsigned long long)addr);
+        if (!mmio_ptr_base(c, e->unary.operand, acc, &b, depth + 1)) return false;
+        sp->param = b.param; sp->lo = b.addr; sp->type = b.pointee;
+        sp->hi = mmio_span_end(b.addr, b.pointee, b.exact);
+        return true;
     }
-    return -1;   /* a bare name is the global rule's */
+    if (e->kind == NODE_FIELD) {
+        MmioSpan cs;
+        if (mmio_ptr_base(c, e->field.object, acc, &b, depth + 1)) {
+            cs.param = b.param; cs.lo = b.addr; cs.type = b.pointee;
+            cs.hi = mmio_span_end(b.addr, b.pointee, b.exact);
+        } else if (!mmio_lvalue_span(c, e->field.object, acc, &cs, depth + 1)) {
+            return false;
+        }
+        /* a POINTER-typed container is an auto-deref through a stored pointer:
+         * the write lands wherever that pointer points, which is not known */
+        Type *st = cs.type ? type_unwrap_distinct(cs.type) : NULL;
+        if (!st || type_dispatch_kind(st) != TYPE_STRUCT) return false;
+        for (uint32_t fi = 0; fi < st->struct_type.field_count; fi++) {
+            SField *f = &st->struct_type.fields[fi];
+            if (f->name_len != (uint32_t)e->field.field_name_len ||
+                memcmp(f->name, e->field.field_name, f->name_len) != 0) continue;
+            int64_t off = mmio_struct_field_offset(st, fi);
+            if (off == CONST_EVAL_FAIL || off < 0) return false;
+            sp->param = cs.param;
+            sp->lo = mmio_add_sat(cs.lo, (uint64_t)off);
+            sp->type = f->type;
+            sp->hi = mmio_span_end(sp->lo, f->type, cs.hi != MMIO_SPAN_OPEN);
+            return true;
+        }
+        return false;
+    }
+    if (e->kind == NODE_INDEX) {
+        int64_t k = 0;
+        bool kc = eval_const_expr_ok(e->index_expr.index, &k) && k >= 0;
+        Type *elem;
+        uint64_t lo;
+        bool exact;
+        int param;
+        if (mmio_ptr_base(c, e->index_expr.object, acc, &b, depth + 1)) {
+            elem = b.pointee; lo = b.addr; exact = b.exact; param = b.param;
+        } else {
+            MmioSpan cs;
+            if (!mmio_lvalue_span(c, e->index_expr.object, acc, &cs, depth + 1)) return false;
+            Type *at = cs.type ? type_unwrap_distinct(cs.type) : NULL;
+            if (!at || type_dispatch_kind(at) != TYPE_ARRAY) return false;
+            elem = at->array.inner; lo = cs.lo; param = cs.param;
+            exact = cs.hi != MMIO_SPAN_OPEN;
+            if (!kc) {   /* somewhere in this array */
+                sp->param = param; sp->lo = lo; sp->hi = cs.hi; sp->type = elem;
+                return true;
+            }
+        }
+        sp->param = param; sp->type = elem;
+        if (!kc) {       /* somewhere from the base upward */
+            sp->lo = lo; sp->hi = MMIO_SPAN_OPEN;
+            return true;
+        }
+        int64_t es = elem ? compute_type_size(elem) : CONST_EVAL_FAIL;
+        if (es == CONST_EVAL_FAIL || es <= 0) {
+            sp->lo = lo; sp->hi = MMIO_SPAN_OPEN;
+            return true;
+        }
+        uint64_t off = ((uint64_t)k > MMIO_SPAN_OPEN / (uint64_t)es)
+            ? MMIO_SPAN_OPEN : (uint64_t)k * (uint64_t)es;
+        sp->lo = mmio_add_sat(lo, off);
+        sp->hi = mmio_span_end(sp->lo, elem, exact);
+        return true;
+    }
+    return false;   /* a bare name is the global rule's */
+}
+
+/* Record one register write from the current context. An OPEN span is clamped
+ * to the end of the declared `mmio` range that holds its start. */
+static void mmio_access_record(Checker *c, uint64_t lo, uint64_t hi, bool rmw,
+                               bool opaque, int line) {
+    if (hi == MMIO_SPAN_OPEN) {
+        for (int ri = 0; ri < c->mmio_range_count; ri++)
+            if (lo >= c->mmio_ranges[ri][0] && lo <= c->mmio_ranges[ri][1]) {
+                hi = c->mmio_ranges[ri][1];
+                break;
+            }
+    }
+    /* BUG-1059c: inside @critical the read-modify-write cannot be split */
+    if (c->critical_depth > 0) { rmw = false; opaque = false; }
+    if (c->mmio_access_count >= c->mmio_access_capacity) {
+        int nc = c->mmio_access_capacity ? c->mmio_access_capacity * 2 : 16;
+        struct MmioAccess *na = (struct MmioAccess *)realloc(c->mmio_accesses,
+                                    (size_t)nc * sizeof(struct MmioAccess));
+        if (!na) return;
+        c->mmio_accesses = na; c->mmio_access_capacity = nc;
+    }
+    struct MmioAccess *a = &c->mmio_accesses[c->mmio_access_count++];
+    memset(a, 0, sizeof(*a));
+    a->lo = lo; a->hi = hi < lo ? lo : hi;
+    a->from_isr = c->in_interrupt;
+    a->rmw = rmw; a->opaque = opaque;
+    a->isr_body = c->current_body;
+    a->line = line;
+}
+
+/* Is this assignment a read-modify-write of its register? A compound operator, a
+ * bit range, or the written-out form (`u.ctrl = u.ctrl | 1` — the value names the
+ * same pointer; name-level, like rmw_scan_body's test for a parameter). */
+static bool mmio_assign_is_rmw(Node *assign, Node *t) {
+    if (assign->assign.op != TOK_EQ) return true;
+    if (assign->assign.target && assign->assign.target->kind == NODE_SLICE) return true;
+    Node *root = rmw_target_root_ident(t);
+    return root && expr_mentions_name(assign->assign.value, root->ident.name,
+                                      (uint32_t)root->ident.name_len, 0);
 }
 static void track_mmio_register_write(Checker *c, Node *assign) {
     if (!assign || assign->kind != NODE_ASSIGN) return;
     Node *t = assign->assign.target;
-    bool is_rmw = assign->assign.op != TOK_EQ;
-    if (t && t->kind == NODE_SLICE) { is_rmw = true; t = t->slice.object; }  /* bit range */
-    int n = mmio_register_key(c, t, NULL, 0, 0);
-    if (n <= 0) return;
-    char *key = (char *)arena_alloc(c->arena, (size_t)n + 1);
-    if (!key) return;
-    mmio_register_key(c, t, key, (size_t)n + 1, 0);
-    track_isr_global_ex(c, key, (uint32_t)n, is_rmw, false, assign->loc.line);
+    if (t && t->kind == NODE_SLICE) t = t->slice.object;   /* bit range */
+    MmioSpan sp;
+    if (!mmio_lvalue_span(c, t, NULL, &sp, 0) || sp.param >= 0) return;
+    mmio_access_record(c, sp.lo, sp.hi, mmio_assign_is_rmw(assign, t), false,
+                       assign->loc.line);
+}
+
+/* BUG-1481: summary mode — a write through a parameter of acc->fd. */
+static void mmio_pw_add(MmioPwAcc *acc, int param, uint64_t lo, uint64_t hi, bool rmw) {
+    if (acc->open) return;
+    if (acc->n >= acc->cap) {
+        int nc = acc->cap ? acc->cap * 2 : 8;
+        struct MmioParamWrite *nv = (struct MmioParamWrite *)realloc(acc->v,
+                                        (size_t)nc * sizeof(struct MmioParamWrite));
+        if (!nv) { acc->open = true; return; }
+        acc->v = nv; acc->cap = nc;
+    }
+    struct MmioParamWrite *w = &acc->v[acc->n++];
+    w->param = param; w->lo = lo; w->hi = hi; w->rmw = rmw;
+}
+static void mmio_pw_assign(Checker *c, MmioPwAcc *acc, Node *assign) {
+    Node *t = assign->assign.target;
+    if (t && t->kind == NODE_SLICE) t = t->slice.object;
+    MmioSpan sp;
+    if (!mmio_lvalue_span(c, t, acc, &sp, 0) || sp.param < 0) return;
+    mmio_pw_add(acc, sp.param, sp.lo, sp.hi, mmio_assign_is_rmw(assign, t));
+}
+/* A callee's parameter writes, at a call whose argument `arg` has base `ab`. */
+static void mmio_pw_compose(struct MmioParamWrite *w, const MmioBase *ab,
+                            uint64_t *lo, uint64_t *hi) {
+    *lo = mmio_add_sat(ab->addr, w->lo);
+    *hi = (ab->exact && w->hi != MMIO_SPAN_OPEN) ? mmio_add_sat(ab->addr, w->hi)
+                                                 : MMIO_SPAN_OPEN;
+}
+static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth);
+/* Summary mode: a call inside acc->fd that hands a parameter-derived pointer on. */
+static void mmio_pw_call(Checker *c, MmioPwAcc *acc, Symbol *cs, Node *call) {
+    for (int ai = 0; ai < call->call.arg_count; ai++) {
+        MmioBase ab;
+        if (!mmio_ptr_base(c, call->call.args[ai], acc, &ab, 0) || ab.param < 0) continue;
+        if (!cs->mmio_pw_done) {   /* depth cap or recursion: assume the worst */
+            mmio_pw_add(acc, ab.param, ab.addr, MMIO_SPAN_OPEN, true);
+            continue;
+        }
+        for (int wi = 0; wi < cs->mmio_pw_count; wi++) {
+            struct MmioParamWrite *w = &cs->mmio_pw[wi];
+            if (w->param != ai) continue;
+            uint64_t lo, hi;
+            mmio_pw_compose(w, &ab, &lo, &hi);
+            mmio_pw_add(acc, ab.param, lo, hi, w->rmw);
+        }
+    }
+}
+/* Check mode: a call to a named function — its parameter writes land on the
+ * registers its arguments point at, in the CALLER's context. */
+static void mmio_call_site_record(Checker *c, Symbol *fn, Node *call) {
+    if (!fn || !fn->is_function) return;
+    (void)func_rmw_param_mask(c, fn, 0);
+    for (int ai = 0; ai < call->call.arg_count; ai++) {
+        MmioBase ab;
+        if (!mmio_ptr_base(c, call->call.args[ai], NULL, &ab, 0) || ab.param >= 0) continue;
+        if (!fn->mmio_pw_done) {
+            if (fn->func_node && fn->func_node->kind == NODE_FUNC_DECL &&
+                fn->func_node->func_decl.body)
+                mmio_access_record(c, ab.addr, MMIO_SPAN_OPEN, true, false, call->loc.line);
+            continue;
+        }
+        for (int wi = 0; wi < fn->mmio_pw_count; wi++) {
+            struct MmioParamWrite *w = &fn->mmio_pw[wi];
+            if (w->param != ai) continue;
+            uint64_t lo, hi;
+            mmio_pw_compose(w, &ab, &lo, &hi);
+            mmio_access_record(c, lo, hi, w->rmw, false, call->loc.line);
+        }
+    }
+}
+/* A register pointer handed to a call the analysis cannot see (a function
+ * pointer): the callee MAY read-modify-write anything from there upward. */
+static void mmio_opaque_arg_record(Checker *c, Node *arg, int line) {
+    MmioBase ab;
+    if (!mmio_ptr_base(c, arg, NULL, &ab, 0) || ab.param >= 0) return;
+    mmio_access_record(c, ab.addr, MMIO_SPAN_OPEN, false, true, line);
 }
 
 /* The main-checker RMW sink, per target (BUG-1124). `ud` is the NODE_ASSIGN. */
@@ -15215,6 +15592,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 : NULL;
             if (rc && rc->is_function) {
                 uint64_t rm = func_rmw_param_mask(c, rc, 0);
+                mmio_call_site_record(c, rc, node);   /* BUG-1481 */
                 for (int i = 0; rm && i < node->call.arg_count && i < 64; i++) {
                     if (!(rm & (1ULL << i))) continue;
                     /* BUG-1046: `&g`, a local alias `q` (bound `&g` at its
@@ -15231,6 +15609,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 for (int i = 0; i < node->call.arg_count; i++) {
                     rmw_arg_targets_main(c, node->call.args[i],
                                          track_opaque_arg_visit, NULL);   /* BUG-1124 */
+                    mmio_opaque_arg_record(c, node->call.args[i], node->loc.line);   /* BUG-1481 */
                 }
             }
         }
@@ -30696,6 +31075,7 @@ static void esc_restore(Checker *c, const Checker *snap) {
     ESC_KEEP_BUF(prov_summaries, prov_summary_capacity);
     ESC_KEEP_BUF(param_expects, param_expect_capacity);
     ESC_KEEP_BUF(isr_globals, isr_global_capacity);
+    ESC_KEEP_BUF(mmio_accesses, mmio_access_capacity);   /* BUG-1480 */
     ESC_KEEP_BUF(atomic_plain_writes, atomic_plain_write_capacity);
     ESC_KEEP_BUF(atomic_args, atomic_arg_cap);
     ESC_KEEP_BUF(atomic_fields, atomic_field_capacity);
@@ -30745,6 +31125,27 @@ static void check_func_body(Checker *c, Node *node) {
 }
 
 static void check_func_body_once(Checker *c, Node *node) {
+    /* BUG-1483: an async function's state struct, _init and _poll are generated
+     * FROM ITS BODY, so a bodyless `async void f();` with no definition anywhere
+     * has nothing to generate — the checker accepted it and the emitted C named
+     * `_zer_async_f`, which GCC refused ("unknown type name"). A forward
+     * declaration completed by a later definition is fine (the Symbol then
+     * points at the definition). There is no extern-async: C cannot provide the
+     * state machine. */
+    if (node->kind == NODE_FUNC_DECL && !node->func_decl.body && node->func_decl.is_async) {
+        Symbol *as = scope_lookup(c->current_scope, node->func_decl.name,
+                                  (uint32_t)node->func_decl.name_len);
+        if (!as || !as->func_node || as->func_node->kind != NODE_FUNC_DECL ||
+            !as->func_node->func_decl.body)
+            checker_error(c, node->loc.line,
+                "async function '%.*s' is declared but never defined — an async "
+                "function's state machine (_zer_async_%.*s, its _init and _poll) is "
+                "generated from its body, so it cannot be an external declaration. "
+                "Give it a body",
+                (int)node->func_decl.name_len, node->func_decl.name,
+                (int)node->func_decl.name_len, node->func_decl.name);
+        return;
+    }
     if (node->kind == NODE_FUNC_DECL && node->func_decl.body) {
         /* resolve return type */
         Type *ret = resolve_type(c, node->func_decl.return_type);
@@ -31147,7 +31548,9 @@ static void check_func_body_once(Checker *c, Node *node) {
          * still set so track_isr_global tags them from_isr. */
         _isr_depth_reported = false;   /* BUG-976: per interrupt */
         isr_mmio_ptrs_reset();          /* BUG-1358 */
+        _isr_mmio_walk_active = true;   /* BUG-1481: the walk's own frame table */
         record_isr_globals(c, node->interrupt.body, 0);
+        _isr_mmio_walk_active = false;
         pop_scope(c);
         c->in_interrupt = false;
         _isr_effects_scope = NULL;   /* BUG-1425 */
@@ -32477,7 +32880,9 @@ static void record_isr_funcname_binding(Checker *c, Node *value, int depth) {
     if (fs && fs->is_function && fs->func_node &&
         fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
         DeclModuleSave dm = decl_module_enter(c, fs);   /* BUG-1199 */
+        IsrMmioFrame mf = isr_mmio_frame_enter(c, fs, NULL);   /* BUG-1481 */
         record_isr_globals(c, fs->func_node->func_decl.body, depth + 1);
+        isr_mmio_frame_leave(mf);
         decl_module_leave(c, dm);
     }
 }
@@ -32507,7 +32912,9 @@ static bool isr_record_bound_fn(Checker *c, Symbol *fs, void *ud) {
     if (!fs || !fs->func_node || fs->func_node->kind != NODE_FUNC_DECL ||
         !fs->func_node->func_decl.body) return false;
     DeclModuleSave dm = decl_module_enter(c, fs);
+    IsrMmioFrame mf = isr_mmio_frame_enter(c, fs, NULL);   /* BUG-1481 */
     record_isr_globals(c, fs->func_node->func_decl.body, depth);
+    isr_mmio_frame_leave(mf);
     decl_module_leave(c, dm);
     return false;   /* record every bound function */
 }
@@ -32607,7 +33014,10 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
                                     rmw_bind_param_visit, &_bu);   /* BUG-1124 */
                 }
                 DeclModuleSave dm = decl_module_enter(c, cs);   /* BUG-1199 */
+                /* BUG-1481: bind each parameter to its argument's register */
+                IsrMmioFrame mf = isr_mmio_frame_enter(c, cs, node);
                 record_isr_globals(c, cs->func_node->func_decl.body, depth + 1);
+                isr_mmio_frame_leave(mf);
                 decl_module_leave(c, dm);
                 _rmw_alias_count = _sv;
             }
@@ -32625,8 +33035,10 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
         }
         /* BUG-1046: the ISR sibling of the spawn scan's opaque-call rule. */
         if (callee_is_opaque_funcptr(c, node->call.callee)) {
-            for (int i = 0; i < node->call.arg_count; i++)
+            for (int i = 0; i < node->call.arg_count; i++) {
                 rmw_arg_targets(c, node->call.args[i], isr_opaque_visit, NULL);   /* BUG-1124 */
+                mmio_opaque_arg_record(c, node->call.args[i], node->loc.line);   /* BUG-1481 */
+            }
         }
         return;
     }
@@ -32656,7 +33068,7 @@ static void record_isr_globals(Checker *c, Node *node, int depth) {
          * `*p += 1` in this ISR resolves to counter. Same mechanism as the spawn
          * scan's var-decl arm — the two sinks must learn a form together. */
         static_local_record(node);   /* BUG-971 */
-        isr_mmio_ptr_record(node);   /* BUG-1358 */
+        isr_mmio_ptr_record(c, node);   /* BUG-1358 */
         /* BUG-976: record the overflow at BOTH scans — the two NODE_VAR_DECL arms are
          * the mirrored sink pair, so a flag set at one and not the other is exactly
          * the drift this class is made of. */
@@ -33771,8 +34183,61 @@ static void check_atomic_cell_safety(Checker *c) {
     }
 }
 
+/* BUG-1358 / BUG-1480: memory-mapped registers shared between an interrupt
+ * handler and main code (or a second handler). Matched by OVERLAP of byte spans
+ * — one register may be spelled `u.ctrl`, `v[0]`, `*r` or reached through a
+ * helper's parameter. It is volatile by construction (BUG-1195) and one word;
+ * only the read-modify-write half of the rule applies: some write to the span is
+ * an RMW (or MAY be one, handed to a call the analysis cannot see), and the
+ * writes to it come from an interrupt AND from another context. Quadratic in the
+ * number of register writes, which is the number of such statements. */
+static void check_mmio_register_sharing(Checker *c) {
+    int n = c->mmio_access_count;
+    for (int i = 0; i < n; i++) {
+        struct MmioAccess *r = &c->mmio_accesses[i];
+        if ((!r->rmw && !r->opaque) || r->reported) continue;
+        bool isr = r->from_isr, main_side = !r->from_isr, multi = false;
+        const Node *isr_body = r->from_isr ? r->isr_body : NULL;
+        for (int j = 0; j < n; j++) {
+            struct MmioAccess *o = &c->mmio_accesses[j];
+            if (j == i || o->hi < r->lo || o->lo > r->hi) continue;
+            if (o->from_isr) {
+                if (isr_body && o->isr_body != isr_body) multi = true;
+                if (!isr_body) isr_body = o->isr_body;
+                isr = true;
+            } else {
+                main_side = true;
+            }
+        }
+        if (!isr || (!main_side && !multi)) continue;
+        for (int j = 0; j < n; j++) {   /* one diagnostic per overlapping group */
+            struct MmioAccess *o = &c->mmio_accesses[j];
+            if (!(o->hi < r->lo || o->lo > r->hi)) o->reported = true;
+        }
+        const char *other = main_side ? "main" : "another interrupt handler";
+        unsigned long long slo = (unsigned long long)r->lo, shi = (unsigned long long)r->hi;
+        if (r->rmw)
+            checker_error(c, r->line,
+                "MMIO register at 0x%llx..0x%llx is read-modify-written and is written "
+                "from both interrupt and %s code — the read and the write can be split "
+                "by an interrupt, losing an update; do the read/modify/write inside "
+                "@critical on every side",
+                slo, shi, other);
+        else
+            checker_error(c, r->line,
+                "MMIO register at 0x%llx..0x%llx is written from both interrupt and %s "
+                "code and a pointer to it is passed to a call through a function pointer "
+                "— the analysis cannot see that callee, so it cannot rule out a "
+                "read-modify-write there, which an interrupt can split, losing an update. "
+                "Call the helper by name so its body can be checked, or do the access "
+                "inside @critical",
+                slo, shi, other);
+    }
+}
+
 /* Post-check: validate interrupt safety for shared globals */
 static void check_interrupt_safety(Checker *c) {
+    check_mmio_register_sharing(c);   /* BUG-1480 */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
         /* shared = touched from an ISR AND from main, or from TWO ISRs (BUG-1059d) */
@@ -33791,19 +34256,6 @@ static void check_interrupt_safety(Checker *c) {
                 "can. Pass the value in and out, or make it a shared struct / "
                 "@atomic_* cell",
                 (int)g->name_len, g->name);
-            continue;
-        }
-        if (g->name_len > 14 && memcmp(g->name, "MMIO register ", 14) == 0) {
-            /* BUG-1358: a register reached through a constant @inttoptr pointer.
-             * It is volatile by construction (BUG-1195) and one word; only the
-             * read-modify-write half of the rule applies. */
-            if (g->compound_in_isr || g->compound_in_func)
-                checker_error(c, g->decl_line,
-                    "%.*s is read-modify-written and is written from both interrupt "
-                    "and %s code — the read and the write can be split by an "
-                    "interrupt, losing an update; do the read/modify/write inside "
-                    "@critical on every side",
-                    (int)g->name_len, g->name, other);
             continue;
         }
         Symbol *sym = g->sym ? g->sym : global_decl_lookup(c, g->name, g->name_len);
@@ -37777,7 +38229,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
 
     /* Interrupt safety — validate shared globals (global state, collected while
      * every body was checked) */
-    if (c->isr_global_count > 0) {
+    if (c->isr_global_count > 0 || c->mmio_access_count > 0) {   /* BUG-1480 */
         check_interrupt_safety(c);
     }
     /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */

@@ -1,0 +1,5 @@
+// BUG-1483 boundary: a FORWARD-declared async completed by a later definition still works.
+async void f();
+u32 cnt;
+async void f() { cnt += 1; yield; cnt += 1; }
+u32 main() { _zer_async_f t; _zer_async_f_init(&t); while (!_zer_async_f_poll(&t)) { } if (cnt != 2) { return 1; } return 0; }

@@ -1,0 +1,9 @@
+// EXPECTED: compile error
+// expect-error: is read-modify-written and is written from both interrupt
+// BUG-1481: the RMW happens through a helper's pointer PARAMETER; each side forms
+// its own pointer to the peripheral and hands it to the helper.
+mmio 0x40000000..0x4000FFFF;
+struct Regs { u32 ctrl; u32 status; }
+void setb(volatile *Regs p) { p.ctrl |= 2; }
+interrupt USART1 { volatile *Regs a = @inttoptr(*Regs, 0x40000000); setb(a); }
+u32 main() { volatile *Regs b = @inttoptr(*Regs, 0x40000000); setb(b); return 0; }

@@ -167,6 +167,7 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+    bool global_tentative;   /* BUG-1482: emitting a forward (tentative) declaration of a global */
     /* BUG-1442: > 0 while emitting a STATIC LOCAL's initializer. GCC accepts a
      * compound literal `(T){ … }` as a file-scope initializer, but at BLOCK
      * scope a NESTED one is "initializer element is not constant"

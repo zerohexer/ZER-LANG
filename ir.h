@@ -390,9 +390,17 @@ typedef struct {
     /* BUG-1394: name index over `locals` for ir_find_local_exact_first — two
      * open-addressing tables (exact name, orig_name) holding the LAST id with
      * that spelling. Built lazily and extended incrementally as locals are
-     * appended (locals are never renamed or removed). Heap-allocated so the
+     * appended (locals are never removed; a RENAME goes through ir_local_rename,
+     * which resets this). Heap-allocated so the
      * arena-owned IRFunc stays a plain value. NULL until first lookup. */
     struct IRNameIndex *name_index;
+    /* BUG-1486: the index behind ir_find_local and ir_add_local's dedup — for
+     * each spelling, every local whose orig_name OR name has it, in id order
+     * (so "last visible, else last" is a walk from the end, reading `hidden`
+     * live). The linear scans made lowering quadratic in the number of locals:
+     * 20,000 straight-line statements took 5.7 s, 100,000 over 2 minutes.
+     * A rename (ir_local_rename) rebuilds it. NULL until first lookup. */
+    struct IRLookupIndex *lookup_index;
 } IRFunc;
 
 /* ================================================================
@@ -412,6 +420,15 @@ int ir_find_local(IRFunc *func, const char *name, uint32_t name_len);
 /* BUG-1470: ZerLocalVolFn for checker_expr_reads_volatile (ud = IRFunc *). */
 int ir_local_volatile_by_name(void *ud, const char *name, uint32_t len);
 int ir_find_local_exact_first(IRFunc *func, const char *name, uint32_t name_len);
+/* Change a local's C name after it was added (BUG-1486: keeps the name indexes
+ * right — the only sanctioned way to write IRLocal.name). */
+void ir_local_rename(IRFunc *func, int id, const char *name, uint32_t name_len);
+/* BUG-1486: the FIRST local (lowest id) whose name or orig_name is `name` —
+ * "is this spelling an IR local at all?" — and the first whose C `name` is
+ * exactly `name`. -1 when none. Indexed; the emitter asked both by linear scan
+ * once per identifier. */
+int ir_find_local_first(IRFunc *func, const char *name, uint32_t name_len);
+int ir_find_local_first_named(IRFunc *func, const char *name, uint32_t name_len);
 
 /* Create a new basic block. Returns the block ID. */
 int ir_add_block(IRFunc *func, Arena *arena);

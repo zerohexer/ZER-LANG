@@ -509,8 +509,7 @@ static void local_avoid_global_name(LowerCtx *ctx, int id) {
     if (!nn) return;
     memcpy(nn, l->name, l->name_len);
     memcpy(nn + l->name_len, buf, (size_t)sl + 1);
-    l->name = nn;
-    l->name_len += (uint32_t)sl;
+    ir_local_rename(ctx->func, id, nn, l->name_len + (uint32_t)sl);   /* BUG-1486 */
 }
 
 static int create_temp(LowerCtx *ctx, Type *type, int line) {

@@ -304,6 +304,10 @@ typedef struct {
 struct Node {
     NodeKind kind;
     SrcLoc loc;
+    /* BUG-1484: the height of this expression subtree (a leaf is 1), stamped by
+     * the PARSER so it can bound AST depth. 0 = not computed yet. Only the parser
+     * reads it; later passes may rewrite the tree freely. */
+    uint32_t parse_height;
 
     union {
         /* NODE_FILE: root of compilation unit */

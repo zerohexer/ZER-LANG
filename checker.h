@@ -464,6 +464,23 @@ typedef struct {
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;
+    /* BUG-1480: writes to MEMORY-MAPPED registers, as BYTE SPANS [lo, hi] of the
+     * constant address space (hi == UINT64_MAX: "from lo upward", the answer for a
+     * non-constant index). Collect-then-check like isr_globals, but matched by
+     * OVERLAP rather than by name: `u[1]` through a `*u32` at 0x40000000 and
+     * `v.status` through a `*Regs` at the same base are one register, and a key
+     * string cannot say so. */
+    struct MmioAccess {
+        uint64_t lo, hi;
+        bool from_isr;
+        bool rmw;            /* read-modify-write (compound op, bit range, written-out) */
+        bool opaque;         /* handed to a call the analysis cannot see — MAY be RMW'd */
+        bool reported;
+        const Node *isr_body;
+        int line;
+    } *mmio_accesses;
+    int mmio_access_count;
+    int mmio_access_capacity;
 
     /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
      * recorded during check; post-check flags any whose symbol got marked

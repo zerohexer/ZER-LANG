@@ -30,6 +30,18 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 MMIO / parser / compile-time round (BUG-1480..1487)
+
+1. **MMIO register sharing** does not follow a local alias of a parameter inside a helper
+   (`r = p; r.x |= 1`), a struct carrying a register pointer, a function reached through a
+   funcptr binding (walked with parameters unbound), or a global register pointer not
+   initialised directly with `@inttoptr`; register READS are not recorded.
+2. The parser's 256 depth limit protects an -O2 zerc on a 1 MB stack; an -O0 build crashes
+   near 200 levels either way.
+3. Remaining super-linear compile time: the VRP store scans every recorded range
+   (`vrp_apply_store` / `vrp_key_relation` — 20,000 local declarations take ~2.3 s), and
+   zercheck_ir looks function summaries up linearly (20,000 functions ~1.9 s).
+
 ## OPEN — residuals of the 2026-09-28 single-evaluation / lock round (BUG-1470..1476)
 
 1. A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an

@@ -30,6 +30,20 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 round-4 hunt (BUG-1490..1510; measured)
+
+1. **Leak half of a joined identity (BUG-1490).** When a pointer names allocation A on one
+   path and B on the other, a free through it marks the kept identity FREED on both paths, so
+   a leak of A on the path that pointed at B is not reported. Memory safety is intact (every
+   member is checked at a use); only the leak diagnostic is lost.
+2. **A literal tree whose exact value lies outside int64** (`(i128)(0 - 10000000000000000000)`)
+   is not retyped wider and still wraps at 64 bits (BUG-1505 residual — pre-existing).
+3. **Label functions widen VRP over the whole body** when anything takes an address (BUG-1499):
+   sound, but a function with a label and an `&` anywhere loses ranges it could keep.
+4. **Every call inside an async body widens every frame-local range** (BUG-1503) — the price of
+   a possible re-entrant `_poll`. A whole-program "does this call reach a poll of this task?"
+   query would recover it.
+
 ## OPEN — residuals of the 2026-09-28 MMIO / parser / compile-time round (BUG-1480..1487)
 
 1. **MMIO register sharing** does not follow a local alias of a parameter inside a helper

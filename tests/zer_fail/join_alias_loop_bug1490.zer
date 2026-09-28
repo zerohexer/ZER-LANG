@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: the loop back edge re-aims the pointer before the free.
+struct N { u32 v; }
+u32 main() {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    a.v = 1; b.v = 2;
+    *N p = a;
+    for (u32 i = 0; i < 2; i += 1) {
+        if (i == 1) { free(p); }
+        p = b;
+    }
+    *N r = alloc(N) orelse { free(a); free(b); return 1; };
+    r.v = 99;
+    u32 out = b.v;
+    free(a);
+    free(b);
+    free(r);
+    return out;
+}

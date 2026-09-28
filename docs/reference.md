@@ -2152,7 +2152,15 @@ free(xs);                                    // release a [*]T
   `x` must be the pointer `alloc` handed out: freeing a VIEW inside the
   allocation — a sub-slice that does not start at 0 (`s[1..4]`), or the address
   of an element / field (`&s[2]`) — is a compile error, directly or through a
-  callee that frees its parameter (BUG-1230).
+  callee that frees its parameter (BUG-1230). A view reaching the free through a
+  branch (`if (c) { s = b[2..6]; } free(s);`), an assignment, or the result of a
+  call that returns such a view of its argument (`free(tail(b))`) counts too
+  (BUG-1491).
+- A pointer that names DIFFERENT allocations on different paths
+  (`*T p = a; if (c) { p = b; }`) may be either after the join: freeing
+  through it makes both "maybe freed", so a later use or free of `a` or `b` is
+  refused (BUG-1490). The free-then-replace idiom
+  (`if (c) { free(p); p = alloc(T) orelse return; }`) is unaffected.
 - A freed pointer is dead wherever it is carried: handing a callee a struct
   (by value or `&`) whose field still holds a freed pointer is refused like
   passing the pointer itself (BUG-1225) — reset the field (`h.p = null;`) after

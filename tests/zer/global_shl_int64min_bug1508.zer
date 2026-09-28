@@ -1,0 +1,21 @@
+// BUG-1508: a global initializer folding to the bit pattern 0x8000000000000000
+// (== INT64_MIN == CONST_EVAL_FAIL) was read as "not a constant" and fell back
+// to the `_zer_shl` statement expression at FILE scope (GCC refused it); the
+// constant-count arm also did not see through a CAST count.
+const u64 TOP = (u64)1 << (u64)63;
+const u64 TOP2 = 9223372036854775808;
+u64 top3 = (u64)1 << 63;
+const i64 MIN = -9223372036854775807 - 1;
+const u32 S = (u32)1 << (u32)31;
+?u64 otop = (u64)1 << (u64)63;
+u32 main() {
+    if (TOP == 0) { return 1; }
+    if (TOP != TOP2) { return 2; }
+    if (top3 != TOP) { return 3; }
+    if (MIN >= 0) { return 4; }
+    if ((u64)(MIN) != TOP) { return 5; }
+    if (S != 2147483648) { return 6; }
+    u64 o = otop orelse 0;
+    if (o != TOP) { return 7; }
+    return 0;
+}

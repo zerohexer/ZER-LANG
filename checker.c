@@ -2132,10 +2132,41 @@ static void retype_const_int_to_target(Checker *c, Node *e, Type *target) {
  * the tree to `want` when it fits (the value then computes in that width), else,
  * when any node of it is negative, to i64 — the mathematical value, which the
  * operation then converts. A non-negative tree that does not fit keeps its typing. */
+/* BUG-1505: the MATHEMATICAL value of a pure literal tree, or false when the
+ * int64 fold is not that value. The untyped fold reads a leaf's u64 bit pattern
+ * as int64, so a literal in [2^63, 2^64) folded NEGATIVE and the tree was
+ * retyped to i64: `(u128)17520661291542297623` and `(u128)0xFFFF_FFFF_FFFF_FFFF`
+ * were sign-extended (high 64 bits all ones), `(f64)L` came out negative. A
+ * leaf above INT64_MAX has no exact int64 reading, and a left shift that
+ * carries bits into (or past) the sign bit is not the product it claims to be;
+ * every other operator of eval_const_expr_core already refuses on overflow. */
+static bool lit_tree_exact_int64(Node *e, int depth, int64_t *out) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return false;
+    if (e->kind == NODE_INT_LIT) {
+        if (e->int_lit.value > (uint64_t)INT64_MAX) return false;
+        *out = (int64_t)e->int_lit.value;
+        return true;
+    }
+    int64_t l = 0, r = 0;
+    if (e->kind == NODE_UNARY) {
+        if (!lit_tree_exact_int64(e->unary.operand, depth + 1, &l)) return false;
+    } else if (e->kind == NODE_BINARY) {
+        if (!lit_tree_exact_int64(e->binary.left, depth + 1, &l) ||
+            !lit_tree_exact_int64(e->binary.right, depth + 1, &r)) return false;
+    } else {
+        return false;
+    }
+    int64_t v;
+    if (!eval_const_expr_ok(e, &v)) return false;
+    if (e->kind == NODE_BINARY && e->binary.op == TOK_LSHIFT && r >= 0 && r < 63 &&
+        (l < 0 || (v >> r) != l)) return false;
+    *out = v;
+    return true;
+}
 static bool literal_tree_has_negative(Node *e, int depth) {
     if (!e || depth > ZER_EXPR_WALK_MAX) return false;
-    int64_t v = eval_const_expr(e);
-    if (v != CONST_EVAL_FAIL && v < 0) return true;
+    int64_t v;
+    if (lit_tree_exact_int64(e, 0, &v) && v < 0) return true;   /* BUG-1505 */
     if (e->kind == NODE_UNARY) return literal_tree_has_negative(e->unary.operand, depth + 1);
     if (e->kind == NODE_BINARY)
         return literal_tree_has_negative(e->binary.left, depth + 1) ||
@@ -12079,7 +12110,13 @@ static bool tfold(Checker *c, Node *n, int depth, int64_t *out) {
             if (lty.bits == 0) return false;
             /* a count is read as ITS type's value: an unsigned count at or
              * above 2^63 reads negative here and is over-width either way */
-            if (r < 0 || r >= (int64_t)lty.carrier) return tfold_wrap(0, &ty, out);
+            /* BUG-1506: the cut-off is the DECLARED width `lty.bits`, exactly
+             * as the runtime macro tests `>= w` (shift_guard_width = the ZER
+             * width) before its carrier test. Cutting at the CARRIER folded
+             * `(i3)(-1) >> (i3)3` to -1 while it RUNS as 0, so VRP proved an
+             * index the program never computes (a store past the array, no
+             * check emitted) and a global `i48 G = -5 >> 50` emitted -1. */
+            if (r < 0 || r >= (int64_t)lty.bits) return tfold_wrap(0, &ty, out);
             if (n->binary.op == TOK_LSHIFT) return tfold_wrap(ul << r, &ty, out);
             if (!lty.sg) return tfold_wrap(ul >> r, &ty, out);
             return tfold_wrap((uint64_t)(l >> r), &ty, out);
@@ -12821,6 +12858,10 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * pattern) is a nonzero constant, not "unknown". */
                     int64_t div_val = 0;
                     bool div_known = eval_const_expr_ok(node->binary.right, &div_val);
+                    /* BUG-1510: a CAST constant (`(u21)246 / (u21)58`) — the
+                     * untyped evaluator does not see through a cast. tfold_exact
+                     * trusts only a value every rendering computes identically. */
+                    if (!div_known) div_known = tfold_exact(c, node->binary.right, 0, &div_val);
                     if (!div_known) div_val = CONST_EVAL_FAIL;
                     /* SAFETY: zer_div_valid in src/safety/arith_rules.c (M01).
                      * Oracle: typing.v M01_const_div_by_zero_rejected. Convert
@@ -14397,22 +14438,21 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                             (node->assign.target->kind == NODE_FIELD ||
                              node->assign.target->kind == NODE_INDEX) &&
                             type_can_carry_pointer(tsym->type)) {
-                            Node *sroot = vcheck->slice.object;
-                            while (sroot && (sroot->kind == NODE_FIELD ||
-                                              sroot->kind == NODE_INDEX)) {
-                                if (sroot->kind == NODE_FIELD) sroot = sroot->field.object;
-                                else sroot = sroot->index_expr.object;
-                            }
-                            if (sroot && sroot->kind == NODE_IDENT) {
-                                Symbol *src = scope_lookup(c->current_scope,
-                                    sroot->ident.name, (uint32_t)sroot->ident.name_len);
-                                bool src_is_global = src && global_decl_lookup(c,
-                                    src->name, src->name_len) != NULL;
-                                if (src && (src->is_local_derived ||
-                                            (!src->is_static && !src_is_global))) {
-                                    tsym->is_local_derived = true;
-                                }
-                            }
+                            /* BUG-1494: ask the ONE frame-bound query. The old
+                             * hand-rolled walk tainted the carrier whenever the
+                             * slice's ROOT was any non-static local — including a
+                             * slice/pointer local or PARAM, whose sub-slice views
+                             * the memory it REFERENCES, not the frame. So
+                             * `v.s = b[2..6]; return v;` with `b` a slice param
+                             * was refused as "pointer to local 'v'" while
+                             * `v.s = b` and `return b[2..6]` (BUG-764) were
+                             * accepted, and `h.s = heap[2..6]; free(h.s)` was
+                             * refused as a view of non-heap memory.
+                             * arg_is_local_derived answers FORMED-over-inline-
+                             * storage (array_view_frame_root) vs a view THROUGH a
+                             * reference (the reference's own taint). */
+                            if (arg_is_local_derived(c, vcheck, 0))
+                                tsym->is_local_derived = true;
                         }
                         /* @ptrcast provenance on assignment (compile-time belt) */
                         if (vcheck->kind == NODE_INTRINSIC &&
@@ -15277,6 +15317,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 bool div_ok = false;
                 int64_t dv = 0;   /* BUG-1327: out of band — 2^63 is a nonzero constant */
                 bool dv_known = eval_const_expr_ok(divisor, &dv);
+                if (!dv_known) dv_known = tfold_exact(c, divisor, 0, &dv);   /* BUG-1510 */
                 if (!dv_known && divisor->kind == NODE_IDENT) {
                     Symbol *dsym = scope_lookup(c->current_scope,
                         divisor->ident.name, (uint32_t)divisor->ident.name_len);
@@ -17028,6 +17069,14 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     for (int ci = 0; ci < node->call.arg_count && ci < pc && all_const; ci++) {
                         /* BUG-430: use scoped eval to resolve const idents */
                         int64_t v = eval_const_expr_scoped(c, node->call.args[ci]);
+                        /* BUG-1510: a CAST constant argument (`F((u32)3, 2)`) — the
+                         * scoped evaluator does not look through a cast; the typed
+                         * fold does, at the argument's own type. */
+                        int64_t tv;
+                        if (v == CONST_EVAL_FAIL &&
+                            node->call.args[ci]->kind == NODE_TYPECAST &&
+                            tfold(c, node->call.args[ci], 0, &tv) && tv != CONST_EVAL_FAIL)
+                            v = tv;
                         if (v == CONST_EVAL_FAIL) {
                             /* Float literal: store double bits as int64 for float comptime */
                             if (node->call.args[ci]->kind == NODE_FLOAT_LIT) {

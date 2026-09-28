@@ -1,0 +1,38 @@
+// BUG-1505: an integer literal in [2^63, 2^64) under a cast was classified
+// NEGATIVE by the int64 fold (its u64 bit pattern) and retyped to i64, so
+// every cast wider than 64 bits sign-extended it and (f64)L came out negative.
+// The mathematical sign decides; BUG-1322's negative literals stay negative.
+u64 id(u64 v) { return v; }
+u32 main() {
+    u128 a = (u128)17520661291542297623;
+    u128 c = 0; c = (u128)17520661291542297623;
+    u128 hi = (u128)64;
+    if ((a >> hi) != 0) { return 1; }
+    if ((c >> hi) != 0) { return 2; }
+    if (a != (u128)id(17520661291542297623)) { return 3; }
+    u128 v = (u128)0xFFFFFFFFFFFFFFFF;            // the low-64 mask idiom
+    if ((v >> hi) != 0) { return 4; }
+    if (v != (u128)id(0xFFFFFFFFFFFFFFFF)) { return 5; }
+    u100 m = (u100)0xFFFF_FFFF_FFFF_FFFF;
+    if ((m >> (u100)64) != 0) { return 6; }
+    f64 f = (f64)17520661291542297623;
+    if (f < 0.0) { return 7; }
+    i128 s = (i128)10000000000000000000;
+    if (s < (i128)0) { return 8; }
+    u128 k = (u128)10000000000000000000;
+    if (k != (u128)id(10000000000000000000)) { return 9; }
+    f64 g = (f64)9223372036854775808;             // exactly 2^63
+    if (g != 9223372036854775808.0) { return 10; }
+    // boundary: a genuinely negative tree keeps its mathematical value (BUG-1322)
+    i64 n = (i64)(-1);
+    if (n != 0 - 1) { return 11; }
+    i128 nn = (i128)(-5);
+    if (nn >= (i128)0) { return 12; }
+    f64 nf = (f64)(-3);
+    if (nf != -3.0) { return 13; }
+    i8 sat = @saturate(i8, -1);
+    if (sat != -1) { return 14; }
+    u8 sat2 = @saturate(u8, 18446744073709551615);   // 2^64-1 clamps to 255
+    if (sat2 != 255) { return 15; }
+    return 0;
+}

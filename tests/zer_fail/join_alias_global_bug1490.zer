@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: after the joined free, 'b' (maybe freed) is stored to a global.
+struct N { u32 v; }
+?*N gp;
+u32 pick(bool c) {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    a.v = 1; b.v = 2;
+    *N p = a;
+    if (c) { p = b; }
+    free(p);
+    *N r = alloc(N) orelse { free(b); return 1; };
+    r.v = 99;
+    gp = b;
+    free(r);
+    return 0;
+}
+u32 main() { pick(true); if (gp) |q| { return q.v; } return 0; }

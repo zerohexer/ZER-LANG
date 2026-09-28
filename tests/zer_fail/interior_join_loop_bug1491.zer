@@ -1,0 +1,13 @@
+// EXPECTED: compile error
+// expect-error: INSIDE
+// BUG-1491: the interior view reaches the free through the loop back edge.
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 s = b;
+    for (u32 i = 0; i < 2; i += 1) {
+        if (i == 1) { free(s); return 0; }
+        s = b[2..6];
+    }
+    free(b);
+    return 0;
+}

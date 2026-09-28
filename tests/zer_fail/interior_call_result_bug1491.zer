@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: INSIDE
+// BUG-1491: a CALL RESULT that views its param at an offset
+// (FuncSummary.returns_interior_mask), then freed.
+[*]u8 tail([*]u8 s) { return s[2..s.len]; }
+u32 main() {
+    [*]u8 b = alloc(u8, 8) orelse { return 1; };
+    [*]u8 t = tail(b);
+    free(t);
+    return 0;
+}

@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: the CFG join kept the first predecessor's allocation identity, so
+// free(p) after 'p = a; if (c) { p = b; }' was attributed to 'a' alone and
+// 'b' stayed ALIVE (use after free of a recycled slot, then a double free).
+struct N { u32 v; }
+u32 pick(bool c) {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    a.v = 1; b.v = 2;
+    *N p = a;
+    if (c) { p = b; }
+    free(p);                 // frees b when c is true
+    *N r = alloc(N) orelse { free(b); return 1; };
+    r.v = 99;                // recycles b's slot
+    u32 out = b.v;           // use after free: reads 99
+    free(b);                 // double free
+    free(r);
+    return out;
+}
+u32 main() { return pick(true); }

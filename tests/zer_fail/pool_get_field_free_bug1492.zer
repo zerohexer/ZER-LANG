@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1492: 'free(pool.get(h).p)' freed 'it' behind its back (read 99 pre-fix).
+struct Item { u32 v; }
+struct Node { *Item p; u32 k; }
+Pool(Node, 4) nodes;
+u32 main() {
+    *Item it = alloc(Item) orelse { return 1; };
+    it.v = 5;
+    Handle(Node) nh = nodes.alloc() orelse { free(it); return 1; };
+    nodes.get(nh).p = it;
+    free(nodes.get(nh).p);
+    *Item j = alloc(Item) orelse { nodes.free(nh); return 1; };
+    j.v = 99;
+    u32 r = it.v;
+    free(j);
+    nodes.free(nh);
+    return r;
+}

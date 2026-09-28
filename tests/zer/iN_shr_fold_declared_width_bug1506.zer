@@ -1,0 +1,25 @@
+// BUG-1506: the typed constant fold (VRP, divisor proofs, global
+// initializers) cut shifts off at the CARRIER width while the runtime
+// `_zer_shr(a, b, w)` cuts at the DECLARED width N. A negative iN shifted
+// right by a count in [N, carrier) folded to -1 and ran as 0.
+const i48 G = (i48)(-5) >> (i48)50;       // count >= 48: 0 (was -1)
+const i3 G3 = (i3)(-1) >> (i3)3;          // 0 (was -1)
+const u5 GL = (u5)1 << (u5)6;             // 0
+u32 main() {
+    i48 x = -5; i48 n = 50;
+    i48 r = x >> n;
+    if (G != r) { return 1; }
+    if (G != 0) { return 2; }
+    if (G3 != 0) { return 3; }
+    if (GL != 0) { return 4; }
+    // the fold feeds VRP: k is 0 by the fold AND at run time
+    u8[8] arr;
+    u32 k = (u32)(u3)((i3)(-1) >> (i3)3);
+    arr[k] = 7;
+    if (k != 0) { return 5; }
+    if (arr[0] != 7) { return 6; }
+    // in-range counts are unchanged
+    i48 q = (i48)(-8) >> (i48)1;
+    if (q != -4) { return 7; }
+    return 0;
+}

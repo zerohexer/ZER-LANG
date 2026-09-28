@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1492: the Handle-field form — 'items.free(nodes.get(nh).h)' freed 'ih'.
+struct Item { u32 v; }
+struct Node { Handle(Item) h; u32 k; }
+Pool(Item, 4) items;
+Pool(Node, 4) nodes;
+u32 main() {
+    Handle(Item) ih = items.alloc() orelse { return 1; };
+    items.get(ih).v = 5;
+    Handle(Node) nh = nodes.alloc() orelse { items.free(ih); return 1; };
+    nodes.get(nh).h = ih;
+    items.free(nodes.get(nh).h);
+    Handle(Item) j = items.alloc() orelse { nodes.free(nh); return 1; };
+    items.get(j).v = 99;
+    u32 r = items.get(ih).v;
+    items.free(j);
+    nodes.free(nh);
+    return r;
+}

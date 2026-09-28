@@ -1,0 +1,20 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+// BUG-1490: the joined pointer is freed by a callee (FuncSummary).
+struct N { u32 v; }
+void rel(*N p) { free(p); }
+u32 pick(bool c) {
+    *N a = alloc(N) orelse { return 1; };
+    *N b = alloc(N) orelse { free(a); return 1; };
+    a.v = 1; b.v = 2;
+    *N p = a;
+    if (c) { p = b; }
+    rel(p);
+    *N r = alloc(N) orelse { free(b); return 1; };
+    r.v = 99;
+    u32 out = b.v;
+    free(b);
+    free(r);
+    return out;
+}
+u32 main() { return pick(true); }

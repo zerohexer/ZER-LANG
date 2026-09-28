@@ -5,6 +5,30 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-28 — BUG-1400..: harvest of `loving-bohr-7nox2h`, then a five-area audit (escape order, allocation tracker, concurrency, VRP, emitter)
+
+Harvest: `origin/claude/loving-bohr-7nox2h` (21 commits, a strict superset of `jyw9if`,
+`qzn39v` and `review/25092026`, forked at `07b40f9`; main had only added docs since) —
+merged whole, `make check` green on the merged tree before anything else changed. Then
+five read-only probe agents (bounds/VRP, allocation lifecycle, escape, emitter values,
+concurrency/bare metal) and own probes. Every fix below was A/B-measured against the
+post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
+
+- **BUG-1400 — an orelse in the RIGHT operand of `&&` / `||` ran even when the left
+  operand short-circuited.** `x = a && g({ .v = f() orelse 0 });` called `f()` with `a`
+  false, and so did a slice bound (`a && s[0..(f() orelse 1)].len > 0`), an assignment
+  value (`a && (t = f() orelse 1) > 0`), an array-element target (`bs[0] = a && ...`) and
+  a one-field struct literal assigned whole (`t = { .b = a && ... }`). The plain-assign
+  reroute (G6) guarded the shape with `sc_expr_has_orelse`, an if-chain that its own
+  comment called deliberately partial ("a missed carrier degrades to today's bug") — it did
+  not walk a struct literal, a slice bound or an assignment; and every OTHER passthrough
+  context never rerouted at all, so `pre_lower_orelse` hoisted the orelse in front of the
+  operator. Root fix in `pre_lower_orelse` itself: a `&&` / `||` whose right operand holds
+  an orelse is lowered to branches (`lower_shortcircuit_to_dest`) and named by a temp,
+  wherever it sits; `sc_expr_has_orelse` is now an exhaustive switch that descends exactly
+  where `pre_lower_orelse` descends. Test: `tests/zer/shortcircuit_orelse_passthrough_bug1400.zer`
+  (exit 2 pre-fix: the right side ran).
+
 ## Session 2026-09-27 — BUG-1366..1376: harvest of `loving-bohr-jyw9if`, then stores through pointers, call effects of the assign spelling, root-first places, lock order
 
 Harvest: `origin/claude/loving-bohr-jyw9if` (17 commits, a strict superset of

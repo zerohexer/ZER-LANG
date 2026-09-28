@@ -826,33 +826,64 @@ static void hoist_place_effects(LowerCtx *ctx, Node *n) {
  * Gate it on an orelse ACTUALLY nested in the RHS so the common `x = a && b`
  * keeps its native (already-correct) passthrough emission.
  *
- * If-chain, not a switch, deliberately: this is a partial carrier walk, and a
- * no-default switch here would be a false promise of exhaustiveness. An
- * unlisted kind returns false and falls back to the PRIOR passthrough
- * behaviour — the pre-existing shape, never a crash — so a missed carrier
- * degrades to today's bug rather than to a miscompile of working code. */
+ * BUG-1400: this was an if-chain "deliberately", on the argument that a missed
+ * carrier degrades to the prior bug. It did — silently: `x = a && g({ .v = f()
+ * orelse 0 })`, `x = a && s[0..(f() orelse 1)].len > 0` and `x = a && (t = f()
+ * orelse 1) > 0` all ran f() with `a` false (a struct literal, a slice bound and
+ * an assignment value were not walked). The question it answers is exactly "will
+ * pre_lower_orelse find an orelse here?", so it now descends EXACTLY where
+ * pre_lower_orelse descends — an exhaustive switch, no default, so a new node kind
+ * fails the build instead of reopening the hoist. */
 static bool sc_expr_has_orelse(Node *n) {
     if (!n) return false;
-    if (n->kind == NODE_ORELSE) return true;
-    if (n->kind == NODE_BINARY)
+    switch (n->kind) {
+    case NODE_ORELSE: return true;
+    case NODE_BINARY:
         return sc_expr_has_orelse(n->binary.left) ||
                sc_expr_has_orelse(n->binary.right);
-    if (n->kind == NODE_UNARY) return sc_expr_has_orelse(n->unary.operand);
-    if (n->kind == NODE_TYPECAST) return sc_expr_has_orelse(n->typecast.expr);
-    if (n->kind == NODE_CALL) {
+    case NODE_UNARY: return sc_expr_has_orelse(n->unary.operand);
+    case NODE_TYPECAST: return sc_expr_has_orelse(n->typecast.expr);
+    case NODE_CALL:
+        if (sc_expr_has_orelse(n->call.callee)) return true;
         for (int i = 0; i < n->call.arg_count; i++)
             if (sc_expr_has_orelse(n->call.args[i])) return true;
         return false;
-    }
-    if (n->kind == NODE_INTRINSIC) {
+    case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++)
             if (sc_expr_has_orelse(n->intrinsic.args[i])) return true;
         return false;
-    }
-    if (n->kind == NODE_FIELD) return sc_expr_has_orelse(n->field.object);
-    if (n->kind == NODE_INDEX)
+    case NODE_FIELD: return sc_expr_has_orelse(n->field.object);
+    case NODE_INDEX:
         return sc_expr_has_orelse(n->index_expr.object) ||
                sc_expr_has_orelse(n->index_expr.index);
+    case NODE_SLICE:
+        return sc_expr_has_orelse(n->slice.object) ||
+               sc_expr_has_orelse(n->slice.start) ||
+               sc_expr_has_orelse(n->slice.end);
+    case NODE_ASSIGN:
+        return sc_expr_has_orelse(n->assign.target) ||
+               sc_expr_has_orelse(n->assign.value);
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++)
+            if (sc_expr_has_orelse(n->struct_init.fields[i].value)) return true;
+        return false;
+    /* pre_lower_orelse does not descend into these, so neither does this. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF:
+    case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD:
+    case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return false;
+    }
     return false;
 }
 
@@ -2706,6 +2737,24 @@ static void pre_lower_orelse(LowerCtx *ctx, Node **pp, int line) {
     /* Recurse into children containing expressions */
     switch (n->kind) {
     case NODE_BINARY:
+        /* BUG-1400: an orelse in the RIGHT operand of `&&` / `||` runs only when
+         * the left operand lets it. Hoisting it (the recursion below) moves it in
+         * front of the operator and runs it unconditionally — every passthrough
+         * context that did not reroute the short-circuit itself (a one-field struct
+         * literal assigned whole, `t = { .b = a && g(f() orelse 0) }`, was the last
+         * one measured) called f() with `a` false. Lower the whole operator to
+         * branches here instead, and name its result. */
+        if ((n->binary.op == TOK_AMPAMP || n->binary.op == TOK_PIPEPIPE) &&
+            sc_expr_has_orelse(n->binary.right)) {
+            Type *bt = checker_get_type(ctx->checker, n);
+            if (!bt) bt = ty_bool;
+            int tmp = create_temp(ctx, bt, line);
+            lower_shortcircuit_to_dest(ctx, tmp, n, line);
+            Node *id = make_local_ident(ctx, &ctx->func->locals[tmp], n->loc);
+            checker_set_type(ctx->checker, id, bt);
+            *pp = id;
+            return;
+        }
         pre_lower_orelse(ctx, &n->binary.left, line);
         pre_lower_orelse(ctx, &n->binary.right, line);
         break;

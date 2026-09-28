@@ -1,0 +1,35 @@
+// BUG-1400: an orelse in the RIGHT operand of && / || must run only when the
+// left operand lets it. Every passthrough context used to hoist it in front of
+// the operator (a struct-literal argument, a slice bound, an assignment value,
+// an array-element target, a one-field struct literal assigned whole).
+struct S { u32 v; }
+struct T { bool b; }
+u32 cnt;
+bool[2] bs;
+u32[8] arr;
+?u32 f() { cnt += 1; return 5; }
+?u32 none() { cnt += 1; return null; }
+bool g(S s) { return s.v > 0; }
+
+u32 run(bool a) {
+    bool x = true;
+    T t;
+    x = a && g({ .v = f() orelse 0 });
+    x = a && arr[0..(f() orelse 1)].len > 0;
+    x = a && (arr[0] = (f() orelse 1)) > 0;
+    bs[0] = a && g({ .v = f() orelse 0 });
+    t = { .b = a && g({ .v = f() orelse 0 }) };
+    t.b = a && g({ .v = f() orelse 0 });
+    x = !a || g({ .v = f() orelse 0 });
+    x = a && (none() orelse { return 7; }) > 0;
+    if (x || t.b) { return 50; }
+    return 0;
+}
+
+u32 main() {
+    if (run(false) != 0) { return 1; }
+    if (cnt != 0) { return 2; }       // nothing on the right ran
+    if (run(true) != 7) { return 3; } // the right side runs, and its fallback returns
+    if (cnt != 8) { return 4; }
+    return 0;
+}

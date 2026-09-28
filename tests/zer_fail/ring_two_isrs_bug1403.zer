@@ -1,0 +1,17 @@
+// BUG-1403: the @critical exemption holds for ONE interrupt handler — a second
+// handler can preempt the first mid-update, and main's @critical cannot stop that.
+// expect-error: is used from both interrupt and main code
+Ring(u8, 16) rx_buf;
+u32 main() {
+    u32 n = 0;
+    @critical {
+        if (rx_buf.pop()) |b| { n += (u32)b; }
+    }
+    return n;
+}
+interrupt USART1 {
+    rx_buf.push(7);
+}
+interrupt USART2 {
+    rx_buf.push(9);
+}

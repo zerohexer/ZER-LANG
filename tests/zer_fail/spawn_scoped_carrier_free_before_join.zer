@@ -1,11 +1,13 @@
 // EXPECTED: compile error
-// expect-error: is transferred
+// expect-error: borrowed by a scoped spawn
 // Scoped spawn: freeing a payload the child still holds, BEFORE join().
 // The bare `*T` form was marked TRANSFERRED at the spawn-arg sink and rejected;
 // a by-value struct carrying the pointer found no handle for the struct itself,
 // so nothing was marked and the cross-thread use-after-free compiled clean.
 // Fixed by marking every COMPOUND handle rooted at the arg local, which
 // propagates to the original pointer through the alias group.
+// Since BUG-1332 the checker's borrow refuses it first: the carrier `b` lends
+// the heap pointer `t` until the join (zercheck's TRANSFER is the backstop).
 struct T{u32 v;}
 struct B{ *T t; }
 

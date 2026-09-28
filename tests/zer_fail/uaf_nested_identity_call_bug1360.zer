@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: use after free
+// BUG-1360: id(id(a)) is a; free(a) then c.v read a recycled slot.
+struct T { u32 v; }
+*T id(*T p) { return p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    *T c = id(id(a));
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = c.v;
+    free(b);
+    return r;
+}

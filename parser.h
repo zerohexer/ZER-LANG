@@ -24,6 +24,10 @@ typedef struct {
      * the DECLARATION, and is left for the declaration's own array-suffix
      * branch to consume. */
     int no_array_suffix;
+    /* BUG-1393: links of the `else if` chain being parsed. A chain is a
+     * right-nested tree, and every walker (checker, lowering, emitter)
+     * recurses one frame per link — 10,000 links overflowed the C stack. */
+    int else_if_links;
 } Parser;
 
 /* ---- API ---- */

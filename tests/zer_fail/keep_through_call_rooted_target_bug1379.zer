@@ -1,0 +1,10 @@
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1379: a param stored through a CALL-rooted destination (`*slot() = p`)
+// is retained — keep. The direct `*slot() = &x` was refused (BUG-260); the
+// helper spelling let `put(&x)` leave a stack address in a global.
+?*u32 g;
+*?*u32 slot() { return &g; }
+void put(*u32 p) { *slot() = p; }
+u32 rd() { if (g) |q| { return *q; } return 0; }
+void f() { u32 x = 5; put(&x); }
+u32 main() { f(); return rd(); }

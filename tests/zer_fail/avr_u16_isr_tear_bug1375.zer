@@ -1,0 +1,8 @@
+// zerc-flags: --gcc tests/support/fake_avr_gcc.sh
+// expect-error: is not a single-word scalar
+// BUG-1375: on AVR (16-bit pointers, 8-bit data path) a `volatile u16` load is
+// two 8-bit loads — an ISR store between them tears the main-side read. The
+// single-word exemption was keyed on the POINTER width, so it was accepted.
+volatile u16 stamp;
+interrupt TIM2 { stamp = 1000; }
+u32 main() { u16 s = stamp; return (u32)s; }

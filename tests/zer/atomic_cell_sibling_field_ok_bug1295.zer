@@ -1,0 +1,14 @@
+struct S { u32 n; u32 m; }
+S s;
+u32[4] cnts;
+void w() { @atomic_add(&s.n, 1); @atomic_add(&cnts[1], 1); }
+u32 main() {
+    ThreadHandle th = spawn w();
+    s.m = 3;
+    cnts[2] = 4;
+    u32 v = @atomic_load(&s.n);
+    th.join();
+    S t = s;
+    if (t.m != 3) { return 1; }
+    return 0;
+}

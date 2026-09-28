@@ -115,6 +115,12 @@ typedef struct {
      * user writes it. Inside one, the guard declines and the emitter's trapping
      * form is used instead. */
     int critical_depth;
+    /* BUG-1287: two more scopes a guard's early return must not leave — a @once
+     * body (the done-publish that loser threads wait on would never run: a hang)
+     * and code between @sem_acquire and @sem_release written straight-line in
+     * this function (the permit would never be returned: the next acquire hangs). */
+    int once_depth;
+    int sem_held;
     int active_guard_flag;
     int active_guard_below;
     /* BUG-590: when >0, the next NODE_BLOCK should NOT fire+pop its own
@@ -185,6 +191,7 @@ typedef struct {
  * ir_validate enforces the invariant, so a new emission path cannot reintroduce
  * it. BOTH raw emit helpers route through here. */
 static void ir_add_inst_checked(LowerCtx *ctx, IRInst inst) {
+    if (ctx->defer_body_depth > 0) inst.in_defer_body = true;   /* BUG-1291 */
     IRBlock *bb = &ctx->func->blocks[ctx->current_block];
     if (bb->inst_count > 0 && ir_block_is_terminated(bb)) {
         ctx->current_block = ir_add_block(ctx->func, ctx->arena);
@@ -552,6 +559,21 @@ static bool lower_may_write(Node *n) {
     return true;
 }
 
+/* BUG-1325: can the ORDER in which this value's parts are evaluated be observed?
+ * It writes something, and it is more than one call whose arguments (and callee)
+ * are effect-free. Such a value handed to the passthrough emitter becomes ONE C
+ * expression, whose operand and argument order C leaves unsequenced. */
+static bool value_order_observable(Node *v) {
+    if (!v || !lower_may_write(v)) return false;
+    if (v->kind == NODE_CALL) {
+        if (lower_may_write(v->call.callee)) return true;
+        for (int ai = 0; ai < v->call.arg_count; ai++)
+            if (lower_may_write(v->call.args[ai])) return true;
+        return false;
+    }
+    return true;
+}
+
 /* Snapshot a NAMED local operand into a temp here, at its own evaluation
  * position. Arrays are not copied (an array operand is an address, and C cannot
  * assign one); a temp is returned unchanged. */
@@ -647,6 +669,133 @@ static void hoist_target_indices(LowerCtx *ctx, Node *t, Node *value, Node *body
     case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
     case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_TYPECAST: case NODE_CAST:
     case NODE_SIZEOF:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR:
+    case NODE_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL:
+    case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return;
+    }
+}
+
+/* BUG-1372: make a PLACE expression (`m[i][j]`, `pick().a[k].b`, the lock root
+ * of a shared access) free of effects, evaluating its parts ROOT-FIRST into
+ * temps here. Two defects shared this cause:
+ *   - a fixed array keeps its place in the passthrough C, and the emitter's
+ *     single-evaluation bounds form reads the INDEX before the OBJECT
+ *     (`size_t i = (IDX); check; &OBJ[i]`), so `m[next()][next()]` read m[2][1]
+ *     and `pick().a[k].b = 5` used k before pick() set it — against the
+ *     documented left-to-right order;
+ *   - a shared-struct lock root is emitted once per lock, operation and
+ *     unlock: `pick().v += 1` called pick() five times, locking one object and
+ *     writing another (a data race).
+ * Every part that may write, and — once the place may write at all — every
+ * non-constant index and dereferenced operand before it, is lowered into a temp,
+ * and the node is overwritten IN PLACE with the temp's name, so every holder of
+ * the node (a lock instruction, the passthrough) sees the one value. Only
+ * called when lower_may_write(place). */
+static bool hoist_place_part_const(Node *n) {
+    return n && (n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT ||
+                 n->kind == NODE_BOOL_LIT || n->kind == NODE_SIZEOF);
+}
+static void hoist_place_to_temp(LowerCtx *ctx, Node *n, bool snapshot) {
+    int line = n->loc.line;
+    SrcLoc loc = n->loc;
+    /* Lower a COPY: the instructions lower_expr emits keep a pointer to the
+     * node they lower (inst.expr), and the node itself is overwritten below. */
+    Node *cp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+    if (!cp) return;
+    *cp = *n;
+    Type *nt = checker_get_type(ctx->checker, n);
+    if (nt) checker_set_type(ctx->checker, cp, nt);
+    int id = lower_expr(ctx, cp);
+    if (id < 0) return;
+    if (snapshot) id = snapshot_operand(ctx, id, line);
+    Node *ident = make_local_ident(ctx, &ctx->func->locals[id], loc);
+    Checker *ck = ctx->checker;
+    if (ck->hoist_undo_n >= ck->hoist_undo_cap) {
+        int nc = ck->hoist_undo_cap ? ck->hoist_undo_cap * 2 : 16;
+        struct ZerHoistUndo *nu = (struct ZerHoistUndo *)arena_alloc(ck->arena,
+            (size_t)nc * sizeof(struct ZerHoistUndo));
+        if (!nu) return;   /* no undo record: leave the node as written */
+        if (ck->hoist_undo_n)
+            memcpy(nu, ck->hoist_undo, (size_t)ck->hoist_undo_n * sizeof(struct ZerHoistUndo));
+        ck->hoist_undo = nu;
+        ck->hoist_undo_cap = nc;
+    }
+    ck->hoist_undo[ck->hoist_undo_n].node = n;
+    ck->hoist_undo[ck->hoist_undo_n].func = ctx->func->ast_node;
+    ck->hoist_undo[ck->hoist_undo_n].saved = *n;
+    ck->hoist_undo_n++;
+    *n = *ident;
+}
+
+/* BUG-1372: undo the previous lowering's in-place hoists of `fn`, newest first. */
+static void hoist_restore(Checker *ck, Node *fn) {
+    int w = 0;
+    for (int i = ck->hoist_undo_n - 1; i >= 0; i--)
+        if (ck->hoist_undo[i].func == fn) *ck->hoist_undo[i].node = ck->hoist_undo[i].saved;
+    for (int i = 0; i < ck->hoist_undo_n; i++) {
+        if (ck->hoist_undo[i].func == fn) continue;
+        ck->hoist_undo[w++] = ck->hoist_undo[i];
+    }
+    ck->hoist_undo_n = w;
+}
+/* Does this place's projection chain index a FIXED array (the shape kept whole
+ * in the passthrough)? */
+static bool place_has_array_index(LowerCtx *ctx, Node *n) {
+    while (n) {
+        if (n->kind == NODE_INDEX) {
+            Type *ot = checker_get_type(ctx->checker, n->index_expr.object);
+            if (ot && type_dispatch_kind(ot) == TYPE_ARRAY) return true;
+            n = n->index_expr.object;
+        } else if (n->kind == NODE_FIELD) {
+            n = n->field.object;
+        } else if (n->kind == NODE_UNARY && n->unary.op == TOK_STAR) {
+            n = n->unary.operand;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+static void hoist_place_effects(LowerCtx *ctx, Node *n) {
+    if (!n) return;
+    switch (n->kind) {
+    case NODE_FIELD:
+        hoist_place_effects(ctx, n->field.object);
+        return;
+    case NODE_INDEX:
+        hoist_place_effects(ctx, n->index_expr.object);
+        if (n->index_expr.index && !hoist_place_part_const(n->index_expr.index))
+            hoist_place_to_temp(ctx, n->index_expr.index, true);
+        return;
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && n->unary.operand) {
+            Node *o = n->unary.operand;
+            if (o->kind == NODE_IDENT) hoist_place_to_temp(ctx, o, true);
+            else if (o->kind == NODE_FIELD || o->kind == NODE_INDEX ||
+                     (o->kind == NODE_UNARY && o->unary.op == TOK_STAR)) {
+                hoist_place_effects(ctx, o);
+                if (lower_may_write(o)) hoist_place_to_temp(ctx, o, false);
+            } else if (lower_may_write(o)) {
+                hoist_place_to_temp(ctx, o, false);
+            }
+        }
+        return;
+    case NODE_CALL: case NODE_ORELSE: case NODE_ASSIGN: case NODE_INTRINSIC:
+    case NODE_TYPECAST:
+        /* a value computed at the root (`pick()`, `mk()`): once, here */
+        if (lower_may_write(n)) hoist_place_to_temp(ctx, n, false);
+        return;
+    case NODE_IDENT: case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY:
+    case NODE_SLICE: case NODE_STRUCT_INIT: case NODE_CAST: case NODE_SIZEOF:
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
@@ -760,7 +909,7 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         int tmp = create_temp(ctx, ty_u8, expr->loc.line);
         IRInst inst = make_inst(IR_LITERAL, expr->loc.line);
         inst.dest_local = tmp;
-        inst.literal_int = (int64_t)expr->char_lit.value;
+        inst.literal_int = (int64_t)(uint8_t)expr->char_lit.value;   /* BUG-1320: a u8 */
         inst.literal_kind = 5; /* char */
         emit_3ac(ctx, inst);
         return tmp;
@@ -862,6 +1011,13 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
      * Complex types (Handle auto-deref, opaque, builtins, slices, arrays,
      * enums) go to passthrough → emit_expr handles the full logic. ---- */
     case NODE_FIELD: {
+        /* BUG-1372: a field read through a FIXED-array element whose place has
+         * effects (`pick().a[k].b`) keeps that place in the passthrough C,
+         * where the bounds form reads the index before the object. */
+        if (lower_may_write(expr) && place_has_array_index(ctx, expr)) {
+            hoist_place_effects(ctx, expr);
+            goto passthrough;
+        }
         /* Non-local objects (enum type, module prefix) → passthrough */
         if (expr->field.object && expr->field.object->kind == NODE_IDENT) {
             int obj_id = ir_find_local(ctx->func,
@@ -971,6 +1127,10 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
                 /* BUG-1179: an index that may WRITE (`a[i + seti(&i)]`) is
                  * lowered too, so its operands evaluate left to right in 3AC
                  * instead of as one unsequenced C expression. */
+                if (lower_may_write(expr->index_expr.object)) {   /* BUG-1372 */
+                    hoist_place_effects(ctx, expr);
+                    goto passthrough;
+                }
                 if (expr->index_expr.index &&
                     (expr->index_expr.index->kind == NODE_ORELSE ||
                      lower_may_write(expr->index_expr.index))) {
@@ -1144,6 +1304,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
         bool plain_sc = false;
         bool stmt_pos = ctx->assign_stmt_pos;   /* BUG-1041 */
         ctx->assign_stmt_pos = false;
+        if (lower_may_write(expr->assign.target))                  /* BUG-1372 */
+            hoist_place_effects(ctx, expr->assign.target);
         if (lower_may_write(expr->assign.value)) {                 /* BUG-1184 */
             Node *fb = (ctx->func->ast_node &&
                         ctx->func->ast_node->kind == NODE_FUNC_DECL)
@@ -1169,7 +1331,17 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
              * effect. */
             bool rhs_si_order = rhs && rhs->kind == NODE_STRUCT_INIT &&
                 rhs->struct_init.field_count >= 2 && lower_may_write(rhs);
-            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order) goto passthrough;
+            /* BUG-1325: the same for ANY value whose evaluation order can be
+             * observed — it writes something, and it is more than one call with
+             * effect-free arguments. Passed through, `x = g + step();` and
+             * `x = pair(step(), step2());` were one C expression, which C leaves
+             * unsequenced: GCC read `g` after the call (102, the var-decl form
+             * gives 56) and ran the arguments right to left, against the
+             * documented left-to-right rule (reference.md "Evaluation Order"). */
+            bool rhs_order = rhs && !rhs_sc && rhs->kind != NODE_STRUCT_INIT &&
+                             value_order_observable(rhs);
+            if (!(rhs_sc && sc_expr_has_orelse(rhs)) && !rhs_si_order && !rhs_order)
+                goto passthrough;
             plain_sc = rhs_sc;
         }
         /* Decompose RHS into a local; synthesize `target op= tmp_ident` so the
@@ -1398,6 +1570,42 @@ static void materialise_defers_from(LowerCtx *ctx, int base) {
  * carries an armed gate. Functions WITHOUT a label (the overwhelming majority, and
  * where the safety wins are) get the IR treatment; functions with one keep exactly
  * the behaviour they had. */
+/* BUG-1302: `for (…; k < E; k += 1)` (or `k = k + 1`, `E > k`) with no write to k
+ * in the condition or the body: every step runs with k < E <= max, so k + 1 does
+ * not wrap. Syntactic, and conservative on anything else. */
+static bool for_step_cannot_wrap(Node *node) {
+    Node *c = node->for_stmt.cond, *st = node->for_stmt.step;
+    if (!c || !st || c->kind != NODE_BINARY || st->kind != NODE_ASSIGN) return false;
+    Node *k = NULL;
+    if (c->binary.op == TOK_LT) k = c->binary.left;
+    else if (c->binary.op == TOK_GT) k = c->binary.right;
+    if (!k || k->kind != NODE_IDENT) return false;
+    Node *t = st->assign.target;
+    if (!t || t->kind != NODE_IDENT || t->ident.name_len != k->ident.name_len ||
+        memcmp(t->ident.name, k->ident.name, k->ident.name_len) != 0) return false;
+    Node *v = st->assign.value;
+    bool one = false;
+    if (st->assign.op == TOK_PLUSEQ)
+        one = v && v->kind == NODE_INT_LIT && v->int_lit.value == 1;
+    else if (st->assign.op == TOK_EQ && v && v->kind == NODE_BINARY &&
+             v->binary.op == TOK_PLUS) {
+        Node *l = v->binary.left, *r = v->binary.right;
+        bool ls = l && l->kind == NODE_IDENT && l->ident.name_len == k->ident.name_len &&
+                  memcmp(l->ident.name, k->ident.name, k->ident.name_len) == 0;
+        bool rs = r && r->kind == NODE_IDENT && r->ident.name_len == k->ident.name_len &&
+                  memcmp(r->ident.name, k->ident.name, k->ident.name_len) == 0;
+        one = (ls && r && r->kind == NODE_INT_LIT && r->int_lit.value == 1) ||
+              (rs && l && l->kind == NODE_INT_LIT && l->int_lit.value == 1);
+    }
+    if (!one) return false;
+    const char *nm = k->ident.name;
+    uint32_t nl = (uint32_t)k->ident.name_len;
+    if (ast_name_mutated_or_addrd(c, nm, nl)) return false;
+    if (node->for_stmt.body && ast_name_mutated_or_addrd(node->for_stmt.body, nm, nl))
+        return false;
+    return true;
+}
+
 static bool defers_stay_on_ast(LowerCtx *ctx) {
     return ctx->label_count > 0;
 }
@@ -1559,11 +1767,13 @@ static void lower_one_guard_site(void *ud, const ZerGuardSite *site) {
     /* BUG-1222: nor when the function's result has no zero value (an enum
      * without a 0 variant — the literal return below would forge one). */
     bool no_zero = !void_ret && checker_type_has_no_zero_value(rty);
-    if (ctx->critical_depth > 0 || ctx->defer_body_depth > 0 || no_zero) {
+    bool no_leave = ctx->critical_depth > 0 || ctx->defer_body_depth > 0 ||
+                    ctx->once_depth > 0 || ctx->sem_held > 0;   /* BUG-1287 */
+    if (no_leave || no_zero) {
         IRInst tr = make_inst(IR_TRAP, g->line);
         /* literal_kind names the reason for the emitter's message:
          * 0 = a scope that cannot be left, 1 = no zero value to return */
-        tr.literal_kind = (ctx->critical_depth > 0 || ctx->defer_body_depth > 0) ? 0 : 1;
+        tr.literal_kind = no_leave ? 0 : 1;
         emit_inst(ctx, tr);
         ctx->current_block = bb_ok;
         checker_mark_guard_lowered(ctx->checker, site->access);
@@ -1882,6 +2092,24 @@ static Node *find_shared_root_expr(Checker *c, Node *expr) {
             else if (cur->kind == NODE_INDEX) next = cur->index_expr.object;
             else if (cur->kind == NODE_UNARY && cur->unary.op == TOK_STAR) next = cur->unary.operand;
             else break;
+            /* BUG-1307: `S.alloc_ptr()` / `S.free_ptr(p)` — the auto-slab builtins,
+             * which the universal alloc(S) / free(p) also lower to — name the struct
+             * TYPE as their receiver. It has the shared struct's type, so it was
+             * taken for a shared ROOT and the emitter locked `&S._zer_mtx`: GCC
+             * "'S' undeclared". A type receiver holds no data and needs no lock. */
+            if (cur->kind == NODE_FIELD && next->kind == NODE_IDENT) {
+                const char *fm = cur->field.field_name;
+                size_t fl = cur->field.field_name_len;
+                bool type_method = (fl == 5 && memcmp(fm, "alloc", 5) == 0) ||
+                                   (fl == 9 && memcmp(fm, "alloc_ptr", 9) == 0) ||
+                                   (fl == 4 && memcmp(fm, "free", 4) == 0) ||
+                                   (fl == 8 && memcmp(fm, "free_ptr", 8) == 0);
+                /* The checker routes ANY struct-typed receiver of these four to
+                 * the auto-slab (checker.c "Task.alloc() / Task.free()"), so the
+                 * same test answers it here. */
+                if (type_method &&
+                    type_dispatch_kind(checker_get_type(c, next)) == TYPE_STRUCT) break;
+            }
             Type *nt = checker_get_type(c, next);
             if (nt) {
                 Type *eff = type_unwrap_distinct(nt);
@@ -2161,6 +2389,7 @@ static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
     if (!cond) return NULL;
     Node *root = find_shared_root_expr(ctx->checker, cond);
     if (!root) return NULL;
+    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
     /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
@@ -2215,27 +2444,41 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
     Node *root = find_shared_root_in_stmt_ir(ctx->checker, stmt);
     *out_root = root;
     if (!root) return;
+    if (lower_may_write(root)) hoist_place_effects(ctx, root);   /* BUG-1372 */
+    Node *se = stmt_shared_expr_ir(stmt);
+    SharedRootVec rv; srv_init(&rv);
+    if (se) find_all_shared_roots_expr(ctx->checker, se, &rv);
+    /* BUG-1376: the statement's locks are ONE group. Held together, two
+     * instances of one shared type locked in SOURCE order deadlock against
+     * another statement naming them the other way round (`g1.v = g2.v + 1;` in
+     * one thread, `g2.v = g1.v + 1;` in another — measured hang). The first
+     * lock carries the group size (literal_int); the emitter acquires the whole
+     * group in ADDRESS order, the same order in every thread. */
+    int group_n = 1;
+    for (int i = 0; i < rv.count; i++) if (rv.items[i] != root) group_n++;
+    for (int i = 0; i < rv.count; i++)       /* BUG-1372: before any lock */
+        if (rv.items[i] != root && lower_may_write(rv.items[i]))
+            hoist_place_effects(ctx, rv.items[i]);
     IRInst lock = make_inst(IR_LOCK, stmt->loc.line);
     lock.expr = root;
     lock.src2_local = stmt_writes_shared_ir(stmt) ? 1 : 0;
+    lock.literal_int = group_n;
     emit_inst(ctx, lock);
-    Node *se = stmt_shared_expr_ir(stmt);
     if (se) {
-        SharedRootVec rv; srv_init(&rv);
-        find_all_shared_roots_expr(ctx->checker, se, &rv);
         for (int i = 0; i < rv.count; i++) {
             if (rv.items[i] == root) continue; /* primary already locked */
             IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
             l2.expr = rv.items[i];
             l2.src2_local = 0; /* read lock for extras */
+            l2.literal_int = -1;               /* BUG-1376: a group member */
             emit_inst(ctx, l2);
             /* BUG-935: the UNLOCK replays this set, so a root locked here and
              * dropped from extra_out would be locked and never released. The
              * caller's vector grows with this one. */
             if (extra_out) srv_push(extra_out, rv.items[i]);
         }
-        srv_free(&rv);
     }
+    srv_free(&rv);
 }
 
 static void emit_shared_unlock_if_needed(LowerCtx *ctx, Node *root,
@@ -2699,7 +2942,24 @@ static void lower_orelse_to_dest(LowerCtx *ctx, int dest_local, Node *orelse_nod
              * The fallback expression may contain nested orelse (e.g.,
              * `A orelse bar(B orelse 7)`). Pre-lower any orelse inside
              * before handing the AST to the passthrough emitter. */
-            if (dest_local >= 0) {
+            if (dest_local >= 0 && fb->kind != NODE_STRUCT_INIT &&
+                value_order_observable(fb)) {
+                /* BUG-1325: `none() orelse g + step()` — lowered left to right
+                 * (the var-decl / call-argument order), then copied in. */
+                int fv = lower_expr(ctx, fb);
+                if (fv >= 0) {
+                    IRInst cp = make_inst(IR_COPY, line);
+                    cp.dest_local = dest_local;
+                    cp.src1_local = fv;
+                    emit_inst(ctx, cp);
+                } else {
+                    pre_lower_orelse(ctx, &fb, line);
+                    IRInst assign = make_inst(IR_ASSIGN, line);
+                    assign.dest_local = dest_local;
+                    assign.expr = fb;
+                    emit_inst(ctx, assign);
+                }
+            } else if (dest_local >= 0) {
                 pre_lower_orelse(ctx, &fb, line);
                 IRInst assign = make_inst(IR_ASSIGN, line);
                 assign.dest_local = dest_local;
@@ -3084,6 +3344,15 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
     case NODE_EXPR_STMT: {
         Node *expr = node->expr_stmt.expr;
         if (!expr) break;
+        /* BUG-1287: a straight-line semaphore hold (see LowerCtx.sem_held). The
+         * acquire counts BEFORE its own statement is lowered is irrelevant — it
+         * holds no guarded access. */
+        if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+            memcmp(expr->intrinsic.name, "sem_acquire", 11) == 0)
+            ctx->sem_held++;
+        else if (expr->kind == NODE_INTRINSIC && expr->intrinsic.name_len == 11 &&
+                 memcmp(expr->intrinsic.name, "sem_release", 11) == 0 && ctx->sem_held > 0)
+            ctx->sem_held--;
 
         /* Rewrite idents in expression to use correct local names */
         rewrite_idents(ctx, expr);
@@ -3237,7 +3506,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             Type *ce = ct ? type_unwrap_distinct(ct) : NULL;
             if (has_capture && node->if_stmt.capture_is_ptr && lvalue &&
                 ce && type_dispatch_kind(ce) == TYPE_OPTIONAL &&
-                !type_is_null_sentinel(ce->optional.inner) &&
+                /* BUG-1340: a null-sentinel optional too — `|*pp|` of a `?*T`
+                 * field/global must point at THAT storage, not a temp copy. */
                 ce->optional.inner &&
                 type_dispatch_kind(ce->optional.inner) != TYPE_VOID) {
                 Node *amp = (Node *)arena_alloc(ctx->arena, sizeof(Node));
@@ -3414,6 +3684,8 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
             Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
+            if (step_root && lower_may_write(step_root))
+                hoist_place_effects(ctx, step_root);                 /* BUG-1372 */
             if (step_root) {
                 IRInst lock = make_inst(IR_LOCK, node->loc.line);
                 lock.expr = step_root;
@@ -3426,6 +3698,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
+            step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
             ctx->current_stmt_shared_root = prev_step_shared;
             if (step_root) {
@@ -4118,7 +4391,26 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
 
             int arm_defer_base = ctx->defer_count;
             ctx->block_defers_managed++;  /* switch arm body: we manage */
-            lower_stmt(ctx, arm->body);
+            /* BUG-1275: a bare arm `0 => g.x = 5,` is a lone EXPR_STMT, not a block,
+             * and the per-statement shared-struct lock is taken only by the BLOCK
+             * lowering — so the store ran with no mutex while the braced spelling
+             * locked. Lower a non-block body as a one-statement block (a node built
+             * here; the AST keeps its shape for every other consumer). */
+            Node *arm_body = arm->body;
+            if (arm_body && arm_body->kind != NODE_BLOCK) {
+                Node *blk = (Node *)arena_alloc(ctx->arena, sizeof(Node));
+                Node **one = (Node **)arena_alloc(ctx->arena, sizeof(Node *));
+                if (blk && one) {
+                    memset(blk, 0, sizeof(Node));
+                    blk->kind = NODE_BLOCK;
+                    blk->loc = arm_body->loc;
+                    one[0] = arm_body;
+                    blk->block.stmts = one;
+                    blk->block.stmt_count = 1;
+                    arm_body = blk;
+                }
+            }
+            lower_stmt(ctx, arm_body);
             emit_defer_fire_scoped(ctx, arm_defer_base, true, node->loc.line);
             ctx->defer_count = arm_defer_base;
             ensure_terminated(ctx, bb_exit);
@@ -4402,6 +4694,10 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         rewrite_defer_body_idents(ctx, node->defer.body);
         IRInst push = make_inst(IR_DEFER_PUSH, node->loc.line);
         push.defer_body = node->defer.body;
+        /* BUG-1298: filled below once the template is lowered. */
+        IRDeferTpl *dtpl = (IRDeferTpl *)arena_alloc(ctx->arena, sizeof(IRDeferTpl));
+        if (dtpl) memset(dtpl, 0, sizeof(*dtpl));
+        push.defer_tpl = dtpl;
         emit_inst(ctx, push);
         /* capture-on-FIRE: record the body at this depth so each later FIRE can
          * snapshot the live defers. Grow into arena on overflow (rule #7). */
@@ -4478,12 +4774,13 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             ctx->defer_tpl_count[ctx->defer_count]  = 0;
             ctx->defer_tpl_first[ctx->defer_count]  = -1;
             ctx->defer_tpl_exit[ctx->defer_count]   = 0;
-            /* BUG-965: on the raw-AST path, do not lower a template at all. Lowering
-             * would be wasted, and worse than wasted: pre_lower_orelse REWRITES the
-             * nodes it visits, so the emitter's emit_defer_stmt would then replay an
-             * AST this pass had already mutated — the "never lower the same AST
-             * twice" invariant, hit from inside one lowering. */
-            if (!defers_stay_on_ast(ctx)) {
+            /* BUG-1298: lowered in EVERY function now. BUG-965 declined to lower a
+             * template in a function with a label because the emitter then replayed
+             * the raw AST (emit_defer_stmt) that lowering had already rewritten. The
+             * emitter now emits the TEMPLATE there too, so nothing replays the AST
+             * for emission; zercheck_ir's AST scan of such a body only looks for
+             * frees and uses, which pre_lower_orelse leaves in place. */
+            {
                 int saved_block = ctx->current_block;
                 int saved_n     = ctx->defer_count;
                 int tpl_first   = ir_add_block(ctx->func, ctx->arena);
@@ -4514,6 +4811,12 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                     ctx->defer_tpl_first[ctx->defer_count]  = tpl_first;
                     ctx->defer_tpl_exit[ctx->defer_count]   =
                         (tpl_exit >= 0 && tpl_exit < tpl_n) ? tpl_exit : tpl_n - 1;
+                    if (dtpl) {
+                        dtpl->blocks = tpl;
+                        dtpl->count  = tpl_n;
+                        dtpl->first  = tpl_first;
+                        dtpl->exit   = ctx->defer_tpl_exit[ctx->defer_count];
+                    }
                 }
                 ctx->func->block_count = tpl_first;   /* extract */
             }
@@ -4628,7 +4931,9 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         emit_inst(ctx, br);
 
         ctx->current_block = bb_body;
+        ctx->once_depth++;   /* BUG-1287 */
         lower_stmt(ctx, node->once.body);
+        ctx->once_depth--;
         ensure_terminated(ctx, bb_skip);
 
         ctx->current_block = bb_skip;
@@ -4691,6 +4996,7 @@ IRFunc *ir_lower_func(Arena *arena, void *checker_ptr, Node *func_decl) {
     Checker *checker = (Checker *)checker_ptr;
     if (!func_decl || func_decl->kind != NODE_FUNC_DECL || !func_decl->func_decl.body)
         return NULL;
+    hoist_restore(checker, func_decl);   /* BUG-1372 */
 
     /* Resolve return type */
     Type *ret_type = checker_get_type(checker, func_decl);
@@ -4815,6 +5121,7 @@ IRFunc *ir_lower_interrupt(Arena *arena, void *checker_ptr, Node *interrupt) {
     Checker *checker = (Checker *)checker_ptr;
     if (!interrupt || interrupt->kind != NODE_INTERRUPT || !interrupt->interrupt.body)
         return NULL;
+    hoist_restore(checker, interrupt);   /* BUG-1372 */
 
     IRFunc *func = ir_func_new(arena,
         interrupt->interrupt.name, (uint32_t)interrupt->interrupt.name_len,

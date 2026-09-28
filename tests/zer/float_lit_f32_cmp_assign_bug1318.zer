@@ -1,0 +1,12 @@
+// BUG-1318: regression (see BUGS-FIXED.md).
+// `if (f == 0.1)` is true (literal typed f32), but `e = f == 0.1;` emits
+// `(f == 0.10000000000000001)` (double compare) and is false. Expected exit 0; actual 1.
+f32 id(f32 x) { return x; }
+u32 main() {
+    f32 f = id(0.1);
+    bool e = false;
+    e = f == 0.1;
+    bool d = f == 0.1;
+    if (d != e) { return 1; }
+    return 0;
+}

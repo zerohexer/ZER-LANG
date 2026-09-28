@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: could not be evaluated at compile time
+// BUG-1328 boundary: the comptime division needs no run-time guard because a zero
+// divisor fails the FOLD — the call is still refused.
+comptime u32 DV(u32 x, u32 y) { return x / y; }
+u32 main() { return DV(1, 0); }

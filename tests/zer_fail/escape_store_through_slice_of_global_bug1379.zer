@@ -1,0 +1,8 @@
+// expect-error: cannot store pointer to local 'x' in static/global variable 'garr'
+// BUG-1379: the escape sink's root walk stopped at a SLICE, so a stack address
+// stored through a slice of a global array (`garr[0..2][0] = &x`) was accepted
+// (ASan stack-use-after-return). Also @ptrcast / @container / (*T) launders and
+// computed (call / orelse) destinations.
+?*u32[4] garr;
+void f() { u32 x = 5; garr[0..2][0] = &x; }
+u32 main() { f(); if (garr[0]) |q| { return *q; } return 0; }

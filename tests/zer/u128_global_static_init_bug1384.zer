@@ -1,0 +1,10 @@
+// BUG-1384: u65..u128 global / static initializers wider than 64 bits (the 64-bit folders gave 0 / all-ones)
+u128 G1 = 0xFFFF_FFFF_FFFF_FFFF + 1;
+i100 N = -1;
+u32 f() { static u128 s = 0xFFFF_FFFF_FFFF_FFFF + 1; s += 1; return (u32)(s >> 64); }
+u32 main() {
+    if ((G1 >> 64) != 1) { return 1; }
+    if (f() != 1) { return 2; }
+    if (N != -1) { return 3; }
+    return 0;
+}

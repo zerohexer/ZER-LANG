@@ -1,0 +1,18 @@
+// expect-error: 'q' is freed (freed at line 13)
+// BUG-1366: reading a global THROUGH a pointer bound to it (`*lp`, lp = &slot)
+// after the global's allocation was freed in the same function. The read view
+// of the global was minted only for an ALIVE entry, so the freed state never
+// reached q (the bare-name spelling `if (slot) |q|` was refused).
+struct T { u32 v; }
+?*T slot;
+u32 main() {
+    *?*T lp = &slot;
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    slot = a;
+    free(a);
+    u32 r = 0;
+    if (*lp) |q| { r = q.v; }
+    slot = null;
+    return r;
+}

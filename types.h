@@ -228,6 +228,15 @@ struct Symbol {
     Type *type;
 
     bool is_keep;           /* keep parameter — can be stored */
+    /* BUG-1269: this buffer is an arena's BACKING STORE — the arena owns its
+     * bytes, so any mention other than `Arena.over(x)` / `free(x)` is refused.
+     * The arena's name ("" when the over result has no named destination). */
+    /* BUG-1274: Checker.branch_depth when this symbol was declared — a whole-name
+     * reassignment deeper than this may not run, so it cannot clear the escape
+     * taint the declaration-depth value carries. */
+    int decl_branch_depth;
+    const char *arena_backing_of;
+    uint32_t arena_backing_of_len;
     bool is_const;          /* const qualifier */
     bool is_volatile;       /* volatile qualifier — &volatile_var yields volatile pointer */
     bool is_static;         /* static storage duration */
@@ -275,6 +284,9 @@ struct Symbol {
     bool is_from_arena;     /* pointer from ANY arena (global or local) — cannot be stored in globals */
     bool is_nonkeep_derived; /* pointer traces to a non-keep param — cannot be persisted (keep axis) */
     int nonkeep_root_param;  /* keep inference: index of the param this pointer traces to (valid only when is_nonkeep_derived) */
+    uint64_t nonkeep_root_mask; /* BUG-1363: EVERY param it may trace to (bit i = param i; a value that
+                                 * came through `pick(p, q)` or a branch holds either). A single root
+                                 * dropped the others, so only one of them was inferred keep. */
     bool is_keep_derived;   /* pointer traces to a KEEP param — a borrow; storing into a struct field requires a 'keep' field (field-level keep, Rust &'a analog) */
     bool is_thread_handle;  /* ThreadHandle from scoped spawn — must call .join() */
     /* Scoped-borrow exclusivity (Axis C, 2026-06-21): a non-shared local
@@ -318,6 +330,18 @@ struct Symbol {
      * model that replaces the exclusion-list: instead of listing what's safe,
      * mark what's shared and require synchronized access. */
     bool is_atomic_cell;
+    /* BUG-1284: bit i = this function applies an @atomic_* to what its param i
+     * points at (directly, or by handing it to a function that does). */
+    uint64_t atomic_param_mask;
+    uint64_t atomic_param_plain_mask;   /* BUG-1284: param i also used NON-atomically */
+    /* BUG-1303: pairs (i, j) — param i is lent to a scoped spawn (here or in a
+     * callee) while param j is used before the join. A caller that passes ONE
+     * object as both is a race the callee's own borrow check cannot see. */
+    unsigned short *alias_pairs;   /* (lent i << 8) | used j */
+    int alias_pair_n, alias_pair_cap;
+    /* BUG-1303: a pointer / slice LOCAL that holds this function's param n-1
+     * (`*u32 q = b;`); 0 = none. */
+    int param_alias_pos1;
 
     /* BUG-847/849: set on a RESOURCE symbol the first time it is given its
      * backing state — an `Arena` receiving a buffer (a var-decl initializer or
@@ -334,6 +358,10 @@ struct Symbol {
     /* @ptrcast provenance: compile-time check for simple variables (belt),
      * runtime type_id in _zer_opaque for complex paths (suspenders). BUG-393. */
     Type *provenance_type;  /* NULL = unknown origin (params, cinclude) */
+    /* BUG-1299: this `*opaque` local holds a value READ out of a shared struct —
+     * casting it to a ZER pointer would reach the object outside the lock. Sticky
+     * (never cleared): clearing is a relaxation and needs a flow argument. */
+    bool opaque_from_shared;
 
     /* @container provenance: tracks which struct+field this pointer points inside */
     Type *container_struct;          /* NULL = unknown */
@@ -461,6 +489,7 @@ struct Scope {
  * Target configuration — set by checker, read by type_width
  * ================================================================ */
 extern int zer_target_ptr_bits; /* default 32, set via --target-bits */
+extern int zer_target_access_bits; /* BUG-1375: widest untearable access, 0 = ptr width */
 
 /* ================================================================
  * Global type singletons — primitives allocated once
@@ -516,6 +545,7 @@ bool type_is_float(Type *a);
 bool type_is_numeric(Type *a);
 int  type_width(Type *a);          /* bit width: 8, 16, 32, 64 */
 int  type_scalar_bytes(Type *a);   /* BUG-1151: C storage bytes of a scalar (uN/iN: its carrier), 0 if none */
+int  type_access_alignment(Type *a);   /* BUG-1399: looks inside packed structs */
 int  type_alignment_bytes(Type *a); /* required alignment in bytes; recurses
                                       * through aggregates for compound MMIO
                                       * targets; returns 0 if not computable */

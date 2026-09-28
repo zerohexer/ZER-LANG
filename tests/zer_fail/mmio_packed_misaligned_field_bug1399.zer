@@ -1,0 +1,10 @@
+// expect-error: lies at offset 1
+// BUG-1399: a packed register block with a u32 at offset 1 — an unaligned device access.
+mmio 0x40000000..0x400000FF;
+packed struct R { u8 a; u32 b; }
+u32 main() {
+    volatile *R r = @inttoptr(*R, 0x40000000);
+    volatile u32 never = 0;
+    if (never == 42) { return r.b; }
+    return 0;
+}

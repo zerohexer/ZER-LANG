@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: transferred
+shared struct S { u32 x; u32 y; }
+Slab(S) sl;
+void worker(*S w) { w.x = 7; }
+void mid(*S w, bool k) { if (k) { spawn worker(w); } }
+u32 main() {
+    *S p = sl.alloc_ptr() orelse return;
+    mid(p, true);
+    sl.free_ptr(p);
+    return 0;
+}

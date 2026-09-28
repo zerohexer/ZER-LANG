@@ -1,0 +1,19 @@
+// expect-error: which reaches 's.p' through a pointer field
+// BUG-1373: handing a callee a struct whose POINTER field reaches an object
+// holding a freed pointer is handing it the dangling pointer.
+struct T { u32 v; }
+struct S { *T p; }
+struct SS { *S s; }
+u32 rd(*SS x) { return x.s.p.v; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    S s;
+    s.p = a;
+    SS ss = { .s = &s };
+    free(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = rd(&ss);
+    free(b);
+    return r;
+}

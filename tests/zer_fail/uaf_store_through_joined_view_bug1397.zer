@@ -1,0 +1,23 @@
+// expect-error: use after free
+// BUG-1397: a store through a pointer re-aimed in one branch (the join of two views)
+// landed in no slot the analysis could name; the read of s.p returned a recycled object.
+struct T { u32 v; }
+struct S { ?*T p; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    S s; S t;
+    volatile bool c = true;
+    *S p = &t;
+    if (c) { p = &s; }
+    p.p = a;
+    free(a);
+    u32 r = 0;
+    if (alloc(T)) |b| {
+        b.v = 99;
+        if (s.p) |q| { r = q.v; }
+        free(b);
+    }
+    s.p = null;
+    t.p = null;
+    return r;
+}

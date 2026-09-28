@@ -1,0 +1,7 @@
+// expect-error: stack memory may escape through function return
+// BUG-1382: `return mk_arena(buf)` handed an arena over a LOCAL buffer out of
+// its frame through a factory (the direct `return Arena.over(buf)` was refused).
+struct M { u32 v; }
+Arena mk_arena([*]u8 b) { return Arena.over(b); }
+Arena bad() { u8[64] buf; return mk_arena(buf); }
+u32 main() { Arena a = bad(); *M m = a.alloc(M) orelse return; m.v = 7; return m.v; }

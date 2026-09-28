@@ -1,0 +1,18 @@
+// BUG-1314: a `static` local's initializer runs ONCE. Its range was used as the
+// variable's range on every call, so `ga[i]` lost its check and the second call
+// wrote ga[5]. Now the access is guarded: the second call's store is skipped
+// by the auto-guard (i = 5 >= 4) and ga keeps what the first call wrote.
+// BUG-1315: `static u32 k = 7 % 4;` emitted a guarded-division statement
+// expression as a static initializer — GCC "initializer element is not constant".
+u32[4] ga;
+void f() { static u32 i = 0; ga[i] = 1; i += 5; }
+u32 g() { static u32 k = 7 % 4; k += 1; return k; }
+u32 main() {
+    f();
+    f();
+    if (ga[0] != 1) { return 1; }
+    u32 a = g();
+    u32 b = g();
+    if (a != 4 || b != 5) { return 2; }
+    return 0;
+}

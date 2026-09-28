@@ -129,6 +129,18 @@ typedef struct {
      * function's cleanup — wrong. A trap aborts safely before the OOB access,
      * matching how slice bounds-checks already behave inside defers. */
     bool guard_traps;
+    /* BUG-1298: inline defer-template emission. `ir_src_file` / `ir_last_line`
+     * point at the enclosing function's #line state so an inlined body re-anchors
+     * the same way; `defer_label_seq` hands out block labels no function block uses. */
+    const char *ir_src_file;
+    int *ir_last_line;
+    int defer_label_seq;
+    /* BUG-1298: the @once nodes of the function being emitted; a flag is keyed on
+     * the NODE (its index here), not on a block id, so every clone of a defer body
+     * — one per fire site — shares the one flag. */
+    void **once_nodes;
+    int once_n;
+    int once_cap;
     /* BUG-835: how many scopes are open that a `return` must NEVER leave — a held
      * shared lock, or an interrupt-disabled @critical block. Counted rather than
      * a bool because they nest. While non-zero, the bounds/UAF auto-guard degrades
@@ -142,6 +154,7 @@ typedef struct {
      * that substitution (a cycle is refused by the checker, BUG-975; this is the
      * emitter's own backstop). */
     int global_init_depth;
+    bool intn_cast_wrapping;   /* BUG-1385: inside the N-bit wrap of a (uN)x cast */
 
     /* BUG-1027: slice typedefs for element types that have NO pre-emitted named
      * typedef — pointer, optional-value, funcptr, array, nested slice, *opaque.

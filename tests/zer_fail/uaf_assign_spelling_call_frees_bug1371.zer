@@ -1,0 +1,17 @@
+// expect-error: use after free: 'a' is freed
+// BUG-1371: the ASSIGN spelling of a call, `z = eat(a);`, lowered to one
+// passthrough instruction the IR_CALL transfer never saw — the callee's
+// summary (it frees its param) was not applied, so the read of `a` after the
+// call returned a recycled object (exit 99). `u32 z = eat(a);` was refused.
+struct T { u32 v; }
+u32 eat(*T p) { free(p); return 1; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    u32 z = 0;
+    z = eat(a);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = a.v + z;
+    free(b);
+    return r;
+}

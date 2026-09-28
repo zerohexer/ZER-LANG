@@ -1,0 +1,4 @@
+// expect-error: cannot contain itself by value
+// BUG-1389: container ?Node(T) by value — the stamp recursed for ever (SIGSEGV).
+container Node(T) { T v; ?Node(T) next; }
+u32 main(){ Node(u32) n; return 0; }

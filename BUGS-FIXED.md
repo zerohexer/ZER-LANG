@@ -5,6 +5,1171 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-09-27 — BUG-1366..1376: harvest of `loving-bohr-jyw9if`, then stores through pointers, call effects of the assign spelling, root-first places, lock order
+
+Harvest: `origin/claude/loving-bohr-jyw9if` (17 commits, a strict superset of
+`loving-bohr-qzn39v` and `review/25092026`, forked exactly at main) — fast-forwarded;
+`make check` green on it before anything else changed (MAKE_CHECK_EXIT=0). Then own probes
+plus three read-only probe agents (emitter values, allocation tracker, bare-metal /
+concurrency). Every fix below was A/B-measured against the post-harvest build; every new
+negative was confirmed to FIRE there.
+
+- **BUG-1366 — a store or read THROUGH a pointer that can only name one object was not
+  that object's store / read.** `?*T loc; *?*T lp = &loc; *lp = a; free(a); if (loc) |q| {
+  q.v }` returned a recycled object (exit 99) — a single-function use-after-free — and the
+  global spellings (`*gpp = a` with `*?*T gpp = &slot`, a callee `void reg(*T p) { *gpp =
+  p; }`, and the read `if (*lp) |q|`) were all silent (the documented MEDIUM residual of the
+  memory round was the global half). ONE query `ir_ptr_stable_aim` (a local bound once,
+  never reassigned or address-taken, defined `&x`; or a global initialised `&x` that
+  `checker_global_never_mutated` proves is never re-aimed) canonicalises `*p = v` into `x =
+  v` (`ir_canon_deref_store`, run on the ONE transfer) and resolves `*p` in the store
+  summary (`ir_ps_target_rec`) and on reads (`ir_alias_deref_read_local`, and the global
+  mint `ir_value_global_key`). A pointer re-aimed between several objects makes a WEAK store
+  (`ir_ptr_aim_set` / `ir_weak_deref_store`): each candidate gets the allocation in its view
+  set, the representation a wildcard array slot already uses. Found beside it: the global
+  read-view mint handed on only an ALIVE entry, so `slot = a; free(a); if (*lp) |q|` passed
+  while `if (slot) |q|` was refused — FREED/MAYBE_FREED now flow (with the free line).
+  Gate: SHAPE p53 in `tools/sink_matrix.sh` (10 cells, 8 HOLE + 1 OVER-REJECT pre-fix).
+- **BUG-1367 — `global_name_never_mutated` did not look at GLOBAL INITIALIZERS.** `volatile
+  *u32 r = @inttoptr(*u32, 0x40000000); volatile *volatile *u32 rr = &r;` then `*rr =
+  @inttoptr(*u32, 0x400000F0); r[10]` trusted r's declaration bound and read 0x40000118 —
+  outside every mmio range, no check emitted. The same query licenses funcptr resolution
+  and now the BUG-1366 aim. Test: `tests/zer_fail/mmio_bound_global_addr_in_global_init_bug1367.zer`.
+- **BUG-1368 — `loc = null;` did not end a pointer LOCAL's alias of a freed allocation**
+  (the field form `h.p = null;` and globals did): a later `if (loc) |q|` was a false
+  use-after-free. The bare-local sibling of BUG-982's reset, with the overwrite (leak) check
+  first; a param freed then reset still summarises as freeing it (`freed_then_reset`).
+  Test: `tests/zer/local_ptr_reset_after_free_bug1368.zer`.
+- **BUG-1369 — a `const` global read from an interrupt handler and from main was refused
+  "must be declared volatile"** — unfollowable advice for a constant; the spawn scan always
+  exempted const (not a const POINTER / slice, whose pointee is still shared, BUG-1249's
+  form). The two sinks now agree; `tests/test_hw_matrix.c` SITE x SHAPE gained two const cells.
+- **BUG-1370 — a `volatile` POINTER global's WORD was emitted plain.** The checker treats
+  `volatile ?volatile *u32 g` as a volatile single-word cell (the ISR / thread published-
+  pointer exemption rests on it) but the prefix `volatile` landed on the pointee in C
+  (`volatile volatile uint32_t* g`), so `while (g == null) { }` compiled to `jmp .` at -O2.
+  A pointer global that is written anywhere is now `T* volatile g` (also a static pointer
+  local); a never-written one (the `@inttoptr` MMIO base) stays plain. A pointer to a
+  qualified pointer is spelled postfix (`volatile uint32_t* volatile*`), which the old
+  prefix form could not express. Gate: required fingerprint in `tools/emit_audit.sh`
+  (RED on the pre-fix build).
+- **BUG-1371 — the ASSIGN spelling of a call skipped every call effect.** `z = eat(a);` (or
+  `s.f = …`, `arr[0] = …`) lowers to ONE passthrough `IR_ASSIGN <NODE_ASSIGN>` with no
+  IR_CALL, so the callee summary (frees, moves, freed globals, store summary), the funcptr
+  barrier and the dangling-global call window were all skipped: a single-function UAF,
+  double free and use-after-move compiled while `u32 z = eat(a);` was refused. The store
+  transfer runs as written, then the IR_CALL transfer runs on the call with no destination
+  (`ir_assign_call_value`); the store-summary scan follows the call inside an assignment too.
+  The two spellings now agree, which also surfaced a genuine leak the assign spelling of
+  `tests/zer_fail/multiview_*` had hidden. Gate: SHAPE p54 (5 of 6 reject cells HOLE pre-fix).
+- **BUG-1372 — a fixed-array PLACE was evaluated index-first, and a shared-lock root once per
+  lock / operation / unlock.** The emitter's single-evaluation bounds form reads the index
+  before the object (`size_t i = (IDX); check; &OBJ[i]`), so `m[next()][next()]` read m[2][1]
+  and `pick().a[k].b = 5` used k before `pick()` set it (reference.md: left to right). And
+  the lock root of `pick().v += 1` on a shared struct was emitted at the lock, the operation
+  and the unlock — pick() ran five times, the mutex of g1 guarded a write to g2 (race). ONE
+  lowering step `hoist_place_effects` evaluates a place's parts root-first into temps and
+  rewrites the node IN PLACE, so the lock instruction and the passthrough see one value;
+  called for a fixed-array read / field read, an assignment target, and every lock root
+  (statement, condition, for-step). The rewrites are recorded on the Checker and undone
+  when the same function is lowered again (the zercheck shim, then the emitter —
+  `test_firmware` caught the double lowering). Tests:
+  `tests/zer/eval_order_fixed_array_place_bug1372.zer`,
+  `tests/zer/shared_lock_root_single_eval_bug1372.zer` (both exit 1 pre-fix).
+- **BUG-1373 — an allocation reached through a POINTER FIELD of a struct was untracked.**
+  `SS ss = { .s = &s }; ss.s.p = a; free(a); s.p.v` (and the callee store `put(&ss, a)`, a
+  copy `*S q = ss.s`, the read `ss.s.p.v`, a callee read `rd(&ss)`, a heap carrier
+  `{ .s = hs }`, and the double free `free(s.p)`) all ran exit 99 / silently. A pointer
+  field that views a local aggregate (or a stable pointer local) records the view
+  (`view_root_local` on the compound entry — the field-level sibling of BUG-984's local),
+  and ONE re-rooting `ir_reroot_views` makes `(ss, ".s.p")` name `(s, ".p")` at every sink;
+  a call handed `&ss` is checked for freed pointers in what it reaches through the field.
+  Gate: SHAPE p55 (7 HOLE + 1 OVER-REJECT pre-fix).
+- **BUG-1374 — `&pool.get(h).v` handed to a scoped spawn lent nothing.** The borrow walk
+  needed a named root under the `&`; the object was a call. Freeing h in the window let the
+  thread write the recycled slot, a live object the parent had since allocated (exit 99),
+  while `&h.v` was refused. The `&` of a call-rooted place lends what the call reaches, and
+  a HANDLE stands for its slot like a pointer does. Test:
+  `tests/zer_fail/spawn_borrow_pool_get_bug1374.zer`.
+- **BUG-1375 — on AVR a `volatile u16` shared between an ISR and main was accepted as one
+  word.** The exemption compared against the POINTER width (16); AVR's data path is 8 bits,
+  so a u16 (and a 16-bit pointer) is two accesses and tears. `zer_target_access_bits` (8
+  when the target probe reports `__AVR__`) bounds the exemption. Test:
+  `tests/zer_fail/avr_u16_isr_tear_bug1375.zer` via `tests/support/fake_avr_gcc.sh` (a probe
+  stand-in, so the rule is testable on any host).
+- **BUG-1376 — the compiler's own locks deadlocked.** A statement touching two instances of
+  ONE shared type (the B1 multi-root lock) acquired them in SOURCE order, so `g1.v = g2.v +
+  1;` in one thread and `g2.v = g1.v + 1;` in another hung (measured 3/3, `timeout` 124) —
+  with no lock written by the user. The statement's locks are now one group (the first
+  IR_LOCK carries its size) acquired in ADDRESS order at run time. Test:
+  `tests/zer/shared_same_type_lock_order_bug1376.zer` (the runner's timeout makes a hang a
+  FAIL).
+
+## Session 2026-09-27 (d) — BUG-1386, BUG-1394..1399: the recorded residuals
+
+The open residuals of the (a)..(c) rounds, worked through. Every hazard below was
+measured accept-unsafe (or wrong) on the pre-change build and is refused (or right) now;
+the sink-matrix cells were confirmed to report HOLES against that build.
+
+- **BUG-1386 — a global array sized by a const whose value needs typed arithmetic.**
+  `const u32 X = (0 - 1) / 536870912 + 1;` is 8; a local `u32[X]` had 8 elements and a global
+  one 1, because global types are resolved at registration, before any initializer is typed,
+  and the untyped fold reads `0 - 1` as -1. `resolve_const_ident` (and `tfold`'s identifier
+  arm) now type a const's initializer ON DEMAND when it has not been — quietly
+  (`Checker.diag_quiet`: the owning pass re-checks and reports for real), only for a
+  constant-shaped tree (no calls: a comptime call may name a later function) — and fold it
+  typed. The chain guard (cycle + 64 links) applies to the typed fold too; a first draft
+  bypassed it and `global_init_chain_too_deep` compiled, which `make check` caught. Also
+  fixes an over-rejection: `const u32 B = (u32)(A + A);` over `const u8 A` could not size an
+  array at all. Test: `tests/zer/global_array_size_typed_const_bug1386.zer`.
+- **BUG-1394 — quadratic compile time.** `ir_find_local_exact_first`, called per identifier
+  by every zercheck_ir walker, scanned the local table (76% of the time). A lazily built,
+  incrementally extended hash index on the IRFunc answers the same "last exact name, else
+  last orig_name" question (16,000 straight-line statements: 24 s -> 0.9 s; identical C).
+  The fixpoint's convergence test and the leak pass's per-return scans were O(handles^2)
+  too; both now use per-state hash sets (800 allocations with an `orelse return` each:
+  8.8 s -> 3.5 s, identical diagnostics).
+- **BUG-1395 — three places whose slot had no key.** (a) An element / field read out of a
+  slot that VIEWS a local aggregate (`ps[0] = &s; if (ps[0]) |q| { q.p = a; }`) did not make
+  the reader a view — only a slot holding an allocation aliased (`ir_inherit_slot_view`).
+  (b) A call at the base of a projection (`getp(&s).p = a`) — `ir_rebase_slice_index`, the
+  key normaliser, now rewrites it to the argument the callee provably returns, and a call
+  RESULT that is `&X` is a view of X (the lowering hoists such a place root into a temp).
+  (c) A GLOBAL carrier (`gss.s = &gs; gs.p = a; … gss.s.p`) — a global projection entry
+  records the global aggregate it views (`view_root_gkey`) and global keys re-root through
+  it (`ir_reroot_global_views`). All three read a recycled object (exit 99).
+- **BUG-1396 — a view names a SLOT, not only a whole local, and is bound from any view
+  expression.** `*S p = &w.inner;` (and `&w.arr[1]`) views `(w, ".inner")`, so `p.p` is
+  `w.inner.p`; a re-aim `p = getp(&s)` / `p = p2` moves the view. ONE resolver,
+  `ir_view_set_of_value` (`&place`, a viewing pointer, a call returning an argument), at
+  every binding site: var-decl, assignment to a local, to a field / element, a call result.
+  Only `&name` used to create a view, and only of a whole local.
+- **BUG-1397 — a view that is one of SEVERAL slots.** A join of two different views used to
+  become "ambiguous" and stop re-rooting, so `*S p = &t; if (c) { p = &s; } p.p = a;` stored
+  nowhere the analysis could name. A view is now a candidate SET (up to 8, joined as the
+  union); a call that may return any of several arguments (`pick(&s, &t, c)`) views all of
+  them; a store through such a pointer is a WEAK store into every candidate slot (the BUG-1366
+  view-set representation), so the read of `s.p` after the free is refused. The `h.p = null`
+  reset now also clears a slot's view set, or the documented reset would be a false error.
+  Gate for 1395..1397: SHAPE p57 in `tools/sink_matrix.sh` (9 HOLES pre-fix). Tests:
+  `tests/zer_fail/uaf_{global_carrier_view_bug1395,store_through_joined_view_bug1397}.zer`,
+  boundaries `tests/zer/view_{slot_store_reset,join_store_reset}_ok_bug139{6,7}.zer`.
+- **BUG-1398 — lock order across a CALL.** A statement holding the (recursive) mutex of
+  shared instance A that calls a function locking instance B of the SAME type nests two
+  locks of one type; a thread doing it the other way round deadlocks (`a.v = xfer(&b)` /
+  `b.v = xfer(&a)`). BUG-1376 ordered only the statement's own locks. The per-function
+  shared-types summary now records WHICH instance (a named global, a pointer parameter —
+  mapped through each call's argument — or any), and the statement check compares a
+  callee's instance with the ones it holds: the same instance is the recursive re-entry and
+  stays legal. An indirect call is checked through EACH function the pointer may call,
+  with that function's instances mapped through the call's arguments; the first draft
+  counted it as "any instance" and the concurrency matrix's callback-table cell (a plain
+  `shared` statement calling `fp()` bound to a function re-taking the same global) went
+  red — so did the summary merge of an indirect call, which now keeps a named-global
+  instance. Corpus cost: zero. Gate: SHAPE p58 (6 HOLES pre-fix, 4 boundary cells).
+  Test: `tests/zer/shared_same_instance_across_call_ok_bug1398.zer`.
+- **BUG-1399 — a packed MMIO overlay with a misaligned field.** `packed struct R { u8 a; u32
+  b; }` over `@inttoptr(*R, 0x40000000)` put a u32 register at 0x40000001 — a fault on
+  Cortex-M device memory, split byte accesses elsewhere. `@inttoptr` now refuses a pointee
+  whose layout places a multi-byte field at an offset its alignment does not divide
+  (`mmio_misaligned_field`, recursing nested structs / arrays / unions), and the address
+  alignment gate — the constant check AND the runtime trap for a variable address — uses the
+  alignment the ACCESSES need (`type_access_alignment`), not the packed struct's own 1.
+  Tests: `tests/zer_fail/mmio_packed_{misaligned_field,misaligned_nested,odd_address}_bug1399.zer`,
+  `tests/zer_trap/mmio_packed_variable_odd_address_bug1399.zer`, boundary
+  `tests/zer/mmio_packed_aligned_overlay_ok_bug1399.zer`.
+
+## Session 2026-09-27 (c) — BUG-1387..1393: crash / hang fuzzing
+
+A crash-fuzzing pass over an ASan+UBSan build: ~92,000 mutated corpus cases, ~180
+hand-built deep-nesting inputs (100..10,000), a 320-cell self-containing-type matrix and
+~250 integer edge values. Nine signatures; seven fixed here, the polynomial slowdowns
+recorded in `docs/limitations.md`. Every reproducer below runs clean under ASan+UBSan now.
+
+- **BUG-1387 — heap over-read in the inline `asm(` raw-source scanner.** `void f(){asm(x'`
+  at end of file (no newline): the quote-skipping loops stopped at the NUL and the outer
+  `src++` stepped past it; a trailing backslash inside a quote did the same. Every step now
+  checks for the terminator before moving, and an unterminated `asm(` is a parse error.
+  Test: `tests/zer_fail/asm_unterminated_quote_eof_bug1387.zer`.
+- **BUG-1388 — signed overflow inside the compiler's range tracker.** `if (n >
+  9223372036854775807)` on a u64 pushed the range `[INT64_MAX + 1, …]`. `vrp_succ` /
+  `vrp_pred` saturate to the full range — the conservative reading, and a u64 above
+  INT64_MAX is outside the int64 domain anyway. Test (UBSan-clean now):
+  `tests/zer/vrp_guard_int64_max_bug1388.zer`.
+- **BUG-1389 — self-containment through `?T`, and no recovery after the error.** `struct A
+  { u32 a; ?A y; }` was ACCEPTED (a value optional holds its payload inline — the size is
+  infinite): without a local of type A the compile "succeeded" and GCC failed on
+  `_zer_opt_A`; with one, the stack-size pass recursed until SIGSEGV. The same for a union
+  variant and a `container Node(T) { ?Node(T) next; }`. `byvalue_core_type` peels array,
+  `?T` and distinct for all three rules (a `?*A` is a pointer and stops the walk). And after
+  ANY self-containment report the checker kept going with the cyclic type, so `@pun`,
+  `@size`, a union switch or a struct init recursed for ever in `compute_type_size` /
+  `type_alignment_bytes` / `zero_value_nonnull_leaf`: the offending field is now re-typed to
+  `u8` after the report (error recovery). Tests: five `tests/zer_fail/self_contain_*_bug1389.zer`.
+- **BUG-1390 — `defer` followed by a loop that never exits aborted the compiler.** `void run()
+  { defer { } for (;;) { } }` — valid code — failed IR validation ("IR_DEFER_PUSH has no
+  CFG-reachable IR_DEFER_FIRE") and hit `abort()`. The rule now requires a fire only when a
+  function EXIT is reachable from the push (`cfg_reaches_exit`, iterative); a defer on a path
+  that never returns has nothing to fire at. Test: `tests/zer/defer_then_infinite_loop_bug1390.zer`.
+- **BUG-1391 — emitted C doubled per nesting level.** The comma bounds form `(check(i, N),
+  a)[i]` repeats the index text and the slice hoist `__typeof__(obj) t = obj` repeats the
+  object, so `a[a[…a[i]…]]` at depth 24 wrote 528 MB of C (5.7 GB with `% 4`), and a
+  sub-slice chain 8.4 GB. An index that is not a few nodes of names / literals / fields /
+  arithmetic (`expr_emit_small`) takes the single-evaluation form, and the hoists use
+  `__auto_type`, which names the object once. Output is linear now (~25 KB at depth 24).
+  Test (semantics of the forms taken): `tests/zer/nested_index_single_emit_bug1391.zer`.
+- **BUG-1392 — nested `@saturate` / `@truncate` / `@bitcast` doubled the checking work.** The
+  generic argument loop checked each argument, then the intrinsic's own arm called
+  `check_expr` on it again — 1.9 s at depth 24, and a diagnostic in an argument could be
+  printed twice. The arms read the recorded type (`intrinsic_arg_type`); 0.015 s now.
+- **BUG-1393 — no bound on `else if` chains or array dimensions.** An else-if chain is a
+  right-nested tree and every walker recurses per link: 700 links overflowed the ASan build,
+  10,000 the release build (and Windows gives the main thread 1 MB, not 8). A chain is now
+  capped at 256 links and an array type at 64 dimensions, each with its own error. Tests:
+  `tests/zer_fail/{else_if_chain_too_long,array_too_many_dimensions}_bug1393.zer`, boundary
+  `tests/zer/else_if_chain_256_links_bug1393.zer`.
+
+## Session 2026-09-27 (b) — BUG-1377..1386: union lock through an ancestor, volatile index reads, escape through computed destinations, funcptr hand-off summaries, literal sub-slice keys, >64-bit constants, uN cast wrap
+
+A second round of read-only probe agents (escape / modules / async, and VRP / bounds / enum /
+union) on the BUG-1366..1376 build. Each fix A/B-measured; each new negative fires on the
+post-harvest build.
+
+- **BUG-1377 — the union-switch mutation lock missed writes through an ENCLOSING object.**
+  Inside `switch (w.u) { .q => |*bq| { … } }`, `w = w2;`, `w = { .u = w2.u };`, a write
+  through `*W pw = &w` (`pw.u.p = …`), and — for `switch (pw.u)` — a write to `w.u` by name all
+  replaced the union under the live capture; `(*bq).a[2]` then read a `*T` as a `*Big` (ASan
+  global-buffer-overflow). The key comparison took the ANCESTOR key `w` for "a different
+  element" of `w.u` (disjoint now requires that neither key be a prefix of the other); a
+  pointer alias counted only a pointer to the union itself (now: to anything holding it,
+  `type_holds_byvalue`); and a switch reached THROUGH a pointer blocks a write to any object
+  holding the union type whose path reaches the union (`Checker.union_switch_via_ptr`), so a
+  sibling field (`w.k = 3`) stays legal. Tests: three `tests/zer_fail/union_switch_*_bug1377.zer`,
+  boundary `tests/zer/union_switch_sibling_field_write_bug1377.zer`.
+- **BUG-1378 — a volatile read INSIDE an index expression was loaded twice.** BUG-1011 made a
+  bare volatile index single-read; `g[hv + 0]`, `g[gs.v % 16]`, `s[hv * 1]` and a bit-slice
+  index took the comma form `(check((size_t)(hv + 0), 8), g)[hv + 0]` — the access used a
+  value that was never checked (an ISR or a device can change it between the two loads).
+  `expr_reads_volatile` (exhaustive, answers YES for anything it does not model; IR locals
+  carry their own qualifier) routes every such index through the single-evaluation form.
+  Gate: required fingerprint in `tools/emit_audit.sh` (RED pre-fix).
+- **BUG-1379 — the escape sink's destination walk stopped at a slice, a launder and a
+  computed destination.** `garr[0..2][0] = &x`, `gh[1..3][0].p = &x`, `@ptrcast(*H, gp).p =
+  &x`, `@container(*O, &go.h, h).h.p = &x`, `(gm orelse &gh).p = &x`, and the keep spellings
+  `void put(*u32 p) { *slot() = p; }` / `hp().p = p` all stored a stack address into lasting
+  storage (ASan stack-use-after-return). `classify_escape_sink` now walks a SLICE, a launder
+  and an `&` step, and treats a destination rooted at a value it cannot place (a call, an
+  orelse) as a sink — so every rule that asks it, keep inference included, agrees. Tests:
+  `tests/zer_fail/escape_store_through_slice_of_global_bug1379.zer`,
+  `tests/zer_fail/keep_through_call_rooted_target_bug1379.zer`.
+- **BUG-1380 — a callee handing its param to a FUNCTION POINTER said nothing in its summary.**
+  `void apply(*(*T) f, *T p) { f(p); }` — the argument-precise barrier widens what was handed
+  to the unknown callee, but a PARAM has no entry until one is minted, so nothing reached the
+  summary and `apply(freer, a); a.v` read a freed object (exit 99; also through a struct-field
+  funcptr, a global funcptr, and across a module). The barrier now records WHICH params were
+  handed to an unknown callee (`ZerCheck.cur_handoff_params`), without minting an entry for
+  them, and the summary publishes that as `transfers_param` bit 4 — so the caller's argument
+  is MAYBE_FREED and, as at a direct funcptr call, no longer this frame's leak unless the
+  callee also frees it. A first draft MINTED the param's identity at the barrier instead;
+  `make check` refused it — the callback idiom (`m.hash_fn(key)`, then `key` read by the
+  caller) became a false use-after-free, because a minted param entry turns "handed to an
+  unknown callee" into a free-path fact. The hand-off is an OWNERSHIP fact about the caller's
+  argument, not a state of the callee's param. Tests:
+  `tests/zer_fail/uaf_after_funcptr_free_in_callee_bug1380.zer`, boundary
+  `tests/zer/funcptr_handoff_in_callee_no_leak_bug1380.zer` (a false leak pre-fix).
+- **BUG-1381 — `Ring.push` of a param-derived pointer did not infer keep.** `void send(*u32
+  p) { M m = { .p = p }; r.push(m); }` then `send(&x)` left a stack address in the channel.
+  A Ring is global storage; the push is now a keep-inference sink (the direct push of `&x`
+  was already refused). Test: `tests/zer_fail/ring_push_param_keep_bug1381.zer`.
+- **BUG-1382 — an Arena did not count as carrying a pointer.** `void setup([*]u8 b) { ga =
+  Arena.over(b); }` then `setup(localbuf)`, and `return mk_arena(buf)` through a factory,
+  retained a stack buffer (ASan in the arena's memset). `type_carries_data_pointer` now
+  answers YES for an Arena — it holds a pointer to its backing store — so every value sink
+  (keep inference, call-result escape) sees it. A global buffer behind it still compiles.
+  Tests: `tests/zer_fail/arena_over_{param_to_global,local_via_factory_return}_bug1382.zer`.
+
+Gate for 1379..1382: SHAPE p56 in `tools/sink_matrix.sh` (6 HOLE + 1 OVER-REJECT pre-fix).
+
+- **BUG-1383 — a store through a LITERAL sub-slice of an array was not keyed.** `la[1..3][0]
+  = a` IS `la[1] = a`, but the compound-key extractor stopped at the SLICE, so the slot never
+  aliased `a`: `free(a); … la[1]` read a recycled object (exit 99), for a local array and a
+  global one alike. `ir_rebase_slice_index` folds a constant `[lo..hi][k]` to `[lo+k]` (in
+  both `ir_extract_compound_key` and `ir_global_projection_key`); a variable bound stays
+  unkeyed and keeps the untrackable-store rule. The use-after-free message now names the
+  SLOT when the entry is a projection. Test: `tests/zer_fail/uaf_store_through_literal_subslice_bug1383.zer`.
+- **BUG-1384 — integers wider than 64 bits were folded by 64-bit evaluators.** `u128 g =
+  0xFFFF_FFFF_FFFF_FFFF;` emitted `= (-1)` (all 128 ones), `… + 1` emitted 0, `i100 n = -1`
+  was wrong the same way, a `static u128` inside a function likewise, and a `comptime u128
+  F() { return 0xFFFF_FFFF_FFFF_FFFF + 1; }` returned 0 where its run-time twin returns 2^64.
+  Now: a 65..128-bit literal is emitted as a 128-bit operand (`emit_int_literal`); a global /
+  static initializer of such a type is emitted as the TREE (GCC folds it at 128 bits, then it
+  is wrapped to N) and the checker admits only what that expresses exactly — literals under
+  `+ - * & | ^ ~` and casts (`global_wide_init_ok`); a comptime function or comptime-body
+  local wider than 64 bits is REFUSED (the interpreter is 64-bit — refusing beats folding
+  wrongly). The in-place global constant fold is skipped above 64 bits. Tests:
+  `tests/zer/u128_global_static_init_bug1384.zer`, `tests/zer_fail/comptime_u128_refused_bug1384.zer`,
+  `tests/zer_fail/u128_global_init_shift_refused_bug1384.zer` (the shift form is an
+  over-rejection accepted on purpose; it computes correctly but is outside the admitted set).
+- **BUG-1385 — a cast to a non-native uN / iN wrapped to N bits only in some positions.**
+  `u32 d = (u32)(u2)x` gave 2, but `s = (u32)(u2)x` stored 6, `a[(u2)big]` indexed with the
+  unwrapped value (trapped), `(u2)x == 2` compared the carrier, and a global `const u32 C =
+  (u32)(u2)6` was 6 — the passthrough and AST emission paths cast to the CARRIER only. Both
+  NODE_TYPECAST paths now open `emit_intn_value_wrap_open/close` (once per cast,
+  `Emitter.intn_cast_wrapping`). Test: `tests/zer/intn_cast_wrap_all_forms_bug1385.zer`
+  (six of its seven checks fail pre-fix).
+- **BUG-1386 — see session (d): fixed there (a const's initializer typed on demand).**
+
+## Session 2026-09-26 — BUG-1326..1359: harvest of `loving-bohr-qzn39v`, then a four-area audit (literal typing, comptime, captures, bare-metal emission)
+
+Harvest first: `origin/claude/loving-bohr-qzn39v` (8 commits, BUG-1268..1325, a strict
+superset of `review/25092026`) forked exactly at main — fast-forwarded, `make check` green.
+Older branches (`l07qno`, `8rby10`, `stoic-mendel-p4i854`) were already consumed. Then four
+read-only probe agents (emitter values, memory safety, bare-metal, concurrency) plus own
+probes. Every entry below was A/B-measured against the post-harvest build.
+
+- **BUG-1326 — a pure literal tree with `/`, `%`, `>>` or `~` could not initialise a narrow
+  signed type.** `i8 x = -5 / 1;` / `i8 x = 0 - 5 / 1;` were "cannot initialize 'i8' with
+  'u32'" while `i8 x = 0 - 5;` compiled. The only licence was the ring-homomorphism rule,
+  which must refuse those operators because it lets an intermediate wrap. Second licence
+  (`lit_tree_exact_in_width`): EVERY node's exact value fits the target and every shift count
+  is in [0, width-1] — then nothing ever wraps and the target-width computation IS the exact
+  one. The shift bound keeps ZER's over-width-is-0 rule out (`-5 >> 10` is 0 in ZER, -1
+  exactly). Tests: `tests/zer/literal_tree_exact_division_bug1326.zer`, two boundary
+  negatives `literal_tree_{negative_to_unsigned,shift_past_width}_bug1326.zer`.
+- **BUG-1327 — INT64_MIN / u64 2^63 was "not a constant".** `CONST_EVAL_FAIL` is INT64_MIN,
+  so `i64 m = -9223372036854775807 - 1;` was refused and `x / 9223372036854775808` (binary,
+  compound, const global, var-decl) was "not proven nonzero". The evaluator core
+  (`eval_const_expr_core`, ast.h) now reports failure out of band; `eval_const_expr_ok` is
+  the new entry point and the sentinel API is a thin wrapper, so every unmigrated caller
+  behaves exactly as before. Migrated: the literal-tree retype, both divisor proofs, and a
+  var-decl of a >= 2^63 u64 literal records "nonzero" with a full range. Test:
+  `tests/zer/int64_min_constant_bug1327.zer`.
+- **BUG-1328 — comptime functions could not cast, name a const global, or divide.**
+  `comptime u32 W(u32 x) { return (u32)(x * 2); }`, `return x + K;` and `return x / y;`
+  were all refused — the last by the RUN-TIME division guard, in a body that is never
+  emitted. The interpreter now folds `(T)x` (integer/bool source to an integer of at most 64
+  bits, wrapped as the emitted conversion is) and resolves an integer `const` global through
+  the one const resolver, in the GLOBAL scope (a same-named local of the caller cannot
+  capture it); the division guard is skipped in a comptime body (a zero divisor fails the
+  fold and the call is refused). Tests: `tests/zer/comptime_cast_and_const_global_bug1328.zer`,
+  `tests/zer_fail/comptime_division_by_zero_fold_bug1328.zer`.
+- **BUG-1329 — `alloc(u3, n)` / `alloc(i48, n)` said "undefined identifier 'u3'".**
+  `alloc_resolve_elem_type` knew only the keyword widths. Test:
+  `tests/zer/alloc_arbitrary_width_elem_bug1329.zer`.
+- **BUG-1330 — `if (g.o) |*v| { v.x += 1; }` on an optional inside a SHARED struct wrote the
+  shared bytes with no lock** (the auto-lock covers the condition only; TSan race; also
+  through a `*S` param and a nested field). Refused through `lvalue_path_through_shared` —
+  the union-switch sibling (B2) now uses the same path query (it tested only the ROOT). Tests:
+  `tests/zer_fail/shared_optional_ptr_capture{,_param,_nested}_bug1330.zer`; boundary
+  `tests/zer/shared_optional_value_capture_ok_bug1330.zer`.
+- **BUG-1340 — `|*pp|` of a `?*T` / `?funcptr` bound the POINTEE's address, not the
+  optional's.** Emitted `pp = o;` into a `T **`, so `*pp = &other` wrote a pointer into the
+  object's own bytes (a 4-byte struct global overwritten, its neighbour clobbered — silent).
+  IR_COPY now takes the optional's address for a null-sentinel optional (the type test `dst
+  == *inner` separates it from the value capture), and ir_lower's BUG-1054 lvalue-address
+  path no longer excludes null-sentinel optionals (a field/global/element capture pointed
+  into a temp copy). Test: `tests/zer/optional_ptr_mutable_capture_bug1340.zer`.
+- **BUG-1341 — a pointer to a function pointer was not a C declarator**
+  (`uint32_t (*)(uint32_t)* pp`) — every `**(u32) -> u32` local/param and every `|*pf|`
+  capture of a `?funcptr` failed in GCC. `emit_type_and_name` puts the stars inside:
+  `uint32_t (**pp)(uint32_t)`. Test: `tests/zer/pointer_to_funcptr_bug1341.zer`.
+- **BUG-1342 — `@critical` masked nothing on bare-metal RISC-V / AArch64 / ARM A-R unless the
+  build passed `-ffreestanding`.** The privileged arms were gated on `!_ZER_HOSTED`
+  (= `__STDC_HOSTED__`), which a newlib toolchain (`riscv*-unknown-elf`, `aarch64-none-elf`,
+  `arm-none-eabi` on an A/R core) sets to 1; the fence arm ran and the ISR read-modify-write
+  the checker had told the user to wrap lost updates. New preamble macro `_ZER_USER_MODE` =
+  hosted C AND an operating system (`__linux__`, `__APPLE__`, `_WIN32`, …); the privileged
+  arms key on `!_ZER_USER_MODE`. Gate: three new newlib rows in `tools/emit_audit.sh`'s
+  per-target `@critical` table (RED on the old build).
+- **BUG-1343 — a COMPUTED `@inttoptr` address bound a plain pointer.** BUG-1195 made only a
+  constant address volatile; `*Regs u = @inttoptr(*Regs, base + n*0x100); u.ctrl = 1;
+  u.ctrl = 2; while (u.status == 0) {}` passed the same runtime mmio-range check and -O2
+  deleted the first store and hoisted the poll (also `@ptrtoint(r) + 4`). The result is now
+  volatile for every address in strict mode; under `--no-strict-mmio` (no range check —
+  lib/compat.zer's pointer-arithmetic emulation) only the constant form is promoted. Tests:
+  `tests/zer_fail/inttoptr_computed_addr_volatile_{l13,l14}_bug1343.zer`.
+- **BUG-1344 — a whole-array copy to/from a volatile array was a plain `memmove`** (qualifier
+  cast away: -O2 merged 32-bit FIFO registers into 64-bit accesses, deleted the first of two
+  writes, turned a poll into `jmp .`). The IR path had no volatile case at all; the AST path
+  used a BYTE loop (four accesses to a 32-bit register). One emitter `emit_array_assign`,
+  element-wise at the innermost element type through volatile pointers; `expr_is_volatile`
+  now sees an access THROUGH a volatile pointer or slice at any step. Gate: `emit_audit.sh`
+  "bmq" sample; test `tests/zer/volatile_array_copy_bug1344.zer`.
+- **BUG-1345 — array PARAMETERS dropped qualifiers in both directions.** Passing a volatile
+  array to `void f(u32[4] a)` (C: a plain pointer) was accepted, as was a `const` array to a
+  writing callee; and a DECLARED `volatile u32[4] a` parameter was emitted as `uint32_t
+  a[4]`. `reject_array_param_qualifier_drop` at the call-arg sink (reads the callee's
+  parameter type node; an indirect callee counts as unqualified), and
+  `emit_func_decl_params` emits the element qualifier. Tests:
+  `tests/zer_fail/{volatile_array_to_plain_param,const_array_to_mutable_param}_bug1345.zer`,
+  `tests/zer/qualified_array_param_bug1345.zer`.
+- **BUG-1346 — `section(...)` was silently dropped on every declaration form except the
+  generic one** (`volatile`, `const`, `static`, `threadlocal`, `interrupt`, `async` returned
+  earlier) — a DMA buffer outside DMA-reachable RAM, a `.noinit` flag zeroed at reset, a
+  `.ramfunc` ISR running from flash. `parse_declaration` now parses the attribute, calls the
+  body parser, and applies it to whatever came back; `NODE_INTERRUPT` carries a section; a
+  declaration that cannot carry it (and `naked` on a non-function) is an error. Test:
+  `tests/zer_fail/section_on_struct_decl_bug1346.zer` + `emit_audit.sh` "bmq".
+- **BUG-1347 — `interrupt X as "SYMBOL"` was parsed and never emitted**: the handler was
+  `X_IRQHandler`, so the vector table kept its weak default and the handler never ran. One
+  `emit_isr_signature` for prototype and definition; the name must be a C identifier. Test:
+  `tests/zer_fail/interrupt_as_name_not_identifier_bug1347.zer` + `emit_audit.sh` "bmq".
+- **BUG-1348 — RISC-V `@critical` / `@cpu_restore_int_state` restored ALL of `mstatus`**, so
+  anything the block changed (FS=Dirty from FP use) was reverted and a lazy-FPU context
+  switch skipped saving the FP registers. Restores MIE (bit 3) only.
+- **BUG-1349 — a nested index with a side-effecting inner index addressed the wrong
+  element.** The single-evaluation lvalue form `*({ ...; &a[i]; })` was followed by the
+  outer `[j]` / `.f`, and postfix binds tighter than unary `*`: `m[id(1)][2] = 7` wrote
+  `m[3][0]` (`m[id(2)][2]` overflowed the stack — ASan), for a call, a volatile, an
+  orelse, `k += 1` as the inner index; `rs[id(1)].x = 5` did not compile. The four forms
+  (both emitter paths, array and slice) are parenthesised, and the IR form now evaluates
+  an lvalue OBJECT with a side effect before the index (`s.m[t(1)][t(2)]` ran t(2) first).
+  Test: `tests/zer/nested_index_side_effect_bug1349.zer`.
+- **BUG-1350 — C trigraphs rewrote string literals.** The driver compiles with
+  `-std=c99`, so `"??="` became `"#"` and `"??/"` a backslash escaping the next byte.
+  `emit_c_string_text` emits `?` as `\?`. Test: `tests/zer/string_trigraph_literal_bug1350.zer`.
+- **BUG-1351 — an index, a slice / bit-slice position and an alloc count wider than 64
+  bits were silently narrowed** (`s[(1 << 64) + 1]` read `s[1]` after passing the check as
+  1; a `u65` index wrote `arr[2]`; `alloc(u32, 2^64 + 2)` returned 2 elements). Refused
+  (`reject_wide_position`), as `@inttoptr` refuses a wide address. Tests:
+  `tests/zer_fail/wide_{index,alloc_count}_bug1351.zer`.
+- **BUG-1352 — a shift count wider than 64 bits was narrowed by `(int64_t)` in
+  `_zer_shl`/`_zer_shr`** (`x << ((1 << 64) + 1)` shifted by 1; UBSan). A count that does
+  not round-trip through int64_t is out of range → 0. Test:
+  `tests/zer/wide_shift_count_bug1352.zer`.
+- **BUG-1353 — `@ctz`/`@clz`/`@popcount`/`@ffs`/`@parity` on u65..u128 used the low 64
+  bits** (`@ctz(1 << 70)` was 64). Refused like `@bswap64`. Test:
+  `tests/zer_fail/bitquery_wide_operand_bug1353.zer`.
+- **BUG-1354 — an ARRAY FIELD of a frame-held struct escaped as a view.**
+  `[*]u32 view(W w) { return w.a; }` (a by-value struct PARAMETER was exempted as "caller
+  memory" along with array parameters), `[*]u32 s = w.a; return s;` and `return
+  ident(w.a);` on a LOCAL struct, sub-slice and carrier variants — all accepted, ASan
+  stack-use-after-return. Every site walked to the root ident and tested whether the ROOT
+  was an array. ONE predicate, `array_storage_frame_root` / `array_view_frame_root`, now
+  answers "which of this frame's variables holds this array?" (the storage is someone
+  else's only through a pointer/slice step, or at a global / static / array-pointer-slice
+  parameter root) and feeds `arg_is_local_derived`, the slice-binding taint and the
+  return sink. Gate: SHAPE p60 in `tools/sink_matrix.sh` (6 HOLE on the old build, 4
+  boundary cells). Tests: `tests/zer_fail/{param_struct_array_field_escape,
+  local_struct_array_field_view_escape,local_struct_array_field_call_launder}_bug1354.zer`.
+- **BUG-1355 — views into two more frame temporaries.** `(mkp(v) orelse dflt()).a` (an
+  orelse reached through by-value steps is a temporary, like a call —
+  `ref_path_hits_call_temp`), and `if (mk(7)) |*v| { return v.a[0..]; }` (a `|*v|`
+  capture of frame storage — a local, a by-value parameter or a condition temporary — is
+  now local-derived). Tests: `tests/zer_fail/{orelse_temp_array_view,
+  mutable_capture_call_temp_view}_bug1355.zer`.
+- **BUG-1356 — calling a function pointer produced by an expression aborted the
+  compiler** (`sel(1)(5)`, `(maybe(k) orelse f)(x)`: "INTERNAL ERROR: emitter cannot lower
+  this callee expression"). Emitted as a parenthesised callee through the BUG-1019 null
+  guard. Test: `tests/zer/call_result_callee_bug1356.zer`.
+- **BUG-1357 — a function returning a NULLABLE function pointer emitted
+  `uint32_t (*)(uint32_t) f(...)`** (GCC refused). `func_ret_funcptr_type` peels the
+  null-sentinel optional. Same test.
+- **BUG-1358 — an MMIO register read-modify-written from an interrupt and from main
+  through pointers each side forms itself was accepted** (`interrupt U { volatile *Regs u
+  = @inttoptr(*Regs, A); u.ctrl |= 1; }` beside main's `u.ctrl |= 2`; two globals bound
+  to one address; a helper forming the pointer, called from both) — a lost update to the
+  register. The ISR/main RMW rule was keyed on global NAMES. A write through a pointer
+  bound once to a constant `@inttoptr` is now also keyed on "MMIO register ADDR.path"
+  (`track_mmio_register_write`, both the check_expr sink and the ISR walk, which records
+  callee locals as it passes them), so both sides meet in one entry. Boundary: `@critical`
+  on both sides, different registers/fields, ISR reads only. Tests:
+  `tests/zer_fail/isr_mmio_register_rmw_{x2,x4,x8}_bug1358.zer`.
+- **BUG-1359 — a uN / iN read out of foreign memory was not narrowed to its width.**
+  ZER stores only in-range values, but a device register (or C, or a `@pun` view) can
+  leave bits above N set: `u3 f = rr.a;` through an MMIO pointer held 127, `i5 v = *reg;`
+  held 127 instead of -1, and every comparison read the raw carrier. The IR emits the
+  width wrap after each field / element / deref LOAD (`emit_intn_load_normalize`). The
+  AST emitter path (labelled-function defer bodies, global initializers) does not.
+  Test: `tests/zer/uN_load_from_mmio_masked_bug1359.zer`.
+- Tooling: `test_fuzz.c` declares `_POSIX_C_SOURCE` (implicit `fileno` warning — the build is
+  otherwise warning-free).
+
+## Session 2026-09-26 — BUG-1331..1336: what a scoped-spawn CARRIER lends
+
+All six were accepted by the pre-change build (eed55b58) and TSan/ASan-confirmed in the probe
+round; every new negative below compiles clean there. One query throughout — the borrow roots
+(`collect_borrow_roots` / `borrow_roots_of_ident`) — read by the spawn sink, not a use-site patch.
+
+- **BUG-1331 — an async task's `_init` arguments were not lent through `&task`.**
+  `_zer_async_f_init(&t, &x); ThreadHandle th = spawn w(&t); x += 1;` raced the child's poll
+  (also a global `&g`, and a threadlocal `&tl` reached the child's own TLS slot). The task
+  stores every argument, so it is a carrier: `async_init_record_task_roots` records the roots
+  of args 1.. on the task's root symbol at the `_init` call, and the existing `&carrier` arm of
+  the spawn sink lends them. Tests: `tests/zer_fail/spawn_borrow_async_task_{local,global,threadlocal}_bug1331.zer`,
+  boundary `tests/zer/spawn_borrow_async_task_join_bug1331.zer`.
+- **BUG-1332 — a heap payload reached through `&carrier` / `&task` could be freed or written
+  in the window.** `H h = { .p = p }; spawn w(&h); free(p);` (and the slot reused by the next
+  `alloc`, the thread writing a DIFFERENT live object), `p.v += 1` racing `h.p.v += 1`, the
+  `h.p = p` field-store spelling, and the task form `init(&t, p)`. A pointer with no recorded
+  root pointed at memory the checker could not name, so the carrier lent nothing. Now an
+  unrooted POINTER / SLICE name stands for its own pointee (`borrow_roots_of_ident`), exactly
+  as `spawn w(p)` already lent `p`. Zero corpus verdict changes. Tests:
+  `tests/zer_fail/spawn_borrow_heap_{carrier_free,carrier_reuse,carrier_write,carrier_fieldassign,task_free,task_reuse}_bug1332.zer`,
+  boundary `tests/zer/spawn_borrow_heap_carrier_join_bug1332.zer`.
+- **BUG-1333 — a GLOBAL pointer initialised to `&g` did not lend `g`.** `*u32 gp = &g;
+  spawn w(gp); g += 1;` (also through a local copy `q = gp`, and `&g` + `gp` to two live
+  threads). A global's declaration initializer is never a recorded borrow root; the spawn
+  sink's ident arm now asks `collect_borrow_roots`, which for a global pointer runs the AIM
+  query (`for_each_write_target`: the initializer and every `gp = …` in the program). The
+  pointer's own name is added too when a write cannot be followed. Recorded names on a
+  ThreadHandle now grow instead of being dropped past 3 per argument (an un-recorded name was
+  never released by the join). Tests: `tests/zer_fail/spawn_borrow_global_ptr{,_copy,_twice}_bug1333.zer`,
+  boundary `tests/zer/spawn_borrow_global_ptr_join_bug1333.zer`.
+- **BUG-1334 — reaching a lent global THROUGH a global pointer.** A callee `void bump() {
+  *gp += 1; }` called in the window (the BUG-1125 callee walk visited `gp`, never `g`), and
+  the parent's own `*gp += 1` / `u32 v = *gp`. `walk_callee_globals` follows a pointer global
+  to its aims for the two borrow clients (`follow_pointee`), and `global_pointer_lent_aim`
+  answers the parent's read and write-through sinks. Tests:
+  `tests/zer_fail/spawn_borrow_global_ptr_{callee,parent_write,parent_read}_bug1334.zer`.
+- **BUG-1335 — a struct carrier built by a FACTORY lent nothing.** `H mk() { H h = { .p = &g
+  }; return h; }` then `H h = mk(); spawn w(h);` or `spawn w(mk())`. The BUG-1285 return walk
+  resolved the returned name in the CALLER's scope and dropped the callee's locals. When a
+  pointer-carrying return names a callee local, `ret_local_scan` over-approximates soundly:
+  every global whose address the callee (or its callees) forms, every global array it names
+  whole, and every global pointer's aim. Tests: `tests/zer_fail/spawn_borrow_factory_carrier{,_arg}_bug1335.zer`,
+  boundary `tests/zer/spawn_borrow_factory_carrier_join_bug1335.zer`.
+- **BUG-1336 — a parent `@atomic_*` on a lent object was exempt from the borrow.** The borrow
+  checks skip an `&` operand, so `spawn w(&g); @atomic_add(&g, 1);` raced the thread's plain
+  `*p += 1` (an atomic is atomic only against other atomics). The atomic-target check now
+  refuses a lent root (directly, through a pointer alias, or through a global pointer's aim).
+  The stack-local form had been refused for the WRONG reason ("no other thread can reference
+  it" — one does). Tests: `tests/zer_fail/spawn_borrow_atomic_{global,load,local}_bug1336.zer`,
+  boundary `tests/zer/spawn_borrow_atomic_after_join_bug1336.zer`.
+
+`tests/zer_fail/spawn_scoped_carrier_free_before_join.zer` (by-value `spawn w(b)`, `b.t = t`,
+`free(t)` before the join) is now refused by the checker's borrow before zercheck's TRANSFER;
+its `// expect-error:` moved from "is transferred" to "borrowed by a scoped spawn" — both are
+the right reason, the borrow simply fires first.
+
+Gate: SHAPE p20 +7 cells (5 reject, 2 boundary) and p32 +1 in `tools/sink_matrix.sh` — all six
+reject cells HOLE on the pre-change build. Residuals: `docs/limitations.md` "residuals of
+BUG-1331..1336".
+## Session 2026-09-26 — BUG-1360..1355: memory-safety audit round (call-result identity, callee store summaries, keep value query, overwritten free facts, owned-object stores)
+
+Six accept-unsafe holes from a probe round (reproducers read a recycled `alloc(T)` slot —
+exit 99 — which ASan cannot see, or a dead frame through a global — ASan
+stack-use-after-return). Every negative below was A/B-measured: ACCEPTED by the
+pre-change build (eed55b58), rejected with the stated reason after.
+
+- **BUG-1360 — a call argument that is ITSELF a call result lost its allocation identity.**
+  `*T c = id(id(a)); free(a); c.v`, `unwrap(wrap(a))`, `wrap(a).p`, `pick(id(a), a)`,
+  `W w = wrap(id(a))`, `g = id(id(a))` (global left dangling), `c = id(id(arena_alloc));
+  ar.reset(); c.v`, `fp(id(a))` (not widened by the funcptr barrier), `f(x, id(x))` (aliased
+  argument to a freeing callee), `killp(id(id(a)))` / `consume(pass(o))` (double free) all
+  compiled. The inner call is lowered into a temp, but every sink reads the ORIGINAL AST,
+  where the argument is a NODE_CALL with no key, so the outer result aliased nothing and was
+  registered as a FRESH allocation (which is also why the SAFE spelling `*T c = id(id(a));
+  free(c);` was a false "a never freed"). Fix: the view query `ir_view_arg_handle` resolves a
+  call (or a field of one) whose summary returns (a view of) one of its arguments to THAT
+  argument — the query `free()` already used (`ir_resolve_returned_arg`, BUG-1257) — and so
+  do the aliased-argument query `ir_arg_handle`, the indirect-call barrier and the
+  field-free widening. A struct-valued call with no single returned param resolves, for the
+  view query only, when every field view names the same param (`ir_resolve_returned_arg_ex`
+  `collapse_struct`). `*T c = wrap(a).p;` (a field READ out of a call) aliases through the
+  same resolution. Gate: SHAPE p49 in `tools/sink_matrix.sh` (8 HOLE + 1 OVER-REJECT on the
+  old build). Tests: `tests/zer_fail/*_bug1360.zer` (11), boundary
+  `tests/zer/nested_identity_call_ok_bug1360.zer` (rejected by the old build).
+- **BUG-1361 — a callee storing a param into an ELEMENT or the WHOLE object was not
+  summarised.** BUG-1241's `param_store` recorded `dst.f.g = src` only: `s.data[k].p = p`,
+  `s.arr[1] = p`, a container push `s.data[s.top].p = p`, `*s = { .p = p }`, `*s = t`, and
+  `PT x = { .p = p }; s.data[1] = x;` left the caller's object holding nothing, so
+  `put(&s, a); free(a); s.data[0].p.v` read a recycled slot. The collector is rewritten as
+  ONE scan (`ir_ps_scan`) over every spelling: a target path of fields, literal indices
+  (`[1]`) and unnameable indices (`[*]`), `*x` as x; a value that is a param, a copy of one,
+  a reference into one, a struct literal, an aggregate LOCAL (whatever was stored into it,
+  recursively), an identity call; and a callee's own entries composed through its
+  arguments. At the call site (`ir_apply_param_stores`) a reference lands at the path and an
+  aggregate lands every allocation it carries at path + sub-path; a `[*]` path lands in the
+  array's wildcard slot as an aliasing `[*@L]` entry, exactly what a direct store at an
+  untrackable index leaves. Two unnameable indices on one path are refused (no read could
+  meet the key). Gate: SHAPE p50 cells `elem_*`, `whole_object`, `aggregate_value`. Tests:
+  `tests/zer_fail/uaf_callee_*_bug1361.zer` (4).
+- **BUG-1362 — a callee storing a param into a GLOBAL was not summarised.** `reg(p) { g =
+  p; }` (and `garr[1] = p`, `gs.p = p`, `gs = { .p = p }`, `gs2[1].p = p`, `garr[k] = p`,
+  `S t = { .p = p }; gs = t;`) then `reg(a); free(a); rd()` read the freed object; the
+  direct `g = a` in the caller is refused by the dangling-global rules. Same collector: an
+  entry with dst -1 names the global by its FULL key (the IR_GLOBAL_ROOT_ID spelling), the
+  call site registers it exactly as the direct store does (and marks the argument escaped —
+  the global owns it), and the BUG-739/742 exit and call-window rules then apply unchanged.
+  An element stored at an index the caller cannot name gets its own sentence (no `x = null;`
+  can name that slot). `tests/zer_trap/wrong_pool_handle_via_global_bug1270.zer` freed a
+  handle a callee had stashed in a global — the direct spelling is refused; the test now
+  leaves the global as owner. Gate: SHAPE p50 `global_*`. Tests:
+  `tests/zer_fail/dangling_global_callee_*_bug1362.zer` (6), boundary
+  `tests/zer/callee_store_then_reset_ok_bug1361.zer`.
+- **BUG-1363 — keep inference missed every spelling of a param reaching a global that was
+  not a bare ident or a direct call.** `*u32 z = id(p); g = z;`, `?*u32 z = id(p)`,
+  `z = id(p)`, `gs.p = z`, `if (pp(p)) |z| { gn.p = z; }`, `*u32 z = pp(p) orelse return;`,
+  `[*]u32 v = sv(s); gsl = v;`, `g = { .p = p }`, `garr[0] = { .p = p }`, a nested literal,
+  `N n = { .p = p }; garr[0] = n;`, `t[0].p = p; garr[1] = t[0];`, `*s = { .p = p }` through
+  a pointer to a global, `*h = { .p = p }; gh = h;` — keep was never inferred, so `put(&x)`
+  stored a stack address in a global (ASan stack-use-after-return). The alias sites walked
+  FIELD/INDEX/SLICE to a root IDENT and stopped at anything else. ONE query now:
+  `keep_value_roots` (checker.c) — the SET of non-keep params a value may carry, through
+  field/index/slice/deref/launder, BOTH orelse arms, calls (the positions the return summary
+  allows; every argument for an unresolvable callee), struct literals. `Symbol.
+  nonkeep_root_mask` holds the set (a single `nonkeep_root_param` dropped the other arm of a
+  join). Every alias site taints through `taint_nonkeep_from_value` (var-decl init,
+  assignment — including a `*h =` target, which makes `h` carry it — if/switch capture), and
+  the persist sink is ONE arm gated on the TARGET carrying a reference (a literal has no type
+  of its own); it replaces the ident arm and the call arm (`call_has_nonkeep_derived_arg` /
+  `infer_keep_from_call_args` are gone). The spawn sink and the keep-call edges ask the same
+  query. Gate: SHAPE p51 (7 HOLE on the old build). Tests:
+  `tests/zer_fail/keep_infer_*_bug1363.zer` (18), boundaries
+  `tests/zer/keep_infer_{global_arg,local_use,local_struct}_ok_bug1363.zer`.
+- **BUG-1364 — a slot freed and then OVERWRITTEN lost the fact that it was freed.** `void
+  re(*H h) { *T n = alloc(T) orelse return; free(h.p); h.p = n; }` freed the caller's
+  allocation on its live path, but the store turned the FREED entry into an ALIVE alias of n;
+  the summary saw nothing on that path and "not freed" on the orelse path, so the caller's
+  alias `a` of the old `h.p` stayed ALIVE. The `= null` reset already kept the fact
+  (BUG-985); every other overwrite dropped it. `ir_slot_note_overwrite`, called from
+  `ir_report_overwrite` (the one "an entry is about to be overwritten" query) and the three
+  store arms that did not call it. Gate: p52 `replace_after_free`. Test:
+  `tests/zer_fail/uaf_callee_frees_field_then_replaces_bug1364.zer`.
+- **BUG-1365 — an allocation stored into a field of an object the function OWNS was marked
+  escaped.** `*N n = alloc(N) orelse ...; n.p = a; free(n);` leaked `a` in silence:
+  `ir_target_root_escapes` called any pointer root "outside the function". A non-param
+  pointer local holding a live, owned, non-arena allocation is not; the slot aliases `a`, and
+  when n escapes (returned, stored to a global, freed through its field) the slot goes with
+  it. The field-free widening now also reaches the slots recorded under any ALIAS of the
+  argument (`j.p = d; ... drop(hn)` where hn aliases j). Also: a same-named local shadows a
+  global in that predicate. Gate: p52 `leak_through_node` + `safe_node_returned`. Tests:
+  `tests/zer_fail/leak_stored_into_freed_node_bug1365.zer`, boundary
+  `tests/zer/owned_node_field_store_ok_bug1365.zer`.
+
+---
+
+## Session 2026-09-25f — BUG-1308..1325: five-area audit (escape through indirection, funcptr reach via global initializers, global-read aliases, VRP, emitter literals, `main` ABI)
+
+Harvest first: `origin/review/25092026` (6 commits, BUG-1268..1307, forked on main) merged
+cleanly. Then five read-only probe agents (memory safety, bounds, concurrency/bare-metal,
+emitter values, reference.md coverage) plus own probes against the merged tree. Every entry
+below was A/B-measured against a from-HEAD build of the merge.
+
+- **BUG-1308 — the comptime evaluator folded `x >>= n` / `x <<= n` for n in [width, 63] as
+  a real shift, and did +, -, * and unary - in SIGNED int64.** `comptime i32 SR(i32 a) {
+  i32 x = a; x >>= 40; return x; }` folded -1 while the runtime gives 0 (ZER: over-width
+  shift = 0); `comptime u64 SQ(u64 a) { return a * a; }` at 2^32 was signed-overflow UB in
+  the compiler itself (UBSan, checker.c eval_const_expr_subst). Fix: the compound shift tests
+  the TARGET width like the binary operator does; +, -, * and negate compute in uint64_t
+  (same bits, defined); ast.h's untyped `-INT64_MIN` is a fold failure. Test:
+  `tests/zer/comptime_fold_wraps_and_shift_width_bug1308.zer` (exit 1 on the old build).
+- **BUG-1309 — a frame address stored THROUGH AN INDIRECTION that is not the root escaped.**
+  `void mk([*]?*u32 s) { u32 loc = 5; s[1] = &loc; }`, `s[1].p = &loc` through a `[*]H`
+  param or a local slice view of a global, `w.hp.p = &loc` through a POINTER FIELD of a local
+  struct, `w.s[0].p = &loc` through a slice field — all compiled; ASan
+  stack-use-after-return. `classify_escape_sink` asked only the ROOT's type; it now walks the
+  chain and reports "not this frame's memory" when any step goes through a pointer, Handle or
+  slice (15 sinks share it). The diagnostic says "through pointer or slice" (it named every
+  such root a "pointer parameter"). Zero corpus verdict changes. Gate: SHAPE p47 in
+  `tools/sink_matrix.sh` (5 HOLE on the old build). Tests:
+  `tests/zer_fail/escape_{slice_elem_store,ptr_field_of_local}_bug1309.zer`.
+- **BUG-1310 — a function pointer bound in a GLOBAL's declaration initializer was followed
+  by no scan.** `const Ops ops = { .f = set }; void w() { ops.f(); } spawn w();` — the spawn
+  race scan exempted the read of `ops` (const, and a funcptr is not a data pointer) and
+  followed nothing: TSan data race, a Pool used from two threads, and (through a copy `Ops o
+  = ops`, a factory returning `ops.f`, a by-value param) the same. Even a bare `const *() gcb
+  = set; gcb()` was missed at the SPAWN sink (the ISR sink had facet 1). At the ISR sink the
+  struct form left the global non-volatile; in the deadlock summaries `ops.f()` was a call to
+  nothing, so `a.x = get()` with get calling a B-writing callback HUNG at run time — and so
+  did any helper calling through a funcptr LOCAL (`*() f = inner; f()`), and a direct
+  statement `a.x = f()`. ONE query, `global_bound_functions` / `indirect_callee_functions`
+  (checker.c): a read of a funcptr-carrying global reaches every function its initializer
+  names when the global cannot change (const, or `global_name_never_mutated`), else every
+  function of a carried signature; an indirect call through anything else reaches every
+  function of its signature (the BUG-1290 end). Wired into the spawn scan's and the ISR
+  scan's global-read arms and both deadlock collectors. A re-entry stack stops a callback
+  that reads its own table. Zero corpus verdict changes. Gate: REACH grid cells
+  `const-global-funcptr`, `global-struct-init`, `global-init-copy` (spawn, x4 payloads) and
+  the ISR sub-grid's two (5 FAIL on the old build). Tests:
+  `tests/zer_fail/{deadlock_via_global_init_funcptr,deadlock_via_local_funcptr,spawn_race_via_global_init_funcptr}_bug1310.zer`,
+  boundary `tests/zer/funcptr_global_init_callback_ok_bug1310.zer`.
+- **BUG-1311 — a GETTER of a global was a borrow of nothing.** `?*T getg() { return g; }`,
+  then `g = a; *T c = getg() orelse return; g = null; free(c); a.v` read a recycled object
+  (and `free(a)` after it double-freed, so two later allocations shared one slot). The direct
+  read `c = g` aliases the global's entry (BUG-1242); the call did not. New summary fact
+  `FuncSummary.ret_global_key` — every live return reads ONE global key, or null — and
+  `ir_value_global_key` answers it for a call, so every consumer (the read alias, the
+  BUG-1181 free-through-global trace) treats the call as that read. The call-result entry the
+  call transfer registered is replaced by the alias.
+- **BUG-1312 — a GLOBAL array handed as a slice to an element-freeing callee.**
+  `dropit(gh)` with `dropit([*]H s) { free(s[0].p ...) }` then `a.v`: the BUG-1300 widening
+  ran only for a LOCAL array root; a global's element entries are keyed under
+  `IR_GLOBAL_ROOT_ID` with the same path shape and now widen too. Gate: SHAPE p48 (4 HOLE on
+  the old build). Tests: `tests/zer_fail/uaf_via_global_getter_bug1311.zer`,
+  `tests/zer_fail/uaf_global_array_elem_free_callee_bug1312.zer`.
+- **BUG-1313 — a `return` inside an orelse fallback that is itself an EXPRESSION was missing
+  from the return-range summary.** `u32 f(u32 x) { u32 y = m() orelse m2() orelse { return 5;
+  }; return x % 4; }` summarised [0,3]; `ga[f(g)]` on a `u32[4]` elided its check and wrote
+  ga[5] (ASan). `scan_expr_orelse_returns` handed every fallback to the STATEMENT walker; an
+  expression fallback is now scanned as an expression, and the if-chain is an exhaustive
+  switch. Tests: `tests/zer_trap/return_range_orelse_{expr,call}_fallback_bug1313.zer`.
+- **BUG-1314 — a `static` local's initializer was used as its range on every call.**
+  `void f() { static u32 i = 0; ga[i] = 1; i += 5; }` — the second call wrote ga[5] with no
+  check. The init runs once; a static now starts with no range (like a global, which it
+  already was for invalidation). Test: `tests/zer/static_local_no_init_range_bug1314.zer`.
+- **BUG-1315 — `static u32 k = 7 % 4;` failed at GCC** ("initializer element is not
+  constant"): the guarded division is a statement expression. A static's integer initializer
+  is now folded like a global's (BUG-1090 typed fold). Same test.
+- **BUG-1316 — `main`'s signature was not checked.** `i32 main(i32 argc, [*][*]u8 argv)`
+  compiled to `main(int32_t, _zer_xslice…)`: argv's `.len` was read out of envp (measured
+  140721442775592) and every bounds check trusted it; `f64 main()` exited with garbage (208).
+  `main` now returns void or an integer of at most 64 bits, and takes nothing or exactly one
+  `[*][*]u8 args` — which is now REAL: the emitter declares `main(int, char **)` and builds the
+  slices from argc/argv (NUL-scanned, bounds-checked like any slice). There was no way to read
+  the command line before. The one corpus `main(u32 cond)` (a negative test) moved its body to
+  a helper. Tests: `tests/zer/main_args_slice_bug1316.zer`,
+  `tests/zer_fail/main_{c_style_params,float_return}_bug1316.zer`.
+- **BUG-1317 — a 2-hop param view was summarised as nothing.** `tb(s) { return tr(tl(s)); }`
+  (both return sub-slices of their param): the summary resolved one hop, so `t = tb(s)` was a
+  fresh allocation — a false "never freed", which is what broke `lib/str.zer`'s `bytes_trim` —
+  and a use after freeing the argument was caught only by that wrong reason. Arm (c2) now
+  iterates through calls and temps. Tests: `tests/zer/view_return_two_hop_bug1317.zer`,
+  `tests/zer_fail/view_return_two_hop_uaf_bug1317.zer`.
+- **BUG-1318 — float literals were emitted as C INTEGERS in every expression position.**
+  `emit_double_lit` printed `2.0` as `2` (`%.17g`): `a = 1.0 / 2.0;` computed `1 / 2` = 0.0,
+  `100000.0 * 100000.0` an int multiply, `@bitcast(u64, 2.0)` copied 8 bytes out of a 4-byte
+  int (ASan), `-0.0` lost its sign. Only the var-decl form (a typed temp) was right. An integral
+  value now carries `.0`, and an f32-typed literal is printed as its float value with `f` (so
+  `c = a * 0.1` computes in f32 like the var-decl form). Also: a nonzero float-literal divisor
+  is proven (a global `f64 h = 1.0 / 2.0;` emitted the guard at file scope); `%` / `%=` on a
+  float is a checker error (GCC used to refuse it). Tests: `tests/zer/float_lit_*_bug1318.zer`,
+  `tests/zer_fail/float_remainder_bug1318.zer`.
+- **BUG-1319 — `f32 a = 3.0 / 4.0;` was refused** while `f32 a = 0.75;` compiled: the float
+  twin of BUG-940 (a pure literal TREE is as constant as a lone literal). Test:
+  `tests/zer/float_literal_tree_f32_bug1319.zer`.
+- **BUG-1320 — a char literal of 0x80 and above sign-extended.** `'\xff'` read the AST's
+  signed `char`: `w = '\xff'` gave 4294967295, `t['\xff'] = 7` trapped as out of bounds, and
+  `c == '\xff'` was false for c = 255. ONE `emit_char_lit` for both emitter paths; the IR
+  literal is `(uint8_t)`. Tests: `tests/zer/char_lit_high_byte*_bug1320.zer`.
+- **BUG-1321 — string escapes were copied verbatim into C, whose escapes are greedier.**
+  `"\x41b"` (two bytes in ZER) was one out-of-range byte in C; `"\01"` (NUL, '1') was the
+  octal byte 0x01 — wrong `.len`, wrong bytes. `emit_c_string_text` closes a hex escape with
+  `""` when a hex digit follows and spells `\0` as `\000`. Tests:
+  `tests/zer/string_{hex_escape_fixed_width,nul_then_digit}_bug1321.zer`.
+- **BUG-1322 — a negative literal with no destination type wrapped as u32.** `(i64)(-1)` was
+  4294967295, `@saturate(i8, -1)` 127, `@try_enum(E, -1)` null for a declared `a = -1`, and a
+  `-1 =>` arm on an i64 subject never matched. The LIT-1 retype now runs at the cast operand,
+  the switch arm (to the subject's width) and the two value intrinsics (to i64 when
+  negative). Tests: `tests/zer/neg_literal_*_bug1322.zer`.
+- **BUG-1323 — bit queries on narrow operands.** `@clz(u8 0)` was 8 (the operand's own
+  width, while `@clz(u8 1)` is 31) and `@popcount(i8 -1)` 32 (sign-extended). The operand is
+  zero-extended to its counted width (32 or 64, as documented) at both emitter paths. Tests:
+  `tests/zer/bitq_*_bug1323.zer`.
+- **BUG-1324 — a `uN` store into a PACKED struct wrote through a misaligned pointer.** The
+  single-evaluation temp was a plain `__typeof__(p.w) *` into an odd offset (UBSan; a hard
+  fault on Cortex-M0/RISC-V; merely slow on x86, so the hosted test cannot discriminate —
+  verified with UBSan by hand). The pointee is `aligned(1)` for a packed path. Test:
+  `tests/zer/packed_uN_store_aligned_bug1324.zer`.
+- **BUG-1325 — a plain assignment and an orelse fallback broke the documented left-to-right
+  evaluation order.** `x = g + step();` read g after the call (102; the var-decl form gives
+  56), `x = pair(step(), step2())` ran the arguments right to left, `none() orelse g +
+  step()` likewise: each was ONE C expression, unsequenced. A value whose order is observable
+  (`value_order_observable`: it writes, and is more than one call with effect-free arguments)
+  is now lowered left to right like a var-decl initializer. Tests:
+  `tests/zer/{assign_eval_order_left_to_right,orelse_fallback_eval_order}_bug1325.zer`.
+- **Also:** `tests/zer_fail/compound_field_maybe_freed.zer` carried a merge-CONFLICT MARKER
+  since BUG-941, so it "passed" on a parse error (a vacuous negative). Repaired, given an
+  `expect-error`, and `tests/test_zer.sh` now refuses a run in which any test file carries a
+  conflict marker. `docs/reference.md` gained: comments, operator precedence (and no `?:`),
+  array initialisation (no array literal; an array PARAMETER aliases the caller), declaration
+  order / prototypes / recursion, the `main` entry point, enum ↔ int, the section attribute
+  on functions, a corrected do-while example (the old one was not valid ZER), and six "NOT in
+  ZER" items. CLAUDE.md's `[*]u8 msg = "Hello"` is `const [*]u8` (a literal is read-only).
+
+---
+
+## Session 2026-09-25e — BUG-1304..1307: pointer-to-array type, byte address of a packed field, `f(*p);`, alloc of a shared struct
+
+- **BUG-1304 — `*u32[4]` reached GCC as `uint32_t[4]* p`.** Refused at `resolve_type`
+  (TYNODE_POINTER over an array) with the slice / struct-wrapper remedy. Test:
+  `tests/zer_fail/pointer_to_array_type_bug1304.zer`.
+- **BUG-1305 — `&p.b` / `&p.w8[1]` on a u8 member of a packed struct was refused** (a
+  relaxation, done on its own per the sound-relaxation discipline). The gate now asks the
+  alignment of the addressed type; alignment 1 cannot be misaligned. Every hazard form in
+  `tests/zer_fail/*packed*` still rejects; corpus scan: zero verdict differences. Test:
+  `tests/zer/packed_byte_addr_ok_bug1305.zer` (replaces the pinned over-rejection).
+- **BUG-1306 — `add(*p);` failed to parse.** Two statement-level lookaheads decided "funcptr
+  declaration" from the two tokens `( *`, which a call whose first argument is a dereference
+  also starts with. Both now ask `is_func_ptr_start`, which checks the whole declarator shape
+  `( * [name] [dims] ) (` (RF10's single query, which the two peeks had duplicated). Test:
+  `tests/zer/call_deref_arg_stmt_bug1306.zer` (parse error on the old build).
+- **BUG-1307 — `alloc(S)` / `free(p)` on a SHARED struct failed at GCC** ("'S' undeclared").
+  Both lower to the auto-slab builtins whose receiver is the struct TYPE (`S.alloc_ptr()`,
+  `S.free_ptr(p)`); `find_shared_root_expr` took that type-name receiver for a shared object
+  and the emitter locked `&S._zer_mtx`. A struct-typed receiver of alloc / alloc_ptr / free /
+  free_ptr is exactly what the checker routes to the auto-slab, so the finder now stops there.
+  Test: `tests/zer/alloc_shared_struct_bug1307.zer` (GCC error on the old build).
+
+---
+
+## Session 2026-09-25d — BUG-1303: one object passed as two params of a scoped-spawn lender
+
+**Symptom (from-HEAD `c960b4ba` build).** `void f(*u32 a, *u32 b) { ThreadHandle t = spawn
+w(a); *b = 5; t.join(); }` called as `f(&v, &v)` compiled: the scoped-spawn borrow is checked
+inside `f`, where `a` and `b` are different names, so the thread's write through `a` and the
+parent's write through `b` raced on `v`. Same through a local copy of `b`, and through a
+callee `h(a, b) { f(a, b); }`.
+
+**Fix.** Each function records (lent i, used j) PARAM pairs: a param (or a local holding one,
+`Symbol.param_alias_pos1`) lent to a scoped spawn sets `Checker.lent_param_live_mask` until
+the last join; a pointer/slice param used while that mask is non-zero adds pairs. Calls that
+forward two of the caller's params are recorded (`ParamFwdRec`) and the pairs carried to a
+fixpoint; then every call that passes one object (by `alias_arg_root`) as both halves of a
+pair is refused. SHAPE p46 in `tools/sink_matrix.sh` (four HOLE cells on the old build, two
+boundary cells).
+
+**Tests.** `tests/zer_fail/spawn_param_alias_bug1303.zer`,
+`tests/zer_fail/spawn_param_alias_forward_bug1303.zer`,
+`tests/zer/spawn_param_alias_boundary_bug1303.zer`.
+
+---
+
+## Session 2026-09-25c — BUG-1300..1302: three ways an array slot still held a freed pointer
+
+All three measured on the from-HEAD `c960b4ba` build, where each negative COMPILED and read a
+freed object; pinned by SHAPE p45 in `tools/sink_matrix.sh` (all four reject cells HOLE on
+that build, CLEAN now; three boundary cells).
+
+- **BUG-1300 — a callee that frees the ELEMENTS of an array it is handed.** `drain(arr)` then
+  `arr[0].v`: no summary said "frees through a slice param at a variable index", so the
+  caller's precise slot stayed ALIVE. `FuncSummary.frees_param_elems` (`ir_collect_elem_frees`:
+  a free whose argument traces to an element read of param i — through copies, captures and
+  orelse — or a call handing param i to a callee with the bit), applied in
+  `ir_call_hands_local_array`: the array's slots and their aliases become MAYBE_FREED +
+  escaped. Side effect: a false LEAK of such an alias after a drain (`x` stored in `arr[0]`,
+  `drain(arr)`) is gone. Tests: `drain_callee_uaf_bug1300`, `drain_callee_nested_uaf_bug1300`,
+  `tests/zer/drain_callee_boundary_bug1300`.
+- **BUG-1301 — an index EXPRESSION had no key.** `g[k % 4] = x; a = g[k % 4]; free(a); q =
+  g[k % 4]; q.v` compiled. A pure arithmetic index over literals and trackable locals is now
+  keyed by its text (`[(k%4)]`), killed when any name inside it is written. Tests:
+  `slot_expr_index_uaf_bug1301`, `tests/zer/slot_expr_index_rekey_bug1301`.
+- **BUG-1302 — a slot freed through `tbl[i]`, read after `i` moved on.** The kill dropped the
+  FREED fact. It now lands on the array wildcard, relative to the counter when the counter
+  only moved by a NON-WRAPPING increment — a wrap would bring it back onto the freed slots, so
+  "monotone" needs the for-step `k += 1` under `k < E` (`IRInst.step_nowrap`) or a 64-bit
+  counter. Tests: `slot_moved_counter_uaf_bug1302`, `slot_counter_reset_uaf_bug1302`,
+  `tests/zer/slot_counter_consume_bug1302`.
+
+Corpus scan: the only verdict difference is the BUG-1300 positive (a false leak on HEAD).
+
+---
+
+## Session 2026-09-25b — BUG-1299: a shared struct's `*opaque` field cast back to a ZER pointer
+
+**Symptom (from-HEAD `c960b4ba` build).** BUG-1286 allows a top-level `*opaque` field in a
+`shared struct` (the C-handle idiom). `*T t = @ptrcast(*T, s.handle); t.x += 1;` in two
+spawned threads compiled: each thread got a ZER pointer into the pointee that outlived the
+per-statement lock, and both wrote `obj.x` unlocked. Same through a local copy (`h = s.handle;
+@pun(*T, h)`), and through `if (s.mh) |h| { (*T)h }`.
+
+**Fix.** `opaque_read_from_shared` (a field read at any step through a shared struct —
+`lvalue_path_through_shared` — or a local carrying the sticky `Symbol.opaque_from_shared`,
+peeling casts, pointer intrinsics and both orelse arms) and one reporter
+`reject_shared_opaque_unwrap`, called by the C-style cast, `@ptrcast` and `@pun` when the
+source is `*opaque` and the target is a non-opaque pointer. The flag is set at a var-decl
+init, an assignment and an if-unwrap capture. Residual (function param / return launder) in
+limitations.md. Corpus scan: zero verdict differences (the first draft rounded a NULL walk to
+"reject" and hit three positives — found by the scan).
+
+**Tests.** `tests/zer_fail/shared_opaque_cast_{direct,local_copy,capture}_bug1299.zer` (all
+accepted pre-fix).
+
+---
+
+## Session 2026-09-25 — BUG-1298: defer bodies in a function WITH a label
+
+**Symptom (measured on the from-HEAD `c960b4ba` build).** In a function containing a
+`goto` label, a defer body was emitted by `emit_defer_stmt`, the eleven-kind AST emitter
+refactor L had retired everywhere else:
+- a shared-struct read in a defer-body CONDITION (`defer { if (s.v > 3) {…} }`) took no mutex;
+- `switch`, `do-while` and `@critical` printed `compiler bug: emit_defer_stmt has no handler`
+  and emitted a `_zer_trap` in place of the code (the programs exited 133);
+- an unproven index in a var-decl initialiser, a for-initialiser or a while condition had
+  NO guard — `arr[100]` on a `u32[4]` was read silently (exit 0);
+- the same AST emitter served the C-level auto-guard early exit (`emit_defers_from`) in
+  EVERY function, so a label-free function with `defer { switch … }` and an unproven loop
+  condition index also turned the switch into a trap.
+And zercheck_ir, which checks a labelled function's defer bodies from the AST:
+- never ran the wrong-pool check on them (`defer heap.free_ptr(t)` on an auto-slab `t`
+  accepted; the label-free twin rejected);
+- credited every defer's frees to every return, so a defer registered inside `if (c)` hid
+  the leak on the goto path that never passed it;
+- checked no USES at the eager fire a `goto` performs.
+
+**Root cause.** BUG-965 declined to lower a template on the label path because the
+emitter replayed the raw AST and `pre_lower_orelse` rewrites it. The splice itself is
+still impossible there (the goto guard / ARMED flags would become IR branches whose
+correlation zercheck cannot see) — but the EMISSION did not need the splice.
+
+**Fix.** The template is lowered in every function and hung on the push
+(`IRInst.defer_tpl`). `emit_defer_body` emits it inline, with fresh block labels, at every
+AST-flagged fire and every `emit_defers_from` exit; both block loops and the inline body
+share one `emit_ir_inst_guarded`. zercheck: `ir_defer_check_expr` (UAF + wrong-pool at
+every position), per-return application of only the bodies whose no-work-after fire
+reaches that return (`ir_fire_mark_returns`), uses checked at a fire with work after.
+`ir_zc_error` drops an identical repeat on the same line (one body is checked once per
+fire that reaches it).
+
+**Two @once defects found by probing the new path.** The @once flag was keyed on the
+branch's `false_block` id. A defer body is CLONED per fire site, so a `@once` in a defer
+body got one flag per exit path and ran once PER PATH (measured: a two-exit function ran
+it twice — pre-existing on the spliced path since refactor L); the inline copy in a
+labelled function named an undeclared flag. The flag is now keyed on the @once NODE
+(`emit_once_id`), declared for the body and every template (`emit_once_decls`). And the
+ASYNC block loop never published "done" at the join (`emit_once_join_publish`, now shared),
+so the second task reaching an async @once spun forever on a flag stuck at 1 — measured:
+the program hung (timeout 124).
+
+**Tests.** `tests/zer/defer_once_per_fire_bug1298.zer`, `tests/zer/async_once_second_task_bug1298.zer`
+(hung pre-fix), `tests/zer/defer_label_stmt_kinds_bug1298.zer` (both paths, exits 133 pre-fix),
+`tests/zer/defer_guard_exit_switch_bug1298.zer` (label-free C-level exit, traps pre-fix),
+`tests/zer_trap/defer_label_guard_{vardecl,forinit,whilecond}_bug1298.zer` (exit 0 pre-fix),
+`tests/zer_fail/defer_label_{wrong_pool,leak_branch}_bug1298.zer` (accepted pre-fix), and a
+required-emission case in `tools/emit_audit.sh` (labelled vs plain defer-body condition
+lock; RED on the pre-fix build). Corpus scan: zero verdict differences.
+
+---
+
+## Session 2026-09-24g — BUG-1268..1297: closing the MEDIUM limitations (arena, wrong-pool, races, escapes)
+
+**Method.** Every item below was an entry in `docs/limitations.md` or a finding of the read-only
+triage agents that re-measured it; each was RE-REPRODUCED on the from-HEAD (`ae001cfe`) build
+before any change. Every negative COMPILES on that build and is refused now for its
+`// expect-error:` reason; the trap tests exit 9 (the other pool's object) on it. Gates: sink
+matrix shape **p44** (five hazard cells, all HOLES on HEAD, plus four boundary cells) and a new
+required-emission case in `tools/emit_audit.sh` (red on HEAD). Corpus cost, compiler-classified
+over tests/, rust_tests/, zig_tests/, test_modules/, examples/, lib/: **zero** files newly
+rejected. The corpus scan caught one draft: the first `@once` fix (1276) descended the block
+with no exemption and rejected six publish-once idioms, which is why it has one.
+
+### BUG-1268 — `free(hb)` of a heap backing store left the arena's objects live
+zercheck_ir records which allocation backs each Arena local (`Arena.over(x)` at a call, an
+Arena copy, an assignment) and links every allocation from that arena as a VIEW of it, so
+freeing the backing store invalidates them. Also: the caller-side arena-reset rule (BUG-1264)
+no longer counts an allocation from a caller-LOCAL arena, which no callee can reset.
+Tests: `arena_backing_view_uaf_bug1268.zer`, positive `arena_local_vs_callee_global_reset_ok_bug1268.zer`.
+
+### BUG-1269 — an arena's backing store stayed addressable after `Arena.over()`
+Two arenas over one buffer handed out the same bytes; a plain write to the buffer overwrote a
+`[*]T` header living in an arena object (forged `.len`, then an out-of-bounds write the bounds
+check trusts). A buffer handed to `Arena.over` now belongs to the arena: every other mention is
+refused ("is the backing store of arena"), a second arena over it too ("already backs arena").
+The only permitted mentions are `Arena.over(x)` and `free(x)`. The rule is flow-INSENSITIVE (a
+use before the `over` is refused as well) and whole-program for globals.
+Tests: `arena_backing_second_arena_bug1269.zer`, `arena_backing_read_bug1269.zer`, positive
+`arena_backing_over_ok_bug1269.zer`.
+
+### BUG-1270 — a Handle from one pool used with another returned the OTHER pool's object
+`rd(h)` doing `pb.get(x)` on an `h` from `pa` (also via a global and via a Ring): every pool
+started its generations at 0, so the check passed. Each pool / slab now seeds its slot
+generations from its own address (`_zer_gen_seed`), so a foreign handle mismatches, and
+`free` traps too ("free of a handle this pool/slab did not issue"). A RUN-time check: two
+pools' generations could only meet after ~2^31 recycles of one slot (limitations.md).
+Tests: `tests/zer_trap/wrong_pool_handle_via_{callee,global,ring}_bug1270.zer`.
+
+### BUG-1271 — `@container` provenance through a struct field
+`H h = { .q = &ls[0] }; @container(*D, h.q, link)` — the fact lived on symbols only. A
+per-function compound map (`cprov_*`) carries it for `h.q` / `arr[i]` roots whose address is
+never taken. Tests: `container_whole_object_field_bug1271.zer`, positive `container_field_heap_ok_bug1271.zer`.
+
+### BUG-1272 — a callee freeing a FIELD of a by-value struct argument, handed stack memory
+`void rel(H h) { free(h.d); }` now infers `keep` on `h`, so `rel(h)` with `h.d = arr[0..]` is
+refused at the call. Tests: `free_byvalue_param_field_stack_bug1272.zer`, positive `…_heap_ok_bug1272.zer`.
+
+### BUG-1273 — an index in the RHS of `&&` / `||` or an `orelse` value fallback got a HOISTED guard
+The early-return auto-guard ran before the whole statement, so `if (i < 4 && a[i] > 0)` with
+`i = 9` returned from the function although `a[i]` never executes (a miscompile, not a crash).
+Those positions now get the inline single-evaluation check at the access itself; an MMIO index
+or a dyn-freed UAF guard in such a position is a checker error.
+Tests: `shortcircuit_and_index_guard_bug1273.zer`, `orelse_fallback_index_guard_bug1273.zer`,
+`shortcircuit_guard_no_early_return_bug1273.zer`.
+
+### BUG-1274 — a conditional reassignment cleared a pointer's escape taint on every path
+`*u32 p = &loc; if (c) { p = &gx; } return p;` compiled (ASan stack-use-after-return). A
+reassignment now replaces the taint only when it is at the declaration's branch depth
+(`Symbol.decl_branch_depth`). Tests: `cond_reassign_{return_local,store_global}_bug1274.zer`, p44.
+
+### BUG-1275 — a bare switch arm (`0 => g.x = 5,`) ran its shared store unlocked
+The arm body was lowered without the statement wrapper that carries the per-statement lock. It
+is now wrapped in a block. Test: `switch_bare_arm_shared_lock_bug1275.zer` (a two-thread counter;
+probabilistic on HEAD) and the deterministic `emit_audit.sh` required-lock case.
+
+### BUG-1276 — an `@once` body was invisible to the spawn race scan
+It was a leaf. It is now scanned, with the publish-once exemption stated precisely: a global
+touched ONLY inside ONE `@once` block of a SCOPED spawn target is exempt, and the parent may
+not touch it outside that same block — directly, through a callee, or through a function
+pointer — until the LAST join (not the first: a conditional `@once` may be skipped by the
+thread that joined). Two different `@once` blocks on one global race and are refused; a
+fire-and-forget thread gets no exemption (its window is the rest of the program).
+Tests: `once_*_bug1276.zer` (7 negatives), positive `once_same_block_parent_call_ok_bug1276.zer`.
+
+### BUG-1277 — a written-out read-modify-write through a global pointer (`*gp = *gp + 1`)
+The RMW read side only matched the target by name; it now asks `for_each_write_target` whether a
+deref on the value side reaches the same global (`value_derefs_global`). Both sinks (ISR, spawn)
+and main. Tests: `{isr,spawn}_rmw_written_out_gptr_bug1277.zer`, two new cells in the RMW grid.
+
+### BUG-1278 — a cast in the MIDDLE of a reference path hid the root from the escape walks
+`g = &((*Inner)h.in).v` stored a pointer into a stack object. A reference formed through a
+path containing a cast is refused (`ref_path_crosses_launder`); a cast at the root stays legal.
+Tests: `interior_cast_ref_{global,local,nonkeep}_bug1278.zer`, p44.
+
+### BUG-1279 — a detached thread started by a CALLEE received the caller's stack
+`void mid(*S w) { spawn grand(w); }` then `mid(&local)`: ASan stack-use-after-return. A param
+handed to a fire-and-forget spawn now infers `keep`. Tests: `detached_grandchild_local{,2}_bug1279.zer`, p44.
+
+### BUG-1280 — freeing an allocation after a callee handed it to a detached thread
+`mid(p); free(p);` (the thread still writes it). FuncSummary gains `transfers_param` (a param
+handed to a fire-and-forget spawn on every path / some path) and the call site marks the
+argument TRANSFERRED / MAYBE_FREED, exactly as a direct `spawn w(p)` does. Note the live handler
+is `IR_NOP` wrapping NODE_SPAWN; `IR_SPAWN` in zercheck_ir.c is never emitted.
+Tests: `forwarded_spawn_*_bug1280.zer`, positives for a heap/global argument and a joining callee.
+
+### BUG-1281 — an arena backing store with a SECOND name
+Found while documenting 1269: its "every mention of the name" rule is sound only when the
+buffer has ONE name. `Arena.over(st.buf)`, `Arena.over(p.buf)`, `Arena.over(v)` with
+`v = lb[0..]`, and `Arena mk([*]u8 b) { return Arena.over(b); }` called as `mk(lb[0..])` each
+left a name the header could be forged through (`.len` read 200). `Arena.over` now takes an
+array identifier, a slice parameter, or a fresh never-reassigned `alloc` slice; a parameter a
+function turns into a backing store (directly or by forwarding, to a fixpoint) CONSUMES the
+caller's argument, which is then held to the same rule. Tests: `arena_backing_*_bug1281.zer`,
+positive `arena_over_param_returned_ok_bug1281.zer`.
+
+### BUG-1282 — a free through a FIELD over a variable index (`free(larr[i].p)`)
+The variable-index free barrier (BUG-741/1130) recognised only a bare `free(arr[i])`, so
+`free(larr[i].p); free(larr[0].p);` compiled (limitations.md recorded it as refused "for the
+wrong reason"; re-measured, it was ACCEPTED, and ran: an auto-slab free recycles silently), as
+did a read of `larr[0].p.v` after it. One helper, `ir_elem_free_index`, finds the index under a
+field chain at all three sites. Tests: `elem_field_*_bug1282.zer`.
+
+### BUG-1283 — a BY-VALUE struct param's field copied into the returned struct
+`H mk(G g) { H h; h.p = g.p; return h; }`, then `free(a)` (where `g.p == a`), then
+`mk(g).p.v`. `h.p = g.p` lowers to a passthrough that records nothing, and the return-field
+summary matched only a param's bare handle. The BUG-1131 backstop (an unaccounted reference
+field of a returned value is a MAY view of each reference param) now also runs, for every
+returned value, against by-value struct params that carry a reference; the call site views every
+allocation the struct argument carries. MAY only, so it can refuse a use after the argument's
+allocation is freed and never accept one. Tests: `byvalue_param_field_returned_{uaf,ok}_bug1283.zer`.
+
+### BUG-1284 — an atomic cell reached through a POINTER
+`*u32 p = &g; @atomic_add(p, 1)` in a thread, or a helper `add1(*u32 p) { @atomic_add(p, 1); }`
+called with `&g` (directly or through a forwarding `add2`), never made `g` an atomic cell, so
+main's plain `g += 1` raced the thread's atomic with no diagnostic. A pointer operand is now
+resolved through `for_each_write_target`; a param used as an atomic target is recorded on the
+function (`Symbol.atomic_param_mask`), every direct call records what its pointer arguments
+reach, and the post-check (`check_atomic_cell_safety`, after every body) propagates the masks
+to a fixpoint and marks the globals. The same facts fix two over-rejections: handing `&g`
+straight to such a helper is no longer a "launder" of the cell (unless the helper ALSO uses the
+param non-atomically — `atomic_param_plain_mask`), and `@atomic_add(&p.n, 1)` through a pointer
+local was refused as "a stack local". Tests: `atomic_*_bug1284.zer` (4 negatives, 2 positives).
+
+### O4 — `@barrier_acq_rel` did not count as synchronisation
+A spawn target that touched a non-shared global and used `@barrier_load` / `@barrier_store` /
+`@barrier()` got the "verify ordering" WARNING; the same target with `@barrier_acq_rel` was a
+hard ERROR. It is the fourth fence of the same list. Test: `spawn_barrier_acq_rel_warns_ok.zer`.
+
+### BUG-1285 — a global lent to a scoped spawn through a callee's RETURNED pointer
+`*u32 p = getp(); ThreadHandle th = spawn w(p); gv += 1;` with `getp() { return &gv; }` (and the
+threadlocal sibling) was accepted: `collect_borrow_roots` looked at a call's ARGUMENTS only. It
+now also collects the GLOBAL roots of the named callee's `return` expressions (orelse-block
+returns included; a recursive callee is walked once). Names the callee binds are dropped.
+Tests: `lend_*_via_returned_ptr*_bug1285.zer`.
+
+### BUG-1286 — a pointer FIELD of a `shared struct` was an unlocked channel
+`shared struct S { ?*Cell p; }`: `?*Cell q = s.p;` locks for that statement only, then
+`q.n += 1` in two threads raced on the Cell (lost updates, measured). A shared struct's field
+may no longer carry a pointer to non-shared data (`type_carries_nonshared_pointer`: a pointer,
+slice, also inside a nested struct / optional / array); a pointer to a shared struct is fine
+(that is locked itself), as is a function pointer and a top-level `*opaque` C handle — the
+reference-examples gate caught that the first draft refused the documented C-interop example.
+Its cast-back residual is in limitations.md. Chosen over tracking every
+pointer read OUT of a shared struct through locals and captures (a flow question of the kind
+that has leaked repeatedly); corpus cost zero. Tests: `shared_struct_pointer_*_bug1286.zer`.
+
+### BUG-1287 — an auto-guard's early return inside `@once`, or while holding a semaphore, HUNG
+`void init() { @once { arr[idx] = 1; } }` with `idx = 9`: the compiler-inserted `return`
+skipped the done-publish, and the next `init()` waited on it forever; the same between a
+straight-line `@sem_acquire` and `@sem_release` leaked the permit. A user-written `return` in
+`@once` is already a compile error — the compiler was emitting the construct it bans. The guard
+now TRAPS there, as it already did in `@critical`, a defer body and a held lock (LowerCtx
+`once_depth` / `sem_held`). Tests: `tests/zer_trap/{once,sem}_guard_no_hang_bug1287.zer`.
+
+### BUG-1288 — BUG-1241's "callee stores param into another param's field" was syntactic
+`void init(*S s, *Box b) { *Box x = b; s.b = x; }` (a local copy) and `init(s, b) { set2(s, b); }`
+(a helper) were not summarised, so `init(&t, p); free(p); poll(&t)` wrote into a recycled object.
+The collector follows a local back through its copies to every param it may hold, and re-maps
+a callee's own store entries through the call's arguments (the iterative summary build reaches
+the fixpoint). Tests: `param_store_via_{local_copy,helper}_bug1288.zer`.
+
+### BUG-1289 — BUG-1242's global-read view missed a read THROUGH a pointer to the global
+`*?*Box slot = &gb; if (*slot) |b| { release(); b.v = 99; }` — the deref is an `IR_UNOP`, and the
+key resolver knew bare names and projections only. A deref of a local defined once as `&g` now
+keys g. Tests: `global_read_via_pointer_*_bug1289.zer`.
+
+### BUG-1290 — the funcptr REACH class at the spawn ARGUMENT, closed by its conservative end
+`spawn worker(o.h)` (a field), `spawn worker(t[0])` (an element), a reassigned funcptr local, a
+global funcptr, a funcptr LOCAL handed to a helper that spawns it, and a struct carrier forwarded
+through a helper — each reached the thread unscanned (TSan races). The resolvers stay precise
+for a direct name and for a local bound once at its declaration and never rebound; anything
+else falls back to EVERY function of the pointer's signature (`funcptr_sig_racy_target` — a
+funcptr can hold nothing else, there is no cast between funcptr types). A helper that spawns
+a callback PARAM is therefore checked against every same-signature function in the program:
+refused if any of them races, accepted when all are race-free (the boundary positive and the
+three non-racy payload columns pin that). Corpus cost zero. Gate: five new cells in the REACH
+GRID of `tests/test_conc_matrix.c` (spawned from `main` — a first draft spawned them inside a
+spawned `worker`, where the outer scan found `cb` by name and all five passed on the unfixed
+build). The ISR sibling holds by other rules: a funcptr an ISR can call must live in a global,
+and such a global is refused unless it is a single-word volatile scalar. Tests: `funcptr_reach_*_bug1290.zer`.
+
+### BUG-1291 — a guard's early exit inside a label-free DEFER BODY re-fired the defers
+A loop condition or for-init in a defer body is a guard site the IR lowering declines, so the
+emitter's C-level guard ran — and its exit RETURNS, firing the pending defers, the one being run
+included, from raw AST and unguarded: an ASan global-buffer-overflow and a cleanup that ran
+twice (`cnt` 12 instead of 11). Instructions lowered inside a defer body carry
+`IRInst.in_defer_body`, and the guard there TRAPS, as the IR-lowered one already did.
+Tests: `tests/zer_trap/defer_body_*_bug1291.zer`.
+
+### BUG-1292 — an `await` condition's guard sat BEFORE the resume label
+The generic per-instruction guard was emitted ahead of `case N:`, so a resumed poll jumped past
+it and indexed out of bounds. IR_AWAIT emits its condition's guard after its own case label.
+Test: `await_cond_guard_after_resume_bug1292.zer` (the second poll now ends the task).
+
+### BUG-1293 — a runtime value wider than a bit-slice field was truncated silently
+`r[7..0] = x` with `x = 300` stored 44 — the implicit narrowing refused everywhere else (a
+constant that does not fit was already an error). A plain `=` now needs the value's TYPE to fit,
+or its proven range (an identifier's VRP range, `& mask`, `% n`); otherwise `@truncate` or a
+mask. A compound operator's operand is not the stored value and is exempt (the corpus scan
+caught `r[7..0] <<= s` in a first draft). Tests: `bitslice_runtime_value_*_bug1293.zer`.
+
+### BUG-1294 — an indirect call that may free a global (BUG-1181 residual)
+`*() fp = drop_g; fp(); a.v` — no summary is applied at an indirect call. It now applies every
+function's freed-global set as MAYBE_FREED, the union BUG-1172 already uses for arena resets.
+Tests: `indirect_call_*_bug1294.zer`.
+
+### BUG-1295 — the atomic-cell rule was blind to WHOLE-AGGREGATE access
+With a thread doing `@atomic_add(&s.n, 1)`, main's `S t = s;`, `s = { ... }`, `u32[4] c =
+cnts;`, a slice view, `clear(cnts)`, `reset(&s)` — and a helper doing `S t = s;` — were
+accepted. An identifier that is not the object of a `.f` / `[i]` names the whole object and is
+recorded as the path `*`, which conflicts with every atomic row of the same symbol; the callee
+walk tells its visitor the same thing. A sibling field (`s.m`) is still independent.
+Tests: `atomic_cell_whole_aggregate_*_bug1295.zer` (7), two positives.
+
+### BUG-1296 — `--stack-limit` measured only `main` and interrupt handlers
+On bare metal the entry is whatever the vector table names (`Reset_Handler`, `_start`), so a
+real firmware's whole chain went unmeasured — a 3200-byte chain passed `--stack-limit 1000`
+because each 800-byte frame fit. A call-graph ROOT (nothing in the program calls it) is now an
+entry point whose chain must fit. Tests: `stack_limit_root_entry*_bug1296.zer` (from the BUG-923
+probe of an audit branch).
+
+### BUG-1297 — GCC-style operands in the INLINE `asm("...")` form were invisible
+The inline form is kept as raw text, so `asm("nop" : : "r"(g))` in a spawned naked function
+read a non-shared global with no race diagnostic, and `"r"(a.x)` read a shared struct with no
+lock (the BUG-1013 residual). The structured form's operands are typed ZER expressions that
+every analysis sees; the inline form now refuses operands (a `:` outside a string or char
+literal) and points there. Zero corpus cost — only reference.md's SYNTAX sketch used it.
+Tests: `asm_inline_operand_{global,shared}_bug1297.zer`.
+
 ## Session 2026-09-24f — BUG-1254..1267: the allocator audit round (ag10)
 
 **Method.** A read-only agent probed ~200 allocator / free / move / arena shapes against a

@@ -563,7 +563,6 @@ zercheck_ir.c:if (ret->kind == TYPE_POINTER || ret->kind == TYPE_OPAQUE) return 
 zercheck_ir.c:if (ret_eff && (ret_eff->kind == TYPE_HANDLE ||
 zercheck_ir.c:if (ret_eff && (ret_eff->kind == TYPE_POINTER ||
 zercheck_ir.c:if (ret_eff && ret_eff->kind == TYPE_OPTIONAL) {
-zercheck_ir.c:if (rt && rt->kind == TYPE_POINTER) return true;
 zercheck_ir.c:if (sym->type && sym->type->kind == TYPE_FUNC_PTR &&
 zercheck_ir.c:if (vt && (vt->kind == TYPE_STRUCT || vt->kind == TYPE_UNION)) {
 zercheck_ir.c:if (vt_eff && (vt_eff->kind == TYPE_STRUCT ||

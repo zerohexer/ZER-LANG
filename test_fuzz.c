@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L   /* fileno / dup / dup2 on strict C99 (cf. BUG-417) */
+#endif
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>

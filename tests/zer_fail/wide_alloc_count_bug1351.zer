@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: an allocation count must be at most 64 bits wide
+// BUG-1351: alloc(u32, 2^64 + 2) returned a 2-element slice.
+u32 main() {
+    u128 one = 1;
+    u128 n = (one << 64) + 2;
+    [*]u32 s = alloc(u32, n) orelse return;
+    free(s);
+    return 0;
+}

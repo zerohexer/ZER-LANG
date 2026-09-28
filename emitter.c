@@ -44,14 +44,111 @@ static void emit(Emitter *e, const char *fmt, ...) {
  *
  * ONE helper, not five spellings. A new float-emitting site must call this, never
  * `%.17g`; `tools/audit_float_literal.sh` fails the build on a raw one. */
-static void emit_double_lit(Emitter *e, double v) {
+/* BUG-1318: `%.17g` prints an INTEGRAL double without a decimal point — `2.0` as
+ * `2`, `-0.0` as `-0` — and C reads that token as an INT. The var-decl form hid it
+ * (the value lands in a typed temp); every expression position computed in int:
+ * `a = 1.0 / 2.0;` was `a = 1 / 2` = 0.0, `100000.0 * 100000.0` an int multiply,
+ * `@bitcast(u64, 2.0)` copied 8 bytes out of a 4-byte int (ASan), and `-0.0` lost
+ * its sign. An integral value now carries `.0`. `f32` = the literal's checked type
+ * is f32: it is printed as the FLOAT value with an `f` suffix, so an expression
+ * such as `c = a * 0.1` computes in f32 like the var-decl form does (the typed
+ * temp converts the double literal to float — the same value printed here). */
+static void emit_double_lit(Emitter *e, double v, bool f32) {
     /* NaN first: every comparison against NaN is false, so an `isnan`-last
      * ordering would fall through to `%.17g` and print `nan`. Same reason the
      * float->int saturation guard tests NaN first (BUG-883). */
-    if (v != v) { emit(e, "__builtin_nan(\"\")"); return; }
+    if (v != v) { emit(e, f32 ? "__builtin_nanf(\"\")" : "__builtin_nan(\"\")"); return; }
+    if (f32) {
+        float fv = (float)v;
+        if (fv != fv || fv > 3.40282347e38f || fv < -3.40282347e38f) {
+            emit(e, fv < 0 ? "(-__builtin_inff())" : "__builtin_inff()");
+            return;
+        }
+        emit(e, "%.9g", (double)fv);
+        if (fv < 1e9f && fv > -1e9f && fv == (float)(long long)fv) emit(e, ".0");
+        emit(e, "f");
+        return;
+    }
     if (v > 1.7976931348623157e308) { emit(e, "__builtin_inf()"); return; }
     if (v < -1.7976931348623157e308) { emit(e, "(-__builtin_inf())"); return; }
     emit(e, "%.17g", v);
+    /* %.17g uses an exponent (a floating token) from 1e17 up */
+    if (v < 1e17 && v > -1e17 && v == (double)(long long)v) emit(e, ".0");
+}
+/* The literal's checked type decides its C spelling. */
+static bool emit_type_is_f32(Type *t) {
+    t = t ? type_unwrap_distinct(t) : NULL;
+    return t && type_dispatch_kind(t) == TYPE_F32;
+}
+
+/* BUG-1323: the operand of a bit-query intrinsic (@popcount/@ctz/@clz/@parity/
+ * @ffs), ZERO-extended to the width it is counted at — 32 for up to 32 bits, else
+ * 64 (reference.md: "only TWO widths"). The operand used to reach the builtin
+ * as-is: a signed narrow value SIGN-extended (`@popcount(i8 -1)` was 32, not 8;
+ * `i5 -1` also 32), and the zero result was the operand's OWN width (`@clz(u8 0)`
+ * was 8 while `@clz(u8 1)` was 31 — not even monotonic). */
+static int bitq_count_width(int w) { return w > 32 ? 64 : 32; }
+static void bitq_operand_open(Emitter *e, int w) {
+    emit(e, w > 32 ? "((uint64_t)(" : "((uint32_t)(");
+}
+static void bitq_operand_close(Emitter *e, int w) {
+    if (w <= 0 || w == 32 || w >= 64) { emit(e, "))"); return; }
+    emit(e, ") & 0x%llxULL)", (unsigned long long)((1ULL << w) - 1ULL));
+}
+
+/* BUG-1321: the body of a ZER string literal as C string-literal text. ZER's
+ * escapes are fixed-width — `\xHH` is exactly two hex digits and `\0` is one NUL
+ * byte — while C's are greedy: `\x` eats EVERY following hex digit and `\0`
+ * starts an OCTAL escape of up to three digits. Copied verbatim, `"\x41b"` (two
+ * bytes in ZER) was one out-of-range byte in C and `"\01"` (NUL, '1') was the
+ * single byte 0x01 — a wrong `.len` and wrong bytes, silently. A hex escape is
+ * closed with `""` (C literal concatenation) when a hex digit follows, and `\0`
+ * is spelled `\000` (three octal digits end the escape). Every other character
+ * and escape is copied as written. */
+static int zer_is_hex(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+static void emit_c_string_text(Emitter *e, const char *t, int n) {
+    for (int i = 0; i < n; i++) {
+        /* BUG-1350: `??` starts a C TRIGRAPH and the driver compiles with
+         * -std=c99, which translates them: "??=" became "#" (.len 3 -> a
+         * 1-byte string plus sizeof 2) and "??/" a backslash that escaped the
+         * next character. `\?` is the same byte and never starts one. */
+        if (t[i] == '?') { fputs("\\?", e->out); continue; }
+        if (t[i] != '\\' || i + 1 >= n) { fputc(t[i], e->out); continue; }
+        char esc = t[i + 1];
+        if (esc == 'x') {
+            /* \xHH — the lexer guarantees two hex digits */
+            fputc('\\', e->out); fputc('x', e->out);
+            if (i + 2 < n) fputc(t[i + 2], e->out);
+            if (i + 3 < n) fputc(t[i + 3], e->out);
+            i += 3;
+            if (i + 1 < n && zer_is_hex(t[i + 1])) fputs("\"\"", e->out);
+            continue;
+        }
+        if (esc == '0') { fputs("\\000", e->out); i += 1; continue; }
+        fputc('\\', e->out); fputc(esc, e->out);
+        i += 1;
+    }
+}
+static void emit_zer_string_slice(Emitter *e, const char *t, int n, bool paren) {
+    emit(e, paren ? "((_zer_slice_u8){ (uint8_t*)\"" : "(_zer_slice_u8){ (uint8_t*)\"");
+    emit_c_string_text(e, t, n);
+    emit(e, "\", sizeof(\"");
+    emit_c_string_text(e, t, n);
+    emit(e, paren ? "\") - 1 })" : "\") - 1 }");
+}
+
+/* BUG-1320: a character literal is a u8 (BUG-1191). The AST field is a (signed)
+ * `char`, so '\xff' read as -1: one emitter printed `(unsigned)-1` = 4294967295
+ * (`t['\xff'] = 7` trapped as out of bounds, `c == '\xff'` was false for c = 255)
+ * and the other printed the raw byte inside quotes, a negative `int` in C. ONE
+ * spelling for both paths: printable ASCII as itself, everything else as its
+ * unsigned value. */
+static void emit_char_lit(Emitter *e, Node *node) {
+    unsigned v = (unsigned)(uint8_t)node->char_lit.value;
+    if (v >= 32 && v < 127 && v != '\'' && v != '\\') emit(e, "'%c'", (char)v);
+    else emit(e, "%uU", v);
 }
 
 /* emit a user-defined type name with optional module prefix for namespace mangling.
@@ -315,6 +412,23 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
      * SField.is_volatile for each field access. Handles: dev.regs where
      * dev is non-volatile but regs field is volatile u8[4]. */
     Node *n = expr;
+    /* BUG-1344: an access THROUGH a volatile pointer / volatile slice is volatile
+     * at every step — `r.fifo` / `r[i].fifo` for `volatile *Regs r`, `vs[i]` for a
+     * `volatile [*]T`. The field walk below only knew volatile FIELDS and the root
+     * symbol, so a whole-array copy out of a peripheral became a plain memmove. */
+    for (Node *w = expr; w; ) {
+        Node *obj = NULL;
+        if (w->kind == NODE_FIELD) obj = w->field.object;
+        else if (w->kind == NODE_INDEX) obj = w->index_expr.object;
+        else if (w->kind == NODE_UNARY && w->unary.op == TOK_STAR) obj = w->unary.operand;
+        else break;
+        Type *ot = obj ? checker_get_type(e->checker, obj) : NULL;
+        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+        if (oe && type_dispatch_kind(oe) == TYPE_OPTIONAL) oe = type_unwrap_distinct(oe->optional.inner);
+        if (oe && type_dispatch_kind(oe) == TYPE_POINTER && oe->pointer.is_volatile) return true;
+        if (oe && type_dispatch_kind(oe) == TYPE_SLICE && oe->slice.is_volatile) return true;
+        w = obj;
+    }
     while (n && n->kind == NODE_FIELD) {
         Type *obj_type = checker_get_type(e->checker, n->field.object);
         if (obj_type) {
@@ -350,6 +464,61 @@ static bool expr_is_volatile(Emitter *e, Node *expr) {
     }
     return false;
 }
+
+/* BUG-1378: does evaluating `n` READ volatile memory anywhere inside it? The
+ * single-evaluation decision for an index asked expr_is_volatile, which answers
+ * for a PLACE (`hv`, `reg.status`) — so `g[hv + 0]`, `g[gs.v % 16]`, `s[hv * 1]`
+ * took the comma form `(check((size_t)(hv + 0), 8), g)[hv + 0]`: two loads of
+ * the volatile, the access using a value that was never checked (an ISR or a
+ * device can change it in between). Exhaustive; any node the walk does not
+ * model answers YES (single evaluation is always correct, only dearer). */
+static bool expr_is_volatile(Emitter *e, Node *expr);
+static bool expr_reads_volatile(Emitter *e, Node *n, IRFunc *func) {
+    if (!n) return false;
+    switch (n->kind) {
+    case NODE_IDENT:
+        if (func) {   /* an IR local carries its own qualifier */
+            for (int li = 0; li < func->local_count; li++)
+                if (func->locals[li].name_len == (uint32_t)n->ident.name_len &&
+                    memcmp(func->locals[li].name, n->ident.name, n->ident.name_len) == 0)
+                    return func->locals[li].is_volatile;
+        }
+        return expr_is_volatile(e, n);
+    case NODE_FIELD:
+        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->field.object, func);
+    case NODE_INDEX:
+        return expr_is_volatile(e, n) || expr_reads_volatile(e, n->index_expr.object, func) ||
+               expr_reads_volatile(e, n->index_expr.index, func);
+    case NODE_UNARY:
+        if (n->unary.op == TOK_STAR && expr_is_volatile(e, n)) return true;
+        return expr_reads_volatile(e, n->unary.operand, func);
+    case NODE_BINARY:
+        return expr_reads_volatile(e, n->binary.left, func) || expr_reads_volatile(e, n->binary.right, func);
+    case NODE_TYPECAST:
+        return expr_reads_volatile(e, n->typecast.expr, func);
+    case NODE_SLICE:
+        return expr_reads_volatile(e, n->slice.object, func) ||
+               expr_reads_volatile(e, n->slice.start, func) || expr_reads_volatile(e, n->slice.end, func);
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+        return false;
+    /* A call / assignment / intrinsic / orelse is a side effect already
+     * (expr_has_side_effects); everything else is not an expression. */
+    case NODE_CALL: case NODE_ASSIGN: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT:
+    case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN:
+    case NODE_YIELD: case NODE_AWAIT: case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return true;
+    }
+    return true;
+}
+
 
 /* A field-access OBJECT needs C parentheses when its emitted form binds LOOSER
  * than the postfix `.`/`->` accessor. Without them valid ZER `(*p).field`
@@ -415,6 +584,28 @@ static bool field_obj_needs_parens(Node *obj) {
  * into NODE_INDEX.object but not NODE_INDEX.index, so `arr[fn()] <<= n`
  * silently evaluated `fn()` twice (BUG: indexed compound side-effect).
  */
+
+/* BUG-1391: may this expression be written out TWICE in the emitted C? The
+ * comma bounds form `(check(i, N), a)[i]` repeats the index text, and a nested
+ * index doubled the output per level (`a[a[a[…]]]` at depth 24 = 528 MB of C).
+ * Small = a few nodes of names, literals, fields, unary / binary / casts; any
+ * other kind, or more than a handful of nodes, takes the single-evaluation
+ * form, whose output is linear. An if-chain on purpose: an unlisted kind
+ * answers NOT small, which is always correct (just a statement expression). */
+static bool expr_emit_small_b(Node *n, int *budget) {
+    if (!n || --(*budget) < 0) return false;
+    if (n->kind == NODE_IDENT || n->kind == NODE_INT_LIT || n->kind == NODE_CHAR_LIT ||
+        n->kind == NODE_BOOL_LIT)
+        return true;
+    if (n->kind == NODE_FIELD) return expr_emit_small_b(n->field.object, budget);
+    if (n->kind == NODE_UNARY) return expr_emit_small_b(n->unary.operand, budget);
+    if (n->kind == NODE_TYPECAST) return expr_emit_small_b(n->typecast.expr, budget);
+    if (n->kind == NODE_BINARY)
+        return expr_emit_small_b(n->binary.left, budget) &&
+               expr_emit_small_b(n->binary.right, budget);
+    return false;
+}
+static bool expr_emit_small(Node *n) { int b = 8; return expr_emit_small_b(n, &b); }
 
 static bool expr_has_side_effects(Node *n) {
     if (!n) return false;
@@ -634,6 +825,18 @@ static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
          * `__typeof__(...)` + one initialiser, so the bounds check inside
          * the index emitter still evaluates exactly once. */
         emit_rewritten_node(e, inst->expr->call.callee, func);
+    } else if (inst->expr && inst->expr->kind == NODE_CALL && inst->expr->call.callee &&
+               (inst->expr->call.callee->kind == NODE_CALL ||
+                inst->expr->call.callee->kind == NODE_ORELSE ||
+                (inst->expr->call.callee->kind == NODE_UNARY &&
+                 inst->expr->call.callee->unary.op == TOK_STAR))) {
+        /* BUG-1356: a function pointer produced by an EXPRESSION — `sel(1)(5)`,
+         * `(fa orelse fb)(x)`, `(*pf)(x)` — aborted the compiler ("INTERNAL ERROR:
+         * emitter cannot lower this callee expression"). The callee is one value;
+         * the BUG-1019 null guard evaluates this text exactly once. */
+        emit(e, "(");
+        emit_rewritten_node(e, inst->expr->call.callee, func);
+        emit(e, ")");
     } else {
         emit_unreachable(e, "this callee expression", inst->expr);   /* BUG-851 */
     }
@@ -722,7 +925,7 @@ static void emit_safety_early_return(Emitter *e, bool with_braces) {
     }
     if (e->guard_traps || e->noreturn_scope_depth > 0) {
         if (with_braces) emit(e, "{ ");
-        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+        emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block, @once body, semaphore hold "
                 "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);");
         if (with_braces) emit(e, " }\n"); else emit(e, " ");
         return;
@@ -898,6 +1101,9 @@ static Type *resolve_tynode(Emitter *e, TypeNode *tn) {
 }
 
 static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len);
+static bool global_is_ptr_shaped(Type *type);   /* BUG-1370 */
+static void emit_global_decl_name(Emitter *e, Type *type, const char *name,
+                                  uint32_t len, bool word_vol);
 /* BUG-1111: ONE function-declarator emitter for the prototype path and the IR
  * definition path. A function RETURNING a function pointer needs C's nested
  * declarator `RET (*name(params))(fp_args)`; only the definition path knew, so a
@@ -905,14 +1111,24 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t len
  * `uint32_t (*)(uint32_t, uint32_t) select_op(uint32_t kind);`, which GCC
  * refuses. Split as head / params / tail so each caller keeps its own name
  * spelling (the IR path mangles from IRFunc, the prototype from the AST). */
+/* BUG-1357: a NULLABLE function pointer return (`?*(u32) -> u32 f()`) is the same
+ * C pointer (null sentinel) and needs the same declarator; it was emitted as
+ * `uint32_t (*)(uint32_t) f(...)`, which GCC refused. Returns the funcptr Type. */
+static Type *func_ret_funcptr_type(Type *ret) {
+    Type *r = ret ? type_unwrap_distinct(ret) : NULL;
+    if (r && type_dispatch_kind(r) == TYPE_OPTIONAL && r->optional.inner &&
+        is_null_sentinel(r->optional.inner))
+        r = type_unwrap_distinct(r->optional.inner);
+    return (r && type_dispatch_kind(r) == TYPE_FUNC_PTR) ? r : NULL;
+}
 static bool func_ret_is_funcptr(Type *ret, bool main_promote) {
-    return !main_promote && ret && type_dispatch_kind(ret) == TYPE_FUNC_PTR;
+    return !main_promote && func_ret_funcptr_type(ret) != NULL;
 }
 static void emit_func_decl_head(Emitter *e, Type *ret, bool main_promote) {
     if (main_promote) {
         emit(e, "int ");
     } else if (func_ret_is_funcptr(ret, main_promote)) {
-        emit_type(e, type_unwrap_distinct(ret)->func_ptr.ret);
+        emit_type(e, func_ret_funcptr_type(ret)->func_ptr.ret);
         emit(e, " (*");
     } else if (ret) {
         emit_type(e, ret);
@@ -932,6 +1148,21 @@ static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
             Type *ptype = (func_type && func_type->kind == TYPE_FUNC_PTR &&
                           (uint32_t)i < func_type->func_ptr.param_count) ?
                 func_type->func_ptr.params[i] : resolve_tynode(e, p->type);
+            /* BUG-1345: an ARRAY parameter's qualifier lives only on its type node
+             * (an array Type carries none), and C needs it on the element:
+             * `volatile u32[4] a` must be `volatile uint32_t a[4]`, or every
+             * access in the callee goes through a plain pointer. */
+            if (type_dispatch_kind(ptype) == TYPE_ARRAY) {
+                bool pv = false, pc = false;
+                TypeNode *qt = p->type;
+                for (int d = 0; qt && d < 16 &&
+                     (TYNODE_CONST == qt->kind || TYNODE_VOLATILE == qt->kind); d++) {
+                    if (TYNODE_CONST == qt->kind) pc = true; else pv = true;
+                    qt = qt->qualified.inner;
+                }
+                if (pc) emit(e, "const ");
+                if (pv) emit(e, "volatile ");
+            }
             emit_type_and_name(e, ptype, p->name, p->name_len);
         }
         if (fn->func_decl.is_variadic) emit(e, ", ...");
@@ -940,7 +1171,7 @@ static void emit_func_decl_params(Emitter *e, Node *fn, Type *func_type) {
 }
 static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
     if (!func_ret_is_funcptr(ret, main_promote)) return;
-    Type *r = type_unwrap_distinct(ret);
+    Type *r = func_ret_funcptr_type(ret);
     emit(e, ")(");
     if (r->func_ptr.param_count == 0) emit(e, "void");
     for (uint32_t i = 0; i < r->func_ptr.param_count; i++) {
@@ -952,6 +1183,21 @@ static void emit_func_decl_tail(Emitter *e, Type *ret, bool main_promote) {
 
 static void emit_defers(Emitter *e);
 static void emit_defers_from(Emitter *e, int base);
+static void emit_defer_body(Emitter *e, IRFunc *func, Node *db);   /* BUG-1298 */
+/* BUG-1298: the flag id of a @once — its index among the function's @once NODES. */
+static int emit_once_id(Emitter *e, Node *n) {
+    for (int i = 0; i < e->once_n; i++)
+        if (e->once_nodes[i] == (void *)n) return i;
+    if (e->once_n == e->once_cap) {
+        int nc = e->once_cap ? e->once_cap * 2 : 8;
+        void **nn = (void **)realloc(e->once_nodes, (size_t)nc * sizeof(void *));
+        if (!nn) return 0;
+        e->once_nodes = nn;
+        e->once_cap = nc;
+    }
+    e->once_nodes[e->once_n] = (void *)n;
+    return e->once_n++;
+}
 static void emit_defer_stmt(Emitter *e, Node *s, IRFunc *func);
 
 static void emit_ptr_to_elem(Emitter *e, Type *elem, bool is_volatile); /* BUG-1027, defined below */
@@ -2204,6 +2450,38 @@ static void emit_intn_mask_lv(Emitter *e, Type *t, const char *lv) {
     }
 }
 
+/* BUG-1385: the EXPRESSION form of the N-bit wrap, around a value of a
+ * non-native uN / iN type — `(u2)x` is x mod 4, `(i3)x` sign-extends bit 2. The
+ * IR_CAST emission masked; the passthrough (a plain assignment, an index, a
+ * defer body) and AST (global initializer) casts emitted a bare C carrier cast,
+ * so `s = (u32)(u2)x;` stored 6 for x == 6 (the var-decl form stored 2) and
+ * `a[(u2)x]` trapped on a valid index. Returns true when it opened a wrap; the
+ * caller emits the value and then emit_intn_value_wrap_close. */
+static bool emit_intn_value_wrap_open(Emitter *e, Type *t) {
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    if (k != TYPE_UINT && k != TYPE_SINT) return false;
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) return false;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    const char *su = (cw==8)?"uint8_t":(cw==16)?"uint16_t":(cw==32)?"uint32_t":(cw==64)?"uint64_t":"unsigned __int128";
+    const char *ss = (cw==8)?"int8_t":(cw==16)?"int16_t":(cw==32)?"int32_t":(cw==64)?"int64_t":"__int128";
+    if (k == TYPE_UINT) emit(e, "((%s)((", su);
+    else emit(e, "((%s)((%s)(", ss, su);
+    return true;
+}
+static void emit_intn_value_wrap_close(Emitter *e, Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    uint32_t nb = type_unwrap_distinct(t)->intn.bits;
+    uint32_t cw = (nb <= 8) ? 8 : (nb <= 16) ? 16 : (nb <= 32) ? 32 : (nb <= 64) ? 64 : 128;
+    if (k == TYPE_UINT) {
+        if (nb < 64) emit(e, ") & 0x%llxULL))", (unsigned long long)((1ULL << nb) - 1ULL));
+        else emit(e, ") & ((((unsigned __int128)1u) << %u) - 1u)))", nb);
+    } else {
+        emit(e, ") << %u) >> %u)", cw - nb, cw - nb);
+    }
+}
+
 /* True if t is a non-native-width uN/iN scalar (needs post-store masking). */
 static bool type_is_nonnative_intn(Type *t) {
     if (!t) return false;
@@ -2241,6 +2519,22 @@ static void emit_type(Emitter *e, Type *t) {
             if (t->pointer.is_const) emit(e, "const ");
             if (t->pointer.is_volatile) emit(e, "volatile ");
             emit(e, "_zer_opaque");
+        } else if ((t->pointer.is_const || t->pointer.is_volatile) &&
+                   global_is_ptr_shaped(t->pointer.inner) &&
+                   type_dispatch_kind(type_unwrap_distinct(t->pointer.inner)) != TYPE_FUNC_PTR &&
+                   !(type_dispatch_kind(type_unwrap_distinct(t->pointer.inner)) == TYPE_OPTIONAL &&
+                     type_dispatch_kind(type_unwrap_distinct(
+                         type_unwrap_distinct(t->pointer.inner)->optional.inner)) == TYPE_FUNC_PTR)) {
+            /* BUG-1370: a pointer to a QUALIFIED POINTER (`volatile *volatile *u32`,
+             * the type of `&r` for a volatile pointer global r). A C prefix
+             * qualifier binds to the innermost base type, so the old spelling
+             * `volatile volatile uint32_t**` described a pointer to a pointer to
+             * volatile u32 — the middle qualifier was lost. The postfix form
+             * qualifies exactly the pointed-at pointer object. */
+            emit_type(e, t->pointer.inner);
+            if (t->pointer.is_const) emit(e, " const");
+            if (t->pointer.is_volatile) emit(e, " volatile");
+            emit(e, "*");
         } else {
             if (t->pointer.is_const) emit(e, "const ");
             if (t->pointer.is_volatile) emit(e, "volatile ");
@@ -2476,6 +2770,39 @@ static void emit_type_and_name(Emitter *e, Type *t, const char *name, size_t nam
         return;
     }
 
+    /* BUG-1341: a POINTER to a function pointer (`**(u32) -> u32 pp`, the
+     * `|*pf|` capture of a `?funcptr`) needs the stars INSIDE the declarator:
+     * `ret (**name)(params)`. The generic pointer path emitted the abstract
+     * funcptr type followed by `*` and the name — `uint32_t (*)(uint32_t)* pp`,
+     * not C — so every such declaration failed in GCC. */
+    {
+        int fp_stars = 0;
+        Type *cur = type_unwrap_distinct(t);
+        while (cur) {
+            if (type_dispatch_kind(cur) == TYPE_OPTIONAL && cur->optional.inner &&
+                is_null_sentinel(cur->optional.inner)) {
+                cur = type_unwrap_distinct(cur->optional.inner);
+            } else if (type_dispatch_kind(cur) == TYPE_POINTER && cur->pointer.inner) {
+                fp_stars++;
+                cur = type_unwrap_distinct(cur->pointer.inner);
+            } else {
+                break;
+            }
+        }
+        if (fp_stars > 0 && cur && type_dispatch_kind(cur) == TYPE_FUNC_PTR) {
+            emit_type(e, cur->func_ptr.ret);
+            emit(e, " (*");
+            for (int si = 0; si < fp_stars; si++) emit(e, "*");
+            emit(e, "%.*s)(", (int)name_len, name);
+            for (uint32_t i = 0; i < cur->func_ptr.param_count; i++) {
+                if (i > 0) emit(e, ", ");
+                emit_type(e, cur->func_ptr.params[i]);
+            }
+            emit(e, ")");
+            return;
+        }
+    }
+
     /* function pointer: ret (*name)(param1, param2, ...) */
     if (t->kind == TYPE_FUNC_PTR) {
         emit_type(e, t->func_ptr.ret);
@@ -2608,6 +2935,14 @@ static void emit_int_literal(Emitter *e, Node *node) {
     Type *eff = lt ? type_unwrap_distinct(lt) : NULL;
     int w = (eff && type_is_integer(eff)) ? type_width(eff) : 0;
     bool sg = w > 0 && type_is_signed(eff);
+    if (w > 64) {
+        /* BUG-1384: a literal of a 65..128-bit type is an operand of 128-bit
+         * arithmetic; as a bare `…ULL` it is 64-bit in C, so `a = 0xFFFF_FFFF_
+         * FFFF_FFFF + 1` wrapped to 0 at 64 bits (the var-decl form, lowered to
+         * a typed temp, gave 2^64). */
+        emit(e, "((%s)%lluULL)", sg ? "__int128" : "unsigned __int128", v);
+        return;
+    }
     if (v > 0xFFFFFFFFULL || w > 32) {
         /* The width comes from the TYPE, not the value: a small literal inside a
          * 64-bit expression must still be 64-bit or the operation wraps at 32. A
@@ -2650,7 +2985,17 @@ static bool struct_init_names_array_field(Type *si_type, Node *node) {
  * Returns false when the target is not this function's business. */
 typedef void (*EmitNodeFn)(Emitter *, Node *, IRFunc *);
 static void emit_bitslice_set(Emitter *e, Node *node, IRFunc *func, EmitNodeFn sub);   /* BUG-1198 */
+static bool lvalue_through_packed(Emitter *e, Node *lv);   /* BUG-1324 */
 static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f);
+/* BUG-1344: ONE emitter for a whole-array assignment `dst = src`, both paths.
+ * Plain arrays: memmove (overlap-safe, BUG-306). When either side is volatile the
+ * copy is ELEMENT-wise at the array's innermost element type, through volatile
+ * pointers — never memmove (which drops the qualifier: -O2 merged 32-bit
+ * registers into 64-bit accesses, deleted the first of two writes, and hoisted a
+ * poll loop into `jmp .`) and never a byte loop (a 32-bit FIFO register read as
+ * four byte accesses is four different reads on most peripherals). */
+static void emit_array_assign(Emitter *e, Type *arr_t, Node *dst, Node *src,
+                              bool is_volatile, IRFunc *func, EmitNodeFn en);
 static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en) {
     Node *tgt = node->assign.target;
     Type *nn_t = tgt ? checker_get_type(e->checker, tgt) : NULL;
@@ -2692,6 +3037,19 @@ static bool emit_intn_store(Emitter *e, Node *node, IRFunc *func, EmitNodeFn en)
         emit(e, "); _zer_up%d->_tag = %ld; ", tmp, utag);
         snprintf(lv, sizeof lv, "(_zer_up%d->%.*s)", tmp,
                  (int)tgt->field.field_name_len, tgt->field.field_name);
+    } else if (lvalue_through_packed(e, tgt)) {
+        /* BUG-1324: a field of a PACKED struct may sit at any byte offset, so a
+         * plain `__typeof__(p.w) *` to it is misaligned (UBSan; a hard fault on
+         * Cortex-M0 / RISC-V) — the pointer ZER forbids users to form (BUG-972).
+         * An aligned(1) pointee keeps the single evaluation and makes GCC use
+         * accesses that are legal at any address. */
+        emit(e, "typedef __typeof__(");
+        en(e, tgt, func);
+        emit(e, ") __attribute__((aligned(1))) _zer_ua%d; _zer_ua%d *_zer_np%d = &(",
+             tmp, tmp, tmp);
+        en(e, tgt, func);
+        emit(e, "); ");
+        snprintf(lv, sizeof lv, "(*_zer_np%d)", tmp);
     } else {
         emit(e, "__typeof__(");
         en(e, tgt, func);
@@ -2878,6 +3236,41 @@ static void emit_expr(Emitter *e, Node *node) {
     e->nn_lvalue = saved_lv;
 }
 
+static void emit_array_assign(Emitter *e, Type *arr_t, Node *dst, Node *src,
+                              bool is_volatile, IRFunc *func, EmitNodeFn en) {
+    int tmp = e->temp_count++;
+    if (!is_volatile) {
+        emit(e, "({ __typeof__(");
+        en(e, dst, func);
+        emit(e, ") *_zer_ma%d = &(", tmp);
+        en(e, dst, func);
+        emit(e, "); memmove(_zer_ma%d, ", tmp);
+        en(e, src, func);
+        emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+        return;
+    }
+    Type *elem = type_unwrap_distinct(arr_t);
+    while (elem && type_dispatch_kind(elem) == TYPE_ARRAY) elem = type_unwrap_distinct(elem->array.inner);
+    emit(e, "({ volatile ");
+    emit_type(e, elem);
+    emit(e, " *_zer_vd%d = (volatile ", tmp);
+    emit_type(e, elem);
+    emit(e, " *)&(");
+    en(e, dst, func);
+    emit(e, "); const volatile ");
+    emit_type(e, elem);
+    emit(e, " *_zer_vs%d = (const volatile ", tmp);
+    emit_type(e, elem);
+    emit(e, " *)&(");
+    en(e, src, func);
+    emit(e, "); for (size_t _zer_vi%d = 0; _zer_vi%d < sizeof(", tmp, tmp);
+    en(e, dst, func);
+    emit(e, ") / sizeof(");
+    emit_type(e, elem);
+    emit(e, "); _zer_vi%d++) _zer_vd%d[_zer_vi%d] = _zer_vs%d[_zer_vi%d]; })",
+         tmp, tmp, tmp, tmp, tmp);
+}
+
 static void emit_node_via_ast(Emitter *e, Node *n, IRFunc *f) {
     (void)f;
     emit_expr(e, n);
@@ -2892,7 +3285,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         break;
 
     case NODE_FLOAT_LIT:
-        emit_double_lit(e, node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value,
+                           emit_type_is_f32(checker_get_type(e->checker, node)));
         break;
 
     case NODE_STRING_LIT:
@@ -2901,19 +3295,11 @@ static void emit_expr_impl(Emitter *e, Node *node) {
          * sequences at compile time. Source-char count overcounted ("\n"
          * is 2 source chars / 1 emitted byte), letting bounds checks
          * approve OOB reads on escape-bearing literals. */
-        emit(e, "((_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 })",
-             (int)node->string_lit.length, node->string_lit.value,
-             (int)node->string_lit.length, node->string_lit.value);
+        emit_zer_string_slice(e, node->string_lit.value, (int)node->string_lit.length, true);
         break;
 
     case NODE_CHAR_LIT:
-        if (node->char_lit.value == '\n') emit(e, "'\\n'");
-        else if (node->char_lit.value == '\t') emit(e, "'\\t'");
-        else if (node->char_lit.value == '\r') emit(e, "'\\r'");
-        else if (node->char_lit.value == '\0') emit(e, "'\\0'");
-        else if (node->char_lit.value == '\\') emit(e, "'\\\\'");
-        else if (node->char_lit.value == '\'') emit(e, "'\\''");
-        else emit(e, "'%c'", node->char_lit.value);
+        emit_char_lit(e, node);
         break;
 
     case NODE_BOOL_LIT:
@@ -3277,25 +3663,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* BUG-273/320: check if target OR source is volatile — use byte loop */
                 bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
                                     expr_is_volatile(e, node->assign.value);
-                int tmp = e->temp_count++;
-                if (arr_volatile) {
-                    emit(e, "({ volatile uint8_t *_zer_vd%d = (volatile uint8_t*)&(", tmp);
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); const volatile uint8_t *_zer_vs%d = (const volatile uint8_t*)&(", tmp);
-                    emit_expr(e, node->assign.value);
-                    emit(e, "); for (size_t _i = 0; _i < sizeof(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, "); _i++) _zer_vd%d[_i] = _zer_vs%d[_i]; })", tmp, tmp);
-                } else {
-                    emit(e, "({ __typeof__(");
-                    emit_expr(e, node->assign.target);
-                    emit(e, ") *_zer_ma%d = &(", tmp);
-                    emit_expr(e, node->assign.target);
-                    /* BUG-306: use memmove for overlap-safe self-assignment */
-                    emit(e, "); memmove(_zer_ma%d, ", tmp);
-                    emit_expr(e, node->assign.value);
-                    emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
-                }
+                emit_array_assign(e, tgt_type, node->assign.target, node->assign.value,
+                                  arr_volatile, NULL, emit_node_via_ast);   /* BUG-1344 */
                 goto assign_done;
             }
         }
@@ -3443,7 +3812,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             }
             /* Comptime float return — emit double literal */
             if (node->call.is_comptime_float) {
-                emit_double_lit(e, node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value,
+                                   emit_type_is_f32(checker_get_type(e->checker, node)));
                 break;
             }
             Type *ct = checker_get_type(e->checker, node);
@@ -4028,13 +4398,16 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* Single-eval lvalue path: pointer dereference preserves lvalue.
                  * *({ size_t _i = idx; check(_i); &arr[_i]; }) */
                 int tmp = e->temp_count++;
-                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                /* BUG-1349: parenthesised — a postfix `[j]` / `.f` binds tighter
+                 * than unary `*`, so a bare `*({...})[j]` indexed the POINTER:
+                 * `m[id(1)][2] = 7` wrote m[3][0]. */
+                emit(e, "(*({ size_t _zer_idx%d = (size_t)(", tmp);
                 emit_expr(e, node->index_expr.index);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
                 emit_array_size(e, idx_obj_type);
                 emit(e, ", __FILE__, __LINE__); &");
                 emit_expr(e, node->index_expr.object);
-                emit(e, "[_zer_idx%d]; })", tmp);
+                emit(e, "[_zer_idx%d]; }))", tmp);
             } else {
                 /* Simple index — comma operator, preserves lvalue */
                 emit(e, "(_zer_bounds_check((size_t)(");
@@ -4052,7 +4425,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 /* hoist both object and index for single-eval.
                  * A18: use __typeof__ to preserve volatile (BUG-319 pattern). */
                 int tmp = e->temp_count++;
-                emit(e, "*({ __typeof__(");
+                emit(e, "(*({ __typeof__(");   /* BUG-1349 */
                 emit_expr(e, node->index_expr.object);
                 emit(e, ") _zer_obj%d = ", tmp);
                 emit_expr(e, node->index_expr.object);
@@ -4060,7 +4433,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit_expr(e, node->index_expr.index);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, __FILE__, __LINE__); &",
                      tmp, tmp);
-                emit(e, "_zer_obj%d.ptr[_zer_idx%d]; })", tmp, tmp);
+                emit(e, "_zer_obj%d.ptr[_zer_idx%d]; }))", tmp, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_expr(e, node->index_expr.index);
@@ -4256,10 +4629,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
         if (slice_obj_side_effect && obj_is_slice) {
             /* hoist entire object into temp, build slice from temp */
             int sl_tmp = e->temp_count++;
-            /* A18: __typeof__ preserves volatile */
-            emit(e, "({ __typeof__(");
-            emit_expr(e, node->slice.object);
-            emit(e, ") _zer_so%d = ", sl_tmp);
+            /* A18/BUG-1391: the temp is a private copy of the slice HEADER — its
+             * element qualifiers live in the slice type, which __auto_type keeps. */
+            emit(e, "({ __auto_type _zer_so%d = ", sl_tmp);   /* BUG-1391: the object once */
             emit_expr(e, node->slice.object);
             emit(e, "; ");
             if (slice_type_emitted) { /* re-emit type name for inner struct */ }
@@ -4293,9 +4665,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             emit(e, "({ ");
             if (obj_is_slice) {
                 /* Hoist slice object so .len is single-evaluation. */
-                emit(e, "__typeof__(");
-                emit_expr(e, node->slice.object);
-                emit(e, ") _zer_so%d = ", sl_tmp);
+                emit(e, "__auto_type _zer_so%d = ", sl_tmp);   /* BUG-1391: the object once */
                 emit_expr(e, node->slice.object);
                 emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", sl_tmp, sl_tmp);
             } else if (is_array) {
@@ -4442,6 +4812,17 @@ static void emit_expr_impl(Emitter *e, Node *node) {
     case NODE_TYPECAST: {
         /* (Type)expr — emit as C cast for primitives.
          * For *opaque round-trips, emit the _zer_opaque unwrap/wrap. */
+        if (!e->intn_cast_wrapping) {   /* BUG-1385: the N-bit wrap, once */
+            Type *wt = checker_get_type(e->checker, node);
+            if (emit_intn_value_wrap_open(e, wt)) {
+                e->intn_cast_wrapping = true;
+                emit_expr(e, node);
+                e->intn_cast_wrapping = false;
+                emit_intn_value_wrap_close(e, wt);
+                break;
+            }
+        }
+        e->intn_cast_wrapping = false;
         Type *tgt = checker_get_type(e->checker, node);
         Type *src = checker_get_type(e->checker, node->typecast.expr);
         Type *tgt_eff = tgt ? type_unwrap_distinct(tgt) : NULL;
@@ -5250,14 +5631,20 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                  * GCC statement expressions are not allowed. Use a conditional expression
                  * which double-evaluates the arg — safe for globals (constant expr) and
                  * matches the IR-path semantics: ctz(0)/clz(0) → bit-width. */
-                emit(e, "(uint32_t)(((");
+                emit(e, "(uint32_t)((");
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
-                emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                bitq_operand_close(e, w);
+                emit(e, " == 0) ? %d : __builtin_%.*s%s(", bitq_count_width(w), (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
+                bitq_operand_close(e, w);
                 emit(e, "))");
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_expr(e, node->intrinsic.args[0]);
+                bitq_operand_close(e, w);
                 emit(e, ")");
             }
         } else if (nlen == 4 && memcmp(name, "addc", 4) == 0 && node->intrinsic.arg_count == 3) {
@@ -5334,25 +5721,7 @@ static void emit_defers_from(Emitter *e, int base) {
     for (int di = e->defer_stack.count - 1; di >= base; di--) {
         Node *db = e->defer_stack.stmts[di];
         if (!db) continue;
-        if (db->kind == NODE_BLOCK) {
-            /* F4 (2026-08-02): brace-scope the block-form defer body. A defer
-             * body is emitted at EVERY exit path, so a local declared inside
-             * (`defer { u32 z = x; ... }`) otherwise lands in the SHARED C
-             * function scope and the second exit path's copy is a gcc
-             * "redefinition" error — valid ZER failed to compile, and only at
-             * the gcc stage. The single-statement form below never declares, so
-             * it needs no brace. */
-            emit_indent(e);
-            emit(e, "{\n");
-            e->indent++;
-            for (int si = 0; si < db->block.stmt_count; si++)
-                emit_defer_stmt(e, db->block.stmts[si], func);
-            e->indent--;
-            emit_indent(e);
-            emit(e, "}\n");
-        } else {
-            emit_defer_stmt(e, db, func);
-        }
+        emit_defer_body(e, func, db);
     }
 }
 
@@ -5931,6 +6300,23 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
  * NODE_INTERRUPT). For interrupts, the GCC `interrupt` attribute is
  * emitted by the IR path's existing inline code — this helper covers
  * regular function attributes. */
+/* The ONE interrupt-handler signature (prototype and definition). BUG-1347:
+ * the `as "SYMBOL"` clause was parsed and never read — `interrupt UART_1 as
+ * "USART1_IRQHandler"` emitted `UART_1_IRQHandler`, so the vector table's weak
+ * default stayed linked and the handler never ran, with no diagnostic anywhere.
+ * BUG-1346: `section(...)` on an interrupt is honoured here too. */
+static void emit_isr_signature(Emitter *e, Node *isr) {
+    emit(e, "void __attribute__((interrupt, used");
+    if (isr->interrupt.section)
+        emit(e, ", section(\"%.*s\")", (int)isr->interrupt.section_len,
+             isr->interrupt.section);
+    emit(e, ")) ");
+    if (isr->interrupt.as_name)
+        emit(e, "%.*s(void)", (int)isr->interrupt.as_name_len, isr->interrupt.as_name);
+    else
+        emit(e, "%.*s_IRQHandler(void)", (int)isr->interrupt.name_len, isr->interrupt.name);
+}
+
 static void emit_func_attributes(Emitter *e, Node *fn) {
     if (!fn || fn->kind != NODE_FUNC_DECL) return;
     if (fn->func_decl.section) {
@@ -6147,6 +6533,64 @@ static void emit_early_async_structs(Emitter *e, Node *file_node) {
     }
 }
 
+/* BUG-1370: is this global POINTER-shaped — `*T`, a null-sentinel `?*T`, a
+ * funcptr or `?funcptr` — so that a declaration-level `volatile` must not be
+ * emitted as a C prefix (which binds to the pointee)? */
+static bool global_is_ptr_shaped(Type *type) {
+    Type *t = type ? type_unwrap_distinct(type) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL && is_null_sentinel(t->optional.inner))
+        t = type_unwrap_distinct(t->optional.inner);
+    if (!t) return false;
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_POINTER || k == TYPE_FUNC_PTR;
+}
+
+/* BUG-1370: must the pointer WORD of this `volatile` global be a C volatile
+ * object? The checker treats a `volatile` pointer global as a volatile
+ * single-word cell — the race exemption for the published-pointer idiom
+ * (`volatile ?volatile *u32 g = null;` set by an ISR, polled by main) rests on
+ * it — but the word was emitted plain, so `while (g == null) { }` compiled to
+ * `jmp .` at -O2 (the load hoisted out of the loop). The word is made volatile
+ * whenever the global can change: a pointer global that is const or never
+ * assigned / address-taken anywhere holds one value, and keeping it plain lets
+ * GCC fold the MMIO base address of the `volatile *u32 reg = @inttoptr(...)`
+ * idiom exactly as before. */
+static bool global_ptr_word_volatile(Emitter *e, Node *node, Type *type) {
+    if (!node->var_decl.is_volatile || !global_is_ptr_shaped(type)) return false;
+    Symbol *s = NULL;
+    if (e->current_module) {
+        uint32_t mlen = e->current_module_len + 2 + (uint32_t)node->var_decl.name_len;
+        char *mangled = (char *)arena_alloc(e->arena, mlen + 1);
+        if (mangled) {
+            memcpy(mangled, e->current_module, e->current_module_len);
+            mangled[e->current_module_len] = '_';
+            mangled[e->current_module_len + 1] = '_';
+            memcpy(mangled + e->current_module_len + 2, node->var_decl.name,
+                   node->var_decl.name_len);
+            mangled[mlen] = '\0';
+            s = scope_lookup(e->checker->global_scope, mangled, mlen);
+        }
+    }
+    if (!s) s = scope_lookup(e->checker->global_scope, node->var_decl.name,
+                             (uint32_t)node->var_decl.name_len);
+    if (s && (s->is_const || checker_global_never_mutated(e->checker, s))) return false;
+    return true;
+}
+
+/* The declarator of a global: `volatile` inside it (after the stars) when the
+ * pointer word is volatile — valid for every pointer-shaped declarator
+ * emit_type_and_name produces (`T* volatile g`, `R (*volatile g)(…)`). */
+static void emit_global_decl_name(Emitter *e, Type *type, const char *name,
+                                  uint32_t len, bool word_vol) {
+    if (!word_vol) { emit_type_and_name(e, type, name, len); return; }
+    char *nm = (char *)arena_alloc(e->arena, (size_t)len + 10);
+    if (!nm) { emit_type_and_name(e, type, name, len); return; }
+    memcpy(nm, "volatile ", 9);
+    memcpy(nm + 9, name, len);
+    nm[len + 9] = '\0';
+    emit_type_and_name(e, type, nm, len + 9);
+}
+
 static void emit_global_var_inner(Emitter *e, Node *node);
 static void emit_global_var(Emitter *e, Node *node) {
     /* BUG-997: mark the global-initializer context for the whole emission, so a
@@ -6222,8 +6666,13 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
     }
 
     if (node->var_decl.is_static) emit(e, "static ");
-    /* volatile on non-pointer scalars (pointers handled above) */
-    if (node->var_decl.is_volatile && !(type && type_unwrap_distinct(type)->kind == TYPE_POINTER))
+    /* volatile on non-pointer scalars. A POINTER-shaped global (`*T`, `?*T`,
+     * a funcptr) spells its pointee's volatile in the TYPE; a prefix here would
+     * land on the pointee in C too (`volatile ?*u32 g` became `volatile
+     * uint32_t* g` — pointer to volatile, the word itself plain). BUG-1370: the
+     * WORD is volatile via global_ptr_word_volatile below. */
+    bool word_vol = global_ptr_word_volatile(e, node, type);
+    if (node->var_decl.is_volatile && !global_is_ptr_shaped(type))
         emit(e, "volatile ");
     /* BUG-1115: a ZER `const` global is read-only by the checker's rules and was
      * emitted as a plain C object — so it occupied RAM (.data) rather than flash
@@ -6253,9 +6702,10 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
         mangled[e->current_module_len + 1] = '_';
         memcpy(mangled + e->current_module_len + 2, node->var_decl.name, node->var_decl.name_len);
         mangled[mlen] = '\0';
-        emit_type_and_name(e, type, mangled, (int)mlen);
+        emit_global_decl_name(e, type, mangled, mlen, word_vol);
     } else {
-        emit_type_and_name(e, type, node->var_decl.name, node->var_decl.name_len);
+        emit_global_decl_name(e, type, node->var_decl.name,
+                              (uint32_t)node->var_decl.name_len, word_vol);
     }
 
     if (node->var_decl.init) {
@@ -6326,6 +6776,35 @@ static void emit_global_var_inner(Emitter *e, Node *node) {
                 emit(e, " = ");
                 emit_expr(e, gci);
                 emitted_const = true;
+            }
+            {
+                /* BUG-1384: a u65..u128 / i65..i128 initializer cannot be folded
+                 * (the constant evaluators are 64-bit: `u128 g = 0xFFFF_FFFF_
+                 * FFFF_FFFF;` emitted `= (-1)`, all ones; `… + 1` emitted 0).
+                 * The checker admits only literals under + - * & | ^ ~ and casts
+                 * there (global_wide_init_ok), which is a C constant expression
+                 * once each literal carries the 128-bit type — GCC folds it
+                 * exactly as the same code computes at run time. Wrapped to N. */
+                Type *gt = type ? type_unwrap_distinct(type) : NULL;
+                if (!emitted_const && gt && type_is_integer(gt) && type_width(gt) > 64) {
+                    int nb = type_width(gt);
+                    bool sgn = type_is_signed(gt);
+                    emit(e, " = ");
+                    if (nb >= 128) {
+                        emit(e, "(%s)(", sgn ? "__int128" : "unsigned __int128");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ")");
+                    } else if (!sgn) {
+                        emit(e, "((unsigned __int128)(");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ") & (((unsigned __int128)1 << %d) - 1))", nb);
+                    } else {
+                        emit(e, "((__int128)((unsigned __int128)(");
+                        emit_expr(e, node->var_decl.init);
+                        emit(e, ") << %d) >> %d)", 128 - nb, 128 - nb);
+                    }
+                    emitted_const = true;
+                }
             }
             if (!emitted_const) {
                 /* BUG-1090: typed fold first (see the optional arm above).
@@ -6856,8 +7335,8 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
              * .S/linker script the C TU never sees; without `used`,
              * `gcc -ffunction-sections -Wl,--gc-sections` silently tree-shakes
              * the handler and the vector slot keeps its default trap. */
-            emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void);\n",
-                 (int)decl->interrupt.name_len, decl->interrupt.name);
+            emit_isr_signature(e, decl);
+            emit(e, ";\n");
         }
         break;
 
@@ -6999,6 +7478,22 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "#else\n");
     emit(e, "#  define _ZER_HOSTED 1\n");
     emit(e, "#endif\n");
+    /* BUG-1342: "hosted" in the C sense is NOT "runs in user mode". A bare-metal
+     * newlib toolchain (riscv*-unknown-elf, aarch64-none-elf, arm-none-eabi on an
+     * A/R core) reports __STDC_HOSTED__ == 1 unless -ffreestanding is passed, and
+     * most SDKs do not pass it — so `@critical` there took the FENCE arm and never
+     * masked an interrupt: the ISR read-modify-write the checker had told the user
+     * to wrap in `@critical` lost updates in silence. User mode is the conjunction
+     * the privileged arms actually need to rule out: a hosted implementation AND an
+     * operating system to be hosted by. */
+    emit(e, "#if _ZER_HOSTED && (defined(__linux__) || defined(__unix__) || "
+            "defined(__APPLE__) || defined(_WIN32) || defined(__CYGWIN__) || "
+            "defined(__wasi__) || defined(__FreeBSD__) || defined(__NetBSD__) || "
+            "defined(__OpenBSD__) || defined(__HAIKU__))\n");
+    emit(e, "#  define _ZER_USER_MODE 1\n");
+    emit(e, "#else\n");
+    emit(e, "#  define _ZER_USER_MODE 0\n");
+    emit(e, "#endif\n");
     /* C99 4.6 guarantees stdint.h and stddef.h on a FREESTANDING implementation
      * too, so they stay outside the gate. */
     emit(e, "#include <stdint.h>\n");
@@ -7129,6 +7624,19 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        uint8_t used[CAPACITY]; \\\n");
     emit(e, "    } NAME = {0}\n");
     emit(e, "\n");
+    /* BUG-1270: each allocator starts its slots' generations at its OWN seed.
+     * With every Pool and Slab starting at 1, a Handle from pool A carried the
+     * generation pool B's slot also held, so `pb.get(h_from_pa)` passed the check
+     * and returned B's live object — through a parameter, a global or a Ring,
+     * where no static rule can follow the handle. The seed is derived from the
+     * allocator's own address (a Pool's gen array, a Slab's struct), so two live
+     * allocators differ and no call site changes. */
+    emit(e, "static inline uint32_t _zer_gen_seed(const void *owner) {\n");
+    emit(e, "    uint64_t a = (uint64_t)(uintptr_t)owner;\n");
+    emit(e, "    uint32_t x = (uint32_t)((a >> 3) ^ (a >> 35)) * 0x9E3779B9u;\n");
+    emit(e, "    x ^= x >> 16;\n");
+    emit(e, "    return x ? x : 1u;\n");
+    emit(e, "}\n\n");
     emit(e, "static inline uint64_t _zer_pool_alloc(void *pool_ptr, size_t slot_size, "
             "uint32_t *gen, uint8_t *used, size_t capacity, uint8_t *ok) {\n");
     emit(e, "    for (uint32_t i = 0; i < capacity; i++) {\n");
@@ -7144,7 +7652,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * The asymmetry is why it survived: the FRESH-page path already callocs, so
      * only the REUSE path was affected. */
     emit(e, "            memset((char*)pool_ptr + (size_t)i * slot_size, 0, slot_size);\n");
-    emit(e, "            if (gen[i] == 0) gen[i] = 1; /* skip 0: reserved for null handle */\n");
+    emit(e, "            if (gen[i] == 0) gen[i] = _zer_gen_seed(gen); /* BUG-1270; never 0 */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -7414,12 +7922,18 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * carrier test `sizeof(a) * 8` stays as well: the ZER width alone would let a
      * count reach an operand C has narrower than the ZER type claims, and a C
      * shift by >= its operand's width is undefined. */
+    /* BUG-1352: a count WIDER than 64 bits (a u128 shift count) was narrowed by
+     * the (int64_t) casts — `x << ((1 << 64) + 1)` shifted by 1 (UBSan: shift
+     * exponent too large). A count that does not survive the round trip through
+     * int64_t is out of range by definition, so it is the "0" case. */
     emit(e, "#define _zer_shl(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "((__typeof__(_b))(int64_t)_b != _b || "
+            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
             "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) << _b; })\n");
     emit(e, "#define _zer_shr(a, b, w) ({ __typeof__(b) _b = (b); "
-            "((int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
+            "((__typeof__(_b))(int64_t)_b != _b || "
+            "(int64_t)_b < 0 || (int64_t)_b >= (int64_t)(w) || "
             "(int64_t)_b >= (int64_t)(sizeof(a) * 8)) "
             "? (__typeof__(a))0 : (a) >> _b; })\n\n");
 
@@ -7434,7 +7948,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    uint32_t h_gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen) {\n");
-    emit(e, "        _zer_trap(\"use-after-free: handle generation mismatch\", __FILE__, __LINE__);\n");
+    emit(e, "        _zer_trap(\"use-after-free or wrong-pool handle: generation mismatch\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    return (char*)slots + idx * slot_size;\n");
     emit(e, "}\n\n");
@@ -7458,6 +7972,10 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * pool-clear). Documented in docs/limitations.md cross-function
      * wrong-pool gap as the natural follow-up. */
     emit(e, "    if (h_gen == 0) return;  /* null handle: no-op */\n");
+    /* BUG-1270: a handle this pool never issued (another pool's, or a stale one)
+     * used to free whatever live object sat in that slot. */
+    emit(e, "    if (idx >= capacity || !used[idx] || gen[idx] != h_gen)\n");
+    emit(e, "        _zer_trap(\"free of a handle this pool did not issue (wrong pool or already freed)\", __FILE__, __LINE__);\n");
     emit(e, "    if (idx < capacity) {\n");
     emit(e, "        used[idx] = 0;\n");
     emit(e, "        gen[idx]++;\n");
@@ -7540,7 +8058,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
      * The asymmetry is why it survived: the FRESH-page path already callocs, so
      * only the REUSE path was affected. */
     emit(e, "            memset(s->pages[i / _ZER_SLAB_PAGE_SLOTS] + (i %% _ZER_SLAB_PAGE_SLOTS) * s->slot_size, 0, s->slot_size);\n");
-    emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1; /* zero handle must not match */\n");
+    emit(e, "            if (s->gen[i] == 0) s->gen[i] = _zer_gen_seed(s); /* BUG-1270; never 0 */\n");
     emit(e, "            *ok = 1;\n");
     emit(e, "            return ((uint64_t)s->gen[i] << 32) | i;\n");
     emit(e, "        }\n");
@@ -7564,7 +8082,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    s->page_count++;\n");
     emit(e, "    s->total_slots += _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    s->used[base] = 1;\n");
-    emit(e, "    if (s->gen[base] == 0) s->gen[base] = 1; /* zero handle must not match */\n");
+    emit(e, "    if (s->gen[base] == 0) s->gen[base] = _zer_gen_seed(s); /* BUG-1270; never 0 */\n");
     emit(e, "    *ok = 1;\n");
     emit(e, "    return ((uint64_t)s->gen[base] << 32) | base;\n");
     emit(e, "}\n\n");
@@ -7573,7 +8091,7 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    uint32_t idx = (uint32_t)(handle & 0xFFFFFFFF);\n");
     emit(e, "    uint32_t gen = (uint32_t)(handle >> 32);\n");
     emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != gen) {\n");
-    emit(e, "        _zer_trap(\"slab: use-after-free or invalid handle\", __FILE__, __LINE__);\n");
+    emit(e, "        _zer_trap(\"slab: use-after-free, wrong-slab or invalid handle\", __FILE__, __LINE__);\n");
     emit(e, "    }\n");
     emit(e, "    size_t page = idx / _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "    size_t slot = idx %% _ZER_SLAB_PAGE_SLOTS;\n");
@@ -7586,6 +8104,8 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     /* SAFETY (silent-gap audit 2026-05-21): mirror _zer_pool_free's
      * null-handle no-op. See _zer_pool_free for rationale. */
     emit(e, "    if (h_gen == 0) return;  /* null handle: no-op */\n");
+    emit(e, "    if (idx >= s->total_slots || !s->used[idx] || s->gen[idx] != h_gen)   /* BUG-1270 */\n");
+    emit(e, "        _zer_trap(\"free of a handle this slab did not issue (wrong slab or already freed)\", __FILE__, __LINE__);\n");
     emit(e, "    if (idx < s->total_slots) {\n");
     emit(e, "        s->used[idx] = 0;\n");
     emit(e, "        s->gen[idx]++;\n");
@@ -7879,6 +8399,16 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
         emit(e, "self->%.*s", (int)l->name_len, l->name);
     else
         emit(e, "%.*s", (int)l->name_len, l->name);
+}
+
+/* BUG-1359: a uN / iN value LOADED out of memory is re-wrapped to its width. ZER
+ * itself only ever stores in-range values, but a device register, C code or a
+ * `@pun` view can leave bits above N set, and every later comparison read the
+ * raw carrier (`u3 f = rr.a;` held 127 on a byte 0x7F; `i5` held 127, not -1).
+ * One AND (or sign-extend) after the load restores the type's range. */
+static void emit_intn_load_normalize(Emitter *e, IRFunc *func, int local_id) {
+    if (local_id < 0 || local_id >= func->local_count) return;
+    emit_intn_mask(e, &func->locals[local_id], func->is_async ? "self->" : "");
 }
 
 /* BUG-1152: the statement form of the non-null load guard — after an IR load
@@ -8314,7 +8844,8 @@ static void emit_inttoptr(Emitter *e, Node *node, IRFunc *func) {
     /* F4: alignment via type_alignment_bytes (aggregate-aware). GAP-2 (BUG-736):
      * alignment is a property of the TARGET TYPE and is checked even with zero
      * declared mmio ranges (--no-strict-mmio); only the range check needs them. */
-    int align = inner ? type_alignment_bytes(inner) : 0;
+    /* BUG-1399: what the ACCESSES need — a packed struct's own alignment is 1 */
+    int align = inner ? type_access_alignment(inner) : 0;
     if (!var_addr && node->intrinsic.addr_is_const) {
         emit(e, "((");
         emit_type(e, t);
@@ -8475,17 +9006,14 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         emit_int_literal(e, node);
         return;
     case NODE_FLOAT_LIT:
-        emit_double_lit(e, node->float_lit.value);
+        emit_double_lit(e, node->float_lit.value,
+                           emit_type_is_f32(checker_get_type(e->checker, node)));
         return;
     case NODE_BOOL_LIT:
         emit(e, "%d", node->bool_lit.value ? 1 : 0);
         return;
     case NODE_CHAR_LIT:
-        if (node->char_lit.value >= 32 && node->char_lit.value < 127 &&
-            node->char_lit.value != '\'' && node->char_lit.value != '\\')
-            emit(e, "'%c'", (char)node->char_lit.value);
-        else
-            emit(e, "%u", (unsigned)node->char_lit.value);
+        emit_char_lit(e, node);
         return;
     case NODE_NULL_LIT:
         emit(e, "0");
@@ -8494,9 +9022,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         /* sizeof("...") - 1 so C resolves escapes; source-char count
          * was off-by-many for any escape sequence, silently inflating
          * .len past actual byte count. */
-        emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
-             (int)node->string_lit.length, node->string_lit.value,
-             (int)node->string_lit.length, node->string_lit.value);
+        emit_zer_string_slice(e, node->string_lit.value, (int)node->string_lit.length, false);
         return;
 
     case NODE_BINARY: {
@@ -8973,7 +9499,9 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
          * different value or pops a second entry. expr_is_volatile spans
          * the field chain; OR it in to route through the single-eval
          * statement-expression branch. */
-        if (expr_is_volatile(e, node->index_expr.index)) idx_se = true;
+        if (expr_reads_volatile(e, node->index_expr.index, func)) idx_se = true;   /* BUG-1378 */
+        if (!expr_emit_small(node->index_expr.index)) idx_se = true;          /* BUG-1391 */
+        if (idx_slice && !expr_emit_small(node->index_expr.object)) obj_se = true;   /* BUG-1391: .len and .ptr */
         if (expr_is_volatile(e, node->index_expr.object)) obj_se = true;
         /* BUG-1098: an ident index the checker declined to auto-guard because the
          * statement may change it — the check and the access must read it ONCE,
@@ -8987,14 +9515,14 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         if (idx_slice) {
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
-                emit(e, "*({ __typeof__(");
-                emit_rewritten_node(e, node->index_expr.object, func);
-                emit(e, ") _zer_obj%d = ", tmp);
+                /* BUG-1349; BUG-1391: `__auto_type`, so the object's text is
+                 * written once (a `__typeof__(obj)` copy doubled it per level). */
+                emit(e, "(*({ __auto_type _zer_obj%d = ", tmp);
                 emit_rewritten_node(e, node->index_expr.object, func);
                 emit(e, "; size_t _zer_idx%d = (size_t)(", tmp);
                 emit_rewritten_node(e, node->index_expr.index, func);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, _zer_obj%d.len, "
-                       "__FILE__, __LINE__); &_zer_obj%d.ptr[_zer_idx%d]; })",
+                       "__FILE__, __LINE__); &_zer_obj%d.ptr[_zer_idx%d]; }))",
                      tmp, tmp, tmp, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
@@ -9034,13 +9562,35 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
              * expressions use single-eval `*({...})` to avoid double-eval. */
             if (idx_se || obj_se) {
                 int tmp = e->temp_count++;
-                emit(e, "*({ size_t _zer_idx%d = (size_t)(", tmp);
+                /* BUG-1349: the OBJECT is evaluated first (left to right) when it
+                 * has a side effect of its own — `s.m[t(1)][t(2)]` ran t(2) first. */
+                /* only for an lvalue object — `&(f().arr)` is not C */
+                bool obj_hoist = obj_se;
+                {
+                    Node *b = node->index_expr.object;
+                    while (b && (b->kind == NODE_FIELD || b->kind == NODE_INDEX))
+                        b = b->kind == NODE_FIELD ? b->field.object : b->index_expr.object;
+                    if (!b || !(b->kind == NODE_IDENT ||
+                                (b->kind == NODE_UNARY && b->unary.op == TOK_STAR)))
+                        obj_hoist = false;
+                }
+                if (obj_hoist) {
+                    emit(e, "(*({ __auto_type _zer_iob%d = &(", tmp);   /* BUG-1391 */
+                    emit_rewritten_node(e, node->index_expr.object, func);
+                    emit(e, "); size_t _zer_idx%d = (size_t)(", tmp);
+                } else {
+                    emit(e, "(*({ size_t _zer_idx%d = (size_t)(", tmp);
+                }
                 emit_rewritten_node(e, node->index_expr.index, func);
                 emit(e, "); _zer_bounds_check(_zer_idx%d, ", tmp);
                 emit_array_size(e, idx_obj_eff);
                 emit(e, ", __FILE__, __LINE__); &");
-                emit_rewritten_node(e, node->index_expr.object, func);
-                emit(e, "[_zer_idx%d]; })", tmp);
+                if (obj_hoist) {
+                    emit(e, "(*_zer_iob%d)", tmp);
+                } else {
+                    emit_rewritten_node(e, node->index_expr.object, func);
+                }
+                emit(e, "[_zer_idx%d]; }))"  /* BUG-1349 */, tmp);
             } else {
                 emit(e, "(_zer_bounds_check((size_t)(");
                 emit_rewritten_node(e, node->index_expr.index, func);
@@ -9188,14 +9738,10 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
         }
         /* Array assignment — memcpy/byte-loop */
         if (tgt_eff && tgt_eff->kind == TYPE_ARRAY) {
-            int tmp = e->temp_count++;
-            emit(e, "({ __typeof__(");
-            emit_rewritten_node(e, node->assign.target, func);
-            emit(e, ") *_zer_ma%d = &(", tmp);
-            emit_rewritten_node(e, node->assign.target, func);
-            emit(e, "); memmove(_zer_ma%d, ", tmp);
-            emit_rewritten_node(e, node->assign.value, func);
-            emit(e, ", sizeof(*_zer_ma%d)); })", tmp);
+            bool arr_volatile = expr_is_volatile(e, node->assign.target) ||
+                                expr_is_volatile(e, node->assign.value);
+            emit_array_assign(e, tgt_eff, node->assign.target, node->assign.value,
+                              arr_volatile, func, emit_rewritten_node);   /* BUG-1344 */
             return;
         }
         /* Shared struct locking — emit lock + assign + unlock */
@@ -9396,7 +9942,8 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 return;
             }
             if (node->call.is_comptime_float)
-                emit_double_lit(e, node->call.comptime_float_value);
+                emit_double_lit(e, node->call.comptime_float_value,
+                                   emit_type_is_f32(checker_get_type(e->checker, node)));
             else
                 emit(e, "%lld", (long long)node->call.comptime_value);
             return;
@@ -11370,7 +11917,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 "#elif defined(__ARM_ARCH)\n"
                 "    { uint32_t _zer_r32 = (uint32_t)_zer_rstate; __asm__ __volatile__ (\"msr cpsr_c, %0\" :: \"r\"(_zer_r32) : \"memory\"); }\n"
                 "#elif defined(__riscv)\n"
-                "    { unsigned long _zer_m = (unsigned long)_zer_rstate; __asm__ __volatile__ (\"csrw mstatus, %0\" :: \"r\"(_zer_m) : \"memory\"); }\n"
+                "    { unsigned long _zer_m = (unsigned long)_zer_rstate & 8UL; __asm__ __volatile__ (\"csrc mstatus, %0\\n\\tcsrs mstatus, %1\" :: \"r\"(8UL), \"r\"(_zer_m) : \"memory\"); } /* BUG-1348: MIE only */\n"
                 "#else\n"
                 "    (void)_zer_rstate;\n"
                 "#endif\n"
@@ -11427,23 +11974,29 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                  * form double-evaluates the arg, which is safe because the
                  * side-effect-free gate excludes calls / assigns / etc. */
                 if (!expr_has_side_effects(node->intrinsic.args[0])) {
-                    emit(e, "(uint32_t)(((");
+                    emit(e, "(uint32_t)((");
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, ") == 0) ? %d : __builtin_%.*s%s(", w, (int)nlen, name, suffix);
+                    bitq_operand_close(e, w);
+                    emit(e, " == 0) ? %d : __builtin_%.*s%s(", bitq_count_width(w), (int)nlen, name, suffix);
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
+                    bitq_operand_close(e, w);
                     emit(e, "))");
                 } else {
                     int t = e->temp_count++;
-                    emit(e, "({ __typeof__(");
+                    emit(e, "({ %s _zer_bz%d = ", w > 32 ? "uint64_t" : "uint32_t", t);
+                    bitq_operand_open(e, w);
                     emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, ") _zer_bz%d = (", t);
-                    emit_rewritten_node(e, node->intrinsic.args[0], func);
-                    emit(e, "); (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
-                         t, w, (int)nlen, name, suffix, t);
+                    bitq_operand_close(e, w);
+                    emit(e, "; (uint32_t)(_zer_bz%d == 0 ? %d : __builtin_%.*s%s(_zer_bz%d)); })",
+                         t, bitq_count_width(w), (int)nlen, name, suffix, t);
                 }
             } else {
                 emit(e, "(uint32_t)__builtin_%.*s%s(", (int)nlen, name, suffix);
+                bitq_operand_open(e, w);
                 emit_rewritten_node(e, node->intrinsic.args[0], func);
+                bitq_operand_close(e, w);
                 emit(e, ")");
             }
         } else if (nlen == 12 && memcmp(name, "barrier_init", 12) == 0 && node->intrinsic.arg_count >= 2) {
@@ -11782,9 +12335,7 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             /* Hoist obj so .len is single-evaluation (its type matches the
              * slice we're producing — same .ptr / .len shape). */
             if (bounds_present) {
-                emit(e, "__typeof__(");
-                emit_rewritten_node(e, node->slice.object, func);
-                emit(e, ") _zer_so%d = ", t);
+                emit(e, "__auto_type _zer_so%d = ", t);   /* BUG-1391: the object once */
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, "; size_t _zer_cap%d = _zer_so%d.len; ", t, t);
             }
@@ -11906,11 +12457,13 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
             emit_f2i_close(e, t3, tmp);
             return;
         }
+        bool w3 = emit_intn_value_wrap_open(e, t3);   /* BUG-1385 */
         emit(e, "((");
         if (t3) emit_type(e, t3);
         emit(e, ")");
         emit_rewritten_node(e, node->typecast.expr, func);
         emit(e, ")");
+        if (w3) emit_intn_value_wrap_close(e, t3);
         return;
     }
 
@@ -12677,16 +13230,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              *   loser : CAS fails -> spin-load until ==2 (ACQUIRE) -> skip
              * The ACQUIRE load pairs with the winner's RELEASE store, so a loser
              * never observes the half-constructed state the winner published. */
-            int oid = inst->false_block;
+            /* BUG-1298: the flag is keyed on the @once NODE, so the clones of a
+             * defer body (one per fire site) share it; the CAS scratch keeps the
+             * block id, which is unique per clone. */
+            int oid = emit_once_id(e, inst->expr);
+            int xid = inst->false_block;
             emit_indent(e);
             emit(e, "{\n");
             emit_indent(e);
             emit(e, "#if _ZER_HOSTED\n");
             emit_indent(e);
-            emit(e, "uint32_t _zer_once_exp_%d = 0;\n", oid);
+            emit(e, "uint32_t _zer_once_exp_%d = 0;\n", xid);
             emit_indent(e);
             emit(e, "if (__atomic_compare_exchange_n(&_zer_once_%d, &_zer_once_exp_%d, 1u, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) goto _zer_bb%d;\n",
-                 oid, oid, inst->true_block);
+                 oid, xid, inst->true_block);
             emit_indent(e);
             emit(e, "else { while (__atomic_load_n(&_zer_once_%d, __ATOMIC_ACQUIRE) != 2u) _zer_once_relax(); goto _zer_bb%d; }\n",
                  oid, inst->false_block);
@@ -12969,6 +13526,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * is set (legacy), fall back to the pre-computed local. */
             emit_indent(e);
             emit(e, "case %d:;\n", e->async_yield_id);
+            /* BUG-1292: the condition's auto-guard runs on EVERY evaluation, so it
+             * goes AFTER the resume label — emitted before it (the generic
+             * per-instruction guard), a resumed poll jumped past the check and
+             * indexed out of bounds (ASan global-buffer-overflow). */
+            if (inst->expr) emit_auto_guards(e, inst->expr);
             emit_indent(e);
             emit(e, "if (!(");
             if (inst->expr) {
@@ -13010,6 +13572,50 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * the root ident; src2_local encodes write-lock (1) vs
          * read-lock (0) for shared(rw) structs. Reuses the same
          * emit_shared_lock_mode helper the AST path uses. */
+        /* BUG-1376: a statement's lock GROUP (the first lock carries its size,
+         * the members follow it in this block) is acquired in ADDRESS order —
+         * the same order in every thread — so two statements locking the same
+         * instances in opposite source order cannot deadlock. Members were
+         * emitted by the group and are skipped here. */
+        if (inst->literal_int == -1) break;
+        if (inst->literal_int >= 2 && inst->expr) {
+            int n = (int)inst->literal_int;
+            bool ok = true;
+            for (int k = 1; k < n; k++)
+                if (inst[k].op != IR_LOCK || inst[k].literal_int != -1 || !inst[k].expr) ok = false;
+            if (ok) {
+                emit_indent(e);
+                emit(e, "{ uintptr_t _zer_la[%d] = { ", n);
+                for (int k = 0; k < n; k++) {
+                    Type *rt = checker_get_type(e->checker, inst[k].expr);
+                    bool is_ptr = type_dispatch_kind(rt) == TYPE_POINTER;
+                    emit(e, "%s(uintptr_t)%s(", k ? ", " : "", is_ptr ? "" : "&");
+                    emit_expr(e, inst[k].expr);
+                    emit(e, ")");
+                }
+                emit(e, " };\n");
+                emit_indent(e);
+                emit(e, "  int _zer_lo[%d]; for (int _zer_i = 0; _zer_i < %d; _zer_i++) _zer_lo[_zer_i] = _zer_i;\n", n, n);
+                emit_indent(e);
+                emit(e, "  for (int _zer_i = 1; _zer_i < %d; _zer_i++) { int _zer_k = _zer_lo[_zer_i]; int _zer_j = _zer_i;"
+                        " while (_zer_j > 0 && _zer_la[_zer_lo[_zer_j - 1]] > _zer_la[_zer_k]) { _zer_lo[_zer_j] = _zer_lo[_zer_j - 1]; _zer_j--; }"
+                        " _zer_lo[_zer_j] = _zer_k; }\n", n);
+                emit_indent(e);
+                emit(e, "  for (int _zer_i = 0; _zer_i < %d; _zer_i++) switch (_zer_lo[_zer_i]) {\n", n);
+                for (int k = 0; k < n; k++) {
+                    emit_indent(e);
+                    emit(e, "  case %d: {\n", k);
+                    emit_shared_lock_mode(e, inst[k].expr, inst[k].src2_local != 0);
+                    emit_indent(e);
+                    emit(e, "  } break;\n");
+                }
+                emit_indent(e);
+                emit(e, "  default: break; }\n");
+                emit_indent(e);
+                emit(e, "}\n");
+                break;
+            }
+        }
         if (inst->expr) {
             emit_shared_lock_mode(e, inst->expr, inst->src2_local != 0);
         }
@@ -13026,7 +13632,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     "no zero value (non-null pointer / enum without a 0 variant) — it cannot "
                     "return early\", __FILE__, __LINE__);\n");
         else
-            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block "
+            emit(e, "_zer_trap(\"out-of-bounds access inside a held lock, @critical block, @once body, semaphore hold "
                     "or defer cleanup — cannot return without leaking it\", __FILE__, __LINE__);\n");
         break;
 
@@ -13102,11 +13708,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "uint32_t _zer_primask; __asm__ __volatile__(\"mrs %%0, primask\\n cpsid i\" : \"=r\"(_zer_primask) :: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uint64_t _zer_daif; __asm__ __volatile__(\"mrs %%0, daif\\n\\tmsr daifset, #2\" : \"=r\"(_zer_daif) :: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uint32_t _zer_cpsr; __asm__ __volatile__(\"mrs %%0, cpsr\\n\\tcpsid i\" : \"=r\"(_zer_cpsr) :: \"memory\");\n");
         emit_indent(e);
@@ -13114,7 +13720,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "uint8_t _zer_sreg = SREG; __asm__ __volatile__(\"cli\" ::: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "unsigned long _zer_mstatus; __asm__ __volatile__(\"csrrci %%0, mstatus, 8\" : \"=r\"(_zer_mstatus) :: \"memory\");\n");
         emit_indent(e);
@@ -13124,7 +13730,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * __STDC_HOSTED__ == 0 (freestanding) + x86 arch macro. On
          * hosted user-mode x86, cli/sti would SIGSEGV (CPL != 0), so
          * the fence-only fallback is correct there. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "uintptr_t _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
         emit_indent(e);
@@ -13151,11 +13757,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr primask, %%0\" :: \"r\"(_zer_primask) : \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__aarch64__) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__aarch64__) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr daif, %%0\" :: \"r\"(_zer_daif) : \"memory\");\n");
         emit_indent(e);
-        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__ARM_ARCH) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"msr cpsr_c, %%0\" :: \"r\"(_zer_cpsr) : \"memory\");\n");
         emit_indent(e);
@@ -13165,13 +13771,18 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
          * complete before interrupts return (SREG= is not a compiler barrier). */
         emit(e, "__asm__ __volatile__(\"\" ::: \"memory\"); SREG = _zer_sreg;\n");
         emit_indent(e);
-        emit(e, "#elif defined(__riscv) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif defined(__riscv) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
-        emit(e, "__asm__ __volatile__(\"csrw mstatus, %%0\" :: \"r\"(_zer_mstatus) : \"memory\");\n");
+        /* BUG-1348: restore ONLY MIE (bit 3), the one bit csrrci cleared. A full
+         * `csrw mstatus, saved` reverted everything the block changed — FS=Dirty
+         * set by FP use went back to Clean, so a lazy-FPU context switch skipped
+         * saving the FP registers. `csrs` of the saved MIE bit is exact: set when
+         * it was set, untouched (still clear) when it was not — nesting-safe. */
+        emit(e, "__asm__ __volatile__(\"csrs mstatus, %%0\" :: \"r\"(_zer_mstatus & 8UL) : \"memory\");\n");
         emit_indent(e);
         /* Gap 10 fix: restore EFLAGS on bare-metal x86. The push/pop
          * order matches IR_CRITICAL_BEGIN's save/disable sequence. */
-        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_HOSTED)\n");
+        emit(e, "#elif (defined(__x86_64__) || defined(__i386__)) && (!_ZER_USER_MODE)\n");
         emit_indent(e);
         emit(e, "__asm__ __volatile__(\"push %%0\\n\\tpopf\" :: \"r\"(_zer_x86_flags) : \"memory\", \"cc\");\n");
         emit_indent(e);
@@ -13277,24 +13888,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ") {\n");
                 e->indent++;
             }
-            if (db->kind == NODE_BLOCK) {
-                /* F4 (2026-08-02): brace-scope — see the emit_defers_from
-                 * sibling. Flattening the block here rather than calling
-                 * emit_defer_stmt(block) is deliberate: the `guarded` if-wrap
-                 * above must be able to nest the whole body. These braces just
-                 * restore the scope the flattening removes. */
-                emit_indent(e);
-                emit(e, "{\n");
-                e->indent++;
-                for (int si = 0; si < db->block.stmt_count; si++) {
-                    emit_defer_stmt(e, db->block.stmts[si], func);
-                }
-                e->indent--;
-                emit_indent(e);
-                emit(e, "}\n");
-            } else {
-                emit_defer_stmt(e, db, func);
-            }
+            emit_defer_body(e, func, db);
             if (armed_flag >= 0) {
                 e->indent--;
                 emit_indent(e);
@@ -13878,6 +14472,29 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                      type_dispatch_kind(src_eff->pointer.inner) == TYPE_OPTIONAL &&
                                      !is_null_sentinel(type_unwrap_distinct(src_eff->pointer.inner)->optional.inner));
 
+            /* BUG-1340: the same two captures when the optional is a NULL SENTINEL
+             * (`?*T`, `?funcptr`) — its storage IS the pointer, so `|*pp|` is the
+             * optional's own address. Fell through to the plain copy `pp = o;`,
+             * binding a `T **` to the POINTEE's address: `*pp = &other` wrote a
+             * pointer into the object's bytes (measured: a 4-byte struct global
+             * overwritten, the neighbour clobbered). A VALUE capture `|p|` has
+             * dst type `*T` = the inner itself, never `**T`, so the type test is
+             * what tells the two apart. */
+            bool need_ns_addr_capture = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_eff && src_eff->kind == TYPE_OPTIONAL &&
+                                     is_null_sentinel(src_eff->optional.inner) &&
+                                     dst_eff->pointer.inner &&
+                                     type_equals(dst_eff->pointer.inner, src_eff->optional.inner));
+            Type *src_pointee = (src_eff && type_dispatch_kind(src_eff) == TYPE_POINTER)
+                                ? type_unwrap_distinct(src_eff->pointer.inner) : NULL;
+            bool need_ns_addr_capture_via_ptr = (dst && dst->is_capture &&
+                                     dst_eff && dst_eff->kind == TYPE_POINTER &&
+                                     src_pointee && type_dispatch_kind(src_pointee) == TYPE_OPTIONAL &&
+                                     is_null_sentinel(src_pointee->optional.inner) &&
+                                     dst_eff->pointer.inner &&
+                                     type_equals(dst_eff->pointer.inner, src_pointee->optional.inner));
+
             const char *sp = func->is_async ? "self->" : "";
 
             /* Array→array copy: use memcpy (C can't assign arrays).
@@ -13906,7 +14523,11 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                src_eff->pointer.inner &&
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
-            if (need_addr_capture_via_ptr) {
+            if (need_ns_addr_capture) {                 /* BUG-1340 */
+                emit(e, "&%s%.*s;\n", sp, (int)src->name_len, src->name);
+            } else if (need_ns_addr_capture_via_ptr) {  /* BUG-1340 */
+                emit(e, "%s%.*s;\n", sp, (int)src->name_len, src->name);
+            } else if (need_addr_capture_via_ptr) {
                 emit(e, "&%s%.*s->value;\n",
                      sp, (int)src->name_len, src->name);
             } else if (need_addr_capture) {
@@ -14003,15 +14624,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 break;
             }
             case 1: /* float */
-                emit_double_lit(e, inst->literal_float);
+                emit_double_lit(e, inst->literal_float,
+                    inst->dest_local >= 0 && inst->dest_local < func->local_count &&
+                    emit_type_is_f32(func->locals[inst->dest_local].type));
                 break;
             case 2: /* string */
                 /* sizeof("...") - 1 so C resolves escapes; source-char
                  * count overcounted (silent OOB on bounds-checked
                  * reads of escape-bearing literals). */
-                emit(e, "(_zer_slice_u8){ (uint8_t*)\"%.*s\", sizeof(\"%.*s\") - 1 }",
-                     (int)inst->literal_str_len, inst->literal_str,
-                     (int)inst->literal_str_len, inst->literal_str);
+                emit_zer_string_slice(e, inst->literal_str, (int)inst->literal_str_len, false);
                 break;
             case 3: /* bool */
                 emit(e, "%s", inst->literal_int ? "1" : "0");
@@ -14175,6 +14796,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit(e, ";");
                 emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
                 emit(e, "\n");
+                emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
                 goto unop_done;
             case TOK_AMP: /* addr-of */
                 emit_indent(e);
@@ -14219,6 +14841,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                  (int)inst->field_name_len, inst->field_name);
             emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
             emit(e, "\n");
+            emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
         }
         break;
     }
@@ -14258,6 +14881,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             }
             emit_nonnull_local_check(e, func, inst->dest_local); /* BUG-1152 */
             emit(e, "\n");
+            emit_intn_load_normalize(e, func, inst->dest_local);  /* BUG-1359 */
         }
         break;
     }
@@ -14587,6 +15211,183 @@ static void emit_line_map(Emitter *e, const char *src_file, int line, int *last)
     *last = line;
 }
 
+/* BUG-1298: publish "done" at a @once's join block — the block some @once branch in
+ * `blocks` names as its false_block. `blocks` is the function's, or a defer
+ * template's (whose instructions still carry the template's ORIGINAL ids). */
+static void emit_once_join_publish(Emitter *e, IRBlock *blocks, int n, int block_id) {
+    for (int bj = 0; bj < n; bj++) {
+        for (int ij = 0; ij < blocks[bj].inst_count; ij++) {
+            IRInst *in = &blocks[bj].insts[ij];
+            if (in->op == IR_BRANCH && in->cond_local < 0 && in->expr &&
+                in->expr->kind == NODE_ONCE && in->false_block == block_id) {
+                emit(e, "#if _ZER_HOSTED\n");
+                emit_indent(e);
+                emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n",
+                     emit_once_id(e, in->expr));
+                emit(e, "#endif\n");
+                return;
+            }
+        }
+    }
+}
+
+static void emit_once_decls_in(Emitter *e, IRBlock *blocks, int n, const char *indent) {
+    for (int bi = 0; bi < n; bi++) {
+        for (int ii = 0; ii < blocks[bi].inst_count; ii++) {
+            IRInst *in = &blocks[bi].insts[ii];
+            if (in->op == IR_BRANCH && in->cond_local < 0 && in->expr &&
+                in->expr->kind == NODE_ONCE) {
+                int before = e->once_n;
+                int id = emit_once_id(e, in->expr);
+                if (e->once_n > before)
+                    emit(e, "%sstatic uint32_t _zer_once_%d = 0;\n", indent, id);
+            }
+        }
+    }
+}
+
+/* B4 (BUG-756) + BUG-1298: declare one function-scope flag per @once NODE — in the
+ * body and in every defer template (a labelled function emits those inline). */
+static void emit_once_decls(Emitter *e, IRFunc *func, const char *indent) {
+    e->once_n = 0;
+    emit_once_decls_in(e, func->blocks, func->block_count, indent);
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_DEFER_PUSH && in->defer_tpl && in->defer_tpl->count > 0)
+                emit_once_decls_in(e, in->defer_tpl->blocks, in->defer_tpl->count, indent);
+        }
+    }
+}
+
+/* One IR instruction with its C-level auto-guards. Shared by the regular and the
+ * async block loops, and by inline defer-template emission (BUG-1298). */
+static void emit_ir_inst_guarded(Emitter *e, IRInst *ins, IRFunc *func,
+                                 const char *src_file, int *last_line) {
+    /* BUG-1003: anchor the line counter BEFORE the guards, so an
+     * auto-guard trap reports the access's line, not the previous one. */
+    emit_line_map(e, src_file, ins->source_line, last_line);
+    if (ins->expr) {
+        IROpKind k = ins->op;
+        /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
+         * AST array indexing re-emitted per-poll) and IR_NOP (carries
+         * NODE_SPAWN args copied in parent thread). Both were
+         * silently miscompiling unproven arr[i] — emit_auto_guards
+         * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
+        /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
+         * gate too. It carries the SHARED ROOT expression, and that root can
+         * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
+         * the guard was emitted before the ASSIGN, which is INSIDE the lock,
+         * so the emitted C read:
+         *
+         *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
+         *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
+         *
+         * — the lock's own bounds check traps first, and even reaching the
+         * guard it could only trap, because a lock is held and returning
+         * would leak it. Measured: exit 133 on a program whose guard should
+         * have taken a clean early return. Guarding the LOCK emits the check
+         * BEFORE the lock, where the early return is still legal.
+         *
+         * This is the gate defect M exists to remove, and IR_LOCK is a
+         * measured instance of it: an op kind carrying a guardable expr that
+         * nobody had added. The list is hand-maintained and has been widened
+         * reactively three times now (2026-05-03/06 async, 2026-06-30
+         * AWAIT/NOP, and this). */
+        if (ir_op_takes_auto_guards(k) &&
+            !(k == IR_AWAIT && func->is_async)) {   /* BUG-1292: after its case label */
+            bool sv_gt = e->guard_traps;              /* BUG-1291 */
+            if (ins->in_defer_body) e->guard_traps = true;
+            emit_auto_guards(e, ins->expr);
+            e->guard_traps = sv_gt;
+        }
+    }
+    emit_ir_inst(e, ins, func);
+}
+
+/* BUG-1298: the template ir_lower built for this defer body at its registration. */
+static IRDeferTpl *ir_defer_tpl_for_body(IRFunc *func, Node *db) {
+    for (int bi = 0; bi < func->block_count; bi++) {
+        IRBlock *bb = &func->blocks[bi];
+        for (int ii = 0; ii < bb->inst_count; ii++) {
+            IRInst *in = &bb->insts[ii];
+            if (in->op == IR_DEFER_PUSH && in->defer_body == db &&
+                in->defer_tpl && in->defer_tpl->count > 0)
+                return in->defer_tpl;
+        }
+    }
+    return NULL;
+}
+
+/* BUG-1298: emit ONE defer body at a fire point that ir_lower did not splice — a
+ * fire in a function with a LABEL (the goto guard / ARMED flags wrap it in C), or
+ * a C-level early exit (emit_defers_from).
+ *
+ * The body is emitted from its IR TEMPLATE, inline, with fresh block labels — the
+ * same instructions a spliced body would have produced. It used to go through
+ * emit_defer_stmt, a second statement emitter over the raw AST covering eleven
+ * node kinds, which is exactly what refactor L removed for label-free functions:
+ * measured on the pre-fix build, a shared read in a defer-body CONDITION took no
+ * lock, and `switch` / `do-while` / `@critical` became `compiler bug: ... no
+ * handler` plus a `_zer_trap` in place of valid code.
+ *
+ * A body with no template (none was lowered) keeps the AST path. */
+static void emit_defer_body(Emitter *e, IRFunc *func, Node *db) {
+    IRDeferTpl *t = func ? ir_defer_tpl_for_body(func, db) : NULL;
+    if (!t) {
+        if (db->kind == NODE_BLOCK) {
+            /* F4 (2026-08-02): brace-scope the block-form body — it is emitted at
+             * every exit path, so a declared local would otherwise be redefined. */
+            emit_indent(e);
+            emit(e, "{\n");
+            e->indent++;
+            for (int si = 0; si < db->block.stmt_count; si++)
+                emit_defer_stmt(e, db->block.stmts[si], func);
+            e->indent--;
+            emit_indent(e);
+            emit(e, "}\n");
+        } else {
+            emit_defer_stmt(e, db, func);
+        }
+        return;
+    }
+    /* Labels beyond any function block id, unique per emitted copy: a body is
+     * emitted once per fire site, and C labels are function-scoped. */
+    int base = (1 << 24) + e->defer_label_seq;
+    e->defer_label_seq += t->count + 1;
+    int end = base + t->count;
+    int dummy_line = -1;
+    int *last = e->ir_last_line ? e->ir_last_line : &dummy_line;
+    emit_indent(e);
+    emit(e, "{\n");
+    e->indent++;
+    for (int k = 0; k < t->count; k++) {
+        IRBlock *tb = &t->blocks[k];
+        emit(e, "_zer_bb%d:;\n", base + k);
+        emit_once_join_publish(e, t->blocks, t->count, t->first + k);
+        for (int ii = 0; ii < tb->inst_count; ii++) {
+            IRInst c = tb->insts[ii];
+            if (c.true_block  >= t->first && c.true_block  < t->first + t->count)
+                c.true_block  = base + (c.true_block  - t->first);
+            if (c.false_block >= t->first && c.false_block < t->first + t->count)
+                c.false_block = base + (c.false_block - t->first);
+            if (c.goto_block  >= t->first && c.goto_block  < t->first + t->count)
+                c.goto_block  = base + (c.goto_block  - t->first);
+            emit_ir_inst_guarded(e, &c, func, e->ir_src_file, last);
+        }
+        /* The exit block (and any block lowering left open) leaves the body. */
+        if (!ir_block_is_terminated(tb)) {
+            emit_indent(e);
+            emit(e, "goto _zer_bb%d;\n", end);
+        }
+    }
+    emit(e, "_zer_bb%d:;\n", end);
+    e->indent--;
+    emit_indent(e);
+    emit(e, "}\n");
+}
+
 /* Emit a regular (non-async) function from IR */
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
@@ -14605,8 +15406,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         /* 8ezecl (copied): emit `used` so -ffunction-sections + --gc-sections
          * (mainstream embedded flags) cannot silently tree-shake the ISR — the
          * only reference is the vector table in a separate TU. */
-        emit(e, "void __attribute__((interrupt, used)) %.*s_IRQHandler(void) {\n",
-             (int)fn->interrupt.name_len, fn->interrupt.name);
+        emit_isr_signature(e, fn);
+        emit(e, " {\n");
         e->indent++;
         e->current_func_ret = NULL;
     } else {
@@ -14655,10 +15456,41 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
 
         /* Parameters — use AST types (same resolution as AST emitter).
          * IR local types may be ty_void for complex params (struct, pointer). */
-        emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
+        /* BUG-1316: `main([*][*]u8 args)` — the C runtime calls main with
+         * (argc, argv), so the ZER parameter is BUILT here from them: a stack
+         * array of `[*]u8` (one per argument, length by scanning for the NUL) and
+         * a slice over it. The checker admits no other parameter list for main. */
+        bool main_args = !func->module_prefix && func->name_len == 4 &&
+            memcmp(func->name, "main", 4) == 0 && fn->func_decl.param_count == 1;
+        if (main_args) emit(e, "(int _zer_argc, char **_zer_argv)");
+        else emit_func_decl_params(e, fn, checker_get_type(e->checker, fn));
         emit_func_decl_tail(e, ret, main_promote);
         emit(e, " {\n");
         e->indent++;
+        if (main_args) {
+            ParamDecl *ap = &fn->func_decl.params[0];
+            Type *fty = checker_get_type(e->checker, fn);
+            Type *at = (fty && type_dispatch_kind(fty) == TYPE_FUNC_PTR && fty->func_ptr.param_count == 1)
+                ? fty->func_ptr.params[0] : resolve_tynode(e, ap->type);
+            Type *au = type_unwrap_distinct(at);
+            Type *elem = au->slice.inner;
+            emit_indent(e);
+            emit_type(e, elem);
+            emit(e, " _zer_argbuf[_zer_argc > 0 ? _zer_argc : 1];\n");
+            emit_indent(e);
+            emit(e, "for (int _zer_ai = 0; _zer_ai < _zer_argc; _zer_ai++) {\n");
+            emit_indent(e);
+            emit(e, "    size_t _zer_al = 0; while (_zer_argv[_zer_ai][_zer_al]) _zer_al++;\n");
+            emit_indent(e);
+            emit(e, "    _zer_argbuf[_zer_ai].ptr = (uint8_t *)_zer_argv[_zer_ai];\n");
+            emit_indent(e);
+            emit(e, "    _zer_argbuf[_zer_ai].len = _zer_al;\n");
+            emit_indent(e);
+            emit(e, "}\n");
+            emit_indent(e);
+            emit_type_and_name(e, at, ap->name, ap->name_len);
+            emit(e, " = { .ptr = _zer_argbuf, .len = (size_t)(_zer_argc > 0 ? _zer_argc : 0) };\n");
+        }
         e->current_func_ret = ret; /* needed for IR_RETURN optional wrapping */
     }
     e->defer_stack.count = 0; /* clear defer stack from previous function */
@@ -14682,16 +15514,38 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * qualifier here. Skip pointer/slice — their volatile is already in the
          * emitted type (`volatile uint32_t *`); an outer prefix would change meaning
          * (volatile-pointer vs pointer-to-volatile). */
-        if (l->is_volatile && l->type) {
+        /* BUG-1370: a STATIC pointer local is one object shared by every
+         * execution of its function — an interrupt handler and main, two
+         * threads — exactly like a global, so its `volatile` is the WORD's
+         * (the pointee's volatile is already in the type). */
+        bool static_word_vol = l->is_static && l->is_volatile && global_is_ptr_shaped(l->type);
+        if (l->is_volatile && l->type && !static_word_vol) {
             TypeKind vtk = type_dispatch_kind(l->type);
             if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
                 emit(e, "volatile ");
         }
-        emit_type_and_name(e, l->type, l->name, l->name_len);
+        if (static_word_vol)
+            emit_global_decl_name(e, l->type, l->name, (uint32_t)l->name_len, true);
+        else
+            emit_type_and_name(e, l->type, l->name, l->name_len);
         if (l->is_static && l->static_init) {
-            emit(e, " = ");
-            emit_rewritten_node(e, l->static_init, func);
-            emit(e, ";\n");
+            /* BUG-1315: a static's initializer is a C CONSTANT expression. An
+             * integer one is folded the way a global's is (BUG-1090 typed fold):
+             * rendered as an expression, `static u32 i = 7 % 4;` emitted the
+             * guarded-division statement expression and GCC refused it
+             * ("initializer element is not constant"). */
+            int64_t sv;
+            if (type_is_integer(l->type) &&
+                checker_fold_const_typed(e->checker, l->static_init, &sv) &&
+                sv != CONST_EVAL_FAIL) {
+                sv = fold_wrap_to_type(sv, l->type);
+                if (sv < 0) emit(e, " = (%lld);\n", (long long)sv);
+                else emit(e, " = %lluULL;\n", (unsigned long long)sv);
+            } else {
+                emit(e, " = ");
+                emit_rewritten_node(e, l->static_init, func);
+                emit(e, ";\n");
+            }
         } else {
             emit(e, " = {0};\n"); /* auto-zero */
         }
@@ -14702,17 +15556,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
      * (emitted at the join block below) can both reference it. The flag id is the
      * @once's bb_skip (false_block) id — unique within the function, and reachable
      * from both the branch (inst->false_block) and the join (bb->id). */
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        for (int ii = 0; ii < bb->inst_count; ii++) {
-            IRInst *in = &bb->insts[ii];
-            if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                in->expr && in->expr->kind == NODE_ONCE) {
-                emit_indent(e);
-                emit(e, "static uint32_t _zer_once_%d = 0;\n", in->false_block);
-            }
-        }
-    }
+    emit_once_decls(e, func, "    ");
 
     /* Wholesale source mapping stays OFF during IR block emission — an
      * unconditional #line collides with goto labels and statement expressions
@@ -14721,6 +15565,10 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
     int last_mapped_line = -1;
+    const char *sv_ir_src = e->ir_src_file;     /* BUG-1298 */
+    int *sv_ir_last = e->ir_last_line;
+    e->ir_src_file = saved_source;
+    e->ir_last_line = &last_mapped_line;
 
     /* Emit basic blocks */
     for (int bi = 0; bi < func->block_count; bi++) {
@@ -14734,23 +15582,7 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
          * "done" (RELEASE) so a spinning loser (ACQUIRE) observes the fully
          * constructed state. The loser also re-enters here and re-stores 2
          * (idempotent). Hosted only; freestanding @once is single-core (no wait). */
-        {
-            bool is_once_join = false;
-            for (int bj = 0; bj < func->block_count && !is_once_join; bj++) {
-                for (int ij = 0; ij < func->blocks[bj].inst_count; ij++) {
-                    IRInst *in = &func->blocks[bj].insts[ij];
-                    if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                        in->expr && in->expr->kind == NODE_ONCE &&
-                        in->false_block == bb->id) { is_once_join = true; break; }
-                }
-            }
-            if (is_once_join) {
-                emit(e, "#if _ZER_HOSTED\n");
-                emit_indent(e);
-                emit(e, "__atomic_store_n(&_zer_once_%d, 2u, __ATOMIC_RELEASE);\n", bb->id);
-                emit(e, "#endif\n");
-            }
-        }
+        emit_once_join_publish(e, func->blocks, func->block_count, bb->id);
 
         /* Check if block has a capture that conflicts with another capture
          * of the same name but different type — wrap in C { } scope.
@@ -14808,42 +15640,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
              * unmapped; baremetal: silent corruption (entire address space
              * valid). The handler comment claimed the pre-pass handles arrays
              * — true for IR_ASSIGN, was false for IR_INDEX_READ. */
-            IRInst *ins = &bb->insts[ii];
-            /* BUG-1003: anchor the line counter BEFORE the guards, so an
-             * auto-guard trap reports the access's line, not the previous one. */
-            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): widened to IR_AWAIT (cond carries
-                 * AST array indexing re-emitted per-poll) and IR_NOP (carries
-                 * NODE_SPAWN args copied in parent thread). Both were
-                 * silently miscompiling unproven arr[i] — emit_auto_guards
-                 * extended to descend NODE_SPAWN/NODE_AWAIT to pair. */
-                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
-                 * gate too. It carries the SHARED ROOT expression, and that root can
-                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
-                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
-                 * so the emitted C read:
-                 *
-                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
-                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
-                 *
-                 * — the lock's own bounds check traps first, and even reaching the
-                 * guard it could only trap, because a lock is held and returning
-                 * would leak it. Measured: exit 133 on a program whose guard should
-                 * have taken a clean early return. Guarding the LOCK emits the check
-                 * BEFORE the lock, where the early return is still legal.
-                 *
-                 * This is the gate defect M exists to remove, and IR_LOCK is a
-                 * measured instance of it: an op kind carrying a guardable expr that
-                 * nobody had added. The list is hand-maintained and has been widened
-                 * reactively three times now (2026-05-03/06 async, 2026-06-30
-                 * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k)) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
-            emit_ir_inst(e, ins, func);
+            emit_ir_inst_guarded(e, &bb->insts[ii], func, saved_source,
+                                 &last_mapped_line);
         }
 
         if (has_capture_scope) {
@@ -14859,6 +15657,8 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
      * fall-through from int main = return 0 implicitly. */
 
     e->source_file = saved_source;
+    e->ir_src_file = sv_ir_src;
+    e->ir_last_line = sv_ir_last;
     e->current_func_ret = NULL;
     e->current_main_promoted = false;
     e->indent--;
@@ -15044,15 +15844,7 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
      * are C statics — one per @once, shared by every task, which is exactly
      * @once's "once per program". Missing here, a @once in an async body was an
      * undeclared identifier at GCC. */
-    for (int bi = 0; bi < func->block_count; bi++) {
-        IRBlock *bb = &func->blocks[bi];
-        for (int ii = 0; ii < bb->inst_count; ii++) {
-            IRInst *in = &bb->insts[ii];
-            if (in->op == IR_BRANCH && in->cond_local < 0 &&
-                in->expr && in->expr->kind == NODE_ONCE)
-                emit(e, "    static uint32_t _zer_once_%d = 0;\n", in->false_block);
-        }
-    }
+    emit_once_decls(e, func, "    ");
     emit(e, "    switch (self->_zer_state) { case 0:;\n");
 
     e->indent = 1;
@@ -15073,6 +15865,10 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     const char *saved_source = e->source_file;
     e->source_file = NULL;
     int last_mapped_line = -1;
+    const char *sv_ir_src = e->ir_src_file;     /* BUG-1298 */
+    int *sv_ir_last = e->ir_last_line;
+    e->ir_src_file = saved_source;
+    e->ir_last_line = &last_mapped_line;
 
     /* BUG-863: IR_RETURN reads this to decide whether the async termination
      * also stores a result. The regular-function path sets it; this one never
@@ -15087,50 +15883,20 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
             emit_indent(e);
             emit(e, "_zer_bb%d:;\n", bb->id);
         }
+        /* BUG-1298: the winner's done-publish was missing on the async path, so a
+         * second arrival at an async @once spun forever on a flag stuck at 1. */
+        emit_once_join_publish(e, func->blocks, func->block_count, bb->id);
         for (int ii = 0; ii < bb->inst_count; ii++) {
-            /* Audit-fix (2026-05-03/06): mirror the regular-IR path's auto-guard
-             * emission. Without this, async functions silently miscompiled
-             * unproven `arr[i]` accesses — the warning claimed an auto-guard
-             * was inserted, but the async emission loop only called
-             * emit_ir_inst (no emit_auto_guards). The guard now fires the
-             * same way as the regular path; emit_auto_guard_return_body
-             * emits `self->_zer_state = -1; return 1;` for async returns. */
-            IRInst *ins = &bb->insts[ii];
-            emit_line_map(e, saved_source, ins->source_line, &last_mapped_line);
-            if (ins->expr) {
-                IROpKind k = ins->op;
-                /* Audit-fix (2026-06-30): paired with the regular-path gate
-                 * widening — IR_AWAIT carries the await condition's array
-                 * indexing re-emitted per-poll; IR_NOP carries spawn args. */
-                /* BUG-952 (refactor M, the ordering half): IR_LOCK belongs in this
-                 * gate too. It carries the SHARED ROOT expression, and that root can
-                 * be INDEXED — `arr[i].v = 1` on a `shared struct S[4]`. Without it
-                 * the guard was emitted before the ASSIGN, which is INSIDE the lock,
-                 * so the emitted C read:
-                 *
-                 *   pthread_mutex_lock(&(_zer_bounds_check(i,4,…), arr)[i]._zer_mtx);
-                 *   if ((size_t)(i) >= 4u) { _zer_trap("…inside a held lock…"); }
-                 *
-                 * — the lock's own bounds check traps first, and even reaching the
-                 * guard it could only trap, because a lock is held and returning
-                 * would leak it. Measured: exit 133 on a program whose guard should
-                 * have taken a clean early return. Guarding the LOCK emits the check
-                 * BEFORE the lock, where the early return is still legal.
-                 *
-                 * This is the gate defect M exists to remove, and IR_LOCK is a
-                 * measured instance of it: an op kind carrying a guardable expr that
-                 * nobody had added. The list is hand-maintained and has been widened
-                 * reactively three times now (2026-05-03/06 async, 2026-06-30
-                 * AWAIT/NOP, and this). */
-                if (ir_op_takes_auto_guards(k)) {
-                    emit_auto_guards(e, ins->expr);
-                }
-            }
-            emit_ir_inst(e, ins, func);
+            /* Audit-fix (2026-05-03/06): the async loop mirrors the regular path's
+             * auto-guard emission — one helper now, so the two cannot drift. */
+            emit_ir_inst_guarded(e, &bb->insts[ii], func, saved_source,
+                                 &last_mapped_line);
         }
     }
 
     e->source_file = saved_source;
+    e->ir_src_file = sv_ir_src;
+    e->ir_last_line = sv_ir_last;
     e->current_func_ret = saved_ret;
     emit(e, "    } self->_zer_state = -1; return 1;\n");
     emit(e, "}\n\n");

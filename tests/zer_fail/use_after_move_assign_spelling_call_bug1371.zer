@@ -1,0 +1,12 @@
+// expect-error: is transferred
+// BUG-1371: `z = eat(a);` with a move struct — the move into the callee was
+// never applied for the assign spelling, so `a.k` after it compiled.
+move struct Tok { u32 k; }
+u32 eat(Tok t) { return t.k; }
+u32 main() {
+    Tok a;
+    a.k = 3;
+    u32 z = 0;
+    z = eat(a);
+    return a.k + z;
+}

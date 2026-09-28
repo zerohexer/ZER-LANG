@@ -1,0 +1,10 @@
+// expect-error: spawn target 'w' accesses non-shared global 'g'
+// BUG-1310: the callback is bound in a const GLOBAL struct's initializer. The
+// read of `ops` was exempt (const) and nothing followed `ops.f()` — TSan
+// reported the race on `g`.
+u32 g;
+void set() { for (u32 i = 0; i < 100000; i += 1) { g = g + 1; } }
+struct Ops { *() f; }
+const Ops ops = { .f = set };
+void w() { ops.f(); }
+u32 main() { spawn w(); for (u32 i = 0; i < 100000; i += 1) { g = g + 1; } return 0; }

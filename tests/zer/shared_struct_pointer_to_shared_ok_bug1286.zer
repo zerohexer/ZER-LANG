@@ -1,0 +1,8 @@
+shared struct Inner { u32 n; }
+shared struct S { ?*Inner p; u32 k; }
+Inner in;
+S s;
+u32 main() {
+    s.p = &in;
+    return 0;
+}

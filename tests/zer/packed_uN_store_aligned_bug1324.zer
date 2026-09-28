@@ -1,0 +1,12 @@
+// BUG-1324: regression (see BUGS-FIXED.md).
+// UBSan: store to misaligned address for type 'uint16_t'. Emitter writes the uN
+// field through `__typeof__(p.w) *np = &(p.w)` — a misaligned pointer into a packed
+// struct, which ZER itself forbids users to form (BUG-972). Hard-faults on strict-align targets.
+packed struct P { u8 a; u12 w; }
+u32 main() {
+    P p;
+    p.w = 4095;
+    p.w += 1;
+    if (p.w != 0) { return 1; }
+    return 0;
+}

@@ -1,0 +1,3 @@
+// expect-error: unterminated 'asm('
+// BUG-1387: a quote at end of file inside asm( read past the source buffer (ASan).
+void f(){asm(x'

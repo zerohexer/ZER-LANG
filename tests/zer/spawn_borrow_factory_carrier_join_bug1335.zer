@@ -1,0 +1,15 @@
+// BUG-1335 boundary: a struct carrier built by a factory points at g; g is
+// read only after the join.
+u32 g;
+u32 other;
+struct H { *u32 p; }
+H mk() { H h = { .p = &g }; return h; }
+void w(H h) { *h.p += 42; }
+u32 main() {
+    H h = mk();
+    ThreadHandle th = spawn w(h);
+    other = 1;
+    th.join();
+    if (g != 42) { return 1; }
+    return 0;
+}

@@ -50,6 +50,23 @@ typedef struct {
     const char *source;     /* source text for error display (NULL = skip source line) */
     int error_count;
     int warning_count;
+    /* BUG-1386: >0 while the checker types something SPECULATIVELY (a const
+     * initializer typed on demand at registration). Diagnostics are counted in
+     * diag_quiet_hits instead of being reported; the pass that owns the node
+     * checks it again later and reports for real. */
+    int diag_quiet;
+    int diag_quiet_hits;
+    /* BUG-1398: the function whose body the shared-types summary is scanning
+     * (so a param-rooted access can name its parameter), and — while one
+     * statement is checked for lock order across its calls — the instances it
+     * locks directly (malloc'd, per statement). */
+    Node *fsc_scan_func;
+    Node *lockchk_func;   /* BUG-1398: the function whose statements are lock-checked */
+    struct LockInst { uint32_t type_id; uint8_t kind; const char *name; uint32_t len; } *lockchk_roots;
+    int lockchk_root_n, lockchk_root_cap;
+    bool lockchk_collect_roots;
+    Node *lockchk_hazard_call;
+    uint32_t lockchk_hazard_type;
     Type *current_func_ret; /* return type of current function (for return stmt checking) */
     Node *current_func_node; /* NODE_FUNC_DECL being checked — keep inference (Site 1) */
     Type *current_func_sig;  /* its signature Type* — writable param_keeps for inference */
@@ -171,6 +188,16 @@ typedef struct {
     int auto_slab_count;
     int auto_slab_capacity;
     int target_ptr_bits;  /* target pointer width in bits (default 32 for embedded) */
+    int target_access_bits; /* BUG-1375: widest single (untearable) access; <= target_ptr_bits */
+    /* BUG-1372: AST nodes ir_lower rewrote IN PLACE to name a hoisted temp,
+     * with their original contents, keyed on the function lowered. A function
+     * lowered again (the zercheck shim, then the emitter) is restored first, so
+     * every lowering hoists from the program as written. */
+    struct ZerHoistUndo { Node *node; Node *func; Node saved; } *hoist_undo;
+    /* BUG-1377: the switched union is reached THROUGH a pointer (`switch (pw.u)`),
+     * so a write to any object of a type holding the union may be the same bytes. */
+    bool union_switch_via_ptr;
+    int hoist_undo_n, hoist_undo_cap;
     /* Fix #4 (2026-05-02): @probe behavior selector via --probe-mode flag.
      *   0 = HOSTED (default) — install signal handler, return null on fault
      *   1 = RAW              — direct read, no fault recovery (freestanding ok)
@@ -348,6 +375,12 @@ typedef struct {
      * function. */
     Symbol **lent_globals;
     int lent_global_count, lent_global_cap;
+    /* BUG-1276: globals a RUNNING scoped thread writes inside a @once block, and
+     * which @once node owns each. While the spawn window is open the parent may
+     * touch them only inside that same @once (directly or through a callee). */
+    struct OnceLent { Symbol *g; Node *once; int line; } *once_lent;
+    int once_lent_count, once_lent_cap;
+    Node *cur_once_node;   /* innermost @once being checked (NULL outside) */
     /* BUG-980: the mirror of lockchk_direct_only — collect ONLY what the
      * statement's CALLEES touch, skipping its own direct accesses. Intersecting
      * the two sets is what makes same-type re-entry visible: the full pass
@@ -358,6 +391,26 @@ typedef struct {
     bool lockchk_callee_only;
     bool lockchk_saw_opaque_call;
     bool in_amp;              /* A6-full: true while checking the operand of `&` — a global under `&` is an address-take, not a plain value read */
+    /* BUG-1269: the ONE identifier node that is the root of an `Arena.over(x)`
+     * / `free(x)` argument being checked — the only mention of an arena's
+     * backing store the ownership rule allows. */
+    Node *arena_backing_exempt;
+    bool arena_backing_scanned;   /* the whole-program global scan ran */
+    /* this function's locals handed to Arena.over, with the arena they back */
+    struct ArenaBackingName { const char *name; uint32_t len; const char *arena;
+                              uint32_t alen; int line; } *fn_arena_backing;
+    int fn_arena_backing_n, fn_arena_backing_cap;
+    /* BUG-1281: parameters a function turns into an arena backing store —
+     * `Arena.over(p)`, directly or by forwarding p to such a parameter. Keyed on
+     * the FUNC_DECL node (both symbols of a module function share it). A call
+     * hands its argument's buffer to the arena: the caller's buffer is consumed. */
+    struct ArenaConsume { Node *fn; bool *param; int n; } *arena_consume;
+    int arena_consume_n, arena_consume_cap;
+    /* BUG-1271: container provenance of a POINTER FIELD / ELEMENT of a local
+     * (`H h = { .q = &ls[0] };` -> "h.q" is a whole object). Per function. */
+    struct CProvEntry { const char *key; uint32_t len; int kind; Type *st;
+                        const char *fn; uint32_t fl; } *cprov_map;
+    int cprov_n, cprov_cap;
     bool in_atomic_intrinsic_arg; /* A6-full slice 4: true while checking the TARGET arg (arg0) of an @atomic_* — that &g is the BLESSED atomic access; any OTHER &atomic_cell launders it */
     bool in_once;       /* B4: true while checking a @once body — control flow (return/break/continue/goto) that exits the body would skip the winner's one-time-done publish and hang threads waiting on @once */
     bool in_comptime_body; /* true when checking comptime function body — skip comptime arg validation */
@@ -404,8 +457,30 @@ typedef struct {
     struct AtomicPlainWrite {
         struct Symbol *sym;
         int line;
+        /* BUG-1284: `&g` handed straight to param `via_argi` of `via_callee` —
+         * not a launder when that param is only used atomically. */
+        struct Symbol *via_callee;
+        int via_argi;
     } *atomic_plain_writes;
+    Node *field_obj_node;            /* BUG-1295: the object of the NODE_FIELD / NODE_INDEX being checked */
+    struct Symbol *amp_arg_callee;   /* the call whose argument is being checked */
+    int amp_arg_index;
     int atomic_plain_write_count;
+    /* BUG-1284: every pointer argument of a direct call — the global it may
+     * reach, or the caller's param it forwards — resolved against the callees'
+     * atomic_param_mask after all bodies are checked. */
+    struct AtomicArgRec { Symbol *callee; int argi; Symbol *g; Symbol *caller;
+                          int caller_param; } *atomic_args;
+    int atomic_arg_n, atomic_arg_cap;
+    /* BUG-1303: direct calls passing one object as two pointer arguments. */
+    struct AliasCallRec { Symbol *callee; int line; int argc;
+                          const char **roots; uint32_t *root_lens; } *alias_calls;
+    int alias_call_n, alias_call_cap;
+    /* BUG-1303: calls forwarding the caller's params (for the pair fixpoint). */
+    struct ParamFwdRec { Symbol *caller; Symbol *callee; int argc; signed char *pparam; }
+        *param_fwds;
+    int param_fwd_n, param_fwd_cap;
+    uint64_t lent_param_live_mask;   /* params lent to a still-live scoped thread */
     int atomic_plain_write_capacity;
 
     /* A6-full slice 3: struct-field atomic cells `@atomic_*(&s.f)` on a plain
@@ -505,6 +580,13 @@ typedef struct {
         uint32_t *type_ids;     /* array of shared struct type_ids */
         int type_count;
         int type_capacity;
+        /* BUG-1398: per type_ids[i], WHICH instance of that type the function
+         * locks: a named global, the pointee of pointer parameter inst_param[i],
+         * or any (unknown / several / a local). Grown with type_ids. */
+        uint8_t *inst_kind;
+        const char **inst_name;
+        uint32_t *inst_name_len;
+        int *inst_param;
         bool computed;          /* true if DFS completed (memoized) */
         bool in_progress;       /* true during DFS (cycle detection) */
     } **func_shared_cache;  /* BUG-949: array of POINTERS to individually
@@ -556,6 +638,10 @@ enum { ANW_ASSIGN = 0, ANW_ADDR = 1, ANW_OPAQUE = 2 };
 typedef bool (*AstNameWriteFn)(Node *value, int kind, void *ud);
 bool ast_name_writes(Node *n, const char *name, uint32_t len, AstNameWriteFn fn, void *ud);
 int ast_name_bind_count(Node *n, const char *name, uint32_t len);   /* BUG-1055 */
+/* BUG-1366: is this GLOBAL never assigned or address-taken anywhere in the
+ * program (every registered body AND every global initializer)? The one query
+ * anything trusting a global's declaration initializer asks. */
+bool checker_global_never_mutated(Checker *c, Symbol *sym);
 /* BUG-847/849: deferred resource-initialisation check. Runs after ALL module
  * bodies, so a resource declared in one module and initialised in another is
  * seen. Covers Arena backing stores and Barrier targets. */

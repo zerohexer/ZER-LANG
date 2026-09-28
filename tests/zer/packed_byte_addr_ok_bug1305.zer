@@ -1,0 +1,22 @@
+// BUG-1305: the address of an alignment-ONE member of a packed struct is accepted —
+// a u8 field, an element of a u8 array field, a struct of bytes. Such a pointer can
+// never be misaligned. (Was pinned as a deliberate over-rejection by BUG-972 in
+// tests/zer_fail/packed_u8_array_elem_addr.zer.) The hazards stay refused:
+// tests/zer_fail/packed_array_elem_addr.zer (a u32 element) and the u32 field forms.
+struct Bytes { u8 m; u8 n; }
+packed struct P { u8 a; u32 x; u8 b; u8[4] w8; Bytes bs; }
+P p;
+u32 main() {
+    *u8 q = &p.b;
+    *q = 7;
+    *u8 r = &p.w8[1];
+    *r = 3;
+    *Bytes s = &p.bs;
+    s.m = 2;
+    u8 t = @atomic_load(&p.b);
+    if (p.b != 7) { return 1; }
+    if (p.w8[1] != 3) { return 2; }
+    if (p.bs.m != 2) { return 3; }
+    if (t != 7) { return 4; }
+    return 0;
+}

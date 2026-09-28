@@ -1,0 +1,15 @@
+// BUG-1403: a Ring shared by an interrupt handler and main is accepted only when
+// EVERY main-side operation is inside @critical — here one pop is not.
+// expect-error: is used from both interrupt and main code
+Ring(u8, 16) rx_buf;
+u32 main() {
+    u32 n = 0;
+    @critical {
+        if (rx_buf.pop()) |b| { n += (u32)b; }
+    }
+    if (rx_buf.pop()) |b| { n += (u32)b; }
+    return n;
+}
+interrupt USART1 {
+    rx_buf.push(7);
+}

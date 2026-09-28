@@ -152,7 +152,9 @@ make_prelude() {
 
 # A block is "top-level" if any line starts a declaration we can compile directly.
 is_toplevel() {
-    grep -qE '^[[:space:]]*(struct|union|enum|container|move|shared|packed|typedef|import|cinclude|mmio|const|volatile|threadlocal|comptime|async|naked|interrupt|Pool\(|Slab\(|Ring\(|Arena|Semaphore\(|Barrier)[[:space:](]' "$1" && return 0
+    grep -qE '^[[:space:]]*(struct|union|enum|container|move|shared|packed|typedef|import|cinclude|mmio|const|volatile|threadlocal|comptime|async|naked|interrupt|distinct|Arena|Barrier)[[:space:](]' "$1" && return 0
+    # a container global: `Pool(Task, 8) p;` — the type argument follows the `(` directly
+    grep -qE '^[[:space:]]*(Pool|Slab|Ring|Semaphore)\(' "$1" && return 0
     # a function DEFINITION at column 0: `... ident(...) {`
     grep -qE '^[A-Za-z_?*\[].*\)[[:space:]]*\{[[:space:]]*$' "$1" && return 0
     # ... or a one-line one: `u32 f(u32 n) { return n; }` — a column-0 statement

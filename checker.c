@@ -30818,6 +30818,7 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
             } else {
                 g->from_func = true;
                 if (is_compound) g->compound_in_func = true;
+                if (c->critical_depth == 0) g->uncritical_in_func = true;   /* BUG-1403 */
             }
             return;
         }
@@ -30843,6 +30844,7 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
     } else {
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
+        if (c->critical_depth == 0) g->uncritical_in_func = true;   /* BUG-1403 */
     }
 }
 
@@ -32400,7 +32402,18 @@ static void check_interrupt_safety(Checker *c) {
             continue;
         }
         TypeKind gk = type_dispatch_kind(sym->type);
-        if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
+        /* BUG-1403: the multi-step update cannot be split when EVERY regular-code
+         * access sits inside @critical (interrupts are off for its duration) and
+         * only ONE interrupt handler touches it (a handler is not interrupted by
+         * regular code; a second handler could preempt the first). That is the
+         * canonical UART-RX shape — the handler pushes, main pops under
+         * @critical — and the one this diagnostic's advice could not reach. The
+         * same exemption BUG-1059c gives a volatile RMW. */
+        bool all_main_critical = g->from_func && !g->uncritical_in_func && !g->multi_isr;
+        if ((gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
+             gk == TYPE_ARENA) && all_main_critical) {
+            /* accepted: every regular-code operation is interrupt-atomic */
+        } else if (gk == TYPE_POOL || gk == TYPE_RING || gk == TYPE_SLAB ||
             gk == TYPE_ARENA) {
             /* BUG-1059g: "declare it volatile" was the advice here, and following
              * it produced a second error ("not a single-word scalar") — the
@@ -32411,8 +32424,9 @@ static void check_interrupt_safety(Checker *c) {
                 "'%.*s' (%s) is used from both interrupt and %s code — its "
                 "internal bookkeeping is updated in several non-atomic steps, so an "
                 "interrupt landing mid-operation corrupts it, and 'volatile' cannot "
-                "fix that. Give each context its own, or hand values across in a "
-                "volatile single-word variable / @atomic_* cell",
+                "fix that. Do every non-interrupt operation on it inside @critical "
+                "(with one interrupt handler using it), give each context its own, "
+                "or hand values across in a volatile single-word variable / @atomic_* cell",
                 (int)g->name_len, g->name, type_name(sym->type), other);
         } else if (!sym->is_volatile) {
             checker_error(c, sym->line,

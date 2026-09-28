@@ -434,6 +434,7 @@ typedef struct {
         const Node *first_isr_body;
         bool multi_isr;
         bool compound_in_func;  /* compound assign in regular func */
+        bool uncritical_in_func; /* BUG-1403: a regular-code access OUTSIDE @critical */
         /* BUG-1046: passed BY POINTER to a call whose target the analysis cannot
          * see (a function-pointer callee). That call may read-modify-write it;
          * "did not look" must not read as "no RMW", but the sentence must not

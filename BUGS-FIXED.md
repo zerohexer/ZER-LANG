@@ -320,6 +320,13 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   Tests: 13 `tests/zer_fail/*_bug146[0-5].zer`, `tests/zer/passthrough_call_effects_bug1460.zer`,
   `slot_view_spellings_bug1461.zer`; SHAPES p64 (31 cells) and p65 (16 cells) — 33 HOLE + 1
   OVER-REJECT pre-fix.
+- **BUG-1466 — copying a WHOLE global aggregate into a local dropped the allocations its
+  fields hold.** `gs.p = a; free(a); S v = gs; if (v.p) |q| { q.v }` read a recycled object
+  (and `S v; v = gs;` the same): `ir_carry_projection` carried a field / element source
+  only; a bare global ident now carries its `(IR_GLOBAL_ROOT_ID, "gs.…")` rows (a local
+  source already took `ir_carry_compounds`). Tests:
+  `tests/zer_fail/global_aggregate_copy{,_assign}_uaf_bug1466.zer`,
+  `tests/zer/global_aggregate_copy_live_bug1466.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

@@ -1,0 +1,17 @@
+// BUG-1466: the assignment spelling of the whole-global copy.
+// expect-error: use after free
+struct T { u32 v; }
+struct S { ?*T p; u32 k; }
+S gs;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 5;
+    gs.p = a;
+    free(a);
+    u32 r = 0;
+    S v;
+    v = gs;
+    if (v.p) |q| { r = q.v; }
+    gs.p = null;
+    return r;
+}

@@ -1,0 +1,6 @@
+// BUG-1406: @bitcast skipped its width check when a size was unknown — an Arena
+// reinterpreted as a 512-byte struct read 512 bytes out of a small object.
+// expect-error: @bitcast needs both sizes known at compile time
+struct Big { u64[64] w; }
+Arena ar;
+u32 main() { Big b = @bitcast(Big, ar); return (u32)b.w[63]; }

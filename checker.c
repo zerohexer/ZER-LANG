@@ -18536,6 +18536,21 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         checker_error(c, node->loc.line,
                             "@bitcast requires same-width types (target %d bits, source %d bits)", tw, vw);
                     }
+                    /* BUG-1406: an UNKNOWN width is not a pass. `compute_type_size`
+                     * fails for an Arena / Barrier / Semaphore / async task, and the
+                     * check above was skipped, so `Big b = @bitcast(Big, ar);`
+                     * memcpy'd 512 bytes out of a 40-byte object (ASan
+                     * stack-buffer-overflow). A width the checker cannot compute
+                     * cannot be proven equal — round toward reject. */
+                    else if (result && val_type && (tw <= 0 || vw <= 0) &&
+                             type_dispatch_kind(result) != TYPE_VOID &&
+                             type_dispatch_kind(val_type) != TYPE_VOID) {
+                        checker_error(c, node->loc.line,
+                            "@bitcast needs both sizes known at compile time ('%s' / '%s') — "
+                            "a runtime resource (Arena, Barrier, Semaphore, async task) has no "
+                            "bit pattern to reinterpret",
+                            type_name(result), type_name(val_type));
+                    }
                     /* BUG-341: volatile stripping via @bitcast (same as @ptrcast BUG-258) */
                     check_volatile_strip(c, node->intrinsic.args[0], val_type, result,
                                          node->loc.line, "@bitcast");

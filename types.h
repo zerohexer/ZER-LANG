@@ -465,6 +465,15 @@ struct Symbol {
      * test_firmware_patterns for >4 minutes. */
     bool rmw_summary_done;
     uint64_t rmw_param_mask;
+    /* BUG-1481: the MEMORY-MAPPED half of the same summary — every write this
+     * function makes THROUGH a pointer parameter, as a byte span relative to the
+     * pointer (`void setb(volatile *Regs u){ u.ctrl |= 2; }` -> param 0, bytes
+     * 0..3, RMW). Computed in the same pass as rmw_param_mask; a call site adds the
+     * argument's constant MMIO address. mmio_pw_done stays false while the walk
+     * is in progress, which a caller reads as "unknown" (conservative). */
+    struct MmioParamWrite { int param; uint64_t lo, hi; bool rmw; } *mmio_pw;
+    int mmio_pw_count;
+    bool mmio_pw_done;
 
     /* module prefix for name mangling (NULL = main module) */
     const char *module_prefix;
@@ -486,6 +495,14 @@ struct Scope {
     uint32_t symbol_count;
     uint32_t symbol_capacity;
     const char *module_name; /* non-NULL for module-level scopes */
+    /* BUG-1487: a hash index over `symbols`, built once the scope is large (a
+     * scan per lookup made a function with N locals cost N^2: 20,000 local
+     * declarations spent most of their time in scope_lookup_local / scope_add).
+     * Open addressing, power-of-two `hidx_cap` slots, symbols[0 .. hidx_n)
+     * inserted; the FIRST symbol with a name wins, as the scan did. Heap-owned. */
+    Symbol **hidx;
+    uint32_t hidx_cap;
+    uint32_t hidx_n;
 };
 
 /* ================================================================

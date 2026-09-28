@@ -357,6 +357,41 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   `union_volatile_path_remedy_bug1470`, `volatile_single_eval_forms_bug1471`,
   `shared_lock_root_volatile_bug1474`, `shared_rw_alias_group_bug1475`,
   `cond_wait_outside_lock_bug1476`.
+- **BUG-1480 / BUG-1481 — the ISR/main MMIO read-modify-write rule missed an INDEXED
+  register and a register written through a HELPER'S PARAMETER.** `u[1] |= …` on both sides
+  (the BUG-1358 key handled a pointer base only for a field and a deref), and `setb(volatile
+  *Regs u) { u.ctrl |= 2; }` called from the handler and from main, each forming the pointer
+  locally — both lost-update races on real hardware, accepted. A register write is now a
+  BYTE SPAN of the constant address space (`mmio_lvalue_span`, `mmio_ptr_base`), two writes
+  meet when their spans overlap (a non-constant index spans to the end of its mmio range),
+  checked by `check_mmio_register_sharing` over `Checker.mmio_accesses`; a per-function
+  summary `Symbol.mmio_pw` carries writes through parameters to the call site, and the
+  handler-side walk binds each parameter to its argument's address. Also: a helper declared
+  after the handler, and the written-out `u.ctrl = u.ctrl | 1`. Tests: four
+  `tests/zer_fail/isr_mmio_register_rmw_*_bug148{0,1}.zer`; an MMIO REGISTER grid in
+  `tests/test_hw_matrix.c` (18 cells, 13 failing pre-fix).
+- **BUG-1482 — a global initializer naming a LATER global failed at GCC** (`*u32 p = &g;
+  u32 g = 42;`, also `@ptrtoint(&g)`, a slice of a later array, cycles). The emitter writes
+  a C tentative declaration of every later global an initializer names
+  (`emit_forward_global_refs`).
+- **BUG-1483** — a bodyless `async void f();` with no definition was accepted and failed at
+  GCC; now a checker error (a forward declaration completed later still works).
+- **BUG-1484 — zerc crashed on a long operator chain** (a 400,000-term `a + a + …`
+  segfaulted after the checker's own depth error; with a 1 MB stack, 900 terms crashed
+  below the checker's limit). The parser stamps each expression with its height
+  (`Node.parse_height`) and bounds binary / orelse / assignment chains, unary operators and
+  postfix call / field / index / slice chains together with nesting at 256, reporting once.
+  (`tests/zer_fail/leak_handle_300_structs_deep.zer` was rewritten to reach its 300-deep
+  type walk without a 300-deep field ACCESS.)
+- **BUG-1486 / BUG-1487 — compile time was quadratic in statement count** (100,000 `x = x
+  + 1;` took over 150 s; 20,000 switch arms or ifs timed out). A per-function name index
+  behind `ir_find_local` / `ir_add_local` that keeps the "last visible, else last" rule;
+  first-match lookups in the emitter; `ir_validate`'s duplicate-id check by sort; lazily
+  computed guard sets in zercheck_ir; a hash index for large checker scopes (`Scope.hidx`).
+  100,000 statements now take ~1 s.
+  Tests (1482..1484): `tests/zer/global_init_forward_ref_bug1482.zer`,
+  `async_forward_decl_bug1483.zer`, `long_chains_under_limit_bug1484.zer`;
+  `tests/zer_fail/async_bodyless_decl_bug1483.zer`, `parser_long_{add,field}_chain_bug1484.zer`.
 - **BUG-1403 (relaxation) — a Ring / Pool / Slab / Arena shared with ONE interrupt handler
   is accepted when every main-side operation is inside `@critical`.** The rule refused the
   canonical UART-RX shape (the handler pushes, main pops) even under `@critical`, whose

@@ -250,6 +250,11 @@ typedef struct {
      * "Level B guarded-refinement support" and
      * proofs/operational/lambda_zer_handle/handle_flow_lattice.v Level B. */
     void *gr_block_guards;
+    /* BUG-1486: the function the guard sets belong to — they are computed on the
+     * FIRST query (most functions never reach a MAYBE_FREED decision, and the
+     * computation is quadratic in branches: 20,000 switch arms took 113 s). */
+    void *gr_func;
+    bool gr_block_guards_done;
     int gr_block_count;
     int gr_cur_block;
 } ZerCheck;

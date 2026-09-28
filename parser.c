@@ -1157,6 +1157,99 @@ static Node *parse_primary(Parser *p) {
     return new_node(p, NODE_NULL_LIT);
 }
 
+/* ---- BUG-1484: AST height bound ----
+ *
+ * The recursion guard (p->depth, limit 256) counts the PARSER's recursion, and a
+ * left-associative chain is parsed by a LOOP: `a + a + ... + a` (400,000 terms)
+ * nests the AST 400,000 deep while p->depth never passes 2, and so do the
+ * postfix chains `x.f.f.f`, `t[t[...]]`, `f()()()`. Every later walker —
+ * checker, zercheck_ir, ir_lower, emitter — recurses over that tree, so the
+ * checker's own "expression nesting too deep (limit 1000)" fired and the next
+ * walk segfaulted; on a 1 MB stack (a Windows main thread) 900 terms crashed in
+ * check_expr, below that limit. The PARSER is the one place that sees every
+ * expression before anything walks it, so the bound lives here and is the SAME
+ * bound the recursion guard enforces: p->depth (what encloses the node — block
+ * and expression nesting) plus the node's own subtree height may not exceed
+ * PARSE_NEST_LIMIT. Measured: a 256-deep expression checks and emits on a
+ * `ulimit -s 1024` stack with the -O2 compiler (the chain crashed at ~900). */
+#define PARSE_NEST_LIMIT 256
+static uint32_t pnode_height(Node *n);
+static uint32_t pnode_max(uint32_t a, uint32_t b) { return a > b ? a : b; }
+/* Height of a subtree, computed once and cached. Only descends nodes that were
+ * not stamped as they were built (literals, primaries, statement bodies of an
+ * orelse block), whose children were stamped by their own parse_precedence. */
+static uint32_t pnode_height(Node *n) {
+    if (!n) return 0;
+    if (n->parse_height) return n->parse_height;
+    uint32_t h = 0;
+    #define PH(x) do { h = pnode_max(h, pnode_height(x)); } while (0)
+    switch (n->kind) {
+    case NODE_BLOCK: for (int i = 0; i < n->block.stmt_count; i++) PH(n->block.stmts[i]); break;
+    case NODE_IF: PH(n->if_stmt.cond); PH(n->if_stmt.then_body); PH(n->if_stmt.else_body); break;
+    case NODE_FOR: PH(n->for_stmt.init); PH(n->for_stmt.cond); PH(n->for_stmt.step); PH(n->for_stmt.body); break;
+    case NODE_WHILE: case NODE_DO_WHILE: PH(n->while_stmt.cond); PH(n->while_stmt.body); break;
+    case NODE_SWITCH:
+        PH(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) PH(n->switch_stmt.arms[i].body);
+        break;
+    case NODE_RETURN: PH(n->ret.expr); break;
+    case NODE_DEFER: PH(n->defer.body); break;
+    case NODE_EXPR_STMT: PH(n->expr_stmt.expr); break;
+    case NODE_VAR_DECL: case NODE_GLOBAL_VAR: PH(n->var_decl.init); break;
+    case NODE_CRITICAL: PH(n->critical.body); break;
+    case NODE_ONCE: PH(n->once.body); break;
+    case NODE_SPAWN: for (int i = 0; i < n->spawn_stmt.arg_count; i++) PH(n->spawn_stmt.args[i]); break;
+    case NODE_AWAIT: PH(n->await_stmt.cond); break;
+    case NODE_STATIC_ASSERT: PH(n->static_assert_stmt.cond); break;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) PH(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) PH(n->asm_stmt.outputs[i].expr);
+        break;
+    case NODE_BINARY: PH(n->binary.left); PH(n->binary.right); break;
+    case NODE_UNARY: PH(n->unary.operand); break;
+    case NODE_ASSIGN: PH(n->assign.target); PH(n->assign.value); break;
+    case NODE_CALL:
+        PH(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) PH(n->call.args[i]);
+        break;
+    case NODE_FIELD: PH(n->field.object); break;
+    case NODE_INDEX: PH(n->index_expr.object); PH(n->index_expr.index); break;
+    case NODE_SLICE: PH(n->slice.object); PH(n->slice.start); PH(n->slice.end); break;
+    case NODE_ORELSE: PH(n->orelse.expr); PH(n->orelse.fallback); break;
+    case NODE_INTRINSIC: for (int i = 0; i < n->intrinsic.arg_count; i++) PH(n->intrinsic.args[i]); break;
+    case NODE_TYPECAST: PH(n->typecast.expr); break;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) PH(n->struct_init.fields[i].value);
+        break;
+    /* declarations never sit inside an expression; leaves have no children */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        break;
+    }
+    #undef PH
+    n->parse_height = h < UINT32_MAX ? h + 1 : h;
+    return n->parse_height;
+}
+/* Stamp a node the parser just built from `a` and `b` (either may be NULL).
+ * Returns false — after reporting once — when it would nest past the limit; the
+ * caller then keeps its previous subtree instead, so the tree never grows past
+ * the bound while the rest of the chain is still consumed. */
+static bool pnode_stamp(Parser *p, Node *n, uint32_t child_h) {
+    uint32_t h = child_h + 1;
+    if ((uint32_t)(p->depth > 0 ? p->depth : 0) + h > PARSE_NEST_LIMIT) {
+        error(p, "expression nesting too deep (limit 256) — a chain of operators, "
+                 "field accesses, indexes or calls nests as deeply as parentheses; "
+                 "split it with intermediate variables");
+        return false;
+    }
+    n->parse_height = h;
+    return true;
+}
+
 /* ---- Unary expressions ---- */
 
 static Node *parse_postfix(Parser *p, Node *left); /* forward decl */
@@ -1186,6 +1279,8 @@ static Node *parse_unary_inner(Parser *p) {
         Node *n = new_node(p, NODE_UNARY);
         n->unary.op = op;
         n->unary.operand = parse_unary(p);
+        if (!pnode_stamp(p, n, pnode_height(n->unary.operand)))   /* BUG-1484 */
+            return n->unary.operand;
         return n;
     }
     /* parse_primary then postfix (. [] () ) so that &x.field = &(x.field) */
@@ -1238,6 +1333,11 @@ static Node *parse_postfix(Parser *p, Node *left) {
                 n->call.args = (Node **)arena_alloc(p->arena, arg_count * sizeof(Node *));
                 memcpy(n->call.args, args, arg_count * sizeof(Node *));
             }
+            {   /* BUG-1484 */
+                uint32_t ch = pnode_height(left);
+                for (int ai = 0; ai < arg_count; ai++) ch = pnode_max(ch, pnode_height(args[ai]));
+                if (!pnode_stamp(p, n, ch)) continue;
+            }
             left = n;
             continue;
         }
@@ -1249,6 +1349,7 @@ static Node *parse_postfix(Parser *p, Node *left) {
             n->field.object = left;
             n->field.field_name = tok_text(&p->previous);
             n->field.field_name_len = tok_len(&p->previous);
+            if (!pnode_stamp(p, n, pnode_height(left))) continue;   /* BUG-1484 */
             left = n;
             continue;
         }
@@ -1264,6 +1365,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
                 n->slice.start = NULL;
                 n->slice.end = parse_expression(p);
                 consume(p, TOK_RBRACKET, "expected ']' after slice");
+                if (!pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                                 pnode_height(n->slice.end)))) continue;   /* BUG-1484 */
                 left = n;
                 continue;
             }
@@ -1279,6 +1382,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
                     n->slice.end = parse_expression(p);
                 }
                 consume(p, TOK_RBRACKET, "expected ']' after slice");
+                if (!pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_max(
+                        pnode_height(first), pnode_height(n->slice.end))))) continue;   /* BUG-1484 */
                 left = n;
                 continue;
             }
@@ -1288,6 +1393,8 @@ static Node *parse_postfix(Parser *p, Node *left) {
             n->index_expr.object = left;
             n->index_expr.index = first;
             consume(p, TOK_RBRACKET, "expected ']' after index");
+            if (!pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_height(first))))
+                continue;   /* BUG-1484 */
             left = n;
             continue;
         }
@@ -1335,7 +1442,9 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
                 /* orelse value */
                 n->orelse.fallback = parse_precedence(p, PREC_ORELSE);
             }
-            left = n;
+            if (pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                            pnode_height(n->orelse.fallback))))   /* BUG-1484 */
+                left = n;
             left = parse_postfix(p, left);
             continue;
         }
@@ -1347,7 +1456,9 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
             n->assign.op = op;
             n->assign.target = left;
             n->assign.value = parse_precedence(p, PREC_ASSIGN);
-            left = n;
+            if (pnode_stamp(p, n, pnode_max(pnode_height(left),
+                                            pnode_height(n->assign.value))))   /* BUG-1484 */
+                left = n;
             continue;
         }
 
@@ -1363,9 +1474,12 @@ static Node *parse_precedence(Parser *p, Precedence min_prec) {
         n->binary.op = op;
         n->binary.left = left;
         n->binary.right = right;
-        left = n;
+        /* BUG-1484: the loop is how a left-associative chain nests — bound it */
+        if (pnode_stamp(p, n, pnode_max(pnode_height(left), pnode_height(right))))
+            left = n;
     }
 
+    (void)pnode_height(left);   /* BUG-1484: stamp what this level returns */
     p->depth--;
     return left;
 }

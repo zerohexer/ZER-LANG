@@ -1189,6 +1189,15 @@ static IRGuardSet *ir_compute_block_guards(IRFunc *func) {
  *     has the same value at both branches.
  *   - NULL guards / out-of-range blocks / no contradiction → false (→ reject).
  * So a wrong/absent guard can only OVER-reject, never accept an unsafe use. */
+/* BUG-1486: the per-block guard sets, computed on the first query. */
+static IRGuardSet *ir_block_guards_get(ZerCheck *zc) {
+    if (!zc->gr_block_guards_done && zc->gr_func) {
+        zc->gr_block_guards_done = true;
+        zc->gr_block_guards = ir_compute_block_guards((IRFunc *)zc->gr_func);
+    }
+    return (IRGuardSet *)zc->gr_block_guards;
+}
+
 static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
     if (!h || h->state != IR_HS_MAYBE_FREED) return false;
     /* §A #4 SOUNDNESS (2026-07-04): once the handle has been freed on ALL paths
@@ -1201,7 +1210,7 @@ static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
      * is set once coverage completes and propagates monotonically through the
      * CFG merge, so a legit single-free-then-disjoint-use is preserved. */
     if (h->freed_all_paths) return false;
-    if (!zc->gr_block_guards) return false;
+    if (!ir_block_guards_get(zc)) return false;
     int fb = h->free_block;
     int ub = zc->gr_cur_block;
     if (fb < 0 || fb >= zc->gr_block_count) return false;
@@ -1225,7 +1234,7 @@ static bool ir_use_guard_disjoint(ZerCheck *zc, IRHandleInfo *h) {
  * on every path (no enclosing condition can skip both — that case has a count>1
  * guard set and is rejected here, staying a leak). */
 static bool ir_free_completes_coverage(ZerCheck *zc, IRHandleInfo *h) {
-    if (!h || !zc->gr_block_guards) return false;
+    if (!h || !ir_block_guards_get(zc)) return false;
     int fb = h->free_block;
     int ub = zc->gr_cur_block;
     if (fb < 0 || fb >= zc->gr_block_count) return false;
@@ -14536,8 +14545,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
      * read at MAYBE_FREED use sites to recover `if(c){free} if(!c){use}` when the
      * use's guard is disjoint from the free's. Stored on zc for the free/use
      * sites inside ir_check_inst. */
-    IRGuardSet *block_guards = ir_compute_block_guards(func);
-    zc->gr_block_guards = block_guards;
+    /* BUG-1486: computed on first use (ir_block_guards_get) */
+    zc->gr_block_guards = NULL;
+    zc->gr_func = func;
+    zc->gr_block_guards_done = false;
     zc->gr_block_count = func->block_count;
     zc->gr_cur_block = 0;
 
@@ -16341,8 +16352,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
     for (int bi = 0; bi < func->block_count; bi++)
         ir_ps_free(&block_states[bi]);
     free(block_states);
-    free(block_guards);            /* Level B: per-block guard sets */
+    free(zc->gr_block_guards);     /* Level B: per-block guard sets */
     zc->gr_block_guards = NULL;
+    zc->gr_func = NULL;
+    zc->gr_block_guards_done = false;
     zc->gr_block_count = 0;
 
     return zc->error_count == 0;

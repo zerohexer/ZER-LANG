@@ -3,6 +3,7 @@
 #include "src/safety/coerce_rules.h"  /* zer_coerce_* — VST-verified */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <stdarg.h>
 
 /* ================================================================
@@ -735,7 +736,46 @@ bool scope_insert(Arena *a, Scope *s, Symbol *sym) {
     return true;
 }
 
+/* BUG-1487: see Scope.hidx. */
+#define SCOPE_HIDX_MIN 32
+static uint32_t scope_name_hash(const char *s, uint32_t n) {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+static void scope_hidx_put(Scope *s, Symbol *sym) {
+    uint32_t m = s->hidx_cap - 1;
+    for (uint32_t k = scope_name_hash(sym->name, sym->name_len) & m;; k = (k + 1) & m) {
+        Symbol *e = s->hidx[k];
+        if (!e) { s->hidx[k] = sym; return; }
+        if (e->name_len == sym->name_len && memcmp(e->name, sym->name, sym->name_len) == 0)
+            return;   /* first one wins */
+    }
+}
+/* Bring the index up to date; false = not indexed (small, or out of memory). */
+static bool scope_hidx_sync(Scope *s) {
+    if (s->symbol_count < SCOPE_HIDX_MIN) return false;
+    if (!s->hidx || (s->symbol_count + 1) * 2 > s->hidx_cap) {
+        uint32_t cap = s->hidx_cap ? s->hidx_cap : 64;
+        while ((s->symbol_count + 1) * 2 > cap) cap *= 2;
+        Symbol **nt = (Symbol **)calloc(cap, sizeof(Symbol *));
+        if (!nt) return false;
+        free(s->hidx);
+        s->hidx = nt; s->hidx_cap = cap; s->hidx_n = 0;
+    }
+    for (; s->hidx_n < s->symbol_count; s->hidx_n++) scope_hidx_put(s, s->symbols[s->hidx_n]);
+    return true;
+}
+
 Symbol *scope_lookup_local(Scope *s, const char *name, uint32_t name_len) {
+    if (scope_hidx_sync(s)) {
+        uint32_t m = s->hidx_cap - 1;
+        for (uint32_t k = scope_name_hash(name, name_len) & m;; k = (k + 1) & m) {
+            Symbol *e = s->hidx[k];
+            if (!e) return NULL;
+            if (e->name_len == name_len && memcmp(e->name, name, name_len) == 0) return e;
+        }
+    }
     for (uint32_t i = 0; i < s->symbol_count; i++) {
         if (s->symbols[i]->name_len == name_len &&
             memcmp(s->symbols[i]->name, name, name_len) == 0) {

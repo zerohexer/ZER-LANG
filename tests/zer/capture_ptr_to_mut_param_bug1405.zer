@@ -1,0 +1,11 @@
+// BUG-1405: an if-unwrap capture of ?*T is an immutable BINDING with a writable
+// pointee — `t.id += 1` compiled while passing t to a *T parameter was refused.
+struct Task { u32 id; }
+Task gt;
+?*Task find(u32 k) { if (k == 0) { return null; } return &gt; }
+void touch(*Task t) { t.id += 1; }
+u32 main() {
+    ?*Task m = find(1);
+    if (m) |t| { touch(t); t.id += 1; }
+    return gt.id - 2;
+}

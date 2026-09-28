@@ -8138,7 +8138,7 @@ static Symbol *handle_alloc_source_of(Checker *c, Node *v) {
         return NULL;
     Type *ot = typemap_get(c, obj);
     if (!ot) return NULL;
-    if (ot->kind == TYPE_POOL || ot->kind == TYPE_SLAB) {
+    if (type_dispatch_kind(ot) == TYPE_POOL || type_dispatch_kind(ot) == TYPE_SLAB) {
         Symbol *a = scope_lookup(c->current_scope, obj->ident.name, (uint32_t)obj->ident.name_len);
         if (!a) a = global_decl_lookup(c, obj->ident.name, (uint32_t)obj->ident.name_len);
         return a;
@@ -8175,7 +8175,7 @@ static bool handle_src_write_visit(Node *v, int kind, void *ud) {
         memcmp(v->call.callee->field.field_name, "alloc", 5) == 0) {
         Node *o = v->call.callee->field.object;
         Symbol *os = global_decl_lookup(u->c, o->ident.name, (uint32_t)o->ident.name_len);
-        if (os && os->type && (os->type->kind == TYPE_POOL || os->type->kind == TYPE_SLAB))
+        if (os && os->type && (type_dispatch_kind(os->type) == TYPE_POOL || type_dispatch_kind(os->type) == TYPE_SLAB))
             got = os;
         else if (os && os->type && type_dispatch_kind(os->type) == TYPE_STRUCT &&
                  !(os->func_node && (os->func_node->kind == NODE_GLOBAL_VAR ||
@@ -15659,7 +15659,15 @@ static Type *check_expr(Checker *c, Node *node) {
                             Symbol *asym = scope_lookup(c->current_scope,
                                 node->call.args[i]->ident.name,
                                 (uint32_t)node->call.args[i]->ident.name_len);
-                            if (asym && asym->is_const) {
+                            /* BUG-1405: ONLY the distinct form it exists for. On any
+                             * other symbol `is_const` is an immutable BINDING — an
+                             * if-unwrap capture `if (m) |t|` of a `?*T` — whose
+                             * pointee is writable (`t.id = 2` compiles), so passing
+                             * `t` to a `*T` parameter is the same write, not a
+                             * const strip. It was refused, and the refusal was the
+                             * one inconsistent answer. */
+                            if (asym && asym->is_const && asym->type &&
+                                type_unwrap_distinct(asym->type) != asym->type) {
                                 TypeKind ca_pk = type_dispatch_kind(param);
                                 bool param_mut =
                                     (ca_pk == TYPE_POINTER && !ca_par->pointer.is_const) ||

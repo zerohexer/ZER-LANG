@@ -55,6 +55,17 @@ repeated.
 4. A static-local or global initializer `= &tl` (a threadlocal's address) is accepted by
    the checker and refused by GCC ("initializer element is not constant") — loud.
 
+## OPEN — an ARRAY parameter is treated as frame storage by the escape sinks (2026-09-28, LOW — over-rejection)
+
+`[*]u32 head(u32[4] a) { return a[0..2]; }` is refused ("cannot return pointer to local
+'a'"), although an array parameter ALIASES the caller's array (reference.md: an array
+parameter does not copy) — the same shape with a `[*]u32` parameter is accepted
+(BUG-764). Relaxing it is a multi-site change and an accept-unsafe risk: the parameter
+setup does not taint an ARRAY param non-keep (only pointer / slice / opaque / carriers),
+`classify_return_root` must classify the view as ARParam(n) so `g = head(local)` is
+refused at the call site, and every store sink (global, out-param, spawn, Ring) must
+agree. Until then, take a slice parameter.
+
 ## OPEN — residuals of the 2026-09-28 escape fixpoint (BUG-1402; LOW — over-rejection)
 
 The loop / goto / defer join is sound by construction (it only ever ADDS may-taint) and

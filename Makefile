@@ -243,6 +243,8 @@ check: zerc test_lexer test_parser test_parser_edge test_checker test_checker_fu
 	@bash tools/audit_carrier_dispatch.sh
 	@echo "=== Float-literal audit (inf/nan must not reach emitted C as bare tokens) ==="
 	@bash tools/audit_float_literal.sh
+	@echo "=== Escape-fixpoint restore audit (every realloc'd Checker buffer kept, BUG-1402) ==="
+	@bash tools/audit_esc_restore.sh
 	@echo "=== Emit audit (dead-stub fingerprints) ==="
 	@bash tools/emit_audit.sh ./zerc
 	@echo "=== Flag-handler matrix (construct x context verdicts) ==="

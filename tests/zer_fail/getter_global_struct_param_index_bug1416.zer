@@ -1,0 +1,19 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1416: a getter returning the STRUCT ghs[i] carries ghs[*].p
+struct T { u32 v; }
+struct H { ?*T p; }
+H[2] ghs;
+H get(u32 i) { return ghs[i]; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ghs[0].p = a;
+    H h = get(0);
+    if (h.p) |q| { free(q); }
+    *T b = alloc(T) orelse { return 1; };
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    ghs[0].p = null;
+    return r;
+}

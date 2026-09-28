@@ -1,0 +1,19 @@
+// BUG-1415 boundary: slice elements handed to an INDIRECT call are consumed-maybe;
+// the caller that does not touch them afterwards compiles. A read-only DIRECT
+// callee still leaves the elements usable.
+struct T { u32 v; }
+void drop([*]?*T s) { if (s[0]) |p| { free(p); } }
+u32 sum([*]?*T s) { u32 r = 0; if (s[0]) |p| { r = p.v; } return r; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 9;
+    ?*T[1] arr;
+    arr[0] = a;
+    u32 r = sum(arr[0..]);
+    if (r != 9) { free(a); arr[0] = null; return 1; }
+    if (a.v != 9) { free(a); arr[0] = null; return 2; }
+    *([*]?*T) fp = drop;
+    fp(arr[0..]);
+    arr[0] = null;
+    return 0;
+}

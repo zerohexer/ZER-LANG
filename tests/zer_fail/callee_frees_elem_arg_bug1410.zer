@@ -1,0 +1,16 @@
+// EXPECTED: compile error
+// expect-error: freeing 'a' which may already be freed
+// BUG-1410: a callee that frees its (element) argument — drop(arr[i]) — may free
+// what arr[0] holds; the later free(a) is a possible double free.
+struct T { u32 v; }
+void drop(?*T p) { if (p) |q| { free(q); } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[0] = a;
+    u32 i = 0;
+    drop(arr[i]);
+    arr[0] = null;
+    free(a);
+    return 0;
+}

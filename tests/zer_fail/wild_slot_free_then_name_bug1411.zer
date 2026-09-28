@@ -1,0 +1,17 @@
+// EXPECTED: compile error
+// expect-error: 'a' is maybe-freed
+// BUG-1411: an allocation made ONCE and stored at an untrackable index, freed through a slot read, is maybe-freed under its own name
+struct T { u32 v; }
+u32 g(u32 x) { return x; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[2] arr;
+    arr[g(0)] = a;
+    if (arr[0]) |x| { free(x); }       // frees a
+    *T b = alloc(T) orelse { free(a); return 1; };   // reuses a's slot
+    b.v = 99;
+    u32 r = a.v;                       // stale read: 99
+    free(b);
+    arr[0] = null;
+    return r;
+}

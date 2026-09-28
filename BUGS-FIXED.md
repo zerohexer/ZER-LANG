@@ -115,6 +115,46 @@ post-harvest build (`scratchpad/base/zerc`), and every new test FAILS there.
   also admitted bool. An output's type must now be one every bit pattern is valid for:
   an integer, or a nullable `?*T` (newly accepted — the unknown-provenance pointer floor,
   as for a cinclude return). Tests: `tests/zer_fail/asm_output_{nonnull_ptr,enum}_bug1408.zer`.
+- **BUG-1410 — freeing through a struct FIELD read at a variable index never reached the
+  allocation.** `H h = hs[i]; free(h.p); ... free(a)` (and `*H hp = &hs[i]; free(hp.p)`,
+  a by-value callee `drop(hs[i])`, a nested field, the range-for form, and `drop(arr[i])`
+  of a bare element) freed `a` behind the tracker's back: a double free / stale read of a
+  recycled slot (exit 99). `ir_entry_is_precise_slot` required a path ENDING in `]`, so
+  `hs[0].p` counted as a wildcard member and the free barrier skipped it. A path with an
+  index and no `[*` is precise now (the old meaning survives as `ir_entry_is_precise_elem`
+  for the BUG-1302 site); `ir_slot_decompose_key` falls back to the resolved key;
+  `ir_slot_arg_free_barrier` runs at the summary free arms.
+- **BUG-1411 (narrowed) — an allocation stored at an UNTRACKABLE index and freed through
+  a slot read stayed alive under its own name** (`arr[g(0)] = a; if (arr[0]) |x| {
+  free(x); } a.v`). The wildcard exemption in the free barrier now applies only to an
+  allocation written on a CFG cycle (`ir_aid_single_instance`). Residual in
+  limitations.md: the same shape entirely inside one loop body.
+- **BUG-1412 / BUG-1413 — a callee that resets an arena / frees an argument did not see
+  the SAME allocation carried by ANOTHER argument's field or element.** `use(h)` where the
+  callee resets the arena `h.p` came from (and `use(&h)`); `use(h, a)` where the callee
+  frees `a` and reads `h.p` (and `use(&h, a)`, `use(arr[0..], a)`, `use(h, h)`, a callee
+  freeing a global `h` carries). One reach query, `ir_arg_reach` (what an argument
+  designates, what it carries by value / through `&` / a slice / a pointer view, and other
+  spellings of the same slot), at both arms.
+- **BUG-1414 — Ring push / pop / free of the popped copy left the original alive.**
+  `ir_ring_transfer`: a Ring is an array written at an unknown slot — push adds what the
+  value reaches to its wildcard, pop gives the destination's reference fields slot views.
+- **BUG-1415 — slice elements handed to an INDIRECT call were not widened** (the direct
+  call was, BUG-1300). `ir_indirect_call_barrier` widens everything the argument reaches.
+- **BUG-1416 — a getter returning a GLOBAL ELEMENT (indexed by a param, or a struct value
+  of one) was not linked to the caller's alias.** `ir_summary_global_key` spells the
+  getter's return key for the caller (a non-literal index becomes `[*]`);
+  `ir_global_family_read` aliases the exact entry or makes a slot view of every match.
+- **BUG-1417 (over-rejection) — moving an initialised move struct into a field / element
+  and consuming it was refused** ("use after move: 'ts[0]'"). The slot now gets a fresh
+  ownership identity (`ir_move_store_target_owns`); a double consume is still refused.
+- **BUG-1419 — a heap use-after-free INSIDE zerc**: in the passthrough field-read arm
+  `fsrc_h` pointed into the handle array across an `ir_add_handle` that may realloc it
+  (ASan on three corpus files). Re-fetched by key. A new `-DZER_DEBUG_HANDLE_MOVE` build
+  mode moves the array on every add, so any pointer held across an add is a deterministic
+  ASan report; the whole corpus (3,430 files) is clean under it.
+  Tests (1410..1419): 19 `tests/zer_fail/*_bug141*.zer`, 8 `tests/zer/*_bug141*.zer`;
+  SHAPE p63 in `tools/sink_matrix.sh` (16 cells: 11 HOLE + 1 OVER-REJECT pre-fix).
 - **BUG-1420 — the statement's shared lock was HELD across an orelse-BLOCK fallback.**
   The checker treats the block's statements as separate lock scopes (BUG-1047); the
   lowering kept `current_stmt_shared_root` locked while lowering the block, so `u32 x =

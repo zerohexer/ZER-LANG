@@ -30,6 +30,18 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-09-28 allocation-tracker round (BUG-1410..1417; measured)
+
+1. **BUG-1411 is narrowed, not closed**: an allocation made INSIDE a loop, stored at an
+   untrackable index (`arr[g(i)] = a`) and freed through a slot read in the same loop body,
+   then used by its own name, is still accepted (the per-instance wildcard exemption cannot
+   tell one iteration's allocation from another's).
+2. **A Ring filled in one function and drained in another** is not followed (the Ring
+   transfer, BUG-1414, is per function).
+3. **Over-rejection**: a free-every-element loop over STRUCT elements stored at literal
+   indices (`hs[0].p = a; hs[1].p = b; for i { free(hs[i].p) }`) is refused — the same
+   verdict the plain pointer-array version (`?*T[2]`) already had.
+
 ## OPEN — residuals of the 2026-09-28 concurrency round (BUG-1420..1425; measured)
 
 1. **A funcptr LOCAL reaches every function of its signature** for the context bans

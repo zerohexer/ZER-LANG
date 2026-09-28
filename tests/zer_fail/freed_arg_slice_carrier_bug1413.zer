@@ -1,0 +1,21 @@
+// EXPECTED: compile error
+// expect-error: carries (in a field or element) the same allocation
+// BUG-1413: use(arr[0..], a): a slice of an array carrying the freed allocation
+struct T { u32 v; }
+u32 use([*]?*T s, *T q) {
+    free(q);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (s[0]) |p| { r = p.v; }
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    ?*T[1] arr;
+    arr[0] = a;
+    u32 r = use(arr[0..], a);
+    arr[0] = null;
+    return r;
+}

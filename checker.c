@@ -860,8 +860,20 @@ static void checker_add_diag(Checker *c, int line, int severity, const char *fmt
     }
 }
 
+/* BUG-1488: the escape fixpoint's final walk re-checks a body whose first walk
+ * already printed its diagnostics; a diagnostic identical to one of those (same
+ * line, severity and text) is not repeated. Defined with the fixpoint. */
+static bool esc_diag_is_dup(Checker *c, int line, int severity, const char *fmt, va_list ap);
+
 static void checker_error(Checker *c, int line, const char *fmt, ...) {
     if (c->diag_quiet) { c->diag_quiet_hits++; return; }   /* BUG-1386 */
+    {
+        va_list dq;
+        va_start(dq, fmt);
+        bool dup = esc_diag_is_dup(c, line, 1, fmt, dq);
+        va_end(dq);
+        if (dup) return;
+    }
     c->error_count++;
     va_list args;
     va_start(args, fmt);
@@ -877,6 +889,13 @@ static void checker_error(Checker *c, int line, const char *fmt, ...) {
 
 static void checker_warning(Checker *c, int line, const char *fmt, ...) {
     if (c->diag_quiet) { c->diag_quiet_hits++; return; }   /* BUG-1386 */
+    {
+        va_list dq;
+        va_start(dq, fmt);
+        bool dup = esc_diag_is_dup(c, line, 2, fmt, dq);
+        va_end(dq);
+        if (dup) return;
+    }
     c->warning_count++;
     va_list args;
     va_start(args, fmt);
@@ -30786,7 +30805,21 @@ struct EscState {
     int defers_seen;    /* `defer`s registered so far in this walk */
     int dedupe_from, dedupe_to;   /* the final walk does not repeat these diagnostics */
     uint64_t growth;    /* monotone count of fact bits, to detect the fixpoint */
+    bool saturate;      /* BUG-1489: no convergence within the cap — apply the union */
 };
+
+static bool esc_diag_is_dup(Checker *c, int line, int severity, const char *fmt, va_list ap) {
+    struct EscState *e = c->esc;
+    if (!e || e->dedupe_to <= e->dedupe_from || !c->diagnostics) return false;
+    char msg[sizeof(((Diagnostic *)0)->message)];
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    for (int i = e->dedupe_from; i < e->dedupe_to && i < c->diag_count; i++) {
+        Diagnostic *d = &c->diagnostics[i];
+        if (d->line == line && d->severity == severity && strcmp(d->message, msg) == 0)
+            return true;
+    }
+    return false;
+}
 
 static uint32_t esc_bits(const Symbol *s) {
     return (s->is_local_derived ? ESC_LOCAL : 0) | (s->is_arena_derived ? ESC_ARENA : 0) |
@@ -30840,7 +30873,18 @@ static void esc_note_ever(Checker *c, Symbol *s) {
 }
 static void esc_apply_fact(Checker *c, const void *loop, Symbol *s) {
     if (!esc_on(c) || !s) return;
-    EscFact *f = esc_fact_find(c->esc, loop, s->name);
+    struct EscState *e = c->esc;
+    if (e->saturate) {   /* BUG-1489 */
+        if (!type_can_carry_pointer(s->type)) return;
+        uint32_t b = 0; uint64_t m = 0; int root = 0;
+        for (int i = 0; i < e->n; i++) {
+            b |= e->facts[i].bits; m |= e->facts[i].nk_mask;
+            if (e->facts[i].bits & ESC_NONKEEP) root = e->facts[i].nk_root;
+        }
+        esc_apply(s, b, m, root);
+        return;
+    }
+    EscFact *f = esc_fact_find(e, loop, s->name);
     if (f) esc_apply(s, f->bits, f->nk_mask, f->nk_root);
 }
 /* The function's own scopes, innermost first — NOT a module / global scope. */
@@ -31095,7 +31139,7 @@ static void check_func_body(Checker *c, Node *node) {
         if (!c->esc) { check_func_body_once(c, node); return; }
     }
     struct EscState *e = c->esc;
-    e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0;
+    e->n = 0; e->growth = 0; e->event = false; e->defers_seen = 0; e->saturate = false;
     e->dedupe_from = e->dedupe_to = 0;
     e->sticky = esc_has_jump(c, body, 0);
     Checker *snap = (Checker *)malloc(sizeof(Checker));
@@ -31105,6 +31149,7 @@ static void check_func_body(Checker *c, Node *node) {
     e->active = true;
     check_func_body_once(c, node);                 /* the real walk */
     if (e->event) {
+        bool converged = false;
         for (int it = 0; it < ESC_FIXPOINT_MAX; it++) {
             uint64_t g0 = e->growth;
             esc_restore(c, snap);
@@ -31112,8 +31157,16 @@ static void check_func_body(Checker *c, Node *node) {
             c->diag_quiet++;
             check_func_body_once(c, node);         /* quiet: only grows the facts */
             c->diag_quiet--;
-            if (e->growth == g0) break;
+            if (e->growth == g0) { converged = true; break; }
         }
+        /* BUG-1489: the cap must round toward reject. Each round moves a taint one
+         * link along a textually BACKWARD copy chain, so a chain longer than the cap
+         * (`gp = p0; p0 = p1; ... p16 = &x;` in a loop) was left half-joined and the
+         * final walk ACCEPTED the escape. Past the cap, saturate: every loop fact and
+         * every "ever" fact becomes the union of all facts the function has — a
+         * superset of any fixpoint, since a flag can only reach a variable through a
+         * chain of the flags that exist at all. */
+        if (!converged) e->saturate = true;
         esc_restore(c, snap);
         e->defers_seen = 0;
         e->dedupe_from = diag_start; e->dedupe_to = c->diag_count;
@@ -31121,6 +31174,7 @@ static void check_func_body(Checker *c, Node *node) {
         e->dedupe_from = e->dedupe_to = 0;
     }
     e->active = false;
+    e->saturate = false;
     free(snap);
 }
 

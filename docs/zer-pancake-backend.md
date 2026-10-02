@@ -1,6 +1,6 @@
 # ZER on Pancake — verified compilation without CompCert or GCC
 
-**Status: DESIGN + SPIKE (2026-09-28). Nothing is built beyond the spike.** Adopting this route
+**Status: DESIGN + SPIKES (2026-09-28; concurrency 2026-10-02, §12). Nothing is built beyond the spikes.** Adopting this route
 **reverses the locked decision "Emit-C via GCC is the permanent architecture"** (CLAUDE.md,
 "Architecture Decision: Emit-C Permanently"). That reversal is an owner decision, not something to
 drift into; this document records the case for it and what the spike measured.
@@ -272,6 +272,359 @@ record below is kept as the diagnosis.
 4. Runtime routines: division/modulo, traps.
 5. `make CC=ccomp` for `zerc` itself (untested; ZER's own source must fit CompCert's C subset).
 6. Pin the first CakeML release containing PR #1506 and switch `u32` memory fields to `ld32`/`st32`.
+7. Concurrency (`spawn`, `shared struct`): after items 2 to 4, in the order of §12.10.
+
+## §12 Concurrency on the Pancake path (spike 2026-10-02)
+
+**Status: SPIKE ONLY.** A hand-written Pancake component and a C harness, run on x86-64. No ZER
+code was involved: nothing here is emitted by `zerc` yet.
+
+### §12.1 The starting fact: verified compilers prove sequential code
+
+| compiler | what its theorem covers |
+|---|---|
+| CompCert | sequential C. pthreads can be called as external functions, but the theorem says nothing about threads sharing memory |
+| CakeML / Pancake | sequential programs, plus memory declared as shared with the outside (§12.3) |
+| Bedrock2, Jasmin | sequential |
+
+Proved compilation of shared-memory concurrency exists only as research (CompCertTSO, the concurrent
+CompCert work). A Pancake program has no threads, no atomics and no memory-ordering model. This is
+not a gap relative to any competitor.
+
+### §12.2 Terms (they were conflated in the design discussion)
+
+| question | options |
+|---|---|
+| do things run at the same instant? | one core, interleaved (**concurrency**) / several cores (**parallelism**) |
+| what do they share? | everything in one address space (**threads**) / nothing except declared regions (**components**) |
+
+"Single-threaded" below describes what each compiled component may **assume** (nobody else touches
+its private memory). It does not describe how the whole program runs: the spike ran two components
+truly in parallel on two cores.
+
+### §12.3 Three ways to get concurrency
+
+1. **Components (the seL4 pattern; recommended).** Each component is a single-threaded piece of
+   code, compiled separately. Something outside (an OS, a small kernel, or a thread-start stub)
+   runs them. They communicate through memory regions **outside** every component, read and written
+   with Pancake's shared-memory operations (`!ldw`, `!stw`, `!ld32`, `!st32`, `!ld8`, `!st8`), whose
+   semantics already says the memory can change between accesses. Each component's proof stays
+   honest.
+2. **Threads through FFI stubs.** Thread start, lock, unlock and atomics are FFI calls to small
+   trusted stubs. This is option 1 inside one process; it is what the spike tested.
+3. **Stay on GCC.** `spawn`, `shared struct` and atomics keep working on the C path, with ZER's
+   concurrency checks and no proved backend.
+
+**Interrupts** on single-core bare metal are also concurrency. Shape: a tiny trusted stub records
+the event in a shared location; the main loop reads it with a shared-memory load. That is option 1.
+
+```
+                 process
+   +------------------------------------------+
+   |  thread 1 (core A)    thread 2 (core B)  |   real OS threads, simultaneous
+   |  +------------+       +------------+     |
+   |  | instance a |       | instance b |     |   each single-threaded inside,
+   |  | own memory |       | own memory |     |   each with its own heap + stack
+   |  +-----+------+       +------+-----+     |
+   |        +------ lock ---------+           |   FFI stubs (trusted)
+   |            shared counter                |   outside both: !ldw / !stw only
+   +------------------------------------------+
+```
+
+### §12.4 How entry into compiled Pancake code works (read from the generated `.S`)
+
+With `--main_return=true`, `cml_main` runs Pancake's `main` and returns; each `export fun` then
+becomes a C-callable symbol. The generated file keeps **one** set of state in ordinary globals:
+
+| symbol | role |
+|---|---|
+| `cml_heap`, `cml_stack`, `cml_stackend` | the memory region; set by the caller before `cml_main` |
+| `ret_base`, `ret_stack`, `ret_stackend` | saved by `cml_return`, reloaded into `r14`/`r12`/`r13` by `cake_enter` on every exported call |
+| `can_enter` | re-entry flag: `cake_enter` tests it, jumps to `cake_err3` (`cml_err(3)`) if 0, else sets it to 0; `cake_return` sets it back to 1 |
+
+Consequences:
+
+- **One compiled image = one instance.** Two threads inside it would share one Pancake stack.
+- **The re-entry guard is a plain test-then-set, not atomic.** It stopped the bad case 20 of 20 times
+  in the spike, but two threads can pass it together. Treat it as a debugging aid, never as the
+  mechanism.
+- **Several instances need several copies** of those globals, i.e. the object linked more than once
+  under different symbol names (§12.5).
+
+### §12.5 The spike
+
+Tooling: CakeML `v3479` (`cake-x64-64`), host GCC 7.5, x86-64 Linux, 20 cores. One Pancake
+component, compiled once, linked **twice** into one process (symbols renamed with `objcopy`), driven
+by two pthreads.
+
+| set-up | result |
+|---|---|
+| **two instances, one per thread; shared counter under an FFI lock** | **correct 10/10** (6,000,000 of 6,000,000 increments); each instance's private count intact (3,000,000 each) |
+| two instances, shared counter **without** the lock | wrong 10/10 (e.g. 3,746,453 of 6,000,000): a real data race. Compiles with no warning |
+| one instance, two threads, every call serialised by one outer lock (a monitor) | correct 10/10; no parallelism inside the instance, and its private state is one copy seen by both threads |
+| one instance, two threads, no serialisation | stopped 20/20 by the re-entry guard (`cml_err(3)`) |
+| private work only: two instances in parallel vs one after the other | 1.88x to 1.99x faster, identical results |
+
+The same source compiles for `--target=arm8` and `--target=riscv` with the same entry guard; those
+were **not run**.
+
+Findings:
+
+1. **Two instances of one component can live in one process.** Not known before the spike.
+2. **Pancake does not prevent data races on shared memory.** The enforcement must come from above:
+   ZER's `shared struct` rule.
+3. **Parallelism is real**, not simulated.
+
+Build commands:
+
+```sh
+cake --pancake --main_return=true < worker.pnk > worker.S
+gcc -c -o worker.o worker.S
+for p in a_ b_; do
+  nm worker.o | awk -v p=$p '$2 ~ /[TDBR]/ {print $3, p $3}' > syms_$p.txt   # defined globals only
+  objcopy --redefine-syms=syms_$p.txt worker.o worker_$p.o
+done
+gcc -O2 -pthread -o conc harness.c worker_a_.o worker_b_.o
+./conc two-instances-locked 3000000     # also: two-instances-racy, one-instance-monitor,
+                                        #       one-instance-raw, speed
+```
+
+The renaming covers `cml_main`, `cml_heap`, `cml_stack`, `cml_stackend`, the four buffer/text
+markers and the exported functions. The file-local labels (`ret_base`, `can_enter`, ...) are already
+per-object. Undefined references (`cml_err`, `cml_clear`, `ffilock`, `ffiunlock`) stay shared.
+
+`worker.pnk`:
+
+```
+// One ZER "thread body" as a Pancake component.
+//   private state : word at @base (this instance's own memory)
+//   shared state  : a counter OUTSIDE Pancake memory, reached only with !ldw / !stw
+//   locking       : FFI stubs (trusted), like a ZER shared struct's auto-lock
+
+// increments the shared counter n times under the lock; returns private count
+export fun work_locked(1 shared, 1 n) {
+  var i = 0;
+  var v = 0;
+  while i <+ n {
+    @lock(0, 0, 0, 0);
+    !ldw v, shared;
+    v = v + 1;
+    !stw shared, v;
+    @unlock(0, 0, 0, 0);
+    var p = lds 1 @base;
+    st @base, p + 1;
+    i = i + 1;
+  }
+  var r = lds 1 @base;
+  return r;
+}
+
+// same, but WITHOUT the lock: a data race on the shared counter
+export fun work_racy(1 shared, 1 n) {
+  var i = 0;
+  var v = 0;
+  while i <+ n {
+    !ldw v, shared;
+    v = v + 1;
+    !stw shared, v;
+    var p = lds 1 @base;
+    st @base, p + 1;
+    i = i + 1;
+  }
+  var r = lds 1 @base;
+  return r;
+}
+
+// pure private computation (for the parallel-speed measurement)
+export fun spin(1 n) {
+  var i = 0;
+  var acc = 0;
+  while i <+ n {
+    acc = (acc * 31 + i) & 4294967295;
+    st @base + 8, acc;
+    i = i + 1;
+  }
+  return acc;
+}
+
+export fun reset() {
+  st @base, 0;
+  return 0;
+}
+
+fun main() {
+  st @base, 0;
+  return 0;
+}
+```
+
+`harness.c`:
+
+```c
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+/* two separately-linked copies of the same compiled Pancake component */
+#define INST(p) \
+  extern void p##cml_main(void); extern void *p##cml_heap, *p##cml_stack, *p##cml_stackend; \
+  extern long p##work_locked(long, long), p##work_racy(long, long), p##spin(long), p##reset(void);
+INST(a_) INST(b_)
+
+/* runtime hooks the generated code expects */
+void cml_exit(int c) { fprintf(stderr, "  [pancake runtime: cml_exit(%d)]\n", c); exit(40 + c); }
+void cml_err(int c)  { fprintf(stderr, "  [pancake runtime: cml_err(%d)%s]\n", c,
+                               c == 3 ? " = re-entered while already running" : ""); exit(40 + c); }
+void cml_clear(void) {}
+
+/* trusted FFI stubs: the lock a ZER shared struct would carry */
+static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+void ffilock(unsigned char *c, long cl, unsigned char *a, long al)   { pthread_mutex_lock(&mu); }
+void ffiunlock(unsigned char *c, long cl, unsigned char *a, long al) { pthread_mutex_unlock(&mu); }
+
+static void boot(void **heap, void **stack, void **stackend, void (*m)(void)) {
+  size_t h = 1 << 20, s = 1 << 20;
+  char *p = malloc(h + s);
+  *heap = p; *stack = p + h; *stackend = p + h + s;
+  m();                                   /* runs Pancake main(), which returns */
+}
+
+static volatile long shared_counter;
+static long N;
+static pthread_mutex_t entry = PTHREAD_MUTEX_INITIALIZER;
+typedef long (*work_fn)(long, long);
+struct job { work_fn f; int serialise; long priv; };
+
+static void *run(void *v) {
+  struct job *j = v;
+  if (j->serialise) {                    /* monitor: one thread inside the image at a time */
+    long r = 0;
+    for (long i = 0; i < N; i++) { pthread_mutex_lock(&entry); r = j->f((long)&shared_counter, 1); pthread_mutex_unlock(&entry); }
+    j->priv = r;
+  } else j->priv = j->f((long)&shared_counter, N);
+  return 0;
+}
+static double now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
+static void *run_spin_a(void *v) { *(long *)v = a_spin(N); return 0; }
+static void *run_spin_b(void *v) { *(long *)v = b_spin(N); return 0; }
+
+int main(int argc, char **argv) {
+  const char *mode = argc > 1 ? argv[1] : "";
+  N = argc > 2 ? atol(argv[2]) : 200000;
+  boot(&a_cml_heap, &a_cml_stack, &a_cml_stackend, a_cml_main);
+  boot(&b_cml_heap, &b_cml_stack, &b_cml_stackend, b_cml_main);
+  pthread_t t1, t2;
+  struct job j1 = {0}, j2 = {0};
+
+  if (!strcmp(mode, "two-instances-locked"))      { j1.f = a_work_locked; j2.f = b_work_locked; }
+  else if (!strcmp(mode, "two-instances-racy"))   { j1.f = a_work_racy;   j2.f = b_work_racy; }
+  else if (!strcmp(mode, "one-instance-raw"))     { j1.f = a_work_locked; j2.f = a_work_locked; }
+  else if (!strcmp(mode, "one-instance-monitor")) { j1.f = a_work_racy;   j2.f = a_work_racy; j1.serialise = j2.serialise = 1; }
+  else if (!strcmp(mode, "speed")) {
+    long r1, r2, r3, r4; double t0 = now();
+    r1 = a_spin(N); r2 = b_spin(N);
+    double seq = now() - t0; t0 = now();
+    pthread_create(&t1, 0, run_spin_a, &r3); pthread_create(&t2, 0, run_spin_b, &r4);
+    pthread_join(t1, 0); pthread_join(t2, 0);
+    double par = now() - t0;
+    printf("sequential %.3fs  parallel %.3fs  speedup %.2fx  results %s\n", seq, par, seq / par,
+           (r1 == r3 && r2 == r4 && r1 == r2) ? "identical" : "DIFFER");
+    return 0;
+  } else { fprintf(stderr, "mode?\n"); return 2; }
+
+  pthread_create(&t1, 0, run, &j1); pthread_create(&t2, 0, run, &j2);
+  pthread_join(t1, 0); pthread_join(t2, 0);
+  long want = 2 * N;
+  printf("shared=%ld (want %ld) %s | private: t1=%ld t2=%ld\n", shared_counter, want,
+         shared_counter == want ? "OK" : "LOST UPDATES", j1.priv, j2.priv);
+  return shared_counter == want ? 0 : 1;
+}
+```
+
+### §12.6 Mapping ZER onto it
+
+| ZER | Pancake path |
+|---|---|
+| `spawn f(...)` | start a thread on its own instance of the component holding `f` (trusted stub) |
+| data not marked `shared` | the instance's own memory; Pancake's sequential theorem applies |
+| `shared struct`, atomics, `Ring` | memory **outside** every instance, reached only with shared-memory operations; lock/unlock and atomic operations as FFI stubs |
+
+Why ZER is a good fit: Pancake's theorem assumes nobody else changes the program's ordinary memory.
+For hand-written multi-threaded Pancake that is an unchecked hope. ZER's checker already enforces
+it at source level (non-shared pointers and Handles cannot be passed to `spawn`; a spawn target's
+body is scanned for unsynchronised global access; CLAUDE.md "Thread data race"). So ZER can state
+**why** the sequential proof applies per thread.
+
+Open design points (not solved by the spike):
+
+- **Globals.** A ZER global is one object for the whole process; with one instance per thread, a
+  global placed in instance memory would silently become one copy per thread. Every global reachable
+  from more than one thread body must live in the outside region.
+- **Scoped spawn.** ZER allows a non-shared pointer into a `spawn` when the thread is joined in scope
+  (`ThreadHandle` + join). On this path that pointer would reach into another instance's private
+  memory. Either such data moves to the outside region, or the form is refused on this path.
+- **Code size.** Each instance is a full copy of the component's code.
+
+### §12.7 Who owns the lock
+
+| | who decides where to lock | what the lock is |
+|---|---|---|
+| ZER on GCC (today) | ZER's emitter, per statement touching a `shared struct` | `pthread_mutex_lock`/`unlock` written into the emitted C (`emitter.c`, the `_zer_mtx` field; recursive mutex, BUG-473) |
+| ZER on Pancake (design) | the same rule, in the Pancake emitter | an FFI call to a stub: pthread on a hosted system; interrupt disable/enable on single-core bare metal; a spinlock on an atomic instruction on multicore bare metal |
+
+The placement is ZER's on both paths. The primitive is borrowed on both paths.
+
+Trust ledger for the concurrent path (additions to §6):
+
+| item | status |
+|---|---|
+| each instance's code between FFI calls | **proved** (Pancake backend) |
+| lock, unlock, thread-start and atomic stubs, and the platform lock under them | trusted; specified by the effect table (`docs/asm_lang_zer_safe.md`) |
+| the emitter placing lock calls and choosing instance vs outside memory | trusted, tested (differential against the GCC path) |
+| "no instance touches another's private memory" | from ZER's checker (not yet proved) plus the stubs |
+| the `objcopy` renaming step | trusted build step; a workaround, not a CakeML feature |
+| weak memory ordering on multicore | not modelled anywhere; the stubs must use the right barriers |
+
+### §12.8 Intrinsics on the Pancake path
+
+ZER's intrinsics fall into four groups. The lowering is chosen by the emitter; source code is the
+same on both paths.
+
+| group | examples | Pancake path | status |
+|---|---|---|---|
+| 1. pure computations | `@popcount`, `@clz`, `@ctz`, `@bswap*`, `@addc`/`@subb`, `@mulw`, `@truncate`, `@saturate` | Pancake functions (`inline fun`): bit tricks, loops, wide multiply in halves | proved; slower than one machine instruction |
+| 2. MMIO | `volatile` register access via `@inttoptr` | shared-memory operations | proved, with device behaviour as the floor |
+| 3. atomics and barriers | `@atomic_*`, `@barrier*`, `@cond_*` | not expressible; FFI stubs per ISA | trusted |
+| 4. privileged / CPU-specific | `@cpu_disable_int`, MSR/CR access, port I/O, `@probe` | not expressible; FFI stubs per ISA | trusted |
+| hints | `@expect`, `@unreachable` | dropped, or a trap | n/a |
+
+For groups 3 and 4 the **effect table** (pre/postconditions per intrinsic, per-ISA entries) is the
+specification of the stubs. Pancake models an FFI call as an interaction with an external oracle, so
+its theorem holds relative to what the stubs do; the effect table is where that is written down.
+The effect-row fold rules and QEMU conformance witnesses stay optional (GCC-path raw asm only).
+
+### §12.9 Limits of the spike
+
+- Run on x86-64 only. ARMv8 and RISC-V compile; not executed.
+- A plain mutex only. Atomics, condition variables, `shared(rw)` and `Ring` were not tested.
+- A test, not a proof: Pancake's theorem covers each instance alone.
+- `objcopy` renaming is a workaround in the trusted build.
+- Thread start was `pthread_create` in the C harness; there is no `spawn` stub yet.
+
+### §12.10 Build order for concurrency
+
+1. The single-threaded Pancake emitter (§11 items 2 to 4). Nothing below can start before it.
+2. `shared struct` lowering: outside-region placement, `!ldw`/`!stw` access, lock calls by the C
+   emitter's existing per-statement rule.
+3. `spawn` lowering: one instance per thread body, plus the start stub; settle the globals and
+   scoped-spawn points of §12.6.
+4. The stubs per platform, each with its effect-table entry.
+5. The multi-instance build step. Worth raising upstream: a supported way to produce several
+   instances (a symbol-prefix option) would remove the `objcopy` workaround.
+6. Run the spike on ARMv8 and RISC-V under an emulator.
 
 ## References (for a future paper's related work)
 

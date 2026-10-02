@@ -147,7 +147,7 @@ second line of defence, and that is what the translations reproduce.
 |---|---|---|---|
 | x86-64 result | 105 | **105, then UAF trap, exit 3** | **105, then UAF trap, exit 3** |
 | other ISAs, same source | all GCC targets | **ARMv8, RISC-V, MIPS compiled unchanged** (not run: no emulator) | ARM-M4 / RISC-V: experimental, 32-bit, `u64` handle rejected ("too many large parameters") |
-| `u32` | native | words + mask (internal `ld32`/`st32` disabled, §9) | native `u8`/`u32`/`u64` |
+| `u32` | native | words + mask in the spike (internal `ld32`/`st32` were broken in v3479; fixed upstream since, §9) | native `u8`/`u32`/`u64` |
 | mutable global state | static struct | static heap (`@base`) | globals read-only: pool in caller-owned memory |
 | trap | `_zer_trap` | FFI call to C | no C calls: returned status code |
 | helpers | calls | calls | no general calling convention: two live handles to one helper conflict in register allocation; inline or spill to `stack` |
@@ -213,12 +213,20 @@ mask, which fails silently** (garbage in the high bits surfaces later in a compa
 1. one word per field: simple, fast, uses more memory;
 2. four byte accesses with shifts: exact ZER/C layout, slower; required where layout is observable
    (packed structs, FFI buffers shared with C);
-3. `ld32`/`st32` if Pancake re-enables them (§9).
+3. `ld32`/`st32`: fixed upstream on 2026-09-30 (§9); usable from the first CakeML release that
+   includes PR #1506. This becomes the preferred form once that release is pinned.
 
 Use (1) for ordinary data and (2) where layout is observable. MMIO always uses the shared-memory
 `!ld32`/`!st32`, which work.
 
-## §9 Pancake's internal `ld32`/`st32`
+## §9 Pancake's internal `ld32`/`st32` (FIXED UPSTREAM 2026-09-30)
+
+**Status: fixed.** The owner reported it as CakeML issue **#1505**; it was closed by **PR #1506,
+"Add missing localise clauses for 32-bit ops"**, merged 2026-09-30. The fix is the two equations
+proposed in the report (`Load32` in `localise_exp`, `Store32` in `localise_prog`), and the same PR
+changed the NEWS tag from "Feature disabled: `32bit`" to "Feature **enabled**: `32bit`". Releases
+up to and including v3479 still have the bug; use the first release that contains #1506. The
+record below is kept as the diagnosis.
 
 - **Symptom:** any internal `ld32`/`st32` whose operands mention a local variable or parameter fails
   with a spurious "variable … is not in scope" error (v3304, v3400, v3479; 64-bit and 32-bit
@@ -236,17 +244,22 @@ Use (1) for ordinary data and (2) where layout is observable. MMIO always uses t
   accepts, not that it accepts everything. The code Pancake did produce in the spike is covered by
   its proof. A fix is front-end only and needs no new compiler proof (the backend `Load32`/`Store32`
   support was proved in PR #1165); maintainers only rebuild.
-- **Reported upstream** by the owner (issue text in `~/Downloads/cakeml-issue-ld32-st32.md`, follow-up
-  comment in `~/Downloads/cakeml-issue-comment.md`), with the two-line suggested fix.
-- **Not a blocker for ZER:** values use §8's canonical form; MMIO uses the working shared-memory ops;
-  only internal-memory `u32` fields pay a memory or speed cost.
+- **Reported upstream** by the owner as issue #1505, with the two-line suggested fix and a follow-up
+  comment about the NEWS tag; **fixed by PR #1506** as proposed (see the status note above).
+- **Was not a blocker for ZER** even before the fix: values use §8's canonical form and MMIO uses the
+  shared-memory ops. With the fix, internal-memory `u32` fields can use `ld32`/`st32` directly, so the
+  word-per-field or byte-wise workaround is only needed on releases without #1506.
 
 ## §10 Licences
 
 - **Pancake / CakeML:** BSD-3; ship freely, commercially too.
 - **CompCert:** running `ccomp` is non-commercial only (AbsInt licence otherwise); compiled output is
   not mentioned; `runtime/` is BSD; the C/Clight semantics, `lib/`, `common/`, `cparser/`, `export/`
-  are LGPL. Building `zerc` with `ccomp` is fine while ZER is non-commercial.
+  are LGPL. Building `zerc` with `ccomp` is fine while ZER is non-commercial: **confirmed in writing by
+  AbsInt on 2026-09-30**, along with "services around the free ZER need no licence" and "selling a
+  commercial version requires a project licence, EUR 44,970 perpetual per project and target"
+  (`docs/zer-unified-compiler.md` §4.1). Self-hosting through Pancake, or building with GCC, avoids
+  that cost for a commercial edition.
 - **GCC:** GPL; bundling it (as ZER does today) is fine.
 
 ## §11 Next steps
@@ -258,7 +271,7 @@ Use (1) for ordinary data and (2) where layout is observable. MMIO always uses t
 3. Differential test harness: GCC path vs Pancake path on the existing ZER test programs.
 4. Runtime routines: division/modulo, traps.
 5. `make CC=ccomp` for `zerc` itself (untested; ZER's own source must fit CompCert's C subset).
-6. Watch the upstream `ld32`/`st32` issue.
+6. Pin the first CakeML release containing PR #1506 and switch `u32` memory fields to `ld32`/`st32`.
 
 ## References (for a future paper's related work)
 

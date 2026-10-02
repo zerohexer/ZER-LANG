@@ -152,11 +152,34 @@ What that means for ZER:
 | building `zerc` with `ccomp` for open-source, non-commercial ZER, shipping only the `zerc` binary | no (research / personal use; `ccomp` is never shipped) |
 | a company **running** the `zerc` binary | no: running a binary is not using CompCert; `runtime/` is BSD |
 | a company building its own firmware with ZER → `ccomp` | **yes**: that company runs `ccomp` commercially |
-| ZER itself starts earning money (sales, paid support, funded development) | the `ccomp` build step becomes commercial: buy a licence or build releases with GCC |
+| services using the free ZER, or being paid to improve the free ZER | **no** (AbsInt, in writing, §4.1) |
+| **selling a commercial version of ZER** built with `ccomp` | **yes**: a project licence, **EUR 44,970 perpetual, per project and per target** (§4.1); or build that edition with GCC / self-hosted through Pancake instead |
 | VST, clightgen, the Clight semantics | free, commercial included (BSD / LGPL) |
 
 Default stays **emit C → GCC** (CLAUDE.md "Emit-C Permanently"); `ccomp` is a certified-build mode.
-If any case turns commercial, get AbsInt to confirm the output point in writing.
+
+### 4.1 AbsInt's written answer (2026-09-30)
+
+The owner asked AbsInt directly, as an independent developer, describing the use exactly: `ccomp`
+run only by the owner, only to build the `zerc` binary (about once per release), never distributed,
+never run by users, and no CompCert backend or code inside `zerc`. Christian Ferdinand (AbsInt's
+Geschäftsführung) replied by email:
+
+1. **Open-source, non-commercial ZER:** "what you describe is clearly a non-commercial activity …
+   from my point of view, please go ahead in using CompCert." He also notes the INRIA licence is
+   imprecise: "We don't really know precisely what is covered by it besides academic research and
+   education."
+2. **Services and paid improvement of the free version:** "Neither using the 'free' non-commercial
+   version of ZER in your services, nor getting paid for improving the 'free' non-commercial version
+   of ZER requires a commercial CompCert license."
+3. **A commercial version:** "Selling a commercial version of ZER requires a commercial CompCert
+   license. A license for one project (like ZER) and one target (like x86) is called a project
+   license and costs 44970€ (perpetual)."
+
+Reading: the licence applies to a commercial edition **built with CompCert**. A commercial edition
+whose binary is built with GCC, or self-hosted through Pancake, involves no CompCert; that reading
+has not been confirmed in writing (one follow-up question would settle it). Keep the email: it is
+the written permission for the non-commercial use.
 
 ---
 

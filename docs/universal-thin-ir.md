@@ -374,8 +374,9 @@ it anyway) and automate later.
   testing across lanes).
 - **No CakeML dependency for route B.** CakeML/Pancake is optional, for the ISAs it supports.
 - **Pancake facts relevant here** (from `docs/zer-pancake-backend.md`): Pancake is a separate language
-  that shares CakeML's backend (from wordLang down); it has no GC; its internal `ld32`/`st32` are
-  currently rejected by a front-end bug (missing `localise` cases; reported upstream); it has no
+  that shares CakeML's backend (from wordLang down); it has no GC; its internal `ld32`/`st32` were
+  rejected by a front-end bug through v3479 (missing `localise` cases; reported by the owner as #1505
+  and fixed by PR #1506 on 2026-09-30); it has no
   division operator; comparisons `<` signed, `<+` unsigned.
 - **Intrinsics on these paths:** pure computations (popcount, clz, bswap, carry arithmetic) become thin
   IR operations or routines; MMIO becomes volatile loads/stores; atomics and privileged instructions
@@ -412,8 +413,10 @@ product/
   their code (e.g. `basis_ffi.c`). Released versions stay BSD permanently.
 - **GCC-built tools:** building your own tools with GCC is free; the GCC Runtime Library Exception keeps
   your binaries from becoming GPL.
-- **CompCert (`ccomp`) itself:** running it for commercial purposes needs an AbsInt licence; route B
-  does not need it.
+- **CompCert (`ccomp`) itself:** route B does not need it. For the record, AbsInt confirmed in writing
+  (2026-09-30) that building the open-source ZER with it is fine and that services around the free ZER
+  need no licence; selling a commercial edition built with it needs a project licence (EUR 44,970
+  perpetual, per project and target). Details: `docs/zer-unified-compiler.md` §4.1.
 
 ### 8.3 Product, not service
 

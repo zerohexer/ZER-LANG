@@ -167,13 +167,6 @@ typedef struct {
      * BUG-1421: the loop blocks current when the group was installed, so a
      * break / continue only releases it when it leaves THAT loop. */
     StmtLock held;
-    /* §E #29 C-F3 (2026-07-03): the held group saved while a condition's
-     * shared-read lock is active, so an `orelse return/break` INSIDE an
-     * if/while/for/switch/do-while CONDITION releases the cond mutex before the
-     * early exit (else the lock leaks → permanent deadlock). Cond locks do not
-     * nest within one condition (conditions are expressions), so one slot
-     * suffices. */
-    StmtLock cond_held_saved;
     /* BUG-1041: set by the expression-STATEMENT arm for the one lower_expr call
      * whose NODE_ASSIGN result is discarded. Everywhere else a NODE_ASSIGN sits in
      * VALUE position — `if ((x += 1) > 3)`, `y = (x += 1) + 2` — and the compound
@@ -806,6 +799,68 @@ static void hoist_restore(Checker *ck, Node *fn) {
     }
     ck->hoist_undo_n = w;
 }
+/* BUG-1527: the passthrough emits an intrinsic / a slice as ONE C expression,
+ * whose operand order C leaves unspecified (GCC picked right-to-left), so
+ * reference.md's left-to-right promise held for `x + bump(&x)` (BUG-1179) but
+ * not for `@saturate(u8, x + bump(&x))`, `a[0 .. x + bump(&x)]`, `r[x+bump(&x) .. 0]`
+ * or `@atomic_add(&g, x + bump(&x))` (each read x AFTER the call). When the order
+ * is observable, each value operand is lowered into a temp in source order
+ * (hoist_place_to_temp — recorded for the second lowering, BUG-1372), so the
+ * expression the emitter sees reads only temps. An operand that is a constant,
+ * or an ARRAY (an address, not a value), stays in place. */
+static void sequence_passthrough_operands(LowerCtx *ctx, Node *expr) {
+    if (!expr || !value_order_observable(expr)) return;
+    Node **ops[3];
+    int n = 0;
+    if (expr->kind == NODE_INTRINSIC) {
+        const char *nm = expr->intrinsic.name;
+        size_t nl = expr->intrinsic.name_len;
+        /* a condvar condition is re-evaluated in the wait loop — never hoisted */
+        if (nl >= 5 && memcmp(nm, "cond_", 5) == 0) return;
+        int cnt = expr->intrinsic.arg_count;
+        if ((nl == 6 && memcmp(nm, "offset", 6) == 0) ||
+            (nl == 9 && memcmp(nm, "container", 9) == 0))
+            cnt--;                               /* the last arg is a field NAME */
+        for (int i = 0; i < cnt; i++) {
+            Node **slot = &expr->intrinsic.args[i];
+            bool later = false;
+            for (int j = i + 1; j < cnt && !later; j++)
+                later = lower_may_write(expr->intrinsic.args[j]);
+            Node *a = *slot;
+            if (!a || hoist_place_part_const(a)) continue;
+            if (!later && !lower_may_write(a)) continue;   /* nothing to order */
+            Type *at = checker_get_type(ctx->checker, a);
+            TypeKind ak = at ? type_dispatch_kind(at) : TYPE_VOID;
+            /* an array is an address; a sync object / allocator is named, not
+             * copied (`@barrier_init(b, n())` initialised a COPY of b) */
+            if (ak == TYPE_ARRAY || ak == TYPE_BARRIER || ak == TYPE_SEMAPHORE ||
+                ak == TYPE_POOL || ak == TYPE_RING || ak == TYPE_SLAB || ak == TYPE_ARENA)
+                continue;
+            if (ak == TYPE_STRUCT && at && type_unwrap_distinct(at)->struct_type.is_shared)
+                continue;
+            hoist_place_to_temp(ctx, a, later);
+        }
+        return;
+    }
+    if (expr->kind == NODE_SLICE) {
+        Type *ot = checker_get_type(ctx->checker, expr->slice.object);
+        bool obj_value = ot && type_dispatch_kind(ot) != TYPE_ARRAY &&
+                         type_dispatch_kind(ot) != TYPE_SLICE &&
+                         type_dispatch_kind(ot) != TYPE_POINTER;   /* a bit-slice read */
+        if (obj_value) ops[n++] = &expr->slice.object;
+        if (expr->slice.start) ops[n++] = &expr->slice.start;
+        if (expr->slice.end) ops[n++] = &expr->slice.end;
+        for (int i = 0; i < n; i++) {
+            bool later = false;
+            for (int j = i + 1; j < n && !later; j++) later = lower_may_write(*ops[j]);
+            Node *a = *ops[i];
+            if (!a || hoist_place_part_const(a)) continue;
+            if (!later && !lower_may_write(a)) continue;
+            hoist_place_to_temp(ctx, a, later);
+        }
+    }
+}
+
 /* BUG-1474: THE gate for hoist_place_effects — "must this place's parts be
  * evaluated exactly once, here, root first?" A part that may WRITE (BUG-1372)
  * or that READS VOLATILE memory: a place is re-emitted at the lock, the
@@ -1332,6 +1387,20 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
 
         bool call_is_comptime = expr->call.is_comptime_resolved;
         bool call_is_builtin = call_bypasses_arg_lowering(ctx, expr);
+        /* BUG-1527: a Ring push's VALUE argument is emitted inside the push
+         * macro as one C initializer — `rq.push(mk(x, bump(&x)))` read x after
+         * the call. Lower it here, in source order, when its order is observable. */
+        if (call_is_builtin && expr->call.arg_count == 1 && expr->call.args[0] &&
+            expr->call.callee && expr->call.callee->kind == NODE_FIELD &&
+            value_order_observable(expr->call.args[0])) {
+            Type *rot = checker_get_type(ctx->checker, expr->call.callee->field.object);
+            const char *mn = expr->call.callee->field.field_name;
+            size_t ml = expr->call.callee->field.field_name_len;
+            if (rot && type_dispatch_kind(rot) == TYPE_RING &&
+                ((ml == 4 && memcmp(mn, "push", 4) == 0) ||
+                 (ml == 12 && memcmp(mn, "push_checked", 12) == 0)))
+                hoist_place_to_temp(ctx, expr->call.args[0], false);
+        }
 
         /* Decompose arguments to locals (skip for builtins — type-name args) */
         int *arg_locals = NULL;
@@ -1527,6 +1596,8 @@ static int lower_expr(LowerCtx *ctx, Node *expr) {
          * has no NODE_ORELSE case. Walks the AST and replaces each orelse with a
          * NODE_IDENT referencing a tmp local that gets the orelse result. */
         pre_lower_orelse(ctx, &expr, expr->loc.line);
+        if (expr->kind == NODE_INTRINSIC || expr->kind == NODE_SLICE)
+            sequence_passthrough_operands(ctx, expr);          /* BUG-1527 */
         Type *rt = checker_get_type(ctx->checker, expr);
         if (!rt) rt = ty_i32; /* fallback — most expressions have some value type */
         /* Void/array expressions don't produce a storable value */
@@ -2564,34 +2635,77 @@ static bool held_released_by_jump(LowerCtx *ctx, bool is_continue) {
  * inside the body. The cond lock is acquired briefly, the snapshot
  * captured by `lower_expr`, then released — same shape as
  * emit_shared_lock_if_needed for simple statements. */
-static Node *emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
-    if (!cond) return NULL;
+/* BUG-1513: a condition / for-step reading TWO roots of one shared type
+ * (`if (a1.x == a2.x)`, `for (...; ...; a1.x = a2.x + i)`) locked only the
+ * PRIMARY root and read the other with no lock — a data race the statement form
+ * (B1, emit_shared_lock_if_needed) had closed and these five sites never got.
+ * The lock is now the statement's GROUP: every root, taken in address order
+ * (BUG-1376), released as one unit (BUG-1475). The held group (with the extras)
+ * is installed so an orelse early exit inside the condition releases all of
+ * them; the enclosing group is restored at the unlock. */
+typedef struct CondLock {
+    Node *root;
+    SharedRootVec *extra;
+    StmtLock saved;
+} CondLock;
+
+static CondLock emit_shared_lock_around_cond_ex(LowerCtx *ctx, Node *cond, int line,
+                                                bool write) {
+    CondLock cl;
+    memset(&cl, 0, sizeof(cl));
+    if (!cond) return cl;
     Node *root = find_shared_root_expr(ctx->checker, cond);
-    if (!root) return NULL;
+    if (!root) return cl;
     if (lower_place_needs_single_eval(ctx, root)) hoist_place_effects(ctx, root);   /* BUG-1372, BUG-1474 */
+    SharedRootVec rv; srv_init(&rv);
+    find_all_shared_roots_expr(ctx->checker, cond, &rv);
+    SharedRootVec *ex = (SharedRootVec *)arena_alloc(ctx->arena, sizeof(SharedRootVec));
+    srv_init(ex);
+    for (int i = 0; i < rv.count; i++)
+        if (rv.items[i] != root) srv_push(ex, rv.items[i]);
+    srv_free(&rv);
+    for (int i = 0; i < ex->count; i++)       /* BUG-1372: before any lock */
+        if (lower_place_needs_single_eval(ctx, ex->items[i]))
+            hoist_place_effects(ctx, ex->items[i]);
+    /* BUG-1543: a condition can WRITE (`if ((a2.x += 1) == 0)`) — under a
+     * shared(rw) READ lock that is a lost update (measured, two threads). A
+     * condition that may write takes the whole group for writing. */
+    if (lower_may_write(cond)) write = true;
     IRInst lock = make_inst(IR_LOCK, line);
     lock.expr = root;
     /* Audit 2026-06-11: cond evaluation is READ-only for shared(rw).
      * Without explicit src2_local=0, the make_inst default of -1 means the
      * emitter's `inst->src2_local != 0` check sees true → write lock for
      * every cond read, defeating shared(rw)'s reader concurrency. */
-    lock.src2_local = 0;
+    lock.src2_local = write ? 1 : 0;
+    lock.literal_int = 1 + ex->count;
     emit_inst(ctx, lock);
-    /* §E #29 C-F3: expose the cond's lock root so an `orelse return/break/continue`
+    for (int i = 0; i < ex->count; i++) {
+        IRInst l2 = make_inst(IR_LOCK, line);
+        l2.expr = ex->items[i];
+        l2.src2_local = write ? 1 : 0;        /* BUG-1543: a writing cond / step writes any root */
+        l2.literal_int = -1;                  /* BUG-1376: a group member */
+        emit_inst(ctx, l2);
+    }
+    /* §E #29 C-F3: expose the cond's lock group so an `orelse return/break/continue`
      * lowered from INSIDE the condition (lower_orelse_to_dest consults
-     * ctx->held) releases the mutex on the early-exit path.
+     * ctx->held) releases the mutexes on the early-exit path.
      * Restored by emit_shared_unlock_after_cond on the normal path. */
-    ctx->cond_held_saved = ctx->held;
-    ctx->held = held_make(ctx, root, NULL, false);
-    return root;
+    cl.root = root;
+    cl.extra = ex;
+    cl.saved = ctx->held;
+    ctx->held = held_make(ctx, root, ex, write);
+    return cl;
 }
 
-static void emit_shared_unlock_after_cond(LowerCtx *ctx, Node *root, int line) {
-    if (!root) return;
-    ctx->held = ctx->cond_held_saved;  /* §E #29 C-F3 restore */
-    IRInst unlock = make_inst(IR_UNLOCK, line);
-    unlock.expr = root;
-    emit_inst(ctx, unlock);
+static CondLock emit_shared_lock_around_cond(LowerCtx *ctx, Node *cond, int line) {
+    return emit_shared_lock_around_cond_ex(ctx, cond, line, false);
+}
+
+static void emit_shared_unlock_after_cond(LowerCtx *ctx, CondLock *cl, int line) {
+    if (!cl->root) return;
+    ctx->held = cl->saved;  /* §E #29 C-F3 restore */
+    emit_unlock_group(ctx, cl->root, cl->extra, line);
 }
 
 /* Does this source statement WRITE to a shared field? */
@@ -2603,6 +2717,14 @@ static bool stmt_writes_shared_ir(Node *stmt) {
     /* Conservative default for VAR_DECL init: reads shared — the decl
      * itself writes to a local, not the shared field. So read lock. */
     return false;
+}
+
+/* BUG-1543: the part of a statement expression evaluated as a VALUE — for an
+ * assignment, its right side (the target's own write is the primary lock's
+ * business); otherwise the expression itself. */
+static Node *stmt_expr_value_part(Node *se) {
+    if (se && se->kind == NODE_ASSIGN) return se->assign.value;
+    return se;
 }
 
 /* B1 lock emission. Captures the EXTRA shared roots locked (beyond the primary)
@@ -2650,7 +2772,10 @@ static void emit_shared_lock_if_needed(LowerCtx *ctx, Node *stmt, Node **out_roo
             if (rv.items[i] == root) continue; /* primary already locked */
             IRInst l2 = make_inst(IR_LOCK, stmt->loc.line);
             l2.expr = rv.items[i];
-            l2.src2_local = 0; /* read lock for extras */
+            /* BUG-1543: an extra root can be WRITTEN by a nested assignment
+             * (`a1.x = (a2.x = i)`) — read-locked it lost updates. A statement
+             * whose value may write takes its extras for writing too. */
+            l2.src2_local = (se && lower_may_write(stmt_expr_value_part(se))) ? 1 : 0;
             l2.literal_int = -1;               /* BUG-1376: a group member */
             emit_inst(ctx, l2);
             /* BUG-935: the UNLOCK replays this set, so a root locked here and
@@ -3725,7 +3850,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * Then decompose if safe. */
         rewrite_idents(ctx, node->if_stmt.cond);
         /* Gap 36: lock shared struct read in cond (deadlock-safe scope) */
-        Node *if_cond_lock = emit_shared_lock_around_cond(ctx, node->if_stmt.cond,
+        CondLock if_cond_lock = emit_shared_lock_around_cond(ctx, node->if_stmt.cond,
                                                            node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         /* BUG-1054: a MUTABLE capture `|*v|` must point INTO the optional the
@@ -3774,7 +3899,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         }
         if (cap_addr_local < 0)
             br.cond_local = lower_expr(ctx, node->if_stmt.cond);
-        emit_shared_unlock_after_cond(ctx, if_cond_lock, node->loc.line);
+        emit_shared_unlock_after_cond(ctx, &if_cond_lock, node->loc.line);
         br.true_block = bb_then;
         br.false_block = bb_else >= 0 ? bb_else : bb_join;
         emit_inst(ctx, br);
@@ -3886,11 +4011,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         if (node->for_stmt.cond) {
             rewrite_idents(ctx, node->for_stmt.cond);
             /* Gap 36: lock shared struct read in cond */
-            Node *for_cond_lock = emit_shared_lock_around_cond(ctx, node->for_stmt.cond,
+            CondLock for_cond_lock = emit_shared_lock_around_cond(ctx, node->for_stmt.cond,
                                                                 node->loc.line);
             IRInst br = make_inst(IR_BRANCH, node->loc.line);
             br.cond_local = lower_expr(ctx, node->for_stmt.cond);
-            emit_shared_unlock_after_cond(ctx, for_cond_lock, node->loc.line);
+            emit_shared_unlock_after_cond(ctx, &for_cond_lock, node->loc.line);
             br.true_block = bb_body;
             br.false_block = bb_exit;
             emit_inst(ctx, br);
@@ -3925,28 +4050,17 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
              * the shared root on the RAW step, lock, install ctx->held
              * (so an orelse-return/break/continue inside the step releases the
              * lock before the early exit), lower, then unlock. */
-            Node *step_root = find_shared_root_expr(ctx->checker, node->for_stmt.step);
-            if (step_root && lower_place_needs_single_eval(ctx, step_root))
-                hoist_place_effects(ctx, step_root);                 /* BUG-1372, BUG-1474 */
-            if (step_root) {
-                IRInst lock = make_inst(IR_LOCK, node->loc.line);
-                lock.expr = step_root;
-                lock.src2_local = 1; /* write lock — step typically writes */
-                emit_inst(ctx, lock);
-            }
-            StmtLock prev_step_held = held_enter(ctx, step_root, NULL, true);
+            /* BUG-1513: the step's lock is the whole GROUP (a write group: the
+             * step typically writes its primary root). */
+            CondLock step_lock = emit_shared_lock_around_cond_ex(ctx,
+                node->for_stmt.step, node->loc.line, true);
             /* Step may contain orelse: `for (..; ..; x = next() orelse 0)` */
             pre_lower_orelse(ctx, &node->for_stmt.step, node->loc.line);
             IRInst step = make_inst(IR_ASSIGN, node->loc.line);
             step.expr = node->for_stmt.step;
             step.step_nowrap = for_step_cannot_wrap(node);   /* BUG-1302 */
             emit_inst(ctx, step);
-            ctx->held = prev_step_held;
-            if (step_root) {
-                IRInst unlock = make_inst(IR_UNLOCK, node->loc.line);
-                unlock.expr = step_root;
-                emit_inst(ctx, unlock);
-            }
+            emit_shared_unlock_after_cond(ctx, &step_lock, node->loc.line);
         }
         ensure_terminated(ctx, bb_cond); /* back edge */
 
@@ -3994,11 +4108,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         {
         rewrite_idents(ctx, node->while_stmt.cond);
         /* Gap 36: lock shared struct read in cond */
-        Node *while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
+        CondLock while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
                                                               node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.cond_local = lower_expr(ctx, node->while_stmt.cond);
-        emit_shared_unlock_after_cond(ctx, while_cond_lock, node->loc.line);
+        emit_shared_unlock_after_cond(ctx, &while_cond_lock, node->loc.line);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -4060,11 +4174,11 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         {
         rewrite_idents(ctx, node->while_stmt.cond);
         /* Gap 36: lock shared struct read in cond */
-        Node *while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
+        CondLock while_cond_lock = emit_shared_lock_around_cond(ctx, node->while_stmt.cond,
                                                               node->loc.line);
         IRInst br = make_inst(IR_BRANCH, node->loc.line);
         br.cond_local = lower_expr(ctx, node->while_stmt.cond);
-        emit_shared_unlock_after_cond(ctx, while_cond_lock, node->loc.line);
+        emit_shared_unlock_after_cond(ctx, &while_cond_lock, node->loc.line);
         br.true_block = bb_body;
         br.false_block = bb_exit;
         emit_inst(ctx, br);
@@ -4126,7 +4240,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
          * scopes the entire switch-expression evaluation/hoist; arm bodies
          * may reach back through captures or sw_ref but those are fully
          * resolved at hoist time. */
-        Node *switch_expr_lock = emit_shared_lock_around_cond(ctx, node->switch_stmt.expr,
+        CondLock switch_expr_lock = emit_shared_lock_around_cond(ctx, node->switch_stmt.expr,
                                                                node->loc.line);
 
         /* Hoist switch expression.
@@ -4171,7 +4285,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
                  * access. */
                 int val_local = lower_expr(ctx, sw_expr);
                 if (val_local < 0) {
-                    emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                    emit_shared_unlock_after_cond(ctx, &switch_expr_lock, node->loc.line);
                     break;
                 }
                 IRLocal *vl = &ctx->func->locals[val_local];
@@ -4192,7 +4306,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             checker_set_type(ctx->checker, addr_expr, ptr_to_union);
             int ptr_local = lower_expr(ctx, addr_expr);
             if (ptr_local < 0) {
-                emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                emit_shared_unlock_after_cond(ctx, &switch_expr_lock, node->loc.line);
                 break;
             }
             IRLocal *pl = &ctx->func->locals[ptr_local];
@@ -4201,7 +4315,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
             int val_local = lower_expr(ctx, node->switch_stmt.expr);
             if (val_local < 0) {
                 /* audit 2026-06-04: release switch-expr lock on early break. */
-                emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+                emit_shared_unlock_after_cond(ctx, &switch_expr_lock, node->loc.line);
                 break;
             }
             IRLocal *vl = &ctx->func->locals[val_local];
@@ -4211,7 +4325,7 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         /* Gap 36: hoist complete — release the switch-expr lock before
          * arm bodies run. Holding it across arm bodies would deadlock
          * any nested shared access. */
-        emit_shared_unlock_after_cond(ctx, switch_expr_lock, node->loc.line);
+        emit_shared_unlock_after_cond(ctx, &switch_expr_lock, node->loc.line);
 
         int bb_exit = ir_add_block(ctx->func, ctx->arena);
 
@@ -4784,6 +4898,28 @@ static void lower_stmt(LowerCtx *ctx, Node *node) {
         bool goto_had_defers = ctx->defer_count > fire_base;
         int goto_fired_count = ctx->defer_count - fire_base; /* count actually fired */
         emit_defer_fire_scoped(ctx, fire_base, true, node->loc.line);
+        /* BUG-1540: DISARM what this goto just fired. A forward goto fires every
+         * pending defer, and the per-LABEL "already fired" flag below guards
+         * only the fire at that label's own exits — after two gotos to two
+         * different labels (`goto out; out: … goto out2; out2: return`), the
+         * return checked out2's flag alone and fired the defer AGAIN: a double
+         * `free(p)` releasing a slot already handed out anew (measured: a
+         * pointer stored after the first label read another live object). The
+         * defer's own ARMED flag (F2, present in every function with a label)
+         * is the fact "pending and not yet run"; clearing it here makes every
+         * later fire of this registration a no-op until the registration
+         * itself runs again (a backward goto re-arms it). */
+        if (ctx->defer_body_depth == 0 && ctx->defer_flags) {
+            for (int di = fire_base; di < ctx->defer_count && di < ctx->defer_bodies_cap; di++) {
+                int af = ctx->defer_flags[di];
+                if (af < 0) continue;
+                IRInst clr = make_inst(IR_LITERAL, node->loc.line);
+                clr.dest_local = af;
+                clr.literal_int = 0;
+                clr.literal_kind = 0;
+                emit_inst(ctx, clr);
+            }
+        }
         ctx->defer_count = fire_base;
         /* A goto always leaves the statement: labels are statements, and no
          * statement is lowered while a group is held (BUG-1420). */

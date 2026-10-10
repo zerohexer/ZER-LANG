@@ -1,0 +1,6 @@
+// expect-error: cannot initialize mutable pointer from const
+// BUG-1541: a write into memory reached through a CONST slice (param, struct
+// field, element address, atomic) went to .rodata unrefused.
+const u32[4] tab;
+void w(const [*]u32 s) { *u32 q = &s[1]; *q = 9; }
+u32 main() { w(tab); return tab[1]; }

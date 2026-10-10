@@ -30,6 +30,63 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
+
+1. **A race in a spawn target is only a WARNING when the target (or any callee) contains
+   any `@atomic_*` / `@barrier`** — whichever global the atomic touches. This is the
+   documented hand-built-lock escape (`rt_conc_atomic_spinlock`: a CAS spinlock guarding a
+   plain counter, which the analysis cannot verify), and it also downgrades a plain racy
+   `g += 1` next to an unrelated `@atomic_store(&flag, 1)` (measured: lost updates, TSan).
+   A trust gap by design; the precise fix is to downgrade only an access the analysis can
+   show is ordered by the atomic it pairs with.
+2. **A split RMW through CALLS** — `u32 t = rd(); wr(t + 1);` where `rd` returns `g` and
+   `wr` stores it — is not seen at either race sink (the taint follows values through
+   locals, not a call's return of a global). Needs a "returns global G" summary feeding
+   `rmw_value_source_global`.
+3. **A helper called only from an interrupt handler counts as MAIN code** for the
+   ISR-sharing rule: `void bump() { count = 5; } interrupt T { bump(); }` is refused
+   "must be declared volatile" though main never touches `count` (over-rejection). Needs
+   reachability from the non-ISR roots (main, spawn targets, funcptr-taken and exported
+   functions) — a relaxation, so it needs the accept-unsafe discipline.
+4. **An interrupt handler reaching a call CYCLE is reported as "a call chain deeper than
+   32"** (the walk has no visited set; the verdict — refusing recursion in an ISR — stands,
+   the wording is wrong).
+5. **Over-rejections from the allocation tracker:** the free-every-slot loop over a GLOBAL
+   array (`for (i) { if (gs[i]) |p| { free(p); } gs[i] = null; }`) is refused ("double free
+   'p'"), though the same loop over a slice parameter compiles; freeing a heap linked list
+   built from `alloc(Node)` + `?*Node next` is refused in the iterative and recursive forms.
+   The variable-index global free (BUG-1530) widens a caller's `gs[0]` even when the
+   callee's index provably differs.
+6. **Leak false negatives:** after filling an array at a variable index, ONE free at a
+   literal index silences every leak; an allocation consumed inline (`(alloc(T) orelse
+   return).v = 3;`) is never registered.
+7. **A pointer to a block-scoped local outlives the block silently** (`if (c) { u32 x = 5; p
+   = &x; } … *p`): the IR's locals are flat, so this is not C-level UB, but two sibling
+   blocks' `x` share one C object and `*p` observes the second (exit 10, not 5). Block
+   lifetimes are not modelled by the escape analysis.
+8. **Type positions that do not parse a container stamp:** `alloc(Box(u32))`, `alloc(LNode(u32),
+   2)`, `arena.alloc(Box(u32))`, `@size(Box(u32))` ("expected expression"); a typedef alias
+   works.
+9. **Loud name collisions:** a user `struct slice_u8` and the runtime's `_zer_opt_slice_u8`;
+   an async function holding its own task type in a local (`_zer_async_a t;` inside `a`)
+   reaches GCC as an incomplete type.
+10. **Over-rejection:** a comptime u64 value at or above 2^63 is "could not be evaluated"
+   (the INT64_MIN sentinel / 64-bit evaluator). (A negative i128 divisor literal — CLOSED,
+   BUG-1538.)
+11. **Seen by the adversarial pass, not fixed (loud / pre-existing):** reserved names in
+   `container` FIELDS reach GCC (`container B(T) { T __LINE__; }`); a threadlocal ARRAY viewed
+   in a global initializer (`[*]u32 gs = ta;`) reaches GCC as "not constant"; a static local
+   read as an IR operand in an async body is emitted as `_zer_self->name` (GCC: no member);
+   `pool.get(h).f(3)` (call through a funcptr field of a pool slot) is an INTERNAL ERROR; a
+   union array variant captured `|*v|` in a switch reaches GCC (`v_capN` undeclared); `void
+   rel(*?*T slot){ if (*slot) |q| { free(q); } *slot = null; }` then `rel(&gq)` while holding a
+   copy of `gq` is a use-after-free not refused (the pointer-to-pointer slot class of the
+   2026-09-27 residual 1).
+12. **A `static const` / `const` parameter or struct FIELD of a VALUE type** (`u32 f(const u32
+   x) { x = 5; }`, `struct S { const u32 id; }` then `s.id = 3`) — the qualifier is dropped by
+   design ("a variable qualifier, not a type property") on params and fields; decide whether
+   to honour it.
+
 ## OPEN — residuals of the 2026-09-28 round-4 hunt (BUG-1490..1510; measured)
 
 1. **Leak half of a joined identity (BUG-1490).** When a pointer names allocation A on one
@@ -58,9 +115,8 @@ repeated.
 
 ## OPEN — residuals of the 2026-09-28 single-evaluation / lock round (BUG-1470..1476)
 
-1. A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an
-   interrupt handler (only a direct `@cond_wait` there is); the new `can_cond_wait` summary
-   flag can close it.
+1. ~~A callee that `@cond_wait`s is not refused when reached from inside `@critical` or an
+   interrupt handler~~ — CLOSED 2026-10-10 (BUG-1512, with every blocking wait in an ISR).
 2. A lock root whose place is a SLICE is not hoisted by `hoist_place_effects` (non-packed
    bit-slice writes are evaluated once through the emitter's pointer hoist).
 3. The moved volatile predicates resolve a root name in the checker's CURRENT module; the
@@ -103,12 +159,12 @@ emitted name.
    (BUG-1425), so `*() -> u32 fp = tick;` inside @critical is refused when ANY `() -> u32`
    function (even `main`) allocates. A local bound once at its declaration could resolve to
    that one function (the spawn scan's binding walk) — over-rejection only.
-2. **The for-loop STEP takes only the statement's primary lock** — the B1 multi-root lock
-   group was never applied to the step expression. Noticed, not probed for a hole.
-3. **`ensure_func_props` treats a call cycle as "no additional effects"** — a recursive
-   chain under-approximates can_spawn / can_alloc / can_enable_int (pre-existing).
-4. A static-local or global initializer `= &tl` (a threadlocal's address) is accepted by
-   the checker and refused by GCC ("initializer element is not constant") — loud.
+2. ~~**The for-loop STEP takes only the statement's primary lock**~~ — CLOSED 2026-10-10
+   (BUG-1513: it was a live race, and every CONDITION had the same defect; BUG-1518: the
+   step was not in the deadlock check either).
+3. ~~**`ensure_func_props` treats a call cycle as "no additional effects"**~~ — CLOSED
+   2026-10-10 (BUG-1511, fixpoint over the cycle).
+4. ~~A static-local or global initializer `= &tl`~~ — CLOSED 2026-10-10 (BUG-1514).
 
 ## OPEN — an ARRAY parameter is treated as frame storage by the escape sinks (2026-09-28, LOW — over-rejection)
 
@@ -617,8 +673,10 @@ return p.v;` is REFUSED (use after free) although the label is inside the defer'
 guards the label's return-fire with a runtime flag (plt86m). CLAUDE.md and
 `tests/zer/goto_defer.zer` / `rust_tests/rt_goto_fires_defer.zer` rely on "fire all";
 reference.md used to state the scope-based rule (C++/Zig: a jump runs the defers of the scopes
-it LEAVES) and now documents the implemented one. Memory-safe either way: zercheck sees the
-DEFER_FIRE on the goto path. Fix sketch if the scope-based rule is adopted: `fire_base` = the
+it LEAVES) and now documents the implemented one. Memory-safe since BUG-1540 (2026-10-10):
+before it, two forward gotos to two DIFFERENT labels fired the defer a second time at the
+return (a double free), which this entry's old "memory-safe either way" missed; a goto now
+disarms each defer it fires. zercheck sees the DEFER_FIRE on the goto path. Fix sketch if the scope-based rule is adopted: `fire_base` = the
 defer count live at the label's lexical position (known at the LABEL for a backward goto; for
 a forward goto the label's enclosing-scope defer depth is known from collect_labels), plus
 the label's guard flag keyed per fired range.

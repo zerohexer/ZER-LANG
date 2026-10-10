@@ -1,0 +1,6 @@
+// expect-error: local-derived pointer
+// BUG-1516 sibling sink (see escape_local_array_field_view_bug1516).
+struct O { u8[4] buf; [*]u8 view; }
+O g;
+void f() { O o; o.buf[0] = 7; o.view = o.buf; g = o; }
+u32 main() { f(); u32[16] pad; pad[2] = 9; return g.view[0] + pad[2]; }

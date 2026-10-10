@@ -1,0 +1,5 @@
+// expect-error: cannot switch on a 'void' value
+// BUG-1544: a void switch subject dropped the default arm silently.
+u32 g;
+void v() { }
+u32 main() { switch (v()) { default => { g += 10; } } return g - 10; }

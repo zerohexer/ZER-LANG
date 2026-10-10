@@ -171,6 +171,12 @@ typedef struct {
     /* BUG-1425: bumped when every body is typed, so a function summary cached
      * earlier (when its indirect calls could not be resolved yet) is recomputed. */
     int props_epoch;
+    /* BUG-1511: a call CYCLE leaves the summaries computed inside it partial
+     * (the in-progress function contributes only what it had found so far).
+     * The outermost ensure_func_props iterates to a fixpoint when one was hit. */
+    int props_depth;
+    bool props_cycle_hit;
+    bool props_changed;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */

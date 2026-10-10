@@ -1,0 +1,6 @@
+// BUG-1527 follow-up: hoisting @barrier_init operands for order must not copy
+// the Barrier (it initialised a copy and @barrier_wait trapped).
+Barrier b;
+u32 cnt;
+u32 n() { cnt += 1; return 1; }
+u32 main() { @barrier_init(b, n()); @barrier_wait(b); return 0; }

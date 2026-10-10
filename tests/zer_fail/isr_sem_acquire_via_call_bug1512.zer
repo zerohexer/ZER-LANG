@@ -1,0 +1,8 @@
+// expect-error: interrupt handler calls a function that may block
+// BUG-1512: a blocking @sem_acquire written in an interrupt handler was refused,
+// the same acquire one call away was accepted (the ISR sleeps on a count only a
+// preempted thread can release).
+Semaphore(1) s;
+void take() { @sem_acquire(s); }
+interrupt TIMER0 { take(); }
+u32 main() { return 0; }

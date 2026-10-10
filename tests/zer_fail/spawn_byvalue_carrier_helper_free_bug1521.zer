@@ -1,0 +1,23 @@
+// expect-error: which was already transferred
+// BUG-1521: the heap sibling — the helper's summary did not say a FIELD of its
+// by-value param went to a detached thread; free(p) then let the thread write
+// into a recycled object (exit 99).
+shared struct S { u32 n; }
+struct C { *S s; }
+void wc(C c) {
+    for (u32 i = 0; i < 50000000; i += 1) { }
+    c.s.n = 99;
+}
+void start(C c) { spawn wc(c); }
+u32 main() {
+    *S p = alloc(S) orelse return;
+    C c = { .s = p };
+    start(c);
+    free(p);
+    *S q = alloc(S) orelse return;
+    q.n = 5;
+    for (u32 i = 0; i < 300000000; i += 1) { }
+    u32 r = q.n;
+    free(q);
+    return r;
+}

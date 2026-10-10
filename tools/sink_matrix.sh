@@ -1515,6 +1515,41 @@ cell p66_safe_pool_get_field    compile "$P66"' u32 main(){ Handle(P66n) nh = no
 cell p66_safe_fieldstore_param  compile "$P66"' V66 mk2([*]u8 b){ V66 v; v.s = b[2..6]; return v; } u32 main(){ u8[8] buf; V66 w = mk2(buf); return (u32)w.s.len - 4; }'
 cell p66_safe_fieldstore_heap   compile "$P66"' u32 main(){ [*]u8 h = alloc(u8, 8) orelse return; V66 x; x.s = h[0..8]; x.s[1] = 3; free(x.s); return 0; }'
 
+# SHAPE p67 (BUG-1516, BUG-1517, BUG-1530): an IMPLICIT array -> slice view (the
+# coercion, no `[..]` written) of a HEAP object's array field, and of a LOCAL's
+# array field, crossed with the sink (var-decl, assign, struct literal, return,
+# pool.get, local-struct field then return / global copy / out-param); the
+# assignment of a PURE view; a callee freeing a global slot through a variable
+# index. BOUNDARY: a view of a GLOBAL array field, an array PARAM view, a view used
+# before the free.
+echo "===== SHAPE p67 = implicit array view x sink, pure-view assign, variable-index global free ====="
+P67='struct T67 { u32 v; u32[4] arr; }
+struct V67 { [*]u32 s; }
+struct A67 { u8[4] buf; }
+struct O67 { [*]u8 view; }
+Pool(T67, 4) pool67;
+O67 go67;
+T67 gt67;
+?*T67[4] gs67;
+u32 gi67 = 1;
+void zap67() { u32 i = gi67; if (i < 4) { if (gs67[i]) |p| { free(p); } gs67[i] = null; } }
+*T67 pick67(*T67 x, *T67 y, u32 c) { if (c == 0) { return x; } return y; }
+[*]u32 view67(*T67 t) { return t.arr; }
+'
+cell p67_heap_vardecl        reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = a.arr; free(a); return s[2]; }'
+cell p67_heap_assign         reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = gt67.arr; s = a.arr; free(a); return s[2]; }'
+cell p67_heap_struct_lit     reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; V67 w = { .s = a.arr }; free(a); return w.s[2]; }'
+cell p67_heap_return_view    reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = view67(a); free(a); return s[2]; }'
+cell p67_pool_get_view       reject "$P67"' u32 main(){ Handle(T67) h = pool67.alloc() orelse return; [*]u32 s = pool67.get(h).arr; pool67.free(h); return s[2]; }'
+cell p67_local_field_return  reject "$P67"' O67 mk(){ A67 a; O67 o; o.view = a.buf; return o; } u32 main(){ O67 o = mk(); return (u32)o.view[0]; }'
+cell p67_local_field_global  reject "$P67"' void mk(){ A67 a; O67 o; o.view = a.buf; go67 = o; } u32 main(){ mk(); return 0; }'
+cell p67_local_field_outparam reject "$P67"' void mk(*[*]u8 out){ A67 a; O67 o; o.view = a.buf; *out = o.view; } u32 main(){ [*]u8 s = go67.view; mk(&s); return 0; }'
+cell p67_pure_view_assign    reject "$P67"' u32 main(){ volatile u32 k = 0; *T67 a = alloc(T67) orelse return; *T67 c = alloc(T67) orelse { free(a); return 1; }; *T67 got = pick67(a, c, k); ?*T67 out = null; out = got; free(a); u32 r = 0; if (out) |o| { r = o.v; } free(c); return r; }'
+cell p67_global_var_index_free reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; gs67[1] = a; zap67(); return a.v; }'
+cell p67_safe_global_field   compile "$P67"' u32 main(){ [*]u32 s = gt67.arr; s[1] = 2; return s[1] - 2; }'
+cell p67_safe_param_array    compile "$P67"' u32 rd([*]u32 x){ return x[0]; } u32 main(){ u32[4] loc; loc[0] = 3; return rd(loc) - 3; }'
+cell p67_safe_use_before_free compile "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; a.arr[2] = 7; [*]u32 s = a.arr; u32 r = s[2]; free(a); return r - 7; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

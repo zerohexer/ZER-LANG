@@ -1,0 +1,23 @@
+// expect-error: may be a view of
+// BUG-1517 sibling: a Ring pop / slot read assigned to a struct carried no view.
+struct T { u32 v; }
+struct M { *T p; }
+volatile u32 gk;
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    M[2] ms;
+    u32 k = gk;
+    if (k < 2) { ms[k].p = a; }
+    free(a);
+    u32 j = gk;
+    if (j >= 2) { return 0; }
+    M got = ms[j];
+    M out;
+    out = got;
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = out.p.v;
+    free(b);
+    return r;
+}

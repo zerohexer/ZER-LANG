@@ -232,6 +232,7 @@ static bool const_expr_reads_typed_value(Node *e, int depth) {
                const_expr_reads_typed_value(e->binary.right, depth + 1);
     return false;
 }
+static Type *check_expr(Checker *c, Node *node);   /* BUG-1534 */
 static int64_t eval_decl_size_expr(Checker *c, Node *e) {
     if (!e) return CONST_EVAL_FAIL;
     /* BUG-1209: a size EXPRESSION over typed values has a checked type, and its
@@ -243,6 +244,22 @@ static int64_t eval_decl_size_expr(Checker *c, Node *e) {
     int64_t val = eval_const_expr(e);
     if (val != CONST_EVAL_FAIL) return ct_wrap(val, wb, ws);
     int64_t sval = eval_const_expr_scoped(c, e);
+    /* BUG-1534: `const u32 K = BIT(2); u32[K] buf;` at GLOBAL scope — the array
+     * type is resolved while declarations register, before K's initializer has
+     * been type-checked, so its comptime call was not folded yet and the size
+     * read as "not a constant" (a local `u8[K]` worked: the const was checked
+     * first). Type-check a referenced const's initializer now and retry. */
+    if (sval == CONST_EVAL_FAIL && e->kind == NODE_IDENT) {
+        Symbol *ks = scope_lookup(c->current_scope, e->ident.name, (uint32_t)e->ident.name_len);
+        Node *kd = ks ? ks->func_node : NULL;
+        if (ks && ks->is_const && kd &&
+            (kd->kind == NODE_GLOBAL_VAR || kd->kind == NODE_VAR_DECL) &&
+            kd->var_decl.init && kd->var_decl.init->kind == NODE_CALL &&
+            !kd->var_decl.init->call.is_comptime_resolved) {
+            (void)check_expr(c, kd->var_decl.init);
+            sval = eval_const_expr_scoped(c, e);
+        }
+    }
     if (sval == CONST_EVAL_FAIL) return CONST_EVAL_FAIL;
     sval = ct_wrap(sval, wb, ws);
     e->kind = NODE_INT_LIT;
@@ -441,6 +458,7 @@ static const char *global_init_node_reason(Node *n, Type *type) {
 static Symbol *global_decl_lookup(Checker *c, const char *name, uint32_t name_len);
 static void check_suspend_in_union_capture(Checker *c, Node *node, const char *what);
 static void check_suspend_in_once(Checker *c, Node *node, const char *what);
+static bool sym_is_threadlocal(Symbol *s);
 static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, Node **bad) {
     if (!n) return NULL;
     /* BUG-1016: NULL past the cap read as "nothing offending", so a call hidden 200
@@ -474,6 +492,23 @@ static const char *global_init_scan(Checker *c, Node *n, Type *type, int depth, 
              * call on it points into a dead one (and C refuses the initializer:
              * a frame address is not a constant). A static local's own address
              * IS a constant and stays allowed. */
+            /* BUG-1514: `*u32 gp = &tl;` / `static *u32 sp = &tl;` with `tl`
+             * threadlocal — each thread has its own copy, so its address is not
+             * a link-time constant (GCC: "initializer element is not constant",
+             * against the generated file) and, held in a global, would name one
+             * thread's copy for every thread (A5 / BUG-1170 refuse the
+             * assignment spelling). */
+            if (c && r && r->kind == NODE_IDENT) {
+                Symbol *ts = scope_lookup(c->current_scope, r->ident.name,
+                                          (uint32_t)r->ident.name_len);
+                if (!ts) ts = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
+                if (sym_is_threadlocal(ts)) {
+                    *bad = n;
+                    return "takes the address of a threadlocal — each thread has its own "
+                           "copy, so the address is not a constant and would name one "
+                           "thread's copy for every thread";
+                }
+            }
             if (c && c->gi_static_local && r && r->kind == NODE_IDENT) {
                 Symbol *gs = global_decl_lookup(c, r->ident.name, (uint32_t)r->ident.name_len);
                 Symbol *ls = scope_lookup(c->current_scope, r->ident.name,
@@ -1301,7 +1336,11 @@ static void check_c_reserved_ident(Checker *c, const char *name, uint32_t len,
               "(POSIX reserves every name ending in '_t')";
         break;
     case CRID_NS:
-        if (use != CRUSE_DEFINITION && use != CRUSE_LOCAL) return;
+        /* BUG-1532: a FIELD in the reserved namespace was exempt, so `u32 _Bool;`
+         * (a C keyword), `u32 __typeof__;`, `u32 __FILE__;` / `__x86_64__` (a
+         * predefined MACRO) reached GCC. C reserves these for ANY use (C11
+         * 7.1.3); only a bodyless extern keeps the exemption. */
+        if (use == CRUSE_EXTERN_FUNC) return;
         why = "is in C's reserved namespace (a leading '__' or '_' + capital letter)";
         break;
     case CRID_LIBC:
@@ -2690,15 +2729,50 @@ static bool reject_unique_resource_copy(Checker *c, Node *value, Type *vt,
  * CLAUDE.md names as the #1 recurring bug class, and it is exactly what let the
  * negative literal stay accepted at every one of them: there was no single place
  * to add the condition. One query now; each site keeps its own error wording. */
-static bool value_flows_to(Node *value, Type *vt, Type *target) {
+/* BUG-1516: an ARRAY flowing into a slice destination forms a VIEW of the
+ * array — exactly `arr[..]` — but was left in the AST as the bare array
+ * expression. Every analysis that asks "does this value FORM a reference?"
+ * (zercheck_ir's interior-view alias, the escape sinks, the borrow roots)
+ * recognises the explicit NODE_SLICE, and the implicit spelling reached each one
+ * as a plain READ of an aggregate: `[*]u32 s = a.arr; free(a); s[2]` read a
+ * recycled allocation at var-decl, assignment, struct-literal field, return and
+ * through `pool.get(h).arr` (measured: exit 99), while `a.arr[0..]` was refused
+ * at all of them. The coercion is decided HERE, at the one value-flow query, so
+ * here the view is made explicit: the node is rewritten in place into a full
+ * slice of a copy of itself, and every downstream reader sees one spelling. */
+static void make_array_view_explicit(Checker *c, Node *value, Type *vt, Type *target) {
+    if (!c || !value || !vt || !target) return;
+    Type *ve = type_unwrap_distinct(vt);
+    if (!ve || type_dispatch_kind(ve) != TYPE_ARRAY) return;
+    Type *te = type_unwrap_distinct(target);
+    if (te && type_dispatch_kind(te) == TYPE_OPTIONAL) te = type_unwrap_distinct(te->optional.inner);
+    if (!te || type_dispatch_kind(te) != TYPE_SLICE) return;
+    if (value->kind != NODE_IDENT && value->kind != NODE_FIELD &&
+        value->kind != NODE_INDEX &&
+        !(value->kind == NODE_UNARY && value->unary.op == TOK_STAR))
+        return;
+    Node *inner = (Node *)arena_alloc(c->arena, sizeof(Node));
+    if (!inner) return;
+    *inner = *value;
+    memset(&value->slice, 0, sizeof(value->slice));
+    value->kind = NODE_SLICE;
+    value->slice.object = inner;
+    value->slice.start = NULL;
+    value->slice.end = NULL;
+    checker_set_type(c, inner, vt);
+    checker_set_type(c, value, te);
+}
+
+static bool value_flows_to_ex(Checker *c, Node *value, Type *vt, Type *target) {
     if (const_negative_into_unsigned(value, target)) return false;
     if (const_signedness_divergent_into_unsigned(value, target)) return false;  /* BUG-1018 */
     if (const_int_into_enum(value, vt, target)) return false;
     if (type_equals(target, vt)) return true;
-    if (can_implicit_coerce(vt, target)) return true;
+    if (can_implicit_coerce(vt, target)) { make_array_view_explicit(c, value, vt, target); return true; }
     if (is_literal_compatible(value, target)) return true;
     return false;
 }
+#define value_flows_to(v, vt, t) value_flows_to_ex(c, (v), (vt), (t))
 
 /* The negative-constant rejection needs its OWN wording: the generic
  * type-mismatch message at each sink would print `'u32' with 'u32'` — the same
@@ -6790,6 +6864,36 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
     return NULL;
 }
 
+/* BUG-1010 / BUG-1526: maintain a value-taint table across one assignment
+ * whose target is NOT a global — ONE function for the ISR/main sink and the
+ * spawn-scan sink, so the two cannot disagree. A plain `t = <expr>` into a bare
+ * local re-binds (and, from no global, CLEARS) its taint. A COMPOUND op or a
+ * write into a PROJECTION of a local (`t += g`, `t.v = g`, `t[0] = g`) ADDS
+ * the value's global to the root local and never clears — before BUG-1526 those
+ * spellings carried nothing and `t.v = g; g = t.v + 1;` was a split RMW
+ * accepted at both sinks (TSan: lost updates). */
+static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
+                               Node *node) {
+    Node *tg = node->assign.target;
+    if (!tg) return;
+    if (node->assign.op == TOK_EQ && tg->kind == NODE_IDENT) {
+        rmw_tab_set(tab, n, cap, 0, tg->ident.name, (uint32_t)tg->ident.name_len,
+                    rmw_value_source_global(c, *tab, *n, node->assign.value, 0));
+        return;
+    }
+    Node *rt = tg;
+    while (rt && (rt->kind == NODE_FIELD || rt->kind == NODE_INDEX)) {
+        Node *ob = rt->kind == NODE_FIELD ? rt->field.object : rt->index_expr.object;
+        TypeKind ok = type_dispatch_kind(checker_get_type(c, ob));
+        if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE)
+            return;   /* writes through a reference: not the local's own storage */
+        rt = ob;
+    }
+    if (!rt || rt->kind != NODE_IDENT) return;
+    Symbol *src = rmw_value_source_global(c, *tab, *n, node->assign.value, 0);
+    if (src) rmw_tab_set(tab, n, cap, 0, rt->ident.name, (uint32_t)rt->ident.name_len, src);
+}
+
 /* Does this value expression carry `g` through a tainted LOCAL? (A direct
  * mention of `g` itself is `assign_reads_own_target`'s job, not this one.)
  * Feeds a REJECT, so the cap and the statement kinds round to TRUE. */
@@ -8729,6 +8833,8 @@ static Type *zero_value_nonnull_leaf(Type *t, const SField **leaf) {
 }
 
 static Type *type_struct_literal(Checker *c, Node *sinit, Type *target, int line);
+static void ring_push_value_check(Checker *c, Type *elt, Node *arg, int line);   /* BUG-1523 */
+static bool expr_is_assignable_place(Checker *c, Node *t, int depth);   /* BUG-1525 */
 static bool validate_struct_init(Checker *c, Node *sinit, Type *target_type, int line) {
     Type *st = type_unwrap_distinct(target_type);
     if (st->kind != TYPE_STRUCT) {
@@ -12292,6 +12398,17 @@ static int64_t vrp_const_value(Checker *c, Node *n, Type *dest) {
      * BUG-1062's i128 trap test with BUG-1090). */
     if (n && n->kind == NODE_INT_LIT && n->int_lit.value <= (uint64_t)INT64_MAX)
         return (int64_t)n->int_lit.value;
+    /* BUG-1538: and so is a NEGATED lone literal into a SIGNED type — `i128 m
+     * = -1; 10 / m` was "divisor not proven nonzero" (tfold has no 128-bit
+     * model) while the i64 spelling passed. Signed only: into an unsigned type
+     * `-1` is refused elsewhere and its value is not -1. */
+    if (n && n->kind == NODE_UNARY && n->unary.op == TOK_MINUS && n->unary.operand &&
+        n->unary.operand->kind == NODE_INT_LIT &&
+        n->unary.operand->int_lit.value <= (uint64_t)INT64_MAX) {
+        Type *nt = typemap_get(c, n);
+        if (nt && type_is_signed(nt))
+            return -(int64_t)n->unary.operand->int_lit.value;
+    }
     int64_t v;
     if (!tfold(c, n, 0, &v)) return CONST_EVAL_FAIL;
     TFoldTy fty;
@@ -13009,6 +13126,23 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 Type *eff_l = type_unwrap_distinct(left);
                 Type *eff_r = type_unwrap_distinct(right);
                 TypeKind kl = type_dispatch_kind(eff_l), kr = type_dispatch_kind(eff_r);
+                /* BUG-1522: a VOID operand (`v() == v()`, or a struct literal,
+                 * which has no type without a target) passed every rule below
+                 * — type_equals(void, void) — and the IR lowered a comparison
+                 * with no operands: an INTERNAL ERROR abort. */
+                if (kl == TYPE_VOID || kr == TYPE_VOID) {
+                    Node *vn = kl == TYPE_VOID ? node->binary.left : node->binary.right;
+                    if (vn && vn->kind == NODE_STRUCT_INIT)
+                        checker_error(c, node->loc.line,
+                            "a struct literal has no type of its own here — it cannot be "
+                            "compared (and an aggregate has no defined equality); compare "
+                            "the fields you care about individually");
+                    else
+                        checker_error(c, node->loc.line,
+                            "cannot compare a 'void' value — the expression produces no value");
+                    result = ty_bool;
+                    break;
+                }
                 bool agg_l = (kl == TYPE_SLICE || kl == TYPE_ARRAY ||
                               kl == TYPE_STRUCT || kl == TYPE_UNION);
                 bool agg_r = (kr == TYPE_SLICE || kr == TYPE_ARRAY ||
@@ -13273,6 +13407,23 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             {
                 Node *root = node->unary.operand;
                 while (root) {
+                    /* BUG-1541: an element / field reached THROUGH a const (or
+                     * volatile) slice or pointer is const (volatile) memory —
+                     * `*u32 q = &s[1]` from a `const [*]u32 s` handed out a
+                     * writable pointer into .rodata. */
+                    Node *ob = root->kind == NODE_FIELD ? root->field.object
+                             : root->kind == NODE_INDEX ? root->index_expr.object : NULL;
+                    if (ob) {
+                        Type *ot = typemap_get(c, ob);
+                        Type *oe = ot ? type_unwrap_distinct(ot) : NULL;
+                        if (oe && type_dispatch_kind(oe) == TYPE_SLICE) {
+                            if (oe->slice.is_const) result->pointer.is_const = true;
+                            if (oe->slice.is_volatile) result->pointer.is_volatile = true;
+                        } else if (oe && type_dispatch_kind(oe) == TYPE_POINTER) {
+                            if (oe->pointer.is_const) result->pointer.is_const = true;
+                            if (oe->pointer.is_volatile) result->pointer.is_volatile = true;
+                        }
+                    }
                     if (root->kind == NODE_FIELD) root = root->field.object;
                     else if (root->kind == NODE_INDEX) root = root->index_expr.object;
                     else break;
@@ -13487,6 +13638,11 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * target is a pointer type. Same logic as var_decl hook. */
         route_alloc_to_ptr_if_needed(c, node->assign.value, target);
         Type *value = check_expr(c, node->assign.value);
+        /* BUG-1516: make the array view explicit BEFORE the taint / escape
+         * blocks below read the value's shape (value_flows_to, further down,
+         * would be too late for them). */
+        if (node->assign.op == TOK_EQ && value && target && can_implicit_coerce(value, target))
+            make_array_view_explicit(c, node->assign.value, value, target);
         /* BUG-1271: the compound container-provenance map follows every store. */
         if (node->assign.target->kind == NODE_IDENT) {
             if (node->assign.op == TOK_EQ)
@@ -13706,16 +13862,9 @@ static Type *check_expr_impl(Checker *c, Node *node) {
              * from, and CLEARS it when the value came from none — so
              * `u32 t = g; t = 5; g = t;` is not an RMW. Only a bare local ident
              * target: a write through a projection is not a rebinding. */
-            if (node->assign.op == TOK_EQ &&
-                node->assign.target && node->assign.target->kind == NODE_IDENT &&
-                !gs) {
-                rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
-                            &c->rmw_taint_capacity, 0,
-                            node->assign.target->ident.name,
-                            (uint32_t)node->assign.target->ident.name_len,
-                            rmw_value_source_global(c, c->rmw_taints,
-                                c->rmw_taint_count, node->assign.value, 0));
-            }
+            if (!gs)
+                rmw_taint_maintain(c, &c->rmw_taints, &c->rmw_taint_count,
+                                   &c->rmw_taint_capacity, node);
             /* BUG-1046: `h.p = &g` / `q = &g` — the local now designates g. */
             if (node->assign.op == TOK_EQ && node->assign.target)
                 rmw_bind_carrier_main(c, node->assign.target, node->assign.value);
@@ -13726,25 +13875,9 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * type (not a pointer, which auto-derefs to lvalue), reject.
          * Deref (*expr) makes it an lvalue, so stop walking at NODE_UNARY. */
         {
-            Node *t = node->assign.target;
-            while (t) {
-                if (t->kind == NODE_FIELD) t = t->field.object;
-                else if (t->kind == NODE_INDEX) t = t->index_expr.object;
-                else break;
-            }
-            if (t && (t->kind == NODE_INT_LIT || t->kind == NODE_STRING_LIT ||
-                t->kind == NODE_NULL_LIT || t->kind == NODE_BOOL_LIT)) {
+            if (!expr_is_assignable_place(c, node->assign.target, 0))
                 checker_error(c, node->loc.line,
                     "cannot assign to expression — not an lvalue");
-            }
-            /* function call: only reject if it returns a value type (not pointer) */
-            if (t && t->kind == NODE_CALL) {
-                Type *call_ret = checker_get_type(c, t);
-                if (call_ret && call_ret->kind != TYPE_POINTER) {
-                    checker_error(c, node->loc.line,
-                        "cannot assign to expression — not an lvalue");
-                }
-            }
 
             /* BUG-967: the VIEW HEADER is read-only. Both spellings land here —
              * `s.len = n` and `s.len += n` are the same NODE_ASSIGN, differing only
@@ -13920,6 +14053,18 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     }
                     root = root->field.object;
                 } else if (root->kind == NODE_INDEX) {
+                    /* BUG-1541: an element of a CONST SLICE is read-only memory —
+                     * the slice's const lives in its TYPE, not on a Symbol, so a
+                     * `const [*]u32` PARAMETER / struct field / call result
+                     * (`void w(const [*]u32 s) { s[0] += 9; }`, `n.name[0] = 65`)
+                     * wrote into .rodata (a fault hosted, a flash write on bare
+                     * metal). Same rule as an element through a `const *T`. */
+                    Type *ix_obj = typemap_get(c, root->index_expr.object);
+                    Type *ix_eff = ix_obj ? type_unwrap_distinct(ix_obj) : NULL;
+                    if (ix_eff && type_dispatch_kind(ix_eff) == TYPE_SLICE && ix_eff->slice.is_const)
+                        through_const_pointer = true;
+                    if (ix_eff && type_dispatch_kind(ix_eff) == TYPE_POINTER && ix_eff->pointer.is_const)
+                        through_const_pointer = true;
                     root = root->index_expr.object;
                 } else {
                     /* H1 (2026-08-02): a NODE_UNARY that is NOT a deref — in
@@ -14928,24 +15073,24 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (node->assign.value->kind == NODE_ORELSE &&
                 node->assign.value->orelse.fallback) {
                 Node *fb = node->assign.value->orelse.fallback;
+                /* BUG-1516: a SLICE of an array is the same view — the
+                 * explicit `opt orelse local_buf[0..]` was never checked here
+                 * (accepted: a dangling global), and the implicit spelling is
+                 * now made explicit by value_flows_to. */
+                if (fb->kind == NODE_SLICE && fb->slice.object) fb = fb->slice.object;
                 Type *fb_type = typemap_get(c, fb);
                 if (fb_type && type_unwrap_distinct(fb_type)->kind == TYPE_ARRAY) {
                     arr_checks[arr_check_count++] = fb;
                 }
             }
             for (int aci = 0; aci < arr_check_count; aci++) {
-                Node *vroot = arr_checks[aci];
-                while (vroot && (vroot->kind == NODE_FIELD || vroot->kind == NODE_INDEX)) {
-                    if (vroot->kind == NODE_FIELD) vroot = vroot->field.object;
-                    else vroot = vroot->index_expr.object;
-                }
-                if (vroot && vroot->kind == NODE_IDENT) {
-                    Symbol *vsym = scope_lookup(c->current_scope,
-                        vroot->ident.name, (uint32_t)vroot->ident.name_len);
-                    bool val_is_global = vsym &&
-                        (vsym->is_static || global_decl_lookup(c,
-                            vsym->name, vsym->name_len) != NULL);
-                    if (vsym && !val_is_global) {
+                /* BUG-1516: the ONE frame-storage query (array_view_frame_root,
+                 * BUG-1354) — it sees through a slice, stops at a pointer step
+                 * and knows an array PARAM names the caller's memory; the
+                 * hand-rolled root walk here did none of that. */
+                Symbol *vsym = array_view_frame_root(c, arr_checks[aci]);
+                {
+                    if (vsym) {
                         /* value root is local — reject if target is global/static OR
                          * a pointer-param field (escape-matrix H2: array->slice into
                          * a *Holder field previously slipped). */
@@ -16126,6 +16271,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * inner-kind class. */
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
+                        ring_push_value_check(c, elt, node->call.args[0], node->loc.line);
                         if (elt && type_carries_data_pointer(elt, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
@@ -16160,6 +16306,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * predicate — the push sibling, fixed in the same commit). */
                     if (node->call.arg_count == 1) {
                         Type *elt = obj->ring.elem;
+                        ring_push_value_check(c, elt, node->call.args[0], node->loc.line);
                         if (elt && type_carries_data_pointer(elt, 0))
                             checker_warning(c, node->loc.line,
                                 "pushing pointer through Ring channel — "
@@ -16922,14 +17069,23 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                 /* Slice-borrow case (BUG-751): the IDENT may not carry
                                  * is_local_derived (a local ARRAY ident is plain), but
                                  * `local[0..]` still borrows stack memory. */
-                                if (ld_via_slice && arg_sym && !arg_sym->is_static && edge_vkind == KV_NONE) {
-                                    bool sym_is_global = global_decl_lookup(c,
-                                        arg_sym->name, arg_sym->name_len) != NULL;
-                                    if (!sym_is_global && !arg_sym->is_local_derived) {
+                                /* BUG-1516 follow-up: through the ONE frame-storage query
+                                 * — the hand-rolled walk ignored pointer / slice steps, so
+                                 * `stash(a.arr)` with `a` a `*A` (now spelled `a.arr[..]`)
+                                 * was a "slice borrowing local 'a'". */
+                                if (ld_via_slice && edge_vkind == KV_NONE) {
+                                    Node *sv = ld_nodes[ldi];
+                                    while (sv && sv->kind != NODE_SLICE &&
+                                           (sv->kind == NODE_FIELD || sv->kind == NODE_INDEX))
+                                        sv = sv->kind == NODE_FIELD ? sv->field.object
+                                                                    : sv->index_expr.object;
+                                    Symbol *fr = sv ? array_view_frame_root(c, sv) : NULL;
+                                    if (fr && !fr->is_local_derived) {
                                         edge_vkind = KV_SLICE_LOCAL;
-                                        edge_argname = arg_sym->name; edge_argname_len = arg_sym->name_len;
+                                        edge_argname = fr->name; edge_argname_len = fr->name_len;
                                     }
                                 }
+                                (void)arg_sym;
                             }
                         }
                         if (arg_node->kind == NODE_IDENT) {
@@ -17748,6 +17904,27 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                     mark_proven(c, node);
                 }
             }
+            /* BUG-1515: a CONSTANT index that is not a lone literal — `a[2 + 2]`,
+             * `a[IDX(2)]` (a comptime call), `a[K * 2]` — compiled to a runtime
+             * bounds check that ALWAYS traps (bare metal: a trap in the field)
+             * instead of the compile error `a[4]` gets. The typed fold is the
+             * value the emitter renders (BUG-1090), so in range it is proven. */
+            else if (node->index_expr.index->kind != NODE_IDENT) {
+                int64_t kv = vrp_const_value(c, node->index_expr.index, NULL);
+                if (kv != CONST_EVAL_FAIL && kv >= 0) {
+                    if ((uint64_t)kv >= obj->array.size) {
+                        if (c->shortcircuit_rhs_depth == 0) {
+                            checker_error(c, node->loc.line,
+                                "array index %lld (a constant expression) is out of "
+                                "bounds for array of size %llu",
+                                (long long)kv, (unsigned long long)obj->array.size);
+                            mark_proven(c, node);   /* diagnosed — no auto-guard */
+                        }
+                    } else {
+                        mark_proven(c, node);
+                    }
+                }
+            }
             /* range propagation: check if index ident has proven range */
             if (node->index_expr.index->kind == NODE_IDENT) {
                 struct VarRange *r = find_var_range(c,
@@ -18253,6 +18430,23 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                 }
             }
             result = type_slice(c->arena, obj->array.inner);
+            /* BUG-1529: a view of a volatile / const array IS a volatile / const
+             * slice — typed plain, the emitter named `_zer_slice_T` where the
+             * parameter wanted `_zer_vslice_T` (GCC refused `read(hw[0..])`).
+             * The qualifier-drop rules already refuse a plain destination. */
+            {
+                bool av = false, ac = false;
+                array_view_qualifiers(c, node->slice.object, &av, &ac);
+                if ((av || ac) && result) {
+                    Type *q = (Type *)arena_alloc(c->arena, sizeof(Type));
+                    if (q) {
+                        *q = *result;
+                        q->slice.is_volatile = av;
+                        q->slice.is_const = ac;
+                        result = q;
+                    }
+                }
+            }
         } else if (obj->kind == TYPE_SLICE) {
             result = obj; /* slice of slice = same slice type */
         } else if (type_is_integer(obj) && type_dispatch_kind(obj) == TYPE_ENUM) {
@@ -18755,6 +18949,14 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * arg0 (value args are checked normally, so reading another atomic cell
          * as a value is still caught). */
         bool atomic_intr = (nlen >= 7 && memcmp(name, "atomic_", 7) == 0);
+        /* BUG-1524: an intrinsic gives a struct LITERAL operand no type — it was
+         * emitted as `(void){ .x = 1 }` and GCC refused it. */
+        for (int i = 0; i < node->intrinsic.arg_count; i++)
+            if (node->intrinsic.args[i] && node->intrinsic.args[i]->kind == NODE_STRUCT_INIT)
+                checker_error(c, node->loc.line,
+                    "@%.*s: a struct literal has no type of its own here — declare a "
+                    "typed local first (`T v = { ... };`) and pass that",
+                    (int)nlen, name);
         for (int i = 0; i < node->intrinsic.arg_count; i++) {
             if (has_field_arg && i == node->intrinsic.arg_count - 1) {
                 /* last arg is a field name — don't look up as variable */
@@ -20649,6 +20851,17 @@ static Type *check_expr_impl(Checker *c, Node *node) {
             if (!is_load && !is_store && !is_cas && !is_arith) {
                 checker_error(c, node->loc.line, "unknown atomic intrinsic '@%.*s'", (int)nlen, name);
             }
+            /* BUG-1541: a WRITING atomic through a pointer to const memory —
+             * `@atomic_add(&s[0], 1)` with `s` a `const [*]u32` (the element's
+             * address is a const pointer since BUG-1541) wrote into .rodata. */
+            if (!is_load && node->intrinsic.arg_count > 0) {
+                Type *pt0 = typemap_get(c, node->intrinsic.args[0]);
+                Type *pe0 = pt0 ? type_unwrap_distinct(pt0) : NULL;
+                if (pe0 && type_dispatch_kind(pe0) == TYPE_POINTER && pe0->pointer.is_const)
+                    checker_error(c, node->loc.line,
+                        "@%.*s writes through a pointer to const memory — data is read-only",
+                        (int)nlen, name);
+            }
             /* Operand must be SHARED-CAPABLE storage. An atomic on a STACK LOCAL
              * is meaningless: the frame is private, so no other thread can hold a
              * stable reference to it (and if its address escaped to a thread, the
@@ -21529,6 +21742,8 @@ static bool func_props_merge_reached(Checker *c, Symbol *fs, void *ud) {
     if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
     if (fs->props.can_cond_wait)                                   /* BUG-1476 */
         parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
+    if (fs->props.can_block)                               /* BUG-1512 */
+        parent_sym->props.can_block = parent_sym->props.block_via_call = true;
     return false;   /* visit every target */
 }
 
@@ -21574,7 +21789,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     if (parent_sym->props.can_yield && parent_sym->props.can_spawn &&
         parent_sym->props.can_alloc && parent_sym->props.has_sync &&
         parent_sym->props.can_enable_int && parent_sym->props.can_cond_wait &&
-        parent_sym->props.cond_wait_via_call)
+        parent_sym->props.cond_wait_via_call && parent_sym->props.can_block &&
+        parent_sym->props.block_via_call)
         return;
 
     switch (node->kind) {
@@ -21617,6 +21833,11 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
         if ((nl == 9 && memcmp(n, "cond_wait", 9) == 0) ||
             (nl == 14 && memcmp(n, "cond_timedwait", 14) == 0))
             parent_sym->props.can_cond_wait = true;                  /* BUG-1476 */
+        if ((nl == 9 && memcmp(n, "cond_wait", 9) == 0) ||
+            (nl == 14 && memcmp(n, "cond_timedwait", 14) == 0) ||
+            (nl == 12 && memcmp(n, "barrier_wait", 12) == 0) ||
+            (nl == 11 && memcmp(n, "sem_acquire", 11) == 0))
+            parent_sym->props.can_block = true;                      /* BUG-1512 */
         for (int i = 0; i < node->intrinsic.arg_count; i++)
             scan_func_props(c, node->intrinsic.args[i], parent_sym);
         return;
@@ -21717,6 +21938,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
                 if (callee->props.can_cond_wait)                       /* BUG-1476 */
                     parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
+                if (callee->props.can_block)                               /* BUG-1512 */
+                    parent_sym->props.can_block = parent_sym->props.block_via_call = true;
             }
         }
 
@@ -21759,6 +21982,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (fs->props.can_enable_int) parent_sym->props.can_enable_int = true;
                 if (fs->props.can_cond_wait)                           /* BUG-1476 */
                     parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
+                if (fs->props.can_block)                               /* BUG-1512 */
+                    parent_sym->props.can_block = parent_sym->props.block_via_call = true;
             }
         }
 
@@ -21787,6 +22012,8 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
                 if (callee->props.can_enable_int) parent_sym->props.can_enable_int = true;
                 if (callee->props.can_cond_wait)                       /* BUG-1476 */
                     parent_sym->props.can_cond_wait = parent_sym->props.cond_wait_via_call = true;
+                if (callee->props.can_block)                               /* BUG-1512 */
+                    parent_sym->props.can_block = parent_sym->props.block_via_call = true;
                 }
             }
         }
@@ -21895,19 +22122,102 @@ static void scan_func_props(Checker *c, Node *node, Symbol *parent_sym) {
     }
 }
 
+/* BUG-1523: a Ring push is a VALUE-FLOW sink (the value is copied into an
+ * element of type T) and was the one that never asked value_flows_to — so
+ * `Ring(u8, 4).push(k)` with `u32 k = 300` stored 44 with no diagnostic, a
+ * struct of the wrong type reached GCC, and a struct LITERAL (no type of its
+ * own) was emitted as `(void){ .v = y }`, which GCC refuses. */
+static void ring_push_value_check(Checker *c, Type *elt, Node *arg, int line) {
+    if (!elt || !arg) return;
+    Type *at = typemap_get(c, arg);
+    if (arg->kind == NODE_STRUCT_INIT) {
+        Type *lt = type_struct_literal(c, arg, elt, line);
+        if (lt) at = lt;
+    }
+    if (!at) return;
+    /* the array -> slice hazards (qualifier drop, packed misalignment) every
+     * other value-flow sink asks (BUG-1057) */
+    reject_array_view_hazards(c, arg, elt, line);
+    if (!value_flows_to(arg, at, elt) &&
+        !report_value_flow_refusal(c, arg, elt, line, "ring push")) {
+        char an[96], en[96];
+        snprintf(an, sizeof(an), "%s", type_name(at));
+        snprintf(en, sizeof(en), "%s", type_name(elt));
+        checker_error(c, line, "cannot push '%s' into a Ring of '%s'", an, en);
+    }
+}
+
+/* BUG-1525: is this expression a PLACE that an assignment can write? An
+ * ALLOW-list (exhaustive, no default): the old rule was a deny-list of
+ * literals and value-returning calls, so `~x = 5`, `(u32)x = 3`, `(x + 1) = 3`
+ * reached GCC ("lvalue required"), and `@truncate(u32, x) = 3` /
+ * `@bitcast(u32, x) = 9` COMPILED and threw the write away (x unchanged). A
+ * field / index through a pointer, slice or Handle names storage whatever the
+ * object expression is (`f().x`, `pool.get(h).x`, `sl()[0]`). */
+static bool expr_is_assignable_place(Checker *c, Node *t, int depth) {
+    if (!t || depth > ZER_EXPR_WALK_MAX) return false;
+    switch (t->kind) {
+    case NODE_IDENT: return true;
+    case NODE_UNARY: return t->unary.op == TOK_STAR;
+    case NODE_FIELD: case NODE_INDEX: case NODE_SLICE: {
+        Node *obj = t->kind == NODE_FIELD ? t->field.object
+                  : t->kind == NODE_INDEX ? t->index_expr.object : t->slice.object;
+        TypeKind ok = type_dispatch_kind(checker_get_type(c, obj));
+        /* a SLICE is a place only as a BIT-slice of an integer (`reg[7..4] = v`);
+         * a slice of an array / slice is a view VALUE (`a[0..2] = s` reached GCC) */
+        if (t->kind == NODE_SLICE && !type_is_integer(checker_get_type(c, obj)))
+            return false;
+        if (ok == TYPE_POINTER || ok == TYPE_SLICE || ok == TYPE_HANDLE)
+            return true;
+        return expr_is_assignable_place(c, obj, depth + 1);
+    }
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_BINARY: case NODE_ASSIGN: case NODE_CALL: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_CAST: case NODE_TYPECAST: case NODE_SIZEOF:
+    case NODE_STRUCT_INIT:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE:
+    case NODE_DEFER: case NODE_GOTO: case NODE_LABEL: case NODE_EXPR_STMT: case NODE_ASM:
+    case NODE_CRITICAL: case NODE_ONCE: case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT:
+    case NODE_DO_WHILE: case NODE_STATIC_ASSERT:
+        return false;
+    }
+    return false;
+}
+
 /* Lazy compute function properties with DFS cycle detection.
- * Call this before reading sym->props. Idempotent — second call is O(1). */
-static void ensure_func_props(Checker *c, Symbol *sym) {
+ * Call this before reading sym->props. Idempotent — second call is O(1).
+ *
+ * BUG-1511: a call CYCLE used to be "conservative (no additional effects)", which
+ * is the UNSAFE direction for a summary read by a ban: with `a(){ b(); alloc }`,
+ * `b(){ c(); }`, `c(){ a(); }`, computing c's summary first froze b's summary while
+ * a was still in progress — before a's own alloc was seen — so `@critical { b(); }`
+ * reached calloc with interrupts disabled and was accepted (the c() spelling was
+ * refused). The flags only ever turn ON, so the summaries form a monotone system:
+ * the outermost call re-runs the DFS under a fresh epoch until no flag changes. */
+static void ensure_func_props_once(Checker *c, Symbol *sym) {
     if (!sym || !sym->is_function) return;
     /* BUG-1425: a summary computed before every body was typed could not resolve
      * its indirect calls (the callee's type was not known yet); the epoch bump in
      * check_deferred_body_effects makes it recompute. The flags only ever turn
      * ON, so the facts found the first time stay valid. */
     if (sym->props.computed && sym->props.epoch == c->props_epoch) return;
-    if (sym->props.in_progress) return; /* cycle — conservative (no additional effects) */
+    if (sym->props.in_progress) {        /* cycle — partial, iterate (BUG-1511) */
+        c->props_cycle_hit = true;
+        return;
+    }
     if (!sym->func_node) return;        /* no body (cinclude, forward decl without body) */
 
     sym->props.in_progress = true;
+    bool b_y = sym->props.can_yield, b_s = sym->props.can_spawn,
+         b_a = sym->props.can_alloc, b_h = sym->props.has_sync,
+         b_e = sym->props.can_enable_int, b_w = sym->props.can_cond_wait,
+         b_v = sym->props.cond_wait_via_call, b_k = sym->props.can_block,
+         b_kc = sym->props.block_via_call;
 
     Node *body = NULL;
     if (sym->func_node->kind == NODE_FUNC_DECL)
@@ -21923,9 +22233,34 @@ static void ensure_func_props(Checker *c, Symbol *sym) {
         }
     }
 
+    if (b_y != sym->props.can_yield || b_s != sym->props.can_spawn ||
+        b_a != sym->props.can_alloc || b_h != sym->props.has_sync ||
+        b_e != sym->props.can_enable_int || b_w != sym->props.can_cond_wait ||
+        b_v != sym->props.cond_wait_via_call || b_k != sym->props.can_block ||
+        b_kc != sym->props.block_via_call)
+        c->props_changed = true;
     sym->props.in_progress = false;
     sym->props.computed = true;
     sym->props.epoch = c->props_epoch;
+}
+
+static void ensure_func_props(Checker *c, Symbol *sym) {
+    if (c->props_depth > 0) { ensure_func_props_once(c, sym); return; }
+    c->props_depth++;
+    bool sv_hit = c->props_cycle_hit;
+    c->props_cycle_hit = false;
+    ensure_func_props_once(c, sym);
+    /* every pass re-scans each reachable function and can only turn flags on, so
+     * this terminates within (functions x flags) passes; in practice one extra. */
+    while (c->props_cycle_hit) {
+        c->props_cycle_hit = false;
+        c->props_changed = false;
+        c->props_epoch++;
+        ensure_func_props_once(c, sym);
+        if (!c->props_changed) break;
+    }
+    c->props_cycle_hit = sv_hit;
+    c->props_depth--;
 }
 
 /* Check a body subtree for banned effects. Used at context entry points
@@ -21986,6 +22321,23 @@ static void run_body_effects(Checker *c, int kind, Node *body, Node *scope_fn, i
             false, NULL,
             true, "cannot spawn inside interrupt handler — pthread_create in ISR is unsafe",
             true, "cannot allocate inside interrupt handler — heap allocation may deadlock");
+        /* BUG-1512: a BLOCKING wait (@cond_wait / @cond_timedwait /
+         * @barrier_wait / @sem_acquire) is refused when written in the handler,
+         * and was accepted one call away — the handler then sleeps on a lock or
+         * a count only a thread it preempted can release. */
+        {
+            Symbol tmp = {0};
+            tmp.is_function = true;
+            tmp.props.in_progress = true;
+            tmp.func_node = scope_fn;
+            scan_func_props(c, body, &tmp);
+            if (tmp.props.block_via_call)
+                checker_error(c, line,
+                    "interrupt handler calls a function that may block (@cond_wait / "
+                    "@cond_timedwait / @barrier_wait / @sem_acquire, directly or in a "
+                    "callee) — a blocking wait hangs the ISR. Signal a thread instead "
+                    "(@cond_signal / @sem_release are allowed)");
+        }
         return;
     case BODY_EFFECTS_CRITICAL: {
         check_body_effects(c, body, scope_fn, line,
@@ -22006,6 +22358,14 @@ static void run_body_effects(Checker *c, int kind, Node *body, Node *scope_fn, i
             tmp.props.in_progress = true;
             tmp.func_node = scope_fn;   /* BUG-1425 */
             scan_func_props(c, body, &tmp);
+            /* BUG-1512: the transitive sibling of the direct `@cond_wait` ban in
+             * @critical — waiting on a mutex with interrupts disabled. */
+            if (tmp.props.cond_wait_via_call)
+                checker_error(c, line,
+                    "@critical body calls a function that may @cond_wait / "
+                    "@cond_timedwait (directly or in a callee) — it would release and "
+                    "wait on a mutex with interrupts disabled (deadlock). Move the call "
+                    "outside @critical");
             if (tmp.props.can_enable_int)
                 checker_error(c, line,
                     "@critical body re-enables or waits for interrupts (@cpu_enable_int / "
@@ -23077,13 +23437,9 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
                 _is_rmw = true;
             /* Maintain the taint: a plain `local = <expr>` re-binds it, and a
              * value from no global CLEARS it. */
-            if (node->assign.op == TOK_EQ && !ts &&
-                node->assign.target->kind == NODE_IDENT)
-                rmw_tab_set(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap, 0,
-                             node->assign.target->ident.name,
-                             (uint32_t)node->assign.target->ident.name_len,
-                             rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
-                                                     node->assign.value, 0));
+            if (!ts)
+                rmw_taint_maintain(c, &_rmw_vtaint, &_rmw_vtaint_count,
+                                   &_rmw_vtaint_cap, node);   /* BUG-1526 */
             (void)_is_rmw;
             /* BUG-1124: every global the target may land on (a retargeted
              * pointer), each classified against its own name. */
@@ -24004,6 +24360,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
             route_alloc_to_ptr_if_needed(c, node->var_decl.init, type);
 
             Type *init_type = check_expr(c, node->var_decl.init);
+            if (init_type && type && can_implicit_coerce(init_type, type))   /* BUG-1516 */
+                make_array_view_explicit(c, node->var_decl.init, init_type, type);
             /* BUG-799: an @inttoptr result is a peripheral address; a non-volatile
              * destination lets GCC coalesce or delete the accesses. */
             check_inttoptr_dest_volatile(c, node->var_decl.init, type, node->loc.line);
@@ -25701,7 +26059,16 @@ static void check_stmt_impl(Checker *c, Node *node) {
     }
 
     case NODE_SWITCH: {
+        if (node->switch_stmt.expr && node->switch_stmt.expr->kind == NODE_STRUCT_INIT)
+            checker_error(c, node->loc.line,      /* BUG-1524 */
+                "cannot switch on a struct literal — it has no type of its own here");
         Type *expr = check_expr(c, node->switch_stmt.expr);
+        /* BUG-1544: `switch (v())` on a VOID call was accepted and the default
+         * arm's body silently dropped (nothing to dispatch on). */
+        if (expr && type_dispatch_kind(expr) == TYPE_VOID &&
+            node->switch_stmt.expr && node->switch_stmt.expr->kind != NODE_STRUCT_INIT)
+            checker_error(c, node->loc.line,
+                "cannot switch on a 'void' value — the expression produces no value");
         /* BUG-271: unwrap distinct for union/enum switch dispatch */
         Type *expr_eff = expr ? type_unwrap_distinct(expr) : NULL;
 
@@ -28542,6 +28909,24 @@ static void check_stmt_impl(Checker *c, Node *node) {
              * cross-thread stack-UAF was masked only by an emitter limitation
              * (GCC rejected the slice assignment), so the checker itself accepted
              * it. Verified: `zerc -o x.c` emits NO diagnostic on main. */
+            /* BUG-1279: a fire-and-forget thread RETAINS the pointer past this
+             * call — the parameter it came from escapes, which is what keep
+             * means. `void mid(*S w) { spawn grand(w); }` then `mid(&local)`
+             * handed a stack frame to a detached thread (ASan
+             * stack-use-after-return); keep makes the call site refuse it.
+             * BUG-1521: for EVERY argument that carries a pointer, not only a bare
+             * pointer / slice — a by-value struct carrying `*shared S`
+             * (`void start(C c) { spawn wc(c); }`, exempt from the non-shared
+             * carrier rule) inferred no keep, so `start(c)` with `c.s = &loc`
+             * handed a stack frame to the thread (ASan stack-use-after-return;
+             * the heap spelling wrote 99 into a recycled object). */
+            if (!is_scoped &&
+                type_carries_data_pointer(checker_get_type(c, node->spawn_stmt.args[i]), 0) &&
+                !spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i]))
+                /* BUG-1363: every spelling of the argument — `spawn grand(id(w))`,
+                 * `spawn grand(h.p)` — through the one value query. */
+                infer_mark_param_keep_mask(c,
+                    keep_value_roots(c, node->spawn_stmt.args[i], 0));
             Type *eff_pl = eff;
             if (eff_pl->kind == TYPE_OPTIONAL)
                 eff_pl = type_unwrap_distinct(eff_pl->optional.inner);
@@ -28559,17 +28944,6 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 }
                 bool stack_derived =
                     spawn_arg_is_stack_derived(c, node->spawn_stmt.args[i]);
-                /* BUG-1279: a fire-and-forget thread RETAINS the pointer past this
-                 * call — the parameter it came from escapes, which is what keep
-                 * means. `void mid(*S w) { spawn grand(w); }` then `mid(&local)`
-                 * handed a stack frame to a detached thread (ASan
-                 * stack-use-after-return); keep makes the call site refuse it. */
-                if (!is_scoped && !stack_derived &&
-                    type_carries_data_pointer(checker_get_type(c, node->spawn_stmt.args[i]), 0))
-                    /* BUG-1363: every spelling of the argument — `spawn grand(id(w))`,
-                     * `spawn grand(h.p)` — through the one value query. */
-                    infer_mark_param_keep_mask(c,
-                        keep_value_roots(c, node->spawn_stmt.args[i], 0));
                 if (is_scoped) {
                     /* OK — scoped spawn, thread joined before scope exit */
                 } else if (stack_derived) {
@@ -37803,10 +38177,24 @@ static int collect_shared_types_in_stmt(Checker *c, Node *stmt, Type **types, in
     case NODE_IF: return collect_shared_types_in_expr(c, stmt->if_stmt.cond, types, max_types, 0);
     case NODE_WHILE: case NODE_DO_WHILE: return collect_shared_types_in_expr(c, stmt->while_stmt.cond, types, max_types, 0);
     case NODE_FOR: {
-        int n = collect_shared_types_in_expr(c, stmt->for_stmt.init, types, max_types, 0);
-        if (stmt->for_stmt.cond)
-            n = collect_shared_types_in_expr(c, stmt->for_stmt.cond, types, max_types, n);
-        return n;
+        /* BUG-1518: init, cond and STEP are three separate lock scopes in the
+         * emitted C (the init is lowered as its own statement, cond and step
+         * each take their own group). The STEP was never collected, so
+         * `for (...; ...; i += a.x + b.y)` (two shared types, held together)
+         * was accepted — measured: a two-thread A->B / B->A hang; and init and
+         * cond were merged into ONE set, refusing `for (u32 k = a.x; b.y < 3; …)`
+         * which never holds both. Answer for the position with the most types. */
+        Node *best = NULL;
+        int bestn = 0;
+        for (int pi = 0; pi < 3; pi++) {
+            Node *e = pi == 0 ? stmt->for_stmt.init
+                    : pi == 1 ? stmt->for_stmt.cond : stmt->for_stmt.step;
+            if (!e) continue;
+            int n = collect_shared_types_in_expr(c, e, types, max_types, 0);
+            if (n > bestn) { bestn = n; best = e; }
+        }
+        if (!best) return 0;
+        return collect_shared_types_in_expr(c, best, types, max_types, 0);
     }
     case NODE_SWITCH: return collect_shared_types_in_expr(c, stmt->switch_stmt.expr, types, max_types, 0);
     /* Stage 2 Part B (2026-04-28): exhaustive — same shape as

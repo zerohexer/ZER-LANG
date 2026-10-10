@@ -1,0 +1,22 @@
+// expect-error: is maybe-freed
+// BUG-1530: a callee freeing `gs[i]` (a variable index) was keyed on the
+// callee's own local name and never met the caller's `gs[1]` entry — a read
+// through `a` hit a recycled object (exit 99).
+struct T { u32 v; }
+?*T[4] gs;
+u32 gi = 1;
+void zap() {
+    u32 i = gi;
+    if (i < 4) { if (gs[i]) |p| { free(p); } gs[i] = null; }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    gs[1] = a;
+    zap();
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    return r;
+}

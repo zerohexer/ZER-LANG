@@ -1,0 +1,21 @@
+// expect-error: cannot satisfy 'keep' parameter
+// BUG-1521: a helper spawning a by-value struct carrying `*shared S` inferred no
+// keep, so a caller's stack object reached a detached thread (ASan
+// stack-use-after-return).
+shared struct S { u32 n; }
+struct C { *S s; }
+void wc(C c) {
+    for (u32 i = 0; i < 50000000; i += 1) { }
+    c.s.n = 99;
+}
+void start(C c) { spawn wc(c); }
+void run() {
+    S loc;
+    C c = { .s = &loc };
+    start(c);
+}
+u32 main() {
+    run();
+    for (u32 i = 0; i < 200000000; i += 1) { }
+    return 0;
+}

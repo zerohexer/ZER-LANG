@@ -1,0 +1,4 @@
+// expect-error: a struct literal has no type of its own here
+// BUG-1524: an untyped struct literal as an intrinsic operand reached GCC.
+struct P { u32 x; u32 y; }
+u32 main() { u64 r = @bitcast(u64, { .x = 1, .y = 2 }); return 0; }

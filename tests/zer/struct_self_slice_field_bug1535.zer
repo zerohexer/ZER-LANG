@@ -1,0 +1,4 @@
+// BUG-1535: a struct holding a slice of ITSELF named `_zer_slice_N` before it
+// was declared (the slice typedef followed the struct body).
+struct N { u32 v; [*]N kids; }
+u32 main() { N n; n.v = 1; return n.v - 1; }

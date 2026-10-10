@@ -1,0 +1,22 @@
+// expect-error: designates the same allocation as global
+// BUG-1530 sibling: global struct array slot freed by a callee at a variable index.
+struct T { u32 v; }
+struct Reg { ?*T[4] slots; }
+Reg greg;
+volatile u32 gk;
+void reg(*T p, u32 i) { if (i < 4) { greg.slots[i] = p; } }
+void zap(u32 i) { if (i < 4) { if (greg.slots[i]) |p| { free(p); } greg.slots[i] = null; } }
+u32 bad(*T t) {
+    zap(gk);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = t.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    reg(a, gk);
+    return bad(a);
+}

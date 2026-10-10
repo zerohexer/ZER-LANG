@@ -1,0 +1,16 @@
+// BUG-1519: an async task struct dropped `volatile` from its locals (GCC -O2
+// deleted the delay loop), a static nested in a block was undeclared, and a
+// `static ?u32` got an initializer GCC refused.
+async void adelay(u32 k) {
+    volatile u32 i = 0;
+    while (i < 10) { i += 1; }
+    if (k > 0) { static u32 cnt = 0; cnt += 1; }
+    static ?u32 o = 5;
+    yield;
+}
+u32 main() {
+    _zer_async_adelay t;
+    _zer_async_adelay_init(&t, 1);
+    while (_zer_async_adelay_poll(&t) == 0) { }
+    return 0;
+}

@@ -1,0 +1,10 @@
+// expect-error: @critical body calls a function that may @cond_wait
+// BUG-1512: `@critical { @cond_wait(q, ...); }` was refused, the same wait one
+// call away was accepted — a mutex wait with interrupts disabled.
+shared struct Q { u32 n; }
+Q q;
+void waiter() { @cond_wait(q, q.n > 0); }
+u32 main() {
+    @critical { waiter(); }
+    return 0;
+}

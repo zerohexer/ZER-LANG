@@ -1,0 +1,21 @@
+// expect-error: designates the same allocation as global
+// BUG-1530 sibling: the callee frees gs[i] and reads its own argument.
+struct T { u32 v; }
+?*T[4] gs;
+volatile u32 gk;
+u32 bad(*T t) {
+    u32 i = gk;
+    if (i < 4) { if (gs[i]) |p| { free(p); } gs[i] = null; }
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = t.v;
+    free(b);
+    return r;
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    u32 k = gk;
+    if (k < 4) { gs[k] = a; }
+    return bad(a);
+}

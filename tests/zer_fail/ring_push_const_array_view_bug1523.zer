@@ -1,0 +1,6 @@
+// expect-error: cannot form a mutable slice over a const array
+// BUG-1523 follow-up: a Ring push of an array into a Ring([*]T) dropped const
+// (the only value-flow sink without the array-view hazard checks).
+const u32[4] gk;
+Ring([*]u32, 2) r;
+u32 main() { r.push(gk); [*]u32 s = r.pop() orelse return; s[0] = 5; return gk[0]; }

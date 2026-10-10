@@ -1,0 +1,14 @@
+// expect-error: cannot return pointer to local
+// BUG-1516: `o.view = a.buf;` (implicit view of a LOCAL's array field into a local
+// struct) left o untainted; `return o` dangled (ASan stack-use-after-return).
+struct A { u8[4] buf; }
+struct O { [*]u8 view; }
+O mk() {
+    A a;
+    a.buf[0] = 7;
+    O o;
+    o.view = a.buf;      // implicit u8[4] -> [*]u8 of a LOCAL's array field
+    return o;            // accepted: o never tainted
+}
+u32 clobber() { u32[16] pad; pad[2] = 9; return pad[2]; }
+u32 main() { O o = mk(); clobber(); return o.view[0]; }

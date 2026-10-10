@@ -1,0 +1,22 @@
+// expect-error: bug1511.zer:20: error: cannot heap-allocate or free inside @critical
+// BUG-1511: a call CYCLE froze b's summary while a was still in progress, so
+// `@critical { b(); }` reached calloc through b -> c -> a and was accepted
+// (the same call spelled through c, in x, was refused).
+// (Line 17 is refused on every build; the expectation pins line 20.)
+struct T { u32 v; }
+volatile u32 flag;
+void b();
+void c();
+void a() {
+    if (flag == 7) { b(); }
+    ?*T t = alloc(T);
+    if (t) |p| { free(p); }
+}
+void b() { if (flag == 9) { c(); } }
+void c() { if (flag == 8) { a(); } }
+void x() { @critical { c(); } }
+u32 main() {
+    x();
+    @critical { b(); }
+    return 0;
+}

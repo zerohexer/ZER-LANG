@@ -1,0 +1,24 @@
+// BUG-1513: a condition / for-step reading TWO roots of one shared type locked
+// only the first and read the second with no lock (TSan: data race). Every
+// control-flow position now takes the statement's whole lock group.
+shared struct A { u32 x; }
+A a1;
+A a2;
+void writer() {
+    for (u32 i = 0; i < 2000; i += 1) { a2.x = i; }
+}
+u32 main() {
+    ThreadHandle th = spawn writer();
+    u32 n = 0;
+    for (u32 i = 0; i < 2000; a1.x = a2.x) {
+        if (a1.x == a2.x) { n += 1; }
+        while (a1.x > a2.x) { a1.x = 0; }
+        switch (a1.x + a2.x) { default => { n += 0; } }
+        i += 1;
+    }
+    th.join();
+    a1.x = 5;
+    a2.x = 5;
+    if (a1.x != a2.x) { return 1; }
+    return 0;
+}

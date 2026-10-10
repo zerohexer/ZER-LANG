@@ -1,0 +1,5 @@
+// BUG-1536: a funcptr whose return type is a funcptr was emitted as
+// `uint32_t (*)(uint32_t) (*fac)(uint32_t)` — not C.
+u32 inc(u32 x) { return x + 1; }
+*(u32) -> u32 pick(u32 k) { return inc; }
+u32 main() { *(u32) -> *(u32) -> u32 fac = pick; *(u32) -> u32 f = fac(0); return f(41) - 42; }

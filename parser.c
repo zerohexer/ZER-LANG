@@ -2556,6 +2556,18 @@ static Node *parse_statement(Parser *p) {
                     parse_type(p);
                     if (!p->had_error && check(p, TOK_RPAREN)) {
                         advance(p); /* consume ) */
+                        /* BUG-1537: an ARRAY of a container stamp —
+                         * `Box(u32)[3] arr;` — was a parse error locally
+                         * (a global was fine): skip the dimensions first. */
+                        while (check(p, TOK_LBRACKET)) {
+                            int depth = 0;
+                            do {
+                                if (check(p, TOK_LBRACKET)) depth++;
+                                else if (check(p, TOK_RBRACKET)) depth--;
+                                if (check(p, TOK_EOF)) break;
+                                advance(p);
+                            } while (depth > 0);
+                        }
                         is_var = check(p, TOK_IDENT);
                     }
                     p->had_error = sv_err;
@@ -2900,6 +2912,19 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
 
     /* global variable: type name = expr; or type name; */
     Node *n = new_node(p, NODE_GLOBAL_VAR);
+    /* BUG-1542: `static const u32 K = 5;`, `static volatile u32 flag;` and the
+     * `threadlocal` spellings reach here with the qualifier still WRAPPED around
+     * the type (parse_type), where resolve_type drops it from a value type ("a
+     * variable qualifier, not a type property") — the declaration flags the rest
+     * of the compiler reads were never set. `K = 9` compiled, and a `static
+     * volatile` ISR flag was emitted plain (-O2: `while (flag == 0) {}` became
+     * `jmp .`). The plain `const` / `volatile` global path (parse_var_decl) sets
+     * the flags and leaves the bare type — the same shape here. */
+    while (type && (type->kind == TYNODE_CONST || type->kind == TYNODE_VOLATILE)) {
+        if (type->kind == TYNODE_CONST) n->var_decl.is_const = true;
+        else n->var_decl.is_volatile = true;
+        type = type->qualified.inner;
+    }
     n->var_decl.type = type;
     n->var_decl.name = name;
     n->var_decl.name_len = name_len;

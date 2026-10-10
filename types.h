@@ -408,6 +408,8 @@ struct Symbol {
         bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */
         bool can_cond_wait;  /* BUG-1476: @cond_wait / @cond_timedwait (directly or transitively) */
         bool cond_wait_via_call; /* BUG-1476: ...reached through a CALL (not this body's own wait) */
+        bool can_block;      /* BUG-1512: a BLOCKING wait — @cond_wait / @cond_timedwait / @barrier_wait / @sem_acquire */
+        bool block_via_call; /* BUG-1512: ...reached through a CALL */
         /* Direct-only effect flags — set when the effect appears literally
          * in this function's immediate body (NOT through a callee). Used by
          * check_body_effects to suppress duplicate body-level errors when

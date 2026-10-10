@@ -455,6 +455,17 @@ static void emit_decl_cname_in(Emitter *e, const char *mod, uint32_t mod_len,
 /* ---- Qualifier helpers (RF11) ---- */
 
 /* Check if an expression's root symbol has volatile qualifier. */
+/* BUG-1529: the slice type a view builds, with the source's volatile kept. */
+static Type *slice_view_type(Emitter *e, Type *inner, bool is_volatile) {
+    Type *t = type_slice(e->arena, inner);
+    if (!t || !is_volatile) return t;
+    Type *v = (Type *)arena_alloc(e->arena, sizeof(Type));
+    if (!v) return t;
+    *v = *t;
+    v->slice.is_volatile = true;
+    return v;
+}
+
 static bool expr_is_volatile(Emitter *e, Node *expr) {
     /* BUG-1470: the one shared place-volatility query (moved to checker.c so
      * ir_lower asks the identical question). */
@@ -2717,13 +2728,21 @@ static void emit_type(Emitter *e, Type *t) {
         break;
 
     case TYPE_FUNC_PTR:
+        /* BUG-1536: a funcptr TYPE is emitted as a type SPECIFIER —
+         * `__typeof__(ret (*)(params))` — not as the bare abstract declarator.
+         * Every generic site writes `emit_type(T)` and then a name, a `*`, or
+         * `[N]` after it; the bare form made those `ret (*)(params) name`, not
+         * C: a funcptr RETURNING a funcptr (`*(u32) -> *(u32) -> u32 fac`), a
+         * slice of nullable funcptrs, a `?**` funcptr. The specifier form
+         * composes with any declarator, and in a cast it is the same type. */
+        emit(e, "__typeof__(");
         emit_type(e, t->func_ptr.ret);
         emit(e, " (*)(");
         for (uint32_t i = 0; i < t->func_ptr.param_count; i++) {
             if (i > 0) emit(e, ", ");
             emit_type(e, t->func_ptr.params[i]);
         }
-        emit(e, ")");
+        emit(e, "))");
         break;
 
     case TYPE_DISTINCT:
@@ -4667,12 +4686,28 @@ static void emit_expr_impl(Emitter *e, Node *node) {
          * element kind — the per-site switch here used to leave enum / Handle /
          * pointer / optional / funcptr / array / nested-slice elements to the
          * anonymous-struct fallback below, an incompatible C type at each site. */
+        /* BUG-1529: a view of a VOLATILE array is a `volatile [*]T` — every
+         * literal built here named the plain `_zer_slice_T`, so `read(hw[0..])`
+         * on a `volatile u8[4] hw` was refused by GCC (and, had it built, the
+         * view would have dropped the qualifier). The checker's type of the
+         * slice expression, or the object's own qualifier, decides. */
+        bool sl_vol = false;
+        {
+            Type *snt = checker_get_type(e->checker, node);
+            Type *sne = snt ? type_unwrap_distinct(snt) : NULL;
+            if (sne && type_dispatch_kind(sne) == TYPE_SLICE && sne->slice.is_volatile)
+                sl_vol = true;
+            if (obj_type && type_dispatch_kind(obj_type) == TYPE_SLICE && obj_type->slice.is_volatile)
+                sl_vol = true;
+            if (obj_type && type_dispatch_kind(obj_type) == TYPE_ARRAY && expr_is_volatile(e, node->slice.object))
+                sl_vol = true;
+        }
         bool slice_type_emitted = false;
         if (slice_needs_runtime_check && !slice_obj_side_effect_early) {
             /* skip the normal struct literal — we'll wrap in stmt expr */
         } else if (eff_elem && !slice_obj_side_effect_early) {
             emit(e, "((");
-            emit_slice_name(e, eff_elem, false, false);
+            emit_slice_name(e, eff_elem, sl_vol, false);
             emit(e, "){ ");
             slice_type_emitted = true;
         }
@@ -4712,7 +4747,7 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             if (slice_type_emitted) { /* re-emit type name for inner struct */ }
             /* rebuild the slice struct from the temp */
             emit(e, "(");
-            emit_type(e, type_slice(e->arena, obj_type->slice.inner));
+            emit_type(e, slice_view_type(e, obj_type->slice.inner, sl_vol));
             emit(e, "){ &(_zer_so%d.ptr)[", sl_tmp);
             if (node->slice.start) emit_expr(e, node->slice.start);
             else emit(e, "0");
@@ -4771,8 +4806,8 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             emit(e, "if (_zer_se%d > _zer_cap%d) _zer_trap(\"slice end > len\", __FILE__, __LINE__); ",
                  sl_tmp, sl_tmp);
             emit(e, "(");
-            emit_type(e, type_slice(e->arena, obj_type->kind == TYPE_ARRAY ?
-                obj_type->array.inner : obj_type->slice.inner));
+            emit_type(e, slice_view_type(e, type_dispatch_kind(obj_type) == TYPE_ARRAY ?
+                obj_type->array.inner : obj_type->slice.inner, sl_vol));
             emit(e, "){ &(");
             if (obj_is_slice) {
                 emit(e, "_zer_so%d.ptr", sl_tmp);
@@ -4812,6 +4847,16 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 emit(e, ").len - (");
                 emit_expr(e, node->slice.start);
                 emit(e, ")");
+            } else if (obj_type && type_dispatch_kind(obj_type) == TYPE_ARRAY) {
+                /* BUG-1516: `arr[..]` — the whole array (formed by make_array_view_explicit). This arm emitted a
+                 * length of 0, so a whole-array view in a global / static
+                 * initializer or a labelled function's defer body was empty
+                 * (every index then trapped or was refused). */
+                emit(e, "%llu", (unsigned long long)obj_type->array.size);
+            } else if (obj_is_slice) {
+                emit(e, "(");
+                emit_expr(e, node->slice.object);
+                emit(e, ").len");
             } else {
                 emit(e, "0 /* unknown len */");
             }
@@ -5988,6 +6033,38 @@ static int container_inst_index_of(Emitter *e, Type *t) {
  * `inprog` guards a by-value cycle, which the checker already rejects (J4's
  * self-containment guard) — the guard here just prevents infinite recursion if
  * one ever slips through. */
+/* The four companion typedefs every struct gets — `?S`, `[*]S`,
+ * `volatile [*]S`, `?[*]S`. BUG-1535: ONE helper, also called for a stamped
+ * `container` struct, which got none of them (`?Box(u32)` / `[*]Box(u32)`
+ * named `_zer_opt_Box_u32` / `_zer_slice_Box_u32` and GCC refused the unknown
+ * type, although reference.md documents both). */
+static void emit_struct_companion_typedefs(Emitter *e, Type *st,
+                                           const char *name, uint32_t name_len) {
+    #define CT_NAME() do { if (st) EMIT_STRUCT_NAME(e, st); \
+                           else emit(e, "%.*s", (int)name_len, name); } while (0)
+    emit(e, "typedef struct { struct "); CT_NAME();
+    emit(e, " value; uint8_t has_value; } _zer_opt_"); CT_NAME(); emit(e, ";\n\n");
+    #undef CT_NAME
+}
+
+/* BUG-1535: the SLICE companions of a struct need only a pointer to it, so they
+ * are emitted up front, after a forward `struct X;` — before ANY struct body.
+ * Emitted after the body, a struct holding a slice of ITSELF (`struct N {
+ * [*]N kids; }`, the tree idiom reference.md documents for containers too) or
+ * of a struct declared later named an undeclared typedef. */
+static void emit_struct_slice_forward(Emitter *e, Type *st) {
+    if (!st) return;
+    #define SF_NAME() EMIT_STRUCT_NAME(e, st)
+    emit(e, "struct "); SF_NAME(); emit(e, ";\n");
+    emit(e, "typedef struct { struct "); SF_NAME();
+    emit(e, "* ptr; size_t len; } _zer_slice_"); SF_NAME(); emit(e, ";\n");
+    emit(e, "typedef struct { volatile struct "); SF_NAME();
+    emit(e, "* ptr; size_t len; } _zer_vslice_"); SF_NAME(); emit(e, ";\n");
+    emit(e, "typedef struct { _zer_slice_"); SF_NAME();
+    emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); SF_NAME(); emit(e, ";\n");
+    #undef SF_NAME
+}
+
 static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *inprog) {
     if (emitted[ci] || inprog[ci]) return;
     Type *st = e->checker->container_instances[ci].stamped_struct;
@@ -6023,28 +6100,63 @@ static void emit_one_container_struct(Emitter *e, int ci, char *emitted, char *i
         emit(e, ";\n");
     }
     e->indent--;
-    emit(e, "};\n\n");
+    emit(e, "};\n");
+    emit_struct_companion_typedefs(e, st, st->struct_type.name,
+                                   (uint32_t)st->struct_type.name_len);   /* BUG-1535 */
     record_user_type_emitted(e, st);   /* BUG-1027: exotic-slice dependency set */
 }
 
 /* Emit all stamped container struct declarations, topologically ordered so a
  * by-value container field's struct is always complete before its user. */
+/* BUG-1535: the per-instance marks, grown to the current instance count. */
+static bool ctr_marks_ready(Emitter *e) {
+    int n = e->checker ? e->checker->container_inst_count : 0;
+    if (n <= e->ctr_n) return true;
+    char *ne = (char *)arena_alloc(e->arena, (size_t)n);
+    char *ni = (char *)arena_alloc(e->arena, (size_t)n);
+    if (!ne || !ni) return false;
+    memset(ne, 0, (size_t)n); memset(ni, 0, (size_t)n);
+    if (e->ctr_n) { memcpy(ne, e->ctr_emitted, (size_t)e->ctr_n);
+                    memcpy(ni, e->ctr_inprog, (size_t)e->ctr_n); }
+    e->ctr_emitted = ne; e->ctr_inprog = ni; e->ctr_n = n;
+    return true;
+}
+
+/* BUG-1535: emit every container stamp a struct / union holds BY VALUE before
+ * it — the stamps used to come after ALL regular types, so `struct S {
+ * Box(u32) b; }` was "field 'b' has incomplete type". */
+static void emit_container_deps_of(Emitter *e, Type *t) {
+    if (!t || !e->checker || e->checker->container_inst_count == 0) return;
+    if (!ctr_marks_ready(e)) return;
+    Type *u = type_unwrap_distinct(t);
+    TypeKind k = type_dispatch_kind(u);
+    if (k != TYPE_STRUCT && k != TYPE_UNION) return;
+    uint32_t n = k == TYPE_STRUCT ? u->struct_type.field_count : u->union_type.variant_count;
+    for (uint32_t i = 0; i < n; i++) {
+        Type *ft = k == TYPE_STRUCT ? u->struct_type.fields[i].type : u->union_type.variants[i].type;
+        ft = type_unwrap_distinct(ft);
+        while (ft && type_dispatch_kind(ft) == TYPE_ARRAY) ft = type_unwrap_distinct(ft->array.inner);
+        if (ft && type_dispatch_kind(ft) == TYPE_OPTIONAL) ft = type_unwrap_distinct(ft->optional.inner);
+        if (!ft || type_dispatch_kind(ft) != TYPE_STRUCT) continue;
+        int dep = container_inst_index_of(e, ft);
+        if (dep >= 0) emit_one_container_struct(e, dep, e->ctr_emitted, e->ctr_inprog);
+    }
+}
+
 static void emit_container_structs(Emitter *e) {
     if (!e->checker || e->checker->container_inst_count == 0) return;
     /* BUG-867: once per BUILD, not once per module — the instance list is shared
      * (a stamp is keyed by template + type argument, not by which module wrote
      * it), so the per-module call emitted `struct Box_u32` twice and GCC
      * reported a redefinition. Any `container` template used across a module
-     * boundary hit this. */
+     * boundary hit this. BUG-1535: the marks live on the Emitter, so a stamp
+     * emitted early (emit_container_deps_of) is not emitted again here. */
     if (e->container_structs_emitted) return;
     e->container_structs_emitted = true;
+    if (!ctr_marks_ready(e)) return;
     int n = e->checker->container_inst_count;
-    char *emitted = (char *)calloc((size_t)n, 1);
-    char *inprog = (char *)calloc((size_t)n, 1);
-    if (!emitted || !inprog) { free(emitted); free(inprog); return; }
-    for (int ci = 0; ci < n; ci++) emit_one_container_struct(e, ci, emitted, inprog);
-    free(emitted);
-    free(inprog);
+    for (int ci = 0; ci < n; ci++)
+        emit_one_container_struct(e, ci, e->ctr_emitted, e->ctr_inprog);
 }
 
 static void emit_struct_decl(Emitter *e, Node *node) {
@@ -6096,38 +6208,8 @@ static void emit_struct_decl(Emitter *e, Node *node) {
     }
     e->indent--;
     emit(e, "};\n");
-    /* emit optional typedef for this struct */
-    emit(e, "typedef struct { struct ");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, " value; uint8_t has_value; } _zer_opt_");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, ";\n");
-    /* emit slice typedef for this struct */
-    emit(e, "typedef struct { struct ");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, "* ptr; size_t len; } _zer_slice_");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, ";\n");
-    /* emit volatile slice typedef for this struct */
-    emit(e, "typedef struct { volatile struct ");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, "* ptr; size_t len; } _zer_vslice_");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, ";\n");
-    /* emit optional-slice typedef for this struct */
-    emit(e, "typedef struct { _zer_slice_");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, " value; uint8_t has_value; } _zer_opt_slice_");
-    if (st) EMIT_STRUCT_NAME(e, st);
-    else emit(e, "%.*s", (int)node->struct_decl.name_len, node->struct_decl.name);
-    emit(e, ";\n\n");
+    emit_struct_companion_typedefs(e, st, node->struct_decl.name,
+                                   (uint32_t)node->struct_decl.name_len);
     record_user_type_emitted(e, st);   /* BUG-1027: exotic-slice dependency set */
 }
 
@@ -6362,6 +6444,28 @@ static void emit_structured_asm(Emitter *e, Node *a, IRFunc *func) {
         }
     }
     emit(e, ");\n");
+    /* BUG-1545: an asm OUTPUT into a non-native uN / iN receives a full
+     * register — `outputs: { "rax" = small }` left 200 in a `u3`. Wrap it to
+     * N bits, as every other way a value enters such a variable is. */
+    for (int i = 0; i < a->asm_stmt.output_count; i++) {
+        AsmOperand *op = &a->asm_stmt.outputs[i];
+        Type *ot = checker_get_type(e->checker, op->expr);
+        if (!ot) continue;
+        TypeKind ok = type_dispatch_kind(ot);
+        if (ok != TYPE_UINT && ok != TYPE_SINT) continue;
+        uint32_t nb = type_unwrap_distinct(ot)->intn.bits;
+        if (nb == 8 || nb == 16 || nb == 32 || nb == 64 || nb == 128) continue;
+        emit_indent(e);
+        emit_rewritten_node(e, op->expr, func);
+        emit(e, " = ");
+        if (emit_intn_value_wrap_open(e, ot)) {
+            emit_rewritten_node(e, op->expr, func);
+            emit_intn_value_wrap_close(e, ot);
+        } else {
+            emit_rewritten_node(e, op->expr, func);
+        }
+        emit(e, ";\n");
+    }
 }
 
 /* BUG-651 fix (2026-05-02): single source of truth for function-level
@@ -8506,11 +8610,29 @@ static void emit_module_body(Emitter *e, Node *file_node) {
      * written with the prototypes after it. */
     emit_async_forward_typedefs(e, file_node);
 
+    /* BUG-1535: every struct's slice companions, before any struct body. */
+    for (int i = 0; i < file_node->file.decl_count; i++) {
+        Node *d = file_node->file.decls[i];
+        if (d->kind != NODE_STRUCT_DECL) continue;
+        Type *st = checker_get_type(e->checker, d);
+        if (st && type_dispatch_kind(st) == TYPE_STRUCT) emit_struct_slice_forward(e, st);
+    }
+    if (e->checker && !e->container_structs_emitted) {
+        for (int ci = 0; ci < e->checker->container_inst_count; ci++) {
+            Type *cst = e->checker->container_instances[ci].stamped_struct;
+            if (cst && type_dispatch_kind(cst) == TYPE_STRUCT && !e->ctr_slices_fwd_done)
+                emit_struct_slice_forward(e, cst);
+        }
+        e->ctr_slices_fwd_done = true;
+    }
+
     /* Pass 1: emit struct/enum/union/typedef declarations first */
     for (int i = 0; i < file_node->file.decl_count; i++) {
         Node *d = file_node->file.decls[i];
         if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_ENUM_DECL ||
             d->kind == NODE_UNION_DECL || d->kind == NODE_TYPEDEF) {
+            if (d->kind == NODE_STRUCT_DECL || d->kind == NODE_UNION_DECL)
+                emit_container_deps_of(e, checker_get_type(e->checker, d));   /* BUG-1535 */
             flush_exotic_slices(e);
             emit_top_level_decl(e, d, file_node, i);
         }
@@ -12646,7 +12768,14 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                          t, arr_cap);
                 }
                 emit(e, "((");
-                emit_type(e, type_slice(e->arena, elem));
+                {   /* BUG-1529: keep the array's volatile in the view */
+                    Type *snt = checker_get_type(e->checker, node);
+                    Type *sne = snt ? type_unwrap_distinct(snt) : NULL;
+                    bool vol = (sne && type_dispatch_kind(sne) == TYPE_SLICE &&
+                                sne->slice.is_volatile) ||
+                               expr_is_volatile(e, node->slice.object);
+                    emit_type(e, slice_view_type(e, elem, vol));
+                }
                 emit(e, "){ &(");
                 emit_rewritten_node(e, node->slice.object, func);
                 emit(e, ")[");
@@ -13255,6 +13384,16 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 if (need_unwrap) emit(e, ".value");
             }
             emit(e, ";\n");
+            /* BUG-1528: a BIT-SLICE read (`h[2..0]`, `h[hi..0]`) is computed in
+             * uint64_t and was stored into a non-native iN / uN carrier
+             * unwrapped — an i3 held 7, and 63 when the position ran past the
+             * width (the sign-extended carrier bits leaked in), a value outside
+             * the type. Re-wrap to N bits, as a load from memory is (BUG-1359). */
+            if (inst->expr->kind == NODE_SLICE && src_eff &&
+                (type_dispatch_kind(src_eff) == TYPE_UINT ||
+                 type_dispatch_kind(src_eff) == TYPE_SINT ||
+                 type_is_integer(src_eff)))
+                emit_intn_load_normalize(e, func, inst->dest_local);
         } else if (inst->expr) {
             /* Assignment to non-local (field, index) or void expr */
             emit_indent(e);
@@ -14017,11 +14156,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         emit_indent(e);
         emit(e, "uintptr_t _zer_x86_flags; __asm__ __volatile__(\"pushf\\n\\tpop %%0\\n\\tcli\" : \"=r\"(_zer_x86_flags) :: \"memory\");\n");
         emit_indent(e);
-        emit(e, "#else\n");
+        /* BUG-1520: the fence is the right @critical only in USER mode (no
+         * interrupt can preempt this code). A bare-metal build for an arch with
+         * no arm above (MSP430, Xtensa, MIPS, PowerPC, …) fell through to the
+         * same fence and compiled CLEAN — while the checker had accepted Ring /
+         * RMW sharing with an ISR on the strength of "every main-side access is
+         * inside @critical". Refuse the build there, exactly as
+         * @cpu_disable_int already does for an unlisted arch. */
+        emit(e, "#elif _ZER_USER_MODE\n");
         emit_indent(e);
-        emit(e, "/* hosted x86 / unknown arch: cli/sti illegal in user mode — fall back to fence. */\n");
+        emit(e, "/* user mode: interrupts cannot preempt this code — a fence suffices. */\n");
         emit_indent(e);
         emit(e, "__atomic_thread_fence(__ATOMIC_SEQ_CST);\n");
+        emit_indent(e);
+        emit(e, "#else\n");
+        emit_indent(e);
+        emit(e, "#error \"ZER @critical: no interrupt-disable sequence for this bare-metal target architecture\"\n");
         emit_indent(e);
         emit(e, "#endif\n");
         break;
@@ -15676,6 +15826,52 @@ static void emit_defer_body(Emitter *e, IRFunc *func, Node *db) {
 }
 
 /* Emit a regular (non-async) function from IR */
+/* BUG-1519: the declaration HEAD of a function local (`[static] [volatile] T
+ * name`), shared by the regular function path, the async task STRUCT (each
+ * non-static local is a field) and the async poll's statics. The async paths
+ * spelled it with a bare emit_type_and_name, so `volatile u32 i` in an async
+ * body became a plain struct field and GCC -O2 deleted a delay loop; a static
+ * nested in a block was never declared, and a `static ?u32` got an in-function
+ * initializer GCC refused. */
+static void emit_local_decl_head(Emitter *e, IRLocal *l) {
+    if (l->is_static) emit(e, "static ");
+    /* #19 (VOL-1): a `volatile` scalar/aggregate local carries no volatile in
+     * its Type (only slice/pointer do, propagated by the checker), so emit the
+     * qualifier here. Skip pointer/slice — their volatile is already in the
+     * emitted type (`volatile uint32_t *`); an outer prefix would change meaning
+     * (volatile-pointer vs pointer-to-volatile). */
+    /* BUG-1370: a STATIC pointer local is one object shared by every
+     * execution of its function — an interrupt handler and main, two
+     * threads — exactly like a global, so its `volatile` is the WORD's
+     * (the pointee's volatile is already in the type). */
+    bool static_word_vol = l->is_static && l->is_volatile && global_is_ptr_shaped(l->type);
+    if (l->is_volatile && l->type && !static_word_vol) {
+        TypeKind vtk = type_dispatch_kind(l->type);
+        if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
+            emit(e, "volatile ");
+    }
+    if (static_word_vol)
+        emit_global_decl_name(e, l->type, l->name, (uint32_t)l->name_len, true);
+    else
+        emit_type_and_name(e, l->type, l->name, l->name_len);
+}
+
+static void emit_static_local_init(Emitter *e, IRLocal *l) {
+    /* BUG-1315 / BUG-1442: a static's initializer is a C CONSTANT expression —
+     * the same contract as a global's, so it is emitted by the SAME helper, in
+     * the same constant-init context (emit_expr's global_init_depth: const-global
+     * substitution, the constant float->int form). It used to go through
+     * emit_rewritten_node, the in-function expression path, which produced
+     * `= 5U` for a `static ?u32`, statement expressions, and bare arrays for
+     * slices. */
+    e->global_init_depth++;
+    e->static_brace_init++;
+    emit_static_storage_init(e, l->type, l->static_init);
+    e->static_brace_init--;
+    e->global_init_depth--;
+    emit(e, ";\n");
+}
+
 static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
     /* Emit function signature (from AST node) */
     Node *fn = func->ast_node;
@@ -15795,40 +15991,9 @@ static void emit_regular_func_from_ir(Emitter *e, IRFunc *func) {
         if (l->is_capture && l->type && l->type->kind == TYPE_VOID) continue;
         if (!l->type) continue;
         emit_indent(e);
-        if (l->is_static) emit(e, "static ");
-        /* #19 (VOL-1): a `volatile` scalar/aggregate local carries no volatile in
-         * its Type (only slice/pointer do, propagated by the checker), so emit the
-         * qualifier here. Skip pointer/slice — their volatile is already in the
-         * emitted type (`volatile uint32_t *`); an outer prefix would change meaning
-         * (volatile-pointer vs pointer-to-volatile). */
-        /* BUG-1370: a STATIC pointer local is one object shared by every
-         * execution of its function — an interrupt handler and main, two
-         * threads — exactly like a global, so its `volatile` is the WORD's
-         * (the pointee's volatile is already in the type). */
-        bool static_word_vol = l->is_static && l->is_volatile && global_is_ptr_shaped(l->type);
-        if (l->is_volatile && l->type && !static_word_vol) {
-            TypeKind vtk = type_dispatch_kind(l->type);
-            if (vtk != TYPE_POINTER && vtk != TYPE_SLICE)
-                emit(e, "volatile ");
-        }
-        if (static_word_vol)
-            emit_global_decl_name(e, l->type, l->name, (uint32_t)l->name_len, true);
-        else
-            emit_type_and_name(e, l->type, l->name, l->name_len);
+        emit_local_decl_head(e, l);
         if (l->is_static && l->static_init) {
-            /* BUG-1315 / BUG-1442: a static's initializer is a C CONSTANT
-             * expression — the same contract as a global's, so it is emitted by
-             * the SAME helper, in the same constant-init context (emit_expr's
-             * global_init_depth: const-global substitution, the constant
-             * float->int form). It used to go through emit_rewritten_node, the
-             * in-function expression path, which produced `= 5U` for a
-             * `static ?u32`, statement expressions, and bare arrays for slices. */
-            e->global_init_depth++;
-            e->static_brace_init++;
-            emit_static_storage_init(e, l->type, l->static_init);
-            e->static_brace_init--;
-            e->global_init_depth--;
-            emit(e, ";\n");
+            emit_static_local_init(e, l);
         } else {
             emit(e, " = {0};\n"); /* auto-zero */
         }
@@ -15992,7 +16157,7 @@ static void emit_async_state_struct(Emitter *e, IRFunc *func) {
         if (l->is_static) continue;
         if (!l->type) continue;
         emit(e, "    ");
-        emit_type_and_name(e, l->type, l->name, l->name_len);
+        emit_local_decl_head(e, l);   /* BUG-1519: keeps `volatile` */
         emit(e, ";\n");
     }
     emit(e, "};\n\n");
@@ -16101,24 +16266,16 @@ static void emit_async_func_from_ir(Emitter *e, IRFunc *func) {
     emit(e, "static inline int %.*s_poll(%.*s *_zer_self) {\n",
          flen, mname, flen, mname);
 
-    /* Emit static locals BEFORE the switch (C static, not in state struct) */
-    {
-        Node *body = func->ast_node ? func->ast_node->func_decl.body : NULL;
-        if (body && body->kind == NODE_BLOCK) {
-            for (int si = 0; si < body->block.stmt_count; si++) {
-                Node *s = body->block.stmts[si];
-                if (s && s->kind == NODE_VAR_DECL && s->var_decl.is_static) {
-                    emit(e, "    static ");
-                    Type *vt = checker_get_type(e->checker, s);
-                    if (vt) emit_type_and_name(e, vt, s->var_decl.name, s->var_decl.name_len);
-                    if (s->var_decl.init) {
-                        emit(e, " = ");
-                        emit_rewritten_node(e, s->var_decl.init, func);
-                    }
-                    emit(e, ";\n");
-                }
-            }
-        }
+    /* Emit static locals BEFORE the switch (C static, not in state struct).
+     * BUG-1519: every static LOCAL of the IR (a static nested in a block too),
+     * through the regular path's helpers — qualifier and constant initializer. */
+    for (int li = 0; li < func->local_count; li++) {
+        IRLocal *l = &func->locals[li];
+        if (!l->is_static || !l->type) continue;
+        emit(e, "    ");
+        emit_local_decl_head(e, l);
+        if (l->static_init) emit_static_local_init(e, l);
+        else emit(e, " = {0};\n");
     }
 
     /* BUG-1240: the @once flags (the same pre-scan as the regular path). They

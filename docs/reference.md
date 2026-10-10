@@ -330,7 +330,18 @@ u32[4] values;            // 4 u32s
 i32[3][3] matrix;         // 3x3 multi-dimensional
 ```
 
-An array type may have at most 64 dimensions.
+An array type may have at most 64 dimensions. A type is read left to right, so
+`u32[2][3] grid` is THREE rows of `u32[2]` — the LAST size in the type is the FIRST
+index (`grid[0..2][0..1]`), the reverse of C's `uint32_t grid[2][3]`:
+
+```zer
+u32[2][3] grid;               // 3 rows, each a u32[2]
+u32 main() {
+    grid[2][1] = 5;           // row 2 (< 3), column 1 (< 2)
+    // grid[1][2] = 5;        // COMPILE ERROR — 2 is out of bounds for size 2
+    return grid[2][1] - 5;
+}
+```
 
 **EXAMPLE**
 ```zer
@@ -2703,6 +2714,10 @@ Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
 - `.push_checked(val)` → `?void` — Push value. Returns null if full.
 - `.pop()` → `?T` — Pop oldest. Returns null if empty.
 
+The pushed value must FLOW into `T` like any assignment: `Ring(u8, 4).push(k)` with a
+`u32 k` is a compile error (no silent truncation), and a struct literal is typed
+against `T` (`rq.push({ .v = 1 })`).
+
 Discarding a `push_checked` result is a compile error: reporting overflow is its
 entire purpose, so throwing the report away makes it identical to `push`. Write
 `rb.push_checked(x) orelse { ... };`, or call `push` if dropping on overflow is
@@ -4454,6 +4469,18 @@ Per-architecture interrupt disable/enable.
 
 Turning interrupts back on inside the block — `@cpu_enable_int()`, `@cpu_restore_int_state(...)`, or waiting for one with `@cpu_wait_int()` / `@cpu_deep_sleep()`, directly or in a called function — is **banned** too: code after that point would run unprotected while the compiler still treats it as inside `@critical` (and a wait with interrupts off never wakes on x86).
 
+`@cond_wait` / `@cond_timedwait` are **banned** inside `@critical`, directly or in a
+called function (the wait would release and re-take a mutex with interrupts off), and
+every `@cond_*` / `@sem_*` / `@barrier_wait` that BLOCKS is banned in an interrupt
+handler the same two ways. Signalling (`@cond_signal`, `@sem_release`) is allowed.
+
+The interrupt-disable sequence is chosen per target (ARM M-profile PRIMASK, AArch64
+DAIF, ARM A/R CPSR, AVR SREG, RISC-V `mstatus`, x86 `cli`). In user mode (hosted
+Linux/macOS/Windows) no interrupt can preempt the program and the block is a full
+fence. A bare-metal build for an architecture with no sequence (MSP430, Xtensa, MIPS,
+PowerPC, …) is a **compile error** (`#error`) rather than a block that silently masks
+nothing.
+
 **EXAMPLE**
 ```zer
 u32 shared_counter;
@@ -5791,6 +5818,12 @@ u32 main() {
 `x /= 0` and `x %= 0` with a divisor that folds to zero are compile errors, exactly
 like `x / 0`; a divisor the compiler cannot prove nonzero is one too (see "SAFETY GUARANTEES").
 
+The TARGET must be a place: a variable, a field, an element, a bit-slice, or `*p`.
+A value — a cast `(u32)x`, an intrinsic result `@truncate(u32, x)`, `~x`, `x + 1`, a
+call returning a value — is a compile error ("not an lvalue"), never a write that is
+silently discarded. A field or element reached THROUGH a pointer, slice or Handle is a
+place whatever produced the pointer (`get().v = 1` when `get` returns `*T`).
+
 ### Precedence
 
 Binary operators bind in the SAME order as C, loosest first. `orelse` sits
@@ -5858,7 +5891,9 @@ u32 main() { u32 a = 3; u32 b = a > 2 ? 1 : 0; return b; }
 
 Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once — for
 binary operators, comparisons, call arguments, struct-literal fields and array indices,
-whether an operand is a local, a global or a field. An assignment evaluates its TARGET
+intrinsic arguments (`@saturate(u8, x + bump(&x))`), slice bounds (`a[0 .. x + bump(&x)]`),
+bit-slice positions and the value of a Ring `push`, whether an operand is a local, a
+global or a field. An assignment evaluates its TARGET
 (including every index in it) before its value, and yields the stored value.
 A PLACE is evaluated from its root outward: in `m[f()][g()]`, `pick().a[k].b` or
 `mk().v[k]`, the object (`m`, `pick()`, `mk()`) comes first, then each index in the

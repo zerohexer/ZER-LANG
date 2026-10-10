@@ -1,0 +1,5 @@
+// BUG-1533: alloc(T2) through a typedef alias then free(p) was a false
+// "wrong pool" (both names are one auto-slab).
+struct S { u32 v; }
+typedef S T2;
+u32 main() { *T2 p = alloc(T2) orelse return; p.v = 3; u32 r = p.v; free(p); return r - 3; }

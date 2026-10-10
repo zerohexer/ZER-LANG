@@ -1,0 +1,6 @@
+// BUG-1518: a for-loop init and cond are separate lock scopes; reading A in the
+// init and B in the cond holds no two locks at once and is accepted.
+shared struct A { u32 x; }
+shared struct B { u32 y; }
+A a; B b;
+u32 main() { for (u32 k = a.x; b.y < 3; k += 1) { b.y = 3; } return 0; }

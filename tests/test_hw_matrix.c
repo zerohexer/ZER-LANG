@@ -329,6 +329,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_GPTR_COPY_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
+               RFORM_SPLIT_COMPOUND, RFORM_SPLIT_FIELD, RFORM_SPLIT_INDEX,
                RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
                RFORM_PARAM_CALL_ARG, RFORM_PARAM_RETURN, RFORM_PARAM_IF_COND,
                RFORM_ALIAS_ARG, RFORM_CARRIER, RFORM_CARRIER_LIT,
@@ -370,6 +371,9 @@ static const char *rform_name(RForm f) {
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
     case RFORM_SPLIT_STMT:      return "split t=g;g=t+1";
     case RFORM_SPLIT_2HOP:      return "split 2-hop";
+    case RFORM_SPLIT_COMPOUND:  return "split t+=g;g=t+1";
+    case RFORM_SPLIT_FIELD:     return "split t.v=g;g=t.v+1";
+    case RFORM_SPLIT_INDEX:     return "split t[0]=g;g=t[0]+1";
     case RFORM_PARAM_SWITCH:    return "param in switch";
     case RFORM_PARAM_ONCE:      return "param in @once";
     case RFORM_PARAM_ORELSE:    return "param in orelse{}";
@@ -418,6 +422,11 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
      * pins the taint being TRANSITIVE — a local reading a local that read g. */
     case RFORM_SPLIT_STMT:     *helper = "";                                    *body = "u32 t = g; g = t + 1;"; break;
     case RFORM_SPLIT_2HOP:     *helper = "";                                    *body = "u32 t = g; u32 u = t; g = u + 1;"; break;
+    /* BUG-1526: the taint carried by a COMPOUND op and by a PROJECTION of the
+     * local — each accepted at every site before. */
+    case RFORM_SPLIT_COMPOUND: *helper = "";                                    *body = "u32 t = 0; t += g; g = t + 1;"; break;
+    case RFORM_SPLIT_FIELD:    *helper = "struct TT { u32 v; }";                *body = "TT t; t.v = g; g = t.v + 1;"; break;
+    case RFORM_SPLIT_INDEX:    *helper = "";                                    *body = "u32[1] t; t[0] = g; g = t[0] + 1;"; break;
     /* BUG-1043: the SAME `*p += 1` through a pointer param, in six POSITIONS the
      * main-side summary walk never descended. Each was accepted at the main site
      * (a torn ISR/main update, silent on bare metal) while the plain

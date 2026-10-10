@@ -82,6 +82,11 @@ typedef struct {
      * module in the build, so emitting it per-module produced a duplicate
      * `struct Box_u32 { … }` and GCC refused the file. Emit it once. */
     bool container_structs_emitted;
+    /* BUG-1535: per-instance emitted / in-progress marks, kept across modules
+     * so a stamp can be emitted on demand before a struct that holds it. */
+    char *ctr_emitted, *ctr_inprog;
+    int ctr_n;
+    bool ctr_slices_fwd_done;
     /* BUG-1453: which of the checker's auto-slabs are already declared — each
      * is declared by the module that declares its struct. */
     bool *auto_slab_done;

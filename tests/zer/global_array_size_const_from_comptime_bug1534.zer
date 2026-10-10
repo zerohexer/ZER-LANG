@@ -1,0 +1,6 @@
+// BUG-1534: a global array sized by a const whose initializer is a comptime
+// call was "not a compile-time constant" (a local array sized the same worked).
+comptime u32 BIT(u32 n) { return 1 << n; }
+const u32 K = BIT(2);
+u32[K] buf;
+u32 main() { buf[3] = 1; return buf[3] - 1; }

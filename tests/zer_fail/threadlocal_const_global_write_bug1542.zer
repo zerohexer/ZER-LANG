@@ -1,0 +1,4 @@
+// expect-error: cannot assign to const variable
+// BUG-1542: the threadlocal spelling.
+threadlocal const u32 K = 5;
+u32 main() { K = 9; return K; }

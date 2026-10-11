@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: container field name '__LINE__' is in C's reserved namespace
+// BUG-1553: container field names reach C in every stamp; the reserved-name check
+// covered struct fields only.
+container B(T) { T __LINE__; }
+u32 main() { B(u32) b; return 0; }

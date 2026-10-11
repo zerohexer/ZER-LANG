@@ -1,0 +1,25 @@
+// BUG-1549: a call through a funcptr FIELD of a Pool / Slab slot (`pool.get(h).f(3)`)
+// aborted the compiler — the IR call emitter only spelled a field callee whose object
+// was a plain name.
+struct T { *(u32) -> u32 f; u32 k; }
+u32 id(u32 x) { return x; }
+u32 twice(u32 x) { return x * 2; }
+Pool(T, 4) pool;
+Slab(T) slab;
+u32 main() {
+    ?Handle(T) mh = pool.alloc();
+    if (mh) |h| {
+        pool.get(h).f = id;
+        u32 r = pool.get(h).f(3);
+        pool.free(h);
+        if (r != 3) { return 1; }
+    } else { return 2; }
+    ?Handle(T) ms = slab.alloc();
+    if (ms) |s| {
+        slab.get(s).f = twice;
+        u32 r2 = slab.get(s).f(5);
+        slab.free(s);
+        if (r2 != 10) { return 3; }
+    } else { return 4; }
+    return 0;
+}

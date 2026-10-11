@@ -1016,6 +1016,9 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
 
 **NOTES**
 - Mutable capture `|*v|` takes a pointer to the original union variant.
+- An ARRAY variant cannot be captured `|*v|` — that would be a pointer to an array,
+  which ZER does not have (the same rule as `*u32[4]`). Capture it by value `|v|` to
+  read it, or wrap the array in a struct variant and capture that.
 - Mutating the switched-on union's variant inside a capture arm is a compile error —
   and so is writing anything that CONTAINS it: `switch (w.u)` refuses `w = w2;`,
   `w = { .u = … };` and a write through a pointer to `w` (`pw.u.p = …`). When the
@@ -1438,6 +1441,17 @@ i32 main() {
   `const u32 A = 5; const u32 B = A + 1; u32 G = B;` is fine (`G` starts at 6).
 - A string literal is read-only. `[*]u8 S = "x";` is rejected at global and
   local scope alike; declare it `const [*]u8`.
+- **Where `const` attaches.** On a VALUE type `const` qualifies the VARIABLE, not
+  the type; on a pointer or slice it makes the TARGET read-only (`const *T`,
+  `const [*]T`, `?const *T`). So it applies wherever a variable is declared — a
+  global, a local, a `static`, and a PARAMETER (`u32 f(const u32 x)` cannot assign
+  `x`; `const S s` cannot assign `s.v`; a pointer field of `s` is still writable
+  through). A struct FIELD, union variant or container field is not a variable, so
+  `struct S { const u32 id; }` is a compile error rather than a silently ignored
+  qualifier: declare the struct variable `const`, or hold the data behind a
+  `const *T`. `const ?*T` is refused for the same reason (the `const` would land on
+  the optional, not the target) — write `?const *T`. `const volatile *T` keeps both
+  qualifiers (a read-only register).
 
 **SEE ALSO**
 comptime, static, Pool, Ring
@@ -6361,7 +6375,7 @@ the `Handle` by value rather than a pointer to it.
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must use @truncate or @saturate explicitly |
 | Missing switch case | Exhaustive check for enums, bools, unions |
-| Dangling pointer | Scope escape analysis on return, assign, keep, orelse |
+| Dangling pointer | Scope escape analysis on return, assign, keep, orelse — and BLOCK lifetimes: a pointer to an inner block's local cannot be stored in a variable of an outer block (`if (c) { u32 x; p = &x; }` is an error) |
 | Union type confusion | Cannot mutate union variant during switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in globals |
 | Division by zero | Forced guard — compile error if divisor not proven nonzero. A float divisor is proven by `if (y == 0.0) { return; }` / `if (y != 0.0) { ... }` (BUG-1067) — float division follows the integer rule, not IEEE `inf` |

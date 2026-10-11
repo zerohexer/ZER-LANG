@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: would be a pointer to an array
+// BUG-1551: a `|*v|` capture of an ARRAY variant is a pointer-to-array, which ZER
+// does not have — it reached GCC as `uint32_t[4]* v_cap5` (undeclared capture).
+union U { u32[4] arr; u32 x; }
+u32 main() { U u; u.arr[0] = 1; switch (u) { .arr => |*v| { (*v)[0] = 2; } .x => |v| { } } return 0; }

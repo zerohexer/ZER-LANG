@@ -46,6 +46,10 @@ typedef struct {
     Arena *arena;           /* arena for type allocations */
     Scope *global_scope;    /* module-level scope */
     Scope *current_scope;   /* current scope in traversal */
+    /* BUG-1554: the scope holding the current function's PARAMETERS (an interrupt:
+     * the scope its body block opens in). It and the body's top block share one
+     * lifetime; every scope below them is a shorter-lived block. NULL outside a body. */
+    Scope *fn_param_scope;
     const char *file_name;
     const char *source;     /* source text for error display (NULL = skip source line) */
     int error_count;

@@ -1,0 +1,14 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'held'
+// BUG-1548: a callee freeing through a pointer-to-pointer param (`free(*slot)`)
+// was invisible to its summary — `held` read a freed (recycled) object.
+struct T { u32 v; }
+?*T gq;
+void rel(*?*T slot) { if (*slot) |q| { free(q); } *slot = null; }
+u32 main() {
+    gq = alloc(T);
+    *T held = gq orelse return;
+    rel(&gq);
+    held.v = 5;
+    return 0;
+}

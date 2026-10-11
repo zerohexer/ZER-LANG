@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'c'
+void dropsl(*[*]u8 s) { free(*s); }
+u32 main() { [*]u8 b = alloc(u8, 8) orelse return; [*]u8 c = b; dropsl(&b); c[0] = 1; return 0; }

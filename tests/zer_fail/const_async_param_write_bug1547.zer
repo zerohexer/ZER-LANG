@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to const variable 'n'
+async void w(const u32 n) { n = 3; yield; }
+u32 main() { return 0; }

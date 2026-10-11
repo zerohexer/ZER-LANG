@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: would keep pointing at 'x'
+// BUG-1554: READING a pointer field out of an inner aggregate carries what the
+// aggregate was aimed at (`p = h.p`).
+struct H { *u32 p; }
+u32 main() { u32 b = 1; *u32 p = &b; { u32 x = 7; H h = { .p = &x }; p = h.p; } return *p; }

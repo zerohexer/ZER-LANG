@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: maybe-freed
+struct T { u32 v; }
+void maybe(*?*T s, bool c) { if (c) { if (*s) |q| { free(q); } *s = null; } }
+u32 main() { ?*T lq = alloc(T); *T h = lq orelse return; maybe(&lq, true); h.v = 1; if (lq) |p| { free(p); } return 0; }

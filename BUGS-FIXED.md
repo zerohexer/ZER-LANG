@@ -131,6 +131,66 @@ A/B-measured against a HEAD build, and every new negative is ACCEPTED by it.
   (a const array pushed into `Ring([*]u32, 2)`).
 - **BUG-1538 — `i128 m = -1; 10 / m`** was "divisor not proven nonzero" (a negated literal
   had no typed fold at 128 bits); the i64 spelling passed.
+- **BUG-1548 — a callee freeing THROUGH a pointer-to-reference parameter was invisible.**
+  `void rel(*?*T s) { if (*s) |q| { free(q); } *s = null; }` (also `**T` / `*[*]T`): the
+  tracker never keyed `*s`, so the summary said "frees nothing" — `held = g; rel(&g);
+  held.v` read a recycled object (a global), and a LOCAL `x` after `rel(&x)` was a false
+  leak. The slot behind each such param is now an entry `(param, "*")` minted at function
+  entry (alive, escaped, an id disjoint from the param's own); `*s` keys to it, a deref
+  read aliases it, and the summary records `FuncSummary.frees_param_deref` (freed on
+  some / every path, left dangling or reset to null). The call site applies it to the
+  object the argument names (`&x`, a forwarded param, a pointer with one stable aim):
+  every alias becomes FREED / MAYBE_FREED, and `x` itself holds null when every freeing
+  path reset the slot — so the release-and-null idiom compiles and re-releases cleanly.
+  A pointer whose target cannot be named is refused. Gate: SHAPE p68 (4 holes + 1
+  over-reject on the previous compiler).
+- **BUG-1549 — `pool.get(h).f(3)` aborted the compiler** (a call through a funcptr field
+  of a Pool / Slab slot): the IR callee emitter only spelled a field callee whose object
+  was a plain name. The general field emitter now spells every object form.
+- **BUG-1550 — a `static` local read as an IR operand in an async body** was emitted as
+  `_zer_self->cnt` (GCC: no member). ONE spelling query `ir_local_pfx` replaces the
+  per-site `func->is_async ? "_zer_self->" : ""` (some sites applied one prefix to three
+  locals at once).
+- **BUG-1551 — `|*v|` over an ARRAY** (union array variant, optional array) reached GCC
+  as `uint32_t[4]* v`. A pointer to an array is not a ZER type (BUG-1304); the three
+  capture sites now refuse it with the by-value / struct-wrapper alternatives.
+- **BUG-1552 — a global or static initializer viewing a THREADLOCAL array** (`[*]u32 gs =
+  ta;`, `static [*]u32 s = ta[1..3];`) reached GCC as "not constant": the "a bare array
+  name is its constant address" exemption did not ask threadlocal, and BUG-1514 covered
+  the `&` spelling only.
+- **BUG-1553 — reserved C names as `container` field names** reached GCC; the BUG-1446
+  check now covers container fields.
+- **BUG-1554 — a pointer to an INNER block's local outlived the block silently.**
+  `if (c) { u32 x = 5; p = &x; } if (c) { u32 x = 10; } return *p;` returned 10: the IR
+  locals are flat (no C-level UB) but the two `x` are one C object. The escape sinks ask
+  only "does it outlive the FRAME?". `check_block_lifetime_escape` asks the block
+  question at every assignment whose destination can hold a reference: the value's
+  storage root (`value_block_local` — `&x`, an array view, a pointer local through its
+  recorded borrow root, a struct literal, an orelse arm, a call that may return a view
+  of an argument) must not live in a deeper block than the destination's root
+  (`local_lifetime_level`: a parameter and the body's top block are one level).
+  Corpus cost 0. Gate: SHAPE p69.
+- **BUG-1555 — an interrupt handler reaching a call CYCLE was reported as "a call chain
+  deeper than 32"**: the ISR walk had a depth cap and no path set. One descent helper
+  `isr_walk_callee_body` (the three descent sites) keeps the active path and reports the
+  cycle by name; the verdict (no recursion in a handler) is unchanged.
+- **BUG-1546 — `const volatile *u32` dropped `volatile`.** The const arm of `resolve_type`
+  rebuilt the pointer from the inner type and copied only the target; a read-only register
+  pointer (parameter or field) was emitted non-volatile, and passing `&vx` to such a
+  parameter was refused. Test: `tests/zer/const_volatile_ptr_param_bug1546.zer`.
+- **BUG-1547 — `const` on a PARAMETER or a FIELD of a value type was silently ignored.**
+  ZER's rule is that on a value type `const` qualifies the VARIABLE (resolve_type keeps it
+  only as a pointer/slice TARGET), and only the var-decl paths carried it. A parameter is a
+  variable, so `u32 f(const u32 x) { x = 5; }`, `const S s` then `s.v = 2`, and passing `&x`
+  to a `*u32` all compiled; it now gets `Symbol.is_const` exactly like a local (async
+  parameters too). A struct field / union variant / container field is NOT a variable, so a
+  value-type `const` there is refused rather than ignored (`s.id = 3` compiled on a
+  `const u32 id`, `s.a[1] = 4` on a `const u32[4] a`); `const ?*T` is refused at both sites
+  with the `?const *T` spelling. One predicate `typenode_const_dropped` + one reporter
+  `reject_const_value_field`. Corpus cost 0 (every file hitting a const diagnostic was an
+  existing negative). Rejecting the field form is forward-compatible: honouring it later
+  breaks no program. Tests: 9 `*_bug1547` negatives (all accepted by the previous compiler) +
+  `tests/zer/const_param_read_and_copy_bug1547.zer`.
 
 ## Session 2026-09-28 — BUG-1400..: harvest of `loving-bohr-7nox2h`, then a five-area audit (escape order, allocation tracker, concurrency, VRP, emitter)
 

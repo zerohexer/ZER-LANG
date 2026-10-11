@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: container field 'v'
+container Box(T) { const T v; }
+u32 main() { Box(u32) b; return 0; }

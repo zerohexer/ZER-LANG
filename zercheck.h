@@ -98,6 +98,14 @@ typedef struct {
      * is fine, and the free-only checks (heap-only argument, interior pointer)
      * must not fire for it. NULL when nothing is transferred. */
     unsigned char *transfers_param;
+    /* BUG-1548: the callee frees the object param i POINTS AT — the slot
+     * behind a pointer-to-reference param (`void rel(*?*T s) { free(*s); }`,
+     * `**T`, `*[*]T`). The caller's `&x` names x, which the bare / field
+     * summaries never touched, so `held = x; rel(&x); held.v` was a silent
+     * use-after-free (and a local x a false leak). Bits: 1 = freed on some
+     * path, 2 = on every path, 4 = some freeing path left the slot DANGLING
+     * (not reset to null by the callee). NULL when param_count == 0. */
+    unsigned char *frees_param_deref;
     /* BUG-1300: bit i = the callee may free a value read out of an ELEMENT of
      * param i (`drain([*]?*T a) { if (a[i]) |p| { free(p); } }`), directly or
      * through a callee with the bit. The caller widens the elements of the array

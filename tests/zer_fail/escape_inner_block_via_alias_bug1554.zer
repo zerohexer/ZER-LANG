@@ -1,0 +1,3 @@
+// EXPECTED: compile error
+// expect-error: would keep pointing at 'x'
+u32 main() { u32 base = 1; *u32 p = &base; { u32 x = 7; *u32 q = &x; p = q; } return *p; }

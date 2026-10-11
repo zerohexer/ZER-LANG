@@ -1,0 +1,11 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'held'
+struct T { u32 v; }
+void rel(**T slot) { free(*slot); }
+u32 main() {
+    *T lq = alloc(T) orelse return;
+    *T held = lq;
+    rel(&lq);
+    held.v = 5;
+    return 0;
+}

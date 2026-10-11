@@ -1,0 +1,7 @@
+// EXPECTED: compile error
+// expect-error: names a threadlocal
+// BUG-1552: a global viewing a threadlocal ARRAY reached GCC ("initializer element
+// is not constant"); the array-is-its-address exemption did not ask threadlocal.
+threadlocal u32[4] ta;
+[*]u32 gs = ta;
+u32 main() { return 0; }

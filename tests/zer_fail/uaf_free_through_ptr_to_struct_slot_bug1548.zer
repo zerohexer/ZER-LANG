@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'h'
+struct T { u32 v; }
+struct Box { ?*T p; }
+void rel(*?*T slot) { if (*slot) |q| { free(q); } *slot = null; }
+u32 main() { Box b; b.p = alloc(T); *T h = b.p orelse return; rel(&b.p); h.v = 1; return 0; }

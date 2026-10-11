@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to const variable 's'
+struct S { u32 v; }
+u32 f(const S s) { s.v = 2; return s.v; }
+u32 main() { S s; return f(s) - 2; }

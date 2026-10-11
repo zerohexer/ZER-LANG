@@ -1,0 +1,16 @@
+// BUG-1551 boundary: an array variant is read through a VALUE capture, and
+// mutated in place through a struct-wrapped variant's pointer capture.
+struct W { u32[4] a; }
+union U { u32[4] arr; u32 x; }
+union V { W w; u32 x; }
+u32 main() {
+    U u; u.arr[1] = 1;
+    u32 r = 0;
+    switch (u) { .arr => |v| { r = v[1]; } .x => |v| { r = v; } }
+    if (r != 1) { return 1; }
+    V w; W init; init.a[0] = 0; w.w = init;
+    switch (w) { .w => |*p| { p.a[0] = 2; } .x => |v| { } }
+    u32 got = 0;
+    switch (w) { .w => |p| { got = p.a[0]; } .x => |v| { } }
+    return got - 2;
+}

@@ -2322,3 +2322,48 @@ zercheck_ir.c:ir_expr_has_ptrish_call:NODE_SWITCH:switch_stmt.expr
 zercheck_ir.c:ir_expr_has_ptrish_call:NODE_VAR_DECL:var_decl.init
 zercheck_ir.c:ir_expr_has_ptrish_call:NODE_WHILE:while_stmt.body
 zercheck_ir.c:ir_expr_has_ptrish_call:NODE_WHILE:while_stmt.cond
+# 2026-10-11 — BUG-1554 value_block_local: follows only REFERENCE-FORMING values (&, a slice
+# of an array, a carrier read, orelse arms, struct-literal fields, call args the callee may
+# return). A statement is not a value; arithmetic / a cast / an intrinsic / an assignment
+# value / a callee expression designates no storage. Missing one can only miss a block
+# escape the frame sinks still bound — never a frame escape.
+checker.c:value_block_local:NODE_ASM:asm_stmt.inputs
+checker.c:value_block_local:NODE_ASM:asm_stmt.outputs
+checker.c:value_block_local:NODE_ASSIGN:assign.target
+checker.c:value_block_local:NODE_ASSIGN:assign.value
+checker.c:value_block_local:NODE_AWAIT:await_stmt.cond
+checker.c:value_block_local:NODE_BINARY:binary.left
+checker.c:value_block_local:NODE_BINARY:binary.right
+checker.c:value_block_local:NODE_BLOCK:block.stmts
+checker.c:value_block_local:NODE_CALL:call.callee
+checker.c:value_block_local:NODE_CRITICAL:critical.body
+checker.c:value_block_local:NODE_DEFER:defer.body
+checker.c:value_block_local:NODE_DO_WHILE:while_stmt.body
+checker.c:value_block_local:NODE_DO_WHILE:while_stmt.cond
+checker.c:value_block_local:NODE_EXPR_STMT:expr_stmt.expr
+checker.c:value_block_local:NODE_FIELD:field.object
+checker.c:value_block_local:NODE_FILE:file.decls
+checker.c:value_block_local:NODE_FOR:for_stmt.body
+checker.c:value_block_local:NODE_FOR:for_stmt.cond
+checker.c:value_block_local:NODE_FOR:for_stmt.init
+checker.c:value_block_local:NODE_FOR:for_stmt.step
+checker.c:value_block_local:NODE_FUNC_DECL:func_decl.body
+checker.c:value_block_local:NODE_GLOBAL_VAR:var_decl.init
+checker.c:value_block_local:NODE_IF:if_stmt.cond
+checker.c:value_block_local:NODE_IF:if_stmt.else_body
+checker.c:value_block_local:NODE_IF:if_stmt.then_body
+checker.c:value_block_local:NODE_INDEX:index_expr.index
+checker.c:value_block_local:NODE_INTERRUPT:interrupt.body
+checker.c:value_block_local:NODE_INTRINSIC:intrinsic.args
+checker.c:value_block_local:NODE_ONCE:once.body
+checker.c:value_block_local:NODE_RETURN:ret.expr
+checker.c:value_block_local:NODE_SLICE:slice.end
+checker.c:value_block_local:NODE_SLICE:slice.start
+checker.c:value_block_local:NODE_SPAWN:spawn_stmt.args
+checker.c:value_block_local:NODE_STATIC_ASSERT:static_assert_stmt.cond
+checker.c:value_block_local:NODE_SWITCH:switch_stmt.arms
+checker.c:value_block_local:NODE_SWITCH:switch_stmt.expr
+checker.c:value_block_local:NODE_TYPECAST:typecast.expr
+checker.c:value_block_local:NODE_VAR_DECL:var_decl.init
+checker.c:value_block_local:NODE_WHILE:while_stmt.body
+checker.c:value_block_local:NODE_WHILE:while_stmt.cond

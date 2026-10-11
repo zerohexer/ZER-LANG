@@ -1,0 +1,3 @@
+// EXPECTED: compile error
+// expect-error: would keep pointing at 'tmp'
+u32 main() { u32[4] outer; [*]u32 s = outer; for (u32 i = 0; i < 2; i += 1) { u32[4] tmp; tmp[0] = i; s = tmp; } return s[0]; }

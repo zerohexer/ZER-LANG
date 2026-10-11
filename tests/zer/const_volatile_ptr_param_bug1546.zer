@@ -1,0 +1,11 @@
+// BUG-1546: `const volatile *u32` kept const and DROPPED volatile, so passing a
+// volatile address was refused (and a read-only register pointer field lost volatile).
+struct Regs { const volatile *u32 sr; }
+u32 rd(const volatile *u32 p) { return *p; }
+u32 main() {
+    volatile u32 x = 5;
+    if (rd(&x) != 5) { return 1; }
+    Regs r = { .sr = &x };
+    if (*r.sr != 5) { return 2; }
+    return 0;
+}

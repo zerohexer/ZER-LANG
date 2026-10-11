@@ -785,7 +785,14 @@ static void emit_ir_call_callee(Emitter *e, IRInst *inst, IRFunc *func) {
                      (int)callee->field.field_name_len, callee->field.field_name);
             }
         } else {
-            emit_unreachable(e, "this call target", inst->expr);   /* BUG-851 */
+            /* BUG-1549: the funcptr field of an object that is not a plain name —
+             * `pool.get(h).f(3)`, a Pool/Slab slot (or any call result) — aborted
+             * the compiler here. The field emitter already spells every object
+             * form (the slot lookup + generation check included); the BUG-1019
+             * null guard evaluates this text exactly once. */
+            emit(e, "(");
+            emit_rewritten_node(e, callee, func);
+            emit(e, ")");
         }
     } else if (inst->expr && inst->expr->kind == NODE_CALL &&
                inst->expr->call.callee &&
@@ -8788,13 +8795,18 @@ static void emit_alloc_sym_cname(Emitter *e, Symbol *sym) {
     emit(e, "%.*s", (int)sym->name_len, sym->name);
 }
 
+/* BUG-1550: how an IR local is spelled in C. In an async body every local
+ * lives in the task struct EXCEPT a `static` one, which is a function-scope C
+ * static (BUG-1519) — ONE answer for every site that names a local, so a read
+ * of `cnt` can no longer be `_zer_self->cnt` (no such member). */
+static const char *ir_local_pfx(IRFunc *func, IRLocal *l) {
+    return (func && func->is_async && l && !l->is_static) ? "_zer_self->" : "";
+}
+
 static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
     IRLocal *l = &func->locals[local_id];
-    if (func->is_async)
-        emit(e, "_zer_self->%.*s", (int)l->name_len, l->name);
-    else
-        emit(e, "%.*s", (int)l->name_len, l->name);
+    emit(e, "%s%.*s", ir_local_pfx(func, l), (int)l->name_len, l->name);
 }
 
 /* BUG-1359: a uN / iN value LOADED out of memory is re-wrapped to its width. ZER
@@ -8804,7 +8816,7 @@ static void emit_local_name(Emitter *e, IRFunc *func, int local_id) {
  * One AND (or sign-extend) after the load restores the type's range. */
 static void emit_intn_load_normalize(Emitter *e, IRFunc *func, int local_id) {
     if (local_id < 0 || local_id >= func->local_count) return;
-    emit_intn_mask(e, &func->locals[local_id], func->is_async ? "_zer_self->" : "");
+    emit_intn_mask(e, &func->locals[local_id], ir_local_pfx(func, &func->locals[local_id]));
 }
 
 /* BUG-1152: the statement form of the non-null load guard — after an IR load
@@ -13325,20 +13337,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * capture needs this). Must emit BEFORE "dst = " prefix. */
             if (dst_eff && dst_eff->kind == TYPE_ARRAY &&
                 src_eff && src_eff->kind == TYPE_ARRAY) {
-                const char *sp = func->is_async ? "_zer_self->" : "";
                 emit_indent(e);
-                emit(e, "memcpy(%s%.*s, ", sp, (int)dest->name_len, dest->name);
+                emit(e, "memcpy(%s%.*s, ", ir_local_pfx(func, dest), (int)dest->name_len, dest->name);
                 emit_rewritten_node(e, inst->expr, func);
-                emit(e, ", sizeof(%s%.*s));\n", sp, (int)dest->name_len, dest->name);
+                emit(e, ", sizeof(%s%.*s));\n", ir_local_pfx(func, dest), (int)dest->name_len, dest->name);
                 break;
             }
 
             emit_indent(e);
-            if (func->is_async) {
-                emit(e, "_zer_self->%.*s = ", (int)dest->name_len, dest->name);
-            } else {
-                emit(e, "%.*s = ", (int)dest->name_len, dest->name);
-            }
+            emit(e, "%s%.*s = ", ir_local_pfx(func, dest), (int)dest->name_len, dest->name);
 
             bool need_unwrap = (src_eff && src_eff->kind == TYPE_OPTIONAL &&
                                dst_eff && dst_eff->kind != TYPE_OPTIONAL &&
@@ -14928,7 +14935,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                      dst_eff->pointer.inner &&
                                      type_equals(dst_eff->pointer.inner, src_pointee->optional.inner));
 
-            const char *sp = func->is_async ? "_zer_self->" : "";
 
             /* Array→array copy: use memcpy (C can't assign arrays).
              * Handle BEFORE emitting "dst = " prefix. */
@@ -14940,14 +14946,14 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                  * a decayed pointer, so sizeof(src) was 8 and `u8[64] c = a;`
                  * copied 8 bytes. The types are equal, so the sizes are. */
                 emit(e, "memcpy(%s%.*s, %s%.*s, sizeof(%s%.*s));\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)src->name_len, src->name,
-                     sp, (int)dst->name_len, dst->name);
+                     ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
+                     ir_local_pfx(func, src), (int)src->name_len, src->name,
+                     ir_local_pfx(func, dst), (int)dst->name_len, dst->name);
                 break;
             }
 
             emit_indent(e);
-            emit(e, "%s%.*s = ", sp, (int)dst->name_len, dst->name);
+            emit(e, "%s%.*s = ", ir_local_pfx(func, dst), (int)dst->name_len, dst->name);
 
             /* Detect null literal source — lower_expr(NODE_NULL_LIT) creates
              * a local of type *void as placeholder. Wrapping that into ?T
@@ -14957,20 +14963,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                                type_unwrap_distinct(src_eff->pointer.inner)->kind == TYPE_VOID;
 
             if (need_ns_addr_capture) {                 /* BUG-1340 */
-                emit(e, "&%s%.*s;\n", sp, (int)src->name_len, src->name);
+                emit(e, "&%s%.*s;\n", ir_local_pfx(func, src), (int)src->name_len, src->name);
             } else if (need_ns_addr_capture_via_ptr) {  /* BUG-1340 */
-                emit(e, "%s%.*s;\n", sp, (int)src->name_len, src->name);
+                emit(e, "%s%.*s;\n", ir_local_pfx(func, src), (int)src->name_len, src->name);
             } else if (need_addr_capture_via_ptr) {
                 emit(e, "&%s%.*s->value;\n",
-                     sp, (int)src->name_len, src->name);
+                     ir_local_pfx(func, src), (int)src->name_len, src->name);
             } else if (need_addr_capture) {
                 emit(e, "&%s%.*s.value;\n",
-                     sp, (int)src->name_len, src->name);
+                     ir_local_pfx(func, src), (int)src->name_len, src->name);
             } else if (need_slice) {
                 emit(e, "(");
                 emit_type(e, dst_eff);
                 emit(e, "){ %s%.*s, %u };\n",
-                     sp, (int)src->name_len, src->name,
+                     ir_local_pfx(func, src), (int)src->name_len, src->name,
                      src_eff ? (unsigned)src_eff->array.size : 0);
             } else if (need_wrap && is_null_src) {
                 if (is_void_opt(dst_eff)) {
@@ -14994,20 +15000,20 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     emit(e, "){ (");
                     emit_type(e, aw_inner);
                     emit(e, "){ %s%.*s, %u }, 1 };\n",
-                         sp, (int)src->name_len, src->name,
+                         ir_local_pfx(func, src), (int)src->name_len, src->name,
                          (unsigned)src_eff->array.size);
                 } else {
                     emit(e, "(");
                     emit_type(e, dst_eff);
                     emit(e, "){ %s%.*s, 1 };\n",
-                         sp, (int)src->name_len, src->name);
+                         ir_local_pfx(func, src), (int)src->name_len, src->name);
                 }
             } else if (need_unwrap) {
                 emit(e, "%s%.*s.value;\n",
-                     sp, (int)src->name_len, src->name);
+                     ir_local_pfx(func, src), (int)src->name_len, src->name);
             } else {
                 emit(e, "%s%.*s;\n",
-                     sp, (int)src->name_len, src->name);
+                     ir_local_pfx(func, src), (int)src->name_len, src->name);
             }
         }
         break;
@@ -15017,10 +15023,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
         if (inst->dest_local >= 0) {
             IRLocal *dst = &func->locals[inst->dest_local];
             emit_indent(e);
-            if (func->is_async)
-                emit(e, "_zer_self->%.*s = ", (int)dst->name_len, dst->name);
-            else
-                emit(e, "%.*s = ", (int)dst->name_len, dst->name);
+            emit(e, "%s%.*s = ", ir_local_pfx(func, dst), (int)dst->name_len, dst->name);
             switch (inst->literal_kind) {
             case 0: /* int */ {
                 /* BUG-592: emit a type-matched literal. Always-ULL emission
@@ -15104,7 +15107,6 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             IRLocal *dst = &func->locals[inst->dest_local];
             IRLocal *s1 = &func->locals[inst->src1_local];
             IRLocal *s2 = &func->locals[inst->src2_local];
-            const char *sp = func->is_async ? "_zer_self->" : "";
 
             /* Phase 3 fix #5: shift safety. ZER spec: shift by >= width = 0.
              * Use _zer_shl/_zer_shr macros (defined in preamble) instead of
@@ -15112,12 +15114,12 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             if (inst->op_token == TOK_LSHIFT || inst->op_token == TOK_RSHIFT) {
                 emit_indent(e);
                 emit(e, "%s%.*s = %s(%s%.*s, %s%.*s, %d);\n",
-                     sp, (int)dst->name_len, dst->name,
+                     ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
                      inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
-                     sp, (int)s1->name_len, s1->name,
-                     sp, (int)s2->name_len, s2->name,
+                     ir_local_pfx(func, s1), (int)s1->name_len, s1->name,
+                     ir_local_pfx(func, s2), (int)s2->name_len, s2->name,
                      shift_guard_width(s1->type));
-                emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN shift result to its width */
+                emit_intn_mask(e, dst, ir_local_pfx(func, dst)); /* Path C: wrap uN/iN shift result to its width */
                 break;
             }
 
@@ -15136,7 +15138,7 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                 emit_indent(e);
                 emit(e, "if (%s%.*s == 0) "
                         "_zer_trap(\"division by zero\", __FILE__, __LINE__);",
-                     sp, (int)s2->name_len, s2->name);
+                     ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
                 Type *lt = s1->type ? type_unwrap_distinct(s1->type) : NULL;
                 /* BUG-1066: everything that can TRAP stays on the ONE C line the
                  * `#line` directive above names. The zero test used to end with a
@@ -15149,15 +15151,15 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
                     signed_min_text(lt, minlit, sizeof minlit);
                     emit(e, " if (%s%.*s == %s && %s%.*s == -1) "
                             "_zer_trap(\"signed division overflow\", __FILE__, __LINE__);",
-                         sp, (int)s1->name_len, s1->name, minlit,
-                         sp, (int)s2->name_len, s2->name);
+                         ir_local_pfx(func, s1), (int)s1->name_len, s1->name, minlit,
+                         ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
                 }
                 emit(e, " %s%.*s = (%s%.*s %s %s%.*s);\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name,
+                     ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
+                     ir_local_pfx(func, s1), (int)s1->name_len, s1->name,
                      inst->op_token == TOK_SLASH ? "/" : "%",
-                     sp, (int)s2->name_len, s2->name);
-                emit_intn_mask(e, dst, sp); /* BUG-1062: wrap an iN/uN quotient to its width */
+                     ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
+                emit_intn_mask(e, dst, ir_local_pfx(func, dst)); /* BUG-1062: wrap an iN/uN quotient to its width */
                 break;
             }
 
@@ -15191,24 +15193,24 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
             bool s2_signed = t2 && type_is_signed(t2);
             emit_indent(e);
             if (is_cmp && s1_signed && !s2_signed) {
-                emit(e, "%s%.*s = (%s%.*s %s (", sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name, op);
+                emit(e, "%s%.*s = (%s%.*s %s (", ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
+                     ir_local_pfx(func, s1), (int)s1->name_len, s1->name, op);
                 emit_type(e, s1->type);
-                emit(e, ")%s%.*s);\n", sp, (int)s2->name_len, s2->name);
+                emit(e, ")%s%.*s);\n", ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
             } else if (is_cmp && !s1_signed && s2_signed) {
-                emit(e, "%s%.*s = ((", sp, (int)dst->name_len, dst->name);
+                emit(e, "%s%.*s = ((", ir_local_pfx(func, dst), (int)dst->name_len, dst->name);
                 emit_type(e, s2->type);
                 emit(e, ")%s%.*s %s %s%.*s);\n",
-                     sp, (int)s1->name_len, s1->name, op,
-                     sp, (int)s2->name_len, s2->name);
+                     ir_local_pfx(func, s1), (int)s1->name_len, s1->name, op,
+                     ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
             } else {
                 emit(e, "%s%.*s = (%s%.*s %s %s%.*s);\n",
-                     sp, (int)dst->name_len, dst->name,
-                     sp, (int)s1->name_len, s1->name,
+                     ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
+                     ir_local_pfx(func, s1), (int)s1->name_len, s1->name,
                      op,
-                     sp, (int)s2->name_len, s2->name);
+                     ir_local_pfx(func, s2), (int)s2->name_len, s2->name);
             }
-            emit_intn_mask(e, dst, sp); /* Path C: wrap uN/iN arithmetic result to its width */
+            emit_intn_mask(e, dst, ir_local_pfx(func, dst)); /* Path C: wrap uN/iN arithmetic result to its width */
         }
         break;
     }
@@ -15249,8 +15251,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * (~x) can leave bits above N set in the carrier. (! yields a bool;
              * deref/addr-of already jumped to unop_done.) */
             if (inst->op_token == TOK_MINUS || inst->op_token == TOK_TILDE) {
-                const char *usp = func->is_async ? "_zer_self->" : "";
-                emit_intn_mask(e, &func->locals[inst->dest_local], usp);
+                emit_intn_mask(e, &func->locals[inst->dest_local],
+                               ir_local_pfx(func, &func->locals[inst->dest_local]));
             }
         }
         unop_done:
@@ -15427,8 +15429,8 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * covers them, and it is the SAME emit_intn_mask that IR_BINOP and
              * IR_UNOP use rather than a new expression-position wrapper. */
             if (inst->dest_local >= 0) {
-                const char *csp = func->is_async ? "_zer_self->" : "";
-                emit_intn_mask(e, &func->locals[inst->dest_local], csp);
+                emit_intn_mask(e, &func->locals[inst->dest_local],
+                               ir_local_pfx(func, &func->locals[inst->dest_local]));
             }
         }
         break;

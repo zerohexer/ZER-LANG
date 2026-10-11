@@ -1,0 +1,18 @@
+// BUG-1548: the release-and-null idiom through a pointer-to-pointer param.
+// The callee frees what the slot holds and resets it, so the caller's variable
+// is null afterwards — no leak, no use-after-free, and it may be released again.
+struct T { u32 v; }
+void rel(*?*T slot) { if (*slot) |q| { free(q); } *slot = null; }
+void mk(*?*T s) { *s = alloc(T); }
+u32 main() {
+    ?*T lq = alloc(T);
+    rel(&lq);
+    if (lq) |p| { p.v = 1; return 1; }
+    rel(&lq);
+    ?*T x;
+    mk(&x);
+    if (x) |p| { p.v = 3; } else { return 2; }
+    rel(&x);
+    if (x) |p| { return 3; }
+    return 0;
+}

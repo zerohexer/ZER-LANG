@@ -48,9 +48,6 @@ repeated.
    "must be declared volatile" though main never touches `count` (over-rejection). Needs
    reachability from the non-ISR roots (main, spawn targets, funcptr-taken and exported
    functions) — a relaxation, so it needs the accept-unsafe discipline.
-4. **An interrupt handler reaching a call CYCLE is reported as "a call chain deeper than
-   32"** (the walk has no visited set; the verdict — refusing recursion in an ISR — stands,
-   the wording is wrong).
 5. **Over-rejections from the allocation tracker:** the free-every-slot loop over a GLOBAL
    array (`for (i) { if (gs[i]) |p| { free(p); } gs[i] = null; }`) is refused ("double free
    'p'"), though the same loop over a slice parameter compiles; freeing a heap linked list
@@ -60,10 +57,11 @@ repeated.
 6. **Leak false negatives:** after filling an array at a variable index, ONE free at a
    literal index silences every leak; an allocation consumed inline (`(alloc(T) orelse
    return).v = 3;`) is never registered.
-7. **A pointer to a block-scoped local outlives the block silently** (`if (c) { u32 x = 5; p
-   = &x; } … *p`): the IR's locals are flat, so this is not C-level UB, but two sibling
-   blocks' `x` share one C object and `*p` observes the second (exit 10, not 5). Block
-   lifetimes are not modelled by the escape analysis.
+7. **Block lifetimes (BUG-1554) are compared at ASSIGNMENTS only.** The other two ways a
+   pointer to a local leaves its block — a callee storing it (`set(&outer, &x)`) and a
+   store through a pointer (`*pp = &x`) — are refused by the stricter FRAME rules
+   (keep inference / "through pointer or slice"), measured 2026-10-11. Sound, but those
+   rules refuse them even when everything lives in one block (over-rejection).
 8. **Type positions that do not parse a container stamp:** `alloc(Box(u32))`, `alloc(LNode(u32),
    2)`, `arena.alloc(Box(u32))`, `@size(Box(u32))` ("expected expression"); a typedef alias
    works.
@@ -73,19 +71,10 @@ repeated.
 10. **Over-rejection:** a comptime u64 value at or above 2^63 is "could not be evaluated"
    (the INT64_MIN sentinel / 64-bit evaluator). (A negative i128 divisor literal — CLOSED,
    BUG-1538.)
-11. **Seen by the adversarial pass, not fixed (loud / pre-existing):** reserved names in
-   `container` FIELDS reach GCC (`container B(T) { T __LINE__; }`); a threadlocal ARRAY viewed
-   in a global initializer (`[*]u32 gs = ta;`) reaches GCC as "not constant"; a static local
-   read as an IR operand in an async body is emitted as `_zer_self->name` (GCC: no member);
-   `pool.get(h).f(3)` (call through a funcptr field of a pool slot) is an INTERNAL ERROR; a
-   union array variant captured `|*v|` in a switch reaches GCC (`v_capN` undeclared); `void
-   rel(*?*T slot){ if (*slot) |q| { free(q); } *slot = null; }` then `rel(&gq)` while holding a
-   copy of `gq` is a use-after-free not refused (the pointer-to-pointer slot class of the
-   2026-09-27 residual 1).
-12. **A `static const` / `const` parameter or struct FIELD of a VALUE type** (`u32 f(const u32
-   x) { x = 5; }`, `struct S { const u32 id; }` then `s.id = 3`) — the qualifier is dropped by
-   design ("a variable qualifier, not a type property") on params and fields; decide whether
-   to honour it.
+11. **A callee freeing through a pointer-to-reference param (BUG-1548) needs the argument's
+   target.** `rel(pick(&a, &b, c))` is refused ("which object that is cannot be
+   determined") rather than widening both candidates; a pointer-to-reference reached
+   through a struct field of a param (`free(*b.pp)`) is not keyed.
 
 ## OPEN — residuals of the 2026-09-28 round-4 hunt (BUG-1490..1510; measured)
 

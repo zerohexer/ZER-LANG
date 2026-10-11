@@ -1,0 +1,16 @@
+// BUG-1547: a const parameter is readable, copyable, and (for a struct carrying
+// a pointer) its pointee stays writable — the same rules as a const local.
+struct S { u32 v; *u32 p; }
+u32 rd(const S s) { *s.p = 7; return s.v + *s.p; }
+u32 cp(const u32 x) { u32 y = x; y += 1; return y; }
+u32 sum(const [*]u32 xs) { u32 t = 0; for (u32 i = 0; i < xs.len; i += 1) { t += xs[i]; } return t; }
+u32 main() {
+    u32 k = 1;
+    S s = { .v = 2, .p = &k };
+    if (rd(s) != 9) { return 1; }
+    if (k != 7) { return 2; }
+    if (cp(4) != 5) { return 3; }
+    u32[3] a; a[0] = 1; a[1] = 2; a[2] = 3;
+    if (sum(a) != 6) { return 4; }
+    return 0;
+}

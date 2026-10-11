@@ -1878,6 +1878,25 @@ static int ir_alloc_id_of_local(int local_id) {
     return local_id + 1;
 }
 
+/* BUG-1548: the SLOT behind a pointer-to-reference PARAMETER — `*s` in
+ * `void rel(*?*T s)` / `**T` / `*[*]T` / `*Handle(T)` — is the caller's
+ * object, keyed (param, "*"). Minted at function entry (alive, escaped: the
+ * caller owns it) with an allocation id disjoint from every local's
+ * (ir_alloc_id_of_local) and from the fresh-id counter, so freeing what the
+ * slot holds never reads as freeing the pointer param itself. Only a
+ * pointer-to-REFERENCE qualifies: a pointer to a struct reaches its fields
+ * through the existing ".f" keys. */
+#define IR_PARAM_DEREF_AID_BASE 500000
+static const char ir_deref_path[] = "*";
+static bool ir_type_is_ref_leaf(Type *t);
+static bool ir_param_deref_slot(IRFunc *func, int local) {
+    if (!func || local < 0 || local >= func->local_count) return false;
+    if (!func->locals[local].is_param) return false;
+    Type *t = func->locals[local].type ? type_unwrap_distinct(func->locals[local].type) : NULL;
+    if (!t || type_dispatch_kind(t) != TYPE_POINTER || !t->pointer.inner) return false;
+    return ir_type_is_ref_leaf(t->pointer.inner);
+}
+
 /* ================================================================
  * Escape detection helpers (Phase B2)
  *
@@ -2695,6 +2714,18 @@ static IRPathState ir_block_entry_state(ZerCheck *zc, IRFunc *func, int bi,
                     ir_register_nested_handles(&merged, zc->arena,
                         plocal, st, "", 0, 0);
                 }
+                /* BUG-1548: the slot behind each pointer-to-reference param. */
+                for (int li = 0; li < func->local_count; li++) {
+                    if (!ir_param_deref_slot(func, li)) continue;
+                    IRHandleInfo *dh = ir_add_compound_handle(&merged, li,
+                        ir_deref_path, 1);
+                    if (!dh) continue;
+                    dh->state = IR_HS_ALIVE;
+                    dh->alloc_line = 0;
+                    dh->alloc_id = IR_PARAM_DEREF_AID_BASE + li;
+                    dh->source_color = ZC_COLOR_UNKNOWN;
+                    dh->escaped = true;
+                }
             }
         }
         return merged;
@@ -3326,6 +3357,18 @@ static int ir_extract_compound_key(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     expr = ir_peel_launder(expr);  /* BUG-791/931: launders are identity for allocations */
     if (!expr) return -1;
     expr = ir_rebase_slice_index(zc, func, expr, 0);   /* BUG-1383 */
+    /* BUG-1548: `*s` for a pointer-to-reference param is its entry slot. */
+    if (expr->kind == NODE_UNARY && expr->unary.op == TOK_STAR && expr->unary.operand &&
+        expr->unary.operand->kind == NODE_IDENT && func) {
+        Node *o = expr->unary.operand;
+        int pl = ir_find_local_exact_first(func, o->ident.name, (uint32_t)o->ident.name_len);
+        if (ir_param_deref_slot(func, pl)) {
+            *out_local = pl;
+            *out_path = ir_deref_path;
+            *out_path_len = 1;
+            return 0;
+        }
+    }
 
     /* BUG-1492: `pool.get(h).f` and the auto-deref `h.f` are TWO SPELLINGS of
      * one slot field — the checker lowers `h.f` to exactly `pool.get(h).f`.
@@ -5391,6 +5434,68 @@ static void ir_report_freed_alias(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             (int)what_len, what, (int)gh->path_len, gh->path, (int)fnl, fn,
             (int)gh->path_len, gh->path);
         return;
+    }
+}
+
+/* BUG-1548: apply FuncSummary.frees_param_deref at a call — the callee frees
+ * the object argument pi POINTS AT. `&x` names x (a local, a projection, a
+ * global); a forwarded pointer-to-reference param names its own entry slot;
+ * any other pointer is followed to the one object it provably designates. A
+ * pointer whose target cannot be named is refused: there is no allocation to
+ * mark, and accepting it is the silent use-after-free this closes. Every alias
+ * of the object's allocation becomes FREED (MAYBE_FREED on some paths); the
+ * object itself holds null afterwards when every freeing path reset the slot. */
+static IRHandleInfo *ir_find_handle(IRPathState *ps, int local_id);
+static IRHandleInfo *ir_find_compound_handle(IRPathState *ps, int local_id,
+                                             const char *path, uint32_t path_len);
+static Node *ir_ptr_stable_aim(ZerCheck *zc, IRFunc *func, Node *p);
+static void ir_apply_param_deref_frees(ZerCheck *zc, IRFunc *func, IRPathState *ps,
+                                       const FuncSummary *s, Node *call, int line) {
+    if (!s || !s->frees_param_deref || !call || call->kind != NODE_CALL) return;
+    for (int pi = 0; pi < s->param_count && pi < call->call.arg_count; pi++) {
+        unsigned char b = s->frees_param_deref[pi];
+        if (!(b & 1)) continue;
+        Node *a = ir_resolve_returned_arg(zc, call->call.args[pi]);
+        a = a ? ir_peel_launder(a) : NULL;
+        if (!a) continue;
+        int rl = -1; const char *rp = NULL; uint32_t rpl = 0;
+        bool keyed = false;
+        if (a->kind == NODE_UNARY && a->unary.op == TOK_AMP && a->unary.operand) {
+            keyed = ir_extract_compound_key(zc, func, ps, a->unary.operand, &rl, &rp, &rpl) == 0;
+        } else if (a->kind == NODE_IDENT) {
+            int al = ir_find_local_exact_first(func, a->ident.name, (uint32_t)a->ident.name_len);
+            if (ir_param_deref_slot(func, al)) {
+                rl = al; rp = ir_deref_path; rpl = 1; keyed = true;
+            } else {
+                Node *x = ir_ptr_stable_aim(zc, func, a);
+                if (x) keyed = ir_extract_compound_key(zc, func, ps, x, &rl, &rp, &rpl) == 0;
+            }
+        }
+        if (!keyed) {
+            ir_zc_error(zc, line,
+                "argument %d: the callee frees the object this pointer points at, and "
+                "which object that is cannot be determined here — pass '&x' of the "
+                "variable that holds the allocation", pi + 1);
+            continue;
+        }
+        IRHandleInfo *h = rpl == 0 ? (rl >= 0 ? ir_find_handle(ps, rl) : NULL)
+                                   : ir_find_compound_handle(ps, rl, rp, rpl);
+        if (!h) continue;   /* nothing tracked in that object here */
+        if (ir_is_invalid(h)) {
+            ir_zc_error(zc, line,
+                "argument %d: passing a pointer to a %s allocation to a function that "
+                "frees it", pi + 1, ir_state_name(h->state));
+            continue;
+        }
+        IRHandleState ns = (b & 2) ? IR_HS_FREED : IR_HS_MAYBE_FREED;
+        h->state = ns;
+        h->free_line = line;
+        ir_propagate_alias_state(ps, h, ns, line);
+        if (!(b & 4)) {   /* the callee reset the slot on every freeing path */
+            h->state = IR_HS_UNKNOWN;
+            if (b & 2) h->freed_then_reset = true;
+            else h->maybe_freed_then_reset = true;
+        }
     }
 }
 
@@ -13644,6 +13749,8 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
         if (inst->expr && inst->expr->kind == NODE_CALL)
             ir_check_freed_arg_aliasing(zc, func, ps, summary, inst->expr,
                                         inst->source_line, fn_name, fn_name_len);
+        if (inst->expr && inst->expr->kind == NODE_CALL)     /* BUG-1548 */
+            ir_apply_param_deref_frees(zc, func, ps, summary, inst->expr, inst->source_line);
 
         /* BUG-1172: the callee resets a non-local arena — every arena-coloured
          * handle of THIS function is freed across the call, exactly as if the
@@ -14710,10 +14817,18 @@ static void ir_alias_deref_read_local(ZerCheck *zc, IRFunc *func, IRPathState *p
         inst->expr->unary.op != TOK_STAR) return;
     if (inst->dest_local < 0 || inst->dest_local >= func->local_count) return;
     if (ir_find_handle(ps, inst->dest_local)) return;
-    Node *x = ir_ptr_stable_aim(zc, func, inst->expr->unary.operand);
-    if (!x) return;
     IRHandleInfo *xh = NULL;
-    if (x->kind == NODE_IDENT) {
+    {   /* BUG-1548: `*s` of a pointer-to-reference param reads its entry slot */
+        int dl; const char *dp; uint32_t dpl;
+        if (ir_extract_compound_key(zc, func, ps, inst->expr, &dl, &dp, &dpl) == 0 &&
+            dp == ir_deref_path)
+            xh = ir_find_compound_handle(ps, dl, dp, dpl);
+    }
+    Node *x = xh ? NULL : ir_ptr_stable_aim(zc, func, inst->expr->unary.operand);
+    if (!x && !xh) return;
+    if (xh) {
+        /* resolved above */
+    } else if (x->kind == NODE_IDENT) {
         int xl = ir_find_local_exact_first(func, x->ident.name, (uint32_t)x->ident.name_len);
         if (xl < 0) return;
         xh = ir_find_handle(ps, xl);
@@ -15317,7 +15432,11 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
         bool *frees_field = NULL;
         bool *maybe_frees_field = NULL;
         unsigned char *xfer = NULL;   /* BUG-1280 */
+        unsigned char *deref = NULL;  /* BUG-1548 */
         if (pc > 0) {
+            deref = (unsigned char *)calloc(pc, 1);
+            bool *all_deref_freed = (bool *)malloc(pc * sizeof(bool));
+            for (int i = 0; i < pc; i++) all_deref_freed[i] = true;
             frees = (bool *)calloc(pc, sizeof(bool));
             maybe_frees = (bool *)calloc(pc, sizeof(bool));
             frees_field = (bool *)calloc(pc, sizeof(bool));
@@ -15359,6 +15478,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (plocal < 0) {
                         all_return_blocks_freed[i] = false;
                         all_ret_field_freed[i] = false;
+                        all_deref_freed[i] = false;   /* BUG-1548 */
                         continue;
                     }
                     /* BUG-985: this return is the NULL PATH of param i's OWN
@@ -15387,9 +15507,25 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     {
                         bool block_field_freed = false;
                         bool block_field_maybe = false;
+                        bool block_deref_freed = false;   /* BUG-1548 */
                         for (int hh = 0; hh < ps->handle_count; hh++) {
                             IRHandleInfo *ch = &ps->handles[hh];
                             if (ch->local_id != plocal || ch->path_len == 0) continue;
+                            /* BUG-1548: the slot behind a pointer-to-reference
+                             * param is not a FIELD — it is what the caller's
+                             * `&x` names. Its own bits, never the field widening. */
+                            if (ch->path_len == 1 && ch->path && ch->path[0] == '*') {
+                                bool f = ch->state == IR_HS_FREED ||
+                                         (ch->state == IR_HS_UNKNOWN && ch->freed_then_reset);
+                                bool m = ch->state == IR_HS_MAYBE_FREED ||
+                                         ch->maybe_freed_then_reset;
+                                if (deref && (f || m)) deref[i] |= 1;
+                                if (deref && (ch->state == IR_HS_FREED ||
+                                              ch->state == IR_HS_MAYBE_FREED))
+                                    deref[i] |= 4;
+                                if (f) block_deref_freed = true;
+                                continue;
+                            }
                             /* BUG-985: a slot freed and then RESET (`h.p = null;`)
                              * still freed the caller's allocation. */
                             if (ch->state == IR_HS_FREED || ch->freed_then_reset)
@@ -15409,6 +15545,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                         else all_fxfer[i] = false;
                         if (block_field_freed || block_field_maybe) any_field_freed[i] = true;
                         if (!block_field_freed) all_ret_field_freed[i] = false;
+                        if (!block_deref_freed) all_deref_freed[i] = false;   /* BUG-1548 */
                     }
                     /* Use the RESOLVED Type from IR local rather than the syntactic
                      * TypeNode: `typedef *T TPtr; void destroy(TPtr p)` has
@@ -15466,6 +15603,10 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 }
             }
 
+            /* BUG-1548: freed on EVERY live return */
+            for (int i = 0; i < pc; i++)
+                if (return_blocks > 0 && all_deref_freed[i] && (deref[i] & 1)) deref[i] |= 2;
+            free(all_deref_freed);
             /* frees_param[i] = true iff EVERY return block had this param FREED */
             for (int i = 0; i < pc; i++) {
                 if (return_blocks > 0 && all_return_blocks_freed[i]
@@ -16222,6 +16363,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                     if (emf != (maybe_frees_field ? maybe_frees_field[i] : false)) changed = true;
                     unsigned char ex = existing->transfers_param ? existing->transfers_param[i] : 0;
                     if (ex != (xfer ? xfer[i] : 0)) changed = true;   /* BUG-1280 */
+                    unsigned char ed = existing->frees_param_deref ? existing->frees_param_deref[i] : 0;
+                    if (ed != (deref ? deref[i] : 0)) changed = true;   /* BUG-1548 */
                 }
             } else {
                 changed = true;
@@ -16269,6 +16412,8 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 existing->maybe_frees_param_field = maybe_frees_field;
                 free(existing->transfers_param);
                 existing->transfers_param = xfer;   /* BUG-1280 */
+                free(existing->frees_param_deref);
+                existing->frees_param_deref = deref;   /* BUG-1548 */
                 existing->returns_color = returns_color_final;
                 existing->returns_param_color = returns_param_color_final;
                 existing->returns_param_mask = returns_param_mask_final;
@@ -16282,6 +16427,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);
                 free(xfer);
+                free(deref);
             }
         } else {
             if (zc->summary_count >= zc->summary_capacity) {
@@ -16305,6 +16451,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 s->frees_param_field = frees_field;
                 s->maybe_frees_param_field = maybe_frees_field;
                 s->transfers_param = xfer;   /* BUG-1280 */
+                s->frees_param_deref = deref;   /* BUG-1548 */
                 s->returns_color = returns_color_final;
                 s->returns_param_color = returns_param_color_final;
                 s->returns_param_mask = returns_param_mask_final;
@@ -16327,6 +16474,7 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                 free(frees); free(maybe_frees);
                 free(frees_field); free(maybe_frees_field);
                 free(xfer);
+                free(deref);
             }
         }
         free(rf);   /* the summary holds an ARENA copy */

@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: union variant 'a': 'const' on a value field
+union U { const u32 a; u8 b; }
+u32 main() { return 0; }

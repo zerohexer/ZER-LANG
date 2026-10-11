@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot assign to const variable 'x'
+// BUG-1547: a parameter is a variable; a value-type const was silently dropped.
+u32 f(const u32 x) { x = 5; return x; }
+u32 main() { return f(1) - 5; }

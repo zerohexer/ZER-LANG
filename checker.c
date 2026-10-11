@@ -2550,6 +2550,87 @@ static bool type_is_async_task(Type *t) {
     return true;
 }
 
+/* BUG-1559: the async state type a by-value local of type `t` places in the
+ * frame (through arrays / distinct), or NULL. An array is finite, so the walk
+ * needs no cap. */
+static Type *async_task_state_of(Type *t) {
+    while (t) {
+        Type *u = type_unwrap_distinct(t);
+        if (!u) return NULL;
+        if (type_dispatch_kind(u) == TYPE_ARRAY) { t = u->array.inner; continue; }
+        return (type_dispatch_kind(u) == TYPE_STRUCT && u->struct_type.is_async_state) ? u : NULL;
+    }
+    return NULL;
+}
+
+static void record_async_frame_edge(Checker *c, Node *decl, Type *t) {
+    Node *fn = c->current_func_node;
+    if (!c->in_async || !fn || fn->kind != NODE_FUNC_DECL || !fn->func_decl.async_state)
+        return;
+    Type *to = async_task_state_of(t);
+    if (!to) return;
+    if (c->async_frame_edge_count >= c->async_frame_edge_capacity) {
+        int nc = c->async_frame_edge_capacity ? c->async_frame_edge_capacity * 2 : 8;
+        struct AsyncFrameEdge *ne = (struct AsyncFrameEdge *)realloc(c->async_frame_edges,
+                                        (size_t)nc * sizeof(struct AsyncFrameEdge));
+        if (!ne) return;
+        c->async_frame_edges = ne; c->async_frame_edge_capacity = nc;
+    }
+    struct AsyncFrameEdge *e = &c->async_frame_edges[c->async_frame_edge_count++];
+    memset(e, 0, sizeof(*e));
+    e->from = fn->func_decl.async_state; e->to = to;
+    e->local = decl->var_decl.name; e->local_len = (uint32_t)decl->var_decl.name_len;
+    e->file = c->file_name; e->source = c->source; e->line = decl->loc.line;
+}
+
+/* Does the state `from` reach `target` through frame edges? `seen` marks visited
+ * edges' targets (indexed by edge), so a cycle not through `target` ends. */
+static bool async_frame_reaches(Checker *c, Type *from, Type *target, bool *seen) {
+    for (int i = 0; i < c->async_frame_edge_count; i++) {
+        struct AsyncFrameEdge *e = &c->async_frame_edges[i];
+        if (e->from != from || seen[i]) continue;
+        seen[i] = true;
+        if (e->to == target) return true;
+        if (async_frame_reaches(c, e->to, target, seen)) return true;
+    }
+    return false;
+}
+
+/* BUG-1559: a task frame cannot contain itself. GCC saw `field has incomplete
+ * type` for `async void a() { _zer_async_a t; }` and for the two-function cycle. */
+static void check_async_frame_cycles(Checker *c) {
+    int n = c->async_frame_edge_count;
+    if (n <= 0) return;
+    bool *seen = (bool *)calloc((size_t)n, sizeof(bool));
+    if (!seen) return;
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int i = 0; i < n; i++) {
+        struct AsyncFrameEdge *e = &c->async_frame_edges[i];
+        memset(seen, 0, (size_t)n * sizeof(bool));
+        bool cyc = e->to == e->from || async_frame_reaches(c, e->to, e->from, seen);
+        if (!cyc) continue;
+        c->file_name = e->file; c->source = e->source;
+        if (e->to == e->from)
+            checker_error(c, e->line,
+                "local '%.*s' holds this async function's own task '%.*s' by value — "
+                "a task's state holds its locals, so it would contain itself; declare "
+                "the task outside (a global or the caller's local) and pass a "
+                "'*_zer_async_...' pointer",
+                (int)e->local_len, e->local,
+                (int)e->to->struct_type.name_len, e->to->struct_type.name);
+        else
+            checker_error(c, e->line,
+                "local '%.*s' holds task '%.*s' by value, whose state (through its own "
+                "locals) holds .%.*s. again — task states cannot contain one another; "
+                "declare one task outside and pass a '*_zer_async_...' pointer",
+                (int)e->local_len, e->local,
+                (int)e->to->struct_type.name_len, e->to->struct_type.name,
+                (int)e->from->struct_type.name_len, e->from->struct_type.name);
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+    free(seen);
+}
+
 static const char _res_walk_stopped[] = "<walk stopped>";
 
 /* BUG-1177: an async function's STATE (`_zer_async_NAME`) is a unique resource
@@ -6631,6 +6712,8 @@ static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
  * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
  * out in full evaded it at every sink. */
 static bool assign_reads_own_target(Checker *c, Node *value, Symbol *tgt);
+static Symbol *vf_call_ret_global(Checker *c, Node *call);       /* BUG-1561 */
+static Symbol *vf_call_param_store(Checker *c, Node *call, int i); /* BUG-1561 */
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
 /* BUG-999 (from v6o9c5, its BUG-975): ONE exhaustive walker for "does this
@@ -6876,7 +6959,7 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
         return NULL;
     case NODE_CALL:
         for (int i = 0; i < e->call.arg_count; i++) { Symbol *r = RVS(e->call.args[i]); if (r) return r; }
-        return NULL;
+        return vf_call_ret_global(c, e);   /* BUG-1561: `u32 t = rd();` */
     case NODE_ORELSE: { Symbol *l = RVS(e->orelse.expr); return l ? l : RVS(e->orelse.fallback); }
     case NODE_STRUCT_INIT:
         for (int i = 0; i < e->struct_init.field_count; i++) { Symbol *r = RVS(e->struct_init.fields[i].value); if (r) return r; }
@@ -6932,11 +7015,11 @@ static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
 /* Does this value expression carry `g` through a tainted LOCAL? (A direct
  * mention of `g` itself is `assign_reads_own_target`'s job, not this one.)
  * Feeds a REJECT, so the cap and the statement kinds round to TRUE. */
-static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
+static bool rmw_value_taints_global(Checker *c, RmwTaintEnt *tab, int n, Node *e,
                                     Symbol *g, int depth) {
     if (!e || !g) return false;
     if (depth > ZER_EXPR_WALK_MAX) return true;   /* BUG-1010 polarity; BUG-1016 bound */
-    #define RVT(x) rmw_value_taints_global(tab, n, (x), g, depth + 1)
+    #define RVT(x) rmw_value_taints_global(c, tab, n, (x), g, depth + 1)
     switch (e->kind) {
     case NODE_IDENT:
         return rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len) == g;
@@ -6952,6 +7035,7 @@ static bool rmw_value_taints_global(RmwTaintEnt *tab, int n, Node *e,
         return false;
     case NODE_CALL:
         for (int i = 0; i < e->call.arg_count; i++) if (RVT(e->call.args[i])) return true;
+        if (vf_call_ret_global(c, e) == g) return true;   /* BUG-1561: `g = rd() + 1` */
         return RVT(e->call.callee);
     case NODE_ORELSE:   return RVT(e->orelse.expr) || RVT(e->orelse.fallback);
     case NODE_STRUCT_INIT:
@@ -7003,6 +7087,260 @@ static void mmio_pw_call(Checker *c, MmioPwAcc *acc, Symbol *cs, Node *call);
  * "shared between interrupt and main" never fired. Computed ONCE per function and
  * cached on the Symbol; a call site then just tests a bit. */
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth);
+
+/* ---- BUG-1561: value-flow summary for a read-modify-write split across calls.
+ *
+ * `u32 t = rd(); wr(t + 1);` with `rd` returning `g` and `wr` storing its
+ * parameter into `g` is the same non-atomic read-modify-write as `g += 1`, and
+ * both race sinks missed it: the split-statement taint (BUG-1010) follows a
+ * global's value through LOCALS, and a call's return value carried nothing.
+ *
+ * The summary walks the callee's body once, flow-INSENSITIVELY (a local's sources
+ * only grow, so a value set in one branch and read after the join is kept — the
+ * reject direction), mapping each local to the parameters and the global its
+ * value may come from. A local declared in the body shadows a global of the same
+ * name from its declaration on. Not followed (each a missed rejection, recorded
+ * in limitations.md): a store through a pointer (`*gp = v`), a value passed
+ * through a call's ARGUMENT and returned (`return id(g)`), and recursion (an
+ * in-progress summary reads as empty). */
+typedef struct { const char *name; uint32_t len; uint64_t pmask; Symbol *g; } VfLocal;
+typedef struct {
+    Checker *c; Node *fd;
+    VfLocal *loc; int n, cap;
+    Symbol *ret_g; Symbol **pstore; int np;
+} VfCtx;
+
+static Symbol *vf_call_ret_global(Checker *c, Node *call);
+
+static int vf_local_find(VfCtx *x, const char *nm, uint32_t nl) {
+    for (int i = x->n - 1; i >= 0; i--)
+        if (x->loc[i].len == nl && memcmp(x->loc[i].name, nm, nl) == 0) return i;
+    return -1;
+}
+static int vf_param_find(VfCtx *x, const char *nm, uint32_t nl) {
+    for (int i = 0; i < x->fd->func_decl.param_count && i < 64; i++) {
+        ParamDecl *pd = &x->fd->func_decl.params[i];
+        if (pd->name && pd->name_len == nl && memcmp(pd->name, nm, nl) == 0) return i;
+    }
+    return -1;
+}
+static int vf_local_add(VfCtx *x, const char *nm, uint32_t nl) {
+    if (x->n >= x->cap) {
+        int nc = x->cap ? x->cap * 2 : 8;
+        VfLocal *nb = (VfLocal *)realloc(x->loc, (size_t)nc * sizeof(VfLocal));
+        if (!nb) return -1;
+        x->loc = nb; x->cap = nc;
+    }
+    VfLocal *l = &x->loc[x->n];
+    l->name = nm; l->len = nl; l->pmask = 0; l->g = NULL;
+    return x->n++;
+}
+
+/* Which parameters (`*pm`) and which global (`*g`, first found) may the value of
+ * `e` come from? */
+static void vf_value(VfCtx *x, Node *e, uint64_t *pm, Symbol **g, int depth) {
+    if (!e || depth > ZER_EXPR_WALK_MAX) return;
+    #define VFV(y) vf_value(x, (y), pm, g, depth + 1)
+    switch (e->kind) {
+    case NODE_IDENT: {
+        const char *nm = e->ident.name; uint32_t nl = (uint32_t)e->ident.name_len;
+        int li = vf_local_find(x, nm, nl);
+        if (li >= 0) { *pm |= x->loc[li].pmask; if (!*g) *g = x->loc[li].g; return; }
+        int pi = vf_param_find(x, nm, nl);
+        if (pi >= 0) { *pm |= 1ULL << pi; return; }
+        Symbol *s = global_decl_lookup(x->c, nm, nl);
+        if (s && !s->is_function && !*g) *g = s;
+        return;
+    }
+    case NODE_UNARY:    VFV(e->unary.operand); return;
+    case NODE_TYPECAST: VFV(e->typecast.expr); return;
+    case NODE_FIELD:    VFV(e->field.object); return;
+    case NODE_INDEX:    VFV(e->index_expr.object); VFV(e->index_expr.index); return;
+    case NODE_SLICE:    VFV(e->slice.object); VFV(e->slice.start); VFV(e->slice.end); return;
+    case NODE_BINARY:   VFV(e->binary.left); VFV(e->binary.right); return;
+    case NODE_ASSIGN:   VFV(e->assign.value); return;
+    case NODE_ORELSE:   VFV(e->orelse.expr); VFV(e->orelse.fallback); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < e->intrinsic.arg_count; i++) VFV(e->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < e->struct_init.field_count; i++) VFV(e->struct_init.fields[i].value);
+        return;
+    case NODE_CALL: {
+        /* Arguments are read too (the same answer rmw_value_source_global gives). */
+        for (int i = 0; i < e->call.arg_count; i++) VFV(e->call.args[i]);
+        Symbol *rg = vf_call_ret_global(x->c, e);
+        if (rg && !*g) *g = rg;
+        return;
+    }
+    /* Leaves that carry no global's value, and statement kinds an expression
+     * walker is never handed. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return;
+    }
+    #undef VFV
+}
+
+/* One assignment's effect: into a local (its sources grow), or into a global
+ * (every parameter in the value is recorded as stored there). A target reached
+ * through a dereference is not followed. */
+static void vf_assign(VfCtx *x, Node *n) {
+    Node *t = n->assign.target;
+    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX))
+        t = t->kind == NODE_FIELD ? t->field.object : t->index_expr.object;
+    if (!t || t->kind != NODE_IDENT) return;
+    uint64_t pm = 0; Symbol *g = NULL;
+    vf_value(x, n->assign.value, &pm, &g, 0);
+    const char *nm = t->ident.name; uint32_t nl = (uint32_t)t->ident.name_len;
+    int li = vf_local_find(x, nm, nl);
+    if (li < 0 && vf_param_find(x, nm, nl) >= 0) li = vf_local_add(x, nm, nl);
+    if (li >= 0) {
+        x->loc[li].pmask |= pm;
+        if (!x->loc[li].g) x->loc[li].g = g;
+        return;
+    }
+    Symbol *gs = global_decl_lookup(x->c, nm, nl);
+    if (!gs || gs->is_function) return;
+    for (int i = 0; i < x->np && i < 64; i++)
+        if ((pm & (1ULL << i)) && !x->pstore[i]) x->pstore[i] = gs;
+}
+
+static void vf_walk(VfCtx *x, Node *n, int depth) {
+    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    #define VFW(y) vf_walk(x, (y), depth + 1)
+    switch (n->kind) {
+    case NODE_VAR_DECL: {
+        VFW(n->var_decl.init);   /* assignments nested in the initializer */
+        uint64_t pm = 0; Symbol *g = NULL;
+        vf_value(x, n->var_decl.init, &pm, &g, 0);
+        if (n->var_decl.name) {
+            int li = vf_local_add(x, n->var_decl.name, (uint32_t)n->var_decl.name_len);
+            if (li >= 0) { x->loc[li].pmask = pm; x->loc[li].g = g; }
+        }
+        return;
+    }
+    case NODE_ASSIGN:
+        VFW(n->assign.target); VFW(n->assign.value);
+        vf_assign(x, n);
+        return;
+    case NODE_RETURN: {
+        VFW(n->ret.expr);
+        uint64_t pm = 0; Symbol *g = NULL;
+        vf_value(x, n->ret.expr, &pm, &g, 0);
+        if (g && !x->ret_g) x->ret_g = g;
+        return;
+    }
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) VFW(n->block.stmts[i]);
+        return;
+    case NODE_IF:
+        VFW(n->if_stmt.cond); VFW(n->if_stmt.then_body); VFW(n->if_stmt.else_body);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        VFW(n->while_stmt.cond); VFW(n->while_stmt.body);
+        return;
+    case NODE_FOR:
+        VFW(n->for_stmt.init); VFW(n->for_stmt.cond);
+        VFW(n->for_stmt.step); VFW(n->for_stmt.body);
+        return;
+    case NODE_SWITCH:
+        VFW(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) VFW(n->switch_stmt.arms[i].body);
+        return;
+    case NODE_EXPR_STMT: VFW(n->expr_stmt.expr);  return;
+    case NODE_CRITICAL:  VFW(n->critical.body);   return;
+    case NODE_DEFER:     VFW(n->defer.body);      return;
+    case NODE_ONCE:      VFW(n->once.body);       return;
+    case NODE_AWAIT:     VFW(n->await_stmt.cond); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) VFW(n->spawn_stmt.args[i]);
+        return;
+    case NODE_BINARY:    VFW(n->binary.left); VFW(n->binary.right); return;
+    case NODE_UNARY:     VFW(n->unary.operand); return;
+    case NODE_CALL:
+        VFW(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) VFW(n->call.args[i]);
+        return;
+    case NODE_FIELD:     VFW(n->field.object); return;
+    case NODE_INDEX:     VFW(n->index_expr.object); VFW(n->index_expr.index); return;
+    case NODE_SLICE:     VFW(n->slice.object); VFW(n->slice.start); VFW(n->slice.end); return;
+    case NODE_ORELSE:    VFW(n->orelse.expr); VFW(n->orelse.fallback); return;
+    case NODE_TYPECAST:  VFW(n->typecast.expr); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) VFW(n->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) VFW(n->struct_init.fields[i].value);
+        return;
+    /* No statement or assignment below these. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return;
+    }
+    #undef VFW
+}
+
+static void vf_summary(Checker *c, Symbol *fn) {
+    if (!fn || !fn->is_function || fn->vf_state != 0) return;
+    Node *fd = fn->func_node;
+    if (!fd || fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) { fn->vf_state = 2; return; }
+    fn->vf_state = 1;   /* recursion guard */
+    VfCtx x;
+    memset(&x, 0, sizeof(x));
+    x.c = c; x.fd = fd;
+    x.np = fd->func_decl.param_count;
+    if (x.np > 0)
+        x.pstore = (Symbol **)arena_alloc(c->arena, (size_t)x.np * sizeof(Symbol *));
+    if (x.np > 0 && x.pstore) memset(x.pstore, 0, (size_t)x.np * sizeof(Symbol *));
+    if (x.np > 0 && !x.pstore) x.np = 0;
+    DeclModuleSave dm = decl_module_enter(c, fn);   /* resolve names in fn's module */
+    vf_walk(&x, fd->func_decl.body, 0);
+    decl_module_leave(c, dm);
+    free(x.loc);
+    fn->vf_ret_global = x.ret_g;
+    fn->vf_param_store = x.pstore;
+    fn->vf_param_count = x.np;
+    fn->vf_state = 2;
+}
+
+/* The global a direct call's result may carry, or NULL. */
+static Symbol *vf_call_ret_global(Checker *c, Node *call) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee ||
+        call->call.callee->kind != NODE_IDENT) return NULL;
+    Symbol *fs = global_decl_lookup(c, call->call.callee->ident.name,
+                                    (uint32_t)call->call.callee->ident.name_len);
+    if (!fs || !fs->is_function) return NULL;
+    vf_summary(c, fs);
+    return fs->vf_state == 2 ? fs->vf_ret_global : NULL;
+}
+
+/* The global a direct callee stores parameter `i` into, or NULL. */
+static Symbol *vf_call_param_store(Checker *c, Node *call, int i) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee ||
+        call->call.callee->kind != NODE_IDENT) return NULL;
+    Symbol *fs = global_decl_lookup(c, call->call.callee->ident.name,
+                                    (uint32_t)call->call.callee->ident.name_len);
+    if (!fs || !fs->is_function) return NULL;
+    vf_summary(c, fs);
+    if (fs->vf_state != 2 || i < 0 || i >= fs->vf_param_count) return NULL;
+    return fs->vf_param_store[i];
+}
 
 /* Root ident of an assignment target, seeing through deref/field/index. */
 static Node *rmw_target_root_ident(Node *t) {
@@ -7888,7 +8226,7 @@ static void main_rmw_visit(Checker *c, Symbol *g, void *ud) {
     bool is_rmw = (node->assign.op != TOK_EQ) ||
                   target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                   assign_reads_own_target(c, node->assign.value, g) ||
-                  rmw_value_taints_global(c->rmw_taints, c->rmw_taint_count,
+                  rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
                                           node->assign.value, g, 0);  /* BUG-1010 */
     if (is_rmw) track_isr_global(c, g->name, g->name_len, true);
 }
@@ -7959,7 +8297,7 @@ static void spawn_rmw_visit(Checker *c, Symbol *ts, void *ud) {
     bool is_rmw = (node->assign.op != TOK_EQ) ||
                   target_is_bit_range(c, node->assign.target) ||  /* BUG-834 */
                   assign_reads_own_target(c, node->assign.value, ts) ||
-                  rmw_value_taints_global(_rmw_vtaint, _rmw_vtaint_count,
+                  rmw_value_taints_global(c, _rmw_vtaint, _rmw_vtaint_count,
                                           node->assign.value, ts, 0);  /* BUG-1010 */
     if (zer_volatile_compound_valid(ts->is_volatile ? 1 : 0, is_rmw ? 1 : 0) == 0 &&
         !(_scan_once_node && once_single_owner(ts, _scan_once_node)))   /* BUG-1276 */
@@ -9389,6 +9727,82 @@ static Type *alloc_resolve_elem_type(Checker *c, const char *name, uint32_t len)
     Symbol *s = scope_lookup(c->current_scope, name, len);
     if (s && s->type) return s->type;
     return NULL;
+}
+
+/* BUG-1556: a container STAMP written where a type NAME is expected —
+ * `alloc(Box(u32))`, `arena.alloc(Box(u32))`, `@size(Box(u32))`. The parser
+ * reads it as the call `Box(u32)` (a lone primitive keyword is an argument there).
+ * A container's type argument is always a plain name or another stamp (BUG-738),
+ * so the call converts losslessly into a TYNODE_CONTAINER. NULL = not a stamp. */
+static const struct { const char *n; uint32_t l; TypeNodeKind k; } prim_tynodes[] = {
+    {"u8",2,TYNODE_U8},{"u16",3,TYNODE_U16},{"u32",3,TYNODE_U32},{"u64",3,TYNODE_U64},
+    {"i8",2,TYNODE_I8},{"i16",3,TYNODE_I16},{"i32",3,TYNODE_I32},{"i64",3,TYNODE_I64},
+    {"usize",5,TYNODE_USIZE},{"f32",3,TYNODE_F32},{"f64",3,TYNODE_F64},{"bool",4,TYNODE_BOOL},
+};
+static bool is_container_template_name(Checker *c, const char *n, uint32_t l) {
+    for (int i = 0; i < c->container_tmpl_count; i++)
+        if (c->container_templates[i].name_len == l &&
+            memcmp(c->container_templates[i].name, n, l) == 0) return true;
+    return false;
+}
+static TypeNode *stamp_expr_typenode(Checker *c, Node *e, int depth) {
+    if (!e || depth > 64) return NULL;
+    TypeNode *tn = NULL;
+    if (e->kind == NODE_IDENT) {
+        tn = (TypeNode *)arena_alloc(c->arena, sizeof(TypeNode));
+        if (!tn) return NULL;
+        memset(tn, 0, sizeof(TypeNode));
+        tn->loc = e->loc;
+        for (size_t i = 0; i < sizeof(prim_tynodes) / sizeof(prim_tynodes[0]); i++)
+            if (prim_tynodes[i].l == e->ident.name_len &&
+                memcmp(prim_tynodes[i].n, e->ident.name, prim_tynodes[i].l) == 0) {
+                tn->kind = prim_tynodes[i].k;
+                return tn;
+            }
+        tn->kind = TYNODE_NAMED;
+        tn->named.name = e->ident.name;
+        tn->named.name_len = e->ident.name_len;
+        return tn;
+    }
+    if (e->kind != NODE_CALL || e->call.arg_count != 1 || !e->call.callee ||
+        e->call.callee->kind != NODE_IDENT ||
+        !is_container_template_name(c, e->call.callee->ident.name,
+                                    (uint32_t)e->call.callee->ident.name_len))
+        return NULL;
+    TypeNode *arg = stamp_expr_typenode(c, e->call.args[0], depth + 1);
+    if (!arg) return NULL;
+    tn = (TypeNode *)arena_alloc(c->arena, sizeof(TypeNode));
+    if (!tn) return NULL;
+    memset(tn, 0, sizeof(TypeNode));
+    tn->kind = TYNODE_CONTAINER;
+    tn->loc = e->loc;
+    tn->container.name = e->call.callee->ident.name;
+    tn->container.name_len = e->call.callee->ident.name_len;
+    tn->container.type_arg = arg;
+    return tn;
+}
+/* Rewrite a stamp in a type-NAME argument into the stamped struct's own name, so
+ * every later reader (alloc's element lookup, the auto-slab, zercheck_ir's
+ * method classification, the emitter's sizeof) sees the plain struct name a
+ * typedef alias would have given it. Idempotent: a second lowering sees an ident. */
+static void stamp_type_arg_to_name(Checker *c, Node *arg) {
+    if (!arg || arg->kind != NODE_CALL) return;
+    TypeNode *tn = stamp_expr_typenode(c, arg, 0);
+    if (!tn) return;   /* a CALL argument yields a container stamp or NULL */
+    Type *st = resolve_type(c, tn);
+    Type *se = st ? type_unwrap_distinct(st) : NULL;
+    if (!se || type_dispatch_kind(se) != TYPE_STRUCT) return;
+    /* the stamp registers its struct where it was resolved; a name read from
+     * file scope (the emitter's auto-slab, a later function) must find it too */
+    if (!scope_lookup(c->global_scope, se->struct_type.name, se->struct_type.name_len))
+        scope_add(c->arena, c->global_scope, se->struct_type.name,
+                  se->struct_type.name_len, se, arg->loc.line, c->file_name);
+    int line = arg->loc.line;
+    memset(&arg->call, 0, sizeof(arg->call));
+    arg->kind = NODE_IDENT;
+    arg->loc.line = line;
+    arg->ident.name = se->struct_type.name;
+    arg->ident.name_len = se->struct_type.name_len;
 }
 
 /* ---- Volatile stripping check helper ---- */
@@ -14131,7 +14545,7 @@ static Type *check_expr_impl(Checker *c, Node *node) {
              * the two-statement spelling is a lost update: the ISR fires between
              * them and its store is discarded. */
             if (!is_rmw && gs &&
-                rmw_value_taints_global(c->rmw_taints, c->rmw_taint_count,
+                rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
                                         node->assign.value, gs, 0))
                 is_rmw = true;
             (void)is_rmw;
@@ -14348,6 +14762,14 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         through_const_pointer = true;
                     if (ix_eff && type_dispatch_kind(ix_eff) == TYPE_POINTER && ix_eff->pointer.is_const)
                         through_const_pointer = true;
+                    /* BUG-1557: an element reached THROUGH a slice / pointer is not
+                     * the variable's own storage — `if (bs) |q| { q[2] = x; }` writes
+                     * the heap elements a (const) capture views, exactly as `p.f = x`
+                     * through a `|p|` pointer capture always could. Read-only data is
+                     * the TYPE's const (above), never the variable's. */
+                    if (ix_eff && (type_dispatch_kind(ix_eff) == TYPE_SLICE ||
+                                   type_dispatch_kind(ix_eff) == TYPE_POINTER))
+                        through_pointer = true;
                     root = root->index_expr.object;
                 } else {
                     /* H1 (2026-08-02): a NODE_UNARY that is NOT a deref — in
@@ -15870,6 +16292,18 @@ static Type *check_expr_impl(Checker *c, Node *node) {
 
     /* ---- Function call ---- */
     case NODE_CALL: {
+        /* BUG-1556: a container stamp in a type-NAME argument — the universal
+         * `alloc(Box(u32), n)` and the Arena `alloc` / `alloc_slice` — becomes the
+         * stamped struct's name before anything reads the argument. */
+        if (node->call.arg_count >= 1 && node->call.callee &&
+            ((node->call.callee->kind == NODE_IDENT && node->call.callee->ident.name_len == 5 &&
+              memcmp(node->call.callee->ident.name, "alloc", 5) == 0) ||
+             (node->call.callee->kind == NODE_FIELD &&
+              ((node->call.callee->field.field_name_len == 5 &&
+                memcmp(node->call.callee->field.field_name, "alloc", 5) == 0) ||
+               (node->call.callee->field.field_name_len == 11 &&
+                memcmp(node->call.callee->field.field_name, "alloc_slice", 11) == 0)))))
+            stamp_type_arg_to_name(c, node->call.args[0]);
         check_call_vs_lent_globals(c, node);   /* BUG-1125 */
         check_call_vs_once_lent(c, node);      /* BUG-1276 */
         if (c->union_ptr_capture_type) {                                  /* BUG-1186 */
@@ -16058,6 +16492,23 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         c->amp_arg_callee = cfs; c->amp_arg_index = i;
                     }
                 }
+                /* BUG-1556: the TYPE-NAME argument of a `.alloc(T)` /
+                 * `.alloc_slice(T, n)` method that is a primitive keyword
+                 * (`ar.alloc(u32)`) is not a value — there is no symbol `u32` to
+                 * check. The method arm resolves it (alloc_resolve_elem_type). */
+                Node *tna = node->call.args[i];
+                if (i == 0 && tna && tna->kind == NODE_IDENT && node->call.callee &&
+                    node->call.callee->kind == NODE_FIELD &&
+                    ((node->call.callee->field.field_name_len == 5 &&
+                      memcmp(node->call.callee->field.field_name, "alloc", 5) == 0) ||
+                     (node->call.callee->field.field_name_len == 11 &&
+                      memcmp(node->call.callee->field.field_name, "alloc_slice", 11) == 0)) &&
+                    !scope_lookup(c->current_scope, tna->ident.name, (uint32_t)tna->ident.name_len) &&
+                    alloc_resolve_elem_type(c, tna->ident.name, (uint32_t)tna->ident.name_len)) {
+                    arg_types[i] = alloc_resolve_elem_type(c, tna->ident.name,
+                                                           (uint32_t)tna->ident.name_len);
+                    typemap_set(c, tna, arg_types[i]);
+                } else
                 arg_types[i] = check_expr(c, node->call.args[i]);
                 c->amp_arg_callee = sv_ac; c->amp_arg_index = sv_ai;
                 c->arena_backing_exempt = sv_ex;
@@ -16100,6 +16551,16 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * only the literal `&g`. */
                     rmw_arg_targets_main(c, node->call.args[i],
                                          track_rmw_arg_visit, NULL);   /* BUG-1124 */
+                }
+                /* BUG-1561: `wr(t + 1)` storing a value read from the same
+                 * global (`u32 t = rd();`, or `wr(g + 1)`) is a read-modify-
+                 * write of it. */
+                for (int i = 0; i < node->call.arg_count; i++) {
+                    Symbol *sg = vf_call_param_store(c, node, i);
+                    if (sg && (assign_reads_own_target(c, node->call.args[i], sg) ||
+                               rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
+                                                       node->call.args[i], sg, 0)))
+                        track_isr_global(c, sg->name, sg->name_len, true);
                 }
             } else if (callee_is_opaque_funcptr(c, cal)) {
                 /* BUG-1046: a call through a function pointer — no body to
@@ -16765,10 +17226,12 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         node->call.args[0]->kind == NODE_IDENT) {
                         const char *tname = node->call.args[0]->ident.name;
                         size_t tlen = node->call.args[0]->ident.name_len;
-                        Symbol *sym = scope_lookup(c->current_scope, tname, tlen);
-                        if (sym && sym->type) {
+                        /* BUG-1556: the universal alloc's resolver — a primitive
+                         * (`arena.alloc(u32)`) is a type name here too. */
+                        Type *aet = alloc_resolve_elem_type(c, tname, (uint32_t)tlen);
+                        if (aet) {
                             result = type_optional(c->arena,
-                                type_pointer(c->arena, sym->type));
+                                type_pointer(c->arena, aet));
                         } else {
                             checker_error(c, node->loc.line,
                                 "arena.alloc: unknown type '%.*s'", (int)tlen, tname);
@@ -16804,10 +17267,10 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                         node->call.args[0]->kind == NODE_IDENT) {
                         const char *tname = node->call.args[0]->ident.name;
                         size_t tlen = node->call.args[0]->ident.name_len;
-                        Symbol *sym = scope_lookup(c->current_scope, tname, tlen);
-                        if (sym && sym->type) {
+                        Type *aet = alloc_resolve_elem_type(c, tname, (uint32_t)tlen);   /* BUG-1556 */
+                        if (aet) {
                             result = type_optional(c->arena,
-                                type_slice(c->arena, sym->type));
+                                type_slice(c->arena, aet));
                         } else {
                             checker_error(c, node->loc.line,
                                 "arena.alloc_slice: unknown type '%.*s'", (int)tlen, tname);
@@ -16838,7 +17301,9 @@ static Type *check_expr_impl(Checker *c, Node *node) {
 
             /* Task.alloc() / Task.free() — auto-Slab sugar */
             obj = type_unwrap_distinct(obj);
-            if (obj->kind == TYPE_STRUCT) {
+            if (type_dispatch_kind(obj) == TYPE_STRUCT &&
+                !type_struct_has_field(obj, node->call.callee->field.field_name,
+                    (uint32_t)node->call.callee->field.field_name_len)) {   /* BUG-1558 */
                 /* V3: route Task.free(arg) to Task.free_ptr when arg is *T. */
                 route_free_to_ptr_if_needed(c, node);
                 mname = node->call.callee->field.field_name;
@@ -19223,6 +19688,13 @@ static Type *check_expr_impl(Checker *c, Node *node) {
     case NODE_INTRINSIC: {
         const char *name = node->intrinsic.name;
         uint32_t nlen = (uint32_t)node->intrinsic.name_len;
+
+        /* BUG-1556: `@size(Box(u32))` / `@offset(Box(u32), f)` — a container stamp
+         * spelled where the type NAME goes; the same rewrite the alloc forms get. */
+        if (node->intrinsic.arg_count >= 1 && !node->intrinsic.type_arg &&
+            ((nlen == 4 && memcmp(name, "size", 4) == 0) ||
+             (nlen == 6 && memcmp(name, "offset", 6) == 0)))
+            stamp_type_arg_to_name(c, node->intrinsic.args[0]);
 
         /* type-check arguments — skip field name args for @offset, @container */
         bool has_field_arg = (nlen == 6 && memcmp(name, "offset", 6) == 0) ||
@@ -23555,6 +24027,294 @@ static bool scan_funcptr_field_bindings(Checker *c, Node *n, int depth,
 
 /* Check if a function body accesses non-shared, non-const, non-threadlocal globals.
  * Used to validate spawn targets — accessing such globals from a spawned thread is a data race. */
+/* THE exemption set of the spawn race scan: does a non-function global `sym`
+ * need synchronisation when a spawned thread touches it? (Extracted for
+ * BUG-1562, which asks the same question of the globals a thread WRITES.) */
+static bool spawn_global_needs_sync(Checker *c, Symbol *sym) {
+    if (!sym || sym->is_function || !sym->type) return false;
+    /* BUG-1249: const exempts a value that cannot change — not the
+     * mutable data a const POINTER / slice / carrier points at
+     * (`const [*]u32 gs = arr;` read while main writes arr). */
+    if (sym->is_const && !type_carries_data_pointer(sym->type, 0)) return false;
+    /* volatile: an "explicit low-level opt-in" for the SINGLE-WORD
+     * volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer).
+     * That rationale is width-bounded and the check never was:
+     * 2026-08-03 measured `volatile u64 big; big = <64-bit>;` from a
+     * spawned thread ACCEPTED on a 32-bit target, where the store lowers
+     * to TWO 32-bit stores and can TEAR — a reader may observe half of
+     * each write. "Single word" is doing real work in that sentence, so
+     * enforce it: skip only for a scalar no wider than the target word.
+     *
+     * Deliberately NOT tightened further. A single-word volatile store
+     * still provides no ORDERING, but banning it would break the
+     * universal embedded flag idiom, the ISR path treats it the same
+     * way, and the diagnostic already tells the user volatile is not
+     * synchronization. That part is a judgment call and stays as-is;
+     * a tearable multi-word store is not. */
+    if (sym->is_volatile &&
+        volatile_global_exempt_from_race_check(c, sym)) return false;
+    /* volatile but wider than a word (or an aggregate) — falls through
+     * and is flagged: the store lowers to several stores and tears. */
+    /* threadlocal: check the AST node for is_threadlocal flag */
+    if (sym->func_node &&
+        (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
+        sym->func_node->var_decl.is_threadlocal) return false;
+    Type *t = type_unwrap_distinct(sym->type);
+    if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
+        return false;
+    /* Barrier (own mutex) and Semaphore (own counting lock) are
+     * internally synchronized → safe. Pool, Slab, Ring are NOT
+     * thread-safe (non-atomic alloc/free/push/pop metadata).
+     * Axis A4 (2026-06-21): Arena REMOVED from this exclusion — its
+     * bump-pointer metadata is NOT thread-safe either (concurrent
+     * arena.alloc() races); it was wrongly grouped with the
+     * internally-synced primitives. A global Arena touched from a
+     * spawned thread now flags as a data race. */
+    if (t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
+        return false;
+    return true;
+}
+
+/* ---- BUG-1562: two unguarded writers under the atomic/barrier downgrade ----
+ *
+ * A spawn target containing any @atomic_* / @barrier has its race finding
+ * downgraded to a warning: a hand-built protocol (a CAS spinlock, a release/
+ * acquire flag) can order plain accesses in ways the analysis cannot verify.
+ * But no protocol orders two threads that both WRITE a plain global while
+ * holding nothing — `g += 1; @atomic_store(&flag, 1);` run by two threads
+ * loses updates whatever the flag is for. A write counts as guarded when it
+ * sits between a spin ACQUIRE of a lock word (`while (!@atomic_cas(&L, ..))`,
+ * `while (@atomic_xchg(&L, 1) != 0)`) and its RELEASE (`@atomic_store(&L, ..)`
+ * / `@atomic_xchg(&L, ..)`) in one statement list; a guarded region's callees
+ * are guarded too. */
+/* The lock word an `@atomic_NAME(&L, ...)` intrinsic names, when NAME is one
+ * of `names` (a NULL-terminated list). */
+static Symbol *sync_intrinsic_lock(Checker *c, Node *e, const char *const *names) {
+    if (!e || e->kind != NODE_INTRINSIC || e->intrinsic.arg_count < 1) return NULL;
+    bool hit = false;
+    for (int i = 0; names[i]; i++)
+        if (e->intrinsic.name_len == strlen(names[i]) &&
+            memcmp(e->intrinsic.name, names[i], e->intrinsic.name_len) == 0) hit = true;
+    if (!hit) return NULL;
+    Node *a = e->intrinsic.args[0];
+    if (!a || a->kind != NODE_UNARY || a->unary.op != TOK_AMP) return NULL;
+    return resolve_write_target_global(c, a->unary.operand, 0);
+}
+/* A CAS / exchange somewhere in a spin condition (through `!`, comparisons). */
+static Symbol *sync_cond_cas_lock(Checker *c, Node *e, int depth) {
+    static const char *const acq[] = { "atomic_cas", "atomic_xchg", NULL };
+    if (!e || depth > 16) return NULL;
+    Symbol *l = sync_intrinsic_lock(c, e, acq);
+    if (l) return l;
+    if (e->kind == NODE_UNARY) return sync_cond_cas_lock(c, e->unary.operand, depth + 1);
+    if (e->kind == NODE_BINARY) {
+        l = sync_cond_cas_lock(c, e->binary.left, depth + 1);
+        return l ? l : sync_cond_cas_lock(c, e->binary.right, depth + 1);
+    }
+    return NULL;
+}
+static Symbol *sync_stmt_acquires(Checker *c, Node *s) {
+    if (!s) return NULL;
+    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE)
+        return sync_cond_cas_lock(c, s->while_stmt.cond, 0);
+    return NULL;
+}
+static Symbol *sync_stmt_releases(Checker *c, Node *s) {
+    static const char *const rel[] = { "atomic_store", "atomic_xchg", NULL };
+    if (!s || s->kind != NODE_EXPR_STMT) return NULL;
+    return sync_intrinsic_lock(c, s->expr_stmt.expr, rel);
+}
+
+/* One write of a global by a thread, and the lock word held around it (NULL
+ * when none is). */
+typedef struct { Symbol *g; Symbol *lock; } SyncWrite;
+typedef struct { SyncWrite *v; int n, cap; } SyncWriteSet;
+static bool sync_wset_has(SyncWriteSet *s, Symbol *g, Symbol *lock) {
+    for (int i = 0; i < s->n; i++) if (s->v[i].g == g && s->v[i].lock == lock) return true;
+    return false;
+}
+static void sync_wset_add(SyncWriteSet *s, Symbol *g, Symbol *lock) {
+    if (!g || sync_wset_has(s, g, lock)) return;
+    if (s->n >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 8;
+        SyncWrite *nb = (SyncWrite *)realloc(s->v, (size_t)nc * sizeof(SyncWrite));
+        if (!nb) return;
+        s->v = nb; s->cap = nc;
+    }
+    s->v[s->n].g = g; s->v[s->n].lock = lock; s->n++;
+}
+
+/* Every global this code WRITES, each with the lock held around the write,
+ * transitively through direct calls. `seen` records (function, lock) pairs
+ * already walked, so a body is walked once per lock it can run under. */
+static void sync_thread_writes(Checker *c, Node *n, Symbol *lock, SyncWriteSet *out,
+                               SyncWriteSet *seen, int depth) {
+    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    #define SUW(y) sync_thread_writes(c, (y), lock, out, seen, depth + 1)
+    switch (n->kind) {
+    case NODE_BLOCK: {
+        Symbol *held = NULL;   /* a lock taken at this level, inside an unlocked context */
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *st = n->block.stmts[i];
+            if (held) {
+                if (sync_stmt_releases(c, st) == held) { held = NULL; continue; }
+                sync_thread_writes(c, st, held, out, seen, depth + 1);
+                continue;
+            }
+            Symbol *acq = lock ? NULL : sync_stmt_acquires(c, st);
+            if (acq) { held = acq; continue; }
+            SUW(st);
+        }
+        return;
+    }
+    case NODE_ASSIGN: {
+        Symbol *g = resolve_write_target_global(c, n->assign.target, 0);
+        if (g && spawn_global_needs_sync(c, g)) sync_wset_add(out, g, lock);
+        SUW(n->assign.target); SUW(n->assign.value);
+        return;
+    }
+    case NODE_CALL: {
+        SUW(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) SUW(n->call.args[i]);
+        Node *cal = n->call.callee;
+        if (cal && cal->kind == NODE_IDENT) {
+            Symbol *fs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
+            if (fs && fs->is_function && fs->func_node &&
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body &&
+                !sync_wset_has(seen, fs, lock)) {
+                sync_wset_add(seen, fs, lock);
+                DeclModuleSave dm = decl_module_enter(c, fs);
+                SUW(fs->func_node->func_decl.body);
+                decl_module_leave(c, dm);
+            }
+        }
+        return;
+    }
+    case NODE_IF:
+        SUW(n->if_stmt.cond); SUW(n->if_stmt.then_body); SUW(n->if_stmt.else_body);
+        return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        SUW(n->while_stmt.cond); SUW(n->while_stmt.body);
+        return;
+    case NODE_FOR:
+        SUW(n->for_stmt.init); SUW(n->for_stmt.cond);
+        SUW(n->for_stmt.step); SUW(n->for_stmt.body);
+        return;
+    case NODE_SWITCH:
+        SUW(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) SUW(n->switch_stmt.arms[i].body);
+        return;
+    case NODE_EXPR_STMT: SUW(n->expr_stmt.expr);  return;
+    case NODE_VAR_DECL:  SUW(n->var_decl.init);   return;
+    case NODE_RETURN:    SUW(n->ret.expr);        return;
+    case NODE_CRITICAL:  SUW(n->critical.body);   return;
+    case NODE_DEFER:     SUW(n->defer.body);      return;
+    /* A @once body runs once program-wide (BUG-1276's single-owner rule). */
+    case NODE_ONCE:      return;
+    case NODE_AWAIT:     SUW(n->await_stmt.cond); return;
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) SUW(n->spawn_stmt.args[i]);
+        return;
+    case NODE_BINARY:    SUW(n->binary.left); SUW(n->binary.right); return;
+    case NODE_UNARY:     SUW(n->unary.operand); return;
+    case NODE_FIELD:     SUW(n->field.object); return;
+    case NODE_INDEX:     SUW(n->index_expr.object); SUW(n->index_expr.index); return;
+    case NODE_SLICE:     SUW(n->slice.object); SUW(n->slice.start); SUW(n->slice.end); return;
+    case NODE_ORELSE:    SUW(n->orelse.expr); SUW(n->orelse.fallback); return;
+    case NODE_TYPECAST:  SUW(n->typecast.expr); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) SUW(n->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) SUW(n->struct_init.fields[i].value);
+        return;
+    /* No write below these. */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+        return;
+    }
+    #undef SUW
+}
+
+static void record_sync_spawn(Checker *c, Symbol *target, int line) {
+    if (c->sync_spawn_count >= c->sync_spawn_capacity) {
+        int nc = c->sync_spawn_capacity ? c->sync_spawn_capacity * 2 : 8;
+        struct SyncSpawnSite *nb = (struct SyncSpawnSite *)realloc(c->sync_spawns,
+                                       (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        c->sync_spawns = nb; c->sync_spawn_capacity = nc;
+    }
+    struct SyncSpawnSite *s = &c->sync_spawns[c->sync_spawn_count++];
+    s->target = target; s->repeated = c->in_loop;
+    s->file = c->file_name; s->source = c->source; s->line = line;
+}
+
+/* Two thread instances writing global `g` conflict unless BOTH hold the same
+ * lock word around the write. The instances are: a site spawned in a loop
+ * (counted twice — the same writes against themselves), and every other
+ * downgraded site. */
+static bool sync_writes_conflict(SyncWriteSet *a, SyncWriteSet *b, Symbol *g) {
+    for (int i = 0; i < a->n; i++) {
+        if (a->v[i].g != g) continue;
+        for (int j = 0; j < b->n; j++) {
+            if (b->v[j].g != g) continue;
+            if (!a->v[i].lock || !b->v[j].lock || a->v[i].lock != b->v[j].lock) return true;
+        }
+    }
+    return false;
+}
+
+static void check_sync_spawn_writers(Checker *c) {
+    int n = c->sync_spawn_count;
+    if (n <= 0) return;
+    SyncWriteSet *w = (SyncWriteSet *)calloc((size_t)n, sizeof(SyncWriteSet));
+    if (!w) return;
+    for (int i = 0; i < n; i++) {
+        Symbol *t = c->sync_spawns[i].target;
+        if (!t || !t->func_node || t->func_node->kind != NODE_FUNC_DECL) continue;
+        SyncWriteSet seen = {0};
+        sync_wset_add(&seen, t, NULL);
+        DeclModuleSave dm = decl_module_enter(c, t);
+        sync_thread_writes(c, t->func_node->func_decl.body, NULL, &w[i], &seen, 0);
+        decl_module_leave(c, dm);
+        free(seen.v);
+    }
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    SyncWriteSet reported = {0};
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < w[i].n; k++) {
+            Symbol *g = w[i].v[k].g;
+            if (sync_wset_has(&reported, g, NULL)) continue;
+            bool conflict = c->sync_spawns[i].repeated && sync_writes_conflict(&w[i], &w[i], g);
+            for (int j = i + 1; j < n && !conflict; j++)
+                conflict = sync_writes_conflict(&w[i], &w[j], g);
+            if (!conflict) continue;
+            sync_wset_add(&reported, g, NULL);
+            struct SyncSpawnSite *s = &c->sync_spawns[i];
+            c->file_name = s->file; c->source = s->source;
+            checker_error(c, s->line,
+                "spawn target '%.*s' writes non-shared global '%.*s', and another thread "
+                "writes it too without holding the same lock — an @atomic_* / @barrier "
+                "elsewhere in the thread does not order two writers. Take ONE lock around "
+                "every write (`while (!@atomic_cas(&lock, 0, 1)) {}` ... "
+                "`@atomic_store(&lock, 0);`), or use @atomic_* / a shared struct",
+                (int)s->target->name_len, s->target->name,
+                (int)g->name_len, g->name);
+        }
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+    free(reported.v);
+    for (int i = 0; i < n; i++) free(w[i].v);
+    free(w);
+}
+
 static bool scan_unsafe_global_access(Checker *c, Node *node,
                                        const char **out_name, uint32_t *out_len) {
     if (!node) return false;
@@ -23568,49 +24328,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
             SpawnBoundUd bu = { out_name, out_len };
             if (global_bound_functions(c, sym, spawn_scan_bound_fn, &bu)) return true;
         }
-        if (sym && !sym->is_function && sym->type) {
-            /* Skip: const, volatile (explicit low-level opt-in), threadlocal,
-             * shared, Pool/Slab/Ring/Arena/Barrier */
-            /* BUG-1249: const exempts a value that cannot change — not the
-             * mutable data a const POINTER / slice / carrier points at
-             * (`const [*]u32 gs = arr;` read while main writes arr). */
-            if (sym->is_const && !type_carries_data_pointer(sym->type, 0)) return false;
-            /* volatile: an "explicit low-level opt-in" for the SINGLE-WORD
-             * volatile-flag idiom (see tests/zer/spawn_volatile_store_ok.zer).
-             * That rationale is width-bounded and the check never was:
-             * 2026-08-03 measured `volatile u64 big; big = <64-bit>;` from a
-             * spawned thread ACCEPTED on a 32-bit target, where the store lowers
-             * to TWO 32-bit stores and can TEAR — a reader may observe half of
-             * each write. "Single word" is doing real work in that sentence, so
-             * enforce it: skip only for a scalar no wider than the target word.
-             *
-             * Deliberately NOT tightened further. A single-word volatile store
-             * still provides no ORDERING, but banning it would break the
-             * universal embedded flag idiom, the ISR path treats it the same
-             * way, and the diagnostic already tells the user volatile is not
-             * synchronization. That part is a judgment call and stays as-is;
-             * a tearable multi-word store is not. */
-            if (sym->is_volatile &&
-                volatile_global_exempt_from_race_check(c, sym)) return false;
-            /* volatile but wider than a word (or an aggregate) — falls through
-             * and is flagged: the store lowers to several stores and tears. */
-            /* threadlocal: check the AST node for is_threadlocal flag */
-            if (sym->func_node &&
-                (sym->func_node->kind == NODE_VAR_DECL || sym->func_node->kind == NODE_GLOBAL_VAR) &&
-                sym->func_node->var_decl.is_threadlocal) return false;
-            Type *t = type_unwrap_distinct(sym->type);
-            if (t->kind == TYPE_STRUCT && (t->struct_type.is_shared || t->struct_type.is_shared_rw))
-                return false;
-            /* Barrier (own mutex) and Semaphore (own counting lock) are
-             * internally synchronized → safe. Pool, Slab, Ring are NOT
-             * thread-safe (non-atomic alloc/free/push/pop metadata).
-             * Axis A4 (2026-06-21): Arena REMOVED from this exclusion — its
-             * bump-pointer metadata is NOT thread-safe either (concurrent
-             * arena.alloc() races); it was wrongly grouped with the
-             * internally-synced primitives. A global Arena touched from a
-             * spawned thread now flags as a data race. */
-            if (t->kind == TYPE_BARRIER || t->kind == TYPE_SEMAPHORE)
-                return false;
+        if (sym && !sym->is_function && sym->type && spawn_global_needs_sync(c, sym)) {
             /* BUG-1276: touched only inside one @once of a scoped spawn target */
             if (scan_once_exempt(sym)) return false;
             /* Non-shared global — potential data race */
@@ -23715,7 +24433,7 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
              * form taught to one sink and not the other fails the build, and it
              * caught this the moment the ISR half went in. */
             if (!_is_rmw && ts &&
-                rmw_value_taints_global(_rmw_vtaint, _rmw_vtaint_count,
+                rmw_value_taints_global(c, _rmw_vtaint, _rmw_vtaint_count,
                                         node->assign.value, ts, 0))
                 _is_rmw = true;
             /* Maintain the taint: a plain `local = <expr>` re-binds it, and a
@@ -23758,6 +24476,25 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         /* Check call arguments for global access */
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
+        /* BUG-1561: `wr(t + 1)` where `wr` stores its parameter into a volatile
+         * global and `t` carries that global's value (`u32 t = rd();`) — the
+         * read-modify-write split across two calls. Same verdict as the
+         * NODE_ASSIGN arm's spawn_rmw_visit. */
+        for (int i = 0; i < node->call.arg_count; i++) {
+            Symbol *sg = vf_call_param_store(c, node, i);
+            if (!sg || sg->is_function || sg->is_const) continue;
+            if (!assign_reads_own_target(c, node->call.args[i], sg) &&
+                !rmw_value_taints_global(c, _rmw_vtaint, _rmw_vtaint_count,
+                                         node->call.args[i], sg, 0))
+                continue;
+            if (zer_volatile_compound_valid(sg->is_volatile ? 1 : 0, 1) == 0 &&
+                !(_scan_once_node && once_single_owner(sg, _scan_once_node))) {
+                _rmw_flagged_rmw = true;
+                *out_name = sg->name;
+                *out_len = sg->name_len;
+                return true;
+            }
+        }
         {
             /* Depth limit shared between the direct-call, funcptr-arg, and
              * funcptr-binding transitive scans — single counter is critical
@@ -24584,6 +25321,8 @@ static void check_stmt_impl(Checker *c, Node *node) {
             checker_error(c, node->loc.line,
                 "cannot declare variable of type 'void'");
         }
+        if (node->kind == NODE_VAR_DECL && !node->var_decl.is_static)
+            record_async_frame_edge(c, node, type);   /* BUG-1559 */
         /* Pool/Ring/Slab must be global or static — not on the stack */
         if (node->kind == NODE_VAR_DECL && type &&
             (type_dispatch_kind(type) == TYPE_POOL || type_dispatch_kind(type) == TYPE_RING ||
@@ -29841,6 +30580,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 ensure_func_props(c, func_sym);
                 bool has_sync = func_sym->props.has_sync;
                 if (has_sync) {
+                    record_sync_spawn(c, func_sym, node->loc.line);   /* BUG-1562 */
                     checker_warning(c, node->loc.line,
                         "spawn target '%.*s' accesses %s '%.*s' — "
                         "potential data race (atomic/barrier present, verify ordering)",
@@ -30558,6 +31298,7 @@ static void register_decl(Checker *c, Node *node) {
             async_type->struct_type.fields = NULL;
             async_type->struct_type.type_id = c->next_type_id++;
             async_type->struct_type.is_async_state = true;   /* BUG-1177 */
+            node->func_decl.async_state = async_type;          /* BUG-1559 */
             /* BUG-1455: the state type and its three accessors belong to the
              * async function's MODULE, like the function itself — the C names
              * carry the prefix (emitter async_cbase), and a name two modules
@@ -31870,6 +32611,8 @@ static void esc_restore(Checker *c, const Checker *snap) {
     ESC_KEEP_BUF(param_expects, param_expect_capacity);
     ESC_KEEP_BUF(isr_globals, isr_global_capacity);
     ESC_KEEP_BUF(mmio_accesses, mmio_access_capacity);   /* BUG-1480 */
+    ESC_KEEP_BUF(async_frame_edges, async_frame_edge_capacity);   /* BUG-1559 */
+    ESC_KEEP_BUF(sync_spawns, sync_spawn_capacity);                /* BUG-1562 */
     ESC_KEEP_BUF(atomic_plain_writes, atomic_plain_write_capacity);
     ESC_KEEP_BUF(atomic_args, atomic_arg_cap);
     ESC_KEEP_BUF(atomic_fields, atomic_field_capacity);
@@ -39197,6 +39940,8 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     /* A6-full: atomic-cell inclusion — flag plain writes to @atomic'd globals */
     check_atomic_cell_safety(c);
     check_alias_spawn_calls(c);   /* BUG-1303 */
+    check_async_frame_cycles(c);  /* BUG-1559 */
+    check_sync_spawn_writers(c);  /* BUG-1562 */
 
     /* Stack depth analysis — detect recursion; --stack-limit over the WHOLE
      * program (BUG-1037: imported functions had no frame before) */

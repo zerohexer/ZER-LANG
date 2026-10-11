@@ -1,0 +1,3 @@
+// expect-error: own task '_zer_async_a' by value
+async void a() { _zer_async_a t; yield; }
+u32 main() { return 0; }

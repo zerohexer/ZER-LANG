@@ -467,6 +467,15 @@ struct Symbol {
      * test_firmware_patterns for >4 minutes. */
     bool rmw_summary_done;
     uint64_t rmw_param_mask;
+    /* BUG-1561: the VALUE-flow half, for a read-modify-write split across calls
+     * (`u32 t = rd(); wr(t + 1);`): a global this function's RETURN value may
+     * carry, and per parameter a global its value may be STORED into. Lazy;
+     * vf_state 0 = not computed, 1 = in progress (a recursive call reads it as
+     * empty), 2 = done. */
+    uint8_t vf_state;
+    struct Symbol *vf_ret_global;
+    struct Symbol **vf_param_store;
+    int vf_param_count;
     /* BUG-1481: the MEMORY-MAPPED half of the same summary — every write this
      * function makes THROUGH a pointer parameter, as a byte span relative to the
      * pointer (`void setb(volatile *Regs u){ u.ctrl |= 2; }` -> param 0, bytes
@@ -572,6 +581,10 @@ int  type_alignment_bytes(Type *a); /* required alignment in bytes; recurses
                                       * through aggregates for compound MMIO
                                       * targets; returns 0 if not computable */
 bool type_is_optional(Type *a);
+/* BUG-1558: does struct type `t` (distinct-unwrapped) declare a FIELD named
+ * name? A field wins over the auto-Slab method sugar (`Task.alloc()`), so a
+ * funcptr field `ops.alloc(x)` is an ordinary indirect call. */
+bool type_struct_has_field(Type *t, const char *name, uint32_t len);
 Type *type_unwrap_optional(Type *a); /* ?T → T */
 
 /* coercion: can 'from' be implicitly converted to 'to'? */

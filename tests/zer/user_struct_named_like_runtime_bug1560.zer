@@ -1,0 +1,6 @@
+// BUG-1560: a user type named slice_u8 / opt_u32 no longer collides with the runtime's optional-slice typedefs
+struct opt_u32 { u32 a; }
+struct opt_slice_u8 { u32 a; }
+u32 main() { opt_u32 s; ?u32 q = 3; opt_slice_u8 w; ?[*]u8 o = null; return s.a + w.a + (q orelse 0) - 3 + second(); }
+struct slice_u8 { u32 a; }
+u32 second() { slice_u8 s; s.a = 1; ?[*]u8 o = null; const [*]u8 x = "hi"; if (o) |v| { return 9; } return s.a - 1 + (u32)x.len - 2; }

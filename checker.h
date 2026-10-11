@@ -492,6 +492,33 @@ typedef struct {
     int mmio_access_count;
     int mmio_access_capacity;
 
+    /* BUG-1559: an async function's FRAME holds its locals by value, so a local
+     * of task type `_zer_async_B` inside async A makes A's state contain B's.
+     * One edge per such local; a cycle (A holds A, or A holds B holds A) is a
+     * type containing itself, refused in the whole-program post pass. */
+    struct AsyncFrameEdge {
+        Type *from, *to;
+        const char *local; uint32_t local_len;
+        const char *file; const char *source;
+        int line;
+    } *async_frame_edges;
+    int async_frame_edge_count;
+    int async_frame_edge_capacity;
+
+    /* BUG-1562: spawn sites whose race finding was DOWNGRADED to a warning
+     * because the target contains an @atomic_* / @barrier (a hand-built
+     * protocol the analysis trusts). The post pass refuses the one thing such
+     * a protocol cannot make safe without mutual exclusion: two threads both
+     * WRITING the same plain global outside every lock they take. */
+    struct SyncSpawnSite {
+        Symbol *target;
+        bool repeated;        /* spawned inside a loop: two instances at least */
+        const char *file; const char *source;
+        int line;
+    } *sync_spawns;
+    int sync_spawn_count;
+    int sync_spawn_capacity;
+
     /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
      * recorded during check; post-check flags any whose symbol got marked
      * is_atomic_cell (an `@atomic_*` target). Collect-then-check, like ISR. */

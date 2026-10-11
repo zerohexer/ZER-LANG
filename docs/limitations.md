@@ -32,17 +32,20 @@ repeated.
 
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
-1. **A race in a spawn target is only a WARNING when the target (or any callee) contains
-   any `@atomic_*` / `@barrier`** — whichever global the atomic touches. This is the
-   documented hand-built-lock escape (`rt_conc_atomic_spinlock`: a CAS spinlock guarding a
-   plain counter, which the analysis cannot verify), and it also downgrades a plain racy
-   `g += 1` next to an unrelated `@atomic_store(&flag, 1)` (measured: lost updates, TSan).
-   A trust gap by design; the precise fix is to downgrade only an access the analysis can
-   show is ordered by the atomic it pairs with.
-2. **A split RMW through CALLS** — `u32 t = rd(); wr(t + 1);` where `rd` returns `g` and
-   `wr` stores it — is not seen at either race sink (the taint follows values through
-   locals, not a call's return of a global). Needs a "returns global G" summary feeding
-   `rmw_value_source_global`.
+1. **The atomic/barrier downgrade still trusts a READER.** BUG-1562 refuses two threads
+   WRITING one plain global without a common lock, which closes the measured lost-update
+   case. What stays a warning: a plain read in one thread against a plain write in
+   another, with any `@atomic_*` / `@barrier` present (the release/acquire flag idiom
+   looks identical to an unordered read). Two more limits of the BUG-1562 rule: the
+   parent's own writes inside the spawn..join window are not counted as a writer, and a
+   spawn inside a function called twice counts once (only a loop around the spawn
+   counts twice). The lock recogniser knows a spin `while` on `@atomic_cas` /
+   `@atomic_xchg` and a release `@atomic_store` / `@atomic_xchg` in one statement list.
+2. **The split RMW through CALLS (BUG-1561) follows** a callee's return of a global and
+   a parameter stored into a global, through locals, both flow-insensitively. Not
+   followed: a store through a pointer in the callee (`*gp = v`), a value passed through
+   another call's ARGUMENT and returned (`return id(g)`), and recursion (an in-progress
+   summary reads as empty).
 3. **A helper called only from an interrupt handler counts as MAIN code** for the
    ISR-sharing rule: `void bump() { count = 5; } interrupt T { bump(); }` is refused
    "must be declared volatile" though main never touches `count` (over-rejection). Needs
@@ -62,12 +65,10 @@ repeated.
    store through a pointer (`*pp = &x`) — are refused by the stricter FRAME rules
    (keep inference / "through pointer or slice"), measured 2026-10-11. Sound, but those
    rules refuse them even when everything lives in one block (over-rejection).
-8. **Type positions that do not parse a container stamp:** `alloc(Box(u32))`, `alloc(LNode(u32),
-   2)`, `arena.alloc(Box(u32))`, `@size(Box(u32))` ("expected expression"); a typedef alias
-   works.
-9. **Loud name collisions:** a user `struct slice_u8` and the runtime's `_zer_opt_slice_u8`;
-   an async function holding its own task type in a local (`_zer_async_a t;` inside `a`)
-   reaches GCC as an incomplete type.
+8. ~~Type positions that do not parse a container stamp~~ — CLOSED 2026-10-11 (BUG-1556:
+   `alloc` / `arena.alloc` / `alloc_slice` / `@size` / `@offset` take a stamp and a primitive).
+9. ~~Loud name collisions~~ — CLOSED 2026-10-11 (BUG-1560: optional-slice typedefs are
+   `_zer_optslice_*`; BUG-1559: a task frame containing itself is a checker error).
 10. **Over-rejection:** a comptime u64 value at or above 2^63 is "could not be evaluated"
    (the INT64_MIN sentinel / 64-bit evaluator). (A negative i128 divisor literal — CLOSED,
    BUG-1538.)

@@ -1,0 +1,7 @@
+// expect-error: const
+u32[4] arr;
+u32 main() {
+    ?const [*]u32 os = arr;
+    if (os) |q| { q[1] = 5; }
+    return 0;
+}

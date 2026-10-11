@@ -174,6 +174,62 @@ A/B-measured against a HEAD build, and every new negative is ACCEPTED by it.
   deeper than 32"**: the ISR walk had a depth cap and no path set. One descent helper
   `isr_walk_callee_body` (the three descent sites) keeps the active path and reports the
   cycle by name; the verdict (no recursion in a handler) is unchanged.
+- **BUG-1556 — a container stamp or a primitive keyword could not be a TYPE ARGUMENT.**
+  `alloc(Box(u32))`, `@size(Box(u32))`, `@offset(Box(u32), n)`, `ar.alloc(u32)`,
+  `ar.alloc_slice(u8, n)` were parse errors ("expected expression"). The parser now
+  accepts a lone primitive keyword as a call argument (`parser_next_closes_arg`); a stamp
+  parses as a CALL, and the checker rewrites it — only when the callee names a declared
+  container TEMPLATE, so `ops.alloc(wrap(x))` stays a call — into the ident of the stamped
+  struct (`stamp_type_arg_to_name`, registering the stamp in global scope). From there
+  every layer sees the ordinary named-type spelling; the tracker catches UAF / leak on a
+  stamped allocation. The Arena arms resolve the element through
+  `alloc_resolve_elem_type` (checker) / `emit_type_name_arg` (emitter, both dispatch
+  paths) — they looked the name up as a SYMBOL, which a primitive has none of.
+  Tests: `container_stamp_type_arg_bug1556`, `arena_primitive_type_arg_bug1556` +
+  `container_stamp_{uaf,leak}_bug1556` negatives.
+- **BUG-1557 — writing an element of an optional SLICE's capture was refused** ("cannot
+  assign to const variable 'q'" on `if (bs) |q| { q[2].a = 7; }`) — the capture binding is
+  const, its ELEMENTS are not. The assignment target walk now treats an index through a
+  slice or pointer as going through a pointer, exactly like a field through a pointer;
+  `const [*]T` element writes and `const T[N]` arrays stay refused. Tests:
+  `slice_capture_elem_write_bug1557` + `const_slice_capture_write_bug1557`.
+- **BUG-1558 — a funcptr FIELD named `alloc` / `free` / ... was hijacked by the
+  `Task.alloc()` auto-Slab sugar**: `ops.alloc(wrap(3))` was "Ops.alloc() takes no
+  arguments". One predicate `type_struct_has_field` at the four sugar sites (checker,
+  both emitter paths, the tracker's receiver classification): a field of that name wins.
+  Test: `struct_field_named_alloc_bug1558`.
+- **BUG-1559 — an async task frame holding its own task reached GCC** ("field 't' has
+  incomplete type") — `async void a() { _zer_async_a t; }`, an array of them, and the
+  two-function cycle (a holds b, b holds a). A task's state holds its locals by value, so
+  each is a type containing itself. Every non-static local of task type records an edge
+  (`record_async_frame_edge`, `FuncDecl.async_state` names the state type); the
+  whole-program pass `check_async_frame_cycles` refuses any edge on a cycle. Holding
+  ANOTHER task (acyclic) still compiles. Tests: `async_frame_holds_other_task_bug1559` +
+  three negatives.
+- **BUG-1560 — a user type named `slice_u8` collided with the runtime** — its optional
+  `_zer_opt_slice_u8` is the name `?[*]u8` used. The runtime's optional-slice typedefs are
+  `_zer_optslice_*` now; a user type can never spell `optslice` after `_zer_opt_`. Test:
+  `user_struct_named_like_runtime_bug1560`.
+- **BUG-1561 — a read-modify-write split across CALLS was accepted at every race sink.**
+  `u32 t = rd(); wr(t + 1);` (`rd` returns `g`, `wr` stores its parameter into `g`),
+  `wr(rd() + 1)`, `u32 t = rd(); g = t + 1;` and `u32 t = g; wr(t + 1);` — the split-
+  statement taint (BUG-1010) followed a global's value through locals only. A lazy
+  per-function VALUE-FLOW summary (`vf_summary`: the global a return may carry, and per
+  parameter the global it may be stored into; flow-insensitive, through locals) feeds the
+  read side (`rmw_value_source_global` / `rmw_value_taints_global` at a call) and a
+  write-through-call check at the spawn scan and the main/ISR call sink. Gate: four new
+  spellings x three sites in the RMW FORM grid (`tests/test_hw_matrix.c`) plus a
+  `calls-other-global` boundary; 11 of the 12 cells fail on the previous build.
+- **BUG-1562 — the atomic/barrier downgrade covered two WRITERS.** A spawn target with any
+  `@atomic_*` / `@barrier` has its race finding downgraded to a warning, so `g += 1;
+  @atomic_store(&flag, 1);` run by two threads compiled and lost updates. The downgraded
+  spawn sites are recorded (`record_sync_spawn`), each target's writes collected with the
+  lock word held around them (`sync_thread_writes`: a spin acquire on `@atomic_cas` /
+  `@atomic_xchg` and its `@atomic_store` / `@atomic_xchg` release, callees included), and
+  the whole-program pass refuses a global written by two thread instances (two sites, or
+  one spawned in a loop) unless both hold the SAME lock. The exemption set is the race
+  scan's own, extracted as `spawn_global_needs_sync`. Corpus cost 0. Tests: three
+  negatives + `sync_downgrade_same_lock_ok_bug1562`.
 - **BUG-1546 — `const volatile *u32` dropped `volatile`.** The const arm of `resolve_type`
   rebuilt the pointer from the inner type and copied only the target; a read-only register
   pointer (parameter or field) was emitted non-volatile, and passing `&vx` to such a

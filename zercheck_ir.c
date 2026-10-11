@@ -4418,8 +4418,9 @@ static bool ir_receiver_is_builtin_target(Checker *c, Node *callee) {
         case TYPE_SLAB:
         case TYPE_RING:
         case TYPE_ARENA:
-        case TYPE_STRUCT:   /* Task.alloc auto-slab sugar */
-            return true;
+        case TYPE_STRUCT:   /* Task.alloc auto-slab sugar — unless a FIELD of that name exists (BUG-1558) */
+            return !type_struct_has_field(eff, callee->field.field_name,
+                                          (uint32_t)callee->field.field_name_len);
         /* Stage 2 Part B (2026-04-28): exhaustive — every other TYPE_KIND
          * is rejected as a builtin method receiver. Adding a new TYPE_
          * forces a deliberate decision (does it have alloc/free methods?). */

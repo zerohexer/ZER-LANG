@@ -1,0 +1,4 @@
+// expect-error: task states cannot contain one another
+async void a() { _zer_async_b t; yield; }
+async void b() { _zer_async_a u; yield; }
+u32 main() { return 0; }

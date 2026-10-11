@@ -324,6 +324,16 @@ int type_access_alignment(Type *a) {
     return type_alignment_bytes(a);
 }
 
+bool type_struct_has_field(Type *t, const char *name, uint32_t len) {
+    t = type_unwrap_distinct(t);
+    if (!t || type_dispatch_kind(t) != TYPE_STRUCT) return false;
+    for (uint32_t i = 0; i < t->struct_type.field_count; i++) {
+        SField *f = &t->struct_type.fields[i];
+        if (f->name_len == len && memcmp(f->name, name, len) == 0) return true;
+    }
+    return false;
+}
+
 bool type_is_optional(Type *a) {
     /* BUG-409: unwrap distinct — distinct typedef ?*T is still optional */
     a = type_unwrap_distinct(a);

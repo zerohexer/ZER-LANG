@@ -433,6 +433,16 @@ static Symbol *emit_decl_lookup(Emitter *e, const char *name, uint32_t len) {
     return emit_decl_lookup_in(e, e->current_module, e->current_module_len, name, len);
 }
 
+/* BUG-1556: the element type an Arena `.alloc(T)` / `.alloc_slice(T, n)` names —
+ * a declared type by its symbol, a primitive keyword (`u32`, which has no
+ * symbol) by the type the checker recorded on the argument. NULL = unknown. */
+static Type *emit_type_name_arg(Emitter *e, Node *a) {
+    if (!a || a->kind != NODE_IDENT) return NULL;
+    Symbol *ts = emit_decl_lookup(e, a->ident.name, (uint32_t)a->ident.name_len);
+    if (ts && ts->type) return ts->type;
+    return checker_get_type(e->checker, a);
+}
+
 /* The C spelling of a top-level name resolved in module `mod`. `static_guess`:
  * when the name resolves to NOTHING inside a module, it is a module-private
  * name the checker registered only in the module scope — spell it with the
@@ -1431,7 +1441,7 @@ static void emit_slice_name(Emitter *e, Type *elem, bool is_volatile, bool is_op
         free(b.p);
         return;
     }
-    emit(e, "%s", is_opt ? "_zer_opt_slice_" : is_volatile ? "_zer_vslice_" : "_zer_slice_");
+    emit(e, "%s", is_opt ? "_zer_optslice_" : is_volatile ? "_zer_vslice_" : "_zer_slice_");
     if (type_dispatch_kind(elem) == TYPE_STRUCT) { EMIT_STRUCT_NAME(e, elem); return; }
     if (type_dispatch_kind(elem) == TYPE_UNION)  { EMIT_UNION_NAME(e, elem); return; }
     xslice_suffix_append(&b, elem);   /* primitive / uN / enum / Handle carrier */
@@ -2638,7 +2648,7 @@ static void emit_type(Emitter *e, Type *t) {
             EMIT_UNION_NAME(e, opt_inner);
             break;
         case TYPE_SLICE:
-            /* ?[*]T → _zer_opt_slice_T / _zer_xopt_slice_<mangled> (BUG-1027: one query) */
+            /* ?[*]T → _zer_optslice_T / _zer_xopt_slice_<mangled> (BUG-1027: one query) */
             emit_slice_name(e, opt_inner->slice.inner, false, true);
             break;
         /* Stage 2 Part B (2026-04-28): exhaustive — fallback to
@@ -4112,19 +4122,15 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                          * Returns ?*T — null sentinel (NULL = none) */
                         if (node->call.arg_count >= 1 &&
                             node->call.args[0]->kind == NODE_IDENT) {
-                            const char *tname = node->call.args[0]->ident.name;
-                            int tlen = (int)node->call.args[0]->ident.name_len;
-                            /* Look up type to emit correct C name */
-                            Symbol *tsym = emit_decl_lookup(e, /* BUG-1450 */
-                                tname, (uint32_t)tlen);
-                            if (tsym && tsym->type) {
+                            Type *tty = emit_type_name_arg(e, node->call.args[0]);   /* BUG-1556 */
+                            if (tty) {
                                 emit(e, "((");
-                                emit_type(e, tsym->type);
-                                emit(e, "*)_zer_arena_alloc(&%.*s, sizeof(",
+                                emit_type(e, type_pointer(e->arena, tty));
+                                emit(e, ")_zer_arena_alloc(&%.*s, sizeof(",
                                      alen, aname);
-                                emit_type(e, tsym->type);
+                                emit_type(e, tty);
                                 emit(e, "), _Alignof(");
-                                emit_type(e, tsym->type);
+                                emit_type(e, tty);
                                 emit(e, ")))");
                             }
                         }
@@ -4134,29 +4140,26 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                          * Optional slice: { .value = { .ptr, .len }, .has_value } */
                         if (node->call.arg_count >= 2 &&
                             node->call.args[0]->kind == NODE_IDENT) {
-                            const char *tname = node->call.args[0]->ident.name;
-                            int tlen = (int)node->call.args[0]->ident.name_len;
-                            Symbol *tsym = emit_decl_lookup(e, /* BUG-1450 */
-                                tname, (uint32_t)tlen);
-                            if (tsym && tsym->type) {
+                            Type *tty = emit_type_name_arg(e, node->call.args[0]);   /* BUG-1556 */
+                            if (tty) {
                                 int tmp = e->temp_count++;
-                                Type *slice_type = type_slice(e->arena, tsym->type);
+                                Type *slice_type = type_slice(e->arena, tty);
                                 Type *opt_type = type_optional(e->arena, slice_type);
                                 emit(e, "({ size_t _zer_asn%d = (size_t)", tmp);
                                 emit_expr(e, node->call.args[1]);
                                 /* BUG-266: overflow-safe multiplication for alloc size */
                                 emit(e, "; size_t _zer_asz%d; void *_zer_asp%d = "
                                      "__builtin_mul_overflow(sizeof(", tmp, tmp);
-                                emit_type(e, tsym->type);
+                                emit_type(e, tty);
                                 emit(e, "), _zer_asn%d, &_zer_asz%d) ? (void*)0 : "
                                      "_zer_arena_alloc(&%.*s, _zer_asz%d, _Alignof(",
                                      tmp, tmp, alen, aname, tmp);
-                                emit_type(e, tsym->type);
+                                emit_type(e, tty);
                                 emit(e, ")); ");
                                 emit_type(e, opt_type);
                                 emit(e, " _zer_asr%d = {0}; ", tmp);
                                 emit(e, "if (_zer_asp%d) { _zer_asr%d.value.ptr = (", tmp, tmp);
-                                emit_type(e, tsym->type);
+                                emit_type(e, tty);
                                 emit(e, "*)_zer_asp%d; _zer_asr%d.value.len = _zer_asn%d; "
                                      "_zer_asr%d.has_value = 1; } ",
                                      tmp, tmp, tmp, tmp);
@@ -4179,7 +4182,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
             Node *obj_n = node->call.callee->field.object;
             Type *ot = checker_get_type(e->checker, obj_n);
             if (ot) ot = type_unwrap_distinct(ot);
-            if (ot && ot->kind == TYPE_STRUCT) {
+            if (ot && type_dispatch_kind(ot) == TYPE_STRUCT &&
+                !type_struct_has_field(ot, node->call.callee->field.field_name,
+                    (uint32_t)node->call.callee->field.field_name_len)) {   /* BUG-1558 */
                 const char *mn = node->call.callee->field.field_name;
                 uint32_t ml = (uint32_t)node->call.callee->field.field_name_len;
                 /* BUG-1453: auto-slab name through emit_auto_slab_name */
@@ -6068,7 +6073,7 @@ static void emit_struct_slice_forward(Emitter *e, Type *st) {
     emit(e, "typedef struct { volatile struct "); SF_NAME();
     emit(e, "* ptr; size_t len; } _zer_vslice_"); SF_NAME(); emit(e, ";\n");
     emit(e, "typedef struct { _zer_slice_"); SF_NAME();
-    emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); SF_NAME(); emit(e, ";\n");
+    emit(e, " value; uint8_t has_value; } _zer_optslice_"); SF_NAME(); emit(e, ";\n");
     #undef SF_NAME
 }
 
@@ -7601,7 +7606,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
         emit(e, "* ptr; size_t len; } _zer_vslice_"); EMIT_UNAME();
         emit(e, ";\n");
         emit(e, "typedef struct { _zer_slice_"); EMIT_UNAME();
-        emit(e, " value; uint8_t has_value; } _zer_opt_slice_"); EMIT_UNAME();
+        emit(e, " value; uint8_t has_value; } _zer_optslice_"); EMIT_UNAME();
         emit(e, ";\n\n");
         record_user_type_emitted(e, ut);   /* BUG-1027: exotic-slice dependency set */
         break;
@@ -7900,15 +7905,15 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { volatile double* ptr; size_t len; } _zer_vslice_f64;\n");
     emit(e, "\n");
     /* ZER optional-slice types — ?[]T for all primitives */
-    emit(e, "typedef struct { _zer_slice_u8 value; uint8_t has_value; } _zer_opt_slice_u8;\n");
-    emit(e, "typedef struct { _zer_slice_u16 value; uint8_t has_value; } _zer_opt_slice_u16;\n");
-    emit(e, "typedef struct { _zer_slice_u32 value; uint8_t has_value; } _zer_opt_slice_u32;\n");
-    emit(e, "typedef struct { _zer_slice_u64 value; uint8_t has_value; } _zer_opt_slice_u64;\n");
-    emit(e, "typedef struct { _zer_slice_i8 value; uint8_t has_value; } _zer_opt_slice_i8;\n");
-    emit(e, "typedef struct { _zer_slice_i16 value; uint8_t has_value; } _zer_opt_slice_i16;\n");
-    emit(e, "typedef struct { _zer_slice_i32 value; uint8_t has_value; } _zer_opt_slice_i32;\n");
-    emit(e, "typedef struct { _zer_slice_i64 value; uint8_t has_value; } _zer_opt_slice_i64;\n");
-    emit(e, "typedef struct { _zer_slice_usize value; uint8_t has_value; } _zer_opt_slice_usize;\n");
+    emit(e, "typedef struct { _zer_slice_u8 value; uint8_t has_value; } _zer_optslice_u8;\n");
+    emit(e, "typedef struct { _zer_slice_u16 value; uint8_t has_value; } _zer_optslice_u16;\n");
+    emit(e, "typedef struct { _zer_slice_u32 value; uint8_t has_value; } _zer_optslice_u32;\n");
+    emit(e, "typedef struct { _zer_slice_u64 value; uint8_t has_value; } _zer_optslice_u64;\n");
+    emit(e, "typedef struct { _zer_slice_i8 value; uint8_t has_value; } _zer_optslice_i8;\n");
+    emit(e, "typedef struct { _zer_slice_i16 value; uint8_t has_value; } _zer_optslice_i16;\n");
+    emit(e, "typedef struct { _zer_slice_i32 value; uint8_t has_value; } _zer_optslice_i32;\n");
+    emit(e, "typedef struct { _zer_slice_i64 value; uint8_t has_value; } _zer_optslice_i64;\n");
+    emit(e, "typedef struct { _zer_slice_usize value; uint8_t has_value; } _zer_optslice_usize;\n");
 
     /* G1 (2026-08-01): 128-bit carriers, for uN/iN with 64 < N <= 128. Needed by
      * intn_carrier_suffix's "i128"/"u128" arm.
@@ -7925,11 +7930,11 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "typedef struct { __int128* ptr; size_t len; } _zer_slice_i128;\n");
     emit(e, "typedef struct { volatile unsigned __int128* ptr; size_t len; } _zer_vslice_u128;\n");
     emit(e, "typedef struct { volatile __int128* ptr; size_t len; } _zer_vslice_i128;\n");
-    emit(e, "typedef struct { _zer_slice_u128 value; uint8_t has_value; } _zer_opt_slice_u128;\n");
-    emit(e, "typedef struct { _zer_slice_i128 value; uint8_t has_value; } _zer_opt_slice_i128;\n");
+    emit(e, "typedef struct { _zer_slice_u128 value; uint8_t has_value; } _zer_optslice_u128;\n");
+    emit(e, "typedef struct { _zer_slice_i128 value; uint8_t has_value; } _zer_optslice_i128;\n");
     emit(e, "#endif\n");
-    emit(e, "typedef struct { _zer_slice_f32 value; uint8_t has_value; } _zer_opt_slice_f32;\n");
-    emit(e, "typedef struct { _zer_slice_f64 value; uint8_t has_value; } _zer_opt_slice_f64;\n");
+    emit(e, "typedef struct { _zer_slice_f32 value; uint8_t has_value; } _zer_optslice_f32;\n");
+    emit(e, "typedef struct { _zer_slice_f64 value; uint8_t has_value; } _zer_optslice_f64;\n");
     emit(e, "\n");
 
     /* ZER runtime: Pool helper macros */
@@ -9030,19 +9035,19 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             return true;
         }
         if (ml==5 && !memcmp(mn,"alloc",5) && node->call.arg_count>0 && node->call.args[0]->kind==NODE_IDENT) {
-            Symbol *ts=emit_decl_lookup(e,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
+            Type *tst = emit_type_name_arg(e, node->call.args[0]);   /* BUG-1556 */
             /* BUG-1040: emit_type spells a struct WITH its module prefix (`struct
              * arena_lib__Node`); the hand-rolled `struct Node` here was an
              * incomplete type inside an imported module (same defect BUG-1029
              * fixed for alloc(T, n)). */
-            if (ts&&ts->type) { emit(e,"(("); emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
-                emit_type(e,ts->type);
-                emit(e,"),_Alignof("); emit_type(e,ts->type); emit(e,")))"); return true; }
+            if (tst) { emit(e,"(("); emit_type(e,type_pointer(e->arena,tst)); emit(e,")_zer_arena_alloc(&%.*s,sizeof(",(int)ol,on);
+                emit_type(e,tst);
+                emit(e,"),_Alignof("); emit_type(e,tst); emit(e,")))"); return true; }
         }
         if (ml==11 && !memcmp(mn,"alloc_slice",11) && node->call.arg_count>1 && node->call.args[0]->kind==NODE_IDENT) {
             /* arena.alloc_slice(T, n) → allocate n*sizeof(T), return ?[]T */
-            Symbol *ts=emit_decl_lookup(e,node->call.args[0]->ident.name,(uint32_t)node->call.args[0]->ident.name_len);
-            if (ts&&ts->type) { int t=e->temp_count++;
+            Type *tst = emit_type_name_arg(e, node->call.args[0]);   /* BUG-1556 */
+            if (tst) { int t=e->temp_count++;
                 /* BUG-845: the byte count is `sizeof(T) * n` and it MUST be
                  * computed with an overflow check. The AST path has done this
                  * since BUG-266; this IR path — the only one that runs for a
@@ -9068,22 +9073,22 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
                  * a wrapper whose absence produces a WRONG LENGTH defeats every
                  * downstream guard rather than merely removing one. */
                 emit(e,"size_t _zer_asz%d; uint8_t *_zer_ap%d=__builtin_mul_overflow(sizeof(",t,t);
-                emit_type(e,ts->type);   /* BUG-1040: module-prefixed spelling */
+                emit_type(e,tst);   /* BUG-1040: module-prefixed spelling */
                 emit(e,"),_zer_an%d,&_zer_asz%d)?(uint8_t*)0:(uint8_t*)_zer_arena_alloc(&%.*s,_zer_asz%d,",t,t,(int)ol,on,t);
                 /* _Alignof(T) */
-                emit(e,"_Alignof("); emit_type(e,ts->type); emit(e,"));");
+                emit(e,"_Alignof("); emit_type(e,tst); emit(e,"));");
                 /* wrap in ?[]T */
                 emit(e,"_zer_ap%d?(",t);
-                Type *slice_t=type_slice(e->arena,ts->type); Type *opt_t=type_optional(e->arena,slice_t);
+                Type *slice_t=type_slice(e->arena,tst); Type *opt_t=type_optional(e->arena,slice_t);
                 emit_type(e,opt_t); emit(e,"){("); emit_type(e,slice_t); emit(e,"){(");
-                emit_type(e,type_pointer(e->arena,ts->type)); emit(e,")_zer_ap%d,_zer_an%d},1}:(",t,t);
+                emit_type(e,type_pointer(e->arena,tst)); emit(e,")_zer_ap%d,_zer_an%d},1}:(",t,t);
                 emit_type(e,opt_t); emit(e,"){0};})");
                 return true;
             }
         }
     }
-    /* Task.alloc/free (auto-slab) */
-    if (te->kind == TYPE_STRUCT) {
+    /* Task.alloc/free (auto-slab) — a FIELD of that name is a plain call (BUG-1558) */
+    if (type_dispatch_kind(te) == TYPE_STRUCT && !type_struct_has_field(te, mn, ml)) {
         /* BUG-1453: the slab AND the struct tag spelled with the module prefix
          * (emit_auto_slab_name / emit_type) — `(struct Ta*)` and
          * `_zer_auto_slab_Ta` named nothing inside a module. */

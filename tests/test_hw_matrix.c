@@ -339,6 +339,8 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
                RFORM_CARRIER_TWO_LIT, RFORM_CARRIER_TWO_ASSIGN,
                RFORM_GLOBAL_CARRIER_LIT,
+               RFORM_SPLIT_CALLS, RFORM_SPLIT_CALLS_INLINE,
+               RFORM_SPLIT_READ_CALL, RFORM_SPLIT_WRITE_CALL,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -398,6 +400,10 @@ static const char *rform_name(RForm f) {
     case RFORM_CARRIER_TWO_LIT:     return "carrier {.p=&d,.q=&g}";
     case RFORM_CARRIER_TWO_ASSIGN:  return "carrier h.p=&d;h.q=&g";
     case RFORM_GLOBAL_CARRIER_LIT:  return "global carrier {.p=&g}";
+    case RFORM_SPLIT_CALLS:         return "calls t=rd();wr(t+1)";
+    case RFORM_SPLIT_CALLS_INLINE:  return "calls wr(rd()+1)";
+    case RFORM_SPLIT_READ_CALL:     return "calls t=rd();g=t+1";
+    case RFORM_SPLIT_WRITE_CALL:    return "calls t=g;wr(t+1)";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -504,6 +510,17 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     /* BUG-1201: a GLOBAL carrier whose pointer comes from its struct-literal
      * initializer. The write-target walk followed `&x`, a pointer name, a slice and
      * `orelse` as an assigned value, never a struct literal. */
+    /* BUG-1561: the split RMW with a CALL on either half — the read returned
+     * by `rd`, the write done by `wr` storing its parameter. Accepted at every
+     * site before: the taint followed a global's value through locals only. */
+    case RFORM_SPLIT_CALLS:        *helper = "u32 rd(){ return g; }\nvoid wr(u32 v){ g = v; }";
+                                                                                 *body = "u32 t = rd(); wr(t + 1);"; break;
+    case RFORM_SPLIT_CALLS_INLINE: *helper = "u32 rd(){ return g; }\nvoid wr(u32 v){ g = v; }";
+                                                                                 *body = "wr(rd() + 1);"; break;
+    case RFORM_SPLIT_READ_CALL:    *helper = "u32 rd(){ u32 x = g; return x; }";
+                                                                                 *body = "u32 t = rd(); g = t + 1;"; break;
+    case RFORM_SPLIT_WRITE_CALL:   *helper = "void wr(u32 v){ u32 w = v; g = w; }";
+                                                                                 *body = "u32 t = g; wr(t + 1);"; break;
     case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
                                                                                  *body = "*gh.p += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
@@ -888,9 +905,9 @@ int main(void) {
      * writes g", which rejects a great deal of correct firmware. */
     fprintf(stderr, "\n--- RMW split-taint boundary (must COMPILE) ---\n");
     {
-        static const char *bnames[4] = { "taint-cleared", "other-global", "not-shared",
-                                         "retarget-plain-store" };
-        static const char *bbodies[4] = {
+        static const char *bnames[5] = { "taint-cleared", "other-global", "not-shared",
+                                         "retarget-plain-store", "calls-other-global" };
+        static const char *bbodies[5] = {
             "volatile u32 g;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = g; t = 5; g = t; return g & 1; }\n",
             "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
@@ -901,9 +918,14 @@ int main(void) {
              * first draft of the fix rejected exactly this. */
             "volatile u32 g;\nvolatile u32 h;\nvolatile *u32 gp = &g;\n"
             "interrupt TIMER { *gp = 5; }\nvoid aim(){ gp = &h; }\n"
-            "u32 main(){ aim(); u32 t = h; return t & 1; }\n"
+            "u32 main(){ aim(); u32 t = h; return t & 1; }\n",
+            /* BUG-1561 boundary: the call summary must name the RIGHT global —
+             * `rd` reads h, `wr` stores g, so nothing is read-modify-written. */
+            "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
+            "u32 rd(){ return h; }\nvoid wr(u32 v){ g = v; }\n"
+            "u32 main(){ u32 t = rd(); wr(t + 1); return g & 1; }\n"
         };
-        for (int bi = 0; bi < 4; bi++) {
+        for (int bi = 0; bi < 5; bi++) {
             valid_cells++;
             char bnm[192];
             snprintf(bnm, sizeof(bnm), "rmw-boundary/%s", bnames[bi]);

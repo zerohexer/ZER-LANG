@@ -2888,21 +2888,22 @@ from a DIFFERENT arena is a compile error, because their lifetimes are not tied
 together (a local arena's buffer dies with the frame). Storing one into a
 global/static remains a compile error.
 
-**ERRORS**
+**PRIMITIVE AND STAMPED ELEMENT TYPES.** `T` may be a primitive keyword or a
+container stamp, as well as a struct/enum name (BUG-1556 — both used to be parse
+errors):
 ```zer
-ar.alloc(u32)          // PARSE ERROR — T must be struct/enum name, not primitive
-ar.alloc_slice(u8, n)  // PARSE ERROR — same restriction
-```
-
-Workaround for primitives:
-```zer
-struct Byte { u8 val; }
+container Box(T) { T v; u32 n; }
 u8[256] backing;
 
 u32 main() {
     Arena ar = Arena.over(backing);
-    [*]Byte bytes = ar.alloc_slice(Byte, 64) orelse { return 1; };
-    bytes[0].val = 7;
+    [*]u8 bytes = ar.alloc_slice(u8, 64) orelse { return 1; };
+    bytes[0] = 7;
+    *u32 one = ar.alloc(u32) orelse { return 2; };
+    *one = 5;
+    *Box(u32) b = ar.alloc(Box(u32)) orelse { return 3; };
+    b.v = bytes[0] + *one;
+    if (b.v != 12) { return 4; }
     return 0;
 }
 ```
@@ -3368,7 +3369,9 @@ usize s = @size(Task);     // e.g., 12
 ```
 
 **NOTES**
-- The operand may be a type name, a `uN`/`iN` spelling, or a VARIABLE — for a
+- The operand may be a type name, a container stamp (`@size(Box(u32))`, also
+  `@offset(Box(u32), n)` and `alloc(Box(u32))` — BUG-1556), a `uN`/`iN`
+  spelling, or a VARIABLE — for a
   variable it is the size of the variable's type (BUG-1038: `@size(x)` used to
   be spelled `sizeof(struct x)` and `@size(u21)` was an undefined identifier).
   A `uN` reports its CARRIER: `@size(u21)` is 4, `@size(u3)` is 1.
@@ -6592,7 +6595,16 @@ u32 main() {
   `threadlocal`, or synchronizes with `@atomic_*` compiles as usual
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
-  - Has atomic/barrier → compile **warning** (lock-free pattern possible)
+  - Has atomic/barrier → compile **warning** (lock-free pattern possible) —
+    EXCEPT when two threads both WRITE the same plain global without holding
+    the same lock: that is an **error** (BUG-1562). A protocol can order one
+    writer against its readers; it never orders two writers. Two spawns of a
+    target, a spawn inside a loop, or two different targets each count. A write
+    is held by a lock when it sits between a spin acquire of a lock word and its
+    release in one statement list (callees included) — example below
+  - A read-modify-write may be split across CALLS — `u32 t = rd(); wr(t + 1);`
+    with `rd` returning `g` and `wr` storing its parameter into `g` — and is the
+    same non-atomic RMW as `g += 1` at every sink (BUG-1561)
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
   **single-word** `volatile` global. Two of these cover the VALUE, never what it
@@ -6630,6 +6642,19 @@ u32 main() {
   writing `g2.v = g1.v + 1;` cannot deadlock with it
 - A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
   lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
+
+Two writers under ONE lock — a warning, not an error (BUG-1562):
+```zer
+u32 lock;
+u32 counter;
+void inc() { while (!@atomic_cas(&lock, 0, 1)) { } counter += 1; @atomic_store(&lock, 0); }
+u32 main() {
+    ThreadHandle a = spawn inc();     // warning (verify ordering) — not an error
+    ThreadHandle b = spawn inc();
+    a.join(); b.join();
+    return counter - 2;
+}
+```
 
 ### Condvar — Thread Synchronization
 ```zer
@@ -7007,7 +7032,10 @@ polls, so the compiler treats it like any other object that keeps a pointer:
   the type). Not a struct or union field, a slice element, or a heap allocation
   (`alloc(_zer_async_NAME, n)`) — hold a `*_zer_async_NAME` instead. A task is
   never copied (`b = a`, `b = *pa`), because its promoted locals may point into
-  itself.
+  itself. An async function may hold ANOTHER task in a local, but not its own
+  task type (`_zer_async_a t;` inside `a`), and two tasks may not hold each
+  other — a task's state holds its locals, so either would contain itself
+  (BUG-1559).
 
 ```zer
 async void tick_task(*u32 n) { *n += 1; yield; *n += 1; }

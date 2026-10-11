@@ -418,6 +418,25 @@ static TypeNode *parse_func_ptr_2c(Parser *p) {
  * ZER types: u32, *Task, ?*Task, []u8, u8[256], Pool(T, N), etc.
  * ================================================================ */
 
+/* BUG-1556: is the token AFTER the current one a `,` or `)` — i.e. does the
+ * current token stand alone as an argument? Speculative: the scanner and the
+ * token pair are restored. */
+static bool parser_next_closes_arg(Parser *p) {
+    Scanner saved = *p->scanner;
+    Token saved_cur = p->current;
+    Token saved_prev = p->previous;
+    bool saved_panic = p->panic_mode;
+    bool saved_err = p->had_error;
+    advance(p);
+    bool r = p->current.type == TOK_COMMA || p->current.type == TOK_RPAREN;
+    *p->scanner = saved;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    p->panic_mode = saved_panic;
+    p->had_error = saved_err;
+    return r;
+}
+
 static bool is_type_token(TokenType type) {
     switch (type) {
     case TOK_U8: case TOK_U16: case TOK_U32: case TOK_U64:
@@ -1312,11 +1331,19 @@ static Node *parse_postfix(Parser *p, Node *left) {
                     /* alloc(PRIM, n): the first arg may be a primitive type
                      * keyword (u8/u32/.../bool). Synthesize an ident carrying its
                      * spelling so alloc works over ALL element types, not just
-                     * struct names. See docs/universal_alloc.md. */
-                    if (arg_count == 0 && left->kind == NODE_IDENT &&
+                     * struct names. See docs/universal_alloc.md.
+                     * BUG-1556: ANY call argument that is a lone primitive keyword
+                     * (followed by `,` or `)`) is such a type name — it can never
+                     * be a value there. That is what lets a container STAMP parse
+                     * in a type-argument position: `alloc(Box(u32))` is the call
+                     * `Box(u32)` the checker turns into the stamped type
+                     * (stamp_type_arg). */
+                    bool lone_prim = p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL &&
+                        parser_next_closes_arg(p);
+                    if (lone_prim || (arg_count == 0 && left->kind == NODE_IDENT &&
                         left->ident.name_len == 5 &&
                         memcmp(left->ident.name, "alloc", 5) == 0 &&
-                        p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL) {
+                        p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL)) {
                         Node *tn = new_node(p, NODE_IDENT);
                         tn->ident.name = p->current.start;
                         tn->ident.name_len = p->current.length;

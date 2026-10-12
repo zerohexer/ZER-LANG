@@ -1,0 +1,5 @@
+// expect-error: duplicate switch arm value 1
+// BUG-1592: a duplicate constant arm was accepted silently (dead arm).
+u32 main() { u32 x = 1; u32 r = 0;
+ switch (x) { 1 => { r = 1; } 1 => { r = 2; } default => { r = 3; } }
+ return r - 1; }

@@ -403,6 +403,7 @@ struct Symbol {
         bool in_progress;    /* true = DFS in progress (cycle detection) */
         bool can_yield;      /* body contains yield/await (directly or transitively) */
         bool can_spawn;      /* body contains spawn (directly or transitively) */
+        bool can_detach;     /* BUG-1589: a FIRE-AND-FORGET spawn (no ThreadHandle), directly or transitively — a thread still running when the call returns */
         bool can_alloc;      /* body contains slab.alloc/Task.new (directly or transitively) */
         bool has_sync;       /* body contains @atomic_* or @barrier (absorbs has_atomic_or_barrier) */
         bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */

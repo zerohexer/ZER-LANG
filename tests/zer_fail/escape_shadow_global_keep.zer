@@ -1,0 +1,7 @@
+// expect-error: local variable 'x' cannot satisfy 'keep' parameter
+// BUG-1568: a local / param sharing a GLOBAL name was program storage to the escape sinks.
+u32 x = 1;
+?*u32 gp = null;
+void st(*u32 p) { gp = p; }
+void f() { u32 x = 7; st(&x); }
+u32 main() { f(); return 0; }

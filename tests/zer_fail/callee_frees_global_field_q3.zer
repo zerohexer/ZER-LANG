@@ -1,0 +1,20 @@
+// expect-error: carries a freed pointer at 'gs.p'
+// BUG-1571: a callee freeing a FIELD of a GLOBAL aggregate argument was unseen (rl >= 0 dropped the global root).
+struct T { u32 v; }
+struct H { ?*T p; }
+H gs;
+void rel(H h) { if (h.p) |q| { free(q); } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    gs.p = a;
+    rel(gs);
+    *T b = alloc(T) orelse return;
+    defer free(b);
+    rel(gs);
+    gs.p = null;
+    *T c = alloc(T) orelse return;
+    defer free(c);
+    b.v = 1;
+    c.v = 2;
+    return b.v;
+}

@@ -3,6 +3,9 @@
 // Uses libc putchar/fputc — available on any hosted platform.
 // Embedded targets: replace these declarations with UART-backed versions.
 
+// fmt_u64 / fmt_i64 / fmt_hex live in str.zer — imported, not assumed concatenated.
+import str;
+
 // C function declarations (provided by libc, linked by GCC)
 cinclude "stdio.h";
 cinclude "zer_helpers.h";
@@ -16,21 +19,21 @@ i32 fputc(i32 c, *opaque stream);
 // ================================================================
 
 // Print a byte slice to stdout (no newline)
-void print(const []u8 s) {
+void print(const [*]u8 s) {
     for (usize i = 0; i < s.len; i += 1) {
-        putchar(@truncate(i32, s[i]));
+        putchar((i32)s[i]);
     }
 }
 
 // Print a byte slice to stdout with newline
-void println(const []u8 s) {
+void println(const [*]u8 s) {
     print(s);
     putchar(10);
 }
 
 // Print a single character
 void print_char(u8 c) {
-    putchar(@truncate(i32, c));
+    putchar((i32)c);
 }
 
 // Print a newline
@@ -51,7 +54,7 @@ void print_u64(u64 val) {
 
 // Print unsigned 32-bit integer as decimal
 void print_u32(u32 val) {
-    print_u64(@truncate(u64, val));
+    print_u64((u64)val);
 }
 
 // Print signed 64-bit integer as decimal
@@ -63,7 +66,7 @@ void print_i64(i64 val) {
 
 // Print signed 32-bit integer as decimal
 void print_i32(i32 val) {
-    print_i64(@truncate(i64, val));
+    print_i64((i64)val);
 }
 
 // Print unsigned integer as hexadecimal (no 0x prefix)
@@ -90,7 +93,7 @@ void print_bool(bool val) {
 
 // Print usize as decimal
 void print_usize(usize val) {
-    print_u64(@truncate(u64, val));
+    print_u64((u64)val);
 }
 
 // ================================================================
@@ -98,18 +101,19 @@ void print_usize(usize val) {
 // ================================================================
 
 // Print to stderr (for error messages)
-void eprint(const []u8 s) {
-    *opaque err = zer_get_stderr();
+void eprint(const [*]u8 s) {
+    // The stream is borrowed from C, never ours to close: pass it straight to fputc
+    // rather than binding it to a local, which the tracker would treat as an owned
+    // allocation (a C function returning *opaque is presumed to hand over ownership).
     for (usize i = 0; i < s.len; i += 1) {
-        fputc(@truncate(i32, s[i]), err);
+        fputc((i32)s[i], zer_get_stderr());
     }
 }
 
 // Print to stderr with newline
-void eprintln(const []u8 s) {
+void eprintln(const [*]u8 s) {
     eprint(s);
-    *opaque err = zer_get_stderr();
-    fputc(10, err);
+    fputc(10, zer_get_stderr());
 }
 
 // ================================================================
@@ -117,14 +121,14 @@ void eprintln(const []u8 s) {
 // ================================================================
 
 // Print "key: value\n" pattern (common for debugging)
-void print_kv(const []u8 key, const []u8 value) {
+void print_kv(const [*]u8 key, const [*]u8 value) {
     print(key);
     print(": ");
     println(value);
 }
 
 // Print "key: N\n" pattern with integer value
-void print_kv_u32(const []u8 key, u32 value) {
+void print_kv_u32(const [*]u8 key, u32 value) {
     print(key);
     print(": ");
     print_u32(value);
@@ -132,7 +136,7 @@ void print_kv_u32(const []u8 key, u32 value) {
 }
 
 // Print "label [N/M]\n" progress pattern
-void print_progress(const []u8 label, u32 current, u32 total) {
+void print_progress(const [*]u8 label, u32 current, u32 total) {
     print(label);
     print(" [");
     print_u32(current);

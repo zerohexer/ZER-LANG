@@ -1,0 +1,7 @@
+// expect-error: local variable 'x' cannot satisfy 'keep' parameter
+// BUG-1568: a local / param sharing a GLOBAL name was program storage to the escape sinks.
+u32 x = 1;
+async void rd(*u32 p) { yield; *p += 1; }
+_zer_async_rd gt;
+void start() { u32 x = 7; _zer_async_rd_init(&gt, &x); }
+u32 main() { start(); _zer_async_rd_poll(&gt); _zer_async_rd_poll(&gt); return 0; }

@@ -1,0 +1,8 @@
+// expect-error: would keep pointing at 'r' after 'r' dies
+// BUG-1569: a static shadow of the root name made the carrier look like static storage.
+u32 main() {
+    u32 g = 1; *u32 q = &g;
+    { u32 x = 7; *u32 r = &x; { static u32 x = 0; q = r; } }
+    { u32 x = 99; x += 1; }
+    return *q;
+}

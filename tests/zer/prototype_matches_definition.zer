@@ -1,0 +1,6 @@
+// BUG-1584 boundary: matching prototypes.
+u32 tw(u32 x);
+?*u32 gp(*u32 p);
+u32 main() { u32 v = 3; ?*u32 q = gp(&v); return tw(3); }
+u32 tw(u32 x) { return x - 3; }
+?*u32 gp(*u32 p) { return p; }

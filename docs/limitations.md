@@ -30,6 +30,31 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
+## OPEN — residuals of the 2026-10-12 audit (BUG-1566..1596; measured)
+
+1. **The `*opaque` C bridge (BUG-1594).** A C extern with an `*opaque` / `?*opaque` in its
+   signature is called through a static inline wrapper selected by a function-like macro.
+   Not bridged: a VARIADIC extern with an `*opaque` fixed parameter (the 16-byte struct is
+   still what C receives — refuse or bridge it), and TAKING THE ADDRESS of a bridged
+   function (`fp = sensor_read`) names the C function, whose `void *` signature differs from
+   the ZER function-pointer type — GCC refuses it (loud). With any `cinclude` in the
+   program the bridge emits no prototype of its own (the header is the authority); a
+   bridged function the header does not declare is then GCC's "implicit declaration"
+   (loud). The non-bridged externs still rely on the hard-coded stdlib skip list in
+   `emit_top_level_decl` to avoid `uint8_t *` vs `char *` prototype conflicts with headers.
+2. **The volatile-flag RMW rule (BUG-1591) records every volatile global a thread TOUCHES**
+   under the single-word exemption, reads included: a thread that only READS the flag still
+   refuses the spawner's `vg |= 2` in the window (over-rejection; the lost-update needs a
+   thread store).
+3. **Condition facts (BUG-1566) are taken from EFFECT-FREE conditions only**, and only from
+   `ident|field OP constant`. `i < n` with a variable `n` contributes nothing on its own (its
+   range is not consulted in a conjunct); `if (n < 8 && i < n)` proves nothing about `i`.
+4. **Range-for over an element** (`for (x in hs[k].s)`) is refused (BUG-1581) — assign the
+   collection to a local. A relaxation would need a snapshot of the collection itself.
+5. **`can_detach` (BUG-1589) follows direct calls, module-qualified calls and function
+   names passed as arguments**; an indirect call through a funcptr reaches its candidate
+   set through `func_props_merge_reached` only where the existing FuncProps machinery does.
+
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
 1. **What the atomic/barrier downgrade check (BUG-1562/1563/1565) still trusts.** The
@@ -58,8 +83,8 @@ repeated.
    The variable-index global free (BUG-1530) widens a caller's `gs[0]` even when the
    callee's index provably differs.
 6. **Leak false negatives:** after filling an array at a variable index, ONE free at a
-   literal index silences every leak; an allocation consumed inline (`(alloc(T) orelse
-   return).v = 3;`) is never registered.
+   literal index silences every leak. (An allocation consumed inline, `(alloc(T) orelse
+   return).v = 3;`, is refused since BUG-1597.)
 7. **Block lifetimes (BUG-1554) are compared at ASSIGNMENTS only.** The other two ways a
    pointer to a local leaves its block — a callee storing it (`set(&outer, &x)`) and a
    store through a pointer (`*pp = &x`) — are refused by the stricter FRAME rules
@@ -258,7 +283,7 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
    `<avr/io.h>` (loud).
 4. **Over-rejections seen (loud):** ~~a `const` global read from an ISR and from main is refused
    "must be declared volatile"~~ (CLOSED 2026-09-27, BUG-1369); a function
-   returning an `@inttoptr` pointer is reported as a leak; `volatile f32` is "not single-word"
+   ~~returning an `@inttoptr` pointer is reported as a leak~~ (CLOSED 2026-10-12, BUG-1599); `volatile f32` is "not single-word"
    on a 32-bit target.
 5. **reference.md "use a packed struct for named bit-fields" is misleading**: `packed struct
    CR { u3 mode; u5 prio; }` lays the fields out in byte CARRIERS (u3 -> u8), not as bits —
@@ -317,16 +342,12 @@ measured at zero corpus cost; its precision residue, each an over-rejection:
 
 ## OPEN — residuals of the 2026-09-25f audit (BUG-1308..1325; measured)
 
-1. **`lib/` does not compile as shipped** (LOW — loud). `fmt.zer` calls `fmt_u64`/`fmt_i64`
-   that it never declares (it assumes concatenation with `str.zer`), `io.zer` calls `fputc`
-   it does not declare, and `io_open` is refused — `return fopen(&path_buf[0], …)`: a bodyless
-   extern handed a LOCAL buffer may return a pointer into it, so the result is frame-bound.
-   That rejection is the C-FFI floor working as designed (a C function CAN return its
-   argument); the library, not the checker, needs restructuring (a static path buffer, or
-   an `io_open` that takes a caller buffer). `compat.zer` is C-conversion scaffolding and is
-   not meant to compile without `--no-strict-mmio`. Only `str.zer` compiles (fixed by
-   BUG-1317). Imports resolve from the entry file's directory only, so `lib/` must be copied
-   beside the program. reference.md deliberately does not document the library until it builds.
+1. ~~**`lib/` does not compile as shipped**~~ — CLOSED 2026-10-12: fmt imports str, io
+   declares its C functions, the module-prefixed C externs (BUG-1593), the `*opaque` C ABI
+   (BUG-1594), the const `*opaque` temp (BUG-1595) and the param-view false leak (BUG-1596)
+   are fixed, and `tests/test_lib.sh` (in `make check`) builds and runs a program importing
+   every module. Imports still resolve from the entry file's directory only, so `lib/` is
+   copied beside the program; reference.md documents the library now that it builds.
 2. ~~**Two literal-typing over-rejections.**~~ — CLOSED 2026-09-26 (BUG-1326, BUG-1327).
 3. **BUG-1310 precision.** An indirect call through a funcptr LOCAL / param / mutable global
    reaches every function of its SIGNATURE (the BUG-1290 end), so a helper calling a callback
@@ -3943,7 +3964,8 @@ Unreachable only because `asm` is naked-only; opens seven holes at once the day 
 
 ### Reported but NOT fixed on any branch — carry as OPEN, do not "harvest"
 
-- **extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`** (4z36e0,
+- ~~**extern `*opaque` crosses the C boundary with an UNINITIALISED `type_id`**~~ — CLOSED
+  2026-10-12 (BUG-1594, the `void *` bridge). Original text: (4z36e0,
   HIGH). ZER emits `_zer_opaque zzz_ptr(void);` where the real C function is
   `void *zzz_ptr(void);`. `.ptr` arrives correctly by ABI luck; `.type_id` is register
   residue. `@ptrcast`'s `!= 0` escape then either FALSE-TRAPS on correct code (measured,

@@ -1599,6 +1599,44 @@ cell p69_safe_aim_out    compile "$P69"' u32 main(){ u32 b = 3; *u32 p = &b; { *
 cell p69_safe_inside     compile "$P69"' u32 main(){ u32 r = 0; { u32 x = 7; *u32 q = &x; r = *q; } return r - 7; }'
 cell p69_safe_nested     compile "$P69"' u32 main(){ u32 r = 0; { u32 x = 1; *u32 p = &x; { u32 y = 2; p = &x; r = *p + y; } } return r - 3; }'
 
+# SHAPE p70 (BUG-1568): a LOCAL or PARAMETER that shares a GLOBAL's name. Every
+# frame sink asked "does a global of this NAME exist?" instead of "does the name
+# resolve to it?", so the shadowing local was program storage to all of them.
+# BOUNDARY: a local aimed at by a same-named local pointer, and a write through
+# the global's own name, must compile.
+echo "===== SHAPE p70 = a local / param named like a global ====="
+P70='u32 x70 = 1;
+u32[4] a70;
+struct W70 { *u32 p; }
+*u32 id70(*u32 p) { return p; }
+void st70(*u32 p) { g_p = p; }
+'
+cell p70_return          reject "$P70"' *u32 c() { u32 x70 = 7; *u32 p = &x70; return p; } u32 main(){return 0;}'
+cell p70_return_direct   reject "$P70"' *u32 c() { u32 x70 = 7; return &x70; } u32 main(){return 0;}'
+cell p70_param           reject "$P70"' *u32 c(u32 x70) { return &x70; } u32 main(){return 0;}'
+cell p70_store_glob      reject "$P70"' void c() { u32 x70 = 7; g_p = &x70; } u32 main(){return 0;}'
+cell p70_array_slice     reject "$P70"' [*]u32 c() { u32[4] a70; return a70; } u32 main(){return 0;}'
+cell p70_call_result     reject "$P70"' *u32 c() { u32 x70 = 7; return id70(&x70); } u32 main(){return 0;}'
+cell p70_keep_call       reject "$P70"' void c() { u32 x70 = 7; st70(&x70); } u32 main(){return 0;}'
+cell p70_struct_lit      reject "$P70"' W70 c() { u32 x70 = 7; W70 w = { .p = &x70 }; return w; } u32 main(){return 0;}'
+cell p70_safe_local_tgt  compile "$P70"' u32 main(){ u32 v = 7; ?*u32 g_p = null; g_p = &v; if (g_p) |q| { return *q - 7; } return 1; }'
+cell p70_safe_global     compile "$P70"' *u32 c() { return &x70; } u32 main(){ return *c() - 1; }'
+
+# SHAPE p71 (BUG-1569/1570): the block-lifetime rule's remaining spellings — a
+# place reached THROUGH a slice / pointer local (`&s[0]`), a field read through a
+# pointer with two recorded roots, an async task holding an inner block's address,
+# and a borrow root re-aimed by a SHADOWING static. BOUNDARY: views of outer storage.
+echo "===== SHAPE p71 = inner-block storage through views / tasks / shadows ====="
+P71='struct W71 { *u32 p; }
+async void rd71(*u32 p) { yield; *p += 1; }
+'
+cell p71_slice_elem      reject "$P71"' u32 main(){ u32 g = 1; *u32 q = &g; { u32[2] a; a[0] = 7; [*]u32 s = a; q = &s[0]; } return *q; }'
+cell p71_ptr_carrier     reject "$P71"' u32 main(){ u32 g = 1; *u32 q = &g; { u32 x = 7; W71 w = { .p = &x }; *W71 wp = &w; q = wp.p; } return *q; }'
+cell p71_async_task      reject "$P71"' u32 main(){ _zer_async_rd71 t; { u32 x = 7; _zer_async_rd71_init(&t, &x); } _zer_async_rd71_poll(&t); return 0; }'
+cell p71_static_shadow   reject "$P71"' u32 main(){ u32 g = 1; *u32 q = &g; { u32 x = 7; *u32 r = &x; { static u32 x = 0; q = r; } } return *q; }'
+cell p71_safe_outer_view compile "$P71"' u32 main(){ u32[4] o; o[0] = 3; u32 g = 1; *u32 q = &g; { [*]u32 s = o; q = &s[0]; } return *q - 3; }'
+cell p71_safe_task_block compile "$P71"' u32 main(){ u32 y = 0; { _zer_async_rd71 t; u32 x = 7; _zer_async_rd71_init(&t, &x); _zer_async_rd71_poll(&t); _zer_async_rd71_poll(&t); y = x; } return y - 8; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

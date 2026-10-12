@@ -1,0 +1,12 @@
+// BUG-1581 boundary: nested field paths of a variable.
+struct In { u32[3] a; }
+struct Out { In i; [*]u32 s; }
+Out o;
+u32 main() {
+    o.i.a[0] = 1; o.i.a[1] = 2; o.i.a[2] = 3;
+    o.s = o.i.a;
+    u32 sum = 0;
+    for (u32 x in o.i.a) { sum += x; }
+    for (u32 y in o.s) { sum += y; }
+    return sum - 12;
+}

@@ -1,0 +1,13 @@
+// BUG-1572 boundary: a global move struct stays the owner; borrow it by pointer,
+// move a LOCAL freely, and moving a fresh literal INTO the global is fine.
+move struct Tok { u32 k; }
+Tok g;
+u32 peek(*Tok t) { return t.k; }
+u32 eat(Tok t) { return t.k; }
+u32 main() {
+    Tok fresh = { .k = 2 };
+    g = { .k = 5 };
+    u32 a = peek(&g) + peek(&g);
+    u32 b = eat(fresh);
+    return a + b - 12;
+}

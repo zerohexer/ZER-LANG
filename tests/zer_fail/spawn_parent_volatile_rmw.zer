@@ -1,0 +1,15 @@
+// expect-error: non-atomic read-modify-write of volatile global 'vg' while a spawned
+// BUG-1591: the spawner's RMW of a volatile flag a thread stores was unchecked (lost stores).
+volatile u32 vg;
+void worker() { vg = 1; }
+u32 main() {
+    u32 lost = 0;
+    for (u32 r = 0; r < 2000; r += 1) {
+        vg = 0;
+        ThreadHandle th = spawn worker();
+        for (u32 i = 0; i < 2000; i += 1) { vg |= 2; }
+        th.join();
+        if ((vg & 1) == 0) { lost += 1; }
+    }
+    return lost;
+}

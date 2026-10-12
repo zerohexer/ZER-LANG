@@ -83,7 +83,8 @@ static Token error_token(Scanner *s, const char *message) {
 
 /* ---- Skip whitespace and comments ---- */
 
-static void skip_whitespace(Scanner *s) {
+/* Returns true when a block comment runs to the end of the input (BUG-1582). */
+static bool skip_whitespace(Scanner *s) {
     for (;;) {
         char c = peek(s);
         switch (c) {
@@ -105,18 +106,21 @@ static void skip_whitespace(Scanner *s) {
                     advance(s); /* skip / */
                     advance(s); /* skip * */
                     while (!(peek(s) == '*' && peek_next(s) == '/')) {
-                        if (peek(s) == '\0') return; /* unterminated — caught later */
+                        /* BUG-1582: "caught later" was never true — the rest of
+                         * the file was silently a comment (a static_assert after
+                         * it never ran). C refuses this; so does ZER. */
+                        if (peek(s) == '\0') return true;
                         if (peek(s) == '\n') s->line++;
                         advance(s);
                     }
                     advance(s); /* skip * */
                     advance(s); /* skip / */
                 } else {
-                    return; /* just a slash — not whitespace */
+                    return false; /* just a slash — not whitespace */
                 }
                 break;
             default:
-                return;
+                return false;
         }
     }
 }
@@ -444,7 +448,11 @@ static Token scan_char(Scanner *s) {
 /* ---- Main scanner function ---- */
 
 Token next_token(Scanner *s) {
-    skip_whitespace(s);
+    if (skip_whitespace(s)) {
+        s->pos = s->len;   /* consumed; the error token is reported once */
+        return error_token(s, "unterminated block comment — a '/*' with no closing '*/' "
+                              "would turn the rest of the file into a comment");
+    }
 
     if (s->pos >= s->len) {
         return make_token(s, TOK_EOF, s->pos);

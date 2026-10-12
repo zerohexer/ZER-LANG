@@ -1,0 +1,5 @@
+// expect-error: does not match its earlier declaration
+// BUG-1584: a prototype disagreeing with its definition reached GCC.
+u32 tw(u8 x);
+u32 main() { return tw(3); }
+u32 tw(u32 x) { return x - 3; }

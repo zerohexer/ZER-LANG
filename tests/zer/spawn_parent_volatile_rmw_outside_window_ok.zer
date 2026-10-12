@@ -1,0 +1,12 @@
+// BUG-1591 boundary: read-modify-writes of the flag BEFORE the spawn and AFTER
+// the join are single-threaded.
+volatile u32 vg;
+void worker() { vg = 1; }
+u32 main() {
+    vg |= 2;
+    ThreadHandle th = spawn worker();
+    th.join();
+    vg |= 4;
+    if (vg != 5) { return 1; }
+    return 0;
+}

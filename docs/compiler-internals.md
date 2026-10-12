@@ -162,6 +162,68 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## The 2026-10-12 audit (BUG-1566..1596) — what took a loop to find
+
+**"Is this a global?" is an IDENTITY question, never a NAME question (BUG-1568).** ~48 checker
+sites wrote `global_decl_lookup(c, name) != NULL`: "does a global of this name exist?". A local
+or parameter that merely shares a global's name (in this module or ANY imported one) was then
+program storage to every frame-escape sink — the shadowed name returned a dangling stack address
+at seven sinks. Use **`name_is_global_here(c, name, len)`**: the first declaration of the name on
+the current scope chain must BE the global's symbol (`== global_decl_lookup(...)`). Exception: a
+whole-program SCAN that walks ANOTHER function's body runs with the caller's scope chain, so there
+the name lookup (over-approximating "global") is the right call — do not convert scan sites. A
+site that already holds the resolved `Symbol *s` should compare `global_decl_lookup(...) == s`.
+
+**A fact recorded BY NAME is re-resolved where it is used, and a shadowing declaration in
+between re-aims it (BUG-1569).** `Symbol.borrow_root_name` (BUG-969), `th_borrow_names` and the
+block-lifetime carrier root are all names. A `static u32 v` nested between the record and the use
+made `v` mean the static, which "lends nothing". `name_is_shadowed_here` (distinct declarations of
+the name on the visible chain, the global counted when it is not the visible one) is the guard:
+refuse / treat conservatively where the answer matters. The durable fix is recording the Symbol.
+
+**Range narrowing from a CONDITION must come from an effect-free condition (BUG-1566).** The first
+draft of `vrp_push_cond_facts` proved `a[9]` from `if (i < 4 && (i = 9) > 0) { a[i] }`: the fact of
+the left conjunct was stale by the time the body ran. `vrp_cond_effect_free` (exhaustive, answers NO
+for any call / assignment / orelse / intrinsic) gates the whole condition. In the RHS of `&&`, the
+LHS facts are pushed and the count restored after; a store inside the RHS reaches every entry of
+its variable (BUG-1430), so the restore cannot resurrect a stale range. The new matrix cells pin it.
+
+**The emitter and the typed fold must compute the SAME shift (BUG-1577).** C does not apply the
+usual arithmetic conversions to `<<` / `>>`: the result has the PROMOTED LEFT operand's type. ZER
+types a shift like `+` (common type), and `tfold` folded at that width — so `u32 << u64` was
+proven at 64 bits and ran at 32, and VRP elided a check for an index the program never computed.
+Any operator whose C typing differs from ZER's needs its operand CONVERTED in the emitted C
+(`emit_shift_left_open`); grep the fold for every operator and confirm the emitter matches.
+
+**`*opaque` is a 16-byte struct in ZER and `void *` in C (BUG-1594).** A C extern declared in ZER
+with `*opaque` was called with the struct ABI. The fix cannot touch call sites (two emitter paths,
+plus funcptr guards): a C extern with an `*opaque` / `?*opaque` gets a `void *` C prototype, a
+`static inline _zer_xw_NAME` wrapper with the ZER signature, and `#define NAME(...)
+_zer_xw_NAME(__VA_ARGS__)` — every call site of every path is redirected by the preprocessor. With
+a `cinclude`, no prototype is emitted (the header's own `FILE *` / `char *` spelling would
+conflict); the wrapper's conversions are implicit C conversions. Related: **a bodyless function no
+module defines is a C symbol and has no module prefix** (BUG-1593, `unprefix_c_externs`, run at
+the end of the whole-program post passes) — before it, every extern declared in an imported
+module was emitted `mod__name` and could not link. `tests/test_lib.sh` is the gate.
+
+**A view set on a GLOBAL entry means different things for different producers (BUG-1575).** The
+global-store helper gives `(IR_GLOBAL_ROOT_ID, "g")` a view set for a call result that may be any
+of several allocations, and the dangling-global checks consult it — but Ring wildcard entries
+(BUG-1414) ALSO carry views, of values the Ring may no longer hold. Checking every global view set
+broke `ring_pop_read_ok_bug1414`. Views are honoured only on entries the helper marked
+(`IRHandleInfo.gstore_views`), and every re-binding of the entry clears the mark.
+
+**The atomic-cell window is a property of the THREADS, not of the text (BUG-1589).** It opened only
+at a spawn written earlier in the same function. `FuncProps.can_detach` (a fire-and-forget spawn,
+transitive) opens it after a call, at the top of a loop whose subtree can detach (the next
+iteration runs after the spawn), and at a label when anything in the function can detach (a
+backward goto). A helper that spawns and joins does not detach.
+
+**A bare `orelse return` returns NULL, not "something unclassifiable" (BUG-1596).** The return
+summary bailed on any return without a value local, which made one `x orelse return` in a
+function returning a param view register every call result as a fresh allocation (false leaks
+in every caller). A valueless return in a value-returning function is the null it returns.
+
 ## Merge-back methodology — consuming the `claude/*` fix tracker (2026-07-13..15)
 
 There are **41 unique soundness/miscompile/crash fixes** already FOUND + FIXED across

@@ -1,0 +1,18 @@
+// expect-error: use after free
+// BUG-1571: a callee freeing a FIELD of a GLOBAL aggregate argument was unseen (rl >= 0 dropped the global root).
+struct T { u32 v; }
+struct Own { ?*T p; }
+Own g;
+void consume(Own o) { if (o.p) |q| { free(q); } }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    g.p = a;
+    consume(g);
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = 0;
+    if (g.p) |q| { r = q.v; }
+    free(b);
+    return r;
+}

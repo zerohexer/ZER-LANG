@@ -115,6 +115,12 @@ static void emit_c_string_text(Emitter *e, const char *t, int n) {
          * 1-byte string plus sizeof 2) and "??/" a backslash that escaped the
          * next character. `\?` is the same byte and never starts one. */
         if (t[i] == '?') { fputs("\\?", e->out); continue; }
+        /* BUG-1583: the lexer lets a string literal SPAN lines (it counts them);
+         * a raw newline / CR copied into C ends the C literal ("missing
+         * terminating \" character", reported against the .zer line). Same
+         * bytes, spelled as escapes. */
+        if (t[i] == '\n') { fputs("\\n", e->out); continue; }
+        if (t[i] == '\r') { fputs("\\r", e->out); continue; }
         if (t[i] != '\\' || i + 1 >= n) { fputc(t[i], e->out); continue; }
         char esc = t[i + 1];
         if (esc == 'x') {
@@ -2095,6 +2101,37 @@ static int shift_guard_width(Type *lhs) {
     return w > 0 ? w : 128;
 }
 
+/* BUG-1577: a shift's RESULT type — the common type of its operands, exactly as
+ * for `+` (the checker's typing, and the typed fold's). C does not apply the
+ * usual arithmetic conversions to `<<`, so `u32 << u64` shifted the u32 operand
+ * in 32 bits while the checker typed (and VRP folded) the result as u64:
+ * `((A << M) >> 33) ^ 7` folded to 0 and ran as 7, and the proven index elided
+ * the bounds check (ASan global-buffer-overflow). The operand is converted to
+ * the result type FIRST and the width tested is the result's. */
+static Type *shift_result_type(Emitter *e, Node *node) {
+    Type *rt = checker_get_type(e->checker, node);
+    Type *rte = rt ? type_unwrap_distinct(rt) : NULL;
+    if (!rte || !type_is_integer(rte)) {
+        Type *lt = checker_get_type(e->checker, node->binary.left);
+        rte = lt ? type_unwrap_distinct(lt) : NULL;
+    }
+    return rte;
+}
+static int shift_result_width(Emitter *e, Node *node) {
+    return shift_guard_width(shift_result_type(e, node));
+}
+/* emits `(RT)(` — the caller emits the operand and the closing `)` */
+static void emit_shift_left_open(Emitter *e, Node *node) {
+    Type *rte = shift_result_type(e, node);
+    if (rte && type_is_integer(rte)) {
+        emit(e, "(");
+        emit_type(e, rte);
+        emit(e, ")(");
+    } else {
+        emit(e, "(");
+    }
+}
+
 /* The four saturation limits, as C constant-expression text. Extracted so the
  * statement-expression form (emit_f2i_close) and the CONSTANT form
  * (emit_f2i_const, BUG-990) cannot drift apart — the bounds ARE the safety
@@ -2573,9 +2610,13 @@ static void emit_type(Emitter *e, Type *t) {
 
     case TYPE_POINTER:
         if (t->pointer.inner && type_unwrap_distinct(t->pointer.inner)->kind == TYPE_OPAQUE) {
-            /* BUG-393: *opaque → _zer_opaque (tagged struct, not void*) */
-            if (t->pointer.is_const) emit(e, "const ");
-            if (t->pointer.is_volatile) emit(e, "volatile ");
+            /* BUG-393: *opaque → _zer_opaque (tagged struct, not void*).
+             * BUG-1595: NOT `const _zer_opaque` for `const *opaque` — the
+             * qualifier is on the POINTEE, while a qualified struct makes the
+             * variable itself const: every IR temp of the type was declared
+             * `const _zer_opaque t = {0};` and then assigned (a GCC error, so
+             * `fwrite(@ptrcast(const *opaque, p), …)` could not be built). The
+             * checker enforces the pointee qualifier; the C object is plain. */
             emit(e, "_zer_opaque");
         } else if ((t->pointer.is_const || t->pointer.is_volatile) &&
                    global_is_ptr_shaped(t->pointer.inner) &&
@@ -3501,8 +3542,9 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 int64_t sc = 0;
                 bool sc_ok = checker_fold_const_typed(e->checker, node->binary.right, &sc) ||
                              eval_const_expr_ok(node->binary.right, &sc);
-                Type *lt = checker_get_type(e->checker, node->binary.left);
-                Type *lte = lt ? type_unwrap_distinct(lt) : NULL;
+                /* BUG-1577: the RESULT type's width and C type (see
+                 * shift_result_type) — the operand is converted first. */
+                Type *lte = shift_result_type(e, node);
                 int lw = (lte && type_is_integer(lte)) ? type_width(lte) : 0;
                 if (sc_ok && lw > 0) {
                     if (sc < 0 || sc >= lw) {
@@ -3510,19 +3552,22 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                         emit_type(e, lte);
                         emit(e, ")0)");
                     } else {
-                        emit(e, "(");
+                        emit(e, "((");
+                        emit_type(e, lte);
+                        emit(e, ")(");
                         emit_expr(e, node->binary.left);
-                        emit(e, " %s %lld)", node->binary.op == TOK_LSHIFT ? "<<" : ">>",
+                        emit(e, ") %s %lld)", node->binary.op == TOK_LSHIFT ? "<<" : ">>",
                              (long long)sc);
                     }
                     break;
                 }
             }
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+            emit_shift_left_open(e, node);
             emit_expr(e, node->binary.left);
-            emit(e, ", ");
+            emit(e, "), ");
             emit_expr(e, node->binary.right);
-            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
+            emit(e, ", %d)", shift_result_width(e, node));
         } else {
             /* check if result type is narrower than int — need cast to prevent
              * C integer promotion from changing wrapping behavior */
@@ -3967,13 +4012,13 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                         handled = true;
                     } else if (mlen == 8 && memcmp(mname, "free_ptr", 8) == 0) {
                         /* pool.free_ptr(ptr) → find slot index from pointer, free it */
-                        emit(e, "_zer_pool_free(%.*s.gen, %.*s.used, "
-                             "((uint64_t)((char*)(", plen, pname, plen, pname);
+                        /* BUG-1576: free BY POINTER (see _zer_pool_free_ptr) */
+                        emit(e, "_zer_pool_free_ptr(%.*s.slots, %.*s.gen, %.*s.used, "
+                             "sizeof(%.*s.slots[0]), (void*)(", plen, pname, plen, pname,
+                             plen, pname, plen, pname);
                         if (node->call.arg_count > 0)
                             emit_expr(e, node->call.args[0]);
-                        emit(e, ") - (char*)%.*s.slots) / sizeof(%.*s.slots[0])), %llu)",
-                             plen, pname, plen, pname,
-                             (unsigned long long)pool->pool.count);
+                        emit(e, "), %llu)", (unsigned long long)pool->pool.count);
                         handled = true;
                     }
                 }
@@ -5073,9 +5118,19 @@ static void emit_expr_impl(Emitter *e, Node *node) {
                 Type *ftype = struct_field_type_by_name(si_type, fname, fname_len);
                 Type *slice_tgt = aggregate_slice_coerce_target(ftype, fv_type);
                 Type *vte = fv_type ? type_unwrap_distinct(fv_type) : NULL;
+                Type *fte = ftype ? type_unwrap_distinct(ftype) : NULL;
+                int64_t fcv;
                 if (slice_tgt && vte && type_dispatch_kind(vte) == TYPE_ARRAY)
                     emit_array_as_slice(e, fval, vte, slice_tgt);
-                else
+                else if (e->global_init_depth > 0 && fte && type_is_integer(fte) &&
+                         type_width(fte) <= 64 && global_init_fold(e, fval, &fcv)) {
+                    /* BUG-1579: a FIELD of a global initializer is a constant of
+                     * the FIELD's type, folded and wrapped like a scalar global
+                     * (BUG-1032). `S gs = { .b = C3 * 3 };` with a `u3` field
+                     * emitted `.b = (7 * 3)` — 21 in a type whose values are 0..7
+                     * (5 expected), and an i5 field kept 16 where -16 is the value. */
+                    emit_folded_int(e, fold_wrap_to_type(fcv, fte), "%s", "%s");
+                } else
                     emit_expr(e, fval);
             }
         }
@@ -6533,6 +6588,124 @@ static void emit_func_attributes(Emitter *e, Node *fn) {
     }
 }
 
+/* BUG-1593: is this bodyless declaration a C function — no module defines it
+ * (the checker dropped its module prefix, unprefix_c_externs)? */
+static bool decl_is_c_extern(Emitter *e, Node *node) {
+    if (!node || node->kind != NODE_FUNC_DECL || node->func_decl.body) return false;
+    Symbol *s = emit_decl_lookup(e, node->func_decl.name, (uint32_t)node->func_decl.name_len);
+    return s && s->is_function && !s->module_prefix && s->func_node &&
+           s->func_node->kind == NODE_FUNC_DECL && !s->func_node->func_decl.body;
+}
+
+/* BUG-1594: 1 = `*opaque`, 2 = `?*opaque`, 0 = anything else. */
+static int ffi_opaque_kind(Type *t) {
+    Type *u = t ? type_unwrap_distinct(t) : NULL;
+    if (!u) return 0;
+    if (type_dispatch_kind(u) == TYPE_OPTIONAL) {
+        Type *in = type_unwrap_distinct(u->optional.inner);
+        if (in && type_dispatch_kind(in) == TYPE_POINTER &&
+            type_dispatch_kind(in->pointer.inner) == TYPE_OPAQUE) return 2;
+        return 0;
+    }
+    if (type_dispatch_kind(u) == TYPE_POINTER &&
+        type_dispatch_kind(u->pointer.inner) == TYPE_OPAQUE) return 1;
+    return 0;
+}
+static Type *ffi_opaque_ptr(Type *t) {   /* the `*opaque` pointer type inside */
+    Type *u = type_unwrap_distinct(t);
+    if (type_dispatch_kind(u) == TYPE_OPTIONAL) u = type_unwrap_distinct(u->optional.inner);
+    return u;
+}
+static bool c_extern_needs_opaque_bridge(Emitter *e, Node *decl) {
+    if (!decl_is_c_extern(e, decl) || decl->func_decl.is_variadic) return false;
+    Type *ft = checker_get_type(e->checker, decl);
+    if (!ft || type_dispatch_kind(ft) != TYPE_FUNC_PTR) return false;
+    if (ffi_opaque_kind(ft->func_ptr.ret)) return true;
+    for (uint32_t i = 0; i < ft->func_ptr.param_count; i++)
+        if (ffi_opaque_kind(ft->func_ptr.params[i])) return true;
+    return false;
+}
+static void emit_ffi_void_ptr(Emitter *e, Type *t) {
+    Type *p = ffi_opaque_ptr(t);
+    if (p && p->pointer.is_const) emit(e, "const ");
+    if (p && p->pointer.is_volatile) emit(e, "volatile ");
+    emit(e, "void *");
+}
+
+/* BUG-1594: `*opaque` is ZER's tagged value `_zer_opaque {ptr, type_id}` — a
+ * 16-byte struct — so a C function declared in ZER with an `*opaque` parameter or
+ * return was called with the WRONG ABI: `u32 pick(*opaque p, u32 y)` against C's
+ * `uint32_t pick(void *p, uint32_t y)` passed the struct in two registers and C
+ * read the type_id as `y` (exit 104), and an `*opaque` RETURN arrived with its
+ * type_id as register residue (the documented 4z36e0 entry: @ptrcast then
+ * false-trapped, or passed a wrong cast). The C side of `*opaque` is `void *`.
+ *
+ * So the extern's C prototype spells `void *` in those positions, and a static
+ * inline wrapper with the ZER signature converts — `.ptr` going in, a fresh
+ * `{ptr, 0}` coming out (type_id 0 = provenance unknown, exactly what a value
+ * from C is) — and a function-like macro routes every call site of BOTH emitter
+ * paths through it, so no call site has to know. `#ifndef`-guarded: two modules
+ * may declare the same C function. `proto` = emit the C prototype (false for the
+ * names a standard header already declares). Taking the function's ADDRESS gets
+ * the C function itself, whose type differs from the ZER function-pointer type —
+ * GCC refuses that loudly. */
+static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
+    Type *ft = checker_get_type(e->checker, decl);
+    Type *ret = ft->func_ptr.ret;
+    const char *n = decl->func_decl.name;
+    int nl = (int)decl->func_decl.name_len;
+    uint32_t pc = ft->func_ptr.param_count;
+    int rk = ffi_opaque_kind(ret);
+    emit(e, "#ifndef _ZER_XW_%.*s\n#define _ZER_XW_%.*s\n", nl, n, nl, n);
+    if (proto) {
+        if (rk) emit_ffi_void_ptr(e, ret); else emit_func_decl_head(e, ret, false);
+        emit(e, "%.*s(", nl, n);
+        if (pc == 0) emit(e, "void");
+        for (uint32_t i = 0; i < pc; i++) {
+            if (i) emit(e, ", ");
+            if (ffi_opaque_kind(ft->func_ptr.params[i])) emit_ffi_void_ptr(e, ft->func_ptr.params[i]);
+            else emit_type(e, ft->func_ptr.params[i]);
+        }
+        emit(e, ")");
+        if (!rk) emit_func_decl_tail(e, ret, false);
+        emit(e, ";\n");
+    }
+    emit(e, "static inline ");
+    emit_func_decl_head(e, ret, false);
+    emit(e, "_zer_xw_%.*s(", nl, n);
+    if (pc == 0) emit(e, "void");
+    for (uint32_t i = 0; i < pc; i++) {
+        if (i) emit(e, ", ");
+        char an[24];
+        snprintf(an, sizeof an, "_zer_xa%u", i);
+        emit_type_and_name(e, ft->func_ptr.params[i], an, (uint32_t)strlen(an));
+    }
+    emit(e, ")");
+    emit_func_decl_tail(e, ret, false);
+    emit(e, " {\n    ");
+    bool is_void = !ret || type_dispatch_kind(ret) == TYPE_VOID;
+    if (rk) emit(e, "void *_zer_xr = (void *)");
+    else if (!is_void) emit(e, "return ");
+    emit(e, "%.*s(", nl, n);
+    for (uint32_t i = 0; i < pc; i++) {
+        if (i) emit(e, ", ");
+        int k = ffi_opaque_kind(ft->func_ptr.params[i]);
+        if (k == 1) emit(e, "_zer_xa%u.ptr", i);
+        else if (k == 2) emit(e, "(_zer_xa%u.has_value ? _zer_xa%u.value.ptr : (void *)0)", i, i);
+        else emit(e, "_zer_xa%u", i);
+    }
+    emit(e, ");\n");
+    if (rk == 1) {
+        emit(e, "    _zer_opaque _zer_xo = { 0 };\n    _zer_xo.ptr = _zer_xr;\n"
+                "    return _zer_xo;\n");
+    } else if (rk == 2) {
+        emit(e, "    _zer_opt_opaque _zer_xo = { 0 };\n"
+                "    if (_zer_xr) { _zer_xo.value.ptr = _zer_xr; _zer_xo.has_value = 1; }\n"
+                "    return _zer_xo;\n");
+    }
+    emit(e, "}\n#define %.*s(...) _zer_xw_%.*s(__VA_ARGS__)\n#endif\n\n", nl, n, nl, n);
+}
+
 static void emit_func_decl(Emitter *e, Node *node) {
     ZTRACE("EMIT  function '%.*s'", (int)node->func_decl.name_len, node->func_decl.name);
 
@@ -6589,7 +6762,10 @@ static void emit_func_decl(Emitter *e, Node *node) {
     emit_func_attributes(e, node);
 
     emit_func_decl_head(e, ret, false);                 /* BUG-1111 */
-    EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
+    if (decl_is_c_extern(e, node))                      /* BUG-1593: the C name */
+        emit(e, "%.*s", (int)node->func_decl.name_len, node->func_decl.name);
+    else
+        EMIT_MANGLED_NAME(e, node->func_decl.name, node->func_decl.name_len);
     emit_func_decl_params(e, node, func_type);
     emit_func_decl_tail(e, ret, false);
     emit(e, " ");
@@ -7539,6 +7715,9 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
             {
                 const char *n = decl->func_decl.name;
                 size_t nl = decl->func_decl.name_len;
+                /* BUG-1594: a C extern whose signature holds `*opaque` gets the
+                 * void * bridge (its own prototype, if any, is part of it). */
+                bool bridged = c_extern_needs_opaque_bridge(e, decl);
                 bool is_cstdlib = (nl == 4 && memcmp(n, "puts", 4) == 0) ||
                                   (nl == 6 && memcmp(n, "printf", 6) == 0) ||
                                   (nl == 7 && memcmp(n, "fprintf", 7) == 0) ||
@@ -7557,7 +7736,15 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
                                   (nl == 6 && memcmp(n, "memchr", 6) == 0) ||
                                   (nl == 7 && memcmp(n, "bsearch", 7) == 0) ||
                                   (nl == 5 && memcmp(n, "qsort", 5) == 0);
-                if (!is_cstdlib) emit_func_decl(e, decl);
+                /* With a C header included, the HEADER declares the function —
+                 * a prototype of ours would spell `uint8_t *` where it says
+                 * `char *` (or `void *` where it says `FILE *`) and conflict;
+                 * the bridge's argument / result conversions are implicit C
+                 * conversions to whatever the header declares. Without one,
+                 * the bridge's `void *` prototype is the declaration. */
+                if (bridged) emit_c_extern_opaque_bridge(e, decl,
+                                                         !is_cstdlib && !e->saw_cinclude);
+                else if (!is_cstdlib) emit_func_decl(e, decl);
             }
             break;
         }
@@ -7644,6 +7831,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
     case NODE_CINCLUDE:
         /* cinclude "<stdio.h>" → #include <stdio.h>  (system header)
          * cinclude "myheader.h" → #include "myheader.h" (local header) */
+        e->saw_cinclude = true;   /* BUG-1594 */
         if (decl->cinclude.path_len >= 2 &&
             decl->cinclude.path[0] == '<' &&
             decl->cinclude.path[decl->cinclude.path_len - 1] == '>') {
@@ -8320,6 +8508,23 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "    }\n");
     emit(e, "}\n\n");
 
+    /* BUG-1576: `pool.free_ptr(p)` handed _zer_pool_free the bare slot INDEX as a
+     * handle — generation 0, the null-handle no-op — so it never freed anything:
+     * a Pool(T, 1) could hand out its one slot exactly once. Free by POINTER:
+     * the pointer must be a slot start this pool issued and still in use. */
+    emit(e, "static inline void _zer_pool_free_ptr(void *slots, uint32_t *gen, uint8_t *used, "
+            "size_t slot_size, void *ptr, size_t capacity) {\n");
+    emit(e, "    if (!ptr) return;\n");
+    emit(e, "    size_t off = (size_t)((char*)ptr - (char*)slots);\n");
+    emit(e, "    if ((char*)ptr < (char*)slots || off %% slot_size != 0 || off / slot_size >= capacity)\n");
+    emit(e, "        _zer_trap(\"pool: free_ptr of a pointer this pool did not issue\", __FILE__, __LINE__);\n");
+    emit(e, "    size_t idx = off / slot_size;\n");
+    emit(e, "    if (!used[idx]) _zer_trap(\"pool: double free of a pointer (slot not in use)\", __FILE__, __LINE__);\n");
+    emit(e, "    used[idx] = 0;\n");
+    emit(e, "    gen[idx]++;\n");
+    emit(e, "    if (gen[idx] == 0) gen[idx] = 1;\n");
+    emit(e, "}\n\n");
+
     /* ZER runtime: Ring helper */
     emit(e, "/* ZER Ring runtime */\n");
     emit(e, "#define _ZER_RING_DECL(NAME, ELEM_TYPE, CAPACITY) \\\n");
@@ -8456,6 +8661,11 @@ void emit_file_module(Emitter *e, Node *file_node, bool with_preamble) {
     emit(e, "        size_t page = i / _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "        size_t slot = i %% _ZER_SLAB_PAGE_SLOTS;\n");
     emit(e, "        if (s->pages[page] + slot * s->slot_size == (char*)ptr) {\n");
+    /* BUG-1576: a second free of a slot that is no longer in use was SILENT,
+     * so a compile-time miss became a recycled-slot corruption (the next
+     * alloc handed the slot to a live object, then two allocs aliased it).
+     * The Handle path has trapped since BUG-1270; the pointer path now too. */
+    emit(e, "            if (!s->used[i]) _zer_trap(\"slab: double free of a pointer (slot not in use)\", __FILE__, __LINE__);\n");
     emit(e, "            s->used[i] = 0;\n");
     emit(e, "            s->gen[i]++;\n");
     emit(e, "            if (s->gen[i] == 0) s->gen[i] = 1;\n");
@@ -8903,7 +9113,7 @@ static bool emit_builtin_inline(Emitter *e, Node *node, IRFunc *func) {
             int t=e->temp_count++; emit(e,"({uint8_t _zer_aok%d=0;uint64_t _zer_ah%d=_zer_pool_alloc(%.*s.slots,sizeof(%.*s.slots[0]),%.*s.gen,%.*s.used,%llu,&_zer_aok%d);_zer_aok%d?(",t,t,(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,(unsigned long long)te->pool.count,t,t); emit_type(e,type_pointer(e->arena,te->pool.elem)); emit(e,")_zer_pool_get(%.*s.slots,%.*s.gen,%.*s.used,sizeof(%.*s.slots[0]),_zer_ah%d,%llu):(void*)0;})",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on,t,(unsigned long long)te->pool.count); return true;
         }
         if (ml==8 && !memcmp(mn,"free_ptr",8) && node->call.arg_count>0) {
-            emit(e,"_zer_pool_free(%.*s.gen,%.*s.used,((uint64_t)((char*)(",(int)ol,on,(int)ol,on); BA(0); emit(e,")-(char*)%.*s.slots)/sizeof(%.*s.slots[0])),%llu)",(int)ol,on,(int)ol,on,(unsigned long long)te->pool.count); return true;
+            emit(e,"_zer_pool_free_ptr(%.*s.slots,%.*s.gen,%.*s.used,sizeof(%.*s.slots[0]),(void*)(",(int)ol,on,(int)ol,on,(int)ol,on,(int)ol,on); BA(0); emit(e,"),%llu)",(unsigned long long)te->pool.count); return true;   /* BUG-1576 */
         }
     }
     /* Slab */
@@ -9494,19 +9704,21 @@ static void emit_rewritten_node_impl(Emitter *e, Node *node, IRFunc *func) {
                 emit_type(e, rts);
                 emit(e, " %s = %s(", lvbuf,
                      node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+                emit_shift_left_open(e, node);
                 emit_rewritten_node(e, node->binary.left, func);
-                emit(e, ", ");
+                emit(e, "), ");
                 emit_rewritten_node(e, node->binary.right, func);
-                emit(e, ", %d); ", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
+                emit(e, ", %d); ", shift_result_width(e, node));
                 emit_intn_mask_lv(e, rts, lvbuf);
                 emit(e, "%s; })", lvbuf);
                 return;
             }
             emit(e, "%s(", node->binary.op == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+            emit_shift_left_open(e, node);
             emit_rewritten_node(e, node->binary.left, func);
-            emit(e, ", ");
+            emit(e, "), ");
             emit_rewritten_node(e, node->binary.right, func);
-            emit(e, ", %d)", shift_guard_width(checker_get_type(e->checker, node->binary.left)));
+            emit(e, ", %d)", shift_result_width(e, node));
             return;
         }
         /* BUG-604: signed division overflow (INT_MIN / -1 is C UB).
@@ -15117,13 +15329,22 @@ static void emit_ir_inst(Emitter *e, IRInst *inst, IRFunc *func) {
              * Use _zer_shl/_zer_shr macros (defined in preamble) instead of
              * raw << / >>, which are C undefined behavior when n >= width. */
             if (inst->op_token == TOK_LSHIFT || inst->op_token == TOK_RSHIFT) {
+                /* BUG-1577: shift in the RESULT type (dst), at its width —
+                 * `u32 << u64` is a u64 shift, as the checker types it and the
+                 * typed fold computes it. Shifting the u32 operand in C made
+                 * VRP prove an index the program never computed. */
+                Type *srt = dst->type;
+                Type *srte = srt ? type_unwrap_distinct(srt) : NULL;
+                bool scast = srte && type_is_integer(srte);
                 emit_indent(e);
-                emit(e, "%s%.*s = %s(%s%.*s, %s%.*s, %d);\n",
+                emit(e, "%s%.*s = %s(",
                      ir_local_pfx(func, dst), (int)dst->name_len, dst->name,
-                     inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr",
+                     inst->op_token == TOK_LSHIFT ? "_zer_shl" : "_zer_shr");
+                if (scast) { emit(e, "("); emit_type(e, srte); emit(e, ")"); }
+                emit(e, "%s%.*s, %s%.*s, %d);\n",
                      ir_local_pfx(func, s1), (int)s1->name_len, s1->name,
                      ir_local_pfx(func, s2), (int)s2->name_len, s2->name,
-                     shift_guard_width(s1->type));
+                     shift_guard_width(scast ? srte : s1->type));
                 emit_intn_mask(e, dst, ir_local_pfx(func, dst)); /* Path C: wrap uN/iN shift result to its width */
                 break;
             }

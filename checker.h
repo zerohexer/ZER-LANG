@@ -398,6 +398,14 @@ typedef struct {
      * function. */
     Symbol **lent_globals;
     int lent_global_count, lent_global_cap;
+    /* BUG-1591: VOLATILE globals a spawned thread touches under the single-word
+     * exemption, and the spawner's read-modify-writes of volatile globals inside
+     * its concurrent window — the post pass refuses their intersection (the RMW
+     * can overwrite the thread's store). Arena-grown, whole-program. */
+    Symbol **thr_vol;
+    int thr_vol_n, thr_vol_cap;
+    struct ParVolRmw { Symbol *s; int line; const char *file; const char *src; } *par_vol_rmw;
+    int par_vol_rmw_n, par_vol_rmw_cap;
     /* BUG-1276: globals a RUNNING scoped thread writes inside a @once block, and
      * which @once node owns each. While the spawn window is open the parent may
      * touch them only inside that same @once (directly or through a callee). */

@@ -1,0 +1,11 @@
+// BUG-1578 boundary: constants that fit, and an explicit narrowing.
+const u32 K = 3;
+u32 main() {
+    u32 a = 0;
+    a[3..0] = 15;
+    a[7..4] = K + 2;
+    u8 small = 9;
+    a[11..8] = @truncate(u4, small);
+    if (a != 0x95F) { return 1; }
+    return 0;
+}

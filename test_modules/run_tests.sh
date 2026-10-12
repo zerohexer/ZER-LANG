@@ -149,6 +149,7 @@ run_test m1457_user 0
 run_test m1459_user 0
 # BUG-1457/1458: the freeing `release` is c's; the report names c's FILE.
 expect_err m1457_negative "m1457_c.zer:6: zercheck: use after free: 's'"
+expect_err m1568_negative "cannot return pointer to local 'x1568'"
 
 # cleanup
 rm -f _*.c _*.exe _*.o _*[!.]*

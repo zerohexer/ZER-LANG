@@ -144,6 +144,10 @@ typedef enum {
     VP_ADDR_TAKEN,        /* B7 — index mutated through `&k` in the body */
     VP_FOR_BODY_LOWERED,  /* BUG-1034 — a SIGNED counter lowered in the body */
     VP_FOR_STEP_DEC,      /* BUG-1034 — a SIGNED counter with a DECREMENTING step */
+    VP_AND_LATER_WRITE,   /* BUG-1566 — a later conjunct WRITES the index */
+    VP_OR_THEN,           /* BUG-1566 — `i < 4 || j < 4` true says nothing about i */
+    VP_AND_ELSE,          /* BUG-1566 — the else arm of a conjunction */
+    VP_WHILE_AND_STEP,    /* BUG-1566 — the conjunction holds at entry, not after `i += 1` */
 
     /* ---- PROVEN: the construct's own bound really does prove it ---- */
     VP_FOR_BODY_OK,       /* counter in the body, bounded by the loop condition */
@@ -151,6 +155,13 @@ typedef enum {
     VP_WHILE_BODY_OK,     /* counter in a while body, bounded by the condition */
     VP_CONST_OK,          /* a literal index inside the array */
     VP_FOR_SIGNED_OK,     /* BUG-1034 pin: signed counter, `i = i + 1` step, read-only body */
+    VP_AND_IF_OK,         /* BUG-1566 — `if (i < n && i < 4) { a[i] }` */
+    VP_AND_RHS_OK,        /* BUG-1566 — `i < 4 && a[i] == 0`, the RHS under the LHS */
+    VP_AND_WHILE_OK,      /* BUG-1566 — `while (k < n && k < 4) { a[k] }` */
+    VP_AND_FOR_OK,        /* BUG-1566 — `for (j = 0; j < n && j < 4; ...) { a[j] }` */
+    VP_OR_GUARD_OK,       /* BUG-1566 — `if (i >= 4 || j >= 4) { return; }` then a[i], a[j] */
+    VP_NOT_OK,            /* BUG-1566 — `if (!(i >= 4)) { a[i] }` */
+    VP_LOOP_BOUND_RANGE_OK, /* BUG-1567 — `for (i < n)` with n's range max in bounds */
     VPSCEN_COUNT
 } VPScenario;
 
@@ -162,9 +173,12 @@ static int scenario_is_stale(VPScenario s) {
         case VP_DOWHILE_COND: case VP_DOWHILE_BODY:
         case VP_GOTO_BACK: case VP_SWITCH_ARM: case VP_ADDR_TAKEN:
         case VP_FOR_BODY_LOWERED: case VP_FOR_STEP_DEC:
+        case VP_AND_LATER_WRITE: case VP_OR_THEN: case VP_AND_ELSE: case VP_WHILE_AND_STEP:
             return 1;
         case VP_FOR_BODY_OK: case VP_FOR_STEP_OK:
         case VP_WHILE_BODY_OK: case VP_CONST_OK: case VP_FOR_SIGNED_OK:
+        case VP_AND_IF_OK: case VP_AND_RHS_OK: case VP_AND_WHILE_OK: case VP_AND_FOR_OK:
+        case VP_OR_GUARD_OK: case VP_NOT_OK: case VP_LOOP_BOUND_RANGE_OK:
             return 0;
         case VPSCEN_COUNT: break;
     }
@@ -193,6 +207,17 @@ static const char *scen_name(VPScenario s) {
         case VP_WHILE_BODY_OK:     return "while/body PROVEN";
         case VP_CONST_OK:          return "literal index PROVEN";
         case VP_FOR_SIGNED_OK:     return "for/body(signed, i = i + 1) PROVEN";
+        case VP_AND_LATER_WRITE:   return "if/&&(later conjunct writes i)";
+        case VP_OR_THEN:           return "if/||(then arm)";
+        case VP_AND_ELSE:          return "if/&&(else arm)";
+        case VP_WHILE_AND_STEP:    return "while/&&(after the increment)";
+        case VP_AND_IF_OK:         return "if/&& PROVEN";
+        case VP_AND_RHS_OK:        return "&& right operand PROVEN";
+        case VP_AND_WHILE_OK:      return "while/&& PROVEN";
+        case VP_AND_FOR_OK:        return "for/&& PROVEN";
+        case VP_OR_GUARD_OK:       return "||-guard PROVEN";
+        case VP_NOT_OK:            return "if/! PROVEN";
+        case VP_LOOP_BOUND_RANGE_OK: return "for/bound range PROVEN";
         case VPSCEN_COUNT:         break;
     }
     return "?";
@@ -360,6 +385,97 @@ static void gen(VPScenario s, char *buf, size_t n) {
             "    u32 s = 0;\n"
             "    for (i32 i = 0; i < 4; i = i + 1) { s += a[i]; }\n"
             "    return s;\n}\n");
+        break;
+    case VP_AND_LATER_WRITE:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i) {\n"
+            "    if (i < 4 && (i = 9) > 0) { a[i] = 6; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1); }\n");
+        break;
+    case VP_OR_THEN:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 j) {\n"
+            "    if (i < 4 || j < 4) { a[i] = 3; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(9, 1); }\n");
+        break;
+    case VP_AND_ELSE:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 j) {\n"
+            "    if (i < 4 && j < 4) { } else { a[i] = 8; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(9, 1); }\n");
+        break;
+    case VP_WHILE_AND_STEP:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 n) {\n"
+            "    while (i < n && i < 4) { i += 1; a[i] = 9; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(0, 100); }\n");
+        break;
+    case VP_AND_IF_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 n) {\n"
+            "    if (i < n && i < 4) { a[i] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
+        break;
+    case VP_AND_RHS_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i) {\n"
+            "    if (i < 4 && a[i] == 0) { return 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1); }\n");
+        break;
+    case VP_AND_WHILE_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 n) {\n"
+            "    u32 k = 0;\n"
+            "    while (k < n && k < 4) { a[k] = 1; k += 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(2); }\n");
+        break;
+    case VP_AND_FOR_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 n) {\n"
+            "    for (u32 j = 0; j < n && j < 4; j += 1) { a[j] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(2); }\n");
+        break;
+    case VP_OR_GUARD_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 j) {\n"
+            "    if (i >= 4 || j >= 4) { return 0; }\n"
+            "    a[i] = 1; a[j] = 2;\n"
+            "    return 1;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
+        break;
+    case VP_NOT_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i) {\n"
+            "    if (!(i >= 4)) { a[i] = 5; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1); }\n");
+        break;
+    case VP_LOOP_BOUND_RANGE_OK:
+        snprintf(buf, n,
+            "u32[512] a;\n"
+            "u32 f(u32 n) {\n"
+            "    if (n >= 511) { return 0; }\n"
+            "    for (u32 i = 0; i < n; i += 1) { a[i] = 1; }\n"
+            "    return 1;\n}\n"
+            "u32 main() { return f(5); }\n");
         break;
     case VP_FOR_BODY_OK:
         snprintf(buf, n,

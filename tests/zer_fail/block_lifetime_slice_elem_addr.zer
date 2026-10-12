@@ -1,0 +1,7 @@
+// expect-error: would keep pointing at 'x' after 'x' dies
+// BUG-1570: &s[0] through a slice local aimed at an inner block's array
+struct W { u32[2] a; }
+u32 main() { u32 g = 1; *u32 q = &g;
+  { W x; x.a[0] = 7; [*]u32 s = x.a; q = &s[0]; }
+  { W x; x.a[0] = 100; }
+  return *q; }

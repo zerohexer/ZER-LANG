@@ -15,6 +15,10 @@ Two comment forms, exactly as in C: `//` runs to the end of the line, and
 `*/` ends the comment, so commenting out a region that already contains a
 `/* */` comment leaves its tail as code. Use `//` on each line, or
 `comptime if (0) { ... }` (which still has to parse), to disable a region.
+A `/*` with no closing `*/` is a compile error ("unterminated block comment"),
+as in C — it does not silently turn the rest of the file into a comment. A source
+file may not contain a NUL byte (everything after one would be ignored), so the
+compiler refuses such a file outright.
 
 ```zer
 // a line comment
@@ -234,7 +238,9 @@ u32 main() {
 
 **DESCRIPTION**
 Integer literals are decimal, hexadecimal (`0x`), or binary (`0b`); `_` digit
-separators are ignored anywhere after the first digit. There is **no octal**:
+separators are ignored anywhere after the first digit of the NUMBER — `1_000`,
+`0x4002_0014` and a trailing `1_` are fine, but `0x_FF` is an error ("expected hex
+digit after '0x'": the prefix must be followed by a digit). There is **no octal**:
 `0o17` is a syntax error, and a leading zero is just decimal (`017` is
 seventeen, not fifteen as in C). A bare integer literal is `u32`; a literal too
 big for 32 bits (`0x1_0000_0000`) initialises a `u64` fine.
@@ -244,7 +250,9 @@ implicitly; it does not convert to a signed type (`i8 c = 'A';` is an error).
 Escapes, shared with string literals: `\n \t \r \\ \0 \xHH`, plus `\'` in a
 character and `\"` in a string. Any other escape is a compile error (`'\q'` is
 "invalid escape sequence in character literal"; in a string, "invalid escape
-sequence in string").
+sequence in string"). A string literal MAY span lines: a raw line break inside the
+quotes is part of the string (one `\n` byte; a CRLF file contributes `\r\n`), so
+`"ab` + newline + `cd"` has `.len` 5.
 
 **EXAMPLE**
 ```zer
@@ -894,6 +902,10 @@ a.kind;              // COMPILE ERROR — use after move
 - Copying a struct that CONTAINS a move struct, a pointer or a Handle out of a
   dereference (`H copy = *hp;`) is refused — the copy would be a second owner the
   compiler cannot tie back. Read the fields you need (`u32 v = hp.v;`) instead.
+- A move struct cannot be MOVED OUT of a global or a `static` (BUG-1572): a global
+  has no single owner, so `consume(g); consume(g);` or `Token b = g; Token c = g;`
+  would move it twice. Keep the global as the owner and pass `&g` (a borrow); moving
+  a fresh value INTO the global (`g = { .kind = 1 };`) is fine.
 
 **SEE ALSO**
 struct, shared struct
@@ -910,6 +922,9 @@ Switch on enum must be exhaustive — missing a variant is a compile error.
 ```zer
 enum State { idle, running, blocked, done }
 ```
+The commas between variants are optional (`enum E { a b c }` parses), a trailing
+comma is fine, and an enum must have at least one variant — `enum E { }` is a compile
+error (it would have no value to hold).
 
 **EXAMPLE**
 ```zer
@@ -1102,7 +1117,9 @@ void greet([*]u8 name) {
 **DECLARATION ORDER, PROTOTYPES, RECURSION**
 - A function may be called before its definition — there are no forward
   declarations to maintain. A bodyless prototype (`u32 f(u32 x);`) is also
-  accepted and is harmless; a bodyless declaration with NO definition anywhere
+  accepted and is harmless as long as it AGREES with the definition — the parameter
+  types, their count and the return type must be the same, or the definition is a
+  compile error (BUG-1584; `keep` may differ, it is inferred); a bodyless declaration with NO definition anywhere
   is an extern (a C function — see cinclude / Variadic).
 - Functions cannot be nested inside other functions, and there are no closures:
   pass a function pointer plus a context pointer (`*opaque`) the C way.
@@ -1526,7 +1543,10 @@ static void helper() { }    // not exported
   `static u32 b = l;` naming a local (or a call, or a mutable global) is refused
   (BUG-1213); initialise it to a constant and assign on first use.
 - Globals may be used above their declaration (BUG-1214) — every top-level name is
-  visible to every function in the file.
+  visible to every function in the file. The exception is a TYPE position: a constant
+  used as an array size, a `Pool` / `Ring` / `Semaphore` count or a `comptime` call in
+  one (`u8[N] buf;`, `Pool(T, N) p;`) must be declared ABOVE that use — types are
+  resolved in declaration order ("undefined identifier 'N'").
 
 ---
 
@@ -1672,7 +1692,13 @@ u32 main() {
 ```
 
 **NOTES**
-- Collection must be a variable or field access — function calls rejected at parse time.
+- The collection must be a variable or a FIELD PATH of one (`buf`, `o.items`,
+  `o.inner.items`). A call, an element (`hs[k].s`) or any other expression is a parse
+  error — the loop reads the collection again at every iteration, so it must be a
+  place with no side effect that cannot change which object it names (BUG-1581: `for
+  (x in pick().a)` used to call `pick()` once per iteration). Assign it to a local first.
+- The length is read once, before the first iteration; every element access is
+  bounds-checked against the live slice.
 - Desugars to indexed for loop with bounds-checked access.
 
 ---
@@ -1725,6 +1751,10 @@ void dispatch(State state, u32 code, bool ready) {
   undeclared names): unwrap first, `if (x) |u| { switch (u) { ... } }`.
 - An arm body may be a single expression terminated by a comma instead of a
   `{ }` block: `0 => note(),`.
+- An integer arm value may be any expression of the operand's type, evaluated at
+  run time in arm order — the FIRST arm that matches runs (`y => { }` with a
+  variable `y` is legal). Two CONSTANT arm values that are equal are a compile
+  error ("duplicate switch arm value"): the later arm could never run.
 - Switching on a `?Enum` with enum-dot arms is allowed; when the
   optional is **null, no arm runs** and control continues after the switch.
 
@@ -2389,7 +2419,9 @@ Pool(Task, 8) tasks;       // 8 slots for Task, global only
 - `.alloc_ptr()` → `?*T` — Allocate a slot (pointer). Returns null if all slots used.
 - `.get(h)` → `*T` — Access by handle. Traps if gen mismatch.
 - `.free(h)` → `void` — Free slot by handle, increment generation.
-- `.free_ptr(p)` → `void` — Free slot by pointer.
+- `.free_ptr(p)` → `void` — Free slot by pointer. The pointer must be a slot start
+  this pool handed out and still in use; anything else traps at run time (a double
+  free, a foreign or interior pointer). Before BUG-1576 it never freed the slot.
 
 A RECYCLED slot is zeroed before it is handed back, so the auto-zero guarantee
 holds for the second and every later allocation of a slot, not only the first.
@@ -2780,7 +2812,11 @@ u32 main() {
   and one handler only — two handlers could preempt each other mid-update. The same
   rule covers `Pool`, `Slab` and `Arena` (and `Slab` / `alloc` are refused inside an
   interrupt handler anyway).
-- A spawned thread may not use a global Ring at all; wrap it in a `shared struct`.
+- A spawned thread may not use a global Ring at all (its head / tail / count are
+  plain fields, so two threads would corrupt them), and a Ring cannot be a field of
+  a `shared struct` either (no Pool / Ring / Slab / Arena can). To pass data between
+  threads, put a plain array plus its indices in a `shared struct` (every access is
+  auto-locked), or use `@atomic_*` on the indices.
 - The element type cannot be a unique resource — `Arena`, `Pool`, `Slab`, `Ring`,
   `Barrier`, `Semaphore`, an async task, or an aggregate carrying one. A Ring copies
   elements in and out by value, and a copy of those is a second owner of one state.
@@ -2854,8 +2890,9 @@ the call: inside the callee the pointer dangles from the reset on.
 
 **METHODS**
 - `Arena.over(buf)` → `Arena` — Create arena over an array or slice.
-- `.alloc(T)` → `?*T` — Allocate one T (aligned). T must be struct/enum name.
-- `.alloc_slice(T, n)` → `?[*]T` — Allocate n elements. T must be struct/enum name.
+- `.alloc(T)` → `?*T` — Allocate one T (aligned). T is a struct / enum / union name,
+  a primitive keyword (`u32`) or a container stamp (`Box(u32)`).
+- `.alloc_slice(T, n)` → `?[*]T` — Allocate n elements of any of those types.
 - `.reset()` → `void` — Reset offset to 0 (frees everything).
 - `.unsafe_reset()` → `void` — Reset without warning.
 
@@ -4370,7 +4407,9 @@ u32 main() {
 `(Name)expr` is parsed as the parenthesised expression `(Name)` followed by
 `expr`, because `(x)` has to keep meaning "the variable x". Only these start a
 cast: the primitive keywords (`u8`..`u64`, `i8`..`i64`, `usize`, `f32`, `f64`,
-`bool`, `void`, `opaque`), `?`, `const`, `volatile`, and `*`. So a POINTER to a
+`bool`, `void`, `opaque`), `?`, `const`, `volatile`, and `*`. (`(?T)x` parses as a
+cast but is always refused — "invalid cast from 'u32' to '?u32'": a `T` already
+converts to `?T` implicitly, so write `?u32 o = x;`.) So a POINTER to a
 user type works and a bare user type does not:
 
 ```zer
@@ -4410,6 +4449,12 @@ void demo() {
     bool swapped = @atomic_cas(&lock, 0, 1);
 }
 ```
+
+Every VALUE operand (the stored value, the operand of an arithmetic atomic, the
+expected and desired values of a cas) flows into the CELL like an assignment does
+(BUG-1586): `@atomic_store(&u16cell, some_u32)`, a negative constant into an
+unsigned cell, a float or a pointer are compile errors — convert explicitly
+(`@truncate(u16, x)`). A literal that fits the cell is fine.
 
 ---
 
@@ -4895,7 +4940,9 @@ naked void idle() {
 Operands are written in the STRUCTURED form below. The GCC-style inline
 `asm("mov %0, %1" : "=r"(out) : "r"(in))` is a compile error: its operands are raw
 text, so the race, lock, lifetime and move analyses could not see the ZER values
-they name.
+they name. The inline form's argument must be ONLY string literals (adjacent ones
+concatenate, `asm("nop\n" "nop")`): no comments, names or colons between them
+(BUG-1580 — a `/* " */` comment used to hide the operand list from the check).
 
 **STRUCTURED FORM**
 Besides the GCC-style string, a structured `asm { }` block names every operand
@@ -5192,7 +5239,7 @@ they are checked but cannot be built without that library.
 <!-- audit: compile-only: needs the C library's sensor.h -->
 ```zer
 cinclude "sensor.h";
-*opaque sensor_open(const [*]u8 path);
+*opaque sensor_open(const *u8 path);   // a string literal coerces to `const *u8`
 void sensor_close(*opaque dev);
 u32 sensor_read(*opaque dev);
 
@@ -5247,10 +5294,54 @@ read-modify-write of it must be done inside `@critical` or with `@atomic_*` (see
 | `shared struct` | Data race prevention | Auto-lock (recursive pthread_mutex) |
 | `spawn` checker | Thread creation safety | Compile-time arg validation |
 
+**How `*opaque` crosses into C (BUG-1594).** Inside ZER an `*opaque` is a tagged value
+`{ptr, type_id}` (the runtime half of provenance); in C it is a `void *`. For a C function
+declared in ZER (a bodyless declaration no module defines), every `*opaque` / `?*opaque`
+parameter and return is passed as `void *` — so the header above may declare
+`void *sensor_open(const char *path); uint32_t sensor_read(void *dev);` exactly as C does,
+and a separately compiled `.c` file works too. A value coming back from C has unknown
+provenance (type_id 0), which `@ptrcast` accepts. Two rules follow: a C function with an
+`*opaque` parameter cannot be variadic, and its ADDRESS cannot be taken into a ZER function
+pointer (the C function's signature uses `void *`) — wrap it in a ZER function instead.
+A slice parameter (`[*]u8`) is a `{ptr, len}` struct C cannot spell: declare a C function's
+string parameter as `const *u8` (a string literal or `s.ptr` passes to it).
+
 **What ZER cannot protect:** C library internal bugs. If the C library itself has data races or UAF in its own code, ZER can't fix that — same boundary as Rust's `unsafe extern`.
 
 **SEE ALSO**
 import, *opaque
+
+---
+
+### Standard library (`lib/`)
+
+The repository ships three modules: `str.zer` (byte-slice helpers), `fmt.zer` (printing,
+imports `str`) and `io.zer` (files through libc, hosted only). Imports resolve from the
+ENTRY file's directory, so copy `lib/*.zer` and `lib/zer_helpers.h` next to your program.
+`make check` builds and runs a program importing all three (`tests/test_lib.sh`).
+
+| module | functions |
+|---|---|
+| `str` | `bytes_equal`, `bytes_equal_ci`, `bytes_compare`, `bytes_find`, `bytes_find_last`, `bytes_find_byte`, `bytes_contains`, `bytes_starts_with`, `bytes_ends_with`, `bytes_copy`, `bytes_fill`, `bytes_zero`, `bytes_trim_left`, `bytes_trim_right`, `bytes_trim`, `u8_is_space` / `_alpha` / `_digit` / `_alnum` / `_hex` / `_upper` / `_lower`, `u8_to_lower`, `u8_to_upper`, `parse_u64`, `parse_i64`, `fmt_u64`, `fmt_i64`, `fmt_hex` |
+| `fmt` | `print`, `println`, `print_char`, `print_nl`, `print_u64` / `_u32` / `_i64` / `_i32` / `_usize`, `print_hex`, `print_hex_prefix`, `print_bool`, `eprint`, `eprintln`, `print_kv`, `print_kv_u32`, `print_progress` |
+| `io` | `io_open` (returns `?*opaque`), `io_close`, `io_read`, `io_write`, `io_writeln`, `io_read_file_buf` (into a caller buffer, returns the filled view), `io_write_file` |
+
+<!-- audit: skip -->
+```zer
+import fmt;
+import io;
+import str;
+u8[64] buf;
+u32 main() {
+    println("hello");                       // stdout
+    print_u32(42); print_nl();
+    if (!io_write_file("out.txt", "data")) { return 1; }
+    if (io_read_file_buf("out.txt", buf)) |s| {
+        if (!bytes_equal(s, "data")) { return 2; }
+    }
+    return 0;
+}
+```
 
 ---
 
@@ -5770,18 +5861,22 @@ though its value would be 0).
 
 ### Bitwise
 `&  |  ^  ~  <<  >>` — Shift by >= width OR < 0 returns 0 (defined).
-"Width" is the ZER width of the left operand, not its C carrier: `i5 x = -16;
-x >> 5` is 0 even though an `i5` is stored in an 8-bit carrier (BUG-1065).
 This covers negative shift counts too: a signed count that is negative
 (e.g. `i32 n = -1; x << n`) returns 0 rather than falling into C
 undefined behavior.
 
 **The width is the RESULT type's, and a shift does not promote.** The result of
 `a << n` has the common type of `a` and `n` (a literal count takes `a`'s type),
-exactly like `+`; there is no C-style promotion to `int`. So `u8 a = 200;
-u32 x = a << 4;` is a u8 shift — 3200 wraps to 128 — and `a << 8` is 0, where C
-would give 3200 and 51200. Widen first when you want the wide result:
-`u32 x = (u32)a << 4;` is 3200. The same rule folds at file scope: a global
+exactly like `+`; there is no C-style promotion to `int`. The left operand is
+converted to that type FIRST, and "width" is that type's ZER width, not its C
+carrier (`i5 x = -16; x >> 5` is 0 although an `i5` is stored in 8 bits). So
+`u8 a = 200; u32 x = a << 4;` is a u8 shift — 3200 wraps to 128 — and `a << 8`
+is 0, where C would give 3200 and 51200. Widen first when you want the wide
+result: `u32 x = (u32)a << 4;` is 3200. A count of a WIDER type widens the shift
+the same way: with `u8 b = 255; u32 n = 8;`, `b << n` is a u32 shift (65280), and
+with `u32 c; u64 m;`, `c << m` is a u64 shift — `0xFFFFFFFF << (u64)4` is
+`0xFFFFFFFF0` (BUG-1577: the emitted C used to shift in 32 bits while the
+compiler's own constant folding used 64). The same rule folds at file scope: a global
 `const u32 S = B << 4;` with `const u8 B = 200;` is 128, and a constant count at
 or beyond the width (`const u32 Z = 1 << 200;`) folds to 0.
 
@@ -5811,12 +5906,35 @@ OPTIONAL is rejected too — see `?T` above; only `opt == null` is allowed.
 `&&  ||  !` — Short-circuit evaluation.
 
 The RIGHT operand of `&&` / `||` runs only when the left permits it, and the
-bounds checker knows that: `if (i < 4 && a[i] > 0)` — the canonical guarded
-access — compiles. The index is not PROVEN in range there (range narrowing does
-not yet flow across a short-circuit), so it carries a runtime auto-guard rather
-than being elided; write the guard as a nested `if` to get the check for free.
-Putting the access on the LEFT (`a[i] > 0 && i < 4`) runs it unconditionally and
-is still a hard error when the index is provably out of range.
+bounds checker knows that: in `if (i < 4 && a[i] > 0)` — the canonical guarded
+access — `a[i]` is PROVEN in range (no runtime check), because the right operand
+of `&&` is checked under "the left is true" and that of `||` under "the left is
+false". The same facts narrow the BODY of an `if`, `while` or `for` (BUG-1566):
+`if (i < n && i < 4) { a[i] }`, `while (k < len && k < 8) { buf[k] = 0; k += 1; }`,
+`if (!(i >= 4)) { a[i] }`, and the guard `if (i >= 4 || j >= 4) { return; }`
+proves both `a[i]` and `a[j]` after it. Facts are taken only from a condition with
+no side effect (no call, no assignment): in `if (i < 4 && (i = 9) > 0)` the left
+fact is stale by the time the body runs. Putting the access on the LEFT
+(`a[i] > 0 && i < 4`) runs it unconditionally and is still a hard error when the
+index is provably out of range.
+
+`!` also accepts an INTEGER operand: `!x` is `x == 0` and yields a `bool`. `&&` and
+`||` do not — their operands must be `bool`.
+
+```zer
+u32[8] buf;
+u32 fill(u32 len) {
+    u32 k = 0;
+    while (k < len && k < 8) { buf[k] = 1; k += 1; }   // proven: no runtime check
+    if (k >= 8 || len == 0) { return 0; }
+    return buf[k - 1] + buf[k];                        // k - 1 is not proven: checked
+}
+u32 main() {
+    u32 n = 0;
+    if (!n) { n = fill(3); }     // `!` on an integer: n == 0
+    return n - 1;                 // fill(3) = buf[2] + buf[3] = 1 + 0
+}
+```
 
 ### Assignment
 `=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=`
@@ -6207,6 +6325,19 @@ u32 main() {
 With two scoped threads live, one `join` does not close the window — the other thread is
 still running.
 
+A fire-and-forget spawn opens the window for the rest of the function, and it does not
+have to be written there (BUG-1589): a call to a function that spawns one (directly or in
+any callee) opens it after the call, a loop whose body spawns one is concurrent from its
+first statement (the next iteration runs after the spawn), and a label is concurrent if a
+spawn anywhere in the function can reach it through a backward `goto`. A helper that
+spawns and JOINS before returning opens nothing. Bit-slice writes count as plain
+accesses (`g[3..0] = 1` rewrites the whole word, BUG-1588).
+
+The single-word `volatile` flag a thread may STORE without atomics (the flag idiom) has
+the matching rule on the spawner's side (BUG-1591): inside the window, the spawner may
+store or read it, but not READ-MODIFY-WRITE it (`vg |= 2`, `vg += 1`, `vg[3..0] = 1`) —
+the write-back can erase the thread's store. Use `@atomic_*` on it, or join first.
+
 ### An out-of-bounds access inside `@critical` TRAPS
 
 The auto-guard normally returns early. Inside `@critical` an early `return` would
@@ -6474,6 +6605,10 @@ u32 main() {
   races. A pointer to another `shared struct` is allowed (that one locks itself),
   and so is a function pointer, and a top-level `*opaque` C-library handle (see
   "Safe C Library Interop").
+- A shared struct cannot be OVERWRITTEN as a whole (`g = { .value = 5 };`), and
+  neither can anything that CONTAINS one — a struct with a shared-struct field, an
+  array of them, a union variant (BUG-1587): `outer = { .z = 1 };` would zero the
+  embedded mutex while another thread may hold it. Assign the other fields one by one.
 
 ### shared(rw) struct — Reader-Writer Lock
 ```zer

@@ -1,0 +1,14 @@
+// BUG-1586 boundary: fitting literals and widening operands.
+u16 g16;
+u64 g64;
+u8 g8;
+u32 main() {
+    u8 small = 3;
+    @atomic_add(&g16, 1);
+    @atomic_add(&g64, small);
+    @atomic_or(&g8, 255);
+    @atomic_store(&g16, 65535);
+    bool ok = @atomic_cas(&g16, 65535, 7);
+    if (!ok) { return 1; }
+    return (u32)@atomic_load(&g16) + (u32)@atomic_load(&g64) + (u32)g8 - 265;
+}

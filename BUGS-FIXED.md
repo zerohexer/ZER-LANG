@@ -5,6 +5,158 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-10-12 — BUG-1566..1596: five-area audit (escape, allocation tracker, values, concurrency, language surface), the library made to build, `*opaque` at the C boundary
+
+No unconsumed audit branch remained: `loving-bohr-u1sijc`, `zerohexer/review/28092026`,
+`loving-bohr-7nox2h`, `-jyw9if`, `-qzn39v` and `review/25092026` are all in main under
+rebased SHAs (their BUG numbers are in this file). Five probe agents, each in its own scratch
+build, plus own probes. Every fix was A/B-measured against a HEAD build (`/tmp/.../base/zerc`);
+every new negative is ACCEPTED by it.
+
+**Escape / lifetime**
+- **BUG-1568 — a local or parameter NAMED LIKE A GLOBAL was program storage to every frame
+  sink.** ~48 sites asked `global_decl_lookup(c, name) != NULL` ("does a global of this name
+  exist?") instead of "does the name resolve to it?". `u32 x = 1; *u32 f() { u32 x = 7; return
+  &x; }` compiled (ASan stack-use-after-return), and the same at the global-store, keep-call,
+  struct-literal, Ring-push, async-init and array-to-slice sinks, and across modules (an
+  imported module's global name was enough). The reverse over-rejected `?*u32 q` (a local
+  shadowing a global `q`) receiving `&local`. One query `name_is_global_here` (the name's
+  resolution in the current scope chain must BE the global's symbol) at every boolean site of
+  the checked function's own scope; whole-program scans keep the name lookup (their current
+  scope is not the scanned body's). Gate: SHAPE p70 in `tools/sink_matrix.sh` (9 mismatches
+  pre-fix). Tests: 7 `tests/zer_fail/escape_shadow_global_*.zer`, `test_modules/m1568_*`.
+- **BUG-1569 — a SHADOWING declaration re-aimed a borrow root recorded by NAME.** `*u32 r =
+  &v; { static u32 v; spawn w(r); *r2 += 1; }` lent the static (lends nothing) and the parent's
+  write raced the thread (TSan); the block-lifetime rule read the static as program storage.
+  `name_is_shadowed_here`: an ambiguous lent name is refused at the spawn, any visible lent
+  declaration counts at the write-through check, and the block rule treats the carrier as its
+  own bound. Tests: `spawn_borrow_static_shadow_{lend,write}`, `block_lifetime_static_shadow_root`.
+- **BUG-1570 — three block-lifetime spellings (BUG-1554) went unseen:** `q = &s[0]` through a
+  slice local aimed at an inner array (`through_ref_block_local`), `q = wp.p` through a pointer
+  with two recorded roots (ambiguous now bounds by the pointer's own block), and an async
+  `_init(&t, &x)` into an outer-block task (the BUG-1554 comparison with the task as the
+  destination). All three returned a sibling block's value (exit 100/101). Gate: SHAPE p71.
+
+**Allocation tracker**
+- **BUG-1571 — a callee freeing a FIELD of a GLOBAL aggregate argument** (`consume(g)`,
+  `consume(&g)`, `consume(ga[1])`) was invisible: the field widening and the BUG-1521 transfer
+  required `rl >= 0` and a global root is `IR_GLOBAL_ROOT_ID`. Exit 99 (recycled slot), and a
+  second `rel(gs)` freed a live slot so two later allocations aliased. `ir_path_is_under` adds
+  the projection boundary (`g` must not match `gx.p`). Tests: `callee_frees_global_field_*`.
+- **BUG-1572 — a `move struct` moved OUT of a global (or static)** — `consume(g); consume(g);`,
+  `Tok b = g; Tok c = g;` — was untracked (transfers are keyed on locals). Refused at all eight
+  value-flow sinks through `reject_unique_resource_copy` (Rust refuses a move out of a static).
+  Corpus cost: zero. Tests: `move_out_of_global_*`, positive `move_global_owner_by_pointer_ok`.
+- **BUG-1573 — an async body freeing a FIELD of its param** (`async void rel(H h) { yield;
+  free(h.p); }`): `_init` carried only the bare handle and `_poll` applied only bare-param frees.
+  `_init` now carries the argument's field entries and `_poll` applies `frees_param_field`
+  (exit 99 / double free before). Tests: `async_frees_param_field_*`.
+- **BUG-1574 — `free(call(...))` whose result names several params or a field of a by-value
+  struct param** (`free(pick(a, b, c))`, `free(getq(h))`) was attributed to nothing.
+  `ir_free_of_unresolved_call`: the argument-precise barrier — every allocation a candidate
+  argument carries becomes MAYBE_FREED (check first, then mark: `pick(a, a)` names one
+  allocation twice). Tests: `free_unresolved_call_result_*`.
+- **BUG-1575 — a call result stored into a GLOBAL** (`g = id(a)`, `gs.p = id(a)`, `garr[1] =
+  …`, `g = mb(a)`, `gs = { .p = id(a) }`) registered no alias, and a multi-candidate one (`g =
+  pick(a, b, c)`, `g = getq(h)`, `z = pick(…); g = z`) nothing at all: `free(a)` left the global
+  dangling unflagged (exit 99 from another function). The store source resolves through
+  `ir_resolve_returned_arg`; a multi-candidate value gives the global entry a VIEW set
+  (`gstore_views`) and the dangling-global checks consult it. Tests: `global_store_call_result_*`.
+- **BUG-1576 — `pool.free_ptr(p)` NEVER FREED.** Both emitter paths passed the bare slot index
+  as a handle — generation 0, the null-handle no-op — so a `Pool(T, 1)` handed out its slot
+  once (exit 7). New runtime `_zer_pool_free_ptr` (slot-start and in-use checked, traps
+  otherwise); `_zer_slab_free_ptr` traps on a slot not in use (the Handle path did since BUG-1270).
+  Test: `tests/zer/pool_free_ptr_releases_slot.zer`.
+- **BUG-1596 — a bare `orelse return` (null) made a param-view return look like a fresh
+  allocation** (`?[*]u8 f([*]u8 b) { x = op() orelse return; …; return b[0..n]; }`): every
+  caller got a false "never freed" (lib/io.zer's `io_read_file_buf` was unusable). A valueless
+  return is the null it returns. Guard: `view_return_bare_orelse_uaf` (the view still aliases).
+
+**Values / emitter**
+- **BUG-1577 — `u32 << u64` was typed u64 by the checker and FOLDED at 64 bits, but the emitted
+  C shifted the u32 in 32 bits** (C applies no usual conversions to `<<`): `((A << M) >> 33) ^ 7`
+  was proven 0 and ran as 7 — the bounds check was elided (ASan global-buffer-overflow). A
+  shift now converts its operand to the RESULT (common) type first and uses that width, in both
+  emitter paths and the typed fold (also `u8 << u32`: 65280, not 0). reference.md's Bitwise
+  section contradicted itself on this and now states one rule.
+- **BUG-1578 — a bit-slice write of a constant folding negative / differently untyped**
+  (`a[3..0] = 0 - 16`, `b[0..0] = (0 - 1) / 1073741824`) was silently cut: the guard used the
+  untyped fold and skipped negatives. Typed fold now.
+- **BUG-1579 — uN/iN FIELDS of a GLOBAL struct initializer were neither folded nor wrapped**
+  (`.b = C3 * 3` on a `u3` held 21). Folded and wrapped like a scalar global.
+- **BUG-1583 — a raw newline in a string literal** (the lexer allows multi-line strings) was
+  copied into the C literal; escaped now.
+- **BUG-1595 — `const *opaque` was spelled `const _zer_opaque`**, making every IR temp of the
+  type a const object that was then assigned (GCC error).
+
+**Concurrency**
+- **BUG-1586 — `@atomic_*` VALUE operands were never typed against the cell**: silent
+  narrowing, negative into unsigned, float-to-int UB (exit 112 at -O0, 111 at -O2), a pointer
+  added to an integer. They flow into the cell through `value_flows_to`. Corpus cost zero.
+- **BUG-1587 — overwriting a struct that EMBEDS a shared struct** (`go = { .z = i }`, an array
+  element, through a pointer, a function result) zeroed a held mutex (glibc assertion abort
+  3/3). `type_embeds_shared_struct` replaces the top-level-only test.
+- **BUG-1588 — a bit-slice WRITE to an atomic cell** (`g[3..0] = 1`) was not a plain access.
+- **BUG-1589 — the atomic-cell concurrent window was lexical, per function**: a spawn inside a
+  called helper, in a loop body (the next iteration) or reached by a backward goto opened
+  nothing (lost updates 3/3). New FuncProps `can_detach` (a fire-and-forget spawn, transitive):
+  a call to such a function opens the window, so does a loop / label whose subtree can detach.
+  A helper that spawns and joins opens nothing.
+- **BUG-1590 — Pool / Ring / Semaphore capacities past u32 were truncated mod 2^32**
+  (`(int)val` before the positivity test).
+- **BUG-1591 — the spawner's read-modify-write of a `volatile` flag a thread stores** (`vg |=
+  2` in the window) erased the thread's stores (27/2000 at -O2); the mirror and the ISR form
+  were refused. Recorded both halves; a post pass refuses the intersection.
+
+**Language surface**
+- **BUG-1566 — a CONJUNCTION narrowed nothing.** `if (i < n && i < 4) { a[i] }`, `while (k <
+  len && k < 8)`, the RHS of `&&` / `||`, `!(i >= 4)` and the guard `if (i >= 4 || j >= 4) {
+  return; }` all carried auto-guards (and warnings telling the user to add the test they had
+  written). `vrp_push_cond_facts` (conjuncts true / disjuncts false / `!` flips), taken only from
+  an EFFECT-FREE condition: the first draft proved `a[9]` from `if (i < 4 && (i = 9) > 0)`.
+  Gate: 11 cells in `tests/test_vrp_position_matrix.c` (6 PROVEN cells over-reject pre-fix).
+- **BUG-1567 — a loop bound VARIABLE with a known range** (`if (n >= 511) return; for (i < n)`)
+  proved nothing (only a single-valued range counted); its maximum bounds the counter.
+- **BUG-1580 — a C comment in inline `asm("...")` hid the operand colons** from the BUG-1297
+  raw-text check (`asm("movl $99, %0" /* " */ : "=r"(s.a[4]) /* " */)` wrote past the array,
+  exit 99). The text must be string literals only.
+- **BUG-1581 — range-for re-evaluated the collection's OBJECT per iteration** (`pick().a` called
+  pick n+1 times; the shared AST sub-node anti-pattern). Only a variable or a field path of one;
+  deep-cloned.
+- **BUG-1582 — an unterminated `/*` or a NUL byte silently ended the file.** Both are errors.
+- **BUG-1584 — a prototype disagreeing with its definition** reached GCC ("conflicting types").
+- **BUG-1585 — an empty enum** bypassed the zero-variant rule (`(u32)s.e` read 0 of a type with
+  no values).
+- **BUG-1592 — duplicate constant switch arms** were accepted (the later arm dead).
+- **BUG-1597 — an allocation used only as a TEMPORARY** (`(alloc(T) orelse return).v = 3;`,
+  `(alloc(u8, 4) orelse return)[0]`) was never registered — a guaranteed leak, silent. Refused
+  at the projection (limitations.md 2026-10-10 #6, half).
+- **BUG-1598 — a top-level function whose return type starts with `const` / `volatile`**
+  (`volatile *R reg() { ... }`, `const *Cfg cfg()`) was parsed as a global variable ("expected ';'
+  after variable declaration"). The lookahead now speculatively parses the TYPE
+  (`qualified_toplevel_is_func`) and checks for `name (`, so every qualified return type works.
+- **BUG-1599 — a function returning `@inttoptr(...)` was a false leak at every caller**
+  ("handle 'r' allocated … never freed"): the result was registered as a fresh allocation because
+  `ir_is_content_return_expr` knew only field/index/null. An `@inttoptr` result names a fixed
+  address — it is now a content return (leak suppressed, still registered for UAF).
+  Test: `tests/zer/mmio_accessor_qualified_return.zer` (fails to parse on the base compiler).
+
+**The library and the C boundary**
+- **lib/ did not build** (limitations.md OPEN since 2026-09-25): `fmt.zer` now imports `str`,
+  `io.zer` declares `fputc` and keeps its NUL-terminated copies in static buffers (a stack buffer
+  handed to `fopen` made the returned FILE* frame-bound), `[]T` spellings updated.
+- **BUG-1593 — an extern C function declared in an imported module was emitted with the module
+  prefix** (`io__fopen`, `fmt__fputc`), so it could never link. Once every module is checked, a
+  bodyless function no module defines drops its prefix (`unprefix_c_externs`).
+- **BUG-1594 — `*opaque` crossed the C boundary as the 16-byte `_zer_opaque` struct**: an
+  `*opaque` parameter shifted every later argument (C read the type_id as the next one, exit
+  104) and an `*opaque` RETURN carried a type_id of register residue (the 4z36e0 OPEN entry). A
+  C extern's prototype spells `void *` there and a static inline wrapper (selected by a
+  function-like macro, so both emitter paths are covered) converts — `.ptr` in, `{ptr, 0}` out.
+  With a C header included, the header declares the function and the bridge emits no prototype.
+- Gate: `tests/test_lib.sh` in `make check` — builds every module of `lib/` and runs a program
+  importing all three (fails against the pre-session compiler).
+
 ## Session 2026-10-10 — BUG-1511..1537: five-area audit (allocation tracker, bounds/escape, emitter values, concurrency/bare metal, crash/reference) + own probes
 
 No unconsumed audit branch remained (every `claude/*` / `review/*` branch is patch-equivalent

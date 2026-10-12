@@ -1,0 +1,13 @@
+// BUG-1573 boundary: a task that frees its param's field, polled to completion.
+struct T { u32 v; }
+struct H { *T p; }
+async u32 rel(H h) { u32 r = h.p.v; yield; free(h.p); return r; }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    H h = { .p = a };
+    _zer_async_rel task;
+    _zer_async_rel_init(&task, h);
+    while (_zer_async_rel_poll(&task) == 0) { }
+    return _zer_async_rel_result(&task) - 7;
+}

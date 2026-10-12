@@ -1,0 +1,7 @@
+// expect-error: cannot push a local-derived pointer through Ring
+// BUG-1568: a local / param sharing a GLOBAL name was program storage to the escape sinks.
+struct M { *u32 p; }
+Ring(M, 4) rq;
+u32 x = 1;
+void f() { u32 x = 7; M m = { .p = &x }; rq.push(m); }
+u32 main() { f(); return 0; }

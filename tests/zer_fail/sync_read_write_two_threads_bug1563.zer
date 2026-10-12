@@ -1,0 +1,6 @@
+// expect-error: no common lock and no release/acquire flag
+u32 g;
+u32 flag;
+void wr() { g = 5; @atomic_store(&flag, 1); }
+void rd() { u32 x = g; @atomic_store(&flag, 2); }
+u32 main() { ThreadHandle a = spawn wr(); ThreadHandle b = spawn rd(); a.join(); b.join(); return 0; }

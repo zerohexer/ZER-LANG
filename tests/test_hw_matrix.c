@@ -341,6 +341,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_GLOBAL_CARRIER_LIT,
                RFORM_SPLIT_CALLS, RFORM_SPLIT_CALLS_INLINE,
                RFORM_SPLIT_READ_CALL, RFORM_SPLIT_WRITE_CALL,
+               RFORM_SPLIT_CALL_PTR_STORE, RFORM_SPLIT_CALL_FORWARD,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -404,6 +405,8 @@ static const char *rform_name(RForm f) {
     case RFORM_SPLIT_CALLS_INLINE:  return "calls wr(rd()+1)";
     case RFORM_SPLIT_READ_CALL:     return "calls t=rd();g=t+1";
     case RFORM_SPLIT_WRITE_CALL:    return "calls t=g;wr(t+1)";
+    case RFORM_SPLIT_CALL_PTR_STORE: return "calls wr stores *gp";
+    case RFORM_SPLIT_CALL_FORWARD:  return "calls wr forwards v";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -520,6 +523,12 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     case RFORM_SPLIT_READ_CALL:    *helper = "u32 rd(){ u32 x = g; return x; }";
                                                                                  *body = "u32 t = rd(); g = t + 1;"; break;
     case RFORM_SPLIT_WRITE_CALL:   *helper = "void wr(u32 v){ u32 w = v; g = w; }";
+                                                                                 *body = "u32 t = g; wr(t + 1);"; break;
+    /* The write half one more step away: through a global pointer, and through
+     * a helper that only forwards its parameter to the real writer. */
+    case RFORM_SPLIT_CALL_PTR_STORE: *helper = "volatile *u32 gp = &g;\nu32 rd(){ return g; }\nvoid wr(u32 v){ *gp = v; }";
+                                                                                 *body = "u32 t = rd(); wr(t + 1);"; break;
+    case RFORM_SPLIT_CALL_FORWARD: *helper = "void wr2(u32 v){ g = v; }\nvoid wr(u32 v){ wr2(v); }";
                                                                                  *body = "u32 t = g; wr(t + 1);"; break;
     case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
                                                                                  *body = "*gh.p += 1;"; break;

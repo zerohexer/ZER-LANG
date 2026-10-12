@@ -1,4 +1,4 @@
-// expect-error: without holding the same lock
+// expect-error: no common lock and no release/acquire flag
 u32 la;
 u32 lb;
 u32 counter;

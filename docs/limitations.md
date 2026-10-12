@@ -32,20 +32,24 @@ repeated.
 
 ## OPEN — residuals of the 2026-10-10 audit (BUG-1511..1537; measured)
 
-1. **The atomic/barrier downgrade still trusts a READER.** BUG-1562 refuses two threads
-   WRITING one plain global without a common lock, which closes the measured lost-update
-   case. What stays a warning: a plain read in one thread against a plain write in
-   another, with any `@atomic_*` / `@barrier` present (the release/acquire flag idiom
-   looks identical to an unordered read). Two more limits of the BUG-1562 rule: the
-   parent's own writes inside the spawn..join window are not counted as a writer, and a
-   spawn inside a function called twice counts once (only a loop around the spawn
-   counts twice). The lock recogniser knows a spin `while` on `@atomic_cas` /
-   `@atomic_xchg` and a release `@atomic_store` / `@atomic_xchg` in one statement list.
-2. **The split RMW through CALLS (BUG-1561) follows** a callee's return of a global and
-   a parameter stored into a global, through locals, both flow-insensitively. Not
-   followed: a store through a pointer in the callee (`*gp = v`), a value passed through
-   another call's ARGUMENT and returned (`return id(g)`), and recursion (an in-progress
-   summary reads as empty).
+1. **What the atomic/barrier downgrade check (BUG-1562/1563) still trusts.** It refuses
+   any two thread instances touching one plain global (one writing) unless ONE lock or a
+   release/acquire hand-off orders them. The orderings it RECOGNISES are spelled in one
+   statement list: a lock is a spin `while` on `@atomic_cas` / `@atomic_xchg` up to its
+   `@atomic_store` / `@atomic_xchg` release; a hand-off is a write followed (later in the
+   list or an enclosing one) by any non-load atomic on the flag, and a read after a loop
+   that reads the flag atomically or inside `if (<atomic read of the flag>)`. It TRUSTS
+   that a recognised flag wait means the flag was set by the publishing write (a third
+   party setting the flag is not modelled). Instances it does not see: a fire-and-forget
+   thread against code that runs after the SPAWNING FUNCTION RETURNS (its callers), and an
+   access through a pointer handed to the thread (`&g` is not an access). A function with
+   no ZER caller counts as running once (a C caller is invisible).
+2. **The split RMW through CALLS (BUG-1561) follows** a callee's return of a global, a
+   parameter stored into a global directly, through a global pointer or a local pointer
+   aimed at it, or forwarded to another writer — through locals, flow-insensitively. Not
+   followed: a store through a pointer PARAMETER (`void wr(*u32 p, u32 v) { *p = v; }`,
+   which is `func_rmw_param_mask`'s question only for a compound op), and recursion that
+   relays the value only through itself (an in-progress summary reads as empty).
 3. **A helper called only from an interrupt handler counts as MAIN code** for the
    ISR-sharing rule: `void bump() { count = 5; } interrupt T { bump(); }` is refused
    "must be declared volatile" though main never touches `count` (over-rejection). Needs

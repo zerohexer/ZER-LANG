@@ -512,7 +512,9 @@ typedef struct {
      * WRITING the same plain global outside every lock they take. */
     struct SyncSpawnSite {
         Symbol *target;
-        bool repeated;        /* spawned inside a loop: two instances at least */
+        struct Node *spawn;   /* BUG-1563: the spawn node, for the parent window */
+        Symbol *encl;         /* the function containing the spawn */
+        bool repeated;        /* spawned in a loop, or its function may run twice */
         const char *file; const char *source;
         int line;
     } *sync_spawns;

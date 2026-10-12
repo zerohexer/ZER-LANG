@@ -1,0 +1,30 @@
+// BUG-1563 boundary: the release/acquire hand-off orders a plain write in one
+// thread before a plain read in another — both the wait-loop form and the
+// `if (@atomic_load(&F))` form. A thread joined before the next spawn does not
+// race it either.
+u32 data;
+u32 flag;
+u32 out;
+u32 seen;
+u32 cnt;
+u32 fl2;
+void writer() { data = 42; @atomic_store(&flag, 1); }
+void reader() {
+    while (@atomic_load(&flag) == 0) { }
+    out = data;
+    if (@atomic_load(&flag) == 1) { seen = data; }
+}
+void bump() { cnt += 1; @atomic_store(&fl2, 1); }
+u32 main() {
+    ThreadHandle tw = spawn writer();
+    ThreadHandle tr = spawn reader();
+    tw.join();
+    tr.join();
+    if (out != 42) { return 1; }
+    ThreadHandle a = spawn bump();
+    a.join();
+    ThreadHandle b = spawn bump();
+    b.join();
+    if (cnt != 2) { return 2; }
+    return 0;
+}

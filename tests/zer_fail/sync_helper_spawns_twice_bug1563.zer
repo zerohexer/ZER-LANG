@@ -1,0 +1,6 @@
+// expect-error: no common lock and no release/acquire flag
+u32 g;
+u32 flag;
+void w() { g += 1; @atomic_store(&flag, 1); }
+void start() { spawn w(); }
+u32 main() { start(); start(); return 0; }

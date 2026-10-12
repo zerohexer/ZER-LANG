@@ -230,6 +230,29 @@ A/B-measured against a HEAD build, and every new negative is ACCEPTED by it.
   one spawned in a loop) unless both hold the SAME lock. The exemption set is the race
   scan's own, extracted as `spawn_global_needs_sync`. Corpus cost 0. Tests: three
   negatives + `sync_downgrade_same_lock_ok_bug1562`.
+- **BUG-1561b — the split-RMW summary missed the write half one step away**: `wr` storing
+  through a global pointer (`*gp = v`) or a local pointer aimed at the global
+  (`volatile *u32 p = &g; *p = v;`), and a `wr` that only FORWARDS its parameter to the real
+  writer (`void wr(u32 v) { wr2(v); }`). `vf_assign` now follows a store through a pointer
+  with the shared `for_each_write_target` (a local aimed `&g` carries `g`), and a call
+  argument carrying parameter bits inherits the callee's store. Gate: two more spellings in
+  the RMW FORM grid (6 cells, all accepted by the previous build) + the
+  `split_rmw_calls_other_target_ok_bug1561b` boundary.
+- **BUG-1563 — the atomic/barrier downgrade check counted only WRITERS, only spawn sites,
+  and wrongly counted SEQUENTIAL ones.** Accepted before (TSan-class races): a plain read
+  in one thread against a write in another; the spawning code reading or writing the
+  global between the spawn and its `join()`; a helper that spawns, called twice. And
+  over-rejected: `a = spawn w(); a.join(); b = spawn w(); b.join();` (BUG-1562 counted it
+  as two concurrent writers). One walker `sync_walk` collects every plain read and write of
+  a thread instance with what orders it (the lock held, the flag WAITED on before, the flag
+  RELEASED after); the spawning function is walked in WINDOW mode from the spawn to the
+  join (`spawn_stmt.handle_name`), recording later spawns as sequential; a call-site census
+  (`census_walk` / `census_instances`) decides whether an enclosing function can run twice.
+  Two instances conflict unless ONE lock or a publish/acquire pair on one flag orders the
+  two accesses. Atomic cells are left to their own rule. Corpus cost 0. Gate: the
+  ATOMIC-DOWNGRADE grid in `tests/test_conc_matrix.c` (pair x ordering x access, 21 cells;
+  7 false negatives and 1 over-rejection on the previous build) + four negatives +
+  `sync_flag_handoff_ok_bug1563`.
 - **BUG-1546 — `const volatile *u32` dropped `volatile`.** The const arm of `resolve_type`
   rebuilt the pointer from the inner type and copied only the target; a read-only register
   pointer (parameter or field) was emitted non-volatile, and passing `&vx` to such a

@@ -1,0 +1,11 @@
+// BUG-1561b boundary: stores through a pointer aimed at h / a forwarding helper do not
+// read-modify-write g.
+volatile u32 g;
+volatile u32 h;
+volatile *u32 hp = &h;
+u32 rd() { return g; }
+void wr(u32 v) { *hp = v; }
+void wr2(u32 v) { volatile *u32 p = &h; *p = v; }
+void wr3(u32 v) { wr(v); }
+void worker() { u32 t = rd(); wr(t + 1); wr2(t + 1); wr3(t + 2); }
+u32 main() { ThreadHandle th = spawn worker(); th.join(); if (h != 0) { return 0; } return 1; }

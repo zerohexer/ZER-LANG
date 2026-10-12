@@ -6596,12 +6596,17 @@ u32 main() {
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
   - Has atomic/barrier → compile **warning** (lock-free pattern possible) —
-    EXCEPT when two threads both WRITE the same plain global without holding
-    the same lock: that is an **error** (BUG-1562). A protocol can order one
-    writer against its readers; it never orders two writers. Two spawns of a
-    target, a spawn inside a loop, or two different targets each count. A write
-    is held by a lock when it sits between a spin acquire of a lock word and its
-    release in one statement list (callees included) — example below
+    EXCEPT when two thread instances touch the same plain global, at least one
+    writing, and neither ONE common lock nor a release/acquire hand-off orders
+    them: that is an **error** (BUG-1562/1563). The instances are two spawns,
+    one target spawned in a loop or by a function that can run twice, and the
+    spawning code between the spawn and its `join()`. An access is under a lock
+    when it sits between a spin acquire of a lock word and its release in one
+    statement list (callees included); a hand-off is a write followed by
+    `@atomic_store(&flag, ..)` in one thread and a read after a wait on
+    `@atomic_load(&flag)` (a loop, or `if (@atomic_load(&flag) ...)`) in the
+    other. A thread joined before the next one is spawned does not count —
+    examples below
   - A read-modify-write may be split across CALLS — `u32 t = rd(); wr(t + 1);`
     with `rd` returning `g` and `wr` storing its parameter into `g` — and is the
     same non-atomic RMW as `g += 1` at every sink (BUG-1561)
@@ -6643,7 +6648,7 @@ u32 main() {
 - A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
   lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
 
-Two writers under ONE lock — a warning, not an error (BUG-1562):
+Two writers under ONE lock, and a flag hand-off — warnings, not errors (BUG-1562/1563):
 ```zer
 u32 lock;
 u32 counter;
@@ -6653,6 +6658,19 @@ u32 main() {
     ThreadHandle b = spawn inc();
     a.join(); b.join();
     return counter - 2;
+}
+```
+```zer
+u32 data;
+u32 ready;
+u32 got;
+void producer() { data = 42; @atomic_store(&ready, 1); }       // write, then release
+void consumer() { while (@atomic_load(&ready) == 0) { } got = data; }  // wait, then read
+u32 main() {
+    ThreadHandle p = spawn producer();
+    ThreadHandle q = spawn consumer();
+    p.join(); q.join();
+    return got - 42;
 }
 ```
 

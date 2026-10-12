@@ -7193,25 +7193,71 @@ static void vf_value(VfCtx *x, Node *e, uint64_t *pm, Symbol **g, int depth) {
 /* One assignment's effect: into a local (its sources grow), or into a global
  * (every parameter in the value is recorded as stored there). A target reached
  * through a dereference is not followed. */
+/* Record that the parameters in `pm` may be stored into global `g`. */
+static void vf_param_store_mark(VfCtx *x, uint64_t pm, Symbol *g) {
+    if (!g || g->is_function) return;
+    for (int i = 0; i < x->np && i < 64; i++)
+        if ((pm & (1ULL << i)) && !x->pstore[i]) x->pstore[i] = g;
+}
+typedef struct { VfCtx *x; uint64_t pm; } VfStoreUd;
+static void vf_store_visit(Checker *c, Symbol *g, void *ud) {
+    (void)c;
+    VfStoreUd *u = (VfStoreUd *)ud;
+    vf_param_store_mark(u->x, u->pm, g);
+}
+
+/* One assignment's effect: into a local (its sources grow), or into a global
+ * (every parameter in the value is recorded as stored there). A store THROUGH
+ * a pointer lands on the pointee: a global pointer's targets (the shared
+ * resolver, retargets included), or the global a local pointer was aimed at
+ * (`*u32 p = &g;` gives p the source g). A store through a pointer PARAMETER
+ * lands in the caller's object — func_rmw_param_mask's question, not this one. */
 static void vf_assign(VfCtx *x, Node *n) {
     Node *t = n->assign.target;
-    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX))
-        t = t->kind == NODE_FIELD ? t->field.object : t->index_expr.object;
+    bool deref = false;
+    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX || t->kind == NODE_SLICE ||
+                 (t->kind == NODE_UNARY && t->unary.op == TOK_STAR))) {
+        if (t->kind == NODE_UNARY) deref = true;
+        t = t->kind == NODE_FIELD ? t->field.object :
+            t->kind == NODE_INDEX ? t->index_expr.object :
+            t->kind == NODE_SLICE ? t->slice.object : t->unary.operand;
+    }
     if (!t || t->kind != NODE_IDENT) return;
     uint64_t pm = 0; Symbol *g = NULL;
     vf_value(x, n->assign.value, &pm, &g, 0);
     const char *nm = t->ident.name; uint32_t nl = (uint32_t)t->ident.name_len;
     int li = vf_local_find(x, nm, nl);
+    if (deref) {
+        if (li >= 0) {
+            Symbol *pg = x->loc[li].g;
+            if (!pg || !pg->type) return;
+            TypeKind pk = type_dispatch_kind(pg->type);
+            if (pk != TYPE_POINTER && pk != TYPE_SLICE) {   /* aimed `&g` */
+                vf_param_store_mark(x, pm, pg);
+                return;
+            }
+            /* a copy of a global pointer: store through that pointer */
+            Node id, un;
+            memset(&id, 0, sizeof(id)); memset(&un, 0, sizeof(un));
+            id.kind = NODE_IDENT; id.loc = t->loc;
+            id.ident.name = pg->name; id.ident.name_len = pg->name_len;
+            un.kind = NODE_UNARY; un.loc = t->loc; un.unary.op = TOK_STAR; un.unary.operand = &id;
+            VfStoreUd ud = { x, pm };
+            for_each_write_target(x->c, &un, vf_store_visit, &ud);
+            return;
+        }
+        if (vf_param_find(x, nm, nl) >= 0) return;
+        VfStoreUd ud = { x, pm };
+        for_each_write_target(x->c, n->assign.target, vf_store_visit, &ud);
+        return;
+    }
     if (li < 0 && vf_param_find(x, nm, nl) >= 0) li = vf_local_add(x, nm, nl);
     if (li >= 0) {
         x->loc[li].pmask |= pm;
         if (!x->loc[li].g) x->loc[li].g = g;
         return;
     }
-    Symbol *gs = global_decl_lookup(x->c, nm, nl);
-    if (!gs || gs->is_function) return;
-    for (int i = 0; i < x->np && i < 64; i++)
-        if ((pm & (1ULL << i)) && !x->pstore[i]) x->pstore[i] = gs;
+    vf_param_store_mark(x, pm, global_decl_lookup(x->c, nm, nl));
 }
 
 static void vf_walk(VfCtx *x, Node *n, int depth) {
@@ -7268,7 +7314,16 @@ static void vf_walk(VfCtx *x, Node *n, int depth) {
     case NODE_UNARY:     VFW(n->unary.operand); return;
     case NODE_CALL:
         VFW(n->call.callee);
-        for (int i = 0; i < n->call.arg_count; i++) VFW(n->call.args[i]);
+        for (int i = 0; i < n->call.arg_count; i++) {
+            VFW(n->call.args[i]);
+            /* a parameter FORWARDED to a callee that stores it into a global
+             * (`void wr(u32 v) { wr2(v); }`) is stored there by this function */
+            Symbol *ps = vf_call_param_store(x->c, n, i);
+            if (!ps) continue;
+            uint64_t pm = 0; Symbol *g = NULL;
+            vf_value(x, n->call.args[i], &pm, &g, 0);
+            vf_param_store_mark(x, pm, ps);
+        }
         return;
     case NODE_FIELD:     VFW(n->field.object); return;
     case NODE_INDEX:     VFW(n->index_expr.object); VFW(n->index_expr.index); return;
@@ -24125,110 +24180,309 @@ static Symbol *sync_stmt_releases(Checker *c, Node *s) {
     return sync_intrinsic_lock(c, s->expr_stmt.expr, rel);
 }
 
-/* One write of a global by a thread, and the lock word held around it (NULL
- * when none is). */
-typedef struct { Symbol *g; Symbol *lock; } SyncWrite;
-typedef struct { SyncWrite *v; int n, cap; } SyncWriteSet;
-static bool sync_wset_has(SyncWriteSet *s, Symbol *g, Symbol *lock) {
-    for (int i = 0; i < s->n; i++) if (s->v[i].g == g && s->v[i].lock == lock) return true;
+/* A flag word an `@atomic_*` intrinsic other than a load PUBLISHES through
+ * (store, exchange, read-modify-write): the statement is a release on it. */
+static Symbol *sync_stmt_release_flag(Checker *c, Node *s) {
+    static const char *const rel[] = {
+        "atomic_store", "atomic_xchg", "atomic_cas", "atomic_add", "atomic_sub",
+        "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
+        "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
+    if (!s) return NULL;
+    Node *e = s->kind == NODE_EXPR_STMT ? s->expr_stmt.expr :
+              s->kind == NODE_VAR_DECL ? s->var_decl.init : NULL;
+    if (e && e->kind == NODE_ASSIGN) e = e->assign.value;
+    return sync_intrinsic_lock(c, e, rel);
+}
+/* The flag an expression READS atomically (any `@atomic_*(&F, ...)` in it). */
+static Symbol *sync_expr_atomic_flag(Checker *c, Node *e, int depth) {
+    static const char *const any[] = {
+        "atomic_load", "atomic_cas", "atomic_xchg", "atomic_add", "atomic_sub",
+        "atomic_or", "atomic_and", "atomic_xor", "atomic_nand", "atomic_add_fetch",
+        "atomic_sub_fetch", "atomic_or_fetch", "atomic_and_fetch", "atomic_xor_fetch", NULL };
+    if (!e || depth > ZER_EXPR_WALK_MAX) return NULL;
+    Symbol *f = sync_intrinsic_lock(c, e, any);
+    if (f) return f;
+    switch (e->kind) {
+    case NODE_UNARY:    return sync_expr_atomic_flag(c, e->unary.operand, depth + 1);
+    case NODE_TYPECAST: return sync_expr_atomic_flag(c, e->typecast.expr, depth + 1);
+    case NODE_ASSIGN:   return sync_expr_atomic_flag(c, e->assign.value, depth + 1);
+    case NODE_BINARY: {
+        f = sync_expr_atomic_flag(c, e->binary.left, depth + 1);
+        return f ? f : sync_expr_atomic_flag(c, e->binary.right, depth + 1);
+    }
+    case NODE_EXPR_STMT: return sync_expr_atomic_flag(c, e->expr_stmt.expr, depth + 1);
+    case NODE_VAR_DECL:  return sync_expr_atomic_flag(c, e->var_decl.init, depth + 1);
+    case NODE_BLOCK:
+        for (int i = 0; i < e->block.stmt_count; i++) {
+            f = sync_expr_atomic_flag(c, e->block.stmts[i], depth + 1);
+            if (f) return f;
+        }
+        return NULL;
+    /* Only the spellings a wait loop is written in carry the acquire; any
+     * other kind answers "no flag", which can only refuse more. */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_IDENT: case NODE_FIELD:
+    case NODE_INDEX: case NODE_SLICE: case NODE_CALL: case NODE_ORELSE:
+    case NODE_INTRINSIC: case NODE_STRUCT_INIT: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_IF: case NODE_FOR: case NODE_WHILE: case NODE_DO_WHILE: case NODE_SWITCH:
+    case NODE_RETURN: case NODE_BREAK: case NODE_CONTINUE: case NODE_DEFER:
+    case NODE_GOTO: case NODE_LABEL: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        return NULL;
+    }
+    return NULL;
+}
+/* A WAIT on a flag: a loop whose condition or body reads it atomically
+ * (`while (@atomic_load(&F) == 0) {}`, `while (b == 0) { b = @atomic_load(&F); }`).
+ * Code after it runs after the flag was seen set. */
+static Symbol *sync_stmt_flag_acquire(Checker *c, Node *s) {
+    if (!s) return NULL;
+    if (s->kind == NODE_WHILE || s->kind == NODE_DO_WHILE) {
+        Symbol *f = sync_expr_atomic_flag(c, s->while_stmt.cond, 0);
+        return f ? f : sync_expr_atomic_flag(c, s->while_stmt.body, 0);
+    }
+    return NULL;
+}
+
+/* One plain access of a global by a thread instance, with what orders it:
+ *   lock — the lock word held around it (a spin acquire ... its release);
+ *   acq  — a flag the code WAITED on before it (the reader side of a release/
+ *          acquire hand-off);
+ *   pub  — a flag the code RELEASES after it (the writer side). */
+typedef struct { Symbol *g; bool write; Symbol *lock, *acq, *pub; } SyncAcc;
+typedef struct { SyncAcc *v; int n, cap; } SyncAccSet;
+static bool sync_acc_has(SyncAccSet *s, SyncAcc a) {
+    for (int i = 0; i < s->n; i++)
+        if (s->v[i].g == a.g && s->v[i].write == a.write && s->v[i].lock == a.lock &&
+            s->v[i].acq == a.acq && s->v[i].pub == a.pub) return true;
     return false;
 }
-static void sync_wset_add(SyncWriteSet *s, Symbol *g, Symbol *lock) {
-    if (!g || sync_wset_has(s, g, lock)) return;
+static void sync_acc_add(SyncAccSet *s, SyncAcc a) {
+    if (!a.g || sync_acc_has(s, a)) return;
     if (s->n >= s->cap) {
         int nc = s->cap ? s->cap * 2 : 8;
-        SyncWrite *nb = (SyncWrite *)realloc(s->v, (size_t)nc * sizeof(SyncWrite));
+        SyncAcc *nb = (SyncAcc *)realloc(s->v, (size_t)nc * sizeof(SyncAcc));
         if (!nb) return;
         s->v = nb; s->cap = nc;
     }
-    s->v[s->n].g = g; s->v[s->n].lock = lock; s->n++;
+    s->v[s->n++] = a;
 }
 
-/* Every global this code WRITES, each with the lock held around the write,
- * transitively through direct calls. `seen` records (function, lock) pairs
- * already walked, so a body is walked once per lock it can run under. */
-static void sync_thread_writes(Checker *c, Node *n, Symbol *lock, SyncWriteSet *out,
-                               SyncWriteSet *seen, int depth) {
+typedef struct { Symbol *lock, *acq, *pub; } SyncCtx;
+/* THREAD: the walk is a thread's body — every access counts. WINDOW: the walk
+ * is the function that SPAWNED it, and only the accesses between the spawn and
+ * its join count (BEFORE -> IN at the spawn, IN -> AFTER at `handle.join()`). */
+enum { SW_THREAD, SW_BEFORE, SW_IN, SW_AFTER };
+typedef struct {
+    Checker *c;
+    SyncAccSet *out;
+    SyncAccSet seen;          /* (function, ctx) pairs descended; .g = the function */
+    int phase;
+    Node *spawn;              /* WINDOW: the spawn statement */
+    const char *handle; uint32_t handle_len;
+    Node **seq; int nseq, cseq;   /* spawn nodes met AFTER the join */
+} SyncWalk;
+
+static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth);
+static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
+    if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
+    SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
+    sync_acc_add(w->out, a);
+}
+/* An lvalue: its ROOT is named, not read; its index expressions are read. */
+static void sync_lvalue(SyncWalk *w, Node *t, SyncCtx ctx, int depth) {
+    if (!t || depth > ZER_EXPR_WALK_MAX) return;
+    switch (t->kind) {
+    case NODE_IDENT: return;
+    case NODE_FIELD: sync_lvalue(w, t->field.object, ctx, depth + 1); return;
+    case NODE_INDEX:
+        sync_lvalue(w, t->index_expr.object, ctx, depth + 1);
+        sync_walk(w, t->index_expr.index, ctx, depth + 1);
+        return;
+    case NODE_SLICE:
+        sync_lvalue(w, t->slice.object, ctx, depth + 1);
+        sync_walk(w, t->slice.start, ctx, depth + 1);
+        sync_walk(w, t->slice.end, ctx, depth + 1);
+        return;
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_BINARY: case NODE_UNARY:
+    case NODE_ASSIGN: case NODE_CALL: case NODE_ORELSE: case NODE_INTRINSIC:
+    case NODE_STRUCT_INIT: case NODE_TYPECAST: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
+    case NODE_VAR_DECL: case NODE_BLOCK: case NODE_IF: case NODE_FOR: case NODE_WHILE:
+    case NODE_DO_WHILE: case NODE_SWITCH: case NODE_RETURN: case NODE_BREAK:
+    case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
+    case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
+    case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
+        sync_walk(w, t, ctx, depth + 1);   /* `*p` and the rest read their operand */
+        return;
+    }
+}
+/* Two paths rejoin: the thread is live after the join point if it is live on
+ * either path. */
+static int sync_phase_join(int a, int b) {
+    if (a == SW_THREAD) return a;
+    if (a == SW_IN || b == SW_IN) return SW_IN;
+    if (a == SW_AFTER || b == SW_AFTER) return SW_AFTER;
+    return SW_BEFORE;
+}
+static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
-    #define SUW(y) sync_thread_writes(c, (y), lock, out, seen, depth + 1)
+    Checker *c = w->c;
+    #define SW(y) sync_walk(w, (y), ctx, depth + 1)
     switch (n->kind) {
-    case NODE_BLOCK: {
-        Symbol *held = NULL;   /* a lock taken at this level, inside an unlocked context */
-        for (int i = 0; i < n->block.stmt_count; i++) {
-            Node *st = n->block.stmts[i];
-            if (held) {
-                if (sync_stmt_releases(c, st) == held) { held = NULL; continue; }
-                sync_thread_writes(c, st, held, out, seen, depth + 1);
-                continue;
-            }
-            Symbol *acq = lock ? NULL : sync_stmt_acquires(c, st);
-            if (acq) { held = acq; continue; }
-            SUW(st);
-        }
+    case NODE_IDENT: {
+        Symbol *g = global_decl_lookup(c, n->ident.name, (uint32_t)n->ident.name_len);
+        if (g && !g->is_function) sync_record(w, g, false, ctx);
         return;
     }
     case NODE_ASSIGN: {
-        Symbol *g = resolve_write_target_global(c, n->assign.target, 0);
-        if (g && spawn_global_needs_sync(c, g)) sync_wset_add(out, g, lock);
-        SUW(n->assign.target); SUW(n->assign.value);
+        sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
+        sync_lvalue(w, n->assign.target, ctx, depth + 1);
+        SW(n->assign.value);
         return;
     }
+    case NODE_UNARY:
+        if (n->unary.op == TOK_AMP) { sync_lvalue(w, n->unary.operand, ctx, depth + 1); return; }
+        SW(n->unary.operand);
+        return;
     case NODE_CALL: {
-        SUW(n->call.callee);
-        for (int i = 0; i < n->call.arg_count; i++) SUW(n->call.args[i]);
+        SW(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) SW(n->call.args[i]);
         Node *cal = n->call.callee;
+        if (cal && cal->kind == NODE_FIELD && w->handle && w->phase == SW_IN &&
+            cal->field.field_name_len == 4 && memcmp(cal->field.field_name, "join", 4) == 0 &&
+            cal->field.object && cal->field.object->kind == NODE_IDENT &&
+            cal->field.object->ident.name_len == w->handle_len &&
+            memcmp(cal->field.object->ident.name, w->handle, w->handle_len) == 0) {
+            w->phase = SW_AFTER;
+            return;
+        }
+        if (w->phase != SW_THREAD && w->phase != SW_IN) return;
         if (cal && cal->kind == NODE_IDENT) {
             Symbol *fs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
             if (fs && fs->is_function && fs->func_node &&
-                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body &&
-                !sync_wset_has(seen, fs, lock)) {
-                sync_wset_add(seen, fs, lock);
-                DeclModuleSave dm = decl_module_enter(c, fs);
-                SUW(fs->func_node->func_decl.body);
-                decl_module_leave(c, dm);
+                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
+                SyncAcc key = { fs, false, ctx.lock, ctx.acq, ctx.pub };
+                if (!sync_acc_has(&w->seen, key)) {
+                    sync_acc_add(&w->seen, key);
+                    int sv = w->phase;
+                    w->phase = SW_THREAD;   /* the whole callee runs in the window */
+                    DeclModuleSave dm = decl_module_enter(c, fs);
+                    sync_walk(w, fs->func_node->func_decl.body, ctx, depth + 1);
+                    decl_module_leave(c, dm);
+                    w->phase = sv;
+                }
             }
         }
         return;
     }
-    case NODE_IF:
-        SUW(n->if_stmt.cond); SUW(n->if_stmt.then_body); SUW(n->if_stmt.else_body);
+    case NODE_SPAWN:
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) SW(n->spawn_stmt.args[i]);
+        if (n == w->spawn && w->phase == SW_BEFORE) {
+            w->phase = SW_IN;
+            w->handle = n->spawn_stmt.handle_name;
+            w->handle_len = (uint32_t)n->spawn_stmt.handle_name_len;
+        } else if (w->phase == SW_AFTER) {
+            if (w->nseq >= w->cseq) {
+                int nc = w->cseq ? w->cseq * 2 : 8;
+                Node **nb = (Node **)realloc(w->seq, (size_t)nc * sizeof(Node *));
+                if (!nb) return;
+                w->seq = nb; w->cseq = nc;
+            }
+            w->seq[w->nseq++] = n;
+        }
         return;
-    case NODE_WHILE: case NODE_DO_WHILE:
-        SUW(n->while_stmt.cond); SUW(n->while_stmt.body);
+    case NODE_BLOCK: {
+        SyncCtx cur = ctx;
+        Symbol *held = NULL;
+        for (int i = 0; i < n->block.stmt_count; i++) {
+            Node *st = n->block.stmts[i];
+            if (held) {
+                if (sync_stmt_releases(c, st) == held) { held = NULL; cur.lock = ctx.lock; continue; }
+            } else if (!cur.lock) {
+                Symbol *l = sync_stmt_acquires(c, st);
+                if (l) { held = l; cur.lock = l; continue; }
+            }
+            SyncCtx sc = cur;
+            for (int j = i + 1; j < n->block.stmt_count; j++) {
+                Symbol *f = sync_stmt_release_flag(c, n->block.stmts[j]);
+                if (f) { sc.pub = f; break; }
+            }
+            sync_walk(w, st, sc, depth + 1);
+            Symbol *af = sync_stmt_flag_acquire(c, st);
+            if (af) cur.acq = af;
+        }
         return;
-    case NODE_FOR:
-        SUW(n->for_stmt.init); SUW(n->for_stmt.cond);
-        SUW(n->for_stmt.step); SUW(n->for_stmt.body);
+    }
+    case NODE_IF: {
+        SW(n->if_stmt.cond);
+        SyncCtx tc = ctx;
+        Symbol *f = sync_expr_atomic_flag(c, n->if_stmt.cond, 0);
+        if (f) tc.acq = f;
+        int p0 = w->phase;
+        sync_walk(w, n->if_stmt.then_body, tc, depth + 1);
+        int p1 = w->phase;
+        w->phase = p0;
+        SW(n->if_stmt.else_body);
+        w->phase = sync_phase_join(p1, w->phase);
         return;
-    case NODE_SWITCH:
-        SUW(n->switch_stmt.expr);
-        for (int i = 0; i < n->switch_stmt.arm_count; i++) SUW(n->switch_stmt.arms[i].body);
+    }
+    case NODE_WHILE: case NODE_DO_WHILE: {
+        SW(n->while_stmt.cond);
+        int p0 = w->phase;
+        SW(n->while_stmt.body);
+        /* spawned in the body and still live: later iterations run all of it */
+        if (p0 == SW_BEFORE && w->phase == SW_IN) SW(n->while_stmt.body);
+        if (p0 == SW_IN) w->phase = SW_IN;   /* a join in the body may not run */
         return;
-    case NODE_EXPR_STMT: SUW(n->expr_stmt.expr);  return;
-    case NODE_VAR_DECL:  SUW(n->var_decl.init);   return;
-    case NODE_RETURN:    SUW(n->ret.expr);        return;
-    case NODE_CRITICAL:  SUW(n->critical.body);   return;
-    case NODE_DEFER:     SUW(n->defer.body);      return;
+    }
+    case NODE_FOR: {
+        SW(n->for_stmt.init); SW(n->for_stmt.cond);
+        int p0 = w->phase;
+        SW(n->for_stmt.body); SW(n->for_stmt.step);
+        if (p0 == SW_BEFORE && w->phase == SW_IN) { SW(n->for_stmt.body); SW(n->for_stmt.step); }
+        if (p0 == SW_IN) w->phase = SW_IN;
+        return;
+    }
+    case NODE_SWITCH: {
+        SW(n->switch_stmt.expr);
+        int p0 = w->phase, acc = p0;
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            w->phase = p0;
+            SW(n->switch_stmt.arms[i].body);
+            acc = sync_phase_join(acc, w->phase);
+        }
+        w->phase = acc;
+        return;
+    }
+    case NODE_VAR_DECL:  SW(n->var_decl.init);   return;
+    case NODE_EXPR_STMT: SW(n->expr_stmt.expr);  return;
+    case NODE_RETURN:    SW(n->ret.expr);        return;
+    case NODE_CRITICAL:  SW(n->critical.body);   return;
+    case NODE_DEFER:     SW(n->defer.body);      return;
     /* A @once body runs once program-wide (BUG-1276's single-owner rule). */
     case NODE_ONCE:      return;
-    case NODE_AWAIT:     SUW(n->await_stmt.cond); return;
-    case NODE_SPAWN:
-        for (int i = 0; i < n->spawn_stmt.arg_count; i++) SUW(n->spawn_stmt.args[i]);
-        return;
-    case NODE_BINARY:    SUW(n->binary.left); SUW(n->binary.right); return;
-    case NODE_UNARY:     SUW(n->unary.operand); return;
-    case NODE_FIELD:     SUW(n->field.object); return;
-    case NODE_INDEX:     SUW(n->index_expr.object); SUW(n->index_expr.index); return;
-    case NODE_SLICE:     SUW(n->slice.object); SUW(n->slice.start); SUW(n->slice.end); return;
-    case NODE_ORELSE:    SUW(n->orelse.expr); SUW(n->orelse.fallback); return;
-    case NODE_TYPECAST:  SUW(n->typecast.expr); return;
+    case NODE_AWAIT:     SW(n->await_stmt.cond); return;
+    case NODE_BINARY:    SW(n->binary.left); SW(n->binary.right); return;
+    case NODE_FIELD:     SW(n->field.object); return;
+    case NODE_INDEX:     SW(n->index_expr.object); SW(n->index_expr.index); return;
+    case NODE_SLICE:     SW(n->slice.object); SW(n->slice.start); SW(n->slice.end); return;
+    case NODE_ORELSE:    SW(n->orelse.expr); SW(n->orelse.fallback); return;
+    case NODE_TYPECAST:  SW(n->typecast.expr); return;
     case NODE_INTRINSIC:
-        for (int i = 0; i < n->intrinsic.arg_count; i++) SUW(n->intrinsic.args[i]);
+        for (int i = 0; i < n->intrinsic.arg_count; i++) SW(n->intrinsic.args[i]);
         return;
     case NODE_STRUCT_INIT:
-        for (int i = 0; i < n->struct_init.field_count; i++) SUW(n->struct_init.fields[i].value);
+        for (int i = 0; i < n->struct_init.field_count; i++) SW(n->struct_init.fields[i].value);
         return;
-    /* No write below these. */
+    /* No access below these. */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
@@ -24237,13 +24491,133 @@ static void sync_thread_writes(Checker *c, Node *n, Symbol *lock, SyncWriteSet *
     case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
-    case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
+    case NODE_CAST: case NODE_SIZEOF:
         return;
     }
-    #undef SUW
+    #undef SW
 }
 
-static void record_sync_spawn(Checker *c, Symbol *target, int line) {
+/* ---- How many times can a function run? (a call-site census) ----
+ * A spawn site whose enclosing function can run twice starts two threads. */
+typedef struct { Symbol *caller, *callee; bool in_loop; } SyncCallSite;
+typedef struct {
+    SyncCallSite *v; int n, cap;
+    Symbol **taken; int nt, ct;          /* functions used as VALUES */
+} SyncCensus;
+static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_loop) {
+    if (k->n >= k->cap) {
+        int nc = k->cap ? k->cap * 2 : 32;
+        SyncCallSite *nb = (SyncCallSite *)realloc(k->v, (size_t)nc * sizeof(*nb));
+        if (!nb) return;
+        k->v = nb; k->cap = nc;
+    }
+    k->v[k->n].caller = caller; k->v[k->n].callee = callee; k->v[k->n].in_loop = in_loop;
+    k->n++;
+}
+static void census_taken(SyncCensus *k, Symbol *f) {
+    for (int i = 0; i < k->nt; i++) if (k->taken[i] == f) return;
+    if (k->nt >= k->ct) {
+        int nc = k->ct ? k->ct * 2 : 16;
+        Symbol **nb = (Symbol **)realloc(k->taken, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return;
+        k->taken = nb; k->ct = nc;
+    }
+    k->taken[k->nt++] = f;
+}
+static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool loop, int depth) {
+    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    #define CW(y) census_walk(c, k, (y), caller, loop, depth + 1)
+    #define CWL(y) census_walk(c, k, (y), caller, true, depth + 1)
+    switch (n->kind) {
+    case NODE_IDENT: {
+        Symbol *f = global_decl_lookup(c, n->ident.name, (uint32_t)n->ident.name_len);
+        if (f && f->is_function) census_taken(k, f);   /* a function as a VALUE */
+        return;
+    }
+    case NODE_CALL: {
+        Node *cal = n->call.callee;
+        Symbol *f = (cal && cal->kind == NODE_IDENT)
+            ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len) : NULL;
+        if (f && f->is_function) census_add(k, caller, f, loop);
+        else CW(cal);
+        for (int i = 0; i < n->call.arg_count; i++) CW(n->call.args[i]);
+        return;
+    }
+    case NODE_SPAWN: {
+        Symbol *f = global_decl_lookup(c, n->spawn_stmt.func_name,
+                                       (uint32_t)n->spawn_stmt.func_name_len);
+        if (f && f->is_function) census_add(k, caller, f, loop);
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) CW(n->spawn_stmt.args[i]);
+        return;
+    }
+    case NODE_WHILE: case NODE_DO_WHILE: CWL(n->while_stmt.cond); CWL(n->while_stmt.body); return;
+    case NODE_FOR:
+        CW(n->for_stmt.init); CWL(n->for_stmt.cond); CWL(n->for_stmt.step); CWL(n->for_stmt.body);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) CW(n->block.stmts[i]);
+        return;
+    case NODE_IF: CW(n->if_stmt.cond); CW(n->if_stmt.then_body); CW(n->if_stmt.else_body); return;
+    case NODE_SWITCH:
+        CW(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) CW(n->switch_stmt.arms[i].body);
+        return;
+    case NODE_VAR_DECL:  CW(n->var_decl.init);   return;
+    case NODE_EXPR_STMT: CW(n->expr_stmt.expr);  return;
+    case NODE_RETURN:    CW(n->ret.expr);        return;
+    case NODE_CRITICAL:  CW(n->critical.body);   return;
+    case NODE_DEFER:     CW(n->defer.body);      return;
+    case NODE_ONCE:      CW(n->once.body);       return;
+    case NODE_AWAIT:     CW(n->await_stmt.cond); return;
+    case NODE_ASSIGN:    CW(n->assign.target); CW(n->assign.value); return;
+    case NODE_BINARY:    CW(n->binary.left); CW(n->binary.right); return;
+    case NODE_UNARY:     CW(n->unary.operand); return;
+    case NODE_FIELD:     CW(n->field.object); return;
+    case NODE_INDEX:     CW(n->index_expr.object); CW(n->index_expr.index); return;
+    case NODE_SLICE:     CW(n->slice.object); CW(n->slice.start); CW(n->slice.end); return;
+    case NODE_ORELSE:    CW(n->orelse.expr); CW(n->orelse.fallback); return;
+    case NODE_TYPECAST:  CW(n->typecast.expr); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) CW(n->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) CW(n->struct_init.fields[i].value);
+        return;
+    case NODE_GLOBAL_VAR: CW(n->var_decl.init); return;   /* `*() g = f;` takes f */
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
+    case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
+    case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
+    case NODE_MMIO: case NODE_CONTAINER_DECL:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
+    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
+    case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
+    case NODE_CAST: case NODE_SIZEOF:
+        return;
+    }
+    #undef CW
+    #undef CWL
+}
+/* 1 = runs at most once, 2 = may run more than once. `main` runs once; a
+ * function used as a value, reached from an interrupt, called in a loop or
+ * from two places, or on a call cycle may run more. A function with no ZER
+ * caller at all counts once (it is dead, or called from C). */
+static int census_instances(Checker *c, SyncCensus *k, Symbol *f, Symbol **stack, int sp) {
+    if (!f) return 2;
+    if (f->name_len == 4 && memcmp(f->name, "main", 4) == 0 && !f->module_prefix) return 1;
+    for (int i = 0; i < sp; i++) if (stack[i] == f) return 2;   /* a cycle */
+    for (int i = 0; i < k->nt; i++) if (k->taken[i] == f) return 2;
+    stack[sp] = f;   /* `stack` holds k->n + 1 slots: each level follows a distinct site */
+    int total = 0;
+    for (int i = 0; i < k->n && total < 2; i++) {
+        if (k->v[i].callee != f) continue;
+        if (k->v[i].in_loop || !k->v[i].caller) { total = 2; break; }
+        total += census_instances(c, k, k->v[i].caller, stack, sp + 1);
+    }
+    return total == 0 ? 1 : (total > 2 ? 2 : total);
+}
+
+static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line) {
     if (c->sync_spawn_count >= c->sync_spawn_capacity) {
         int nc = c->sync_spawn_capacity ? c->sync_spawn_capacity * 2 : 8;
         struct SyncSpawnSite *nb = (struct SyncSpawnSite *)realloc(c->sync_spawns,
@@ -24252,67 +24626,150 @@ static void record_sync_spawn(Checker *c, Symbol *target, int line) {
         c->sync_spawns = nb; c->sync_spawn_capacity = nc;
     }
     struct SyncSpawnSite *s = &c->sync_spawns[c->sync_spawn_count++];
-    s->target = target; s->repeated = c->in_loop;
+    s->target = target; s->spawn = spawn; s->encl = current_func_symbol(c);
+    s->repeated = c->in_loop;
     s->file = c->file_name; s->source = c->source; s->line = line;
 }
 
-/* Two thread instances writing global `g` conflict unless BOTH hold the same
- * lock word around the write. The instances are: a site spawned in a loop
- * (counted twice — the same writes against themselves), and every other
- * downgraded site. */
-static bool sync_writes_conflict(SyncWriteSet *a, SyncWriteSet *b, Symbol *g) {
-    for (int i = 0; i < a->n; i++) {
-        if (a->v[i].g != g) continue;
+/* Is access `a` ordered before access `b`? Both under one lock, or `a` released
+ * through a flag `b` waited on. */
+static bool sync_ordered(SyncAcc *a, SyncAcc *b) {
+    if (a->lock && a->lock == b->lock) return true;
+    if (a->pub && a->pub == b->acq) return true;
+    if (b->pub && b->pub == a->acq) return true;
+    return false;
+}
+/* The first global two access sets touch with at least one write and no
+ * ordering between the two accesses, or NULL. */
+static Symbol *sync_sets_conflict(SyncAccSet *a, SyncAccSet *b) {
+    for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
-            if (b->v[j].g != g) continue;
-            if (!a->v[i].lock || !b->v[j].lock || a->v[i].lock != b->v[j].lock) return true;
+            SyncAcc *x = &a->v[i], *y = &b->v[j];
+            if (x->g != y->g || (!x->write && !y->write)) continue;
+            if (!sync_ordered(x, y)) return x->g;
         }
-    }
+    return NULL;
+}
+static bool sync_seq_has(SyncWalk *w, Node *n) {
+    for (int i = 0; i < w->nseq; i++) if (w->seq[i] == n) return true;
     return false;
 }
 
-static void check_sync_spawn_writers(Checker *c) {
+/* BUG-1562/1563: the race finding of a spawn target with an @atomic_* /
+ * @barrier is only a warning, because a hand-built protocol can order plain
+ * accesses. Refuse what no protocol the analysis can see orders: two thread
+ * instances (two spawns, one spawned twice, or a spawn and the code running
+ * in its spawn..join window) touching one plain global, at least one writing,
+ * with neither a common lock nor a release/acquire hand-off between them. */
+static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int count) {
     int n = c->sync_spawn_count;
     if (n <= 0) return;
-    SyncWriteSet *w = (SyncWriteSet *)calloc((size_t)n, sizeof(SyncWriteSet));
-    if (!w) return;
-    for (int i = 0; i < n; i++) {
-        Symbol *t = c->sync_spawns[i].target;
-        if (!t || !t->func_node || t->func_node->kind != NODE_FUNC_DECL) continue;
-        SyncWriteSet seen = {0};
-        sync_wset_add(&seen, t, NULL);
-        DeclModuleSave dm = decl_module_enter(c, t);
-        sync_thread_writes(c, t->func_node->func_decl.body, NULL, &w[i], &seen, 0);
-        decl_module_leave(c, dm);
-        free(seen.v);
-    }
-    const char *sv_fn = c->file_name, *sv_src = c->source;
-    SyncWriteSet reported = {0};
-    for (int i = 0; i < n; i++) {
-        for (int k = 0; k < w[i].n; k++) {
-            Symbol *g = w[i].v[k].g;
-            if (sync_wset_has(&reported, g, NULL)) continue;
-            bool conflict = c->sync_spawns[i].repeated && sync_writes_conflict(&w[i], &w[i], g);
-            for (int j = i + 1; j < n && !conflict; j++)
-                conflict = sync_writes_conflict(&w[i], &w[j], g);
-            if (!conflict) continue;
-            sync_wset_add(&reported, g, NULL);
-            struct SyncSpawnSite *s = &c->sync_spawns[i];
-            c->file_name = s->file; c->source = s->source;
-            checker_error(c, s->line,
-                "spawn target '%.*s' writes non-shared global '%.*s', and another thread "
-                "writes it too without holding the same lock — an @atomic_* / @barrier "
-                "elsewhere in the thread does not order two writers. Take ONE lock around "
-                "every write (`while (!@atomic_cas(&lock, 0, 1)) {}` ... "
-                "`@atomic_store(&lock, 0);`), or use @atomic_* / a shared struct",
-                (int)s->target->name_len, s->target->name,
-                (int)g->name_len, g->name);
+    const char *sv_fn = c->file_name, *sv_src = c->source, *sv_mod = c->current_module;
+    uint32_t sv_ml = c->current_module_len;
+    SyncCensus k;
+    memset(&k, 0, sizeof(k));
+    for (int fi = 0; fi < count; fi++) {
+        Node *fn = files[fi].ast;
+        if (!fn || fn->kind != NODE_FILE) continue;
+        c->current_module = files[fi].module; c->current_module_len = files[fi].module_len;
+        for (int i = 0; i < fn->file.decl_count; i++) {
+            Node *d = fn->file.decls[i];
+            if (d->kind == NODE_FUNC_DECL && d->func_decl.body) {
+                Symbol *self = global_decl_lookup(c, d->func_decl.name,
+                                                  (uint32_t)d->func_decl.name_len);
+                census_walk(c, &k, d->func_decl.body, self, false, 0);
+            } else if (d->kind == NODE_INTERRUPT) {
+                census_walk(c, &k, d->interrupt.body, NULL, false, 0);
+            } else if (d->kind == NODE_GLOBAL_VAR) {
+                census_walk(c, &k, d, NULL, false, 0);
+            }
         }
     }
+    c->current_module = sv_mod; c->current_module_len = sv_ml;
+
+    SyncAccSet *thr = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
+    SyncAccSet *win = (SyncAccSet *)calloc((size_t)n, sizeof(SyncAccSet));
+    SyncWalk *ww = (SyncWalk *)calloc((size_t)n, sizeof(SyncWalk));
+    if (!thr || !win || !ww) { free(thr); free(win); free(ww); free(k.v); free(k.taken); return; }
+    SyncCtx none = { NULL, NULL, NULL };
+    Symbol **stack = (Symbol **)calloc((size_t)k.n + 1, sizeof(Symbol *));
+    for (int i = 0; i < n; i++) {
+        struct SyncSpawnSite *s = &c->sync_spawns[i];
+        /* no stack: count the site twice — the conservative answer */
+        if (!s->repeated && (!stack || census_instances(c, &k, s->encl, stack, 0) >= 2))
+            s->repeated = true;
+        Symbol *t = s->target;
+        if (t && t->func_node && t->func_node->kind == NODE_FUNC_DECL) {
+            SyncWalk tw;
+            memset(&tw, 0, sizeof(tw));
+            tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD;
+            SyncAcc self = { t, false, NULL, NULL, NULL };
+            sync_acc_add(&tw.seen, self);
+            DeclModuleSave dm = decl_module_enter(c, t);
+            sync_walk(&tw, t->func_node->func_decl.body, none, 0);
+            decl_module_leave(c, dm);
+            free(tw.seen.v); free(tw.seq);
+        }
+        Symbol *e = s->encl;
+        ww[i].c = c; ww[i].out = &win[i]; ww[i].phase = SW_BEFORE; ww[i].spawn = s->spawn;
+        if (e && e->func_node && e->func_node->kind == NODE_FUNC_DECL) {
+            DeclModuleSave dm = decl_module_enter(c, e);
+            sync_walk(&ww[i], e->func_node->func_decl.body, none, 0);
+            decl_module_leave(c, dm);
+        }
+    }
+    bool *done = (bool *)calloc((size_t)n, sizeof(bool));
+    for (int i = 0; i < n && done; i++) {
+        struct SyncSpawnSite *s = &c->sync_spawns[i];
+        Symbol *g = NULL;
+        const char *why = NULL;
+        Symbol *other = NULL;
+        if (s->repeated && (g = sync_sets_conflict(&thr[i], &thr[i]))) {
+            why = "is started more than once, and its copies";
+        } else if ((g = sync_sets_conflict(&thr[i], &win[i]))) {
+            why = "and the code that spawned it (between the spawn and the join)";
+        } else {
+            for (int j = i + 1; j < n; j++) {
+                if (sync_seq_has(&ww[i], c->sync_spawns[j].spawn) ||
+                    sync_seq_has(&ww[j], s->spawn)) continue;   /* joined before */
+                if ((g = sync_sets_conflict(&thr[i], &thr[j]))) {
+                    other = c->sync_spawns[j].target;
+                    why = "and spawn target";
+                    break;
+                }
+            }
+        }
+        if (!g || done[i]) continue;
+        done[i] = true;
+        c->file_name = s->file; c->source = s->source;
+        if (other)
+            checker_error(c, s->line,
+                "spawn target '%.*s' %s '%.*s' both access non-shared global '%.*s', at "
+                "least one writing, with no common lock and no release/acquire flag "
+                "ordering them — an @atomic_* / @barrier elsewhere in a thread does not. "
+                "Take ONE lock around every access (`while (!@atomic_cas(&lock, 0, 1)) {}` "
+                "... `@atomic_store(&lock, 0);`), hand it off through a flag (write, then "
+                "`@atomic_store(&flag, 1)`; wait on `@atomic_load(&flag)`, then read), or "
+                "use @atomic_* / a shared struct",
+                (int)s->target->name_len, s->target->name, why,
+                (int)other->name_len, other->name, (int)g->name_len, g->name);
+        else
+            checker_error(c, s->line,
+                "spawn target '%.*s' %s both access non-shared global '%.*s', at least "
+                "one writing, with no common lock and no release/acquire flag ordering "
+                "them — an @atomic_* / @barrier elsewhere in the thread does not. Take ONE "
+                "lock around every access (`while (!@atomic_cas(&lock, 0, 1)) {}` ... "
+                "`@atomic_store(&lock, 0);`), hand it off through a flag (write, then "
+                "`@atomic_store(&flag, 1)`; wait on `@atomic_load(&flag)`, then read), or "
+                "use @atomic_* / a shared struct",
+                (int)s->target->name_len, s->target->name, why,
+                (int)g->name_len, g->name);
+    }
     c->file_name = sv_fn; c->source = sv_src;
-    free(reported.v);
-    for (int i = 0; i < n; i++) free(w[i].v);
-    free(w);
+    for (int i = 0; i < n; i++) {
+        free(thr[i].v); free(win[i].v); free(ww[i].seen.v); free(ww[i].seq);
+    }
+    free(thr); free(win); free(ww); free(done); free(k.v); free(k.taken); free(stack);
 }
 
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -30580,7 +31037,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 ensure_func_props(c, func_sym);
                 bool has_sync = func_sym->props.has_sync;
                 if (has_sync) {
-                    record_sync_spawn(c, func_sym, node->loc.line);   /* BUG-1562 */
+                    record_sync_spawn(c, func_sym, node, node->loc.line);   /* BUG-1562 */
                     checker_warning(c, node->loc.line,
                         "spawn target '%.*s' accesses %s '%.*s' — "
                         "potential data race (atomic/barrier present, verify ordering)",
@@ -39941,7 +40398,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     check_atomic_cell_safety(c);
     check_alias_spawn_calls(c);   /* BUG-1303 */
     check_async_frame_cycles(c);  /* BUG-1559 */
-    check_sync_spawn_writers(c);  /* BUG-1562 */
+    check_sync_spawn_writers(c, files, count);  /* BUG-1562/1563 */
 
     /* Stack depth analysis — detect recursion; --stack-limit over the WHOLE
      * program (BUG-1037: imported functions had no frame before) */

@@ -230,6 +230,31 @@ A/B-measured against a HEAD build, and every new negative is ACCEPTED by it.
   one spawned in a loop) unless both hold the SAME lock. The exemption set is the race
   scan's own, extracted as `spawn_global_needs_sync`. Corpus cost 0. Tests: three
   negatives + `sync_downgrade_same_lock_ok_bug1562`.
+- **BUG-1564 — the split-RMW taint held ONE global per value.** `u32 t = g + h; h = t + 1;`
+  in a thread kept `g` (the first seen) and missed the RMW of `h`; the same through a helper
+  returning `g + h`. And a write half done by a helper storing through a POINTER PARAMETER
+  (`void wr(volatile *u32 p, u32 v) { *p = v; }` called `wr(&g, t + 1)`) was not followed.
+  The per-local taint is now a SET (`rmw_tab_add` / `rmw_tab_rebind`, several rows per name)
+  and the value-flow summary records SETS: a return's sources (globals, argument values,
+  objects arguments point at), each parameter's destinations (globals, or the object another
+  parameter points at), substituted at every call (`call_value_sources`, `call_rmw_globals`,
+  one per sink). A call cycle is summarised to a fixpoint (a head iterates until its summary
+  stops growing), and a summary the walk cannot finish (asm, >64 params) is OPAQUE. Gate:
+  three more spellings in the RMW FORM grid (9 cells, all accepted by the previous build) +
+  three negatives; `split_rmw_recursive_relay_bug1564` pins recursion (refused before too).
+- **BUG-1565 — four instances the atomic/barrier downgrade check did not see.** (C1) A
+  fire-and-forget thread runs beside its spawner's CALLERS after the call returns — every
+  caller (transitively) is now walked from the call onward (`sync_window_callers`, the census
+  records each call node, indirect calls included). (C2) An access through a pointer the
+  thread was handed — the spawn's arguments are resolved at the spawn (`SyncSpawnSite.binds`)
+  and every callee's parameters at the call (`sync_descend`), so `*p`, `p.f`, `p[i]` and a
+  carrier's `*h.p` count as accesses of the global; every spawn the race scan found clean is
+  now recorded too, since it can only conflict this way. (C3) A function with no ZER caller
+  counts as running more than once. (C4) A flag hand-off holds only when no other instance
+  (thread, spawner window, interrupt handler, or a second copy of the publisher) stores the
+  flag except after waiting on it. Corpus cost 0 (247 spawn/atomic files). Gate: the
+  ATOMIC-DOWNGRADE grid gained three pairs and two orders (11 cells refused only now) + five
+  negatives + three boundary positives.
 - **BUG-1561b — the split-RMW summary missed the write half one step away**: `wr` storing
   through a global pointer (`*gp = v`) or a local pointer aimed at the global
   (`volatile *u32 p = &g; *p = v;`), and a `wr` that only FORWARDS its parameter to the real

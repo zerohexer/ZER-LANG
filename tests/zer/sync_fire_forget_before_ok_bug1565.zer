@@ -1,0 +1,6 @@
+// BUG-1565 (C1 boundary): the caller reads g BEFORE the call that starts the thread.
+u32 g;
+u32 flag;
+void w() { g = 1; @atomic_store(&flag, 1); }
+void start() { spawn w(); }
+u32 main() { u32 x = g; start(); return x; }

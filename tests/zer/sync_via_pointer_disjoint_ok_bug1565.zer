@@ -1,0 +1,7 @@
+// BUG-1565 (C2 boundary): the two threads are handed DIFFERENT globals.
+u32 g;
+u32 h;
+u32 flag;
+void a(*u32 p) { *p = 1; @atomic_store(&flag, 1); }
+void b(*u32 p) { *p = 2; @atomic_store(&flag, 2); }
+u32 main() { ThreadHandle t1 = spawn a(&g); ThreadHandle t2 = spawn b(&h); t1.join(); t2.join(); return 0; }

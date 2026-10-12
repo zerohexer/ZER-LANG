@@ -515,6 +515,12 @@ typedef struct {
         struct Node *spawn;   /* BUG-1563: the spawn node, for the parent window */
         Symbol *encl;         /* the function containing the spawn */
         bool repeated;        /* spawned in a loop, or its function may run twice */
+        bool downgraded;      /* BUG-1565: the race finding was a warning; false = the
+                               * scan found no plain global access at all */
+        /* BUG-1565: the globals each argument points at (or carries a pointer
+         * to), resolved at the spawn while its scope is live */
+        struct SyncArgBind { int param; Symbol *g; bool direct; } *binds;
+        int nbind;
         const char *file; const char *source;
         int line;
     } *sync_spawns;

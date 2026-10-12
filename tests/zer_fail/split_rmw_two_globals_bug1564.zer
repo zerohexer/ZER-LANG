@@ -1,0 +1,7 @@
+// BUG-1564: the split-RMW taint held ONE global per local, so a value read from
+// two globals kept the first; the write of h from h was missed.
+// expect-error: non-atomic read-modify-write on volatile global 'h'
+volatile u32 g;
+volatile u32 h;
+void worker() { u32 t = g + h; h = t + 1; }
+u32 main() { ThreadHandle th = spawn worker(); th.join(); return 0; }

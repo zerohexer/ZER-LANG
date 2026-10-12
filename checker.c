@@ -6460,9 +6460,6 @@ static void isr_opaque_visit(Checker *c, Symbol *g, void *ud) {
  * argument-precise barrier (BUG-740): a call whose target cannot be seen may
  * read-modify-write anything handed to it by pointer, and ONLY that — flagged
  * with its own wording, because it is not a proven RMW. ---- */
-static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n, const char *nm, uint32_t nl);
-static void rmw_tab_set(RmwTaintEnt **tab, int *n, int *cap, int fixed_max,
-                        const char *nm, uint32_t nl, Symbol *g);
 static Node *carrier_root_ident(Node *t) {
     while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX))
         t = (t->kind == NODE_FIELD) ? t->field.object : t->index_expr.object;
@@ -6712,8 +6709,27 @@ static bool callee_is_opaque_funcptr(Checker *c, Node *callee) {
  * rule was SYNTACTIC (it tested only the compound operator), so spelling the RMW
  * out in full evaded it at every sink. */
 static bool assign_reads_own_target(Checker *c, Node *value, Symbol *tgt);
-static Symbol *vf_call_ret_global(Checker *c, Node *call);       /* BUG-1561 */
-static Symbol *vf_call_param_store(Checker *c, Node *call, int i); /* BUG-1561 */
+/* BUG-1564: a small arena-grown set of globals (the taint and value-flow sets). */
+typedef struct { Symbol **v; int n, cap; } VfSet;
+static bool vfset_has(const VfSet *s, Symbol *g) {
+    for (int i = 0; i < s->n; i++) if (s->v[i] == g) return true;
+    return false;
+}
+static void vfset_add(Checker *c, VfSet *s, Symbol *g) {
+    if (!g || g->is_function || vfset_has(s, g)) return;
+    if (s->n >= s->cap) {
+        int nc = s->cap ? s->cap * 2 : 4;
+        Symbol **nb = (Symbol **)arena_alloc(c->arena, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return;
+        if (s->n) memcpy(nb, s->v, (size_t)s->n * sizeof(Symbol *));
+        s->v = nb; s->cap = nc;
+    }
+    s->v[s->n++] = g;
+}
+static void vfset_union(Checker *c, VfSet *d, const VfSet *s) {
+    for (int i = 0; i < s->n; i++) vfset_add(c, d, s->v[i]);
+}
+static void call_value_sources(Checker *c, RmwTaintEnt *tab, int n, Node *call, int depth, VfSet *out);
 /* Does this expression mention the identifier `nm`? Used to recognise a
  * WRITTEN-OUT read-modify-write (`*p = *p + 1`) against a parameter name. */
 /* BUG-999 (from v6o9c5, its BUG-975): ONE exhaustive walker for "does this
@@ -6868,102 +6884,107 @@ static bool assign_reads_own_target(Checker *c, Node *value, Symbol *tgt) {
  *   rmw_value_taints_global     the query the RMW site asks: does this value
  *                               expression carry global `g` through a local?
  */
-static Symbol *rmw_tab_lookup(RmwTaintEnt *tab, int n,
-                              const char *nm, uint32_t nl) {
-    /* BUG-1129: the carrier table may hold several rows per name; a cleared row
-     * is NULL. (The taint table keeps one row per name, so for it this is the
-     * same answer as before.) */
-    for (int i = n - 1; i >= 0; i--)
-        if (tab[i].global && tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
-            return tab[i].global;
-    return NULL;
+/* BUG-1564: a local's taint is a SET of globals — one row per (name, global);
+ * a cleared row has global NULL. It held ONE global, so `u32 t = g + h;
+ * h = t + 1;` kept only `g` and the read-modify-write of `h` was accepted at
+ * every sink. */
+static bool rmw_tab_has(RmwTaintEnt *tab, int n, const char *nm, uint32_t nl, Symbol *g) {
+    for (int i = 0; i < n; i++)
+        if (tab[i].global == g && tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0)
+            return true;
+    return false;
 }
-
-/* Set (or, with g == NULL, clear) a local's taint in `*tab`. `cap` is the
- * capacity cell for the growable table and may be NULL for a FIXED one, in which
- * case a full table silently drops the row — which costs a missed rejection,
- * never a wrong one. */
-static void rmw_tab_set(RmwTaintEnt **tab, int *n, int *cap, int fixed_max,
-                        const char *nm, uint32_t nl, Symbol *g) {
-    if (!nm || nl == 0) return;
-    for (int i = 0; i < *n; i++) {
-        if ((*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0) {
-            (*tab)[i].global = g;   /* NULL clears */
+static void rmw_tab_collect(Checker *c, RmwTaintEnt *tab, int n, const char *nm, uint32_t nl,
+                            VfSet *out, bool *any) {
+    for (int i = 0; i < n; i++)
+        if (tab[i].global && tab[i].name_len == nl && memcmp(tab[i].name, nm, nl) == 0) {
+            vfset_add(c, out, tab[i].global);
+            *any = true;
+        }
+}
+static void rmw_tab_add(RmwTaintEnt **tab, int *n, int *cap, const char *nm, uint32_t nl,
+                        Symbol *g) {
+    if (!nm || nl == 0 || !g || rmw_tab_has(*tab, *n, nm, nl, g)) return;
+    for (int i = 0; i < *n; i++)   /* reuse a cleared row of the same name */
+        if (!(*tab)[i].global && (*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0) {
+            (*tab)[i].global = g;
             return;
         }
-    }
-    if (!g) return;   /* nothing to record */
-    if (cap) {
-        if (*n >= *cap) {
-            int nc = *cap ? *cap * 2 : 8;
-            RmwTaintEnt *nt = (RmwTaintEnt *)realloc(*tab, (size_t)nc * sizeof(*nt));
-            if (!nt) return;
-            *tab = nt;
-            *cap = nc;
-        }
-    } else if (*n >= fixed_max) {
-        return;
+    if (*n >= *cap) {
+        int nc = *cap ? *cap * 2 : 8;
+        RmwTaintEnt *nt = (RmwTaintEnt *)realloc(*tab, (size_t)nc * sizeof(*nt));
+        if (!nt) return;
+        *tab = nt;
+        *cap = nc;
     }
     (*tab)[*n].name = nm;
     (*tab)[*n].name_len = nl;
     (*tab)[*n].global = g;
     (*n)++;
 }
+/* A plain `t = <value>` (or a declaration): t now carries exactly these. */
+static void rmw_tab_rebind(RmwTaintEnt **tab, int *n, int *cap, const char *nm, uint32_t nl,
+                           const VfSet *srcs) {
+    if (!nm || nl == 0) return;
+    for (int i = 0; i < *n; i++)
+        if ((*tab)[i].name_len == nl && memcmp((*tab)[i].name, nm, nl) == 0)
+            (*tab)[i].global = NULL;
+    for (int i = 0; i < srcs->n; i++) rmw_tab_add(tab, n, cap, nm, nl, srcs->v[i]);
+}
 
-/* Which global (if any) does this expression's value come from? A direct read of
- * a global, or a read of a local already carrying one. Depth-limited, partial by
- * design like `expr_mentions_global` — an unlisted node kind yields "none", which
- * costs a missed rejection and never a wrong one. */
-static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
-                                       Node *e, int depth) {
-    /* The walk RECORDS a source for a later rule; there is no conservative
-     * value to return past the cap ("came from every global" cannot be a row),
-     * so the remedy is a cap past anything real. BUG-1016: "anything real" is
-     * check_expr's bound, NOT the parser's 256 — a flat `g + 1 + ... (300 terms)`
-     * parses iteratively, reached depth 300 here, lost the taint, and
-     * `u32 t = <that>; g = t;` was accepted at both race sinks. */
-    if (!e || depth > ZER_EXPR_WALK_MAX) return NULL;
-    #define RVS(x) rmw_value_source_global(c, tab, n, (x), depth + 1)
+typedef struct { Checker *c; VfSet *out; } RmwSrcUd;
+static void rmw_src_visit(Checker *c, Symbol *g, void *ud) {
+    RmwSrcUd *u = (RmwSrcUd *)ud;
+    vfset_add(c, u->out, g);
+}
+/* Every global this expression's value may come from: a direct read of a
+ * global, a read through a pointer (every object it may designate), a local
+ * carrying globals, a call's result (the callee's value-flow summary). */
+static void rmw_value_sources(Checker *c, RmwTaintEnt *tab, int n, Node *e, int depth,
+                              VfSet *out) {
+    /* The walk RECORDS sources for a later rule; past the cap there is no
+     * conservative set ("every global" cannot be a row), so the remedy is a
+     * cap past anything real (BUG-1016: check_expr's bound). */
+    if (!e || depth > ZER_EXPR_WALK_MAX) return;
+    #define RVS(x) rmw_value_sources(c, tab, n, (x), depth + 1, out)
     switch (e->kind) {
     case NODE_IDENT: {
-        Symbol *t = rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len);
-        if (t) return t;
+        bool any = false;
+        rmw_tab_collect(c, tab, n, e->ident.name, (uint32_t)e->ident.name_len, out, &any);
+        if (any) return;
         /* A GLOBAL read. Same test `resolve_write_target_global` uses on the
          * WRITE side, so the two halves of the RMW agree on what a global is. */
         Symbol *sym = scope_lookup(c->current_scope, e->ident.name,
                                    (uint32_t)e->ident.name_len);
-        if (!sym || sym->is_function) return NULL;
-        return global_decl_lookup(c, sym->name, sym->name_len);
+        if (!sym || sym->is_function) return;
+        vfset_add(c, out, global_decl_lookup(c, sym->name, sym->name_len));
+        return;
     }
     case NODE_UNARY:
         /* BUG-1168: a READ through a pointer names the POINTEE, exactly as the
-         * write side resolves it. `u32 t = *gp; *gp = t + 1;` with a GLOBAL
-         * `volatile *u32 gp = &g` recorded the taint as `gp` (the pointer)
-         * while the write resolved to `g`, so the split RMW was accepted at the
-         * ISR, spawn and main sinks. A LOCAL pointer worked only because its
-         * var-decl seeds the taint `p -> g`. Same resolver both halves. */
+         * write side resolves it — every object the pointer may designate. */
         if (e->unary.op == TOK_STAR) {
-            Symbol *pt = resolve_write_target_global(c, e, 0);
-            if (pt) return pt;
+            int before = out->n;
+            RmwSrcUd u = { c, out };
+            for_each_write_target(c, e, rmw_src_visit, &u);
+            if (out->n != before) return;
         }
-        return RVS(e->unary.operand);
-    case NODE_TYPECAST: return RVS(e->typecast.expr);
-    case NODE_FIELD:    return RVS(e->field.object);
-    case NODE_INDEX: {  Symbol *l = RVS(e->index_expr.object); return l ? l : RVS(e->index_expr.index); }
-    case NODE_SLICE: {  Symbol *l = RVS(e->slice.object); if (l) return l;
-                        l = RVS(e->slice.start); return l ? l : RVS(e->slice.end); }
-    case NODE_BINARY: { Symbol *l = RVS(e->binary.left); return l ? l : RVS(e->binary.right); }
-    case NODE_ASSIGN: { Symbol *l = RVS(e->assign.value); return l ? l : RVS(e->assign.target); }
+        RVS(e->unary.operand);
+        return;
+    case NODE_TYPECAST: RVS(e->typecast.expr); return;
+    case NODE_FIELD:    RVS(e->field.object); return;
+    case NODE_INDEX:    RVS(e->index_expr.object); RVS(e->index_expr.index); return;
+    case NODE_SLICE:    RVS(e->slice.object); RVS(e->slice.start); RVS(e->slice.end); return;
+    case NODE_BINARY:   RVS(e->binary.left); RVS(e->binary.right); return;
+    case NODE_ASSIGN:   RVS(e->assign.value); RVS(e->assign.target); return;
     case NODE_INTRINSIC:
-        for (int i = 0; i < e->intrinsic.arg_count; i++) { Symbol *r = RVS(e->intrinsic.args[i]); if (r) return r; }
-        return NULL;
-    case NODE_CALL:
-        for (int i = 0; i < e->call.arg_count; i++) { Symbol *r = RVS(e->call.args[i]); if (r) return r; }
-        return vf_call_ret_global(c, e);   /* BUG-1561: `u32 t = rd();` */
-    case NODE_ORELSE: { Symbol *l = RVS(e->orelse.expr); return l ? l : RVS(e->orelse.fallback); }
+        for (int i = 0; i < e->intrinsic.arg_count; i++) RVS(e->intrinsic.args[i]);
+        return;
+    case NODE_CALL:     call_value_sources(c, tab, n, e, depth, out); return;   /* BUG-1561/1564 */
+    case NODE_ORELSE:   RVS(e->orelse.expr); RVS(e->orelse.fallback); return;
     case NODE_STRUCT_INIT:
-        for (int i = 0; i < e->struct_init.field_count; i++) { Symbol *r = RVS(e->struct_init.fields[i].value); if (r) return r; }
-        return NULL;
+        for (int i = 0; i < e->struct_init.field_count; i++) RVS(e->struct_init.fields[i].value);
+        return;
     /* Leaves that cannot carry a global's value, and statement kinds an
      * expression walker is never handed. */
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
@@ -6976,10 +6997,9 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
     case NODE_CONTINUE: case NODE_DEFER: case NODE_GOTO: case NODE_LABEL:
     case NODE_EXPR_STMT: case NODE_ASM: case NODE_CRITICAL: case NODE_ONCE:
     case NODE_SPAWN: case NODE_YIELD: case NODE_AWAIT: case NODE_STATIC_ASSERT:
-        return NULL;
+        return;
     }
     #undef RVS
-    return NULL;
 }
 
 /* BUG-1010 / BUG-1526: maintain a value-taint table across one assignment
@@ -6987,16 +7007,15 @@ static Symbol *rmw_value_source_global(Checker *c, RmwTaintEnt *tab, int n,
  * spawn-scan sink, so the two cannot disagree. A plain `t = <expr>` into a bare
  * local re-binds (and, from no global, CLEARS) its taint. A COMPOUND op or a
  * write into a PROJECTION of a local (`t += g`, `t.v = g`, `t[0] = g`) ADDS
- * the value's global to the root local and never clears — before BUG-1526 those
- * spellings carried nothing and `t.v = g; g = t.v + 1;` was a split RMW
- * accepted at both sinks (TSan: lost updates). */
+ * the value's globals to the root local and never clears. */
 static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
                                Node *node) {
     Node *tg = node->assign.target;
     if (!tg) return;
+    VfSet srcs = {0};
+    rmw_value_sources(c, *tab, *n, node->assign.value, 0, &srcs);
     if (node->assign.op == TOK_EQ && tg->kind == NODE_IDENT) {
-        rmw_tab_set(tab, n, cap, 0, tg->ident.name, (uint32_t)tg->ident.name_len,
-                    rmw_value_source_global(c, *tab, *n, node->assign.value, 0));
+        rmw_tab_rebind(tab, n, cap, tg->ident.name, (uint32_t)tg->ident.name_len, &srcs);
         return;
     }
     Node *rt = tg;
@@ -7008,12 +7027,12 @@ static void rmw_taint_maintain(Checker *c, RmwTaintEnt **tab, int *n, int *cap,
         rt = ob;
     }
     if (!rt || rt->kind != NODE_IDENT) return;
-    Symbol *src = rmw_value_source_global(c, *tab, *n, node->assign.value, 0);
-    if (src) rmw_tab_set(tab, n, cap, 0, rt->ident.name, (uint32_t)rt->ident.name_len, src);
+    for (int i = 0; i < srcs.n; i++)
+        rmw_tab_add(tab, n, cap, rt->ident.name, (uint32_t)rt->ident.name_len, srcs.v[i]);
 }
 
-/* Does this value expression carry `g` through a tainted LOCAL? (A direct
- * mention of `g` itself is `assign_reads_own_target`'s job, not this one.)
+/* Does this value expression carry `g` through a tainted LOCAL or a call's
+ * result? (A direct mention of `g` itself is `assign_reads_own_target`'s job.)
  * Feeds a REJECT, so the cap and the statement kinds round to TRUE. */
 static bool rmw_value_taints_global(Checker *c, RmwTaintEnt *tab, int n, Node *e,
                                     Symbol *g, int depth) {
@@ -7022,7 +7041,7 @@ static bool rmw_value_taints_global(Checker *c, RmwTaintEnt *tab, int n, Node *e
     #define RVT(x) rmw_value_taints_global(c, tab, n, (x), g, depth + 1)
     switch (e->kind) {
     case NODE_IDENT:
-        return rmw_tab_lookup(tab, n, e->ident.name, (uint32_t)e->ident.name_len) == g;
+        return rmw_tab_has(tab, n, e->ident.name, (uint32_t)e->ident.name_len, g);
     case NODE_UNARY:    return RVT(e->unary.operand);
     case NODE_TYPECAST: return RVT(e->typecast.expr);
     case NODE_FIELD:    return RVT(e->field.object);
@@ -7033,10 +7052,14 @@ static bool rmw_value_taints_global(Checker *c, RmwTaintEnt *tab, int n, Node *e
     case NODE_INTRINSIC:
         for (int i = 0; i < e->intrinsic.arg_count; i++) if (RVT(e->intrinsic.args[i])) return true;
         return false;
-    case NODE_CALL:
-        for (int i = 0; i < e->call.arg_count; i++) if (RVT(e->call.args[i])) return true;
-        if (vf_call_ret_global(c, e) == g) return true;   /* BUG-1561: `g = rd() + 1` */
+    case NODE_CALL: {
+        /* BUG-1561/1564: the call's RESULT carries what its callee's summary
+         * says, substituted with these arguments (`g = rd() + 1`) */
+        VfSet srcs = {0};
+        call_value_sources(c, tab, n, e, depth, &srcs);
+        if (vfset_has(&srcs, g)) return true;
         return RVT(e->call.callee);
+    }
     case NODE_ORELSE:   return RVT(e->orelse.expr) || RVT(e->orelse.fallback);
     case NODE_STRUCT_INIT:
         for (int i = 0; i < e->struct_init.field_count; i++) if (RVT(e->struct_init.fields[i].value)) return true;
@@ -7088,29 +7111,74 @@ static void mmio_pw_call(Checker *c, MmioPwAcc *acc, Symbol *cs, Node *call);
  * cached on the Symbol; a call site then just tests a bit. */
 static uint64_t func_rmw_param_mask(Checker *c, Symbol *fn, int depth);
 
-/* ---- BUG-1561: value-flow summary for a read-modify-write split across calls.
+/* ---- BUG-1561/1564: value-flow summary for a read-modify-write split across calls.
  *
  * `u32 t = rd(); wr(t + 1);` with `rd` returning `g` and `wr` storing its
- * parameter into `g` is the same non-atomic read-modify-write as `g += 1`, and
- * both race sinks missed it: the split-statement taint (BUG-1010) follows a
- * global's value through LOCALS, and a call's return value carried nothing.
+ * parameter into `g` is the same non-atomic read-modify-write as `g += 1`. Per
+ * function, flow-INSENSITIVELY (a local's sources only grow, so a value set in
+ * one branch and read after the join is kept — the reject direction), the
+ * summary records:
  *
- * The summary walks the callee's body once, flow-INSENSITIVELY (a local's sources
- * only grow, so a value set in one branch and read after the join is kept — the
- * reject direction), mapping each local to the parameters and the global its
- * value may come from. A local declared in the body shadows a global of the same
- * name from its declaration on. Not followed (each a missed rejection, recorded
- * in limitations.md): a store through a pointer (`*gp = v`), a value passed
- * through a call's ARGUMENT and returned (`return id(g)`), and recursion (an
- * in-progress summary reads as empty). */
-typedef struct { const char *name; uint32_t len; uint64_t pmask; Symbol *g; } VfLocal;
+ *   SOURCES of a value — a set of globals, plus SOURCE BITS naming what the
+ *   caller supplies: VAL(i) = the value of argument i, PTD(j) = the object
+ *   argument j points to (a read through pointer parameter j);
+ *   ret        — the sources the return value may carry;
+ *   dest[bit]  — for each source bit, the globals it may be STORED into, and
+ *                the pointer parameters it may be stored THROUGH.
+ *
+ * A call site substitutes its arguments (call_value_sources /
+ * call_rmw_globals). Calls inside the summarised body are substituted the same
+ * way, so a helper forwarding a parameter to another writer is a writer. An
+ * indirect call unions every candidate target (indirect_callee_functions).
+ * Recursion is solved by iteration to a fixpoint: an in-progress function
+ * reads as its sets so far, and the head of the cycle re-walks until nothing
+ * grows. A function with more than VF_MAX_PARAMS parameters, or any body the
+ * walk cannot finish, is OPAQUE: every argument may reach every global it
+ * writes and every object any argument points to. */
+#define VF_MAX_PARAMS 64
+typedef bool (*BoundFnVisit)(Checker *c, Symbol *fn, void *ud);
+static bool indirect_callee_functions(Checker *c, Node *callee, BoundFnVisit v, void *ud);
+/* A value's sources: globals, the value of argument i (val bit i), the object
+ * argument j points to (ptd bit j). */
+typedef struct { VfSet g; uint64_t val, ptd; } VfSrc;
+static void vfsrc_union(Checker *c, VfSrc *d, const VfSrc *s) {
+    vfset_union(c, &d->g, &s->g);
+    d->val |= s->val; d->ptd |= s->ptd;
+}
+/* Where a source may be stored: globals, or through pointer parameters. */
+typedef struct { VfSet g; uint64_t via; } VfDest;
+struct VfSummary {
+    VfSrc ret;
+    VfDest val_dest[VF_MAX_PARAMS];   /* argument i's value stored there */
+    VfDest ptd_dest[VF_MAX_PARAMS];   /* argument j's pointee stored there */
+    VfSet writes;                     /* every global the body writes (opaque fallback) */
+    bool opaque;
+    int np;
+};
+/* The size of a summary — it only grows, so an unchanged size is a fixpoint. */
+static int vf_popcount64(uint64_t v) { int n = 0; while (v) { v &= v - 1; n++; } return n; }
+static uint64_t vf_summary_size(const struct VfSummary *s) {
+    uint64_t z = (uint64_t)s->ret.g.n + (uint64_t)vf_popcount64(s->ret.val) +
+                 (uint64_t)vf_popcount64(s->ret.ptd) + (uint64_t)s->writes.n + (s->opaque ? 1u : 0u);
+    for (int i = 0; i < VF_MAX_PARAMS; i++)
+        z += (uint64_t)s->val_dest[i].g.n + (uint64_t)vf_popcount64(s->val_dest[i].via) +
+             (uint64_t)s->ptd_dest[i].g.n + (uint64_t)vf_popcount64(s->ptd_dest[i].via);
+    return z;
+}
+static void vfdest_union(Checker *c, VfDest *d, const VfDest *s) {
+    vfset_union(c, &d->g, &s->g);
+    d->via |= s->via;
+}
+
+typedef struct { const char *name; uint32_t len; VfSrc src; } VfLocal;
 typedef struct {
-    Checker *c; Node *fd;
+    Checker *c; Node *fd; Symbol *fn; struct VfSummary *s;
     VfLocal *loc; int n, cap;
-    Symbol *ret_g; Symbol **pstore; int np;
 } VfCtx;
 
-static Symbol *vf_call_ret_global(Checker *c, Node *call);
+static struct VfSummary *vf_summary(Checker *c, Symbol *fn);
+typedef void (*VfCalleeFn)(Checker *c, struct VfSummary *s, void *ud);
+static void vf_for_each_callee(Checker *c, Node *call, VfCalleeFn f, void *ud);
 
 static int vf_local_find(VfCtx *x, const char *nm, uint32_t nl) {
     for (int i = x->n - 1; i >= 0; i--)
@@ -7118,7 +7186,7 @@ static int vf_local_find(VfCtx *x, const char *nm, uint32_t nl) {
     return -1;
 }
 static int vf_param_find(VfCtx *x, const char *nm, uint32_t nl) {
-    for (int i = 0; i < x->fd->func_decl.param_count && i < 64; i++) {
+    for (int i = 0; i < x->fd->func_decl.param_count && i < VF_MAX_PARAMS; i++) {
         ParamDecl *pd = &x->fd->func_decl.params[i];
         if (pd->name && pd->name_len == nl && memcmp(pd->name, nm, nl) == 0) return i;
     }
@@ -7132,30 +7200,150 @@ static int vf_local_add(VfCtx *x, const char *nm, uint32_t nl) {
         x->loc = nb; x->cap = nc;
     }
     VfLocal *l = &x->loc[x->n];
-    l->name = nm; l->len = nl; l->pmask = 0; l->g = NULL;
+    memset(l, 0, sizeof(*l));
+    l->name = nm; l->len = nl;
     return x->n++;
 }
 
-/* Which parameters (`*pm`) and which global (`*g`, first found) may the value of
- * `e` come from? */
-static void vf_value(VfCtx *x, Node *e, uint64_t *pm, Symbol **g, int depth) {
+/* The root identifier of a place, and whether the path to it goes through a
+ * dereference or a projection (`*p`, `p.f`, `p[i]`). */
+static Node *vf_place_root(Node *t, bool *stepped, bool *deref) {
+    *stepped = false; *deref = false;
+    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX || t->kind == NODE_SLICE ||
+                 (t->kind == NODE_UNARY && t->unary.op == TOK_STAR))) {
+        *stepped = true;
+        if (t->kind == NODE_UNARY) *deref = true;
+        t = t->kind == NODE_FIELD ? t->field.object :
+            t->kind == NODE_INDEX ? t->index_expr.object :
+            t->kind == NODE_SLICE ? t->slice.object : t->unary.operand;
+    }
+    return (t && t->kind == NODE_IDENT) ? t : NULL;
+}
+static bool vf_type_is_ref(Type *t) {
+    TypeKind k = type_dispatch_kind(t);
+    return k == TYPE_POINTER || k == TYPE_SLICE;
+}
+/* Collect the targets of a store through `*ident` for a global pointer. */
+typedef struct { Checker *c; VfSet *out; } VfCollectUd;
+static void vf_collect_visit(Checker *c, Symbol *g, void *ud) {
+    VfCollectUd *u = (VfCollectUd *)ud;
+    vfset_add(c, u->out, g);
+}
+static void vf_pointee_of_global(Checker *c, Symbol *pg, Node *at, VfSet *out) {
+    Node id, un;
+    memset(&id, 0, sizeof(id)); memset(&un, 0, sizeof(un));
+    id.kind = NODE_IDENT; id.loc = at ? at->loc : id.loc;
+    id.ident.name = pg->name; id.ident.name_len = pg->name_len;
+    un.kind = NODE_UNARY; un.loc = id.loc; un.unary.op = TOK_STAR; un.unary.operand = &id;
+    VfCollectUd u = { c, out };
+    for_each_write_target(c, &un, vf_collect_visit, &u);
+}
+
+static void vf_value(VfCtx *x, Node *e, VfSrc *out, int depth);
+
+/* What argument expression `arg` POINTS AT, in this function's terms: a global,
+ * a pointer parameter (ptd bit), or what a local pointer was aimed at. */
+static void vf_arg_pointee(VfCtx *x, Node *arg, VfSrc *out) {
+    if (!arg) return;
+    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+        bool st, dr;
+        Node *r = vf_place_root(arg->unary.operand, &st, &dr);
+        if (!r) return;
+        int li = vf_local_find(x, r->ident.name, (uint32_t)r->ident.name_len);
+        if (li >= 0) { if (dr) vfsrc_union(x->c, out, &x->loc[li].src); return; }
+        int pi = vf_param_find(x, r->ident.name, (uint32_t)r->ident.name_len);
+        if (pi >= 0) { if (dr) out->ptd |= 1ULL << pi; return; }
+        VfCollectUd u = { x->c, &out->g };
+        for_each_write_target(x->c, arg->unary.operand, vf_collect_visit, &u);
+        return;
+    }
+    bool st, dr;
+    Node *r = vf_place_root(arg, &st, &dr);
+    if (r && !st) {
+        int li = vf_local_find(x, r->ident.name, (uint32_t)r->ident.name_len);
+        if (li >= 0) {   /* a local pointer: whatever it was aimed at */
+            VfSrc *ls = &x->loc[li].src;
+            for (int i = 0; i < ls->g.n; i++) {
+                Symbol *g = ls->g.v[i];
+                if (g->type && vf_type_is_ref(g->type)) vf_pointee_of_global(x->c, g, arg, &out->g);
+                else vfset_add(x->c, &out->g, g);
+            }
+            out->ptd |= ls->ptd;
+            out->ptd |= ls->val;   /* a parameter's value copied into the local */
+            return;
+        }
+        int pi = vf_param_find(x, r->ident.name, (uint32_t)r->ident.name_len);
+        if (pi >= 0) { out->ptd |= 1ULL << pi; return; }
+        Symbol *gs = global_decl_lookup(x->c, r->ident.name, (uint32_t)r->ident.name_len);
+        if (gs && !gs->is_function) vf_pointee_of_global(x->c, gs, arg, &out->g);
+        return;
+    }
+    /* anything else: every target the shared resolver finds through it */
+    Node un;
+    memset(&un, 0, sizeof(un));
+    un.kind = NODE_UNARY; un.loc = arg->loc; un.unary.op = TOK_STAR; un.unary.operand = arg;
+    VfCollectUd u = { x->c, &out->g };
+    for_each_write_target(x->c, &un, vf_collect_visit, &u);
+}
+
+/* Substitute a callee summary's source bits with this call's arguments. */
+static void vf_subst_src(VfCtx *x, Node *call, uint64_t val, uint64_t ptd, VfSrc *out, int depth) {
+    for (int i = 0; i < call->call.arg_count && i < VF_MAX_PARAMS; i++) {
+        if (val & (1ULL << i)) vf_value(x, call->call.args[i], out, depth + 1);
+        if (ptd & (1ULL << i)) vf_arg_pointee(x, call->call.args[i], out);
+    }
+}
+
+typedef struct { VfCtx *x; Node *call; VfSrc *out; int depth; } VfRetUd;
+static void vf_ret_callee(Checker *c, struct VfSummary *s, void *ud) {
+    VfRetUd *u = (VfRetUd *)ud;
+    if (!s || s->opaque) {   /* every argument, and everything they point at */
+        for (int i = 0; i < u->call->call.arg_count; i++) {
+            vf_value(u->x, u->call->call.args[i], u->out, u->depth + 1);
+            vf_arg_pointee(u->x, u->call->call.args[i], u->out);
+        }
+        if (s) vfset_union(c, &u->out->g, &s->writes);
+        return;
+    }
+    vfset_union(c, &u->out->g, &s->ret.g);
+    vf_subst_src(u->x, u->call, s->ret.val, s->ret.ptd, u->out, u->depth);
+}
+
+/* Which globals / argument values / argument pointees may the value of `e`
+ * come from? */
+static void vf_value(VfCtx *x, Node *e, VfSrc *out, int depth) {
     if (!e || depth > ZER_EXPR_WALK_MAX) return;
-    #define VFV(y) vf_value(x, (y), pm, g, depth + 1)
+    #define VFV(y) vf_value(x, (y), out, depth + 1)
     switch (e->kind) {
     case NODE_IDENT: {
         const char *nm = e->ident.name; uint32_t nl = (uint32_t)e->ident.name_len;
         int li = vf_local_find(x, nm, nl);
-        if (li >= 0) { *pm |= x->loc[li].pmask; if (!*g) *g = x->loc[li].g; return; }
+        if (li >= 0) { vfsrc_union(x->c, out, &x->loc[li].src); return; }
         int pi = vf_param_find(x, nm, nl);
-        if (pi >= 0) { *pm |= 1ULL << pi; return; }
+        if (pi >= 0) { out->val |= 1ULL << pi; return; }
         Symbol *s = global_decl_lookup(x->c, nm, nl);
-        if (s && !s->is_function && !*g) *g = s;
+        if (s && !s->is_function) vfset_add(x->c, &out->g, s);
         return;
     }
-    case NODE_UNARY:    VFV(e->unary.operand); return;
+    case NODE_UNARY:
+        if (e->unary.op == TOK_STAR) { vf_arg_pointee(x, e->unary.operand, out); return; }
+        VFV(e->unary.operand);
+        return;
+    case NODE_FIELD: case NODE_INDEX: {
+        /* a projection of a parameter reads its value or (through a pointer)
+         * what it points at — both, since the type is not consulted */
+        bool st, dr;
+        Node *r = vf_place_root(e, &st, &dr);
+        if (r) {
+            int pi = vf_param_find(x, r->ident.name, (uint32_t)r->ident.name_len);
+            if (pi >= 0 && vf_local_find(x, r->ident.name, (uint32_t)r->ident.name_len) < 0)
+                out->ptd |= 1ULL << pi;
+        }
+        if (e->kind == NODE_FIELD) VFV(e->field.object);
+        else { VFV(e->index_expr.object); VFV(e->index_expr.index); }
+        return;
+    }
     case NODE_TYPECAST: VFV(e->typecast.expr); return;
-    case NODE_FIELD:    VFV(e->field.object); return;
-    case NODE_INDEX:    VFV(e->index_expr.object); VFV(e->index_expr.index); return;
     case NODE_SLICE:    VFV(e->slice.object); VFV(e->slice.start); VFV(e->slice.end); return;
     case NODE_BINARY:   VFV(e->binary.left); VFV(e->binary.right); return;
     case NODE_ASSIGN:   VFV(e->assign.value); return;
@@ -7167,10 +7355,8 @@ static void vf_value(VfCtx *x, Node *e, uint64_t *pm, Symbol **g, int depth) {
         for (int i = 0; i < e->struct_init.field_count; i++) VFV(e->struct_init.fields[i].value);
         return;
     case NODE_CALL: {
-        /* Arguments are read too (the same answer rmw_value_source_global gives). */
-        for (int i = 0; i < e->call.arg_count; i++) VFV(e->call.args[i]);
-        Symbol *rg = vf_call_ret_global(x->c, e);
-        if (rg && !*g) *g = rg;
+        VfRetUd u = { x, e, out, depth };
+        vf_for_each_callee(x->c, e, vf_ret_callee, &u);
         return;
     }
     /* Leaves that carry no global's value, and statement kinds an expression
@@ -7190,87 +7376,120 @@ static void vf_value(VfCtx *x, Node *e, uint64_t *pm, Symbol **g, int depth) {
     #undef VFV
 }
 
-/* One assignment's effect: into a local (its sources grow), or into a global
- * (every parameter in the value is recorded as stored there). A target reached
- * through a dereference is not followed. */
-/* Record that the parameters in `pm` may be stored into global `g`. */
-static void vf_param_store_mark(VfCtx *x, uint64_t pm, Symbol *g) {
-    if (!g || g->is_function) return;
-    for (int i = 0; i < x->np && i < 64; i++)
-        if ((pm & (1ULL << i)) && !x->pstore[i]) x->pstore[i] = g;
+/* Record that every source in `src` may be stored into `dst`. */
+static void vf_store(VfCtx *x, const VfSrc *src, const VfDest *dst) {
+    for (int i = 0; i < VF_MAX_PARAMS; i++) {
+        if (src->val & (1ULL << i)) vfdest_union(x->c, &x->s->val_dest[i], dst);
+        if (src->ptd & (1ULL << i)) vfdest_union(x->c, &x->s->ptd_dest[i], dst);
+    }
 }
-typedef struct { VfCtx *x; uint64_t pm; } VfStoreUd;
-static void vf_store_visit(Checker *c, Symbol *g, void *ud) {
-    (void)c;
-    VfStoreUd *u = (VfStoreUd *)ud;
-    vf_param_store_mark(u->x, u->pm, g);
+/* Where a store through argument expression `arg` lands, in this function's
+ * terms (the pointee of `arg`). */
+static void vf_arg_dest(VfCtx *x, Node *arg, VfDest *out) {
+    VfSrc p;
+    memset(&p, 0, sizeof(p));
+    vf_arg_pointee(x, arg, &p);
+    vfset_union(x->c, &out->g, &p.g);
+    out->via |= p.ptd;
 }
 
-/* One assignment's effect: into a local (its sources grow), or into a global
- * (every parameter in the value is recorded as stored there). A store THROUGH
- * a pointer lands on the pointee: a global pointer's targets (the shared
- * resolver, retargets included), or the global a local pointer was aimed at
- * (`*u32 p = &g;` gives p the source g). A store through a pointer PARAMETER
- * lands in the caller's object — func_rmw_param_mask's question, not this one. */
+/* One assignment's effect. */
 static void vf_assign(VfCtx *x, Node *n) {
-    Node *t = n->assign.target;
-    bool deref = false;
-    while (t && (t->kind == NODE_FIELD || t->kind == NODE_INDEX || t->kind == NODE_SLICE ||
-                 (t->kind == NODE_UNARY && t->unary.op == TOK_STAR))) {
-        if (t->kind == NODE_UNARY) deref = true;
-        t = t->kind == NODE_FIELD ? t->field.object :
-            t->kind == NODE_INDEX ? t->index_expr.object :
-            t->kind == NODE_SLICE ? t->slice.object : t->unary.operand;
+    VfSrc src;
+    memset(&src, 0, sizeof(src));
+    vf_value(x, n->assign.value, &src, 0);
+    bool st, dr;
+    Node *r = vf_place_root(n->assign.target, &st, &dr);
+    VfDest d;
+    memset(&d, 0, sizeof(d));
+    if (!r) {   /* a target the root walk cannot name: every resolver target */
+        VfCollectUd u = { x->c, &d.g };
+        for_each_write_target(x->c, n->assign.target, vf_collect_visit, &u);
+        vfset_union(x->c, &x->s->writes, &d.g);
+        vf_store(x, &src, &d);
+        return;
     }
-    if (!t || t->kind != NODE_IDENT) return;
-    uint64_t pm = 0; Symbol *g = NULL;
-    vf_value(x, n->assign.value, &pm, &g, 0);
-    const char *nm = t->ident.name; uint32_t nl = (uint32_t)t->ident.name_len;
+    const char *nm = r->ident.name; uint32_t nl = (uint32_t)r->ident.name_len;
     int li = vf_local_find(x, nm, nl);
-    if (deref) {
-        if (li >= 0) {
-            Symbol *pg = x->loc[li].g;
-            if (!pg || !pg->type) return;
-            TypeKind pk = type_dispatch_kind(pg->type);
-            if (pk != TYPE_POINTER && pk != TYPE_SLICE) {   /* aimed `&g` */
-                vf_param_store_mark(x, pm, pg);
-                return;
-            }
-            /* a copy of a global pointer: store through that pointer */
-            Node id, un;
-            memset(&id, 0, sizeof(id)); memset(&un, 0, sizeof(un));
-            id.kind = NODE_IDENT; id.loc = t->loc;
-            id.ident.name = pg->name; id.ident.name_len = pg->name_len;
-            un.kind = NODE_UNARY; un.loc = t->loc; un.unary.op = TOK_STAR; un.unary.operand = &id;
-            VfStoreUd ud = { x, pm };
-            for_each_write_target(x->c, &un, vf_store_visit, &ud);
+    int pi = li < 0 ? vf_param_find(x, nm, nl) : -1;
+    if (li >= 0) {
+        if (!dr) { vfsrc_union(x->c, &x->loc[li].src, &src); return; }   /* the local itself */
+        /* through a local pointer: where it was aimed */
+        Node id;
+        memset(&id, 0, sizeof(id));
+        id.kind = NODE_IDENT; id.loc = r->loc; id.ident.name = nm; id.ident.name_len = nl;
+        vf_arg_dest(x, &id, &d);
+    } else if (pi >= 0) {
+        if (!st) {   /* rebinding the parameter itself: a local from here on */
+            int nli = vf_local_add(x, nm, nl);
+            if (nli >= 0) { x->loc[nli].src.val |= 1ULL << pi; vfsrc_union(x->c, &x->loc[nli].src, &src); }
             return;
         }
-        if (vf_param_find(x, nm, nl) >= 0) return;
-        VfStoreUd ud = { x, pm };
-        for_each_write_target(x->c, n->assign.target, vf_store_visit, &ud);
+        d.via |= 1ULL << pi;   /* through (or into) the parameter: the caller's object */
+    } else {
+        VfCollectUd u = { x->c, &d.g };
+        for_each_write_target(x->c, n->assign.target, vf_collect_visit, &u);
+    }
+    vfset_union(x->c, &x->s->writes, &d.g);
+    vf_store(x, &src, &d);
+}
+
+typedef struct { VfCtx *x; Node *call; } VfCallUd;
+static void vf_call_callee(Checker *c, struct VfSummary *s, void *ud) {
+    VfCallUd *u = (VfCallUd *)ud;
+    VfCtx *x = u->x;
+    Node *call = u->call;
+    int na = call->call.arg_count;
+    if (!s || s->opaque) {
+        /* every argument may reach every global the callee writes and
+         * every object any argument points to */
+        VfDest d;
+        memset(&d, 0, sizeof(d));
+        if (s) vfset_union(c, &d.g, &s->writes);
+        for (int k = 0; k < na; k++) vf_arg_dest(x, call->call.args[k], &d);
+        for (int i = 0; i < na; i++) {
+            VfSrc src;
+            memset(&src, 0, sizeof(src));
+            vf_value(x, call->call.args[i], &src, 0);
+            vf_arg_pointee(x, call->call.args[i], &src);
+            vf_store(x, &src, &d);
+        }
+        vfset_union(c, &x->s->writes, &d.g);
         return;
     }
-    if (li < 0 && vf_param_find(x, nm, nl) >= 0) li = vf_local_add(x, nm, nl);
-    if (li >= 0) {
-        x->loc[li].pmask |= pm;
-        if (!x->loc[li].g) x->loc[li].g = g;
-        return;
+    vfset_union(c, &x->s->writes, &s->writes);
+    for (int b = 0; b < na && b < VF_MAX_PARAMS; b++) {
+        for (int kind = 0; kind < 2; kind++) {
+            VfDest *cd = kind == 0 ? &s->val_dest[b] : &s->ptd_dest[b];
+            if (cd->g.n == 0 && cd->via == 0) continue;
+            VfDest d;
+            memset(&d, 0, sizeof(d));
+            vfset_union(c, &d.g, &cd->g);
+            for (int k = 0; k < na && k < VF_MAX_PARAMS; k++)
+                if (cd->via & (1ULL << k)) vf_arg_dest(x, call->call.args[k], &d);
+            VfSrc src;
+            memset(&src, 0, sizeof(src));
+            if (kind == 0) vf_value(x, call->call.args[b], &src, 0);
+            else vf_arg_pointee(x, call->call.args[b], &src);
+            vfset_union(c, &x->s->writes, &d.g);
+            vf_store(x, &src, &d);
+        }
     }
-    vf_param_store_mark(x, pm, global_decl_lookup(x->c, nm, nl));
 }
 
 static void vf_walk(VfCtx *x, Node *n, int depth) {
-    if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
+    if (!n) return;
+    if (depth > 4 * ZER_STMT_NEST_MAX) { x->s->opaque = true; return; }
     #define VFW(y) vf_walk(x, (y), depth + 1)
     switch (n->kind) {
     case NODE_VAR_DECL: {
         VFW(n->var_decl.init);   /* assignments nested in the initializer */
-        uint64_t pm = 0; Symbol *g = NULL;
-        vf_value(x, n->var_decl.init, &pm, &g, 0);
+        VfSrc src;
+        memset(&src, 0, sizeof(src));
+        vf_value(x, n->var_decl.init, &src, 0);
         if (n->var_decl.name) {
             int li = vf_local_add(x, n->var_decl.name, (uint32_t)n->var_decl.name_len);
-            if (li >= 0) { x->loc[li].pmask = pm; x->loc[li].g = g; }
+            if (li >= 0) x->loc[li].src = src;
         }
         return;
     }
@@ -7280,9 +7499,10 @@ static void vf_walk(VfCtx *x, Node *n, int depth) {
         return;
     case NODE_RETURN: {
         VFW(n->ret.expr);
-        uint64_t pm = 0; Symbol *g = NULL;
-        vf_value(x, n->ret.expr, &pm, &g, 0);
-        if (g && !x->ret_g) x->ret_g = g;
+        VfSrc src;
+        memset(&src, 0, sizeof(src));
+        vf_value(x, n->ret.expr, &src, 0);
+        vfsrc_union(x->c, &x->s->ret, &src);
         return;
     }
     case NODE_BLOCK:
@@ -7312,19 +7532,13 @@ static void vf_walk(VfCtx *x, Node *n, int depth) {
         return;
     case NODE_BINARY:    VFW(n->binary.left); VFW(n->binary.right); return;
     case NODE_UNARY:     VFW(n->unary.operand); return;
-    case NODE_CALL:
+    case NODE_CALL: {
         VFW(n->call.callee);
-        for (int i = 0; i < n->call.arg_count; i++) {
-            VFW(n->call.args[i]);
-            /* a parameter FORWARDED to a callee that stores it into a global
-             * (`void wr(u32 v) { wr2(v); }`) is stored there by this function */
-            Symbol *ps = vf_call_param_store(x->c, n, i);
-            if (!ps) continue;
-            uint64_t pm = 0; Symbol *g = NULL;
-            vf_value(x, n->call.args[i], &pm, &g, 0);
-            vf_param_store_mark(x, pm, ps);
-        }
+        for (int i = 0; i < n->call.arg_count; i++) VFW(n->call.args[i]);
+        VfCallUd u = { x, n };
+        vf_for_each_callee(x->c, n, vf_call_callee, &u);
         return;
+    }
     case NODE_FIELD:     VFW(n->field.object); return;
     case NODE_INDEX:     VFW(n->index_expr.object); VFW(n->index_expr.index); return;
     case NODE_SLICE:     VFW(n->slice.object); VFW(n->slice.start); VFW(n->slice.end); return;
@@ -7336,13 +7550,15 @@ static void vf_walk(VfCtx *x, Node *n, int depth) {
     case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++) VFW(n->struct_init.fields[i].value);
         return;
+    /* inline asm (naked-only): its outputs may write anything it names */
+    case NODE_ASM: x->s->opaque = true; return;
     /* No statement or assignment below these. */
     case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL:
     case NODE_ENUM_DECL: case NODE_UNION_DECL: case NODE_TYPEDEF:
     case NODE_IMPORT: case NODE_CINCLUDE: case NODE_INTERRUPT:
     case NODE_MMIO: case NODE_GLOBAL_VAR: case NODE_CONTAINER_DECL:
     case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL:
-    case NODE_ASM: case NODE_YIELD: case NODE_STATIC_ASSERT:
+    case NODE_YIELD: case NODE_STATIC_ASSERT:
     case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT:
     case NODE_CHAR_LIT: case NODE_BOOL_LIT: case NODE_NULL_LIT:
     case NODE_IDENT: case NODE_CAST: case NODE_SIZEOF:
@@ -7351,50 +7567,217 @@ static void vf_walk(VfCtx *x, Node *n, int depth) {
     #undef VFW
 }
 
-static void vf_summary(Checker *c, Symbol *fn) {
-    if (!fn || !fn->is_function || fn->vf_state != 0) return;
+/* The recursion fixpoint. `vf_stack` holds the functions being summarised; a
+ * call to one of them reads its sets so far and records the shallowest such
+ * function as `vf_low`. A function that saw nothing below itself finalises; a
+ * function that saw a function below it stays PROVISIONAL (state 0, sets kept)
+ * so it is re-walked; the head of the cycle iterates until no set grows. */
+static Symbol **vf_stack;
+static int vf_sp, vf_scap;
+static int vf_low = 1 << 30;
+
+static struct VfSummary *vf_summary(Checker *c, Symbol *fn) {
+    if (!fn || !fn->is_function) return NULL;
+    if (fn->vf_state == 2) return fn->vf;
+    if (fn->vf_state == 1) {   /* recursion: read the sets so far */
+        for (int i = 0; i < vf_sp; i++)
+            if (vf_stack[i] == fn && i < vf_low) vf_low = i;
+        return fn->vf;
+    }
     Node *fd = fn->func_node;
-    if (!fd || fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) { fn->vf_state = 2; return; }
-    fn->vf_state = 1;   /* recursion guard */
-    VfCtx x;
-    memset(&x, 0, sizeof(x));
-    x.c = c; x.fd = fd;
-    x.np = fd->func_decl.param_count;
-    if (x.np > 0)
-        x.pstore = (Symbol **)arena_alloc(c->arena, (size_t)x.np * sizeof(Symbol *));
-    if (x.np > 0 && x.pstore) memset(x.pstore, 0, (size_t)x.np * sizeof(Symbol *));
-    if (x.np > 0 && !x.pstore) x.np = 0;
-    DeclModuleSave dm = decl_module_enter(c, fn);   /* resolve names in fn's module */
-    vf_walk(&x, fd->func_decl.body, 0);
-    decl_module_leave(c, dm);
-    free(x.loc);
-    fn->vf_ret_global = x.ret_g;
-    fn->vf_param_store = x.pstore;
-    fn->vf_param_count = x.np;
-    fn->vf_state = 2;
+    if (!fd || fd->kind != NODE_FUNC_DECL || !fd->func_decl.body) return NULL;
+    if (!fn->vf) {
+        fn->vf = (struct VfSummary *)arena_alloc(c->arena, sizeof(struct VfSummary));
+        if (!fn->vf) return NULL;
+        memset(fn->vf, 0, sizeof(struct VfSummary));
+        fn->vf->np = fd->func_decl.param_count;
+        if (fd->func_decl.param_count > VF_MAX_PARAMS) fn->vf->opaque = true;
+    }
+    if (vf_sp >= vf_scap) {
+        int nc = vf_scap ? vf_scap * 2 : 16;
+        Symbol **nb = (Symbol **)realloc(vf_stack, (size_t)nc * sizeof(Symbol *));
+        if (!nb) { fn->vf->opaque = true; fn->vf_state = 2; return fn->vf; }
+        vf_stack = nb; vf_scap = nc;
+    }
+    int my = vf_sp;
+    vf_stack[vf_sp++] = fn;
+    int saved_low = vf_low;
+    for (;;) {
+        fn->vf_state = 1;
+        vf_low = 1 << 30;
+        uint64_t g0 = vf_summary_size(fn->vf);
+        VfCtx x;
+        memset(&x, 0, sizeof(x));
+        x.c = c; x.fd = fd; x.fn = fn; x.s = fn->vf;
+        DeclModuleSave dm = decl_module_enter(c, fn);
+        vf_walk(&x, fd->func_decl.body, 0);
+        decl_module_leave(c, dm);
+        free(x.loc);
+        if (vf_low < my) {          /* depends on a function still below us */
+            fn->vf_state = 0;
+            if (vf_low < saved_low) saved_low = vf_low;
+            break;
+        }
+        if (vf_low == my && vf_summary_size(fn->vf) != g0) continue;   /* head of a cycle: iterate */
+        fn->vf_state = 2;
+        break;
+    }
+    vf_sp = my;
+    vf_low = saved_low;
+    return fn->vf;
 }
 
-/* The global a direct call's result may carry, or NULL. */
-static Symbol *vf_call_ret_global(Checker *c, Node *call) {
-    if (!call || call->kind != NODE_CALL || !call->call.callee ||
-        call->call.callee->kind != NODE_IDENT) return NULL;
-    Symbol *fs = global_decl_lookup(c, call->call.callee->ident.name,
-                                    (uint32_t)call->call.callee->ident.name_len);
-    if (!fs || !fs->is_function) return NULL;
-    vf_summary(c, fs);
-    return fs->vf_state == 2 ? fs->vf_ret_global : NULL;
+/* Every summary a call may run: the direct callee, or every candidate of an
+ * indirect one. NULL = an unresolvable callee (a C function, or no candidate). */
+typedef struct { VfCalleeFn f; void *ud; bool any; } VfCandUd;
+static bool vf_cand_visit(Checker *c, Symbol *fn, void *ud) {
+    VfCandUd *u = (VfCandUd *)ud;
+    u->any = true;
+    u->f(c, vf_summary(c, fn), u->ud);
+    return false;
+}
+static void vf_for_each_callee(Checker *c, Node *call, VfCalleeFn f, void *ud) {
+    if (!call || call->kind != NODE_CALL || !call->call.callee) { f(c, NULL, ud); return; }
+    Node *cal = call->call.callee;
+    if (cal->kind == NODE_IDENT) {
+        Symbol *fs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
+        if (fs && fs->is_function) {
+            struct VfSummary *s = vf_summary(c, fs);
+            if (s || fs->func_node) { f(c, s, ud); return; }
+            return;   /* a bodyless extern: C code, the FFI floor */
+        }
+    }
+    if (cal->kind == NODE_FIELD) {   /* a builtin method, unless the field is a funcptr */
+        Type *ct = typemap_get(c, cal);
+        Type *cu = ct ? type_unwrap_distinct(ct) : NULL;
+        if (cu && type_dispatch_kind(cu) == TYPE_OPTIONAL) cu = type_unwrap_optional(cu);
+        if (!cu || type_dispatch_kind(cu) != TYPE_FUNC_PTR) return;
+    }
+    VfCandUd u = { f, ud, false };
+    indirect_callee_functions(c, cal, vf_cand_visit, &u);
+    if (!u.any) f(c, NULL, ud);
 }
 
-/* The global a direct callee stores parameter `i` into, or NULL. */
-static Symbol *vf_call_param_store(Checker *c, Node *call, int i) {
-    if (!call || call->kind != NODE_CALL || !call->call.callee ||
-        call->call.callee->kind != NODE_IDENT) return NULL;
-    Symbol *fs = global_decl_lookup(c, call->call.callee->ident.name,
-                                    (uint32_t)call->call.callee->ident.name_len);
-    if (!fs || !fs->is_function) return NULL;
-    vf_summary(c, fs);
-    if (fs->vf_state != 2 || i < 0 || i >= fs->vf_param_count) return NULL;
-    return fs->vf_param_store[i];
+/* ---- The call-site queries the race sinks ask. ---- */
+
+/* Every global the argument expression points at (for a pointer argument). */
+static void call_arg_pointees(Checker *c, Node *arg, VfSet *out) {
+    if (!arg) return;
+    VfCollectUd u = { c, out };
+    if (arg->kind == NODE_UNARY && arg->unary.op == TOK_AMP) {
+        for_each_write_target(c, arg->unary.operand, vf_collect_visit, &u);
+        return;
+    }
+    Node un;
+    memset(&un, 0, sizeof(un));
+    un.kind = NODE_UNARY; un.loc = arg->loc; un.unary.op = TOK_STAR; un.unary.operand = arg;
+    for_each_write_target(c, &un, vf_collect_visit, &u);
+}
+static void rmw_value_sources(Checker *c, RmwTaintEnt *tab, int n, Node *e, int depth, VfSet *out);
+typedef struct { RmwTaintEnt *tab; int n; Node *call; VfSet *out; int depth; } CallSrcUd;
+static void call_src_callee(Checker *c, struct VfSummary *s, void *ud) {
+    CallSrcUd *u = (CallSrcUd *)ud;
+    Node *call = u->call;
+    if (!s || s->opaque) {
+        for (int i = 0; i < call->call.arg_count; i++) {
+            rmw_value_sources(c, u->tab, u->n, call->call.args[i], u->depth + 1, u->out);
+            call_arg_pointees(c, call->call.args[i], u->out);
+        }
+        if (s) vfset_union(c, u->out, &s->writes);
+        return;
+    }
+    vfset_union(c, u->out, &s->ret.g);
+    for (int i = 0; i < call->call.arg_count && i < VF_MAX_PARAMS; i++) {
+        if (s->ret.val & (1ULL << i))
+            rmw_value_sources(c, u->tab, u->n, call->call.args[i], u->depth + 1, u->out);
+        if (s->ret.ptd & (1ULL << i)) call_arg_pointees(c, call->call.args[i], u->out);
+    }
+}
+/* The globals a call's RESULT may carry. */
+static void call_value_sources(Checker *c, RmwTaintEnt *tab, int n, Node *call, int depth, VfSet *out) {
+    CallSrcUd u = { tab, n, call, out, depth };
+    vf_for_each_callee(c, call, call_src_callee, &u);
+}
+
+/* Every global a call read-modify-writes by storing a value derived from it
+ * back into it: argument i (or what it points at) carries G, and the callee
+ * stores that source into G (directly, or through a pointer argument). */
+/* `may`: the callee was named by indirect resolution (every function the call
+ * can designate) and the global was handed BY POINTER — the sinks keep their
+ * "a call through a function pointer" wording for that, not a proven RMW. */
+typedef void (*RmwHitFn)(Checker *c, Symbol *g, bool may, void *ud);
+typedef struct {
+    RmwTaintEnt *tab; int n; Node *call; RmwHitFn hit; void *ud;
+    bool indirect; VfSet handed;
+} CallRmwUd;
+static void call_rmw_check_src(Checker *c, CallRmwUd *u, const VfSet *srcs, const VfSet *dests) {
+    for (int i = 0; i < dests->n; i++)
+        if (vfset_has(srcs, dests->v[i]))
+            u->hit(c, dests->v[i], u->indirect && vfset_has(&u->handed, dests->v[i]), u->ud);
+}
+static void call_rmw_callee(Checker *c, struct VfSummary *s, void *ud) {
+    CallRmwUd *u = (CallRmwUd *)ud;
+    Node *call = u->call;
+    int na = call->call.arg_count;
+    if (!s || s->opaque) {
+        VfSet d = {0};
+        if (s) vfset_union(c, &d, &s->writes);
+        for (int k = 0; k < na; k++) call_arg_pointees(c, call->call.args[k], &d);
+        VfSet src = {0};
+        for (int i = 0; i < na; i++) {
+            rmw_value_sources(c, u->tab, u->n, call->call.args[i], 0, &src);
+            call_arg_pointees(c, call->call.args[i], &src);
+        }
+        call_rmw_check_src(c, u, &src, &d);
+        return;
+    }
+    for (int b = 0; b < na && b < VF_MAX_PARAMS; b++) {
+        for (int kind = 0; kind < 2; kind++) {
+            VfDest *cd = kind == 0 ? &s->val_dest[b] : &s->ptd_dest[b];
+            if (cd->g.n == 0 && cd->via == 0) continue;
+            VfSet d = {0};
+            vfset_union(c, &d, &cd->g);
+            for (int k = 0; k < na && k < VF_MAX_PARAMS; k++)
+                if (cd->via & (1ULL << k)) call_arg_pointees(c, call->call.args[k], &d);
+            VfSet src = {0};
+            if (kind == 0) rmw_value_sources(c, u->tab, u->n, call->call.args[b], 0, &src);
+            else call_arg_pointees(c, call->call.args[b], &src);
+            call_rmw_check_src(c, u, &src, &d);
+        }
+    }
+}
+static void call_rmw_globals(Checker *c, RmwTaintEnt *tab, int n, Node *call,
+                             RmwHitFn hit, void *ud) {
+    CallRmwUd u;
+    memset(&u, 0, sizeof(u));
+    u.tab = tab; u.n = n; u.call = call; u.hit = hit; u.ud = ud;
+    Node *cal = call ? call->call.callee : NULL;
+    Symbol *fs = (cal && cal->kind == NODE_IDENT)
+        ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len) : NULL;
+    u.indirect = !(fs && fs->is_function);
+    if (u.indirect && call)
+        for (int i = 0; i < call->call.arg_count; i++)
+            call_arg_pointees(c, call->call.args[i], &u.handed);
+    vf_for_each_callee(c, call, call_rmw_callee, &u);
+}
+static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
+                                bool is_compound, bool is_static_local, int line);
+static void main_call_rmw_hit(Checker *c, Symbol *g, bool may, void *ud) {
+    (void)ud;
+    if (may) track_isr_global_opaque(c, g->name, g->name_len);
+    else track_isr_global(c, g->name, g->name_len, true);
+}
+static bool once_single_owner(Symbol *g, Node *once);
+static Node *_scan_once_node;
+typedef struct { Symbol *g; bool may; } SpawnRmwHit;
+static void spawn_call_rmw_hit(Checker *c, Symbol *g, bool may, void *ud) {
+    (void)c;
+    SpawnRmwHit *out = (SpawnRmwHit *)ud;
+    if ((out->g && !out->may) || g->is_const) return;
+    if (zer_volatile_compound_valid(g->is_volatile ? 1 : 0, 1) == 0 &&
+        !(_scan_once_node && once_single_owner(g, _scan_once_node))) {
+        if (!out->g || !may) { out->g = g; out->may = may; }   /* a proven hit wins */
+    }
 }
 
 /* Root ident of an assignment target, seeing through deref/field/index. */
@@ -7731,6 +8114,20 @@ static bool write_target_reassign_visit(Node *value, int kind, void *ud) {
             write_target_reassign_visit(v->struct_init.fields[i].value, ANW_ASSIGN, ud);
     }
     return false;           /* keep walking: every write contributes */
+}
+
+/* BUG-1565: every global a pointer VALUE may point at (or a carrier value may
+ * carry a pointer to) — `&g`, `&g.f`, a slice of `buf`, a pointer name followed
+ * through its declaration and every reassignment, a struct literal's pointer
+ * fields, both arms of an orelse. The value-side twin of for_each_write_target. */
+static void for_each_value_pointee(Checker *c, Node *value, WriteTargetFn fn, void *ud) {
+    WriteTargetWalk w;
+    memset(&w, 0, sizeof(w));
+    w.c = c; w.fn = fn; w.ud = ud;
+    symset_init(&w.pointers);
+    symset_init(&w.emitted);
+    WriteTargetReassignUd u = { &w, 0 };
+    write_target_reassign_visit(value, ANW_ASSIGN, &u);
 }
 
 /* `names_pointee`: the node stands for what the pointer POINTS AT even when it is
@@ -16590,6 +16987,10 @@ static Type *check_expr_impl(Checker *c, Node *node) {
          * MEMOISED per-function summary, so this costs one bit test per argument —
          * the naive version (re-walking callee bodies per caller) was exponential
          * and hung test_firmware_patterns. */
+        /* BUG-1561/1564: a call storing a value derived from a global back into
+         * it (`wr(t + 1)` after `u32 t = rd();`, `wr(&g, g + 1)`, a forwarding
+         * helper, an indirect call's candidates) read-modify-writes it. */
+        call_rmw_globals(c, c->rmw_taints, c->rmw_taint_count, node, main_call_rmw_hit, NULL);
         if (node->call.callee) {
             Node *cal = node->call.callee;
             Symbol *rc = (cal->kind == NODE_IDENT)
@@ -16606,16 +17007,6 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                      * only the literal `&g`. */
                     rmw_arg_targets_main(c, node->call.args[i],
                                          track_rmw_arg_visit, NULL);   /* BUG-1124 */
-                }
-                /* BUG-1561: `wr(t + 1)` storing a value read from the same
-                 * global (`u32 t = rd();`, or `wr(g + 1)`) is a read-modify-
-                 * write of it. */
-                for (int i = 0; i < node->call.arg_count; i++) {
-                    Symbol *sg = vf_call_param_store(c, node, i);
-                    if (sg && (assign_reads_own_target(c, node->call.args[i], sg) ||
-                               rmw_value_taints_global(c, c->rmw_taints, c->rmw_taint_count,
-                                                       node->call.args[i], sg, 0)))
-                        track_isr_global(c, sg->name, sg->name_len, true);
                 }
             } else if (callee_is_opaque_funcptr(c, cal)) {
                 /* BUG-1046: a call through a function pointer — no body to
@@ -22533,7 +22924,6 @@ static Type *check_expr_impl(Checker *c, Node *node) {
 /* Forward declaration — mutual recursion with scan_func_props */
 static void ensure_func_props(Checker *c, Symbol *sym);
 /* BUG-1310 / BUG-1425: which functions can an indirect call reach? (below) */
-typedef bool (*BoundFnVisit)(Checker *c, Symbol *fn, void *ud);
 static bool indirect_callee_functions_in(Checker *c, Node *callee, Node *scope_fn,
                                          BoundFnVisit v, void *ud);
 
@@ -24253,7 +24643,25 @@ static Symbol *sync_stmt_flag_acquire(Checker *c, Node *s) {
  *          acquire hand-off);
  *   pub  — a flag the code RELEASES after it (the writer side). */
 typedef struct { Symbol *g; bool write; Symbol *lock, *acq, *pub; } SyncAcc;
-typedef struct { SyncAcc *v; int n, cap; } SyncAccSet;
+/* BUG-1565 (C4): a write of flag `f` by an instance, and the flag that
+ * instance had WAITED on before it (`acq`). */
+typedef struct { Symbol *f, *acq; } SyncFW;
+typedef struct {
+    SyncAcc *v; int n, cap;
+    SyncFW *fw; int nfw, cfw;   /* every flag this instance writes */
+    bool repeated;              /* more than one copy of this instance runs */
+} SyncAccSet;
+static void sync_fw_add(SyncAccSet *s, Symbol *f, Symbol *acq) {
+    if (!f) return;
+    for (int i = 0; i < s->nfw; i++) if (s->fw[i].f == f && s->fw[i].acq == acq) return;
+    if (s->nfw >= s->cfw) {
+        int nc = s->cfw ? s->cfw * 2 : 8;
+        SyncFW *nb = (SyncFW *)realloc(s->fw, (size_t)nc * sizeof(SyncFW));
+        if (!nb) return;
+        s->fw = nb; s->cfw = nc;
+    }
+    s->fw[s->nfw].f = f; s->fw[s->nfw].acq = acq; s->nfw++;
+}
 static bool sync_acc_has(SyncAccSet *s, SyncAcc a) {
     for (int i = 0; i < s->n; i++)
         if (s->v[i].g == a.g && s->v[i].write == a.write && s->v[i].lock == a.lock &&
@@ -24276,15 +24684,111 @@ typedef struct { Symbol *lock, *acq, *pub; } SyncCtx;
  * is the function that SPAWNED it, and only the accesses between the spawn and
  * its join count (BEFORE -> IN at the spawn, IN -> AFTER at `handle.join()`). */
 enum { SW_THREAD, SW_BEFORE, SW_IN, SW_AFTER };
+/* BUG-1565 (C2): a name bound to a global it points at (or a carrier of a
+ * pointer to it). `direct`: the name IS the pointer (any step through it
+ * reaches g); otherwise it carries one (a field step, then a deref). `decl`
+ * ends a name's entries (a declaration); later non-decl entries are
+ * reassignments, all of which the name may hold. */
+typedef struct { const char *name; uint32_t len; Symbol *g; bool direct, decl; } SyncBind;
+/* A callee already walked under this lock/flag context with these bindings. */
+typedef struct { Symbol *fn; SyncCtx ctx; SyncBind *b; int nb; } SyncSeen;
 typedef struct {
     Checker *c;
     SyncAccSet *out;
-    SyncAccSet seen;          /* (function, ctx) pairs descended; .g = the function */
+    SyncSeen *seen; int nseen, cseen;
     int phase;
-    Node *spawn;              /* WINDOW: the spawn statement */
+    Node *spawn;              /* WINDOW: the spawn statement — or, for a caller of
+                               * the spawning function (BUG-1565 C1), the CALL */
     const char *handle; uint32_t handle_len;
     Node **seq; int nseq, cseq;   /* spawn nodes met AFTER the join */
+    SyncBind *bind; int nbind, cbind;
+    int frame;                /* first binding of the function being walked */
+    Node *fnode;              /* the function being walked (indirect callees) */
 } SyncWalk;
+typedef struct { Symbol **v; int n, cap; bool direct; } SyncGl;
+static void sync_gl_add(SyncGl *l, Symbol *g) {
+    if (!g) return;
+    for (int i = 0; i < l->n; i++) if (l->v[i] == g) return;
+    if (l->n >= l->cap) {
+        int nc = l->cap ? l->cap * 2 : 4;
+        Symbol **nb = (Symbol **)realloc(l->v, (size_t)nc * sizeof(Symbol *));
+        if (!nb) return;
+        l->v = nb; l->cap = nc;
+    }
+    l->v[l->n++] = g;
+}
+static void sync_gl_cb(Checker *c, Symbol *g, void *ud) {
+    (void)c;
+    if (g && !g->is_function) sync_gl_add((SyncGl *)ud, g);
+}
+static void sync_bind_push(SyncWalk *w, const char *nm, uint32_t nl, Symbol *g,
+                           bool direct, bool decl) {
+    if (w->nbind >= w->cbind) {
+        int nc = w->cbind ? w->cbind * 2 : 16;
+        SyncBind *nb = (SyncBind *)realloc(w->bind, (size_t)nc * sizeof(SyncBind));
+        if (!nb) return;
+        w->bind = nb; w->cbind = nc;
+    }
+    SyncBind b = { nm, nl, g, direct, decl };
+    w->bind[w->nbind++] = b;
+}
+static bool sync_name_bound(SyncWalk *w, const char *nm, uint32_t nl) {
+    for (int i = w->nbind - 1; i >= w->frame; i--)
+        if (w->bind[i].len == nl && memcmp(w->bind[i].name, nm, nl) == 0) return true;
+    return false;
+}
+/* Collect the globals bound to `nm` (back to its declaration). */
+static void sync_name_globals(SyncWalk *w, const char *nm, uint32_t nl, SyncGl *out) {
+    for (int i = w->nbind - 1; i >= w->frame; i--) {
+        SyncBind *b = &w->bind[i];
+        if (b->len != nl || memcmp(b->name, nm, nl) != 0) continue;
+        sync_gl_add(out, b->g);
+        if (b->decl) return;
+    }
+}
+/* A value of a type that cannot carry a pointer binds nothing — passing `g`
+ * by value is a copy. */
+static bool sync_value_carries(Checker *c, Node *v) {
+    Type *t = typemap_get(c, v);
+    return t && type_carries_data_pointer(t, 0);
+}
+static bool sync_value_direct(Checker *c, Node *v) {
+    Type *t = v ? typemap_get(c, v) : NULL;
+    if (t && type_dispatch_kind(t) == TYPE_OPTIONAL) t = type_unwrap_optional(type_unwrap_distinct(t));
+    int k = type_dispatch_kind(t);
+    return k == TYPE_POINTER || k == TYPE_SLICE;
+}
+/* Every global the pointer VALUE `v` may point at. A name bound in this walk
+ * answers from its bindings; anything else resolves against the program. */
+static void sync_value_globals(SyncWalk *w, Node *v, SyncGl *out, int depth) {
+    v = v ? unwrap_ptr_launder(v) : NULL;
+    if (!v || depth > ZER_EXPR_WALK_MAX) return;
+    if (v->kind == NODE_ORELSE) {
+        sync_value_globals(w, v->orelse.expr, out, depth + 1);
+        sync_value_globals(w, v->orelse.fallback, out, depth + 1);
+        return;
+    }
+    if (v->kind == NODE_STRUCT_INIT) {
+        for (int i = 0; i < v->struct_init.field_count; i++)
+            sync_value_globals(w, v->struct_init.fields[i].value, out, depth + 1);
+        return;
+    }
+    if (!sync_value_carries(w->c, v)) return;
+    Node *r = (v->kind == NODE_UNARY && v->unary.op == TOK_AMP) ? v->unary.operand : v;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
+        else r = r->unary.operand;
+    }
+    if (r && r->kind == NODE_IDENT &&
+        sync_name_bound(w, r->ident.name, (uint32_t)r->ident.name_len)) {
+        sync_name_globals(w, r->ident.name, (uint32_t)r->ident.name_len, out);
+        return;
+    }
+    for_each_value_pointee(w->c, v, sync_gl_cb, out);
+}
 
 static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth);
 static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
@@ -24292,6 +24796,30 @@ static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
     SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
     sync_acc_add(w->out, a);
+}
+/* BUG-1565 (C2): an access THROUGH a name bound to a global — `*p`, `p.f`,
+ * `p[i]`, and for a carrier `*h.p` / `h.p.f` — is an access of that global.
+ * A bare pointer name is not (it reads the pointer, a local). */
+static void sync_record_bound(SyncWalk *w, Node *place, bool write, SyncCtx ctx) {
+    Node *r = place;
+    int steps = 0;
+    bool star = false;
+    while (r && (r->kind == NODE_FIELD || r->kind == NODE_INDEX || r->kind == NODE_SLICE ||
+                 (r->kind == NODE_UNARY && r->unary.op == TOK_STAR))) {
+        if (r->kind == NODE_FIELD) r = r->field.object;
+        else if (r->kind == NODE_INDEX) r = r->index_expr.object;
+        else if (r->kind == NODE_SLICE) r = r->slice.object;
+        else { r = r->unary.operand; star = true; }
+        steps++;
+    }
+    if (!r || r->kind != NODE_IDENT || steps == 0) return;
+    for (int i = w->nbind - 1; i >= w->frame; i--) {
+        SyncBind *b = &w->bind[i];
+        if (b->len != (uint32_t)r->ident.name_len ||
+            memcmp(b->name, r->ident.name, b->len) != 0) continue;
+        if (b->g && (b->direct || star || steps >= 2)) sync_record(w, b->g, write, ctx);
+        if (b->decl) return;
+    }
 }
 /* An lvalue: its ROOT is named, not read; its index expressions are read. */
 static void sync_lvalue(SyncWalk *w, Node *t, SyncCtx ctx, int depth) {
@@ -24332,6 +24860,71 @@ static int sync_phase_join(int a, int b) {
     if (a == SW_AFTER || b == SW_AFTER) return SW_AFTER;
     return SW_BEFORE;
 }
+static bool sync_seen_same(SyncSeen *a, Symbol *fn, SyncCtx ctx, SyncBind *b, int nb) {
+    if (a->fn != fn || a->nb != nb || a->ctx.lock != ctx.lock || a->ctx.acq != ctx.acq ||
+        a->ctx.pub != ctx.pub) return false;
+    for (int i = 0; i < nb; i++)
+        if (a->b[i].g != b[i].g || a->b[i].direct != b[i].direct ||
+            a->b[i].decl != b[i].decl || a->b[i].len != b[i].len ||
+            memcmp(a->b[i].name, b[i].name, b[i].len) != 0) return false;
+    return true;
+}
+/* Walk callee `fs` as part of this instance, its parameters bound to what the
+ * arguments point at (BUG-1565 C2). Each (callee, context, bindings) once. */
+static void sync_descend(SyncWalk *w, Symbol *fs, Node **args, int nargs, SyncCtx ctx,
+                         int depth) {
+    if (!fs || !fs->is_function || !fs->func_node || fs->func_node->kind != NODE_FUNC_DECL ||
+        !fs->func_node->func_decl.body) return;
+    Node *fd = fs->func_node;
+    /* resolve every argument in the CALLER's bindings before pushing any */
+    SyncBind *nb = NULL; int nn = 0, cn = 0;
+    for (int i = 0; i < fd->func_decl.param_count && i < nargs; i++) {
+        ParamDecl *pd = &fd->func_decl.params[i];
+        SyncGl gl; memset(&gl, 0, sizeof(gl));
+        sync_value_globals(w, args[i], &gl, 0);
+        bool direct = sync_value_direct(w->c, args[i]);
+        int cnt = gl.n ? gl.n : 1;
+        for (int j = 0; j < cnt; j++) {
+            if (nn >= cn) {
+                int nc = cn ? cn * 2 : 8;
+                SyncBind *x = (SyncBind *)realloc(nb, (size_t)nc * sizeof(SyncBind));
+                if (!x) break;
+                nb = x; cn = nc;
+            }
+            SyncBind b = { pd->name, (uint32_t)pd->name_len, gl.n ? gl.v[j] : NULL, direct, j == 0 };
+            nb[nn++] = b;
+        }
+        free(gl.v);
+    }
+    for (int i = 0; i < w->nseen; i++)
+        if (sync_seen_same(&w->seen[i], fs, ctx, nb, nn)) { free(nb); return; }
+    if (w->nseen >= w->cseen) {
+        int nc = w->cseen ? w->cseen * 2 : 8;
+        SyncSeen *x = (SyncSeen *)realloc(w->seen, (size_t)nc * sizeof(SyncSeen));
+        if (!x) { free(nb); return; }
+        w->seen = x; w->cseen = nc;
+    }
+    SyncSeen sn = { fs, ctx, nb, nn };
+    w->seen[w->nseen++] = sn;   /* owns nb */
+    int sv_frame = w->frame, sv_n = w->nbind, sv_phase = w->phase;
+    Node *sv_fn = w->fnode;
+    w->frame = w->nbind;
+    for (int i = 0; i < nn; i++)
+        sync_bind_push(w, nb[i].name, nb[i].len, nb[i].g, nb[i].direct, nb[i].decl);
+    w->phase = SW_THREAD;   /* the whole callee runs in the window */
+    w->fnode = fd;
+    DeclModuleSave dm = decl_module_enter(w->c, fs);
+    sync_walk(w, fd->func_decl.body, ctx, depth + 1);
+    decl_module_leave(w->c, dm);
+    w->frame = sv_frame; w->nbind = sv_n; w->phase = sv_phase; w->fnode = sv_fn;
+}
+typedef struct { SyncWalk *w; Node **args; int nargs; SyncCtx ctx; int depth; } SyncIndUd;
+static bool sync_indirect_visit(Checker *c, Symbol *fn, void *ud) {
+    (void)c;
+    SyncIndUd *u = (SyncIndUd *)ud;
+    sync_descend(u->w, fn, u->args, u->nargs, u->ctx, u->depth);
+    return false;
+}
 static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
     Checker *c = w->c;
@@ -24344,12 +24937,26 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     }
     case NODE_ASSIGN: {
         sync_record(w, resolve_write_target_global(c, n->assign.target, 0), true, ctx);
+        sync_record_bound(w, n->assign.target, true, ctx);
         sync_lvalue(w, n->assign.target, ctx, depth + 1);
         SW(n->assign.value);
+        /* a bound name re-aimed: it may now hold this value's targets too */
+        Node *t = n->assign.target;
+        if (t && t->kind == NODE_IDENT &&
+            sync_name_bound(w, t->ident.name, (uint32_t)t->ident.name_len)) {
+            SyncGl gl; memset(&gl, 0, sizeof(gl));
+            sync_value_globals(w, n->assign.value, &gl, 0);
+            bool direct = sync_value_direct(c, n->assign.value);
+            for (int i = 0; i < gl.n; i++)
+                sync_bind_push(w, t->ident.name, (uint32_t)t->ident.name_len, gl.v[i],
+                               direct, false);
+            free(gl.v);
+        }
         return;
     }
     case NODE_UNARY:
         if (n->unary.op == TOK_AMP) { sync_lvalue(w, n->unary.operand, ctx, depth + 1); return; }
+        if (n->unary.op == TOK_STAR) sync_record_bound(w, n, false, ctx);
         SW(n->unary.operand);
         return;
     case NODE_CALL: {
@@ -24364,22 +24971,20 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
             w->phase = SW_AFTER;
             return;
         }
+        /* BUG-1565 (C1): the call of the function that started a fire-and-
+         * forget thread — everything after it in this caller runs beside it */
+        if (n == w->spawn && w->phase == SW_BEFORE) { w->phase = SW_IN; return; }
         if (w->phase != SW_THREAD && w->phase != SW_IN) return;
-        if (cal && cal->kind == NODE_IDENT) {
-            Symbol *fs = global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len);
-            if (fs && fs->is_function && fs->func_node &&
-                fs->func_node->kind == NODE_FUNC_DECL && fs->func_node->func_decl.body) {
-                SyncAcc key = { fs, false, ctx.lock, ctx.acq, ctx.pub };
-                if (!sync_acc_has(&w->seen, key)) {
-                    sync_acc_add(&w->seen, key);
-                    int sv = w->phase;
-                    w->phase = SW_THREAD;   /* the whole callee runs in the window */
-                    DeclModuleSave dm = decl_module_enter(c, fs);
-                    sync_walk(w, fs->func_node->func_decl.body, ctx, depth + 1);
-                    decl_module_leave(c, dm);
-                    w->phase = sv;
-                }
-            }
+        Symbol *fs = (cal && cal->kind == NODE_IDENT)
+            ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len) : NULL;
+        bool local_name = cal && cal->kind == NODE_IDENT && w->fnode &&
+            fn_binds_name(w->fnode, cal->ident.name, (uint32_t)cal->ident.name_len);
+        if (fs && fs->is_function && !local_name) {
+            sync_descend(w, fs, n->call.args, n->call.arg_count, ctx, depth);
+        } else if (cal) {
+            /* an indirect call runs whichever function it designates */
+            SyncIndUd u = { w, n->call.args, n->call.arg_count, ctx, depth };
+            indirect_callee_functions_in(c, cal, w->fnode, sync_indirect_visit, &u);
         }
         return;
     }
@@ -24462,7 +25067,18 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
         w->phase = acc;
         return;
     }
-    case NODE_VAR_DECL:  SW(n->var_decl.init);   return;
+    case NODE_VAR_DECL: {
+        SW(n->var_decl.init);
+        /* a declaration ends every earlier binding of its name */
+        SyncGl gl; memset(&gl, 0, sizeof(gl));
+        if (n->var_decl.init) sync_value_globals(w, n->var_decl.init, &gl, 0);
+        bool direct = n->var_decl.init && sync_value_direct(c, n->var_decl.init);
+        const char *nm = n->var_decl.name; uint32_t nl = (uint32_t)n->var_decl.name_len;
+        if (gl.n == 0) sync_bind_push(w, nm, nl, NULL, false, true);
+        for (int i = 0; i < gl.n; i++) sync_bind_push(w, nm, nl, gl.v[i], direct, i == 0);
+        free(gl.v);
+        return;
+    }
     case NODE_EXPR_STMT: SW(n->expr_stmt.expr);  return;
     case NODE_RETURN:    SW(n->ret.expr);        return;
     case NODE_CRITICAL:  SW(n->critical.body);   return;
@@ -24471,13 +25087,29 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
     case NODE_ONCE:      return;
     case NODE_AWAIT:     SW(n->await_stmt.cond); return;
     case NODE_BINARY:    SW(n->binary.left); SW(n->binary.right); return;
-    case NODE_FIELD:     SW(n->field.object); return;
-    case NODE_INDEX:     SW(n->index_expr.object); SW(n->index_expr.index); return;
-    case NODE_SLICE:     SW(n->slice.object); SW(n->slice.start); SW(n->slice.end); return;
+    case NODE_FIELD:     sync_record_bound(w, n, false, ctx); SW(n->field.object); return;
+    case NODE_INDEX:
+        sync_record_bound(w, n, false, ctx);
+        SW(n->index_expr.object); SW(n->index_expr.index);
+        return;
+    case NODE_SLICE:
+        sync_record_bound(w, n, false, ctx);
+        SW(n->slice.object); SW(n->slice.start); SW(n->slice.end);
+        return;
     case NODE_ORELSE:    SW(n->orelse.expr); SW(n->orelse.fallback); return;
     case NODE_TYPECAST:  SW(n->typecast.expr); return;
     case NODE_INTRINSIC:
         for (int i = 0; i < n->intrinsic.arg_count; i++) SW(n->intrinsic.args[i]);
+        /* BUG-1565 (C4): every flag this instance WRITES — a store / RMW /
+         * exchange, not a load — and what it had waited on before */
+        if ((w->phase == SW_THREAD || w->phase == SW_IN) && n->intrinsic.arg_count > 0 &&
+            n->intrinsic.name_len > 7 && memcmp(n->intrinsic.name, "atomic_", 7) == 0 &&
+            !(n->intrinsic.name_len == 11 && memcmp(n->intrinsic.name, "atomic_load", 11) == 0)) {
+            SyncGl gl; memset(&gl, 0, sizeof(gl));
+            sync_value_globals(w, n->intrinsic.args[0], &gl, 0);
+            for (int i = 0; i < gl.n; i++) sync_fw_add(w->out, gl.v[i], ctx.acq);
+            free(gl.v);
+        }
         return;
     case NODE_STRUCT_INIT:
         for (int i = 0; i < n->struct_init.field_count; i++) SW(n->struct_init.fields[i].value);
@@ -24499,12 +25131,15 @@ static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth) {
 
 /* ---- How many times can a function run? (a call-site census) ----
  * A spawn site whose enclosing function can run twice starts two threads. */
-typedef struct { Symbol *caller, *callee; bool in_loop; } SyncCallSite;
+/* `call`: the call node in the caller (NULL for a spawn — the callee then runs
+ * as a thread, not as part of the caller). */
+typedef struct { Symbol *caller, *callee; bool in_loop; Node *call; } SyncCallSite;
 typedef struct {
     SyncCallSite *v; int n, cap;
     Symbol **taken; int nt, ct;          /* functions used as VALUES */
 } SyncCensus;
-static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_loop) {
+static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_loop,
+                       Node *call) {
     if (k->n >= k->cap) {
         int nc = k->cap ? k->cap * 2 : 32;
         SyncCallSite *nb = (SyncCallSite *)realloc(k->v, (size_t)nc * sizeof(*nb));
@@ -24512,6 +25147,7 @@ static void census_add(SyncCensus *k, Symbol *caller, Symbol *callee, bool in_lo
         k->v = nb; k->cap = nc;
     }
     k->v[k->n].caller = caller; k->v[k->n].callee = callee; k->v[k->n].in_loop = in_loop;
+    k->v[k->n].call = call;
     k->n++;
 }
 static void census_taken(SyncCensus *k, Symbol *f) {
@@ -24523,6 +25159,13 @@ static void census_taken(SyncCensus *k, Symbol *f) {
         k->taken = nb; k->ct = nc;
     }
     k->taken[k->nt++] = f;
+}
+typedef struct { SyncCensus *k; Symbol *caller; bool loop; Node *call; } CensusIndUd;
+static bool census_indirect_visit(Checker *c, Symbol *fn, void *ud) {
+    (void)c;
+    CensusIndUd *u = (CensusIndUd *)ud;
+    census_add(u->k, u->caller, fn, u->loop, u->call);
+    return false;
 }
 static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool loop, int depth) {
     if (!n || depth > 4 * ZER_STMT_NEST_MAX) return;
@@ -24538,15 +25181,25 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
         Node *cal = n->call.callee;
         Symbol *f = (cal && cal->kind == NODE_IDENT)
             ? global_decl_lookup(c, cal->ident.name, (uint32_t)cal->ident.name_len) : NULL;
-        if (f && f->is_function) census_add(k, caller, f, loop);
-        else CW(cal);
+        if (f && f->is_function && caller && caller->func_node &&
+            fn_binds_name(caller->func_node, cal->ident.name, (uint32_t)cal->ident.name_len))
+            f = NULL;   /* a local funcptr shadowing a function's name */
+        if (f && f->is_function) census_add(k, caller, f, loop, n);
+        else {
+            CW(cal);
+            /* BUG-1565 (C1): an indirect call is a call of every function it
+             * may designate — the caller runs on after it returns */
+            CensusIndUd u = { k, caller, loop, n };
+            if (cal) indirect_callee_functions_in(c, cal, caller ? caller->func_node : NULL,
+                                                  census_indirect_visit, &u);
+        }
         for (int i = 0; i < n->call.arg_count; i++) CW(n->call.args[i]);
         return;
     }
     case NODE_SPAWN: {
         Symbol *f = global_decl_lookup(c, n->spawn_stmt.func_name,
                                        (uint32_t)n->spawn_stmt.func_name_len);
-        if (f && f->is_function) census_add(k, caller, f, loop);
+        if (f && f->is_function) census_add(k, caller, f, loop, NULL);
         for (int i = 0; i < n->spawn_stmt.arg_count; i++) CW(n->spawn_stmt.args[i]);
         return;
     }
@@ -24600,8 +25253,8 @@ static void census_walk(Checker *c, SyncCensus *k, Node *n, Symbol *caller, bool
 }
 /* 1 = runs at most once, 2 = may run more than once. `main` runs once; a
  * function used as a value, reached from an interrupt, called in a loop or
- * from two places, or on a call cycle may run more. A function with no ZER
- * caller at all counts once (it is dead, or called from C). */
+ * from two places, or on a call cycle may run more. BUG-1565 (C3): so may a
+ * function with no ZER caller at all — C can call it any number of times. */
 static int census_instances(Checker *c, SyncCensus *k, Symbol *f, Symbol **stack, int sp) {
     if (!f) return 2;
     if (f->name_len == 4 && memcmp(f->name, "main", 4) == 0 && !f->module_prefix) return 1;
@@ -24614,10 +25267,11 @@ static int census_instances(Checker *c, SyncCensus *k, Symbol *f, Symbol **stack
         if (k->v[i].in_loop || !k->v[i].caller) { total = 2; break; }
         total += census_instances(c, k, k->v[i].caller, stack, sp + 1);
     }
-    return total == 0 ? 1 : (total > 2 ? 2 : total);
+    return total == 0 ? 2 : (total > 2 ? 2 : total);
 }
 
-static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line) {
+static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line,
+                              bool downgraded) {
     if (c->sync_spawn_count >= c->sync_spawn_capacity) {
         int nc = c->sync_spawn_capacity ? c->sync_spawn_capacity * 2 : 8;
         struct SyncSpawnSite *nb = (struct SyncSpawnSite *)realloc(c->sync_spawns,
@@ -24628,27 +25282,114 @@ static void record_sync_spawn(Checker *c, Symbol *target, Node *spawn, int line)
     struct SyncSpawnSite *s = &c->sync_spawns[c->sync_spawn_count++];
     s->target = target; s->spawn = spawn; s->encl = current_func_symbol(c);
     s->repeated = c->in_loop;
+    s->downgraded = downgraded;
+    s->binds = NULL; s->nbind = 0;
     s->file = c->file_name; s->source = c->source; s->line = line;
+    /* BUG-1565 (C2): what each argument points at, resolved now — the
+     * argument's own scope is live here and gone by the post pass. */
+    if (!spawn || !target || !target->func_node || target->func_node->kind != NODE_FUNC_DECL)
+        return;
+    Node *fd = target->func_node;
+    int total = 0, cap = 0;
+    struct SyncArgBind *bv = NULL;
+    for (int i = 0; i < spawn->spawn_stmt.arg_count && i < fd->func_decl.param_count; i++) {
+        Node *a = spawn->spawn_stmt.args[i];
+        SyncGl gl; memset(&gl, 0, sizeof(gl));
+        SyncWalk none; memset(&none, 0, sizeof(none)); none.c = c;
+        sync_value_globals(&none, a, &gl, 0);
+        bool direct = sync_value_direct(c, a);
+        for (int j = 0; j < gl.n; j++) {
+            if (total >= cap) {
+                int nc = cap ? cap * 2 : 4;
+                struct SyncArgBind *nb = (struct SyncArgBind *)arena_alloc(c->arena,
+                                            (size_t)nc * sizeof(*nb));
+                if (!nb) break;
+                if (bv) memcpy(nb, bv, (size_t)total * sizeof(*nb));
+                bv = nb; cap = nc;
+            }
+            bv[total].param = i; bv[total].g = gl.v[j]; bv[total].direct = direct;
+            total++;
+        }
+        free(gl.v);
+    }
+    s->binds = bv; s->nbind = total;
 }
 
-/* Is access `a` ordered before access `b`? Both under one lock, or `a` released
- * through a flag `b` waited on. */
-static bool sync_ordered(SyncAcc *a, SyncAcc *b) {
+/* BUG-1565 (C4): a wait on flag `f` proves the publisher `pub` set it only
+ * when nothing else can: no other instance — and no second copy of the
+ * publisher — writes `f` except AFTER waiting on `f` itself (a reset or a
+ * relay, which happens after a genuine publish and passes its ordering on). */
+static bool sync_flag_forged(Symbol *f, SyncAccSet *pub, SyncAccSet **all, int nall) {
+    for (int i = 0; i < nall; i++) {
+        SyncAccSet *s = all[i];
+        for (int j = 0; j < s->nfw; j++) {
+            if (s->fw[j].f != f || s->fw[j].acq == f) continue;
+            if (s == pub && !s->repeated) continue;
+            return true;
+        }
+    }
+    return false;
+}
+/* Is access `a` (instance `as`) ordered before access `b` (instance `bs`)?
+ * Both under one lock, or one released through a flag the other waited on and
+ * only its publisher sets. */
+static bool sync_ordered(SyncAcc *a, SyncAccSet *as, SyncAcc *b, SyncAccSet *bs,
+                         SyncAccSet **all, int nall) {
     if (a->lock && a->lock == b->lock) return true;
-    if (a->pub && a->pub == b->acq) return true;
-    if (b->pub && b->pub == a->acq) return true;
+    if (a->pub && a->pub == b->acq && !sync_flag_forged(a->pub, as, all, nall)) return true;
+    if (b->pub && b->pub == a->acq && !sync_flag_forged(b->pub, bs, all, nall)) return true;
     return false;
 }
 /* The first global two access sets touch with at least one write and no
  * ordering between the two accesses, or NULL. */
-static Symbol *sync_sets_conflict(SyncAccSet *a, SyncAccSet *b) {
+static Symbol *sync_sets_conflict(SyncAccSet *a, SyncAccSet *b, SyncAccSet **all, int nall) {
     for (int i = 0; i < a->n; i++)
         for (int j = 0; j < b->n; j++) {
             SyncAcc *x = &a->v[i], *y = &b->v[j];
             if (x->g != y->g || (!x->write && !y->write)) continue;
-            if (!sync_ordered(x, y)) return x->g;
+            if (!sync_ordered(x, a, y, b, all, nall)) return x->g;
         }
     return NULL;
+}
+static void sync_walk_free(SyncWalk *w) {
+    for (int i = 0; i < w->nseen; i++) free(w->seen[i].b);
+    free(w->seen); free(w->seq); free(w->bind);
+    w->seen = NULL; w->seq = NULL; w->bind = NULL;
+    w->nseen = w->cseen = w->nseq = w->cseq = w->nbind = w->cbind = 0;
+}
+/* BUG-1565 (C1): a fire-and-forget thread outlives the function that started
+ * it — every caller of that function runs on beside it after the call, and so
+ * does every caller of THOSE. Walk each such caller from the call onward into
+ * `out`. */
+static void sync_window_callers(Checker *c, SyncCensus *k, Symbol *encl, SyncAccSet *out) {
+    Symbol **q = (Symbol **)calloc((size_t)k->n + 2, sizeof(Symbol *));
+    if (!q) return;
+    int qn = 0;
+    q[qn++] = encl;
+    SyncCtx none = { NULL, NULL, NULL };
+    for (int qi = 0; qi < qn; qi++) {
+        Symbol *f = q[qi];
+        for (int i = 0; i < k->n; i++) {
+            SyncCallSite *cs = &k->v[i];
+            if (cs->callee != f || !cs->call || !cs->caller) continue;
+            Symbol *cl = cs->caller;
+            if (cl->func_node && cl->func_node->kind == NODE_FUNC_DECL &&
+                cl->func_node->func_decl.body) {
+                SyncWalk w;
+                memset(&w, 0, sizeof(w));
+                w.c = c; w.out = out; w.phase = SW_BEFORE; w.spawn = cs->call;
+                w.fnode = cl->func_node;
+                DeclModuleSave dm = decl_module_enter(c, cl);
+                sync_walk(&w, cl->func_node->func_decl.body, none, 0);
+                decl_module_leave(c, dm);
+                sync_walk_free(&w);
+            }
+            bool seen = false;
+            for (int j = 0; j < qn; j++) if (q[j] == cl) { seen = true; break; }
+            if (!seen && qn < k->n + 2) q[qn++] = cl;
+        }
+    }
+    free(q);
 }
 static bool sync_seq_has(SyncWalk *w, Node *n) {
     for (int i = 0; i < w->nseq; i++) if (w->seq[i] == n) return true;
@@ -24702,37 +25443,94 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
         if (t && t->func_node && t->func_node->kind == NODE_FUNC_DECL) {
             SyncWalk tw;
             memset(&tw, 0, sizeof(tw));
-            tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD;
-            SyncAcc self = { t, false, NULL, NULL, NULL };
-            sync_acc_add(&tw.seen, self);
+            tw.c = c; tw.out = &thr[i]; tw.phase = SW_THREAD; tw.fnode = t->func_node;
+            /* the target's params, bound to what the spawn handed them */
+            Node *fd = t->func_node;
+            for (int p = 0; p < fd->func_decl.param_count; p++) {
+                ParamDecl *pd = &fd->func_decl.params[p];
+                bool first = true;
+                for (int b = 0; b < s->nbind; b++) {
+                    if (s->binds[b].param != p) continue;
+                    sync_bind_push(&tw, pd->name, (uint32_t)pd->name_len, s->binds[b].g,
+                                   s->binds[b].direct, first);
+                    first = false;
+                }
+                if (first) sync_bind_push(&tw, pd->name, (uint32_t)pd->name_len, NULL,
+                                          false, true);
+            }
             DeclModuleSave dm = decl_module_enter(c, t);
             sync_walk(&tw, t->func_node->func_decl.body, none, 0);
             decl_module_leave(c, dm);
-            free(tw.seen.v); free(tw.seq);
+            sync_walk_free(&tw);
         }
         Symbol *e = s->encl;
         ww[i].c = c; ww[i].out = &win[i]; ww[i].phase = SW_BEFORE; ww[i].spawn = s->spawn;
         if (e && e->func_node && e->func_node->kind == NODE_FUNC_DECL) {
+            ww[i].fnode = e->func_node;
             DeclModuleSave dm = decl_module_enter(c, e);
             sync_walk(&ww[i], e->func_node->func_decl.body, none, 0);
             decl_module_leave(c, dm);
         }
+        if (e && s->spawn && !s->spawn->spawn_stmt.handle_name)
+            sync_window_callers(c, &k, e, &win[i]);
+        thr[i].repeated = win[i].repeated = s->repeated;
     }
+    /* An interrupt handler writing a hand-off flag forges it as much as a
+     * thread does (C4); its accesses are the ISR rules', only its flag writes
+     * count here. */
+    int nisr = 0;
+    for (int fi = 0; fi < count; fi++) {
+        Node *fn = files[fi].ast;
+        if (!fn || fn->kind != NODE_FILE) continue;
+        for (int i = 0; i < fn->file.decl_count; i++)
+            if (fn->file.decls[i]->kind == NODE_INTERRUPT) nisr++;
+    }
+    SyncAccSet *isr = (SyncAccSet *)calloc((size_t)nisr + 1, sizeof(SyncAccSet));
+    int ni = 0;
+    for (int fi = 0; fi < count && isr; fi++) {
+        Node *fn = files[fi].ast;
+        if (!fn || fn->kind != NODE_FILE) continue;
+        c->current_module = files[fi].module; c->current_module_len = files[fi].module_len;
+        for (int i = 0; i < fn->file.decl_count && ni < nisr; i++) {
+            Node *d = fn->file.decls[i];
+            if (d->kind != NODE_INTERRUPT) continue;
+            SyncWalk iw;
+            memset(&iw, 0, sizeof(iw));
+            iw.c = c; iw.out = &isr[ni]; iw.phase = SW_THREAD;
+            sync_walk(&iw, d->interrupt.body, none, 0);
+            sync_walk_free(&iw);
+            isr[ni].repeated = true;
+            ni++;
+        }
+    }
+    c->current_module = sv_mod; c->current_module_len = sv_ml;
+    SyncAccSet **all = (SyncAccSet **)calloc((size_t)(2 * n + ni + 1), sizeof(SyncAccSet *));
+    int nall = 0;
+    for (int i = 0; i < n && all; i++) { all[nall++] = &thr[i]; all[nall++] = &win[i]; }
+    for (int i = 0; i < ni && all; i++) all[nall++] = &isr[i];
     bool *done = (bool *)calloc((size_t)n, sizeof(bool));
-    for (int i = 0; i < n && done; i++) {
+    for (int i = 0; i < n && done && all; i++) {
         struct SyncSpawnSite *s = &c->sync_spawns[i];
         Symbol *g = NULL;
         const char *why = NULL;
         Symbol *other = NULL;
-        if (s->repeated && (g = sync_sets_conflict(&thr[i], &thr[i]))) {
+        /* A thread the scan found clean reaches globals only through what it
+         * was handed: its own copies and its parent are the scoped-borrow
+         * rules' (BUG-969/1118); here it only meets a downgraded thread. */
+        bool ffg = s->spawn && !s->spawn->spawn_stmt.handle_name;
+        if (s->downgraded && s->repeated &&
+            (g = sync_sets_conflict(&thr[i], &thr[i], all, nall))) {
             why = "is started more than once, and its copies";
-        } else if ((g = sync_sets_conflict(&thr[i], &win[i]))) {
-            why = "and the code that spawned it (between the spawn and the join)";
+        } else if (s->downgraded && (g = sync_sets_conflict(&thr[i], &win[i], all, nall))) {
+            why = ffg ? "and the code that runs after it was started (in the function that "
+                        "spawned it, or in any caller after that function returns)"
+                      : "and the code that spawned it (between the spawn and the join)";
         } else {
             for (int j = i + 1; j < n; j++) {
+                if (!s->downgraded && !c->sync_spawns[j].downgraded) continue;
                 if (sync_seq_has(&ww[i], c->sync_spawns[j].spawn) ||
                     sync_seq_has(&ww[j], s->spawn)) continue;   /* joined before */
-                if ((g = sync_sets_conflict(&thr[i], &thr[j]))) {
+                if ((g = sync_sets_conflict(&thr[i], &thr[j], all, nall))) {
                     other = c->sync_spawns[j].target;
                     why = "and spawn target";
                     break;
@@ -24767,9 +25565,12 @@ static void check_sync_spawn_writers(Checker *c, const CheckerFile *files, int c
     }
     c->file_name = sv_fn; c->source = sv_src;
     for (int i = 0; i < n; i++) {
-        free(thr[i].v); free(win[i].v); free(ww[i].seen.v); free(ww[i].seq);
+        free(thr[i].v); free(win[i].v); free(thr[i].fw); free(win[i].fw);
+        sync_walk_free(&ww[i]);
     }
+    for (int i = 0; i < ni; i++) { free(isr[i].v); free(isr[i].fw); }
     free(thr); free(win); free(ww); free(done); free(k.v); free(k.taken); free(stack);
+    free(all); free(isr);
 }
 
 static bool scan_unsafe_global_access(Checker *c, Node *node,
@@ -24858,10 +25659,12 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
          * `u32 t = g;` inside a spawned body makes `t` carry `g`. Uses the same
          * query helper as the ISR sink; only the table differs. */
         if (node->var_decl.init && node->var_decl.name)
-            rmw_tab_set(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap, 0,
-                         node->var_decl.name, (uint32_t)node->var_decl.name_len,
-                         rmw_value_source_global(c, _rmw_vtaint, _rmw_vtaint_count,
-                                                 node->var_decl.init, 0));
+        {
+            VfSet srcs = {0};
+            rmw_value_sources(c, _rmw_vtaint, _rmw_vtaint_count, node->var_decl.init, 0, &srcs);
+            rmw_tab_rebind(&_rmw_vtaint, &_rmw_vtaint_count, &_rmw_vtaint_cap,
+                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs);
+        }
         return scan_unsafe_global_access(c, node->var_decl.init, out_name, out_len);
     case NODE_ASSIGN:
         /* Axis A3 (2026-06-21): a COMPOUND assignment (RMW: +=, |=, etc.) on a
@@ -24933,22 +25736,17 @@ static bool scan_unsafe_global_access(Checker *c, Node *node,
         /* Check call arguments for global access */
         for (int i = 0; i < node->call.arg_count; i++)
             if (scan_unsafe_global_access(c, node->call.args[i], out_name, out_len)) return true;
-        /* BUG-1561: `wr(t + 1)` where `wr` stores its parameter into a volatile
-         * global and `t` carries that global's value (`u32 t = rd();`) — the
-         * read-modify-write split across two calls. Same verdict as the
-         * NODE_ASSIGN arm's spawn_rmw_visit. */
-        for (int i = 0; i < node->call.arg_count; i++) {
-            Symbol *sg = vf_call_param_store(c, node, i);
-            if (!sg || sg->is_function || sg->is_const) continue;
-            if (!assign_reads_own_target(c, node->call.args[i], sg) &&
-                !rmw_value_taints_global(c, _rmw_vtaint, _rmw_vtaint_count,
-                                         node->call.args[i], sg, 0))
-                continue;
-            if (zer_volatile_compound_valid(sg->is_volatile ? 1 : 0, 1) == 0 &&
-                !(_scan_once_node && once_single_owner(sg, _scan_once_node))) {
-                _rmw_flagged_rmw = true;
-                *out_name = sg->name;
-                *out_len = sg->name_len;
+        /* BUG-1561/1564: a call storing a value derived from a volatile global
+         * back into it — the read-modify-write split across calls. Same verdict
+         * as the NODE_ASSIGN arm's spawn_rmw_visit. */
+        {
+            SpawnRmwHit sh = { NULL, false };
+            call_rmw_globals(c, _rmw_vtaint, _rmw_vtaint_count, node, spawn_call_rmw_hit, &sh);
+            if (sh.g) {
+                if (sh.may) _rmw_flagged_opaque = true;   /* BUG-1046 wording */
+                else _rmw_flagged_rmw = true;
+                *out_name = sh.g->name;
+                *out_len = sh.g->name_len;
                 return true;
             }
         }
@@ -25760,11 +26558,12 @@ static void check_stmt_impl(Checker *c, Node *node) {
          * because the query is name resolution only — it never reads the
          * typemap — and the init's own identifiers are already in scope. */
         if (node->kind == NODE_VAR_DECL && node->var_decl.init && node->var_decl.name)
-            rmw_tab_set(&c->rmw_taints, &c->rmw_taint_count,
-                        &c->rmw_taint_capacity, 0,
-                        node->var_decl.name, (uint32_t)node->var_decl.name_len,
-                        rmw_value_source_global(c, c->rmw_taints,
-                            c->rmw_taint_count, node->var_decl.init, 0));
+        {
+            VfSet srcs = {0};
+            rmw_value_sources(c, c->rmw_taints, c->rmw_taint_count, node->var_decl.init, 0, &srcs);
+            rmw_tab_rebind(&c->rmw_taints, &c->rmw_taint_count, &c->rmw_taint_capacity,
+                           node->var_decl.name, (uint32_t)node->var_decl.name_len, &srcs);
+        }
         /* BUG-1046: `H h = { .p = &g };` / `volatile *u32 q = &g;` — a carrier.
          * Name-keyed like the taint above; the declaring name rebinds (or clears,
          * for a value from no global), so a shadowing local cannot inherit. */
@@ -31030,6 +31829,10 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 c->once_lent[c->once_lent_count].line = node->loc.line;
                 c->once_lent_count++;
             }
+            /* BUG-1565: a thread the scan found no plain global access in can
+             * still reach one through a pointer it was handed (C2), or write a
+             * flag another hand-off relies on (C4) — the post pass needs it. */
+            if (!spawn_hit) record_sync_spawn(c, func_sym, node, node->loc.line, false);
             if (spawn_hit) {
                 /* If function uses @atomic_* or @barrier — developer is doing manual
                  * synchronization (lock-free pattern). Warn, don't error.
@@ -31037,7 +31840,7 @@ static void check_stmt_impl(Checker *c, Node *node) {
                 ensure_func_props(c, func_sym);
                 bool has_sync = func_sym->props.has_sync;
                 if (has_sync) {
-                    record_sync_spawn(c, func_sym, node, node->loc.line);   /* BUG-1562 */
+                    record_sync_spawn(c, func_sym, node, node->loc.line, true);   /* BUG-1562 */
                     checker_warning(c, node->loc.line,
                         "spawn target '%.*s' accesses %s '%.*s' — "
                         "potential data race (atomic/barrier present, verify ordering)",

@@ -1,0 +1,7 @@
+// BUG-1565 (C4 boundary): the reader stores the flag back AFTER its wait — a
+// relay that happens after a genuine publish, not a forgery.
+u32 g;
+u32 flag;
+void a() { g = 1; @atomic_store(&flag, 1); }
+void b() { while (@atomic_load(&flag) == 0) {} u32 x = g; @atomic_store(&flag, 0); }
+u32 main() { ThreadHandle t1 = spawn a(); ThreadHandle t2 = spawn b(); t1.join(); t2.join(); return 0; }

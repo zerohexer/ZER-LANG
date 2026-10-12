@@ -6606,10 +6606,19 @@ u32 main() {
     `@atomic_store(&flag, ..)` in one thread and a read after a wait on
     `@atomic_load(&flag)` (a loop, or `if (@atomic_load(&flag) ...)`) in the
     other. A thread joined before the next one is spawned does not count —
-    examples below
+    examples below. Also counted (BUG-1565): a fire-and-forget thread against
+    the code its spawner's CALLERS run after the call returns; an access
+    through a pointer the thread was handed (`spawn w(&g)` then `*p = 1`); a
+    function no ZER code calls counts as running more than once (C may call
+    it). A hand-off holds only when no other thread or interrupt handler — and
+    no second copy of the publisher — stores the flag, except after waiting
+    on it itself (a reader resetting the flag after its wait is fine)
   - A read-modify-write may be split across CALLS — `u32 t = rd(); wr(t + 1);`
     with `rd` returning `g` and `wr` storing its parameter into `g` — and is the
-    same non-atomic RMW as `g += 1` at every sink (BUG-1561)
+    same non-atomic RMW as `g += 1` at every sink (BUG-1561). A value carries
+    EVERY global it was read from (`u32 t = d + g; g = t + 1;`), a helper may
+    store through a pointer PARAMETER (`wr(&g, t + 1)` with `*p = v`), and a
+    recursive helper is summarised to a fixpoint (BUG-1564)
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
   **single-word** `volatile` global. Two of these cover the VALUE, never what it

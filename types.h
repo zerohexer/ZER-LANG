@@ -469,13 +469,11 @@ struct Symbol {
     uint64_t rmw_param_mask;
     /* BUG-1561: the VALUE-flow half, for a read-modify-write split across calls
      * (`u32 t = rd(); wr(t + 1);`): a global this function's RETURN value may
-     * carry, and per parameter a global its value may be STORED into. Lazy;
-     * vf_state 0 = not computed, 1 = in progress (a recursive call reads it as
-     * empty), 2 = done. */
+     * carry, and where each parameter's value / pointee may be STORED. Lazy;
+     * vf_state 0 = not computed (or provisional inside a recursion cycle),
+     * 1 = in progress (a recursive call reads its sets so far), 2 = final. */
     uint8_t vf_state;
-    struct Symbol *vf_ret_global;
-    struct Symbol **vf_param_store;
-    int vf_param_count;
+    struct VfSummary *vf;   /* BUG-1564: sets of sources / destinations (checker.c) */
     /* BUG-1481: the MEMORY-MAPPED half of the same summary — every write this
      * function makes THROUGH a pointer parameter, as a byte span relative to the
      * pointer (`void setb(volatile *Regs u){ u.ctrl |= 2; }` -> param 0, bytes

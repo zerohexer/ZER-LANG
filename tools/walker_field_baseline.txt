@@ -2367,6 +2367,8 @@ checker.c:value_block_local:NODE_TYPECAST:typecast.expr
 checker.c:value_block_local:NODE_VAR_DECL:var_decl.init
 checker.c:value_block_local:NODE_WHILE:while_stmt.body
 checker.c:value_block_local:NODE_WHILE:while_stmt.cond
+# BUG-1564: vf_value's NODE_CALL reads call.args through vf_ret_callee (each argument is
+# substituted for the callee's param bits), not by a recursive descent here.
 # BUG-1561 vf_value: an EXPRESSION value walker (statement kinds listed for -Werror=switch
 # only); an assignment's value is its VALUE, not its target; a call's value is its
 # callee's summarised return, not the callee expression. vf_walk: declarations and
@@ -2376,6 +2378,7 @@ checker.c:vf_value:NODE_ASM:asm_stmt.outputs
 checker.c:vf_value:NODE_ASSIGN:assign.target
 checker.c:vf_value:NODE_AWAIT:await_stmt.cond
 checker.c:vf_value:NODE_BLOCK:block.stmts
+checker.c:vf_value:NODE_CALL:call.args
 checker.c:vf_value:NODE_CALL:call.callee
 checker.c:vf_value:NODE_CRITICAL:critical.body
 checker.c:vf_value:NODE_DEFER:defer.body

@@ -342,6 +342,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_SPLIT_CALLS, RFORM_SPLIT_CALLS_INLINE,
                RFORM_SPLIT_READ_CALL, RFORM_SPLIT_WRITE_CALL,
                RFORM_SPLIT_CALL_PTR_STORE, RFORM_SPLIT_CALL_FORWARD,
+               RFORM_SPLIT_TWO_GLOBALS, RFORM_SPLIT_CALL_SUM, RFORM_SPLIT_CALL_PARAM_STORE,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -407,6 +408,9 @@ static const char *rform_name(RForm f) {
     case RFORM_SPLIT_WRITE_CALL:    return "calls t=g;wr(t+1)";
     case RFORM_SPLIT_CALL_PTR_STORE: return "calls wr stores *gp";
     case RFORM_SPLIT_CALL_FORWARD:  return "calls wr forwards v";
+    case RFORM_SPLIT_TWO_GLOBALS:   return "t=d+g;g=t+1";
+    case RFORM_SPLIT_CALL_SUM:      return "calls t=rd() d+g";
+    case RFORM_SPLIT_CALL_PARAM_STORE: return "calls wr(&g,t+1)";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -530,6 +534,15 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
                                                                                  *body = "u32 t = rd(); wr(t + 1);"; break;
     case RFORM_SPLIT_CALL_FORWARD: *helper = "void wr2(u32 v){ g = v; }\nvoid wr(u32 v){ wr2(v); }";
                                                                                  *body = "u32 t = g; wr(t + 1);"; break;
+    /* BUG-1564: the taint held ONE global per local, so a value read from two
+     * globals kept whichever was seen first; and a helper storing through a
+     * pointer PARAMETER was not followed to the global its caller handed it. */
+    case RFORM_SPLIT_TWO_GLOBALS:  *helper = "volatile u32 d;";
+                                                                                 *body = "u32 t = d + g; g = t + 1;"; break;
+    case RFORM_SPLIT_CALL_SUM:     *helper = "volatile u32 d;\nu32 rd(){ return d + g; }";
+                                                                                 *body = "u32 t = rd(); g = t + 1;"; break;
+    case RFORM_SPLIT_CALL_PARAM_STORE: *helper = "void wr(volatile *u32 p, u32 v){ *p = v; }";
+                                                                                 *body = "u32 t = g; wr(&g, t + 1);"; break;
     case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
                                                                                  *body = "*gh.p += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;

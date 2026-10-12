@@ -1,0 +1,6 @@
+// EXPECTED: compile error
+// expect-error: which object that is cannot be determined
+struct T { u32 v; }
+void rel(*?*T slot) { if (*slot) |q| { free(q); } *slot = null; }
+*?*T pick(*?*T a, *?*T b, bool c) { if (c) { return a; } return b; }
+u32 main() { ?*T a = alloc(T); ?*T b = alloc(T); rel(pick(&a, &b, true)); if (a) |p| { free(p); } if (b) |p| { free(p); } return 0; }

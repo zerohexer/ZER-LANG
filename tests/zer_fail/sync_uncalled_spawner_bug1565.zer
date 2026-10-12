@@ -1,0 +1,8 @@
+// BUG-1565 (C3): a function no ZER code calls may be called from C any number
+// of times, so the thread it starts may run twice.
+// expect-error: no common lock and no release/acquire flag
+u32 g;
+u32 flag;
+void w() { g += 1; @atomic_store(&flag, 1); }
+void start() { spawn w(); }
+u32 main() { return 0; }

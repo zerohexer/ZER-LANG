@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: double free
+struct T { u32 v; }
+void rel(**T slot) { free(*slot); }
+u32 main() { *T lq = alloc(T) orelse return; rel(&lq); free(lq); return 0; }

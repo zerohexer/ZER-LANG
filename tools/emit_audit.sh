@@ -109,6 +109,74 @@ else
     REQ_FAIL=$((REQ_FAIL + 1))
 fi
 
+# BUG-1513 — a CONDITION / for-STEP reading two roots of one shared type locked
+# the primary root only and read the second UNLOCKED (TSan: data race). Every
+# control-flow position must take the whole group: each sample's main must lock
+# AND unlock BOTH a1 and a2. Verified RED on the pre-fix compiler.
+cond_group() {   # name, statement using a1 and a2 in the position under test
+    cat > "$req_dir/cg_$1.zer" <<ZEOF
+shared struct A { u32 x; }
+A a1;
+A a2;
+u32 main() { u32 i = 0; $2 return 0; }
+ZEOF
+    if "$ZERC" "$req_dir/cg_$1.zer" -o "$req_dir/cg_$1.c" >/dev/null 2>&1; then
+        body=$(sed -n '/^uint32_t main/,/^}/p' "$req_dir/cg_$1.c")
+        for r in a1 a2; do
+            nl=$(printf '%s\n' "$body" | { grep -cE '(mutex_lock|rdlock|wrlock)\(&'"$r"'\.' || true; })
+            nu=$(printf '%s\n' "$body" | { grep -cE 'unlock\(&'"$r"'\.' || true; })
+            if [ "$nl" -lt 1 ] || [ "$nu" -lt 1 ]; then
+                echo "MISSING EMISSION: '$1' does not lock+unlock shared root $r (lock=$nl unlock=$nu) (BUG-1513)"
+                REQ_FAIL=$((REQ_FAIL + 1))
+            fi
+        done
+    else
+        echo "MISSING EMISSION: the shared cond-group sample '$1' failed to compile"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
+}
+cond_group if      'if (a1.x == a2.x) { i = 1; }'
+cond_group while   'while (a1.x < a2.x) { i += 1; break; }'
+cond_group dowhile 'do { i += 1; } while (a1.x < a2.x);'
+cond_group forcond 'for (u32 k = 0; a1.x < a2.x; k += 1) { break; }'
+cond_group forstep 'for (u32 k = 0; k < 2; a1.x = a2.x + k) { k += 1; }'
+cond_group switch  'switch (a1.x + a2.x) { default => { i = 2; } }'
+
+# BUG-1519 — an async task's `volatile` local is a FIELD of the task struct and
+# must stay volatile there (the plain field let GCC -O2 delete a delay loop).
+cat > "$req_dir/asyncvol.zer" <<'ZEOF'
+async void adelay() { volatile u32 i = 0; while (i < 10) { i += 1; } yield; }
+u32 main() { _zer_async_adelay t; _zer_async_adelay_init(&t); while (_zer_async_adelay_poll(&t) == 0) { } return 0; }
+ZEOF
+if "$ZERC" "$req_dir/asyncvol.zer" -o "$req_dir/asyncvol.c" >/dev/null 2>&1; then
+    grep -qE '^ +volatile uint32_t i;' "$req_dir/asyncvol.c" || {
+        echo "MISSING EMISSION: an async task's volatile local lost its qualifier (BUG-1519)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+else
+    echo "MISSING EMISSION: the async-volatile sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
+# BUG-1542 — `static volatile` / `threadlocal volatile` globals keep the qualifier
+# (the parser left it wrapped around the type, where it was dropped: an ISR flag
+# loop `while (flag == 0) {}` became `jmp .` at -O2).
+cat > "$req_dir/statvol.zer" <<'ZEOF'
+static volatile u32 flag;
+threadlocal volatile u32 tv;
+u32 main() { flag = 1; tv = 1; return flag + tv - 2; }
+ZEOF
+if "$ZERC" "$req_dir/statvol.zer" -o "$req_dir/statvol.c" >/dev/null 2>&1; then
+    grep -q 'static volatile uint32_t flag' "$req_dir/statvol.c" || {
+        echo "MISSING EMISSION: a static volatile global lost its qualifier (BUG-1542)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+    grep -q '__thread volatile uint32_t tv' "$req_dir/statvol.c" || {
+        echo "MISSING EMISSION: a threadlocal volatile global lost its qualifier (BUG-1542)"
+        REQ_FAIL=$((REQ_FAIL + 1)); }
+else
+    echo "MISSING EMISSION: the static-volatile sample failed to compile"
+    REQ_FAIL=$((REQ_FAIL + 1))
+fi
+
 # BUG-1370 — a `volatile` POINTER global that some code writes is a volatile
 # WORD in C. The checker exempts it from the ISR / thread race rules as a
 # volatile single-word cell; the emitter spelled `volatile ?volatile *u32 g` as
@@ -317,7 +385,20 @@ x86 (bare)|-ffreestanding|cli
 riscv (bare, newlib: hosted C, no OS)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__riscv=1|csrrci
 aarch64 (bare, newlib: hosted C, no OS)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__aarch64__=1 -D__ARM_ARCH=8 -D__ARM_ARCH_PROFILE=65|daifset
 arm R-profile (bare, newlib)|-U__linux__ -U__linux -Ulinux -U__unix__ -U__unix -Uunix -D__ARM_ARCH=7 -D__ARM_ARCH_PROFILE=82|cpsid
+x86 (hosted)||__atomic_thread_fence
 TARGETS
+    # BUG-1520: an arch with NO arm (MSP430 here) on bare metal must refuse the
+    # build — it used to take the user-mode fence and compile clean.
+    # (#include lines dropped: the host's headers refuse a non-x86 preprocess.)
+    grep -v '^#include' "$req_dir/crit.c" > "$req_dir/crit_noinc.c"
+    if gcc -E -U__x86_64__ -U__i386__ -U__amd64__ -D__MSP430__=1 -ffreestanding \
+           -x c "$req_dir/crit_noinc.c" -o /dev/null 2>"$req_dir/crit_err.txt"; then
+        echo "MISSING EMISSION: @critical on an unlisted bare-metal arch compiled (want #error) (BUG-1520)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    elif ! grep -q 'ZER @critical: no interrupt-disable sequence' "$req_dir/crit_err.txt"; then
+        echo "MISSING EMISSION: @critical on an unlisted bare-metal arch failed for another reason (BUG-1520)"
+        REQ_FAIL=$((REQ_FAIL + 1))
+    fi
 else
     echo "MISSING EMISSION: the @critical cascade sample failed to compile"
     REQ_FAIL=$((REQ_FAIL + 1))

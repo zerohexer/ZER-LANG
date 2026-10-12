@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: 'const' on a value field has no effect
+// BUG-1547: const is a variable qualifier, not a type property; s.id = 3 compiled.
+struct S { const u32 id; u32 v; }
+u32 main() { S s; s.id = 3; return 0; }

@@ -1,0 +1,11 @@
+// BUG-1556: a primitive keyword is a type argument to arena.alloc / alloc_slice
+Arena ar;
+u8[256] backing;
+u32 main() {
+    ar = Arena.over(backing);
+    ?[*]u8 bs = ar.alloc_slice(u8, 8);
+    if (bs) |b| { b[3] = 9; if (b[3] != 9) { return 1; } } else { return 2; }
+    ?*u32 one = ar.alloc(u32);
+    if (one) |o| { *o = 5; if (*o != 5) { return 3; } } else { return 4; }
+    return 0;
+}

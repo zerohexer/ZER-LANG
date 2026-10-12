@@ -1,0 +1,8 @@
+// expect-error: cannot assign to const variable 'K'
+// BUG-1542: `static const` (and `threadlocal const`) globals lost the qualifier —
+// `K = 9` compiled and returned 9.
+static const u32 K = 5;
+u32 main() {
+    K = 9;
+    return K;
+}

@@ -1,0 +1,10 @@
+// EXPECTED: compile error
+// expect-error: reaches a recursive call cycle through 'a'
+// BUG-1555: an interrupt handler reaching a call CYCLE was reported as "a call
+// chain deeper than 32" — the walk had no path set. Same verdict, true reason.
+volatile u32 count;
+void a(u32 n);
+void b(u32 n) { if (n > 0) { a(n - 1); } }
+void a(u32 n) { count = n; b(n); }
+interrupt TIMER { a(3); }
+u32 main() { return 0; }

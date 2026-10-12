@@ -1,0 +1,5 @@
+// BUG-1523: a struct literal pushed into a Ring is typed against the element
+// (it was emitted as `(void){ .v = y }`, which GCC refused).
+struct M { u32 v; }
+Ring(M, 4) rq;
+u32 main() { u32 y = 3; rq.push({ .v = y }); M m = rq.pop() orelse return; if (m.v != 3) { return 1; } return 0; }

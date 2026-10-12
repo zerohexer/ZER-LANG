@@ -1918,7 +1918,7 @@ typedef struct { uint8_t has_value; } _zer_opt_void;
 // All null-sentinel checks in emitter use this macro — never check TYPE_POINTER alone
 
 // ?[]T — optional slice (named typedef for all types)
-// _zer_opt_slice_u8, _zer_opt_slice_StructName, etc.
+// _zer_optslice_u8, _zer_optslice_StructName, etc.
 // Previously anonymous — BUG-069 fixed with named typedefs
 
 // []T — slice (named typedef for ALL types now)
@@ -1999,7 +1999,7 @@ Enums emit as `#define` constants, not C enums:
 - Optional typedefs: `_zer_opt_T` (e.g., `_zer_opt_u32`, `_zer_opt_StructName`, `_zer_opt_UnionName`)
 - Slice typedefs: `_zer_slice_T` (all primitives + `_zer_slice_StructName`, `_zer_slice_UnionName`);
   enum elements reuse `_zer_slice_i32`, `Handle` elements `_zer_slice_u64`, `uN` the carrier's
-- Optional slice typedefs: `_zer_opt_slice_T` (all primitives + struct/union names)
+- Optional slice typedefs: `_zer_optslice_T` (all primitives + struct/union names)
 - **EXOTIC-element slice typedefs (BUG-1027, 2026-09-14): `_zer_xslice_<mangled>` /
   `_zer_xvslice_<mangled>` / `_zer_xopt_slice_<mangled>`** for every element kind that has no
   pre-emitted named typedef — pointer, value optional, funcptr, array, nested slice, `*opaque`,
@@ -4220,7 +4220,7 @@ Two tools + one library for automated C-to-ZER migration:
 **Slice types in emitted C:**
 - `[]T` → named typedef `_zer_slice_T` for ALL types (primitives in preamble, struct/union after declaration)
 - Slice indexing embedded in bounds check pattern above — `.ptr` added automatically
-- `?[]T` → named typedef `_zer_opt_slice_T` (all types)
+- `?[]T` → named typedef `_zer_optslice_T` (all types)
 
 **Null-sentinel types (`is_null_sentinel()` function):**
 - `?*T` → plain C pointer (NULL = none).
@@ -4261,7 +4261,7 @@ The `is_null_sentinel()` function in emitter.c unwraps TYPE_DISTINCT before chec
 The checker and emitter have paths that check `TYPE_FUNC_PTR`, `TYPE_STRUCT`, etc. If the type is wrapped in `TYPE_DISTINCT`, these checks fail silently. Always unwrap: `if (t->kind == TYPE_DISTINCT) t = t->distinct.underlying;`
 
 **4. Named typedefs for EVERY compound type.**
-Anonymous `struct { ... }` in C creates a new type at each use. Slices, optional slices, and optional types for structs/unions/enums ALL need named typedefs (`_zer_slice_T`, `_zer_opt_T`, `_zer_opt_slice_T`). If you add a new compound type, emit its typedef after declaration AND in `emit_file_no_preamble`.
+Anonymous `struct { ... }` in C creates a new type at each use. Slices, optional slices, and optional types for structs/unions/enums ALL need named typedefs (`_zer_slice_T`, `_zer_opt_T`, `_zer_optslice_T`). If you add a new compound type, emit its typedef after declaration AND in `emit_file_no_preamble`.
 
 **5. Function pointer syntax — name goes INSIDE `(*)`.**
 `emit_type_and_name` handles this for TYPE_FUNC_PTR, TYPE_OPTIONAL wrapping func ptr, and TYPE_DISTINCT wrapping func ptr. If you add new optional/distinct combinations, check that `emit_type_and_name` handles the name placement.
@@ -4304,7 +4304,7 @@ The detection checks `mlen == 5 "alloc" || mlen == 11 "alloc_slice"`. Both resul
 **18. `eval_const_expr()` in `ast.h` — shared constant folder.**
 Evaluates compile-time integer expressions (+, -, *, /, %, <<, >>, &, |, unary -). Used by both checker (array/pool/ring size resolution) and emitter (resolve_type_for_emit). Without this, `u8[4 * 256]` silently becomes `u8[0]`.
 
-**19. `[]bool` maps to `_zer_slice_u8` / `_zer_opt_slice_u8`.**
+**19. `[]bool` maps to `_zer_slice_u8` / `_zer_optslice_u8`.**
 TYPE_BOOL must be handled in emit_type(TYPE_SLICE), emit_type(TYPE_OPTIONAL > TYPE_SLICE), and NODE_SLICE expression emission. Bool is uint8_t in C — uses the same slice typedef as u8.
 
 **20. String literals are `const []u8` — CANNOT assign to mutable `[]u8`.**

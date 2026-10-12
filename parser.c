@@ -418,6 +418,25 @@ static TypeNode *parse_func_ptr_2c(Parser *p) {
  * ZER types: u32, *Task, ?*Task, []u8, u8[256], Pool(T, N), etc.
  * ================================================================ */
 
+/* BUG-1556: is the token AFTER the current one a `,` or `)` — i.e. does the
+ * current token stand alone as an argument? Speculative: the scanner and the
+ * token pair are restored. */
+static bool parser_next_closes_arg(Parser *p) {
+    Scanner saved = *p->scanner;
+    Token saved_cur = p->current;
+    Token saved_prev = p->previous;
+    bool saved_panic = p->panic_mode;
+    bool saved_err = p->had_error;
+    advance(p);
+    bool r = p->current.type == TOK_COMMA || p->current.type == TOK_RPAREN;
+    *p->scanner = saved;
+    p->current = saved_cur;
+    p->previous = saved_prev;
+    p->panic_mode = saved_panic;
+    p->had_error = saved_err;
+    return r;
+}
+
 static bool is_type_token(TokenType type) {
     switch (type) {
     case TOK_U8: case TOK_U16: case TOK_U32: case TOK_U64:
@@ -1312,11 +1331,19 @@ static Node *parse_postfix(Parser *p, Node *left) {
                     /* alloc(PRIM, n): the first arg may be a primitive type
                      * keyword (u8/u32/.../bool). Synthesize an ident carrying its
                      * spelling so alloc works over ALL element types, not just
-                     * struct names. See docs/universal_alloc.md. */
-                    if (arg_count == 0 && left->kind == NODE_IDENT &&
+                     * struct names. See docs/universal_alloc.md.
+                     * BUG-1556: ANY call argument that is a lone primitive keyword
+                     * (followed by `,` or `)`) is such a type name — it can never
+                     * be a value there. That is what lets a container STAMP parse
+                     * in a type-argument position: `alloc(Box(u32))` is the call
+                     * `Box(u32)` the checker turns into the stamped type
+                     * (stamp_type_arg). */
+                    bool lone_prim = p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL &&
+                        parser_next_closes_arg(p);
+                    if (lone_prim || (arg_count == 0 && left->kind == NODE_IDENT &&
                         left->ident.name_len == 5 &&
                         memcmp(left->ident.name, "alloc", 5) == 0 &&
-                        p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL) {
+                        p->current.type >= TOK_U8 && p->current.type <= TOK_BOOL)) {
                         Node *tn = new_node(p, NODE_IDENT);
                         tn->ident.name = p->current.start;
                         tn->ident.name_len = p->current.length;
@@ -2556,6 +2583,18 @@ static Node *parse_statement(Parser *p) {
                     parse_type(p);
                     if (!p->had_error && check(p, TOK_RPAREN)) {
                         advance(p); /* consume ) */
+                        /* BUG-1537: an ARRAY of a container stamp —
+                         * `Box(u32)[3] arr;` — was a parse error locally
+                         * (a global was fine): skip the dimensions first. */
+                        while (check(p, TOK_LBRACKET)) {
+                            int depth = 0;
+                            do {
+                                if (check(p, TOK_LBRACKET)) depth++;
+                                else if (check(p, TOK_RBRACKET)) depth--;
+                                if (check(p, TOK_EOF)) break;
+                                advance(p);
+                            } while (depth > 0);
+                        }
                         is_var = check(p, TOK_IDENT);
                     }
                     p->had_error = sv_err;
@@ -2900,6 +2939,19 @@ static Node *parse_func_or_var(Parser *p, bool is_static) {
 
     /* global variable: type name = expr; or type name; */
     Node *n = new_node(p, NODE_GLOBAL_VAR);
+    /* BUG-1542: `static const u32 K = 5;`, `static volatile u32 flag;` and the
+     * `threadlocal` spellings reach here with the qualifier still WRAPPED around
+     * the type (parse_type), where resolve_type drops it from a value type ("a
+     * variable qualifier, not a type property") — the declaration flags the rest
+     * of the compiler reads were never set. `K = 9` compiled, and a `static
+     * volatile` ISR flag was emitted plain (-O2: `while (flag == 0) {}` became
+     * `jmp .`). The plain `const` / `volatile` global path (parse_var_decl) sets
+     * the flags and leaves the bare type — the same shape here. */
+    while (type && (type->kind == TYNODE_CONST || type->kind == TYNODE_VOLATILE)) {
+        if (type->kind == TYNODE_CONST) n->var_decl.is_const = true;
+        else n->var_decl.is_volatile = true;
+        type = type->qualified.inner;
+    }
     n->var_decl.type = type;
     n->var_decl.name = name;
     n->var_decl.name_len = name_len;

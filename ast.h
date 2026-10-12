@@ -328,6 +328,7 @@ struct Node {
             bool is_comptime;       /* comptime = compile-time evaluated */
             bool is_naked;          /* naked = no prologue/epilogue, asm-only body */
             bool is_async;          /* async = coroutine, transformed to state machine */
+            struct Type *async_state; /* BUG-1559: the `_zer_async_NAME` state type (async only) */
             bool is_variadic;       /* C-interop varargs (...) — bodyless extern decls only */
             const char *section;    /* section(".text.startup") or NULL */
             size_t section_len;

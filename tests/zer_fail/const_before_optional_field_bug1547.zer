@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: 'const' before '?' does not reach the target
+struct S { const ?*u32 p; }
+u32 main() { return 0; }

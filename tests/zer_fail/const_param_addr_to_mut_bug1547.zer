@@ -1,0 +1,5 @@
+// EXPECTED: compile error
+// expect-error: cannot pass const pointer to mutable parameter
+u32 bump(*u32 p) { *p += 1; return *p; }
+u32 f(const u32 x) { return bump(&x); }
+u32 main() { return f(1); }

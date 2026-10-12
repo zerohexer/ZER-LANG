@@ -189,13 +189,12 @@ u8 val = rx_buf.pop() orelse return;
 // Arena — bump allocator
 u8[4096] backing;
 Arena scratch = Arena.over(backing);
-*Task t = scratch.alloc(Task) orelse return;  // T must be struct name, NOT primitive
+*Task t = scratch.alloc(Task) orelse return;  // T: struct name, primitive (u32) or stamp (Box(u32))
 scratch.reset();
 
 // WRONG — these are common mistakes:
 *Task t = tasks.get(h);     // ERROR: get() result is non-storable, use inline
 Pool(Task, 8) local_pool;   // ERROR: Pool/Slab/Ring must be global/static
-arena.alloc(u32);            // ERROR: primitive keyword, use struct wrapper
 ```
 
 ## Defer

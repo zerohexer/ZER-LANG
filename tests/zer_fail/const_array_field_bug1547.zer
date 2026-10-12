@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: 'const' on a value field has no effect
+struct S { const u32[4] a; }
+u32 main() { S s; s.a[1] = 4; return 0; }

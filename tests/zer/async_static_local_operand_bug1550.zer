@@ -1,0 +1,22 @@
+// BUG-1550: a static local read as an IR operand in an async body was emitted
+// as `_zer_self->cnt` (no such member — statics are function-scope C statics).
+u32 g;
+async void w() {
+    static u32 cnt;
+    static u32[4] hist;
+    cnt += 1;
+    hist[cnt % 4] = cnt;
+    if (cnt > 1) { g = cnt + hist[1]; }
+    u32 x = cnt * 2;
+    yield;
+    while (cnt < 3) { cnt += 1; yield; }
+    g = g + x + cnt;
+}
+u32 main() {
+    _zer_async_w t; _zer_async_w_init(&t);
+    while (_zer_async_w_poll(&t) == 0) { }
+    if (g != 5) { return 1; }
+    _zer_async_w t2; _zer_async_w_init(&t2);
+    while (_zer_async_w_poll(&t2) == 0) { }
+    return 0;
+}

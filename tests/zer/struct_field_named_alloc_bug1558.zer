@@ -1,0 +1,11 @@
+// BUG-1558: a funcptr FIELD named alloc is an ordinary call, not the Task.alloc() sugar
+struct Ops { *(u32) -> u32 alloc; }
+u32 wrap(u32 x) { return x + 1; }
+u32 dbl(u32 x) { return x * 2; }
+u32 main() {
+    Ops ops = { .alloc = dbl };
+    u32 r = ops.alloc(wrap(3));
+    if (r != 8) { return 1; }
+    u32 u8v = 4;
+    return ops.alloc(u8v) - 8;
+}

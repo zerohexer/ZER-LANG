@@ -23,6 +23,7 @@
  * flat scenario list (like the curated control-flow scenarios).
  */
 #include <stdio.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include "zer_tmp.h"
@@ -147,6 +148,171 @@ static int run_pos(const char *name, const char *code) {
     fprintf(stderr, "    %.110s\n", eb);
     fprintf(stderr, "--- program ---\n%s--- end ---\n", code);
     return 0;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * ATOMIC-DOWNGRADE GRID (2026-10-12, BUG-1562/1563)
+ *
+ * A spawn target containing any @atomic_* / @barrier has its race finding
+ * downgraded to a warning (a hand-built protocol may order its accesses). The
+ * post pass refuses what nothing the analysis can see orders: two thread
+ * INSTANCES touching one plain global, at least one writing, with neither ONE
+ * common lock nor a release/acquire hand-off between them. The axes:
+ *   pair  — which two instances: two spawn targets, one target spawned in a
+ *           loop, one spawned by a helper called twice, a target against the
+ *           code in its own spawn..join window;
+ *   order — nothing, one CAS lock, two DIFFERENT locks, a flag hand-off;
+ *   access— write/write, write/read.
+ * NEGATIVE: order none / two locks. POSITIVE: one lock / hand-off. The self
+ * pairs (loop, helper) run ONE body twice, so they take write/write under none
+ * and one lock only.
+ *
+ * BUG-1565 adds three pairs and two orders:
+ *   caller   — a fire-and-forget thread started by a helper, against the code
+ *              of the helper's CALLER after the call (C1);
+ *   uncalled — a helper no ZER code calls starts the thread: C may call it any
+ *              number of times, so it is a self pair (C3);
+ *   pointer  — one thread reaches g only through the `*u32` it was handed (C2);
+ *   forged   — the hand-off, plus a THIRD thread that also stores the flag, so
+ *              the wait no longer proves the publisher set it (C4, negative);
+ *   reset    — the hand-off where the reader stores the flag back AFTER its
+ *              wait — a relay, not a forgery (C4's boundary, positive).
+ * ------------------------------------------------------------------------- */
+typedef enum { DP_TWO, DP_LOOP, DP_HELPER, DP_PARENT, DP_CALLER, DP_UNCALLED, DP_POINTER,
+               DP_COUNT } DgPair;
+typedef enum { DO_NONE, DO_LOCK, DO_TWO_LOCKS, DO_HANDOFF, DO_FORGED, DO_RESET,
+               DO_COUNT } DgOrder;
+typedef enum { DA_WW, DA_WR, DA_COUNT } DgAccess;
+static const char *dp_name(DgPair p) {
+    switch (p) {
+    case DP_TWO: return "two-targets"; case DP_LOOP: return "loop-spawn";
+    case DP_HELPER: return "helper-twice"; case DP_PARENT: return "parent-window";
+    case DP_CALLER: return "caller-after"; case DP_UNCALLED: return "uncalled";
+    case DP_POINTER: return "via-pointer";
+    case DP_COUNT: break;
+    }
+    return "?";
+}
+static const char *do_name(DgOrder o) {
+    switch (o) {
+    case DO_NONE: return "none"; case DO_LOCK: return "one-lock";
+    case DO_TWO_LOCKS: return "two-locks"; case DO_HANDOFF: return "handoff";
+    case DO_FORGED: return "forged"; case DO_RESET: return "reset";
+    case DO_COUNT: break;
+    }
+    return "?";
+}
+static int dg_cell_exists(DgPair p, DgOrder o, DgAccess a) {
+    if ((o == DO_FORGED || o == DO_RESET) && p != DP_TWO) return 0;
+    switch (p) {
+    case DP_LOOP: case DP_HELPER: case DP_UNCALLED:   /* one body against itself */
+        return a == DA_WW && (o == DO_NONE || o == DO_LOCK);
+    case DP_TWO: case DP_PARENT: case DP_CALLER: case DP_POINTER: return 1;
+    case DP_COUNT: break;
+    }
+    (void)o;
+    return 0;
+}
+static int dg_negative(DgOrder o) {
+    switch (o) {
+    case DO_NONE: case DO_TWO_LOCKS: case DO_FORGED: return 1;
+    case DO_LOCK: case DO_HANDOFF: case DO_RESET: return 0;
+    case DO_COUNT: break;
+    }
+    return 1;
+}
+/* The body of instance `which` (0 = first, 1 = second). */
+static const char *dg_body(DgOrder o, DgAccess a, int which) {
+    int wr = (which == 0 || a == DA_WW);
+    switch (o) {
+    case DO_NONE:
+        return wr ? "g = 1; @atomic_store(&fl, 1);" : "u32 x = g; @atomic_store(&fl, 2);";
+    case DO_LOCK:
+        return wr ? "while (!@atomic_cas(&la, 0, 1)) { } g += 1; @atomic_store(&la, 0);"
+                  : "while (!@atomic_cas(&la, 0, 1)) { } u32 x = g; @atomic_store(&la, 0);";
+    case DO_TWO_LOCKS:
+        if (which == 0) return "while (!@atomic_cas(&la, 0, 1)) { } g += 1; @atomic_store(&la, 0);";
+        return wr ? "while (!@atomic_cas(&lb, 0, 1)) { } g += 1; @atomic_store(&lb, 0);"
+                  : "while (!@atomic_cas(&lb, 0, 1)) { } u32 x = g; @atomic_store(&lb, 0);";
+    case DO_HANDOFF: case DO_FORGED:
+        if (which == 0) return "g = 1; @atomic_store(&fl, 1);";
+        return wr ? "while (@atomic_load(&fl) == 0) { } g = 2;"
+                  : "while (@atomic_load(&fl) == 0) { } u32 x = g;";
+    case DO_RESET:
+        if (which == 0) return "g = 1; @atomic_store(&fl, 1);";
+        return wr ? "while (@atomic_load(&fl) == 0) { } g = 2; @atomic_store(&fl, 0);"
+                  : "while (@atomic_load(&fl) == 0) { } u32 x = g; @atomic_store(&fl, 0);";
+    case DO_COUNT: break;
+    }
+    return "";
+}
+/* `body` with every access of `g` made through the pointer `p` (the word g only). */
+static void dg_via_pointer(const char *body, char *out, size_t n) {
+    size_t k = 0;
+    for (size_t i = 0; body[i] && k + 3 < n; i++) {
+        int word = body[i] == 'g' && (i == 0 || !(isalnum((unsigned char)body[i - 1]) ||
+                                                  body[i - 1] == '_')) &&
+                   !(isalnum((unsigned char)body[i + 1]) || body[i + 1] == '_');
+        if (word) { out[k++] = '*'; out[k++] = 'p'; }
+        else out[k++] = body[i];
+    }
+    out[k] = 0;
+}
+static void gen_downgrade(DgPair p, DgOrder o, DgAccess a, char *out, size_t n) {
+    const char *hdr = "u32 g;\nu32 fl;\nu32 la;\nu32 lb;\n";
+    switch (p) {
+    case DP_TWO:
+        if (o == DO_FORGED) {
+            snprintf(out, n, "%svoid ta() { %s }\nvoid tb() { %s }\n"
+                     "void tf() { @atomic_store(&fl, 1); }\n"
+                     "u32 main() { ThreadHandle t1 = spawn ta(); ThreadHandle t2 = spawn tb();"
+                     " ThreadHandle t3 = spawn tf(); t1.join(); t2.join(); t3.join(); return 0; }\n",
+                     hdr, dg_body(o, a, 0), dg_body(o, a, 1));
+            return;
+        }
+        snprintf(out, n, "%svoid ta() { %s }\nvoid tb() { %s }\n"
+                 "u32 main() { ThreadHandle t1 = spawn ta(); ThreadHandle t2 = spawn tb();"
+                 " t1.join(); t2.join(); return 0; }\n",
+                 hdr, dg_body(o, a, 0), dg_body(o, a, 1));
+        return;
+    case DP_CALLER:
+        snprintf(out, n, "%svoid ta() { %s }\nvoid start() { spawn ta(); }\n"
+                 "u32 main() { start(); %s return 0; }\n",
+                 hdr, dg_body(o, a, 0), dg_body(o, a, 1));
+        return;
+    case DP_UNCALLED:
+        snprintf(out, n, "%svoid ta() { %s }\nvoid start() { spawn ta(); }\n"
+                 "u32 main() { return 0; }\n",
+                 hdr, dg_body(o, a, 0));
+        return;
+    case DP_POINTER: {
+        char pb[512];
+        dg_via_pointer(dg_body(o, a, 0), pb, sizeof(pb));
+        snprintf(out, n, "%svoid ta(*u32 p) { %s }\nvoid tb() { %s }\n"
+                 "u32 main() { ThreadHandle t1 = spawn ta(&g); ThreadHandle t2 = spawn tb();"
+                 " t1.join(); t2.join(); return 0; }\n",
+                 hdr, pb, dg_body(o, a, 1));
+        return;
+    }
+    case DP_LOOP:
+        snprintf(out, n, "%svoid ta() { %s }\n"
+                 "u32 main() { for (u32 i = 0; i < 2; i += 1) { spawn ta(); } return 0; }\n",
+                 hdr, dg_body(o, a, 0));
+        return;
+    case DP_HELPER:
+        snprintf(out, n, "%svoid ta() { %s }\nvoid start() { spawn ta(); }\n"
+                 "u32 main() { start(); start(); return 0; }\n",
+                 hdr, dg_body(o, a, 0));
+        return;
+    case DP_PARENT:
+        snprintf(out, n, "%svoid ta() { %s }\n"
+                 "u32 main() { ThreadHandle t1 = spawn ta(); %s t1.join(); return 0; }\n",
+                 hdr, dg_body(o, a, 0), dg_body(o, a, 1));
+        return;
+    case DP_COUNT: break;
+    }
+    out[0] = 0;
 }
 
 typedef enum {
@@ -1158,6 +1324,28 @@ int main(void) {
                     ok ? "ok" : "*** FAIL ***");
             if (!ok) grid_ok = 0;
         }
+    }
+
+    /* ---- atomic-downgrade grid (BUG-1562/1563) ---- */
+    fprintf(stderr, "\n  -- atomic-downgrade grid (instance pair x ordering x access) --\n");
+    {
+        char dbuf[1536];
+        for (DgPair dp = 0; dp < DP_COUNT; dp++)
+            for (DgOrder dor = 0; dor < DO_COUNT; dor++)
+                for (DgAccess da = 0; da < DA_COUNT; da++) {
+                    if (!dg_cell_exists(dp, dor, da)) continue;
+                    valid_cells++;
+                    int neg = dg_negative(dor);
+                    char nm[160];
+                    snprintf(nm, sizeof(nm), "downgrade/%s/%s/%s", dp_name(dp), do_name(dor),
+                             da == DA_WW ? "write-write" : "write-read");
+                    gen_downgrade(dp, dor, da, dbuf, sizeof(dbuf));
+                    int ok = neg ? run_neg(nm, dbuf) : run_pos(nm, dbuf);
+                    fprintf(stderr, "  [%-13s][%-9s][%-11s][%-3s] %s\n", dp_name(dp), do_name(dor),
+                            da == DA_WW ? "write-write" : "write-read", neg ? "neg" : "pos",
+                            ok ? "ok" : "*** FAIL ***");
+                    if (!ok) grid_ok = 0;
+                }
     }
 
     fprintf(stderr, "\n=== conc-matrix: %d/%d cells correct ===\n", passed, valid_cells);

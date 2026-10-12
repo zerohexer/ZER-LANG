@@ -1,0 +1,6 @@
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+volatile u32 g;
+u32 rd() { return g; }
+void wr(u32 v) { g = v; }
+void worker() { u32 t = rd(); wr(t + 1); }
+u32 main() { ThreadHandle th = spawn worker(); th.join(); return 0; }

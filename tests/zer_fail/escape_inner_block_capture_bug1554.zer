@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: would keep pointing at 'v'
+?u32 mk() { return 4; }
+u32 main() { u32 base = 0; *u32 p = &base; if (mk()) |v| { p = &v; } return *p; }

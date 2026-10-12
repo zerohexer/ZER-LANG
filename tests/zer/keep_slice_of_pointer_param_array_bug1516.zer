@@ -1,0 +1,7 @@
+// BUG-1516 follow-up: `stash(a.arr)` with `a` a pointer names the caller's (heap)
+// memory, not a frame-local array — it was refused as "slice borrowing local".
+struct A { u32[4] arr; u32 n; }
+[*]u32 g; ?*A keepa;
+void stash([*]u32 s) { g = s; }
+void put(*A a) { stash(a.arr); }
+u32 main() { *A a = alloc(A) orelse return; keepa = a; stash(a.arr); put(a); a.arr[2] = 5; return g[2] - 5; }

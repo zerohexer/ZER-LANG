@@ -1,0 +1,8 @@
+// BUG-1565 (C2): ... and through a helper that the pointer is passed on to.
+// expect-error: no common lock and no release/acquire flag
+u32 g;
+u32 flag;
+void put(*u32 q) { *q = 7; }
+void a(*u32 p) { put(p); @atomic_store(&flag, 1); }
+void b() { g = 2; @atomic_store(&flag, 2); }
+u32 main() { ThreadHandle t1 = spawn a(&g); ThreadHandle t2 = spawn b(); t1.join(); t2.join(); return 0; }

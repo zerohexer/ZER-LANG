@@ -1,0 +1,6 @@
+// expect-error: takes the address of a threadlocal
+// BUG-1514: `*u32 gp = &tl;` was accepted by the checker and refused by GCC
+// ("initializer element is not constant") against the generated file.
+threadlocal u32 tl;
+*u32 gp = &tl;
+u32 main() { return *gp; }

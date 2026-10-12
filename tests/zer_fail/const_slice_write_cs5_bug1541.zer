@@ -1,0 +1,9 @@
+// expect-error: cannot write through const pointer
+// BUG-1541: a write into memory reached through a CONST slice (param, struct
+// field, element address, atomic) went to .rodata unrefused.
+const u32[4] tab;
+void w(const [*]u32 s) { s[0] += 9; }
+u32 main() {
+    w(tab);
+    return tab[0];
+}

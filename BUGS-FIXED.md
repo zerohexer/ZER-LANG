@@ -5,6 +5,297 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
+## Session 2026-10-10 — BUG-1511..1537: five-area audit (allocation tracker, bounds/escape, emitter values, concurrency/bare metal, crash/reference) + own probes
+
+No unconsumed audit branch remained (every `claude/*` / `review/*` branch is patch-equivalent
+to main or was harvested before). Five read-only probe agents plus own probes; every fix was
+A/B-measured against a HEAD build, and every new negative is ACCEPTED by it.
+
+- **BUG-1511 — a call CYCLE froze a function summary while it was still in progress.**
+  `ensure_func_props` answered a cycle "no additional effects", so with `a(){ b(); alloc }`,
+  `b(){ c(); }`, `c(){ a(); }`, computing c first froze b's summary before a's alloc was seen
+  and `@critical { b(); }` reached calloc with interrupts disabled (accepted). The flags only
+  turn on, so the outermost call now re-runs the DFS under a fresh epoch until no flag changes.
+  Test: `tests/zer_fail/critical_alloc_via_call_cycle_bug1511.zer` (pins the line).
+- **BUG-1512 — a BLOCKING wait one call away from an ISR / @critical.** `@cond_wait` /
+  `@cond_timedwait` / `@barrier_wait` / `@sem_acquire` were refused written in a handler and
+  accepted in a callee; `@cond_wait` the same in @critical. New summary flags
+  `props.can_block` / `block_via_call`. Tests: `critical_cond_wait_via_call_bug1512`,
+  `isr_sem_acquire_via_call_bug1512`.
+- **BUG-1513 — a CONDITION / for-STEP reading two roots of one shared type locked only the
+  first.** `if (a1.x == a2.x)`, while / do-while / for cond / switch subject and the for step
+  read `a2` unlocked (TSan data race). `emit_shared_lock_around_cond` now takes the statement's
+  whole lock group (address order, released as one unit) — `CondLock`. Gate: `cond_group` cells
+  in `tools/emit_audit.sh` (6 RED pre-fix). Test: `tests/zer/shared_cond_step_lock_group_bug1513.zer`.
+- **BUG-1514 — `&threadlocal` in a global / static initializer** reached GCC ("initializer
+  element is not constant"); `global_init_scan` refuses it. Tests: `*_init_addr_of_threadlocal_bug1514`.
+- **BUG-1515 — a CONSTANT non-literal index (`a[2 + 2]`, `a[IDX(2)]`) compiled to a bounds
+  check that always trapped** (a field trap on bare metal) instead of `a[4]`'s compile error;
+  in range it is now proven. Tests: `const_expr_index_oob_bug1515`, `const_expr_index_proven_bug1515`.
+- **BUG-1516 — the IMPLICIT array -> slice view formed no reference.** `[*]u32 s = a.arr;
+  free(a); s[2]` read a recycled object (exit 99) at var-decl, assignment, struct-literal
+  field, return and through `pool.get(h).arr`; `o.view = a.buf; return o;` (a local's array
+  FIELD into a local struct) dangled (ASan stack-use-after-return) through return, global copy,
+  out-param and keep call — while the explicit `a.arr[0..]` was refused everywhere. Root fix:
+  the one value-flow query (`value_flows_to`) rewrites the coerced value in place into the
+  explicit full slice `arr[..]` (`make_array_view_explicit`, also run early at the assignment
+  and var-decl sinks), so every downstream analysis sees one spelling. Found on the way: `g =
+  opt orelse local_buf[0..]` (an EXPLICIT slice in the fallback) was accepted — that sink now
+  asks `array_view_frame_root`. The AST emitter's `arr[..]` (no start, no end — reachable only
+  through this rewrite, in a static / global initializer) emitted a length of 0; it is the
+  array's size now. Tests: 10 `tests/zer_fail/*_bug1516.zer`; gate: SHAPE p67 in
+  `tools/sink_matrix.sh` (13 cells, 10 HOLE on the pre-fix build — with BUG-1517 / BUG-1530).
+- **BUG-1517 — `out = got;` (assignment of a PURE view — a join, a Ring pop, a slot read)
+  dropped the view;** the var-decl spelling kept it. The assignment arm required
+  `alloc_id != 0`, and the struct-copy carry kept only compounds with their own allocation;
+  it is now the shared `ir_carry_compounds`. Tests: 3 `uaf_assign_pure_view_*_bug1517.zer`.
+- **BUG-1518 — the for-loop STEP was never collected by the deadlock check** (`i += a.x +
+  b.y` with two shared types: a two-thread hang); init and cond were MERGED into one set
+  (over-rejecting `for (k = a.x; b.y < 3; …)`). Each position is its own lock scope now.
+- **BUG-1519 — an async task dropped `volatile` from its locals** (GCC -O2 deleted a delay
+  loop); a static nested in a block was undeclared; a `static ?u32` got an initializer GCC
+  refused. One helper (`emit_local_decl_head` / `emit_static_local_init`) for the regular
+  and the async paths. Gate: `asyncvol` in `tools/emit_audit.sh`.
+- **BUG-1520 — `@critical` on an unlisted bare-metal arch (MSP430, Xtensa, MIPS, PPC)
+  compiled to a fence** (no interrupt masking) while the checker trusted it; it is `#error`
+  now, as `@cpu_disable_int` already was. Gate: MSP430 row in `tools/emit_audit.sh`.
+- **BUG-1521 — a helper spawning a by-value struct carrying a pointer** (`void start(C c) {
+  spawn wc(c); }`) inferred no keep (`*shared S` carriers are exempt from the carrier rule)
+  and its summary said nothing about the transfer: stack-use-after-return, and a heap
+  write into a recycled object (exit 99). Keep inference runs for every pointer-carrying
+  argument; field transfers are summarised (`transfers_param` bits 8/16, sentinel field
+  "\x02") and applied to every allocation the caller's argument carries.
+- **BUG-1522 — `v() == v()` (void operands) aborted the compiler** with an IR validation
+  error; a struct literal in a comparison likewise.
+- **BUG-1523 — a Ring push never asked `value_flows_to`:** `Ring(u8, 4).push(k)` with `k =
+  300` stored 44 silently; a struct literal pushed was `(void){…}` at GCC.
+- **BUG-1524 — a struct literal as an intrinsic operand / switch subject** reached GCC.
+- **BUG-1525 — assignment to a non-lvalue:** `@truncate(u32, x) = 3;` compiled and the write
+  was discarded; `~x = 5`, `(u32)x = 3` reached GCC. The rule is an exhaustive allow-list of places.
+- **BUG-1526 — a split read-modify-write through a COMPOUND op or a PROJECTION of a local**
+  (`t += g; g = t + 1;`, `t.v = g; g = t.v + 1;`, `t[0] = g; g = t[0] + 1;`) on a volatile
+  global was accepted at the spawn and ISR sinks (TSan: lost updates). One taint-maintenance
+  helper (`rmw_taint_maintain`) for both sinks; RMW grid cells in `tests/test_hw_matrix.c`
+  (RED pre-fix).
+- **BUG-1527 — left-to-right evaluation inside intrinsic arguments, slice bounds, bit-slice
+  positions and a Ring push value:** the passthrough emitted each as one C expression, GCC
+  evaluated the call first (`@saturate(u8, x + bump(&x))` gave 16, not 6). Operands are
+  lowered to temps in source order when the order is observable. Test:
+  `tests/zer/eval_order_passthrough_operands_bug1527.zer` (exit 252 pre-fix).
+- **BUG-1528 — a bit-slice READ of a signed iN was stored unwrapped** (an i3 held 7, or 63).
+- **BUG-1529 — an explicit slice of a volatile array** was typed and emitted as a plain slice
+  (GCC refused `read(hw[0..])`; had it built, the qualifier was gone).
+- **BUG-1530 — a callee freeing a global slot through a VARIABLE index** recorded the key
+  under its own local name (`gs[i]`) and never met the caller's `gs[1]` / `gs[k]` entry: a
+  read through the stored pointer hit a recycled object (exit 99). Keys now match with any
+  non-literal index as a wildcard (`ir_global_keys_may_alias`), and a wildcard VIEW entry
+  widens its members. Tests: 4 `uaf_global_slot_freed_by_callee_*_bug1530.zer`.
+- **BUG-1531 — a false "allocated but never freed"** on a function returning a view of
+  static storage through a local struct field (`ir_expr_has_ptrish_call` had no NODE_ASSIGN
+  arm; now an exhaustive switch).
+- **BUG-1532 — a struct FIELD in C's reserved namespace** (`_Bool`, `__FILE__`) reached GCC.
+- **BUG-1533 — `alloc(T2)` through a typedef alias, then `free(p)`,** was a false "wrong pool".
+- **BUG-1534 — `const u32 K = BIT(2); u32[K] buf;` at global scope** was "not a constant".
+- **BUG-1535 — struct slice typedefs came after the struct body** (`struct N { [*]N kids; }`
+  did not compile); container stamps had no `?` / slice typedefs and came after every regular
+  struct (a struct holding `Box(u32)` by value had an incomplete field). Slice companions are
+  forward-declared before any body; stamps are emitted on demand before their holder.
+- **BUG-1536 — a funcptr RETURNING a funcptr** (and a slice / pointer of funcptrs) emitted
+  `ret (*)(p) (*name)(p)`; a funcptr type is now a `__typeof__(...)` specifier everywhere.
+- **BUG-1537 — `Box(u32)[3] arr;` as a LOCAL** was a parse error.
+- **BUG-1540 — a defer fired TWICE after two forward gotos to two different labels**
+  (`goto out; out: … goto out2; out2: return`): each label's "already fired" flag guarded
+  only its own exits, so the return re-fired it — with `defer free(p)` a double free that
+  released a slot already handed out again (a pointer stored after the first label read
+  another live object, 7 not 42). The goto now DISARMS each defer it fires (the F2 armed
+  flag), so no later fire of that registration runs until it registers again. Tests:
+  `defer_two_forward_gotos_fire_once_bug1540`, `defer_free_two_gotos_no_double_free_bug1540`.
+- **BUG-1541 — writes into memory reached through a CONST slice** (a `const [*]T` param /
+  struct field / call result: `s[0] += 9`, `n.name[0] = 65`, `s[0].a = 9`, `&s[1]` as a
+  mutable `*u32`, `@atomic_add(&s[0], 1)`) were accepted and wrote .rodata (a fault hosted,
+  a flash write on bare metal). The const check follows an index through a const slice /
+  pointer, `&` of such an element is a const pointer, and a writing atomic refuses one.
+- **BUG-1542 — `static const`, `static volatile`, `threadlocal const` / `volatile`
+  globals lost the qualifier** (`K = 9` compiled; a `static volatile` ISR flag loop became
+  `jmp .` at -O2). The parser now sets the declaration flags as the plain spelling does.
+  Gate: `statvol` in `tools/emit_audit.sh`.
+- **BUG-1543 — a WRITE inside a condition (or a nested assignment to an extra root) under
+  a `shared(rw)` lock took the READ lock** — lost updates. A writing condition / statement
+  value takes its group for writing.
+- **BUG-1544 — `switch (v())` on a void call** dropped the default arm silently.
+- **BUG-1545 — an asm output into a non-native uN / iN** kept a full register value.
+- Follow-ups of this round's own changes, found by an adversarial pass over them: the
+  operand hoist (BUG-1527) copied a Barrier (`@barrier_init(b, n())` initialised a copy);
+  the keep sink's slice-borrow walk (now `array_view_frame_root`) refused `stash(a.arr)`
+  through a pointer param; a Ring push of an array skipped the array-view hazard checks
+  (a const array pushed into `Ring([*]u32, 2)`).
+- **BUG-1538 — `i128 m = -1; 10 / m`** was "divisor not proven nonzero" (a negated literal
+  had no typed fold at 128 bits); the i64 spelling passed.
+- **BUG-1548 — a callee freeing THROUGH a pointer-to-reference parameter was invisible.**
+  `void rel(*?*T s) { if (*s) |q| { free(q); } *s = null; }` (also `**T` / `*[*]T`): the
+  tracker never keyed `*s`, so the summary said "frees nothing" — `held = g; rel(&g);
+  held.v` read a recycled object (a global), and a LOCAL `x` after `rel(&x)` was a false
+  leak. The slot behind each such param is now an entry `(param, "*")` minted at function
+  entry (alive, escaped, an id disjoint from the param's own); `*s` keys to it, a deref
+  read aliases it, and the summary records `FuncSummary.frees_param_deref` (freed on
+  some / every path, left dangling or reset to null). The call site applies it to the
+  object the argument names (`&x`, a forwarded param, a pointer with one stable aim):
+  every alias becomes FREED / MAYBE_FREED, and `x` itself holds null when every freeing
+  path reset the slot — so the release-and-null idiom compiles and re-releases cleanly.
+  A pointer whose target cannot be named is refused. Gate: SHAPE p68 (4 holes + 1
+  over-reject on the previous compiler).
+- **BUG-1549 — `pool.get(h).f(3)` aborted the compiler** (a call through a funcptr field
+  of a Pool / Slab slot): the IR callee emitter only spelled a field callee whose object
+  was a plain name. The general field emitter now spells every object form.
+- **BUG-1550 — a `static` local read as an IR operand in an async body** was emitted as
+  `_zer_self->cnt` (GCC: no member). ONE spelling query `ir_local_pfx` replaces the
+  per-site `func->is_async ? "_zer_self->" : ""` (some sites applied one prefix to three
+  locals at once).
+- **BUG-1551 — `|*v|` over an ARRAY** (union array variant, optional array) reached GCC
+  as `uint32_t[4]* v`. A pointer to an array is not a ZER type (BUG-1304); the three
+  capture sites now refuse it with the by-value / struct-wrapper alternatives.
+- **BUG-1552 — a global or static initializer viewing a THREADLOCAL array** (`[*]u32 gs =
+  ta;`, `static [*]u32 s = ta[1..3];`) reached GCC as "not constant": the "a bare array
+  name is its constant address" exemption did not ask threadlocal, and BUG-1514 covered
+  the `&` spelling only.
+- **BUG-1553 — reserved C names as `container` field names** reached GCC; the BUG-1446
+  check now covers container fields.
+- **BUG-1554 — a pointer to an INNER block's local outlived the block silently.**
+  `if (c) { u32 x = 5; p = &x; } if (c) { u32 x = 10; } return *p;` returned 10: the IR
+  locals are flat (no C-level UB) but the two `x` are one C object. The escape sinks ask
+  only "does it outlive the FRAME?". `check_block_lifetime_escape` asks the block
+  question at every assignment whose destination can hold a reference: the value's
+  storage root (`value_block_local` — `&x`, an array view, a pointer local through its
+  recorded borrow root, a struct literal, an orelse arm, a call that may return a view
+  of an argument) must not live in a deeper block than the destination's root
+  (`local_lifetime_level`: a parameter and the body's top block are one level).
+  Corpus cost 0. Gate: SHAPE p69.
+- **BUG-1555 — an interrupt handler reaching a call CYCLE was reported as "a call chain
+  deeper than 32"**: the ISR walk had a depth cap and no path set. One descent helper
+  `isr_walk_callee_body` (the three descent sites) keeps the active path and reports the
+  cycle by name; the verdict (no recursion in a handler) is unchanged.
+- **BUG-1556 — a container stamp or a primitive keyword could not be a TYPE ARGUMENT.**
+  `alloc(Box(u32))`, `@size(Box(u32))`, `@offset(Box(u32), n)`, `ar.alloc(u32)`,
+  `ar.alloc_slice(u8, n)` were parse errors ("expected expression"). The parser now
+  accepts a lone primitive keyword as a call argument (`parser_next_closes_arg`); a stamp
+  parses as a CALL, and the checker rewrites it — only when the callee names a declared
+  container TEMPLATE, so `ops.alloc(wrap(x))` stays a call — into the ident of the stamped
+  struct (`stamp_type_arg_to_name`, registering the stamp in global scope). From there
+  every layer sees the ordinary named-type spelling; the tracker catches UAF / leak on a
+  stamped allocation. The Arena arms resolve the element through
+  `alloc_resolve_elem_type` (checker) / `emit_type_name_arg` (emitter, both dispatch
+  paths) — they looked the name up as a SYMBOL, which a primitive has none of.
+  Tests: `container_stamp_type_arg_bug1556`, `arena_primitive_type_arg_bug1556` +
+  `container_stamp_{uaf,leak}_bug1556` negatives.
+- **BUG-1557 — writing an element of an optional SLICE's capture was refused** ("cannot
+  assign to const variable 'q'" on `if (bs) |q| { q[2].a = 7; }`) — the capture binding is
+  const, its ELEMENTS are not. The assignment target walk now treats an index through a
+  slice or pointer as going through a pointer, exactly like a field through a pointer;
+  `const [*]T` element writes and `const T[N]` arrays stay refused. Tests:
+  `slice_capture_elem_write_bug1557` + `const_slice_capture_write_bug1557`.
+- **BUG-1558 — a funcptr FIELD named `alloc` / `free` / ... was hijacked by the
+  `Task.alloc()` auto-Slab sugar**: `ops.alloc(wrap(3))` was "Ops.alloc() takes no
+  arguments". One predicate `type_struct_has_field` at the four sugar sites (checker,
+  both emitter paths, the tracker's receiver classification): a field of that name wins.
+  Test: `struct_field_named_alloc_bug1558`.
+- **BUG-1559 — an async task frame holding its own task reached GCC** ("field 't' has
+  incomplete type") — `async void a() { _zer_async_a t; }`, an array of them, and the
+  two-function cycle (a holds b, b holds a). A task's state holds its locals by value, so
+  each is a type containing itself. Every non-static local of task type records an edge
+  (`record_async_frame_edge`, `FuncDecl.async_state` names the state type); the
+  whole-program pass `check_async_frame_cycles` refuses any edge on a cycle. Holding
+  ANOTHER task (acyclic) still compiles. Tests: `async_frame_holds_other_task_bug1559` +
+  three negatives.
+- **BUG-1560 — a user type named `slice_u8` collided with the runtime** — its optional
+  `_zer_opt_slice_u8` is the name `?[*]u8` used. The runtime's optional-slice typedefs are
+  `_zer_optslice_*` now; a user type can never spell `optslice` after `_zer_opt_`. Test:
+  `user_struct_named_like_runtime_bug1560`.
+- **BUG-1561 — a read-modify-write split across CALLS was accepted at every race sink.**
+  `u32 t = rd(); wr(t + 1);` (`rd` returns `g`, `wr` stores its parameter into `g`),
+  `wr(rd() + 1)`, `u32 t = rd(); g = t + 1;` and `u32 t = g; wr(t + 1);` — the split-
+  statement taint (BUG-1010) followed a global's value through locals only. A lazy
+  per-function VALUE-FLOW summary (`vf_summary`: the global a return may carry, and per
+  parameter the global it may be stored into; flow-insensitive, through locals) feeds the
+  read side (`rmw_value_source_global` / `rmw_value_taints_global` at a call) and a
+  write-through-call check at the spawn scan and the main/ISR call sink. Gate: four new
+  spellings x three sites in the RMW FORM grid (`tests/test_hw_matrix.c`) plus a
+  `calls-other-global` boundary; 11 of the 12 cells fail on the previous build.
+- **BUG-1562 — the atomic/barrier downgrade covered two WRITERS.** A spawn target with any
+  `@atomic_*` / `@barrier` has its race finding downgraded to a warning, so `g += 1;
+  @atomic_store(&flag, 1);` run by two threads compiled and lost updates. The downgraded
+  spawn sites are recorded (`record_sync_spawn`), each target's writes collected with the
+  lock word held around them (`sync_thread_writes`: a spin acquire on `@atomic_cas` /
+  `@atomic_xchg` and its `@atomic_store` / `@atomic_xchg` release, callees included), and
+  the whole-program pass refuses a global written by two thread instances (two sites, or
+  one spawned in a loop) unless both hold the SAME lock. The exemption set is the race
+  scan's own, extracted as `spawn_global_needs_sync`. Corpus cost 0. Tests: three
+  negatives + `sync_downgrade_same_lock_ok_bug1562`.
+- **BUG-1564 — the split-RMW taint held ONE global per value.** `u32 t = g + h; h = t + 1;`
+  in a thread kept `g` (the first seen) and missed the RMW of `h`; the same through a helper
+  returning `g + h`. And a write half done by a helper storing through a POINTER PARAMETER
+  (`void wr(volatile *u32 p, u32 v) { *p = v; }` called `wr(&g, t + 1)`) was not followed.
+  The per-local taint is now a SET (`rmw_tab_add` / `rmw_tab_rebind`, several rows per name)
+  and the value-flow summary records SETS: a return's sources (globals, argument values,
+  objects arguments point at), each parameter's destinations (globals, or the object another
+  parameter points at), substituted at every call (`call_value_sources`, `call_rmw_globals`,
+  one per sink). A call cycle is summarised to a fixpoint (a head iterates until its summary
+  stops growing), and a summary the walk cannot finish (asm, >64 params) is OPAQUE. Gate:
+  three more spellings in the RMW FORM grid (9 cells, all accepted by the previous build) +
+  three negatives; `split_rmw_recursive_relay_bug1564` pins recursion (refused before too).
+- **BUG-1565 — four instances the atomic/barrier downgrade check did not see.** (C1) A
+  fire-and-forget thread runs beside its spawner's CALLERS after the call returns — every
+  caller (transitively) is now walked from the call onward (`sync_window_callers`, the census
+  records each call node, indirect calls included). (C2) An access through a pointer the
+  thread was handed — the spawn's arguments are resolved at the spawn (`SyncSpawnSite.binds`)
+  and every callee's parameters at the call (`sync_descend`), so `*p`, `p.f`, `p[i]` and a
+  carrier's `*h.p` count as accesses of the global; every spawn the race scan found clean is
+  now recorded too, since it can only conflict this way. (C3) A function with no ZER caller
+  counts as running more than once. (C4) A flag hand-off holds only when no other instance
+  (thread, spawner window, interrupt handler, or a second copy of the publisher) stores the
+  flag except after waiting on it. Corpus cost 0 (247 spawn/atomic files). Gate: the
+  ATOMIC-DOWNGRADE grid gained three pairs and two orders (11 cells refused only now) + five
+  negatives + three boundary positives.
+- **BUG-1561b — the split-RMW summary missed the write half one step away**: `wr` storing
+  through a global pointer (`*gp = v`) or a local pointer aimed at the global
+  (`volatile *u32 p = &g; *p = v;`), and a `wr` that only FORWARDS its parameter to the real
+  writer (`void wr(u32 v) { wr2(v); }`). `vf_assign` now follows a store through a pointer
+  with the shared `for_each_write_target` (a local aimed `&g` carries `g`), and a call
+  argument carrying parameter bits inherits the callee's store. Gate: two more spellings in
+  the RMW FORM grid (6 cells, all accepted by the previous build) + the
+  `split_rmw_calls_other_target_ok_bug1561b` boundary.
+- **BUG-1563 — the atomic/barrier downgrade check counted only WRITERS, only spawn sites,
+  and wrongly counted SEQUENTIAL ones.** Accepted before (TSan-class races): a plain read
+  in one thread against a write in another; the spawning code reading or writing the
+  global between the spawn and its `join()`; a helper that spawns, called twice. And
+  over-rejected: `a = spawn w(); a.join(); b = spawn w(); b.join();` (BUG-1562 counted it
+  as two concurrent writers). One walker `sync_walk` collects every plain read and write of
+  a thread instance with what orders it (the lock held, the flag WAITED on before, the flag
+  RELEASED after); the spawning function is walked in WINDOW mode from the spawn to the
+  join (`spawn_stmt.handle_name`), recording later spawns as sequential; a call-site census
+  (`census_walk` / `census_instances`) decides whether an enclosing function can run twice.
+  Two instances conflict unless ONE lock or a publish/acquire pair on one flag orders the
+  two accesses. Atomic cells are left to their own rule. Corpus cost 0. Gate: the
+  ATOMIC-DOWNGRADE grid in `tests/test_conc_matrix.c` (pair x ordering x access, 21 cells;
+  7 false negatives and 1 over-rejection on the previous build) + four negatives +
+  `sync_flag_handoff_ok_bug1563`.
+- **BUG-1546 — `const volatile *u32` dropped `volatile`.** The const arm of `resolve_type`
+  rebuilt the pointer from the inner type and copied only the target; a read-only register
+  pointer (parameter or field) was emitted non-volatile, and passing `&vx` to such a
+  parameter was refused. Test: `tests/zer/const_volatile_ptr_param_bug1546.zer`.
+- **BUG-1547 — `const` on a PARAMETER or a FIELD of a value type was silently ignored.**
+  ZER's rule is that on a value type `const` qualifies the VARIABLE (resolve_type keeps it
+  only as a pointer/slice TARGET), and only the var-decl paths carried it. A parameter is a
+  variable, so `u32 f(const u32 x) { x = 5; }`, `const S s` then `s.v = 2`, and passing `&x`
+  to a `*u32` all compiled; it now gets `Symbol.is_const` exactly like a local (async
+  parameters too). A struct field / union variant / container field is NOT a variable, so a
+  value-type `const` there is refused rather than ignored (`s.id = 3` compiled on a
+  `const u32 id`, `s.a[1] = 4` on a `const u32[4] a`); `const ?*T` is refused at both sites
+  with the `?const *T` spelling. One predicate `typenode_const_dropped` + one reporter
+  `reject_const_value_field`. Corpus cost 0 (every file hitting a const diagnostic was an
+  existing negative). Rejecting the field form is forward-compatible: honouring it later
+  breaks no program. Tests: 9 `*_bug1547` negatives (all accepted by the previous compiler) +
+  `tests/zer/const_param_read_and_copy_bug1547.zer`.
+
 ## Session 2026-09-28 — BUG-1400..: harvest of `loving-bohr-7nox2h`, then a five-area audit (escape order, allocation tracker, concurrency, VRP, emitter)
 
 Harvest: `origin/claude/loving-bohr-7nox2h` (21 commits, a strict superset of `jyw9if`,

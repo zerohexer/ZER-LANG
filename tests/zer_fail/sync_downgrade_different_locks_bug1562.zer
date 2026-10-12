@@ -1,0 +1,7 @@
+// expect-error: no common lock and no release/acquire flag
+u32 la;
+u32 lb;
+u32 counter;
+void wa() { while (!@atomic_cas(&la, 0, 1)) { } counter += 1; @atomic_store(&la, 0); }
+void wb() { while (!@atomic_cas(&lb, 0, 1)) { } counter += 1; @atomic_store(&lb, 0); }
+u32 main() { ThreadHandle a = spawn wa(); ThreadHandle b = spawn wb(); a.join(); b.join(); return 0; }

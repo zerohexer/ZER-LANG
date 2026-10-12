@@ -1,0 +1,3 @@
+// BUG-1538: a negated literal into an i128 was not a known constant for the
+// nonzero-divisor proof (i64 was fine).
+u32 main() { i128 m = -1; i128 r = 10 / m; if (r != -10) { return 1; } return 0; }

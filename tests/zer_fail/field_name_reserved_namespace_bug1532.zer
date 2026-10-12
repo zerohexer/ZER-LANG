@@ -1,0 +1,4 @@
+// expect-error: is in C's reserved namespace
+// BUG-1532: a struct FIELD named `_Bool` / `__FILE__` / `__x86_64__` reached GCC.
+struct Q { u32 _Bool; }
+u32 main() { Q q; return q._Bool; }

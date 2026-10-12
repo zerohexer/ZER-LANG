@@ -1,0 +1,8 @@
+// BUG-1557: the capture of an optional SLICE is a const binding, but its
+// ELEMENTS are not const — writing q[i] goes through the slice's pointer.
+struct P { u32 a; }
+u32 main() {
+    ?[*]P bs = alloc(P, 3);
+    if (bs) |q| { q[2].a = 7; u32 r = q[2].a; free(q); return r - 7; }
+    return 6;
+}

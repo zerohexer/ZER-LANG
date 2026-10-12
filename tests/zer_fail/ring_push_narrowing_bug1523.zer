@@ -1,0 +1,10 @@
+// expect-error: cannot push 'u32' into a Ring of 'u8'
+// BUG-1523: a Ring push never asked value_flows_to — a u32 300 pushed into a
+// Ring(u8, 4) was stored as 44 with no diagnostic.
+Ring(u8, 4) rq;
+u32 main() {
+    u32 k = 300;
+    rq.push(k);
+    u8 a = rq.pop() orelse return;
+    return (u32)a;
+}

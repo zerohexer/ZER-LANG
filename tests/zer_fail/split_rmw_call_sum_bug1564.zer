@@ -1,0 +1,7 @@
+// BUG-1564: a helper returning a value of TWO globals (the call summary held one).
+// expect-error: non-atomic read-modify-write on volatile global 'h'
+volatile u32 g;
+volatile u32 h;
+u32 rd() { return g + h; }
+void worker() { u32 t = rd(); h = t + 1; }
+u32 main() { ThreadHandle th = spawn worker(); th.join(); return 0; }

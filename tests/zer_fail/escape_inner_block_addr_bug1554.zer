@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: 'p' would keep pointing at 'x' after 'x' dies
+// BUG-1554: a pointer to a block-scoped local outlived its block. The IR locals
+// are flat, so the two sibling `x` are ONE C object and `*p` read 10, not 5.
+u32 main() {
+    volatile bool c = true;
+    u32 base = 0;
+    *u32 p = &base;
+    if (c) { u32 x = 5; p = &x; }
+    if (c) { u32 x = 10; x += 0; }
+    return *p;
+}

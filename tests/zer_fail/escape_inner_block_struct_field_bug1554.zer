@@ -1,0 +1,4 @@
+// EXPECTED: compile error
+// expect-error: 'h' would keep pointing at 'x'
+struct H { *u32 p; }
+u32 main() { u32 base = 1; H h = { .p = &base }; { u32 x = 7; h.p = &x; } return *h.p; }

@@ -710,3 +710,5 @@ checker.c:else if (type->kind == TYPE_POINTER && !type->pointer.is_const)
 checker.c:if (eff && eff->kind == TYPE_SLICE && !eff->slice.is_volatile) {
 checker.c:if (type->kind == TYPE_SLICE && !type->slice.is_const)
 checker.c:} else if (eff && eff->kind == TYPE_POINTER && !eff->pointer.is_volatile) {
+checker.c:if (tn->kind == TYNODE_CONST) has_const = true;
+checker.c:while (tn && (tn->kind == TYNODE_CONST || tn->kind == TYNODE_VOLATILE)) {

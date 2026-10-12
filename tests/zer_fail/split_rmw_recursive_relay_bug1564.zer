@@ -1,0 +1,7 @@
+// BUG-1564: the value relays through a recursive helper (a call-cycle fixpoint).
+// Pins the shape; it was refused before the rewrite too.
+// expect-error: is read-modify-written and is shared between interrupt and main
+volatile u32 g;
+u32 rd(u32 n) { if (n == 0) { return g; } return rd(n - 1); }
+interrupt TIMER { g = 1; }
+u32 main() { u32 t = rd(3); g = t + 1; return 0; }

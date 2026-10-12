@@ -1,0 +1,4 @@
+// BUG-1559: an async task may hold ANOTHER task by value (acyclic), declared before or after it
+async void b() { yield; }
+async void a() { _zer_async_b t; _zer_async_b_init(&t); while (_zer_async_b_poll(&t) == 0) { yield; } }
+u32 main() { _zer_async_a x; _zer_async_a_init(&x); while (_zer_async_a_poll(&x) == 0) { } return 0; }

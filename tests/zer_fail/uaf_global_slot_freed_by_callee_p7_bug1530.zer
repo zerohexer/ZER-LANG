@@ -1,0 +1,21 @@
+// expect-error: is maybe-freed
+// BUG-1530 sibling: caller stores at a variable index, callee frees at another.
+struct T { u32 v; }
+?*T[4] gs;
+volatile u32 gk;
+void zap() {
+    u32 i = gk;
+    if (i < 4) { if (gs[i]) |p| { free(p); } gs[i] = null; }
+}
+u32 main() {
+    *T a = alloc(T) orelse return;
+    a.v = 7;
+    u32 k = gk;
+    if (k < 4) { gs[k] = a; }
+    zap();
+    *T b = alloc(T) orelse return;
+    b.v = 99;
+    u32 r = a.v;
+    free(b);
+    return r;
+}

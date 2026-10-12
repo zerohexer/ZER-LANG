@@ -408,6 +408,8 @@ struct Symbol {
         bool can_enable_int; /* BUG-1251: re-enables / waits for interrupts (directly or transitively) */
         bool can_cond_wait;  /* BUG-1476: @cond_wait / @cond_timedwait (directly or transitively) */
         bool cond_wait_via_call; /* BUG-1476: ...reached through a CALL (not this body's own wait) */
+        bool can_block;      /* BUG-1512: a BLOCKING wait — @cond_wait / @cond_timedwait / @barrier_wait / @sem_acquire */
+        bool block_via_call; /* BUG-1512: ...reached through a CALL */
         /* Direct-only effect flags — set when the effect appears literally
          * in this function's immediate body (NOT through a callee). Used by
          * check_body_effects to suppress duplicate body-level errors when
@@ -465,6 +467,13 @@ struct Symbol {
      * test_firmware_patterns for >4 minutes. */
     bool rmw_summary_done;
     uint64_t rmw_param_mask;
+    /* BUG-1561: the VALUE-flow half, for a read-modify-write split across calls
+     * (`u32 t = rd(); wr(t + 1);`): a global this function's RETURN value may
+     * carry, and where each parameter's value / pointee may be STORED. Lazy;
+     * vf_state 0 = not computed (or provisional inside a recursion cycle),
+     * 1 = in progress (a recursive call reads its sets so far), 2 = final. */
+    uint8_t vf_state;
+    struct VfSummary *vf;   /* BUG-1564: sets of sources / destinations (checker.c) */
     /* BUG-1481: the MEMORY-MAPPED half of the same summary — every write this
      * function makes THROUGH a pointer parameter, as a byte span relative to the
      * pointer (`void setb(volatile *Regs u){ u.ctrl |= 2; }` -> param 0, bytes
@@ -570,6 +579,10 @@ int  type_alignment_bytes(Type *a); /* required alignment in bytes; recurses
                                       * through aggregates for compound MMIO
                                       * targets; returns 0 if not computable */
 bool type_is_optional(Type *a);
+/* BUG-1558: does struct type `t` (distinct-unwrapped) declare a FIELD named
+ * name? A field wins over the auto-Slab method sugar (`Task.alloc()`), so a
+ * funcptr field `ops.alloc(x)` is an ordinary indirect call. */
+bool type_struct_has_field(Type *t, const char *name, uint32_t len);
 Type *type_unwrap_optional(Type *a); /* ?T → T */
 
 /* coercion: can 'from' be implicitly converted to 'to'? */

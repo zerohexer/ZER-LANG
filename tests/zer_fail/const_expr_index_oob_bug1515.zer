@@ -1,0 +1,9 @@
+// expect-error: array index 4 (a constant expression) is out of bounds
+// BUG-1515: `a[4]` was a compile error but `a[IDX(2)]` (a comptime call) and
+// `a[2 + 2]` compiled to a bounds check that always trapped at run time.
+comptime u32 IDX(u32 n) { return n * 2; }
+u32[4] a;
+u32 main() {
+    a[IDX(2)] = 1;
+    return 0;
+}

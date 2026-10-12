@@ -1,0 +1,9 @@
+// expect-error: cannot assign to expression — not an lvalue
+// BUG-1525: `@truncate(u32, x) = 3;` compiled and the write was thrown away
+// (x stayed 1); `~x = 5` / `(u32)x = 3` reached GCC. The lvalue rule is now an
+// allow-list of places.
+u32 main() {
+    u32 x = 1;
+    @truncate(u32, x) = 3;
+    return x;
+}

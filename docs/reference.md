@@ -330,7 +330,18 @@ u32[4] values;            // 4 u32s
 i32[3][3] matrix;         // 3x3 multi-dimensional
 ```
 
-An array type may have at most 64 dimensions.
+An array type may have at most 64 dimensions. A type is read left to right, so
+`u32[2][3] grid` is THREE rows of `u32[2]` — the LAST size in the type is the FIRST
+index (`grid[0..2][0..1]`), the reverse of C's `uint32_t grid[2][3]`:
+
+```zer
+u32[2][3] grid;               // 3 rows, each a u32[2]
+u32 main() {
+    grid[2][1] = 5;           // row 2 (< 3), column 1 (< 2)
+    // grid[1][2] = 5;        // COMPILE ERROR — 2 is out of bounds for size 2
+    return grid[2][1] - 5;
+}
+```
 
 **EXAMPLE**
 ```zer
@@ -1005,6 +1016,9 @@ msg.sensor.temperature;         // COMPILE ERROR — must switch first
 
 **NOTES**
 - Mutable capture `|*v|` takes a pointer to the original union variant.
+- An ARRAY variant cannot be captured `|*v|` — that would be a pointer to an array,
+  which ZER does not have (the same rule as `*u32[4]`). Capture it by value `|v|` to
+  read it, or wrap the array in a struct variant and capture that.
 - Mutating the switched-on union's variant inside a capture arm is a compile error —
   and so is writing anything that CONTAINS it: `switch (w.u)` refuses `w = w2;`,
   `w = { .u = … };` and a write through a pointer to `w` (`pw.u.p = …`). When the
@@ -1427,6 +1441,17 @@ i32 main() {
   `const u32 A = 5; const u32 B = A + 1; u32 G = B;` is fine (`G` starts at 6).
 - A string literal is read-only. `[*]u8 S = "x";` is rejected at global and
   local scope alike; declare it `const [*]u8`.
+- **Where `const` attaches.** On a VALUE type `const` qualifies the VARIABLE, not
+  the type; on a pointer or slice it makes the TARGET read-only (`const *T`,
+  `const [*]T`, `?const *T`). So it applies wherever a variable is declared — a
+  global, a local, a `static`, and a PARAMETER (`u32 f(const u32 x)` cannot assign
+  `x`; `const S s` cannot assign `s.v`; a pointer field of `s` is still writable
+  through). A struct FIELD, union variant or container field is not a variable, so
+  `struct S { const u32 id; }` is a compile error rather than a silently ignored
+  qualifier: declare the struct variable `const`, or hold the data behind a
+  `const *T`. `const ?*T` is refused for the same reason (the `const` would land on
+  the optional, not the target) — write `?const *T`. `const volatile *T` keeps both
+  qualifiers (a read-only register).
 
 **SEE ALSO**
 comptime, static, Pool, Ring
@@ -2703,6 +2728,10 @@ Ring(u8, 256) rx_buf;      // 256-byte circular buffer, global only
 - `.push_checked(val)` → `?void` — Push value. Returns null if full.
 - `.pop()` → `?T` — Pop oldest. Returns null if empty.
 
+The pushed value must FLOW into `T` like any assignment: `Ring(u8, 4).push(k)` with a
+`u32 k` is a compile error (no silent truncation), and a struct literal is typed
+against `T` (`rq.push({ .v = 1 })`).
+
 Discarding a `push_checked` result is a compile error: reporting overflow is its
 entire purpose, so throwing the report away makes it identical to `push`. Write
 `rb.push_checked(x) orelse { ... };`, or call `push` if dropping on overflow is
@@ -2859,21 +2888,22 @@ from a DIFFERENT arena is a compile error, because their lifetimes are not tied
 together (a local arena's buffer dies with the frame). Storing one into a
 global/static remains a compile error.
 
-**ERRORS**
+**PRIMITIVE AND STAMPED ELEMENT TYPES.** `T` may be a primitive keyword or a
+container stamp, as well as a struct/enum name (BUG-1556 — both used to be parse
+errors):
 ```zer
-ar.alloc(u32)          // PARSE ERROR — T must be struct/enum name, not primitive
-ar.alloc_slice(u8, n)  // PARSE ERROR — same restriction
-```
-
-Workaround for primitives:
-```zer
-struct Byte { u8 val; }
+container Box(T) { T v; u32 n; }
 u8[256] backing;
 
 u32 main() {
     Arena ar = Arena.over(backing);
-    [*]Byte bytes = ar.alloc_slice(Byte, 64) orelse { return 1; };
-    bytes[0].val = 7;
+    [*]u8 bytes = ar.alloc_slice(u8, 64) orelse { return 1; };
+    bytes[0] = 7;
+    *u32 one = ar.alloc(u32) orelse { return 2; };
+    *one = 5;
+    *Box(u32) b = ar.alloc(Box(u32)) orelse { return 3; };
+    b.v = bytes[0] + *one;
+    if (b.v != 12) { return 4; }
     return 0;
 }
 ```
@@ -3339,7 +3369,9 @@ usize s = @size(Task);     // e.g., 12
 ```
 
 **NOTES**
-- The operand may be a type name, a `uN`/`iN` spelling, or a VARIABLE — for a
+- The operand may be a type name, a container stamp (`@size(Box(u32))`, also
+  `@offset(Box(u32), n)` and `alloc(Box(u32))` — BUG-1556), a `uN`/`iN`
+  spelling, or a VARIABLE — for a
   variable it is the size of the variable's type (BUG-1038: `@size(x)` used to
   be spelled `sizeof(struct x)` and `@size(u21)` was an undefined identifier).
   A `uN` reports its CARRIER: `@size(u21)` is 4, `@size(u3)` is 1.
@@ -4453,6 +4485,18 @@ Per-architecture interrupt disable/enable.
 `yield`, `await`, and `spawn` are also **banned** inside `@critical` — both directly and transitively (calling a function that yields/spawns is also rejected). Yield/await would suspend with interrupts disabled (system hang). Spawn would create a thread with interrupts disabled (hardware-unsafe).
 
 Turning interrupts back on inside the block — `@cpu_enable_int()`, `@cpu_restore_int_state(...)`, or waiting for one with `@cpu_wait_int()` / `@cpu_deep_sleep()`, directly or in a called function — is **banned** too: code after that point would run unprotected while the compiler still treats it as inside `@critical` (and a wait with interrupts off never wakes on x86).
+
+`@cond_wait` / `@cond_timedwait` are **banned** inside `@critical`, directly or in a
+called function (the wait would release and re-take a mutex with interrupts off), and
+every `@cond_*` / `@sem_*` / `@barrier_wait` that BLOCKS is banned in an interrupt
+handler the same two ways. Signalling (`@cond_signal`, `@sem_release`) is allowed.
+
+The interrupt-disable sequence is chosen per target (ARM M-profile PRIMASK, AArch64
+DAIF, ARM A/R CPSR, AVR SREG, RISC-V `mstatus`, x86 `cli`). In user mode (hosted
+Linux/macOS/Windows) no interrupt can preempt the program and the block is a full
+fence. A bare-metal build for an architecture with no sequence (MSP430, Xtensa, MIPS,
+PowerPC, …) is a **compile error** (`#error`) rather than a block that silently masks
+nothing.
 
 **EXAMPLE**
 ```zer
@@ -5791,6 +5835,12 @@ u32 main() {
 `x /= 0` and `x %= 0` with a divisor that folds to zero are compile errors, exactly
 like `x / 0`; a divisor the compiler cannot prove nonzero is one too (see "SAFETY GUARANTEES").
 
+The TARGET must be a place: a variable, a field, an element, a bit-slice, or `*p`.
+A value — a cast `(u32)x`, an intrinsic result `@truncate(u32, x)`, `~x`, `x + 1`, a
+call returning a value — is a compile error ("not an lvalue"), never a write that is
+silently discarded. A field or element reached THROUGH a pointer, slice or Handle is a
+place whatever produced the pointer (`get().v = 1` when `get` returns `*T`).
+
 ### Precedence
 
 Binary operators bind in the SAME order as C, loosest first. `orelse` sits
@@ -5858,7 +5908,9 @@ u32 main() { u32 a = 3; u32 b = a > 2 ? 1 : 0; return b; }
 
 Operands are evaluated LEFT TO RIGHT, and every side effect happens exactly once — for
 binary operators, comparisons, call arguments, struct-literal fields and array indices,
-whether an operand is a local, a global or a field. An assignment evaluates its TARGET
+intrinsic arguments (`@saturate(u8, x + bump(&x))`), slice bounds (`a[0 .. x + bump(&x)]`),
+bit-slice positions and the value of a Ring `push`, whether an operand is a local, a
+global or a field. An assignment evaluates its TARGET
 (including every index in it) before its value, and yields the stored value.
 A PLACE is evaluated from its root outward: in `m[f()][g()]`, `pick().a[k].b` or
 `mk().v[k]`, the object (`m`, `pick()`, `mk()`) comes first, then each index in the
@@ -6326,7 +6378,7 @@ the `Handle` by value rather than a pointer to it.
 | Integer overflow | Wraps (defined), never UB |
 | Silent truncation | Must use @truncate or @saturate explicitly |
 | Missing switch case | Exhaustive check for enums, bools, unions |
-| Dangling pointer | Scope escape analysis on return, assign, keep, orelse |
+| Dangling pointer | Scope escape analysis on return, assign, keep, orelse — and BLOCK lifetimes: a pointer to an inner block's local cannot be stored in a variable of an outer block (`if (c) { u32 x; p = &x; }` is an error) |
 | Union type confusion | Cannot mutate union variant during switch capture |
 | Arena pointer escape | Arena-derived pointers cannot be stored in globals |
 | Division by zero | Forced guard — compile error if divisor not proven nonzero. A float divisor is proven by `if (y == 0.0) { return; }` / `if (y != 0.0) { ... }` (BUG-1067) — float division follows the integer rule, not IEEE `inf` |
@@ -6543,7 +6595,30 @@ u32 main() {
   `threadlocal`, or synchronizes with `@atomic_*` compiles as usual
 - Spawn target body scanned for non-shared global access:
   - No atomic/barrier in function → compile **error**
-  - Has atomic/barrier → compile **warning** (lock-free pattern possible)
+  - Has atomic/barrier → compile **warning** (lock-free pattern possible) —
+    EXCEPT when two thread instances touch the same plain global, at least one
+    writing, and neither ONE common lock nor a release/acquire hand-off orders
+    them: that is an **error** (BUG-1562/1563). The instances are two spawns,
+    one target spawned in a loop or by a function that can run twice, and the
+    spawning code between the spawn and its `join()`. An access is under a lock
+    when it sits between a spin acquire of a lock word and its release in one
+    statement list (callees included); a hand-off is a write followed by
+    `@atomic_store(&flag, ..)` in one thread and a read after a wait on
+    `@atomic_load(&flag)` (a loop, or `if (@atomic_load(&flag) ...)`) in the
+    other. A thread joined before the next one is spawned does not count —
+    examples below. Also counted (BUG-1565): a fire-and-forget thread against
+    the code its spawner's CALLERS run after the call returns; an access
+    through a pointer the thread was handed (`spawn w(&g)` then `*p = 1`); a
+    function no ZER code calls counts as running more than once (C may call
+    it). A hand-off holds only when no other thread or interrupt handler — and
+    no second copy of the publisher — stores the flag, except after waiting
+    on it itself (a reader resetting the flag after its wait is fine)
+  - A read-modify-write may be split across CALLS — `u32 t = rd(); wr(t + 1);`
+    with `rd` returning `g` and `wr` storing its parameter into `g` — and is the
+    same non-atomic RMW as `g += 1` at every sink (BUG-1561). A value carries
+    EVERY global it was read from (`u32 t = d + g; g = t + 1;`), a helper may
+    store through a pointer PARAMETER (`wr(&g, t + 1)` with `*p = v`), and a
+    recursive helper is summarised to a fixpoint (BUG-1564)
   - Transitive: follows callees 8 levels deep
 - Escape hatches: `shared struct`, `threadlocal`, `@atomic_*`, `const`, and a
   **single-word** `volatile` global. Two of these cover the VALUE, never what it
@@ -6581,6 +6656,32 @@ u32 main() {
   writing `g2.v = g1.v + 1;` cannot deadlock with it
 - A scoped-spawn argument that is an address INTO a pool slot (`&pool.get(h).v`)
   lends `h` exactly as `&h.v` does: freeing or using `h` before `.join()` is refused
+
+Two writers under ONE lock, and a flag hand-off — warnings, not errors (BUG-1562/1563):
+```zer
+u32 lock;
+u32 counter;
+void inc() { while (!@atomic_cas(&lock, 0, 1)) { } counter += 1; @atomic_store(&lock, 0); }
+u32 main() {
+    ThreadHandle a = spawn inc();     // warning (verify ordering) — not an error
+    ThreadHandle b = spawn inc();
+    a.join(); b.join();
+    return counter - 2;
+}
+```
+```zer
+u32 data;
+u32 ready;
+u32 got;
+void producer() { data = 42; @atomic_store(&ready, 1); }       // write, then release
+void consumer() { while (@atomic_load(&ready) == 0) { } got = data; }  // wait, then read
+u32 main() {
+    ThreadHandle p = spawn producer();
+    ThreadHandle q = spawn consumer();
+    p.join(); q.join();
+    return got - 42;
+}
+```
 
 ### Condvar — Thread Synchronization
 ```zer
@@ -6958,7 +7059,10 @@ polls, so the compiler treats it like any other object that keeps a pointer:
   the type). Not a struct or union field, a slice element, or a heap allocation
   (`alloc(_zer_async_NAME, n)`) — hold a `*_zer_async_NAME` instead. A task is
   never copied (`b = a`, `b = *pa`), because its promoted locals may point into
-  itself.
+  itself. An async function may hold ANOTHER task in a local, but not its own
+  task type (`_zer_async_a t;` inside `a`), and two tasks may not hold each
+  other — a task's state holds its locals, so either would contain itself
+  (BUG-1559).
 
 ```zer
 async void tick_task(*u32 n) { *n += 1; yield; *n += 1; }

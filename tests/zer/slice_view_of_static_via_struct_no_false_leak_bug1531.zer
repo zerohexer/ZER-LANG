@@ -1,0 +1,6 @@
+// BUG-1531: a function returning a view of STATIC storage through a local
+// struct field was reported "allocated but never freed" (it allocates nothing).
+u8[4] gb;
+struct O { [*]u8 view; }
+[*]u8 gv() { O o; o.view = gb; return o.view; }
+u32 main() { [*]u8 s = gv(); return s[0]; }

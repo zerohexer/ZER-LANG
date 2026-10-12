@@ -1,0 +1,6 @@
+// expect-error: is read-modify-written and is shared between interrupt and main
+volatile u32 g;
+u32 rd() { return g; }
+void wr(u32 v) { g = v; }
+interrupt TIMER0 { u32 t = rd(); wr(t + 1); }
+u32 main() { g = 1; return 0; }

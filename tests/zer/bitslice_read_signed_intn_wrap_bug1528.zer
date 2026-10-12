@@ -1,0 +1,13 @@
+// BUG-1528: a bit-slice READ of a signed iN was stored unwrapped (an i3 held 7,
+// or 63 with a position past the width) — a value outside the type.
+u32 g = 5;
+u32 main() {
+    i3 h = -1;
+    i3 k = h[2..0];           // full-width field of an i3: expect -1
+    if (k > 3) { }  // an i3 can never exceed 3
+    u32 hi = g;               // runtime position past the width
+    i3 m = h[hi..0];
+    i32 w = (i32)m;
+    if (w != -1) { return (u32)(w + 100); }
+    return 0;
+}

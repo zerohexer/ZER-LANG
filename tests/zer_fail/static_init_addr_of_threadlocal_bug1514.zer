@@ -1,0 +1,5 @@
+// expect-error: takes the address of a threadlocal
+// BUG-1514: the static-local spelling of the same initializer.
+threadlocal u32 tl;
+u32 f() { static *u32 sp = &tl; return *sp; }
+u32 main() { return f(); }

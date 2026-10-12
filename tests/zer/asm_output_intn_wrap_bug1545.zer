@@ -1,0 +1,15 @@
+// BUG-1545: an asm output into a u3 kept a full register value (200).
+u3 small;
+naked void f() {
+    asm {
+        instructions: "mov $200, %0"
+        outputs: { "rax" = small }
+        clobbers: [ "memory" ]
+        safety: "plain register move — no memory access, no flags consumed"
+    }
+}
+u32 main() {
+    f();
+    u32 k = (u32)small;
+    return k;
+}

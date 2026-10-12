@@ -1,0 +1,13 @@
+// BUG-1543: a WRITE inside a condition of a shared(rw) struct took only the read
+// lock — two threads lost updates (exit 1). A writing condition takes the write lock.
+shared(rw) struct A { u32 x; }
+A a1;
+A a2;
+void w() { for (u32 i = 0; i < 200000; i += 1) { if ((a2.x += 1) == 0) { a1.x = 1; } } }
+u32 main() {
+    ThreadHandle t = spawn w();
+    for (u32 i = 0; i < 200000; i += 1) { if ((a2.x += 1) == 0) { a1.x = 1; } }
+    t.join();
+    if (a2.x != 400000) { return 1; }
+    return 0;
+}

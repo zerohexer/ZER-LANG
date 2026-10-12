@@ -46,6 +46,10 @@ typedef struct {
     Arena *arena;           /* arena for type allocations */
     Scope *global_scope;    /* module-level scope */
     Scope *current_scope;   /* current scope in traversal */
+    /* BUG-1554: the scope holding the current function's PARAMETERS (an interrupt:
+     * the scope its body block opens in). It and the body's top block share one
+     * lifetime; every scope below them is a shorter-lived block. NULL outside a body. */
+    Scope *fn_param_scope;
     const char *file_name;
     const char *source;     /* source text for error display (NULL = skip source line) */
     int error_count;
@@ -171,6 +175,12 @@ typedef struct {
     /* BUG-1425: bumped when every body is typed, so a function summary cached
      * earlier (when its indirect calls could not be resolved yet) is recomputed. */
     int props_epoch;
+    /* BUG-1511: a call CYCLE leaves the summaries computed inside it partial
+     * (the in-progress function contributes only what it had found so far).
+     * The outermost ensure_func_props iterates to a fixpoint when one was hit. */
+    int props_depth;
+    bool props_cycle_hit;
+    bool props_changed;
     const char *current_module;   /* module name for prefix (NULL = main module) */
     uint32_t current_module_len;
     int expr_depth;               /* recursion depth guard for check_expr */
@@ -481,6 +491,41 @@ typedef struct {
     } *mmio_accesses;
     int mmio_access_count;
     int mmio_access_capacity;
+
+    /* BUG-1559: an async function's FRAME holds its locals by value, so a local
+     * of task type `_zer_async_B` inside async A makes A's state contain B's.
+     * One edge per such local; a cycle (A holds A, or A holds B holds A) is a
+     * type containing itself, refused in the whole-program post pass. */
+    struct AsyncFrameEdge {
+        Type *from, *to;
+        const char *local; uint32_t local_len;
+        const char *file; const char *source;
+        int line;
+    } *async_frame_edges;
+    int async_frame_edge_count;
+    int async_frame_edge_capacity;
+
+    /* BUG-1562: spawn sites whose race finding was DOWNGRADED to a warning
+     * because the target contains an @atomic_* / @barrier (a hand-built
+     * protocol the analysis trusts). The post pass refuses the one thing such
+     * a protocol cannot make safe without mutual exclusion: two threads both
+     * WRITING the same plain global outside every lock they take. */
+    struct SyncSpawnSite {
+        Symbol *target;
+        struct Node *spawn;   /* BUG-1563: the spawn node, for the parent window */
+        Symbol *encl;         /* the function containing the spawn */
+        bool repeated;        /* spawned in a loop, or its function may run twice */
+        bool downgraded;      /* BUG-1565: the race finding was a warning; false = the
+                               * scan found no plain global access at all */
+        /* BUG-1565: the globals each argument points at (or carries a pointer
+         * to), resolved at the spawn while its scope is live */
+        struct SyncArgBind { int param; Symbol *g; bool direct; } *binds;
+        int nbind;
+        const char *file; const char *source;
+        int line;
+    } *sync_spawns;
+    int sync_spawn_count;
+    int sync_spawn_capacity;
 
     /* A6-full atomic-cell inclusion: plain (non-atomic) writes to scalar globals,
      * recorded during check; post-check flags any whose symbol got marked

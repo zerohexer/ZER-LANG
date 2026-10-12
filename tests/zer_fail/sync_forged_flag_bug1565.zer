@@ -1,0 +1,9 @@
+// BUG-1565 (C4): a third thread also stores the flag, so b's wait no longer
+// proves a wrote g first.
+// expect-error: no common lock and no release/acquire flag
+u32 g;
+u32 flag;
+void a() { g = 1; @atomic_store(&flag, 1); }
+void b() { while (@atomic_load(&flag) == 0) {} u32 x = g; }
+void f() { @atomic_store(&flag, 1); }
+u32 main() { ThreadHandle t1 = spawn a(); ThreadHandle t2 = spawn b(); ThreadHandle t3 = spawn f(); t1.join(); t2.join(); t3.join(); return 0; }

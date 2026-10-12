@@ -1,0 +1,3 @@
+// expect-error: never freed
+container Box(T) { T v; u32 n; }
+u32 main() { *Box(u32) b = alloc(Box(u32)) orelse return; b.v = 1; return 0; }

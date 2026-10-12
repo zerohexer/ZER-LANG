@@ -1,0 +1,6 @@
+// BUG-1564: the write half is a helper storing through a pointer PARAMETER.
+// expect-error: non-atomic read-modify-write on volatile global 'g'
+volatile u32 g;
+void wr(volatile *u32 p, u32 v) { *p = v; }
+void worker() { u32 t = g; wr(&g, t + 1); }
+u32 main() { ThreadHandle th = spawn worker(); th.join(); return 0; }

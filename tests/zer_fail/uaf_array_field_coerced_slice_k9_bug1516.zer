@@ -1,0 +1,15 @@
+// expect-error: use after free
+// BUG-1516 sibling sink of the implicit array->slice view (see uaf_array_field_coerced_slice_bug1516).
+struct T { u32 v; u32[4] arr; }
+Pool(T, 2) pool;
+u32 main() {
+    Handle(T) h = pool.alloc() orelse return;
+    pool.get(h).arr[2] = 7;
+    [*]u32 s = pool.get(h).arr;
+    pool.free(h);
+    Handle(T) h2 = pool.alloc() orelse return;
+    pool.get(h2).arr[2] = 99;
+    u32 r = s[2];
+    pool.free(h2);
+    return r;
+}

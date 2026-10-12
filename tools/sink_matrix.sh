@@ -1515,6 +1515,90 @@ cell p66_safe_pool_get_field    compile "$P66"' u32 main(){ Handle(P66n) nh = no
 cell p66_safe_fieldstore_param  compile "$P66"' V66 mk2([*]u8 b){ V66 v; v.s = b[2..6]; return v; } u32 main(){ u8[8] buf; V66 w = mk2(buf); return (u32)w.s.len - 4; }'
 cell p66_safe_fieldstore_heap   compile "$P66"' u32 main(){ [*]u8 h = alloc(u8, 8) orelse return; V66 x; x.s = h[0..8]; x.s[1] = 3; free(x.s); return 0; }'
 
+# SHAPE p67 (BUG-1516, BUG-1517, BUG-1530): an IMPLICIT array -> slice view (the
+# coercion, no `[..]` written) of a HEAP object's array field, and of a LOCAL's
+# array field, crossed with the sink (var-decl, assign, struct literal, return,
+# pool.get, local-struct field then return / global copy / out-param); the
+# assignment of a PURE view; a callee freeing a global slot through a variable
+# index. BOUNDARY: a view of a GLOBAL array field, an array PARAM view, a view used
+# before the free.
+echo "===== SHAPE p67 = implicit array view x sink, pure-view assign, variable-index global free ====="
+P67='struct T67 { u32 v; u32[4] arr; }
+struct V67 { [*]u32 s; }
+struct A67 { u8[4] buf; }
+struct O67 { [*]u8 view; }
+Pool(T67, 4) pool67;
+O67 go67;
+T67 gt67;
+?*T67[4] gs67;
+u32 gi67 = 1;
+void zap67() { u32 i = gi67; if (i < 4) { if (gs67[i]) |p| { free(p); } gs67[i] = null; } }
+*T67 pick67(*T67 x, *T67 y, u32 c) { if (c == 0) { return x; } return y; }
+[*]u32 view67(*T67 t) { return t.arr; }
+'
+cell p67_heap_vardecl        reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = a.arr; free(a); return s[2]; }'
+cell p67_heap_assign         reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = gt67.arr; s = a.arr; free(a); return s[2]; }'
+cell p67_heap_struct_lit     reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; V67 w = { .s = a.arr }; free(a); return w.s[2]; }'
+cell p67_heap_return_view    reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; [*]u32 s = view67(a); free(a); return s[2]; }'
+cell p67_pool_get_view       reject "$P67"' u32 main(){ Handle(T67) h = pool67.alloc() orelse return; [*]u32 s = pool67.get(h).arr; pool67.free(h); return s[2]; }'
+cell p67_local_field_return  reject "$P67"' O67 mk(){ A67 a; O67 o; o.view = a.buf; return o; } u32 main(){ O67 o = mk(); return (u32)o.view[0]; }'
+cell p67_local_field_global  reject "$P67"' void mk(){ A67 a; O67 o; o.view = a.buf; go67 = o; } u32 main(){ mk(); return 0; }'
+cell p67_local_field_outparam reject "$P67"' void mk(*[*]u8 out){ A67 a; O67 o; o.view = a.buf; *out = o.view; } u32 main(){ [*]u8 s = go67.view; mk(&s); return 0; }'
+cell p67_pure_view_assign    reject "$P67"' u32 main(){ volatile u32 k = 0; *T67 a = alloc(T67) orelse return; *T67 c = alloc(T67) orelse { free(a); return 1; }; *T67 got = pick67(a, c, k); ?*T67 out = null; out = got; free(a); u32 r = 0; if (out) |o| { r = o.v; } free(c); return r; }'
+cell p67_global_var_index_free reject "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; gs67[1] = a; zap67(); return a.v; }'
+cell p67_safe_global_field   compile "$P67"' u32 main(){ [*]u32 s = gt67.arr; s[1] = 2; return s[1] - 2; }'
+cell p67_safe_param_array    compile "$P67"' u32 rd([*]u32 x){ return x[0]; } u32 main(){ u32[4] loc; loc[0] = 3; return rd(loc) - 3; }'
+cell p67_safe_use_before_free compile "$P67"' u32 main(){ *T67 a = alloc(T67) orelse return; a.arr[2] = 7; [*]u32 s = a.arr; u32 r = s[2]; free(a); return r - 7; }'
+
+# SHAPE p68 (BUG-1548): a callee frees the object a POINTER-TO-REFERENCE param
+# points at (`free(*s)`, the `if (*s) |q| { free(q); } *s = null;` release idiom)
+# — crossed with what `&x` names (global, local, struct slot, slice), a wrapper
+# that forwards the param, a conditional free, and a double free. BOUNDARY: the
+# release-and-null idiom leaves x null (no leak, no UAF, re-release fine) and an
+# init out-param (`*s = alloc(T)`) frees nothing.
+echo "===== SHAPE p68 = free through a pointer-to-reference param ====="
+P68='struct T68 { u32 v; }
+struct B68 { ?*T68 p; }
+?*T68 g68;
+void rel68(*?*T68 s) { if (*s) |q| { free(q); } *s = null; }
+void drop68(**T68 s) { free(*s); }
+void wrap68(*?*T68 s) { rel68(s); }
+void maybe68(*?*T68 s, bool c) { if (c) { rel68(s); } }
+void dsl68(*[*]u8 s) { free(*s); }
+void mk68(*?*T68 s) { *s = alloc(T68); }
+'
+cell p68_global          reject "$P68"' u32 main(){ g68 = alloc(T68); *T68 h = g68 orelse return; rel68(&g68); return h.v; }'
+cell p68_local           reject "$P68"' u32 main(){ *T68 a = alloc(T68) orelse return; *T68 h = a; drop68(&a); return h.v; }'
+cell p68_struct_slot     reject "$P68"' u32 main(){ B68 b; b.p = alloc(T68); *T68 h = b.p orelse return; rel68(&b.p); return h.v; }'
+cell p68_slice           reject "$P68"' u32 main(){ [*]u8 b = alloc(u8, 8) orelse return; [*]u8 c = b; dsl68(&b); return (u32)c[0]; }'
+cell p68_wrapper         reject "$P68"' u32 main(){ g68 = alloc(T68); *T68 h = g68 orelse return; wrap68(&g68); return h.v; }'
+cell p68_maybe           reject "$P68"' u32 main(){ ?*T68 a = alloc(T68); *T68 h = a orelse return; maybe68(&a, true); u32 r = h.v; if (a) |p| { free(p); } return r; }'
+cell p68_double_free     reject "$P68"' u32 main(){ *T68 a = alloc(T68) orelse return; drop68(&a); free(a); return 0; }'
+cell p68_safe_release    compile "$P68"' u32 main(){ ?*T68 a = alloc(T68); rel68(&a); rel68(&a); if (a) |p| { return 1; } return 0; }'
+cell p68_safe_init_out   compile "$P68"' u32 main(){ ?*T68 x; mk68(&x); if (x) |p| { p.v = 2; } rel68(&x); return 0; }'
+
+# SHAPE p69 (BUG-1554): a pointer into an INNER block's local stored in a variable
+# of an OUTER block — `&x`, a pointer alias, a struct field, an array view, an
+# if-capture, a loop counter, a switch arm. BOUNDARY: an inner alias aimed at an
+# OUTER local, a pointer used only inside its block, a nested read of an
+# enclosing local.
+echo "===== SHAPE p69 = pointer to an inner block's local held by an outer one ====="
+P69='struct H69 { *u32 p; }
+?u32 mk69() { return 4; }
+'
+cell p69_addr            reject "$P69"' u32 main(){ volatile bool c = true; u32 b = 0; *u32 p = &b; if (c) { u32 x = 5; p = &x; } return *p; }'
+cell p69_alias           reject "$P69"' u32 main(){ u32 b = 1; *u32 p = &b; { u32 x = 7; *u32 q = &x; p = q; } return *p; }'
+cell p69_struct_field    reject "$P69"' u32 main(){ u32 b = 1; H69 h = { .p = &b }; { u32 x = 7; h.p = &x; } return *h.p; }'
+cell p69_array_view      reject "$P69"' u32 main(){ u32[4] o; [*]u32 s = o; { u32[4] t; t[0] = 1; s = t; } return s[0]; }'
+cell p69_capture         reject "$P69"' u32 main(){ u32 b = 0; *u32 p = &b; if (mk69()) |v| { p = &v; } return *p; }'
+cell p69_loop_counter    reject "$P69"' u32 main(){ u32 b = 0; *u32 p = &b; for (u32 i = 0; i < 3; i += 1) { p = &i; } return *p; }'
+cell p69_switch_arm      reject "$P69"' u32 main(){ u32 b = 0; *u32 p = &b; u32 k = 1; switch (k) { 1 => { u32 z = 3; p = &z; } default => { } } return *p; }'
+cell p69_field_read      reject "$P69"' u32 main(){ u32 b = 1; *u32 p = &b; { u32 x = 7; H69 h = { .p = &x }; p = h.p; } return *p; }'
+cell p69_safe_field_out  compile "$P69"' u32 main(){ u32 b = 1; *u32 p = &b; { H69 h = { .p = &b }; p = h.p; } return *p - 1; }'
+cell p69_safe_aim_out    compile "$P69"' u32 main(){ u32 b = 3; *u32 p = &b; { *u32 q = &b; p = q; } return *p - 3; }'
+cell p69_safe_inside     compile "$P69"' u32 main(){ u32 r = 0; { u32 x = 7; *u32 q = &x; r = *q; } return r - 7; }'
+cell p69_safe_nested     compile "$P69"' u32 main(){ u32 r = 0; { u32 x = 1; *u32 p = &x; { u32 y = 2; p = &x; r = *p + y; } } return r - 3; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

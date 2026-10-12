@@ -329,6 +329,7 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_GPTR_COPY_WRITTEN_OUT, RFORM_LOCAL_ALIAS,
                RFORM_PTR_PARAM, RFORM_PTR_PARAM_2HOP, RFORM_GLOBAL_ALIAS,
                RFORM_SPLIT_STMT, RFORM_SPLIT_2HOP,
+               RFORM_SPLIT_COMPOUND, RFORM_SPLIT_FIELD, RFORM_SPLIT_INDEX,
                RFORM_PARAM_SWITCH, RFORM_PARAM_ONCE, RFORM_PARAM_ORELSE,
                RFORM_PARAM_CALL_ARG, RFORM_PARAM_RETURN, RFORM_PARAM_IF_COND,
                RFORM_ALIAS_ARG, RFORM_CARRIER, RFORM_CARRIER_LIT,
@@ -338,6 +339,10 @@ typedef enum { RFORM_NAMED_COMPOUND, RFORM_WRITTEN_OUT, RFORM_GPTR_WRITTEN_OUT,
                RFORM_RETARGET_ARG, RFORM_RETARGET_COPY_ARG, RFORM_RETARGET_COPY_DEREF,
                RFORM_CARRIER_TWO_LIT, RFORM_CARRIER_TWO_ASSIGN,
                RFORM_GLOBAL_CARRIER_LIT,
+               RFORM_SPLIT_CALLS, RFORM_SPLIT_CALLS_INLINE,
+               RFORM_SPLIT_READ_CALL, RFORM_SPLIT_WRITE_CALL,
+               RFORM_SPLIT_CALL_PTR_STORE, RFORM_SPLIT_CALL_FORWARD,
+               RFORM_SPLIT_TWO_GLOBALS, RFORM_SPLIT_CALL_SUM, RFORM_SPLIT_CALL_PARAM_STORE,
                RFORM_COUNT } RForm;
 /* BUG-1043: the RMW grid has THREE sites, not two. The spawn scan and the ISR
  * walker are exhaustive descents of the body that performs the RMW; the MAIN
@@ -370,6 +375,9 @@ static const char *rform_name(RForm f) {
     case RFORM_GLOBAL_ALIAS:    return "global *gp+=1";
     case RFORM_SPLIT_STMT:      return "split t=g;g=t+1";
     case RFORM_SPLIT_2HOP:      return "split 2-hop";
+    case RFORM_SPLIT_COMPOUND:  return "split t+=g;g=t+1";
+    case RFORM_SPLIT_FIELD:     return "split t.v=g;g=t.v+1";
+    case RFORM_SPLIT_INDEX:     return "split t[0]=g;g=t[0]+1";
     case RFORM_PARAM_SWITCH:    return "param in switch";
     case RFORM_PARAM_ONCE:      return "param in @once";
     case RFORM_PARAM_ORELSE:    return "param in orelse{}";
@@ -394,6 +402,15 @@ static const char *rform_name(RForm f) {
     case RFORM_CARRIER_TWO_LIT:     return "carrier {.p=&d,.q=&g}";
     case RFORM_CARRIER_TWO_ASSIGN:  return "carrier h.p=&d;h.q=&g";
     case RFORM_GLOBAL_CARRIER_LIT:  return "global carrier {.p=&g}";
+    case RFORM_SPLIT_CALLS:         return "calls t=rd();wr(t+1)";
+    case RFORM_SPLIT_CALLS_INLINE:  return "calls wr(rd()+1)";
+    case RFORM_SPLIT_READ_CALL:     return "calls t=rd();g=t+1";
+    case RFORM_SPLIT_WRITE_CALL:    return "calls t=g;wr(t+1)";
+    case RFORM_SPLIT_CALL_PTR_STORE: return "calls wr stores *gp";
+    case RFORM_SPLIT_CALL_FORWARD:  return "calls wr forwards v";
+    case RFORM_SPLIT_TWO_GLOBALS:   return "t=d+g;g=t+1";
+    case RFORM_SPLIT_CALL_SUM:      return "calls t=rd() d+g";
+    case RFORM_SPLIT_CALL_PARAM_STORE: return "calls wr(&g,t+1)";
     case RFORM_COUNT: break;
     }
     return "?";
@@ -418,6 +435,11 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
      * pins the taint being TRANSITIVE — a local reading a local that read g. */
     case RFORM_SPLIT_STMT:     *helper = "";                                    *body = "u32 t = g; g = t + 1;"; break;
     case RFORM_SPLIT_2HOP:     *helper = "";                                    *body = "u32 t = g; u32 u = t; g = u + 1;"; break;
+    /* BUG-1526: the taint carried by a COMPOUND op and by a PROJECTION of the
+     * local — each accepted at every site before. */
+    case RFORM_SPLIT_COMPOUND: *helper = "";                                    *body = "u32 t = 0; t += g; g = t + 1;"; break;
+    case RFORM_SPLIT_FIELD:    *helper = "struct TT { u32 v; }";                *body = "TT t; t.v = g; g = t.v + 1;"; break;
+    case RFORM_SPLIT_INDEX:    *helper = "";                                    *body = "u32[1] t; t[0] = g; g = t[0] + 1;"; break;
     /* BUG-1043: the SAME `*p += 1` through a pointer param, in six POSITIONS the
      * main-side summary walk never descended. Each was accepted at the main site
      * (a torn ISR/main update, silent on bare metal) while the plain
@@ -495,6 +517,32 @@ static void rform_parts(RForm f, const char **helper, const char **body) {
     /* BUG-1201: a GLOBAL carrier whose pointer comes from its struct-literal
      * initializer. The write-target walk followed `&x`, a pointer name, a slice and
      * `orelse` as an assigned value, never a struct literal. */
+    /* BUG-1561: the split RMW with a CALL on either half — the read returned
+     * by `rd`, the write done by `wr` storing its parameter. Accepted at every
+     * site before: the taint followed a global's value through locals only. */
+    case RFORM_SPLIT_CALLS:        *helper = "u32 rd(){ return g; }\nvoid wr(u32 v){ g = v; }";
+                                                                                 *body = "u32 t = rd(); wr(t + 1);"; break;
+    case RFORM_SPLIT_CALLS_INLINE: *helper = "u32 rd(){ return g; }\nvoid wr(u32 v){ g = v; }";
+                                                                                 *body = "wr(rd() + 1);"; break;
+    case RFORM_SPLIT_READ_CALL:    *helper = "u32 rd(){ u32 x = g; return x; }";
+                                                                                 *body = "u32 t = rd(); g = t + 1;"; break;
+    case RFORM_SPLIT_WRITE_CALL:   *helper = "void wr(u32 v){ u32 w = v; g = w; }";
+                                                                                 *body = "u32 t = g; wr(t + 1);"; break;
+    /* The write half one more step away: through a global pointer, and through
+     * a helper that only forwards its parameter to the real writer. */
+    case RFORM_SPLIT_CALL_PTR_STORE: *helper = "volatile *u32 gp = &g;\nu32 rd(){ return g; }\nvoid wr(u32 v){ *gp = v; }";
+                                                                                 *body = "u32 t = rd(); wr(t + 1);"; break;
+    case RFORM_SPLIT_CALL_FORWARD: *helper = "void wr2(u32 v){ g = v; }\nvoid wr(u32 v){ wr2(v); }";
+                                                                                 *body = "u32 t = g; wr(t + 1);"; break;
+    /* BUG-1564: the taint held ONE global per local, so a value read from two
+     * globals kept whichever was seen first; and a helper storing through a
+     * pointer PARAMETER was not followed to the global its caller handed it. */
+    case RFORM_SPLIT_TWO_GLOBALS:  *helper = "volatile u32 d;";
+                                                                                 *body = "u32 t = d + g; g = t + 1;"; break;
+    case RFORM_SPLIT_CALL_SUM:     *helper = "volatile u32 d;\nu32 rd(){ return d + g; }";
+                                                                                 *body = "u32 t = rd(); g = t + 1;"; break;
+    case RFORM_SPLIT_CALL_PARAM_STORE: *helper = "void wr(volatile *u32 p, u32 v){ *p = v; }";
+                                                                                 *body = "u32 t = g; wr(&g, t + 1);"; break;
     case RFORM_GLOBAL_CARRIER_LIT:  *helper = "struct GH { volatile *u32 p; }\nGH gh = { .p = &g };";
                                                                                  *body = "*gh.p += 1;"; break;
     case RFORM_COUNT:          *helper = ""; *body = ""; break;
@@ -879,9 +927,9 @@ int main(void) {
      * writes g", which rejects a great deal of correct firmware. */
     fprintf(stderr, "\n--- RMW split-taint boundary (must COMPILE) ---\n");
     {
-        static const char *bnames[4] = { "taint-cleared", "other-global", "not-shared",
-                                         "retarget-plain-store" };
-        static const char *bbodies[4] = {
+        static const char *bnames[5] = { "taint-cleared", "other-global", "not-shared",
+                                         "retarget-plain-store", "calls-other-global" };
+        static const char *bbodies[5] = {
             "volatile u32 g;\ninterrupt TIMER { g = 7; }\n"
             "u32 main(){ u32 t = g; t = 5; g = t; return g & 1; }\n",
             "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
@@ -892,9 +940,14 @@ int main(void) {
              * first draft of the fix rejected exactly this. */
             "volatile u32 g;\nvolatile u32 h;\nvolatile *u32 gp = &g;\n"
             "interrupt TIMER { *gp = 5; }\nvoid aim(){ gp = &h; }\n"
-            "u32 main(){ aim(); u32 t = h; return t & 1; }\n"
+            "u32 main(){ aim(); u32 t = h; return t & 1; }\n",
+            /* BUG-1561 boundary: the call summary must name the RIGHT global —
+             * `rd` reads h, `wr` stores g, so nothing is read-modify-written. */
+            "volatile u32 g;\nvolatile u32 h;\ninterrupt TIMER { g = 7; }\n"
+            "u32 rd(){ return h; }\nvoid wr(u32 v){ g = v; }\n"
+            "u32 main(){ u32 t = rd(); wr(t + 1); return g & 1; }\n"
         };
-        for (int bi = 0; bi < 4; bi++) {
+        for (int bi = 0; bi < 5; bi++) {
             valid_cells++;
             char bnm[192];
             snprintf(bnm, sizeof(bnm), "rmw-boundary/%s", bnames[bi]);

@@ -1,0 +1,4 @@
+// expect-error: cannot compare a 'void' value
+// BUG-1522: `v() == v()` aborted the compiler with an IR validation error.
+void v() { }
+u32 main() { bool r = v() == v(); if (r) { return 1; } return 0; }

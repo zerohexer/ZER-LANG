@@ -1,0 +1,10 @@
+// BUG-1604: a thread that only READS the volatile flag cannot lose the spawner's
+// read-modify-write, so 'vg |= 2' in the window is accepted (was refused).
+volatile u32 vg;
+volatile u32 seen; void worker() { seen = vg; }
+u32 main() {
+    ThreadHandle th = spawn worker();
+    vg |= 2;
+    th.join();
+    return 0;
+}

@@ -335,6 +335,10 @@ typedef struct {
      * rule for its variable-index slots, see ir_slot_view_freed). Cleared
      * when k is written (ir_kill_index_facts). */
     bool has_slot;
+    /* BUG-1603: the view was read at a LITERAL index (`arr[0]`). A free
+     * through it empties that one slot; it is no evidence the program drains
+     * the array, so it must not set `slot_drained`. */
+    bool slot_lit;
     int slot_root;
     const char *slot_arr_path;
     uint32_t slot_arr_plen;
@@ -824,8 +828,10 @@ static void ir_merge_slot_facts(IRHandleInfo *rh, const IRHandleInfo *ph) {
               memcmp(rh->slot_key_path, ph->slot_key_path, rh->slot_key_plen) == 0));
         if (!same_arr) rh->has_slot = false;
         if (!same_key) { rh->slot_key_path = NULL; rh->slot_key_plen = 0; }
+        if (!ph->slot_lit) rh->slot_lit = false;   /* a variable read on some path */
     } else if (!rh->has_slot && ph->has_slot) {
         rh->has_slot = true;
+        rh->slot_lit = ph->slot_lit;
         rh->slot_root = ph->slot_root;
         rh->slot_arr_path = ph->slot_arr_path;
         rh->slot_arr_plen = ph->slot_arr_plen;
@@ -1530,6 +1536,7 @@ typedef struct {
     uint32_t view_root_gkey_len;
     bool view_is_slot;    /* BUG-1074 */
     bool has_slot;        /* BUG-1130: the slot a view was read through */
+    bool slot_lit;        /* BUG-1603 */
     int slot_root;
     const char *slot_arr_path;
     uint32_t slot_arr_plen;
@@ -1564,6 +1571,7 @@ static void ir_snapshot_alias(IRAliasSnapshot *snap, const IRHandleInfo *src) {
     snap->view_root_gkey_len = src->view_root_gkey_len;
     snap->view_is_slot = src->view_is_slot;
     snap->has_slot = src->has_slot;
+    snap->slot_lit = src->slot_lit;
     snap->slot_root = src->slot_root;
     snap->slot_arr_path = src->slot_arr_path;
     snap->slot_arr_plen = src->slot_arr_plen;
@@ -1601,6 +1609,7 @@ static void ir_apply_alias(IRHandleInfo *dst, const IRAliasSnapshot *snap) {
     dst->view_root_gkey_len = snap->view_root_gkey_len;
     dst->view_is_slot = snap->view_is_slot;         /* BUG-1074 */
     dst->has_slot = snap->has_slot;                 /* BUG-1130 */
+    dst->slot_lit = snap->slot_lit;                 /* BUG-1603 */
     dst->slot_root = snap->slot_root;
     dst->slot_arr_path = snap->slot_arr_path;
     dst->slot_arr_plen = snap->slot_arr_plen;
@@ -1891,6 +1900,10 @@ static int ir_alloc_id_of_local(int local_id) {
  * pointer-to-REFERENCE qualifies: a pointer to a struct reaches its fields
  * through the existing ".f" keys. */
 #define IR_PARAM_DEREF_AID_BASE 500000
+/* BUG-1605: the id of a global's entry minted by a re-read in a loop (one per
+ * reading local, the same on every pass). Disjoint from locals' ids, the param
+ * deref slots above and the fresh-id counter (1000000+). */
+#define IR_GLOBAL_READ_AID_BASE 700000
 static const char ir_deref_path[] = "*";
 static bool ir_type_is_ref_leaf(Type *t);
 static bool ir_param_deref_slot(IRFunc *func, int local) {
@@ -6190,6 +6203,7 @@ static void ir_slot_read(ZerCheck *zc, IRFunc *func, IRPathState *ps,
     dh->view_overflow = tmp.view_overflow;
     for (int k = 0; k < tmp.view_count; k++) ir_view_add(dh, tmp.view_alloc_ids[k]);
     dh->has_slot = true;
+    dh->slot_lit = r.kind == IR_SLOT_LIT;
     dh->slot_root = r.root;
     dh->slot_arr_path = r.apath;
     dh->slot_arr_plen = r.aplen;
@@ -6280,7 +6294,11 @@ static void ir_slot_view_freed(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             }
         }
     }
-    if (ir_slot_root_is_local_storage(func, root)) {
+    /* BUG-1603: only a free through a VARIABLE-index read drains (the sibling
+     * rule in the direct free sink tests `r.kind != IR_SLOT_LIT` too). A
+     * literal one used to: `if (arr[0]) |p| { free(p); }` after a fill loop
+     * silenced the leak of every other slot. */
+    if (!hin->slot_lit && ir_slot_root_is_local_storage(func, root)) {
         IRHandleInfo *w = ir_slot_wild_at(zc, ps, root, ap ? ap : "", apl, "", 0, true);
         if (w) w->slot_drained = true;
     }
@@ -15133,7 +15151,11 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
         if (!gh) return;
         gh->state = IR_HS_ALIVE;
         gh->alloc_line = inst->source_line;
-        gh->alloc_id = _ir_next_alloc_id++;
+        /* BUG-1605: re-minted on every pass of a loop whose index write drops
+         * the entry (`gs[i]`, then `i += 1`) — a fresh id per pass never
+         * reaches a fixpoint. The reading local's own id is the same on
+         * every pass. */
+        gh->alloc_id = IR_GLOBAL_READ_AID_BASE + inst->dest_local;
         gh->source_color = ZC_COLOR_UNKNOWN;
     }
     /* BUG-1366: a FREED / MAYBE_FREED entry is read too — the global still
@@ -15146,6 +15168,10 @@ static void ir_mint_global_read_view(ZerCheck *zc, IRFunc *func, IRPathState *ps
         (gh->state != IR_HS_ALIVE && gh->state != IR_HS_FREED &&
          gh->state != IR_HS_MAYBE_FREED)) return;
     IRHandleInfo snap = *gh;
+    /* ir_add_compound_handle above may have reallocated the table: `prev`
+     * is re-found, never kept across it (BUG-1605 made the stale path reach
+     * here with an entry, where the old call-read path also could). */
+    prev = ir_find_handle(ps, inst->dest_local);
     IRHandleInfo *dh = prev ? prev : ir_add_handle(ps, inst->dest_local);
     if (!dh) return;
     if (prev) {                       /* BUG-1311: the result IS the global's value */
@@ -15507,6 +15533,25 @@ static void ir_check_inst(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFunc *f
         ir_mint_global_read_view(zc, func, ps, &shadow);
         ir_kill_index_facts(zc, func, ps, &shadow);
         return;
+    }
+    /* BUG-1605: an instruction that DEFINES a compiler temp makes the temp's
+     * previous value dead — on a loop back edge that value is the previous
+     * iteration's. Its entry was kept and every transfer that only binds a
+     * dest WITHOUT an entry left it in place: `if (gs[i]) |p| { free(p); }`
+     * over a global array read the previous slot's FREED state on the next
+     * pass ("double free 'p'"). Temps are never leak-checked, so dropping
+     * the dead entry loses no report; the other entries of its allocation
+     * group are untouched. */
+    if (inst->op == IR_ASSIGN && inst->dest_local >= 0 &&
+        inst->dest_local < func->local_count && func->locals[inst->dest_local].is_temp &&
+        inst->expr && inst->expr->kind != NODE_ASSIGN) {
+        for (int hi = 0; hi < ps->handle_count; hi++) {
+            IRHandleInfo *th = &ps->handles[hi];
+            if (th->local_id != inst->dest_local || th->path_len != 0) continue;
+            memmove(th, th + 1, (size_t)(ps->handle_count - hi - 1) * sizeof(IRHandleInfo));
+            ps->handle_count--;
+            break;
+        }
     }
     ir_check_inst_core(zc, ps, inst, func);
     ir_apply_passthrough_calls(zc, ps, inst, func, &pcalls);

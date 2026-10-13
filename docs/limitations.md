@@ -34,18 +34,19 @@ repeated.
 
 1. **The `*opaque` C bridge (BUG-1594).** A C extern with an `*opaque` / `?*opaque` in its
    signature is called through a static inline wrapper selected by a function-like macro.
-   Not bridged: a VARIADIC extern with an `*opaque` fixed parameter (the 16-byte struct is
-   still what C receives — refuse or bridge it), and TAKING THE ADDRESS of a bridged
+   (A VARIADIC extern with an `*opaque` is refused since BUG-1601.) Not bridged: TAKING THE
+   ADDRESS of a bridged
    function (`fp = sensor_read`) names the C function, whose `void *` signature differs from
    the ZER function-pointer type — GCC refuses it (loud). With any `cinclude` in the
    program the bridge emits no prototype of its own (the header is the authority); a
    bridged function the header does not declare is then GCC's "implicit declaration"
-   (loud). The non-bridged externs still rely on the hard-coded stdlib skip list in
-   `emit_top_level_decl` to avoid `uint8_t *` vs `char *` prototype conflicts with headers.
-2. **The volatile-flag RMW rule (BUG-1591) records every volatile global a thread TOUCHES**
-   under the single-word exemption, reads included: a thread that only READS the flag still
-   refuses the spawner's `vg |= 2` in the window (over-rejection; the lost-update needs a
-   thread store).
+   (loud). Without a `cinclude`, a non-bridged extern binds to its C symbol under a private
+   name (BUG-1602), so the hard-coded stdlib skip list in `emit_top_level_decl` is now only
+   needed WITH a `cinclude`, where ZER's prototype must still agree with the user's header
+   (a mismatch is GCC's "conflicting types", loud). The bridge's own `void *` prototype is
+   aliased the same way.
+2. ~~The volatile-flag RMW rule refused a spawner's RMW against a thread that only READS the
+   flag~~ — CLOSED 2026-10-13 (BUG-1604: thread STORES are recorded by the sync walk).
 3. **Condition facts (BUG-1566) are taken from EFFECT-FREE conditions only**, and only from
    `ident|field OP constant`. `i < n` with a variable `n` contributes nothing on its own (its
    range is not consulted in a conjunct); `if (n < 8 && i < n)` proves nothing about `i`.
@@ -76,15 +77,13 @@ repeated.
    "must be declared volatile" though main never touches `count` (over-rejection). Needs
    reachability from the non-ISR roots (main, spawn targets, funcptr-taken and exported
    functions) — a relaxation, so it needs the accept-unsafe discipline.
-5. **Over-rejections from the allocation tracker:** the free-every-slot loop over a GLOBAL
-   array (`for (i) { if (gs[i]) |p| { free(p); } gs[i] = null; }`) is refused ("double free
-   'p'"), though the same loop over a slice parameter compiles; freeing a heap linked list
+5. **Over-rejections from the allocation tracker:** (the free-every-slot loop over a GLOBAL
+   array compiles since BUG-1605.) Freeing a heap linked list
    built from `alloc(Node)` + `?*Node next` is refused in the iterative and recursive forms.
    The variable-index global free (BUG-1530) widens a caller's `gs[0]` even when the
    callee's index provably differs.
-6. **Leak false negatives:** after filling an array at a variable index, ONE free at a
-   literal index silences every leak. (An allocation consumed inline, `(alloc(T) orelse
-   return).v = 3;`, is refused since BUG-1597.)
+6. ~~Leak false negatives~~ — CLOSED 2026-10-13: one free at a literal index after a
+   variable-index fill (BUG-1603), and an allocation consumed inline (BUG-1597).
 7. **Block lifetimes (BUG-1554) are compared at ASSIGNMENTS only.** The other two ways a
    pointer to a local leaves its block — a callee storing it (`set(&outer, &x)`) and a
    store through a pointer (`*pp = &x`) — are refused by the stricter FRAME rules

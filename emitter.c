@@ -6649,6 +6649,16 @@ static void emit_ffi_void_ptr(Emitter *e, Type *t) {
  * names a standard header already declares). Taking the function's ADDRESS gets
  * the C function itself, whose type differs from the ZER function-pointer type —
  * GCC refuses that loudly. */
+/* BUG-1602: `_ZER_CSYM(name)` = an asm label naming the C symbol `name`
+ * (with the target's user-label prefix), so a declaration can bind to a C
+ * function under a private C name. Self-contained, `#ifndef`-guarded. */
+static void emit_csym_macro(Emitter *e) {
+    emit(e, "#ifndef _ZER_CSYM\n"
+            "#  ifndef __USER_LABEL_PREFIX__\n#    define __USER_LABEL_PREFIX__\n#  endif\n"
+            "#  define _ZER_CSTR2(x) #x\n#  define _ZER_CSTR(x) _ZER_CSTR2(x)\n"
+            "#  define _ZER_CSYM(n) __asm__(_ZER_CSTR(__USER_LABEL_PREFIX__) #n)\n"
+            "#endif\n");
+}
 static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
     Type *ft = checker_get_type(e->checker, decl);
     Type *ret = ft->func_ptr.ret;
@@ -6656,10 +6666,15 @@ static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
     int nl = (int)decl->func_decl.name_len;
     uint32_t pc = ft->func_ptr.param_count;
     int rk = ffi_opaque_kind(ret);
+    /* BUG-1602: our own prototype binds to the C symbol under a private
+     * name (`_zer_c_NAME`), so it cannot conflict with a preamble header; the
+     * wrapper calls that name. Without our prototype the header's NAME is it. */
+    if (proto) emit_csym_macro(e);
     emit(e, "#ifndef _ZER_XW_%.*s\n#define _ZER_XW_%.*s\n", nl, n, nl, n);
+    const char *cpfx = proto ? "_zer_c_" : "";
     if (proto) {
         if (rk) emit_ffi_void_ptr(e, ret); else emit_func_decl_head(e, ret, false);
-        emit(e, "%.*s(", nl, n);
+        emit(e, "_zer_c_%.*s(", nl, n);
         if (pc == 0) emit(e, "void");
         for (uint32_t i = 0; i < pc; i++) {
             if (i) emit(e, ", ");
@@ -6668,7 +6683,7 @@ static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
         }
         emit(e, ")");
         if (!rk) emit_func_decl_tail(e, ret, false);
-        emit(e, ";\n");
+        emit(e, " _ZER_CSYM(%.*s);\n", nl, n);
     }
     emit(e, "static inline ");
     emit_func_decl_head(e, ret, false);
@@ -6686,7 +6701,7 @@ static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
     bool is_void = !ret || type_dispatch_kind(ret) == TYPE_VOID;
     if (rk) emit(e, "void *_zer_xr = (void *)");
     else if (!is_void) emit(e, "return ");
-    emit(e, "%.*s(", nl, n);
+    emit(e, "%s%.*s(", cpfx, nl, n);
     for (uint32_t i = 0; i < pc; i++) {
         if (i) emit(e, ", ");
         int k = ffi_opaque_kind(ft->func_ptr.params[i]);
@@ -6704,6 +6719,34 @@ static void emit_c_extern_opaque_bridge(Emitter *e, Node *decl, bool proto) {
                 "    return _zer_xo;\n");
     }
     emit(e, "}\n#define %.*s(...) _zer_xw_%.*s(__VA_ARGS__)\n#endif\n\n", nl, n, nl, n);
+}
+
+/* BUG-1602: the C prototype of a C extern, bound to the C symbol under a
+ * PRIVATE C name. A plain prototype `int32_t snprintf(uint8_t*, ...)` conflicts
+ * with the declaration the preamble's own headers (<stdio.h>, <string.h>,
+ * <stdlib.h>) already made — `char *` vs `uint8_t *` is "conflicting types",
+ * a GCC error on the user's .zer line — so only a hand-kept list of names was
+ * safe to declare. `_zer_c_NAME(...) __asm__("NAME")` names the same linker
+ * symbol and can conflict with nothing; `#define NAME _zer_c_NAME` routes every
+ * call site (both emitter paths, and taking the address) to it. Used only
+ * WITHOUT a `cinclude`: a user header is then the authority, and a vendor
+ * header's `static inline` function has no symbol to bind to. Self-contained
+ * (`--lib` emits no preamble), `#ifndef`-guarded (two modules may declare it). */
+static void emit_c_extern_alias_decl(Emitter *e, Node *decl) {
+    const char *n = decl->func_decl.name;
+    int nl = (int)decl->func_decl.name_len;
+    Type *func_type = checker_get_type(e->checker, decl);
+    Type *ret = (func_type && func_type->kind == TYPE_FUNC_PTR) ?
+        func_type->func_ptr.ret : NULL;
+    emit_csym_macro(e);
+    emit(e, "#ifndef _ZER_XC_%.*s\n#define _ZER_XC_%.*s\n#undef %.*s\n",
+         nl, n, nl, n, nl, n);
+    emit_func_decl_head(e, ret, false);
+    emit(e, "_zer_c_%.*s", nl, n);
+    emit_func_decl_params(e, decl, func_type);
+    emit_func_decl_tail(e, ret, false);
+    emit(e, " _ZER_CSYM(%.*s);\n#define %.*s _zer_c_%.*s\n#endif\n\n",
+         nl, n, nl, n, nl, n);
 }
 
 static void emit_func_decl(Emitter *e, Node *node) {
@@ -7744,6 +7787,7 @@ static void emit_top_level_decl(Emitter *e, Node *decl, Node *file_node, int dec
                  * the bridge's `void *` prototype is the declaration. */
                 if (bridged) emit_c_extern_opaque_bridge(e, decl,
                                                          !is_cstdlib && !e->saw_cinclude);
+                else if (!is_cstdlib && !e->saw_cinclude) emit_c_extern_alias_decl(e, decl);
                 else if (!is_cstdlib) emit_func_decl(e, decl);
             }
             break;

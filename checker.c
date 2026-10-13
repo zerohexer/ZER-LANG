@@ -756,6 +756,43 @@ static bool is_null_sentinel_ck(Type *inner) {
     return k == TYPE_POINTER || k == TYPE_FUNC_PTR;
 }
 
+/* BUG-1600: may a value of this type cross a C `...`? Only a C SCALAR has a
+ * defined representation there: an integer (incl. uN/iN, bool, enum, Handle),
+ * a float, a C pointer, a function pointer, or a null-sentinel optional of
+ * those. A slice, struct, union, array, value-optional and `*opaque` (which is
+ * the struct `_zer_opaque`) were passed BY VALUE as a C aggregate — `printf("%s",
+ * s)` handed printf a 16-byte {ptr,len}, which happens to land the pointer in
+ * the right register on x86-64 and is garbage on other ABIs. Exhaustive (no
+ * default:) so a new kind must be classified. */
+static bool variadic_arg_is_c_scalar(Type *t) {
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return false;
+    switch (type_dispatch_kind(u)) {
+    case TYPE_BOOL:
+    case TYPE_U8: case TYPE_U16: case TYPE_U32: case TYPE_U64: case TYPE_USIZE:
+    case TYPE_I8: case TYPE_I16: case TYPE_I32: case TYPE_I64:
+    case TYPE_F32: case TYPE_F64:
+    case TYPE_UINT: case TYPE_SINT:
+    case TYPE_ENUM:
+    case TYPE_HANDLE:      /* a u64 */
+    case TYPE_FUNC_PTR:
+        return true;
+    case TYPE_POINTER:     /* `*opaque` is a struct in C */
+        return !(u->pointer.inner &&
+                 type_dispatch_kind(u->pointer.inner) == TYPE_OPAQUE);
+    case TYPE_OPTIONAL:    /* only the null-sentinel form is a C pointer */
+        return is_null_sentinel_ck(u->optional.inner);
+    case TYPE_VOID:
+    case TYPE_SLICE: case TYPE_ARRAY: case TYPE_STRUCT: case TYPE_UNION:
+    case TYPE_OPAQUE:
+    case TYPE_POOL: case TYPE_RING: case TYPE_ARENA: case TYPE_BARRIER:
+    case TYPE_SLAB: case TYPE_SEMAPHORE:
+    case TYPE_DISTINCT:    /* unwrapped above; unreachable */
+        return false;
+    }
+    return false;
+}
+
 
 /* Does this type CARRY a pointer/slice/opaque whose pointee is NOT a shared
  * struct? That is the exact hazard the bare fire-and-forget spawn rule tests
@@ -18130,6 +18167,44 @@ static Type *check_expr_impl(Checker *c, Node *node) {
                                     : "expected %u arguments, got %d",
                     fixed_params, node->call.arg_count);
             } else {
+                /* BUG-1600: a variadic argument has no parameter type to be
+                 * converted to, so it must already be a C scalar. */
+                for (int vi = (int)fixed_params; callee_variadic &&
+                     vi < node->call.arg_count; vi++) {
+                    Type *vt = arg_types[vi];
+                    if (!vt || variadic_arg_is_c_scalar(vt)) continue;
+                    /* A string LITERAL is NUL-terminated, so the C reading of
+                     * it is its pointer: rewrite it to `"…".ptr` in the AST
+                     * (one spelling for every emitter path). It used to cross
+                     * as the {ptr,len} struct, and `printf("%s %d", "ok", 5)`
+                     * printed "ok 2" — `%d` consumed the hidden length. */
+                    if (node->call.args[vi]->kind == NODE_STRING_LIT) {
+                        Node *lit = node->call.args[vi];
+                        Node *f = (Node *)arena_alloc(c->arena, sizeof(Node));
+                        if (f) {
+                            memset(f, 0, sizeof(*f));
+                            f->kind = NODE_FIELD;
+                            f->loc = lit->loc;
+                            f->field.object = lit;
+                            f->field.field_name = "ptr";
+                            f->field.field_name_len = 3;
+                            node->call.args[vi] = f;
+                            arg_types[vi] = check_expr(c, f);
+                            continue;
+                        }
+                    }
+                    TypeKind vk = type_dispatch_kind(vt);
+                    const char *hint =
+                        vk == TYPE_SLICE ? " — pass '.ptr' (and '.len' if the callee needs it)" :
+                        vk == TYPE_POINTER ?
+                            " — '*opaque' is not a C pointer here; pass a typed '*T' or '@ptrtoint(p)'" :
+                        vk == TYPE_OPTIONAL ? " — unwrap it first ('orelse' or 'if (x) |v|')" :
+                        " — pass its scalar fields individually";
+                    checker_error(c, node->loc.line,
+                        "argument %d to variadic '...': type '%s' has no C scalar "
+                        "representation and would be passed as a C aggregate%s",
+                        vi + 1, type_name(vt), hint);
+                }
                 /* verify each arg type */
                 for (uint32_t i = 0; i < effective_callee->func_ptr.param_count; i++) {
                     Type *param = effective_callee->func_ptr.params[i];
@@ -24877,10 +24952,8 @@ static bool spawn_global_needs_sync(Checker *c, Symbol *sym) {
      * synchronization. That part is a judgment call and stays as-is;
      * a tearable multi-word store is not. */
     if (sym->is_volatile &&
-        volatile_global_exempt_from_race_check(c, sym)) {
-        record_thread_volatile(c, sym);   /* BUG-1591 */
-        return false;
-    }
+        volatile_global_exempt_from_race_check(c, sym))
+        return false;   /* a thread STORE of it is recorded by sync_record (BUG-1604) */
     /* volatile but wider than a word (or an aggregate) — falls through
      * and is flagged: the store lowers to several stores and tears. */
     /* threadlocal: check the AST node for is_threadlocal flag */
@@ -25176,6 +25249,14 @@ static void sync_value_globals(SyncWalk *w, Node *v, SyncGl *out, int depth) {
 static void sync_walk(SyncWalk *w, Node *n, SyncCtx ctx, int depth);
 static void sync_record(SyncWalk *w, Symbol *g, bool write, SyncCtx ctx) {
     if (w->phase != SW_THREAD && w->phase != SW_IN) return;
+    /* BUG-1604: a single-word volatile flag a THREAD STORES — the half of the
+     * BUG-1591 lost-update the spawner's RMW races with. Recorded here, where
+     * the access kind is known; a thread that only READS the flag cannot lose
+     * the spawner's update (it used to be recorded by the exemption itself,
+     * so `vg |= 2` was refused against a reader). */
+    if (w->phase == SW_THREAD && write && g && g->is_volatile && !g->is_function &&
+        g->type && volatile_global_exempt_from_race_check(w->c, g))
+        record_thread_volatile(w->c, g);
     if (!g || g->is_atomic_cell || !spawn_global_needs_sync(w->c, g)) return;
     SyncAcc a = { g, write, ctx.lock, ctx.acq, ctx.pub };
     sync_acc_add(w->out, a);
@@ -33081,6 +33162,28 @@ static void register_decl(Checker *c, Node *node) {
         }
         Type *func_type = type_func_ptr(c->arena, params, pc, ret);
         func_type->func_ptr.is_variadic = node->func_decl.is_variadic;
+        /* BUG-1601: a variadic declaration is a C function (only bodyless externs
+         * may be variadic), and the `*opaque` bridge (BUG-1594) cannot wrap a
+         * variadic call — so an `*opaque` in its signature reached C as the
+         * 16-byte `_zer_opaque` struct where C expects `void *`. Refuse it. */
+        if (node->func_decl.is_variadic) {
+            for (uint32_t i = 0; i <= pc; i++) {
+                Type *t = i < pc ? params[i] : ret;
+                Type *u = type_unwrap_distinct(t);
+                if (u && type_dispatch_kind(u) == TYPE_OPTIONAL)
+                    u = type_unwrap_distinct(u->optional.inner);
+                if (u && type_dispatch_kind(u) == TYPE_POINTER && u->pointer.inner &&
+                    type_dispatch_kind(u->pointer.inner) == TYPE_OPAQUE) {
+                    checker_error(c, node->loc.line,
+                        "variadic extern '%.*s': %s is '*opaque', which C receives as "
+                        "a 16-byte struct, not 'void *' — a variadic C function cannot "
+                        "be bridged; declare that position as a typed '*T' instead",
+                        (int)node->func_decl.name_len, node->func_decl.name,
+                        i < pc ? "a parameter" : "the return type");
+                    break;
+                }
+            }
+        }
         /* BUG-1384: the comptime interpreter computes in 64 bits. A comptime
          * function taking or returning a u65..u128 / i65..i128 folded to a
          * different value than the same function run at run time
@@ -41819,6 +41922,73 @@ static void unprefix_c_externs(Checker *c) {
     for (int i = 0; i < c->module_own_count; i++) unprefix_c_extern_sym(c->module_own[i].sym);
 }
 
+/* BUG-1606: a position in a C function's signature that C cannot spell. A
+ * slice is ZER's `{ptr, len}` struct and a value-optional its `{value,
+ * has_value}` struct — no C declaration of the function can name either, so
+ * the call passes a struct C reads as something else. A plain prototype used
+ * to collide with the libc header ("conflicting types", loud); since BUG-1602
+ * binds the declaration to the C symbol under a private name, it would have
+ * linked and passed the struct in silence (`i32 strcmp(const [*]u8 a, ...)`).
+ * `?*opaque` is bridged (BUG-1594), `?*T` / `?funcptr` are C pointers, and a
+ * struct by value is legitimate C (the C side declares the same struct). */
+static const char *c_extern_unspellable(Type *t) {
+    Type *u = type_unwrap_distinct(t);
+    if (!u) return NULL;
+    if (type_dispatch_kind(u) == TYPE_SLICE)
+        return "a slice is a {ptr, len} struct C cannot spell — pass 'const *T' ('s.ptr') and the length separately";
+    if (type_dispatch_kind(u) == TYPE_OPTIONAL) {
+        Type *in = type_unwrap_distinct(u->optional.inner);
+        if (!in || type_dispatch_kind(in) == TYPE_VOID) return NULL;   /* ?void return: has_value only */
+        if (type_dispatch_kind(in) == TYPE_FUNC_PTR) return NULL;
+        if (type_dispatch_kind(in) == TYPE_POINTER) return NULL;     /* ?*T, and ?*opaque (bridged) */
+        return "a value-optional is a {value, has_value} struct C cannot spell — pass the value and a separate flag";
+    }
+    return NULL;
+}
+static void check_c_extern_signatures(Checker *c, const CheckerFile *files, int count) {
+    const char *sv_fn = c->file_name, *sv_src = c->source;
+    for (int fi = 0; fi < count; fi++) {
+        Node *fn = files[fi].ast;
+        if (!fn || fn->kind != NODE_FILE) continue;
+        c->file_name = files[fi].file_name ? files[fi].file_name : sv_fn;
+        c->source = files[fi].source;
+        for (int i = 0; i < fn->file.decl_count; i++) {
+            Node *d = fn->file.decls[i];
+            if (d->kind != NODE_FUNC_DECL || d->func_decl.body ||
+                d->func_decl.is_async || d->func_decl.is_comptime) continue;
+            /* a C function = no module DEFINES it: the symbol still points at a
+             * bodyless declaration (a definition replaces func_node). */
+            Symbol *sym = NULL;
+            Scope *g = c->global_scope;
+            for (uint32_t k = 0; g && k < g->symbol_count && !sym; k++) {
+                Symbol *s = g->symbols[k];
+                if (s && s->is_function && s->func_node &&
+                    s->name_len == (uint32_t)d->func_decl.name_len &&
+                    memcmp(s->name, d->func_decl.name, s->name_len) == 0) sym = s;
+            }
+            if (!sym || !sym->func_node || sym->func_node->kind != NODE_FUNC_DECL ||
+                sym->func_node->func_decl.body) continue;
+            Type *ft = typemap_get(c, d);
+            if (!ft || type_dispatch_kind(ft) != TYPE_FUNC_PTR) continue;
+            for (uint32_t pi = 0; pi <= ft->func_ptr.param_count; pi++) {
+                bool is_ret = pi == ft->func_ptr.param_count;
+                const char *why = c_extern_unspellable(is_ret ? ft->func_ptr.ret
+                                                              : ft->func_ptr.params[pi]);
+                if (!why) continue;
+                if (is_ret)
+                    checker_error(c, d->loc.line,
+                        "C function '%.*s' (declared without a body): its return type — %s",
+                        (int)d->func_decl.name_len, d->func_decl.name, why);
+                else
+                    checker_error(c, d->loc.line,
+                        "C function '%.*s' (declared without a body): parameter %u — %s",
+                        (int)d->func_decl.name_len, d->func_decl.name, pi + 1, why);
+            }
+        }
+    }
+    c->file_name = sv_fn; c->source = sv_src;
+}
+
 void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) {
     if (!files || count <= 0) return;
     /* The main module's context is what the caller left in the checker; every
@@ -41858,6 +42028,7 @@ void checker_post_passes_files(Checker *c, const CheckerFile *files, int count) 
     check_async_frame_cycles(c);  /* BUG-1559 */
     check_sync_spawn_writers(c, files, count);  /* BUG-1562/1563 */
     check_parent_volatile_rmw(c);               /* BUG-1591 */
+    check_c_extern_signatures(c, files, count); /* BUG-1606 */
     unprefix_c_externs(c);                      /* BUG-1593 */
 
     /* Stack depth analysis — detect recursion; --stack-limit over the WHOLE

@@ -1,0 +1,4 @@
+// expect-error: a value-optional is a {value, has_value} struct C cannot spell
+// BUG-1606: no C declaration can return ZER's optional struct.
+?u32 c_lookup(u32 key);
+u32 main() { return 0; }

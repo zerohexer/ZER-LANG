@@ -1,0 +1,5 @@
+// expect-error: a variadic C function cannot be bridged
+// BUG-1601: the *opaque bridge cannot wrap a variadic call, so C would receive
+// the 16-byte _zer_opaque struct where it expects void *.
+i32 vlog(*opaque ctx, const *u8 fmt, ...);
+u32 main() { return 0; }

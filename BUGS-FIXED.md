@@ -141,6 +141,71 @@ every new negative is ACCEPTED by it.
   address — it is now a content return (leak suppressed, still registered for UAF).
   Test: `tests/zer/mmio_accessor_qualified_return.zer` (fails to parse on the base compiler).
 
+**The C variadic boundary (2026-10-13)**
+- **BUG-1600 — a non-scalar value in a variadic tail crossed as a C struct.** `printf("%s %d",
+  "ok", 5)` printed `ok 2`: the string literal is a `{ptr,len}` slice, C received both words,
+  and `%d` consumed the hidden length — the documented printf example itself. A slice, struct,
+  union, array, value-optional or `*opaque` (`_zer_opaque` is a struct) in a variadic tail is
+  now refused at the call (`variadic_arg_is_c_scalar`, exhaustive); a STRING LITERAL is
+  rewritten in the AST to `"…".ptr`, its NUL-terminated pointer, so every emitter path sees one
+  spelling. Corpus cost: zero (the one doc test now prints the right value). Tests:
+  `tests/zer/variadic_string_literal_is_cstring.zer`, `tests/zer_fail/variadic_arg_*.zer`.
+- **BUG-1601 — a variadic extern with an `*opaque` parameter** passed the 16-byte struct where C
+  expects `void *` (the BUG-1594 bridge cannot wrap a variadic call). Refused at the
+  declaration. Test: `tests/zer_fail/variadic_extern_opaque_param.zer`.
+- **BUG-1602 — declaring a libc function the preamble's headers already declare** (`strcmp`,
+  `atoi`, `snprintf`, …) was a GCC "conflicting types" error unless the name was on a
+  hand-kept skip list: ZER's prototype spells `uint8_t *` where the header says `char *`.
+  Without a `cinclude`, a C extern's prototype is now `_zer_c_NAME(...) __asm__("NAME")` plus
+  `#define NAME _zer_c_NAME` (`emit_c_extern_alias_decl`) — the same linker symbol under a
+  private C name, which cannot conflict. With a `cinclude` the header stays the authority (a
+  vendor `static inline` has no symbol to bind to). The `*opaque` bridge's own `void *`
+  prototype is bound the same way (a bridged `memcmp` conflicted with `<string.h>`). Tests:
+  `tests/zer/c_extern_libc_alias.zer`, `tests/zer/c_extern_opaque_bridge_libc.zer`.
+- **BUG-1606 — a C function declared with a slice or value-optional in its signature.**
+  `i32 strcmp(const [*]u8 a, const [*]u8 b);` passes ZER's `{ptr,len}` struct where C reads a
+  `char *`. It used to be caught only by accident (the plain prototype collided with
+  `<string.h>`, loud); once BUG-1602 bound the declaration to the C symbol it would have
+  linked and run on garbage — measured on the BUG-1602 build before this fix landed. A post
+  pass (`check_c_extern_signatures`, after every module is checked so a forward declaration
+  completed by a definition is not a C function) refuses a slice and a value-optional in a C
+  function's parameters and return; `?*T`, `?*opaque` (bridged), function pointers and structs
+  by value stay legal. Corpus cost zero. Tests: `tests/zer_fail/c_extern_slice_param.zer`,
+  `tests/zer_fail/c_extern_value_optional_return.zer`.
+
+**The allocation tracker**
+- **BUG-1603 — one free at a LITERAL index silenced every leak of an array filled at a variable
+  index.** `for (i) { arr[i] = alloc(N); }  if (arr[0]) |p| { free(p); }` compiled clean, leaking
+  three objects: a free through ANY slot view marked the array DRAINED (the exemption meant for a
+  free-every-slot loop), while the sibling rule in the direct free sink already required a
+  non-literal index. The view now records `slot_lit` (kept through snapshots and joins as "every
+  path literal"), and `ir_slot_view_freed` drains only for a variable-index read. Tests:
+  `tests/zer_fail/leak_fill_loop_one_literal_free.zer`, `tests/zer/slot_drain_loop_and_literal_ok.zer`.
+
+- **BUG-1605 — the free-every-slot loop over a GLOBAL array was refused** ("double free 'p'",
+  "use of freed value an unnamed temporary") while the same loop over a slice parameter compiled.
+  The compiler temp holding the `gs[i]` read kept its entry from the PREVIOUS iteration across
+  the back edge: the global-read mint (`ir_mint_global_read_view`) binds only a destination
+  with no entry, so it never replaced it, and `p` copied the freed state. An instruction that
+  defines a TEMP now drops the temp's dead entry first (temps are never leak-checked); the
+  mint's id is `IR_GLOBAL_READ_AID_BASE + dest` rather than a fresh id, because the index write
+  (`i += 1`) drops the `gs[i]` entry every pass and a fresh id per pass never reached a fixpoint
+  (measured: "did not converge within 96 iterations" on the refused shapes). Same-iteration
+  re-reads, a post-loop read of a drained slot and a double free in the body are still refused.
+  Tests: `tests/zer/global_array_drain_loop_ok.zer`,
+  `tests/zer_fail/global_array_drain_loop_uaf_same_iter.zer`.
+
+**Concurrency**
+- **BUG-1604 — the volatile-flag RMW rule (BUG-1591) was refused against a thread that only
+  READ the flag.** The flag was recorded by the single-word volatile EXEMPTION inside
+  `spawn_global_needs_sync`, which has no access kind, so a reader counted as a storer. The
+  record moved to `sync_record` (the BUG-1562 sync walk, which visits every spawn target
+  through callees, function pointers and bound parameters and knows read vs write), phase
+  THREAD, writes only. Measured against the previous build: the callee, funcptr,
+  fire-and-forget and scoped store forms all still refused; the reader forms accepted. Tests:
+  `tests/zer/spawn_parent_volatile_rmw_reader_ok.zer`,
+  `tests/zer_fail/spawn_parent_volatile_rmw_funcptr_store.zer`.
+
 **The library and the C boundary**
 - **lib/ did not build** (limitations.md OPEN since 2026-09-25): `fmt.zer` now imports `str`,
   `io.zer` declares `fputc` and keeps its NUL-terminated copies in static buffers (a stack buffer

@@ -162,6 +162,53 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## The C variadic boundary and C-extern prototypes (BUG-1600..1602, 2026-10-13)
+
+**A variadic argument is converted to NOTHING — it crosses with its emitted C representation.**
+The fixed parameters of a C call get the usual coercions (slice -> `.ptr` for a `*T` param, the
+`*opaque` bridge), but the `...` tail has no parameter type, so whatever the emitter spells is
+what C receives. For a ZER aggregate that is a struct: `printf("%s %d", "ok", 5)` printed
+`ok 2` (the slice's `len` landed in `%d`'s slot) — and that was the DOCUMENTED example, passing
+its own test, because the test only checked the exit code. `variadic_arg_is_c_scalar` (checker,
+exhaustive) refuses every non-scalar; a STRING LITERAL is rewritten in the AST to `"…".ptr`
+(one spelling for all three call emitters — the same make-it-explicit-in-the-AST device as
+BUG-1516's array views). When a test exercises output, assert the OUTPUT (or an `snprintf`
+buffer), not the exit code.
+
+**Binding a C extern to its symbol under a private C name (BUG-1602).** A ZER declaration of a
+libc function is emitted as `T _zer_c_NAME(params) __asm__(USER_LABEL_PREFIX "NAME");` then
+`#undef NAME` / `#define NAME _zer_c_NAME`. Same linker symbol, different C identifier — so it
+can never be "conflicting types" with `<stdio.h>`/`<string.h>`/`<stdlib.h>`, which spell `char *`
+where ZER spells `uint8_t *`. Works with `--wrap=malloc` (the reference is still to `malloc`)
+and with GCC builtins/fortify (the alias bypasses the fortify wrapper; it calls the real
+function). NOT used with a `cinclude`: a user/vendor header may define the function as `static
+inline` (CMSIS `NVIC_EnableIRQ`), which has no symbol to bind to — a link error where today the
+header's definition is used. The hand-kept `is_cstdlib` skip list therefore still matters, but
+only in the `cinclude` case.
+
+**Removing an accidental refusal can turn a hole silent — re-probe what the old error was
+covering (BUG-1606).** The plain prototype's "conflicting types" error had been the ONLY thing
+refusing `i32 strcmp(const [*]u8 a, ...)` — a slice passed where C reads `char *`. BUG-1602
+removed the conflict, and the shape would have linked and run on garbage. Whenever a fix makes
+a previously loud failure compile, list what that failure was rejecting and check each shape
+is still refused for the RIGHT reason (`check_c_extern_signatures` now does, by intent).
+
+## The allocation tracker: a temp's dead entry, and ids that must be the same on every pass (BUG-1605)
+
+**A compiler temp redefined in a loop keeps its LAST iteration's entry unless something
+rebinds it.** Most transfers bind a destination only when it has no entry (`if (prev) return;`
+in the global-read mint), so on the back edge the temp still held the previous slot's FREED
+state and `if (gs[i]) |p| { free(p); }` over a global array was a "double free". Fix: an
+instruction that defines a TEMP drops the temp's entry first (temps are never leak-checked).
+Do NOT detect "stale" by comparing the entry before/after the transfer — that makes the
+transfer depend on the destination's own incoming state, and the fixpoint oscillated.
+
+**An id minted inside a loop must be the same on every pass.** A per-pass `_ir_next_alloc_id++`
+for an entry the loop's index write deletes (`gs[i]`, then `i += 1`) never converges ("did not
+converge within 96 iterations", which is itself a refusal). Mint from a stable source — the
+reading local (`IR_GLOBAL_READ_AID_BASE + dest`), the allocation's local (`local + 1`) —
+never from the counter, for anything re-created per iteration.
+
 ## The 2026-10-12 audit (BUG-1566..1596) — what took a loop to find
 
 **"Is this a global?" is an IDENTITY question, never a NAME question (BUG-1568).** ~48 checker

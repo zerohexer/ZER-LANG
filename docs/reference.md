@@ -5185,6 +5185,12 @@ No `cinclude` is required for `printf` — the declaration alone is enough, beca
 emitted C is compiled by GCC which already has it. Use `cinclude "<stdio.h>";` when you
 want the header's other declarations too.
 
+Any C library function can be declared this way, including ones whose standard header
+spells the types differently (`i32 strcmp(const *u8 a, const *u8 b);` against C's
+`const char *`). Without a `cinclude`, ZER binds its declaration to the C symbol under a
+private C name, so it never conflicts with a header the runtime includes. With a
+`cinclude`, the header is the authority and your declaration must agree with it.
+
 String literals are `[*]u8` and auto-coerce to `const *u8` at an extern call site, so
 `"hello"` can be passed directly. Passing a literal to a NON-const `*u8` parameter is
 rejected — that would allow a write into `.rodata`.
@@ -5205,6 +5211,27 @@ void g(const *u8 s, ...) { }   // ERROR: variadic '...' is only allowed on bodyl
   void f(...);                   // ERROR: '...' requires at least one named parameter before it
   ```
 - A call must supply at least the fixed parameters; the variadic tail may be empty.
+- A variadic argument has no parameter type to be converted to, so it must already be
+  a **C scalar**: an integer (any width, `bool`, an enum, a `Handle`), a float, a typed
+  pointer `*T`, a null-sentinel `?*T`, or a function pointer. A **string literal** is
+  passed as its NUL-terminated pointer (`"ok"` crosses as `"ok".ptr`). Everything else is
+  refused, because C would receive it as a struct — before this rule
+  `printf("%s %d", "ok", 5)` printed `ok 2`: `%d` read the literal's hidden length.
+  <!-- audit: expect-error: has no C scalar representation -->
+  ```zer
+  i32 printf(const *u8 fmt, ...);
+  u32 main() {
+      const [*]u8 s = "hi";
+      printf("%.*s\n", (i32)s.len, s.ptr);  // OK — a slice crosses as its fields
+      printf("%s\n", s);                    // ERROR: type 'const [*]u8' has no C scalar
+      return 0;                             //        representation — pass '.ptr'
+  }
+  ```
+  A slice variable is not known to be NUL-terminated, so pass `.ptr` with a length
+  (`%.*s`); a struct or a value-optional passes its fields / its unwrapped value; an
+  `*opaque` (which C sees as a 16-byte tagged value) passes `@ptrtoint(p)` or a typed `*T`.
+- A variadic declaration cannot have an `*opaque` parameter or return: the `void *`
+  bridge below cannot wrap a variadic call.
 - Arguments in the variadic tail are **not type-checked against the format string.** This is
   C's contract, not ZER's — a `%d` paired with a `f64` is undefined behaviour exactly as it
   is in C. Everything else about the call (the pointer's validity, the slice's bounds, the
@@ -5304,7 +5331,9 @@ provenance (type_id 0), which `@ptrcast` accepts. Two rules follow: a C function
 `*opaque` parameter cannot be variadic, and its ADDRESS cannot be taken into a ZER function
 pointer (the C function's signature uses `void *`) — wrap it in a ZER function instead.
 A slice parameter (`[*]u8`) is a `{ptr, len}` struct C cannot spell: declare a C function's
-string parameter as `const *u8` (a string literal or `s.ptr` passes to it).
+string parameter as `const *u8` (a string literal or `s.ptr` passes to it). A slice or a
+value-optional (`?u32`) anywhere in a C function's signature is a compile error; `?*T` is a
+C pointer and is fine.
 
 **What ZER cannot protect:** C library internal bugs. If the C library itself has data races or UAF in its own code, ZER can't fix that — same boundary as Rust's `unsafe extern`.
 

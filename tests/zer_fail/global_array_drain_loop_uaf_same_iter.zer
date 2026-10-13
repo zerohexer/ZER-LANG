@@ -1,0 +1,8 @@
+// expect-error: use after free
+// BUG-1605 boundary: inside one iteration, a second read of the slot just freed is
+// still a use after free.
+struct N { u32 v; }
+?*N[4] gs;
+void fill() { for (u32 i = 0; i < 4; i += 1) { gs[i] = alloc(N); } }
+void drain() { for (u32 i = 0; i < 4; i += 1) { if (gs[i]) |p| { free(p); } if (gs[i]) |q| { q.v = 2; } gs[i] = null; } }
+u32 main() { fill(); drain(); return 0; }

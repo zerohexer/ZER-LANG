@@ -1,0 +1,8 @@
+// expect-error: pass its scalar fields individually
+i32 printf(const *u8 fmt, ...);
+struct P { u32 x; u32 y; }
+u32 main() {
+    P p = { .x = 1, .y = 2 };
+    printf("%d\n", p);
+    return 0;
+}

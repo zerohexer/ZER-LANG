@@ -195,6 +195,32 @@ every new negative is ACCEPTED by it.
   Tests: `tests/zer/global_array_drain_loop_ok.zer`,
   `tests/zer_fail/global_array_drain_loop_uaf_same_iter.zer`.
 
+**VRP / interrupts (2026-10-15)**
+- **BUG-1607 — a comparison with a VARIABLE bound narrowed nothing.** `if (n < 8 && i < n)
+  { a[i] }` on a `u32[8]` got an auto-guard (a silent early return) and a warning to add the
+  test already written; only `x OP constant` was read. `vrp_push_cond_facts` now reads the
+  other variable's CURRENT range (`x < y` true => `x <= max(y) - 1`, both directions), and a
+  conjunction is walked left, right, left so the order of `n < 8` and `i < n` does not matter.
+  Sound because the fact compares x with y's value AT THE TEST, which lay in y's range; the
+  condition is effect-free (BUG-1566). A signed index keeps no lower bound; an off-by-one bound
+  (`n <= 9`) still guards; `n > 8 && i > n` is the "always out of bounds" error a constant gives.
+  Gate: 4 cells in `tests/test_vrp_position_matrix.c` (the two PROVEN cells fail on the
+  previous build).
+- **BUG-1608 — a helper reached only from an interrupt handler counted as MAIN code.**
+  `void bump() { count = 5; } interrupt T { bump(); }` was "accessed from both interrupt and
+  main code — must be declared volatile" (and the MMIO register-sharing rule, BUG-1480, the
+  same for a register RMW in such a helper): regular-code accesses were recorded by whichever
+  body was being checked. Each access now remembers its body (`IsrGlobal.facc`; the MMIO record
+  already had it), and the post pass drops the bodies that are ISR-ONLY: not `main`, referenced
+  only as a DIRECT call, at least once, every caller an interrupt body or another ISR-only
+  function (greatest fixpoint), and C cannot call it (`static`, or the program has a ZER
+  `main`). One exhaustive reference walk over every module (`isrref_walk`, no `default:`; a
+  function-pointer value, spawn target, global initializer or call from regular code all
+  disqualify; a cap reached disqualifies everything). Two handlers sharing it through the
+  helper, main calling it, its address taken, a global initializer naming it, a `--lib` build
+  without `main`: all still refused. Gate: 7 cells in `tests/test_hw_matrix.c` (the three
+  positive cells fail on the previous build).
+
 **Concurrency**
 - **BUG-1604 — the volatile-flag RMW rule (BUG-1591) was refused against a thread that only
   READ the flag.** The flag was recorded by the single-word volatile EXEMPTION inside

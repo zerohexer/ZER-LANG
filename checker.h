@@ -479,6 +479,16 @@ typedef struct {
          * `volatile static local` idiom to point at; the fix is to pass the value). */
         bool is_static_local;
         int  decl_line;
+        /* BUG-1608: the regular-code accesses, per FUNCTION BODY that made them
+         * (NULL = outside any body). A body only an interrupt handler can reach
+         * is not main code: its accesses are dropped from the from_func /
+         * compound / uncritical / opaque facts by check_interrupt_safety (the
+         * ISR walk already recorded them on the interrupt side). */
+        struct IsrFuncAcc {
+            const Node *body;
+            bool compound, uncritical, opaque;
+        } *facc;
+        int nfacc, facc_cap;
     } *isr_globals;
     int isr_global_count;
     int isr_global_capacity;

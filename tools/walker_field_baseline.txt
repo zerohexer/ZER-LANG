@@ -2552,3 +2552,10 @@ checker.c:vrp_cond_effect_free:NODE_SWITCH:switch_stmt.expr
 checker.c:vrp_cond_effect_free:NODE_VAR_DECL:var_decl.init
 checker.c:vrp_cond_effect_free:NODE_WHILE:while_stmt.body
 checker.c:vrp_cond_effect_free:NODE_WHILE:while_stmt.cond
+# BUG-1608: isrref_walk never descends a declaration — isrref_compute enters every
+# function body, interrupt body and global initializer itself, with the CALLER context
+# (which function / ISR / root) the walk attributes calls to. Descending here would
+# attribute a nested body's calls to the wrong caller.
+checker.c:isrref_walk:NODE_FILE:file.decls
+checker.c:isrref_walk:NODE_FUNC_DECL:func_decl.body
+checker.c:isrref_walk:NODE_INTERRUPT:interrupt.body

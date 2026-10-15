@@ -162,6 +162,24 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
+## Reachability for the interrupt-sharing rules (BUG-1608, 2026-10-15)
+
+**"Which context runs this body?" is a reachability question, and both ISR sharing sinks asked
+"which body was being checked?" instead.** A regular-code access is recorded while the checker
+walks each function body in turn, so a helper's own body is checked as regular code even when
+only an interrupt handler calls it. The interrupt side was already right (the ISR walk descends
+direct calls with `current_body` = the HANDLER's body, which is also what keeps two handlers
+sharing a helper distinct for `multi_isr`). The fix records the BODY with every regular-code
+access (`IsrGlobal.facc`; `MmioAccess.isr_body` already held it) and decides in the post pass,
+where the whole program is visible (`isrref_compute`). Two rules that keep it sound:
+- **Any reference that is not a DIRECT call disqualifies** — a funcptr value, a spawn target, a
+  global initializer. The walk records references by NAME across modules, so a collision can
+  only over-count callers (the conservative side).
+- **C must not be able to call it** — `static`, or the program has a ZER `main`. In a `--lib`
+  build the C side owns the entry point and may call any non-static function.
+A third sink that classifies code by context (the next one will appear) must ask the same
+`isrref_body_isr_only` question, not re-derive it.
+
 ## The C variadic boundary and C-extern prototypes (BUG-1600..1602, 2026-10-13)
 
 **A variadic argument is converted to NOTHING — it crosses with its emitted C representation.**

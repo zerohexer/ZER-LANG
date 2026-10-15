@@ -148,6 +148,8 @@ typedef enum {
     VP_OR_THEN,           /* BUG-1566 — `i < 4 || j < 4` true says nothing about i */
     VP_AND_ELSE,          /* BUG-1566 — the else arm of a conjunction */
     VP_WHILE_AND_STEP,    /* BUG-1566 — the conjunction holds at entry, not after `i += 1` */
+    VP_REL_OFF_BY_ONE,    /* BUG-1607 — `i < n && n <= 5` on a [4] array: i may be 4 */
+    VP_REL_SIGNED,        /* BUG-1607 — `n < 4 && i < n` with SIGNED i: no lower bound */
 
     /* ---- PROVEN: the construct's own bound really does prove it ---- */
     VP_FOR_BODY_OK,       /* counter in the body, bounded by the loop condition */
@@ -162,6 +164,8 @@ typedef enum {
     VP_OR_GUARD_OK,       /* BUG-1566 — `if (i >= 4 || j >= 4) { return; }` then a[i], a[j] */
     VP_NOT_OK,            /* BUG-1566 — `if (!(i >= 4)) { a[i] }` */
     VP_LOOP_BOUND_RANGE_OK, /* BUG-1567 — `for (i < n)` with n's range max in bounds */
+    VP_REL_OK,            /* BUG-1607 — `if (n <= 4 && i < n) { a[i] }` */
+    VP_REL_ORDER_OK,      /* BUG-1607 — `if (i < n && n <= 4)`: the bound comes LATER */
     VPSCEN_COUNT
 } VPScenario;
 
@@ -174,11 +178,13 @@ static int scenario_is_stale(VPScenario s) {
         case VP_GOTO_BACK: case VP_SWITCH_ARM: case VP_ADDR_TAKEN:
         case VP_FOR_BODY_LOWERED: case VP_FOR_STEP_DEC:
         case VP_AND_LATER_WRITE: case VP_OR_THEN: case VP_AND_ELSE: case VP_WHILE_AND_STEP:
+        case VP_REL_OFF_BY_ONE: case VP_REL_SIGNED:
             return 1;
         case VP_FOR_BODY_OK: case VP_FOR_STEP_OK:
         case VP_WHILE_BODY_OK: case VP_CONST_OK: case VP_FOR_SIGNED_OK:
         case VP_AND_IF_OK: case VP_AND_RHS_OK: case VP_AND_WHILE_OK: case VP_AND_FOR_OK:
         case VP_OR_GUARD_OK: case VP_NOT_OK: case VP_LOOP_BOUND_RANGE_OK:
+        case VP_REL_OK: case VP_REL_ORDER_OK:
             return 0;
         case VPSCEN_COUNT: break;
     }
@@ -218,6 +224,10 @@ static const char *scen_name(VPScenario s) {
         case VP_OR_GUARD_OK:       return "||-guard PROVEN";
         case VP_NOT_OK:            return "if/! PROVEN";
         case VP_LOOP_BOUND_RANGE_OK: return "for/bound range PROVEN";
+        case VP_REL_OFF_BY_ONE:    return "if/&&(i < n, n <= 5)";
+        case VP_REL_SIGNED:        return "if/&&(signed i < n)";
+        case VP_REL_OK:            return "if/&&(n <= 4, i < n) PROVEN";
+        case VP_REL_ORDER_OK:      return "if/&&(i < n, n <= 4) PROVEN";
         case VPSCEN_COUNT:         break;
     }
     return "?";
@@ -417,6 +427,38 @@ static void gen(VPScenario s, char *buf, size_t n) {
             "    while (i < n && i < 4) { i += 1; a[i] = 9; }\n"
             "    return 0;\n}\n"
             "u32 main() { return f(0, 100); }\n");
+        break;
+    case VP_REL_OFF_BY_ONE:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 n) {\n"
+            "    if (i < n && n <= 5) { a[i] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
+        break;
+    case VP_REL_SIGNED:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(i32 i, i32 n) {\n"
+            "    if (n < 4 && i < n) { a[i] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
+        break;
+    case VP_REL_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 n) {\n"
+            "    if (n <= 4 && i < n) { a[i] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
+        break;
+    case VP_REL_ORDER_OK:
+        snprintf(buf, n,
+            "u32[4] a;\n"
+            "u32 f(u32 i, u32 n) {\n"
+            "    if (i < n && n <= 4) { a[i] = 1; }\n"
+            "    return 0;\n}\n"
+            "u32 main() { return f(1, 2); }\n");
         break;
     case VP_AND_IF_OK:
         snprintf(buf, n,

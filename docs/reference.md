@@ -4866,7 +4866,18 @@ interrupt UART_1 as "USART1_IRQHandler" {   // explicit symbol name
   `volatile` ("global 'g' is accessed from both interrupt and main code — must
   be declared volatile"). Reaching it INDIRECTLY counts: through a helper, a
   function pointer, or a global pointer whose initializer is `&g` (the ISR
-  writing `*gp` and main reading `g` touch the same global).
+  writing `*gp` and main reading `g` touch the same global). A helper that ONLY
+  interrupt handlers call (directly, never through a function pointer, a spawn or
+  from regular code) is part of the handler, not main code: its accesses count on
+  the interrupt side only. That needs the helper to be `static`, or the program to
+  have its own `main` (in a `--lib` build C could call it).
+  <!-- audit: compile-only: an interrupt block does not build on hosted x86-64 -->
+  ```zer
+  u32 count;
+  void bump() { count = count + 1; }      // only TIMER0 reaches it
+  interrupt TIMER0 { bump(); }
+  u32 main() { return 0; }                // compiles: main never touches count
+  ```
 - A `const` global needs none of this — it cannot change, so reading it from a
   handler and from main cannot race (`const u32 LIMIT = 10;` read on both sides
   compiles). A `const` POINTER / slice is different: the constant is the pointer,

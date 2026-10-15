@@ -117,11 +117,19 @@ typedef enum {
     HW_SPAWN_IN_ISR,        /* spawn inside interrupt handler */
     HW_ISR_GLOBAL_NONVOLATILE, /* non-volatile global shared interrupt+main */
     HW_ISR_COMPOUND_RMW,    /* volatile global compound-assign shared ISR+main */
+    /* BUG-1608 — a helper's accesses are main code unless ONLY an interrupt reaches it */
+    HW_ISR_HELPER_MAIN_CALLS,  /* main also calls the helper */
+    HW_ISR_HELPER_FUNCPTR,     /* the helper's address is taken in main */
+    HW_ISR_HELPER_TWO_ISRS,    /* two handlers share it through the helper */
+    HW_ISR_HELPER_MMIO_MAIN,   /* MMIO RMW in the helper AND in main */
     /* POSITIVE — structurally-valid hardware access (must compile) */
     HW_MMIO_OK,             /* @inttoptr in range, aligned, volatile */
     HW_POOL_IN_ISR_OK,      /* pool.alloc() in interrupt (Pool is ISR-safe) */
     HW_ATOMIC_GLOBAL_OK,    /* @atomic_store(&g, 0) on a u32 global */
     HW_ISR_VOLATILE_OK,     /* volatile global shared ISR+main, plain assign */
+    HW_ISR_ONLY_HELPER_OK,  /* BUG-1608: helper reached only from one handler */
+    HW_ISR_ONLY_CHAIN_OK,   /* BUG-1608: ...through a chain of helpers */
+    HW_ISR_ONLY_MMIO_OK,    /* BUG-1608: MMIO RMW in a helper only the handler reaches */
     HWSCEN_COUNT
 } HWScenario;
 
@@ -130,9 +138,12 @@ static int scenario_is_negative(HWScenario s) {
         case HW_MMIO_NO_DECL: case HW_MMIO_OOB: case HW_MMIO_MISALIGNED:
         case HW_VOLATILE_STRIP: case HW_SLAB_IN_ISR: case HW_SPAWN_IN_ISR:
         case HW_ISR_GLOBAL_NONVOLATILE: case HW_ISR_COMPOUND_RMW:
+        case HW_ISR_HELPER_MAIN_CALLS: case HW_ISR_HELPER_FUNCPTR:
+        case HW_ISR_HELPER_TWO_ISRS: case HW_ISR_HELPER_MMIO_MAIN:
             return 1;
         case HW_MMIO_OK: case HW_POOL_IN_ISR_OK: case HW_ATOMIC_GLOBAL_OK:
         case HW_ISR_VOLATILE_OK:
+        case HW_ISR_ONLY_HELPER_OK: case HW_ISR_ONLY_CHAIN_OK: case HW_ISR_ONLY_MMIO_OK:
             return 0;
         case HWSCEN_COUNT: break;
     }
@@ -153,6 +164,13 @@ static const char *scen_name(HWScenario s) {
         case HW_POOL_IN_ISR_OK:         return "pool-in-isr-ok";
         case HW_ATOMIC_GLOBAL_OK:       return "atomic-global-ok";
         case HW_ISR_VOLATILE_OK:        return "isr-volatile-plain-ok";
+        case HW_ISR_HELPER_MAIN_CALLS:  return "isr-helper-main-calls";
+        case HW_ISR_HELPER_FUNCPTR:     return "isr-helper-funcptr";
+        case HW_ISR_HELPER_TWO_ISRS:    return "isr-helper-two-isrs";
+        case HW_ISR_HELPER_MMIO_MAIN:   return "isr-helper-mmio-main";
+        case HW_ISR_ONLY_HELPER_OK:     return "isr-only-helper-ok";
+        case HW_ISR_ONLY_CHAIN_OK:      return "isr-only-chain-ok";
+        case HW_ISR_ONLY_MMIO_OK:       return "isr-only-mmio-ok";
         case HWSCEN_COUNT: break;
     }
     return "?";
@@ -234,6 +252,47 @@ static void gen(HWScenario s, char *buf, size_t n) {
                 "volatile u32 g_flag;\n"
                 "interrupt UART { g_flag = 1; }\n"
                 "u32 main() { u32 x = g_flag; return x; }\n");
+            break;
+        case HW_ISR_HELPER_MAIN_CALLS:
+            snprintf(buf, n,
+                "u32 count;\nvoid bump() { count = 5; }\n"
+                "interrupt TIMER0 { bump(); }\nu32 main() { bump(); return 0; }\n");
+            break;
+        case HW_ISR_HELPER_FUNCPTR:
+            snprintf(buf, n,
+                "u32 count;\nvoid bump() { count = 5; }\n"
+                "interrupt TIMER0 { bump(); }\n"
+                "u32 main() { *() f = bump; f(); return 0; }\n");
+            break;
+        case HW_ISR_HELPER_TWO_ISRS:
+            snprintf(buf, n,
+                "u32 count;\nvoid bump() { count = count + 1; }\n"
+                "interrupt TIMER0 { bump(); }\ninterrupt TIMER1 { bump(); }\n"
+                "u32 main() { return 0; }\n");
+            break;
+        case HW_ISR_HELPER_MMIO_MAIN:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "volatile *u32 reg = @inttoptr(*u32, 0x40000000);\n"
+                "void kick() { *reg |= 1; }\ninterrupt TIMER0 { kick(); }\n"
+                "u32 main() { *reg |= 2; return 0; }\n");
+            break;
+        case HW_ISR_ONLY_HELPER_OK:
+            snprintf(buf, n,
+                "u32 count;\nvoid bump() { count = 5; }\n"
+                "interrupt TIMER0 { bump(); }\nu32 main() { return 0; }\n");
+            break;
+        case HW_ISR_ONLY_CHAIN_OK:
+            snprintf(buf, n,
+                "u32 count;\nvoid b() { count = count + 1; }\nvoid a() { b(); }\n"
+                "interrupt TIMER0 { a(); }\nu32 main() { return 0; }\n");
+            break;
+        case HW_ISR_ONLY_MMIO_OK:
+            snprintf(buf, n,
+                "mmio 0x40000000..0x40000FFF;\n"
+                "volatile *u32 reg = @inttoptr(*u32, 0x40000000);\n"
+                "void kick() { *reg |= 1; }\ninterrupt TIMER0 { kick(); }\n"
+                "u32 main() { return 0; }\n");
             break;
         case HWSCEN_COUNT: buf[0] = 0; break;
     }

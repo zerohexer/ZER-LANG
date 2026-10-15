@@ -26744,6 +26744,27 @@ static bool vrp_cond_effect_free(Node *e, int depth) {
     return false;
 }
 
+/* BUG-1607: the VRP key of a comparison operand that is a variable — a
+ * non-volatile identifier or a field path (the spellings the constant form
+ * already narrows). */
+static bool vrp_cond_var_key(Checker *c, Node *v, const char **out, uint32_t *olen) {
+    if (!v) return false;
+    if (v->kind == NODE_IDENT) {
+        Symbol *vs = scope_lookup(c->current_scope, v->ident.name,
+                                  (uint32_t)v->ident.name_len);
+        if (vs && vs->is_volatile) return false;
+        *out = v->ident.name; *olen = (uint32_t)v->ident.name_len;
+        return true;
+    }
+    if (v->kind == NODE_FIELD) {
+        ExprKey ek = build_expr_key_a(c, v);
+        if (ek.len == 0) return false;
+        *out = ek.str; *olen = (uint32_t)ek.len;
+        return true;
+    }
+    return false;
+}
+
 static void vrp_push_cond_facts(Checker *c, Node *cond, bool truth, int depth) {
     if (!cond || depth > 64) return;   /* parser-bounded; past it: no facts (sound) */
     if (depth == 0 && !vrp_cond_effect_free(cond, 0)) return;
@@ -26756,6 +26777,9 @@ static void vrp_push_cond_facts(Checker *c, Node *cond, bool truth, int depth) {
     if ((op == TOK_AMPAMP && truth) || (op == TOK_PIPEPIPE && !truth)) {
         vrp_push_cond_facts(c, cond->binary.left, truth, depth + 1);
         vrp_push_cond_facts(c, cond->binary.right, truth, depth + 1);
+        /* BUG-1607: once more — a relational conjunct reads the OTHER variable's
+         * range, which a LATER conjunct may have narrowed (`i < n && n < 8`). */
+        vrp_push_cond_facts(c, cond->binary.left, truth, depth + 1);
         return;
     }
     if (op != TOK_LT && op != TOK_LTEQ && op != TOK_GT && op != TOK_GTEQ &&
@@ -26786,7 +26810,63 @@ static void vrp_push_cond_facts(Checker *c, Node *cond, bool truth, int depth) {
         }
         var_left = side == 0;
     }
-    if (!var) return;
+    /* BUG-1607: no constant side — `x OP y` with y a variable whose range is
+     * known HERE. The fact about x holds at the body whatever y does later: it
+     * compares x with y's value at the test, which lay in y's range. Both
+     * directions are pushed (x from y's range, y from x's). */
+    if (!var) {
+        for (int side = 0; side < 2; side++) {
+            Node *v = side == 0 ? lhs : rhs;
+            Node *o = side == 0 ? rhs : lhs;
+            const char *vn; uint32_t vl;
+            if (!vrp_cond_var_key(c, v, &vn, &vl)) continue;
+            const char *on; uint32_t ol;
+            if (!vrp_cond_var_key(c, o, &on, &ol)) continue;
+            struct VarRange *orr = find_var_range(c, on, ol);
+            if (!orr) continue;
+            int64_t omin = orr->min_val, omax = orr->max_val;
+            TokenType rop = op;
+            if (side == 1) {
+                switch (rop) {
+                case TOK_LT:   rop = TOK_GT;   break;
+                case TOK_LTEQ: rop = TOK_GTEQ; break;
+                case TOK_GT:   rop = TOK_LT;   break;
+                case TOK_GTEQ: rop = TOK_LTEQ; break;
+                default: break;
+                }
+            }
+            if (!truth) {
+                switch (rop) {
+                case TOK_LT:     rop = TOK_GTEQ;   break;
+                case TOK_LTEQ:   rop = TOK_GT;     break;
+                case TOK_GT:     rop = TOK_LTEQ;   break;
+                case TOK_GTEQ:   rop = TOK_LT;     break;
+                case TOK_EQEQ:   rop = TOK_BANGEQ; break;
+                case TOK_BANGEQ: rop = TOK_EQEQ;   break;
+                default: break;
+                }
+            }
+            switch (rop) {
+            case TOK_LT:
+                if (omax != INT64_MAX) push_var_range(c, vn, vl, INT64_MIN, vrp_pred(omax), omax <= 0);
+                break;
+            case TOK_LTEQ:
+                if (omax != INT64_MAX) push_var_range(c, vn, vl, INT64_MIN, omax, omax < 0);
+                break;
+            case TOK_GT:
+                if (omin != INT64_MIN) push_var_range(c, vn, vl, vrp_succ(omin), INT64_MAX, omin >= 0);
+                break;
+            case TOK_GTEQ:
+                if (omin != INT64_MIN) push_var_range(c, vn, vl, omin, INT64_MAX, omin > 0);
+                break;
+            case TOK_EQEQ:
+                push_var_range(c, vn, vl, omin, omax, omin > 0 || omax < 0);
+                break;
+            default: break;
+            }
+        }
+        return;
+    }
     /* Normalise to `var OP k`, then negate for a false condition. */
     if (!var_left) {
         switch (op) {
@@ -36268,6 +36348,23 @@ void checker_walk_guard_sites(Checker *c, Node *node, ZerGuardFn fn, void *ud) {
 /* ================================================================
  * INTERRUPT SAFETY — track globals shared between ISR and regular code
  * ================================================================ */
+/* BUG-1608: remember WHICH body made a regular-code access (flags OR per body;
+ * the escape fixpoint re-walks bodies, so a body is recorded once). */
+static struct IsrFuncAcc *isr_facc_note(struct IsrGlobal *g, const Node *body) {
+    for (int i = 0; i < g->nfacc; i++) if (g->facc[i].body == body) return &g->facc[i];
+    if (g->nfacc >= g->facc_cap) {
+        int nc = g->facc_cap ? g->facc_cap * 2 : 4;
+        struct IsrFuncAcc *nf = (struct IsrFuncAcc *)realloc(g->facc,
+                                    (size_t)nc * sizeof(*nf));
+        if (!nf) return NULL;
+        g->facc = nf; g->facc_cap = nc;
+    }
+    struct IsrFuncAcc *a = &g->facc[g->nfacc++];
+    memset(a, 0, sizeof(*a));
+    a->body = body;
+    return a;
+}
+
 static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                                 bool is_compound, bool is_static_local, int line) {
     /* BUG-1059c: a read-modify-write in MAIN code inside `@critical` cannot be
@@ -36300,6 +36397,11 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
                 g->from_func = true;
                 if (is_compound) g->compound_in_func = true;
                 if (c->critical_depth == 0) g->uncritical_in_func = true;   /* BUG-1403 */
+                struct IsrFuncAcc *fa = isr_facc_note(g, c->current_body);
+                if (fa) {
+                    if (is_compound) fa->compound = true;
+                    if (c->critical_depth == 0) fa->uncritical = true;
+                }
             }
             return;
         }
@@ -36326,6 +36428,11 @@ static void track_isr_global_ex(Checker *c, const char *name, uint32_t name_len,
         g->from_func = true;
         if (is_compound) g->compound_in_func = true;
         if (c->critical_depth == 0) g->uncritical_in_func = true;   /* BUG-1403 */
+        struct IsrFuncAcc *fa = isr_facc_note(g, c->current_body);
+        if (fa) {
+            if (is_compound) fa->compound = true;
+            if (c->critical_depth == 0) fa->uncritical = true;
+        }
     }
 }
 
@@ -36382,7 +36489,12 @@ static void track_isr_global_opaque(Checker *c, const char *name, uint32_t name_
         bool same = (gsym || g->sym) ? g->sym == gsym
                   : (g->name_len == name_len && memcmp(g->name, name, name_len) == 0);
         if (same) {
-            if (c->in_interrupt) g->opaque_in_isr = true; else g->opaque_in_func = true;
+            if (c->in_interrupt) g->opaque_in_isr = true;
+            else {
+                g->opaque_in_func = true;
+                struct IsrFuncAcc *fa = isr_facc_note(g, c->current_body);
+                if (fa) fa->opaque = true;
+            }
             return;
         }
     }
@@ -37874,12 +37986,205 @@ static void check_atomic_cell_safety(Checker *c) {
  * an RMW (or MAY be one, handed to a call the analysis cannot see), and the
  * writes to it come from an interrupt AND from another context. Quadratic in the
  * number of register writes, which is the number of such statements. */
-static void check_mmio_register_sharing(Checker *c) {
+/* BUG-1608: which function bodies can ONLY be entered from an interrupt
+ * handler? Regular-code accesses those bodies make are interrupt accesses (the
+ * ISR walk records them on that side); counting them as "main" refused
+ * `void bump() { count = 5; } interrupt T { bump(); }` with "accessed from both
+ * interrupt and main code" though main never touches `count`.
+ *
+ * A function is ISR-only when it is not `main`, every reference to its name is a
+ * DIRECT call, it has at least one, and every caller is an interrupt body or
+ * another ISR-only function (greatest fixpoint, so a recursion among helpers stays
+ * ISR-only). Any other reference — a function-pointer value, a spawn target, a
+ * global initializer, a call from main or from any non-ISR-only function — makes
+ * it regular code. And a C caller must be impossible: the function is `static`,
+ * or the program has its own ZER `main` (a `--lib` build without one keeps every
+ * non-static function as regular code). Names are matched across modules as one
+ * set: a reference under a name counts against every function of that name, the
+ * conservative direction. The walk is exhaustive (no `default:`); a cap reached
+ * marks the walk UNKNOWN, and then no function is ISR-only. */
+#define ISRREF_ROOT (-1)   /* a global initializer: regular code */
+#define ISRREF_ISR  (-2)   /* an interrupt body */
+typedef struct {
+    const char *name; uint32_t name_len;
+    const Node *body;
+    bool is_static, value_use, isr_only;
+    int *callers; int ncallers, cap;
+} IsrRefFn;
+typedef struct { IsrRefFn *f; int n, cap; bool unknown; } IsrRefCtx;
+
+static void isrref_note_call(IsrRefCtx *x, const char *nm, uint32_t nl, int from) {
+    for (int i = 0; i < x->n; i++) {
+        IsrRefFn *f = &x->f[i];
+        if (f->name_len != nl || memcmp(f->name, nm, nl) != 0) continue;
+        if (f->ncallers >= f->cap) {
+            int nc = f->cap ? f->cap * 2 : 4;
+            int *np = (int *)realloc(f->callers, (size_t)nc * sizeof(int));
+            if (!np) { x->unknown = true; return; }
+            f->callers = np; f->cap = nc;
+        }
+        f->callers[f->ncallers++] = from;
+    }
+}
+static void isrref_note_value(IsrRefCtx *x, const char *nm, uint32_t nl) {
+    for (int i = 0; i < x->n; i++)
+        if (x->f[i].name_len == nl && memcmp(x->f[i].name, nm, nl) == 0)
+            x->f[i].value_use = true;
+}
+static void isrref_walk(IsrRefCtx *x, Node *n, int from, int depth) {
+    if (!n || x->unknown) return;
+    if (depth > 4096) { x->unknown = true; return; }
+    #define IW(e) isrref_walk(x, (e), from, depth + 1)
+    switch (n->kind) {
+    case NODE_IDENT:
+        isrref_note_value(x, n->ident.name, (uint32_t)n->ident.name_len);
+        return;
+    case NODE_CALL:
+        if (n->call.callee && n->call.callee->kind == NODE_IDENT)
+            isrref_note_call(x, n->call.callee->ident.name,
+                             (uint32_t)n->call.callee->ident.name_len, from);
+        else if (n->call.callee && n->call.callee->kind == NODE_FIELD) {
+            /* `mod.f()` — a qualified call; for a funcptr FIELD the function
+             * reaches the field elsewhere, as a value. Both read as a call. */
+            isrref_note_call(x, n->call.callee->field.field_name,
+                             (uint32_t)n->call.callee->field.field_name_len, from);
+            IW(n->call.callee->field.object);
+        } else IW(n->call.callee);
+        for (int i = 0; i < n->call.arg_count; i++) IW(n->call.args[i]);
+        IW(n->call.comptime_struct_init);
+        return;
+    case NODE_SPAWN:   /* a thread target: regular code */
+        isrref_note_value(x, n->spawn_stmt.func_name, (uint32_t)n->spawn_stmt.func_name_len);
+        for (int i = 0; i < n->spawn_stmt.arg_count; i++) IW(n->spawn_stmt.args[i]);
+        return;
+    case NODE_BINARY:   IW(n->binary.left); IW(n->binary.right); return;
+    case NODE_UNARY:    IW(n->unary.operand); return;
+    case NODE_ASSIGN:   IW(n->assign.target); IW(n->assign.value); return;
+    case NODE_FIELD:    IW(n->field.object); return;
+    case NODE_INDEX:    IW(n->index_expr.object); IW(n->index_expr.index); return;
+    case NODE_SLICE:    IW(n->slice.object); IW(n->slice.start); IW(n->slice.end); return;
+    case NODE_ORELSE:   IW(n->orelse.expr); IW(n->orelse.fallback); return;
+    case NODE_TYPECAST: IW(n->typecast.expr); return;
+    case NODE_INTRINSIC:
+        for (int i = 0; i < n->intrinsic.arg_count; i++) IW(n->intrinsic.args[i]);
+        return;
+    case NODE_STRUCT_INIT:
+        for (int i = 0; i < n->struct_init.field_count; i++) IW(n->struct_init.fields[i].value);
+        return;
+    case NODE_BLOCK:
+        for (int i = 0; i < n->block.stmt_count; i++) IW(n->block.stmts[i]);
+        return;
+    case NODE_VAR_DECL:  IW(n->var_decl.init); return;
+    case NODE_GLOBAL_VAR: IW(n->var_decl.init); return;
+    case NODE_IF:       IW(n->if_stmt.cond); IW(n->if_stmt.then_body); IW(n->if_stmt.else_body); return;
+    case NODE_FOR:      IW(n->for_stmt.init); IW(n->for_stmt.cond); IW(n->for_stmt.step); IW(n->for_stmt.body); return;
+    case NODE_WHILE: case NODE_DO_WHILE:
+        IW(n->while_stmt.cond); IW(n->while_stmt.body); return;
+    case NODE_SWITCH:
+        IW(n->switch_stmt.expr);
+        for (int i = 0; i < n->switch_stmt.arm_count; i++) {
+            for (int v = 0; v < n->switch_stmt.arms[i].value_count; v++)
+                IW(n->switch_stmt.arms[i].values[v]);
+            IW(n->switch_stmt.arms[i].body);
+        }
+        return;
+    case NODE_RETURN:   IW(n->ret.expr); return;
+    case NODE_DEFER:    IW(n->defer.body); return;
+    case NODE_EXPR_STMT: IW(n->expr_stmt.expr); return;
+    case NODE_CRITICAL: IW(n->critical.body); return;
+    case NODE_ONCE:     IW(n->once.body); return;
+    case NODE_AWAIT:    IW(n->await_stmt.cond); return;
+    case NODE_STATIC_ASSERT: IW(n->static_assert_stmt.cond); return;
+    case NODE_ASM:
+        for (int i = 0; i < n->asm_stmt.input_count; i++) IW(n->asm_stmt.inputs[i].expr);
+        for (int i = 0; i < n->asm_stmt.output_count; i++) IW(n->asm_stmt.outputs[i].expr);
+        return;
+    /* No expression inside (or not a body this walk starts from). */
+    case NODE_INT_LIT: case NODE_FLOAT_LIT: case NODE_STRING_LIT: case NODE_CHAR_LIT:
+    case NODE_BOOL_LIT: case NODE_NULL_LIT: case NODE_SIZEOF: case NODE_CAST:
+    case NODE_BREAK: case NODE_CONTINUE: case NODE_GOTO: case NODE_LABEL: case NODE_YIELD:
+    case NODE_FILE: case NODE_FUNC_DECL: case NODE_STRUCT_DECL: case NODE_ENUM_DECL:
+    case NODE_UNION_DECL: case NODE_TYPEDEF: case NODE_IMPORT: case NODE_CINCLUDE:
+    case NODE_INTERRUPT: case NODE_MMIO: case NODE_CONTAINER_DECL:
+        return;
+    }
+    #undef IW
+}
+
+/* Fills `x` with the ISR-only verdict per function body. */
+static void isrref_compute(Checker *c, IsrRefCtx *x) {
+    memset(x, 0, sizeof(*x));
+    bool has_main = false;
+    for (int fi = 0; fi < c->reg_file_count; fi++) {
+        Node *f = c->reg_files[fi];
+        for (int di = 0; f && di < f->file.decl_count; di++) {
+            Node *d = f->file.decls[di];
+            if (d->kind != NODE_FUNC_DECL || !d->func_decl.body) continue;
+            if (d->func_decl.name_len == 4 && memcmp(d->func_decl.name, "main", 4) == 0)
+                has_main = true;
+            if (x->n >= x->cap) {
+                int nc = x->cap ? x->cap * 2 : 32;
+                IsrRefFn *nf = (IsrRefFn *)realloc(x->f, (size_t)nc * sizeof(*nf));
+                if (!nf) { x->unknown = true; return; }
+                x->f = nf; x->cap = nc;
+            }
+            IsrRefFn *e = &x->f[x->n++];
+            memset(e, 0, sizeof(*e));
+            e->name = d->func_decl.name; e->name_len = (uint32_t)d->func_decl.name_len;
+            e->body = d->func_decl.body; e->is_static = d->func_decl.is_static;
+        }
+    }
+    int fn_ix = 0;
+    for (int fi = 0; fi < c->reg_file_count; fi++) {
+        Node *f = c->reg_files[fi];
+        for (int di = 0; f && di < f->file.decl_count; di++) {
+            Node *d = f->file.decls[di];
+            if (d->kind == NODE_FUNC_DECL && d->func_decl.body)
+                isrref_walk(x, d->func_decl.body, fn_ix++, 0);
+            else if (d->kind == NODE_INTERRUPT)
+                isrref_walk(x, d->interrupt.body, ISRREF_ISR, 0);
+            else if (d->kind == NODE_GLOBAL_VAR)
+                isrref_walk(x, d, ISRREF_ROOT, 0);
+        }
+    }
+    if (x->unknown) return;
+    for (int i = 0; i < x->n; i++) {
+        IsrRefFn *e = &x->f[i];
+        bool is_main = e->name_len == 4 && memcmp(e->name, "main", 4) == 0;
+        e->isr_only = !is_main && !e->value_use && e->ncallers > 0 &&
+                      (e->is_static || has_main);
+    }
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (int i = 0; i < x->n; i++) {
+            IsrRefFn *e = &x->f[i];
+            if (!e->isr_only) continue;
+            for (int k = 0; k < e->ncallers; k++) {
+                int from = e->callers[k];
+                if (from == ISRREF_ISR) continue;
+                if (from >= 0 && from < x->n && x->f[from].isr_only) continue;
+                e->isr_only = false; changed = true; break;
+            }
+        }
+    }
+}
+static bool isrref_body_isr_only(const IsrRefCtx *x, const Node *body) {
+    if (!body || x->unknown) return false;
+    for (int i = 0; i < x->n; i++) if (x->f[i].body == body) return x->f[i].isr_only;
+    return false;
+}
+static void isrref_free(IsrRefCtx *x) {
+    for (int i = 0; i < x->n; i++) free(x->f[i].callers);
+    free(x->f);
+}
+
+static void check_mmio_register_sharing(Checker *c, const IsrRefCtx *iref) {
     int n = c->mmio_access_count;
     for (int i = 0; i < n; i++) {
         struct MmioAccess *r = &c->mmio_accesses[i];
         if ((!r->rmw && !r->opaque) || r->reported) continue;
-        bool isr = r->from_isr, main_side = !r->from_isr, multi = false;
+        bool isr = r->from_isr, multi = false;
+        bool main_side = !r->from_isr && !isrref_body_isr_only(iref, r->isr_body);
         const Node *isr_body = r->from_isr ? r->isr_body : NULL;
         for (int j = 0; j < n; j++) {
             struct MmioAccess *o = &c->mmio_accesses[j];
@@ -37888,7 +38193,7 @@ static void check_mmio_register_sharing(Checker *c) {
                 if (isr_body && o->isr_body != isr_body) multi = true;
                 if (!isr_body) isr_body = o->isr_body;
                 isr = true;
-            } else {
+            } else if (!isrref_body_isr_only(iref, o->isr_body)) {   /* BUG-1608 */
                 main_side = true;
             }
         }
@@ -37920,9 +38225,26 @@ static void check_mmio_register_sharing(Checker *c) {
 
 /* Post-check: validate interrupt safety for shared globals */
 static void check_interrupt_safety(Checker *c) {
-    check_mmio_register_sharing(c);   /* BUG-1480 */
+    IsrRefCtx iref;
+    isrref_compute(c, &iref);   /* BUG-1608 */
+    check_mmio_register_sharing(c, &iref);   /* BUG-1480 */
     for (int i = 0; i < c->isr_global_count; i++) {
         struct IsrGlobal *g = &c->isr_globals[i];
+        /* BUG-1608: drop the regular-code accesses made by bodies only an
+         * interrupt can reach, and recompute the facts from what is left. */
+        if (g->from_func && g->nfacc > 0) {
+            bool ff = false, cf = false, uf = false, of = false;
+            for (int k = 0; k < g->nfacc; k++) {
+                struct IsrFuncAcc *a = &g->facc[k];
+                if (isrref_body_isr_only(&iref, a->body)) continue;
+                ff = true;
+                if (a->compound) cf = true;
+                if (a->uncritical) uf = true;
+                if (a->opaque) of = true;
+            }
+            g->from_func = ff; g->compound_in_func = cf;
+            g->uncritical_in_func = uf; g->opaque_in_func = of;
+        }
         /* shared = touched from an ISR AND from main, or from TWO ISRs (BUG-1059d) */
         if (!g->from_isr || (!g->from_func && !g->multi_isr)) continue;
         const char *other = g->from_func ? "main" : "another interrupt handler";
@@ -38055,6 +38377,7 @@ static void check_interrupt_safety(Checker *c) {
         }
         c->file_name = sv_fn; c->source = sv_src;
     }
+    isrref_free(&iref);
 }
 
 /* ================================================================

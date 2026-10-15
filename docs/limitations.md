@@ -47,9 +47,11 @@ repeated.
    aliased the same way.
 2. ~~The volatile-flag RMW rule refused a spawner's RMW against a thread that only READS the
    flag~~ — CLOSED 2026-10-13 (BUG-1604: thread STORES are recorded by the sync walk).
-3. **Condition facts (BUG-1566) are taken from EFFECT-FREE conditions only**, and only from
-   `ident|field OP constant`. `i < n` with a variable `n` contributes nothing on its own (its
-   range is not consulted in a conjunct); `if (n < 8 && i < n)` proves nothing about `i`.
+3. **Condition facts (BUG-1566/1607) are taken from EFFECT-FREE conditions only.** Since
+   BUG-1607 `i < n` reads `n`'s CURRENT range (`if (n < 8 && i < n)` proves `i <= 6`, either
+   conjunct order). Still not used: a bound that is an expression (`i < n - 1`, `i < s.len`
+   of a slice) and a relation between two variables that have no range yet (no relational
+   domain: `i < n` stored as a fact and applied when `n` is narrowed later is not kept).
 4. **Range-for over an element** (`for (x in hs[k].s)`) is refused (BUG-1581) — assign the
    collection to a local. A relaxation would need a snapshot of the collection itself.
 5. **`can_detach` (BUG-1589) follows direct calls, module-qualified calls and function
@@ -72,14 +74,30 @@ repeated.
    through pointers (global, local, parameter), forwarding and call cycles. Not followed: a
    value passed back through memory a pointer argument points at (an out-parameter
    `void rd(*u32 o) { *o = g; }`), which the per-object summary does not model.
-3. **A helper called only from an interrupt handler counts as MAIN code** for the
-   ISR-sharing rule: `void bump() { count = 5; } interrupt T { bump(); }` is refused
-   "must be declared volatile" though main never touches `count` (over-rejection). Needs
-   reachability from the non-ISR roots (main, spawn targets, funcptr-taken and exported
-   functions) — a relaxation, so it needs the accept-unsafe discipline.
+3. ~~A helper called only from an interrupt handler counts as MAIN code~~ — CLOSED
+   2026-10-15 (BUG-1608). Still conservative: a function is ISR-only only when it is `static`
+   or the program has a ZER `main` (a `--lib` build keeps every non-static helper as main
+   code, because C may call it), and names are matched across modules as one set (two
+   modules' `bump` share their callers).
 5. **Over-rejections from the allocation tracker:** (the free-every-slot loop over a GLOBAL
    array compiles since BUG-1605.) Freeing a heap linked list
    built from `alloc(Node)` + `?*Node next` is refused in the iterative and recursive forms.
+   **Why it is a design change, not a patch (analysed 2026-10-15).** Every node comes from ONE
+   allocation site, so they share one identity (`aid = local + 1`), and `n.next = head`
+   aliases the field to that identity: freeing the first node marks them all freed. The
+   tempting fix — give a read of `p.next` a FRESH identity — is UNSOUND three ways: a cycle
+   (`last.next = first`, or `n.next = n`) makes `p.next` an already-freed node; a second
+   pointer into the list (`tail`, a global) frees a node the traversal later reaches; two lists
+   sharing a tail free it twice. A sound version needs a proven OWNERSHIP invariant on the
+   link field — every object has at most one incoming `next` and the chain is acyclic — checked
+   at EVERY store to that field program-wide (`n.next = head; head = n;` with `n` fresh and
+   `head` dead afterwards preserves it; `tail.next = n; tail = n;` keeps a second pointer and
+   needs `tail` treated as a borrow that dies before any free), plus recency abstraction in
+   zercheck_ir (the node being freed is a materialised singleton taken out of the "rest of the
+   list" summary, which stays alive). That is shape analysis: oracle first
+   (`handle_flow_lattice.v`-style, with the ownership invariant as an explicit precondition —
+   the Level B lesson), then the C. Workarounds today: a `Pool`/`Slab` with `Handle(Node)`
+   links, or nodes in an array with index links.
    The variable-index global free (BUG-1530) widens a caller's `gs[0]` even when the
    callee's index provably differs.
 6. ~~Leak false negatives~~ — CLOSED 2026-10-13: one free at a literal index after a

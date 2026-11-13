@@ -162,7 +162,7 @@ was silent truncation). Open follow-ups (limitations.md "native uN/iN"): VRP
 mask-elision (deferred — Rice-bounded perf), single-bit `reg[5]` shorthand
 (architect decision, use `reg[5..5]`).
 
-## The 2026-11-13 audit (BUG-1609..1635) — what took a loop to find
+## The 2026-11-13 audit (BUG-1609..1638) — what took a loop to find
 
 Read with BUGS-FIXED.md "Session 2026-11-13". Only what is not obvious from the diff.
 
@@ -322,6 +322,16 @@ correctly everywhere else. Any new consumer that takes an element access apart i
 keying it whole must call `ir_rebase_slice_index` first; that is the one place a view's
 index is translated (a zero-start view keeps a variable index, a shifted one becomes
 "some element").
+
+**11c. An allocation's NAMES decide who owes the free — count them (BUG-1636..1638).** The exit
+leak pass skips temps and skips `escaped` entries because both are copies / hand-offs of an
+owner that is reported elsewhere. That is only right while the OWNER exists: an allocation held
+only by temps (`f(alloc(T))`), or whose only owner slot was marked escaped by an applier
+(`put(&h, alloc(T))`), has no one left to report it. When teaching a store / hand-off applier
+to mark `escaped`, ask whether the destination is this frame's own storage
+(`ir_key_path_in_frame`) — if so the slot keeps the duty. And a hand-off applier keyed on the
+BARE handle (`ir_find_handle(arg_local)`) does nothing for a by-value struct argument, whose
+allocations are compound entries `(local, ".f")`: descend explicitly.
 
 **12. Two strictness levels for "a place a view names" — do not merge them.**
 `ir_place_fixed_below_root` (per-STATE view keys, BUG-1621) refuses a variable index: a key

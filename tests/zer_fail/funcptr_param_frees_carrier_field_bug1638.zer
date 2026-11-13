@@ -1,0 +1,18 @@
+// EXPECTED: compile error
+// expect-error: use after free: 'a' is maybe-freed
+// BUG-1638: a struct carrying a pointer is handed to a FUNCPTR parameter whose
+// target frees that pointer field. The bare-pointer hand-off was widened (the
+// use after was refused), but a struct carrier's field was not — the allocation
+// stayed ALIVE and `a.v = 99` read freed memory (exit 99). The carried field now
+// gets the same MAYBE_FREED the bare pointer gets.
+struct T { u32 v; }
+struct H { *T p; }
+void fre(H h) { free(h.p); }
+void apply(*(H) f, H h) { f(h); }
+u32 main() {
+    *T a = alloc(T) orelse return;
+    H h = { .p = a };
+    apply(fre, h);
+    a.v = 99;
+    return a.v;
+}

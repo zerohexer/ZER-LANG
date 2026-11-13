@@ -1,0 +1,12 @@
+// expect-trap
+// expect-trap-msg: slice end > len
+// Promoted from tests/zer_gaps/audit_2026-06-02_slice_oob.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+i32 main() {
+    u8[4] data;
+    data[0] = 1; data[1] = 2; data[2] = 3; data[3] = 4;
+    u32 e = 100;
+    for (u32 k = 0; k < 1; k += 1) { e = 100; }   // defeat VRP
+    [*]u8 s = data[0..e];
+    return (i32)s.len;   // returns 100 (currently); should trap
+}

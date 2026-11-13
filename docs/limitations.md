@@ -30,7 +30,7 @@ This section says what was DECIDED (so it is not re-litigated), the recipe that 
 adoption cheap, and the corrections I made to my OWN earlier work so they are not
 repeated.
 
-## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1635; measured, reproducers in `tests/zer_gaps/`)
+## OPEN — residuals of the 2026-11-13 audit (BUG-1609..1638; measured, reproducers in `tests/zer_gaps/`)
 
 Found by the four probe runs of this session and NOT fixed. Each accept-unsafe item has an
 executed reproducer in `tests/zer_gaps/` (compile-clean = the gap still holds; the runner
@@ -67,9 +67,7 @@ each a missing SUMMARY fact, not a missing key:
    the state-based note (BUG-1623) has no entry to find.
    `alloc_callee_frees_global_{struct_copy,optional_capture}`. (A slice VIEW of a global
    array is CLOSED, BUG-1635.)
-5. **A carrier forwarded to a funcptr PARAMETER** — `apply(fre, h)` with `h` a struct holding
-   the pointer: the bare-pointer argument is widened (BUG-740), the carrier's fields are not.
-   `alloc_funcptr_param_frees_carrier_field`.
+5. ~~A carrier forwarded to a funcptr PARAMETER~~ — CLOSED (BUG-1638).
 6. ~~A `?*T` read out of a slice view of a local array~~ — CLOSED (BUG-1635).
    Residual precision (loud): a VARIABLE index through a view that does not start at 0
    (`[*]?*T u = arr[1..3]; for (i..) { free(u[i]); u[i] = null; }`) is "some element", so
@@ -81,8 +79,7 @@ each a missing SUMMARY fact, not a missing key:
 8. **`move struct` across a pointer / slice parameter** — `void eat(*W w) { consume(w.t); }`
    called twice, through a pointer local, or on a slice element: no memory fault, the
    use-after-move guarantee only. `move_{double_via_param_forward,via_ptr_local_then_use,from_slice_param}`.
-9. **Silent leaks** — `use(alloc(T) orelse return)` (an allocation consumed as a call
-   argument — BUG-1597 covered the other inline positions; `leak_inline_alloc_call_arg`), a
+9. **Silent leaks** — ~~`use(alloc(T) orelse return)`~~ (CLOSED, BUG-1636/1637), a
    `goto` that jumps over a `defer free(a)`, and a GLOBAL slot overwritten with null
    (`g.p = alloc(T); g.p = null;` — global entries are escaped, so the overwrite query stays
    silent; the LOCAL-slot form is reported since BUG-1627).

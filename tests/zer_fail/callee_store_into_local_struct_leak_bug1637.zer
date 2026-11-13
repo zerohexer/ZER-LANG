@@ -1,0 +1,15 @@
+// EXPECTED: compile error
+// expect-error: never freed
+// BUG-1637: a callee stores an inline allocation into a field of the caller's
+// own local struct (`put_h(&h, alloc(T) orelse return)`). The store applier
+// marked the slot escaped, which put it in the exit pass's covered set and
+// silenced the leak — but a slot in this frame's OWN storage is still this
+// frame's to free, exactly as the direct `h.p = alloc(T);` is reported.
+struct T { u32 v; }
+struct H { ?*T p; }
+void put_h(*H h, *T p) { h.p = p; }
+u32 main() {
+    H h;
+    put_h(&h, alloc(T) orelse return);
+    return 0;
+}

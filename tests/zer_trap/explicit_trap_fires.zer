@@ -1,0 +1,8 @@
+// expect-trap
+// expect-trap-msg: trap at
+// Promoted from tests/zer_gaps/ast_explicit_trap.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
+u32 main() {
+    @trap();
+    return 0;
+}

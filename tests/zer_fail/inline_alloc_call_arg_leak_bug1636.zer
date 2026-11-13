@@ -1,0 +1,12 @@
+// EXPECTED: compile error
+// expect-error: never bound to a name
+// BUG-1636: an allocation consumed inline as a call argument lives only in the
+// orelse temp and the argument temp — every entry of it was a temp, which the
+// leak pass skips, so the guaranteed leak was silent. The callee here keeps a
+// value, not the pointer, so nothing frees it.
+struct T { u32 v; }
+u32 use(*T p) { return p.v; }
+u32 main() {
+    u32 r = use(alloc(T) orelse return);
+    return r;
+}

@@ -1794,10 +1794,10 @@ All numbered patterns from BUG-042 through BUG-337. Key themes:
 ### Test Locations Summary
 | Directory | What | Count | Runner |
 |---|---|---|---|
-| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 984 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 1764 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 99 (2026-11-13) | `tests/test_zer.sh` |
-| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 36 (2026-11-13) | `tests/test_zer.sh` |
+| `tests/zer/` | ZER integration tests (positive — must compile + run + exit 0) | 992 (2026-11-13) | `tests/test_zer.sh` |
+| `tests/zer_fail/` | ZER negative tests (must fail to compile) | 1769 (2026-11-13) | `tests/test_zer.sh` |
+| `tests/zer_trap/` | compile clean, MUST trap at runtime (`// expect-trap`) | 109 (2026-11-13) | `tests/test_zer.sh` |
+| `tests/zer_gaps/` | known gaps — compile-clean IS the gap (expectation INVERTED) | 15 (2026-11-13) | `tests/test_zer.sh` |
 | `test_modules/` | Multi-file module tests | 115 files (2026-11-13) | `test_modules/run_tests.sh` |
 | `rust_tests/` | Rust test/ui translations ONLY | 784 | `rust_tests/run_tests.sh` |
 | `zig_tests/` | Zig test translations ONLY | 36 | `zig_tests/run_tests.sh` |

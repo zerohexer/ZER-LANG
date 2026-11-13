@@ -1851,6 +1851,33 @@ cell p77_safe_hop_readonly  compile "$P77H"' u32 main(){ *T77 a = alloc(T77) ore
 cell p77_safe_teardown      compile "$P77"' void drop(*C77 c) { *H77 h = &c.h; if (h.p) |q| { free(q); } h.p = null; } void dropg() { *H77 h = &gc77.h; if (h.p) |q| { free(q); } h.p = null; } void link(*C77 c, *T77 p) { *H77 h = &c.h; h.p = p; } u32 main(){ *T77 a = alloc(T77) orelse return; C77 c; link(&c, a); drop(&c); gc77.h.p = alloc(T77); dropg(); return 0; }'
 cell p77_safe_deref_pp      compile "$P77"' u32 main(){ *T77 a = alloc(T77) orelse return; a.v = 4; **T77 pp = &a; u32 r = (*pp).v; free(*pp); return r - 4; }'
 
+# SHAPE p78 (BUG-1636/1637/1638): an allocation with no NAME of its own — passed
+# inline to a call, stored by a callee into the caller's OWN frame slot, or carried
+# in a struct handed to a funcptr that frees it. Each is the leak / use-after-free
+# the named spelling already catches. BOUNDARY: the callee frees or keeps it; the
+# caller frees the slot; a store into a GLOBAL slot stays escaped.
+echo "===== SHAPE p78 = an allocation reached only through a temp / callee store / carrier ====="
+P78='struct T78 { u32 v; }
+struct H78 { ?*T78 p; }
+struct N78 { *T78 p; }
+?*T78 g78;
+u32 use78(*T78 p) { return p.v; }
+void drop78(*T78 p) { free(p); }
+void keep78(*T78 p) { g78 = p; }
+void put78(*H78 h, *T78 p) { h.p = p; }
+void putg78(*T78 p) { g78 = p; }
+void fre78(N78 n) { free(n.p); }
+void apply78(*(N78) f, N78 n) { f(n); }
+'
+cell p78_inline_arg_leak    reject "$P78"' u32 main(){ u32 r = use78(alloc(T78) orelse return); return r; }'
+cell p78_inline_block_leak  reject "$P78"' u32 main(){ use78(alloc(T78) orelse { return 1; }); return 0; }'
+cell p78_store_local_leak   reject "$P78"' u32 main(){ H78 h; put78(&h, alloc(T78) orelse return); return 0; }'
+cell p78_carrier_use_uaf    reject "$P78"' u32 main(){ *T78 a = alloc(T78) orelse return; N78 n = { .p = a }; apply78(fre78, n); return a.v; }'
+cell p78_safe_inline_drop   compile "$P78"' u32 main(){ drop78(alloc(T78) orelse return); return 0; }'
+cell p78_safe_inline_keep   compile "$P78"' u32 main(){ keep78(alloc(T78) orelse return); if (g78) |q| { free(q); } g78 = null; return 0; }'
+cell p78_safe_store_free    compile "$P78"' u32 main(){ H78 h; put78(&h, alloc(T78) orelse return); if (h.p) |q| { free(q); } h.p = null; return 0; }'
+cell p78_safe_store_global  compile "$P78"' u32 main(){ putg78(alloc(T78) orelse return); if (g78) |q| { free(q); } g78 = null; return 0; }'
+
 echo "==================================================================="
 echo "matrix: $pass ok, $fail mismatch"
 [ -n "$holes" ]   && echo "HOLES (compile but should reject):$holes"

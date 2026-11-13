@@ -1,4 +1,0 @@
-u32 main() {
-    ?u32 r = @probe(0x0);  // attempt to read null
-    return r orelse 42;
-}

@@ -1,7 +1,0 @@
-// GAP (2026-11-13 audit, docs/limitations.md): an allocation consumed inline as a call argument leaks silently
-struct T { u32 v; }
-u32 use(*T p) { return p.v; }
-u32 main() {
-    u32 r = use(alloc(T) orelse return);
-    return r;
-}

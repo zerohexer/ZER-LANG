@@ -1,0 +1,11 @@
+// Promoted from tests/zer_gaps/audit2026-05-24_spawn_alias_args.zer (2026-11-13): filed as a gap, measured correct.
+// One shared global passed twice to a scoped spawn: every access is auto-locked, so the
+// two parameters aliasing is not a race.
+shared struct S { u32 v; }
+S g;
+void worker(*S a, *S b) { a.v = 1; b.v = 2; }
+u32 main() {
+    ThreadHandle th = spawn worker(&g, &g);
+    th.join();
+    return g.v - 2;
+}

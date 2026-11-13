@@ -1,8 +1,7 @@
-// AUDIT2 #12 (verify [*]T bounds check)
-// CLAIM: [*]T bounds-checked on every access.
-// TEST: allocate slice of len 5, access index 10.
-// EXPECTED: runtime trap (or compile error if VRP proves).
-
+// expect-trap
+// expect-trap-msg: out of bounds
+// Promoted from tests/zer_gaps/audit2_slice_oob.zer (2026-11-13): this was filed as a gap but
+// the guarantee holds — the program compiles and the runtime check fires.
 struct Cell { u32 v; }
 
 u32 main() {

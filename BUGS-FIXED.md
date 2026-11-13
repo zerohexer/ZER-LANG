@@ -5,7 +5,7 @@ Each entry: what broke, root cause, fix, and test that prevents regression.
 
 ---
 
-## Session 2026-11-13 — BUG-1609..1635: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
+## Session 2026-11-13 — BUG-1609..1638: branch `serene-shannon-0xnbk1` adopted, then a four-area audit (escape, allocation views, bounds / values, concurrency) and the ISR tick-counter relaxation
 
 **Branch.** The one branch ahead of main, `zerohexer-automated/serene-shannon-0xnbk1`
 (BUG-1566..1608, 3 commits), forked AT main's head, so it was a fast-forward; `make check`
@@ -212,6 +212,30 @@ matrix cell is ACCEPTED (or wrong) on it. What was found and NOT fixed is in
   `slice_view_optptr_consume_ok_bug1635`, `global_slice_view_teardown_ok_bug1635`; p45
   local-view cells. Also: `ir_path_is_under` passed a NULL base to `memcmp` for an empty
   base (UBSan; undefined even at length 0) — guarded.
+
+**Allocation tracker — an allocation with no name of its own (third pass)**
+- **BUG-1636 — an allocation passed inline to a call leaked silently.** `use(alloc(T) orelse
+  return)` lives only in the orelse temp and the argument temp; the exit leak pass skips temps
+  (they are copies of a named owner), so with no named owner nothing was ever reported. A temp
+  is now exempt only when its allocation has a NAMED entry (`ir_alloc_has_named_entry`), is
+  not definitely-ALIVE-from-a-known-allocator otherwise (a C function's `*opaque` result is
+  only presumed owned — `lib/fmt.zer`; a MAYBE_FREED temp after a loop join is a stale copy).
+  The store applier also falls back to the IR argument local when the argument AST has no key,
+  so `keep_it(alloc(T) orelse return)` is recognised as kept. Own diagnostic (the temp's
+  generated name meant nothing). Tests: `inline_alloc_call_arg_leak_bug1636`, positive
+  `inline_alloc_call_arg_freed_ok_bug1636`.
+- **BUG-1637 — a callee storing an inline allocation into the caller's own struct silenced the
+  leak.** `put(&h, alloc(T) orelse return)` marked the slot `escaped`, which put the allocation
+  in the exit pass's covered set, while the direct `h.p = alloc(T);` is reported. A slot in the
+  caller's own frame storage (`ir_key_path_in_frame`: local aggregate, value steps only) keeps
+  the leak duty; a pointer / slice / Handle step or a global still escapes. Tests:
+  `callee_store_into_local_struct_leak_bug1637`, positive `..._freed_ok_bug1637`.
+- **BUG-1638 — a struct carrying a pointer, handed to a funcptr PARAMETER that frees the
+  field, was not widened.** The hand-off of a bare pointer argument became MAYBE_FREED; a
+  by-value struct argument owns no bare entry (the allocation sits in the compound
+  `(h, ".p")`) so nothing was touched and `a.v` after read freed memory (exit 99). Every
+  allocation the struct carries now gets the same MAYBE_FREED + hand-off. Test:
+  `funcptr_param_frees_carrier_field_bug1638`; sink-matrix SHAPE p78.
 
 **Compile-time evaluation**
 - **BUG-1630 — a comptime shift by exactly 63 on a 64-bit operand "could not be evaluated"**

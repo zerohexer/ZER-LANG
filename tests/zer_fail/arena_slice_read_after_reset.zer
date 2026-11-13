@@ -1,0 +1,29 @@
+// EXPECTED: compile error
+// expect-error: use after free: 's' is freed
+// Promoted from tests/zer_gaps/audit2_slice_alloc_safety.zer (2026-11-13): an arena slice read
+// after arena.reset() — the rejection IS the intended one (the old 'masked' note was wrong).
+struct Cell { u32 v; }
+
+u32 main() {
+    u8[4096] buf;
+    Arena ar = Arena.over(buf[0..]);
+
+    // alloc 5 Cells as a slice
+    ?[*]Cell ms = ar.alloc_slice(Cell, 5);
+    [*]Cell s = ms orelse return;
+
+    // in-bounds access
+    s[0].v = 100;
+    s[4].v = 500;
+
+    u32 r = s[0].v + s[4].v;
+
+    // arena.reset invalidates the slice data
+    ar.reset();
+
+    // post-reset: does zercheck catch?
+    // r2 reading s[0] is UAF — but arena + slice tracking?
+    u32 r2 = s[0].v;
+
+    return r + r2;
+}

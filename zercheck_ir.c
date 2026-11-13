@@ -4786,6 +4786,20 @@ static void ir_extract_pool_name(Node *call, const char **out_name,
  *   - and NO OTHER user-visible entry still holds the same alloc_id — `?*T mt`
  *     beside its unwrapped `*T t`, or a global that received it, keep the
  *     allocation reachable, so overwriting one of them loses nothing. */
+/* BUG-1636: does any entry of this allocation live under a non-temp local or a
+ * global (a name the program can free it through)? An allocation with id 0
+ * names nothing tracked — answer yes, so it stays exempt. */
+static bool ir_alloc_has_named_entry(IRFunc *func, IRPathState *ps, int aid) {
+    if (aid <= 0) return true;
+    for (int i = 0; i < ps->handle_count; i++) {
+        IRHandleInfo *o = &ps->handles[i];
+        if (o->alloc_id != aid) continue;
+        if (o->local_id < 0) return true;                       /* a global root */
+        if (o->local_id >= func->local_count) return true;
+        if (!func->locals[o->local_id].is_temp) return true;
+    }
+    return false;
+}
 static bool ir_entry_is_temp(IRFunc *func, int local_id) {
     return local_id >= 0 && local_id < func->local_count &&
            func->locals[local_id].is_temp;
@@ -9649,8 +9663,54 @@ static struct ZcParamStore *ir_collect_param_stores(ZerCheck *zc, IRFunc *func, 
  * applies a store summary. A path with an unnameable index `[*]` lands in the
  * array's wildcard slot as an aliasing `[*@L]` entry — what a direct store at
  * an untrackable index leaves behind (ir_slot_demote_into). */
-static void ir_ps_place(ZerCheck *zc, IRPathState *ps, int root, const char *full,
-                        uint32_t fl, const IRHandleInfo *src, int line) {
+/* BUG-1637: does the slot `(root, path)` lie in THIS frame's own storage — a
+ * non-param, non-static local aggregate, every step below it a struct / union
+ * field or a fixed-array element (a value step)? A pointer, slice or Handle
+ * step leaves the frame. Unknown shapes answer no (the escaped reading). */
+static bool ir_key_path_in_frame(IRFunc *func, int root, const char *p, uint32_t pl) {
+    if (!ir_slot_root_is_local_storage(func, root)) return false;
+    Type *t = func->locals[root].type;
+    uint32_t i = 0;
+    while (i < pl) {
+        TypeKind k = t ? type_dispatch_kind(t) : TYPE_VOID;
+        if (p[i] == '.') {
+            uint32_t j = i + 1;
+            while (j < pl && p[j] != '.' && p[j] != '[') j++;
+            Type *ut = type_unwrap_distinct(t);
+            Type *nt = NULL;
+            uint32_t nl = j - i - 1;
+            if (k == TYPE_STRUCT) {
+                for (uint32_t f = 0; f < ut->struct_type.field_count; f++)
+                    if (ut->struct_type.fields[f].name_len == nl &&
+                        memcmp(ut->struct_type.fields[f].name, p + i + 1, nl) == 0)
+                        nt = ut->struct_type.fields[f].type;
+            } else if (k == TYPE_UNION) {
+                for (uint32_t f = 0; f < ut->union_type.variant_count; f++)
+                    if (ut->union_type.variants[f].name_len == nl &&
+                        memcmp(ut->union_type.variants[f].name, p + i + 1, nl) == 0)
+                        nt = ut->union_type.variants[f].type;
+            } else {
+                return false;
+            }
+            if (!nt) return false;
+            t = nt;
+            i = j;
+        } else if (p[i] == '[') {
+            if (k != TYPE_ARRAY) return false;
+            uint32_t j = i + 1;
+            while (j < pl && p[j] != ']') j++;
+            if (j >= pl) return false;
+            t = type_unwrap_distinct(t)->array.inner;
+            i = j + 1;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ir_ps_place(ZerCheck *zc, IRFunc *func, IRPathState *ps, int root,
+                        const char *full, uint32_t fl, const IRHandleInfo *src, int line) {
     if (!src || src->alloc_id == 0) return;
     IRHandleInfo snap = *src;          /* the adds below may realloc */
     /* A GLOBAL now holds it: the allocation escaped this frame, exactly as the
@@ -9669,7 +9729,12 @@ static void ir_ps_place(ZerCheck *zc, IRPathState *ps, int root, const char *ful
         ch->alloc_line = snap.alloc_line;
         ch->free_line = snap.free_line;
         ch->source_color = snap.source_color;
-        ch->escaped = true;   /* the argument's own entry keeps the leak duty */
+        /* BUG-1637: a slot in the caller's OWN frame storage (`put(&h, a)` into a
+         * local `H h`) is where the allocation now lives — exactly what the
+         * direct `h.p = a;` records. Marking it escaped put the allocation in
+         * the exit pass's "covered" set and silenced the argument's leak too, so
+         * `put(&h, alloc(T) orelse return); return 0;` leaked with no error. */
+        ch->escaped = ir_key_path_in_frame(func, root, full, fl) ? snap.escaped : true;
         return;
     }
     if (count > 1) {
@@ -9710,7 +9775,7 @@ static void ir_ps_apply_value(ZerCheck *zc, IRFunc *func, IRPathState *ps, int r
     bool aggregate = vk == TYPE_STRUCT || vk == TYPE_UNION || vk == TYPE_ARRAY;
     Node *pv = ir_peel_launder(val);
     if (!aggregate || !pv) {
-        ir_ps_place(zc, ps, root, full, fl, ir_view_arg_handle(zc, func, ps, val), line);
+        ir_ps_place(zc, func, ps, root, full, fl, ir_view_arg_handle(zc, func, ps, val), line);
         return;
     }
     if (pv->kind == NODE_STRUCT_INIT) {
@@ -9769,13 +9834,14 @@ static void ir_ps_apply_value(ZerCheck *zc, IRFunc *func, IRPathState *ps, int r
     for (int k = 0; k < n; k++) {
         uint32_t sub = rows[k].path_len - spl;
         char *np = ir_cat3(zc, full, fl, rows[k].path + spl, sub, "", 0);
-        if (np) ir_ps_place(zc, ps, root, np, fl + sub, &rows[k], line);
+        if (np) ir_ps_place(zc, func, ps, root, np, fl + sub, &rows[k], line);
     }
     free(rows);
 }
 
 static void ir_apply_param_stores(ZerCheck *zc, IRFunc *func, IRPathState *ps,
-                                  const FuncSummary *s, Node *call, int line) {
+                                  const FuncSummary *s, Node *call, const IRInst *ci,
+                                  int line) {
     for (int k = 0; k < s->param_store_n; k++) {
         const struct ZcParamStore *e = &s->param_store[k];
         if (e->src >= call->call.arg_count) continue;
@@ -9828,7 +9894,24 @@ static void ir_apply_param_stores(ZerCheck *zc, IRFunc *func, IRPathState *ps,
             p = (char *)rp;
             if (tot == 0) continue;
         }
-        ir_ps_apply_value(zc, func, ps, root, p, tot, call->call.args[e->src], line, 0);
+        /* BUG-1636: an argument whose AST has no key — an allocation passed
+         * inline, `keep_it(alloc(T) orelse return)` — still has the IR local the
+         * call lowered it into. Without it the store placed nothing: the callee
+         * kept the pointer and the caller's only (temp) entry looked leaked. */
+        Node *av = call->call.args[e->src];
+        if (ci && ci->call_arg_locals && e->src < ci->call_arg_local_count &&
+            ci->call_arg_locals[e->src] >= 0 && !ir_view_arg_handle(zc, func, ps, av)) {
+            Type *avt = checker_get_type(zc->checker, av);
+            Type *avi = avt ? type_unwrap_optional(avt) : NULL;
+            TypeKind avk = avi ? type_dispatch_kind(avi) : TYPE_VOID;
+            IRHandleInfo *lh = ir_find_handle(ps, ci->call_arg_locals[e->src]);
+            if (lh && lh->alloc_id != 0 && avk != TYPE_STRUCT && avk != TYPE_UNION &&
+                avk != TYPE_ARRAY) {
+                ir_ps_place(zc, func, ps, root, p, tot, lh, line);
+                continue;
+            }
+        }
+        ir_ps_apply_value(zc, func, ps, root, p, tot, av, line, 0);
     }
 }
 
@@ -14592,7 +14675,7 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             ir_apply_freed_globals(zc, ps, summary, inst->source_line);
         if (summary->param_store_n > 0 && inst->expr &&         /* BUG-1241 */
             inst->expr->kind == NODE_CALL)
-            ir_apply_param_stores(zc, func, ps, summary, inst->expr,
+            ir_apply_param_stores(zc, func, ps, summary, inst->expr, inst,
                                   inst->source_line);
         if (summary->polls_n > 0 && inst->expr &&                /* BUG-1243 */
             inst->expr->kind == NODE_CALL)
@@ -14818,6 +14901,48 @@ static void ir_check_inst_core(ZerCheck *zc, IRPathState *ps, IRInst *inst, IRFu
             }
             }
             }
+          }
+
+          /* BUG-1638: the callee HANDS a by-value struct argument to an unknown
+           * callee (a funcptr) that frees a pointer FIELD of it — `apply(fre, h)`
+           * with `fre(H h){ free(h.p); }` and `h.p = alloc`. The struct local owns
+           * no bare handle (the allocation lives in the compound `(h,".p")`), so
+           * the (xf&4) application above — keyed on the bare handle — touched
+           * nothing, and the carried allocation stayed this frame's, ALIVE: a
+           * later `a.v` read freed memory. Give every carried allocation the same
+           * MAYBE_FREED + hand-off the bare-pointer argument gets. Independent of
+           * the bare-handle lookup, so it runs for a struct with no bare entry. */
+          if ((xf & 4) && !summary->frees_param[pi] && inst->args &&
+              pi < inst->arg_count && inst->args[pi]) {
+              Node *ae = ir_resolve_returned_arg(zc, inst->args[pi]);
+              if (ae && ae->kind == NODE_UNARY && ae->unary.op == TOK_AMP && ae->unary.operand)
+                  ae = ae->unary.operand;
+              int rl; const char *rp; uint32_t rpl;
+              if (ae && ir_extract_compound_key(zc, func, ps, ae, &rl, &rp, &rpl) == 0 &&
+                  rpl == 0 && (rl >= 0 || rl == IR_GLOBAL_ROOT_ID)) {
+                  int cn = 0;
+                  for (int hh = 0; hh < ps->handle_count; hh++)
+                      if (ps->handles[hh].local_id == rl && ps->handles[hh].path_len > 0 &&
+                          ps->handles[hh].alloc_id != 0 && !ir_is_invalid(&ps->handles[hh])) cn++;
+                  int *caids = cn > 0 ? (int *)malloc((size_t)cn * sizeof(int)) : NULL;
+                  cn = 0;
+                  for (int hh = 0; caids && hh < ps->handle_count; hh++)
+                      if (ps->handles[hh].local_id == rl && ps->handles[hh].path_len > 0 &&
+                          ps->handles[hh].alloc_id != 0 && !ir_is_invalid(&ps->handles[hh]))
+                          caids[cn++] = ps->handles[hh].alloc_id;
+                  for (int k = 0; k < cn; k++)
+                      for (int gi = 0; gi < ps->handle_count; gi++) {
+                          IRHandleInfo *g = &ps->handles[gi];
+                          if (g->alloc_id != caids[k] || ir_is_invalid(g)) continue;
+                          if (g->state == IR_HS_ALIVE) {
+                              g->state = IR_HS_MAYBE_FREED;
+                              g->free_line = inst->source_line;
+                          }
+                          g->escaped = true;
+                          g->handed_off = true;
+                      }
+                  free(caids);
+              }
           }
 
           /* BUG-1410: an ELEMENT argument reaches the array's other
@@ -17790,7 +17915,22 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
                  * ir_move_exempts_leak_check. `true` here EXEMPTS, so the
                  * conservative answer is the opposite of the copy sink's. */
                 if (ir_move_exempts_leak_check(lt)) continue;
-                if (loc->is_temp) continue;
+                /* BUG-1636: a temp is a transient copy of a NAMED owner, so it is
+                 * exempt — but only when the allocation HAS one. `use(alloc(T)
+                 * orelse return)` puts the allocation in the orelse temp and the
+                 * argument temp and nowhere else: every entry of it was a temp,
+                 * the leak pass skipped them all, and the leak was silent. A
+                 * callee that frees or keeps the argument still clears it (the
+                 * entries are FREED / escaped by its summary). */
+                /* Only for an allocation from a known allocator (ZER's alloc /
+                 * pool / slab, or libc malloc) that is still definitely ALIVE: a
+                 * C function's `*opaque` result is only PRESUMED owned (a borrowed
+                 * stream, lib/fmt.zer), and a MAYBE_FREED temp after a loop join is
+                 * a stale copy whose named owner carries the real state. */
+                if (loc->is_temp &&
+                    (h->state != IR_HS_ALIVE || h->source_color == ZC_COLOR_UNKNOWN ||
+                     ir_alloc_has_named_entry(func, ps, h->alloc_id)))
+                    continue;
                 if (loc->is_param) continue;
             }
             /* Compound entities (s.h, arr[0]): historically skipped wholesale,
@@ -17825,7 +17965,20 @@ bool zercheck_ir(ZerCheck *zc, IRFunc *func) {
             }
             if (reported) continue;
 
-            if (h->state == IR_HS_ALIVE) {
+            if (h->state == IR_HS_ALIVE && func->locals[h->local_id].is_temp) {
+                /* BUG-1636: only temps hold it (the exemption above let it through) */
+                ir_zc_error(zc, h->alloc_line > 0 ? h->alloc_line : last->source_line,
+                    "the allocation at line %d is never bound to a name, so nothing can "
+                    "free it (a leak) — bind it first: '*T p = alloc(T) orelse return;', "
+                    "then pass 'p' and free it", h->alloc_line);
+                if (reported_n >= reported_cap) {
+                    reported_cap = reported_cap < 8 ? 8 : reported_cap * 2;
+                    int *nr = (int *)realloc(reported_ids, reported_cap * sizeof(int));
+                    if (nr) reported_ids = nr;
+                }
+                if (reported_n < reported_cap)
+                    reported_ids[reported_n++] = h->alloc_id;
+            } else if (h->state == IR_HS_ALIVE) {
                 if (h->is_thread_handle) {
                     ir_zc_error(zc, last->source_line,
                         "ThreadHandle '%.*s' not joined before function exit — "
